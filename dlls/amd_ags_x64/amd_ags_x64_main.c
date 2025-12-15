@@ -357,7 +357,7 @@ static BOOL get_ags_version_from_resource(const WCHAR *filename, enum amd_ags_ve
     infosize = GetFileVersionInfoSizeW(filename, NULL);
     if (!infosize)
     {
-        TRACE("File version info not found, err %u.\n", GetLastError());
+        TRACE("File version info not found, err %lu.\n", GetLastError());
         return FALSE;
     }
 
@@ -369,14 +369,14 @@ static BOOL get_ags_version_from_resource(const WCHAR *filename, enum amd_ags_ve
 
     if (!GetFileVersionInfoW(filename, 0, infosize, infobuf))
     {
-        ERR("GetFileVersionInfoW failed, err %u.\n", GetLastError());
+        ERR("GetFileVersionInfoW failed, err %lu.\n", GetLastError());
         free(infobuf);
         return FALSE;
     }
 
     if (!VerQueryValueW(infobuf, L"\\", &val, &vallen) || (vallen != sizeof(VS_FIXEDFILEINFO)))
     {
-        ERR("Version value not found, err %u.\n", GetLastError());
+        ERR("Version value not found, err %lu.\n", GetLastError());
         free(infobuf);
         return FALSE;
     }
@@ -1622,7 +1622,7 @@ AGSReturnCode WINAPI agsDriverExtensionsDX11_CreateDevice( AGSContext* context,
     }
     if (FAILED(hr))
     {
-        ERR("Device creation failed, hr %#x.\n", hr);
+        ERR("Device creation failed, hr %#lx.\n", hr);
         return AGS_DX_FAILURE;
     }
 
@@ -1696,7 +1696,7 @@ AGSReturnCode WINAPI agsDriverExtensionsDX12_CreateDevice(AGSContext *context,
     if (FAILED(hr = pD3D12CreateDevice((IUnknown *)creation_params->pAdapter, creation_params->FeatureLevel,
             &creation_params->iid, (void **)&returned_params->pDevice)))
     {
-        ERR("D3D12CreateDevice failed, hr %#x.\n", hr);
+        ERR("D3D12CreateDevice failed, hr %#lx.\n", hr);
         return AGS_DX_FAILURE;
     }
 
@@ -1846,7 +1846,7 @@ AGSReturnCode WINAPI agsDriverExtensionsDX12_PopMarker(AGSContext *context, ID3D
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
 {
-    TRACE("%p, %u, %p.\n", instance, reason, reserved);
+    TRACE("%p, %lu, %p.\n", instance, reason, reserved);
 
     switch (reason)
     {
