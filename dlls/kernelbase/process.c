@@ -37,6 +37,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(process);
 
 static DWORD shutdown_flags = 0;
 static DWORD shutdown_priority = 0x280;
+static char process_mitigation_policy[MaxProcessMitigationPolicy][16];
+static SIZE_T process_mitigation_policy_size[MaxProcessMitigationPolicy];
 
 /***********************************************************************
  * Processes
@@ -933,7 +935,35 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetProcessId( HANDLE process )
 BOOL WINAPI /* DECLSPEC_HOTPATCH */ GetProcessMitigationPolicy( HANDLE process, PROCESS_MITIGATION_POLICY policy,
                                                           void *buffer, SIZE_T length )
 {
-    FIXME( "(%p, %u, %p, %Iu): stub\n", process, policy, buffer, length );
+    BOOL current_process;
+    DWORD process_id;
+    SIZE_T size;
+
+    TRACE( "(%p, %u, %p, %Iu)\n", process, policy, buffer, length );
+
+    if (!buffer || policy < ProcessDEPPolicy || policy >= MaxProcessMitigationPolicy ||
+        length > sizeof(process_mitigation_policy[0]))
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    current_process = process == GetCurrentProcess();
+    if (!current_process)
+    {
+        process_id = GetProcessId( process );
+        if (!process_id) return FALSE;
+        current_process = process_id == GetCurrentProcessId();
+    }
+
+    memset( buffer, 0, length );
+
+    if (current_process)
+    {
+        size = min( length, process_mitigation_policy_size[policy] );
+        if (size) memcpy( buffer, process_mitigation_policy[policy], size );
+    }
+
     return TRUE;
 }
 
@@ -1277,7 +1307,18 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetProcessGroupAffinity( HANDLE process, const GRO
 BOOL WINAPI /* DECLSPEC_HOTPATCH */ SetProcessMitigationPolicy( PROCESS_MITIGATION_POLICY policy,
                                                           void *buffer, SIZE_T length )
 {
-    FIXME( "(%d, %p, %Iu): stub\n", policy, buffer, length );
+    TRACE( "(%d, %p, %Iu)\n", policy, buffer, length );
+
+    if (!buffer || policy < ProcessDEPPolicy || policy >= MaxProcessMitigationPolicy ||
+        length > sizeof(process_mitigation_policy[0]))
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    memset( process_mitigation_policy[policy], 0, sizeof(process_mitigation_policy[policy]) );
+    memcpy( process_mitigation_policy[policy], buffer, length );
+    process_mitigation_policy_size[policy] = length;
     return TRUE;
 }
 
