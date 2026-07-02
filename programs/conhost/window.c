@@ -750,13 +750,37 @@ static void fill_logfont( LOGFONTW *lf, const WCHAR *face_name, size_t face_name
     lf->lfFaceName[face_name_size / sizeof(WCHAR)] = 0;
 }
 
+static void set_fallback_font_metrics( struct console *console, const struct console_config *config )
+{
+    struct font_info *font_info = &console->active->font;
+    unsigned int width = config->cell_width;
+    unsigned int height = config->cell_height;
+    WCHAR *face_name;
+
+    if (!width) width = MulDiv( 8, GetDpiForSystem(), USER_DEFAULT_SCREEN_DPI );
+    if (!height) height = MulDiv( 16, GetDpiForSystem(), USER_DEFAULT_SCREEN_DPI );
+
+    face_name = malloc( sizeof(WCHAR) );
+    if (face_name) face_name[0] = 0;
+
+    free( font_info->face_name );
+    font_info->width = width;
+    font_info->height = height;
+    font_info->pitch_family = FIXED_PITCH | FF_DONTCARE;
+    font_info->weight = config->font_weight ? config->font_weight : FW_NORMAL;
+    font_info->face_name = face_name;
+    font_info->face_len = 0;
+}
+
 static BOOL set_console_font( struct console *console, const LOGFONTW *logfont )
 {
     struct font_info *font_info = &console->active->font;
     HFONT font, old_font;
     TEXTMETRICW tm;
     WCHAR face_name[LF_FACESIZE];
+    WCHAR *new_face_name;
     CPINFO cpinfo;
+    int face_len;
     HDC dc;
 
     TRACE( "%s\n", debugstr_logfont( logfont, 0 ));
@@ -780,10 +804,26 @@ static BOOL set_console_font( struct console *console, const LOGFONTW *logfont )
     }
 
     old_font = SelectObject( dc, font );
-    GetTextMetricsW( dc, &tm );
-    font_info->face_len = GetTextFaceW( dc, ARRAY_SIZE(face_name), face_name ) - 1;
+    if (!GetTextMetricsW( dc, &tm ) || !tm.tmAveCharWidth || !(tm.tmHeight + tm.tmExternalLeading))
+    {
+        SelectObject( dc, old_font );
+        ReleaseDC( console->win, dc );
+        DeleteObject( font );
+        return FALSE;
+    }
+    face_len = GetTextFaceW( dc, ARRAY_SIZE(face_name), face_name );
     SelectObject( dc, old_font );
     ReleaseDC( console->win, dc );
+    if (face_len > 0) face_len--;
+    else face_len = 0;
+
+    if (!(new_face_name = malloc( (face_len + 1) * sizeof(WCHAR) )))
+    {
+        DeleteObject( font );
+        return FALSE;
+    }
+    memcpy( new_face_name, face_name, face_len * sizeof(WCHAR) );
+    new_face_name[face_len] = 0;
 
     font_info->width  = tm.tmAveCharWidth;
     font_info->height = tm.tmHeight + tm.tmExternalLeading;
@@ -791,8 +831,8 @@ static BOOL set_console_font( struct console *console, const LOGFONTW *logfont )
     font_info->weight = tm.tmWeight;
 
     free( font_info->face_name );
-    font_info->face_name = malloc( font_info->face_len * sizeof(WCHAR) );
-    memcpy( font_info->face_name, face_name, font_info->face_len * sizeof(WCHAR) );
+    font_info->face_name = new_face_name;
+    font_info->face_len = face_len;
 
     /* FIXME: use maximum width for DBCS codepages since some chars take two cells */
     if (GetCPInfo( console->output_cp, &cpinfo ) && cpinfo.MaxCharSize == 2)
@@ -869,6 +909,7 @@ static void set_first_font( struct console *console, struct console_config *conf
 {
     LOGFONTW lf;
     struct font_chooser fc;
+    BOOL font_set = FALSE;
 
     TRACE("Looking for a suitable console font\n");
 
@@ -883,8 +924,21 @@ static void set_first_font( struct console *console, struct console_config *conf
 
     fc.lf.lfHeight = config->cell_height;
     fc.lf.lfWidth = config->cell_width;
-    if (!fc.weight || !set_console_font( console, &fc.lf ))
+    if (fc.weight)
+        font_set = set_console_font( console, &fc.lf );
+
+    if (!font_set)
+    {
+        WARN("Falling back to default logical console font\n");
+        fill_logfont( &lf, L"", 0, config->cell_height, config->font_weight );
+        lf.lfWidth = config->cell_width;
+        font_set = set_console_font( console, &lf );
+    }
+    if (!font_set)
+    {
         ERR("Unable to find a valid console font\n");
+        set_fallback_font_metrics( console, config );
+    }
 
     /* Update active configuration */
     config->cell_width  = console->active->font.width;
