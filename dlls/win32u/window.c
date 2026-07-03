@@ -2065,6 +2065,32 @@ static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, str
     return TRUE;
 }
 
+static BOOL is_chromium_cef_child_window(HWND hwnd)
+{
+    static const WCHAR cef_browser_window[] =
+        {'C','e','f','B','r','o','w','s','e','r','W','i','n','d','o','w',0};
+    static const WCHAR chrome_render_widget[] =
+        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
+    static const WCHAR chrome_widget_prefix[] =
+        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcscmp(class_name, cef_browser_window)
+        || !wcscmp(class_name, chrome_render_widget)
+        || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
+}
+
 static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
                                                   struct window_rects *rects, RECT *surface_rect )
 {
@@ -2091,7 +2117,14 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
-    else if (is_child) needs_surface = FALSE;
+    else if (is_child && !is_chromium_cef_child_window(hwnd)) needs_surface = FALSE;
+    else if (is_child)
+    {
+        TRACE( "allowing Chromium/CEF child window %p to own a redirected surface\n", hwnd );
+        if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
+        else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
+        else needs_surface = !!(style & WS_VISIBLE);
+    }
     else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
     else needs_surface = !!(style & WS_VISIBLE);

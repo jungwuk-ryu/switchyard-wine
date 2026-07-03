@@ -49,6 +49,32 @@ static struct list dce_list = LIST_INIT(dce_list);
 
 #define DCE_CACHE_SIZE 64
 
+static BOOL is_chromium_cef_child_window(HWND hwnd)
+{
+    static const WCHAR cef_browser_window[] =
+        {'C','e','f','B','r','o','w','s','e','r','W','i','n','d','o','w',0};
+    static const WCHAR chrome_render_widget[] =
+        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
+    static const WCHAR chrome_widget_prefix[] =
+        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcscmp(class_name, cef_browser_window)
+        || !wcscmp(class_name, chrome_render_widget)
+        || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
+}
+
 static struct list window_surfaces = LIST_INIT( window_surfaces );
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -867,12 +893,33 @@ static void update_visible_region( struct dce *dce )
     /* don't use a surface to paint the client area of OpenGL windows */
     if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW))
     {
-        win = get_win_ptr( top_win );
-        if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+        if (top_win != dce->hwnd && is_chromium_cef_child_window(dce->hwnd))
         {
-            surface = win->surface;
-            if (surface) window_surface_add_ref( surface );
-            release_win_ptr( win );
+            win = get_win_ptr( dce->hwnd );
+            if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+            {
+                surface = win->surface;
+                if (surface && surface != &dummy_surface)
+                {
+                    window_surface_add_ref( surface );
+                    top_rect = win_rect;
+                    TRACE( "using Chromium/CEF child surface %p for hwnd %p instead of top window %p\n",
+                           surface, dce->hwnd, top_win );
+                }
+                else surface = NULL;
+                release_win_ptr( win );
+            }
+        }
+
+        if (!surface)
+        {
+            win = get_win_ptr( top_win );
+            if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+            {
+                surface = win->surface;
+                if (surface) window_surface_add_ref( surface );
+                release_win_ptr( win );
+            }
         }
     }
 
@@ -1386,6 +1433,12 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 
     dce->hwnd = hwnd;
     dce->flags = (dce->flags & ~user_flags) | (flags & user_flags);
+
+    if (!update_vis_rgn && is_chromium_cef_child_window( hwnd ))
+    {
+        TRACE( "refreshing cached DCE visible region for Chromium/CEF child hwnd %p\n", hwnd );
+        update_vis_rgn = TRUE;
+    }
 
     /* cross-process invalidation is not supported yet, so always update the vis rgn */
     if (!is_current_process_window( hwnd )) update_vis_rgn = TRUE;

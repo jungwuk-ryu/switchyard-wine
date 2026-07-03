@@ -45,6 +45,32 @@ static CFMutableDictionaryRef win_datas;
 
 static unsigned int activate_on_focus_time;
 
+static BOOL is_chromium_cef_child_window(HWND hwnd)
+{
+    static const WCHAR cef_browser_window[] =
+        {'C','e','f','B','r','o','w','s','e','r','W','i','n','d','o','w',0};
+    static const WCHAR chrome_render_widget[] =
+        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
+    static const WCHAR chrome_widget_prefix[] =
+        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcscmp(class_name, cef_browser_window)
+        || !wcscmp(class_name, chrome_render_widget)
+        || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
+}
+
 
 /* per-monitor DPI aware NtUserSetWindowPos call */
 static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, UINT flags)
@@ -1637,6 +1663,7 @@ BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const stru
 {
     struct macdrv_win_data *data = get_win_data(hwnd);
     BOOL ret = FALSE;
+    HWND root;
 
     TRACE("hwnd %p, swp_flags %04x, shaped %u, rects %s\n", hwnd, swp_flags, shaped, debugstr_window_rects(rects));
 
@@ -1645,6 +1672,18 @@ BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const stru
 
     ret = !!data->cocoa_window; /* use default surface if we don't have a window */
     release_win_data(data);
+
+    if (!ret && is_chromium_cef_child_window(hwnd) && (root = NtUserGetAncestor(hwnd, GA_ROOT)) && root != hwnd)
+    {
+        struct macdrv_win_data *root_data = get_win_data(root);
+
+        if (root_data)
+        {
+            ret = !!root_data->cocoa_window;
+            release_win_data(root_data);
+        }
+        if (ret) TRACE("Switchyard redirecting Chromium/CEF child window %p through root %p\n", hwnd, root);
+    }
 
     return ret;
 }
