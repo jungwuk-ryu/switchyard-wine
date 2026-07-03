@@ -600,6 +600,12 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                     case PROC_THREAD_ATTRIBUTE_EXTENDED_FLAGS:
                         FIXME("PROC_THREAD_ATTRIBUTE_EXTENDED_FLAGS %lx.\n", *(ULONG *)attrs->attrs[i].value);
                         break;
+                    case PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY:
+                        TRACE("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY size %Iu.\n", attrs->attrs[i].size);
+                        break;
+                    case PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER:
+                        TRACE("PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER size %Iu.\n", attrs->attrs[i].size);
+                        break;
                     case PROC_THREAD_ATTRIBUTE_HANDLE_LIST:
                         handle_list = &attrs->attrs[i];
                         TRACE("PROC_THREAD_ATTRIBUTE_HANDLE_LIST handle count %Iu.\n", attrs->attrs[i].size / sizeof(HANDLE));
@@ -1872,6 +1878,9 @@ static inline DWORD validate_proc_thread_attribute( DWORD_PTR attr, SIZE_T size 
     case PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY:
         if (size != sizeof(DWORD) && size != sizeof(DWORD64) && size != sizeof(DWORD64) * 2)
             return ERROR_BAD_LENGTH;
+        break;
+    case PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER:
+        if (size != sizeof(DWORD) && size != sizeof(DWORD64)) return ERROR_BAD_LENGTH;
         break;
     case PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE:
        if (size != sizeof(HPCON)) return ERROR_BAD_LENGTH;
