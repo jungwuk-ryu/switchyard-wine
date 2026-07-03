@@ -3424,6 +3424,7 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 static BYTE *native_callback_thunk_ptr;
 static BYTE *native_callback_thunk_end;
 static const BYTE native_callback_thunk_marker[] = { 0x66, 0x90, 0x66, 0x90, 0x66, 0x90, 0x66, 0x90 };
+#define SWITCHYARD_NATIVE_CALLBACK_E_FAIL ((ULONG_PTR)0x80004005)
 
 static inline void switchyard_set_macos_tsd_base( void *base )
 {
@@ -3442,6 +3443,7 @@ struct switchyard_native_callback_scope
     TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
+    BOOL left;
 };
 
 static BOOL switchyard_get_native_callback_context( void **pthread_teb, DWORD **native_callback_depth )
@@ -3458,11 +3460,40 @@ static BOOL switchyard_get_native_callback_context( void **pthread_teb, DWORD **
     return TRUE;
 }
 
+struct switchyard_native_callback_exception_context
+{
+    void *func;
+    ULONG_PTR ret;
+    struct switchyard_native_callback_scope *scope;
+};
+
+static LONG switchyard_native_callback_exception_filter( EXCEPTION_POINTERS *ptr, void *ctx )
+{
+    struct switchyard_native_callback_exception_context *exception = ctx;
+    void *module;
+
+    if (!ptr || !ptr->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+
+    switchyard_set_macos_tsd_base( exception->scope->teb );
+
+    if (RtlPcToFileHeader( ptr->ExceptionRecord->ExceptionAddress, &module ))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    exception->ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
+    WARN( "native callback target %p raised host exception %#lx at %p, returning %#Ix\n",
+          exception->func, ptr->ExceptionRecord->ExceptionCode,
+          ptr->ExceptionRecord->ExceptionAddress, exception->ret );
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static void CALLBACK switchyard_leave_native_callback( BOOL normal, void *ctx )
 {
     struct switchyard_native_callback_scope *scope = ctx;
 
     (void)normal;
+    if (scope->left) return;
+    scope->left = TRUE;
     if (scope->native_callback_depth && *scope->native_callback_depth)
         --*scope->native_callback_depth;
     switchyard_set_macos_tsd_base( scope->native_callback_depth && *scope->native_callback_depth ?
@@ -3475,16 +3506,33 @@ static ULONG_PTR WINAPI switchyard_native_callback3_on_user_stack( void *func, U
                                                                    DWORD *native_callback_depth )
 {
     typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
-    struct switchyard_native_callback_scope scope = { NtCurrentTeb(), pthread_teb, native_callback_depth };
-    ULONG_PTR ret;
+    struct switchyard_native_callback_scope scope = { NtCurrentTeb(), pthread_teb, native_callback_depth, FALSE };
+    struct switchyard_native_callback_exception_context exception =
+    {
+        func,
+        SWITCHYARD_NATIVE_CALLBACK_E_FAIL,
+        &scope
+    };
+    ULONG_PTR ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
 
     ++*native_callback_depth;
-    switchyard_set_macos_tsd_base( pthread_teb );
     __TRY
     {
-        ret = ((native_callback_func)func)( arg0, arg1, arg2 );
+        __TRY
+        {
+            switchyard_set_macos_tsd_base( pthread_teb );
+            ret = ((native_callback_func)func)( arg0, arg1, arg2 );
+            switchyard_leave_native_callback( TRUE, &scope );
+        }
+        __EXCEPT_CTX( switchyard_native_callback_exception_filter, &exception )
+        {
+            switchyard_leave_native_callback( FALSE, &scope );
+            ret = exception.ret;
+        }
+        __ENDTRY
     }
     __FINALLY_CTX( switchyard_leave_native_callback, &scope )
+
     return ret;
 }
 
@@ -3494,16 +3542,33 @@ static ULONG_PTR WINAPI switchyard_native_callback4_on_user_stack( void *func, U
                                                                    DWORD *native_callback_depth )
 {
     typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
-    struct switchyard_native_callback_scope scope = { NtCurrentTeb(), pthread_teb, native_callback_depth };
-    ULONG_PTR ret;
+    struct switchyard_native_callback_scope scope = { NtCurrentTeb(), pthread_teb, native_callback_depth, FALSE };
+    struct switchyard_native_callback_exception_context exception =
+    {
+        func,
+        SWITCHYARD_NATIVE_CALLBACK_E_FAIL,
+        &scope
+    };
+    ULONG_PTR ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
 
     ++*native_callback_depth;
-    switchyard_set_macos_tsd_base( pthread_teb );
     __TRY
     {
-        ret = ((native_callback_func)func)( arg0, arg1, arg2, arg3 );
+        __TRY
+        {
+            switchyard_set_macos_tsd_base( pthread_teb );
+            ret = ((native_callback_func)func)( arg0, arg1, arg2, arg3 );
+            switchyard_leave_native_callback( TRUE, &scope );
+        }
+        __EXCEPT_CTX( switchyard_native_callback_exception_filter, &exception )
+        {
+            switchyard_leave_native_callback( FALSE, &scope );
+            ret = exception.ret;
+        }
+        __ENDTRY
     }
     __FINALLY_CTX( switchyard_leave_native_callback, &scope )
+
     return ret;
 }
 
