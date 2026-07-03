@@ -3639,6 +3639,13 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "movq %rax,%rdx\n\t"
                    "movq %rcx,%r14\n\t"
                    "movq %r13,%rdi\n\t"            /* teb */
+                   "cmpl $1,0x344(%r13)\n\t"       /* amd64_thread_data()->native_callback_depth */
+                   "jbe 1f\n\t"
+                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "testq %rdi,%rdi\n\t"
+                   "jnz 2f\n"
+                   "1:\tmovq %r13,%rdi\n"
+                   "2:\t"
                    "xorl %esi,%esi\n\t"
                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
                    "syscall\n\t"
