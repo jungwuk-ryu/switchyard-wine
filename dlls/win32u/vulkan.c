@@ -46,6 +46,8 @@ WINE_DECLARE_DEBUG_CHANNEL(fps);
 
 static const struct vulkan_driver_funcs *driver_funcs;
 
+#define SWITCHYARD_VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME "VK_KHR_portability_subset"
+
 static const UINT EXTERNAL_MEMORY_WIN32_BITS = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT |
@@ -496,6 +498,12 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
     for (uint32_t i = 0; i < count; i++)
     {
         const char *extension = properties[i].extensionName;
+        if (!strcmp( extension, SWITCHYARD_VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME ))
+        {
+            physical_device->has_portability_subset = 1;
+            TRACE( "  - %s\n", extension );
+            continue;
+        }
 #define USE_VK_EXT(x)                           \
         if (!strcmp( extension, #x ))           \
         {                                       \
@@ -724,10 +732,12 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
         physical_device->extensions.has_VK_EXT_swapchain_maintenance1)
         device->extensions.has_VK_EXT_swapchain_maintenance1 = 1;
 
-    if (!(extensions = mem_alloc( pool, sizeof(device->extensions) * 8 * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(extensions = mem_alloc( pool, (sizeof(device->extensions) * 8 + 1) * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
 #define USE_VK_EXT(x) if (device->extensions.has_ ## x) extensions[count++] = #x;
     ALL_VK_DEVICE_EXTS
 #undef USE_VK_EXT
+    if (physical_device->has_portability_subset)
+        extensions[count++] = SWITCHYARD_VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
 
     TRACE( "Enabling %u host device extensions\n", count );
     for (const char **extension = extensions, **end = extension + count; extension < end; extension++)

@@ -181,6 +181,7 @@ struct vulkan_physical_device
     VkPhysicalDeviceMemoryProperties memory_properties;
     uint32_t external_memory_align;
     uint32_t map_placed_align;
+    unsigned int has_portability_subset;
 };
 
 static inline struct vulkan_physical_device *vulkan_physical_device_from_handle( VkPhysicalDevice handle )
