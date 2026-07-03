@@ -3419,12 +3419,233 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 }
 
 
+#ifdef _WIN64
+
+static BYTE *native_callback_thunk_ptr;
+static BYTE *native_callback_thunk_end;
+static const BYTE native_callback_thunk_marker[] = { 0x66, 0x90, 0x66, 0x90, 0x66, 0x90, 0x66, 0x90 };
+
+static ULONG_PTR WINAPI native_callback_bridge3( void *func, ULONG_PTR arg0,
+                                                 ULONG_PTR arg1, ULONG_PTR arg2 )
+{
+    struct native_callback_params params = { func, { arg0, arg1, arg2, 0 }, 0 };
+    NTSTATUS status;
+
+    status = WINE_UNIX_CALL( unix_call_native_callback3, &params );
+    if (status) WARN( "native callback3 bridge failed, status %#lx\n", status );
+    return params.ret;
+}
+
+static ULONG_PTR WINAPI native_callback_bridge4( void *func, ULONG_PTR arg0,
+                                                 ULONG_PTR arg1, ULONG_PTR arg2,
+                                                 ULONG_PTR arg3 )
+{
+    struct native_callback_params params = { func, { arg0, arg1, arg2, arg3 }, 0 };
+    NTSTATUS status;
+
+    status = WINE_UNIX_CALL( unix_call_native_callback4, &params );
+    if (status) WARN( "native callback4 bridge failed, status %#lx\n", status );
+    return params.ret;
+}
+
+static void register_native_callback_thunk_region( void *base, SIZE_T size )
+{
+    struct native_code_region_params params = { base, size };
+    NTSTATUS status;
+
+    status = WINE_UNIX_CALL( unix_register_non_native_code_region, &params );
+    if (status) WARN( "native callback thunk registration failed, status %#lx\n", status );
+}
+
+static BOOL is_native_callback_thunk( const void *ptr )
+{
+    const BYTE *code = ptr;
+    BOOL ret = FALSE;
+
+    __TRY
+    {
+        ret = !memcmp( code, native_callback_thunk_marker, sizeof(native_callback_thunk_marker) );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        ret = FALSE;
+    }
+    __ENDTRY
+
+    return ret;
+}
+
+static BYTE *alloc_native_callback_thunk( SIZE_T size )
+{
+    void *new_region_base = NULL;
+    SIZE_T new_region_size = 0;
+    BYTE *ret = NULL;
+    SIZE_T aligned_size = (size + 15) & ~15;
+
+    RtlEnterCriticalSection( &loader_section );
+    if (!native_callback_thunk_ptr || native_callback_thunk_ptr + aligned_size > native_callback_thunk_end)
+    {
+        void *base = NULL;
+        SIZE_T alloc_size = 0x1000;
+
+        if (!NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &alloc_size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE ))
+        {
+            native_callback_thunk_ptr = base;
+            native_callback_thunk_end = native_callback_thunk_ptr + alloc_size;
+            new_region_base = base;
+            new_region_size = alloc_size;
+        }
+    }
+    if (native_callback_thunk_ptr && native_callback_thunk_ptr + aligned_size <= native_callback_thunk_end)
+    {
+        ret = native_callback_thunk_ptr;
+        native_callback_thunk_ptr += aligned_size;
+    }
+    RtlLeaveCriticalSection( &loader_section );
+    if (new_region_base) register_native_callback_thunk_region( new_region_base, new_region_size );
+    return ret;
+}
+
+static BYTE *emit_native_callback_common( BYTE *code, void *func, void *bridge )
+{
+    static const BYTE shift_args[] =
+    {
+        0x4d, 0x89, 0xc1, /* mov %r8,%r9 */
+        0x49, 0x89, 0xd0, /* mov %rdx,%r8 */
+        0x48, 0x89, 0xca, /* mov %rcx,%rdx */
+        0x48, 0xb9        /* movabs func,%rcx */
+    };
+
+    memcpy( code, shift_args, sizeof(shift_args) );
+    code += sizeof(shift_args);
+    memcpy( code, &func, sizeof(func) );
+    code += sizeof(func);
+    *code++ = 0x48;
+    *code++ = 0xb8;       /* movabs bridge,%rax */
+    memcpy( code, &bridge, sizeof(bridge) );
+    code += sizeof(bridge);
+    *code++ = 0xff;
+    *code++ = 0xd0;       /* call *%rax */
+    return code;
+}
+
+static void *create_native_callback_thunk( void *func, unsigned int argc )
+{
+    BYTE *code, *p;
+    SIZE_T size = 64;
+
+    if (argc == 4) size += 8;
+    if (!(code = alloc_native_callback_thunk( size ))) return NULL;
+
+    p = code;
+    memcpy( p, native_callback_thunk_marker, sizeof(native_callback_thunk_marker) );
+    p += sizeof(native_callback_thunk_marker);
+
+    if (argc == 3)
+    {
+        *p++ = 0x48;
+        *p++ = 0x83;
+        *p++ = 0xec;
+        *p++ = 0x28;       /* sub $0x28,%rsp */
+        p = emit_native_callback_common( p, func, native_callback_bridge3 );
+        *p++ = 0x48;
+        *p++ = 0x83;
+        *p++ = 0xc4;
+        *p++ = 0x28;       /* add $0x28,%rsp */
+    }
+    else if (argc == 4)
+    {
+        *p++ = 0x48;
+        *p++ = 0x83;
+        *p++ = 0xec;
+        *p++ = 0x38;       /* sub $0x38,%rsp */
+        *p++ = 0x4c;
+        *p++ = 0x89;
+        *p++ = 0x4c;
+        *p++ = 0x24;
+        *p++ = 0x20;       /* mov %r9,0x20(%rsp) */
+        p = emit_native_callback_common( p, func, native_callback_bridge4 );
+        *p++ = 0x48;
+        *p++ = 0x83;
+        *p++ = 0xc4;
+        *p++ = 0x38;       /* add $0x38,%rsp */
+    }
+    else return NULL;
+
+    *p++ = 0xc3;           /* ret */
+    return code;
+}
+
+static BOOL is_native_callback_target( void *func )
+{
+    void *module;
+
+    return func && !is_native_callback_thunk( func ) && !RtlPcToFileHeader( func, &module );
+}
+
+static BOOL is_native_callback_target_or_thunk( void *func )
+{
+    return is_native_callback_thunk( func ) || is_native_callback_target( func );
+}
+
+static void wrap_native_callback_entry( void **slot, unsigned int argc )
+{
+    void *func, *thunk;
+
+    func = *slot;
+    if (!is_native_callback_target( func )) return;
+    if (!(thunk = create_native_callback_thunk( func, argc ))) return;
+
+    *slot = thunk;
+    TRACE( "bridging native callback table entry %p target %p argc %u thunk %p\n",
+           slot, func, argc, thunk );
+}
+
+static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS status )
+{
+    void **table = args;
+    void *module;
+
+    if (status || code || !args || !RtlPcToFileHeader( args, &module )) return;
+
+    __TRY
+    {
+        if (!is_native_callback_target_or_thunk( table[1] ) ||
+            !is_native_callback_target_or_thunk( table[2] ) ||
+            !table[42] || !table[43])
+            return;
+
+        wrap_native_callback_entry( &table[1], 3 ); /* CreateDXGIFactory2 */
+        wrap_native_callback_entry( &table[2], 4 ); /* D3D12CreateDevice */
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+}
+
+#else
+
+static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS status )
+{
+    (void)code;
+    (void)args;
+    (void)status;
+}
+
+#endif
+
+
 /***********************************************************************
  *           __wine_unix_call
  */
 NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args )
 {
-    return __wine_unix_call_dispatcher( handle, code, args );
+    NTSTATUS status = __wine_unix_call_dispatcher( handle, code, args );
+
+    wrap_native_callback_table( code, args, status );
+    return status;
 }
 
 

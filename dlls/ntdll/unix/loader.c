@@ -1019,8 +1019,64 @@ static NTSTATUS unixcall_native_thread_func( void *args )
 }
 
 
+static NTSTATUS unixcall_native_callback3( void *args )
+{
+#ifdef __x86_64__
+    struct native_callback_params *params = args;
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
+
+    if (!params->func) return STATUS_INVALID_PARAMETER;
+    params->ret = ((native_callback_func)params->func)( params->args[0], params->args[1], params->args[2] );
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
+static NTSTATUS unixcall_native_callback4( void *args )
+{
+#ifdef __x86_64__
+    struct native_callback_params *params = args;
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+
+    if (!params->func) return STATUS_INVALID_PARAMETER;
+    params->ret = ((native_callback_func)params->func)( params->args[0], params->args[1],
+                                                        params->args[2], params->args[3] );
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
+static NTSTATUS unixcall_register_non_native_code_region( void *args )
+{
+    struct native_code_region_params *params = args;
+
+    if (!params->base || !params->size) return STATUS_INVALID_PARAMETER;
+    virtual_register_non_native_code_region( params->base, params->size );
+    return STATUS_SUCCESS;
+}
+
+
 #ifdef _WIN64
 static NTSTATUS wow64_native_thread_func( void *args )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS wow64_native_callback3( void *args )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS wow64_native_callback4( void *args )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS wow64_register_non_native_code_region( void *args )
 {
     return STATUS_NOT_SUPPORTED;
 }
@@ -1037,6 +1093,9 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_server_handle_to_fd,
     unixcall_wine_spawnvp,
     unixcall_native_thread_func,
+    unixcall_native_callback3,
+    unixcall_native_callback4,
+    unixcall_register_non_native_code_region,
     system_time_precise,
 };
 
@@ -1056,6 +1115,9 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
     wow64_native_thread_func,
+    wow64_native_callback3,
+    wow64_native_callback4,
+    wow64_register_non_native_code_region,
     system_time_precise,
 };
 

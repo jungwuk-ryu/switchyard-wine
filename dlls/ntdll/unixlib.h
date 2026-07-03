@@ -61,6 +61,19 @@ struct native_thread_func_params
     void *arg;
 };
 
+struct native_callback_params
+{
+    void      *func;
+    ULONG_PTR args[4];
+    ULONG_PTR ret;
+};
+
+struct native_code_region_params
+{
+    const void *base;
+    SIZE_T      size;
+};
+
 struct load_so_dll_params
 {
     UNICODE_STRING              nt_name;
@@ -84,6 +97,9 @@ enum ntdll_unix_funcs
     unix_wine_server_handle_to_fd,
     unix_wine_spawnvp,
     unix_call_native_thread_func,
+    unix_call_native_callback3,
+    unix_call_native_callback4,
+    unix_register_non_native_code_region,
     unix_system_time_precise,
 };
 
