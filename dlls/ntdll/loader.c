@@ -4703,6 +4703,8 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
  */
 NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args )
 {
+    if (!handle || !__wine_unix_call_dispatcher) return STATUS_INVALID_HANDLE;
+
     void *pe_callback_storage[SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES];
     void *dispatch_args = prepare_pe_callback_table( code, args, pe_callback_storage,
                                                      ARRAY_SIZE(pe_callback_storage) );
