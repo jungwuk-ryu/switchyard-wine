@@ -285,7 +285,9 @@ extern NTSTATUS WINAPI __wine_load_unix_lib( const UNICODE_STRING *name, unixlib
                                              unixlib_handle_t *handle );
 extern NTSTATUS WINAPI __wine_unload_unix_lib( unixlib_module_t lib );
 
-#ifdef __arm64ec__
+#ifdef WINE_UNIX_CALL_EXPORT
+NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args );
+#elif defined __arm64ec__
 NTSTATUS __wine_unix_call_arm64ec( unixlib_handle_t handle, unsigned int code, void *args );
 static inline NTSTATUS __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args )
 {

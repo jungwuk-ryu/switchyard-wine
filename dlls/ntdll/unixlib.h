@@ -21,7 +21,9 @@
 #ifndef __NTDLL_UNIXLIB_H
 #define __NTDLL_UNIXLIB_H
 
+#define WINE_UNIX_CALL_EXPORT
 #include "wine/unixlib.h"
+#undef WINE_UNIX_CALL_EXPORT
 
 struct _DISPATCHER_CONTEXT;
 

@@ -3420,6 +3420,15 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 
 
 /***********************************************************************
+ *           __wine_unix_call
+ */
+NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args )
+{
+    return __wine_unix_call_dispatcher( handle, code, args );
+}
+
+
+/***********************************************************************
  *           wine_server_call
  */
 unsigned int CDECL wine_server_call( void *req_ptr )
