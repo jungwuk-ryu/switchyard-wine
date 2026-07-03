@@ -40,6 +40,7 @@ struct current_teb_params
 
 struct native_callback_context_params
 {
+    void *teb;
     void *pthread_teb;
     void *native_callback_depth;
 };

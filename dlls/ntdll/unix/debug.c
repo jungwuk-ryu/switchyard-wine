@@ -300,10 +300,12 @@ NTSTATUS unixcall_get_native_callback_context( void *args )
     struct native_callback_context_params *params = args;
     struct thread_data *data = get_thread_data();
 
+    params->teb = NULL;
     params->pthread_teb = NULL;
     params->native_callback_depth = NULL;
     if (!data || !data->teb) return STATUS_UNSUCCESSFUL;
 
+    params->teb = data->teb;
     params->pthread_teb = *(void **)((char *)data->teb + switchyard_amd64_pthread_teb_offset);
     params->native_callback_depth = (char *)data->teb + switchyard_amd64_native_callback_depth_offset;
     return params->pthread_teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;

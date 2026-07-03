@@ -3418,13 +3418,22 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
     return WINE_UNIX_CALL( unix_wine_spawnvp, &params );
 }
 
+#define SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES 43
 
 #ifdef _WIN64
 
 static BYTE *native_callback_thunk_ptr;
 static BYTE *native_callback_thunk_end;
 static const BYTE native_callback_thunk_marker[] = { 0x66, 0x90, 0x66, 0x90, 0x66, 0x90, 0x66, 0x90 };
+static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0x1f, 0x40, 0x00 };
 #define SWITCHYARD_NATIVE_CALLBACK_E_FAIL ((ULONG_PTR)0x80004005)
+#define SWITCHYARD_PE_CALLBACK_MAX_ARGS 9
+#define SWITCHYARD_PE_CALLBACK_SKIP 0xff
+#define SWITCHYARD_PE_CALLBACK_FRAME_SIZE 0xa8
+#define SWITCHYARD_PE_CALLBACK_PARAMS_OFFSET 0x20
+#define SWITCHYARD_PE_CALLBACK_FUNC_OFFSET 0x00
+#define SWITCHYARD_PE_CALLBACK_ARGC_OFFSET 0x08
+#define SWITCHYARD_PE_CALLBACK_ARGS_OFFSET 0x10
 
 static inline void switchyard_set_macos_tsd_base( void *base )
 {
@@ -3446,15 +3455,38 @@ struct switchyard_native_callback_scope
     BOOL left;
 };
 
-static BOOL switchyard_get_native_callback_context( void **pthread_teb, DWORD **native_callback_depth )
+struct switchyard_pe_callback_params
 {
-    struct native_callback_context_params params = { NULL, NULL };
+    void *func;
+    ULONG argc;
+    ULONG_PTR args[SWITCHYARD_PE_CALLBACK_MAX_ARGS];
+};
 
+C_ASSERT( FIELD_OFFSET( struct switchyard_pe_callback_params, func ) == SWITCHYARD_PE_CALLBACK_FUNC_OFFSET );
+C_ASSERT( FIELD_OFFSET( struct switchyard_pe_callback_params, argc ) == SWITCHYARD_PE_CALLBACK_ARGC_OFFSET );
+C_ASSERT( FIELD_OFFSET( struct switchyard_pe_callback_params, args ) == SWITCHYARD_PE_CALLBACK_ARGS_OFFSET );
+
+struct switchyard_pe_callback_scope
+{
+    void *pthread_teb;
+    DWORD *native_callback_depth;
+    BOOL restore_native_depth;
+    BOOL left;
+};
+
+static BOOL switchyard_get_native_callback_context( TEB **teb, void **pthread_teb, DWORD **native_callback_depth )
+{
+    struct native_callback_context_params params = { NULL, NULL, NULL };
+
+    *teb = NULL;
     *pthread_teb = NULL;
     *native_callback_depth = NULL;
-    if (WINE_UNIX_CALL( unix_get_native_callback_context, &params )) return FALSE;
-    if (!params.pthread_teb || !params.native_callback_depth) return FALSE;
+    if (!__wine_unixlib_handle || !__wine_unix_call_dispatcher) return FALSE;
+    if (__wine_unix_call_dispatcher( __wine_unixlib_handle, unix_get_native_callback_context, &params ))
+        return FALSE;
+    if (!params.teb || !params.pthread_teb || !params.native_callback_depth) return FALSE;
 
+    *teb = params.teb;
     *pthread_teb = params.pthread_teb;
     *native_callback_depth = params.native_callback_depth;
     return TRUE;
@@ -3500,13 +3532,42 @@ static void CALLBACK switchyard_leave_native_callback( BOOL normal, void *ctx )
                                    scope->pthread_teb : scope->teb );
 }
 
+static BOOL switchyard_enter_native_callback_scope( struct switchyard_native_callback_scope *scope )
+{
+    TEB *teb;
+    void *pthread_teb;
+    DWORD *native_callback_depth;
+
+    if (!switchyard_get_native_callback_context( &teb, &pthread_teb, &native_callback_depth ))
+        return FALSE;
+
+    scope->teb = teb;
+    scope->pthread_teb = pthread_teb;
+    scope->native_callback_depth = native_callback_depth;
+    scope->left = FALSE;
+    ++*native_callback_depth;
+    return TRUE;
+}
+
+static void CALLBACK switchyard_leave_pe_callback( BOOL normal, void *ctx )
+{
+    struct switchyard_pe_callback_scope *scope = ctx;
+
+    (void)normal;
+    if (scope->left) return;
+    scope->left = TRUE;
+    if (scope->restore_native_depth && scope->native_callback_depth)
+        ++*scope->native_callback_depth;
+    switchyard_set_macos_tsd_base( scope->pthread_teb );
+}
+
 static ULONG_PTR WINAPI switchyard_native_callback3_on_user_stack( void *func, ULONG_PTR arg0,
                                                                    ULONG_PTR arg1, ULONG_PTR arg2,
-                                                                   void *pthread_teb,
+                                                                   TEB *teb, void *pthread_teb,
                                                                    DWORD *native_callback_depth )
 {
     typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
-    struct switchyard_native_callback_scope scope = { NtCurrentTeb(), pthread_teb, native_callback_depth, FALSE };
+    struct switchyard_native_callback_scope scope = { teb, pthread_teb, native_callback_depth, FALSE };
     struct switchyard_native_callback_exception_context exception =
     {
         func,
@@ -3538,11 +3599,11 @@ static ULONG_PTR WINAPI switchyard_native_callback3_on_user_stack( void *func, U
 
 static ULONG_PTR WINAPI switchyard_native_callback4_on_user_stack( void *func, ULONG_PTR arg0,
                                                                    ULONG_PTR arg1, ULONG_PTR arg2,
-                                                                   ULONG_PTR arg3, void *pthread_teb,
-                                                                   DWORD *native_callback_depth )
+                                                                   ULONG_PTR arg3, TEB *teb,
+                                                                   void *pthread_teb, DWORD *native_callback_depth )
 {
     typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
-    struct switchyard_native_callback_scope scope = { NtCurrentTeb(), pthread_teb, native_callback_depth, FALSE };
+    struct switchyard_native_callback_scope scope = { teb, pthread_teb, native_callback_depth, FALSE };
     struct switchyard_native_callback_exception_context exception =
     {
         func,
@@ -3572,17 +3633,98 @@ static ULONG_PTR WINAPI switchyard_native_callback4_on_user_stack( void *func, U
     return ret;
 }
 
+static ULONG_PTR switchyard_call_pe_callback( const struct switchyard_pe_callback_params *params )
+{
+    typedef ULONG_PTR (WINAPI *pe_callback_func0)(void);
+    typedef ULONG_PTR (WINAPI *pe_callback_func1)(ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *pe_callback_func2)(ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *pe_callback_func3)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *pe_callback_func4)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *pe_callback_func5)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                  ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *pe_callback_func6)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                  ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *pe_callback_func7)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                  ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *pe_callback_func8)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                  ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *pe_callback_func9)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                  ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                  ULONG_PTR);
+    const ULONG_PTR *args = params->args;
+
+    switch (params->argc)
+    {
+    case 0:
+        return ((pe_callback_func0)params->func)();
+    case 1:
+        return ((pe_callback_func1)params->func)( args[0] );
+    case 2:
+        return ((pe_callback_func2)params->func)( args[0], args[1] );
+    case 3:
+        return ((pe_callback_func3)params->func)( args[0], args[1], args[2] );
+    case 4:
+        return ((pe_callback_func4)params->func)( args[0], args[1], args[2], args[3] );
+    case 5:
+        return ((pe_callback_func5)params->func)( args[0], args[1], args[2], args[3],
+                                                  args[4] );
+    case 6:
+        return ((pe_callback_func6)params->func)( args[0], args[1], args[2], args[3],
+                                                  args[4], args[5] );
+    case 7:
+        return ((pe_callback_func7)params->func)( args[0], args[1], args[2], args[3],
+                                                  args[4], args[5], args[6] );
+    case 8:
+        return ((pe_callback_func8)params->func)( args[0], args[1], args[2], args[3],
+                                                  args[4], args[5], args[6], args[7] );
+    case 9:
+        return ((pe_callback_func9)params->func)( args[0], args[1], args[2], args[3],
+                                                  args[4], args[5], args[6], args[7],
+                                                  args[8] );
+    default:
+        return 0;
+    }
+}
+
+static ULONG_PTR WINAPI pe_callback_bridge( struct switchyard_pe_callback_params *params )
+{
+    struct switchyard_pe_callback_scope scope;
+    TEB *teb;
+    void *pthread_teb;
+    DWORD *native_callback_depth;
+    ULONG_PTR ret = 0;
+
+    if (!params || !switchyard_get_native_callback_context( &teb, &pthread_teb, &native_callback_depth ))
+        return 0;
+
+    switchyard_set_macos_tsd_base( teb );
+    scope.pthread_teb = pthread_teb;
+    scope.native_callback_depth = native_callback_depth;
+    scope.restore_native_depth = native_callback_depth && *native_callback_depth;
+    scope.left = FALSE;
+    if (scope.restore_native_depth) --*native_callback_depth;
+
+    __TRY
+    {
+        ret = switchyard_call_pe_callback( params );
+    }
+    __FINALLY_CTX( switchyard_leave_pe_callback, &scope )
+
+    return ret;
+}
+
 static ULONG_PTR WINAPI native_callback_bridge3( void *func, ULONG_PTR arg0,
                                                  ULONG_PTR arg1, ULONG_PTR arg2 )
 {
+    TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
     struct native_callback_params params = { func, { arg0, arg1, arg2, 0 }, 0 };
     NTSTATUS status;
 
-    if (func && switchyard_get_native_callback_context( &pthread_teb, &native_callback_depth ))
+    if (func && switchyard_get_native_callback_context( &teb, &pthread_teb, &native_callback_depth ))
         return switchyard_native_callback3_on_user_stack( func, arg0, arg1, arg2,
-                                                          pthread_teb, native_callback_depth );
+                                                          teb, pthread_teb, native_callback_depth );
 
     status = WINE_UNIX_CALL( unix_call_native_callback3, &params );
     if (status) WARN( "native callback3 bridge failed, status %#lx\n", status );
@@ -3593,14 +3735,15 @@ static ULONG_PTR WINAPI native_callback_bridge4( void *func, ULONG_PTR arg0,
                                                  ULONG_PTR arg1, ULONG_PTR arg2,
                                                  ULONG_PTR arg3 )
 {
+    TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
     struct native_callback_params params = { func, { arg0, arg1, arg2, arg3 }, 0 };
     NTSTATUS status;
 
-    if (func && switchyard_get_native_callback_context( &pthread_teb, &native_callback_depth ))
+    if (func && switchyard_get_native_callback_context( &teb, &pthread_teb, &native_callback_depth ))
         return switchyard_native_callback4_on_user_stack( func, arg0, arg1, arg2, arg3,
-                                                          pthread_teb, native_callback_depth );
+                                                          teb, pthread_teb, native_callback_depth );
 
     status = WINE_UNIX_CALL( unix_call_native_callback4, &params );
     if (status) WARN( "native callback4 bridge failed, status %#lx\n", status );
@@ -3624,6 +3767,24 @@ static BOOL is_native_callback_thunk( const void *ptr )
     __TRY
     {
         ret = !memcmp( code, native_callback_thunk_marker, sizeof(native_callback_thunk_marker) );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        ret = FALSE;
+    }
+    __ENDTRY
+
+    return ret;
+}
+
+static BOOL is_pe_callback_thunk( const void *ptr )
+{
+    const BYTE *code = ptr;
+    BOOL ret = FALSE;
+
+    __TRY
+    {
+        ret = !memcmp( code, pe_callback_thunk_marker, sizeof(pe_callback_thunk_marker) );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -3666,6 +3827,54 @@ static BYTE *alloc_native_callback_thunk( SIZE_T size )
     return ret;
 }
 
+static BYTE *emit_mov_imm64_rax( BYTE *code, const void *value )
+{
+    *code++ = 0x48;
+    *code++ = 0xb8;       /* movabs value,%rax */
+    memcpy( code, &value, sizeof(value) );
+    return code + sizeof(value);
+}
+
+static BYTE *emit_mov_rax_rsp_disp( BYTE *code, unsigned int disp )
+{
+    *code++ = 0x48;
+    *code++ = 0x89;       /* mov %rax,disp(%rsp) */
+    if (disp <= 0x7f)
+    {
+        *code++ = 0x44;
+        *code++ = 0x24;
+        *code++ = disp;
+    }
+    else
+    {
+        *code++ = 0x84;
+        *code++ = 0x24;
+        memcpy( code, &disp, sizeof(disp) );
+        code += sizeof(disp);
+    }
+    return code;
+}
+
+static BYTE *emit_mov_rsp_disp_rax( BYTE *code, unsigned int disp )
+{
+    *code++ = 0x48;
+    *code++ = 0x8b;       /* mov disp(%rsp),%rax */
+    if (disp <= 0x7f)
+    {
+        *code++ = 0x44;
+        *code++ = 0x24;
+        *code++ = disp;
+    }
+    else
+    {
+        *code++ = 0x84;
+        *code++ = 0x24;
+        memcpy( code, &disp, sizeof(disp) );
+        code += sizeof(disp);
+    }
+    return code;
+}
+
 static BYTE *emit_native_callback_common( BYTE *code, void *func, void *bridge )
 {
     static const BYTE shift_args[] =
@@ -3686,6 +3895,83 @@ static BYTE *emit_native_callback_common( BYTE *code, void *func, void *bridge )
     code += sizeof(bridge);
     *code++ = 0xff;
     *code++ = 0xd0;       /* call *%rax */
+    return code;
+}
+
+static BYTE *emit_pe_callback_reg_arg( BYTE *code, unsigned int arg, unsigned int disp )
+{
+    static const BYTE arg0[] = { 0x48, 0x89, 0x4c, 0x24 }; /* mov %rcx,disp(%rsp) */
+    static const BYTE arg1[] = { 0x48, 0x89, 0x54, 0x24 }; /* mov %rdx,disp(%rsp) */
+    static const BYTE arg2[] = { 0x4c, 0x89, 0x44, 0x24 }; /* mov %r8,disp(%rsp) */
+    static const BYTE arg3[] = { 0x4c, 0x89, 0x4c, 0x24 }; /* mov %r9,disp(%rsp) */
+    const BYTE *op = arg == 0 ? arg0 : arg == 1 ? arg1 : arg == 2 ? arg2 : arg3;
+
+    memcpy( code, op, sizeof(arg0) );
+    code += sizeof(arg0);
+    *code++ = disp;
+    return code;
+}
+
+static void *create_pe_callback_thunk( void *func, unsigned int argc )
+{
+    BYTE *code, *p;
+    unsigned int i;
+    SIZE_T size = 240;
+
+    if (argc > SWITCHYARD_PE_CALLBACK_MAX_ARGS) return NULL;
+    if (!(code = alloc_native_callback_thunk( size ))) return NULL;
+
+    p = code;
+    memcpy( p, pe_callback_thunk_marker, sizeof(pe_callback_thunk_marker) );
+    p += sizeof(pe_callback_thunk_marker);
+
+    *p++ = 0x48;
+    *p++ = 0x81;
+    *p++ = 0xec;          /* sub $SWITCHYARD_PE_CALLBACK_FRAME_SIZE,%rsp */
+    i = SWITCHYARD_PE_CALLBACK_FRAME_SIZE;
+    memcpy( p, &i, sizeof(i) );
+    p += sizeof(i);
+
+    p = emit_mov_imm64_rax( p, func );
+    p = emit_mov_rax_rsp_disp( p, SWITCHYARD_PE_CALLBACK_PARAMS_OFFSET +
+                                  SWITCHYARD_PE_CALLBACK_FUNC_OFFSET );
+
+    *p++ = 0xc7;
+    *p++ = 0x44;
+    *p++ = 0x24;
+    *p++ = SWITCHYARD_PE_CALLBACK_PARAMS_OFFSET + SWITCHYARD_PE_CALLBACK_ARGC_OFFSET;
+    memcpy( p, &argc, sizeof(argc) );
+    p += sizeof(argc);
+
+    for (i = 0; i < min( argc, 4 ); ++i)
+        p = emit_pe_callback_reg_arg( p, i, SWITCHYARD_PE_CALLBACK_PARAMS_OFFSET +
+                                      SWITCHYARD_PE_CALLBACK_ARGS_OFFSET + i * sizeof(ULONG_PTR) );
+
+    for (i = 4; i < argc; ++i)
+    {
+        p = emit_mov_rsp_disp_rax( p, SWITCHYARD_PE_CALLBACK_FRAME_SIZE + 0x28 +
+                                      (i - 4) * sizeof(ULONG_PTR) );
+        p = emit_mov_rax_rsp_disp( p, SWITCHYARD_PE_CALLBACK_PARAMS_OFFSET +
+                                      SWITCHYARD_PE_CALLBACK_ARGS_OFFSET + i * sizeof(ULONG_PTR) );
+    }
+
+    *p++ = 0x48;
+    *p++ = 0x8d;
+    *p++ = 0x4c;
+    *p++ = 0x24;
+    *p++ = SWITCHYARD_PE_CALLBACK_PARAMS_OFFSET; /* lea params,%rcx */
+    p = emit_mov_imm64_rax( p, pe_callback_bridge );
+    *p++ = 0xff;
+    *p++ = 0xd0;          /* call *%rax */
+
+    *p++ = 0x48;
+    *p++ = 0x81;
+    *p++ = 0xc4;          /* add $SWITCHYARD_PE_CALLBACK_FRAME_SIZE,%rsp */
+    i = SWITCHYARD_PE_CALLBACK_FRAME_SIZE;
+    memcpy( p, &i, sizeof(i) );
+    p += sizeof(i);
+    *p++ = 0xc3;          /* ret */
+
     return code;
 }
 
@@ -3740,12 +4026,39 @@ static BOOL is_native_callback_target( void *func )
 {
     void *module;
 
-    return func && !is_native_callback_thunk( func ) && !RtlPcToFileHeader( func, &module );
+    return func && !is_native_callback_thunk( func ) && !is_pe_callback_thunk( func ) &&
+           !RtlPcToFileHeader( func, &module );
 }
 
 static BOOL is_native_callback_target_or_thunk( void *func )
 {
     return is_native_callback_thunk( func ) || is_native_callback_target( func );
+}
+
+static BOOL is_pe_callback_target( void *func )
+{
+    void *entry_module;
+
+    return func && !is_native_callback_thunk( func ) && !is_pe_callback_thunk( func ) &&
+           RtlPcToFileHeader( func, &entry_module );
+}
+
+static BOOL is_pe_callback_target_in_module( void *func, void *module )
+{
+    void *entry_module;
+
+    return func && !is_native_callback_thunk( func ) && !is_pe_callback_thunk( func ) &&
+           RtlPcToFileHeader( func, &entry_module ) && entry_module == module;
+}
+
+static BOOL is_pe_callback_target_or_thunk( void *func )
+{
+    return is_pe_callback_thunk( func ) || is_pe_callback_target( func );
+}
+
+static BOOL is_pe_callback_target_or_thunk_in_module( void *func, void *module )
+{
+    return is_pe_callback_thunk( func ) || is_pe_callback_target_in_module( func, module );
 }
 
 static void wrap_native_callback_entry( void **slot, unsigned int argc )
@@ -3784,7 +4097,64 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
     __ENDTRY
 }
 
+static void *prepare_pe_callback_table( unsigned int code, void *args, void **storage, SIZE_T storage_count )
+{
+    static const unsigned char argc[SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES] =
+    {
+        6, 6, 5, 9, 1, 4, 2, 4, 2, 2, 6, 7, 1, 3, 3, 5, 2, 6, 1, 1, 1, 1,
+        4, 7, 6, 3, 2, 1, 1, 2, 2, 3, 0, 3, 4, 3,
+        4, 3, 1, 1, 3, SWITCHYARD_PE_CALLBACK_SKIP, SWITCHYARD_PE_CALLBACK_SKIP
+    };
+    void **table = args;
+    void *module;
+    unsigned int i;
+
+    if (code != 1 || !args || storage_count < SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES ||
+        !RtlPcToFileHeader( args, &module ))
+        return args;
+
+    __TRY
+    {
+        if (!is_pe_callback_target_or_thunk_in_module( table[0], module ) ||
+            !is_pe_callback_target_or_thunk_in_module( table[5], module ) ||
+            !is_pe_callback_target_or_thunk( table[27] ) ||
+            !is_pe_callback_target_or_thunk_in_module( table[28], module ) ||
+            !is_pe_callback_target_or_thunk_in_module( table[40], module ) ||
+            !table[41] || table[42] != (void *)0x1000000)
+            return args;
+
+        memcpy( storage, table, ARRAY_SIZE(argc) * sizeof(*storage) );
+        for (i = 0; i < ARRAY_SIZE(argc); ++i)
+        {
+            void *func, *thunk;
+
+            if (argc[i] == SWITCHYARD_PE_CALLBACK_SKIP) continue;
+            func = storage[i];
+            if (!is_pe_callback_target( func )) continue;
+            if (!(thunk = create_pe_callback_thunk( func, argc[i] ))) continue;
+            storage[i] = thunk;
+            TRACE( "bridging native-to-PE Win32 callback table entry %u target %p argc %u thunk %p\n",
+                   i, func, argc[i], thunk );
+        }
+        return storage;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+
+    return args;
+}
+
 #else
+
+static void *prepare_pe_callback_table( unsigned int code, void *args, void **storage, SIZE_T storage_count )
+{
+    (void)code;
+    (void)storage;
+    (void)storage_count;
+    return args;
+}
 
 static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS status )
 {
@@ -3801,7 +4171,25 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
  */
 NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args )
 {
-    NTSTATUS status = __wine_unix_call_dispatcher( handle, code, args );
+    void *pe_callback_storage[SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES];
+    void *dispatch_args = prepare_pe_callback_table( code, args, pe_callback_storage,
+                                                     ARRAY_SIZE(pe_callback_storage) );
+#ifdef _WIN64
+    struct switchyard_native_callback_scope scope;
+    NTSTATUS status;
+
+    if (switchyard_enter_native_callback_scope( &scope ))
+    {
+        __TRY
+        {
+            status = __wine_unix_call_dispatcher( handle, code, dispatch_args );
+        }
+        __FINALLY_CTX( switchyard_leave_native_callback, &scope )
+    }
+    else status = __wine_unix_call_dispatcher( handle, code, dispatch_args );
+#else
+    NTSTATUS status = __wine_unix_call_dispatcher( handle, code, dispatch_args );
+#endif
 
     wrap_native_callback_table( code, args, status );
     return status;
