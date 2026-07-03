@@ -891,38 +891,40 @@ static void update_visible_region( struct dce *dce )
     if (dce->clip_rgn) NtGdiCombineRgn( vis_rgn, vis_rgn, dce->clip_rgn,
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
-    /* don't use a surface to paint the client area of OpenGL windows */
-    if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW))
+    if (is_chromium_cef_child_window(dce->hwnd))
     {
-        if (is_chromium_cef_child_window(dce->hwnd))
+        win = get_win_ptr( dce->hwnd );
+        if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
         {
-            win = get_win_ptr( dce->hwnd );
-            if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+            surface = win->surface;
+            if (surface && surface != &dummy_surface)
             {
-                surface = win->surface;
-                if (surface && surface != &dummy_surface)
-                {
-                    window_surface_add_ref( surface );
-                    top_rect = win_rect;
-                    TRACE( "using current Chromium/CEF child surface %p for hwnd %p instead of top window %p\n",
-                           surface, dce->hwnd, top_win );
-                }
-                else surface = NULL;
-                release_win_ptr( win );
+                window_surface_add_ref( surface );
+                surface->flush_on_unlock = TRUE;
+                top_rect = win_rect;
+                TRACE( "using current Chromium/CEF child surface %p for hwnd %p instead of top window %p\n",
+                       surface, dce->hwnd, top_win );
             }
-        }
-
-        if (!surface)
-        {
-            win = get_win_ptr( top_win );
-            if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
-            {
-                surface = win->surface;
-                if (surface) window_surface_add_ref( surface );
-                release_win_ptr( win );
-            }
+            else surface = NULL;
+            release_win_ptr( win );
         }
     }
+
+    /* don't use a surface to paint the client area of OpenGL windows */
+    if (!surface && (!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW)))
+    {
+        win = get_win_ptr( top_win );
+        if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+        {
+            surface = win->surface;
+            if (surface) window_surface_add_ref( surface );
+            release_win_ptr( win );
+        }
+    }
+
+    if (is_chromium_cef_child_window(dce->hwnd) && !surface)
+        TRACE( "Chromium/CEF child hwnd %p has no current surface for DCE %p\n",
+               dce->hwnd, dce->hdc );
 
     if (!surface) SetRectEmpty( &top_rect );
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
