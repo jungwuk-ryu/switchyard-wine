@@ -166,6 +166,34 @@ static void constrain_window_frame(CGPoint* origin, CGSize* size)
     }
 }
 
+/***********************************************************************
+ *              keep_window_frame_on_desktop
+ *
+ * Bring normal-sized top-level windows back to the visible desktop if an
+ * application supplied sentinel or otherwise nonsensical offscreen placement.
+ */
+static void keep_window_frame_on_desktop(CGPoint *origin, const CGSize *size)
+{
+    CGRect desktop_rect = macdrv_get_desktop_rect();
+    CGRect frame;
+
+    if (!origin || !size || size->width < 1 || size->height < 1)
+        return;
+    if (CGRectGetWidth(desktop_rect) < 1 || CGRectGetHeight(desktop_rect) < 1)
+        return;
+    if (size->width > CGRectGetWidth(desktop_rect) || size->height > CGRectGetHeight(desktop_rect))
+        return;
+
+    frame = CGRectMake(origin->x, origin->y, size->width, size->height);
+    if (CGRectIntersectsRect(frame, desktop_rect))
+        return;
+
+    origin->x = CGRectGetMinX(desktop_rect) + (CGRectGetWidth(desktop_rect) - size->width) / 2;
+    origin->y = CGRectGetMinY(desktop_rect) + (CGRectGetHeight(desktop_rect) - size->height) / 2;
+    TRACE("Switchyard centered off-desktop window frame %s on desktop %s\n",
+          wine_dbgstr_cgrect(frame), wine_dbgstr_cgrect(desktop_rect));
+}
+
 
 /***********************************************************************
  *              alloc_win_data
@@ -478,6 +506,7 @@ static void create_cocoa_window(struct macdrv_win_data *data)
     constrain_window_frame(&frame.origin, &frame.size);
     if (frame.size.width < 1 || frame.size.height < 1)
         frame.size.width = frame.size.height = 1;
+    keep_window_frame_on_desktop(&frame.origin, &frame.size);
 
     TRACE("creating %p window %s whole %s client %s\n", data->hwnd, wine_dbgstr_rect(&data->rects.window),
           wine_dbgstr_rect(&data->rects.visible), wine_dbgstr_rect(&data->rects.client));
@@ -761,6 +790,8 @@ static void sync_window_position(struct macdrv_win_data *data, UINT swp_flags, c
         constrain_window_frame(&frame.origin, &frame.size);
         if (frame.size.width < 1 || frame.size.height < 1)
             frame.size.width = frame.size.height = 1;
+        if (!(swp_flags & SWP_HIDEWINDOW))
+            keep_window_frame_on_desktop(&frame.origin, &frame.size);
 
         macdrv_set_cocoa_window_frame(data->cocoa_window, &frame);
     }
