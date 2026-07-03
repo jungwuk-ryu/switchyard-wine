@@ -893,7 +893,7 @@ static void update_visible_region( struct dce *dce )
     /* don't use a surface to paint the client area of OpenGL windows */
     if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW))
     {
-        if (top_win != dce->hwnd && is_chromium_cef_child_window(dce->hwnd))
+        if (is_chromium_cef_child_window(dce->hwnd))
         {
             win = get_win_ptr( dce->hwnd );
             if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
@@ -903,7 +903,7 @@ static void update_visible_region( struct dce *dce )
                 {
                     window_surface_add_ref( surface );
                     top_rect = win_rect;
-                    TRACE( "using Chromium/CEF child surface %p for hwnd %p instead of top window %p\n",
+                    TRACE( "using current Chromium/CEF child surface %p for hwnd %p instead of top window %p\n",
                            surface, dce->hwnd, top_win );
                 }
                 else surface = NULL;
