@@ -277,6 +277,18 @@ NTSTATUS unixcall_wine_dbg_write( void *args )
     return write( 2, params->str, params->len );
 }
 
+/***********************************************************************
+ *		unixcall_get_current_teb
+ */
+NTSTATUS unixcall_get_current_teb( void *args )
+{
+    struct current_teb_params *params = args;
+    struct thread_data *data = get_thread_data();
+
+    params->teb = data ? data->teb : NULL;
+    return params->teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 #ifdef _WIN64
 /***********************************************************************
  *		wow64_wine_dbg_write
@@ -290,6 +302,22 @@ NTSTATUS wow64_wine_dbg_write( void *args )
     } const *params32 = args;
 
     return write( 2, ULongToPtr(params32->str), params32->len );
+}
+
+/***********************************************************************
+ *		wow64_get_current_teb
+ */
+NTSTATUS wow64_get_current_teb( void *args )
+{
+    struct
+    {
+        ULONG teb;
+    } *params32 = args;
+    struct thread_data *data = get_thread_data();
+    void *teb = data ? get_wow_teb( data->teb ) : NULL;
+
+    params32->teb = PtrToUlong( teb );
+    return teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 #endif
 

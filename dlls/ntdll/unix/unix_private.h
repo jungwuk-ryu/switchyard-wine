@@ -397,12 +397,14 @@ extern void set_async_direct_result( HANDLE *async_handle, unsigned int options,
                                      NTSTATUS status, ULONG_PTR information, BOOL mark_pending );
 
 extern NTSTATUS unixcall_wine_dbg_write( void *args );
+extern NTSTATUS unixcall_get_current_teb( void *args );
 extern NTSTATUS unixcall_wine_server_call( void *args );
 extern NTSTATUS unixcall_wine_server_fd_to_handle( void *args );
 extern NTSTATUS unixcall_wine_server_handle_to_fd( void *args );
 extern NTSTATUS unixcall_wine_spawnvp( void *args );
 #ifdef _WIN64
 extern NTSTATUS wow64_wine_dbg_write( void *args );
+extern NTSTATUS wow64_get_current_teb( void *args );
 extern NTSTATUS wow64_wine_server_call( void *args );
 extern NTSTATUS wow64_wine_server_fd_to_handle( void *args );
 extern NTSTATUS wow64_wine_server_handle_to_fd( void *args );

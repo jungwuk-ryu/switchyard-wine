@@ -49,11 +49,30 @@ C_ASSERT( sizeof(struct debug_info) == 0x800 );
 
 static int nb_debug_options;
 static struct __wine_debug_channel *debug_options;
+static struct debug_info fallback_debug_info;
+
+static inline TEB *get_debug_teb(void)
+{
+    TEB *teb = NtCurrentTeb();
+
+#ifdef _WIN64
+    if (!teb)
+    {
+        struct current_teb_params params = { NULL };
+
+        if (!WINE_UNIX_CALL( unix_get_current_teb, &params )) teb = params.teb;
+    }
+#endif
+    return teb;
+}
 
 static inline struct debug_info *get_info(void)
 {
 #ifdef _WIN64
-    return (struct debug_info *)((TEB32 *)((char *)NtCurrentTeb() + 0x2000) + 1);
+    TEB *teb = get_debug_teb();
+
+    if (!teb) return &fallback_debug_info;
+    return (struct debug_info *)((TEB32 *)((char *)teb + 0x2000) + 1);
 #else
     return (struct debug_info *)(NtCurrentTeb() + 1);
 #endif
@@ -62,8 +81,10 @@ static inline struct debug_info *get_info(void)
 static void init_options(void)
 {
     unsigned int offset = page_size * (sizeof(void *) / 4);
+    TEB *teb = get_debug_teb();
 
-    debug_options = (struct __wine_debug_channel *)((char *)NtCurrentTeb()->Peb + offset);
+    if (!teb) return;
+    debug_options = (struct __wine_debug_channel *)((char *)teb->Peb + offset);
     while (debug_options[nb_debug_options].name[0]) nb_debug_options++;
 }
 
@@ -96,6 +117,7 @@ unsigned char __cdecl __wine_dbg_get_channel_flags( struct __wine_debug_channel 
     if (!(channel->flags & (1 << __WINE_DBCL_INIT))) return channel->flags;
 
     if (!debug_options) init_options();
+    if (!debug_options) return 0;
 
     flags = debug_options[nb_debug_options].flags;
     min = 0;
@@ -139,10 +161,13 @@ int __cdecl __wine_dbg_header( enum __wine_debug_class cls, struct __wine_debug_
                                const char *function )
 {
     static const char * const classes[] = { "fixme", "err", "warn", "trace" };
-    struct debug_info *info = get_info();
-    char *pos = info->output;
+    struct debug_info *info;
+    char *pos;
 
     if (!(__wine_dbg_get_channel_flags( channel ) & (1 << cls))) return -1;
+
+    info = get_info();
+    pos = info->output;
 
     /* only print header if we are at the beginning of the line */
     if (info->out_pos) return 0;
