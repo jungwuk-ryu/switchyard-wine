@@ -3518,6 +3518,45 @@ static BOOL switchyard_get_native_callback_context( TEB **teb, void **pthread_te
     return TRUE;
 }
 
+static BOOL switchyard_find_pe_module_nolock( const void *addr, void **module )
+{
+    const char *pc = addr;
+    TEB *teb = NtCurrentTeb();
+    PEB_LDR_DATA *ldr;
+    LIST_ENTRY *mark, *entry;
+    BOOL found = FALSE;
+
+    if (module) *module = NULL;
+    if (!pc || !teb || !teb->Peb || !(ldr = teb->Peb->LdrData)) return FALSE;
+
+    __TRY
+    {
+        mark = &ldr->InMemoryOrderModuleList;
+        for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+        {
+            LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY,
+                                                           InMemoryOrderLinks );
+            const char *base = mod->DllBase;
+            SIZE_T size = mod->SizeOfImage;
+
+            if (pc >= base && pc < base + size)
+            {
+                if (module) *module = mod->DllBase;
+                found = TRUE;
+                break;
+            }
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        if (module) *module = NULL;
+        found = FALSE;
+    }
+    __ENDTRY
+
+    return found;
+}
+
 struct switchyard_native_callback_exception_context
 {
     void *func;
@@ -3528,13 +3567,12 @@ struct switchyard_native_callback_exception_context
 static LONG switchyard_native_callback_exception_filter( EXCEPTION_POINTERS *ptr, void *ctx )
 {
     struct switchyard_native_callback_exception_context *exception = ctx;
-    void *module;
 
     if (!ptr || !ptr->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
 
     switchyard_set_macos_tsd_base( exception->scope->teb );
 
-    if (RtlPcToFileHeader( ptr->ExceptionRecord->ExceptionAddress, &module ))
+    if (switchyard_find_pe_module_nolock( ptr->ExceptionRecord->ExceptionAddress, NULL ))
         return EXCEPTION_CONTINUE_SEARCH;
 
     exception->ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
@@ -4543,10 +4581,8 @@ static void *create_native_callback_thunk( void *func, unsigned int argc, ULONG 
 
 static BOOL is_native_callback_target( void *func )
 {
-    void *module;
-
     return func && !is_native_callback_thunk( func ) && !is_pe_callback_thunk( func ) &&
-           !RtlPcToFileHeader( func, &module );
+           !switchyard_find_pe_module_nolock( func, NULL );
 }
 
 static BOOL is_native_callback_target_or_thunk( void *func )
@@ -4556,10 +4592,10 @@ static BOOL is_native_callback_target_or_thunk( void *func )
 
 static BOOL is_pe_callback_target( void *func )
 {
-    void *entry_module;
+    void *module;
 
     return func && !is_native_callback_thunk( func ) && !is_pe_callback_thunk( func ) &&
-           RtlPcToFileHeader( func, &entry_module );
+           switchyard_find_pe_module_nolock( func, &module );
 }
 
 static BOOL is_pe_callback_target_in_module( void *func, void *module )
@@ -4567,7 +4603,7 @@ static BOOL is_pe_callback_target_in_module( void *func, void *module )
     void *entry_module;
 
     return func && !is_native_callback_thunk( func ) && !is_pe_callback_thunk( func ) &&
-           RtlPcToFileHeader( func, &entry_module ) && entry_module == module;
+           switchyard_find_pe_module_nolock( func, &entry_module ) && entry_module == module;
 }
 
 static BOOL is_pe_callback_target_or_thunk( void *func )
@@ -4642,7 +4678,7 @@ static void *prepare_pe_callback_table( unsigned int code, void *args, void **st
     unsigned int i;
 
     if (code != 1 || !args || storage_count < SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES ||
-        !RtlPcToFileHeader( args, &module ))
+        !switchyard_find_pe_module_nolock( args, &module ))
         return args;
 
     __TRY
