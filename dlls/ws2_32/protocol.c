@@ -23,6 +23,7 @@
  */
 
 #include "ws2_32_private.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(winsock);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
@@ -2088,15 +2089,296 @@ int WINAPI WSAGetServiceClassNameByClassIdW( GUID *class, WCHAR *service, DWORD 
     return -1;
 }
 
+struct lookup_service
+{
+    struct list entry;
+    DWORD flags;
+    BOOL returned;
+};
+
+DECLARE_CRITICAL_SECTION( lookup_service_cs );
+static struct list lookup_services = LIST_INIT( lookup_services );
+
+static BOOL lookup_service_query_supportedA( const WSAQUERYSETA *query )
+{
+    if (query->dwSize < sizeof(*query))
+    {
+        SetLastError( WSAEINVAL );
+        return FALSE;
+    }
+
+    if (query->dwNameSpace != NS_ALL && query->dwNameSpace != NS_NLA)
+    {
+        SetLastError( WSASERVICE_NOT_FOUND );
+        return FALSE;
+    }
+
+    if (query->lpszServiceInstanceName || query->lpServiceClassId || query->lpVersion ||
+        query->lpszComment || query->lpNSProviderId || query->lpszContext ||
+        query->dwNumberOfProtocols || query->lpafpProtocols || query->lpszQueryString ||
+        query->dwNumberOfCsAddrs || query->lpcsaBuffer || query->lpBlob)
+    {
+        SetLastError( WSASERVICE_NOT_FOUND );
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOL lookup_service_query_supportedW( const WSAQUERYSETW *query )
+{
+    if (query->dwSize < sizeof(*query))
+    {
+        SetLastError( WSAEINVAL );
+        return FALSE;
+    }
+
+    if (query->dwNameSpace != NS_ALL && query->dwNameSpace != NS_NLA)
+    {
+        SetLastError( WSASERVICE_NOT_FOUND );
+        return FALSE;
+    }
+
+    if (query->lpszServiceInstanceName || query->lpServiceClassId || query->lpVersion ||
+        query->lpszComment || query->lpNSProviderId || query->lpszContext ||
+        query->dwNumberOfProtocols || query->lpafpProtocols || query->lpszQueryString ||
+        query->dwNumberOfCsAddrs || query->lpcsaBuffer || query->lpBlob)
+    {
+        SetLastError( WSASERVICE_NOT_FOUND );
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOL lookup_service_begin( DWORD flags, HANDLE *lookup )
+{
+    struct lookup_service *service;
+
+    if (!lookup)
+    {
+        SetLastError( WSAEFAULT );
+        return FALSE;
+    }
+    *lookup = NULL;
+
+    if (!(service = calloc( 1, sizeof(*service) )))
+    {
+        SetLastError( WSA_NOT_ENOUGH_MEMORY );
+        return FALSE;
+    }
+
+    service->flags = flags;
+    EnterCriticalSection( &lookup_service_cs );
+    list_add_tail( &lookup_services, &service->entry );
+    LeaveCriticalSection( &lookup_service_cs );
+    *lookup = service;
+    return TRUE;
+}
+
+static struct lookup_service *lookup_service_find( HANDLE lookup )
+{
+    struct lookup_service *service;
+
+    LIST_FOR_EACH_ENTRY( service, &lookup_services, struct lookup_service, entry )
+    {
+        if (service == lookup) return service;
+    }
+    return NULL;
+}
+
+static SIZE_T lookup_service_align_size( SIZE_T size )
+{
+    return (size + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
+}
+
+static DWORD lookup_service_blob_size(void)
+{
+    return FIELD_OFFSET( NLA_BLOB, data.connectivity ) + sizeof(((NLA_BLOB *)0)->data.connectivity);
+}
+
+static void lookup_service_fill_blob( BLOB *blob, NLA_BLOB *nla )
+{
+    DWORD blob_size = lookup_service_blob_size();
+
+    blob->cbSize = blob_size;
+    blob->pBlobData = (BYTE *)nla;
+    memset( nla, 0, blob_size );
+    nla->header.type = NLA_CONNECTIVITY;
+    nla->header.dwSize = blob_size;
+    nla->data.connectivity.type = NLA_NETWORK_UNKNOWN;
+    nla->data.connectivity.internet = NLA_INTERNET_YES;
+}
+
+static int lookup_service_nextW( HANDLE lookup, DWORD flags, DWORD *len, WSAQUERYSETW *results )
+{
+    static const WCHAR networkW[] = L"Wine Network";
+    struct lookup_service *service;
+    DWORD query_flags, name_size = sizeof(networkW), blob_size = lookup_service_blob_size();
+    SIZE_T offset, name_offset = 0, blob_offset = 0, nla_offset = 0, required;
+    WCHAR *name = NULL;
+    BLOB *blob = NULL;
+    NLA_BLOB *nla = NULL;
+
+    if (!len)
+    {
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+    EnterCriticalSection( &lookup_service_cs );
+    if (!(service = lookup_service_find( lookup )))
+    {
+        LeaveCriticalSection( &lookup_service_cs );
+        SetLastError( ERROR_INVALID_HANDLE );
+        return -1;
+    }
+    if (service->returned)
+    {
+        LeaveCriticalSection( &lookup_service_cs );
+        SetLastError( WSA_E_NO_MORE );
+        return -1;
+    }
+
+    query_flags = service->flags | flags;
+    offset = lookup_service_align_size( sizeof(*results) );
+
+    if (query_flags & LUP_RETURN_NAME)
+    {
+        name_offset = offset;
+        offset = lookup_service_align_size( offset + name_size );
+    }
+    if (query_flags & LUP_RETURN_BLOB)
+    {
+        blob_offset = offset;
+        offset = lookup_service_align_size( offset + sizeof(*blob) );
+        nla_offset = offset;
+        offset = lookup_service_align_size( offset + blob_size );
+    }
+
+    required = offset;
+    if (!results || *len < required)
+    {
+        *len = required;
+        LeaveCriticalSection( &lookup_service_cs );
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+
+    memset( results, 0, required );
+    results->dwSize = sizeof(*results);
+    results->dwNameSpace = NS_NLA;
+    if (query_flags & LUP_RETURN_NAME)
+    {
+        name = (WCHAR *)((char *)results + name_offset);
+        results->lpszServiceInstanceName = name;
+        memcpy( name, networkW, name_size );
+    }
+    if (query_flags & LUP_RETURN_BLOB)
+    {
+        blob = (BLOB *)((char *)results + blob_offset);
+        nla = (NLA_BLOB *)((char *)results + nla_offset);
+        results->lpBlob = blob;
+        lookup_service_fill_blob( blob, nla );
+    }
+
+    service->returned = TRUE;
+    LeaveCriticalSection( &lookup_service_cs );
+    return 0;
+}
+
+static int lookup_service_nextA( HANDLE lookup, DWORD flags, DWORD *len, WSAQUERYSETA *results )
+{
+    static const char networkA[] = "Wine Network";
+    struct lookup_service *service;
+    DWORD query_flags, name_size = sizeof(networkA), blob_size = lookup_service_blob_size();
+    SIZE_T offset, name_offset = 0, blob_offset = 0, nla_offset = 0, required;
+    char *name = NULL;
+    BLOB *blob = NULL;
+    NLA_BLOB *nla = NULL;
+
+    if (!len)
+    {
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+    EnterCriticalSection( &lookup_service_cs );
+    if (!(service = lookup_service_find( lookup )))
+    {
+        LeaveCriticalSection( &lookup_service_cs );
+        SetLastError( ERROR_INVALID_HANDLE );
+        return -1;
+    }
+    if (service->returned)
+    {
+        LeaveCriticalSection( &lookup_service_cs );
+        SetLastError( WSA_E_NO_MORE );
+        return -1;
+    }
+
+    query_flags = service->flags | flags;
+    offset = lookup_service_align_size( sizeof(*results) );
+
+    if (query_flags & LUP_RETURN_NAME)
+    {
+        name_offset = offset;
+        offset = lookup_service_align_size( offset + name_size );
+    }
+    if (query_flags & LUP_RETURN_BLOB)
+    {
+        blob_offset = offset;
+        offset = lookup_service_align_size( offset + sizeof(*blob) );
+        nla_offset = offset;
+        offset = lookup_service_align_size( offset + blob_size );
+    }
+
+    required = offset;
+    if (!results || *len < required)
+    {
+        *len = required;
+        LeaveCriticalSection( &lookup_service_cs );
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+
+    memset( results, 0, required );
+    results->dwSize = sizeof(*results);
+    results->dwNameSpace = NS_NLA;
+    if (query_flags & LUP_RETURN_NAME)
+    {
+        name = (char *)results + name_offset;
+        results->lpszServiceInstanceName = name;
+        memcpy( name, networkA, name_size );
+    }
+    if (query_flags & LUP_RETURN_BLOB)
+    {
+        blob = (BLOB *)((char *)results + blob_offset);
+        nla = (NLA_BLOB *)((char *)results + nla_offset);
+        results->lpBlob = blob;
+        lookup_service_fill_blob( blob, nla );
+    }
+
+    service->returned = TRUE;
+    LeaveCriticalSection( &lookup_service_cs );
+    return 0;
+}
+
 
 /***********************************************************************
  *      WSALookupServiceBeginA   (ws2_32.@)
  */
 int WINAPI WSALookupServiceBeginA( WSAQUERYSETA *query, DWORD flags, HANDLE *lookup )
 {
-    FIXME( "(%p %#lx %p) Stub!\n", query, flags, lookup );
-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
-    return -1;
+    TRACE( "(%p %#lx %p)\n", query, flags, lookup );
+
+    if (!query)
+    {
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+
+    if (!lookup_service_query_supportedA( query )) return -1;
+
+    return lookup_service_begin( flags, lookup ) ? 0 : -1;
 }
 
 
@@ -2105,9 +2387,17 @@ int WINAPI WSALookupServiceBeginA( WSAQUERYSETA *query, DWORD flags, HANDLE *loo
  */
 int WINAPI WSALookupServiceBeginW( WSAQUERYSETW *query, DWORD flags, HANDLE *lookup )
 {
-    FIXME( "(%p %#lx %p) Stub!\n", query, flags, lookup );
-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
-    return -1;
+    TRACE( "(%p %#lx %p)\n", query, flags, lookup );
+
+    if (!query)
+    {
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+
+    if (!lookup_service_query_supportedW( query )) return -1;
+
+    return lookup_service_begin( flags, lookup ) ? 0 : -1;
 }
 
 
@@ -2116,7 +2406,21 @@ int WINAPI WSALookupServiceBeginW( WSAQUERYSETW *query, DWORD flags, HANDLE *loo
  */
 int WINAPI WSALookupServiceEnd( HANDLE lookup )
 {
-    FIXME("(%p) Stub!\n", lookup );
+    struct lookup_service *service;
+
+    TRACE( "(%p)\n", lookup );
+
+    EnterCriticalSection( &lookup_service_cs );
+    if (!(service = lookup_service_find( lookup )))
+    {
+        LeaveCriticalSection( &lookup_service_cs );
+        SetLastError( ERROR_INVALID_HANDLE );
+        return -1;
+    }
+
+    list_remove( &service->entry );
+    LeaveCriticalSection( &lookup_service_cs );
+    free( service );
     return 0;
 }
 
@@ -2126,9 +2430,8 @@ int WINAPI WSALookupServiceEnd( HANDLE lookup )
  */
 int WINAPI WSALookupServiceNextA( HANDLE lookup, DWORD flags, DWORD *len, WSAQUERYSETA *results )
 {
-    FIXME( "(%p %#lx %p %p) Stub!\n", lookup, flags, len, results );
-    SetLastError( WSA_E_NO_MORE );
-    return -1;
+    TRACE( "(%p %#lx %p %p)\n", lookup, flags, len, results );
+    return lookup_service_nextA( lookup, flags, len, results );
 }
 
 
@@ -2137,9 +2440,8 @@ int WINAPI WSALookupServiceNextA( HANDLE lookup, DWORD flags, DWORD *len, WSAQUE
  */
 int WINAPI WSALookupServiceNextW( HANDLE lookup, DWORD flags, DWORD *len, WSAQUERYSETW *results )
 {
-    FIXME( "(%p %#lx %p %p) Stub!\n", lookup, flags, len, results );
-    SetLastError( WSA_E_NO_MORE );
-    return -1;
+    TRACE( "(%p %#lx %p %p)\n", lookup, flags, len, results );
+    return lookup_service_nextW( lookup, flags, len, results );
 }
 
 
