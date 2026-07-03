@@ -55,6 +55,12 @@ struct wine_spawnvp_params
     int          wait;
 };
 
+struct native_thread_func_params
+{
+    void *func;
+    void *arg;
+};
+
 struct load_so_dll_params
 {
     UNICODE_STRING              nt_name;
@@ -77,6 +83,7 @@ enum ntdll_unix_funcs
     unix_wine_server_fd_to_handle,
     unix_wine_server_handle_to_fd,
     unix_wine_spawnvp,
+    unix_call_native_thread_func,
     unix_system_time_precise,
 };
 

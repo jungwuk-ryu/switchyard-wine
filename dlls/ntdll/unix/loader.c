@@ -1004,6 +1004,28 @@ static NTSTATUS unwind_builtin_dll( void *args )
 
 #endif /* SO_DLLS_SUPPORTED */
 
+static NTSTATUS unixcall_native_thread_func( void *args )
+{
+#ifdef __x86_64__
+    struct native_thread_func_params *params = args;
+    typedef void (__attribute__((ms_abi)) *native_thread_func)(void *);
+
+    if (!params->func) return STATUS_INVALID_PARAMETER;
+    ((native_thread_func)params->func)( params->arg );
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
+#ifdef _WIN64
+static NTSTATUS wow64_native_thread_func( void *args )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+#endif
+
 
 static const unixlib_entry_t unix_call_funcs[] =
 {
@@ -1014,6 +1036,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_server_fd_to_handle,
     unixcall_wine_server_handle_to_fd,
     unixcall_wine_spawnvp,
+    unixcall_native_thread_func,
     system_time_precise,
 };
 
@@ -1032,6 +1055,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_fd_to_handle,
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
+    wow64_native_thread_func,
     system_time_precise,
 };
 

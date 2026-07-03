@@ -41,6 +41,87 @@ WINE_DEFAULT_DEBUG_CHANNEL(thread);
  ***********************************************************************/
 
 
+#ifdef _WIN64
+
+struct native_thread_bridge_params
+{
+    void *func;
+    void *arg;
+};
+
+extern NTSTATUS WINAPI __wine_call_native_thread_func( void *func, void *arg );
+
+static BOOL get_native_thread_thunk_target( LPTHREAD_START_ROUTINE start, void **target )
+{
+    const BYTE *code = (const BYTE *)start;
+    BOOL found = FALSE;
+    void *func = NULL, *module;
+    LONG disp;
+    void **slot;
+
+    __TRY
+    {
+        if (code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xec && code[3] == 0x28 &&
+            code[4] == 0xff && code[5] == 0x15 &&
+            code[10] == 0x31 && code[11] == 0xc0 &&
+            code[12] == 0x48 && code[13] == 0x83 && code[14] == 0xc4 && code[15] == 0x28 &&
+            code[16] == 0xc3)
+        {
+            memcpy( &disp, code + 6, sizeof(disp) );
+            slot = (void **)(code + 10 + disp);
+            func = *slot;
+            found = !!func;
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        found = FALSE;
+    }
+    __ENDTRY
+
+    if (!found || RtlPcToFileHeader( func, &module )) return FALSE;
+
+    *target = func;
+    return TRUE;
+}
+
+static DWORD WINAPI native_thread_bridge_start( void *arg )
+{
+    struct native_thread_bridge_params *params = arg;
+    void *func = params->func;
+    void *thread_arg = params->arg;
+    NTSTATUS status;
+
+    HeapFree( GetProcessHeap(), 0, params );
+
+    status = __wine_call_native_thread_func( func, thread_arg );
+    if (status) WARN( "native thread bridge call failed, status %#lx\n", status );
+    return 0;
+}
+
+static struct native_thread_bridge_params *wrap_native_thread_thunk( LPTHREAD_START_ROUTINE start,
+                                                                     void *param,
+                                                                     LPTHREAD_START_ROUTINE *wrapped_start,
+                                                                     void **wrapped_param )
+{
+    struct native_thread_bridge_params *params;
+    void *func;
+
+    if (!get_native_thread_thunk_target( start, &func )) return NULL;
+    if (!(params = HeapAlloc( GetProcessHeap(), 0, sizeof(*params) ))) return NULL;
+
+    params->func = func;
+    params->arg = param;
+    *wrapped_start = native_thread_bridge_start;
+    *wrapped_param = params;
+
+    TRACE( "bridging native ms_abi thread thunk %p target %p arg %p\n", start, func, param );
+    return params;
+}
+
+#endif
+
+
 static DWORD rtlmode_to_win32mode( DWORD rtlmode )
 {
     DWORD win32mode = 0;
@@ -98,6 +179,11 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateRemoteThreadEx( HANDLE process, SECURITY_A
     SIZE_T stack_reserve = 0, stack_commit = 0;
     GROUP_AFFINITY *group_affinity = NULL;
 
+#ifdef _WIN64
+    struct native_thread_bridge_params *native_bridge = NULL;
+    LPTHREAD_START_ROUTINE thread_start = start;
+    void *thread_param = param;
+#endif
     if (attributes)
     {
         DWORD i;
@@ -141,11 +227,23 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateRemoteThreadEx( HANDLE process, SECURITY_A
 
     RtlGetActiveActivationContext( &actctx );
 
+#ifdef _WIN64
+    if (process == GetCurrentProcess())
+        native_bridge = wrap_native_thread_thunk( start, param, &thread_start, &thread_param );
+#endif
+
     if (!set_ntstatus( NtCreateThreadEx( &handle, THREAD_ALL_ACCESS, &attr, process,
+#ifdef _WIN64
+                                         (PRTL_THREAD_START_ROUTINE)thread_start, thread_param,
+#else
                                          (PRTL_THREAD_START_ROUTINE)start, param,
+#endif
                                          THREAD_CREATE_FLAGS_CREATE_SUSPENDED, 0,
                                          stack_commit, stack_reserve, attr_list )))
     {
+#ifdef _WIN64
+        HeapFree( GetProcessHeap(), 0, native_bridge );
+#endif
         if (actctx) RtlReleaseActivationContext( actctx );
         return 0;
     }

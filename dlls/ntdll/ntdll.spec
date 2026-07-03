@@ -1764,6 +1764,7 @@
 # Unix interface
 @ stdcall -arch=x86_64 __wine_unix_call(long long ptr)
 @ stdcall __wine_unix_spawnvp(long ptr)
+@ stdcall -arch=x86_64 __wine_call_native_thread_func(ptr ptr)
 @ stdcall __wine_ctrl_routine(ptr)
 @ extern -private __wine_syscall_dispatcher
 @ extern -private __wine_unix_call_dispatcher

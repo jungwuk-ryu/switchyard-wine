@@ -3429,6 +3429,17 @@ NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, vo
 
 
 /***********************************************************************
+ *           __wine_call_native_thread_func
+ */
+NTSTATUS WINAPI __wine_call_native_thread_func( void *func, void *arg )
+{
+    struct native_thread_func_params params = { func, arg };
+
+    return WINE_UNIX_CALL( unix_call_native_thread_func, &params );
+}
+
+
+/***********************************************************************
  *           wine_server_call
  */
 unsigned int CDECL wine_server_call( void *req_ptr )
