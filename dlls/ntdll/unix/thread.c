@@ -1233,6 +1233,10 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
 #endif
 
     /* native stack */
+#if defined(__APPLE__) && defined(__x86_64__)
+    if (main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 && reserve_size < 0x800000)
+        reserve_size = 0x800000;
+#endif
     if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
         return status;
     teb->Tib.StackBase = stack.StackBase;
