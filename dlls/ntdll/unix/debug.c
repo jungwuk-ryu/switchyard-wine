@@ -289,6 +289,26 @@ NTSTATUS unixcall_get_current_teb( void *args )
     return params->teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+/***********************************************************************
+ *		unixcall_get_native_callback_context
+ */
+NTSTATUS unixcall_get_native_callback_context( void *args )
+{
+#if defined(__APPLE__) && defined(__x86_64__)
+    enum { switchyard_amd64_pthread_teb_offset = 0x320 };
+    struct native_callback_context_params *params = args;
+    struct thread_data *data = get_thread_data();
+
+    params->pthread_teb = NULL;
+    if (!data || !data->teb) return STATUS_UNSUCCESSFUL;
+
+    params->pthread_teb = *(void **)((char *)data->teb + switchyard_amd64_pthread_teb_offset);
+    return params->pthread_teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
 #ifdef _WIN64
 /***********************************************************************
  *		wow64_wine_dbg_write
@@ -318,6 +338,14 @@ NTSTATUS wow64_get_current_teb( void *args )
 
     params32->teb = PtrToUlong( teb );
     return teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+/***********************************************************************
+ *		wow64_get_native_callback_context
+ */
+NTSTATUS wow64_get_native_callback_context( void *args )
+{
+    return STATUS_NOT_SUPPORTED;
 }
 #endif
 

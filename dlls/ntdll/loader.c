@@ -3425,9 +3425,66 @@ static BYTE *native_callback_thunk_ptr;
 static BYTE *native_callback_thunk_end;
 static const BYTE native_callback_thunk_marker[] = { 0x66, 0x90, 0x66, 0x90, 0x66, 0x90, 0x66, 0x90 };
 
+static inline void switchyard_set_macos_tsd_base( void *base )
+{
+    __asm__ __volatile__(
+        "movq %0,%%rdi\n\t"
+        "xorl %%esi,%%esi\n\t"
+        "movl $0x3000003,%%eax\n\t"
+        "syscall"
+        :
+        : "r" (base)
+        : "rax", "rdi", "rsi", "rcx", "r11", "memory" );
+}
+
+static BOOL switchyard_get_native_callback_context( void **pthread_teb )
+{
+    struct native_callback_context_params params = { NULL };
+
+    *pthread_teb = NULL;
+    if (WINE_UNIX_CALL( unix_get_native_callback_context, &params )) return FALSE;
+    if (!params.pthread_teb) return FALSE;
+
+    *pthread_teb = params.pthread_teb;
+    return TRUE;
+}
+
+static ULONG_PTR WINAPI switchyard_native_callback3_on_user_stack( void *func, ULONG_PTR arg0,
+                                                                   ULONG_PTR arg1, ULONG_PTR arg2,
+                                                                   void *pthread_teb )
+{
+    typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    TEB *teb = NtCurrentTeb();
+    ULONG_PTR ret;
+
+    switchyard_set_macos_tsd_base( pthread_teb );
+    ret = ((native_callback_func)func)( arg0, arg1, arg2 );
+    switchyard_set_macos_tsd_base( teb );
+    return ret;
+}
+
+static ULONG_PTR WINAPI switchyard_native_callback4_on_user_stack( void *func, ULONG_PTR arg0,
+                                                                   ULONG_PTR arg1, ULONG_PTR arg2,
+                                                                   ULONG_PTR arg3, void *pthread_teb )
+{
+    typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    TEB *teb = NtCurrentTeb();
+    ULONG_PTR ret;
+
+    switchyard_set_macos_tsd_base( pthread_teb );
+    ret = ((native_callback_func)func)( arg0, arg1, arg2, arg3 );
+    switchyard_set_macos_tsd_base( teb );
+    return ret;
+}
+
 static ULONG_PTR WINAPI native_callback_bridge3( void *func, ULONG_PTR arg0,
                                                  ULONG_PTR arg1, ULONG_PTR arg2 )
 {
+    void *pthread_teb;
+
+    if (func && switchyard_get_native_callback_context( &pthread_teb ))
+        return switchyard_native_callback3_on_user_stack( func, arg0, arg1, arg2, pthread_teb );
+
     struct native_callback_params params = { func, { arg0, arg1, arg2, 0 }, 0 };
     NTSTATUS status;
 
@@ -3440,6 +3497,11 @@ static ULONG_PTR WINAPI native_callback_bridge4( void *func, ULONG_PTR arg0,
                                                  ULONG_PTR arg1, ULONG_PTR arg2,
                                                  ULONG_PTR arg3 )
 {
+    void *pthread_teb;
+
+    if (func && switchyard_get_native_callback_context( &pthread_teb ))
+        return switchyard_native_callback4_on_user_stack( func, arg0, arg1, arg2, arg3, pthread_teb );
+
     struct native_callback_params params = { func, { arg0, arg1, arg2, arg3 }, 0 };
     NTSTATUS status;
 

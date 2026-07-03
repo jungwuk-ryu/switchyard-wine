@@ -38,6 +38,11 @@ struct current_teb_params
     void *teb;
 };
 
+struct native_callback_context_params
+{
+    void *pthread_teb;
+};
+
 struct wine_server_fd_to_handle_params
 {
     int          fd;
@@ -98,6 +103,7 @@ enum ntdll_unix_funcs
     unix_unwind_builtin_dll,
     unix_wine_dbg_write,
     unix_get_current_teb,
+    unix_get_native_callback_context,
     unix_wine_server_call,
     unix_wine_server_fd_to_handle,
     unix_wine_server_handle_to_fd,
