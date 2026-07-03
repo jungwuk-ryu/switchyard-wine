@@ -2988,13 +2988,84 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
  *           __wine_syscall_dispatcher
  */
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                   "popq %r11\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "pushfq\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %r11\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "xorq %r11,%r11\n\t"
                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") ":\n\t"
                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+#ifdef __APPLE__
+                   "testq %rcx,%rcx\n\t"
+                   "jz 1f\n\t"
+                   "movq %gs:0x30,%r11\n\t"
+                   "testq %r11,%r11\n\t"
+                   "jnz 2f\n"
+                   "1:\t"
+                   "pushq %rax\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %r10\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %rdx\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %r8\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %r9\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %rdi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %rsi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "subq $0xa8,%rsp\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 0xa8\n\t")
+                   "movdqa %xmm6,0x00(%rsp)\n\t"
+                   "movdqa %xmm7,0x10(%rsp)\n\t"
+                   "movdqa %xmm8,0x20(%rsp)\n\t"
+                   "movdqa %xmm9,0x30(%rsp)\n\t"
+                   "movdqa %xmm10,0x40(%rsp)\n\t"
+                   "movdqa %xmm11,0x50(%rsp)\n\t"
+                   "movdqa %xmm12,0x60(%rsp)\n\t"
+                   "movdqa %xmm13,0x70(%rsp)\n\t"
+                   "movdqa %xmm14,0x80(%rsp)\n\t"
+                   "movdqa %xmm15,0x90(%rsp)\n\t"
+                   "call " __ASM_NAME("__wine_get_current_teb_from_pthread") "\n\t"
+                   "movdqa 0x00(%rsp),%xmm6\n\t"
+                   "movdqa 0x10(%rsp),%xmm7\n\t"
+                   "movdqa 0x20(%rsp),%xmm8\n\t"
+                   "movdqa 0x30(%rsp),%xmm9\n\t"
+                   "movdqa 0x40(%rsp),%xmm10\n\t"
+                   "movdqa 0x50(%rsp),%xmm11\n\t"
+                   "movdqa 0x60(%rsp),%xmm12\n\t"
+                   "movdqa 0x70(%rsp),%xmm13\n\t"
+                   "movdqa 0x80(%rsp),%xmm14\n\t"
+                   "movdqa 0x90(%rsp),%xmm15\n\t"
+                   "addq $0xa8,%rsp\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -0xa8\n\t")
+                   "testq %rax,%rax\n\t"
+                   "jz 1f\n\t"
+                   "movq %rax,%r11\n\t"
+                   "movq 0x378(%rax),%rcx\n"
+                   "1:\tpopq %rsi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %rdi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %r9\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %r8\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %rdx\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %r10\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %rax\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "2:\n\t"
+#endif
                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
-                   "pushfq\n\t"
-                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
                    "popq 0x80(%rcx)\n\t"
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    "movl $0,0xb4(%rcx)\n\t"        /* frame->restore_flags */
@@ -3020,7 +3091,16 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "movw %ss,0x90(%rcx)\n\t"
                    "movq %rbp,0x98(%rcx)\n\t"
                    __ASM_CFI_REG_IS_AT2(rbp, rcx, 0x98, 0x01)
+#ifdef __APPLE__
+                   "testq %r11,%r11\n\t"
+                   "jnz 1f\n\t"
+                   "movq %gs:0x30,%r13\n\t"
+                   "jmp 2f\n"
+                   "1:\tmovq %r11,%r13\n"          /* recovered or validated teb */
+                   "2:\n\t"
+#else
                    "movq %gs:0x30,%r13\n\t"        /* teb */
+#endif
                    "movl %eax,0xb0(%rcx)\n\t"      /* frame->syscall_id */
                    /* Legends of Runeterra hooks the first system call return instruction, and
                     * depends on us returning to it. Adjust the return address accordingly. */
@@ -3300,12 +3380,83 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
+                   "popq %r11\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "pushfq\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %r11\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "xorq %r11,%r11\n\t"
                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+#ifdef __APPLE__
+                   "testq %rcx,%rcx\n\t"
+                   "jz 1f\n\t"
+                   "movq %gs:0x30,%r11\n\t"
+                   "testq %r11,%r11\n\t"
+                   "jnz 2f\n"
+                   "1:\t"
+                   "pushq %rax\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %r10\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %rdx\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %r8\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %r9\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %rdi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "pushq %rsi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "subq $0xa8,%rsp\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 0xa8\n\t")
+                   "movdqa %xmm6,0x00(%rsp)\n\t"
+                   "movdqa %xmm7,0x10(%rsp)\n\t"
+                   "movdqa %xmm8,0x20(%rsp)\n\t"
+                   "movdqa %xmm9,0x30(%rsp)\n\t"
+                   "movdqa %xmm10,0x40(%rsp)\n\t"
+                   "movdqa %xmm11,0x50(%rsp)\n\t"
+                   "movdqa %xmm12,0x60(%rsp)\n\t"
+                   "movdqa %xmm13,0x70(%rsp)\n\t"
+                   "movdqa %xmm14,0x80(%rsp)\n\t"
+                   "movdqa %xmm15,0x90(%rsp)\n\t"
+                   "call " __ASM_NAME("__wine_get_current_teb_from_pthread") "\n\t"
+                   "movdqa 0x00(%rsp),%xmm6\n\t"
+                   "movdqa 0x10(%rsp),%xmm7\n\t"
+                   "movdqa 0x20(%rsp),%xmm8\n\t"
+                   "movdqa 0x30(%rsp),%xmm9\n\t"
+                   "movdqa 0x40(%rsp),%xmm10\n\t"
+                   "movdqa 0x50(%rsp),%xmm11\n\t"
+                   "movdqa 0x60(%rsp),%xmm12\n\t"
+                   "movdqa 0x70(%rsp),%xmm13\n\t"
+                   "movdqa 0x80(%rsp),%xmm14\n\t"
+                   "movdqa 0x90(%rsp),%xmm15\n\t"
+                   "addq $0xa8,%rsp\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -0xa8\n\t")
+                   "testq %rax,%rax\n\t"
+                   "jz 1f\n\t"
+                   "movq %rax,%r11\n\t"
+                   "movq 0x378(%rax),%rcx\n"
+                   "1:\tpopq %rsi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %rdi\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %r9\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %r8\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %rdx\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %r10\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "popq %rax\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "2:\n\t"
+#endif
                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
-                   "pushfq\n\t"
-                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
                    "popq 0x80(%rcx)\n\t"
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    "movl $0x10000,0xb4(%rcx)\n\t"    /* frame->restore_flags <- RESTORE_FLAGS_INSTRUMENTATION */
