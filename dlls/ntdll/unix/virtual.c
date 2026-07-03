@@ -848,12 +848,111 @@ static NTSTATUS get_unixlib_funcs( void *so_handle, BOOL wow, const void **funcs
 }
 
 
+#ifdef __APPLE__
+typedef void (*non_native_code_region_registrar)(const void *, size_t);
+#define MAX_NON_NATIVE_CODE_REGION_REGISTRARS 16
+
+static pthread_mutex_t non_native_code_region_mutex = PTHREAD_MUTEX_INITIALIZER;
+static non_native_code_region_registrar non_native_code_region_registrars[MAX_NON_NATIVE_CODE_REGION_REGISTRARS];
+static unsigned int non_native_code_region_registrar_count;
+
+static void add_non_native_code_region_registrar( non_native_code_region_registrar register_region )
+{
+    unsigned int i;
+
+    if (!register_region) return;
+
+    mutex_lock( &non_native_code_region_mutex );
+    for (i = 0; i < non_native_code_region_registrar_count; i++)
+    {
+        if (non_native_code_region_registrars[i] == register_region)
+        {
+            mutex_unlock( &non_native_code_region_mutex );
+            return;
+        }
+    }
+    if (non_native_code_region_registrar_count < MAX_NON_NATIVE_CODE_REGION_REGISTRARS)
+        non_native_code_region_registrars[non_native_code_region_registrar_count++] = register_region;
+    else
+        WARN_(module)( "too many non-native code region registrars\n" );
+    mutex_unlock( &non_native_code_region_mutex );
+}
+
+void virtual_register_non_native_code_region( const void *base, SIZE_T size )
+{
+    non_native_code_region_registrar registrars[MAX_NON_NATIVE_CODE_REGION_REGISTRARS];
+    unsigned int i, count;
+
+    if (!base || !size) return;
+
+    mutex_lock( &non_native_code_region_mutex );
+    count = non_native_code_region_registrar_count;
+    memcpy( registrars, non_native_code_region_registrars, count * sizeof(*registrars) );
+    mutex_unlock( &non_native_code_region_mutex );
+
+    for (i = 0; i < count; i++)
+    {
+        TRACE_(module)( "registering dynamic non-native code region %p-%p\n",
+                        base, (const char *)base + size );
+        registrars[i]( base, size );
+    }
+}
+
+static void register_non_native_code_region( void *so_handle, void *module )
+{
+    int (*supports_regions)(void);
+    non_native_code_region_registrar register_region;
+    IMAGE_DOS_HEADER *dos = module;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_SECTION_HEADER *sec;
+    unsigned int i;
+
+    if (!so_handle || !module) return;
+
+    supports_regions = dlsym( so_handle, "supports_non_native_code_regions" );
+    register_region = dlsym( so_handle, "register_non_native_code_region" );
+    if (!register_region || (supports_regions && !supports_regions())) return;
+    add_non_native_code_region_registrar( register_region );
+
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    nt = (IMAGE_NT_HEADERS *)((char *)module + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    sec = IMAGE_FIRST_SECTION( nt );
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        SIZE_T size;
+        void *base;
+
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+        size = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+        if (!size) continue;
+
+        base = (char *)module + sec[i].VirtualAddress;
+        TRACE_(module)( "registering non-native code region %p-%p for %p\n",
+                        base, (char *)base + size, module );
+        register_region( base, size );
+    }
+}
+#else
+void virtual_register_non_native_code_region( const void *base, SIZE_T size )
+{
+}
+
+static void register_non_native_code_region( void *so_handle, void *module )
+{
+}
+#endif
+
+
 /***********************************************************************
  *           load_builtin_unixlib
  */
 static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs )
 {
     NTSTATUS (*entry)(void) = NULL;
+    void *unix_handle = NULL;
     sigset_t sigset;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     struct builtin_module *builtin;
@@ -867,9 +966,14 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             if (!builtin->unix_handle)
                 WARN_(module)( "failed to load %s: %s\n", debugstr_a(builtin->unix_path), dlerror() );
         }
-        if (builtin->unix_handle) status = get_unixlib_funcs( builtin->unix_handle, wow, funcs, &entry );
+        if (builtin->unix_handle)
+        {
+            unix_handle = builtin->unix_handle;
+            status = get_unixlib_funcs( builtin->unix_handle, wow, funcs, &entry );
+        }
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (!status) register_non_native_code_region( unix_handle, module );
     if (!status && entry) status = entry();
     return status;
 }
