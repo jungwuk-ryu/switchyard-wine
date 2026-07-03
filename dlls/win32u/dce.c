@@ -254,6 +254,7 @@ static void scaled_surface_set_target( struct scaled_surface *surface, struct wi
     if (surface->target_surface) window_surface_release( surface->target_surface );
     window_surface_add_ref( (surface->target_surface = target) );
     surface->dpi_to = dpi_to;
+    surface->header.flush_on_unlock = target->flush_on_unlock;
 }
 
 static struct window_surface *scaled_surface_create( HWND hwnd, const RECT *surface_rect, UINT dpi_from, UINT dpi_to,

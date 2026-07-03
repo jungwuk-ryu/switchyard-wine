@@ -307,6 +307,7 @@ struct window_surface
     RECT                               bounds;       /* dirty area rectangle */
     HRGN                               clip_region;  /* visible region of the surface, fully visible if 0 */
     DWORD                              draw_start_ticks; /* start ticks of fresh draw */
+    BOOL                               flush_on_unlock; /* force a flush when the DIB draw lock is released */
     COLORREF                           color_key;    /* layered window surface color key, invalid if CLR_INVALID */
     UINT                               alpha_bits;   /* layered window global alpha bits, invalid if -1 */
     UINT                               alpha_mask;   /* layered window per-pixel alpha mask, invalid if 0 */

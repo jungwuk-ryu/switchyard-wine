@@ -241,6 +241,7 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
         surface->provider = provider;
         surface->offset = *offset;
         surface->child = child;
+        window_surface->flush_on_unlock = child;
     }
 
     return window_surface;

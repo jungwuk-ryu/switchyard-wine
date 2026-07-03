@@ -534,7 +534,7 @@ static inline void unlock_surface( struct windrv_physdev *dev )
     {
         DWORD ticks = NtGetTickCount() - surface->draw_start_ticks;
         window_surface_unlock( surface );
-        if (ticks > FLUSH_PERIOD) window_surface_flush( dev->surface );
+        if (ticks > FLUSH_PERIOD || surface->flush_on_unlock) window_surface_flush( surface );
     }
 }
 
