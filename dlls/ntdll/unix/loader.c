@@ -1204,6 +1204,98 @@ static NTSTATUS open_builtin_pe_file( const char *name, OBJECT_ATTRIBUTES *attr,
     return status;
 }
 
+#define SWITCHYARD_GRAPHICS_FALLBACK_DIR "/switchyard-wine-graphics"
+
+/***********************************************************************
+ *           switchyard_command_line_contains
+ */
+static BOOL switchyard_command_line_contains( const WCHAR *needle )
+{
+    RTL_USER_PROCESS_PARAMETERS *params;
+    const WCHAR *cmdline;
+    SIZE_T needle_len = 0;
+    SIZE_T length, i, j;
+
+    if (!needle)
+        return FALSE;
+
+    while (needle[needle_len])
+        ++needle_len;
+
+    if (!needle_len || !peb || !(params = peb->ProcessParameters) || !params->CommandLine.Buffer)
+        return FALSE;
+
+    cmdline = params->CommandLine.Buffer;
+    length = params->CommandLine.Length / sizeof(WCHAR);
+    if (length < needle_len)
+        return FALSE;
+
+    for (i = 0; i <= length - needle_len; ++i)
+    {
+        for (j = 0; j < needle_len; ++j)
+        {
+            if (cmdline[i + j] != needle[j])
+                break;
+        }
+
+        if (j == needle_len)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL switchyard_is_chromium_gpu_process(void)
+{
+    if (!switchyard_command_line_contains( L"--type=gpu-process" ))
+        return FALSE;
+
+    return switchyard_command_line_contains( L"--enable-chrome-runtime" )
+            || switchyard_command_line_contains( L"--user-agent-product" )
+            || switchyard_command_line_contains( L"--mojo-platform-channel-handle" );
+}
+
+static BOOL switchyard_is_graphics_dll( const char *name )
+{
+    return !strcmp( name, "d3d10.dll" )
+            || !strcmp( name, "d3d11.dll" )
+            || !strcmp( name, "d3d12.dll" )
+            || !strcmp( name, "dcomp.dll" )
+            || !strcmp( name, "dxgi.dll" );
+}
+
+static BOOL switchyard_should_use_wine_graphics_fallback( const char *name )
+{
+    if (!switchyard_is_chromium_gpu_process())
+        return FALSE;
+    if (!switchyard_is_graphics_dll( name ))
+        return FALSE;
+
+    return TRUE;
+}
+
+static char *switchyard_prepend_graphics_fallback_root( char *ptr, const char *dll_path )
+{
+    size_t dll_path_len = strlen(dll_path);
+    static const char wine_dir[] = "/wine";
+
+    if (dll_path_len >= sizeof(wine_dir) - 1
+            && !strcmp( dll_path + dll_path_len - (sizeof(wine_dir) - 1), wine_dir ))
+        dll_path_len -= sizeof(wine_dir) - 1;
+
+    ptr = prepend( ptr, SWITCHYARD_GRAPHICS_FALLBACK_DIR,
+                   strlen(SWITCHYARD_GRAPHICS_FALLBACK_DIR) );
+    ptr = prepend( ptr, dll_path, dll_path_len );
+    return ptr;
+}
+
+static char *switchyard_prepend_graphics_fallback_path( char *ptr, const char *arch_dir,
+                                                       const char *dll_path )
+{
+    ptr = prepend( ptr, arch_dir, strlen(arch_dir) );
+    return switchyard_prepend_graphics_fallback_root( ptr, dll_path );
+}
+
 
 /***********************************************************************
  *           find_builtin_dll
@@ -1221,6 +1313,7 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
     OBJECT_ATTRIBUTES attr;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     BOOL found_image = FALSE;
+    BOOL switchyard_use_graphics_fallback = FALSE;
 
     InitializeObjectAttributes( &attr, nt_name, 0, 0, NULL );
 
@@ -1240,7 +1333,8 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
             pe_build_dir = alt_build_dir;
         maxlen = max( strlen(build_dir), strlen(pe_build_dir) ) + sizeof("/programs/") + len;
     }
-    maxlen = max( maxlen, dll_path_maxlen + 1 ) + len + sizeof("/aarch64-windows") + sizeof(".so");
+    maxlen = max( maxlen, dll_path_maxlen + sizeof(SWITCHYARD_GRAPHICS_FALLBACK_DIR) )
+            + len + sizeof("/aarch64-windows") + sizeof(".so");
 
     if (!(file = malloc( maxlen ))) return STATUS_NO_MEMORY;
 
@@ -1265,6 +1359,7 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
     file[--pos] = '/';
 
     TRACE( "looking for %s for file %s\n", debugstr_a(file + pos + 1), debugstr_us(nt_name) );
+    switchyard_use_graphics_fallback = switchyard_should_use_wine_graphics_fallback( file + pos + 1 );
 
     if (build_dir)
     {
@@ -1291,6 +1386,26 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
 
     for (i = 0; dll_paths[i]; i++)
     {
+        if (switchyard_use_graphics_fallback)
+        {
+            char *fallback_pe_path = file + pos;
+
+            fallback_pe_path = switchyard_prepend_graphics_fallback_path( fallback_pe_path, pe_dir, dll_paths[i] );
+            status = open_builtin_pe_file( fallback_pe_path, &attr, module, size_ptr, image_info,
+                                           limit_low, limit_high, load_machine, prefer_native, offset );
+            if (!status)
+            {
+                WARN( "Switchyard routing Chromium GPU subprocess %s to Wine graphics fallback %s.\n",
+                       debugstr_a(file + pos + 1), debugstr_a(fallback_pe_path) );
+                ptr = file + pos;
+                ptr = switchyard_prepend_graphics_fallback_path( ptr, so_dir, dll_paths[i] );
+                goto done;
+            }
+            TRACE( "Switchyard Wine graphics fallback %s unavailable at %s status %#lx.\n",
+                   debugstr_a(file + pos + 1), debugstr_a(fallback_pe_path), (ULONG)status );
+            if (status == STATUS_NOT_SUPPORTED) found_image = TRUE;
+            else if (status != STATUS_DLL_NOT_FOUND) goto done;
+        }
         ptr = file + pos;
         ptr = prepend( ptr, pe_dir, strlen(pe_dir) );
         ptr = prepend( ptr, dll_paths[i], strlen(dll_paths[i]) );
