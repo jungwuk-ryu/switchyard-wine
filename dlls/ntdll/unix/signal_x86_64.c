@@ -515,6 +515,7 @@ struct amd64_thread_data
     DWORD                 fs;            /* 0338 WOW TEB selector */
     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
     char                  syscall_dispatch; /* 0340 */
+    DWORD                 native_callback_depth; /* 0344 Switchyard native callback nesting */
 };
 
 C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
@@ -524,6 +525,7 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, ins
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, native_callback_depth ) == 0x344 );
 
 static inline struct amd64_thread_data *amd64_thread_data( struct thread_data *data )
 {
@@ -824,7 +826,7 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
 #elif defined __APPLE__
     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
         !is_inside_syscall( data, RSP_sig(sigcontext )))
-        _thread_set_tsd_base( (uint64_t)data->teb );
+        _thread_set_tsd_base( (uint64_t)(amd64_data->native_callback_depth ? amd64_data->pthread_teb : data->teb) );
 #endif
     if (is_16bit( sigcontext )) return;
 #ifdef DS_sig

@@ -41,6 +41,7 @@ struct current_teb_params
 struct native_callback_context_params
 {
     void *pthread_teb;
+    void *native_callback_depth;
 };
 
 struct wine_server_fd_to_handle_params
