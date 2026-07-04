@@ -75,6 +75,8 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static __thread unsigned int chromium_cef_child_surface_create_depth;
+
 static struct list window_surfaces = LIST_INIT( window_surfaces );
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -907,6 +909,39 @@ static void update_visible_region( struct dce *dce )
             }
             else surface = NULL;
             release_win_ptr( win );
+        }
+
+        if (!surface && !IsRectEmpty( &win_rect ))
+        {
+            if (chromium_cef_child_surface_create_depth)
+            {
+                TRACE( "skipping recursive local Chromium/CEF child surface creation for hwnd %p DCE %p\n",
+                       dce->hwnd, dce->hdc );
+            }
+            else
+            {
+                UINT raw_dpi;
+
+                chromium_cef_child_surface_create_depth++;
+                get_win_monitor_dpi( dce->hwnd, &raw_dpi );
+                create_window_surface( dce->hwnd, FALSE, &win_rect, raw_dpi, &surface );
+                chromium_cef_child_surface_create_depth--;
+
+                if (surface && surface != &dummy_surface)
+                {
+                    surface->flush_on_unlock = TRUE;
+                    top_rect = win_rect;
+                    TRACE( "created local Chromium/CEF child surface %p for foreign hwnd %p DCE %p\n",
+                           surface, dce->hwnd, dce->hdc );
+                }
+                else
+                {
+                    if (surface) window_surface_release( surface );
+                    surface = NULL;
+                    TRACE( "could not create local Chromium/CEF child surface for foreign hwnd %p DCE %p\n",
+                           dce->hwnd, dce->hdc );
+                }
+            }
         }
     }
 

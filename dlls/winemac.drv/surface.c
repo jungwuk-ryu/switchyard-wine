@@ -255,7 +255,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
 {
     struct window_surface *previous;
     struct macdrv_win_data *data;
-    macdrv_window window;
+    macdrv_window window = NULL;
     POINT offset = {0, 0};
     BOOL child = FALSE;
 
@@ -267,16 +267,20 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
 
         if (!mac_surface->child) return TRUE;
     }
-    if (!(data = get_win_data(hwnd))) return TRUE; /* use default surface */
-    window = data->cocoa_window;
-
-    if (layered)
+    if ((data = get_win_data(hwnd)))
     {
-        data->layered = TRUE;
-        data->ulw_layered = TRUE;
-    }
+        window = data->cocoa_window;
 
-    release_win_data(data);
+        if (layered)
+        {
+            data->layered = TRUE;
+            data->ulw_layered = TRUE;
+        }
+
+        release_win_data(data);
+    }
+    else if (!is_chromium_cef_child_window(hwnd)) return TRUE; /* use default surface */
+    else TRACE("Switchyard Chromium/CEF child hwnd %p has no local mac win data; trying root redirection\n", hwnd);
 
     if (!window && is_chromium_cef_child_window(hwnd))
     {
@@ -297,6 +301,8 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
             }
             release_win_data(root_data);
         }
+        else TRACE("Switchyard Chromium/CEF child surface hwnd %p has no root mac win data for root %p\n",
+                   hwnd, root);
     }
 
     if (previous)
