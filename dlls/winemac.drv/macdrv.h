@@ -205,6 +205,7 @@ extern struct macdrv_client_surface *impl_from_client_surface(struct client_surf
 extern BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
+extern struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RECT *surface_rect);
 extern void release_win_data(struct macdrv_win_data *data);
 extern void init_win_context(void);
 extern macdrv_window macdrv_get_cocoa_window(HWND hwnd, BOOL require_on_screen);

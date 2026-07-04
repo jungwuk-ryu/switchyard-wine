@@ -580,12 +580,19 @@ static void destroy_cocoa_window(struct macdrv_win_data *data)
  *
  * Create a Mac data window structure for an existing window.
  */
+static void show_window(struct macdrv_win_data *data);
+
 static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct window_rects *rects)
 {
     struct macdrv_win_data *data;
+    BOOL foreign_chromium_child = FALSE;
     HWND parent;
 
-    if (NtUserGetWindowThread(hwnd, NULL) != GetCurrentThreadId()) return NULL;
+    if (NtUserGetWindowThread(hwnd, NULL) != GetCurrentThreadId())
+    {
+        if (!is_chromium_cef_child_window(hwnd)) return NULL;
+        foreign_chromium_child = TRUE;
+    }
 
     if (!(parent = NtUserGetAncestor(hwnd, GA_PARENT)))  /* desktop */
     {
@@ -596,9 +603,10 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
     if (!(data = alloc_win_data(hwnd))) return NULL;
     data->rects = *rects;
 
-    if (parent == NtUserGetDesktopWindow())
+    if (parent == NtUserGetDesktopWindow() || foreign_chromium_child)
     {
         create_cocoa_window(data);
+        if (foreign_chromium_child && data->cocoa_window) show_window(data);
         TRACE("win %p/%p window %s whole %s client %s\n",
                hwnd, data->cocoa_window, wine_dbgstr_rect(&data->rects.window),
                wine_dbgstr_rect(&data->rects.visible), wine_dbgstr_rect(&data->rects.client));
@@ -608,6 +616,40 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
            hwnd, data->cocoa_window, wine_dbgstr_rect(&data->rects.window),
            wine_dbgstr_rect(&data->rects.visible), wine_dbgstr_rect(&data->rects.client));
     return data;
+}
+
+struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RECT *surface_rect)
+{
+    struct window_rects rects;
+    UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
+    RECT client;
+
+    if (!is_chromium_cef_child_window(hwnd)) return NULL;
+    if (NtUserGetWindowThread(hwnd, NULL) == GetCurrentThreadId()) return NULL;
+
+    SetRectEmpty(&rects.window);
+    if (NtUserGetClientRect(hwnd, &client, dpi))
+    {
+        NtUserMapWindowPoints(hwnd, 0, (POINT *)&client, 2, dpi);
+        rects.window = client;
+    }
+    if (IsRectEmpty(&rects.window))
+    {
+        POINT origin = {0, 0};
+        int width = surface_rect->right - surface_rect->left;
+        int height = surface_rect->bottom - surface_rect->top;
+
+        NtUserMapWindowPoints(hwnd, 0, &origin, 1, dpi);
+        SetRect(&rects.window, origin.x, origin.y, origin.x + width, origin.y + height);
+    }
+
+    rects.client = rects.window;
+    rects.visible = rects.window;
+
+    TRACE("creating foreign Chromium/CEF child mac win data for hwnd %p rects %s\n",
+          hwnd, debugstr_window_rects(&rects));
+
+    return macdrv_create_win_data(hwnd, &rects);
 }
 
 

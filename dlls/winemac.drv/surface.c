@@ -305,6 +305,16 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
                    hwnd, root);
     }
 
+    if (!window && is_chromium_cef_child_window(hwnd) &&
+        (data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
+    {
+        window = data->cocoa_window;
+        child = FALSE;
+        TRACE("Switchyard created standalone Chromium/CEF child surface window hwnd %p window %p\n",
+              hwnd, window);
+        release_win_data(data);
+    }
+
     if (previous)
     {
         window_surface_release(previous);
