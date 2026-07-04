@@ -3166,6 +3166,35 @@ static BOOL font_CreateDC( PHYSDEV *dev, LPCWSTR device, LPCWSTR output, const D
     return TRUE;
 }
 
+static BOOL ensure_font_driver( DC *dc )
+{
+    struct font_physdev *physdev;
+
+    if (find_dc_driver( dc, &font_driver )) return TRUE;
+    if (!font_funcs) return FALSE;
+    if (!(physdev = calloc( 1, sizeof(*physdev) ))) return FALSE;
+
+    push_dc_driver( &dc->physDev, &physdev->dev, &font_driver );
+    return TRUE;
+}
+
+static BOOL select_current_font( DC *dc )
+{
+    PHYSDEV physdev;
+    UINT aa_flags = 0;
+
+    if (!ensure_font_driver( dc )) return FALSE;
+    physdev = GET_DC_PHYSDEV( dc, pSelectFont );
+    if (!physdev->funcs->pSelectFont( physdev, dc->hFont, &aa_flags )) return FALSE;
+
+    dc->aa_flags = aa_flags ? aa_flags : GGO_BITMAP;
+    if (dc->font_gamma_ramp == NULL)
+        dc->font_gamma_ramp = &font_gamma_ramp;
+    return TRUE;
+}
+
+static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags );
+
 
 /*************************************************************
  * font_DeleteDC
@@ -4370,6 +4399,13 @@ static BOOL font_GetTextMetrics( PHYSDEV dev, TEXTMETRICW *metrics )
 
     if (!physdev->font)
     {
+        DC *dc = get_physdev_dc( dev );
+
+        if (dc->hFont) select_current_font( dc );
+    }
+
+    if (!physdev->font)
+    {
         dev = GET_NEXT_PHYSDEV( dev, pGetTextMetrics );
         return dev->funcs->pGetTextMetrics( dev, metrics );
     }
@@ -5066,6 +5102,13 @@ HGDIOBJ WINAPI NtGdiSelectFont( HDC hdc, HGDIOBJ handle )
         return 0;
     }
 
+    if (font_funcs && !ensure_font_driver( dc ))
+    {
+        GDI_dec_ref_count( handle );
+        release_dc_ptr( dc );
+        return 0;
+    }
+
     physdev = GET_DC_PHYSDEV( dc, pSelectFont );
     if (physdev->funcs->pSelectFont( physdev, handle, &aa_flags ))
     {
@@ -5293,6 +5336,7 @@ BOOL WINAPI NtGdiGetTextMetricsW( HDC hdc, TEXTMETRICW *metrics, ULONG flags )
     DC * dc = get_dc_ptr( hdc );
     if (!dc) return FALSE;
 
+    if (font_funcs && !find_dc_driver( dc, &font_driver ) && !select_current_font( dc )) goto done;
     physdev = GET_DC_PHYSDEV( dc, pGetTextMetrics );
     ret = physdev->funcs->pGetTextMetrics( physdev, metrics );
 
@@ -5334,6 +5378,7 @@ BOOL WINAPI NtGdiGetTextMetricsW( HDC hdc, TEXTMETRICW *metrics, ULONG flags )
           metrics->tmDescent,
           metrics->tmHeight );
     }
+done:
     release_dc_ptr( dc );
     return ret;
 }
