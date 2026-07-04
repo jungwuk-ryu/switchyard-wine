@@ -1664,7 +1664,7 @@ done:
 /***********************************************************************
  *              UpdateLayeredWindow   (MACDRV.@)
  */
-void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags)
+void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, BOOL per_pixel_alpha, UINT flags)
 {
     struct macdrv_win_data *data;
 
@@ -1675,7 +1675,7 @@ void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags)
             show_window(data);
 
         /* The ULW flags are a superset of the LWA flags. */
-        sync_window_opacity(data, alpha, TRUE, flags);
+        sync_window_opacity(data, alpha, per_pixel_alpha, flags);
         release_win_data(data);
     }
 }

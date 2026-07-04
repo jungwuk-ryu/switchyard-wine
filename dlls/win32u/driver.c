@@ -855,7 +855,7 @@ static LRESULT nulldrv_SysCommand( HWND hwnd, WPARAM wparam, LPARAM lparam, cons
     return -1;
 }
 
-static void nulldrv_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
+static void nulldrv_UpdateLayeredWindow( HWND hwnd, BYTE alpha, BOOL per_pixel_alpha, UINT flags )
 {
 }
 
@@ -1248,9 +1248,9 @@ static void loaderdrv_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
     load_driver()->pSetWindowRgn( hwnd, hrgn, redraw );
 }
 
-static void loaderdrv_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
+static void loaderdrv_UpdateLayeredWindow( HWND hwnd, BYTE alpha, BOOL per_pixel_alpha, UINT flags )
 {
-    load_driver()->pUpdateLayeredWindow( hwnd, alpha, flags );
+    load_driver()->pUpdateLayeredWindow( hwnd, alpha, per_pixel_alpha, flags );
 }
 
 static LRESULT loaderdrv_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *buffer )
