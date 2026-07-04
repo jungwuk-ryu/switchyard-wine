@@ -192,6 +192,8 @@ struct macdrv_win_data
     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
     unsigned int        minimized : 1;          /* is window minimized? */
     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
+    unsigned int        foreign_child : 1;      /* process-local host window for a foreign child HWND */
+    unsigned int        foreign_surface_refs;   /* surfaces presenting into a foreign child host window */
 };
 
 struct macdrv_client_surface
@@ -206,6 +208,8 @@ extern BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_s
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
 extern struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RECT *surface_rect);
+extern BOOL macdrv_retain_foreign_child_win_data(HWND hwnd);
+extern void macdrv_release_foreign_child_win_data(HWND hwnd);
 extern void release_win_data(struct macdrv_win_data *data);
 extern void init_win_context(void);
 extern macdrv_window macdrv_get_cocoa_window(HWND hwnd, BOOL require_on_screen);

@@ -50,6 +50,7 @@ struct macdrv_window_surface
     CGDataProviderRef       provider;
     POINT                   offset;
     BOOL                    child;
+    BOOL                    foreign_child;
 };
 
 static BOOL is_chromium_cef_child_window(HWND hwnd)
@@ -168,6 +169,8 @@ static void macdrv_surface_destroy(struct window_surface *window_surface)
 
     TRACE("freeing %p\n", surface);
     CGDataProviderRelease(surface->provider);
+    if (surface->foreign_child)
+        macdrv_release_foreign_child_win_data(window_surface->hwnd);
 }
 
 static const struct window_surface_funcs macdrv_surface_funcs =
@@ -187,7 +190,7 @@ static struct macdrv_window_surface *get_mac_surface(struct window_surface *surf
  *              create_surface
  */
 static struct window_surface *create_surface(HWND hwnd, macdrv_window window, const RECT *rect,
-                                             const POINT *offset, BOOL child)
+                                             const POINT *offset, BOOL child, BOOL foreign_child)
 {
     struct macdrv_window_surface *surface;
     int width = rect->right - rect->left, height = rect->bottom - rect->top;
@@ -241,6 +244,7 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
         surface->provider = provider;
         surface->offset = *offset;
         surface->child = child;
+        surface->foreign_child = foreign_child;
         window_surface->flush_on_unlock = child;
     }
 
@@ -258,6 +262,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     macdrv_window window = NULL;
     POINT offset = {0, 0};
     BOOL child = FALSE;
+    BOOL foreign_child = FALSE;
 
     TRACE("hwnd %p, layered %u, surface_rect %s, surface %p\n", hwnd, layered, wine_dbgstr_rect(surface_rect), surface);
 
@@ -322,7 +327,11 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     }
 
     if (window)
-        *surface = create_surface(hwnd, window, surface_rect, &offset, child);
+    {
+        foreign_child = macdrv_retain_foreign_child_win_data(hwnd);
+        if (!(*surface = create_surface(hwnd, window, surface_rect, &offset, child, foreign_child)) && foreign_child)
+            macdrv_release_foreign_child_win_data(hwnd);
+    }
 
     return TRUE;
 }

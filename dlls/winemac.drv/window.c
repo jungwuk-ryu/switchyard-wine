@@ -602,6 +602,7 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
 
     if (!(data = alloc_win_data(hwnd))) return NULL;
     data->rects = *rects;
+    data->foreign_child = foreign_chromium_child;
 
     if (parent == NtUserGetDesktopWindow() || foreign_chromium_child)
     {
@@ -650,6 +651,45 @@ struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RE
           hwnd, debugstr_window_rects(&rects));
 
     return macdrv_create_win_data(hwnd, &rects);
+}
+
+BOOL macdrv_retain_foreign_child_win_data(HWND hwnd)
+{
+    struct macdrv_win_data *data;
+    BOOL ret = FALSE;
+
+    if ((data = get_win_data(hwnd)))
+    {
+        if ((ret = data->foreign_child))
+            data->foreign_surface_refs++;
+        release_win_data(data);
+    }
+
+    return ret;
+}
+
+void macdrv_release_foreign_child_win_data(HWND hwnd)
+{
+    struct macdrv_win_data *data;
+
+    if (!(data = get_win_data(hwnd))) return;
+    if (!data->foreign_child)
+    {
+        release_win_data(data);
+        return;
+    }
+    if (data->foreign_surface_refs && --data->foreign_surface_refs)
+    {
+        release_win_data(data);
+        return;
+    }
+
+    TRACE("destroying foreign Chromium/CEF child mac win data for hwnd %p window %p\n",
+          hwnd, data->cocoa_window);
+    destroy_cocoa_window(data);
+    CFDictionaryRemoveValue(win_datas, hwnd);
+    release_win_data(data);
+    free(data);
 }
 
 
