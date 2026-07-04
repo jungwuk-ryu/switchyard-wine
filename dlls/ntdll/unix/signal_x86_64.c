@@ -1493,6 +1493,16 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Rip--;
 
     rsp = is_16bit(sigcontext) ? get_wow_teb(data->teb)->SystemReserved1[0] : RSP_sig(sigcontext);
+#ifdef __APPLE__
+    if (is_wow64() && CS_sig(sigcontext) != cs64_sel &&
+        (rsp < (ULONG_PTR)data->teb->Tib.StackLimit || rsp > (ULONG_PTR)data->teb->Tib.StackBase) &&
+        R14_sig(sigcontext) >= (ULONG_PTR)data->teb->Tib.StackLimit &&
+        R14_sig(sigcontext) <= (ULONG_PTR)data->teb->Tib.StackBase)
+    {
+        /* Rosetta may report the 32-bit ESP in RSP while SS still looks 64-bit. */
+        rsp = R14_sig(sigcontext);
+    }
+#endif
     rsp &= ~(ULONG_PTR)15;
     stack_size = rsp - ((rsp - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
     stack = virtual_setup_exception( data, (void *)rsp, stack_size, rec );
