@@ -1858,12 +1858,6 @@ SymCryptSha256AppendBlocks(
         SymCryptSha256AppendBlocks_shani( pChain, pbData, cbData, pcbRemaining );
         SymCryptRestoreXmm( &SaveData );
     }
-    else if (SYMCRYPT_CPU_FEATURES_PRESENT(SYMCRYPT_CPU_FEATURE_SSSE3 | SYMCRYPT_CPU_FEATURE_BMI2)
-            && SymCryptSaveXmm(&SaveData) == SYMCRYPT_NO_ERROR)
-    {
-        SymCryptSha256AppendBlocks_xmm_4blocks(pChain, pbData, cbData, pcbRemaining);
-        SymCryptRestoreXmm(&SaveData);
-    }
     else {
         SymCryptSha256AppendBlocks_ul1( pChain, pbData, cbData, pcbRemaining );
     }
