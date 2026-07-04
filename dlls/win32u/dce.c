@@ -43,6 +43,9 @@ struct dce
     UINT        flags;
     LONG        count;         /* usage count; 0 or 1 for cache DCEs, always 1 for window DCEs,
                                   always >= 1 for class DCEs */
+    struct window_surface *chromium_child_surface;
+    HWND        chromium_child_surface_hwnd;
+    RECT        chromium_child_surface_rect;
 };
 
 static struct list dce_list = LIST_INIT(dce_list);
@@ -627,6 +630,21 @@ void window_surface_release( struct window_surface *surface )
     }
 }
 
+static void release_chromium_child_surface( struct dce *dce )
+{
+    if (dce->chromium_child_surface) window_surface_release( dce->chromium_child_surface );
+    dce->chromium_child_surface = NULL;
+    dce->chromium_child_surface_hwnd = 0;
+    SetRectEmpty( &dce->chromium_child_surface_rect );
+}
+
+static BOOL chromium_child_surface_matches( const struct dce *dce, HWND hwnd, const RECT *rect )
+{
+    return dce->chromium_child_surface
+        && dce->chromium_child_surface_hwnd == hwnd
+        && EqualRect( &dce->chromium_child_surface_rect, rect );
+}
+
 void window_surface_lock( struct window_surface *surface )
 {
     if (surface == &dummy_surface) return;
@@ -922,16 +940,41 @@ static void update_visible_region( struct dce *dce )
             {
                 UINT raw_dpi;
 
-                chromium_cef_child_surface_create_depth++;
-                get_win_monitor_dpi( dce->hwnd, &raw_dpi );
-                create_window_surface( dce->hwnd, FALSE, &win_rect, raw_dpi, &surface );
-                chromium_cef_child_surface_create_depth--;
+                if (chromium_child_surface_matches( dce, dce->hwnd, &win_rect ))
+                {
+                    surface = dce->chromium_child_surface;
+                    window_surface_add_ref( surface );
+                    TRACE( "reusing local Chromium/CEF child surface %p for foreign hwnd %p DCE %p\n",
+                           surface, dce->hwnd, dce->hdc );
+                }
+                else if (dce->chromium_child_surface)
+                {
+                    TRACE( "dropping stale Chromium/CEF child surface %p for foreign hwnd %p DCE %p\n",
+                           dce->chromium_child_surface, dce->chromium_child_surface_hwnd, dce->hdc );
+                    release_chromium_child_surface( dce );
+                }
+
+                if (!surface)
+                {
+                    chromium_cef_child_surface_create_depth++;
+                    get_win_monitor_dpi( dce->hwnd, &raw_dpi );
+                    create_window_surface( dce->hwnd, FALSE, &win_rect, raw_dpi, &surface );
+                    chromium_cef_child_surface_create_depth--;
+                }
 
                 if (surface && surface != &dummy_surface)
                 {
                     surface->flush_on_unlock = TRUE;
+                    if (dce->chromium_child_surface != surface)
+                    {
+                        if (dce->chromium_child_surface) window_surface_release( dce->chromium_child_surface );
+                        dce->chromium_child_surface = surface;
+                        dce->chromium_child_surface_hwnd = dce->hwnd;
+                        dce->chromium_child_surface_rect = win_rect;
+                        window_surface_add_ref( surface );
+                    }
                     top_rect = win_rect;
-                    TRACE( "created local Chromium/CEF child surface %p for foreign hwnd %p DCE %p\n",
+                    TRACE( "using local Chromium/CEF child surface %p for foreign hwnd %p DCE %p\n",
                            surface, dce->hwnd, dce->hdc );
                 }
                 else
@@ -975,6 +1018,7 @@ static void release_dce( struct dce *dce )
 
     set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface );
     user_driver->pReleaseDC( dce->hwnd, dce->hdc );
+    release_chromium_child_surface( dce );
 
     if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
     dce->clip_rgn = 0;
@@ -1016,6 +1060,7 @@ BOOL delete_dce( struct dce *dce )
     {
         list_remove( &dce->entry );
         if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
+        release_chromium_child_surface( dce );
         free( dce );
     }
     user_unlock();
@@ -1060,6 +1105,9 @@ static struct dce *alloc_dce(void)
     dce->clip_rgn  = 0;
     dce->flags     = 0;
     dce->count     = 1;
+    dce->chromium_child_surface = NULL;
+    dce->chromium_child_surface_hwnd = 0;
+    SetRectEmpty( &dce->chromium_child_surface_rect );
 
     set_dc_dce( dce->hdc, dce );
     return dce;
