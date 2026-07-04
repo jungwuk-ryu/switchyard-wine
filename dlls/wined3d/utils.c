@@ -1888,6 +1888,20 @@ static void format_clear_caps(struct wined3d_format *format, unsigned int caps)
         format->caps[i] &= ~caps;
 }
 
+static BOOL format_uses_legacy_rgb16f_fallback(const struct wined3d_format_gl *format)
+{
+    return format->internal == GL_RGB16F_ARB
+            && format->format == GL_RGB
+            && format->type == GL_HALF_FLOAT_ARB;
+}
+
+static void format_disable_fbo_caps(struct wined3d_format *format)
+{
+    format_clear_caps(format, WINED3D_FORMAT_CAP_RENDERTARGET | WINED3D_FORMAT_CAP_DEPTH_STENCIL
+            | WINED3D_FORMAT_CAP_FBO_ATTACHABLE | WINED3D_FORMAT_CAP_FBO_ATTACHABLE_SRGB
+            | WINED3D_FORMAT_CAP_POSTPIXELSHADER_BLENDING);
+}
+
 static enum wined3d_channel_type map_channel_type(char t)
 {
     switch (t)
@@ -2696,6 +2710,14 @@ static void init_format_fbo_compat_info(const struct wined3d_adapter *adapter,
             if (!format->internal)
                 continue;
 
+            if ((gl_info->quirks & WINED3D_QUIRK_BROKEN_RGB16F_FBO)
+                    && format_uses_legacy_rgb16f_fallback(format))
+            {
+                TRACE("Skipping format %s legacy RGB16F FBO probe.\n", debug_d3dformat(format->f.id));
+                format_disable_fbo_caps(&format->f);
+                continue;
+            }
+
             for (type = 0; type < ARRAY_SIZE(format->f.caps); ++type)
             {
                 gl_info->gl_ops.ext.p_glGetInternalformativ(wined3d_gl_type_to_enum(type),
@@ -2808,6 +2830,14 @@ static void init_format_fbo_compat_info(const struct wined3d_adapter *adapter,
         {
             TRACE("Skipping format %s because it's a compressed format.\n",
                     debug_d3dformat(format->f.id));
+            continue;
+        }
+
+        if ((gl_info->quirks & WINED3D_QUIRK_BROKEN_RGB16F_FBO)
+                && format_uses_legacy_rgb16f_fallback(format))
+        {
+            TRACE("Skipping format %s legacy RGB16F FBO probe.\n", debug_d3dformat(format->f.id));
+            format_disable_fbo_caps(&format->f);
             continue;
         }
 

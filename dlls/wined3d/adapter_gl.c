@@ -941,6 +941,11 @@ static void quirk_broken_rgba16(struct wined3d_gl_info *gl_info)
     gl_info->quirks |= WINED3D_QUIRK_BROKEN_RGBA16;
 }
 
+static void quirk_broken_rgb16f_fbo(struct wined3d_gl_info *gl_info)
+{
+    gl_info->quirks |= WINED3D_QUIRK_BROKEN_RGB16F_FBO;
+}
+
 static void quirk_infolog_spam(struct wined3d_gl_info *gl_info)
 {
     gl_info->quirks |= WINED3D_QUIRK_INFO_LOG_SPAM;
@@ -1045,6 +1050,11 @@ static void fixup_extensions(struct wined3d_gl_info *gl_info, struct wined3d_cap
             match_apple,
             quirk_apple_glsl_constants,
             "Apple GLSL uniform override"
+        },
+        {
+            match_apple,
+            quirk_broken_rgb16f_fbo,
+            "Apple RGB16F FBO probe workaround"
         },
         {
             match_geforce5,
@@ -1156,13 +1166,16 @@ static enum wined3d_gl_vendor wined3d_guess_gl_vendor(const struct wined3d_gl_in
      * the opengl 1.2+ core, while other extensions are advertised, but software emulated. So try to
      * detect the Apple OpenGL implementation to apply some extension fixups afterwards.
      *
-     * Detecting this isn't really easy. The vendor string doesn't mention Apple. Compile-time checks
+     * Detecting this historically wasn't really easy. The vendor string didn't mention Apple. Compile-time checks
      * aren't sufficient either because a Linux binary may display on a macos X server via remote X11.
      * So try to detect the GL implementation by looking at certain Apple extensions. Some extensions
      * like client storage might be supported on other implementations too, but GL_APPLE_flush_render
      * is specific to the Mac OS X window management, and GL_APPLE_ycbcr_422 is QuickTime specific. So
      * the chance that other implementations support them is rather small since Win32 QuickTime uses
      * DirectDraw, not OpenGL. */
+    if (!strcmp(gl_vendor_string, "Apple"))
+        return GL_VENDOR_APPLE;
+
     if (gl_info->supported[APPLE_FLUSH_RENDER]
             && (gl_info->supported[APPLE_YCBCR_422] || gl_info->supported[APPLE_RGB_422]))
         return GL_VENDOR_APPLE;
@@ -1218,7 +1231,9 @@ static enum wined3d_pci_vendor wined3d_guess_card_vendor(const char *gl_vendor_s
             /* Intel switched from Intel(R) to Intel® recently, so just match Intel. */
             || strstr(gl_renderer, "Intel")
             || strstr(gl_renderer, "i915")
-            || strstr(gl_vendor_string, "Intel Inc."))
+            || strstr(gl_vendor_string, "Intel Inc.")
+            || !strcmp(gl_vendor_string, "Apple")
+            || !strncmp(gl_renderer, "Apple ", 6))
         return HW_VENDOR_INTEL;
 
     if (strstr(gl_vendor_string, "Red Hat")
