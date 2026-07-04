@@ -946,6 +946,11 @@ static void quirk_broken_rgb16f_fbo(struct wined3d_gl_info *gl_info)
     gl_info->quirks |= WINED3D_QUIRK_BROKEN_RGB16F_FBO;
 }
 
+static void quirk_broken_fbo_draw_probe(struct wined3d_gl_info *gl_info)
+{
+    gl_info->quirks |= WINED3D_QUIRK_BROKEN_FBO_DRAW_PROBE;
+}
+
 static void quirk_infolog_spam(struct wined3d_gl_info *gl_info)
 {
     gl_info->quirks |= WINED3D_QUIRK_INFO_LOG_SPAM;
@@ -1055,6 +1060,11 @@ static void fixup_extensions(struct wined3d_gl_info *gl_info, struct wined3d_cap
             match_apple,
             quirk_broken_rgb16f_fbo,
             "Apple RGB16F FBO probe workaround"
+        },
+        {
+            match_apple,
+            quirk_broken_fbo_draw_probe,
+            "Apple FBO draw probe workaround"
         },
         {
             match_geforce5,

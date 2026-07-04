@@ -2494,6 +2494,13 @@ static void check_fbo_compat(struct wined3d_caps_gl_ctx *ctx, struct wined3d_for
         }
 
         if (status == GL_FRAMEBUFFER_COMPLETE
+                && (gl_info->quirks & WINED3D_QUIRK_BROKEN_FBO_DRAW_PROBE))
+        {
+            TRACE("Skipping format %s FBO blending draw probe, type %u.\n",
+                    debug_d3dformat(format->f.id), type);
+            format->f.caps[type] &= ~WINED3D_FORMAT_CAP_POSTPIXELSHADER_BLENDING;
+        }
+        else if (status == GL_FRAMEBUFFER_COMPLETE
                 && ((format->f.caps[type] & WINED3D_FORMAT_CAP_POSTPIXELSHADER_BLENDING)
                 || !(gl_info->quirks & WINED3D_QUIRK_LIMITED_TEX_FILTERING))
                 && !(format->f.attrs & WINED3D_FORMAT_ATTR_INTEGER)
