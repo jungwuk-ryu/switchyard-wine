@@ -28,10 +28,65 @@ WINE_DEFAULT_DEBUG_CHANNEL(class);
 
 #define MAX_ATOM_LEN 255 /* from dlls/kernel32/atom.c */
 
+struct wndclass_redirect_data
+{
+    ULONG size;
+    DWORD res;
+    ULONG name_len;
+    ULONG name_offset;
+    ULONG module_len;
+    ULONG module_offset;
+};
+
 static inline const char *debugstr_us( const UNICODE_STRING *us )
 {
     if (!us) return "<null>";
     return debugstr_wn( us->Buffer, us->Length / sizeof(WCHAR) );
+}
+
+static BOOL actctx_section_contains_range( const ACTCTX_SECTION_KEYED_DATA *data, UINT_PTR offset, SIZE_T size )
+{
+    return data->lpSectionBase && offset <= data->ulSectionTotalLength
+            && size <= data->ulSectionTotalLength - offset;
+}
+
+static BOOL actctx_section_contains_pointer( const ACTCTX_SECTION_KEYED_DATA *data, const void *ptr, SIZE_T size )
+{
+    UINT_PTR base = (UINT_PTR)data->lpSectionBase, value = (UINT_PTR)ptr;
+
+    return ptr && value >= base && actctx_section_contains_range( data, value - base, size );
+}
+
+static BOOL actctx_section_contains_data( const ACTCTX_SECTION_KEYED_DATA *data, SIZE_T size )
+{
+    return data->ulLength >= size && actctx_section_contains_pointer( data, data->lpData, size );
+}
+
+static BOOL actctx_data_contains_range( const ACTCTX_SECTION_KEYED_DATA *data, UINT_PTR offset, SIZE_T size )
+{
+    UINT_PTR base = (UINT_PTR)data->lpData;
+
+    return data->lpData && offset <= data->ulLength && size <= data->ulLength - offset
+            && offset <= ~(UINT_PTR)0 - base
+            && actctx_section_contains_pointer( data, (const BYTE *)data->lpData + offset, size );
+}
+
+static BOOL actctx_data_contains_string( const ACTCTX_SECTION_KEYED_DATA *data, UINT_PTR offset, ULONG len )
+{
+    return data->lpData && len <= ~(ULONG)0 - sizeof(WCHAR)
+            && actctx_data_contains_range( data, offset, len + sizeof(WCHAR) );
+}
+
+static BOOL actctx_section_contains_string( const ACTCTX_SECTION_KEYED_DATA *data, UINT_PTR offset, ULONG len )
+{
+    return len <= ~(ULONG)0 - sizeof(WCHAR)
+            && actctx_section_contains_range( data, offset, len + sizeof(WCHAR) );
+}
+
+static BOOL unicode_string_has_write_capacity( const UNICODE_STRING *str, ULONG len )
+{
+    return str->Buffer && str->MaximumLength >= sizeof(WCHAR)
+            && len <= str->MaximumLength - sizeof(WCHAR);
 }
 
 /***********************************************************************
@@ -210,6 +265,7 @@ void get_class_version( UNICODE_STRING *name, UNICODE_STRING *version, BOOL load
     ACTCTX_SECTION_KEYED_DATA data = {.cbSize = sizeof(data)};
     const WCHAR *class_name = name->Buffer;
     HMODULE hmod = NULL;
+    BOOL redirected = FALSE;
 
     memset( version, 0, sizeof(*version) );
 
@@ -217,31 +273,33 @@ void get_class_version( UNICODE_STRING *name, UNICODE_STRING *version, BOOL load
 
     if (!RtlFindActivationContextSectionString( 0, NULL, ACTIVATION_CONTEXT_SECTION_WINDOW_CLASS_REDIRECTION, name, &data ))
     {
-        struct wndclass_redirect_data
-        {
-            ULONG size;
-            DWORD res;
-            ULONG name_len;
-            ULONG name_offset;
-            ULONG module_len;
-            ULONG module_offset;
-        } *wndclass = (struct wndclass_redirect_data *)data.lpData;
+        struct wndclass_redirect_data *wndclass = (struct wndclass_redirect_data *)data.lpData;
         const WCHAR *module, *ptr;
 
-        module = (const WCHAR *)((BYTE *)data.lpSectionBase + wndclass->module_offset);
-        if (load && !(hmod = GetModuleHandleW( module ))) hmod = LoadLibraryW( module );
+        if (actctx_section_contains_data( &data, sizeof(*wndclass) )
+                && wndclass->name_len >= name->Length
+                && unicode_string_has_write_capacity( name, wndclass->name_len )
+                && actctx_data_contains_string( &data, wndclass->name_offset, wndclass->name_len )
+                && actctx_section_contains_string( &data, wndclass->module_offset, wndclass->module_len ))
+        {
+            module = (const WCHAR *)((BYTE *)data.lpSectionBase + wndclass->module_offset);
+            if (load && !(hmod = GetModuleHandleW( module ))) hmod = LoadLibraryW( module );
 
-        *version = *name;
-        version->Length = wndclass->name_len - name->Length;
-        class_name += version->Length / sizeof(WCHAR);
+            *version = *name;
+            version->Length = wndclass->name_len - name->Length;
+            class_name += version->Length / sizeof(WCHAR);
 
-        ptr = (const WCHAR *)((BYTE *)wndclass + wndclass->name_offset);
-        memcpy( name->Buffer, ptr, wndclass->name_len );
-        name->Length = wndclass->name_len;
-        name->Buffer[name->Length / sizeof(WCHAR)] = 0;
+            ptr = (const WCHAR *)((BYTE *)wndclass + wndclass->name_offset);
+            memcpy( name->Buffer, ptr, wndclass->name_len );
+            name->Length = wndclass->name_len;
+            name->Buffer[name->Length / sizeof(WCHAR)] = 0;
+            redirected = TRUE;
+        }
+        else
+            WARN( "ignoring invalid activation context window class data for %s\n", debugstr_us(name) );
     }
     /* comctl32 v5 */
-    else if (load && is_comctl32_class( name->Buffer ))
+    if (!redirected && load && is_comctl32_class( name->Buffer ))
     {
         hmod = GetModuleHandleW( L"C:\\windows\\system32\\comctl32.dll" );
         if (!hmod) hmod = LoadLibraryW( L"C:\\windows\\system32\\comctl32.dll" );
