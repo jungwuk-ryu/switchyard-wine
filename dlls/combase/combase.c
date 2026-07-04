@@ -91,6 +91,33 @@ struct progidredirect_data
     ULONG clsid_offset;
 };
 
+static BOOL actctx_section_contains_range(const ACTCTX_SECTION_KEYED_DATA *data, UINT_PTR offset, SIZE_T size)
+{
+    return data->lpSectionBase && offset <= data->ulSectionTotalLength
+            && size <= data->ulSectionTotalLength - offset;
+}
+
+static BOOL actctx_section_contains_pointer(const ACTCTX_SECTION_KEYED_DATA *data, const void *ptr, SIZE_T size)
+{
+    UINT_PTR base = (UINT_PTR)data->lpSectionBase, value = (UINT_PTR)ptr;
+
+    return ptr && value >= base && actctx_section_contains_range(data, value - base, size);
+}
+
+static BOOL actctx_section_contains_data(const ACTCTX_SECTION_KEYED_DATA *data, SIZE_T size)
+{
+    return data->ulLength >= size && actctx_section_contains_pointer(data, data->lpData, size);
+}
+
+static BOOL actctx_data_contains_range(const ACTCTX_SECTION_KEYED_DATA *data, UINT_PTR offset, SIZE_T size)
+{
+    UINT_PTR base = (UINT_PTR)data->lpData;
+
+    return data->lpData && offset <= data->ulLength && size <= data->ulLength - offset
+            && offset <= ~(UINT_PTR)0 - base
+            && actctx_section_contains_pointer(data, (const BYTE *)data->lpData + offset, size);
+}
+
 struct init_spy
 {
     struct list entry;
@@ -1271,7 +1298,7 @@ done:
  */
 HRESULT WINAPI DECLSPEC_HOTPATCH ProgIDFromCLSID(REFCLSID clsid, LPOLESTR *progid)
 {
-    ACTCTX_SECTION_KEYED_DATA data;
+    ACTCTX_SECTION_KEYED_DATA data = { sizeof(data) };
     LONG progidlen = 0;
     HKEY hkey;
     REGSAM opposite = (sizeof(void *) > sizeof(int)) ? KEY_WOW64_32KEY : KEY_WOW64_64KEY;
@@ -1283,26 +1310,46 @@ HRESULT WINAPI DECLSPEC_HOTPATCH ProgIDFromCLSID(REFCLSID clsid, LPOLESTR *progi
 
     *progid = NULL;
 
-    data.cbSize = sizeof(data);
     if (FindActCtxSectionGuid(0, NULL, ACTIVATION_CONTEXT_SECTION_COM_SERVER_REDIRECTION,
             clsid, &data))
     {
-        struct comclassredirect_data *comclass = (struct comclassredirect_data *)data.lpData;
-        if (comclass->progid_len)
+        if (actctx_section_contains_data(&data, sizeof(struct comclassredirect_data)))
         {
-            WCHAR *ptrW;
+            struct comclassredirect_data *comclass = (struct comclassredirect_data *)data.lpData;
 
-            *progid = CoTaskMemAlloc(comclass->progid_len + sizeof(WCHAR));
-            if (!*progid) return E_OUTOFMEMORY;
+            if (comclass->progid_len)
+            {
+                WCHAR *ptrW;
+                SIZE_T progid_size;
 
-            ptrW = (WCHAR *)((BYTE *)comclass + comclass->progid_offset);
-            memcpy(*progid, ptrW, comclass->progid_len + sizeof(WCHAR));
-            return S_OK;
+                if (comclass->progid_len > ~(ULONG)0 - sizeof(WCHAR))
+                {
+                    WARN("ignoring invalid activation context ProgID data for %s\n", debugstr_guid(clsid));
+                    goto registry;
+                }
+                progid_size = comclass->progid_len + sizeof(WCHAR);
+
+                if (!actctx_data_contains_range(&data, comclass->progid_offset, progid_size))
+                {
+                    WARN("ignoring invalid activation context ProgID data for %s\n", debugstr_guid(clsid));
+                    goto registry;
+                }
+
+                *progid = CoTaskMemAlloc(progid_size);
+                if (!*progid) return E_OUTOFMEMORY;
+
+                ptrW = (WCHAR *)((BYTE *)comclass + comclass->progid_offset);
+                memcpy(*progid, ptrW, progid_size);
+                return S_OK;
+            }
+            else
+                return REGDB_E_CLASSNOTREG;
         }
         else
-            return REGDB_E_CLASSNOTREG;
+            WARN("ignoring invalid activation context COM server data for %s\n", debugstr_guid(clsid));
     }
 
+registry:
     hr = open_key_for_clsid(clsid, L"ProgID", KEY_READ, &hkey);
     if (FAILED(hr) && (opposite == KEY_WOW64_32KEY || (IsWow64Process(GetCurrentProcess(), &is_wow64) && is_wow64)))
     {
@@ -1446,19 +1493,27 @@ static HRESULT clsid_from_string_reg(LPCOLESTR progid, CLSID *clsid)
  */
 HRESULT WINAPI DECLSPEC_HOTPATCH CLSIDFromProgID(LPCOLESTR progid, CLSID *clsid)
 {
-    ACTCTX_SECTION_KEYED_DATA data;
+    ACTCTX_SECTION_KEYED_DATA data = { sizeof(data) };
 
     if (!progid || !clsid)
         return E_INVALIDARG;
 
-    data.cbSize = sizeof(data);
     if (FindActCtxSectionStringW(0, NULL, ACTIVATION_CONTEXT_SECTION_COM_PROGID_REDIRECTION,
             progid, &data))
     {
-        struct progidredirect_data *progiddata = (struct progidredirect_data *)data.lpData;
-        CLSID *alias = (CLSID *)((BYTE *)data.lpSectionBase + progiddata->clsid_offset);
-        *clsid = *alias;
-        return S_OK;
+        if (actctx_section_contains_data(&data, sizeof(struct progidredirect_data)))
+        {
+            struct progidredirect_data *progiddata = (struct progidredirect_data *)data.lpData;
+
+            if (actctx_section_contains_range(&data, progiddata->clsid_offset, sizeof(*clsid)))
+            {
+                CLSID *alias = (CLSID *)((BYTE *)data.lpSectionBase + progiddata->clsid_offset);
+                *clsid = *alias;
+                return S_OK;
+            }
+        }
+
+        WARN("ignoring invalid activation context ProgID redirection for %s\n", debugstr_w(progid));
     }
 
     return clsid_from_string_reg(progid, clsid);
@@ -1761,24 +1816,35 @@ static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
 
     if (clscontext & CLSCTX_INPROC)
     {
-        ACTCTX_SECTION_KEYED_DATA data;
+        ACTCTX_SECTION_KEYED_DATA data = { sizeof(data) };
 
-        data.cbSize = sizeof(data);
         /* search activation context first */
         if (FindActCtxSectionGuid(FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX, NULL,
                 ACTIVATION_CONTEXT_SECTION_COM_SERVER_REDIRECTION, rclsid, &data))
         {
-            struct comclassredirect_data *comclass = (struct comclassredirect_data *)data.lpData;
+            if (actctx_section_contains_data(&data, sizeof(struct comclassredirect_data)))
+            {
+                struct comclassredirect_data *comclass = (struct comclassredirect_data *)data.lpData;
+                SIZE_T name_size;
 
-            clsreg.u.actctx.module_name = (WCHAR *)((BYTE *)data.lpSectionBase + comclass->name_offset);
-            clsreg.u.actctx.hactctx = data.hActCtx;
-            clsreg.u.actctx.threading_model = comclass->model;
-            clsreg.origin = CLASS_REG_ACTCTX;
+                if (comclass->name_len <= ~(ULONG)0 - sizeof(WCHAR)
+                        && (name_size = comclass->name_len + sizeof(WCHAR))
+                        && actctx_section_contains_range(&data, comclass->name_offset, name_size))
+                {
+                    clsreg.u.actctx.module_name = (WCHAR *)((BYTE *)data.lpSectionBase + comclass->name_offset);
+                    clsreg.u.actctx.hactctx = data.hActCtx;
+                    clsreg.u.actctx.threading_model = comclass->model;
+                    clsreg.origin = CLASS_REG_ACTCTX;
 
-            hr = apartment_get_inproc_class_object(apt, &clsreg, &comclass->clsid, riid, clscontext, obj);
-            ReleaseActCtx(data.hActCtx);
-            apartment_release(apt);
-            return hr;
+                    hr = apartment_get_inproc_class_object(apt, &clsreg, &comclass->clsid, riid, clscontext, obj);
+                    ReleaseActCtx(data.hActCtx);
+                    apartment_release(apt);
+                    return hr;
+                }
+            }
+
+            WARN("ignoring invalid activation context COM server data for %s\n", debugstr_guid(rclsid));
+            if (data.hActCtx) ReleaseActCtx(data.hActCtx);
         }
     }
 
@@ -2309,7 +2375,7 @@ HRESULT WINAPI CoGetPSClsid(REFIID riid, CLSID *pclsid)
     static const WCHAR interfaceW[] = L"Interface\\";
     static const WCHAR psW[] = L"\\ProxyStubClsid32";
     WCHAR path[ARRAY_SIZE(interfaceW) - 1 + CHARS_IN_GUID - 1 + ARRAY_SIZE(psW)];
-    ACTCTX_SECTION_KEYED_DATA data;
+    ACTCTX_SECTION_KEYED_DATA data = { sizeof(data) };
     struct registered_ps *cur;
     REGSAM opposite = (sizeof(void*) > sizeof(int)) ? KEY_WOW64_32KEY : KEY_WOW64_64KEY;
     BOOL is_wow64;
@@ -2340,13 +2406,17 @@ HRESULT WINAPI CoGetPSClsid(REFIID riid, CLSID *pclsid)
 
     LeaveCriticalSection(&cs_registered_ps);
 
-    data.cbSize = sizeof(data);
     if (FindActCtxSectionGuid(0, NULL, ACTIVATION_CONTEXT_SECTION_COM_INTERFACE_REDIRECTION,
             riid, &data))
     {
-        struct ifacepsredirect_data *ifaceps = (struct ifacepsredirect_data *)data.lpData;
-        *pclsid = ifaceps->iid;
-        return S_OK;
+        if (actctx_section_contains_data(&data, sizeof(struct ifacepsredirect_data)))
+        {
+            struct ifacepsredirect_data *ifaceps = (struct ifacepsredirect_data *)data.lpData;
+            *pclsid = ifaceps->iid;
+            return S_OK;
+        }
+
+        WARN("ignoring invalid activation context COM interface data for %s\n", debugstr_guid(riid));
     }
 
     /* Interface\\{string form of riid}\\ProxyStubClsid32 */
