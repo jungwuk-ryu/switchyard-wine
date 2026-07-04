@@ -440,6 +440,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) setShape:(CGPathRef)newShape;
 
+    - (void) checkWineDisplayLink;
     - (void) updateForGLSubviews;
 
     - (BOOL) becameEligibleParentOrChild;
@@ -3631,6 +3632,15 @@ void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rec
         [view setColorImage:image];
         [view setSurfaceRect:cgrect_mac_from_win(rect)];
         [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
+
+        if (!window.drawnSinceShown)
+        {
+            [window setAutodisplay:YES];
+            [window displayIfNeeded];
+
+            /* Now that real layer contents exist, retry the normal display-link gate. */
+            [window checkWineDisplayLink];
+        }
 
         CGImageRelease(image);
     });
