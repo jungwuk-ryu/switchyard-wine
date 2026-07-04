@@ -2083,7 +2083,6 @@ BOOL WINAPI WinHttpGetIEProxyConfigForCurrentUser( WINHTTP_CURRENT_USER_IE_PROXY
         return FALSE;
     }
     memset( config, 0, sizeof(*config) );
-    config->fAutoDetect = TRUE;
 
     if (RegOpenKeyExW( HKEY_CURRENT_USER, path_connections, 0, KEY_READ, &hkey ) ||
         RegQueryValueExW( hkey, L"DefaultConnectionSettings", NULL, &type, NULL, &size ) ||
