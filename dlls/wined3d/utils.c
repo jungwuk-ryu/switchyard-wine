@@ -1888,10 +1888,9 @@ static void format_clear_caps(struct wined3d_format *format, unsigned int caps)
         format->caps[i] &= ~caps;
 }
 
-static BOOL format_uses_legacy_rgb16f_fallback(const struct wined3d_format_gl *format)
+static BOOL format_uses_legacy_rgb16f_storage(const struct wined3d_format_gl *format)
 {
     return format->internal == GL_RGB16F_ARB
-            && format->format == GL_RGB
             && format->type == GL_HALF_FLOAT_ARB;
 }
 
@@ -2711,7 +2710,7 @@ static void init_format_fbo_compat_info(const struct wined3d_adapter *adapter,
                 continue;
 
             if ((gl_info->quirks & WINED3D_QUIRK_BROKEN_RGB16F_FBO)
-                    && format_uses_legacy_rgb16f_fallback(format))
+                    && format_uses_legacy_rgb16f_storage(format))
             {
                 TRACE("Skipping format %s legacy RGB16F FBO probe.\n", debug_d3dformat(format->f.id));
                 format_disable_fbo_caps(&format->f);
@@ -2834,7 +2833,7 @@ static void init_format_fbo_compat_info(const struct wined3d_adapter *adapter,
         }
 
         if ((gl_info->quirks & WINED3D_QUIRK_BROKEN_RGB16F_FBO)
-                && format_uses_legacy_rgb16f_fallback(format))
+                && format_uses_legacy_rgb16f_storage(format))
         {
             TRACE("Skipping format %s legacy RGB16F FBO probe.\n", debug_d3dformat(format->f.id));
             format_disable_fbo_caps(&format->f);
