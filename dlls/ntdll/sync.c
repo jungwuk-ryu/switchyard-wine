@@ -45,6 +45,21 @@ static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
     return wine_dbgstr_longlong( timeout->QuadPart );
 }
 
+static inline DWORD get_sync_thread_id(void)
+{
+    TEB *teb = NtCurrentTeb();
+
+#ifdef _WIN64
+    if (!teb)
+    {
+        struct current_teb_params params = { NULL };
+
+        if (!WINE_UNIX_CALL( unix_get_current_teb, &params )) teb = params.teb;
+    }
+#endif
+    return teb ? HandleToULong( teb->ClientId.UniqueThread ) : 0;
+}
+
 /******************************************************************
  *              RtlRunOnceInitialize (NTDLL.@)
  */
@@ -317,7 +332,7 @@ NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
         timeout = (TRACE_ON(relay) ? 300 : 60);
 
         ERR( "section %p %s wait timed out in thread %04lx, blocked by %04lx, retrying (%u sec)\n",
-             crit, debugstr_a(crit_section_get_name(crit)), GetCurrentThreadId(), HandleToULong(crit->OwningThread), timeout );
+             crit, debugstr_a(crit_section_get_name(crit)), get_sync_thread_id(), HandleToULong(crit->OwningThread), timeout );
     }
     if (crit_section_has_debuginfo( crit )) crit->DebugInfo->ContentionCount++;
     return STATUS_SUCCESS;
@@ -350,6 +365,8 @@ NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
  */
 NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
+    DWORD thread_id;
+
     if (crit->SpinCount)
     {
         ULONG count;
@@ -370,7 +387,9 @@ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
     {
         NTSTATUS status;
 
-        if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
+        thread_id = get_sync_thread_id();
+
+        if (crit->OwningThread == ULongToHandle(thread_id))
         {
             crit->RecursionCount++;
             return STATUS_SUCCESS;
@@ -380,7 +399,8 @@ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
         if ((status = RtlpWaitForCriticalSection( crit ))) RtlRaiseStatus( status );
     }
 done:
-    crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
+    thread_id = get_sync_thread_id();
+    crit->OwningThread   = ULongToHandle(thread_id);
     crit->RecursionCount = 1;
     return STATUS_SUCCESS;
 }
@@ -392,13 +412,15 @@ done:
 BOOL WINAPI RtlTryEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
     BOOL ret = FALSE;
+    DWORD thread_id = get_sync_thread_id();
+
     if (InterlockedCompareExchange( &crit->LockCount, 0, -1 ) == -1)
     {
-        crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
+        crit->OwningThread   = ULongToHandle(thread_id);
         crit->RecursionCount = 1;
         ret = TRUE;
     }
-    else if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
+    else if (crit->OwningThread == ULongToHandle(thread_id))
     {
         InterlockedIncrement( &crit->LockCount );
         crit->RecursionCount++;
@@ -422,7 +444,7 @@ BOOL WINAPI RtlIsCriticalSectionLocked( RTL_CRITICAL_SECTION *crit )
  */
 BOOL WINAPI RtlIsCriticalSectionLockedByThread( RTL_CRITICAL_SECTION *crit )
 {
-    return crit->OwningThread == ULongToHandle(GetCurrentThreadId()) &&
+    return crit->OwningThread == ULongToHandle(get_sync_thread_id()) &&
            crit->RecursionCount;
 }
 
@@ -1176,7 +1198,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
         return STATUS_INVALID_PARAMETER;
 
     entry.addr = addr;
-    entry.tid = GetCurrentThreadId();
+    entry.tid = get_sync_thread_id();
 
     spin_lock( &queue->lock );
 
