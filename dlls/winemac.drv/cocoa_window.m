@@ -406,7 +406,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) wine_setBackingSize:(const int*)newBackingSize;
 
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
-    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId;
+    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame;
+    - (void) updateCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame;
     - (void) removeCALayerHostView:(CAContextID)contextId;
 
 @end
@@ -727,7 +728,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         return _metalView;
     }
 
-    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId
+    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame
     {
         if (!_caLayerHosts)
             _caLayerHosts = [[NSMutableDictionary alloc] init];
@@ -738,13 +739,35 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         [host setContextId:contextId];
         host.magnificationFilter = kCAFilterNearest;
         host.contentsScale = retina_on ? 2.0 : 1.0;
-        host.frame = self.layer.bounds;
-        host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+        if (CGRectIsNull(frame))
+        {
+            host.frame = self.layer.bounds;
+            host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+        }
+        else
+        {
+            host.frame = frame;
+            host.autoresizingMask = 0;
+        }
 
         [self.layer addSublayer:host];
         [_caLayerHosts setObject:host forKey:@(contextId)];
 
         [(WineWindow*)self.window windowDidDrawContent];
+    }
+
+    - (void) updateCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame
+    {
+        CALayerHost* host = [_caLayerHosts objectForKey:@(contextId)];
+
+        if (!host)
+        {
+            [self addCALayerHostViewWithContextId:contextId frame:frame];
+            return;
+        }
+
+        if (!CGRectIsNull(frame))
+            host.frame = frame;
     }
 
     - (void) removeCALayerHostView:(CAContextID)contextId
@@ -4091,6 +4114,91 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 
 @end
 
+@interface CAContextImageLayer : NSObject
+{
+    void* hwnd;
+    void* release_hwnd;
+    CALayer* image_layer;
+    CAContext* remote_context;
+    CAContextID context_id;
+}
+
+- (instancetype) initWithHwnd:(void*)newHwnd releaseHwnd:(void*)newReleaseHwnd bounds:(CGRect)bounds;
+- (void) setColorImage:(CGImageRef)image bounds:(CGRect)bounds;
+
+@end
+
+@implementation CAContextImageLayer
+
+- (instancetype) initWithHwnd:(void*)newHwnd releaseHwnd:(void*)newReleaseHwnd bounds:(CGRect)bounds
+{
+    self = [super init];
+    if (!self) return nil;
+
+    hwnd = newHwnd;
+    release_hwnd = newReleaseHwnd ? newReleaseHwnd : newHwnd;
+
+    image_layer = [[CALayer alloc] init];
+    if (!image_layer)
+    {
+        [self release];
+        return nil;
+    }
+
+    image_layer.magnificationFilter = kCAFilterNearest;
+    image_layer.minificationFilter = kCAFilterNearest;
+    image_layer.contentsGravity = kCAGravityResize;
+    image_layer.contentsScale = retina_on ? 2.0 : 1.0;
+    [image_layer setBounds:cgrect_mac_from_win(bounds)];
+    [image_layer setAnchorPoint:CGPointMake(0, 0)];
+
+    OnMainThread(^{
+        remote_context = [[CAContext contextWithCGSConnection:CGSMainConnectionID()
+                                                      options:[NSDictionary dictionary]] retain];
+        [remote_context setLayer:image_layer];
+        context_id = [remote_context contextId];
+    });
+
+    if (!remote_context || !context_id)
+    {
+        [self release];
+        return nil;
+    }
+
+    macdrv_create_remote_layer(hwnd, context_id);
+    return self;
+}
+
+- (void) setColorImage:(CGImageRef)image bounds:(CGRect)bounds
+{
+    CGImageRetain(image);
+    macdrv_update_remote_layer(hwnd, context_id);
+
+    OnMainThreadAsync(^{
+        image_layer.contentsScale = retina_on ? 2.0 : 1.0;
+        image_layer.bounds = cgrect_mac_from_win(bounds);
+        image_layer.contents = (id)image;
+        CGImageRelease(image);
+    });
+}
+
+- (void) dealloc
+{
+    if (context_id) macdrv_release_remote_layer(release_hwnd, context_id);
+    CAContext *context = remote_context;
+    CALayer *layer = image_layer;
+
+    OnMainThreadAsync(^{
+        [context setLayer:nil];
+        [context release];
+        [layer release];
+    });
+
+    [super dealloc];
+}
+
+@end
+
 @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
 {
     void* hwnd;
@@ -4209,7 +4317,37 @@ void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int conte
         NSView* content_view = [window contentView];
 
         if ([content_view isKindOfClass:[WineContentView class]])
-            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id];
+            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id frame:CGRectNull];
+    });
+}
+}
+
+void macdrv_window_create_ca_layer_host_view_at(macdrv_window w, unsigned int context_id, CGRect frame)
+{
+@autoreleasepool
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThread(^{
+        NSView* content_view = [window contentView];
+
+        if ([content_view isKindOfClass:[WineContentView class]])
+            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id frame:frame];
+    });
+}
+}
+
+void macdrv_window_update_ca_layer_host_view(macdrv_window w, unsigned int context_id, CGRect frame)
+{
+@autoreleasepool
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThread(^{
+        NSView* content_view = [window contentView];
+
+        if ([content_view isKindOfClass:[WineContentView class]])
+            [(WineContentView*)content_view updateCALayerHostViewWithContextId:context_id frame:frame];
     });
 }
 }
@@ -4227,6 +4365,21 @@ void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int cont
             [(WineContentView*)content_view removeCALayerHostView:context_id];
     });
 }
+}
+
+macdrv_image_layer macdrv_create_image_layer(void* hwnd, void* release_hwnd, CGRect bounds)
+{
+    return (macdrv_image_layer)[[CAContextImageLayer alloc] initWithHwnd:hwnd releaseHwnd:release_hwnd bounds:bounds];
+}
+
+void macdrv_image_layer_set_color_image(macdrv_image_layer image_layer, CGImageRef image, CGRect bounds)
+{
+    [(CAContextImageLayer*)image_layer setColorImage:image bounds:bounds];
+}
+
+void macdrv_destroy_image_layer(macdrv_image_layer image_layer)
+{
+    [(CAContextImageLayer*)image_layer release];
 }
 
 bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2])

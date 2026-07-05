@@ -47,10 +47,13 @@ struct macdrv_window_surface
 {
     struct window_surface   header;
     macdrv_window           window;
+    macdrv_image_layer      image_layer;
+    HWND                    remote_layer_root;
     CGDataProviderRef       provider;
     void                   *bits;
     POINT                   offset;
     BOOL                    child;
+    BOOL                    remote_child;
     BOOL                    foreign_child;
     BOOL                    foreign_child_fronted;
     BOOL                    chromium_blank_owner_transparent;
@@ -116,7 +119,7 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
     unsigned int width, height, stride_pixels, x_step, y_step, samples = 0, blank_samples = 0;
     unsigned int x, y;
 
-    if (surface->child || surface->foreign_child) return FALSE;
+    if (surface->child || surface->remote_child || surface->foreign_child) return FALSE;
     if (!is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
     if (!pixels || color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
         return FALSE;
@@ -237,14 +240,17 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
         OffsetRect(&translated_rect, surface->offset.x, surface->offset.y);
         OffsetRect(&translated_dirty, surface->offset.x, surface->offset.y);
     }
-    else
+    else if (!surface->remote_child)
         sync_foreign_child_surface_frame(surface);
 
-    macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(translated_rect),
-                                  cgrect_from_rect(translated_dirty));
+    if (surface->remote_child)
+        macdrv_image_layer_set_color_image(surface->image_layer, image, cgrect_from_rect(*rect));
+    else
+        macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(translated_rect),
+                                      cgrect_from_rect(translated_dirty));
     CGImageRelease(image);
 
-    if (shape_changed && !surface->child)
+    if (shape_changed && !surface->child && !surface->remote_child)
     {
         if (!shape_bits)
             macdrv_window_set_shape_image(surface->window, NULL);
@@ -280,6 +286,8 @@ static void macdrv_surface_destroy(struct window_surface *window_surface)
     struct macdrv_window_surface *surface = get_mac_surface(window_surface);
 
     TRACE("freeing %p\n", surface);
+    if (surface->image_layer)
+        macdrv_destroy_image_layer(surface->image_layer);
     CGDataProviderRelease(surface->provider);
     if (surface->foreign_child)
         macdrv_release_foreign_child_win_data(window_surface->hwnd);
@@ -304,7 +312,8 @@ static struct macdrv_window_surface *get_mac_surface(struct window_surface *surf
  *              create_surface
  */
 static struct window_surface *create_surface(HWND hwnd, macdrv_window window, const RECT *rect,
-                                             const POINT *offset, BOOL child, BOOL foreign_child)
+                                             const POINT *offset, BOOL child, BOOL remote_child,
+                                             HWND remote_layer_root, BOOL foreign_child)
 {
     struct macdrv_window_surface *surface;
     int width = rect->right - rect->left, height = rect->bottom - rect->top;
@@ -355,17 +364,38 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
     {
         surface = get_mac_surface(window_surface);
         surface->window = window;
+        surface->image_layer = NULL;
+        surface->remote_layer_root = remote_layer_root;
         surface->provider = provider;
         surface->bits = bits;
         surface->offset = *offset;
         surface->child = child;
+        surface->remote_child = remote_child;
         surface->foreign_child = foreign_child;
         surface->foreign_child_fronted = FALSE;
         surface->chromium_blank_owner_transparent = FALSE;
-        window_surface->flush_on_unlock = child || foreign_child;
+        window_surface->flush_on_unlock = child || remote_child || foreign_child;
+
+        if (remote_child &&
+            !(surface->image_layer = macdrv_create_image_layer(hwnd, remote_layer_root, cgrect_from_rect(*rect))))
+        {
+            window_surface_release(window_surface);
+            return NULL;
+        }
     }
 
     return window_surface;
+}
+
+static BOOL can_host_remote_layer(HWND hwnd)
+{
+    struct macdrv_win_data *data;
+    BOOL ret;
+
+    if (!(data = get_win_data(hwnd))) return FALSE;
+    ret = !!data->cocoa_window;
+    release_win_data(data);
+    return ret;
 }
 
 
@@ -379,7 +409,9 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     macdrv_window window = NULL;
     POINT offset = {0, 0};
     BOOL child = FALSE;
+    BOOL remote_child = FALSE;
     BOOL foreign_child = FALSE;
+    HWND remote_layer_root = NULL;
 
     TRACE("hwnd %p, layered %u, surface_rect %s, surface %p\n", hwnd, layered, wine_dbgstr_rect(surface_rect), surface);
 
@@ -428,6 +460,15 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     }
 
     if (!window && is_chromium_cef_child_window(hwnd) &&
+        (remote_layer_root = NtUserGetAncestor(hwnd, GA_ROOT)) && remote_layer_root != hwnd &&
+        can_host_remote_layer(remote_layer_root))
+    {
+        remote_child = TRUE;
+        TRACE("Switchyard exporting Chromium/CEF foreign child surface hwnd %p to root %p remote layer\n",
+              hwnd, remote_layer_root);
+    }
+
+    if (!remote_child && !window && is_chromium_cef_child_window(hwnd) &&
         (data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
     {
         window = data->cocoa_window;
@@ -443,11 +484,27 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
         *surface = NULL;
     }
 
-    if (window)
+    if (window || remote_child)
     {
-        foreign_child = macdrv_retain_foreign_child_win_data(hwnd);
-        if (!(*surface = create_surface(hwnd, window, surface_rect, &offset, child, foreign_child)) && foreign_child)
+        if (window)
+            foreign_child = macdrv_retain_foreign_child_win_data(hwnd);
+        if (!(*surface = create_surface(hwnd, window, surface_rect, &offset, child, remote_child,
+                                        remote_layer_root, foreign_child)) && foreign_child)
             macdrv_release_foreign_child_win_data(hwnd);
+    }
+
+    if (!*surface && remote_child && is_chromium_cef_child_window(hwnd) &&
+        (data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
+    {
+        window = data->cocoa_window;
+        child = FALSE;
+        foreign_child = macdrv_retain_foreign_child_win_data(hwnd);
+        TRACE("Switchyard falling back to standalone Chromium/CEF child surface window hwnd %p window %p\n",
+              hwnd, window);
+        if (!(*surface = create_surface(hwnd, window, surface_rect, &offset, child, FALSE, NULL, foreign_child)) &&
+            foreign_child)
+            macdrv_release_foreign_child_win_data(hwnd);
+        release_win_data(data);
     }
 
     return TRUE;

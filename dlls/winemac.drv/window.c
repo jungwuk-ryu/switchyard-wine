@@ -1683,45 +1683,101 @@ void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, BOOL per_pixel_alpha, UIN
     }
 }
 
+static BOOL get_remote_layer_host(HWND hwnd, macdrv_window *window, CGRect *frame)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    struct macdrv_win_data *root_data;
+    RECT rect;
+
+    if (!root) return FALSE;
+    if (!(root_data = get_win_data(root))) return FALSE;
+    if (!root_data->cocoa_window)
+    {
+        release_win_data(root_data);
+        return FALSE;
+    }
+
+    *window = root_data->cocoa_window;
+    *frame = CGRectNull;
+
+    if (root != hwnd)
+    {
+        UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+
+        if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI)))
+        {
+            release_win_data(root_data);
+            return FALSE;
+        }
+        NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
+        OffsetRect(&rect, root_data->rects.client.left - root_data->rects.visible.left,
+                   root_data->rects.client.top - root_data->rects.visible.top);
+        *frame = cgrect_mac_from_win(cgrect_from_rect(rect));
+    }
+
+    release_win_data(root_data);
+    return TRUE;
+}
+
 
 /**********************************************************************
  *              WindowMessage   (MACDRV.@)
  */
 LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    struct macdrv_win_data *data;
-
     TRACE("%p, %u, %u, %lu\n", hwnd, msg, (unsigned)wp, lp);
 
     switch(msg)
     {
     case WM_MACDRV_SET_WIN_REGION:
+    {
+        struct macdrv_win_data *data;
+
         if ((data = get_win_data(hwnd)))
         {
             sync_window_region(data, (HRGN)1);
             release_win_data(data);
         }
         return 0;
+    }
     case WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS:
         activate_on_following_focus();
         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
         return 0;
     case WM_MACDRV_CREATE_REMOTE_LAYER:
-        if ((data = get_win_data(hwnd)))
+    {
+        macdrv_window window;
+        CGRect frame;
+
+        if (get_remote_layer_host(hwnd, &window, &frame))
         {
             TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
-            if (data->cocoa_window) macdrv_window_create_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
-            release_win_data(data);
+            if (CGRectIsNull(frame)) macdrv_window_create_ca_layer_host_view(window, (unsigned int)lp);
+            else macdrv_window_create_ca_layer_host_view_at(window, (unsigned int)lp, frame);
         }
         return 0;
+    }
+    case WM_MACDRV_UPDATE_REMOTE_LAYER:
+    {
+        macdrv_window window;
+        CGRect frame;
+
+        if (get_remote_layer_host(hwnd, &window, &frame) && !CGRectIsNull(frame))
+            macdrv_window_update_ca_layer_host_view(window, (unsigned int)lp, frame);
+        return 0;
+    }
     case WM_MACDRV_RELEASE_REMOTE_LAYER:
-        if ((data = get_win_data(hwnd)))
+    {
+        macdrv_window window;
+        CGRect frame;
+
+        if (get_remote_layer_host(hwnd, &window, &frame))
         {
             TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
-            if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
-            release_win_data(data);
+            macdrv_window_release_ca_layer_host_view(window, (unsigned int)lp);
         }
         return 0;
+    }
     }
 
     FIXME("unrecognized window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (unsigned long)wp, lp);
@@ -1732,6 +1788,12 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 void macdrv_create_remote_layer(void* hwnd_ptr, unsigned int context_id)
 {
     NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, 0, context_id);
+}
+
+
+void macdrv_update_remote_layer(void* hwnd_ptr, unsigned int context_id)
+{
+    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_UPDATE_REMOTE_LAYER, 0, context_id);
 }
 
 
