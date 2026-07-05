@@ -3653,6 +3653,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         switch (ret)
         {
         case 1:
+            usleep( 0 );
             return STATUS_ALERTED;
         case 0:
             return STATUS_TIMEOUT;

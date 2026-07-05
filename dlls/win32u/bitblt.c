@@ -232,6 +232,76 @@ static DWORD blend_bits( const BITMAPINFO *src_info, const struct gdi_image_bits
     return blend_bitmapinfo( src_info, src_bits->ptr, src, dst_info, dst_bits->ptr, dst, blend );
 }
 
+static DWORD make_bits_copy( const BITMAPINFO *info, struct gdi_image_bits *bits )
+{
+    int size = info->bmiHeader.biSizeImage;
+    void *ptr;
+
+    if (bits->is_copy) return ERROR_SUCCESS;
+    if (!size) size = get_dib_image_size( info );
+    if (!(ptr = malloc( size ))) return ERROR_OUTOFMEMORY;
+
+    memcpy( ptr, bits->ptr, size );
+    if (bits->free) bits->free( bits );
+    bits->ptr = ptr;
+    bits->is_copy = TRUE;
+    bits->free = free_heap_bits;
+    bits->param = NULL;
+    return ERROR_SUCCESS;
+}
+
+static DWORD repair_alpha_blend_source_alpha( const BITMAPINFO *info, struct gdi_image_bits *bits,
+                                              const struct bitblt_coords *src, BLENDFUNCTION blend )
+{
+    const BITMAPINFOHEADER *header = &info->bmiHeader;
+    const RECT *rect = &src->visrect;
+    DWORD color_mask, err;
+    unsigned int repaired = 0;
+    int height, stride, x, y;
+
+    if (!(blend.AlphaFormat & AC_SRC_ALPHA)) return ERROR_SUCCESS;
+    if (!blend.SourceConstantAlpha) return ERROR_SUCCESS;
+    if (!bits->ptr || IsRectEmpty( rect )) return ERROR_SUCCESS;
+    if (header->biPlanes != 1 || header->biBitCount != 32) return ERROR_SUCCESS;
+
+    if (header->biCompression == BI_RGB) color_mask = 0x00ffffff;
+    else if (header->biCompression == BI_BITFIELDS)
+    {
+        const DWORD *masks = (const DWORD *)info->bmiColors;
+
+        color_mask = masks[0] | masks[1] | masks[2];
+    }
+    else return ERROR_SUCCESS;
+
+    if (color_mask & 0xff000000) return ERROR_SUCCESS;
+
+    height = abs( header->biHeight );
+    if (!height) return ERROR_SUCCESS;
+    stride = header->biSizeImage / height;
+    if (!stride) stride = get_dib_stride( header->biWidth, header->biBitCount );
+
+    if ((err = make_bits_copy( info, bits ))) return err;
+
+    for (y = rect->top; y < rect->bottom; y++)
+    {
+        UINT32 *pixel = (UINT32 *)((BYTE *)bits->ptr +
+                                  (header->biHeight < 0 ? y : height - 1 - y) * stride);
+
+        for (x = rect->left; x < rect->right; x++)
+        {
+            if (!(pixel[x] & 0xff000000) && (pixel[x] & color_mask))
+            {
+                pixel[x] |= 0xff000000;
+                repaired++;
+            }
+        }
+    }
+
+    if (repaired) TRACE( "repaired %u invalid source alpha pixels for %s\n",
+                         repaired, wine_dbgstr_rect( rect ) );
+    return ERROR_SUCCESS;
+}
+
 static RGBQUAD get_dc_rgb_color( DC *dc, int color_table_size, COLORREF color )
 {
     RGBQUAD ret = { 0, 0, 0, 0 };
@@ -340,6 +410,7 @@ BOOL nulldrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
     src_dev = GET_DC_PHYSDEV( dc_src, pGetImage );
     err = src_dev->funcs->pGetImage( src_dev, src_info, &bits, src );
     if (err) goto done;
+    if ((err = repair_alpha_blend_source_alpha( src_info, &bits, src, func ))) goto free_bits;
 
     dst_dev = GET_DC_PHYSDEV( dc_dst, pBlendImage );
     copy_bitmapinfo( dst_info, src_info );
@@ -358,6 +429,7 @@ BOOL nulldrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
         if (!err) err = dst_dev->funcs->pBlendImage( dst_dev, dst_info, &bits, src, dst, func );
     }
 
+free_bits:
     if (bits.free) bits.free( &bits );
 done:
     if (err) RtlSetLastWin32Error( err );

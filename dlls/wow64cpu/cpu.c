@@ -429,10 +429,14 @@ NTSTATUS WINAPI BTCpuResetToConsistentState( EXCEPTION_POINTERS *ptrs )
     context->SegCs = cs64_sel;
     context->Rsp = context->R14;
     context->SegSs = ds64_sel;
+
     /* fixup machine frame */
     machine_frame = (struct machine_frame *)(((ULONG_PTR)(ptrs->ExceptionRecord + 1) + 15) & ~15);
     machine_frame->rip = context->Rip;
+    machine_frame->cs = context->SegCs;
+    machine_frame->eflags = context->EFlags;
     machine_frame->rsp = context->Rsp;
+    machine_frame->ss = context->SegSs;
     return STATUS_SUCCESS;
 }
 

@@ -63,9 +63,62 @@ extern void WINAPI process_breakpoint(void);
 
 static inline BOOL is_valid_frame( ULONG_PTR frame )
 {
-    if (frame & (sizeof(void*) - 1)) return FALSE;
-    return ((void *)frame >= NtCurrentTeb()->Tib.StackLimit &&
-            (void *)frame <= NtCurrentTeb()->Tib.StackBase);
+    TEB *teb = NtCurrentTeb();
+
+    if ((void *)frame >= teb->Tib.StackLimit && (void *)frame <= teb->Tib.StackBase)
+        return !(frame & (sizeof(void*) - 1));
+#ifdef _WIN64
+    if (teb->WowTebOffset)
+    {
+        TEB32 *wow_teb = (TEB32 *)((char *)teb + teb->WowTebOffset);
+
+        if (frame >= wow_teb->Tib.StackLimit && frame <= wow_teb->Tib.StackBase)
+            return !(frame & (sizeof(ULONG) - 1));
+    }
+#endif
+    return FALSE;
+}
+
+static inline BOOL is_valid_stack_guarantee_frame( ULONG_PTR frame, ULONG_PTR stack_limit, ULONG_PTR stack_base,
+                                                   ULONG_PTR deallocation_stack, ULONG_PTR guaranteed_stack_bytes,
+                                                   ULONG_PTR alignment )
+{
+    ULONG_PTR guarantee_size;
+
+    if (frame >= stack_limit && frame <= stack_base)
+        return !(frame & (alignment - 1));
+
+    if (!deallocation_stack || frame >= stack_limit || stack_limit <= deallocation_stack)
+        return FALSE;
+
+    guarantee_size = guaranteed_stack_bytes > page_size ? guaranteed_stack_bytes : page_size;
+    if (guarantee_size > stack_limit - deallocation_stack)
+        guarantee_size = stack_limit - deallocation_stack;
+
+    return frame >= stack_limit - guarantee_size && !(frame & (alignment - 1));
+}
+
+static inline BOOL is_valid_frame_or_stack_guarantee( ULONG_PTR frame )
+{
+    TEB *teb = NtCurrentTeb();
+
+    if (is_valid_stack_guarantee_frame( frame, (ULONG_PTR)teb->Tib.StackLimit,
+            (ULONG_PTR)teb->Tib.StackBase, (ULONG_PTR)teb->DeallocationStack,
+            teb->GuaranteedStackBytes, sizeof(void *) ))
+        return TRUE;
+
+#ifdef _WIN64
+    if (teb->WowTebOffset)
+    {
+        TEB32 *wow_teb = (TEB32 *)((char *)teb + teb->WowTebOffset);
+
+        if (is_valid_stack_guarantee_frame( frame, wow_teb->Tib.StackLimit,
+                wow_teb->Tib.StackBase, wow_teb->DeallocationStack,
+                wow_teb->GuaranteedStackBytes, sizeof(ULONG) ))
+            return TRUE;
+    }
+#endif
+    return FALSE;
 }
 
 extern void WINAPI LdrInitializeThunk(CONTEXT*,ULONG_PTR,ULONG_PTR,ULONG_PTR);

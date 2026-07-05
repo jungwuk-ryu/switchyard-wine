@@ -2483,7 +2483,15 @@ static void test_immediate_context(void)
     ok(refcount == expected_refcount, "Got refcount %lu, expected %lu.\n", refcount, expected_refcount);
 
     enabled = ID3D11Multithread_GetMultithreadProtected(multithread);
-    todo_wine ok(!enabled, "Multithread protection is %#x.\n", enabled);
+    ok(!enabled, "Multithread protection is %#x.\n", enabled);
+    enabled = ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+    ok(!enabled, "Previous multithread protection is %#x.\n", enabled);
+    enabled = ID3D11Multithread_GetMultithreadProtected(multithread);
+    ok(enabled, "Multithread protection is %#x.\n", enabled);
+    enabled = ID3D11Multithread_SetMultithreadProtected(multithread, FALSE);
+    ok(enabled, "Previous multithread protection is %#x.\n", enabled);
+    enabled = ID3D11Multithread_GetMultithreadProtected(multithread);
+    ok(!enabled, "Multithread protection is %#x.\n", enabled);
 
     ID3D11Multithread_Release(multithread);
 
@@ -17767,7 +17775,7 @@ static void test_getdc(void)
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDXGISurface1_GetDC(surface, FALSE, &dc);
-    todo_wine ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
+    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
 
     IDXGISurface1_Release(surface);
     ID3D11Texture2D_Release(texture);
@@ -17780,13 +17788,17 @@ static void test_getdc(void)
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDXGISurface1_ReleaseDC(surface, NULL);
-    todo_wine ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
+    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDXGISurface1_GetDC(surface, FALSE, &dc);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = IDXGISurface1_GetDC(surface, FALSE, &dc);
+    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
 
     hr = IDXGISurface1_ReleaseDC(surface, NULL);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = IDXGISurface1_ReleaseDC(surface, NULL);
+    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
 
     IDXGISurface1_Release(surface);
     ID3D11Texture2D_Release(texture);
@@ -36377,6 +36389,7 @@ static void test_nv12(void)
     unsigned int test_idx;
     ID3D10Blob *bytecode;
     ID3D11Device *device;
+    UINT p010_support;
     UINT support;
     HRESULT hr;
 
@@ -36454,6 +36467,10 @@ static void test_nv12(void)
 
     hr = ID3D11Device_CheckFormatSupport(device, DXGI_FORMAT_NV12, &support);
     todo_wine_if (!damavand) ok(hr == S_OK || broken(hr == E_FAIL) /* Win7 */, "Got hr %#lx.\n", hr);
+
+    p010_support = 0xdeadbeef;
+    hr = ID3D11Device_CheckFormatSupport(device, DXGI_FORMAT_P010, &p010_support);
+    ok(hr == S_OK || broken(hr == E_FAIL) /* Win7 */, "Got hr %#lx.\n", hr);
 
     if (!(support & D3D11_FORMAT_SUPPORT_TEXTURE2D))
     {

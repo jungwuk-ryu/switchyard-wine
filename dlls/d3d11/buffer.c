@@ -486,7 +486,7 @@ static HRESULT d3d_buffer_init(struct d3d_buffer *buffer, struct d3d_device *dev
 
     hr = d3d_device_create_dxgi_resource((IUnknown *)&device->ID3D10Device1_iface,
             wined3d_buffer_get_resource(buffer->wined3d_buffer), (IUnknown *)&buffer->ID3D10Buffer_iface,
-            FALSE, &buffer->dxgi_resource);
+            FALSE, buffer->desc.MiscFlags, &buffer->dxgi_resource);
     if (FAILED(hr))
     {
         ERR("Failed to create DXGI resource, returning %#.lx\n", hr);

@@ -173,12 +173,15 @@ struct dxgi_adapter *unsafe_impl_from_IDXGIAdapter(IDXGIAdapter *iface);
 struct d3d11_swapchain
 {
     IDXGISwapChain4 IDXGISwapChain4_iface;
+    IWineDXGISwapChain IWineDXGISwapChain_iface;
     LONG refcount;
     struct wined3d_private_store private_store;
     struct wined3d_swapchain *wined3d_swapchain;
+    IDXGISurface *front_buffer_surface;
     struct wined3d_swapchain_state_parent state_parent;
     IWineDXGIDevice *device;
     IWineDXGIFactory *factory;
+    DXGI_ALPHA_MODE alpha_mode;
 
     IDXGIOutput *target;
     LONG present_count;
@@ -186,7 +189,7 @@ struct d3d11_swapchain
 };
 
 HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,
-        struct wined3d_swapchain_desc *desc);
+        struct wined3d_swapchain_desc *desc, const DXGI_SWAP_CHAIN_DESC1 *dxgi_desc);
 
 HRESULT d3d12_swapchain_create(IWineDXGIFactory *factory, ID3D12CommandQueue *queue, HWND window,
         const DXGI_SWAP_CHAIN_DESC1 *swapchain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc,
@@ -199,6 +202,7 @@ struct dxgi_resource
 {
     IDXGISurface2 IDXGISurface2_iface;
     IDXGIResource1 IDXGIResource1_iface;
+    IDXGIKeyedMutex IDXGIKeyedMutex_iface;
     IUnknown IUnknown_iface;
     IUnknown *outer_unknown;
     LONG refcount;
@@ -207,11 +211,19 @@ struct dxgi_resource
     IDXGIResource1 *parent_resource;
     struct wined3d_resource *wined3d_resource;
     unsigned int subresource_idx;
+    unsigned int misc_flags;
+    HANDLE shared_handle;
+    CRITICAL_SECTION keyed_mutex_cs;
+    CONDITION_VARIABLE keyed_mutex_cv;
+    UINT64 keyed_mutex_key;
+    BOOL keyed_mutex_acquired;
     HDC dc;
 };
 
 HRESULT dxgi_resource_init(struct dxgi_resource *resource, IDXGIDevice *device,
         IUnknown *outer, BOOL needs_surface, struct wined3d_resource *wined3d_resource,
-        IDXGIResource1 *parent_resource, unsigned int subresource_index);
+        IDXGIResource1 *parent_resource, unsigned int subresource_index, unsigned int misc_flags);
+HRESULT dxgi_resource_open_shared(HANDLE handle, REFIID iid, void **resource);
+HRESULT dxgi_resource_open_shared_nt(HANDLE handle, REFIID iid, void **resource);
 
 #endif /* __WINE_DXGI_PRIVATE_H */

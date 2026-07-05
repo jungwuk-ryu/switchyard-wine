@@ -1209,18 +1209,17 @@ static NTSTATUS open_builtin_pe_file( const char *name, OBJECT_ATTRIBUTES *attr,
 /***********************************************************************
  *           switchyard_command_line_contains
  */
-static BOOL switchyard_command_line_contains( const WCHAR *needle )
+static BOOL switchyard_command_line_contains( const char *needle )
 {
     RTL_USER_PROCESS_PARAMETERS *params;
     const WCHAR *cmdline;
-    SIZE_T needle_len = 0;
+    SIZE_T needle_len;
     SIZE_T length, i, j;
 
     if (!needle)
         return FALSE;
 
-    while (needle[needle_len])
-        ++needle_len;
+    needle_len = strlen( needle );
 
     if (!needle_len || !peb || !(params = peb->ProcessParameters) || !params->CommandLine.Buffer)
         return FALSE;
@@ -1234,7 +1233,7 @@ static BOOL switchyard_command_line_contains( const WCHAR *needle )
     {
         for (j = 0; j < needle_len; ++j)
         {
-            if (cmdline[i + j] != needle[j])
+            if (cmdline[i + j] != (unsigned char)needle[j])
                 break;
         }
 
@@ -1247,12 +1246,12 @@ static BOOL switchyard_command_line_contains( const WCHAR *needle )
 
 static BOOL switchyard_is_chromium_gpu_process(void)
 {
-    if (!switchyard_command_line_contains( L"--type=gpu-process" ))
+    if (!switchyard_command_line_contains( "--type=gpu-process" ))
         return FALSE;
 
-    return switchyard_command_line_contains( L"--enable-chrome-runtime" )
-            || switchyard_command_line_contains( L"--user-agent-product" )
-            || switchyard_command_line_contains( L"--mojo-platform-channel-handle" );
+    return switchyard_command_line_contains( "--enable-chrome-runtime" )
+            || switchyard_command_line_contains( "--user-agent-product" )
+            || switchyard_command_line_contains( "--mojo-platform-channel-handle" );
 }
 
 static BOOL switchyard_is_graphics_dll( const char *name )
@@ -1401,8 +1400,8 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
                 ptr = switchyard_prepend_graphics_fallback_path( ptr, so_dir, dll_paths[i] );
                 goto done;
             }
-            TRACE( "Switchyard Wine graphics fallback %s unavailable at %s status %#lx.\n",
-                   debugstr_a(file + pos + 1), debugstr_a(fallback_pe_path), (ULONG)status );
+            TRACE( "Switchyard Wine graphics fallback %s unavailable at %s status %#x.\n",
+                   debugstr_a(file + pos + 1), debugstr_a(fallback_pe_path), (unsigned int)status );
             if (status == STATUS_NOT_SUPPORTED) found_image = TRUE;
             else if (status != STATUS_DLL_NOT_FOUND) goto done;
         }

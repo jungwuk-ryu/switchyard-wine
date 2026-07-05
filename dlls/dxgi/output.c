@@ -551,7 +551,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_DuplicateOutput(IDXGIOutput6 *iface
 
 static BOOL STDMETHODCALLTYPE dxgi_output_SupportsOverlays(IDXGIOutput6 *iface)
 {
-    FIXME("iface %p stub!\n", iface);
+    FIXME("iface %p semi-stub.\n", iface);
 
     return FALSE;
 }
@@ -561,9 +561,13 @@ static BOOL STDMETHODCALLTYPE dxgi_output_SupportsOverlays(IDXGIOutput6 *iface)
 static HRESULT STDMETHODCALLTYPE dxgi_output_CheckOverlaySupport(IDXGIOutput6 *iface,
         DXGI_FORMAT format, IUnknown *device, UINT *flags)
 {
-    FIXME("iface %p, format %#x, device %p, flags %p stub!\n", iface, format, device, flags);
+    FIXME("iface %p, format %#x, device %p, flags %p semi-stub.\n", iface, format, device, flags);
 
-    return E_NOTIMPL;
+    if (!device || !flags)
+        return E_INVALIDARG;
+
+    *flags = 0;
+    return S_OK;
 }
 
 /* IDXGIOutput4 methods */

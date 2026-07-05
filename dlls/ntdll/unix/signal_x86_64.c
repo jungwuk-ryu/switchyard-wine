@@ -1481,6 +1481,9 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
     NTSTATUS status;
     XSAVE_AREA_HEADER *src_xs;
     void *callback;
+#ifdef __APPLE__
+    BOOL use_wow64_r14_stack = FALSE;
+#endif
 
     status = send_debug_event( data, rec, context, TRUE, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
@@ -1494,13 +1497,15 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
 
     rsp = is_16bit(sigcontext) ? get_wow_teb(data->teb)->SystemReserved1[0] : RSP_sig(sigcontext);
 #ifdef __APPLE__
-    if (is_wow64() && CS_sig(sigcontext) != cs64_sel &&
+    if (is_wow64() &&
         (rsp < (ULONG_PTR)data->teb->Tib.StackLimit || rsp > (ULONG_PTR)data->teb->Tib.StackBase) &&
         R14_sig(sigcontext) >= (ULONG_PTR)data->teb->Tib.StackLimit &&
         R14_sig(sigcontext) <= (ULONG_PTR)data->teb->Tib.StackBase)
     {
-        /* Rosetta may report the 32-bit ESP in RSP while SS still looks 64-bit. */
+        /* Rosetta may report the 32-bit ESP in RSP while the segment registers
+         * already look 64-bit during WoW64 exception transitions. */
         rsp = R14_sig(sigcontext);
+        use_wow64_r14_stack = TRUE;
     }
 #endif
     rsp &= ~(ULONG_PTR)15;
@@ -1509,7 +1514,10 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
     stack->rec               = *rec;
     stack->context           = *context;
     stack->machine_frame.rip = context->Rip;
+    stack->machine_frame.cs  = context->SegCs;
+    stack->machine_frame.eflags = context->EFlags;
     stack->machine_frame.rsp = context->Rsp;
+    stack->machine_frame.ss  = context->SegSs;
 
     if ((src_xs = xstate_from_context( context )))
     {
@@ -1524,6 +1532,18 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
     {
         context_init_xstate( &stack->context, NULL );
     }
+
+#ifdef __APPLE__
+    if (use_wow64_r14_stack)
+    {
+        ULONG_PTR wow64_copy_len = stack->context_ex.All.Length;
+
+        if (wow64_copy_len < sizeof(*stack)) wow64_copy_len = sizeof(*stack);
+        /* Wow64PrepareForException copies the exception block below R14; keep
+         * that copy in-place after using R14 to recover the host stack pointer. */
+        R14_sig(sigcontext) = (ULONG_PTR)stack + wow64_copy_len;
+    }
+#endif
 
     CS_sig(sigcontext)  = cs64_sel;
     RIP_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
@@ -1581,7 +1601,10 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     stack->context.P3Home    = arg3;
     stack->context.P4Home    = (ULONG64)func;
     stack->machine_frame.rip = stack->context.Rip;
+    stack->machine_frame.cs  = stack->context.SegCs;
+    stack->machine_frame.eflags = stack->context.EFlags;
     stack->machine_frame.rsp = stack->context.Rsp;
+    stack->machine_frame.ss  = stack->context.SegSs;
     frame->rbp = stack->context.Rbp;
     frame->rsp = (ULONG64)stack;
     frame->rip = (ULONG64)pKiUserApcDispatcher;
@@ -1625,7 +1648,10 @@ NTSTATUS call_user_exception_dispatcher( struct thread_data *data, EXCEPTION_REC
     /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
     if (stack->rec.ExceptionCode == EXCEPTION_BREAKPOINT) stack->context.Rip--;
     stack->machine_frame.rip = stack->context.Rip;
+    stack->machine_frame.cs  = stack->context.SegCs;
+    stack->machine_frame.eflags = stack->context.EFlags;
     stack->machine_frame.rsp = stack->context.Rsp;
+    stack->machine_frame.ss  = stack->context.SegSs;
     frame->rbp = stack->context.Rbp;
     frame->rsp = (ULONG64)stack;
     frame->rip = (ULONG64)pKiUserExceptionDispatcher;
@@ -1801,7 +1827,10 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
     stack->len               = len;
     stack->id                = id;
     stack->machine_frame.rip = frame->rip;
+    stack->machine_frame.cs  = cs64_sel;
+    stack->machine_frame.eflags = frame->eflags;
     stack->machine_frame.rsp = frame->rsp;
+    stack->machine_frame.ss  = ds64_sel;
     memcpy( stack->args_data, args, len );
     return call_user_mode_callback( rsp, ret_ptr, ret_len, pKiUserCallbackDispatcher, data->teb );
 }
@@ -2280,6 +2309,55 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
     return TRUE;
 }
 
+#ifdef __APPLE__
+static BOOL recover_wow64_transition_fault( struct thread_data *data, ucontext_t *sigcontext,
+                                            const EXCEPTION_RECORD *rec )
+{
+    static const BYTE thunk_prefix[] =
+    {
+        0x4c, 0x87, 0xf4,                         /* xchgq %r14,%rsp */
+        0x41, 0x89, 0xbd, 0x9c, 0x00, 0x00, 0x00, /* movl %edi,0x9c(%r13) */
+        0x41, 0x89, 0xb5, 0xa0, 0x00, 0x00, 0x00, /* movl %esi,0xa0(%r13) */
+        0x41, 0x89, 0x9d, 0xa4, 0x00, 0x00, 0x00, /* movl %ebx,0xa4(%r13) */
+        0x41, 0x89, 0xad, 0xb4, 0x00, 0x00, 0x00, /* movl %ebp,0xb4(%r13) */
+        0x41, 0x8b, 0x16,                         /* movl (%r14),%edx */
+        0x41, 0x89, 0x95, 0xb8, 0x00, 0x00, 0x00, /* movl %edx,0xb8(%r13) */
+        0x8b, 0x15                                /* movl cs32_sel(%rip),%edx */
+    };
+    const ULONG_PTR fault_offset = sizeof(thunk_prefix) - 2;
+    ULONG_PTR rip = RIP_sig(sigcontext);
+    ULONG_PTR start = rip - fault_offset;
+    ULONG guest_esp = RSI_sig(sigcontext) + 1;
+    ULONG guest_esi = RSP_sig(sigcontext);
+    BYTE code[sizeof(thunk_prefix)];
+
+    if (!is_wow64() || !data->teb) return FALSE;
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        rec->NumberParameters < 2 ||
+        rec->ExceptionInformation[0] != EXCEPTION_READ_FAULT)
+        return FALSE;
+    if (CS_sig(sigcontext) != cs32_sel) return FALSE;
+    if (R14_sig(sigcontext) < (ULONG_PTR)data->teb->Tib.StackLimit ||
+        R14_sig(sigcontext) > (ULONG_PTR)data->teb->Tib.StackBase)
+        return FALSE;
+    if (RSP_sig(sigcontext) >= (ULONG_PTR)data->teb->Tib.StackLimit &&
+        RSP_sig(sigcontext) <= (ULONG_PTR)data->teb->Tib.StackBase)
+        return FALSE;
+    if (rip < fault_offset || !guest_esp) return FALSE;
+    if (virtual_uninterrupted_read_memory( (void *)start, code, sizeof(code) ) != sizeof(code) ||
+        memcmp( code, thunk_prefix, sizeof(code) ))
+        return FALSE;
+
+    RIP_sig(sigcontext) = start + 3;
+    CS_sig(sigcontext) = cs64_sel;
+    RSP_sig(sigcontext) = R14_sig(sigcontext);
+    R14_sig(sigcontext) = guest_esp;
+    RSI_sig(sigcontext) = guest_esi;
+    leave_handler( data, sigcontext );
+    return TRUE;
+}
+#endif
+
 
 /**********************************************************************
  *		segv_handler
@@ -2367,6 +2445,9 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
         break;
     }
+#ifdef __APPLE__
+    if (recover_wow64_transition_fault( data, sigcontext, &rec )) return;
+#endif
     if (handle_syscall_fault( data, sigcontext, &rec, &context.c )) return;
     setup_raise_exception( data, sigcontext, &rec, &context );
 }

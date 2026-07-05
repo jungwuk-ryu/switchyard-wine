@@ -21,6 +21,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
 
+#define SWITCHYARD_APPLE_VENDOR_ID 0x106b
+
 static const struct wined3d_state_entry_template misc_state_template_vk[] =
 {
     {STATE_CONSTANT_BUFFER(WINED3D_SHADER_TYPE_VERTEX),   {STATE_CONSTANT_BUFFER(WINED3D_SHADER_TYPE_VERTEX),   state_nop}},
@@ -2213,19 +2215,39 @@ static bool feature_level_9_3_supported(const struct wined3d_physical_device_inf
             && info->features2.features.independentBlend;
 }
 
-static bool feature_level_10_supported(const struct wined3d_physical_device_info *info, unsigned int shader_model)
+static bool switchyard_is_apple_vulkan_device(const struct wined3d_adapter_vk *adapter_vk)
 {
-    return shader_model >= 4
-            && info->features2.features.multiViewport
-            && info->features2.features.geometryShader
-            && info->features2.features.depthClamp
-            && info->features2.features.depthBiasClamp
+    return adapter_vk->device_properties.vendorID == SWITCHYARD_APPLE_VENDOR_ID;
+}
+
+static bool switchyard_needs_apple_feature_level_10_relaxation(const struct wined3d_adapter_vk *adapter_vk,
+        const struct wined3d_physical_device_info *info)
+{
+    return switchyard_is_apple_vulkan_device(adapter_vk)
+            && (!info->features2.features.geometryShader
+            || !info->features2.features.pipelineStatisticsQuery
+            || !info->features2.features.shaderCullDistance);
+}
+
+static bool feature_level_10_supported(const struct wined3d_adapter_vk *adapter_vk,
+        const struct wined3d_physical_device_info *info, unsigned int shader_model)
+{
+    if (shader_model < 4
+            || !info->features2.features.multiViewport
+            || !info->features2.features.depthClamp
+            || !info->features2.features.depthBiasClamp
+            || !info->features2.features.shaderClipDistance
+            || !info->draw_parameters_features.shaderDrawParameters
+            || !info->vertex_divisor_features.vertexAttributeInstanceRateDivisor
+            || !info->vertex_divisor_features.vertexAttributeInstanceRateZeroDivisor)
+        return false;
+
+    if (switchyard_needs_apple_feature_level_10_relaxation(adapter_vk, info))
+        return true;
+
+    return info->features2.features.geometryShader
             && info->features2.features.pipelineStatisticsQuery
-            && info->features2.features.shaderClipDistance
-            && info->features2.features.shaderCullDistance
-            && info->draw_parameters_features.shaderDrawParameters
-            && info->vertex_divisor_features.vertexAttributeInstanceRateDivisor
-            && info->vertex_divisor_features.vertexAttributeInstanceRateZeroDivisor;
+            && info->features2.features.shaderCullDistance;
 }
 
 static bool feature_level_10_1_supported(const struct wined3d_physical_device_info *info, unsigned int shader_model)
@@ -2248,8 +2270,8 @@ static bool feature_level_11_1_supported(const struct wined3d_physical_device_in
     return info->features2.features.vertexPipelineStoresAndAtomics;
 }
 
-static enum wined3d_feature_level feature_level_from_caps(const struct wined3d_physical_device_info *info,
-        const struct shader_caps *shader_caps)
+static enum wined3d_feature_level feature_level_from_caps(const struct wined3d_adapter_vk *adapter_vk,
+        const struct wined3d_physical_device_info *info, const struct shader_caps *shader_caps)
 {
     unsigned int shader_model;
 
@@ -2270,7 +2292,7 @@ static enum wined3d_feature_level feature_level_from_caps(const struct wined3d_p
     if (!feature_level_9_3_supported(info, shader_model))
         return WINED3D_FEATURE_LEVEL_9_2;
 
-    if (!feature_level_10_supported(info, shader_model))
+    if (!feature_level_10_supported(adapter_vk, info, shader_model))
         return WINED3D_FEATURE_LEVEL_9_3;
 
     if (!feature_level_10_1_supported(info, shader_model))
@@ -2352,7 +2374,7 @@ static void wined3d_adapter_vk_init_d3d_info(struct wined3d_adapter_vk *adapter_
     d3d_info->full_ffp_varyings = !!(shader_caps.wined3d_caps & WINED3D_SHADER_CAP_FULL_FFP_VARYINGS);
     d3d_info->scaled_resolve = false;
     d3d_info->pbo = true;
-    d3d_info->feature_level = feature_level_from_caps(&device_info, &shader_caps);
+    d3d_info->feature_level = feature_level_from_caps(adapter_vk, &device_info, &shader_caps);
     d3d_info->subpixel_viewport = true;
     d3d_info->fences = true;
     d3d_info->persistent_map = true;
@@ -2578,6 +2600,7 @@ static BOOL wined3d_adapter_vk_init(struct wined3d_adapter_vk *adapter_vk,
         VK_CALL(vkGetPhysicalDeviceProperties2(adapter_vk->physical_device, &properties2));
     else
         VK_CALL(vkGetPhysicalDeviceProperties(adapter_vk->physical_device, &properties2.properties));
+    adapter_vk->device_properties = properties2.properties;
     adapter_vk->device_limits = properties2.properties.limits;
 
     VK_CALL(vkGetPhysicalDeviceMemoryProperties(adapter_vk->physical_device, &adapter_vk->memory_properties));

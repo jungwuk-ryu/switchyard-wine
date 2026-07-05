@@ -20,8 +20,6 @@
  */
 
 #include <stdarg.h>
-#include <wchar.h>
-
 #include "winternl.h"
 #define COBJMACROS
 #include "windef.h"
@@ -32,44 +30,6 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dwmapi);
-
-static BOOL switchyard_command_line_has_marker(const WCHAR *cmdline, const WCHAR *marker)
-{
-    return cmdline && wcsstr(cmdline, marker);
-}
-
-static BOOL switchyard_is_chromium_cef_process(void)
-{
-    static BOOL warned;
-    static BOOL detected;
-    const WCHAR *cmdline;
-
-    if (detected)
-        return TRUE;
-
-    if (GetModuleHandleW(L"libcef.dll") || GetModuleHandleW(L"chrome_elf.dll"))
-    {
-        detected = TRUE;
-    }
-    else
-    {
-        cmdline = GetCommandLineW();
-        detected = switchyard_command_line_has_marker(cmdline, L"--type=gpu-process")
-                || switchyard_command_line_has_marker(cmdline, L"--type=renderer")
-                || switchyard_command_line_has_marker(cmdline, L"--type=utility")
-                || switchyard_command_line_has_marker(cmdline, L"--enable-chrome-runtime")
-                || switchyard_command_line_has_marker(cmdline, L"--mojo-platform-channel-handle")
-                || switchyard_command_line_has_marker(cmdline, L"--user-agent-product");
-    }
-
-    if (detected && !warned)
-    {
-        WARN("Switchyard reporting DWM composition disabled for Chromium/CEF process.\n");
-        warned = TRUE;
-    }
-
-    return detected;
-}
 
 
 /**********************************************************************
@@ -83,13 +43,6 @@ HRESULT WINAPI DwmIsCompositionEnabled(BOOL *enabled)
 
     if (!enabled)
         return E_INVALIDARG;
-
-    if (switchyard_is_chromium_cef_process())
-    {
-        *enabled = FALSE;
-        TRACE("Chromium/CEF process: composition disabled.\n");
-        return S_OK;
-    }
 
     *enabled = FALSE;
     version.dwOSVersionInfoSize = sizeof(version);
@@ -115,12 +68,6 @@ HRESULT WINAPI DwmEnableComposition(UINT uCompositionAction)
 HRESULT WINAPI DwmExtendFrameIntoClientArea(HWND hwnd, const MARGINS* margins)
 {
     FIXME("(%p, %p) stub\n", hwnd, margins);
-
-    if (switchyard_is_chromium_cef_process())
-    {
-        TRACE("Chromium/CEF process: DWM frame extension disabled.\n");
-        return DWM_E_COMPOSITIONDISABLED;
-    }
 
     return S_OK;
 }
@@ -155,12 +102,6 @@ HRESULT WINAPI DwmSetWindowAttribute(HWND hwnd, DWORD attributenum, LPCVOID attr
     static BOOL once;
 
     if (!once++) FIXME("(%p, %lx, %p, %lx) stub\n", hwnd, attributenum, attribute, size);
-
-    if (switchyard_is_chromium_cef_process())
-    {
-        TRACE("Chromium/CEF process: DWM window attribute disabled.\n");
-        return DWM_E_COMPOSITIONDISABLED;
-    }
 
     return S_OK;
 }

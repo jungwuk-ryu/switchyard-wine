@@ -1416,6 +1416,12 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     }
 
     err = CGLCreateContext(pix, share, &context->cglcontext);
+    if (err == kCGLBadMatch && share)
+    {
+        WARN("CGLCreateContext() failed with incompatible share context; retrying without sharing\n");
+        context->cglcontext = NULL;
+        err = CGLCreateContext(pix, NULL, &context->cglcontext);
+    }
     CGLReleasePixelFormat(pix);
     if (err != kCGLNoError || !context->cglcontext)
     {

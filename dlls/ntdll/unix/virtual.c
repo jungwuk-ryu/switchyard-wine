@@ -138,6 +138,7 @@ struct file_view
 #define VPROT_GUARD      0x10
 #define VPROT_COMMITTED  0x20
 #define VPROT_WRITEWATCH 0x40
+#define VPROT_COPIED     0x80
 /* per-mapping protection flags */
 #define VPROT_ARM64EC          0x0100  /* view may contain ARM64EC code */
 #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
@@ -1452,7 +1453,8 @@ static const char *get_prot_str( BYTE prot )
     buffer[0] = (prot & VPROT_COMMITTED) ? 'c' : '-';
     buffer[1] = (prot & VPROT_GUARD) ? 'g' : ((prot & VPROT_WRITEWATCH) ? 'H' : '-');
     buffer[2] = (prot & VPROT_READ) ? 'r' : '-';
-    buffer[3] = (prot & VPROT_WRITECOPY) ? 'W' : ((prot & VPROT_WRITE) ? 'w' : '-');
+    buffer[3] = (prot & VPROT_WRITECOPY) ? (prot & VPROT_COPIED ? 'w' : 'W')
+            : ((prot & VPROT_WRITE) ? 'w' : '-');
     buffer[4] = (prot & VPROT_EXEC) ? 'x' : '-';
     buffer[5] = 0;
     return buffer;
@@ -1979,10 +1981,37 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
  */
 static DWORD get_win32_prot( BYTE vprot, unsigned int map_prot )
 {
-    DWORD ret = VIRTUAL_Win32Flags[vprot & 0x0f];
+    DWORD ret;
+
+    if ((vprot & (VPROT_COPIED | VPROT_WRITECOPY)) == (VPROT_COPIED | VPROT_WRITECOPY))
+        vprot = (vprot & ~VPROT_WRITECOPY) | VPROT_WRITE;
+
+    ret = VIRTUAL_Win32Flags[vprot & 0x0f];
     if (vprot & VPROT_GUARD) ret |= PAGE_GUARD;
     if (map_prot & SEC_NOCACHE) ret |= PAGE_NOCACHE;
     return ret;
+}
+
+
+static DWORD get_virtual_protect_old_prot( BYTE vprot, unsigned int map_prot, ULONG new_prot )
+{
+    DWORD old = get_win32_prot( vprot, map_prot );
+
+    if (map_prot & SEC_IMAGE)
+    {
+        switch (new_prot & 0xff)
+        {
+        case PAGE_READONLY:
+        case PAGE_READWRITE:
+            if ((old & 0xff) == PAGE_WRITECOPY) old = (old & ~0xff) | PAGE_READWRITE;
+            break;
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+            if ((old & 0xff) == PAGE_EXECUTE_WRITECOPY) old = (old & ~0xff) | PAGE_EXECUTE_READWRITE;
+            break;
+        }
+    }
+    return old;
 }
 
 
@@ -2115,6 +2144,22 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
     NTSTATUS status;
 
     if ((status = get_vprot_flags( protect, &vprot, view->protect & SEC_IMAGE ))) return status;
+    if (view->protect & SEC_IMAGE)
+    {
+        BYTE current = get_host_page_vprot( base );
+
+        switch (protect & 0xff)
+        {
+        case PAGE_READWRITE:
+            if (current & (VPROT_READ | VPROT_WRITECOPY))
+                vprot = (vprot & ~VPROT_WRITECOPY) | VPROT_WRITE;
+            break;
+        case PAGE_EXECUTE_READWRITE:
+            if (current & (VPROT_EXEC | VPROT_WRITECOPY))
+                vprot = (vprot & ~VPROT_WRITECOPY) | VPROT_WRITE;
+            break;
+        }
+    }
     if (is_view_valloc( view ))
     {
         if (vprot & VPROT_WRITECOPY) return STATUS_INVALID_PAGE_PROTECTION;
@@ -2122,7 +2167,10 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
     else
     {
         BYTE access = vprot & (VPROT_READ | VPROT_WRITE | VPROT_EXEC);
-        if ((view->protect & access) != access) return STATUS_INVALID_PAGE_PROTECTION;
+        unsigned int allowed = view->protect;
+
+        if ((view->protect & VPROT_WRITECOPY) && (access & VPROT_WRITE)) allowed |= VPROT_WRITE;
+        if ((allowed & access) != access) return STATUS_INVALID_PAGE_PROTECTION;
     }
 
     if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED )) return STATUS_ACCESS_DENIED;
@@ -5685,8 +5733,16 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
         /* Make sure all the pages are committed */
         if (get_committed_size( view, base, size, &vprot, VPROT_COMMITTED ) >= size && (vprot & VPROT_COMMITTED))
         {
-            old = get_win32_prot( vprot, view->protect );
+            DWORD old_raw = get_win32_prot( vprot, view->protect );
+
+            old = get_virtual_protect_old_prot( vprot, view->protect, new_prot );
             status = set_protection( view, base, size, new_prot );
+            if (status == STATUS_SUCCESS
+                    && ((old_raw & 0xff) == PAGE_WRITECOPY || (old_raw & 0xff) == PAGE_EXECUTE_WRITECOPY))
+            {
+                TRACE( "marking %p-%p as copied writecopy\n", base, base + size );
+                set_page_vprot_bits( base, size, VPROT_COPIED, 0 );
+            }
         }
         else status = STATUS_NOT_COMMITTED;
     }

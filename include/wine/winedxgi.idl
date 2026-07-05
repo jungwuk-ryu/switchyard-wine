@@ -50,6 +50,17 @@ interface IWineDXGIDevice : IDXGIDevice3
         [in] const DXGI_SHARED_RESOURCE *shared_resource,
         [in] IUnknown *outer,
         [in] BOOL needs_surface,
+        [in] UINT resource_misc_flags,
+        [out] void **resource
+    );
+    HRESULT open_shared_resource(
+        [in] HANDLE handle,
+        [in] REFIID iid,
+        [out] void **resource
+    );
+    HRESULT open_shared_resource1(
+        [in] HANDLE handle,
+        [in] REFIID iid,
         [out] void **resource
     );
 }
@@ -64,6 +75,19 @@ interface IWineDXGIDeviceParent : IUnknown
     struct wined3d_device_parent *get_wined3d_device_parent();
     HRESULT register_swapchain_texture(struct wined3d_texture *texture,
             unsigned int texture_flags, IDXGISurface **ret_surface);
+}
+
+[
+    object,
+    local,
+    uuid(0106fe93-7ee2-4a9c-a20a-6f24e3f9f726)
+]
+interface IWineDXGISwapChain : IUnknown
+{
+    HRESULT get_front_buffer(
+        [in] REFIID iid,
+        [out] void **surface
+    );
 }
 
 struct wine_dxgi_adapter_info

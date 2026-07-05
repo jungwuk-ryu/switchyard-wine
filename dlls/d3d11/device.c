@@ -3901,16 +3901,26 @@ static void STDMETHODCALLTYPE d3d11_multithread_Leave(ID3D11Multithread *iface)
 static BOOL STDMETHODCALLTYPE d3d11_multithread_SetMultithreadProtected(
         ID3D11Multithread *iface, BOOL enable)
 {
-    FIXME("iface %p, enable %#x stub!\n", iface, enable);
+    struct d3d11_device_context *context = impl_from_ID3D11Multithread(iface);
+    BOOL previous;
 
-    return TRUE;
+    TRACE("iface %p, enable %#x.\n", iface, enable);
+
+    previous = InterlockedExchange(&context->device->multithread_protected, !!enable);
+
+    return previous;
 }
 
 static BOOL STDMETHODCALLTYPE d3d11_multithread_GetMultithreadProtected(ID3D11Multithread *iface)
 {
-    FIXME("iface %p stub!\n", iface);
+    struct d3d11_device_context *context = impl_from_ID3D11Multithread(iface);
+    BOOL protected;
 
-    return TRUE;
+    TRACE("iface %p.\n", iface);
+
+    protected = InterlockedCompareExchange(&context->device->multithread_protected, 0, 0);
+
+    return protected;
 }
 
 static const struct ID3D11MultithreadVtbl d3d11_multithread_vtbl =
@@ -4591,12 +4601,52 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateDeferredContext(ID3D11Device
     return S_OK;
 }
 
+static HRESULT d3d_device_open_shared_resource(IUnknown *device_iface, HANDLE resource, REFIID iid, void **out)
+{
+    IWineDXGIDevice *wine_device;
+    HRESULT hr;
+
+    if (!out)
+        return E_POINTER;
+    *out = NULL;
+
+    if (FAILED(hr = IUnknown_QueryInterface(device_iface, &IID_IWineDXGIDevice, (void **)&wine_device)))
+    {
+        WARN("Failed to query IWineDXGIDevice, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    hr = IWineDXGIDevice_open_shared_resource(wine_device, resource, iid, out);
+    IWineDXGIDevice_Release(wine_device);
+    return hr;
+}
+
+static HRESULT d3d_device_open_shared_resource1(IUnknown *device_iface, HANDLE resource, REFIID iid, void **out)
+{
+    IWineDXGIDevice *wine_device;
+    HRESULT hr;
+
+    if (!out)
+        return E_POINTER;
+    *out = NULL;
+
+    if (FAILED(hr = IUnknown_QueryInterface(device_iface, &IID_IWineDXGIDevice, (void **)&wine_device)))
+    {
+        WARN("Failed to query IWineDXGIDevice, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    hr = IWineDXGIDevice_open_shared_resource1(wine_device, resource, iid, out);
+    IWineDXGIDevice_Release(wine_device);
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedResource(ID3D11Device5 *iface, HANDLE resource, REFIID iid,
         void **out)
 {
-    FIXME("iface %p, resource %p, iid %s, out %p stub!\n", iface, resource, debugstr_guid(iid), out);
+    FIXME("iface %p, resource %p, iid %s, out %p semi-stub.\n", iface, resource, debugstr_guid(iid), out);
 
-    return E_NOTIMPL;
+    return d3d_device_open_shared_resource((IUnknown *)iface, resource, iid, out);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFormatSupport(ID3D11Device5 *iface, DXGI_FORMAT format,
@@ -4639,8 +4689,31 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFormatSupport(ID3D11Device5 *
     wined3d_format = wined3dformat_from_dxgi_format(format);
     if (format && !wined3d_format)
     {
-        WARN("Invalid format %#x.\n", format);
         *format_support = 0;
+        switch (format)
+        {
+            case DXGI_FORMAT_AYUV:
+            case DXGI_FORMAT_Y410:
+            case DXGI_FORMAT_Y416:
+            case DXGI_FORMAT_P010:
+            case DXGI_FORMAT_P016:
+            case DXGI_FORMAT_420_OPAQUE:
+            case DXGI_FORMAT_Y210:
+            case DXGI_FORMAT_Y216:
+            case DXGI_FORMAT_NV11:
+            case DXGI_FORMAT_AI44:
+            case DXGI_FORMAT_IA44:
+            case DXGI_FORMAT_P8:
+            case DXGI_FORMAT_A8P8:
+            case DXGI_FORMAT_P208:
+            case DXGI_FORMAT_V208:
+            case DXGI_FORMAT_V408:
+                FIXME("Format %#x is known but unsupported, returning no support.\n", format);
+                return S_OK;
+            default:
+                WARN("Invalid format %#x.\n", format);
+                break;
+        }
         return E_FAIL;
     }
 
@@ -5239,9 +5312,14 @@ fail:
 static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedResource1(ID3D11Device5 *iface, HANDLE handle,
         REFIID iid, void **resource)
 {
-    FIXME("iface %p, handle %p, iid %s, resource %p stub!\n", iface, handle, debugstr_guid(iid), resource);
+    FIXME("iface %p, handle %p, iid %s, resource %p semi-stub.\n", iface, handle, debugstr_guid(iid), resource);
 
-    return E_NOTIMPL;
+    if (resource)
+        *resource = NULL;
+    if ((ULONG_PTR)handle & 0xc0000000u)
+        return E_INVALIDARG;
+
+    return d3d_device_open_shared_resource1((IUnknown *)iface, handle, iid, resource);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedResourceByName(ID3D11Device5 *iface, const WCHAR *name,
@@ -7500,10 +7578,10 @@ static UINT STDMETHODCALLTYPE d3d10_device_GetCreationFlags(ID3D10Device1 *iface
 static HRESULT STDMETHODCALLTYPE d3d10_device_OpenSharedResource(ID3D10Device1 *iface,
         HANDLE resource_handle, REFIID guid, void **resource)
 {
-    FIXME("iface %p, resource_handle %p, guid %s, resource %p stub!\n",
+    FIXME("iface %p, resource_handle %p, guid %s, resource %p semi-stub.\n",
             iface, resource_handle, debugstr_guid(guid), resource);
 
-    return E_NOTIMPL;
+    return d3d_device_open_shared_resource((IUnknown *)iface, resource_handle, guid, resource);
 }
 
 static void STDMETHODCALLTYPE d3d10_device_SetTextFilterSize(ID3D10Device1 *iface, UINT width, UINT height)
@@ -7695,16 +7773,26 @@ static void STDMETHODCALLTYPE d3d10_multithread_Leave(ID3D10Multithread *iface)
 
 static BOOL STDMETHODCALLTYPE d3d10_multithread_SetMultithreadProtected(ID3D10Multithread *iface, BOOL enable)
 {
-    FIXME("iface %p, enable %#x stub!\n", iface, enable);
+    struct d3d_device *device = impl_from_ID3D10Multithread(iface);
+    BOOL previous;
 
-    return TRUE;
+    TRACE("iface %p, enable %#x.\n", iface, enable);
+
+    previous = InterlockedExchange(&device->multithread_protected, !!enable);
+
+    return previous;
 }
 
 static BOOL STDMETHODCALLTYPE d3d10_multithread_GetMultithreadProtected(ID3D10Multithread *iface)
 {
-    FIXME("iface %p stub!\n", iface);
+    struct d3d_device *device = impl_from_ID3D10Multithread(iface);
+    BOOL protected;
 
-    return TRUE;
+    TRACE("iface %p.\n", iface);
+
+    protected = InterlockedCompareExchange(&device->multithread_protected, 0, 0);
+
+    return protected;
 }
 
 static const struct ID3D10MultithreadVtbl d3d10_multithread_vtbl =
@@ -8167,6 +8255,7 @@ void d3d_device_init(struct d3d_device *device, void *outer_unknown)
     /* COM aggregation always takes place */
     device->outer_unk = outer_unknown;
     device->d3d11_only = FALSE;
+    device->multithread_protected = TRUE;
     device->state = NULL;
 
     d3d11_device_context_init(&device->immediate_context, device, D3D11_DEVICE_CONTEXT_IMMEDIATE);

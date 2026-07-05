@@ -488,6 +488,258 @@ struct srw_lock
 };
 C_ASSERT( sizeof(struct srw_lock) == 4 );
 
+struct srw_unaligned_entry
+{
+    struct list entry;
+    RTL_SRWLOCK *lock;
+    struct srw_lock state;
+};
+
+static struct list srw_unaligned_locks = LIST_INIT( srw_unaligned_locks );
+static LONG srw_unaligned_table_lock;
+
+static inline BOOL srw_lock_is_unaligned( const RTL_SRWLOCK *lock )
+{
+    return (ULONG_PTR)lock & (sizeof(LONG) - 1);
+}
+
+static void srw_unaligned_lock_table(void)
+{
+    while (InterlockedCompareExchange( &srw_unaligned_table_lock, -1, 0 ))
+        YieldProcessor();
+}
+
+static void srw_unaligned_unlock_table(void)
+{
+    InterlockedExchange( &srw_unaligned_table_lock, 0 );
+}
+
+static inline BOOL srw_state_is_zero( const struct srw_lock *state )
+{
+    return !state->exclusive_waiters && !state->owners;
+}
+
+static void srw_unaligned_store_state( RTL_SRWLOCK *lock, const struct srw_lock *state )
+{
+    memcpy( lock, state, sizeof(*state) );
+}
+
+static void *srw_unaligned_raw_owners_addr( RTL_SRWLOCK *lock )
+{
+    return (char *)lock + FIELD_OFFSET( struct srw_lock, owners );
+}
+
+static void srw_unaligned_wake_exclusive( RTL_SRWLOCK *lock, struct srw_unaligned_entry *entry )
+{
+    /* Wake the mirrored app-memory address too, in case a first-touch release
+     * inherits waiters that were registered before the side-table entry existed. */
+    RtlWakeAddressSingle( &entry->state.owners );
+    RtlWakeAddressSingle( srw_unaligned_raw_owners_addr( lock ) );
+}
+
+static void srw_unaligned_wake_all( RTL_SRWLOCK *lock, struct srw_unaligned_entry *entry )
+{
+    /* See srw_unaligned_wake_exclusive(). */
+    RtlWakeAddressAll( &entry->state );
+    RtlWakeAddressAll( lock );
+}
+
+static struct srw_unaligned_entry *srw_unaligned_get_entry( RTL_SRWLOCK *lock )
+{
+    struct srw_unaligned_entry *entry, *candidate = NULL;
+    struct srw_lock raw;
+
+    for (;;)
+    {
+        srw_unaligned_lock_table();
+        memcpy( &raw, lock, sizeof(raw) );
+
+        LIST_FOR_EACH_ENTRY( entry, &srw_unaligned_locks, struct srw_unaligned_entry, entry )
+        {
+            if (entry->lock != lock) continue;
+
+            /* The side table is authoritative while a lock is active; a raw
+             * zero observed from unaligned app memory must not erase ownership.
+             * Explicit resets go through RtlInitializeSRWLock(). */
+            if (srw_state_is_zero( &entry->state ))
+                entry->state = raw;
+
+            srw_unaligned_unlock_table();
+            if (candidate) RtlFreeHeap( GetProcessHeap(), 0, candidate );
+            return entry;
+        }
+
+        if (candidate)
+        {
+            candidate->lock = lock;
+            candidate->state = raw;
+            list_add_tail( &srw_unaligned_locks, &candidate->entry );
+            srw_unaligned_unlock_table();
+            return candidate;
+        }
+
+        srw_unaligned_unlock_table();
+
+        if (!(candidate = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*candidate) )))
+            RtlRaiseStatus( STATUS_NO_MEMORY );
+    }
+}
+
+static void srw_unaligned_reset( RTL_SRWLOCK *lock )
+{
+    struct srw_unaligned_entry *entry;
+    struct srw_lock zero;
+
+    memset( lock, 0, sizeof(*lock) );
+    memset( &zero, 0, sizeof(zero) );
+
+    srw_unaligned_lock_table();
+
+    LIST_FOR_EACH_ENTRY( entry, &srw_unaligned_locks, struct srw_unaligned_entry, entry )
+    {
+        if (entry->lock == lock)
+        {
+            entry->state = zero;
+            break;
+        }
+    }
+
+    srw_unaligned_unlock_table();
+}
+
+static void srw_unaligned_acquire_exclusive( RTL_SRWLOCK *lock )
+{
+    struct srw_unaligned_entry *entry = srw_unaligned_get_entry( lock );
+    unsigned short owners;
+
+    srw_unaligned_lock_table();
+    entry->state.exclusive_waiters += 2;
+    srw_unaligned_store_state( lock, &entry->state );
+
+    for (;;)
+    {
+        if (!entry->state.owners)
+        {
+            entry->state.owners = 1;
+            entry->state.exclusive_waiters -= 2;
+            entry->state.exclusive_waiters |= 1;
+            srw_unaligned_store_state( lock, &entry->state );
+            srw_unaligned_unlock_table();
+            return;
+        }
+
+        owners = entry->state.owners;
+        srw_unaligned_unlock_table();
+        RtlWaitOnAddress( &entry->state.owners, &owners, sizeof(owners), NULL );
+        srw_unaligned_lock_table();
+    }
+}
+
+static void srw_unaligned_acquire_shared( RTL_SRWLOCK *lock )
+{
+    struct srw_unaligned_entry *entry = srw_unaligned_get_entry( lock );
+    struct srw_lock state;
+
+    srw_unaligned_lock_table();
+
+    for (;;)
+    {
+        if (!entry->state.exclusive_waiters)
+        {
+            ++entry->state.owners;
+            srw_unaligned_store_state( lock, &entry->state );
+            srw_unaligned_unlock_table();
+            return;
+        }
+
+        state = entry->state;
+        srw_unaligned_unlock_table();
+        RtlWaitOnAddress( &entry->state, &state, sizeof(state), NULL );
+        srw_unaligned_lock_table();
+    }
+}
+
+static void srw_unaligned_release_exclusive( RTL_SRWLOCK *lock )
+{
+    struct srw_unaligned_entry *entry = srw_unaligned_get_entry( lock );
+    BOOL wake_exclusive;
+
+    srw_unaligned_lock_table();
+
+    if (!(entry->state.exclusive_waiters & 1)) ERR("Lock %p is not owned exclusive!\n", lock);
+
+    entry->state.owners = 0;
+    entry->state.exclusive_waiters &= ~1;
+    wake_exclusive = !!entry->state.exclusive_waiters;
+    srw_unaligned_store_state( lock, &entry->state );
+
+    srw_unaligned_unlock_table();
+
+    if (wake_exclusive)
+        srw_unaligned_wake_exclusive( lock, entry );
+    else
+        srw_unaligned_wake_all( lock, entry );
+}
+
+static void srw_unaligned_release_shared( RTL_SRWLOCK *lock )
+{
+    struct srw_unaligned_entry *entry = srw_unaligned_get_entry( lock );
+    BOOL wake_exclusive;
+
+    srw_unaligned_lock_table();
+
+    if (entry->state.exclusive_waiters & 1) ERR("Lock %p is owned exclusive!\n", lock);
+    else if (!entry->state.owners) ERR("Lock %p is not owned shared!\n", lock);
+
+    --entry->state.owners;
+    wake_exclusive = !entry->state.owners;
+    srw_unaligned_store_state( lock, &entry->state );
+
+    srw_unaligned_unlock_table();
+
+    if (wake_exclusive)
+        srw_unaligned_wake_exclusive( lock, entry );
+}
+
+static BOOLEAN srw_unaligned_try_acquire_exclusive( RTL_SRWLOCK *lock )
+{
+    struct srw_unaligned_entry *entry = srw_unaligned_get_entry( lock );
+    BOOLEAN ret;
+
+    srw_unaligned_lock_table();
+
+    if (!entry->state.owners)
+    {
+        entry->state.owners = 1;
+        entry->state.exclusive_waiters |= 1;
+        srw_unaligned_store_state( lock, &entry->state );
+        ret = TRUE;
+    }
+    else ret = FALSE;
+
+    srw_unaligned_unlock_table();
+    return ret;
+}
+
+static BOOLEAN srw_unaligned_try_acquire_shared( RTL_SRWLOCK *lock )
+{
+    struct srw_unaligned_entry *entry = srw_unaligned_get_entry( lock );
+    BOOLEAN ret;
+
+    srw_unaligned_lock_table();
+
+    if (!entry->state.exclusive_waiters)
+    {
+        ++entry->state.owners;
+        srw_unaligned_store_state( lock, &entry->state );
+        ret = TRUE;
+    }
+    else ret = FALSE;
+
+    srw_unaligned_unlock_table();
+    return ret;
+}
+
 /***********************************************************************
  *              RtlInitializeSRWLock (NTDLL.@)
  *
@@ -500,6 +752,12 @@ C_ASSERT( sizeof(struct srw_lock) == 4 );
  */
 void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
 {
+    if (srw_lock_is_unaligned( lock ))
+    {
+        srw_unaligned_reset( lock );
+        return;
+    }
+
     lock->Ptr = NULL;
 }
 
@@ -514,6 +772,12 @@ void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
 void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
+
+    if (srw_lock_is_unaligned( lock ))
+    {
+        srw_unaligned_acquire_exclusive( lock );
+        return;
+    }
 
     InterlockedExchangeAdd16( &u.s->exclusive_waiters, 2 );
 
@@ -557,6 +821,12 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
 
+    if (srw_lock_is_unaligned( lock ))
+    {
+        srw_unaligned_acquire_shared( lock );
+        return;
+    }
+
     for (;;)
     {
         union { struct srw_lock s; LONG l; } old, new;
@@ -593,6 +863,12 @@ void WINAPI RtlReleaseSRWLockExclusive( RTL_SRWLOCK *lock )
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
 
+    if (srw_lock_is_unaligned( lock ))
+    {
+        srw_unaligned_release_exclusive( lock );
+        return;
+    }
+
     do
     {
         old.s = *u.s;
@@ -617,6 +893,12 @@ void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
+
+    if (srw_lock_is_unaligned( lock ))
+    {
+        srw_unaligned_release_shared( lock );
+        return;
+    }
 
     do
     {
@@ -645,6 +927,9 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
     BOOLEAN ret;
+
+    if (srw_lock_is_unaligned( lock ))
+        return srw_unaligned_try_acquire_exclusive( lock );
 
     do
     {
@@ -675,6 +960,9 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockShared( RTL_SRWLOCK *lock )
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
     BOOLEAN ret;
+
+    if (srw_lock_is_unaligned( lock ))
+        return srw_unaligned_try_acquire_shared( lock );
 
     do
     {

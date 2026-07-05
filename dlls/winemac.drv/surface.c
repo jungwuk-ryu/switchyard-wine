@@ -48,6 +48,7 @@ struct macdrv_window_surface
     struct window_surface   header;
     macdrv_window           window;
     CGDataProviderRef       provider;
+    void                   *bits;
     POINT                   offset;
     BOOL                    child;
     BOOL                    foreign_child;
@@ -61,6 +62,8 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
     static const WCHAR chrome_widget_prefix[] =
         {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    static const WCHAR intermediate_d3d_window[] =
+        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
     WCHAR class_name[64];
     UNICODE_STRING name =
     {
@@ -76,6 +79,7 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
 
     return !wcscmp(class_name, cef_browser_window)
         || !wcscmp(class_name, chrome_render_widget)
+        || !wcscmp(class_name, intermediate_d3d_window)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
@@ -103,6 +107,33 @@ static void macdrv_surface_set_clip(struct window_surface *window_surface, const
 {
 }
 
+static void sync_foreign_child_surface_frame(struct macdrv_window_surface *surface)
+{
+    HWND hwnd = surface->header.hwnd;
+    struct macdrv_win_data *data;
+    RECT rect;
+    UINT dpi;
+    CGRect frame;
+
+    if (!surface->foreign_child || !surface->window) return;
+
+    dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
+    if (!NtUserGetClientRect(hwnd, &rect, dpi)) return;
+    NtUserMapWindowPoints(hwnd, 0, (POINT *)&rect, 2, dpi);
+    if (IsRectEmpty(&rect)) return;
+
+    if ((data = get_win_data(hwnd)))
+    {
+        data->rects.window = rect;
+        data->rects.client = rect;
+        data->rects.visible = rect;
+        release_win_data(data);
+    }
+
+    frame = cgrect_from_rect(rect);
+    macdrv_set_cocoa_window_frame(surface->window, &frame);
+}
+
 /***********************************************************************
  *              macdrv_surface_flush
  */
@@ -117,6 +148,10 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     CGImageRef image;
 
     colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+
+    if (color_bits && color_bits != surface->bits)
+        memcpy(surface->bits, color_bits, color_info->bmiHeader.biSizeImage);
+
     image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
                           color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), colorspace,
                           alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
@@ -127,6 +162,8 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
         OffsetRect(&translated_rect, surface->offset.x, surface->offset.y);
         OffsetRect(&translated_dirty, surface->offset.x, surface->offset.y);
     }
+    else
+        sync_foreign_child_surface_frame(surface);
 
     macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(translated_rect),
                                   cgrect_from_rect(translated_dirty));
@@ -242,10 +279,11 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
         surface = get_mac_surface(window_surface);
         surface->window = window;
         surface->provider = provider;
+        surface->bits = bits;
         surface->offset = *offset;
         surface->child = child;
         surface->foreign_child = foreign_child;
-        window_surface->flush_on_unlock = child;
+        window_surface->flush_on_unlock = child || foreign_child;
     }
 
     return window_surface;

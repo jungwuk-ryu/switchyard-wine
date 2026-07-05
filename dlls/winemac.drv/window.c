@@ -53,6 +53,8 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
     static const WCHAR chrome_widget_prefix[] =
         {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    static const WCHAR intermediate_d3d_window[] =
+        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
     WCHAR class_name[64];
     UNICODE_STRING name =
     {
@@ -68,6 +70,7 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
 
     return !wcscmp(class_name, cef_browser_window)
         || !wcscmp(class_name, chrome_render_widget)
+        || !wcscmp(class_name, intermediate_d3d_window)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 

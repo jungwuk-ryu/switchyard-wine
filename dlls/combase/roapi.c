@@ -42,9 +42,57 @@ struct activatable_class_data
     DWORD threading_model;
 };
 
+static BOOL actctx_section_contains_range(const ACTCTX_SECTION_KEYED_DATA *data, UINT_PTR offset, SIZE_T size)
+{
+    return data->lpSectionBase && offset <= data->ulSectionTotalLength
+            && size <= data->ulSectionTotalLength - offset;
+}
+
+static BOOL actctx_section_contains_pointer(const ACTCTX_SECTION_KEYED_DATA *data, const void *ptr, SIZE_T size)
+{
+    UINT_PTR base = (UINT_PTR)data->lpSectionBase, value = (UINT_PTR)ptr;
+
+    return ptr && value >= base && actctx_section_contains_range(data, value - base, size);
+}
+
+static BOOL actctx_section_contains_data(const ACTCTX_SECTION_KEYED_DATA *data, SIZE_T size)
+{
+    return data->ulLength >= size && actctx_section_contains_pointer(data, data->lpData, size);
+}
+
+static HRESULT get_builtin_library_for_classid(const WCHAR *classid, WCHAR **out)
+{
+    static const struct
+    {
+        const WCHAR *classid;
+        const WCHAR *library;
+    }
+    builtin_classes[] =
+    {
+        { L"Windows.UI.Core.CoreWindow", L"windows.ui.dll" },
+        { L"Windows.UI.ViewManagement.AccessibilitySettings", L"windows.ui.dll" },
+        { L"Windows.UI.ViewManagement.InputPane", L"windows.ui.dll" },
+        { L"Windows.UI.ViewManagement.UISettings", L"windows.ui.dll" },
+        { L"Windows.UI.ViewManagement.UIViewSettings", L"windows.ui.dll" },
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(builtin_classes); ++i)
+    {
+        if (!wcscmp(classid, builtin_classes[i].classid))
+        {
+            if (!(*out = wcsdup(builtin_classes[i].library)))
+                return E_OUTOFMEMORY;
+            return S_OK;
+        }
+    }
+
+    return REGDB_E_CLASSNOTREG;
+}
+
 static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
 {
-    ACTCTX_SECTION_KEYED_DATA data;
+    ACTCTX_SECTION_KEYED_DATA data = { sizeof(data) };
     HKEY hkey_root, hkey_class;
     DWORD type, size;
     HRESULT hr;
@@ -53,15 +101,32 @@ static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
     *out = NULL;
 
     /* search activation context first */
-    data.cbSize = sizeof(data);
     if (FindActCtxSectionStringW(FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX, NULL,
             ACTIVATION_CONTEXT_SECTION_WINRT_ACTIVATABLE_CLASSES, classid, &data))
     {
-        struct activatable_class_data *activatable_class = (struct activatable_class_data *)data.lpData;
-        void *ptr = (BYTE *)data.lpSectionBase + activatable_class->module_offset;
-        *out = wcsdup(ptr);
-        return S_OK;
+        if (actctx_section_contains_data(&data, sizeof(struct activatable_class_data)))
+        {
+            struct activatable_class_data *activatable_class = (struct activatable_class_data *)data.lpData;
+            SIZE_T module_size;
+
+            if (activatable_class->module_len <= ~(ULONG)0 - sizeof(WCHAR)
+                    && (module_size = activatable_class->module_len + sizeof(WCHAR))
+                    && actctx_section_contains_range(&data, activatable_class->module_offset, module_size))
+            {
+                const WCHAR *ptr = (const WCHAR *)((BYTE *)data.lpSectionBase + activatable_class->module_offset);
+
+                *out = wcsdup(ptr);
+                if (data.hActCtx) ReleaseActCtx(data.hActCtx);
+                return *out ? S_OK : E_OUTOFMEMORY;
+            }
+        }
+
+        WARN("Ignoring invalid activation context data for class %s\n", debugstr_w(classid));
+        if (data.hActCtx) ReleaseActCtx(data.hActCtx);
     }
+
+    if (SUCCEEDED(hr = get_builtin_library_for_classid(classid, out)))
+        return hr;
 
     /* load class registry key */
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId",

@@ -32,6 +32,7 @@
 #include "windows.ui.h"
 #define WIDL_using_Windows_UI_ViewManagement
 #include "windows.ui.viewmanagement.h"
+#include "uiviewsettingsinterop.h"
 
 #include "wine/test.h"
 
@@ -515,6 +516,90 @@ static void test_AccessibilitySettings(void)
     ok( ref == 1, "got ref %ld.\n", ref );
 }
 
+static void test_UIViewSettings(void)
+{
+    static const WCHAR *class_name = RuntimeClass_Windows_UI_ViewManagement_UIViewSettings;
+    IUIViewSettingsInterop *interop;
+    IUIViewSettingsStatics *statics;
+    IActivationFactory *factory;
+    IUIViewSettings *settings;
+    UserInteractionMode mode;
+    IUnknown *unknown;
+    HSTRING str;
+    HRESULT hr;
+    HWND hwnd;
+    LONG ref;
+
+    hr = WindowsCreateString( class_name, wcslen( class_name ), &str );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+
+    hr = RoGetActivationFactory( str, &IID_IActivationFactory, (void **)&factory );
+    ok( hr == S_OK || broken( hr == REGDB_E_CLASSNOTREG ), "got hr %#lx.\n", hr );
+    if (FAILED( hr ))
+    {
+        win_skip( "%s runtimeclass not registered, skipping tests.\n", wine_dbgstr_w( class_name ) );
+        WindowsDeleteString( str );
+        return;
+    }
+
+    check_interface( factory, &IID_IUnknown, TRUE );
+    check_interface( factory, &IID_IInspectable, TRUE );
+    check_interface( factory, &IID_IActivationFactory, TRUE );
+    check_interface( factory, &IID_IUIViewSettingsInterop, TRUE );
+    check_interface( factory, &IID_IUIViewSettingsStatics, TRUE );
+    check_interface( factory, &IID_IUIViewSettings, FALSE );
+
+    hr = RoGetActivationFactory( str, &IID_IUIViewSettingsStatics, (void **)&statics );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    settings = NULL;
+    hr = IUIViewSettingsStatics_GetForCurrentView( statics, &settings );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    ok( !!settings, "Expected settings instance.\n" );
+    mode = 0xdeadbeef;
+    hr = IUIViewSettings_get_UserInteractionMode( settings, &mode );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    ok( mode == UserInteractionMode_Mouse || mode == UserInteractionMode_Touch,
+            "got unexpected interaction mode %d.\n", mode );
+    IUIViewSettings_Release( settings );
+    IUIViewSettingsStatics_Release( statics );
+
+    hr = RoGetActivationFactory( str, &IID_IUIViewSettingsInterop, (void **)&interop );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+
+    hwnd = CreateWindowW( L"static", L"uiviewsettings", WS_OVERLAPPEDWINDOW,
+            0, 0, 1, 1, NULL, NULL, NULL, NULL );
+    ok( !!hwnd, "Failed to create test window, error %lu.\n", GetLastError() );
+
+    settings = NULL;
+    hr = IUIViewSettingsInterop_GetForWindow( interop, hwnd, &IID_IUIViewSettings, (void **)&settings );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    ok( !!settings, "Expected settings instance.\n" );
+    mode = 0xdeadbeef;
+    hr = IUIViewSettings_get_UserInteractionMode( settings, &mode );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    ok( mode == UserInteractionMode_Mouse || mode == UserInteractionMode_Touch,
+            "got unexpected interaction mode %d.\n", mode );
+    IUIViewSettings_Release( settings );
+
+    unknown = NULL;
+    hr = IUIViewSettingsInterop_GetForWindow( interop, hwnd, &IID_IUnknown, (void **)&unknown );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    ok( !!unknown, "Expected IUnknown.\n" );
+    IUnknown_Release( unknown );
+
+    settings = (void *)0xdeadbeef;
+    hr = IUIViewSettingsInterop_GetForWindow( interop, hwnd, &IID_IUIViewSettingsStatics, (void **)&settings );
+    ok( hr == E_NOINTERFACE, "got hr %#lx.\n", hr );
+    ok( !settings, "Expected NULL settings pointer.\n" );
+
+    if (hwnd) DestroyWindow( hwnd );
+    IUIViewSettingsInterop_Release( interop );
+    WindowsDeleteString( str );
+
+    ref = IActivationFactory_Release( factory );
+    ok( ref == 1, "got ref %ld.\n", ref );
+}
+
 START_TEST(uisettings)
 {
     HRESULT hr;
@@ -525,6 +610,7 @@ START_TEST(uisettings)
     test_UISettings();
     test_UISettings_weak_ref();
     test_AccessibilitySettings();
+    test_UIViewSettings();
 
     RoUninitialize();
 }

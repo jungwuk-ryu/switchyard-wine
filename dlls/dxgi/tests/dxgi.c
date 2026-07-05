@@ -5414,10 +5414,13 @@ static void test_swapchain_formats(IUnknown *device, BOOL is_d3d12)
 
 static void test_maximum_frame_latency(void)
 {
+    IDXGIDevice2 *device2;
     IDXGIDevice1 *device1;
     IDXGIDevice *device;
     UINT max_latency;
+    DWORD wait_result;
     ULONG refcount;
+    HANDLE event;
     HRESULT hr;
 
     if (!(device = create_device(0)))
@@ -5460,6 +5463,28 @@ static void test_maximum_frame_latency(void)
     else
     {
         win_skip("IDXGIDevice1 is not implemented.\n");
+    }
+
+    if (SUCCEEDED(IDXGIDevice_QueryInterface(device, &IID_IDXGIDevice2, (void **)&device2)))
+    {
+        if (!(event = CreateEventA(NULL, FALSE, FALSE, NULL)))
+        {
+            skip("Failed to create event.\n");
+        }
+        else
+        {
+            hr = IDXGIDevice2_EnqueueSetEvent(device2, event);
+            ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+            wait_result = WaitForSingleObject(event, 1000);
+            ok(wait_result == WAIT_OBJECT_0, "Got unexpected wait result %#lx.\n", wait_result);
+            CloseHandle(event);
+        }
+
+        IDXGIDevice2_Release(device2);
+    }
+    else
+    {
+        win_skip("IDXGIDevice2 is not implemented.\n");
     }
 
     refcount = IDXGIDevice_Release(device);

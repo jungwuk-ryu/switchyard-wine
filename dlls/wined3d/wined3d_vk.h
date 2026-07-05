@@ -808,6 +808,7 @@ struct wined3d_adapter_vk
     const char **device_extensions;
     VkPhysicalDevice physical_device;
 
+    VkPhysicalDeviceProperties device_properties;
     VkPhysicalDeviceLimits device_limits;
     VkPhysicalDeviceMemoryProperties memory_properties;
 };

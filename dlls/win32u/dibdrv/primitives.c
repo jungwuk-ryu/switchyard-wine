@@ -112,6 +112,55 @@ static const BYTE pixel_masks_4[2] = {0xf0, 0x0f};
 static const BYTE pixel_masks_1[8] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
 static const BYTE edge_masks_1[8] = {0xff, 0x7f, 0x3f, 0x1f, 0x0f, 0x07, 0x03, 0x01};
 
+static inline DWORD high_byte_alpha_mask_32( const dib_info *dib )
+{
+    DWORD color_mask = dib->red_mask | dib->green_mask | dib->blue_mask;
+
+    return (dib->bit_count == 32 && !(color_mask & 0xff000000)) ? 0xff000000 : 0;
+}
+
+static inline DWORD blend_alpha_byte_32( DWORD dst, BYTE alpha, DWORD alpha_mask )
+{
+    if (!alpha_mask) return 0;
+    return (alpha + ((BYTE)(dst >> 24) * (255 - alpha) + 127) / 255) << 24;
+}
+
+static inline DWORD opaque_alpha_pixel_32( DWORD pixel, DWORD alpha_mask )
+{
+    return pixel | alpha_mask;
+}
+
+static inline void set_opaque_alpha_32( DWORD *pixels, int count, DWORD alpha_mask )
+{
+    if (!alpha_mask) return;
+    while (count--) *pixels++ |= alpha_mask;
+}
+
+static inline BYTE visible_source_alpha_32( DWORD src )
+{
+    BYTE alpha = src >> 24;
+
+    return (!alpha && (src & 0x00ffffff)) ? 255 : alpha;
+}
+
+static inline BYTE source_alpha_32( DWORD src, BLENDFUNCTION blend )
+{
+    if (!(blend.AlphaFormat & AC_SRC_ALPHA)) return 0;
+    return (visible_source_alpha_32( src ) * blend.SourceConstantAlpha + 127) / 255;
+}
+
+static inline BYTE glyph_alpha_32( BYTE glyph )
+{
+    return (glyph * 255 + 8) / 16;
+}
+
+static inline BYTE subpixel_alpha_32( DWORD glyph )
+{
+    BYTE r = glyph >> 16, g = glyph >> 8, b = glyph;
+
+    return max( max( r, g ), b );
+}
+
 #define FILTER_DIBINDEX(rgbquad,other_val) \
     (HIWORD( *(DWORD *)(&rgbquad) ) == 0x10ff ? LOWORD( *(DWORD *)(&rgbquad) ) : (other_val))
 
@@ -271,7 +320,10 @@ static inline void memset_16( WORD *start, WORD val, DWORD size )
 static void solid_rects_32(const dib_info *dib, int num, const RECT *rc, DWORD and, DWORD xor)
 {
     DWORD *ptr, *start;
+    DWORD alpha_mask = high_byte_alpha_mask_32( dib );
     int x, y, i;
+
+    if (!and) xor |= alpha_mask;
 
     for(i = 0; i < num; i++, rc++)
     {
@@ -582,6 +634,8 @@ static void solid_line_32(const dib_info *dib, const POINT *start, const struct 
     int len = params->length, err = params->err_start;
     int major_inc, minor_inc;
 
+    if (!and) xor |= high_byte_alpha_mask_32( dib );
+
     if (params->x_major)
     {
         major_inc = params->x_inc;
@@ -823,6 +877,7 @@ static void pattern_rects_32(const dib_info *dib, int num, const RECT *rc, const
                              const dib_info *brush, const rop_mask_bits *bits)
 {
     DWORD *ptr, *start, *start_and, *and_ptr, *start_xor, *xor_ptr;
+    DWORD alpha_mask = high_byte_alpha_mask_32( dib );
     int x, y, i, len, brush_x;
     POINT offset;
 
@@ -843,7 +898,11 @@ static void pattern_rects_32(const dib_info *dib, int num, const RECT *rc, const
 
                 for(x = rc->left, ptr = start; x < rc->right; x++)
                 {
-                    do_rop_32(ptr++, *and_ptr++, *xor_ptr++);
+                    DWORD and_mask = *and_ptr++, xor_mask = *xor_ptr++;
+
+                    do_rop_32(ptr, and_mask, xor_mask);
+                    if (and_mask != ~0u || xor_mask) *ptr |= alpha_mask;
+                    ptr++;
                     if(and_ptr == start_and + brush->width)
                     {
                         and_ptr = start_and;
@@ -873,6 +932,7 @@ static void pattern_rects_32(const dib_info *dib, int num, const RECT *rc, const
                 {
                     len = min( rc->right - x, brush->width - brush_x );
                     memcpy( start + x - rc->left, start_xor + brush_x, len * 4 );
+                    set_opaque_alpha_32( start + x - rc->left, len, alpha_mask );
                     brush_x = 0;
                 }
 
@@ -1383,6 +1443,7 @@ static void copy_rect_32(const dib_info *dst, const RECT *rc,
                          const dib_info *src, const POINT *origin, int rop2, int overlap)
 {
     DWORD *dst_start, *src_start;
+    DWORD alpha_mask = high_byte_alpha_mask_32( dst ) & high_byte_alpha_mask_32( src );
     int y, dst_stride, src_stride;
     SIZE size;
 
@@ -1404,7 +1465,10 @@ static void copy_rect_32(const dib_info *dst, const RECT *rc,
     if (rop2 == R2_COPYPEN)
     {
         for (y = rc->top; y < rc->bottom; y++, dst_start += dst_stride, src_start += src_stride)
+        {
             memmove( dst_start, src_start, (rc->right - rc->left) * 4 );
+            set_opaque_alpha_32( dst_start, rc->right - rc->left, alpha_mask );
+        }
         return;
     }
 
@@ -4645,7 +4709,7 @@ static inline DWORD blend_argb( DWORD dst, DWORD src )
     BYTE b = (BYTE)src;
     BYTE g = (BYTE)(src >> 8);
     BYTE r = (BYTE)(src >> 16);
-    DWORD alpha  = (BYTE)(src >> 24);
+    DWORD alpha  = visible_source_alpha_32( src );
     return ((b     + ((BYTE)dst         * (255 - alpha) + 127) / 255) |
             (g     + ((BYTE)(dst >> 8)  * (255 - alpha) + 127) / 255) << 8 |
             (r     + ((BYTE)(dst >> 16) * (255 - alpha) + 127) / 255) << 16 |
@@ -4654,10 +4718,11 @@ static inline DWORD blend_argb( DWORD dst, DWORD src )
 
 static inline DWORD blend_argb_alpha( DWORD dst, DWORD src, DWORD alpha )
 {
-    BYTE b = ((BYTE)src         * alpha + 127) / 255;
-    BYTE g = ((BYTE)(src >> 8)  * alpha + 127) / 255;
-    BYTE r = ((BYTE)(src >> 16) * alpha + 127) / 255;
-    alpha  = ((BYTE)(src >> 24) * alpha + 127) / 255;
+    DWORD const_alpha = alpha;
+    BYTE b = ((BYTE)src         * const_alpha + 127) / 255;
+    BYTE g = ((BYTE)(src >> 8)  * const_alpha + 127) / 255;
+    BYTE r = ((BYTE)(src >> 16) * const_alpha + 127) / 255;
+    alpha  = (visible_source_alpha_32( src ) * const_alpha + 127) / 255;
     return ((b     + ((BYTE)dst         * (255 - alpha) + 127) / 255) |
             (g     + ((BYTE)(dst >> 8)  * (255 - alpha) + 127) / 255) << 8 |
             (r     + ((BYTE)(dst >> 16) * (255 - alpha) + 127) / 255) << 16 |
@@ -4668,11 +4733,11 @@ static inline DWORD blend_rgb( BYTE dst_r, BYTE dst_g, BYTE dst_b, DWORD src, BL
 {
     if (blend.AlphaFormat & AC_SRC_ALPHA)
     {
-        DWORD alpha = blend.SourceConstantAlpha;
-        BYTE src_b = ((BYTE)src         * alpha + 127) / 255;
-        BYTE src_g = ((BYTE)(src >> 8)  * alpha + 127) / 255;
-        BYTE src_r = ((BYTE)(src >> 16) * alpha + 127) / 255;
-        alpha      = ((BYTE)(src >> 24) * alpha + 127) / 255;
+        DWORD const_alpha = blend.SourceConstantAlpha;
+        DWORD alpha = source_alpha_32( src, blend );
+        BYTE src_b = ((BYTE)src         * const_alpha + 127) / 255;
+        BYTE src_g = ((BYTE)(src >> 8)  * const_alpha + 127) / 255;
+        BYTE src_r = ((BYTE)(src >> 16) * const_alpha + 127) / 255;
         return ((src_b + (dst_b * (255 - alpha) + 127) / 255) |
                 (src_g + (dst_g * (255 - alpha) + 127) / 255) << 8 |
                 (src_r + (dst_r * (255 - alpha) + 127) / 255) << 16);
@@ -4718,6 +4783,7 @@ static void blend_rects_32(const dib_info *dst, int num, const RECT *rc,
                            const dib_info *src, const POINT *offset, BLENDFUNCTION blend)
 {
     int i, x, y;
+    DWORD alpha_mask = high_byte_alpha_mask_32( dst );
 
     for (i = 0; i < num; i++, rc++)
     {
@@ -4734,7 +4800,8 @@ static void blend_rects_32(const dib_info *dst, int num, const RECT *rc,
                                            dst_ptr[x] >> dst->green_shift,
                                            dst_ptr[x] >> dst->blue_shift,
                                            src_ptr[x], blend );
-                    dst_ptr[x] = ((( val        & 0xff) << dst->blue_shift) |
+                    dst_ptr[x] = blend_alpha_byte_32( dst_ptr[x], source_alpha_32( src_ptr[x], blend ), alpha_mask ) |
+                                 ((( val        & 0xff) << dst->blue_shift) |
                                   (((val >> 8)  & 0xff) << dst->green_shift) |
                                   (((val >> 16) & 0xff) << dst->red_shift));
                 }
@@ -4750,7 +4817,8 @@ static void blend_rects_32(const dib_info *dst, int num, const RECT *rc,
                                            get_field( dst_ptr[x], dst->green_shift, dst->green_len ),
                                            get_field( dst_ptr[x], dst->blue_shift, dst->blue_len ),
                                            src_ptr[x], blend );
-                    dst_ptr[x] = rgb_to_pixel_masks( dst, val >> 16, val >> 8, val );
+                    dst_ptr[x] = blend_alpha_byte_32( dst_ptr[x], source_alpha_32( src_ptr[x], blend ), alpha_mask ) |
+                                 rgb_to_pixel_masks( dst, val >> 16, val >> 8, val );
                 }
             }
         }
@@ -5036,13 +5104,15 @@ static inline DWORD gradient_triangle_8( const dib_info *dib, const TRIVERTEX *v
 static BOOL gradient_rect_8888( const dib_info *dib, const RECT *rc, const TRIVERTEX *v, int mode )
 {
     DWORD *ptr = get_pixel_ptr_32( dib, rc->left, rc->top );
+    DWORD alpha_mask = high_byte_alpha_mask_32( dib );
     int x, y, left, right, det;
 
     switch (mode)
     {
     case GRADIENT_FILL_RECT_H:
         for (x = 0; x < rc->right - rc->left; x++)
-            ptr[x] = gradient_rgb_8888( v, rc->left + x - v[0].x, v[1].x - v[0].x );
+            ptr[x] = opaque_alpha_pixel_32( gradient_rgb_8888( v, rc->left + x - v[0].x,
+                                                               v[1].x - v[0].x ), alpha_mask );
 
         for (y = rc->top + 1; y < rc->bottom; y++, ptr += dib->stride / 4)
             memcpy( ptr + dib->stride / 4, ptr, (rc->right - rc->left) * 4 );
@@ -5051,7 +5121,8 @@ static BOOL gradient_rect_8888( const dib_info *dib, const RECT *rc, const TRIVE
     case GRADIENT_FILL_RECT_V:
         for (y = rc->top; y < rc->bottom; y++, ptr += dib->stride / 4)
         {
-            DWORD val = gradient_rgb_8888( v, y - v[0].y, v[1].y - v[0].y );
+            DWORD val = opaque_alpha_pixel_32( gradient_rgb_8888( v, y - v[0].y, v[1].y - v[0].y ),
+                                               alpha_mask );
             memset_32( ptr, val, rc->right - rc->left );
         }
         break;
@@ -5061,7 +5132,9 @@ static BOOL gradient_rect_8888( const dib_info *dib, const RECT *rc, const TRIVE
         for (y = rc->top; y < rc->bottom; y++, ptr += dib->stride / 4)
         {
             triangle_coords( v, rc, y, &left, &right );
-            for (x = left; x < right; x++) ptr[x - rc->left] = gradient_triangle_8888( v, x, y, det );
+            for (x = left; x < right; x++)
+                ptr[x - rc->left] = opaque_alpha_pixel_32( gradient_triangle_8888( v, x, y, det ),
+                                                           alpha_mask );
         }
         break;
     }
@@ -5071,6 +5144,7 @@ static BOOL gradient_rect_8888( const dib_info *dib, const RECT *rc, const TRIVE
 static BOOL gradient_rect_32( const dib_info *dib, const RECT *rc, const TRIVERTEX *v, int mode )
 {
     DWORD *ptr = get_pixel_ptr_32( dib, rc->left, rc->top );
+    DWORD alpha_mask = high_byte_alpha_mask_32( dib );
     int x, y, left, right, det;
 
     switch (mode)
@@ -5081,9 +5155,9 @@ static BOOL gradient_rect_32( const dib_info *dib, const RECT *rc, const TRIVERT
             for (x = 0; x < rc->right - rc->left; x++)
             {
                 DWORD val = gradient_rgb_24( v, rc->left + x - v[0].x, v[1].x - v[0].x );
-                ptr[x] = ((( val        & 0xff) << dib->blue_shift) |
-                          (((val >> 8)  & 0xff) << dib->green_shift) |
-                          (((val >> 16) & 0xff) << dib->red_shift));
+                ptr[x] = opaque_alpha_pixel_32( ((( val        & 0xff) << dib->blue_shift) |
+                                                 (((val >> 8)  & 0xff) << dib->green_shift) |
+                                                 (((val >> 16) & 0xff) << dib->red_shift)), alpha_mask );
             }
         }
         else
@@ -5091,7 +5165,8 @@ static BOOL gradient_rect_32( const dib_info *dib, const RECT *rc, const TRIVERT
             for (x = 0; x < rc->right - rc->left; x++)
             {
                 DWORD val = gradient_rgb_24( v, rc->left + x - v[0].x, v[1].x - v[0].x );
-                ptr[x] = rgb_to_pixel_masks( dib, val >> 16, val >> 8, val );
+                ptr[x] = opaque_alpha_pixel_32( rgb_to_pixel_masks( dib, val >> 16, val >> 8, val ),
+                                                alpha_mask );
             }
         }
 
@@ -5109,6 +5184,7 @@ static BOOL gradient_rect_32( const dib_info *dib, const RECT *rc, const TRIVERT
                        (((val >> 16) & 0xff) << dib->red_shift));
             else
                 val = rgb_to_pixel_masks( dib, val >> 16, val >> 8, val );
+            val = opaque_alpha_pixel_32( val, alpha_mask );
 
             memset_32( ptr, val, rc->right - rc->left );
         }
@@ -5124,15 +5200,17 @@ static BOOL gradient_rect_32( const dib_info *dib, const RECT *rc, const TRIVERT
                 for (x = left; x < right; x++)
                 {
                     DWORD val = gradient_triangle_24( v, x, y, det );
-                    ptr[x - rc->left] = ((( val        & 0xff) << dib->blue_shift) |
-                                         (((val >> 8)  & 0xff) << dib->green_shift) |
-                                         (((val >> 16) & 0xff) << dib->red_shift));
+                    ptr[x - rc->left] = opaque_alpha_pixel_32(
+                        ((( val        & 0xff) << dib->blue_shift) |
+                         (((val >> 8)  & 0xff) << dib->green_shift) |
+                         (((val >> 16) & 0xff) << dib->red_shift)), alpha_mask );
                 }
             else
                 for (x = left; x < right; x++)
                 {
                     DWORD val = gradient_triangle_24( v, x, y, det );
-                    ptr[x - rc->left] = rgb_to_pixel_masks( dib, val >> 16, val >> 8, val );
+                    ptr[x - rc->left] = opaque_alpha_pixel_32(
+                        rgb_to_pixel_masks( dib, val >> 16, val >> 8, val ), alpha_mask );
                 }
         }
         break;
@@ -5447,6 +5525,7 @@ static void mask_rect_32( const dib_info *dst, const RECT *rc,
                           const dib_info *src, const POINT *origin, int rop2 )
 {
     DWORD *dst_start = get_pixel_ptr_32(dst, rc->left, rc->top), dst_colors[256];
+    DWORD alpha_mask = high_byte_alpha_mask_32( dst );
     DWORD src_val, bit_val, i, full, pos;
     int x, y, origin_end = origin->x + rc->right - rc->left;
     const RGBQUAD *color_table = get_dib_color_table( src );
@@ -5454,11 +5533,11 @@ static void mask_rect_32( const dib_info *dst, const RECT *rc,
 
     if (dst->funcs == &funcs_8888)
         for (i = 0; i < 2; i++)
-            dst_colors[i] = color_table[i].rgbRed << 16 | color_table[i].rgbGreen << 8 |
+            dst_colors[i] = alpha_mask | color_table[i].rgbRed << 16 | color_table[i].rgbGreen << 8 |
                 color_table[i].rgbBlue;
     else
         for (i = 0; i < 2; i++)
-            dst_colors[i] = rgbquad_to_pixel_masks(dst, color_table[i]);
+            dst_colors[i] = opaque_alpha_pixel_32( rgbquad_to_pixel_masks(dst, color_table[i]), alpha_mask );
 
     /* Creating a BYTE-sized table so we don't need to mask the lsb of bit_val */
     for (i = 2; i < ARRAY_SIZE(dst_colors); i++)
@@ -6138,6 +6217,7 @@ static void draw_glyph_8888( const dib_info *dib, const RECT *rect, const dib_in
 {
     DWORD *dst_ptr = get_pixel_ptr_32( dib, rect->left, rect->top );
     const BYTE *glyph_ptr = get_pixel_ptr_8( glyph, origin->x, origin->y );
+    DWORD alpha_mask = high_byte_alpha_mask_32( dib );
     int x, y;
 
     for (y = rect->top; y < rect->bottom; y++)
@@ -6145,8 +6225,13 @@ static void draw_glyph_8888( const dib_info *dib, const RECT *rect, const dib_in
         for (x = 0; x < rect->right - rect->left; x++)
         {
             if (glyph_ptr[x] <= 1) continue;
-            if (glyph_ptr[x] >= 16) { dst_ptr[x] = text_pixel; continue; }
-            dst_ptr[x] = aa_rgb( dst_ptr[x] >> 16, dst_ptr[x] >> 8, dst_ptr[x], text_pixel, ranges + glyph_ptr[x] );
+            if (glyph_ptr[x] >= 16)
+            {
+                dst_ptr[x] = (text_pixel & ~alpha_mask) | blend_alpha_byte_32( dst_ptr[x], 255, alpha_mask );
+                continue;
+            }
+            dst_ptr[x] = blend_alpha_byte_32( dst_ptr[x], glyph_alpha_32( glyph_ptr[x] ), alpha_mask ) |
+                         aa_rgb( dst_ptr[x] >> 16, dst_ptr[x] >> 8, dst_ptr[x], text_pixel, ranges + glyph_ptr[x] );
         }
         dst_ptr += dib->stride / 4;
         glyph_ptr += glyph->stride;
@@ -6158,6 +6243,7 @@ static void draw_glyph_32( const dib_info *dib, const RECT *rect, const dib_info
 {
     DWORD *dst_ptr = get_pixel_ptr_32( dib, rect->left, rect->top );
     const BYTE *glyph_ptr = get_pixel_ptr_8( glyph, origin->x, origin->y );
+    DWORD alpha_mask = high_byte_alpha_mask_32( dib );
     int x, y;
     DWORD text, val;
 
@@ -6170,12 +6256,17 @@ static void draw_glyph_32( const dib_info *dib, const RECT *rect, const dib_info
         for (x = 0; x < rect->right - rect->left; x++)
         {
             if (glyph_ptr[x] <= 1) continue;
-            if (glyph_ptr[x] >= 16) { dst_ptr[x] = text_pixel; continue; }
+            if (glyph_ptr[x] >= 16)
+            {
+                dst_ptr[x] = (text_pixel & ~alpha_mask) | blend_alpha_byte_32( dst_ptr[x], 255, alpha_mask );
+                continue;
+            }
             val = aa_rgb( get_field(dst_ptr[x], dib->red_shift,   dib->red_len),
                           get_field(dst_ptr[x], dib->green_shift, dib->green_len),
                           get_field(dst_ptr[x], dib->blue_shift,  dib->blue_len),
                           text, ranges + glyph_ptr[x] );
-            dst_ptr[x] = rgb_to_pixel_masks( dib, val >> 16, val >> 8, val );
+            dst_ptr[x] = blend_alpha_byte_32( dst_ptr[x], glyph_alpha_32( glyph_ptr[x] ), alpha_mask ) |
+                         rgb_to_pixel_masks( dib, val >> 16, val >> 8, val );
         }
         dst_ptr += dib->stride / 4;
         glyph_ptr += glyph->stride;
@@ -6371,6 +6462,7 @@ static void draw_subpixel_glyph_8888( const dib_info *dib, const RECT *rect, con
 {
     DWORD *dst_ptr = get_pixel_ptr_32( dib, rect->left, rect->top );
     const DWORD *glyph_ptr = get_pixel_ptr_32( glyph, origin->x, origin->y );
+    DWORD alpha_mask = high_byte_alpha_mask_32( dib );
     int x, y;
 
     for (y = rect->top; y < rect->bottom; y++)
@@ -6378,7 +6470,8 @@ static void draw_subpixel_glyph_8888( const dib_info *dib, const RECT *rect, con
         for (x = 0; x < rect->right - rect->left; x++)
         {
             if (glyph_ptr[x] == 0) continue;
-            dst_ptr[x] = blend_subpixel( dst_ptr[x] >> 16, dst_ptr[x] >> 8, dst_ptr[x],
+            dst_ptr[x] = blend_alpha_byte_32( dst_ptr[x], subpixel_alpha_32( glyph_ptr[x] ), alpha_mask ) |
+                         blend_subpixel( dst_ptr[x] >> 16, dst_ptr[x] >> 8, dst_ptr[x],
                                          text_pixel, glyph_ptr[x], gamma_ramp );
         }
         dst_ptr += dib->stride / 4;
@@ -6392,6 +6485,7 @@ static void draw_subpixel_glyph_32( const dib_info *dib, const RECT *rect, const
 {
     DWORD *dst_ptr = get_pixel_ptr_32( dib, rect->left, rect->top );
     const DWORD *glyph_ptr = get_pixel_ptr_32( glyph, origin->x, origin->y );
+    DWORD alpha_mask = high_byte_alpha_mask_32( dib );
     int x, y;
     DWORD text, val;
 
@@ -6408,7 +6502,8 @@ static void draw_subpixel_glyph_32( const dib_info *dib, const RECT *rect, const
                                   get_field(dst_ptr[x], dib->green_shift, dib->green_len),
                                   get_field(dst_ptr[x], dib->blue_shift,  dib->blue_len),
                                   text, glyph_ptr[x], gamma_ramp );
-            dst_ptr[x] = rgb_to_pixel_masks( dib, val >> 16, val >> 8, val );
+            dst_ptr[x] = blend_alpha_byte_32( dst_ptr[x], subpixel_alpha_32( glyph_ptr[x] ), alpha_mask ) |
+                         rgb_to_pixel_masks( dib, val >> 16, val >> 8, val );
         }
         dst_ptr += dib->stride / 4;
         glyph_ptr += glyph->stride / 4;
@@ -6904,6 +6999,7 @@ static void stretch_row_32(const dib_info *dst_dib, const POINT *dst_start,
 {
     DWORD *dst_ptr = get_pixel_ptr_32( dst_dib, dst_start->x, dst_start->y );
     DWORD *src_ptr = get_pixel_ptr_32( src_dib, src_start->x, src_start->y );
+    DWORD alpha_mask = high_byte_alpha_mask_32( dst_dib ) & high_byte_alpha_mask_32( src_dib );
     int err = params->err_start;
     int width;
 
@@ -6911,7 +7007,7 @@ static void stretch_row_32(const dib_info *dst_dib, const POINT *dst_start,
     {
         for (width = params->length; width; width--)
         {
-            *dst_ptr = *src_ptr;
+            *dst_ptr = opaque_alpha_pixel_32( *src_ptr, alpha_mask );
             dst_ptr += params->dst_inc;
             if (err > 0)
             {
@@ -7159,6 +7255,7 @@ static void shrink_row_32(const dib_info *dst_dib, const POINT *dst_start,
 {
     DWORD *dst_ptr = get_pixel_ptr_32( dst_dib, dst_start->x, dst_start->y );
     DWORD *src_ptr = get_pixel_ptr_32( src_dib, src_start->x, src_start->y );
+    DWORD alpha_mask = high_byte_alpha_mask_32( dst_dib ) & high_byte_alpha_mask_32( src_dib );
     int err = params->err_start;
     int width;
 
@@ -7166,7 +7263,7 @@ static void shrink_row_32(const dib_info *dst_dib, const POINT *dst_start,
     {
         for (width = params->length; width; width--)
         {
-            *dst_ptr = *src_ptr;
+            *dst_ptr = opaque_alpha_pixel_32( *src_ptr, alpha_mask );
             src_ptr += params->src_inc;
             if (err > 0)
             {

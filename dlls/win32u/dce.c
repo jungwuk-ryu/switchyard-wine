@@ -60,6 +60,8 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
     static const WCHAR chrome_widget_prefix[] =
         {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    static const WCHAR intermediate_d3d_window[] =
+        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
     WCHAR class_name[64];
     UNICODE_STRING name =
     {
@@ -75,6 +77,7 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
 
     return !wcscmp(class_name, cef_browser_window)
         || !wcscmp(class_name, chrome_render_widget)
+        || !wcscmp(class_name, intermediate_d3d_window)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
@@ -558,6 +561,88 @@ static BOOL update_surface_shape( struct window_surface *surface, const RECT *re
         return clear_surface_shape( surface );
 }
 
+static void include_debug_point( RECT *bounds, UINT *count, LONG x, LONG y )
+{
+    if (!*count)
+    {
+        bounds->left = x;
+        bounds->top = y;
+        bounds->right = x + 1;
+        bounds->bottom = y + 1;
+    }
+    else
+    {
+        if (x < bounds->left) bounds->left = x;
+        if (y < bounds->top) bounds->top = y;
+        if (x >= bounds->right) bounds->right = x + 1;
+        if (y >= bounds->bottom) bounds->bottom = y + 1;
+    }
+    (*count)++;
+}
+
+static void trace_layered_surface_visibility( struct window_surface *surface, const BITMAPINFO *color_info,
+                                              const void *color_bits, const BITMAPINFO *shape_info,
+                                              const void *shape_bits )
+{
+    const BITMAPINFOHEADER *color_header = &color_info->bmiHeader;
+    RECT alpha_bounds = {0}, shape_bounds = {0};
+    UINT alpha_count = 0, shape_count = 0;
+    INT color_width = color_header->biWidth;
+    INT color_height = abs( color_header->biHeight );
+    UINT color_stride = color_height ? color_header->biSizeImage / color_height : 0;
+    INT shape_width = 0, shape_height = 0;
+    UINT shape_stride = 0;
+    INT x, y;
+
+    if (!surface->alpha_mask && !shape_bits) return;
+
+    if (!color_stride && color_width > 0)
+        color_stride = get_dib_stride( color_width, color_header->biBitCount );
+
+    if (color_bits && color_header->biBitCount == 32 && color_width > 0 && color_height > 0 &&
+        surface->alpha_mask == 0xff000000)
+    {
+        for (y = 0; y < color_height; y++)
+        {
+            const UINT32 *pixel = (const UINT32 *)((const BYTE *)color_bits +
+                                    (color_header->biHeight < 0 ? y : color_height - 1 - y) * color_stride);
+
+            for (x = 0; x < color_width; x++)
+                if (pixel[x] & surface->alpha_mask) include_debug_point( &alpha_bounds, &alpha_count, x, y );
+        }
+    }
+
+    if (shape_bits)
+    {
+        const BITMAPINFOHEADER *shape_header = &shape_info->bmiHeader;
+
+        shape_width = shape_header->biWidth;
+        shape_height = abs( shape_header->biHeight );
+        shape_stride = shape_height ? shape_header->biSizeImage / shape_height : 0;
+        if (!shape_stride && shape_width > 0)
+            shape_stride = get_dib_stride( shape_width, shape_header->biBitCount );
+
+        if (shape_width > 0 && shape_height > 0)
+        {
+            for (y = 0; y < shape_height; y++)
+            {
+                const BYTE *row = (const BYTE *)shape_bits +
+                                  (shape_header->biHeight < 0 ? y : shape_height - 1 - y) * shape_stride;
+
+                for (x = 0; x < shape_width; x++)
+                    if (row[x / 8] & (0x80 >> (x & 7)))
+                        include_debug_point( &shape_bounds, &shape_count, x, y );
+            }
+        }
+    }
+
+    TRACE( "layered visibility hwnd %p alpha_mask %#x color %dx%d stride %u alpha_count %u alpha_bounds %s shape %dx%d stride %u shape_count %u shape_bounds %s shape_bits %p\n",
+           surface->hwnd, surface->alpha_mask, color_width, color_header->biHeight, color_stride,
+           alpha_count, wine_dbgstr_rect( &alpha_bounds ), shape_width,
+           shape_bits ? shape_info->bmiHeader.biHeight : 0, shape_stride, shape_count,
+           wine_dbgstr_rect( &shape_bounds ), shape_bits );
+}
+
 static void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info )
 {
     struct bitblt_coords coords = {0};
@@ -683,6 +768,7 @@ void window_surface_flush( struct window_surface *surface )
 
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+        trace_layered_surface_visibility( surface, color_info, color_bits, shape_info, shape_bits );
 
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
@@ -690,6 +776,40 @@ void window_surface_flush( struct window_surface *surface )
     }
 
     window_surface_unlock( surface );
+}
+
+static BOOL repair_layered_orphan_alpha( const BITMAPINFO *info, void *color_bits, UINT alpha_mask )
+{
+    const BITMAPINFOHEADER *header = &info->bmiHeader;
+    UINT height, stride, x, y;
+    BYTE *row = color_bits;
+    BOOL repaired = FALSE;
+    INT width = header->biWidth;
+
+    if (alpha_mask != 0xff000000) return FALSE;
+    if (header->biBitCount != 32 || width <= 0) return FALSE;
+
+    height = abs( header->biHeight );
+    if (!height) return FALSE;
+
+    stride = header->biSizeImage / height;
+    if (!stride) stride = width * sizeof(UINT32);
+
+    for (y = 0; y < height; y++, row += stride)
+    {
+        UINT32 *pixel = (UINT32 *)row;
+
+        for (x = 0; x < width; x++)
+        {
+            if (!(pixel[x] & alpha_mask) && (pixel[x] & ~alpha_mask))
+            {
+                pixel[x] |= alpha_mask;
+                repaired = TRUE;
+            }
+        }
+    }
+
+    return repaired;
 }
 
 void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
@@ -701,6 +821,8 @@ void window_surface_set_layered( struct window_surface *surface, COLORREF color_
     window_surface_lock( surface );
     if ((color_bits = window_surface_get_color( surface, color_info )))
     {
+        if (repair_layered_orphan_alpha( color_info, color_bits, alpha_mask )) surface->bounds = surface->rect;
+
         color_key = get_color_key( color_info, color_key );
         if (color_key != surface->color_key)
         {

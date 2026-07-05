@@ -56,10 +56,13 @@ static BOOL wined3d_texture_use_pbo(const struct wined3d_texture *texture, const
     if (!wined3d_texture_can_use_pbo(texture, d3d_info))
         return FALSE;
 
-    /* Use a PBO for dynamic textures and read-only staging textures. */
+    /* Use a PBO for dynamic textures, read-only staging textures, and
+     * GDI-compatible textures whose DC backing store mirrors a GPU texture. */
     return (!(texture->resource.access & WINED3D_RESOURCE_ACCESS_CPU)
                 && texture->resource.usage & WINED3DUSAGE_DYNAMIC)
-            || texture->resource.access == (WINED3D_RESOURCE_ACCESS_CPU | WINED3D_RESOURCE_ACCESS_MAP_R);
+            || texture->resource.access == (WINED3D_RESOURCE_ACCESS_CPU | WINED3D_RESOURCE_ACCESS_MAP_R)
+            || ((texture->flags & WINED3D_TEXTURE_GET_DC)
+                && (texture->resource.access & WINED3D_RESOURCE_ACCESS_GPU));
 }
 
 /* Front buffer coordinates are always full screen coordinates, but our GL

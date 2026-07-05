@@ -28,6 +28,7 @@
 
 
 #include <assert.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -74,6 +75,7 @@ static	DWORD	PCM_drvClose(DWORD dwDevID)
 
 /* flags for fdwDriver */
 #define PCM_RESAMPLE	1
+#define PCM_HIGH_DEPTH	2
 
 typedef void (*PCM_CONVERT_KEEP_RATE)(const unsigned char*, int, unsigned char*);
 
@@ -216,6 +218,112 @@ static inline void  W24(unsigned char* dst, int s)
     dst[0] = HIBYTE(LOWORD(s));
     dst[1] = LOBYTE(HIWORD(s));
     dst[2] = HIBYTE(HIWORD(s));
+}
+
+static inline BOOL PCM_IsPackedFormat(const WAVEFORMATEX *wfx)
+{
+    return wfx->nChannels && !(wfx->wBitsPerSample % 8)
+            && wfx->nBlockAlign == wfx->nChannels * (wfx->wBitsPerSample / 8);
+}
+
+static inline BOOL PCM_IsHighDepthSource(const WAVEFORMATEX *wfx)
+{
+    return wfx->wBitsPerSample > 24 && wfx->wBitsPerSample <= 64
+            && !(wfx->wBitsPerSample % 8);
+}
+
+static LONGLONG PCM_ReadSignedSample(const unsigned char *src, unsigned int bytes)
+{
+    ULONGLONG value = 0;
+    unsigned int i;
+
+    for (i = 0; i < bytes; i++)
+        value |= (ULONGLONG)src[i] << (i * 8);
+    if (bytes < sizeof(value) && (src[bytes - 1] & 0x80))
+        value |= ~(~(ULONGLONG)0 >> ((sizeof(value) - bytes) * 8));
+    return value;
+}
+
+static LONGLONG PCM_ClampSignedSample(LONGLONG value, unsigned int bits)
+{
+    LONGLONG max, min;
+
+    if (bits >= 64) return value;
+    max = ((LONGLONG)1 << (bits - 1)) - 1;
+    min = -((LONGLONG)1 << (bits - 1));
+    if (value > max) return max;
+    if (value < min) return min;
+    return value;
+}
+
+static LONGLONG PCM_AddSignedSamples(LONGLONG left, LONGLONG right, unsigned int bits)
+{
+    if (bits >= 64)
+    {
+        if (right > 0 && left > LLONG_MAX - right) return LLONG_MAX;
+        if (right < 0 && left < LLONG_MIN - right) return LLONG_MIN;
+        return left + right;
+    }
+    return PCM_ClampSignedSample(left + right, bits);
+}
+
+static LONGLONG PCM_ConvertSignedSample(LONGLONG value, unsigned int src_bits, unsigned int dst_bits)
+{
+    if (src_bits > dst_bits)
+        value >>= src_bits - dst_bits;
+    else if (src_bits < dst_bits)
+        value <<= dst_bits - src_bits;
+    return PCM_ClampSignedSample(value, dst_bits);
+}
+
+static void PCM_WriteSignedSample(unsigned char *dst, LONGLONG value, unsigned int bits)
+{
+    value = PCM_ClampSignedSample(value, bits);
+    switch (bits)
+    {
+    case 8:
+        *dst = (unsigned char)(value + 128);
+        break;
+    case 16:
+        W16(dst, value);
+        break;
+    case 24:
+        dst[0] = value;
+        dst[1] = value >> 8;
+        dst[2] = value >> 16;
+        break;
+    }
+}
+
+static void PCM_ConvertHighDepthKeepRate(PACMDRVSTREAMINSTANCE adsi,
+        const unsigned char *src, int ns, unsigned char *dst)
+{
+    const WAVEFORMATEX *src_fmt = adsi->pwfxSrc;
+    const WAVEFORMATEX *dst_fmt = adsi->pwfxDst;
+    unsigned int src_bits = src_fmt->wBitsPerSample;
+    unsigned int dst_bits = dst_fmt->wBitsPerSample;
+    unsigned int src_bytes = src_bits / 8;
+    unsigned int dst_bytes = dst_bits / 8;
+
+    while (ns--)
+    {
+        LONGLONG left = PCM_ReadSignedSample(src, src_bytes);
+        LONGLONG right = src_fmt->nChannels == 2 ? PCM_ReadSignedSample(src + src_bytes, src_bytes) : left;
+
+        if (dst_fmt->nChannels == 1)
+        {
+            LONGLONG mixed = src_fmt->nChannels == 2 ? PCM_AddSignedSamples(left, right, src_bits) : left;
+            PCM_WriteSignedSample(dst, PCM_ConvertSignedSample(mixed, src_bits, dst_bits), dst_bits);
+        }
+        else
+        {
+            PCM_WriteSignedSample(dst, PCM_ConvertSignedSample(left, src_bits, dst_bits), dst_bits);
+            PCM_WriteSignedSample(dst + dst_bytes, PCM_ConvertSignedSample(right, src_bits, dst_bits), dst_bits);
+        }
+
+        src += src_fmt->nBlockAlign;
+        dst += dst_fmt->nBlockAlign;
+    }
 }
 
 /***********************************************************************
@@ -1145,6 +1253,37 @@ static	LRESULT	PCM_StreamOpen(PACMDRVSTREAMINSTANCE adsi)
 
     assert(!(adsi->fdwOpen & ACM_STREAMOPENF_ASYNC));
 
+    if (PCM_IsHighDepthSource(adsi->pwfxSrc)){
+        if (!PCM_IsPackedFormat(adsi->pwfxSrc)) {
+            FIXME("Source: %u-bit samples must be packed\n", adsi->pwfxSrc->wBitsPerSample);
+            return MMSYSERR_NOTSUPPORTED;
+        }
+        if (!PCM_IsPackedFormat(adsi->pwfxDst) || adsi->pwfxDst->wBitsPerSample > 24) {
+            FIXME("Unsupported destination bit depth: %u\n", adsi->pwfxDst->wBitsPerSample);
+            return MMSYSERR_NOTSUPPORTED;
+        }
+        if ((adsi->pwfxSrc->nChannels != 1 && adsi->pwfxSrc->nChannels != 2)
+                || (adsi->pwfxDst->nChannels != 1 && adsi->pwfxDst->nChannels != 2)) {
+            FIXME("Unsupported channel conversion: %u -> %u\n",
+                    adsi->pwfxSrc->nChannels, adsi->pwfxDst->nChannels);
+            return MMSYSERR_NOTSUPPORTED;
+        }
+        if (adsi->pwfxSrc->nSamplesPerSec != adsi->pwfxDst->nSamplesPerSec) {
+            FIXME("Unsupported high-depth PCM resampling: %lu -> %lu\n",
+                    adsi->pwfxSrc->nSamplesPerSec, adsi->pwfxDst->nSamplesPerSec);
+            return MMSYSERR_NOTSUPPORTED;
+        }
+
+        apd = HeapAlloc(GetProcessHeap(), 0, sizeof(AcmPcmData));
+        if (!apd)
+            return MMSYSERR_NOMEM;
+        memset(apd, 0, sizeof(*apd));
+
+        adsi->dwDriver = (DWORD_PTR)apd;
+        adsi->fdwDriver = PCM_HIGH_DEPTH;
+        return MMSYSERR_NOERROR;
+    }
+
     switch(adsi->pwfxSrc->wBitsPerSample){
     case 8:
         idx = 0;
@@ -1303,7 +1442,10 @@ static LRESULT PCM_StreamConvert(PACMDRVSTREAMINSTANCE adsi, PACMDRVSTREAMHEADER
     }
 
     /* do the job */
-    if (adsi->fdwDriver & PCM_RESAMPLE) {
+    if (adsi->fdwDriver & PCM_HIGH_DEPTH) {
+        if (nsrc < ndst) ndst = nsrc; else nsrc = ndst;
+        PCM_ConvertHighDepthKeepRate(adsi, adsh->pbSrc, nsrc, adsh->pbDst);
+    } else if (adsi->fdwDriver & PCM_RESAMPLE) {
         apd->cvt.cvtChangeRate(adsi->pwfxSrc->nSamplesPerSec, adsh->pbSrc, &nsrc,
                                adsi->pwfxDst->nSamplesPerSec, adsh->pbDst, &ndst);
     } else {

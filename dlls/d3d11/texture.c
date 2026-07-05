@@ -414,7 +414,7 @@ static const struct wined3d_parent_ops d3d_texture1d_wined3d_parent_ops =
 };
 
 HRESULT d3d_device_create_dxgi_resource(IUnknown *device, struct wined3d_resource *wined3d_resource,
-        IUnknown *outer, BOOL needs_surface, IUnknown **dxgi_resource)
+        IUnknown *outer, BOOL needs_surface, UINT misc_flags, IUnknown **dxgi_resource)
 {
     IWineDXGIDevice *wine_device;
     HRESULT hr;
@@ -426,7 +426,7 @@ HRESULT d3d_device_create_dxgi_resource(IUnknown *device, struct wined3d_resourc
     }
 
     hr = IWineDXGIDevice_create_resource(wine_device, wined3d_resource, 0, NULL, outer,
-            needs_surface, (void **)dxgi_resource);
+            needs_surface, misc_flags, (void **)dxgi_resource);
     IWineDXGIDevice_Release(wine_device);
     if (FAILED(hr))
     {
@@ -491,7 +491,7 @@ HRESULT d3d_texture1d_create(struct d3d_device *device, const D3D11_TEXTURE1D_DE
     needs_surface = desc->MipLevels == 1 && desc->ArraySize == 1;
     hr = d3d_device_create_dxgi_resource((IUnknown *)&device->ID3D10Device1_iface,
             wined3d_texture_get_resource(texture->wined3d_texture), (IUnknown *)&texture->ID3D10Texture1D_iface,
-            needs_surface, &texture->dxgi_resource);
+            needs_surface, desc->MiscFlags, &texture->dxgi_resource);
     if (FAILED(hr))
     {
         ERR("Failed to create DXGI resource, returning %#.lx\n", hr);
@@ -1036,7 +1036,7 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
     needs_surface = desc->MipLevels == 1 && desc->ArraySize == 1;
     hr = d3d_device_create_dxgi_resource((IUnknown *)&device->ID3D10Device1_iface,
             wined3d_texture_get_resource(texture->wined3d_texture), (IUnknown *)&texture->ID3D10Texture2D_iface,
-            needs_surface, &texture->dxgi_resource);
+            needs_surface, desc->MiscFlags, &texture->dxgi_resource);
     if (FAILED(hr))
     {
         ERR("Failed to create DXGI resource, returning %#.lx\n", hr);
@@ -1495,7 +1495,7 @@ static HRESULT d3d_texture3d_init(struct d3d_texture3d *texture, struct d3d_devi
 
     hr = d3d_device_create_dxgi_resource((IUnknown *)&device->ID3D10Device1_iface,
             wined3d_texture_get_resource(texture->wined3d_texture), (IUnknown *)&texture->ID3D10Texture3D_iface,
-            FALSE, &texture->dxgi_resource);
+            FALSE, desc->MiscFlags, &texture->dxgi_resource);
     if (FAILED(hr))
     {
         ERR("Failed to create DXGI resource, returning %#.lx\n", hr);

@@ -318,9 +318,20 @@ static HRESULT STDMETHODCALLTYPE dxgi_device_ReclaimResources(IWineDXGIDevice *i
 
 static HRESULT STDMETHODCALLTYPE dxgi_device_EnqueueSetEvent(IWineDXGIDevice *iface, HANDLE event)
 {
-    FIXME("iface %p, event %p stub!\n", iface, event);
+    struct dxgi_device *device = impl_from_IWineDXGIDevice(iface);
+    struct wined3d_device_context *context;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, event %p.\n", iface, event);
+
+    wined3d_mutex_lock();
+    context = wined3d_device_get_immediate_context(device->wined3d_device);
+    wined3d_device_context_flush(context);
+    wined3d_mutex_unlock();
+
+    if (!SetEvent(event))
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    return S_OK;
 }
 
 static void STDMETHODCALLTYPE dxgi_device_Trim(IWineDXGIDevice *iface)
@@ -332,14 +343,15 @@ static void STDMETHODCALLTYPE dxgi_device_Trim(IWineDXGIDevice *iface)
 
 static HRESULT STDMETHODCALLTYPE dxgi_device_create_resource(IWineDXGIDevice *iface,
         struct wined3d_resource *wined3d_resource, DXGI_USAGE usage,
-        const DXGI_SHARED_RESOURCE *shared_resource, IUnknown *outer, BOOL needs_surface, void **resource)
+        const DXGI_SHARED_RESOURCE *shared_resource, IUnknown *outer, BOOL needs_surface,
+        UINT resource_misc_flags, void **resource)
 {
     struct dxgi_resource *object;
     HRESULT hr;
 
     TRACE("iface %p, wined3d_resource %p, usage %#x, shared_resource %p, outer %p, needs_surface %d, "
-            "resource %p.\n", iface, wined3d_resource, usage, shared_resource, outer, needs_surface,
-            resource);
+            "resource_misc_flags %#x, resource %p.\n", iface, wined3d_resource, usage, shared_resource,
+            outer, needs_surface, resource_misc_flags, resource);
 
     if (!(object = calloc(1, sizeof(*object))))
     {
@@ -348,7 +360,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_device_create_resource(IWineDXGIDevice *if
     }
 
     if (FAILED(hr = dxgi_resource_init(object, (IDXGIDevice *)iface, outer, needs_surface,
-            wined3d_resource, NULL, 0)))
+            wined3d_resource, NULL, 0, resource_misc_flags)))
     {
         WARN("Failed to initialize resource, hr %#lx.\n", hr);
         free(object);
@@ -359,6 +371,22 @@ static HRESULT STDMETHODCALLTYPE dxgi_device_create_resource(IWineDXGIDevice *if
     *resource = outer ? &object->IUnknown_iface : (IUnknown *)&object->IDXGIResource1_iface;
 
     return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dxgi_device_open_shared_resource(IWineDXGIDevice *iface, HANDLE handle,
+        REFIID iid, void **resource)
+{
+    FIXME("iface %p, handle %p, iid %s, resource %p semi-stub.\n", iface, handle, debugstr_guid(iid), resource);
+
+    return dxgi_resource_open_shared(handle, iid, resource);
+}
+
+static HRESULT STDMETHODCALLTYPE dxgi_device_open_shared_resource1(IWineDXGIDevice *iface, HANDLE handle,
+        REFIID iid, void **resource)
+{
+    FIXME("iface %p, handle %p, iid %s, resource %p semi-stub.\n", iface, handle, debugstr_guid(iid), resource);
+
+    return dxgi_resource_open_shared_nt(handle, iid, resource);
 }
 
 static const struct IWineDXGIDeviceVtbl dxgi_device_vtbl =
@@ -389,6 +417,8 @@ static const struct IWineDXGIDeviceVtbl dxgi_device_vtbl =
     dxgi_device_Trim,
     /* IWineDXGIDevice methods */
     dxgi_device_create_resource,
+    dxgi_device_open_shared_resource,
+    dxgi_device_open_shared_resource1,
 };
 
 static inline struct dxgi_device *impl_from_IWineDXGISwapChainFactory(IWineDXGISwapChainFactory *iface)
@@ -462,7 +492,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_swapchain_factory_create_swapchain(IWineDX
         return E_OUTOFMEMORY;
     }
 
-    if (FAILED(hr = d3d11_swapchain_init(object, device, &wined3d_desc)))
+    if (FAILED(hr = d3d11_swapchain_init(object, device, &wined3d_desc, desc)))
     {
         WARN("Failed to initialise swapchain, hr %#lx.\n", hr);
         free(object);

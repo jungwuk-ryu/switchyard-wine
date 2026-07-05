@@ -256,7 +256,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     unwind_done:
         if (!dispatch.EstablisherFrame) break;
 
-        if (!is_valid_frame( dispatch.EstablisherFrame ))
+        if (!is_valid_frame_or_stack_guarantee( dispatch.EstablisherFrame ))
         {
             ERR( "invalid frame %p (%p-%p)\n", (void *)dispatch.EstablisherFrame,
                  NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
@@ -732,7 +732,7 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
     unwind_done:
         if (!dispatch.EstablisherFrame) break;
 
-        if (!is_valid_frame( dispatch.EstablisherFrame ))
+        if (!is_valid_frame_or_stack_guarantee( dispatch.EstablisherFrame ))
         {
             ERR( "invalid frame %p (%p-%p)\n", (void *)dispatch.EstablisherFrame,
                  NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );

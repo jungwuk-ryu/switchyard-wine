@@ -101,8 +101,12 @@ static HRESULT WINAPI uiviewsettings_GetTrustLevel( IUIViewSettings *iface, Trus
 
 static HRESULT WINAPI uiviewsettings_get_UserInteractionMode( IUIViewSettings *iface, enum UserInteractionMode *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+
+    *value = UserInteractionMode_Mouse;
+    return S_OK;
 }
 
 static const struct IUIViewSettingsVtbl uiviewsettings_vtbl =
@@ -205,6 +209,8 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
 
     TRACE( "iface %p, instance %p.\n", iface, instance );
 
+    if (!instance) return E_POINTER;
+
     if (!(impl = calloc( 1, sizeof(*impl) )))
     {
         *instance = NULL;
@@ -236,11 +242,22 @@ DEFINE_IINSPECTABLE( ui_viewsettings_interop, IUIViewSettingsInterop, struct uiv
 static HRESULT WINAPI ui_viewsettings_interop_GetForWindow( IUIViewSettingsInterop *iface, HWND window, REFIID riid, void **uiviewsettings )
 {
     struct uiviewsettings_statics *impl = impl_from_IUIViewSettingsInterop( iface );
+    IInspectable *instance;
+    HRESULT hr;
 
     TRACE( "(window %p, riid %s, uiviewsettings %p)\n", window, debugstr_guid( riid ), uiviewsettings );
 
-    factory_ActivateInstance( &impl->IActivationFactory_iface, (IInspectable **)uiviewsettings );
-    return S_OK;
+    if (!uiviewsettings) return E_POINTER;
+
+    *uiviewsettings = NULL;
+    if (!riid) return E_INVALIDARG;
+
+    if (FAILED( hr = factory_ActivateInstance( &impl->IActivationFactory_iface, &instance ) ))
+        return hr;
+
+    hr = IInspectable_QueryInterface( instance, riid, uiviewsettings );
+    IInspectable_Release( instance );
+    return hr;
 }
 
 static const struct IUIViewSettingsInteropVtbl ui_viewsettings_interop_vtbl =
@@ -265,6 +282,8 @@ static HRESULT WINAPI ui_viewsettings_statics_GetForCurrentView( IUIViewSettings
     struct uiviewsettings_statics *impl = impl_from_IUIViewSettingsStatics( iface );
 
     TRACE( "(uiviewsettings %p)\n", uiviewsettings );
+
+    if (!uiviewsettings) return E_POINTER;
 
     factory_ActivateInstance( &impl->IActivationFactory_iface, (IInspectable **)uiviewsettings );
     return S_OK;

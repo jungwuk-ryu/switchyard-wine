@@ -450,7 +450,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
 @end
 
-
 @implementation WineBaseView
 
     - (void) setRetinaMode:(BOOL)mode
@@ -561,6 +560,11 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         if (image)
         {
+            if (colorImage && CGImageGetWidth(colorImage) >= 400 && CGImageGetHeight(colorImage) >= 300)
+            {
+                [window setBackgroundColor:[NSColor blackColor]];
+                [window setOpaque:YES];
+            }
             layer.position = surfaceRect.origin;
             layer.contents = (id)image;
             CFRelease(image);
