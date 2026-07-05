@@ -135,6 +135,7 @@ static void sync_foreign_child_surface_frame(struct macdrv_window_surface *surfa
     macdrv_set_cocoa_window_frame(surface->window, &frame);
     if (!surface->foreign_child_fronted)
     {
+        macdrv_set_cocoa_window_ignores_mouse_events(surface->window, TRUE);
         macdrv_order_cocoa_window(surface->window, NULL, NULL, FALSE);
         surface->foreign_child_fronted = TRUE;
     }

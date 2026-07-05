@@ -4352,3 +4352,15 @@ void macdrv_clear_ime_text(void)
             [[window contentView] clearMarkedText];
     });
 }
+
+/***********************************************************************
+ *              macdrv_set_cocoa_window_ignores_mouse_events
+ */
+void macdrv_set_cocoa_window_ignores_mouse_events(macdrv_window w, bool ignores)
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThread(^{
+        [window setIgnoresMouseEvents:(ignores ? YES : NO)];
+    });
+}

@@ -505,6 +505,7 @@ extern void macdrv_set_cocoa_window_title(macdrv_window w, const UniChar* title,
 extern void macdrv_order_cocoa_window(macdrv_window w, macdrv_window prev,
         macdrv_window next, bool activate);
 extern void macdrv_hide_cocoa_window(macdrv_window w);
+extern void macdrv_set_cocoa_window_ignores_mouse_events(macdrv_window w, bool ignores);
 extern void macdrv_set_cocoa_window_frame(macdrv_window w, const CGRect* new_frame);
 extern void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame);
 extern void macdrv_set_cocoa_parent_window(macdrv_window w, macdrv_window parent);
