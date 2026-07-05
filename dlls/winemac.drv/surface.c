@@ -53,6 +53,7 @@ struct macdrv_window_surface
     BOOL                    child;
     BOOL                    foreign_child;
     BOOL                    foreign_child_fronted;
+    BOOL                    chromium_blank_owner_transparent;
 };
 
 static BOOL is_chromium_cef_child_window(HWND hwnd)
@@ -108,6 +109,71 @@ static void macdrv_surface_set_clip(struct window_surface *window_surface, const
 {
 }
 
+static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surface,
+                                            const BITMAPINFO *color_info, const void *color_bits)
+{
+    const DWORD *pixels = color_bits ? color_bits : surface->bits;
+    unsigned int width, height, stride_pixels, x_step, y_step, samples = 0, blank_samples = 0;
+    unsigned int x, y;
+
+    if (surface->child || surface->foreign_child) return FALSE;
+    if (!is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
+    if (!pixels || color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
+        return FALSE;
+
+    width = color_info->bmiHeader.biWidth;
+    height = abs(color_info->bmiHeader.biHeight);
+    if (width < 400 || height < 300) return FALSE;
+
+    stride_pixels = color_info->bmiHeader.biSizeImage / height / sizeof(*pixels);
+    if (stride_pixels < width) return FALSE;
+
+    x_step = width / 32;
+    y_step = height / 24;
+    if (!x_step) x_step = 1;
+    if (!y_step) y_step = 1;
+
+    for (y = 0; y < height; y += y_step)
+    {
+        const DWORD *row = pixels + y * stride_pixels;
+
+        for (x = 0; x < width; x += x_step)
+        {
+            DWORD pixel = row[x];
+            BYTE blue = pixel & 0xff;
+            BYTE green = (pixel >> 8) & 0xff;
+            BYTE red = (pixel >> 16) & 0xff;
+
+            samples++;
+            if (red <= 8 && green <= 8 && blue <= 8)
+                blank_samples++;
+        }
+    }
+
+    return samples && blank_samples * 100 >= samples * 98;
+}
+
+static void sync_blank_chromium_owner_opacity(struct macdrv_window_surface *surface,
+                                             const BITMAPINFO *color_info, const void *color_bits)
+{
+    BOOL blank = is_blank_chromium_owner_surface(surface, color_info, color_bits);
+
+    if (blank && !surface->chromium_blank_owner_transparent)
+    {
+        TRACE("making blank Chromium/CEF owner host hwnd %p window %p nearly transparent\n",
+              surface->header.hwnd, surface->window);
+        macdrv_set_window_alpha(surface->window, 0.01);
+        surface->chromium_blank_owner_transparent = TRUE;
+    }
+    else if (!blank && surface->chromium_blank_owner_transparent)
+    {
+        TRACE("restoring Chromium/CEF owner host hwnd %p window %p opacity\n",
+              surface->header.hwnd, surface->window);
+        macdrv_set_window_alpha(surface->window, 1.0);
+        surface->chromium_blank_owner_transparent = FALSE;
+    }
+}
+
 static void sync_foreign_child_surface_frame(struct macdrv_window_surface *surface)
 {
     HWND hwnd = surface->header.hwnd;
@@ -158,6 +224,8 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
 
     if (color_bits && color_bits != surface->bits)
         memcpy(surface->bits, color_bits, color_info->bmiHeader.biSizeImage);
+
+    sync_blank_chromium_owner_opacity(surface, color_info, color_bits);
 
     image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
                           color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), colorspace,
@@ -215,6 +283,8 @@ static void macdrv_surface_destroy(struct window_surface *window_surface)
     CGDataProviderRelease(surface->provider);
     if (surface->foreign_child)
         macdrv_release_foreign_child_win_data(window_surface->hwnd);
+    if (surface->chromium_blank_owner_transparent)
+        macdrv_set_window_alpha(surface->window, 1.0);
 }
 
 static const struct window_surface_funcs macdrv_surface_funcs =
@@ -291,6 +361,7 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
         surface->child = child;
         surface->foreign_child = foreign_child;
         surface->foreign_child_fronted = FALSE;
+        surface->chromium_blank_owner_transparent = FALSE;
         window_surface->flush_on_unlock = child || foreign_child;
     }
 
