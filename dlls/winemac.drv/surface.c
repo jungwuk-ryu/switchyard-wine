@@ -52,6 +52,7 @@ struct macdrv_window_surface
     POINT                   offset;
     BOOL                    child;
     BOOL                    foreign_child;
+    BOOL                    foreign_child_fronted;
 };
 
 static BOOL is_chromium_cef_child_window(HWND hwnd)
@@ -132,6 +133,11 @@ static void sync_foreign_child_surface_frame(struct macdrv_window_surface *surfa
 
     frame = cgrect_from_rect(rect);
     macdrv_set_cocoa_window_frame(surface->window, &frame);
+    if (!surface->foreign_child_fronted)
+    {
+        macdrv_order_cocoa_window(surface->window, NULL, NULL, FALSE);
+        surface->foreign_child_fronted = TRUE;
+    }
 }
 
 /***********************************************************************
@@ -283,6 +289,7 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
         surface->offset = *offset;
         surface->child = child;
         surface->foreign_child = foreign_child;
+        surface->foreign_child_fronted = FALSE;
         window_surface->flush_on_unlock = child || foreign_child;
     }
 
