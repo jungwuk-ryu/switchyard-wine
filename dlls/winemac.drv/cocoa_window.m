@@ -4216,9 +4216,22 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
         return nil;
     }
 
+    NSDictionary* disabledActions = [NSDictionary dictionaryWithObjectsAndKeys:
+        [NSNull null], @"bounds",
+        [NSNull null], @"contents",
+        [NSNull null], @"contentsScale",
+        [NSNull null], @"frame",
+        [NSNull null], @"hidden",
+        [NSNull null], @"opacity",
+        [NSNull null], @"onOrderIn",
+        [NSNull null], @"onOrderOut",
+        [NSNull null], @"position",
+        [NSNull null], @"sublayers",
+        nil];
     image_layer.magnificationFilter = kCAFilterNearest;
     image_layer.minificationFilter = kCAFilterNearest;
     image_layer.contentsGravity = kCAGravityResize;
+    image_layer.actions = disabledActions;
     image_layer.contentsScale = retina_on ? 2.0 : 1.0;
     [image_layer setBounds:cgrect_mac_from_win(bounds)];
     [image_layer setAnchorPoint:CGPointMake(0, 0)];
@@ -4246,9 +4259,12 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     macdrv_update_remote_layer_for_host(release_hwnd, hwnd, context_id);
 
     OnMainThreadAsync(^{
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         image_layer.contentsScale = retina_on ? 2.0 : 1.0;
         image_layer.bounds = cgrect_mac_from_win(bounds);
         image_layer.contents = (id)image;
+        [CATransaction commit];
         CGImageRelease(image);
     });
 }
