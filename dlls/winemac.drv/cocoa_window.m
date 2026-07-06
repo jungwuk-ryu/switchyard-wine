@@ -401,6 +401,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) addGLContext:(WineOpenGLContext*)context;
     - (void) removeGLContext:(WineOpenGLContext*)context;
     - (void) updateGLContexts;
+    - (void) clearColorImage;
 
     - (void) wine_getBackingSize:(int*)outBackingSize;
     - (void) wine_setBackingSize:(const int*)newBackingSize;
@@ -548,6 +549,12 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         if (window.closing)
             return;
 
+        if (!colorImage)
+        {
+            layer.contents = nil;
+            return;
+        }
+
         imageRect = layer.bounds;
         imageRect.origin.x *= layer.contentsScale;
         imageRect.origin.y *= layer.contentsScale;
@@ -591,6 +598,13 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         CGImageRelease(colorImage);
         colorImage = CGImageRetain(image);
+    }
+
+    - (void) clearColorImage
+    {
+        CGImageRelease(colorImage);
+        colorImage = NULL;
+        self.layer.contents = nil;
     }
 
     - (void) setShapeImage:(CGImageRef)image
@@ -3670,6 +3684,24 @@ void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rec
         }
 
         CGImageRelease(image);
+    });
+}
+}
+
+/***********************************************************************
+ *              macdrv_window_clear_color_image
+ */
+void macdrv_window_clear_color_image(macdrv_window w)
+{
+@autoreleasepool
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThreadAsync(^{
+        WineContentView *view = [window contentView];
+
+        [view clearColorImage];
+        [view setNeedsDisplay:true];
     });
 }
 }

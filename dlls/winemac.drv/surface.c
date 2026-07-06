@@ -113,7 +113,8 @@ static void macdrv_surface_set_clip(struct window_surface *window_surface, const
 }
 
 static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surface,
-                                            const BITMAPINFO *color_info, const void *color_bits)
+                                            const BITMAPINFO *color_info, const void *color_bits,
+                                            BOOL *remote_layer_host)
 {
     const DWORD *pixels = color_bits ? color_bits : surface->bits;
     unsigned int width, height, stride_pixels, x_step, y_step, samples = 0, blank_samples = 0;
@@ -121,14 +122,15 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
     struct macdrv_win_data *data;
     BOOL has_remote_layer_hosts = FALSE;
 
+    *remote_layer_host = FALSE;
+
     if (surface->child || surface->remote_child || surface->foreign_child) return FALSE;
-    if (!is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
     if ((data = get_win_data(surface->header.hwnd)))
     {
         has_remote_layer_hosts = !!data->remote_layer_hosts;
         release_win_data(data);
     }
-    if (has_remote_layer_hosts) return FALSE;
+    if (!has_remote_layer_hosts && !is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
     if (!pixels || color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
         return FALSE;
 
@@ -161,13 +163,33 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
         }
     }
 
-    return samples && blank_samples * 100 >= samples * 98;
+    if (!samples || blank_samples * 100 < samples * 98) return FALSE;
+
+    *remote_layer_host = has_remote_layer_hosts;
+    return TRUE;
 }
 
-static void sync_blank_chromium_owner_opacity(struct macdrv_window_surface *surface,
-                                             const BITMAPINFO *color_info, const void *color_bits)
+static BOOL sync_blank_chromium_owner_surface(struct macdrv_window_surface *surface,
+                                              const BITMAPINFO *color_info, const void *color_bits)
 {
-    BOOL blank = is_blank_chromium_owner_surface(surface, color_info, color_bits);
+    BOOL remote_layer_host = FALSE;
+    BOOL blank = is_blank_chromium_owner_surface(surface, color_info, color_bits, &remote_layer_host);
+
+    if (blank && remote_layer_host)
+    {
+        if (surface->chromium_blank_owner_transparent)
+        {
+            TRACE("restoring Chromium/CEF owner host hwnd %p window %p opacity before clearing hosted backing surface\n",
+                  surface->header.hwnd, surface->window);
+            macdrv_set_window_alpha(surface->window, 1.0);
+            surface->chromium_blank_owner_transparent = FALSE;
+        }
+
+        TRACE("clearing blank Chromium/CEF owner host hwnd %p window %p behind remote layer hosts\n",
+              surface->header.hwnd, surface->window);
+        macdrv_window_clear_color_image(surface->window);
+        return TRUE;
+    }
 
     if (blank && !surface->chromium_blank_owner_transparent)
     {
@@ -183,6 +205,8 @@ static void sync_blank_chromium_owner_opacity(struct macdrv_window_surface *surf
         macdrv_set_window_alpha(surface->window, 1.0);
         surface->chromium_blank_owner_transparent = FALSE;
     }
+
+    return FALSE;
 }
 
 static void sync_foreign_child_surface_frame(struct macdrv_window_surface *surface)
@@ -228,35 +252,40 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     struct macdrv_window_surface *surface = get_mac_surface(window_surface);
     CGImageAlphaInfo alpha_info = (window_surface->alpha_mask ? kCGImageAlphaPremultipliedFirst : kCGImageAlphaNoneSkipFirst);
     RECT translated_rect = *rect, translated_dirty = *dirty;
-    CGColorSpaceRef colorspace;
+    CGColorSpaceRef colorspace = NULL;
     CGImageRef image;
-
-    colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    BOOL clear_color_image;
 
     if (color_bits && color_bits != surface->bits)
         memcpy(surface->bits, color_bits, color_info->bmiHeader.biSizeImage);
 
-    sync_blank_chromium_owner_opacity(surface, color_info, color_bits);
+    clear_color_image = sync_blank_chromium_owner_surface(surface, color_info, color_bits);
 
-    image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
-                          color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), colorspace,
-                          alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
-    CGColorSpaceRelease(colorspace);
-
-    if (surface->child)
+    if (!clear_color_image)
     {
-        OffsetRect(&translated_rect, surface->offset.x, surface->offset.y);
-        OffsetRect(&translated_dirty, surface->offset.x, surface->offset.y);
+        colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
+                              color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), colorspace,
+                              alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
+        CGColorSpaceRelease(colorspace);
+
+        if (surface->child)
+        {
+            OffsetRect(&translated_rect, surface->offset.x, surface->offset.y);
+            OffsetRect(&translated_dirty, surface->offset.x, surface->offset.y);
+        }
+        else if (!surface->remote_child)
+            sync_foreign_child_surface_frame(surface);
+
+        if (surface->remote_child)
+            macdrv_image_layer_set_color_image(surface->image_layer, image, cgrect_from_rect(*rect));
+        else
+            macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(translated_rect),
+                                          cgrect_from_rect(translated_dirty));
+        CGImageRelease(image);
     }
     else if (!surface->remote_child)
         sync_foreign_child_surface_frame(surface);
-
-    if (surface->remote_child)
-        macdrv_image_layer_set_color_image(surface->image_layer, image, cgrect_from_rect(*rect));
-    else
-        macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(translated_rect),
-                                      cgrect_from_rect(translated_dirty));
-    CGImageRelease(image);
 
     if (shape_changed && !surface->child && !surface->remote_child)
     {
