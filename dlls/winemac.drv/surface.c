@@ -122,6 +122,7 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
     unsigned int x, y;
     struct macdrv_win_data *data;
     BOOL has_remote_layer_hosts = FALSE;
+    BOOL had_remote_layer_host = FALSE;
 
     *remote_layer_host = FALSE;
 
@@ -129,9 +130,11 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
     if ((data = get_win_data(surface->header.hwnd)))
     {
         has_remote_layer_hosts = !!data->remote_layer_hosts;
+        had_remote_layer_host = !!data->remote_layer_hosted_once;
         release_win_data(data);
     }
     if (!has_remote_layer_hosts &&
+        !had_remote_layer_host &&
         !surface->chromium_blank_owner_had_remote_layer &&
         !is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
     if (!pixels || color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
@@ -168,7 +171,7 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
 
     if (!samples || blank_samples * 100 < samples * 98) return FALSE;
 
-    *remote_layer_host = has_remote_layer_hosts;
+    *remote_layer_host = has_remote_layer_hosts || had_remote_layer_host;
     return TRUE;
 }
 

@@ -1773,6 +1773,7 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
+            data->remote_layer_hosted_once = TRUE;
             restore_alpha = !data->remote_layer_hosts++;
             release_win_data(data);
 
@@ -1794,6 +1795,7 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
+            data->remote_layer_hosted_once = TRUE;
             if (!data->remote_layer_hosts)
             {
                 data->remote_layer_hosts = 1;
