@@ -1683,21 +1683,20 @@ void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, BOOL per_pixel_alpha, UIN
     }
 }
 
-static BOOL get_remote_layer_host(HWND hwnd, macdrv_window *window, CGRect *frame)
+static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, CGRect *frame)
 {
     HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
     struct macdrv_win_data *root_data;
     RECT rect;
 
-    if (!root) return FALSE;
-    if (!(root_data = get_win_data(root))) return FALSE;
+    if (!root) return NULL;
+    if (!(root_data = get_win_data(root))) return NULL;
     if (!root_data->cocoa_window)
     {
         release_win_data(root_data);
-        return FALSE;
+        return NULL;
     }
 
-    *window = root_data->cocoa_window;
     *frame = CGRectNull;
 
     if (root != hwnd)
@@ -1707,7 +1706,7 @@ static BOOL get_remote_layer_host(HWND hwnd, macdrv_window *window, CGRect *fram
         if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI)))
         {
             release_win_data(root_data);
-            return FALSE;
+            return NULL;
         }
         NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
         OffsetRect(&rect, root_data->rects.client.left - root_data->rects.visible.left,
@@ -1715,8 +1714,7 @@ static BOOL get_remote_layer_host(HWND hwnd, macdrv_window *window, CGRect *fram
         *frame = cgrect_mac_from_win(cgrect_from_rect(rect));
     }
 
-    release_win_data(root_data);
-    return TRUE;
+    return root_data;
 }
 
 
@@ -1744,14 +1742,34 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         activate_on_following_focus();
         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
         return 0;
+    case WM_MACDRV_CAN_HOST_REMOTE_LAYER:
+    {
+        struct macdrv_win_data *data;
+        CGRect frame;
+        BOOL can_host = FALSE;
+
+        if ((data = get_remote_layer_host_data(hwnd, &frame)))
+        {
+            can_host = TRUE;
+            release_win_data(data);
+        }
+        return can_host;
+    }
     case WM_MACDRV_CREATE_REMOTE_LAYER:
     {
+        struct macdrv_win_data *data;
         macdrv_window window;
         CGRect frame;
+        BOOL restore_alpha = FALSE;
 
-        if (get_remote_layer_host(hwnd, &window, &frame))
+        if ((data = get_remote_layer_host_data(hwnd, &frame)))
         {
+            window = data->cocoa_window;
+            restore_alpha = !data->remote_layer_hosts++;
+            release_win_data(data);
+
             TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
+            if (restore_alpha) macdrv_set_window_alpha(window, 1.0);
             if (CGRectIsNull(frame)) macdrv_window_create_ca_layer_host_view(window, (unsigned int)lp);
             else macdrv_window_create_ca_layer_host_view_at(window, (unsigned int)lp, frame);
         }
@@ -1759,23 +1777,43 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_MACDRV_UPDATE_REMOTE_LAYER:
     {
-        macdrv_window window;
-        CGRect frame;
+        struct macdrv_win_data *data;
+        macdrv_window window = NULL;
+        CGRect frame = CGRectNull;
+        BOOL restore_alpha = FALSE;
 
-        if (get_remote_layer_host(hwnd, &window, &frame) && !CGRectIsNull(frame))
+        if ((data = get_remote_layer_host_data(hwnd, &frame)))
+        {
+            window = data->cocoa_window;
+            if (!data->remote_layer_hosts)
+            {
+                data->remote_layer_hosts = 1;
+                restore_alpha = TRUE;
+            }
+            release_win_data(data);
+
+            if (restore_alpha) macdrv_set_window_alpha(window, 1.0);
+        }
+        if (window && !CGRectIsNull(frame))
             macdrv_window_update_ca_layer_host_view(window, (unsigned int)lp, frame);
         return 0;
     }
     case WM_MACDRV_RELEASE_REMOTE_LAYER:
     {
-        macdrv_window window;
-        CGRect frame;
+        HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+        struct macdrv_win_data *data;
+        macdrv_window window = NULL;
 
-        if (get_remote_layer_host(hwnd, &window, &frame))
+        if (root && (data = get_win_data(root)))
         {
+            window = data->cocoa_window;
+            if (data->remote_layer_hosts) data->remote_layer_hosts--;
+            release_win_data(data);
+
             TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
-            macdrv_window_release_ca_layer_host_view(window, (unsigned int)lp);
         }
+        if (window)
+            macdrv_window_release_ca_layer_host_view(window, (unsigned int)lp);
         return 0;
     }
     }

@@ -96,6 +96,7 @@ enum macdrv_window_messages
 {
     WM_MACDRV_SET_WIN_REGION = WM_WINE_FIRST_DRIVER_MSG,
     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
+    WM_MACDRV_CAN_HOST_REMOTE_LAYER,
     WM_MACDRV_CREATE_REMOTE_LAYER,
     WM_MACDRV_UPDATE_REMOTE_LAYER,
     WM_MACDRV_RELEASE_REMOTE_LAYER,
@@ -195,6 +196,7 @@ struct macdrv_win_data
     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
     unsigned int        foreign_child : 1;      /* process-local host window for a foreign child HWND */
     unsigned int        foreign_surface_refs;   /* surfaces presenting into a foreign child host window */
+    unsigned int        remote_layer_hosts;     /* foreign child layers hosted inside this window */
 };
 
 struct macdrv_client_surface

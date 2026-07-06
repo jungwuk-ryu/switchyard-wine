@@ -118,9 +118,17 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
     const DWORD *pixels = color_bits ? color_bits : surface->bits;
     unsigned int width, height, stride_pixels, x_step, y_step, samples = 0, blank_samples = 0;
     unsigned int x, y;
+    struct macdrv_win_data *data;
+    BOOL has_remote_layer_hosts = FALSE;
 
     if (surface->child || surface->remote_child || surface->foreign_child) return FALSE;
     if (!is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
+    if ((data = get_win_data(surface->header.hwnd)))
+    {
+        has_remote_layer_hosts = !!data->remote_layer_hosts;
+        release_win_data(data);
+    }
+    if (has_remote_layer_hosts) return FALSE;
     if (!pixels || color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
         return FALSE;
 
@@ -389,15 +397,18 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
 
 static BOOL can_host_remote_layer(HWND hwnd)
 {
-    struct macdrv_win_data *data;
-    BOOL ret;
+    DWORD_PTR result = 0;
 
-    if (!(data = get_win_data(hwnd))) return FALSE;
-    ret = !!data->cocoa_window;
-    release_win_data(data);
-    return ret;
+    if (!NtUserGetWindowThread(hwnd, NULL)) return FALSE;
+    if (!send_message_timeout(hwnd, WM_MACDRV_CAN_HOST_REMOTE_LAYER, 0, 0,
+                              SMTO_ABORTIFHUNG, 500, &result))
+    {
+        TRACE("Switchyard remote layer host check timed out or failed for hwnd %p\n", hwnd);
+        return FALSE;
+    }
+
+    return !!result;
 }
-
 
 /***********************************************************************
  *              CreateWindowSurface   (MACDRV.@)
@@ -461,7 +472,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
 
     if (!window && is_chromium_cef_child_window(hwnd) &&
         (remote_layer_root = NtUserGetAncestor(hwnd, GA_ROOT)) && remote_layer_root != hwnd &&
-        can_host_remote_layer(remote_layer_root))
+        can_host_remote_layer(hwnd))
     {
         remote_child = TRUE;
         TRACE("Switchyard exporting Chromium/CEF foreign child surface hwnd %p to root %p remote layer\n",
