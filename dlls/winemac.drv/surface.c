@@ -57,6 +57,7 @@ struct macdrv_window_surface
     BOOL                    foreign_child;
     BOOL                    foreign_child_fronted;
     BOOL                    chromium_blank_owner_transparent;
+    BOOL                    chromium_blank_owner_had_remote_layer;
 };
 
 static BOOL is_chromium_cef_child_window(HWND hwnd)
@@ -130,7 +131,9 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
         has_remote_layer_hosts = !!data->remote_layer_hosts;
         release_win_data(data);
     }
-    if (!has_remote_layer_hosts && !is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
+    if (!has_remote_layer_hosts &&
+        !surface->chromium_blank_owner_had_remote_layer &&
+        !is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
     if (!pixels || color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
         return FALSE;
 
@@ -176,6 +179,9 @@ static BOOL sync_blank_chromium_owner_surface(struct macdrv_window_surface *surf
     BOOL blank = is_blank_chromium_owner_surface(surface, color_info, color_bits, &remote_layer_host);
 
     if (blank && remote_layer_host)
+        surface->chromium_blank_owner_had_remote_layer = TRUE;
+
+    if (blank && (remote_layer_host || surface->chromium_blank_owner_had_remote_layer))
     {
         if (surface->chromium_blank_owner_transparent)
         {
@@ -190,6 +196,9 @@ static BOOL sync_blank_chromium_owner_surface(struct macdrv_window_surface *surf
         macdrv_window_clear_color_image(surface->window);
         return TRUE;
     }
+
+    if (!blank)
+        surface->chromium_blank_owner_had_remote_layer = FALSE;
 
     if (blank && !surface->chromium_blank_owner_transparent)
     {
@@ -411,6 +420,7 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
         surface->foreign_child = foreign_child;
         surface->foreign_child_fronted = FALSE;
         surface->chromium_blank_owner_transparent = FALSE;
+        surface->chromium_blank_owner_had_remote_layer = FALSE;
         window_surface->flush_on_unlock = child || remote_child || foreign_child;
 
         if (remote_child &&
