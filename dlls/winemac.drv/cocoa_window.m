@@ -24,6 +24,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 
 #import "cocoa_window.h"
@@ -809,12 +810,24 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) removeCALayerHostView:(CAContextID)contextId
     {
         NSNumber* key = @(contextId);
+        CALayerHost* host = [_caLayerHosts objectForKey:key];
+
+        if (!host) return;
+        [host retain];
+        [_caLayerHosts removeObjectForKey:key];
 
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        [[_caLayerHosts objectForKey:key] removeFromSuperlayer];
-        [_caLayerHosts removeObjectForKey:key];
+        host.zPosition = 1.0;
         [CATransaction commit];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            [host removeFromSuperlayer];
+            [CATransaction commit];
+            [host release];
+        });
     }
 
     - (void) setLayerRetinaProperties:(BOOL)mode
@@ -4246,7 +4259,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     CAContext *context = remote_context;
     CALayer *layer = image_layer;
 
-    OnMainThreadAsync(^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         [context setLayer:nil];
         [context release];
         [layer release];
@@ -4332,7 +4345,8 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     CAMetalLayer *layer = offscreen_layer;
     macdrv_metal_device dev = device;
 
-    OnMainThreadAsync(^{
+    /* This is the exported offscreen remote-layer swapchain, not a local view swapchain. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         [context setLayer:nil];
         [context release];
         [layer release];
