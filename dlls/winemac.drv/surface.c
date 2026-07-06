@@ -395,15 +395,15 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
     return window_surface;
 }
 
-static BOOL can_host_remote_layer(HWND hwnd)
+static BOOL can_host_remote_layer(HWND hwnd, HWND root)
 {
     DWORD_PTR result = 0;
 
-    if (!NtUserGetWindowThread(hwnd, NULL)) return FALSE;
-    if (!send_message_timeout(hwnd, WM_MACDRV_CAN_HOST_REMOTE_LAYER, 0, 0,
+    if (!NtUserGetWindowThread(root, NULL)) return FALSE;
+    if (!send_message_timeout(root, WM_MACDRV_CAN_HOST_REMOTE_LAYER, (WPARAM)hwnd, 0,
                               SMTO_ABORTIFHUNG, 500, &result))
     {
-        TRACE("Switchyard remote layer host check timed out or failed for hwnd %p\n", hwnd);
+        TRACE("Switchyard remote layer host check timed out or failed for hwnd %p root %p\n", hwnd, root);
         return FALSE;
     }
 
@@ -472,7 +472,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
 
     if (!window && is_chromium_cef_child_window(hwnd) &&
         (remote_layer_root = NtUserGetAncestor(hwnd, GA_ROOT)) && remote_layer_root != hwnd &&
-        can_host_remote_layer(hwnd))
+        can_host_remote_layer(hwnd, remote_layer_root))
     {
         remote_child = TRUE;
         TRACE("Switchyard exporting Chromium/CEF foreign child surface hwnd %p to root %p remote layer\n",

@@ -4165,14 +4165,14 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
         return nil;
     }
 
-    macdrv_create_remote_layer(hwnd, context_id);
+    macdrv_create_remote_layer_for_host(release_hwnd, hwnd, context_id);
     return self;
 }
 
 - (void) setColorImage:(CGImageRef)image bounds:(CGRect)bounds
 {
     CGImageRetain(image);
-    macdrv_update_remote_layer(hwnd, context_id);
+    macdrv_update_remote_layer_for_host(release_hwnd, hwnd, context_id);
 
     OnMainThreadAsync(^{
         image_layer.contentsScale = retina_on ? 2.0 : 1.0;

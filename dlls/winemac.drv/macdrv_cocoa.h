@@ -539,7 +539,9 @@ extern void macdrv_window_create_ca_layer_host_view_at(macdrv_window w, unsigned
 extern void macdrv_window_update_ca_layer_host_view(macdrv_window w, unsigned int context_id, CGRect frame);
 extern void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id);
 extern void macdrv_create_remote_layer(void* hwnd, unsigned int context_id);
+extern void macdrv_create_remote_layer_for_host(void* host_hwnd, void* child_hwnd, unsigned int context_id);
 extern void macdrv_update_remote_layer(void* hwnd, unsigned int context_id);
+extern void macdrv_update_remote_layer_for_host(void* host_hwnd, void* child_hwnd, unsigned int context_id);
 extern void macdrv_release_remote_layer(void* hwnd, unsigned int context_id);
 extern macdrv_image_layer macdrv_create_image_layer(void* hwnd, void* release_hwnd, CGRect bounds);
 extern void macdrv_image_layer_set_color_image(macdrv_image_layer layer, CGImageRef image, CGRect bounds);

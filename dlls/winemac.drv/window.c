@@ -1683,13 +1683,19 @@ void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, BOOL per_pixel_alpha, UIN
     }
 }
 
-static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, CGRect *frame)
+static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expected_root, CGRect *frame)
 {
     HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
     struct macdrv_win_data *root_data;
     RECT rect;
 
     if (!root) return NULL;
+    if (expected_root && root != expected_root)
+    {
+        TRACE("Switchyard remote layer host root changed for hwnd %p expected %p got %p\n",
+              hwnd, expected_root, root);
+        return NULL;
+    }
     if (!(root_data = get_win_data(root))) return NULL;
     if (!root_data->cocoa_window)
     {
@@ -1745,10 +1751,11 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MACDRV_CAN_HOST_REMOTE_LAYER:
     {
         struct macdrv_win_data *data;
+        HWND child = wp ? (HWND)wp : hwnd;
         CGRect frame;
         BOOL can_host = FALSE;
 
-        if ((data = get_remote_layer_host_data(hwnd, &frame)))
+        if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             can_host = TRUE;
             release_win_data(data);
@@ -1758,11 +1765,12 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MACDRV_CREATE_REMOTE_LAYER:
     {
         struct macdrv_win_data *data;
+        HWND child = wp ? (HWND)wp : hwnd;
         macdrv_window window;
         CGRect frame;
         BOOL restore_alpha = FALSE;
 
-        if ((data = get_remote_layer_host_data(hwnd, &frame)))
+        if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
             restore_alpha = !data->remote_layer_hosts++;
@@ -1778,11 +1786,12 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MACDRV_UPDATE_REMOTE_LAYER:
     {
         struct macdrv_win_data *data;
+        HWND child = wp ? (HWND)wp : hwnd;
         macdrv_window window = NULL;
         CGRect frame = CGRectNull;
         BOOL restore_alpha = FALSE;
 
-        if ((data = get_remote_layer_host_data(hwnd, &frame)))
+        if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
             if (!data->remote_layer_hosts)
@@ -1829,9 +1838,21 @@ void macdrv_create_remote_layer(void* hwnd_ptr, unsigned int context_id)
 }
 
 
+void macdrv_create_remote_layer_for_host(void* host_hwnd_ptr, void* child_hwnd_ptr, unsigned int context_id)
+{
+    NtUserPostMessage((HWND)host_hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, (WPARAM)child_hwnd_ptr, context_id);
+}
+
+
 void macdrv_update_remote_layer(void* hwnd_ptr, unsigned int context_id)
 {
     NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_UPDATE_REMOTE_LAYER, 0, context_id);
+}
+
+
+void macdrv_update_remote_layer_for_host(void* host_hwnd_ptr, void* child_hwnd_ptr, unsigned int context_id)
+{
+    NtUserPostMessage((HWND)host_hwnd_ptr, WM_MACDRV_UPDATE_REMOTE_LAYER, (WPARAM)child_hwnd_ptr, context_id);
 }
 
 
