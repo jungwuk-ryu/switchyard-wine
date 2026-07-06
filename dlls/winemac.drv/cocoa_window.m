@@ -749,10 +749,26 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         [self removeCALayerHostView:contextId];
 
+        NSDictionary* disabledActions = [NSDictionary dictionaryWithObjectsAndKeys:
+            [NSNull null], @"bounds",
+            [NSNull null], @"contents",
+            [NSNull null], @"contentsScale",
+            [NSNull null], @"frame",
+            [NSNull null], @"hidden",
+            [NSNull null], @"opacity",
+            [NSNull null], @"onOrderIn",
+            [NSNull null], @"onOrderOut",
+            [NSNull null], @"position",
+            [NSNull null], @"sublayers",
+            nil];
         CALayerHost* host = [CALayerHost layer];
         [host setContextId:contextId];
+        host.actions = disabledActions;
         host.magnificationFilter = kCAFilterNearest;
         host.contentsScale = retina_on ? 2.0 : 1.0;
+
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         if (CGRectIsNull(frame))
         {
             host.frame = self.layer.bounds;
@@ -766,6 +782,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         [self.layer addSublayer:host];
         [_caLayerHosts setObject:host forKey:@(contextId)];
+        [CATransaction commit];
 
         [(WineWindow*)self.window windowDidDrawContent];
     }
@@ -781,14 +798,23 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         }
 
         if (!CGRectIsNull(frame))
+        {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
             host.frame = frame;
+            [CATransaction commit];
+        }
     }
 
     - (void) removeCALayerHostView:(CAContextID)contextId
     {
         NSNumber* key = @(contextId);
+
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         [[_caLayerHosts objectForKey:key] removeFromSuperlayer];
         [_caLayerHosts removeObjectForKey:key];
+        [CATransaction commit];
     }
 
     - (void) setLayerRetinaProperties:(BOOL)mode
