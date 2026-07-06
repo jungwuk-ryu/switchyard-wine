@@ -188,7 +188,7 @@ static BOOL sync_blank_chromium_owner_surface(struct macdrv_window_surface *surf
     {
         if (surface->chromium_blank_owner_transparent)
         {
-            TRACE("restoring Chromium/CEF owner host hwnd %p window %p opacity before clearing hosted backing surface\n",
+            TRACE("restoring Chromium/CEF owner host hwnd %p window %p opacity before clearing blank backing surface\n",
                   surface->header.hwnd, surface->window);
             macdrv_set_window_alpha(surface->window, 1.0);
             surface->chromium_blank_owner_transparent = FALSE;
