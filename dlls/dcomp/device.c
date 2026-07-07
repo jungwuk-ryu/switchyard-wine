@@ -674,6 +674,7 @@ static HRESULT create_bgra_surface_from_rgba(IDXGISurface *rgba_surface, IDXGISu
     vp.MaxDepth = 1;
     ID3D11DeviceContext1_RSSetViewports(d3d11_device_context1, 1, &vp);
     ID3D11DeviceContext1_Draw(d3d11_device_context1, 4, 0);
+    ID3D11DeviceContext1_Flush(d3d11_device_context1);
 
     hr = ID3D11Texture2D_QueryInterface(dst_texture, &IID_IDXGISurface, (void **)bgra_surface);
     if (FAILED(hr))
