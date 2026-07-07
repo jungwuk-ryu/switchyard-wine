@@ -711,9 +711,9 @@ interface IDCompositionTexture : IUnknown
 ]
 interface IDCompositionDynamicTexture : IUnknown
 {
-    HRESULT SetTexture([in, optional] IDCompositionTexture *texture,
+    HRESULT SetTexture([in, optional] IDCompositionTexture *texture);
+    HRESULT SetTextureWithDirtyRects([in, optional] IDCompositionTexture *texture,
             [in, optional, size_is(rect_count)] const RECT *rects, [in] SIZE_T rect_count);
-    HRESULT SetTexture2([in, optional] IDCompositionTexture *texture);
 }
 
 [

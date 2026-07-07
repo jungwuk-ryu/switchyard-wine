@@ -191,7 +191,7 @@ static ULONG STDMETHODCALLTYPE dynamic_texture_Release(IDCompositionDynamicTextu
     return ref;
 }
 
-static HRESULT STDMETHODCALLTYPE dynamic_texture_SetTexture(IDCompositionDynamicTexture *iface,
+static HRESULT dynamic_texture_set_texture_with_dirty_rects(IDCompositionDynamicTexture *iface,
         IDCompositionTexture *dcomp_texture, const RECT *rects, SIZE_T rect_count)
 {
     struct composition_dynamic_texture *texture = impl_from_IDCompositionDynamicTexture(iface);
@@ -222,12 +222,18 @@ static HRESULT STDMETHODCALLTYPE dynamic_texture_SetTexture(IDCompositionDynamic
     return S_OK;
 }
 
-static HRESULT STDMETHODCALLTYPE dynamic_texture_SetTexture2(IDCompositionDynamicTexture *iface,
+static HRESULT STDMETHODCALLTYPE dynamic_texture_SetTexture(IDCompositionDynamicTexture *iface,
         IDCompositionTexture *texture)
 {
     TRACE("iface %p, texture %p.\n", iface, texture);
 
-    return IDCompositionDynamicTexture_SetTexture(iface, texture, NULL, 0);
+    return dynamic_texture_set_texture_with_dirty_rects(iface, texture, NULL, 0);
+}
+
+static HRESULT STDMETHODCALLTYPE dynamic_texture_SetTextureWithDirtyRects(IDCompositionDynamicTexture *iface,
+        IDCompositionTexture *texture, const RECT *rects, SIZE_T rect_count)
+{
+    return dynamic_texture_set_texture_with_dirty_rects(iface, texture, rects, rect_count);
 }
 
 static const struct IDCompositionDynamicTextureVtbl dynamic_texture_vtbl =
@@ -236,7 +242,7 @@ static const struct IDCompositionDynamicTextureVtbl dynamic_texture_vtbl =
     dynamic_texture_AddRef,
     dynamic_texture_Release,
     dynamic_texture_SetTexture,
-    dynamic_texture_SetTexture2,
+    dynamic_texture_SetTextureWithDirtyRects,
 };
 
 HRESULT create_dynamic_texture(IDCompositionDynamicTexture **out)
