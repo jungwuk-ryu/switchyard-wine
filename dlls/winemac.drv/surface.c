@@ -323,12 +323,15 @@ static BOOL is_solid_chromium_owner_placeholder(struct macdrv_window_surface *su
                                                 BOOL *remote_layer_host)
 {
     struct macdrv_win_data *data;
+    HWND root;
     BOOL has_remote_layer_hosts = FALSE;
     BOOL had_remote_layer_host = FALSE;
 
     *remote_layer_host = FALSE;
 
     if (surface->child || surface->remote_child || surface->foreign_child) return FALSE;
+    root = NtUserGetAncestor(surface->header.hwnd, GA_ROOT);
+    if (!chromium_root_has_smaller_hosted_layer(root)) return FALSE;
     if ((data = get_win_data(surface->header.hwnd)))
     {
         has_remote_layer_hosts = !!data->remote_layer_hosts;
