@@ -372,14 +372,17 @@ static void wined3d_texture_vk_download_plane(struct wined3d_context *context, V
     struct wined3d_bo_address staging_bo_addr;
     VkPipelineStageFlags bo_stage_flags = 0;
     const struct wined3d_vk_info *vk_info;
+    struct wined3d_device_vk *device_vk;
     VkCommandBuffer vk_command_buffer;
     VkImageSubresourceRange vk_range;
     VkBufferMemoryBarrier vk_barrier;
+    VkMappedMemoryRange range;
     struct wined3d_bo_vk staging_bo;
     struct wined3d_bo_vk *dst_bo;
     VkBufferImageCopy region;
     size_t dst_offset = 0;
     void *map_ptr;
+    bool sync_get_dc = false;
 
     TRACE("context %p, vk_aspect %#x, src_texture %p, src_sub_resource_idx %u, src_box %s, dst_bo_addr %s, "
             "plane_format %s, dst_x %u, dst_y %u, dst_z %u, dst_row_pitch %u, dst_slice_pitch %u.\n",
@@ -541,6 +544,8 @@ static void wined3d_texture_vk_download_plane(struct wined3d_context *context, V
         vk_barrier.dstAccessMask = vk_barrier.srcAccessMask;
         vk_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
+        sync_get_dc = dst_bo->host_synced && (src_texture->flags & WINED3D_TEXTURE_GET_DC);
+
         if (dst_bo->host_synced)
         {
             vk_barrier.dstAccessMask |= VK_ACCESS_HOST_READ_BIT;
@@ -551,6 +556,23 @@ static void wined3d_texture_vk_download_plane(struct wined3d_context *context, V
                 bo_stage_flags, 0, 0, NULL, 1, &vk_barrier, 0, NULL));
         /* Start the download so we don't stall waiting for the result. */
         wined3d_context_vk_submit_command_buffer(context_vk, 0, NULL, NULL, 0, NULL);
+
+        if (sync_get_dc)
+        {
+            /* GDI DCs are backed by this mapped BO, so callers may read it immediately after GetDC(). */
+            wined3d_context_vk_wait_command_buffer(context_vk, dst_bo->command_buffer_id);
+            if (!dst_bo->b.coherent && dst_bo->b.map_ptr)
+            {
+                device_vk = wined3d_device_vk(context->device);
+
+                range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                range.pNext = NULL;
+                range.memory = dst_bo->vk_memory;
+                range.offset = dst_bo->b.memory_offset + dst_offset;
+                range.size = sub_resource->size;
+                VK_CALL(vkInvalidateMappedMemoryRanges(device_vk->vk_device, 1, &range));
+            }
+        }
     }
 }
 
