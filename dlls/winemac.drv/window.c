@@ -1979,6 +1979,7 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL restore_alpha = FALSE;
         BOOL suppress_chromium_placeholder;
         BOOL remove_full_root_placeholder;
+        BOOL clear_chromium_light_placeholder;
         unsigned int context_id = (unsigned int)lp;
 
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
@@ -1991,6 +1992,8 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 data->chromium_smaller_layer_hosted_once = TRUE;
             suppress_chromium_placeholder = suppress_chromium_placeholder &&
                                            data->chromium_smaller_layer_hosted_once;
+            clear_chromium_light_placeholder = is_chromium_cef_child_window(child) &&
+                                               data->chromium_smaller_layer_hosted_once;
             if (suppress_chromium_placeholder && mark_remote_layer_context_suppressed(data, context_id))
             {
                 release_win_data(data);
@@ -2006,7 +2009,7 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", context_id);
             if (restore_alpha) macdrv_set_window_alpha(window, 1.0);
-            if (is_chromium_cef_child_window(child))
+            if (clear_chromium_light_placeholder)
                 macdrv_window_clear_light_color_image(window);
             if (remove_full_root_placeholder)
             {
