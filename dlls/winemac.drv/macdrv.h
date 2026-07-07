@@ -198,6 +198,8 @@ struct macdrv_win_data
     unsigned int        remote_layer_hosted_once : 1; /* has this window ever hosted a foreign remote layer? */
     unsigned int        foreign_surface_refs;   /* surfaces presenting into a foreign child host window */
     unsigned int        remote_layer_hosts;     /* foreign child layers hosted inside this window */
+    CFMutableSetRef     remote_layer_contexts;  /* hosted foreign remote layer context ids */
+    CFMutableSetRef     suppressed_remote_layer_contexts; /* hidden placeholder context ids */
 };
 
 struct macdrv_client_surface

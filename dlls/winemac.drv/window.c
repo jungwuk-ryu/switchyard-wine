@@ -74,6 +74,205 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static int rect_width(const RECT *rect)
+{
+    return rect->right - rect->left;
+}
+
+static int rect_height(const RECT *rect)
+{
+    return rect->bottom - rect->top;
+}
+
+static BOOL rect_nearly_covers_client(const RECT *rect, int width, int height)
+{
+    int rect_w = rect_width(rect);
+    int rect_h = rect_height(rect);
+
+    return rect->left >= -1 && rect->left <= 1 &&
+           rect->top >= -1 && rect->top <= 1 &&
+           rect_w >= width - 2 && rect_w <= width + 2 &&
+           rect_h >= height - 2 && rect_h <= height + 2;
+}
+
+static BOOL has_visible_smaller_chromium_viewport(HWND root, HWND hwnd)
+{
+    UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+    HWND child;
+    RECT root_client;
+    int root_width, root_height;
+
+    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
+    root_width = rect_width(&root_client);
+    root_height = rect_height(&root_client);
+    if (root_width <= 0 || root_height <= 0) return FALSE;
+
+    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        RECT rect;
+        int width, height;
+
+        if (child == hwnd) continue;
+        if (!NtUserIsWindowVisible(child)) continue;
+        if (!is_chromium_cef_child_window(child)) continue;
+        if (NtUserGetAncestor(child, GA_ROOT) != root) continue;
+        if (!NtUserGetClientRect(child, &rect, NtUserGetWinMonitorDpi(child, MDT_RAW_DPI))) continue;
+
+        NtUserMapWindowPoints(child, root, (POINT *)&rect, 2, root_dpi);
+        width = rect_width(&rect);
+        height = rect_height(&rect);
+        if (width <= 0 || height <= 0) continue;
+        if (rect_nearly_covers_client(&rect, root_width, root_height)) continue;
+        if (width * 4 < root_width * 3) continue;
+        if (height * 2 < root_height) continue;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL is_visible_smaller_chromium_viewport(HWND hwnd, HWND expected_root)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    UINT root_dpi;
+    RECT root_client, rect;
+    int root_width, root_height, width, height;
+
+    if (!root || root == hwnd) return FALSE;
+    if (expected_root && root != expected_root) return FALSE;
+    if (!NtUserIsWindowVisible(hwnd)) return FALSE;
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+
+    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
+    root_width = rect_width(&root_client);
+    root_height = rect_height(&root_client);
+    if (root_width <= 0 || root_height <= 0) return FALSE;
+    if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
+
+    NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
+    width = rect_width(&rect);
+    height = rect_height(&rect);
+    if (width <= 0 || height <= 0) return FALSE;
+    if (rect_nearly_covers_client(&rect, root_width, root_height)) return FALSE;
+
+    return width * 4 >= root_width * 3 && height * 2 >= root_height;
+}
+
+static BOOL has_full_root_chromium_viewport_sibling(HWND hwnd, HWND expected_root)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    UINT root_dpi;
+    HWND child;
+    RECT root_client;
+    int root_width, root_height;
+
+    if (!root || root == hwnd) return FALSE;
+    if (expected_root && root != expected_root) return FALSE;
+
+    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
+    root_width = rect_width(&root_client);
+    root_height = rect_height(&root_client);
+    if (root_width <= 0 || root_height <= 0) return FALSE;
+
+    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        RECT rect;
+
+        if (child == hwnd) continue;
+        if (!NtUserIsWindowVisible(child)) continue;
+        if (!is_chromium_cef_child_window(child)) continue;
+        if (NtUserGetAncestor(child, GA_ROOT) != root) continue;
+        if (!NtUserGetClientRect(child, &rect, NtUserGetWinMonitorDpi(child, MDT_RAW_DPI))) continue;
+
+        NtUserMapWindowPoints(child, root, (POINT *)&rect, 2, root_dpi);
+        if (rect_nearly_covers_client(&rect, root_width, root_height))
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL is_full_root_chromium_placeholder(HWND hwnd, HWND expected_root)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    UINT root_dpi;
+    RECT root_client, rect;
+    int root_width, root_height;
+
+    if (!root || root == hwnd) return FALSE;
+    if (expected_root && root != expected_root) return FALSE;
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+
+    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
+    root_width = rect_width(&root_client);
+    root_height = rect_height(&root_client);
+    if (root_width <= 0 || root_height <= 0) return FALSE;
+    if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
+
+    NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
+    return rect_nearly_covers_client(&rect, root_width, root_height) &&
+           has_visible_smaller_chromium_viewport(root, hwnd);
+}
+
+static const void *remote_layer_context_key(unsigned int context_id)
+{
+    return (const void *)((ULONG_PTR)context_id + 1);
+}
+
+static BOOL remote_layer_context_set_contains(CFMutableSetRef set, unsigned int context_id)
+{
+    return set && CFSetContainsValue(set, remote_layer_context_key(context_id));
+}
+
+static BOOL remote_layer_context_set_add(CFMutableSetRef *set, unsigned int context_id)
+{
+    if (*set && CFSetContainsValue(*set, remote_layer_context_key(context_id))) return FALSE;
+    if (!*set && !(*set = CFSetCreateMutable(NULL, 0, NULL))) return FALSE;
+
+    CFSetAddValue(*set, remote_layer_context_key(context_id));
+    return TRUE;
+}
+
+static BOOL remote_layer_context_set_remove(CFMutableSetRef set, unsigned int context_id)
+{
+    if (!set || !CFSetContainsValue(set, remote_layer_context_key(context_id))) return FALSE;
+
+    CFSetRemoveValue(set, remote_layer_context_key(context_id));
+    return TRUE;
+}
+
+static BOOL mark_remote_layer_context_hosted(struct macdrv_win_data *data, unsigned int context_id,
+                                             BOOL *restore_alpha)
+{
+    *restore_alpha = FALSE;
+    remote_layer_context_set_remove(data->suppressed_remote_layer_contexts, context_id);
+    data->remote_layer_hosted_once = TRUE;
+
+    if (remote_layer_context_set_add(&data->remote_layer_contexts, context_id))
+    {
+        *restore_alpha = !data->remote_layer_hosts++;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL mark_remote_layer_context_suppressed(struct macdrv_win_data *data, unsigned int context_id)
+{
+    if (!remote_layer_context_set_contains(data->suppressed_remote_layer_contexts, context_id) &&
+        !remote_layer_context_set_add(&data->suppressed_remote_layer_contexts, context_id))
+        return FALSE;
+
+    if (remote_layer_context_set_remove(data->remote_layer_contexts, context_id) &&
+        data->remote_layer_hosts)
+        data->remote_layer_hosts--;
+    return TRUE;
+}
 
 /* per-monitor DPI aware NtUserSetWindowPos call */
 static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, UINT flags)
@@ -269,6 +468,13 @@ struct macdrv_win_data *get_win_data(HWND hwnd)
 void release_win_data(struct macdrv_win_data *data)
 {
     if (data) pthread_mutex_unlock(&win_data_mutex);
+}
+
+static void free_win_data(struct macdrv_win_data *data)
+{
+    if (data->remote_layer_contexts) CFRelease(data->remote_layer_contexts);
+    if (data->suppressed_remote_layer_contexts) CFRelease(data->suppressed_remote_layer_contexts);
+    free(data);
 }
 
 
@@ -692,7 +898,7 @@ void macdrv_release_foreign_child_win_data(HWND hwnd)
     destroy_cocoa_window(data);
     CFDictionaryRemoveValue(win_datas, hwnd);
     release_win_data(data);
-    free(data);
+    free_win_data(data);
 }
 
 
@@ -1427,7 +1633,7 @@ void macdrv_DestroyWindow(HWND hwnd)
 
     CFDictionaryRemoveValue(win_datas, hwnd);
     release_win_data(data);
-    free(data);
+    free_win_data(data);
 }
 
 
@@ -1707,6 +1913,7 @@ static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expect
 
     if (root != hwnd)
     {
+        BOOL chromium_child = is_chromium_cef_child_window(hwnd);
         UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
 
         if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI)))
@@ -1715,8 +1922,9 @@ static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expect
             return NULL;
         }
         NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
-        OffsetRect(&rect, root_data->rects.client.left - root_data->rects.visible.left,
-                   root_data->rects.client.top - root_data->rects.visible.top);
+        if (!chromium_child)
+            OffsetRect(&rect, root_data->rects.client.left - root_data->rects.visible.left,
+                       root_data->rects.client.top - root_data->rects.visible.top);
         *frame = cgrect_mac_from_win(cgrect_from_rect(rect));
     }
 
@@ -1769,18 +1977,42 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         macdrv_window window;
         CGRect frame;
         BOOL restore_alpha = FALSE;
+        BOOL suppress_chromium_placeholder;
+        BOOL remove_full_root_placeholder;
+        unsigned int context_id = (unsigned int)lp;
 
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
-            data->remote_layer_hosted_once = TRUE;
-            restore_alpha = !data->remote_layer_hosts++;
+            suppress_chromium_placeholder = is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
+            remove_full_root_placeholder = is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
+                                           has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
+            if (suppress_chromium_placeholder && mark_remote_layer_context_suppressed(data, context_id))
+            {
+                release_win_data(data);
+                TRACE("Switchyard suppressing full-root Chromium/CEF remote layer hwnd %p context_id %u\n",
+                      child, context_id);
+                macdrv_window_clear_light_color_image(window);
+                macdrv_window_release_ca_layer_host_view_immediately(window, context_id);
+                return 0;
+            }
+
+            mark_remote_layer_context_hosted(data, context_id, &restore_alpha);
             release_win_data(data);
 
-            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
+            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", context_id);
             if (restore_alpha) macdrv_set_window_alpha(window, 1.0);
-            if (CGRectIsNull(frame)) macdrv_window_create_ca_layer_host_view(window, (unsigned int)lp);
-            else macdrv_window_create_ca_layer_host_view_at(window, (unsigned int)lp, frame);
+            if (is_chromium_cef_child_window(child))
+                macdrv_window_clear_light_color_image(window);
+            if (remove_full_root_placeholder)
+            {
+                macdrv_window_clear_color_image(window);
+                macdrv_window_remove_full_frame_ca_layer_host_views(window, context_id);
+            }
+            if (CGRectIsNull(frame))
+                macdrv_window_create_ca_layer_host_view(window, context_id);
+            else
+                macdrv_window_create_ca_layer_host_view_at(window, context_id, frame);
         }
         return 0;
     }
@@ -1791,22 +2023,38 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         macdrv_window window = NULL;
         CGRect frame = CGRectNull;
         BOOL restore_alpha = FALSE;
+        BOOL suppress_chromium_placeholder;
+        BOOL remove_full_root_placeholder;
+        unsigned int context_id = (unsigned int)lp;
 
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
-            data->remote_layer_hosted_once = TRUE;
-            if (!data->remote_layer_hosts)
+            suppress_chromium_placeholder = is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
+            remove_full_root_placeholder = is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
+                                           has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
+            if (suppress_chromium_placeholder && mark_remote_layer_context_suppressed(data, context_id))
             {
-                data->remote_layer_hosts = 1;
-                restore_alpha = TRUE;
+                release_win_data(data);
+                TRACE("Switchyard suppressing full-root Chromium/CEF remote layer update hwnd %p context_id %u\n",
+                      child, context_id);
+                macdrv_window_clear_light_color_image(window);
+                macdrv_window_release_ca_layer_host_view_immediately(window, context_id);
+                return 0;
             }
+
+            mark_remote_layer_context_hosted(data, context_id, &restore_alpha);
             release_win_data(data);
 
             if (restore_alpha) macdrv_set_window_alpha(window, 1.0);
+            if (remove_full_root_placeholder)
+            {
+                macdrv_window_clear_color_image(window);
+                macdrv_window_remove_full_frame_ca_layer_host_views(window, context_id);
+            }
         }
         if (window && !CGRectIsNull(frame))
-            macdrv_window_update_ca_layer_host_view(window, (unsigned int)lp, frame);
+            macdrv_window_update_ca_layer_host_view(window, context_id, frame);
         return 0;
     }
     case WM_MACDRV_RELEASE_REMOTE_LAYER:
@@ -1814,17 +2062,21 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
         struct macdrv_win_data *data;
         macdrv_window window = NULL;
+        unsigned int context_id = (unsigned int)lp;
 
         if (root && (data = get_win_data(root)))
         {
             window = data->cocoa_window;
-            if (data->remote_layer_hosts) data->remote_layer_hosts--;
+            if (!remote_layer_context_set_remove(data->suppressed_remote_layer_contexts, context_id) &&
+                remote_layer_context_set_remove(data->remote_layer_contexts, context_id) &&
+                data->remote_layer_hosts)
+                data->remote_layer_hosts--;
             release_win_data(data);
 
-            TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
+            TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", context_id);
         }
         if (window)
-            macdrv_window_release_ca_layer_host_view(window, (unsigned int)lp);
+            macdrv_window_release_ca_layer_host_view(window, context_id);
         return 0;
     }
     }

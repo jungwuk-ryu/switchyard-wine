@@ -535,10 +535,13 @@ extern macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* hwnd, CGRe
 extern macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain);
 extern void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain);
 extern void macdrv_window_clear_color_image(macdrv_window w);
+extern void macdrv_window_clear_light_color_image(macdrv_window w);
 extern void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id);
 extern void macdrv_window_create_ca_layer_host_view_at(macdrv_window w, unsigned int context_id, CGRect frame);
 extern void macdrv_window_update_ca_layer_host_view(macdrv_window w, unsigned int context_id, CGRect frame);
 extern void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id);
+extern void macdrv_window_release_ca_layer_host_view_immediately(macdrv_window w, unsigned int context_id);
+extern void macdrv_window_remove_full_frame_ca_layer_host_views(macdrv_window w, unsigned int keep_context_id);
 extern void macdrv_create_remote_layer(void* hwnd, unsigned int context_id);
 extern void macdrv_create_remote_layer_for_host(void* host_hwnd, void* child_hwnd, unsigned int context_id);
 extern void macdrv_update_remote_layer(void* hwnd, unsigned int context_id);

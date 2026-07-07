@@ -58,6 +58,15 @@ struct macdrv_window_surface
     BOOL                    foreign_child_fronted;
     BOOL                    chromium_blank_owner_transparent;
     BOOL                    chromium_blank_owner_had_remote_layer;
+    BOOL                    chromium_child_had_real_image;
+};
+
+enum solid_surface_kind
+{
+    SOLID_SURFACE_NONE,
+    SOLID_SURFACE_DARK,
+    SOLID_SURFACE_LIGHT,
+    SOLID_SURFACE_OTHER,
 };
 
 static BOOL is_chromium_cef_child_window(HWND hwnd)
@@ -89,6 +98,185 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static int rect_width(const RECT *rect)
+{
+    return rect->right - rect->left;
+}
+
+static int rect_height(const RECT *rect)
+{
+    return rect->bottom - rect->top;
+}
+
+static BOOL rect_nearly_covers_client(const RECT *rect, int width, int height)
+{
+    int rect_w = rect_width(rect);
+    int rect_h = rect_height(rect);
+
+    return rect->left >= -1 && rect->left <= 1 &&
+           rect->top >= -1 && rect->top <= 1 &&
+           rect_w >= width - 2 && rect_w <= width + 2 &&
+           rect_h >= height - 2 && rect_h <= height + 2;
+}
+
+static BOOL has_visible_smaller_chromium_viewport(HWND root, HWND hwnd)
+{
+    UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+    HWND child;
+    RECT root_client;
+    int root_width, root_height;
+
+    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
+    root_width = rect_width(&root_client);
+    root_height = rect_height(&root_client);
+    if (root_width <= 0 || root_height <= 0) return FALSE;
+
+    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        RECT rect;
+        int width, height;
+
+        if (child == hwnd) continue;
+        if (!NtUserIsWindowVisible(child)) continue;
+        if (!is_chromium_cef_child_window(child)) continue;
+        if (NtUserGetAncestor(child, GA_ROOT) != root) continue;
+        if (!NtUserGetClientRect(child, &rect, NtUserGetWinMonitorDpi(child, MDT_RAW_DPI))) continue;
+
+        NtUserMapWindowPoints(child, root, (POINT *)&rect, 2, root_dpi);
+        width = rect_width(&rect);
+        height = rect_height(&rect);
+        if (width <= 0 || height <= 0) continue;
+        if (rect_nearly_covers_client(&rect, root_width, root_height)) continue;
+        if (width * 4 < root_width * 3) continue;
+        if (height * 2 < root_height) continue;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL is_full_root_chromium_placeholder(HWND hwnd, HWND root)
+{
+    UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+    RECT root_client, rect;
+    int root_width, root_height;
+
+    if (!root || root == hwnd) return FALSE;
+    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
+    root_width = rect_width(&root_client);
+    root_height = rect_height(&root_client);
+    if (root_width <= 0 || root_height <= 0) return FALSE;
+    if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
+
+    NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
+    return rect_nearly_covers_client(&rect, root_width, root_height) &&
+           has_visible_smaller_chromium_viewport(root, hwnd);
+}
+
+static HWND find_full_root_chromium_placeholder(HWND hwnd, HWND root)
+{
+    HWND candidate;
+
+    if (!root || root == hwnd) return NULL;
+
+    for (candidate = hwnd; candidate && candidate != root;
+         candidate = NtUserGetAncestor(candidate, GA_PARENT))
+    {
+        if (!is_chromium_cef_child_window(candidate)) continue;
+        if (NtUserGetAncestor(candidate, GA_ROOT) != root) continue;
+        if (is_full_root_chromium_placeholder(candidate, root))
+            return candidate;
+    }
+
+    return NULL;
+}
+
+static BOOL should_suppress_chromium_placeholder_surface(struct macdrv_window_surface *surface)
+{
+    HWND root;
+
+    if (!surface->child && !surface->remote_child && !surface->foreign_child) return FALSE;
+    if (!is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
+    root = NtUserGetAncestor(surface->header.hwnd, GA_ROOT);
+    return !!find_full_root_chromium_placeholder(surface->header.hwnd, root);
+}
+
+static BOOL get_child_root_offset(HWND hwnd, POINT *offset)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    RECT rect;
+    UINT root_dpi;
+
+    if (!root || root == hwnd) return FALSE;
+    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+    if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
+
+    NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
+    offset->x = rect.left;
+    offset->y = rect.top;
+    return TRUE;
+}
+
+static enum solid_surface_kind get_nearly_solid_surface_kind(const BITMAPINFO *color_info, const void *pixels)
+{
+    unsigned int width, height, stride_pixels, x_step, y_step, samples = 0, solid_samples = 0;
+    unsigned int x, y;
+    BYTE base_red = 0, base_green = 0, base_blue = 0;
+    BOOL have_base = FALSE;
+
+    if (!pixels || color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
+        return SOLID_SURFACE_NONE;
+
+    width = color_info->bmiHeader.biWidth;
+    height = abs(color_info->bmiHeader.biHeight);
+    if (width < 400 || height < 300) return SOLID_SURFACE_NONE;
+
+    stride_pixels = color_info->bmiHeader.biSizeImage / height / sizeof(DWORD);
+    if (stride_pixels < width) return SOLID_SURFACE_NONE;
+
+    x_step = width / 32;
+    y_step = height / 24;
+    if (!x_step) x_step = 1;
+    if (!y_step) y_step = 1;
+
+    for (y = 0; y < height; y += y_step)
+    {
+        const DWORD *row = (const DWORD *)pixels + y * stride_pixels;
+
+        for (x = 0; x < width; x += x_step)
+        {
+            DWORD pixel = row[x];
+            BYTE blue = pixel & 0xff;
+            BYTE green = (pixel >> 8) & 0xff;
+            BYTE red = (pixel >> 16) & 0xff;
+
+            if (!have_base)
+            {
+                base_red = red;
+                base_green = green;
+                base_blue = blue;
+                have_base = TRUE;
+            }
+
+            samples++;
+            if (abs(red - base_red) <= 8 &&
+                abs(green - base_green) <= 8 &&
+                abs(blue - base_blue) <= 8)
+                solid_samples++;
+        }
+    }
+
+    if (!samples || solid_samples * 100 < samples * 98)
+        return SOLID_SURFACE_NONE;
+
+    if (base_red <= 8 && base_green <= 8 && base_blue <= 8)
+        return SOLID_SURFACE_DARK;
+    if (base_red >= 247 && base_green >= 247 && base_blue >= 247)
+        return SOLID_SURFACE_LIGHT;
+    return SOLID_SURFACE_OTHER;
+}
+
 static struct macdrv_window_surface *get_mac_surface(struct window_surface *surface);
 
 static CGDataProviderRef data_provider_create(size_t size, void **bits)
@@ -113,13 +301,10 @@ static void macdrv_surface_set_clip(struct window_surface *window_surface, const
 {
 }
 
-static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surface,
-                                            const BITMAPINFO *color_info, const void *color_bits,
-                                            BOOL *remote_layer_host)
+static BOOL is_solid_chromium_owner_placeholder(struct macdrv_window_surface *surface,
+                                                enum solid_surface_kind solid_kind,
+                                                BOOL *remote_layer_host)
 {
-    const DWORD *pixels = color_bits ? color_bits : surface->bits;
-    unsigned int width, height, stride_pixels, x_step, y_step, samples = 0, blank_samples = 0;
-    unsigned int x, y;
     struct macdrv_win_data *data;
     BOOL has_remote_layer_hosts = FALSE;
     BOOL had_remote_layer_host = FALSE;
@@ -136,55 +321,25 @@ static BOOL is_blank_chromium_owner_surface(struct macdrv_window_surface *surfac
     if (!has_remote_layer_hosts &&
         !had_remote_layer_host &&
         !surface->chromium_blank_owner_had_remote_layer &&
-        !is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
-    if (!pixels || color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
+        !is_chromium_cef_child_window(surface->header.hwnd) &&
+        !has_visible_smaller_chromium_viewport(surface->header.hwnd, NULL)) return FALSE;
+    if (solid_kind != SOLID_SURFACE_DARK && solid_kind != SOLID_SURFACE_LIGHT)
         return FALSE;
-
-    width = color_info->bmiHeader.biWidth;
-    height = abs(color_info->bmiHeader.biHeight);
-    if (width < 400 || height < 300) return FALSE;
-
-    stride_pixels = color_info->bmiHeader.biSizeImage / height / sizeof(*pixels);
-    if (stride_pixels < width) return FALSE;
-
-    x_step = width / 32;
-    y_step = height / 24;
-    if (!x_step) x_step = 1;
-    if (!y_step) y_step = 1;
-
-    for (y = 0; y < height; y += y_step)
-    {
-        const DWORD *row = pixels + y * stride_pixels;
-
-        for (x = 0; x < width; x += x_step)
-        {
-            DWORD pixel = row[x];
-            BYTE blue = pixel & 0xff;
-            BYTE green = (pixel >> 8) & 0xff;
-            BYTE red = (pixel >> 16) & 0xff;
-
-            samples++;
-            if (red <= 8 && green <= 8 && blue <= 8)
-                blank_samples++;
-        }
-    }
-
-    if (!samples || blank_samples * 100 < samples * 98) return FALSE;
 
     *remote_layer_host = has_remote_layer_hosts || had_remote_layer_host;
     return TRUE;
 }
 
 static BOOL sync_blank_chromium_owner_surface(struct macdrv_window_surface *surface,
-                                              const BITMAPINFO *color_info, const void *color_bits)
+                                              enum solid_surface_kind solid_kind)
 {
     BOOL remote_layer_host = FALSE;
-    BOOL blank = is_blank_chromium_owner_surface(surface, color_info, color_bits, &remote_layer_host);
+    BOOL blank = is_solid_chromium_owner_placeholder(surface, solid_kind, &remote_layer_host);
 
     if (blank && remote_layer_host)
         surface->chromium_blank_owner_had_remote_layer = TRUE;
 
-    if (blank && (remote_layer_host || surface->chromium_blank_owner_had_remote_layer))
+    if (blank)
     {
         if (surface->chromium_blank_owner_transparent)
         {
@@ -200,17 +355,9 @@ static BOOL sync_blank_chromium_owner_surface(struct macdrv_window_surface *surf
         return TRUE;
     }
 
-    if (!blank)
-        surface->chromium_blank_owner_had_remote_layer = FALSE;
+    surface->chromium_blank_owner_had_remote_layer = FALSE;
 
-    if (blank && !surface->chromium_blank_owner_transparent)
-    {
-        TRACE("making blank Chromium/CEF owner host hwnd %p window %p nearly transparent\n",
-              surface->header.hwnd, surface->window);
-        macdrv_set_window_alpha(surface->window, 0.01);
-        surface->chromium_blank_owner_transparent = TRUE;
-    }
-    else if (!blank && surface->chromium_blank_owner_transparent)
+    if (surface->chromium_blank_owner_transparent)
     {
         TRACE("restoring Chromium/CEF owner host hwnd %p window %p opacity\n",
               surface->header.hwnd, surface->window);
@@ -267,11 +414,33 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     CGColorSpaceRef colorspace = NULL;
     CGImageRef image;
     BOOL clear_color_image;
+    enum solid_surface_kind solid_kind;
 
     if (color_bits && color_bits != surface->bits)
         memcpy(surface->bits, color_bits, color_info->bmiHeader.biSizeImage);
 
-    clear_color_image = sync_blank_chromium_owner_surface(surface, color_info, color_bits);
+    solid_kind = get_nearly_solid_surface_kind(color_info, color_bits ? color_bits : surface->bits);
+
+    if (should_suppress_chromium_placeholder_surface(surface) && solid_kind != SOLID_SURFACE_NONE)
+    {
+        TRACE("Switchyard suppressing solid full-root Chromium/CEF surface flush hwnd %p with smaller viewport sibling\n",
+              surface->header.hwnd);
+        return TRUE;
+    }
+
+    if (surface->image_layer && solid_kind != SOLID_SURFACE_NONE &&
+        is_chromium_cef_child_window(surface->header.hwnd))
+    {
+        if (surface->chromium_child_had_real_image)
+            TRACE("Switchyard holding last Chromium/CEF image-layer frame over solid placeholder hwnd %p\n",
+                  surface->header.hwnd);
+        else
+            TRACE("Switchyard deferring Chromium/CEF image-layer host until real content for hwnd %p\n",
+                  surface->header.hwnd);
+        return TRUE;
+    }
+
+    clear_color_image = sync_blank_chromium_owner_surface(surface, solid_kind);
 
     if (!clear_color_image)
     {
@@ -281,16 +450,25 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
                               alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
         CGColorSpaceRelease(colorspace);
 
-        if (surface->child)
+        if (surface->child && !surface->image_layer)
         {
-            OffsetRect(&translated_rect, surface->offset.x, surface->offset.y);
-            OffsetRect(&translated_dirty, surface->offset.x, surface->offset.y);
+            POINT offset = surface->offset;
+
+            if (is_chromium_cef_child_window(surface->header.hwnd))
+                get_child_root_offset(surface->header.hwnd, &offset);
+
+            OffsetRect(&translated_rect, offset.x, offset.y);
+            OffsetRect(&translated_dirty, offset.x, offset.y);
         }
         else if (!surface->remote_child)
             sync_foreign_child_surface_frame(surface);
 
-        if (surface->remote_child)
+        if (surface->image_layer)
+        {
             macdrv_image_layer_set_color_image(surface->image_layer, image, cgrect_from_rect(*rect));
+            if (solid_kind == SOLID_SURFACE_NONE && is_chromium_cef_child_window(surface->header.hwnd))
+                surface->chromium_child_had_real_image = TRUE;
+        }
         else
             macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(translated_rect),
                                           cgrect_from_rect(translated_dirty));
@@ -424,13 +602,17 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
         surface->foreign_child_fronted = FALSE;
         surface->chromium_blank_owner_transparent = FALSE;
         surface->chromium_blank_owner_had_remote_layer = FALSE;
+        surface->chromium_child_had_real_image = FALSE;
         window_surface->flush_on_unlock = child || remote_child || foreign_child;
 
-        if (remote_child &&
-            !(surface->image_layer = macdrv_create_image_layer(hwnd, remote_layer_root, cgrect_from_rect(*rect))))
+        if ((child || remote_child) && remote_layer_root)
         {
-            window_surface_release(window_surface);
-            return NULL;
+            surface->image_layer = macdrv_create_image_layer(hwnd, remote_layer_root, cgrect_from_rect(*rect));
+            if (!surface->image_layer && remote_child)
+            {
+                window_surface_release(window_surface);
+                return NULL;
+            }
         }
     }
 
@@ -502,6 +684,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
 
                 NtUserMapWindowPoints(hwnd, root, &offset, 1, dpi);
                 window = root_data->cocoa_window;
+                remote_layer_root = root;
                 child = TRUE;
                 TRACE("Switchyard redirecting Chromium/CEF child surface hwnd %p to root %p offset %s\n",
                       hwnd, root, wine_dbgstr_point(&offset));
