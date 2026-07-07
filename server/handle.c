@@ -751,7 +751,22 @@ DECL_HANDLER(set_security_object)
     if (req->security_info & DACL_SECURITY_INFORMATION)
         access |= WRITE_DAC;
 
-    if (!(obj = get_handle_obj( current->process, req->handle, access, NULL ))) return;
+    if (!(obj = get_handle_obj( current->process, req->handle, access, NULL )))
+    {
+        unsigned int token_access = WRITE_DAC;
+
+        if (get_error() != STATUS_ACCESS_DENIED || access != WRITE_DAC ||
+            req->security_info != DACL_SECURITY_INFORMATION)
+            return;
+        if (!(obj = get_handle_obj( current->process, req->handle, 0, NULL )))
+            return;
+        if (obj->ops->type != &key_type || !check_object_access( current->process->token, obj, &token_access ))
+        {
+            release_object( obj );
+            return;
+        }
+        clear_error();
+    }
 
     obj->ops->set_sd( obj, sd, req->security_info );
     release_object( obj );
