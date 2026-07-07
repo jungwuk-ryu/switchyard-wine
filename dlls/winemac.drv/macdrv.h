@@ -196,6 +196,7 @@ struct macdrv_win_data
     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
     unsigned int        foreign_child : 1;      /* process-local host window for a foreign child HWND */
     unsigned int        remote_layer_hosted_once : 1; /* has this window ever hosted a foreign remote layer? */
+    unsigned int        chromium_smaller_layer_hosted_once : 1; /* has a smaller Chromium child hosted a layer? */
     unsigned int        foreign_surface_refs;   /* surfaces presenting into a foreign child host window */
     unsigned int        remote_layer_hosts;     /* foreign child layers hosted inside this window */
     CFMutableSetRef     remote_layer_contexts;  /* hosted foreign remote layer context ids */

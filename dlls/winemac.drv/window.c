@@ -1987,6 +1987,10 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             suppress_chromium_placeholder = is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
             remove_full_root_placeholder = is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
                                            has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
+            if (remove_full_root_placeholder)
+                data->chromium_smaller_layer_hosted_once = TRUE;
+            suppress_chromium_placeholder = suppress_chromium_placeholder &&
+                                           data->chromium_smaller_layer_hosted_once;
             if (suppress_chromium_placeholder && mark_remote_layer_context_suppressed(data, context_id))
             {
                 release_win_data(data);
@@ -2033,6 +2037,10 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             suppress_chromium_placeholder = is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
             remove_full_root_placeholder = is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
                                            has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
+            if (remove_full_root_placeholder)
+                data->chromium_smaller_layer_hosted_once = TRUE;
+            suppress_chromium_placeholder = suppress_chromium_placeholder &&
+                                           data->chromium_smaller_layer_hosted_once;
             if (suppress_chromium_placeholder && mark_remote_layer_context_suppressed(data, context_id))
             {
                 release_win_data(data);
