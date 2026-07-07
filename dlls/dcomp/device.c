@@ -1157,7 +1157,7 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
         }
 
         do_composite_dxgi_surface(target, visual, dxgi_surface, alpha_mode,
-                IsEqualGUID(&visual->content_iid, &IID_IDXGISwapChain1) || dynamic_texture,
+                IsEqualGUID(&visual->content_iid, &IID_IDXGISwapChain1),
                 dynamic_texture, offset_x, offset_y);
         IDXGISurface_Release(dxgi_surface);
         if (dynamic_texture)
