@@ -63,6 +63,7 @@ static const WCHAR pe_dir[] = L"";
 
 /* we don't want to include winuser.h */
 #define RT_MANIFEST                         ((ULONG_PTR)24)
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID  ((ULONG_PTR)1)
 #define ISOLATIONAWARE_MANIFEST_RESOURCE_ID ((ULONG_PTR)2)
 
 typedef DWORD (CALLBACK *DLLENTRYPROC)(HMODULE,DWORD,LPVOID);
@@ -1271,23 +1272,39 @@ done:
  */
 static NTSTATUS create_module_activation_context( LDR_DATA_TABLE_ENTRY *module )
 {
-    NTSTATUS status;
+    static const ULONG_PTR resource_ids[] =
+    {
+        ISOLATIONAWARE_MANIFEST_RESOURCE_ID,
+        CREATEPROCESS_MANIFEST_RESOURCE_ID
+    };
+
     LDR_RESOURCE_INFO info;
     const IMAGE_RESOURCE_DATA_ENTRY *entry;
+    NTSTATUS status = STATUS_RESOURCE_DATA_NOT_FOUND;
+    unsigned int i;
 
     info.Type = RT_MANIFEST;
-    info.Name = ISOLATIONAWARE_MANIFEST_RESOURCE_ID;
     info.Language = 0;
-    if (!(status = LdrFindResource_U( module->DllBase, &info, 3, &entry )))
+
+    for (i = 0; i < ARRAY_SIZE( resource_ids ); i++)
     {
-        ACTCTXW ctx;
-        ctx.cbSize   = sizeof(ctx);
-        ctx.lpSource = NULL;
-        ctx.dwFlags  = ACTCTX_FLAG_RESOURCE_NAME_VALID | ACTCTX_FLAG_HMODULE_VALID;
-        ctx.hModule  = module->DllBase;
-        ctx.lpResourceName = (LPCWSTR)ISOLATIONAWARE_MANIFEST_RESOURCE_ID;
-        status = RtlCreateActivationContext( &module->ActivationContext, &ctx );
+        if (i && (module->Flags & LDR_IMAGE_IS_DLL)) break;
+
+        info.Name = resource_ids[i];
+        if (!(status = LdrFindResource_U( module->DllBase, &info, 3, &entry )))
+        {
+            ACTCTXW ctx;
+
+            ctx.cbSize   = sizeof(ctx);
+            ctx.lpSource = NULL;
+            ctx.dwFlags  = ACTCTX_FLAG_RESOURCE_NAME_VALID | ACTCTX_FLAG_HMODULE_VALID;
+            ctx.hModule  = module->DllBase;
+            ctx.lpResourceName = (LPCWSTR)resource_ids[i];
+            status = RtlCreateActivationContext( &module->ActivationContext, &ctx );
+            break;
+        }
     }
+
     return status;
 }
 
