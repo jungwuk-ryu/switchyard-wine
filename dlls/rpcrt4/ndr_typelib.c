@@ -181,6 +181,8 @@ static unsigned int type_memsize(ITypeInfo *typeinfo, TYPEDESC *desc, unsigned i
     case VT_PTR:
     case VT_UNKNOWN:
     case VT_DISPATCH:
+    case VT_LPSTR:
+    case VT_LPWSTR:
         size = align = sizeof(void *);
         break;
     case VT_VARIANT:
@@ -787,6 +789,18 @@ static size_t write_pointer_tfs(ITypeInfo *typeinfo, unsigned char *str,
     return off;
 }
 
+static size_t write_string_tfs(unsigned char *str, size_t *len, VARTYPE vt, BOOL toplevel)
+{
+    size_t off = *len;
+
+    WRITE_CHAR(str, *len, toplevel ? FC_RP : FC_UP);
+    WRITE_CHAR(str, *len, FC_SIMPLE_POINTER);
+    WRITE_CHAR(str, *len, vt == VT_LPWSTR ? FC_C_WSTRING : FC_C_CSTRING);
+    WRITE_CHAR(str, *len, FC_PAD);
+
+    return off;
+}
+
 static size_t write_type_tfs(ITypeInfo *typeinfo, unsigned char *str,
         size_t *len, TYPEDESC *desc, BOOL toplevel, BOOL onstack)
 {
@@ -806,6 +820,9 @@ static size_t write_type_tfs(ITypeInfo *typeinfo, unsigned char *str,
         return write_pointer_tfs(typeinfo, str, len, desc->lptdesc, toplevel, onstack);
     case VT_CARRAY:
         return write_array_tfs(typeinfo, str, len, desc->lpadesc);
+    case VT_LPSTR:
+    case VT_LPWSTR:
+        return write_string_tfs(str, len, desc->vt, toplevel);
     case VT_USERDEFINED:
         ITypeInfo_GetRefTypeInfo(typeinfo, desc->hreftype, &refinfo);
         ITypeInfo_GetTypeAttr(refinfo, &attr);
@@ -872,6 +889,8 @@ static unsigned int get_stack_size(ITypeInfo *typeinfo, TYPEDESC *desc, unsigned
     case VT_UNKNOWN:
     case VT_DISPATCH:
     case VT_CARRAY:
+    case VT_LPSTR:
+    case VT_LPWSTR:
         byval = 0;
         break;
     case VT_VARIANT:
@@ -1011,6 +1030,8 @@ static HRESULT get_param_info(ITypeInfo *typeinfo, TYPEDESC *tdesc, int is_in,
     case VT_BSTR:
     case VT_SAFEARRAY:
     case VT_CY:
+    case VT_LPSTR:
+    case VT_LPWSTR:
         *flags |= (by_val ? IsByValue : IsSimpleRef) | MustFree;
         break;
     case VT_UNKNOWN:
