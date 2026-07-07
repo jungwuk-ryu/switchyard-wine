@@ -2968,6 +2968,20 @@ static NTSTATUS build_dlldata_path( LPCWSTR libname, ACTCTX_SECTION_KEYED_DATA *
     return status;
 }
 
+static BOOL is_global_winsxs_manifest_path( const WCHAR *path )
+{
+    static const WCHAR winsxs_manifestsW[] = L"\\winsxs\\manifests\\";
+    SIZE_T path_len, windows_len = wcslen( windows_dir );
+    SIZE_T manifests_len = ARRAY_SIZE( winsxs_manifestsW ) - 1;
+
+    if (!path) return FALSE;
+    path_len = wcslen( path );
+    if (path_len < windows_len + manifests_len) return FALSE;
+    if (RtlCompareUnicodeStrings( path, windows_len, windows_dir, windows_len, TRUE )) return FALSE;
+    return !RtlCompareUnicodeStrings( path + windows_len, manifests_len,
+                                      winsxs_manifestsW, manifests_len, TRUE );
+}
+
 
 /***********************************************************************
  *	find_actctx_dll
@@ -3033,12 +3047,14 @@ static NTSTATUS find_actctx_dll( LPCWSTR libname, LPWSTR *fullname )
         DWORD len, dirlen = info->ulAssemblyDirectoryNameLength / sizeof(WCHAR);
         p++;
         len = wcslen( p );
-        if (!dirlen || len <= dirlen ||
+        if (!is_global_winsxs_manifest_path( info->lpAssemblyManifestPath ) ||
+            !dirlen || len <= dirlen ||
             RtlCompareUnicodeStrings( p, dirlen, info->lpAssemblyDirectoryName, dirlen, TRUE ) ||
             wcsicmp( p + dirlen, L".manifest" ))
         {
-            /* manifest name does not match directory name, so it's not a global
-             * windows/winsxs manifest; use the manifest directory name instead */
+            /* App-local private assembly files are resolved relative to their
+             * manifest directory. Global WinSxS manifests use windows\winsxs
+             * assembly directories instead. */
             dirlen = p - info->lpAssemblyManifestPath;
             needed = (dirlen + 1) * sizeof(WCHAR) + nameW.Length;
             if (!(*fullname = p = RtlAllocateHeap( GetProcessHeap(), 0, needed )))
