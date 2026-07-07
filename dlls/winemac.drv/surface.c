@@ -192,6 +192,22 @@ static HWND find_full_root_chromium_placeholder(HWND hwnd, HWND root)
     return NULL;
 }
 
+static BOOL chromium_root_has_smaller_hosted_layer(HWND root)
+{
+    struct macdrv_win_data *data;
+    BOOL ret = FALSE;
+
+    if (!root) return FALSE;
+
+    if ((data = get_win_data(root)))
+    {
+        ret = !!data->chromium_smaller_layer_hosted_once;
+        release_win_data(data);
+    }
+
+    return ret;
+}
+
 static BOOL should_suppress_chromium_placeholder_surface(struct macdrv_window_surface *surface)
 {
     HWND root;
@@ -199,6 +215,7 @@ static BOOL should_suppress_chromium_placeholder_surface(struct macdrv_window_su
     if (!surface->child && !surface->remote_child && !surface->foreign_child) return FALSE;
     if (!is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
     root = NtUserGetAncestor(surface->header.hwnd, GA_ROOT);
+    if (!chromium_root_has_smaller_hosted_layer(root)) return FALSE;
     return !!find_full_root_chromium_placeholder(surface->header.hwnd, root);
 }
 
@@ -429,7 +446,8 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     }
 
     if (surface->image_layer && solid_kind != SOLID_SURFACE_NONE &&
-        is_chromium_cef_child_window(surface->header.hwnd))
+        is_chromium_cef_child_window(surface->header.hwnd) &&
+        chromium_root_has_smaller_hosted_layer(NtUserGetAncestor(surface->header.hwnd, GA_ROOT)))
     {
         if (surface->chromium_child_had_real_image)
             TRACE("Switchyard holding last Chromium/CEF image-layer frame over solid placeholder hwnd %p\n",
