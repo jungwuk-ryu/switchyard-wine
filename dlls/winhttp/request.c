@@ -369,13 +369,27 @@ struct gzip_stream
     z_stream zstream;
     struct read_buffer buf;
     BOOL end_of_data;
+    BOOL parent_drained;
 };
+
+static DWORD gzip_drain_parent( struct gzip_stream *gzip_stream, struct request *request )
+{
+    DWORD ret;
+
+    if (gzip_stream->parent_drained) return ERROR_SUCCESS;
+
+    ret = gzip_stream->parent->vtbl->drain_data( gzip_stream->parent, request );
+    if (ret) WARN( "failed to drain parent stream: %lu\n", ret );
+    else gzip_stream->parent_drained = TRUE;
+    return ret;
+}
 
 static BOOL gzip_end_of_data( struct data_stream *stream, struct request *request )
 {
     struct gzip_stream *gzip_stream = (struct gzip_stream *)stream;
-    return gzip_stream->end_of_data ||
-           (!gzip_stream->buf.size && gzip_stream->parent->vtbl->end_of_data( gzip_stream->parent, request ));
+    if (gzip_stream->end_of_data) return !gzip_drain_parent( gzip_stream, request );
+    return !gzip_stream->buf.size &&
+           gzip_stream->parent->vtbl->end_of_data( gzip_stream->parent, request );
 }
 
 static DWORD gzip_fill_buffer( struct data_stream *stream, struct request *request, struct read_buffer *buf )
@@ -385,7 +399,8 @@ static DWORD gzip_fill_buffer( struct data_stream *stream, struct request *reque
     DWORD size, to_read, offset = 0, ret = ERROR_SUCCESS;
     int zres;
 
-    if (gzip_end_of_data( stream, request )) return ERROR_SUCCESS;
+    if (gzip_stream->end_of_data) return gzip_drain_parent( gzip_stream, request );
+    if (!gzip_stream->buf.size && gzip_stream->parent->vtbl->end_of_data( gzip_stream->parent, request )) return ERROR_SUCCESS;
 
     if (buf->pos)
     {
@@ -430,6 +445,7 @@ static DWORD gzip_fill_buffer( struct data_stream *stream, struct request *reque
             TRACE( "end of data\n" );
             gzip_stream->end_of_data = TRUE;
             inflateEnd( zstream );
+            break;
         }
         else if (zres != Z_OK)
         {
@@ -445,7 +461,7 @@ static DWORD gzip_fill_buffer( struct data_stream *stream, struct request *reque
 static DWORD gzip_drain_data( struct data_stream *stream, struct request *request )
 {
     struct gzip_stream *gzip_stream = (struct gzip_stream *)stream;
-    return gzip_stream->parent->vtbl->drain_data( gzip_stream->parent, request );
+    return gzip_drain_parent( gzip_stream, request );
 }
 
 static void gzip_destroy( struct data_stream *stream )
