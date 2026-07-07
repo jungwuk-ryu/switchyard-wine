@@ -1448,6 +1448,13 @@ static HRESULT get_iface_info(ITypeInfo *typeinfo, WORD *funcs, WORD *parentfunc
     *parentfuncs = typeattr->cbSizeVft / (syskind == SYS_WIN64 ? 8 : 4) - *funcs;
     ITypeInfo_ReleaseTypeAttr(*real_typeinfo, typeattr);
 
+    /* No parent typeinfo is needed when the interface only inherits IUnknown. */
+    if (*parentfuncs <= 3)
+    {
+        *parentiid = IID_IUnknown;
+        return S_OK;
+    }
+
     hr = ITypeInfo_GetRefTypeOfImplType(*real_typeinfo, 0, &reftype);
     if (FAILED(hr))
         goto err;
