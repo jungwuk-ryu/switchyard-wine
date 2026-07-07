@@ -993,6 +993,8 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
 
         if ((texture->swapchain = wined3d_texture_get_swapchain(wined3d_texture)))
             wined3d_swapchain_incref(texture->swapchain);
+        if (desc->MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE)
+            wined3d_texture_enable_get_dc(wined3d_texture);
     }
     else
     {

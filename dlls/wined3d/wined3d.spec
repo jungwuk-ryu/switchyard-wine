@@ -328,6 +328,7 @@
 @ cdecl wined3d_texture_add_dirty_region(ptr long ptr)
 @ cdecl wined3d_texture_create(ptr ptr long long long ptr ptr ptr ptr)
 @ cdecl wined3d_texture_decref(ptr)
+@ cdecl wined3d_texture_enable_get_dc(ptr)
 @ cdecl wined3d_texture_from_resource(ptr)
 @ cdecl wined3d_texture_get_dc(ptr long ptr)
 @ cdecl wined3d_texture_get_level_count(ptr)

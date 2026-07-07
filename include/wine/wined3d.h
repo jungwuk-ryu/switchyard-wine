@@ -2949,6 +2949,7 @@ HRESULT __cdecl wined3d_texture_create(struct wined3d_device *device, const stru
         UINT layer_count, unsigned int level_count, uint32_t flags, const struct wined3d_sub_resource_data *data,
         void *parent, const struct wined3d_parent_ops *parent_ops, struct wined3d_texture **texture);
 struct wined3d_texture * __cdecl wined3d_texture_from_resource(struct wined3d_resource *resource);
+void __cdecl wined3d_texture_enable_get_dc(struct wined3d_texture *texture);
 ULONG __cdecl wined3d_texture_decref(struct wined3d_texture *texture);
 HRESULT __cdecl wined3d_texture_get_dc(struct wined3d_texture *texture, unsigned int sub_resource_idx, HDC *dc);
 unsigned int __cdecl wined3d_texture_get_level_count(const struct wined3d_texture *texture);

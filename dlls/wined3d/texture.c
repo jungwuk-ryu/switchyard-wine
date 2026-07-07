@@ -732,6 +732,13 @@ ULONG CDECL wined3d_texture_decref(struct wined3d_texture *texture)
     return refcount;
 }
 
+void CDECL wined3d_texture_enable_get_dc(struct wined3d_texture *texture)
+{
+    TRACE("texture %p.\n", texture);
+
+    texture->flags |= WINED3D_TEXTURE_GET_DC;
+}
+
 struct wined3d_resource * CDECL wined3d_texture_get_resource(struct wined3d_texture *texture)
 {
     TRACE("texture %p.\n", texture);
