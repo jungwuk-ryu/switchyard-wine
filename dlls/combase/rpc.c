@@ -412,6 +412,32 @@ static DWORD start_local_service(const WCHAR *name, DWORD num, LPCWSTR *params)
     return r;
 }
 
+static BOOL query_appid_string_value(HKEY hkey, const WCHAR *name, WCHAR **value)
+{
+    DWORD type, size = 0;
+    LONG ret;
+
+    *value = NULL;
+
+    ret = RegQueryValueExW(hkey, name, NULL, &type, NULL, &size);
+    if (ret != ERROR_SUCCESS || type != REG_SZ || !size) return FALSE;
+
+    if (!(*value = calloc(1, size + sizeof(WCHAR)))) return FALSE;
+
+    ret = RegQueryValueExW(hkey, name, NULL, &type, (BYTE *)*value, &size);
+    if (ret == ERROR_SUCCESS && type == REG_SZ) return TRUE;
+
+    free(*value);
+    *value = NULL;
+    return FALSE;
+}
+
+static BOOL query_appid_service_parameters(HKEY hkey, WCHAR **value)
+{
+    return query_appid_string_value(hkey, L"ServiceParameters", value)
+            || query_appid_string_value(hkey, L"ServiceParams", value);
+}
+
 /*
  * create_local_service()  - start a COM server in a service
  *
@@ -424,10 +450,10 @@ static DWORD start_local_service(const WCHAR *name, DWORD num, LPCWSTR *params)
 static HRESULT create_local_service(REFCLSID rclsid)
 {
     HRESULT hr;
-    WCHAR buf[CHARS_IN_GUID];
     HKEY hkey;
     LONG r;
-    DWORD type, sz;
+    WCHAR *service_name = NULL;
+    WCHAR *service_args = NULL;
 
     TRACE("Attempting to start Local service for %s\n", debugstr_guid(rclsid));
 
@@ -436,32 +462,24 @@ static HRESULT create_local_service(REFCLSID rclsid)
         return hr;
 
     /* read the LocalService and ServiceParameters values from the AppID key */
-    sz = sizeof buf;
-    r = RegQueryValueExW(hkey, L"LocalService", NULL, &type, (LPBYTE)buf, &sz);
-    if (r == ERROR_SUCCESS && type == REG_SZ)
+    if (query_appid_string_value(hkey, L"LocalService", &service_name))
     {
         DWORD num_args = 0;
         LPWSTR args[1] = { NULL };
 
         /*
          * FIXME: I'm not really sure how to deal with the service parameters.
-         *        I suspect that the string returned from RegQueryValueExW
-         *        should be split into a number of arguments by spaces.
-         *        It would make more sense if ServiceParams contained a
-         *        REG_MULTI_SZ here, but it's a REG_SZ for the services
-         *        that I'm interested in for the moment.
+         *        The documented ServiceParameters value is a REG_SZ passed as
+         *        a single argument during COM LocalService activation.
          */
-        r = RegQueryValueExW(hkey, L"ServiceParams", NULL, &type, NULL, &sz);
-        if (r == ERROR_SUCCESS && type == REG_SZ && sz)
+        if (query_appid_service_parameters(hkey, &service_args) && service_args[0])
         {
-            args[0] = calloc(1, sz);
+            args[0] = service_args;
             num_args++;
-            RegQueryValueExW(hkey, L"ServiceParams", NULL, &type, (LPBYTE)args[0], &sz);
         }
-        r = start_local_service(buf, num_args, (LPCWSTR *)args);
+        r = start_local_service(service_name, num_args, (LPCWSTR *)args);
         if (r != ERROR_SUCCESS)
             hr = REGDB_E_CLASSNOTREG; /* FIXME: check retval */
-        free(args[0]);
     }
     else
     {
@@ -470,6 +488,8 @@ static HRESULT create_local_service(REFCLSID rclsid)
     }
     RegCloseKey(hkey);
 
+    free(service_args);
+    free(service_name);
     return hr;
 }
 
