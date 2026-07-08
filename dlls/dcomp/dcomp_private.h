@@ -20,6 +20,7 @@
 
 #include "dcomp.h"
 #include "dcomp_private_iface.h"
+#include "wingdi.h"
 #include "d2d1_1.h"
 #include <d3d11.h>
 #include "wine/list.h"
@@ -58,6 +59,21 @@ struct composition_surface
     UINT height;
     DXGI_FORMAT pixel_format;
     DXGI_ALPHA_MODE alpha_mode;
+    LONG ref;
+};
+
+struct composition_dynamic_texture
+{
+    IDCompositionDynamicTexture IDCompositionDynamicTexture_iface;
+    IDCompositionTexture *texture;
+    RECT damage_rect;
+    BOOL has_damage_rect;
+    HDC cache_dc;
+    HBITMAP cache_bitmap;
+    HGDIOBJ old_cache_bitmap;
+    UINT cache_width;
+    UINT cache_height;
+    BOOL cache_valid;
     LONG ref;
 };
 
@@ -119,6 +135,11 @@ static inline struct composition_surface *impl_from_IDCompositionSurface(IDCompo
     return CONTAINING_RECORD(iface, struct composition_surface, IDCompositionSurfaceUnknown_iface);
 }
 
+static inline struct composition_dynamic_texture *impl_from_IDCompositionDynamicTexture(IDCompositionDynamicTexture *iface)
+{
+    return CONTAINING_RECORD(iface, struct composition_dynamic_texture, IDCompositionDynamicTexture_iface);
+}
+
 static inline struct composition_surface_factory *impl_from_IDCompositionSurfaceFactory(IDCompositionSurfaceFactory *iface)
 {
     return CONTAINING_RECORD(iface, struct composition_surface_factory, IDCompositionSurfaceFactory_iface);
@@ -146,6 +167,9 @@ void dcomp_unlock(void);
 HRESULT create_surface(struct composition_surface_factory *factory, UINT width, UINT height,
         DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode, IDCompositionSurface **dcomp_surface);
 HRESULT create_surface_factory(struct composition_device *device, IUnknown *rendering_device, IDCompositionSurfaceFactory **factory);
+HRESULT create_dynamic_texture(IDCompositionDynamicTexture **texture);
+HRESULT dcomp_dynamic_texture_get_dxgi_surface(IDCompositionDynamicTexture *texture,
+        IDXGISurface **surface, DXGI_ALPHA_MODE *alpha_mode);
 HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost, IDCompositionTarget **target);
 HRESULT create_target_from_shared_visual_handle(struct composition_device *device, HANDLE shared_visual_handle, void **new_target);
 HRESULT create_visual(int version, REFIID iid, void **visual);

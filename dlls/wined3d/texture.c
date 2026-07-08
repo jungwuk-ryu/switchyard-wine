@@ -1890,6 +1890,7 @@ HRESULT CDECL wined3d_texture_get_dc(struct wined3d_texture *texture, unsigned i
 {
     struct wined3d_device *device = texture->resource.device;
     struct wined3d_texture_sub_resource *sub_resource;
+    struct wined3d_context *context;
     struct wined3d_dc_info *dc_info;
 
     TRACE("texture %p, sub_resource_idx %u, dc %p.\n", texture, sub_resource_idx, dc);
@@ -1922,6 +1923,23 @@ HRESULT CDECL wined3d_texture_get_dc(struct wined3d_texture *texture, unsigned i
         if (!(dc_info = texture->dc_info) || !dc_info[sub_resource_idx].dc)
             return WINED3DERR_INVALIDCALL;
     }
+
+    if (!(sub_resource->locations & texture->resource.map_binding))
+    {
+        context = context_acquire(device, NULL, 0);
+        if (!wined3d_texture_load_location(texture, sub_resource_idx, context, texture->resource.map_binding))
+        {
+            ERR("Failed to load texture into map binding %s.\n",
+                    wined3d_debug_location(texture->resource.map_binding));
+            context_release(context);
+            return WINED3DERR_INVALIDCALL;
+        }
+        context_release(context);
+    }
+
+    if (texture->dirty_regions)
+        wined3d_texture_dirty_region_add(texture, sub_resource_idx / texture->level_count, NULL);
+    wined3d_texture_invalidate_location(texture, sub_resource_idx, ~texture->resource.map_binding);
 
     if (!(texture->flags & WINED3D_TEXTURE_GET_DC_LENIENT))
         texture->flags |= WINED3D_TEXTURE_DC_IN_USE;

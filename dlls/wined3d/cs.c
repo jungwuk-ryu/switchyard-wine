@@ -719,7 +719,8 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
 
     /* Discard buffers if the swap effect allows it. */
     back_buffer = swapchain->back_buffers[desc->backbuffer_count - 1];
-    if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
+    /* The software DComp compositor may read the last presented flip buffer. */
+    if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD)
         wined3d_texture_validate_location(back_buffer, 0, WINED3D_LOCATION_DISCARDED);
 
     if (dsv && dsv->resource->type != WINED3D_RTYPE_BUFFER)

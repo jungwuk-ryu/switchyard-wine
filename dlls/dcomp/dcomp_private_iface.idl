@@ -50,7 +50,7 @@ interface IDCompositionDeviceUnknown : IDCompositionDesktopDevicePartner
     HRESULT Unknown7();
     HRESULT Unknown8();
     HRESULT Unknown9();
-    HRESULT Unknown10();
+    HRESULT Unknown10([out] IDCompositionDynamicTexture **texture);
     HRESULT Unknown11();
     HRESULT Unknown12();
     HRESULT Unknown13();

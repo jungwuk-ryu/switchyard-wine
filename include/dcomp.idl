@@ -691,6 +691,33 @@ interface IDCompositionDevice3 : IDCompositionDevice2
 
 [
     object,
+    uuid(929bb1aa-725f-433b-abd7-273075a835f2),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionTexture : IUnknown
+{
+    HRESULT SetSourceRect([in, optional] const D2D_RECT_U *source_rect);
+    HRESULT SetColorSpace([in] DXGI_COLOR_SPACE_TYPE color_space);
+    HRESULT SetAlphaMode([in] DXGI_ALPHA_MODE alpha_mode);
+    HRESULT GetAvailableFence([out] UINT64 *fence_value, [in] REFIID iid, [out] void **available_fence);
+}
+
+[
+    object,
+    uuid(a1de1d3f-6405-447f-8e95-1383a34b0277),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionDynamicTexture : IUnknown
+{
+    HRESULT SetTexture([in, optional] IDCompositionTexture *texture,
+            [in, optional, size_is(rect_count)] const RECT *rects, [in] SIZE_T rect_count);
+    HRESULT SetTexture2([in, optional] IDCompositionTexture *texture);
+}
+
+[
+    object,
     uuid(5f4633fe-1e08-4cb8-8c75-ce24333f5602),
     local,
     pointer_default(unique)

@@ -31,6 +31,7 @@
 #include "winnls.h"
 
 #include "dxgi1_6.h"
+#include "dcomp.h"
 #include "d3d10_1.h"
 #include "d3d12.h"
 #ifdef DXGI_INIT_GUID
@@ -174,9 +175,11 @@ struct d3d11_swapchain
 {
     IDXGISwapChain4 IDXGISwapChain4_iface;
     IWineDXGISwapChain IWineDXGISwapChain_iface;
+    IDCompositionTexture IDCompositionTexture_iface;
     LONG refcount;
     struct wined3d_private_store private_store;
     struct wined3d_swapchain *wined3d_swapchain;
+    struct wined3d_device *wined3d_device;
     IDXGISurface *front_buffer_surface;
     struct wined3d_swapchain_state_parent state_parent;
     IWineDXGIDevice *device;

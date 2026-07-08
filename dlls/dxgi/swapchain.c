@@ -27,6 +27,9 @@
 WINE_DEFAULT_DEBUG_CHANNEL(dxgi);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
+const IID IID_IDCompositionTexture =
+    {0x929bb1aa, 0x725f, 0x433b, {0xab, 0xd7, 0x27, 0x30, 0x75, 0xa8, 0x35, 0xf2}};
+
 static DXGI_SWAP_EFFECT dxgi_swap_effect_from_wined3d(enum wined3d_swap_effect swap_effect)
 {
     switch (swap_effect)
@@ -190,10 +193,17 @@ static inline struct d3d11_swapchain *d3d11_swapchain_from_IWineDXGISwapChain(IW
     return CONTAINING_RECORD(iface, struct d3d11_swapchain, IWineDXGISwapChain_iface);
 }
 
+static inline struct d3d11_swapchain *d3d11_swapchain_from_IDCompositionTexture(IDCompositionTexture *iface)
+{
+    return CONTAINING_RECORD(iface, struct d3d11_swapchain, IDCompositionTexture_iface);
+}
+
 /* IUnknown methods */
 
 static HRESULT STDMETHODCALLTYPE d3d11_swapchain_QueryInterface(IDXGISwapChain4 *iface, REFIID riid, void **object)
 {
+    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
+
     TRACE("iface %p, riid %s, object %p\n", iface, debugstr_guid(riid), object);
 
     if (IsEqualGUID(riid, &IID_IUnknown)
@@ -211,10 +221,14 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_QueryInterface(IDXGISwapChain4 
     }
     if (IsEqualGUID(riid, &IID_IWineDXGISwapChain))
     {
-        struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
-
         IUnknown_AddRef(iface);
         *object = &swapchain->IWineDXGISwapChain_iface;
+        return S_OK;
+    }
+    if (IsEqualGUID(riid, &IID_IDCompositionTexture))
+    {
+        IUnknown_AddRef(iface);
+        *object = &swapchain->IDCompositionTexture_iface;
         return S_OK;
     }
 
@@ -223,6 +237,93 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_QueryInterface(IDXGISwapChain4 
     *object = NULL;
     return E_NOINTERFACE;
 }
+
+static HRESULT STDMETHODCALLTYPE d3d11_swapchain_texture_QueryInterface(IDCompositionTexture *iface,
+        REFIID riid, void **object)
+{
+    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDCompositionTexture(iface);
+
+    TRACE("iface %p, riid %s, object %p.\n", iface, debugstr_guid(riid), object);
+
+    if (!object)
+        return E_INVALIDARG;
+
+    if (IsEqualGUID(riid, &IID_IDCompositionTexture))
+    {
+        IDXGISwapChain4_AddRef(&swapchain->IDXGISwapChain4_iface);
+        *object = iface;
+        return S_OK;
+    }
+
+    return IDXGISwapChain4_QueryInterface(&swapchain->IDXGISwapChain4_iface, riid, object);
+}
+
+static ULONG STDMETHODCALLTYPE d3d11_swapchain_texture_AddRef(IDCompositionTexture *iface)
+{
+    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDCompositionTexture(iface);
+
+    return IDXGISwapChain4_AddRef(&swapchain->IDXGISwapChain4_iface);
+}
+
+static ULONG STDMETHODCALLTYPE d3d11_swapchain_texture_Release(IDCompositionTexture *iface)
+{
+    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDCompositionTexture(iface);
+
+    return IDXGISwapChain4_Release(&swapchain->IDXGISwapChain4_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_swapchain_texture_SetSourceRect(IDCompositionTexture *iface,
+        const D2D_RECT_U *source_rect)
+{
+    TRACE("iface %p, source_rect %p.\n", iface, source_rect);
+
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_swapchain_texture_SetColorSpace(IDCompositionTexture *iface,
+        DXGI_COLOR_SPACE_TYPE color_space)
+{
+    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDCompositionTexture(iface);
+
+    TRACE("iface %p, color_space %#x.\n", iface, color_space);
+
+    return IDXGISwapChain4_SetColorSpace1(&swapchain->IDXGISwapChain4_iface, color_space);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_swapchain_texture_SetAlphaMode(IDCompositionTexture *iface,
+        DXGI_ALPHA_MODE alpha_mode)
+{
+    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDCompositionTexture(iface);
+
+    TRACE("iface %p, alpha_mode %#x.\n", iface, alpha_mode);
+
+    swapchain->alpha_mode = alpha_mode;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d11_swapchain_texture_GetAvailableFence(IDCompositionTexture *iface,
+        UINT64 *fence_value, REFIID iid, void **available_fence)
+{
+    FIXME("iface %p, fence_value %p, iid %s, available_fence %p stub!\n",
+            iface, fence_value, debugstr_guid(iid), available_fence);
+
+    if (fence_value)
+        *fence_value = 0;
+    if (available_fence)
+        *available_fence = NULL;
+    return E_NOTIMPL;
+}
+
+static const struct IDCompositionTextureVtbl d3d11_swapchain_texture_vtbl =
+{
+    d3d11_swapchain_texture_QueryInterface,
+    d3d11_swapchain_texture_AddRef,
+    d3d11_swapchain_texture_Release,
+    d3d11_swapchain_texture_SetSourceRect,
+    d3d11_swapchain_texture_SetColorSpace,
+    d3d11_swapchain_texture_SetAlphaMode,
+    d3d11_swapchain_texture_GetAvailableFence,
+};
 
 static ULONG STDMETHODCALLTYPE d3d11_swapchain_AddRef(IDXGISwapChain4 *iface)
 {
@@ -342,6 +443,88 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
             present_rect, present_rect, NULL, sync_interval, 0)))
         InterlockedIncrement(&swapchain->present_count);
     return hr;
+}
+
+static void d3d11_swapchain_preserve_dirty_present(struct d3d11_swapchain *swapchain,
+        const DXGI_PRESENT_PARAMETERS *present_parameters)
+{
+    struct wined3d_texture *front_buffer, *back_buffer;
+    struct wined3d_swapchain_desc swapchain_desc;
+    struct wined3d_sub_resource_desc desc;
+    struct wined3d_device_context *context;
+    LONG band_top, band_bottom, x, next_left;
+    RECT bounds, dirty, rect;
+    BOOL extended;
+    UINT i;
+    HRESULT hr;
+
+    wined3d_mutex_lock();
+    wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &swapchain_desc);
+    if (swapchain_desc.swap_effect != WINED3D_SWAP_EFFECT_FLIP_DISCARD
+            && swapchain_desc.swap_effect != WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL)
+    {
+        wined3d_mutex_unlock();
+        return;
+    }
+
+    front_buffer = wined3d_swapchain_get_front_buffer(swapchain->wined3d_swapchain);
+    back_buffer = wined3d_swapchain_get_back_buffer(swapchain->wined3d_swapchain, 0);
+    if (!front_buffer || !back_buffer || FAILED(wined3d_texture_get_sub_resource_desc(back_buffer, 0, &desc)))
+    {
+        wined3d_mutex_unlock();
+        return;
+    }
+
+    SetRect(&bounds, 0, 0, desc.width, desc.height);
+    context = wined3d_device_get_immediate_context(swapchain->wined3d_device);
+
+    for (band_top = bounds.top; band_top < bounds.bottom; band_top = band_bottom)
+    {
+        band_bottom = bounds.bottom;
+        for (i = 0; i < present_parameters->DirtyRectsCount; ++i)
+        {
+            if (!IntersectRect(&dirty, &present_parameters->pDirtyRects[i], &bounds))
+                continue;
+            if (dirty.top > band_top && dirty.top < band_bottom)
+                band_bottom = dirty.top;
+            if (dirty.bottom > band_top && dirty.bottom < band_bottom)
+                band_bottom = dirty.bottom;
+        }
+
+        x = bounds.left;
+        while (x < bounds.right)
+        {
+            extended = FALSE;
+            next_left = bounds.right;
+            for (i = 0; i < present_parameters->DirtyRectsCount; ++i)
+            {
+                if (!IntersectRect(&dirty, &present_parameters->pDirtyRects[i], &bounds)
+                        || dirty.top >= band_bottom || dirty.bottom <= band_top || dirty.right <= x)
+                    continue;
+
+                if (dirty.left <= x)
+                {
+                    x = dirty.right;
+                    extended = TRUE;
+                }
+                else if (dirty.left < next_left)
+                {
+                    next_left = dirty.left;
+                }
+            }
+
+            if (extended)
+                continue;
+
+            SetRect(&rect, x, band_top, next_left, band_bottom);
+            if (FAILED(hr = wined3d_device_context_blt(context, back_buffer, 0, &rect,
+                    front_buffer, 0, &rect, 0, NULL, WINED3D_TEXF_POINT)))
+                WARN("Failed to preserve dirty-present region %s, hr %#lx.\n",
+                        wine_dbgstr_rect(&rect), hr);
+            x = next_left;
+        }
+    }
+    wined3d_mutex_unlock();
 }
 
 static HRESULT STDMETHODCALLTYPE DECLSPEC_HOTPATCH d3d11_swapchain_Present(IDXGISwapChain4 *iface, UINT sync_interval, UINT flags)
@@ -748,6 +931,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_Present1(IDXGISwapChain4 *iface
                     wine_dbgstr_rect(present_parameters->pScrollRect), present_parameters->pScrollOffset);
 
         TRACE("Using dirty rect union %s.\n", wine_dbgstr_rect(&dirty_rect));
+        d3d11_swapchain_preserve_dirty_present(swapchain, present_parameters);
         return d3d11_swapchain_present(swapchain, sync_interval, flags, &dirty_rect);
     }
     else if (present_parameters && (present_parameters->pScrollRect || present_parameters->pScrollOffset))
@@ -1023,6 +1207,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_internal_get_front_buffer(IWine
         return E_INVALIDARG;
 
     *surface = NULL;
+    wined3d_swapchain_wait_present(swapchain->wined3d_swapchain);
     if (!swapchain->front_buffer_surface)
         return DXGI_ERROR_INVALID_CALL;
 
@@ -1091,8 +1276,7 @@ static HRESULT d3d11_swapchain_create_d3d11_textures(struct d3d11_swapchain *swa
         return E_FAIL;
     }
 
-    if (desc->flags & WINED3D_SWAPCHAIN_GDI_COMPATIBLE)
-        texture_flags |= WINED3D_TEXTURE_CREATE_GET_DC;
+    texture_flags |= WINED3D_TEXTURE_CREATE_GET_DC;
 
     if (FAILED(hr = IWineDXGIDeviceParent_register_swapchain_texture(dxgi_device_parent,
             wined3d_swapchain_get_front_buffer(swapchain->wined3d_swapchain),
@@ -1137,9 +1321,11 @@ HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_devi
         return hr;
     }
     IWineDXGIDevice_AddRef(swapchain->device = &device->IWineDXGIDevice_iface);
+    swapchain->wined3d_device = device->wined3d_device;
 
     swapchain->IDXGISwapChain4_iface.lpVtbl = &d3d11_swapchain_vtbl;
     swapchain->IWineDXGISwapChain_iface.lpVtbl = &d3d11_swapchain_internal_vtbl;
+    swapchain->IDCompositionTexture_iface.lpVtbl = &d3d11_swapchain_texture_vtbl;
     swapchain->state_parent.ops = &d3d11_swapchain_state_parent_ops;
     swapchain->refcount = 1;
     swapchain->alpha_mode = dxgi_desc->AlphaMode == DXGI_ALPHA_MODE_UNSPECIFIED

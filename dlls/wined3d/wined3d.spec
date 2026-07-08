@@ -315,6 +315,7 @@
 @ cdecl wined3d_swapchain_set_max_frame_latency(ptr long)
 @ cdecl wined3d_swapchain_set_palette(ptr ptr)
 @ cdecl wined3d_swapchain_set_window(ptr ptr)
+@ cdecl wined3d_swapchain_wait_present(ptr)
 
 @ cdecl wined3d_swapchain_state_create(ptr ptr ptr ptr ptr)
 @ cdecl wined3d_swapchain_state_destroy(ptr)

@@ -43,6 +43,9 @@ struct wined3d_texture;
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
+static const GUID IID_IDCompositionDevice5 =
+    {0x2c6bebfe, 0xa603, 0x472f, {0xaf, 0x34, 0xd2, 0x44, 0x33, 0x56, 0xe6, 0x1b}};
+
 static CRITICAL_SECTION dcomp_cs;
 static CRITICAL_SECTION_DEBUG dcomp_debug =
 {
@@ -62,6 +65,310 @@ void dcomp_unlock(void)
     LeaveCriticalSection(&dcomp_cs);
 }
 
+static HRESULT visual_ensure_interop_from_surface(struct composition_visual *visual,
+        IDXGISurface *surface)
+{
+    ID2D1GdiInteropRenderTarget *interop;
+    ID2D1DeviceContext *device_context;
+    IDXGIDevice *dxgi_device;
+    ID2D1Device *d2d_device;
+    HRESULT hr;
+
+    if (visual->device_context && visual->interop)
+        return S_OK;
+
+    hr = IDXGISurface_GetDevice(surface, &IID_IDXGIDevice, (void **)&dxgi_device);
+    if (FAILED(hr))
+    {
+        ERR("Failed to get the dxgi surface device, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    hr = D2D1CreateDevice(dxgi_device, NULL, &d2d_device);
+    IDXGIDevice_Release(dxgi_device);
+    if (FAILED(hr))
+    {
+        ERR("Failed to create a D2D device, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    hr = ID2D1Device_CreateDeviceContext(d2d_device, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+            &device_context);
+    ID2D1Device_Release(d2d_device);
+    if (FAILED(hr))
+    {
+        ERR("Failed to create a D2D device context, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    hr = ID2D1DeviceContext_QueryInterface(device_context,
+            &IID_ID2D1GdiInteropRenderTarget, (void **)&interop);
+    if (FAILED(hr))
+    {
+        ERR("Failed to get a ID2D1GdiInteropRenderTarget, hr %#lx.\n", hr);
+        ID2D1DeviceContext_Release(device_context);
+        return hr;
+    }
+
+    if (visual->interop)
+    {
+        ID2D1GdiInteropRenderTarget_Release(visual->interop);
+        visual->interop = NULL;
+    }
+    if (visual->device_context)
+    {
+        ID2D1DeviceContext_Release(visual->device_context);
+        visual->device_context = NULL;
+    }
+
+    visual->device_context = device_context;
+    visual->interop = interop;
+    return S_OK;
+}
+
+static void dynamic_texture_destroy_cache(struct composition_dynamic_texture *texture)
+{
+    if (texture->cache_dc)
+    {
+        SelectObject(texture->cache_dc, texture->old_cache_bitmap);
+        DeleteDC(texture->cache_dc);
+        texture->cache_dc = NULL;
+        texture->old_cache_bitmap = NULL;
+    }
+    if (texture->cache_bitmap)
+    {
+        DeleteObject(texture->cache_bitmap);
+        texture->cache_bitmap = NULL;
+    }
+    texture->cache_width = 0;
+    texture->cache_height = 0;
+    texture->cache_valid = FALSE;
+}
+
+static HRESULT STDMETHODCALLTYPE dynamic_texture_QueryInterface(IDCompositionDynamicTexture *iface,
+        REFIID iid, void **out)
+{
+    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (!out)
+        return E_INVALIDARG;
+
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IDCompositionDynamicTexture))
+    {
+        IDCompositionDynamicTexture_AddRef(iface);
+        *out = iface;
+        return S_OK;
+    }
+
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE dynamic_texture_AddRef(IDCompositionDynamicTexture *iface)
+{
+    struct composition_dynamic_texture *texture = impl_from_IDCompositionDynamicTexture(iface);
+    ULONG ref = InterlockedIncrement(&texture->ref);
+
+    TRACE("iface %p, ref %lu.\n", iface, ref);
+    return ref;
+}
+
+static ULONG STDMETHODCALLTYPE dynamic_texture_Release(IDCompositionDynamicTexture *iface)
+{
+    struct composition_dynamic_texture *texture = impl_from_IDCompositionDynamicTexture(iface);
+    ULONG ref = InterlockedDecrement(&texture->ref);
+
+    TRACE("iface %p, ref %lu.\n", iface, ref);
+
+    if (!ref)
+    {
+        dynamic_texture_destroy_cache(texture);
+        if (texture->texture)
+            IDCompositionTexture_Release(texture->texture);
+        free(texture);
+    }
+
+    return ref;
+}
+
+static HRESULT STDMETHODCALLTYPE dynamic_texture_SetTexture(IDCompositionDynamicTexture *iface,
+        IDCompositionTexture *dcomp_texture, const RECT *rects, SIZE_T rect_count)
+{
+    struct composition_dynamic_texture *texture = impl_from_IDCompositionDynamicTexture(iface);
+    SIZE_T i;
+
+    TRACE("iface %p, texture %p, rects %p, rect_count %Iu.\n", iface, dcomp_texture, rects, rect_count);
+
+    dcomp_lock();
+    if (texture->texture != dcomp_texture)
+        texture->cache_valid = FALSE;
+
+    if (texture->texture)
+        IDCompositionTexture_Release(texture->texture);
+    texture->texture = dcomp_texture;
+    if (texture->texture)
+        IDCompositionTexture_AddRef(texture->texture);
+
+    texture->has_damage_rect = rects && rect_count;
+    if (texture->has_damage_rect)
+    {
+        texture->damage_rect = rects[0];
+        for (i = 1; i < rect_count; ++i)
+            UnionRect(&texture->damage_rect, &texture->damage_rect, &rects[i]);
+        TRACE("Damage rect %s.\n", wine_dbgstr_rect(&texture->damage_rect));
+    }
+    dcomp_unlock();
+
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dynamic_texture_SetTexture2(IDCompositionDynamicTexture *iface,
+        IDCompositionTexture *texture)
+{
+    TRACE("iface %p, texture %p.\n", iface, texture);
+
+    return IDCompositionDynamicTexture_SetTexture(iface, texture, NULL, 0);
+}
+
+static const struct IDCompositionDynamicTextureVtbl dynamic_texture_vtbl =
+{
+    dynamic_texture_QueryInterface,
+    dynamic_texture_AddRef,
+    dynamic_texture_Release,
+    dynamic_texture_SetTexture,
+    dynamic_texture_SetTexture2,
+};
+
+HRESULT create_dynamic_texture(IDCompositionDynamicTexture **out)
+{
+    struct composition_dynamic_texture *texture;
+
+    TRACE("out %p.\n", out);
+
+    if (!out)
+        return E_INVALIDARG;
+
+    if (!(texture = calloc(1, sizeof(*texture))))
+        return E_OUTOFMEMORY;
+
+    texture->IDCompositionDynamicTexture_iface.lpVtbl = &dynamic_texture_vtbl;
+    texture->ref = 1;
+    *out = &texture->IDCompositionDynamicTexture_iface;
+    return S_OK;
+}
+
+HRESULT dcomp_dynamic_texture_get_dxgi_surface(IDCompositionDynamicTexture *iface,
+        IDXGISurface **surface, DXGI_ALPHA_MODE *alpha_mode)
+{
+    struct composition_dynamic_texture *texture = impl_from_IDCompositionDynamicTexture(iface);
+    IDCompositionTexture *dcomp_texture;
+    IWineDXGISwapChain *wine_swapchain;
+    IDXGISwapChain1 *swapchain;
+    HRESULT hr;
+
+    TRACE("iface %p, surface %p, alpha_mode %p.\n", iface, surface, alpha_mode);
+
+    if (!surface)
+        return E_INVALIDARG;
+
+    *surface = NULL;
+    if (alpha_mode)
+        *alpha_mode = DXGI_ALPHA_MODE_IGNORE;
+
+    dcomp_lock();
+    if (!texture->texture)
+    {
+        dcomp_unlock();
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    dcomp_texture = texture->texture;
+    IDCompositionTexture_AddRef(dcomp_texture);
+    dcomp_unlock();
+
+    if (alpha_mode && SUCCEEDED(IDCompositionTexture_QueryInterface(dcomp_texture,
+            &IID_IDXGISwapChain1, (void **)&swapchain)))
+    {
+        DXGI_SWAP_CHAIN_DESC1 desc;
+
+        if (SUCCEEDED(IDXGISwapChain1_GetDesc1(swapchain, &desc)))
+            *alpha_mode = desc.AlphaMode;
+        IDXGISwapChain1_Release(swapchain);
+    }
+
+    if (SUCCEEDED(hr = IDCompositionTexture_QueryInterface(dcomp_texture,
+            &IID_IWineDXGISwapChain, (void **)&wine_swapchain)))
+    {
+        hr = IWineDXGISwapChain_get_front_buffer(wine_swapchain, &IID_IDXGISurface, (void **)surface);
+        IWineDXGISwapChain_Release(wine_swapchain);
+    }
+    else
+    {
+        hr = IDCompositionTexture_QueryInterface(dcomp_texture, &IID_IDXGISurface, (void **)surface);
+    }
+
+    IDCompositionTexture_Release(dcomp_texture);
+    return hr;
+}
+
+static HRESULT dynamic_texture_update_cache(struct composition_dynamic_texture *texture,
+        HDC src_dc, UINT width, UINT height, HDC *cache_dc)
+{
+    RECT bounds = {0, 0, width, height}, update_rect = bounds;
+    BITMAPINFO bitmap_info = {{0}};
+
+    if (!texture->cache_dc || texture->cache_width != width || texture->cache_height != height)
+    {
+        dynamic_texture_destroy_cache(texture);
+
+        bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+        bitmap_info.bmiHeader.biWidth = width;
+        bitmap_info.bmiHeader.biHeight = -(LONG)height;
+        bitmap_info.bmiHeader.biPlanes = 1;
+        bitmap_info.bmiHeader.biBitCount = 32;
+        bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+        if (!(texture->cache_dc = CreateCompatibleDC(src_dc)))
+            return HRESULT_FROM_WIN32(GetLastError());
+
+        if (!(texture->cache_bitmap = CreateDIBSection(src_dc, &bitmap_info, DIB_RGB_COLORS,
+                NULL, NULL, 0)))
+        {
+            DWORD error = GetLastError();
+            dynamic_texture_destroy_cache(texture);
+            return HRESULT_FROM_WIN32(error);
+        }
+
+        texture->old_cache_bitmap = SelectObject(texture->cache_dc, texture->cache_bitmap);
+        texture->cache_width = width;
+        texture->cache_height = height;
+    }
+
+    if (texture->cache_valid && texture->has_damage_rect)
+    {
+        if (!IntersectRect(&update_rect, &texture->damage_rect, &bounds))
+        {
+            *cache_dc = texture->cache_dc;
+            return S_OK;
+        }
+    }
+
+    TRACE("Updating dynamic texture cache %p from rect %s.\n", texture->cache_bitmap,
+            wine_dbgstr_rect(&update_rect));
+
+    if (!BitBlt(texture->cache_dc, update_rect.left, update_rect.top,
+            update_rect.right - update_rect.left, update_rect.bottom - update_rect.top,
+            src_dc, update_rect.left, update_rect.top, SRCCOPY))
+    {
+        DWORD error = GetLastError();
+        WARN("Failed to update dynamic texture cache, error %lu.\n", error);
+        return HRESULT_FROM_WIN32(error);
+    }
+
+    texture->cache_valid = TRUE;
+    *cache_dc = texture->cache_dc;
+    return S_OK;
+}
+
 static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *iface,
         REFIID iid, void **out)
 {
@@ -79,6 +386,7 @@ static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *ifac
     else if ((device->version >= 2
               && (IsEqualGUID(iid, &IID_IDCompositionDevice2)
                   || IsEqualGUID(iid, &IID_IDCompositionDevice3)
+                  || IsEqualGUID(iid, &IID_IDCompositionDevice5)
                   || IsEqualGUID(iid, &IID_IDCompositionDesktopDevice)))
               || IsEqualGUID(iid, &IID_IDCompositionDesktopDevicePartner)
               || IsEqualGUID(iid, &IID_IDCompositionDeviceUnknown))
@@ -87,6 +395,7 @@ static HRESULT STDMETHODCALLTYPE device_QueryInterface(IDCompositionDevice *ifac
         *out = &device->IDCompositionDeviceUnknown_iface;
 
         if (IsEqualGUID(iid, &IID_IDCompositionDesktopDevicePartner)
+            || IsEqualGUID(iid, &IID_IDCompositionDevice5)
             || IsEqualGUID(iid, &IID_IDCompositionDeviceUnknown))
             FIXME("Returning undocumented interface %s %p.\n", wine_dbgstr_guid(iid), *out);
         return S_OK;
@@ -408,11 +717,65 @@ done:
     return hr;
 }
 
+static void dcomp_blit_dc_to_target(const struct composition_target *target,
+                                    const struct composition_visual *visual,
+                                    HDC src_dc, UINT src_width, UINT src_height,
+                                    BLENDFUNCTION blend_func, BOOL force_opaque,
+                                    float offset_x, float offset_y)
+{
+    UINT src_x = 0, src_y = 0, width = src_width, height = src_height;
+    DWORD style = DCX_USESTYLE | DCX_CACHE;
+    HDC dst_dc;
+    int dst_x = offset_x, dst_y = offset_y;
+
+    /* DComp content composes over child HWND hosts; child clipping would exclude Chromium CEF content. */
+    if (visual->has_clip)
+    {
+        int left = max((int)visual->clip_rect.left, 0);
+        int top = max((int)visual->clip_rect.top, 0);
+        int right = min((int)visual->clip_rect.right, (int)src_width);
+        int bottom = min((int)visual->clip_rect.bottom, (int)src_height);
+
+        if (right <= left || bottom <= top)
+            return;
+
+        src_x = left;
+        src_y = top;
+        dst_x += left;
+        dst_y += top;
+        width = right - left;
+        height = bottom - top;
+    }
+
+    dst_dc = GetDCEx(target->hwnd, 0, style);
+    if (!dst_dc)
+    {
+        WARN("Failed to get destination DC, error %lu.\n", GetLastError());
+        return;
+    }
+
+    if (!blend_func.AlphaFormat && blend_func.SourceConstantAlpha == 255)
+    {
+        if (!BitBlt(dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y, SRCCOPY))
+            WARN("BitBlt failed, error %lu.\n", GetLastError());
+    }
+    else if (!GdiAlphaBlend(dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y,
+            width, height, blend_func))
+    {
+        WARN("GdiAlphaBlend failed, error %lu.\n", GetLastError());
+        if (force_opaque && !BitBlt(dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y, SRCCOPY))
+            WARN("Opaque BitBlt fallback failed, error %lu.\n", GetLastError());
+    }
+
+    ReleaseDC(target->hwnd, dst_dc);
+}
+
 static void do_composite_dxgi_surface(const struct composition_target *target,
                                       const struct composition_visual *visual,
                                       IDXGISurface *dxgi_surface,
                                       DXGI_ALPHA_MODE alpha_mode,
                                       BOOL force_opaque,
+                                      IDCompositionDynamicTexture *dynamic_texture,
                                       float offset_x, float offset_y)
 {
     ID3DDeviceContextState *state = NULL, *old_state = NULL;
@@ -422,15 +785,14 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
     D2D1_BITMAP_PROPERTIES1 bitmap_desc;
     ID2D1Bitmap1 *target_bitmap = NULL;
     ID3D11Device1 *d3d11_device = NULL;
+    IDXGISurface1 *dxgi_surface1 = NULL;
     IDXGISurface *bgra_surface = NULL;
     DXGI_SURFACE_DESC surface_desc;
     ID2D1Bitmap *src_bitmap = NULL;
     ID2D1Image *old_target = NULL;
-    HDC dst_dc, src_dc;
+    HDC cache_dc = NULL;
+    HDC src_dc;
     D2D1_SIZE_U size;
-    UINT src_x = 0, src_y = 0, width, height;
-    int dst_x, dst_y;
-    DWORD style;
     BLENDFUNCTION blend_func = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     HRESULT hr;
 
@@ -520,6 +882,30 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
 
     size.width = surface_desc.Width;
     size.height = surface_desc.Height;
+
+    if (dynamic_texture && SUCCEEDED(hr = IDXGISurface_QueryInterface(dxgi_surface,
+            &IID_IDXGISurface1, (void **)&dxgi_surface1)))
+    {
+        struct composition_dynamic_texture *texture = impl_from_IDCompositionDynamicTexture(dynamic_texture);
+
+        if (SUCCEEDED(hr = IDXGISurface1_GetDC(dxgi_surface1, FALSE, &src_dc)))
+        {
+            hr = dynamic_texture_update_cache(texture, src_dc, size.width, size.height, &cache_dc);
+            IDXGISurface1_ReleaseDC(dxgi_surface1, NULL);
+            if (FAILED(hr))
+            {
+                WARN("Failed to update dynamic texture cache from surface DC, hr %#lx.\n", hr);
+                goto done;
+            }
+
+            dcomp_blit_dc_to_target(target, visual, cache_dc, size.width, size.height,
+                    blend_func, force_opaque, offset_x, offset_y);
+            goto done;
+        }
+
+        TRACE("Failed to get direct dynamic texture DC, hr %#lx; falling back to D2D copy.\n", hr);
+    }
+
     bitmap_desc.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
     bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
     bitmap_desc.dpiX = 0;
@@ -560,51 +946,20 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
         goto done;
     }
 
-    /* DComp content composes over child HWND hosts; child clipping would exclude Chromium CEF content. */
-    style = DCX_USESTYLE | DCX_CACHE;
-    dst_x = offset_x;
-    dst_y = offset_y;
-    width = size.width;
-    height = size.height;
-
-    if (visual->has_clip)
+    if (dynamic_texture)
     {
-        int left = max((int)visual->clip_rect.left, 0);
-        int top = max((int)visual->clip_rect.top, 0);
-        int right = min((int)visual->clip_rect.right, (int)size.width);
-        int bottom = min((int)visual->clip_rect.bottom, (int)size.height);
+        struct composition_dynamic_texture *texture = impl_from_IDCompositionDynamicTexture(dynamic_texture);
 
-        if (right <= left || bottom <= top)
+        if (FAILED(hr = dynamic_texture_update_cache(texture, src_dc, size.width, size.height, &cache_dc)))
+        {
+            WARN("Failed to update dynamic texture cache, hr %#lx.\n", hr);
             goto release_dc_target;
-
-        src_x = left;
-        src_y = top;
-        dst_x += left;
-        dst_y += top;
-        width = right - left;
-        height = bottom - top;
+        }
+        src_dc = cache_dc;
     }
 
-    dst_dc = GetDCEx(target->hwnd, 0, style);
-    if (!dst_dc)
-    {
-        WARN("Failed to get destination DC, error %lu.\n", GetLastError());
-        goto release_dc_target;
-    }
-
-    if (!blend_func.AlphaFormat && blend_func.SourceConstantAlpha == 255)
-    {
-        if (!BitBlt(dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y, SRCCOPY))
-            WARN("BitBlt failed, error %lu.\n", GetLastError());
-    }
-    else if (!GdiAlphaBlend(dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y,
-            width, height, blend_func))
-    {
-        WARN("GdiAlphaBlend failed, error %lu.\n", GetLastError());
-        if (force_opaque && !BitBlt(dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y, SRCCOPY))
-            WARN("Opaque BitBlt fallback failed, error %lu.\n", GetLastError());
-    }
-    ReleaseDC(target->hwnd, dst_dc);
+    dcomp_blit_dc_to_target(target, visual, src_dc, size.width, size.height,
+            blend_func, force_opaque, offset_x, offset_y);
 
 release_dc_target:
     ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, NULL);
@@ -613,6 +968,8 @@ release_dc_target:
         ID2D1Image_Release(old_target);
 
 done:
+    if (dxgi_surface1)
+        IDXGISurface1_Release(dxgi_surface1);
     if (bgra_surface)
         IDXGISurface_Release(bgra_surface);
     if (src_bitmap)
@@ -680,6 +1037,7 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
 {
     struct composition_visual *child_visual;
     DXGI_ALPHA_MODE alpha_mode = DXGI_ALPHA_MODE_IGNORE;
+    IDCompositionDynamicTexture *dynamic_texture = NULL;
     IDXGISurface *dxgi_surface;
     HRESULT hr;
 
@@ -766,15 +1124,46 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
                 return E_FAIL;
             }
         }
+        else if (IsEqualGUID(&visual->content_iid, &IID_IDCompositionDynamicTexture))
+        {
+            hr = IUnknown_QueryInterface(visual->content, &IID_IDCompositionDynamicTexture,
+                    (void **)&dynamic_texture);
+            if (FAILED(hr))
+            {
+                FIXME("Failed to query IDCompositionDynamicTexture.\n");
+                return hr;
+            }
+
+            hr = dcomp_dynamic_texture_get_dxgi_surface(dynamic_texture, &dxgi_surface, &alpha_mode);
+            if (FAILED(hr))
+            {
+                IDCompositionDynamicTexture_Release(dynamic_texture);
+                TRACE("Dynamic texture has no current DXGI surface, hr %#lx.\n", hr);
+                return S_OK;
+            }
+        }
         else
         {
             FIXME("content_iid %s is unsupported.\n", wine_dbgstr_guid(&visual->content_iid));
             return E_FAIL;
         }
 
+        if (dynamic_texture && FAILED(hr = visual_ensure_interop_from_surface(visual, dxgi_surface)))
+        {
+            IDCompositionDynamicTexture_Release(dynamic_texture);
+            IDXGISurface_Release(dxgi_surface);
+            return hr;
+        }
+
         do_composite_dxgi_surface(target, visual, dxgi_surface, alpha_mode,
-                IsEqualGUID(&visual->content_iid, &IID_IDXGISwapChain1), offset_x, offset_y);
+                IsEqualGUID(&visual->content_iid, &IID_IDXGISwapChain1) || dynamic_texture,
+                dynamic_texture, offset_x, offset_y);
         IDXGISurface_Release(dxgi_surface);
+        if (dynamic_texture)
+        {
+            IDCompositionDynamicTexture_Release(dynamic_texture);
+            dynamic_texture = NULL;
+        }
     }
 
     LIST_FOR_EACH_ENTRY(child_visual, &visual->child_visuals, struct composition_visual, entry)
@@ -1389,10 +1778,12 @@ static HRESULT STDMETHODCALLTYPE desktop_device_Unknown9(IDCompositionDeviceUnkn
     return E_NOTIMPL;
 }
 
-static HRESULT STDMETHODCALLTYPE desktop_device_Unknown10(IDCompositionDeviceUnknown *iface)
+static HRESULT STDMETHODCALLTYPE desktop_device_Unknown10(IDCompositionDeviceUnknown *iface,
+        IDCompositionDynamicTexture **texture)
 {
-    FIXME("iface %p stub!\n", iface);
-    return E_NOTIMPL;
+    TRACE("iface %p, texture %p.\n", iface, texture);
+
+    return create_dynamic_texture(texture);
 }
 
 static HRESULT STDMETHODCALLTYPE desktop_device_Unknown11(IDCompositionDeviceUnknown *iface)

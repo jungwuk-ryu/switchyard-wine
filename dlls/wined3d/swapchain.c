@@ -281,6 +281,15 @@ HRESULT CDECL wined3d_swapchain_get_front_buffer_data(const struct wined3d_swapc
             swapchain->front_buffer, 0, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
 }
 
+void CDECL wined3d_swapchain_wait_present(struct wined3d_swapchain *swapchain)
+{
+    TRACE("swapchain %p.\n", swapchain);
+
+    wined3d_mutex_lock();
+    wined3d_cs_finish(swapchain->device->cs, WINED3D_CS_QUEUE_DEFAULT);
+    wined3d_mutex_unlock();
+}
+
 struct wined3d_texture * CDECL wined3d_swapchain_get_back_buffer(const struct wined3d_swapchain *swapchain,
         UINT back_buffer_idx)
 {
@@ -1168,7 +1177,8 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             swapchain_vk->vk_images[image_idx], &vk_range);
 
-    if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
+    /* The software DComp compositor may read the last presented flip buffer. */
+    if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD)
         vk_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     else
         vk_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -1437,8 +1447,7 @@ static HRESULT wined3d_swapchain_apply_max_frame_latency(struct wined3d_swapchai
 {
     TRACE("swapchain %p, latency %u.\n", swapchain, latency);
 
-    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT)
-            && latency > swapchain->max_frame_latency)
+    if (swapchain->frame_latency_semaphore && latency > swapchain->max_frame_latency)
     {
         if (!ReleaseSemaphore(swapchain->frame_latency_semaphore, latency - swapchain->max_frame_latency, NULL))
         {
@@ -1467,7 +1476,7 @@ void swapchain_set_max_frame_latency(struct wined3d_swapchain *swapchain, const 
         return;
 
     /* Subtract 1 for the implicit OpenGL latency. */
-    swapchain->max_frame_latency = device->max_frame_latency >= 2 ? device->max_frame_latency - 1 : 1;
+    wined3d_swapchain_apply_max_frame_latency(swapchain, device->max_frame_latency >= 2 ? device->max_frame_latency - 1 : 1);
 }
 
 HRESULT CDECL wined3d_swapchain_get_max_frame_latency(struct wined3d_swapchain *swapchain, unsigned int *latency)
@@ -1677,15 +1686,13 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
     swapchain_set_max_frame_latency(swapchain, device);
 
     if (desc->flags & WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT)
-    {
         swapchain->max_frame_latency = 1;
 
-        if (!(swapchain->frame_latency_semaphore = CreateSemaphoreW(NULL, swapchain->max_frame_latency, LONG_MAX, NULL)))
-        {
-            ERR("Failed to create frame latency semaphore, error %lu.\n", GetLastError());
-            wined3d_mutex_unlock();
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
+    if (!(swapchain->frame_latency_semaphore = CreateSemaphoreW(NULL, swapchain->max_frame_latency, LONG_MAX, NULL)))
+    {
+        ERR("Failed to create frame latency semaphore, error %lu.\n", GetLastError());
+        wined3d_mutex_unlock();
+        return HRESULT_FROM_WIN32(GetLastError());
     }
 
     if (!(swapchain->dc = GetDCEx(swapchain->win_handle, 0, DCX_USESTYLE | DCX_CACHE)))

@@ -236,11 +236,12 @@ static HRESULT STDMETHODCALLTYPE visual_SetClip(IDCompositionVisualUnknown *ifac
 static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *iface, IUnknown *content)
 {
     struct composition_visual *visual = impl_from_IDCompositionVisualUnknown(iface);
-    ID2D1GdiInteropRenderTarget *interop;
-    ID2D1DeviceContext *device_context;
+    ID2D1GdiInteropRenderTarget *interop = NULL;
+    ID2D1DeviceContext *device_context = NULL;
     IDXGISwapChain1 *dxgi_swapchain;
+    IDCompositionDynamicTexture *dynamic_texture;
     IDCompositionSurface *suface;
-    IDXGIDevice *dxgi_device;
+    IDXGIDevice *dxgi_device = NULL;
     ID2D1Device *d2d_device;
     const GUID *iid = NULL;
     HRESULT hr;
@@ -291,39 +292,49 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisualUnknown *i
                 return E_INVALIDARG;
             }
         }
+        else if (SUCCEEDED(IUnknown_QueryInterface(content, &IID_IDCompositionDynamicTexture,
+                (void **)&dynamic_texture)))
+        {
+            iid = &IID_IDCompositionDynamicTexture;
+
+            IDCompositionDynamicTexture_Release(dynamic_texture);
+        }
         else
         {
-            FIXME("Only IDXGISwapChain1 or IDCompositionSurface are currently supported.\n");
+            FIXME("Only IDXGISwapChain1, IDCompositionSurface, or IDCompositionDynamicTexture are currently supported.\n");
             dcomp_unlock();
             return E_INVALIDARG;
         }
 
-        hr = D2D1CreateDevice(dxgi_device, NULL, &d2d_device);
-        IDXGIDevice_Release(dxgi_device);
-        if (FAILED(hr))
+        if (dxgi_device)
         {
-            ERR("Failed to create a D2D device, hr %#lx.\n", hr);
-            dcomp_unlock();
-            return hr;
-        }
+            hr = D2D1CreateDevice(dxgi_device, NULL, &d2d_device);
+            IDXGIDevice_Release(dxgi_device);
+            if (FAILED(hr))
+            {
+                ERR("Failed to create a D2D device, hr %#lx.\n", hr);
+                dcomp_unlock();
+                return hr;
+            }
 
-        hr = ID2D1Device_CreateDeviceContext(d2d_device, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-                &device_context);
-        ID2D1Device_Release(d2d_device);
-        if (FAILED(hr))
-        {
-            ERR("Failed to create a D2D device context, hr %#lx.\n", hr);
-            dcomp_unlock();
-            return hr;
-        }
+            hr = ID2D1Device_CreateDeviceContext(d2d_device, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                    &device_context);
+            ID2D1Device_Release(d2d_device);
+            if (FAILED(hr))
+            {
+                ERR("Failed to create a D2D device context, hr %#lx.\n", hr);
+                dcomp_unlock();
+                return hr;
+            }
 
-        if (FAILED(hr = ID2D1DeviceContext_QueryInterface(device_context,
-                &IID_ID2D1GdiInteropRenderTarget, (void **)&interop)))
-        {
-            ERR("Failed to get a ID2D1GdiInteropRenderTarget, hr %#lx.\n", hr);
-            ID2D1DeviceContext_Release(device_context);
-            dcomp_unlock();
-            return hr;
+            if (FAILED(hr = ID2D1DeviceContext_QueryInterface(device_context,
+                    &IID_ID2D1GdiInteropRenderTarget, (void **)&interop)))
+            {
+                ERR("Failed to get a ID2D1GdiInteropRenderTarget, hr %#lx.\n", hr);
+                ID2D1DeviceContext_Release(device_context);
+                dcomp_unlock();
+                return hr;
+            }
         }
     }
 
