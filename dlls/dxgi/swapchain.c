@@ -445,10 +445,25 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
     return hr;
 }
 
+static BOOL d3d11_swapchain_desc_is_flip_model(const struct wined3d_swapchain_desc *desc)
+{
+    return desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD
+            || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL;
+}
+
+static struct wined3d_texture *d3d11_swapchain_get_presented_texture(struct d3d11_swapchain *swapchain,
+        const struct wined3d_swapchain_desc *desc)
+{
+    if (d3d11_swapchain_desc_is_flip_model(desc) && desc->backbuffer_count > 1)
+        return wined3d_swapchain_get_back_buffer(swapchain->wined3d_swapchain, desc->backbuffer_count - 1);
+
+    return wined3d_swapchain_get_front_buffer(swapchain->wined3d_swapchain);
+}
+
 static void d3d11_swapchain_preserve_dirty_present(struct d3d11_swapchain *swapchain,
         const DXGI_PRESENT_PARAMETERS *present_parameters)
 {
-    struct wined3d_texture *front_buffer, *back_buffer;
+    struct wined3d_texture *presented_texture, *back_buffer;
     struct wined3d_swapchain_desc swapchain_desc;
     struct wined3d_sub_resource_desc desc;
     struct wined3d_device_context *context;
@@ -460,16 +475,15 @@ static void d3d11_swapchain_preserve_dirty_present(struct d3d11_swapchain *swapc
 
     wined3d_mutex_lock();
     wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &swapchain_desc);
-    if (swapchain_desc.swap_effect != WINED3D_SWAP_EFFECT_FLIP_DISCARD
-            && swapchain_desc.swap_effect != WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL)
+    if (!d3d11_swapchain_desc_is_flip_model(&swapchain_desc))
     {
         wined3d_mutex_unlock();
         return;
     }
 
-    front_buffer = wined3d_swapchain_get_front_buffer(swapchain->wined3d_swapchain);
+    presented_texture = d3d11_swapchain_get_presented_texture(swapchain, &swapchain_desc);
     back_buffer = wined3d_swapchain_get_back_buffer(swapchain->wined3d_swapchain, 0);
-    if (!front_buffer || !back_buffer || FAILED(wined3d_texture_get_sub_resource_desc(back_buffer, 0, &desc)))
+    if (!presented_texture || !back_buffer || FAILED(wined3d_texture_get_sub_resource_desc(back_buffer, 0, &desc)))
     {
         wined3d_mutex_unlock();
         return;
@@ -518,7 +532,7 @@ static void d3d11_swapchain_preserve_dirty_present(struct d3d11_swapchain *swapc
 
             SetRect(&rect, x, band_top, next_left, band_bottom);
             if (FAILED(hr = wined3d_device_context_blt(context, back_buffer, 0, &rect,
-                    front_buffer, 0, &rect, 0, NULL, WINED3D_TEXF_POINT)))
+                    presented_texture, 0, &rect, 0, NULL, WINED3D_TEXF_POINT)))
                 WARN("Failed to preserve dirty-present region %s, hr %#lx.\n",
                         wine_dbgstr_rect(&rect), hr);
             x = next_left;
@@ -1200,6 +1214,10 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_internal_get_front_buffer(IWine
         REFIID iid, void **surface)
 {
     struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IWineDXGISwapChain(iface);
+    struct wined3d_swapchain_desc swapchain_desc;
+    struct wined3d_texture *texture;
+    IUnknown *parent;
+    HRESULT hr;
 
     TRACE("iface %p, iid %s, surface %p.\n", iface, debugstr_guid(iid), surface);
 
@@ -1208,6 +1226,26 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_internal_get_front_buffer(IWine
 
     *surface = NULL;
     wined3d_swapchain_wait_present(swapchain->wined3d_swapchain);
+
+    wined3d_mutex_lock();
+    wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &swapchain_desc);
+    if (d3d11_swapchain_desc_is_flip_model(&swapchain_desc) && swapchain_desc.backbuffer_count > 1
+            && (texture = d3d11_swapchain_get_presented_texture(swapchain, &swapchain_desc)))
+    {
+        parent = wined3d_texture_get_parent(texture);
+        hr = IUnknown_QueryInterface(parent, iid, surface);
+        wined3d_mutex_unlock();
+        if (SUCCEEDED(hr))
+            return hr;
+
+        WARN("Failed to query presented back buffer surface, hr %#lx.\n", hr);
+        *surface = NULL;
+    }
+    else
+    {
+        wined3d_mutex_unlock();
+    }
+
     if (!swapchain->front_buffer_surface)
         return DXGI_ERROR_INVALID_CALL;
 
