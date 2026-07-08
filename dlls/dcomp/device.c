@@ -728,11 +728,11 @@ static void dcomp_blit_dc_to_target(const struct composition_target *target,
                                     const struct composition_visual *visual,
                                     HDC src_dc, UINT src_width, UINT src_height,
                                     BLENDFUNCTION blend_func, BOOL force_opaque,
-                                    float offset_x, float offset_y)
+                                    float offset_x, float offset_y, HDC dst_dc)
 {
     UINT src_x = 0, src_y = 0, width = src_width, height = src_height;
     DWORD style = DCX_USESTYLE | DCX_CACHE;
-    HDC dst_dc;
+    BOOL release_dst_dc = FALSE;
     int dst_x = offset_x, dst_y = offset_y;
 
     /* DComp content composes over child HWND hosts; child clipping would exclude Chromium CEF content. */
@@ -754,11 +754,15 @@ static void dcomp_blit_dc_to_target(const struct composition_target *target,
         height = bottom - top;
     }
 
-    dst_dc = GetDCEx(target->hwnd, 0, style);
     if (!dst_dc)
     {
-        WARN("Failed to get destination DC, error %lu.\n", GetLastError());
-        return;
+        dst_dc = GetDCEx(target->hwnd, 0, style);
+        if (!dst_dc)
+        {
+            WARN("Failed to get destination DC, error %lu.\n", GetLastError());
+            return;
+        }
+        release_dst_dc = TRUE;
     }
 
     if (!blend_func.AlphaFormat && blend_func.SourceConstantAlpha == 255)
@@ -774,7 +778,8 @@ static void dcomp_blit_dc_to_target(const struct composition_target *target,
             WARN("Opaque BitBlt fallback failed, error %lu.\n", GetLastError());
     }
 
-    ReleaseDC(target->hwnd, dst_dc);
+    if (release_dst_dc)
+        ReleaseDC(target->hwnd, dst_dc);
 }
 
 static void do_composite_dxgi_surface(const struct composition_target *target,
@@ -783,7 +788,7 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
                                       DXGI_ALPHA_MODE alpha_mode,
                                       BOOL force_opaque,
                                       IDCompositionDynamicTexture *dynamic_texture,
-                                      float offset_x, float offset_y)
+                                      float offset_x, float offset_y, HDC target_dc)
 {
     ID3DDeviceContextState *state = NULL, *old_state = NULL;
     ID3D11DeviceContext1 *d3d11_device_context1 = NULL;
@@ -906,7 +911,7 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
             }
 
             dcomp_blit_dc_to_target(target, visual, cache_dc, size.width, size.height,
-                    blend_func, force_opaque, offset_x, offset_y);
+                    blend_func, force_opaque, offset_x, offset_y, target_dc);
             goto done;
         }
 
@@ -966,7 +971,7 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
     }
 
     dcomp_blit_dc_to_target(target, visual, src_dc, size.width, size.height,
-            blend_func, force_opaque, offset_x, offset_y);
+            blend_func, force_opaque, offset_x, offset_y, target_dc);
 
 release_dc_target:
     ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, NULL);
@@ -1022,25 +1027,21 @@ static struct composition_visual * shared_visual_target_get_root(HANDLE shared_v
     return visual;
 }
 
-static void clear_composition_target(const struct composition_target *target)
+static void clear_composition_target(const struct composition_target *target, HDC dc)
 {
     RECT rect;
-    HDC dc;
-    DWORD style = DCX_USESTYLE | DCX_CACHE;
 
     if (!GetClientRect(target->hwnd, &rect))
         return;
 
-    dc = GetDCEx(target->hwnd, 0, style);
     if (!dc)
         return;
 
     FillRect(dc, &rect, GetStockObject(BLACK_BRUSH));
-    ReleaseDC(target->hwnd, dc);
 }
 
 static HRESULT do_composite(const struct composition_target *target, struct composition_visual *visual,
-        float offset_x, float offset_y)
+        HDC target_dc, float offset_x, float offset_y)
 {
     struct composition_visual *child_visual;
     DXGI_ALPHA_MODE alpha_mode = DXGI_ALPHA_MODE_IGNORE;
@@ -1055,7 +1056,7 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
     {
         struct composition_visual *root = shared_visual_target_get_root(visual->shared_visual_handle);
         if (root)
-            do_composite(target, root, offset_x, offset_y);
+            do_composite(target, root, target_dc, offset_x, offset_y);
     }
 
     /* Render content */
@@ -1164,7 +1165,7 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
 
         do_composite_dxgi_surface(target, visual, dxgi_surface, alpha_mode,
                 IsEqualGUID(&visual->content_iid, &IID_IDXGISwapChain1),
-                dynamic_texture, offset_x, offset_y);
+                dynamic_texture, offset_x, offset_y, target_dc);
         IDXGISurface_Release(dxgi_surface);
         if (dynamic_texture)
         {
@@ -1175,7 +1176,7 @@ static HRESULT do_composite(const struct composition_target *target, struct comp
 
     LIST_FOR_EACH_ENTRY(child_visual, &visual->child_visuals, struct composition_visual, entry)
     {
-        do_composite(target, child_visual, offset_x, offset_y);
+        do_composite(target, child_visual, target_dc, offset_x, offset_y);
     }
 
     return S_OK;
@@ -1203,6 +1204,9 @@ static DWORD WINAPI composite_thread_proc(void *iface)
         count = 0;
         LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
         {
+            DWORD style = DCX_USESTYLE | DCX_CACHE;
+            HDC target_dc;
+
             if (!target->root)
             {
                 FIXME("Target %p has no root.\n", &target->IDCompositionTarget_iface);
@@ -1215,9 +1219,17 @@ static DWORD WINAPI composite_thread_proc(void *iface)
                 continue;
 
             visual = impl_from_IDCompositionVisual(target->root);
-            clear_composition_target(target);
-            if (SUCCEEDED(do_composite(target, visual, 0.0f, 0.0f)))
+            if (!(target_dc = GetDCEx(target->hwnd, 0, style)))
+            {
+                WARN("Failed to get target DC for composition hwnd %p, error %lu.\n",
+                        target->hwnd, GetLastError());
+                continue;
+            }
+
+            clear_composition_target(target, target_dc);
+            if (SUCCEEDED(do_composite(target, visual, target_dc, 0.0f, 0.0f)))
                 count++;
+            ReleaseDC(target->hwnd, target_dc);
         }
 
         if (!count)
