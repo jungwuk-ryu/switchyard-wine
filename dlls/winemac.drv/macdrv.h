@@ -100,6 +100,7 @@ enum macdrv_window_messages
     WM_MACDRV_CREATE_REMOTE_LAYER,
     WM_MACDRV_UPDATE_REMOTE_LAYER,
     WM_MACDRV_RELEASE_REMOTE_LAYER,
+    WM_MACDRV_PRESENT_ROOT_SURFACE,
 };
 
 struct macdrv_thread_data
@@ -214,6 +215,7 @@ extern struct macdrv_client_surface *impl_from_client_surface(struct client_surf
 extern BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
+extern BOOL macdrv_present_root_surface(HWND root, HWND source);
 extern struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RECT *surface_rect);
 extern BOOL macdrv_retain_foreign_child_win_data(HWND hwnd);
 extern void macdrv_release_foreign_child_win_data(HWND hwnd);

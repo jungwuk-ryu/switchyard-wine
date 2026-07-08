@@ -26,6 +26,15 @@
 
 #include "config.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "macdrv.h"
 #include "winuser.h"
 
@@ -42,6 +51,60 @@ static inline int get_dib_image_size(const BITMAPINFO *info)
         * abs(info->bmiHeader.biHeight);
 }
 
+#define ROOT_SURFACE_SHM_MAGIC 0x53595253 /* "SYRS" */
+#define ROOT_SURFACE_SHM_VERSION 1
+
+struct root_surface_shm_header
+{
+    UINT magic;
+    UINT version;
+    UINT header_size;
+    UINT sequence;
+    RECT rect;
+    RECT dirty;
+    UINT width;
+    UINT height;
+    UINT stride;
+    UINT bits_size;
+    UINT alpha_mask;
+};
+
+static UINT64 root_surface_hash(HWND root, HWND source)
+{
+    UINT64 hash = 1469598103934665603ULL;
+    UINT64 values[] = { getuid(), (UINT_PTR)root, (UINT_PTR)source };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(values); i++)
+    {
+        UINT64 value = values[i];
+        unsigned int byte;
+
+        for (byte = 0; byte < sizeof(value); byte++)
+        {
+            hash ^= value & 0xff;
+            hash *= 1099511628211ULL;
+            value >>= 8;
+        }
+    }
+
+    return hash;
+}
+
+static void root_surface_shm_name(char *name, size_t size, HWND root, HWND source)
+{
+    snprintf(name, size, "/sy%016llx", (unsigned long long)root_surface_hash(root, source));
+}
+
+static void unlink_root_surface_shm(HWND root, HWND source)
+{
+    char name[32];
+
+    if (!root || !source) return;
+    root_surface_shm_name(name, sizeof(name), root, source);
+    shm_unlink(name);
+}
+
 
 struct macdrv_window_surface
 {
@@ -56,6 +119,8 @@ struct macdrv_window_surface
     BOOL                    remote_child;
     BOOL                    foreign_child;
     BOOL                    foreign_child_fronted;
+    BOOL                    root_surface_relay;
+    HWND                    root_surface_root;
     BOOL                    chromium_blank_owner_transparent;
     BOOL                    chromium_blank_owner_had_remote_layer;
     BOOL                    chromium_child_had_real_image;
@@ -171,6 +236,17 @@ static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
     return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
 }
 
+static BOOL chromium_hwnd_or_root_uses_dcomp_composition(HWND hwnd)
+{
+    HWND root;
+
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+    if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && chromium_root_uses_dcomp_composition(root);
+}
+
 static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
 {
     HWND root;
@@ -180,6 +256,65 @@ static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
 
     root = NtUserGetAncestor(hwnd, GA_ROOT);
     return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
+}
+
+static BOOL chromium_hwnd_should_relay_root_surface(HWND hwnd, HWND *root_ret)
+{
+    HWND root;
+    struct macdrv_win_data *root_data;
+    DWORD root_thread_id;
+    BOOL has_owner_root_window = FALSE;
+
+    if (root_ret) *root_ret = NULL;
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+    if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
+    if (!chromium_hwnd_or_root_uses_dcomp_composition(hwnd)) return FALSE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    if (!root) return FALSE;
+    root_thread_id = NtUserGetWindowThread(root, NULL);
+
+    if ((root_data = get_win_data(root)))
+    {
+        if (root_data->foreign_child && root_data->cocoa_window && root_data->on_screen)
+        {
+            TRACE("Switchyard hiding stale Chromium/CEF foreign root window %p for relay source %p\n",
+                  root, hwnd);
+            macdrv_hide_cocoa_window(root_data->cocoa_window);
+            root_data->on_screen = FALSE;
+        }
+        has_owner_root_window = root_thread_id == GetCurrentThreadId() &&
+                                root_data->cocoa_window && !root_data->foreign_child;
+        release_win_data(root_data);
+    }
+    if (has_owner_root_window) return FALSE;
+
+    if (root_ret) *root_ret = root;
+    return TRUE;
+}
+
+static BOOL root_surface_header_is_valid(const struct root_surface_shm_header *header, SIZE_T map_size)
+{
+    SIZE_T min_stride, expected_bits;
+
+    if (header->magic != ROOT_SURFACE_SHM_MAGIC ||
+        header->version != ROOT_SURFACE_SHM_VERSION ||
+        header->header_size != sizeof(*header) ||
+        header->width == 0 || header->height == 0 ||
+        header->stride == 0 || header->bits_size == 0 ||
+        sizeof(*header) > map_size)
+        return FALSE;
+
+    if ((SIZE_T)header->width > ((SIZE_T)-1) / 4) return FALSE;
+    min_stride = (SIZE_T)header->width * 4;
+    if ((SIZE_T)header->stride < min_stride) return FALSE;
+    if ((SIZE_T)header->height > ((SIZE_T)-1) / header->stride) return FALSE;
+
+    expected_bits = (SIZE_T)header->stride * header->height;
+    if (header->bits_size != expected_bits) return FALSE;
+    if (expected_bits > map_size - sizeof(*header)) return FALSE;
+
+    return TRUE;
 }
 
 static int rect_width(const RECT *rect)
@@ -306,6 +441,7 @@ static BOOL should_suppress_chromium_placeholder_surface(struct macdrv_window_su
 static BOOL get_child_root_offset(HWND hwnd, POINT *offset)
 {
     HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    struct macdrv_win_data *root_data;
     RECT rect;
     UINT root_dpi;
 
@@ -316,6 +452,231 @@ static BOOL get_child_root_offset(HWND hwnd, POINT *offset)
     NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
     offset->x = rect.left;
     offset->y = rect.top;
+    if ((root_data = get_win_data(root)))
+    {
+        offset->x += root_data->rects.client.left - root_data->rects.visible.left;
+        offset->y += root_data->rects.client.top - root_data->rects.visible.top;
+        release_win_data(root_data);
+    }
+    return TRUE;
+}
+
+static BOOL get_root_surface_offset(HWND root, HWND source, POINT *offset, macdrv_window *window)
+{
+    struct macdrv_win_data *root_data;
+    RECT rect;
+
+    offset->x = 0;
+    offset->y = 0;
+    *window = NULL;
+
+    if (!root || !source) return FALSE;
+    if (!(root_data = get_win_data(root))) return FALSE;
+    if (!root_data->cocoa_window)
+    {
+        release_win_data(root_data);
+        return FALSE;
+    }
+
+    if (source != root)
+    {
+        UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+
+        if (!NtUserGetClientRect(source, &rect, NtUserGetWinMonitorDpi(source, MDT_RAW_DPI)))
+        {
+            release_win_data(root_data);
+            return FALSE;
+        }
+        NtUserMapWindowPoints(source, root, (POINT *)&rect, 2, root_dpi);
+        offset->x = rect.left;
+        offset->y = rect.top;
+    }
+
+    offset->x += root_data->rects.client.left - root_data->rects.visible.left;
+    offset->y += root_data->rects.client.top - root_data->rects.visible.top;
+    *window = root_data->cocoa_window;
+    release_win_data(root_data);
+    return TRUE;
+}
+
+static BOOL relay_root_surface_flush(struct macdrv_window_surface *surface, const RECT *rect, const RECT *dirty,
+                                     const BITMAPINFO *color_info, const void *pixels)
+{
+    struct root_surface_shm_header *header;
+    HWND root = surface->root_surface_root;
+    SIZE_T bits_size, map_size;
+    unsigned int width, height, stride;
+    struct stat st;
+    char name[32];
+    void *map;
+    int fd;
+
+    if (!root || !pixels) return FALSE;
+    if (color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB) return FALSE;
+    if (color_info->bmiHeader.biWidth <= 0 || color_info->bmiHeader.biHeight == 0) return FALSE;
+    width = color_info->bmiHeader.biWidth;
+    height = abs(color_info->bmiHeader.biHeight);
+    stride = get_dib_stride(width, color_info->bmiHeader.biBitCount);
+    if (!stride || (SIZE_T)height > ((SIZE_T)-1) / stride) return FALSE;
+    bits_size = (SIZE_T)stride * height;
+    if (!bits_size || bits_size > (UINT)-1 || bits_size > ((SIZE_T)-1) - sizeof(*header)) return FALSE;
+    map_size = sizeof(*header) + bits_size;
+
+    root_surface_shm_name(name, sizeof(name), root, surface->header.hwnd);
+    if ((fd = shm_open(name, O_CREAT | O_RDWR, 0600)) == -1)
+    {
+        TRACE("Switchyard failed to open Chromium root-surface shm %s: %s\n", name, strerror(errno));
+        return FALSE;
+    }
+    if (fstat(fd, &st) == -1)
+    {
+        TRACE("Switchyard failed to stat Chromium root-surface shm %s: %s\n", name, strerror(errno));
+        close(fd);
+        return FALSE;
+    }
+    if (st.st_size < 0)
+    {
+        TRACE("Switchyard Chromium root-surface shm %s has invalid size %lld\n",
+              name, (long long)st.st_size);
+        close(fd);
+        return FALSE;
+    }
+    if ((SIZE_T)st.st_size < map_size && ftruncate(fd, map_size) == -1)
+    {
+        TRACE("Switchyard failed to resize Chromium root-surface shm %s from %lld to %lu: %s\n",
+              name, (long long)st.st_size, (unsigned long)map_size, strerror(errno));
+        close(fd);
+        shm_unlink(name);
+        if ((fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600)) == -1)
+        {
+            TRACE("Switchyard failed to recreate Chromium root-surface shm %s: %s\n", name, strerror(errno));
+            return FALSE;
+        }
+        if (ftruncate(fd, map_size) == -1)
+        {
+            TRACE("Switchyard failed to resize recreated Chromium root-surface shm %s to %lu: %s\n",
+                  name, (unsigned long)map_size, strerror(errno));
+            close(fd);
+            shm_unlink(name);
+            return FALSE;
+        }
+    }
+    map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED)
+    {
+        TRACE("Switchyard failed to map Chromium root-surface shm %s: %s\n", name, strerror(errno));
+        return FALSE;
+    }
+
+    header = map;
+    header->sequence++;
+    header->magic = ROOT_SURFACE_SHM_MAGIC;
+    header->version = ROOT_SURFACE_SHM_VERSION;
+    header->header_size = sizeof(*header);
+    header->rect = *rect;
+    header->dirty = *dirty;
+    header->width = width;
+    header->height = height;
+    header->stride = stride;
+    header->bits_size = (UINT)bits_size;
+    header->alpha_mask = surface->header.alpha_mask;
+    memcpy((BYTE *)map + sizeof(*header), pixels, bits_size);
+    header->sequence++;
+    munmap(map, map_size);
+
+    TRACE("Switchyard relaying Chromium/CEF surface hwnd %p through DComp root %p via shm %s rect %s dirty %s\n",
+          surface->header.hwnd, root, name, wine_dbgstr_rect(rect), wine_dbgstr_rect(dirty));
+    send_message_timeout(root, WM_MACDRV_PRESENT_ROOT_SURFACE, (WPARAM)surface->header.hwnd, 0,
+                         SMTO_ABORTIFHUNG, 500, NULL);
+    return TRUE;
+}
+
+BOOL macdrv_present_root_surface(HWND root, HWND source)
+{
+    const struct root_surface_shm_header *header;
+    CGColorSpaceRef colorspace;
+    CGDataProviderRef provider;
+    CGImageAlphaInfo alpha_info;
+    CGImageRef image;
+    macdrv_window window;
+    POINT offset;
+    SIZE_T map_size;
+    CGRect image_rect, dirty_rect;
+    CFDataRef data;
+    RECT rect, dirty;
+    struct stat st;
+    char name[32];
+    void *map;
+    int fd;
+
+    if (!root || !source) return FALSE;
+    if (source != root && NtUserGetAncestor(source, GA_ROOT) != root) return FALSE;
+    if (!chromium_hwnd_or_root_uses_dcomp_composition(source)) return FALSE;
+
+    root_surface_shm_name(name, sizeof(name), root, source);
+    if ((fd = shm_open(name, O_RDONLY, 0600)) == -1)
+    {
+        TRACE("Switchyard failed to open Chromium root-surface present shm %s: %s\n", name, strerror(errno));
+        return FALSE;
+    }
+    if (fstat(fd, &st) == -1 || st.st_size < sizeof(*header))
+    {
+        close(fd);
+        return FALSE;
+    }
+    map_size = st.st_size;
+    map = mmap(NULL, map_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return FALSE;
+
+    header = map;
+    if (!root_surface_header_is_valid(header, map_size))
+    {
+        munmap(map, map_size);
+        return FALSE;
+    }
+    if (!get_root_surface_offset(root, source, &offset, &window))
+    {
+        munmap(map, map_size);
+        return FALSE;
+    }
+
+    rect = header->rect;
+    dirty = header->dirty;
+    OffsetRect(&rect, offset.x, offset.y);
+    OffsetRect(&dirty, offset.x, offset.y);
+
+    data = CFDataCreate(NULL, (const UInt8 *)map + sizeof(*header), header->bits_size);
+    if (!data)
+    {
+        munmap(map, map_size);
+        return FALSE;
+    }
+    provider = CGDataProviderCreateWithCFData(data);
+    CFRelease(data);
+    if (!provider)
+    {
+        munmap(map, map_size);
+        return FALSE;
+    }
+
+    alpha_info = header->alpha_mask ? kCGImageAlphaPremultipliedFirst : kCGImageAlphaNoneSkipFirst;
+    colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    image = CGImageCreate(header->width, header->height, 8, 32, header->stride, colorspace,
+                          alpha_info | kCGBitmapByteOrder32Little, provider, NULL, retina_on,
+                          kCGRenderingIntentDefault);
+    CGColorSpaceRelease(colorspace);
+    CGDataProviderRelease(provider);
+    munmap(map, map_size);
+    if (!image) return FALSE;
+
+    image_rect = cgrect_from_rect(rect);
+    dirty_rect = cgrect_from_rect(dirty);
+    TRACE("Switchyard presenting Chromium/CEF surface hwnd %p into DComp root %p backing rect %s dirty %s\n",
+          source, root, wine_dbgstr_rect(&rect), wine_dbgstr_rect(&dirty));
+    macdrv_window_set_color_image(window, image, image_rect, dirty_rect);
+    CGImageRelease(image);
     return TRUE;
 }
 
@@ -528,6 +889,14 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
 
     solid_kind = get_nearly_solid_surface_kind(color_info, color_bits ? color_bits : surface->bits);
 
+    if (surface->root_surface_relay)
+    {
+        if (!relay_root_surface_flush(surface, rect, dirty, color_info, color_bits ? color_bits : surface->bits))
+            TRACE("Switchyard failed to relay Chromium/CEF surface hwnd %p into DComp root %p\n",
+                  surface->header.hwnd, surface->root_surface_root);
+        return TRUE;
+    }
+
     if ((surface->child || surface->remote_child || surface->foreign_child) &&
         chromium_hwnd_should_root_compose_surface(surface->header.hwnd))
     {
@@ -683,6 +1052,8 @@ static void macdrv_surface_destroy(struct window_surface *window_surface)
     CGDataProviderRelease(surface->provider);
     if (surface->foreign_child)
         macdrv_release_foreign_child_win_data(window_surface->hwnd);
+    if (surface->root_surface_relay)
+        unlink_root_surface_shm(surface->root_surface_root, window_surface->hwnd);
     if (surface->chromium_blank_owner_transparent)
         macdrv_set_window_alpha(surface->window, 1.0);
 }
@@ -705,7 +1076,8 @@ static struct macdrv_window_surface *get_mac_surface(struct window_surface *surf
  */
 static struct window_surface *create_surface(HWND hwnd, macdrv_window window, const RECT *rect,
                                              const POINT *offset, BOOL child, BOOL remote_child,
-                                             HWND remote_layer_root, BOOL foreign_child)
+                                             HWND remote_layer_root, BOOL foreign_child,
+                                             BOOL root_surface_relay, HWND root_surface_root)
 {
     struct macdrv_window_surface *surface;
     int width = rect->right - rect->left, height = rect->bottom - rect->top;
@@ -765,12 +1137,14 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
         surface->remote_child = remote_child;
         surface->foreign_child = foreign_child;
         surface->foreign_child_fronted = FALSE;
+        surface->root_surface_relay = root_surface_relay;
+        surface->root_surface_root = root_surface_root;
         surface->chromium_blank_owner_transparent = FALSE;
         surface->chromium_blank_owner_had_remote_layer = FALSE;
         surface->chromium_child_had_real_image = FALSE;
-        window_surface->flush_on_unlock = child || remote_child || foreign_child;
+        window_surface->flush_on_unlock = child || remote_child || foreign_child || root_surface_relay;
 
-        if ((child || remote_child) && remote_layer_root)
+        if (!root_surface_relay && (child || remote_child) && remote_layer_root)
         {
             surface->image_layer = macdrv_create_image_layer(hwnd, remote_layer_root, cgrect_from_rect(*rect));
             if (!surface->image_layer && remote_child)
@@ -813,6 +1187,8 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     BOOL foreign_child = FALSE;
     BOOL root_composed_child = chromium_hwnd_should_root_compose_surface(hwnd);
     HWND remote_layer_root = NULL;
+    HWND root_surface_root = NULL;
+    BOOL root_surface_relay = chromium_hwnd_should_relay_root_surface(hwnd, &root_surface_root);
 
     TRACE("hwnd %p, layered %u, surface_rect %s, surface %p\n", hwnd, layered, wine_dbgstr_rect(surface_rect), surface);
 
@@ -820,9 +1196,11 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     {
         struct macdrv_window_surface *mac_surface = get_mac_surface(previous);
 
-        if (!mac_surface->child && !mac_surface->remote_child && !mac_surface->foreign_child) return TRUE;
+        if (!mac_surface->child && !mac_surface->remote_child && !mac_surface->foreign_child &&
+            !mac_surface->root_surface_relay)
+            return TRUE;
     }
-    if (chromium_hwnd_uses_dcomp_root_composition(hwnd) && !root_composed_child)
+    if (chromium_hwnd_uses_dcomp_root_composition(hwnd) && !root_composed_child && !root_surface_relay)
     {
         TRACE("Switchyard leaving Chromium/CEF child hwnd %p on Wine DComp root composition\n", hwnd);
         if (previous)
@@ -872,7 +1250,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
                    hwnd, root);
     }
 
-    if (!root_composed_child && !window && is_chromium_cef_child_window(hwnd) &&
+    if (!root_surface_relay && !root_composed_child && !window && is_chromium_cef_child_window(hwnd) &&
         (remote_layer_root = NtUserGetAncestor(hwnd, GA_ROOT)) && remote_layer_root != hwnd &&
         can_host_remote_layer(hwnd, remote_layer_root))
     {
@@ -881,7 +1259,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
               hwnd, remote_layer_root);
     }
 
-    if (!root_composed_child && !remote_child && !window && is_chromium_cef_child_window(hwnd) &&
+    if (!root_surface_relay && !root_composed_child && !remote_child && !window && is_chromium_cef_child_window(hwnd) &&
         (data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
     {
         window = data->cocoa_window;
@@ -897,16 +1275,21 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
         *surface = NULL;
     }
 
-    if (window || remote_child)
+    if (root_surface_relay)
+        TRACE("Switchyard creating Chromium/CEF root-surface relay hwnd %p to DComp root %p\n",
+              hwnd, root_surface_root);
+
+    if (window || remote_child || root_surface_relay)
     {
         if (window)
             foreign_child = macdrv_retain_foreign_child_win_data(hwnd);
         if (!(*surface = create_surface(hwnd, window, surface_rect, &offset, child, remote_child,
-                                        remote_layer_root, foreign_child)) && foreign_child)
+                                        remote_layer_root, foreign_child,
+                                        root_surface_relay, root_surface_root)) && foreign_child)
             macdrv_release_foreign_child_win_data(hwnd);
     }
 
-    if (!root_composed_child && !*surface && remote_child && is_chromium_cef_child_window(hwnd) &&
+    if (!root_surface_relay && !root_composed_child && !*surface && remote_child && is_chromium_cef_child_window(hwnd) &&
         (data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
     {
         window = data->cocoa_window;
@@ -914,7 +1297,8 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
         foreign_child = macdrv_retain_foreign_child_win_data(hwnd);
         TRACE("Switchyard falling back to standalone Chromium/CEF child surface window hwnd %p window %p\n",
               hwnd, window);
-        if (!(*surface = create_surface(hwnd, window, surface_rect, &offset, child, FALSE, NULL, foreign_child)) &&
+        if (!(*surface = create_surface(hwnd, window, surface_rect, &offset, child, FALSE, NULL, foreign_child,
+                                        FALSE, NULL)) &&
             foreign_child)
             macdrv_release_foreign_child_win_data(hwnd);
         release_win_data(data);

@@ -147,6 +147,17 @@ static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
     return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
 }
 
+static BOOL chromium_hwnd_or_root_uses_dcomp_composition(HWND hwnd)
+{
+    HWND root;
+
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+    if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && chromium_root_uses_dcomp_composition(root);
+}
+
 static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
 {
     HWND root;
@@ -884,6 +895,12 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
     if (NtUserGetWindowThread(hwnd, NULL) != GetCurrentThreadId())
     {
         if (!is_chromium_cef_child_window(hwnd)) return NULL;
+        if (chromium_hwnd_or_root_uses_dcomp_composition(hwnd))
+        {
+            TRACE("not creating foreign Chromium/CEF mac win data for hwnd %p because DComp owns composition\n",
+                  hwnd);
+            return NULL;
+        }
         foreign_chromium_child = TRUE;
     }
 
@@ -920,7 +937,7 @@ struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RE
 
     if (!is_chromium_cef_child_window(hwnd)) return NULL;
     if (NtUserGetWindowThread(hwnd, NULL) == GetCurrentThreadId()) return NULL;
-    if (chromium_hwnd_uses_dcomp_root_composition(hwnd))
+    if (chromium_hwnd_or_root_uses_dcomp_composition(hwnd))
     {
         TRACE("not creating foreign Chromium/CEF child mac win data for hwnd %p because DComp owns composition\n",
               hwnd);
@@ -2182,6 +2199,13 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (window)
             macdrv_window_release_ca_layer_host_view(window, context_id);
+        return 0;
+    }
+    case WM_MACDRV_PRESENT_ROOT_SURFACE:
+    {
+        HWND source = (HWND)wp;
+
+        macdrv_present_root_surface(hwnd, source ? source : hwnd);
         return 0;
     }
     }
