@@ -74,6 +74,59 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static const WCHAR wine_window_topmost_composed[] =
+    {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
+static const WCHAR wine_window_non_topmost_composed[] =
+    {'w','i','n','e','_','w','i','n','d','o','w','_','n','o','n','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
+
+static BOOL is_dcomp_composed_hwnd(HWND hwnd)
+{
+    return hwnd && (NtUserGetProp(hwnd, wine_window_topmost_composed) ||
+                   NtUserGetProp(hwnd, wine_window_non_topmost_composed));
+}
+
+static BOOL chromium_subtree_has_dcomp_target(HWND hwnd)
+{
+    HWND child;
+
+    if (is_chromium_cef_child_window(hwnd) && is_dcomp_composed_hwnd(hwnd)) return TRUE;
+
+    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL chromium_root_uses_dcomp_composition(HWND root)
+{
+    HWND child;
+
+    if (!root) return FALSE;
+    if (is_dcomp_composed_hwnd(root)) return TRUE;
+
+    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
+{
+    HWND root;
+
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+    if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
+}
+
 static int rect_width(const RECT *rect)
 {
     return rect->right - rect->left;
@@ -836,6 +889,12 @@ struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RE
 
     if (!is_chromium_cef_child_window(hwnd)) return NULL;
     if (NtUserGetWindowThread(hwnd, NULL) == GetCurrentThreadId()) return NULL;
+    if (chromium_hwnd_uses_dcomp_root_composition(hwnd))
+    {
+        TRACE("not creating foreign Chromium/CEF child mac win data for hwnd %p because DComp owns composition\n",
+              hwnd);
+        return NULL;
+    }
 
     SetRectEmpty(&rects.window);
     if (NtUserGetClientRect(hwnd, &client, dpi))
@@ -1896,6 +1955,12 @@ static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expect
     RECT rect;
 
     if (!root) return NULL;
+    if (chromium_hwnd_uses_dcomp_root_composition(hwnd))
+    {
+        TRACE("Switchyard refusing Chromium/CEF remote layer host for hwnd %p because DComp owns root composition\n",
+              hwnd);
+        return NULL;
+    }
     if (expected_root && root != expected_root)
     {
         TRACE("Switchyard remote layer host root changed for hwnd %p expected %p got %p\n",
@@ -2135,6 +2200,18 @@ BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const stru
     HWND root;
 
     TRACE("hwnd %p, swp_flags %04x, shaped %u, rects %s\n", hwnd, swp_flags, shaped, debugstr_window_rects(rects));
+
+    if (chromium_hwnd_uses_dcomp_root_composition(hwnd))
+    {
+        if (data)
+        {
+            if (data->foreign_child && data->cocoa_window && data->on_screen)
+                hide_window(data);
+            release_win_data(data);
+        }
+        TRACE("Switchyard keeping Chromium/CEF child window %p on Wine DComp root composition\n", hwnd);
+        return FALSE;
+    }
 
     if (!data && !(data = macdrv_create_win_data(hwnd, rects))) return FALSE; /* use default surface */
     data->shaped = shaped;

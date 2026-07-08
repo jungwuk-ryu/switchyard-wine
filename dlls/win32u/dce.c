@@ -81,6 +81,59 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static const WCHAR wine_window_topmost_composed[] =
+    {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
+static const WCHAR wine_window_non_topmost_composed[] =
+    {'w','i','n','e','_','w','i','n','d','o','w','_','n','o','n','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
+
+static BOOL is_dcomp_composed_hwnd(HWND hwnd)
+{
+    return hwnd && (NtUserGetProp(hwnd, wine_window_topmost_composed) ||
+                   NtUserGetProp(hwnd, wine_window_non_topmost_composed));
+}
+
+static BOOL chromium_subtree_has_dcomp_target(HWND hwnd)
+{
+    HWND child;
+
+    if (is_chromium_cef_child_window(hwnd) && is_dcomp_composed_hwnd(hwnd)) return TRUE;
+
+    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL chromium_root_uses_dcomp_composition(HWND root)
+{
+    HWND child;
+
+    if (!root) return FALSE;
+    if (is_dcomp_composed_hwnd(root)) return TRUE;
+
+    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
+{
+    HWND root;
+
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+    if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
+}
+
 static __thread unsigned int chromium_cef_child_surface_create_depth;
 
 static struct list window_surfaces = LIST_INIT( window_surfaces );
@@ -1033,7 +1086,14 @@ static void update_visible_region( struct dce *dce )
     if (dce->clip_rgn) NtGdiCombineRgn( vis_rgn, vis_rgn, dce->clip_rgn,
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
-    if (is_chromium_cef_child_window(dce->hwnd))
+    if (chromium_hwnd_uses_dcomp_root_composition(dce->hwnd))
+    {
+        if (dce->chromium_child_surface)
+            release_chromium_child_surface( dce );
+        TRACE( "using root/top surface for Chromium/CEF child hwnd %p because DComp owns composition\n",
+               dce->hwnd );
+    }
+    else if (is_chromium_cef_child_window(dce->hwnd))
     {
         win = get_win_ptr( dce->hwnd );
         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
