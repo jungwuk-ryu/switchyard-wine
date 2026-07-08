@@ -1913,7 +1913,6 @@ static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expect
 
     if (root != hwnd)
     {
-        BOOL chromium_child = is_chromium_cef_child_window(hwnd);
         UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
 
         if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI)))
@@ -1922,9 +1921,8 @@ static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expect
             return NULL;
         }
         NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
-        if (!chromium_child)
-            OffsetRect(&rect, root_data->rects.client.left - root_data->rects.visible.left,
-                       root_data->rects.client.top - root_data->rects.visible.top);
+        OffsetRect(&rect, root_data->rects.client.left - root_data->rects.visible.left,
+                   root_data->rects.client.top - root_data->rects.visible.top);
         *frame = cgrect_mac_from_win(cgrect_from_rect(rect));
     }
 
