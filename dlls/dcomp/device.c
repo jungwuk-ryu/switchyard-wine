@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 #include "ntstatus.h"
@@ -773,9 +774,17 @@ static void dcomp_blit_dc_to_target(const struct composition_target *target,
     else if (!GdiAlphaBlend(dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y,
             width, height, blend_func))
     {
-        WARN("GdiAlphaBlend failed, error %lu.\n", GetLastError());
+        DWORD error = GetLastError();
+
         if (force_opaque && !BitBlt(dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y, SRCCOPY))
+        {
+            WARN("GdiAlphaBlend failed, error %lu.\n", error);
             WARN("Opaque BitBlt fallback failed, error %lu.\n", GetLastError());
+        }
+        else if (!force_opaque)
+        {
+            WARN("GdiAlphaBlend failed, error %lu.\n", error);
+        }
     }
 
     if (release_dst_dc)
@@ -1027,6 +1036,170 @@ static struct composition_visual * shared_visual_target_get_root(HANDLE shared_v
     return visual;
 }
 
+struct dcomp_target_frame
+{
+    HDC dc;
+    HBITMAP bitmap;
+    HGDIOBJ old_bitmap;
+    RECT client_rect;
+};
+
+static void destroy_target_frame(struct dcomp_target_frame *frame)
+{
+    if (frame->old_bitmap)
+    {
+        SelectObject(frame->dc, frame->old_bitmap);
+        frame->old_bitmap = NULL;
+    }
+    if (frame->bitmap)
+    {
+        DeleteObject(frame->bitmap);
+        frame->bitmap = NULL;
+    }
+    if (frame->dc)
+    {
+        DeleteDC(frame->dc);
+        frame->dc = NULL;
+    }
+}
+
+static BOOL create_target_frame(HWND hwnd, struct dcomp_target_frame *frame)
+{
+    BITMAPINFO info;
+    void *bits = NULL;
+    int width, height;
+
+    memset(frame, 0, sizeof(*frame));
+
+    if (!GetClientRect(hwnd, &frame->client_rect))
+    {
+        DWORD error = GetLastError();
+
+        if (error == ERROR_INVALID_WINDOW_HANDLE)
+            TRACE("Skipping destroyed composition hwnd %p.\n", hwnd);
+        else
+            WARN("Failed to get target client rect for composition hwnd %p, error %lu.\n",
+                    hwnd, error);
+        return FALSE;
+    }
+
+    width = frame->client_rect.right - frame->client_rect.left;
+    height = frame->client_rect.bottom - frame->client_rect.top;
+    if (width <= 0 || height <= 0)
+        return FALSE;
+
+    memset(&info, 0, sizeof(info));
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    if (!(frame->dc = CreateCompatibleDC(NULL)))
+    {
+        WARN("Failed to create composition frame DC, error %lu.\n", GetLastError());
+        return FALSE;
+    }
+
+    if (!(frame->bitmap = CreateDIBSection(frame->dc, &info, DIB_RGB_COLORS, &bits, NULL, 0)))
+    {
+        WARN("Failed to create composition frame bitmap %dx%d, error %lu.\n",
+                width, height, GetLastError());
+        destroy_target_frame(frame);
+        return FALSE;
+    }
+
+    if (!(frame->old_bitmap = SelectObject(frame->dc, frame->bitmap)))
+    {
+        WARN("Failed to select composition frame bitmap, error %lu.\n", GetLastError());
+        destroy_target_frame(frame);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static HWND get_target_present_hwnd(HWND hwnd, POINT *offset)
+{
+    HWND root = GetAncestor(hwnd, GA_ROOT);
+    POINT origin = {0, 0};
+
+    offset->x = 0;
+    offset->y = 0;
+
+    if (!root || root == hwnd)
+        return hwnd;
+
+    if (!ClientToScreen(hwnd, &origin))
+    {
+        WARN("Failed to map composition hwnd %p to screen coordinates, error %lu.\n",
+                hwnd, GetLastError());
+        return hwnd;
+    }
+    if (!ScreenToClient(root, &origin))
+    {
+        WARN("Failed to map composition hwnd %p to root hwnd %p coordinates, error %lu.\n",
+                hwnd, root, GetLastError());
+        return hwnd;
+    }
+
+    *offset = origin;
+    return root;
+}
+
+static BOOL present_target_frame(HWND hwnd, const struct dcomp_target_frame *frame)
+{
+    DWORD style = DCX_USESTYLE | DCX_CACHE;
+    RECT present_rect, client_rect;
+    POINT offset;
+    HWND present_hwnd;
+    HDC target_dc;
+    int src_x, src_y, width, height;
+    BOOL ret;
+
+    present_hwnd = get_target_present_hwnd(hwnd, &offset);
+    present_rect.left = offset.x;
+    present_rect.top = offset.y;
+    present_rect.right = offset.x + frame->client_rect.right - frame->client_rect.left;
+    present_rect.bottom = offset.y + frame->client_rect.bottom - frame->client_rect.top;
+
+    if (present_hwnd != hwnd)
+    {
+        if (!GetClientRect(present_hwnd, &client_rect))
+        {
+            WARN("Failed to get root composition hwnd %p client rect, error %lu.\n",
+                    present_hwnd, GetLastError());
+            return FALSE;
+        }
+        if (!IntersectRect(&present_rect, &present_rect, &client_rect))
+            return FALSE;
+    }
+
+    src_x = present_rect.left - offset.x;
+    src_y = present_rect.top - offset.y;
+    width = present_rect.right - present_rect.left;
+    height = present_rect.bottom - present_rect.top;
+    if (width <= 0 || height <= 0)
+        return FALSE;
+
+    if (!(target_dc = GetDCEx(present_hwnd, 0, style)))
+    {
+        WARN("Failed to get present DC for composition hwnd %p root %p, error %lu.\n",
+                hwnd, present_hwnd, GetLastError());
+        return FALSE;
+    }
+
+    ret = BitBlt(target_dc, present_rect.left, present_rect.top, width, height,
+            frame->dc, src_x, src_y, SRCCOPY);
+    if (!ret)
+        WARN("Failed to present composition frame hwnd %p root %p, error %lu.\n",
+                hwnd, present_hwnd, GetLastError());
+
+    ReleaseDC(present_hwnd, target_dc);
+    return ret;
+}
+
 static void clear_composition_target(const struct composition_target *target, HDC dc)
 {
     RECT rect;
@@ -1199,13 +1372,14 @@ static DWORD WINAPI composite_thread_proc(void *iface)
 
     while (TRUE)
     {
+        BOOL has_active_target = FALSE;
+
         dcomp_lock();
 
         count = 0;
         LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
         {
-            DWORD style = DCX_USESTYLE | DCX_CACHE;
-            HDC target_dc;
+            struct dcomp_target_frame frame;
 
             if (!target->root)
             {
@@ -1218,21 +1392,25 @@ static DWORD WINAPI composite_thread_proc(void *iface)
             if (target->shared_visual_handle)
                 continue;
 
+            has_active_target = TRUE;
             visual = impl_from_IDCompositionVisual(target->root);
-            if (!(target_dc = GetDCEx(target->hwnd, 0, style)))
+
+            if (!create_target_frame(target->hwnd, &frame))
+                continue;
+
+            clear_composition_target(target, frame.dc);
+            if (FAILED(do_composite(target, visual, frame.dc, 0.0f, 0.0f)))
             {
-                WARN("Failed to get target DC for composition hwnd %p, error %lu.\n",
-                        target->hwnd, GetLastError());
+                destroy_target_frame(&frame);
                 continue;
             }
 
-            clear_composition_target(target, target_dc);
-            if (SUCCEEDED(do_composite(target, visual, target_dc, 0.0f, 0.0f)))
+            if (present_target_frame(target->hwnd, &frame))
                 count++;
-            ReleaseDC(target->hwnd, target_dc);
+            destroy_target_frame(&frame);
         }
 
-        if (!count)
+        if (!count && !has_active_target)
         {
             TRACE("Composition thread exited.\n");
             device->thread_exited = TRUE;
