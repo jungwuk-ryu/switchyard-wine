@@ -98,6 +98,26 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static BOOL is_chromium_dcomp_target_window(HWND hwnd)
+{
+    static const WCHAR intermediate_d3d_window[] =
+        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcscmp(class_name, intermediate_d3d_window);
+}
+
 static const WCHAR wine_window_topmost_composed[] =
     {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
 static const WCHAR wine_window_non_topmost_composed[] =
@@ -146,6 +166,17 @@ static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
 
     if (!is_chromium_cef_child_window(hwnd)) return FALSE;
     if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
+}
+
+static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
+{
+    HWND root;
+
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+    if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
 
     root = NtUserGetAncestor(hwnd, GA_ROOT);
     return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
@@ -488,6 +519,9 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     CGImageRef image;
     BOOL clear_color_image;
     enum solid_surface_kind solid_kind;
+    macdrv_window root_composed_window = NULL;
+    POINT root_composed_offset = {0, 0};
+    BOOL root_composed_surface = FALSE;
 
     if (color_bits && color_bits != surface->bits)
         memcpy(surface->bits, color_bits, color_info->bmiHeader.biSizeImage);
@@ -495,7 +529,42 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     solid_kind = get_nearly_solid_surface_kind(color_info, color_bits ? color_bits : surface->bits);
 
     if ((surface->child || surface->remote_child || surface->foreign_child) &&
-        chromium_hwnd_uses_dcomp_root_composition(surface->header.hwnd))
+        chromium_hwnd_should_root_compose_surface(surface->header.hwnd))
+    {
+        HWND root = NtUserGetAncestor(surface->header.hwnd, GA_ROOT);
+        struct macdrv_win_data *root_data = root ? get_win_data(root) : NULL;
+
+        if (root_data && root_data->cocoa_window &&
+            get_child_root_offset(surface->header.hwnd, &root_composed_offset))
+        {
+            struct macdrv_win_data *data;
+
+            root_composed_window = root_data->cocoa_window;
+            root_composed_surface = TRUE;
+
+            if (surface->image_layer)
+            {
+                macdrv_destroy_image_layer(surface->image_layer);
+                surface->image_layer = NULL;
+            }
+            if (surface->foreign_child && surface->window)
+            {
+                macdrv_hide_cocoa_window(surface->window);
+                if ((data = get_win_data(surface->header.hwnd)))
+                {
+                    data->on_screen = FALSE;
+                    release_win_data(data);
+                }
+            }
+            TRACE("Switchyard composing Chromium/CEF child surface hwnd %p into DComp root %p backing at offset %s\n",
+                  surface->header.hwnd, root, wine_dbgstr_point(&root_composed_offset));
+        }
+        if (root_data)
+            release_win_data(root_data);
+    }
+
+    if ((surface->child || surface->remote_child || surface->foreign_child) &&
+        chromium_hwnd_uses_dcomp_root_composition(surface->header.hwnd) && !root_composed_surface)
     {
         if (surface->image_layer)
         {
@@ -504,7 +573,7 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
         }
         if (surface->foreign_child && surface->window)
             macdrv_hide_cocoa_window(surface->window);
-        TRACE("Switchyard suppressing Chromium/CEF child surface flush hwnd %p because DComp owns root composition\n",
+        TRACE("Switchyard suppressing Chromium/CEF DComp target surface flush hwnd %p because DComp owns root composition\n",
               surface->header.hwnd);
         return TRUE;
     }
@@ -539,7 +608,7 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
                               alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
         CGColorSpaceRelease(colorspace);
 
-        if (surface->child && !surface->image_layer)
+        if (!root_composed_surface && surface->child && !surface->image_layer)
         {
             POINT offset = surface->offset;
 
@@ -549,10 +618,17 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
             OffsetRect(&translated_rect, offset.x, offset.y);
             OffsetRect(&translated_dirty, offset.x, offset.y);
         }
-        else if (!surface->remote_child)
+        else if (!root_composed_surface && !surface->remote_child)
             sync_foreign_child_surface_frame(surface);
 
-        if (surface->image_layer)
+        if (root_composed_surface)
+        {
+            OffsetRect(&translated_rect, root_composed_offset.x, root_composed_offset.y);
+            OffsetRect(&translated_dirty, root_composed_offset.x, root_composed_offset.y);
+            macdrv_window_set_color_image(root_composed_window, image, cgrect_from_rect(translated_rect),
+                                          cgrect_from_rect(translated_dirty));
+        }
+        else if (surface->image_layer)
         {
             macdrv_image_layer_set_color_image(surface->image_layer, image, cgrect_from_rect(*rect));
             if (solid_kind == SOLID_SURFACE_NONE && is_chromium_cef_child_window(surface->header.hwnd))
@@ -735,6 +811,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     BOOL child = FALSE;
     BOOL remote_child = FALSE;
     BOOL foreign_child = FALSE;
+    BOOL root_composed_child = chromium_hwnd_should_root_compose_surface(hwnd);
     HWND remote_layer_root = NULL;
 
     TRACE("hwnd %p, layered %u, surface_rect %s, surface %p\n", hwnd, layered, wine_dbgstr_rect(surface_rect), surface);
@@ -745,7 +822,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
 
         if (!mac_surface->child && !mac_surface->remote_child && !mac_surface->foreign_child) return TRUE;
     }
-    if (chromium_hwnd_uses_dcomp_root_composition(hwnd))
+    if (chromium_hwnd_uses_dcomp_root_composition(hwnd) && !root_composed_child)
     {
         TRACE("Switchyard leaving Chromium/CEF child hwnd %p on Wine DComp root composition\n", hwnd);
         if (previous)
@@ -783,10 +860,11 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
 
                 NtUserMapWindowPoints(hwnd, root, &offset, 1, dpi);
                 window = root_data->cocoa_window;
-                remote_layer_root = root;
+                remote_layer_root = root_composed_child ? NULL : root;
                 child = TRUE;
-                TRACE("Switchyard redirecting Chromium/CEF child surface hwnd %p to root %p offset %s\n",
-                      hwnd, root, wine_dbgstr_point(&offset));
+                TRACE("Switchyard redirecting Chromium/CEF child surface hwnd %p to root %p offset %s%s\n",
+                      hwnd, root, wine_dbgstr_point(&offset),
+                      root_composed_child ? " for DComp root backing composition" : "");
             }
             release_win_data(root_data);
         }
@@ -794,7 +872,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
                    hwnd, root);
     }
 
-    if (!window && is_chromium_cef_child_window(hwnd) &&
+    if (!root_composed_child && !window && is_chromium_cef_child_window(hwnd) &&
         (remote_layer_root = NtUserGetAncestor(hwnd, GA_ROOT)) && remote_layer_root != hwnd &&
         can_host_remote_layer(hwnd, remote_layer_root))
     {
@@ -803,7 +881,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
               hwnd, remote_layer_root);
     }
 
-    if (!remote_child && !window && is_chromium_cef_child_window(hwnd) &&
+    if (!root_composed_child && !remote_child && !window && is_chromium_cef_child_window(hwnd) &&
         (data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
     {
         window = data->cocoa_window;
@@ -828,7 +906,7 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
             macdrv_release_foreign_child_win_data(hwnd);
     }
 
-    if (!*surface && remote_child && is_chromium_cef_child_window(hwnd) &&
+    if (!root_composed_child && !*surface && remote_child && is_chromium_cef_child_window(hwnd) &&
         (data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
     {
         window = data->cocoa_window;

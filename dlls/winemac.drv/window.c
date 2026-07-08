@@ -74,6 +74,26 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static BOOL is_chromium_dcomp_target_window(HWND hwnd)
+{
+    static const WCHAR intermediate_d3d_window[] =
+        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcscmp(class_name, intermediate_d3d_window);
+}
+
 static const WCHAR wine_window_topmost_composed[] =
     {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
 static const WCHAR wine_window_non_topmost_composed[] =
@@ -122,6 +142,17 @@ static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
 
     if (!is_chromium_cef_child_window(hwnd)) return FALSE;
     if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
+}
+
+static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
+{
+    HWND root;
+
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+    if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
 
     root = NtUserGetAncestor(hwnd, GA_ROOT);
     return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
@@ -2208,6 +2239,23 @@ BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const stru
             if (data->foreign_child && data->cocoa_window && data->on_screen)
                 hide_window(data);
             release_win_data(data);
+        }
+        if (chromium_hwnd_should_root_compose_surface(hwnd) &&
+            (root = NtUserGetAncestor(hwnd, GA_ROOT)) && root != hwnd)
+        {
+            struct macdrv_win_data *root_data = get_win_data(root);
+
+            if (root_data)
+            {
+                ret = !!root_data->cocoa_window;
+                release_win_data(root_data);
+            }
+            if (ret)
+            {
+                TRACE("Switchyard routing Chromium/CEF child window %p through DComp root %p backing surface\n",
+                      hwnd, root);
+                return TRUE;
+            }
         }
         TRACE("Switchyard keeping Chromium/CEF child window %p on Wine DComp root composition\n", hwnd);
         return FALSE;

@@ -2094,6 +2094,26 @@ static BOOL is_chromium_cef_child_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static BOOL is_chromium_dcomp_target_window(HWND hwnd)
+{
+    static const WCHAR intermediate_d3d_window[] =
+        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcscmp(class_name, intermediate_d3d_window);
+}
+
 static const WCHAR wine_window_topmost_composed[] =
     {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
 static const WCHAR wine_window_non_topmost_composed[] =
@@ -2147,6 +2167,17 @@ static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
     return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
 }
 
+static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
+{
+    HWND root;
+
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+    if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
+}
+
 static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
                                                   struct window_rects *rects, RECT *surface_rect )
 {
@@ -2173,7 +2204,8 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
-    else if (is_child && chromium_hwnd_uses_dcomp_root_composition(hwnd))
+    else if (is_child && chromium_hwnd_uses_dcomp_root_composition(hwnd) &&
+             !chromium_hwnd_should_root_compose_surface(hwnd))
     {
         TRACE( "keeping Chromium/CEF child window %p on its root surface because DComp owns composition\n", hwnd );
         needs_surface = FALSE;
