@@ -475,6 +475,7 @@ static BOOL should_suppress_chromium_placeholder_surface(struct macdrv_window_su
 
     if (!surface->child && !surface->remote_child && !surface->foreign_child) return FALSE;
     if (!is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
+    if (!chromium_hwnd_or_root_uses_dcomp_composition(surface->header.hwnd)) return FALSE;
     root = NtUserGetAncestor(surface->header.hwnd, GA_ROOT);
     if (!chromium_root_has_smaller_hosted_layer(root)) return FALSE;
     return !!find_full_root_chromium_placeholder(surface->header.hwnd, root);

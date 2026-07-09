@@ -2104,6 +2104,7 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         macdrv_window window;
         CGRect frame;
         BOOL restore_alpha = FALSE;
+        BOOL dcomp_root_composition;
         BOOL suppress_chromium_placeholder;
         BOOL remove_full_root_placeholder;
         BOOL clear_chromium_light_placeholder;
@@ -2112,8 +2113,11 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
-            suppress_chromium_placeholder = is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
-            remove_full_root_placeholder = is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
+            dcomp_root_composition = chromium_hwnd_or_root_uses_dcomp_composition(child);
+            suppress_chromium_placeholder = dcomp_root_composition &&
+                                           is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
+            remove_full_root_placeholder = dcomp_root_composition &&
+                                           is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
                                            has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
             if (remove_full_root_placeholder)
                 data->chromium_smaller_layer_hosted_once = TRUE;
@@ -2157,6 +2161,7 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         macdrv_window window = NULL;
         CGRect frame = CGRectNull;
         BOOL restore_alpha = FALSE;
+        BOOL dcomp_root_composition;
         BOOL suppress_chromium_placeholder;
         BOOL remove_full_root_placeholder;
         unsigned int context_id = (unsigned int)lp;
@@ -2164,8 +2169,11 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
-            suppress_chromium_placeholder = is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
-            remove_full_root_placeholder = is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
+            dcomp_root_composition = chromium_hwnd_or_root_uses_dcomp_composition(child);
+            suppress_chromium_placeholder = dcomp_root_composition &&
+                                           is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
+            remove_full_root_placeholder = dcomp_root_composition &&
+                                           is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
                                            has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
             if (remove_full_root_placeholder)
                 data->chromium_smaller_layer_hosted_once = TRUE;
