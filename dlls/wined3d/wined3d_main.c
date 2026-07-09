@@ -36,8 +36,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(d3d);
 WINE_DECLARE_DEBUG_CHANNEL(vkd3d);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
-extern void CDECL wine_get_host_version( const char **sysname, const char **release );
-
 struct wined3d_wndproc
 {
     struct wined3d *wined3d;
@@ -238,69 +236,6 @@ static DWORD get_config_key_dword(HKEY defkey, HKEY appkey, const char *env, con
 success:
     *value = data;
     return 0;
-}
-
-static BOOL switchyard_command_line_contains(const char *needle)
-{
-    const WCHAR *cmdline;
-    SIZE_T needle_len;
-    SIZE_T length, i, j;
-
-    if (!needle)
-        return FALSE;
-
-    needle_len = strlen( needle );
-
-    if (!needle_len || !(cmdline = GetCommandLineW()))
-        return FALSE;
-
-    for (length = 0; cmdline[length]; ++length)
-        ;
-    if (length < needle_len)
-        return FALSE;
-
-    for (i = 0; i <= length - needle_len; ++i)
-    {
-        for (j = 0; j < needle_len; ++j)
-        {
-            if (cmdline[i + j] != (unsigned char)needle[j])
-                break;
-        }
-
-        if (j == needle_len)
-            return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL switchyard_is_chromium_gpu_process(void)
-{
-    if (!switchyard_command_line_contains( "--type=gpu-process" ))
-        return FALSE;
-
-    return switchyard_command_line_contains( "--enable-chrome-runtime" )
-            || switchyard_command_line_contains( "--user-agent-product" )
-            || switchyard_command_line_contains( "--mojo-platform-channel-handle" );
-}
-
-static BOOL switchyard_is_macos(void)
-{
-    const char *sysname;
-
-    wine_get_host_version( &sysname, NULL );
-    return sysname && !strcmp( sysname, "Darwin" );
-}
-
-static void switchyard_select_renderer_defaults(void)
-{
-    if (wined3d_settings.renderer != WINED3D_RENDERER_AUTO)
-        return;
-    if (!switchyard_is_macos() || !switchyard_is_chromium_gpu_process())
-        return;
-
-    ERR_(winediag)("Switchyard using the Vulkan renderer for Chromium GPU helper process.\n");
-    wined3d_settings.renderer = WINED3D_RENDERER_VULKAN;
 }
 
 BOOL wined3d_get_app_name(char *app_name, unsigned int app_name_size)
@@ -537,8 +472,6 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
 
     if (appkey) RegCloseKey( appkey );
     if (hkey) RegCloseKey( hkey );
-
-    switchyard_select_renderer_defaults();
 
     if (!getenv( "VKD3D_DEBUG" ))
     {
