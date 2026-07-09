@@ -414,6 +414,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
     - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame;
     - (void) updateCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame;
+    - (void) updateCALayerHostZPosition:(CALayerHost*)host;
+    - (BOOL) caLayerHostFrame:(CGRect)frame nearlyEqualsFrame:(CGRect)other;
     - (void) removeCALayerHostView:(CAContextID)contextId;
     - (void) removeCALayerHostViewImmediately:(CAContextID)contextId;
     - (void) removeFullFrameCALayerHostViewsExceptContextId:(CAContextID)contextId;
@@ -866,6 +868,16 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         return _metalView;
     }
 
+    - (void) updateCALayerHostZPosition:(CALayerHost*)host
+    {
+        BOOL full_frame;
+
+        if (!host) return;
+
+        full_frame = [self caLayerHostFrame:host.frame nearlyEqualsFrame:self.layer.bounds];
+        host.zPosition = full_frame ? 0.0 : 1.0;
+    }
+
     - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame
     {
         if (!_caLayerHosts)
@@ -904,6 +916,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             host.frame = frame;
             host.autoresizingMask = 0;
         }
+        [self updateCALayerHostZPosition:host];
 
         [self.layer addSublayer:host];
         [_caLayerHosts setObject:host forKey:@(contextId)];
@@ -927,6 +940,14 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
             host.frame = frame;
+            [self updateCALayerHostZPosition:host];
+            [CATransaction commit];
+        }
+        else if (!CGRectIsNull(frame))
+        {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            [self updateCALayerHostZPosition:host];
             [CATransaction commit];
         }
     }
@@ -943,9 +964,11 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         NSNumber* key = @(contextId);
         CALayerHost* host = [_caLayerHosts objectForKey:key];
+        BOOL full_frame;
 
         if (!host) return;
         [host retain];
+        full_frame = [self caLayerHostFrame:host.frame nearlyEqualsFrame:self.layer.bounds];
         [_caLayerHosts removeObjectForKey:key];
 
         [CATransaction begin];
@@ -953,7 +976,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         if (immediately)
             [host removeFromSuperlayer];
         else
-            host.zPosition = 1.0;
+            host.zPosition = full_frame ? 0.0 : 1.0;
         [CATransaction commit];
 
         if (immediately)
