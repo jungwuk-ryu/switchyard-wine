@@ -38,8 +38,11 @@ CGImageRef create_cgimage_from_icon_bitmaps(HDC hdc, HANDLE icon, HBITMAP hbmCol
                                             unsigned char *mask_bits, int mask_size, int width,
                                             int height, int istep)
 {
-    int i;
-    BOOL has_alpha = FALSE;
+    int i, x, y;
+    BOOL has_alpha = FALSE, has_nonzero_alpha = FALSE, has_nonopaque_alpha = FALSE;
+    BOOL mask_drawn = FALSE, has_mask_transparency = FALSE;
+    unsigned int width_bytes = (width + 31) / 32 * 4;
+    unsigned int opaque_mask_pixels = 0, opaque_mask_nonopaque_alpha = 0;
     DWORD *ptr;
     CGBitmapInfo alpha_format;
     CGColorSpaceRef colorspace;
@@ -56,9 +59,61 @@ CGImageRef create_cgimage_from_icon_bitmaps(HDC hdc, HANDLE icon, HBITMAP hbmCol
         return NULL;
     }
 
-    /* check if the cursor frame was drawn with an alpha channel */
+    /* Check if the cursor frame was drawn with meaningful alpha.
+       Some 32-bpp icons leave unused alpha bytes set to 0xff or noisy
+       values while relying on the monochrome mask for transparency.
+       Treating that alpha as authoritative makes masked pixels opaque
+       black or punches noisy holes into the icon. */
     for (i = 0, ptr = (DWORD*)color_bits; i < width * height; i++, ptr++)
-        if ((has_alpha = (*ptr & 0xff000000) != 0)) break;
+    {
+        BYTE alpha = *ptr >> 24;
+
+        has_nonzero_alpha |= !!alpha;
+        has_nonopaque_alpha |= (alpha != 0xff);
+        if ((has_alpha = has_nonzero_alpha && has_nonopaque_alpha)) break;
+    }
+
+    if (has_alpha)
+    {
+        memset(mask_bits, 0xFF, mask_size);
+        NtGdiSelectBitmap(hdc, hbmMask);
+        if (!NtUserDrawIconEx(hdc, 0, 0, icon, width, height, istep, NULL, DI_MASK))
+            WARN("Failed to draw frame mask %d.\n", istep);
+        else
+        {
+            DWORD *pixel = (DWORD*)color_bits;
+            unsigned int opaque_threshold;
+
+            mask_drawn = TRUE;
+            for (y = 0; y < height; y++)
+            {
+                unsigned char *mask_row = mask_bits + y * width_bytes;
+
+                for (x = 0; x < width; x++, pixel++)
+                {
+                    BOOL mask_transparent = !!(mask_row[x >> 3] & (0x80 >> (x & 7)));
+                    BYTE alpha = *pixel >> 24;
+
+                    if (mask_transparent)
+                    {
+                        has_mask_transparency = TRUE;
+                        continue;
+                    }
+
+                    opaque_mask_pixels++;
+                    if (alpha != 0xff) opaque_mask_nonopaque_alpha++;
+                }
+            }
+
+            opaque_threshold = max(16u, opaque_mask_pixels / 8);
+            if (has_mask_transparency && opaque_mask_nonopaque_alpha > opaque_threshold)
+            {
+                TRACE("ignoring noisy alpha channel for frame %d: %u nonopaque alpha pixels inside %u opaque mask pixels\n",
+                      istep, opaque_mask_nonopaque_alpha, opaque_mask_pixels);
+                has_alpha = FALSE;
+            }
+        }
+    }
 
     if (has_alpha)
         alpha_format = kCGImageAlphaFirst;
@@ -103,17 +158,19 @@ CGImageRef create_cgimage_from_icon_bitmaps(HDC hdc, HANDLE icon, HBITMAP hbmCol
     /* if no alpha channel was drawn then generate it from the mask */
     if (!has_alpha)
     {
-        unsigned int width_bytes = (width + 31) / 32 * 4;
         CGImageRef cgmask, temp;
 
         /* draw the cursor mask to a temporary buffer */
-        memset(mask_bits, 0xFF, mask_size);
-        NtGdiSelectBitmap(hdc, hbmMask);
-        if (!NtUserDrawIconEx(hdc, 0, 0, icon, width, height, istep, NULL, DI_MASK))
+        if (!mask_drawn)
         {
-            WARN("Failed to draw frame mask %d.\n", istep);
-            CGImageRelease(cgimage);
-            return NULL;
+            memset(mask_bits, 0xFF, mask_size);
+            NtGdiSelectBitmap(hdc, hbmMask);
+            if (!NtUserDrawIconEx(hdc, 0, 0, icon, width, height, istep, NULL, DI_MASK))
+            {
+                WARN("Failed to draw frame mask %d.\n", istep);
+                CGImageRelease(cgimage);
+                return NULL;
+            }
         }
 
         data = CFDataCreate(NULL, (UInt8*)mask_bits, mask_size);
