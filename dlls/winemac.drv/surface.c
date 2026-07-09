@@ -247,6 +247,34 @@ static BOOL chromium_hwnd_or_root_uses_dcomp_composition(HWND hwnd)
     return root && chromium_root_uses_dcomp_composition(root);
 }
 
+static BOOL chromium_hwnd_or_owner_uses_dcomp_composition(HWND hwnd)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    HWND owner;
+
+    if (!root) return FALSE;
+    if (chromium_hwnd_or_root_uses_dcomp_composition(hwnd)) return TRUE;
+    owner = NtUserGetAncestor(root, GA_ROOTOWNER);
+    return owner && owner != root &&
+           is_chromium_cef_child_window(root) && is_chromium_cef_child_window(owner) &&
+           chromium_root_uses_dcomp_composition(owner);
+}
+
+static HWND get_chromium_owner_composition_root(HWND hwnd)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    HWND owner;
+
+    if (!root) return NULL;
+    owner = NtUserGetAncestor(root, GA_ROOTOWNER);
+    if (owner && owner != root &&
+        is_chromium_cef_child_window(root) && is_chromium_cef_child_window(owner) &&
+        (chromium_root_uses_dcomp_composition(root) || chromium_root_uses_dcomp_composition(owner)))
+        return owner;
+
+    return root;
+}
+
 static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
 {
     HWND root;
@@ -260,18 +288,21 @@ static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
 
 static BOOL chromium_hwnd_should_relay_root_surface(HWND hwnd, HWND *root_ret)
 {
-    HWND root;
+    HWND source_root, root;
     struct macdrv_win_data *root_data;
     DWORD root_thread_id;
     BOOL has_owner_root_window = FALSE;
+    BOOL relay_to_owner_root;
 
     if (root_ret) *root_ret = NULL;
     if (!is_chromium_cef_child_window(hwnd)) return FALSE;
     if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
-    if (!chromium_hwnd_or_root_uses_dcomp_composition(hwnd)) return FALSE;
+    if (!chromium_hwnd_or_owner_uses_dcomp_composition(hwnd)) return FALSE;
 
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    source_root = NtUserGetAncestor(hwnd, GA_ROOT);
+    root = get_chromium_owner_composition_root(hwnd);
     if (!root) return FALSE;
+    relay_to_owner_root = source_root && source_root != root;
     root_thread_id = NtUserGetWindowThread(root, NULL);
 
     if ((root_data = get_win_data(root)))
@@ -287,10 +318,21 @@ static BOOL chromium_hwnd_should_relay_root_surface(HWND hwnd, HWND *root_ret)
                                 root_data->cocoa_window && !root_data->foreign_child;
         release_win_data(root_data);
     }
-    if (has_owner_root_window) return FALSE;
+    if (has_owner_root_window && !relay_to_owner_root) return FALSE;
 
     if (root_ret) *root_ret = root;
     return TRUE;
+}
+
+static BOOL chromium_root_surface_should_preserve_alpha(HWND root, HWND source)
+{
+    HWND source_root = NtUserGetAncestor(source, GA_ROOT);
+    HWND source_owner = source_root ? NtUserGetAncestor(source_root, GA_ROOTOWNER) : NULL;
+
+    return source_root && source_owner && source_owner == root && source_owner != source_root &&
+           is_chromium_cef_child_window(source_root) && is_chromium_cef_child_window(root) &&
+           (chromium_root_uses_dcomp_composition(source_root) ||
+            chromium_root_uses_dcomp_composition(root));
 }
 
 static BOOL root_surface_header_is_valid(const struct root_surface_shm_header *header, SIZE_T map_size)
@@ -581,6 +623,8 @@ static BOOL relay_root_surface_flush(struct macdrv_window_surface *surface, cons
     header->stride = stride;
     header->bits_size = (UINT)bits_size;
     header->alpha_mask = surface->header.alpha_mask;
+    if (!header->alpha_mask && chromium_root_surface_should_preserve_alpha(root, surface->header.hwnd))
+        header->alpha_mask = 0xff000000;
     memcpy((BYTE *)map + sizeof(*header), pixels, bits_size);
     header->sequence++;
     munmap(map, map_size);
@@ -598,7 +642,7 @@ BOOL macdrv_present_root_surface(HWND root, HWND source)
     CGColorSpaceRef colorspace;
     CGDataProviderRef provider;
     CGImageAlphaInfo alpha_info;
-    CGImageRef image;
+    CGImageRef image, cropped_image;
     macdrv_window window;
     POINT offset;
     SIZE_T map_size;
@@ -611,8 +655,14 @@ BOOL macdrv_present_root_surface(HWND root, HWND source)
     int fd;
 
     if (!root || !source) return FALSE;
-    if (source != root && NtUserGetAncestor(source, GA_ROOT) != root) return FALSE;
-    if (!chromium_hwnd_or_root_uses_dcomp_composition(source)) return FALSE;
+    if (source != root)
+    {
+        HWND source_root = NtUserGetAncestor(source, GA_ROOT);
+        HWND source_owner = source_root ? NtUserGetAncestor(source_root, GA_ROOTOWNER) : NULL;
+
+        if (source_root != root && source_owner != root) return FALSE;
+    }
+    if (!chromium_hwnd_or_owner_uses_dcomp_composition(source)) return FALSE;
 
     root_surface_shm_name(name, sizeof(name), root, source);
     if ((fd = shm_open(name, O_RDONLY, 0600)) == -1)
@@ -671,10 +721,41 @@ BOOL macdrv_present_root_surface(HWND root, HWND source)
     munmap(map, map_size);
     if (!image) return FALSE;
 
+    if (rect.left < 0 || rect.top < 0)
+    {
+        int crop_x = rect.left < 0 ? -rect.left : 0;
+        int crop_y = rect.top < 0 ? -rect.top : 0;
+        size_t image_width = CGImageGetWidth(image);
+        size_t image_height = CGImageGetHeight(image);
+        CGRect crop_rect;
+
+        if ((size_t)crop_x >= image_width || (size_t)crop_y >= image_height)
+        {
+            CGImageRelease(image);
+            return FALSE;
+        }
+
+        crop_rect = CGRectMake(crop_x, crop_y, image_width - crop_x, image_height - crop_y);
+        if (!(cropped_image = CGImageCreateWithImageInRect(image, crop_rect)))
+        {
+            CGImageRelease(image);
+            return FALSE;
+        }
+        CGImageRelease(image);
+        image = cropped_image;
+
+        if (crop_x) rect.left = 0;
+        if (crop_y) rect.top = 0;
+        if (dirty.left < rect.left) dirty.left = rect.left;
+        if (dirty.top < rect.top) dirty.top = rect.top;
+        if (dirty.right > rect.right) dirty.right = rect.right;
+        if (dirty.bottom > rect.bottom) dirty.bottom = rect.bottom;
+    }
+
     image_rect = cgrect_from_rect(rect);
     dirty_rect = cgrect_from_rect(dirty);
-    TRACE("Switchyard presenting Chromium/CEF surface hwnd %p into DComp root %p backing rect %s dirty %s\n",
-          source, root, wine_dbgstr_rect(&rect), wine_dbgstr_rect(&dirty));
+    TRACE("Switchyard presenting Chromium/CEF surface hwnd %p into DComp root %p backing rect %s dirty %s alpha %#x\n",
+          source, root, wine_dbgstr_rect(&rect), wine_dbgstr_rect(&dirty), header->alpha_mask);
     macdrv_window_set_color_image(window, image, image_rect, dirty_rect);
     CGImageRelease(image);
     return TRUE;

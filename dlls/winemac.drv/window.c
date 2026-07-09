@@ -158,6 +158,18 @@ static BOOL chromium_hwnd_or_root_uses_dcomp_composition(HWND hwnd)
     return root && chromium_root_uses_dcomp_composition(root);
 }
 
+static BOOL chromium_hwnd_uses_owner_composition(HWND hwnd)
+{
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    HWND owner;
+
+    if (!root || root != hwnd) return FALSE;
+    owner = NtUserGetAncestor(root, GA_ROOTOWNER);
+    return owner && owner != root &&
+           is_chromium_cef_child_window(root) && is_chromium_cef_child_window(owner) &&
+           (chromium_root_uses_dcomp_composition(root) || chromium_root_uses_dcomp_composition(owner));
+}
+
 static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
 {
     HWND root;
@@ -916,7 +928,11 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
 
     if (parent == NtUserGetDesktopWindow() || foreign_chromium_child)
     {
-        create_cocoa_window(data);
+        if (chromium_hwnd_uses_owner_composition(hwnd))
+            TRACE("not creating owned Chromium/CEF popup mac window for hwnd %p because DComp presents through owner root\n",
+                  hwnd);
+        else
+            create_cocoa_window(data);
         if (foreign_chromium_child && data->cocoa_window) show_window(data);
         TRACE("win %p/%p window %s whole %s client %s\n",
                hwnd, data->cocoa_window, wine_dbgstr_rect(&data->rects.window),
@@ -2285,6 +2301,23 @@ BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const stru
         return FALSE;
     }
 
+    if (chromium_hwnd_uses_owner_composition(hwnd))
+    {
+        if (data)
+        {
+            if (data->cocoa_window)
+            {
+                TRACE("Switchyard destroying owned Chromium/CEF popup mac window for hwnd %p because DComp presents through owner root\n",
+                      hwnd);
+                destroy_cocoa_window(data);
+            }
+            release_win_data(data);
+        }
+        TRACE("Switchyard keeping owned Chromium/CEF popup hwnd %p on owner DComp root composition\n",
+              hwnd);
+        return FALSE;
+    }
+
     if (!data && !(data = macdrv_create_win_data(hwnd, rects))) return FALSE; /* use default surface */
     data->shaped = shaped;
 
@@ -2351,6 +2384,17 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
     TRACE("win %p/%p new_rects %s style %08x flags %08x surface %p\n", hwnd, data->cocoa_window,
           debugstr_window_rects(new_rects), new_style, swp_flags, surface);
+
+    if (chromium_hwnd_uses_owner_composition(hwnd))
+    {
+        if (data->cocoa_window)
+        {
+            TRACE("Switchyard destroying owned Chromium/CEF popup mac window for hwnd %p after owner DComp composition became active\n",
+                  hwnd);
+            destroy_cocoa_window(data);
+        }
+        goto done;
+    }
 
     if (!data->cocoa_window) goto done;
 
