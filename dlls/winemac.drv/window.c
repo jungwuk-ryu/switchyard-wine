@@ -468,6 +468,40 @@ static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, 
     return ret;
 }
 
+static BOOL chrome_root_should_use_custom_frame(HWND hwnd, DWORD style, DWORD ex_style)
+{
+    HWND root;
+
+    if (!is_chrome_widget_window(hwnd)) return FALSE;
+    if ((style & (WS_CHILD | WS_CAPTION)) != WS_CAPTION) return FALSE;
+    if (ex_style & WS_EX_TOOLWINDOW) return FALSE;
+    if (NtUserGetWindowRelative(hwnd, GW_OWNER)) return FALSE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && root == hwnd;
+}
+
+static BOOL win_data_uses_chrome_custom_frame(struct macdrv_win_data *data)
+{
+    DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+    DWORD ex_style = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
+
+    return chrome_root_should_use_custom_frame(data->hwnd, style, ex_style);
+}
+
+static const RECT *get_cocoa_frame_rect(struct macdrv_win_data *data)
+{
+    if (win_data_uses_chrome_custom_frame(data)) return &data->rects.window;
+    return &data->rects.visible;
+}
+
+static void offset_client_rect_to_cocoa_frame(struct macdrv_win_data *data, RECT *rect)
+{
+    const RECT *frame_rect = get_cocoa_frame_rect(data);
+
+    OffsetRect(rect, data->rects.client.left - frame_rect->left,
+               data->rects.client.top - frame_rect->top);
+}
 
 static struct macdrv_window_features get_window_features_for_style(DWORD style, DWORD ex_style, BOOL shaped)
 {
@@ -506,6 +540,13 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
     struct macdrv_window_features wf = {0};
 
     if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
+    if (chrome_root_should_use_custom_frame(data->hwnd, style, ex_style))
+    {
+        wf.shadow = TRUE;
+        if ((style & WS_THICKFRAME) && !data->shaped) wf.resizable = TRUE;
+        TRACE("Switchyard using borderless Chrome custom frame for hwnd %p\n", data->hwnd);
+        return wf;
+    }
     if (EqualRect(&data->rects.window, &data->rects.visible)) return wf;
 
     return get_window_features_for_style(style, ex_style, data->shaped);
@@ -922,7 +963,7 @@ static void create_cocoa_window(struct macdrv_win_data *data)
 
     wf = get_cocoa_window_features(data, style, ex_style);
 
-    frame = cgrect_from_rect(data->rects.visible);
+    frame = cgrect_from_rect(*get_cocoa_frame_rect(data));
     constrain_window_frame(&frame.origin, &frame.size);
     if (frame.size.width < 1 || frame.size.height < 1)
         frame.size.width = frame.size.height = 1;
@@ -1299,7 +1340,7 @@ RGNDATA *get_region_data(HRGN hrgn, HDC hdc_lptodp)
  */
 static void sync_window_position(struct macdrv_win_data *data, UINT swp_flags, const struct window_rects *old_rects)
 {
-    CGRect frame = cgrect_from_rect(data->rects.visible);
+    CGRect frame = cgrect_from_rect(*get_cocoa_frame_rect(data));
 
     if (data->cocoa_window)
     {
@@ -1662,7 +1703,7 @@ static void macdrv_client_surface_update(struct client_surface *client)
     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
 
     if (!(data = get_win_data(toplevel))) return;
-    OffsetRect(&rect, data->rects.client.left - data->rects.visible.left, data->rects.client.top - data->rects.visible.top);
+    offset_client_rect_to_cocoa_frame(data, &rect);
     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
     release_win_data(data);
@@ -2128,8 +2169,7 @@ static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expect
             return NULL;
         }
         NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
-        OffsetRect(&rect, root_data->rects.client.left - root_data->rects.visible.left,
-                   root_data->rects.client.top - root_data->rects.visible.top);
+        offset_client_rect_to_cocoa_frame(root_data, &rect);
         *frame = cgrect_mac_from_win(cgrect_from_rect(rect));
     }
 
@@ -2433,7 +2473,10 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
 {
     struct macdrv_window_features wf = get_window_features_for_style(style, ex_style, FALSE);
 
-    *style_mask = ex_style = 0;
+    *style_mask = *ex_style_mask = 0;
+    if (chrome_root_should_use_custom_frame(hwnd, style, ex_style))
+        return TRUE;
+
     if (wf.title_bar)
     {
         *style_mask |= WS_CAPTION;

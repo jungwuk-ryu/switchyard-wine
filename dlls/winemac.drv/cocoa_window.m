@@ -79,7 +79,11 @@ static NSUInteger style_mask_for_features(const struct macdrv_window_features* w
         if (wf->resizable || wf->maximize_button) style_mask |= NSWindowStyleMaskResizable;
         if (wf->utility) style_mask |= NSWindowStyleMaskUtilityWindow;
     }
-    else style_mask = NSWindowStyleMaskBorderless;
+    else
+    {
+        style_mask = NSWindowStyleMaskBorderless;
+        if (wf->resizable) style_mask |= NSWindowStyleMaskResizable;
+    }
 
     if (wf->prevents_app_activation) style_mask |= NSWindowStyleMaskNonactivatingPanel;
 
