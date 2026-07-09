@@ -179,6 +179,7 @@ static void dynamic_texture_destroy_cache(struct composition_dynamic_texture *te
         DeleteObject(texture->cache_bitmap);
         texture->cache_bitmap = NULL;
     }
+    texture->cache_bits = NULL;
     texture->cache_width = 0;
     texture->cache_height = 0;
     texture->cache_valid = FALSE;
@@ -356,7 +357,7 @@ HRESULT dcomp_dynamic_texture_get_dxgi_surface(IDCompositionDynamicTexture *ifac
 }
 
 static HRESULT dynamic_texture_update_cache(struct composition_dynamic_texture *texture,
-        HDC src_dc, UINT width, UINT height, HDC *cache_dc)
+        HDC src_dc, UINT width, UINT height, BOOL preserve_alpha, HDC *cache_dc)
 {
     RECT bounds = {0, 0, width, height}, update_rect = bounds;
     BITMAPINFO bitmap_info = {{0}};
@@ -376,7 +377,7 @@ static HRESULT dynamic_texture_update_cache(struct composition_dynamic_texture *
             return HRESULT_FROM_WIN32(GetLastError());
 
         if (!(texture->cache_bitmap = CreateDIBSection(src_dc, &bitmap_info, DIB_RGB_COLORS,
-                NULL, NULL, 0)))
+                &texture->cache_bits, NULL, 0)))
         {
             DWORD error = GetLastError();
             dynamic_texture_destroy_cache(texture);
@@ -399,6 +400,38 @@ static HRESULT dynamic_texture_update_cache(struct composition_dynamic_texture *
 
     TRACE("Updating dynamic texture cache %p from rect %s.\n", texture->cache_bitmap,
             wine_dbgstr_rect(&update_rect));
+
+    if (preserve_alpha && texture->cache_bits)
+    {
+        HGDIOBJ bitmap = GetCurrentObject(src_dc, OBJ_BITMAP);
+        DIBSECTION dib;
+
+        if (bitmap && GetObjectW(bitmap, sizeof(dib), &dib) == sizeof(dib) &&
+                dib.dsBm.bmBits && dib.dsBm.bmBitsPixel == 32 &&
+                dib.dsBm.bmWidth >= (LONG)width && abs(dib.dsBm.bmHeight) >= (LONG)height)
+        {
+            BYTE *dst_bits = texture->cache_bits;
+            const BYTE *src_bits = dib.dsBm.bmBits;
+            LONG src_stride = dib.dsBm.bmWidthBytes;
+            BOOL src_top_down = dib.dsBmih.biHeight < 0;
+            unsigned int y;
+
+            for (y = update_rect.top; y < (unsigned int)update_rect.bottom; y++)
+            {
+                unsigned int src_y = src_top_down ? y : abs(dib.dsBm.bmHeight) - 1 - y;
+
+                memcpy(dst_bits + y * width * 4 + update_rect.left * 4,
+                        src_bits + src_y * src_stride + update_rect.left * 4,
+                        (update_rect.right - update_rect.left) * 4);
+            }
+
+            texture->cache_valid = TRUE;
+            *cache_dc = texture->cache_dc;
+            return S_OK;
+        }
+
+        TRACE("Dynamic texture source DC has no readable 32-bit DIBSECTION alpha; falling back to BitBlt.\n");
+    }
 
     if (!BitBlt(texture->cache_dc, update_rect.left, update_rect.top,
             update_rect.right - update_rect.left, update_rect.bottom - update_rect.top,
@@ -829,6 +862,14 @@ static void dcomp_blit_dc_to_target(const struct composition_target *target,
         ReleaseDC(target->hwnd, dst_dc);
 }
 
+static BOOL dcomp_target_needs_alpha_cache(const struct composition_target *target)
+{
+    HWND root = target->hwnd ? GetAncestor(target->hwnd, GA_ROOT) : NULL;
+    HWND present_root = target->hwnd ? get_chromium_composition_present_root(target->hwnd) : NULL;
+
+    return root && present_root && root != present_root;
+}
+
 static void do_composite_dxgi_surface(const struct composition_target *target,
                                       const struct composition_visual *visual,
                                       IDXGISurface *dxgi_surface,
@@ -852,6 +893,7 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
     HDC cache_dc = NULL;
     HDC src_dc;
     D2D1_SIZE_U size;
+    BOOL preserve_dynamic_alpha;
     BLENDFUNCTION blend_func = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     HRESULT hr;
 
@@ -941,6 +983,7 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
 
     size.width = surface_desc.Width;
     size.height = surface_desc.Height;
+    preserve_dynamic_alpha = blend_func.AlphaFormat == AC_SRC_ALPHA && dcomp_target_needs_alpha_cache(target);
 
     if (dynamic_texture && SUCCEEDED(hr = IDXGISurface_QueryInterface(dxgi_surface,
             &IID_IDXGISurface1, (void **)&dxgi_surface1)))
@@ -949,7 +992,8 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
 
         if (SUCCEEDED(hr = IDXGISurface1_GetDC(dxgi_surface1, FALSE, &src_dc)))
         {
-            hr = dynamic_texture_update_cache(texture, src_dc, size.width, size.height, &cache_dc);
+            hr = dynamic_texture_update_cache(texture, src_dc, size.width, size.height,
+                    preserve_dynamic_alpha, &cache_dc);
             IDXGISurface1_ReleaseDC(dxgi_surface1, NULL);
             if (FAILED(hr))
             {
@@ -1009,7 +1053,8 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
     {
         struct composition_dynamic_texture *texture = impl_from_IDCompositionDynamicTexture(dynamic_texture);
 
-        if (FAILED(hr = dynamic_texture_update_cache(texture, src_dc, size.width, size.height, &cache_dc)))
+        if (FAILED(hr = dynamic_texture_update_cache(texture, src_dc, size.width, size.height,
+                preserve_dynamic_alpha, &cache_dc)))
         {
             WARN("Failed to update dynamic texture cache, hr %#lx.\n", hr);
             goto release_dc_target;

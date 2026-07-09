@@ -70,6 +70,7 @@ struct composition_dynamic_texture
     BOOL has_damage_rect;
     HDC cache_dc;
     HBITMAP cache_bitmap;
+    void *cache_bits;
     HGDIOBJ old_cache_bitmap;
     UINT cache_width;
     UINT cache_height;
