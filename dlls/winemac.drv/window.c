@@ -98,6 +98,8 @@ static const WCHAR wine_window_topmost_composed[] =
     {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
 static const WCHAR wine_window_non_topmost_composed[] =
     {'w','i','n','e','_','w','i','n','d','o','w','_','n','o','n','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
+static const WCHAR wine_window_owner_composed[] =
+    {'w','i','n','e','_','w','i','n','d','o','w','_','o','w','n','e','r','_','c','o','m','p','o','s','e','d',0};
 
 static BOOL is_dcomp_composed_hwnd(HWND hwnd)
 {
@@ -165,9 +167,12 @@ static BOOL chromium_hwnd_uses_owner_composition(HWND hwnd)
 
     if (!root || root != hwnd) return FALSE;
     owner = NtUserGetAncestor(root, GA_ROOTOWNER);
-    return owner && owner != root &&
-           is_chromium_cef_child_window(root) && is_chromium_cef_child_window(owner) &&
-           (chromium_root_uses_dcomp_composition(root) || chromium_root_uses_dcomp_composition(owner));
+    if (!owner || owner == root ||
+            !is_chromium_cef_child_window(root) || !is_chromium_cef_child_window(owner))
+        return FALSE;
+    if (NtUserGetProp(hwnd, wine_window_owner_composed)) return TRUE;
+
+    return chromium_root_uses_dcomp_composition(root) || chromium_root_uses_dcomp_composition(owner);
 }
 
 static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)

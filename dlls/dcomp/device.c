@@ -57,6 +57,9 @@ static CRITICAL_SECTION_DEBUG dcomp_debug =
 };
 static CRITICAL_SECTION dcomp_cs = { &dcomp_debug, -1, 0, 0, 0, 0 };
 
+static const WCHAR wine_window_owner_composed[] =
+    {'w','i','n','e','_','w','i','n','d','o','w','_','o','w','n','e','r','_','c','o','m','p','o','s','e','d',0};
+
 static BOOL is_chromium_composition_window(HWND hwnd)
 {
     static const WCHAR cef_browser_window[] =
@@ -92,6 +95,20 @@ static HWND get_chromium_composition_present_root(HWND hwnd)
         return owner;
 
     return root;
+}
+
+static void mark_chromium_owner_composed_window(HWND hwnd)
+{
+    HWND root;
+
+    if (!hwnd) return;
+    root = GetAncestor(hwnd, GA_ROOT);
+    if (!root) root = hwnd;
+    if (GetPropW(root, wine_window_owner_composed)) return;
+
+    SetPropW(root, wine_window_owner_composed, (HANDLE)1);
+    SetWindowPos(root, 0, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 }
 
 void dcomp_lock(void)
@@ -1747,6 +1764,8 @@ static DWORD WINAPI composite_thread_proc(void *iface)
             if (alpha_present)
             {
                 unsigned int scrubbed = scrub_target_frame_edge_black_alpha(&frame->frame);
+
+                mark_chromium_owner_composed_window(target->hwnd);
 
                 if (scrubbed)
                     TRACE("Switchyard scrubbed %u edge-black DComp alpha pixels hwnd %p for root %p rect %s.\n",
