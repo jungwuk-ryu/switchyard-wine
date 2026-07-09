@@ -464,6 +464,12 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) becameIneligibleChild;
 
     - (void) windowDidDrawContent;
+    - (BOOL) trackParentWindowNumber:(CGWindowID)parentWindowNumber
+                         parentFrame:(CGRect)parentFrame childFrame:(CGRect)childFrame;
+    - (void) stopTrackingParentWindow;
+    + (void) syncTrackedParentWindows;
+    + (void) trackedParentWindowsTimerFired:(NSTimer*)timer;
+    - (void) updateTrackedParentBounds:(CGRect)parentBounds;
 
 @end
 
@@ -1333,6 +1339,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @implementation WineWindow
 
     static WineWindow* causing_becomeKeyWindow;
+    static NSMutableSet* trackedParentWindows;
+    static NSTimer* trackedParentWindowsTimer;
 
     @synthesize disabled, noForeground, preventsAppActivation, floating, fullscreen, fakingClose, closing, latentParentWindow, hwnd, queue;
     @synthesize drawnSinceShown;
@@ -1429,6 +1437,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) dealloc
     {
+        [self stopTrackingParentWindow];
         [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
         [[NSNotificationCenter defaultCenter] removeObserver:self];
         [queue release];
@@ -1436,6 +1445,171 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         [latentParentWindow release];
         [contentViewMaskLayer release];
         [super dealloc];
+    }
+
+    - (void) updateTrackedParentBounds:(CGRect)parentBounds
+    {
+        CGRect childFrame;
+
+        childFrame.origin.x = parentBounds.origin.x + trackedParentLeftInset;
+        childFrame.origin.y = parentBounds.origin.y + trackedParentTopInset;
+        childFrame.size.width = MAX(1, parentBounds.size.width - trackedParentLeftInset -
+                                      trackedParentRightInset);
+        childFrame.size.height = MAX(1, parentBounds.size.height - trackedParentTopInset -
+                                       trackedParentBottomInset);
+        if (!trackedParentHasChildFrame || !CGRectEqualToRect(childFrame, trackedParentLastChildFrame))
+        {
+            [self setFrameFromWine:NSRectFromCGRect(cgrect_mac_from_win(childFrame))];
+            trackedParentLastChildFrame = childFrame;
+            trackedParentHasChildFrame = YES;
+        }
+    }
+
+    + (void) syncTrackedParentWindows
+    {
+        CFArrayRef windowInfo;
+        NSMutableDictionary* boundsByNumber;
+        NSMutableDictionary* indicesByNumber;
+        NSMutableDictionary* groups;
+        NSUInteger i;
+
+        if (![trackedParentWindows count]) return;
+        windowInfo = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
+                                                kCGWindowListExcludeDesktopElements,
+                                                kCGNullWindowID);
+        if (!windowInfo)
+        {
+            for (WineWindow* window in trackedParentWindows)
+                if ([window isOrderedIn]) [window doOrderOut];
+            return;
+        }
+
+        boundsByNumber = [NSMutableDictionary dictionary];
+        indicesByNumber = [NSMutableDictionary dictionary];
+        groups = [NSMutableDictionary dictionary];
+        for (i = 0; i < CFArrayGetCount(windowInfo); i++)
+        {
+            CFDictionaryRef info = CFArrayGetValueAtIndex(windowInfo, i);
+            CFNumberRef number = CFDictionaryGetValue(info, kCGWindowNumber);
+            CFDictionaryRef boundsDict = CFDictionaryGetValue(info, kCGWindowBounds);
+            CGRect bounds;
+            int value = 0;
+
+            if (!number || !boundsDict || !CFNumberGetValue(number, kCFNumberIntType, &value) ||
+                !CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds))
+                continue;
+            NSNumber* key = [NSNumber numberWithUnsignedInt:(unsigned int)value];
+            [boundsByNumber setObject:[NSValue valueWithBytes:&bounds objCType:@encode(CGRect)] forKey:key];
+            [indicesByNumber setObject:[NSNumber numberWithUnsignedInteger:i] forKey:key];
+        }
+
+        for (WineWindow* window in trackedParentWindows)
+        {
+            NSNumber* parentKey = [NSNumber numberWithUnsignedInt:window->trackedParentWindowNumber];
+            NSValue* parentValue = [boundsByNumber objectForKey:parentKey];
+            CGRect parentBounds;
+
+            if (!window->trackedParentWindowNumber || !parentValue)
+            {
+                if ([window isOrderedIn]) [window doOrderOut];
+                continue;
+            }
+
+            [parentValue getValue:&parentBounds];
+            [window updateTrackedParentBounds:parentBounds];
+            NSMutableArray* group = [groups objectForKey:parentKey];
+            if (!group)
+            {
+                group = [NSMutableArray array];
+                [groups setObject:group forKey:parentKey];
+            }
+            [group addObject:window];
+        }
+
+        for (NSNumber* parentKey in groups)
+        {
+            NSMutableArray* group = [groups objectForKey:parentKey];
+            NSUInteger parentIndex = [[indicesByNumber objectForKey:parentKey] unsignedIntegerValue];
+            BOOL ordered = parentIndex >= [group count];
+
+            [group sortUsingComparator:^NSComparisonResult(WineWindow* left, WineWindow* right) {
+                uintptr_t leftHwnd = (uintptr_t)left.hwnd;
+                uintptr_t rightHwnd = (uintptr_t)right.hwnd;
+
+                if (leftHwnd < rightHwnd) return NSOrderedAscending;
+                if (leftHwnd > rightHwnd) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+
+            for (i = 0; ordered && i < [group count]; i++)
+            {
+                WineWindow* window = [group objectAtIndex:i];
+                NSNumber* childKey = [NSNumber numberWithInteger:window.windowNumber];
+                NSNumber* childIndex = [indicesByNumber objectForKey:childKey];
+
+                if (!childIndex || [childIndex unsignedIntegerValue] != parentIndex - [group count] + i)
+                    ordered = NO;
+            }
+            if (!ordered)
+            {
+                NSInteger relativeWindowNumber = [parentKey integerValue];
+
+                for (i = [group count]; i > 0; i--)
+                {
+                    WineWindow* window = [group objectAtIndex:i - 1];
+
+                    [window orderWindow:NSWindowAbove relativeTo:relativeWindowNumber];
+                    relativeWindowNumber = window.windowNumber;
+                }
+            }
+        }
+
+        CFRelease(windowInfo);
+    }
+
+    + (void) trackedParentWindowsTimerFired:(NSTimer*)timer
+    {
+        if (timer == trackedParentWindowsTimer) [self syncTrackedParentWindows];
+    }
+
+    - (BOOL) trackParentWindowNumber:(CGWindowID)parentWindowNumber
+                         parentFrame:(CGRect)parentFrame childFrame:(CGRect)childFrame
+    {
+        trackedParentWindowNumber = parentWindowNumber;
+        trackedParentLeftInset = childFrame.origin.x - parentFrame.origin.x;
+        trackedParentTopInset = childFrame.origin.y - parentFrame.origin.y;
+        trackedParentRightInset = CGRectGetMaxX(parentFrame) - CGRectGetMaxX(childFrame);
+        trackedParentBottomInset = CGRectGetMaxY(parentFrame) - CGRectGetMaxY(childFrame);
+        [self setIgnoresMouseEvents:YES];
+
+        if (!trackedParentWindows)
+            trackedParentWindows = [[NSMutableSet alloc] init];
+        [trackedParentWindows addObject:self];
+        if (!trackedParentWindowsTimer)
+        {
+            trackedParentWindowsTimer = [[NSTimer timerWithTimeInterval:0.1 target:[WineWindow class]
+                                                       selector:@selector(trackedParentWindowsTimerFired:)
+                                                       userInfo:nil repeats:YES] retain];
+            [[NSRunLoop mainRunLoop] addTimer:trackedParentWindowsTimer forMode:NSRunLoopCommonModes];
+        }
+        [[self class] syncTrackedParentWindows];
+        return [self isOrderedIn];
+    }
+
+    - (void) stopTrackingParentWindow
+    {
+        [trackedParentWindows removeObject:self];
+        if (![trackedParentWindows count])
+        {
+            [trackedParentWindowsTimer invalidate];
+            [trackedParentWindowsTimer release];
+            trackedParentWindowsTimer = nil;
+            [trackedParentWindows release];
+            trackedParentWindows = nil;
+        }
+        trackedParentWindowNumber = 0;
+        trackedParentHasChildFrame = NO;
+        if ([self isOrderedIn]) [self doOrderOut];
     }
 
     - (BOOL) preventResizing
@@ -3753,6 +3927,18 @@ void* macdrv_get_window_hwnd(macdrv_window w)
 }
 
 /***********************************************************************
+ *              macdrv_get_cocoa_window_number
+ */
+unsigned int macdrv_get_cocoa_window_number(macdrv_window w)
+{
+    WineWindow* window = (WineWindow*)w;
+    __block NSInteger number = 0;
+
+    OnMainThread(^{ number = window.windowNumber; });
+    return number > 0 ? (unsigned int)number : 0;
+}
+
+/***********************************************************************
  *              macdrv_set_cocoa_window_features
  *
  * Update a Cocoa window's features.
@@ -3845,6 +4031,45 @@ void macdrv_hide_cocoa_window(macdrv_window w)
     OnMainThread(^{
         [window doOrderOut];
     });
+}
+
+/***********************************************************************
+ *              macdrv_is_cocoa_window_ordered_in
+ */
+bool macdrv_is_cocoa_window_ordered_in(macdrv_window w)
+{
+    WineWindow* window = (WineWindow*)w;
+    __block BOOL ret;
+
+    OnMainThread(^{ ret = [window isOrderedIn]; });
+    return ret;
+}
+
+/***********************************************************************
+ *              macdrv_track_cocoa_window_parent
+ *
+ * Keep a process-local foreign child host aligned and stacked immediately
+ * above a native owner window from another Wine process.
+ */
+bool macdrv_track_cocoa_window_parent(macdrv_window w, unsigned int parent_window_number,
+                                      CGRect parent_frame, CGRect child_frame)
+{
+    WineWindow* window = (WineWindow*)w;
+    __block BOOL ret = NO;
+
+    OnMainThread(^{ ret = [window trackParentWindowNumber:parent_window_number
+                                               parentFrame:parent_frame childFrame:child_frame]; });
+    return ret;
+}
+
+/***********************************************************************
+ *              macdrv_untrack_cocoa_window_parent
+ */
+void macdrv_untrack_cocoa_window_parent(macdrv_window w)
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThread(^{ [window stopTrackingParentWindow]; });
 }
 
 /***********************************************************************

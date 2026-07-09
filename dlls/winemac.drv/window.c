@@ -41,6 +41,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
 
 
 static pthread_mutex_t win_data_mutex;
+static pthread_mutex_t foreign_child_create_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CFMutableDictionaryRef win_datas;
 
 static unsigned int activate_on_focus_time;
@@ -100,6 +101,8 @@ static const WCHAR wine_window_non_topmost_composed[] =
     {'w','i','n','e','_','w','i','n','d','o','w','_','n','o','n','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
 static const WCHAR wine_window_owner_composed[] =
     {'w','i','n','e','_','w','i','n','d','o','w','_','o','w','n','e','r','_','c','o','m','p','o','s','e','d',0};
+static const WCHAR wine_cocoa_window_number[] =
+    {'w','i','n','e','_','c','o','c','o','a','_','w','i','n','d','o','w','_','n','u','m','b','e','r',0};
 
 static BOOL is_dcomp_composed_hwnd(HWND hwnd)
 {
@@ -705,6 +708,17 @@ static void free_win_data(struct macdrv_win_data *data)
 
 
 /***********************************************************************
+ *              is_win_data_on_screen
+ */
+static BOOL is_win_data_on_screen(const struct macdrv_win_data *data)
+{
+    if (data->foreign_child && data->cocoa_window)
+        return macdrv_is_cocoa_window_ordered_in(data->cocoa_window);
+    return data->on_screen;
+}
+
+
+/***********************************************************************
  *              macdrv_get_cocoa_window
  *
  * Return the Mac window associated with the full area of a window
@@ -713,7 +727,7 @@ macdrv_window macdrv_get_cocoa_window(HWND hwnd, BOOL require_on_screen)
 {
     struct macdrv_win_data *data = get_win_data(hwnd);
     macdrv_window ret = NULL;
-    if (data && (data->on_screen || !require_on_screen))
+    if (data && (!require_on_screen || is_win_data_on_screen(data)))
         ret = data->cocoa_window;
     release_win_data(data);
     return ret;
@@ -975,6 +989,14 @@ static void create_cocoa_window(struct macdrv_win_data *data)
     data->cocoa_window = macdrv_create_cocoa_window(&wf, frame, data->hwnd, thread_data->queue);
     if (!data->cocoa_window) goto done;
 
+    if (!data->foreign_child)
+    {
+        unsigned int window_number = macdrv_get_cocoa_window_number(data->cocoa_window);
+
+        if (window_number)
+            NtUserSetProp(data->hwnd, wine_cocoa_window_number, ULongToHandle(window_number));
+    }
+
     set_cocoa_window_properties(data);
 
     /* set the window text */
@@ -1004,6 +1026,10 @@ static void destroy_cocoa_window(struct macdrv_win_data *data)
 
     TRACE("win %p Cocoa win %p\n", data->hwnd, data->cocoa_window);
 
+    if (data->foreign_child)
+        macdrv_untrack_cocoa_window_parent(data->cocoa_window);
+    else
+        NtUserRemoveProp(data->hwnd, wine_cocoa_window_number);
     macdrv_destroy_cocoa_window(data->cocoa_window);
     data->cocoa_window = 0;
     data->on_screen = FALSE;
@@ -1016,6 +1042,7 @@ static void destroy_cocoa_window(struct macdrv_win_data *data)
  * Create a Mac data window structure for an existing window.
  */
 static void show_window(struct macdrv_win_data *data);
+static void hide_window(struct macdrv_win_data *data);
 
 static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct window_rects *rects)
 {
@@ -1052,7 +1079,6 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
                   hwnd);
         else
             create_cocoa_window(data);
-        if (foreign_chromium_child && data->cocoa_window) show_window(data);
         TRACE("win %p/%p window %s whole %s client %s\n",
                hwnd, data->cocoa_window, wine_dbgstr_rect(&data->rects.window),
                wine_dbgstr_rect(&data->rects.visible), wine_dbgstr_rect(&data->rects.client));
@@ -1064,7 +1090,7 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
     return data;
 }
 
-struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RECT *surface_rect)
+static struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RECT *surface_rect)
 {
     struct window_rects rects;
     UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
@@ -1104,18 +1130,39 @@ struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RE
     return macdrv_create_win_data(hwnd, &rects);
 }
 
-BOOL macdrv_retain_foreign_child_win_data(HWND hwnd)
+BOOL macdrv_acquire_foreign_child_win_data(HWND hwnd, const RECT *surface_rect,
+                                           macdrv_window *window)
 {
     struct macdrv_win_data *data;
     BOOL ret = FALSE;
 
+    if (window) *window = NULL;
+    pthread_mutex_lock(&foreign_child_create_mutex);
+
+    if (chromium_hwnd_or_root_uses_root_surface_composition(hwnd))
+        goto done;
+
     if ((data = get_win_data(hwnd)))
     {
-        if ((ret = data->foreign_child))
+        if ((ret = data->foreign_child && data->cocoa_window))
+        {
             data->foreign_surface_refs++;
+            if (window) *window = data->cocoa_window;
+        }
+        release_win_data(data);
+    }
+    else if ((data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
+    {
+        if ((ret = data->foreign_child && data->cocoa_window))
+        {
+            data->foreign_surface_refs++;
+            if (window) *window = data->cocoa_window;
+        }
         release_win_data(data);
     }
 
+done:
+    pthread_mutex_unlock(&foreign_child_create_mutex);
     return ret;
 }
 
@@ -1123,16 +1170,17 @@ void macdrv_release_foreign_child_win_data(HWND hwnd)
 {
     struct macdrv_win_data *data;
 
-    if (!(data = get_win_data(hwnd))) return;
+    pthread_mutex_lock(&foreign_child_create_mutex);
+    if (!(data = get_win_data(hwnd))) goto done;
     if (!data->foreign_child)
     {
         release_win_data(data);
-        return;
+        goto done;
     }
     if (data->foreign_surface_refs && --data->foreign_surface_refs)
     {
         release_win_data(data);
-        return;
+        goto done;
     }
 
     TRACE("destroying foreign Chromium/CEF child mac win data for hwnd %p window %p\n",
@@ -1141,6 +1189,9 @@ void macdrv_release_foreign_child_win_data(HWND hwnd)
     CFDictionaryRemoveValue(win_datas, hwnd);
     release_win_data(data);
     free_win_data(data);
+
+done:
+    pthread_mutex_unlock(&foreign_child_create_mutex);
 }
 
 
@@ -1199,7 +1250,7 @@ static void set_focus(HWND hwnd, BOOL raise)
 
     if (!(data = get_win_data(hwnd))) return;
 
-    if (data->cocoa_window && data->on_screen)
+    if (data->cocoa_window && is_win_data_on_screen(data))
     {
         BOOL activate = activate_on_focus_time && (NtGetTickCount() - activate_on_focus_time < 2000);
         /* Set Mac focus */
@@ -1243,6 +1294,13 @@ static void show_window(struct macdrv_win_data *data)
         activate = activate_on_focus_time && (NtGetTickCount() - activate_on_focus_time < 2000);
     macdrv_order_cocoa_window(data->cocoa_window, prev_window, next_window, activate);
     data->on_screen = TRUE;
+    if (!data->foreign_child)
+    {
+        unsigned int window_number = macdrv_get_cocoa_window_number(data->cocoa_window);
+
+        if (window_number)
+            NtUserSetProp(data->hwnd, wine_cocoa_window_number, ULongToHandle(window_number));
+    }
 
     info.cbSize = sizeof(info);
     if (NtUserGetGUIThreadInfo(NtUserGetWindowThread(data->hwnd, NULL), &info) && info.hwndFocus &&
@@ -1263,6 +1321,87 @@ static void hide_window(struct macdrv_win_data *data)
     if (data->cocoa_window)
         macdrv_hide_cocoa_window(data->cocoa_window);
     data->on_screen = FALSE;
+}
+
+
+/***********************************************************************
+ *              macdrv_present_foreign_child_window
+ *
+ * Synchronize and non-activatingly order a process-local host for a
+ * Chromium child HWND owned by another process.  The owner process cannot
+ * deliver its WindowPosChanged events to this process, so validate owner
+ * state whenever the renderer presents.
+ */
+BOOL macdrv_present_foreign_child_window(HWND hwnd)
+{
+    struct macdrv_win_data *data;
+    HWND root;
+    RECT rect, root_client_rect, root_window_rect, root_size, relative_rect, clipped;
+    UINT dpi, root_dpi;
+    DWORD style, root_style;
+    CGRect frame, root_frame;
+    unsigned int root_window_number;
+    BOOL tracking_allowed = FALSE, valid = FALSE;
+
+    if (!(data = get_win_data(hwnd))) return FALSE;
+    if (!data->foreign_child || !data->cocoa_window) goto done;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+    root_style = root ? NtUserGetWindowLongW(root, GWL_STYLE) : 0;
+    if (!NtUserGetWindowThread(hwnd, NULL) || !root || !NtUserGetWindowThread(root, NULL) ||
+        chromium_hwnd_or_root_uses_root_surface_composition(hwnd) ||
+        !(style & WS_VISIBLE))
+        goto done;
+
+    root_window_number = HandleToUlong(NtUserGetProp(root, wine_cocoa_window_number));
+    if (!root_window_number) goto done;
+    tracking_allowed = TRUE;
+
+    if ((root_style & (WS_VISIBLE | WS_MINIMIZE)) != WS_VISIBLE || !NtUserIsWindowVisible(root))
+        goto done;
+
+    dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
+    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
+    if (!NtUserGetClientRect(hwnd, &rect, dpi) || IsRectEmpty(&rect) ||
+        !NtUserGetClientRect(root, &root_client_rect, root_dpi) || IsRectEmpty(&root_client_rect))
+        goto done;
+    NtUserMapWindowPoints(hwnd, 0, (POINT *)&rect, 2, dpi);
+    NtUserMapWindowPoints(root, 0, (POINT *)&root_client_rect, 2, root_dpi);
+    NtUserGetWindowRect(root, &root_window_rect, root_dpi);
+    if (IsRectEmpty(&root_window_rect) || !intersect_rect(&clipped, &rect, &root_client_rect)) goto done;
+
+    data->rects.window = rect;
+    data->rects.client = rect;
+    data->rects.visible = clipped;
+    frame = cgrect_from_rect(rect);
+    root_frame = cgrect_from_rect(root_window_rect);
+    SetRect(&root_size, 0, 0, root_window_rect.right - root_window_rect.left,
+            root_window_rect.bottom - root_window_rect.top);
+    relative_rect = rect;
+    OffsetRect(&relative_rect, -root_window_rect.left, -root_window_rect.top);
+    if (data->foreign_parent_window_number != root_window_number ||
+        !EqualRect(&data->foreign_parent_rect, &root_size) ||
+        !EqualRect(&data->foreign_child_rect, &relative_rect))
+    {
+        valid = macdrv_track_cocoa_window_parent(data->cocoa_window, root_window_number,
+                                                 root_frame, frame);
+        data->foreign_parent_window_number = root_window_number;
+        data->foreign_parent_rect = root_size;
+        data->foreign_child_rect = relative_rect;
+    }
+    else valid = TRUE;
+    data->on_screen = valid;
+
+done:
+    if (!tracking_allowed)
+    {
+        macdrv_untrack_cocoa_window_parent(data->cocoa_window);
+        data->foreign_parent_window_number = 0;
+    }
+    if (!valid) hide_window(data);
+    release_win_data(data);
+    return valid;
 }
 
 
@@ -1364,7 +1503,8 @@ static void sync_window_position(struct macdrv_win_data *data, UINT swp_flags, c
     TRACE("win %p/%p whole_rect %s frame %s\n", data->hwnd, data->cocoa_window,
           wine_dbgstr_rect(&data->rects.visible), wine_dbgstr_cgrect(frame));
 
-    if (data->cocoa_window && data->on_screen && (!(swp_flags & SWP_NOZORDER) || (swp_flags & SWP_SHOWWINDOW)))
+    if (data->cocoa_window && is_win_data_on_screen(data) &&
+        (!(swp_flags & SWP_NOZORDER) || (swp_flags & SWP_SHOWWINDOW)))
         show_window(data);
 }
 
@@ -1706,6 +1846,8 @@ static void macdrv_client_surface_destroy(struct client_surface *client)
     TRACE("%s\n", debugstr_client_surface(client));
 
     if (surface->metal_swapchain) macdrv_destroy_swapchain(surface->metal_swapchain);
+    if (surface->foreign_child_hwnd)
+        macdrv_release_foreign_child_win_data(surface->foreign_child_hwnd);
 }
 
 static void macdrv_client_surface_detach(struct client_surface *client)
@@ -1741,7 +1883,16 @@ static void macdrv_client_surface_update(struct client_surface *client)
     NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
 
-    if (!(data = get_win_data(toplevel))) return;
+    if (!(data = get_win_data(toplevel)))
+    {
+        if (!surface->foreign_child_hwnd || !(data = get_win_data(hwnd))) return;
+
+        NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+        macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
+        macdrv_set_view_superview(surface->cocoa_view, NULL, data->cocoa_window, NULL, NULL);
+        release_win_data(data);
+        return;
+    }
     offset_client_rect_to_cocoa_frame(data, &rect);
     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
@@ -1755,7 +1906,8 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (!(data = get_win_data(surface->client.hwnd))) return;
+    if (!(data = get_win_data(surface->foreign_child_hwnd ?
+                              surface->foreign_child_hwnd : surface->client.hwnd))) return;
     if (data->client_view != surface->cocoa_view)
     {
         if (data->client_view) macdrv_set_view_hidden(data->client_view, TRUE);
@@ -1763,6 +1915,8 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
         data->client_view = surface->cocoa_view;
     }
     release_win_data(data);
+    if (surface->foreign_child_hwnd)
+        macdrv_present_foreign_child_window(surface->foreign_child_hwnd);
 }
 
 static const struct client_surface_funcs macdrv_client_surface_funcs =
@@ -1783,20 +1937,32 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct macdrv_client_surface *surface;
+    BOOL foreign_child = is_chromium_cef_child_window(hwnd) &&
+                         NtUserGetWindowThread(hwnd, NULL) != GetCurrentThreadId();
+    BOOL foreign_child_acquired;
     RECT rect;
 
     NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
 
-    surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd);
+    foreign_child_acquired = foreign_child &&
+                             macdrv_acquire_foreign_child_win_data(hwnd, &rect, NULL);
+    if (!(surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd)))
+    {
+        if (foreign_child_acquired) macdrv_release_foreign_child_win_data(hwnd);
+        return NULL;
+    }
+    if (foreign_child_acquired) surface->foreign_child_hwnd = hwnd;
     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(rect));
+    if (!surface->cocoa_view)
+    {
+        client_surface_release(&surface->client);
+        return NULL;
+    }
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
-    if (surface)
-    {
-        macdrv_client_surface_update(&surface->client);
-        macdrv_client_surface_present(&surface->client, 0);
-    }
+    macdrv_client_surface_update(&surface->client);
+    macdrv_client_surface_present(&surface->client, 0);
 
     return &surface->client;
 }
@@ -1954,7 +2120,7 @@ void macdrv_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWOR
         {
             sync_window_opacity(data, alpha, FALSE, flags);
             /* since layered attributes are now set, can now show the window */
-            if ((NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE) && !data->on_screen)
+            if ((NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE) && !is_win_data_on_screen(data))
                 show_window(data);
         }
         release_win_data(data);
@@ -2090,7 +2256,7 @@ UINT macdrv_ShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp)
         }
         goto done;
     }
-    if (!data->on_screen) goto done;
+    if (!is_win_data_on_screen(data)) goto done;
 
     /* only fetch the new rectangle if the ShowWindow was a result of an external event */
 
@@ -2127,7 +2293,7 @@ LRESULT macdrv_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *
     TRACE("%p, %x, %lx\n", hwnd, (unsigned)wparam, lparam);
 
     if (!(data = get_win_data(hwnd))) goto done;
-    if (!data->cocoa_window || !data->on_screen) goto done;
+    if (!data->cocoa_window || !is_win_data_on_screen(data)) goto done;
 
     /* prevent a simple ALT press+release from activating the system menu,
        as that can get confusing */
@@ -2161,7 +2327,8 @@ void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, BOOL per_pixel_alpha, UIN
     if ((data = get_win_data(hwnd)))
     {
         /* Since layered attributes are now set, can now show the window */
-        if (data->cocoa_window && !data->on_screen && NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE)
+        if (data->cocoa_window && !is_win_data_on_screen(data) &&
+            NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE)
             show_window(data);
 
         /* The ULW flags are a superset of the LWA flags. */
@@ -2442,7 +2609,7 @@ BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const stru
     {
         if (data)
         {
-            if (data->foreign_child && data->cocoa_window && data->on_screen)
+            if (data->foreign_child && data->cocoa_window)
                 hide_window(data);
             release_win_data(data);
         }
@@ -2566,7 +2733,7 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
     if (!data->cocoa_window) goto done;
 
-    if (data->on_screen)
+    if (is_win_data_on_screen(data))
     {
         if ((swp_flags & SWP_HIDEWINDOW) && !(new_style & WS_VISIBLE))
             hide_window(data);
@@ -2587,11 +2754,11 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
     {
         if (data->cocoa_window)
         {
-            if (!data->on_screen || (swp_flags & (SWP_FRAMECHANGED|SWP_STATECHANGED)))
+            if (!is_win_data_on_screen(data) || (swp_flags & (SWP_FRAMECHANGED|SWP_STATECHANGED)))
                 set_cocoa_window_properties(data);
 
             /* layered windows are not shown until their attributes are set */
-            if (!data->on_screen &&
+            if (!is_win_data_on_screen(data) &&
                 (data->layered || !(NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED)))
                 show_window(data);
         }
@@ -2655,7 +2822,7 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
 
     if (!hwnd) return;
     if (!(data = get_win_data(hwnd))) return;
-    if (!data->on_screen || data->minimized)
+    if (!is_win_data_on_screen(data) || data->minimized)
     {
         release_win_data(data);
         return;
@@ -3013,7 +3180,7 @@ void macdrv_reassert_window_position(HWND hwnd)
     struct macdrv_win_data *data = get_win_data(hwnd);
     if (data)
     {
-        if (data->cocoa_window && data->on_screen)
+        if (data->cocoa_window && is_win_data_on_screen(data))
             sync_window_position(data, SWP_NOZORDER | SWP_NOACTIVATE, NULL);
         release_win_data(data);
     }

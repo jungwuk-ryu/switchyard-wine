@@ -199,6 +199,9 @@ struct macdrv_win_data
     unsigned int        remote_layer_hosted_once : 1; /* has this window ever hosted a foreign remote layer? */
     unsigned int        chromium_smaller_layer_hosted_once : 1; /* has a smaller Chromium child hosted a layer? */
     unsigned int        foreign_surface_refs;   /* surfaces presenting into a foreign child host window */
+    unsigned int        foreign_parent_window_number; /* tracked owner WindowServer window */
+    RECT                foreign_parent_rect;    /* tracked owner size, normalized to the origin */
+    RECT                foreign_child_rect;     /* tracked child frame relative to the owner */
     unsigned int        remote_layer_hosts;     /* foreign child layers hosted inside this window */
     CFMutableSetRef     remote_layer_contexts;  /* hosted foreign remote layer context ids */
     CFMutableSetRef     suppressed_remote_layer_contexts; /* hidden placeholder context ids */
@@ -209,6 +212,7 @@ struct macdrv_client_surface
     struct client_surface   client;
     macdrv_view             cocoa_view;
     macdrv_metal_swapchain  metal_swapchain;
+    HWND                    foreign_child_hwnd; /* process-local host for a foreign child HWND */
 };
 
 extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
@@ -218,9 +222,10 @@ extern void macdrv_end_window_move_surface_hold(void);
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
 extern BOOL macdrv_present_root_surface(HWND root, HWND source);
-extern struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RECT *surface_rect);
-extern BOOL macdrv_retain_foreign_child_win_data(HWND hwnd);
+extern BOOL macdrv_acquire_foreign_child_win_data(HWND hwnd, const RECT *surface_rect,
+                                                   macdrv_window *window);
 extern void macdrv_release_foreign_child_win_data(HWND hwnd);
+extern BOOL macdrv_present_foreign_child_window(HWND hwnd);
 extern void release_win_data(struct macdrv_win_data *data);
 extern void init_win_context(void);
 extern macdrv_window macdrv_get_cocoa_window(HWND hwnd, BOOL require_on_screen);

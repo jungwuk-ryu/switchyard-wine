@@ -84,6 +84,14 @@
     BOOL surfaceUpdatesSuspended;
     BOOL fakingClose;
 
+    CGWindowID trackedParentWindowNumber;
+    CGFloat trackedParentLeftInset;
+    CGFloat trackedParentTopInset;
+    CGFloat trackedParentRightInset;
+    CGFloat trackedParentBottomInset;
+    CGRect trackedParentLastChildFrame;
+    BOOL trackedParentHasChildFrame;
+
     CAShapeLayer* contentViewMaskLayer;
 }
 
