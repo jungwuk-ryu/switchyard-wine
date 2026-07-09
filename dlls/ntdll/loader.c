@@ -3577,6 +3577,54 @@ static BOOL switchyard_find_pe_module_nolock( const void *addr, void **module )
     return found;
 }
 
+static void switchyard_allow_gptk_trampoline_data_section( void *table )
+{
+    enum { switchyard_sparse_trampoline_section_min_size = 0x100000 };
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_SECTION_HEADER *section;
+    void *module;
+    unsigned int i;
+
+    if (!switchyard_find_pe_module_nolock( table, &module )) return;
+    if (!(nt = RtlImageNtHeader( module ))) return;
+
+    section = IMAGE_FIRST_SECTION( nt );
+    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        SIZE_T virtual_size = section[i].Misc.VirtualSize;
+        SIZE_T raw_size = section[i].SizeOfRawData;
+        SIZE_T section_size = virtual_size;
+        BYTE *section_base = (BYTE *)module + section[i].VirtualAddress;
+        void *protect_base;
+        SIZE_T protect_size;
+        ULONG old_prot;
+
+        if (raw_size > section_size) section_size = raw_size;
+        if ((BYTE *)table < section_base || (BYTE *)table >= section_base + section_size)
+            continue;
+
+        if (!(section[i].Characteristics & IMAGE_SCN_MEM_WRITE) ||
+            (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            return;
+        if (section_size < switchyard_sparse_trampoline_section_min_size || virtual_size <= raw_size)
+            return;
+
+        protect_base = section_base;
+        protect_size = section_size;
+        if (NtProtectVirtualMemory( NtCurrentProcess(), &protect_base, &protect_size,
+                                    PAGE_EXECUTE_WRITECOPY, &old_prot ))
+        {
+            WARN( "failed to make GPTK callback trampoline data executable module %p section %.8s base %p size %#Ix\n",
+                  module, section[i].Name, section_base, section_size );
+            return;
+        }
+
+        TRACE( "made GPTK callback trampoline data executable module %p section %.8s base %p size %#Ix old %#lx\n",
+               module, section[i].Name, section_base, section_size, old_prot );
+        return;
+    }
+}
+
 struct switchyard_native_callback_exception_context
 {
     void *func;
@@ -4657,9 +4705,8 @@ static void wrap_native_callback_entry( void **slot, unsigned int argc )
 static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS status )
 {
     void **table = args;
-    void *module;
 
-    if (status || code || !args || !RtlPcToFileHeader( args, &module )) return;
+    if (status || code || !args || !switchyard_find_pe_module_nolock( args, NULL )) return;
 
     __TRY
     {
@@ -4667,6 +4714,8 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
             !is_native_callback_target_or_thunk( table[2] ) ||
             !table[42] || !table[43])
             return;
+
+        switchyard_allow_gptk_trampoline_data_section( table );
 
         wrap_native_callback_entry( &table[1], 3 ); /* CreateDXGIFactory2 */
         wrap_native_callback_entry( &table[2], 4 ); /* D3D12CreateDevice */
