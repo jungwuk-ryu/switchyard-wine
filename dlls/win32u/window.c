@@ -2125,6 +2125,66 @@ static BOOL is_dcomp_composed_hwnd(HWND hwnd)
                    NtUserGetProp(hwnd, wine_window_non_topmost_composed));
 }
 
+static BOOL is_chrome_widget_window(HWND hwnd)
+{
+    static const WCHAR chrome_widget_prefix[] =
+        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
+}
+
+static BOOL is_chrome_render_widget_host_window(HWND hwnd)
+{
+    static const WCHAR chrome_render_widget[] =
+        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcscmp(class_name, chrome_render_widget);
+}
+
+static BOOL chrome_subtree_has_render_widget(HWND hwnd)
+{
+    HWND child;
+
+    if (is_chrome_render_widget_host_window(hwnd)) return TRUE;
+
+    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        if (chrome_subtree_has_render_widget(child)) return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL chrome_root_has_render_widget(HWND root)
+{
+    return root && is_chrome_widget_window(root) && chrome_subtree_has_render_widget(root);
+}
+
 static BOOL chromium_subtree_has_dcomp_target(HWND hwnd)
 {
     HWND child;
@@ -2175,7 +2235,8 @@ static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
     if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
 
     root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
+    return root && root != hwnd &&
+           (chromium_root_uses_dcomp_composition(root) || chrome_root_has_render_widget(root));
 }
 
 static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,

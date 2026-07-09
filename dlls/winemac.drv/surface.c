@@ -194,6 +194,66 @@ static BOOL is_dcomp_composed_hwnd(HWND hwnd)
                    NtUserGetProp(hwnd, wine_window_non_topmost_composed));
 }
 
+static BOOL is_chrome_widget_window(HWND hwnd)
+{
+    static const WCHAR chrome_widget_prefix[] =
+        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
+}
+
+static BOOL is_chrome_render_widget_host_window(HWND hwnd)
+{
+    static const WCHAR chrome_render_widget[] =
+        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
+    WCHAR class_name[64];
+    UNICODE_STRING name =
+    {
+        .Buffer = class_name,
+        .MaximumLength = sizeof(class_name),
+    };
+    int len;
+
+    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
+
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+
+    return !wcscmp(class_name, chrome_render_widget);
+}
+
+static BOOL chrome_subtree_has_render_widget(HWND hwnd)
+{
+    HWND child;
+
+    if (is_chrome_render_widget_host_window(hwnd)) return TRUE;
+
+    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
+         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+    {
+        if (chrome_subtree_has_render_widget(child)) return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL chrome_root_has_render_widget(HWND root)
+{
+    return root && is_chrome_widget_window(root) && chrome_subtree_has_render_widget(root);
+}
+
 static BOOL chromium_subtree_has_dcomp_target(HWND hwnd)
 {
     HWND child;
@@ -247,17 +307,29 @@ static BOOL chromium_hwnd_or_root_uses_dcomp_composition(HWND hwnd)
     return root && chromium_root_uses_dcomp_composition(root);
 }
 
-static BOOL chromium_hwnd_or_owner_uses_dcomp_composition(HWND hwnd)
+static BOOL chromium_hwnd_or_root_uses_root_surface_composition(HWND hwnd)
+{
+    HWND root;
+
+    if (chromium_hwnd_or_root_uses_dcomp_composition(hwnd)) return TRUE;
+    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
+
+    root = NtUserGetAncestor(hwnd, GA_ROOT);
+    return root && chrome_root_has_render_widget(root);
+}
+
+static BOOL chromium_hwnd_or_owner_uses_root_surface_composition(HWND hwnd)
 {
     HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
     HWND owner;
 
     if (!root) return FALSE;
-    if (chromium_hwnd_or_root_uses_dcomp_composition(hwnd)) return TRUE;
+    if (chromium_hwnd_or_root_uses_root_surface_composition(hwnd)) return TRUE;
+
     owner = NtUserGetAncestor(root, GA_ROOTOWNER);
     return owner && owner != root &&
            is_chromium_cef_child_window(root) && is_chromium_cef_child_window(owner) &&
-           chromium_root_uses_dcomp_composition(owner);
+           (chromium_root_uses_dcomp_composition(owner) || chrome_root_has_render_widget(owner));
 }
 
 static HWND get_chromium_owner_composition_root(HWND hwnd)
@@ -269,7 +341,8 @@ static HWND get_chromium_owner_composition_root(HWND hwnd)
     owner = NtUserGetAncestor(root, GA_ROOTOWNER);
     if (owner && owner != root &&
         is_chromium_cef_child_window(root) && is_chromium_cef_child_window(owner) &&
-        (chromium_root_uses_dcomp_composition(root) || chromium_root_uses_dcomp_composition(owner)))
+        (chromium_root_uses_dcomp_composition(root) || chromium_root_uses_dcomp_composition(owner) ||
+         chrome_root_has_render_widget(root) || chrome_root_has_render_widget(owner)))
         return owner;
 
     return root;
@@ -283,7 +356,8 @@ static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
     if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
 
     root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
+    return root && root != hwnd &&
+           (chromium_root_uses_dcomp_composition(root) || chrome_root_has_render_widget(root));
 }
 
 static BOOL chromium_hwnd_should_relay_root_surface(HWND hwnd, HWND *root_ret)
@@ -297,11 +371,21 @@ static BOOL chromium_hwnd_should_relay_root_surface(HWND hwnd, HWND *root_ret)
     if (root_ret) *root_ret = NULL;
     if (!is_chromium_cef_child_window(hwnd)) return FALSE;
     if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
-    if (!chromium_hwnd_or_owner_uses_dcomp_composition(hwnd)) return FALSE;
+    if (!chromium_hwnd_or_owner_uses_root_surface_composition(hwnd)) return FALSE;
 
     source_root = NtUserGetAncestor(hwnd, GA_ROOT);
     root = get_chromium_owner_composition_root(hwnd);
     if (!root) return FALSE;
+    if (source_root == hwnd && root == hwnd)
+    {
+        struct macdrv_win_data *data = get_win_data(hwnd);
+
+        if (data)
+        {
+            release_win_data(data);
+            return FALSE;
+        }
+    }
     relay_to_owner_root = source_root && source_root != root;
     root_thread_id = NtUserGetWindowThread(root, NULL);
 
@@ -332,7 +416,9 @@ static BOOL chromium_root_surface_should_preserve_alpha(HWND root, HWND source)
     return source_root && source_owner && source_owner == root && source_owner != source_root &&
            is_chromium_cef_child_window(source_root) && is_chromium_cef_child_window(root) &&
            (chromium_root_uses_dcomp_composition(source_root) ||
-            chromium_root_uses_dcomp_composition(root));
+            chromium_root_uses_dcomp_composition(root) ||
+            chrome_root_has_render_widget(source_root) ||
+            chrome_root_has_render_widget(root));
 }
 
 static BOOL root_surface_header_is_valid(const struct root_surface_shm_header *header, SIZE_T map_size)
@@ -475,7 +561,7 @@ static BOOL should_suppress_chromium_placeholder_surface(struct macdrv_window_su
 
     if (!surface->child && !surface->remote_child && !surface->foreign_child) return FALSE;
     if (!is_chromium_cef_child_window(surface->header.hwnd)) return FALSE;
-    if (!chromium_hwnd_or_root_uses_dcomp_composition(surface->header.hwnd)) return FALSE;
+    if (!chromium_hwnd_or_root_uses_root_surface_composition(surface->header.hwnd)) return FALSE;
     root = NtUserGetAncestor(surface->header.hwnd, GA_ROOT);
     if (!chromium_root_has_smaller_hosted_layer(root)) return FALSE;
     return !!find_full_root_chromium_placeholder(surface->header.hwnd, root);
@@ -663,7 +749,7 @@ BOOL macdrv_present_root_surface(HWND root, HWND source)
 
         if (source_root != root && source_owner != root) return FALSE;
     }
-    if (!chromium_hwnd_or_owner_uses_dcomp_composition(source)) return FALSE;
+    if (!chromium_hwnd_or_owner_uses_root_surface_composition(source)) return FALSE;
 
     root_surface_shm_name(name, sizeof(name), root, source);
     if ((fd = shm_open(name, O_RDONLY, 0600)) == -1)
@@ -973,6 +1059,13 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
 
     if (surface->root_surface_relay)
     {
+        if (solid_kind == SOLID_SURFACE_DARK && surface->header.hwnd == surface->root_surface_root &&
+            NtUserGetAncestor(surface->header.hwnd, GA_ROOT) == surface->header.hwnd)
+        {
+            TRACE("Switchyard suppressing dark Chromium/CEF root relay placeholder hwnd %p\n",
+                  surface->header.hwnd);
+            return TRUE;
+        }
         if (!relay_root_surface_flush(surface, rect, dirty, color_info, color_bits ? color_bits : surface->bits))
             TRACE("Switchyard failed to relay Chromium/CEF surface hwnd %p into DComp root %p\n",
                   surface->header.hwnd, surface->root_surface_root);
@@ -1306,6 +1399,19 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     }
     else if (!is_chromium_cef_child_window(hwnd)) return TRUE; /* use default surface */
     else TRACE("Switchyard Chromium/CEF child hwnd %p has no local mac win data; trying root redirection\n", hwnd);
+
+    if (!window && !root_surface_relay && !root_composed_child &&
+        chromium_hwnd_or_root_uses_root_surface_composition(hwnd) &&
+        NtUserGetAncestor(hwnd, GA_ROOT) == hwnd)
+    {
+        TRACE("Switchyard leaving Chromium/CEF root hwnd %p on its owner root window\n", hwnd);
+        if (previous)
+        {
+            window_surface_release(previous);
+            *surface = NULL;
+        }
+        return TRUE;
+    }
 
     if (!window && is_chromium_cef_child_window(hwnd))
     {
