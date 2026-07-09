@@ -3502,20 +3502,40 @@ struct switchyard_pe_callback_scope
 
 static BOOL switchyard_get_native_callback_context( TEB **teb, void **pthread_teb, DWORD **native_callback_depth )
 {
-    struct native_callback_context_params params = { NULL, NULL, NULL };
+    enum
+    {
+        switchyard_amd64_pthread_teb_offset = 0x320,
+        switchyard_amd64_native_callback_depth_offset = 0x344
+    };
+    TEB *current = NtCurrentTeb();
+    BOOL ret = FALSE;
 
     *teb = NULL;
     *pthread_teb = NULL;
     *native_callback_depth = NULL;
-    if (!__wine_unixlib_handle || !__wine_unix_call_dispatcher) return FALSE;
-    if (__wine_unix_call_dispatcher( __wine_unixlib_handle, unix_get_native_callback_context, &params ))
-        return FALSE;
-    if (!params.teb || !params.pthread_teb || !params.native_callback_depth) return FALSE;
 
-    *teb = params.teb;
-    *pthread_teb = params.pthread_teb;
-    *native_callback_depth = params.native_callback_depth;
-    return TRUE;
+    if (!current) return FALSE;
+
+    __TRY
+    {
+        void *stored_pthread_teb = *(void **)((char *)current + switchyard_amd64_pthread_teb_offset);
+        DWORD *stored_depth = (DWORD *)((char *)current +
+                                        switchyard_amd64_native_callback_depth_offset);
+
+        if (stored_pthread_teb && stored_depth)
+        {
+            *teb = current;
+            *pthread_teb = stored_pthread_teb;
+            *native_callback_depth = stored_depth;
+            ret = TRUE;
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+
+    return ret;
 }
 
 static BOOL switchyard_find_pe_module_nolock( const void *addr, void **module )
