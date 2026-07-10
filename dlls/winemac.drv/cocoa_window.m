@@ -1686,6 +1686,14 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         trackedParentRightInset = CGRectGetMaxX(parentFrame) - CGRectGetMaxX(childFrame);
         trackedParentBottomInset = CGRectGetMaxY(parentFrame) - CGRectGetMaxY(childFrame);
 
+        /*
+         * This window only carries pixels rendered by a Chromium helper
+         * process.  Native pointer events must continue through to the
+         * application-owned parent, which owns the corresponding Win32 input
+         * hierarchy and forwards them to windowless Chromium content.
+         */
+        [self setIgnoresMouseEvents:YES];
+
         if (!trackedParentWindows)
             trackedParentWindows = [[NSMutableSet alloc] init];
         [trackedParentWindows addObject:self];
