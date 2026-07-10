@@ -1685,7 +1685,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         trackedParentTopInset = childFrame.origin.y - parentFrame.origin.y;
         trackedParentRightInset = CGRectGetMaxX(parentFrame) - CGRectGetMaxX(childFrame);
         trackedParentBottomInset = CGRectGetMaxY(parentFrame) - CGRectGetMaxY(childFrame);
-        [self setIgnoresMouseEvents:YES];
 
         if (!trackedParentWindows)
             trackedParentWindows = [[NSMutableSet alloc] init];

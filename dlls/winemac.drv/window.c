@@ -559,7 +559,16 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
 {
     struct macdrv_window_features wf = {0};
 
-    if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
+    if ((ex_style & WS_EX_NOACTIVATE) || data->foreign_child)
+    {
+        /*
+         * A foreign Chromium host owns the native pixels for a child HWND in
+         * another Wine process.  Let this process receive native pointer
+         * events so macdrv can route them to that HWND through the Wine
+         * server, but never let the pixel host activate its helper process.
+         */
+        wf.prevents_app_activation = TRUE;
+    }
     if (chrome_root_should_use_custom_frame(data->hwnd, style, ex_style))
     {
         wf.shadow = TRUE;
