@@ -517,6 +517,7 @@ extern void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame);
 extern void macdrv_set_cocoa_window_surface_updates_suspended(macdrv_window w, bool suspended);
 extern void macdrv_set_cocoa_parent_window(macdrv_window w, macdrv_window parent);
 extern void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty);
+extern void macdrv_window_set_root_surface_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty);
 extern void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image);
 extern void macdrv_set_window_shape(macdrv_window w, const CGRect *rects, int count);
 extern void macdrv_set_window_alpha(macdrv_window w, CGFloat alpha);
@@ -548,6 +549,7 @@ extern void macdrv_window_update_ca_layer_host_view(macdrv_window w, unsigned in
 extern void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id);
 extern void macdrv_window_release_ca_layer_host_view_immediately(macdrv_window w, unsigned int context_id);
 extern void macdrv_window_remove_full_frame_ca_layer_host_views(macdrv_window w, unsigned int keep_context_id);
+extern void macdrv_window_remove_all_ca_layer_host_views(macdrv_window w);
 extern void macdrv_create_remote_layer(void* hwnd, unsigned int context_id);
 extern void macdrv_create_remote_layer_for_host(void* host_hwnd, void* child_hwnd, unsigned int context_id);
 extern void macdrv_update_remote_layer(void* hwnd, unsigned int context_id);

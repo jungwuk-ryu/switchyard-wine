@@ -82,6 +82,7 @@
     BOOL ignore_windowDeminiaturize;
     BOOL ignore_windowResize;
     BOOL surfaceUpdatesSuspended;
+    unsigned long long rootSurfaceSubmissionSequence;
     BOOL fakingClose;
 
     CGWindowID trackedParentWindowNumber;

@@ -198,6 +198,8 @@ struct macdrv_win_data
     unsigned int        foreign_child : 1;      /* process-local host window for a foreign child HWND */
     unsigned int        remote_layer_hosted_once : 1; /* has this window ever hosted a foreign remote layer? */
     unsigned int        chromium_smaller_layer_hosted_once : 1; /* has a smaller Chromium child hosted a layer? */
+    unsigned int        chromium_root_surface_presented_once : 1; /* authoritative Chromium root backing has been presented */
+    unsigned int        chromium_client_only_had_non_dark_backing : 1; /* retain valid first-run backing over dark transition placeholders */
     unsigned int        foreign_surface_refs;   /* surfaces presenting into a foreign child host window */
     unsigned int        foreign_parent_window_number; /* tracked owner WindowServer window */
     RECT                foreign_parent_rect;    /* tracked owner size, normalized to the origin */
@@ -205,6 +207,7 @@ struct macdrv_win_data
     unsigned int        remote_layer_hosts;     /* foreign child layers hosted inside this window */
     CFMutableSetRef     remote_layer_contexts;  /* hosted foreign remote layer context ids */
     CFMutableSetRef     suppressed_remote_layer_contexts; /* hidden placeholder context ids */
+    CFMutableArrayRef   chromium_root_surface_overlays; /* active relayed popup HWNDs, back to front */
 };
 
 struct macdrv_client_surface
@@ -221,7 +224,11 @@ extern void macdrv_begin_window_move_surface_hold(HWND hwnd);
 extern void macdrv_end_window_move_surface_hold(void);
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
+extern BOOL macdrv_win_data_uses_chrome_client_only_frame(struct macdrv_win_data *data);
+extern void macdrv_offset_client_rect_to_cocoa_frame(struct macdrv_win_data *data, RECT *rect);
 extern BOOL macdrv_present_root_surface(HWND root, HWND source);
+extern void macdrv_forget_root_surface_overlay(HWND root, HWND source);
+extern void macdrv_release_root_surface_backing(HWND root);
 extern BOOL macdrv_acquire_foreign_child_win_data(HWND hwnd, const RECT *surface_rect,
                                                    macdrv_window *window);
 extern void macdrv_release_foreign_child_win_data(HWND hwnd);

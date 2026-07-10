@@ -83,6 +83,42 @@ static BOOL is_chromium_composition_window(HWND hwnd)
         || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
 }
 
+static BOOL is_chrome_widget_window(HWND hwnd)
+{
+    static const WCHAR chrome_widget_prefix[] =
+        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
+    WCHAR class_name[64];
+    int len;
+
+    if (!hwnd || !(len = GetClassNameW(hwnd, class_name, ARRAY_SIZE(class_name)))) return FALSE;
+    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
+    class_name[len] = 0;
+    return !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
+}
+
+static BOOL is_official_chrome_process(void)
+{
+    WCHAR path[1024];
+    WCHAR *name, *p;
+    DWORD len;
+
+    if (!(len = GetModuleFileNameW(NULL, path, ARRAY_SIZE(path))) || len >= ARRAY_SIZE(path))
+        return FALSE;
+    name = path;
+    for (p = path; p < path + len; p++)
+        if (*p == '\\' || *p == '/') name = p + 1;
+    return !wcsicmp(name, L"chrome.exe");
+}
+
+static BOOL is_chrome_owned_popup_target(HWND hwnd_root, HWND present_hwnd)
+{
+    if (!hwnd_root || !present_hwnd || hwnd_root == present_hwnd ||
+        !is_official_chrome_process()) return FALSE;
+    if (!is_chrome_widget_window(hwnd_root) || !is_chrome_widget_window(present_hwnd)) return FALSE;
+    if (!(GetWindowLongW(hwnd_root, GWL_STYLE) & WS_POPUP)) return FALSE;
+    return GetAncestor(hwnd_root, GA_ROOTOWNER) == present_hwnd;
+}
+
 static HWND get_chromium_composition_present_root(HWND hwnd)
 {
     HWND root = GetAncestor(hwnd, GA_ROOT);
@@ -1774,6 +1810,23 @@ static DWORD WINAPI composite_thread_proc(void *iface)
                 {
                     TRACE("Switchyard skipped solid dark DComp alpha frame hwnd %p for root %p rect %s.\n",
                             target->hwnd, present_hwnd, wine_dbgstr_rect(&present_rect));
+                    destroy_target_frame(&frame->frame);
+                    free(frame);
+                    continue;
+                }
+                if (is_chrome_owned_popup_target(hwnd_root, present_hwnd))
+                {
+                    /* A popup DComp device cannot see the page target owned by
+                       another Chrome process/device.  Publishing its locally
+                       cleared root-sized frame would therefore replace the
+                       page with black.  Present the alpha popup to its own HWND
+                       so winemac can relay it over the authoritative root
+                       backing in the owner process. */
+                    frame->hwnd = target->hwnd;
+                    frame->present_rect = frame->frame.client_rect;
+                    frame->offset.x = frame->offset.y = 0;
+                    frame->src_x = frame->src_y = 0;
+                    if (present_target_frame(frame)) count++;
                     destroy_target_frame(&frame->frame);
                     free(frame);
                     continue;

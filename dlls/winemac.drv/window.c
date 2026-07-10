@@ -492,13 +492,30 @@ static BOOL win_data_uses_chrome_custom_frame(struct macdrv_win_data *data)
     return chrome_root_should_use_custom_frame(data->hwnd, style, ex_style);
 }
 
+BOOL macdrv_win_data_uses_chrome_client_only_frame(struct macdrv_win_data *data)
+{
+    return win_data_uses_chrome_custom_frame(data) &&
+           data->rects.client.top > data->rects.window.top + 1;
+}
+
 static const RECT *get_cocoa_frame_rect(struct macdrv_win_data *data)
 {
-    if (win_data_uses_chrome_custom_frame(data)) return &data->rects.window;
+    if (win_data_uses_chrome_custom_frame(data))
+    {
+        /*
+         * Chrome paints its custom frame inside the Win32 client. The nominal
+         * sizing border remains outside that client even when the caption is
+         * extended, and exposing it as Cocoa content produces asymmetric edge
+         * bands. Client-only roots such as first-run also keep a real caption
+         * inset. In both cases the borderless native host must cover the client
+         * itself so renderer pixels and input use the same native bounds.
+         */
+        return &data->rects.client;
+    }
     return &data->rects.visible;
 }
 
-static void offset_client_rect_to_cocoa_frame(struct macdrv_win_data *data, RECT *rect)
+void macdrv_offset_client_rect_to_cocoa_frame(struct macdrv_win_data *data, RECT *rect)
 {
     const RECT *frame_rect = get_cocoa_frame_rect(data);
 
@@ -703,6 +720,7 @@ static void free_win_data(struct macdrv_win_data *data)
 {
     if (data->remote_layer_contexts) CFRelease(data->remote_layer_contexts);
     if (data->suppressed_remote_layer_contexts) CFRelease(data->suppressed_remote_layer_contexts);
+    if (data->chromium_root_surface_overlays) CFRelease(data->chromium_root_surface_overlays);
     free(data);
 }
 
@@ -1582,6 +1600,8 @@ void macdrv_begin_window_move_surface_hold(HWND hwnd)
     macdrv_end_window_move_surface_hold();
     if (!root || !chromium_hwnd_or_root_uses_root_surface_composition(root)) return;
 
+    TRACE("holding Chromium/CEF root backing during window move hwnd %p root %p\n", hwnd, root);
+
     if ((data = get_win_data(root)))
     {
         if (data->cocoa_window)
@@ -1600,6 +1620,8 @@ void macdrv_end_window_move_surface_hold(void)
 
     window_move_surface_hold_root = NULL;
     if (!root) return;
+
+    TRACE("releasing Chromium/CEF root backing after window move root %p\n", root);
     if ((data = get_win_data(root)))
     {
         if (data->cocoa_window)
@@ -1893,7 +1915,7 @@ static void macdrv_client_surface_update(struct client_surface *client)
         release_win_data(data);
         return;
     }
-    offset_client_rect_to_cocoa_frame(data, &rect);
+    macdrv_offset_client_rect_to_cocoa_frame(data, &rect);
     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
     release_win_data(data);
@@ -2076,6 +2098,7 @@ void macdrv_DestroyWindow(HWND hwnd)
 
     if (data->drag_event) NtSetEvent(data->drag_event, NULL);
 
+    macdrv_release_root_surface_backing(hwnd);
     destroy_cocoa_window(data);
 
     CFDictionaryRemoveValue(win_datas, hwnd);
@@ -2375,7 +2398,7 @@ static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expect
             return NULL;
         }
         NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
-        offset_client_rect_to_cocoa_frame(root_data, &rect);
+        macdrv_offset_client_rect_to_cocoa_frame(root_data, &rect);
         *frame = cgrect_mac_from_win(cgrect_from_rect(rect));
     }
 
@@ -2429,6 +2452,8 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         CGRect frame;
         BOOL restore_alpha = FALSE;
         BOOL dcomp_root_composition;
+        BOOL client_only_root;
+        BOOL stable_root_backing;
         BOOL suppress_chromium_placeholder;
         BOOL remove_full_root_placeholder;
         BOOL clear_chromium_light_placeholder;
@@ -2437,17 +2462,21 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
+            client_only_root = macdrv_win_data_uses_chrome_client_only_frame(data);
+            stable_root_backing = data->chromium_root_surface_presented_once;
             dcomp_root_composition = chromium_hwnd_or_root_uses_root_surface_composition(child);
-            suppress_chromium_placeholder = dcomp_root_composition &&
+            suppress_chromium_placeholder = (!client_only_root || stable_root_backing) &&
+                                           dcomp_root_composition &&
                                            is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
-            remove_full_root_placeholder = dcomp_root_composition &&
+            remove_full_root_placeholder = (!client_only_root || stable_root_backing) &&
+                                           dcomp_root_composition &&
                                            is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
                                            has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
             if (remove_full_root_placeholder)
                 data->chromium_smaller_layer_hosted_once = TRUE;
             suppress_chromium_placeholder = suppress_chromium_placeholder &&
                                            data->chromium_smaller_layer_hosted_once;
-            clear_chromium_light_placeholder = is_chromium_cef_child_window(child) &&
+            clear_chromium_light_placeholder = !client_only_root && is_chromium_cef_child_window(child) &&
                                                data->chromium_smaller_layer_hosted_once;
             if (suppress_chromium_placeholder && mark_remote_layer_context_suppressed(data, context_id))
             {
@@ -2486,6 +2515,8 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         CGRect frame = CGRectNull;
         BOOL restore_alpha = FALSE;
         BOOL dcomp_root_composition;
+        BOOL client_only_root;
+        BOOL stable_root_backing;
         BOOL suppress_chromium_placeholder;
         BOOL remove_full_root_placeholder;
         unsigned int context_id = (unsigned int)lp;
@@ -2493,10 +2524,14 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
         {
             window = data->cocoa_window;
+            client_only_root = macdrv_win_data_uses_chrome_client_only_frame(data);
+            stable_root_backing = data->chromium_root_surface_presented_once;
             dcomp_root_composition = chromium_hwnd_or_root_uses_root_surface_composition(child);
-            suppress_chromium_placeholder = dcomp_root_composition &&
+            suppress_chromium_placeholder = (!client_only_root || stable_root_backing) &&
+                                           dcomp_root_composition &&
                                            is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
-            remove_full_root_placeholder = dcomp_root_composition &&
+            remove_full_root_placeholder = (!client_only_root || stable_root_backing) &&
+                                           dcomp_root_composition &&
                                            is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
                                            has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
             if (remove_full_root_placeholder)
@@ -2553,6 +2588,8 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         HWND source = (HWND)wp;
 
+        if (lp && source && source != hwnd)
+            macdrv_forget_root_surface_overlay(hwnd, source);
         macdrv_present_root_surface(hwnd, source ? source : hwnd);
         return 0;
     }
@@ -2818,7 +2855,7 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
     RECT rect;
     UINT flags = SWP_NOACTIVATE | SWP_NOZORDER;
     int width, height;
-    BOOL being_dragged;
+    BOOL being_dragged, chrome_custom_frame, position_changed;
 
     if (!hwnd) return;
     if (!(data = get_win_data(hwnd))) return;
@@ -2835,7 +2872,23 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
           event->window_frame_changed.fullscreen, event->window_frame_changed.in_resize);
 
     rect = rect_from_cgrect(event->window_frame_changed.frame);
-    rect = window_rect_from_visible(&data->rects, rect);
+    chrome_custom_frame = win_data_uses_chrome_custom_frame(data);
+    if (chrome_custom_frame)
+    {
+        const RECT *frame_rect = get_cocoa_frame_rect(data);
+
+        /*
+         * A Chrome Cocoa frame represents the Win32 client. Convert AppKit's
+         * move/resize result back to the whole Win32 window before feeding it
+         * to user32, otherwise every frame notification applies the non-client
+         * insets a second time and shifts pixels away from input coordinates.
+         */
+        rect.left += data->rects.window.left - frame_rect->left;
+        rect.top += data->rects.window.top - frame_rect->top;
+        rect.right += data->rects.window.right - frame_rect->right;
+        rect.bottom += data->rects.window.bottom - frame_rect->bottom;
+    }
+    else rect = window_rect_from_visible(&data->rects, rect);
     width = rect.right - rect.left;
     height = rect.bottom - rect.top;
 
@@ -2844,6 +2897,7 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
     else
         TRACE("%p moving from (%d,%d) to (%d,%d)\n", hwnd, data->rects.window.left,
               data->rects.window.top, rect.left, rect.top);
+    position_changed = !(flags & SWP_NOMOVE);
 
     if ((data->rects.window.right - data->rects.window.left == width &&
          data->rects.window.bottom - data->rects.window.top == height) ||
@@ -2864,6 +2918,14 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
         if (send_sizemove)
             send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
         NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+        if (chrome_custom_frame && position_changed)
+        {
+            /* AppKit discards Chromium's composed root contents on a native
+               borderless move, while a position-only Win32 change does not
+               make Chromium submit a replacement frame.  Repaint into the
+               same root backing at its new position. */
+            NtUserRedrawWindow(hwnd, NULL, 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+        }
         if (send_sizemove)
             send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
     }
@@ -3096,6 +3158,10 @@ void macdrv_window_drag_begin(HWND hwnd, const macdrv_event *event)
     data->drag_event = drag_event;
     release_win_data(data);
 
+    /* Chrome's custom frame is moved by Cocoa rather than move_window().  Keep
+       the already-composited root backing stable for that native drag too. */
+    macdrv_begin_window_move_surface_hold(hwnd);
+
     if (!event->window_drag_begin.no_activate && can_window_become_foreground(hwnd) &&
         NtUserGetForegroundWindow() != hwnd)
     {
@@ -3140,6 +3206,7 @@ void macdrv_window_drag_begin(HWND hwnd, const macdrv_event *event)
     }
 
     send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
+    macdrv_end_window_move_surface_hold();
 
     TRACE("done\n");
 
