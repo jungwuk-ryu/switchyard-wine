@@ -43,190 +43,31 @@ struct dce
     UINT        flags;
     LONG        count;         /* usage count; 0 or 1 for cache DCEs, always 1 for window DCEs,
                                   always >= 1 for class DCEs */
-    struct window_surface *chromium_child_surface;
-    HWND        chromium_child_surface_hwnd;
-    RECT        chromium_child_surface_rect;
+    struct foreign_surface_entry *foreign_surface;
 };
 
 static struct list dce_list = LIST_INIT(dce_list);
 
 #define DCE_CACHE_SIZE 64
 
-static BOOL is_chromium_cef_child_window(HWND hwnd)
+/* A DC obtained in a process other than the HWND owner cannot access the
+   owner's WND object. Cache one redirected backing per foreign HWND in this
+   process so client, caret and transient DCs all update one endpoint. */
+struct foreign_surface_entry
 {
-    static const WCHAR cef_browser_window[] =
-        {'C','e','f','B','r','o','w','s','e','r','W','i','n','d','o','w',0};
-    static const WCHAR chrome_render_widget[] =
-        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
-    static const WCHAR chrome_widget_prefix[] =
-        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
-    static const WCHAR intermediate_d3d_window[] =
-        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
+    struct list entry;
+    HWND hwnd;
+    DWORD owner_thread;
+    DWORD owner_process;
+    RECT rect;
+    UINT monitor_dpi;
+    unsigned int refs;
+    struct window_surface *surface;
+};
 
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, cef_browser_window)
-        || !wcscmp(class_name, chrome_render_widget)
-        || !wcscmp(class_name, intermediate_d3d_window)
-        || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
-}
-
-static BOOL is_chromium_dcomp_target_window(HWND hwnd)
-{
-    static const WCHAR intermediate_d3d_window[] =
-        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, intermediate_d3d_window);
-}
-
-static const WCHAR wine_window_topmost_composed[] =
-    {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
-static const WCHAR wine_window_non_topmost_composed[] =
-    {'w','i','n','e','_','w','i','n','d','o','w','_','n','o','n','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
-
-static BOOL is_dcomp_composed_hwnd(HWND hwnd)
-{
-    return hwnd && (NtUserGetProp(hwnd, wine_window_topmost_composed) ||
-                   NtUserGetProp(hwnd, wine_window_non_topmost_composed));
-}
-
-static BOOL is_chrome_widget_window(HWND hwnd)
-{
-    static const WCHAR chrome_widget_prefix[] =
-        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
-}
-
-static BOOL is_chrome_render_widget_host_window(HWND hwnd)
-{
-    static const WCHAR chrome_render_widget[] =
-        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, chrome_render_widget);
-}
-
-static BOOL chrome_subtree_has_render_widget(HWND hwnd)
-{
-    HWND child;
-
-    if (is_chrome_render_widget_host_window(hwnd)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chrome_subtree_has_render_widget(child)) return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL chrome_root_has_render_widget(HWND root)
-{
-    return root && is_chrome_widget_window(root) && chrome_subtree_has_render_widget(root);
-}
-
-static BOOL chromium_subtree_has_dcomp_target(HWND hwnd)
-{
-    HWND child;
-
-    if (is_chromium_cef_child_window(hwnd) && is_dcomp_composed_hwnd(hwnd)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL chromium_root_uses_dcomp_composition(HWND root)
-{
-    HWND child;
-
-    if (!root) return FALSE;
-    if (is_dcomp_composed_hwnd(root)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
-{
-    HWND root;
-
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-    if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
-}
-
-static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
-{
-    HWND root;
-
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-    if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root != hwnd &&
-           (chromium_root_uses_dcomp_composition(root) || chrome_root_has_render_widget(root));
-}
-
-static __thread unsigned int chromium_cef_child_surface_create_depth;
+static struct list foreign_surfaces = LIST_INIT(foreign_surfaces);
+static pthread_mutex_t foreign_surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread unsigned int foreign_surface_create_depth;
 
 static struct list window_surfaces = LIST_INIT( window_surfaces );
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -860,19 +701,133 @@ void window_surface_release( struct window_surface *surface )
     }
 }
 
-static void release_chromium_child_surface( struct dce *dce )
+static void release_foreign_surface( struct dce *dce )
 {
-    if (dce->chromium_child_surface) window_surface_release( dce->chromium_child_surface );
-    dce->chromium_child_surface = NULL;
-    dce->chromium_child_surface_hwnd = 0;
-    SetRectEmpty( &dce->chromium_child_surface_rect );
+    struct foreign_surface_entry *entry = dce->foreign_surface;
+    struct window_surface *surface = NULL;
+
+    if (!entry) return;
+    dce->foreign_surface = NULL;
+
+    pthread_mutex_lock( &foreign_surfaces_lock );
+    if (!--entry->refs)
+    {
+        list_remove( &entry->entry );
+        surface = entry->surface;
+    }
+    pthread_mutex_unlock( &foreign_surfaces_lock );
+
+    if (surface)
+    {
+        window_surface_release( surface );
+        free( entry );
+    }
 }
 
-static BOOL chromium_child_surface_matches( const struct dce *dce, HWND hwnd, const RECT *rect )
+static BOOL foreign_surface_matches( const struct foreign_surface_entry *entry,
+                                     HWND hwnd, DWORD owner_thread, DWORD owner_process,
+                                     const RECT *rect, UINT monitor_dpi )
 {
-    return dce->chromium_child_surface
-        && dce->chromium_child_surface_hwnd == hwnd
-        && EqualRect( &dce->chromium_child_surface_rect, rect );
+    return entry && entry->hwnd == hwnd && entry->owner_thread == owner_thread &&
+           entry->owner_process == owner_process && entry->monitor_dpi == monitor_dpi &&
+           EqualRect( &entry->rect, rect );
+}
+
+static struct window_surface *acquire_foreign_surface( struct dce *dce, HWND hwnd,
+                                                       const RECT *rect, UINT monitor_dpi )
+{
+    struct foreign_surface_entry *entry, *candidate = NULL;
+    struct window_surface *created = NULL, *surface = NULL, *old_surface = NULL;
+    DWORD owner_process = 0, owner_thread;
+
+    if (!(owner_thread = NtUserGetWindowThread( hwnd, &owner_process )) || !owner_process) return NULL;
+
+    if (foreign_surface_matches( dce->foreign_surface, hwnd, owner_thread, owner_process,
+                                 rect, monitor_dpi ))
+    {
+        surface = dce->foreign_surface->surface;
+        window_surface_add_ref( surface );
+        return surface;
+    }
+
+    release_foreign_surface( dce );
+    if (foreign_surface_create_depth) return NULL;
+
+    pthread_mutex_lock( &foreign_surfaces_lock );
+    LIST_FOR_EACH_ENTRY( entry, &foreign_surfaces, struct foreign_surface_entry, entry )
+    {
+        if (!foreign_surface_matches( entry, hwnd, owner_thread, owner_process,
+                                      rect, monitor_dpi )) continue;
+        entry->refs++;
+        dce->foreign_surface = entry;
+        surface = entry->surface;
+        window_surface_add_ref( surface );
+        break;
+    }
+    pthread_mutex_unlock( &foreign_surfaces_lock );
+    if (surface) return surface;
+
+    foreign_surface_create_depth++;
+    create_window_surface( hwnd, FALSE, rect, monitor_dpi, &created );
+    foreign_surface_create_depth--;
+    if (!created || created == &dummy_surface)
+    {
+        if (created) window_surface_release( created );
+        return NULL;
+    }
+
+    if (!(candidate = calloc( 1, sizeof(*candidate) )))
+    {
+        window_surface_release( created );
+        return NULL;
+    }
+    candidate->hwnd = hwnd;
+    candidate->owner_thread = owner_thread;
+    candidate->owner_process = owner_process;
+    candidate->rect = *rect;
+    candidate->monitor_dpi = monitor_dpi;
+    candidate->refs = 1;
+    candidate->surface = created;
+
+    pthread_mutex_lock( &foreign_surfaces_lock );
+    LIST_FOR_EACH_ENTRY( entry, &foreign_surfaces, struct foreign_surface_entry, entry )
+    {
+        if (entry->hwnd != hwnd) continue;
+        entry->refs++;
+        dce->foreign_surface = entry;
+        if (!foreign_surface_matches( entry, hwnd, owner_thread, owner_process,
+                                      rect, monitor_dpi ))
+        {
+            old_surface = entry->surface;
+            entry->surface = created;
+            entry->rect = *rect;
+            entry->owner_thread = owner_thread;
+            entry->owner_process = owner_process;
+            entry->monitor_dpi = monitor_dpi;
+            candidate->surface = NULL;
+            created = NULL;
+        }
+        surface = entry->surface;
+        window_surface_add_ref( surface );
+        break;
+    }
+    if (!surface)
+    {
+        list_add_tail( &foreign_surfaces, &candidate->entry );
+        dce->foreign_surface = candidate;
+        surface = candidate->surface;
+        window_surface_add_ref( surface );
+        candidate = NULL;
+    }
+    pthread_mutex_unlock( &foreign_surfaces_lock );
+
+    if (candidate)
+    {
+        if (candidate->surface) window_surface_release( candidate->surface );
+        free( candidate );
+    }
+    if (old_surface) window_surface_release( old_surface );
+    return surface;
 }
 
 void window_surface_lock( struct window_surface *surface )
@@ -1178,16 +1133,9 @@ static void update_visible_region( struct dce *dce )
     if (dce->clip_rgn) NtGdiCombineRgn( vis_rgn, vis_rgn, dce->clip_rgn,
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
-    if (chromium_hwnd_uses_dcomp_root_composition(dce->hwnd) &&
-        !chromium_hwnd_should_root_compose_surface(dce->hwnd))
+    if (is_current_process_window( dce->hwnd ))
     {
-        if (dce->chromium_child_surface)
-            release_chromium_child_surface( dce );
-        TRACE( "using root/top surface for Chromium/CEF child hwnd %p because DComp owns composition\n",
-               dce->hwnd );
-    }
-    else if (is_chromium_cef_child_window(dce->hwnd))
-    {
+        release_foreign_surface( dce );
         win = get_win_ptr( dce->hwnd );
         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
         {
@@ -1197,69 +1145,25 @@ static void update_visible_region( struct dce *dce )
                 window_surface_add_ref( surface );
                 surface->flush_on_unlock = TRUE;
                 top_rect = win_rect;
-                TRACE( "using current Chromium/CEF child surface %p for hwnd %p instead of top window %p\n",
-                       surface, dce->hwnd, top_win );
+                TRACE( "using HWND-owned redirected surface %p for hwnd %p\n",
+                       surface, dce->hwnd );
             }
             else surface = NULL;
             release_win_ptr( win );
         }
+    }
+    else if (!IsRectEmpty( &win_rect ))
+    {
+        UINT raw_dpi;
 
-        if (!surface && !IsRectEmpty( &win_rect ))
+        get_win_monitor_dpi( dce->hwnd, &raw_dpi );
+        surface = acquire_foreign_surface( dce, dce->hwnd, &win_rect, raw_dpi );
+        if (surface)
         {
-            if (chromium_cef_child_surface_create_depth)
-            {
-                TRACE( "skipping recursive local Chromium/CEF child surface creation for hwnd %p DCE %p\n",
-                       dce->hwnd, dce->hdc );
-            }
-            else
-            {
-                UINT raw_dpi;
-
-                if (chromium_child_surface_matches( dce, dce->hwnd, &win_rect ))
-                {
-                    surface = dce->chromium_child_surface;
-                    window_surface_add_ref( surface );
-                    TRACE( "reusing local Chromium/CEF child surface %p for foreign hwnd %p DCE %p\n",
-                           surface, dce->hwnd, dce->hdc );
-                }
-                else if (dce->chromium_child_surface)
-                {
-                    TRACE( "dropping stale Chromium/CEF child surface %p for foreign hwnd %p DCE %p\n",
-                           dce->chromium_child_surface, dce->chromium_child_surface_hwnd, dce->hdc );
-                    release_chromium_child_surface( dce );
-                }
-
-                if (!surface)
-                {
-                    chromium_cef_child_surface_create_depth++;
-                    get_win_monitor_dpi( dce->hwnd, &raw_dpi );
-                    create_window_surface( dce->hwnd, FALSE, &win_rect, raw_dpi, &surface );
-                    chromium_cef_child_surface_create_depth--;
-                }
-
-                if (surface && surface != &dummy_surface)
-                {
-                    surface->flush_on_unlock = TRUE;
-                    if (dce->chromium_child_surface != surface)
-                    {
-                        if (dce->chromium_child_surface) window_surface_release( dce->chromium_child_surface );
-                        dce->chromium_child_surface = surface;
-                        dce->chromium_child_surface_hwnd = dce->hwnd;
-                        dce->chromium_child_surface_rect = win_rect;
-                        window_surface_add_ref( surface );
-                    }
-                    top_rect = win_rect;
-                    TRACE( "using local Chromium/CEF child surface %p for foreign hwnd %p DCE %p\n",
-                           surface, dce->hwnd, dce->hdc );
-                }
-                else
-                {
-                    if (surface) window_surface_release( surface );
-                    surface = NULL;
-                    TRACE( "could not create local Chromium/CEF child surface for foreign hwnd %p DCE %p\n",
-                           dce->hwnd, dce->hdc );
-                }
-            }
+            surface->flush_on_unlock = TRUE;
+            top_rect = win_rect;
+            TRACE( "using process-shared foreign surface %p for hwnd %p DCE %p\n",
+                   surface, dce->hwnd, dce->hdc );
         }
     }
 
@@ -1275,10 +1179,6 @@ static void update_visible_region( struct dce *dce )
         }
     }
 
-    if (is_chromium_cef_child_window(dce->hwnd) && !surface)
-        TRACE( "Chromium/CEF child hwnd %p has no current surface for DCE %p\n",
-               dce->hwnd, dce->hdc );
-
     if (!surface) SetRectEmpty( &top_rect );
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
     if (surface) window_surface_release( surface );
@@ -1293,7 +1193,7 @@ static void release_dce( struct dce *dce )
 
     set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface );
     user_driver->pReleaseDC( dce->hwnd, dce->hdc );
-    release_chromium_child_surface( dce );
+    release_foreign_surface( dce );
 
     if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
     dce->clip_rgn = 0;
@@ -1335,7 +1235,7 @@ BOOL delete_dce( struct dce *dce )
     {
         list_remove( &dce->entry );
         if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
-        release_chromium_child_surface( dce );
+        release_foreign_surface( dce );
         free( dce );
     }
     user_unlock();
@@ -1380,9 +1280,7 @@ static struct dce *alloc_dce(void)
     dce->clip_rgn  = 0;
     dce->flags     = 0;
     dce->count     = 1;
-    dce->chromium_child_surface = NULL;
-    dce->chromium_child_surface_hwnd = 0;
-    SetRectEmpty( &dce->chromium_child_surface_rect );
+    dce->foreign_surface = NULL;
 
     set_dc_dce( dce->hdc, dce );
     return dce;
@@ -1794,12 +1692,6 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 
     dce->hwnd = hwnd;
     dce->flags = (dce->flags & ~user_flags) | (flags & user_flags);
-
-    if (!update_vis_rgn && is_chromium_cef_child_window( hwnd ))
-    {
-        TRACE( "refreshing cached DCE visible region for Chromium/CEF child hwnd %p\n", hwnd );
-        update_vis_rgn = TRUE;
-    }
 
     /* cross-process invalidation is not supported yet, so always update the vis rgn */
     if (!is_current_process_window( hwnd )) update_vis_rgn = TRUE;

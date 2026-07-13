@@ -22,6 +22,7 @@
 
 #define GL_SILENCE_DEPRECATION
 #import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #include <dispatch/dispatch.h>
@@ -370,6 +371,31 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @interface WineBaseView : NSView
 @end
 
+@class WineContentView;
+
+@interface WineCompositorNode : NSObject
+{
+@public
+    uint64_t revision;
+    unsigned int contextId;
+    WineContentView* view; /* assign; a view detaches its nodes before dealloc */
+    CALayer* clipContainer;
+    CALayerHost* remoteHost;
+    CAShapeLayer* visibilityMask;
+}
+@end
+
+static NSMutableDictionary<NSNumber*, WineCompositorNode*>* compositorNodes;
+static NSMutableDictionary<NSNumber*, NSNumber*>* compositorRevisions;
+
+static void WineCompositorApplyNode(WineContentView* view, uint64_t nodeId,
+                                    uint64_t revision, unsigned int contextId,
+                                    CGRect contentFrame, CGRect clipFrame,
+                                    const CGRect *visibleRects, unsigned int visibleCount,
+                                    CGFloat zPosition, BOOL displayed);
+static void WineCompositorRemoveNode(uint64_t nodeId, uint64_t revision, BOOL permanent);
+static void WineCompositorDetachView(WineContentView* view);
+
 
 @interface WineMetalView : WineBaseView
 {
@@ -387,6 +413,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     CGImageRef colorImage;
     CGImageRef shapeImage;
     CALayer* rootSurfaceLayer;
+    CALayer* compositorRootLayer;
 
     NSMutableArray* glContexts;
     NSMutableArray* pendingGlContexts;
@@ -400,7 +427,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     int backingSize[2];
 
     WineMetalView *_metalView;
-    NSMutableDictionary<NSNumber*, CALayerHost*>* _caLayerHosts;
 }
 
 @property (readonly, nonatomic) BOOL everHadGLContext;
@@ -408,25 +434,12 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) addGLContext:(WineOpenGLContext*)context;
     - (void) removeGLContext:(WineOpenGLContext*)context;
     - (void) updateGLContexts;
-    - (void) clearColorImage;
-    - (BOOL) imageIsLightPlaceholder:(CGImageRef)image;
-    - (BOOL) colorImageIsLightPlaceholder;
-    - (void) clearLightPlaceholderBackingColor;
-
     - (void) wine_getBackingSize:(int*)outBackingSize;
     - (void) wine_setBackingSize:(const int*)newBackingSize;
 
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
-    - (void) activateRootSurfaceComposition;
-    - (void) updateRootSurfaceInRect:(CGRect)dirty;
-    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame;
-    - (void) updateCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame;
-    - (void) updateCALayerHostZPosition:(CALayerHost*)host;
-    - (BOOL) caLayerHostFrame:(CGRect)frame nearlyEqualsFrame:(CGRect)other;
-    - (void) removeCALayerHostView:(CAContextID)contextId;
-    - (void) removeCALayerHostViewImmediately:(CAContextID)contextId;
+    - (CALayer*) compositorLayer;
     - (void) removeAllCALayerHostViews;
-    - (void) removeFullFrameCALayerHostViewsExceptContextId:(CAContextID)contextId;
 
 @end
 
@@ -447,8 +460,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
 @property (nonatomic) BOOL shapeChangedSinceLastDraw;
 @property (readonly, nonatomic) BOOL needsTransparency;
-@property (nonatomic) BOOL switchyardBlankBackingColor;
-@property (nonatomic) BOOL switchyardRootSurfaceComposition;
 @property (nonatomic) BOOL surfaceUpdatesSuspended;
 
 @property (nonatomic) BOOL usePerPixelAlpha;
@@ -469,15 +480,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) becameIneligibleChild;
 
     - (void) windowDidDrawContent;
-    - (BOOL) trackParentWindowNumber:(CGWindowID)parentWindowNumber
-                         parentFrame:(CGRect)parentFrame childFrame:(CGRect)childFrame;
-    - (void) stopTrackingParentWindow;
-    + (void) syncTrackedParentWindows;
-    + (void) trackedParentWindowsTimerFired:(NSTimer*)timer;
-    - (void) updateTrackedParentBounds:(CGRect)parentBounds;
-    - (unsigned long long) nextRootSurfaceSubmissionSequence;
-    - (BOOL) isCurrentRootSurfaceSubmissionSequence:(unsigned long long)sequence;
-
+    - (void) enqueueSurfaceImage:(CGImageRef)image rect:(CGRect)rect dirty:(CGRect)dirty;
+    - (void) drainSurfaceImage;
 @end
 
 @implementation WineBaseView
@@ -526,6 +530,181 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @end
 
 
+@implementation WineCompositorNode
+
+- (void)dealloc
+{
+    [remoteHost setContextId:0];
+    [clipContainer removeFromSuperlayer];
+    [remoteHost removeFromSuperlayer];
+    [remoteHost release];
+    [visibilityMask release];
+    [clipContainer release];
+    [super dealloc];
+}
+
+@end
+
+
+static uint64_t WineCompositorKnownRevision(NSNumber* key)
+{
+    NSNumber* value = [compositorRevisions objectForKey:key];
+    return value ? [value unsignedLongLongValue] : 0;
+}
+
+static WineCompositorNode* WineCompositorCreateNode(void)
+{
+    NSDictionary* disabledActions = [NSDictionary dictionaryWithObjectsAndKeys:
+        [NSNull null], @"bounds", [NSNull null], @"contents",
+        [NSNull null], @"contentsScale", [NSNull null], @"frame",
+        [NSNull null], @"hidden", [NSNull null], @"opacity",
+        [NSNull null], @"onOrderIn", [NSNull null], @"onOrderOut",
+        [NSNull null], @"position", [NSNull null], @"sublayers", nil];
+    WineCompositorNode* node = [[[WineCompositorNode alloc] init] autorelease];
+
+    node->clipContainer = [[CALayer alloc] init];
+    node->remoteHost = [[CALayerHost alloc] init];
+    node->visibilityMask = [[CAShapeLayer alloc] init];
+    if (!node->clipContainer || !node->remoteHost || !node->visibilityMask) return nil;
+
+    node->clipContainer.anchorPoint = CGPointMake(0, 0);
+    node->clipContainer.masksToBounds = YES;
+    node->clipContainer.actions = disabledActions;
+    node->visibilityMask.anchorPoint = CGPointMake(0, 0);
+    node->visibilityMask.actions = disabledActions;
+    node->clipContainer.mask = node->visibilityMask;
+    node->remoteHost.anchorPoint = CGPointMake(0, 0);
+    node->remoteHost.actions = disabledActions;
+    node->remoteHost.magnificationFilter = kCAFilterNearest;
+    node->remoteHost.minificationFilter = kCAFilterNearest;
+    node->remoteHost.contentsScale = retina_on ? 2.0 : 1.0;
+    [node->clipContainer addSublayer:node->remoteHost];
+    return node;
+}
+
+static void WineCompositorApplyNode(WineContentView* view, uint64_t nodeId,
+                                    uint64_t newRevision, unsigned int contextId,
+                                    CGRect contentFrame, CGRect clipFrame,
+                                    const CGRect *visibleRects, unsigned int visibleCount,
+                                    CGFloat zPosition, BOOL displayed)
+{
+    NSNumber* key = [NSNumber numberWithUnsignedLongLong:nodeId];
+    WineCompositorNode* node;
+
+    NSCAssert([NSThread isMainThread], @"compositor commands must run on the main thread");
+    if (!compositorNodes) compositorNodes = [[NSMutableDictionary alloc] init];
+    if (!compositorRevisions) compositorRevisions = [[NSMutableDictionary alloc] init];
+    if (newRevision <= WineCompositorKnownRevision(key)) return;
+
+    node = [compositorNodes objectForKey:key];
+    if (!node)
+    {
+        if (!(node = WineCompositorCreateNode())) return;
+        [compositorNodes setObject:node forKey:key];
+    }
+    [compositorRevisions setObject:[NSNumber numberWithUnsignedLongLong:newRevision] forKey:key];
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (node->contextId != contextId)
+    {
+        [node->remoteHost setContextId:0];
+        [node->remoteHost setContextId:contextId];
+        node->contextId = contextId;
+    }
+    node->revision = newRevision;
+
+    if (!displayed || !view || CGRectIsEmpty(clipFrame))
+    {
+        [node->clipContainer removeFromSuperlayer];
+        node->view = nil;
+    }
+    else
+    {
+        CGMutablePathRef path = CGPathCreateMutable();
+        unsigned int i;
+
+        if (node->view != view || node->clipContainer.superlayer != [view compositorLayer])
+        {
+            [node->clipContainer removeFromSuperlayer];
+            [[view compositorLayer] addSublayer:node->clipContainer];
+            node->view = view;
+        }
+        node->clipContainer.frame = clipFrame;
+        node->clipContainer.zPosition = zPosition;
+        node->clipContainer.hidden = NO;
+        node->visibilityMask.frame = node->clipContainer.bounds;
+        for (i = 0; path && i < visibleCount; i++)
+        {
+            CGRect rect = visibleRects[i];
+
+            rect.origin.x -= clipFrame.origin.x;
+            rect.origin.y -= clipFrame.origin.y;
+            CGPathAddRect(path, NULL, rect);
+        }
+        node->visibilityMask.path = path;
+        if (path) CGPathRelease(path);
+        node->remoteHost.frame = CGRectMake(contentFrame.origin.x - clipFrame.origin.x,
+                                             contentFrame.origin.y - clipFrame.origin.y,
+                                             contentFrame.size.width, contentFrame.size.height);
+    }
+    [CATransaction commit];
+    [CATransaction flush];
+
+    if (displayed && view) [(WineWindow*)view.window windowDidDrawContent];
+}
+
+static void WineCompositorRemoveNode(uint64_t nodeId, uint64_t newRevision, BOOL permanent)
+{
+    NSNumber* key = [NSNumber numberWithUnsignedLongLong:nodeId];
+    WineCompositorNode* node;
+
+    NSCAssert([NSThread isMainThread], @"compositor commands must run on the main thread");
+    if (!compositorRevisions) compositorRevisions = [[NSMutableDictionary alloc] init];
+    if (newRevision <= WineCompositorKnownRevision(key)) return;
+    [compositorRevisions setObject:[NSNumber numberWithUnsignedLongLong:newRevision] forKey:key];
+
+    node = [compositorNodes objectForKey:key];
+    if (!node)
+    {
+        if (permanent) [compositorRevisions removeObjectForKey:key];
+        return;
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [node->clipContainer removeFromSuperlayer];
+    node->view = nil;
+    node->revision = newRevision;
+    if (permanent)
+    {
+        [node->remoteHost setContextId:0];
+        node->contextId = 0;
+        [compositorNodes removeObjectForKey:key];
+        /* C-side command submission is serialized with revision assignment.
+           Once a permanent removal reaches the main queue, no older apply can
+           arrive behind it and the tombstone no longer needs to be retained. */
+        [compositorRevisions removeObjectForKey:key];
+    }
+    [CATransaction commit];
+    [CATransaction flush];
+}
+
+static void WineCompositorDetachView(WineContentView* view)
+{
+    NSArray* nodes;
+
+    NSCAssert([NSThread isMainThread], @"compositor view teardown must run on the main thread");
+    nodes = [[compositorNodes allValues] copy];
+    for (WineCompositorNode* node in nodes)
+    {
+        if (node->view != view) continue;
+        [node->clipContainer removeFromSuperlayer];
+        node->view = nil;
+    }
+    [nodes release];
+}
+
+
 @implementation WineContentView
 
 @synthesize everHadGLContext = _everHadGLContext;
@@ -535,8 +714,34 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         self = [super initWithFrame:frame];
         if (self)
         {
+            NSDictionary* disabledActions = [NSDictionary dictionaryWithObjectsAndKeys:
+                [NSNull null], @"bounds", [NSNull null], @"contents",
+                [NSNull null], @"frame", [NSNull null], @"position",
+                [NSNull null], @"sublayers", nil];
+
             [self setLayerContentsPlacement:NSViewLayerContentsPlacementTopLeft];
             [self setWantsLayer:YES];
+            self.layer.contents = nil;
+
+            /* The NSView layer is the immutable Cocoa/input coordinate root.
+               Local pixels and cross-process compositor nodes must never move
+               that root or replace each other's layer trees. */
+            rootSurfaceLayer = [[CALayer alloc] init];
+            rootSurfaceLayer.anchorPoint = CGPointMake(0, 0);
+            rootSurfaceLayer.frame = self.layer.bounds;
+            rootSurfaceLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+            rootSurfaceLayer.contentsGravity = kCAGravityResize;
+            rootSurfaceLayer.actions = disabledActions;
+
+            compositorRootLayer = [[CALayer alloc] init];
+            compositorRootLayer.anchorPoint = CGPointMake(0, 0);
+            compositorRootLayer.frame = self.layer.bounds;
+            compositorRootLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+            compositorRootLayer.masksToBounds = YES;
+            compositorRootLayer.actions = disabledActions;
+
+            [self.layer addSublayer:rootSurfaceLayer];
+            [self.layer addSublayer:compositorRootLayer];
             [self setLayerRetinaProperties:retina_on];
             [self setAutoresizesSubviews:NO];
         }
@@ -545,13 +750,15 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) dealloc
     {
+        WineCompositorDetachView(self);
         [markedText release];
         [glContexts release];
         [pendingGlContexts release];
-        [_caLayerHosts release];
         rootSurfaceLayer.delegate = nil;
         [rootSurfaceLayer removeFromSuperlayer];
         [rootSurfaceLayer release];
+        [compositorRootLayer removeFromSuperlayer];
+        [compositorRootLayer release];
         CGImageRelease(colorImage);
         CGImageRelease(shapeImage);
         [super dealloc];
@@ -572,15 +779,12 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         WineWindow* window = (WineWindow*)[self window];
         CGImageRef image, maskedImage;
         CGRect imageRect;
-        CALayer* layer = [self layer];
+        CALayer* layer = rootSurfaceLayer;
 
         if ([window contentView] != self)
             return;
 
         if (window.closing)
-            return;
-
-        if (window.switchyardRootSurfaceComposition)
             return;
 
         if (!colorImage)
@@ -602,12 +806,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         if (image)
         {
-            if (colorImage && CGImageGetWidth(colorImage) >= 400 && CGImageGetHeight(colorImage) >= 300)
-            {
-                [window setBackgroundColor:[NSColor blackColor]];
-                [window setOpaque:YES];
-            }
-            layer.position = surfaceRect.origin;
             layer.contents = (id)image;
             CFRelease(image);
             [window windowDidDrawContent];
@@ -626,136 +824,18 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) setSurfaceRect:(CGRect)rect
     {
         surfaceRect = rect;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        rootSurfaceLayer.frame = rect;
+        rootSurfaceLayer.bounds = CGRectMake(0, 0, rect.size.width, rect.size.height);
+        [CATransaction commit];
     }
 
     - (void) setColorImage:(CGImageRef)image
     {
-        WineWindow* window = (WineWindow*)[self window];
-
-        if (window && !window.switchyardRootSurfaceComposition &&
-            window.switchyardBlankBackingColor && _caLayerHosts && [_caLayerHosts count] &&
-            [self imageIsLightPlaceholder:image])
-        {
-            [window setBackgroundColor:[NSColor blackColor]];
-            [window setOpaque:YES];
-            CGImageRelease(colorImage);
-            colorImage = NULL;
-            self.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-            self.layer.contents = nil;
-            return;
-        }
-
-        if (window)
-            window.switchyardBlankBackingColor = NO;
-        self.layer.backgroundColor = NULL;
+        rootSurfaceLayer.backgroundColor = NULL;
         CGImageRelease(colorImage);
         colorImage = CGImageRetain(image);
-    }
-
-    - (void) clearColorImage
-    {
-        WineWindow* window = (WineWindow*)[self window];
-
-        if (window)
-        {
-            window.switchyardBlankBackingColor = YES;
-            [window setBackgroundColor:[NSColor blackColor]];
-            [window setOpaque:YES];
-        }
-        CGImageRelease(colorImage);
-        colorImage = NULL;
-        self.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-        self.layer.contents = nil;
-    }
-
-    - (BOOL) imageIsLightPlaceholder:(CGImageRef)image
-    {
-        static const size_t sample_width = 32;
-        static const size_t sample_height = 24;
-        unsigned char samples[sample_width * sample_height * 4];
-        CGColorSpaceRef color_space;
-        CGContextRef context;
-        unsigned int solid_samples = 0;
-        unsigned int sample_count = 0;
-        unsigned char base_red = 0, base_green = 0, base_blue = 0;
-        BOOL have_base = NO;
-        size_t width, height;
-        size_t x, y;
-
-        if (!image)
-            return YES;
-
-        width = CGImageGetWidth(image);
-        height = CGImageGetHeight(image);
-        if (width < 400 || height < 300)
-            return NO;
-
-        color_space = CGColorSpaceCreateDeviceRGB();
-        if (!color_space)
-            return NO;
-
-        context = CGBitmapContextCreate(samples, sample_width, sample_height, 8, sample_width * 4,
-                                        color_space, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-        CGColorSpaceRelease(color_space);
-        if (!context)
-            return NO;
-
-        CGContextSetInterpolationQuality(context, kCGInterpolationNone);
-        CGContextDrawImage(context, CGRectMake(0, 0, sample_width, sample_height), image);
-        CGContextRelease(context);
-
-        for (y = 0; y < sample_height; y++)
-        {
-            for (x = 0; x < sample_width; x++)
-            {
-                unsigned char *pixel = samples + (y * sample_width + x) * 4;
-                unsigned char red = pixel[0];
-                unsigned char green = pixel[1];
-                unsigned char blue = pixel[2];
-
-                if (!have_base)
-                {
-                    base_red = red;
-                    base_green = green;
-                    base_blue = blue;
-                    have_base = YES;
-                }
-
-                sample_count++;
-                if (abs((int)red - (int)base_red) <= 8 &&
-                    abs((int)green - (int)base_green) <= 8 &&
-                    abs((int)blue - (int)base_blue) <= 8)
-                    solid_samples++;
-            }
-        }
-
-        return sample_count && solid_samples * 100 >= sample_count * 98 &&
-               base_red >= 247 && base_green >= 247 && base_blue >= 247;
-    }
-
-    - (BOOL) colorImageIsLightPlaceholder
-    {
-        return [self imageIsLightPlaceholder:colorImage];
-    }
-
-    - (void) clearLightPlaceholderBackingColor
-    {
-        WineWindow* window = (WineWindow*)[self window];
-
-        if (![self colorImageIsLightPlaceholder])
-            return;
-
-        if (window)
-        {
-            window.switchyardBlankBackingColor = YES;
-            [window setBackgroundColor:[NSColor blackColor]];
-            [window setOpaque:YES];
-        }
-        self.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-
-        CGImageRelease(colorImage);
-        colorImage = NULL;
-        self.layer.contents = nil;
     }
 
     - (void) setShapeImage:(CGImageRef)image
@@ -881,253 +961,34 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device
     {
         if (_metalView)
-        {
-            if (((WineWindow*)self.window).switchyardRootSurfaceComposition)
-                _metalView.hidden = YES;
             return _metalView;
-        }
 
         WineMetalView* view = [[WineMetalView alloc] initWithFrame:[self bounds] device:device];
         [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [self setAutoresizesSubviews:YES];
         [self addSubview:view positioned:NSWindowBelow relativeTo:nil];
         _metalView = view;
-        if (((WineWindow*)self.window).switchyardRootSurfaceComposition)
-            _metalView.hidden = YES;
 
         [(WineWindow*)self.window windowDidDrawContent];
 
         return _metalView;
     }
 
-    - (void) activateRootSurfaceComposition
+    - (CALayer*) compositorLayer
     {
-        if (_metalView)
-            _metalView.hidden = YES;
-        if (rootSurfaceLayer) return;
-
-        [self removeAllCALayerHostViews];
-        self.layer.sublayers = nil;
-        self.layer.contents = nil;
-        self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
-
-        rootSurfaceLayer = [[CALayer alloc] init];
-        rootSurfaceLayer.frame = self.layer.bounds;
-        rootSurfaceLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-        rootSurfaceLayer.contentsScale = retina_on ? 2.0 : 1.0;
-        rootSurfaceLayer.contentsGravity = kCAGravityResize;
-        rootSurfaceLayer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-        rootSurfaceLayer.actions = [NSDictionary dictionaryWithObjectsAndKeys:
-            [NSNull null], @"bounds", [NSNull null], @"contents",
-            [NSNull null], @"frame", [NSNull null], @"position",
-            [NSNull null], @"sublayers", nil];
-        [self.layer addSublayer:rootSurfaceLayer];
-    }
-
-    - (void) updateRootSurfaceInRect:(CGRect)dirty
-    {
-        CGImageRef croppedImage;
-        CGRect crop;
-        CGFloat scale;
-
-        if (!rootSurfaceLayer) return;
-        if (!colorImage) return;
-        scale = rootSurfaceLayer.contentsScale ?: 1.0;
-        crop = rootSurfaceLayer.bounds;
-        crop.origin.x *= scale;
-        crop.origin.y *= scale;
-        crop.size.width *= scale;
-        crop.size.height *= scale;
-        if (!(croppedImage = CGImageCreateWithImageInRect(colorImage, crop))) return;
-
-        /* Publish one complete root image to the sole native backing.  A
-           delegate-drawn CALayer cycles through cleared internal buffers for
-           partial updates, exposing black outside the dirty rectangle. */
-        (void)dirty;
-        rootSurfaceLayer.contents = (id)croppedImage;
-        CGImageRelease(croppedImage);
-    }
-
-    - (void) updateCALayerHostZPosition:(CALayerHost*)host
-    {
-        BOOL full_frame;
-
-        if (!host) return;
-
-        full_frame = [self caLayerHostFrame:host.frame nearlyEqualsFrame:self.layer.bounds];
-        host.zPosition = full_frame ? 0.0 : 1.0;
-    }
-
-    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame
-    {
-        if (!_caLayerHosts)
-            _caLayerHosts = [[NSMutableDictionary alloc] init];
-
-        [self removeCALayerHostView:contextId];
-        if (((WineWindow*)self.window).switchyardRootSurfaceComposition)
-            return;
-
-        NSDictionary* disabledActions = [NSDictionary dictionaryWithObjectsAndKeys:
-            [NSNull null], @"bounds",
-            [NSNull null], @"contents",
-            [NSNull null], @"contentsScale",
-            [NSNull null], @"frame",
-            [NSNull null], @"hidden",
-            [NSNull null], @"opacity",
-            [NSNull null], @"onOrderIn",
-            [NSNull null], @"onOrderOut",
-            [NSNull null], @"position",
-            [NSNull null], @"sublayers",
-            nil];
-        CALayerHost* host = [CALayerHost layer];
-        [host setContextId:contextId];
-        host.actions = disabledActions;
-        host.magnificationFilter = kCAFilterNearest;
-        host.contentsScale = retina_on ? 2.0 : 1.0;
-        host.masksToBounds = YES;
-
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        if (CGRectIsNull(frame))
-        {
-            host.frame = self.layer.bounds;
-            host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-        }
-        else
-        {
-            host.frame = frame;
-            host.autoresizingMask = 0;
-        }
-        [self updateCALayerHostZPosition:host];
-
-        [self.layer addSublayer:host];
-        [_caLayerHosts setObject:host forKey:@(contextId)];
-        [CATransaction commit];
-
-        [(WineWindow*)self.window windowDidDrawContent];
-    }
-
-    - (void) updateCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame
-    {
-        CALayerHost* host = [_caLayerHosts objectForKey:@(contextId)];
-
-        if (((WineWindow*)self.window).switchyardRootSurfaceComposition)
-        {
-            [self removeCALayerHostViewImmediately:contextId];
-            return;
-        }
-
-        if (!host)
-        {
-            [self addCALayerHostViewWithContextId:contextId frame:frame];
-            return;
-        }
-
-        if (!CGRectIsNull(frame) && !CGRectEqualToRect(host.frame, frame))
-        {
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            host.frame = frame;
-            [self updateCALayerHostZPosition:host];
-            [CATransaction commit];
-        }
-        else if (!CGRectIsNull(frame))
-        {
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            [self updateCALayerHostZPosition:host];
-            [CATransaction commit];
-        }
-    }
-
-    - (BOOL) caLayerHostFrame:(CGRect)frame nearlyEqualsFrame:(CGRect)other
-    {
-        return fabs(frame.origin.x - other.origin.x) <= 1.0 &&
-               fabs(frame.origin.y - other.origin.y) <= 1.0 &&
-               fabs(frame.size.width - other.size.width) <= 1.0 &&
-               fabs(frame.size.height - other.size.height) <= 1.0;
+        return compositorRootLayer;
     }
 
     - (void) removeAllCALayerHostViews
     {
-        NSArray* keys;
-
-        if (!_caLayerHosts) return;
-        keys = [[_caLayerHosts allKeys] copy];
-        for (NSNumber* key in keys)
-            [self removeCALayerHostViewImmediately:[key unsignedIntValue]];
-        [keys release];
-    }
-
-    - (void) removeCALayerHostView:(CAContextID)contextId immediately:(BOOL)immediately
-    {
-        NSNumber* key = @(contextId);
-        CALayerHost* host = [_caLayerHosts objectForKey:key];
-        BOOL full_frame;
-
-        if (!host) return;
-        [host retain];
-        full_frame = [self caLayerHostFrame:host.frame nearlyEqualsFrame:self.layer.bounds];
-        [_caLayerHosts removeObjectForKey:key];
-
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        if (immediately)
-            [host removeFromSuperlayer];
-        else
-            host.zPosition = full_frame ? 0.0 : 1.0;
-        [CATransaction commit];
-
-        if (immediately)
-        {
-            [host release];
-            return;
-        }
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            [host removeFromSuperlayer];
-            [CATransaction commit];
-            [host release];
-        });
-    }
-
-    - (void) removeCALayerHostView:(CAContextID)contextId
-    {
-        [self removeCALayerHostView:contextId immediately:NO];
-    }
-
-    - (void) removeCALayerHostViewImmediately:(CAContextID)contextId
-    {
-        [self removeCALayerHostView:contextId immediately:YES];
-    }
-
-    - (void) removeFullFrameCALayerHostViewsExceptContextId:(CAContextID)contextId
-    {
-        NSArray* keys;
-        CGRect bounds;
-
-        if (!_caLayerHosts) return;
-
-        keys = [[_caLayerHosts allKeys] copy];
-        bounds = self.layer.bounds;
-        for (NSNumber* key in keys)
-        {
-            CALayerHost* host;
-
-            if ([key unsignedIntValue] == contextId) continue;
-            host = [_caLayerHosts objectForKey:key];
-            if (host && [self caLayerHostFrame:host.frame nearlyEqualsFrame:bounds])
-                [self removeCALayerHostViewImmediately:[key unsignedIntValue]];
-        }
-        [keys release];
+        WineCompositorDetachView(self);
     }
 
     - (void) setLayerRetinaProperties:(BOOL)mode
     {
         [self layer].contentsScale = mode ? 2.0 : 1.0;
         rootSurfaceLayer.contentsScale = mode ? 2.0 : 1.0;
+        compositorRootLayer.contentsScale = mode ? 2.0 : 1.0;
         [self layer].minificationFilter = mode ? kCAFilterLinear : kCAFilterNearest;
         [self layer].magnificationFilter = mode ? kCAFilterLinear : kCAFilterNearest;
 
@@ -1164,8 +1025,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         [self updateGLContexts];
         [self setLayerRetinaProperties:mode];
 
-        for (CALayerHost* host in [_caLayerHosts allValues])
-            host.contentsScale = mode ? 2.0 : 1.0;
+        for (WineCompositorNode* node in [compositorNodes allValues])
+            if (node->view == self) node->remoteHost.contentsScale = mode ? 2.0 : 1.0;
 
         [super setRetinaMode:mode];
     }
@@ -1428,8 +1289,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @implementation WineWindow
 
     static WineWindow* causing_becomeKeyWindow;
-    static NSMutableSet* trackedParentWindows;
-    static NSTimer* trackedParentWindowsTimer;
 
     @synthesize disabled, noForeground, preventsAppActivation, floating, fullscreen, fakingClose, closing, latentParentWindow, hwnd, queue;
     @synthesize drawnSinceShown;
@@ -1439,20 +1298,68 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     @synthesize himc, commandDone;
     @synthesize contentViewMaskLayer;
 
-    - (unsigned long long) nextRootSurfaceSubmissionSequence
+    - (void) enqueueSurfaceImage:(CGImageRef)image rect:(CGRect)rect dirty:(CGRect)dirty
     {
+        CGImageRef replaced = NULL;
+        BOOL schedule = NO;
+
+        if (!image) return;
+        CGImageRetain(image);
         @synchronized(self)
         {
-            return ++rootSurfaceSubmissionSequence;
+            replaced = pendingSurfaceImage;
+            pendingSurfaceImage = image;
+            pendingSurfaceRect = rect;
+            pendingSurfaceDirty = surfaceUpdateScheduled ?
+                                  CGRectUnion(pendingSurfaceDirty, dirty) : dirty;
+            if (!surfaceUpdateScheduled)
+            {
+                surfaceUpdateScheduled = YES;
+                schedule = YES;
+            }
         }
+        if (replaced) CGImageRelease(replaced);
+        if (schedule) OnMainThreadAsync(^{ [self drainSurfaceImage]; });
     }
 
-    - (BOOL) isCurrentRootSurfaceSubmissionSequence:(unsigned long long)sequence
+    - (void) drainSurfaceImage
     {
+        WineContentView *view = [self contentView];
+        CGImageRef image;
+        CGRect rect, dirty;
+        BOOL again;
+
         @synchronized(self)
         {
-            return sequence == rootSurfaceSubmissionSequence;
+            image = pendingSurfaceImage;
+            pendingSurfaceImage = NULL;
+            rect = pendingSurfaceRect;
+            dirty = pendingSurfaceDirty;
         }
+
+        if (image)
+        {
+            [view setColorImage:image];
+            [view setSurfaceRect:cgrect_mac_from_win(rect)];
+            if (!surfaceUpdatesSuspended)
+            {
+                [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
+                if (!drawnSinceShown)
+                {
+                    [self setAutodisplay:YES];
+                    [self displayIfNeeded];
+                    [self checkWineDisplayLink];
+                }
+            }
+            CGImageRelease(image);
+        }
+
+        @synchronized(self)
+        {
+            again = pendingSurfaceImage != NULL;
+            if (!again) surfaceUpdateScheduled = NO;
+        }
+        if (again) OnMainThreadAsync(^{ [self drainSurfaceImage]; });
     }
 
     + (WineWindow*) createWindowWithFeatures:(const struct macdrv_window_features*)wf
@@ -1542,186 +1449,14 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) dealloc
     {
-        [self stopTrackingParentWindow];
         [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
         [[NSNotificationCenter defaultCenter] removeObserver:self];
         [queue release];
         [latentChildWindows release];
         [latentParentWindow release];
+        if (pendingSurfaceImage) CGImageRelease(pendingSurfaceImage);
         [contentViewMaskLayer release];
         [super dealloc];
-    }
-
-    - (void) updateTrackedParentBounds:(CGRect)parentBounds
-    {
-        CGRect childFrame;
-
-        childFrame.origin.x = parentBounds.origin.x + trackedParentLeftInset;
-        childFrame.origin.y = parentBounds.origin.y + trackedParentTopInset;
-        childFrame.size.width = MAX(1, parentBounds.size.width - trackedParentLeftInset -
-                                      trackedParentRightInset);
-        childFrame.size.height = MAX(1, parentBounds.size.height - trackedParentTopInset -
-                                       trackedParentBottomInset);
-        if (!trackedParentHasChildFrame || !CGRectEqualToRect(childFrame, trackedParentLastChildFrame))
-        {
-            [self setFrameFromWine:NSRectFromCGRect(cgrect_mac_from_win(childFrame))];
-            trackedParentLastChildFrame = childFrame;
-            trackedParentHasChildFrame = YES;
-        }
-    }
-
-    + (void) syncTrackedParentWindows
-    {
-        CFArrayRef windowInfo;
-        NSMutableDictionary* boundsByNumber;
-        NSMutableDictionary* indicesByNumber;
-        NSMutableDictionary* groups;
-        NSUInteger i;
-
-        if (![trackedParentWindows count]) return;
-        windowInfo = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
-                                                kCGWindowListExcludeDesktopElements,
-                                                kCGNullWindowID);
-        if (!windowInfo)
-        {
-            for (WineWindow* window in trackedParentWindows)
-                if ([window isOrderedIn]) [window doOrderOut];
-            return;
-        }
-
-        boundsByNumber = [NSMutableDictionary dictionary];
-        indicesByNumber = [NSMutableDictionary dictionary];
-        groups = [NSMutableDictionary dictionary];
-        for (i = 0; i < CFArrayGetCount(windowInfo); i++)
-        {
-            CFDictionaryRef info = CFArrayGetValueAtIndex(windowInfo, i);
-            CFNumberRef number = CFDictionaryGetValue(info, kCGWindowNumber);
-            CFDictionaryRef boundsDict = CFDictionaryGetValue(info, kCGWindowBounds);
-            CGRect bounds;
-            int value = 0;
-
-            if (!number || !boundsDict || !CFNumberGetValue(number, kCFNumberIntType, &value) ||
-                !CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds))
-                continue;
-            NSNumber* key = [NSNumber numberWithUnsignedInt:(unsigned int)value];
-            [boundsByNumber setObject:[NSValue valueWithBytes:&bounds objCType:@encode(CGRect)] forKey:key];
-            [indicesByNumber setObject:[NSNumber numberWithUnsignedInteger:i] forKey:key];
-        }
-
-        for (WineWindow* window in trackedParentWindows)
-        {
-            NSNumber* parentKey = [NSNumber numberWithUnsignedInt:window->trackedParentWindowNumber];
-            NSValue* parentValue = [boundsByNumber objectForKey:parentKey];
-            CGRect parentBounds;
-
-            if (!window->trackedParentWindowNumber || !parentValue)
-            {
-                if ([window isOrderedIn]) [window doOrderOut];
-                continue;
-            }
-
-            [parentValue getValue:&parentBounds];
-            [window updateTrackedParentBounds:parentBounds];
-            NSMutableArray* group = [groups objectForKey:parentKey];
-            if (!group)
-            {
-                group = [NSMutableArray array];
-                [groups setObject:group forKey:parentKey];
-            }
-            [group addObject:window];
-        }
-
-        for (NSNumber* parentKey in groups)
-        {
-            NSMutableArray* group = [groups objectForKey:parentKey];
-            NSUInteger parentIndex = [[indicesByNumber objectForKey:parentKey] unsignedIntegerValue];
-            BOOL ordered = parentIndex >= [group count];
-
-            [group sortUsingComparator:^NSComparisonResult(WineWindow* left, WineWindow* right) {
-                uintptr_t leftHwnd = (uintptr_t)left.hwnd;
-                uintptr_t rightHwnd = (uintptr_t)right.hwnd;
-
-                if (leftHwnd < rightHwnd) return NSOrderedAscending;
-                if (leftHwnd > rightHwnd) return NSOrderedDescending;
-                return NSOrderedSame;
-            }];
-
-            for (i = 0; ordered && i < [group count]; i++)
-            {
-                WineWindow* window = [group objectAtIndex:i];
-                NSNumber* childKey = [NSNumber numberWithInteger:window.windowNumber];
-                NSNumber* childIndex = [indicesByNumber objectForKey:childKey];
-
-                if (!childIndex || [childIndex unsignedIntegerValue] != parentIndex - [group count] + i)
-                    ordered = NO;
-            }
-            if (!ordered)
-            {
-                NSInteger relativeWindowNumber = [parentKey integerValue];
-
-                for (i = [group count]; i > 0; i--)
-                {
-                    WineWindow* window = [group objectAtIndex:i - 1];
-
-                    [window orderWindow:NSWindowAbove relativeTo:relativeWindowNumber];
-                    relativeWindowNumber = window.windowNumber;
-                }
-            }
-        }
-
-        CFRelease(windowInfo);
-    }
-
-    + (void) trackedParentWindowsTimerFired:(NSTimer*)timer
-    {
-        if (timer == trackedParentWindowsTimer) [self syncTrackedParentWindows];
-    }
-
-    - (BOOL) trackParentWindowNumber:(CGWindowID)parentWindowNumber
-                         parentFrame:(CGRect)parentFrame childFrame:(CGRect)childFrame
-    {
-        trackedParentWindowNumber = parentWindowNumber;
-        trackedParentLeftInset = childFrame.origin.x - parentFrame.origin.x;
-        trackedParentTopInset = childFrame.origin.y - parentFrame.origin.y;
-        trackedParentRightInset = CGRectGetMaxX(parentFrame) - CGRectGetMaxX(childFrame);
-        trackedParentBottomInset = CGRectGetMaxY(parentFrame) - CGRectGetMaxY(childFrame);
-
-        /*
-         * This window only carries pixels rendered by a Chromium helper
-         * process.  Native pointer events must continue through to the
-         * application-owned parent, which owns the corresponding Win32 input
-         * hierarchy and forwards them to windowless Chromium content.
-         */
-        [self setIgnoresMouseEvents:YES];
-
-        if (!trackedParentWindows)
-            trackedParentWindows = [[NSMutableSet alloc] init];
-        [trackedParentWindows addObject:self];
-        if (!trackedParentWindowsTimer)
-        {
-            trackedParentWindowsTimer = [[NSTimer timerWithTimeInterval:0.1 target:[WineWindow class]
-                                                       selector:@selector(trackedParentWindowsTimerFired:)
-                                                       userInfo:nil repeats:YES] retain];
-            [[NSRunLoop mainRunLoop] addTimer:trackedParentWindowsTimer forMode:NSRunLoopCommonModes];
-        }
-        [[self class] syncTrackedParentWindows];
-        return [self isOrderedIn];
-    }
-
-    - (void) stopTrackingParentWindow
-    {
-        [trackedParentWindows removeObject:self];
-        if (![trackedParentWindows count])
-        {
-            [trackedParentWindowsTimer invalidate];
-            [trackedParentWindowsTimer release];
-            trackedParentWindowsTimer = nil;
-            [trackedParentWindows release];
-            trackedParentWindows = nil;
-        }
-        trackedParentWindowNumber = 0;
-        trackedParentHasChildFrame = NO;
-        if ([self isOrderedIn]) [self doOrderOut];
     }
 
     - (BOOL) preventResizing
@@ -2510,7 +2245,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         else
             [self orderOut:nil];
         [self checkWineDisplayLink];
-        self.switchyardBlankBackingColor = NO;
         [self setBackgroundColor:[NSColor clearColor]];
         [self setOpaque:NO];
         drawnSinceShown = NO;
@@ -2691,8 +2425,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         {
             self.shapeChangedSinceLastDraw = TRUE;
             [[self contentView] setNeedsDisplay:YES];
-            [self setBackgroundColor:self.switchyardBlankBackingColor ? [NSColor blackColor] :
-                                                                          [NSColor windowBackgroundColor]];
+            [self setBackgroundColor:[NSColor windowBackgroundColor]];
             [self setOpaque:YES];
         }
         else if ([self isOpaque] && self.needsTransparency)
@@ -4018,14 +3751,24 @@ void macdrv_destroy_cocoa_window(macdrv_window w)
 {
     WineWindow* window = (WineWindow*)w;
 
+    [window.queue discardEventsMatchingMask:-1 forWindow:window];
     OnMainThread(^{
         window.closing = TRUE;
         [window doOrderOut];
         [window close];
+        [window release];
     });
-    [window.queue discardEventsMatchingMask:-1 forWindow:window];
-    [window release];
 }
+}
+
+macdrv_window macdrv_retain_cocoa_window(macdrv_window w)
+{
+    return (macdrv_window)[(id)w retain];
+}
+
+void macdrv_release_cocoa_window(macdrv_window w)
+{
+    OnMainThread(^{ [(id)w release]; });
 }
 
 /***********************************************************************
@@ -4159,33 +3902,6 @@ bool macdrv_is_cocoa_window_ordered_in(macdrv_window w)
 }
 
 /***********************************************************************
- *              macdrv_track_cocoa_window_parent
- *
- * Keep a process-local foreign child host aligned and stacked immediately
- * above a native owner window from another Wine process.
- */
-bool macdrv_track_cocoa_window_parent(macdrv_window w, unsigned int parent_window_number,
-                                      CGRect parent_frame, CGRect child_frame)
-{
-    WineWindow* window = (WineWindow*)w;
-    __block BOOL ret = NO;
-
-    OnMainThread(^{ ret = [window trackParentWindowNumber:parent_window_number
-                                               parentFrame:parent_frame childFrame:child_frame]; });
-    return ret;
-}
-
-/***********************************************************************
- *              macdrv_untrack_cocoa_window_parent
- */
-void macdrv_untrack_cocoa_window_parent(macdrv_window w)
-{
-    WineWindow* window = (WineWindow*)w;
-
-    OnMainThread(^{ [window stopTrackingParentWindow]; });
-}
-
-/***********************************************************************
  *              macdrv_set_cocoa_window_frame
  *
  * Move a Cocoa window.
@@ -4261,119 +3977,15 @@ void macdrv_set_cocoa_parent_window(macdrv_window w, macdrv_window parent)
  * Push a window surface color pixel update in a specified rect (in non-client
  * area coordinates).
  */
-static void macdrv_window_set_color_image_internal(macdrv_window w, CGImageRef image, CGRect rect,
-                                                    CGRect dirty, BOOL root_surface)
-{
-@autoreleasepool
-{
-    WineWindow* window = (WineWindow*)w;
-    dispatch_block_t update;
-    unsigned long long root_surface_sequence =
-        root_surface ? [window nextRootSurfaceSubmissionSequence] : 0;
-
-    CGImageRetain(image);
-
-    update = ^{
-        WineContentView *view = [window contentView];
-
-        if (root_surface && ![window isCurrentRootSurfaceSubmissionSequence:root_surface_sequence])
-        {
-            CGImageRelease(image);
-            return;
-        }
-        if (window.surfaceUpdatesSuspended)
-        {
-            CGImageRelease(image);
-            return;
-        }
-
-        if (root_surface)
-        {
-            window.switchyardRootSurfaceComposition = YES;
-            [view activateRootSurfaceComposition];
-            [view setShapeImage:NULL];
-            [window setShape:NULL];
-        }
-        [view setColorImage:image];
-        [view setSurfaceRect:cgrect_mac_from_win(rect)];
-        if (root_surface)
-        {
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            [view activateRootSurfaceComposition];
-            [view updateRootSurfaceInRect:cgrect_mac_from_win(dirty)];
-            [CATransaction commit];
-        }
-        else
-            [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
-
-        if (!window.drawnSinceShown)
-        {
-            [window setAutodisplay:YES];
-            [window displayIfNeeded];
-
-            /* Now that real layer contents exist, retry the normal display-link gate. */
-            [window checkWineDisplayLink];
-        }
-
-        CGImageRelease(image);
-    };
-    OnMainThreadAsync(update);
-}
-}
-
 void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty)
 {
-    macdrv_window_set_color_image_internal(w, image, rect, dirty, NO);
-}
-
-void macdrv_window_set_root_surface_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty)
-{
-    macdrv_window_set_color_image_internal(w, image, rect, dirty, YES);
-}
-
-/***********************************************************************
- *              macdrv_window_clear_color_image
- */
-void macdrv_window_clear_color_image(macdrv_window w)
-{
 @autoreleasepool
 {
     WineWindow* window = (WineWindow*)w;
 
-    OnMainThreadAsync(^{
-        WineContentView *view = [window contentView];
-
-        if (window.surfaceUpdatesSuspended || window.switchyardRootSurfaceComposition)
-            return;
-
-        [view clearColorImage];
-        [view setNeedsDisplay:true];
-    });
+    [window enqueueSurfaceImage:image rect:rect dirty:dirty];
 }
 }
-
-/***********************************************************************
- *              macdrv_window_clear_light_color_image
- */
-void macdrv_window_clear_light_color_image(macdrv_window w)
-{
-@autoreleasepool
-{
-    WineWindow* window = (WineWindow*)w;
-
-    OnMainThreadAsync(^{
-        WineContentView *view = [window contentView];
-
-        if (window.surfaceUpdatesSuspended || window.switchyardRootSurfaceComposition)
-            return;
-
-        [view clearLightPlaceholderBackingColor];
-        [view setNeedsDisplay:true];
-    });
-}
-}
-
 
 /***********************************************************************
  *              macdrv_window_set_shape_image
@@ -4389,11 +4001,6 @@ void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image)
     OnMainThreadAsync(^{
         WineContentView *view = [window contentView];
 
-        if (window.switchyardRootSurfaceComposition)
-        {
-            CGImageRelease(image);
-            return;
-        }
         [view setShapeImage:image];
         [view setNeedsDisplay:true];
         [window checkTransparency];
@@ -4819,30 +4426,309 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 
 @end
 
+@interface CAContextIOSurfaceLayer : NSObject
+{
+    void* source_hwnd;
+    CALayer* surface_layer;
+    CAContext* remote_context;
+    CAContextID context_id;
+    BOOL registered;
+    BOOL registering;
+    BOOL invalidated;
+    BOOL present_scheduled;
+    CGRect layer_bounds;
+    IOSurfaceRef pending_surface;
+    CGRect pending_bounds;
+    uint64_t next_present_serial;
+    uint64_t pending_present_serial;
+    uint64_t applied_present_serial;
+}
+
+- (instancetype) initWithSourceHwnd:(void*)newSourceHwnd bounds:(CGRect)bounds opaque:(BOOL)opaque;
+- (void) presentSurface:(IOSurfaceRef)surface bounds:(CGRect)bounds;
+- (void) detachRemoteLayer;
+- (void) drainPendingSurface;
+
+@end
+
+@implementation CAContextIOSurfaceLayer
+
+- (instancetype) initWithSourceHwnd:(void*)newSourceHwnd bounds:(CGRect)bounds opaque:(BOOL)opaque
+{
+    self = [super init];
+    if (!self) return nil;
+
+    source_hwnd = newSourceHwnd;
+    surface_layer = [[CALayer alloc] init];
+    if (!surface_layer)
+    {
+        [self release];
+        return nil;
+    }
+
+    surface_layer.actions = [NSDictionary dictionaryWithObjectsAndKeys:
+        [NSNull null], @"bounds",
+        [NSNull null], @"contents",
+        [NSNull null], @"contentsScale",
+        [NSNull null], @"frame",
+        [NSNull null], @"hidden",
+        [NSNull null], @"opacity",
+        [NSNull null], @"onOrderIn",
+        [NSNull null], @"onOrderOut",
+        [NSNull null], @"position",
+        [NSNull null], @"sublayers",
+        nil];
+    surface_layer.anchorPoint = CGPointMake(0, 0);
+    layer_bounds = CGRectMake(0, 0, bounds.size.width, bounds.size.height);
+    surface_layer.bounds = cgrect_mac_from_win(layer_bounds);
+    surface_layer.contentsGravity = kCAGravityResize;
+    surface_layer.contentsScale = retina_on ? 2.0 : 1.0;
+    surface_layer.magnificationFilter = kCAFilterNearest;
+    surface_layer.minificationFilter = kCAFilterNearest;
+    /* Win32 ignores the WGL default framebuffer's alpha channel for an
+       ordinary native window, so an application may leave it at zero even
+       when RGB contains the complete frame. Treat an HWND hosted by its own
+       native root as opaque, while preserving alpha for child/owned popup
+       surfaces that are actually composited over it. */
+    surface_layer.opaque = opaque;
+
+    /* A CAContext can export a layer tree without an NSWindow.  Keeping this
+       context independent from AppKit window lifetime is the core contract of
+       the foreign GPU surface path. */
+    OnMainThread(^{
+        remote_context = [[CAContext contextWithCGSConnection:CGSMainConnectionID()
+                                                      options:[NSDictionary dictionary]] retain];
+        [remote_context setLayer:surface_layer];
+        context_id = [remote_context contextId];
+    });
+
+    if (!remote_context || !context_id)
+    {
+        [self release];
+        return nil;
+    }
+
+    return self;
+}
+
+- (void) drainPendingSurface
+{
+    IOSurfaceRef surface;
+    CGRect bounds;
+    uint64_t serial;
+    BOOL again;
+
+    @synchronized(self)
+    {
+        surface = pending_surface;
+        pending_surface = NULL;
+        bounds = pending_bounds;
+        serial = pending_present_serial;
+    }
+    if (surface)
+    {
+        if (serial > applied_present_serial)
+        {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            surface_layer.bounds = cgrect_mac_from_win(bounds);
+            surface_layer.contentsScale = retina_on ? 2.0 : 1.0;
+            surface_layer.contents = (id)surface;
+            [CATransaction commit];
+            [CATransaction flush];
+            applied_present_serial = serial;
+        }
+        CFRelease(surface);
+    }
+
+    @synchronized(self)
+    {
+        again = pending_surface != NULL;
+        if (!again) present_scheduled = NO;
+    }
+    if (again) OnMainThreadAsync(^{ [self drainPendingSurface]; });
+}
+
+- (void) presentSurface:(IOSurfaceRef)surface bounds:(CGRect)bounds
+{
+    CGRect new_bounds = CGRectMake(0, 0, bounds.size.width, bounds.size.height);
+    IOSurfaceRef replaced_surface = NULL;
+    uint64_t serial;
+    BOOL create_host = NO, schedule = NO;
+
+    if (!surface) return;
+    CFRetain(surface);
+
+    @synchronized(self)
+    {
+        if (invalidated)
+        {
+            CFRelease(surface);
+            return;
+        }
+        serial = ++next_present_serial;
+        if (!registered && !registering)
+        {
+            registering = YES;
+            create_host = YES;
+        }
+        else
+        {
+            replaced_surface = pending_surface;
+            pending_surface = surface;
+            pending_bounds = new_bounds;
+            pending_present_serial = serial;
+            surface = NULL; /* pending_surface owns the retain */
+            if (registered && !present_scheduled)
+            {
+                present_scheduled = YES;
+                schedule = YES;
+            }
+        }
+        layer_bounds = new_bounds;
+    }
+    if (replaced_surface) CFRelease(replaced_surface);
+
+    if (create_host)
+    {
+        BOOL attached;
+        BOOL release_attached = NO;
+
+        /* Establish the exported CAContext once before telling the native root
+           to host it.  Subsequent frames never synchronously wait for the
+           Cocoa main thread. */
+        OnMainThread(^{
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            surface_layer.bounds = cgrect_mac_from_win(new_bounds);
+            surface_layer.contentsScale = retina_on ? 2.0 : 1.0;
+            surface_layer.contents = (id)surface;
+            [CATransaction commit];
+            [CATransaction flush];
+            applied_present_serial = serial;
+            CFRelease(surface);
+        });
+        attached = macdrv_attach_remote_layer(source_hwnd, context_id, true, new_bounds.size);
+
+        @synchronized(self)
+        {
+            if (invalidated)
+            {
+                registered = NO;
+                release_attached = attached;
+            }
+            else registered = attached;
+            registering = NO;
+            if (registered && pending_surface)
+            {
+                if (!present_scheduled)
+                {
+                    present_scheduled = YES;
+                    schedule = YES;
+                }
+            }
+        }
+        if (release_attached)
+            macdrv_release_remote_layer(source_hwnd, context_id, true);
+        if (schedule) OnMainThreadAsync(^{ [self drainPendingSurface]; });
+        return;
+    }
+
+    if (schedule) OnMainThreadAsync(^{ [self drainPendingSurface]; });
+}
+
+- (void) detachRemoteLayer
+{
+    BOOL release;
+
+    @synchronized(self)
+    {
+        invalidated = YES;
+        release = registered;
+        registered = NO;
+    }
+    if (release && context_id)
+        macdrv_release_remote_layer(source_hwnd, context_id, true);
+}
+
+- (void) dealloc
+{
+    if (pending_surface) CFRelease(pending_surface);
+    CAContext* context = remote_context;
+    CALayer* layer = surface_layer;
+
+    OnMainThread(^{
+        [context setLayer:nil];
+        [context release];
+        [layer release];
+    });
+    [super dealloc];
+}
+
+@end
+
 @interface CAContextImageLayer : NSObject
 {
-    void* hwnd;
-    void* release_hwnd;
+    void* source_hwnd;
     CALayer* image_layer;
     CAContext* remote_context;
     CAContextID context_id;
-    BOOL hosted;
+    BOOL registered;
+    BOOL registering;
+    BOOL invalidated;
+    BOOL update_scheduled;
+    CGRect layer_bounds;
+    CGImageRef pending_image;
+    CGRect pending_bounds;
 }
 
-- (instancetype) initWithHwnd:(void*)newHwnd releaseHwnd:(void*)newReleaseHwnd bounds:(CGRect)bounds;
-- (void) setColorImage:(CGImageRef)image bounds:(CGRect)bounds;
+- (instancetype) initWithHwnd:(void*)newHwnd bounds:(CGRect)bounds;
+- (BOOL) setColorImage:(CGImageRef)image bounds:(CGRect)bounds;
+- (void) detachRemoteLayer;
+- (void) drainPendingImage;
 
 @end
 
 @implementation CAContextImageLayer
 
-- (instancetype) initWithHwnd:(void*)newHwnd releaseHwnd:(void*)newReleaseHwnd bounds:(CGRect)bounds
+- (void) drainPendingImage
+{
+    CGImageRef image;
+    CGRect bounds;
+    BOOL again;
+
+    @synchronized(self)
+    {
+        image = pending_image;
+        pending_image = NULL;
+        bounds = pending_bounds;
+    }
+    if (image)
+    {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        image_layer.contentsScale = retina_on ? 2.0 : 1.0;
+        image_layer.bounds = cgrect_mac_from_win(bounds);
+        image_layer.contents = (id)image;
+        [CATransaction commit];
+        [CATransaction flush];
+        CGImageRelease(image);
+    }
+
+    @synchronized(self)
+    {
+        again = pending_image != NULL;
+        if (!again) update_scheduled = NO;
+    }
+    if (again) OnMainThreadAsync(^{ [self drainPendingImage]; });
+}
+
+- (instancetype) initWithHwnd:(void*)newHwnd bounds:(CGRect)bounds
 {
     self = [super init];
     if (!self) return nil;
 
-    hwnd = newHwnd;
-    release_hwnd = newReleaseHwnd ? newReleaseHwnd : newHwnd;
+    source_hwnd = newHwnd;
 
     image_layer = [[CALayer alloc] init];
     if (!image_layer)
@@ -4868,7 +4754,8 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     image_layer.contentsGravity = kCAGravityResize;
     image_layer.actions = disabledActions;
     image_layer.contentsScale = retina_on ? 2.0 : 1.0;
-    [image_layer setBounds:cgrect_mac_from_win(bounds)];
+    layer_bounds = CGRectMake(0, 0, bounds.size.width, bounds.size.height);
+    [image_layer setBounds:cgrect_mac_from_win(layer_bounds)];
     [image_layer setAnchorPoint:CGPointMake(0, 0)];
 
     OnMainThread(^{
@@ -4887,11 +4774,31 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     return self;
 }
 
-- (void) setColorImage:(CGImageRef)image bounds:(CGRect)bounds
+- (BOOL) setColorImage:(CGImageRef)image bounds:(CGRect)bounds
 {
-    BOOL create_host = !hosted;
+    CGRect new_bounds = CGRectMake(0, 0, bounds.size.width, bounds.size.height);
+    BOOL create_host = NO;
+    BOOL schedule = NO;
+    BOOL attached = NO, release_attached = NO, result;
+    CGImageRef replaced_image = NULL;
+
+    layer_bounds = new_bounds;
 
     CGImageRetain(image);
+
+    @synchronized(self)
+    {
+        if (invalidated)
+        {
+            CGImageRelease(image);
+            return NO;
+        }
+        if (!registered && !registering)
+        {
+            registering = YES;
+            create_host = YES;
+        }
+    }
 
     if (create_host)
     {
@@ -4899,36 +4806,66 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
             image_layer.contentsScale = retina_on ? 2.0 : 1.0;
-            image_layer.bounds = cgrect_mac_from_win(bounds);
+            image_layer.bounds = cgrect_mac_from_win(new_bounds);
             image_layer.contents = (id)image;
             [CATransaction commit];
+            [CATransaction flush];
             CGImageRelease(image);
         });
-        hosted = TRUE;
-        macdrv_create_remote_layer_for_host(release_hwnd, hwnd, context_id);
-        return;
+        attached = macdrv_attach_remote_layer(source_hwnd, context_id, false, new_bounds.size);
+        @synchronized(self)
+        {
+            if (invalidated)
+                release_attached = attached;
+            else
+                registered = attached;
+            registering = NO;
+            result = registered;
+        }
+        if (release_attached)
+            macdrv_release_remote_layer(source_hwnd, context_id, false);
+        return result;
     }
 
-    macdrv_update_remote_layer_for_host(release_hwnd, hwnd, context_id);
+    @synchronized(self)
+    {
+        replaced_image = pending_image;
+        pending_image = image;
+        pending_bounds = new_bounds;
+        if (!update_scheduled)
+        {
+            update_scheduled = YES;
+            schedule = YES;
+        }
+    }
+    if (replaced_image) CGImageRelease(replaced_image);
+    if (schedule) OnMainThreadAsync(^{ [self drainPendingImage]; });
+    @synchronized(self) { result = registered; }
+    return result;
+}
 
-    OnMainThreadAsync(^{
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        image_layer.contentsScale = retina_on ? 2.0 : 1.0;
-        image_layer.bounds = cgrect_mac_from_win(bounds);
-        image_layer.contents = (id)image;
-        [CATransaction commit];
-        CGImageRelease(image);
-    });
+- (void) detachRemoteLayer
+{
+    BOOL release;
+
+    @synchronized(self)
+    {
+        invalidated = YES;
+        release = registered;
+        registered = NO;
+    }
+    if (context_id && release)
+        macdrv_release_remote_layer(source_hwnd, context_id, false);
 }
 
 - (void) dealloc
 {
-    if (context_id && hosted) macdrv_release_remote_layer(release_hwnd, context_id);
     CAContext *context = remote_context;
     CALayer *layer = image_layer;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    if (pending_image) CGImageRelease(pending_image);
+
+    OnMainThread(^{
         [context setLayer:nil];
         [context release];
         [layer release];
@@ -4939,34 +4876,80 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 
 @end
 
+@class CAContextSwapChain;
+
+@interface WineRemoteMetalLayer : CAMetalLayer
+{
+    CAContextSwapChain* compositorOwner; /* assign */
+}
+
+@property(assign, nonatomic) CAContextSwapChain* compositorOwner;
+
+@end
+
 @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
 {
-    void* hwnd;
+    void* source_hwnd;
     macdrv_metal_device device;
     CAMetalLayer* offscreen_layer;
     CAContext* remote_context;
     CAContextID context_id;
+    BOOL registered;
+    BOOL registering;
+    BOOL invalidated;
+    CGSize endpoint_size;
 }
 
-- (instancetype) initWithHwnd:(void*)hwnd bounds:(CGRect)bounds;
+- (instancetype) initWithSourceHwnd:(void*)sourceHwnd bounds:(CGRect)bounds;
+- (void) ensureRemoteLayerRegistered;
+- (void) detachRemoteLayer;
+
+@end
+
+@implementation WineRemoteMetalLayer
+
+@synthesize compositorOwner;
+
+- (id<CAMetalDrawable>)nextDrawable
+{
+    id<CAMetalDrawable> drawable = [super nextDrawable];
+    if (drawable)
+    {
+        CAContextSwapChain* owner = [compositorOwner retain];
+
+        if ([drawable respondsToSelector:@selector(addPresentedHandler:)])
+            [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+                [owner ensureRemoteLayerRegistered];
+                [owner release];
+                (void)presented;
+            }];
+        else
+        {
+            [owner ensureRemoteLayerRegistered];
+            [owner release];
+        }
+    }
+    return drawable;
+}
 
 @end
 
 @implementation CAContextSwapChain
 
-- (instancetype) initWithHwnd:(void*)newHwnd bounds:(CGRect)bounds
+- (instancetype) initWithSourceHwnd:(void*)newSourceHwnd bounds:(CGRect)bounds
 {
     self = [super init];
     if (!self) return nil;
 
-    hwnd = newHwnd;
+    source_hwnd = newSourceHwnd;
+    endpoint_size = bounds.size;
     if (!(device = macdrv_create_metal_device()))
     {
         [self release];
         return nil;
     }
 
-    offscreen_layer = [[CAMetalLayer alloc] init];
+    offscreen_layer = [[WineRemoteMetalLayer alloc] init];
     if (!offscreen_layer)
     {
         macdrv_release_metal_device(device);
@@ -4976,6 +4959,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     }
 
     offscreen_layer.device = (id<MTLDevice>)device;
+    ((WineRemoteMetalLayer*)offscreen_layer).compositorOwner = self;
     offscreen_layer.framebufferOnly = YES;
     offscreen_layer.magnificationFilter = kCAFilterNearest;
     offscreen_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
@@ -4998,7 +4982,6 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
         return nil;
     }
 
-    macdrv_create_remote_layer(hwnd, context_id);
     return self;
 }
 
@@ -5007,15 +4990,55 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     return offscreen_layer;
 }
 
+- (void) ensureRemoteLayerRegistered
+{
+    BOOL attach = NO, attached, release_attached = NO;
+
+    @synchronized(self)
+    {
+        if (!invalidated && !registered && !registering)
+        {
+            registering = YES;
+            attach = YES;
+        }
+    }
+    if (!attach) return;
+    attached = macdrv_attach_remote_layer(source_hwnd, context_id, true, endpoint_size);
+    @synchronized(self)
+    {
+        if (invalidated)
+            release_attached = attached;
+        else
+            registered = attached;
+        registering = NO;
+    }
+    if (release_attached)
+        macdrv_release_remote_layer(source_hwnd, context_id, true);
+}
+
+- (void) detachRemoteLayer
+{
+    BOOL release;
+
+    @synchronized(self)
+    {
+        invalidated = YES;
+        release = registered;
+        registered = NO;
+    }
+    if (context_id && release)
+        macdrv_release_remote_layer(source_hwnd, context_id, true);
+}
+
 - (void) dealloc
 {
-    if (context_id) macdrv_release_remote_layer(hwnd, context_id);
+    ((WineRemoteMetalLayer*)offscreen_layer).compositorOwner = nil;
     CAContext *context = remote_context;
     CAMetalLayer *layer = offscreen_layer;
     macdrv_metal_device dev = device;
 
     /* This is the exported offscreen remote-layer swapchain, not a local view swapchain. */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    OnMainThread(^{
         [context setLayer:nil];
         [context release];
         [layer release];
@@ -5032,9 +5055,10 @@ macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v)
     return (macdrv_metal_swapchain)[[MetalViewSwapChain alloc] initWithView:v];
 }
 
-macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* hwnd, CGRect bounds)
+macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* source_hwnd, CGRect bounds)
 {
-    return (macdrv_metal_swapchain)[[CAContextSwapChain alloc] initWithHwnd:hwnd bounds:bounds];
+    return (macdrv_metal_swapchain)[[CAContextSwapChain alloc] initWithSourceHwnd:source_hwnd
+                                                                               bounds:bounds];
 }
 
 macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain)
@@ -5045,96 +5069,55 @@ macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain)
 
 void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain)
 {
+    if ([(id)swapchain respondsToSelector:@selector(detachRemoteLayer)])
+        [(CAContextSwapChain*)swapchain detachRemoteLayer];
     [(id<WineMetalSwapChain>)swapchain release];
 }
 
-void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id)
+void macdrv_window_apply_compositor_node(macdrv_window w, uint64_t node_id,
+                                         uint64_t revision, unsigned int context_id,
+                                         CGRect content_frame, CGRect clip_frame,
+                                         const CGRect *visible_rects, unsigned int visible_count,
+                                         double z_position, bool displayed)
 {
 @autoreleasepool
 {
-    WineWindow* window = (WineWindow*)w;
+    WineWindow* window = [(WineWindow*)w retain];
+    CGRect* rects = NULL;
 
-    OnMainThread(^{
+    if (visible_count)
+    {
+        if ((rects = malloc(visible_count * sizeof(*rects))))
+            memcpy(rects, visible_rects, visible_count * sizeof(*rects));
+        else
+        {
+            visible_count = 0;
+            displayed = false;
+        }
+    }
+
+    OnMainThreadAsync(^{
         NSView* content_view = [window contentView];
 
-        if ([content_view isKindOfClass:[WineContentView class]])
-            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id frame:CGRectNull];
+        WineContentView* view = [content_view isKindOfClass:[WineContentView class]] ?
+                                (WineContentView*)content_view : nil;
+        WineCompositorApplyNode(view, node_id, revision, context_id, content_frame,
+                                clip_frame, rects, visible_count, z_position, displayed);
+        free(rects);
+        [window release];
     });
 }
 }
 
-void macdrv_window_create_ca_layer_host_view_at(macdrv_window w, unsigned int context_id, CGRect frame)
+void macdrv_window_remove_compositor_node(macdrv_window w, uint64_t node_id,
+                                          uint64_t revision, bool permanent)
 {
 @autoreleasepool
 {
-    WineWindow* window = (WineWindow*)w;
-
-    OnMainThread(^{
-        NSView* content_view = [window contentView];
-
-        if ([content_view isKindOfClass:[WineContentView class]])
-            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id frame:frame];
+    OnMainThreadAsync(^{
+        WineCompositorRemoveNode(node_id, revision, permanent);
     });
-}
-}
-
-void macdrv_window_update_ca_layer_host_view(macdrv_window w, unsigned int context_id, CGRect frame)
-{
-@autoreleasepool
-{
-    WineWindow* window = (WineWindow*)w;
-
-    OnMainThread(^{
-        NSView* content_view = [window contentView];
-
-        if ([content_view isKindOfClass:[WineContentView class]])
-            [(WineContentView*)content_view updateCALayerHostViewWithContextId:context_id frame:frame];
-    });
-}
-}
-
-void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id)
-{
-@autoreleasepool
-{
-    WineWindow* window = (WineWindow*)w;
-
-    OnMainThread(^{
-        NSView* content_view = [window contentView];
-
-        if ([content_view isKindOfClass:[WineContentView class]])
-            [(WineContentView*)content_view removeCALayerHostView:context_id];
-    });
-}
-}
-
-void macdrv_window_release_ca_layer_host_view_immediately(macdrv_window w, unsigned int context_id)
-{
-@autoreleasepool
-{
-    WineWindow* window = (WineWindow*)w;
-
-    OnMainThread(^{
-        NSView* content_view = [window contentView];
-
-        if ([content_view isKindOfClass:[WineContentView class]])
-            [(WineContentView*)content_view removeCALayerHostViewImmediately:context_id];
-    });
-}
-}
-
-void macdrv_window_remove_full_frame_ca_layer_host_views(macdrv_window w, unsigned int keep_context_id)
-{
-@autoreleasepool
-{
-    WineWindow* window = (WineWindow*)w;
-
-    OnMainThread(^{
-        NSView* content_view = [window contentView];
-
-        if ([content_view isKindOfClass:[WineContentView class]])
-            [(WineContentView*)content_view removeFullFrameCALayerHostViewsExceptContextId:keep_context_id];
-    });
+    (void)w;
 }
 }
 
@@ -5153,19 +5136,39 @@ void macdrv_window_remove_all_ca_layer_host_views(macdrv_window w)
 }
 }
 
-macdrv_image_layer macdrv_create_image_layer(void* hwnd, void* release_hwnd, CGRect bounds)
+macdrv_image_layer macdrv_create_image_layer(void* hwnd, CGRect bounds)
 {
-    return (macdrv_image_layer)[[CAContextImageLayer alloc] initWithHwnd:hwnd releaseHwnd:release_hwnd bounds:bounds];
+    return (macdrv_image_layer)[[CAContextImageLayer alloc] initWithHwnd:hwnd bounds:bounds];
 }
 
-void macdrv_image_layer_set_color_image(macdrv_image_layer image_layer, CGImageRef image, CGRect bounds)
+bool macdrv_image_layer_set_color_image(macdrv_image_layer image_layer, CGImageRef image, CGRect bounds)
 {
-    [(CAContextImageLayer*)image_layer setColorImage:image bounds:bounds];
+    return [(CAContextImageLayer*)image_layer setColorImage:image bounds:bounds];
 }
 
 void macdrv_destroy_image_layer(macdrv_image_layer image_layer)
 {
+    [(CAContextImageLayer*)image_layer detachRemoteLayer];
     [(CAContextImageLayer*)image_layer release];
+}
+
+macdrv_iosurface_layer macdrv_create_iosurface_layer(void* source_hwnd, CGRect bounds,
+                                                     bool opaque)
+{
+    return (macdrv_iosurface_layer)[[CAContextIOSurfaceLayer alloc] initWithSourceHwnd:source_hwnd
+                                                                                bounds:bounds
+                                                                                opaque:opaque];
+}
+
+void macdrv_iosurface_layer_present(macdrv_iosurface_layer layer, void* io_surface, CGRect bounds)
+{
+    [(CAContextIOSurfaceLayer*)layer presentSurface:(IOSurfaceRef)io_surface bounds:bounds];
+}
+
+void macdrv_destroy_iosurface_layer(macdrv_iosurface_layer layer)
+{
+    [(CAContextIOSurfaceLayer*)layer detachRemoteLayer];
+    [(CAContextIOSurfaceLayer*)layer release];
 }
 
 bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2])

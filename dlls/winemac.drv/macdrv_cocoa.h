@@ -108,6 +108,7 @@ typedef struct macdrv_opaque_metal_view* macdrv_metal_view;
 typedef struct macdrv_opaque_metal_layer* macdrv_metal_layer;
 typedef struct macdrv_opaque_metal_swapchain* macdrv_metal_swapchain;
 typedef struct macdrv_opaque_image_layer* macdrv_image_layer;
+typedef struct macdrv_opaque_iosurface_layer* macdrv_iosurface_layer;
 typedef struct macdrv_opaque_status_item* macdrv_status_item;
 struct macdrv_event;
 struct macdrv_query;
@@ -496,6 +497,8 @@ struct window_surface;
 extern macdrv_window macdrv_create_cocoa_window(const struct macdrv_window_features* wf,
         CGRect frame, void* hwnd, macdrv_event_queue queue);
 extern void macdrv_destroy_cocoa_window(macdrv_window w);
+extern macdrv_window macdrv_retain_cocoa_window(macdrv_window w);
+extern void macdrv_release_cocoa_window(macdrv_window w);
 extern void* macdrv_get_window_hwnd(macdrv_window w);
 extern void macdrv_set_cocoa_window_features(macdrv_window w,
         const struct macdrv_window_features* wf);
@@ -509,15 +512,11 @@ extern void macdrv_hide_cocoa_window(macdrv_window w);
 extern bool macdrv_is_cocoa_window_ordered_in(macdrv_window w);
 extern void macdrv_set_cocoa_window_ignores_mouse_events(macdrv_window w, bool ignores);
 extern unsigned int macdrv_get_cocoa_window_number(macdrv_window w);
-extern bool macdrv_track_cocoa_window_parent(macdrv_window w, unsigned int parent_window_number,
-                                             CGRect parent_frame, CGRect child_frame);
-extern void macdrv_untrack_cocoa_window_parent(macdrv_window w);
 extern void macdrv_set_cocoa_window_frame(macdrv_window w, const CGRect* new_frame);
 extern void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame);
 extern void macdrv_set_cocoa_window_surface_updates_suspended(macdrv_window w, bool suspended);
 extern void macdrv_set_cocoa_parent_window(macdrv_window w, macdrv_window parent);
 extern void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty);
-extern void macdrv_window_set_root_surface_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty);
 extern void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image);
 extern void macdrv_set_window_shape(macdrv_window w, const CGRect *rects, int count);
 extern void macdrv_set_window_alpha(macdrv_window w, CGFloat alpha);
@@ -538,26 +537,28 @@ extern macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_met
 extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
 extern void macdrv_view_release_metal_view(macdrv_metal_view v);
 extern macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v);
-extern macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* hwnd, CGRect bounds);
+extern macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* source_hwnd, CGRect bounds);
 extern macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain);
 extern void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain);
-extern void macdrv_window_clear_color_image(macdrv_window w);
-extern void macdrv_window_clear_light_color_image(macdrv_window w);
-extern void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id);
-extern void macdrv_window_create_ca_layer_host_view_at(macdrv_window w, unsigned int context_id, CGRect frame);
-extern void macdrv_window_update_ca_layer_host_view(macdrv_window w, unsigned int context_id, CGRect frame);
-extern void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id);
-extern void macdrv_window_release_ca_layer_host_view_immediately(macdrv_window w, unsigned int context_id);
-extern void macdrv_window_remove_full_frame_ca_layer_host_views(macdrv_window w, unsigned int keep_context_id);
+extern void macdrv_window_apply_compositor_node(macdrv_window w, uint64_t node_id,
+                                                 uint64_t revision, unsigned int context_id,
+                                                 CGRect content_frame, CGRect clip_frame,
+                                                 const CGRect *visible_rects, unsigned int visible_count,
+                                                 double z_position, bool displayed);
+extern void macdrv_window_remove_compositor_node(macdrv_window w, uint64_t node_id,
+                                                  uint64_t revision, bool permanent);
 extern void macdrv_window_remove_all_ca_layer_host_views(macdrv_window w);
-extern void macdrv_create_remote_layer(void* hwnd, unsigned int context_id);
-extern void macdrv_create_remote_layer_for_host(void* host_hwnd, void* child_hwnd, unsigned int context_id);
-extern void macdrv_update_remote_layer(void* hwnd, unsigned int context_id);
-extern void macdrv_update_remote_layer_for_host(void* host_hwnd, void* child_hwnd, unsigned int context_id);
-extern void macdrv_release_remote_layer(void* hwnd, unsigned int context_id);
-extern macdrv_image_layer macdrv_create_image_layer(void* hwnd, void* release_hwnd, CGRect bounds);
-extern void macdrv_image_layer_set_color_image(macdrv_image_layer layer, CGImageRef image, CGRect bounds);
+extern bool macdrv_attach_remote_layer(void* source_hwnd, unsigned int context_id, bool gpu,
+                                       CGSize endpoint_size);
+extern bool macdrv_release_remote_layer(void* source_hwnd, unsigned int context_id, bool gpu);
+extern macdrv_image_layer macdrv_create_image_layer(void* hwnd, CGRect bounds);
+extern bool macdrv_image_layer_set_color_image(macdrv_image_layer layer, CGImageRef image, CGRect bounds);
 extern void macdrv_destroy_image_layer(macdrv_image_layer layer);
+extern macdrv_iosurface_layer macdrv_create_iosurface_layer(void* source_hwnd, CGRect bounds,
+                                                            bool opaque);
+extern void macdrv_iosurface_layer_present(macdrv_iosurface_layer layer, void* io_surface,
+                                            CGRect bounds);
+extern void macdrv_destroy_iosurface_layer(macdrv_iosurface_layer layer);
 extern bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2]);
 extern void macdrv_set_view_backing_size(macdrv_view v, const int backing_size[2]);
 extern uint32_t macdrv_window_background_color(void);

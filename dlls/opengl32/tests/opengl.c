@@ -5014,6 +5014,41 @@ static void test_memory_map( HDC hdc)
     }
     else skip( "glMapBufferRange not available\n" );
 
+    if (ext.glMapBufferRange && ext.glFlushMappedBufferRange)
+    {
+        static const char flushed_data[] = "explicit-flush";
+
+        memset( data, 0, sizeof(data) );
+        ext.glBindBuffer( GL_ARRAY_BUFFER, src );
+        ext.glBufferData( GL_ARRAY_BUFFER, sizeof(data), data, GL_STREAM_DRAW );
+        src_ptr = ext.glMapBufferRange( GL_ARRAY_BUFFER, 0, sizeof(data),
+                                        GL_MAP_WRITE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT );
+        check_gl_error( GL_NO_ERROR );
+        ok( !!src_ptr, "glMapBufferRange failed\n" );
+        memcpy( src_ptr, flushed_data, sizeof(flushed_data) );
+        ext.glFlushMappedBufferRange( GL_ARRAY_BUFFER, 0, sizeof(flushed_data) );
+        check_gl_error( GL_NO_ERROR );
+        ret = ext.glUnmapBuffer( GL_ARRAY_BUFFER );
+        ok( ret, "glUnmapBuffer failed\n" );
+        check_gl_error( GL_NO_ERROR );
+
+        ext.glBindBuffer( GL_COPY_READ_BUFFER, src );
+        ext.glBindBuffer( GL_COPY_WRITE_BUFFER, dst );
+        ext.glBufferData( GL_COPY_WRITE_BUFFER, sizeof(data), NULL, GL_STREAM_READ );
+        ext.glCopyBufferSubData( GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER,
+                                 0, 0, sizeof(flushed_data) );
+        dst_ptr = ext.glMapBufferRange( GL_COPY_WRITE_BUFFER, 0, sizeof(flushed_data),
+                                        GL_MAP_READ_BIT );
+        check_gl_error( GL_NO_ERROR );
+        ok( !!dst_ptr, "glMapBufferRange failed\n" );
+        ok( !memcmp( dst_ptr, flushed_data, sizeof(flushed_data) ),
+            "explicitly flushed data was not visible, got %s\n",
+            debugstr_an(dst_ptr, sizeof(flushed_data)) );
+        ext.glUnmapBuffer( GL_COPY_WRITE_BUFFER );
+        check_gl_error( GL_NO_ERROR );
+    }
+    else skip( "explicit mapped-buffer flush not available\n" );
+
     if (have_persistent_storage)
     {
         for (i = 0; i < sizeof(data); i++) data[i] = '0' + i;

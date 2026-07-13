@@ -68,6 +68,13 @@ enum opengl_extension
     GL_EXTENSION_COUNT,
 };
 
+enum opengl_native_share_group
+{
+    OPENGL_NATIVE_SHARE_GROUP_GENERIC,
+    OPENGL_NATIVE_SHARE_GROUP_COMPAT,
+    OPENGL_NATIVE_SHARE_GROUP_CORE,
+};
+
 struct opengl_client_context
 {
     struct HGLRC__              obj;            /* client object header */
@@ -79,6 +86,7 @@ struct opengl_client_context
     GLint                       profile_mask;
     int                         major_version;
     int                         minor_version;
+    UINT                        native_share_group;                     /* enum opengl_native_share_group */
     BOOLEAN                     extensions[GL_EXTENSION_COUNT];         /* exposed client extensions */
     UINT32                      extension_count;                        /* size of supported extensions */
     UINT16                      extension_array[GL_EXTENSION_COUNT];    /* array of supported extensions */
@@ -112,9 +120,15 @@ struct __GLsync
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 38
+#define WINE_OPENGL_DRIVER_VERSION 39
 
 struct opengl_drawable;
+
+struct opengl_context_fbos
+{
+    GLuint draw;
+    GLuint read;
+};
 
 struct opengl_context
 {
@@ -123,6 +137,8 @@ struct opengl_context
     int                         format;             /* pixel format of the context */
     struct opengl_drawable     *draw;               /* currently bound draw surface */
     struct opengl_drawable     *read;               /* currently bound read surface */
+    struct opengl_context_fbos  draw_fbos;          /* native FBO pair for draw surface in this context */
+    struct opengl_context_fbos  read_fbos;          /* native FBO pair for read surface in this context */
 };
 
 static inline struct opengl_context *opengl_context_from_handle( HGLRC client_context )
@@ -242,9 +258,12 @@ struct opengl_driver_funcs
     BOOL (*p_describe_pixel_format)(int,struct wgl_pixel_format*);
     void (*p_init_extensions)( struct opengl_funcs *funcs, BOOLEAN extensions[GL_EXTENSION_COUNT] );
     BOOL (*p_surface_create)( struct client_surface *client, int format, struct opengl_drawable **drawable );
+    BOOL separate_context_profiles; /* native core and compatibility contexts need distinct share roots */
     BOOL (*p_context_create)( int format, void *share, const int *attribs, void **context );
     BOOL (*p_context_destroy)(void*);
     BOOL (*p_make_current)( struct opengl_drawable *draw, struct opengl_drawable *read, void *private );
+    BOOL (*p_context_get_fbos)( void *private, struct opengl_drawable *drawable,
+                                struct opengl_context_fbos *fbos );
     BOOL (*p_pbuffer_create)( HDC hdc, int format, BOOL largest, GLenum texture_format, GLenum texture_target,
                               GLint max_level, GLsizei *width, GLsizei *height, struct opengl_drawable **drawable );
     BOOL (*p_pbuffer_updated)( HDC hdc, struct opengl_drawable *drawable, GLenum cube_face, GLint mipmap_level );

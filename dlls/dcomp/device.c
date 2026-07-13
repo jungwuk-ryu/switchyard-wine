@@ -57,96 +57,6 @@ static CRITICAL_SECTION_DEBUG dcomp_debug =
 };
 static CRITICAL_SECTION dcomp_cs = { &dcomp_debug, -1, 0, 0, 0, 0 };
 
-static const WCHAR wine_window_owner_composed[] =
-    {'w','i','n','e','_','w','i','n','d','o','w','_','o','w','n','e','r','_','c','o','m','p','o','s','e','d',0};
-
-static BOOL is_chromium_composition_window(HWND hwnd)
-{
-    static const WCHAR cef_browser_window[] =
-        {'C','e','f','B','r','o','w','s','e','r','W','i','n','d','o','w',0};
-    static const WCHAR chrome_render_widget[] =
-        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
-    static const WCHAR chrome_widget_prefix[] =
-        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
-    static const WCHAR intermediate_d3d_window[] =
-        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
-    WCHAR class_name[64];
-    int len;
-
-    if (!hwnd || !(len = GetClassNameW(hwnd, class_name, ARRAY_SIZE(class_name)))) return FALSE;
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, cef_browser_window)
-        || !wcscmp(class_name, chrome_render_widget)
-        || !wcscmp(class_name, intermediate_d3d_window)
-        || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
-}
-
-static BOOL is_chrome_widget_window(HWND hwnd)
-{
-    static const WCHAR chrome_widget_prefix[] =
-        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
-    WCHAR class_name[64];
-    int len;
-
-    if (!hwnd || !(len = GetClassNameW(hwnd, class_name, ARRAY_SIZE(class_name)))) return FALSE;
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-    return !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
-}
-
-static BOOL is_official_chrome_process(void)
-{
-    WCHAR path[1024];
-    WCHAR *name, *p;
-    DWORD len;
-
-    if (!(len = GetModuleFileNameW(NULL, path, ARRAY_SIZE(path))) || len >= ARRAY_SIZE(path))
-        return FALSE;
-    name = path;
-    for (p = path; p < path + len; p++)
-        if (*p == '\\' || *p == '/') name = p + 1;
-    return !wcsicmp(name, L"chrome.exe");
-}
-
-static BOOL is_chrome_owned_popup_target(HWND hwnd_root, HWND present_hwnd)
-{
-    if (!hwnd_root || !present_hwnd || hwnd_root == present_hwnd ||
-        !is_official_chrome_process()) return FALSE;
-    if (!is_chrome_widget_window(hwnd_root) || !is_chrome_widget_window(present_hwnd)) return FALSE;
-    if (!(GetWindowLongW(hwnd_root, GWL_STYLE) & WS_POPUP)) return FALSE;
-    return GetAncestor(hwnd_root, GA_ROOTOWNER) == present_hwnd;
-}
-
-static HWND get_chromium_composition_present_root(HWND hwnd)
-{
-    HWND root = GetAncestor(hwnd, GA_ROOT);
-    HWND owner;
-
-    if (!root) return hwnd;
-    owner = GetAncestor(root, GA_ROOTOWNER);
-    if (owner && owner != root &&
-        is_chromium_composition_window(root) && is_chromium_composition_window(owner))
-        return owner;
-
-    return root;
-}
-
-static void mark_chromium_owner_composed_window(HWND hwnd)
-{
-    HWND root;
-
-    if (!hwnd) return;
-    root = GetAncestor(hwnd, GA_ROOT);
-    if (!root) root = hwnd;
-    if (GetPropW(root, wine_window_owner_composed)) return;
-
-    SetPropW(root, wine_window_owner_composed, (HANDLE)1);
-    SetWindowPos(root, 0, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-}
-
 void dcomp_lock(void)
 {
     EnterCriticalSection(&dcomp_cs);
@@ -860,7 +770,8 @@ static void dcomp_blit_dc_to_target(const struct composition_target *target,
     BOOL release_dst_dc = FALSE;
     int dst_x = offset_x, dst_y = offset_y;
 
-    /* DComp content composes over child HWND hosts; child clipping would exclude Chromium CEF content. */
+    /* DComp content composes over child HWND hosts; child clipping would
+       incorrectly remove pixels which belong to the composition target. */
     if (visual->has_clip)
     {
         int left = max((int)visual->clip_rect.left, 0);
@@ -913,14 +824,6 @@ static void dcomp_blit_dc_to_target(const struct composition_target *target,
 
     if (release_dst_dc)
         ReleaseDC(target->hwnd, dst_dc);
-}
-
-static BOOL dcomp_target_needs_alpha_cache(const struct composition_target *target)
-{
-    HWND root = target->hwnd ? GetAncestor(target->hwnd, GA_ROOT) : NULL;
-    HWND present_root = target->hwnd ? get_chromium_composition_present_root(target->hwnd) : NULL;
-
-    return root && present_root && root != present_root;
 }
 
 static void do_composite_dxgi_surface(const struct composition_target *target,
@@ -1036,7 +939,7 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
 
     size.width = surface_desc.Width;
     size.height = surface_desc.Height;
-    preserve_dynamic_alpha = blend_func.AlphaFormat == AC_SRC_ALPHA && dcomp_target_needs_alpha_cache(target);
+    preserve_dynamic_alpha = blend_func.AlphaFormat == AC_SRC_ALPHA;
 
     if (dynamic_texture && SUCCEEDED(hr = IDXGISurface_QueryInterface(dxgi_surface,
             &IID_IDXGISurface1, (void **)&dxgi_surface1)))
@@ -1187,12 +1090,7 @@ struct dcomp_present_frame
 {
     struct list entry;
     HWND hwnd;
-    HWND source_hwnd;
     struct dcomp_target_frame frame;
-    RECT present_rect;
-    POINT offset;
-    int src_x;
-    int src_y;
 };
 
 static void destroy_target_frame(struct dcomp_target_frame *frame)
@@ -1274,276 +1172,28 @@ static BOOL create_target_frame(HWND hwnd, struct dcomp_target_frame *frame)
     return TRUE;
 }
 
-static HWND get_target_present_hwnd(HWND hwnd, POINT *offset)
-{
-    HWND root = get_chromium_composition_present_root(hwnd);
-    POINT origin = {0, 0};
-
-    offset->x = 0;
-    offset->y = 0;
-
-    if (!root || root == hwnd)
-        return hwnd;
-
-    if (!ClientToScreen(hwnd, &origin))
-    {
-        WARN("Failed to map composition hwnd %p to screen coordinates, error %lu.\n",
-                hwnd, GetLastError());
-        return hwnd;
-    }
-    if (!ScreenToClient(root, &origin))
-    {
-        WARN("Failed to map composition hwnd %p to root hwnd %p coordinates, error %lu.\n",
-                hwnd, root, GetLastError());
-        return hwnd;
-    }
-
-    *offset = origin;
-    return root;
-}
-
-static BOOL get_target_present_info(HWND hwnd, const struct dcomp_target_frame *frame,
-        HWND *present_hwnd, RECT *present_rect, POINT *offset, int *src_x, int *src_y)
-{
-    RECT client_rect;
-
-    *present_hwnd = get_target_present_hwnd(hwnd, offset);
-    present_rect->left = offset->x;
-    present_rect->top = offset->y;
-    present_rect->right = offset->x + frame->client_rect.right - frame->client_rect.left;
-    present_rect->bottom = offset->y + frame->client_rect.bottom - frame->client_rect.top;
-
-    if (*present_hwnd != hwnd)
-    {
-        if (!GetClientRect(*present_hwnd, &client_rect))
-        {
-            WARN("Failed to get root composition hwnd %p client rect, error %lu.\n",
-                    *present_hwnd, GetLastError());
-            return FALSE;
-        }
-        if (!IntersectRect(present_rect, present_rect, &client_rect))
-            return FALSE;
-    }
-
-    *src_x = present_rect->left - offset->x;
-    *src_y = present_rect->top - offset->y;
-    if (present_rect->right <= present_rect->left || present_rect->bottom <= present_rect->top)
-        return FALSE;
-
-    return TRUE;
-}
-
-static struct dcomp_present_frame *find_present_frame(struct list *frames, HWND hwnd)
-{
-    struct dcomp_present_frame *present;
-
-    LIST_FOR_EACH_ENTRY(present, frames, struct dcomp_present_frame, entry)
-    {
-        if (present->hwnd == hwnd)
-            return present;
-    }
-
-    return NULL;
-}
-
-static void blend_frame_into_present_frame(struct dcomp_present_frame *dst,
-        const struct dcomp_present_frame *src)
-{
-    RECT rect;
-    int x, y, width, height;
-
-    if (!dst->frame.bits || !src->frame.bits) return;
-    if (!IntersectRect(&rect, &dst->present_rect, &src->present_rect)) return;
-
-    width = rect.right - rect.left;
-    height = rect.bottom - rect.top;
-    for (y = 0; y < height; y++)
-    {
-        BYTE *dst_pixel = (BYTE *)dst->frame.bits +
-                (dst->src_y + rect.top - dst->present_rect.top + y) * dst->frame.stride +
-                (dst->src_x + rect.left - dst->present_rect.left) * 4;
-        const BYTE *src_pixel = (const BYTE *)src->frame.bits +
-                (src->src_y + rect.top - src->present_rect.top + y) * src->frame.stride +
-                (src->src_x + rect.left - src->present_rect.left) * 4;
-
-        for (x = 0; x < width; x++, dst_pixel += 4, src_pixel += 4)
-        {
-            unsigned int alpha = src_pixel[3];
-            unsigned int inv_alpha;
-
-            if (!alpha) continue;
-            if (alpha == 255)
-            {
-                dst_pixel[0] = src_pixel[0];
-                dst_pixel[1] = src_pixel[1];
-                dst_pixel[2] = src_pixel[2];
-                dst_pixel[3] = 255;
-                continue;
-            }
-
-            inv_alpha = 255 - alpha;
-            dst_pixel[0] = min(255, src_pixel[0] + (dst_pixel[0] * inv_alpha + 127) / 255);
-            dst_pixel[1] = min(255, src_pixel[1] + (dst_pixel[1] * inv_alpha + 127) / 255);
-            dst_pixel[2] = min(255, src_pixel[2] + (dst_pixel[2] * inv_alpha + 127) / 255);
-            dst_pixel[3] = min(255, alpha + (dst_pixel[3] * inv_alpha + 127) / 255);
-        }
-    }
-
-    TRACE("Switchyard blended DComp frame hwnd %p into root %p rect %s.\n",
-            src->source_hwnd, dst->hwnd, wine_dbgstr_rect(&rect));
-}
-
-static BOOL is_target_frame_nearly_solid_dark(const struct dcomp_target_frame *frame)
-{
-    const BYTE *bits = frame->bits;
-    int width = frame->client_rect.right - frame->client_rect.left;
-    int height = frame->client_rect.bottom - frame->client_rect.top;
-    unsigned int x_step, y_step, samples = 0, visible = 0, dark = 0;
-    unsigned int x, y;
-
-    if (!bits || width <= 0 || height <= 0) return FALSE;
-
-    x_step = width / 32;
-    y_step = height / 24;
-    if (!x_step) x_step = 1;
-    if (!y_step) y_step = 1;
-
-    for (y = 0; y < height; y += y_step)
-    {
-        const BYTE *row = bits + y * frame->stride;
-
-        for (x = 0; x < width; x += x_step)
-        {
-            const BYTE *pixel = row + x * 4;
-
-            samples++;
-            if (pixel[3] <= 8) continue;
-            visible++;
-            if (pixel[0] <= 32 && pixel[1] <= 32 && pixel[2] <= 32) dark++;
-        }
-    }
-
-    return samples && visible && dark * 100 >= visible * 98;
-}
-
-static BOOL is_opaque_black_edge_pixel(const BYTE *pixel)
-{
-    return pixel[3] >= 248 && pixel[0] <= 12 && pixel[1] <= 12 && pixel[2] <= 12;
-}
-
-static BOOL target_frame_should_scrub_edge_black_alpha(const struct dcomp_target_frame *frame)
-{
-    const BYTE *bits = frame->bits;
-    int width = frame->client_rect.right - frame->client_rect.left;
-    int height = frame->client_rect.bottom - frame->client_rect.top;
-    SIZE_T visible = 0, non_black_visible = 0, edge_black = 0;
-    int x, y;
-
-    if (!bits || width <= 0 || height <= 0) return FALSE;
-
-    for (y = 0; y < height; y++)
-    {
-        const BYTE *row = bits + y * frame->stride;
-
-        for (x = 0; x < width; x++)
-        {
-            const BYTE *pixel = row + x * 4;
-            BOOL opaque_black;
-
-            if (pixel[3] <= 8) continue;
-            visible++;
-            opaque_black = is_opaque_black_edge_pixel(pixel);
-            if (!opaque_black) non_black_visible++;
-            else if (!x || !y || x + 1 == width || y + 1 == height) edge_black++;
-        }
-    }
-
-    if (!edge_black || visible < 64 || non_black_visible < 64) return FALSE;
-    return non_black_visible >= (visible + 11) / 12;
-}
-
-static unsigned int scrub_target_frame_edge_black_alpha(struct dcomp_target_frame *frame)
-{
-    BYTE *bits = frame->bits;
-    int width = frame->client_rect.right - frame->client_rect.left;
-    int height = frame->client_rect.bottom - frame->client_rect.top;
-    unsigned int *queue;
-    SIZE_T count, head = 0, tail = 0;
-    unsigned int scrubbed = 0;
-    int x, y;
-
-    if (!bits || width <= 0 || height <= 0) return 0;
-    if (!target_frame_should_scrub_edge_black_alpha(frame)) return 0;
-    if ((SIZE_T)width > ((SIZE_T)-1) / (SIZE_T)height) return 0;
-    count = (SIZE_T)width * (SIZE_T)height;
-    if (count > ((SIZE_T)-1) / sizeof(*queue)) return 0;
-    if (!(queue = malloc(count * sizeof(*queue)))) return 0;
-
-#define SCRUB_PUSH(px, py)                                                     \
-    do                                                                        \
-    {                                                                         \
-        BYTE *pixel = bits + (py) * frame->stride + (px) * 4;                 \
-        if (is_opaque_black_edge_pixel(pixel))                                \
-        {                                                                     \
-            pixel[0] = pixel[1] = pixel[2] = pixel[3] = 0;                    \
-            queue[tail++] = (unsigned int)((py) * width + (px));              \
-            scrubbed++;                                                       \
-        }                                                                     \
-    } while (0)
-
-    for (x = 0; x < width; x++)
-    {
-        SCRUB_PUSH(x, 0);
-        if (height > 1) SCRUB_PUSH(x, height - 1);
-    }
-    for (y = 1; y < height - 1; y++)
-    {
-        SCRUB_PUSH(0, y);
-        if (width > 1) SCRUB_PUSH(width - 1, y);
-    }
-
-    while (head < tail)
-    {
-        unsigned int pos = queue[head++];
-
-        x = pos % width;
-        y = pos / width;
-        if (x > 0) SCRUB_PUSH(x - 1, y);
-        if (x + 1 < width) SCRUB_PUSH(x + 1, y);
-        if (y > 0) SCRUB_PUSH(x, y - 1);
-        if (y + 1 < height) SCRUB_PUSH(x, y + 1);
-    }
-
-#undef SCRUB_PUSH
-
-    free(queue);
-    return scrubbed;
-}
-
 static BOOL present_target_frame(const struct dcomp_present_frame *present)
 {
     DWORD style = DCX_USESTYLE | DCX_CACHE;
     HDC target_dc;
-    int width = present->present_rect.right - present->present_rect.left;
-    int height = present->present_rect.bottom - present->present_rect.top;
+    int width = present->frame.client_rect.right - present->frame.client_rect.left;
+    int height = present->frame.client_rect.bottom - present->frame.client_rect.top;
     BOOL ret;
 
     if (!(target_dc = GetDCEx(present->hwnd, 0, style)))
     {
-        WARN("Failed to get present DC for composition hwnd %p root %p, error %lu.\n",
-                present->source_hwnd, present->hwnd, GetLastError());
+        WARN("Failed to get present DC for composition hwnd %p, error %lu.\n",
+                present->hwnd, GetLastError());
         return FALSE;
     }
 
-    ret = BitBlt(target_dc, present->present_rect.left, present->present_rect.top, width, height,
-            present->frame.dc, present->src_x, present->src_y, SRCCOPY);
+    ret = BitBlt(target_dc, 0, 0, width, height, present->frame.dc, 0, 0, SRCCOPY);
     if (!ret)
-        WARN("Failed to present composition frame hwnd %p root %p, error %lu.\n",
-                present->source_hwnd, present->hwnd, GetLastError());
+        WARN("Failed to present composition frame hwnd %p, error %lu.\n",
+                present->hwnd, GetLastError());
     else
-        TRACE("Switchyard presented DComp frame hwnd %p through root %p offset %ld,%ld rect %s.\n",
-                present->source_hwnd, present->hwnd, present->offset.x, present->offset.y,
-                wine_dbgstr_rect(&present->present_rect));
+        TRACE("Presented DComp frame directly to hwnd %p rect %s.\n",
+                present->hwnd, wine_dbgstr_rect(&present->frame.client_rect));
 
     ReleaseDC(present->hwnd, target_dc);
     return ret;
@@ -1559,6 +1209,17 @@ static void destroy_present_frames(struct list *frames)
         destroy_target_frame(&present->frame);
         free(present);
     }
+}
+
+static struct dcomp_present_frame *find_present_frame(struct list *frames, HWND hwnd)
+{
+    struct dcomp_present_frame *present;
+
+    LIST_FOR_EACH_ENTRY(present, frames, struct dcomp_present_frame, entry)
+    {
+        if (present->hwnd == hwnd) return present;
+    }
+    return NULL;
 }
 
 static void clear_composition_target(const struct composition_target *target, struct dcomp_target_frame *frame)
@@ -1729,124 +1390,66 @@ static DWORD WINAPI composite_thread_proc(void *iface)
     while (TRUE)
     {
         struct list present_frames = LIST_INIT(present_frames);
-        struct list alpha_frames = LIST_INIT(alpha_frames);
         BOOL has_active_target = FALSE;
         struct dcomp_present_frame *present;
-        struct dcomp_present_frame *alpha;
-        struct dcomp_present_frame *dst;
+        unsigned int plane;
 
         dcomp_lock();
 
         count = 0;
-        LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
+        /* Both target kinds may be attached to the same HWND.  Composite the
+         * non-topmost plane first and alpha-blend the topmost plane into the
+         * same client frame so transparent topmost pixels preserve content
+         * below them.  Publishing two full SRCCOPY frames would discard the
+         * first target completely. */
+        for (plane = 0; plane < 2; plane++)
         {
-            HWND hwnd_root, present_hwnd;
-            struct dcomp_present_frame *frame;
-            RECT present_rect;
-            POINT offset;
-            int src_x, src_y;
-            BOOL alpha_present;
-
-            if (!target->root)
+            LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
             {
-                FIXME("Target %p has no root.\n", &target->IDCompositionTarget_iface);
-                continue;
-            }
+                struct dcomp_present_frame *frame;
+                BOOL new_frame = FALSE;
 
-            /* Skip targets created from a shared visual handle. Composition for such targets will
-             * be done for the visual tree where the visual created from the shared visual handle is at */
-            if (target->shared_visual_handle)
-                continue;
-
-            has_active_target = TRUE;
-            visual = impl_from_IDCompositionVisual(target->root);
-
-            if (!(frame = calloc(1, sizeof(*frame))))
-            {
-                ERR("Failed to allocate composition present frame.\n");
-                continue;
-            }
-            if (!create_target_frame(target->hwnd, &frame->frame))
-            {
-                free(frame);
-                continue;
-            }
-
-            clear_composition_target(target, &frame->frame);
-            if (FAILED(do_composite(target, visual, frame->frame.dc, 0.0f, 0.0f)))
-            {
-                destroy_target_frame(&frame->frame);
-                free(frame);
-                continue;
-            }
-
-            if (!get_target_present_info(target->hwnd, &frame->frame,
-                    &present_hwnd, &present_rect, &offset, &src_x, &src_y))
-            {
-                destroy_target_frame(&frame->frame);
-                free(frame);
-                continue;
-            }
-
-            hwnd_root = GetAncestor(target->hwnd, GA_ROOT);
-            alpha_present = hwnd_root && present_hwnd != hwnd_root;
-            frame->hwnd = present_hwnd;
-            frame->source_hwnd = target->hwnd;
-            frame->present_rect = present_rect;
-            frame->offset = offset;
-            frame->src_x = src_x;
-            frame->src_y = src_y;
-
-            if (alpha_present)
-            {
-                unsigned int scrubbed = scrub_target_frame_edge_black_alpha(&frame->frame);
-
-                mark_chromium_owner_composed_window(target->hwnd);
-
-                if (scrubbed)
-                    TRACE("Switchyard scrubbed %u edge-black DComp alpha pixels hwnd %p for root %p rect %s.\n",
-                            scrubbed, target->hwnd, present_hwnd, wine_dbgstr_rect(&present_rect));
-                if (scrubbed && is_target_frame_nearly_solid_dark(&frame->frame))
+                if (!!target->topmost != !!plane) continue;
+                if (!target->root)
                 {
-                    TRACE("Switchyard skipped solid dark DComp alpha frame hwnd %p for root %p rect %s.\n",
-                            target->hwnd, present_hwnd, wine_dbgstr_rect(&present_rect));
-                    destroy_target_frame(&frame->frame);
-                    free(frame);
+                    FIXME("Target %p has no root.\n", &target->IDCompositionTarget_iface);
                     continue;
                 }
-                if (is_chrome_owned_popup_target(hwnd_root, present_hwnd))
+
+                /* Skip targets created from a shared visual handle. Composition for such targets will
+                 * be done for the visual tree where the visual created from the shared visual handle is at */
+                if (target->shared_visual_handle)
+                    continue;
+
+                has_active_target = TRUE;
+                visual = impl_from_IDCompositionVisual(target->root);
+
+                if (!(frame = find_present_frame(&present_frames, target->hwnd)))
                 {
-                    /* A popup DComp device cannot see the page target owned by
-                       another Chrome process/device.  Publishing its locally
-                       cleared root-sized frame would therefore replace the
-                       page with black.  Present the alpha popup to its own HWND
-                       so winemac can relay it over the authoritative root
-                       backing in the owner process. */
+                    if (!(frame = calloc(1, sizeof(*frame))))
+                    {
+                        ERR("Failed to allocate composition present frame.\n");
+                        continue;
+                    }
+                    if (!create_target_frame(target->hwnd, &frame->frame))
+                    {
+                        free(frame);
+                        continue;
+                    }
                     frame->hwnd = target->hwnd;
-                    frame->present_rect = frame->frame.client_rect;
-                    frame->offset.x = frame->offset.y = 0;
-                    frame->src_x = frame->src_y = 0;
-                    if (present_target_frame(frame)) count++;
+                    clear_composition_target(target, &frame->frame);
+                    list_add_tail(&present_frames, &frame->entry);
+                    new_frame = TRUE;
+                }
+
+                if (FAILED(do_composite(target, visual, frame->frame.dc, 0.0f, 0.0f)) && new_frame)
+                {
+                    list_remove(&frame->entry);
                     destroy_target_frame(&frame->frame);
                     free(frame);
-                    continue;
                 }
-                list_add_tail(&alpha_frames, &frame->entry);
-                continue;
             }
-
-            list_add_tail(&present_frames, &frame->entry);
         }
-
-        LIST_FOR_EACH_ENTRY(alpha, &alpha_frames, struct dcomp_present_frame, entry)
-        {
-            if ((dst = find_present_frame(&present_frames, alpha->hwnd)))
-                blend_frame_into_present_frame(dst, alpha);
-            else
-                TRACE("Switchyard skipped DComp alpha frame hwnd %p for root %p because no base frame is ready.\n",
-                        alpha->source_hwnd, alpha->hwnd);
-        }
-        destroy_present_frames(&alpha_frames);
 
         LIST_FOR_EACH_ENTRY(present, &present_frames, struct dcomp_present_frame, entry)
         {

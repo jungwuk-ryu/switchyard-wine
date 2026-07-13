@@ -96,11 +96,10 @@ enum macdrv_window_messages
 {
     WM_MACDRV_SET_WIN_REGION = WM_WINE_FIRST_DRIVER_MSG,
     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
-    WM_MACDRV_CAN_HOST_REMOTE_LAYER,
-    WM_MACDRV_CREATE_REMOTE_LAYER,
-    WM_MACDRV_UPDATE_REMOTE_LAYER,
-    WM_MACDRV_RELEASE_REMOTE_LAYER,
-    WM_MACDRV_PRESENT_ROOT_SURFACE,
+    WM_MACDRV_ATTACH_REMOTE_DIB_LAYER,
+    WM_MACDRV_ATTACH_REMOTE_GPU_LAYER,
+    WM_MACDRV_RELEASE_REMOTE_DIB_LAYER,
+    WM_MACDRV_RELEASE_REMOTE_GPU_LAYER,
 };
 
 struct macdrv_thread_data
@@ -195,19 +194,6 @@ struct macdrv_win_data
     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
     unsigned int        minimized : 1;          /* is window minimized? */
     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
-    unsigned int        foreign_child : 1;      /* process-local host window for a foreign child HWND */
-    unsigned int        remote_layer_hosted_once : 1; /* has this window ever hosted a foreign remote layer? */
-    unsigned int        chromium_smaller_layer_hosted_once : 1; /* has a smaller Chromium child hosted a layer? */
-    unsigned int        chromium_root_surface_presented_once : 1; /* authoritative Chromium root backing has been presented */
-    unsigned int        chromium_client_only_had_non_dark_backing : 1; /* retain valid first-run backing over dark transition placeholders */
-    unsigned int        foreign_surface_refs;   /* surfaces presenting into a foreign child host window */
-    unsigned int        foreign_parent_window_number; /* tracked owner WindowServer window */
-    RECT                foreign_parent_rect;    /* tracked owner size, normalized to the origin */
-    RECT                foreign_child_rect;     /* tracked child frame relative to the owner */
-    unsigned int        remote_layer_hosts;     /* foreign child layers hosted inside this window */
-    CFMutableSetRef     remote_layer_contexts;  /* hosted foreign remote layer context ids */
-    CFMutableSetRef     suppressed_remote_layer_contexts; /* hidden placeholder context ids */
-    CFMutableArrayRef   chromium_root_surface_overlays; /* active relayed popup HWNDs, back to front */
 };
 
 struct macdrv_client_surface
@@ -215,7 +201,7 @@ struct macdrv_client_surface
     struct client_surface   client;
     macdrv_view             cocoa_view;
     macdrv_metal_swapchain  metal_swapchain;
-    HWND                    foreign_child_hwnd; /* process-local host for a foreign child HWND */
+    HWND                    windowless_hwnd; /* foreign HWND presented into its native root layer tree */
 };
 
 extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
@@ -224,15 +210,7 @@ extern void macdrv_begin_window_move_surface_hold(HWND hwnd);
 extern void macdrv_end_window_move_surface_hold(void);
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
-extern BOOL macdrv_win_data_uses_chrome_client_only_frame(struct macdrv_win_data *data);
 extern void macdrv_offset_client_rect_to_cocoa_frame(struct macdrv_win_data *data, RECT *rect);
-extern BOOL macdrv_present_root_surface(HWND root, HWND source);
-extern void macdrv_forget_root_surface_overlay(HWND root, HWND source);
-extern void macdrv_release_root_surface_backing(HWND root);
-extern BOOL macdrv_acquire_foreign_child_win_data(HWND hwnd, const RECT *surface_rect,
-                                                   macdrv_window *window);
-extern void macdrv_release_foreign_child_win_data(HWND hwnd);
-extern BOOL macdrv_present_foreign_child_window(HWND hwnd);
 extern void release_win_data(struct macdrv_win_data *data);
 extern void init_win_context(void);
 extern macdrv_window macdrv_get_cocoa_window(HWND hwnd, BOOL require_on_screen);

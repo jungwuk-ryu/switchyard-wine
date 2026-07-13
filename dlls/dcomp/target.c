@@ -30,6 +30,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 static const WCHAR *wine_window_topmost_composed = L"wine_window_topmost_composed";
 static const WCHAR *wine_window_non_topmost_composed = L"wine_window_non_topmost_composed";
 
+static void refresh_composition_surface(HWND hwnd)
+{
+    SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
 static HRESULT STDMETHODCALLTYPE target_QueryInterface(IDCompositionTarget *iface, REFIID iid, void **out)
 {
     TRACE("iface %p, iid %s, out %p!\n", iface, debugstr_guid(iid), out);
@@ -68,7 +74,8 @@ static ULONG STDMETHODCALLTYPE target_Release(IDCompositionTarget *iface)
     if (!ref)
     {
         prop = target->topmost ? wine_window_topmost_composed : wine_window_non_topmost_composed;
-        RemovePropW(target->hwnd, prop);
+        if (RemovePropW(target->hwnd, prop))
+            refresh_composition_surface(target->hwnd);
 
         dcomp_lock();
         list_remove(&target->entry);
@@ -186,7 +193,8 @@ HRESULT create_target(struct composition_device *device, HWND hwnd, BOOL topmost
     *new_target = &target->IDCompositionTarget_iface;
 
     prop = target->topmost ? wine_window_topmost_composed : wine_window_non_topmost_composed;
-    SetPropW(target->hwnd, prop, (HANDLE)1);
+    if (SetPropW(target->hwnd, prop, (HANDLE)1))
+        refresh_composition_surface(target->hwnd);
     return S_OK;
 }
 

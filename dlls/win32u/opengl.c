@@ -77,11 +77,181 @@ static const struct opengl_driver_funcs nulldrv_funcs, *driver_funcs = &nulldrv_
 static struct list devices_egl = LIST_INIT( devices_egl );
 static struct egl_platform display_egl;
 static struct opengl_funcs display_funcs;
-static void *global_context;
+
+enum opengl_share_profile
+{
+    OPENGL_SHARE_PROFILE_COMPAT,
+    OPENGL_SHARE_PROFILE_CORE,
+    OPENGL_SHARE_PROFILE_COUNT,
+};
+
+enum internal_context_profile
+{
+    INTERNAL_CONTEXT_DEFAULT,
+    INTERNAL_CONTEXT_COMPAT,
+    INTERNAL_CONTEXT_CORE,
+};
+
+static void *global_contexts[OPENGL_SHARE_PROFILE_COUNT];
 
 static BOOLEAN global_extensions[GL_EXTENSION_COUNT];
 static struct wgl_pixel_format *pixel_formats;
 static UINT formats_count, onscreen_count;
+
+/* A foreign HWND has no process-local WND object, but its OpenGL producer
+ * still needs the same persistent state that WND.current_drawable,
+ * WND.unused_drawable, and WND.swap_interval provide to a local window.
+ *
+ * Cross-process renderers can alternate between a foreign presentation HWND
+ * and process-local helper windows.  Do not tear down the redirected surface
+ * merely because the cache DC was released.
+ */
+struct foreign_window_opengl_state
+{
+    struct list entry;
+    HWND hwnd;
+    DWORD owner_thread;
+    DWORD owner_process;
+    struct opengl_drawable *current_drawable;
+    struct opengl_drawable *unused_drawable;
+    int swap_interval;
+};
+
+static pthread_mutex_t foreign_window_opengl_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct list foreign_window_opengl_states = LIST_INIT( foreign_window_opengl_states );
+
+static struct foreign_window_opengl_state *get_foreign_window_opengl_state_locked(
+    HWND hwnd, DWORD owner_thread, DWORD owner_process, BOOL create,
+    struct opengl_drawable **stale_current, struct opengl_drawable **stale_unused )
+{
+    struct foreign_window_opengl_state *state, *stale_state = NULL;
+
+    LIST_FOR_EACH_ENTRY( state, &foreign_window_opengl_states,
+                         struct foreign_window_opengl_state, entry )
+    {
+        if (state->hwnd != hwnd) continue;
+        if (state->owner_thread == owner_thread && state->owner_process == owner_process)
+            return state;
+
+        /* HWND values may be recycled.  Reset the entry before associating it
+         * with a different server-side window generation. */
+        *stale_current = state->current_drawable;
+        *stale_unused = state->unused_drawable;
+        state->current_drawable = NULL;
+        state->unused_drawable = NULL;
+        state->owner_thread = owner_thread;
+        state->owner_process = owner_process;
+        state->swap_interval = 0;
+        return state;
+    }
+
+    if (!create) return NULL;
+
+    /* Destroy notifications do not cross the process boundary.  Retire one
+     * provably dead generation while creating a new state, but never evict a
+     * live foreign HWND merely to enforce an arbitrary cache size: its cached
+     * drawable may be the ownership that keeps a visible detached context
+     * presented.  Repeated window churn therefore reclaims stale entries at
+     * least as quickly as it creates replacements. */
+    LIST_FOR_EACH_ENTRY( state, &foreign_window_opengl_states,
+                         struct foreign_window_opengl_state, entry )
+    {
+        DWORD process = 0;
+        DWORD thread = NtUserGetWindowThread( state->hwnd, &process );
+
+        if (thread == state->owner_thread && process == state->owner_process) continue;
+        stale_state = state;
+        break;
+    }
+    if (stale_state)
+    {
+        list_remove( &stale_state->entry );
+        *stale_current = stale_state->current_drawable;
+        *stale_unused = stale_state->unused_drawable;
+        free( stale_state );
+    }
+    if (!(state = calloc( 1, sizeof(*state) ))) return NULL;
+    state->hwnd = hwnd;
+    state->owner_thread = owner_thread;
+    state->owner_process = owner_process;
+    list_add_tail( &foreign_window_opengl_states, &state->entry );
+    return state;
+}
+
+static BOOL get_foreign_window_identity( HWND hwnd, DWORD *owner_thread, DWORD *owner_process )
+{
+    *owner_process = 0;
+    *owner_thread = NtUserGetWindowThread( hwnd, owner_process );
+    return *owner_thread && *owner_process;
+}
+
+static void set_foreign_window_opengl_drawable( HWND hwnd,
+                                                 struct opengl_drawable *new_drawable,
+                                                 BOOL current )
+{
+    struct opengl_drawable *old_drawable = NULL, *stale_current = NULL, *stale_unused = NULL;
+    struct foreign_window_opengl_state *state;
+    DWORD owner_thread, owner_process;
+
+    if (!get_foreign_window_identity( hwnd, &owner_thread, &owner_process )) return;
+
+    pthread_mutex_lock( &foreign_window_opengl_mutex );
+    if ((state = get_foreign_window_opengl_state_locked( hwnd, owner_thread, owner_process,
+                                                          TRUE, &stale_current, &stale_unused )))
+    {
+        struct opengl_drawable **slot = current ? &state->current_drawable :
+                                                  &state->unused_drawable;
+        old_drawable = *slot;
+        if ((*slot = new_drawable)) opengl_drawable_add_ref( new_drawable );
+    }
+    pthread_mutex_unlock( &foreign_window_opengl_mutex );
+
+    if (old_drawable) opengl_drawable_release( old_drawable );
+    if (stale_current) opengl_drawable_release( stale_current );
+    if (stale_unused) opengl_drawable_release( stale_unused );
+}
+
+static struct opengl_drawable *get_foreign_window_current_drawable( HWND hwnd )
+{
+    struct opengl_drawable *drawable = NULL, *stale_current = NULL, *stale_unused = NULL;
+    struct foreign_window_opengl_state *state;
+    DWORD owner_thread, owner_process;
+
+    if (!get_foreign_window_identity( hwnd, &owner_thread, &owner_process )) return NULL;
+
+    pthread_mutex_lock( &foreign_window_opengl_mutex );
+    if ((state = get_foreign_window_opengl_state_locked( hwnd, owner_thread, owner_process,
+                                                          FALSE, &stale_current, &stale_unused )) &&
+        (drawable = state->current_drawable))
+        opengl_drawable_add_ref( drawable );
+    pthread_mutex_unlock( &foreign_window_opengl_mutex );
+
+    if (stale_current) opengl_drawable_release( stale_current );
+    if (stale_unused) opengl_drawable_release( stale_unused );
+    return drawable;
+}
+
+static struct opengl_drawable *take_foreign_window_unused_drawable( HWND hwnd )
+{
+    struct opengl_drawable *drawable = NULL, *stale_current = NULL, *stale_unused = NULL;
+    struct foreign_window_opengl_state *state;
+    DWORD owner_thread, owner_process;
+
+    if (!get_foreign_window_identity( hwnd, &owner_thread, &owner_process )) return NULL;
+
+    pthread_mutex_lock( &foreign_window_opengl_mutex );
+    if ((state = get_foreign_window_opengl_state_locked( hwnd, owner_thread, owner_process,
+                                                          FALSE, &stale_current, &stale_unused )))
+    {
+        drawable = state->unused_drawable;
+        state->unused_drawable = NULL; /* transfer the table's reference */
+    }
+    pthread_mutex_unlock( &foreign_window_opengl_mutex );
+
+    if (stale_current) opengl_drawable_release( stale_current );
+    if (stale_unused) opengl_drawable_release( stale_unused );
+    return drawable;
+}
 
 static BOOL has_extension( const char *list, const char *ext )
 {
@@ -193,6 +363,71 @@ static BOOL opengl_drawable_swap( struct opengl_drawable *drawable )
     return drawable->funcs->swap( drawable );
 }
 
+static enum opengl_share_profile context_share_profile( const int *attribs )
+{
+    int major = 1, minor = 0, profile = 0;
+    BOOL profile_set = FALSE;
+
+    for (; attribs && attribs[0]; attribs += 2)
+    {
+        switch (attribs[0])
+        {
+        case WGL_CONTEXT_MAJOR_VERSION_ARB:
+            major = attribs[1];
+            break;
+        case WGL_CONTEXT_MINOR_VERSION_ARB:
+            minor = attribs[1];
+            break;
+        case WGL_CONTEXT_PROFILE_MASK_ARB:
+            profile = attribs[1];
+            profile_set = TRUE;
+            break;
+        }
+    }
+
+    if (profile_set)
+        return profile & WGL_CONTEXT_CORE_PROFILE_BIT_ARB ? OPENGL_SHARE_PROFILE_CORE :
+                                                           OPENGL_SHARE_PROFILE_COMPAT;
+    if (major > 3 || (major == 3 && minor >= 2)) return OPENGL_SHARE_PROFILE_CORE;
+    return OPENGL_SHARE_PROFILE_COMPAT;
+}
+
+static void *internal_context_create( enum internal_context_profile profile, void *share,
+                                      int *context_format )
+{
+    static const int compat_attribs[] =
+    {
+        WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB, 0,
+    };
+    static const int core_attribs[] =
+    {
+        WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+        WGL_CONTEXT_MINOR_VERSION_ARB, 2,
+        WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+        0,
+    };
+    const int *attribs = profile == INTERNAL_CONTEXT_DEFAULT ? NULL :
+                         profile == INTERNAL_CONTEXT_CORE ? core_attribs : compat_attribs;
+    void *context;
+    int format;
+
+    for (format = 1; format <= formats_count; format++)
+    {
+        struct wgl_pixel_format *desc = pixel_formats + format - 1;
+        if (!(desc->pfd.dwFlags & PFD_SUPPORT_OPENGL)) continue;
+        if (desc->pfd.iPixelType != PFD_TYPE_RGBA) continue;
+        if (desc->pfd.cColorBits < 24) continue;
+        if (!driver_funcs->p_context_create( format, share, attribs, &context )) continue;
+        if (context_format) *context_format = format;
+        return context;
+    }
+
+    WARN( "Failed to create internal %s context\n",
+          profile == INTERNAL_CONTEXT_CORE ? "core" :
+          profile == INTERNAL_CONTEXT_COMPAT ? "compatibility" : "default" );
+    return NULL;
+}
+
 static BOOL make_null_context_current( struct opengl_drawable *drawable )
 {
     struct opengl_thread_data *data = get_opengl_thread_data();
@@ -200,17 +435,11 @@ static BOOL make_null_context_current( struct opengl_drawable *drawable )
 
     if (!data->null_context)
     {
-        for (format = 1; format <= formats_count; format++)
-        {
-            struct wgl_pixel_format *desc = pixel_formats + format - 1;
-            if (!(desc->pfd.dwFlags & PFD_SUPPORT_OPENGL)) continue;
-            if (desc->pfd.iPixelType != PFD_TYPE_RGBA) continue;
-            if (desc->pfd.cColorBits < 24) continue;
-            break;
-        }
+        enum internal_context_profile profile = driver_funcs->separate_context_profiles ?
+                                                INTERNAL_CONTEXT_COMPAT : INTERNAL_CONTEXT_DEFAULT;
 
-        if (format > formats_count) return FALSE;
-        driver_funcs->p_context_create( format, global_context, NULL, &data->null_context );
+        if (!(data->null_context = internal_context_create( profile,
+                  global_contexts[OPENGL_SHARE_PROFILE_COMPAT], &format ))) return FALSE;
         if (driver_funcs->p_null_surface_create) driver_funcs->p_null_surface_create( format, &data->null_surface );
     }
 
@@ -1235,10 +1464,12 @@ static void init_device_info( struct egl_platform *egl, const struct opengl_func
     TRACE( "  - device_uuid: %s\n", debugstr_guid(&egl->device_uuid) );
     TRACE( "  - driver_uuid: %s\n", debugstr_guid(&egl->driver_uuid) );
 
-    if (egl == &display_egl)
+    if (egl == &display_egl && !driver_funcs->separate_context_profiles)
     {
-        if (core_context) core_context = InterlockedExchangePointer( &global_context, core_context );
-        else if (compat_context) compat_context = InterlockedExchangePointer( &global_context, compat_context );
+        if (core_context)
+            core_context = InterlockedExchangePointer( &global_contexts[OPENGL_SHARE_PROFILE_COMPAT], core_context );
+        else if (compat_context)
+            compat_context = InterlockedExchangePointer( &global_contexts[OPENGL_SHARE_PROFILE_COMPAT], compat_context );
     }
     if (compat_context) funcs->p_eglDestroyContext( egl->display, compat_context );
     if (core_context) funcs->p_eglDestroyContext( egl->display, core_context );
@@ -1398,7 +1629,9 @@ void set_window_opengl_drawable( HWND hwnd, struct opengl_drawable *new_drawable
     struct opengl_drawable *old_drawable = NULL;
     WND *win;
 
-    if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    if ((win = get_win_ptr( hwnd )) == WND_OTHER_PROCESS)
+        set_foreign_window_opengl_drawable( hwnd, new_drawable, current );
+    else if (win && win != WND_DESKTOP)
     {
         struct opengl_drawable **ptr = current ? &win->current_drawable : &win->unused_drawable;
         old_drawable = *ptr;
@@ -1414,7 +1647,9 @@ static struct opengl_drawable *get_window_current_drawable( HWND hwnd )
     struct opengl_drawable *drawable = NULL;
     WND *win;
 
-    if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    if ((win = get_win_ptr( hwnd )) == WND_OTHER_PROCESS)
+        drawable = get_foreign_window_current_drawable( hwnd );
+    else if (win && win != WND_DESKTOP)
     {
         if ((drawable = win->current_drawable)) opengl_drawable_add_ref( drawable );
         release_win_ptr( win );
@@ -1429,7 +1664,9 @@ static struct opengl_drawable *get_window_unused_drawable( HWND hwnd, int format
     struct opengl_drawable *drawable = NULL;
     WND *win;
 
-    if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    if ((win = get_win_ptr( hwnd )) == WND_OTHER_PROCESS)
+        drawable = take_foreign_window_unused_drawable( hwnd );
+    else if (win && win != WND_DESKTOP)
     {
         drawable = win->unused_drawable;
         win->unused_drawable = NULL;
@@ -1823,6 +2060,16 @@ static void context_exchange_drawables( struct opengl_context *context, struct o
     *read = old_read;
 }
 
+static BOOL context_get_drawable_fbos( struct opengl_context *context,
+                                       struct opengl_drawable *drawable,
+                                       struct opengl_context_fbos *fbos )
+{
+    fbos->draw = drawable->draw_fbo;
+    fbos->read = drawable->read_fbo;
+    if (!driver_funcs->p_context_get_fbos) return TRUE;
+    return driver_funcs->p_context_get_fbos( context->driver_private, drawable, fbos );
+}
+
 /* return an updated drawable, recreating one if the window drawables have been invalidated (mostly wineandroid) */
 static struct opengl_drawable *get_updated_drawable( HDC hdc, int format, struct opengl_drawable *drawable )
 {
@@ -1872,7 +2119,11 @@ static BOOL context_sync_drawables( struct opengl_context *context, HDC draw_hdc
 
     if (!ret && (ret = driver_funcs->p_make_current( new_draw, new_read, context->driver_private )))
     {
-        NtCurrentTeb()->glContext = context;
+        ret = context_get_drawable_fbos( context, new_draw, &context->draw_fbos ) &&
+              context_get_drawable_fbos( context, new_read, &context->read_fbos );
+        if (ret) NtCurrentTeb()->glContext = context;
+
+        if (!ret) goto done;
 
         if (old_draw && old_draw != new_draw && old_draw != new_read && old_draw->client)
             set_window_opengl_drawable( old_draw->client->hwnd, old_draw, FALSE );
@@ -1887,6 +2138,7 @@ static BOOL context_sync_drawables( struct opengl_context *context, HDC draw_hdc
         opengl_drawable_flush( new_draw, new_draw->interval, 0 );
     }
 
+done:
     if (ret)
     {
         /* update the current window drawable to the last used draw surface */
@@ -2262,10 +2514,25 @@ static BOOL win32u_wglSetPbufferAttribARB( HPBUFFERARB client_pbuffer, const int
 
 static int get_window_swap_interval( HWND hwnd )
 {
+    struct opengl_drawable *stale_current = NULL, *stale_unused = NULL;
+    struct foreign_window_opengl_state *state;
+    DWORD owner_thread, owner_process;
     int interval;
     WND *win;
 
-    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return 0;
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP) return 0;
+    if (win == WND_OTHER_PROCESS)
+    {
+        if (!get_foreign_window_identity( hwnd, &owner_thread, &owner_process )) return 0;
+        pthread_mutex_lock( &foreign_window_opengl_mutex );
+        state = get_foreign_window_opengl_state_locked( hwnd, owner_thread, owner_process,
+                                                         FALSE, &stale_current, &stale_unused );
+        interval = state ? state->swap_interval : 0;
+        pthread_mutex_unlock( &foreign_window_opengl_mutex );
+        if (stale_current) opengl_drawable_release( stale_current );
+        if (stale_unused) opengl_drawable_release( stale_unused );
+        return interval;
+    }
     interval = win->swap_interval;
     release_win_ptr( win );
 
@@ -2274,6 +2541,8 @@ static int get_window_swap_interval( HWND hwnd )
 
 static BOOL win32u_context_create( struct opengl_context *context, HDC hdc, const int *attribs )
 {
+    enum opengl_share_profile profile = context_share_profile( attribs );
+    void *share;
     int format;
 
     TRACE( "context %p, hdc %p, attribs %p\n", context, hdc, attribs );
@@ -2285,12 +2554,24 @@ static BOOL win32u_context_create( struct opengl_context *context, HDC hdc, cons
         else RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
         return FALSE;
     }
-    if (!driver_funcs->p_context_create( format, global_context, attribs, &context->driver_private ))
+    if (!driver_funcs->separate_context_profiles) profile = OPENGL_SHARE_PROFILE_COMPAT;
+    if (!(share = global_contexts[profile]))
+    {
+        WARN( "No internal %s share context for context %p\n",
+              profile == OPENGL_SHARE_PROFILE_CORE ? "core" : "compatibility", context );
+        RtlSetLastWin32Error( ERROR_INVALID_OPERATION );
+        return FALSE;
+    }
+    if (!driver_funcs->p_context_create( format, share, attribs, &context->driver_private ))
     {
         WARN( "Failed to create driver context for context %p\n", context );
         return FALSE;
     }
     context->format = format;
+    opengl_client_context_from_client( context->client_context )->native_share_group =
+        !driver_funcs->separate_context_profiles ? OPENGL_NATIVE_SHARE_GROUP_GENERIC :
+        profile == OPENGL_SHARE_PROFILE_CORE ? OPENGL_NATIVE_SHARE_GROUP_CORE :
+                                               OPENGL_NATIVE_SHARE_GROUP_COMPAT;
 
     TRACE( "created context %p, format %u for driver context %p\n", context, format, context->driver_private );
     return TRUE;
@@ -2376,6 +2657,9 @@ static BOOL win32u_wglSwapBuffers( HDC hdc )
 
 static BOOL win32u_wglSwapIntervalEXT( int interval )
 {
+    struct opengl_drawable *stale_current = NULL, *stale_unused = NULL;
+    struct foreign_window_opengl_state *state;
+    DWORD owner_thread, owner_process;
     HDC hdc = NtCurrentTeb()->glReserved1[0];
     HWND hwnd;
     WND *win;
@@ -2385,10 +2669,22 @@ static BOOL win32u_wglSwapIntervalEXT( int interval )
         RtlSetLastWin32Error( ERROR_DC_NOT_FOUND );
         return FALSE;
     }
-    if (win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+    if (win == WND_DESKTOP)
     {
         WARN( "setting swap interval on win %p not supported\n", hwnd );
-        return TRUE;
+        return FALSE;
+    }
+    if (win == WND_OTHER_PROCESS)
+    {
+        if (!get_foreign_window_identity( hwnd, &owner_thread, &owner_process )) return FALSE;
+        pthread_mutex_lock( &foreign_window_opengl_mutex );
+        state = get_foreign_window_opengl_state_locked( hwnd, owner_thread, owner_process,
+                                                         TRUE, &stale_current, &stale_unused );
+        if (state) state->swap_interval = interval;
+        pthread_mutex_unlock( &foreign_window_opengl_mutex );
+        if (stale_current) opengl_drawable_release( stale_current );
+        if (stale_unused) opengl_drawable_release( stale_unused );
+        return !!state;
     }
 
     TRACE( "setting window %p swap interval %d\n", hwnd, interval );
@@ -2400,24 +2696,14 @@ static BOOL win32u_wglSwapIntervalEXT( int interval )
 static int win32u_wglGetSwapIntervalEXT(void)
 {
     HDC hdc = NtCurrentTeb()->glReserved1[0];
-    int interval;
     HWND hwnd;
-    WND *win;
 
-    if (!(hwnd = NtUserWindowFromDC( hdc )) || !(win = get_win_ptr( hwnd )))
+    if (!(hwnd = NtUserWindowFromDC( hdc )))
     {
         RtlSetLastWin32Error( ERROR_DC_NOT_FOUND );
         return 0;
     }
-    if (win == WND_DESKTOP || win == WND_OTHER_PROCESS)
-    {
-        WARN( "setting swap interval on win %p not supported\n", hwnd );
-        return TRUE;
-    }
-    interval = win->swap_interval;
-    release_win_ptr( win );
-
-    return interval;
+    return get_window_swap_interval( hwnd );
 }
 
 static void set_gl_error( GLenum error )
@@ -2782,17 +3068,14 @@ static void display_funcs_init(void)
             init_device_info( egl, &display_funcs );
     }
 
-    if (!global_context)
+    if (!global_contexts[OPENGL_SHARE_PROFILE_COMPAT])
     {
-        for (int format = 1; format <= formats_count; format++)
-        {
-            struct wgl_pixel_format *desc = pixel_formats + format - 1;
-            if (!(desc->pfd.dwFlags & PFD_SUPPORT_OPENGL)) continue;
-            if (desc->pfd.iPixelType != PFD_TYPE_RGBA) continue;
-            if (desc->pfd.cColorBits < 24) continue;
-            if (driver_funcs->p_context_create( format, NULL, NULL, &global_context )) break;
-        }
+        enum internal_context_profile profile = driver_funcs->separate_context_profiles ?
+                                                INTERNAL_CONTEXT_COMPAT : INTERNAL_CONTEXT_DEFAULT;
+        global_contexts[OPENGL_SHARE_PROFILE_COMPAT] = internal_context_create( profile, NULL, NULL );
     }
+    if (driver_funcs->separate_context_profiles && !global_contexts[OPENGL_SHARE_PROFILE_CORE])
+        global_contexts[OPENGL_SHARE_PROFILE_CORE] = internal_context_create( INTERNAL_CONTEXT_CORE, NULL, NULL );
 }
 
 /***********************************************************************

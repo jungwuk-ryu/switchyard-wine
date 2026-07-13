@@ -906,6 +906,35 @@ HGLRC WINAPI wglCreateContext( HDC hdc )
     return wglCreateContextAttribsARB( hdc, NULL, attribs );
 }
 
+static enum opengl_native_share_group context_native_share_group( const int *attribs )
+{
+    int major = 1, minor = 0, profile = 0;
+    BOOL profile_set = FALSE;
+
+    for (; attribs && attribs[0]; attribs += 2)
+    {
+        switch (attribs[0])
+        {
+        case WGL_CONTEXT_MAJOR_VERSION_ARB:
+            major = attribs[1];
+            break;
+        case WGL_CONTEXT_MINOR_VERSION_ARB:
+            minor = attribs[1];
+            break;
+        case WGL_CONTEXT_PROFILE_MASK_ARB:
+            profile = attribs[1];
+            profile_set = TRUE;
+            break;
+        }
+    }
+
+    if (profile_set)
+        return profile & WGL_CONTEXT_CORE_PROFILE_BIT_ARB ? OPENGL_NATIVE_SHARE_GROUP_CORE :
+                                                           OPENGL_NATIVE_SHARE_GROUP_COMPAT;
+    return major > 3 || (major == 3 && minor >= 2) ? OPENGL_NATIVE_SHARE_GROUP_CORE :
+                                                    OPENGL_NATIVE_SHARE_GROUP_COMPAT;
+}
+
 HGLRC WINAPI wglCreateContextAttribsARB( HDC hdc, HGLRC share, const int *attribs )
 {
     struct wglCreateContextAttribsARB_params args = { .teb = NtCurrentTeb(), .hDC = hdc, .attribList = attribs };
@@ -917,6 +946,13 @@ HGLRC WINAPI wglCreateContextAttribsARB( HDC hdc, HGLRC share, const int *attrib
 
     if (share && !(share_context = context_from_handle( share )))
     {
+        SetLastError( ERROR_INVALID_OPERATION );
+        return NULL;
+    }
+    if (share_context && share_context->base.native_share_group &&
+        share_context->base.native_share_group != context_native_share_group( attribs ))
+    {
+        WARN( "Cannot share native OpenGL objects across compatibility and core profiles\n" );
         SetLastError( ERROR_INVALID_OPERATION );
         return NULL;
     }
@@ -1013,6 +1049,12 @@ BOOL WINAPI wglShareLists( HGLRC src_handle, HGLRC dst_handle )
     if (!(src_context = context_from_handle( src_handle ))) return FALSE;
     if (!(dst_context = context_from_handle( dst_handle ))) return FALSE;
     if (ReadNoFence( &dst_context->lists->modified )) return FALSE;
+    if (src_context->base.native_share_group != dst_context->base.native_share_group &&
+        (src_context->base.native_share_group || dst_context->base.native_share_group))
+    {
+        WARN( "Cannot share native OpenGL objects across compatibility and core profiles\n" );
+        return FALSE;
+    }
 
     lists = display_lists_acquire( src_context->lists );
     lists = InterlockedExchangePointer( (void *)&dst_context->lists, lists );

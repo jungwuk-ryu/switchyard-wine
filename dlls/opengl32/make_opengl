@@ -595,6 +595,12 @@ sub generate_unix_thunk($$$$)
         my $target = "GL_DRAW_FRAMEBUFFER";
         $target = "GL_READ_FRAMEBUFFER" if $arg =~ "readFramebuffer";
         $target = "params->target" if $call_args =~ "params->target";
+        if (($name eq "glBindFramebuffer" || $name eq "glBindFramebufferEXT") &&
+            $arg eq "framebuffer")
+        {
+            $ret .= "    if (!$arg && bind_separate_default_fbos( $teb, params->target, " .
+                    "(void (*)(GLenum, GLuint))funcs->p_$name )) goto bound_default_fbos;\n";
+        }
         $ret .= "    if (!$arg) $arg = get_default_fbo( $teb, $target );\n";
     }
     $ret .= "    resolve_default_fbo( $teb, TRUE );\n" if resolve_default_fbo( $name );
@@ -617,6 +623,7 @@ sub generate_unix_thunk($$$$)
         $ret .= "funcs->p_$name($call_args);\n";
     }
     $ret .= "    pthread_mutex_unlock( &wgl_lock );\n" if $need_lock;
+    $ret .= "bound_default_fbos:\n" if $name eq "glBindFramebuffer" || $name eq "glBindFramebufferEXT";
     $ret .= "    set_current_fbo( $teb, params->target, params->framebuffer );\n" if $name =~ /glBindFramebuffer/;
     $ret .= "    pop_default_fbo( $teb );\n" if hide_default_fbo( $name );
     if (defined $state_attrib_funcs{$name})

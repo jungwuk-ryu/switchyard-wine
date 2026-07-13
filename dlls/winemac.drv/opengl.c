@@ -36,6 +36,8 @@
 #define GL_SILENCE_DEPRECATION
 #define __gl_h_
 #define __gltypes_h_
+#include <IOSurface/IOSurface.h>
+#include <OpenGL/CGLIOSurface.h>
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/glu.h>
 #include <OpenGL/CGLRenderers.h>
@@ -53,21 +55,28 @@ struct gl_info {
 
 static struct gl_info gl_info;
 
+#define FOREIGN_SURFACE_BUFFER_COUNT 3
+
 
 struct macdrv_context
 {
+    BOOL                    core;
     int                     format;
-    GLint                   renderer_id;
     macdrv_opengl_context   context;
     CGLContextObj           cglcontext;
     HWND                    draw_hwnd;
     macdrv_view             draw_view;
     CGLPBufferObj           draw_pbuffer;
+    struct gl_drawable      *draw_foreign;
     GLenum                  draw_pbuffer_face;
     GLint                   draw_pbuffer_level;
     HWND                    read_hwnd;
     macdrv_view             read_view;
     CGLPBufferObj           read_pbuffer;
+    struct gl_drawable      *read_foreign;
+    struct foreign_surface_binding *foreign_bindings;
+    struct foreign_surface_binding *draw_foreign_binding;
+    struct foreign_surface_binding *read_foreign_binding;
     int                     swap_interval;
 };
 
@@ -75,7 +84,58 @@ struct gl_drawable
 {
     struct opengl_drawable  base;
     CGLPBufferObj           pbuffer;
+    struct foreign_surface_target *foreign_target;
 };
+
+/* Framebuffer names are context-local even when their attachments are shared.
+ * Keep all Wine-owned GL state on the (native CGL context, HWND drawable)
+ * binding instead of publishing one drawable-global numeric FBO name. */
+struct foreign_surface_binding
+{
+    struct foreign_surface_binding *next;
+    struct macdrv_context  *context;
+    struct gl_drawable     *drawable;
+    struct foreign_surface_backing *backing;
+    GLuint                  application_draw_fbo;
+    GLuint                  application_read_fbo;
+    GLuint                  source_draw_fbo;
+    GLuint                  source_read_fbo;
+    GLuint                  color_renderbuffers[4];
+    GLuint                  color_textures[4];
+    GLuint                  depth_stencil;
+    GLuint                  resolve_depth_stencil;
+    GLuint                  present_textures[FOREIGN_SURFACE_BUFFER_COUNT];
+    GLuint                  present_fbos[FOREIGN_SURFACE_BUFFER_COUNT];
+};
+
+struct foreign_surface_backing
+{
+    LONG                    refs;
+    int                     format;
+    unsigned int            width;
+    unsigned int            height;
+    unsigned int            color_count;
+    IOSurfaceRef            color_surfaces[4];
+    IOSurfaceRef            present_surfaces[FOREIGN_SURFACE_BUFFER_COUNT];
+};
+
+struct foreign_surface_target
+{
+    struct foreign_surface_target *next;
+    LONG                    refs;
+    HWND                    hwnd;
+    DWORD                   owner_thread;
+    DWORD                   owner_process;
+    unsigned int            drawable_refs;
+    macdrv_iosurface_layer  layer;
+    struct foreign_surface_backing *current;
+    pthread_mutex_t         present_mutex;
+    unsigned int            present_count;
+    BOOL                    suspended;
+};
+
+static pthread_mutex_t foreign_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct foreign_surface_target *foreign_surface_targets;
 
 static struct gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
 {
@@ -88,6 +148,10 @@ static const struct opengl_driver_funcs macdrv_driver_funcs;
 static const struct opengl_drawable_funcs macdrv_surface_funcs;
 static const struct opengl_drawable_funcs macdrv_pbuffer_funcs;
 
+/* macOS cannot share objects between its legacy 2.1 compatibility profile and
+ * a 3.2/4.1 core profile.  Keep one internal share root per native profile
+ * instead of silently creating an unshared context and violating Wine's GL
+ * object-sharing contract. */
 static void (*pglCopyColorTable)(GLenum target, GLenum internalformat, GLint x, GLint y,
                                  GLsizei width);
 static void (*pglCopyPixels)(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type);
@@ -95,6 +159,7 @@ static const GLubyte *(*pglGetString)(GLenum name);
 static PFN_glGetIntegerv pglGetIntegerv;
 static void (*pglReadPixels)(GLint x, GLint y, GLsizei width, GLsizei height,
                              GLenum format, GLenum type, void *pixels);
+
 
 
 struct color_mode {
@@ -227,6 +292,7 @@ C_ASSERT(sizeof(((pixel_format_or_code*)0)->format) <= sizeof(((pixel_format_or_
 
 static pixel_format *pixel_formats;
 static int nb_formats, nb_displayable_formats;
+static CGLOpenGLProfile core_profile;
 
 
 static const char* debugstr_attrib(int attrib, int value)
@@ -1203,55 +1269,51 @@ static const pixel_format *get_pixel_format(int format, BOOL allow_nondisplayabl
 }
 
 
+static CGLContextObj init_context(CGLOpenGLProfile profile)
+{
+    CGLPixelFormatAttribute attribs[] =
+    {
+        kCGLPFADisplayMask, CGDisplayIDToOpenGLDisplayMask(CGMainDisplayID()),
+        kCGLPFAAccelerated, kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)profile, 0,
+    };
+    CGLPixelFormatObj pix;
+    CGLContextObj context;
+    GLint screens;
+    CGLError err;
+
+    if ((err = CGLChoosePixelFormat(attribs, &pix, &screens)) || !pix)
+    {
+        WARN("CGLChoosePixelFormat() failed with error %d %s\n", err, CGLErrorString(err));
+        return NULL;
+    }
+    if ((err = CGLCreateContext(pix, NULL, &context)) || !context)
+    {
+        WARN("CGLCreateContext() failed with error %d %s\n", err, CGLErrorString(err));
+        context = NULL;
+    }
+    CGLReleasePixelFormat(pix);
+
+    if ((err = CGLSetCurrentContext(context)))
+    {
+        WARN("CGLSetCurrentContext() failed with error %d %s\n", err, CGLErrorString(err));
+        CGLReleaseContext(context);
+        return NULL;
+    }
+
+    return context;
+}
+
 static BOOL init_gl_info(void)
 {
     static const char legacy_extensions[] = " WGL_EXT_extensions_string";
     static const char legacy_ext_swap_control[] = " WGL_EXT_swap_control";
 
-    CGDirectDisplayID display = CGMainDisplayID();
-    CGOpenGLDisplayMask displayMask = CGDisplayIDToOpenGLDisplayMask(display);
-    CGLPixelFormatAttribute attribs[] = {
-        kCGLPFADisplayMask, displayMask,
-        0
-    };
-    CGLPixelFormatAttribute core_attribs[] =
-    {
-        kCGLPFADisplayMask, displayMask,
-        kCGLPFAAccelerated,
-        kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_3_2_Core,
-        0
-    };
-    CGLPixelFormatObj pix;
-    GLint virtualScreens;
-    CGLError err;
     CGLContextObj context;
     CGLContextObj old_context = CGLGetCurrentContext();
     const char *str;
     size_t length;
 
-    err = CGLChoosePixelFormat(attribs, &pix, &virtualScreens);
-    if (err != kCGLNoError || !pix)
-    {
-        WARN("CGLChoosePixelFormat() failed with error %d %s\n", err, CGLErrorString(err));
-        return FALSE;
-    }
-
-    err = CGLCreateContext(pix, NULL, &context);
-    CGLReleasePixelFormat(pix);
-    if (err != kCGLNoError || !context)
-    {
-        WARN("CGLCreateContext() failed with error %d %s\n", err, CGLErrorString(err));
-        return FALSE;
-    }
-
-    err = CGLSetCurrentContext(context);
-    if (err != kCGLNoError)
-    {
-        WARN("CGLSetCurrentContext() failed with error %d %s\n", err, CGLErrorString(err));
-        CGLReleaseContext(context);
-        return FALSE;
-    }
-
+    if (!(context = init_context(kCGLOGLPVersion_Legacy))) return FALSE;
     str = (const char*)pglGetString(GL_EXTENSIONS);
     length = strlen(str) + sizeof(legacy_extensions);
     if (allow_vsync)
@@ -1271,38 +1333,23 @@ static BOOL init_gl_info(void)
 
     CGLSetCurrentContext(old_context);
     CGLReleaseContext(context);
+    core_profile = kCGLOGLPVersion_Legacy;
 
-    err = CGLChoosePixelFormat(core_attribs, &pix, &virtualScreens);
-    if (err != kCGLNoError || !pix)
-    {
-        WARN("CGLChoosePixelFormat() for a core context failed with error %d %s\n",
-             err, CGLErrorString(err));
-        return TRUE;
-    }
-
-    err = CGLCreateContext(pix, NULL, &context);
-    CGLReleasePixelFormat(pix);
-    if (err != kCGLNoError || !context)
-    {
-        WARN("CGLCreateContext() for a core context failed with error %d %s\n",
-             err, CGLErrorString(err));
-        return TRUE;
-    }
-
-    err = CGLSetCurrentContext(context);
-    if (err != kCGLNoError)
-    {
-        WARN("CGLSetCurrentContext() for a core context failed with error %d %s\n",
-             err, CGLErrorString(err));
-        CGLReleaseContext(context);
-        return TRUE;
-    }
-
+    if (!(context = init_context(kCGLOGLPVersion_GL3_Core))) return TRUE;
     str = (const char*)pglGetString(GL_VERSION);
-    TRACE("Core context GL version: %s\n", str);
+    TRACE("GL3_Core context version: %s\n", str);
     sscanf(str, "%u.%u", &gl_info.max_major, &gl_info.max_minor);
     CGLSetCurrentContext(old_context);
     CGLReleaseContext(context);
+    core_profile = kCGLOGLPVersion_GL3_Core;
+
+    if (!(context = init_context(kCGLOGLPVersion_GL4_Core))) return TRUE;
+    str = (const char*)pglGetString(GL_VERSION);
+    TRACE("GL4_Core context version: %s\n", str);
+    sscanf(str, "%u.%u", &gl_info.max_major, &gl_info.max_minor);
+    CGLSetCurrentContext(old_context);
+    CGLReleaseContext(context);
+    core_profile = kCGLOGLPVersion_GL4_Core;
 
     return TRUE;
 }
@@ -1311,7 +1358,7 @@ static BOOL init_gl_info(void)
 /**********************************************************************
  *              create_context
  */
-static BOOL create_context(struct macdrv_context *context, CGLContextObj share, unsigned int major)
+static BOOL create_context(struct macdrv_context *context, CGLContextObj share)
 {
     const pixel_format *pf;
     CGLPixelFormatAttribute attribs[64];
@@ -1319,7 +1366,6 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     CGLPixelFormatObj pix;
     GLint virtualScreens;
     CGLError err;
-    BOOL core = major >= 3;
 
     pf = get_pixel_format(context->format, TRUE /* non-displayable */);
     if (!pf)
@@ -1331,14 +1377,6 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
 
     attribs[n++] = kCGLPFAMinimumPolicy;
     attribs[n++] = kCGLPFAClosestPolicy;
-
-    if (context->renderer_id)
-    {
-        attribs[n++] = kCGLPFARendererID;
-        attribs[n++] = context->renderer_id;
-        attribs[n++] = kCGLPFASingleRenderer;
-        attribs[n++] = kCGLPFANoRecovery;
-    }
 
     if (pf->accelerated)
     {
@@ -1354,7 +1392,7 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     if (pf->double_buffer)
         attribs[n++] = kCGLPFADoubleBuffer;
 
-    if (!core)
+    if (!context->core)
     {
         attribs[n++] = kCGLPFAAuxBuffers;
         attribs[n++] = pf->aux_buffers;
@@ -1376,13 +1414,13 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     if (pf->stereo)
         attribs[n++] = kCGLPFAStereo;
 
-    if (pf->accum_mode && !core)
+    if (pf->accum_mode && !context->core)
     {
         attribs[n++] = kCGLPFAAccumSize;
         attribs[n++] = color_modes[pf->accum_mode - 1].color_bits;
     }
 
-    if (pf->pbuffer && !core)
+    if (pf->pbuffer && !context->core)
         attribs[n++] = kCGLPFAPBuffer;
 
     if (pf->sample_buffers && pf->samples)
@@ -1396,13 +1434,10 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     if (pf->backing_store)
         attribs[n++] = kCGLPFABackingStore;
 
-    if (core)
+    if (context->core)
     {
         attribs[n++] = kCGLPFAOpenGLProfile;
-        if (major == 3)
-            attribs[n++] = (int)kCGLOGLPVersion_GL3_Core;
-        else
-            attribs[n++] = (int)kCGLOGLPVersion_GL4_Core;
+        attribs[n++] = (CGLPixelFormatAttribute)core_profile;
     }
 
     attribs[n] = 0;
@@ -1416,12 +1451,6 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     }
 
     err = CGLCreateContext(pix, share, &context->cglcontext);
-    if (err == kCGLBadMatch && share)
-    {
-        WARN("CGLCreateContext() failed with incompatible share context; retrying without sharing\n");
-        context->cglcontext = NULL;
-        err = CGLCreateContext(pix, NULL, &context->cglcontext);
-    }
     CGLReleasePixelFormat(pix);
     if (err != kCGLNoError || !context->cglcontext)
     {
@@ -1461,13 +1490,850 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     return TRUE;
 }
 
+static void foreign_surface_backing_retain(struct foreign_surface_backing *backing)
+{
+    InterlockedIncrement(&backing->refs);
+}
+
+static void foreign_surface_backing_release(struct foreign_surface_backing *backing)
+{
+    unsigned int i;
+
+    if (!backing || InterlockedDecrement(&backing->refs)) return;
+    for (i = 0; i < ARRAY_SIZE(backing->color_surfaces); i++)
+        if (backing->color_surfaces[i]) CFRelease(backing->color_surfaces[i]);
+    for (i = 0; i < ARRAY_SIZE(backing->present_surfaces); i++)
+        if (backing->present_surfaces[i]) CFRelease(backing->present_surfaces[i]);
+    free(backing);
+}
+
+static void foreign_surface_target_retain(struct foreign_surface_target *target)
+{
+    InterlockedIncrement(&target->refs);
+}
+
+static void foreign_surface_target_release(struct foreign_surface_target *target)
+{
+    if (!target || InterlockedDecrement(&target->refs)) return;
+    if (target->layer) macdrv_destroy_iosurface_layer(target->layer);
+    foreign_surface_backing_release(target->current);
+    pthread_mutex_destroy(&target->present_mutex);
+    free(target);
+}
+
+static void foreign_surface_set_number(CFMutableDictionaryRef properties, CFStringRef key,
+                                       SInt64 value)
+{
+    CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt64Type, &value);
+
+    if (number)
+    {
+        CFDictionarySetValue(properties, key, number);
+        CFRelease(number);
+    }
+}
+
+static BOOL foreign_surface_initialize_iosurface(IOSurfaceRef surface)
+{
+    void *base;
+    size_t size;
+    kern_return_t ret;
+
+    if ((ret = IOSurfaceLock(surface, 0, NULL)) != KERN_SUCCESS)
+    {
+        WARN("Failed to lock new foreign IOSurface: %#x\n", ret);
+        return FALSE;
+    }
+    base = IOSurfaceGetBaseAddress(surface);
+    size = IOSurfaceGetAllocSize(surface);
+    if (base && size) memset(base, 0, size);
+    ret = IOSurfaceUnlock(surface, 0, NULL);
+    if (ret != KERN_SUCCESS)
+        WARN("Failed to unlock new foreign IOSurface: %#x\n", ret);
+    return base && size && ret == KERN_SUCCESS;
+}
+
+static struct foreign_surface_backing *foreign_surface_backing_create(int format,
+                                                                       unsigned int width,
+                                                                       unsigned int height)
+{
+    const pixel_format *pf = get_pixel_format(format, TRUE);
+    struct foreign_surface_backing *backing;
+    CFMutableDictionaryRef properties;
+    unsigned int i;
+
+    if (!pf || !width || !height) return NULL;
+    if (!(backing = calloc(1, sizeof(*backing)))) return NULL;
+    backing->refs = 1;
+    backing->format = format;
+    backing->width = width;
+    backing->height = height;
+    backing->color_count = (pf->double_buffer ? 2 : 1) * (pf->stereo ? 2 : 1);
+
+    properties = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                           &kCFTypeDictionaryValueCallBacks);
+    if (!properties) goto failed;
+    foreign_surface_set_number(properties, kIOSurfaceWidth, width);
+    foreign_surface_set_number(properties, kIOSurfaceHeight, height);
+    foreign_surface_set_number(properties, kIOSurfaceBytesPerElement, 4);
+    foreign_surface_set_number(properties, kIOSurfacePixelFormat, 0x42475241 /* BGRA */);
+    for (i = 0; i < backing->color_count; i++)
+    {
+        backing->color_surfaces[i] = IOSurfaceCreate(properties);
+        if (!backing->color_surfaces[i]) break;
+    }
+    if (i == backing->color_count)
+    {
+        for (i = 0; i < ARRAY_SIZE(backing->present_surfaces); i++)
+        {
+            backing->present_surfaces[i] = IOSurfaceCreate(properties);
+            if (!backing->present_surfaces[i]) break;
+        }
+    }
+    CFRelease(properties);
+    if (!backing->color_surfaces[backing->color_count - 1] ||
+        !backing->present_surfaces[ARRAY_SIZE(backing->present_surfaces) - 1])
+    {
+        WARN("Failed to allocate persistent color/presentation IOSurfaces for %ux%u foreign target\n",
+             width, height);
+        goto failed;
+    }
+    for (i = 0; i < backing->color_count; i++)
+        if (!foreign_surface_initialize_iosurface(backing->color_surfaces[i])) goto failed;
+    for (i = 0; i < ARRAY_SIZE(backing->present_surfaces); i++)
+        if (!foreign_surface_initialize_iosurface(backing->present_surfaces[i])) goto failed;
+
+    return backing;
+
+failed:
+    foreign_surface_backing_release(backing);
+    return NULL;
+}
+
+static BOOL foreign_surface_query_window(HWND hwnd, DWORD *owner_thread, DWORD *owner_process,
+                                         unsigned int *width, unsigned int *height)
+{
+    RECT rect;
+
+    if (!NtUserIsWindow(hwnd) || !(*owner_thread = NtUserGetWindowThread(hwnd, owner_process)) || !*owner_process ||
+        !NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI)))
+        return FALSE;
+
+    *width = max(0, rect.right - rect.left);
+    *height = max(0, rect.bottom - rect.top);
+    return TRUE;
+}
+
+static BOOL foreign_surface_target_acquire(HWND hwnd, int format,
+                                           struct foreign_surface_target **target_ret)
+{
+    struct foreign_surface_target **entry, *target = NULL, *stale = NULL;
+    struct foreign_surface_backing *backing = NULL;
+    BOOL new_target = FALSE;
+    DWORD owner_thread, owner_process;
+    unsigned int width, height;
+
+    *target_ret = NULL;
+    if (!foreign_surface_query_window(hwnd, &owner_thread, &owner_process, &width, &height)) return FALSE;
+    pthread_mutex_lock(&foreign_surface_mutex);
+    for (entry = &foreign_surface_targets; *entry; entry = &(*entry)->next)
+    {
+        if ((*entry)->hwnd != hwnd) continue;
+        /* The compositor host is a replaceable presentation endpoint.  It can
+         * appear after the GPU drawable, or change during fullscreen and
+         * owned-popup transitions, without changing the Win32 drawable. */
+        if ((*entry)->owner_thread == owner_thread && (*entry)->owner_process == owner_process)
+        {
+            target = *entry;
+            break;
+        }
+
+        stale = *entry;
+        *entry = stale->next;
+        stale->next = NULL;
+        break;
+    }
+
+    if (!target)
+    {
+        if ((width && height && !(backing = foreign_surface_backing_create(format, width, height))) ||
+            !(target = calloc(1, sizeof(*target))))
+            goto failed_locked;
+        new_target = TRUE;
+
+        target->refs = 1; /* registry ownership */
+        target->hwnd = hwnd;
+        target->owner_thread = owner_thread;
+        target->owner_process = owner_process;
+        target->drawable_refs = 0;
+        target->current = backing;
+        target->suspended = !backing;
+        pthread_mutex_init(&target->present_mutex, NULL);
+        if (!(target->layer = macdrv_create_iosurface_layer(
+                  hwnd, CGRectMake(0, 0, width, height),
+                  NtUserGetAncestor(hwnd, GA_ROOTOWNER) == hwnd)))
+            goto failed_locked;
+
+        target->next = foreign_surface_targets;
+        foreign_surface_targets = target;
+        TRACE("Created persistent windowless target %p hwnd %p size %ux%u format %d\n",
+              target, hwnd, width, height, format);
+    }
+    target->drawable_refs++;
+    foreign_surface_target_retain(target);
+    pthread_mutex_unlock(&foreign_surface_mutex);
+
+    foreign_surface_target_release(stale);
+    *target_ret = target;
+    return TRUE;
+
+failed_locked:
+    pthread_mutex_unlock(&foreign_surface_mutex);
+    foreign_surface_target_release(stale);
+    if (new_target)
+        foreign_surface_target_release(target);
+    else if (!target) foreign_surface_backing_release(backing);
+    return FALSE;
+}
+
+static void foreign_surface_target_remove(struct foreign_surface_target *target)
+{
+    struct foreign_surface_target **entry;
+    BOOL removed = FALSE;
+
+    pthread_mutex_lock(&foreign_surface_mutex);
+    for (entry = &foreign_surface_targets; *entry; entry = &(*entry)->next)
+    {
+        if (*entry != target) continue;
+        *entry = target->next;
+        target->next = NULL;
+        removed = TRUE;
+        break;
+    }
+    pthread_mutex_unlock(&foreign_surface_mutex);
+    if (removed) foreign_surface_target_release(target);
+}
+
+static void foreign_surface_target_detach_drawable(struct foreign_surface_target *target)
+{
+    struct foreign_surface_target **entry;
+    BOOL removed = FALSE;
+
+    if (!target) return;
+    pthread_mutex_lock(&foreign_surface_mutex);
+    if (target->drawable_refs && !--target->drawable_refs)
+    {
+        for (entry = &foreign_surface_targets; *entry; entry = &(*entry)->next)
+        {
+            if (*entry != target) continue;
+            *entry = target->next;
+            target->next = NULL;
+            removed = TRUE;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&foreign_surface_mutex);
+
+    /* win32u retains the current/unused drawable across temporary HDC and
+       context detachments.  Once the final drawable reference reaches this
+       driver, no producer can present again; drop the registry ownership so
+       the CA layer and every IOSurface generation are released. */
+    if (removed) foreign_surface_target_release(target); /* registry ownership */
+    foreign_surface_target_release(target); /* drawable reference */
+}
+
+static void foreign_surface_map_default_buffers(struct opengl_drawable *drawable)
+{
+    opengl_drawable_map_buffer(drawable, GL_FRONT_LEFT, GL_COLOR_ATTACHMENT0);
+    opengl_drawable_map_buffer(drawable, GL_FRONT, GL_COLOR_ATTACHMENT0);
+    opengl_drawable_map_buffer(drawable, GL_LEFT, GL_COLOR_ATTACHMENT0);
+    opengl_drawable_map_buffer(drawable, GL_FRONT_AND_BACK, GL_COLOR_ATTACHMENT0);
+    if (drawable->doublebuffer)
+    {
+        opengl_drawable_map_buffer(drawable, GL_BACK_LEFT, GL_COLOR_ATTACHMENT1);
+        opengl_drawable_map_buffer(drawable, GL_BACK, GL_COLOR_ATTACHMENT1);
+    }
+    if (drawable->stereo)
+    {
+        GLenum right = drawable->doublebuffer ? GL_COLOR_ATTACHMENT2 : GL_COLOR_ATTACHMENT1;
+
+        opengl_drawable_map_buffer(drawable, GL_FRONT_RIGHT, right);
+        opengl_drawable_map_buffer(drawable, GL_RIGHT, right);
+        if (drawable->doublebuffer)
+            opengl_drawable_map_buffer(drawable, GL_BACK_RIGHT, GL_COLOR_ATTACHMENT3);
+    }
+}
+
+static struct foreign_surface_binding *foreign_surface_binding_find(
+    struct macdrv_context *context, struct gl_drawable *gl)
+{
+    struct foreign_surface_binding *binding;
+
+    for (binding = context->foreign_bindings; binding; binding = binding->next)
+        if (binding->drawable == gl) return binding;
+    return NULL;
+}
+
+static void foreign_surface_binding_attach(struct foreign_surface_binding *binding,
+                                           const pixel_format *pf,
+                                           const GLuint textures[4],
+                                           const GLuint renderbuffers[4], GLuint depth_stencil,
+                                           GLuint resolve_depth_stencil)
+{
+    unsigned int color_count = (binding->drawable->base.doublebuffer ? 2 : 1) *
+                               (binding->drawable->base.stereo ? 2 : 1);
+    unsigned int i;
+
+    funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, binding->application_read_fbo);
+    for (i = 0; i < color_count; i++)
+        funcs->p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i,
+                                        GL_TEXTURE_RECTANGLE, textures[i], 0);
+
+    if (!pf->sample_buffers || !pf->samples)
+    {
+        if (pf->depth_bits)
+            funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                               GL_RENDERBUFFER, depth_stencil);
+        if (pf->stencil_bits)
+            funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                               GL_RENDERBUFFER, depth_stencil);
+        return;
+    }
+
+    funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, binding->application_draw_fbo);
+    for (i = 0; i < color_count; i++)
+        funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i,
+                                           GL_RENDERBUFFER, renderbuffers[i]);
+    if (pf->stencil_bits)
+        funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                           GL_RENDERBUFFER, depth_stencil);
+    if (pf->depth_bits)
+        funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                           GL_RENDERBUFFER, depth_stencil);
+
+    funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, binding->application_read_fbo);
+    if (pf->stencil_bits)
+        funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                           GL_RENDERBUFFER, resolve_depth_stencil);
+    if (pf->depth_bits)
+        funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                           GL_RENDERBUFFER, resolve_depth_stencil);
+}
+
+static BOOL foreign_surface_binding_check(struct foreign_surface_binding *binding,
+                                          const pixel_format *pf)
+{
+    GLenum status;
+
+    funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, binding->application_read_fbo);
+    status = funcs->p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE)
+    {
+        WARN("Foreign application read framebuffer incomplete for hwnd %p context %p: %#x\n",
+             binding->drawable->foreign_target->hwnd, binding->context, status);
+        return FALSE;
+    }
+    if (!pf->sample_buffers || !pf->samples) return TRUE;
+
+    funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, binding->application_draw_fbo);
+    status = funcs->p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE)
+    {
+        WARN("Foreign application draw framebuffer incomplete for hwnd %p context %p: %#x\n",
+             binding->drawable->foreign_target->hwnd, binding->context, status);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void foreign_surface_binding_delete_objects(struct foreign_surface_binding *binding)
+{
+    if (binding->application_draw_fbo &&
+        binding->application_draw_fbo != binding->application_read_fbo)
+        funcs->p_glDeleteFramebuffers(1, &binding->application_draw_fbo);
+    if (binding->application_read_fbo)
+        funcs->p_glDeleteFramebuffers(1, &binding->application_read_fbo);
+    if (binding->source_draw_fbo && binding->source_draw_fbo != binding->source_read_fbo)
+        funcs->p_glDeleteFramebuffers(1, &binding->source_draw_fbo);
+    if (binding->source_read_fbo)
+        funcs->p_glDeleteFramebuffers(1, &binding->source_read_fbo);
+    funcs->p_glDeleteRenderbuffers(ARRAY_SIZE(binding->color_renderbuffers),
+                                   binding->color_renderbuffers);
+    if (binding->depth_stencil)
+        funcs->p_glDeleteRenderbuffers(1, &binding->depth_stencil);
+    if (binding->resolve_depth_stencil)
+        funcs->p_glDeleteRenderbuffers(1, &binding->resolve_depth_stencil);
+    funcs->p_glDeleteTextures(ARRAY_SIZE(binding->color_textures),
+                              binding->color_textures);
+    funcs->p_glDeleteFramebuffers(ARRAY_SIZE(binding->present_fbos),
+                                  binding->present_fbos);
+    funcs->p_glDeleteTextures(ARRAY_SIZE(binding->present_textures),
+                              binding->present_textures);
+}
+
+static BOOL foreign_surface_binding_refresh(struct macdrv_context *context,
+                                            struct gl_drawable *gl,
+                                            struct foreign_surface_backing *backing,
+                                            BOOL copy_previous_contents,
+                                            struct foreign_surface_binding **binding_ret)
+{
+    const pixel_format *pf = get_pixel_format(gl->base.format, TRUE);
+    struct foreign_surface_binding *binding = foreign_surface_binding_find(context, gl);
+    struct foreign_surface_backing *old_backing;
+    GLuint textures[4] = {0}, renderbuffers[4] = {0};
+    GLuint present_textures[FOREIGN_SURFACE_BUFFER_COUNT] = {0};
+    GLuint present_fbos[FOREIGN_SURFACE_BUFFER_COUNT] = {0};
+    GLuint depth_stencil = 0, resolve_depth_stencil = 0;
+    GLuint candidate_read_fbo = 0, candidate_draw_fbo = 0;
+    GLint old_read_fbo = 0, old_draw_fbo = 0;
+    GLint old_active_texture = 0, old_rectangle_texture = 0, old_renderbuffer = 0;
+    GLboolean scissor_enabled, framebuffer_srgb_enabled;
+    unsigned int color_count, i;
+    GLenum depth_format = 0, status;
+    BOOL created = FALSE, committed = FALSE;
+    CGLError err;
+
+    *binding_ret = NULL;
+    if (!pf || !backing) return FALSE;
+    if (binding && binding->backing == backing)
+    {
+        *binding_ret = binding;
+        return TRUE;
+    }
+    if ((err = CGLSetCurrentContext(context->cglcontext)) != kCGLNoError)
+    {
+        WARN("Failed to make application context current for foreign hwnd %p: %d %s\n",
+             gl->foreign_target->hwnd, err, CGLErrorString(err));
+        return FALSE;
+    }
+    CGLClearDrawable(context->cglcontext);
+
+    if (!binding)
+    {
+        if (!(binding = calloc(1, sizeof(*binding)))) return FALSE;
+        binding->context = context;
+        binding->drawable = gl;
+        opengl_drawable_add_ref(&gl->base);
+        created = TRUE;
+    }
+
+    funcs->p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read_fbo);
+    funcs->p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw_fbo);
+    funcs->p_glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active_texture);
+    funcs->p_glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &old_rectangle_texture);
+    funcs->p_glGetIntegerv(GL_RENDERBUFFER_BINDING, &old_renderbuffer);
+    scissor_enabled = funcs->p_glIsEnabled(GL_SCISSOR_TEST);
+    framebuffer_srgb_enabled = funcs->p_glIsEnabled(GL_FRAMEBUFFER_SRGB);
+    funcs->p_glDisable(GL_SCISSOR_TEST);
+    funcs->p_glDisable(GL_FRAMEBUFFER_SRGB);
+
+    color_count = (gl->base.doublebuffer ? 2 : 1) * (gl->base.stereo ? 2 : 1);
+    funcs->p_glGenTextures(color_count, textures);
+    for (i = 0; i < color_count; i++)
+    {
+        funcs->p_glBindTexture(GL_TEXTURE_RECTANGLE, textures[i]);
+        funcs->p_glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        funcs->p_glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        funcs->p_glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        funcs->p_glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        err = CGLTexImageIOSurface2D(context->cglcontext, GL_TEXTURE_RECTANGLE, GL_RGBA8,
+                                     backing->width, backing->height, GL_BGRA,
+                                     GL_UNSIGNED_INT_8_8_8_8_REV,
+                                     backing->color_surfaces[i], 0);
+        if (err != kCGLNoError)
+        {
+            WARN("CGLTexImageIOSurface2D failed for application color buffer %u hwnd %p: %d %s\n",
+                 i, gl->foreign_target->hwnd, err, CGLErrorString(err));
+            goto done;
+        }
+    }
+
+    if (pf->sample_buffers && pf->samples)
+    {
+        funcs->p_glGenRenderbuffers(color_count, renderbuffers);
+        for (i = 0; i < color_count; i++)
+        {
+            funcs->p_glBindRenderbuffer(GL_RENDERBUFFER, renderbuffers[i]);
+            funcs->p_glRenderbufferStorageMultisample(GL_RENDERBUFFER, pf->samples, GL_RGBA8,
+                                                      backing->width, backing->height);
+        }
+    }
+    if (pf->depth_bits || pf->stencil_bits)
+    {
+        if (pf->depth_bits && pf->stencil_bits) depth_format = GL_DEPTH24_STENCIL8;
+        else if (pf->stencil_bits) depth_format = GL_STENCIL_INDEX8;
+        else if (pf->depth_bits <= 16) depth_format = GL_DEPTH_COMPONENT16;
+        else depth_format = GL_DEPTH_COMPONENT24;
+
+        funcs->p_glGenRenderbuffers(1, &depth_stencil);
+        funcs->p_glBindRenderbuffer(GL_RENDERBUFFER, depth_stencil);
+        if (pf->sample_buffers && pf->samples)
+            funcs->p_glRenderbufferStorageMultisample(GL_RENDERBUFFER, pf->samples, depth_format,
+                                                      backing->width, backing->height);
+        else
+            funcs->p_glRenderbufferStorage(GL_RENDERBUFFER, depth_format,
+                                           backing->width, backing->height);
+
+        if (pf->sample_buffers && pf->samples)
+        {
+            funcs->p_glGenRenderbuffers(1, &resolve_depth_stencil);
+            funcs->p_glBindRenderbuffer(GL_RENDERBUFFER, resolve_depth_stencil);
+            funcs->p_glRenderbufferStorage(GL_RENDERBUFFER, depth_format,
+                                           backing->width, backing->height);
+        }
+    }
+
+    funcs->p_glGenFramebuffers(1, &candidate_read_fbo);
+    if (pf->sample_buffers && pf->samples)
+        funcs->p_glGenFramebuffers(1, &candidate_draw_fbo);
+    else
+        candidate_draw_fbo = candidate_read_fbo;
+
+    {
+        struct foreign_surface_binding candidate = *binding;
+
+        candidate.application_read_fbo = candidate_read_fbo;
+        candidate.application_draw_fbo = candidate_draw_fbo;
+        foreign_surface_binding_attach(&candidate, pf, textures, renderbuffers,
+                                       depth_stencil, resolve_depth_stencil);
+        if (!foreign_surface_binding_check(&candidate, pf)) goto done;
+    }
+
+    funcs->p_glGenTextures(ARRAY_SIZE(present_textures), present_textures);
+    funcs->p_glGenFramebuffers(ARRAY_SIZE(present_fbos), present_fbos);
+    for (i = 0; i < ARRAY_SIZE(present_textures); i++)
+    {
+        funcs->p_glBindTexture(GL_TEXTURE_RECTANGLE, present_textures[i]);
+        funcs->p_glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        funcs->p_glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        funcs->p_glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        funcs->p_glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        err = CGLTexImageIOSurface2D(context->cglcontext, GL_TEXTURE_RECTANGLE, GL_RGBA8,
+                                     backing->width, backing->height, GL_BGRA,
+                                     GL_UNSIGNED_INT_8_8_8_8_REV,
+                                     backing->present_surfaces[i], 0);
+        if (err != kCGLNoError)
+        {
+            WARN("CGLTexImageIOSurface2D failed for presentation buffer %u hwnd %p: %d %s\n",
+                 i, gl->foreign_target->hwnd, err, CGLErrorString(err));
+            goto done;
+        }
+
+        funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, present_fbos[i]);
+        funcs->p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                        GL_TEXTURE_RECTANGLE, present_textures[i], 0);
+        funcs->p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        funcs->p_glReadBuffer(GL_COLOR_ATTACHMENT0);
+        status = funcs->p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE)
+        {
+            WARN("Foreign presentation framebuffer incomplete for hwnd %p slot %u: %#x\n",
+                 gl->foreign_target->hwnd, i, status);
+            goto done;
+        }
+    }
+
+    /* IOSurface contents belong to the backing generation, not to a context
+       binding.  New surfaces were initialized once at allocation.  Only the
+       context that owns a private, not-yet-published resize candidate may seed
+       it from the previous complete generation.  Attaching another context to
+       an already-published backing must never clear or overwrite its pixels. */
+    if (copy_previous_contents && binding->backing)
+    {
+        unsigned int copy_width = min(binding->backing->width, backing->width);
+        unsigned int copy_height = min(binding->backing->height, backing->height);
+        GLenum mask = GL_COLOR_BUFFER_BIT;
+
+        if (pf->depth_bits) mask |= GL_DEPTH_BUFFER_BIT;
+        if (pf->stencil_bits) mask |= GL_STENCIL_BUFFER_BIT;
+
+        if (binding->application_draw_fbo != binding->application_read_fbo)
+        {
+            funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, binding->source_draw_fbo);
+            funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, binding->source_read_fbo);
+            for (i = 0; i < color_count; i++)
+            {
+                funcs->p_glReadBuffer(GL_COLOR_ATTACHMENT0 + i);
+                funcs->p_glDrawBuffer(GL_COLOR_ATTACHMENT0 + i);
+                funcs->p_glBlitFramebuffer(0, 0, binding->backing->width,
+                                           binding->backing->height,
+                                           0, 0, binding->backing->width,
+                                           binding->backing->height,
+                                           mask, GL_NEAREST);
+                mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+            }
+        }
+
+        funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, binding->source_read_fbo);
+        funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, candidate_read_fbo);
+        for (i = 0; i < color_count; i++)
+        {
+            funcs->p_glReadBuffer(GL_COLOR_ATTACHMENT0 + i);
+            funcs->p_glDrawBuffer(GL_COLOR_ATTACHMENT0 + i);
+            funcs->p_glBlitFramebuffer(0, 0, copy_width, copy_height,
+                                       0, 0, copy_width, copy_height,
+                                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+
+    if (!binding->application_read_fbo)
+    {
+        funcs->p_glGenFramebuffers(1, &binding->application_read_fbo);
+        if (pf->sample_buffers && pf->samples)
+            funcs->p_glGenFramebuffers(1, &binding->application_draw_fbo);
+        else
+            binding->application_draw_fbo = binding->application_read_fbo;
+    }
+    foreign_surface_binding_attach(binding, pf, textures, renderbuffers,
+                                   depth_stencil, resolve_depth_stencil);
+    if (!foreign_surface_binding_check(binding, pf))
+    {
+        if (binding->backing)
+            foreign_surface_binding_attach(binding, pf, binding->color_textures,
+                                           binding->color_renderbuffers,
+                                           binding->depth_stencil,
+                                           binding->resolve_depth_stencil);
+        goto done;
+    }
+
+    if (created)
+    {
+        GLenum initial_buffer = gl->base.doublebuffer ? GL_COLOR_ATTACHMENT1 :
+                                                       GL_COLOR_ATTACHMENT0;
+
+        funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, binding->application_draw_fbo);
+        funcs->p_glDrawBuffer(initial_buffer);
+        funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, binding->application_read_fbo);
+        funcs->p_glReadBuffer(initial_buffer);
+    }
+
+    funcs->p_glFlush();
+    funcs->p_glDeleteRenderbuffers(ARRAY_SIZE(binding->color_renderbuffers),
+                                   binding->color_renderbuffers);
+    if (binding->depth_stencil)
+        funcs->p_glDeleteRenderbuffers(1, &binding->depth_stencil);
+    if (binding->resolve_depth_stencil)
+        funcs->p_glDeleteRenderbuffers(1, &binding->resolve_depth_stencil);
+    funcs->p_glDeleteTextures(ARRAY_SIZE(binding->color_textures),
+                              binding->color_textures);
+    if (binding->source_draw_fbo && binding->source_draw_fbo != binding->source_read_fbo)
+        funcs->p_glDeleteFramebuffers(1, &binding->source_draw_fbo);
+    if (binding->source_read_fbo)
+        funcs->p_glDeleteFramebuffers(1, &binding->source_read_fbo);
+    funcs->p_glDeleteFramebuffers(ARRAY_SIZE(binding->present_fbos),
+                                  binding->present_fbos);
+    funcs->p_glDeleteTextures(ARRAY_SIZE(binding->present_textures),
+                              binding->present_textures);
+
+    memcpy(binding->color_textures, textures, sizeof(textures));
+    memcpy(binding->color_renderbuffers, renderbuffers, sizeof(renderbuffers));
+    memcpy(binding->present_textures, present_textures, sizeof(present_textures));
+    memcpy(binding->present_fbos, present_fbos, sizeof(present_fbos));
+    binding->source_read_fbo = candidate_read_fbo;
+    binding->source_draw_fbo = candidate_draw_fbo;
+    binding->depth_stencil = depth_stencil;
+    binding->resolve_depth_stencil = resolve_depth_stencil;
+    memset(textures, 0, sizeof(textures));
+    memset(renderbuffers, 0, sizeof(renderbuffers));
+    memset(present_textures, 0, sizeof(present_textures));
+    memset(present_fbos, 0, sizeof(present_fbos));
+    candidate_read_fbo = candidate_draw_fbo = 0;
+    depth_stencil = resolve_depth_stencil = 0;
+
+    foreign_surface_backing_retain(backing);
+    old_backing = binding->backing;
+    binding->backing = backing;
+    foreign_surface_backing_release(old_backing);
+    if (created)
+    {
+        binding->next = context->foreign_bindings;
+        context->foreign_bindings = binding;
+    }
+    committed = TRUE;
+
+done:
+    if (candidate_draw_fbo && candidate_draw_fbo != candidate_read_fbo)
+        funcs->p_glDeleteFramebuffers(1, &candidate_draw_fbo);
+    if (candidate_read_fbo)
+        funcs->p_glDeleteFramebuffers(1, &candidate_read_fbo);
+    funcs->p_glDeleteRenderbuffers(ARRAY_SIZE(renderbuffers), renderbuffers);
+    if (depth_stencil)
+        funcs->p_glDeleteRenderbuffers(1, &depth_stencil);
+    if (resolve_depth_stencil)
+        funcs->p_glDeleteRenderbuffers(1, &resolve_depth_stencil);
+    funcs->p_glDeleteTextures(ARRAY_SIZE(textures), textures);
+    funcs->p_glDeleteFramebuffers(ARRAY_SIZE(present_fbos), present_fbos);
+    funcs->p_glDeleteTextures(ARRAY_SIZE(present_textures), present_textures);
+
+    funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, old_read_fbo);
+    funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, old_draw_fbo);
+    funcs->p_glActiveTexture(old_active_texture);
+    funcs->p_glBindTexture(GL_TEXTURE_RECTANGLE, old_rectangle_texture);
+    funcs->p_glBindRenderbuffer(GL_RENDERBUFFER, old_renderbuffer);
+    if (scissor_enabled) funcs->p_glEnable(GL_SCISSOR_TEST);
+    else funcs->p_glDisable(GL_SCISSOR_TEST);
+    if (framebuffer_srgb_enabled) funcs->p_glEnable(GL_FRAMEBUFFER_SRGB);
+    else funcs->p_glDisable(GL_FRAMEBUFFER_SRGB);
+
+    if (!committed && created)
+    {
+        foreign_surface_binding_delete_objects(binding);
+        opengl_drawable_release(&gl->base);
+        free(binding);
+        binding = NULL;
+    }
+    *binding_ret = committed ? binding : NULL;
+    return committed;
+}
+static BOOL foreign_surface_drawable_refresh(struct macdrv_context *context,
+                                             struct gl_drawable *gl)
+{
+    struct foreign_surface_target *target = gl->foreign_target;
+    struct foreign_surface_binding *binding;
+    DWORD owner_thread, owner_process;
+    unsigned int width, height;
+
+    for (;;)
+    {
+        struct foreign_surface_backing *candidate = NULL, *current = NULL, *old_target = NULL;
+        DWORD verified_owner_thread, verified_owner_process;
+        unsigned int verified_width, verified_height;
+        BOOL use_published_generation = FALSE;
+
+        if (!target ||
+            !foreign_surface_query_window(target->hwnd, &owner_thread, &owner_process, &width, &height) ||
+            owner_thread != target->owner_thread || owner_process != target->owner_process)
+        {
+            if (target) foreign_surface_target_remove(target);
+            return FALSE;
+        }
+        /* A zero-sized client rect is a suspended HWND generation, not a tiny
+           replacement surface.  Preserve the last complete binding so a hide,
+           fullscreen transition, or popup reparent cannot erase the window. */
+        if (!width || !height)
+        {
+            pthread_mutex_lock(&target->present_mutex);
+            target->suspended = TRUE;
+            binding = foreign_surface_binding_find(context, gl);
+            pthread_mutex_unlock(&target->present_mutex);
+            return binding && binding->backing;
+        }
+
+        pthread_mutex_lock(&target->present_mutex);
+        if (target->current && target->current->format == gl->base.format &&
+            target->current->width == width && target->current->height == height)
+        {
+            current = target->current;
+            foreign_surface_backing_retain(current);
+        }
+        pthread_mutex_unlock(&target->present_mutex);
+
+        if (!current)
+        {
+            if (!(candidate = foreign_surface_backing_create(gl->base.format, width, height)))
+                return FALSE;
+
+            pthread_mutex_lock(&target->present_mutex);
+            if (target->current && target->current->format == gl->base.format &&
+                target->current->width == width && target->current->height == height)
+                current = target->current;
+            else
+                current = candidate;
+            foreign_surface_backing_retain(current);
+            pthread_mutex_unlock(&target->present_mutex);
+        }
+
+        /* IOSurface allocation, texture mapping, frame preservation, and FBO
+           validation deliberately run without the target lock.  The old
+           complete generation remains presentable while a live resize builds
+           the candidate, avoiding the window-move stalls of the old model. */
+        if (!foreign_surface_binding_refresh(context, gl, current, current == candidate, &binding))
+        {
+            foreign_surface_backing_release(current);
+            foreign_surface_backing_release(candidate);
+            return FALSE;
+        }
+
+        if (!foreign_surface_query_window(target->hwnd, &verified_owner_thread, &verified_owner_process,
+                                          &verified_width, &verified_height) ||
+            verified_owner_thread != owner_thread || verified_owner_process != owner_process)
+        {
+            foreign_surface_backing_release(current);
+            foreign_surface_backing_release(candidate);
+            return FALSE;
+        }
+        if (verified_width != width || verified_height != height)
+        {
+            if (!verified_width || !verified_height)
+            {
+                pthread_mutex_lock(&target->present_mutex);
+                target->suspended = TRUE;
+                pthread_mutex_unlock(&target->present_mutex);
+            }
+            /* Do not chase every intermediate live-resize size in one call.
+               Keep the published complete frame; the next flush prepares the
+               newest geometry and can copy from this already-built binding. */
+            foreign_surface_backing_release(current);
+            foreign_surface_backing_release(candidate);
+            return TRUE;
+        }
+
+        pthread_mutex_lock(&target->present_mutex);
+        if (target->current != current && target->current &&
+            target->current->format == gl->base.format &&
+            target->current->width == width && target->current->height == height)
+        {
+            /* Another context published an equivalent generation while this
+               binding was prepared.  Remap to that authoritative IOSurface
+               rather than maintaining two current generations for one HWND. */
+            use_published_generation = TRUE;
+        }
+        else if (target->current != current)
+        {
+            old_target = target->current;
+            foreign_surface_backing_retain(current);
+            target->current = current;
+            TRACE("Committed foreign IOSurface generation hwnd %p size %ux%u format %d\n",
+                  target->hwnd, width, height, gl->base.format);
+        }
+        if (!use_published_generation) target->suspended = FALSE;
+        pthread_mutex_unlock(&target->present_mutex);
+
+        foreign_surface_backing_release(old_target);
+        foreign_surface_backing_release(current);
+        foreign_surface_backing_release(candidate);
+        if (use_published_generation) continue;
+        return TRUE;
+    }
+}
 static BOOL macdrv_surface_create(struct client_surface *client, int format, struct opengl_drawable **drawable)
 {
     struct macdrv_win_data *data;
     HWND hwnd = client->hwnd;
+    struct macdrv_client_surface *surface = impl_from_client_surface(client);
     struct gl_drawable *gl;
 
     TRACE("client %s, format %d, drawable %p\n", debugstr_client_surface(client), format, drawable);
+
+    if (surface->windowless_hwnd)
+    {
+        struct foreign_surface_target *target;
+
+        if (!foreign_surface_target_acquire(hwnd, format, &target))
+        {
+            WARN("Failed to create windowless foreign GPU target hwnd %p format %d\n", hwnd, format);
+            return FALSE;
+        }
+        if (!(gl = opengl_drawable_create(sizeof(*gl), &macdrv_surface_funcs, format, client)))
+        {
+            foreign_surface_target_detach_drawable(target);
+            return FALSE;
+        }
+        gl->foreign_target = target;
+        foreign_surface_map_default_buffers(&gl->base);
+        *drawable = &gl->base;
+        return TRUE;
+    }
 
     if (!(data = get_win_data(hwnd)))
     {
@@ -1484,7 +2350,11 @@ static BOOL macdrv_surface_create(struct client_surface *client, int format, str
 
 static void macdrv_surface_destroy(struct opengl_drawable *base)
 {
+    struct gl_drawable *gl = impl_from_opengl_drawable(base);
+
     TRACE("drawable %s\n", debugstr_opengl_drawable(base));
+
+    if (gl->foreign_target) foreign_surface_target_detach_drawable(gl->foreign_target);
 }
 
 /**********************************************************************
@@ -1509,7 +2379,22 @@ static void make_context_current(struct macdrv_context *context, BOOL read)
         pbuffer = context->draw_pbuffer;
     }
 
-    if (view || !pbuffer)
+    if (context->draw_foreign || context->read_foreign)
+    {
+        GLint enabled;
+
+        if (CGLIsEnabled(context->cglcontext, kCGLCESurfaceBackingSize, &enabled) == kCGLNoError && enabled)
+            CGLDisable(context->cglcontext, kCGLCESurfaceBackingSize);
+        CGLClearDrawable(context->cglcontext);
+        CGLSetCurrentContext(context->cglcontext);
+        if (context->draw_foreign_binding)
+            funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                       context->draw_foreign_binding->application_draw_fbo);
+        if (context->read_foreign_binding)
+            funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                       context->read_foreign_binding->application_read_fbo);
+    }
+    else if (view || !pbuffer)
         macdrv_make_context_current(context->context, view, cgrect_from_rect(view_rect));
     else
     {
@@ -2009,18 +2894,117 @@ static void macdrv_glCopyPixels(GLint x, GLint y, GLsizei width, GLsizei height,
         make_context_current(context, FALSE);
 }
 
+static BOOL foreign_surface_present(struct macdrv_context *context, struct gl_drawable *gl,
+                                    BOOL swap)
+{
+    struct foreign_surface_target *target = gl->foreign_target;
+    struct foreign_surface_binding *binding;
+    struct foreign_surface_backing *backing;
+    GLenum source_buffer;
+    GLint old_read_fbo, old_draw_fbo;
+    GLboolean scissor_enabled, framebuffer_srgb_enabled;
+    unsigned int present_index, present_width, present_height;
+
+    if (!context || !target || !foreign_surface_drawable_refresh(context, gl))
+        return FALSE;
+    if (!(binding = foreign_surface_binding_find(context, gl))) return FALSE;
+
+    pthread_mutex_lock(&target->present_mutex);
+    backing = target->current;
+    if (target->suspended || !target->layer || !backing || binding->backing != backing ||
+        !binding->source_read_fbo || !binding->present_fbos[0])
+    {
+        pthread_mutex_unlock(&target->present_mutex);
+        return FALSE;
+    }
+    if (CGLGetCurrentContext() != context->cglcontext)
+    {
+        WARN("Unexpected current context %p while presenting foreign hwnd %p (expected %p)\n",
+             CGLGetCurrentContext(), target->hwnd, context->cglcontext);
+        pthread_mutex_unlock(&target->present_mutex);
+        return FALSE;
+    }
+
+    funcs->p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read_fbo);
+    funcs->p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw_fbo);
+    scissor_enabled = funcs->p_glIsEnabled(GL_SCISSOR_TEST);
+    framebuffer_srgb_enabled = funcs->p_glIsEnabled(GL_FRAMEBUFFER_SRGB);
+
+    source_buffer = swap && gl->base.doublebuffer ? GL_COLOR_ATTACHMENT1 :
+                                                        GL_COLOR_ATTACHMENT0;
+    present_index = target->present_count % ARRAY_SIZE(binding->present_fbos);
+    funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, binding->source_read_fbo);
+    funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, binding->present_fbos[present_index]);
+    funcs->p_glReadBuffer(source_buffer);
+    funcs->p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    funcs->p_glDisable(GL_SCISSOR_TEST);
+    funcs->p_glDisable(GL_FRAMEBUFFER_SRGB);
+
+    /* OpenGL row zero is the bottom row while CALayer interprets IOSurface row
+       zero as the top row.  Reverse the destination Y coordinates so the
+       pixels and Wine's Cocoa input coordinates describe the same client. */
+    funcs->p_glBlitFramebuffer(0, 0, backing->width, backing->height,
+                               0, backing->height, backing->width, 0,
+                               GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    if (swap && gl->base.doublebuffer)
+    {
+        /* There is no native drawable to perform the default framebuffer's
+           front/back transition.  Copy-swap is deterministic and preserves
+           untouched damage regions for the next frame.  Both FBO bindings
+           are internal, so application read/draw-buffer state is never
+           modified. */
+        funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, binding->source_read_fbo);
+        funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, binding->source_read_fbo);
+        funcs->p_glReadBuffer(GL_COLOR_ATTACHMENT1);
+        funcs->p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        funcs->p_glBlitFramebuffer(0, 0, backing->width, backing->height,
+                                   0, 0, backing->width, backing->height,
+                                   GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
+    funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, old_read_fbo);
+    funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, old_draw_fbo);
+    if (scissor_enabled) funcs->p_glEnable(GL_SCISSOR_TEST);
+    else funcs->p_glDisable(GL_SCISSOR_TEST);
+    if (framebuffer_srgb_enabled) funcs->p_glEnable(GL_FRAMEBUFFER_SRGB);
+    else funcs->p_glDisable(GL_FRAMEBUFFER_SRGB);
+
+    /* Producer rendering and the presentation copy are ordered in the same
+       native context command stream.  No drawable-global share group, sync
+       object, glFinish, or cross-context namespace is involved. */
+    funcs->p_glFlush();
+
+    present_width = backing->width;
+    present_height = backing->height;
+    target->present_count++;
+    macdrv_iosurface_layer_present(target->layer, backing->present_surfaces[present_index],
+                                   CGRectMake(0, 0, present_width, present_height));
+    pthread_mutex_unlock(&target->present_mutex);
+    return TRUE;
+}
 static void macdrv_surface_flush(struct opengl_drawable *base, UINT flags)
 {
     struct macdrv_client_surface *client = impl_from_client_surface(base->client);
     struct macdrv_context *context = NtCurrentTeb()->glReserved2;
+    struct gl_drawable *gl = impl_from_opengl_drawable(base);
 
     TRACE("%s flags %#x\n", debugstr_opengl_drawable(base), flags);
 
     if (!context) return;
     if (flags & GL_FLUSH_INTERVAL) set_swap_interval(context, base->interval);
-    if (flags & GL_FLUSH_UPDATED) make_context_current(context, context->read_view == client->cocoa_view);
+    if (client->windowless_hwnd && flags & GL_FLUSH_UPDATED &&
+        !foreign_surface_drawable_refresh(context, gl))
+        return;
+    if (flags & GL_FLUSH_UPDATED && !client->windowless_hwnd)
+        make_context_current(context, context->read_view == client->cocoa_view);
     if (flags & GL_FLUSH_PRESENT)
     {
+        if (client->windowless_hwnd)
+        {
+            foreign_surface_present(context, gl, FALSE);
+            return;
+        }
         macdrv_flush_opengl_context(context->context);
         client_surface_present(base->client);
     }
@@ -2104,14 +3088,13 @@ static UINT macdrv_pbuffer_bind(HDC hdc, struct opengl_drawable *base, GLenum so
  *
  * WGL_ARB_create_context: wglCreateContextAttribsARB
  */
-static BOOL macdrv_context_create(int format, void *shared, const int *attrib_list, void **private)
+static BOOL macdrv_context_create(int format, void *share, const int *attrib_list, void **private)
 {
-    struct macdrv_context *share_context = shared;
+    struct macdrv_context *share_context = share;
     struct macdrv_context *context;
     const int *iptr;
     int major = 1, minor = 0, profile = WGL_CONTEXT_CORE_PROFILE_BIT_ARB, flags = 0;
     BOOL core = FALSE;
-    GLint renderer_id = 0;
 
     TRACE("format %d, share_context %p, attrib_list %p\n", format, share_context, attrib_list);
 
@@ -2151,6 +3134,7 @@ static BOOL macdrv_context_create(int format, void *shared, const int *attrib_li
                     RtlSetLastWin32Error(ERROR_INVALID_PROFILE_ARB);
                     return FALSE;
                 }
+                core = value == WGL_CONTEXT_CORE_PROFILE_BIT_ARB;
                 profile = value;
                 break;
 
@@ -2161,39 +3145,25 @@ static BOOL macdrv_context_create(int format, void *shared, const int *attrib_li
         }
     }
 
-    if ((major == 3 && (minor == 2 || minor == 3)) ||
-        (major == 4 && (minor == 0 || minor == 1)))
+    if (major > gl_info.max_major || (major == gl_info.max_major && minor > gl_info.max_minor))
     {
-        if (!(flags & WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB))
-        {
-            WARN("OS X only supports forward-compatible 3.2+ contexts\n");
-            RtlSetLastWin32Error(ERROR_INVALID_VERSION_ARB);
-            return FALSE;
-        }
+        WARN("Profile version %u.%u not supported\n", major, minor);
+        RtlSetLastWin32Error(ERROR_INVALID_VERSION_ARB);
+        return FALSE;
+    }
+
+    if ((major == 3 && minor >= 2) || major > 3)
+    {
         if (profile != WGL_CONTEXT_CORE_PROFILE_BIT_ARB)
         {
             WARN("Compatibility profiles for GL version >= 3.2 not supported\n");
             RtlSetLastWin32Error(ERROR_INVALID_PROFILE_ARB);
             return FALSE;
         }
-        if (major > gl_info.max_major ||
-            (major == gl_info.max_major && minor > gl_info.max_minor))
-        {
-            WARN("This GL implementation does not support the requested GL version %u.%u\n",
-                 major, minor);
-            RtlSetLastWin32Error(ERROR_INVALID_PROFILE_ARB);
-            return FALSE;
-        }
         core = TRUE;
     }
-    else if (major >= 3)
-    {
-        WARN("Profile version %u.%u not supported\n", major, minor);
-        RtlSetLastWin32Error(ERROR_INVALID_VERSION_ARB);
-        return FALSE;
-    }
-    else if (major < 1 || (major == 1 && (minor < 0 || minor > 5)) ||
-             (major == 2 && (minor < 0 || minor > 1)))
+    else if (major < 1 || minor < 0 || (major == 1 && minor > 5) ||
+             (major == 2 && minor > 1))
     {
         WARN("Invalid GL version requested\n");
         RtlSetLastWin32Error(ERROR_INVALID_VERSION_ARB);
@@ -2206,11 +3176,18 @@ static BOOL macdrv_context_create(int format, void *shared, const int *attrib_li
         return FALSE;
     }
 
-    if (!(context = calloc(1, sizeof(*context)))) return FALSE;
+    if (share_context && share_context->core != core)
+    {
+        ERR("Refusing to create an unshared context from an incompatible native share root\n");
+        RtlSetLastWin32Error(ERROR_INVALID_OPERATION);
+        return FALSE;
+    }
 
+    if (!(context = calloc(1, sizeof(*context)))) return FALSE;
+    context->core = core;
     context->format = format;
-    context->renderer_id = renderer_id;
-    if (!create_context(context, share_context ? share_context->cglcontext : NULL, major))
+
+    if (!create_context(context, share_context ? share_context->cglcontext : NULL))
     {
         free(context);
         return FALSE;
@@ -2282,12 +3259,22 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
     context->read_hwnd = context->draw_hwnd = NULL;
     context->read_view = context->draw_view = NULL;
     context->read_pbuffer = context->draw_pbuffer = NULL;
+    context->read_foreign = context->draw_foreign = NULL;
+    context->read_foreign_binding = context->draw_foreign_binding = NULL;
 
     if (draw->base.client)
     {
         struct macdrv_client_surface *client = impl_from_client_surface(draw->base.client);
         context->draw_hwnd = draw->base.client->hwnd;
-        context->draw_view = client->cocoa_view;
+        if (client->windowless_hwnd)
+        {
+            if (!foreign_surface_drawable_refresh(context, draw)) return FALSE;
+            context->draw_foreign = draw;
+            if (!(context->draw_foreign_binding = foreign_surface_binding_find(context, draw)))
+                return FALSE;
+        }
+        else
+            context->draw_view = client->cocoa_view;
     }
     else
     {
@@ -2300,21 +3287,57 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
         {
             struct macdrv_client_surface *client = impl_from_client_surface(read->base.client);
             context->read_hwnd = read->base.client->hwnd;
-            context->read_view = client->cocoa_view;
+            if (client->windowless_hwnd)
+            {
+                if (!foreign_surface_drawable_refresh(context, read)) return FALSE;
+                context->read_foreign = read;
+                if (!(context->read_foreign_binding = foreign_surface_binding_find(context, read)))
+                    return FALSE;
+            }
+            else
+                context->read_view = client->cocoa_view;
         }
         else
         {
             context->read_pbuffer = read->pbuffer;
         }
     }
+    else
+    {
+        context->read_hwnd = context->draw_hwnd;
+        context->read_view = context->draw_view;
+        context->read_pbuffer = context->draw_pbuffer;
+        context->read_foreign = context->draw_foreign;
+        context->read_foreign_binding = context->draw_foreign_binding;
+    }
 
-    TRACE("making context current with draw_view %p draw_pbuffer %p read_view %p read_pbuffer %p format %u\n",
-          context->draw_view, context->draw_pbuffer, context->read_view, context->read_pbuffer, context->format);
+    TRACE("making context current with draw_view %p draw_pbuffer %p draw_foreign %p read_view %p read_pbuffer %p read_foreign %p format %u\n",
+          context->draw_view, context->draw_pbuffer, context->draw_foreign,
+          context->read_view, context->read_pbuffer, context->read_foreign, context->format);
 
     make_context_current(context, FALSE);
     NtCurrentTeb()->glReserved2 = context;
 
     return TRUE;
+}
+
+static BOOL macdrv_context_get_fbos(void *private, struct opengl_drawable *base,
+                                    struct opengl_context_fbos *fbos)
+{
+    struct macdrv_context *context = private;
+    struct gl_drawable *gl = impl_from_opengl_drawable(base);
+    struct foreign_surface_binding *binding;
+
+    if (!gl->foreign_target)
+    {
+        fbos->draw = base->draw_fbo;
+        fbos->read = base->read_fbo;
+        return TRUE;
+    }
+    if (!(binding = foreign_surface_binding_find(context, gl))) return FALSE;
+    fbos->draw = binding->application_draw_fbo;
+    fbos->read = binding->application_read_fbo;
+    return fbos->draw && fbos->read;
 }
 
 
@@ -2731,8 +3754,25 @@ static BOOL macdrv_describe_pixel_format(int format, struct wgl_pixel_format *de
 static BOOL macdrv_context_destroy(void *private)
 {
     struct macdrv_context *context = private;
+    struct foreign_surface_binding *binding, *next;
 
     TRACE("deleting context %p/%p/%p\n", context, context->context, context->cglcontext);
+
+    if (context->foreign_bindings)
+    {
+        CGLClearDrawable(context->cglcontext);
+        CGLSetCurrentContext(context->cglcontext);
+    }
+    for (binding = context->foreign_bindings; binding; binding = next)
+    {
+        next = binding->next;
+        foreign_surface_binding_delete_objects(binding);
+        foreign_surface_backing_release(binding->backing);
+        opengl_drawable_release(&binding->drawable->base);
+        free(binding);
+    }
+    context->foreign_bindings = NULL;
+    context->draw_foreign_binding = context->read_foreign_binding = NULL;
 
     macdrv_dispose_opengl_context(context->context);
     free(context);
@@ -2754,13 +3794,17 @@ static void *macdrv_get_proc_address(const char *name)
 static BOOL macdrv_surface_swap(struct opengl_drawable *base)
 {
     struct macdrv_context *context = NtCurrentTeb()->glReserved2;
+    struct gl_drawable *gl = impl_from_opengl_drawable(base);
+    struct macdrv_client_surface *client = impl_from_client_surface(base->client);
 
     TRACE("%s context %p/%p/%p\n", debugstr_opengl_drawable(base), context, (context ? context->context : NULL),
           (context ? context->cglcontext : NULL));
 
+    if (context && client->windowless_hwnd)
+        return foreign_surface_present(context, gl, TRUE);
+
     if (context)
     {
-        struct macdrv_client_surface *client = impl_from_client_surface(base->client);
         make_context_current(context, context->read_view == client->cocoa_view);
         macdrv_flush_opengl_context(context->context);
     }
@@ -2775,9 +3819,11 @@ static const struct opengl_driver_funcs macdrv_driver_funcs =
     .p_describe_pixel_format = macdrv_describe_pixel_format,
     .p_init_extensions = macdrv_init_extensions,
     .p_surface_create = macdrv_surface_create,
+    .separate_context_profiles = TRUE,
     .p_context_create = macdrv_context_create,
     .p_context_destroy = macdrv_context_destroy,
     .p_make_current = macdrv_make_current,
+    .p_context_get_fbos = macdrv_context_get_fbos,
     .p_pbuffer_create = macdrv_pbuffer_create,
     .p_pbuffer_updated = macdrv_pbuffer_updated,
     .p_pbuffer_bind = macdrv_pbuffer_bind,

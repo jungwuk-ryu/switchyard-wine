@@ -156,6 +156,8 @@ struct buffer
     void *host_ptr;
     void *map_ptr;
     size_t copy_length;
+    size_t map_length;
+    GLbitfield map_access;
     void *vm_ptr;
     SIZE_T vm_size;
     BOOL pinned;
@@ -1380,38 +1382,55 @@ void set_current_fbo( TEB *teb, GLenum target, GLuint fbo )
 
 GLuint get_default_fbo( TEB *teb, GLenum target )
 {
-    struct opengl_drawable *draw, *read;
     struct context *ctx;
 
-    if (!(ctx = get_current_context( teb, &draw, &read ))) return 0;
-    if (target == GL_FRAMEBUFFER) return draw->draw_fbo;
-    if (target == GL_DRAW_FRAMEBUFFER) return draw->draw_fbo;
-    if (target == GL_READ_FRAMEBUFFER) return read->read_fbo;
+    if (!(ctx = get_current_context( teb, NULL, NULL ))) return 0;
+    if (target == GL_FRAMEBUFFER) return ctx->base.draw_fbos.draw;
+    if (target == GL_DRAW_FRAMEBUFFER) return ctx->base.draw_fbos.draw;
+    if (target == GL_READ_FRAMEBUFFER) return ctx->base.read_fbos.read;
     return 0;
+}
+
+BOOL bind_separate_default_fbos( TEB *teb, GLenum target,
+                                 void (*bind)( GLenum target, GLuint framebuffer ) )
+{
+    struct context *ctx;
+    GLuint draw, read;
+
+    if (target != GL_FRAMEBUFFER || !(ctx = get_current_context( teb, NULL, NULL ))) return FALSE;
+    draw = ctx->base.draw_fbos.draw;
+    read = ctx->base.read_fbos.read;
+    if (draw == read) return FALSE;
+
+    /* GL_FRAMEBUFFER aliases both bindings, but a redirected multisample
+     * default framebuffer has distinct context-local draw and resolve FBOs.
+     * A single native GLuint cannot represent that WGL operation. */
+    bind( GL_DRAW_FRAMEBUFFER, draw );
+    bind( GL_READ_FRAMEBUFFER, read );
+    return TRUE;
 }
 
 void push_default_fbo( TEB *teb )
 {
     const struct opengl_funcs *funcs = teb->glTable;
-    struct opengl_drawable *draw, *read;
     struct context *ctx;
 
-    if (!(ctx = get_current_context( teb, &draw, &read ))) return;
-    if (!ctx->draw_fbo && draw->draw_fbo) funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, 0 );
-    if (!ctx->read_fbo && read->read_fbo) funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+    if (!(ctx = get_current_context( teb, NULL, NULL ))) return;
+    if (!ctx->draw_fbo && ctx->base.draw_fbos.draw) funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, 0 );
+    if (!ctx->read_fbo && ctx->base.read_fbos.read) funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
 }
 
 void pop_default_fbo( TEB *teb )
 {
     const struct opengl_funcs *funcs = teb->glTable;
-    struct opengl_drawable *draw, *read;
+    struct opengl_drawable *draw;
     struct context *ctx;
     RECT rect;
 
-    if (!(ctx = get_current_context( teb, &draw, &read ))) return;
-    if (!ctx->draw_fbo) funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, draw->draw_fbo );
-    if (!ctx->read_fbo) funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read->read_fbo );
-    if (!ctx->has_viewport && draw->draw_fbo && draw->client)
+    if (!(ctx = get_current_context( teb, &draw, NULL ))) return;
+    if (!ctx->draw_fbo) funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, ctx->base.draw_fbos.draw );
+    if (!ctx->read_fbo) funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, ctx->base.read_fbos.read );
+    if (!ctx->has_viewport && ctx->base.draw_fbos.draw && draw->client)
     {
         NtUserGetClientRect( draw->client->hwnd, &rect, NtUserGetDpiForWindow( draw->client->hwnd ) );
         funcs->p_glViewport( 0, 0, rect.right, rect.bottom );
@@ -1422,20 +1441,22 @@ void pop_default_fbo( TEB *teb )
 void resolve_default_fbo( TEB *teb, BOOL read )
 {
     const struct opengl_funcs *funcs = teb->glTable;
+    const struct opengl_context_fbos *fbos;
     struct opengl_drawable *drawable;
     struct context *ctx;
 
     if (!(ctx = get_current_context( teb, read ? NULL : &drawable, read ? &drawable : NULL )) || !drawable) return;
+    fbos = read ? &ctx->base.read_fbos : &ctx->base.draw_fbos;
 
-    if (drawable->draw_fbo && drawable->read_fbo && drawable->draw_fbo != drawable->read_fbo)
+    if (fbos->draw && fbos->read && fbos->draw != fbos->read)
     {
         GLenum mask = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
         RECT rect;
 
         NtUserGetClientRect( drawable->client->hwnd, &rect, NtUserGetDpiForWindow( drawable->client->hwnd ) );
 
-        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, drawable->draw_fbo );
-        funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, drawable->read_fbo );
+        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, fbos->draw );
+        funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, fbos->read );
 
         if (context_draws_front( ctx ))
         {
@@ -1469,8 +1490,10 @@ void resolve_default_fbo( TEB *teb, BOOL read )
             mask &= ~(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         }
 
-        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, ctx->read_fbo );
-        funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, ctx->draw_fbo );
+        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER,
+                                    ctx->read_fbo ? ctx->read_fbo : ctx->base.read_fbos.read );
+        funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER,
+                                    ctx->draw_fbo ? ctx->draw_fbo : ctx->base.draw_fbos.draw );
     }
 }
 
@@ -1669,7 +1692,7 @@ void wrap_glGetFramebufferParameteriv( TEB *teb, GLuint fbo, GLenum pname, GLint
     if ((ctx = get_current_context( teb, &draw, &read )) && !fbo)
     {
         if (get_default_fbo_integer( ctx, draw, read, pname, params )) return;
-        fbo = draw->draw_fbo;
+        fbo = ctx->base.draw_fbos.draw;
     }
 
     p_glGetFramebufferParameteriv( fbo, pname, params );
@@ -1925,6 +1948,21 @@ static void flush_buffer( TEB *teb, struct buffer *buffer, size_t offset, size_t
     };
     VkResult vr;
 
+    /* A 32-bit application cannot use a native mapping above 4 GB.  In that
+     * case wow64_map_buffer() returns a low-address copy.  Explicitly flushed
+     * writes have to reach the native mapping before the driver flushes it;
+     * copying the mapping only at UnmapBuffer is too late and violates
+     * GL_MAP_FLUSH_EXPLICIT_BIT visibility semantics. */
+    if (!buffer->vk_memory && buffer->host_ptr && buffer->map_ptr != buffer->host_ptr &&
+        (buffer->map_access & (GL_MAP_WRITE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT)) ==
+        (GL_MAP_WRITE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT) &&
+        offset <= buffer->map_length && length <= buffer->map_length - offset)
+    {
+        TRACE( "Copying flushed range %#zx+%#zx from wow64 buffer %p to buffer %p\n",
+               offset, length, buffer->map_ptr, buffer->host_ptr );
+        memcpy( (char *)buffer->host_ptr + offset, (char *)buffer->map_ptr + offset, length );
+    }
+
     if (!buffer->vk_memory) return;
 
     vr = buffer->vk_device->p_vkFlushMappedMemoryRanges( buffer->vk_device->vk_device, 1, &memory_range );
@@ -2132,6 +2170,9 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
 
     buffer->host_ptr = ptr;
     if (!offset && !length) length = buffer->size;
+    buffer->map_length = length;
+    buffer->map_access = access;
+    buffer->copy_length = 0;
     if (ULongToPtr(PtrToUlong(ptr)) == ptr) /* we're lucky */
     {
         buffer->map_ptr = ptr;
@@ -2147,7 +2188,8 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
 
     if (!buffer_vm_alloc( teb, buffer, length + (offset & 0xf) )) goto unmap;
     buffer->map_ptr = (char *)buffer->vm_ptr + (offset & 0xf);
-    buffer->copy_length = (access & GL_MAP_WRITE_BIT) ? length : 0;
+    if ((access & GL_MAP_WRITE_BIT) && !(access & GL_MAP_FLUSH_EXPLICIT_BIT))
+        buffer->copy_length = length;
     if (!(access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)))
     {
         static int once;
@@ -2360,6 +2402,8 @@ static BOOL wow64_unmap_buffer( TEB *teb, struct buffer *buffer )
     }
 
     buffer->host_ptr = buffer->map_ptr = NULL;
+    buffer->map_length = 0;
+    buffer->map_access = 0;
     return TRUE;
 }
 

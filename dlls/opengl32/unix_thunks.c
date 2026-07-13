@@ -3984,8 +3984,11 @@ static NTSTATUS ext_glBindFramebuffer( void *args )
     GLuint framebuffer = params->framebuffer;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glBindFramebuffer) return STATUS_NOT_IMPLEMENTED;
+    if (!framebuffer && bind_separate_default_fbos( params->teb, params->target,
+            (void (*)(GLenum, GLuint))funcs->p_glBindFramebuffer )) goto bound_default_fbos;
     if (!framebuffer) framebuffer = get_default_fbo( params->teb, params->target );
     funcs->p_glBindFramebuffer( params->target, framebuffer );
+bound_default_fbos:
     set_current_fbo( params->teb, params->target, params->framebuffer );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
@@ -3997,8 +4000,11 @@ static NTSTATUS ext_glBindFramebufferEXT( void *args )
     GLuint framebuffer = params->framebuffer;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glBindFramebufferEXT) return STATUS_NOT_IMPLEMENTED;
+    if (!framebuffer && bind_separate_default_fbos( params->teb, params->target,
+            (void (*)(GLenum, GLuint))funcs->p_glBindFramebufferEXT )) goto bound_default_fbos;
     if (!framebuffer) framebuffer = get_default_fbo( params->teb, params->target );
     funcs->p_glBindFramebufferEXT( params->target, framebuffer );
+bound_default_fbos:
     set_current_fbo( params->teb, params->target, params->framebuffer );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
@@ -40192,8 +40198,11 @@ static NTSTATUS wow64_ext_glBindFramebuffer( void *args )
     GLuint framebuffer = params->framebuffer;
     const struct opengl_funcs *funcs = teb->glTable;
     if (!funcs->p_glBindFramebuffer) return STATUS_NOT_IMPLEMENTED;
+    if (!framebuffer && bind_separate_default_fbos( teb, params->target,
+            (void (*)(GLenum, GLuint))funcs->p_glBindFramebuffer )) goto bound_default_fbos;
     if (!framebuffer) framebuffer = get_default_fbo( teb, params->target );
     funcs->p_glBindFramebuffer( params->target, framebuffer );
+bound_default_fbos:
     set_current_fbo( teb, params->target, params->framebuffer );
     set_context_attribute( teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
@@ -40211,8 +40220,11 @@ static NTSTATUS wow64_ext_glBindFramebufferEXT( void *args )
     GLuint framebuffer = params->framebuffer;
     const struct opengl_funcs *funcs = teb->glTable;
     if (!funcs->p_glBindFramebufferEXT) return STATUS_NOT_IMPLEMENTED;
+    if (!framebuffer && bind_separate_default_fbos( teb, params->target,
+            (void (*)(GLenum, GLuint))funcs->p_glBindFramebufferEXT )) goto bound_default_fbos;
     if (!framebuffer) framebuffer = get_default_fbo( teb, params->target );
     funcs->p_glBindFramebufferEXT( params->target, framebuffer );
+bound_default_fbos:
     set_current_fbo( teb, params->target, params->framebuffer );
     set_context_attribute( teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;

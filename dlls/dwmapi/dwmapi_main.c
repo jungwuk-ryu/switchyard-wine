@@ -67,7 +67,29 @@ HRESULT WINAPI DwmEnableComposition(UINT uCompositionAction)
  */
 HRESULT WINAPI DwmExtendFrameIntoClientArea(HWND hwnd, const MARGINS* margins)
 {
-    FIXME("(%p, %p) stub\n", hwnd, margins);
+    static const WCHAR extended_frame_prop[] =
+        L"wine_dwm_extended_frame";
+    BOOL enabled;
+
+    TRACE("(%p, %p)\n", hwnd, margins);
+
+    if (!margins) return E_INVALIDARG;
+    if (!IsWindow(hwnd)) return E_HANDLE;
+
+    enabled = margins->cxLeftWidth || margins->cxRightWidth ||
+              margins->cyTopHeight || margins->cyBottomHeight;
+    if (enabled)
+    {
+        if (!SetPropW(hwnd, extended_frame_prop, (HANDLE)(ULONG_PTR)1))
+            return HRESULT_FROM_WIN32(GetLastError());
+    }
+    else RemovePropW(hwnd, extended_frame_prop);
+
+    /* The platform driver derives native frame geometry from this state.
+       Re-evaluate it even if the Win32 window rectangle did not change. */
+    SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
     return S_OK;
 }

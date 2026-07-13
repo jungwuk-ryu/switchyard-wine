@@ -41,426 +41,49 @@ WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
 
 
 static pthread_mutex_t win_data_mutex;
-static pthread_mutex_t foreign_child_create_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CFMutableDictionaryRef win_datas;
+
+enum macdrv_compositor_plane
+{
+    MACDRV_COMPOSITOR_DIB,
+    MACDRV_COMPOSITOR_GPU,
+};
+
+struct macdrv_remote_layer
+{
+    struct macdrv_remote_layer *next;
+    UINT64 node_id;
+    UINT64 revision;
+    UINT64 refresh_ticket;
+    HWND source;
+    DWORD source_thread;
+    DWORD source_process;
+    enum macdrv_compositor_plane plane;
+    unsigned int context_id;
+    SIZE endpoint_size;
+    HWND host;
+    uintptr_t host_cookie;
+    CGRect content_frame;
+    CGRect clip_frame;
+    double z_position;
+    BOOL displayed;
+    BOOL endpoint_dirty;
+};
+
+static pthread_mutex_t remote_layer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct macdrv_remote_layer *remote_layers;
+static UINT64 next_remote_layer_node_id;
+
+static void remote_layer_purge_source(HWND source);
+static void remote_layer_detach_host(HWND host);
+static void remote_layer_refresh_all(void);
 
 static unsigned int activate_on_focus_time;
 
-static BOOL is_chromium_cef_child_window(HWND hwnd)
-{
-    static const WCHAR cef_browser_window[] =
-        {'C','e','f','B','r','o','w','s','e','r','W','i','n','d','o','w',0};
-    static const WCHAR chrome_render_widget[] =
-        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
-    static const WCHAR chrome_widget_prefix[] =
-        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
-    static const WCHAR intermediate_d3d_window[] =
-        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, cef_browser_window)
-        || !wcscmp(class_name, chrome_render_widget)
-        || !wcscmp(class_name, intermediate_d3d_window)
-        || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
-}
-
-static BOOL is_chromium_dcomp_target_window(HWND hwnd)
-{
-    static const WCHAR intermediate_d3d_window[] =
-        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, intermediate_d3d_window);
-}
-
-static const WCHAR wine_window_topmost_composed[] =
-    {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
-static const WCHAR wine_window_non_topmost_composed[] =
-    {'w','i','n','e','_','w','i','n','d','o','w','_','n','o','n','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
-static const WCHAR wine_window_owner_composed[] =
-    {'w','i','n','e','_','w','i','n','d','o','w','_','o','w','n','e','r','_','c','o','m','p','o','s','e','d',0};
 static const WCHAR wine_cocoa_window_number[] =
     {'w','i','n','e','_','c','o','c','o','a','_','w','i','n','d','o','w','_','n','u','m','b','e','r',0};
-
-static BOOL is_dcomp_composed_hwnd(HWND hwnd)
-{
-    return hwnd && (NtUserGetProp(hwnd, wine_window_topmost_composed) ||
-                   NtUserGetProp(hwnd, wine_window_non_topmost_composed));
-}
-
-static BOOL is_chrome_widget_window(HWND hwnd)
-{
-    static const WCHAR chrome_widget_prefix[] =
-        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
-}
-
-static BOOL is_chrome_render_widget_host_window(HWND hwnd)
-{
-    static const WCHAR chrome_render_widget[] =
-        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, chrome_render_widget);
-}
-
-static BOOL chrome_subtree_has_render_widget(HWND hwnd)
-{
-    HWND child;
-
-    if (is_chrome_render_widget_host_window(hwnd)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chrome_subtree_has_render_widget(child)) return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL chrome_root_has_render_widget(HWND root)
-{
-    return root && is_chrome_widget_window(root) && chrome_subtree_has_render_widget(root);
-}
-
-static BOOL chromium_subtree_has_dcomp_target(HWND hwnd)
-{
-    HWND child;
-
-    if (is_chromium_cef_child_window(hwnd) && is_dcomp_composed_hwnd(hwnd)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL chromium_root_uses_dcomp_composition(HWND root)
-{
-    HWND child;
-
-    if (!root) return FALSE;
-    if (is_dcomp_composed_hwnd(root)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
-{
-    HWND root;
-
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-    if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
-}
-
-static BOOL chromium_hwnd_or_root_uses_dcomp_composition(HWND hwnd)
-{
-    HWND root;
-
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-    if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && chromium_root_uses_dcomp_composition(root);
-}
-
-static BOOL chromium_hwnd_or_root_uses_root_surface_composition(HWND hwnd)
-{
-    HWND root;
-
-    if (chromium_hwnd_or_root_uses_dcomp_composition(hwnd)) return TRUE;
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && chrome_root_has_render_widget(root);
-}
-
-static BOOL chromium_hwnd_uses_owner_composition(HWND hwnd)
-{
-    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
-    HWND owner;
-
-    if (!root || root != hwnd) return FALSE;
-    owner = NtUserGetAncestor(root, GA_ROOTOWNER);
-    if (!owner || owner == root ||
-            !is_chromium_cef_child_window(root) || !is_chromium_cef_child_window(owner))
-        return FALSE;
-    if (NtUserGetProp(hwnd, wine_window_owner_composed)) return TRUE;
-
-    return chromium_root_uses_dcomp_composition(root) || chromium_root_uses_dcomp_composition(owner) ||
-           chrome_root_has_render_widget(root) || chrome_root_has_render_widget(owner);
-}
-
-static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
-{
-    HWND root;
-
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-    if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root != hwnd &&
-           (chromium_root_uses_dcomp_composition(root) || chrome_root_has_render_widget(root));
-}
-
-static int rect_width(const RECT *rect)
-{
-    return rect->right - rect->left;
-}
-
-static int rect_height(const RECT *rect)
-{
-    return rect->bottom - rect->top;
-}
-
-static BOOL rect_nearly_covers_client(const RECT *rect, int width, int height)
-{
-    int rect_w = rect_width(rect);
-    int rect_h = rect_height(rect);
-
-    return rect->left >= -1 && rect->left <= 1 &&
-           rect->top >= -1 && rect->top <= 1 &&
-           rect_w >= width - 2 && rect_w <= width + 2 &&
-           rect_h >= height - 2 && rect_h <= height + 2;
-}
-
-static BOOL has_visible_smaller_chromium_viewport(HWND root, HWND hwnd)
-{
-    UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
-    HWND child;
-    RECT root_client;
-    int root_width, root_height;
-
-    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
-    root_width = rect_width(&root_client);
-    root_height = rect_height(&root_client);
-    if (root_width <= 0 || root_height <= 0) return FALSE;
-
-    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        RECT rect;
-        int width, height;
-
-        if (child == hwnd) continue;
-        if (!NtUserIsWindowVisible(child)) continue;
-        if (!is_chromium_cef_child_window(child)) continue;
-        if (NtUserGetAncestor(child, GA_ROOT) != root) continue;
-        if (!NtUserGetClientRect(child, &rect, NtUserGetWinMonitorDpi(child, MDT_RAW_DPI))) continue;
-
-        NtUserMapWindowPoints(child, root, (POINT *)&rect, 2, root_dpi);
-        width = rect_width(&rect);
-        height = rect_height(&rect);
-        if (width <= 0 || height <= 0) continue;
-        if (rect_nearly_covers_client(&rect, root_width, root_height)) continue;
-        if (width * 4 < root_width * 3) continue;
-        if (height * 2 < root_height) continue;
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL is_visible_smaller_chromium_viewport(HWND hwnd, HWND expected_root)
-{
-    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
-    UINT root_dpi;
-    RECT root_client, rect;
-    int root_width, root_height, width, height;
-
-    if (!root || root == hwnd) return FALSE;
-    if (expected_root && root != expected_root) return FALSE;
-    if (!NtUserIsWindowVisible(hwnd)) return FALSE;
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-
-    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
-    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
-    root_width = rect_width(&root_client);
-    root_height = rect_height(&root_client);
-    if (root_width <= 0 || root_height <= 0) return FALSE;
-    if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
-
-    NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
-    width = rect_width(&rect);
-    height = rect_height(&rect);
-    if (width <= 0 || height <= 0) return FALSE;
-    if (rect_nearly_covers_client(&rect, root_width, root_height)) return FALSE;
-
-    return width * 4 >= root_width * 3 && height * 2 >= root_height;
-}
-
-static BOOL has_full_root_chromium_viewport_sibling(HWND hwnd, HWND expected_root)
-{
-    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
-    UINT root_dpi;
-    HWND child;
-    RECT root_client;
-    int root_width, root_height;
-
-    if (!root || root == hwnd) return FALSE;
-    if (expected_root && root != expected_root) return FALSE;
-
-    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
-    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
-    root_width = rect_width(&root_client);
-    root_height = rect_height(&root_client);
-    if (root_width <= 0 || root_height <= 0) return FALSE;
-
-    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        RECT rect;
-
-        if (child == hwnd) continue;
-        if (!NtUserIsWindowVisible(child)) continue;
-        if (!is_chromium_cef_child_window(child)) continue;
-        if (NtUserGetAncestor(child, GA_ROOT) != root) continue;
-        if (!NtUserGetClientRect(child, &rect, NtUserGetWinMonitorDpi(child, MDT_RAW_DPI))) continue;
-
-        NtUserMapWindowPoints(child, root, (POINT *)&rect, 2, root_dpi);
-        if (rect_nearly_covers_client(&rect, root_width, root_height))
-            return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL is_full_root_chromium_placeholder(HWND hwnd, HWND expected_root)
-{
-    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
-    UINT root_dpi;
-    RECT root_client, rect;
-    int root_width, root_height;
-
-    if (!root || root == hwnd) return FALSE;
-    if (expected_root && root != expected_root) return FALSE;
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-
-    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
-    if (!NtUserGetClientRect(root, &root_client, root_dpi)) return FALSE;
-    root_width = rect_width(&root_client);
-    root_height = rect_height(&root_client);
-    if (root_width <= 0 || root_height <= 0) return FALSE;
-    if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
-
-    NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
-    return rect_nearly_covers_client(&rect, root_width, root_height) &&
-           has_visible_smaller_chromium_viewport(root, hwnd);
-}
-
-static const void *remote_layer_context_key(unsigned int context_id)
-{
-    return (const void *)((ULONG_PTR)context_id + 1);
-}
-
-static BOOL remote_layer_context_set_contains(CFMutableSetRef set, unsigned int context_id)
-{
-    return set && CFSetContainsValue(set, remote_layer_context_key(context_id));
-}
-
-static BOOL remote_layer_context_set_add(CFMutableSetRef *set, unsigned int context_id)
-{
-    if (*set && CFSetContainsValue(*set, remote_layer_context_key(context_id))) return FALSE;
-    if (!*set && !(*set = CFSetCreateMutable(NULL, 0, NULL))) return FALSE;
-
-    CFSetAddValue(*set, remote_layer_context_key(context_id));
-    return TRUE;
-}
-
-static BOOL remote_layer_context_set_remove(CFMutableSetRef set, unsigned int context_id)
-{
-    if (!set || !CFSetContainsValue(set, remote_layer_context_key(context_id))) return FALSE;
-
-    CFSetRemoveValue(set, remote_layer_context_key(context_id));
-    return TRUE;
-}
-
-static BOOL mark_remote_layer_context_hosted(struct macdrv_win_data *data, unsigned int context_id,
-                                             BOOL *restore_alpha)
-{
-    *restore_alpha = FALSE;
-    remote_layer_context_set_remove(data->suppressed_remote_layer_contexts, context_id);
-    data->remote_layer_hosted_once = TRUE;
-
-    if (remote_layer_context_set_add(&data->remote_layer_contexts, context_id))
-    {
-        *restore_alpha = !data->remote_layer_hosts++;
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL mark_remote_layer_context_suppressed(struct macdrv_win_data *data, unsigned int context_id)
-{
-    if (!remote_layer_context_set_contains(data->suppressed_remote_layer_contexts, context_id) &&
-        !remote_layer_context_set_add(&data->suppressed_remote_layer_contexts, context_id))
-        return FALSE;
-
-    if (remote_layer_context_set_remove(data->remote_layer_contexts, context_id) &&
-        data->remote_layer_hosts)
-        data->remote_layer_hosts--;
-    return TRUE;
-}
+static const WCHAR wine_dwm_extended_frame[] =
+    {'w','i','n','e','_','d','w','m','_','e','x','t','e','n','d','e','d','_','f','r','a','m','e',0};
 
 /* per-monitor DPI aware NtUserSetWindowPos call */
 static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, UINT flags)
@@ -471,39 +94,32 @@ static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, 
     return ret;
 }
 
-static BOOL chrome_root_should_use_custom_frame(HWND hwnd, DWORD style, DWORD ex_style)
+static BOOL root_uses_extended_frame(HWND hwnd, DWORD style, DWORD ex_style)
 {
     HWND root;
 
-    if (!is_chrome_widget_window(hwnd)) return FALSE;
+    if (!NtUserGetProp(hwnd, wine_dwm_extended_frame)) return FALSE;
     if ((style & (WS_CHILD | WS_CAPTION)) != WS_CAPTION) return FALSE;
     if (ex_style & WS_EX_TOOLWINDOW) return FALSE;
-    if (NtUserGetWindowRelative(hwnd, GW_OWNER)) return FALSE;
 
     root = NtUserGetAncestor(hwnd, GA_ROOT);
     return root && root == hwnd;
 }
 
-static BOOL win_data_uses_chrome_custom_frame(struct macdrv_win_data *data)
+static BOOL win_data_uses_extended_frame(struct macdrv_win_data *data)
 {
     DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
     DWORD ex_style = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
 
-    return chrome_root_should_use_custom_frame(data->hwnd, style, ex_style);
-}
-
-BOOL macdrv_win_data_uses_chrome_client_only_frame(struct macdrv_win_data *data)
-{
-    return win_data_uses_chrome_custom_frame(data) &&
-           data->rects.client.top > data->rects.window.top + 1;
+    return root_uses_extended_frame(data->hwnd, style, ex_style);
 }
 
 static const RECT *get_cocoa_frame_rect(struct macdrv_win_data *data)
 {
-    if (win_data_uses_chrome_custom_frame(data))
+    if (win_data_uses_extended_frame(data))
     {
         /*
-         * Chrome paints its custom frame inside the Win32 client. The nominal
+         * A DWM-extended custom frame is painted inside the Win32 client. The nominal
          * sizing border remains outside that client even when the caption is
          * extended, and exposing it as Cocoa content produces asymmetric edge
          * bands. Client-only roots such as first-run also keep a real caption
@@ -559,21 +175,12 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
 {
     struct macdrv_window_features wf = {0};
 
-    if ((ex_style & WS_EX_NOACTIVATE) || data->foreign_child)
-    {
-        /*
-         * A foreign Chromium host owns the native pixels for a child HWND in
-         * another Wine process.  Keep the pixel host nonactivating while its
-         * Cocoa window remains click-through; the application-owned parent
-         * must retain activation and receive native pointer events.
-         */
-        wf.prevents_app_activation = TRUE;
-    }
-    if (chrome_root_should_use_custom_frame(data->hwnd, style, ex_style))
+    if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
+    if (root_uses_extended_frame(data->hwnd, style, ex_style))
     {
         wf.shadow = TRUE;
         if ((style & WS_THICKFRAME) && !data->shaped) wf.resizable = TRUE;
-        TRACE("Switchyard using borderless Chrome custom frame for hwnd %p\n", data->hwnd);
+        TRACE("Switchyard using borderless DWM-extended frame for hwnd %p\n", data->hwnd);
         return wf;
     }
     if (EqualRect(&data->rects.window, &data->rects.visible)) return wf;
@@ -727,9 +334,6 @@ void release_win_data(struct macdrv_win_data *data)
 
 static void free_win_data(struct macdrv_win_data *data)
 {
-    if (data->remote_layer_contexts) CFRelease(data->remote_layer_contexts);
-    if (data->suppressed_remote_layer_contexts) CFRelease(data->suppressed_remote_layer_contexts);
-    if (data->chromium_root_surface_overlays) CFRelease(data->chromium_root_surface_overlays);
     free(data);
 }
 
@@ -739,8 +343,6 @@ static void free_win_data(struct macdrv_win_data *data)
  */
 static BOOL is_win_data_on_screen(const struct macdrv_win_data *data)
 {
-    if (data->foreign_child && data->cocoa_window)
-        return macdrv_is_cocoa_window_ordered_in(data->cocoa_window);
     return data->on_screen;
 }
 
@@ -1016,7 +618,6 @@ static void create_cocoa_window(struct macdrv_win_data *data)
     data->cocoa_window = macdrv_create_cocoa_window(&wf, frame, data->hwnd, thread_data->queue);
     if (!data->cocoa_window) goto done;
 
-    if (!data->foreign_child)
     {
         unsigned int window_number = macdrv_get_cocoa_window_number(data->cocoa_window);
 
@@ -1053,10 +654,7 @@ static void destroy_cocoa_window(struct macdrv_win_data *data)
 
     TRACE("win %p Cocoa win %p\n", data->hwnd, data->cocoa_window);
 
-    if (data->foreign_child)
-        macdrv_untrack_cocoa_window_parent(data->cocoa_window);
-    else
-        NtUserRemoveProp(data->hwnd, wine_cocoa_window_number);
+    NtUserRemoveProp(data->hwnd, wine_cocoa_window_number);
     macdrv_destroy_cocoa_window(data->cocoa_window);
     data->cocoa_window = 0;
     data->on_screen = FALSE;
@@ -1074,20 +672,11 @@ static void hide_window(struct macdrv_win_data *data);
 static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct window_rects *rects)
 {
     struct macdrv_win_data *data;
-    BOOL foreign_chromium_child = FALSE;
+    DWORD owner_process = 0;
     HWND parent;
 
-    if (NtUserGetWindowThread(hwnd, NULL) != GetCurrentThreadId())
-    {
-        if (!is_chromium_cef_child_window(hwnd)) return NULL;
-        if (chromium_hwnd_or_root_uses_root_surface_composition(hwnd))
-        {
-            TRACE("not creating foreign Chromium/CEF mac win data for hwnd %p because root composition owns it\n",
-                  hwnd);
-            return NULL;
-        }
-        foreign_chromium_child = TRUE;
-    }
+    if (!NtUserGetWindowThread(hwnd, &owner_process) || owner_process != GetCurrentProcessId())
+        return NULL;
 
     if (!(parent = NtUserGetAncestor(hwnd, GA_PARENT)))  /* desktop */
     {
@@ -1097,15 +686,10 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
 
     if (!(data = alloc_win_data(hwnd))) return NULL;
     data->rects = *rects;
-    data->foreign_child = foreign_chromium_child;
 
-    if (parent == NtUserGetDesktopWindow() || foreign_chromium_child)
+    if (parent == NtUserGetDesktopWindow())
     {
-        if (chromium_hwnd_uses_owner_composition(hwnd))
-            TRACE("not creating owned Chromium/CEF popup mac window for hwnd %p because DComp presents through owner root\n",
-                  hwnd);
-        else
-            create_cocoa_window(data);
+        create_cocoa_window(data);
         TRACE("win %p/%p window %s whole %s client %s\n",
                hwnd, data->cocoa_window, wine_dbgstr_rect(&data->rects.window),
                wine_dbgstr_rect(&data->rects.visible), wine_dbgstr_rect(&data->rects.client));
@@ -1116,111 +700,6 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
            wine_dbgstr_rect(&data->rects.visible), wine_dbgstr_rect(&data->rects.client));
     return data;
 }
-
-static struct macdrv_win_data *macdrv_create_foreign_child_win_data(HWND hwnd, const RECT *surface_rect)
-{
-    struct window_rects rects;
-    UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
-    RECT client;
-
-    if (!is_chromium_cef_child_window(hwnd)) return NULL;
-    if (NtUserGetWindowThread(hwnd, NULL) == GetCurrentThreadId()) return NULL;
-    if (chromium_hwnd_or_root_uses_root_surface_composition(hwnd))
-    {
-        TRACE("not creating foreign Chromium/CEF child mac win data for hwnd %p because root composition owns it\n",
-              hwnd);
-        return NULL;
-    }
-
-    SetRectEmpty(&rects.window);
-    if (NtUserGetClientRect(hwnd, &client, dpi))
-    {
-        NtUserMapWindowPoints(hwnd, 0, (POINT *)&client, 2, dpi);
-        rects.window = client;
-    }
-    if (IsRectEmpty(&rects.window))
-    {
-        POINT origin = {0, 0};
-        int width = surface_rect->right - surface_rect->left;
-        int height = surface_rect->bottom - surface_rect->top;
-
-        NtUserMapWindowPoints(hwnd, 0, &origin, 1, dpi);
-        SetRect(&rects.window, origin.x, origin.y, origin.x + width, origin.y + height);
-    }
-
-    rects.client = rects.window;
-    rects.visible = rects.window;
-
-    TRACE("creating foreign Chromium/CEF child mac win data for hwnd %p rects %s\n",
-          hwnd, debugstr_window_rects(&rects));
-
-    return macdrv_create_win_data(hwnd, &rects);
-}
-
-BOOL macdrv_acquire_foreign_child_win_data(HWND hwnd, const RECT *surface_rect,
-                                           macdrv_window *window)
-{
-    struct macdrv_win_data *data;
-    BOOL ret = FALSE;
-
-    if (window) *window = NULL;
-    pthread_mutex_lock(&foreign_child_create_mutex);
-
-    if (chromium_hwnd_or_root_uses_root_surface_composition(hwnd))
-        goto done;
-
-    if ((data = get_win_data(hwnd)))
-    {
-        if ((ret = data->foreign_child && data->cocoa_window))
-        {
-            data->foreign_surface_refs++;
-            if (window) *window = data->cocoa_window;
-        }
-        release_win_data(data);
-    }
-    else if ((data = macdrv_create_foreign_child_win_data(hwnd, surface_rect)))
-    {
-        if ((ret = data->foreign_child && data->cocoa_window))
-        {
-            data->foreign_surface_refs++;
-            if (window) *window = data->cocoa_window;
-        }
-        release_win_data(data);
-    }
-
-done:
-    pthread_mutex_unlock(&foreign_child_create_mutex);
-    return ret;
-}
-
-void macdrv_release_foreign_child_win_data(HWND hwnd)
-{
-    struct macdrv_win_data *data;
-
-    pthread_mutex_lock(&foreign_child_create_mutex);
-    if (!(data = get_win_data(hwnd))) goto done;
-    if (!data->foreign_child)
-    {
-        release_win_data(data);
-        goto done;
-    }
-    if (data->foreign_surface_refs && --data->foreign_surface_refs)
-    {
-        release_win_data(data);
-        goto done;
-    }
-
-    TRACE("destroying foreign Chromium/CEF child mac win data for hwnd %p window %p\n",
-          hwnd, data->cocoa_window);
-    destroy_cocoa_window(data);
-    CFDictionaryRemoveValue(win_datas, hwnd);
-    release_win_data(data);
-    free_win_data(data);
-
-done:
-    pthread_mutex_unlock(&foreign_child_create_mutex);
-}
-
 
 /**********************************************************************
  *              is_owned_by
@@ -1321,7 +800,6 @@ static void show_window(struct macdrv_win_data *data)
         activate = activate_on_focus_time && (NtGetTickCount() - activate_on_focus_time < 2000);
     macdrv_order_cocoa_window(data->cocoa_window, prev_window, next_window, activate);
     data->on_screen = TRUE;
-    if (!data->foreign_child)
     {
         unsigned int window_number = macdrv_get_cocoa_window_number(data->cocoa_window);
 
@@ -1348,87 +826,6 @@ static void hide_window(struct macdrv_win_data *data)
     if (data->cocoa_window)
         macdrv_hide_cocoa_window(data->cocoa_window);
     data->on_screen = FALSE;
-}
-
-
-/***********************************************************************
- *              macdrv_present_foreign_child_window
- *
- * Synchronize and non-activatingly order a process-local host for a
- * Chromium child HWND owned by another process.  The owner process cannot
- * deliver its WindowPosChanged events to this process, so validate owner
- * state whenever the renderer presents.
- */
-BOOL macdrv_present_foreign_child_window(HWND hwnd)
-{
-    struct macdrv_win_data *data;
-    HWND root;
-    RECT rect, root_client_rect, root_window_rect, root_size, relative_rect, clipped;
-    UINT dpi, root_dpi;
-    DWORD style, root_style;
-    CGRect frame, root_frame;
-    unsigned int root_window_number;
-    BOOL tracking_allowed = FALSE, valid = FALSE;
-
-    if (!(data = get_win_data(hwnd))) return FALSE;
-    if (!data->foreign_child || !data->cocoa_window) goto done;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
-    root_style = root ? NtUserGetWindowLongW(root, GWL_STYLE) : 0;
-    if (!NtUserGetWindowThread(hwnd, NULL) || !root || !NtUserGetWindowThread(root, NULL) ||
-        chromium_hwnd_or_root_uses_root_surface_composition(hwnd) ||
-        !(style & WS_VISIBLE))
-        goto done;
-
-    root_window_number = HandleToUlong(NtUserGetProp(root, wine_cocoa_window_number));
-    if (!root_window_number) goto done;
-    tracking_allowed = TRUE;
-
-    if ((root_style & (WS_VISIBLE | WS_MINIMIZE)) != WS_VISIBLE || !NtUserIsWindowVisible(root))
-        goto done;
-
-    dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
-    root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
-    if (!NtUserGetClientRect(hwnd, &rect, dpi) || IsRectEmpty(&rect) ||
-        !NtUserGetClientRect(root, &root_client_rect, root_dpi) || IsRectEmpty(&root_client_rect))
-        goto done;
-    NtUserMapWindowPoints(hwnd, 0, (POINT *)&rect, 2, dpi);
-    NtUserMapWindowPoints(root, 0, (POINT *)&root_client_rect, 2, root_dpi);
-    NtUserGetWindowRect(root, &root_window_rect, root_dpi);
-    if (IsRectEmpty(&root_window_rect) || !intersect_rect(&clipped, &rect, &root_client_rect)) goto done;
-
-    data->rects.window = rect;
-    data->rects.client = rect;
-    data->rects.visible = clipped;
-    frame = cgrect_from_rect(rect);
-    root_frame = cgrect_from_rect(root_window_rect);
-    SetRect(&root_size, 0, 0, root_window_rect.right - root_window_rect.left,
-            root_window_rect.bottom - root_window_rect.top);
-    relative_rect = rect;
-    OffsetRect(&relative_rect, -root_window_rect.left, -root_window_rect.top);
-    if (data->foreign_parent_window_number != root_window_number ||
-        !EqualRect(&data->foreign_parent_rect, &root_size) ||
-        !EqualRect(&data->foreign_child_rect, &relative_rect))
-    {
-        valid = macdrv_track_cocoa_window_parent(data->cocoa_window, root_window_number,
-                                                 root_frame, frame);
-        data->foreign_parent_window_number = root_window_number;
-        data->foreign_parent_rect = root_size;
-        data->foreign_child_rect = relative_rect;
-    }
-    else valid = TRUE;
-    data->on_screen = valid;
-
-done:
-    if (!tracking_allowed)
-    {
-        macdrv_untrack_cocoa_window_parent(data->cocoa_window);
-        data->foreign_parent_window_number = 0;
-    }
-    if (!valid) hide_window(data);
-    release_win_data(data);
-    return valid;
 }
 
 
@@ -1607,9 +1004,9 @@ void macdrv_begin_window_move_surface_hold(HWND hwnd)
     HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
 
     macdrv_end_window_move_surface_hold();
-    if (!root || !chromium_hwnd_or_root_uses_root_surface_composition(root)) return;
+    if (!root) return;
 
-    TRACE("holding Chromium/CEF root backing during window move hwnd %p root %p\n", hwnd, root);
+    TRACE("holding native root backing during window move hwnd %p root %p\n", hwnd, root);
 
     if ((data = get_win_data(root)))
     {
@@ -1630,14 +1027,13 @@ void macdrv_end_window_move_surface_hold(void)
     window_move_surface_hold_root = NULL;
     if (!root) return;
 
-    TRACE("releasing Chromium/CEF root backing after window move root %p\n", root);
+    TRACE("releasing native root backing after window move root %p\n", root);
     if ((data = get_win_data(root)))
     {
         if (data->cocoa_window)
             macdrv_set_cocoa_window_surface_updates_suspended(data->cocoa_window, false);
         release_win_data(data);
     }
-    NtUserRedrawWindow(root, NULL, 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
 }
 
 
@@ -1877,8 +1273,6 @@ static void macdrv_client_surface_destroy(struct client_surface *client)
     TRACE("%s\n", debugstr_client_surface(client));
 
     if (surface->metal_swapchain) macdrv_destroy_swapchain(surface->metal_swapchain);
-    if (surface->foreign_child_hwnd)
-        macdrv_release_foreign_child_win_data(surface->foreign_child_hwnd);
 }
 
 static void macdrv_client_surface_detach(struct client_surface *client)
@@ -1911,19 +1305,12 @@ static void macdrv_client_surface_update(struct client_surface *client)
 
     TRACE("%s\n", debugstr_client_surface(client));
 
+    if (surface->windowless_hwnd) return;
+
     NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
 
-    if (!(data = get_win_data(toplevel)))
-    {
-        if (!surface->foreign_child_hwnd || !(data = get_win_data(hwnd))) return;
-
-        NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
-        macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
-        macdrv_set_view_superview(surface->cocoa_view, NULL, data->cocoa_window, NULL, NULL);
-        release_win_data(data);
-        return;
-    }
+    if (!(data = get_win_data(toplevel))) return;
     macdrv_offset_client_rect_to_cocoa_frame(data, &rect);
     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
@@ -1937,8 +1324,11 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (!(data = get_win_data(surface->foreign_child_hwnd ?
-                              surface->foreign_child_hwnd : surface->client.hwnd))) return;
+    /* Foreign GPU surfaces are published through their offscreen IOSurface
+       layer.  They intentionally have no process-local Cocoa view/window. */
+    if (surface->windowless_hwnd) return;
+
+    if (!(data = get_win_data(surface->client.hwnd))) return;
     if (data->client_view != surface->cocoa_view)
     {
         if (data->client_view) macdrv_set_view_hidden(data->client_view, TRUE);
@@ -1946,8 +1336,6 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
         data->client_view = surface->cocoa_view;
     }
     release_win_data(data);
-    if (surface->foreign_child_hwnd)
-        macdrv_present_foreign_child_window(surface->foreign_child_hwnd);
 }
 
 static const struct client_surface_funcs macdrv_client_surface_funcs =
@@ -1968,22 +1356,31 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format)
 {
     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
     struct macdrv_client_surface *surface;
-    BOOL foreign_child = is_chromium_cef_child_window(hwnd) &&
-                         NtUserGetWindowThread(hwnd, NULL) != GetCurrentThreadId();
-    BOOL foreign_child_acquired;
+    struct macdrv_win_data *root_data;
+    BOOL has_local_cocoa_root = FALSE;
     RECT rect;
+
+    if ((root_data = get_win_data(toplevel)))
+    {
+        has_local_cocoa_root = !!root_data->cocoa_window;
+        release_win_data(root_data);
+    }
 
     NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
 
-    foreign_child_acquired = foreign_child &&
-                             macdrv_acquire_foreign_child_win_data(hwnd, &rect, NULL);
     if (!(surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd)))
-    {
-        if (foreign_child_acquired) macdrv_release_foreign_child_win_data(hwnd);
         return NULL;
+    if (!has_local_cocoa_root)
+        surface->windowless_hwnd = hwnd;
+
+    if (surface->windowless_hwnd)
+    {
+        TRACE("Switchyard created windowless GPU client surface %p source %p pixel_format %d rect %s\n",
+              surface, hwnd, pixel_format, wine_dbgstr_rect(&rect));
+        return &surface->client;
     }
-    if (foreign_child_acquired) surface->foreign_child_hwnd = hwnd;
+
     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(rect));
     if (!surface->cocoa_view)
     {
@@ -2004,6 +1401,15 @@ BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface 
     struct macdrv_win_data *data;
 
     if (surface->metal_swapchain) return TRUE;
+
+    if (surface->windowless_hwnd)
+    {
+        RECT rect;
+
+        if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
+        surface->metal_swapchain = macdrv_create_offscreen_swapchain(hwnd, cgrect_from_rect(rect));
+        return surface->metal_swapchain != NULL;
+    }
 
     if ((data = get_win_data(hwnd)))
     {
@@ -2103,11 +1509,16 @@ void macdrv_DestroyWindow(HWND hwnd)
 
     TRACE("%p\n", hwnd);
 
+    /* Source nodes can outlive their producer CAContext, and host nodes can
+       otherwise outlive their sole native Cocoa root.  Remove both sides while
+       the HWND identity is still queryable. */
+    remote_layer_purge_source(hwnd);
+    remote_layer_detach_host(hwnd);
+
     if (!(data = get_win_data(hwnd))) return;
 
     if (data->drag_event) NtSetEvent(data->drag_event, NULL);
 
-    macdrv_release_root_surface_backing(hwnd);
     destroy_cocoa_window(data);
 
     CFDictionaryRemoveValue(win_datas, hwnd);
@@ -2172,7 +1583,13 @@ void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent)
     TRACE("%p, %p, %p\n", hwnd, parent, old_parent);
 
     if (parent == old_parent) return;
-    if (!(data = get_win_data(hwnd))) return;
+    if (parent != NtUserGetDesktopWindow() && old_parent == NtUserGetDesktopWindow())
+        remote_layer_detach_host(hwnd);
+    if (!(data = get_win_data(hwnd)))
+    {
+        remote_layer_refresh_all();
+        return;
+    }
 
     if (parent != NtUserGetDesktopWindow()) /* a child window */
     {
@@ -2187,6 +1604,7 @@ void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent)
         create_cocoa_window(data);
     }
     release_win_data(data);
+    remote_layer_refresh_all();
 }
 
 
@@ -2369,49 +1787,599 @@ void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, BOOL per_pixel_alpha, UIN
     }
 }
 
-static struct macdrv_win_data *get_remote_layer_host_data(HWND hwnd, HWND expected_root, CGRect *frame)
+
+struct remote_layer_snapshot
 {
-    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
-    struct macdrv_win_data *root_data;
-    RECT rect;
+    UINT64 node_id;
+    UINT64 revision;
+    UINT64 refresh_ticket;
+    HWND source;
+    DWORD source_thread;
+    DWORD source_process;
+    enum macdrv_compositor_plane plane;
+    unsigned int context_id;
+    SIZE endpoint_size;
+    HWND host;
+    uintptr_t host_cookie;
+    CGRect content_frame;
+    CGRect clip_frame;
+    double z_position;
+    BOOL displayed;
+    BOOL endpoint_dirty;
+};
 
-    if (!root) return NULL;
-    if (chromium_hwnd_uses_dcomp_root_composition(hwnd))
+static struct macdrv_remote_layer *remote_layer_find_node_locked(UINT64 node_id)
+{
+    struct macdrv_remote_layer *entry;
+
+    for (entry = remote_layers; entry; entry = entry->next)
+        if (entry->node_id == node_id) return entry;
+    return NULL;
+}
+
+static void remote_layer_snapshot_from_entry(const struct macdrv_remote_layer *entry,
+                                             struct remote_layer_snapshot *snapshot)
+{
+    snapshot->node_id = entry->node_id;
+    snapshot->revision = entry->revision;
+    snapshot->refresh_ticket = entry->refresh_ticket;
+    snapshot->source = entry->source;
+    snapshot->source_thread = entry->source_thread;
+    snapshot->source_process = entry->source_process;
+    snapshot->plane = entry->plane;
+    snapshot->context_id = entry->context_id;
+    snapshot->endpoint_size = entry->endpoint_size;
+    snapshot->host = entry->host;
+    snapshot->host_cookie = entry->host_cookie;
+    snapshot->content_frame = entry->content_frame;
+    snapshot->clip_frame = entry->clip_frame;
+    snapshot->z_position = entry->z_position;
+    snapshot->displayed = entry->displayed;
+    snapshot->endpoint_dirty = entry->endpoint_dirty;
+}
+
+static BOOL compositor_find_tree_ordinal_v2(HWND sibling, HWND target,
+                                             unsigned int *ordinal, unsigned int *result)
+{
+    HWND next, child;
+
+    if (!sibling) return FALSE;
+    next = NtUserGetWindowRelative(sibling, GW_HWNDNEXT);
+    if (next && compositor_find_tree_ordinal_v2(next, target, ordinal, result)) return TRUE;
+    ++*ordinal;
+    if (sibling == target)
     {
-        TRACE("Switchyard refusing Chromium/CEF remote layer host for hwnd %p because DComp owns root composition\n",
-              hwnd);
-        return NULL;
+        *result = *ordinal;
+        return TRUE;
     }
-    if (expected_root && root != expected_root)
+    child = NtUserGetWindowRelative(sibling, GW_CHILD);
+    return child && compositor_find_tree_ordinal_v2(child, target, ordinal, result);
+}
+
+static double compositor_z_position_v2(HWND host, HWND source,
+                                        enum macdrv_compositor_plane plane)
+{
+    HWND root = NtUserGetAncestor(source, GA_ROOT);
+    unsigned int ordinal = 0, result = 0;
+    double base;
+
+    if (source == host)
+        base = 0.0;
+    else if (root == host && compositor_find_tree_ordinal_v2(
+                 NtUserGetWindowRelative(host, GW_CHILD), source, &ordinal, &result))
+        base = result * 2.0;
+    else
     {
-        TRACE("Switchyard remote layer host root changed for hwnd %p expected %p got %p\n",
-              hwnd, expected_root, root);
-        return NULL;
+        HWND desktop = NtUserGetDesktopWindow();
+
+        if (root && compositor_find_tree_ordinal_v2(
+                        NtUserGetWindowRelative(desktop, GW_CHILD), root, &ordinal, &result))
+            base = 1000000.0 + result * 2.0;
+        else
+            base = 1000000.0;
     }
-    if (!(root_data = get_win_data(root))) return NULL;
-    if (!root_data->cocoa_window)
+    return base + (plane == MACDRV_COMPOSITOR_GPU ? 1.0 : 0.0);
+}
+
+/* Return the nearest process-local Cocoa root from the real root/owner chain.
+   The retain is acquired while win_data is locked, so the pointer remains
+   valid after release_win_data() and through the synchronous Cocoa command. */
+static HWND remote_layer_find_local_host(HWND source, macdrv_window *window_ret)
+{
+    HWND candidate, owner;
+
+    *window_ret = NULL;
+    if (!source || !(candidate = NtUserGetAncestor(source, GA_ROOT))) return NULL;
+
+    for (;;)
     {
-        release_win_data(root_data);
-        return NULL;
-    }
+        struct macdrv_win_data *data;
 
-    *frame = CGRectNull;
-
-    if (root != hwnd)
-    {
-        UINT root_dpi = NtUserGetWinMonitorDpi(root, MDT_RAW_DPI);
-
-        if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI)))
+        if ((data = get_win_data(candidate)))
         {
-            release_win_data(root_data);
-            return NULL;
+            if (data->cocoa_window)
+                *window_ret = macdrv_retain_cocoa_window(data->cocoa_window);
+            release_win_data(data);
+            if (*window_ret) return candidate;
         }
-        NtUserMapWindowPoints(hwnd, root, (POINT *)&rect, 2, root_dpi);
-        macdrv_offset_client_rect_to_cocoa_frame(root_data, &rect);
-        *frame = cgrect_mac_from_win(cgrect_from_rect(rect));
+
+        if (!(owner = NtUserGetWindowRelative(candidate, GW_OWNER))) break;
+        owner = NtUserGetAncestor(owner, GA_ROOT);
+        if (!owner || owner == candidate) break;
+        candidate = owner;
+    }
+    return NULL;
+}
+
+static void remote_layer_combine_rect(HRGN region, const RECT *rect, int mode)
+{
+    HRGN temp;
+
+    if (!(temp = NtGdiCreateRectRgn(rect->left, rect->top, rect->right, rect->bottom))) return;
+    NtGdiCombineRgn(region, region, temp, mode);
+    NtGdiDeleteObjectApp(temp);
+}
+
+static BOOL remote_layer_query_placement(HWND source, HWND host, macdrv_window retained_window,
+                                         enum macdrv_compositor_plane plane,
+                                         const SIZE *endpoint_size,
+                                         CGRect *content_frame, CGRect *clip_frame,
+                                         CGRect **visible_rects, unsigned int *visible_count,
+                                         double *z_position, BOOL *displayed)
+{
+    struct macdrv_win_data *host_data;
+    HWND current, parent, root, sibling;
+    RECT content, clip, parent_rect, host_rect, sibling_rect;
+    HRGN visible_region = NULL;
+    RGNDATA *region_data = NULL;
+    UINT host_dpi;
+    BOOL visible;
+
+    *visible_rects = NULL;
+    *visible_count = 0;
+
+    if (!source || !host || !retained_window ||
+        !NtUserGetClientRect(source, &content, NtUserGetWinMonitorDpi(source, MDT_RAW_DPI)))
+        return FALSE;
+
+    host_dpi = NtUserGetWinMonitorDpi(host, MDT_RAW_DPI);
+    NtUserMapWindowPoints(source, host, (POINT *)&content, 2, host_dpi);
+    clip = content;
+    /* A child with WS_VISIBLE is still hidden when any intermediate parent is
+       hidden. Mirror IsWindowVisible semantics so a remote endpoint cannot
+       outlive the Win32 subtree that owns its presentation. */
+    visible = NtUserIsWindowVisible(source);
+    visible_region = NtGdiCreateRectRgn(clip.left, clip.top, clip.right, clip.bottom);
+    if (!visible_region) return FALSE;
+
+    /* The producer layer may use a rounded allocation larger than the HWND
+       client. Keep that allocation at 1:1 scale and crop it with clip_frame;
+       resizing CALayerHost to the client would scale pixels and desynchronise
+       rendering from Win32 input coordinates. */
+    if (endpoint_size && endpoint_size->cx > 0 && endpoint_size->cy > 0)
+    {
+        content.right = content.left + endpoint_size->cx;
+        content.bottom = content.top + endpoint_size->cy;
     }
 
-    return root_data;
+    if (NtUserGetClientRect(host, &host_rect, host_dpi))
+    {
+        intersect_rect(&clip, &clip, &host_rect);
+        remote_layer_combine_rect(visible_region, &host_rect, RGN_AND);
+    }
+
+    current = source;
+    while (current != host && (NtUserGetWindowLongW(current, GWL_STYLE) & WS_CHILD))
+    {
+        parent = NtUserGetAncestor(current, GA_PARENT);
+        if (!parent || parent == current) break;
+        if (NtUserGetClientRect(parent, &parent_rect,
+                                NtUserGetWinMonitorDpi(parent, MDT_RAW_DPI)))
+        {
+            NtUserMapWindowPoints(parent, host, (POINT *)&parent_rect, 2, host_dpi);
+            intersect_rect(&clip, &clip, &parent_rect);
+            remote_layer_combine_rect(visible_region, &parent_rect, RGN_AND);
+        }
+
+        /* A remote producer is above the root bitmap as a layer, so explicitly
+           remove regions occupied by higher Win32 siblings. This restores the
+           interleaving that a single root GDI bitmap otherwise cannot express. */
+        for (sibling = NtUserGetWindowRelative(parent, GW_CHILD); sibling && sibling != current;
+             sibling = NtUserGetWindowRelative(sibling, GW_HWNDNEXT))
+        {
+            if (!(NtUserGetWindowLongW(sibling, GWL_STYLE) & WS_VISIBLE)) continue;
+            if (!NtUserGetClientRect(sibling, &sibling_rect,
+                                     NtUserGetWinMonitorDpi(sibling, MDT_RAW_DPI)))
+                continue;
+            NtUserMapWindowPoints(sibling, host, (POINT *)&sibling_rect, 2, host_dpi);
+            remote_layer_combine_rect(visible_region, &sibling_rect, RGN_DIFF);
+        }
+        current = parent;
+    }
+
+    root = NtUserGetAncestor(source, GA_ROOT);
+    if (root && (NtUserGetWindowLongW(root, GWL_STYLE) & WS_MINIMIZE)) visible = FALSE;
+
+    if (!visible || NtGdiGetRgnBox(visible_region, &clip) == NULLREGION)
+    {
+        visible = FALSE;
+        SetRectEmpty(&clip);
+    }
+
+    if (!(host_data = get_win_data(host)))
+    {
+        NtGdiDeleteObjectApp(visible_region);
+        return FALSE;
+    }
+    if (host_data->cocoa_window != retained_window)
+    {
+        release_win_data(host_data);
+        NtGdiDeleteObjectApp(visible_region);
+        return FALSE;
+    }
+
+    if (visible)
+    {
+        DWORD size = NtGdiGetRegionData(visible_region, 0, NULL);
+
+        if (size && (region_data = malloc(size)) &&
+            NtGdiGetRegionData(visible_region, size, region_data))
+        {
+            RECT *rects = (RECT *)region_data->Buffer;
+            unsigned int i;
+
+            if ((*visible_rects = malloc(region_data->rdh.nCount * sizeof(**visible_rects))))
+            {
+                *visible_count = region_data->rdh.nCount;
+                for (i = 0; i < *visible_count; i++)
+                {
+                    RECT rect = rects[i];
+
+                    macdrv_offset_client_rect_to_cocoa_frame(host_data, &rect);
+                    (*visible_rects)[i] = cgrect_mac_from_win(cgrect_from_rect(rect));
+                }
+            }
+        }
+    }
+    macdrv_offset_client_rect_to_cocoa_frame(host_data, &content);
+    macdrv_offset_client_rect_to_cocoa_frame(host_data, &clip);
+    release_win_data(host_data);
+    free(region_data);
+    NtGdiDeleteObjectApp(visible_region);
+
+    *content_frame = cgrect_mac_from_win(cgrect_from_rect(content));
+    *clip_frame = cgrect_mac_from_win(cgrect_from_rect(clip));
+    *z_position = compositor_z_position_v2(host, source, plane);
+    *displayed = visible && !IsRectEmpty(&clip) && *visible_count;
+    return TRUE;
+}
+
+static void remote_layer_remove_cocoa(UINT64 node_id, UINT64 revision, BOOL permanent)
+{
+    macdrv_window_remove_compositor_node(NULL, node_id, revision, permanent);
+}
+
+static BOOL remote_layer_remove_node(UINT64 node_id, UINT64 expected_ticket, BOOL permanent)
+{
+    struct macdrv_remote_layer **cursor, *entry = NULL;
+    UINT64 revision = 0;
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    for (cursor = &remote_layers; *cursor; cursor = &(*cursor)->next)
+    {
+        if ((*cursor)->node_id != node_id) continue;
+        if (expected_ticket && (*cursor)->refresh_ticket != expected_ticket) break;
+        entry = *cursor;
+        *cursor = entry->next;
+        entry->next = NULL;
+        revision = ++entry->revision;
+        remote_layer_remove_cocoa(node_id, revision, permanent);
+        break;
+    }
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    if (!entry) return FALSE;
+    free(entry);
+    return TRUE;
+}
+
+static BOOL remote_layer_refresh_node(UINT64 node_id)
+{
+    struct remote_layer_snapshot snapshot;
+    struct macdrv_remote_layer *entry;
+    macdrv_window window = NULL;
+    HWND host = NULL;
+    DWORD source_process = 0, source_thread;
+    uintptr_t host_cookie = 0;
+    CGRect content_frame = CGRectZero, clip_frame = CGRectZero;
+    CGRect *visible_rects = NULL;
+    unsigned int visible_count = 0;
+    double z_position = 0.0;
+    BOOL displayed = FALSE, valid = FALSE;
+    UINT64 revision;
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    if (!(entry = remote_layer_find_node_locked(node_id)))
+    {
+        pthread_mutex_unlock(&remote_layer_mutex);
+        return FALSE;
+    }
+    entry->refresh_ticket++;
+    remote_layer_snapshot_from_entry(entry, &snapshot);
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    source_thread = NtUserGetWindowThread(snapshot.source, &source_process);
+    if (!source_thread || source_thread != snapshot.source_thread ||
+        source_process != snapshot.source_process)
+        return remote_layer_remove_node(node_id, snapshot.refresh_ticket, TRUE);
+
+    if ((host = remote_layer_find_local_host(snapshot.source, &window)))
+    {
+        host_cookie = (uintptr_t)window;
+        valid = remote_layer_query_placement(snapshot.source, host, window, snapshot.plane,
+                                             &snapshot.endpoint_size,
+                                             &content_frame, &clip_frame,
+                                             &visible_rects, &visible_count, &z_position,
+                                             &displayed);
+        if (!valid)
+        {
+            macdrv_release_cocoa_window(window);
+            window = NULL;
+            host = NULL;
+            host_cookie = 0;
+            displayed = FALSE;
+        }
+    }
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    entry = remote_layer_find_node_locked(node_id);
+    if (!entry || entry->refresh_ticket != snapshot.refresh_ticket ||
+        entry->context_id != snapshot.context_id || entry->source != snapshot.source)
+    {
+        pthread_mutex_unlock(&remote_layer_mutex);
+        if (window) macdrv_release_cocoa_window(window);
+        free(visible_rects);
+        return FALSE;
+    }
+
+    /* The visible-region mask can change while the bounding rectangle stays
+       constant, so every targeted tree refresh publishes a new revision. */
+    entry->host = host;
+    entry->host_cookie = host_cookie;
+    entry->content_frame = content_frame;
+    entry->clip_frame = clip_frame;
+    entry->z_position = z_position;
+    entry->displayed = displayed;
+    entry->endpoint_dirty = FALSE;
+    revision = ++entry->revision;
+    /* Submit while holding the registry lock. This gives the asynchronous
+       Cocoa queue the same per-node order as revision assignment, so a
+       permanent removal cannot be followed by an older delayed apply. */
+    if (host && window)
+        macdrv_window_apply_compositor_node(window, node_id, revision, snapshot.context_id,
+                                            content_frame, clip_frame, visible_rects,
+                                            visible_count, z_position, displayed);
+    else
+        remote_layer_remove_cocoa(node_id, revision, FALSE);
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    if (window)
+        macdrv_release_cocoa_window(window);
+    free(visible_rects);
+    return TRUE;
+}
+
+static void remote_layer_refresh_all(void)
+{
+    UINT64 *node_ids = NULL;
+    struct macdrv_remote_layer *entry;
+    unsigned int count = 0, i = 0;
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    for (entry = remote_layers; entry; entry = entry->next) count++;
+    if (count) node_ids = malloc(count * sizeof(*node_ids));
+    if (node_ids)
+        for (entry = remote_layers; entry; entry = entry->next) node_ids[i++] = entry->node_id;
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    for (i = 0; node_ids && i < count; i++) remote_layer_refresh_node(node_ids[i]);
+    free(node_ids);
+}
+
+static void remote_layer_refresh_for_window(HWND changed, UINT swp_flags)
+{
+    struct refresh_candidate
+    {
+        UINT64 node_id;
+        HWND source;
+        HWND host;
+    } *candidates = NULL;
+    struct macdrv_remote_layer *entry;
+    HWND changed_root = NtUserGetAncestor(changed, GA_ROOT);
+    BOOL changes_composition = !(swp_flags & SWP_NOMOVE) ||
+                               !(swp_flags & SWP_NOSIZE) ||
+                               !(swp_flags & SWP_NOZORDER) ||
+                               (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW |
+                                             SWP_FRAMECHANGED | SWP_STATECHANGED));
+    unsigned int count = 0, i = 0;
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    for (entry = remote_layers; entry; entry = entry->next) count++;
+    if (count) candidates = malloc(count * sizeof(*candidates));
+    if (candidates)
+    {
+        for (entry = remote_layers; entry; entry = entry->next)
+        {
+            candidates[i].node_id = entry->node_id;
+            candidates[i].source = entry->source;
+            candidates[i].host = entry->host;
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    for (i = 0; candidates && i < count; i++)
+    {
+        BOOL host_move_only = candidates[i].host == changed &&
+                              (swp_flags & SWP_NOSIZE) &&
+                              (swp_flags & SWP_NOZORDER) &&
+                              !(swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW |
+                                             SWP_FRAMECHANGED | SWP_STATECHANGED));
+        BOOL related;
+
+        if (host_move_only) continue;
+        related = candidates[i].source == changed || candidates[i].host == changed ||
+                  NtUserIsChild(changed, candidates[i].source);
+        /* Sibling geometry, visibility and ordering contribute to the mask
+           which interleaves a remote endpoint with ordinary Win32 children.
+           Refresh all endpoints in that root when any of those inputs change;
+           a native root-only move is still skipped above because its client
+           coordinates and masks do not change. */
+        if (!related && changes_composition)
+            related = changed_root && NtUserGetAncestor(candidates[i].source, GA_ROOT) == changed_root;
+        if (related) remote_layer_refresh_node(candidates[i].node_id);
+    }
+    free(candidates);
+}
+
+static void remote_layer_purge_source(HWND source)
+{
+    for (;;)
+    {
+        struct macdrv_remote_layer **cursor, *entry = NULL;
+        UINT64 node_id = 0, revision = 0;
+
+        pthread_mutex_lock(&remote_layer_mutex);
+        for (cursor = &remote_layers; *cursor; cursor = &(*cursor)->next)
+        {
+            if ((*cursor)->source != source) continue;
+            entry = *cursor;
+            *cursor = entry->next;
+            node_id = entry->node_id;
+            revision = ++entry->revision;
+            remote_layer_remove_cocoa(node_id, revision, TRUE);
+            break;
+        }
+        pthread_mutex_unlock(&remote_layer_mutex);
+        if (!entry) break;
+        free(entry);
+    }
+}
+
+static void remote_layer_detach_host(HWND host)
+{
+    for (;;)
+    {
+        struct macdrv_remote_layer *entry;
+        UINT64 node_id = 0, revision = 0;
+
+        pthread_mutex_lock(&remote_layer_mutex);
+        for (entry = remote_layers; entry; entry = entry->next)
+            if (entry->host == host) break;
+        if (!entry)
+        {
+            pthread_mutex_unlock(&remote_layer_mutex);
+            break;
+        }
+        entry->host = NULL;
+        entry->host_cookie = 0;
+        entry->displayed = FALSE;
+        entry->refresh_ticket++;
+        node_id = entry->node_id;
+        revision = ++entry->revision;
+        remote_layer_remove_cocoa(node_id, revision, FALSE);
+        pthread_mutex_unlock(&remote_layer_mutex);
+    }
+}
+
+static BOOL remote_layer_attach(HWND source, unsigned int context_id,
+                                enum macdrv_compositor_plane plane, SIZE endpoint_size)
+{
+    struct macdrv_remote_layer **cursor, *entry = NULL, *stale = NULL;
+    DWORD source_process = 0, source_thread;
+    UINT64 node_id;
+
+    if (!context_id || !(source_thread = NtUserGetWindowThread(source, &source_process)) ||
+        !source_process) return FALSE;
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    for (cursor = &remote_layers; *cursor; cursor = &(*cursor)->next)
+    {
+        if ((*cursor)->source != source || (*cursor)->plane != plane) continue;
+        if ((*cursor)->source_thread == source_thread &&
+            (*cursor)->source_process == source_process)
+            entry = *cursor;
+        else
+        {
+            stale = *cursor;
+            *cursor = stale->next;
+            stale->next = NULL;
+        }
+        break;
+    }
+
+    if (!entry)
+    {
+        if (!(entry = calloc(1, sizeof(*entry))))
+        {
+            pthread_mutex_unlock(&remote_layer_mutex);
+            free(stale);
+            return FALSE;
+        }
+        if (!(entry->node_id = ++next_remote_layer_node_id))
+            entry->node_id = ++next_remote_layer_node_id;
+        entry->revision = 1;
+        entry->source = source;
+        entry->source_thread = source_thread;
+        entry->source_process = source_process;
+        entry->plane = plane;
+        entry->next = remote_layers;
+        remote_layers = entry;
+    }
+    entry->context_id = context_id;
+    entry->endpoint_size = endpoint_size;
+    entry->endpoint_dirty = TRUE;
+    entry->refresh_ticket++;
+    node_id = entry->node_id;
+    if (stale)
+        remote_layer_remove_cocoa(stale->node_id, ++stale->revision, TRUE);
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    if (stale)
+    {
+        free(stale);
+    }
+    remote_layer_refresh_node(node_id);
+    return TRUE; /* A missing native root is a valid pending endpoint. */
+}
+
+static BOOL remote_layer_release(HWND source, unsigned int context_id,
+                                 enum macdrv_compositor_plane plane)
+{
+    struct macdrv_remote_layer **cursor, *entry = NULL;
+    UINT64 node_id = 0, revision = 0;
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    for (cursor = &remote_layers; *cursor; cursor = &(*cursor)->next)
+    {
+        if ((*cursor)->source != source || (*cursor)->plane != plane) continue;
+        if ((*cursor)->context_id != context_id)
+        {
+            pthread_mutex_unlock(&remote_layer_mutex);
+            return TRUE; /* stale producer generation */
+        }
+        entry = *cursor;
+        *cursor = entry->next;
+        node_id = entry->node_id;
+        revision = ++entry->revision;
+        remote_layer_remove_cocoa(node_id, revision, TRUE);
+        break;
+    }
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    if (!entry) return TRUE;
+    free(entry);
+    return TRUE;
 }
 
 
@@ -2439,168 +2407,22 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         activate_on_following_focus();
         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
         return 0;
-    case WM_MACDRV_CAN_HOST_REMOTE_LAYER:
+    case WM_MACDRV_ATTACH_REMOTE_DIB_LAYER:
+    case WM_MACDRV_ATTACH_REMOTE_GPU_LAYER:
     {
-        struct macdrv_win_data *data;
-        HWND child = wp ? (HWND)wp : hwnd;
-        CGRect frame;
-        BOOL can_host = FALSE;
+        enum macdrv_compositor_plane plane = msg == WM_MACDRV_ATTACH_REMOTE_GPU_LAYER ?
+                                             MACDRV_COMPOSITOR_GPU : MACDRV_COMPOSITOR_DIB;
+        SIZE endpoint_size = {LOWORD(lp), HIWORD(lp)};
 
-        if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
-        {
-            can_host = TRUE;
-            release_win_data(data);
-        }
-        return can_host;
+        return remote_layer_attach(hwnd, (unsigned int)wp, plane, endpoint_size);
     }
-    case WM_MACDRV_CREATE_REMOTE_LAYER:
+    case WM_MACDRV_RELEASE_REMOTE_DIB_LAYER:
+    case WM_MACDRV_RELEASE_REMOTE_GPU_LAYER:
     {
-        struct macdrv_win_data *data;
-        HWND child = wp ? (HWND)wp : hwnd;
-        macdrv_window window;
-        CGRect frame;
-        BOOL restore_alpha = FALSE;
-        BOOL dcomp_root_composition;
-        BOOL client_only_root;
-        BOOL stable_root_backing;
-        BOOL suppress_chromium_placeholder;
-        BOOL remove_full_root_placeholder;
-        BOOL clear_chromium_light_placeholder;
-        unsigned int context_id = (unsigned int)lp;
+        enum macdrv_compositor_plane plane = msg == WM_MACDRV_RELEASE_REMOTE_GPU_LAYER ?
+                                             MACDRV_COMPOSITOR_GPU : MACDRV_COMPOSITOR_DIB;
 
-        if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
-        {
-            window = data->cocoa_window;
-            client_only_root = macdrv_win_data_uses_chrome_client_only_frame(data);
-            stable_root_backing = data->chromium_root_surface_presented_once;
-            dcomp_root_composition = chromium_hwnd_or_root_uses_root_surface_composition(child);
-            suppress_chromium_placeholder = (!client_only_root || stable_root_backing) &&
-                                           dcomp_root_composition &&
-                                           is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
-            remove_full_root_placeholder = (!client_only_root || stable_root_backing) &&
-                                           dcomp_root_composition &&
-                                           is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
-                                           has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
-            if (remove_full_root_placeholder)
-                data->chromium_smaller_layer_hosted_once = TRUE;
-            suppress_chromium_placeholder = suppress_chromium_placeholder &&
-                                           data->chromium_smaller_layer_hosted_once;
-            clear_chromium_light_placeholder = !client_only_root && is_chromium_cef_child_window(child) &&
-                                               data->chromium_smaller_layer_hosted_once;
-            if (suppress_chromium_placeholder && mark_remote_layer_context_suppressed(data, context_id))
-            {
-                release_win_data(data);
-                TRACE("Switchyard suppressing full-root Chromium/CEF remote layer hwnd %p context_id %u\n",
-                      child, context_id);
-                macdrv_window_clear_light_color_image(window);
-                macdrv_window_release_ca_layer_host_view_immediately(window, context_id);
-                return 0;
-            }
-
-            mark_remote_layer_context_hosted(data, context_id, &restore_alpha);
-            release_win_data(data);
-
-            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", context_id);
-            if (restore_alpha) macdrv_set_window_alpha(window, 1.0);
-            if (clear_chromium_light_placeholder)
-                macdrv_window_clear_light_color_image(window);
-            if (remove_full_root_placeholder)
-            {
-                macdrv_window_clear_color_image(window);
-                macdrv_window_remove_full_frame_ca_layer_host_views(window, context_id);
-            }
-            if (CGRectIsNull(frame))
-                macdrv_window_create_ca_layer_host_view(window, context_id);
-            else
-                macdrv_window_create_ca_layer_host_view_at(window, context_id, frame);
-        }
-        return 0;
-    }
-    case WM_MACDRV_UPDATE_REMOTE_LAYER:
-    {
-        struct macdrv_win_data *data;
-        HWND child = wp ? (HWND)wp : hwnd;
-        macdrv_window window = NULL;
-        CGRect frame = CGRectNull;
-        BOOL restore_alpha = FALSE;
-        BOOL dcomp_root_composition;
-        BOOL client_only_root;
-        BOOL stable_root_backing;
-        BOOL suppress_chromium_placeholder;
-        BOOL remove_full_root_placeholder;
-        unsigned int context_id = (unsigned int)lp;
-
-        if ((data = get_remote_layer_host_data(child, wp ? hwnd : 0, &frame)))
-        {
-            window = data->cocoa_window;
-            client_only_root = macdrv_win_data_uses_chrome_client_only_frame(data);
-            stable_root_backing = data->chromium_root_surface_presented_once;
-            dcomp_root_composition = chromium_hwnd_or_root_uses_root_surface_composition(child);
-            suppress_chromium_placeholder = (!client_only_root || stable_root_backing) &&
-                                           dcomp_root_composition &&
-                                           is_full_root_chromium_placeholder(child, wp ? hwnd : 0);
-            remove_full_root_placeholder = (!client_only_root || stable_root_backing) &&
-                                           dcomp_root_composition &&
-                                           is_visible_smaller_chromium_viewport(child, wp ? hwnd : 0) &&
-                                           has_full_root_chromium_viewport_sibling(child, wp ? hwnd : 0);
-            if (remove_full_root_placeholder)
-                data->chromium_smaller_layer_hosted_once = TRUE;
-            suppress_chromium_placeholder = suppress_chromium_placeholder &&
-                                           data->chromium_smaller_layer_hosted_once;
-            if (suppress_chromium_placeholder && mark_remote_layer_context_suppressed(data, context_id))
-            {
-                release_win_data(data);
-                TRACE("Switchyard suppressing full-root Chromium/CEF remote layer update hwnd %p context_id %u\n",
-                      child, context_id);
-                macdrv_window_clear_light_color_image(window);
-                macdrv_window_release_ca_layer_host_view_immediately(window, context_id);
-                return 0;
-            }
-
-            mark_remote_layer_context_hosted(data, context_id, &restore_alpha);
-            release_win_data(data);
-
-            if (restore_alpha) macdrv_set_window_alpha(window, 1.0);
-            if (remove_full_root_placeholder)
-            {
-                macdrv_window_clear_color_image(window);
-                macdrv_window_remove_full_frame_ca_layer_host_views(window, context_id);
-            }
-        }
-        if (window && !CGRectIsNull(frame))
-            macdrv_window_update_ca_layer_host_view(window, context_id, frame);
-        return 0;
-    }
-    case WM_MACDRV_RELEASE_REMOTE_LAYER:
-    {
-        HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
-        struct macdrv_win_data *data;
-        macdrv_window window = NULL;
-        unsigned int context_id = (unsigned int)lp;
-
-        if (root && (data = get_win_data(root)))
-        {
-            window = data->cocoa_window;
-            if (!remote_layer_context_set_remove(data->suppressed_remote_layer_contexts, context_id) &&
-                remote_layer_context_set_remove(data->remote_layer_contexts, context_id) &&
-                data->remote_layer_hosts)
-                data->remote_layer_hosts--;
-            release_win_data(data);
-
-            TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", context_id);
-        }
-        if (window)
-            macdrv_window_release_ca_layer_host_view(window, context_id);
-        return 0;
-    }
-    case WM_MACDRV_PRESENT_ROOT_SURFACE:
-    {
-        HWND source = (HWND)wp;
-
-        if (lp && source && source != hwnd)
-            macdrv_forget_root_surface_overlay(hwnd, source);
-        macdrv_present_root_surface(hwnd, source ? source : hwnd);
-        return 0;
+        return remote_layer_release(hwnd, (unsigned int)wp, plane);
     }
     }
 
@@ -2609,33 +2431,44 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 
-void macdrv_create_remote_layer(void* hwnd_ptr, unsigned int context_id)
+
+static BOOL send_source_layer_message(HWND source, UINT message, unsigned int context_id,
+                                      SIZE endpoint_size)
 {
-    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, 0, context_id);
+    DWORD_PTR result = 0;
+
+    if (!source || !NtUserGetWindowThread(source, NULL)) return FALSE;
+    if (!send_message_timeout(source, message, context_id,
+                              MAKELPARAM(endpoint_size.cx, endpoint_size.cy),
+                              SMTO_ABORTIFHUNG, 2000, &result))
+    {
+        WARN("Switchyard source compositor message %#x timed out for source %p context %u\n",
+             message, source, context_id);
+        return FALSE;
+    }
+    return !!result;
 }
 
-
-void macdrv_create_remote_layer_for_host(void* host_hwnd_ptr, void* child_hwnd_ptr, unsigned int context_id)
+bool macdrv_attach_remote_layer(void* source_ptr, unsigned int context_id, bool gpu,
+                                CGSize endpoint_size)
 {
-    NtUserPostMessage((HWND)host_hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, (WPARAM)child_hwnd_ptr, context_id);
+    SIZE size = {min(max((int)endpoint_size.width, 0), 0xffff),
+                 min(max((int)endpoint_size.height, 0), 0xffff)};
+
+    return send_source_layer_message((HWND)source_ptr,
+                                     gpu ? WM_MACDRV_ATTACH_REMOTE_GPU_LAYER :
+                                           WM_MACDRV_ATTACH_REMOTE_DIB_LAYER,
+                                     context_id, size);
 }
 
-
-void macdrv_update_remote_layer(void* hwnd_ptr, unsigned int context_id)
+bool macdrv_release_remote_layer(void* source_ptr, unsigned int context_id, bool gpu)
 {
-    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_UPDATE_REMOTE_LAYER, 0, context_id);
-}
+    SIZE size = {0};
 
-
-void macdrv_update_remote_layer_for_host(void* host_hwnd_ptr, void* child_hwnd_ptr, unsigned int context_id)
-{
-    NtUserPostMessage((HWND)host_hwnd_ptr, WM_MACDRV_UPDATE_REMOTE_LAYER, (WPARAM)child_hwnd_ptr, context_id);
-}
-
-
-void macdrv_release_remote_layer(void* hwnd_ptr, unsigned int context_id)
-{
-    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_RELEASE_REMOTE_LAYER, 0, context_id);
+    return send_source_layer_message((HWND)source_ptr,
+                                     gpu ? WM_MACDRV_RELEASE_REMOTE_GPU_LAYER :
+                                           WM_MACDRV_RELEASE_REMOTE_DIB_LAYER,
+                                     context_id, size);
 }
 
 
@@ -2645,76 +2478,18 @@ void macdrv_release_remote_layer(void* hwnd_ptr, unsigned int context_id)
 BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects)
 {
     struct macdrv_win_data *data = get_win_data(hwnd);
-    BOOL root_composed_child = chromium_hwnd_should_root_compose_surface(hwnd);
     BOOL ret = FALSE;
-    HWND root;
 
     TRACE("hwnd %p, swp_flags %04x, shaped %u, rects %s\n", hwnd, swp_flags, shaped, debugstr_window_rects(rects));
-
-    if (chromium_hwnd_uses_dcomp_root_composition(hwnd) || root_composed_child)
-    {
-        if (data)
-        {
-            if (data->foreign_child && data->cocoa_window)
-                hide_window(data);
-            release_win_data(data);
-        }
-        if (root_composed_child && (root = NtUserGetAncestor(hwnd, GA_ROOT)) && root != hwnd)
-        {
-            struct macdrv_win_data *root_data = get_win_data(root);
-
-            if (root_data)
-            {
-                ret = !!root_data->cocoa_window;
-                release_win_data(root_data);
-            }
-            if (ret)
-            {
-                TRACE("Switchyard routing Chromium/CEF child window %p through DComp root %p backing surface\n",
-                      hwnd, root);
-                return TRUE;
-            }
-        }
-        TRACE("Switchyard keeping Chromium/CEF child window %p on Wine DComp root composition\n", hwnd);
-        return FALSE;
-    }
-
-    if (chromium_hwnd_uses_owner_composition(hwnd))
-    {
-        if (data)
-        {
-            if (data->cocoa_window)
-            {
-                TRACE("Switchyard destroying owned Chromium/CEF popup mac window for hwnd %p because DComp presents through owner root\n",
-                      hwnd);
-                destroy_cocoa_window(data);
-            }
-            release_win_data(data);
-        }
-        TRACE("Switchyard keeping owned Chromium/CEF popup hwnd %p on owner DComp root composition\n",
-              hwnd);
-        return FALSE;
-    }
 
     if (!data && !(data = macdrv_create_win_data(hwnd, rects))) return FALSE; /* use default surface */
     data->shaped = shaped;
 
-    ret = !!data->cocoa_window; /* use default surface if we don't have a window */
+    ret = !!data->cocoa_window;
     release_win_data(data);
-
-    if (!ret && is_chromium_cef_child_window(hwnd) && (root = NtUserGetAncestor(hwnd, GA_ROOT)) && root != hwnd)
-    {
-        struct macdrv_win_data *root_data = get_win_data(root);
-
-        if (root_data)
-        {
-            ret = !!root_data->cocoa_window;
-            release_win_data(root_data);
-        }
-        if (ret) TRACE("Switchyard redirecting Chromium/CEF child window %p through root %p\n", hwnd, root);
-    }
-
-    return ret;
+    /* A non-native HWND still owns a pending DIB/GPU plane even before its
+       canonical Cocoa root exists. */
+    return ret || NtUserIsWindow(hwnd);
 }
 
 
@@ -2726,7 +2501,7 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
     struct macdrv_window_features wf = get_window_features_for_style(style, ex_style, FALSE);
 
     *style_mask = *ex_style_mask = 0;
-    if (chrome_root_should_use_custom_frame(hwnd, style, ex_style))
+    if (root_uses_extended_frame(hwnd, style, ex_style))
         return TRUE;
 
     if (wf.title_bar)
@@ -2756,7 +2531,11 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
     unsigned int new_style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     struct window_rects old_rects;
 
-    if (!(data = get_win_data(hwnd))) return;
+    if (!(data = get_win_data(hwnd)))
+    {
+        remote_layer_refresh_for_window(hwnd, swp_flags);
+        return;
+    }
 
     thread_data = macdrv_thread_data();
 
@@ -2765,17 +2544,6 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
     TRACE("win %p/%p new_rects %s style %08x flags %08x surface %p\n", hwnd, data->cocoa_window,
           debugstr_window_rects(new_rects), new_style, swp_flags, surface);
-
-    if (chromium_hwnd_uses_owner_composition(hwnd))
-    {
-        if (data->cocoa_window)
-        {
-            TRACE("Switchyard destroying owned Chromium/CEF popup mac window for hwnd %p after owner DComp composition became active\n",
-                  hwnd);
-            destroy_cocoa_window(data);
-        }
-        goto done;
-    }
 
     if (!data->cocoa_window) goto done;
 
@@ -2819,6 +2587,9 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
 done:
     release_win_data(data);
+    /* Compositor geometry follows the authoritative Win32 window tree, not
+       whichever pixel producer happens to submit the next frame. */
+    remote_layer_refresh_for_window(hwnd, swp_flags);
 }
 
 
@@ -2864,7 +2635,7 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
     RECT rect;
     UINT flags = SWP_NOACTIVATE | SWP_NOZORDER;
     int width, height;
-    BOOL being_dragged, chrome_custom_frame, position_changed;
+    BOOL being_dragged, extended_frame;
 
     if (!hwnd) return;
     if (!(data = get_win_data(hwnd))) return;
@@ -2881,13 +2652,13 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
           event->window_frame_changed.fullscreen, event->window_frame_changed.in_resize);
 
     rect = rect_from_cgrect(event->window_frame_changed.frame);
-    chrome_custom_frame = win_data_uses_chrome_custom_frame(data);
-    if (chrome_custom_frame)
+    extended_frame = win_data_uses_extended_frame(data);
+    if (extended_frame)
     {
         const RECT *frame_rect = get_cocoa_frame_rect(data);
 
         /*
-         * A Chrome Cocoa frame represents the Win32 client. Convert AppKit's
+         * A DWM-extended Cocoa frame represents the Win32 client. Convert AppKit's
          * move/resize result back to the whole Win32 window before feeding it
          * to user32, otherwise every frame notification applies the non-client
          * insets a second time and shifts pixels away from input coordinates.
@@ -2906,7 +2677,6 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
     else
         TRACE("%p moving from (%d,%d) to (%d,%d)\n", hwnd, data->rects.window.left,
               data->rects.window.top, rect.left, rect.top);
-    position_changed = !(flags & SWP_NOMOVE);
 
     if ((data->rects.window.right - data->rects.window.left == width &&
          data->rects.window.bottom - data->rects.window.top == height) ||
@@ -2927,14 +2697,6 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
         if (send_sizemove)
             send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
         NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
-        if (chrome_custom_frame && position_changed)
-        {
-            /* AppKit discards Chromium's composed root contents on a native
-               borderless move, while a position-only Win32 change does not
-               make Chromium submit a replacement frame.  Repaint into the
-               same root backing at its new position. */
-            NtUserRedrawWindow(hwnd, NULL, 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-        }
         if (send_sizemove)
             send_message(hwnd, WM_EXITSIZEMOVE, 0, 0);
     }
@@ -3167,8 +2929,7 @@ void macdrv_window_drag_begin(HWND hwnd, const macdrv_event *event)
     data->drag_event = drag_event;
     release_win_data(data);
 
-    /* Chrome's custom frame is moved by Cocoa rather than move_window().  Keep
-       the already-composited root backing stable for that native drag too. */
+    /* Preserve the latest complete backing while Cocoa drives a native drag. */
     macdrv_begin_window_move_surface_hold(hwnd);
 
     if (!event->window_drag_begin.no_activate && can_window_become_foreground(hwnd) &&

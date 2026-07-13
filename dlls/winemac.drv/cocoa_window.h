@@ -82,16 +82,12 @@
     BOOL ignore_windowDeminiaturize;
     BOOL ignore_windowResize;
     BOOL surfaceUpdatesSuspended;
-    unsigned long long rootSurfaceSubmissionSequence;
+    BOOL surfaceUpdateScheduled;
+    CGImageRef pendingSurfaceImage;
+    CGRect pendingSurfaceRect;
+    CGRect pendingSurfaceDirty;
     BOOL fakingClose;
 
-    CGWindowID trackedParentWindowNumber;
-    CGFloat trackedParentLeftInset;
-    CGFloat trackedParentTopInset;
-    CGFloat trackedParentRightInset;
-    CGFloat trackedParentBottomInset;
-    CGRect trackedParentLastChildFrame;
-    BOOL trackedParentHasChildFrame;
 
     CAShapeLayer* contentViewMaskLayer;
 }

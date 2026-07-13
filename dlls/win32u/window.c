@@ -2065,55 +2065,6 @@ static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, str
     return TRUE;
 }
 
-static BOOL is_chromium_cef_child_window(HWND hwnd)
-{
-    static const WCHAR cef_browser_window[] =
-        {'C','e','f','B','r','o','w','s','e','r','W','i','n','d','o','w',0};
-    static const WCHAR chrome_render_widget[] =
-        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
-    static const WCHAR chrome_widget_prefix[] =
-        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
-    static const WCHAR intermediate_d3d_window[] =
-        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, cef_browser_window)
-        || !wcscmp(class_name, chrome_render_widget)
-        || !wcscmp(class_name, intermediate_d3d_window)
-        || !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
-}
-
-static BOOL is_chromium_dcomp_target_window(HWND hwnd)
-{
-    static const WCHAR intermediate_d3d_window[] =
-        {'I','n','t','e','r','m','e','d','i','a','t','e',' ','D','3','D',' ','W','i','n','d','o','w',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, intermediate_d3d_window);
-}
-
 static const WCHAR wine_window_topmost_composed[] =
     {'w','i','n','e','_','w','i','n','d','o','w','_','t','o','p','m','o','s','t','_','c','o','m','p','o','s','e','d',0};
 static const WCHAR wine_window_non_topmost_composed[] =
@@ -2125,118 +2076,24 @@ static BOOL is_dcomp_composed_hwnd(HWND hwnd)
                    NtUserGetProp(hwnd, wine_window_non_topmost_composed));
 }
 
-static BOOL is_chrome_widget_window(HWND hwnd)
+static BOOL child_crosses_process_boundary(HWND hwnd)
 {
-    static const WCHAR chrome_widget_prefix[] =
-        {'C','h','r','o','m','e','_','W','i','d','g','e','t','W','i','n','_',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
+    HWND current = hwnd, parent, desktop = NtUserGetDesktopWindow();
+    DWORD process, parent_process;
+
+    if (!NtUserGetWindowThread( hwnd, &process )) return FALSE;
+    while ((parent = NtUserGetAncestor( current, GA_PARENT )) && parent != desktop)
     {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcsncmp(class_name, chrome_widget_prefix, ARRAY_SIZE(chrome_widget_prefix) - 1);
-}
-
-static BOOL is_chrome_render_widget_host_window(HWND hwnd)
-{
-    static const WCHAR chrome_render_widget[] =
-        {'C','h','r','o','m','e','_','R','e','n','d','e','r','W','i','d','g','e','t','H','o','s','t','H','W','N','D',0};
-    WCHAR class_name[64];
-    UNICODE_STRING name =
-    {
-        .Buffer = class_name,
-        .MaximumLength = sizeof(class_name),
-    };
-    int len;
-
-    if (!(len = NtUserGetClassName(hwnd, FALSE, &name))) return FALSE;
-
-    if (len >= ARRAY_SIZE(class_name)) len = ARRAY_SIZE(class_name) - 1;
-    class_name[len] = 0;
-
-    return !wcscmp(class_name, chrome_render_widget);
-}
-
-static BOOL chrome_subtree_has_render_widget(HWND hwnd)
-{
-    HWND child;
-
-    if (is_chrome_render_widget_host_window(hwnd)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chrome_subtree_has_render_widget(child)) return TRUE;
+        if (!NtUserGetWindowThread( parent, &parent_process ) || parent_process != process)
+            return TRUE;
+        current = parent;
     }
-
     return FALSE;
 }
 
-static BOOL chrome_root_has_render_widget(HWND root)
+static BOOL child_needs_redirected_surface(HWND hwnd)
 {
-    return root && is_chrome_widget_window(root) && chrome_subtree_has_render_widget(root);
-}
-
-static BOOL chromium_subtree_has_dcomp_target(HWND hwnd)
-{
-    HWND child;
-
-    if (is_chromium_cef_child_window(hwnd) && is_dcomp_composed_hwnd(hwnd)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL chromium_root_uses_dcomp_composition(HWND root)
-{
-    HWND child;
-
-    if (!root) return FALSE;
-    if (is_dcomp_composed_hwnd(root)) return TRUE;
-
-    for (child = NtUserGetWindowRelative(root, GW_CHILD); child;
-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
-    {
-        if (chromium_subtree_has_dcomp_target(child)) return TRUE;
-    }
-
-    return FALSE;
-}
-
-static BOOL chromium_hwnd_uses_dcomp_root_composition(HWND hwnd)
-{
-    HWND root;
-
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-    if (is_dcomp_composed_hwnd(hwnd)) return TRUE;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root != hwnd && chromium_root_uses_dcomp_composition(root);
-}
-
-static BOOL chromium_hwnd_should_root_compose_surface(HWND hwnd)
-{
-    HWND root;
-
-    if (!is_chromium_cef_child_window(hwnd)) return FALSE;
-    if (is_dcomp_composed_hwnd(hwnd) || is_chromium_dcomp_target_window(hwnd)) return FALSE;
-
-    root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root != hwnd &&
-           (chromium_root_uses_dcomp_composition(root) || chrome_root_has_render_widget(root));
+    return is_dcomp_composed_hwnd( hwnd ) || child_crosses_process_boundary( hwnd );
 }
 
 static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
@@ -2265,16 +2122,10 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
-    else if (is_child && chromium_hwnd_uses_dcomp_root_composition(hwnd) &&
-             !chromium_hwnd_should_root_compose_surface(hwnd))
-    {
-        TRACE( "keeping Chromium/CEF child window %p on its root surface because DComp owns composition\n", hwnd );
-        needs_surface = FALSE;
-    }
-    else if (is_child && !is_chromium_cef_child_window(hwnd)) needs_surface = FALSE;
+    else if (is_child && !child_needs_redirected_surface( hwnd )) needs_surface = FALSE;
     else if (is_child)
     {
-        TRACE( "allowing Chromium/CEF child window %p to own a redirected surface\n", hwnd );
+        TRACE( "allowing independent child window %p to own a redirected surface\n", hwnd );
         if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
         else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
         else needs_surface = !!(style & WS_VISIBLE);

@@ -9,6 +9,7 @@ UNIX_LIBS    = \
 	-framework CoreVideo \
 	-framework Foundation \
 	-framework IOKit \
+	-framework IOSurface \
 	-framework Metal \
 	-framework OpenGL \
 	-framework QuartzCore \
