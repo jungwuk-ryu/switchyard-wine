@@ -22,7 +22,7 @@ brew install bison flex pkgconf mingw-w64
 ./switchyard/verify_source.sh
 ```
 
-This verifies the pinned upstream ancestry, imported patch trailers, whitespace, and the absence of obvious proprietary runtime artifacts.
+This verifies the pinned upstream ancestry, whitespace, and the absence of obvious proprietary runtime artifacts.
 
 Inspect the source identity that would be written to a runtime manifest with:
 

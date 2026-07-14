@@ -22,4 +22,4 @@ Every generated `switchyard-runtime.json` records the source repository and comm
 
 ## Release model
 
-The `main` branch is a linear downstream branch rooted at the revision in `switchyard/upstream-base.txt`. Historical Switchyard patches were imported as individual commits with `Switchyard-Patch` trailers. Source tags identify immutable inputs; they do not imply that Apple or other third-party binaries are included.
+The `main` branch is a linear downstream branch rooted at the revision in `switchyard/upstream-base.txt`. Each Switchyard compatibility change is represented by an ordinary reviewable commit, and Git history is the canonical change record. Source tags identify immutable inputs; they do not imply that Apple or other third-party binaries are included.

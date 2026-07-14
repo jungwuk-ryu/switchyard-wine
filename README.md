@@ -18,10 +18,7 @@ Switchyard Wine is an independent downstream project. It is not affiliated with 
 - `switchyard/`: source verification and reproducible local runtime build tooling
 - `docs/architecture.md`: application, runtime, and user-provided software boundaries
 - `docs/building.md`: supported local build workflow
-- `docs/provenance.md`: upstream base, history import, and licensing provenance
-- `docs/import-map.md`: one-to-one mapping from every former patch ID to its commit
-- `docs/patch-history.md`: historical rationale and validation ledger for the imported patch IDs
-- `switchyard/imported-patches.txt`: immutable manifest of the 106 migrated patch IDs
+- `docs/provenance.md`: upstream base, commit history, and licensing provenance
 
 Start with:
 
