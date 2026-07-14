@@ -298,6 +298,338 @@ static struct cryptobuffer_factory cryptobuffer_factory =
 
 IActivationFactory *cryptobuffer_activation_factory = &cryptobuffer_factory.IActivationFactory_iface;
 
+struct appcapability_factory
+{
+    IActivationFactory IActivationFactory_iface;
+    IAppCapabilityStatics IAppCapabilityStatics_iface;
+    LONG refcount;
+};
+
+struct appcapability
+{
+    IAppCapability IAppCapability_iface;
+    LONG refcount;
+    HSTRING capability_name;
+};
+
+static inline struct appcapability_factory *impl_from_appcapability_factory_IActivationFactory(IActivationFactory *iface)
+{
+    return CONTAINING_RECORD(iface, struct appcapability_factory, IActivationFactory_iface);
+}
+
+static inline struct appcapability *impl_from_IAppCapability(IAppCapability *iface)
+{
+    return CONTAINING_RECORD(iface, struct appcapability, IAppCapability_iface);
+}
+
+static HRESULT appcapability_get_class_name(HSTRING *class_name)
+{
+    return WindowsCreateString(RuntimeClass_Windows_Security_Authorization_AppCapabilityAccess_AppCapability,
+            wcslen(RuntimeClass_Windows_Security_Authorization_AppCapabilityAccess_AppCapability), class_name);
+}
+
+static HRESULT WINAPI appcapability_factory_QueryInterface(IActivationFactory *iface, REFIID iid, void **out)
+{
+    struct appcapability_factory *factory = impl_from_appcapability_factory_IActivationFactory(iface);
+
+    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IUnknown) ||
+        IsEqualGUID(iid, &IID_IInspectable) ||
+        IsEqualGUID(iid, &IID_IAgileObject) ||
+        IsEqualGUID(iid, &IID_IActivationFactory))
+    {
+        IUnknown_AddRef(iface);
+        *out = &factory->IActivationFactory_iface;
+        return S_OK;
+    }
+
+    if (IsEqualGUID(iid, &IID_IAppCapabilityStatics))
+    {
+        IUnknown_AddRef(iface);
+        *out = &factory->IAppCapabilityStatics_iface;
+        return S_OK;
+    }
+
+    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI appcapability_factory_AddRef(IActivationFactory *iface)
+{
+    struct appcapability_factory *factory = impl_from_appcapability_factory_IActivationFactory(iface);
+    ULONG refcount = InterlockedIncrement(&factory->refcount);
+
+    TRACE("iface %p, refcount %lu.\n", iface, refcount);
+
+    return refcount;
+}
+
+static ULONG WINAPI appcapability_factory_Release(IActivationFactory *iface)
+{
+    struct appcapability_factory *factory = impl_from_appcapability_factory_IActivationFactory(iface);
+    ULONG refcount = InterlockedDecrement(&factory->refcount);
+
+    TRACE("iface %p, refcount %lu.\n", iface, refcount);
+
+    return refcount;
+}
+
+static HRESULT WINAPI appcapability_factory_GetIids(IActivationFactory *iface, ULONG *iid_count, IID **iids)
+{
+    FIXME("iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids);
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI appcapability_factory_GetRuntimeClassName(IActivationFactory *iface, HSTRING *class_name)
+{
+    TRACE("iface %p, class_name %p.\n", iface, class_name);
+    return appcapability_get_class_name(class_name);
+}
+
+static HRESULT WINAPI appcapability_factory_GetTrustLevel(IActivationFactory *iface, TrustLevel *trust_level)
+{
+    TRACE("iface %p, trust_level %p.\n", iface, trust_level);
+    *trust_level = BaseTrust;
+    return S_OK;
+}
+
+static const struct IAppCapabilityVtbl appcapability_vtbl;
+
+static HRESULT appcapability_create(HSTRING capability_name, IAppCapability **out)
+{
+    struct appcapability *impl;
+    HRESULT hr;
+
+    if (!(impl = calloc(1, sizeof(*impl))))
+        return E_OUTOFMEMORY;
+
+    impl->IAppCapability_iface.lpVtbl = &appcapability_vtbl;
+    impl->refcount = 1;
+
+    if (FAILED(hr = WindowsDuplicateString(capability_name, &impl->capability_name)))
+    {
+        free(impl);
+        return hr;
+    }
+
+    *out = &impl->IAppCapability_iface;
+    return S_OK;
+}
+
+static HRESULT WINAPI appcapability_factory_ActivateInstance(IActivationFactory *iface, IInspectable **instance)
+{
+    FIXME("iface %p, instance %p stub!\n", iface, instance);
+    return E_NOTIMPL;
+}
+
+static const struct IActivationFactoryVtbl appcapability_factory_vtbl =
+{
+    appcapability_factory_QueryInterface,
+    appcapability_factory_AddRef,
+    appcapability_factory_Release,
+    /* IInspectable methods */
+    appcapability_factory_GetIids,
+    appcapability_factory_GetRuntimeClassName,
+    appcapability_factory_GetTrustLevel,
+    /* IActivationFactory methods */
+    appcapability_factory_ActivateInstance,
+};
+
+DEFINE_IINSPECTABLE(appcapability_statics, IAppCapabilityStatics, struct appcapability_factory, IActivationFactory_iface);
+
+static HRESULT WINAPI appcapability_statics_RequestAccessForCapabilitiesAsync(IAppCapabilityStatics *iface,
+        IIterable_HSTRING *capability_names, IAsyncOperation_IMapView_HSTRING_AppCapabilityAccessStatus **operation)
+{
+    FIXME("iface %p, capability_names %p, operation %p stub!\n", iface, capability_names, operation);
+    *operation = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI appcapability_statics_RequestAccessForCapabilitiesForUserAsync(IAppCapabilityStatics *iface,
+        __x_ABI_CWindows_CSystem_CIUser *user, IIterable_HSTRING *capability_names,
+        IAsyncOperation_IMapView_HSTRING_AppCapabilityAccessStatus **operation)
+{
+    FIXME("iface %p, user %p, capability_names %p, operation %p stub!\n", iface, user, capability_names, operation);
+    *operation = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI appcapability_statics_Create(IAppCapabilityStatics *iface, HSTRING capability_name,
+        IAppCapability **result)
+{
+    TRACE("iface %p, capability_name %s, result %p.\n", iface, debugstr_hstring(capability_name), result);
+    return appcapability_create(capability_name, result);
+}
+
+static HRESULT WINAPI appcapability_statics_CreateWithProcessIdForUser(IAppCapabilityStatics *iface,
+        __x_ABI_CWindows_CSystem_CIUser *user, HSTRING capability_name, UINT32 pid, IAppCapability **result)
+{
+    TRACE("iface %p, user %p, capability_name %s, pid %u, result %p.\n",
+            iface, user, debugstr_hstring(capability_name), pid, result);
+    return appcapability_create(capability_name, result);
+}
+
+static const struct IAppCapabilityStaticsVtbl appcapability_statics_vtbl =
+{
+    appcapability_statics_QueryInterface,
+    appcapability_statics_AddRef,
+    appcapability_statics_Release,
+    /* IInspectable methods */
+    appcapability_statics_GetIids,
+    appcapability_statics_GetRuntimeClassName,
+    appcapability_statics_GetTrustLevel,
+    /* IAppCapabilityStatics methods */
+    appcapability_statics_RequestAccessForCapabilitiesAsync,
+    appcapability_statics_RequestAccessForCapabilitiesForUserAsync,
+    appcapability_statics_Create,
+    appcapability_statics_CreateWithProcessIdForUser,
+};
+
+static HRESULT WINAPI appcapability_QueryInterface(IAppCapability *iface, REFIID iid, void **out)
+{
+    struct appcapability *impl = impl_from_IAppCapability(iface);
+
+    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IUnknown) ||
+        IsEqualGUID(iid, &IID_IInspectable) ||
+        IsEqualGUID(iid, &IID_IAgileObject) ||
+        IsEqualGUID(iid, &IID_IAppCapability))
+    {
+        IAppCapability_AddRef(iface);
+        *out = &impl->IAppCapability_iface;
+        return S_OK;
+    }
+
+    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI appcapability_AddRef(IAppCapability *iface)
+{
+    struct appcapability *impl = impl_from_IAppCapability(iface);
+    ULONG refcount = InterlockedIncrement(&impl->refcount);
+
+    TRACE("iface %p, refcount %lu.\n", iface, refcount);
+
+    return refcount;
+}
+
+static ULONG WINAPI appcapability_Release(IAppCapability *iface)
+{
+    struct appcapability *impl = impl_from_IAppCapability(iface);
+    ULONG refcount = InterlockedDecrement(&impl->refcount);
+
+    TRACE("iface %p, refcount %lu.\n", iface, refcount);
+
+    if (!refcount)
+    {
+        WindowsDeleteString(impl->capability_name);
+        free(impl);
+    }
+
+    return refcount;
+}
+
+static HRESULT WINAPI appcapability_GetIids(IAppCapability *iface, ULONG *iid_count, IID **iids)
+{
+    FIXME("iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids);
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI appcapability_GetRuntimeClassName(IAppCapability *iface, HSTRING *class_name)
+{
+    TRACE("iface %p, class_name %p.\n", iface, class_name);
+    return appcapability_get_class_name(class_name);
+}
+
+static HRESULT WINAPI appcapability_GetTrustLevel(IAppCapability *iface, TrustLevel *trust_level)
+{
+    TRACE("iface %p, trust_level %p.\n", iface, trust_level);
+    *trust_level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI appcapability_get_CapabilityName(IAppCapability *iface, HSTRING *value)
+{
+    struct appcapability *impl = impl_from_IAppCapability(iface);
+
+    TRACE("iface %p, value %p.\n", iface, value);
+
+    return WindowsDuplicateString(impl->capability_name, value);
+}
+
+static HRESULT WINAPI appcapability_get_User(IAppCapability *iface, __x_ABI_CWindows_CSystem_CIUser **value)
+{
+    TRACE("iface %p, value %p.\n", iface, value);
+
+    *value = NULL;
+    return S_OK;
+}
+
+static HRESULT WINAPI appcapability_RequestAccessAsync(IAppCapability *iface,
+        IAsyncOperation_AppCapabilityAccessStatus **operation)
+{
+    FIXME("iface %p, operation %p stub!\n", iface, operation);
+    *operation = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI appcapability_CheckAccess(IAppCapability *iface, AppCapabilityAccessStatus *result)
+{
+    TRACE("iface %p, result %p.\n", iface, result);
+
+    *result = AppCapabilityAccessStatus_DeniedBySystem;
+    return S_OK;
+}
+
+static HRESULT WINAPI appcapability_add_AccessChanged(IAppCapability *iface,
+        ITypedEventHandler_AppCapability_AppCapabilityAccessChangedEventArgs *handler, EventRegistrationToken *token)
+{
+    static LONG next_token;
+
+    FIXME("iface %p, handler %p, token %p stub!\n", iface, handler, token);
+
+    token->value = InterlockedIncrement(&next_token);
+    return S_OK;
+}
+
+static HRESULT WINAPI appcapability_remove_AccessChanged(IAppCapability *iface, EventRegistrationToken token)
+{
+    FIXME("iface %p, token %#I64x stub!\n", iface, token.value);
+    return S_OK;
+}
+
+static const struct IAppCapabilityVtbl appcapability_vtbl =
+{
+    appcapability_QueryInterface,
+    appcapability_AddRef,
+    appcapability_Release,
+    /* IInspectable methods */
+    appcapability_GetIids,
+    appcapability_GetRuntimeClassName,
+    appcapability_GetTrustLevel,
+    /* IAppCapability methods */
+    appcapability_get_CapabilityName,
+    appcapability_get_User,
+    appcapability_RequestAccessAsync,
+    appcapability_CheckAccess,
+    appcapability_add_AccessChanged,
+    appcapability_remove_AccessChanged,
+};
+
+static struct appcapability_factory appcapability_factory =
+{
+    .IActivationFactory_iface.lpVtbl = &appcapability_factory_vtbl,
+    .IAppCapabilityStatics_iface.lpVtbl = &appcapability_statics_vtbl,
+    .refcount = 1,
+};
+
+IActivationFactory *appcapability_activation_factory = &appcapability_factory.IActivationFactory_iface;
+
 HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void **out)
 {
     FIXME("clsid %s, riid %s, out %p stub!\n", debugstr_guid(clsid), debugstr_guid(riid), out);
@@ -316,6 +648,8 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
         IActivationFactory_QueryInterface(cryptobuffer_activation_factory, &IID_IActivationFactory, (void **)factory);
     if (!wcscmp(name, RuntimeClass_Windows_Security_Credentials_KeyCredentialManager))
         IActivationFactory_QueryInterface(credentials_activation_factory, &IID_IActivationFactory, (void **)factory);
+    if (!wcscmp(name, RuntimeClass_Windows_Security_Authorization_AppCapabilityAccess_AppCapability))
+        IActivationFactory_QueryInterface(appcapability_activation_factory, &IID_IActivationFactory, (void **)factory);
 
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;

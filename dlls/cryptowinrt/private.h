@@ -36,6 +36,8 @@
 #include "windows.storage.streams.h"
 #define WIDL_using_Windows_Security_Credentials
 #include "windows.security.credentials.h"
+#define WIDL_using_Windows_Security_Authorization_AppCapabilityAccess
+#include "windows.security.authorization.appcapabilityaccess.h"
 
 #include "async_private.h"
 

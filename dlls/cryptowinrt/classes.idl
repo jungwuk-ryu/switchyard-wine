@@ -21,10 +21,14 @@
 
 import "windows.security.cryptography.idl";
 import "windows.security.credentials.idl";
+import "windows.security.authorization.appcapabilityaccess.idl";
 
 namespace Windows.Security.Cryptography {
     runtimeclass CryptographicBuffer;
 }
 namespace Windows.Security.Credentials {
     runtimeclass KeyCredentialManager;
+}
+namespace Windows.Security.Authorization.AppCapabilityAccess {
+    runtimeclass AppCapability;
 }
