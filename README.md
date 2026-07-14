@@ -1,4 +1,40 @@
-## INTRODUCTION
+# Switchyard Wine
+
+Switchyard Wine is the public downstream Wine source used by the Switchyard macOS compatibility manager for Windows game launchers on Apple Silicon.
+
+This repository keeps each Switchyard compatibility change as a reviewable commit on top of a pinned WineHQ revision. It also contains the local runtime builder and the provenance required to reproduce a matching runtime.
+
+Switchyard Wine is an independent downstream project. It is not affiliated with or endorsed by WineHQ, Apple, Valve, Epic Games, GOG, Blizzard Entertainment, Google, or Microsoft.
+
+## Important boundaries
+
+- Wine and Switchyard's Wine modifications are LGPL-2.1-or-later source.
+- Apple Game Porting Toolkit is user-provided software and is not included here.
+- No launcher binaries, game assets, credentials, runtime caches, or locally built runtimes belong in this repository.
+- The Switchyard macOS app does not link against Wine; it launches this runtime through an external runner.
+
+## Repository layout
+
+- `switchyard/`: source verification and reproducible local runtime build tooling
+- `docs/architecture.md`: application, runtime, and user-provided software boundaries
+- `docs/building.md`: supported local build workflow
+- `docs/provenance.md`: upstream base, history import, and licensing provenance
+- `docs/import-map.md`: one-to-one mapping from every former patch ID to its commit
+- `docs/patch-history.md`: historical rationale and validation ledger for the imported patch IDs
+- `switchyard/imported-patches.txt`: immutable manifest of the 106 migrated patch IDs
+
+Start with:
+
+```sh
+./switchyard/verify_source.sh
+./switchyard/build_runtime.sh
+```
+
+See `CONTRIBUTING.md` before proposing changes. Binary releases are intentionally deferred until source publication, dependency notices, signing, and notarization are complete.
+
+## Upstream Wine documentation
+
+### Introduction
 
 Wine is a program which allows running Microsoft Windows programs
 (including DOS, Windows 3.x, Win32, and Win64 executables) on Unix.

@@ -1,0 +1,24 @@
+name: Source integrity
+
+on:
+  push:
+    branches: [main]
+    tags: ["source-*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 256
+      - name: Verify downstream history and source policy
+        run: ./switchyard/verify_source.sh
+      - name: Check runtime tooling syntax
+        run: bash -n switchyard/build_runtime.sh switchyard/lib/directory_safety.sh switchyard/tests/directory_safety_test.sh
