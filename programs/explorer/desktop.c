@@ -788,6 +788,19 @@ static DWORD WINAPI display_settings_restorer_thread( void *param )
 }
 
 static WNDPROC desktop_orig_wndproc;
+static WNDPROC message_parent_orig_wndproc;
+
+/* window procedure for the HWND_MESSAGE parent */
+static LRESULT WINAPI message_parent_wnd_proc( HWND hwnd, UINT message, WPARAM wp, LPARAM lp )
+{
+    if (message == WM_PARENTNOTIFY && LOWORD(wp) == WM_DESTROY)
+    {
+        handle_parent_notify( (HWND)lp, wp );
+        return 0;
+    }
+
+    return message_parent_orig_wndproc( hwnd, message, wp, lp );
+}
 
 /* window procedure for the desktop window */
 static LRESULT WINAPI desktop_wnd_proc( HWND hwnd, UINT message, WPARAM wp, LPARAM lp )
@@ -1199,7 +1212,7 @@ void manage_desktop( WCHAR *arg )
     HDESK desktop = 0;
     GUID guid;
     MSG msg;
-    HWND hwnd;
+    HWND hwnd, message_parent;
     unsigned int width, height;
     WCHAR *cmdline = NULL, *driver = NULL;
     WCHAR *p = arg;
@@ -1273,8 +1286,12 @@ void manage_desktop( WCHAR *arg )
     if (hwnd)
     {
         /* create the HWND_MESSAGE parent */
-        CreateWindowExW( 0, L"Message", NULL, WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-                         0, 0, 100, 100, 0, 0, 0, NULL );
+        message_parent = CreateWindowExW( 0, L"Message", NULL,
+                                          WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                          0, 0, 100, 100, 0, 0, 0, NULL );
+        if (message_parent)
+            message_parent_orig_wndproc = (WNDPROC)SetWindowLongPtrW(
+                message_parent, GWLP_WNDPROC, (LONG_PTR)message_parent_wnd_proc );
 
         desktop_orig_wndproc = (WNDPROC)SetWindowLongPtrW( hwnd, GWLP_WNDPROC,
             (LONG_PTR)desktop_wnd_proc );
