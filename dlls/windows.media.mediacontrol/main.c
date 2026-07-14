@@ -19,6 +19,7 @@
 
 #include "initguid.h"
 #include "private.h"
+#include "roapi.h"
 
 #include "wine/debug.h"
 
@@ -880,6 +881,43 @@ static const struct ISystemMediaTransportControlsVtbl media_control_vtbl =
 
 DEFINE_IINSPECTABLE( media_control_statics, ISystemMediaTransportControlsInterop, struct media_control_statics, IActivationFactory_iface )
 
+static HRESULT check_stream_dependencies(void)
+{
+    static const WCHAR stream_name[] = L"Windows.Storage.Streams.InMemoryRandomAccessStream";
+    static const WCHAR writer_name[] = L"Windows.Storage.Streams.DataWriter";
+    IInspectable *stream = NULL;
+    IRandomAccessStream *random_access = NULL;
+    IOutputStream *output = NULL;
+    IDataWriterFactory *writer_factory = NULL;
+    IDataWriter *writer = NULL;
+    HSTRING classid;
+    HRESULT hr;
+
+    if (FAILED(hr = WindowsCreateString(stream_name, ARRAY_SIZE(stream_name) - 1, &classid)))
+        return hr;
+    hr = RoActivateInstance(classid, &stream);
+    WindowsDeleteString(classid);
+    if (FAILED(hr)) goto done;
+    if (FAILED(hr = IInspectable_QueryInterface(stream, &IID_IRandomAccessStream, (void **)&random_access)))
+        goto done;
+    if (FAILED(hr = IInspectable_QueryInterface(stream, &IID_IOutputStream, (void **)&output)))
+        goto done;
+
+    if (FAILED(hr = WindowsCreateString(writer_name, ARRAY_SIZE(writer_name) - 1, &classid)))
+        goto done;
+    hr = RoGetActivationFactory(classid, &IID_IDataWriterFactory, (void **)&writer_factory);
+    WindowsDeleteString(classid);
+    if (SUCCEEDED(hr)) hr = IDataWriterFactory_CreateDataWriter(writer_factory, output, &writer);
+
+done:
+    if (writer) IDataWriter_Release(writer);
+    if (writer_factory) IDataWriterFactory_Release(writer_factory);
+    if (output) IOutputStream_Release(output);
+    if (random_access) IRandomAccessStream_Release(random_access);
+    if (stream) IInspectable_Release(stream);
+    return hr;
+}
+
 static HRESULT WINAPI media_control_statics_GetForWindow( ISystemMediaTransportControlsInterop *iface, HWND window, REFIID riid, void **control )
 {
     struct media_control *impl;
@@ -887,7 +925,14 @@ static HRESULT WINAPI media_control_statics_GetForWindow( ISystemMediaTransportC
 
     TRACE( "iface %p, window %p, riid %s, control %p\n", iface, window, debugstr_guid( riid ), control );
 
-    if (!window) return E_POINTER;
+    if (!window || !control) return E_POINTER;
+    *control = NULL;
+
+    if (FAILED(hr = check_stream_dependencies()))
+    {
+        WARN( "required WinRT stream classes are unavailable, hr %#lx; disabling media controls.\n", hr );
+        return E_NOTIMPL;
+    }
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->ISystemMediaTransportControls_iface.lpVtbl = &media_control_vtbl;

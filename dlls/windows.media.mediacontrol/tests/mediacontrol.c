@@ -57,6 +57,43 @@ static void check_interface_GetForWindow( void *media_control_interop_statics, H
     if (media_control_statics) ISystemMediaTransportControls_Release( media_control_statics );
 }
 
+static BOOL stream_dependencies_available(void)
+{
+    static const WCHAR stream_name[] = L"Windows.Storage.Streams.InMemoryRandomAccessStream";
+    static const WCHAR writer_name[] = L"Windows.Storage.Streams.DataWriter";
+    IDataWriterFactory *writer_factory = NULL;
+    IDataWriter *writer = NULL;
+    IInspectable *stream = NULL;
+    IRandomAccessStream *random_access = NULL;
+    IOutputStream *output = NULL;
+    HSTRING classid;
+    HRESULT hr;
+
+    hr = WindowsCreateString(stream_name, ARRAY_SIZE(stream_name) - 1, &classid);
+    if (FAILED(hr)) return FALSE;
+    hr = RoActivateInstance(classid, &stream);
+    WindowsDeleteString(classid);
+    if (FAILED(hr)) goto done;
+    if (FAILED(hr = IInspectable_QueryInterface(stream, &IID_IRandomAccessStream, (void **)&random_access)))
+        goto done;
+    if (FAILED(hr = IInspectable_QueryInterface(stream, &IID_IOutputStream, (void **)&output)))
+        goto done;
+
+    hr = WindowsCreateString(writer_name, ARRAY_SIZE(writer_name) - 1, &classid);
+    if (FAILED(hr)) goto done;
+    hr = RoGetActivationFactory(classid, &IID_IDataWriterFactory, (void **)&writer_factory);
+    WindowsDeleteString(classid);
+    if (SUCCEEDED(hr)) hr = IDataWriterFactory_CreateDataWriter(writer_factory, output, &writer);
+
+done:
+    if (writer) IDataWriter_Release(writer);
+    if (writer_factory) IDataWriterFactory_Release(writer_factory);
+    if (output) IOutputStream_Release(output);
+    if (random_access) IRandomAccessStream_Release(random_access);
+    if (stream) IInspectable_Release(stream);
+    return SUCCEEDED(hr);
+}
+
 static void test_MediaControlStatics(void)
 {
     static const WCHAR *media_control_statics_name = L"Windows.Media.SystemMediaTransportControls";
@@ -100,6 +137,18 @@ static void test_MediaControlStatics(void)
 
     window = CreateWindowExA( 0, "static", 0, 0, CW_USEDEFAULT, CW_USEDEFAULT, 800, 600, NULL, NULL, GetModuleHandleA( NULL ), 0 );
     ok( window != NULL, "Failed to create a window\n" );
+
+    if (!stream_dependencies_available())
+    {
+        media_control_statics = (void *)0xdeadbeef;
+        hr = ISystemMediaTransportControlsInterop_GetForWindow( media_control_interop_statics, window,
+                &IID_ISystemMediaTransportControls, (void **)&media_control_statics );
+        ok( hr == E_NOTIMPL, "got hr %#lx.\n", hr );
+        ok( media_control_statics == NULL, "got media control %p.\n", media_control_statics );
+        skip( "WinRT stream dependencies are unavailable, skipping media control instance tests.\n" );
+        goto done;
+    }
+
     hr = ISystemMediaTransportControlsInterop_GetForWindow( media_control_interop_statics, window, &IID_ISystemMediaTransportControlsInterop, (void **)&media_control_statics );
     ok( hr == E_NOINTERFACE || broken(hr == 0x80070578) /* Win8 */, "got hr %#lx.\n", hr );
 
