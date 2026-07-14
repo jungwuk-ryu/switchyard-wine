@@ -1050,6 +1050,103 @@ static NTSTATUS unixcall_native_callback4( void *args )
 }
 
 
+static NTSTATUS unixcall_native_callback_args( void *args )
+{
+#ifdef __x86_64__
+    struct native_callback_args_params *params = args;
+#if defined(__APPLE__)
+    enum { switchyard_amd64_pthread_teb_offset = 0x320 };
+    struct thread_data *data = get_thread_data();
+#endif
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func0)(void);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func1)(ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func2)(ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func3)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func4)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func5)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                       ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func6)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                       ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func7)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                       ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func8)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                       ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func9)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                       ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                       ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func10)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                        ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func11)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (__attribute__((ms_abi)) *native_callback_func12)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    const ULONG_PTR *argv = params->args;
+
+    if (!params->func || params->argc > ARRAY_SIZE(params->args)) return STATUS_INVALID_PARAMETER;
+#if defined(__APPLE__)
+    params->native_tsd_base = data && data->teb ?
+                              *(void **)((char *)data->teb + switchyard_amd64_pthread_teb_offset) : NULL;
+#else
+    params->native_tsd_base = NULL;
+#endif
+    switch (params->argc)
+    {
+    case 0:
+        params->ret = ((native_callback_func0)params->func)();
+        break;
+    case 1:
+        params->ret = ((native_callback_func1)params->func)( argv[0] );
+        break;
+    case 2:
+        params->ret = ((native_callback_func2)params->func)( argv[0], argv[1] );
+        break;
+    case 3:
+        params->ret = ((native_callback_func3)params->func)( argv[0], argv[1], argv[2] );
+        break;
+    case 4:
+        params->ret = ((native_callback_func4)params->func)( argv[0], argv[1], argv[2], argv[3] );
+        break;
+    case 5:
+        params->ret = ((native_callback_func5)params->func)( argv[0], argv[1], argv[2], argv[3], argv[4] );
+        break;
+    case 6:
+        params->ret = ((native_callback_func6)params->func)( argv[0], argv[1], argv[2], argv[3], argv[4], argv[5] );
+        break;
+    case 7:
+        params->ret = ((native_callback_func7)params->func)( argv[0], argv[1], argv[2], argv[3], argv[4], argv[5],
+                                                             argv[6] );
+        break;
+    case 8:
+        params->ret = ((native_callback_func8)params->func)( argv[0], argv[1], argv[2], argv[3], argv[4], argv[5],
+                                                             argv[6], argv[7] );
+        break;
+    case 9:
+        params->ret = ((native_callback_func9)params->func)( argv[0], argv[1], argv[2], argv[3], argv[4], argv[5],
+                                                             argv[6], argv[7], argv[8] );
+        break;
+    case 10:
+        params->ret = ((native_callback_func10)params->func)( argv[0], argv[1], argv[2], argv[3], argv[4], argv[5],
+                                                              argv[6], argv[7], argv[8], argv[9] );
+        break;
+    case 11:
+        params->ret = ((native_callback_func11)params->func)( argv[0], argv[1], argv[2], argv[3], argv[4], argv[5],
+                                                              argv[6], argv[7], argv[8], argv[9], argv[10] );
+        break;
+    case 12:
+        params->ret = ((native_callback_func12)params->func)( argv[0], argv[1], argv[2], argv[3], argv[4], argv[5],
+                                                              argv[6], argv[7], argv[8], argv[9], argv[10], argv[11] );
+        break;
+    }
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
 static NTSTATUS unixcall_register_non_native_code_region( void *args )
 {
     struct native_code_region_params *params = args;
@@ -1072,6 +1169,11 @@ static NTSTATUS wow64_native_callback3( void *args )
 }
 
 static NTSTATUS wow64_native_callback4( void *args )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
+static NTSTATUS wow64_native_callback_args( void *args )
 {
     return STATUS_NOT_SUPPORTED;
 }
@@ -1099,6 +1201,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_native_callback4,
     unixcall_register_non_native_code_region,
     system_time_precise,
+    unixcall_native_callback_args,
 };
 
 
@@ -1123,6 +1226,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_native_callback4,
     wow64_register_non_native_code_region,
     system_time_precise,
+    wow64_native_callback_args,
 };
 
 #endif  /* _WIN64 */

@@ -597,6 +597,83 @@ BOOL macdrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, 
 }
 
 
+/* Native graphics components distributed with Apple's translation runtime
+ * discover this table through dlsym().  Keep the first ten entries compatible
+ * with the layout used by those components. */
+struct macdrv_graphics_win_data
+{
+    HWND hwnd;
+    macdrv_window cocoa_window;
+    macdrv_view cocoa_view;
+    macdrv_view client_cocoa_view;
+    struct macdrv_win_data *data;
+};
+
+struct macdrv_graphics_functions
+{
+    void (*init_display_devices)(BOOL force);
+    struct macdrv_graphics_win_data *(*get_win_data)(HWND hwnd);
+    void (*release_win_data)(struct macdrv_graphics_win_data *data);
+    macdrv_window (*get_cocoa_window)(HWND hwnd, BOOL require_on_screen);
+    macdrv_metal_device (*create_metal_device)(void);
+    void (*release_metal_device)(macdrv_metal_device device);
+    macdrv_metal_view (*create_metal_view)(macdrv_view view, macdrv_metal_device device);
+    macdrv_metal_layer (*get_metal_layer)(macdrv_metal_view view);
+    void (*release_metal_view)(macdrv_metal_view view);
+    void (*on_main_thread)(dispatch_block_t block);
+    void *legacy_win32_callbacks[14];
+};
+
+extern void OnMainThread(dispatch_block_t block);
+
+static void macdrv_graphics_init_display_devices(BOOL force)
+{
+    (void)force;
+}
+
+static struct macdrv_graphics_win_data *macdrv_graphics_get_win_data(HWND hwnd)
+{
+    struct macdrv_graphics_win_data *compat;
+    struct macdrv_win_data *data;
+
+    if (!(compat = malloc(sizeof(*compat)))) return NULL;
+    if (!(data = get_win_data(hwnd)))
+    {
+        free(compat);
+        return NULL;
+    }
+
+    compat->hwnd = data->hwnd;
+    compat->cocoa_window = data->cocoa_window;
+    compat->cocoa_view = data->client_view;
+    compat->client_cocoa_view = data->client_view;
+    compat->data = data;
+    return compat;
+}
+
+static void macdrv_graphics_release_win_data(struct macdrv_graphics_win_data *compat)
+{
+    if (!compat) return;
+    release_win_data(compat->data);
+    free(compat);
+}
+
+struct macdrv_graphics_functions macdrv_functions __attribute__((visibility("default"))) =
+{
+    macdrv_graphics_init_display_devices,
+    macdrv_graphics_get_win_data,
+    macdrv_graphics_release_win_data,
+    macdrv_get_cocoa_window,
+    macdrv_create_metal_device,
+    macdrv_release_metal_device,
+    macdrv_view_create_metal_view,
+    macdrv_view_get_metal_layer,
+    macdrv_view_release_metal_view,
+    OnMainThread,
+    { NULL }
+};
+
+
 static NTSTATUS macdrv_quit_result(void *arg)
 {
     struct quit_result_params *params = arg;

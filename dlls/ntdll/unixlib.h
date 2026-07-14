@@ -80,6 +80,15 @@ struct native_callback_params
     ULONG_PTR ret;
 };
 
+struct native_callback_args_params
+{
+    void      *func;
+    ULONG      argc;
+    ULONG_PTR args[12];
+    ULONG_PTR ret;
+    void      *native_tsd_base;
+};
+
 struct native_code_region_params
 {
     const void *base;
@@ -115,6 +124,7 @@ enum ntdll_unix_funcs
     unix_call_native_callback4,
     unix_register_non_native_code_region,
     unix_system_time_precise,
+    unix_call_native_callback_args,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;
