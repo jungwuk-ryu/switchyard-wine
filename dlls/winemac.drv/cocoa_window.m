@@ -444,6 +444,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @property (nonatomic) BOOL shapeChangedSinceLastDraw;
 @property (readonly, nonatomic) BOOL needsTransparency;
 @property (nonatomic) BOOL switchyardBlankBackingColor;
+@property (nonatomic) BOOL surfaceUpdatesSuspended;
 
 @property (nonatomic) BOOL usePerPixelAlpha;
 
@@ -1335,6 +1336,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     @synthesize disabled, noForeground, preventsAppActivation, floating, fullscreen, fakingClose, closing, latentParentWindow, hwnd, queue;
     @synthesize drawnSinceShown;
+    @synthesize surfaceUpdatesSuspended;
     @synthesize shapeChangedSinceLastDraw;
     @synthesize usePerPixelAlpha;
     @synthesize himc, commandDone;
@@ -3878,6 +3880,28 @@ void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame)
 }
 
 /***********************************************************************
+ *              macdrv_set_cocoa_window_surface_updates_suspended
+ *
+ * Preserve the last complete root surface during an interactive move.
+ */
+void macdrv_set_cocoa_window_surface_updates_suspended(macdrv_window w, bool suspended)
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThread(^{
+        WineContentView *view = [window contentView];
+
+        window.surfaceUpdatesSuspended = suspended;
+        if (!suspended)
+        {
+            [view setNeedsDisplay:YES];
+            [view displayIfNeeded];
+            [window checkWineDisplayLink];
+        }
+    });
+}
+
+/***********************************************************************
  *              macdrv_set_cocoa_parent_window
  *
  * Sets the parent window for a Cocoa window.  If parent is NULL, clears
@@ -3910,6 +3934,12 @@ void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rec
     OnMainThreadAsync(^{
         WineContentView *view = [window contentView];
 
+        if (window.surfaceUpdatesSuspended)
+        {
+            CGImageRelease(image);
+            return;
+        }
+
         [view setColorImage:image];
         [view setSurfaceRect:cgrect_mac_from_win(rect)];
         [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
@@ -3940,6 +3970,9 @@ void macdrv_window_clear_color_image(macdrv_window w)
     OnMainThreadAsync(^{
         WineContentView *view = [window contentView];
 
+        if (window.surfaceUpdatesSuspended)
+            return;
+
         [view clearColorImage];
         [view setNeedsDisplay:true];
     });
@@ -3957,6 +3990,9 @@ void macdrv_window_clear_light_color_image(macdrv_window w)
 
     OnMainThreadAsync(^{
         WineContentView *view = [window contentView];
+
+        if (window.surfaceUpdatesSuspended)
+            return;
 
         [view clearLightPlaceholderBackingColor];
         [view setNeedsDisplay:true];

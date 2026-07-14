@@ -81,6 +81,7 @@
 
     BOOL ignore_windowDeminiaturize;
     BOOL ignore_windowResize;
+    BOOL surfaceUpdatesSuspended;
     BOOL fakingClose;
 
     CAShapeLayer* contentViewMaskLayer;

@@ -509,6 +509,7 @@ extern void macdrv_hide_cocoa_window(macdrv_window w);
 extern void macdrv_set_cocoa_window_ignores_mouse_events(macdrv_window w, bool ignores);
 extern void macdrv_set_cocoa_window_frame(macdrv_window w, const CGRect* new_frame);
 extern void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame);
+extern void macdrv_set_cocoa_window_surface_updates_suspended(macdrv_window w, bool suspended);
 extern void macdrv_set_cocoa_parent_window(macdrv_window w, macdrv_window parent);
 extern void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty);
 extern void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image);

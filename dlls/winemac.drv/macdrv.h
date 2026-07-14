@@ -213,6 +213,8 @@ struct macdrv_client_surface
 
 extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
 extern BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
+extern void macdrv_begin_window_move_surface_hold(HWND hwnd);
+extern void macdrv_end_window_move_surface_hold(void);
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
 extern BOOL macdrv_present_root_surface(HWND root, HWND source);

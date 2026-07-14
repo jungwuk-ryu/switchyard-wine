@@ -1432,6 +1432,43 @@ static HMONITOR monitor_from_point(POINT pt, UINT flags)
     return NtUserMonitorFromRect(&rect, flags);
 }
 
+static HWND window_move_surface_hold_root;
+
+void macdrv_begin_window_move_surface_hold(HWND hwnd)
+{
+    struct macdrv_win_data *data;
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+
+    macdrv_end_window_move_surface_hold();
+    if (!root || !chromium_hwnd_or_root_uses_root_surface_composition(root)) return;
+
+    if ((data = get_win_data(root)))
+    {
+        if (data->cocoa_window)
+        {
+            macdrv_set_cocoa_window_surface_updates_suspended(data->cocoa_window, true);
+            window_move_surface_hold_root = root;
+        }
+        release_win_data(data);
+    }
+}
+
+void macdrv_end_window_move_surface_hold(void)
+{
+    struct macdrv_win_data *data;
+    HWND root = window_move_surface_hold_root;
+
+    window_move_surface_hold_root = NULL;
+    if (!root) return;
+    if ((data = get_win_data(root)))
+    {
+        if (data->cocoa_window)
+            macdrv_set_cocoa_window_surface_updates_suspended(data->cocoa_window, false);
+        release_win_data(data);
+    }
+    NtUserRedrawWindow(root, NULL, 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+}
+
 
 /***********************************************************************
  *              move_window
@@ -1503,6 +1540,7 @@ static LRESULT move_window(HWND hwnd, WPARAM wparam)
     /* repaint the window before moving it around */
     NtUserRedrawWindow(hwnd, NULL, 0, RDW_UPDATENOW | RDW_ALLCHILDREN);
 
+    macdrv_begin_window_move_surface_hold(hwnd);
     send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
     set_capture_window_for_move(hwnd);
 
@@ -1613,6 +1651,7 @@ static LRESULT move_window(HWND hwnd, WPARAM wparam)
         set_window_pos(hwnd, 0, origRect.left, origRect.top, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
     }
 
+    macdrv_end_window_move_surface_hold();
     return 0;
 }
 

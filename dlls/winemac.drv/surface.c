@@ -1034,6 +1034,44 @@ static void sync_foreign_child_surface_frame(struct macdrv_window_surface *surfa
     macdrv_order_cocoa_window(surface->window, NULL, NULL, FALSE);
 }
 
+static void merge_root_surface_dirty_bits(struct macdrv_window_surface *surface, const RECT *rect,
+                                          const RECT *dirty, const BITMAPINFO *color_info,
+                                          const void *color_bits)
+{
+    RECT update;
+    unsigned int height, stride, row, copy_width;
+    const BYTE *src = color_bits;
+    BYTE *dst = surface->bits;
+
+    if (!color_bits || color_bits == surface->bits) return;
+    if (color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
+    {
+        memcpy(surface->bits, color_bits, color_info->bmiHeader.biSizeImage);
+        return;
+    }
+
+    height = abs(color_info->bmiHeader.biHeight);
+    if (!height) return;
+    stride = color_info->bmiHeader.biSizeImage / height;
+    if (!stride) return;
+
+    /* window_surface_flush() already reports damage in surface-local coordinates. */
+    (void)rect;
+    update = *dirty;
+    update.left = max(update.left, 0);
+    update.top = max(update.top, 0);
+    update.right = min(update.right, color_info->bmiHeader.biWidth);
+    update.bottom = min(update.bottom, height);
+    if (update.left >= update.right || update.top >= update.bottom) return;
+
+    copy_width = (update.right - update.left) * 4;
+    for (row = update.top; row < update.bottom; row++)
+    {
+        memcpy(dst + row * stride + update.left * 4,
+               src + row * stride + update.left * 4, copy_width);
+    }
+}
+
 /***********************************************************************
  *              macdrv_surface_flush
  */
@@ -1052,10 +1090,12 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     POINT root_composed_offset = {0, 0};
     BOOL root_composed_surface = FALSE;
 
-    if (color_bits && color_bits != surface->bits)
+    if (surface->root_surface_relay)
+        merge_root_surface_dirty_bits(surface, rect, dirty, color_info, color_bits);
+    else if (color_bits && color_bits != surface->bits)
         memcpy(surface->bits, color_bits, color_info->bmiHeader.biSizeImage);
 
-    solid_kind = get_nearly_solid_surface_kind(color_info, color_bits ? color_bits : surface->bits);
+    solid_kind = get_nearly_solid_surface_kind(color_info, surface->bits);
 
     if (surface->root_surface_relay)
     {
@@ -1066,7 +1106,7 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
                   surface->header.hwnd);
             return TRUE;
         }
-        if (!relay_root_surface_flush(surface, rect, dirty, color_info, color_bits ? color_bits : surface->bits))
+        if (!relay_root_surface_flush(surface, rect, dirty, color_info, surface->bits))
             TRACE("Switchyard failed to relay Chromium/CEF surface hwnd %p into DComp root %p\n",
                   surface->header.hwnd, surface->root_surface_root);
         return TRUE;
