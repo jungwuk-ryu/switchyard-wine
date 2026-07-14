@@ -31,6 +31,7 @@
 #include "ddk/ntddk.h"
 
 #include "kernelbase.h"
+#include "wine/list.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(security);
@@ -202,6 +203,124 @@ static const char *debugstr_sid( PSID sid )
                                 psid->SubAuthority[6], psid->SubAuthority[7]);
     }
     return "(too-big)";
+}
+
+struct appcontainer_registration
+{
+    struct list entry;
+    WCHAR *moniker;
+    SID sid;
+};
+
+static struct list appcontainer_registrations = LIST_INIT( appcontainer_registrations );
+static CRITICAL_SECTION appcontainer_section;
+static CRITICAL_SECTION_DEBUG appcontainer_critsect_debug =
+{
+    0, 0, &appcontainer_section,
+    { &appcontainer_critsect_debug.ProcessLocksList, &appcontainer_critsect_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": appcontainer_section") }
+};
+static CRITICAL_SECTION appcontainer_section = { &appcontainer_critsect_debug, -1, 0, 0, 0, 0 };
+
+static struct appcontainer_registration *find_appcontainer_registration( PSID sid )
+{
+    struct appcontainer_registration *registration;
+
+    LIST_FOR_EACH_ENTRY( registration, &appcontainer_registrations, struct appcontainer_registration, entry )
+        if (RtlEqualSid( &registration->sid, sid )) return registration;
+    return NULL;
+}
+
+/******************************************************************************
+ * AppContainerRegisterSid   (kernelbase.@)
+ */
+HRESULT WINAPI AppContainerRegisterSid( PSID sid, const WCHAR *moniker, const WCHAR *display_name )
+{
+    struct appcontainer_registration *registration;
+    SIZE_T sid_size, moniker_size, size;
+    HRESULT hr = S_OK;
+
+    TRACE("sid %s, moniker %s, display name %s.\n", debugstr_sid(sid), debugstr_w(moniker),
+          debugstr_w(display_name));
+
+    if (!sid || !RtlValidSid(sid) || !moniker || !display_name) return E_INVALIDARG;
+
+    sid_size = RtlLengthSid(sid);
+    moniker_size = (wcslen(moniker) + 1) * sizeof(WCHAR);
+    size = offsetof(struct appcontainer_registration, sid) + sid_size + moniker_size;
+    if (!(registration = HeapAlloc(GetProcessHeap(), 0, size))) return E_OUTOFMEMORY;
+
+    memcpy(&registration->sid, sid, sid_size);
+    registration->moniker = (WCHAR *)((BYTE *)&registration->sid + sid_size);
+    memcpy(registration->moniker, moniker, moniker_size);
+
+    RtlEnterCriticalSection(&appcontainer_section);
+    if (find_appcontainer_registration(sid))
+        hr = HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+    else
+        list_add_tail(&appcontainer_registrations, &registration->entry);
+    RtlLeaveCriticalSection(&appcontainer_section);
+
+    if (FAILED(hr)) HeapFree(GetProcessHeap(), 0, registration);
+    return hr;
+}
+
+/******************************************************************************
+ * AppContainerUnregisterSid   (kernelbase.@)
+ */
+HRESULT WINAPI AppContainerUnregisterSid( PSID sid )
+{
+    struct appcontainer_registration *registration = NULL;
+
+    TRACE("sid %s.\n", debugstr_sid(sid));
+
+    if (!sid || !RtlValidSid(sid)) return E_INVALIDARG;
+
+    RtlEnterCriticalSection(&appcontainer_section);
+    if ((registration = find_appcontainer_registration(sid))) list_remove(&registration->entry);
+    RtlLeaveCriticalSection(&appcontainer_section);
+
+    if (!registration) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    HeapFree(GetProcessHeap(), 0, registration);
+    return S_OK;
+}
+
+/******************************************************************************
+ * AppContainerLookupMoniker   (kernelbase.@)
+ */
+HRESULT WINAPI AppContainerLookupMoniker( PSID sid, WCHAR **moniker )
+{
+    struct appcontainer_registration *registration;
+    HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    SIZE_T size;
+
+    TRACE("sid %s, moniker %p.\n", debugstr_sid(sid), moniker);
+
+    if (!sid || !RtlValidSid(sid) || !moniker) return E_INVALIDARG;
+    *moniker = NULL;
+
+    RtlEnterCriticalSection(&appcontainer_section);
+    if ((registration = find_appcontainer_registration(sid)))
+    {
+        size = (wcslen(registration->moniker) + 1) * sizeof(WCHAR);
+        if ((*moniker = LocalAlloc(0, size)))
+        {
+            memcpy(*moniker, registration->moniker, size);
+            hr = S_OK;
+        }
+        else hr = E_OUTOFMEMORY;
+    }
+    RtlLeaveCriticalSection(&appcontainer_section);
+    return hr;
+}
+
+/******************************************************************************
+ * AppContainerFreeMemory   (kernelbase.@)
+ */
+void WINAPI AppContainerFreeMemory( void *memory )
+{
+    TRACE("memory %p.\n", memory);
+    LocalFree(memory);
 }
 
 /******************************************************************************

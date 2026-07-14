@@ -24,6 +24,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winreg.h"
+#include "wincrypt.h"
 #include "winternl.h"
 #include "winnls.h"
 #include "sddl.h"
@@ -695,4 +696,65 @@ HRESULT WINAPI CreateAppContainerProfile(PCWSTR container_name, PCWSTR display_n
           debugstr_w(description), capabilities, capability_count, container_sid);
 
     return E_NOTIMPL;
+}
+
+HRESULT WINAPI DeriveAppContainerSidFromAppContainerName(PCWSTR container_name, SID **container_sid)
+{
+    static const SID_IDENTIFIER_AUTHORITY app_package_authority = {SECURITY_APP_PACKAGE_AUTHORITY};
+    BYTE hash[32];
+    DWORD hash_size = sizeof(hash), error, i;
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash_handle = 0;
+    UNICODE_STRING name, lowercase = {0};
+    SID *sid = NULL;
+    NTSTATUS status;
+    HRESULT hr;
+
+    TRACE("(%s, %p)\n", debugstr_w(container_name), container_sid);
+
+    if (!container_name || !container_sid) return E_INVALIDARG;
+    *container_sid = NULL;
+
+    RtlInitUnicodeString(&name, container_name);
+    if ((status = RtlDowncaseUnicodeString(&lowercase, &name, TRUE)))
+        return HRESULT_FROM_NT(status);
+
+    if (!CryptAcquireContextW(&provider, NULL, NULL, PROV_RSA_AES,
+                              CRYPT_VERIFYCONTEXT | CRYPT_SILENT) ||
+        !CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash_handle) ||
+        !CryptHashData(hash_handle, (const BYTE *)lowercase.Buffer, lowercase.Length, 0) ||
+        !CryptGetHashParam(hash_handle, HP_HASHVAL, hash, &hash_size, 0))
+    {
+        error = GetLastError();
+        hr = HRESULT_FROM_WIN32(error);
+        goto done;
+    }
+
+    if (!(sid = HeapAlloc(GetProcessHeap(), 0, GetSidLengthRequired(SECURITY_APP_PACKAGE_RID_COUNT))))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    if (!InitializeSid(sid, (SID_IDENTIFIER_AUTHORITY *)&app_package_authority,
+                       SECURITY_APP_PACKAGE_RID_COUNT))
+    {
+        error = GetLastError();
+        hr = HRESULT_FROM_WIN32(error);
+        goto done;
+    }
+
+    *GetSidSubAuthority(sid, 0) = SECURITY_APP_PACKAGE_BASE_RID;
+    for (i = 0; i < SECURITY_APP_PACKAGE_RID_COUNT - 1; ++i)
+        memcpy(GetSidSubAuthority(sid, i + 1), hash + i * sizeof(DWORD), sizeof(DWORD));
+
+    *container_sid = sid;
+    sid = NULL;
+    hr = S_OK;
+
+done:
+    HeapFree(GetProcessHeap(), 0, sid);
+    if (hash_handle) CryptDestroyHash(hash_handle);
+    if (provider) CryptReleaseContext(provider, 0);
+    RtlFreeUnicodeString(&lowercase);
+    return hr;
 }

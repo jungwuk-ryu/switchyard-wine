@@ -36,6 +36,7 @@
 #define expect_gle(EXPECTED) ok(GetLastError() == (EXPECTED), "Expected %d, got %ld\n", (EXPECTED), GetLastError())
 
 static BOOL (WINAPI *pIsWow64Process)(HANDLE,PBOOL);
+static HRESULT (WINAPI *pDeriveAppContainerSidFromAppContainerName)(PCWSTR, PSID *);
 
 struct profile_item
 {
@@ -71,6 +72,68 @@ static BOOL get_env(const WCHAR * env, const char * var, char ** result)
         p++;
     } while (*p);
     return FALSE;
+}
+
+static void test_app_container_sid(void)
+{
+    static const SID_IDENTIFIER_AUTHORITY app_package_authority = {SECURITY_APP_PACKAGE_AUTHORITY};
+    static const struct
+    {
+        BYTE revision;
+        BYTE subauthority_count;
+        SID_IDENTIFIER_AUTHORITY authority;
+        DWORD subauthority[SECURITY_APP_PACKAGE_RID_COUNT];
+    } shell_experience_sid =
+    {
+        SID_REVISION, SECURITY_APP_PACKAGE_RID_COUNT, {SECURITY_APP_PACKAGE_AUTHORITY},
+        {SECURITY_APP_PACKAGE_BASE_RID, 155514346, 2573954481, 755741238, 1654018636,
+         1233331829, 3075935687, 2861478708}
+    };
+    static const WCHAR name[] = L"Switchyard.Chrome.Media";
+    static const WCHAR uppercase_name[] = L"SWITCHYARD.CHROME.MEDIA";
+    static const WCHAR other_name[] = L"Switchyard.Chrome.Other";
+    static const WCHAR shell_experience_name[] = L"microsoft.windows.shellexperiencehost_cw5n1h2txyewy";
+    PSID sid = NULL, uppercase_sid = NULL, other_sid = NULL, known_sid = NULL;
+    HRESULT hr;
+
+    pDeriveAppContainerSidFromAppContainerName = (void *)GetProcAddress(GetModuleHandleA("userenv.dll"),
+            "DeriveAppContainerSidFromAppContainerName");
+    if (!pDeriveAppContainerSidFromAppContainerName)
+    {
+        win_skip("DeriveAppContainerSidFromAppContainerName is unavailable\n");
+        return;
+    }
+
+    hr = pDeriveAppContainerSidFromAppContainerName(name, &sid);
+    ok(hr == S_OK, "got hr %#lx\n", hr);
+    ok(sid != NULL, "expected a SID\n");
+    if (!sid) return;
+
+    ok(IsValidSid(sid), "expected a valid SID\n");
+    ok(*GetSidSubAuthorityCount(sid) == SECURITY_APP_PACKAGE_RID_COUNT,
+       "got %u subauthorities\n", *GetSidSubAuthorityCount(sid));
+    ok(!memcmp(GetSidIdentifierAuthority(sid), &app_package_authority, sizeof(app_package_authority)),
+       "unexpected identifier authority\n");
+    ok(*GetSidSubAuthority(sid, 0) == SECURITY_APP_PACKAGE_BASE_RID,
+       "got base RID %#lx\n", *GetSidSubAuthority(sid, 0));
+
+    hr = pDeriveAppContainerSidFromAppContainerName(uppercase_name, &uppercase_sid);
+    ok(hr == S_OK, "got hr %#lx\n", hr);
+    ok(uppercase_sid && EqualSid(sid, uppercase_sid), "SID derivation should be case-insensitive\n");
+
+    hr = pDeriveAppContainerSidFromAppContainerName(other_name, &other_sid);
+    ok(hr == S_OK, "got hr %#lx\n", hr);
+    ok(other_sid && !EqualSid(sid, other_sid), "different names should derive different SIDs\n");
+
+    hr = pDeriveAppContainerSidFromAppContainerName(shell_experience_name, &known_sid);
+    ok(hr == S_OK, "got hr %#lx\n", hr);
+    ok(known_sid && EqualSid(known_sid, (PSID)&shell_experience_sid),
+       "SID derivation does not match the known Windows vector\n");
+
+    FreeSid(known_sid);
+    FreeSid(other_sid);
+    FreeSid(uppercase_sid);
+    FreeSid(sid);
 }
 
 static void test_create_env(void)
@@ -464,4 +527,5 @@ START_TEST(userenv)
     test_create_env();
     test_get_profiles_dir();
     test_get_user_profile_dir();
+    test_app_container_sid();
 }

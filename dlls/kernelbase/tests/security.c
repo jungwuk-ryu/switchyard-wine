@@ -29,8 +29,54 @@
 #include "wine/test.h"
 
 static BOOL (WINAPI *pDeriveCapabilitySidsFromName)(const WCHAR *, PSID **, DWORD *, PSID **, DWORD *);
+static HRESULT (WINAPI *pAppContainerRegisterSid)(PSID, const WCHAR *, const WCHAR *);
+static HRESULT (WINAPI *pAppContainerUnregisterSid)(PSID);
+static HRESULT (WINAPI *pAppContainerLookupMoniker)(PSID, WCHAR **);
+static void (WINAPI *pAppContainerFreeMemory)(void *);
+static HRESULT (WINAPI *pDeriveAppContainerSidFromAppContainerName)(const WCHAR *, PSID *);
+static void *(WINAPI *pFreeSid)(PSID);
 
 static NTSTATUS (WINAPI *pRtlDeriveCapabilitySidsFromName)(UNICODE_STRING *, PSID, PSID);
+
+static void test_appcontainer_registration(void)
+{
+    static const WCHAR name[] = L"Wine.Kernelbase.AppContainer.Test";
+    WCHAR *moniker = NULL;
+    PSID sid = NULL;
+    HRESULT hr;
+
+    if (!pAppContainerRegisterSid || !pAppContainerUnregisterSid || !pAppContainerLookupMoniker ||
+        !pAppContainerFreeMemory ||
+        !pDeriveAppContainerSidFromAppContainerName || !pFreeSid)
+    {
+        win_skip("AppContainer APIs are unavailable.\n");
+        return;
+    }
+
+    hr = pDeriveAppContainerSidFromAppContainerName(name, &sid);
+    ok(hr == S_OK, "got hr %#lx.\n", hr);
+    if (FAILED(hr)) return;
+
+    pAppContainerUnregisterSid(sid);
+    hr = pAppContainerRegisterSid(sid, name, name);
+    ok(hr == S_OK, "got hr %#lx.\n", hr);
+    hr = pAppContainerRegisterSid(sid, name, name);
+    ok(hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), "got hr %#lx.\n", hr);
+
+    hr = pAppContainerLookupMoniker(sid, &moniker);
+    ok(hr == S_OK, "got hr %#lx.\n", hr);
+    ok(moniker && !wcscmp(moniker, name), "got moniker %s.\n", wine_dbgstr_w(moniker));
+    pAppContainerFreeMemory(moniker);
+
+    hr = pAppContainerUnregisterSid(sid);
+    ok(hr == S_OK, "got hr %#lx.\n", hr);
+    moniker = (void *)0xdeadbeef;
+    hr = pAppContainerLookupMoniker(sid, &moniker);
+    ok(hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND), "got hr %#lx.\n", hr);
+    ok(moniker == NULL, "got moniker %p.\n", moniker);
+
+    pFreeSid(sid);
+}
 
 static void test_DeriveCapabilitySidsFromName(void)
 {
@@ -87,13 +133,23 @@ static void test_DeriveCapabilitySidsFromName(void)
 
 START_TEST(security)
 {
-    HMODULE hmod;
+    HMODULE hmod, userenv;
 
     hmod = LoadLibraryA("kernelbase.dll");
     pDeriveCapabilitySidsFromName = (void *)GetProcAddress(hmod, "DeriveCapabilitySidsFromName");
+    pAppContainerRegisterSid = (void *)GetProcAddress(hmod, "AppContainerRegisterSid");
+    pAppContainerUnregisterSid = (void *)GetProcAddress(hmod, "AppContainerUnregisterSid");
+    pAppContainerLookupMoniker = (void *)GetProcAddress(hmod, "AppContainerLookupMoniker");
+    pAppContainerFreeMemory = (void *)GetProcAddress(hmod, "AppContainerFreeMemory");
+    pFreeSid = (void *)GetProcAddress(hmod, "FreeSid");
+
+    userenv = LoadLibraryA("userenv.dll");
+    pDeriveAppContainerSidFromAppContainerName = (void *)GetProcAddress(userenv,
+            "DeriveAppContainerSidFromAppContainerName");
 
     hmod = LoadLibraryA("ntdll.dll");
     pRtlDeriveCapabilitySidsFromName = (void *)GetProcAddress(hmod, "RtlDeriveCapabilitySidsFromName");
 
     test_DeriveCapabilitySidsFromName();
+    test_appcontainer_registration();
 }
