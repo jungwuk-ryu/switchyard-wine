@@ -2006,6 +2006,194 @@ static BOOL on_exclude_list(const WCHAR *command)
     return found;
 }
 
+static BOOL is_protocol_scheme_valid(const WCHAR *scheme)
+{
+    const WCHAR *p;
+
+    if (!scheme[0] || !((scheme[0] >= 'A' && scheme[0] <= 'Z') ||
+                        (scheme[0] >= 'a' && scheme[0] <= 'z')))
+        return FALSE;
+
+    for (p = scheme + 1; *p; p++)
+    {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') || *p == '+' || *p == '-' || *p == '.')
+            continue;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL protocol_association_export_enabled(void)
+{
+    const WCHAR *path = _wgetenv( L"SWITCHYARD_PROTOCOL_ASSOCIATIONS_FILE" );
+
+    return path && path[0];
+}
+
+static WCHAR *get_protocol_command(HKEY key, const WCHAR *scheme)
+{
+    WCHAR *shell_key, *command_key, *verb, *command;
+
+    if (key == HKEY_CLASSES_ROOT) return assoc_query( ASSOCSTR_COMMAND, scheme, L"open" );
+
+    shell_key = heap_wprintf( L"%s\\shell", scheme );
+    verb = reg_get_valW( key, shell_key, NULL );
+    free( shell_key );
+    if (!verb || !verb[0])
+    {
+        free( verb );
+        verb = xwcsdup( L"open" );
+    }
+
+    command_key = heap_wprintf( L"%s\\shell\\%s\\command", scheme, verb );
+    command = reg_get_valW( key, command_key, NULL );
+    free( command_key );
+    free( verb );
+    return command;
+}
+
+static BOOL is_protocol_association_exportable(HKEY key, const WCHAR *scheme)
+{
+    WCHAR *command;
+    BOOL ret;
+
+    if (RegGetValueW( key, scheme, L"URL Protocol", RRF_RT_ANY,
+                      NULL, NULL, NULL ) != ERROR_SUCCESS)
+        return FALSE;
+
+    command = get_protocol_command( key, scheme );
+    ret = command && !on_exclude_list( command );
+    free( command );
+    return ret;
+}
+
+static void export_protocol_associations_from_key(FILE *file, HKEY key, HKEY overriding_key)
+{
+    int i;
+
+    for (i = 0; ; i++)
+    {
+        WCHAR *win_type = reg_enum_keyW( key, i );
+        char *scheme;
+
+        if (!win_type) break;
+        if (win_type[0] == '.' || is_type_banned( win_type ) || !is_protocol_scheme_valid( win_type ) ||
+            !is_protocol_association_exportable( key, win_type ) ||
+            (overriding_key && is_protocol_association_exportable( overriding_key, win_type )))
+        {
+            free( win_type );
+            continue;
+        }
+
+        wcslwr( win_type );
+        scheme = wchars_to_utf8_chars( win_type );
+        fprintf( file, "%s\n", scheme );
+        free( scheme );
+        free( win_type );
+    }
+}
+
+static BOOL export_protocol_associations(void)
+{
+    const WCHAR *path = _wgetenv( L"SWITCHYARD_PROTOCOL_ASSOCIATIONS_FILE" );
+    WCHAR *temporary_path;
+    HKEY user_classes = NULL;
+    FILE *file;
+    BOOL ret = FALSE;
+
+    if (!path || !path[0]) return FALSE;
+
+    temporary_path = heap_wprintf( L"%s.%lu.tmp", path, GetCurrentProcessId() );
+    if (!(file = _wfopen( temporary_path, L"wb" )))
+    {
+        WINE_ERR( "error writing protocol association export %s\n", wine_dbgstr_w(temporary_path) );
+        free( temporary_path );
+        return FALSE;
+    }
+
+    fprintf( file, "# switchyard-wine-protocols-v1\n" );
+    if (RegOpenKeyExW( HKEY_CURRENT_USER, L"Software\\Classes", 0, KEY_READ, &user_classes ) == ERROR_SUCCESS)
+        export_protocol_associations_from_key( file, user_classes, NULL );
+    export_protocol_associations_from_key( file, HKEY_CLASSES_ROOT, user_classes );
+    if (user_classes) RegCloseKey( user_classes );
+
+    if (fclose( file ))
+        WINE_ERR( "error closing protocol association export %s\n", wine_dbgstr_w(temporary_path) );
+    else if (MoveFileExW( temporary_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ))
+        ret = TRUE;
+    else
+        WINE_ERR( "error publishing protocol association export %s, error %lu\n",
+                  wine_dbgstr_w(path), GetLastError() );
+
+    if (!ret) DeleteFileW( temporary_path );
+    free( temporary_path );
+    return ret;
+}
+
+static void monitor_protocol_associations(void)
+{
+    static const WCHAR mutex_name[] = L"__wine_switchyard_protocol_monitor";
+    HKEY keys[2], user_classes, machine_classes;
+    HANDLE events[2], mutex;
+    DWORD count = 0, i, status;
+
+    mutex = CreateMutexW( NULL, TRUE, mutex_name );
+    if (!mutex) return;
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle( mutex );
+        return;
+    }
+
+    if (RegOpenKeyExW( HKEY_CURRENT_USER, L"Software\\Classes", 0, KEY_NOTIFY, &user_classes ) == ERROR_SUCCESS)
+    {
+        HANDLE event = CreateEventW( NULL, FALSE, FALSE, NULL );
+
+        if (event)
+        {
+            keys[count] = user_classes;
+            events[count++] = event;
+        }
+        else RegCloseKey( user_classes );
+    }
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Classes", 0, KEY_NOTIFY, &machine_classes ) == ERROR_SUCCESS)
+    {
+        HANDLE event = CreateEventW( NULL, FALSE, FALSE, NULL );
+
+        if (event)
+        {
+            keys[count] = machine_classes;
+            events[count++] = event;
+        }
+        else RegCloseKey( machine_classes );
+    }
+
+    while (count)
+    {
+        for (i = 0; i < count; i++)
+        {
+            status = RegNotifyChangeKeyValue( keys[i], TRUE,
+                                              REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
+                                              events[i], TRUE );
+            if (status != ERROR_SUCCESS) goto done;
+        }
+
+        export_protocol_associations();
+        status = WaitForMultipleObjects( count, events, FALSE, INFINITE );
+        if (status >= WAIT_OBJECT_0 + count) break;
+    }
+
+done:
+    for (i = 0; i < count; i++)
+    {
+        CloseHandle( events[i] );
+        RegCloseKey( keys[i] );
+    }
+    ReleaseMutex( mutex );
+    CloseHandle( mutex );
+}
+
 static WCHAR *get_special_mime_type(LPCWSTR extension)
 {
     if (!wcsicmp(extension, L".lnk"))
@@ -2879,10 +3067,14 @@ int PASCAL wWinMain (HINSTANCE hInstance, HINSTANCE prev, LPWSTR cmdline, int sh
     LPWSTR token = NULL, p;
     BOOL bWait = FALSE;
     BOOL bURL = FALSE;
+    BOOL have_xdg;
+    BOOL have_protocol_export;
     HRESULT hr;
     int ret = 0;
 
-    if (!init_xdg())
+    have_xdg = init_xdg();
+    have_protocol_export = protocol_association_export_enabled();
+    if (!have_xdg && !have_protocol_export)
         return 1;
 
     hr = CoInitialize(NULL);
@@ -2900,12 +3092,20 @@ int PASCAL wWinMain (HINSTANCE hInstance, HINSTANCE prev, LPWSTR cmdline, int sh
         if( !wcscmp( token, L"-a" ) )
         {
             if (associations_enabled())
-                RefreshFileTypeAssociations();
+            {
+                if (have_xdg) RefreshFileTypeAssociations();
+                if (have_protocol_export && !export_protocol_associations()) ret = 1;
+            }
+            continue;
+        }
+        if( !wcscmp( token, L"-m" ) )
+        {
+            if (associations_enabled() && have_protocol_export) monitor_protocol_associations();
             continue;
         }
         if( !wcscmp( token, L"-r" ) )
         {
-            cleanup_menus();
+            if (have_xdg) cleanup_menus();
             continue;
         }
         if( !wcscmp( token, L"-w" ) )
@@ -2930,6 +3130,7 @@ int PASCAL wWinMain (HINSTANCE hInstance, HINSTANCE prev, LPWSTR cmdline, int sh
         {
             BOOL bRet;
 
+            if (!have_xdg) continue;
             if (bURL)
                 bRet = Process_URL( token, bWait );
             else
