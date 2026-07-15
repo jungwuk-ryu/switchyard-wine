@@ -760,7 +760,14 @@ BOOL pe_load_debug_info(struct module* module)
 {
     SYMSRV_INDEX_INFOW srv_info = {.sizeofstruct = sizeof(srv_info)};
     SYMSRV_INDEX_INFOW alt_srv_info;
+    struct module_format *pe_format = module->format_info[DFI_PE];
     BOOL ret = FALSE;
+
+    if (!pe_format)
+    {
+        module->module.SymType = SymNone;
+        return FALSE;
+    }
 
     if (!(dbghelp_options & SYMOPT_PUBLICS_ONLY))
     {
@@ -804,7 +811,7 @@ BOOL pe_load_debug_info(struct module* module)
         }
         if (!ret && !module->dont_load_symbols) /* didn't find direct .dbg or .pdb info, try other potential formats */
         {
-            image_check_alternate(&module->format_info[DFI_PE]->u.pe_info->fmap, module);
+            image_check_alternate(&pe_format->u.pe_info->fmap, module);
             ret = pe_load_dwarf(module) ||
                 pe_load_stabs(module) ||
                 pe_load_msc_debug_info(module) ||

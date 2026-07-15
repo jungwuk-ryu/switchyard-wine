@@ -29,6 +29,8 @@ Switchyard Wine is not a rolling mirror of the latest WineHQ release. A newer up
 - `docs/architecture.md`: application, runtime, and user-provided software boundaries
 - `docs/building.md`: supported local build workflow
 - `docs/provenance.md`: upstream base, commit history, and licensing provenance
+- `docs/troubleshooting-unity-games.md`: a reusable crash-triage case study for
+  Unity, D3DMetal, DbgHelp, and long managed-runtime paths
 
 Start with:
 

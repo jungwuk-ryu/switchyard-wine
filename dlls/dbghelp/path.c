@@ -241,6 +241,8 @@ static BOOL do_searchW(PCWSTR file, PWSTR buffer, BOOL recurse,
 
     pos = lstrlenW(buffer);
     if (pos == 0) return FALSE;
+    if (pos + (buffer[pos - 1] != '\\') + ARRAY_SIZE(L"*.*") > MAX_PATH)
+        return FALSE;
     if (buffer[pos - 1] != '\\') buffer[pos++] = '\\';
     lstrcpyW(buffer + pos, L"*.*");
     if ((h = FindFirstFileW(buffer, &fd)) == INVALID_HANDLE_VALUE)
@@ -250,8 +252,12 @@ static BOOL do_searchW(PCWSTR file, PWSTR buffer, BOOL recurse,
      */
     do
     {
+        unsigned len;
+
         if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
 
+        len = lstrlenW(fd.cFileName);
+        if (pos + len >= MAX_PATH) continue;
         lstrcpyW(buffer + pos, fd.cFileName);
         if (recurse && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
             found = do_searchW(file, buffer, TRUE, cb, user);

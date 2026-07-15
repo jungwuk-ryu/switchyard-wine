@@ -3474,6 +3474,13 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE 0x10
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_ADAPTER_OUTPUT_VTABLE 0x20
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_OUTPUT_OUTPUT_VTABLE 0x40
+#define SWITCHYARD_NATIVE_CALLBACK_WRAP_COM_IUNKNOWN_OUTPUT_VTABLE 0x80
+#define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT 8
+#define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK 0x0f00
+#define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE 0x1000
+#define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
+    (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
+     SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
 #define SWITCHYARD_PE_CALLBACK_MAX_ARGS 9
 #define SWITCHYARD_PE_CALLBACK_SKIP 0xff
 #define SWITCHYARD_PE_CALLBACK_FRAME_SIZE 0xa8
@@ -3948,17 +3955,51 @@ static BOOL switchyard_gfxt_deferred_vtable_entry_enabled( unsigned int index )
     return FALSE;
 }
 
-static void switchyard_wrap_protected_native_callback_entry( void **slot, unsigned int argc,
-                                                              ULONG flags )
+static BOOL switchyard_store_native_callback_thunk( void **slot, void *thunk )
 {
     void *addr = slot;
     SIZE_T size = sizeof(*slot);
     ULONG old_prot;
+    BOOL ret = FALSE;
 
-    if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_EXECUTE_READWRITE, &old_prot ))
-        return;
-    wrap_native_callback_entry_with_flags( slot, argc, flags );
-    NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old_prot, &old_prot );
+    if (!NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                 PAGE_EXECUTE_READWRITE, &old_prot ))
+    {
+        *slot = thunk;
+        ret = TRUE;
+        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old_prot, &old_prot );
+    }
+    else
+    {
+        /* Native Mach-O __DATA mappings are outside Wine's virtual-memory map,
+         * even when the host mapping itself is writable. */
+        __TRY
+        {
+            *slot = thunk;
+            ret = TRUE;
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+            ret = FALSE;
+        }
+        __ENDTRY
+    }
+
+    return ret;
+}
+
+static BOOL switchyard_wrap_protected_native_callback_entry( void **slot, unsigned int argc,
+                                                              ULONG flags )
+{
+    void *func, *thunk;
+
+    if (!slot || !(func = *slot) || !is_native_callback_target( func )) return FALSE;
+    if (!(thunk = create_native_callback_thunk( func, argc, flags ))) return FALSE;
+    if (!switchyard_store_native_callback_thunk( slot, thunk )) return FALSE;
+
+    TRACE( "bridging protected native callback entry %p target %p argc %u thunk %p\n",
+           slot, func, argc, thunk );
+    return TRUE;
 }
 
 static BOOL switchyard_get_native_callback_jump_table_slot( void *entry, void ***result )
@@ -3994,29 +4035,20 @@ static BOOL switchyard_wrap_native_callback_jump_table_entry( void *entry, unsig
 
     if (!switchyard_get_native_callback_jump_table_slot( entry, &slot )) return FALSE;
 
-    switchyard_wrap_protected_native_callback_entry( slot, argc, flags );
-    return TRUE;
+    return switchyard_wrap_protected_native_callback_entry( slot, argc, flags );
 }
 
 static BOOL switchyard_wrap_native_callback_vtable_slot( void **slot, unsigned int argc,
                                                           ULONG flags )
 {
-    void *addr, *entry, *thunk;
-    SIZE_T size;
-    ULONG old_prot;
+    void *entry, *thunk;
 
     if (!slot) return FALSE;
     entry = *slot;
     if (switchyard_get_native_callback_jump_table_slot( entry, NULL ))
     {
         if (!(thunk = create_native_callback_thunk( entry, argc, flags ))) return FALSE;
-        addr = slot;
-        size = sizeof(*slot);
-        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
-                                    PAGE_EXECUTE_READWRITE, &old_prot ))
-            return FALSE;
-        *slot = thunk;
-        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old_prot, &old_prot );
+        if (!switchyard_store_native_callback_thunk( slot, thunk )) return FALSE;
         TRACE( "bridged COM vtable jump-stub slot %p entry %p argc %u\n", slot, entry, argc );
         return TRUE;
     }
@@ -4027,8 +4059,222 @@ static BOOL switchyard_wrap_native_callback_vtable_slot( void **slot, unsigned i
         return FALSE;
     }
 
-    switchyard_wrap_protected_native_callback_entry( slot, argc, flags );
-    return TRUE;
+    return switchyard_wrap_protected_native_callback_entry( slot, argc, flags );
+}
+
+static ULONG switchyard_com_iunknown_output_flags( unsigned int output_arg )
+{
+    return SWITCHYARD_NATIVE_CALLBACK_WRAP_COM_IUNKNOWN_OUTPUT_VTABLE |
+           SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG( output_arg );
+}
+
+static ULONG switchyard_d3d11_device_child_output_flags( unsigned int output_arg )
+{
+    return switchyard_com_iunknown_output_flags( output_arg ) |
+           SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE;
+}
+
+static ULONG switchyard_com_vtable_entry_flags( unsigned int index )
+{
+    /* QueryInterface always returns the requested interface through argument 2. */
+    return index ? 0 : switchyard_com_iunknown_output_flags( 2 );
+}
+
+static ULONG switchyard_dxgi_factory_vtable_entry_flags( unsigned int index )
+{
+    switch (index)
+    {
+    case 6:  /* GetParent */
+    case 7:  /* EnumAdapters */
+    case 11: /* CreateSoftwareAdapter */
+    case 12: /* EnumAdapters1 */
+    case 27: /* EnumWarpAdapter */
+        return switchyard_com_iunknown_output_flags( 2 );
+
+    case 10: /* CreateSwapChain */
+    case 26: /* EnumAdapterByLuid */
+        return switchyard_com_iunknown_output_flags( 3 );
+
+    case 24: /* CreateSwapChainForComposition */
+    case 29: /* EnumAdapterByGpuPreference */
+        return switchyard_com_iunknown_output_flags( 4 );
+
+    case 16: /* CreateSwapChainForCoreWindow */
+        return switchyard_com_iunknown_output_flags( 5 );
+
+    case 15: /* CreateSwapChainForHwnd */
+        return switchyard_com_iunknown_output_flags( 6 );
+
+    default:
+        return 0;
+    }
+}
+
+static ULONG switchyard_dxgi_adapter_vtable_entry_flags( unsigned int index )
+{
+    /* GetParent and EnumOutputs return a COM interface through argument 2. */
+    return index == 6 || index == 7 ? switchyard_com_iunknown_output_flags( 2 ) : 0;
+}
+
+static ULONG switchyard_dxgi_output_vtable_entry_flags( unsigned int index )
+{
+    switch (index)
+    {
+    case 6:  /* GetParent */
+    case 22: /* DuplicateOutput */
+        return switchyard_com_iunknown_output_flags( 2 );
+
+    case 26: /* DuplicateOutput1 */
+        return switchyard_com_iunknown_output_flags( 5 );
+
+    default:
+        return 0;
+    }
+}
+
+static ULONG switchyard_dxgi_swapchain_vtable_entry_flags( unsigned int index )
+{
+    switch (index)
+    {
+    case 6:  /* GetParent */
+    case 7:  /* GetDevice */
+    case 11: /* GetFullscreenState */
+    case 21: /* GetCoreWindow */
+        return switchyard_com_iunknown_output_flags( 2 );
+
+    case 9:  /* GetBuffer */
+        return switchyard_com_iunknown_output_flags( 3 );
+
+    case 15: /* GetContainingOutput */
+    case 24: /* GetRestrictToOutput */
+        return switchyard_com_iunknown_output_flags( 1 );
+
+    default:
+        return 0;
+    }
+}
+
+static ULONG switchyard_d3d11_device_vtable_entry_flags( unsigned int index )
+{
+    unsigned int output_arg;
+
+    switch (index)
+    {
+    case 3:  /* CreateBuffer */
+    case 4:  /* CreateTexture1D */
+    case 5:  /* CreateTexture2D */
+    case 6:  /* CreateTexture3D */
+    case 7:  /* CreateShaderResourceView */
+    case 8:  /* CreateUnorderedAccessView */
+    case 9:  /* CreateRenderTargetView */
+    case 10: /* CreateDepthStencilView */
+    case 28: /* OpenSharedResource */
+    case 48: /* OpenSharedResource1 */
+    case 54: /* CreateTexture2D1 */
+    case 55: /* CreateTexture3D1 */
+    case 57: /* CreateShaderResourceView1 */
+    case 58: /* CreateUnorderedAccessView1 */
+    case 59: /* CreateRenderTargetView1 */
+    case 67: /* OpenSharedFence */
+        output_arg = 3;
+        break;
+
+    case 11: /* CreateInputLayout */
+        output_arg = 5;
+        break;
+
+    case 12: /* CreateVertexShader */
+    case 13: /* CreateGeometryShader */
+    case 15: /* CreatePixelShader */
+    case 16: /* CreateHullShader */
+    case 17: /* CreateDomainShader */
+    case 18: /* CreateComputeShader */
+    case 49: /* OpenSharedResourceByName */
+    case 68: /* CreateFence */
+        output_arg = 4;
+        break;
+
+    case 14: /* CreateGeometryShaderWithStreamOutput */
+        output_arg = 9;
+        break;
+
+    case 19: /* CreateClassLinkage */
+        output_arg = 1;
+        break;
+
+    case 20: /* CreateBlendState */
+    case 21: /* CreateDepthStencilState */
+    case 22: /* CreateRasterizerState */
+    case 23: /* CreateSamplerState */
+    case 24: /* CreateQuery */
+    case 25: /* CreatePredicate */
+    case 26: /* CreateCounter */
+    case 27: /* CreateDeferredContext */
+    case 44: /* CreateDeferredContext1 */
+    case 45: /* CreateBlendState1 */
+    case 46: /* CreateRasterizerState1 */
+    case 51: /* CreateDeferredContext2 */
+    case 56: /* CreateRasterizerState2 */
+    case 60: /* CreateQuery1 */
+    case 62: /* CreateDeferredContext3 */
+        output_arg = 2;
+        break;
+
+    case 47: /* CreateDeviceContextState */
+        output_arg = 7;
+        break;
+
+    default:
+        return 0;
+    }
+
+    return switchyard_d3d11_device_child_output_flags( output_arg );
+}
+
+static ULONG switchyard_d3d11_device_context_vtable_entry_flags( unsigned int index )
+{
+    /* ID3D11DeviceContext::FinishCommandList returns a new command-list object. */
+    return index == 114 ? switchyard_d3d11_device_child_output_flags( 2 ) : 0;
+}
+
+static void switchyard_wrap_com_iunknown_output_vtable(
+    const struct switchyard_native_callback_params *params )
+{
+    unsigned int output_arg = (params->flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) >>
+                              SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT;
+    void **vtable;
+    void *object;
+
+    if (output_arg >= params->argc || !params->args[output_arg]) return;
+
+    __TRY
+    {
+        object = *(void **)params->args[output_arg];
+        if (!object || !(vtable = *(void ***)object)) return;
+
+        TRACE( "wrapping COM output %p object %p IUnknown vtable %p\n",
+               (void *)params->args[output_arg], object, vtable );
+        switchyard_wrap_native_callback_vtable_slot(
+            &vtable[0], 3, switchyard_com_iunknown_output_flags( 2 ) |
+                              (params->flags &
+                               SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE) );
+        switchyard_wrap_native_callback_vtable_slot( &vtable[1], 1, 0 );
+        switchyard_wrap_native_callback_vtable_slot( &vtable[2], 1, 0 );
+        if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE)
+        {
+            unsigned int i;
+
+            /* All objects created by ID3D11Device inherit ID3D11DeviceChild.
+             * Its private-data methods may retain and release Metal objects. */
+            for (i = 3; i < 7; ++i)
+                switchyard_wrap_native_callback_vtable_slot(
+                    &vtable[i], SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS, 0 );
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
 }
 
 static BOOL switchyard_gfxt_deferred_vtable_entry_uses_scalar_float( unsigned int index )
@@ -4190,8 +4436,9 @@ static void CALLBACK switchyard_restore_com_vtable( BOOL normal, void *ctx )
     __ENDTRY
 }
 
-static void switchyard_wrap_com_vtable_jump_targets( void *object, unsigned int entries,
-                                                     BOOL (*uses_scalar_float)(unsigned int) )
+static void switchyard_wrap_com_vtable_jump_targets(
+    void *object, unsigned int entries, BOOL (*uses_scalar_float)(unsigned int),
+    ULONG (*entry_flags)(unsigned int) )
 {
     void **vtable, **wrapped_vtable;
     unsigned int i;
@@ -4209,9 +4456,13 @@ static void switchyard_wrap_com_vtable_jump_targets( void *object, unsigned int 
 
         for (i = 0; i < entries; ++i)
         {
+            ULONG flags = switchyard_com_vtable_entry_flags( i );
+
             if (uses_scalar_float && uses_scalar_float( i )) continue;
+            if (entry_flags) flags |= entry_flags( i );
             switchyard_wrap_native_callback_vtable_slot( &vtable[i],
-                                                         SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS, 0 );
+                                                         SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS,
+                                                         flags );
         }
     }
     __EXCEPT_PAGE_FAULT
@@ -4220,8 +4471,9 @@ static void switchyard_wrap_com_vtable_jump_targets( void *object, unsigned int 
     __ENDTRY
 }
 
-static void switchyard_wrap_com_output_vtable_jump_targets( ULONG_PTR output, unsigned int entries,
-                                                            BOOL (*uses_scalar_float)(unsigned int) )
+static void switchyard_wrap_com_output_vtable_jump_targets(
+    ULONG_PTR output, unsigned int entries, BOOL (*uses_scalar_float)(unsigned int),
+    ULONG (*entry_flags)(unsigned int) )
 {
     void *object;
 
@@ -4238,7 +4490,7 @@ static void switchyard_wrap_com_output_vtable_jump_targets( ULONG_PTR output, un
     __ENDTRY
 
     TRACE( "checking COM output %p object %p entries %u\n", (void *)output, object, entries );
-    switchyard_wrap_com_vtable_jump_targets( object, entries, uses_scalar_float );
+    switchyard_wrap_com_vtable_jump_targets( object, entries, uses_scalar_float, entry_flags );
 }
 
 static void switchyard_wrap_d3d11_create_device_output_vtables(
@@ -4257,19 +4509,24 @@ static void switchyard_wrap_d3d11_create_device_output_vtables(
         TRACE( "wrapping D3D11CreateDevice outputs device %p context %p\n",
                (void *)params->args[7], (void *)params->args[9] );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[7], d3d11_device_vtable_entries,
-                                                        NULL );
+                                                        NULL,
+                                                        switchyard_d3d11_device_vtable_entry_flags );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[9], d3d11_device_context_vtable_entries,
-                                                        switchyard_gfxt_deferred_vtable_entry_uses_scalar_float );
+                                                        switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
+                                                        switchyard_d3d11_device_context_vtable_entry_flags );
         break;
     case 12: /* D3D11CreateDeviceAndSwapChain */
         TRACE( "wrapping D3D11CreateDeviceAndSwapChain outputs swapchain %p device %p context %p\n",
                (void *)params->args[8], (void *)params->args[9], (void *)params->args[11] );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[8], dxgi_swapchain_vtable_entries,
-                                                        NULL );
+                                                        NULL,
+                                                        switchyard_dxgi_swapchain_vtable_entry_flags );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[9], d3d11_device_vtable_entries,
-                                                        NULL );
+                                                        NULL,
+                                                        switchyard_d3d11_device_vtable_entry_flags );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[11], d3d11_device_context_vtable_entries,
-                                                        switchyard_gfxt_deferred_vtable_entry_uses_scalar_float );
+                                                        switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
+                                                        switchyard_d3d11_device_context_vtable_entry_flags );
         break;
     }
 }
@@ -4302,9 +4559,10 @@ static void switchyard_wrap_dxgi_factory_output_vtable(
 
         for (i = 0; i < ARRAY_SIZE(argc); ++i)
         {
-            ULONG flags = 0;
+            ULONG flags = switchyard_com_vtable_entry_flags( i ) |
+                          switchyard_dxgi_factory_vtable_entry_flags( i );
 
-            if (i == 7 || i == 12 || i == 26 || i == 27 || i == 29)
+            if (i == 7 || i == 11 || i == 12 || i == 26 || i == 27 || i == 29)
                 flags |= SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_ADAPTER_OUTPUT_VTABLE;
             if (i == 10 || i == 15 || i == 16 || i == 24)
                 flags |= SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE;
@@ -4343,7 +4601,9 @@ static void switchyard_wrap_dxgi_output_output_vtable(
         vtable = wrapped_vtable;
 
         for (i = 0; i < ARRAY_SIZE(argc); ++i)
-            switchyard_wrap_native_callback_vtable_slot( &vtable[i], argc[i], 0 );
+            switchyard_wrap_native_callback_vtable_slot(
+                &vtable[i], argc[i], switchyard_com_vtable_entry_flags( i ) |
+                                         switchyard_dxgi_output_vtable_entry_flags( i ) );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -4376,7 +4636,10 @@ static void switchyard_wrap_dxgi_adapter_output_vtable(
 
         for (i = 0; i < ARRAY_SIZE(argc); ++i)
         {
-            ULONG flags = i == 7 ? SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_OUTPUT_OUTPUT_VTABLE : 0;
+            ULONG flags = switchyard_com_vtable_entry_flags( i ) |
+                          switchyard_dxgi_adapter_vtable_entry_flags( i );
+
+            if (i == 7) flags |= SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_OUTPUT_OUTPUT_VTABLE;
 
             switchyard_wrap_native_callback_vtable_slot( &vtable[i], argc[i], flags );
         }
@@ -4408,7 +4671,8 @@ static void switchyard_wrap_dxgi_swapchain_output_vtable(
         for (i = 0; i < dxgi_swapchain_vtable_entries; ++i)
             switchyard_wrap_native_callback_vtable_slot( &vtable[i],
                                                          SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS,
-                                                         0 );
+                                                         switchyard_com_vtable_entry_flags( i ) |
+                                                         switchyard_dxgi_swapchain_vtable_entry_flags( i ) );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -4517,6 +4781,8 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
                 switchyard_note_gfxt_deferred_vtable( ret );
             if ((LONG)ret >= 0)
             {
+                if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_COM_IUNKNOWN_OUTPUT_VTABLE)
+                    switchyard_wrap_com_iunknown_output_vtable( params );
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_FACTORY_OUTPUT_VTABLE)
                     switchyard_wrap_dxgi_factory_output_vtable( params );
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE)
