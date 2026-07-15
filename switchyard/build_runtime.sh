@@ -66,11 +66,13 @@ USER_SET_WINE_INSTALL_PREFIX="${WINE_INSTALL_PREFIX+x}"
 GPTK_PATH="${GPTK_PATH:-$(defaults read dev.switchyard.Switchyard gptkPath 2>/dev/null || true)}"
 TLS_SOURCE_PREFIX="${TLS_SOURCE_PREFIX:-${SWITCHYARD_TLS_SOURCE_PREFIX:-}}"
 TLS_DLOPEN_NAME="@loader_path/../../switchyard-tls/lib/libgnutls.dylib"
-DEFAULT_JOBS="$(($(sysctl -n hw.ncpu) - 1))"
-if [ "$DEFAULT_JOBS" -lt 1 ]; then
-  DEFAULT_JOBS=1
+MAX_JOBS=13
+JOBS="${JOBS:-$MAX_JOBS}"
+if [ "$JOBS" -gt "$MAX_JOBS" ]; then
+  JOBS="$MAX_JOBS"
+elif [ "$JOBS" -lt 1 ]; then
+  JOBS=1
 fi
-JOBS="${JOBS:-$DEFAULT_JOBS}"
 RECONFIGURE="${RECONFIGURE:-0}"
 INSTALL_STAGE_ROOT=""
 SWAP_HELPER_DIR=""
