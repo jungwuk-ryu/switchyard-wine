@@ -699,6 +699,67 @@ static BOOL bmi_has_alpha( const BITMAPINFO *info, const void *bits )
 }
 
 /***********************************************************************
+ *          stretch_alpha_bits
+ *
+ * Stretch 32-bpp icon bits while preserving their alpha channel.
+ */
+static BOOL stretch_alpha_bits( HDC hdc, const BITMAP *dst_bm, const BITMAPINFO *src_info,
+                                const void *src_bits, void *dst_bits )
+{
+    const BITMAPINFOHEADER *src_header = &src_info->bmiHeader;
+    BITMAPINFO alpha_info = {0};
+    const unsigned char *src = src_bits;
+    DWORD *src_alpha = NULL, *scaled_color = NULL, *dst = dst_bits;
+    size_t src_count, dst_count, i;
+    int lines;
+    BOOL ret = FALSE;
+
+    if (src_header->biWidth <= 0 || !src_header->biHeight) return FALSE;
+    src_count = (size_t)src_header->biWidth * abs( src_header->biHeight );
+    dst_count = (size_t)dst_bm->bmWidth * dst_bm->bmHeight;
+
+    if (!(src_alpha = malloc( src_count * sizeof(*src_alpha) ))) goto done;
+    if (!(scaled_color = malloc( dst_count * sizeof(*scaled_color) ))) goto done;
+
+    lines = StretchDIBits( hdc, 0, 0, dst_bm->bmWidth, dst_bm->bmHeight,
+                           0, 0, src_header->biWidth, src_header->biHeight,
+                           src_bits, src_info, DIB_RGB_COLORS, SRCCOPY );
+    if (!lines || lines == GDI_ERROR) goto done;
+    memcpy( scaled_color, dst_bits, dst_count * sizeof(*scaled_color) );
+
+    /* GDI treats the high byte of a BI_RGB pixel as unused and makes it
+       opaque during StretchDIBits.  Scale a grayscale copy of the source
+       alpha through the color channels, then put it back in the high byte. */
+    for (i = 0; i < src_count; i++)
+    {
+        BYTE alpha = src[i * 4 + 3];
+        src_alpha[i] = 0xff000000 | alpha * 0x00010101;
+    }
+
+    alpha_info.bmiHeader.biSize = sizeof(alpha_info.bmiHeader);
+    alpha_info.bmiHeader.biWidth = src_header->biWidth;
+    alpha_info.bmiHeader.biHeight = src_header->biHeight;
+    alpha_info.bmiHeader.biPlanes = 1;
+    alpha_info.bmiHeader.biBitCount = 32;
+    alpha_info.bmiHeader.biCompression = BI_RGB;
+    alpha_info.bmiHeader.biSizeImage = src_count * sizeof(*src_alpha);
+
+    lines = StretchDIBits( hdc, 0, 0, dst_bm->bmWidth, dst_bm->bmHeight,
+                           0, 0, src_header->biWidth, src_header->biHeight,
+                           src_alpha, &alpha_info, DIB_RGB_COLORS, SRCCOPY );
+    if (!lines || lines == GDI_ERROR) goto done;
+
+    for (i = 0; i < dst_count; i++)
+        dst[i] = (scaled_color[i] & 0x00ffffff) | ((dst[i] & 0xff) << 24);
+    ret = TRUE;
+
+done:
+    free( scaled_color );
+    free( src_alpha );
+    return ret;
+}
+
+/***********************************************************************
  *          create_alpha_bitmap
  *
  * Create the alpha bitmap for a 32-bpp icon that has an alpha channel.
@@ -734,9 +795,12 @@ static HBITMAP create_alpha_bitmap( HBITMAP color, const BITMAPINFO *src_info, c
     if (src_info)
     {
         SelectObject( hdc, alpha );
-        StretchDIBits( hdc, 0, 0, bm.bmWidth, bm.bmHeight,
-                       0, 0, src_info->bmiHeader.biWidth, src_info->bmiHeader.biHeight,
-                       color_bits, src_info, DIB_RGB_COLORS, SRCCOPY );
+        if (!stretch_alpha_bits( hdc, &bm, src_info, color_bits, bits ))
+        {
+            DeleteObject( alpha );
+            alpha = 0;
+            goto done;
+        }
 
     }
     else

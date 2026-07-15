@@ -2050,6 +2050,89 @@ static HICON create_test_icon(HDC hdc, int width, int height, int bpp,
     return CreateIconIndirect(&iconInfo);
 }
 
+static void test_resource_icon_alpha(void)
+{
+    struct resource_bits
+    {
+        BITMAPINFOHEADER header;
+        UINT32 color[2];
+        UINT32 mask;
+    } image = {0};
+    struct cursor_resource_bits
+    {
+        SHORT hotspot[2];
+        struct resource_bits image;
+    } cursor = {0};
+    BITMAPINFO bitmap_info = {0};
+    HBITMAP bitmap, old_bitmap;
+    HDC hdc;
+    HICON handle;
+    UINT32 *bits;
+    COLORREF result;
+    unsigned int i;
+
+    image.header.biSize = sizeof(image.header);
+    image.header.biWidth = 2;
+    image.header.biHeight = 2; /* color and mask */
+    image.header.biPlanes = 1;
+    image.header.biBitCount = 32;
+    image.header.biCompression = BI_RGB;
+    image.color[0] = 0x80a0b0c0;
+    image.color[1] = 0x00000000;
+    cursor.image = image;
+
+    bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+    bitmap_info.bmiHeader.biWidth = 2;
+    bitmap_info.bmiHeader.biHeight = 1;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+    hdc = CreateCompatibleDC(0);
+    ok(hdc != NULL, "CreateCompatibleDC failed\n");
+    if (!hdc) return;
+    bitmap = CreateDIBSection(hdc, &bitmap_info, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
+    ok(bitmap != NULL, "CreateDIBSection failed\n");
+    if (!bitmap)
+    {
+        DeleteDC(hdc);
+        return;
+    }
+    old_bitmap = SelectObject(hdc, bitmap);
+
+    for (i = 0; i < 2; i++)
+    {
+        const BYTE *resource = i ? (const BYTE *)&cursor : (const BYTE *)&image;
+        UINT resource_size = i ? sizeof(cursor) : sizeof(image);
+
+        winetest_push_context(i ? "cursor" : "icon");
+        handle = CreateIconFromResourceEx((BYTE *)resource, resource_size, !i,
+                                          0x00030000, 2, 1, 0);
+        ok(handle != NULL, "CreateIconFromResourceEx failed, error %lu\n", GetLastError());
+        if (handle)
+        {
+            bits[0] = bits[1] = 0xffffffff;
+            ok(DrawIconEx(hdc, 0, 0, handle, 2, 1, 0, NULL, DI_NORMAL),
+               "DrawIconEx failed, error %lu\n", GetLastError());
+
+            result = GetPixel(hdc, 0, 0);
+            ok(color_match(result, 0x00dfd7cf),
+               "Expected alpha-blended color 0x00dfd7cf, got %#08lx\n", result);
+            result = GetPixel(hdc, 1, 0);
+            ok(color_match(result, 0x00ffffff),
+               "Expected transparent pixel to preserve white, got %#08lx\n", result);
+
+            if (i) DestroyCursor(handle);
+            else DestroyIcon(handle);
+        }
+        winetest_pop_context();
+    }
+
+    SelectObject(hdc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(hdc);
+}
+
 static void check_alpha_draw(HDC hdc, BOOL drawiconex, BOOL alpha, int bpp, int line)
 {
     HICON hicon;
@@ -3140,6 +3223,7 @@ START_TEST(cursoricon)
     test_CreateIcon();
     test_LoadImage();
     test_CreateIconFromResource();
+    test_resource_icon_alpha();
     test_GetCursorFrameInfo();
     test_DrawIcon();
     test_DrawIconEx();
