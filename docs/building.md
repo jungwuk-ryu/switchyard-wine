@@ -36,7 +36,16 @@ Inspect the source identity that would be written to a runtime manifest with:
 ./switchyard/build_runtime.sh
 ```
 
-The builder downloads and verifies Wine Mono and required open-source Homebrew bottles into user-local caches. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, and core-binary integrity metadata.
+The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, and the pinned redistributable Noto font set into user-local caches. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, font-asset, and core-binary integrity metadata.
+
+The font set supplies regular faces for every Noto family referenced by Wine's DirectWrite fallback table, common bold faces, symbols, and the Japanese, Korean, Simplified Chinese, Traditional Chinese, and Hong Kong faces from Noto Sans CJK. The unmodified files are installed in `share/wine/fonts`, so they are visible to every prefix without copying fonts into `C:\\Windows\\Fonts`. Their pinned URLs and SHA-256 values live in `switchyard/font-assets.tsv`; SIL Open Font License 1.1 notices are copied into the runtime.
+
+Validate the manifest without network access, or verify every downloaded font and its family metadata, with:
+
+```sh
+./switchyard/verify_font_assets.sh
+./switchyard/verify_font_assets.sh --download
+```
 
 An existing custom install prefix is replaced only when it is a child of Switchyard's managed runtime root or contains a valid Switchyard runtime manifest for that exact path. Existing cache directories require a regular Switchyard ownership marker; an intact full-content digest is required for reuse, while an owned cache with damaged content is safely replaced. The builder refuses symbolic-link destinations, unmanaged directories, the managed root itself, the home directory, and dangerous ancestor paths.
 
@@ -49,6 +58,7 @@ Useful overrides include:
 - `WINE_INSTALL_PREFIX`: explicit installation directory;
 - `RECONFIGURE=1`: rerun Wine configuration;
 - `GPTK_PATH`: user-selected local GPTK path; and
+- `FONT_ASSET_DOWNLOAD_CACHE_DIR`: cache for the verified redistributable font files;
 - `SWITCHYARD_TLS_SOURCE_PREFIX`: user-local x86_64 Wine prefix containing a compatible GnuTLS dependency closure.
 
 To reuse a complete runtime with exactly matching inputs:

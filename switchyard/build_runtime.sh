@@ -55,6 +55,10 @@ FONT_DEPS_LAYER_SHA256=(
   "2cc112cce103be3beb13cc8ba67f521d4e972c4082fd69868d34920d63120c09"
   "fbb3a7908a19f306823dbd51b417705c73f710a9a1fb1e34ba7aa67a3c966094"
 )
+FONT_ASSET_SET_VERSION="noto-monthly-release-2026.07.01-cjk-2.004"
+FONT_ASSET_MANIFEST="$ROOT_DIR/switchyard/font-assets.tsv"
+FONT_ASSET_DOWNLOAD_CACHE_DIR="${FONT_ASSET_DOWNLOAD_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Fonts/assets/noto-monthly-release-2026.07.01}"
+FONT_ASSET_PREFIX="${FONT_ASSET_PREFIX:-${HOME}/.switchyard/deps/fonts/assets-${FONT_ASSET_SET_VERSION}}"
 TLS_DEPS_CACHE_DIR="${TLS_DEPS_CACHE_DIR:-${HOME}/.switchyard/deps/tls}"
 USER_SET_WINE_BUILD_DIR="${WINE_BUILD_DIR+x}"
 WINE_BUILD_DIR="${WINE_BUILD_DIR:-}"
@@ -209,6 +213,135 @@ download_wine_mono() {
   fi
   mv "$temporary_file" "$cached_file"
   printf '%s\n' "$cached_file"
+}
+
+download_font_asset() {
+  local name="$1"
+  local expected_hash="$2"
+  local url="$3"
+  local cached_file="$FONT_ASSET_DOWNLOAD_CACHE_DIR/$name"
+  local temporary_file="$cached_file.tmp.$$"
+  local actual_hash
+
+  mkdir -p "$FONT_ASSET_DOWNLOAD_CACHE_DIR"
+  if [ -f "$cached_file" ]; then
+    actual_hash="$(sha256_file "$cached_file")"
+    if [ "$actual_hash" = "$expected_hash" ]; then
+      printf '%s\n' "$cached_file"
+      return 0
+    fi
+    echo "cached font asset $name has unexpected sha256 $actual_hash; downloading again." >&2
+    rm -f "$cached_file"
+  fi
+
+  rm -f "$temporary_file"
+  curl -fL --retry 3 --connect-timeout 20 -o "$temporary_file" "$url"
+  actual_hash="$(sha256_file "$temporary_file")"
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    rm -f "$temporary_file"
+    echo "font asset $name sha256 mismatch: expected $expected_hash, got $actual_hash" >&2
+    exit 1
+  fi
+  mv "$temporary_file" "$cached_file"
+  printf '%s\n' "$cached_file"
+}
+
+stage_font_assets() {
+  local temporary_prefix
+  local kind
+  local name
+  local expected_hash
+  local url
+  local extra
+  local asset
+  local font_count=0
+  local license_count=0
+
+  if [ ! -f "$FONT_ASSET_MANIFEST" ]; then
+    echo "missing font asset manifest: $FONT_ASSET_MANIFEST" >&2
+    exit 1
+  fi
+
+  if content_tree_is_verified "$FONT_ASSET_PREFIX" &&
+     cmp -s "$FONT_ASSET_MANIFEST" \
+       "$FONT_ASSET_PREFIX/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv"; then
+    printf '%s\n' "$FONT_ASSET_PREFIX"
+    return 0
+  fi
+
+  temporary_prefix="${FONT_ASSET_PREFIX}.tmp.$$"
+  rm -rf "$temporary_prefix"
+  mkdir -p "$temporary_prefix/share/wine/fonts" \
+    "$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets"
+
+  while IFS=$'\t' read -r kind name expected_hash url extra; do
+    case "$kind" in
+      ''|'#'*) continue ;;
+      font|license) ;;
+      *)
+        echo "unsupported font asset type '$kind' in $FONT_ASSET_MANIFEST" >&2
+        exit 1
+        ;;
+    esac
+    if [ -n "${extra:-}" ] || [ -z "$name" ] || [ -z "$expected_hash" ] || [ -z "$url" ]; then
+      echo "invalid font asset manifest row for $name" >&2
+      exit 1
+    fi
+    case "$name" in
+      */*|.*|'')
+        echo "unsafe font asset file name: $name" >&2
+        exit 1
+        ;;
+    esac
+    if ! printf '%s\n' "$expected_hash" | grep -Eq '^[0-9a-f]{64}$'; then
+      echo "invalid sha256 for font asset $name" >&2
+      exit 1
+    fi
+    case "$url" in
+      https://*) ;;
+      *)
+        echo "font asset URL must use HTTPS: $url" >&2
+        exit 1
+        ;;
+    esac
+
+    asset="$(download_font_asset "$name" "$expected_hash" "$url")"
+    if [ "$kind" = "font" ]; then
+      case "$name" in
+        *.ttf|*.ttc|*.otf) ;;
+        *)
+          echo "unsupported font file extension: $name" >&2
+          exit 1
+          ;;
+      esac
+      install -m 0644 "$asset" "$temporary_prefix/share/wine/fonts/$name"
+      font_count=$((font_count + 1))
+    else
+      install -m 0644 "$asset" \
+        "$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/$name"
+      license_count=$((license_count + 1))
+    fi
+  done < "$FONT_ASSET_MANIFEST"
+
+  if [ "$font_count" -lt 1 ] || [ "$license_count" -lt 1 ]; then
+    echo "font asset manifest did not provide both fonts and license notices" >&2
+    exit 1
+  fi
+
+  install -m 0644 "$FONT_ASSET_MANIFEST" \
+    "$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv"
+  cat >"$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/README.txt" <<EOF
+Switchyard Wine redistributable font set $FONT_ASSET_SET_VERSION
+
+These unmodified Noto font binaries are installed under share/wine/fonts so
+every Wine prefix has deterministic multilingual text fallback. The files are
+licensed under the SIL Open Font License 1.1. Preserve the included license
+notices and manifest when distributing the runtime.
+EOF
+
+  write_content_tree_digest "$temporary_prefix"
+  atomic_replace_directory "$temporary_prefix" "$FONT_ASSET_PREFIX" cache
+  printf '%s\n' "$FONT_ASSET_PREFIX"
 }
 
 download_homebrew_oci_blob() {
@@ -874,6 +1007,9 @@ vulkan_deps_prefix="$(stage_vulkan_deps)"
 vulkan_deps_digest="$(content_tree_digest "$vulkan_deps_prefix")"
 font_deps_prefix="$(stage_font_deps)"
 font_deps_digest="$(content_tree_digest "$font_deps_prefix")"
+font_assets_prefix="$(stage_font_assets)"
+font_assets_digest="$(content_tree_digest "$font_assets_prefix")"
+font_asset_count="$(awk -F '\t' '$1 == "font" { count++ } END { print count + 0 }' "$FONT_ASSET_MANIFEST")"
 tls_deps_prefix="$(stage_tls_deps)"
 if [ -n "$tls_deps_prefix" ]; then
   tls_deps_digest="$(content_tree_digest "$tls_deps_prefix")"
@@ -883,7 +1019,7 @@ else
   tls_dlopen_digest="none"
 fi
 
-runtime_id="switchyard-local-wow64-x86_64-${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${vulkan_deps_digest}-${font_deps_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
+runtime_id="switchyard-local-wow64-x86_64-${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${vulkan_deps_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
 if [ -z "$USER_SET_WINE_INSTALL_PREFIX" ]; then
   WINE_INSTALL_PREFIX="${HOME}/.switchyard/runtimes/$runtime_id"
 fi
@@ -905,6 +1041,13 @@ runtime_is_complete_at() {
   local expected_wine_sha
   local expected_i386_ntdll_sha
   local expected_x86_64_ntdll_sha
+  local manifest_font_assets_digest
+  local kind
+  local name
+  local expected_hash
+  local url
+  local extra
+  local asset_path
 
   [ -f "$manifest" ] || return 1
   manifest_id="$(/usr/bin/plutil -extract id raw -o - "$manifest" 2>/dev/null || true)"
@@ -927,6 +1070,21 @@ runtime_is_complete_at() {
     [ "$(sha256_file "$prefix/lib/wine/i386-windows/ntdll.dll")" = "$expected_i386_ntdll_sha" ] || return 1
   [ -n "$expected_x86_64_ntdll_sha" ] &&
     [ "$(sha256_file "$prefix/lib/wine/x86_64-windows/ntdll.dll")" = "$expected_x86_64_ntdll_sha" ] || return 1
+  manifest_font_assets_digest="$(/usr/bin/plutil -extract fontAssets.digest raw -o - "$manifest" 2>/dev/null || true)"
+  [ "$manifest_font_assets_digest" = "$font_assets_digest" ] || return 1
+  cmp -s "$FONT_ASSET_MANIFEST" \
+    "$prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv" || return 1
+  while IFS=$'\t' read -r kind name expected_hash url extra; do
+    case "$kind" in
+      ''|'#'*) continue ;;
+      font) asset_path="$prefix/share/wine/fonts/$name" ;;
+      license) asset_path="$prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/$name" ;;
+      *) return 1 ;;
+    esac
+    [ -z "${extra:-}" ] || return 1
+    [ -f "$asset_path" ] || return 1
+    [ "$(sha256_file "$asset_path")" = "$expected_hash" ] || return 1
+  done < "$FONT_ASSET_MANIFEST"
 }
 
 runtime_is_complete() {
@@ -1159,6 +1317,13 @@ if [ -f "$runtime_font_root/etc/fonts/fonts.conf" ]; then
     "$runtime_font_root/etc/fonts/fonts.conf"
 fi
 
+echo "installing $font_asset_count redistributable Noto fonts"
+mkdir -p "$WINE_INSTALL_PREFIX/share/wine/fonts" \
+  "$runtime_font_root/share/doc/switchyard-font-assets"
+ditto "$font_assets_prefix/share/wine/fonts" "$WINE_INSTALL_PREFIX/share/wine/fonts"
+ditto "$font_assets_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets" \
+  "$runtime_font_root/share/doc/switchyard-font-assets"
+
 if [ -n "$tls_deps_prefix" ]; then
   echo "installing x86_64 GnuTLS runtime libraries"
   rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-tls"
@@ -1335,6 +1500,15 @@ x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows
     fi
   done
   printf '    ]\n'
+  printf '  },\n'
+  printf '  "fontAssets": {\n'
+  printf '    "root": "share/wine/fonts",\n'
+  printf '    "documentation": "lib/switchyard-fonts/share/doc/switchyard-font-assets",\n'
+  printf '    "setVersion": %s,\n' "$(json_string "$FONT_ASSET_SET_VERSION")"
+  printf '    "digest": %s,\n' "$(json_string "$font_assets_digest")"
+  printf '    "fontCount": %s,\n' "$font_asset_count"
+  printf '    "license": "SIL Open Font License 1.1",\n'
+  printf '    "manifest": "lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv"\n'
   printf '  },\n'
   if [ -n "$tls_deps_prefix" ]; then
     printf '  "tlsRuntime": {\n'

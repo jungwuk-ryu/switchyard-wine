@@ -1618,6 +1618,36 @@ static const struct font_links_defaults_list
     }
 };
 
+/* Switchyard ships these OFL-licensed faces in share/wine/fonts. Keep the
+ * common non-CJK scripts in the GDI SystemLink chain; DirectWrite uses its
+ * range-specific fallback table for the complete bundled set. */
+#define SWITCHYARD_NOTO_SYSTEM_LINKS \
+    "NotoSansArabic-Regular.ttf,Noto Sans Arabic\0" \
+    "NotoSansHebrew-Regular.ttf,Noto Sans Hebrew\0" \
+    "NotoSansArmenian-Regular.ttf,Noto Sans Armenian\0" \
+    "NotoSansGeorgian-Regular.ttf,Noto Sans Georgian\0" \
+    "NotoSansDevanagari-Regular.ttf,Noto Sans Devanagari\0" \
+    "NotoSansBengali-Regular.ttf,Noto Sans Bengali\0" \
+    "NotoSansGurmukhi-Regular.ttf,Noto Sans Gurmukhi\0" \
+    "NotoSansGujarati-Regular.ttf,Noto Sans Gujarati\0" \
+    "NotoSansOriya-Regular.ttf,Noto Sans Oriya\0" \
+    "NotoSansTamil-Regular.ttf,Noto Sans Tamil\0" \
+    "NotoSansTelugu-Regular.ttf,Noto Sans Telugu\0" \
+    "NotoSansKannada-Regular.ttf,Noto Sans Kannada\0" \
+    "NotoSansMalayalam-Regular.ttf,Noto Sans Malayalam\0" \
+    "NotoSansSinhala-Regular.ttf,Noto Sans Sinhala\0" \
+    "NotoSansThai-Regular.ttf,Noto Sans Thai\0" \
+    "NotoSansLao-Regular.ttf,Noto Sans Lao\0" \
+    "NotoSansMyanmar-Regular.ttf,Noto Sans Myanmar\0" \
+    "NotoSansKhmer-Regular.ttf,Noto Sans Khmer\0" \
+    "NotoSerifTibetan-Regular.ttf,Noto Serif Tibetan\0" \
+    "NotoSansEthiopic-Regular.ttf,Noto Sans Ethiopic\0" \
+    "NotoSansCherokee-Regular.ttf,Noto Sans Cherokee\0" \
+    "NotoSansCanadianAboriginal-Regular.ttf,Noto Sans Canadian Aboriginal\0" \
+    "NotoSansMongolian-Regular.ttf,Noto Sans Mongolian\0" \
+    "NotoSansSymbols-Regular.ttf,Noto Sans Symbols\0" \
+    "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols 2\0"
+
 static const char system_link_tahoma_sc[] =
     "SIMSUN.TTC,SimSun\0"
     "MINGLIU.TTC,PMingLiu\0"
@@ -1627,7 +1657,9 @@ static const char system_link_tahoma_sc[] =
     "MSJH.TTC,Microsoft JhengHei UI\0"
     "YUGOTHM.TTC,Yu Gothic UI\0"
     "MALGUN.TTF,Malgun Gothic\0"
-    "SEGUISYM.TTF,Segoe UI Symbol\0";
+    "SEGUISYM.TTF,Segoe UI Symbol\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK SC\0"
+    SWITCHYARD_NOTO_SYSTEM_LINKS;
 
 static const char system_link_tahoma_tc[] =
     "MINGLIU.TTC,PMingLiu\0"
@@ -1638,7 +1670,10 @@ static const char system_link_tahoma_tc[] =
     "MSYH.TTC,Microsoft YaHei UI\0"
     "YUGOTHM.TTC,Yu Gothic UI\0"
     "MALGUN.TTF,Malgun Gothic\0"
-    "SEGUISYM.TTF,Segoe UI Symbol\0";
+    "SEGUISYM.TTF,Segoe UI Symbol\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK TC\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK HK\0"
+    SWITCHYARD_NOTO_SYSTEM_LINKS;
 
 static const char system_link_tahoma_jp[] =
     "MSGOTHIC.TTC,MS UI Gothic\0"
@@ -1649,7 +1684,9 @@ static const char system_link_tahoma_jp[] =
     "MSJH.TTC,Microsoft JhengHei UI\0"
     "MSYH.TTC,Microsoft YaHei UI\0"
     "MALGUN.TTF,Malgun Gothic\0"
-    "SEGUISYM.TTF,Segoe UI Symbol\0";
+    "SEGUISYM.TTF,Segoe UI Symbol\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK JP\0"
+    SWITCHYARD_NOTO_SYSTEM_LINKS;
 
 static const char system_link_tahoma_kr[] =
     "GULIM.TTC,Gulim\0"
@@ -1660,7 +1697,9 @@ static const char system_link_tahoma_kr[] =
     "YUGOTHM.TTC,Yu Gothic UI\0"
     "MSJH.TTC,Microsoft JhengHei UI\0"
     "MSYH.TTC,Microsoft YaHei UI\0"
-    "SEGUISYM.TTF,Segoe UI Symbol\0";
+    "SEGUISYM.TTF,Segoe UI Symbol\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK KR\0"
+    SWITCHYARD_NOTO_SYSTEM_LINKS;
 
 static const char system_link_tahoma_non_cjk[] =
     "MSGOTHIC.TTC,MS UI Gothic\0"
@@ -1671,7 +1710,15 @@ static const char system_link_tahoma_non_cjk[] =
     "MSJH.TTC,Microsoft JhengHei UI\0"
     "MSYH.TTC,Microsoft YaHei UI\0"
     "MALGUN.TTF,Malgun Gothic\0"
-    "SEGUISYM.TTF,Segoe UI Symbol\0";
+    "SEGUISYM.TTF,Segoe UI Symbol\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK JP\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK TC\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK SC\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK KR\0"
+    "NotoSansCJK-Regular.ttc,Noto Sans CJK HK\0"
+    SWITCHYARD_NOTO_SYSTEM_LINKS;
+
+#undef SWITCHYARD_NOTO_SYSTEM_LINKS
 
 static const char system_link_ms_gothic[] =
     "MINGLIU.TTC,MingLiU\0"

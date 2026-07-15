@@ -286,6 +286,12 @@ system_fallback_config[] =
       "A960-A97F, AC00-D7FF, "
       "D7B0-D7FF",              L"Noto Sans CJK KR" },
 
+    { "1200-139F, 2D80-2DDF, AB00-AB2F, 1E7E0-1E7FF", L"Noto Sans Ethiopic" },
+
+    { "13A0-13FF, AB70-ABBF",   L"Noto Sans Cherokee" },
+
+    { "1400-167F, 18B0-18FF",   L"Noto Sans Canadian Aboriginal" },
+
     { "1680-169F",              L"Noto Sans Ogham" },
 
     { "16A0-16FF",              L"Noto Sans Runic" },
@@ -294,6 +300,8 @@ system_fallback_config[] =
     { "1720-173F",              L"Noto Sans Hanunoo" },
     { "1740-175F",              L"Noto Sans Buhid" },
     { "1760-177F",              L"Noto Sans Tagbanwa" },
+
+    { "1780-17FF, 19E0-19FF",   L"Noto Sans Khmer" },
 
     { "1800-18AF, 202F, 11660-1167F", L"Noto Sans Mongolian" },
 
@@ -334,6 +342,7 @@ system_fallback_config[] =
 
     { "2E80-2EFF",              L"Noto Sans CJK SC", L"zh-Hans" },
     { "2E80-2EFF",              L"Noto Sans CJK TC", L"zh-Hant" },
+    { "2E80-2EFF",              L"Noto Sans CJK HK", L"zh-HK" },
     { "2E80-2EFF",              L"Noto Sans CJK KR", L"ko" },
 
     /* CJK Symbols and Punctuation - 3000-303F
@@ -343,6 +352,7 @@ system_fallback_config[] =
 
     { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK SC", L"zh-Hans" },
     { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK TC", L"zh-Hant" },
+    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK HK", L"zh-HK" },
     { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK KR", L"ko" },
     { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK JP" },
 
@@ -351,6 +361,7 @@ system_fallback_config[] =
 
     { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK SC", L"zh-Hans" },
     { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK TC", L"zh-Hant" },
+    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK HK", L"zh-HK" },
     { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK KR", L"ko" },
     { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK JP" },
 
@@ -365,17 +376,20 @@ system_fallback_config[] =
     { "A930-A95F",              L"Noto Sans Rejang" },
     { "A980-A9DF",              L"Noto Sans Javanese" },
     { "AA00-AA5F",              L"Noto Sans Cham" },
+    { "AAE0-AAFF, ABC0-ABFF",   L"Noto Sans Meetei Mayek" },
 
     /* CJK Compatibility Ideographs - F900-FAFF */
 
     { "F900-FAFF",              L"Noto Sans CJK SC", L"zh-Hans" },
     { "F900-FAFF",              L"Noto Sans CJK TC", L"zh-Hant" },
+    { "F900-FAFF",              L"Noto Sans CJK HK", L"zh-HK" },
     { "F900-FAFF",              L"Noto Sans CJK KR", L"ko" },
     { "F900-FAFF",              L"Noto Sans CJK JP" },
 
     /* Vertical Forms - FE10-FE1F */
 
     { "FE10-FE1F",              L"Noto Sans CJK SC", L"zh-Hans" },
+    { "FE10-FE1F",              L"Noto Sans CJK HK", L"zh-HK" },
     { "FE10-FE1F",              L"Noto Sans CJK KR", L"ko" },
     { "FE10-FE1F",              L"Noto Sans CJK TC" },
 
@@ -383,6 +397,7 @@ system_fallback_config[] =
        Small Form Variants     - FE50-FE6F */
 
     { "FE30-FE6F",              L"Noto Sans CJK SC", L"zh-Hans" },
+    { "FE30-FE6F",              L"Noto Sans CJK HK", L"zh-HK" },
     { "FE30-FE6F",              L"Noto Sans CJK KR", L"ko" },
     { "FE30-FE6F",              L"Noto Sans CJK JP", L"ja" },
     { "FE30-FE6F",              L"Noto Sans CJK TC" },
@@ -390,6 +405,7 @@ system_fallback_config[] =
     /* Halfwidth and Fullwidth Forms */
     { "FF00-FFEF",              L"Noto Sans CJK SC", L"zh-Hans" },
     { "FF00-FFEF",              L"Noto Sans CJK TC", L"zh-Hant" },
+    { "FF00-FFEF",              L"Noto Sans CJK HK", L"zh-HK" },
     { "FF00-FFEF",              L"Noto Sans CJK KR", L"ko" },
     { "FF00-FFEF",              L"Noto Sans CJK JP" },
 
