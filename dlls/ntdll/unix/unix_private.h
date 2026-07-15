@@ -122,6 +122,10 @@ struct thread_data
 
 extern pthread_key_t thread_data_key;
 
+#if defined(__APPLE__) && defined(__x86_64__)
+extern void *__wine_get_current_teb_from_pthread(void);
+#endif
+
 static inline struct thread_data *get_thread_data(void)
 {
     return pthread_getspecific( thread_data_key );

@@ -3472,6 +3472,8 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_OUTPUT_VTABLES 0x04
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_FACTORY_OUTPUT_VTABLE 0x08
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE 0x10
+#define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_ADAPTER_OUTPUT_VTABLE 0x20
+#define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_OUTPUT_OUTPUT_VTABLE 0x40
 #define SWITCHYARD_PE_CALLBACK_MAX_ARGS 9
 #define SWITCHYARD_PE_CALLBACK_SKIP 0xff
 #define SWITCHYARD_PE_CALLBACK_FRAME_SIZE 0xa8
@@ -3525,6 +3527,7 @@ C_ASSERT( FIELD_OFFSET( struct switchyard_native_callback_params, args ) == SWIT
 
 static void wrap_native_callback_entry_with_flags( void **slot, unsigned int argc, ULONG flags );
 static BOOL is_native_callback_target( void *func );
+static void *create_native_callback_thunk( void *func, unsigned int argc, ULONG flags );
 static void **switchyard_gfxt_deferred_vtable;
 
 struct switchyard_pe_callback_scope
@@ -3549,15 +3552,21 @@ static BOOL switchyard_get_native_callback_context( TEB **teb, void **pthread_te
     *pthread_teb = NULL;
     *native_callback_depth = NULL;
 
-    if (!current) return FALSE;
+    /* A Windows TEB is page-aligned.  With the native pthread TSD installed,
+     * gs:0x30 is pthread data instead; never probe that value through SEH,
+     * since dispatching the resulting fault requires a valid TEB itself. */
+    if (!current || ((ULONG_PTR)current & 0xfff)) return FALSE;
 
     __TRY
     {
         void *stored_pthread_teb = *(void **)((char *)current + switchyard_amd64_pthread_teb_offset);
         DWORD *stored_depth = (DWORD *)((char *)current +
                                         switchyard_amd64_native_callback_depth_offset);
+        const void *stack_ptr = &current;
 
-        if (stored_pthread_teb && stored_depth)
+        if (current->Tib.Self == &current->Tib &&
+            stack_ptr >= current->Tib.StackLimit && stack_ptr < current->Tib.StackBase &&
+            stored_pthread_teb && stored_depth)
         {
             *teb = current;
             *pthread_teb = stored_pthread_teb;
@@ -3571,6 +3580,36 @@ static BOOL switchyard_get_native_callback_context( TEB **teb, void **pthread_te
     __ENDTRY
 
     return ret;
+}
+
+typedef TEB *(__attribute__((sysv_abi)) *switchyard_get_teb_from_pthread_func)(void);
+static switchyard_get_teb_from_pthread_func switchyard_get_teb_from_pthread;
+
+static void switchyard_init_native_callback_recovery(void)
+{
+    struct native_callback_context_params params = { 0 };
+
+    if (switchyard_get_teb_from_pthread || !__wine_unixlib_handle ||
+        !__wine_unix_call_dispatcher)
+        return;
+
+    if (!__wine_unix_call_dispatcher( __wine_unixlib_handle,
+                                      unix_get_native_callback_context, &params ))
+        switchyard_get_teb_from_pthread = params.get_teb_from_pthread;
+}
+
+static BOOL switchyard_recover_native_callback_context( TEB **teb, void **pthread_teb,
+                                                        DWORD **native_callback_depth )
+{
+    TEB *current;
+
+    if (!switchyard_get_teb_from_pthread ||
+        !(current = switchyard_get_teb_from_pthread()))
+        return FALSE;
+
+    switchyard_set_macos_tsd_base( current );
+    return switchyard_get_native_callback_context( teb, pthread_teb,
+                                                   native_callback_depth );
 }
 
 static BOOL switchyard_find_pe_module_nolock( const void *addr, void **module )
@@ -3922,8 +3961,7 @@ static void switchyard_wrap_protected_native_callback_entry( void **slot, unsign
     NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old_prot, &old_prot );
 }
 
-static BOOL switchyard_wrap_native_callback_jump_table_entry( void *entry, unsigned int argc,
-                                                               ULONG flags )
+static BOOL switchyard_get_native_callback_jump_table_slot( void *entry, void ***result )
 {
     static const BYTE jump_entry_prefix[] = { 0xff, 0x25, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
     static const BYTE adjusted_jump_entry_prefix[] = { 0x48, 0x83, 0xe9, 0x10, 0x48, 0xb8 };
@@ -3945,6 +3983,17 @@ static BOOL switchyard_wrap_native_callback_jump_table_entry( void *entry, unsig
         target == __wine_syscall_dispatcher || target == (void *)__wine_unix_call_dispatcher)
         return FALSE;
 
+    if (result) *result = slot;
+    return TRUE;
+}
+
+static BOOL switchyard_wrap_native_callback_jump_table_entry( void *entry, unsigned int argc,
+                                                               ULONG flags )
+{
+    void **slot;
+
+    if (!switchyard_get_native_callback_jump_table_slot( entry, &slot )) return FALSE;
+
     switchyard_wrap_protected_native_callback_entry( slot, argc, flags );
     return TRUE;
 }
@@ -3952,12 +4001,22 @@ static BOOL switchyard_wrap_native_callback_jump_table_entry( void *entry, unsig
 static BOOL switchyard_wrap_native_callback_vtable_slot( void **slot, unsigned int argc,
                                                           ULONG flags )
 {
-    void *entry;
+    void *addr, *entry, *thunk;
+    SIZE_T size;
+    ULONG old_prot;
 
     if (!slot) return FALSE;
     entry = *slot;
-    if (switchyard_wrap_native_callback_jump_table_entry( entry, argc, flags ))
+    if (switchyard_get_native_callback_jump_table_slot( entry, NULL ))
     {
+        if (!(thunk = create_native_callback_thunk( entry, argc, flags ))) return FALSE;
+        addr = slot;
+        size = sizeof(*slot);
+        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                    PAGE_EXECUTE_READWRITE, &old_prot ))
+            return FALSE;
+        *slot = thunk;
+        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old_prot, &old_prot );
         TRACE( "bridged COM vtable jump-stub slot %p entry %p argc %u\n", slot, entry, argc );
         return TRUE;
     }
@@ -4003,21 +4062,55 @@ static void switchyard_wrap_gfxt_deferred_vtable_jump_targets(void)
     __ENDTRY
 }
 
+struct switchyard_com_vtable_clone_header
+{
+    ULONG_PTR magic;
+    void **original;
+};
+
+static const ULONG_PTR switchyard_com_vtable_clone_magic =
+    (ULONG_PTR)0x5359575654424c45ULL;
+/* Preserve native C++ RTTI and this-adjustment metadata preceding the vtable. */
+#define SWITCHYARD_COM_VTABLE_PREFIX_SIZE 0x30
+
 static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vtable,
                                                         unsigned int entries )
 {
+    struct switchyard_com_vtable_clone_header *existing_header;
+    struct switchyard_com_vtable_clone_header *header;
     void *base = NULL;
     void **copy = NULL;
-    SIZE_T size = entries * sizeof(*copy);
+    SIZE_T size = sizeof(*header) + SWITCHYARD_COM_VTABLE_PREFIX_SIZE +
+                  entries * sizeof(*copy);
 
     if (!object || !vtable || !size) return NULL;
+
+    __TRY
+    {
+        existing_header = (struct switchyard_com_vtable_clone_header *)
+                          ((BYTE *)vtable - SWITCHYARD_COM_VTABLE_PREFIX_SIZE) - 1;
+        if (existing_header->magic == switchyard_com_vtable_clone_magic &&
+            existing_header->original)
+            return NULL;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+
     if (NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &size,
                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE ))
         return NULL;
 
-    copy = base;
+    header = base;
+    copy = (void **)((BYTE *)(header + 1) + SWITCHYARD_COM_VTABLE_PREFIX_SIZE);
     __TRY
     {
+        header->magic = switchyard_com_vtable_clone_magic;
+        header->original = vtable;
+        memcpy( (BYTE *)copy - SWITCHYARD_COM_VTABLE_PREFIX_SIZE,
+                (BYTE *)vtable - SWITCHYARD_COM_VTABLE_PREFIX_SIZE,
+                SWITCHYARD_COM_VTABLE_PREFIX_SIZE );
         memcpy( copy, vtable, entries * sizeof(*copy) );
         *(void ***)object = copy;
         TRACE( "cloned COM object %p vtable %p -> %p entries %u\n",
@@ -4036,6 +4129,67 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     return copy;
 }
 
+struct switchyard_com_vtable_scope
+{
+    void *object;
+    void **original;
+    void **wrapped;
+    BOOL unwrapped;
+};
+
+static BOOL switchyard_unwrap_com_vtable( void *object,
+                                          struct switchyard_com_vtable_scope *scope )
+{
+    struct switchyard_com_vtable_clone_header *header;
+    void **wrapped;
+    BOOL ret = FALSE;
+
+    memset( scope, 0, sizeof(*scope) );
+    if (!object) return FALSE;
+
+    __TRY
+    {
+        wrapped = *(void ***)object;
+        if (!wrapped) return FALSE;
+        header = (struct switchyard_com_vtable_clone_header *)
+                 ((BYTE *)wrapped - SWITCHYARD_COM_VTABLE_PREFIX_SIZE) - 1;
+        if (header->magic == switchyard_com_vtable_clone_magic && header->original)
+        {
+            scope->object = object;
+            scope->original = header->original;
+            scope->wrapped = wrapped;
+            scope->unwrapped = TRUE;
+            *(void ***)object = header->original;
+            ret = TRUE;
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+
+    return ret;
+}
+
+static void CALLBACK switchyard_restore_com_vtable( BOOL normal, void *ctx )
+{
+    struct switchyard_com_vtable_scope *scope = ctx;
+
+    (void)normal;
+    if (!scope->unwrapped) return;
+    scope->unwrapped = FALSE;
+
+    __TRY
+    {
+        if (*(void ***)scope->object == scope->original)
+            *(void ***)scope->object = scope->wrapped;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+}
+
 static void switchyard_wrap_com_vtable_jump_targets( void *object, unsigned int entries,
                                                      BOOL (*uses_scalar_float)(unsigned int) )
 {
@@ -4049,7 +4203,8 @@ static void switchyard_wrap_com_vtable_jump_targets( void *object, unsigned int 
         vtable = *(void ***)object;
         if (!vtable) return;
         wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable, entries );
-        if (wrapped_vtable) vtable = wrapped_vtable;
+        if (!wrapped_vtable) return;
+        vtable = wrapped_vtable;
         TRACE( "checking COM object %p vtable %p entries %u\n", object, vtable, entries );
 
         for (i = 0; i < entries; ++i)
@@ -4091,8 +4246,8 @@ static void switchyard_wrap_d3d11_create_device_output_vtables(
 {
     enum
     {
-        d3d11_device_vtable_entries = 43,
-        d3d11_device_context_vtable_entries = 110,
+        d3d11_device_vtable_entries = 69,
+        d3d11_device_context_vtable_entries = 149,
         dxgi_swapchain_vtable_entries = 41
     };
 
@@ -4142,12 +4297,86 @@ static void switchyard_wrap_dxgi_factory_output_vtable(
         if (!object || !(vtable = *(void ***)object)) return;
         wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable,
                                                                    ARRAY_SIZE(argc) );
-        if (wrapped_vtable) vtable = wrapped_vtable;
+        if (!wrapped_vtable) return;
+        vtable = wrapped_vtable;
 
         for (i = 0; i < ARRAY_SIZE(argc); ++i)
         {
-            ULONG flags = i == 10 || i == 15 || i == 16 || i == 24 ?
-                          SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE : 0;
+            ULONG flags = 0;
+
+            if (i == 7 || i == 12 || i == 26 || i == 27 || i == 29)
+                flags |= SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_ADAPTER_OUTPUT_VTABLE;
+            if (i == 10 || i == 15 || i == 16 || i == 24)
+                flags |= SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE;
+
+            switchyard_wrap_native_callback_vtable_slot( &vtable[i], argc[i], flags );
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+}
+
+static void switchyard_wrap_dxgi_output_output_vtable(
+    const struct switchyard_native_callback_params *params )
+{
+    static const BYTE argc[] =
+    {
+        3, 1, 1, 4, 3, 4, 3, 2,
+        5, 4, 1, 3, 1, 2, 2, 2,
+        2, 2, 2, 5, 4, 2, 3, 1,
+        4, 5, 6, 2, 2
+    };
+    void **vtable, **wrapped_vtable;
+    void *object;
+    unsigned int i;
+
+    if (!params->argc) return;
+    __TRY
+    {
+        object = *(void **)params->args[params->argc - 1];
+        if (!object || !(vtable = *(void ***)object)) return;
+        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable,
+                                                                   ARRAY_SIZE(argc) );
+        if (!wrapped_vtable) return;
+        vtable = wrapped_vtable;
+
+        for (i = 0; i < ARRAY_SIZE(argc); ++i)
+            switchyard_wrap_native_callback_vtable_slot( &vtable[i], argc[i], 0 );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+}
+
+static void switchyard_wrap_dxgi_adapter_output_vtable(
+    const struct switchyard_native_callback_params *params )
+{
+    static const BYTE argc[] =
+    {
+        3, 1, 1, 4, 3, 4, 3, 3,
+        2, 3, 2, 2, 3, 2, 4, 4,
+        3, 2, 2
+    };
+    void **vtable, **wrapped_vtable;
+    void *object;
+    unsigned int i;
+
+    if (!params->argc) return;
+    __TRY
+    {
+        object = *(void **)params->args[params->argc - 1];
+        if (!object || !(vtable = *(void ***)object)) return;
+        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable,
+                                                                   ARRAY_SIZE(argc) );
+        if (!wrapped_vtable) return;
+        vtable = wrapped_vtable;
+
+        for (i = 0; i < ARRAY_SIZE(argc); ++i)
+        {
+            ULONG flags = i == 7 ? SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_OUTPUT_OUTPUT_VTABLE : 0;
 
             switchyard_wrap_native_callback_vtable_slot( &vtable[i], argc[i], flags );
         }
@@ -4162,10 +4391,157 @@ static void switchyard_wrap_dxgi_swapchain_output_vtable(
     const struct switchyard_native_callback_params *params )
 {
     enum { dxgi_swapchain_vtable_entries = 41 };
+    void **vtable, **wrapped_vtable;
+    void *object;
+    unsigned int i;
 
     if (!params->argc) return;
-    switchyard_wrap_com_output_vtable_jump_targets( params->args[params->argc - 1],
-                                                    dxgi_swapchain_vtable_entries, NULL );
+    __TRY
+    {
+        object = *(void **)params->args[params->argc - 1];
+        if (!object || !(vtable = *(void ***)object)) return;
+        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable,
+                                                                   dxgi_swapchain_vtable_entries );
+        if (!wrapped_vtable) return;
+        vtable = wrapped_vtable;
+
+        for (i = 0; i < dxgi_swapchain_vtable_entries; ++i)
+            switchyard_wrap_native_callback_vtable_slot( &vtable[i],
+                                                         SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS,
+                                                         0 );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+}
+
+static ULONG_PTR switchyard_call_native_callback_args(
+    const struct switchyard_native_callback_params *params )
+{
+    typedef ULONG_PTR (WINAPI *native_callback_func0)(void);
+    typedef ULONG_PTR (WINAPI *native_callback_func1)(ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func2)(ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func3)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func4)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func5)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                       ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func6)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                       ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func7)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                       ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func8)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                       ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func9)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                       ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                       ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func10)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                        ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func11)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    typedef ULONG_PTR (WINAPI *native_callback_func12)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
+                                                        ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    const ULONG_PTR *args = params->args;
+
+    switch (params->argc)
+    {
+    case 0:
+        return ((native_callback_func0)params->func)();
+    case 1:
+        return ((native_callback_func1)params->func)( args[0] );
+    case 2:
+        return ((native_callback_func2)params->func)( args[0], args[1] );
+    case 3:
+        return ((native_callback_func3)params->func)( args[0], args[1], args[2] );
+    case 4:
+        return ((native_callback_func4)params->func)( args[0], args[1], args[2], args[3] );
+    case 5:
+        return ((native_callback_func5)params->func)( args[0], args[1], args[2], args[3], args[4] );
+    case 6:
+        return ((native_callback_func6)params->func)( args[0], args[1], args[2], args[3], args[4], args[5] );
+    case 7:
+        return ((native_callback_func7)params->func)( args[0], args[1], args[2], args[3], args[4], args[5],
+                                                      args[6] );
+    case 8:
+        return ((native_callback_func8)params->func)( args[0], args[1], args[2], args[3], args[4], args[5],
+                                                      args[6], args[7] );
+    case 9:
+        return ((native_callback_func9)params->func)( args[0], args[1], args[2], args[3], args[4], args[5],
+                                                      args[6], args[7], args[8] );
+    case 10:
+        return ((native_callback_func10)params->func)( args[0], args[1], args[2], args[3], args[4], args[5],
+                                                       args[6], args[7], args[8], args[9] );
+    case 11:
+        return ((native_callback_func11)params->func)( args[0], args[1], args[2], args[3], args[4], args[5],
+                                                       args[6], args[7], args[8], args[9], args[10] );
+    case 12:
+        return ((native_callback_func12)params->func)( args[0], args[1], args[2], args[3], args[4], args[5],
+                                                       args[6], args[7], args[8], args[9], args[10], args[11] );
+    default:
+        return SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
+    }
+}
+
+static ULONG_PTR switchyard_native_callback_args_on_user_stack(
+    const struct switchyard_native_callback_params *params, TEB *teb, void *pthread_teb,
+    DWORD *native_callback_depth )
+{
+    struct switchyard_native_callback_scope scope = { teb, pthread_teb, native_callback_depth, FALSE };
+    struct switchyard_native_callback_exception_context exception =
+    {
+        params->func,
+        SWITCHYARD_NATIVE_CALLBACK_E_FAIL,
+        &scope
+    };
+    struct switchyard_com_vtable_scope input_vtable_scope;
+    ULONG_PTR ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
+
+    memset( &input_vtable_scope, 0, sizeof(input_vtable_scope) );
+    ++*native_callback_depth;
+    __TRY
+    {
+        __TRY
+        {
+            if ((params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_OUTPUT_VTABLES) &&
+                (params->argc == 10 || params->argc == 12))
+                switchyard_unwrap_com_vtable( (void *)params->args[0],
+                                               &input_vtable_scope );
+            switchyard_set_macos_tsd_base( pthread_teb );
+            ret = switchyard_call_native_callback_args( params );
+            switchyard_leave_native_callback( TRUE, &scope );
+            switchyard_restore_com_vtable( TRUE, &input_vtable_scope );
+            if (params->flags & SWITCHYARD_NATIVE_CALLBACK_NOTE_GFXT_DEFERRED_VTABLE)
+                switchyard_note_gfxt_deferred_vtable( ret );
+            if ((LONG)ret >= 0)
+            {
+                if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_FACTORY_OUTPUT_VTABLE)
+                    switchyard_wrap_dxgi_factory_output_vtable( params );
+                if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE)
+                    switchyard_wrap_dxgi_swapchain_output_vtable( params );
+                if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_ADAPTER_OUTPUT_VTABLE)
+                    switchyard_wrap_dxgi_adapter_output_vtable( params );
+                if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_OUTPUT_OUTPUT_VTABLE)
+                    switchyard_wrap_dxgi_output_output_vtable( params );
+                if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_OUTPUT_VTABLES)
+                    switchyard_wrap_d3d11_create_device_output_vtables( params );
+                if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_GFXT_DEFERRED_VTABLE)
+                    switchyard_wrap_gfxt_deferred_vtable_jump_targets();
+            }
+        }
+        __EXCEPT_CTX( switchyard_native_callback_exception_filter, &exception )
+        {
+            switchyard_leave_native_callback( FALSE, &scope );
+            switchyard_restore_com_vtable( FALSE, &input_vtable_scope );
+            ret = exception.ret;
+        }
+        __ENDTRY
+    }
+    __FINALLY_CTX( switchyard_leave_native_callback, &scope )
+
+    return ret;
 }
 
 static ULONG_PTR switchyard_call_pe_callback( const struct switchyard_pe_callback_params *params )
@@ -4229,7 +4605,11 @@ static ULONG_PTR WINAPI pe_callback_bridge( struct switchyard_pe_callback_params
     DWORD *native_callback_depth;
     ULONG_PTR ret = 0;
 
-    if (!params || !switchyard_get_native_callback_context( &teb, &pthread_teb, &native_callback_depth ))
+    if (!params ||
+        (!switchyard_get_native_callback_context( &teb, &pthread_teb,
+                                                  &native_callback_depth ) &&
+         !switchyard_recover_native_callback_context( &teb, &pthread_teb,
+                                                      &native_callback_depth )))
         return 0;
 
     switchyard_set_macos_tsd_base( teb );
@@ -4250,83 +4630,83 @@ static ULONG_PTR WINAPI pe_callback_bridge( struct switchyard_pe_callback_params
 
 static ULONG_PTR WINAPI native_callback_bridge_args( struct switchyard_native_callback_params *params )
 {
-    struct native_callback_args_params native_params;
     TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
-    BOOL have_context;
-    NTSTATUS status;
+    BOOL recovered = FALSE;
 
-    if (!params || !params->func || params->argc > ARRAY_SIZE(native_params.args))
+    if (!params || !params->func || params->argc > ARRAY_SIZE(params->args))
         return SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
 
-    have_context = switchyard_get_native_callback_context( &teb, &pthread_teb,
-                                                           &native_callback_depth );
+    if (!switchyard_get_native_callback_context( &teb, &pthread_teb,
+                                                  &native_callback_depth ))
+    {
+        if (!switchyard_recover_native_callback_context( &teb, &pthread_teb,
+                                                         &native_callback_depth ))
+            return switchyard_call_native_callback_args( params );
+        recovered = TRUE;
+    }
 
-    memset( &native_params, 0, sizeof(native_params) );
-    native_params.func = params->func;
-    native_params.argc = params->argc;
-    memcpy( native_params.args, params->args, params->argc * sizeof(*params->args) );
-    status = WINE_UNIX_CALL( unix_call_native_callback_args, &native_params );
-    if (!have_context && native_params.native_tsd_base)
-        switchyard_set_macos_tsd_base( native_params.native_tsd_base );
-    if (status)
+    if (!recovered) switchyard_init_native_callback_recovery();
+    if (recovered)
     {
-        WARN( "native callback args bridge failed for target %p argc %lu, status %#lx\n",
-              params->func, params->argc, status );
-        return SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
+        switchyard_set_macos_tsd_base( pthread_teb );
+        return switchyard_call_native_callback_args( params );
     }
-    if (params->flags & SWITCHYARD_NATIVE_CALLBACK_NOTE_GFXT_DEFERRED_VTABLE)
-        switchyard_note_gfxt_deferred_vtable( native_params.ret );
-    if ((LONG)native_params.ret >= 0)
-    {
-        if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_FACTORY_OUTPUT_VTABLE)
-            switchyard_wrap_dxgi_factory_output_vtable( params );
-        if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE)
-            switchyard_wrap_dxgi_swapchain_output_vtable( params );
-        if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_OUTPUT_VTABLES)
-            switchyard_wrap_d3d11_create_device_output_vtables( params );
-        if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_GFXT_DEFERRED_VTABLE)
-            switchyard_wrap_gfxt_deferred_vtable_jump_targets();
-    }
-    return native_params.ret;
+
+    return switchyard_native_callback_args_on_user_stack( params, teb, pthread_teb,
+                                                          native_callback_depth );
 }
 
 static ULONG_PTR WINAPI native_callback_bridge3( void *func, ULONG_PTR arg0,
                                                  ULONG_PTR arg1, ULONG_PTR arg2 )
 {
+    typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
     TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
-    struct native_callback_params params = { func, { arg0, arg1, arg2, 0 }, 0 };
-    NTSTATUS status;
 
-    if (func && switchyard_get_native_callback_context( &teb, &pthread_teb, &native_callback_depth ))
+    if (func && switchyard_get_native_callback_context( &teb, &pthread_teb,
+                                                        &native_callback_depth ))
+    {
+        switchyard_init_native_callback_recovery();
         return switchyard_native_callback3_on_user_stack( func, arg0, arg1, arg2,
                                                           teb, pthread_teb, native_callback_depth );
+    }
+    if (func && switchyard_recover_native_callback_context( &teb, &pthread_teb,
+                                                            &native_callback_depth ))
+    {
+        switchyard_set_macos_tsd_base( pthread_teb );
+    }
 
-    status = WINE_UNIX_CALL( unix_call_native_callback3, &params );
-    if (status) WARN( "native callback3 bridge failed, status %#lx\n", status );
-    return params.ret;
+    if (!func) return SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
+    return ((native_callback_func)func)( arg0, arg1, arg2 );
 }
 
 static ULONG_PTR WINAPI native_callback_bridge4( void *func, ULONG_PTR arg0,
                                                  ULONG_PTR arg1, ULONG_PTR arg2,
                                                  ULONG_PTR arg3 )
 {
+    typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
     TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
-    struct native_callback_params params = { func, { arg0, arg1, arg2, arg3 }, 0 };
-    NTSTATUS status;
 
-    if (func && switchyard_get_native_callback_context( &teb, &pthread_teb, &native_callback_depth ))
+    if (func && switchyard_get_native_callback_context( &teb, &pthread_teb,
+                                                        &native_callback_depth ))
+    {
+        switchyard_init_native_callback_recovery();
         return switchyard_native_callback4_on_user_stack( func, arg0, arg1, arg2, arg3,
                                                           teb, pthread_teb, native_callback_depth );
+    }
+    if (func && switchyard_recover_native_callback_context( &teb, &pthread_teb,
+                                                            &native_callback_depth ))
+    {
+        switchyard_set_macos_tsd_base( pthread_teb );
+    }
 
-    status = WINE_UNIX_CALL( unix_call_native_callback4, &params );
-    if (status) WARN( "native callback4 bridge failed, status %#lx\n", status );
-    return params.ret;
+    if (!func) return SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
+    return ((native_callback_func)func)( arg0, arg1, arg2, arg3 );
 }
 
 static void register_native_callback_thunk_region( void *base, SIZE_T size )
@@ -4872,9 +5252,35 @@ NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, vo
  */
 NTSTATUS WINAPI __wine_call_native_thread_func( void *func, void *arg )
 {
+#ifdef _WIN64
+    typedef void (WINAPI *native_thread_func)(void *);
+    struct switchyard_native_callback_scope scope;
+
+    if (!func) return STATUS_INVALID_PARAMETER;
+
+    /*
+     * D3DMetal exposes native thread entry points through small jump thunks.
+     * Keeping one of those entry points inside a Unix call leaves it on the
+     * kernel stack, where a callback into PE code would have to nest the same
+     * Unix dispatcher.  Run it on the Windows thread's user stack instead and
+     * keep the native callback depth set for the lifetime of the entry point.
+     */
+    switchyard_init_native_callback_recovery();
+    if (!switchyard_enter_native_callback_scope( &scope )) return STATUS_UNSUCCESSFUL;
+
+    __TRY
+    {
+        switchyard_set_macos_tsd_base( scope.pthread_teb );
+        ((native_thread_func)func)( arg );
+    }
+    __FINALLY_CTX( switchyard_leave_native_callback, &scope )
+
+    return STATUS_SUCCESS;
+#else
     struct native_thread_func_params params = { func, arg };
 
     return WINE_UNIX_CALL( unix_call_native_thread_func, &params );
+#endif
 }
 
 

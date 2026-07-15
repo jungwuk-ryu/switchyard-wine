@@ -635,6 +635,7 @@ static struct macdrv_graphics_win_data *macdrv_graphics_get_win_data(HWND hwnd)
 {
     struct macdrv_graphics_win_data *compat;
     struct macdrv_win_data *data;
+    macdrv_view client_view;
 
     if (!(compat = malloc(sizeof(*compat)))) return NULL;
     if (!(data = get_win_data(hwnd)))
@@ -643,10 +644,14 @@ static struct macdrv_graphics_win_data *macdrv_graphics_get_win_data(HWND hwnd)
         return NULL;
     }
 
+    client_view = data->client_view;
+    if (!client_view)
+        client_view = macdrv_get_cocoa_window_content_view(data->cocoa_window);
+
     compat->hwnd = data->hwnd;
     compat->cocoa_window = data->cocoa_window;
-    compat->cocoa_view = data->client_view;
-    compat->client_cocoa_view = data->client_view;
+    compat->cocoa_view = client_view;
+    compat->client_cocoa_view = client_view;
     compat->data = data;
     return compat;
 }

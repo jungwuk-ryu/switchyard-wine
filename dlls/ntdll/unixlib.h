@@ -43,6 +43,7 @@ struct native_callback_context_params
     void *teb;
     void *pthread_teb;
     void *native_callback_depth;
+    void *get_teb_from_pthread;
 };
 
 struct wine_server_fd_to_handle_params

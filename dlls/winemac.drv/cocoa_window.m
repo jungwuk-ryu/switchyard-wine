@@ -4332,6 +4332,16 @@ macdrv_metal_device macdrv_create_metal_device(void)
 }
 }
 
+macdrv_view macdrv_get_cocoa_window_content_view(macdrv_window w)
+{
+    WineWindow *window = (WineWindow *)w;
+    __block WineContentView *view = nil;
+
+    if (!window) return NULL;
+    OnMainThread(^{ view = (WineContentView *)[window contentView]; });
+    return (macdrv_view)view;
+}
+
 void macdrv_release_metal_device(macdrv_metal_device d)
 {
 @autoreleasepool
