@@ -1,10 +1,20 @@
 # Switchyard Wine
 
-Switchyard Wine is the public downstream Wine source used by the Switchyard macOS compatibility manager for Windows game launchers on Apple Silicon.
+Switchyard Wine is the public downstream Wine source used by the Switchyard macOS compatibility manager for Windows games and their launchers on Apple Silicon.
 
 This repository keeps each Switchyard compatibility change as a reviewable commit on top of a pinned WineHQ revision. It also contains the local runtime builder and the provenance required to reproduce a matching runtime.
 
 Switchyard Wine is an independent downstream project. It is not affiliated with or endorsed by WineHQ, Apple, Valve, Epic Games, GOG, Blizzard Entertainment, Google, or Microsoft.
+
+## Why Switchyard Wine
+
+Switchyard Wine grew out of the repeated friction of running Windows games on macOS. Installing Wine was rarely the end of the setup: a game might require launcher-specific command-line arguments, while storefronts such as Steam or Battle.net could fail before the game itself started. Earlier experience with Wine on Linux exposed the same pattern in another form, with users expected to find a suitable Wine version for each game and install fonts or other runtime pieces by hand.
+
+Switchyard moves that recurring compatibility work out of each user's setup and into a maintained Wine runtime. When practical, the project fixes Wine or the integrated runtime instead of asking every user to reproduce the same per-application workaround. The goal is for a user to install the current Switchyard runtime, select a Windows executable, and run it with as little manual configuration as possible.
+
+## Compatibility over version numbers
+
+Switchyard Wine is not a rolling mirror of the latest WineHQ release. A newer upstream revision is adopted only when it can preserve the launcher and game workflows that already work in Switchyard. Individual upstream fixes may be cherry-picked or adapted, and Switchyard-specific fixes may remain downstream. Maintaining a downstream branch also lets Switchyard iterate on integrated fixes without requiring every change to be generalized or prepared for upstream review first. Advancing the upstream base is a compatibility decision, not a release-calendar obligation.
 
 ## Important boundaries
 

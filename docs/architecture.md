@@ -22,4 +22,6 @@ Every generated `switchyard-runtime.json` records the source repository and comm
 
 ## Release model
 
-The `main` branch is a linear downstream branch rooted at the revision in `switchyard/upstream-base.txt`. Each Switchyard compatibility change is represented by an ordinary reviewable commit, and Git history is the canonical change record. Source tags identify immutable inputs; they do not imply that Apple or other third-party binaries are included.
+The `main` branch is a linear downstream branch rooted at the revision in `switchyard/upstream-base.txt`. That revision is a compatibility baseline, not a promise to follow WineHQ's release cadence. Upstream fixes may be cherry-picked or adapted individually, and the base advances only after established Switchyard launcher and game workflows have been checked for regressions. Preserving known-working behavior takes priority over adopting a newer Wine version.
+
+Each Switchyard compatibility change is represented by an ordinary reviewable commit, and Git history is the canonical change record. A change does not need to be suitable for upstream Wine to remain in the downstream branch, but it must keep its rationale and validation evidence reviewable. Source tags identify immutable inputs; they do not imply that Apple or other third-party binaries are included.
