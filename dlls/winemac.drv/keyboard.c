@@ -1050,6 +1050,122 @@ void macdrv_keyboard_changed(const macdrv_event *event)
 }
 
 
+static WORD vkey_to_scan(WORD vkey)
+{
+    struct macdrv_thread_data *thread_data = macdrv_thread_data();
+    unsigned int keyc;
+
+    for (keyc = 0; keyc < ARRAY_SIZE(thread_data->keyc2vkey); keyc++)
+        if (thread_data->keyc2vkey[keyc] == vkey)
+            return thread_data->keyc2scan[keyc];
+
+    return 0;
+}
+
+
+/***********************************************************************
+ *              macdrv_edit_command
+ */
+void macdrv_edit_command(const macdrv_event *event)
+{
+    struct macdrv_thread_data *thread_data = macdrv_thread_data();
+    HWND hwnd = macdrv_get_window_hwnd(event->window);
+    WORD key_vkey, key_scan, left_alt_scan, right_alt_scan, control_scan;
+    BOOL left_alt_down, right_alt_down, control_down;
+    BYTE keystate[256];
+    DWORD flags;
+
+    TRACE_(key)("hwnd %p command %d\n", hwnd, event->edit_command.command);
+
+    switch (event->edit_command.command)
+    {
+    case EDIT_COMMAND_COPY:
+        key_vkey = 'C';
+        break;
+    case EDIT_COMMAND_PASTE:
+        key_vkey = 'V';
+        break;
+    default:
+        WARN("unrecognized edit command %d\n", event->edit_command.command);
+        return;
+    }
+
+    if (!NtUserGetAsyncKeyboardState(keystate))
+    {
+        WARN("failed to query keyboard state\n");
+        return;
+    }
+
+    key_scan = vkey_to_scan(key_vkey);
+    left_alt_down = (keystate[VK_LMENU] & 0x80) != 0;
+    right_alt_down = (keystate[VK_RMENU] & 0x80) != 0;
+    control_down = ((keystate[VK_LCONTROL] | keystate[VK_RCONTROL]) & 0x80) != 0;
+    left_alt_scan = left_alt_down ? vkey_to_scan(VK_LMENU) : 0;
+    right_alt_scan = right_alt_down ? vkey_to_scan(VK_RMENU) : 0;
+    control_scan = control_down ? 0 : vkey_to_scan(VK_LCONTROL);
+
+    if (!key_scan || (left_alt_down && !left_alt_scan) ||
+        (right_alt_down && !right_alt_scan) || (!control_down && !control_scan))
+    {
+        WARN("failed to find scan codes for edit shortcut\n");
+        return;
+    }
+
+    /* Command is normally reported as Alt.  Release it before synthesizing
+       Ctrl+C/V, then tap it once to cancel the Windows menu activation caused
+       by the release. */
+    if (left_alt_down)
+    {
+        flags = KEYEVENTF_KEYUP;
+        if (left_alt_scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
+        macdrv_send_keyboard_input(hwnd, VK_LMENU, left_alt_scan & 0xff, flags,
+                                   event->edit_command.time_ms);
+    }
+    if (right_alt_down)
+    {
+        flags = KEYEVENTF_KEYUP;
+        if (right_alt_scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
+        macdrv_send_keyboard_input(hwnd, VK_RMENU, right_alt_scan & 0xff, flags,
+                                   event->edit_command.time_ms);
+    }
+    if (left_alt_down ^ right_alt_down)
+    {
+        WORD vkey = left_alt_down ? VK_LMENU : VK_RMENU;
+        WORD scan = left_alt_down ? left_alt_scan : right_alt_scan;
+
+        flags = (scan & 0x100) ? KEYEVENTF_EXTENDEDKEY : 0;
+        macdrv_send_keyboard_input(hwnd, vkey, scan & 0xff, flags,
+                                   event->edit_command.time_ms);
+        macdrv_send_keyboard_input(hwnd, vkey, scan & 0xff, flags | KEYEVENTF_KEYUP,
+                                   event->edit_command.time_ms);
+    }
+
+    if (!control_down)
+    {
+        flags = (control_scan & 0x100) ? KEYEVENTF_EXTENDEDKEY : 0;
+        macdrv_send_keyboard_input(hwnd, VK_LCONTROL, control_scan & 0xff, flags,
+                                   event->edit_command.time_ms);
+    }
+
+    flags = (key_scan & 0x100) ? KEYEVENTF_EXTENDEDKEY : 0;
+    macdrv_send_keyboard_input(hwnd, key_vkey, key_scan & 0xff, flags,
+                               event->edit_command.time_ms);
+    macdrv_send_keyboard_input(hwnd, key_vkey, key_scan & 0xff, flags | KEYEVENTF_KEYUP,
+                               event->edit_command.time_ms);
+
+    if (!control_down)
+    {
+        flags = KEYEVENTF_KEYUP;
+        if (control_scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
+        macdrv_send_keyboard_input(hwnd, VK_LCONTROL, control_scan & 0xff, flags,
+                                   event->edit_command.time_ms);
+    }
+
+    thread_data->last_modifiers &= ~(NX_COMMANDMASK | NX_DEVICELCMDKEYMASK |
+                                     NX_DEVICERCMDKEYMASK);
+}
+
+
 /***********************************************************************
  *              macdrv_hotkey_press
  *

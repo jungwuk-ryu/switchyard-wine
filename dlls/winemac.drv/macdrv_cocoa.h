@@ -88,6 +88,11 @@ enum {
 };
 
 enum {
+    EDIT_COMMAND_COPY,
+    EDIT_COMMAND_PASTE,
+};
+
+enum {
     GL_SURFACE_IN_FRONT_OPAQUE,
     GL_SURFACE_IN_FRONT_TRANSPARENT,
     GL_SURFACE_BEHIND,
@@ -276,6 +281,7 @@ enum {
     APP_DEACTIVATED,
     APP_QUIT_REQUESTED,
     DISPLAYS_CHANGED,
+    EDIT_COMMAND,
     HOTKEY_PRESS,
     IM_SET_TEXT,
     KEY_PRESS,
@@ -329,6 +335,10 @@ typedef struct macdrv_event {
         struct {
             bool activating;
         }                                           displays_changed;
+        struct {
+            int             command;
+            unsigned long   time_ms;
+        }                                           edit_command;
         struct {
             unsigned int    vkey;
             unsigned int    mod_flags;

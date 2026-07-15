@@ -2513,6 +2513,46 @@ static void WineCompositorDetachView(WineContentView* view)
                 event:theEvent];
     }
 
+    - (BOOL) postCommandEditShortcut:(NSEvent *)theEvent
+    {
+        NSUInteger modifiers = [theEvent modifierFlags] &
+            (NSEventModifierFlagCommand | NSEventModifierFlagControl |
+             NSEventModifierFlagOption | NSEventModifierFlagShift);
+        macdrv_event* event;
+        int command;
+
+        if (modifiers != NSEventModifierFlagCommand || [theEvent isARepeat])
+            return FALSE;
+
+        switch ([theEvent keyCode])
+        {
+        case kVK_ANSI_C:
+            command = EDIT_COMMAND_COPY;
+            break;
+        case kVK_ANSI_V:
+            command = EDIT_COMMAND_PASTE;
+            break;
+        default:
+            return FALSE;
+        }
+
+        [self flagsChanged:theEvent];
+
+        event = macdrv_create_event(EDIT_COMMAND, self);
+        event->edit_command.command = command;
+        event->edit_command.time_ms = [[WineApplicationController sharedController]
+            ticksForEventTime:[theEvent timestamp]];
+        [queue postEvent:event];
+        macdrv_release_event(event);
+
+        /* Command is normally exposed as Alt.  The edit command releases it,
+           so forget the physical modifier until another event resynchronizes
+           the state.  This also prevents releasing Command from focusing a
+           Windows menu bar. */
+        lastModifierFlags &= ~(NX_COMMANDMASK | NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK);
+        return TRUE;
+    }
+
     - (void) setWineMinSize:(NSSize)minSize maxSize:(NSSize)maxSize
     {
         savedContentMinSize = minSize;
@@ -2885,6 +2925,9 @@ static void WineCompositorDetachView(WineContentView* view)
     - (void) sendEvent:(NSEvent*)event
     {
         NSEventType type = event.type;
+
+        if (type == NSEventTypeKeyDown && [self postCommandEditShortcut:event])
+            return;
 
         /* NSWindow consumes certain key-down events as part of Cocoa's keyboard
            interface control.  For example, Control-Tab switches focus among

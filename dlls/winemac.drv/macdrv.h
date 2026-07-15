@@ -247,6 +247,7 @@ extern void macdrv_release_capture(HWND hwnd, const macdrv_event *event);
 
 extern void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data);
 extern void macdrv_keyboard_changed(const macdrv_event *event);
+extern void macdrv_edit_command(const macdrv_event *event);
 extern void macdrv_key_event(HWND hwnd, const macdrv_event *event);
 extern void macdrv_hotkey_press(const macdrv_event *event);
 extern HKL macdrv_get_hkl_from_source(TISInputSourceRef input_source);
