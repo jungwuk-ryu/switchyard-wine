@@ -2177,6 +2177,8 @@ static void WineCompositorDetachView(WineContentView* view)
 
             if ([self becameEligibleParentOrChild])
                 needAdjustWindowLevels = TRUE;
+            if (!wasVisible && fullscreen && [self isOnActiveSpace])
+                needAdjustWindowLevels = TRUE;
 
             if (needAdjustWindowLevels)
             {
