@@ -19,6 +19,7 @@
  */
 
 #include <stdarg.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -56,6 +57,8 @@ static USHORT ds64_sel;
 static USHORT fs32_sel;
 
 void **__wine_unix_call_dispatcher = NULL;
+
+extern void CDECL wine_get_host_version( const char **sysname, const char **release );
 
 BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
 {
@@ -178,6 +181,9 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    ".seh_pushreg %rdi\n\t"
                    ".seh_stackalloc 0x28\n\t"
                    ".seh_endprologue\n\t"
+                   ".rept 10\n\t"
+                   "nop\n\t"
+                   ".endr\n\t"
                    "xchgq %r14,%rsp\n\t"
                    "movl %edi,0x9c(%r13)\n\t"   /* context->Edi */
                    "movl %esi,0xa0(%r13)\n\t"   /* context->Esi */
@@ -246,6 +252,9 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
                    ".seh_pushreg %rdi\n\t"
                    ".seh_stackalloc 0x28\n\t"
                    ".seh_endprologue\n\t"
+                   ".rept 10\n\t"
+                   "nop\n\t"
+                   ".endr\n\t"
                    "xchgq %r14,%rsp\n\t"
                    "movl %edi,0x9c(%r13)\n\t"   /* context->Edi */
                    "movl %esi,0xa0(%r13)\n\t"   /* context->Esi */
@@ -298,6 +307,31 @@ __ASM_GLOBAL_FUNC( BTCpuSimulate,
                    "jmp syscall_32to64_return\n" )
 
 
+static void patch_macos_transition_entry( void *entry )
+{
+    /* Rosetta may briefly decode the target of the far jump as 32-bit code. In
+     * that mode the REX byte below is a flag-changing DEC instruction, but the
+     * invalid LOCK prefix faults before it can run. The 64-bit instructions
+     * preserve flags and restore both the register and host stack scratch. */
+    static const BYTE fault_entry[] =
+    {
+        0xf0, 0x4d, 0x87, 0x5e, 0x20,  /* lock xchgq %r11,0x20(%r14) */
+        0xf0, 0x4d, 0x87, 0x5e, 0x20   /* lock xchgq %r11,0x20(%r14) */
+    };
+    const char *sysname;
+    SIZE_T size = sizeof(fault_entry);
+    ULONG old_prot, tmp_prot;
+    void *base = entry;
+
+    wine_get_host_version( &sysname, NULL );
+    if (strcmp( sysname, "Darwin" )) return;
+    if (NtProtectVirtualMemory( GetCurrentProcess(), &base, &size, PAGE_EXECUTE_READWRITE, &old_prot )) return;
+    memcpy( entry, fault_entry, sizeof(fault_entry) );
+    NtFlushInstructionCache( GetCurrentProcess(), entry, sizeof(fault_entry) );
+    NtProtectVirtualMemory( GetCurrentProcess(), &base, &size, old_prot, &tmp_prot );
+}
+
+
 /**********************************************************************
  *           BTCpuProcessInit  (wow64cpu.@)
  */
@@ -334,6 +368,9 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
     RtlWow64GetThreadContext( GetCurrentThread(), &context_i386 );
     cs32_sel = context_i386.SegCs;
     ss32_sel = context_i386.SegSs;
+
+    patch_macos_transition_entry( syscall_32to64 );
+    patch_macos_transition_entry( unix_call_32to64 );
 
     thunk->syscall_thunk.ljmp  = 0xff;
     thunk->syscall_thunk.modrm = 0x2d;

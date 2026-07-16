@@ -2313,6 +2313,14 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
 static BOOL recover_wow64_transition_fault( struct thread_data *data, ucontext_t *sigcontext,
                                             const EXCEPTION_RECORD *rec )
 {
+    static const BYTE fault_prefix[] =
+    {
+        0xf0, 0x4d, 0x87, 0x5e, 0x20,             /* lock xchgq %r11,0x20(%r14) */
+        0xf0, 0x4d, 0x87, 0x5e, 0x20,             /* lock xchgq %r11,0x20(%r14) */
+        0x4c, 0x87, 0xf4,                         /* xchgq %r14,%rsp */
+        0x41, 0x89, 0xbd, 0x9c, 0x00, 0x00, 0x00, /* movl %edi,0x9c(%r13) */
+        0x41, 0x89, 0xb5, 0xa0, 0x00, 0x00, 0x00  /* movl %esi,0xa0(%r13) */
+    };
     static const BYTE thunk_prefix[] =
     {
         0x4c, 0x87, 0xf4,                         /* xchgq %r14,%rsp */
@@ -2332,6 +2340,29 @@ static BOOL recover_wow64_transition_fault( struct thread_data *data, ucontext_t
     BYTE code[sizeof(thunk_prefix)];
 
     if (!is_wow64() || !data->teb) return FALSE;
+    if (rec->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION)
+    {
+        ULONG_PTR guest_rsp = RSP_sig(sigcontext);
+        BYTE fault_code[sizeof(fault_prefix)];
+
+        if (CS_sig(sigcontext) != cs32_sel && CS_sig(sigcontext) != cs64_sel) return FALSE;
+        if (R14_sig(sigcontext) < (ULONG_PTR)data->teb->Tib.StackLimit ||
+            R14_sig(sigcontext) > (ULONG_PTR)data->teb->Tib.StackBase)
+            return FALSE;
+        if (RSP_sig(sigcontext) >= (ULONG_PTR)data->teb->Tib.StackLimit &&
+            RSP_sig(sigcontext) <= (ULONG_PTR)data->teb->Tib.StackBase)
+            return FALSE;
+        if (virtual_uninterrupted_read_memory( (void *)rip, fault_code, sizeof(fault_code) ) != sizeof(fault_code) ||
+            memcmp( fault_code, fault_prefix, sizeof(fault_code) ))
+            return FALSE;
+
+        CS_sig(sigcontext) = cs64_sel;
+        RSP_sig(sigcontext) = R14_sig(sigcontext);
+        R14_sig(sigcontext) = guest_rsp;
+        RIP_sig(sigcontext) = rip + 13;
+        leave_handler( data, sigcontext );
+        return TRUE;
+    }
     if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
         rec->NumberParameters < 2 ||
         rec->ExceptionInformation[0] != EXCEPTION_READ_FAULT)
