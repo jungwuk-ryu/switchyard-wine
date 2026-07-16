@@ -5,6 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="${FONT_ASSET_MANIFEST:-$ROOT_DIR/switchyard/font-assets.tsv}"
 MODE="${1:-}"
 CACHE_DIR="${FONT_ASSET_DOWNLOAD_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Fonts/assets/noto-monthly-release-2026.07.01}"
+ALIAS_SCRIPT="$ROOT_DIR/switchyard/make_font_alias.py"
+ALIAS_SOURCE="NotoSansCJK-Regular.ttc"
+ALIAS_FAMILY="Arial Unicode MS"
+ALIAS_POSTSCRIPT="ArialUnicodeMS"
+ALIAS_FACE_INDEX=1
+ALIAS_SHA256="ccdd3bd646d95b31513e10ad9c975d878c0ef8b25ff2d92f2e635b50218b128e"
 
 case "$MODE" in
   ''|--download) ;;
@@ -16,6 +22,10 @@ esac
 
 if [ ! -f "$MANIFEST" ]; then
   echo "font asset verification failed: missing $MANIFEST" >&2
+  exit 1
+fi
+if [ ! -f "$ALIAS_SCRIPT" ]; then
+  echo "font asset verification failed: missing $ALIAS_SCRIPT" >&2
   exit 1
 fi
 
@@ -143,4 +153,28 @@ if [ "$MODE" = "--download" ] && command -v fc-scan >/dev/null 2>&1; then
   done
 fi
 
-echo "verified $font_count redistributable fonts and $license_count license notices"
+if [ "$MODE" = "--download" ]; then
+  alias_directory="$(mktemp -d "${TMPDIR:-/tmp}/switchyard-font-alias.XXXXXX")"
+  trap 'rm -rf "$alias_directory"' EXIT
+  python3 "$ALIAS_SCRIPT" \
+    "$CACHE_DIR/$ALIAS_SOURCE" \
+    "$alias_directory/ArialUnicodeMS.otf" \
+    --face-index "$ALIAS_FACE_INDEX" \
+    --family "$ALIAS_FAMILY" \
+    --postscript "$ALIAS_POSTSCRIPT"
+  if [ "$(sha256_file "$alias_directory/ArialUnicodeMS.otf")" != "$ALIAS_SHA256" ]; then
+    echo "font asset verification failed: generated compatibility alias has an unexpected sha256" >&2
+    exit 1
+  fi
+  if command -v fc-scan >/dev/null 2>&1; then
+    alias_families="$(fc-scan --format '%{family}\n' "$alias_directory/ArialUnicodeMS.otf")"
+    if ! printf '%s\n' "$alias_families" | grep -Fqx "$ALIAS_FAMILY"; then
+      echo "font asset verification failed: compatibility family '$ALIAS_FAMILY' was not found" >&2
+      exit 1
+    fi
+  fi
+  rm -rf "$alias_directory"
+  trap - EXIT
+fi
+
+echo "verified $font_count redistributable source fonts, 1 compatibility alias, and $license_count license notices"

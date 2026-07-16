@@ -55,10 +55,17 @@ FONT_DEPS_LAYER_SHA256=(
   "2cc112cce103be3beb13cc8ba67f521d4e972c4082fd69868d34920d63120c09"
   "fbb3a7908a19f306823dbd51b417705c73f710a9a1fb1e34ba7aa67a3c966094"
 )
-FONT_ASSET_SET_VERSION="noto-monthly-release-2026.07.01-cjk-2.004"
+FONT_ASSET_SET_VERSION="noto-monthly-release-2026.07.01-cjk-2.004-aliases-1"
 FONT_ASSET_MANIFEST="$ROOT_DIR/switchyard/font-assets.tsv"
 FONT_ASSET_DOWNLOAD_CACHE_DIR="${FONT_ASSET_DOWNLOAD_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Fonts/assets/noto-monthly-release-2026.07.01}"
 FONT_ASSET_PREFIX="${FONT_ASSET_PREFIX:-${HOME}/.switchyard/deps/fonts/assets-${FONT_ASSET_SET_VERSION}}"
+FONT_ALIAS_SCRIPT="$ROOT_DIR/switchyard/make_font_alias.py"
+FONT_ALIAS_SOURCE="NotoSansCJK-Regular.ttc"
+FONT_ALIAS_FILE="ArialUnicodeMS.otf"
+FONT_ALIAS_FAMILY="Arial Unicode MS"
+FONT_ALIAS_POSTSCRIPT="ArialUnicodeMS"
+FONT_ALIAS_FACE_INDEX=1
+FONT_ALIAS_SHA256="ccdd3bd646d95b31513e10ad9c975d878c0ef8b25ff2d92f2e635b50218b128e"
 TLS_DEPS_CACHE_DIR="${TLS_DEPS_CACHE_DIR:-${HOME}/.switchyard/deps/tls}"
 USER_SET_WINE_BUILD_DIR="${WINE_BUILD_DIR+x}"
 WINE_BUILD_DIR="${WINE_BUILD_DIR:-}"
@@ -266,7 +273,9 @@ stage_font_assets() {
 
   if content_tree_is_verified "$FONT_ASSET_PREFIX" &&
      cmp -s "$FONT_ASSET_MANIFEST" \
-       "$FONT_ASSET_PREFIX/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv"; then
+       "$FONT_ASSET_PREFIX/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv" &&
+     [ -f "$FONT_ASSET_PREFIX/share/wine/fonts/$FONT_ALIAS_FILE" ] &&
+     [ "$(sha256_file "$FONT_ASSET_PREFIX/share/wine/fonts/$FONT_ALIAS_FILE")" = "$FONT_ALIAS_SHA256" ]; then
     printf '%s\n' "$FONT_ASSET_PREFIX"
     return 0
   fi
@@ -330,15 +339,36 @@ stage_font_assets() {
     exit 1
   fi
 
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to generate the bundled font compatibility alias" >&2
+    exit 1
+  fi
+  if [ ! -f "$FONT_ALIAS_SCRIPT" ]; then
+    echo "missing font compatibility alias generator: $FONT_ALIAS_SCRIPT" >&2
+    exit 1
+  fi
+  python3 "$FONT_ALIAS_SCRIPT" \
+    "$temporary_prefix/share/wine/fonts/$FONT_ALIAS_SOURCE" \
+    "$temporary_prefix/share/wine/fonts/$FONT_ALIAS_FILE" \
+    --face-index "$FONT_ALIAS_FACE_INDEX" \
+    --family "$FONT_ALIAS_FAMILY" \
+    --postscript "$FONT_ALIAS_POSTSCRIPT"
+  if [ "$(sha256_file "$temporary_prefix/share/wine/fonts/$FONT_ALIAS_FILE")" != "$FONT_ALIAS_SHA256" ]; then
+    echo "generated font compatibility alias has an unexpected sha256" >&2
+    exit 1
+  fi
+  font_count=$((font_count + 1))
+
   install -m 0644 "$FONT_ASSET_MANIFEST" \
     "$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv"
   cat >"$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/README.txt" <<EOF
 Switchyard Wine redistributable font set $FONT_ASSET_SET_VERSION
 
-These unmodified Noto font binaries are installed under share/wine/fonts so
-every Wine prefix has deterministic multilingual text fallback. The files are
-licensed under the SIL Open Font License 1.1. Preserve the included license
-notices and manifest when distributing the runtime.
+The Noto font binaries are installed under share/wine/fonts so every Wine
+prefix has deterministic multilingual text fallback. ArialUnicodeMS.otf is an
+OFL-licensed compatibility alias generated from the Korean face of
+NotoSansCJK-Regular.ttc; it is not a Microsoft font. Preserve the included
+license notices and manifest when distributing the runtime.
 EOF
 
   write_content_tree_digest "$temporary_prefix"
@@ -1011,7 +1041,7 @@ font_deps_prefix="$(stage_font_deps)"
 font_deps_digest="$(content_tree_digest "$font_deps_prefix")"
 font_assets_prefix="$(stage_font_assets)"
 font_assets_digest="$(content_tree_digest "$font_assets_prefix")"
-font_asset_count="$(awk -F '\t' '$1 == "font" { count++ } END { print count + 0 }' "$FONT_ASSET_MANIFEST")"
+font_asset_count="$(awk -F '\t' '$1 == "font" { count++ } END { print count + 1 }' "$FONT_ASSET_MANIFEST")"
 tls_deps_prefix="$(stage_tls_deps)"
 if [ -n "$tls_deps_prefix" ]; then
   tls_deps_digest="$(content_tree_digest "$tls_deps_prefix")"
@@ -1087,6 +1117,8 @@ runtime_is_complete_at() {
     [ -f "$asset_path" ] || return 1
     [ "$(sha256_file "$asset_path")" = "$expected_hash" ] || return 1
   done < "$FONT_ASSET_MANIFEST"
+  [ -f "$prefix/share/wine/fonts/$FONT_ALIAS_FILE" ] || return 1
+  [ "$(sha256_file "$prefix/share/wine/fonts/$FONT_ALIAS_FILE")" = "$FONT_ALIAS_SHA256" ] || return 1
 }
 
 runtime_is_complete() {
@@ -1319,7 +1351,7 @@ if [ -f "$runtime_font_root/etc/fonts/fonts.conf" ]; then
     "$runtime_font_root/etc/fonts/fonts.conf"
 fi
 
-echo "installing $font_asset_count redistributable Noto fonts"
+echo "installing $font_asset_count redistributable font files"
 mkdir -p "$WINE_INSTALL_PREFIX/share/wine/fonts" \
   "$runtime_font_root/share/doc/switchyard-font-assets"
 ditto "$font_assets_prefix/share/wine/fonts" "$WINE_INSTALL_PREFIX/share/wine/fonts"
@@ -1510,6 +1542,9 @@ x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows
   printf '    "digest": %s,\n' "$(json_string "$font_assets_digest")"
   printf '    "fontCount": %s,\n' "$font_asset_count"
   printf '    "license": "SIL Open Font License 1.1",\n'
+  printf '    "compatibilityAlias": {"file": %s, "family": %s, "source": %s, "faceIndex": %s, "sha256": %s},\n' \
+    "$(json_string "$FONT_ALIAS_FILE")" "$(json_string "$FONT_ALIAS_FAMILY")" \
+    "$(json_string "$FONT_ALIAS_SOURCE")" "$FONT_ALIAS_FACE_INDEX" "$(json_string "$FONT_ALIAS_SHA256")"
   printf '    "manifest": "lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv"\n'
   printf '  },\n'
   if [ -n "$tls_deps_prefix" ]; then

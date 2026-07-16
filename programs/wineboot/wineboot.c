@@ -1617,6 +1617,41 @@ static void install_root_pnp_devices(void)
     SetupDiDestroyDeviceInfoList(set);
 }
 
+static void install_compatibility_fonts(void)
+{
+    static const WCHAR source_suffix[] = L"\\fonts\\ArialUnicodeMS.otf";
+    static const WCHAR fonts_suffix[] = L"\\Fonts";
+    static const WCHAR target_suffix[] = L"\\ArialUnicodeMS.otf";
+    const WCHAR *data_dir = _wgetenv( L"WINEDATADIR" );
+    WCHAR target[MAX_PATH + ARRAY_SIZE(fonts_suffix) + ARRAY_SIZE(target_suffix)], *source;
+    DWORD error;
+
+    if (!data_dir) return;
+    if (!(source = malloc( (lstrlenW(data_dir) + ARRAY_SIZE(source_suffix)) * sizeof(WCHAR) ))) return;
+    lstrcpyW( source, data_dir );
+    lstrcatW( source, source_suffix );
+    source[1] = '\\';  /* change \??\ to \\?\ */
+
+    if (GetFileAttributesW( source ) == INVALID_FILE_ATTRIBUTES)
+    {
+        TRACE( "compatibility font %s is not installed\n", debugstr_w(source) );
+        free( source );
+        return;
+    }
+
+    lstrcpyW( target, windowsdir );
+    lstrcatW( target, fonts_suffix );
+    CreateDirectoryW( target, NULL );
+    lstrcatW( target, target_suffix );
+    if (!CopyFileW( source, target, TRUE ))
+    {
+        error = GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS)
+            WINE_WARN( "failed to install compatibility font %s, error %lu\n", debugstr_w(target), error );
+    }
+    free( source );
+}
+
 static void update_user_profile(void)
 {
     char token_buf[sizeof(TOKEN_USER) + sizeof(SID) + sizeof(DWORD) * SID_MAX_SUB_AUTHORITIES];
@@ -1705,6 +1740,7 @@ static void update_wineprefix( BOOL force )
             }
             DestroyWindow( hwnd );
         }
+        install_compatibility_fonts();
         install_root_pnp_devices();
         update_user_profile();
 
