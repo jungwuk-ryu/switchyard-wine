@@ -592,14 +592,10 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
     device_invalidate_state(swapchain->device, STATE_FRAMEBUFFER);
 }
 
-static bool swapchain_present_is_partial_copy(struct wined3d_swapchain *swapchain, const RECT *dst_rect)
+static bool swapchain_present_is_partial(const struct wined3d_swapchain *swapchain, const RECT *dst_rect)
 {
-    enum wined3d_swap_effect swap_effect = swapchain->state.desc.swap_effect;
     const struct wined3d_swapchain_desc *desc = &swapchain->state.desc;
     unsigned int width, height;
-
-    if (swap_effect != WINED3D_SWAP_EFFECT_COPY && swap_effect != WINED3D_SWAP_EFFECT_COPY_VSYNC)
-        return false;
 
     if (!desc->windowed)
     {
@@ -620,6 +616,14 @@ static bool swapchain_present_is_partial_copy(struct wined3d_swapchain *swapchai
         return true;
 
     return false;
+}
+
+static bool swapchain_present_is_partial_copy(const struct wined3d_swapchain *swapchain, const RECT *dst_rect)
+{
+    enum wined3d_swap_effect swap_effect = swapchain->state.desc.swap_effect;
+
+    return (swap_effect == WINED3D_SWAP_EFFECT_COPY || swap_effect == WINED3D_SWAP_EFFECT_COPY_VSYNC)
+            && swapchain_present_is_partial(swapchain, dst_rect);
 }
 
 static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
@@ -645,7 +649,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format - 1];
     if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
             || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
-            && swapchain_present_is_partial_copy(swapchain, dst_rect)))
+            && swapchain_present_is_partial(swapchain, dst_rect)))
     {
         swapchain_blit_gdi(swapchain, context, src_rect, dst_rect);
     }
