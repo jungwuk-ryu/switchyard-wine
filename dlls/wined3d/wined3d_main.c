@@ -139,18 +139,6 @@ enum wined3d_renderer CDECL wined3d_get_renderer(void)
     return wined3d_settings.renderer;
 }
 
-static BOOL wined3d_is_browser_gpu_process(void)
-{
-    const WCHAR *command_line = GetCommandLineW();
-
-    if (!command_line || !wcsstr(command_line, L"--type=gpu-process"))
-        return FALSE;
-
-    return wcsstr(command_line, L"--enable-chrome-runtime")
-            || wcsstr(command_line, L"--user-agent-product")
-            || wcsstr(command_line, L"--mojo-platform-channel-handle");
-}
-
 struct wined3d * CDECL wined3d_create(uint32_t flags)
 {
     struct wined3d *object;
@@ -484,17 +472,6 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
 
     if (appkey) RegCloseKey( appkey );
     if (hkey) RegCloseKey( hkey );
-
-    /* On hosts where the OpenGL backend exposes less than D3D feature level
-     * 10, ANGLE rejects it and falls back to a software GPU process. The
-     * Vulkan backend exposes the feature level required by browser GPU
-     * subprocesses and avoids that fragile extra process. Keep explicit user
-     * and application renderer settings authoritative. */
-    if (wined3d_settings.renderer == WINED3D_RENDERER_AUTO && wined3d_is_browser_gpu_process())
-    {
-        ERR_(winediag)("Using the Vulkan renderer for a browser GPU subprocess.\n");
-        wined3d_settings.renderer = WINED3D_RENDERER_VULKAN;
-    }
 
     if (!getenv( "VKD3D_DEBUG" ))
     {
