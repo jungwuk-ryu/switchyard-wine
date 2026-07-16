@@ -94,32 +94,46 @@ static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, 
     return ret;
 }
 
-static BOOL root_uses_extended_frame(HWND hwnd, DWORD style, DWORD ex_style)
+static BOOL root_uses_client_frame(HWND hwnd, DWORD style, DWORD ex_style)
 {
+    WINDOWINFO info = {.cbSize = sizeof(info)};
+    LONG sizing_inset, top_inset;
     HWND root;
 
-    if (!NtUserGetProp(hwnd, wine_dwm_extended_frame)) return FALSE;
     if ((style & (WS_CHILD | WS_CAPTION)) != WS_CAPTION) return FALSE;
     if (ex_style & WS_EX_TOOLWINDOW) return FALSE;
 
     root = NtUserGetAncestor(hwnd, GA_ROOT);
-    return root && root == hwnd;
+    if (!root || root != hwnd) return FALSE;
+    if (NtUserGetProp(hwnd, wine_dwm_extended_frame)) return TRUE;
+
+    /* Modern custom frames can retract their DWM glass margins while still
+       consuming the caption through WM_NCCALCSIZE.  In that state the top
+       client inset is no larger than the nominal sizing border, so a native
+       title bar would cover content which belongs to the application. */
+    if (!NtUserGetWindowInfo(hwnd, &info)) return FALSE;
+    if (IsRectEmpty(&info.rcWindow) || IsRectEmpty(&info.rcClient)) return FALSE;
+    sizing_inset = max(0, info.rcClient.left - info.rcWindow.left);
+    sizing_inset = max(sizing_inset, info.rcWindow.right - info.rcClient.right);
+    sizing_inset = max(sizing_inset, info.rcWindow.bottom - info.rcClient.bottom);
+    top_inset = info.rcClient.top - info.rcWindow.top;
+    return top_inset <= sizing_inset;
 }
 
-static BOOL win_data_uses_extended_frame(struct macdrv_win_data *data)
+static BOOL win_data_uses_client_frame(struct macdrv_win_data *data)
 {
     DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
     DWORD ex_style = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
 
-    return root_uses_extended_frame(data->hwnd, style, ex_style);
+    return root_uses_client_frame(data->hwnd, style, ex_style);
 }
 
 static const RECT *get_cocoa_frame_rect(struct macdrv_win_data *data)
 {
-    if (win_data_uses_extended_frame(data))
+    if (win_data_uses_client_frame(data))
     {
         /*
-         * A DWM-extended custom frame is painted inside the Win32 client. The nominal
+         * A client-drawn custom frame is painted inside the Win32 client. The nominal
          * sizing border remains outside that client even when the caption is
          * extended, and exposing it as Cocoa content produces asymmetric edge
          * bands. Client-only roots such as first-run also keep a real caption
@@ -176,11 +190,11 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
     struct macdrv_window_features wf = {0};
 
     if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
-    if (root_uses_extended_frame(data->hwnd, style, ex_style))
+    if (root_uses_client_frame(data->hwnd, style, ex_style))
     {
         wf.shadow = TRUE;
         if ((style & WS_THICKFRAME) && !data->shaped) wf.resizable = TRUE;
-        TRACE("Switchyard using borderless DWM-extended frame for hwnd %p\n", data->hwnd);
+        TRACE("Switchyard using borderless client-drawn frame for hwnd %p\n", data->hwnd);
         return wf;
     }
     if (EqualRect(&data->rects.window, &data->rects.visible)) return wf;
@@ -2501,7 +2515,7 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
     struct macdrv_window_features wf = get_window_features_for_style(style, ex_style, FALSE);
 
     *style_mask = *ex_style_mask = 0;
-    if (root_uses_extended_frame(hwnd, style, ex_style))
+    if (root_uses_client_frame(hwnd, style, ex_style))
         return TRUE;
 
     if (wf.title_bar)
@@ -2635,7 +2649,7 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
     RECT rect;
     UINT flags = SWP_NOACTIVATE | SWP_NOZORDER;
     int width, height;
-    BOOL being_dragged, extended_frame;
+    BOOL being_dragged, client_frame;
 
     if (!hwnd) return;
     if (!(data = get_win_data(hwnd))) return;
@@ -2652,13 +2666,13 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
           event->window_frame_changed.fullscreen, event->window_frame_changed.in_resize);
 
     rect = rect_from_cgrect(event->window_frame_changed.frame);
-    extended_frame = win_data_uses_extended_frame(data);
-    if (extended_frame)
+    client_frame = win_data_uses_client_frame(data);
+    if (client_frame)
     {
         const RECT *frame_rect = get_cocoa_frame_rect(data);
 
         /*
-         * A DWM-extended Cocoa frame represents the Win32 client. Convert AppKit's
+         * A client-drawn Cocoa frame represents the Win32 client. Convert AppKit's
          * move/resize result back to the whole Win32 window before feeding it
          * to user32, otherwise every frame notification applies the non-client
          * insets a second time and shifts pixels away from input coordinates.
