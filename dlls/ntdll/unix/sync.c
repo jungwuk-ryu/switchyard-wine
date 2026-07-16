@@ -3619,6 +3619,12 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 
             if (ret == -1 && errno == ETIMEDOUT) return STATUS_TIMEOUT;
         }
+#ifdef __APPLE__
+        /* Match the scheduler handoff used by the kqueue implementation.
+         * Some WaitOnAddress users depend on the alerting thread getting a
+         * chance to publish the state associated with the wake. */
+        usleep( 0 );
+#endif
         return STATUS_ALERTED;
     }
 #elif defined(HAVE_KQUEUE)
