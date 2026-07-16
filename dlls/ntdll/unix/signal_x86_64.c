@@ -2340,6 +2340,66 @@ static BOOL recover_wow64_transition_fault( struct thread_data *data, ucontext_t
     BYTE code[sizeof(thunk_prefix)];
 
     if (!is_wow64() || !data->teb) return FALSE;
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        rec->NumberParameters >= 2 &&
+        ((ERROR_sig(sigcontext) >> 1) & 0x09) == EXCEPTION_EXECUTE_FAULT &&
+        rec->ExceptionInformation[1] == rip &&
+        CS_sig(sigcontext) == cs64_sel && rip >> 32)
+    {
+        WOW64_CPURESERVED *cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
+        WOW_TEB *wow_teb = get_wow_teb( data->teb );
+        I386_CONTEXT *wow_context;
+        ULONG_PTR guest_rsp = RSP_sig(sigcontext);
+        ULONG64 far_target, popped, expected_rsp;
+        BYTE ret_code[3];
+        USHORT stack_adjust = 0;
+
+        /* Rosetta can update the far-jump transition state while briefly
+         * continuing to decode the compatibility-mode target as 64-bit code.
+         * A 32-bit RET then consumes two adjacent stack entries as one 64-bit
+         * RIP.  Validate the saved far target and RET stack effect so this
+         * state remains distinct from an ordinary bad 64-bit return. */
+        if (R14_sig(sigcontext) < (ULONG_PTR)data->teb->Tib.StackLimit ||
+            R14_sig(sigcontext) > (ULONG_PTR)data->teb->Tib.StackBase - sizeof(far_target))
+            return FALSE;
+        if (!cpu || !wow_teb || R13_sig(sigcontext) != (ULONG_PTR)(cpu + 1))
+            return FALSE;
+        wow_context = (I386_CONTEXT *)(cpu + 1);
+        if (wow_context->SegCs != cs32_sel ||
+            wow_context->Esp < wow_teb->Tib.StackLimit ||
+            wow_context->Esp > wow_teb->Tib.StackBase - sizeof(popped))
+            return FALSE;
+        if (virtual_uninterrupted_read_memory( (void *)R14_sig(sigcontext),
+                                               &far_target, sizeof(far_target) ) != sizeof(far_target) ||
+            far_target != ((ULONG64)wow_context->SegCs << 32 | wow_context->Eip))
+            return FALSE;
+        if (virtual_uninterrupted_read_memory( ULongToPtr(wow_context->Eip),
+                                               ret_code, 1 ) != 1)
+            return FALSE;
+        if (ret_code[0] == 0xc2)
+        {
+            if (virtual_uninterrupted_read_memory( (BYTE *)ULongToPtr(wow_context->Eip) + 1,
+                                                   ret_code + 1, 2 ) != 2)
+                return FALSE;
+            memcpy( &stack_adjust, ret_code + 1, sizeof(stack_adjust) );
+        }
+        else if (ret_code[0] != 0xc3) return FALSE;
+        expected_rsp = (ULONG64)wow_context->Esp + sizeof(popped) + stack_adjust;
+        if (expected_rsp != guest_rsp || expected_rsp > wow_teb->Tib.StackBase)
+            return FALSE;
+        if (virtual_uninterrupted_read_memory( ULongToPtr(wow_context->Esp),
+                                               &popped, sizeof(popped) ) != sizeof(popped) ||
+            popped != rip)
+            return FALSE;
+
+        TRACE_(seh)( "recovered stale WOW64 RET at %04x:%08x\n",
+                     wow_context->SegCs, wow_context->Eip );
+        CS_sig(sigcontext) = cs32_sel;
+        RIP_sig(sigcontext) = (ULONG)rip;
+        RSP_sig(sigcontext) = (ULONG)(guest_rsp - sizeof(ULONG));
+        leave_handler( data, sigcontext );
+        return TRUE;
+    }
     if (rec->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION)
     {
         ULONG_PTR guest_rsp = RSP_sig(sigcontext);
