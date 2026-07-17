@@ -1474,7 +1474,7 @@ static NTSTATUS process_attach( void *args )
     libgnutls_handle = dlopen(SONAME_LIBGNUTLS, RTLD_NOW);
     if (!libgnutls_handle)
     {
-        ERR_(winediag)("Failed to load libgnutls, secure connections will not be available.\n");
+        ERR_(winediag)("Failed to load libgnutls, secure connections will not be available: %s\n", dlerror());
         return STATUS_DLL_NOT_FOUND;
     }
 
