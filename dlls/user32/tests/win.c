@@ -7581,6 +7581,25 @@ static void test_ShowWindow(void)
     SetRectEmpty(&rcEmpty);
 
     hwnd = CreateWindowExA(0, "MainWindowClass", NULL,
+                           WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+                           WS_MAXIMIZEBOX | WS_MAXIMIZE | WS_POPUP,
+                           rcMain.left, rcMain.top,
+                           rcMain.right - rcMain.left, rcMain.bottom - rcMain.top,
+                           0, 0, 0, NULL);
+    assert(hwnd);
+
+    style = GetWindowLongA(hwnd, GWL_STYLE);
+    ok(!(style & WS_VISIBLE), "window should not be visible\n");
+    ok(style & WS_MAXIMIZE, "window should be maximized\n");
+
+    ret = DefWindowProcA(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
+    ok(!ret, "not expected ret: %Iu\n", ret);
+    style = GetWindowLongA(hwnd, GWL_STYLE);
+    ok(!(style & WS_VISIBLE), "window should not be visible\n");
+    ok(style & WS_MAXIMIZE, "window should be maximized\n");
+    DestroyWindow(hwnd);
+
+    hwnd = CreateWindowExA(0, "MainWindowClass", NULL,
                           WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
                           WS_MAXIMIZEBOX | WS_POPUP,
                           rcMain.left, rcMain.top,

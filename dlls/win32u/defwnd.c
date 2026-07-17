@@ -995,8 +995,11 @@ static LRESULT handle_sys_command( HWND hwnd, WPARAM wparam, LPARAM lparam )
         break;
 
     case SC_MAXIMIZE:
-        if (is_iconic(hwnd)) NtUserShowOwnedPopups( hwnd, TRUE );
-        NtUserShowWindow( hwnd, SW_MAXIMIZE );
+        if (!is_zoomed( hwnd ))
+        {
+            if (is_iconic( hwnd )) NtUserShowOwnedPopups( hwnd, TRUE );
+            NtUserShowWindow( hwnd, SW_MAXIMIZE );
+        }
         break;
 
     case SC_CLOSE:
