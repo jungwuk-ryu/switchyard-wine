@@ -1443,7 +1443,6 @@ static void copy_rect_32(const dib_info *dst, const RECT *rc,
                          const dib_info *src, const POINT *origin, int rop2, int overlap)
 {
     DWORD *dst_start, *src_start;
-    DWORD alpha_mask = high_byte_alpha_mask_32( dst ) & high_byte_alpha_mask_32( src );
     int y, dst_stride, src_stride;
     SIZE size;
 
@@ -1465,10 +1464,7 @@ static void copy_rect_32(const dib_info *dst, const RECT *rc,
     if (rop2 == R2_COPYPEN)
     {
         for (y = rc->top; y < rc->bottom; y++, dst_start += dst_stride, src_start += src_stride)
-        {
             memmove( dst_start, src_start, (rc->right - rc->left) * 4 );
-            set_opaque_alpha_32( dst_start, rc->right - rc->left, alpha_mask );
-        }
         return;
     }
 
@@ -6999,7 +6995,6 @@ static void stretch_row_32(const dib_info *dst_dib, const POINT *dst_start,
 {
     DWORD *dst_ptr = get_pixel_ptr_32( dst_dib, dst_start->x, dst_start->y );
     DWORD *src_ptr = get_pixel_ptr_32( src_dib, src_start->x, src_start->y );
-    DWORD alpha_mask = high_byte_alpha_mask_32( dst_dib ) & high_byte_alpha_mask_32( src_dib );
     int err = params->err_start;
     int width;
 
@@ -7007,7 +7002,7 @@ static void stretch_row_32(const dib_info *dst_dib, const POINT *dst_start,
     {
         for (width = params->length; width; width--)
         {
-            *dst_ptr = opaque_alpha_pixel_32( *src_ptr, alpha_mask );
+            *dst_ptr = *src_ptr;
             dst_ptr += params->dst_inc;
             if (err > 0)
             {
@@ -7255,7 +7250,6 @@ static void shrink_row_32(const dib_info *dst_dib, const POINT *dst_start,
 {
     DWORD *dst_ptr = get_pixel_ptr_32( dst_dib, dst_start->x, dst_start->y );
     DWORD *src_ptr = get_pixel_ptr_32( src_dib, src_start->x, src_start->y );
-    DWORD alpha_mask = high_byte_alpha_mask_32( dst_dib ) & high_byte_alpha_mask_32( src_dib );
     int err = params->err_start;
     int width;
 
@@ -7263,7 +7257,7 @@ static void shrink_row_32(const dib_info *dst_dib, const POINT *dst_start,
     {
         for (width = params->length; width; width--)
         {
-            *dst_ptr = opaque_alpha_pixel_32( *src_ptr, alpha_mask );
+            *dst_ptr = *src_ptr;
             src_ptr += params->src_inc;
             if (err > 0)
             {
