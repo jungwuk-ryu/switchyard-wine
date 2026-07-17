@@ -70,7 +70,15 @@ TLS_DEPS_CACHE_DIR="${TLS_DEPS_CACHE_DIR:-${HOME}/.switchyard/deps/tls}"
 USER_SET_WINE_BUILD_DIR="${WINE_BUILD_DIR+x}"
 WINE_BUILD_DIR="${WINE_BUILD_DIR:-}"
 USER_SET_WINE_INSTALL_PREFIX="${WINE_INSTALL_PREFIX+x}"
-GPTK_PATH="${GPTK_PATH:-$(defaults read dev.switchyard.Switchyard gptkPath 2>/dev/null || true)}"
+DISABLE_GPTK_OVERLAY="${SWITCHYARD_DISABLE_GPTK_OVERLAY:-0}"
+case "$DISABLE_GPTK_OVERLAY" in
+  0) GPTK_PATH="${GPTK_PATH:-$(defaults read dev.switchyard.Switchyard gptkPath 2>/dev/null || true)}" ;;
+  1) GPTK_PATH="" ;;
+  *)
+    echo "SWITCHYARD_DISABLE_GPTK_OVERLAY must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 TLS_SOURCE_PREFIX="${TLS_SOURCE_PREFIX:-${SWITCHYARD_TLS_SOURCE_PREFIX:-}}"
 TLS_DLOPEN_NAME="@loader_path/../../switchyard-tls/lib/libgnutls.dylib"
 MAX_JOBS=13
@@ -1014,6 +1022,7 @@ if [ "$MODE" = "--source-info" ]; then
   echo "sourceDirty=$source_dirty"
   echo "sourceTreeDigest=$source_digest"
   echo "patchsetID=$patchset_id"
+  echo "gptkOverlayDisabled=$DISABLE_GPTK_OVERLAY"
   exit 0
 fi
 
@@ -1327,6 +1336,8 @@ if [ -n "$GPTK_PATH" ] && [ -d "$GPTK_PATH/redist/lib" ]; then
     exit 1
   fi
   ditto "$GPTK_PATH/redist/lib" "$WINE_INSTALL_PREFIX/lib"
+elif [ "$DISABLE_GPTK_OVERLAY" = "1" ]; then
+  echo "GPTK overlay explicitly disabled for this runtime build"
 else
   echo "GPTK redist was not found; leaving Wine runtime without GPTK overlay." >&2
 fi

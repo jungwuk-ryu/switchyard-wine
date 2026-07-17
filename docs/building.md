@@ -51,6 +51,8 @@ An existing custom install prefix is replaced only when it is a child of Switchy
 
 The optional `GPTK_PATH` variable may point to a user-selected local Game Porting Toolkit installation. The builder fingerprints and overlays that local input; it never downloads or publishes GPTK.
 
+Set `SWITCHYARD_DISABLE_GPTK_OVERLAY=1` when preparing a redistributable Wine-only build. This explicit mode ignores both `GPTK_PATH` and the path saved in Switchyard preferences, records an empty GPTK path with the `no-gptk` digest, and leaves the Wine-built graphics modules in place. A release workflow must still verify notices, signing, notarization, and LGPL replacement requirements before publishing the resulting runtime.
+
 Useful overrides include:
 
 - `JOBS`: build parallelism; defaults to one fewer than the machine's logical CPU count;
@@ -58,6 +60,7 @@ Useful overrides include:
 - `WINE_INSTALL_PREFIX`: explicit installation directory;
 - `RECONFIGURE=1`: rerun Wine configuration;
 - `GPTK_PATH`: user-selected local GPTK path; and
+- `SWITCHYARD_DISABLE_GPTK_OVERLAY=1`: force a Wine-only build without reading or copying GPTK;
 - `FONT_ASSET_DOWNLOAD_CACHE_DIR`: cache for the verified redistributable font files;
 - `SWITCHYARD_TLS_SOURCE_PREFIX`: user-local x86_64 Wine prefix containing a compatible GnuTLS dependency closure.
 
