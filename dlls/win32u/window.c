@@ -2661,7 +2661,10 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         NtGdiSelectBitmap( hdc, surface->color_bitmap );
 
         if (dirty) intersect_rect( &rect, &rect, dirty );
-        NtGdiPatBlt( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, BLACKNESS );
+        /* Per-pixel alpha is source-over composited below.  Clear its target
+           to transparent black so zero-alpha source pixels remain transparent. */
+        if (!source_per_pixel_alpha || !window_surface_clear_rect( surface, &rect ))
+            NtGdiPatBlt( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, BLACKNESS );
 
         src_rect = rect;
         if (pts_src) OffsetRect( &src_rect, pts_src->x, pts_src->y );

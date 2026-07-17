@@ -842,6 +842,38 @@ void window_surface_unlock( struct window_surface *surface )
     pthread_mutex_unlock( &surface->mutex );
 }
 
+/* The surface must be locked by the caller. */
+BOOL window_surface_clear_rect( struct window_surface *surface, const RECT *rect )
+{
+    char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *color_info = (BITMAPINFO *)color_buf;
+    const BITMAPINFOHEADER *header = &color_info->bmiHeader;
+    RECT bounds, clear_rect;
+    BYTE *color_bits, *row;
+    UINT height, stride;
+    int y;
+
+    if (surface == &dummy_surface || !(color_bits = window_surface_get_color( surface, color_info )))
+        return FALSE;
+    if (header->biBitCount != 32 || header->biWidth <= 0 || !(height = abs( header->biHeight )))
+        return FALSE;
+
+    SetRect( &bounds, 0, 0, header->biWidth, height );
+    if (!intersect_rect( &clear_rect, rect, &bounds )) return TRUE;
+
+    stride = header->biSizeImage / height;
+    if (!stride) stride = get_dib_stride( header->biWidth, header->biBitCount );
+
+    for (y = clear_rect.top; y < clear_rect.bottom; y++)
+    {
+        UINT row_index = header->biHeight < 0 ? y : height - 1 - y;
+
+        row = color_bits + row_index * stride + clear_rect.left * sizeof(UINT32);
+        memset( row, 0, (clear_rect.right - clear_rect.left) * sizeof(UINT32) );
+    }
+    return TRUE;
+}
+
 void window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
