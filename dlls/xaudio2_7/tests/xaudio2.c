@@ -136,6 +136,29 @@ static HRESULT create_mastering_voice(IXAudio2 *audio, unsigned int channel_coun
 #endif
 }
 
+static void test_mastering_voice_creation_failure(IXAudio2 *audio)
+{
+#if XAUDIO2_VER <= 7
+    IXAudio2MasteringVoice *master = (IXAudio2MasteringVoice *)0xdeadbeef;
+    UINT32 count;
+    HRESULT hr;
+
+    if (!winetest_platform_is_wine)
+        return;
+
+    hr = IXAudio2_GetDeviceCount(audio, &count);
+    ok(hr == S_OK, "GetDeviceCount failed: %08lx\n", hr);
+    if (FAILED(hr))
+        return;
+
+    hr = IXAudio2_CreateMasteringVoice(audio, &master, XAUDIO2_DEFAULT_CHANNELS,
+            44100, 0, count, NULL);
+    ok(hr == XAUDIO2_E_INVALID_CALL, "Got unexpected hr: %08lx\n", hr);
+    ok(master == (IXAudio2MasteringVoice *)0xdeadbeef,
+            "Mastering voice pointer was modified to %p.\n", master);
+#endif
+}
+
 static void get_voice_state(IXAudio2SourceVoice *voice, XAUDIO2_VOICE_STATE *state)
 {
 #if XAUDIO2_VER <= 7
@@ -1466,11 +1489,16 @@ static void test_XAudio2CreateWithVersionInfo(void)
 static UINT32 check_has_devices(IXAudio2 *xa)
 {
     HRESULT hr;
-    IXAudio2MasteringVoice *master;
+    IXAudio2MasteringVoice *master, *master2 = (IXAudio2MasteringVoice *)0xdeadbeef;
 
     hr = create_mastering_voice(xa, 2, &master);
     if(hr != S_OK)
         return 0;
+
+    hr = create_mastering_voice(xa, 2, &master2);
+    ok(hr == XAUDIO2_E_INVALID_CALL, "Got unexpected hr: %08lx\n", hr);
+    ok(master2 == (IXAudio2MasteringVoice *)0xdeadbeef,
+            "Mastering voice pointer was modified to %p.\n", master2);
 
     IXAudio2MasteringVoice_DestroyVoice(master);
 
@@ -1494,6 +1522,7 @@ START_TEST(xaudio2)
 #endif
 
     test_interfaces(audio);
+    test_mastering_voice_creation_failure(audio);
 
     if (check_has_devices(audio))
     {
