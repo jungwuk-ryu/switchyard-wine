@@ -39,7 +39,17 @@ Start with:
 ./switchyard/build_runtime.sh
 ```
 
-See `CONTRIBUTING.md` before proposing changes. Binary releases are intentionally deferred until source publication, dependency notices, signing, and notarization are complete.
+See `CONTRIBUTING.md` before proposing changes. Developer ID signed and
+notarized Wine-only runtime archives are published on the
+[GitHub Releases](https://github.com/jungwuk-ryu/switchyard-wine/releases)
+page. Each archive is tied to an exact source revision and includes a release
+manifest, SHA-256 checksum, dependency notices, and corresponding-source
+instructions. The Switchyard app installs only the release matching its bundled
+compatibility revision.
+
+Game Porting Toolkit is never part of those archives. Users obtain it directly
+from Apple and may let Switchyard import their local copy after accepting
+Apple's terms.
 
 ## Upstream Wine documentation
 

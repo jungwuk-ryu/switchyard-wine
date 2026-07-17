@@ -21,4 +21,4 @@ jobs:
       - name: Verify downstream history and source policy
         run: ./switchyard/verify_source.sh
       - name: Check runtime tooling syntax
-        run: bash -n switchyard/build_runtime.sh switchyard/lib/directory_safety.sh switchyard/tests/directory_safety_test.sh
+        run: bash -n switchyard/build_runtime.sh switchyard/release_runtime.sh switchyard/verify_tls_packages.sh switchyard/lib/directory_safety.sh switchyard/tests/directory_safety_test.sh switchyard/tests/runtime_tls_smoke_test.sh

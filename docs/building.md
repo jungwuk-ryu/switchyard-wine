@@ -36,7 +36,7 @@ Inspect the source identity that would be written to a runtime manifest with:
 ./switchyard/build_runtime.sh
 ```
 
-The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, and the pinned redistributable Noto font set into user-local caches. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, font-asset, and core-binary integrity metadata.
+The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, a pinned x86_64 conda-forge GnuTLS dependency closure, and the pinned redistributable Noto font set into user-local caches. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, font-asset, and core-binary integrity metadata.
 
 The font set supplies regular faces for every Noto family referenced by Wine's DirectWrite fallback table, common bold faces, symbols, and the Japanese, Korean, Simplified Chinese, Traditional Chinese, and Hong Kong faces from Noto Sans CJK. The unmodified files are installed in `share/wine/fonts`, so they are visible to every prefix without copying fonts into `C:\\Windows\\Fonts`. Their pinned URLs and SHA-256 values live in `switchyard/font-assets.tsv`; SIL Open Font License 1.1 notices are copied into the runtime.
 
@@ -62,7 +62,7 @@ Useful overrides include:
 - `GPTK_PATH`: user-selected local GPTK path; and
 - `SWITCHYARD_DISABLE_GPTK_OVERLAY=1`: force a Wine-only build without reading or copying GPTK;
 - `FONT_ASSET_DOWNLOAD_CACHE_DIR`: cache for the verified redistributable font files;
-- `SWITCHYARD_TLS_SOURCE_PREFIX`: user-local x86_64 Wine prefix containing a compatible GnuTLS dependency closure.
+- `TLS_PACKAGE_CACHE_DIR`: cache for the pinned, hash-verified x86_64 conda-forge TLS packages.
 
 To reuse a complete runtime with exactly matching inputs:
 
@@ -72,10 +72,37 @@ To reuse a complete runtime with exactly matching inputs:
 
 Plain `build` produces an artifact without changing the Switchyard application's selected Wine path. `--ensure` is the only mode that updates that preference after a complete matching runtime has been verified or built.
 
-No prebuilt Switchyard Wine runtime is published until its corresponding source, dependency notices, packaging, signing, and notarization workflow have been verified.
+Publish a prebuilt Switchyard Wine runtime only after its corresponding source,
+dependency notices, packaging, signing, and notarization workflow have been
+verified.
+
+For a release build, first build a clean Wine-only runtime and then create a
+Developer ID signed, optionally notarized archive:
+
+```sh
+SWITCHYARD_DISABLE_GPTK_OVERLAY=1 ./switchyard/build_runtime.sh
+./switchyard/release_runtime.sh \
+  --runtime ~/.switchyard/runtimes/<runtime-id> \
+  --output ~/Desktop/switchyard-runtime-release \
+  --identity "Developer ID Application: ..." \
+  --notary-profile switchyard-notary
+```
+
+The release script refuses dirty source builds, GPTK overlays, missing license
+or corresponding-source notices, unexpected signing teams, and runtimes that
+cannot start a fresh Wine prefix. The ZIP itself cannot carry a stapled ticket;
+the generated release manifest records the accepted notarization submission and
+the app verifies the archive digest plus the Developer ID signed Mach-O files.
 
 The destructive-promotion guard has a local macOS regression test:
 
 ```sh
 ./switchyard/tests/directory_safety_test.sh
+```
+
+After building, exercise the runtime-local GnuTLS closure through Wine's WinHTTP
+implementation with:
+
+```sh
+./switchyard/tests/runtime_tls_smoke_test.sh ~/.switchyard/runtimes/<runtime-id>
 ```
