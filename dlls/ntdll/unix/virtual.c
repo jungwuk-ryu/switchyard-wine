@@ -2505,6 +2505,7 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     size_t map_size, host_size;
     int prot = PROT_READ | PROT_WRITE;
     unsigned int flags = MAP_FIXED;
+    BOOL try_mmap;
 
     assert( start < view->size );
     assert( start + size <= view->size );
@@ -2532,7 +2533,15 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
 
     /* only try mmap if media is not removable (or if we require write access),
        and if alignment is correct */
-    if ((!removable || (flags & MAP_SHARED)) && host_addr == map_addr && host_size == map_size)
+    try_mmap = (!removable || (flags & MAP_SHARED)) && host_addr == map_addr && host_size == map_size;
+
+#ifdef __APPLE__
+    /* Hardened Runtime prevents executable protection on file-backed PE image pages.
+     * Keep the image in the anonymous view so that the final mprotect(PROT_EXEC) succeeds. */
+    if (view->protect & SEC_IMAGE) try_mmap = FALSE;
+#endif
+
+    if (try_mmap)
     {
         if (mmap( host_addr, host_size, prot, flags, fd, offset ) != MAP_FAILED)
             return STATUS_SUCCESS;
