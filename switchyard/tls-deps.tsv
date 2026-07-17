@@ -1,0 +1,12 @@
+# Redistributable x86_64 macOS TLS runtime packages from conda-forge.
+# Fields: name, version, build, filename, sha256
+gmp	6.3.0	hf036a51_2	gmp-6.3.0-hf036a51_2.conda	75aa5e7a875afdcf4903b7dc98577672a3dc17b528ac217b915f9528f93c85fc
+gnutls	3.8.13	hba17655_0	gnutls-3.8.13-hba17655_0.conda	8f37eb8a9bd347990565894980ca07e7da2b28f674011c23842e4383db22447e
+libffi	3.5.2	h750e83c_0	libffi-3.5.2-h750e83c_0.conda	277dc89950f5d97f1683f26e362d6dca3c2efa16cb2f6fdb73d109effa1cd3d0
+libiconv	1.18	h57a12c2_2	libiconv-1.18-h57a12c2_2.conda	a1c8cecdf9966921e13f0ae921309a1f415dfbd2b791f2117cf7e8f5e61a48b6
+libidn2	2.3.8	h13f126c_1	libidn2-2.3.8-h13f126c_1.conda	12d9d76ad7101ded05b13a4ab51862bef5731d6715f7f0eb85718a91fbafdcd0
+libintl	0.25.1	h3184127_1	libintl-0.25.1-h3184127_1.conda	8c352744517bc62d24539d1ecc813b9fdc8a785c780197c5f0b84ec5b0dfe122
+libtasn1	4.21.0	hf3981d6_0	libtasn1-4.21.0-hf3981d6_0.conda	9d49c11b80fe95e7c09f4e0fe8d02dfa4c9e812cbe71333a9d5f044b75c792d2
+libunistring	0.9.10	h0d85af4_0	libunistring-0.9.10-h0d85af4_0.tar.bz2	c5805a58cd2b211bffdc8b7cdeba9af3cee456196ab52ab9a30e0353bc95beb7
+nettle	3.10.1	hfe4493a_0	nettle-3.10.1-hfe4493a_0.conda	424033bf8dc48df0cd6dedb71453390d3446aa448c0c91add9768a1df5e09e88
+p11-kit	0.26.4	h8c408c4_0	p11-kit-0.26.4-h8c408c4_0.conda	b71c6bf1b08e3be9ca8834a73ae03185b5e56f21df32047c65560d79738d01ff

@@ -38,5 +38,6 @@ if printf '%s\n' "$added_files" | grep -Eiq '\.(dmg|pkg|metallib|dylib)$'; then
 fi
 
 "$ROOT_DIR/switchyard/verify_font_assets.sh"
+"$ROOT_DIR/switchyard/verify_tls_packages.sh"
 
 echo "source history verified from $upstream_base through $(git -C "$ROOT_DIR" rev-parse HEAD)"

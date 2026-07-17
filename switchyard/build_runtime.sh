@@ -8,9 +8,9 @@ UPSTREAM_BASE_FILE="$ROOT_DIR/switchyard/upstream-base.txt"
 MODE="${1:-build}"
 
 case "$MODE" in
-  build|--ensure|--source-info) ;;
+  build|--ensure|--source-info|--verify-tls) ;;
   *)
-    echo "usage: $0 [--ensure|--source-info]" >&2
+    echo "usage: $0 [--ensure|--source-info|--verify-tls]" >&2
     exit 2
     ;;
 esac
@@ -66,6 +66,10 @@ FONT_ALIAS_FAMILY="Arial Unicode MS"
 FONT_ALIAS_POSTSCRIPT="ArialUnicodeMS"
 FONT_ALIAS_FACE_INDEX=1
 FONT_ALIAS_SHA256="ccdd3bd646d95b31513e10ad9c975d878c0ef8b25ff2d92f2e635b50218b128e"
+TLS_PACKAGE_MANIFEST="$ROOT_DIR/switchyard/tls-deps.tsv"
+TLS_PACKAGE_BASE_URL="https://conda.anaconda.org/conda-forge/osx-64"
+TLS_RUNTIME_LAYOUT_VERSION="3"
+TLS_PACKAGE_CACHE_DIR="${TLS_PACKAGE_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/TLS/packages}"
 TLS_DEPS_CACHE_DIR="${TLS_DEPS_CACHE_DIR:-${HOME}/.switchyard/deps/tls}"
 USER_SET_WINE_BUILD_DIR="${WINE_BUILD_DIR+x}"
 WINE_BUILD_DIR="${WINE_BUILD_DIR:-}"
@@ -79,7 +83,6 @@ case "$DISABLE_GPTK_OVERLAY" in
     exit 2
     ;;
 esac
-TLS_SOURCE_PREFIX="${TLS_SOURCE_PREFIX:-${SWITCHYARD_TLS_SOURCE_PREFIX:-}}"
 TLS_DLOPEN_NAME="@loader_path/../../switchyard-tls/lib/libgnutls.dylib"
 MAX_JOBS=13
 JOBS="${JOBS:-$MAX_JOBS}"
@@ -143,6 +146,8 @@ require_command shasum
 require_command perl
 require_command curl
 require_command tar
+require_command unzip
+require_command zstd
 require_command install_name_tool
 
 sha256_file() {
@@ -750,143 +755,95 @@ relocate_font_deps_for_runtime() {
   done
 }
 
-detect_tls_source_prefix() {
-  local candidates=()
-  local candidate
-  local heroic_prefix="${HOME}/Library/Application Support/heroic/tools/game-porting-toolkit/Game-Porting-Toolkit-latest/Contents/Resources/wine"
+download_tls_package() {
+  local package_name="$1"
+  local filename="$2"
+  local expected_hash="$3"
+  local cached_file="$TLS_PACKAGE_CACHE_DIR/$filename"
+  local temporary_file
+  local actual_hash
 
-  if [ -n "$TLS_SOURCE_PREFIX" ]; then
-    candidates+=("$TLS_SOURCE_PREFIX")
-  fi
-  if [ -n "$GPTK_PATH" ]; then
-    candidates+=("$GPTK_PATH" "$GPTK_PATH/wine" "$GPTK_PATH/Contents/Resources/wine")
-  fi
-  candidates+=("$heroic_prefix")
-
-  for candidate in "${candidates[@]}"; do
-    if [ -f "$candidate/lib/libgnutls.30.dylib" ] &&
-       file "$candidate/lib/libgnutls.30.dylib" | grep -q "x86_64"; then
-      printf '%s\n' "$candidate"
+  mkdir -p "$TLS_PACKAGE_CACHE_DIR"
+  if [ -f "$cached_file" ]; then
+    actual_hash="$(sha256_file "$cached_file")"
+    if [ "$actual_hash" = "$expected_hash" ]; then
+      printf '%s\n' "$cached_file"
       return 0
     fi
-  done
-
-  return 1
-}
-
-collect_tls_library_names() {
-  local source_lib="$1"
-  local list_file
-  local previous_file
-  local pattern
-  local library
-  local dependency
-  local dependency_name
-
-  list_file="$(mktemp)"
-  previous_file="$(mktemp)"
-
-  for pattern in \
-    'libgnutls*.dylib' \
-    'libnettle*.dylib' \
-    'libhogweed*.dylib' \
-    'libtasn1*.dylib' \
-    'libp11-kit*.dylib' \
-    'p11-kit-proxy*.dylib' \
-    'libidn2*.dylib' \
-    'libunistring*.dylib' \
-    'libgmp*.dylib' \
-    'libintl*.dylib' \
-    'libffi*.dylib' \
-    'libz*.dylib' \
-    'libbrotli*.dylib' \
-    'libMacportsLegacySupport*.dylib'
-  do
-    for library in "$source_lib"/$pattern; do
-      [ -f "$library" ] || continue
-      basename "$library" >> "$list_file"
-    done
-  done
-
-  LC_ALL=C sort -u -o "$list_file" "$list_file"
-  if [ ! -s "$list_file" ]; then
-    rm -f "$list_file" "$previous_file"
-    return 1
+    echo "cached $package_name package has unexpected sha256 $actual_hash; downloading again." >&2
+    rm -f "$cached_file"
   fi
 
-  while true; do
-    cp "$list_file" "$previous_file"
-    while IFS= read -r library; do
-      while IFS= read -r dependency; do
-        case "$dependency" in
-          @loader_path/*.dylib)
-            dependency_name="${dependency##*/}"
-            if [ ! -f "$source_lib/$dependency_name" ]; then
-              echo "$library depends on missing TLS runtime library $dependency_name." >&2
-              echo "Expected to find it at $source_lib/$dependency_name." >&2
-              rm -f "$list_file" "$previous_file"
-              return 1
-            fi
-            printf '%s\n' "$dependency_name" >> "$list_file"
-            ;;
-        esac
-      done < <(otool -L "$source_lib/$library" | awk 'NR > 1 { print $1 }')
-    done < "$previous_file"
-    LC_ALL=C sort -u -o "$list_file" "$list_file"
-    if cmp -s "$list_file" "$previous_file"; then
-      break
-    fi
-  done
+  temporary_file="${cached_file}.tmp.$$"
+  rm -f "$temporary_file"
+  curl -fL --retry 3 --retry-delay 1 \
+    -o "$temporary_file" "$TLS_PACKAGE_BASE_URL/$filename"
+  actual_hash="$(sha256_file "$temporary_file")"
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    rm -f "$temporary_file"
+    echo "$package_name package has unexpected sha256 $actual_hash; expected $expected_hash." >&2
+    exit 1
+  fi
+  mv "$temporary_file" "$cached_file"
+  printf '%s\n' "$cached_file"
+}
 
-  cat "$list_file"
-  rm -f "$list_file" "$previous_file"
+extract_tls_package() {
+  local archive="$1"
+  local destination="$2"
+  local container
+  local payload
+
+  mkdir -p "$destination"
+  case "$archive" in
+    *.conda)
+      container="$(mktemp -d)"
+      unzip -q "$archive" -d "$container"
+      for payload in "$container"/pkg-*.tar.zst "$container"/info-*.tar.zst; do
+        [ -f "$payload" ] || continue
+        zstd -dc "$payload" | tar -xf - -C "$destination"
+      done
+      rm -rf "$container"
+      ;;
+    *.tar.bz2)
+      tar -xjf "$archive" -C "$destination"
+      ;;
+    *)
+      echo "unsupported TLS package archive: $archive" >&2
+      exit 1
+      ;;
+  esac
 }
 
 stage_tls_deps() {
-  local source_prefix
-  local source_lib
-  local gnutls_include_dir
-  local source_digest
-  local tls_library_names
+  local manifest_digest
   local tls_deps_prefix
   local temporary_prefix
-  local tls_version
-  local pattern
+  local package_name
+  local package_version
+  local package_build
+  local package_filename
+  local package_hash
+  local extra
+  local package_archive
+  local package_root
+  local package_notice_root
+  local package_pool
+  local closure_file
+  local previous_file
+  local source_library
   local library
   local dependency
   local dependency_name
-  local missing_dependency
   local test_source
+  local test_binary
 
-  if ! source_prefix="$(detect_tls_source_prefix)"; then
-    echo "x86_64 GnuTLS runtime libraries were not found; Wine schannel support will be disabled." >&2
-    echo "Set SWITCHYARD_TLS_SOURCE_PREFIX to a user-local x86_64 Wine runtime containing lib/libgnutls.30.dylib." >&2
-    printf '\n'
-    return 0
-  fi
-
-  gnutls_include_dir="$(brew --prefix gnutls 2>/dev/null || true)/include"
-  if [ ! -f "$gnutls_include_dir/gnutls/gnutls.h" ]; then
-    echo "GnuTLS headers were not found. Install Homebrew gnutls so Wine can compile schannel." >&2
+  if [ ! -f "$TLS_PACKAGE_MANIFEST" ]; then
+    echo "missing pinned TLS package manifest at $TLS_PACKAGE_MANIFEST" >&2
     exit 1
   fi
-
-  source_lib="$source_prefix/lib"
-  if ! tls_library_names="$(collect_tls_library_names "$source_lib")"; then
-    echo "No complete TLS runtime library closure was found in $source_lib." >&2
-    exit 1
-  fi
-  source_digest="$(
-    while IFS= read -r library; do
-      printf '%s %s\n' "$library" "$(sha256_file "$source_lib/$library")"
-    done <<< "$tls_library_names" | short_sha256_stream
-  )"
-  if [ -z "$source_digest" ]; then
-    echo "No TLS runtime libraries were found in $source_lib." >&2
-    exit 1
-  fi
-
-  tls_deps_prefix="$TLS_DEPS_CACHE_DIR/x86_64-gnutls-${source_digest}"
+  manifest_digest="$({ /bin/cat "$TLS_PACKAGE_MANIFEST"; /usr/bin/printf '%s\n' "$TLS_RUNTIME_LAYOUT_VERSION"; } | short_sha256_stream)"
+  tls_deps_prefix="$TLS_DEPS_CACHE_DIR/x86_64-conda-gnutls-${manifest_digest}"
   if content_tree_is_verified "$tls_deps_prefix" &&
      [ -f "$tls_deps_prefix/lib/libgnutls.30.dylib" ] &&
      [ -f "$tls_deps_prefix/lib/pkgconfig/gnutls.pc" ] &&
@@ -896,43 +853,144 @@ stage_tls_deps() {
   fi
 
   temporary_prefix="${tls_deps_prefix}.tmp.$$"
+  package_pool="${temporary_prefix}.pool"
   rm -rf "$temporary_prefix"
+  rm -rf "$package_pool"
   mkdir -p "$temporary_prefix/lib" "$temporary_prefix/include" "$temporary_prefix/lib/pkgconfig" \
-    "$temporary_prefix/share/doc/switchyard-tls"
+    "$temporary_prefix/share/doc/switchyard-tls/packages"
+  mkdir -p "$package_pool/lib"
 
-  while IFS= read -r library; do
-    install -m 0644 "$source_lib/$library" "$temporary_prefix/lib/$library"
-  done <<< "$tls_library_names"
+  while IFS=$'\t' read -r package_name package_version package_build package_filename package_hash extra; do
+    case "$package_name" in
+      ''|'#'*) continue ;;
+    esac
+    if [ -n "${extra:-}" ] || [ -z "$package_hash" ]; then
+      echo "invalid TLS package manifest row for $package_name" >&2
+      exit 1
+    fi
 
-  missing_dependency=0
+    package_archive="$(download_tls_package "$package_name" "$package_filename" "$package_hash")"
+    package_root="$(mktemp -d)"
+    extract_tls_package "$package_archive" "$package_root"
+
+    if [ -d "$package_root/lib" ]; then
+      ditto "$package_root/lib" "$package_pool/lib"
+    fi
+    if [ -d "$package_root/include" ]; then
+      ditto "$package_root/include" "$temporary_prefix/include"
+    fi
+    if [ -d "$package_root/etc" ]; then
+      mkdir -p "$temporary_prefix/etc"
+      ditto "$package_root/etc" "$temporary_prefix/etc"
+    fi
+
+    package_notice_root="$temporary_prefix/share/doc/switchyard-tls/packages/$package_name"
+    mkdir -p "$package_notice_root"
+    if [ ! -d "$package_root/info/licenses" ] ||
+       [ -z "$(find "$package_root/info/licenses" -type f -print -quit)" ]; then
+      echo "$package_name package does not contain redistributable license notices." >&2
+      exit 1
+    fi
+    ditto "$package_root/info/licenses" "$package_notice_root/licenses"
+    for dependency_record in about.json index.json; do
+      if [ -f "$package_root/info/$dependency_record" ]; then
+        install -m 0644 "$package_root/info/$dependency_record" "$package_notice_root/$dependency_record"
+      fi
+    done
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$package_name" "$package_version" "$package_build" "$package_filename" "$package_hash" \
+      >> "$temporary_prefix/share/doc/switchyard-tls/manifest.tsv"
+    rm -rf "$package_root"
+  done < "$TLS_PACKAGE_MANIFEST"
+
+  if [ ! -f "$package_pool/lib/libgnutls.30.dylib" ] ||
+     [ ! -f "$temporary_prefix/include/gnutls/gnutls.h" ]; then
+    echo "pinned TLS packages did not provide GnuTLS libraries and headers." >&2
+    exit 1
+  fi
+
+  closure_file="$(mktemp)"
+  previous_file="$(mktemp)"
+  printf '%s\n' 'libgnutls.30.dylib' > "$closure_file"
+  while true; do
+    cp "$closure_file" "$previous_file"
+    while IFS= read -r dependency_name; do
+      source_library="$package_pool/lib/$dependency_name"
+      if [ ! -e "$source_library" ]; then
+        echo "TLS package closure is missing $dependency_name." >&2
+        exit 1
+      fi
+      while IFS= read -r dependency; do
+        case "$dependency" in
+          @rpath/*.dylib|@loader_path/*.dylib)
+            dependency_name="${dependency##*/}"
+            if [ ! -e "$package_pool/lib/$dependency_name" ]; then
+              echo "$(basename "$source_library") depends on missing TLS package library $dependency_name." >&2
+              exit 1
+            fi
+            printf '%s\n' "$dependency_name" >> "$closure_file"
+            ;;
+          /System/*|/usr/lib/*)
+            ;;
+          *)
+            echo "$(basename "$source_library") has non-relocatable package dependency $dependency." >&2
+            exit 1
+            ;;
+        esac
+      done < <(otool -L "$source_library" | awk 'NR > 1 { print $1 }')
+    done < "$previous_file"
+    LC_ALL=C sort -u -o "$closure_file" "$closure_file"
+    if cmp -s "$closure_file" "$previous_file"; then
+      break
+    fi
+  done
+
+  while IFS= read -r dependency_name; do
+    source_library="$package_pool/lib/$dependency_name"
+    runtime_name="$dependency_name"
+    if [ "$dependency_name" = "libiconv.2.dylib" ]; then
+      # macOS supplies a different libiconv ABI under this leaf name. Keep the
+      # conda implementation distinct so libunistring can still bind to the
+      # system _iconv symbols while libidn2 and libintl bind to _libiconv.
+      runtime_name="libswitchyard-iconv.2.dylib"
+    fi
+    install -m 0644 "$(realpath "$source_library")" "$temporary_prefix/lib/$runtime_name"
+  done < "$closure_file"
+  ln -sf libgnutls.30.dylib "$temporary_prefix/lib/libgnutls.dylib"
+  rm -f "$closure_file" "$previous_file"
+  rm -rf "$package_pool"
+
   for library in "$temporary_prefix"/lib/*.dylib; do
-    [ -f "$library" ] || continue
+    [ -e "$library" ] || continue
+    [ -L "$library" ] && continue
+    if ! file "$library" | grep -q "x86_64"; then
+      echo "TLS runtime library is not x86_64: $library" >&2
+      exit 1
+    fi
+    install_name_tool -id "@loader_path/$(basename "$library")" "$library"
     while IFS= read -r dependency; do
       case "$dependency" in
-        @loader_path/*.dylib)
+        @rpath/*.dylib|@loader_path/*.dylib)
           dependency_name="${dependency##*/}"
-          if [ ! -f "$temporary_prefix/lib/$dependency_name" ]; then
-            echo "$(basename "$library") still has unresolved TLS dependency $dependency_name." >&2
-            missing_dependency=1
+          runtime_dependency_name="$dependency_name"
+          if [ "$dependency_name" = "libiconv.2.dylib" ]; then
+            runtime_dependency_name="libswitchyard-iconv.2.dylib"
           fi
+          if [ ! -e "$temporary_prefix/lib/$runtime_dependency_name" ]; then
+            echo "$(basename "$library") depends on missing TLS runtime library $dependency_name." >&2
+            exit 1
+          fi
+          install_name_tool -change "$dependency" "@loader_path/$runtime_dependency_name" "$library"
+          ;;
+        /System/*|/usr/lib/*)
+          ;;
+        *)
+          echo "$(basename "$library") has non-relocatable TLS dependency $dependency." >&2
+          exit 1
           ;;
       esac
     done < <(otool -L "$library" | awk 'NR > 1 { print $1 }')
   done
-  if [ "$missing_dependency" -ne 0 ]; then
-    exit 1
-  fi
-
-  if [ ! -f "$temporary_prefix/lib/libgnutls.30.dylib" ]; then
-    echo "TLS staging did not produce libgnutls.30.dylib." >&2
-    exit 1
-  fi
-
-  ditto "$gnutls_include_dir" "$temporary_prefix/include"
-  tls_version="$(strings -a "$temporary_prefix/lib/libgnutls.30.dylib" | awk '/^[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
-  if [ -z "$tls_version" ]; then
-    tls_version="$(pkg-config --modversion gnutls 2>/dev/null || printf '3')"
-  fi
 
   cat >"$temporary_prefix/lib/pkgconfig/gnutls.pc" <<EOF
 prefix=$tls_deps_prefix
@@ -941,23 +999,24 @@ libdir=\${prefix}/lib
 includedir=\${prefix}/include
 
 Name: GnuTLS
-Description: User-local x86_64 GnuTLS runtime staged for Switchyard Wine
-Version: $tls_version
+Description: Pinned redistributable x86_64 GnuTLS runtime for Switchyard Wine
+Version: 3.8.13
 Libs: -L\${libdir} -lgnutls
 Cflags: -I\${includedir}
 EOF
 
   cat >"$temporary_prefix/share/doc/switchyard-tls/README.txt" <<EOF
-This directory is a user-local Switchyard staging copy of x86_64 GnuTLS runtime
-libraries discovered at:
-
-$source_prefix
-
-It is used only to build and run the local Wine runtime with schannel support.
-Do not commit these files to the Switchyard repository.
+This directory contains the pinned x86_64 macOS GnuTLS dependency closure used
+by Switchyard Wine for schannel support. Every package is downloaded from the
+conda-forge osx-64 channel and verified against switchyard/tls-deps.tsv before
+staging. The package manifest, original package metadata, and license notices
+are preserved alongside the libraries for redistribution and source tracing.
 EOF
+  install -m 0644 "$TLS_PACKAGE_MANIFEST" \
+    "$temporary_prefix/share/doc/switchyard-tls/packages.tsv"
 
   test_source="$temporary_prefix/gnutls-link-test.c"
+  test_binary="$temporary_prefix/gnutls-link-test"
   cat >"$test_source" <<'EOF'
 #include <gnutls/gnutls.h>
 int main(void) { return gnutls_check_version("3.0") ? 0 : 1; }
@@ -966,8 +1025,9 @@ EOF
     -I"$temporary_prefix/include" \
     -L"$temporary_prefix/lib" \
     -Wl,-rpath,"$temporary_prefix/lib" \
-    "$test_source" -lgnutls -o "$temporary_prefix/gnutls-link-test"
-  rm -f "$test_source" "$temporary_prefix/gnutls-link-test"
+    "$test_source" -lgnutls -o "$test_binary"
+  env DYLD_LIBRARY_PATH="$temporary_prefix/lib" "$test_binary"
+  rm -f "$test_source" "$test_binary"
 
   write_content_tree_digest "$temporary_prefix"
   atomic_replace_directory "$temporary_prefix" "$tls_deps_prefix" cache
@@ -1040,6 +1100,13 @@ if [ -n "$GPTK_PATH" ] && [ -d "$GPTK_PATH/redist/lib" ]; then
       done
     ) | short_sha256_stream
   )"
+fi
+
+if [ "$MODE" = "--verify-tls" ]; then
+  tls_deps_prefix="$(stage_tls_deps)"
+  echo "verified pinned x86_64 TLS runtime at $tls_deps_prefix"
+  echo "tlsRuntimeDigest=$(content_tree_digest "$tls_deps_prefix")"
+  exit 0
 fi
 
 wine_mono_path="$(download_wine_mono)"
@@ -1376,6 +1443,30 @@ if [ -n "$tls_deps_prefix" ]; then
   ditto "$tls_deps_prefix" "$WINE_INSTALL_PREFIX/lib/switchyard-tls"
 fi
 
+echo "installing Wine license, source, and replacement notices"
+wine_notice_root="$WINE_INSTALL_PREFIX/share/doc/switchyard-wine"
+mkdir -p "$wine_notice_root"
+install -m 0644 "$ROOT_DIR/LICENSE" "$wine_notice_root/LICENSE"
+install -m 0644 "$ROOT_DIR/COPYING.LIB" "$wine_notice_root/COPYING.LIB"
+install -m 0644 "$ROOT_DIR/AUTHORS" "$wine_notice_root/AUTHORS"
+install -m 0644 "$ROOT_DIR/docs/building.md" "$wine_notice_root/BUILDING.md"
+install -m 0644 "$ROOT_DIR/docs/provenance.md" "$wine_notice_root/PROVENANCE.md"
+cat >"$wine_notice_root/CORRESPONDING-SOURCE.txt" <<EOF
+Switchyard Wine runtime corresponding source
+
+Repository: $SOURCE_REPOSITORY
+Revision: $wine_revision
+Source URL: $SOURCE_REPOSITORY/tree/$wine_revision
+
+The repository at the revision above contains the complete Switchyard Wine
+source and the scripts used to build this replaceable runtime. Wine and the
+Switchyard modifications are licensed under LGPL-2.1-or-later; see LICENSE and
+COPYING.LIB in this directory. Runtime dependency package identities, hashes,
+metadata, and license notices are retained under the component documentation
+directories. The Switchyard app launches this external runtime and permits the
+user to select a rebuilt or replacement Wine executable independently.
+EOF
+
 rm -rf "$WINE_INSTALL_PREFIX/bin/.switchyard-real"
 
 for wine_binary_name in wine wine64; do
@@ -1564,7 +1655,8 @@ x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows
     printf '    "digest": %s,\n' "$(json_string "$tls_deps_digest")"
     printf '    "architecture": "x86_64",\n'
     printf '    "dlopenName": %s,\n' "$(json_string "$TLS_DLOPEN_NAME")"
-    printf '    "license": "user-local GnuTLS runtime libraries; preserve upstream notices when distributing",\n'
+    printf '    "license": "redistributable conda-forge GnuTLS dependency closure with package notices",\n'
+    printf '    "packageManifest": "lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv",\n'
     printf '    "sourceNote": "lib/switchyard-tls/share/doc/switchyard-tls/README.txt"\n'
     printf '  },\n'
   else
