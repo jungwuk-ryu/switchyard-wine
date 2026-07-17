@@ -96,7 +96,8 @@ for required_notice in \
   share/doc/switchyard-wine/COPYING.LIB \
   share/doc/switchyard-wine/AUTHORS \
   share/doc/switchyard-wine/CORRESPONDING-SOURCE.txt \
-  lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv; do
+  lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv \
+  lib/switchyard-tls/share/doc/switchyard-tls/sources.tsv; do
   [ -f "$RUNTIME/$required_notice" ] || {
     echo "release runtime is missing notice $required_notice" >&2
     exit 1

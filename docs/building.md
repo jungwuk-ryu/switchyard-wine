@@ -36,7 +36,7 @@ Inspect the source identity that would be written to a runtime manifest with:
 ./switchyard/build_runtime.sh
 ```
 
-The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, a pinned x86_64 conda-forge GnuTLS dependency closure, and the pinned redistributable Noto font set into user-local caches. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, font-asset, and core-binary integrity metadata.
+The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, a pinned x86_64 GnuTLS dependency closure, and the pinned redistributable Noto font set into user-local caches. GnuTLS packages come from conda-forge; the legacy libunistring ABI is rebuilt from pinned GNU source so the resulting library can be Developer ID signed and translated reliably by Rosetta. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, font-asset, and core-binary integrity metadata.
 
 The font set supplies regular faces for every Noto family referenced by Wine's DirectWrite fallback table, common bold faces, symbols, and the Japanese, Korean, Simplified Chinese, Traditional Chinese, and Hong Kong faces from Noto Sans CJK. The unmodified files are installed in `share/wine/fonts`, so they are visible to every prefix without copying fonts into `C:\\Windows\\Fonts`. Their pinned URLs and SHA-256 values live in `switchyard/font-assets.tsv`; SIL Open Font License 1.1 notices are copied into the runtime.
 
@@ -62,7 +62,7 @@ Useful overrides include:
 - `GPTK_PATH`: user-selected local GPTK path; and
 - `SWITCHYARD_DISABLE_GPTK_OVERLAY=1`: force a Wine-only build without reading or copying GPTK;
 - `FONT_ASSET_DOWNLOAD_CACHE_DIR`: cache for the verified redistributable font files;
-- `TLS_PACKAGE_CACHE_DIR`: cache for the pinned, hash-verified x86_64 conda-forge TLS packages.
+- `TLS_PACKAGE_CACHE_DIR`: cache for the pinned, hash-verified x86_64 TLS packages and source archives.
 
 To reuse a complete runtime with exactly matching inputs:
 

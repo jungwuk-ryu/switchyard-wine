@@ -1,0 +1,3 @@
+# Redistributable source-built x86_64 macOS TLS runtime dependencies.
+# Fields: name, version, filename, url, sha256
+libunistring	0.9.10	libunistring-0.9.10.tar.gz	https://ftpmirror.gnu.org/gnu/libunistring/libunistring-0.9.10.tar.gz	a82e5b333339a88ea4608e4635479a1cfb2e01aafb925e1290b65710d43f610b

@@ -67,8 +67,10 @@ FONT_ALIAS_POSTSCRIPT="ArialUnicodeMS"
 FONT_ALIAS_FACE_INDEX=1
 FONT_ALIAS_SHA256="ccdd3bd646d95b31513e10ad9c975d878c0ef8b25ff2d92f2e635b50218b128e"
 TLS_PACKAGE_MANIFEST="$ROOT_DIR/switchyard/tls-deps.tsv"
+TLS_SOURCE_MANIFEST="$ROOT_DIR/switchyard/tls-source-deps.tsv"
 TLS_PACKAGE_BASE_URL="https://conda.anaconda.org/conda-forge/osx-64"
-TLS_RUNTIME_LAYOUT_VERSION="3"
+TLS_RUNTIME_LAYOUT_VERSION="5"
+TLS_MIN_MACOS_VERSION="14.0"
 TLS_PACKAGE_CACHE_DIR="${TLS_PACKAGE_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/TLS/packages}"
 TLS_DEPS_CACHE_DIR="${TLS_DEPS_CACHE_DIR:-${HOME}/.switchyard/deps/tls}"
 USER_SET_WINE_BUILD_DIR="${WINE_BUILD_DIR+x}"
@@ -788,6 +790,40 @@ download_tls_package() {
   printf '%s\n' "$cached_file"
 }
 
+download_tls_source() {
+  local source_name="$1"
+  local filename="$2"
+  local url="$3"
+  local expected_hash="$4"
+  local cached_file="$TLS_PACKAGE_CACHE_DIR/$filename"
+  local temporary_file
+  local actual_hash
+
+  mkdir -p "$TLS_PACKAGE_CACHE_DIR"
+  if [ -f "$cached_file" ]; then
+    actual_hash="$(sha256_file "$cached_file")"
+    if [ "$actual_hash" = "$expected_hash" ]; then
+      printf '%s\n' "$cached_file"
+      return 0
+    fi
+    echo "cached $source_name source has unexpected sha256 $actual_hash; downloading again." >&2
+    rm -f "$cached_file"
+  fi
+
+  temporary_file="${cached_file}.tmp.$$"
+  rm -f "$temporary_file"
+  curl -fL --retry 3 --retry-delay 1 --proto '=https' --tlsv1.2 \
+    -o "$temporary_file" "$url"
+  actual_hash="$(sha256_file "$temporary_file")"
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    rm -f "$temporary_file"
+    echo "$source_name source has unexpected sha256 $actual_hash; expected $expected_hash." >&2
+    exit 1
+  fi
+  mv "$temporary_file" "$cached_file"
+  printf '%s\n' "$cached_file"
+}
+
 extract_tls_package() {
   local archive="$1"
   local destination="$2"
@@ -829,6 +865,17 @@ stage_tls_deps() {
   local package_root
   local package_notice_root
   local package_pool
+  local source_name
+  local source_version
+  local source_filename
+  local source_url
+  local source_hash
+  local source_archive
+  local source_work
+  local source_root
+  local source_build
+  local source_prefix
+  local source_log
   local closure_file
   local previous_file
   local source_library
@@ -842,8 +889,12 @@ stage_tls_deps() {
     echo "missing pinned TLS package manifest at $TLS_PACKAGE_MANIFEST" >&2
     exit 1
   fi
-  manifest_digest="$({ /bin/cat "$TLS_PACKAGE_MANIFEST"; /usr/bin/printf '%s\n' "$TLS_RUNTIME_LAYOUT_VERSION"; } | short_sha256_stream)"
-  tls_deps_prefix="$TLS_DEPS_CACHE_DIR/x86_64-conda-gnutls-${manifest_digest}"
+  if [ ! -f "$TLS_SOURCE_MANIFEST" ]; then
+    echo "missing pinned TLS source manifest at $TLS_SOURCE_MANIFEST" >&2
+    exit 1
+  fi
+  manifest_digest="$({ /bin/cat "$TLS_PACKAGE_MANIFEST" "$TLS_SOURCE_MANIFEST"; /usr/bin/printf '%s\n' "$TLS_RUNTIME_LAYOUT_VERSION"; } | short_sha256_stream)"
+  tls_deps_prefix="$TLS_DEPS_CACHE_DIR/x86_64-gnutls-${manifest_digest}"
   if content_tree_is_verified "$tls_deps_prefix" &&
      [ -f "$tls_deps_prefix/lib/libgnutls.30.dylib" ] &&
      [ -f "$tls_deps_prefix/lib/pkgconfig/gnutls.pc" ] &&
@@ -902,6 +953,85 @@ stage_tls_deps() {
       >> "$temporary_prefix/share/doc/switchyard-tls/manifest.tsv"
     rm -rf "$package_root"
   done < "$TLS_PACKAGE_MANIFEST"
+
+  while IFS=$'\t' read -r source_name source_version source_filename source_url source_hash extra; do
+    case "$source_name" in
+      ''|'#'*) continue ;;
+    esac
+    if [ -n "${extra:-}" ] || [ -z "$source_hash" ]; then
+      echo "invalid TLS source manifest row for $source_name" >&2
+      exit 1
+    fi
+    if [ "$source_name" != "libunistring" ]; then
+      echo "unsupported TLS source build $source_name" >&2
+      exit 1
+    fi
+
+    source_archive="$(download_tls_source \
+      "$source_name" "$source_filename" "$source_url" "$source_hash")"
+    source_work="${temporary_prefix}.${source_name}-source"
+    source_root="$source_work/$source_name-$source_version"
+    source_build="$source_work/build"
+    source_prefix="$source_work/prefix"
+    source_log="$source_work/build.log"
+    rm -rf "$source_work"
+    mkdir -p "$source_work" "$source_build" "$source_prefix"
+    tar -xzf "$source_archive" -C "$source_work"
+    [ -x "$source_root/configure" ] || {
+      echo "$source_name source archive has no configure script" >&2
+      exit 1
+    }
+
+    echo "building source-pinned x86_64 $source_name $source_version" >&2
+    if ! (
+      cd "$source_build"
+      env \
+        CC='clang -arch x86_64' \
+        CXX='clang++ -arch x86_64' \
+        CFLAGS="-O2 -mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
+        CXXFLAGS="-O2 -mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
+        LDFLAGS="-mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
+        MACOSX_DEPLOYMENT_TARGET="$TLS_MIN_MACOS_VERSION" \
+        "$source_root/configure" \
+          --build=arm-apple-darwin \
+          --host=x86_64-apple-darwin \
+          --prefix="$source_prefix" \
+          --disable-static \
+          --enable-shared
+      make -j"$JOBS"
+      make install
+    ) >"$source_log" 2>&1; then
+      /bin/cat "$source_log" >&2
+      exit 1
+    fi
+    if [ ! -f "$source_prefix/lib/libunistring.2.dylib" ] ||
+       ! file "$source_prefix/lib/libunistring.2.dylib" | grep -q 'x86_64'; then
+      echo "$source_name source build did not produce the expected x86_64 library" >&2
+      exit 1
+    fi
+    install -m 0644 "$source_prefix/lib/libunistring.2.dylib" \
+      "$package_pool/lib/libunistring.2.dylib"
+    install_name_tool -id '@rpath/libunistring.2.dylib' \
+      "$package_pool/lib/libunistring.2.dylib"
+
+    package_notice_root="$temporary_prefix/share/doc/switchyard-tls/packages/$source_name"
+    mkdir -p "$package_notice_root/licenses"
+    install -m 0644 "$source_root/COPYING.LIB" "$package_notice_root/licenses/COPYING.LIB"
+    if [ -f "$source_root/COPYING" ]; then
+      install -m 0644 "$source_root/COPYING" "$package_notice_root/licenses/COPYING"
+    fi
+    cat >"$package_notice_root/source.txt" <<EOF
+Name: $source_name
+Version: $source_version
+Source: $source_url
+SHA-256: $source_hash
+Build: x86_64 macOS, minimum version $TLS_MIN_MACOS_VERSION
+EOF
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$source_name" "$source_version" "source-xcode" "$source_filename" "$source_hash" \
+      >> "$temporary_prefix/share/doc/switchyard-tls/manifest.tsv"
+    rm -rf "$source_work"
+  done < "$TLS_SOURCE_MANIFEST"
 
   if [ ! -f "$package_pool/lib/libgnutls.30.dylib" ] ||
      [ ! -f "$temporary_prefix/include/gnutls/gnutls.h" ]; then
@@ -1007,13 +1137,16 @@ EOF
 
   cat >"$temporary_prefix/share/doc/switchyard-tls/README.txt" <<EOF
 This directory contains the pinned x86_64 macOS GnuTLS dependency closure used
-by Switchyard Wine for schannel support. Every package is downloaded from the
-conda-forge osx-64 channel and verified against switchyard/tls-deps.tsv before
-staging. The package manifest, original package metadata, and license notices
-are preserved alongside the libraries for redistribution and source tracing.
+by Switchyard Wine for schannel support. Binary packages are downloaded from
+the conda-forge osx-64 channel, while the legacy libunistring ABI is rebuilt
+from its pinned GNU source for modern macOS signing and Rosetta compatibility.
+Every input is hash-verified before staging. Package metadata, source identity,
+and license notices are preserved for redistribution and source tracing.
 EOF
   install -m 0644 "$TLS_PACKAGE_MANIFEST" \
     "$temporary_prefix/share/doc/switchyard-tls/packages.tsv"
+  install -m 0644 "$TLS_SOURCE_MANIFEST" \
+    "$temporary_prefix/share/doc/switchyard-tls/sources.tsv"
 
   test_source="$temporary_prefix/gnutls-link-test.c"
   test_binary="$temporary_prefix/gnutls-link-test"
@@ -1655,7 +1788,7 @@ x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows
     printf '    "digest": %s,\n' "$(json_string "$tls_deps_digest")"
     printf '    "architecture": "x86_64",\n'
     printf '    "dlopenName": %s,\n' "$(json_string "$TLS_DLOPEN_NAME")"
-    printf '    "license": "redistributable conda-forge GnuTLS dependency closure with package notices",\n'
+    printf '    "license": "redistributable conda-forge and source-built GnuTLS dependency closure with notices",\n'
     printf '    "packageManifest": "lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv",\n'
     printf '    "sourceNote": "lib/switchyard-tls/share/doc/switchyard-tls/README.txt"\n'
     printf '  },\n'
