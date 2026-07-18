@@ -3478,6 +3478,7 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT 8
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK 0x0f00
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE 0x1000
+#define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_RESOURCE_OUTPUT_VTABLE 0x2000
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
@@ -4077,7 +4078,9 @@ static ULONG switchyard_d3d11_device_child_output_flags( unsigned int output_arg
 static ULONG switchyard_com_vtable_entry_flags( unsigned int index )
 {
     /* QueryInterface always returns the requested interface through argument 2. */
-    return index ? 0 : switchyard_com_iunknown_output_flags( 2 );
+    if (index) return 0;
+    return switchyard_com_iunknown_output_flags( 2 ) |
+           SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_RESOURCE_OUTPUT_VTABLE;
 }
 
 static ULONG switchyard_dxgi_factory_vtable_entry_flags( unsigned int index )
@@ -4240,8 +4243,19 @@ static ULONG switchyard_d3d11_device_context_vtable_entry_flags( unsigned int in
 static void switchyard_wrap_com_iunknown_output_vtable(
     const struct switchyard_native_callback_params *params )
 {
+    static const GUID iid_idxgi_resource =
+    {
+        0x035f3ab4, 0x482e, 0x4e50, { 0xb4, 0x1f, 0x8a, 0x7f, 0x8b, 0xd8, 0x96, 0x0b }
+    };
+    static const GUID iid_idxgi_resource1 =
+    {
+        0x30961379, 0x4609, 0x4a41, { 0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1 }
+    };
+    static const BYTE dxgi_resource_argc[] = { 3, 2, 2, 2, 2, 3, 5 };
     unsigned int output_arg = (params->flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) >>
                               SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT;
+    unsigned int dxgi_resource_entries = 0;
+    ULONG query_interface_flags = switchyard_com_vtable_entry_flags( 0 );
     void **vtable;
     void *object;
 
@@ -4254,10 +4268,10 @@ static void switchyard_wrap_com_iunknown_output_vtable(
 
         TRACE( "wrapping COM output %p object %p IUnknown vtable %p\n",
                (void *)params->args[output_arg], object, vtable );
-        switchyard_wrap_native_callback_vtable_slot(
-            &vtable[0], 3, switchyard_com_iunknown_output_flags( 2 ) |
-                              (params->flags &
-                               SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE) );
+        if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE)
+            query_interface_flags |=
+                SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE;
+        switchyard_wrap_native_callback_vtable_slot( &vtable[0], 3, query_interface_flags );
         switchyard_wrap_native_callback_vtable_slot( &vtable[1], 1, 0 );
         switchyard_wrap_native_callback_vtable_slot( &vtable[2], 1, 0 );
         if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE)
@@ -4269,6 +4283,31 @@ static void switchyard_wrap_com_iunknown_output_vtable(
             for (i = 3; i < 7; ++i)
                 switchyard_wrap_native_callback_vtable_slot(
                     &vtable[i], SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS, 0 );
+        }
+        if ((params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_RESOURCE_OUTPUT_VTABLE) &&
+            params->argc == 3 && output_arg == 2 && params->args[1])
+        {
+            const GUID *iid = (const GUID *)params->args[1];
+
+            if (!memcmp( iid, &iid_idxgi_resource, sizeof(*iid) ))
+                dxgi_resource_entries = 12;
+            else if (!memcmp( iid, &iid_idxgi_resource1, sizeof(*iid) ))
+                dxgi_resource_entries = 14;
+        }
+        if (dxgi_resource_entries)
+        {
+            unsigned int i;
+
+            TRACE( "wrapping IDXGIResource%s vtable %p\n",
+                   dxgi_resource_entries == 14 ? "1" : "", vtable );
+            for (i = 7; i < dxgi_resource_entries; ++i)
+            {
+                ULONG flags = i == 7 || i == 12 ?
+                              switchyard_com_iunknown_output_flags( 2 ) : 0;
+
+                switchyard_wrap_native_callback_vtable_slot(
+                    &vtable[i], dxgi_resource_argc[i - 7], flags );
+            }
         }
     }
     __EXCEPT_PAGE_FAULT

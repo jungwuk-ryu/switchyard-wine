@@ -50,6 +50,15 @@ Native Mach-O `__DATA` vtables may not exist in Wine's virtual-memory map.
 read-only. A page-fault-protected direct pointer store is a valid fallback when
 the host mapping is writable.
 
+Vuplex 3D WebView exposed the same boundary beyond the device-child methods.
+It queried a shared D3D11 texture for `IDXGIResource` and called vtable slot 8,
+`GetSharedHandle`, while only slots 0 through 6 were bridged. Propagate an
+exact-IID check through wrapped `QueryInterface` calls and bridge the derived
+`IDXGIResource` and `IDXGIResource1` slots as well. D3DMetal 3.0 still returns
+`E_NOTIMPL` for the legacy shared-resource pair, so this converts the Unity
+crash into a graceful webview initialization failure; it does not make the
+browser texture available across processes.
+
 ### DbgHelp symbol search failure
 
 The early crash was `0xc0000005` inside

@@ -106,3 +106,11 @@ implementation with:
 ```sh
 ./switchyard/tests/runtime_tls_smoke_test.sh ~/.switchyard/runtimes/<runtime-id>
 ```
+
+For a runtime with the GPTK overlay, exercise D3DMetal's shared DXGI resource
+callbacks from a fresh prefix with:
+
+```sh
+./switchyard/tests/d3dmetal_dxgi_resource_smoke_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
