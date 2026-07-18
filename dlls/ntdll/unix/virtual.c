@@ -2537,8 +2537,9 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
 
 #ifdef __APPLE__
     /* Hardened Runtime prevents executable protection on file-backed PE image pages.
-     * Keep the image in the anonymous view so that the final mprotect(PROT_EXEC) succeeds. */
-    if (view->protect & SEC_IMAGE) try_mmap = FALSE;
+     * Keep private image pages in the anonymous view so that the final mprotect(PROT_EXEC)
+     * succeeds, but preserve the file backing required by writable shared sections. */
+    if ((view->protect & SEC_IMAGE) && !(vprot & VPROT_WRITE)) try_mmap = FALSE;
 #endif
 
     if (try_mmap)

@@ -2117,6 +2117,44 @@ static void test_section_access(void)
     }
 }
 
+static void test_shared_image_section(void)
+{
+    static const BYTE shared_data[0x200] = "shared section data";
+    IMAGE_SECTION_HEADER shared_section = {0};
+    IMAGE_NT_HEADERS nt_header = nt_header_template;
+    char dll_name[MAX_PATH];
+    HMODULE module;
+
+    nt_header.FileHeader.NumberOfSections = 1;
+    nt_header.OptionalHeader.SectionAlignment = page_size;
+    nt_header.OptionalHeader.FileAlignment = sizeof(shared_data);
+    nt_header.OptionalHeader.SizeOfHeaders = sizeof(shared_data);
+    nt_header.OptionalHeader.SizeOfImage = page_size * 2;
+    nt_header.OptionalHeader.SizeOfInitializedData = sizeof(shared_data);
+
+    memcpy( shared_section.Name, ".mdata", sizeof(".mdata") );
+    shared_section.Misc.VirtualSize = sizeof(shared_data);
+    shared_section.VirtualAddress = page_size;
+    shared_section.SizeOfRawData = sizeof(shared_data);
+    shared_section.PointerToRawData = nt_header.OptionalHeader.FileAlignment;
+    shared_section.Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+                                    IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_SHARED;
+
+    create_test_dll_sections( &dos_header, &nt_header, &shared_section, shared_data, dll_name );
+
+    SetLastError( 0xdeadbeef );
+    module = LoadLibraryExA( dll_name, NULL, DONT_RESOLVE_DLL_REFERENCES );
+    ok( module != NULL, "LoadLibraryExA failed, error %lu.\n", GetLastError() );
+    if (module)
+    {
+        ok( !memcmp( (const BYTE *)module + shared_section.VirtualAddress,
+                     shared_data, sizeof(shared_data) ), "Shared section data was not preserved.\n" );
+        FreeLibrary( module );
+    }
+
+    DeleteFileA( dll_name );
+}
+
 static void test_security_cookie_readonly(void)
 {
     /* a PE whose load-config SecurityCookie points into a
@@ -5007,6 +5045,7 @@ START_TEST(loader)
     test_ResolveDelayLoadedAPI();
     test_ImportDescriptors();
     test_section_access();
+    test_shared_image_section();
     test_security_cookie_readonly();
     test_import_resolution();
     test_export_forwarder_dep_chain();
