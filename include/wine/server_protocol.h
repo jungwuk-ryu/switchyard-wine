@@ -1305,6 +1305,9 @@ struct get_process_native_info_reply
     int          unix_pid;
     unsigned int power_control;
     unsigned int power_state;
+    unsigned __int64 cycle_time;
+    int          terminated;
+    char __pad_36[4];
 };
 
 
@@ -7280,6 +7283,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 954
+#define SERVER_PROTOCOL_VERSION 955
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

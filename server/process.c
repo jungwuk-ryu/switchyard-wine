@@ -51,6 +51,10 @@
 #ifdef HAVE_LIBPROCSTAT
 # include <libprocstat.h>
 #endif
+#ifdef __APPLE__
+# include <libproc.h>
+# include <sys/resource.h>
+#endif
 
 #include "ntstatus.h"
 #include "winternl.h"
@@ -713,7 +717,8 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     list_init( &process->classes );
     list_init( &process->views );
 
-    process->end_time = 0;
+    process->end_time   = 0;
+    process->cycle_time = 0;
 
     if (sd && !default_set_sd( &process->obj, sd, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
                                DACL_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION ))
@@ -986,6 +991,14 @@ void kill_console_processes( struct thread *renderer, int exit_code )
 /* a process has been killed (i.e. its last thread died) */
 static void process_killed( struct process *process )
 {
+#ifdef __APPLE__
+    struct rusage_info_v4 usage;
+
+    if (process->unix_pid != -1 &&
+        !proc_pid_rusage( process->unix_pid, RUSAGE_INFO_V4, (rusage_info_t *)&usage ))
+        process->cycle_time = usage.ri_cycles;
+#endif
+
     assert( list_empty( &process->thread_list ));
     process->end_time = current_time;
     close_process_desktop( process );
@@ -1574,6 +1587,8 @@ DECL_HANDLER(get_process_native_info)
         reply->unix_pid = process->unix_pid;
         reply->power_control = process->power_control;
         reply->power_state = process->power_state;
+        reply->cycle_time = process->cycle_time;
+        reply->terminated = !!process->end_time;
         release_object( process );
     }
 }

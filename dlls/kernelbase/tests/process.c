@@ -621,7 +621,11 @@ static void test_MapViewOfFileFromApp(void)
 
 static void test_QueryProcessCycleTime(void)
 {
+    STARTUPINFOA startup = {sizeof(startup)};
+    PROCESS_INFORMATION process;
+    char command[] = "cmd.exe /c exit 0";
     ULONG64 cycles1, cycles2;
+    DWORD wait;
     BOOL ret;
 
     ret = QueryProcessCycleTime( GetCurrentProcess(), &cycles1 );
@@ -633,6 +637,21 @@ static void test_QueryProcessCycleTime(void)
     ok( cycles2 >= cycles1, "CPU cycles used by process should not decrease.\n" );
     todo_wine_if( cycles2 == cycles1 )
     ok( cycles2 > cycles1, "CPU cycles used by process should be increasing.\n" );
+
+    ret = CreateProcessA( NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                          NULL, NULL, &startup, &process );
+    ok( ret, "CreateProcessA failed, error %lu.\n", GetLastError() );
+    if (!ret) return;
+
+    CloseHandle( process.hThread );
+    wait = WaitForSingleObject( process.hProcess, 30000 );
+    ok( wait == WAIT_OBJECT_0, "WaitForSingleObject returned %#lx.\n", wait );
+
+    Sleep( 1000 );
+    SetLastError( 0xdeadbeef );
+    ret = QueryProcessCycleTime( process.hProcess, &cycles1 );
+    ok( ret, "QueryProcessCycleTime failed for an exited process, error %lu.\n", GetLastError() );
+    CloseHandle( process.hProcess );
 }
 
 static void test_AppPolicy(void)

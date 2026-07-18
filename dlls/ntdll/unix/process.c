@@ -1599,18 +1599,25 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
             {
                 PROCESS_CYCLE_TIME_INFORMATION cycles = {0};
                 int unix_pid = -1;
+                BOOL terminated = FALSE;
 
                 SERVER_START_REQ( get_process_native_info )
                 {
                     req->handle = wine_server_obj_handle( handle );
-                    if (!(ret = wine_server_call( req ))) unix_pid = reply->unix_pid;
+                    if (!(ret = wine_server_call( req )))
+                    {
+                        unix_pid = reply->unix_pid;
+                        cycles.AccumulatedCycles = reply->cycle_time;
+                        cycles.CurrentCycleCount = reply->cycle_time;
+                        terminated = reply->terminated;
+                    }
                 }
                 SERVER_END_REQ;
 
                 if (!ret)
                 {
-                    if (!get_process_cycle_time( unix_pid, &cycles )) ret = STATUS_NOT_SUPPORTED;
-                    else memcpy(info, &cycles, sizeof(PROCESS_CYCLE_TIME_INFORMATION));
+                    if (!terminated) get_process_cycle_time( unix_pid, &cycles );
+                    memcpy(info, &cycles, sizeof(PROCESS_CYCLE_TIME_INFORMATION));
                 }
             }
         }

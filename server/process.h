@@ -57,6 +57,7 @@ struct process
     int                  user_threads;    /* number of user threads running in this process */
     timeout_t            start_time;      /* absolute time at process start */
     timeout_t            end_time;        /* absolute time at process end */
+    unsigned __int64     cycle_time;      /* final host process cycle count */
     affinity_t           affinity;        /* process affinity mask */
     int                  priority;        /* priority class */
     int                  base_priority;   /* base priority to calculate thread priority */

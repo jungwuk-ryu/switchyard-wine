@@ -226,6 +226,8 @@ static void dump_get_process_native_info_reply( const struct get_process_native_
     fprintf( stderr, ", unix_pid=%d", req->unix_pid );
     fprintf( stderr, ", power_control=%08x", req->power_control );
     fprintf( stderr, ", power_state=%08x", req->power_state );
+    dump_uint64( ", cycle_time=", &req->cycle_time );
+    fprintf( stderr, ", terminated=%d", req->terminated );
 }
 
 static void dump_get_process_debug_info_request( const struct get_process_debug_info_request *req )

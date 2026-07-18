@@ -1252,6 +1252,8 @@ typedef volatile struct
     int          unix_pid;         /* Unix process id */
     unsigned int power_control;    /* process power throttling control mask */
     unsigned int power_state;      /* process power throttling state mask */
+    unsigned __int64 cycle_time;   /* final host process cycle count */
+    int          terminated;       /* whether the process has terminated */
 @END
 
 
