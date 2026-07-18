@@ -27,6 +27,7 @@
 #include "windef.h"
 #include "winnt.h"
 #include "winioctl.h"
+#include "winerror.h"
 #include "winternl.h"
 #include "delayloadhandler.h"
 
@@ -3479,6 +3480,11 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK 0x0f00
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE 0x1000
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_RESOURCE_OUTPUT_VTABLE 0x2000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_CHILD_RELEASE 0x4000
+#define SWITCHYARD_NATIVE_CALLBACK_DXGI_RESOURCE_GET_SHARED_HANDLE 0x8000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_OPEN_SHARED_RESOURCE 0x10000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_UPDATE_SUBRESOURCE 0x20000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE 0x40000
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
@@ -3525,6 +3531,16 @@ struct switchyard_native_callback_params
     ULONG_PTR args[SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS];
 };
 
+#define SWITCHYARD_NATIVE_CALLBACK_THUNK_INFO_MAGIC 0x53595754484e4b31ULL
+struct switchyard_native_callback_thunk_info
+{
+    ULONGLONG magic;
+    void *target;
+    ULONG argc;
+    ULONG flags;
+    ULONGLONG reserved;
+};
+
 C_ASSERT( FIELD_OFFSET( struct switchyard_pe_callback_params, func ) == SWITCHYARD_PE_CALLBACK_FUNC_OFFSET );
 C_ASSERT( FIELD_OFFSET( struct switchyard_pe_callback_params, argc ) == SWITCHYARD_PE_CALLBACK_ARGC_OFFSET );
 C_ASSERT( FIELD_OFFSET( struct switchyard_pe_callback_params, args ) == SWITCHYARD_PE_CALLBACK_ARGS_OFFSET );
@@ -3532,9 +3548,13 @@ C_ASSERT( FIELD_OFFSET( struct switchyard_native_callback_params, func ) == SWIT
 C_ASSERT( FIELD_OFFSET( struct switchyard_native_callback_params, argc ) == SWITCHYARD_NATIVE_CALLBACK_ARGC_OFFSET );
 C_ASSERT( FIELD_OFFSET( struct switchyard_native_callback_params, flags ) == SWITCHYARD_NATIVE_CALLBACK_FLAGS_OFFSET );
 C_ASSERT( FIELD_OFFSET( struct switchyard_native_callback_params, args ) == SWITCHYARD_NATIVE_CALLBACK_ARGS_OFFSET );
+C_ASSERT( sizeof(struct switchyard_native_callback_thunk_info) == 32 );
 
 static void wrap_native_callback_entry_with_flags( void **slot, unsigned int argc, ULONG flags );
+static BOOL is_native_callback_thunk( const void *ptr );
 static BOOL is_native_callback_target( void *func );
+static BOOL switchyard_get_native_callback_thunk_info(
+    void *thunk, void **target, unsigned int *argc, ULONG *flags );
 static void *create_native_callback_thunk( void *func, unsigned int argc, ULONG flags );
 static void **switchyard_gfxt_deferred_vtable;
 
@@ -4039,13 +4059,34 @@ static BOOL switchyard_wrap_native_callback_jump_table_entry( void *entry, unsig
     return switchyard_wrap_protected_native_callback_entry( slot, argc, flags );
 }
 
-static BOOL switchyard_wrap_native_callback_vtable_slot( void **slot, unsigned int argc,
-                                                          ULONG flags )
+static BOOL switchyard_wrap_native_callback_vtable_slot_locked(
+    void **slot, unsigned int argc, ULONG flags )
 {
     void *entry, *thunk;
 
     if (!slot) return FALSE;
     entry = *slot;
+    if (is_native_callback_thunk( entry ))
+    {
+        unsigned int old_argc;
+        ULONG old_flags;
+        void *target;
+
+        if (!switchyard_get_native_callback_thunk_info(
+                entry, &target, &old_argc, &old_flags )) return FALSE;
+        if ((flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) &&
+            (old_flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) &&
+            (flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) !=
+            (old_flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)) return FALSE;
+        argc = max( argc, old_argc );
+        flags |= old_flags;
+        if (argc == old_argc && flags == old_flags) return TRUE;
+        if (!(thunk = create_native_callback_thunk( target, argc, flags ))) return FALSE;
+        if (!switchyard_store_native_callback_thunk( slot, thunk )) return FALSE;
+        TRACE( "upgraded COM vtable slot %p argc %u flags %#lx thunk %p\n",
+               slot, argc, flags, thunk );
+        return TRUE;
+    }
     if (switchyard_get_native_callback_jump_table_slot( entry, NULL ))
     {
         if (!(thunk = create_native_callback_thunk( entry, argc, flags ))) return FALSE;
@@ -4061,6 +4102,17 @@ static BOOL switchyard_wrap_native_callback_vtable_slot( void **slot, unsigned i
     }
 
     return switchyard_wrap_protected_native_callback_entry( slot, argc, flags );
+}
+
+static BOOL switchyard_wrap_native_callback_vtable_slot(
+    void **slot, unsigned int argc, ULONG flags )
+{
+    BOOL ret;
+
+    RtlEnterCriticalSection( &loader_section );
+    ret = switchyard_wrap_native_callback_vtable_slot_locked( slot, argc, flags );
+    RtlLeaveCriticalSection( &loader_section );
+    return ret;
 }
 
 static ULONG switchyard_com_iunknown_output_flags( unsigned int output_arg )
@@ -4160,6 +4212,7 @@ static ULONG switchyard_dxgi_swapchain_vtable_entry_flags( unsigned int index )
 static ULONG switchyard_d3d11_device_vtable_entry_flags( unsigned int index )
 {
     unsigned int output_arg;
+    ULONG flags;
 
     switch (index)
     {
@@ -4231,13 +4284,34 @@ static ULONG switchyard_d3d11_device_vtable_entry_flags( unsigned int index )
         return 0;
     }
 
-    return switchyard_d3d11_device_child_output_flags( output_arg );
+    flags = switchyard_d3d11_device_child_output_flags( output_arg );
+    if (index == 28)
+        flags |= SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_OPEN_SHARED_RESOURCE;
+    return flags;
 }
 
 static ULONG switchyard_d3d11_device_context_vtable_entry_flags( unsigned int index )
 {
-    /* ID3D11DeviceContext::FinishCommandList returns a new command-list object. */
-    return index == 114 ? switchyard_d3d11_device_child_output_flags( 2 ) : 0;
+    switch (index)
+    {
+    case 48: /* UpdateSubresource */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_UPDATE_SUBRESOURCE;
+    case 12: /* DrawIndexed */
+    case 13: /* Draw */
+    case 20: /* DrawIndexedInstanced */
+    case 21: /* DrawInstanced */
+    case 38: /* DrawAuto */
+    case 39: /* DrawIndexedInstancedIndirect */
+    case 40: /* DrawInstancedIndirect */
+    case 41: /* Dispatch */
+    case 42: /* DispatchIndirect */
+    case 58: /* ExecuteCommandList */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE;
+    case 114: /* FinishCommandList */
+        return switchyard_d3d11_device_child_output_flags( 2 );
+    default:
+        return 0;
+    }
 }
 
 static void switchyard_wrap_com_iunknown_output_vtable(
@@ -4251,10 +4325,16 @@ static void switchyard_wrap_com_iunknown_output_vtable(
     {
         0x30961379, 0x4609, 0x4a41, { 0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1 }
     };
+    static const GUID iid_d3d11_texture2d =
+    {
+        0x6f15aaf2, 0xd208, 0x4e89, { 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c }
+    };
     static const BYTE dxgi_resource_argc[] = { 3, 2, 2, 2, 2, 3, 5 };
+    static const BYTE d3d11_texture2d_argc[] = { 2, 2, 2, 2 };
     unsigned int output_arg = (params->flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) >>
                               SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT;
     unsigned int dxgi_resource_entries = 0;
+    BOOL d3d11_texture2d = FALSE;
     ULONG query_interface_flags = switchyard_com_vtable_entry_flags( 0 );
     void **vtable;
     void *object;
@@ -4273,7 +4353,10 @@ static void switchyard_wrap_com_iunknown_output_vtable(
                 SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE;
         switchyard_wrap_native_callback_vtable_slot( &vtable[0], 3, query_interface_flags );
         switchyard_wrap_native_callback_vtable_slot( &vtable[1], 1, 0 );
-        switchyard_wrap_native_callback_vtable_slot( &vtable[2], 1, 0 );
+        switchyard_wrap_native_callback_vtable_slot(
+            &vtable[2], 1, params->flags &
+                              SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE ?
+                              SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_CHILD_RELEASE : 0 );
         if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE)
         {
             unsigned int i;
@@ -4293,6 +4376,8 @@ static void switchyard_wrap_com_iunknown_output_vtable(
                 dxgi_resource_entries = 12;
             else if (!memcmp( iid, &iid_idxgi_resource1, sizeof(*iid) ))
                 dxgi_resource_entries = 14;
+            else if (!memcmp( iid, &iid_d3d11_texture2d, sizeof(*iid) ))
+                d3d11_texture2d = TRUE;
         }
         if (dxgi_resource_entries)
         {
@@ -4305,15 +4390,838 @@ static void switchyard_wrap_com_iunknown_output_vtable(
                 ULONG flags = i == 7 || i == 12 ?
                               switchyard_com_iunknown_output_flags( 2 ) : 0;
 
+                if (i == 8)
+                    flags |= SWITCHYARD_NATIVE_CALLBACK_DXGI_RESOURCE_GET_SHARED_HANDLE;
+
                 switchyard_wrap_native_callback_vtable_slot(
                     &vtable[i], dxgi_resource_argc[i - 7], flags );
             }
+        }
+        if (d3d11_texture2d)
+        {
+            unsigned int i;
+
+            TRACE( "wrapping ID3D11Texture2D resource vtable %p\n", vtable );
+            for (i = 7; i <= 10; ++i)
+                switchyard_wrap_native_callback_vtable_slot(
+                    &vtable[i], d3d11_texture2d_argc[i - 7], 0 );
         }
     }
     __EXCEPT_PAGE_FAULT
     {
     }
     __ENDTRY
+}
+
+#define SWITCHYARD_D3D11_RESOURCE_MISC_SHARED 0x00000002
+#define SWITCHYARD_D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX 0x00000100
+#define SWITCHYARD_D3D11_RESOURCE_MISC_SHARED_NTHANDLE 0x00000800
+#define SWITCHYARD_D3D11_BIND_SHADER_RESOURCE 0x00000008
+#define SWITCHYARD_D3D11_BIND_RENDER_TARGET 0x00000020
+#define SWITCHYARD_DXGI_FORMAT_B8G8R8A8_UNORM 87
+#define SWITCHYARD_D3D_SHARED_TOKEN_MASK 0xf0000000u
+#define SWITCHYARD_D3D_SHARED_TOKEN_TAG 0xe0000000u
+#define SWITCHYARD_D3D_SHARED_SECTION_MAGIC 0x5359443344534852ULL
+#define SWITCHYARD_D3D_SHARED_SECTION_VERSION 1
+#define SWITCHYARD_D3D_SHARED_HASH_SIZE 64
+
+struct switchyard_d3d11_texture2d_desc
+{
+    UINT width;
+    UINT height;
+    UINT mip_levels;
+    UINT array_size;
+    UINT format;
+    UINT sample_count;
+    UINT sample_quality;
+    UINT usage;
+    UINT bind_flags;
+    UINT cpu_access_flags;
+    UINT misc_flags;
+};
+
+struct switchyard_d3d_shared_section
+{
+    ULONGLONG magic;
+    UINT version;
+    UINT header_size;
+    struct switchyard_d3d11_texture2d_desc desc;
+    UINT token;
+    UINT row_pitch;
+    UINT payload_size;
+    UINT reserved;
+    DECLSPEC_ALIGN(8) volatile LONGLONG sequence;
+    LONGLONG reserved2;
+};
+
+struct switchyard_d3d_shared_texture
+{
+    struct list entry;
+    struct list owner_entry;
+    void *texture;
+    void *alias;
+    void *device;
+    HANDLE section;
+    HANDLE mutant;
+    void *mapping;
+    SIZE_T mapping_size;
+    ULONGLONG last_sequence;
+    BOOL owner;
+    BOOL retained;
+};
+
+struct switchyard_d3d_context_device
+{
+    struct list entry;
+    void *context;
+    void *device;
+};
+
+C_ASSERT( !(FIELD_OFFSET( struct switchyard_d3d_shared_section, sequence ) & 7) );
+
+static RTL_CRITICAL_SECTION switchyard_d3d_shared_section;
+static RTL_CRITICAL_SECTION_DEBUG switchyard_d3d_shared_section_debug =
+{
+    0, 0, &switchyard_d3d_shared_section,
+    { &switchyard_d3d_shared_section_debug.ProcessLocksList,
+      &switchyard_d3d_shared_section_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": switchyard_d3d_shared_section") }
+};
+static RTL_CRITICAL_SECTION switchyard_d3d_shared_section =
+    { &switchyard_d3d_shared_section_debug, -1, 0, 0, 0, 0 };
+static struct list switchyard_d3d_shared_textures[SWITCHYARD_D3D_SHARED_HASH_SIZE];
+static struct list switchyard_d3d_shared_owners;
+static struct list switchyard_d3d_context_devices;
+static BOOL switchyard_d3d_shared_registry_initialized;
+static LONG switchyard_d3d_shared_owner_count;
+static LONG switchyard_d3d_shared_token_counter;
+
+static void *switchyard_d3d_heap_alloc( SIZE_T size )
+{
+    void *ret = RtlAllocateHeap( NtCurrentTeb()->Peb->ProcessHeap, 0, size );
+
+    if (ret) memset( ret, 0, size );
+    return ret;
+}
+
+static void switchyard_d3d_heap_free( void *ptr )
+{
+    if (ptr) RtlFreeHeap( NtCurrentTeb()->Peb->ProcessHeap, 0, ptr );
+}
+
+static unsigned int switchyard_d3d_shared_pointer_hash( const void *ptr )
+{
+    ULONG_PTR value = (ULONG_PTR)ptr;
+
+    value ^= value >> 17;
+    value ^= value >> 9;
+    return (value >> 4) & (SWITCHYARD_D3D_SHARED_HASH_SIZE - 1);
+}
+
+static void switchyard_d3d_shared_registry_init_locked(void)
+{
+    unsigned int i;
+
+    if (switchyard_d3d_shared_registry_initialized) return;
+    for (i = 0; i < SWITCHYARD_D3D_SHARED_HASH_SIZE; ++i)
+        list_init( &switchyard_d3d_shared_textures[i] );
+    list_init( &switchyard_d3d_shared_owners );
+    list_init( &switchyard_d3d_context_devices );
+    switchyard_d3d_shared_registry_initialized = TRUE;
+}
+
+static void switchyard_track_d3d11_context_device(
+    ULONG_PTR device_output, ULONG_PTR context_output )
+{
+    struct switchyard_d3d_context_device *entry, *new_entry;
+    void *device = NULL, *context = NULL;
+
+    if (!device_output || !context_output) return;
+    __TRY
+    {
+        device = *(void **)device_output;
+        context = *(void **)context_output;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        device = context = NULL;
+    }
+    __ENDTRY
+    if (!device || !context ||
+        !(new_entry = switchyard_d3d_heap_alloc( sizeof(*new_entry) ))) return;
+    new_entry->context = context;
+    new_entry->device = device;
+
+    RtlEnterCriticalSection( &switchyard_d3d_shared_section );
+    switchyard_d3d_shared_registry_init_locked();
+    LIST_FOR_EACH_ENTRY( entry, &switchyard_d3d_context_devices,
+                         struct switchyard_d3d_context_device, entry )
+    {
+        if (entry->context != context) continue;
+        entry->device = device;
+        RtlLeaveCriticalSection( &switchyard_d3d_shared_section );
+        switchyard_d3d_heap_free( new_entry );
+        return;
+    }
+    list_add_tail( &switchyard_d3d_context_devices, &new_entry->entry );
+    RtlLeaveCriticalSection( &switchyard_d3d_shared_section );
+}
+
+static void *switchyard_find_d3d11_context_device_locked( void *context )
+{
+    struct switchyard_d3d_context_device *entry;
+
+    if (!switchyard_d3d_shared_registry_initialized) return NULL;
+    LIST_FOR_EACH_ENTRY_REV( entry, &switchyard_d3d_context_devices,
+                             struct switchyard_d3d_context_device, entry )
+        if (entry->context == context) return entry->device;
+    return NULL;
+}
+
+static struct switchyard_d3d_shared_texture *
+switchyard_find_d3d_shared_texture_locked( void *texture, int owner )
+{
+    struct switchyard_d3d_shared_texture *entry;
+    unsigned int hash = switchyard_d3d_shared_pointer_hash( texture );
+    unsigned int i;
+
+    if (!switchyard_d3d_shared_registry_initialized) return NULL;
+    LIST_FOR_EACH_ENTRY( entry, &switchyard_d3d_shared_textures[hash],
+                         struct switchyard_d3d_shared_texture, entry )
+    {
+        if (entry->texture != texture && entry->alias != texture) continue;
+        if (owner >= 0 && entry->owner != owner) continue;
+        return entry;
+    }
+    /* Different interfaces for a resource need not share the same address. */
+    for (i = 0; i < SWITCHYARD_D3D_SHARED_HASH_SIZE; ++i)
+    {
+        if (i == hash) continue;
+        LIST_FOR_EACH_ENTRY( entry, &switchyard_d3d_shared_textures[i],
+                             struct switchyard_d3d_shared_texture, entry )
+        {
+            if (entry->alias != texture) continue;
+            if (owner >= 0 && entry->owner != owner) continue;
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static void switchyard_destroy_d3d_shared_texture(
+    struct switchyard_d3d_shared_texture *entry )
+{
+    typedef ULONG (WINAPI *release_func)(void *);
+    void *texture, *device;
+
+    if (!entry) return;
+    TRACE( "destroying D3D shared texture %p owner %u retained %u\n",
+           entry->texture, entry->owner, entry->retained );
+    texture = entry->retained ? entry->texture : NULL;
+    device = entry->device;
+    if (entry->mapping) NtUnmapViewOfSection( NtCurrentProcess(), entry->mapping );
+    if (entry->mutant) NtClose( entry->mutant );
+    if (entry->section) NtClose( entry->section );
+    switchyard_d3d_heap_free( entry );
+    if (texture) ((release_func)(*(void ***)texture)[2])( texture );
+    if (device) ((release_func)(*(void ***)device)[2])( device );
+}
+
+static void switchyard_format_d3d_shared_object_name(
+    WCHAR *buffer, UINT token, BOOL mutant )
+{
+    static const WCHAR section_prefix[] = L"\\BaseNamedObjects\\SwitchyardD3DShare-";
+    static const WCHAR mutant_prefix[] = L"\\BaseNamedObjects\\SwitchyardD3DShareLock-";
+    static const WCHAR hex[] = L"0123456789abcdef";
+    const WCHAR *prefix;
+    unsigned int i, len;
+
+    if (mutant)
+    {
+        prefix = mutant_prefix;
+        len = ARRAY_SIZE(mutant_prefix) - 1;
+    }
+    else
+    {
+        prefix = section_prefix;
+        len = ARRAY_SIZE(section_prefix) - 1;
+    }
+    memcpy( buffer, prefix, len * sizeof(*buffer) );
+    for (i = 0; i < 8; ++i)
+        buffer[len + i] = hex[(token >> ((7 - i) * 4)) & 0xf];
+    buffer[len + 8] = 0;
+}
+
+static void switchyard_init_d3d_shared_section_attributes(
+    UINT token, BOOL mutant, WCHAR *name, UNICODE_STRING *string, OBJECT_ATTRIBUTES *attr )
+{
+    switchyard_format_d3d_shared_object_name( name, token, mutant );
+    RtlInitUnicodeString( string, name );
+    InitializeObjectAttributes( attr, string, OBJ_CASE_INSENSITIVE, NULL, NULL );
+}
+
+static UINT switchyard_generate_d3d_shared_token(void)
+{
+    LARGE_INTEGER time;
+    ULONG value;
+
+    NtQuerySystemTime( &time );
+    value = (ULONG)time.QuadPart ^ (ULONG)(time.QuadPart >> 32) ^
+            (ULONG)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess ^
+            (ULONG)InterlockedIncrement( &switchyard_d3d_shared_token_counter );
+    value ^= value >> 16;
+    value *= 0x7feb352d;
+    value ^= value >> 15;
+    return SWITCHYARD_D3D_SHARED_TOKEN_TAG | (value & ~SWITCHYARD_D3D_SHARED_TOKEN_MASK);
+}
+
+static BOOL switchyard_d3d_shared_desc_supported(
+    const struct switchyard_d3d11_texture2d_desc *desc )
+{
+    SIZE_T size;
+
+    if (!desc || !desc->width || !desc->height || desc->mip_levels != 1 ||
+        desc->array_size != 1 || desc->format != SWITCHYARD_DXGI_FORMAT_B8G8R8A8_UNORM ||
+        desc->sample_count != 1 || desc->sample_quality || desc->usage ||
+        desc->cpu_access_flags || desc->misc_flags != SWITCHYARD_D3D11_RESOURCE_MISC_SHARED ||
+        (desc->bind_flags & (SWITCHYARD_D3D11_BIND_SHADER_RESOURCE |
+                             SWITCHYARD_D3D11_BIND_RENDER_TARGET)) !=
+                            (SWITCHYARD_D3D11_BIND_SHADER_RESOURCE |
+                             SWITCHYARD_D3D11_BIND_RENDER_TARGET))
+        return FALSE;
+    size = (SIZE_T)desc->width * 4;
+    if (size / 4 != desc->width || desc->height > ~(SIZE_T)0 / size) return FALSE;
+    return size * desc->height <= ~(UINT)0;
+}
+
+static struct switchyard_d3d_shared_texture *
+switchyard_create_d3d_shared_texture(
+    void *texture, void *alias, void *device,
+    const struct switchyard_d3d11_texture2d_desc *desc )
+{
+    struct switchyard_d3d_shared_texture *entry;
+    struct switchyard_d3d_shared_section *header;
+    LARGE_INTEGER section_size;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING string;
+    WCHAR name[64];
+    SIZE_T header_size = (sizeof(*header) + 63) & ~(SIZE_T)63;
+    SIZE_T payload_size = (SIZE_T)desc->width * desc->height * 4;
+    SIZE_T mapping_size = 0;
+    void *mapping = NULL;
+    HANDLE section = NULL;
+    HANDLE mutant = NULL;
+    NTSTATUS status;
+    UINT token;
+    unsigned int attempt;
+
+    if (payload_size > ~(SIZE_T)0 - header_size) return NULL;
+    if (!(entry = switchyard_d3d_heap_alloc( sizeof(*entry) ))) return NULL;
+    section_size.QuadPart = header_size + payload_size;
+    for (attempt = 0; attempt < 32; ++attempt)
+    {
+        token = switchyard_generate_d3d_shared_token();
+        switchyard_init_d3d_shared_section_attributes( token, FALSE, name, &string, &attr );
+        status = NtCreateSection( &section, SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE,
+                                  &attr, &section_size, PAGE_READWRITE, SEC_COMMIT, NULL );
+        if (status == STATUS_OBJECT_NAME_COLLISION) continue;
+        if (status) break;
+        switchyard_init_d3d_shared_section_attributes( token, TRUE, name, &string, &attr );
+        status = NtCreateMutant( &mutant, MUTANT_ALL_ACCESS, &attr, FALSE );
+        if (!status) break;
+        NtClose( section );
+        section = NULL;
+        if (mutant) NtClose( mutant );
+        mutant = NULL;
+        if (status != STATUS_OBJECT_NAME_COLLISION && status != STATUS_OBJECT_NAME_EXISTS) break;
+    }
+    if (status)
+    {
+        WARN( "failed to create D3D shared objects, status %#lx\n", status );
+        switchyard_d3d_heap_free( entry );
+        return NULL;
+    }
+    status = NtMapViewOfSection( section, NtCurrentProcess(), &mapping, 0, 0, NULL,
+                                 &mapping_size, ViewUnmap, 0, PAGE_READWRITE );
+    if (status)
+    {
+        WARN( "failed to map D3D shared section, status %#lx\n", status );
+        NtClose( mutant );
+        NtClose( section );
+        switchyard_d3d_heap_free( entry );
+        return NULL;
+    }
+
+    memset( mapping, 0, header_size + payload_size );
+    header = mapping;
+    header->magic = SWITCHYARD_D3D_SHARED_SECTION_MAGIC;
+    header->version = SWITCHYARD_D3D_SHARED_SECTION_VERSION;
+    header->header_size = header_size;
+    header->desc = *desc;
+    header->token = token;
+    header->row_pitch = desc->width * 4;
+    header->payload_size = payload_size;
+
+    entry->texture = texture;
+    entry->alias = alias;
+    entry->device = device;
+    entry->section = section;
+    entry->mutant = mutant;
+    entry->mapping = mapping;
+    entry->mapping_size = mapping_size;
+    entry->owner = TRUE;
+    entry->retained = TRUE;
+    return entry;
+}
+
+static struct switchyard_d3d_shared_texture *
+switchyard_open_d3d_shared_texture( UINT token )
+{
+    struct switchyard_d3d_shared_texture *entry;
+    struct switchyard_d3d_shared_section *header;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING string;
+    WCHAR name[64];
+    SIZE_T mapping_size = 0;
+    void *mapping = NULL;
+    HANDLE section = NULL;
+    HANDLE mutant = NULL;
+    NTSTATUS status;
+    BOOL valid = FALSE;
+
+    if ((token & SWITCHYARD_D3D_SHARED_TOKEN_MASK) != SWITCHYARD_D3D_SHARED_TOKEN_TAG)
+        return NULL;
+    switchyard_init_d3d_shared_section_attributes( token, FALSE, name, &string, &attr );
+    status = NtOpenSection( &section, SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE, &attr );
+    if (status) return NULL;
+    switchyard_init_d3d_shared_section_attributes( token, TRUE, name, &string, &attr );
+    status = NtOpenMutant( &mutant, MUTANT_ALL_ACCESS, &attr );
+    if (status)
+    {
+        NtClose( section );
+        return NULL;
+    }
+    status = NtMapViewOfSection( section, NtCurrentProcess(), &mapping, 0, 0, NULL,
+                                 &mapping_size, ViewUnmap, 0, PAGE_READWRITE );
+    if (status)
+    {
+        NtClose( mutant );
+        NtClose( section );
+        return NULL;
+    }
+
+    __TRY
+    {
+        SIZE_T required;
+
+        header = mapping;
+        required = (SIZE_T)header->header_size + header->payload_size;
+        valid = mapping_size >= sizeof(*header) &&
+                header->magic == SWITCHYARD_D3D_SHARED_SECTION_MAGIC &&
+                header->version == SWITCHYARD_D3D_SHARED_SECTION_VERSION &&
+                header->token == token && header->header_size >= sizeof(*header) &&
+                header->header_size <= mapping_size && required >= header->header_size &&
+                required <= mapping_size && switchyard_d3d_shared_desc_supported( &header->desc ) &&
+                header->row_pitch == header->desc.width * 4 &&
+                header->payload_size == (SIZE_T)header->row_pitch * header->desc.height;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        valid = FALSE;
+    }
+    __ENDTRY
+    if (!valid)
+    {
+        NtUnmapViewOfSection( NtCurrentProcess(), mapping );
+        NtClose( mutant );
+        NtClose( section );
+        return NULL;
+    }
+    if (!(entry = switchyard_d3d_heap_alloc( sizeof(*entry) )))
+    {
+        NtUnmapViewOfSection( NtCurrentProcess(), mapping );
+        NtClose( mutant );
+        NtClose( section );
+        return NULL;
+    }
+    entry->section = section;
+    entry->mutant = mutant;
+    entry->mapping = mapping;
+    entry->mapping_size = mapping_size;
+    return entry;
+}
+
+static void switchyard_add_d3d_shared_texture(
+    struct switchyard_d3d_shared_texture *entry )
+{
+    unsigned int hash = switchyard_d3d_shared_pointer_hash( entry->texture );
+
+    RtlEnterCriticalSection( &switchyard_d3d_shared_section );
+    switchyard_d3d_shared_registry_init_locked();
+    list_add_tail( &switchyard_d3d_shared_textures[hash], &entry->entry );
+    if (entry->owner)
+    {
+        list_add_tail( &switchyard_d3d_shared_owners, &entry->owner_entry );
+        InterlockedIncrement( &switchyard_d3d_shared_owner_count );
+    }
+    RtlLeaveCriticalSection( &switchyard_d3d_shared_section );
+}
+
+static void switchyard_release_d3d11_device_child( void *object, ULONG_PTR refs )
+{
+    struct switchyard_d3d_shared_texture *texture = NULL;
+
+    if (refs > 1 || !object) return;
+    RtlEnterCriticalSection( &switchyard_d3d_shared_section );
+    if (switchyard_d3d_shared_registry_initialized)
+    {
+        texture = switchyard_find_d3d_shared_texture_locked( object, -1 );
+        if (texture && ((texture->retained && refs == 1) || (!texture->retained && !refs)))
+        {
+            list_remove( &texture->entry );
+            if (texture->owner)
+            {
+                list_remove( &texture->owner_entry );
+                InterlockedDecrement( &switchyard_d3d_shared_owner_count );
+            }
+        }
+        else texture = NULL;
+    }
+    RtlLeaveCriticalSection( &switchyard_d3d_shared_section );
+    switchyard_destroy_d3d_shared_texture( texture );
+}
+
+static ULONG_PTR switchyard_get_d3d_shared_handle(
+    const struct switchyard_native_callback_params *params, ULONG_PTR ret )
+{
+    static const GUID iid_d3d11_texture2d =
+    {
+        0x6f15aaf2, 0xd208, 0x4e89, { 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c }
+    };
+    static const GUID iid_d3d11_device =
+    {
+        0xdb6f6ddb, 0xac77, 0x4e88, { 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40 }
+    };
+    typedef HRESULT (WINAPI *query_interface_func)(void *, const GUID *, void **);
+    typedef ULONG (WINAPI *release_func)(void *);
+    typedef void (WINAPI *get_desc_func)(void *, struct switchyard_d3d11_texture2d_desc *);
+    struct switchyard_d3d_shared_texture *entry, *existing;
+    struct switchyard_d3d11_texture2d_desc desc;
+    void **vtable;
+    void *texture = NULL, *device = NULL;
+    HANDLE *output;
+    HRESULT hr;
+
+    if ((HRESULT)ret != E_NOTIMPL || params->argc < 2 || !params->args[0] || !params->args[1])
+        return ret;
+    output = (HANDLE *)params->args[1];
+    __TRY
+    {
+        *output = NULL;
+        vtable = *(void ***)params->args[0];
+        hr = ((query_interface_func)vtable[0])((void *)params->args[0],
+                                               &iid_d3d11_texture2d, &texture);
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        hr = E_FAIL;
+    }
+    __ENDTRY
+    if (FAILED(hr) || !texture) return ret;
+
+    memset( &desc, 0, sizeof(desc) );
+    __TRY
+    {
+        vtable = *(void ***)texture;
+        ((get_desc_func)vtable[10])( texture, &desc );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        memset( &desc, 0, sizeof(desc) );
+    }
+    __ENDTRY
+    if (!switchyard_d3d_shared_desc_supported( &desc ))
+    {
+        ((release_func)(*(void ***)texture)[2])( texture );
+        return ret;
+    }
+
+    RtlEnterCriticalSection( &switchyard_d3d_shared_section );
+    switchyard_d3d_shared_registry_init_locked();
+    existing = switchyard_find_d3d_shared_texture_locked( texture, TRUE );
+    if (existing)
+    {
+        struct switchyard_d3d_shared_section *header = existing->mapping;
+
+        *output = (HANDLE)(ULONG_PTR)header->token;
+    }
+    RtlLeaveCriticalSection( &switchyard_d3d_shared_section );
+    if (existing)
+    {
+        ((release_func)(*(void ***)texture)[2])( texture );
+        return S_OK;
+    }
+
+    __TRY
+    {
+        vtable = *(void ***)params->args[0];
+        hr = ((query_interface_func)vtable[7])((void *)params->args[0],
+                                               &iid_d3d11_device, &device);
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        hr = E_FAIL;
+    }
+    __ENDTRY
+    if (FAILED(hr) || !device)
+    {
+        ((release_func)(*(void ***)texture)[2])( texture );
+        return ret;
+    }
+
+    if (!(entry = switchyard_create_d3d_shared_texture(
+              texture, (void *)params->args[0], device, &desc )))
+    {
+        ((release_func)(*(void ***)texture)[2])( texture );
+        ((release_func)(*(void ***)device)[2])( device );
+        return E_OUTOFMEMORY;
+    }
+    RtlEnterCriticalSection( &switchyard_d3d_shared_section );
+    existing = switchyard_find_d3d_shared_texture_locked( texture, TRUE );
+    if (!existing)
+    {
+        unsigned int hash = switchyard_d3d_shared_pointer_hash( texture );
+
+        list_add_tail( &switchyard_d3d_shared_textures[hash], &entry->entry );
+        list_add_tail( &switchyard_d3d_shared_owners, &entry->owner_entry );
+        InterlockedIncrement( &switchyard_d3d_shared_owner_count );
+        existing = entry;
+        entry = NULL;
+    }
+    *output = (HANDLE)(ULONG_PTR)((struct switchyard_d3d_shared_section *)existing->mapping)->token;
+    RtlLeaveCriticalSection( &switchyard_d3d_shared_section );
+    switchyard_destroy_d3d_shared_texture( entry );
+    TRACE( "created D3D shared texture %p token %#Ix\n", texture, (ULONG_PTR)*output );
+    return S_OK;
+}
+
+static ULONG_PTR switchyard_open_d3d_shared_resource(
+    const struct switchyard_native_callback_params *params, ULONG_PTR ret )
+{
+    typedef HRESULT (WINAPI *create_texture2d_func)(
+        void *, const struct switchyard_d3d11_texture2d_desc *, const void *, void **);
+    typedef HRESULT (WINAPI *query_interface_func)(void *, const GUID *, void **);
+    typedef ULONG (WINAPI *release_func)(void *);
+    struct switchyard_d3d_shared_texture *entry;
+    struct switchyard_d3d_shared_section *header;
+    struct switchyard_d3d11_texture2d_desc desc;
+    void **vtable;
+    void *texture = NULL, *result = NULL;
+    UINT token;
+    HRESULT hr;
+
+    if ((HRESULT)ret != E_NOTIMPL || params->argc < 4 || !params->args[0] ||
+        !params->args[2] || !params->args[3])
+        return ret;
+    token = (UINT)(ULONG_PTR)params->args[1];
+    if (!(entry = switchyard_open_d3d_shared_texture( token ))) return ret;
+    header = entry->mapping;
+    desc = header->desc;
+    desc.misc_flags &= ~(SWITCHYARD_D3D11_RESOURCE_MISC_SHARED |
+                         SWITCHYARD_D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                         SWITCHYARD_D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+
+    __TRY
+    {
+        vtable = *(void ***)params->args[0];
+        hr = ((create_texture2d_func)vtable[5])((void *)params->args[0], &desc, NULL, &texture);
+        if (SUCCEEDED(hr) && texture)
+        {
+            vtable = *(void ***)texture;
+            hr = ((query_interface_func)vtable[0])( texture, (const GUID *)params->args[2], &result );
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        hr = E_FAIL;
+    }
+    __ENDTRY
+    if (FAILED(hr) || !texture || !result)
+    {
+        if (texture) ((release_func)(*(void ***)texture)[2])( texture );
+        switchyard_destroy_d3d_shared_texture( entry );
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    entry->texture = texture;
+    entry->alias = result;
+    switchyard_add_d3d_shared_texture( entry );
+    *(void **)params->args[3] = result;
+    ((release_func)(*(void ***)texture)[2])( texture );
+    TRACE( "opened D3D shared texture token %#x as %p\n", token, result );
+    return S_OK;
+}
+
+static void switchyard_publish_d3d_shared_texture(
+    const struct switchyard_native_callback_params *params )
+{
+    struct switchyard_d3d_shared_texture *entry;
+    struct switchyard_d3d_shared_section *header;
+    const BYTE *source;
+    BYTE *destination;
+    UINT source_pitch, row_pitch, y;
+    BOOL copied = FALSE;
+    LARGE_INTEGER timeout = { 0 };
+    NTSTATUS status;
+
+    if (params->argc < 7 || !params->args[1] || params->args[2] || params->args[3] ||
+        !params->args[4])
+        return;
+    RtlEnterCriticalSection( &switchyard_d3d_shared_section );
+    entry = switchyard_find_d3d_shared_texture_locked( (void *)params->args[1], FALSE );
+    RtlLeaveCriticalSection( &switchyard_d3d_shared_section );
+    if (!entry) return;
+    header = entry->mapping;
+    source = (const BYTE *)params->args[4];
+    source_pitch = params->args[5];
+    row_pitch = header->row_pitch;
+    if (source_pitch < row_pitch) return;
+    status = NtWaitForSingleObject( entry->mutant, FALSE, &timeout );
+    if (status != STATUS_SUCCESS && status != STATUS_ABANDONED) return;
+
+    destination = (BYTE *)header + header->header_size;
+    __TRY
+    {
+        for (y = 0; y < header->desc.height; ++y)
+            memcpy( destination + (SIZE_T)y * row_pitch,
+                    source + (SIZE_T)y * source_pitch, row_pitch );
+        copied = TRUE;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        copied = FALSE;
+    }
+    __ENDTRY
+    if (copied)
+    {
+        MemoryBarrier();
+        InterlockedIncrement64( &header->sequence );
+    }
+    NtReleaseMutant( entry->mutant, NULL );
+}
+
+static void CALLBACK switchyard_unlock_d3d_shared_texture( BOOL normal, void *ctx )
+{
+    struct switchyard_d3d_shared_texture *entry = ctx;
+
+    (void)normal;
+    NtReleaseMutant( entry->mutant, NULL );
+}
+
+static void CALLBACK switchyard_leave_d3d_shared_section( BOOL normal, void *ctx )
+{
+    (void)normal;
+    RtlLeaveCriticalSection( ctx );
+}
+
+static void CALLBACK switchyard_restore_windows_teb( BOOL normal, void *ctx )
+{
+    (void)normal;
+    switchyard_set_macos_tsd_base( ctx );
+}
+
+static BOOL switchyard_call_native_update_subresource(
+    void *context, void *texture, const void *source, UINT row_pitch )
+{
+    typedef void (WINAPI *update_subresource_func)(
+        void *, void *, UINT, const void *, const void *, UINT, UINT);
+    DWORD *native_callback_depth;
+    unsigned int argc;
+    void *entry, *target;
+    void *pthread_teb;
+    ULONG flags;
+    TEB *teb;
+
+    __TRY
+    {
+        entry = (*(void ***)context)[48];
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        entry = NULL;
+    }
+    __ENDTRY
+    if (!switchyard_get_native_callback_thunk_info( entry, &target, &argc, &flags ) ||
+        argc < 7 || !(flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_UPDATE_SUBRESOURCE) ||
+        !switchyard_get_native_callback_context( &teb, &pthread_teb, &native_callback_depth ) ||
+        !native_callback_depth || !*native_callback_depth)
+        return FALSE;
+
+    /* This call runs from the outer Draw callback's Windows-side pre-hook.  Going
+     * through the wrapped slot would leave nested post-hook work on the pthread
+     * TEB.  Invoke its recorded native target directly and restore the Windows
+     * TEB before touching the relay lock again. */
+    __TRY
+    {
+        switchyard_set_macos_tsd_base( pthread_teb );
+        ((update_subresource_func)target)( context, texture, 0, NULL, source,
+                                          row_pitch, 0 );
+    }
+    __FINALLY_CTX( switchyard_restore_windows_teb, teb )
+    return TRUE;
+}
+
+static void switchyard_upload_d3d_shared_texture(
+    void *context, struct switchyard_d3d_shared_texture *entry )
+{
+    struct switchyard_d3d_shared_section *header = entry->mapping;
+    LARGE_INTEGER timeout = { 0 };
+    LONGLONG sequence;
+    NTSTATUS status;
+
+    sequence = InterlockedCompareExchange64( &header->sequence, 0, 0 );
+    if (!sequence || (ULONGLONG)sequence == entry->last_sequence) return;
+    status = NtWaitForSingleObject( entry->mutant, FALSE, &timeout );
+    if (status != STATUS_SUCCESS && status != STATUS_ABANDONED) return;
+    sequence = InterlockedCompareExchange64( &header->sequence, 0, 0 );
+    if ((ULONGLONG)sequence == entry->last_sequence)
+    {
+        NtReleaseMutant( entry->mutant, NULL );
+        return;
+    }
+
+    __TRY
+    {
+        if (switchyard_call_native_update_subresource(
+                context, entry->texture,
+                (const BYTE *)header + header->header_size, header->row_pitch ))
+            entry->last_sequence = sequence;
+    }
+    __FINALLY_CTX( switchyard_unlock_d3d_shared_texture, entry )
+}
+
+static void switchyard_upload_all_d3d_shared_textures(
+    const struct switchyard_native_callback_params *params )
+{
+    struct switchyard_d3d_shared_texture *texture;
+    void *context = (void *)params->args[0];
+    void *device;
+
+    if (!InterlockedCompareExchange( &switchyard_d3d_shared_owner_count, 0, 0 ) ||
+        !params->argc || !context) return;
+    RtlEnterCriticalSection( &switchyard_d3d_shared_section );
+    __TRY
+    {
+        if ((device = switchyard_find_d3d11_context_device_locked( context )))
+        {
+            LIST_FOR_EACH_ENTRY( texture, &switchyard_d3d_shared_owners,
+                                 struct switchyard_d3d_shared_texture, owner_entry )
+                if (texture->device == device)
+                    switchyard_upload_d3d_shared_texture( context, texture );
+        }
+    }
+    __FINALLY_CTX( switchyard_leave_d3d_shared_section,
+                   &switchyard_d3d_shared_section )
 }
 
 static BOOL switchyard_gfxt_deferred_vtable_entry_uses_scalar_float( unsigned int index )
@@ -4553,6 +5461,7 @@ static void switchyard_wrap_d3d11_create_device_output_vtables(
         switchyard_wrap_com_output_vtable_jump_targets( params->args[9], d3d11_device_context_vtable_entries,
                                                         switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
                                                         switchyard_d3d11_device_context_vtable_entry_flags );
+        switchyard_track_d3d11_context_device( params->args[7], params->args[9] );
         break;
     case 12: /* D3D11CreateDeviceAndSwapChain */
         TRACE( "wrapping D3D11CreateDeviceAndSwapChain outputs swapchain %p device %p context %p\n",
@@ -4566,6 +5475,7 @@ static void switchyard_wrap_d3d11_create_device_output_vtables(
         switchyard_wrap_com_output_vtable_jump_targets( params->args[11], d3d11_device_context_vtable_entries,
                                                         switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
                                                         switchyard_d3d11_device_context_vtable_entry_flags );
+        switchyard_track_d3d11_context_device( params->args[9], params->args[11] );
         break;
     }
 }
@@ -4812,10 +5722,20 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
                 (params->argc == 10 || params->argc == 12))
                 switchyard_unwrap_com_vtable( (void *)params->args[0],
                                                &input_vtable_scope );
+            if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE)
+                switchyard_upload_all_d3d_shared_textures( params );
             switchyard_set_macos_tsd_base( pthread_teb );
             ret = switchyard_call_native_callback_args( params );
             switchyard_leave_native_callback( TRUE, &scope );
             switchyard_restore_com_vtable( TRUE, &input_vtable_scope );
+            if (params->flags & SWITCHYARD_NATIVE_CALLBACK_DXGI_RESOURCE_GET_SHARED_HANDLE)
+                ret = switchyard_get_d3d_shared_handle( params, ret );
+            if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_OPEN_SHARED_RESOURCE)
+                ret = switchyard_open_d3d_shared_resource( params, ret );
+            if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_UPDATE_SUBRESOURCE)
+                switchyard_publish_d3d_shared_texture( params );
+            if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_CHILD_RELEASE)
+                switchyard_release_d3d11_device_child( (void *)params->args[0], ret );
             if (params->flags & SWITCHYARD_NATIVE_CALLBACK_NOTE_GFXT_DEFERRED_VTABLE)
                 switchyard_note_gfxt_deferred_vtable( ret );
             if ((LONG)ret >= 0)
@@ -5091,6 +6011,47 @@ static BYTE *alloc_native_callback_thunk( SIZE_T size )
     return ret;
 }
 
+static BYTE *alloc_native_callback_thunk_with_info(
+    SIZE_T size, void *target, unsigned int argc, ULONG flags )
+{
+    struct switchyard_native_callback_thunk_info *info;
+
+    if (!(info = (void *)alloc_native_callback_thunk( sizeof(*info) + size ))) return NULL;
+    info->magic = SWITCHYARD_NATIVE_CALLBACK_THUNK_INFO_MAGIC;
+    info->target = target;
+    info->argc = argc;
+    info->flags = flags;
+    info->reserved = 0;
+    return (BYTE *)(info + 1);
+}
+
+static BOOL switchyard_get_native_callback_thunk_info(
+    void *thunk, void **target, unsigned int *argc, ULONG *flags )
+{
+    struct switchyard_native_callback_thunk_info *info;
+    BOOL ret = FALSE;
+
+    if (!is_native_callback_thunk( thunk )) return FALSE;
+    __TRY
+    {
+        info = (struct switchyard_native_callback_thunk_info *)thunk - 1;
+        if (info->magic == SWITCHYARD_NATIVE_CALLBACK_THUNK_INFO_MAGIC &&
+            info->target && info->argc <= SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS)
+        {
+            if (target) *target = info->target;
+            if (argc) *argc = info->argc;
+            if (flags) *flags = info->flags;
+            ret = TRUE;
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        ret = FALSE;
+    }
+    __ENDTRY
+    return ret;
+}
+
 static BYTE *emit_mov_imm64_rax( BYTE *code, const void *value )
 {
     *code++ = 0x48;
@@ -5246,7 +6207,7 @@ static void *create_native_callback_args_thunk( void *func, unsigned int argc, U
     SIZE_T size = 320;
 
     if (argc > SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS) return NULL;
-    if (!(code = alloc_native_callback_thunk( size ))) return NULL;
+    if (!(code = alloc_native_callback_thunk_with_info( size, func, argc, flags ))) return NULL;
 
     p = code;
     memcpy( p, native_callback_thunk_marker, sizeof(native_callback_thunk_marker) );
@@ -5318,7 +6279,7 @@ static void *create_native_callback_thunk( void *func, unsigned int argc, ULONG 
         return create_native_callback_args_thunk( func, argc, flags );
 
     if (argc == 4) size += 8;
-    if (!(code = alloc_native_callback_thunk( size ))) return NULL;
+    if (!(code = alloc_native_callback_thunk_with_info( size, func, argc, flags ))) return NULL;
 
     p = code;
     memcpy( p, native_callback_thunk_marker, sizeof(native_callback_thunk_marker) );
