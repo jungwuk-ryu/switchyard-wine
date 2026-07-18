@@ -3766,6 +3766,18 @@ static void CALLBACK switchyard_leave_native_callback( BOOL normal, void *ctx )
                                    scope->pthread_teb : scope->teb );
 }
 
+static void CALLBACK switchyard_leave_recovered_native_callback( BOOL normal, void *ctx )
+{
+    struct switchyard_native_callback_scope *scope = ctx;
+
+    (void)normal;
+    if (scope->left) return;
+    scope->left = TRUE;
+    if (scope->native_callback_depth && *scope->native_callback_depth)
+        --*scope->native_callback_depth;
+    switchyard_set_macos_tsd_base( scope->pthread_teb );
+}
+
 static BOOL switchyard_enter_native_callback_scope( struct switchyard_native_callback_scope *scope )
 {
     TEB *teb;
@@ -5569,7 +5581,7 @@ static void switchyard_wrap_dxgi_adapter_output_vtable(
         2, 3, 2, 2, 3, 2, 4, 4,
         3, 2, 2
     };
-    void **vtable, **wrapped_vtable;
+    void **vtable;
     void *object;
     unsigned int i;
 
@@ -5578,10 +5590,12 @@ static void switchyard_wrap_dxgi_adapter_output_vtable(
     {
         object = *(void **)params->args[params->argc - 1];
         if (!object || !(vtable = *(void ***)object)) return;
-        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable,
-                                                                   ARRAY_SIZE(argc) );
-        if (!wrapped_vtable) return;
-        vtable = wrapped_vtable;
+
+        /* Native adapters use variable-length Itanium ABI metadata before the
+         * vtable address point.  Keep that address point intact so native
+         * dynamic casts can still inspect all vcall and virtual-base offsets. */
+        TRACE( "checking native DXGI adapter %p vtable %p entries %u\n",
+               object, vtable, (unsigned int)ARRAY_SIZE(argc) );
 
         for (i = 0; i < ARRAY_SIZE(argc); ++i)
         {
@@ -5855,10 +5869,12 @@ static ULONG_PTR WINAPI pe_callback_bridge( struct switchyard_pe_callback_params
 
 static ULONG_PTR WINAPI native_callback_bridge_args( struct switchyard_native_callback_params *params )
 {
+    struct switchyard_native_callback_scope scope;
     TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
     BOOL recovered = FALSE;
+    ULONG_PTR ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
 
     if (!params || !params->func || params->argc > ARRAY_SIZE(params->args))
         return SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
@@ -5875,8 +5891,18 @@ static ULONG_PTR WINAPI native_callback_bridge_args( struct switchyard_native_ca
     if (!recovered) switchyard_init_native_callback_recovery();
     if (recovered)
     {
-        switchyard_set_macos_tsd_base( pthread_teb );
-        return switchyard_call_native_callback_args( params );
+        scope.teb = teb;
+        scope.pthread_teb = pthread_teb;
+        scope.native_callback_depth = native_callback_depth;
+        scope.left = FALSE;
+        ++*native_callback_depth;
+        __TRY
+        {
+            switchyard_set_macos_tsd_base( pthread_teb );
+            ret = switchyard_call_native_callback_args( params );
+        }
+        __FINALLY_CTX( switchyard_leave_recovered_native_callback, &scope )
+        return ret;
     }
 
     return switchyard_native_callback_args_on_user_stack( params, teb, pthread_teb,
@@ -5887,9 +5913,12 @@ static ULONG_PTR WINAPI native_callback_bridge3( void *func, ULONG_PTR arg0,
                                                  ULONG_PTR arg1, ULONG_PTR arg2 )
 {
     typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    struct switchyard_native_callback_scope scope;
     TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
+    BOOL recovered = FALSE;
+    ULONG_PTR ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
 
     if (func && switchyard_get_native_callback_context( &teb, &pthread_teb,
                                                         &native_callback_depth ))
@@ -5900,12 +5929,23 @@ static ULONG_PTR WINAPI native_callback_bridge3( void *func, ULONG_PTR arg0,
     }
     if (func && switchyard_recover_native_callback_context( &teb, &pthread_teb,
                                                             &native_callback_depth ))
-    {
-        switchyard_set_macos_tsd_base( pthread_teb );
-    }
+        recovered = TRUE;
 
     if (!func) return SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
-    return ((native_callback_func)func)( arg0, arg1, arg2 );
+    if (!recovered) return ((native_callback_func)func)( arg0, arg1, arg2 );
+
+    scope.teb = teb;
+    scope.pthread_teb = pthread_teb;
+    scope.native_callback_depth = native_callback_depth;
+    scope.left = FALSE;
+    ++*native_callback_depth;
+    __TRY
+    {
+        switchyard_set_macos_tsd_base( pthread_teb );
+        ret = ((native_callback_func)func)( arg0, arg1, arg2 );
+    }
+    __FINALLY_CTX( switchyard_leave_recovered_native_callback, &scope )
+    return ret;
 }
 
 static ULONG_PTR WINAPI native_callback_bridge4( void *func, ULONG_PTR arg0,
@@ -5913,9 +5953,12 @@ static ULONG_PTR WINAPI native_callback_bridge4( void *func, ULONG_PTR arg0,
                                                  ULONG_PTR arg3 )
 {
     typedef ULONG_PTR (WINAPI *native_callback_func)(ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+    struct switchyard_native_callback_scope scope;
     TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
+    BOOL recovered = FALSE;
+    ULONG_PTR ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
 
     if (func && switchyard_get_native_callback_context( &teb, &pthread_teb,
                                                         &native_callback_depth ))
@@ -5926,12 +5969,23 @@ static ULONG_PTR WINAPI native_callback_bridge4( void *func, ULONG_PTR arg0,
     }
     if (func && switchyard_recover_native_callback_context( &teb, &pthread_teb,
                                                             &native_callback_depth ))
-    {
-        switchyard_set_macos_tsd_base( pthread_teb );
-    }
+        recovered = TRUE;
 
     if (!func) return SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
-    return ((native_callback_func)func)( arg0, arg1, arg2, arg3 );
+    if (!recovered) return ((native_callback_func)func)( arg0, arg1, arg2, arg3 );
+
+    scope.teb = teb;
+    scope.pthread_teb = pthread_teb;
+    scope.native_callback_depth = native_callback_depth;
+    scope.left = FALSE;
+    ++*native_callback_depth;
+    __TRY
+    {
+        switchyard_set_macos_tsd_base( pthread_teb );
+        ret = ((native_callback_func)func)( arg0, arg1, arg2, arg3 );
+    }
+    __FINALLY_CTX( switchyard_leave_recovered_native_callback, &scope )
+    return ret;
 }
 
 static void register_native_callback_thunk_region( void *base, SIZE_T size )

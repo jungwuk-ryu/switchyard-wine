@@ -1,8 +1,9 @@
 #define COBJMACROS
 
 #include <windows.h>
+#include <initguid.h>
 #include <d3d11.h>
-#include <dxgi.h>
+#include <dxgi1_6.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -19,6 +20,120 @@ struct test_context
     HRESULT result;
     HANDLE handle;
 };
+
+static int verify_factory_adapter(void)
+{
+    static const D3D_FEATURE_LEVEL feature_levels[] =
+    {
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+    DXGI_ADAPTER_DESC desc;
+    D3D_FEATURE_LEVEL feature_level;
+    ID3D11DeviceContext *context = NULL;
+    ID3D11Device *device = NULL;
+    IDXGIAdapter *adapter = NULL;
+    IDXGIAdapter1 *adapter1 = NULL;
+    IDXGIFactory1 *factory = NULL;
+    HRESULT hr;
+    unsigned int adapter_index;
+    unsigned int i;
+
+    for (i = 0; i < 8; ++i)
+    {
+        hr = CreateDXGIFactory1( &IID_IDXGIFactory1, (void **)&factory );
+        if (FAILED(hr))
+        {
+            fprintf( stderr, "CreateDXGIFactory1 failed: %#lx\n", hr );
+            return 0;
+        }
+        hr = IDXGIFactory1_EnumAdapters( factory, 0, &adapter );
+        if (FAILED(hr))
+        {
+            fprintf( stderr, "EnumAdapters failed: %#lx\n", hr );
+            IDXGIFactory1_Release( factory );
+            return 0;
+        }
+        hr = IDXGIAdapter_QueryInterface( adapter, &IID_IDXGIAdapter1,
+                                          (void **)&adapter1 );
+        if (FAILED(hr))
+        {
+            fprintf( stderr, "QueryInterface(IDXGIAdapter1) failed: %#lx\n", hr );
+            IDXGIAdapter_Release( adapter );
+            IDXGIFactory1_Release( factory );
+            return 0;
+        }
+        hr = IDXGIAdapter_GetDesc( adapter, &desc );
+        if (FAILED(hr) || !desc.DeviceId)
+        {
+            fprintf( stderr, "IDXGIAdapter::GetDesc returned %#lx, device %#x\n",
+                     hr, desc.DeviceId );
+            IDXGIAdapter1_Release( adapter1 );
+            IDXGIAdapter_Release( adapter );
+            IDXGIFactory1_Release( factory );
+            return 0;
+        }
+        hr = D3D11CreateDevice( adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
+                                feature_levels, ARRAYSIZE(feature_levels),
+                                D3D11_SDK_VERSION, &device, &feature_level, &context );
+        if (FAILED(hr))
+        {
+            fprintf( stderr, "D3D11CreateDevice(adapter) failed: %#lx\n", hr );
+            IDXGIAdapter1_Release( adapter1 );
+            IDXGIAdapter_Release( adapter );
+            IDXGIFactory1_Release( factory );
+            return 0;
+        }
+        ID3D11DeviceContext_Release( context );
+        ID3D11Device_Release( device );
+        IDXGIAdapter1_Release( adapter1 );
+        IDXGIAdapter_Release( adapter );
+        for (adapter_index = 1; ; ++adapter_index)
+        {
+            adapter = NULL;
+            hr = IDXGIFactory1_EnumAdapters( factory, adapter_index, &adapter );
+            if (hr == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(hr))
+            {
+                fprintf( stderr, "EnumAdapters(%u) failed: %#lx\n",
+                         adapter_index, hr );
+                IDXGIFactory1_Release( factory );
+                return 0;
+            }
+            hr = IDXGIAdapter_GetDesc( adapter, &desc );
+            IDXGIAdapter_Release( adapter );
+            if (FAILED(hr))
+            {
+                fprintf( stderr, "IDXGIAdapter::GetDesc(%u) failed: %#lx\n",
+                         adapter_index, hr );
+                IDXGIFactory1_Release( factory );
+                return 0;
+            }
+        }
+        IDXGIFactory1_Release( factory );
+        context = NULL;
+        device = NULL;
+        hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+                                feature_levels, ARRAYSIZE(feature_levels),
+                                D3D11_SDK_VERSION, &device, &feature_level, &context );
+        if (FAILED(hr))
+        {
+            fprintf( stderr, "D3D11CreateDevice(default) failed: %#lx\n", hr );
+            return 0;
+        }
+        ID3D11DeviceContext_Release( context );
+        ID3D11Device_Release( device );
+        context = NULL;
+        device = NULL;
+        adapter1 = NULL;
+        adapter = NULL;
+        factory = NULL;
+    }
+
+    printf( "DXGI adapter callback stress passed (device %#x)\n", desc.DeviceId );
+    return 1;
+}
 
 static void fill_test_pixels( BYTE *pixels, UINT pitch, UINT frame )
 {
@@ -288,7 +403,10 @@ int main( int argc, char **argv )
                           argc >= 4 ? strtoul( argv[3], NULL, 0 ) : 0 );
     if (argc >= 3 && !strcmp( argv[1], "abandon" ))
         return abandon_shared_mutant( strtoul( argv[2], NULL, 0 ) );
+    if (argc >= 2 && !strcmp( argv[1], "adapter" ))
+        return verify_factory_adapter() ? 0 : 1;
 
+    if (!verify_factory_adapter()) return 1;
     if (!create_device( &device, &context )) return 1;
     if (!create_device( &other_device, &other_context )) return 1;
     hr = ID3D11Device_CreateDeferredContext( device, 0, &deferred_context );
