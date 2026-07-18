@@ -397,6 +397,59 @@ static void test_CreateDispatcherQueueController(void)
     check_create_dispatcher_queue_controller( sizeof( DispatcherQueueOptions ), DQTYPE_THREAD_DEDICATED, DQTAT_COM_STA,  S_OK );
 }
 
+static void test_DispatcherQueue_Statics(void)
+{
+    static const WCHAR *dispatcher_queue_statics_name = L"Windows.System.DispatcherQueue";
+    IDispatcherQueueStatics *dispatcher_queue_statics = (void *)0xdeadbeef;
+    IDispatcherQueue *dispatcher_queue = (void *)0xdeadbeef;
+    IActivationFactory *factory = (void *)0xdeadbeef;
+    HSTRING str = NULL;
+    HRESULT hr;
+    LONG ref;
+
+    hr = WindowsCreateString( dispatcher_queue_statics_name, wcslen( dispatcher_queue_statics_name ), &str );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    hr = RoGetActivationFactory( str, &IID_IActivationFactory, (void **)&factory );
+    WindowsDeleteString( str );
+    ok( hr == S_OK || broken(hr == REGDB_E_CLASSNOTREG), "got hr %#lx.\n", hr );
+    if (hr == REGDB_E_CLASSNOTREG)
+    {
+        win_skip( "%s runtimeclass not registered, skipping tests.\n", wine_dbgstr_w( dispatcher_queue_statics_name ) );
+        return;
+    }
+
+    check_interface( factory, &IID_IUnknown );
+    check_interface( factory, &IID_IInspectable );
+    check_interface( factory, &IID_IAgileObject );
+
+    hr = IActivationFactory_QueryInterface( factory, &IID_IDispatcherQueueStatics, (void **)&dispatcher_queue_statics );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+
+    hr = IDispatcherQueueStatics_GetForCurrentThread( dispatcher_queue_statics, &dispatcher_queue );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    ok( dispatcher_queue == NULL, "got dispatcher_queue %p.\n", dispatcher_queue );
+
+    ref = IDispatcherQueueStatics_Release( dispatcher_queue_statics );
+    ok( ref == 2, "got ref %ld.\n", ref );
+    ref = IActivationFactory_Release( factory );
+    ok( ref == 1, "got ref %ld.\n", ref );
+
+    dispatcher_queue_statics = (void *)0xdeadbeef;
+    dispatcher_queue = (void *)0xdeadbeef;
+    hr = WindowsCreateString( dispatcher_queue_statics_name, wcslen( dispatcher_queue_statics_name ), &str );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    hr = RoGetActivationFactory( str, &IID_IDispatcherQueueStatics, (void **)&dispatcher_queue_statics );
+    WindowsDeleteString( str );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+
+    hr = IDispatcherQueueStatics_GetForCurrentThread( dispatcher_queue_statics, &dispatcher_queue );
+    ok( hr == S_OK, "got hr %#lx.\n", hr );
+    ok( dispatcher_queue == NULL, "got dispatcher_queue %p.\n", dispatcher_queue );
+
+    ref = IDispatcherQueueStatics_Release( dispatcher_queue_statics );
+    ok( ref == 1, "got ref %ld.\n", ref );
+}
+
 static void test_DispatcherQueueController_Statics(void)
 {
     static const WCHAR *dispatcher_queue_controller_statics_name = L"Windows.System.DispatcherQueueController";
@@ -544,6 +597,7 @@ START_TEST(coremessaging)
     ok( hr == S_OK, "RoInitialize failed, hr %#lx\n", hr );
 
     test_CreateDispatcherQueueController();
+    test_DispatcherQueue_Statics();
     test_DispatcherQueueController_Statics();
 
     RoUninitialize();
