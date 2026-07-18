@@ -611,7 +611,16 @@ HRESULT WINAPI TF_GetThreadMgr(ITfThreadMgr **pptim)
  */
 HRESULT WINAPI SetInputScope(HWND hwnd, InputScope inputscope)
 {
-    FIXME("STUB: %p %i\n",hwnd,inputscope);
+    static const WCHAR input_scope_prop[] = L"__wine_input_scope";
+    static LONG input_scope_warning;
+
+    TRACE("%p %i\n", hwnd, inputscope);
+
+    if (!IsWindow(hwnd)) return E_INVALIDARG;
+    if (!SetPropW(hwnd, input_scope_prop, ULongToHandle((ULONG)inputscope + 1)))
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (!InterlockedExchange(&input_scope_warning, TRUE))
+        FIXME("Input scope is stored, but TSF input-scope consumption is not implemented.\n");
     return S_OK;
 }
 

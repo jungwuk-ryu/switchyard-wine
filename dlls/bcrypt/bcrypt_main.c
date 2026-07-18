@@ -2615,6 +2615,11 @@ static NTSTATUS export_asymmetric_key( const struct key *key, const WCHAR *type,
     {
         return export_legacy_dsa_key( key, output, output_len, 0, ret_len );
     }
+    else if (!wcscmp( type, BCRYPT_OPAQUE_KEY_BLOB ))
+    {
+        TRACE( "opaque blobs are only supported for symmetric keys\n" );
+        return STATUS_NOT_SUPPORTED;
+    }
 
     FIXME( "unsupported blob type %s\n", debugstr_w(type) );
     return STATUS_NOT_IMPLEMENTED;
@@ -3297,6 +3302,11 @@ static NTSTATUS import_key_pair( const struct algorithm *alg, const WCHAR *type,
     else if (!wcscmp( type, LEGACY_DSA_V2_PRIVATE_BLOB ) || !wcscmp( type, LEGACY_DSA_V2_PUBLIC_BLOB ))
     {
         status = import_legacy_dsa_key( alg->id, input, input_len, &key );
+    }
+    else if (!wcscmp( type, BCRYPT_OPAQUE_KEY_BLOB ))
+    {
+        TRACE( "opaque blobs are only supported for symmetric keys\n" );
+        return STATUS_NOT_SUPPORTED;
     }
     else
     {

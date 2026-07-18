@@ -380,6 +380,8 @@ static void set_user_shared_data_time(void)
 {
     timeout_t tick_count = monotonic_time / 10000;
     static timeout_t last_timezone_update, last_timezone_bias = 65535, adjusted_timezone_bias;
+    static timeout_t interrupt_time_bias;
+    timeout_t unbiased_time = unbiased_counter();
     static int current_year = -1;
     timeout_t timezone_bias;
     struct tm *tm, tm1, tm2;
@@ -420,6 +422,12 @@ static void set_user_shared_data_time(void)
     atomic_store_long(&user_shared_data->InterruptTime.High2Time, monotonic_time >> 32);
     atomic_store_ulong(&user_shared_data->InterruptTime.LowPart, monotonic_time);
     atomic_store_long(&user_shared_data->InterruptTime.High1Time, monotonic_time >> 32);
+
+    /* The two host counters share an epoch and differ only by time spent suspended.
+     * Keep the maximum to avoid making unbiased time jump backwards from sampling jitter. */
+    if (monotonic_time > unbiased_time && monotonic_time - unbiased_time > interrupt_time_bias)
+        interrupt_time_bias = monotonic_time - unbiased_time;
+    WriteRelease64( (LONG64 volatile *)&user_shared_data->InterruptTimeBias, interrupt_time_bias );
 
     atomic_store_long(&user_shared_data->TickCount.High2Time, tick_count >> 32);
     atomic_store_ulong(&user_shared_data->TickCount.LowPart, tick_count);

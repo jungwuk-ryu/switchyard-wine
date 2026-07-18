@@ -291,6 +291,10 @@ C_ASSERT( sizeof(struct afd_get_events_params) == 56 );
 #define IOCTL_AFD_WINE_SET_TCP_KEEPCNT                  WINE_AFD_IOC(302)
 #define IOCTL_AFD_WINE_GET_TCP_KEEPINTVL                WINE_AFD_IOC(303)
 #define IOCTL_AFD_WINE_SET_TCP_KEEPINTVL                WINE_AFD_IOC(304)
+#define IOCTL_AFD_WINE_GET_SO_RANDOMIZE_PORT             WINE_AFD_IOC(305)
+#define IOCTL_AFD_WINE_SET_SO_RANDOMIZE_PORT             WINE_AFD_IOC(306)
+#define IOCTL_AFD_WINE_GET_SO_REUSE_UNICASTPORT           WINE_AFD_IOC(307)
+#define IOCTL_AFD_WINE_SET_SO_REUSE_UNICASTPORT           WINE_AFD_IOC(308)
 
 struct afd_iovec
 {

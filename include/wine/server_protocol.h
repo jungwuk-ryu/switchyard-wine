@@ -1293,6 +1293,22 @@ struct get_process_info_reply
 
 
 
+struct get_process_native_info_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_process_native_info_reply
+{
+    struct reply_header __header;
+    unsigned int handle_count;
+    int          unix_pid;
+    unsigned int power_control;
+    unsigned int power_state;
+};
+
+
+
 struct get_process_debug_info_request
 {
     struct request_header __header;
@@ -1353,7 +1369,9 @@ struct set_process_info_request
     int          disable_boost;
     obj_handle_t token;
     int          mask;
-    char __pad_44[4];
+    unsigned int power_control;
+    unsigned int power_state;
+    char __pad_52[4];
 };
 struct set_process_info_reply
 {
@@ -1364,6 +1382,7 @@ struct set_process_info_reply
 #define SET_PROCESS_INFO_DISABLE_BOOST 0x04
 #define SET_PROCESS_INFO_AFFINITY      0x08
 #define SET_PROCESS_INFO_TOKEN         0x10
+#define SET_PROCESS_INFO_POWER         0x20
 
 
 
@@ -1407,9 +1426,45 @@ struct get_thread_times_reply
     struct reply_header __header;
     timeout_t    creation_time;
     timeout_t    exit_time;
+    timeout_t    kernel_time;
+    timeout_t    user_time;
     int          unix_pid;
     int          unix_tid;
 };
+
+
+
+struct get_thread_native_info_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_thread_native_info_reply
+{
+    struct reply_header __header;
+    unsigned int page_priority;
+    unsigned int power_control;
+    unsigned int power_state;
+    char __pad_20[4];
+};
+
+
+
+struct set_thread_native_info_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+    unsigned int mask;
+    unsigned int page_priority;
+    unsigned int power_control;
+    unsigned int power_state;
+};
+struct set_thread_native_info_reply
+{
+    struct reply_header __header;
+};
+#define SET_THREAD_NATIVE_INFO_PAGE_PRIORITY 0x01
+#define SET_THREAD_NATIVE_INFO_POWER        0x02
 
 
 
@@ -5069,6 +5124,21 @@ struct get_system_handles_reply
 
 
 
+struct get_process_handles_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_process_handles_reply
+{
+    struct reply_header __header;
+    unsigned int count;
+    /* VARARG(handles,uints); */
+    char __pad_12[4];
+};
+
+
+
 struct get_tcp_connections_request
 {
     struct request_header __header;
@@ -6264,12 +6334,15 @@ enum request
     REQ_terminate_process,
     REQ_terminate_thread,
     REQ_get_process_info,
+    REQ_get_process_native_info,
     REQ_get_process_debug_info,
     REQ_get_process_image_name,
     REQ_get_process_vm_counters,
     REQ_set_process_info,
     REQ_get_thread_info,
     REQ_get_thread_times,
+    REQ_get_thread_native_info,
+    REQ_set_thread_native_info,
     REQ_set_thread_info,
     REQ_suspend_thread,
     REQ_resume_thread,
@@ -6490,6 +6563,7 @@ enum request
     REQ_set_security_object,
     REQ_get_security_object,
     REQ_get_system_handles,
+    REQ_get_process_handles,
     REQ_get_tcp_connections,
     REQ_get_udp_endpoints,
     REQ_create_mailslot,
@@ -6581,12 +6655,15 @@ union generic_request
     struct terminate_process_request terminate_process_request;
     struct terminate_thread_request terminate_thread_request;
     struct get_process_info_request get_process_info_request;
+    struct get_process_native_info_request get_process_native_info_request;
     struct get_process_debug_info_request get_process_debug_info_request;
     struct get_process_image_name_request get_process_image_name_request;
     struct get_process_vm_counters_request get_process_vm_counters_request;
     struct set_process_info_request set_process_info_request;
     struct get_thread_info_request get_thread_info_request;
     struct get_thread_times_request get_thread_times_request;
+    struct get_thread_native_info_request get_thread_native_info_request;
+    struct set_thread_native_info_request set_thread_native_info_request;
     struct set_thread_info_request set_thread_info_request;
     struct suspend_thread_request suspend_thread_request;
     struct resume_thread_request resume_thread_request;
@@ -6807,6 +6884,7 @@ union generic_request
     struct set_security_object_request set_security_object_request;
     struct get_security_object_request get_security_object_request;
     struct get_system_handles_request get_system_handles_request;
+    struct get_process_handles_request get_process_handles_request;
     struct get_tcp_connections_request get_tcp_connections_request;
     struct get_udp_endpoints_request get_udp_endpoints_request;
     struct create_mailslot_request create_mailslot_request;
@@ -6896,12 +6974,15 @@ union generic_reply
     struct terminate_process_reply terminate_process_reply;
     struct terminate_thread_reply terminate_thread_reply;
     struct get_process_info_reply get_process_info_reply;
+    struct get_process_native_info_reply get_process_native_info_reply;
     struct get_process_debug_info_reply get_process_debug_info_reply;
     struct get_process_image_name_reply get_process_image_name_reply;
     struct get_process_vm_counters_reply get_process_vm_counters_reply;
     struct set_process_info_reply set_process_info_reply;
     struct get_thread_info_reply get_thread_info_reply;
     struct get_thread_times_reply get_thread_times_reply;
+    struct get_thread_native_info_reply get_thread_native_info_reply;
+    struct set_thread_native_info_reply set_thread_native_info_reply;
     struct set_thread_info_reply set_thread_info_reply;
     struct suspend_thread_reply suspend_thread_reply;
     struct resume_thread_reply resume_thread_reply;
@@ -7122,6 +7203,7 @@ union generic_reply
     struct set_security_object_reply set_security_object_reply;
     struct get_security_object_reply get_security_object_reply;
     struct get_system_handles_reply get_system_handles_reply;
+    struct get_process_handles_reply get_process_handles_reply;
     struct get_tcp_connections_reply get_tcp_connections_reply;
     struct get_udp_endpoints_reply get_udp_endpoints_reply;
     struct create_mailslot_reply create_mailslot_reply;
@@ -7198,6 +7280,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 953
+#define SERVER_PROTOCOL_VERSION 954
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

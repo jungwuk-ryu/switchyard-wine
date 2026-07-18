@@ -215,6 +215,19 @@ static void dump_get_process_info_reply( const struct get_process_info_reply *re
     dump_varargs_pe_image_info( ", image=", cur_size );
 }
 
+static void dump_get_process_native_info_request( const struct get_process_native_info_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_get_process_native_info_reply( const struct get_process_native_info_reply *req )
+{
+    fprintf( stderr, " handle_count=%08x", req->handle_count );
+    fprintf( stderr, ", unix_pid=%d", req->unix_pid );
+    fprintf( stderr, ", power_control=%08x", req->power_control );
+    fprintf( stderr, ", power_state=%08x", req->power_state );
+}
+
 static void dump_get_process_debug_info_request( const struct get_process_debug_info_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
@@ -264,6 +277,8 @@ static void dump_set_process_info_request( const struct set_process_info_request
     fprintf( stderr, ", disable_boost=%d", req->disable_boost );
     fprintf( stderr, ", token=%04x", req->token );
     fprintf( stderr, ", mask=%d", req->mask );
+    fprintf( stderr, ", power_control=%08x", req->power_control );
+    fprintf( stderr, ", power_state=%08x", req->power_state );
 }
 
 static void dump_get_thread_info_request( const struct get_thread_info_request *req )
@@ -297,8 +312,31 @@ static void dump_get_thread_times_reply( const struct get_thread_times_reply *re
 {
     dump_timeout( " creation_time=", &req->creation_time );
     dump_timeout( ", exit_time=", &req->exit_time );
+    dump_timeout( ", kernel_time=", &req->kernel_time );
+    dump_timeout( ", user_time=", &req->user_time );
     fprintf( stderr, ", unix_pid=%d", req->unix_pid );
     fprintf( stderr, ", unix_tid=%d", req->unix_tid );
+}
+
+static void dump_get_thread_native_info_request( const struct get_thread_native_info_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_get_thread_native_info_reply( const struct get_thread_native_info_reply *req )
+{
+    fprintf( stderr, " page_priority=%08x", req->page_priority );
+    fprintf( stderr, ", power_control=%08x", req->power_control );
+    fprintf( stderr, ", power_state=%08x", req->power_state );
+}
+
+static void dump_set_thread_native_info_request( const struct set_thread_native_info_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    fprintf( stderr, ", mask=%08x", req->mask );
+    fprintf( stderr, ", page_priority=%08x", req->page_priority );
+    fprintf( stderr, ", power_control=%08x", req->power_control );
+    fprintf( stderr, ", power_state=%08x", req->power_state );
 }
 
 static void dump_set_thread_info_request( const struct set_thread_info_request *req )
@@ -2777,6 +2815,17 @@ static void dump_get_system_handles_reply( const struct get_system_handles_reply
     dump_varargs_handle_infos( ", data=", cur_size );
 }
 
+static void dump_get_process_handles_request( const struct get_process_handles_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_get_process_handles_reply( const struct get_process_handles_reply *req )
+{
+    fprintf( stderr, " count=%08x", req->count );
+    dump_varargs_uints( ", handles=", cur_size );
+}
+
 static void dump_get_tcp_connections_request( const struct get_tcp_connections_request *req )
 {
     fprintf( stderr, " state_filter=%08x", req->state_filter );
@@ -3563,12 +3612,15 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_terminate_process_request,
     (dump_func)dump_terminate_thread_request,
     (dump_func)dump_get_process_info_request,
+    (dump_func)dump_get_process_native_info_request,
     (dump_func)dump_get_process_debug_info_request,
     (dump_func)dump_get_process_image_name_request,
     (dump_func)dump_get_process_vm_counters_request,
     (dump_func)dump_set_process_info_request,
     (dump_func)dump_get_thread_info_request,
     (dump_func)dump_get_thread_times_request,
+    (dump_func)dump_get_thread_native_info_request,
+    (dump_func)dump_set_thread_native_info_request,
     (dump_func)dump_set_thread_info_request,
     (dump_func)dump_suspend_thread_request,
     (dump_func)dump_resume_thread_request,
@@ -3789,6 +3841,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_security_object_request,
     (dump_func)dump_get_security_object_request,
     (dump_func)dump_get_system_handles_request,
+    (dump_func)dump_get_process_handles_request,
     (dump_func)dump_get_tcp_connections_request,
     (dump_func)dump_get_udp_endpoints_request,
     (dump_func)dump_create_mailslot_request,
@@ -3877,12 +3930,15 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_terminate_process_reply,
     (dump_func)dump_terminate_thread_reply,
     (dump_func)dump_get_process_info_reply,
+    (dump_func)dump_get_process_native_info_reply,
     (dump_func)dump_get_process_debug_info_reply,
     (dump_func)dump_get_process_image_name_reply,
     (dump_func)dump_get_process_vm_counters_reply,
     NULL,
     (dump_func)dump_get_thread_info_reply,
     (dump_func)dump_get_thread_times_reply,
+    (dump_func)dump_get_thread_native_info_reply,
+    NULL,
     NULL,
     (dump_func)dump_suspend_thread_reply,
     (dump_func)dump_resume_thread_reply,
@@ -4103,6 +4159,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_get_security_object_reply,
     (dump_func)dump_get_system_handles_reply,
+    (dump_func)dump_get_process_handles_reply,
     (dump_func)dump_get_tcp_connections_reply,
     (dump_func)dump_get_udp_endpoints_reply,
     (dump_func)dump_create_mailslot_reply,
@@ -4191,12 +4248,15 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "terminate_process",
     "terminate_thread",
     "get_process_info",
+    "get_process_native_info",
     "get_process_debug_info",
     "get_process_image_name",
     "get_process_vm_counters",
     "set_process_info",
     "get_thread_info",
     "get_thread_times",
+    "get_thread_native_info",
+    "set_thread_native_info",
     "set_thread_info",
     "suspend_thread",
     "resume_thread",
@@ -4417,6 +4477,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "set_security_object",
     "get_security_object",
     "get_system_handles",
+    "get_process_handles",
     "get_tcp_connections",
     "get_udp_endpoints",
     "create_mailslot",

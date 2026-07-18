@@ -2626,22 +2626,31 @@ static ULONG WINAPI propertystore_Release(IPropertyStore *iface)
 static HRESULT WINAPI propertystore_GetCount(IPropertyStore *iface, DWORD *props)
 {
     IShellLinkImpl *This = impl_from_IPropertyStore(iface);
-    FIXME("(%p)->(%p): stub\n", This, props);
-    return E_NOTIMPL;
+    TRACE("(%p)->(%p)\n", This, props);
+
+    if (!props) return E_POINTER;
+    /* Shell link property-store data blocks are not currently persisted, so
+     * links loaded by this implementation expose an empty store. */
+    *props = 0;
+    return S_OK;
 }
 
 static HRESULT WINAPI propertystore_GetAt(IPropertyStore *iface, DWORD propid, PROPERTYKEY *key)
 {
     IShellLinkImpl *This = impl_from_IPropertyStore(iface);
-    FIXME("(%p)->(%ld %p): stub\n", This, propid, key);
-    return E_NOTIMPL;
+    TRACE("(%p)->(%ld %p)\n", This, propid, key);
+    if (!key) return E_POINTER;
+    return E_INVALIDARG;
 }
 
 static HRESULT WINAPI propertystore_GetValue(IPropertyStore *iface, REFPROPERTYKEY key, PROPVARIANT *value)
 {
     IShellLinkImpl *This = impl_from_IPropertyStore(iface);
-    FIXME("(%p)->(%p %p): stub\n", This, key, value);
-    return E_NOTIMPL;
+    TRACE("(%p)->(%p %p)\n", This, key, value);
+
+    if (!key || !value) return E_POINTER;
+    PropVariantInit(value);
+    return S_OK;
 }
 
 static HRESULT WINAPI propertystore_SetValue(IPropertyStore *iface, REFPROPERTYKEY key, REFPROPVARIANT value)

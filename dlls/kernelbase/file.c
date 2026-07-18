@@ -2740,11 +2740,14 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
     IO_STATUS_BLOCK io;
     OBJECT_ATTRIBUTES attr;
     FILE_BASIC_INFORMATION info;
+    DWORD move_flags = flags & REPLACEFILE_WRITE_THROUGH ? MOVEFILE_WRITE_THROUGH : 0;
 
     TRACE( "%s %s %s 0x%08lx %p %p\n", debugstr_w(replaced), debugstr_w(replacement), debugstr_w(backup),
            flags, exclude, reserved );
 
-    if (flags) FIXME("Ignoring flags %lx\n", flags);
+    if (flags & ~(REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_MERGE_ERRORS))
+        FIXME("Ignoring unsupported flags %lx\n",
+              flags & ~(REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_MERGE_ERRORS));
 
     /* First two arguments are mandatory */
     if (!replaced || !replacement)
@@ -2791,7 +2794,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
     /* If the user wants a backup then that needs to be performed first */
     if (backup)
     {
-        if (!MoveFileExW( replaced, backup, MOVEFILE_REPLACE_EXISTING )) return FALSE;
+        if (!MoveFileExW( replaced, backup, MOVEFILE_REPLACE_EXISTING | move_flags )) return FALSE;
     }
     else
     {
@@ -2809,7 +2812,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
         *filePart = 0;
 
         if (!GetTempFileNameW( temp_path, L"rf", 0, temp_file ) ||
-            !MoveFileExW( replaced, temp_file, MOVEFILE_REPLACE_EXISTING ))
+            !MoveFileExW( replaced, temp_file, MOVEFILE_REPLACE_EXISTING | move_flags ))
             return FALSE;
 
         DeleteFileW( temp_file );
@@ -2819,7 +2822,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
      * Now that the backup has been performed (if requested), copy the replacement
      * into place
      */
-    if (!MoveFileExW( replacement, replaced, 0 ))
+    if (!MoveFileExW( replacement, replaced, move_flags ))
     {
         /* on failure we need to indicate whether a backup was made */
         if (!backup)

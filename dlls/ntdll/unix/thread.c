@@ -63,7 +63,9 @@
 #endif
 
 #ifdef __APPLE__
+#include <libproc.h>
 #include <mach/mach.h>
+#include <sys/resource.h>
 #endif
 #ifdef __FreeBSD__
 #include <sys/thr.h>
@@ -2028,6 +2030,42 @@ BOOL get_thread_times(int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time, LA
     }
     procstat_close(pstat);
     return ret;
+#elif defined(__APPLE__)
+    if (unix_tid == -1)
+    {
+        struct rusage_info_v4 usage;
+
+        if (proc_pid_rusage( unix_pid, RUSAGE_INFO_V4, (rusage_info_t *)&usage )) return FALSE;
+        kernel_time->QuadPart = usage.ri_system_time / 100;
+        user_time->QuadPart = usage.ri_user_time / 100;
+        return TRUE;
+    }
+    else if (unix_pid == getpid())
+    {
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+        mach_msg_type_name_t type;
+        mach_port_t thread_port;
+        kern_return_t ret;
+
+        ret = mach_port_extract_right( mach_task_self(), unix_tid, MACH_MSG_TYPE_COPY_SEND,
+                                       &thread_port, &type );
+        if (ret != KERN_SUCCESS)
+            return FALSE;
+
+        ret = thread_info( thread_port, THREAD_BASIC_INFO, (thread_info_t)&info, &count );
+        mach_port_deallocate( mach_task_self(), thread_port );
+        if (ret != KERN_SUCCESS) return FALSE;
+
+        kernel_time->QuadPart = info.system_time.seconds * (ULONGLONG)10000000
+                                + info.system_time.microseconds * 10;
+        user_time->QuadPart = info.user_time.seconds * (ULONGLONG)10000000
+                              + info.user_time.microseconds * 10;
+        return TRUE;
+    }
+    /* Mach port names are task-local. The target process' unix_tid cannot be
+     * resolved in this task without acquiring its task port. */
+    return FALSE;
 #else
     static int once;
     if (!once++) FIXME("not implemented on this platform\n");
@@ -2216,8 +2254,9 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
 
     case ThreadTimes:
     {
-        KERNEL_USER_TIMES kusrt;
-        int unix_pid, unix_tid;
+        KERNEL_USER_TIMES kusrt = {{{0}}};
+        int unix_pid = -1, unix_tid = -1;
+        BOOL have_cpu_times = FALSE;
 
         SERVER_START_REQ( get_thread_times )
         {
@@ -2227,6 +2266,12 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
             {
                 kusrt.CreateTime.QuadPart = reply->creation_time;
                 kusrt.ExitTime.QuadPart = reply->exit_time;
+                if (reply->kernel_time != -1 && reply->user_time != -1)
+                {
+                    kusrt.KernelTime.QuadPart = reply->kernel_time;
+                    kusrt.UserTime.QuadPart = reply->user_time;
+                    have_cpu_times = TRUE;
+                }
                 unix_pid = reply->unix_pid;
                 unix_tid = reply->unix_tid;
             }
@@ -2234,10 +2279,9 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         SERVER_END_REQ;
         if (status == STATUS_SUCCESS)
         {
-            BOOL ret = FALSE;
+            BOOL ret = have_cpu_times;
 
-            kusrt.KernelTime.QuadPart = kusrt.UserTime.QuadPart = 0;
-            if (unix_pid != -1 && unix_tid != -1)
+            if (!ret && unix_pid != -1 && unix_tid != -1)
                 ret = get_thread_times( unix_pid, unix_tid, &kusrt.KernelTime, &kusrt.UserTime );
             if (!ret && handle == GetCurrentThread())
             {
@@ -2251,6 +2295,102 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
             }
             if (data) memcpy( data, &kusrt, min( length, sizeof(kusrt) ));
             if (ret_len) *ret_len = min( length, sizeof(kusrt) );
+        }
+        return status;
+    }
+
+    case ThreadCycleTime:
+    {
+        PROCESS_CYCLE_TIME_INFORMATION cycles = {0};
+        LARGE_INTEGER kernel_time = {0}, user_time = {0};
+        int unix_pid = -1, unix_tid = -1;
+        BOOL have_cpu_times = FALSE;
+
+        if (length != sizeof(cycles)) return STATUS_INFO_LENGTH_MISMATCH;
+        if (!data) return STATUS_ACCESS_VIOLATION;
+
+        SERVER_START_REQ( get_thread_times )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            status = wine_server_call( req );
+            if (!status)
+            {
+                if (reply->kernel_time != -1 && reply->user_time != -1)
+                {
+                    kernel_time.QuadPart = reply->kernel_time;
+                    user_time.QuadPart = reply->user_time;
+                    have_cpu_times = TRUE;
+                }
+                unix_pid = reply->unix_pid;
+                unix_tid = reply->unix_tid;
+            }
+        }
+        SERVER_END_REQ;
+
+        if (!status && !have_cpu_times &&
+            !get_thread_times( unix_pid, unix_tid, &kernel_time, &user_time ))
+            status = STATUS_NOT_SUPPORTED;
+        if (!status)
+        {
+            /* The host CPU-time counter is monotonic and suitable for consumers
+             * that use cycle-time deltas, even where per-thread cycle counters
+             * are not exposed by the host. */
+            cycles.AccumulatedCycles = kernel_time.QuadPart + user_time.QuadPart;
+            cycles.CurrentCycleCount = cycles.AccumulatedCycles;
+        }
+        if (!status)
+        {
+            memcpy( data, &cycles, sizeof(cycles) );
+            if (ret_len) *ret_len = sizeof(cycles);
+        }
+        return status;
+    }
+
+    case ThreadPowerThrottlingState:
+    {
+        THREAD_POWER_THROTTLING_STATE info =
+        {
+            THREAD_POWER_THROTTLING_CURRENT_VERSION, 0, 0
+        };
+
+        if (length != sizeof(info)) return STATUS_INFO_LENGTH_MISMATCH;
+        if (!data) return STATUS_ACCESS_VIOLATION;
+
+        SERVER_START_REQ( get_thread_native_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            if (!(status = wine_server_call( req )))
+            {
+                info.ControlMask = reply->power_control;
+                info.StateMask = reply->power_state;
+            }
+        }
+        SERVER_END_REQ;
+        if (!status)
+        {
+            memcpy( data, &info, sizeof(info) );
+            if (ret_len) *ret_len = sizeof(info);
+        }
+        return status;
+    }
+
+    case ThreadPagePriority:
+    {
+        MEMORY_PRIORITY_INFORMATION info;
+
+        if (length != sizeof(info)) return STATUS_INFO_LENGTH_MISMATCH;
+        if (!data) return STATUS_ACCESS_VIOLATION;
+
+        SERVER_START_REQ( get_thread_native_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            if (!(status = wine_server_call( req ))) info.MemoryPriority = reply->page_priority;
+        }
+        SERVER_END_REQ;
+        if (!status)
+        {
+            memcpy( data, &info, sizeof(info) );
+            if (ret_len) *ret_len = sizeof(info);
         }
         return status;
     }
@@ -2650,10 +2790,51 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
         return STATUS_SUCCESS;
 
     case ThreadPowerThrottlingState:
-        if (length != sizeof(THREAD_POWER_THROTTLING_STATE)) return STATUS_INFO_LENGTH_MISMATCH;
-        if (!data) return STATUS_ACCESS_VIOLATION;
-        FIXME( "ThreadPowerThrottling stub!\n" );
-        return STATUS_SUCCESS;
+    {
+        const THREAD_POWER_THROTTLING_STATE *info = data;
+
+        if (length != sizeof(*info)) return STATUS_INFO_LENGTH_MISMATCH;
+        if (!info) return STATUS_ACCESS_VIOLATION;
+        if (info->Version != THREAD_POWER_THROTTLING_CURRENT_VERSION ||
+            info->ControlMask & ~THREAD_POWER_THROTTLING_EXECUTION_SPEED ||
+            info->StateMask & ~info->ControlMask)
+            return STATUS_INVALID_PARAMETER;
+
+        TRACE( "ThreadPowerThrottling hint control %#x, state %#x\n",
+               info->ControlMask, info->StateMask );
+        SERVER_START_REQ( set_thread_native_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->power_control = info->ControlMask;
+            req->power_state = info->StateMask;
+            req->mask = SET_THREAD_NATIVE_INFO_POWER;
+            status = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        return status;
+    }
+
+    case ThreadPagePriority:
+    {
+        const MEMORY_PRIORITY_INFORMATION *info = data;
+
+        if (length != sizeof(*info)) return STATUS_INFO_LENGTH_MISMATCH;
+        if (!info) return STATUS_ACCESS_VIOLATION;
+        if (info->MemoryPriority < MEMORY_PRIORITY_VERY_LOW ||
+            info->MemoryPriority > MEMORY_PRIORITY_NORMAL)
+            return STATUS_INVALID_PARAMETER;
+
+        TRACE( "ThreadPagePriority hint %u\n", info->MemoryPriority );
+        SERVER_START_REQ( set_thread_native_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->page_priority = info->MemoryPriority;
+            req->mask = SET_THREAD_NATIVE_INFO_PAGE_PRIORITY;
+            status = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        return status;
+    }
 
     case ThreadIdealProcessor:
     {

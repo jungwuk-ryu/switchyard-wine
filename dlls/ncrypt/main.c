@@ -41,6 +41,7 @@ static SECURITY_STATUS map_ntstatus(NTSTATUS status)
     case STATUS_INVALID_PARAMETER: return NTE_INVALID_PARAMETER;
     case STATUS_NO_MEMORY:         return NTE_NO_MEMORY;
     case STATUS_NOT_SUPPORTED:     return NTE_NOT_SUPPORTED;
+    case STATUS_NOT_IMPLEMENTED:   return NTE_NOT_SUPPORTED;
     case NTE_BAD_DATA:             return NTE_BAD_DATA;
     case STATUS_BUFFER_TOO_SMALL:  return NTE_BUFFER_TOO_SMALL;
     default:
@@ -242,7 +243,7 @@ SECURITY_STATUS WINAPI NCryptDecrypt(NCRYPT_KEY_HANDLE key, BYTE *input, DWORD i
 
 SECURITY_STATUS WINAPI NCryptDeleteKey(NCRYPT_KEY_HANDLE key, DWORD flags)
 {
-    FIXME("(%#Ix, %#lx): stub\n", key, flags);
+    FIXME("(%#Ix, %#lx): persistent key deletion is not supported\n", key, flags);
     return NTE_NOT_SUPPORTED;
 }
 
@@ -541,9 +542,16 @@ SECURITY_STATUS WINAPI NCryptOpenKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_HAN
 
 SECURITY_STATUS WINAPI NCryptOpenStorageProvider(NCRYPT_PROV_HANDLE *provider, const WCHAR *name, DWORD flags)
 {
+    static const WCHAR software_provider[] = L"Microsoft Software Key Storage Provider";
     struct object *object;
 
-    FIXME("(%p, %s, %#lx): stub\n", provider, wine_dbgstr_w(name), flags);
+    TRACE("(%p, %s, %#lx)\n", provider, wine_dbgstr_w(name), flags);
+
+    if (!provider) return HRESULT_FROM_WIN32(RPC_X_NULL_REF_POINTER);
+    *provider = 0;
+    if (flags) return NTE_BAD_FLAGS;
+    if (name && !lstrcmpiW(name, MS_PLATFORM_CRYPTO_PROVIDER)) return NTE_NOT_SUPPORTED;
+    if (name && lstrcmpiW(name, software_provider)) return NTE_BAD_PROVIDER;
 
     if (!(object = allocate_object(STORAGE_PROVIDER)))
     {
@@ -571,7 +579,7 @@ SECURITY_STATUS WINAPI NCryptSignHash(NCRYPT_KEY_HANDLE handle, void *padding, B
     struct object *object = (struct object *)handle;
 
     TRACE("(%#Ix, %p, %p, %lu, %p, %lu, %#lx)\n", handle, padding, value, value_len, sig, sig_len, flags);
-    if (flags & NCRYPT_SILENT_FLAG) FIXME("Silent flag not implemented\n");
+    if (flags & NCRYPT_SILENT_FLAG) TRACE("No user interaction is required.\n");
 
     if (!object || object->type != KEY) return NTE_INVALID_HANDLE;
 

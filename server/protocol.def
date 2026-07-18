@@ -1244,6 +1244,17 @@ typedef volatile struct
 @END
 
 
+/* Retrieve host-side information about a process */
+@REQ(get_process_native_info)
+    obj_handle_t handle;           /* process handle */
+@REPLY
+    unsigned int handle_count;     /* number of handles in the process */
+    int          unix_pid;         /* Unix process id */
+    unsigned int power_control;    /* process power throttling control mask */
+    unsigned int power_state;      /* process power throttling state mask */
+@END
+
+
 /* Retrieve debug information about a process */
 @REQ(get_process_debug_info)
     obj_handle_t handle;           /* process handle */
@@ -1287,12 +1298,15 @@ typedef volatile struct
     int          disable_boost; /* disable process priority boost */
     obj_handle_t token;        /* primary token */
     int          mask;         /* setting mask (see below) */
+    unsigned int power_control;/* process power throttling control mask */
+    unsigned int power_state;  /* process power throttling state mask */
 @END
 #define SET_PROCESS_INFO_PRIORITY      0x01
 #define SET_PROCESS_INFO_BASE_PRIORITY 0x02
 #define SET_PROCESS_INFO_DISABLE_BOOST 0x04
 #define SET_PROCESS_INFO_AFFINITY      0x08
 #define SET_PROCESS_INFO_TOKEN         0x10
+#define SET_PROCESS_INFO_POWER         0x20
 
 
 /* Retrieve information about a thread */
@@ -1325,9 +1339,33 @@ typedef volatile struct
 @REPLY
     timeout_t    creation_time; /* thread creation time */
     timeout_t    exit_time;     /* thread exit time */
+    timeout_t    kernel_time;   /* host kernel CPU time, or -1 */
+    timeout_t    user_time;     /* host user CPU time, or -1 */
     int          unix_pid;      /* thread native pid */
     int          unix_tid;      /* thread native pid */
 @END
+
+
+/* Retrieve thread scheduling hints */
+@REQ(get_thread_native_info)
+    obj_handle_t handle;          /* thread handle */
+@REPLY
+    unsigned int page_priority;   /* memory page priority */
+    unsigned int power_control;   /* power throttling control mask */
+    unsigned int power_state;     /* power throttling state mask */
+@END
+
+
+/* Set thread scheduling hints */
+@REQ(set_thread_native_info)
+    obj_handle_t handle;          /* thread handle */
+    unsigned int mask;            /* setting mask (see below) */
+    unsigned int page_priority;   /* memory page priority */
+    unsigned int power_control;   /* power throttling control mask */
+    unsigned int power_state;     /* power throttling state mask */
+@END
+#define SET_THREAD_NATIVE_INFO_PAGE_PRIORITY 0x01
+#define SET_THREAD_NATIVE_INFO_POWER        0x02
 
 
 /* Set a thread information */
@@ -3621,6 +3659,15 @@ struct handle_info
 @REPLY
     unsigned int    count;        /* number of handles */
     VARARG(data,handle_infos);    /* array of handle_infos */
+@END
+
+
+/* Return the handle values in a process handle table */
+@REQ(get_process_handles)
+    obj_handle_t handle;          /* process handle */
+@REPLY
+    unsigned int count;           /* number of handles */
+    VARARG(handles,uints);        /* array of handle values */
 @END
 
 

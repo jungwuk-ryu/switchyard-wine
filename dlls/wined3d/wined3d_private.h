@@ -2593,6 +2593,7 @@ HRESULT wined3d_output_get_gamma_ramp(struct wined3d_output *output, struct wine
 struct wined3d_adapter
 {
     unsigned int ordinal;
+    bool is_software;
 
     struct wined3d_d3d_info d3d_info;
     struct wined3d_driver_info driver_info;

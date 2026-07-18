@@ -540,10 +540,14 @@ DWORD WINAPI DECLSPEC_HOTPATCH QueueUserAPC2( PAPCFUNC func, HANDLE thread, ULON
  */
 BOOL WINAPI DECLSPEC_HOTPATCH QueryThreadCycleTime( HANDLE thread, ULONG64 *cycle )
 {
-    static int once;
-    if (!once++) FIXME( "(%p,%p): stub!\n", thread, cycle );
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
-    return FALSE;
+    PROCESS_CYCLE_TIME_INFORMATION time;
+
+    if (!set_ntstatus( NtQueryInformationThread( thread, ThreadCycleTime,
+                                                  &time, sizeof(time), NULL ) ))
+        return FALSE;
+
+    *cycle = time.AccumulatedCycles;
+    return TRUE;
 }
 
 

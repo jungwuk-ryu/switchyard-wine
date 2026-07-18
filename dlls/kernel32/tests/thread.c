@@ -83,6 +83,7 @@ static BOOL (WINAPI *pQueueUserWorkItem)(LPTHREAD_START_ROUTINE,PVOID,ULONG);
 static BOOL (WINAPI *pSetThreadPriorityBoost)(HANDLE,BOOL);
 static BOOL (WINAPI *pSetProcessPriorityBoost)(HANDLE,BOOL);
 static BOOL (WINAPI *pSetThreadStackGuarantee)(ULONG*);
+static BOOL (WINAPI *pSetThreadInformation)(HANDLE,THREAD_INFORMATION_CLASS,void *,DWORD);
 static BOOL (WINAPI *pRegisterWaitForSingleObject)(PHANDLE,HANDLE,WAITORTIMERCALLBACK,PVOID,ULONG,ULONG);
 static BOOL (WINAPI *pUnregisterWait)(HANDLE);
 static BOOL (WINAPI *pIsWow64Process)(HANDLE,PBOOL);
@@ -104,6 +105,7 @@ static HRESULT (WINAPI *pGetThreadDescription)(HANDLE,WCHAR **);
 static HANDLE (WINAPI *pCreateRemoteThreadEx)(HANDLE, SECURITY_ATTRIBUTES *, SIZE_T, LPTHREAD_START_ROUTINE,
                                               LPVOID, DWORD, LPPROC_THREAD_ATTRIBUTE_LIST, DWORD *);
 static NTSTATUS (WINAPI *pNtSetInformationThread)(HANDLE,THREADINFOCLASS,LPCVOID,ULONG);
+static NTSTATUS (WINAPI *pNtGetNextThread)(HANDLE,HANDLE,ACCESS_MASK,ULONG,ULONG,HANDLE *);
 static PVOID (WINAPI *pRtlAddVectoredExceptionHandler)(ULONG,PVECTORED_EXCEPTION_HANDLER);
 static ULONG (WINAPI *pRtlRemoveVectoredExceptionHandler)(PVOID);
 static NTSTATUS (WINAPI *pNtQueryInformationThread)(HANDLE,THREADINFOCLASS,PVOID,ULONG,PULONG);
@@ -869,6 +871,103 @@ static VOID test_GetThreadTimes(void)
      if(access_thread!=NULL) {
        ok(CloseHandle(access_thread)!=0,"CloseHandle Failed\n");
      }
+}
+
+static void test_QueryThreadCycleTime(void)
+{
+    ULONG64 first, second;
+    HANDLE process, thread;
+    NTSTATUS status;
+    BOOL ret;
+
+    ret = QueryThreadCycleTime( GetCurrentThread(), &first );
+    if (!ret && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
+    {
+        win_skip( "QueryThreadCycleTime is not implemented\n" );
+        return;
+    }
+    ok( ret, "QueryThreadCycleTime failed, error %lu\n", GetLastError() );
+
+    ret = QueryThreadCycleTime( GetCurrentThread(), &second );
+    ok( ret, "QueryThreadCycleTime failed, error %lu\n", GetLastError() );
+    ok( second >= first, "Thread cycle time decreased from %I64u to %I64u\n", first, second );
+
+    if (!pNtGetNextThread) return;
+    process = create_target_process( "sleep" );
+    status = pNtGetNextThread( process, NULL, THREAD_QUERY_LIMITED_INFORMATION, 0, 0, &thread );
+    ok( !status, "NtGetNextThread failed, status %#lx\n", status );
+    if (!status)
+    {
+        ret = QueryThreadCycleTime( thread, &first );
+        ok( ret, "Cross-process QueryThreadCycleTime failed, error %lu\n", GetLastError() );
+        CloseHandle( thread );
+    }
+    TerminateProcess( process, 0 );
+    WaitForSingleObject( process, 5000 );
+    CloseHandle( process );
+}
+
+static void test_ThreadInformationHints(void)
+{
+    THREAD_POWER_THROTTLING_STATE power, original_power, queried_power;
+    MEMORY_PRIORITY_INFORMATION memory, original_memory, queried_memory;
+    ULONG len;
+    NTSTATUS status;
+    BOOL ret;
+
+    if (!pSetThreadInformation || !pNtQueryInformationThread)
+    {
+        win_skip( "Thread information APIs are not available\n" );
+        return;
+    }
+
+    status = pNtQueryInformationThread( GetCurrentThread(), ThreadPagePriority,
+                                        &original_memory, sizeof(original_memory), &len );
+    if (!status)
+    {
+        memory.MemoryPriority = MEMORY_PRIORITY_LOW;
+        ret = pSetThreadInformation( GetCurrentThread(), ThreadMemoryPriority,
+                                     &memory, sizeof(memory) );
+        ok( ret, "SetThreadInformation failed, error %lu\n", GetLastError() );
+        status = pNtQueryInformationThread( GetCurrentThread(), ThreadPagePriority,
+                                            &queried_memory, sizeof(queried_memory), &len );
+        ok( !status, "NtQueryInformationThread failed, status %#lx\n", status );
+        ok( queried_memory.MemoryPriority == memory.MemoryPriority,
+            "Expected memory priority %lu, got %lu\n",
+            memory.MemoryPriority, queried_memory.MemoryPriority );
+        pSetThreadInformation( GetCurrentThread(), ThreadMemoryPriority,
+                               &original_memory, sizeof(original_memory) );
+
+        memory.MemoryPriority = 0;
+        SetLastError( 0xdeadbeef );
+        ret = pSetThreadInformation( GetCurrentThread(), ThreadMemoryPriority,
+                                     &memory, sizeof(memory) );
+        ok( !ret && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Expected ERROR_INVALID_PARAMETER, got %lu\n", GetLastError() );
+    }
+
+    status = pNtQueryInformationThread( GetCurrentThread(), ThreadPowerThrottlingState,
+                                        &original_power, sizeof(original_power), &len );
+    if (!status)
+    {
+        power.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+        power.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        power.StateMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        ret = pSetThreadInformation( GetCurrentThread(), ThreadPowerThrottling,
+                                     &power, sizeof(power) );
+        ok( ret, "SetThreadInformation failed, error %lu\n", GetLastError() );
+        status = pNtQueryInformationThread( GetCurrentThread(), ThreadPowerThrottlingState,
+                                            &queried_power, sizeof(queried_power), &len );
+        ok( !status, "NtQueryInformationThread failed, status %#lx\n", status );
+        ok( queried_power.Version == power.Version, "Expected version %lu, got %lu\n",
+            power.Version, queried_power.Version );
+        ok( queried_power.ControlMask == power.ControlMask, "Expected control mask %#lx, got %#lx\n",
+            power.ControlMask, queried_power.ControlMask );
+        ok( queried_power.StateMask == power.StateMask, "Expected state mask %#lx, got %#lx\n",
+            power.StateMask, queried_power.StateMask );
+        pSetThreadInformation( GetCurrentThread(), ThreadPowerThrottling,
+                               &original_power, sizeof(original_power) );
+    }
 }
 
 /* Check the processor affinity functions */
@@ -2617,6 +2716,7 @@ static void init_funcs(void)
     X(SetThreadPriorityBoost);
     X(SetProcessPriorityBoost);
     X(SetThreadStackGuarantee);
+    X(SetThreadInformation);
     X(RegisterWaitForSingleObject);
     X(UnregisterWait);
     X(IsWow64Process);
@@ -2651,6 +2751,7 @@ static void init_funcs(void)
    if (ntdll)
    {
        X(NtQueryInformationThread);
+       X(NtGetNextThread);
        X(RtlGetThreadErrorMode);
        X(NtSetInformationThread);
        X(RtlAddVectoredExceptionHandler);
@@ -2779,6 +2880,8 @@ START_TEST(thread)
    test_GetCurrentThreadStackLimits();
    test_SetThreadStackGuarantee();
    test_GetThreadTimes();
+   test_QueryThreadCycleTime();
+   test_ThreadInformationHints();
    test_thread_processor();
    test_GetThreadExitCode();
 #ifdef __i386__

@@ -4430,12 +4430,12 @@ static void test_ReplaceFileW(void)
     ret = GetTempFileNameW(temp_path, prefix, 0, backup);
     ok(ret != 0, "GetTempFileNameW error (backup) %ld\n", GetLastError());
 
-    ret = pReplaceFileW(replaced, replacement, backup, 0, 0, 0);
+    ret = pReplaceFileW(replaced, replacement, backup, REPLACEFILE_IGNORE_MERGE_ERRORS, 0, 0);
     ok(ret, "ReplaceFileW: error %ld\n", GetLastError());
 
     ret = GetTempFileNameW(temp_path, prefix, 0, replacement);
     ok(ret != 0, "GetTempFileNameW error (replacement) %ld\n", GetLastError());
-    ret = pReplaceFileW(replaced, replacement, NULL, 0, 0, 0);
+    ret = pReplaceFileW(replaced, replacement, NULL, REPLACEFILE_WRITE_THROUGH, 0, 0);
     ok(ret || GetLastError() == ERROR_ACCESS_DENIED,
        "ReplaceFileW: error %ld\n", GetLastError());
 

@@ -2308,6 +2308,10 @@ DWORD WINAPI SetEntriesInAclW( ULONG count, PEXPLICIT_ACCESSW pEntries,
                                             pEntries[i].grfAccessPermissions,
                                             ppsid[i], FALSE, TRUE);
             break;
+        case REVOKE_ACCESS:
+            /* Matching allow ACEs are removed while copying the old ACL. */
+            status = STATUS_SUCCESS;
+            break;
         default:
             FIXME("unhandled access mode %d\n", pEntries[i].grfAccessMode);
         }

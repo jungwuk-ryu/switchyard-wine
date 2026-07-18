@@ -1082,6 +1082,96 @@ static const struct CertPropIDHeader *findPropID(const BYTE *buf, DWORD size,
     return ret;
 }
 
+static void testRegStoreChangeNotification(HCERTSTORE store, HKEY key)
+{
+    static const char value_name[] = "WineCrypt32NotifyTest";
+    HANDLE event, closed_event;
+    DWORD value, wait;
+    BOOL ret;
+    LONG rc;
+
+    event = CreateEventW(NULL, TRUE, TRUE, NULL);
+    ok(event != NULL, "CreateEventW failed: %08lx\n", GetLastError());
+    if (!event)
+        return;
+
+    ret = CertControlStore(store, 0, CERT_STORE_CTRL_NOTIFY_CHANGE, &event);
+    ok(ret, "CertControlStore(NOTIFY_CHANGE) failed: %08lx\n", GetLastError());
+    if (ret)
+    {
+        wait = WaitForSingleObject(event, 0);
+        ok(wait == WAIT_TIMEOUT, "Expected WAIT_TIMEOUT, got %lu\n", wait);
+
+        value = 1;
+        rc = RegSetValueExA(key, value_name, 0, REG_DWORD, (BYTE *)&value, sizeof(value));
+        ok(!rc, "RegSetValueExA failed: %ld\n", rc);
+        wait = WaitForSingleObject(event, 1000);
+        ok(wait == WAIT_OBJECT_0, "Expected WAIT_OBJECT_0, got %lu\n", wait);
+
+        ret = CertControlStore(store, 0, CERT_STORE_CTRL_RESYNC, &event);
+        ok(ret, "CertControlStore(RESYNC) failed: %08lx\n", GetLastError());
+        wait = WaitForSingleObject(event, 0);
+        ok(wait == WAIT_TIMEOUT, "Expected WAIT_TIMEOUT, got %lu\n", wait);
+
+        value = 2;
+        rc = RegSetValueExA(key, value_name, 0, REG_DWORD, (BYTE *)&value, sizeof(value));
+        ok(!rc, "RegSetValueExA failed: %ld\n", rc);
+        wait = WaitForSingleObject(event, 1000);
+        ok(wait == WAIT_OBJECT_0, "Expected WAIT_OBJECT_0, got %lu\n", wait);
+
+        ret = CertControlStore(store, 0, CERT_STORE_CTRL_RESYNC, &event);
+        ok(ret, "CertControlStore(RESYNC) failed: %08lx\n", GetLastError());
+        ret = CertControlStore(store, 0, CERT_STORE_CTRL_CANCEL_NOTIFY, &event);
+        ok(ret, "CertControlStore(CANCEL_NOTIFY) failed: %08lx\n", GetLastError());
+
+        value = 3;
+        rc = RegSetValueExA(key, value_name, 0, REG_DWORD, (BYTE *)&value, sizeof(value));
+        ok(!rc, "RegSetValueExA failed: %ld\n", rc);
+        wait = WaitForSingleObject(event, 100);
+        ok(wait == WAIT_TIMEOUT, "Expected WAIT_TIMEOUT, got %lu\n", wait);
+    }
+    CloseHandle(event);
+
+    event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(event != NULL, "CreateEventW failed: %08lx\n", GetLastError());
+    if (event)
+    {
+        ret = CertControlStore(store, CERT_STORE_CTRL_INHIBIT_DUPLICATE_HANDLE_FLAG,
+            CERT_STORE_CTRL_NOTIFY_CHANGE, &event);
+        ok(ret, "CertControlStore(NOTIFY_CHANGE) failed: %08lx\n", GetLastError());
+        if (ret)
+        {
+            value = 4;
+            rc = RegSetValueExA(key, value_name, 0, REG_DWORD, (BYTE *)&value,
+                sizeof(value));
+            ok(!rc, "RegSetValueExA failed: %ld\n", rc);
+            wait = WaitForSingleObject(event, 1000);
+            ok(wait == WAIT_OBJECT_0, "Expected WAIT_OBJECT_0, got %lu\n", wait);
+            ret = CertControlStore(store, 0, CERT_STORE_CTRL_CANCEL_NOTIFY, &event);
+            ok(ret, "CertControlStore(CANCEL_NOTIFY) failed: %08lx\n", GetLastError());
+        }
+        CloseHandle(event);
+    }
+
+    closed_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(closed_event != NULL, "CreateEventW failed: %08lx\n", GetLastError());
+    if (closed_event)
+    {
+        ret = CertControlStore(store, 0, CERT_STORE_CTRL_NOTIFY_CHANGE, &closed_event);
+        ok(ret, "CertControlStore(NOTIFY_CHANGE) failed: %08lx\n", GetLastError());
+        CloseHandle(closed_event);
+        if (ret)
+        {
+            value = 5;
+            rc = RegSetValueExA(key, value_name, 0, REG_DWORD, (BYTE *)&value,
+                sizeof(value));
+            ok(!rc, "RegSetValueExA failed: %ld\n", rc);
+        }
+    }
+    rc = RegDeleteValueA(key, value_name);
+    ok(!rc, "RegDeleteValueA failed: %ld\n", rc);
+}
+
 static void testRegStore(void)
 {
     static const char tempKey[] = "Software\\Wine\\CryptTemp";
@@ -1122,6 +1212,8 @@ static void testRegStore(void)
 
         store = CertOpenStore(CERT_STORE_PROV_REG, 0, 0, 0, key);
         ok(store != 0, "CertOpenStore failed: %08lx\n", GetLastError());
+        ret = CertControlStore(store, 0, CERT_STORE_CTRL_NOTIFY_CHANGE, NULL);
+        ok(ret, "CertControlStore failed: %08lx\n", GetLastError());
         /* Add a certificate.  It isn't persisted right away, since it's only
          * added to the cache..
          */
@@ -1319,6 +1411,7 @@ static void testRegStore(void)
 
             RegCloseKey(subKey);
         }
+        testRegStoreChangeNotification(store, key);
         CertCloseStore(store, 0);
         /* Is delete allowed on a reg store? */
         store = CertOpenStore(CERT_STORE_PROV_REG, 0, 0,

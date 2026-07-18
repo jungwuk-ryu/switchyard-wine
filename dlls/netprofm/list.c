@@ -189,7 +189,7 @@ static HRESULT WINAPI connection_point_Advise(
     IUnknown *unk;
     HRESULT hr;
 
-    FIXME( "%p, %p, %p - semi-stub\n", cp, sink, cookie );
+    TRACE( "%p, %p, %p\n", cp, sink, cookie );
 
     if (!sink || !cookie)
         return E_POINTER;

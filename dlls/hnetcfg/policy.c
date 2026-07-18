@@ -1222,10 +1222,20 @@ static HRESULT WINAPI fwpolicy2_Invoke(INetFwPolicy2 *iface, DISPID dispIdMember
 
 static HRESULT WINAPI fwpolicy2_get_CurrentProfileTypes(INetFwPolicy2 *iface, LONG *profile)
 {
+    static LONG once;
     fw_policy2 *This = impl_from_INetFwPolicy2( iface );
 
-    FIXME("%p %p\n", This, profile);
-    return E_NOTIMPL;
+    TRACE("%p %p\n", This, profile);
+
+    if (!profile) return E_POINTER;
+
+    /* Wine has no Windows domain membership or firewall profile service.
+     * Treat the host network as public, which is the conservative Windows
+     * profile for an otherwise unclassified connection. */
+    if (!InterlockedExchange(&once, 1))
+        FIXME("Host firewall profile detection is unavailable; returning PUBLIC.\n");
+    *profile = NET_FW_PROFILE2_PUBLIC;
+    return S_OK;
 }
 
 static HRESULT WINAPI fwpolicy2_get_FirewallEnabled(INetFwPolicy2 *iface, NET_FW_PROFILE_TYPE2 profileType, VARIANT_BOOL *enabled)

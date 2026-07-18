@@ -33,6 +33,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(wbemprox);
 struct enum_class_object
 {
     IEnumWbemClassObject IEnumWbemClassObject_iface;
+    struct client_security client_security;
     LONG refs;
     struct query *query;
     UINT index;
@@ -61,6 +62,7 @@ static ULONG WINAPI enum_class_object_Release(
     {
         TRACE("destroying %p\n", ec);
         release_query( ec->query );
+        client_security_cleanup( &ec->client_security );
         free( ec );
     }
     return refs;
@@ -82,7 +84,8 @@ static HRESULT WINAPI enum_class_object_QueryInterface(
     }
     else if ( IsEqualGUID( riid, &IID_IClientSecurity ) )
     {
-        *ppvObject = &client_security;
+        *ppvObject = &ec->client_security.IClientSecurity_iface;
+        IClientSecurity_AddRef( *ppvObject );
         return S_OK;
     }
     else
@@ -208,6 +211,7 @@ HRESULT EnumWbemClassObject_create( struct query *query, LPVOID *ppObj )
     if (!(ec = malloc( sizeof(*ec) ))) return E_OUTOFMEMORY;
 
     ec->IEnumWbemClassObject_iface.lpVtbl = &enum_class_object_vtbl;
+    client_security_init( &ec->client_security, (IUnknown *)&ec->IEnumWbemClassObject_iface );
     ec->refs  = 1;
     ec->query = addref_query( query );
     ec->index = 0;
@@ -273,6 +277,7 @@ static void destroy_record( struct record *record )
 struct class_object
 {
     IWbemClassObject IWbemClassObject_iface;
+    struct client_security client_security;
     LONG refs;
     WCHAR *name;
     IEnumWbemClassObject *iter;
@@ -308,6 +313,7 @@ static ULONG WINAPI class_object_Release(
         if (co->iter) IEnumWbemClassObject_Release( co->iter );
         destroy_record( co->record );
         free( co->name );
+        client_security_cleanup( &co->client_security );
         free( co );
     }
     return refs;
@@ -329,7 +335,8 @@ static HRESULT WINAPI class_object_QueryInterface(
     }
     else if (IsEqualGUID( riid, &IID_IClientSecurity ))
     {
-        *ppvObject = &client_security;
+        *ppvObject = &co->client_security.IClientSecurity_iface;
+        IClientSecurity_AddRef( *ppvObject );
         return S_OK;
     }
     else
@@ -1105,6 +1112,7 @@ HRESULT create_class_object( enum wbm_namespace ns, const WCHAR *name, IEnumWbem
     co->index_property = 0;
     co->record         = record;
     co->ns             = ns;
+    client_security_init( &co->client_security, (IUnknown *)&co->IWbemClassObject_iface );
     if (iter) IEnumWbemClassObject_AddRef( iter );
 
     *obj = &co->IWbemClassObject_iface;

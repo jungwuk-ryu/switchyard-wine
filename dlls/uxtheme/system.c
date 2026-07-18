@@ -49,6 +49,8 @@ static DWORD dwThemeAppProperties = STAP_ALLOW_NONCLIENT | STAP_ALLOW_CONTROLS;
 static ATOM atWindowTheme;
 static ATOM atSubAppName;
 static ATOM atSubIdList;
+static ATOM atDarkModeAllowed;
+static LONG preferred_app_mode;
 
 static BOOL bThemeActive = FALSE;
 static WCHAR szCurrentTheme[MAX_PATH];
@@ -509,6 +511,7 @@ void UXTHEME_InitSystem(HINSTANCE hInst)
     atSubAppName         = GlobalAddAtomW(L"ux_subapp");
     atSubIdList          = GlobalAddAtomW(L"ux_subidlst");
     atDialogThemeEnabled = GlobalAddAtomW(L"ux_dialogtheme");
+    atDarkModeAllowed    = GlobalAddAtomW(L"ux_darkmode_allowed");
 
     UXTHEME_LoadTheme();
     ThemeHooksInstall();
@@ -523,6 +526,7 @@ void UXTHEME_UninitSystem(void)
     GlobalDeleteAtom(atSubAppName);
     GlobalDeleteAtom(atSubIdList);
     GlobalDeleteAtom(atDialogThemeEnabled);
+    GlobalDeleteAtom(atDarkModeAllowed);
 }
 
 /***********************************************************************
@@ -1302,8 +1306,13 @@ BOOLEAN WINAPI ShouldAppsUseDarkMode(void)
  */
 BOOLEAN WINAPI AllowDarkModeForWindow(HWND hwnd, BOOLEAN allow)
 {
-    FIXME("%p %d: stub\n", hwnd, allow);
-    return FALSE;
+    TRACE("%p %d\n", hwnd, allow);
+
+    if (!IsWindow(hwnd)) return FALSE;
+
+    /* Encode both states as non-NULL property values, so an explicit false is
+     * distinguishable from a window that has never opted in. */
+    return SetPropW(hwnd, (LPCWSTR)MAKEINTATOM(atDarkModeAllowed), ULongToHandle(allow ? 2 : 1));
 }
 
 /**********************************************************************
@@ -1312,8 +1321,15 @@ BOOLEAN WINAPI AllowDarkModeForWindow(HWND hwnd, BOOLEAN allow)
  */
 int WINAPI SetPreferredAppMode(int app_mode)
 {
-    FIXME("%d: stub\n", app_mode);
-    return 0;
+    int previous = InterlockedCompareExchange(&preferred_app_mode, 0, 0);
+
+    TRACE("%d\n", app_mode);
+
+    /* PreferredAppMode values are Default, AllowDark, ForceDark and
+     * ForceLight.  Max is a sentinel, not an application mode. */
+    if (app_mode >= 0 && app_mode < 4)
+        InterlockedExchange(&preferred_app_mode, app_mode);
+    return previous;
 }
 
 /**********************************************************************
@@ -1331,6 +1347,17 @@ void WINAPI FlushMenuThemes(void)
  */
 BOOLEAN WINAPI IsDarkModeAllowedForWindow(HWND hwnd)
 {
-    FIXME("%p: stub\n", hwnd);
-    return FALSE;
+    ULONG_PTR allowed;
+    LONG mode;
+
+    TRACE("%p\n", hwnd);
+
+    if (!IsWindow(hwnd)) return FALSE;
+    allowed = HandleToULong(GetPropW(hwnd, (LPCWSTR)MAKEINTATOM(atDarkModeAllowed)));
+    if (allowed != 2) return FALSE;
+
+    mode = InterlockedCompareExchange(&preferred_app_mode, 0, 0);
+    if (mode == 2) return TRUE;  /* ForceDark */
+    if (mode == 3) return FALSE; /* ForceLight */
+    return mode == 1 && ShouldAppsUseDarkMode();
 }

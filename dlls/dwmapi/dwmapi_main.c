@@ -121,11 +121,24 @@ HRESULT WINAPI DwmInvalidateIconicBitmaps(HWND hwnd)
  */
 HRESULT WINAPI DwmSetWindowAttribute(HWND hwnd, DWORD attributenum, LPCVOID attribute, DWORD size)
 {
-    static BOOL once;
+    TRACE("(%p, %lu, %p, %lu)\n", hwnd, attributenum, attribute, size);
 
-    if (!once++) FIXME("(%p, %lx, %p, %lx) stub\n", hwnd, attributenum, attribute, size);
+    if (!IsWindow(hwnd)) return E_HANDLE;
 
-    return S_OK;
+    switch (attributenum)
+    {
+    case DWMWA_TRANSITIONS_FORCEDISABLED:
+        if (!attribute) return E_INVALIDARG;
+        if (size < sizeof(BOOL)) return E_NOT_SUFFICIENT_BUFFER;
+
+        /* Wine has no DWM transition animations to enable or disable. */
+        return S_OK;
+    default:
+        FIXME("attribute %lu not implemented.\n", attributenum);
+        /* Preserve Wine's historical compatibility behavior for attributes
+         * that do not require observable compositor state. */
+        return S_OK;
+    }
 }
 
 /**********************************************************************
@@ -193,10 +206,10 @@ HRESULT WINAPI DwmEnableBlurBehindWindow(HWND hWnd, const DWM_BLURBEHIND *pBlurB
  */
 BOOL WINAPI DwmDefWindowProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam, LRESULT *plResult)
 {
-    static int i;
+    TRACE("(%p, %#x, %Ix, %Ix, %p)\n", hWnd, Msg, wParam, lParam, plResult);
 
-    if (!i++) FIXME("stub\n");
-
+    /* Wine does not draw DWM-managed non-client controls.  Let user32 handle
+     * every message through the caller's normal window procedure. */
     return FALSE;
 }
 
@@ -205,6 +218,7 @@ BOOL WINAPI DwmDefWindowProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam, 
  */
 HRESULT WINAPI DwmGetWindowAttribute(HWND hwnd, DWORD attribute, PVOID pv_attribute, DWORD size)
 {
+    static LONG caption_button_warning;
     BOOL enabled = FALSE;
     HRESULT hr;
 
@@ -216,6 +230,20 @@ HRESULT WINAPI DwmGetWindowAttribute(HWND hwnd, DWORD attribute, PVOID pv_attrib
         return E_HANDLE;
 
     switch (attribute) {
+    case DWMWA_CLOAKED:
+    {
+        DWORD *cloaked = pv_attribute;
+
+        if (!cloaked)
+            return E_INVALIDARG;
+        if (size < sizeof(*cloaked))
+            return E_NOT_SUFFICIENT_BUFFER;
+
+        /* Wine does not currently cloak windows in the DWM sense. */
+        *cloaked = 0;
+        hr = S_OK;
+        break;
+    }
     case DWMWA_EXTENDED_FRAME_BOUNDS:
     {
         RECT *rect = (RECT *)pv_attribute;
@@ -239,7 +267,9 @@ HRESULT WINAPI DwmGetWindowAttribute(HWND hwnd, DWORD attribute, PVOID pv_attrib
         break;
     }
     default:
-        FIXME("attribute %ld not implemented.\n", attribute);
+        if (attribute != DWMWA_CAPTION_BUTTON_BOUNDS ||
+            !InterlockedExchange(&caption_button_warning, TRUE))
+            FIXME("attribute %ld not implemented.\n", attribute);
         hr = E_NOTIMPL;
         break;
     }
@@ -282,7 +312,7 @@ static int get_display_frequency(void)
 HRESULT WINAPI DwmGetCompositionTimingInfo(HWND hwnd, DWM_TIMING_INFO *info)
 {
     LARGE_INTEGER performance_frequency, qpc;
-    static int i, display_frequency;
+    int display_frequency;
 
     if (!info)
         return E_INVALIDARG;
@@ -290,7 +320,7 @@ HRESULT WINAPI DwmGetCompositionTimingInfo(HWND hwnd, DWM_TIMING_INFO *info)
     if (info->cbSize != sizeof(DWM_TIMING_INFO))
         return MILERR_MISMATCHED_SIZE;
 
-    if(!i++) FIXME("(%p %p)\n", hwnd, info);
+    TRACE("(%p %p)\n", hwnd, info);
 
     memset(info, 0, info->cbSize);
     info->cbSize = sizeof(DWM_TIMING_INFO);

@@ -219,7 +219,7 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
     HMODULE module;
     HRESULT hr;
 
-    FIXME("(%s, %s, %p): semi-stub\n", debugstr_hstring(classid), debugstr_guid(iid), class_factory);
+    TRACE("(%s, %s, %p)\n", debugstr_hstring(classid), debugstr_guid(iid), class_factory);
 
     if (!iid || !class_factory)
         return E_INVALIDARG;
@@ -293,7 +293,7 @@ HRESULT WINAPI RoActivateInstance(HSTRING classid, IInspectable **instance)
     IActivationFactory *factory;
     HRESULT hr;
 
-    FIXME("(%p, %p): semi-stub\n", classid, instance);
+    TRACE("(%p, %p)\n", classid, instance);
 
     hr = RoGetActivationFactory(classid, &IID_IActivationFactory, (void **)&factory);
     if (SUCCEEDED(hr))

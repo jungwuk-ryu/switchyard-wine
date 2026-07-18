@@ -1950,12 +1950,19 @@ static HRESULT WINAPI dwritefontface5_GetFontAxisValues(IDWriteFontFace5 *iface,
 
 static BOOL WINAPI dwritefontface5_HasVariations(IDWriteFontFace5 *iface)
 {
-    static int once;
+    IDWriteFontResource *resource;
+    BOOL ret = FALSE;
+    HRESULT hr;
 
-    if (!once++)
-        FIXME("%p: stub\n", iface);
+    TRACE("%p.\n", iface);
 
-    return FALSE;
+    if (SUCCEEDED(hr = IDWriteFontFace5_GetFontResource(iface, &resource)))
+    {
+        ret = IDWriteFontResource_HasVariations(resource);
+        IDWriteFontResource_Release(resource);
+    }
+
+    return ret;
 }
 
 static HRESULT WINAPI dwritefontface5_GetFontResource(IDWriteFontFace5 *iface, IDWriteFontResource **resource)
@@ -7274,7 +7281,16 @@ static HRESULT WINAPI dwritefontresource_GetAxisValueNames(IDWriteFontResource *
 
 static BOOL WINAPI dwritefontresource_HasVariations(IDWriteFontResource *iface)
 {
-    FIXME("%p.\n", iface);
+    struct dwrite_fontresource *resource = impl_from_IDWriteFontResource(iface);
+    unsigned int i;
+
+    TRACE("%p.\n", iface);
+
+    for (i = 0; i < resource->axis_count; ++i)
+    {
+        if (resource->axis[i].min_value != resource->axis[i].max_value)
+            return TRUE;
+    }
 
     return FALSE;
 }

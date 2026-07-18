@@ -17,12 +17,15 @@ DECL_HANDLER(init_thread);
 DECL_HANDLER(terminate_process);
 DECL_HANDLER(terminate_thread);
 DECL_HANDLER(get_process_info);
+DECL_HANDLER(get_process_native_info);
 DECL_HANDLER(get_process_debug_info);
 DECL_HANDLER(get_process_image_name);
 DECL_HANDLER(get_process_vm_counters);
 DECL_HANDLER(set_process_info);
 DECL_HANDLER(get_thread_info);
 DECL_HANDLER(get_thread_times);
+DECL_HANDLER(get_thread_native_info);
+DECL_HANDLER(set_thread_native_info);
 DECL_HANDLER(set_thread_info);
 DECL_HANDLER(suspend_thread);
 DECL_HANDLER(resume_thread);
@@ -243,6 +246,7 @@ DECL_HANDLER(set_token_default_dacl);
 DECL_HANDLER(set_security_object);
 DECL_HANDLER(get_security_object);
 DECL_HANDLER(get_system_handles);
+DECL_HANDLER(get_process_handles);
 DECL_HANDLER(get_tcp_connections);
 DECL_HANDLER(get_udp_endpoints);
 DECL_HANDLER(create_mailslot);
@@ -331,12 +335,15 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_terminate_process,
     (req_handler)req_terminate_thread,
     (req_handler)req_get_process_info,
+    (req_handler)req_get_process_native_info,
     (req_handler)req_get_process_debug_info,
     (req_handler)req_get_process_image_name,
     (req_handler)req_get_process_vm_counters,
     (req_handler)req_set_process_info,
     (req_handler)req_get_thread_info,
     (req_handler)req_get_thread_times,
+    (req_handler)req_get_thread_native_info,
+    (req_handler)req_set_thread_native_info,
     (req_handler)req_set_thread_info,
     (req_handler)req_suspend_thread,
     (req_handler)req_resume_thread,
@@ -557,6 +564,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_set_security_object,
     (req_handler)req_get_security_object,
     (req_handler)req_get_system_handles,
+    (req_handler)req_get_process_handles,
     (req_handler)req_get_tcp_connections,
     (req_handler)req_get_udp_endpoints,
     (req_handler)req_create_mailslot,
@@ -773,6 +781,13 @@ C_ASSERT( offsetof(struct get_process_info_reply, base_priority) == 58 );
 C_ASSERT( offsetof(struct get_process_info_reply, disable_boost) == 60 );
 C_ASSERT( offsetof(struct get_process_info_reply, machine) == 62 );
 C_ASSERT( sizeof(struct get_process_info_reply) == 64 );
+C_ASSERT( offsetof(struct get_process_native_info_request, handle) == 12 );
+C_ASSERT( sizeof(struct get_process_native_info_request) == 16 );
+C_ASSERT( offsetof(struct get_process_native_info_reply, handle_count) == 8 );
+C_ASSERT( offsetof(struct get_process_native_info_reply, unix_pid) == 12 );
+C_ASSERT( offsetof(struct get_process_native_info_reply, power_control) == 16 );
+C_ASSERT( offsetof(struct get_process_native_info_reply, power_state) == 20 );
+C_ASSERT( sizeof(struct get_process_native_info_reply) == 24 );
 C_ASSERT( offsetof(struct get_process_debug_info_request, handle) == 12 );
 C_ASSERT( sizeof(struct get_process_debug_info_request) == 16 );
 C_ASSERT( offsetof(struct get_process_debug_info_reply, debug) == 8 );
@@ -800,7 +815,9 @@ C_ASSERT( offsetof(struct set_process_info_request, base_priority) == 28 );
 C_ASSERT( offsetof(struct set_process_info_request, disable_boost) == 32 );
 C_ASSERT( offsetof(struct set_process_info_request, token) == 36 );
 C_ASSERT( offsetof(struct set_process_info_request, mask) == 40 );
-C_ASSERT( sizeof(struct set_process_info_request) == 48 );
+C_ASSERT( offsetof(struct set_process_info_request, power_control) == 44 );
+C_ASSERT( offsetof(struct set_process_info_request, power_state) == 48 );
+C_ASSERT( sizeof(struct set_process_info_request) == 56 );
 C_ASSERT( offsetof(struct get_thread_info_request, handle) == 12 );
 C_ASSERT( offsetof(struct get_thread_info_request, access) == 16 );
 C_ASSERT( sizeof(struct get_thread_info_request) == 24 );
@@ -820,9 +837,23 @@ C_ASSERT( offsetof(struct get_thread_times_request, handle) == 12 );
 C_ASSERT( sizeof(struct get_thread_times_request) == 16 );
 C_ASSERT( offsetof(struct get_thread_times_reply, creation_time) == 8 );
 C_ASSERT( offsetof(struct get_thread_times_reply, exit_time) == 16 );
-C_ASSERT( offsetof(struct get_thread_times_reply, unix_pid) == 24 );
-C_ASSERT( offsetof(struct get_thread_times_reply, unix_tid) == 28 );
-C_ASSERT( sizeof(struct get_thread_times_reply) == 32 );
+C_ASSERT( offsetof(struct get_thread_times_reply, kernel_time) == 24 );
+C_ASSERT( offsetof(struct get_thread_times_reply, user_time) == 32 );
+C_ASSERT( offsetof(struct get_thread_times_reply, unix_pid) == 40 );
+C_ASSERT( offsetof(struct get_thread_times_reply, unix_tid) == 44 );
+C_ASSERT( sizeof(struct get_thread_times_reply) == 48 );
+C_ASSERT( offsetof(struct get_thread_native_info_request, handle) == 12 );
+C_ASSERT( sizeof(struct get_thread_native_info_request) == 16 );
+C_ASSERT( offsetof(struct get_thread_native_info_reply, page_priority) == 8 );
+C_ASSERT( offsetof(struct get_thread_native_info_reply, power_control) == 12 );
+C_ASSERT( offsetof(struct get_thread_native_info_reply, power_state) == 16 );
+C_ASSERT( sizeof(struct get_thread_native_info_reply) == 24 );
+C_ASSERT( offsetof(struct set_thread_native_info_request, handle) == 12 );
+C_ASSERT( offsetof(struct set_thread_native_info_request, mask) == 16 );
+C_ASSERT( offsetof(struct set_thread_native_info_request, page_priority) == 20 );
+C_ASSERT( offsetof(struct set_thread_native_info_request, power_control) == 24 );
+C_ASSERT( offsetof(struct set_thread_native_info_request, power_state) == 28 );
+C_ASSERT( sizeof(struct set_thread_native_info_request) == 32 );
 C_ASSERT( offsetof(struct set_thread_info_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_thread_info_request, priority) == 16 );
 C_ASSERT( offsetof(struct set_thread_info_request, base_priority) == 20 );
@@ -2028,6 +2059,10 @@ C_ASSERT( sizeof(struct get_security_object_reply) == 16 );
 C_ASSERT( sizeof(struct get_system_handles_request) == 16 );
 C_ASSERT( offsetof(struct get_system_handles_reply, count) == 8 );
 C_ASSERT( sizeof(struct get_system_handles_reply) == 16 );
+C_ASSERT( offsetof(struct get_process_handles_request, handle) == 12 );
+C_ASSERT( sizeof(struct get_process_handles_request) == 16 );
+C_ASSERT( offsetof(struct get_process_handles_reply, count) == 8 );
+C_ASSERT( sizeof(struct get_process_handles_reply) == 16 );
 C_ASSERT( offsetof(struct get_tcp_connections_request, state_filter) == 12 );
 C_ASSERT( sizeof(struct get_tcp_connections_request) == 16 );
 C_ASSERT( offsetof(struct get_tcp_connections_reply, count) == 8 );

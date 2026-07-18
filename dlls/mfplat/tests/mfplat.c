@@ -548,6 +548,8 @@ static HRESULT (WINAPI *pMFTUnregisterLocalByCLSID)(CLSID clsid);
 static HRESULT (WINAPI *pMFAllocateWorkQueueEx)(MFASYNC_WORKQUEUE_TYPE queue_type, DWORD *queue);
 static HRESULT (WINAPI *pMFTEnumEx)(GUID category, UINT32 flags, const MFT_REGISTER_TYPE_INFO *input_type,
         const MFT_REGISTER_TYPE_INFO *output_type, IMFActivate ***activate, UINT32 *count);
+static HRESULT (WINAPI *pMFTEnum2)(GUID category, UINT32 flags, const MFT_REGISTER_TYPE_INFO *input_type,
+        const MFT_REGISTER_TYPE_INFO *output_type, IMFAttributes *attributes, IMFActivate ***activate, UINT32 *count);
 static HRESULT (WINAPI *pMFGetPlaneSize)(DWORD format, DWORD width, DWORD height, DWORD *size);
 static HRESULT (WINAPI *pMFGetStrideForBitmapInfoHeader)(DWORD format, DWORD width, LONG *stride);
 static HRESULT (WINAPI *pMFCreate2DMediaBuffer)(DWORD width, DWORD height, DWORD fourcc, BOOL bottom_up,
@@ -1886,6 +1888,7 @@ static void init_functions(void)
     X(MFRegisterLocalByteStreamHandler);
     X(MFRegisterLocalSchemeHandler);
     X(MFRemovePeriodicCallback);
+    X(MFTEnum2);
     X(MFTEnumEx);
     X(MFTRegisterLocal);
     X(MFTRegisterLocalByCLSID);
@@ -7197,6 +7200,53 @@ static const IClassFactoryVtbl test_mft_factory_vtbl =
     test_mft_factory_CreateInstance,
     test_mft_factory_LockServer,
 };
+
+static void test_MFTEnum2(void)
+{
+    const LUID luid = {0x12345678, 0x12345678};
+    IMFActivate **activate;
+    IMFAttributes *attributes;
+    UINT32 count;
+    HRESULT hr;
+
+    if (!pMFTEnum2)
+    {
+        win_skip("MFTEnum2() is not available.\n");
+        return;
+    }
+
+    hr = MFCreateAttributes(&attributes, 1);
+    ok(hr == S_OK, "Failed to create attributes, hr %#lx.\n", hr);
+
+    hr = IMFAttributes_SetBlob(attributes, &MFT_ENUM_ADAPTER_LUID, (const BYTE *)&luid, sizeof(luid));
+    ok(hr == S_OK, "Failed to set adapter LUID, hr %#lx.\n", hr);
+
+    activate = (IMFActivate **)0xdeadbeef;
+    count = 0xdeadbeef;
+    hr = pMFTEnum2(MFT_CATEGORY_OTHER, MFT_ENUM_FLAG_SYNCMFT, NULL, NULL, attributes, &activate, &count);
+    ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
+
+    hr = IMFAttributes_SetBlob(attributes, &MFT_ENUM_ADAPTER_LUID, (const BYTE *)&luid, sizeof(luid) - 1);
+    ok(hr == S_OK, "Failed to set adapter LUID, hr %#lx.\n", hr);
+
+    activate = (IMFActivate **)0xdeadbeef;
+    count = 0xdeadbeef;
+    hr = pMFTEnum2(MFT_CATEGORY_OTHER, MFT_ENUM_FLAG_HARDWARE, NULL, NULL, attributes, &activate, &count);
+    ok(hr == E_INVALIDARG, "Unexpected hr %#lx.\n", hr);
+
+    hr = IMFAttributes_SetBlob(attributes, &MFT_ENUM_ADAPTER_LUID, (const BYTE *)&luid, sizeof(luid));
+    ok(hr == S_OK, "Failed to set adapter LUID, hr %#lx.\n", hr);
+
+    activate = (IMFActivate **)0xdeadbeef;
+    count = 0xdeadbeef;
+    hr = pMFTEnum2(MFT_CATEGORY_OTHER, MFT_ENUM_FLAG_HARDWARE, NULL, NULL, attributes, &activate, &count);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(!activate, "Unexpected activation array %p.\n", activate);
+    ok(!count, "Unexpected activation count %u.\n", count);
+    CoTaskMemFree(activate);
+
+    IMFAttributes_Release(attributes);
+}
 
 static void test_MFTRegisterLocal(void)
 {
@@ -14683,6 +14733,7 @@ START_TEST(mfplat)
     test_create_property_store();
     test_dxgi_device_manager();
     test_MFCreateTransformActivate();
+    test_MFTEnum2();
     test_MFTRegisterLocal();
     test_queue_com();
     test_MFGetStrideForBitmapInfoHeader();

@@ -194,31 +194,43 @@ void get_resource_lcids( LANGID *user, LANGID *user_neutral, LANGID *system )
 }
 
 
-static NTSTATUS get_dummy_preferred_ui_language( DWORD flags, LANGID lang, ULONG *count,
-                                                 WCHAR *buffer, ULONG *size )
+static NTSTATUS get_preferred_ui_languages( DWORD flags, const LANGID *languages, ULONG language_count,
+                                            ULONG *count, WCHAR *buffer, ULONG *size )
 {
-    WCHAR name[LOCALE_NAME_MAX_LENGTH + 2];
-    NTSTATUS status;
-    ULONG len;
+    WCHAR list[2 * (LOCALE_NAME_MAX_LENGTH + 1) + 1], *next = list;
+    LANGID added[2];
+    ULONG added_count = 0, i, len;
 
-    FIXME("(0x%lx %#x %p %p %p) returning a dummy value (current locale)\n", flags, lang, count, buffer, size);
+    TRACE( "flags %#lx, languages %p, language_count %lu, count %p, buffer %p, size %p\n",
+           flags, languages, language_count, count, buffer, size );
 
-    if (flags & MUI_LANGUAGE_ID) swprintf( name, ARRAY_SIZE(name), L"%04lX", lang );
-    else
+    for (i = 0; i < language_count; i++)
     {
-        UNICODE_STRING str;
+        LANGID lang = languages[i];
+        ULONG j;
 
-        if (lang == LOCALE_CUSTOM_UNSPECIFIED)
-            NtQueryInstallUILanguage( &lang );
+        if (lang == LOCALE_CUSTOM_UNSPECIFIED) NtQueryInstallUILanguage( &lang );
+        for (j = 0; j < added_count; j++) if (added[j] == lang) break;
+        if (j != added_count) continue;
 
-        str.Buffer = name;
-        str.MaximumLength = sizeof(name);
-        status = RtlLcidToLocaleName( lang, &str, 0, FALSE );
-        if (status) return status;
+        if (flags & MUI_LANGUAGE_ID)
+            swprintf( next, list + ARRAY_SIZE(list) - next, L"%04lX", lang );
+        else
+        {
+            UNICODE_STRING str;
+            NTSTATUS status;
+
+            str.Buffer = next;
+            str.MaximumLength = (list + ARRAY_SIZE(list) - next) * sizeof(WCHAR);
+            status = RtlLcidToLocaleName( lang, &str, 0, FALSE );
+            if (status) return status;
+        }
+        next += wcslen( next ) + 1;
+        added[added_count++] = lang;
     }
 
-    len = wcslen( name ) + 2;
-    name[len - 1] = 0;
+    *next++ = 0;
+    len = next - list;
     if (buffer)
     {
         if (len > *size)
@@ -226,10 +238,10 @@ static NTSTATUS get_dummy_preferred_ui_language( DWORD flags, LANGID lang, ULONG
             *size = len;
             return STATUS_BUFFER_TOO_SMALL;
         }
-        memcpy( buffer, name, len * sizeof(WCHAR) );
+        memcpy( buffer, list, len * sizeof(WCHAR) );
     }
     *size = len;
-    *count = 1;
+    *count = added_count;
     TRACE("returned variable content: %ld, \"%s\", %ld\n", *count, debugstr_w(buffer), *size);
     return STATUS_SUCCESS;
 
@@ -240,12 +252,14 @@ static NTSTATUS get_dummy_preferred_ui_language( DWORD flags, LANGID lang, ULONG
  */
 NTSTATUS WINAPI RtlGetProcessPreferredUILanguages( DWORD flags, ULONG *count, WCHAR *buffer, ULONG *size )
 {
-    LANGID ui_language;
+    LANGID languages[2];
+    ULONG language_count = 1;
 
-    FIXME( "%08lx, %p, %p %p\n", flags, count, buffer, size );
+    TRACE( "%08lx, %p, %p %p\n", flags, count, buffer, size );
 
-    NtQueryDefaultUILanguage( &ui_language );
-    return get_dummy_preferred_ui_language( flags, ui_language, count, buffer, size );
+    NtQueryDefaultUILanguage( &languages[0] );
+    if (flags & MUI_MERGE_SYSTEM_FALLBACK) NtQueryInstallUILanguage( &languages[language_count++] );
+    return get_preferred_ui_languages( flags, languages, language_count, count, buffer, size );
 }
 
 
@@ -262,7 +276,7 @@ NTSTATUS WINAPI RtlGetSystemPreferredUILanguages( DWORD flags, ULONG unknown, UL
     if (*size && !buffer) return STATUS_INVALID_PARAMETER;
 
     NtQueryInstallUILanguage( &ui_language );
-    return get_dummy_preferred_ui_language( flags, ui_language, count, buffer, size );
+    return get_preferred_ui_languages( flags, &ui_language, 1, count, buffer, size );
 }
 
 
@@ -271,12 +285,14 @@ NTSTATUS WINAPI RtlGetSystemPreferredUILanguages( DWORD flags, ULONG unknown, UL
  */
 NTSTATUS WINAPI RtlGetThreadPreferredUILanguages( DWORD flags, ULONG *count, WCHAR *buffer, ULONG *size )
 {
-    LANGID ui_language;
+    LANGID languages[2];
+    ULONG language_count = 1;
 
-    FIXME( "%08lx, %p, %p %p\n", flags, count, buffer, size );
+    TRACE( "%08lx, %p, %p %p\n", flags, count, buffer, size );
 
-    NtQueryDefaultUILanguage( &ui_language );
-    return get_dummy_preferred_ui_language( flags, ui_language, count, buffer, size );
+    NtQueryDefaultUILanguage( &languages[0] );
+    if (flags & MUI_MERGE_SYSTEM_FALLBACK) NtQueryInstallUILanguage( &languages[language_count++] );
+    return get_preferred_ui_languages( flags, languages, language_count, count, buffer, size );
 }
 
 
@@ -293,7 +309,7 @@ NTSTATUS WINAPI RtlGetUserPreferredUILanguages( DWORD flags, ULONG unknown, ULON
     if (*size && !buffer) return STATUS_INVALID_PARAMETER;
 
     NtQueryDefaultUILanguage( &ui_language );
-    return get_dummy_preferred_ui_language( flags, ui_language, count, buffer, size );
+    return get_preferred_ui_languages( flags, &ui_language, 1, count, buffer, size );
 }
 
 

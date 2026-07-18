@@ -225,10 +225,10 @@ void WINAPI DECLSPEC_HOTPATCH QueryInterruptTime( ULONGLONG *time )
  */
 void WINAPI DECLSPEC_HOTPATCH QueryInterruptTimePrecise( ULONGLONG *time )
 {
-    static int once;
-    if (!once++) FIXME( "(%p) semi-stub\n", time );
+    LARGE_INTEGER counter;
 
-    QueryInterruptTime( time );
+    NtQueryPerformanceCounter( &counter, NULL );
+    *time = counter.QuadPart;
 }
 
 
@@ -237,10 +237,17 @@ void WINAPI DECLSPEC_HOTPATCH QueryInterruptTimePrecise( ULONGLONG *time )
  */
 void WINAPI DECLSPEC_HOTPATCH QueryUnbiasedInterruptTimePrecise( ULONGLONG *time )
 {
-    static int once;
-    if (!once++) FIXME( "(%p): semi-stub.\n", time );
+    ULONGLONG bias, bias2;
+    LARGE_INTEGER counter;
 
-    RtlQueryUnbiasedInterruptTime( time );
+    do
+    {
+        bias = ReadAcquire64( (const LONG64 volatile *)&user_shared_data->InterruptTimeBias );
+        NtQueryPerformanceCounter( &counter, NULL );
+        bias2 = ReadAcquire64( (const LONG64 volatile *)&user_shared_data->InterruptTimeBias );
+    }
+    while (bias != bias2);
+    *time = counter.QuadPart - bias;
 }
 
 

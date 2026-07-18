@@ -35,6 +35,7 @@ struct uisettings
     IUISettings4 IUISettings4_iface;
     IUISettings5 IUISettings5_iface;
     struct weak_reference_source weak_reference_source;
+    struct event_handlers text_scale_handlers;
 };
 
 static inline struct uisettings *impl_from_IUISettings( IUISettings *iface )
@@ -103,7 +104,11 @@ static ULONG WINAPI uisettings_Release( IUISettings *iface )
 
     TRACE( "iface %p, ref %lu.\n", iface, ref );
 
-    if (!ref) free( impl );
+    if (!ref)
+    {
+        event_handlers_clear( &impl->text_scale_handlers );
+        free( impl );
+    }
     return ref;
 }
 
@@ -277,23 +282,36 @@ DEFINE_IINSPECTABLE( uisettings2, IUISettings2, struct uisettings, IUISettings_i
 
 static HRESULT WINAPI uisettings2_get_TextScaleFactor( IUISettings2 *iface, DOUBLE *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    *value = 1.0;
+    DWORD scale = 100, size = sizeof(scale);
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    RegGetValueW( HKEY_CURRENT_USER, L"Software\\Microsoft\\Accessibility", L"TextScaleFactor",
+                  RRF_RT_REG_DWORD, NULL, &scale, &size );
+    if (scale < 100 || scale > 225) scale = 100;
+    *value = scale / 100.0;
     return S_OK;
 }
 
 static HRESULT WINAPI uisettings2_add_TextScaleFactorChanged( IUISettings2 *iface, ITypedEventHandler_UISettings_IInspectable *handler,
         EventRegistrationToken *cookie )
 {
-    FIXME( "iface %p, handler %p, cookie %p stub!\n", iface, handler, cookie );
-    *cookie = dummy_cookie;
-    return S_OK;
+    static LONG registry_watcher_warning;
+    struct uisettings *impl = impl_from_IUISettings2( iface );
+
+    TRACE( "iface %p, handler %p, cookie %p.\n", iface, handler, cookie );
+    if (!InterlockedExchange( &registry_watcher_warning, TRUE ))
+        FIXME( "Text scale registry change notifications are not implemented; storing handler only.\n" );
+    return event_handlers_add( &impl->text_scale_handlers, (IUnknown *)handler, cookie );
 }
 
 static HRESULT WINAPI uisettings2_remove_TextScaleFactorChanged( IUISettings2 *iface, EventRegistrationToken cookie )
 {
-    FIXME( "iface %p, cookie %#I64x stub!\n", iface, cookie.value );
-    return E_NOTIMPL;
+    struct uisettings *impl = impl_from_IUISettings2( iface );
+
+    TRACE( "iface %p, cookie %#I64x.\n", iface, cookie.value );
+    return event_handlers_remove( &impl->text_scale_handlers, cookie );
 }
 
 static const struct IUISettings2Vtbl uisettings2_vtbl =
@@ -603,6 +621,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
     impl->IUISettings3_iface.lpVtbl = &uisettings3_vtbl;
     impl->IUISettings4_iface.lpVtbl = &uisettings4_vtbl;
     impl->IUISettings5_iface.lpVtbl = &uisettings5_vtbl;
+    event_handlers_init( &impl->text_scale_handlers );
 
     if (FAILED(hr = weak_reference_source_init( &impl->weak_reference_source,
                                                 (IUnknown *)&impl->IUISettings_iface )))

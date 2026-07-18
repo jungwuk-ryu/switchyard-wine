@@ -37,9 +37,19 @@ static ULONG get_refcount(IUnknown *unk)
 static void test_policy2_rules(INetFwPolicy2 *policy2)
 {
     HRESULT hr;
+    LONG profiles;
     INetFwRules *rules, *rules2;
     INetFwServiceRestriction *restriction;
     IUnknown *rulesenum;
+
+    hr = INetFwPolicy2_get_CurrentProfileTypes(policy2, NULL);
+    ok(hr == E_POINTER, "got %08lx\n", hr);
+
+    profiles = 0xdeadbeef;
+    hr = INetFwPolicy2_get_CurrentProfileTypes(policy2, &profiles);
+    ok(hr == S_OK, "got %08lx\n", hr);
+    ok(profiles && !(profiles & ~(NET_FW_PROFILE2_DOMAIN | NET_FW_PROFILE2_PRIVATE | NET_FW_PROFILE2_PUBLIC)),
+            "got unexpected profiles %#lx\n", profiles);
 
     hr = INetFwPolicy2_QueryInterface(policy2, &IID_INetFwRules, (void**)&rules);
     ok(hr == E_NOINTERFACE, "got 0x%08lx\n", hr);

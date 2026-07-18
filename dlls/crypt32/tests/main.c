@@ -30,6 +30,40 @@
 
 static HMODULE hCrypt;
 
+static void test_CryptProtectMemory(void)
+{
+    BYTE data[32], original[sizeof(data)];
+    BOOL ret;
+    unsigned int i;
+
+    for (i = 0; i < sizeof(data); ++i)
+        data[i] = i;
+    memcpy(original, data, sizeof(data));
+
+    ret = CryptProtectMemory(data, sizeof(data), CRYPTPROTECTMEMORY_SAME_PROCESS);
+    ok(ret, "CryptProtectMemory failed, error %lu.\n", GetLastError());
+    ok(memcmp(data, original, sizeof(data)), "Expected protected data to change.\n");
+
+    ret = CryptUnprotectMemory(data, sizeof(data), CRYPTPROTECTMEMORY_SAME_PROCESS);
+    ok(ret, "CryptUnprotectMemory failed, error %lu.\n", GetLastError());
+    ok(!memcmp(data, original, sizeof(data)), "Unexpected unprotected data.\n");
+
+    SetLastError(0xdeadbeef);
+    ret = CryptProtectMemory(NULL, sizeof(data), CRYPTPROTECTMEMORY_SAME_PROCESS);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Expected ERROR_INVALID_PARAMETER, got %lu.\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = CryptProtectMemory(data, sizeof(data) - 1, CRYPTPROTECTMEMORY_SAME_PROCESS);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Expected ERROR_INVALID_PARAMETER, got %lu.\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = CryptProtectMemory(data, sizeof(data), 3);
+    ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Expected ERROR_INVALID_PARAMETER, got %lu.\n", GetLastError());
+}
+
 static void test_findAttribute(void)
 {
     PCRYPT_ATTRIBUTE ret;
@@ -486,5 +520,6 @@ START_TEST(main)
     test_readTrustedPublisherDWORD();
     test_getDefaultCryptProv();
     test_CryptInstallOssGlobal();
+    test_CryptProtectMemory();
     test_format_object();
 }

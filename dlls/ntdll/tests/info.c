@@ -1644,6 +1644,30 @@ static void test_query_firmware(void)
     HeapFree(GetProcessHeap(), 0, sfti);
 }
 
+static void test_query_secure_boot(void)
+{
+    struct
+    {
+        BOOLEAN enabled;
+        BOOLEAN capable;
+    } info = {0xcc, 0xcc};
+    ULONG len = 0xdeadbeef;
+    NTSTATUS status;
+
+    status = pNtQuerySystemInformation(SystemSecureBootInformation, &info, sizeof(info), &len);
+    if (status == STATUS_INVALID_INFO_CLASS || status == STATUS_NOT_IMPLEMENTED)
+    {
+        win_skip("SystemSecureBootInformation is not available\n");
+        return;
+    }
+
+    ok(status == STATUS_SUCCESS, "Expected STATUS_SUCCESS, got %08lx\n", status);
+    ok(len == sizeof(info), "Expected length %Iu, got %lu\n", sizeof(info), len);
+    ok(info.enabled <= TRUE, "Unexpected enabled value %u\n", info.enabled);
+    ok(info.capable <= TRUE, "Unexpected capable value %u\n", info.capable);
+    ok(!info.enabled || info.capable, "Secure boot is enabled but not capable\n");
+}
+
 static void test_query_battery(void)
 {
     SYSTEM_BATTERY_STATE bs;
@@ -2368,10 +2392,54 @@ static void test_query_process_handlecount(void)
 
     /* Check if we have some return values */
     if (winetest_debug > 1) trace("HandleCount : %ld\n", handlecount);
-    todo_wine
+    ok( handlecount > 0, "Expected some handles, got 0\n");
+}
+
+static void test_query_process_handletable(void)
+{
+    ULONG *handles, count, handle_count, len = 0, i;
+    HANDLE event;
+    NTSTATUS status;
+    BOOL found = FALSE;
+
+    event = CreateEventW( NULL, FALSE, FALSE, NULL );
+    ok( event != NULL, "CreateEventW failed, error %lu\n", GetLastError() );
+
+    status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleCount,
+                                         &handle_count, sizeof(handle_count), NULL );
+    ok( !status, "NtQueryInformationProcess failed, status %#lx\n", status );
+
+    status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleTable,
+                                         NULL, 0, &len );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH,
+        "Expected STATUS_INFO_LENGTH_MISMATCH, got %#lx\n", status );
+    ok( len, "Expected a nonzero return length\n" );
+    if (status != STATUS_INFO_LENGTH_MISMATCH || !len)
     {
-        ok( handlecount > 0, "Expected some handles, got 0\n");
+        CloseHandle( event );
+        return;
     }
+
+    handles = HeapAlloc( GetProcessHeap(), 0, len );
+    ok( handles != NULL, "Failed to allocate %lu bytes\n", len );
+    if (!handles)
+    {
+        CloseHandle( event );
+        return;
+    }
+
+    status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleTable,
+                                         handles, len, &len );
+    ok( !status, "NtQueryInformationProcess failed, status %#lx\n", status );
+    ok( !(len % sizeof(handles[0])), "Unexpected return length %lu\n", len );
+    count = len / sizeof(handles[0]);
+    ok( count == handle_count, "Expected %lu handles, got %lu\n", handle_count, count );
+
+    for (i = 0; i < count; i++) if (handles[i] == HandleToULong( event )) found = TRUE;
+    ok( found, "Event handle %p is missing from the handle table\n", event );
+
+    HeapFree( GetProcessHeap(), 0, handles );
+    CloseHandle( event );
 }
 
 static void test_query_process_image_file_name(void)
@@ -4525,6 +4593,7 @@ START_TEST(info)
     test_query_logicalprocex();
     test_query_cpusetinfo();
     test_query_firmware();
+    test_query_secure_boot();
     test_query_data_alignment();
 
     /* NtPowerInformation */
@@ -4540,6 +4609,7 @@ START_TEST(info)
     test_query_process_debug_port_custom_dacl(argc, argv);
     test_query_process_priority();
     test_query_process_handlecount();
+    test_query_process_handletable();
     test_query_process_wow64();
     test_query_process_image_file_name();
     test_query_process_debug_object_handle(argc, argv);

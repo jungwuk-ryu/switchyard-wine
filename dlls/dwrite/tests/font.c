@@ -10086,6 +10086,9 @@ static void test_font_resource(void)
     index = IDWriteFontResource_GetFontFaceIndex(resource);
     ok(!index, "Unexpected index %u.\n", index);
 
+    ret = IDWriteFontResource_HasVariations(resource);
+    ok(!ret, "Expected a non-variable font.\n");
+
     /* Specify axis value, font has no variations. */
     axis_values[0].axisTag = DWRITE_FONT_AXIS_TAG_WEIGHT;
     axis_values[0].value = 400.0f;
@@ -10116,6 +10119,9 @@ static void test_font_resource(void)
 
     hr = IDWriteFontFace_QueryInterface(fontface, &IID_IDWriteFontFace5, (void **)&fontface5);
     ok(hr == S_OK, "Failed to get interface, hr %#lx.\n", hr);
+
+    ret = IDWriteFontFace5_HasVariations(fontface5);
+    ok(!ret, "Expected a non-variable font.\n");
 
     hr = IDWriteFontFace5_GetFontResource(fontface5, &resource2);
     ok(hr == S_OK, "Failed to get font resource, hr %#lx.\n", hr);

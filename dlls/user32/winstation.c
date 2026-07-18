@@ -380,15 +380,15 @@ BOOL WINAPI SetUserObjectInformationA( HANDLE handle, INT index, LPVOID info, DW
 BOOL WINAPI GetUserObjectSecurity( HANDLE handle, PSECURITY_INFORMATION info,
                                    PSECURITY_DESCRIPTOR sid, DWORD len, LPDWORD needed )
 {
-    FIXME( "(%p %p %p len=%ld %p),stub!\n", handle, info, sid, len, needed );
-    if (needed)
-        *needed = sizeof(SECURITY_DESCRIPTOR);
-    if (len < sizeof(SECURITY_DESCRIPTOR))
+    TRACE( "(%p %p %p len=%ld %p)\n", handle, info, sid, len, needed );
+
+    if (!info || !needed)
     {
-        SetLastError( ERROR_INSUFFICIENT_BUFFER );
+        SetLastError( ERROR_INVALID_PARAMETER );
         return FALSE;
     }
-    return InitializeSecurityDescriptor(sid, SECURITY_DESCRIPTOR_REVISION);
+
+    return GetKernelObjectSecurity( handle, *info, sid, len, needed );
 }
 
 /***********************************************************************
@@ -397,6 +397,13 @@ BOOL WINAPI GetUserObjectSecurity( HANDLE handle, PSECURITY_INFORMATION info,
 BOOL WINAPI SetUserObjectSecurity( HANDLE handle, PSECURITY_INFORMATION info,
                                    PSECURITY_DESCRIPTOR sid )
 {
-    FIXME( "(%p,%p,%p),stub!\n", handle, info, sid );
-    return TRUE;
+    TRACE( "(%p,%p,%p)\n", handle, info, sid );
+
+    if (!info || !sid)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    return SetKernelObjectSecurity( handle, *info, sid );
 }

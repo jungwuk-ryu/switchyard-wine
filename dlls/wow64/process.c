@@ -617,6 +617,8 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
     case ProcessExecuteFlags:  /* ULONG */
     case ProcessCookie:  /* ULONG */
     case ProcessCycleTime:  /* PROCESS_CYCLE_TIME_INFORMATION */
+    case ProcessHandleTable:  /* ULONG[] */
+    case ProcessPowerThrottlingState:  /* PROCESS_POWER_THROTTLING_STATE */
         /* FIXME: check buffer alignment */
         return NtQueryInformationProcess( handle, class, ptr, len, retlen );
 
@@ -767,6 +769,9 @@ NTSTATUS WINAPI wow64_NtQueryInformationThread( UINT *args )
     case ThreadSuspendCount:  /* ULONG */
     case ThreadPriorityBoost:   /* ULONG */
     case ThreadIdealProcessorEx: /* PROCESSOR_NUMBER */
+    case ThreadCycleTime:  /* PROCESS_CYCLE_TIME_INFORMATION */
+    case ThreadPagePriority:  /* MEMORY_PRIORITY_INFORMATION */
+    case ThreadPowerThrottlingState:  /* THREAD_POWER_THROTTLING_STATE */
         /* FIXME: check buffer alignment */
         return NtQueryInformationThread( handle, class, ptr, len, retlen );
 
@@ -1047,6 +1052,7 @@ NTSTATUS WINAPI wow64_NtSetInformationThread( UINT *args )
     case ThreadBasePriority:   /* ULONG */
     case ThreadHideFromDebugger:   /* void */
     case ThreadEnableAlignmentFaultFixup:   /* BOOLEAN */
+    case ThreadPagePriority:  /* MEMORY_PRIORITY_INFORMATION */
     case ThreadPowerThrottlingState:  /* THREAD_POWER_THROTTLING_STATE */
     case ThreadIdealProcessor:   /* ULONG */
     case ThreadPriorityBoost:   /* ULONG */

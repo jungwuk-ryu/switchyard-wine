@@ -28,7 +28,22 @@ enum wbm_namespace
     WBEMPROX_NAMESPACE_LAST,
 };
 
-extern IClientSecurity client_security;
+struct client_security
+{
+    IClientSecurity IClientSecurity_iface;
+    IUnknown *owner;
+    CRITICAL_SECTION cs;
+    DWORD authn_svc;
+    DWORD authz_svc;
+    WCHAR *server_principal;
+    DWORD authn_level;
+    DWORD imp_level;
+    void *auth_info;
+    DWORD capabilities;
+};
+
+void client_security_init( struct client_security *client_security, IUnknown *owner );
+void client_security_cleanup( struct client_security *client_security );
 extern struct list *table_list[WBEMPROX_NAMESPACE_LAST];
 
 enum param_direction

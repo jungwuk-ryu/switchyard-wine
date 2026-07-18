@@ -55,6 +55,10 @@
 #ifdef HAVE_LIBPROCSTAT_H
 # include <libprocstat.h>
 #endif
+#ifdef __APPLE__
+# include <libproc.h>
+# include <sys/resource.h>
+#endif
 #include <unistd.h>
 #ifdef HAVE_MACH_MACH_H
 # include <mach/mach.h>
@@ -62,6 +66,7 @@
 
 #include "ntstatus.h"
 #include "windef.h"
+#include "processthreadsapi.h"
 #include "winternl.h"
 #include "winioctl.h"
 #include "ddk/ntddk.h"
@@ -77,6 +82,30 @@ static ULONG execute_flags = MEM_EXECUTE_OPTION_DISABLE;
 
 static UINT process_error_mode;
 ULONG process_cookie = 0xdeadbeef;
+
+static BOOL get_process_cycle_time( int unix_pid, PROCESS_CYCLE_TIME_INFORMATION *cycles )
+{
+#ifdef __APPLE__
+    struct rusage_info_v4 usage;
+
+    if (unix_pid == -1 || proc_pid_rusage( unix_pid, RUSAGE_INFO_V4, (rusage_info_t *)&usage ))
+        return FALSE;
+
+    cycles->AccumulatedCycles = usage.ri_cycles;
+    cycles->CurrentCycleCount = usage.ri_cycles;
+    return TRUE;
+#else
+    LARGE_INTEGER kernel_time, user_time;
+
+    if (!get_thread_times( unix_pid, -1, &kernel_time, &user_time )) return FALSE;
+
+    /* Hosts without a process cycle counter still provide a monotonic CPU-usage
+     * counter. Its unit is opaque to callers of QueryProcessCycleTime. */
+    cycles->AccumulatedCycles = kernel_time.QuadPart + user_time.QuadPart;
+    cycles->CurrentCycleCount = cycles->AccumulatedCycles;
+    return TRUE;
+#endif
+}
 
 static char **build_argv( const UNICODE_STRING *cmdline, int reserved )
 {
@@ -1231,6 +1260,7 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
     case ProcessTimes:
         {
             KERNEL_USER_TIMES pti = {{{0}}};
+            int unix_pid = -1;
 
             if (size >= sizeof(KERNEL_USER_TIMES))
             {
@@ -1238,16 +1268,6 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                 else if (!handle) ret = STATUS_INVALID_HANDLE;
                 else
                 {
-                    long ticks = sysconf(_SC_CLK_TCK);
-                    struct tms tms;
-
-                    /* FIXME: user/kernel times only work for current process */
-                    if (ticks && times( &tms ) != -1)
-                    {
-                        pti.UserTime.QuadPart = (ULONGLONG)tms.tms_utime * 10000000 / ticks;
-                        pti.KernelTime.QuadPart = (ULONGLONG)tms.tms_stime * 10000000 / ticks;
-                    }
-
                     SERVER_START_REQ(get_process_info)
                     {
                         req->handle = wine_server_obj_handle( handle );
@@ -1258,6 +1278,27 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                         }
                     }
                     SERVER_END_REQ;
+
+                    if (!ret) SERVER_START_REQ( get_process_native_info )
+                    {
+                        req->handle = wine_server_obj_handle( handle );
+                        if (!(ret = wine_server_call( req ))) unix_pid = reply->unix_pid;
+                    }
+                    SERVER_END_REQ;
+
+                    if (!ret && unix_pid != -1 &&
+                        !get_thread_times( unix_pid, -1, &pti.KernelTime, &pti.UserTime ) &&
+                        unix_pid == getpid())
+                    {
+                        long ticks = sysconf( _SC_CLK_TCK );
+                        struct tms tms;
+
+                        if (ticks && times( &tms ) != -1)
+                        {
+                            pti.UserTime.QuadPart = (ULONGLONG)tms.tms_utime * 10000000 / ticks;
+                            pti.KernelTime.QuadPart = (ULONGLONG)tms.tms_stime * 10000000 / ticks;
+                        }
+                    }
 
                     memcpy(info, &pti, sizeof(KERNEL_USER_TIMES));
                     len = sizeof(KERNEL_USER_TIMES);
@@ -1371,9 +1412,13 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
             else if (!handle) ret = STATUS_INVALID_HANDLE;
             else
             {
-                FIXME( "ProcessHandleCount (%p,%p,0x%08x,%p) stub\n", handle, info, size, ret_len );
-                memset(info, 0, 4);
-                len = 4;
+                SERVER_START_REQ( get_process_native_info )
+                {
+                    req->handle = wine_server_obj_handle( handle );
+                    if (!(ret = wine_server_call( req ))) *(DWORD *)info = reply->handle_count;
+                }
+                SERVER_END_REQ;
+                len = sizeof(DWORD);
             }
             if (size > 4) ret = STATUS_INFO_LENGTH_MISMATCH;
         }
@@ -1385,8 +1430,16 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         break;
 
     case ProcessHandleTable:
-        FIXME( "ProcessHandleTable (%p,%p,0x%08x,%p) stub\n", handle, info, size, ret_len );
-        len = 0;
+        if (!info && size) ret = STATUS_ACCESS_VIOLATION;
+        else SERVER_START_REQ( get_process_handles )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            wine_server_set_reply( req, info, size );
+            ret = wine_server_call( req );
+            len = reply->count * sizeof(obj_handle_t);
+            if (ret == STATUS_BUFFER_TOO_SMALL) ret = STATUS_INFO_LENGTH_MISMATCH;
+        }
+        SERVER_END_REQ;
         break;
 
     case ProcessAffinityMask:
@@ -1544,14 +1597,47 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
             if (!info) ret = STATUS_ACCESS_VIOLATION;
             else
             {
-                PROCESS_CYCLE_TIME_INFORMATION cycles;
+                PROCESS_CYCLE_TIME_INFORMATION cycles = {0};
+                int unix_pid = -1;
 
-                FIXME( "ProcessCycleTime (%p,%p,0x%08x,%p) stub\n", handle, info, size, ret_len );
-                cycles.AccumulatedCycles = 0;
-                cycles.CurrentCycleCount = 0;
+                SERVER_START_REQ( get_process_native_info )
+                {
+                    req->handle = wine_server_obj_handle( handle );
+                    if (!(ret = wine_server_call( req ))) unix_pid = reply->unix_pid;
+                }
+                SERVER_END_REQ;
 
-                memcpy(info, &cycles, sizeof(PROCESS_CYCLE_TIME_INFORMATION));
+                if (!ret)
+                {
+                    if (!get_process_cycle_time( unix_pid, &cycles )) ret = STATUS_NOT_SUPPORTED;
+                    else memcpy(info, &cycles, sizeof(PROCESS_CYCLE_TIME_INFORMATION));
+                }
             }
+        }
+        else ret = STATUS_INFO_LENGTH_MISMATCH;
+        break;
+
+    case ProcessPowerThrottlingState:
+        len = sizeof(PROCESS_POWER_THROTTLING_STATE);
+        if (size == len)
+        {
+            PROCESS_POWER_THROTTLING_STATE state =
+            {
+                PROCESS_POWER_THROTTLING_CURRENT_VERSION, 0, 0
+            };
+
+            if (!info) ret = STATUS_ACCESS_VIOLATION;
+            else SERVER_START_REQ( get_process_native_info )
+            {
+                req->handle = wine_server_obj_handle( handle );
+                if (!(ret = wine_server_call( req )))
+                {
+                    state.ControlMask = reply->power_control;
+                    state.StateMask = reply->power_state;
+                    memcpy( info, &state, sizeof(state) );
+                }
+            }
+            SERVER_END_REQ;
         }
         else ret = STATUS_INFO_LENGTH_MISMATCH;
         break;
@@ -1860,8 +1946,28 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
         break;
 
     case ProcessPowerThrottlingState:
-        FIXME( "ProcessPowerThrottlingState - stub\n" );
-        return STATUS_SUCCESS;
+    {
+        const PROCESS_POWER_THROTTLING_STATE *state = info;
+        const ULONG valid_mask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                                 PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+
+        if (size != sizeof(*state)) return STATUS_INFO_LENGTH_MISMATCH;
+        if (!state) return STATUS_ACCESS_VIOLATION;
+        if (state->Version != PROCESS_POWER_THROTTLING_CURRENT_VERSION ||
+            state->ControlMask & ~valid_mask || state->StateMask & ~state->ControlMask)
+            return STATUS_INVALID_PARAMETER;
+
+        SERVER_START_REQ( set_process_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->power_control = state->ControlMask;
+            req->power_state = state->StateMask;
+            req->mask = SET_PROCESS_INFO_POWER;
+            ret = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        return ret;
+    }
 
     default:
         FIXME( "(%p,0x%08x,%p,0x%08x) stub\n", handle, class, info, size );

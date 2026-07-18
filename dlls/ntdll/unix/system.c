@@ -3296,7 +3296,7 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
     case SystemPerformanceInformation:  /* 2 */
     {
         SYSTEM_PERFORMANCE_INFORMATION spi;
-        static BOOL fixme_written = FALSE;
+        static BOOL once;
 
         get_performance_info( &spi );
         len = sizeof(spi);
@@ -3306,10 +3306,22 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
             else memcpy( info, &spi, len);
         }
         else ret = STATUS_INFO_LENGTH_MISMATCH;
-        if(!fixme_written) {
-            FIXME("info_class SYSTEM_PERFORMANCE_INFORMATION\n");
-            fixme_written = TRUE;
-        }
+        if (!once++) FIXME( "only idle time and memory totals are reported\n" );
+        break;
+    }
+
+    case SystemSecureBootInformation:  /* 145 */
+    {
+        struct
+        {
+            BOOLEAN enabled;
+            BOOLEAN capable;
+        } secure_boot = {FALSE, FALSE};
+
+        len = sizeof(secure_boot);
+        if (size < len) ret = STATUS_INFO_LENGTH_MISMATCH;
+        else if (!info) ret = STATUS_ACCESS_VIOLATION;
+        else memcpy( info, &secure_boot, sizeof(secure_boot) );
         break;
     }
 

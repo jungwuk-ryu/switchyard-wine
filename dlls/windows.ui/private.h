@@ -38,11 +38,23 @@
 #define WIDL_using_Windows_UI_ViewManagement
 #include "windows.ui.viewmanagement.h"
 
+#include "wine/list.h"
+
 extern IActivationFactory *accessibilitysettings_factory;
 extern IActivationFactory *uisettings_factory;
 extern IActivationFactory *uiviewsettings_factory;
 extern IActivationFactory *inputpane_factory;
 extern IActivationFactory *corewindow_factory;
+
+struct event_handlers
+{
+    struct list entries;
+};
+
+void event_handlers_init( struct event_handlers *handlers );
+HRESULT event_handlers_add( struct event_handlers *handlers, IUnknown *handler, EventRegistrationToken *token );
+HRESULT event_handlers_remove( struct event_handlers *handlers, EventRegistrationToken token );
+void event_handlers_clear( struct event_handlers *handlers );
 
 #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
     static inline impl_type *impl_from( iface_type *iface )                                        \

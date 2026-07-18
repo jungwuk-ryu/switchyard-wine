@@ -13614,6 +13614,99 @@ static void test_so_debug(void)
     closesocket(s);
 }
 
+static void test_so_randomize_port(void)
+{
+    struct sockaddr_in addr = {0};
+    DWORD enabled, reuse;
+    SOCKET s, reuse_socket;
+    int len, ret;
+
+    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ok(s != INVALID_SOCKET, "failed to create socket, error %u\n", WSAGetLastError());
+
+    enabled = 0xdeadbeef;
+    len = sizeof(enabled);
+    WSASetLastError(0xdeadbeef);
+    ret = getsockopt(s, SOL_SOCKET, SO_RANDOMIZE_PORT, (char *)&enabled, &len);
+    if (ret == SOCKET_ERROR && WSAGetLastError() == WSAENOPROTOOPT)
+    {
+        win_skip("SO_RANDOMIZE_PORT is not supported.\n");
+        closesocket(s);
+        return;
+    }
+    ok(!ret, "failed to query SO_RANDOMIZE_PORT, error %u\n", WSAGetLastError());
+    ok(len == sizeof(enabled), "got option length %u\n", len);
+    ok(!enabled, "got default value %lu\n", enabled);
+
+    enabled = TRUE;
+    WSASetLastError(0xdeadbeef);
+    ret = setsockopt(s, SOL_SOCKET, SO_RANDOMIZE_PORT, (char *)&enabled, sizeof(enabled) - 1);
+    ok(ret == SOCKET_ERROR, "unexpectedly accepted a short option buffer\n");
+    ok(WSAGetLastError() == WSAEFAULT, "got error %u\n", WSAGetLastError());
+
+    WSASetLastError(0xdeadbeef);
+    ret = setsockopt(s, SOL_SOCKET, SO_RANDOMIZE_PORT, (char *)&enabled, sizeof(enabled));
+    ok(!ret, "failed to enable SO_RANDOMIZE_PORT, error %u\n", WSAGetLastError());
+
+    enabled = 0xdeadbeef;
+    len = sizeof(enabled);
+    WSASetLastError(0xdeadbeef);
+    ret = getsockopt(s, SOL_SOCKET, SO_RANDOMIZE_PORT, (char *)&enabled, &len);
+    ok(!ret, "failed to query SO_RANDOMIZE_PORT, error %u\n", WSAGetLastError());
+    ok(len == sizeof(enabled), "got option length %u\n", len);
+    ok(enabled == TRUE, "got value %lu\n", enabled);
+
+    enabled = FALSE;
+    WSASetLastError(0xdeadbeef);
+    ret = setsockopt(s, SOL_SOCKET, SO_RANDOMIZE_PORT, (char *)&enabled, sizeof(enabled));
+    ok(!ret, "failed to disable SO_RANDOMIZE_PORT, error %u\n", WSAGetLastError());
+
+    enabled = 0xdeadbeef;
+    len = sizeof(enabled);
+    ret = getsockopt(s, SOL_SOCKET, SO_RANDOMIZE_PORT, (char *)&enabled, &len);
+    ok(!ret, "failed to query disabled SO_RANDOMIZE_PORT, error %u\n", WSAGetLastError());
+    ok(enabled == FALSE, "got value %lu\n", enabled);
+
+    reuse_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ok(reuse_socket != INVALID_SOCKET, "failed to create reuse socket, error %u\n", WSAGetLastError());
+
+    reuse = TRUE;
+    WSASetLastError(0xdeadbeef);
+    ret = setsockopt(reuse_socket, SOL_SOCKET, SO_REUSE_UNICASTPORT, (char *)&reuse, sizeof(reuse));
+    if (ret == SOCKET_ERROR && WSAGetLastError() == WSAENOPROTOOPT)
+        win_skip("SO_REUSE_UNICASTPORT is not supported.\n");
+    else
+    {
+        ok(!ret, "failed to enable SO_REUSE_UNICASTPORT, error %u\n", WSAGetLastError());
+
+        reuse = 0xdeadbeef;
+        len = sizeof(reuse);
+        ret = getsockopt(reuse_socket, SOL_SOCKET, SO_REUSE_UNICASTPORT, (char *)&reuse, &len);
+        ok(!ret, "failed to query SO_REUSE_UNICASTPORT, error %u\n", WSAGetLastError());
+        ok(reuse == TRUE, "got value %lu\n", reuse);
+
+        enabled = TRUE;
+        WSASetLastError(0xdeadbeef);
+        ret = setsockopt(reuse_socket, SOL_SOCKET, SO_RANDOMIZE_PORT, (char *)&enabled, sizeof(enabled));
+        ok(ret == SOCKET_ERROR, "unexpectedly combined SO_REUSE_UNICASTPORT and SO_RANDOMIZE_PORT\n");
+        ok(WSAGetLastError() == WSAEINVAL, "got error %u\n", WSAGetLastError());
+    }
+    closesocket(reuse_socket);
+
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ret = bind(s, (struct sockaddr *)&addr, sizeof(addr));
+    ok(!ret, "failed to bind socket, error %u\n", WSAGetLastError());
+
+    enabled = TRUE;
+    WSASetLastError(0xdeadbeef);
+    ret = setsockopt(s, SOL_SOCKET, SO_RANDOMIZE_PORT, (char *)&enabled, sizeof(enabled));
+    ok(ret == SOCKET_ERROR, "unexpectedly changed SO_RANDOMIZE_PORT on a bound socket\n");
+    ok(WSAGetLastError() == WSAEINVAL, "got error %u\n", WSAGetLastError());
+
+    closesocket(s);
+}
+
 struct sockopt_validity_test
 {
     int opt;
@@ -14967,6 +15060,7 @@ START_TEST( sock )
     test_ipv6_cmsg();
     test_extendedSocketOptions();
     test_so_debug();
+    test_so_randomize_port();
     test_sockopt_validity();
     test_connect_time();
 

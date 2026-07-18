@@ -1403,11 +1403,27 @@ HRESULT WINAPI MFTEnumEx(GUID category, UINT32 flags, const MFT_REGISTER_TYPE_IN
 HRESULT WINAPI MFTEnum2(GUID category, UINT32 flags, const MFT_REGISTER_TYPE_INFO *input_type,
         const MFT_REGISTER_TYPE_INFO *output_type, IMFAttributes *attributes, IMFActivate ***activate, UINT32 *count)
 {
+    UINT32 luid_size;
+    HRESULT hr;
+
     TRACE("%s, %#x, %s, %s, %p, %p, %p.\n", debugstr_mf_guid(&category), flags, debugstr_reg_typeinfo(input_type),
             debugstr_reg_typeinfo(output_type), attributes, activate, count);
 
-    if (attributes)
-        FIXME("Ignoring attributes.\n");
+    if (attributes && (hr = IMFAttributes_GetBlobSize(attributes, &MFT_ENUM_ADAPTER_LUID, &luid_size)) != MF_E_ATTRIBUTENOTFOUND)
+    {
+        if (FAILED(hr)) return hr;
+        if (!(flags & MFT_ENUM_FLAG_HARDWARE) || luid_size != sizeof(LUID))
+            return E_INVALIDARG;
+
+        if (!activate || !count) return E_INVALIDARG;
+
+        /* Wine does not expose hardware MFTs associated with a DXGI adapter.
+         * Returning an empty list preserves the adapter filter instead of
+         * leaking unrelated software transforms into the result. */
+        *activate = NULL;
+        *count = 0;
+        return S_OK;
+    }
 
     return mft_enum(category, flags, input_type, output_type, attributes, activate, count);
 }

@@ -5,6 +5,7 @@ SOURCES = \
 	accessibilitysettings.c \
 	classes.idl \
 	corewindow.c \
+	event_handlers.c \
 	inputpane.c \
 	main.c \
 	uisettings.c \

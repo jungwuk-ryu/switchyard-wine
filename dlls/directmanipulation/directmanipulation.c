@@ -18,21 +18,33 @@
 #define COBJMACROS
 
 #include <stdarg.h>
+#include <string.h>
 
 #include "windef.h"
 #include "winbase.h"
 #include "oleidl.h"
 #include "rpcproxy.h"
 #include "wine/debug.h"
+#include "wine/list.h"
 
 #include "directmanipulation.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(manipulation);
 
+static LONG direct_manipulation_backend_warning;
+
+struct activation_entry
+{
+    struct list entry;
+    HWND window;
+    unsigned int count;
+};
+
 struct directmanipulation
 {
     IDirectManipulationManager2 IDirectManipulationManager2_iface;
     IDirectManipulationUpdateManager *updatemanager;
+    struct list activations;
     LONG ref;
 };
 
@@ -388,6 +400,10 @@ struct directviewport
 {
     IDirectManipulationViewport2 IDirectManipulationViewport2_iface;
     LONG ref;
+    RECT rect;
+    DIRECTMANIPULATION_VIEWPORT_OPTIONS options;
+    DIRECTMANIPULATION_CONFIGURATION configuration;
+    DIRECTMANIPULATION_STATUS status;
 };
 
 static inline struct directviewport *impl_from_IDirectManipulationViewport2(IDirectManipulationViewport2 *iface)
@@ -440,15 +456,17 @@ static ULONG WINAPI viewport_Release(IDirectManipulationViewport2 *iface)
 static HRESULT WINAPI viewport_Enable(IDirectManipulationViewport2 *iface)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p\n", This);
-    return E_NOTIMPL;
+    TRACE("%p\n", This);
+    This->status = DIRECTMANIPULATION_ENABLED;
+    return S_OK;
 }
 
 static HRESULT WINAPI viewport_Disable(IDirectManipulationViewport2 *iface)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p\n", This);
-    return E_NOTIMPL;
+    TRACE("%p\n", This);
+    This->status = DIRECTMANIPULATION_DISABLED;
+    return S_OK;
 }
 
 static HRESULT WINAPI viewport_SetContact(IDirectManipulationViewport2 *iface, UINT32 id)
@@ -475,8 +493,10 @@ static HRESULT WINAPI viewport_ReleaseAllContacts(IDirectManipulationViewport2 *
 static HRESULT WINAPI viewport_GetStatus(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_STATUS *status)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p, %p\n", This, status);
-    return E_NOTIMPL;
+    TRACE("%p, %p\n", This, status);
+    if (!status) return E_POINTER;
+    *status = This->status;
+    return S_OK;
 }
 
 static HRESULT WINAPI viewport_GetTag(IDirectManipulationViewport2 *iface, REFIID riid, void **object, UINT32 *id)
@@ -496,14 +516,18 @@ static HRESULT WINAPI viewport_SetTag(IDirectManipulationViewport2 *iface, IUnkn
 static HRESULT WINAPI viewport_GetViewportRect(IDirectManipulationViewport2 *iface, RECT *viewport)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p, %p\n", This, viewport);
-    return E_NOTIMPL;
+    TRACE("%p, %p\n", This, viewport);
+    if (!viewport) return E_POINTER;
+    *viewport = This->rect;
+    return S_OK;
 }
 
 static HRESULT WINAPI viewport_SetViewportRect(IDirectManipulationViewport2 *iface, const RECT *viewport)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p, %p\n", This, viewport);
+    TRACE("%p, %p\n", This, viewport);
+    if (!viewport) return E_POINTER;
+    This->rect = *viewport;
     return S_OK;
 }
 
@@ -573,7 +597,8 @@ static HRESULT WINAPI viewport_RemoveContent(IDirectManipulationViewport2 *iface
 static HRESULT WINAPI viewport_SetViewportOptions(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_VIEWPORT_OPTIONS options)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p, %d\n", This, options);
+    TRACE("%p, %d\n", This, options);
+    This->options = options;
     return S_OK;
 }
 
@@ -594,7 +619,12 @@ static HRESULT WINAPI viewport_RemoveConfiguration(IDirectManipulationViewport2 
 static HRESULT WINAPI viewport_ActivateConfiguration(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_CONFIGURATION configuration)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p, %d\n", This, configuration);
+    TRACE("%p, %d\n", This, configuration);
+
+    if (!InterlockedExchange(&direct_manipulation_backend_warning, TRUE))
+        FIXME("Direct Manipulation input processing is not implemented; storing configuration only.\n");
+    This->configuration = configuration;
+    This->status = DIRECTMANIPULATION_READY;
     return S_OK;
 }
 
@@ -644,15 +674,27 @@ static HRESULT WINAPI viewport_SetUpdateMode(IDirectManipulationViewport2 *iface
 static HRESULT WINAPI viewport_Stop(IDirectManipulationViewport2 *iface)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p\n", This);
-    return E_NOTIMPL;
+    TRACE("%p\n", This);
+
+    /* There is no host manipulation engine to drain.  Keeping the status at
+     * READY accurately describes the idle viewport after pending input is
+     * discarded. */
+    This->status = DIRECTMANIPULATION_READY;
+    return S_OK;
 }
 
 static HRESULT WINAPI viewport_Abandon(IDirectManipulationViewport2 *iface)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p\n", This);
-    return E_NOTIMPL;
+    TRACE("%p\n", This);
+
+    /* There are no host-side manipulation resources yet.  Reset the local
+     * configuration so the viewport can be configured again or released. */
+    memset(&This->rect, 0, sizeof(This->rect));
+    This->options = DIRECTMANIPULATION_VIEWPORT_OPTIONS_DEFAULT;
+    This->configuration = DIRECTMANIPULATION_CONFIGURATION_NONE;
+    This->status = DIRECTMANIPULATION_BUILDING;
+    return S_OK;
 }
 
 static HRESULT WINAPI viewport_AddBehavior(IDirectManipulationViewport2 *iface, IUnknown *behavior, DWORD *cookie)
@@ -718,13 +760,13 @@ static HRESULT create_viewport(IDirectManipulationViewport2 **obj)
 {
     struct directviewport *object;
 
-    object = malloc(sizeof(*object));
+    object = calloc(1, sizeof(*object));
     if(!object)
         return E_OUTOFMEMORY;
 
     object->IDirectManipulationViewport2_iface.lpVtbl = &viewportVtbl;
     object->ref = 1;
-
+    object->status = DIRECTMANIPULATION_BUILDING;
     *obj = &object->IDirectManipulationViewport2_iface;
 
     return S_OK;
@@ -763,8 +805,15 @@ static ULONG WINAPI direct_manip_Release(IDirectManipulationManager2 *iface)
 
     if (!ref)
     {
+        struct activation_entry *entry, *next;
+
         if(This->updatemanager)
             IDirectManipulationUpdateManager_Release(This->updatemanager);
+        LIST_FOR_EACH_ENTRY_SAFE(entry, next, &This->activations, struct activation_entry, entry)
+        {
+            list_remove(&entry->entry);
+            free(entry);
+        }
         free(This);
     }
     return ref;
@@ -773,15 +822,46 @@ static ULONG WINAPI direct_manip_Release(IDirectManipulationManager2 *iface)
 static HRESULT WINAPI direct_manip_Activate(IDirectManipulationManager2 *iface, HWND window)
 {
     struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
-    FIXME("%p, %p\n", This, window);
-    return E_NOTIMPL;
+    struct activation_entry *entry;
+    TRACE("%p, %p\n", This, window);
+
+    if (!window) return E_INVALIDARG;
+    if (!InterlockedExchange(&direct_manipulation_backend_warning, TRUE))
+        FIXME("Direct Manipulation input processing is not implemented; tracking activation only.\n");
+
+    LIST_FOR_EACH_ENTRY(entry, &This->activations, struct activation_entry, entry)
+    {
+        if (entry->window != window) continue;
+        ++entry->count;
+        return S_OK;
+    }
+
+    if (!(entry = malloc(sizeof(*entry)))) return E_OUTOFMEMORY;
+    entry->window = window;
+    entry->count = 1;
+    list_add_tail(&This->activations, &entry->entry);
+    return S_OK;
 }
 
 static HRESULT WINAPI direct_manip_Deactivate(IDirectManipulationManager2 *iface, HWND window)
 {
     struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
-    FIXME("%p, %p\n", This, window);
-    return E_NOTIMPL;
+    struct activation_entry *entry;
+    TRACE("%p, %p\n", This, window);
+
+    if (!window) return E_INVALIDARG;
+
+    LIST_FOR_EACH_ENTRY(entry, &This->activations, struct activation_entry, entry)
+    {
+        if (entry->window != window) continue;
+        if (!--entry->count)
+        {
+            list_remove(&entry->entry);
+            free(entry);
+        }
+        break;
+    }
+    return S_OK;
 }
 
 static HRESULT WINAPI direct_manip_RegisterHitTestTarget(IDirectManipulationManager2 *iface, HWND window,
@@ -892,6 +972,7 @@ static HRESULT WINAPI DirectManipulation_CreateInstance(IClassFactory *iface, IU
 
     object->IDirectManipulationManager2_iface.lpVtbl = &directmanipVtbl;
     object->ref = 1;
+    list_init(&object->activations);
 
     ret = direct_manip_QueryInterface(&object->IDirectManipulationManager2_iface, riid, ppv);
     direct_manip_Release(&object->IDirectManipulationManager2_iface);

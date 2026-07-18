@@ -19,7 +19,11 @@
 #include <stdarg.h>
 
 #define COBJMACROS
+#include "windef.h"
 #include "initguid.h"
+#include "d3d11.h"
+#include "d3d12.h"
+#include "dxgi1_6.h"
 #include "dxcore.h"
 #include "wine/wined3d.h"
 
@@ -35,6 +39,17 @@ struct dxcore_adapter
     struct wined3d_adapter_identifier identifier;
     char driver_description[128];
 };
+
+struct dxcore_capability_cache
+{
+    struct dxcore_capability_cache *next;
+    LUID luid;
+    LONG d3d11_supported;
+    LONG d3d12_supported;
+};
+
+static struct dxcore_capability_cache *capability_cache;
+static SRWLOCK capability_cache_lock = SRWLOCK_INIT;
 
 static inline struct dxcore_adapter *impl_from_IDXCoreAdapter(IDXCoreAdapter *iface)
 {
@@ -83,16 +98,144 @@ static ULONG STDMETHODCALLTYPE dxcore_adapter_Release(IDXCoreAdapter *iface)
     return refcount;
 }
 
+static LONG dxcore_get_cached_capability(REFLUID luid, BOOL d3d12)
+{
+    struct dxcore_capability_cache *entry;
+    LONG supported = 0;
+
+    AcquireSRWLockShared(&capability_cache_lock);
+    for (entry = capability_cache; entry; entry = entry->next)
+    {
+        if (!memcmp(&entry->luid, luid, sizeof(*luid)))
+        {
+            supported = d3d12 ? entry->d3d12_supported : entry->d3d11_supported;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&capability_cache_lock);
+    return supported;
+}
+
+static void dxcore_cache_capability(REFLUID luid, BOOL d3d12, LONG supported)
+{
+    struct dxcore_capability_cache *entry;
+
+    AcquireSRWLockExclusive(&capability_cache_lock);
+    for (entry = capability_cache; entry; entry = entry->next)
+        if (!memcmp(&entry->luid, luid, sizeof(*luid)))
+            break;
+
+    if (!entry && (entry = calloc(1, sizeof(*entry))))
+    {
+        entry->luid = *luid;
+        entry->next = capability_cache;
+        capability_cache = entry;
+    }
+    if (entry)
+    {
+        if (d3d12)
+            entry->d3d12_supported = supported;
+        else
+            entry->d3d11_supported = supported;
+    }
+    ReleaseSRWLockExclusive(&capability_cache_lock);
+}
+
 static BOOL STDMETHODCALLTYPE dxcore_adapter_IsValid(IDXCoreAdapter *iface)
 {
     FIXME("iface %p stub!\n", iface);
     return FALSE;
 }
 
+static BOOL dxcore_adapter_supports_d3d11(struct dxcore_adapter *adapter)
+{
+    HRESULT (WINAPI *create_factory)(UINT, REFIID, void **);
+    PFN_D3D11_CREATE_DEVICE create_device;
+    IDXGIFactory4 *factory = NULL;
+    IDXGIAdapter *dxgi_adapter = NULL;
+    HMODULE d3d11_module, dxgi_module;
+    LONG cached, supported = 1;
+
+    if ((cached = dxcore_get_cached_capability(&adapter->identifier.adapter_luid, FALSE)))
+        return cached == 2;
+
+    d3d11_module = LoadLibraryW(L"d3d11.dll");
+    dxgi_module = LoadLibraryW(L"dxgi.dll");
+    if (d3d11_module && dxgi_module &&
+        (create_device = (void *)GetProcAddress(d3d11_module, "D3D11CreateDevice")) &&
+        (create_factory = (void *)GetProcAddress(dxgi_module, "CreateDXGIFactory2")) &&
+        SUCCEEDED(create_factory(0, &IID_IDXGIFactory4, (void **)&factory)) &&
+        SUCCEEDED(IDXGIFactory4_EnumAdapterByLuid(factory, adapter->identifier.adapter_luid,
+                &IID_IDXGIAdapter, (void **)&dxgi_adapter)) &&
+        SUCCEEDED(create_device(dxgi_adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, NULL, 0,
+                D3D11_SDK_VERSION, NULL, NULL, NULL)))
+    {
+        supported = 2;
+    }
+    if (dxgi_adapter) IDXGIAdapter_Release(dxgi_adapter);
+    if (factory) IDXGIFactory4_Release(factory);
+    if (dxgi_module) FreeLibrary(dxgi_module);
+    if (d3d11_module) FreeLibrary(d3d11_module);
+
+    dxcore_cache_capability(&adapter->identifier.adapter_luid, FALSE, supported);
+    return supported == 2;
+}
+
+static BOOL dxcore_adapter_supports_d3d12(struct dxcore_adapter *adapter)
+{
+    HRESULT (WINAPI *create_factory)(UINT, REFIID, void **);
+    PFN_D3D12_CREATE_DEVICE create_device;
+    IDXGIFactory4 *factory = NULL;
+    IDXGIAdapter *dxgi_adapter = NULL;
+    HMODULE d3d12_module, dxgi_module;
+    LONG cached, supported = 1;
+
+    if ((cached = dxcore_get_cached_capability(&adapter->identifier.adapter_luid, TRUE)))
+        return cached == 2;
+
+    d3d12_module = LoadLibraryW(L"d3d12.dll");
+    dxgi_module = LoadLibraryW(L"dxgi.dll");
+    if (d3d12_module && dxgi_module &&
+        (create_device = (void *)GetProcAddress(d3d12_module, "D3D12CreateDevice")) &&
+        (create_factory = (void *)GetProcAddress(dxgi_module, "CreateDXGIFactory2")) &&
+        SUCCEEDED(create_factory(0, &IID_IDXGIFactory4, (void **)&factory)) &&
+        SUCCEEDED(IDXGIFactory4_EnumAdapterByLuid(factory, adapter->identifier.adapter_luid,
+                &IID_IDXGIAdapter, (void **)&dxgi_adapter)) &&
+        SUCCEEDED(create_device((IUnknown *)dxgi_adapter, D3D_FEATURE_LEVEL_11_0,
+                &IID_ID3D12Device, NULL)))
+    {
+        supported = 2;
+    }
+    if (dxgi_adapter) IDXGIAdapter_Release(dxgi_adapter);
+    if (factory) IDXGIFactory4_Release(factory);
+    if (dxgi_module) FreeLibrary(dxgi_module);
+    if (d3d12_module) FreeLibrary(d3d12_module);
+
+    dxcore_cache_capability(&adapter->identifier.adapter_luid, TRUE, supported);
+    return supported == 2;
+}
+
+static BOOL dxcore_adapter_supports_attribute(struct dxcore_adapter *adapter, REFGUID attribute)
+{
+    if (IsEqualGUID(attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS))
+        return dxcore_adapter_supports_d3d11(adapter);
+    if (IsEqualGUID(attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS) ||
+        IsEqualGUID(attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE))
+    {
+        /* Both attributes describe device creation through D3D12CreateDevice;
+         * Wine does not expose a separate core-compute driver path. */
+        return dxcore_adapter_supports_d3d12(adapter);
+    }
+    return FALSE;
+}
+
 static BOOL STDMETHODCALLTYPE dxcore_adapter_IsAttributeSupported(IDXCoreAdapter *iface, REFGUID attribute)
 {
-    FIXME("iface %p, attribute %s stub!\n", iface, debugstr_guid(attribute));
-    return FALSE;
+    struct dxcore_adapter *adapter = impl_from_IDXCoreAdapter(iface);
+
+    TRACE("iface %p, attribute %s.\n", iface, debugstr_guid(attribute));
+
+    return dxcore_adapter_supports_attribute(adapter, attribute);
 }
 
 static BOOL STDMETHODCALLTYPE dxcore_adapter_IsPropertySupported(IDXCoreAdapter *iface, DXCoreAdapterProperty property)
@@ -175,8 +318,7 @@ static HRESULT STDMETHODCALLTYPE dxcore_adapter_GetProperty(IDXCoreAdapter *ifac
         }
 
         case IsHardware:
-            FIXME("Returning all adapters as Hardware.\n");
-            *(BYTE *)buffer = 1;
+            *(BYTE *)buffer = !adapter->identifier.is_software;
             break;
 
         case DriverDescription:
@@ -468,27 +610,42 @@ static HRESULT dxcore_adapter_create(const struct wined3d_adapter *wined3d_adapt
     return S_OK;
 }
 
-static HRESULT get_adapters(struct dxcore_adapter_list *list)
+static HRESULT get_adapters(struct dxcore_adapter_list *list, uint32_t num_attributes,
+        const GUID *filter_attributes)
 {
     struct wined3d *wined3d = wined3d_create(0);
+    uint32_t adapter_capacity, i, j;
     HRESULT hr = S_OK;
 
     if (!wined3d)
         return E_FAIL;
 
-    if (!(list->adapter_count = wined3d_get_adapter_count(wined3d)))
+    if (!(adapter_capacity = wined3d_get_adapter_count(wined3d)))
         goto done;
 
-    if (!(list->adapters = calloc(list->adapter_count, sizeof(*list->adapters))))
+    if (!(list->adapters = calloc(adapter_capacity, sizeof(*list->adapters))))
     {
         hr = E_OUTOFMEMORY;
         goto done;
     }
 
-    for (UINT i = 0; i < list->adapter_count; i++)
+    for (i = 0; i < adapter_capacity; ++i)
     {
-        if (FAILED(hr = dxcore_adapter_create(wined3d_get_adapter(wined3d, i), &list->adapters[i])))
+        struct dxcore_adapter *adapter;
+
+        if (FAILED(hr = dxcore_adapter_create(wined3d_get_adapter(wined3d, i), &adapter)))
             goto done;
+
+        for (j = 0; j < num_attributes; ++j)
+        {
+            if (!dxcore_adapter_supports_attribute(adapter, &filter_attributes[j]))
+                break;
+        }
+
+        if (j == num_attributes)
+            list->adapters[list->adapter_count++] = adapter;
+        else
+            IDXCoreAdapter_Release(&adapter->IDXCoreAdapter_iface);
     }
 
 done:
@@ -502,7 +659,7 @@ static HRESULT STDMETHODCALLTYPE dxcore_adapter_factory_CreateAdapterList(IDXCor
     struct dxcore_adapter_list *list;
     HRESULT hr;
 
-    FIXME("iface %p, num_attributes %u, filter_attributes %p, riid %s, out %p semi-stub!\n", iface, num_attributes, filter_attributes,
+    TRACE("iface %p, num_attributes %u, filter_attributes %p, riid %s, out %p.\n", iface, num_attributes, filter_attributes,
             debugstr_guid(riid), out);
 
     if (!out)
@@ -518,7 +675,7 @@ static HRESULT STDMETHODCALLTYPE dxcore_adapter_factory_CreateAdapterList(IDXCor
 
     list->IDXCoreAdapterList_iface.lpVtbl = &dxcore_adapter_list_vtbl;
     list->refcount = 1;
-    if (FAILED(hr = get_adapters(list)))
+    if (FAILED(hr = get_adapters(list, num_attributes, filter_attributes)))
     {
         IDXCoreAdapterList_Release(&list->IDXCoreAdapterList_iface);
         return hr;

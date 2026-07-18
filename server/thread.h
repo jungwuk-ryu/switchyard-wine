@@ -87,6 +87,9 @@ struct thread
     int                    priority;      /* current thread priority */
     int                    base_priority; /* base priority level (relative to process base priority class) */
     int                    disable_boost; /* disable thread priority boost */
+    unsigned int           page_priority; /* memory page priority hint */
+    unsigned int           power_control; /* power throttling control mask */
+    unsigned int           power_state;   /* power throttling state mask */
     int                    suspend;       /* suspend count */
     bool                   is_system;     /* system thread (kernel mode only) */
     bool                   dbg_hidden;    /* hidden from debugger */

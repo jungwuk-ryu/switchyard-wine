@@ -26,13 +26,14 @@ WINE_DEFAULT_DEBUG_CHANNEL(tbs);
 
 TBS_RESULT WINAPI Tbsi_Context_Create(const TBS_CONTEXT_PARAMS *params, TBS_HCONTEXT *out)
 {
-    FIXME("(%p, %p) stub\n", params, out);
+    TRACE("(%p, %p)\n", params, out);
+    /* Wine does not expose a host TPM to Windows applications. */
     return TBS_E_TPM_NOT_FOUND;
 }
 
 TBS_RESULT WINAPI Tbsi_GetDeviceInfo(UINT32 size, void *info)
 {
-    FIXME("(%u, %p) stub\n", size, info);
+    TRACE("(%u, %p)\n", size, info);
     return TBS_E_TPM_NOT_FOUND;
 }
 

@@ -227,9 +227,89 @@ typedef struct _WTSINFOW {
 DECL_WINELIB_TYPE_AW(WTSINFO)
 DECL_WINELIB_TYPE_AW(PWTSINFO)
 
+#define WTS_SESSIONSTATE_UNKNOWN 0xffffffff
+#define WTS_SESSIONSTATE_LOCK    0
+#define WTS_SESSIONSTATE_UNLOCK  1
+
+typedef struct _WTSINFOEX_LEVEL1_A
+{
+    ULONG SessionId;
+    WTS_CONNECTSTATE_CLASS SessionState;
+    LONG SessionFlags;
+    CHAR WinStationName[WINSTATIONNAME_LENGTH + 1];
+    CHAR UserName[USERNAME_LENGTH + 1];
+    CHAR DomainName[DOMAIN_LENGTH + 1];
+    LARGE_INTEGER LogonTime;
+    LARGE_INTEGER ConnectTime;
+    LARGE_INTEGER DisconnectTime;
+    LARGE_INTEGER LastInputTime;
+    LARGE_INTEGER CurrentTime;
+    DWORD IncomingBytes;
+    DWORD OutgoingBytes;
+    DWORD IncomingFrames;
+    DWORD OutgoingFrames;
+    DWORD IncomingCompressedBytes;
+    DWORD OutgoingCompressedBytes;
+} WTSINFOEX_LEVEL1_A, *PWTSINFOEX_LEVEL1_A;
+
+typedef struct _WTSINFOEX_LEVEL1_W
+{
+    ULONG SessionId;
+    WTS_CONNECTSTATE_CLASS SessionState;
+    LONG SessionFlags;
+    WCHAR WinStationName[WINSTATIONNAME_LENGTH + 1];
+    WCHAR UserName[USERNAME_LENGTH + 1];
+    WCHAR DomainName[DOMAIN_LENGTH + 1];
+    LARGE_INTEGER LogonTime;
+    LARGE_INTEGER ConnectTime;
+    LARGE_INTEGER DisconnectTime;
+    LARGE_INTEGER LastInputTime;
+    LARGE_INTEGER CurrentTime;
+    DWORD IncomingBytes;
+    DWORD OutgoingBytes;
+    DWORD IncomingFrames;
+    DWORD OutgoingFrames;
+    DWORD IncomingCompressedBytes;
+    DWORD OutgoingCompressedBytes;
+} WTSINFOEX_LEVEL1_W, *PWTSINFOEX_LEVEL1_W;
+
+DECL_WINELIB_TYPE_AW(WTSINFOEX_LEVEL1)
+DECL_WINELIB_TYPE_AW(PWTSINFOEX_LEVEL1)
+
+typedef union _WTSINFOEX_LEVEL_A
+{
+    WTSINFOEX_LEVEL1_A WTSInfoExLevel1;
+} WTSINFOEX_LEVEL_A, *PWTSINFOEX_LEVEL_A;
+
+typedef union _WTSINFOEX_LEVEL_W
+{
+    WTSINFOEX_LEVEL1_W WTSInfoExLevel1;
+} WTSINFOEX_LEVEL_W, *PWTSINFOEX_LEVEL_W;
+
+DECL_WINELIB_TYPE_AW(WTSINFOEX_LEVEL)
+DECL_WINELIB_TYPE_AW(PWTSINFOEX_LEVEL)
+
+typedef struct _WTSINFOEXA
+{
+    DWORD Level;
+    WTSINFOEX_LEVEL_A Data;
+} WTSINFOEXA, *PWTSINFOEXA;
+
+typedef struct _WTSINFOEXW
+{
+    DWORD Level;
+    WTSINFOEX_LEVEL_W Data;
+} WTSINFOEXW, *PWTSINFOEXW;
+
+DECL_WINELIB_TYPE_AW(WTSINFOEX)
+DECL_WINELIB_TYPE_AW(PWTSINFOEX)
+
 #define WTS_CURRENT_SERVER_HANDLE ((HANDLE)NULL)
 #define WTS_CURRENT_SESSION (~0u)
 #define WTS_ANY_SESSION ((DWORD)-2)
+
+#define NOTIFY_FOR_THIS_SESSION 0
+#define NOTIFY_FOR_ALL_SESSIONS 1
 
 void WINAPI WTSCloseServer(HANDLE);
 BOOL WINAPI WTSConnectSessionA(ULONG, ULONG, PSTR, BOOL);

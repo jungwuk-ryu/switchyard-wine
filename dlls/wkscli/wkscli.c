@@ -36,13 +36,20 @@ NET_API_STATUS NET_API_FUNCTION NetGetJoinInformation(
     PNETSETUP_JOIN_STATUS type)
 {
     static const WCHAR workgroupW[] = L"Workgroup";
+    NET_API_STATUS ret;
 
-    FIXME("Semi-stub %s %p %p\n", wine_dbgstr_w(Server), Name, type);
+    TRACE("%s %p %p\n", wine_dbgstr_w(Server), Name, type);
 
     if (!Name || !type)
         return ERROR_INVALID_PARAMETER;
+    if (Server && *Server)
+    {
+        FIXME("Remote join information is not supported for %s.\n", wine_dbgstr_w(Server));
+        return ERROR_NOT_SUPPORTED;
+    }
 
-    NetApiBufferAllocate(sizeof(workgroupW), (LPVOID *)Name);
+    if ((ret = NetApiBufferAllocate(sizeof(workgroupW), (LPVOID *)Name)))
+        return ret;
     lstrcpyW(*Name, workgroupW);
     *type = NetSetupWorkgroupName;
 

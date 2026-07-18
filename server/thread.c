@@ -421,6 +421,9 @@ static inline void init_thread_structure( struct thread *thread )
     thread->priority        = 0;
     thread->base_priority   = 0;
     thread->disable_boost   = 0;
+    thread->page_priority   = 5;
+    thread->power_control   = 0;
+    thread->power_state     = 0;
     thread->suspend         = 0;
     thread->dbg_hidden      = 0;
     thread->bypass_proc_suspend = 0;
@@ -1895,9 +1898,64 @@ DECL_HANDLER(get_thread_times)
     {
         reply->creation_time  = thread->creation_time;
         reply->exit_time      = thread->exit_time;
+        reply->kernel_time    = -1;
+        reply->user_time      = -1;
         reply->unix_pid       = thread->unix_pid;
         reply->unix_tid       = thread->unix_tid;
 
+#ifdef __APPLE__
+        if (thread->unix_tid != -1 && thread->process->trace_data)
+        {
+            thread_basic_info_data_t info;
+            mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+            mach_msg_type_name_t type;
+            mach_port_t thread_port;
+
+            if (!mach_port_extract_right( thread->process->trace_data, thread->unix_tid,
+                                          MACH_MSG_TYPE_COPY_SEND, &thread_port, &type ))
+            {
+                if (!thread_info( thread_port, THREAD_BASIC_INFO, (thread_info_t)&info, &count ))
+                {
+                    reply->kernel_time = info.system_time.seconds * (timeout_t)TICKS_PER_SEC
+                                         + info.system_time.microseconds * 10;
+                    reply->user_time = info.user_time.seconds * (timeout_t)TICKS_PER_SEC
+                                       + info.user_time.microseconds * 10;
+                }
+                mach_port_deallocate( mach_task_self(), thread_port );
+            }
+        }
+#endif
+
+        release_object( thread );
+    }
+}
+
+DECL_HANDLER(get_thread_native_info)
+{
+    struct thread *thread;
+
+    if ((thread = get_thread_from_handle( req->handle, THREAD_QUERY_LIMITED_INFORMATION )))
+    {
+        reply->page_priority = thread->page_priority;
+        reply->power_control = thread->power_control;
+        reply->power_state = thread->power_state;
+        release_object( thread );
+    }
+}
+
+DECL_HANDLER(set_thread_native_info)
+{
+    struct thread *thread;
+
+    if ((thread = get_thread_from_handle( req->handle, THREAD_SET_INFORMATION )))
+    {
+        if (req->mask & SET_THREAD_NATIVE_INFO_PAGE_PRIORITY)
+            thread->page_priority = req->page_priority;
+        if (req->mask & SET_THREAD_NATIVE_INFO_POWER)
+        {
+            thread->power_control = req->power_control;
+            thread->power_state = req->power_state;
+        }
         release_object( thread );
     }
 }

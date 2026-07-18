@@ -7061,20 +7061,19 @@ static NTSTATUS prefetch_memory( HANDLE process, ULONG_PTR count,
     ULONG_PTR i;
     PVOID base;
     SIZE_T size;
-    static unsigned int once;
-
-    if (!once++)
-    {
-        FIXME( "(process=%p,flags=%u) NtSetInformationVirtualMemory(VmPrefetchInformation) partial stub\n",
-                process, flags );
-    }
 
     for (i = 0; i < count; i++)
     {
         if (!addresses[i].NumberOfBytes) return STATUS_INVALID_PARAMETER_4;
     }
 
-    if (process != NtCurrentProcess()) return STATUS_SUCCESS;
+    if (process != NtCurrentProcess())
+    {
+        static unsigned int once;
+
+        if (!once++) FIXME( "prefetching another process %p is not supported\n", process );
+        return STATUS_SUCCESS;
+    }
 
     for (i = 0; i < count; i++)
     {

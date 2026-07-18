@@ -32,6 +32,7 @@
 #include "user_private.h"
 
 #include "wine/debug.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
@@ -39,6 +40,82 @@ BOOL WINAPI ImmSetActiveContext(HWND, HIMC, BOOL);
 
 #define IMM_INIT_MAGIC 0x19650412
 static LRESULT (WINAPI *imm_ime_wnd_proc)( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, BOOL ansi);
+
+enum power_notification_type
+{
+    POWER_SETTING_NOTIFICATION,
+    SUSPEND_RESUME_NOTIFICATION,
+};
+
+struct power_notification
+{
+    struct list entry;
+    enum power_notification_type type;
+};
+
+static struct list power_notifications = LIST_INIT(power_notifications);
+static LONG power_notification_warning;
+static CRITICAL_SECTION power_notifications_cs;
+static CRITICAL_SECTION_DEBUG power_notifications_cs_debug =
+{
+    0, 0, &power_notifications_cs,
+    { &power_notifications_cs_debug.ProcessLocksList, &power_notifications_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": power_notifications_cs") }
+};
+static CRITICAL_SECTION power_notifications_cs = { &power_notifications_cs_debug, -1, 0, 0, 0, 0 };
+
+static HPOWERNOTIFY register_power_notification(HANDLE recipient, DWORD flags,
+        enum power_notification_type type)
+{
+    struct power_notification *notification;
+    DWORD max_flags = type == POWER_SETTING_NOTIFICATION ? DEVICE_NOTIFY_SERVICE_HANDLE : 2;
+
+    if (!recipient || (flags == DEVICE_NOTIFY_WINDOW_HANDLE && !IsWindow((HWND)recipient)) || flags > max_flags)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
+    if (!(notification = malloc(sizeof(*notification))))
+    {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    notification->type = type;
+
+    EnterCriticalSection(&power_notifications_cs);
+    list_add_tail(&power_notifications, &notification->entry);
+    LeaveCriticalSection(&power_notifications_cs);
+
+    if (!InterlockedExchange(&power_notification_warning, TRUE))
+        FIXME("Power notification delivery is not implemented; registration lifetime only.\n");
+    return (HPOWERNOTIFY)notification;
+}
+
+static BOOL unregister_power_notification(HPOWERNOTIFY handle, enum power_notification_type type)
+{
+    struct power_notification *notification;
+    BOOL found = FALSE;
+
+    EnterCriticalSection(&power_notifications_cs);
+    LIST_FOR_EACH_ENTRY(notification, &power_notifications, struct power_notification, entry)
+    {
+        if (notification != (struct power_notification *)handle || notification->type != type) continue;
+        list_remove(&notification->entry);
+        found = TRUE;
+        break;
+    }
+    LeaveCriticalSection(&power_notifications_cs);
+
+    if (!found)
+    {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    free(notification);
+    return TRUE;
+}
 
 /* USER signal proc flags and codes */
 /* See UserSignalProc for comments */
@@ -409,8 +486,14 @@ BOOL WINAPI UserHandleGrantAccess(HANDLE handle, HANDLE job, BOOL grant)
  */
 HPOWERNOTIFY WINAPI RegisterPowerSettingNotification(HANDLE recipient, const GUID *guid, DWORD flags)
 {
-    FIXME("(%p,%s,%lx): stub\n", recipient, debugstr_guid(guid), flags);
-    return (HPOWERNOTIFY)0xdeadbeef;
+    TRACE("(%p,%s,%lx)\n", recipient, debugstr_guid(guid), flags);
+
+    if (!guid)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    return register_power_notification(recipient, flags, POWER_SETTING_NOTIFICATION);
 }
 
 /**********************************************************************
@@ -418,8 +501,8 @@ HPOWERNOTIFY WINAPI RegisterPowerSettingNotification(HANDLE recipient, const GUI
  */
 BOOL WINAPI UnregisterPowerSettingNotification(HPOWERNOTIFY handle)
 {
-    FIXME("(%p): stub\n", handle);
-    return TRUE;
+    TRACE("(%p)\n", handle);
+    return unregister_power_notification(handle, POWER_SETTING_NOTIFICATION);
 }
 
 /**********************************************************************
@@ -427,8 +510,8 @@ BOOL WINAPI UnregisterPowerSettingNotification(HPOWERNOTIFY handle)
  */
 HPOWERNOTIFY WINAPI RegisterSuspendResumeNotification(HANDLE recipient, DWORD flags)
 {
-    FIXME("%p, %#lx: stub.\n", recipient, flags);
-    return (HPOWERNOTIFY)0xdeadbeef;
+    TRACE("%p, %#lx\n", recipient, flags);
+    return register_power_notification(recipient, flags, SUSPEND_RESUME_NOTIFICATION);
 }
 
 /**********************************************************************
@@ -436,8 +519,8 @@ HPOWERNOTIFY WINAPI RegisterSuspendResumeNotification(HANDLE recipient, DWORD fl
  */
 BOOL WINAPI UnregisterSuspendResumeNotification(HPOWERNOTIFY handle)
 {
-    FIXME("%p: stub.\n", handle);
-    return TRUE;
+    TRACE("%p\n", handle);
+    return unregister_power_notification(handle, SUSPEND_RESUME_NOTIFICATION);
 }
 
 /**********************************************************************
@@ -463,7 +546,16 @@ BOOL WINAPI IsWindowRedirectedForPrint( HWND hwnd )
  */
 BOOL WINAPI RegisterPointerDeviceNotifications(HWND hwnd, BOOL notifyrange)
 {
-    FIXME("(%p %d): stub\n", hwnd, notifyrange);
+    TRACE("(%p %d)\n", hwnd, notifyrange);
+
+    if (!IsWindow(hwnd))
+    {
+        SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+
+    /* Wine currently exposes no pointer devices, so there are no device
+     * arrival or removal notifications to deliver. */
     return TRUE;
 }
 
@@ -472,14 +564,16 @@ BOOL WINAPI RegisterPointerDeviceNotifications(HWND hwnd, BOOL notifyrange)
  */
 BOOL WINAPI GetPointerDevices(UINT32 *device_count, POINTER_DEVICE_INFO *devices)
 {
-    FIXME("(%p %p): partial stub\n", device_count, devices);
+    TRACE("(%p %p)\n", device_count, devices);
 
     if (!device_count)
+    {
+        SetLastError(ERROR_NOACCESS);
         return FALSE;
+    }
 
-    if (devices)
-        return FALSE;
-
+    /* Pointer devices are reported separately from the system mouse.  No
+     * touch, pen, or precision-touchpad backend is exposed by Wine yet. */
     *device_count = 0;
     return TRUE;
 }

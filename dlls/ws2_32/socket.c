@@ -1975,6 +1975,16 @@ int WINAPI getsockopt( SOCKET s, int level, int optname, char *optval, int *optl
             if (!ret && *optlen < sizeof(DWORD)) *optlen = 1;
             return ret;
 
+        case SO_RANDOMIZE_PORT:
+            ret = server_getsockopt( s, IOCTL_AFD_WINE_GET_SO_RANDOMIZE_PORT, optval, optlen );
+            if (!ret && *optlen < sizeof(DWORD)) *optlen = 1;
+            return ret;
+
+        case SO_REUSE_UNICASTPORT:
+            ret = server_getsockopt( s, IOCTL_AFD_WINE_GET_SO_REUSE_UNICASTPORT, optval, optlen );
+            if (!ret && *optlen < sizeof(DWORD)) *optlen = 1;
+            return ret;
+
         case SO_SNDBUF:
             if (*optlen < sizeof(DWORD) || !optval)
             {
@@ -3462,16 +3472,33 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
             return 0;
 
         case SO_RANDOMIZE_PORT:
-            FIXME("Ignoring SO_RANDOMIZE_PORT\n");
-            return 0;
+            if (!optval || optlen < sizeof(value))
+            {
+                SetLastError( WSAEFAULT );
+                return SOCKET_ERROR;
+            }
+            memcpy( &value, optval, sizeof(value) );
+            /* Ephemeral port selection remains delegated to the host network
+             * stack; retain the Windows option state for API compatibility. */
+            TRACE("Using host ephemeral port selection, randomization %s.\n", value ? "enabled" : "disabled");
+            return server_setsockopt( s, IOCTL_AFD_WINE_SET_SO_RANDOMIZE_PORT,
+                                      (char *)&value, sizeof(value) );
 
         case SO_PORT_SCALABILITY:
             FIXME("Ignoring SO_PORT_SCALABILITY\n");
             return 0;
 
         case SO_REUSE_UNICASTPORT:
-            FIXME("Ignoring SO_REUSE_UNICASTPORT\n");
-            return 0;
+            if (!optval || optlen < sizeof(value))
+            {
+                SetLastError( WSAEFAULT );
+                return SOCKET_ERROR;
+            }
+            memcpy( &value, optval, sizeof(value) );
+            /* The host stack owns ephemeral port allocation. Retaining this
+             * state also enforces its documented conflict with randomization. */
+            return server_setsockopt( s, IOCTL_AFD_WINE_SET_SO_REUSE_UNICASTPORT,
+                                      (char *)&value, sizeof(value) );
 
         case SO_REUSE_MULTICASTPORT:
             FIXME("Ignoring SO_REUSE_MULTICASTPORT\n");

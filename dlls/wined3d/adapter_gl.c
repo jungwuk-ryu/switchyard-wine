@@ -5157,6 +5157,7 @@ static BOOL wined3d_adapter_gl_init(struct wined3d_adapter_gl *adapter_gl,
         wined3d_caps_gl_ctx_destroy(&caps_gl_ctx);
         return FALSE;
     }
+    adapter_gl->a.is_software = driver_info->vendor == HW_VENDOR_SOFTWARE;
     TRACE("Reporting (fake) driver version 0x%08x-0x%08x.\n",
             driver_info->version_high, driver_info->version_low);
 

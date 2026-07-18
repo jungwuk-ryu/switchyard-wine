@@ -22,6 +22,7 @@
 #include "winbase.h"
 #include "winternl.h"
 #include "winnls.h"
+#include "winuser.h"
 #include "lmcons.h"
 #include "wtsapi32.h"
 #include "wine/debug.h"
@@ -469,6 +470,52 @@ BOOL WINAPI WTSQuerySessionInformationA(HANDLE server, DWORD session_id, WTS_INF
     if (class == WTSClientProtocolType || class == WTSConnectState)
         return WTSQuerySessionInformationW(server, session_id, class, (WCHAR **)buffer, count);
 
+    if (class == WTSSessionInfoEx)
+    {
+        WTSINFOEX_LEVEL1_A *level;
+        WTSINFOEXW *infoW;
+        WTSINFOEXA *info;
+        DWORD size;
+
+        if (!WTSQuerySessionInformationW(server, session_id, class, (WCHAR **)&infoW, &size))
+            return FALSE;
+        if (!(info = malloc(sizeof(*info))))
+        {
+            WTSFreeMemory(infoW);
+            SetLastError(ERROR_OUTOFMEMORY);
+            return FALSE;
+        }
+
+        memset(info, 0, sizeof(*info));
+        info->Level = infoW->Level;
+        level = &info->Data.WTSInfoExLevel1;
+        level->SessionId = infoW->Data.WTSInfoExLevel1.SessionId;
+        level->SessionState = infoW->Data.WTSInfoExLevel1.SessionState;
+        level->SessionFlags = infoW->Data.WTSInfoExLevel1.SessionFlags;
+        WideCharToMultiByte(CP_ACP, 0, infoW->Data.WTSInfoExLevel1.WinStationName, -1,
+                level->WinStationName, ARRAY_SIZE(level->WinStationName), NULL, NULL);
+        WideCharToMultiByte(CP_ACP, 0, infoW->Data.WTSInfoExLevel1.UserName, -1,
+                level->UserName, ARRAY_SIZE(level->UserName), NULL, NULL);
+        WideCharToMultiByte(CP_ACP, 0, infoW->Data.WTSInfoExLevel1.DomainName, -1,
+                level->DomainName, ARRAY_SIZE(level->DomainName), NULL, NULL);
+        level->LogonTime = infoW->Data.WTSInfoExLevel1.LogonTime;
+        level->ConnectTime = infoW->Data.WTSInfoExLevel1.ConnectTime;
+        level->DisconnectTime = infoW->Data.WTSInfoExLevel1.DisconnectTime;
+        level->LastInputTime = infoW->Data.WTSInfoExLevel1.LastInputTime;
+        level->CurrentTime = infoW->Data.WTSInfoExLevel1.CurrentTime;
+        level->IncomingBytes = infoW->Data.WTSInfoExLevel1.IncomingBytes;
+        level->OutgoingBytes = infoW->Data.WTSInfoExLevel1.OutgoingBytes;
+        level->IncomingFrames = infoW->Data.WTSInfoExLevel1.IncomingFrames;
+        level->OutgoingFrames = infoW->Data.WTSInfoExLevel1.OutgoingFrames;
+        level->IncomingCompressedBytes = infoW->Data.WTSInfoExLevel1.IncomingCompressedBytes;
+        level->OutgoingCompressedBytes = infoW->Data.WTSInfoExLevel1.OutgoingCompressedBytes;
+
+        WTSFreeMemory(infoW);
+        *buffer = (char *)info;
+        *count = sizeof(*info);
+        return TRUE;
+    }
+
     if (class == WTSSessionInfo)
     {
         DWORD size;
@@ -570,7 +617,7 @@ BOOL WINAPI WTSQuerySessionInformationW(HANDLE server, DWORD session_id, WTS_INF
         USHORT *protocol;
 
         if (!(protocol = malloc(sizeof(*protocol)))) return FALSE;
-        FIXME("returning 0 protocol type\n");
+        TRACE("returning console protocol type\n");
         *protocol = 0;
         *buffer = (WCHAR *)protocol;
         *count = sizeof(*protocol);
@@ -632,6 +679,42 @@ BOOL WINAPI WTSQuerySessionInformationW(HANDLE server, DWORD session_id, WTS_INF
         return TRUE;
     }
 
+    if (class == WTSSessionInfoEx)
+    {
+        WTSINFOEX_LEVEL1_W *level;
+        WTSINFOEXW *info;
+        FILETIME current_time;
+        DWORD size;
+
+        if (!(info = calloc(1, sizeof(*info))))
+        {
+            SetLastError(ERROR_OUTOFMEMORY);
+            return FALSE;
+        }
+
+        info->Level = 1;
+        level = &info->Data.WTSInfoExLevel1;
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), &level->SessionId))
+        {
+            free(info);
+            return FALSE;
+        }
+        level->SessionState = WTSActive;
+        level->SessionFlags = WTS_SESSIONSTATE_UNLOCK;
+        wcscpy(level->WinStationName, L"Console");
+        size = ARRAY_SIZE(level->UserName);
+        GetUserNameW(level->UserName, &size);
+        size = ARRAY_SIZE(level->DomainName);
+        GetComputerNameW(level->DomainName, &size);
+        GetSystemTimeAsFileTime(&current_time);
+        level->CurrentTime.LowPart = current_time.dwLowDateTime;
+        level->CurrentTime.HighPart = current_time.dwHighDateTime;
+
+        *buffer = (WCHAR *)info;
+        *count = sizeof(*info);
+        return TRUE;
+    }
+
     FIXME("Unimplemented class %d\n", class);
 
     *buffer = NULL;
@@ -683,8 +766,25 @@ BOOL WINAPI WTSQueryUserConfigW(LPWSTR pServerName, LPWSTR pUserName, WTS_CONFIG
  */
 BOOL WINAPI WTSRegisterSessionNotification(HWND hWnd, DWORD dwFlags)
 {
-    FIXME("Stub %p 0x%08lx\n", hWnd, dwFlags);
-    return TRUE;
+    static const WCHAR notification_prop[] = L"__wine_wts_session_notification";
+
+    TRACE("%p 0x%08lx\n", hWnd, dwFlags);
+
+    if (!IsWindow(hWnd))
+    {
+        SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    if (dwFlags > NOTIFY_FOR_ALL_SESSIONS)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    /* Wine exposes one local console session.  Keep registration state so
+     * callers can use the normal lifetime even though no session switches can
+     * currently generate WM_WTSSESSION_CHANGE. */
+    return SetPropW(hWnd, notification_prop, ULongToHandle(dwFlags + 1));
 }
 
 /************************************************************
@@ -692,8 +792,13 @@ BOOL WINAPI WTSRegisterSessionNotification(HWND hWnd, DWORD dwFlags)
  */
 BOOL WINAPI WTSRegisterSessionNotificationEx(HANDLE hServer, HWND hWnd, DWORD dwFlags)
 {
-    FIXME("Stub %p %p 0x%08lx\n", hServer, hWnd, dwFlags);
-    return TRUE;
+    TRACE("%p %p 0x%08lx\n", hServer, hWnd, dwFlags);
+    if (hServer != WTS_CURRENT_SERVER_HANDLE)
+    {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    return WTSRegisterSessionNotification(hWnd, dwFlags);
 }
 
 
@@ -785,8 +890,21 @@ BOOL WINAPI WTSTerminateProcess(HANDLE hServer, DWORD ProcessId, DWORD ExitCode)
  */
 BOOL WINAPI WTSUnRegisterSessionNotification(HWND hWnd)
 {
-    FIXME("Stub %p\n", hWnd);
-    return FALSE;
+    static const WCHAR notification_prop[] = L"__wine_wts_session_notification";
+
+    TRACE("%p\n", hWnd);
+
+    if (!IsWindow(hWnd))
+    {
+        SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    if (!RemovePropW(hWnd, notification_prop))
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /************************************************************
@@ -794,8 +912,13 @@ BOOL WINAPI WTSUnRegisterSessionNotification(HWND hWnd)
  */
 BOOL WINAPI WTSUnRegisterSessionNotificationEx(HANDLE hServer, HWND hWnd)
 {
-    FIXME("Stub %p %p\n", hServer, hWnd);
-    return FALSE;
+    TRACE("%p %p\n", hServer, hWnd);
+    if (hServer != WTS_CURRENT_SERVER_HANDLE)
+    {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    return WTSUnRegisterSessionNotification(hWnd);
 }
 
 

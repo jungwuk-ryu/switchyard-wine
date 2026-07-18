@@ -47,6 +47,7 @@
 #include "shfldr.h"
 
 #include "wine/debug.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(shell);
 
@@ -680,7 +681,29 @@ VOID WINAPI Printers_UnregisterWindow(HANDLE hClassPidl, HWND hwnd)
 struct window_prop_store
 {
     IPropertyStore IPropertyStore_iface;
+    struct list entry;
     LONG           ref;
+    HWND hwnd;
+    struct window_property *properties;
+    DWORD count;
+    DWORD capacity;
+};
+
+static const WCHAR window_prop_store_name[] = L"__wine_window_property_store";
+static struct list window_prop_stores = LIST_INIT(window_prop_stores);
+static CRITICAL_SECTION window_prop_stores_cs;
+static CRITICAL_SECTION_DEBUG window_prop_stores_cs_debug =
+{
+    0, 0, &window_prop_stores_cs,
+    { &window_prop_stores_cs_debug.ProcessLocksList, &window_prop_stores_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": window_prop_stores_cs") }
+};
+static CRITICAL_SECTION window_prop_stores_cs = { &window_prop_stores_cs_debug, -1, 0, 0, 0, 0 };
+
+struct window_property
+{
+    PROPERTYKEY key;
+    PROPVARIANT value;
 };
 
 static inline struct window_prop_store *impl_from_IPropertyStore(IPropertyStore *iface)
@@ -700,7 +723,15 @@ static ULONG WINAPI window_prop_store_Release(IPropertyStore *iface)
 {
     struct window_prop_store *store = impl_from_IPropertyStore(iface);
     LONG ref = InterlockedDecrement(&store->ref);
-    if (!ref) free(store);
+    if (!ref)
+    {
+        DWORD i;
+
+        for (i = 0; i < store->count; ++i)
+            PropVariantClear(&store->properties[i].value);
+        free(store->properties);
+        free(store);
+    }
     TRACE("returning %ld\n", ref);
     return ref;
 }
@@ -728,31 +759,99 @@ static HRESULT WINAPI window_prop_store_QueryInterface(IPropertyStore *iface, RE
 
 static HRESULT WINAPI window_prop_store_GetCount(IPropertyStore *iface, DWORD *count)
 {
-    FIXME("%p, %p\n", iface, count);
-    return E_NOTIMPL;
+    struct window_prop_store *store = impl_from_IPropertyStore(iface);
+
+    TRACE("%p, %p\n", iface, count);
+    if (!count) return E_POINTER;
+    *count = store->count;
+    return S_OK;
 }
 
 static HRESULT WINAPI window_prop_store_GetAt(IPropertyStore *iface, DWORD prop, PROPERTYKEY *key)
 {
-    FIXME("%p, %lu,%p\n", iface, prop, key);
-    return E_NOTIMPL;
+    struct window_prop_store *store = impl_from_IPropertyStore(iface);
+
+    TRACE("%p, %lu, %p\n", iface, prop, key);
+    if (!key) return E_POINTER;
+    if (prop >= store->count) return E_INVALIDARG;
+    *key = store->properties[prop].key;
+    return S_OK;
 }
 
 static HRESULT WINAPI window_prop_store_GetValue(IPropertyStore *iface, const PROPERTYKEY *key, PROPVARIANT *var)
 {
-    FIXME("%p, {%s,%lu}, %p\n", iface, debugstr_guid(&key->fmtid), key->pid, var);
-    return E_NOTIMPL;
+    struct window_prop_store *store = impl_from_IPropertyStore(iface);
+    DWORD i;
+
+    TRACE("%p, {%s,%lu}, %p\n", iface, key ? debugstr_guid(&key->fmtid) : "(null)",
+          key ? key->pid : 0, var);
+    if (!key || !var) return E_POINTER;
+    PropVariantInit(var);
+
+    for (i = 0; i < store->count; ++i)
+        if (IsEqualPropertyKey(*key, store->properties[i].key))
+            return PropVariantCopy(var, &store->properties[i].value);
+    return S_OK;
 }
 
 static HRESULT WINAPI window_prop_store_SetValue(IPropertyStore *iface, const PROPERTYKEY *key, const PROPVARIANT *var)
 {
-    FIXME("%p, {%s,%lu}, %p\n", iface, debugstr_guid(&key->fmtid), key->pid, var);
+    struct window_prop_store *store = impl_from_IPropertyStore(iface);
+    struct window_property *properties;
+    PROPVARIANT copy;
+    DWORD i;
+    HRESULT hr;
+
+    TRACE("%p, {%s,%lu}, %p\n", iface, key ? debugstr_guid(&key->fmtid) : "(null)",
+          key ? key->pid : 0, var);
+    if (!key || !var) return E_POINTER;
+
+    for (i = 0; i < store->count; ++i)
+        if (IsEqualPropertyKey(*key, store->properties[i].key)) break;
+
+    if (var->vt == VT_EMPTY)
+    {
+        if (i == store->count) return S_OK;
+        PropVariantClear(&store->properties[i].value);
+        if (i + 1 < store->count)
+            memmove(&store->properties[i], &store->properties[i + 1],
+                    (store->count - i - 1) * sizeof(*store->properties));
+        --store->count;
+        return S_OK;
+    }
+
+    PropVariantInit(&copy);
+    if (FAILED(hr = PropVariantCopy(&copy, var))) return hr;
+
+    if (i < store->count)
+    {
+        PropVariantClear(&store->properties[i].value);
+        store->properties[i].value = copy;
+        return S_OK;
+    }
+
+    if (store->count == store->capacity)
+    {
+        DWORD capacity = store->capacity ? store->capacity * 2 : 4;
+
+        if (!(properties = realloc(store->properties, capacity * sizeof(*properties))))
+        {
+            PropVariantClear(&copy);
+            return E_OUTOFMEMORY;
+        }
+        store->properties = properties;
+        store->capacity = capacity;
+    }
+
+    store->properties[store->count].key = *key;
+    store->properties[store->count].value = copy;
+    ++store->count;
     return S_OK;
 }
 
 static HRESULT WINAPI window_prop_store_Commit(IPropertyStore *iface)
 {
-    FIXME("%p\n", iface);
+    TRACE("%p\n", iface);
     return S_OK;
 }
 
@@ -772,7 +871,7 @@ static HRESULT create_window_prop_store(IPropertyStore **obj)
 {
     struct window_prop_store *store;
 
-    if (!(store = malloc(sizeof(*store)))) return E_OUTOFMEMORY;
+    if (!(store = calloc(1, sizeof(*store)))) return E_OUTOFMEMORY;
     store->IPropertyStore_iface.lpVtbl = &window_prop_store_vtbl;
     store->ref = 1;
 
@@ -780,19 +879,81 @@ static HRESULT create_window_prop_store(IPropertyStore **obj)
     return S_OK;
 }
 
+static void free_window_prop_stores(void)
+{
+    struct window_prop_store *store;
+    struct list stores = LIST_INIT(stores);
+
+    EnterCriticalSection(&window_prop_stores_cs);
+    list_move_tail(&stores, &window_prop_stores);
+    LeaveCriticalSection(&window_prop_stores_cs);
+
+    while (!list_empty(&stores))
+    {
+        store = LIST_ENTRY(list_head(&stores), struct window_prop_store, entry);
+        list_remove(&store->entry);
+        if (GetPropW(store->hwnd, window_prop_store_name) == store)
+            RemovePropW(store->hwnd, window_prop_store_name);
+        IPropertyStore_Release(&store->IPropertyStore_iface);
+    }
+}
+
 /*************************************************************************
  * SHGetPropertyStoreForWindow [SHELL32.@]
  */
 HRESULT WINAPI SHGetPropertyStoreForWindow(HWND hwnd, REFIID riid, void **ppv)
 {
-    IPropertyStore *store;
+    struct window_prop_store *store = NULL, *candidate, *stale = NULL;
     HRESULT hr;
 
-    FIXME("(%p %p %p) stub!\n", hwnd, riid, ppv);
+    TRACE("(%p %s %p)\n", hwnd, debugstr_guid(riid), ppv);
 
-    if ((hr = create_window_prop_store( &store )) != S_OK) return hr;
-    hr = IPropertyStore_QueryInterface( store, riid, ppv );
-    IPropertyStore_Release( store );
+    if (!ppv) return E_POINTER;
+    *ppv = NULL;
+    if (!IsWindow(hwnd)) return E_INVALIDARG;
+
+    EnterCriticalSection(&window_prop_stores_cs);
+    LIST_FOR_EACH_ENTRY(candidate, &window_prop_stores, struct window_prop_store, entry)
+    {
+        if (candidate->hwnd != hwnd) continue;
+        if (GetPropW(hwnd, window_prop_store_name) == candidate)
+            store = candidate;
+        else
+        {
+            list_remove(&candidate->entry);
+            stale = candidate;
+        }
+        break;
+    }
+
+    if (!store)
+    {
+        IPropertyStore *iface;
+
+        hr = create_window_prop_store(&iface);
+        if (SUCCEEDED(hr))
+        {
+            store = impl_from_IPropertyStore(iface);
+            store->hwnd = hwnd;
+            if (!SetPropW(hwnd, window_prop_store_name, store))
+            {
+                IPropertyStore_Release(iface);
+                store = NULL;
+                hr = HRESULT_FROM_WIN32(GetLastError());
+            }
+            else
+                list_add_tail(&window_prop_stores, &store->entry);
+        }
+    }
+    else
+        hr = S_OK;
+    if (store) IPropertyStore_AddRef(&store->IPropertyStore_iface);
+    LeaveCriticalSection(&window_prop_stores_cs);
+
+    if (stale) IPropertyStore_Release(&stale->IPropertyStore_iface);
+    if (FAILED(hr)) return hr;
+    hr = IPropertyStore_QueryInterface(&store->IPropertyStore_iface, riid, ppv);
+    IPropertyStore_Release(&store->IPropertyStore_iface);
     return hr;
 }
 
@@ -1079,6 +1240,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID fImpLoad)
 
     case DLL_PROCESS_DETACH:
         if (fImpLoad) break;
+        free_window_prop_stores();
         SIC_Destroy();
         FreeChangeNotifications();
         release_desktop_folder();

@@ -27,6 +27,7 @@
 #include "wincrypt.h"
 #include "winreg.h"
 #include "winuser.h"
+#include "bcrypt.h"
 #include "i_cryptasn1tls.h"
 #include "crypt32_private.h"
 #include "wine/debug.h"
@@ -308,16 +309,91 @@ ASN1encoding_t WINAPI I_CryptGetAsn1Encoder(HCRYPTASN1MODULE x)
     return NULL;
 }
 
+static INIT_ONCE crypt_memory_init_once = INIT_ONCE_STATIC_INIT;
+static BCRYPT_ALG_HANDLE crypt_memory_algorithm;
+static BCRYPT_KEY_HANDLE crypt_memory_key;
+
+static BOOL CALLBACK init_crypt_memory_key(INIT_ONCE *once, void *param, void **context)
+{
+    BYTE secret[32];
+    NTSTATUS status;
+
+    if ((status = BCryptGenRandom(NULL, secret, sizeof(secret), BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        goto failed;
+    if ((status = BCryptOpenAlgorithmProvider(&crypt_memory_algorithm, BCRYPT_AES_ALGORITHM, NULL, 0)))
+        goto failed;
+    if ((status = BCryptSetProperty(crypt_memory_algorithm, BCRYPT_CHAINING_MODE,
+            (BYTE *)BCRYPT_CHAIN_MODE_ECB, sizeof(BCRYPT_CHAIN_MODE_ECB), 0)))
+        goto failed;
+    if ((status = BCryptGenerateSymmetricKey(crypt_memory_algorithm, &crypt_memory_key, NULL, 0,
+            secret, sizeof(secret), 0)))
+        goto failed;
+
+    SecureZeroMemory(secret, sizeof(secret));
+    return TRUE;
+
+failed:
+    SecureZeroMemory(secret, sizeof(secret));
+    if (crypt_memory_algorithm)
+    {
+        BCryptCloseAlgorithmProvider(crypt_memory_algorithm, 0);
+        crypt_memory_algorithm = NULL;
+    }
+    SetLastError(RtlNtStatusToDosError(status));
+    return FALSE;
+}
+
+static BOOL crypt_memory(void *data, DWORD len, DWORD flags, BOOL encrypt)
+{
+    NTSTATUS status;
+    ULONG ret_len;
+
+    TRACE("(%p, %lu, %#lx, %d).\n", data, len, flags, encrypt);
+
+    if (!data || !len || len % CRYPTPROTECTMEMORY_BLOCK_SIZE)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if (flags != CRYPTPROTECTMEMORY_SAME_PROCESS &&
+        flags != CRYPTPROTECTMEMORY_CROSS_PROCESS &&
+        flags != CRYPTPROTECTMEMORY_SAME_LOGON)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if (flags != CRYPTPROTECTMEMORY_SAME_PROCESS)
+    {
+        FIXME("Protection scope %#lx is not supported.\n", flags);
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+
+    if (!InitOnceExecuteOnce(&crypt_memory_init_once, init_crypt_memory_key, NULL, NULL))
+        return FALSE;
+
+    if (encrypt)
+        status = BCryptEncrypt(crypt_memory_key, data, len, NULL, NULL, 0, data, len, &ret_len, 0);
+    else
+        status = BCryptDecrypt(crypt_memory_key, data, len, NULL, NULL, 0, data, len, &ret_len, 0);
+
+    if (status)
+    {
+        SetLastError(RtlNtStatusToDosError(status));
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 BOOL WINAPI CryptProtectMemory(void *data, DWORD len, DWORD flags)
 {
-    static int fixme_once;
-    if (!fixme_once++) FIXME("(%p %lu %08lx): stub\n", data, len, flags);
-    return TRUE;
+    return crypt_memory(data, len, flags, TRUE);
 }
 
 BOOL WINAPI CryptUnprotectMemory(void *data, DWORD len, DWORD flags)
 {
-    static int fixme_once;
-    if (!fixme_once++) FIXME("(%p %lu %08lx): stub\n", data, len, flags);
-    return TRUE;
+    return crypt_memory(data, len, flags, FALSE);
 }

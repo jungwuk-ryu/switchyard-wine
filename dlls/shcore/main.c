@@ -29,6 +29,7 @@
 #include "initguid.h"
 #include "ocidl.h"
 #include "featurestagingapi.h"
+#include "lm.h"
 #include "shellscalingapi.h"
 #include "shcore.h"
 #include "appmodel.h"
@@ -2503,8 +2504,15 @@ BOOL WINAPI IsOS(DWORD feature)
         FIXME("(OS_WELCOMELOGONUI) What should we return here?\n");
         return FALSE;
     case OS_DOMAINMEMBER:
-        FIXME("(OS_DOMAINMEMBER) What should we return here?\n");
-        return TRUE;
+        {
+            NETSETUP_JOIN_STATUS status;
+            WCHAR *name = NULL;
+            NET_API_STATUS ret;
+
+            ret = NetGetJoinInformation(NULL, &name, &status);
+            if (name) NetApiBufferFree(name);
+            ISOS_RETURN(ret == NERR_Success && status == NetSetupDomainName);
+        }
     case OS_ANYSERVER:
         ISOS_RETURN(platform == VER_PLATFORM_WIN32_NT);
     case OS_WOW6432:

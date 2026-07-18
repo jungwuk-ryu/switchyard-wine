@@ -524,6 +524,23 @@ timeout_t monotonic_counter(void)
     return current_time - server_start_time;
 }
 
+/* return a monotonic time counter that doesn't advance during system sleep */
+timeout_t unbiased_counter(void)
+{
+#ifdef __APPLE__
+    static mach_timebase_info_data_t timebase;
+
+    if (!timebase.denom) mach_timebase_info( &timebase );
+    return mach_absolute_time() * timebase.numer / timebase.denom / 100;
+#elif defined(HAVE_CLOCK_GETTIME)
+    struct timespec ts;
+
+    if (!clock_gettime( CLOCK_MONOTONIC, &ts ))
+        return (timeout_t)ts.tv_sec * TICKS_PER_SEC + ts.tv_nsec / 100;
+#endif
+    return monotonic_counter();
+}
+
 static void master_socket_dump( struct object *obj, int verbose )
 {
     struct master_socket *sock = (struct master_socket *)obj;

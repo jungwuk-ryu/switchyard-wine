@@ -826,18 +826,28 @@ static ULONG WINAPI TextStoreACPSink_Release(ITextStoreACPSink *iface)
  * ITextStoreACPSink functions
  *****************************************************/
 
+static LONG text_store_change_warning;
+
+static void warn_text_store_change_not_implemented(void)
+{
+    if (!InterlockedExchange(&text_store_change_warning, TRUE))
+        FIXME("Text store change propagation to TSF context sinks is not implemented.\n");
+}
+
 static HRESULT WINAPI TextStoreACPSink_OnTextChange(ITextStoreACPSink *iface,
         DWORD dwFlags, const TS_TEXTCHANGE *pChange)
 {
     Context *This = impl_from_ITextStoreACPSink(iface);
-    FIXME("STUB:(%p)\n",This);
+    TRACE("(%p) flags %#lx change %p\n", This, dwFlags, pChange);
+    warn_text_store_change_not_implemented();
     return S_OK;
 }
 
 static HRESULT WINAPI TextStoreACPSink_OnSelectionChange(ITextStoreACPSink *iface)
 {
     Context *This = impl_from_ITextStoreACPSink(iface);
-    FIXME("STUB:(%p)\n",This);
+    TRACE("(%p)\n", This);
+    warn_text_store_change_not_implemented();
     return S_OK;
 }
 
@@ -845,7 +855,8 @@ static HRESULT WINAPI TextStoreACPSink_OnLayoutChange(ITextStoreACPSink *iface,
     TsLayoutCode lcode, TsViewCookie vcView)
 {
     Context *This = impl_from_ITextStoreACPSink(iface);
-    FIXME("STUB:(%p)\n",This);
+    TRACE("(%p) code %u view %lu\n", This, lcode, vcView);
+    warn_text_store_change_not_implemented();
     return S_OK;
 }
 

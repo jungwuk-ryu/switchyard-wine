@@ -99,11 +99,17 @@ LONG WINAPI AppPolicyGetMediaFoundationCodecLoading(HANDLE token, AppPolicyMedia
  */
 LONG WINAPI AppPolicyGetProcessTerminationMethod(HANDLE token, AppPolicyProcessTerminationMethod *policy)
 {
-    FIXME("%p, %p\n", token, policy);
+    TOKEN_TYPE type;
+    ULONG size;
+    NTSTATUS status;
 
-    if(policy)
-        *policy = AppPolicyProcessTerminationMethod_ExitProcess;
+    TRACE("%p, %p\n", token, policy);
 
+    if (!token || !policy) return ERROR_INVALID_PARAMETER;
+    if ((status = NtQueryInformationToken( token, TokenType, &type, sizeof(type), &size )))
+        return RtlNtStatusToDosError( status );
+
+    *policy = AppPolicyProcessTerminationMethod_ExitProcess;
     return ERROR_SUCCESS;
 }
 
@@ -112,11 +118,17 @@ LONG WINAPI AppPolicyGetProcessTerminationMethod(HANDLE token, AppPolicyProcessT
  */
 LONG WINAPI AppPolicyGetThreadInitializationType(HANDLE token, AppPolicyThreadInitializationType *policy)
 {
-    FIXME("%p, %p\n", token, policy);
+    TOKEN_TYPE type;
+    ULONG size;
+    NTSTATUS status;
 
-    if(policy)
-        *policy = AppPolicyThreadInitializationType_None;
+    TRACE("%p, %p\n", token, policy);
 
+    if (!token || !policy) return ERROR_INVALID_PARAMETER;
+    if ((status = NtQueryInformationToken( token, TokenType, &type, sizeof(type), &size )))
+        return RtlNtStatusToDosError( status );
+
+    *policy = AppPolicyThreadInitializationType_None;
     return ERROR_SUCCESS;
 }
 

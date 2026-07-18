@@ -2905,6 +2905,7 @@ static BOOL empty_point( POINT pt )
  */
 BOOL WINAPI NtUserGetWindowPlacement( HWND hwnd, WINDOWPLACEMENT *placement )
 {
+    static LONG other_process_warning;
     WND *win = get_win_ptr( hwnd );
     UINT win_dpi;
 
@@ -2930,7 +2931,8 @@ BOOL WINAPI NtUserGetWindowPlacement( HWND hwnd, WINDOWPLACEMENT *placement )
         if (!get_window_rect( hwnd, &normal_position, get_thread_dpi() ))
             return FALSE;
 
-        FIXME("not fully supported on other process window %p.\n", hwnd);
+        if (!InterlockedExchange( &other_process_warning, TRUE ))
+            FIXME("Window placement history for other-process windows is not shared by the server.\n");
 
         placement->length  = sizeof(*placement);
         style = get_window_long( hwnd, GWL_STYLE );
@@ -6508,15 +6510,24 @@ BOOL WINAPI NtUserIsChildWindowDpiMessageEnabled( HWND hwnd )
  */
 BOOL WINAPI NtUserGetWindowDisplayAffinity( HWND hwnd, DWORD *affinity )
 {
-    FIXME( "%p, %p: stub\n", hwnd, affinity );
-
-    if (!hwnd || !affinity)
+    static const WCHAR display_affinity_prop[] =
     {
-        RtlSetLastWin32Error( hwnd ? ERROR_NOACCESS : ERROR_INVALID_WINDOW_HANDLE );
+        '_', '_', 'w', 'i', 'n', 'e', '_', 'd', 'i', 's', 'p', 'l', 'a', 'y', '_',
+        'a', 'f', 'f', 'i', 'n', 'i', 't', 'y', 0
+    };
+    BOOL valid_window = hwnd && is_window(hwnd);
+    HANDLE value;
+
+    TRACE( "%p, %p\n", hwnd, affinity );
+
+    if (!valid_window || !affinity)
+    {
+        RtlSetLastWin32Error( valid_window ? ERROR_NOACCESS : ERROR_INVALID_WINDOW_HANDLE );
         return FALSE;
     }
 
-    *affinity = WDA_NONE;
+    value = NtUserGetProp(hwnd, display_affinity_prop);
+    *affinity = value ? HandleToULong(value) - 1 : WDA_NONE;
     return TRUE;
 }
 

@@ -1101,6 +1101,9 @@ static void test_GetTickCount(void)
 
 BOOL (WINAPI *pQueryUnbiasedInterruptTime)(ULONGLONG *time);
 BOOL (WINAPI *pRtlQueryUnbiasedInterruptTime)(ULONGLONG *time);
+static void (WINAPI *pQueryInterruptTime)(ULONGLONG *time);
+static void (WINAPI *pQueryInterruptTimePrecise)(ULONGLONG *time);
+static void (WINAPI *pQueryUnbiasedInterruptTimePrecise)(ULONGLONG *time);
 
 static void test_QueryUnbiasedInterruptTime(void)
 {
@@ -1129,6 +1132,49 @@ static void test_QueryUnbiasedInterruptTime(void)
         ok( GetLastError() == ERROR_INVALID_PARAMETER, "wrong error %lu\n", GetLastError() );
     }
     else win_skip( "RtlQueryUnbiasedInterruptTime not supported\n" );
+}
+
+static void test_QueryInterruptTime(void)
+{
+    ULONGLONG interrupt, interrupt2, unbiased, unbiased2;
+
+    if (pQueryInterruptTime && pQueryInterruptTimePrecise)
+    {
+        pQueryInterruptTime( &interrupt );
+        pQueryInterruptTimePrecise( &interrupt2 );
+        ok( interrupt <= interrupt2, "coarse interrupt time %s exceeds precise time %s\n",
+            wine_dbgstr_longlong(interrupt), wine_dbgstr_longlong(interrupt2) );
+
+        interrupt = interrupt2;
+        Sleep( 1 );
+        pQueryInterruptTimePrecise( &interrupt2 );
+        ok( interrupt < interrupt2, "precise interrupt time did not advance: %s, %s\n",
+            wine_dbgstr_longlong(interrupt), wine_dbgstr_longlong(interrupt2) );
+    }
+    else win_skip( "QueryInterruptTime functions not supported\n" );
+
+    if (pQueryUnbiasedInterruptTime && pQueryUnbiasedInterruptTimePrecise)
+    {
+        pQueryUnbiasedInterruptTime( &unbiased );
+        pQueryUnbiasedInterruptTimePrecise( &unbiased2 );
+        ok( unbiased <= unbiased2, "coarse unbiased time %s exceeds precise time %s\n",
+            wine_dbgstr_longlong(unbiased), wine_dbgstr_longlong(unbiased2) );
+
+        unbiased = unbiased2;
+        Sleep( 1 );
+        pQueryUnbiasedInterruptTimePrecise( &unbiased2 );
+        ok( unbiased < unbiased2, "precise unbiased time did not advance: %s, %s\n",
+            wine_dbgstr_longlong(unbiased), wine_dbgstr_longlong(unbiased2) );
+
+        if (pQueryInterruptTimePrecise)
+        {
+            pQueryUnbiasedInterruptTimePrecise( &unbiased );
+            pQueryInterruptTimePrecise( &interrupt );
+            ok( unbiased <= interrupt, "unbiased time %s exceeds interrupt time %s\n",
+                wine_dbgstr_longlong(unbiased), wine_dbgstr_longlong(interrupt) );
+        }
+    }
+    else win_skip( "QueryUnbiasedInterruptTimePrecise not supported\n" );
 }
 
 static void test_processor_idle_cycle_time(void)
@@ -1201,7 +1247,10 @@ static void test_processor_idle_cycle_time(void)
 START_TEST(time)
 {
     HMODULE hKernel = GetModuleHandleA("kernel32");
+    HMODULE hKernelBase = GetModuleHandleA("kernelbase");
     HMODULE hntdll = GetModuleHandleA("ntdll");
+
+    if (!hKernelBase) hKernelBase = hKernel;
     pTzSpecificLocalTimeToSystemTime = (void *)GetProcAddress(hKernel, "TzSpecificLocalTimeToSystemTime");
     pSystemTimeToTzSpecificLocalTime = (void *)GetProcAddress( hKernel, "SystemTimeToTzSpecificLocalTime");
     pGetSystemTimes = (void *)GetProcAddress( hKernel, "GetSystemTimes");
@@ -1211,6 +1260,9 @@ START_TEST(time)
     pGetSystemTimePreciseAsFileTime = (void *)GetProcAddress(hKernel, "GetSystemTimePreciseAsFileTime");
     pGetTimeZoneInformationForYear = (void *)GetProcAddress(hKernel, "GetTimeZoneInformationForYear");
     pQueryUnbiasedInterruptTime = (void *)GetProcAddress(hKernel, "QueryUnbiasedInterruptTime");
+    pQueryInterruptTime = (void *)GetProcAddress(hKernelBase, "QueryInterruptTime");
+    pQueryInterruptTimePrecise = (void *)GetProcAddress(hKernelBase, "QueryInterruptTimePrecise");
+    pQueryUnbiasedInterruptTimePrecise = (void *)GetProcAddress(hKernelBase, "QueryUnbiasedInterruptTimePrecise");
     pNtGetTickCount = (void *)GetProcAddress(hntdll, "NtGetTickCount");
     pRtlQueryUnbiasedInterruptTime = (void *)GetProcAddress(hntdll, "RtlQueryUnbiasedInterruptTime");
 
@@ -1229,5 +1281,6 @@ START_TEST(time)
     test_GetTimeZoneInformationForYear();
     test_GetTickCount();
     test_QueryUnbiasedInterruptTime();
+    test_QueryInterruptTime();
     test_processor_idle_cycle_time();
 }

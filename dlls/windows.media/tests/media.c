@@ -91,6 +91,8 @@ static void test_CaptionStatics(void)
     hr = IClosedCaptionPropertiesStatics_get_FontColor( caption_statics, &color );
     ok( hr == S_OK, "get_FontColor returned %#lx\n", hr );
     ok( color == ClosedCaptionColor_Default, "expected default font color, got %d\n", color );
+    hr = IClosedCaptionPropertiesStatics_get_FontColor( caption_statics, NULL );
+    ok( hr == E_POINTER, "get_FontColor returned %#lx\n", hr );
 
     hr = IClosedCaptionPropertiesStatics_get_ComputedFontColor( caption_statics, &computed_color );
     todo_wine ok( hr == E_INVALIDARG, "get_ComputedFontColor returned %#lx\n", hr );

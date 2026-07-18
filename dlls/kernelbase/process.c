@@ -1114,6 +1114,9 @@ BOOL WINAPI GetProcessInformation( HANDLE process, PROCESS_INFORMATION_CLASS inf
 {
     switch (info_class)
     {
+        case ProcessPowerThrottling:
+            return set_ntstatus( NtQueryInformationProcess( process, ProcessPowerThrottlingState,
+                                                             data, size, NULL ));
         case ProcessMachineTypeInfo:
         {
             PROCESS_MACHINE_INFORMATION *mi = data;
@@ -1343,7 +1346,17 @@ BOOL WINAPI /* DECLSPEC_HOTPATCH */ SetProcessPriorityBoost( HANDLE process, BOO
  */
 BOOL WINAPI DECLSPEC_HOTPATCH SetProcessShutdownParameters( DWORD level, DWORD flags )
 {
-    FIXME( "(%08lx, %08lx): partial stub.\n", level, flags );
+    static int once;
+
+    TRACE( "(%08lx, %08lx)\n", level, flags );
+
+    if (level > 0x4ff || flags & ~SHUTDOWN_NORETRY)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    if (!once++) FIXME( "shutdown ordering is not implemented\n" );
     shutdown_flags = flags;
     shutdown_priority = level;
     return TRUE;

@@ -30,6 +30,8 @@ struct inputpane
     IInputPane IInputPane_iface;
     IInputPane2 IInputPane2_iface;
     LONG ref;
+    struct event_handlers showing_handlers;
+    struct event_handlers hiding_handlers;
 };
 
 static inline struct inputpane *impl_from_IInputPane( IInputPane *iface )
@@ -82,7 +84,12 @@ static ULONG WINAPI inputpane_Release( IInputPane *iface )
 
     TRACE( "iface %p, ref %lu.\n", iface, ref );
 
-    if (!ref) free( impl );
+    if (!ref)
+    {
+        event_handlers_clear( &impl->showing_handlers );
+        event_handlers_clear( &impl->hiding_handlers );
+        free( impl );
+    }
     return ref;
 }
 
@@ -106,32 +113,43 @@ static HRESULT WINAPI inputpane_GetTrustLevel( IInputPane *iface, TrustLevel *tr
 
 static HRESULT WINAPI inputpane_add_Showing( IInputPane *iface, ITypedEventHandler_InputPane_InputPaneVisibilityEventArgs *handler, EventRegistrationToken *token )
 {
-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token);
-    return E_NOTIMPL;
+    struct inputpane *impl = impl_from_IInputPane( iface );
+
+    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
+    return event_handlers_add( &impl->showing_handlers, (IUnknown *)handler, token );
 }
 
 static HRESULT WINAPI inputpane_remove_Showing( IInputPane *iface, EventRegistrationToken token )
 {
-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
-    return E_NOTIMPL;
+    struct inputpane *impl = impl_from_IInputPane( iface );
+
+    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
+    return event_handlers_remove( &impl->showing_handlers, token );
 }
 
 static HRESULT WINAPI inputpane_add_Hiding( IInputPane *iface, ITypedEventHandler_InputPane_InputPaneVisibilityEventArgs *handler, EventRegistrationToken *token )
 {
-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token);
-    return E_NOTIMPL;
+    struct inputpane *impl = impl_from_IInputPane( iface );
+
+    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
+    return event_handlers_add( &impl->hiding_handlers, (IUnknown *)handler, token );
 }
 
 static HRESULT WINAPI inputpane_remove_Hiding( IInputPane *iface, EventRegistrationToken token )
 {
-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
-    return E_NOTIMPL;
+    struct inputpane *impl = impl_from_IInputPane( iface );
+
+    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
+    return event_handlers_remove( &impl->hiding_handlers, token );
 }
 
 static HRESULT WINAPI inputpane_OccludedRect( IInputPane *iface, Rect *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    memset( value, 0, sizeof(*value) );
+    return S_OK;
 }
 
 static const struct IInputPaneVtbl inputpane_vtbl =
@@ -157,14 +175,19 @@ DEFINE_IINSPECTABLE( inputpane2, IInputPane2, struct inputpane, IInputPane_iface
 
 static HRESULT WINAPI inputpane2_TryShow( IInputPane2 *iface, boolean *result )
 {
-    FIXME( "iface %p, result %p stub!\n", iface, result );
+    TRACE( "iface %p, result %p.\n", iface, result );
+
+    if (!result) return E_POINTER;
     *result = FALSE;
     return S_OK;
 }
 
 static HRESULT WINAPI inputpane2_TryHide( IInputPane2 *iface, boolean *result )
 {
-    FIXME( "iface %p, result %p stub!\n", iface, result );
+    TRACE( "iface %p, result %p.\n", iface, result );
+
+    if (!result) return E_POINTER;
+    *result = FALSE;
     return S_OK;
 }
 
@@ -284,6 +307,8 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
     impl->IInputPane_iface.lpVtbl = &inputpane_vtbl;
     impl->IInputPane2_iface.lpVtbl = &inputpane2_vtbl;
     impl->ref = 1;
+    event_handlers_init( &impl->showing_handlers );
+    event_handlers_init( &impl->hiding_handlers );
 
     *instance = (IInspectable *)&impl->IInputPane_iface;
     return S_OK;

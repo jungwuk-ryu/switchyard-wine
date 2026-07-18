@@ -437,9 +437,15 @@ static void test_GetCurrentProcessExplicitAppUserModelID(void)
 
 static void test_SHGetPropertyStoreForWindow(void)
 {
+    static const PROPERTYKEY test_key = {{0x9f4c2855, 0x9f79, 0x4b39,
+                                          {0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3}}, 5};
+    PROPVARIANT value, result;
+    DWORD count;
     HRESULT hr;
     IUnknown *unk;
     IPropertyStore *store = NULL;
+    HWND window;
+    WCHAR string[] = L"wine.test.window";
 
     if (!pSHGetPropertyStoreForWindow)
     {
@@ -447,19 +453,49 @@ static void test_SHGetPropertyStoreForWindow(void)
         return;
     }
 
+    window = CreateWindowA("static", "property store", WS_POPUP, 0, 0, 10, 10,
+                           NULL, NULL, NULL, NULL);
+    ok(!!window, "Failed to create window, error %lu.\n", GetLastError());
+
     unk = (IUnknown *)0xdeadbeef;
-    hr = pSHGetPropertyStoreForWindow(GetDesktopWindow(), &IID_IDispatch, (void **)&unk);
+    hr = pSHGetPropertyStoreForWindow(window, &IID_IDispatch, (void **)&unk);
     ok(hr == E_NOINTERFACE, "got 0x%08lx\n", hr);
     ok(unk == NULL, "got %p\n", unk);
 
-    hr = pSHGetPropertyStoreForWindow(GetDesktopWindow(), &IID_IUnknown, (void **)&unk);
+    hr = pSHGetPropertyStoreForWindow(window, &IID_IUnknown, (void **)&unk);
     ok(hr == S_OK, "got 0x%08lx\n", hr);
 
     hr = IUnknown_QueryInterface(unk, &IID_IPropertyStore, (void **)&store);
     ok(hr == S_OK, "got 0x%08lx\n", hr);
 
+    count = 0xdeadbeef;
+    hr = IPropertyStore_GetCount(store, &count);
+    ok(hr == S_OK, "got 0x%08lx.\n", hr);
+    ok(!count, "got %lu properties.\n", count);
+
+    PropVariantInit(&value);
+    value.vt = VT_LPWSTR;
+    value.pwszVal = string;
+    hr = IPropertyStore_SetValue(store, &test_key, &value);
+    ok(hr == S_OK, "got 0x%08lx.\n", hr);
+    hr = IPropertyStore_Commit(store);
+    ok(hr == S_OK, "got 0x%08lx.\n", hr);
+
+    count = 0;
+    hr = IPropertyStore_GetCount(store, &count);
+    ok(hr == S_OK, "got 0x%08lx.\n", hr);
+    ok(count == 1, "got %lu properties.\n", count);
+    PropVariantInit(&result);
+    hr = IPropertyStore_GetValue(store, &test_key, &result);
+    ok(hr == S_OK, "got 0x%08lx.\n", hr);
+    ok(result.vt == VT_LPWSTR, "got type %u.\n", result.vt);
+    if (result.vt == VT_LPWSTR)
+        ok(!wcscmp(result.pwszVal, value.pwszVal), "got %s.\n", wine_dbgstr_w(result.pwszVal));
+    PropVariantClear(&result);
+
     if (store) IPropertyStore_Release(store);
     if (unk) IUnknown_Release(unk);
+    DestroyWindow(window);
 }
 
 START_TEST(appbar)

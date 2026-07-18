@@ -662,8 +662,13 @@ obj_handle_t open_object( struct process *process, obj_handle_t parent, unsigned
 /* return the size of the handle table of a given process */
 unsigned int get_handle_table_count( struct process *process )
 {
-    if (!process->handles) return 0;
-    return process->handles->count;
+    struct handle_table *table = process->handles;
+    unsigned int count = 0;
+    int i;
+
+    if (!table) return 0;
+    for (i = 0; i <= table->last; i++) if (table->entries[i].ptr) count++;
+    return count;
 }
 
 /* close a handle */
@@ -903,6 +908,29 @@ DECL_HANDLER(get_system_handles)
     {
         info.handle = handle;
         enum_processes( enum_handles, &info );
+    }
+}
+
+DECL_HANDLER(get_process_handles)
+{
+    struct process *process;
+
+    if ((process = get_process_from_handle( req->handle, PROCESS_QUERY_INFORMATION )))
+    {
+        struct handle_table *table = process->handles;
+        unsigned int count = get_handle_table_count( process );
+        obj_handle_t *handles;
+        int i;
+
+        reply->count = count;
+        if (get_reply_max_size() < count * sizeof(*handles))
+            set_error( STATUS_BUFFER_TOO_SMALL );
+        else if (count && (handles = set_reply_data_size( count * sizeof(*handles) )))
+        {
+            for (i = 0; i <= table->last; i++)
+                if (table->entries[i].ptr) *handles++ = index_to_handle( i );
+        }
+        release_object( process );
     }
 }
 

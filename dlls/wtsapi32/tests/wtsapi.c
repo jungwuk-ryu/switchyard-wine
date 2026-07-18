@@ -208,6 +208,8 @@ static void test_WTSQuerySessionInformation(void)
     WTS_CONNECTSTATE_CLASS *state;
     WTSINFOW *wtsinfoW;
     WTSINFOA *wtsinfoA;
+    WTSINFOEXW *wtsinfoexW;
+    WTSINFOEXA *wtsinfoexA;
     USHORT *protocol;
     LONGLONG t1, t2;
     BOOL ret;
@@ -384,6 +386,63 @@ static void test_WTSQuerySessionInformation(void)
             "out of order %s %s\n",
             wine_dbgstr_longlong(wtsinfoA->CurrentTime.QuadPart), wine_dbgstr_longlong(t2));
     WTSFreeMemory(wtsinfoA);
+
+    count = 0;
+    wtsinfoexW = NULL;
+    t1 = get_system_time_as_longlong();
+    ret = WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx,
+                                      (WCHAR **)&wtsinfoexW, &count);
+    if (!ret)
+    {
+        win_skip("WTSSessionInfoEx is unavailable, error %lu.\n", GetLastError());
+        return;
+    }
+    t2 = get_system_time_as_longlong();
+    ok(count == sizeof(*wtsinfoexW), "got %lu.\n", count);
+    ok(wtsinfoexW->Level == 1, "got level %lu.\n", wtsinfoexW->Level);
+    ok(wtsinfoexW->Data.WTSInfoExLevel1.SessionId == sessionId, "expected %lu, got %lu.\n",
+       sessionId, wtsinfoexW->Data.WTSInfoExLevel1.SessionId);
+    ok(wtsinfoexW->Data.WTSInfoExLevel1.SessionState == WTSActive, "got state %d.\n",
+       wtsinfoexW->Data.WTSInfoExLevel1.SessionState);
+    ok(t1 <= wtsinfoexW->Data.WTSInfoExLevel1.CurrentTime.QuadPart,
+       "current time is too early.\n");
+    ok(wtsinfoexW->Data.WTSInfoExLevel1.CurrentTime.QuadPart <= t2,
+       "current time is too late.\n");
+    WTSFreeMemory(wtsinfoexW);
+
+    count = 0;
+    wtsinfoexA = NULL;
+    ret = WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx,
+                                      (char **)&wtsinfoexA, &count);
+    ok(ret, "got error %lu.\n", GetLastError());
+    if (ret)
+    {
+        ok(count == sizeof(*wtsinfoexA), "got %lu.\n", count);
+        ok(wtsinfoexA->Level == 1, "got level %lu.\n", wtsinfoexA->Level);
+        ok(wtsinfoexA->Data.WTSInfoExLevel1.SessionId == sessionId, "expected %lu, got %lu.\n",
+           sessionId, wtsinfoexA->Data.WTSInfoExLevel1.SessionId);
+        WTSFreeMemory(wtsinfoexA);
+    }
+}
+
+static void test_session_notifications(void)
+{
+    HWND window;
+    BOOL ret;
+
+    window = CreateWindowW(L"static", L"wtsapi test", WS_POPUP, 0, 0, 10, 10,
+                           NULL, NULL, NULL, NULL);
+    ok(!!window, "Failed to create window, error %lu.\n", GetLastError());
+
+    ret = WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION);
+    ok(ret, "WTSRegisterSessionNotification failed, error %lu.\n", GetLastError());
+    if (ret)
+    {
+        ret = WTSUnRegisterSessionNotification(window);
+        ok(ret, "WTSUnRegisterSessionNotification failed, error %lu.\n", GetLastError());
+    }
+
+    DestroyWindow(window);
 }
 
 static void test_WTSQueryUserToken(void)
@@ -445,4 +504,5 @@ START_TEST (wtsapi)
     test_WTSQuerySessionInformation();
     test_WTSQueryUserToken();
     test_WTSEnumerateSessions();
+    test_session_notifications();
 }

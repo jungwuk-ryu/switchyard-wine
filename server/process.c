@@ -681,6 +681,8 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->priority        = PROCESS_PRIOCLASS_NORMAL;
     process->base_priority   = 8;
     process->disable_boost   = 0;
+    process->power_control   = 0;
+    process->power_state     = 0;
     process->suspend         = 0;
     process->is_system       = 0;
     process->debug_children  = 1;
@@ -1561,6 +1563,21 @@ DECL_HANDLER(get_process_info)
     }
 }
 
+/* fetch host-side information about a process */
+DECL_HANDLER(get_process_native_info)
+{
+    struct process *process;
+
+    if ((process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION )))
+    {
+        reply->handle_count = get_handle_table_count( process );
+        reply->unix_pid = process->unix_pid;
+        reply->power_control = process->power_control;
+        reply->power_state = process->power_state;
+        release_object( process );
+    }
+}
+
 /* retrieve debug information about a process */
 DECL_HANDLER(get_process_debug_info)
 {
@@ -1759,6 +1776,11 @@ DECL_HANDLER(set_process_info)
         if (req->mask & SET_PROCESS_INFO_BASE_PRIORITY) set_process_base_priority( process, req->base_priority );
         if (req->mask & SET_PROCESS_INFO_DISABLE_BOOST) set_process_disable_boost( process, req->disable_boost );
         if (req->mask & SET_PROCESS_INFO_AFFINITY) set_process_affinity( process, req->affinity );
+        if (req->mask & SET_PROCESS_INFO_POWER)
+        {
+            process->power_control = req->power_control;
+            process->power_state = req->power_state;
+        }
         if (req->mask & SET_PROCESS_INFO_TOKEN)
         {
             struct token *token;

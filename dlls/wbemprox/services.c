@@ -30,14 +30,52 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(wbemprox);
 
-struct client_security
-{
-    IClientSecurity IClientSecurity_iface;
-};
-
 static inline struct client_security *impl_from_IClientSecurity( IClientSecurity *iface )
 {
     return CONTAINING_RECORD( iface, struct client_security, IClientSecurity_iface );
+}
+
+static HRESULT client_security_check_proxy(struct client_security *cs, IUnknown *proxy)
+{
+    IUnknown *proxy_unknown, *owner_unknown;
+    HRESULT hr;
+
+    if (!proxy) return E_INVALIDARG;
+    if (FAILED(hr = IUnknown_QueryInterface(proxy, &IID_IUnknown, (void **)&proxy_unknown)))
+        return hr;
+    if (FAILED(hr = IUnknown_QueryInterface(cs->owner, &IID_IUnknown, (void **)&owner_unknown)))
+    {
+        IUnknown_Release(proxy_unknown);
+        return hr;
+    }
+
+    hr = proxy_unknown == owner_unknown ? S_OK : E_NOINTERFACE;
+    IUnknown_Release(owner_unknown);
+    IUnknown_Release(proxy_unknown);
+    return hr;
+}
+
+static BOOL is_valid_authn_service(DWORD service)
+{
+    switch (service)
+    {
+    case RPC_C_AUTHN_NONE:
+    case RPC_C_AUTHN_DCE_PRIVATE:
+    case RPC_C_AUTHN_DCE_PUBLIC:
+    case RPC_C_AUTHN_DEC_PUBLIC:
+    case RPC_C_AUTHN_GSS_NEGOTIATE:
+    case RPC_C_AUTHN_WINNT:
+    case RPC_C_AUTHN_GSS_SCHANNEL:
+    case RPC_C_AUTHN_GSS_KERBEROS:
+    case RPC_C_AUTHN_DPA:
+    case RPC_C_AUTHN_MSN:
+    case RPC_C_AUTHN_DIGEST:
+    case RPC_C_AUTHN_MQ:
+    case RPC_C_AUTHN_DEFAULT:
+        return TRUE;
+    default:
+        return FALSE;
+    }
 }
 
 static HRESULT WINAPI client_security_QueryInterface(
@@ -49,8 +87,10 @@ static HRESULT WINAPI client_security_QueryInterface(
 
     TRACE("%p %s %p\n", cs, debugstr_guid( riid ), ppvObject );
 
-    if ( IsEqualGUID( riid, &IID_IClientSecurity ) ||
-         IsEqualGUID( riid, &IID_IUnknown ) )
+    if (IsEqualGUID(riid, &IID_IUnknown))
+        return IUnknown_QueryInterface(cs->owner, riid, ppvObject);
+
+    if ( IsEqualGUID( riid, &IID_IClientSecurity ) )
     {
         *ppvObject = &cs->IClientSecurity_iface;
     }
@@ -66,15 +106,19 @@ static HRESULT WINAPI client_security_QueryInterface(
 static ULONG WINAPI client_security_AddRef(
     IClientSecurity *iface )
 {
-    FIXME("%p\n", iface);
-    return 2;
+    struct client_security *cs = impl_from_IClientSecurity(iface);
+
+    TRACE("%p\n", iface);
+    return IUnknown_AddRef(cs->owner);
 }
 
 static ULONG WINAPI client_security_Release(
     IClientSecurity *iface )
 {
-    FIXME("%p\n", iface);
-    return 1;
+    struct client_security *cs = impl_from_IClientSecurity(iface);
+
+    TRACE("%p\n", iface);
+    return IUnknown_Release(cs->owner);
 }
 
 static HRESULT WINAPI client_security_QueryBlanket(
@@ -88,22 +132,36 @@ static HRESULT WINAPI client_security_QueryBlanket(
     void **pAuthInfo,
     DWORD *pCapabilities )
 {
-    FIXME("semi-stub.\n");
+    struct client_security *cs = impl_from_IClientSecurity(iface);
+    WCHAR *principal = NULL;
+    HRESULT hr;
 
-    if (pAuthnSvc)
-        *pAuthnSvc = RPC_C_AUTHN_NONE;
-    if (pAuthzSvc)
-        *pAuthzSvc = RPC_C_AUTHZ_NONE;
-    if (pServerPrincName)
-        *pServerPrincName = NULL;
-    if (pAuthnLevel)
-        *pAuthnLevel = RPC_C_AUTHN_LEVEL_NONE;
-    if (pImpLevel)
-        *pImpLevel = RPC_C_IMP_LEVEL_DEFAULT;
-    if (pAuthInfo)
-        *pAuthInfo = NULL;
-    if (pCapabilities)
-        *pCapabilities = 0;
+    TRACE("%p, %p, %p, %p, %p, %p, %p, %p, %p\n", iface, pProxy, pAuthnSvc,
+          pAuthzSvc, pServerPrincName, pAuthnLevel, pImpLevel, pAuthInfo, pCapabilities);
+
+    if (FAILED(hr = client_security_check_proxy(cs, pProxy))) return hr;
+
+    EnterCriticalSection(&cs->cs);
+    if (pServerPrincName && cs->server_principal)
+    {
+        SIZE_T size = (wcslen(cs->server_principal) + 1) * sizeof(WCHAR);
+
+        if ((principal = CoTaskMemAlloc(size))) memcpy(principal, cs->server_principal, size);
+        else
+        {
+            LeaveCriticalSection(&cs->cs);
+            return E_OUTOFMEMORY;
+        }
+    }
+
+    if (pAuthnSvc) *pAuthnSvc = cs->authn_svc;
+    if (pAuthzSvc) *pAuthzSvc = cs->authz_svc;
+    if (pServerPrincName) *pServerPrincName = principal;
+    if (pAuthnLevel) *pAuthnLevel = cs->authn_level;
+    if (pImpLevel) *pImpLevel = cs->imp_level;
+    if (pAuthInfo) *pAuthInfo = cs->auth_info;
+    if (pCapabilities) *pCapabilities = cs->capabilities;
+    LeaveCriticalSection(&cs->cs);
 
     return WBEM_NO_ERROR;
 }
@@ -119,11 +177,46 @@ static HRESULT WINAPI client_security_SetBlanket(
     void *pAuthInfo,
     DWORD Capabilities )
 {
+    struct client_security *cs = impl_from_IClientSecurity(iface);
+    const DWORD valid_capabilities = EOAC_MUTUAL_AUTH | EOAC_STATIC_CLOAKING |
+            EOAC_DYNAMIC_CLOAKING | EOAC_ANY_AUTHORITY | EOAC_MAKE_FULLSIC | EOAC_DEFAULT;
     const OLECHAR *princname = (pServerPrincName == COLE_DEFAULT_PRINCIPAL) ?
                                L"<COLE_DEFAULT_PRINCIPAL>" : pServerPrincName;
+    WCHAR *principal = NULL;
+    HRESULT hr;
 
-    FIXME( "%p, %p, %lu, %lu, %s, %lu, %lu, %p, %#lx\n", iface, pProxy, AuthnSvc, AuthzSvc,
+    TRACE( "%p, %p, %lu, %lu, %s, %lu, %lu, %p, %#lx\n", iface, pProxy, AuthnSvc, AuthzSvc,
            debugstr_w(princname), AuthnLevel, ImpLevel, pAuthInfo, Capabilities );
+
+    if (FAILED(hr = client_security_check_proxy(cs, pProxy))) return hr;
+    if (!is_valid_authn_service(AuthnSvc) ||
+        (AuthzSvc != RPC_C_AUTHZ_NONE && AuthzSvc != RPC_C_AUTHZ_NAME &&
+         AuthzSvc != RPC_C_AUTHZ_DCE && AuthzSvc != RPC_C_AUTHZ_DEFAULT) ||
+        AuthnLevel > RPC_C_AUTHN_LEVEL_PKT_PRIVACY || ImpLevel > RPC_C_IMP_LEVEL_DELEGATE ||
+        (AuthnLevel == RPC_C_AUTHN_LEVEL_NONE && AuthnSvc != RPC_C_AUTHN_NONE) ||
+        Capabilities & ~valid_capabilities ||
+        (Capabilities & EOAC_STATIC_CLOAKING && Capabilities & EOAC_DYNAMIC_CLOAKING) ||
+        (Capabilities & (EOAC_STATIC_CLOAKING | EOAC_DYNAMIC_CLOAKING) &&
+         (pAuthInfo || AuthnSvc == RPC_C_AUTHN_GSS_SCHANNEL)))
+        return E_INVALIDARG;
+
+    if (pServerPrincName && pServerPrincName != COLE_DEFAULT_PRINCIPAL &&
+        !(principal = wcsdup(pServerPrincName)))
+        return E_OUTOFMEMORY;
+
+    EnterCriticalSection(&cs->cs);
+    if (pServerPrincName)
+    {
+        free(cs->server_principal);
+        cs->server_principal = principal;
+    }
+    cs->authn_svc = AuthnSvc;
+    cs->authz_svc = AuthzSvc;
+    cs->authn_level = AuthnLevel;
+    cs->imp_level = ImpLevel;
+    cs->auth_info = pAuthInfo;
+    cs->capabilities = Capabilities;
+    LeaveCriticalSection(&cs->cs);
     return WBEM_NO_ERROR;
 }
 
@@ -146,7 +239,25 @@ static const IClientSecurityVtbl client_security_vtbl =
     client_security_CopyProxy
 };
 
-IClientSecurity client_security = { &client_security_vtbl };
+void client_security_init( struct client_security *cs, IUnknown *owner )
+{
+    memset( cs, 0, sizeof(*cs) );
+    cs->IClientSecurity_iface.lpVtbl = &client_security_vtbl;
+    cs->owner = owner;
+    cs->authn_svc = RPC_C_AUTHN_NONE;
+    cs->authz_svc = RPC_C_AUTHZ_NONE;
+    cs->authn_level = RPC_C_AUTHN_LEVEL_NONE;
+    cs->imp_level = RPC_C_IMP_LEVEL_DEFAULT;
+    InitializeCriticalSectionEx( &cs->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
+    cs->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": client_security.cs");
+}
+
+void client_security_cleanup( struct client_security *cs )
+{
+    free( cs->server_principal );
+    cs->cs.DebugInfo->Spare[0] = 0;
+    DeleteCriticalSection( &cs->cs );
+}
 
 struct async_header
 {
@@ -207,6 +318,7 @@ static HRESULT queue_async( struct async_header *async )
 struct wbem_services
 {
     IWbemServices IWbemServices_iface;
+    struct client_security client_security;
     LONG refs;
     CRITICAL_SECTION cs;
     enum wbm_namespace ns;
@@ -247,6 +359,7 @@ static ULONG WINAPI wbem_services_Release(
         DeleteCriticalSection( &ws->cs );
         if (ws->context)
             IWbemContext_Release( ws->context );
+        client_security_cleanup( &ws->client_security );
         free( ws );
     }
     return refs;
@@ -268,7 +381,8 @@ static HRESULT WINAPI wbem_services_QueryInterface(
     }
     else if ( IsEqualGUID( riid, &IID_IClientSecurity ) )
     {
-        *ppvObject = &client_security;
+        *ppvObject = &ws->client_security.IClientSecurity_iface;
+        IClientSecurity_AddRef(*ppvObject);
         return S_OK;
     }
     else
@@ -990,6 +1104,7 @@ HRESULT WbemServices_create( const WCHAR *namespace, IWbemContext *context, LPVO
     if (!(ws = calloc( 1, sizeof(*ws) ))) return E_OUTOFMEMORY;
 
     ws->IWbemServices_iface.lpVtbl = &wbem_services_vtbl;
+    client_security_init( &ws->client_security, (IUnknown *)&ws->IWbemServices_iface );
     ws->refs      = 1;
     ws->ns        = ns;
     InitializeCriticalSectionEx( &ws->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );

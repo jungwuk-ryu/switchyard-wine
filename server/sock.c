@@ -298,6 +298,8 @@ struct sock
     unsigned int        reset : 1;   /* did we get a TCP reset? */
     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
+    unsigned int        randomize_port : 1; /* winsock SO_RANDOMIZE_PORT option value */
+    unsigned int        reuse_unicastport : 1; /* winsock SO_REUSE_UNICASTPORT option value */
 };
 
 static int is_tcp_socket( struct sock *sock )
@@ -1814,6 +1816,8 @@ static struct sock *create_socket(void)
     sock->reset = 0;
     sock->reuseaddr = 0;
     sock->exclusiveaddruse = 0;
+    sock->randomize_port = 0;
+    sock->reuse_unicastport = 0;
     sock->rcvbuf = 0;
     sock->sndbuf = 0;
     sock->rcvtimeo = 0;
@@ -3399,6 +3403,51 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         return;
     }
 
+    case IOCTL_AFD_WINE_SET_SO_RANDOMIZE_PORT:
+    {
+        int randomize;
+
+        if (get_req_data_size() < sizeof(randomize))
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+        if (sock->bound)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+
+        randomize = *(int *)get_req_data();
+        if (randomize && sock->reuse_unicastport)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+        sock->randomize_port = !!randomize;
+        return;
+    }
+
+    case IOCTL_AFD_WINE_SET_SO_REUSE_UNICASTPORT:
+    {
+        int reuse;
+
+        if (get_req_data_size() < sizeof(reuse))
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+        if (sock->bound)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+
+        reuse = *(int *)get_req_data();
+        sock->reuse_unicastport = !!reuse;
+        return;
+    }
+
     case IOCTL_AFD_WINE_GET_SO_SNDBUF:
     {
         int sndbuf = sock->sndbuf;
@@ -3513,6 +3562,36 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         exclusive = sock->exclusiveaddruse;
         set_reply_data( &exclusive, min( sizeof(exclusive), get_reply_max_size() ));
+        return;
+    }
+
+    case IOCTL_AFD_WINE_GET_SO_RANDOMIZE_PORT:
+    {
+        int randomize;
+
+        if (!get_reply_max_size())
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+
+        randomize = sock->randomize_port;
+        set_reply_data( &randomize, min( sizeof(randomize), get_reply_max_size() ));
+        return;
+    }
+
+    case IOCTL_AFD_WINE_GET_SO_REUSE_UNICASTPORT:
+    {
+        int reuse;
+
+        if (!get_reply_max_size())
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+
+        reuse = sock->reuse_unicastport;
+        set_reply_data( &reuse, min( sizeof(reuse), get_reply_max_size() ));
         return;
     }
 

@@ -140,6 +140,37 @@ cleanup:
     DestroyWindow(hwnd);
 }
 
+static void test_window_attributes(void)
+{
+    DWORD cloaked = 0xdeadbeef;
+    BOOL composition = FALSE, disabled = FALSE, enabled;
+    HWND hwnd;
+    HRESULT hr;
+
+    hwnd = CreateWindowW(L"static", L"static", WS_OVERLAPPEDWINDOW | WS_POPUP,
+                         10, 10, 200, 200, NULL, NULL, NULL, NULL);
+    ok(!!hwnd, "Failed to create window, error %lu.\n", GetLastError());
+
+    hr = DwmIsCompositionEnabled(&composition);
+    ok(hr == S_OK, "DwmIsCompositionEnabled returned %#lx.\n", hr);
+    hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    if (!composition)
+        ok(hr == E_HANDLE, "Got hr %#lx.\n", hr);
+    else
+    {
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        ok(!cloaked, "Got unexpected cloaked flags %#lx.\n", cloaked);
+    }
+
+    hr = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disabled, sizeof(disabled));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    enabled = TRUE;
+    hr = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &enabled, sizeof(enabled));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    DestroyWindow(hwnd);
+}
+
 static void WINAPI apc_func(ULONG_PTR apc_count)
 {
     ++*(unsigned int *)apc_count;
@@ -175,5 +206,6 @@ START_TEST(dwmapi)
     test_DwmIsCompositionEnabled();
     test_DwmGetCompositionTimingInfo();
     test_DWMWA_EXTENDED_FRAME_BOUNDS();
+    test_window_attributes();
     test_DwmFlush();
 }

@@ -2973,6 +2973,10 @@ static void test_RSA(void)
     ret = BCryptImportKeyPair(alg, NULL, BCRYPT_RSAPUBLIC_BLOB, &key, rsaPublicBlob, sizeof(rsaPublicBlob), 0);
     ok(!ret, "BCryptImportKeyPair failed: %#lx\n", ret);
 
+    size = 0xdeadbeef;
+    ret = BCryptExportKey(key, NULL, BCRYPT_OPAQUE_KEY_BLOB, NULL, 0, &size, 0);
+    ok(ret == STATUS_NOT_SUPPORTED, "got %#lx\n", ret);
+
     keylen = 0;
     ret = BCryptGetProperty(key, BCRYPT_KEY_STRENGTH, (UCHAR *)&keylen, sizeof(keylen), &size, 0);
     ok(!ret, "got %#lx\n", ret);
@@ -3003,6 +3007,11 @@ static void test_RSA(void)
 
     ret = BCryptDestroyKey(key);
     ok(!ret, "BCryptDestroyKey failed: %#lx\n", ret);
+
+    key = NULL;
+    ret = BCryptImportKeyPair(alg, NULL, BCRYPT_OPAQUE_KEY_BLOB, &key, rsaPublicBlob, sizeof(rsaPublicBlob), 0);
+    ok(ret == STATUS_NOT_SUPPORTED, "got %#lx\n", ret);
+    ok(!key, "key set to %p\n", key);
 
     /* sign/verify with export/import round-trip */
     ret = BCryptGenerateKeyPair(alg, &key, 1024, 0);

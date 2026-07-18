@@ -1810,6 +1810,7 @@ HRESULT CDECL wined3d_adapter_get_identifier(const struct wined3d_adapter *adapt
     identifier->adapter_luid = adapter->luid;
     identifier->video_memory = min(~(SIZE_T)0, adapter->driver_info.vram_bytes);
     identifier->shared_system_memory = min(~(SIZE_T)0, adapter->driver_info.sysmem_bytes);
+    identifier->is_software = adapter->is_software;
 
     wined3d_mutex_unlock();
 
@@ -3355,6 +3356,7 @@ static struct wined3d_adapter *wined3d_adapter_no3d_create(unsigned int ordinal,
         free(adapter);
         return NULL;
     }
+    adapter->is_software = true;
 
     if (!wined3d_adapter_no3d_init_format_info(adapter))
     {

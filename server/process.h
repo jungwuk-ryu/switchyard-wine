@@ -61,6 +61,8 @@ struct process
     int                  priority;        /* priority class */
     int                  base_priority;   /* base priority to calculate thread priority */
     int                  disable_boost;   /* disable priority boost */
+    unsigned int         power_control;   /* power throttling control mask */
+    unsigned int         power_state;     /* power throttling state mask */
     int                  suspend;         /* global process suspend count */
     unsigned int         is_system:1;     /* is it a system process? */
     unsigned int         debug_children:1;/* also debug all child processes */

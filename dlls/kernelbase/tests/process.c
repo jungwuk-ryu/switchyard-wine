@@ -27,6 +27,7 @@
 #include <winbase.h>
 #include <winerror.h>
 #include <winternl.h>
+#include <appmodel.h>
 
 #include "wine/test.h"
 
@@ -45,6 +46,10 @@ static LPVOID (WINAPI *pMapViewOfFileFromApp)(HANDLE, ULONG, ULONG64, SIZE_T);
 static BOOL (WINAPI *pUnmapViewOfFile2)(HANDLE, void *, ULONG);
 static HRESULT (WINAPI *pGetMachineTypeAttributes)(USHORT, MACHINE_ATTRIBUTES *);
 static BOOL (WINAPI *pIsWow64Process2)(HANDLE, USHORT *, USHORT *);
+static BOOL (WINAPI *pGetProcessInformation)(HANDLE, PROCESS_INFORMATION_CLASS, void *, DWORD);
+static BOOL (WINAPI *pSetProcessInformation)(HANDLE, PROCESS_INFORMATION_CLASS, void *, DWORD);
+static LONG (WINAPI *pAppPolicyGetProcessTerminationMethod)(HANDLE, AppPolicyProcessTerminationMethod *);
+static LONG (WINAPI *pAppPolicyGetThreadInitializationType)(HANDLE, AppPolicyThreadInitializationType *);
 
 static void test_CompareObjectHandles(void)
 {
@@ -625,8 +630,105 @@ static void test_QueryProcessCycleTime(void)
     ret = QueryProcessCycleTime( GetCurrentProcess(), &cycles2 );
     ok( ret, "QueryProcessCycleTime failed, error %lu.\n", GetLastError() );
 
-    todo_wine
+    ok( cycles2 >= cycles1, "CPU cycles used by process should not decrease.\n" );
+    todo_wine_if( cycles2 == cycles1 )
     ok( cycles2 > cycles1, "CPU cycles used by process should be increasing.\n" );
+}
+
+static void test_AppPolicy(void)
+{
+    AppPolicyProcessTerminationMethod termination = 0xdeadbeef;
+    AppPolicyThreadInitializationType initialization = 0xdeadbeef;
+    LONG ret;
+
+    if (!pAppPolicyGetProcessTerminationMethod || !pAppPolicyGetThreadInitializationType)
+    {
+        win_skip("AppPolicy APIs are not available.\n");
+        return;
+    }
+
+    ret = pAppPolicyGetProcessTerminationMethod( GetCurrentProcessToken(), &termination );
+    ok( ret == ERROR_SUCCESS, "AppPolicyGetProcessTerminationMethod returned %ld.\n", ret );
+    ok( termination == AppPolicyProcessTerminationMethod_ExitProcess,
+        "Unexpected process termination method %u.\n", termination );
+
+    ret = pAppPolicyGetThreadInitializationType( GetCurrentProcessToken(), &initialization );
+    ok( ret == ERROR_SUCCESS, "AppPolicyGetThreadInitializationType returned %ld.\n", ret );
+    ok( initialization == AppPolicyThreadInitializationType_None,
+        "Unexpected thread initialization type %u.\n", initialization );
+
+    ret = pAppPolicyGetProcessTerminationMethod( NULL, &termination );
+    ok( ret == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld.\n", ret );
+    ret = pAppPolicyGetThreadInitializationType( GetCurrentProcessToken(), NULL );
+    ok( ret == ERROR_INVALID_PARAMETER, "Expected ERROR_INVALID_PARAMETER, got %ld.\n", ret );
+}
+
+static void test_ProcessShutdownParameters(void)
+{
+    DWORD level, flags;
+    BOOL ret;
+
+    ret = SetProcessShutdownParameters( 0x27f, SHUTDOWN_NORETRY );
+    ok( ret, "SetProcessShutdownParameters failed, error %lu.\n", GetLastError() );
+    ret = GetProcessShutdownParameters( &level, &flags );
+    ok( ret, "GetProcessShutdownParameters failed, error %lu.\n", GetLastError() );
+    ok( level == 0x27f, "Unexpected shutdown level %#lx.\n", level );
+    ok( flags == SHUTDOWN_NORETRY, "Unexpected shutdown flags %#lx.\n", flags );
+
+    SetLastError( 0xdeadbeef );
+    ret = SetProcessShutdownParameters( 0x500, 0 );
+    ok( !ret, "SetProcessShutdownParameters unexpectedly succeeded.\n" );
+    ok( GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected error %lu.\n", GetLastError() );
+
+    SetLastError( 0xdeadbeef );
+    ret = SetProcessShutdownParameters( 0x280, 2 );
+    ok( !ret, "SetProcessShutdownParameters unexpectedly succeeded.\n" );
+    ok( GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected error %lu.\n", GetLastError() );
+
+    ret = SetProcessShutdownParameters( 0x280, 0 );
+    ok( ret, "Failed to restore shutdown parameters, error %lu.\n", GetLastError() );
+}
+
+static void test_ProcessPowerThrottling(void)
+{
+    PROCESS_POWER_THROTTLING_STATE original, state, queried;
+    BOOL ret;
+
+    if (!pGetProcessInformation || !pSetProcessInformation)
+    {
+        win_skip("Process information APIs are not available.\n");
+        return;
+    }
+
+    ret = pGetProcessInformation( GetCurrentProcess(), ProcessPowerThrottling,
+                                  &original, sizeof(original) );
+    if (!ret && GetLastError() == ERROR_INVALID_PARAMETER)
+    {
+        win_skip("ProcessPowerThrottling is not available.\n");
+        return;
+    }
+    ok( ret, "GetProcessInformation failed, error %lu.\n", GetLastError() );
+    if (!ret) return;
+
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    ret = pSetProcessInformation( GetCurrentProcess(), ProcessPowerThrottling,
+                                  &state, sizeof(state) );
+    ok( ret, "SetProcessInformation failed, error %lu.\n", GetLastError() );
+    if (!ret) return;
+
+    memset( &queried, 0xcc, sizeof(queried) );
+    ret = pGetProcessInformation( GetCurrentProcess(), ProcessPowerThrottling,
+                                  &queried, sizeof(queried) );
+    ok( ret, "GetProcessInformation failed, error %lu.\n", GetLastError() );
+    ok( queried.Version == state.Version, "Unexpected version %lu.\n", queried.Version );
+    ok( queried.ControlMask == state.ControlMask, "Unexpected control mask %#lx.\n", queried.ControlMask );
+    ok( queried.StateMask == state.StateMask, "Unexpected state mask %#lx.\n", queried.StateMask );
+
+    ret = pSetProcessInformation( GetCurrentProcess(), ProcessPowerThrottling,
+                                  &original, sizeof(original) );
+    ok( ret, "Failed to restore process power throttling, error %lu.\n", GetLastError() );
 }
 
 static void test_GetMachineTypeAttributes(void)
@@ -675,12 +777,16 @@ static void init_funcs(void)
 
 #define X(f) { p##f = (void*)GetProcAddress(hmod, #f); }
     X(CompareObjectHandles);
+    X(AppPolicyGetProcessTerminationMethod);
+    X(AppPolicyGetThreadInitializationType);
     X(CreateFileMappingFromApp);
     X(GetMachineTypeAttributes);
+    X(GetProcessInformation);
     X(IsWow64Process2);
     X(MapViewOfFile3);
     X(MapViewOfFileFromApp);
     X(OpenFileMappingFromApp);
+    X(SetProcessInformation);
     X(VirtualAlloc2);
     X(VirtualAlloc2FromApp);
     X(VirtualAllocFromApp);
@@ -707,5 +813,8 @@ START_TEST(process)
     test_CreateFileMappingFromApp();
     test_MapViewOfFileFromApp();
     test_QueryProcessCycleTime();
+    test_AppPolicy();
+    test_ProcessShutdownParameters();
+    test_ProcessPowerThrottling();
     test_GetMachineTypeAttributes();
 }

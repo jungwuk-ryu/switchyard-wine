@@ -2665,6 +2665,7 @@ typedef struct tagMINIMIZEDMETRICS {
 /* Window affinity */
 #define WDA_NONE     0x0
 #define WDA_MONITOR  0x1
+#define WDA_EXCLUDEFROMCAPTURE 0x11
 
 /* Window scrolling */
 #define SW_SCROLLCHILDREN      0x0001

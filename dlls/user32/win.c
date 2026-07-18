@@ -1226,8 +1226,9 @@ BOOL WINAPI IsWindowVisible( HWND hwnd )
  */
 BOOL WINAPI IsWindowArranged( HWND hwnd )
 {
-    FIXME( "hwnd %p stub.\n", hwnd );
+    TRACE( "hwnd %p\n", hwnd );
 
+    /* Wine has no system snap-arrangement state. */
     return FALSE;
 }
 
@@ -1584,16 +1585,36 @@ LONG_PTR WINAPI SetWindowLongPtrA( HWND hwnd, INT offset, LONG_PTR newval )
  */
 BOOL WINAPI SetWindowDisplayAffinity(HWND hwnd, DWORD affinity)
 {
-    FIXME("(%p, %lu): stub\n", hwnd, affinity);
+    static const WCHAR display_affinity_prop[] = L"__wine_display_affinity";
+    static LONG capture_warning;
+    DWORD process_id;
 
-    if (!hwnd)
+    TRACE("(%p, %#lx)\n", hwnd, affinity);
+
+    if (!IsWindow(hwnd))
     {
         SetLastError(ERROR_INVALID_WINDOW_HANDLE);
         return FALSE;
     }
 
-    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-    return FALSE;
+    GetWindowThreadProcessId(hwnd, &process_id);
+    if (process_id != GetCurrentProcessId() || NtUserGetAncestor(hwnd, GA_ROOT) != hwnd)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if (affinity != WDA_NONE && affinity != WDA_MONITOR && affinity != WDA_EXCLUDEFROMCAPTURE)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    /* The stored value implements the documented Set/Get state.  Host-driver
+     * capture paths still need to consume it before exclusion is effective. */
+    if (affinity != WDA_NONE && !InterlockedExchange(&capture_warning, TRUE))
+        FIXME("Window capture affinity is stored but not enforced by host drivers.\n");
+    return NtUserSetProp(hwnd, display_affinity_prop, ULongToHandle(affinity + 1));
 }
 
 /**********************************************************************

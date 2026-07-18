@@ -594,7 +594,16 @@ BOOL WINAPI GetAllUsersProfileDirectoryW( LPWSTR lpProfileDir, LPDWORD lpcchSize
 
 BOOL WINAPI GetProfileType( DWORD *pdwFlags )
 {
-    FIXME("%p\n", pdwFlags );
+    TRACE("%p\n", pdwFlags );
+
+    if (!pdwFlags)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    /* Wine profiles are local: they are neither roaming, mandatory, nor
+     * temporary profiles. */
     *pdwFlags = 0;
     return TRUE;
 }
@@ -615,13 +624,28 @@ BOOL WINAPI LoadUserProfileW( HANDLE hToken, LPPROFILEINFOW lpProfileInfo )
 
 BOOL WINAPI RegisterGPNotification( HANDLE event, BOOL machine )
 {
-    FIXME("%p %d\n", event, machine );
+    TRACE("%p %d\n", event, machine );
+
+    /* Wine has no Group Policy refresh provider.  A valid registration has
+     * no changes to signal, but keeping it successful lets callers use the
+     * same wait setup as on a machine without policy updates. */
+    if (!event)
+    {
+        SetLastError( ERROR_INVALID_HANDLE );
+        return FALSE;
+    }
     return TRUE;
 }
 
 BOOL WINAPI UnregisterGPNotification( HANDLE event )
 {
-    FIXME("%p\n", event );
+    TRACE("%p\n", event );
+
+    if (!event)
+    {
+        SetLastError( ERROR_INVALID_HANDLE );
+        return FALSE;
+    }
     return TRUE;
 }
 

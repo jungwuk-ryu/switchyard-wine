@@ -114,7 +114,13 @@ static void test_DXCoreCreateAdapterFactory(void)
     check_interface(list, &IID_IDXCoreAdapterFactory, FALSE);
 
     adapter_count = IDXCoreAdapterList_GetAdapterCount(list);
-    ok(adapter_count != 0, "got adapter_count 0.\n");
+    if (!adapter_count)
+    {
+        win_skip("No D3D12 graphics adapter is available.\n");
+        IDXCoreAdapterList_Release(list);
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
 
     hr = IDXCoreAdapterList_GetAdapter(list, 0xdeadbeef, &IID_IDXCoreAdapter, NULL);
     ok(hr == E_POINTER, "got hr %#lx.\n", hr);
@@ -175,6 +181,11 @@ static void test_GetProperty(void)
     {
         hr = IDXCoreAdapterList_GetAdapter(list, i, &IID_IDXCoreAdapter, (void **)&adapter);
         ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+        ok(IDXCoreAdapter_IsAttributeSupported(adapter, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS),
+                "Expected D3D12 graphics support.\n");
+        ok(!IDXCoreAdapter_IsAttributeSupported(adapter, &IID_IDXCoreAdapter),
+                "Unexpected unknown attribute support.\n");
 
         hr = IDXCoreAdapter_GetProperty(adapter, 0xdeadbeef, 0, hwid);
         ok(hr == DXGI_ERROR_INVALID_CALL, "Got hr %#lx.\n", hr);

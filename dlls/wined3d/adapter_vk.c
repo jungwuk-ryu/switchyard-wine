@@ -2627,6 +2627,7 @@ static BOOL wined3d_adapter_vk_init(struct wined3d_adapter_vk *adapter_vk,
         free(adapter_vk->device_extensions);
         goto fail_vulkan;
     }
+    adapter->is_software = properties2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
 
     adapter->vertex_pipe = wined3d_spirv_vertex_pipe_init_vk();
     adapter->fragment_pipe = wined3d_spirv_fragment_pipe_init_vk();
