@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/switchyard-wine-logo.png" alt="Switchyard Wine logo" width="420">
+</p>
+
 # Switchyard Wine
 
 Switchyard Wine is the public downstream Wine source used by the Switchyard macOS compatibility manager for Windows games and their launchers on Apple Silicon.
