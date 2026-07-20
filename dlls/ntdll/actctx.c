@@ -5936,6 +5936,7 @@ NTSTATUS WINAPI RtlFindActivationContextSectionString( ULONG flags, const GUID *
 {
     PACTCTX_SECTION_KEYED_DATA data = ptr;
     ACTCTX_SECTION_KEYED_DATA data_copy;
+    NTSTATUS param_status;
     NTSTATUS status = STATUS_SXS_KEY_NOT_FOUND;
     ACTIVATION_CONTEXT *actctx;
     ULONG data_size = 0;
@@ -5954,8 +5955,8 @@ NTSTATUS WINAPI RtlFindActivationContextSectionString( ULONG flags, const GUID *
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (data && (status = read_actctx_section_data_size( data, &data_size )))
-        return status;
+    if (data && (param_status = read_actctx_section_data_size( data, &data_size )))
+        return param_status;
 
     if ((data && data_size < offsetof(ACTCTX_SECTION_KEYED_DATA, ulAssemblyRosterIndex)) ||
         !section_name || !section_name->Buffer)
@@ -5996,6 +5997,7 @@ NTSTATUS WINAPI RtlFindActivationContextSectionGuid( ULONG flags, const GUID *ex
 {
     ACTCTX_SECTION_KEYED_DATA *data = ptr;
     ACTCTX_SECTION_KEYED_DATA data_copy;
+    NTSTATUS param_status;
     NTSTATUS status = STATUS_SXS_KEY_NOT_FOUND;
     ACTIVATION_CONTEXT *actctx;
     ULONG data_size;
@@ -6018,14 +6020,14 @@ NTSTATUS WINAPI RtlFindActivationContextSectionGuid( ULONG flags, const GUID *ex
     if (!data || !guid)
         return STATUS_INVALID_PARAMETER;
 
-    if ((status = read_actctx_section_data_size( data, &data_size )))
-        return status;
+    if ((param_status = read_actctx_section_data_size( data, &data_size )))
+        return param_status;
 
     if (data_size < FIELD_OFFSET(ACTCTX_SECTION_KEYED_DATA, ulAssemblyRosterIndex))
         return STATUS_INVALID_PARAMETER;
 
-    if ((status = copy_guid_parameter( &guid_copy, guid )))
-        return status;
+    if ((param_status = copy_guid_parameter( &guid_copy, guid )))
+        return param_status;
 
     TRACE("looking for guid %s\n", debugstr_guid(&guid_copy));
 

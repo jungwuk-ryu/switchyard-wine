@@ -87,6 +87,15 @@ static const char manifest1[] =
 "<assemblyIdentity version=\"1.0.0.0\"  name=\"Wine.Test\" type=\"win32\"></assemblyIdentity>"
 "</assembly>";
 
+static const char process_manifest[] =
+"<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">"
+"<assemblyIdentity version=\"1.0.0.0\" name=\"Wine.Test\" type=\"win32\"/>"
+"<file name=\"process_test.dll\">"
+"<windowClass versioned=\"yes\">ProcessContextClass</windowClass>"
+"<comClass clsid=\"{12345678-1234-5678-1234-111122223333}\" threadingModel=\"Neutral\"/>"
+"</file>"
+"</assembly>";
+
 static const char manifest1_1[] =
 "<assembly xmlns = \"urn:schemas-microsoft-com:asm.v1\" manifestVersion = \"1.0\">"
 "<assemblyIdentity version = \"1.0.0.0\" name = \"Wine.Test\" type = \"win32\"></assemblyIdentity>"
@@ -2655,6 +2664,7 @@ static void test_actctx(void)
 
 static void test_app_manifest(void)
 {
+    ACTCTX_SECTION_KEYED_DATA data;
     HANDLE handle;
     BOOL b;
 
@@ -2669,6 +2679,24 @@ static void test_app_manifest(void)
         test_info_in_assembly(handle, 1, &manifest1_child_info, __LINE__);
         ReleaseActCtx(handle);
     }
+
+    memset(&data, 0, sizeof(data));
+    data.cbSize = sizeof(data);
+    b = FindActCtxSectionStringW(0, NULL, ACTIVATION_CONTEXT_SECTION_WINDOW_CLASS_REDIRECTION,
+                                 L"ProcessContextClass", &data);
+    ok(b, "Failed to find process window class, error %lu.\n", GetLastError());
+    ok(data.ulDataFormatVersion == 1, "Got unexpected data format %lu.\n", data.ulDataFormatVersion);
+    ok(data.lpData != NULL, "Expected window class data.\n");
+    ok(data.lpSectionBase != NULL, "Expected window class section.\n");
+
+    memset(&data, 0, sizeof(data));
+    data.cbSize = sizeof(data);
+    b = FindActCtxSectionGuid(0, NULL, ACTIVATION_CONTEXT_SECTION_COM_SERVER_REDIRECTION,
+                              &IID_CoTest, &data);
+    ok(b, "Failed to find process COM class, error %lu.\n", GetLastError());
+    ok(data.ulDataFormatVersion == 1, "Got unexpected data format %lu.\n", data.ulDataFormatVersion);
+    ok(data.lpData != NULL, "Expected COM class data.\n");
+    ok(data.lpSectionBase != NULL, "Expected COM class section.\n");
 }
 
 static HANDLE create_manifest(const char *filename, const char *data, int line)
@@ -2806,7 +2834,7 @@ static void run_child_process(void)
 
     GetModuleFileNameA(NULL, path, MAX_PATH);
     strcat(path, ".manifest");
-    if(!create_manifest_file(path, manifest1, -1, NULL, NULL)) {
+    if(!create_manifest_file(path, process_manifest, -1, NULL, NULL)) {
         skip("Could not create manifest file\n");
         return;
     }
