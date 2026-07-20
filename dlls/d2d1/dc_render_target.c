@@ -21,6 +21,30 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 
+static void d2d_dc_render_target_release_surface(struct d2d_dc_render_target *render_target)
+{
+    if (render_target->dxgi_surface)
+        IDXGISurface1_Release(render_target->dxgi_surface);
+    if (render_target->readback_texture)
+        ID3D11Texture2D_Release(render_target->readback_texture);
+    if (render_target->d3d_texture)
+        ID3D11Texture2D_Release(render_target->d3d_texture);
+    if (render_target->dib_dc && render_target->dib_old_bitmap)
+        SelectObject(render_target->dib_dc, render_target->dib_old_bitmap);
+    if (render_target->dib_bitmap)
+        DeleteObject(render_target->dib_bitmap);
+    if (render_target->dib_dc)
+        DeleteDC(render_target->dib_dc);
+
+    render_target->dxgi_surface = NULL;
+    render_target->readback_texture = NULL;
+    render_target->d3d_texture = NULL;
+    render_target->dib_dc = NULL;
+    render_target->dib_bitmap = NULL;
+    render_target->dib_old_bitmap = NULL;
+    render_target->dib_bits = NULL;
+}
+
 static inline struct d2d_dc_render_target *impl_from_IUnknown(IUnknown *iface)
 {
     return CONTAINING_RECORD(iface, struct d2d_dc_render_target, ID2D1DCRenderTarget_iface);
@@ -36,6 +60,38 @@ static HRESULT d2d_dc_render_target_present(IUnknown *outer_unknown)
 
     if (!render_target->hdc)
         return D2DERR_WRONG_STATE;
+
+    if (render_target->d3d_texture)
+    {
+        D3D11_MAPPED_SUBRESOURCE map_desc;
+        unsigned int width, height, y;
+
+        width = dst_rect->right - dst_rect->left;
+        height = dst_rect->bottom - dst_rect->top;
+        if (!width || !height)
+            return S_OK;
+
+        ID3D11DeviceContext1_CopyResource(render_target->d3d_context,
+                (ID3D11Resource *)render_target->readback_texture,
+                (ID3D11Resource *)render_target->d3d_texture);
+        if (FAILED(hr = ID3D11DeviceContext1_Map(render_target->d3d_context,
+                (ID3D11Resource *)render_target->readback_texture, 0,
+                D3D11_MAP_READ, 0, &map_desc)))
+        {
+            WARN("Failed to map DC render target readback texture, hr %#lx.\n", hr);
+            return S_OK;
+        }
+
+        for (y = 0; y < height; ++y)
+            memcpy((BYTE *)render_target->dib_bits + y * width * 4,
+                    (BYTE *)map_desc.pData + y * map_desc.RowPitch, width * 4);
+        ID3D11DeviceContext1_Unmap(render_target->d3d_context,
+                (ID3D11Resource *)render_target->readback_texture, 0);
+
+        BitBlt(render_target->hdc, dst_rect->left, dst_rect->top, width, height,
+                render_target->dib_dc, 0, 0, SRCCOPY);
+        return S_OK;
+    }
 
     if (FAILED(hr = IDXGISurface1_GetDC(render_target->dxgi_surface, FALSE, &src_hdc)))
     {
@@ -96,9 +152,12 @@ static ULONG STDMETHODCALLTYPE d2d_dc_render_target_Release(ID2D1DCRenderTarget 
     if (!refcount)
     {
         IUnknown_Release(render_target->dxgi_inner);
-        if (render_target->dxgi_surface)
-            IDXGISurface1_Release(render_target->dxgi_surface);
-        ID3D10Device1_Release(render_target->d3d_device);
+        d2d_dc_render_target_release_surface(render_target);
+        if (render_target->d3d_context)
+            ID3D11DeviceContext1_Release(render_target->d3d_context);
+        if (render_target->d3d_device)
+            ID3D11Device1_Release(render_target->d3d_device);
+        IDXGIDevice_Release(render_target->dxgi_device);
         free(render_target);
     }
 
@@ -591,7 +650,21 @@ static void STDMETHODCALLTYPE d2d_dc_render_target_BeginDraw(ID2D1DCRenderTarget
 
     TRACE("iface %p.\n", iface);
 
-    if (render_target->dxgi_surface)
+    if (render_target->d3d_texture)
+    {
+        unsigned int width = dst_rect->right - dst_rect->left;
+        unsigned int height = dst_rect->bottom - dst_rect->top;
+
+        if (width && height)
+        {
+            BitBlt(render_target->dib_dc, 0, 0, width, height, render_target->hdc,
+                    dst_rect->left, dst_rect->top, SRCCOPY);
+            ID3D11DeviceContext1_UpdateSubresource(render_target->d3d_context,
+                    (ID3D11Resource *)render_target->d3d_texture, 0, NULL,
+                    render_target->dib_bits, width * 4, 0);
+        }
+    }
+    else if (render_target->dxgi_surface)
     {
         if (SUCCEEDED(IDXGISurface1_GetDC(render_target->dxgi_surface, TRUE, &hdc)))
         {
@@ -719,8 +792,16 @@ static HRESULT STDMETHODCALLTYPE d2d_dc_render_target_BindDC(ID2D1DCRenderTarget
     struct d2d_dc_render_target *render_target = impl_from_ID2D1DCRenderTarget(iface);
     D2D1_BITMAP_PROPERTIES1 bitmap_desc;
     struct d2d_bitmap *bitmap_impl;
-    IDXGISurface1 *dxgi_surface;
+    D3D11_TEXTURE2D_DESC texture_desc;
+    ID3D11Texture2D *readback_texture = NULL;
+    ID3D11Texture2D *d3d_texture = NULL;
+    IDXGISurface1 *dxgi_surface = NULL;
     ID2D1DeviceContext *context;
+    HGDIOBJ dib_old_bitmap = NULL;
+    HBITMAP dib_bitmap = NULL;
+    BITMAPINFO bitmap_info;
+    void *dib_bits = NULL;
+    HDC dib_dc = NULL;
     D2D1_SIZE_U bitmap_size;
     ID2D1Bitmap *bitmap;
     DWORD obj_type;
@@ -733,7 +814,9 @@ static HRESULT STDMETHODCALLTYPE d2d_dc_render_target_BindDC(ID2D1DCRenderTarget
         return E_INVALIDARG;
 
     /* Switch dxgi target to new surface. */
-    ID2D1RenderTarget_QueryInterface(render_target->dxgi_target, &IID_ID2D1DeviceContext, (void **)&context);
+    if (FAILED(hr = ID2D1RenderTarget_QueryInterface(render_target->dxgi_target,
+            &IID_ID2D1DeviceContext, (void **)&context)))
+        return hr;
 
     bitmap_size.width = rect->right - rect->left;
     bitmap_size.height = rect->bottom - rect->top;
@@ -751,19 +834,91 @@ static HRESULT STDMETHODCALLTYPE d2d_dc_render_target_BindDC(ID2D1DCRenderTarget
     }
 
     bitmap_impl = unsafe_impl_from_ID2D1Bitmap(bitmap);
-    ID3D11Resource_QueryInterface(bitmap_impl->resource, &IID_IDXGISurface1, (void **)&dxgi_surface);
+
+    if (render_target->d3d_context)
+    {
+        /* D3DMetal does not expose GDI-compatible IDXGISurface1 objects.
+         * Transfer DC contents through a CPU-readable texture instead. */
+        if (FAILED(hr = ID3D11Resource_QueryInterface(bitmap_impl->resource,
+                &IID_ID3D11Texture2D, (void **)&d3d_texture)))
+        {
+            WARN("Failed to get DC render target texture, hr %#lx.\n", hr);
+            goto failed;
+        }
+
+        ID3D11Texture2D_GetDesc(d3d_texture, &texture_desc);
+        texture_desc.Usage = D3D11_USAGE_STAGING;
+        texture_desc.BindFlags = 0;
+        texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        texture_desc.MiscFlags = 0;
+        if (FAILED(hr = ID3D11Device1_CreateTexture2D(render_target->d3d_device,
+                &texture_desc, NULL, &readback_texture)))
+        {
+            WARN("Failed to create DC render target readback texture, hr %#lx.\n", hr);
+            goto failed;
+        }
+
+        memset(&bitmap_info, 0, sizeof(bitmap_info));
+        bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+        bitmap_info.bmiHeader.biWidth = texture_desc.Width;
+        bitmap_info.bmiHeader.biHeight = -(LONG)texture_desc.Height;
+        bitmap_info.bmiHeader.biPlanes = 1;
+        bitmap_info.bmiHeader.biBitCount = 32;
+        bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+        if (!(dib_dc = CreateCompatibleDC(NULL))
+                || !(dib_bitmap = CreateDIBSection(dib_dc, &bitmap_info,
+                DIB_RGB_COLORS, &dib_bits, NULL, 0))
+                || !(dib_old_bitmap = SelectObject(dib_dc, dib_bitmap))
+                || dib_old_bitmap == HGDI_ERROR)
+        {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            if (SUCCEEDED(hr))
+                hr = E_FAIL;
+            WARN("Failed to create DC render target DIB, hr %#lx.\n", hr);
+            goto failed;
+        }
+    }
+    else if (FAILED(hr = ID3D11Resource_QueryInterface(bitmap_impl->resource,
+            &IID_IDXGISurface1, (void **)&dxgi_surface)))
+    {
+        WARN("Failed to get GDI-compatible DXGI surface, hr %#lx.\n", hr);
+        goto failed;
+    }
 
     ID2D1DeviceContext_SetTarget(context, (ID2D1Image *)bitmap);
     ID2D1Bitmap_Release(bitmap);
     ID2D1DeviceContext_Release(context);
 
-    if (render_target->dxgi_surface)
-        IDXGISurface1_Release(render_target->dxgi_surface);
+    d2d_dc_render_target_release_surface(render_target);
     render_target->dxgi_surface = dxgi_surface;
+    render_target->readback_texture = readback_texture;
+    render_target->d3d_texture = d3d_texture;
+    render_target->dib_dc = dib_dc;
+    render_target->dib_bitmap = dib_bitmap;
+    render_target->dib_old_bitmap = dib_old_bitmap;
+    render_target->dib_bits = dib_bits;
 
     render_target->hdc = hdc;
     render_target->dst_rect = *rect;
 
+    return S_OK;
+
+failed:
+    if (dib_dc && dib_old_bitmap && dib_old_bitmap != HGDI_ERROR)
+        SelectObject(dib_dc, dib_old_bitmap);
+    if (dib_bitmap)
+        DeleteObject(dib_bitmap);
+    if (dib_dc)
+        DeleteDC(dib_dc);
+    if (readback_texture)
+        ID3D11Texture2D_Release(readback_texture);
+    if (d3d_texture)
+        ID3D11Texture2D_Release(d3d_texture);
+    if (dxgi_surface)
+        IDXGISurface1_Release(dxgi_surface);
+    ID2D1Bitmap_Release(bitmap);
+    ID2D1DeviceContext_Release(context);
     return hr;
 }
 
@@ -835,9 +990,9 @@ static const struct d2d_device_context_ops d2d_dc_render_target_ops =
 };
 
 HRESULT d2d_dc_render_target_init(struct d2d_dc_render_target *render_target, ID2D1Factory1 *factory,
-        ID3D10Device1 *d3d_device, const D2D1_RENDER_TARGET_PROPERTIES *desc)
+        IDXGIDevice *dxgi_device, ID3D11DeviceContext1 *d3d_context,
+        const D2D1_RENDER_TARGET_PROPERTIES *desc)
 {
-    IDXGIDevice *dxgi_device;
     ID2D1Device *device;
     HRESULT hr;
 
@@ -862,14 +1017,8 @@ HRESULT d2d_dc_render_target_init(struct d2d_dc_render_target *render_target, ID
             return D2DERR_UNSUPPORTED_PIXEL_FORMAT;
     }
 
-    if (FAILED(hr = ID3D10Device1_QueryInterface(d3d_device, &IID_IDXGIDevice, (void **)&dxgi_device)))
-    {
-        WARN("Failed to get DXGI device interface, hr %#lx.\n", hr);
-        return hr;
-    }
-
-    hr = d2d_factory_create_device(factory, dxgi_device, false, &IID_ID2D1Device, (void **)&device);
-    IDXGIDevice_Release(dxgi_device);
+    hr = d2d_factory_create_device(factory, dxgi_device, d3d_context,
+            false, &IID_ID2D1Device, (void **)&device);
     if (FAILED(hr))
     {
         WARN("Failed to create D2D device, hr %#lx.\n", hr);
@@ -894,8 +1043,21 @@ HRESULT d2d_dc_render_target_init(struct d2d_dc_render_target *render_target, ID
         return hr;
     }
 
-    render_target->d3d_device = d3d_device;
-    ID3D10Device1_AddRef(render_target->d3d_device);
+    render_target->dxgi_device = dxgi_device;
+    IDXGIDevice_AddRef(render_target->dxgi_device);
+    if (d3d_context)
+    {
+        if (FAILED(hr = IDXGIDevice_QueryInterface(dxgi_device, &IID_ID3D11Device1,
+                (void **)&render_target->d3d_device)))
+        {
+            WARN("Failed to get D3D11 device interface, hr %#lx.\n", hr);
+            IUnknown_Release(render_target->dxgi_inner);
+            IDXGIDevice_Release(render_target->dxgi_device);
+            return hr;
+        }
+        render_target->d3d_context = d3d_context;
+        ID3D11DeviceContext1_AddRef(render_target->d3d_context);
+    }
 
     return S_OK;
 }

@@ -150,6 +150,10 @@ static ULONG STDMETHODCALLTYPE d2d_factory_Release(ID2D1Factory7 *iface)
 
     if (!refcount)
     {
+        if (factory->dc_context)
+            ID3D11DeviceContext1_Release(factory->dc_context);
+        if (factory->dc_device)
+            IDXGIDevice_Release(factory->dc_device);
         if (factory->device)
             ID3D10Device1_Release(factory->device);
         LIST_FOR_EACH_ENTRY_SAFE(reg, reg2, &factory->effects, struct d2d_effect_registration, entry)
@@ -393,6 +397,64 @@ static HRESULT d2d_factory_get_device(struct d2d_factory *factory, ID3D10Device1
     return hr;
 }
 
+static HRESULT d2d_factory_get_dc_device(struct d2d_factory *factory, IDXGIDevice **device,
+        ID3D11DeviceContext1 **context)
+{
+    static const D3D_FEATURE_LEVEL feature_levels[] =
+    {
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+    ID3D10Device1 *d3d10_device;
+    ID3D11DeviceContext *d3d11_context;
+    ID3D11Device *d3d11_device;
+    HRESULT hr;
+
+    if (factory->dc_device)
+    {
+        *device = factory->dc_device;
+        *context = factory->dc_context;
+        return S_OK;
+    }
+
+    if (SUCCEEDED(d2d_factory_get_device(factory, &d3d10_device)))
+        ID3D10Device1_QueryInterface(d3d10_device, &IID_IDXGIDevice, (void **)&factory->dc_device);
+
+    if (!factory->dc_device)
+    {
+        /* D3DMetal exposes D3D11, but does not implement DXGID3D10CreateDevice(). */
+        if (FAILED(hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, feature_levels, ARRAY_SIZE(feature_levels),
+                D3D11_SDK_VERSION, &d3d11_device, NULL, &d3d11_context)))
+        {
+            WARN("Failed to create fallback D3D11 device, hr %#lx.\n", hr);
+            return hr;
+        }
+
+        hr = ID3D11Device_QueryInterface(d3d11_device, &IID_IDXGIDevice, (void **)&factory->dc_device);
+        if (SUCCEEDED(hr))
+            hr = ID3D11DeviceContext_QueryInterface(d3d11_context, &IID_ID3D11DeviceContext1,
+                    (void **)&factory->dc_context);
+        ID3D11DeviceContext_Release(d3d11_context);
+        ID3D11Device_Release(d3d11_device);
+        if (FAILED(hr))
+        {
+            WARN("Failed to get D3D11 device interfaces, hr %#lx.\n", hr);
+            if (factory->dc_device)
+            {
+                IDXGIDevice_Release(factory->dc_device);
+                factory->dc_device = NULL;
+            }
+            return hr;
+        }
+    }
+
+    *device = factory->dc_device;
+    *context = factory->dc_context;
+    return S_OK;
+}
+
 static HRESULT STDMETHODCALLTYPE d2d_factory_CreateWicBitmapRenderTarget(ID2D1Factory7 *iface,
         IWICBitmap *target, const D2D1_RENDER_TARGET_PROPERTIES *desc, ID2D1RenderTarget **render_target)
 {
@@ -489,18 +551,19 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_CreateDCRenderTarget(ID2D1Factory7 
 {
     struct d2d_factory *factory = impl_from_ID2D1Factory7(iface);
     struct d2d_dc_render_target *object;
-    ID3D10Device1 *device;
+    ID3D11DeviceContext1 *context;
+    IDXGIDevice *device;
     HRESULT hr;
 
     TRACE("iface %p, desc %p, render_target %p.\n", iface, desc, render_target);
 
-    if (FAILED(hr = d2d_factory_get_device(factory, &device)))
+    if (FAILED(hr = d2d_factory_get_dc_device(factory, &device, &context)))
         return hr;
 
     if (!(object = calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = d2d_dc_render_target_init(object, (ID2D1Factory1 *)iface, device, desc)))
+    if (FAILED(hr = d2d_dc_render_target_init(object, (ID2D1Factory1 *)iface, device, context, desc)))
     {
         WARN("Failed to initialise render target, hr %#lx.\n", hr);
         free(object);
@@ -514,7 +577,7 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_CreateDCRenderTarget(ID2D1Factory7 
 }
 
 HRESULT d2d_factory_create_device(ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
-        bool allow_get_dxgi_device, REFIID iid, void **device)
+        ID3D11DeviceContext1 *d3d_context, bool allow_get_dxgi_device, REFIID iid, void **device)
 {
     struct d2d_device *object;
     HRESULT hr;
@@ -522,7 +585,7 @@ HRESULT d2d_factory_create_device(ID2D1Factory1 *factory, IDXGIDevice *dxgi_devi
     if (!(object = calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = d2d_device_init(object, factory, dxgi_device, allow_get_dxgi_device)))
+    if (FAILED(hr = d2d_device_init(object, factory, dxgi_device, d3d_context, allow_get_dxgi_device)))
     {
         ID2D1Device6_Release(&object->ID2D1Device6_iface);
         return hr;
@@ -541,7 +604,8 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_CreateDevice(ID2D1Factory7 *iface,
 {
     TRACE("iface %p, dxgi_device %p, device %p.\n", iface, dxgi_device, device);
 
-    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, true, &IID_ID2D1Device, (void **)device);
+    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, NULL,
+            true, &IID_ID2D1Device, (void **)device);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_factory_CreateStrokeStyle1(ID2D1Factory7 *iface,
@@ -1193,7 +1257,8 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory2_CreateDevice(ID2D1Fac
 {
     TRACE("iface %p, dxgi_device %p, device %p.\n", iface, dxgi_device, device);
 
-    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, true, &IID_ID2D1Device1, (void **)device);
+    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, NULL,
+            true, &IID_ID2D1Device1, (void **)device);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory3_CreateDevice(ID2D1Factory7 *iface,
@@ -1201,7 +1266,8 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory3_CreateDevice(ID2D1Fac
 {
     TRACE("iface %p, dxgi_device %p, device %p.\n", iface, dxgi_device, device);
 
-    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, true, &IID_ID2D1Device2, (void **)device);
+    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, NULL,
+            true, &IID_ID2D1Device2, (void **)device);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory4_CreateDevice(ID2D1Factory7 *iface,
@@ -1209,7 +1275,8 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory4_CreateDevice(ID2D1Fac
 {
     TRACE("iface %p, dxgi_device %p, device %p.\n", iface, dxgi_device, device);
 
-    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, true, &IID_ID2D1Device3, (void **)device);
+    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, NULL,
+            true, &IID_ID2D1Device3, (void **)device);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory5_CreateDevice(ID2D1Factory7 *iface,
@@ -1217,7 +1284,8 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory5_CreateDevice(ID2D1Fac
 {
     TRACE("iface %p, dxgi_device %p, device %p.\n", iface, dxgi_device, device);
 
-    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, true, &IID_ID2D1Device4, (void **)device);
+    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, NULL,
+            true, &IID_ID2D1Device4, (void **)device);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory6_CreateDevice(ID2D1Factory7 *iface,
@@ -1225,7 +1293,8 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory6_CreateDevice(ID2D1Fac
 {
     TRACE("iface %p, dxgi_device %p, device %p.\n", iface, dxgi_device, device);
 
-    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, true, &IID_ID2D1Device5, (void **)device);
+    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, NULL,
+            true, &IID_ID2D1Device5, (void **)device);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory7_CreateDevice(ID2D1Factory7 *iface,
@@ -1233,7 +1302,8 @@ static HRESULT STDMETHODCALLTYPE d2d_factory_ID2D1Factory7_CreateDevice(ID2D1Fac
 {
     TRACE("iface %p, dxgi_device %p, device %p.\n", iface, dxgi_device, device);
 
-    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, true, &IID_ID2D1Device6, (void **)device);
+    return d2d_factory_create_device((ID2D1Factory1 *)iface, dxgi_device, NULL,
+            true, &IID_ID2D1Device6, (void **)device);
 }
 
 static const struct ID2D1Factory7Vtbl d2d_factory_vtbl =

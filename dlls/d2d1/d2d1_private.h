@@ -185,6 +185,7 @@ struct d2d_device_context
     CRITICAL_SECTION *cs;
     struct d2d_device *device;
     ID3D11Device1 *d3d_device;
+    ID3D11DeviceContext1 *d3d_context;
     ID3DDeviceContextState *d3d_state;
     struct
     {
@@ -257,9 +258,18 @@ struct d2d_dc_render_target
     LONG refcount;
 
     IDXGISurface1 *dxgi_surface;
-    ID3D10Device1 *d3d_device;
+    IDXGIDevice *dxgi_device;
+    ID3D11Device1 *d3d_device;
+    ID3D11DeviceContext1 *d3d_context;
+    ID3D11Texture2D *d3d_texture;
+    ID3D11Texture2D *readback_texture;
     ID2D1RenderTarget *dxgi_target;
     IUnknown *dxgi_inner;
+
+    HDC dib_dc;
+    HBITMAP dib_bitmap;
+    HGDIOBJ dib_old_bitmap;
+    void *dib_bits;
 
     RECT dst_rect;
     HDC hdc;
@@ -268,7 +278,8 @@ struct d2d_dc_render_target
 };
 
 HRESULT d2d_dc_render_target_init(struct d2d_dc_render_target *render_target, ID2D1Factory1 *factory,
-        ID3D10Device1 *d3d_device, const D2D1_RENDER_TARGET_PROPERTIES *desc);
+        IDXGIDevice *dxgi_device, ID3D11DeviceContext1 *d3d_context,
+        const D2D1_RENDER_TARGET_PROPERTIES *desc);
 
 struct d2d_hwnd_render_target
 {
@@ -443,6 +454,7 @@ struct d2d_bitmap
     ID3D11RenderTargetView *rtv;
     IDXGISurface *surface;
     ID3D11Resource *resource;
+    ID3D11DeviceContext1 *d3d_context;
     D3D11_MAPPED_SUBRESOURCE mapped_resource;
     D2D1_SIZE_U pixel_size;
     D2D1_PIXEL_FORMAT format;
@@ -656,6 +668,7 @@ struct d2d_device
     LONG refcount;
     ID2D1Factory1 *factory;
     IDXGIDevice *dxgi_device;
+    ID3D11DeviceContext1 *d3d_context;
     bool allow_get_dxgi_device;
 
     ID3D10Blob *precompiled_shape_vs[D2D_SHAPE_TYPE_COUNT];
@@ -736,6 +749,8 @@ struct d2d_factory
     LONG refcount;
 
     ID3D10Device1 *device;
+    IDXGIDevice *dc_device;
+    ID3D11DeviceContext1 *dc_context;
 
     float dpi_x;
     float dpi_y;
@@ -754,7 +769,7 @@ static inline struct d2d_factory *unsafe_impl_from_ID2D1Factory(ID2D1Factory *if
 
 void d2d_effects_init_builtins(struct d2d_factory *factory);
 HRESULT d2d_factory_create_device(ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
-        bool allow_get_dxgi_device, REFIID iid, void **device);
+        ID3D11DeviceContext1 *d3d_context, bool allow_get_dxgi_device, REFIID iid, void **device);
 struct d2d_effect_registration * d2d_factory_get_registered_effect(ID2D1Factory *factory,
         const GUID *effect_id);
 void d2d_factory_register_effect(struct d2d_factory *factory,
@@ -762,7 +777,7 @@ void d2d_factory_register_effect(struct d2d_factory *factory,
 HRESULT d2d_effect_property_get_uint32_value(const struct d2d_effect_properties *properties,
         const struct d2d_effect_property *prop, UINT32 *value);
 HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
-        bool allow_get_dxgi_device);
+        ID3D11DeviceContext1 *d3d_context, bool allow_get_dxgi_device);
 
 struct d2d_transform
 {

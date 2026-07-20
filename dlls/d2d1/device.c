@@ -122,7 +122,6 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
 {
     struct d2d_shape_resources *shape_resources = &render_target->shape_resources[shape_type];
     ID3DDeviceContextState *prev_state;
-    ID3D11Device1 *device = render_target->d3d_device;
     ID3D11DeviceContext1 *context;
     ID3D11Buffer *vs_cb = render_target->vs_cb, *ps_cb = render_target->ps_cb;
     D3D11_RECT scissor_rect;
@@ -139,8 +138,10 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
     if (render_target->cs)
         EnterCriticalSection(render_target->cs);
 
-    ID3D11Device1_GetImmediateContext1(device, &context);
-    ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, &prev_state);
+    context = render_target->d3d_context;
+    ID3D11DeviceContext1_AddRef(context);
+    if (render_target->d3d_state)
+        ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, &prev_state);
 
     ID3D11DeviceContext1_IASetInputLayout(context, shape_resources->il);
     ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -189,9 +190,11 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
     else
         ID3D11DeviceContext1_Draw(context, index_count, 0);
 
-    ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
+    if (render_target->d3d_state)
+        ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
     ID3D11DeviceContext1_Release(context);
-    ID3DDeviceContextState_Release(prev_state);
+    if (render_target->d3d_state)
+        ID3DDeviceContextState_Release(prev_state);
 
     if (render_target->cs)
         LeaveCriticalSection(render_target->cs);
@@ -300,6 +303,7 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
         }
         if (context->d3d_state)
             ID3DDeviceContextState_Release(context->d3d_state);
+        ID3D11DeviceContext1_Release(context->d3d_context);
         if (context->target.object)
             IUnknown_Release(context->target.object);
         ID3D11Device1_Release(context->d3d_device);
@@ -775,7 +779,8 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
     struct d2d_ps_cb *cb_data;
     HRESULT hr;
 
-    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+    d3d_context = (ID3D11DeviceContext *)context->d3d_context;
+    ID3D11DeviceContext_AddRef(d3d_context);
 
     if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->ps_cb,
             0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
@@ -811,7 +816,8 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
     float tmp_x, tmp_y;
     HRESULT hr;
 
-    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+    d3d_context = (ID3D11DeviceContext *)context->d3d_context;
+    ID3D11DeviceContext_AddRef(d3d_context);
 
     if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->vs_cb,
             0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
@@ -1991,7 +1997,8 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
         return;
     }
 
-    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+    d3d_context = (ID3D11DeviceContext *)context->d3d_context;
+    ID3D11DeviceContext_AddRef(d3d_context);
 
     if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)context->vs_cb,
             0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
@@ -4243,12 +4250,25 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
         goto err;
     }
 
+    if (device->d3d_context)
+    {
+        render_target->d3d_context = device->d3d_context;
+        ID3D11DeviceContext1_AddRef(render_target->d3d_context);
+    }
+    else
+    {
+        ID3D11Device1_GetImmediateContext1(render_target->d3d_device, &render_target->d3d_context);
+    }
+
     if (FAILED(hr = ID3D11Device1_CreateDeviceContextState(render_target->d3d_device,
             0, &feature_levels, 1, D3D11_SDK_VERSION, &IID_ID3D11Device1, NULL,
             &render_target->d3d_state)))
     {
         WARN("Failed to create device context state, hr %#lx.\n", hr);
-        goto err;
+        /* A factory-owned fallback device is private to d2d1, so using its
+         * immediate context without state isolation is safe. */
+        if (device->allow_get_dxgi_device)
+            goto err;
     }
 
     for (i = 0; i < ARRAY_SIZE(shape_info); ++i)
@@ -4408,6 +4428,8 @@ err:
     }
     if (render_target->d3d_state)
         ID3DDeviceContextState_Release(render_target->d3d_state);
+    if (render_target->d3d_context)
+        ID3D11DeviceContext1_Release(render_target->d3d_context);
     if (render_target->d3d_device)
         ID3D11Device1_Release(render_target->d3d_device);
     ID2D1Device6_Release(&render_target->device->ID2D1Device6_iface);
@@ -4535,6 +4557,8 @@ static ULONG WINAPI d2d_device_Release(ID2D1Device6 *iface)
 
     if (!refcount)
     {
+        if (device->d3d_context)
+            ID3D11DeviceContext1_Release(device->d3d_context);
         IDXGIDevice_Release(device->dxgi_device);
         ID2D1Factory1_Release(device->factory);
         d2d_device_indexed_objects_clear(&device->shaders);
@@ -4770,7 +4794,7 @@ struct d2d_device *unsafe_impl_from_ID2D1Device(ID2D1Device1 *iface)
 }
 
 HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
-    bool allow_get_dxgi_device)
+        ID3D11DeviceContext1 *d3d_context, bool allow_get_dxgi_device)
 {
     HRESULT hr;
     ID3D10Blob *compiled;
@@ -4781,6 +4805,9 @@ HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGI
     ID2D1Factory1_AddRef(device->factory);
     device->dxgi_device = dxgi_device;
     IDXGIDevice_AddRef(device->dxgi_device);
+    device->d3d_context = d3d_context;
+    if (device->d3d_context)
+        ID3D11DeviceContext1_AddRef(device->d3d_context);
     device->allow_get_dxgi_device = allow_get_dxgi_device;
 
     for (unsigned int i = 0; i < ARRAY_SIZE(shape_info); ++i)

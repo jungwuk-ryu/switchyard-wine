@@ -28,17 +28,10 @@ static inline struct d2d_bitmap *impl_from_ID2D1Bitmap1(ID2D1Bitmap1 *iface)
 
 static HRESULT d2d_bitmap_unmap(struct d2d_bitmap *bitmap)
 {
-    ID3D11DeviceContext *context;
-    ID3D11Device *device;
-
     if (!bitmap->mapped_resource.pData)
         return D2DERR_WRONG_STATE;
 
-    ID3D11Resource_GetDevice(bitmap->resource, &device);
-    ID3D11Device_GetImmediateContext(device, &context);
-    ID3D11DeviceContext_Unmap(context, bitmap->resource, 0);
-    ID3D11DeviceContext_Release(context);
-    ID3D11Device_Release(device);
+    ID3D11DeviceContext1_Unmap(bitmap->d3d_context, bitmap->resource, 0);
 
     memset(&bitmap->mapped_resource, 0, sizeof(bitmap->mapped_resource));
 
@@ -91,6 +84,7 @@ static ULONG STDMETHODCALLTYPE d2d_bitmap_Release(ID2D1Bitmap1 *iface)
             ID3D11RenderTargetView_Release(bitmap->rtv);
         if (bitmap->surface)
             IDXGISurface_Release(bitmap->surface);
+        ID3D11DeviceContext1_Release(bitmap->d3d_context);
         ID3D11Resource_Release(bitmap->resource);
         ID2D1Factory_Release(bitmap->factory);
         free(bitmap);
@@ -154,8 +148,6 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromBitmap(ID2D1Bitmap1 *iface,
 {
     struct d2d_bitmap *src_bitmap = unsafe_impl_from_ID2D1Bitmap(bitmap);
     struct d2d_bitmap *dst_bitmap = impl_from_ID2D1Bitmap1(iface);
-    ID3D11DeviceContext *context;
-    ID3D11Device *device;
     D3D11_BOX box;
 
     TRACE("iface %p, dst_point %s, bitmap %p, src_rect %s.\n", iface,
@@ -171,13 +163,9 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromBitmap(ID2D1Bitmap1 *iface,
         box.back = 1;
     }
 
-    ID3D11Resource_GetDevice(dst_bitmap->resource, &device);
-    ID3D11Device_GetImmediateContext(device, &context);
-    ID3D11DeviceContext_CopySubresourceRegion(context, dst_bitmap->resource, 0,
+    ID3D11DeviceContext1_CopySubresourceRegion(dst_bitmap->d3d_context, dst_bitmap->resource, 0,
             dst_point ? dst_point->x : 0, dst_point ? dst_point->y : 0, 0,
             src_bitmap->resource, 0, src_rect ? &box : NULL);
-    ID3D11DeviceContext_Release(context);
-    ID3D11Device_Release(device);
 
     return S_OK;
 }
@@ -221,8 +209,6 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromMemory(ID2D1Bitmap1 *iface,
         const D2D1_RECT_U *dst_rect, const void *src_data, UINT32 pitch)
 {
     struct d2d_bitmap *bitmap = impl_from_ID2D1Bitmap1(iface);
-    ID3D11DeviceContext *context;
-    ID3D11Device *device;
     D3D11_BOX box;
 
     TRACE("iface %p, dst_rect %s, src_data %p, pitch %u.\n", iface, debug_d2d_rect_u(dst_rect),
@@ -238,11 +224,8 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromMemory(ID2D1Bitmap1 *iface,
         box.back = 1;
     }
 
-    ID3D11Resource_GetDevice(bitmap->resource, &device);
-    ID3D11Device_GetImmediateContext(device, &context);
-    ID3D11DeviceContext_UpdateSubresource(context, bitmap->resource, 0, dst_rect ? &box : NULL, src_data, pitch, 0);
-    ID3D11DeviceContext_Release(context);
-    ID3D11Device_Release(device);
+    ID3D11DeviceContext1_UpdateSubresource(bitmap->d3d_context, bitmap->resource, 0,
+            dst_rect ? &box : NULL, src_data, pitch, 0);
 
     return S_OK;
 }
@@ -279,8 +262,6 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_Map(ID2D1Bitmap1 *iface, D2D1_MAP_OP
 {
     struct d2d_bitmap *bitmap = impl_from_ID2D1Bitmap1(iface);
     D3D11_MAPPED_SUBRESOURCE mapped_resource;
-    ID3D11DeviceContext *context;
-    ID3D11Device *device;
     D3D11_MAP map_type;
     HRESULT hr;
 
@@ -306,15 +287,12 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_Map(ID2D1Bitmap1 *iface, D2D1_MAP_OP
         return E_INVALIDARG;
     }
 
-    ID3D11Resource_GetDevice(bitmap->resource, &device);
-    ID3D11Device_GetImmediateContext(device, &context);
-    if (SUCCEEDED(hr = ID3D11DeviceContext_Map(context, bitmap->resource, 0, map_type,
+    if (SUCCEEDED(hr = ID3D11DeviceContext1_Map(bitmap->d3d_context,
+            bitmap->resource, 0, map_type,
             0, &mapped_resource)))
     {
         bitmap->mapped_resource = mapped_resource;
     }
-    ID3D11DeviceContext_Release(context);
-    ID3D11Device_Release(device);
 
     if (FAILED(hr))
     {
@@ -402,6 +380,8 @@ static void d2d_bitmap_init(struct d2d_bitmap *bitmap, struct d2d_device_context
     bitmap->refcount = 1;
     ID2D1Factory_AddRef(bitmap->factory = context->factory);
     ID3D11Resource_AddRef(bitmap->resource = resource);
+    bitmap->d3d_context = context->d3d_context;
+    ID3D11DeviceContext1_AddRef(bitmap->d3d_context);
     bitmap->pixel_size = size;
     bitmap->format = desc->pixelFormat;
     bitmap->dpi_x = desc->dpiX;
