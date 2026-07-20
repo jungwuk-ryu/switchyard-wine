@@ -51,6 +51,7 @@ static BYTE DECLSPEC_ALIGN(4096) code_buffer[0x1000];
 
 UINT cs32_sel = 0;
 UINT ss32_sel = 0;
+UINT return_guard_target;
 
 static USHORT cs64_sel;
 static USHORT ds64_sel;
@@ -168,6 +169,19 @@ static void copy_context_64to32( I386_CONTEXT *ctx32, DWORD flags, AMD64_CONTEXT
 
 
 /**********************************************************************
+ *           return_32bit_guard
+ *
+ * Trap immediately if Rosetta decodes this 32-bit return stub in 64-bit
+ * mode. PUSH CS is valid in compatibility mode but invalid in long mode.
+ */
+extern void return_32bit_guard(void);
+__ASM_GLOBAL_FUNC( return_32bit_guard,
+                   ".byte 0x0e\n\t"              /* pushl %cs */
+                   ".byte 0x8d,0x64,0x24,0x04\n\t" /* leal 4(%esp),%esp */
+                   ".byte 0xc3" )                /* retl */
+
+
+/**********************************************************************
  *           syscall_32to64
  *
  * Execute a 64-bit syscall from 32-bit code, then return to 32-bit.
@@ -210,11 +224,21 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movl 0xb4(%r13),%ebp\n\t"   /* context->Ebp */
                    "btrl $0,-4(%r13)\n\t"       /* cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE */
                    "jc .Lsyscall_32to64_return\n\t"
+                   "movl return_guard_target(%rip),%ecx\n\t"
+                   "jecxz .Lsyscall_direct_return\n\t"
+                   "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
+                   "subl $4,%r14d\n\t"
+                   "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
+                   "movl %edx,(%r14)\n\t"
+                   "movl %ecx,(%rsp)\n\t"
+                   "jmp .Lsyscall_finish_return\n"
+                   ".Lsyscall_direct_return:\n\t"
                    "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
                    "movl %edx,(%rsp)\n\t"
+                   "movl 0xc4(%r13),%r14d\n"    /* context->Esp */
+                   ".Lsyscall_finish_return:\n\t"
                    "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
                    "movl %edx,4(%rsp)\n\t"
-                   "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
                    "ljmp *(%r14)\n"
                    ".Lsyscall_32to64_return:\n\t"
@@ -273,11 +297,21 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
                    "movl %eax,0xb0(%r13)\n\t"   /* context->Eax */
                    "btrl $0,-4(%r13)\n\t"       /* cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE */
                    "jc .Lsyscall_32to64_return\n\t"
+                   "movl return_guard_target(%rip),%ecx\n\t"
+                   "jecxz .Lunix_direct_return\n\t"
+                   "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
+                   "subl $4,%r14d\n\t"
+                   "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
+                   "movl %edx,(%r14)\n\t"
+                   "movl %ecx,(%rsp)\n\t"
+                   "jmp .Lunix_finish_return\n"
+                   ".Lunix_direct_return:\n\t"
                    "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
                    "movl %edx,(%rsp)\n\t"
+                   "movl 0xc4(%r13),%r14d\n"    /* context->Esp */
+                   ".Lunix_finish_return:\n\t"
                    "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
                    "movl %edx,4(%rsp)\n\t"
-                   "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
                    "ljmp *(%r14)" )
 
@@ -325,6 +359,7 @@ static void patch_macos_transition_entry( void *entry )
 
     wine_get_host_version( &sysname, NULL );
     if (strcmp( sysname, "Darwin" )) return;
+    return_guard_target = PtrToUlong( return_32bit_guard );
     if (NtProtectVirtualMemory( GetCurrentProcess(), &base, &size, PAGE_EXECUTE_READWRITE, &old_prot )) return;
     memcpy( entry, fault_entry, sizeof(fault_entry) );
     NtFlushInstructionCache( GetCurrentProcess(), entry, sizeof(fault_entry) );

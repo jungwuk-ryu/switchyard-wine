@@ -2321,6 +2321,12 @@ static BOOL recover_wow64_transition_fault( struct thread_data *data, ucontext_t
         0x41, 0x89, 0xbd, 0x9c, 0x00, 0x00, 0x00, /* movl %edi,0x9c(%r13) */
         0x41, 0x89, 0xb5, 0xa0, 0x00, 0x00, 0x00  /* movl %esi,0xa0(%r13) */
     };
+    static const BYTE return_guard[] =
+    {
+        0x0e,                                     /* pushl %cs */
+        0x8d, 0x64, 0x24, 0x04,                   /* leal 4(%esp),%esp */
+        0xc3                                      /* retl */
+    };
     static const BYTE thunk_prefix[] =
     {
         0x4c, 0x87, 0xf4,                         /* xchgq %r14,%rsp */
@@ -2402,8 +2408,42 @@ static BOOL recover_wow64_transition_fault( struct thread_data *data, ucontext_t
     }
     if (rec->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION)
     {
+        WOW64_CPURESERVED *cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
+        WOW_TEB *wow_teb = get_wow_teb( data->teb );
+        I386_CONTEXT *wow_context;
         ULONG_PTR guest_rsp = RSP_sig(sigcontext);
+        ULONG64 far_target;
+        ULONG return_target;
         BYTE fault_code[sizeof(fault_prefix)];
+
+        if ((CS_sig(sigcontext) == cs32_sel || CS_sig(sigcontext) == cs64_sel) &&
+            cpu && wow_teb && !(rip >> 32) &&
+            R13_sig(sigcontext) == (ULONG_PTR)(cpu + 1) &&
+            R14_sig(sigcontext) >= (ULONG_PTR)data->teb->Tib.StackLimit &&
+            R14_sig(sigcontext) <= (ULONG_PTR)data->teb->Tib.StackBase - sizeof(far_target))
+        {
+            wow_context = (I386_CONTEXT *)(cpu + 1);
+            if (wow_context->SegCs == cs32_sel &&
+                wow_context->Esp >= wow_teb->Tib.StackLimit + sizeof(return_target) &&
+                wow_context->Esp <= wow_teb->Tib.StackBase &&
+                guest_rsp == wow_context->Esp - sizeof(return_target) &&
+                virtual_uninterrupted_read_memory( (void *)rip, fault_code,
+                                                   sizeof(return_guard) ) == sizeof(return_guard) &&
+                !memcmp( fault_code, return_guard, sizeof(return_guard) ) &&
+                virtual_uninterrupted_read_memory( (void *)R14_sig(sigcontext), &far_target,
+                                                   sizeof(far_target) ) == sizeof(far_target) &&
+                far_target == ((ULONG64)wow_context->SegCs << 32 | (ULONG)rip) &&
+                virtual_uninterrupted_read_memory( (void *)guest_rsp, &return_target,
+                                                   sizeof(return_target) ) == sizeof(return_target) &&
+                return_target == wow_context->Eip)
+            {
+                TRACE_(seh)( "recovered stale WOW64 return guard at %04x:%08x\n",
+                             wow_context->SegCs, wow_context->Eip );
+                CS_sig(sigcontext) = cs32_sel;
+                leave_handler( data, sigcontext );
+                return TRUE;
+            }
+        }
 
         if (CS_sig(sigcontext) != cs32_sel && CS_sig(sigcontext) != cs64_sel) return FALSE;
         if (R14_sig(sigcontext) < (ULONG_PTR)data->teb->Tib.StackLimit ||
