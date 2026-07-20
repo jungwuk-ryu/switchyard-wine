@@ -231,6 +231,8 @@ extern NTSTATUS d3dkmt_destroy_sync( D3DKMT_HANDLE local );
 
 extern BOOL get_opengl_gpus( struct list *gpus );
 extern void cleanup_opengl_thread(void);
+extern BOOL set_foreign_window_pixel_format( HWND hwnd, int format );
+extern int get_foreign_window_pixel_format( HWND hwnd );
 
 /* winstation.c */
 

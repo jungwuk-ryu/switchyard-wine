@@ -99,8 +99,9 @@ static struct wgl_pixel_format *pixel_formats;
 static UINT formats_count, onscreen_count;
 
 /* A foreign HWND has no process-local WND object, but its OpenGL producer
- * still needs the same persistent state that WND.current_drawable,
- * WND.unused_drawable, and WND.swap_interval provide to a local window.
+ * still needs the same persistent state that WND.pixel_format,
+ * WND.current_drawable, WND.unused_drawable, and WND.swap_interval provide to
+ * a local window.
  *
  * Cross-process renderers can alternate between a foreign presentation HWND
  * and process-local helper windows.  Do not tear down the redirected surface
@@ -114,6 +115,7 @@ struct foreign_window_opengl_state
     DWORD owner_process;
     struct opengl_drawable *current_drawable;
     struct opengl_drawable *unused_drawable;
+    int pixel_format;
     int swap_interval;
 };
 
@@ -141,6 +143,7 @@ static struct foreign_window_opengl_state *get_foreign_window_opengl_state_locke
         state->unused_drawable = NULL;
         state->owner_thread = owner_thread;
         state->owner_process = owner_process;
+        state->pixel_format = 0;
         state->swap_interval = 0;
         return state;
     }
@@ -183,6 +186,45 @@ static BOOL get_foreign_window_identity( HWND hwnd, DWORD *owner_thread, DWORD *
     *owner_process = 0;
     *owner_thread = NtUserGetWindowThread( hwnd, owner_process );
     return *owner_thread && *owner_process;
+}
+
+BOOL set_foreign_window_pixel_format( HWND hwnd, int format )
+{
+    struct opengl_drawable *stale_current = NULL, *stale_unused = NULL;
+    struct foreign_window_opengl_state *state;
+    DWORD owner_thread, owner_process;
+
+    if (!get_foreign_window_identity( hwnd, &owner_thread, &owner_process )) return FALSE;
+
+    pthread_mutex_lock( &foreign_window_opengl_mutex );
+    state = get_foreign_window_opengl_state_locked( hwnd, owner_thread, owner_process,
+                                                     TRUE, &stale_current, &stale_unused );
+    if (state) state->pixel_format = format;
+    pthread_mutex_unlock( &foreign_window_opengl_mutex );
+
+    if (stale_current) opengl_drawable_release( stale_current );
+    if (stale_unused) opengl_drawable_release( stale_unused );
+    return !!state;
+}
+
+int get_foreign_window_pixel_format( HWND hwnd )
+{
+    struct opengl_drawable *stale_current = NULL, *stale_unused = NULL;
+    struct foreign_window_opengl_state *state;
+    DWORD owner_thread, owner_process;
+    int format = 0;
+
+    if (!get_foreign_window_identity( hwnd, &owner_thread, &owner_process )) return -1;
+
+    pthread_mutex_lock( &foreign_window_opengl_mutex );
+    state = get_foreign_window_opengl_state_locked( hwnd, owner_thread, owner_process,
+                                                     FALSE, &stale_current, &stale_unused );
+    if (state) format = state->pixel_format;
+    pthread_mutex_unlock( &foreign_window_opengl_mutex );
+
+    if (stale_current) opengl_drawable_release( stale_current );
+    if (stale_unused) opengl_drawable_release( stale_unused );
+    return format;
 }
 
 static void set_foreign_window_opengl_drawable( HWND hwnd,

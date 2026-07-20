@@ -1588,7 +1588,15 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
     WND *win = get_win_ptr( hwnd );
     BOOL changed = FALSE;
 
-    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+    if (win == WND_OTHER_PROCESS)
+    {
+        BOOL ret = set_foreign_window_pixel_format( hwnd, format );
+
+        if (!ret) WARN( "failed to cache format %d on foreign win %p\n", format, hwnd );
+        NtUserPostMessage( hwnd, WM_WINE_SETPIXELFORMAT, format, internal );
+        return ret;
+    }
+    if (!win || win == WND_DESKTOP)
     {
         WARN( "setting format %d on win %p semi-stub!\n", format, hwnd );
         NtUserPostMessage( hwnd, WM_WINE_SETPIXELFORMAT, format, internal );
@@ -1607,7 +1615,8 @@ int get_window_pixel_format( HWND hwnd )
     WND *win = get_win_ptr( hwnd );
     int ret;
 
-    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+    if (win == WND_OTHER_PROCESS) return get_foreign_window_pixel_format( hwnd );
+    if (!win || win == WND_DESKTOP)
     {
         WARN( "getting format on win %p not supported\n", hwnd );
         return -1;
