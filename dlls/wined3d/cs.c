@@ -3404,14 +3404,16 @@ static void *wined3d_cs_mt_require_space(struct wined3d_device_context *context,
 static void wined3d_cs_mt_finish(struct wined3d_device_context *context, enum wined3d_cs_queue_id queue_id)
 {
     struct wined3d_cs *cs = wined3d_cs_from_context(context);
+    struct wined3d_cs_queue *queue = &cs->queue[queue_id];
     unsigned int spin_count = 0;
+    ULONG tail;
 
     if (cs->thread_id == GetCurrentThreadId())
         return wined3d_cs_st_finish(context, queue_id);
 
     TRACE_(d3d_perf)("Waiting for queue %u to be empty.\n", queue_id);
-    while (cs->queue[queue_id].head != *(volatile ULONG *)&cs->queue[queue_id].tail)
-        wined3d_pause(&spin_count);
+    while (queue->head != (tail = *(volatile ULONG *)&queue->tail))
+        wined3d_cs_queue_wait_tail(queue, tail, &spin_count);
     TRACE_(d3d_perf)("Queue is now empty.\n");
 }
 
@@ -3511,6 +3513,8 @@ static inline bool wined3d_cs_execute_next(struct wined3d_cs *cs, struct wined3d
     }
 
     InterlockedExchange((LONG *)&queue->tail, tail);
+    if (InterlockedCompareExchange(&queue->waiters, 0, 0))
+        RtlWakeAddressAll(&queue->tail);
     return true;
 }
 
@@ -3593,8 +3597,12 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
         run = wined3d_cs_execute_next(cs, queue);
     }
 
-    cs->queue[WINED3D_CS_QUEUE_MAP].tail = cs->queue[WINED3D_CS_QUEUE_MAP].head;
-    cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
+    InterlockedExchange((LONG *)&cs->queue[WINED3D_CS_QUEUE_MAP].tail,
+            cs->queue[WINED3D_CS_QUEUE_MAP].head);
+    InterlockedExchange((LONG *)&cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail,
+            cs->queue[WINED3D_CS_QUEUE_DEFAULT].head);
+    RtlWakeAddressAll(&cs->queue[WINED3D_CS_QUEUE_MAP].tail);
+    RtlWakeAddressAll(&cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail);
     TRACE("Stopped.\n");
     FreeLibraryAndExitThread(wined3d_module, 0);
 }
@@ -3719,6 +3727,8 @@ void wined3d_cs_destroy(struct wined3d_cs *cs)
     if (cs->thread)
     {
         wined3d_cs_emit_stop(cs);
+        if (WaitForSingleObject(cs->thread, INFINITE) == WAIT_FAILED)
+            ERR("Waiting for command stream thread failed, error %lu.\n", GetLastError());
         CloseHandle(cs->thread);
         if (cs->event && !CloseHandle(cs->event))
             ERR("Closing event failed.\n");
