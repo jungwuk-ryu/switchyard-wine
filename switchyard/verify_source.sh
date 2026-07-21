@@ -33,7 +33,7 @@ added_files="$({
 # These source-only smoke tests exercise an external runtime interface and do not
 # contain or distribute toolkit artifacts.
 toolkit_candidate_files="$(printf '%s\n' "$added_files" |
-  grep -Ev '^switchyard/tests/d3dmetal_dxgi_resource_smoke(\.c|_test\.sh)$' || true)"
+  grep -Ev '^switchyard/tests/d3dmetal_(d3d12|dxgi_resource)_smoke(\.c|_test\.sh)$' || true)"
 if printf '%s\n' "$toolkit_candidate_files" | grep -Eiq '(^|/)(Game[[:space:]_-]*Porting[[:space:]_-]*Toolkit|GPTK)(/|$)|d3dmetal|libd3dshared|metalirconverter'; then
   fail "tracked file names suggest proprietary Apple Game Porting Toolkit content"
 fi
