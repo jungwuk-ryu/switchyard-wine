@@ -626,6 +626,14 @@ static bool swapchain_present_is_partial_copy(const struct wined3d_swapchain *sw
             && swapchain_present_is_partial(swapchain, dst_rect);
 }
 
+static bool swapchain_window_is_foreign(const struct wined3d_swapchain *swapchain)
+{
+    DWORD process_id = 0;
+
+    return GetWindowThreadProcessId(swapchain->win_handle, &process_id)
+            && process_id != GetCurrentProcessId();
+}
+
 static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
         const RECT *src_rect, const RECT *dst_rect, unsigned int swap_interval, uint32_t flags)
 {
@@ -649,7 +657,8 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format - 1];
     if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
             || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
-            && swapchain_present_is_partial(swapchain, dst_rect)))
+            && swapchain_present_is_partial(swapchain, dst_rect)
+            && !swapchain_window_is_foreign(swapchain)))
     {
         swapchain_blit_gdi(swapchain, context, src_rect, dst_rect);
     }
