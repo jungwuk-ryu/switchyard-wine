@@ -12,7 +12,7 @@ Switchyard Wine is an independent downstream project. It is not affiliated with 
 
 ## Why Switchyard Wine
 
-Switchyard Wine grew out of the repeated friction of running Windows games on macOS. Installing Wine was rarely the end of the setup: a game might require launcher-specific command-line arguments, while storefronts such as Steam or Battle.net could fail before the game itself started. Earlier experience with Wine on Linux exposed the same pattern in another form, with users expected to find a suitable Wine version for each game and install fonts or other runtime pieces by hand.
+Switchyard Wine grew out of the repeated friction of running Windows games on macOS. Installing Wine was rarely the end of the setup: users might need launcher-specific workarounds such as `--disable-gpu`, while storefronts such as Steam or Battle.net could fail before the game itself started. Earlier experience with Wine on Linux exposed the same pattern in another form, with users expected to find a suitable Wine version for each game and install fonts or other runtime pieces by hand.
 
 Switchyard moves that recurring compatibility work out of each user's setup and into a maintained Wine runtime. When practical, the project fixes Wine or the integrated runtime instead of asking every user to reproduce the same per-application workaround. The goal is for a user to install the current Switchyard runtime, select a Windows executable, and run it with as little manual configuration as possible.
 
@@ -32,6 +32,8 @@ Switchyard Wine is not a rolling mirror of the latest WineHQ release. A newer up
 - `switchyard/`: source verification and reproducible local runtime build tooling
 - `docs/architecture.md`: application, runtime, and user-provided software boundaries
 - `docs/building.md`: supported local build workflow
+- `docs/compatibility.md`: reported application compatibility, runtime identity, and
+  reference environment
 - `docs/provenance.md`: upstream base, commit history, and licensing provenance
 - `docs/troubleshooting-unity-games.md`: a reusable crash-triage case study for
   Unity, D3DMetal, DbgHelp, and long managed-runtime paths
