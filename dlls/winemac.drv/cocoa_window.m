@@ -689,6 +689,30 @@ static void WineCompositorRemoveNode(uint64_t nodeId, uint64_t newRevision, BOOL
     [CATransaction flush];
 }
 
+static void WineCompositorPresentNode(uint64_t nodeId, unsigned int contextId)
+{
+    NSNumber* key = [NSNumber numberWithUnsignedLongLong:nodeId];
+    WineCompositorNode* node;
+
+    NSCAssert([NSThread isMainThread], @"compositor commands must run on the main thread");
+    node = [compositorNodes objectForKey:key];
+    if (!node || node->contextId != contextId || !node->view ||
+        node->clipContainer.superlayer != [node->view compositorLayer])
+        return;
+
+    /* Changing a layer in the exported CAContext does not itself invalidate
+       the receiving process' layer-backed NSView. Mark both ends of the host
+       subtree dirty and let WineWindow's display link coalesce frame pulses at
+       the native display rate. */
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [node->remoteHost setNeedsDisplay];
+    [node->clipContainer setNeedsDisplay];
+    [CATransaction commit];
+    [node->view setNeedsDisplayInRect:NSRectFromCGRect(node->clipContainer.frame)];
+    [CATransaction flush];
+}
+
 static void WineCompositorDetachView(WineContentView* view)
 {
     NSArray* nodes;
@@ -4501,6 +4525,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 
 - (instancetype) initWithSourceHwnd:(void*)newSourceHwnd bounds:(CGRect)bounds opaque:(BOOL)opaque;
 - (void) presentSurface:(IOSurfaceRef)surface bounds:(CGRect)bounds;
+- (void) notifyRemoteLayerPresented;
 - (void) detachRemoteLayer;
 - (void) drainPendingSurface;
 
@@ -4692,6 +4717,14 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     if (schedule) OnMainThreadAsync(^{ [self drainPendingSurface]; });
 }
 
+- (void) notifyRemoteLayerPresented
+{
+    BOOL notify;
+
+    @synchronized(self) { notify = registered && !invalidated; }
+    if (notify) macdrv_present_remote_layer(source_hwnd, context_id, true);
+}
+
 - (void) detachRemoteLayer
 {
     BOOL release;
@@ -4739,6 +4772,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 
 - (instancetype) initWithHwnd:(void*)newHwnd bounds:(CGRect)bounds;
 - (BOOL) setColorImage:(CGImageRef)image bounds:(CGRect)bounds;
+- (void) notifyRemoteLayerPresented;
 - (void) detachRemoteLayer;
 - (void) drainPendingImage;
 
@@ -4899,6 +4933,14 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     return result;
 }
 
+- (void) notifyRemoteLayerPresented
+{
+    BOOL notify;
+
+    @synchronized(self) { notify = registered && !invalidated; }
+    if (notify) macdrv_present_remote_layer(source_hwnd, context_id, false);
+}
+
 - (void) detachRemoteLayer
 {
     BOOL release;
@@ -4957,6 +4999,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 
 - (instancetype) initWithSourceHwnd:(void*)sourceHwnd bounds:(CGRect)bounds;
 - (void) ensureRemoteLayerRegistered;
+- (void) notifyRemoteLayerPresented;
 - (void) detachRemoteLayer;
 
 @end
@@ -4972,17 +5015,12 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     {
         CAContextSwapChain* owner = [compositorOwner retain];
 
-        if ([drawable respondsToSelector:@selector(addPresentedHandler:)])
-            [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
-                [owner ensureRemoteLayerRegistered];
-                [owner release];
-                (void)presented;
-            }];
-        else
-        {
-            [owner ensureRemoteLayerRegistered];
-            [owner release];
-        }
+        /* nextDrawable is entered from the Wine rendering thread, where the
+           Win32 TEB is installed. Native presented handlers may run on an
+           arbitrary Metal thread and therefore must not call NtUser APIs. */
+        [owner ensureRemoteLayerRegistered];
+        [owner notifyRemoteLayerPresented];
+        [owner release];
     }
     return drawable;
 }
@@ -5069,6 +5107,14 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     }
     if (release_attached)
         macdrv_release_remote_layer(source_hwnd, context_id, true);
+}
+
+- (void) notifyRemoteLayerPresented
+{
+    BOOL notify;
+
+    @synchronized(self) { notify = registered && !invalidated; }
+    if (notify) macdrv_present_remote_layer(source_hwnd, context_id, true);
 }
 
 - (void) detachRemoteLayer
@@ -5176,6 +5222,18 @@ void macdrv_window_remove_compositor_node(macdrv_window w, uint64_t node_id,
 }
 }
 
+void macdrv_window_present_compositor_node(uint64_t node_id, unsigned int context_id,
+                                           uint64_t present_serial)
+{
+@autoreleasepool
+{
+    OnMainThreadAsync(^{
+        WineCompositorPresentNode(node_id, context_id);
+        macdrv_remote_layer_present_complete(node_id, context_id, present_serial);
+    });
+}
+}
+
 void macdrv_window_remove_all_ca_layer_host_views(macdrv_window w)
 {
 @autoreleasepool
@@ -5198,7 +5256,10 @@ macdrv_image_layer macdrv_create_image_layer(void* hwnd, CGRect bounds)
 
 bool macdrv_image_layer_set_color_image(macdrv_image_layer image_layer, CGImageRef image, CGRect bounds)
 {
-    return [(CAContextImageLayer*)image_layer setColorImage:image bounds:bounds];
+    BOOL result = [(CAContextImageLayer*)image_layer setColorImage:image bounds:bounds];
+
+    if (result) [(CAContextImageLayer*)image_layer notifyRemoteLayerPresented];
+    return result;
 }
 
 void macdrv_destroy_image_layer(macdrv_image_layer image_layer)
@@ -5218,6 +5279,7 @@ macdrv_iosurface_layer macdrv_create_iosurface_layer(void* source_hwnd, CGRect b
 void macdrv_iosurface_layer_present(macdrv_iosurface_layer layer, void* io_surface, CGRect bounds)
 {
     [(CAContextIOSurfaceLayer*)layer presentSurface:(IOSurfaceRef)io_surface bounds:bounds];
+    [(CAContextIOSurfaceLayer*)layer notifyRemoteLayerPresented];
 }
 
 void macdrv_destroy_iosurface_layer(macdrv_iosurface_layer layer)

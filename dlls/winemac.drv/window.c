@@ -68,6 +68,8 @@ struct macdrv_remote_layer
     double z_position;
     BOOL displayed;
     BOOL endpoint_dirty;
+    BOOL present_pending;
+    UINT64 present_serial;
 };
 
 static pthread_mutex_t remote_layer_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2350,6 +2352,11 @@ static BOOL remote_layer_attach(HWND source, unsigned int context_id,
         entry->next = remote_layers;
         remote_layers = entry;
     }
+    if (entry->context_id != context_id)
+    {
+        entry->present_pending = FALSE;
+        entry->present_serial = 0;
+    }
     entry->context_id = context_id;
     entry->endpoint_size = endpoint_size;
     entry->endpoint_dirty = TRUE;
@@ -2396,6 +2403,57 @@ static BOOL remote_layer_release(HWND source, unsigned int context_id,
     return TRUE;
 }
 
+static BOOL remote_layer_present(HWND source, unsigned int context_id,
+                                 enum macdrv_compositor_plane plane)
+{
+    struct macdrv_remote_layer *entry;
+    UINT64 node_id = 0, present_serial = 0;
+    BOOL handled = FALSE;
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    for (entry = remote_layers; entry; entry = entry->next)
+    {
+        if (entry->source != source || entry->plane != plane) continue;
+        handled = TRUE;
+        if (entry->context_id == context_id && entry->host && entry->displayed)
+        {
+            present_serial = ++entry->present_serial;
+            if (!entry->present_pending)
+            {
+                entry->present_pending = TRUE;
+                node_id = entry->node_id;
+            }
+        }
+        break;
+    }
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    if (node_id)
+        macdrv_window_present_compositor_node(node_id, context_id, present_serial);
+    return handled;
+}
+
+void macdrv_remote_layer_present_complete(uint64_t node_id, unsigned int context_id,
+                                           uint64_t present_serial)
+{
+    struct macdrv_remote_layer *entry;
+    UINT64 next_serial = 0;
+
+    pthread_mutex_lock(&remote_layer_mutex);
+    if ((entry = remote_layer_find_node_locked(node_id)) &&
+        entry->context_id == context_id && entry->present_pending)
+    {
+        if (entry->present_serial > present_serial)
+            next_serial = entry->present_serial;
+        else
+            entry->present_pending = FALSE;
+    }
+    pthread_mutex_unlock(&remote_layer_mutex);
+
+    if (next_serial)
+        macdrv_window_present_compositor_node(node_id, context_id, next_serial);
+}
+
 
 /**********************************************************************
  *              WindowMessage   (MACDRV.@)
@@ -2437,6 +2495,13 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                              MACDRV_COMPOSITOR_GPU : MACDRV_COMPOSITOR_DIB;
 
         return remote_layer_release(hwnd, (unsigned int)wp, plane);
+    }
+    case WM_MACDRV_PRESENT_REMOTE_DIB_LAYER:
+    case WM_MACDRV_PRESENT_REMOTE_GPU_LAYER:
+    {
+        enum macdrv_compositor_plane plane = msg == WM_MACDRV_PRESENT_REMOTE_GPU_LAYER ?
+                                             MACDRV_COMPOSITOR_GPU : MACDRV_COMPOSITOR_DIB;
+        return remote_layer_present(hwnd, (unsigned int)wp, plane);
     }
     }
 
@@ -2483,6 +2548,16 @@ bool macdrv_release_remote_layer(void* source_ptr, unsigned int context_id, bool
                                      gpu ? WM_MACDRV_RELEASE_REMOTE_GPU_LAYER :
                                            WM_MACDRV_RELEASE_REMOTE_DIB_LAYER,
                                      context_id, size);
+}
+
+bool macdrv_present_remote_layer(void* source_ptr, unsigned int context_id, bool gpu)
+{
+    HWND source = (HWND)source_ptr;
+
+    if (!source || !context_id || !NtUserGetWindowThread(source, NULL)) return false;
+    return NtUserPostMessage(source, gpu ? WM_MACDRV_PRESENT_REMOTE_GPU_LAYER :
+                                          WM_MACDRV_PRESENT_REMOTE_DIB_LAYER,
+                             context_id, 0);
 }
 
 
