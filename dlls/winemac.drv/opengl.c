@@ -1584,6 +1584,13 @@ static struct foreign_surface_backing *foreign_surface_backing_create(int format
     }
     if (i == backing->color_count)
     {
+        /* The HWND host can belong to a different process than its WGL
+           renderer. Keep render targets private, but allow the final triple-
+           buffered presentation surfaces to be resolved by the host. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CFDictionarySetValue(properties, kIOSurfaceIsGlobal, kCFBooleanTrue);
+#pragma clang diagnostic pop
         for (i = 0; i < ARRAY_SIZE(backing->present_surfaces); i++)
         {
             backing->present_surfaces[i] = IOSurfaceCreate(properties);

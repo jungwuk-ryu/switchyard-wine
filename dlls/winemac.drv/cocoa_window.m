@@ -201,6 +201,10 @@ static inline BOOL stage_manager_enabled(void)
 @end
 
 
+@interface CALayer (WineContentsChangedPrivate)
+    - (void) setContentsChanged;
+@end
+
 @interface WineDisplayLink : NSObject
 {
     CGDirectDisplayID _displayID;
@@ -381,6 +385,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     WineContentView* view; /* assign; a view detaches its nodes before dealloc */
     CALayer* clipContainer;
     CALayerHost* remoteHost;
+    CALayer* sharedSurfaceLayer;
+    IOSurfaceRef sharedSurface;
     CAShapeLayer* visibilityMask;
 }
 @end
@@ -537,7 +543,10 @@ static void WineCompositorDetachView(WineContentView* view);
     [remoteHost setContextId:0];
     [clipContainer removeFromSuperlayer];
     [remoteHost removeFromSuperlayer];
+    [sharedSurfaceLayer removeFromSuperlayer];
+    if (sharedSurface) CFRelease(sharedSurface);
     [remoteHost release];
+    [sharedSurfaceLayer release];
     [visibilityMask release];
     [clipContainer release];
     [super dealloc];
@@ -564,8 +573,10 @@ static WineCompositorNode* WineCompositorCreateNode(void)
 
     node->clipContainer = [[CALayer alloc] init];
     node->remoteHost = [[CALayerHost alloc] init];
+    node->sharedSurfaceLayer = [[CALayer alloc] init];
     node->visibilityMask = [[CAShapeLayer alloc] init];
-    if (!node->clipContainer || !node->remoteHost || !node->visibilityMask) return nil;
+    if (!node->clipContainer || !node->remoteHost || !node->sharedSurfaceLayer ||
+        !node->visibilityMask) return nil;
 
     node->clipContainer.anchorPoint = CGPointMake(0, 0);
     node->clipContainer.masksToBounds = YES;
@@ -578,7 +589,15 @@ static WineCompositorNode* WineCompositorCreateNode(void)
     node->remoteHost.magnificationFilter = kCAFilterNearest;
     node->remoteHost.minificationFilter = kCAFilterNearest;
     node->remoteHost.contentsScale = retina_on ? 2.0 : 1.0;
+    node->sharedSurfaceLayer.anchorPoint = CGPointMake(0, 0);
+    node->sharedSurfaceLayer.actions = disabledActions;
+    node->sharedSurfaceLayer.contentsGravity = kCAGravityResize;
+    node->sharedSurfaceLayer.magnificationFilter = kCAFilterNearest;
+    node->sharedSurfaceLayer.minificationFilter = kCAFilterNearest;
+    node->sharedSurfaceLayer.contentsScale = retina_on ? 2.0 : 1.0;
+    node->sharedSurfaceLayer.hidden = YES;
     [node->clipContainer addSublayer:node->remoteHost];
+    [node->clipContainer addSublayer:node->sharedSurfaceLayer];
     return node;
 }
 
@@ -610,6 +629,14 @@ static void WineCompositorApplyNode(WineContentView* view, uint64_t nodeId,
     {
         [node->remoteHost setContextId:0];
         [node->remoteHost setContextId:contextId];
+        node->remoteHost.hidden = NO;
+        node->sharedSurfaceLayer.hidden = YES;
+        node->sharedSurfaceLayer.contents = nil;
+        if (node->sharedSurface)
+        {
+            CFRelease(node->sharedSurface);
+            node->sharedSurface = NULL;
+        }
         node->contextId = contextId;
     }
     node->revision = newRevision;
@@ -647,6 +674,7 @@ static void WineCompositorApplyNode(WineContentView* view, uint64_t nodeId,
         node->remoteHost.frame = CGRectMake(contentFrame.origin.x - clipFrame.origin.x,
                                              contentFrame.origin.y - clipFrame.origin.y,
                                              contentFrame.size.width, contentFrame.size.height);
+        node->sharedSurfaceLayer.frame = node->remoteHost.frame;
     }
     [CATransaction commit];
     [CATransaction flush];
@@ -689,10 +717,12 @@ static void WineCompositorRemoveNode(uint64_t nodeId, uint64_t newRevision, BOOL
     [CATransaction flush];
 }
 
-static void WineCompositorPresentNode(uint64_t nodeId, unsigned int contextId)
+static void WineCompositorPresentNode(uint64_t nodeId, unsigned int contextId,
+                                      unsigned int surfaceId, BOOL surfaceOpaque)
 {
     NSNumber* key = [NSNumber numberWithUnsignedLongLong:nodeId];
     WineCompositorNode* node;
+    IOSurfaceRef surface = NULL;
 
     NSCAssert([NSThread isMainThread], @"compositor commands must run on the main thread");
     node = [compositorNodes objectForKey:key];
@@ -700,17 +730,42 @@ static void WineCompositorPresentNode(uint64_t nodeId, unsigned int contextId)
         node->clipContainer.superlayer != [node->view compositorLayer])
         return;
 
-    /* Changing a layer in the exported CAContext does not itself invalidate
-       the receiving process' layer-backed NSView. Mark both ends of the host
-       subtree dirty and let WineWindow's display link coalesce frame pulses at
-       the native display rate. */
+    if (surfaceId) surface = IOSurfaceLookup(surfaceId);
+
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    [node->remoteHost setNeedsDisplay];
-    [node->clipContainer setNeedsDisplay];
+    if (surface)
+    {
+        /* CAContext hosts may keep showing an old IOSurface until an unrelated
+           WindowServer transition recomposites their remote tree. Foreign WGL
+           presentation surfaces are explicitly shareable, so publish the
+           newest surface on a process-local layer instead. Updating a local
+           layer participates in the host window's current transaction and
+           does not depend on focus or window ordering changes. */
+        if (node->sharedSurface) CFRelease(node->sharedSurface);
+        node->sharedSurface = surface;
+        CFRetain(node->sharedSurface);
+        node->sharedSurfaceLayer.opaque = surfaceOpaque;
+        node->sharedSurfaceLayer.contents = (id)surface;
+        [node->sharedSurfaceLayer setContentsChanged];
+        node->sharedSurfaceLayer.hidden = NO;
+        node->remoteHost.hidden = YES;
+    }
+    else
+    {
+        node->sharedSurfaceLayer.hidden = YES;
+        node->sharedSurfaceLayer.contents = nil;
+        if (node->sharedSurface)
+        {
+            CFRelease(node->sharedSurface);
+            node->sharedSurface = NULL;
+        }
+        node->remoteHost.hidden = NO;
+        [node->remoteHost setNeedsDisplay];
+    }
     [CATransaction commit];
-    [node->view setNeedsDisplayInRect:NSRectFromCGRect(node->clipContainer.frame)];
     [CATransaction flush];
+    if (surface) CFRelease(surface);
 }
 
 static void WineCompositorDetachView(WineContentView* view)
@@ -1050,7 +1105,11 @@ static void WineCompositorDetachView(WineContentView* view)
         [self setLayerRetinaProperties:mode];
 
         for (WineCompositorNode* node in [compositorNodes allValues])
-            if (node->view == self) node->remoteHost.contentsScale = mode ? 2.0 : 1.0;
+            if (node->view == self)
+            {
+                node->remoteHost.contentsScale = mode ? 2.0 : 1.0;
+                node->sharedSurfaceLayer.contentsScale = mode ? 2.0 : 1.0;
+            }
 
         [super setRetinaMode:mode];
     }
@@ -4515,6 +4574,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     BOOL registering;
     BOOL invalidated;
     BOOL present_scheduled;
+    BOOL surface_opaque;
     CGRect layer_bounds;
     IOSurfaceRef pending_surface;
     CGRect pending_bounds;
@@ -4525,7 +4585,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 
 - (instancetype) initWithSourceHwnd:(void*)newSourceHwnd bounds:(CGRect)bounds opaque:(BOOL)opaque;
 - (void) presentSurface:(IOSurfaceRef)surface bounds:(CGRect)bounds;
-- (void) notifyRemoteLayerPresented;
+- (void) notifyRemoteLayerPresented:(IOSurfaceRef)surface;
 - (void) detachRemoteLayer;
 - (void) drainPendingSurface;
 
@@ -4570,7 +4630,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
        when RGB contains the complete frame. Treat an HWND hosted by its own
        native root as opaque, while preserving alpha for child/owned popup
        surfaces that are actually composited over it. */
-    surface_layer.opaque = opaque;
+    surface_layer.opaque = surface_opaque = opaque;
 
     /* A CAContext can export a layer tree without an NSWindow.  Keeping this
        context independent from AppKit window lifetime is the core contract of
@@ -4717,12 +4777,14 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     if (schedule) OnMainThreadAsync(^{ [self drainPendingSurface]; });
 }
 
-- (void) notifyRemoteLayerPresented
+- (void) notifyRemoteLayerPresented:(IOSurfaceRef)surface
 {
     BOOL notify;
 
     @synchronized(self) { notify = registered && !invalidated; }
-    if (notify) macdrv_present_remote_layer(source_hwnd, context_id, true);
+    if (notify)
+        macdrv_present_remote_layer(source_hwnd, context_id, true, IOSurfaceGetID(surface),
+                                    surface_opaque);
 }
 
 - (void) detachRemoteLayer
@@ -4938,7 +5000,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     BOOL notify;
 
     @synchronized(self) { notify = registered && !invalidated; }
-    if (notify) macdrv_present_remote_layer(source_hwnd, context_id, false);
+    if (notify) macdrv_present_remote_layer(source_hwnd, context_id, false, 0, false);
 }
 
 - (void) detachRemoteLayer
@@ -5114,7 +5176,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     BOOL notify;
 
     @synchronized(self) { notify = registered && !invalidated; }
-    if (notify) macdrv_present_remote_layer(source_hwnd, context_id, true);
+    if (notify) macdrv_present_remote_layer(source_hwnd, context_id, true, 0, false);
 }
 
 - (void) detachRemoteLayer
@@ -5223,12 +5285,13 @@ void macdrv_window_remove_compositor_node(macdrv_window w, uint64_t node_id,
 }
 
 void macdrv_window_present_compositor_node(uint64_t node_id, unsigned int context_id,
-                                           uint64_t present_serial)
+                                           uint64_t present_serial, unsigned int surface_id,
+                                           bool surface_opaque)
 {
 @autoreleasepool
 {
     OnMainThreadAsync(^{
-        WineCompositorPresentNode(node_id, context_id);
+        WineCompositorPresentNode(node_id, context_id, surface_id, surface_opaque);
         macdrv_remote_layer_present_complete(node_id, context_id, present_serial);
     });
 }
@@ -5279,7 +5342,7 @@ macdrv_iosurface_layer macdrv_create_iosurface_layer(void* source_hwnd, CGRect b
 void macdrv_iosurface_layer_present(macdrv_iosurface_layer layer, void* io_surface, CGRect bounds)
 {
     [(CAContextIOSurfaceLayer*)layer presentSurface:(IOSurfaceRef)io_surface bounds:bounds];
-    [(CAContextIOSurfaceLayer*)layer notifyRemoteLayerPresented];
+    [(CAContextIOSurfaceLayer*)layer notifyRemoteLayerPresented:(IOSurfaceRef)io_surface];
 }
 
 void macdrv_destroy_iosurface_layer(macdrv_iosurface_layer layer)

@@ -562,9 +562,11 @@ extern void macdrv_window_remove_all_ca_layer_host_views(macdrv_window w);
 extern bool macdrv_attach_remote_layer(void* source_hwnd, unsigned int context_id, bool gpu,
                                        CGSize endpoint_size);
 extern bool macdrv_release_remote_layer(void* source_hwnd, unsigned int context_id, bool gpu);
-extern bool macdrv_present_remote_layer(void* source_hwnd, unsigned int context_id, bool gpu);
+extern bool macdrv_present_remote_layer(void* source_hwnd, unsigned int context_id, bool gpu,
+                                        unsigned int surface_id, bool surface_opaque);
 extern void macdrv_window_present_compositor_node(uint64_t node_id, unsigned int context_id,
-                                                   uint64_t present_serial);
+                                                   uint64_t present_serial, unsigned int surface_id,
+                                                   bool surface_opaque);
 extern void macdrv_remote_layer_present_complete(uint64_t node_id, unsigned int context_id,
                                                   uint64_t present_serial);
 extern macdrv_image_layer macdrv_create_image_layer(void* hwnd, CGRect bounds);
