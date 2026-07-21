@@ -42,6 +42,7 @@
 #include <OpenGL/glu.h>
 #include <OpenGL/CGLRenderers.h>
 #include <dlfcn.h>
+#include <mach/mach_time.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 
@@ -129,13 +130,17 @@ struct foreign_surface_target
     unsigned int            drawable_refs;
     macdrv_iosurface_layer  layer;
     struct foreign_surface_backing *current;
+    pthread_mutex_t         pacing_mutex;
     pthread_mutex_t         present_mutex;
     unsigned int            present_count;
+    uint64_t                next_present_time;
     BOOL                    suspended;
 };
 
 static pthread_mutex_t foreign_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t foreign_surface_frame_period_once = PTHREAD_ONCE_INIT;
 static struct foreign_surface_target *foreign_surface_targets;
+static uint64_t foreign_surface_frame_period;
 
 static struct gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
 {
@@ -1512,11 +1517,56 @@ static void foreign_surface_target_retain(struct foreign_surface_target *target)
     InterlockedIncrement(&target->refs);
 }
 
+static void foreign_surface_frame_period_init(void)
+{
+    mach_timebase_info_data_t timebase;
+
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.numer)
+        return;
+    foreign_surface_frame_period = ((1000000000ull / foreign_surface_max_frame_rate) *
+            timebase.denom + timebase.numer - 1) / timebase.numer;
+}
+
+static void foreign_surface_target_lock_present(struct foreign_surface_target *target)
+{
+    uint64_t now;
+
+    if (!foreign_surface_max_frame_rate)
+    {
+        pthread_mutex_lock(&target->present_mutex);
+        return;
+    }
+
+    pthread_once(&foreign_surface_frame_period_once, foreign_surface_frame_period_init);
+    if (!foreign_surface_frame_period)
+    {
+        pthread_mutex_lock(&target->present_mutex);
+        return;
+    }
+
+    /* Foreign WGL surfaces are not attached to a native CGL drawable, so the
+       native swap interval cannot provide back-pressure.  Serialize producers
+       while reserving an opt-in frame slot, but do not block resize or suspend
+       updates on present_mutex while waiting for the deadline. */
+    pthread_mutex_lock(&target->pacing_mutex);
+    now = mach_absolute_time();
+    while (target->next_present_time > now)
+    {
+        mach_wait_until(target->next_present_time);
+        now = mach_absolute_time();
+    }
+
+    pthread_mutex_lock(&target->present_mutex);
+    target->next_present_time = mach_absolute_time() + foreign_surface_frame_period;
+    pthread_mutex_unlock(&target->pacing_mutex);
+}
+
 static void foreign_surface_target_release(struct foreign_surface_target *target)
 {
     if (!target || InterlockedDecrement(&target->refs)) return;
     if (target->layer) macdrv_destroy_iosurface_layer(target->layer);
     foreign_surface_backing_release(target->current);
+    pthread_mutex_destroy(&target->pacing_mutex);
     pthread_mutex_destroy(&target->present_mutex);
     free(target);
 }
@@ -1675,6 +1725,7 @@ static BOOL foreign_surface_target_acquire(HWND hwnd, int format,
         target->drawable_refs = 0;
         target->current = backing;
         target->suspended = !backing;
+        pthread_mutex_init(&target->pacing_mutex, NULL);
         pthread_mutex_init(&target->present_mutex, NULL);
         if (!(target->layer = macdrv_create_iosurface_layer(
                   hwnd, CGRectMake(0, 0, width, height),
@@ -2916,7 +2967,7 @@ static BOOL foreign_surface_present(struct macdrv_context *context, struct gl_dr
         return FALSE;
     if (!(binding = foreign_surface_binding_find(context, gl))) return FALSE;
 
-    pthread_mutex_lock(&target->present_mutex);
+    foreign_surface_target_lock_present(target);
     backing = target->current;
     if (target->suspended || !target->layer || !backing || binding->backing != backing ||
         !binding->source_read_fbo || !binding->present_fbos[0])

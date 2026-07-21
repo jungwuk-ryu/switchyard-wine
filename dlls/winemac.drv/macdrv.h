@@ -39,6 +39,7 @@
 
 
 extern BOOL allow_vsync;
+extern unsigned int foreign_surface_max_frame_rate;
 extern BOOL allow_set_gamma;
 extern BOOL allow_software_rendering;
 
