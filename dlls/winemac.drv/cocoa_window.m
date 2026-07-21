@@ -2394,6 +2394,12 @@ static void WineCompositorDetachView(WineContentView* view)
         [controller adjustWindowLevels];
         [NSApp removeWindowsItem:self];
 
+        /* Defer the policy check so any replacement window already queued by
+           the application can be ordered in before removing the Dock icon. */
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [controller transformProcessToAccessoryIfNoVisibleWindows];
+        });
+
         [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_BROUGHT_FORWARD) |
                                          event_mask_for_type(WINDOW_GOT_FOCUS) |
                                          event_mask_for_type(WINDOW_LOST_FOCUS) |

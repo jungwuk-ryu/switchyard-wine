@@ -305,6 +305,25 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
     }
 
+    - (void) transformProcessToAccessoryIfNoVisibleWindows
+    {
+        if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
+            return;
+
+        for (NSWindow* window in [NSApp windows])
+        {
+            if ([window isKindOfClass:[WineWindow class]] &&
+                ([window isVisible] || [window isMiniaturized]))
+                return;
+        }
+
+        /* Wine creates one Cocoa application per Windows process. GUI helper
+           processes can therefore leave a second Dock icon behind after their
+           last native window is hidden. Keep windowless processes available to
+           Windows, but stop presenting them as a separate foreground app. */
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    }
+
     - (BOOL) waitUntilQueryDone:(bool*)done timeout:(NSDate*)timeout processEvents:(BOOL)processEvents
     {
         PerformRequest(NULL);
