@@ -377,12 +377,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
 @class WineContentView;
 
-@interface WineCompositorView : WineBaseView
-
-    - (instancetype) initWithFrame:(NSRect)frame layer:(CALayer*)layer;
-
-@end
-
 @interface WineCompositorNode : NSObject
 {
 @public
@@ -426,7 +420,6 @@ static void WineCompositorDetachView(WineContentView* view);
     CGImageRef shapeImage;
     CALayer* rootSurfaceLayer;
     CALayer* compositorRootLayer;
-    WineCompositorView* compositorView;
 
     NSMutableArray* glContexts;
     NSMutableArray* pendingGlContexts;
@@ -543,36 +536,6 @@ static void WineCompositorDetachView(WineContentView* view);
 @end
 
 
-@implementation WineCompositorView
-
-    - (instancetype) initWithFrame:(NSRect)frame layer:(CALayer*)layer
-    {
-        self = [super initWithFrame:frame];
-        if (self)
-        {
-            /* AppKit only treats an explicitly supplied layer as a layer-hosted
-               tree when it is installed before enabling layer support.  The
-               foreign compositor mutates this tree directly, independently of
-               WineContentView's AppKit-managed GDI updateLayer cycle. */
-            [self setLayer:layer];
-            [self setWantsLayer:YES];
-        }
-        return self;
-    }
-
-    - (NSView*) hitTest:(NSPoint)point
-    {
-        return nil;
-    }
-
-    - (BOOL) isFlipped
-    {
-        return YES;
-    }
-
-@end
-
-
 @implementation WineCompositorNode
 
 - (void)dealloc
@@ -665,8 +628,6 @@ static void WineCompositorApplyNode(WineContentView* view, uint64_t nodeId,
     if (node->contextId != contextId)
     {
         [node->remoteHost setContextId:0];
-        if (node->remoteHost.superlayer != node->clipContainer)
-            [node->clipContainer insertSublayer:node->remoteHost below:node->sharedSurfaceLayer];
         [node->remoteHost setContextId:contextId];
         node->remoteHost.hidden = NO;
         node->sharedSurfaceLayer.hidden = YES;
@@ -788,10 +749,9 @@ static void WineCompositorPresentNode(uint64_t nodeId, unsigned int contextId,
         node->sharedSurfaceLayer.contents = (id)surface;
         [node->sharedSurfaceLayer setContentsChanged];
         node->sharedSurfaceLayer.hidden = NO;
-        [node->remoteHost setContextId:0];
-        [node->remoteHost removeFromSuperlayer];
+        node->remoteHost.hidden = YES;
     }
-    else if (!surfaceId)
+    else
     {
         node->sharedSurfaceLayer.hidden = YES;
         node->sharedSurfaceLayer.contents = nil;
@@ -799,12 +759,6 @@ static void WineCompositorPresentNode(uint64_t nodeId, unsigned int contextId,
         {
             CFRelease(node->sharedSurface);
             node->sharedSurface = NULL;
-        }
-        if (node->remoteHost.superlayer != node->clipContainer)
-        {
-            [node->clipContainer insertSublayer:node->remoteHost below:node->sharedSurfaceLayer];
-            [node->remoteHost setContextId:0];
-            [node->remoteHost setContextId:node->contextId];
         }
         node->remoteHost.hidden = NO;
         [node->remoteHost setNeedsDisplay];
@@ -866,9 +820,7 @@ static void WineCompositorDetachView(WineContentView* view)
             compositorRootLayer.actions = disabledActions;
 
             [self.layer addSublayer:rootSurfaceLayer];
-            compositorView = [[WineCompositorView alloc] initWithFrame:self.bounds
-                                                                  layer:compositorRootLayer];
-            [self addSubview:compositorView positioned:NSWindowAbove relativeTo:nil];
+            [self.layer addSublayer:compositorRootLayer];
             [self setLayerRetinaProperties:retina_on];
             [self setAutoresizesSubviews:NO];
         }
@@ -884,18 +836,11 @@ static void WineCompositorDetachView(WineContentView* view)
         rootSurfaceLayer.delegate = nil;
         [rootSurfaceLayer removeFromSuperlayer];
         [rootSurfaceLayer release];
-        [compositorView removeFromSuperview];
-        [compositorView release];
+        [compositorRootLayer removeFromSuperlayer];
         [compositorRootLayer release];
         CGImageRelease(colorImage);
         CGImageRelease(shapeImage);
         [super dealloc];
-    }
-
-    - (void) setFrameSize:(NSSize)newSize
-    {
-        [super setFrameSize:newSize];
-        [compositorView setFrame:NSMakeRect(0, 0, newSize.width, newSize.height)];
     }
 
     - (BOOL) isFlipped
