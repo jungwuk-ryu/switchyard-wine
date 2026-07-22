@@ -53,17 +53,190 @@ static inline int get_dib_image_size(const BITMAPINFO *info)
  * There is no executable/class detection, shared-memory root relay, surface
  * colour classification, or CPU-side flattening in this contract.
  */
-struct macdrv_window_surface
+struct macdrv_dib_endpoint
 {
-    struct window_surface header;
-    macdrv_window         window;
-    macdrv_image_layer    image_layer;
-    struct window_surface *replaced_surface; /* retained until the first complete replacement frame */
-    CGDataProviderRef     backing_provider;
-    void                 *bits;
+    LONG                       refs;
+    HWND                       hwnd;
+    DWORD                      source_thread;
+    DWORD                      source_process;
+    RECT                       rect;
+    size_t                     image_size;
+    pthread_mutex_t            mutex;
+    macdrv_image_layer         image_layer;
+    struct macdrv_dib_endpoint *replaced_endpoint;
+    struct macdrv_dib_endpoint *next;
+    void                       *bits;
 };
 
+struct macdrv_window_surface
+{
+    struct window_surface      header;
+    macdrv_window              window;
+    struct macdrv_dib_endpoint *dib_endpoint;
+    struct window_surface      *replaced_surface;
+    CGDataProviderRef          backing_provider;
+    void                       *bits;
+};
+
+static pthread_mutex_t dib_endpoints_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct macdrv_dib_endpoint *dib_endpoints;
+
 static struct macdrv_window_surface *get_mac_surface(struct window_surface *surface);
+
+static void dib_endpoint_add_ref(struct macdrv_dib_endpoint *endpoint)
+{
+    InterlockedIncrement(&endpoint->refs);
+}
+
+static void dib_endpoint_release(struct macdrv_dib_endpoint *endpoint)
+{
+    struct macdrv_dib_endpoint *replaced;
+
+    if (InterlockedDecrement(&endpoint->refs)) return;
+
+    replaced = endpoint->replaced_endpoint;
+    macdrv_destroy_image_layer(endpoint->image_layer);
+    pthread_mutex_destroy(&endpoint->mutex);
+    free(endpoint->bits);
+    free(endpoint);
+    if (replaced) dib_endpoint_release(replaced);
+}
+
+static struct macdrv_dib_endpoint *create_dib_endpoint(HWND hwnd, DWORD source_thread,
+                                                        DWORD source_process, const RECT *rect,
+                                                        size_t image_size, DWORD background)
+{
+    struct macdrv_dib_endpoint *endpoint;
+
+    if (!(endpoint = calloc(1, sizeof(*endpoint)))) return NULL;
+    if (!(endpoint->bits = malloc(image_size)))
+    {
+        free(endpoint);
+        return NULL;
+    }
+
+    endpoint->refs = 2; /* one registry reference and one returned surface reference */
+    endpoint->hwnd = hwnd;
+    endpoint->source_thread = source_thread;
+    endpoint->source_process = source_process;
+    endpoint->rect = *rect;
+    endpoint->image_size = image_size;
+    pthread_mutex_init(&endpoint->mutex, NULL);
+    memset_pattern4(endpoint->bits, &background, image_size);
+
+    if (!(endpoint->image_layer = macdrv_create_image_layer(hwnd, cgrect_from_rect(*rect))))
+    {
+        pthread_mutex_destroy(&endpoint->mutex);
+        free(endpoint->bits);
+        free(endpoint);
+        return NULL;
+    }
+    return endpoint;
+}
+
+static void seed_dib_endpoint(struct macdrv_dib_endpoint *replacement,
+                              struct macdrv_dib_endpoint *previous)
+{
+    RECT overlap;
+    size_t new_stride, old_stride, row_bytes;
+    int y;
+
+    if (!intersect_rect(&overlap, &replacement->rect, &previous->rect)) return;
+
+    new_stride = (replacement->rect.right - replacement->rect.left) * 4;
+    old_stride = (previous->rect.right - previous->rect.left) * 4;
+    row_bytes = (overlap.right - overlap.left) * 4;
+
+    pthread_mutex_lock(&previous->mutex);
+    for (y = overlap.top; y < overlap.bottom; y++)
+    {
+        BYTE *dst = (BYTE *)replacement->bits + (y - replacement->rect.top) * new_stride +
+                    (overlap.left - replacement->rect.left) * 4;
+        const BYTE *src = (const BYTE *)previous->bits + (y - previous->rect.top) * old_stride +
+                          (overlap.left - previous->rect.left) * 4;
+
+        memcpy(dst, src, row_bytes);
+    }
+    pthread_mutex_unlock(&previous->mutex);
+}
+
+static struct macdrv_dib_endpoint *acquire_dib_endpoint(HWND hwnd, const RECT *rect,
+                                                         size_t image_size, DWORD background)
+{
+    struct macdrv_dib_endpoint **cursor, *endpoint, *previous = NULL, *retired = NULL;
+    DWORD source_process = 0, source_thread;
+    BOOL same_generation = FALSE;
+
+    if (!(source_thread = NtUserGetWindowThread(hwnd, &source_process)) || !source_process)
+        return NULL;
+
+    pthread_mutex_lock(&dib_endpoints_mutex);
+    for (cursor = &dib_endpoints; *cursor; cursor = &(*cursor)->next)
+    {
+        if ((*cursor)->hwnd != hwnd) continue;
+        previous = *cursor;
+        same_generation = previous->source_thread == source_thread &&
+                          previous->source_process == source_process;
+        if (same_generation && previous->image_size == image_size &&
+            EqualRect(&previous->rect, rect))
+        {
+            dib_endpoint_add_ref(previous);
+            pthread_mutex_unlock(&dib_endpoints_mutex);
+            return previous;
+        }
+        break;
+    }
+
+    if (!(endpoint = create_dib_endpoint(hwnd, source_thread, source_process, rect,
+                                         image_size, background)))
+    {
+        pthread_mutex_unlock(&dib_endpoints_mutex);
+        return NULL;
+    }
+    if (same_generation)
+    {
+        seed_dib_endpoint(endpoint, previous);
+        endpoint->replaced_endpoint = previous; /* transfer the registry reference */
+    }
+    else if (previous)
+        retired = previous;
+
+    if (previous)
+    {
+        endpoint->next = previous->next;
+        *cursor = endpoint;
+        previous->next = NULL;
+    }
+    else
+    {
+        endpoint->next = dib_endpoints;
+        dib_endpoints = endpoint;
+    }
+    pthread_mutex_unlock(&dib_endpoints_mutex);
+    if (retired) dib_endpoint_release(retired);
+
+    TRACE("Switchyard created persistent remote-DIB endpoint source %p rect %s\n",
+          hwnd, wine_dbgstr_rect(rect));
+    return endpoint;
+}
+
+void macdrv_purge_dib_endpoints(HWND hwnd)
+{
+    struct macdrv_dib_endpoint **cursor, *endpoint = NULL;
+
+    pthread_mutex_lock(&dib_endpoints_mutex);
+    for (cursor = &dib_endpoints; *cursor; cursor = &(*cursor)->next)
+    {
+        if ((*cursor)->hwnd != hwnd) continue;
+        endpoint = *cursor;
+        *cursor = endpoint->next;
+        endpoint->next = NULL;
+        break;
+    }
+    pthread_mutex_unlock(&dib_endpoints_mutex);
+
+    if (endpoint) dib_endpoint_release(endpoint);
+}
 
 static void seed_replacement_surface(struct window_surface *replacement,
                                      struct window_surface *previous)
@@ -123,6 +296,44 @@ static CGDataProviderRef snapshot_data_provider_create(const void *bits, size_t 
     return provider;
 }
 
+static void merge_dirty_bits(void *dst_bits, const RECT *dirty,
+                             const BITMAPINFO *color_info, const void *color_bits)
+{
+    RECT update;
+    unsigned int height, stride, row, copy_width;
+    const BYTE *src = color_bits;
+    BYTE *dst = dst_bits;
+
+    if (!color_bits || color_bits == dst_bits) return;
+    if (color_info->bmiHeader.biBitCount != 32 || color_info->bmiHeader.biCompression != BI_RGB)
+    {
+        memcpy(dst_bits, color_bits, color_info->bmiHeader.biSizeImage);
+        return;
+    }
+
+    height = abs(color_info->bmiHeader.biHeight);
+    if (!height) return;
+    stride = color_info->bmiHeader.biSizeImage / height;
+    if (!stride) return;
+
+    /* window_surface_flush() reports damage in surface-local coordinates.
+       Bytes outside that rectangle in a temporary DIB are not guaranteed to
+       belong to this frame, so preserve the persistent backing there. */
+    update = *dirty;
+    update.left = max(update.left, 0);
+    update.top = max(update.top, 0);
+    update.right = min(update.right, color_info->bmiHeader.biWidth);
+    update.bottom = min(update.bottom, height);
+    if (update.left >= update.right || update.top >= update.bottom) return;
+
+    copy_width = (update.right - update.left) * 4;
+    for (row = update.top; row < update.bottom; row++)
+    {
+        memcpy(dst + row * stride + update.left * 4,
+               src + row * stride + update.left * 4, copy_width);
+    }
+}
+
 static void macdrv_surface_set_clip(struct window_surface *window_surface, const RECT *rects, UINT count)
 {
 }
@@ -137,20 +348,34 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     CGDataProviderRef provider;
     CGColorSpaceRef colorspace;
     CGImageRef image;
+    struct macdrv_dib_endpoint *replaced_endpoint = NULL;
     size_t image_size = color_info->bmiHeader.biSizeImage;
     BOOL presented = TRUE;
 
     TRACE("Switchyard submitting %s frame source %p rect %s dirty %s\n",
-          surface->image_layer ? "remote-DIB" : "native-root", window_surface->hwnd,
+          surface->dib_endpoint ? "remote-DIB" : "native-root", window_surface->hwnd,
           wine_dbgstr_rect(rect), wine_dbgstr_rect(dirty));
 
-    if (color_bits && color_bits != surface->bits)
-        memcpy(surface->bits, color_bits, image_size);
+    merge_dirty_bits(surface->bits, dirty, color_info, color_bits);
 
-    if (!(provider = snapshot_data_provider_create(surface->bits, image_size))) return TRUE;
+    if (surface->dib_endpoint)
+    {
+        pthread_mutex_lock(&surface->dib_endpoint->mutex);
+        merge_dirty_bits(surface->dib_endpoint->bits, dirty, color_info, surface->bits);
+        provider = snapshot_data_provider_create(surface->dib_endpoint->bits, image_size);
+    }
+    else
+        provider = snapshot_data_provider_create(surface->bits, image_size);
+
+    if (!provider)
+    {
+        if (surface->dib_endpoint) pthread_mutex_unlock(&surface->dib_endpoint->mutex);
+        return TRUE;
+    }
     if (!(colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB)))
     {
         CGDataProviderRelease(provider);
+        if (surface->dib_endpoint) pthread_mutex_unlock(&surface->dib_endpoint->mutex);
         return TRUE;
     }
 
@@ -160,15 +385,30 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
                           retina_on, kCGRenderingIntentDefault);
     CGColorSpaceRelease(colorspace);
     CGDataProviderRelease(provider);
-    if (!image) return TRUE;
+    if (!image)
+    {
+        if (surface->dib_endpoint) pthread_mutex_unlock(&surface->dib_endpoint->mutex);
+        return TRUE;
+    }
 
-    if (surface->image_layer)
-        presented = macdrv_image_layer_set_color_image(surface->image_layer, image,
+    if (surface->dib_endpoint)
+        presented = macdrv_image_layer_set_color_image(surface->dib_endpoint->image_layer, image,
                                                         cgrect_from_rect(*rect));
     else if (surface->window)
         macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(*rect),
                                       cgrect_from_rect(*dirty));
     CGImageRelease(image);
+
+    if (surface->dib_endpoint)
+    {
+        if (presented)
+        {
+            replaced_endpoint = surface->dib_endpoint->replaced_endpoint;
+            surface->dib_endpoint->replaced_endpoint = NULL;
+        }
+        pthread_mutex_unlock(&surface->dib_endpoint->mutex);
+        if (replaced_endpoint) dib_endpoint_release(replaced_endpoint);
+    }
 
     if (presented && surface->replaced_surface)
     {
@@ -211,8 +451,9 @@ static void macdrv_surface_destroy(struct window_surface *window_surface)
 {
     struct macdrv_window_surface *surface = get_mac_surface(window_surface);
 
-    TRACE("freeing %p\n", surface);
-    if (surface->image_layer) macdrv_destroy_image_layer(surface->image_layer);
+    TRACE("freeing %p source %p replacement %p\n", surface, window_surface->hwnd,
+          surface->replaced_surface);
+    if (surface->dib_endpoint) dib_endpoint_release(surface->dib_endpoint);
     if (surface->replaced_surface) window_surface_release(surface->replaced_surface);
     CGDataProviderRelease(surface->backing_provider);
 }
@@ -283,18 +524,22 @@ static struct window_surface *create_surface(HWND hwnd, macdrv_window window, co
 
     surface = get_mac_surface(window_surface);
     surface->window = window;
-    surface->image_layer = NULL;
+    surface->dib_endpoint = NULL;
     surface->backing_provider = provider;
     surface->bits = bits;
 
     if (!window)
     {
-        surface->image_layer = macdrv_create_image_layer(hwnd, cgrect_from_rect(*rect));
-        if (!surface->image_layer)
+        surface->dib_endpoint = acquire_dib_endpoint(hwnd, rect, info->bmiHeader.biSizeImage,
+                                                     window_background);
+        if (!surface->dib_endpoint)
         {
             window_surface_release(window_surface);
             return NULL;
         }
+        pthread_mutex_lock(&surface->dib_endpoint->mutex);
+        memcpy(surface->bits, surface->dib_endpoint->bits, info->bmiHeader.biSizeImage);
+        pthread_mutex_unlock(&surface->dib_endpoint->mutex);
         window_surface->flush_on_unlock = TRUE;
     }
 
@@ -310,8 +555,8 @@ BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rec
     struct macdrv_win_data *data;
     macdrv_window window = NULL;
 
-    TRACE("hwnd %p, layered %u, surface_rect %s, surface %p\n",
-          hwnd, layered, wine_dbgstr_rect(surface_rect), surface);
+    TRACE("hwnd %p, layered %u, surface_rect %s, surface %p previous %p\n",
+          hwnd, layered, wine_dbgstr_rect(surface_rect), surface, previous);
 
     if ((data = get_win_data(hwnd)))
     {

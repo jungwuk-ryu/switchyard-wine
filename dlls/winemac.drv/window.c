@@ -1052,6 +1052,13 @@ void macdrv_end_window_move_surface_hold(void)
             macdrv_set_cocoa_window_surface_updates_suspended(data->cocoa_window, false);
         release_win_data(data);
     }
+
+    /* Chromium renderers can publish a transient blank frame while their
+       native root is moving.  Surface updates are held above so that frame is
+       not displayed during the drag, but the compositor may not publish
+       another complete frame until unrelated input invalidates the window.
+       Repaint the complete subtree now that presentation has resumed. */
+    NtUserRedrawWindow(root, NULL, 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
 }
 
 
@@ -1526,6 +1533,8 @@ void macdrv_DestroyWindow(HWND hwnd)
     struct macdrv_win_data *data;
 
     TRACE("%p\n", hwnd);
+
+    macdrv_purge_dib_endpoints(hwnd);
 
     /* Source nodes can outlive their producer CAContext, and host nodes can
        otherwise outlive their sole native Cocoa root.  Remove both sides while

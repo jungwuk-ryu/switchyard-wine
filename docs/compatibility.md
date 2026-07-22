@@ -15,7 +15,7 @@ document. Application versions and detailed test steps were not recorded.
 | --- | --- | --- | --- | --- | --- |
 | Heartopia | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Terraria | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
-| Steam | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client · Wine graphics fallback |
+| Steam | Working — window movement and STORE/LIBRARY/COMMUNITY hover menus were verified without white or blank regions; broader client and game workflows were not reverified. | 2026-07-22 | Switchyard Wine development runtime (`d5ec127bafb632ee717819db8eba1d9fccc43e23`, source tree `6207795aa523`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client · CEF remote-DIB surfaces → persistent HWND-scoped CAContext layer · GPTK 3.0 environment with Wine graphics fallback |
 | KakaoTalk | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct executable · shared Steam prefix |
 | Bro Falls: Ultimate Showdown | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Pratfall | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · Vulkan renderer |
@@ -33,7 +33,7 @@ Compatibility may change with application updates, runtime revisions, macOS vers
 or graphics layers. Future updates should record the application version and distribution path,
 verification date, runtime revision, host environment, and any known limitations.
 
-The runtime revision above expands to
+The shared 2026-07-21 runtime revision expands to
 `783c55de9a5b631b6710ed690ec696654a7d17b9`. It uses the `switchyard-wow64-pe` profile
 with `i386` and `x86_64` PE support. GPTK refers to the user-provided Apple Game Porting
 Toolkit 3.0 overlay; it is not distributed by this repository.

@@ -1422,10 +1422,10 @@ static void WineCompositorDetachView(WineContentView* view)
 
         if (image)
         {
-            [view setColorImage:image];
-            [view setSurfaceRect:cgrect_mac_from_win(rect)];
             if (!surfaceUpdatesSuspended)
             {
+                [view setColorImage:image];
+                [view setSurfaceRect:cgrect_mac_from_win(rect)];
                 [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
                 if (!drawnSinceShown)
                 {
