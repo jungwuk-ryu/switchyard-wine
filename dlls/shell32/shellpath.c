@@ -2801,6 +2801,14 @@ done:
     CloseHandle( mgr );
 }
 
+static BOOL private_desktop_enabled(void)
+{
+    const WCHAR *value = _wgetenv( L"SWITCHYARD_PRIVATE_DESKTOP" );
+
+    return value && (value[0] == '1' || value[0] == 'y' || value[0] == 'Y' ||
+                     value[0] == 't' || value[0] == 'T');
+}
+
 /******************************************************************************
  * _SHCreateSymbolicLink  [Internal]
  *
@@ -2819,7 +2827,8 @@ static void _SHCreateSymbolicLink(int nFolder, const WCHAR *path)
             create_link( path, "XDG_DOCUMENTS_DIR", "$HOME/Documents" );
             break;
         case CSIDL_DESKTOPDIRECTORY:
-            create_link( path, "XDG_DESKTOP_DIR", "$HOME/Desktop" );
+            if (!private_desktop_enabled())
+                create_link( path, "XDG_DESKTOP_DIR", "$HOME/Desktop" );
             break;
         case CSIDL_MYPICTURES:
             create_link( path, "XDG_PICTURES_DIR", "$HOME/Pictures" );

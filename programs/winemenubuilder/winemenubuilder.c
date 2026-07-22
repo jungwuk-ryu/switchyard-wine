@@ -2131,12 +2131,230 @@ static BOOL export_protocol_associations(void)
     return ret;
 }
 
-static void monitor_protocol_associations(void)
+static BOOL desktop_shortcut_export_enabled(void)
 {
-    static const WCHAR mutex_name[] = L"__wine_switchyard_protocol_monitor";
+    const WCHAR *path = _wgetenv( L"SWITCHYARD_DESKTOP_SHORTCUTS_FILE" );
+
+    return path && path[0];
+}
+
+static void write_hex_wstring(FILE *file, const WCHAR *string)
+{
+    const unsigned char *p;
+    char *utf8 = wchars_to_utf8_chars( string );
+
+    for (p = (const unsigned char *)utf8; *p; p++) fprintf( file, "%02x", *p );
+    free( utf8 );
+}
+
+static ULONGLONG hash_shortcut_path(const WCHAR *path)
+{
+    ULONGLONG hash = 14695981039346656037ULL;
+
+    while (*path)
+    {
+        hash ^= *path++;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static BOOL write_shortcut_icon(const WCHAR *source, BOOL is_url, const WCHAR *output)
+{
+    WCHAR expanded[MAX_PATH], icon_source[MAX_PATH], target[MAX_PATH], args[INFOTIPSIZE], *temporary;
+    ICONDIRENTRY *entries = NULL;
+    IStream *stream = NULL;
+    int icon_index = 0, entry_count = 0;
+    IShellLinkW *shell_link = NULL;
+    IPersistFile *persist_file = NULL;
+    DWORD expanded_size;
+    HRESULT hr = E_FAIL;
+    BOOL ret = FALSE;
+
+    icon_source[0] = 0;
+    target[0] = 0;
+    if (is_url)
+    {
+        GetPrivateProfileStringW( L"InternetShortcut", L"IconFile", L"", icon_source,
+                                  ARRAY_SIZE(icon_source), source );
+        icon_index = GetPrivateProfileIntW( L"InternetShortcut", L"IconIndex", 0, source );
+        if (!icon_source[0]) lstrcpynW( icon_source, source, ARRAY_SIZE(icon_source) );
+    }
+    else
+    {
+        hr = CoCreateInstance( &CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                               &IID_IShellLinkW, (void **)&shell_link );
+        if (FAILED(hr)) goto done;
+        hr = IShellLinkW_QueryInterface( shell_link, &IID_IPersistFile, (void **)&persist_file );
+        if (FAILED(hr)) goto done;
+        hr = IPersistFile_Load( persist_file, source, STGM_READ );
+        if (FAILED(hr)) goto done;
+
+        get_cmdline( shell_link, target, ARRAY_SIZE(target), args, ARRAY_SIZE(args) );
+        IShellLinkW_GetIconLocation( shell_link, icon_source, ARRAY_SIZE(icon_source), &icon_index );
+        if (!icon_source[0]) lstrcpynW( icon_source, target, ARRAY_SIZE(icon_source) );
+    }
+    expanded_size = ExpandEnvironmentStringsW( icon_source, expanded, ARRAY_SIZE(expanded) );
+    if (expanded_size && expanded_size <= ARRAY_SIZE(expanded))
+        lstrcpynW( icon_source, expanded, ARRAY_SIZE(icon_source) );
+
+    temporary = heap_wprintf( L"%s.%lu.tmp", output, GetCurrentProcessId() );
+    hr = open_icon( icon_source, icon_index, FALSE, &stream, &entries, &entry_count );
+    if (FAILED(hr))
+    {
+        GetSystemDirectoryW( icon_source, ARRAY_SIZE(icon_source) );
+        PathAppendW( icon_source, L"user32.dll" );
+        icon_index = -(INT_PTR)IDI_WINLOGO;
+        hr = open_icon( icon_source, icon_index, FALSE, &stream, &entries, &entry_count );
+    }
+    if (SUCCEEDED(hr)) hr = write_native_icon( stream, entries, entry_count, temporary );
+    if (SUCCEEDED(hr))
+        ret = MoveFileExW( temporary, output, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH );
+    if (!ret) DeleteFileW( temporary );
+    free( temporary );
+
+done:
+    if (!ret) DeleteFileW( output );
+    if (persist_file) IPersistFile_Release( persist_file );
+    if (shell_link) IShellLinkW_Release( shell_link );
+    if (stream) IStream_Release( stream );
+    free( entries );
+    return ret;
+}
+
+static BOOL shortcut_icon_is_current(const WCHAR *source, const WCHAR *output)
+{
+    WIN32_FILE_ATTRIBUTE_DATA source_data, output_data;
+
+    if (!GetFileAttributesExW( source, GetFileExInfoStandard, &source_data ) ||
+        !GetFileAttributesExW( output, GetFileExInfoStandard, &output_data ) ||
+        (!output_data.nFileSizeHigh && !output_data.nFileSizeLow))
+        return FALSE;
+    return CompareFileTime( &output_data.ftLastWriteTime, &source_data.ftLastWriteTime ) >= 0;
+}
+
+static void export_desktop_shortcuts_from_directory(FILE *file, const WCHAR *directory,
+                                                    const WCHAR *icon_directory)
+{
+    WIN32_FIND_DATAW data;
+    WCHAR *pattern;
+    HANDLE find;
+
+    pattern = heap_wprintf( L"%s\\*", directory );
+    find = FindFirstFileW( pattern, &data );
+    free( pattern );
+    if (find == INVALID_HANDLE_VALUE) return;
+
+    do
+    {
+        const WCHAR *extension;
+        WCHAR *display_name, *icon_path, *source;
+        const char *kind;
+        BOOL is_url, have_icon;
+        ULONGLONG hash;
+
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        extension = PathFindExtensionW( data.cFileName );
+        if (!wcsicmp( extension, L".lnk" ))
+        {
+            kind = "lnk";
+            is_url = FALSE;
+        }
+        else if (!wcsicmp( extension, L".url" ))
+        {
+            kind = "url";
+            is_url = TRUE;
+        }
+        else continue;
+
+        source = heap_wprintf( L"%s\\%s", directory, data.cFileName );
+        hash = hash_shortcut_path( source );
+        icon_path = heap_wprintf( L"%s\\%016I64x.png", icon_directory, hash );
+        have_icon = shortcut_icon_is_current( source, icon_path ) ||
+                    write_shortcut_icon( source, is_url, icon_path );
+        display_name = xwcsdup( data.cFileName );
+        PathRemoveExtensionW( display_name );
+
+        fprintf( file, "%s\t", kind );
+        write_hex_wstring( file, display_name );
+        fputc( '\t', file );
+        write_hex_wstring( file, source );
+        fputc( '\t', file );
+        if (have_icon) write_hex_wstring( file, icon_path );
+        fputc( '\n', file );
+
+        free( display_name );
+        free( icon_path );
+        free( source );
+    } while (FindNextFileW( find, &data ));
+
+    FindClose( find );
+}
+
+static BOOL export_desktop_shortcuts(void)
+{
+    const WCHAR *path = _wgetenv( L"SWITCHYARD_DESKTOP_SHORTCUTS_FILE" );
+    WCHAR desktop[MAX_PATH], common_desktop[MAX_PATH], *directory, *icon_directory, *temporary_path;
+    FILE *file;
+    BOOL ret = FALSE;
+
+    if (!path || !path[0]) return FALSE;
+    if (FAILED(SHGetFolderPathW( NULL, CSIDL_DESKTOPDIRECTORY | CSIDL_FLAG_CREATE, NULL,
+                                 SHGFP_TYPE_CURRENT, desktop )))
+        return FALSE;
+    common_desktop[0] = 0;
+    SHGetFolderPathW( NULL, CSIDL_COMMON_DESKTOPDIRECTORY | CSIDL_FLAG_CREATE, NULL,
+                      SHGFP_TYPE_CURRENT, common_desktop );
+
+    directory = xwcsdup( path );
+    if (!PathRemoveFileSpecW( directory ))
+    {
+        free( directory );
+        return FALSE;
+    }
+    icon_directory = heap_wprintf( L"%s\\switchyard-desktop-icons-v1", directory );
+    free( directory );
+    if (!create_directories( icon_directory ))
+    {
+        free( icon_directory );
+        return FALSE;
+    }
+
+    temporary_path = heap_wprintf( L"%s.%lu.tmp", path, GetCurrentProcessId() );
+    if (!(file = _wfopen( temporary_path, L"wb" )))
+    {
+        WINE_ERR( "error writing desktop shortcut export %s\n", wine_dbgstr_w(temporary_path) );
+        free( temporary_path );
+        free( icon_directory );
+        return FALSE;
+    }
+
+    fprintf( file, "# switchyard-wine-desktop-shortcuts-v1\n" );
+    export_desktop_shortcuts_from_directory( file, desktop, icon_directory );
+    if (common_desktop[0] && wcsicmp( common_desktop, desktop ))
+        export_desktop_shortcuts_from_directory( file, common_desktop, icon_directory );
+
+    if (fclose( file ))
+        WINE_ERR( "error closing desktop shortcut export %s\n", wine_dbgstr_w(temporary_path) );
+    else if (MoveFileExW( temporary_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ))
+        ret = TRUE;
+    else
+        WINE_ERR( "error publishing desktop shortcut export %s, error %lu\n",
+                  wine_dbgstr_w(path), GetLastError() );
+
+    if (!ret) DeleteFileW( temporary_path );
+    free( temporary_path );
+    free( icon_directory );
+    return ret;
+}
+
+static void monitor_switchyard_exports(BOOL monitor_protocols, BOOL monitor_shortcuts)
+{
+    static const WCHAR mutex_name[] = L"__wine_switchyard_export_monitor";
     HKEY keys[2], user_classes, machine_classes;
-    HANDLE events[2], mutex;
-    DWORD count = 0, i, status;
+    HANDLE events[4], mutex;
+    WCHAR desktop[MAX_PATH], common_desktop[MAX_PATH];
+    DWORD event_count = 0, key_count = 0, i, status;
 
     mutex = CreateMutexW( NULL, TRUE, mutex_name );
     if (!mutex) return;
@@ -2146,32 +2364,59 @@ static void monitor_protocol_associations(void)
         return;
     }
 
-    if (RegOpenKeyExW( HKEY_CURRENT_USER, L"Software\\Classes", 0, KEY_NOTIFY, &user_classes ) == ERROR_SUCCESS)
+    if (monitor_protocols &&
+        RegOpenKeyExW( HKEY_CURRENT_USER, L"Software\\Classes", 0, KEY_NOTIFY,
+                       &user_classes ) == ERROR_SUCCESS)
     {
         HANDLE event = CreateEventW( NULL, FALSE, FALSE, NULL );
 
         if (event)
         {
-            keys[count] = user_classes;
-            events[count++] = event;
+            keys[key_count++] = user_classes;
+            events[event_count++] = event;
         }
         else RegCloseKey( user_classes );
     }
-    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Classes", 0, KEY_NOTIFY, &machine_classes ) == ERROR_SUCCESS)
+    if (monitor_protocols &&
+        RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Classes", 0, KEY_NOTIFY,
+                       &machine_classes ) == ERROR_SUCCESS)
     {
         HANDLE event = CreateEventW( NULL, FALSE, FALSE, NULL );
 
         if (event)
         {
-            keys[count] = machine_classes;
-            events[count++] = event;
+            keys[key_count++] = machine_classes;
+            events[event_count++] = event;
         }
         else RegCloseKey( machine_classes );
     }
 
-    while (count)
+    desktop[0] = common_desktop[0] = 0;
+    if (monitor_shortcuts &&
+        SUCCEEDED(SHGetFolderPathW( NULL, CSIDL_DESKTOPDIRECTORY | CSIDL_FLAG_CREATE, NULL,
+                                    SHGFP_TYPE_CURRENT, desktop )))
     {
-        for (i = 0; i < count; i++)
+        HANDLE change = FindFirstChangeNotificationW( desktop, FALSE,
+                                                       FILE_NOTIFY_CHANGE_FILE_NAME |
+                                                       FILE_NOTIFY_CHANGE_LAST_WRITE |
+                                                       FILE_NOTIFY_CHANGE_SIZE );
+        if (change != INVALID_HANDLE_VALUE) events[event_count++] = change;
+    }
+    if (monitor_shortcuts &&
+        SUCCEEDED(SHGetFolderPathW( NULL, CSIDL_COMMON_DESKTOPDIRECTORY | CSIDL_FLAG_CREATE,
+                                    NULL, SHGFP_TYPE_CURRENT, common_desktop )) &&
+        wcsicmp( common_desktop, desktop ))
+    {
+        HANDLE change = FindFirstChangeNotificationW( common_desktop, FALSE,
+                                                       FILE_NOTIFY_CHANGE_FILE_NAME |
+                                                       FILE_NOTIFY_CHANGE_LAST_WRITE |
+                                                       FILE_NOTIFY_CHANGE_SIZE );
+        if (change != INVALID_HANDLE_VALUE) events[event_count++] = change;
+    }
+
+    for (;;)
+    {
+        for (i = 0; i < key_count; i++)
         {
             status = RegNotifyChangeKeyValue( keys[i], TRUE,
                                               REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
@@ -2179,17 +2424,30 @@ static void monitor_protocol_associations(void)
             if (status != ERROR_SUCCESS) goto done;
         }
 
-        export_protocol_associations();
-        status = WaitForMultipleObjects( count, events, FALSE, INFINITE );
-        if (status >= WAIT_OBJECT_0 + count) break;
+        if (monitor_protocols) export_protocol_associations();
+        if (monitor_shortcuts) export_desktop_shortcuts();
+        if (!event_count)
+        {
+            if (!monitor_shortcuts) break;
+            Sleep( 1000 );
+            continue;
+        }
+
+        status = WaitForMultipleObjects( event_count, events, FALSE,
+                                         monitor_shortcuts ? 1000 : INFINITE );
+        if (status == WAIT_TIMEOUT) continue;
+        if (status >= WAIT_OBJECT_0 + event_count) break;
+        i = status - WAIT_OBJECT_0;
+        if (i >= key_count && !FindNextChangeNotification( events[i] )) break;
     }
 
 done:
-    for (i = 0; i < count; i++)
+    for (i = 0; i < key_count; i++)
     {
         CloseHandle( events[i] );
         RegCloseKey( keys[i] );
     }
+    for (i = key_count; i < event_count; i++) FindCloseChangeNotification( events[i] );
     ReleaseMutex( mutex );
     CloseHandle( mutex );
 }
@@ -3069,12 +3327,14 @@ int PASCAL wWinMain (HINSTANCE hInstance, HINSTANCE prev, LPWSTR cmdline, int sh
     BOOL bURL = FALSE;
     BOOL have_xdg;
     BOOL have_protocol_export;
+    BOOL have_shortcut_export;
     HRESULT hr;
     int ret = 0;
 
     have_xdg = init_xdg();
     have_protocol_export = protocol_association_export_enabled();
-    if (!have_xdg && !have_protocol_export)
+    have_shortcut_export = desktop_shortcut_export_enabled();
+    if (!have_xdg && !have_protocol_export && !have_shortcut_export)
         return 1;
 
     hr = CoInitialize(NULL);
@@ -3096,11 +3356,14 @@ int PASCAL wWinMain (HINSTANCE hInstance, HINSTANCE prev, LPWSTR cmdline, int sh
                 if (have_xdg) RefreshFileTypeAssociations();
                 if (have_protocol_export && !export_protocol_associations()) ret = 1;
             }
+            if (have_shortcut_export && !export_desktop_shortcuts()) ret = 1;
             continue;
         }
         if( !wcscmp( token, L"-m" ) )
         {
-            if (associations_enabled() && have_protocol_export) monitor_protocol_associations();
+            if (have_protocol_export || have_shortcut_export)
+                monitor_switchyard_exports( associations_enabled() && have_protocol_export,
+                                            have_shortcut_export );
             continue;
         }
         if( !wcscmp( token, L"-r" ) )
@@ -3130,7 +3393,11 @@ int PASCAL wWinMain (HINSTANCE hInstance, HINSTANCE prev, LPWSTR cmdline, int sh
         {
             BOOL bRet;
 
-            if (!have_xdg) continue;
+            if (!have_xdg)
+            {
+                if (have_shortcut_export && !export_desktop_shortcuts()) ret = 1;
+                continue;
+            }
             if (bURL)
                 bRet = Process_URL( token, bWait );
             else
