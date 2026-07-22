@@ -107,6 +107,14 @@ implementation with:
 ./switchyard/tests/runtime_tls_smoke_test.sh ~/.switchyard/runtimes/<runtime-id>
 ```
 
+Verify that WoW64 processes receive the upper 2 GiB of virtual address space by
+default and retain the legacy limit when `WINE_LARGE_ADDRESS_AWARE=0` is set:
+
+```sh
+./switchyard/tests/wow64_large_address_aware_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
+
 For a runtime with the GPTK overlay, exercise D3DMetal's shared DXGI resource
 callbacks from a fresh prefix with:
 

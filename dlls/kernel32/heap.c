@@ -41,6 +41,23 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(globalmem);
 
+#ifndef _WIN64
+static BOOL needs_override_large_address_aware(void)
+{
+    static int needs_override = -1;
+
+    if (needs_override == -1)
+    {
+        char value[16];
+
+        /* Keep the compatibility override enabled when the variable is absent. */
+        needs_override = __wine_get_unix_env( "WINE_LARGE_ADDRESS_AWARE", value, sizeof(value) ) ||
+                         atoi( value ) == 1;
+    }
+    return needs_override;
+}
+#endif
+
 
 /***********************************************************************
  *           HeapCreate   (KERNEL32.@)
@@ -424,6 +441,7 @@ VOID WINAPI GlobalMemoryStatus( LPMEMORYSTATUS lpBuffer )
     OSVERSIONINFOW osver;
 #ifndef _WIN64
     IMAGE_NT_HEADERS *nt = RtlImageNtHeader( GetModuleHandleW(0) );
+    static int force_large_address_aware = -1;
 #endif
 
     /* Because GlobalMemoryStatus is identical to GlobalMemoryStatusEX save
@@ -450,6 +468,8 @@ VOID WINAPI GlobalMemoryStatus( LPMEMORYSTATUS lpBuffer )
     lpBuffer->dwAvailVirtual = memstatus.ullAvailVirtual;
 
 #ifndef _WIN64
+    if (force_large_address_aware == -1)
+        force_large_address_aware = needs_override_large_address_aware();
     if ( osver.dwMajorVersion >= 5 || osver.dwPlatformId == VER_PLATFORM_WIN32_WINDOWS )
     {
         lpBuffer->dwTotalPhys = min( memstatus.ullTotalPhys, MAXDWORD );
@@ -463,7 +483,8 @@ VOID WINAPI GlobalMemoryStatus( LPMEMORYSTATUS lpBuffer )
 
     /* values are limited to 2Gb unless the app has the IMAGE_FILE_LARGE_ADDRESS_AWARE flag */
     /* page file sizes are not limited (Adobe Illustrator 8 depends on this) */
-    if (!(nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE))
+    if (!(nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) &&
+        !force_large_address_aware)
     {
         if (lpBuffer->dwTotalPhys > MAXLONG) lpBuffer->dwTotalPhys = MAXLONG;
         if (lpBuffer->dwAvailPhys > MAXLONG) lpBuffer->dwAvailPhys = MAXLONG;
