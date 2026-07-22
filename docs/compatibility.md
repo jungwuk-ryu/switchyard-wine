@@ -6,8 +6,9 @@ environment, and launch or graphics path. The current entries repeat the selecte
 host recorded when the results were supplied, but these fields remain per-application so later
 checks can update independently.
 
-The results were supplied by the user and were not independently retested while preparing this
-document. Application versions and detailed test steps were not recorded.
+Unless a row says otherwise, the results were supplied by the user and were not independently
+retested while preparing this document. Application versions and detailed test steps were not
+recorded for those entries.
 
 ## Compatibility results
 
@@ -16,6 +17,7 @@ document. Application versions and detailed test steps were not recorded.
 | Heartopia | Working — the title screen rendered and the Steam Overlay opened with Shift+Tab; broader gameplay was not reverified. | 2026-07-23 | Switchyard Wine overlay test runtime (base `eeb99326c247`; hotpatch build `f9cc05b718`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client (app 4025700) · GPTK 3.0 D3D11/DXGI · `GameOverlayRenderer64.dll` |
 | Terraria | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Steam | Working — window movement and STORE/LIBRARY/COMMUNITY hover menus were verified without white or blank regions; broader client and game workflows were not reverified. | 2026-07-22 | Switchyard Wine development runtime (`d5ec127bafb632ee717819db8eba1d9fccc43e23`, source tree `6207795aa523`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client · CEF remote-DIB surfaces → persistent HWND-scoped CAContext layer · GPTK 3.0 environment with Wine graphics fallback |
+| Battle.net 2.52.4.17577 | Partially working — an isolated copied-container launch reached the login page with HTTP 200 and its CEF GPU process remained running for the 62-second test. Agent connectivity, authentication, installs, and games were not verified. | 2026-07-23 | Switchyard Wine diagnostic build (`f0b4a95df547`, base `16ede5945aed`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct launcher · CEF/ANGLE D3D9 fallback · released secondary swapchains reassigned on the graphics command stream |
 | KakaoTalk | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct executable · shared Steam prefix |
 | Bro Falls: Ultimate Showdown | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Pratfall | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · Vulkan renderer |
