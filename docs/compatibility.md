@@ -13,7 +13,7 @@ document. Application versions and detailed test steps were not recorded.
 
 | Application | Status | Last confirmed | Runtime | Host environment | Launch / graphics path |
 | --- | --- | --- | --- | --- | --- |
-| Heartopia | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
+| Heartopia | Working — the title screen rendered and the Steam Overlay opened with Shift+Tab; broader gameplay was not reverified. | 2026-07-23 | Switchyard Wine overlay test runtime (base `eeb99326c247`; hotpatch build `f9cc05b718`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client (app 4025700) · GPTK 3.0 D3D11/DXGI · `GameOverlayRenderer64.dll` |
 | Terraria | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Steam | Working — window movement and STORE/LIBRARY/COMMUNITY hover menus were verified without white or blank regions; broader client and game workflows were not reverified. | 2026-07-22 | Switchyard Wine development runtime (`d5ec127bafb632ee717819db8eba1d9fccc43e23`, source tree `6207795aa523`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client · CEF remote-DIB surfaces → persistent HWND-scoped CAContext layer · GPTK 3.0 environment with Wine graphics fallback |
 | KakaoTalk | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct executable · shared Steam prefix |
