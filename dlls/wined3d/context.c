@@ -37,10 +37,41 @@ void context_resource_released(const struct wined3d_device *device, struct wined
     {
         struct wined3d_context *context = device->contexts[i];
 
-        if (&context->current_rt.texture->resource == resource)
+        if (context->current_rt.texture && &context->current_rt.texture->resource == resource)
         {
             context->current_rt.texture = NULL;
             context->current_rt.sub_resource_idx = 0;
+        }
+    }
+}
+
+void context_swapchain_released(const struct wined3d_device *device, struct wined3d_swapchain *swapchain)
+{
+    struct wined3d_swapchain *replacement = NULL;
+    unsigned int i;
+
+    wined3d_from_cs(device->cs);
+
+    if (device->swapchain_count && device->swapchains[0] != swapchain)
+        replacement = device->swapchains[0];
+
+    for (i = 0; i < device->context_count; ++i)
+    {
+        struct wined3d_context *context = device->contexts[i];
+
+        if (context->current_rt.texture && context->current_rt.texture->swapchain == swapchain)
+        {
+            TRACE("Invalidating render target %p for released swapchain %p in context %p.\n",
+                    context->current_rt.texture, swapchain, context);
+            context->current_rt.texture = NULL;
+            context->current_rt.sub_resource_idx = 0;
+        }
+
+        if (context->swapchain == swapchain)
+        {
+            TRACE("Switching context %p from released swapchain %p to %p.\n",
+                    context, swapchain, replacement);
+            context->swapchain = replacement;
         }
     }
 }

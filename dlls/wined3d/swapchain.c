@@ -101,6 +101,13 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
     }
 }
 
+static void wined3d_swapchain_cleanup_contexts(void *object)
+{
+    struct wined3d_swapchain *swapchain = object;
+
+    context_swapchain_released(swapchain->device, swapchain);
+}
+
 void wined3d_swapchain_gl_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
 {
     wined3d_swapchain_cleanup(&swapchain_gl->s);
@@ -169,6 +176,7 @@ ULONG CDECL wined3d_swapchain_decref(struct wined3d_swapchain *swapchain)
         device = swapchain->device;
         if (device->swapchain_count && device->swapchains[0] == swapchain)
             wined3d_device_uninit_3d(device);
+        wined3d_cs_destroy_object(device->cs, wined3d_swapchain_cleanup_contexts, swapchain);
         wined3d_cs_finish(device->cs, WINED3D_CS_QUEUE_DEFAULT);
 
         if (swapchain->dc)
@@ -1920,6 +1928,7 @@ HRESULT CDECL wined3d_swapchain_create(struct wined3d_device *device,
         wined3d_mutex_lock();
         if (FAILED(hr = wined3d_device_set_implicit_swapchain(device, object)))
         {
+            wined3d_cs_destroy_object(device->cs, wined3d_swapchain_cleanup_contexts, object);
             wined3d_cs_finish(device->cs, WINED3D_CS_QUEUE_DEFAULT);
             device->adapter->adapter_ops->adapter_destroy_swapchain(object);
             wined3d_mutex_unlock();
