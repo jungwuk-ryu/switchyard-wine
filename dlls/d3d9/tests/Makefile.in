@@ -5,4 +5,5 @@ SOURCES = \
 	d3d9ex.c \
 	device.c \
 	stateblock.c \
+	swapchain.c \
 	visual.c

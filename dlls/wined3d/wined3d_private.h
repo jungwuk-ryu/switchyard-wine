@@ -2026,6 +2026,7 @@ BOOL wined3d_clip_blit(const RECT *clip_rect, RECT *clipped, RECT *other);
 void context_invalidate_compute_state(struct wined3d_context *context, DWORD state_id);
 void context_invalidate_state(struct wined3d_context *context, unsigned int state_id);
 void context_resource_released(const struct wined3d_device *device, struct wined3d_resource *resource);
+void context_swapchain_released(const struct wined3d_device *device, struct wined3d_swapchain *swapchain);
 void context_restore(struct wined3d_context *context, struct wined3d_texture *texture,
         unsigned int sub_resource_idx);
 void context_set_tls_idx(DWORD idx);
