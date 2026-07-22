@@ -107,6 +107,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) setupObservations;
     - (void) applicationDidBecomeActive:(NSNotification *)notification;
+    - (NSString*) currentApplicationMenuName;
+    - (void) setApplicationMenuName:(NSString*)name;
 
     static void PerformRequest(void *info);
 
@@ -199,6 +201,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
     - (void) dealloc
     {
         [windowsBeingDragged release];
+        [applicationMenuName release];
         [cursor release];
         [screenFrameCGRects release];
         [applicationIcon release];
@@ -226,7 +229,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
         {
             NSMenu* mainMenu;
             NSMenu* submenu;
-            NSString* bundleName;
+            NSString* displayName;
             NSString* title;
             NSMenuItem* item;
 
@@ -244,11 +247,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
             mainMenu = [[[NSMenu alloc] init] autorelease];
 
             // Application menu
-            submenu = [[[NSMenu alloc] initWithTitle:WineLocalizedString(STRING_MENU_WINE)] autorelease];
-            bundleName = [[NSBundle mainBundle] objectForInfoDictionaryKey:(NSString*)kCFBundleNameKey];
+            displayName = [self currentApplicationMenuName];
+            submenu = [[[NSMenu alloc] initWithTitle:displayName] autorelease];
 
-            if ([bundleName length])
-                title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME), bundleName];
+            if ([displayName length])
+                title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME), displayName];
             else
                 title = WineLocalizedString(STRING_MENU_ITEM_HIDE);
             item = [submenu addItemWithTitle:title action:@selector(hide:) keyEquivalent:@""];
@@ -264,14 +267,14 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
             [submenu addItem:[NSMenuItem separatorItem]];
 
-            if ([bundleName length])
-                title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_QUIT_APPNAME), bundleName];
+            if ([displayName length])
+                title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_QUIT_APPNAME), displayName];
             else
                 title = WineLocalizedString(STRING_MENU_ITEM_QUIT);
             item = [submenu addItemWithTitle:title action:@selector(terminate:) keyEquivalent:@"q"];
             [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
             item = [[[NSMenuItem alloc] init] autorelease];
-            [item setTitle:WineLocalizedString(STRING_MENU_WINE)];
+            [item setTitle:displayName];
             [item setSubmenu:submenu];
             [mainMenu addItem:item];
 
@@ -303,6 +306,81 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
             [NSApp setApplicationIconImage:self.applicationIcon];
         }
+    }
+
+    - (NSString*) currentApplicationMenuName
+    {
+        NSString* bundleName;
+
+        if ([applicationMenuName length])
+            return applicationMenuName;
+
+        bundleName = [[NSBundle mainBundle] objectForInfoDictionaryKey:(NSString*)kCFBundleNameKey];
+        if ([bundleName length])
+            return bundleName;
+
+        return WineLocalizedString(STRING_MENU_WINE);
+    }
+
+    - (void) setApplicationMenuName:(NSString*)name
+    {
+        NSMenu* mainMenu;
+        NSMenuItem* applicationMenuItem;
+        NSMenu* applicationMenu;
+
+        if (![name length] || [applicationMenuName isEqualToString:name])
+            return;
+
+        [applicationMenuName release];
+        applicationMenuName = [name copy];
+
+        mainMenu = [NSApp mainMenu];
+        if (![mainMenu numberOfItems])
+            return;
+
+        applicationMenuItem = [mainMenu itemAtIndex:0];
+        applicationMenu = [applicationMenuItem submenu];
+        if (!applicationMenu)
+            return;
+
+        [applicationMenuItem setTitle:applicationMenuName];
+        [applicationMenu setTitle:applicationMenuName];
+
+        for (NSMenuItem* item in [applicationMenu itemArray])
+        {
+            if ([item action] == @selector(hide:))
+            {
+                [item setTitle:[NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME),
+                                                          applicationMenuName]];
+            }
+            else if ([item action] == @selector(terminate:))
+            {
+                [item setTitle:[NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_QUIT_APPNAME),
+                                                          applicationMenuName]];
+            }
+        }
+    }
+
+    - (void) updateApplicationMenuNameForWindow:(WineWindow*)window
+    {
+        NSString* title;
+
+        if ([window isExcludedFromWindowsMenu] ||
+            (![window isVisible] && ![window isMiniaturized]))
+            return;
+
+        title = [[window title] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (![title length])
+            return;
+
+        /* Keep a visible representative window so transient dialogs do not
+           rename the application menu. */
+        if (applicationMenuNameWindow && applicationMenuNameWindow != window &&
+            ([applicationMenuNameWindow isVisible] || [applicationMenuNameWindow isMiniaturized]))
+            return;
+
+        applicationMenuNameWindow = window;
+        [self setApplicationMenuName:title];
     }
 
     - (void) transformProcessToAccessoryIfNoVisibleWindows
@@ -1888,6 +1966,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             NSWindow* window = [note object];
             if ([window isKindOfClass:[WineWindow class]] && [(WineWindow*)window isFakingClose])
                 return;
+            if (window == applicationMenuNameWindow)
+                applicationMenuNameWindow = nil;
             [keyWindows removeObjectIdenticalTo:window];
             if (window == lastTargetWindow)
                 lastTargetWindow = nil;

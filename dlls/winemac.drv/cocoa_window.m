@@ -2285,7 +2285,10 @@ static void WineCompositorDetachView(WineContentView* view)
             [self windowDidResize:nil skipSizeMove:TRUE];
 
             if (![self isExcludedFromWindowsMenu])
+            {
                 [NSApp addWindowsItem:self title:[self title] filename:NO];
+                [controller updateApplicationMenuNameForWindow:self];
+            }
         }
     }
 
@@ -3976,9 +3979,12 @@ void macdrv_set_cocoa_window_title(macdrv_window w, const unsigned short* title,
     else
         titleString = @"";
     OnMainThreadAsync(^{
+        WineApplicationController* controller = [WineApplicationController sharedController];
+
         [window setTitle:titleString];
         if ([window isOrderedIn] && ![window isExcludedFromWindowsMenu])
             [NSApp changeWindowsItem:window title:titleString filename:NO];
+        [controller updateApplicationMenuNameForWindow:window];
     });
 }
 }

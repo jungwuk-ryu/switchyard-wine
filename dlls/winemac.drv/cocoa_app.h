@@ -88,6 +88,9 @@ enum {
 
     NSImage* applicationIcon;
 
+    NSString* applicationMenuName;
+    WineWindow* applicationMenuNameWindow;
+
     BOOL beenActive;
 
     NSMutableSet* windowsBeingDragged;
@@ -113,6 +116,7 @@ enum {
     - (double) ticksForEventTime:(NSTimeInterval)eventTime;
 
     - (void) windowGotFocus:(WineWindow*)window;
+    - (void) updateApplicationMenuNameForWindow:(WineWindow*)window;
 
     - (BOOL) waitUntilQueryDone:(bool*)done timeout:(NSDate*)timeout processEvents:(BOOL)processEvents;
 
