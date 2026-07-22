@@ -109,6 +109,13 @@ struct unwind_builtin_dll_params
     CONTEXT                    *context;
 };
 
+struct wine_get_unix_env_params
+{
+    const char   *name;
+    char         *value;
+    unsigned int  value_size;
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -126,6 +133,7 @@ enum ntdll_unix_funcs
     unix_register_non_native_code_region,
     unix_system_time_precise,
     unix_call_native_callback_args,
+    unix_get_unix_env,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

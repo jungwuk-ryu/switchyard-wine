@@ -1770,6 +1770,7 @@
 @ extern -private __wine_unix_call_dispatcher
 @ extern -private -arch=arm64ec __wine_unix_call_dispatcher_arm64ec
 @ extern -private __wine_unixlib_handle
+@ stdcall __wine_get_unix_env(ptr ptr long)
 
 # Debugging
 @ stdcall -norelay __wine_dbg_write(ptr long)

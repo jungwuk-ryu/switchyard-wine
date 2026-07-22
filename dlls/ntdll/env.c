@@ -730,3 +730,19 @@ void init_user_process_params(void)
     set_wow64_environment( &new_params->Environment );
     new_params->EnvironmentSize = RtlSizeHeap( GetProcessHeap(), 0, new_params->Environment );
 }
+
+
+/**********************************************************************
+ *      __wine_get_unix_env
+ */
+NTSTATUS WINAPI __wine_get_unix_env( const char *name, char *value, unsigned int value_size )
+{
+    struct wine_get_unix_env_params params =
+    {
+        .name = name,
+        .value = value,
+        .value_size = value_size,
+    };
+
+    return WINE_UNIX_CALL( unix_get_unix_env, &params );
+}

@@ -1157,6 +1157,20 @@ static NTSTATUS unixcall_register_non_native_code_region( void *args )
 }
 
 
+static NTSTATUS unixcall_wine_get_unix_env( void *args )
+{
+    struct wine_get_unix_env_params *params = args;
+    const char *value;
+    size_t len;
+
+    if (!(value = getenv( params->name ))) return STATUS_VARIABLE_NOT_FOUND;
+    len = strlen( value ) + 1;
+    if (len > params->value_size) return STATUS_BUFFER_TOO_SMALL;
+    memcpy( params->value, value, len );
+    return STATUS_SUCCESS;
+}
+
+
 #ifdef _WIN64
 static NTSTATUS wow64_native_thread_func( void *args )
 {
@@ -1182,6 +1196,24 @@ static NTSTATUS wow64_register_non_native_code_region( void *args )
 {
     return STATUS_NOT_SUPPORTED;
 }
+
+static NTSTATUS wow64_wine_get_unix_env( void *args )
+{
+    const struct
+    {
+        ULONG name;
+        ULONG value;
+        unsigned int value_size;
+    } *params32 = args;
+    struct wine_get_unix_env_params params =
+    {
+        .name = ULongToPtr( params32->name ),
+        .value = ULongToPtr( params32->value ),
+        .value_size = params32->value_size,
+    };
+
+    return unixcall_wine_get_unix_env( &params );
+}
 #endif
 
 
@@ -1202,6 +1234,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_register_non_native_code_region,
     system_time_precise,
     unixcall_native_callback_args,
+    unixcall_wine_get_unix_env,
 };
 
 
@@ -1227,6 +1260,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_register_non_native_code_region,
     system_time_precise,
     wow64_native_callback_args,
+    wow64_wine_get_unix_env,
 };
 
 #endif  /* _WIN64 */
