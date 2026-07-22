@@ -166,7 +166,7 @@ NTSTATUS WINAPI HidP_GetButtonCaps( HIDP_REPORT_TYPE report_type, HIDP_BUTTON_CA
     return HidP_GetSpecificButtonCaps( report_type, 0, 0, 0, caps, caps_count, preparsed_data );
 }
 
-NTSTATUS WINAPI HidP_GetCaps( PHIDP_PREPARSED_DATA preparsed_data, HIDP_CAPS *caps )
+NTSTATUS WINAPI DECLSPEC_HOTPATCH HidP_GetCaps( PHIDP_PREPARSED_DATA preparsed_data, HIDP_CAPS *caps )
 {
     struct hid_preparsed_data *preparsed = (struct hid_preparsed_data *)preparsed_data;
     struct hid_value_caps *it, *end;
@@ -898,7 +898,8 @@ static NTSTATUS count_data( const struct hid_value_caps *caps, void *user )
     return HIDP_STATUS_SUCCESS;
 }
 
-ULONG WINAPI HidP_MaxDataListLength( HIDP_REPORT_TYPE report_type, PHIDP_PREPARSED_DATA preparsed_data )
+ULONG WINAPI DECLSPEC_HOTPATCH HidP_MaxDataListLength( HIDP_REPORT_TYPE report_type,
+                                                       PHIDP_PREPARSED_DATA preparsed_data )
 {
     struct hid_preparsed_data *preparsed = (struct hid_preparsed_data *)preparsed_data;
     struct caps_filter filter = {.usage_page = USAGE_ANY, .usage = USAGE_ANY};

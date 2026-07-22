@@ -21,6 +21,137 @@ struct test_context
     HANDLE handle;
 };
 
+typedef PVOID (WINAPI *rtl_pc_to_file_header_func)(PVOID, PVOID *);
+
+static int verify_callback_module(const char *object, void *entry, unsigned int index,
+                                  HMODULE expected,
+                                  rtl_pc_to_file_header_func rtl_pc_to_file_header)
+{
+    HMODULE module = NULL;
+    void *header = NULL;
+
+    if (!GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             (const WCHAR *)entry, &module ) || module != expected)
+    {
+        fprintf( stderr, "%s entry %u resolved to module %p, expected %p\n",
+                 object, index, module, expected );
+        return 0;
+    }
+
+    if (rtl_pc_to_file_header( entry, &header ) != expected || header != expected)
+    {
+        fprintf( stderr, "RtlPcToFileHeader(%s entry %u) returned %p, expected %p\n",
+                 object, index, header, expected );
+        return 0;
+    }
+
+    return 1;
+}
+
+static int verify_dxgi_factory_module(void)
+{
+    union
+    {
+        FARPROC proc;
+        rtl_pc_to_file_header_func rtl_pc_to_file_header;
+    } function;
+    static const unsigned int entries[] = { 10, 15 };
+    static const BYTE hotpatch[8] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    rtl_pc_to_file_header_func rtl_pc_to_file_header;
+    IDXGIFactory2 *second_factory = NULL;
+    IDXGIFactory2 *factory = NULL;
+    BYTE saved[sizeof(hotpatch)];
+    HMODULE expected, ntdll;
+    DWORD old_protect, unused;
+    void **vtable, *header;
+    void *patched_entry;
+    HRESULT hr;
+    unsigned int i;
+    int hotpatch_ok = 0;
+
+    expected = GetModuleHandleW( L"dxgi.dll" );
+    ntdll = GetModuleHandleW( L"ntdll.dll" );
+    function.proc = ntdll ? GetProcAddress( ntdll, "RtlPcToFileHeader" ) : NULL;
+    rtl_pc_to_file_header = function.rtl_pc_to_file_header;
+    if (!expected || !rtl_pc_to_file_header)
+    {
+        fprintf( stderr, "Could not resolve DXGI or RtlPcToFileHeader\n" );
+        return 0;
+    }
+
+    hr = CreateDXGIFactory1( &IID_IDXGIFactory2, (void **)&factory );
+    if (FAILED(hr))
+    {
+        fprintf( stderr, "CreateDXGIFactory1(IDXGIFactory2) failed: %#lx\n", hr );
+        return 0;
+    }
+
+    vtable = *(void ***)factory;
+    for (i = 0; i < ARRAYSIZE(entries); ++i)
+    {
+        if (!verify_callback_module( "DXGI factory", vtable[entries[i]], entries[i],
+                                     expected, rtl_pc_to_file_header ))
+        {
+            IDXGIFactory2_Release( factory );
+            return 0;
+        }
+    }
+
+    patched_entry = vtable[15];
+    if (!VirtualProtect( patched_entry, sizeof(hotpatch), PAGE_EXECUTE_READWRITE,
+                         &old_protect ))
+    {
+        fprintf( stderr, "Could not make factory entry 15 writable: %lu\n", GetLastError() );
+        IDXGIFactory2_Release( factory );
+        return 0;
+    }
+    memcpy( saved, patched_entry, sizeof(saved) );
+    memcpy( patched_entry, hotpatch, sizeof(hotpatch) );
+    FlushInstructionCache( GetCurrentProcess(), patched_entry, sizeof(hotpatch) );
+
+    if (!verify_callback_module( "DXGI factory", patched_entry, 15, expected,
+                                 rtl_pc_to_file_header ))
+        goto restore_hotpatch;
+
+    hr = CreateDXGIFactory1( &IID_IDXGIFactory2, (void **)&second_factory );
+    if (FAILED(hr))
+    {
+        fprintf( stderr, "CreateDXGIFactory1 after hotpatch failed: %#lx\n", hr );
+        goto restore_hotpatch;
+    }
+    if ((*(void ***)second_factory)[15] != patched_entry)
+    {
+        fprintf( stderr, "Factory entry 15 was rewrapped after hotpatch: %p -> %p\n",
+                 patched_entry, (*(void ***)second_factory)[15] );
+        goto restore_hotpatch;
+    }
+    hotpatch_ok = 1;
+
+restore_hotpatch:
+    memcpy( patched_entry, saved, sizeof(saved) );
+    FlushInstructionCache( GetCurrentProcess(), patched_entry, sizeof(saved) );
+    VirtualProtect( patched_entry, sizeof(saved), old_protect, &unused );
+    if (second_factory) IDXGIFactory2_Release( second_factory );
+    if (!hotpatch_ok)
+    {
+        IDXGIFactory2_Release( factory );
+        return 0;
+    }
+
+    header = (void *)(uintptr_t)1;
+    if (rtl_pc_to_file_header( (void *)(uintptr_t)1, &header ) || header)
+    {
+        fprintf( stderr, "RtlPcToFileHeader accepted an unmapped address\n" );
+        IDXGIFactory2_Release( factory );
+        return 0;
+    }
+
+    IDXGIFactory2_Release( factory );
+    printf( "DXGI factory callback module attribution passed\n" );
+    return 1;
+}
+
 static int verify_factory_adapter(void)
 {
     static const D3D_FEATURE_LEVEL feature_levels[] =
@@ -406,6 +537,7 @@ int main( int argc, char **argv )
     if (argc >= 2 && !strcmp( argv[1], "adapter" ))
         return verify_factory_adapter() ? 0 : 1;
 
+    if (!verify_dxgi_factory_module()) return 1;
     if (!verify_factory_adapter()) return 1;
     if (!create_device( &device, &context )) return 1;
     if (!create_device( &other_device, &other_context )) return 1;

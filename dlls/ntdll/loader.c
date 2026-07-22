@@ -3458,6 +3458,13 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 
 static BYTE *native_callback_thunk_ptr;
 static BYTE *native_callback_thunk_end;
+struct switchyard_native_callback_thunk_region
+{
+    struct switchyard_native_callback_thunk_region *next;
+    BYTE *base;
+    BYTE *end;
+};
+static struct switchyard_native_callback_thunk_region *native_callback_thunk_regions;
 static const BYTE native_callback_thunk_marker[] = { 0x66, 0x90, 0x66, 0x90, 0x66, 0x90, 0x66, 0x90 };
 static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0x1f, 0x40, 0x00 };
 #define SWITCHYARD_NATIVE_CALLBACK_E_FAIL ((ULONG_PTR)0x80004005)
@@ -3486,6 +3493,7 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_UPDATE_SUBRESOURCE 0x20000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE 0x40000
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D12_OUTPUT_VTABLE 0x80000
+#define SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI 0x100000
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
@@ -4163,31 +4171,37 @@ static ULONG switchyard_dxgi_factory_vtable_entry_flags( unsigned int index )
     case 11: /* CreateSoftwareAdapter */
     case 12: /* EnumAdapters1 */
     case 27: /* EnumWarpAdapter */
-        return switchyard_com_iunknown_output_flags( 2 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 2 );
 
     case 10: /* CreateSwapChain */
     case 26: /* EnumAdapterByLuid */
-        return switchyard_com_iunknown_output_flags( 3 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 3 );
 
     case 24: /* CreateSwapChainForComposition */
     case 29: /* EnumAdapterByGpuPreference */
-        return switchyard_com_iunknown_output_flags( 4 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 4 );
 
     case 16: /* CreateSwapChainForCoreWindow */
-        return switchyard_com_iunknown_output_flags( 5 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 5 );
 
     case 15: /* CreateSwapChainForHwnd */
-        return switchyard_com_iunknown_output_flags( 6 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 6 );
 
     default:
-        return 0;
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI;
     }
 }
 
 static ULONG switchyard_dxgi_adapter_vtable_entry_flags( unsigned int index )
 {
     /* GetParent and EnumOutputs return a COM interface through argument 2. */
-    return index == 6 || index == 7 ? switchyard_com_iunknown_output_flags( 2 ) : 0;
+    return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+           (index == 6 || index == 7 ? switchyard_com_iunknown_output_flags( 2 ) : 0);
 }
 
 static ULONG switchyard_dxgi_output_vtable_entry_flags( unsigned int index )
@@ -4196,13 +4210,15 @@ static ULONG switchyard_dxgi_output_vtable_entry_flags( unsigned int index )
     {
     case 6:  /* GetParent */
     case 22: /* DuplicateOutput */
-        return switchyard_com_iunknown_output_flags( 2 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 2 );
 
     case 26: /* DuplicateOutput1 */
-        return switchyard_com_iunknown_output_flags( 5 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 5 );
 
     default:
-        return 0;
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI;
     }
 }
 
@@ -4214,17 +4230,20 @@ static ULONG switchyard_dxgi_swapchain_vtable_entry_flags( unsigned int index )
     case 7:  /* GetDevice */
     case 11: /* GetFullscreenState */
     case 21: /* GetCoreWindow */
-        return switchyard_com_iunknown_output_flags( 2 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 2 );
 
     case 9:  /* GetBuffer */
-        return switchyard_d3d12_output_flags( 3 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_d3d12_output_flags( 3 );
 
     case 15: /* GetContainingOutput */
     case 24: /* GetRestrictToOutput */
-        return switchyard_com_iunknown_output_flags( 1 );
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               switchyard_com_iunknown_output_flags( 1 );
 
     default:
-        return 0;
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI;
     }
 }
 
@@ -4517,6 +4536,7 @@ static void switchyard_wrap_com_iunknown_output_vtable(
                 ULONG flags = i == 7 || i == 12 ?
                               switchyard_com_iunknown_output_flags( 2 ) : 0;
 
+                flags |= SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI;
                 if (i == 8)
                     flags |= SWITCHYARD_NATIVE_CALLBACK_DXGI_RESOURCE_GET_SHARED_HANDLE;
 
@@ -6357,20 +6377,7 @@ static void register_native_callback_thunk_region( void *base, SIZE_T size )
 
 static BOOL is_native_callback_thunk( const void *ptr )
 {
-    const BYTE *code = ptr;
-    BOOL ret = FALSE;
-
-    __TRY
-    {
-        ret = !memcmp( code, native_callback_thunk_marker, sizeof(native_callback_thunk_marker) );
-    }
-    __EXCEPT_PAGE_FAULT
-    {
-        ret = FALSE;
-    }
-    __ENDTRY
-
-    return ret;
+    return switchyard_get_native_callback_thunk_info( (void *)ptr, NULL, NULL, NULL );
 }
 
 static BOOL is_pe_callback_thunk( const void *ptr )
@@ -6393,6 +6400,7 @@ static BOOL is_pe_callback_thunk( const void *ptr )
 
 static BYTE *alloc_native_callback_thunk( SIZE_T size )
 {
+    struct switchyard_native_callback_thunk_region *new_region;
     void *new_region_base = NULL;
     SIZE_T new_region_size = 0;
     BYTE *ret = NULL;
@@ -6407,8 +6415,14 @@ static BYTE *alloc_native_callback_thunk( SIZE_T size )
         if (!NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &alloc_size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE ))
         {
-            native_callback_thunk_ptr = base;
-            native_callback_thunk_end = native_callback_thunk_ptr + alloc_size;
+            new_region = base;
+            new_region->next = native_callback_thunk_regions;
+            new_region->end = (BYTE *)base + alloc_size;
+            native_callback_thunk_regions = new_region;
+            native_callback_thunk_ptr = (BYTE *)base +
+                                        ((sizeof(*new_region) + 15) & ~15);
+            new_region->base = native_callback_thunk_ptr;
+            native_callback_thunk_end = (BYTE *)base + alloc_size;
             new_region_base = base;
             new_region_size = alloc_size;
         }
@@ -6421,6 +6435,17 @@ static BYTE *alloc_native_callback_thunk( SIZE_T size )
     RtlLeaveCriticalSection( &loader_section );
     if (new_region_base) register_native_callback_thunk_region( new_region_base, new_region_size );
     return ret;
+}
+
+static BOOL switchyard_is_native_callback_thunk_address( const void *ptr )
+{
+    const struct switchyard_native_callback_thunk_region *region;
+    ULONG_PTR address = (ULONG_PTR)ptr;
+
+    for (region = native_callback_thunk_regions; region; region = region->next)
+        if (address >= (ULONG_PTR)region->base && address < (ULONG_PTR)region->end)
+            return TRUE;
+    return FALSE;
 }
 
 static BYTE *alloc_native_callback_thunk_with_info(
@@ -6443,7 +6468,10 @@ static BOOL switchyard_get_native_callback_thunk_info(
     struct switchyard_native_callback_thunk_info *info;
     BOOL ret = FALSE;
 
-    if (!is_native_callback_thunk( thunk )) return FALSE;
+    /* Steam and similar overlays hotpatch the entry bytes in place.  The
+     * allocation and immutable header still identify our thunk after its
+     * marker has been replaced by a jump. */
+    if (!switchyard_is_native_callback_thunk_address( thunk )) return FALSE;
     __TRY
     {
         info = (struct switchyard_native_callback_thunk_info *)thunk - 1;
@@ -6798,7 +6826,8 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
         switchyard_allow_gptk_trampoline_data_section( table );
 
         wrap_native_callback_entry_with_flags( &table[1], 3,
-                                               SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_FACTORY_OUTPUT_VTABLE ); /* CreateDXGIFactory2 */
+                                               SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_FACTORY_OUTPUT_VTABLE |
+                                               SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI ); /* CreateDXGIFactory2 */
         wrap_native_callback_entry_with_flags( &table[2], 4,
                                                switchyard_d3d12_output_flags( 3 ) ); /* D3D12CreateDevice */
         wrap_native_callback_entry_with_flags( &table[7], 10,
@@ -8219,9 +8248,20 @@ PVOID WINAPI RtlPcToFileHeader( PVOID pc, PVOID *address )
 {
     LDR_DATA_TABLE_ENTRY *module;
     PVOID ret = NULL;
+#ifdef _WIN64
+    WINE_MODREF *wm;
+    ULONG flags;
+#endif
 
     RtlEnterCriticalSection( &loader_section );
     if (!LdrFindEntryForAddress( pc, &module )) ret = module->DllBase;
+#ifdef _WIN64
+    else if (switchyard_is_native_callback_thunk_address( pc ) &&
+             switchyard_get_native_callback_thunk_info( pc, NULL, NULL, &flags ) &&
+             (flags & SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI) &&
+             (wm = find_basename_module( L"dxgi.dll" )))
+        ret = wm->ldr.DllBase;
+#endif
     RtlLeaveCriticalSection( &loader_section );
     *address = ret;
     return ret;
