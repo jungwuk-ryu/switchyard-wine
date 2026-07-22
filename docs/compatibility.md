@@ -21,7 +21,7 @@ document. Application versions and detailed test steps were not recorded.
 | Pratfall | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · Vulkan renderer |
 | Overwatch | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Supermarket Together | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
-| Rockstar Games Launcher | Partially working — form controls update immediately without a focus change; the login flow was not reverified. Idle CPU remains higher than native and is mitigated by a 30 fps `SocialClubHelper.exe` foreign-surface cap. | 2026-07-22 | Switchyard Wine development runtime (`853f1082db553eb94632c245d630291c0642b810`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct launcher · CEF SwiftShader/Vulkan → WGL foreign IOSurface → host CALayer · GPTK 3.0 environment |
+| Rockstar Games Launcher | Partially working — the login flow was not reverified. | 2026-07-22 | Switchyard Wine development runtime (`853f1082db553eb94632c245d630291c0642b810`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct launcher · CEF foreign-surface composition · GPTK 3.0 environment |
 
 ## Status interpretation
 
