@@ -14,24 +14,26 @@ recorded for those entries.
 
 | Application | Status | Last confirmed | Runtime | Host environment | Launch / graphics path |
 | --- | --- | --- | --- | --- | --- |
-| Heartopia | Working — the title screen rendered and the Steam Overlay opened with Shift+Tab; broader gameplay was not reverified. | 2026-07-23 | Switchyard Wine overlay test runtime (base `eeb99326c247`; hotpatch build `f9cc05b718`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client (app 4025700) · GPTK 3.0 D3D11/DXGI · `GameOverlayRenderer64.dll` |
+| Heartopia | Working | 2026-07-23 | Switchyard Wine overlay test runtime (base `eeb99326c247`; hotpatch build `f9cc05b718`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client (app 4025700) · GPTK 3.0 D3D11/DXGI · `GameOverlayRenderer64.dll` |
 | Terraria | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
-| Steam | Working — window movement and STORE/LIBRARY/COMMUNITY hover menus were verified without white or blank regions; broader client and game workflows were not reverified. | 2026-07-22 | Switchyard Wine development runtime (`d5ec127bafb632ee717819db8eba1d9fccc43e23`, source tree `6207795aa523`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client · CEF remote-DIB surfaces → persistent HWND-scoped CAContext layer · GPTK 3.0 environment with Wine graphics fallback |
-| Battle.net 2.52.5.17620 | Working — the authenticated home and game library, friends list, and friend chat were verified; opening chat no longer raised the prior 32-bit `0xe0000008` debugger. An Overwatch download was active, but installation completion and game launch were not tested. | 2026-07-23 | Switchyard Wine diagnostic build (`9a1ff5894dc3`, base `16ede5945aed`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct `Battle.net.exe` · CEF/ANGLE GLES2 fallback · default 4 GiB WoW64 address space with `WINE_LARGE_ADDRESS_AWARE=0` opt-out · CEF scale forced to 1 by the app |
+| Steam | Working | 2026-07-22 | Switchyard Wine development runtime (`d5ec127bafb632ee717819db8eba1d9fccc43e23`, source tree `6207795aa523`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client · CEF remote-DIB surfaces → persistent HWND-scoped CAContext layer · GPTK 3.0 environment with Wine graphics fallback |
+| Battle.net 2.52.5.17620 | Working | 2026-07-23 | Switchyard Wine diagnostic build (`9a1ff5894dc3`, base `16ede5945aed`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct `Battle.net.exe` · CEF/ANGLE GLES2 fallback · default 4 GiB WoW64 address space with `WINE_LARGE_ADDRESS_AWARE=0` opt-out · CEF scale forced to 1 by the app |
 | KakaoTalk | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct executable · shared Steam prefix |
 | Bro Falls: Ultimate Showdown | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Pratfall | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · Vulkan renderer |
 | Overwatch | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Supermarket Together | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
-| Rockstar Games Launcher | Partially working — the login flow was not reverified. | 2026-07-22 | Switchyard Wine development runtime (`853f1082db553eb94632c245d630291c0642b810`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct launcher · CEF foreign-surface composition · GPTK 3.0 environment |
-| RV There Yet? 1.2.0.17491 | Working through the main menu — gameplay was not tested. | 2026-07-23 | Switchyard Wine development runtime (`switchyard-local-wow64-x86_64-d9ce85d3f02b-dirty-daf7e86ab65b-4835e0c18f43-b4525679e7da-9245db166022-4fbf9011be92-1b749a3204a2-b40553c5dc41-62f8fecd4b11`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam default launch (App ID 3949040; no game launch options) · GPTK 3.0 · Direct3D 12 / SM6 |
-| Epic Games Launcher Setup 20.1.0 | Working — the managed telemetry action and final MSI commit completed; launcher startup, self-update, and login were not tested. | 2026-07-22 | Switchyard Wine development runtime (`eeb99326c247dca4a78b05ddaef13b3ac08dc24e`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct MSI (`epic-games-launcher-20-1-0.msi`) · dedicated Switchyard container · Wine graphics path with GPTK overlay disabled |
+| Rockstar Games Launcher | Working | 2026-07-22 | Switchyard Wine development runtime (`853f1082db553eb94632c245d630291c0642b810`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct launcher · CEF foreign-surface composition · GPTK 3.0 environment |
+| RV There Yet? 1.2.0.17491 | Working | 2026-07-23 | Switchyard Wine development runtime (`switchyard-local-wow64-x86_64-d9ce85d3f02b-dirty-daf7e86ab65b-4835e0c18f43-b4525679e7da-9245db166022-4fbf9011be92-1b749a3204a2-b40553c5dc41-62f8fecd4b11`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam default launch (App ID 3949040; no game launch options) · GPTK 3.0 · Direct3D 12 / SM6 |
+| Epic Games Launcher Setup 20.1.0 | Working | 2026-07-22 | Switchyard Wine development runtime (`eeb99326c247dca4a78b05ddaef13b3ac08dc24e`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct MSI (`epic-games-launcher-20-1-0.msi`) · dedicated Switchyard container · Wine graphics path with GPTK overlay disabled |
 
 ## Status interpretation
 
 `Working` means that no blocking issue was reported within the workflow exercised by the user.
 Application versions, detailed test steps, session duration, and peripheral combinations were not
-recorded, so this status should not be interpreted as a guarantee that every feature works.
+recorded, so this status should not be interpreted as a guarantee that every feature works. Status
+notes are reserved for confirmed bugs and material limitations, not successful behavior or untested
+workflows.
 
 Compatibility may change with application updates, runtime revisions, macOS versions, hardware,
 or graphics layers. Future updates should record the application version and distribution path,
