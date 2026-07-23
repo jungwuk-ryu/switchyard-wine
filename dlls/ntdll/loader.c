@@ -3494,6 +3494,7 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE 0x40000
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D12_OUTPUT_VTABLE 0x80000
 #define SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI 0x100000
+#define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D_BLOB_OUTPUT_VTABLE 0x200000
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
@@ -4148,6 +4149,12 @@ static ULONG switchyard_d3d12_output_flags( unsigned int output_arg )
            SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D12_OUTPUT_VTABLE;
 }
 
+static ULONG switchyard_d3d_blob_output_flags( unsigned int output_arg )
+{
+    return SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D_BLOB_OUTPUT_VTABLE |
+           SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG( output_arg );
+}
+
 static ULONG switchyard_d3d11_device_child_output_flags( unsigned int output_arg )
 {
     return switchyard_com_iunknown_output_flags( output_arg ) |
@@ -4387,6 +4394,7 @@ static ULONG switchyard_d3d12_device_vtable_entry_flags( unsigned int index )
     case 54: /* CreateHeap1 */
     case 66: /* AddToStateObject */
     case 75: /* CreateCommandQueue1 */
+    case 81: /* OpenExistingHeapFromAddress1 */
         output_arg = 4;
         break;
 
@@ -4399,6 +4407,7 @@ static ULONG switchyard_d3d12_device_vtable_entry_flags( unsigned int index )
     case 12: /* CreateCommandList */
     case 55: /* CreateReservedResource1 */
     case 61: /* CreateMetaCommand */
+    case 82: /* CreateRootSignatureFromSubobjectInLibrary */
         output_arg = 6;
         break;
 
@@ -4553,6 +4562,33 @@ static void switchyard_wrap_com_iunknown_output_vtable(
                 switchyard_wrap_native_callback_vtable_slot(
                     &vtable[i], d3d11_texture2d_argc[i - 7], 0 );
         }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+}
+
+static void switchyard_wrap_d3d_blob_output_vtable( ULONG_PTR output )
+{
+    void **vtable;
+    void *object;
+
+    if (!output) return;
+
+    __TRY
+    {
+        object = *(void **)output;
+        if (!object || !(vtable = *(void ***)object)) return;
+
+        TRACE( "wrapping D3D blob output %p object %p vtable %p\n",
+               (void *)output, object, vtable );
+        switchyard_wrap_native_callback_vtable_slot(
+            &vtable[0], 3, switchyard_com_iunknown_output_flags( 2 ) );
+        switchyard_wrap_native_callback_vtable_slot( &vtable[1], 1, 0 );
+        switchyard_wrap_native_callback_vtable_slot( &vtable[2], 1, 0 );
+        switchyard_wrap_native_callback_vtable_slot( &vtable[3], 1, 0 );
+        switchyard_wrap_native_callback_vtable_slot( &vtable[4], 1, 0 );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -5413,18 +5449,61 @@ static const ULONG_PTR switchyard_com_vtable_clone_magic =
     (ULONG_PTR)0x5359575654424c45ULL;
 /* Preserve native C++ RTTI and this-adjustment metadata preceding the vtable. */
 #define SWITCHYARD_COM_VTABLE_PREFIX_SIZE 0x30
+#define SWITCHYARD_COM_VTABLE_MAX_ENTRIES 256
+
+static BOOL switchyard_com_vtable_entry_is_callable( void *entry )
+{
+    ULONG_PTR address = (ULONG_PTR)entry;
+
+    /* Itanium C++ vtables are followed by the next subobject's small
+     * offset-to-top value.  Reject those metadata values before applying the
+     * deliberately broad native callback classification. */
+    if (address < 0x10000 || address >= (ULONG_PTR)0x0000800000000000ULL)
+        return FALSE;
+    return is_native_callback_thunk( entry ) || is_native_callback_target( entry );
+}
+
+static void CALLBACK switchyard_leave_loader_section( BOOL normal, void *ctx )
+{
+    (void)normal;
+    RtlLeaveCriticalSection( ctx );
+}
+
+static unsigned int switchyard_get_preserved_com_vtable_entries(
+    void **vtable, unsigned int entries )
+{
+    unsigned int ret = entries;
+
+    RtlEnterCriticalSection( &loader_section );
+    __TRY
+    {
+        __TRY
+        {
+            while (ret < SWITCHYARD_COM_VTABLE_MAX_ENTRIES &&
+                   switchyard_com_vtable_entry_is_callable( vtable[ret] ))
+                ++ret;
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+        }
+        __ENDTRY
+    }
+    __FINALLY_CTX( switchyard_leave_loader_section, &loader_section )
+    return ret;
+}
 
 static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vtable,
-                                                        unsigned int entries )
+                                                        unsigned int entries,
+                                                        BOOL preserve_callable_tail )
 {
     struct switchyard_com_vtable_clone_header *existing_header;
-    struct switchyard_com_vtable_clone_header *header;
+    struct switchyard_com_vtable_clone_header *header = NULL;
+    unsigned int copied_entries = entries;
     void *base = NULL;
     void **copy = NULL;
-    SIZE_T size = sizeof(*header) + SWITCHYARD_COM_VTABLE_PREFIX_SIZE +
-                  entries * sizeof(*copy);
+    SIZE_T size;
 
-    if (!object || !vtable || !size) return NULL;
+    if (!object || !vtable || !entries) return NULL;
 
     __TRY
     {
@@ -5442,6 +5521,18 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     }
     __ENDTRY
 
+    /* D3DMetal implements the COM interfaces as native C++ classes.  Their
+     * primary vtables contain newer public interfaces and private virtual
+     * methods after the IID-visible entries.  Native methods call those
+     * trailing slots directly, so preserve the complete callable prefix while
+     * wrapping only the requested public interface below. */
+    if (preserve_callable_tail)
+        copied_entries = switchyard_get_preserved_com_vtable_entries(
+            vtable, copied_entries );
+
+    size = sizeof(struct switchyard_com_vtable_clone_header) +
+           SWITCHYARD_COM_VTABLE_PREFIX_SIZE +
+           copied_entries * sizeof(*copy);
     if (NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &size,
                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE ))
         return NULL;
@@ -5452,14 +5543,14 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     {
         header->magic = switchyard_com_vtable_clone_magic;
         header->original = vtable;
-        header->entries = entries;
+        header->entries = copied_entries;
         memcpy( (BYTE *)copy - SWITCHYARD_COM_VTABLE_PREFIX_SIZE,
                 (BYTE *)vtable - SWITCHYARD_COM_VTABLE_PREFIX_SIZE,
                 SWITCHYARD_COM_VTABLE_PREFIX_SIZE );
-        memcpy( copy, vtable, entries * sizeof(*copy) );
+        memcpy( copy, vtable, copied_entries * sizeof(*copy) );
         *(void ***)object = copy;
-        TRACE( "cloned COM object %p vtable %p -> %p entries %u\n",
-               object, vtable, copy, entries );
+        TRACE( "cloned COM object %p vtable %p -> %p entries %u, preserved %u\n",
+               object, vtable, copy, entries, copied_entries );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -5536,7 +5627,8 @@ static void CALLBACK switchyard_restore_com_vtable( BOOL normal, void *ctx )
 }
 
 static void switchyard_wrap_com_vtable_jump_targets(
-    void *object, unsigned int entries, BOOL (*uses_scalar_float)(unsigned int),
+    void *object, unsigned int entries, BOOL preserve_callable_tail,
+    BOOL (*uses_scalar_float)(unsigned int),
     ULONG (*entry_flags)(unsigned int) )
 {
     void **vtable, **wrapped_vtable;
@@ -5548,7 +5640,8 @@ static void switchyard_wrap_com_vtable_jump_targets(
     {
         vtable = *(void ***)object;
         if (!vtable) return;
-        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable, entries );
+        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping(
+            object, vtable, entries, preserve_callable_tail );
         if (!wrapped_vtable) return;
         vtable = wrapped_vtable;
         TRACE( "checking COM object %p vtable %p entries %u\n", object, vtable, entries );
@@ -5571,7 +5664,8 @@ static void switchyard_wrap_com_vtable_jump_targets(
 }
 
 static void switchyard_wrap_com_output_vtable_jump_targets(
-    ULONG_PTR output, unsigned int entries, BOOL (*uses_scalar_float)(unsigned int),
+    ULONG_PTR output, unsigned int entries, BOOL preserve_callable_tail,
+    BOOL (*uses_scalar_float)(unsigned int),
     ULONG (*entry_flags)(unsigned int) )
 {
     void *object;
@@ -5589,7 +5683,8 @@ static void switchyard_wrap_com_output_vtable_jump_targets(
     __ENDTRY
 
     TRACE( "checking COM output %p object %p entries %u\n", (void *)output, object, entries );
-    switchyard_wrap_com_vtable_jump_targets( object, entries, uses_scalar_float, entry_flags );
+    switchyard_wrap_com_vtable_jump_targets( object, entries, preserve_callable_tail,
+                                             uses_scalar_float, entry_flags );
 }
 
 enum switchyard_d3d12_interface_kind
@@ -5654,10 +5749,20 @@ static const struct switchyard_d3d12_interface_info switchyard_d3d12_interfaces[
                                 80, SWITCHYARD_D3D12_GRAPHICS_COMMAND_LIST, "ID3D12GraphicsCommandList6" ),
     SWITCHYARD_D3D12_INTERFACE( 0xdd171223, 0x8b61, 0x4769, 0x90, 0xe3, 0x16, 0x0c, 0xcd, 0xe4, 0xe2, 0xc1,
                                 81, SWITCHYARD_D3D12_GRAPHICS_COMMAND_LIST, "ID3D12GraphicsCommandList7" ),
+    SWITCHYARD_D3D12_INTERFACE( 0xee936ef9, 0x599d, 0x4d28, 0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51,
+                                82, SWITCHYARD_D3D12_GRAPHICS_COMMAND_LIST, "ID3D12GraphicsCommandList8" ),
+    SWITCHYARD_D3D12_INTERFACE( 0x34ed2808, 0xffe6, 0x4c2b, 0xb1, 0x1a, 0xca, 0xbd, 0x2b, 0x0c, 0x59, 0xe1,
+                                84, SWITCHYARD_D3D12_GRAPHICS_COMMAND_LIST, "ID3D12GraphicsCommandList9" ),
+    SWITCHYARD_D3D12_INTERFACE( 0x7013c015, 0xd161, 0x4b63, 0xa0, 0x8c, 0x23, 0x85, 0x52, 0xdd, 0x8a, 0xcc,
+                                86, SWITCHYARD_D3D12_GRAPHICS_COMMAND_LIST, "ID3D12GraphicsCommandList10" ),
     SWITCHYARD_D3D12_INTERFACE( 0x0ec870a6, 0x5d7e, 0x4c22, 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed,
                                 19, SWITCHYARD_D3D12_DEVICE_CHILD, "ID3D12CommandQueue" ),
     SWITCHYARD_D3D12_INTERFACE( 0xc54a6b66, 0x72df, 0x4ee8, 0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14,
                                 8, SWITCHYARD_D3D12_DEVICE_CHILD, "ID3D12RootSignature" ),
+    SWITCHYARD_D3D12_INTERFACE( 0x34ab647b, 0x3cc8, 0x46ac, 0x84, 0x1b, 0xc0, 0x96, 0x56, 0x45, 0xc0, 0x46,
+                                4, SWITCHYARD_D3D12_OBJECT, "ID3D12RootSignatureDeserializer" ),
+    SWITCHYARD_D3D12_INTERFACE( 0x7f91ce67, 0x090c, 0x4bb7, 0xb7, 0x8e, 0xed, 0x8f, 0xf2, 0xe3, 0x1d, 0xa0,
+                                5, SWITCHYARD_D3D12_OBJECT, "ID3D12VersionedRootSignatureDeserializer" ),
     SWITCHYARD_D3D12_INTERFACE( 0x765a30f3, 0xf624, 0x4c6f, 0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45,
                                 9, SWITCHYARD_D3D12_PIPELINE_STATE, "ID3D12PipelineState" ),
     SWITCHYARD_D3D12_INTERFACE( 0x0a753dcf, 0xc4d8, 0x4b91, 0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76,
@@ -5688,6 +5793,14 @@ static const struct switchyard_d3d12_interface_info switchyard_d3d12_interfaces[
                                 76, SWITCHYARD_D3D12_DEVICE, "ID3D12Device9" ),
     SWITCHYARD_D3D12_INTERFACE( 0x517f8718, 0xaa66, 0x49f9, 0xb0, 0x2b, 0xa7, 0xab, 0x89, 0xc0, 0x60, 0x31,
                                 79, SWITCHYARD_D3D12_DEVICE, "ID3D12Device10" ),
+    SWITCHYARD_D3D12_INTERFACE( 0x5405c344, 0xd457, 0x444e, 0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39,
+                                80, SWITCHYARD_D3D12_DEVICE, "ID3D12Device11" ),
+    SWITCHYARD_D3D12_INTERFACE( 0x5af5c532, 0x4c91, 0x4cd0, 0xb5, 0x41, 0x15, 0xa4, 0x05, 0x39, 0x5f, 0xc5,
+                                81, SWITCHYARD_D3D12_DEVICE, "ID3D12Device12" ),
+    SWITCHYARD_D3D12_INTERFACE( 0x14eecffc, 0x4df8, 0x40f7, 0xa1, 0x18, 0x5c, 0x81, 0x6f, 0x45, 0x69, 0x5e,
+                                82, SWITCHYARD_D3D12_DEVICE, "ID3D12Device13" ),
+    SWITCHYARD_D3D12_INTERFACE( 0x5f6e592d, 0xd895, 0x44c2, 0x8e, 0x4a, 0x88, 0xad, 0x49, 0x26, 0xd3, 0x23,
+                                83, SWITCHYARD_D3D12_DEVICE, "ID3D12Device14" ),
     SWITCHYARD_D3D12_INTERFACE( 0xc64226a8, 0x9201, 0x46af, 0xb4, 0xcc, 0x53, 0xfb, 0x9f, 0xf7, 0x41, 0x4f,
                                 13, SWITCHYARD_D3D12_PIPELINE_LIBRARY, "ID3D12PipelineLibrary" ),
     SWITCHYARD_D3D12_INTERFACE( 0x80eabf42, 0x2568, 0x4e5e, 0xbd, 0x82, 0xc3, 0x7f, 0x86, 0x96, 0x1d, 0xc3,
@@ -5727,7 +5840,7 @@ static ULONG switchyard_d3d12_pipeline_state_vtable_entry_flags( unsigned int in
 {
     ULONG flags = switchyard_d3d12_device_child_vtable_entry_flags( index );
 
-    if (index == 8) flags |= switchyard_com_iunknown_output_flags( 1 );
+    if (index == 8) flags |= switchyard_d3d_blob_output_flags( 1 );
     return flags;
 }
 
@@ -5741,10 +5854,10 @@ static ULONG switchyard_d3d12_protected_session_vtable_entry_flags( unsigned int
 
 static BOOL switchyard_d3d12_graphics_command_list_entry_uses_scalar_float( unsigned int index )
 {
-    /* ClearDepthStencilView and OMSetDepthBounds pass scalar floats in XMM
-     * registers.  The generic integer callback relay deliberately leaves them
-     * direct, matching the existing D3D11 treatment for such methods. */
-    return index == 47 || index == 62;
+    /* ClearDepthStencilView, OMSetDepthBounds, and RSSetDepthBias pass scalar
+     * floats in XMM registers.  The generic integer callback relay deliberately
+     * leaves them direct, matching the existing D3D11 treatment for such methods. */
+    return index == 47 || index == 62 || index == 82;
 }
 
 static const struct switchyard_d3d12_interface_info *switchyard_find_d3d12_interface( const GUID *iid )
@@ -5824,8 +5937,8 @@ static void switchyard_wrap_d3d12_output_vtable(
 
     TRACE( "wrapping %s output %p entries %u\n", info->name,
            (void *)params->args[output_arg], info->entries );
-    switchyard_wrap_com_output_vtable_jump_targets( params->args[output_arg], info->entries,
-                                                    uses_scalar_float, entry_flags );
+    switchyard_wrap_com_output_vtable_jump_targets(
+        params->args[output_arg], info->entries, TRUE, uses_scalar_float, entry_flags );
 }
 
 static void switchyard_wrap_d3d11_create_device_output_vtables(
@@ -5844,10 +5957,10 @@ static void switchyard_wrap_d3d11_create_device_output_vtables(
         TRACE( "wrapping D3D11CreateDevice outputs device %p context %p\n",
                (void *)params->args[7], (void *)params->args[9] );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[7], d3d11_device_vtable_entries,
-                                                        NULL,
+                                                        FALSE, NULL,
                                                         switchyard_d3d11_device_vtable_entry_flags );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[9], d3d11_device_context_vtable_entries,
-                                                        switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
+                                                        FALSE, switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
                                                         switchyard_d3d11_device_context_vtable_entry_flags );
         switchyard_track_d3d11_context_device( params->args[7], params->args[9] );
         break;
@@ -5855,13 +5968,13 @@ static void switchyard_wrap_d3d11_create_device_output_vtables(
         TRACE( "wrapping D3D11CreateDeviceAndSwapChain outputs swapchain %p device %p context %p\n",
                (void *)params->args[8], (void *)params->args[9], (void *)params->args[11] );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[8], dxgi_swapchain_vtable_entries,
-                                                        NULL,
+                                                        FALSE, NULL,
                                                         switchyard_dxgi_swapchain_vtable_entry_flags );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[9], d3d11_device_vtable_entries,
-                                                        NULL,
+                                                        FALSE, NULL,
                                                         switchyard_d3d11_device_vtable_entry_flags );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[11], d3d11_device_context_vtable_entries,
-                                                        switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
+                                                        FALSE, switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
                                                         switchyard_d3d11_device_context_vtable_entry_flags );
         switchyard_track_d3d11_context_device( params->args[9], params->args[11] );
         break;
@@ -5889,8 +6002,8 @@ static void switchyard_wrap_dxgi_factory_output_vtable(
     {
         object = *(void **)params->args[2];
         if (!object || !(vtable = *(void ***)object)) return;
-        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable,
-                                                                   ARRAY_SIZE(argc) );
+        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping(
+            object, vtable, ARRAY_SIZE(argc), FALSE );
         if (!wrapped_vtable) return;
         vtable = wrapped_vtable;
 
@@ -5932,8 +6045,8 @@ static void switchyard_wrap_dxgi_output_output_vtable(
     {
         object = *(void **)params->args[params->argc - 1];
         if (!object || !(vtable = *(void ***)object)) return;
-        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable,
-                                                                   ARRAY_SIZE(argc) );
+        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping(
+            object, vtable, ARRAY_SIZE(argc), FALSE );
         if (!wrapped_vtable) return;
         vtable = wrapped_vtable;
 
@@ -6002,8 +6115,8 @@ static void switchyard_wrap_dxgi_swapchain_output_vtable(
     {
         object = *(void **)params->args[params->argc - 1];
         if (!object || !(vtable = *(void ***)object)) return;
-        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping( object, vtable,
-                                                                   dxgi_swapchain_vtable_entries );
+        wrapped_vtable = switchyard_clone_com_vtable_for_wrapping(
+            object, vtable, dxgi_swapchain_vtable_entries, FALSE );
         if (!wrapped_vtable) return;
         vtable = wrapped_vtable;
 
@@ -6130,6 +6243,16 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
                 switchyard_note_gfxt_deferred_vtable( ret );
             if ((LONG)ret >= 0)
             {
+                if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D_BLOB_OUTPUT_VTABLE)
+                {
+                    unsigned int output_arg =
+                        (params->flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) >>
+                        SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT;
+
+                    if (output_arg < params->argc)
+                        switchyard_wrap_d3d_blob_output_vtable(
+                            params->args[output_arg] );
+                }
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_COM_IUNKNOWN_OUTPUT_VTABLE)
                     switchyard_wrap_com_iunknown_output_vtable( params );
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D12_OUTPUT_VTABLE)
@@ -6830,6 +6953,16 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
                                                SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI ); /* CreateDXGIFactory2 */
         wrap_native_callback_entry_with_flags( &table[2], 4,
                                                switchyard_d3d12_output_flags( 3 ) ); /* D3D12CreateDevice */
+        wrap_native_callback_entry_with_flags(
+            &table[3], 4,
+            switchyard_d3d_blob_output_flags( 2 ) ); /* D3D12SerializeRootSignature */
+        wrap_native_callback_entry_with_flags(
+            &table[4], 3,
+            switchyard_d3d_blob_output_flags( 1 ) ); /* D3D12SerializeVersionedRootSignature */
+        wrap_native_callback_entry_with_flags(
+            &table[5], 4, switchyard_d3d12_output_flags( 3 ) ); /* D3D12CreateRootSignatureDeserializer */
+        wrap_native_callback_entry_with_flags(
+            &table[6], 4, switchyard_d3d12_output_flags( 3 ) ); /* D3D12CreateVersionedRootSignatureDeserializer */
         wrap_native_callback_entry_with_flags( &table[7], 10,
                                                SWITCHYARD_NATIVE_CALLBACK_WRAP_GFXT_DEFERRED_VTABLE |
                                                SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_OUTPUT_VTABLES ); /* D3D11CreateDevice */

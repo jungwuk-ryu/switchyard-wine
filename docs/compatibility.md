@@ -24,6 +24,7 @@ recorded for those entries.
 | Overwatch | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Supermarket Together | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Rockstar Games Launcher | Partially working — the login flow was not reverified. | 2026-07-22 | Switchyard Wine development runtime (`853f1082db553eb94632c245d630291c0642b810`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Direct launcher · CEF foreign-surface composition · GPTK 3.0 environment |
+| RV There Yet? 1.2.0.17491 | Working through the main menu — gameplay was not tested. | 2026-07-23 | Switchyard Wine development runtime (`switchyard-local-wow64-x86_64-d9ce85d3f02b-dirty-daf7e86ab65b-4835e0c18f43-b4525679e7da-9245db166022-4fbf9011be92-1b749a3204a2-b40553c5dc41-62f8fecd4b11`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam default launch (App ID 3949040; no game launch options) · GPTK 3.0 · Direct3D 12 / SM6 |
 
 ## Status interpretation
 
