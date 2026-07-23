@@ -84,6 +84,7 @@ struct thread
     client_ptr_t           teb;           /* TEB address (in client address space) */
     client_ptr_t           entry_point;   /* entry point (in client address space) */
     affinity_t             affinity;      /* affinity mask */
+    affinity_t             selected_cpu_sets; /* explicit soft CPU set assignment */
     int                    priority;      /* current thread priority */
     int                    base_priority; /* base priority level (relative to process base priority class) */
     int                    disable_boost; /* disable thread priority boost */
@@ -137,6 +138,7 @@ extern unsigned int set_thread_priority( struct thread *thread, int priority );
 extern unsigned int set_thread_base_priority( struct thread *thread, int base_priority );
 extern void set_thread_disable_boost( struct thread *thread, int disable_boost );
 extern int set_thread_affinity( struct thread *thread, affinity_t affinity );
+extern void set_thread_cpu_sets( struct thread *thread, affinity_t cpu_sets );
 extern int suspend_thread( struct thread *thread );
 extern int resume_thread( struct thread *thread );
 

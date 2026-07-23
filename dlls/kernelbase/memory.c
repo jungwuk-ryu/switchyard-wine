@@ -1553,13 +1553,61 @@ BOOL WINAPI GetSystemCpuSetInformation(SYSTEM_CPU_SET_INFORMATION *info, ULONG b
 
 
 /***********************************************************************
+ *           GetThreadSelectedCpuSets   (kernelbase.@)
+ */
+BOOL WINAPI GetThreadSelectedCpuSets(HANDLE thread, ULONG *cpu_set_ids, ULONG count, ULONG *required_count)
+{
+    ULONG length = 0;
+    NTSTATUS status;
+
+    if (!required_count || (!cpu_set_ids && count) || count > ULONG_MAX / sizeof(*cpu_set_ids))
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    status = NtQueryInformationThread( thread, ThreadSelectedCpuSets, cpu_set_ids,
+                                       count * sizeof(*cpu_set_ids), &length );
+    *required_count = length / sizeof(*cpu_set_ids);
+    if (status == STATUS_INFO_LENGTH_MISMATCH) status = STATUS_BUFFER_TOO_SMALL;
+    return set_ntstatus( status );
+}
+
+
+/***********************************************************************
  *           SetThreadSelectedCpuSets   (kernelbase.@)
  */
 BOOL WINAPI SetThreadSelectedCpuSets(HANDLE thread, const ULONG *cpu_set_ids, ULONG count)
 {
-    FIXME( "thread %p, cpu_set_ids %p, count %lu stub.\n", thread, cpu_set_ids, count );
+    if ((!cpu_set_ids && count) || count > ULONG_MAX / sizeof(*cpu_set_ids))
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    return set_ntstatus( NtSetInformationThread( thread, ThreadSelectedCpuSets, cpu_set_ids,
+                                                 count * sizeof(*cpu_set_ids) ));
+}
 
-    return TRUE;
+
+/***********************************************************************
+ *           GetProcessDefaultCpuSets   (kernelbase.@)
+ */
+BOOL WINAPI GetProcessDefaultCpuSets(HANDLE process, ULONG *cpu_set_ids, ULONG count, ULONG *required_count)
+{
+    ULONG length = 0;
+    NTSTATUS status;
+
+    if (!required_count || (!cpu_set_ids && count) || count > ULONG_MAX / sizeof(*cpu_set_ids))
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    status = NtQueryInformationProcess( process, ProcessDefaultCpuSetsInformation, cpu_set_ids,
+                                        count * sizeof(*cpu_set_ids), &length );
+    *required_count = length / sizeof(*cpu_set_ids);
+    if (status == STATUS_INFO_LENGTH_MISMATCH) status = STATUS_BUFFER_TOO_SMALL;
+    return set_ntstatus( status );
 }
 
 
@@ -1568,9 +1616,13 @@ BOOL WINAPI SetThreadSelectedCpuSets(HANDLE thread, const ULONG *cpu_set_ids, UL
  */
 BOOL WINAPI SetProcessDefaultCpuSets(HANDLE process, const ULONG *cpu_set_ids, ULONG count)
 {
-    FIXME( "process %p, cpu_set_ids %p, count %lu stub.\n", process, cpu_set_ids, count );
-
-    return TRUE;
+    if ((!cpu_set_ids && count) || count > ULONG_MAX / sizeof(*cpu_set_ids))
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    return set_ntstatus( NtSetInformationProcess( process, ProcessDefaultCpuSetsInformation, (void *)cpu_set_ids,
+                                                  count * sizeof(*cpu_set_ids) ));
 }
 
 

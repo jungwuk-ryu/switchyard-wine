@@ -45,6 +45,7 @@
 #include <mach/mach_time.h>
 #include <mach/mach_port.h>
 #include <mach/thread_act.h>
+#include <sys/sysctl.h>
 #endif
 
 #include "ntstatus.h"
@@ -271,10 +272,53 @@ static void apply_thread_priority( struct thread *thread )
 
 #elif defined(__APPLE__)
 static unsigned int mach_ticks_per_second;
+static affinity_t apple_perflevel_masks[8 * sizeof(affinity_t)];
+static affinity_t apple_all_cpu_mask;
+static unsigned int apple_perflevel_count;
+
+static int read_apple_perflevel_uint( unsigned int level, const char *property, unsigned int *value )
+{
+    char name[64];
+    size_t size = sizeof(*value);
+
+    snprintf( name, sizeof(name), "hw.perflevel%u.%s", level, property );
+    return !sysctlbyname( name, value, &size, NULL, 0 ) && size == sizeof(*value);
+}
+
+static void init_apple_perflevels(void)
+{
+    affinity_t masks[8 * sizeof(affinity_t)] = {0};
+    unsigned int count, cpu = 0, level;
+    long logical_cpus = sysconf( _SC_NPROCESSORS_ONLN );
+    size_t size = sizeof(count);
+
+    if (logical_cpus <= 0 || logical_cpus > 8 * sizeof(affinity_t)) return;
+    if (sysctlbyname( "hw.nperflevels", &count, &size, NULL, 0 ) || size != sizeof(count)
+        || count < 2 || count > ARRAY_SIZE(masks))
+        return;
+
+    for (level = 0; level < count; ++level)
+    {
+        unsigned int level_cpus, i;
+
+        if (!read_apple_perflevel_uint( level, "logicalcpu", &level_cpus )
+            || !level_cpus || level_cpus > logical_cpus - cpu)
+            return;
+        for (i = 0; i < level_cpus; ++i) masks[level] |= (affinity_t)1 << (cpu + i);
+        cpu += level_cpus;
+    }
+    if (cpu != logical_cpus) return;
+
+    memcpy( apple_perflevel_masks, masks, count * sizeof(*masks) );
+    apple_perflevel_count = count;
+    for (level = 0; level < count; ++level) apple_all_cpu_mask |= masks[level];
+}
 
 void init_threading(void)
 {
     struct mach_timebase_info tb_info;
+
+    init_apple_perflevels();
     if (mach_timebase_info( &tb_info ) == KERN_SUCCESS)
     {
         mach_ticks_per_second = (tb_info.denom * 1000000000U) / tb_info.numer;
@@ -292,11 +336,28 @@ static int get_mach_importance( int effective_priority )
     return min + (effective_priority - 1) * range / 14;
 }
 
+static int get_thread_apple_perflevel( const struct thread *thread )
+{
+    affinity_t selected = thread->selected_cpu_sets;
+    affinity_t mask;
+    unsigned int level;
+
+    if (!apple_perflevel_count) return -1;
+    if (!selected) selected = thread->process->default_cpu_sets;
+
+    mask = (selected ? selected : thread->affinity) & thread->affinity & apple_all_cpu_mask;
+    if (!mask) return -1;
+
+    for (level = 0; level < apple_perflevel_count; ++level)
+        if (!(mask & ~apple_perflevel_masks[level])) return level;
+    return -1;
+}
+
 static void apply_thread_priority( struct thread *thread )
 {
     kern_return_t kr;
     mach_msg_type_name_t type;
-    int throughput_qos, latency_qos;
+    int throughput_qos, latency_qos, perflevel;
     struct thread_extended_policy thread_extended_policy;
     struct thread_precedence_policy thread_precedence_policy;
     mach_port_t thread_port, process_port = thread->process->trace_data;
@@ -336,11 +397,55 @@ static void apply_thread_priority( struct thread *thread )
         latency_qos = LATENCY_QOS_TIER_UNSPECIFIED;
         break;
     }
+
+    /*
+     * macOS has no public hard-affinity API. Approximate a Windows CPU-set or
+     * affinity mask confined to one performance level with a scheduler QoS
+     * hint. Mixed-level masks retain the priority-derived policy above.
+     */
+    perflevel = get_thread_apple_perflevel( thread );
+    if (perflevel >= 0 && effective_priority < LOW_REALTIME_PRIORITY
+        && effective_priority <= thread->priority)
+    {
+        if (!perflevel)
+        {
+            if (throughput_qos > THROUGHPUT_QOS_TIER_1)
+                throughput_qos = THROUGHPUT_QOS_TIER_1;
+            if (latency_qos > LATENCY_QOS_TIER_1)
+                latency_qos = LATENCY_QOS_TIER_1;
+        }
+        else if (perflevel == apple_perflevel_count - 1)
+        {
+            if (throughput_qos < THROUGHPUT_QOS_TIER_3)
+                throughput_qos = THROUGHPUT_QOS_TIER_3;
+            if (latency_qos < LATENCY_QOS_TIER_3)
+                latency_qos = LATENCY_QOS_TIER_3;
+        }
+        else
+        {
+            throughput_qos = THROUGHPUT_QOS_TIER_2;
+            latency_qos = LATENCY_QOS_TIER_2;
+        }
+    }
+
     /* QOS_UNSPECIFIED is assigned the highest tier available, so it does not provide a limit */
-    if (effective_priority >= LOW_REALTIME_PRIORITY || effective_priority > thread->priority)
+    if (effective_priority >= LOW_REALTIME_PRIORITY)
     {
         throughput_qos = THROUGHPUT_QOS_TIER_UNSPECIFIED;
         latency_qos = LATENCY_QOS_TIER_UNSPECIFIED;
+    }
+    else if (effective_priority > thread->priority)
+    {
+        throughput_qos = THROUGHPUT_QOS_TIER_UNSPECIFIED;
+        latency_qos = LATENCY_QOS_TIER_UNSPECIFIED;
+
+        /*
+         * Keep the Wine main-thread priority boost, but do not let it erase an
+         * application's request for the lowest performance level. Throughput
+         * QoS reaches perfcontrol; latency QoS would also alter timer behavior.
+         */
+        if (perflevel >= 0 && perflevel == apple_perflevel_count - 1)
+            throughput_qos = THROUGHPUT_QOS_TIER_3;
     }
 
     thread_policy_set( thread_port, THREAD_LATENCY_QOS_POLICY, (thread_policy_t)&latency_qos,
@@ -406,6 +511,7 @@ static inline void init_thread_structure( struct thread *thread )
     thread->teb             = 0;
     thread->entry_point     = 0;
     thread->system_regs     = 0;
+    thread->selected_cpu_sets = 0;
     thread->queue           = NULL;
     thread->wait            = NULL;
     thread->error           = 0;
@@ -809,8 +915,22 @@ int set_thread_affinity( struct thread *thread, affinity_t affinity )
         ret = sched_setaffinity( thread->unix_tid, sizeof(set), &set );
     }
 #endif
-    if (!ret) thread->affinity = affinity;
+    if (!ret)
+    {
+        thread->affinity = affinity;
+#ifdef __APPLE__
+        if (thread->state == RUNNING && thread->unix_tid != -1) apply_thread_priority( thread );
+#endif
+    }
     return ret;
+}
+
+void set_thread_cpu_sets( struct thread *thread, affinity_t cpu_sets )
+{
+    thread->selected_cpu_sets = cpu_sets;
+#ifdef __APPLE__
+    if (thread->state == RUNNING && thread->unix_tid != -1) apply_thread_priority( thread );
+#endif
 }
 
 affinity_t get_thread_affinity( struct thread *thread )
@@ -924,6 +1044,8 @@ static void set_thread_info( struct thread *thread,
         else if (set_thread_affinity( thread, req->affinity ))
             file_set_error();
     }
+    if (req->mask & SET_THREAD_INFO_CPU_SETS)
+        set_thread_cpu_sets( thread, req->cpu_sets );
     if (req->mask & SET_THREAD_INFO_TOKEN)
         security_set_thread_token( thread, req->token );
     if (req->mask & SET_THREAD_INFO_ENTRYPOINT)
@@ -1889,6 +2011,17 @@ DECL_HANDLER(get_thread_info)
     }
 }
 
+DECL_HANDLER(get_thread_cpu_sets)
+{
+    struct thread *thread;
+
+    if ((thread = get_thread_from_handle( req->handle, THREAD_QUERY_LIMITED_INFORMATION )))
+    {
+        reply->cpu_sets = thread->selected_cpu_sets;
+        release_object( thread );
+    }
+}
+
 /* fetch information about thread times */
 DECL_HANDLER(get_thread_times)
 {
@@ -1964,8 +2097,8 @@ DECL_HANDLER(set_thread_native_info)
 DECL_HANDLER(set_thread_info)
 {
     struct thread *thread;
-    unsigned int access = (req->mask == SET_THREAD_INFO_DESCRIPTION) ? THREAD_SET_LIMITED_INFORMATION
-                                                                     : THREAD_SET_INFORMATION;
+    unsigned int limited = SET_THREAD_INFO_DESCRIPTION | SET_THREAD_INFO_CPU_SETS;
+    unsigned int access = !(req->mask & ~limited) ? THREAD_SET_LIMITED_INFORMATION : THREAD_SET_INFORMATION;
 
     if ((thread = get_thread_from_handle( req->handle, access )))
     {

@@ -1459,6 +1459,30 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         else return STATUS_INFO_LENGTH_MISMATCH;
         break;
 
+    case ProcessDefaultCpuSetsInformation:
+    {
+        ULONG_PTR cpu_sets = 0;
+        ULONG count;
+
+        SERVER_START_REQ(get_process_cpu_sets)
+        {
+            req->handle = wine_server_obj_handle( handle );
+            if (!(ret = wine_server_call( req ))) cpu_sets = reply->cpu_sets;
+        }
+        SERVER_END_REQ;
+        if (ret) break;
+
+        count = cpu_set_mask_to_ids( cpu_sets, NULL, 0 );
+        len = count * sizeof(ULONG);
+        if (size < len)
+            ret = STATUS_INFO_LENGTH_MISMATCH;
+        else if (len && !info)
+            ret = STATUS_ACCESS_VIOLATION;
+        else
+            cpu_set_mask_to_ids( cpu_sets, info, count );
+        break;
+    }
+
     case ProcessSessionInformation:
         len = sizeof(DWORD);
         if (size == len)
@@ -1797,6 +1821,22 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
             req->handle   = wine_server_obj_handle( handle );
             req->affinity = *(PDWORD_PTR)info;
             req->mask     = SET_PROCESS_INFO_AFFINITY;
+            ret = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        break;
+    }
+    case ProcessDefaultCpuSetsInformation:
+    {
+        ULONG_PTR cpu_sets;
+
+        if (size % sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+        if ((ret = cpu_set_ids_to_mask( info, size / sizeof(ULONG), &cpu_sets ))) return ret;
+        SERVER_START_REQ( set_process_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->cpu_sets = cpu_sets;
+            req->mask = SET_PROCESS_INFO_CPU_SETS;
             ret = wine_server_call( req );
         }
         SERVER_END_REQ;

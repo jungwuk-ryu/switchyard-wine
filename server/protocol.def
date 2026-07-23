@@ -1291,10 +1291,19 @@ typedef volatile struct
 @END
 
 
+/* Retrieve the default CPU set assignment of a process */
+@REQ(get_process_cpu_sets)
+    obj_handle_t handle;       /* process handle */
+@REPLY
+    affinity_t   cpu_sets;     /* default soft CPU set assignment */
+@END
+
+
 /* Set a process information */
 @REQ(set_process_info)
     obj_handle_t handle;       /* process handle */
     affinity_t   affinity;     /* affinity mask */
+    affinity_t   cpu_sets;     /* default soft CPU set assignment */
     int          priority;     /* priority class */
     int          base_priority; /* process base priority */
     int          disable_boost; /* disable process priority boost */
@@ -1309,6 +1318,7 @@ typedef volatile struct
 #define SET_PROCESS_INFO_AFFINITY      0x08
 #define SET_PROCESS_INFO_TOKEN         0x10
 #define SET_PROCESS_INFO_POWER         0x20
+#define SET_PROCESS_INFO_CPU_SETS      0x40
 
 
 /* Retrieve information about a thread */
@@ -1333,6 +1343,14 @@ typedef volatile struct
 #define GET_THREAD_INFO_FLAG_TERMINATED    0x02
 #define GET_THREAD_INFO_FLAG_LAST          0x04
 #define GET_THREAD_INFO_FLAG_DISABLE_BOOST 0x08
+
+
+/* Retrieve the selected CPU set assignment of a thread */
+@REQ(get_thread_cpu_sets)
+    obj_handle_t handle;       /* thread handle */
+@REPLY
+    affinity_t   cpu_sets;     /* explicit soft CPU set assignment */
+@END
 
 
 /* Retrieve information about thread times */
@@ -1376,6 +1394,7 @@ typedef volatile struct
     int          priority;     /* current thread priority */
     int          base_priority;/* base priority level (relative to process base priority class) */
     affinity_t   affinity;     /* affinity mask */
+    affinity_t   cpu_sets;     /* explicit soft CPU set assignment */
     client_ptr_t entry_point;  /* thread entry point */
     obj_handle_t token;        /* impersonation token */
     int          disable_boost;/* disable thread priority boost */
@@ -1390,6 +1409,7 @@ typedef volatile struct
 #define SET_THREAD_INFO_DESCRIPTION     0x20
 #define SET_THREAD_INFO_DBG_HIDDEN      0x40
 #define SET_THREAD_INFO_DISABLE_BOOST   0x80
+#define SET_THREAD_INFO_CPU_SETS        0x100
 
 
 /* Suspend a thread */

@@ -270,10 +270,21 @@ static void dump_get_process_vm_counters_reply( const struct get_process_vm_coun
     dump_uint64( ", peak_pagefile_usage=", &req->peak_pagefile_usage );
 }
 
+static void dump_get_process_cpu_sets_request( const struct get_process_cpu_sets_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_get_process_cpu_sets_reply( const struct get_process_cpu_sets_reply *req )
+{
+    dump_uint64( " cpu_sets=", &req->cpu_sets );
+}
+
 static void dump_set_process_info_request( const struct set_process_info_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
     dump_uint64( ", affinity=", &req->affinity );
+    dump_uint64( ", cpu_sets=", &req->cpu_sets );
     fprintf( stderr, ", priority=%d", req->priority );
     fprintf( stderr, ", base_priority=%d", req->base_priority );
     fprintf( stderr, ", disable_boost=%d", req->disable_boost );
@@ -303,6 +314,16 @@ static void dump_get_thread_info_reply( const struct get_thread_info_reply *req 
     fprintf( stderr, ", flags=%08x", req->flags );
     fprintf( stderr, ", desc_len=%u", req->desc_len );
     dump_varargs_unicode_str( ", desc=", cur_size );
+}
+
+static void dump_get_thread_cpu_sets_request( const struct get_thread_cpu_sets_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_get_thread_cpu_sets_reply( const struct get_thread_cpu_sets_reply *req )
+{
+    dump_uint64( " cpu_sets=", &req->cpu_sets );
 }
 
 static void dump_get_thread_times_request( const struct get_thread_times_request *req )
@@ -347,6 +368,7 @@ static void dump_set_thread_info_request( const struct set_thread_info_request *
     fprintf( stderr, ", priority=%d", req->priority );
     fprintf( stderr, ", base_priority=%d", req->base_priority );
     dump_uint64( ", affinity=", &req->affinity );
+    dump_uint64( ", cpu_sets=", &req->cpu_sets );
     dump_uint64( ", entry_point=", &req->entry_point );
     fprintf( stderr, ", token=%04x", req->token );
     fprintf( stderr, ", disable_boost=%d", req->disable_boost );
@@ -3618,8 +3640,10 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_process_debug_info_request,
     (dump_func)dump_get_process_image_name_request,
     (dump_func)dump_get_process_vm_counters_request,
+    (dump_func)dump_get_process_cpu_sets_request,
     (dump_func)dump_set_process_info_request,
     (dump_func)dump_get_thread_info_request,
+    (dump_func)dump_get_thread_cpu_sets_request,
     (dump_func)dump_get_thread_times_request,
     (dump_func)dump_get_thread_native_info_request,
     (dump_func)dump_set_thread_native_info_request,
@@ -3936,8 +3960,10 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_process_debug_info_reply,
     (dump_func)dump_get_process_image_name_reply,
     (dump_func)dump_get_process_vm_counters_reply,
+    (dump_func)dump_get_process_cpu_sets_reply,
     NULL,
     (dump_func)dump_get_thread_info_reply,
+    (dump_func)dump_get_thread_cpu_sets_reply,
     (dump_func)dump_get_thread_times_reply,
     (dump_func)dump_get_thread_native_info_reply,
     NULL,
@@ -4254,8 +4280,10 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_process_debug_info",
     "get_process_image_name",
     "get_process_vm_counters",
+    "get_process_cpu_sets",
     "set_process_info",
     "get_thread_info",
+    "get_thread_cpu_sets",
     "get_thread_times",
     "get_thread_native_info",
     "set_thread_native_info",

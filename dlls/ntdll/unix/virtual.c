@@ -3897,6 +3897,46 @@ ULONG_PTR get_system_affinity_mask(void)
     return ((ULONG_PTR)1 << num_cpus) - 1;
 }
 
+#define CPU_SET_ID_BASE 0x100
+
+NTSTATUS cpu_set_ids_to_mask( const ULONG *ids, ULONG count, ULONG_PTR *mask )
+{
+    ULONG_PTR system_mask = get_system_affinity_mask();
+    unsigned int i;
+
+    *mask = 0;
+    if (count && !ids) return STATUS_ACCESS_VIOLATION;
+
+    for (i = 0; i < count; ++i)
+    {
+        ULONG index;
+        ULONG_PTR bit;
+
+        if (ids[i] < CPU_SET_ID_BASE) return STATUS_CPU_SET_INVALID;
+        index = ids[i] - CPU_SET_ID_BASE;
+        if (index >= 8 * sizeof(ULONG_PTR)) return STATUS_CPU_SET_INVALID;
+        bit = (ULONG_PTR)1 << index;
+        if (!(system_mask & bit)) return STATUS_CPU_SET_INVALID;
+        *mask |= bit;
+    }
+    return STATUS_SUCCESS;
+}
+
+ULONG cpu_set_mask_to_ids( ULONG_PTR mask, ULONG *ids, ULONG count )
+{
+    ULONG required = 0;
+    unsigned int i;
+
+    mask &= get_system_affinity_mask();
+    for (i = 0; i < 8 * sizeof(mask); ++i)
+    {
+        if (!(((ULONG_PTR)1 << i) & mask)) continue;
+        if (ids && required < count) ids[required] = CPU_SET_ID_BASE + i;
+        ++required;
+    }
+    return required;
+}
+
 
 /***********************************************************************
  *           get_host_page_size

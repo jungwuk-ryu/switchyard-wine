@@ -2252,6 +2252,28 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         return status;
     }
 
+    case ThreadSelectedCpuSets:
+    {
+        ULONG_PTR cpu_sets = 0;
+        ULONG count, required;
+
+        SERVER_START_REQ( get_thread_cpu_sets )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            if (!(status = wine_server_call( req ))) cpu_sets = reply->cpu_sets;
+        }
+        SERVER_END_REQ;
+        if (status) return status;
+
+        count = cpu_set_mask_to_ids( cpu_sets, NULL, 0 );
+        required = count * sizeof(ULONG);
+        if (ret_len) *ret_len = required;
+        if (length < required) return STATUS_INFO_LENGTH_MISMATCH;
+        if (required && !data) return STATUS_ACCESS_VIOLATION;
+        cpu_set_mask_to_ids( cpu_sets, data, count );
+        return STATUS_SUCCESS;
+    }
+
     case ThreadTimes:
     {
         KERNEL_USER_TIMES kusrt = {{{0}}};
@@ -2679,6 +2701,24 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             req->handle   = wine_server_obj_handle( handle );
             req->affinity = req_aff;
             req->mask     = SET_THREAD_INFO_AFFINITY;
+            status = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        return status;
+    }
+
+    case ThreadSelectedCpuSets:
+    {
+        ULONG_PTR cpu_sets;
+
+        if (length % sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+        if ((status = cpu_set_ids_to_mask( data, length / sizeof(ULONG), &cpu_sets ))) return status;
+
+        SERVER_START_REQ( set_thread_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->cpu_sets = cpu_sets;
+            req->mask = SET_THREAD_INFO_CPU_SETS;
             status = wine_server_call( req );
         }
         SERVER_END_REQ;

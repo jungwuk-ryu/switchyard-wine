@@ -89,6 +89,10 @@ static BOOL   (WINAPI *pThread32Next)(HANDLE, THREADENTRY32*);
 static BOOL   (WINAPI *pGetLogicalProcessorInformationEx)(LOGICAL_PROCESSOR_RELATIONSHIP,SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*,DWORD*);
 static SIZE_T (WINAPI *pGetLargePageMinimum)(void);
 static BOOL   (WINAPI *pGetSystemCpuSetInformation)(SYSTEM_CPU_SET_INFORMATION*,ULONG,ULONG*,HANDLE,ULONG);
+static BOOL   (WINAPI *pGetProcessDefaultCpuSets)(HANDLE,ULONG*,ULONG,ULONG*);
+static BOOL   (WINAPI *pGetThreadSelectedCpuSets)(HANDLE,ULONG*,ULONG,ULONG*);
+static BOOL   (WINAPI *pSetProcessDefaultCpuSets)(HANDLE,const ULONG*,ULONG);
+static BOOL   (WINAPI *pSetThreadSelectedCpuSets)(HANDLE,const ULONG*,ULONG);
 static BOOL   (WINAPI *pInitializeProcThreadAttributeList)(struct _PROC_THREAD_ATTRIBUTE_LIST*, DWORD, DWORD, SIZE_T*);
 static BOOL   (WINAPI *pUpdateProcThreadAttribute)(struct _PROC_THREAD_ATTRIBUTE_LIST*, DWORD, DWORD_PTR, void *,SIZE_T,void*,SIZE_T*);
 static void   (WINAPI *pDeleteProcThreadAttributeList)(struct _PROC_THREAD_ATTRIBUTE_LIST*);
@@ -277,6 +281,10 @@ static BOOL init(void)
     pGetLogicalProcessorInformationEx = (void *)GetProcAddress(hkernel32, "GetLogicalProcessorInformationEx");
     pGetLargePageMinimum = (void *)GetProcAddress(hkernel32, "GetLargePageMinimum");
     pGetSystemCpuSetInformation = (void *)GetProcAddress(hkernel32, "GetSystemCpuSetInformation");
+    pGetProcessDefaultCpuSets = (void *)GetProcAddress(hkernel32, "GetProcessDefaultCpuSets");
+    pGetThreadSelectedCpuSets = (void *)GetProcAddress(hkernel32, "GetThreadSelectedCpuSets");
+    pSetProcessDefaultCpuSets = (void *)GetProcAddress(hkernel32, "SetProcessDefaultCpuSets");
+    pSetThreadSelectedCpuSets = (void *)GetProcAddress(hkernel32, "SetThreadSelectedCpuSets");
     pInitializeProcThreadAttributeList = (void *)GetProcAddress(hkernel32, "InitializeProcThreadAttributeList");
     pUpdateProcThreadAttribute = (void *)GetProcAddress(hkernel32, "UpdateProcThreadAttribute");
     pDeleteProcThreadAttributeList = (void *)GetProcAddress(hkernel32, "DeleteProcThreadAttributeList");
@@ -4501,6 +4509,124 @@ static void test_GetSystemCpuSetInformation(void)
     free(info);
 }
 
+static ULONG *get_cpu_set_assignment(BOOL (WINAPI *get_cpu_sets)(HANDLE,ULONG*,ULONG,ULONG*),
+                                     HANDLE handle, ULONG *count)
+{
+    ULONG *ids = NULL;
+    BOOL ret;
+
+    *count = 0;
+    SetLastError(0xdeadbeef);
+    ret = get_cpu_sets(handle, NULL, 0, count);
+    ok(ret || GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+       "Unexpected return %d, error %lu.\n", ret, GetLastError());
+    if (!*count) return NULL;
+
+    ids = malloc(*count * sizeof(*ids));
+    ok(!!ids, "Failed to allocate CPU set assignment.\n");
+    if (!ids) return NULL;
+
+    ret = get_cpu_sets(handle, ids, *count, count);
+    ok(ret, "Failed to query CPU set assignment, error %lu.\n", GetLastError());
+    return ids;
+}
+
+static void test_cpu_set_assignment(void)
+{
+    SYSTEM_CPU_SET_INFORMATION *info = NULL;
+    ULONG *process_ids = NULL, *thread_ids = NULL;
+    ULONG process_count = 0, thread_count = 0;
+    ULONG info_size = 0, count, id, invalid_id = 0;
+    HANDLE process = GetCurrentProcess();
+    HANDLE thread = GetCurrentThread();
+    BOOL process_changed = FALSE, thread_changed = FALSE;
+    BOOL ret;
+
+    if (!pGetSystemCpuSetInformation || !pGetProcessDefaultCpuSets || !pGetThreadSelectedCpuSets
+        || !pSetProcessDefaultCpuSets || !pSetThreadSelectedCpuSets)
+    {
+        win_skip("CPU set assignment APIs are not supported.\n");
+        return;
+    }
+
+    ret = pGetSystemCpuSetInformation(NULL, 0, &info_size, process, 0);
+    if (ret || GetLastError() != ERROR_INSUFFICIENT_BUFFER || !info_size)
+    {
+        skip("No system CPU sets are available, ret %d, error %lu, size %lu.\n",
+             ret, GetLastError(), info_size);
+        return;
+    }
+
+    info = malloc(info_size);
+    ok(!!info, "Failed to allocate CPU set information.\n");
+    if (!info) return;
+    ret = pGetSystemCpuSetInformation(info, info_size, &info_size, process, 0);
+    ok(ret, "Failed to query CPU set information, error %lu.\n", GetLastError());
+    if (!ret) goto done;
+
+    id = info->CpuSet.Id;
+    process_ids = get_cpu_set_assignment(pGetProcessDefaultCpuSets, process, &process_count);
+    thread_ids = get_cpu_set_assignment(pGetThreadSelectedCpuSets, thread, &thread_count);
+    if ((process_count && !process_ids) || (thread_count && !thread_ids)) goto done;
+
+    SetLastError(0xdeadbeef);
+    ret = pSetProcessDefaultCpuSets(process, &invalid_id, 1);
+    ok(!ret && GetLastError() == ERROR_CPU_SET_INVALID,
+       "Unexpected return %d, error %lu for invalid process CPU set.\n", ret, GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = pSetThreadSelectedCpuSets(thread, &invalid_id, 1);
+    ok(!ret && GetLastError() == ERROR_CPU_SET_INVALID,
+       "Unexpected return %d, error %lu for invalid thread CPU set.\n", ret, GetLastError());
+
+    ret = pSetProcessDefaultCpuSets(process, &id, 1);
+    ok(ret, "Failed to set the process CPU set, error %lu.\n", GetLastError());
+    process_changed = ret;
+    count = 0;
+    ret = pGetProcessDefaultCpuSets(process, NULL, 0, &count);
+    ok(!ret && GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+       "Unexpected return %d, error %lu.\n", ret, GetLastError());
+    ok(count == 1, "Expected one process CPU set, got %lu.\n", count);
+    count = 1;
+    ret = pGetProcessDefaultCpuSets(process, &count, 1, &info_size);
+    ok(ret, "Failed to query the process CPU set, error %lu.\n", GetLastError());
+    ok(count == id && info_size == 1, "Expected id %#lx, got %#lx, count %lu.\n", id, count, info_size);
+
+    ret = pSetThreadSelectedCpuSets(thread, &id, 1);
+    ok(ret, "Failed to set the thread CPU set, error %lu.\n", GetLastError());
+    thread_changed = ret;
+    count = 0;
+    ret = pGetThreadSelectedCpuSets(thread, NULL, 0, &count);
+    ok(!ret && GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+       "Unexpected return %d, error %lu.\n", ret, GetLastError());
+    ok(count == 1, "Expected one thread CPU set, got %lu.\n", count);
+    count = 1;
+    ret = pGetThreadSelectedCpuSets(thread, &count, 1, &info_size);
+    ok(ret, "Failed to query the thread CPU set, error %lu.\n", GetLastError());
+    ok(count == id && info_size == 1, "Expected id %#lx, got %#lx, count %lu.\n", id, count, info_size);
+
+    ret = pSetThreadSelectedCpuSets(thread, NULL, 0);
+    ok(ret, "Failed to clear the thread CPU set, error %lu.\n", GetLastError());
+    count = 0xdeadbeef;
+    ret = pGetThreadSelectedCpuSets(thread, NULL, 0, &count);
+    ok(ret, "Failed to query a cleared thread CPU set, error %lu.\n", GetLastError());
+    ok(!count, "Expected no thread CPU sets, got %lu.\n", count);
+
+done:
+    if (process_changed)
+    {
+        ret = pSetProcessDefaultCpuSets(process, process_ids, process_count);
+        ok(ret, "Failed to restore the process CPU sets, error %lu.\n", GetLastError());
+    }
+    if (thread_changed)
+    {
+        ret = pSetThreadSelectedCpuSets(thread, thread_ids, thread_count);
+        ok(ret, "Failed to restore the thread CPU sets, error %lu.\n", GetLastError());
+    }
+    free(thread_ids);
+    free(process_ids);
+    free(info);
+}
+
 static void test_largepages(void)
 {
     SIZE_T size;
@@ -5845,6 +5971,7 @@ START_TEST(process)
     test_session_info();
     test_GetLogicalProcessorInformationEx();
     test_GetSystemCpuSetInformation();
+    test_cpu_set_assignment();
     test_largepages();
     test_ProcThreadAttributeList();
     test_SuspendProcessState();

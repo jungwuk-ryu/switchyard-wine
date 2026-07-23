@@ -59,6 +59,7 @@ struct process
     timeout_t            end_time;        /* absolute time at process end */
     unsigned __int64     cycle_time;      /* final host process cycle count */
     affinity_t           affinity;        /* process affinity mask */
+    affinity_t           default_cpu_sets;/* default soft CPU set assignment */
     int                  priority;        /* priority class */
     int                  base_priority;   /* base priority to calculate thread priority */
     int                  disable_boost;   /* disable priority boost */

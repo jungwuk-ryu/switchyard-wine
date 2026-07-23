@@ -682,6 +682,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->exit_code       = STILL_ACTIVE;
     process->running_threads = 0;
     process->user_threads    = 0;
+    process->default_cpu_sets = 0;
     process->priority        = PROCESS_PRIOCLASS_NORMAL;
     process->base_priority   = 8;
     process->disable_boost   = 0;
@@ -1576,6 +1577,17 @@ DECL_HANDLER(get_process_info)
     }
 }
 
+DECL_HANDLER(get_process_cpu_sets)
+{
+    struct process *process;
+
+    if ((process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION )))
+    {
+        reply->cpu_sets = process->default_cpu_sets;
+        release_object( process );
+    }
+}
+
 /* fetch host-side information about a process */
 DECL_HANDLER(get_process_native_info)
 {
@@ -1780,17 +1792,31 @@ static void set_process_affinity( struct process *process, affinity_t affinity )
     }
 }
 
+static void set_process_cpu_sets( struct process *process, affinity_t cpu_sets )
+{
+    struct thread *thread;
+
+    process->default_cpu_sets = cpu_sets;
+    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+    {
+        if (!thread->selected_cpu_sets) set_thread_cpu_sets( thread, 0 );
+    }
+}
+
 /* set information about a process */
 DECL_HANDLER(set_process_info)
 {
     struct process *process;
+    unsigned int access = req->mask == SET_PROCESS_INFO_CPU_SETS ? PROCESS_SET_LIMITED_INFORMATION
+                                                                 : PROCESS_SET_INFORMATION;
 
-    if ((process = get_process_from_handle( req->handle, PROCESS_SET_INFORMATION )))
+    if ((process = get_process_from_handle( req->handle, access )))
     {
         if (req->mask & SET_PROCESS_INFO_PRIORITY) set_process_priority( process, req->priority );
         if (req->mask & SET_PROCESS_INFO_BASE_PRIORITY) set_process_base_priority( process, req->base_priority );
         if (req->mask & SET_PROCESS_INFO_DISABLE_BOOST) set_process_disable_boost( process, req->disable_boost );
         if (req->mask & SET_PROCESS_INFO_AFFINITY) set_process_affinity( process, req->affinity );
+        if (req->mask & SET_PROCESS_INFO_CPU_SETS) set_process_cpu_sets( process, req->cpu_sets );
         if (req->mask & SET_PROCESS_INFO_POWER)
         {
             process->power_control = req->power_control;

@@ -658,7 +658,7 @@
 @ stdcall GetPrivateObjectSecurity(ptr long ptr long ptr)
 @ stdcall GetProcAddress(long str)
 # @ stub GetProcAddressForCaller
-# @ stub GetProcessDefaultCpuSets
+@ stdcall GetProcessDefaultCpuSets(ptr ptr long ptr)
 @ stdcall GetProcessGroupAffinity(long ptr ptr)
 @ stdcall GetProcessHandleCount(long ptr)
 @ stdcall -norelay GetProcessHeap() kernelbase_GetProcessHeap
@@ -762,7 +762,7 @@
 @ stdcall GetThreadPreferredUILanguages(long ptr ptr ptr)
 @ stdcall GetThreadPriority(long)
 @ stdcall GetThreadPriorityBoost(long ptr)
-# @ stub GetThreadSelectedCpuSets
+@ stdcall GetThreadSelectedCpuSets(ptr ptr long ptr)
 @ stdcall GetThreadTimes(long ptr ptr ptr ptr)
 @ stdcall GetThreadUILanguage()
 @ stdcall GetTickCount()

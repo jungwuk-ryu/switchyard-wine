@@ -1362,11 +1362,25 @@ struct get_process_vm_counters_reply
 
 
 
+struct get_process_cpu_sets_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_process_cpu_sets_reply
+{
+    struct reply_header __header;
+    affinity_t   cpu_sets;
+};
+
+
+
 struct set_process_info_request
 {
     struct request_header __header;
     obj_handle_t handle;
     affinity_t   affinity;
+    affinity_t   cpu_sets;
     int          priority;
     int          base_priority;
     int          disable_boost;
@@ -1374,7 +1388,7 @@ struct set_process_info_request
     int          mask;
     unsigned int power_control;
     unsigned int power_state;
-    char __pad_52[4];
+    char __pad_60[4];
 };
 struct set_process_info_reply
 {
@@ -1386,6 +1400,7 @@ struct set_process_info_reply
 #define SET_PROCESS_INFO_AFFINITY      0x08
 #define SET_PROCESS_INFO_TOKEN         0x10
 #define SET_PROCESS_INFO_POWER         0x20
+#define SET_PROCESS_INFO_CPU_SETS      0x40
 
 
 
@@ -1416,6 +1431,19 @@ struct get_thread_info_reply
 #define GET_THREAD_INFO_FLAG_TERMINATED    0x02
 #define GET_THREAD_INFO_FLAG_LAST          0x04
 #define GET_THREAD_INFO_FLAG_DISABLE_BOOST 0x08
+
+
+
+struct get_thread_cpu_sets_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_thread_cpu_sets_reply
+{
+    struct reply_header __header;
+    affinity_t   cpu_sets;
+};
 
 
 
@@ -1478,12 +1506,13 @@ struct set_thread_info_request
     int          priority;
     int          base_priority;
     affinity_t   affinity;
+    affinity_t   cpu_sets;
     client_ptr_t entry_point;
     obj_handle_t token;
     int          disable_boost;
     unsigned int mask;
     /* VARARG(desc,unicode_str); */
-    char __pad_52[4];
+    char __pad_60[4];
 };
 struct set_thread_info_reply
 {
@@ -1497,6 +1526,7 @@ struct set_thread_info_reply
 #define SET_THREAD_INFO_DESCRIPTION     0x20
 #define SET_THREAD_INFO_DBG_HIDDEN      0x40
 #define SET_THREAD_INFO_DISABLE_BOOST   0x80
+#define SET_THREAD_INFO_CPU_SETS        0x100
 
 
 
@@ -6341,8 +6371,10 @@ enum request
     REQ_get_process_debug_info,
     REQ_get_process_image_name,
     REQ_get_process_vm_counters,
+    REQ_get_process_cpu_sets,
     REQ_set_process_info,
     REQ_get_thread_info,
+    REQ_get_thread_cpu_sets,
     REQ_get_thread_times,
     REQ_get_thread_native_info,
     REQ_set_thread_native_info,
@@ -6662,8 +6694,10 @@ union generic_request
     struct get_process_debug_info_request get_process_debug_info_request;
     struct get_process_image_name_request get_process_image_name_request;
     struct get_process_vm_counters_request get_process_vm_counters_request;
+    struct get_process_cpu_sets_request get_process_cpu_sets_request;
     struct set_process_info_request set_process_info_request;
     struct get_thread_info_request get_thread_info_request;
+    struct get_thread_cpu_sets_request get_thread_cpu_sets_request;
     struct get_thread_times_request get_thread_times_request;
     struct get_thread_native_info_request get_thread_native_info_request;
     struct set_thread_native_info_request set_thread_native_info_request;
@@ -6981,8 +7015,10 @@ union generic_reply
     struct get_process_debug_info_reply get_process_debug_info_reply;
     struct get_process_image_name_reply get_process_image_name_reply;
     struct get_process_vm_counters_reply get_process_vm_counters_reply;
+    struct get_process_cpu_sets_reply get_process_cpu_sets_reply;
     struct set_process_info_reply set_process_info_reply;
     struct get_thread_info_reply get_thread_info_reply;
+    struct get_thread_cpu_sets_reply get_thread_cpu_sets_reply;
     struct get_thread_times_reply get_thread_times_reply;
     struct get_thread_native_info_reply get_thread_native_info_reply;
     struct set_thread_native_info_reply set_thread_native_info_reply;
@@ -7283,6 +7319,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 955
+#define SERVER_PROTOCOL_VERSION 956
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
