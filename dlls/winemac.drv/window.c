@@ -352,6 +352,7 @@ void release_win_data(struct macdrv_win_data *data)
 
 static void free_win_data(struct macdrv_win_data *data)
 {
+    if (data->icon_images) CFRelease(data->icon_images);
     free(data);
 }
 
@@ -635,6 +636,9 @@ static void create_cocoa_window(struct macdrv_win_data *data)
 
     data->cocoa_window = macdrv_create_cocoa_window(&wf, frame, data->hwnd, thread_data->queue);
     if (!data->cocoa_window) goto done;
+
+    if (data->icon_images)
+        macdrv_set_cocoa_window_icon(data->cocoa_window, data->icon_images);
 
     {
         unsigned int window_number = macdrv_get_cocoa_window_number(data->cocoa_window);
@@ -972,6 +976,76 @@ static void set_app_icon(void)
         macdrv_set_application_icon(images);
         CFRelease(images);
     }
+}
+
+static void release_icon_info(const ICONINFO *icon_info)
+{
+    if (!icon_info) return;
+    if (icon_info->hbmColor) NtGdiDeleteObjectApp(icon_info->hbmColor);
+    if (icon_info->hbmMask) NtGdiDeleteObjectApp(icon_info->hbmMask);
+}
+
+static void append_icon_image(CFMutableArrayRef images, HICON icon, const ICONINFO *icon_info)
+{
+    BITMAP bitmap;
+    CGImageRef image;
+    HBITMAP size_bitmap;
+    CFIndex i;
+    int width, height;
+
+    if (!icon || !icon_info) return;
+    size_bitmap = icon_info->hbmColor ? icon_info->hbmColor : icon_info->hbmMask;
+    if (!size_bitmap || !NtGdiExtGetObjectW(size_bitmap, sizeof(bitmap), &bitmap)) return;
+
+    width = bitmap.bmWidth;
+    height = bitmap.bmHeight;
+    if (!icon_info->hbmColor) height = max(1, height / 2);
+    if (!(image = create_cgimage_from_icon(icon, width, height))) return;
+
+    for (i = 0; i < CFArrayGetCount(images); i++)
+    {
+        CGImageRef existing = (CGImageRef)CFArrayGetValueAtIndex(images, i);
+
+        if (CGImageGetWidth(existing) == CGImageGetWidth(image) &&
+            CGImageGetHeight(existing) == CGImageGetHeight(image))
+        {
+            CGImageRelease(image);
+            return;
+        }
+    }
+
+    CFArrayAppendValue(images, image);
+    CGImageRelease(image);
+}
+
+static CFArrayRef create_window_icon_images(HICON icon, const ICONINFO *icon_info,
+                                            HICON small_icon, const ICONINFO *small_icon_info)
+{
+    HICON fallback_icon;
+    CFMutableArrayRef images;
+
+    images = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    if (!images) goto done;
+
+    /* get_window_icon_info() supplies IDI_WINLOGO when the window and its
+       class have no icon. Keep the executable resource as the application
+       fallback instead of replacing it with that synthetic window icon. */
+    fallback_icon = LoadImageW(0, (const WCHAR *)IDI_WINLOGO, IMAGE_ICON, 0, 0,
+                               LR_SHARED | LR_DEFAULTSIZE);
+    if (icon != fallback_icon) append_icon_image(images, icon, icon_info);
+    if (small_icon != fallback_icon && small_icon != icon)
+        append_icon_image(images, small_icon, small_icon_info);
+
+    if (!CFArrayGetCount(images))
+    {
+        CFRelease(images);
+        images = NULL;
+    }
+
+done:
+    release_icon_info(icon_info);
+    if (small_icon) release_icon_info(small_icon_info);
+    return images;
 }
 
 
@@ -1659,6 +1733,31 @@ void macdrv_SetWindowRgn(HWND hwnd, HRGN hrgn, BOOL redraw)
         if (procid != GetCurrentProcessId())
             send_message(hwnd, WM_MACDRV_SET_WIN_REGION, 0, 0);
     }
+}
+
+/***********************************************************************
+ *              SetWindowIcons  (MACDRV.@)
+ */
+void macdrv_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *icon_info,
+                           HICON small_icon, const ICONINFO *small_icon_info)
+{
+    CFArrayRef images = create_window_icon_images(icon, icon_info, small_icon, small_icon_info);
+    struct macdrv_win_data *data;
+
+    TRACE("hwnd %p icon %p small_icon %p images %p\n", hwnd, icon, small_icon, images);
+
+    if (!(data = get_win_data(hwnd)))
+    {
+        if (images) CFRelease(images);
+        return;
+    }
+
+    if (data->icon_images) CFRelease(data->icon_images);
+    data->icon_images = images;
+    if (data->cocoa_window)
+        macdrv_set_cocoa_window_icon(data->cocoa_window, images);
+
+    release_win_data(data);
 }
 
 

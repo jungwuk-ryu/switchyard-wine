@@ -147,6 +147,8 @@ extern void macdrv_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alph
                                               DWORD flags);
 extern void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent);
 extern void macdrv_SetWindowRgn(HWND hwnd, HRGN hrgn, BOOL redraw);
+extern void macdrv_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *icon_info,
+                                  HICON small_icon, const ICONINFO *small_icon_info);
 extern void macdrv_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
 extern void macdrv_SetWindowText(HWND hwnd, LPCWSTR text);
 extern UINT macdrv_ShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp);
@@ -188,6 +190,7 @@ struct macdrv_win_data
     HWND                hwnd;                   /* hwnd that this private data belongs to */
     macdrv_window       cocoa_window;
     macdrv_view         client_view;
+    CFArrayRef          icon_images;
     struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
     int                 pixel_format;           /* pixel format for GL */
     HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */

@@ -88,6 +88,7 @@
     CGRect pendingSurfaceDirty;
     BOOL fakingClose;
 
+    NSImage* applicationIcon;
 
     CAShapeLayer* contentViewMaskLayer;
 }
@@ -100,6 +101,7 @@
 @property (readonly, getter=isFullscreen, nonatomic) BOOL fullscreen;
 @property (readonly, getter=isFakingClose, nonatomic) BOOL fakingClose;
 @property (readonly, nonatomic) NSRect wine_fractionalFrame;
+@property (retain, nonatomic) NSImage* applicationIcon;
 
 /* Whether this window, when ordered in and not miniaturized, would appear to
    the user on-screen. That means it has a non-zero size and is not empty-

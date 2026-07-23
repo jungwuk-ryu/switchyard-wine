@@ -87,6 +87,7 @@ enum {
     id<WineClipCursorHandler> clipCursorHandler;
 
     NSImage* applicationIcon;
+    WineWindow* applicationIconWindow;
 
     NSString* applicationMenuName;
     WineWindow* applicationMenuNameWindow;
@@ -116,6 +117,7 @@ enum {
     - (double) ticksForEventTime:(NSTimeInterval)eventTime;
 
     - (void) windowGotFocus:(WineWindow*)window;
+    - (void) updateApplicationIconForWindow:(WineWindow*)window;
     - (void) updateApplicationMenuNameForWindow:(WineWindow*)window;
 
     - (BOOL) waitUntilQueryDone:(bool*)done timeout:(NSDate*)timeout processEvents:(BOOL)processEvents;

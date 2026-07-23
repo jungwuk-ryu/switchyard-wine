@@ -1380,6 +1380,7 @@ static void WineCompositorDetachView(WineContentView* view)
     @synthesize usePerPixelAlpha;
     @synthesize himc, commandDone;
     @synthesize contentViewMaskLayer;
+    @synthesize applicationIcon;
 
     - (void) enqueueSurfaceImage:(CGImageRef)image rect:(CGRect)rect dirty:(CGRect)dirty
     {
@@ -1537,6 +1538,7 @@ static void WineCompositorDetachView(WineContentView* view)
         [queue release];
         [latentChildWindows release];
         [latentParentWindow release];
+        [applicationIcon release];
         if (pendingSurfaceImage) CGImageRelease(pendingSurfaceImage);
         [contentViewMaskLayer release];
         [super dealloc];
@@ -2289,6 +2291,7 @@ static void WineCompositorDetachView(WineContentView* view)
                 [NSApp addWindowsItem:self title:[self title] filename:NO];
                 [controller updateApplicationMenuNameForWindow:self];
             }
+            [controller updateApplicationIconForWindow:self];
         }
     }
 

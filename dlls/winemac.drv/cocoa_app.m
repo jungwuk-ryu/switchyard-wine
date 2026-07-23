@@ -107,12 +107,52 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) setupObservations;
     - (void) applicationDidBecomeActive:(NSNotification *)notification;
+    - (NSImage*) currentApplicationIcon;
+    - (void) applyApplicationIcon;
+    - (BOOL) windowCanRepresentApplicationIcon:(WineWindow*)window;
+    - (void) forgetApplicationIconForWindow:(WineWindow*)window;
     - (NSString*) currentApplicationMenuName;
     - (void) setApplicationMenuName:(NSString*)name;
 
     static void PerformRequest(void *info);
 
 @end
+
+static NSImage* image_from_cgimage_array(NSArray* images)
+{
+    NSImage* nsimage = nil;
+
+    if ([images count])
+    {
+        NSSize bestSize = NSZeroSize;
+        id image;
+
+        nsimage = [[[NSImage alloc] initWithSize:NSZeroSize] autorelease];
+
+        for (image in images)
+        {
+            CGImageRef cgimage = (CGImageRef)image;
+            NSBitmapImageRep* imageRep = [[NSBitmapImageRep alloc] initWithCGImage:cgimage];
+            if (imageRep)
+            {
+                NSSize size = [imageRep size];
+
+                [nsimage addRepresentation:imageRep];
+                [imageRep release];
+
+                if (MIN(size.width, size.height) > MIN(bestSize.width, bestSize.height))
+                    bestSize = size;
+            }
+        }
+
+        if ([[nsimage representations] count] && bestSize.width && bestSize.height)
+            [nsimage setSize:bestSize];
+        else
+            nsimage = nil;
+    }
+
+    return nsimage;
+}
 
 
 @implementation WineApplicationController
@@ -304,8 +344,71 @@ static NSString* WineLocalizedString(unsigned int stringID)
             [NSApp setMainMenu:mainMenu];
             [NSApp setWindowsMenu:submenu];
 
-            [NSApp setApplicationIconImage:self.applicationIcon];
+            [NSApp setApplicationIconImage:[self currentApplicationIcon]];
         }
+    }
+
+    - (NSImage*) currentApplicationIcon
+    {
+        NSImage* windowIcon = [applicationIconWindow applicationIcon];
+
+        return windowIcon ? windowIcon : applicationIcon;
+    }
+
+    - (void) applyApplicationIcon
+    {
+        if ([NSApp activationPolicy] == NSApplicationActivationPolicyRegular)
+            [NSApp setApplicationIconImage:[self currentApplicationIcon]];
+    }
+
+    - (BOOL) windowCanRepresentApplicationIcon:(WineWindow*)window
+    {
+        return window && [window applicationIcon] && ![window isExcludedFromWindowsMenu] &&
+               ([window isVisible] || [window isMiniaturized]);
+    }
+
+    - (void) updateApplicationIconForWindow:(WineWindow*)window
+    {
+        if (applicationIconWindow && applicationIconWindow != window &&
+            [self windowCanRepresentApplicationIcon:applicationIconWindow])
+            return;
+
+        if ([self windowCanRepresentApplicationIcon:window])
+            applicationIconWindow = window;
+        else if (![self windowCanRepresentApplicationIcon:applicationIconWindow])
+        {
+            applicationIconWindow = nil;
+            for (WineWindow* candidate in [NSApp orderedWindows])
+            {
+                if ([candidate isKindOfClass:[WineWindow class]] &&
+                    [self windowCanRepresentApplicationIcon:candidate])
+                {
+                    applicationIconWindow = candidate;
+                    break;
+                }
+            }
+        }
+
+        [self applyApplicationIcon];
+    }
+
+    - (void) forgetApplicationIconForWindow:(WineWindow*)window
+    {
+        if (window != applicationIconWindow)
+            return;
+
+        applicationIconWindow = nil;
+        for (WineWindow* candidate in [NSApp orderedWindows])
+        {
+            if (candidate != window && [candidate isKindOfClass:[WineWindow class]] &&
+                [self windowCanRepresentApplicationIcon:candidate])
+            {
+                applicationIconWindow = candidate;
+                break;
+            }
+        }
+
+        [self applyApplicationIcon];
     }
 
     - (NSString*) currentApplicationMenuName
@@ -472,6 +575,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         macdrv_event* event;
 
+        if ([self windowCanRepresentApplicationIcon:window])
+        {
+            applicationIconWindow = window;
+            [self applyApplicationIcon];
+        }
+        else
+            [self updateApplicationIconForWindow:window];
         [self invalidateGotFocusEvents];
 
         event = macdrv_create_event(WINDOW_GOT_FOCUS, window);
@@ -1153,38 +1263,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) setApplicationIconFromCGImageArray:(NSArray*)images
     {
-        NSImage* nsimage = nil;
-
-        if ([images count])
-        {
-            NSSize bestSize = NSZeroSize;
-            id image;
-
-            nsimage = [[[NSImage alloc] initWithSize:NSZeroSize] autorelease];
-
-            for (image in images)
-            {
-                CGImageRef cgimage = (CGImageRef)image;
-                NSBitmapImageRep* imageRep = [[NSBitmapImageRep alloc] initWithCGImage:cgimage];
-                if (imageRep)
-                {
-                    NSSize size = [imageRep size];
-
-                    [nsimage addRepresentation:imageRep];
-                    [imageRep release];
-
-                    if (MIN(size.width, size.height) > MIN(bestSize.width, bestSize.height))
-                        bestSize = size;
-                }
-            }
-
-            if ([[nsimage representations] count] && bestSize.width && bestSize.height)
-                [nsimage setSize:bestSize];
-            else
-                nsimage = nil;
-        }
-
-        self.applicationIcon = nsimage;
+        self.applicationIcon = image_from_cgimage_array(images);
+        [self applyApplicationIcon];
     }
 
     - (void) handleCommandTab
@@ -1966,6 +2046,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             NSWindow* window = [note object];
             if ([window isKindOfClass:[WineWindow class]] && [(WineWindow*)window isFakingClose])
                 return;
+            if (window == applicationIconWindow)
+                [self forgetApplicationIconForWindow:(WineWindow*)window];
             if (window == applicationMenuNameWindow)
                 applicationMenuNameWindow = nil;
             [keyWindows removeObjectIdenticalTo:window];
@@ -2692,6 +2774,22 @@ void macdrv_set_application_icon(CFArrayRef images)
 
     OnMainThreadAsync(^{
         [[WineApplicationController sharedController] setApplicationIconFromCGImageArray:imageArray];
+    });
+}
+
+/***********************************************************************
+ *              macdrv_set_cocoa_window_icon
+ */
+void macdrv_set_cocoa_window_icon(macdrv_window w, CFArrayRef images)
+{
+    WineWindow* window = (WineWindow*)w;
+    NSArray* imageArray = (NSArray*)images;
+
+    OnMainThreadAsync(^{
+        WineApplicationController* controller = [WineApplicationController sharedController];
+
+        window.applicationIcon = image_from_cgimage_array(imageArray);
+        [controller updateApplicationIconForWindow:window];
     });
 }
 

@@ -514,6 +514,7 @@ extern void macdrv_set_cocoa_window_features(macdrv_window w,
         const struct macdrv_window_features* wf);
 extern void macdrv_set_cocoa_window_state(macdrv_window w,
         const struct macdrv_window_state* state);
+extern void macdrv_set_cocoa_window_icon(macdrv_window w, CFArrayRef images);
 extern void macdrv_set_cocoa_window_title(macdrv_window w, const UniChar* title,
         size_t length);
 extern void macdrv_order_cocoa_window(macdrv_window w, macdrv_window prev,

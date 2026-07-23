@@ -266,6 +266,7 @@ static const struct user_driver_funcs macdrv_funcs =
     .pSetLayeredWindowAttributes = macdrv_SetLayeredWindowAttributes,
     .pSetParent = macdrv_SetParent,
     .pSetWindowRgn = macdrv_SetWindowRgn,
+    .pSetWindowIcons = macdrv_SetWindowIcons,
     .pSetWindowStyle = macdrv_SetWindowStyle,
     .pSetWindowText = macdrv_SetWindowText,
     .pShowWindow = macdrv_ShowWindow,
