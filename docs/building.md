@@ -123,6 +123,14 @@ assertions retain their error diagnostic:
   ~/.switchyard/runtimes/<runtime-id>
 ```
 
+Verify that heap warning diagnostics remain observational while the heap trace
+channel still opts into full validation:
+
+```sh
+./switchyard/tests/heap_warning_flags_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
+
 For a runtime with the GPTK overlay, exercise D3DMetal's shared DXGI resource
 callbacks from a fresh prefix with:
 

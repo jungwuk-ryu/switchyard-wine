@@ -1439,8 +1439,11 @@ static void heap_set_debug_flags( HANDLE handle )
     DWORD dummy, flags, force_flags;
     struct heap *heap;
 
+    /*
+     * Warning output must not implicitly change the allocation layout.
+     * Full validation remains available through the heap trace channel.
+     */
     if (TRACE_ON(heap)) global_flags |= FLG_HEAP_VALIDATE_ALL;
-    if (WARN_ON(heap)) global_flags |= FLG_HEAP_VALIDATE_PARAMETERS;
 
     heap = unsafe_heap_from_handle( handle, 0, &dummy );
     flags = heap_flags_from_global_flag( global_flags );
