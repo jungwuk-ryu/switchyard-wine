@@ -14,6 +14,7 @@ recorded for those entries.
 
 | Application | Status | Last confirmed | Runtime | Host environment | Launch / graphics path |
 | --- | --- | --- | --- | --- | --- |
+| Blender 5.2.0 LTS | Working — Mesa llvmpipe software rendering is CPU-bound | 2026-07-24 | Switchyard Wine development runtime (`361af62b5cf4ecac8f56ebd149c55a0cfa89a875`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client (App ID 365670) · container-wide `WINE_OPENGL_DRIVER=llvmpipe` · Mesa 26.1.1 OpenGL 4.6 |
 | Heartopia | Working | 2026-07-23 | Switchyard Wine overlay test runtime (base `eeb99326c247`; hotpatch build `f9cc05b718`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client (app 4025700) · GPTK 3.0 D3D11/DXGI · `GameOverlayRenderer64.dll` |
 | Terraria | Working | 2026-07-21 | Switchyard Wine 11.12 (`783c55de9a5b`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Steam · GPTK 3.0-enabled runtime |
 | Steam | Working | 2026-07-22 | Switchyard Wine development runtime (`d5ec127bafb632ee717819db8eba1d9fccc43e23`, source tree `6207795aa523`) | macOS 26.5.2 (25F84) · Apple M5 Pro · Rosetta 2 | Windows Steam client · CEF remote-DIB surfaces → persistent HWND-scoped CAContext layer · GPTK 3.0 environment with Wine graphics fallback |
