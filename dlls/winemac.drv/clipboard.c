@@ -1039,6 +1039,7 @@ struct format_entry *get_format_entries(CFTypeRef pasteboard, UINT *entries_size
 
     TRACE("pasteboard %p\n", pasteboard);
 
+    *entries_size = 0;
     /* Do not invoke AppKit image conversion while handling DragEnter. */
     types = macdrv_copy_pasteboard_types(pasteboard, false);
     if (!types) return NULL;
@@ -1046,7 +1047,7 @@ struct format_entry *get_format_entries(CFTypeRef pasteboard, UINT *entries_size
     for (i = 0; i < CFArrayGetCount(types); i++)
     {
         WINE_CLIPFORMAT *format;
-        size_t import_size;
+        size_t entry_size, import_size;
         CFDataRef data;
         void *import;
 
@@ -1058,15 +1059,17 @@ struct format_entry *get_format_entries(CFTypeRef pasteboard, UINT *entries_size
         CFRelease(data);
         if (!import) continue;
 
-        if ((tmp = realloc(entries, size + sizeof(*entries) + import_size)))
+        entry_size = (FIELD_OFFSET(struct format_entry, data[import_size]) + 7) & ~7;
+        if ((tmp = realloc(entries, size + entry_size)))
         {
             struct format_entry *entry = (struct format_entry *)(tmp + size);
+            memset(entry, 0, entry_size);
             entry->format = format->format_id;
             entry->size = import_size;
             memcpy(entry->data, import, import_size);
 
             entries = (struct format_entry *)tmp;
-            size += sizeof(*entry) + import_size;
+            size += entry_size;
         }
 
         free(import);
