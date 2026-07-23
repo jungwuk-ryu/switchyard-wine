@@ -136,6 +136,36 @@ static WCHAR *get_file_name( WCHAR *cmdline, WCHAR *buffer, DWORD buflen )
     return ret;
 }
 
+/***********************************************************************
+ *           hack_append_command_line
+ */
+static const WCHAR *hack_append_command_line( const WCHAR *cmd )
+{
+    static const struct
+    {
+        const WCHAR *exe_name;
+        const WCHAR *append;
+    }
+    options[] =
+    {
+        { L"EpicGamesLauncher.exe", L" --in-process-gpu --use-gl=swiftshader" },
+        { L"EpicWebHelper.exe",     L" --in-process-gpu --use-gl=swiftshader" },
+    };
+    unsigned int i;
+
+    if (!cmd) return NULL;
+
+    for (i = 0; i < ARRAY_SIZE(options); ++i)
+    {
+        if (wcsstr( cmd, options[i].exe_name ) && !wcsstr( cmd, L"--in-process-gpu" ))
+        {
+            TRACE( "HACK: appending %s to command line.\n", debugstr_w(options[i].append) );
+            return options[i].append;
+        }
+    }
+    return NULL;
+}
+
 
 /***********************************************************************
  *           create_process_params
@@ -517,6 +547,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     const struct proc_thread_attr *handle_list = NULL, *job_list = NULL;
     WCHAR name[MAX_PATH];
     WCHAR *p, *tidy_cmdline = cmd_line;
+    const WCHAR *append;
     RTL_USER_PROCESS_PARAMETERS *params = NULL;
     RTL_USER_PROCESS_INFORMATION rtl_info = { 0 };
     HANDLE parent = 0, debug = 0;
@@ -538,10 +569,36 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                 return FALSE;
             swprintf( tidy_cmdline, lstrlenW(app_name) + 3, L"\"%s\"", app_name );
         }
+        else if ((append = hack_append_command_line( app_name )))
+        {
+            tidy_cmdline = RtlAllocateHeap( GetProcessHeap(), 0,
+                                            sizeof(WCHAR) * (lstrlenW(cmd_line) + lstrlenW(append) + 1) );
+            lstrcpyW( tidy_cmdline, cmd_line );
+            lstrcatW( tidy_cmdline, append );
+        }
     }
     else
     {
-        if (!(tidy_cmdline = get_file_name( cmd_line, name, ARRAY_SIZE(name) ))) return FALSE;
+        WCHAR *cmdline_new = NULL;
+
+        if ((append = hack_append_command_line( cmd_line )))
+        {
+            cmdline_new = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(WCHAR)
+                                           * (lstrlenW(cmd_line) + lstrlenW(append) + 1) );
+            lstrcpyW( cmdline_new, cmd_line );
+            lstrcatW( cmdline_new, append );
+        }
+
+        if (!(tidy_cmdline = get_file_name( cmdline_new ? cmdline_new : cmd_line, name, ARRAY_SIZE(name) )))
+        {
+            HeapFree( GetProcessHeap(), 0, cmdline_new );
+            return FALSE;
+        }
+        if (cmdline_new)
+        {
+            if (cmdline_new != tidy_cmdline) HeapFree( GetProcessHeap(), 0, cmdline_new );
+            cmd_line = NULL;
+        }
         app_name = name;
     }
 
