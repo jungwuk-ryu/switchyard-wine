@@ -154,6 +154,51 @@ static NSImage* image_from_cgimage_array(NSArray* images)
     return nsimage;
 }
 
+static BOOL image_has_representation_with_pixel_size(NSImage* image, NSImageRep* candidate)
+{
+    NSImageRep* imageRep;
+
+    for (imageRep in [image representations])
+    {
+        if ([imageRep pixelsWide] == [candidate pixelsWide] &&
+            [imageRep pixelsHigh] == [candidate pixelsHigh])
+            return YES;
+    }
+
+    return NO;
+}
+
+static NSImage* image_by_merging_application_and_window_icons(NSImage* applicationImage,
+                                                               NSImage* windowImage)
+{
+    NSImage* mergedImage;
+    NSImageRep* imageRep;
+    NSSize applicationSize, windowSize;
+
+    if (!windowImage) return applicationImage;
+    if (!applicationImage) return windowImage;
+
+    applicationSize = [applicationImage size];
+    windowSize = [windowImage size];
+    mergedImage = [[[NSImage alloc] initWithSize:applicationSize] autorelease];
+
+    /* Window icons override matching sizes, while the executable image supplies
+       higher-resolution representations for the Dock. */
+    for (imageRep in [applicationImage representations])
+    {
+        if (!image_has_representation_with_pixel_size(windowImage, imageRep))
+            [mergedImage addRepresentation:imageRep];
+    }
+
+    for (imageRep in [windowImage representations])
+        [mergedImage addRepresentation:imageRep];
+
+    if (MIN(windowSize.width, windowSize.height) > MIN(applicationSize.width, applicationSize.height))
+        [mergedImage setSize:windowSize];
+
+    return mergedImage;
+}
+
 
 @implementation WineApplicationController
 
@@ -352,7 +397,7 @@ static NSImage* image_from_cgimage_array(NSArray* images)
     {
         NSImage* windowIcon = [applicationIconWindow applicationIcon];
 
-        return windowIcon ? windowIcon : applicationIcon;
+        return image_by_merging_application_and_window_icons(applicationIcon, windowIcon);
     }
 
     - (void) applyApplicationIcon
