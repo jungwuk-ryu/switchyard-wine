@@ -1514,11 +1514,13 @@ static void test_query_logicalprocex(void)
 static void test_query_cpusetinfo(void)
 {
     SYSTEM_CPU_SET_INFORMATION *info;
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *cores = NULL, *core;
     unsigned int i, cpu_count;
-    ULONG len, expected_len;
+    ULONG len, expected_len, core_len, offset;
     NTSTATUS status;
     SYSTEM_INFO si;
     HANDLE process;
+    DWORD relationship;
 
     if (!pNtQuerySystemInformationEx)
         return;
@@ -1591,6 +1593,56 @@ static void test_query_cpusetinfo(void)
                 d->CpuSet.LogicalProcessorIndex, i);
         ok(!d->CpuSet.AllFlags, "Got unexpected AllFlags %#x, i %u.\n", d->CpuSet.AllFlags, i);
     }
+
+    relationship = RelationProcessorCore;
+    core_len = 0;
+    status = pNtQuerySystemInformationEx(SystemLogicalProcessorInformationEx, &relationship,
+                                         sizeof(relationship), NULL, 0, &core_len);
+    ok(status == STATUS_INFO_LENGTH_MISMATCH, "Got unexpected status %#lx.\n", status);
+    if (status == STATUS_INFO_LENGTH_MISMATCH && core_len)
+    {
+        cores = malloc(core_len);
+        ok(!!cores, "Failed to allocate %lu bytes.\n", core_len);
+    }
+    if (cores)
+    {
+        status = pNtQuerySystemInformationEx(SystemLogicalProcessorInformationEx, &relationship,
+                                             sizeof(relationship), cores, core_len, &core_len);
+        ok(status == STATUS_SUCCESS, "Got unexpected status %#lx.\n", status);
+    }
+    if (cores && status == STATUS_SUCCESS)
+    {
+        for (i = 0; i < cpu_count; ++i)
+        {
+            SYSTEM_CPU_SET_INFORMATION *d = &info[i];
+            BOOL found = FALSE;
+            unsigned int j;
+
+            for (offset = 0; offset < core_len;)
+            {
+                core = (void *)((char *)cores + offset);
+                ok(core->Size, "Core at offset %lu has zero size.\n", offset);
+                if (!core->Size) break;
+                for (j = 0; j < core->Processor.GroupCount; ++j)
+                {
+                    if (core->Processor.GroupMask[j].Group != d->CpuSet.Group
+                        || !(core->Processor.GroupMask[j].Mask
+                             & ((ULONG_PTR)1 << d->CpuSet.LogicalProcessorIndex)))
+                        continue;
+
+                    ok(core->Processor.EfficiencyClass == d->CpuSet.EfficiencyClass,
+                       "CPU %u has core efficiency class %u, CPU set class %u.\n", i,
+                       core->Processor.EfficiencyClass, d->CpuSet.EfficiencyClass);
+                    found = TRUE;
+                    break;
+                }
+                if (found) break;
+                offset += core->Size;
+            }
+            ok(found, "CPU set %u has no matching processor core.\n", i);
+        }
+    }
+    free(cores);
     free(info);
 }
 

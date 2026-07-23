@@ -253,8 +253,10 @@ static char cpu_vendor[13];
 static USHORT cpu_level, cpu_revision;
 static ULONGLONG cpu_id;
 static ULONGLONG cpu_features_bitmap[2];
+#ifdef linux
 static ULONG *performance_cores;
 static unsigned int performance_cores_capacity = 0;
+#endif
 static SYSTEM_LOGICAL_PROCESSOR_INFORMATION *logical_proc_info;
 static unsigned int logical_proc_info_len, logical_proc_info_alloc_len;
 static SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *logical_proc_info_ex;
@@ -786,7 +788,8 @@ static DWORD count_bits( ULONG_PTR mask )
     return count;
 }
 
-static BOOL logical_proc_info_ex_add_by_id( LOGICAL_PROCESSOR_RELATIONSHIP rel, DWORD id, ULONG_PTR mask )
+static BOOL logical_proc_info_ex_add_by_id( LOGICAL_PROCESSOR_RELATIONSHIP rel, DWORD id, ULONG_PTR mask,
+                                            BYTE efficiency_class )
 {
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *dataex;
     unsigned int ofs = 0;
@@ -818,10 +821,7 @@ static BOOL logical_proc_info_ex_add_by_id( LOGICAL_PROCESSOR_RELATIONSHIP rel, 
         dataex->Processor.Flags = count_bits( mask ) > 1 ? LTP_PC_SMT : 0;
     else
         dataex->Processor.Flags = 0;
-    if (rel == RelationProcessorCore && id / 32 < performance_cores_capacity)
-        dataex->Processor.EfficiencyClass = (performance_cores[id / 32] >> (id % 32)) & 1;
-    else
-        dataex->Processor.EfficiencyClass = 0;
+    dataex->Processor.EfficiencyClass = rel == RelationProcessorCore ? efficiency_class : 0;
     dataex->Processor.GroupCount = 1;
     dataex->Processor.GroupMask[0].Mask = mask;
     dataex->Processor.GroupMask[0].Group = 0;
@@ -839,7 +839,8 @@ static BOOL logical_proc_info_ex_add_by_id( LOGICAL_PROCESSOR_RELATIONSHIP rel, 
  * - RelationProcessorPackage: package id ('CPU socket').
  * - RelationProcessorCore: physical core number.
  */
-static BOOL logical_proc_info_add_by_id( LOGICAL_PROCESSOR_RELATIONSHIP rel, DWORD id, ULONG_PTR mask )
+static BOOL logical_proc_info_add_by_id( LOGICAL_PROCESSOR_RELATIONSHIP rel, DWORD id, ULONG_PTR mask,
+                                         BYTE efficiency_class )
 {
     unsigned int i;
 
@@ -849,11 +850,11 @@ static BOOL logical_proc_info_add_by_id( LOGICAL_PROCESSOR_RELATIONSHIP rel, DWO
             && logical_proc_info[i].Reserved[1] == id)
         {
             logical_proc_info[i].ProcessorMask |= mask;
-            return logical_proc_info_ex_add_by_id( rel, id, mask );
+            return logical_proc_info_ex_add_by_id( rel, id, mask, efficiency_class );
         }
         else if (rel == RelationProcessorCore && logical_proc_info[i].Relationship == rel
                  && logical_proc_info[i].Reserved[1] == id)
-            return logical_proc_info_ex_add_by_id( rel, id, mask );
+            return logical_proc_info_ex_add_by_id( rel, id, mask, efficiency_class );
     }
 
     if (!grow_logical_proc_buf()) return FALSE;
@@ -866,7 +867,7 @@ static BOOL logical_proc_info_add_by_id( LOGICAL_PROCESSOR_RELATIONSHIP rel, DWO
     logical_proc_info[i].Reserved[1] = id;
     logical_proc_info_len = i + 1;
 
-    return logical_proc_info_ex_add_by_id( rel, id, mask );
+    return logical_proc_info_ex_add_by_id( rel, id, mask, efficiency_class );
 }
 
 static BOOL logical_proc_info_add_cache( ULONG_PTR mask, CACHE_DESCRIPTOR *cache )
@@ -1114,7 +1115,7 @@ static NTSTATUS create_logical_proc_info(void)
                 fclose(f);
             }
             else r = 0;
-            if (!logical_proc_info_add_by_id( RelationProcessorPackage, r, (ULONG_PTR)1 << i ))
+            if (!logical_proc_info_add_by_id( RelationProcessorPackage, r, (ULONG_PTR)1 << i, 0 ))
             {
                 fclose(fcpu_list);
                 return STATUS_NO_MEMORY;
@@ -1147,7 +1148,9 @@ static NTSTATUS create_logical_proc_info(void)
             }
             else phys_core = i;
 
-            if (!logical_proc_info_add_by_id( RelationProcessorCore, phys_core, thread_mask ))
+            if (!logical_proc_info_add_by_id( RelationProcessorCore, phys_core, thread_mask,
+                                              phys_core / 32 < performance_cores_capacity
+                                              && (performance_cores[phys_core / 32] >> (phys_core % 32)) & 1 ))
             {
                 fclose(fcpu_list);
                 return STATUS_NO_MEMORY;
@@ -1262,6 +1265,210 @@ static NTSTATUS create_logical_proc_info(void)
 
 #elif defined(__APPLE__)
 
+struct apple_perflevel
+{
+    unsigned int physical_cpus;
+    unsigned int logical_cpus;
+    unsigned int cpus_per_l2;
+    unsigned int cpus_per_l3;
+    CACHE_DESCRIPTOR cache[5];
+};
+
+static BOOL apple_perflevel_sysctl_uint( unsigned int level, const char *property, unsigned int *value )
+{
+    char name[64];
+    size_t size = sizeof(*value);
+
+    snprintf( name, sizeof(name), "hw.perflevel%u.%s", level, property );
+    return !sysctlbyname( name, value, &size, NULL, 0 ) && size == sizeof(*value);
+}
+
+static BOOL apple_sysctl_uint64( const char *name, ULONGLONG *value )
+{
+    size_t size = 0;
+
+    if (sysctlbyname( name, NULL, &size, NULL, 0 )) return FALSE;
+    if (size == sizeof(unsigned int))
+    {
+        unsigned int value32;
+
+        if (sysctlbyname( name, &value32, &size, NULL, 0 )) return FALSE;
+        *value = value32;
+        return TRUE;
+    }
+    if (size == sizeof(*value))
+        return !sysctlbyname( name, value, &size, NULL, 0 );
+    return FALSE;
+}
+
+static BOOL apple_perflevel_sysctl_cache_size( unsigned int level, const char *property, DWORD *value )
+{
+    char name[64];
+    ULONGLONG cache_size;
+
+    snprintf( name, sizeof(name), "hw.perflevel%u.%s", level, property );
+    if (!apple_sysctl_uint64( name, &cache_size ) || cache_size > ~(DWORD)0) return FALSE;
+    *value = cache_size;
+    return TRUE;
+}
+
+static ULONG_PTR apple_cpu_mask( unsigned int first, unsigned int count )
+{
+    ULONG_PTR mask = 0;
+    unsigned int i;
+
+    for (i = 0; i < count; ++i) mask |= (ULONG_PTR)1 << (first + i);
+    return mask;
+}
+
+static void init_apple_cache( CACHE_DESCRIPTOR cache[5], unsigned int line_size )
+{
+    memset( cache, 0, 5 * sizeof(*cache) );
+    cache[1].Level = 1;
+    cache[1].Type = CacheInstruction;
+    cache[1].Associativity = 8;
+    cache[1].LineSize = line_size;
+    cache[2].Level = 1;
+    cache[2].Type = CacheData;
+    cache[2].Associativity = 8;
+    cache[2].LineSize = line_size;
+    cache[3].Level = 2;
+    cache[3].Type = CacheUnified;
+    cache[3].Associativity = 8;
+    cache[3].LineSize = line_size;
+    cache[4].Level = 3;
+    cache[4].Type = CacheUnified;
+    cache[4].Associativity = 12;
+    cache[4].LineSize = line_size;
+}
+
+static NTSTATUS create_apple_perflevel_proc_info( unsigned int lcpu_no, unsigned int cores_no,
+                                                  unsigned int pkgs_no, ULONG_PTR *all_cpus_mask )
+{
+    struct apple_perflevel *perflevels;
+    unsigned int perflevels_no, total_cores = 0, total_lcpus = 0;
+    unsigned int cache_line_size = 0x40, assoc, level, phys_core = 0, logical_cpu = 0;
+    ULONGLONG cache_line_size_value;
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+    size_t size;
+
+    if (pkgs_no != 1) return STATUS_NOT_SUPPORTED;
+
+    size = sizeof(perflevels_no);
+    if (sysctlbyname( "hw.nperflevels", &perflevels_no, &size, NULL, 0 ) || size != sizeof(perflevels_no)
+        || perflevels_no < 2 || perflevels_no > 256)
+        return STATUS_NOT_SUPPORTED;
+
+    if (!(perflevels = calloc( perflevels_no, sizeof(*perflevels) ))) return STATUS_NO_MEMORY;
+
+    if (!apple_sysctl_uint64( "hw.cachelinesize", &cache_line_size_value )
+        || !cache_line_size_value || cache_line_size_value > 0xffff)
+        cache_line_size = 0x40;
+    else
+        cache_line_size = cache_line_size_value;
+
+    size = sizeof(assoc);
+    if (sysctlbyname( "machdep.cpu.cache.L2_associativity", &assoc, &size, NULL, 0 )
+        || size != sizeof(assoc) || !assoc)
+        assoc = 8;
+
+    for (level = 0; level < perflevels_no; ++level)
+    {
+        struct apple_perflevel *perflevel = &perflevels[level];
+
+        init_apple_cache( perflevel->cache, cache_line_size );
+        perflevel->cache[3].Associativity = assoc;
+
+        if (!apple_perflevel_sysctl_uint( level, "physicalcpu", &perflevel->physical_cpus )
+            || !apple_perflevel_sysctl_uint( level, "logicalcpu", &perflevel->logical_cpus )
+            || !perflevel->physical_cpus || !perflevel->logical_cpus
+            || perflevel->logical_cpus % perflevel->physical_cpus)
+            goto done;
+
+        if (!apple_perflevel_sysctl_uint( level, "cpusperl2", &perflevel->cpus_per_l2 )
+            || !perflevel->cpus_per_l2 || perflevel->cpus_per_l2 > perflevel->physical_cpus)
+            perflevel->cpus_per_l2 = perflevel->physical_cpus;
+        if (!apple_perflevel_sysctl_uint( level, "cpusperl3", &perflevel->cpus_per_l3 )
+            || !perflevel->cpus_per_l3 || perflevel->cpus_per_l3 > perflevel->physical_cpus)
+            perflevel->cpus_per_l3 = perflevel->physical_cpus;
+
+        apple_perflevel_sysctl_cache_size( level, "l1icachesize", &perflevel->cache[1].Size );
+        apple_perflevel_sysctl_cache_size( level, "l1dcachesize", &perflevel->cache[2].Size );
+        apple_perflevel_sysctl_cache_size( level, "l2cachesize", &perflevel->cache[3].Size );
+        apple_perflevel_sysctl_cache_size( level, "l3cachesize", &perflevel->cache[4].Size );
+
+        total_cores += perflevel->physical_cpus;
+        total_lcpus += perflevel->logical_cpus;
+    }
+
+    if (total_cores != cores_no || total_lcpus != lcpu_no
+        || total_lcpus > 8 * sizeof(ULONG_PTR))
+        goto done;
+
+    status = STATUS_NO_MEMORY;
+    for (level = 0; level < perflevels_no; ++level)
+    {
+        struct apple_perflevel *perflevel = &perflevels[level];
+        unsigned int lcpus_per_core = perflevel->logical_cpus / perflevel->physical_cpus;
+        unsigned int level_first_cpu = logical_cpu;
+        unsigned int i;
+
+        TRACE( "performance level %u has %u logical CPUs from %u physical cores, efficiency class %u\n",
+               level, perflevel->logical_cpus, perflevel->physical_cpus, perflevels_no - level - 1 );
+
+        for (i = 0; i < perflevel->physical_cpus; ++i)
+        {
+            ULONG_PTR mask = apple_cpu_mask( logical_cpu, lcpus_per_core );
+
+            if (!logical_proc_info_add_by_id( RelationProcessorPackage, 0, mask, 0 )
+                || !logical_proc_info_add_by_id( RelationProcessorCore, phys_core, mask,
+                                                 perflevels_no - level - 1 ))
+                goto done;
+            if (perflevel->cache[1].Size
+                && !logical_proc_info_add_cache( mask, &perflevel->cache[1] ))
+                goto done;
+            if (perflevel->cache[2].Size
+                && !logical_proc_info_add_cache( mask, &perflevel->cache[2] ))
+                goto done;
+
+            *all_cpus_mask |= mask;
+            ++phys_core;
+            logical_cpu += lcpus_per_core;
+        }
+
+        if (perflevel->cache[3].Size)
+        {
+            unsigned int cache_cores = perflevel->cpus_per_l2;
+
+            for (i = 0; i < perflevel->physical_cpus; i += cache_cores)
+            {
+                unsigned int cores = min( cache_cores, perflevel->physical_cpus - i );
+                ULONG_PTR mask = apple_cpu_mask( level_first_cpu + i * lcpus_per_core,
+                                                 cores * lcpus_per_core );
+                if (!logical_proc_info_add_cache( mask, &perflevel->cache[3] )) goto done;
+            }
+        }
+
+        if (perflevel->cache[4].Size)
+        {
+            unsigned int cache_cores = perflevel->cpus_per_l3;
+
+            for (i = 0; i < perflevel->physical_cpus; i += cache_cores)
+            {
+                unsigned int cores = min( cache_cores, perflevel->physical_cpus - i );
+                ULONG_PTR mask = apple_cpu_mask( level_first_cpu + i * lcpus_per_core,
+                                                 cores * lcpus_per_core );
+                if (!logical_proc_info_add_cache( mask, &perflevel->cache[4] )) goto done;
+            }
+        }
+    }
+    status = STATUS_SUCCESS;
+
+done:
+    free( perflevels );
+    return status;
+}
+
 /* for 'data', max_len is the array count. for 'dataex', max_len is in bytes */
 static NTSTATUS create_logical_proc_info(void)
 {
@@ -1270,6 +1477,7 @@ static NTSTATUS create_logical_proc_info(void)
     ULONG_PTR all_cpus_mask = 0;
     CACHE_DESCRIPTOR cache[10];
     LONGLONG cache_size, cache_line_size, cache_sharing[10];
+    NTSTATUS status;
     size_t size;
     unsigned int p, i, j, k;
 
@@ -1285,6 +1493,10 @@ static NTSTATUS create_logical_proc_info(void)
 
     TRACE("%u logical CPUs from %u physical cores across %u packages\n",
             lcpu_no, cores_no, pkgs_no);
+
+    status = create_apple_perflevel_proc_info( lcpu_no, cores_no, pkgs_no, &all_cpus_mask );
+    if (status == STATUS_SUCCESS) goto done;
+    if (status != STATUS_NOT_SUPPORTED) return status;
 
     lcpu_per_core = lcpu_no / cores_no;
     cores_per_package = cores_no / pkgs_no;
@@ -1359,12 +1571,12 @@ static NTSTATUS create_logical_proc_info(void)
             all_cpus_mask |= mask;
 
             /* add to package */
-            if(!logical_proc_info_add_by_id( RelationProcessorPackage, p, mask ))
+            if(!logical_proc_info_add_by_id( RelationProcessorPackage, p, mask, 0 ))
                 return STATUS_NO_MEMORY;
 
             /* add new core */
             phys_core = p * cores_per_package + j;
-            if(!logical_proc_info_add_by_id( RelationProcessorCore, phys_core, mask ))
+            if(!logical_proc_info_add_by_id( RelationProcessorCore, phys_core, mask, 0 ))
                 return STATUS_NO_MEMORY;
 
             for(i = 1; i < 5; ++i)
@@ -1385,6 +1597,7 @@ static NTSTATUS create_logical_proc_info(void)
         }
     }
 
+done:
     /* OSX doesn't support NUMA, so just make one NUMA node for all CPUs */
     if(!logical_proc_info_add_numa_node( all_cpus_mask, 0 ))
         return STATUS_NO_MEMORY;
@@ -1447,11 +1660,13 @@ static NTSTATUS traverse_hwloc_topology(hwloc_obj_t obj)
     switch (obj->type)
     {
     case HWLOC_OBJ_PACKAGE:
-        if (!logical_proc_info_add_by_id(RelationProcessorPackage, obj->logical_index, hwloc_bitmap_to_ulong(obj->cpuset)))
+        if (!logical_proc_info_add_by_id(RelationProcessorPackage, obj->logical_index,
+                                         hwloc_bitmap_to_ulong(obj->cpuset), 0))
             return STATUS_NO_MEMORY;
         break;
     case HWLOC_OBJ_CORE:
-        if (!logical_proc_info_add_by_id(RelationProcessorCore, obj->logical_index, hwloc_bitmap_to_ulong(obj->cpuset)))
+        if (!logical_proc_info_add_by_id(RelationProcessorCore, obj->logical_index,
+                                         hwloc_bitmap_to_ulong(obj->cpuset), 0))
             return STATUS_NO_MEMORY;
         break;
     case HWLOC_OBJ_L1CACHE:
