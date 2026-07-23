@@ -96,6 +96,10 @@ for required_notice in \
   share/doc/switchyard-wine/COPYING.LIB \
   share/doc/switchyard-wine/AUTHORS \
   share/doc/switchyard-wine/CORRESPONDING-SOURCE.txt \
+  lib/switchyard-mesa/share/doc/switchyard-mesa/README.txt \
+  lib/switchyard-mesa/share/doc/switchyard-mesa/MESA-LICENSE.rst \
+  lib/switchyard-mesa/share/doc/switchyard-mesa/LLVM-LICENSE.txt \
+  lib/switchyard-mesa/share/doc/switchyard-mesa/DISTRIBUTOR-LICENSE.txt \
   lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv \
   lib/switchyard-tls/share/doc/switchyard-tls/sources.tsv; do
   [ -f "$RUNTIME/$required_notice" ] || {

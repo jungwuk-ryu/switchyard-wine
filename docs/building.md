@@ -36,7 +36,7 @@ Inspect the source identity that would be written to a runtime manifest with:
 ./switchyard/build_runtime.sh
 ```
 
-The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, a pinned x86_64 GnuTLS dependency closure, and the pinned redistributable Noto font set into user-local caches. GnuTLS packages come from conda-forge; the legacy libunistring ABI is rebuilt from pinned GNU source so the resulting library can be Developer ID signed and translated reliably by Rosetta. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, font-asset, and core-binary integrity metadata.
+The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, a pinned x86_64 GnuTLS dependency closure, a pinned i386/x86_64 Mesa Windows OpenGL package, and the pinned redistributable Noto font set into user-local caches. GnuTLS packages come from conda-forge; the legacy libunistring ABI is rebuilt from pinned GNU source so the resulting library can be Developer ID signed and translated reliably by Rosetta. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, font-asset, Mesa, and core-binary integrity metadata.
 
 The font set supplies regular faces for every Noto family referenced by Wine's DirectWrite fallback table, common bold faces, symbols, and the Japanese, Korean, Simplified Chinese, Traditional Chinese, and Hong Kong faces from Noto Sans CJK. The unmodified files are installed in `share/wine/fonts`, so they are visible to every prefix without copying fonts into `C:\\Windows\\Fonts`. Their pinned URLs and SHA-256 values live in `switchyard/font-assets.tsv`; SIL Open Font License 1.1 notices are copied into the runtime.
 
@@ -45,6 +45,12 @@ Validate the manifest without network access, or verify every downloaded font an
 ```sh
 ./switchyard/verify_font_assets.sh
 ./switchyard/verify_font_assets.sh --download
+```
+
+Verify the pinned Mesa archive, both PE architectures, hashes, and license notices with:
+
+```sh
+./switchyard/build_runtime.sh --verify-mesa
 ```
 
 An existing custom install prefix is replaced only when it is a child of Switchyard's managed runtime root or contains a valid Switchyard runtime manifest for that exact path. Existing cache directories require a regular Switchyard ownership marker; an intact full-content digest is required for reuse, while an owned cache with damaged content is safely replaced. The builder refuses symbolic-link destinations, unmanaged directories, the managed root itself, the home directory, and dangerous ancestor paths.
@@ -61,6 +67,8 @@ Useful overrides include:
 - `RECONFIGURE=1`: rerun Wine configuration;
 - `GPTK_PATH`: user-selected local GPTK path; and
 - `SWITCHYARD_DISABLE_GPTK_OVERLAY=1`: force a Wine-only build without reading or copying GPTK;
+- `MESA_WINDOWS_CACHE_DIR`: cache for the pinned Mesa Windows package and notices;
+- `MESA_WINDOWS_DEPS_PREFIX`: verified staging prefix for the i386/x86_64 Mesa DLLs;
 - `FONT_ASSET_DOWNLOAD_CACHE_DIR`: cache for the verified redistributable font files;
 - `TLS_PACKAGE_CACHE_DIR`: cache for the pinned, hash-verified x86_64 TLS packages and source archives.
 
@@ -130,6 +138,20 @@ channel still opts into full validation:
 ./switchyard/tests/heap_warning_flags_test.sh \
   ~/.switchyard/runtimes/<runtime-id>
 ```
+
+Verify that the default Wine OpenGL driver remains unchanged and that the
+explicit Mesa selection provides OpenGL 4.3 or newer through llvmpipe for both
+PE architectures:
+
+```sh
+./switchyard/tests/mesa_opengl_backend_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
+
+At launch time, set `WINE_OPENGL_DRIVER=llvmpipe` in a container's
+environment overrides to select the software OpenGL backend for its complete
+Windows process tree. Use `WINE_OPENGL_DRIVER=wine`, or leave it unset,
+to retain Wine's built-in macOS OpenGL path.
 
 For a runtime with the GPTK overlay, exercise D3DMetal's shared DXGI resource
 callbacks from a fresh prefix with:

@@ -151,6 +151,35 @@ static WCHAR *get_basename( WCHAR *name )
 }
 
 /***************************************************************************
+ *	wcs_contains_ascii
+ *
+ * Return whether a WCHAR string contains an ASCII substring, ignoring case.
+ */
+static BOOL wcs_contains_ascii( const WCHAR *str, const char *ascii )
+{
+    size_t len = strlen( ascii );
+
+    if (!len) return TRUE;
+    while (*str)
+    {
+        size_t i;
+
+        for (i = 0; i < len && str[i]; i++)
+        {
+            WCHAR ch = str[i];
+            unsigned char expected = ascii[i];
+
+            if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+            if (expected >= 'A' && expected <= 'Z') expected += 'a' - 'A';
+            if (ch != expected) break;
+        }
+        if (i == len) return TRUE;
+        str++;
+    }
+    return FALSE;
+}
+
+/***************************************************************************
  *	remove_dll_ext
  *
  * Remove extension if it is ".dll".
@@ -498,10 +527,13 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
                                const struct pe_mapping_info *pe_mapping )
 {
     static const WCHAR prefixW[] = {'\\','?','?','\\'};
+    static const WCHAR opengl32W[] = {'o','p','e','n','g','l','3','2',0};
+    static const WCHAR libgalliumW[] = {'l','i','b','g','a','l','l','i','u','m','_','w','g','l',0};
     enum loadorder ret = LO_INVALID;
     const WCHAR *path = nt_name->Buffer;
     unsigned int len = nt_name->Length / sizeof(WCHAR);
     WCHAR *module, *basename;
+    BOOL switchyard_mesa;
 
     if (!init_done) init_load_order();
 
@@ -516,6 +548,9 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
     module[len + 1] = 0;
     remove_dll_ext( module + 1 );
     basename = get_basename( module + 1 );
+    switchyard_mesa =
+        wcs_contains_ascii( module + 1, "\\lib\\switchyard-mesa\\x86_64-windows\\" ) ||
+        wcs_contains_ascii( module + 1, "\\lib\\switchyard-mesa\\i386-windows\\" );
 
     /* first explicit module name */
     if ((ret = get_load_order_value( std_key, app_key, is_system_dir ? basename : module+1 )) != LO_INVALID)
@@ -532,6 +567,15 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
         /* module basename without '*' */
         if (((ret = get_load_order_value( std_key, app_key, basename )) != LO_INVALID))
             goto done;
+
+        if (switchyard_mesa &&
+            (!wcsicmp( basename, opengl32W ) || !wcsicmp( basename, libgalliumW )))
+        {
+            ret = LO_NATIVE;
+            TRACE( "using runtime-selected Switchyard Mesa OpenGL backend %s for %s\n",
+                   debugstr_loadorder(ret), debugstr_us(nt_name) );
+            goto done;
+        }
 
         if (!main_exe_loaded)  /* if loading the main exe, try native first */
         {

@@ -100,6 +100,12 @@ static UNICODE_STRING system_dll_path; /* path to search for system dependency d
 static DWORD default_search_flags;  /* default flags set by LdrSetDefaultDllDirectories */
 static WCHAR *default_load_path;    /* default dll search path */
 static HANDLE known_dlls_ntdir;  /* NT directory containing known dlls sections */
+static BOOL switchyard_mesa_opengl;  /* use the runtime-selected Mesa OpenGL backend */
+#ifdef _WIN64
+static const WCHAR switchyard_mesa_pe_dir[] = L"x86_64-windows\\";
+#else
+static const WCHAR switchyard_mesa_pe_dir[] = L"i386-windows\\";
+#endif
 
 struct dll_dir_entry
 {
@@ -3170,6 +3176,62 @@ static NTSTATUS get_env_var( const WCHAR *name, SIZE_T extra, UNICODE_STRING *re
     }
 }
 
+static void switchyard_init_mesa_opengl(void)
+{
+    UNICODE_STRING mesa_path;
+
+    if (get_env_var( L"SWITCHYARD_OPENGL_DLL_PATH", 0, &mesa_path )) return;
+    switchyard_mesa_opengl = !!mesa_path.Length;
+    RtlFreeUnicodeString( &mesa_path );
+    if (switchyard_mesa_opengl)
+        TRACE( "enabled the runtime-selected Switchyard Mesa OpenGL backend\n" );
+}
+
+static BOOL switchyard_is_mesa_opengl_dll( const WCHAR *name )
+{
+    return !wcsicmp( name, L"opengl32.dll" ) ||
+           !wcsicmp( name, L"libgallium_wgl.dll" );
+}
+
+static NTSTATUS switchyard_find_mesa_opengl_dll(
+    const WCHAR *libname, UNICODE_STRING *nt_name, WINE_MODREF **pwm,
+    HANDLE *mapping, SECTION_IMAGE_INFORMATION *image_info, struct file_id *id )
+{
+    UNICODE_STRING mesa_path;
+    NTSTATUS status;
+    WCHAR last;
+
+    if (!switchyard_mesa_opengl || contains_path( libname ) ||
+        !switchyard_is_mesa_opengl_dll( libname ))
+        return STATUS_DLL_NOT_FOUND;
+    if (get_env_var( L"SWITCHYARD_OPENGL_DLL_PATH",
+                     wcslen(switchyard_mesa_pe_dir) + wcslen(libname) + 2, &mesa_path ))
+        return STATUS_DLL_NOT_FOUND;
+    if (!mesa_path.Length)
+    {
+        RtlFreeUnicodeString( &mesa_path );
+        return STATUS_DLL_NOT_FOUND;
+    }
+
+    last = mesa_path.Buffer[mesa_path.Length / sizeof(WCHAR) - 1];
+    if (last != '\\' && last != '/') RtlAppendUnicodeToString( &mesa_path, L"\\" );
+    RtlAppendUnicodeToString( &mesa_path, switchyard_mesa_pe_dir );
+    RtlAppendUnicodeToString( &mesa_path, libname );
+    status = RtlDosPathNameToNtPathName_U_WithStatus( mesa_path.Buffer, nt_name, NULL, NULL );
+    RtlFreeUnicodeString( &mesa_path );
+    if (status) return status;
+
+    status = open_dll_file( nt_name, pwm, mapping, image_info, id );
+    if (status)
+    {
+        RtlFreeUnicodeString( nt_name );
+        nt_name->Buffer = NULL;
+        return status;
+    }
+    TRACE( "redirected %s to %s\n", debugstr_w(libname), debugstr_us(nt_name) );
+    return STATUS_SUCCESS;
+}
+
 
 /***********************************************************************
  *	find_builtin_without_file
@@ -3315,6 +3377,11 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
 
     if (!contains_path( libname ))
     {
+        status = switchyard_find_mesa_opengl_dll( libname, nt_name, pwm, mapping,
+                                                  image_info, id );
+        if (!status) return status;
+        if (status != STATUS_DLL_NOT_FOUND) return status;
+
         status = find_apiset_dll( libname, &fullname );
         if (status == STATUS_DLL_NOT_FOUND) return status;
 
@@ -8177,6 +8244,7 @@ void loader_init( CONTEXT *context, void **entry )
             InitializeListHead( &hash_table[i] );
 
         init_user_process_params();
+        switchyard_init_mesa_opengl();
         load_global_options();
         version_init();
         open_known_dll_ntdir();

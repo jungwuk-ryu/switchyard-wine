@@ -11,3 +11,5 @@ The mechanical migration was verified by comparing the Git tree produced by sequ
 Wine and the downstream modifications in this repository are licensed under the GNU Lesser General Public License, version 2.1 or later. See `LICENSE` and `COPYING.LIB`. Anyone distributing a binary built from this repository must continue to satisfy the LGPL source, relinking, notice, and replacement requirements applicable to that distribution.
 
 This repository contains no Apple Game Porting Toolkit binaries or source, no launcher binaries or assets, and no user credentials. References to GPTK, Steam, Battle.net, Chrome, or other software describe compatibility work and local interoperability testing only.
+
+The optional Mesa llvmpipe OpenGL backend is also an external build input rather than tracked binary source. The runtime builder downloads a pinned Mesa Windows distribution, verifies the archive and extracted i386/x86_64 DLL hashes, and records the Mesa source and distributor revisions. Mesa, LLVM, and distributor license notices are retained under `lib/switchyard-mesa/share/doc/switchyard-mesa` in every generated runtime.

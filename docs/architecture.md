@@ -20,6 +20,12 @@ The runtime carries an unmodified, hash-pinned Noto font baseline under the SIL 
 
 Apple Game Porting Toolkit components are outside both repositories. When a user selects a local GPTK installation, the runtime builder fingerprints and overlays the selected redistributable files into that user's local runtime. Those files are never downloaded, committed, or published here.
 
+## Selectable OpenGL driver
+
+The runtime keeps Wine's macOS OpenGL implementation as its default and also carries hash-pinned i386 and x86_64 Mesa llvmpipe DLLs. Setting `WINE_OPENGL_DRIVER=llvmpipe` on a container selects the software driver for its complete Windows process tree; leaving the variable unset, or setting it to `wine`, preserves Wine's built-in driver. The loader resolves the selected runtime DLL directory by architecture and does not inspect executable names, paths, versions, or vendors.
+
+This option is intended for programs that require a newer desktop OpenGL version than macOS CGL exposes. It trades GPU acceleration for API compatibility, so the selection belongs to container configuration rather than an application-specific Wine rule.
+
 ## Runtime identity
 
 Every generated `switchyard-runtime.json` records the source repository and commit, upstream Wine revision, dirty-tree state and digest, dependency digests, supported PE architectures, installed executable, and hashes of core Wine/PE binaries. A runtime directory name includes the same immutable inputs. Builds happen outside the live path and are promoted with an atomic directory swap only after verification, so changing source or dependencies cannot partially mutate an existing installation.

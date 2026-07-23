@@ -8,9 +8,9 @@ UPSTREAM_BASE_FILE="$ROOT_DIR/switchyard/upstream-base.txt"
 MODE="${1:-build}"
 
 case "$MODE" in
-  build|--ensure|--source-info|--verify-tls) ;;
+  build|--ensure|--source-info|--verify-mesa|--verify-tls) ;;
   *)
-    echo "usage: $0 [--ensure|--source-info|--verify-tls]" >&2
+    echo "usage: $0 [--ensure|--source-info|--verify-mesa|--verify-tls]" >&2
     exit 2
     ;;
 esac
@@ -41,6 +41,27 @@ MOLTENVK_LAYER_SHA256="9bb2d88ee0ed7cd035f982a59a2e9c5878237c9f4df88117172ccdbc5
 MOLTENVK_MANIFEST_DIGEST="sha256:6facac52c2f0f948cf185cf97f5f941c4d2f55a75e5e19d7e259e807597afd94"
 VULKAN_CACHE_DIR="${VULKAN_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Vulkan}"
 VULKAN_DEPS_PREFIX="${VULKAN_DEPS_PREFIX:-${HOME}/.switchyard/deps/vulkan/x86_64-loader-${VULKAN_LOADER_VERSION}-moltenvk-${MOLTENVK_VERSION}}"
+MESA_WINDOWS_VERSION="26.1.1"
+MESA_WINDOWS_LLVM_VERSION="22.1.6"
+MESA_WINDOWS_ARCHIVE="mesa3d-${MESA_WINDOWS_VERSION}-release-msvc.7z"
+MESA_WINDOWS_ARCHIVE_URL="https://github.com/pal1000/mesa-dist-win/releases/download/${MESA_WINDOWS_VERSION}/${MESA_WINDOWS_ARCHIVE}"
+MESA_WINDOWS_ARCHIVE_SHA256="d5e90e9ae4d620313b61fbbf8e9a55761454e38b6501c39be6d93449c88780e1"
+MESA_WINDOWS_X86_64_OPENGL_SHA256="d2645f47b4dee4f47dcdfc1b2021a70f471655d95a019cfd1fb48415810867ed"
+MESA_WINDOWS_X86_64_GALLIUM_SHA256="27f16f9e98119ad529ed915d4f65c3a2e8d84b4f8cbdce2f13cda0637b73e05c"
+MESA_WINDOWS_I386_OPENGL_SHA256="da8cd72a4576a3b45507724fec04a4cabcd6d325b542bf441033982383876c6c"
+MESA_WINDOWS_I386_GALLIUM_SHA256="fafac63d8644c9ae80edb51770f8abe5953777b4001dcecb40255c7601c55bec"
+MESA_WINDOWS_DISTRIBUTOR_REPOSITORY="https://github.com/pal1000/mesa-dist-win"
+MESA_WINDOWS_DISTRIBUTOR_REVISION="1e2b696ce9e81e77e17ee6e4787587237ce9d2ed"
+MESA_WINDOWS_DISTRIBUTOR_LICENSE_URL="https://raw.githubusercontent.com/pal1000/mesa-dist-win/${MESA_WINDOWS_VERSION}/LICENSE"
+MESA_WINDOWS_DISTRIBUTOR_LICENSE_SHA256="9cd0121dc070f0ac65c1fc266bee74bdbbc22cea4210ae72ae0c1f076448d4cc"
+MESA_SOURCE_REPOSITORY="https://gitlab.freedesktop.org/mesa/mesa"
+MESA_SOURCE_REVISION="97341aa7d7c340c9a4dbec192795dadd733b5846"
+MESA_SOURCE_LICENSE_URL="https://gitlab.freedesktop.org/mesa/mesa/-/raw/mesa-${MESA_WINDOWS_VERSION}/docs/license.rst"
+MESA_SOURCE_LICENSE_SHA256="0d1a0472ecc81830e75c20d59b0ea02841e3db21255e0ebad97ab682c54d6615"
+MESA_LLVM_LICENSE_URL="https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-${MESA_WINDOWS_LLVM_VERSION}/LICENSE.TXT"
+MESA_LLVM_LICENSE_SHA256="8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+MESA_WINDOWS_CACHE_DIR="${MESA_WINDOWS_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Mesa/windows-${MESA_WINDOWS_VERSION}}"
+MESA_WINDOWS_DEPS_PREFIX="${MESA_WINDOWS_DEPS_PREFIX:-${HOME}/.switchyard/deps/mesa/windows-wow64-${MESA_WINDOWS_VERSION}}"
 FONT_DEPS_CACHE_DIR="${FONT_DEPS_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Fonts/deps}"
 FONT_DEPS_PREFIX="${FONT_DEPS_PREFIX:-${HOME}/.switchyard/deps/fonts/x86_64-freetype-2.14.3-fontconfig-2.18.1}"
 FONT_DLOPEN_FREETYPE="@loader_path/../../switchyard-fonts/lib/libfreetype.6.dylib"
@@ -148,6 +169,7 @@ require_command shasum
 require_command perl
 require_command curl
 require_command tar
+require_command bsdtar
 require_command unzip
 require_command zstd
 require_command install_name_tool
@@ -389,6 +411,190 @@ EOF
   write_content_tree_digest "$temporary_prefix"
   atomic_replace_directory "$temporary_prefix" "$FONT_ASSET_PREFIX" cache
   printf '%s\n' "$FONT_ASSET_PREFIX"
+}
+
+download_mesa_windows_asset() {
+  local name="$1"
+  local expected_hash="$2"
+  local url="$3"
+  local cached_file="$MESA_WINDOWS_CACHE_DIR/$name"
+  local temporary_file="${cached_file}.tmp.$$"
+  local actual_hash
+
+  mkdir -p "$MESA_WINDOWS_CACHE_DIR"
+  if [ -f "$cached_file" ]; then
+    actual_hash="$(sha256_file "$cached_file")"
+    if [ "$actual_hash" = "$expected_hash" ]; then
+      printf '%s\n' "$cached_file"
+      return 0
+    fi
+    echo "cached Mesa Windows asset $name has unexpected sha256 $actual_hash; downloading again." >&2
+    rm -f "$cached_file"
+  fi
+
+  rm -f "$temporary_file"
+  echo "downloading Mesa Windows asset $name" >&2
+  curl -fL --retry 3 --connect-timeout 20 --proto '=https' --tlsv1.2 \
+    -o "$temporary_file" "$url"
+  actual_hash="$(sha256_file "$temporary_file")"
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    rm -f "$temporary_file"
+    echo "Mesa Windows asset $name sha256 mismatch: expected $expected_hash, got $actual_hash" >&2
+    exit 1
+  fi
+  mv "$temporary_file" "$cached_file"
+  printf '%s\n' "$cached_file"
+}
+
+stage_mesa_windows_opengl() {
+  local x86_64_opengl_dll="$MESA_WINDOWS_DEPS_PREFIX/x86_64-windows/opengl32.dll"
+  local x86_64_gallium_dll="$MESA_WINDOWS_DEPS_PREFIX/x86_64-windows/libgallium_wgl.dll"
+  local i386_opengl_dll="$MESA_WINDOWS_DEPS_PREFIX/i386-windows/opengl32.dll"
+  local i386_gallium_dll="$MESA_WINDOWS_DEPS_PREFIX/i386-windows/libgallium_wgl.dll"
+  local notice_root="$MESA_WINDOWS_DEPS_PREFIX/share/doc/switchyard-mesa"
+  local archive
+  local mesa_license
+  local llvm_license
+  local distributor_license
+  local staging_dir
+  local temporary_prefix
+
+  if content_tree_is_verified "$MESA_WINDOWS_DEPS_PREFIX" &&
+     [ -f "$x86_64_opengl_dll" ] &&
+     [ "$(sha256_file "$x86_64_opengl_dll")" = "$MESA_WINDOWS_X86_64_OPENGL_SHA256" ] &&
+     [ -f "$x86_64_gallium_dll" ] &&
+     [ "$(sha256_file "$x86_64_gallium_dll")" = "$MESA_WINDOWS_X86_64_GALLIUM_SHA256" ] &&
+     [ -f "$i386_opengl_dll" ] &&
+     [ "$(sha256_file "$i386_opengl_dll")" = "$MESA_WINDOWS_I386_OPENGL_SHA256" ] &&
+     [ -f "$i386_gallium_dll" ] &&
+     [ "$(sha256_file "$i386_gallium_dll")" = "$MESA_WINDOWS_I386_GALLIUM_SHA256" ] &&
+     [ -f "$notice_root/MESA-LICENSE.rst" ] &&
+     [ "$(sha256_file "$notice_root/MESA-LICENSE.rst")" = "$MESA_SOURCE_LICENSE_SHA256" ] &&
+     [ -f "$notice_root/LLVM-LICENSE.txt" ] &&
+     [ "$(sha256_file "$notice_root/LLVM-LICENSE.txt")" = "$MESA_LLVM_LICENSE_SHA256" ] &&
+     [ -f "$notice_root/DISTRIBUTOR-LICENSE.txt" ] &&
+     [ "$(sha256_file "$notice_root/DISTRIBUTOR-LICENSE.txt")" = "$MESA_WINDOWS_DISTRIBUTOR_LICENSE_SHA256" ]; then
+    printf '%s\n' "$MESA_WINDOWS_DEPS_PREFIX"
+    return 0
+  fi
+
+  archive="$(download_mesa_windows_asset \
+    "$MESA_WINDOWS_ARCHIVE" "$MESA_WINDOWS_ARCHIVE_SHA256" "$MESA_WINDOWS_ARCHIVE_URL")"
+  mesa_license="$(download_mesa_windows_asset \
+    "MESA-LICENSE.rst" "$MESA_SOURCE_LICENSE_SHA256" "$MESA_SOURCE_LICENSE_URL")"
+  llvm_license="$(download_mesa_windows_asset \
+    "LLVM-LICENSE.txt" "$MESA_LLVM_LICENSE_SHA256" "$MESA_LLVM_LICENSE_URL")"
+  distributor_license="$(download_mesa_windows_asset \
+    "DISTRIBUTOR-LICENSE.txt" "$MESA_WINDOWS_DISTRIBUTOR_LICENSE_SHA256" \
+    "$MESA_WINDOWS_DISTRIBUTOR_LICENSE_URL")"
+
+  staging_dir="$(mktemp -d)"
+  temporary_prefix="${MESA_WINDOWS_DEPS_PREFIX}.tmp.$$"
+  rm -rf "$temporary_prefix"
+  mkdir -p "$temporary_prefix/x86_64-windows" "$temporary_prefix/i386-windows" \
+    "$temporary_prefix/share/doc/switchyard-mesa"
+
+  bsdtar -xf "$archive" -C "$staging_dir" \
+    x64/opengl32.dll x64/libgallium_wgl.dll \
+    x86/opengl32.dll x86/libgallium_wgl.dll readme.txt
+  install -m 0644 "$staging_dir/x64/opengl32.dll" \
+    "$temporary_prefix/x86_64-windows/opengl32.dll"
+  install -m 0644 "$staging_dir/x64/libgallium_wgl.dll" \
+    "$temporary_prefix/x86_64-windows/libgallium_wgl.dll"
+  install -m 0644 "$staging_dir/x86/opengl32.dll" \
+    "$temporary_prefix/i386-windows/opengl32.dll"
+  install -m 0644 "$staging_dir/x86/libgallium_wgl.dll" \
+    "$temporary_prefix/i386-windows/libgallium_wgl.dll"
+  install -m 0644 "$staging_dir/readme.txt" \
+    "$temporary_prefix/share/doc/switchyard-mesa/DISTRIBUTOR-README.txt"
+  install -m 0644 "$mesa_license" \
+    "$temporary_prefix/share/doc/switchyard-mesa/MESA-LICENSE.rst"
+  install -m 0644 "$llvm_license" \
+    "$temporary_prefix/share/doc/switchyard-mesa/LLVM-LICENSE.txt"
+  install -m 0644 "$distributor_license" \
+    "$temporary_prefix/share/doc/switchyard-mesa/DISTRIBUTOR-LICENSE.txt"
+
+  if ! file "$temporary_prefix/x86_64-windows/opengl32.dll" |
+       grep -q 'PE32+.*x86-64'; then
+    echo "Mesa opengl32.dll is not an x86_64 PE image." >&2
+    exit 1
+  fi
+  if ! file "$temporary_prefix/x86_64-windows/libgallium_wgl.dll" |
+       grep -q 'PE32+.*x86-64'; then
+    echo "Mesa libgallium_wgl.dll is not an x86_64 PE image." >&2
+    exit 1
+  fi
+  if ! file "$temporary_prefix/i386-windows/opengl32.dll" |
+       grep -q 'PE32 executable.*Intel 80386'; then
+    echo "Mesa opengl32.dll is not an i386 PE image." >&2
+    exit 1
+  fi
+  if ! file "$temporary_prefix/i386-windows/libgallium_wgl.dll" |
+       grep -q 'PE32 executable.*Intel 80386'; then
+    echo "Mesa libgallium_wgl.dll is not an i386 PE image." >&2
+    exit 1
+  fi
+  if [ "$(sha256_file "$temporary_prefix/x86_64-windows/opengl32.dll")" != "$MESA_WINDOWS_X86_64_OPENGL_SHA256" ] ||
+     [ "$(sha256_file "$temporary_prefix/x86_64-windows/libgallium_wgl.dll")" != "$MESA_WINDOWS_X86_64_GALLIUM_SHA256" ] ||
+     [ "$(sha256_file "$temporary_prefix/i386-windows/opengl32.dll")" != "$MESA_WINDOWS_I386_OPENGL_SHA256" ] ||
+     [ "$(sha256_file "$temporary_prefix/i386-windows/libgallium_wgl.dll")" != "$MESA_WINDOWS_I386_GALLIUM_SHA256" ]; then
+    echo "Mesa Windows OpenGL files do not match their pinned hashes." >&2
+    exit 1
+  fi
+
+  cat >"$temporary_prefix/share/doc/switchyard-mesa/README.txt" <<EOF
+Switchyard Wine Mesa Windows OpenGL fallback
+
+Version: $MESA_WINDOWS_VERSION
+Architectures: i386 and x86_64 Windows PE
+Driver: llvmpipe (software rendering)
+Binary package: $MESA_WINDOWS_ARCHIVE_URL
+Binary package SHA-256: $MESA_WINDOWS_ARCHIVE_SHA256
+Distributor repository: $MESA_WINDOWS_DISTRIBUTOR_REPOSITORY
+Distributor revision: $MESA_WINDOWS_DISTRIBUTOR_REVISION
+Mesa source repository: $MESA_SOURCE_REPOSITORY
+Mesa source revision: $MESA_SOURCE_REVISION
+LLVM version: $MESA_WINDOWS_LLVM_VERSION
+
+Set WINE_OPENGL_DRIVER=llvmpipe in the host environment to select these
+DLLs for the complete Windows process tree. The runtime does not inspect or
+match executable names. Without that setting, Wine's built-in OpenGL driver
+remains selected. GALLIUM_DRIVER and MESA_LOADER_DRIVER_OVERRIDE are pinned to
+llvmpipe in this mode for correctness; software rendering can be slower than
+hardware graphics.
+
+Preserve this file, the package readme, and all included license notices when
+distributing the runtime.
+EOF
+
+  {
+    printf '{\n'
+    printf '  "version": %s,\n' "$(json_string "$MESA_WINDOWS_VERSION")"
+    printf '  "architectures": ["i386-windows", "x86_64-windows"],\n'
+    printf '  "driver": "llvmpipe",\n'
+    printf '  "archive": %s,\n' "$(json_string "$MESA_WINDOWS_ARCHIVE")"
+    printf '  "archiveUrl": %s,\n' "$(json_string "$MESA_WINDOWS_ARCHIVE_URL")"
+    printf '  "archiveSha256": %s,\n' "$(json_string "$MESA_WINDOWS_ARCHIVE_SHA256")"
+    printf '  "distributorRepository": %s,\n' \
+      "$(json_string "$MESA_WINDOWS_DISTRIBUTOR_REPOSITORY")"
+    printf '  "distributorRevision": %s,\n' \
+      "$(json_string "$MESA_WINDOWS_DISTRIBUTOR_REVISION")"
+    printf '  "mesaSourceRepository": %s,\n' "$(json_string "$MESA_SOURCE_REPOSITORY")"
+    printf '  "mesaSourceRevision": %s,\n' "$(json_string "$MESA_SOURCE_REVISION")"
+    printf '  "llvmVersion": %s,\n' "$(json_string "$MESA_WINDOWS_LLVM_VERSION")"
+    printf '  "files": {\n'
+    printf '    "x86_64-windows/opengl32.dll": %s,\n' "$(json_string "$MESA_WINDOWS_X86_64_OPENGL_SHA256")"
+    printf '    "x86_64-windows/libgallium_wgl.dll": %s,\n' "$(json_string "$MESA_WINDOWS_X86_64_GALLIUM_SHA256")"
+    printf '    "i386-windows/opengl32.dll": %s,\n' "$(json_string "$MESA_WINDOWS_I386_OPENGL_SHA256")"
+    printf '    "i386-windows/libgallium_wgl.dll": %s\n' "$(json_string "$MESA_WINDOWS_I386_GALLIUM_SHA256")"
+    printf '  }\n'
+    printf '}\n'
+  } >"$temporary_prefix/switchyard-mesa-runtime.json"
+
+  write_content_tree_digest "$temporary_prefix"
+  atomic_replace_directory "$temporary_prefix" "$MESA_WINDOWS_DEPS_PREFIX" cache
+  rm -rf "$staging_dir"
+  printf '%s\n' "$MESA_WINDOWS_DEPS_PREFIX"
 }
 
 download_homebrew_oci_blob() {
@@ -1242,10 +1448,19 @@ if [ "$MODE" = "--verify-tls" ]; then
   exit 0
 fi
 
+if [ "$MODE" = "--verify-mesa" ]; then
+  mesa_windows_prefix="$(stage_mesa_windows_opengl)"
+  echo "verified pinned i386/x86_64 Mesa Windows OpenGL runtime at $mesa_windows_prefix"
+  echo "mesaRuntimeDigest=$(content_tree_digest "$mesa_windows_prefix")"
+  exit 0
+fi
+
 wine_mono_path="$(download_wine_mono)"
 wine_mono_digest="$(sha256_file "$wine_mono_path")"
 vulkan_deps_prefix="$(stage_vulkan_deps)"
 vulkan_deps_digest="$(content_tree_digest "$vulkan_deps_prefix")"
+mesa_windows_prefix="$(stage_mesa_windows_opengl)"
+mesa_windows_digest="$(content_tree_digest "$mesa_windows_prefix")"
 font_deps_prefix="$(stage_font_deps)"
 font_deps_digest="$(content_tree_digest "$font_deps_prefix")"
 font_assets_prefix="$(stage_font_assets)"
@@ -1260,7 +1475,7 @@ else
   tls_dlopen_digest="none"
 fi
 
-runtime_id="switchyard-local-wow64-x86_64-${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${vulkan_deps_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
+runtime_id="switchyard-local-wow64-x86_64-${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${vulkan_deps_digest}-${mesa_windows_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
 if [ -z "$USER_SET_WINE_INSTALL_PREFIX" ]; then
   WINE_INSTALL_PREFIX="${HOME}/.switchyard/runtimes/$runtime_id"
 fi
@@ -1283,6 +1498,7 @@ runtime_is_complete_at() {
   local expected_i386_ntdll_sha
   local expected_x86_64_ntdll_sha
   local manifest_font_assets_digest
+  local manifest_mesa_digest
   local kind
   local name
   local expected_hash
@@ -1311,6 +1527,21 @@ runtime_is_complete_at() {
     [ "$(sha256_file "$prefix/lib/wine/i386-windows/ntdll.dll")" = "$expected_i386_ntdll_sha" ] || return 1
   [ -n "$expected_x86_64_ntdll_sha" ] &&
     [ "$(sha256_file "$prefix/lib/wine/x86_64-windows/ntdll.dll")" = "$expected_x86_64_ntdll_sha" ] || return 1
+  manifest_mesa_digest="$(/usr/bin/plutil -extract mesaOpenGL.digest raw -o - "$manifest" 2>/dev/null || true)"
+  [ "$manifest_mesa_digest" = "$mesa_windows_digest" ] || return 1
+  content_tree_is_verified "$prefix/lib/switchyard-mesa" || return 1
+  [ "$(content_tree_digest "$prefix/lib/switchyard-mesa")" = "$mesa_windows_digest" ] || return 1
+  [ -f "$prefix/lib/switchyard-mesa/x86_64-windows/opengl32.dll" ] || return 1
+  [ "$(sha256_file "$prefix/lib/switchyard-mesa/x86_64-windows/opengl32.dll")" = "$MESA_WINDOWS_X86_64_OPENGL_SHA256" ] || return 1
+  [ -f "$prefix/lib/switchyard-mesa/x86_64-windows/libgallium_wgl.dll" ] || return 1
+  [ "$(sha256_file "$prefix/lib/switchyard-mesa/x86_64-windows/libgallium_wgl.dll")" = "$MESA_WINDOWS_X86_64_GALLIUM_SHA256" ] || return 1
+  [ -f "$prefix/lib/switchyard-mesa/i386-windows/opengl32.dll" ] || return 1
+  [ "$(sha256_file "$prefix/lib/switchyard-mesa/i386-windows/opengl32.dll")" = "$MESA_WINDOWS_I386_OPENGL_SHA256" ] || return 1
+  [ -f "$prefix/lib/switchyard-mesa/i386-windows/libgallium_wgl.dll" ] || return 1
+  [ "$(sha256_file "$prefix/lib/switchyard-mesa/i386-windows/libgallium_wgl.dll")" = "$MESA_WINDOWS_I386_GALLIUM_SHA256" ] || return 1
+  [ -f "$prefix/lib/switchyard-mesa/share/doc/switchyard-mesa/MESA-LICENSE.rst" ] || return 1
+  [ -f "$prefix/lib/switchyard-mesa/share/doc/switchyard-mesa/LLVM-LICENSE.txt" ] || return 1
+  [ -f "$prefix/lib/switchyard-mesa/share/doc/switchyard-mesa/DISTRIBUTOR-LICENSE.txt" ] || return 1
   manifest_font_assets_digest="$(/usr/bin/plutil -extract fontAssets.digest raw -o - "$manifest" 2>/dev/null || true)"
   [ "$manifest_font_assets_digest" = "$font_assets_digest" ] || return 1
   cmp -s "$FONT_ASSET_MANIFEST" \
@@ -1551,6 +1782,11 @@ rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan"
 mkdir -p "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan"
 ditto "$vulkan_deps_prefix" "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan"
 
+echo "installing i386/x86_64 Mesa Windows OpenGL fallback"
+rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-mesa"
+mkdir -p "$WINE_INSTALL_PREFIX/lib/switchyard-mesa"
+ditto "$mesa_windows_prefix" "$WINE_INSTALL_PREFIX/lib/switchyard-mesa"
+
 echo "installing x86_64 FreeType and fontconfig runtime libraries"
 runtime_font_root="$WINE_INSTALL_PREFIX/lib/switchyard-fonts"
 rm -rf "$runtime_font_root"
@@ -1630,6 +1866,7 @@ tls_root="$runtime_dir/lib/switchyard-tls"
 tls_lib="$tls_root/lib"
 font_root="$runtime_dir/lib/switchyard-fonts"
 font_lib="$font_root/lib"
+mesa_gl_root="$runtime_dir/lib/switchyard-mesa"
 
 prepend_path() {
   local value="$1"
@@ -1659,6 +1896,30 @@ if [ -n "${VK_ICD_FILENAMES:-}" ]; then
   export SWITCHYARD_HOST_VK_ICD_FILENAMES="$VK_ICD_FILENAMES"
 fi
 export VK_ICD_FILENAMES="$vulkan_icd"
+case "${WINE_OPENGL_DRIVER:-wine}" in
+  ''|wine)
+    unset SWITCHYARD_OPENGL_DLL_PATH
+    ;;
+  llvmpipe)
+    if [ ! -f "$mesa_gl_root/x86_64-windows/opengl32.dll" ] ||
+       [ ! -f "$mesa_gl_root/x86_64-windows/libgallium_wgl.dll" ] ||
+       [ ! -f "$mesa_gl_root/i386-windows/opengl32.dll" ] ||
+       [ ! -f "$mesa_gl_root/i386-windows/libgallium_wgl.dll" ]; then
+      echo "Switchyard runtime is missing the Mesa OpenGL backend under $mesa_gl_root." >&2
+      exit 127
+    fi
+    mesa_windows_root="Z:${mesa_gl_root//\//\\}"
+    export SWITCHYARD_OPENGL_DLL_PATH="$mesa_windows_root"
+    export GALLIUM_DRIVER="llvmpipe"
+    export MESA_LOADER_DRIVER_OVERRIDE="llvmpipe"
+    export LIBGL_ALWAYS_SOFTWARE="1"
+    ;;
+  *)
+    echo "Unsupported WINE_OPENGL_DRIVER value: $WINE_OPENGL_DRIVER" >&2
+    echo "Supported values are wine and llvmpipe." >&2
+    exit 2
+    ;;
+esac
 
 invoked_name="$(basename "$0")"
 invoked_path="$bin_dir/$invoked_name"
@@ -1746,6 +2007,25 @@ x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows
   printf '    "file": %s,\n' "$(json_string "share/wine/mono/$WINE_MONO_FILE")"
   printf '    "sha256": %s,\n' "$(json_string "$wine_mono_digest")"
   printf '    "source": %s\n' "$(json_string "$WINE_MONO_URL")"
+  printf '  },\n'
+  printf '  "mesaOpenGL": {\n'
+  printf '    "root": "lib/switchyard-mesa",\n'
+  printf '    "digest": %s,\n' "$(json_string "$mesa_windows_digest")"
+  printf '    "version": %s,\n' "$(json_string "$MESA_WINDOWS_VERSION")"
+  printf '    "architectures": ["i386-windows", "x86_64-windows"],\n'
+  printf '    "driver": "llvmpipe",\n'
+  printf '    "selectionEnvironment": "WINE_OPENGL_DRIVER",\n'
+  printf '    "selectionValue": "llvmpipe",\n'
+  printf '    "archive": %s,\n' "$(json_string "$MESA_WINDOWS_ARCHIVE")"
+  printf '    "archiveUrl": %s,\n' "$(json_string "$MESA_WINDOWS_ARCHIVE_URL")"
+  printf '    "archiveSha256": %s,\n' "$(json_string "$MESA_WINDOWS_ARCHIVE_SHA256")"
+  printf '    "x86_64OpenGL32Sha256": %s,\n' "$(json_string "$MESA_WINDOWS_X86_64_OPENGL_SHA256")"
+  printf '    "x86_64GalliumSha256": %s,\n' "$(json_string "$MESA_WINDOWS_X86_64_GALLIUM_SHA256")"
+  printf '    "i386OpenGL32Sha256": %s,\n' "$(json_string "$MESA_WINDOWS_I386_OPENGL_SHA256")"
+  printf '    "i386GalliumSha256": %s,\n' "$(json_string "$MESA_WINDOWS_I386_GALLIUM_SHA256")"
+  printf '    "sourceRepository": %s,\n' "$(json_string "$MESA_SOURCE_REPOSITORY")"
+  printf '    "sourceRevision": %s,\n' "$(json_string "$MESA_SOURCE_REVISION")"
+  printf '    "documentation": "lib/switchyard-mesa/share/doc/switchyard-mesa"\n'
   printf '  },\n'
   printf '  "fontRuntime": {\n'
   printf '    "root": "lib/switchyard-fonts",\n'
