@@ -277,7 +277,6 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         break;
 
     case STATUS_ASSERTION_FAILURE:
-        ERR( "assertion failure exception\n" );
         break;
 
     default:
@@ -300,6 +299,8 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         NtContinue( context, FALSE );
 
     if (status != STATUS_UNHANDLED_EXCEPTION) RtlRaiseStatus( status );
+    if (rec->ExceptionCode == STATUS_ASSERTION_FAILURE)
+        ERR( "assertion failure exception\n" );
     return NtRaiseException( rec, context, FALSE );
 }
 

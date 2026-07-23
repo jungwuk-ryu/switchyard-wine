@@ -115,6 +115,14 @@ default and retain the legacy limit when `WINE_LARGE_ADDRESS_AWARE=0` is set:
   ~/.switchyard/runtimes/<runtime-id>
 ```
 
+Verify that handled assertion exceptions remain trace-only while unhandled
+assertions retain their error diagnostic:
+
+```sh
+./switchyard/tests/assertion_logging_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
+
 For a runtime with the GPTK overlay, exercise D3DMetal's shared DXGI resource
 callbacks from a fresh prefix with:
 
