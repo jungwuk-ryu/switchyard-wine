@@ -4696,7 +4696,10 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
         status = open_unix_file( handle, unix_name, access, &new_attr, attributes,
                                  sharing, disposition, options, ea_buffer, ea_length );
     }
-    else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
+    else if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND)
+        TRACE( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
+    else
+        WARN( "%s could not be resolved (%x)\n", debugstr_us(attr->ObjectName), status );
 
     if (status == STATUS_SUCCESS)
     {
@@ -4892,7 +4895,10 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
         else
             fill_file_info( &st, attributes, info, FileNetworkOpenInformation );
     }
-    else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
+    else if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND)
+        TRACE( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
+    else
+        WARN( "%s could not be resolved (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
     free( nt_name.Buffer );
     return status;
@@ -4921,7 +4927,10 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
         else
             status = fill_file_info( &st, attributes, info, FileBasicInformation );
     }
-    else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
+    else if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND)
+        TRACE( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
+    else
+        WARN( "%s could not be resolved (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
     free( nt_name.Buffer );
     return status;

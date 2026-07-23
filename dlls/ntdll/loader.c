@@ -2110,8 +2110,8 @@ NTSTATUS WINAPI LdrGetProcedureAddress(HMODULE module, const ANSI_STRING *name,
         }
         else
         {
-            WARN( "%s (ordinal %lu) not found in %s\n", debugstr_a(name ? name->Buffer : NULL),
-                  ord, debugstr_us(&wm->ldr.FullDllName) );
+            TRACE( "%s (ordinal %lu) not found in %s\n", debugstr_a(name ? name->Buffer : NULL),
+                   ord, debugstr_us(&wm->ldr.FullDllName) );
         }
     }
 

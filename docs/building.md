@@ -153,6 +153,14 @@ environment overrides to select the software OpenGL backend for its complete
 Windows process tree. Use `WINE_OPENGL_DRIVER=wine`, or leave it unset,
 to retain Wine's built-in macOS OpenGL path.
 
+Verify that expected missing-file and missing-export probes remain available as
+trace diagnostics without being reported as warnings:
+
+```sh
+./switchyard/tests/lookup_logging_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
+
 For a runtime with the GPTK overlay, exercise D3DMetal's shared DXGI resource
 callbacks from a fresh prefix with:
 
