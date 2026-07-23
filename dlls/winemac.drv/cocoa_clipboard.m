@@ -84,10 +84,12 @@ bool macdrv_has_pasteboard_changed(void)
  *              macdrv_copy_pasteboard_types
  *
  * Returns an array of UTI strings for the types of data available on
- * the pasteboard, or NULL on error.  The caller is responsible for
- * releasing the returned array with CFRelease().
+ * the pasteboard, optionally including image types which AppKit or
+ * NSBitmapImageRep can synthesize from the available data, or NULL on
+ * error.  The caller is responsible for releasing the returned array
+ * with CFRelease().
  */
-CFArrayRef macdrv_copy_pasteboard_types(CFTypeRef pasteboard)
+CFArrayRef macdrv_copy_pasteboard_types(CFTypeRef pasteboard, bool include_converted_images)
 {
 @autoreleasepool
 {
@@ -115,12 +117,34 @@ CFArrayRef macdrv_copy_pasteboard_types(CFTypeRef pasteboard)
             if (!local_pb) local_pb = [NSPasteboard generalPasteboard];
             types = [local_pb types];
 
+            if (!include_converted_images)
+            {
+                NSMutableArray* itemTypes = [NSMutableArray array];
+                NSMutableArray* newTypes = [types mutableCopy];
+
+                for (NSPasteboardItem* item in [local_pb pasteboardItems])
+                {
+                    for (NSString* type in [item types])
+                    {
+                        if (![itemTypes containsObject:type]) [itemTypes addObject:type];
+                    }
+                }
+
+                for (NSString* type in BitmapOutputTypeMap)
+                {
+                    if (![itemTypes containsObject:type]) [newTypes removeObject:type];
+                }
+
+                types = [newTypes autorelease];
+            }
+
             // If there are any types understood by NSBitmapImageRep, then we
             // can offer all of the types that it can output, too.  For example,
             // if TIFF is on the pasteboard, we can offer PNG, BMP, etc. to the
             // Windows program.  We'll convert on demand.
-            if ([types firstObjectCommonWithArray:[NSBitmapImageRep imageTypes]] ||
-                [types firstObjectCommonWithArray:[NSBitmapImageRep imagePasteboardTypes]])
+            if (include_converted_images &&
+                ([types firstObjectCommonWithArray:[NSBitmapImageRep imageTypes]] ||
+                 [types firstObjectCommonWithArray:[NSBitmapImageRep imagePasteboardTypes]]))
             {
                 NSMutableArray<NSString *> *newTypes = [[BitmapOutputTypeMap allKeys] mutableCopy];
                 [newTypes removeObjectsInArray:types];
@@ -145,10 +169,12 @@ CFArrayRef macdrv_copy_pasteboard_types(CFTypeRef pasteboard)
  *              macdrv_copy_pasteboard_data
  *
  * Returns the pasteboard data for a specified type, or NULL on error or
- * if there's no such type on the pasteboard.  The caller is responsible
- * for releasing the returned data object with CFRelease().
+ * if there's no such type on the pasteboard.  When allow_image_conversion
+ * is false, image data must be explicitly supplied by a pasteboard item.
+ * The caller is responsible for releasing the returned data object with
+ * CFRelease().
  */
-CFDataRef macdrv_copy_pasteboard_data(CFTypeRef pasteboard, CFStringRef type)
+CFDataRef macdrv_copy_pasteboard_data(CFTypeRef pasteboard, CFStringRef type, bool allow_image_conversion)
 {
     NSPasteboard* pb = (NSPasteboard*)pasteboard;
     __block NSData* ret = nil;
@@ -158,12 +184,23 @@ CFDataRef macdrv_copy_pasteboard_data(CFTypeRef pasteboard, CFStringRef type)
         {
             NSPasteboard* local_pb = pb;
             if (!local_pb) local_pb = [NSPasteboard generalPasteboard];
-            if ([local_pb availableTypeFromArray:@[(NSString*)type]])
-                ret = [[local_pb dataForType:(NSString*)type] copy];
-            else
+
+            for (NSPasteboardItem* item in [local_pb pasteboardItems])
             {
+                if ([[item types] containsObject:(NSString*)type])
+                {
+                    ret = [[item dataForType:(NSString*)type] copy];
+                    break;
+                }
+            }
+
+            if (!ret && (allow_image_conversion || !BitmapOutputTypeMap[(NSString*)type]))
+            {
+                if ([local_pb availableTypeFromArray:@[(NSString*)type]])
+                    ret = [[local_pb dataForType:(NSString*)type] copy];
+
                 NSNumber* bitmapType = BitmapOutputTypeMap[(NSString*)type];
-                if (bitmapType)
+                if (!ret && allow_image_conversion && bitmapType)
                 {
                     NSArray* reps = [NSBitmapImageRep imageRepsWithPasteboard:local_pb];
                     ret = [NSBitmapImageRep representationOfImageRepsInArray:reps
@@ -175,7 +212,7 @@ CFDataRef macdrv_copy_pasteboard_data(CFTypeRef pasteboard, CFStringRef type)
         }
         @catch (id e)
         {
-            ERR(@"Exception discarded while copying pasteboard types: %@\n", e);
+            ERR(@"Exception discarded while copying pasteboard data: %@\n", e);
         }
     });
 

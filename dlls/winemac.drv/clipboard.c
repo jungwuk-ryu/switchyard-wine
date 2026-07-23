@@ -1039,7 +1039,8 @@ struct format_entry *get_format_entries(CFTypeRef pasteboard, UINT *entries_size
 
     TRACE("pasteboard %p\n", pasteboard);
 
-    types = macdrv_copy_pasteboard_types(pasteboard);
+    /* Do not invoke AppKit image conversion while handling DragEnter. */
+    types = macdrv_copy_pasteboard_types(pasteboard, false);
     if (!types) return NULL;
 
     for (i = 0; i < CFArrayGetCount(types); i++)
@@ -1052,8 +1053,10 @@ struct format_entry *get_format_entries(CFTypeRef pasteboard, UINT *entries_size
         type = CFArrayGetValueAtIndex(types, i);
         if (!(format = format_for_type(type))) continue;
 
-        data = macdrv_copy_pasteboard_data(pasteboard, type);
+        if (!(data = macdrv_copy_pasteboard_data(pasteboard, type, false))) continue;
         import = format->import_func(data, &import_size);
+        CFRelease(data);
+        if (!import) continue;
 
         if ((tmp = realloc(entries, size + sizeof(*entries) + import_size)))
         {
@@ -1277,7 +1280,7 @@ static void render_format(UINT id)
 
         if (current_mac_formats[i]->format_id != id) continue;
 
-        pasteboard_data = macdrv_copy_pasteboard_data(NULL, current_mac_formats[i]->type);
+        pasteboard_data = macdrv_copy_pasteboard_data(NULL, current_mac_formats[i]->type, true);
         if (pasteboard_data)
         {
             struct set_clipboard_params params = { 0 };
@@ -1303,7 +1306,7 @@ static void grab_win32_clipboard(void)
     static CFArrayRef last_types;
     CFArrayRef types;
 
-    types = macdrv_copy_pasteboard_types(NULL);
+    types = macdrv_copy_pasteboard_types(NULL, true);
     if (!types)
     {
         WARN("Failed to copy pasteboard types\n");

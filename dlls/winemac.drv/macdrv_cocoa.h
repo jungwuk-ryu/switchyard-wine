@@ -597,8 +597,9 @@ extern int macdrv_layout_list_needs_update;
 
 
 /* clipboard */
-extern CFArrayRef macdrv_copy_pasteboard_types(CFTypeRef pasteboard);
-extern CFDataRef macdrv_copy_pasteboard_data(CFTypeRef pasteboard, CFStringRef type);
+extern CFArrayRef macdrv_copy_pasteboard_types(CFTypeRef pasteboard, bool include_converted_images);
+extern CFDataRef macdrv_copy_pasteboard_data(CFTypeRef pasteboard, CFStringRef type,
+                                             bool allow_image_conversion);
 extern bool macdrv_is_pasteboard_owner(macdrv_window w);
 extern bool macdrv_has_pasteboard_changed(void);
 extern void macdrv_clear_pasteboard(macdrv_window w);
