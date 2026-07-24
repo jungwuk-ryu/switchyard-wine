@@ -117,10 +117,47 @@ wildcard and each directory entry without checking the destination capacity.
    failure, at least five minutes for the Metal failure, and preferably ten
    minutes. Require all of the following:
 
-   - the game process still consumes CPU;
+   - the game process still consumes CPU without being stuck in a busy loop;
    - Steam has no new “no longer tracking” entry;
    - `Player.log` progressed beyond the old stopping point; and
-   - no new Unity crash directory appeared.
+   - no new Unity crash directory appeared;
+   - the loading sequence reached an application-specific completion milestone;
+     and
+   - a safe input changed observable application state.
+
+## Do not infer liveness from a visible window
+
+A visible game window or a running process is necessary evidence, but neither is
+sufficient to record an application as working. A frozen renderer, blocked
+loader, or busy loop can satisfy both conditions indefinitely.
+
+Use a clean, single-game Steam session and collect at least two timestamped
+observations. A successful validation requires:
+
+1. **Load completion:** identify an application-specific milestone beyond the
+   last known stall. Prefer explicit log events such as `Menu UI ready`, a
+   completed map load, or a finished shader precompile. A static counter is a
+   failure even when the window remains visible. For example, Unturned remaining
+   at `0/556` after cancelling BattlEye is hung; the non-BattlEye path is working
+   only after the asset count advances and `Menu UI ready` is logged.
+2. **Temporal progress:** confirm that a log, frame, title, animation, or other
+   state changes between observations. File modification time alone is not
+   enough when the last meaningful event is unchanged.
+3. **Input response:** send a reversible, low-risk input after loading and
+   verify its effect. Examples include changing menu focus or toggling
+   fullscreen with Alt+Enter and observing the window style or geometry change.
+   Restore the prior state when practical.
+4. **Crash and tracking checks:** confirm that the game remains tracked by Steam,
+   that no crash reporter or new crash directory appeared, and that the process
+   did not exit unexpectedly.
+
+Run one game at a time. Stop only the exact game executable between checks. If
+Steam stops accepting launch requests, restart the intended prefix before
+continuing rather than mixing direct launches with a stale Steam session.
+First-run shader compilation must be allowed to finish before declaring a
+timeout. Treat anti-cheat startup failures as a separate compatibility boundary;
+never use an anti-cheat cancellation dialog or the appearance of the subsequent
+game window as proof that the non-anti-cheat path completed.
 
 ## False leads and avoidable detours
 
