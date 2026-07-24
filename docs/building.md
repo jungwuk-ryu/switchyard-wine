@@ -153,6 +153,13 @@ environment overrides to select the software OpenGL backend for its complete
 Windows process tree. Use `WINE_OPENGL_DRIVER=wine`, or leave it unset,
 to retain Wine's built-in macOS OpenGL path.
 
+GPTK runtimes suppress `MTL_HUD_ENABLED=1` at launch because the closed-source
+Metal HUD can fault on an unregistered native GCD worker under Rosetta and
+leave the Wine process in a recursive exception. `D3DM_SHOW_HUD_STATS` remains
+untouched. Developers investigating the HUD itself can explicitly restore the
+unsafe behavior with `SWITCHYARD_ALLOW_UNSAFE_METAL_HUD=1`; production
+containers should leave that override unset.
+
 Verify that expected missing-file and missing-export probes remain available as
 trace diagnostics without being reported as warnings:
 
