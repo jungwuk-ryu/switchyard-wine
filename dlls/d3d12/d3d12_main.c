@@ -151,9 +151,27 @@ static BOOL WINAPI load_d3d12_metal_once(INIT_ONCE *once, void *param, void **co
     return TRUE;
 }
 
+static BOOL switchyard_is_chromium_gpu_process(void)
+{
+    const WCHAR *command_line = GetCommandLineW();
+
+    if (!command_line || !wcsstr(command_line, L"--type=gpu-process"))
+        return FALSE;
+
+    return wcsstr(command_line, L"--enable-chrome-runtime")
+            || wcsstr(command_line, L"--user-agent-product")
+            || wcsstr(command_line, L"--mojo-platform-channel-handle");
+}
+
 static const struct d3d12_metal_backend *get_d3d12_metal_backend(void)
 {
     static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
+
+    if (switchyard_is_chromium_gpu_process())
+    {
+        TRACE("Keeping the Chromium GPU process on the Wine D3D12 fallback.\n");
+        return NULL;
+    }
 
     InitOnceExecuteOnce(&init_once, load_d3d12_metal_once, NULL, NULL);
     return d3d12_metal.module ? &d3d12_metal : NULL;
@@ -422,6 +440,7 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_fe
         REFIID iid, void **device)
 {
     const struct d3d12_metal_backend *backend;
+    IUnknown *probe_device = NULL;
     struct vkd3d_optional_instance_extensions_info optional_extensions_info;
     struct vkd3d_instance_create_info instance_create_info;
     PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr;
@@ -458,7 +477,12 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_fe
 
     if ((backend = get_d3d12_metal_backend()))
     {
-        hr = backend->create_device(adapter, minimum_feature_level, iid, device);
+        hr = backend->create_device(adapter, minimum_feature_level, iid,
+                device ? device : (void **)&probe_device);
+        if (probe_device)
+            IUnknown_Release(probe_device);
+        if (!device && SUCCEEDED(hr))
+            hr = S_FALSE;
         TRACE("D3DMetal device creation returned %#lx.\n", hr);
         return hr;
     }

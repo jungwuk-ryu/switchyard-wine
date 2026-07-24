@@ -26,19 +26,30 @@ trap cleanup EXIT
 
 x86_64-w64-mingw32-gcc -o "$work/d3dmetal-d3d12-smoke.exe" \
   "$ROOT_DIR/switchyard/tests/d3dmetal_d3d12_smoke.c" -ld3d12 -ldxgi -luuid
-WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winedbg.exe=d" \
-  "$RUNTIME/bin/switchyard-wine" "$work/d3dmetal-d3d12-smoke.exe" &
-wine_pid=$!
-(
-  sleep 120
-  if kill -0 "$wine_pid" 2>/dev/null; then
-    echo "D3DMetal D3D12 callback smoke test timed out" >&2
-    kill -TERM "$wine_pid" 2>/dev/null || true
-  fi
-) &
-watchdog_pid=$!
-status=0
-wait "$wine_pid" || status=$?
-kill "$watchdog_pid" 2>/dev/null || true
-wait "$watchdog_pid" 2>/dev/null || true
-exit "$status"
+
+run_smoke() {
+  local description="$1"
+  shift
+  WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winedbg.exe=d" \
+    "$RUNTIME/bin/switchyard-wine" "$work/d3dmetal-d3d12-smoke.exe" "$@" &
+  wine_pid=$!
+  (
+    sleep 120
+    if kill -0 "$wine_pid" 2>/dev/null; then
+      echo "$description timed out" >&2
+      kill -TERM "$wine_pid" 2>/dev/null || true
+    fi
+  ) &
+  watchdog_pid=$!
+  status=0
+  wait "$wine_pid" || status=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$status"
+}
+
+run_smoke "D3DMetal D3D12 callback smoke test"
+run_smoke "Chromium GPU D3D12 fallback probe" \
+  --switchyard-chromium-gpu-probe \
+  --type=gpu-process \
+  --user-agent-product=SwitchyardTest

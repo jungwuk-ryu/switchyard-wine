@@ -340,7 +340,25 @@ done:
     return ret;
 }
 
-int main(void)
+static int run_chromium_gpu_probe(void)
+{
+    HRESULT hr;
+
+    hr = D3D12CreateDevice( NULL, D3D_FEATURE_LEVEL_11_0,
+                            &IID_ID3D12Device, NULL );
+    if (GetModuleHandleW( L"d3dmt.dll" ))
+    {
+        fprintf( stderr,
+                 "The Chromium GPU capability probe activated D3DMetal.\n" );
+        return 1;
+    }
+
+    printf( "Chromium GPU D3D12 probe stayed on the Wine fallback "
+            "(result %#lx).\n", hr );
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {0};
@@ -396,6 +414,9 @@ int main(void)
     void *mapped_data = NULL;
     HRESULT hr;
     int ret = 1;
+
+    if (argc > 1 && !strcmp( argv[1], "--switchyard-chromium-gpu-probe" ))
+        return run_chromium_gpu_probe();
 
     if (!verify_agility_contract()) goto done;
 
@@ -458,6 +479,15 @@ int main(void)
         D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
         D3D12_ROOT_SIGNATURE_FLAG_DENY_AMPLIFICATION_SHADER_ROOT_ACCESS |
         D3D12_ROOT_SIGNATURE_FLAG_DENY_MESH_SHADER_ROOT_ACCESS;
+
+    hr = D3D12CreateDevice( NULL, D3D_FEATURE_LEVEL_11_0,
+                            &IID_ID3D12Device, NULL );
+    if (!check_result( "D3D12CreateDevice capability probe", hr )) goto done;
+    if (hr != S_FALSE)
+    {
+        fprintf( stderr, "D3D12 capability probe returned %#lx instead of S_FALSE.\n", hr );
+        goto done;
+    }
 
     hr = D3D12CreateDevice( NULL, D3D_FEATURE_LEVEL_11_0,
                             &IID_ID3D12Device, (void **)&base_device );
