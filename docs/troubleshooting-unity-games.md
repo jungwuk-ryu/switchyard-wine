@@ -39,6 +39,14 @@ The later Unity crash reported `Illegal Instruction (0xc000001d)` in
 through `objc_storeWeak` and `IOGPUMetalBuffer` destruction. The relevant
 call entered D3DMetal through `ID3D11DeviceChild::SetPrivateData`.
 
+Heartopia later exposed a second entry into the same failure class through
+`ID3D11DeviceContext::ClearDepthStencilView`. Its fourth Microsoft x64
+argument, the scalar `float depth`, is passed in `XMM3`, so the generic callback
+relay that captured only integer argument registers could not bridge the method
+correctly. Do not leave this vtable slot pointing directly at D3DMetal. Its
+generated thunk must save `XMM3`, and the callback must reconstruct a typed
+`float` call after restoring the native pthread TSD base.
+
 The top-level D3D11 and DXGI objects were already bridged, but objects returned
 by `Create*`, `GetBuffer`, and `QueryInterface` kept native child vtables.
 Their methods could therefore run with Wine's Windows TEB installed instead of
@@ -88,6 +96,9 @@ wildcard and each directory entry without checking the destination capacity.
 3. Subtract the loaded module base from the fault address and resolve the PE
    virtual address against the exact built DLL with
    `x86_64-w64-mingw32-addr2line` and `objdump`.
+   For a native macOS fault, reconstruct the stack from the Unity minidump and
+   use `atos` with the exact image load addresses. This identified the
+   `ClearDepthStencilView` callback path without attaching a debugger.
 4. After every patch, reproduce again. A moved fault address often means that
    the first defect was fixed and a second defect is now visible.
 5. Confirm that the process loaded the rebuilt binary. Many Wine builtins are
