@@ -985,7 +985,10 @@ static void state_sample_mask(struct wined3d_context *context, const struct wine
 
 static void state_sample_mask_w(struct wined3d_context *context, const struct wined3d_state *state, DWORD state_id)
 {
-    WARN("Unsupported in local OpenGL implementation: glSampleMaski.\n");
+    static unsigned int once;
+
+    if (state->sample_mask != 0xffffffff && !once++)
+        WARN("Sample mask %#x is not supported by this OpenGL implementation.\n", state->sample_mask);
 }
 
 static void state_compute_shader(struct wined3d_context *context, const struct wined3d_state *state, DWORD state_id)
@@ -1403,7 +1406,7 @@ const struct wined3d_state_entry_template misc_state_template_gl[] =
     { STATE_BLEND,                                        { STATE_BLEND,                                        blend               }, WINED3D_GL_EXT_NONE             },
     { STATE_BLEND_FACTOR,                                 { STATE_BLEND_FACTOR,                                 state_blend_factor  }, EXT_BLEND_COLOR                 },
     { STATE_BLEND_FACTOR,                                 { STATE_BLEND_FACTOR,                                 state_blend_factor_w}, WINED3D_GL_EXT_NONE             },
-    { STATE_SAMPLE_MASK,                                  { STATE_SAMPLE_MASK,                                  state_sample_mask   }, ARB_TEXTURE_MULTISAMPLE         },
+    { STATE_SAMPLE_MASK,                                  { STATE_SAMPLE_MASK,                                  state_sample_mask   }, WINED3D_GL_VERSION_3_2          },
     { STATE_SAMPLE_MASK,                                  { STATE_SAMPLE_MASK,                                  state_sample_mask_w }, WINED3D_GL_EXT_NONE             },
     { STATE_DEPTH_STENCIL,                                { STATE_DEPTH_STENCIL,                                depth_stencil_2s    }, EXT_STENCIL_TWO_SIDE            },
     { STATE_DEPTH_STENCIL,                                { STATE_DEPTH_STENCIL,                                depth_stencil       }, WINED3D_GL_EXT_NONE             },
