@@ -27,6 +27,24 @@ dcomp, winemac: Stabilize custom-frame composition.
 This style applies to all commits in this repository, including build tooling and
 documentation changes.
 
+## Worktree tasks
+
+When the user explicitly identifies a task as worktree work—for example, by saying
+`worktree 작업입니다.` or equivalent wording—complete the entire task in a newly
+created, dedicated Git worktree:
+
+1. Create the worktree and its task branch before making implementation changes.
+2. Perform all implementation, edits, patches, verification, review fixes, and
+   commits in that worktree.
+3. After the task is complete, merge the task branch into `main`.
+4. Verify that `main` contains the completed change, then remove the dedicated
+   worktree and delete the temporary task branch when safe.
+
+Do not report a worktree task as complete while its changes exist only on the
+worktree branch. If unrelated user changes or repository state prevent a safe
+merge or cleanup, preserve the affected work and report the exact blocker instead
+of forcing the operation.
+
 ## Compatibility documentation
 
 When application testing establishes whether a program works, update
