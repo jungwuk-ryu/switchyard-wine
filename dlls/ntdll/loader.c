@@ -73,6 +73,11 @@ typedef void  (CALLBACK *LDRENUMPROC)(LDR_DATA_TABLE_ENTRY *, void *, BOOLEAN *)
 static void __fastcall default_thread_init_func( DWORD unknown, LPTHREAD_START_ROUTINE entry, void *arg );
 void (FASTCALL *pBaseThreadInitThunk)(DWORD,LPTHREAD_START_ROUTINE,void *) = default_thread_init_func;
 NTSTATUS (WINAPI *__wine_unix_call_dispatcher)( unixlib_handle_t, unsigned int, void * ) = NULL;
+#ifdef _WIN64
+NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args );
+static NTSTATUS (WINAPI *switchyard_unix_call_dispatcher)(
+    unixlib_handle_t, unsigned int, void * ) = __wine_unix_call;
+#endif
 
 static DWORD (WINAPI *pCtrlRoutine)(void *);
 
@@ -2101,8 +2106,24 @@ NTSTATUS WINAPI LdrGetProcedureAddress(HMODULE module, const ANSI_STRING *name,
     else if ((exports = RtlImageDirectoryEntryToData( module, TRUE,
                                                       IMAGE_DIRECTORY_ENTRY_EXPORT, &exp_size )))
     {
+#ifdef _WIN64
+        static const char unix_call_dispatcher_name[] = "__wine_unix_call_dispatcher";
+#endif
         void *proc = name ? find_named_export( module, exports, exp_size, name->Buffer, -1, NULL, wm, TRUE )
                           : find_ordinal_export( module, exports, exp_size, ord - exports->Base, NULL, wm, TRUE );
+#ifdef _WIN64
+        /*
+         * GPTK 4 resolves the dispatcher through GetProcAddress and calls it
+         * directly, bypassing the Switchyard callback and TSD bridge.  Wine's
+         * own Unix libraries use RtlFindExportedRoutineByName and must keep the
+         * raw dispatcher, so redirect only the dynamic lookup path.
+         */
+        if (name && wm->ldr.DdagNode == node_ntdll &&
+            name->Length == sizeof(unix_call_dispatcher_name) - 1 &&
+            !memcmp( name->Buffer, unix_call_dispatcher_name,
+                     sizeof(unix_call_dispatcher_name) - 1 ))
+            proc = &switchyard_unix_call_dispatcher;
+#endif
         if (proc)
         {
             *address = proc;
@@ -3519,7 +3540,10 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
     return WINE_UNIX_CALL( unix_wine_spawnvp, &params );
 }
 
-#define SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES 43
+#define SWITCHYARD_GPTK_WIN32_DISPATCH_LEGACY_ENTRIES 43
+#define SWITCHYARD_GPTK_WIN32_DISPATCH_V4_ENTRIES 70
+#define SWITCHYARD_GPTK_WIN32_CALLBACK_LEGACY_ENTRIES 41
+#define SWITCHYARD_GPTK_WIN32_CALLBACK_V4_ENTRIES 68
 
 #ifdef _WIN64
 
@@ -3566,7 +3590,6 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
 #define SWITCHYARD_PE_CALLBACK_MAX_ARGS 9
-#define SWITCHYARD_PE_CALLBACK_SKIP 0xff
 #define SWITCHYARD_PE_CALLBACK_FRAME_SIZE 0xa8
 #define SWITCHYARD_PE_CALLBACK_PARAMS_OFFSET 0x20
 #define SWITCHYARD_PE_CALLBACK_FUNC_OFFSET 0x00
@@ -4718,6 +4741,7 @@ struct switchyard_d3d_shared_texture
     ULONGLONG last_sequence;
     BOOL owner;
     BOOL retained;
+    BOOL alias_retained;
 };
 
 struct switchyard_d3d_context_device
@@ -4862,18 +4886,20 @@ static void switchyard_destroy_d3d_shared_texture(
     struct switchyard_d3d_shared_texture *entry )
 {
     typedef ULONG (WINAPI *release_func)(void *);
-    void *texture, *device;
+    void *texture, *alias, *device;
 
     if (!entry) return;
     TRACE( "destroying D3D shared texture %p owner %u retained %u\n",
            entry->texture, entry->owner, entry->retained );
     texture = entry->retained ? entry->texture : NULL;
+    alias = entry->alias_retained ? entry->alias : NULL;
     device = entry->device;
     if (entry->mapping) NtUnmapViewOfSection( NtCurrentProcess(), entry->mapping );
     if (entry->mutant) NtClose( entry->mutant );
     if (entry->section) NtClose( entry->section );
     switchyard_d3d_heap_free( entry );
     if (texture) ((release_func)(*(void ***)texture)[2])( texture );
+    if (alias) ((release_func)(*(void ***)alias)[2])( alias );
     if (device) ((release_func)(*(void ***)device)[2])( device );
 }
 
@@ -4949,6 +4975,7 @@ switchyard_create_d3d_shared_texture(
     void *texture, void *alias, void *device,
     const struct switchyard_d3d11_texture2d_desc *desc )
 {
+    typedef ULONG (WINAPI *addref_func)(void *);
     struct switchyard_d3d_shared_texture *entry;
     struct switchyard_d3d_shared_section *header;
     LARGE_INTEGER section_size;
@@ -5021,6 +5048,11 @@ switchyard_create_d3d_shared_texture(
     entry->mapping_size = mapping_size;
     entry->owner = TRUE;
     entry->retained = TRUE;
+    if (alias && alias != texture)
+    {
+        ((addref_func)(*(void ***)alias)[1])( alias );
+        entry->alias_retained = TRUE;
+    }
     return entry;
 }
 
@@ -5126,7 +5158,8 @@ static void switchyard_release_d3d11_device_child( void *object, ULONG_PTR refs 
     if (switchyard_d3d_shared_registry_initialized)
     {
         texture = switchyard_find_d3d_shared_texture_locked( object, -1 );
-        if (texture && ((texture->retained && refs == 1) || (!texture->retained && !refs)))
+        if (texture && ((texture->retained && object == texture->alias && refs == 1) ||
+                        (!texture->retained && !refs)))
         {
             list_remove( &texture->entry );
             if (texture->owner)
@@ -5139,6 +5172,23 @@ static void switchyard_release_d3d11_device_child( void *object, ULONG_PTR refs 
     }
     RtlLeaveCriticalSection( &switchyard_d3d_shared_section );
     switchyard_destroy_d3d_shared_texture( texture );
+}
+
+static ULONG_PTR switchyard_restore_native_d3d_shared_handle(
+    HANDLE *output, HANDLE native_output, ULONG_PTR ret )
+{
+    if (SUCCEEDED((HRESULT)ret))
+    {
+        __TRY
+        {
+            *output = native_output;
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+        }
+        __ENDTRY
+    }
+    return ret;
 }
 
 static ULONG_PTR switchyard_get_d3d_shared_handle(
@@ -5159,12 +5209,24 @@ static ULONG_PTR switchyard_get_d3d_shared_handle(
     struct switchyard_d3d11_texture2d_desc desc;
     void **vtable;
     void *texture = NULL, *device = NULL;
-    HANDLE *output;
+    HANDLE native_output = NULL, *output;
     HRESULT hr;
 
-    if ((HRESULT)ret != E_NOTIMPL || params->argc < 2 || !params->args[0] || !params->args[1])
+    if (params->argc < 2 || !params->args[0] || !params->args[1])
         return ret;
     output = (HANDLE *)params->args[1];
+    __TRY
+    {
+        native_output = *output;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        return ret;
+    }
+    __ENDTRY
+    if ((HRESULT)ret != E_NOTIMPL && FAILED((HRESULT)ret))
+        return ret;
+
     __TRY
     {
         *output = NULL;
@@ -5177,7 +5239,8 @@ static ULONG_PTR switchyard_get_d3d_shared_handle(
         hr = E_FAIL;
     }
     __ENDTRY
-    if (FAILED(hr) || !texture) return ret;
+    if (FAILED(hr) || !texture)
+        return switchyard_restore_native_d3d_shared_handle( output, native_output, ret );
 
     memset( &desc, 0, sizeof(desc) );
     __TRY
@@ -5193,7 +5256,7 @@ static ULONG_PTR switchyard_get_d3d_shared_handle(
     if (!switchyard_d3d_shared_desc_supported( &desc ))
     {
         ((release_func)(*(void ***)texture)[2])( texture );
-        return ret;
+        return switchyard_restore_native_d3d_shared_handle( output, native_output, ret );
     }
 
     RtlEnterCriticalSection( &switchyard_d3d_shared_section );
@@ -5226,7 +5289,7 @@ static ULONG_PTR switchyard_get_d3d_shared_handle(
     if (FAILED(hr) || !device)
     {
         ((release_func)(*(void ***)texture)[2])( texture );
-        return ret;
+        return switchyard_restore_native_d3d_shared_handle( output, native_output, ret );
     }
 
     if (!(entry = switchyard_create_d3d_shared_texture(
@@ -5234,6 +5297,8 @@ static ULONG_PTR switchyard_get_d3d_shared_handle(
     {
         ((release_func)(*(void ***)texture)[2])( texture );
         ((release_func)(*(void ***)device)[2])( device );
+        if (SUCCEEDED((HRESULT)ret))
+            return switchyard_restore_native_d3d_shared_handle( output, native_output, ret );
         return E_OUTOFMEMORY;
     }
     RtlEnterCriticalSection( &switchyard_d3d_shared_section );
@@ -7038,6 +7103,7 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
                                                SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_OUTPUT_VTABLES ); /* D3D11CreateDeviceAndSwapChain */
         wrap_native_callback_entry_with_flags( &table[11], 0,
                                                SWITCHYARD_NATIVE_CALLBACK_NOTE_GFXT_DEFERRED_VTABLE ); /* GFXT dispatch post-init */
+        wrap_native_callback_entry_with_flags( &table[42], 1, 0 ); /* GFXT_ThreadCallback */
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -7047,17 +7113,20 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
 
 static void *prepare_pe_callback_table( unsigned int code, void *args, void **storage, SIZE_T storage_count )
 {
-    static const unsigned char argc[SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES] =
+    static const unsigned char argc[SWITCHYARD_GPTK_WIN32_CALLBACK_V4_ENTRIES] =
     {
         6, 6, 5, 9, 1, 4, 2, 4, 2, 2, 6, 7, 1, 3, 3, 5, 2, 6, 1, 1, 1, 1,
         4, 7, 6, 3, 2, 1, 1, 2, 2, 3, 0, 3, 4, 3,
-        4, 3, 1, 1, 3, SWITCHYARD_PE_CALLBACK_SKIP, SWITCHYARD_PE_CALLBACK_SKIP
+        4, 3, 1, 1, 3,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        4,
+        1, 1, 1, 1, 1, 1, 1, 1
     };
     void **table = args;
     void *module;
-    unsigned int i;
+    unsigned int callback_count, entry_count, i;
 
-    if (code != 1 || !args || storage_count < SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES ||
+    if (code != 1 || !args || storage_count < SWITCHYARD_GPTK_WIN32_DISPATCH_V4_ENTRIES ||
         !switchyard_find_pe_module_nolock( args, &module ))
         return args;
 
@@ -7067,16 +7136,29 @@ static void *prepare_pe_callback_table( unsigned int code, void *args, void **st
             !is_pe_callback_target_or_thunk_in_module( table[5], module ) ||
             !is_pe_callback_target_or_thunk( table[27] ) ||
             !is_pe_callback_target_or_thunk_in_module( table[28], module ) ||
-            !is_pe_callback_target_or_thunk_in_module( table[40], module ) ||
-            !table[41] || table[42] != (void *)0x1000000)
+            !is_pe_callback_target_or_thunk_in_module( table[40], module ))
             return args;
 
-        memcpy( storage, table, ARRAY_SIZE(argc) * sizeof(*storage) );
-        for (i = 0; i < ARRAY_SIZE(argc); ++i)
+        if (table[41] && table[42] == (void *)0x1000000)
+        {
+            callback_count = SWITCHYARD_GPTK_WIN32_CALLBACK_LEGACY_ENTRIES;
+            entry_count = SWITCHYARD_GPTK_WIN32_DISPATCH_LEGACY_ENTRIES;
+        }
+        else if (is_pe_callback_target_or_thunk_in_module( table[41], module ) &&
+                 is_pe_callback_target_or_thunk_in_module( table[59], module ) &&
+                 is_pe_callback_target_or_thunk_in_module( table[67], module ) &&
+                 table[68] && table[69] == (void *)0x1000000)
+        {
+            callback_count = SWITCHYARD_GPTK_WIN32_CALLBACK_V4_ENTRIES;
+            entry_count = SWITCHYARD_GPTK_WIN32_DISPATCH_V4_ENTRIES;
+        }
+        else return args;
+
+        memcpy( storage, table, entry_count * sizeof(*storage) );
+        for (i = 0; i < callback_count; ++i)
         {
             void *func, *thunk;
 
-            if (argc[i] == SWITCHYARD_PE_CALLBACK_SKIP) continue;
             func = storage[i];
             if (!is_pe_callback_target( func )) continue;
             if (!(thunk = create_pe_callback_thunk( func, argc[i] ))) continue;
@@ -7119,7 +7201,7 @@ static void wrap_native_callback_table( unsigned int code, void *args, NTSTATUS 
  */
 NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, void *args )
 {
-    void *pe_callback_storage[SWITCHYARD_GPTK_WIN32_DISPATCH_ENTRIES];
+    void *pe_callback_storage[SWITCHYARD_GPTK_WIN32_DISPATCH_V4_ENTRIES];
     void *dispatch_args;
     NTSTATUS status;
 #ifdef _WIN64
