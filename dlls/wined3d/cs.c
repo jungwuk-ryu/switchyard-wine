@@ -3199,7 +3199,10 @@ static bool wined3d_cs_map_upload_bo(struct wined3d_device_context *context, str
                 /* adapter_alloc_bo() should have given us a mapped BO if we are
                  * discarding. */
                 assert(flags & WINED3D_MAP_NOOVERWRITE);
-                WARN_(d3d_perf)("Not accelerating a NOOVERWRITE map because the BO is not mapped.\n");
+                if (device->adapter->d3d_info.persistent_map)
+                    WARN_(d3d_perf)("Not accelerating a NOOVERWRITE map because the BO is not mapped.\n");
+                else
+                    TRACE_(d3d_perf)("Using a synchronous NOOVERWRITE map because persistent mappings are unavailable.\n");
                 return false;
             }
         }
@@ -3208,7 +3211,10 @@ static bool wined3d_cs_map_upload_bo(struct wined3d_device_context *context, str
         if (!map_ptr)
         {
             assert(flags & WINED3D_MAP_NOOVERWRITE);
-            WARN_(d3d_perf)("Not accelerating a NOOVERWRITE map because the sub-resource has no valid address.\n");
+            if (device->adapter->d3d_info.persistent_map)
+                WARN_(d3d_perf)("Not accelerating a NOOVERWRITE map because the sub-resource has no valid address.\n");
+            else
+                TRACE_(d3d_perf)("Using a synchronous NOOVERWRITE map because persistent mappings are unavailable.\n");
             return false;
         }
 
