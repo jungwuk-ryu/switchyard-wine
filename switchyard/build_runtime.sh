@@ -17,7 +17,7 @@ esac
 
 BUILD_PROFILE="switchyard-wow64-pe"
 PE_ARCHS=("i386" "x86_64")
-WINE_GRAPHICS_FALLBACK_MODULES=("d3d10" "d3d11" "d3d12" "dcomp" "dwmapi" "dxgi" "wined3d")
+WINE_GRAPHICS_FALLBACK_MODULES=("d3d10" "d3d11" "d3d12" "d3d12core" "dcomp" "dwmapi" "dxgi" "wined3d")
 WINE_MONO_VERSION="11.2.0"
 WINE_MONO_ARCH="x86"
 WINE_MONO_SHA256="b4525679e7da30d4658ceb85739cbc55c771791054abbb4b3152fe96ded0b897"
@@ -81,6 +81,7 @@ FONT_ASSET_MANIFEST="$ROOT_DIR/switchyard/font-assets.tsv"
 FONT_ASSET_DOWNLOAD_CACHE_DIR="${FONT_ASSET_DOWNLOAD_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Fonts/assets/noto-monthly-release-2026.07.01}"
 FONT_ASSET_PREFIX="${FONT_ASSET_PREFIX:-${HOME}/.switchyard/deps/fonts/assets-${FONT_ASSET_SET_VERSION}}"
 FONT_ALIAS_SCRIPT="$ROOT_DIR/switchyard/make_font_alias.py"
+PE_MODULE_RENAME_SCRIPT="$ROOT_DIR/switchyard/rename_pe_module.py"
 FONT_ALIAS_SOURCE="NotoSansCJK-Regular.ttc"
 FONT_ALIAS_FILE="ArialUnicodeMS.otf"
 FONT_ALIAS_FAMILY="Arial Unicode MS"
@@ -1768,6 +1769,36 @@ if [ -n "$GPTK_PATH" ] && [ -d "$GPTK_PATH/redist/lib" ]; then
     exit 1
   fi
   ditto "$GPTK_PATH/redist/lib" "$WINE_INSTALL_PREFIX/lib"
+
+  gptk_d3d12_pe="$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows/d3d12.dll"
+  gptk_d3d12_unix="$WINE_INSTALL_PREFIX/lib/wine/x86_64-unix/d3d12.so"
+  d3d12_metal_pe="$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows/d3dmt.dll"
+  d3d12_metal_unix="$WINE_INSTALL_PREFIX/lib/wine/x86_64-unix/d3dmt.so"
+  wine_d3d12_pe="$wine_graphics_fallback_root/x86_64-windows/d3d12.dll"
+  wine_d3d12core_pe="$wine_graphics_fallback_root/x86_64-windows/d3d12core.dll"
+
+  if [ -f "$gptk_d3d12_pe" ]; then
+    if [ ! -e "$gptk_d3d12_unix" ]; then
+      echo "GPTK D3D12 overlay is missing its x86_64 Unix library." >&2
+      exit 1
+    fi
+    if [ -e "$d3d12_metal_pe" ] || [ -e "$d3d12_metal_unix" ]; then
+      echo "GPTK overlay unexpectedly contains a d3dmt module." >&2
+      exit 1
+    fi
+    if [ ! -f "$wine_d3d12_pe" ] || [ ! -f "$wine_d3d12core_pe" ]; then
+      echo "Wine D3D12 Agility proxy modules were not preserved before the GPTK overlay." >&2
+      exit 1
+    fi
+
+    echo "installing the D3D12 Agility proxy in front of D3DMetal"
+    mv "$gptk_d3d12_pe" "$d3d12_metal_pe"
+    mv "$gptk_d3d12_unix" "$d3d12_metal_unix"
+    python3 "$PE_MODULE_RENAME_SCRIPT" "$d3d12_metal_pe" d3d12.dll d3dmt.dll
+    install -m 0644 "$wine_d3d12_pe" "$gptk_d3d12_pe"
+    install -m 0644 "$wine_d3d12core_pe" \
+      "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows/d3d12core.dll"
+  fi
 elif [ "$DISABLE_GPTK_OVERLAY" = "1" ]; then
   echo "GPTK overlay explicitly disabled for this runtime build"
 else

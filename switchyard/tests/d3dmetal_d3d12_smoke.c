@@ -10,6 +10,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#define TEST_D3D12_SDK_VERSION 611
+
+__declspec(dllexport) const UINT D3D12SDKVersion = TEST_D3D12_SDK_VERSION;
+__declspec(dllexport) const char *D3D12SDKPath = ".\\D3D12-REDIST\\";
+
 static const GUID iid_id3d12_device14 =
 {
     0x5f6e592d, 0xd895, 0x44c2, { 0x8e, 0x4a, 0x88, 0xad, 0x49, 0x26, 0xd3, 0x23 }
@@ -74,6 +79,94 @@ static int check_result( const char *operation, HRESULT hr )
     if (SUCCEEDED(hr)) return 1;
     fprintf( stderr, "%s failed: %#lx\n", operation, hr );
     return 0;
+}
+
+static int verify_agility_contract(void)
+{
+    ID3D12SDKConfiguration1 *configuration = NULL;
+    ID3D12DeviceFactory *factory = NULL;
+    ID3D12Device *device = NULL;
+    PFN_D3D12_GET_INTERFACE get_interface;
+    D3D12_DEVICE_FACTORY_FLAGS flags;
+    UINT *core_sdk_version;
+    HMODULE d3d12, core;
+    HRESULT hr;
+    int ret = 0;
+
+    if (!(d3d12 = GetModuleHandleW( L"d3d12.dll" )))
+    {
+        fprintf( stderr, "The D3D12 loader was not loaded.\n" );
+        goto done;
+    }
+    if (GetModuleHandleW( L"d3d12core.dll" ))
+    {
+        fprintf( stderr, "The D3D12 loader activated its core module from DllMain.\n" );
+        goto done;
+    }
+    if (!(get_interface = (void *)GetProcAddress( d3d12, "D3D12GetInterface" )))
+    {
+        fprintf( stderr, "The D3D12 loader does not export D3D12GetInterface.\n" );
+        goto done;
+    }
+
+    hr = get_interface( &CLSID_D3D12SDKConfiguration,
+                        &IID_ID3D12SDKConfiguration1, (void **)&configuration );
+    if (!check_result( "D3D12GetInterface(ID3D12SDKConfiguration1)", hr ))
+        goto done;
+    hr = ID3D12SDKConfiguration1_SetSDKVersion(
+        configuration, TEST_D3D12_SDK_VERSION, D3D12SDKPath );
+    if (!check_result( "ID3D12SDKConfiguration1::SetSDKVersion", hr ))
+        goto done;
+    if (!(core = GetModuleHandleW( L"d3d12core.dll" )))
+    {
+        fprintf( stderr, "The D3D12 loader did not activate its system core module.\n" );
+        goto done;
+    }
+    if (!(core_sdk_version = (UINT *)GetProcAddress( core, "D3D12SDKVersion" )))
+    {
+        fprintf( stderr, "D3D12Core does not export D3D12SDKVersion as data.\n" );
+        goto done;
+    }
+    if (*core_sdk_version != TEST_D3D12_SDK_VERSION)
+    {
+        fprintf( stderr, "D3D12Core selected SDK version %u instead of %u.\n",
+                 *core_sdk_version, TEST_D3D12_SDK_VERSION );
+        goto done;
+    }
+    hr = ID3D12SDKConfiguration1_CreateDeviceFactory(
+        configuration, TEST_D3D12_SDK_VERSION, D3D12SDKPath,
+        &IID_ID3D12DeviceFactory, (void **)&factory );
+    if (!check_result( "ID3D12SDKConfiguration1::CreateDeviceFactory", hr ))
+        goto done;
+
+    hr = ID3D12DeviceFactory_SetFlags(
+        factory, D3D12_DEVICE_FACTORY_FLAG_DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON );
+    if (!check_result( "ID3D12DeviceFactory::SetFlags", hr ))
+        goto done;
+    flags = ID3D12DeviceFactory_GetFlags( factory );
+    if (flags != D3D12_DEVICE_FACTORY_FLAG_DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON)
+    {
+        fprintf( stderr, "ID3D12DeviceFactory returned flags %#x.\n", flags );
+        goto done;
+    }
+
+    hr = ID3D12DeviceFactory_CreateDevice(
+        factory, NULL, D3D_FEATURE_LEVEL_12_0, &IID_ID3D12Device, (void **)&device );
+    if (!check_result( "ID3D12DeviceFactory::CreateDevice", hr ))
+        goto done;
+    if (!GetModuleHandleW( L"d3dmt.dll" ))
+    {
+        fprintf( stderr, "The D3D12 Agility proxy did not activate D3DMetal.\n" );
+        goto done;
+    }
+
+    ret = 1;
+
+done:
+    if (device) ID3D12Device_Release( device );
+    if (factory) ID3D12DeviceFactory_Release( factory );
+    if (configuration) ID3D12SDKConfiguration1_Release( configuration );
+    return ret;
 }
 
 struct root_signature_thread_context
@@ -303,6 +396,8 @@ int main(void)
     void *mapped_data = NULL;
     HRESULT hr;
     int ret = 1;
+
+    if (!verify_agility_contract()) goto done;
 
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
