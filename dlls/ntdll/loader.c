@@ -3586,6 +3586,7 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D12_OUTPUT_VTABLE 0x80000
 #define SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI 0x100000
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D_BLOB_OUTPUT_VTABLE 0x200000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_CLEAR_DEPTH_STENCIL_VIEW 0x400000
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
@@ -4429,6 +4430,8 @@ static ULONG switchyard_d3d11_device_context_vtable_entry_flags( unsigned int in
 {
     switch (index)
     {
+    case 53: /* ClearDepthStencilView */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_CLEAR_DEPTH_STENCIL_VIEW;
     case 48: /* UpdateSubresource */
         return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_UPDATE_SUBRESOURCE;
     case 12: /* DrawIndexed */
@@ -5539,9 +5542,10 @@ static void switchyard_upload_all_d3d_shared_textures(
                    &switchyard_d3d_shared_section )
 }
 
-static BOOL switchyard_gfxt_deferred_vtable_entry_uses_scalar_float( unsigned int index )
+static BOOL switchyard_d3d11_context_vtable_entry_uses_unbridged_scalar_float(
+    unsigned int index )
 {
-    return index == 53 || index == 55 || index == 56;
+    return index == 55 || index == 56;
 }
 
 static void switchyard_wrap_gfxt_deferred_vtable_jump_targets(void)
@@ -5559,9 +5563,11 @@ static void switchyard_wrap_gfxt_deferred_vtable_jump_targets(void)
             BYTE *entry = table[i];
 
             if (!entry || !switchyard_gfxt_deferred_vtable_entry_enabled( i ) ||
-                switchyard_gfxt_deferred_vtable_entry_uses_scalar_float( i ))
+                switchyard_d3d11_context_vtable_entry_uses_unbridged_scalar_float( i ))
                 continue;
-            switchyard_wrap_native_callback_jump_table_entry( entry, SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS, 0 );
+            switchyard_wrap_native_callback_jump_table_entry(
+                entry, SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS,
+                switchyard_d3d11_device_context_vtable_entry_flags( i ) );
         }
     }
     __EXCEPT_PAGE_FAULT
@@ -6092,7 +6098,8 @@ static void switchyard_wrap_d3d11_create_device_output_vtables(
                                                         FALSE, NULL,
                                                         switchyard_d3d11_device_vtable_entry_flags );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[9], d3d11_device_context_vtable_entries,
-                                                        FALSE, switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
+                                                        FALSE,
+                                                        switchyard_d3d11_context_vtable_entry_uses_unbridged_scalar_float,
                                                         switchyard_d3d11_device_context_vtable_entry_flags );
         switchyard_track_d3d11_context_device( params->args[7], params->args[9] );
         break;
@@ -6106,7 +6113,8 @@ static void switchyard_wrap_d3d11_create_device_output_vtables(
                                                         FALSE, NULL,
                                                         switchyard_d3d11_device_vtable_entry_flags );
         switchyard_wrap_com_output_vtable_jump_targets( params->args[11], d3d11_device_context_vtable_entries,
-                                                        FALSE, switchyard_gfxt_deferred_vtable_entry_uses_scalar_float,
+                                                        FALSE,
+                                                        switchyard_d3d11_context_vtable_entry_uses_unbridged_scalar_float,
                                                         switchyard_d3d11_device_context_vtable_entry_flags );
         switchyard_track_d3d11_context_device( params->args[9], params->args[11] );
         break;
@@ -6267,6 +6275,8 @@ static void switchyard_wrap_dxgi_swapchain_output_vtable(
 static ULONG_PTR switchyard_call_native_callback_args(
     const struct switchyard_native_callback_params *params )
 {
+    typedef void (WINAPI *d3d11_clear_depth_stencil_view_func)(
+        ULONG_PTR, ULONG_PTR, ULONG_PTR, float, ULONG_PTR);
     typedef ULONG_PTR (WINAPI *native_callback_func0)(void);
     typedef ULONG_PTR (WINAPI *native_callback_func1)(ULONG_PTR);
     typedef ULONG_PTR (WINAPI *native_callback_func2)(ULONG_PTR, ULONG_PTR);
@@ -6293,6 +6303,19 @@ static ULONG_PTR switchyard_call_native_callback_args(
                                                         ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
                                                         ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
     const ULONG_PTR *args = params->args;
+
+    if (params->flags &
+        SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_CLEAR_DEPTH_STENCIL_VIEW)
+    {
+        float depth;
+
+        /* The fourth Microsoft x64 argument is carried in XMM3 when it is a
+         * float.  Recreate that typed call after installing the pthread TSD. */
+        memcpy( &depth, &args[3], sizeof(depth) );
+        ((d3d11_clear_depth_stencil_view_func)params->func)(
+            args[0], args[1], args[2], depth, args[4] );
+        return 0;
+    }
 
     switch (params->argc)
     {
@@ -6943,6 +6966,21 @@ static void *create_native_callback_args_thunk( void *func, unsigned int argc, U
                                       (i - 4) * sizeof(ULONG_PTR) );
         p = emit_mov_rax_rsp_disp( p, SWITCHYARD_NATIVE_CALLBACK_PARAMS_OFFSET +
                                       SWITCHYARD_NATIVE_CALLBACK_ARGS_OFFSET + i * sizeof(ULONG_PTR) );
+    }
+
+    if (flags &
+        SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_CLEAR_DEPTH_STENCIL_VIEW)
+    {
+        static const BYTE save_xmm3[] =
+        {
+            0x66, 0x0f, 0x7e, 0x5c, 0x24,
+            SWITCHYARD_NATIVE_CALLBACK_PARAMS_OFFSET +
+            SWITCHYARD_NATIVE_CALLBACK_ARGS_OFFSET + 3 * sizeof(ULONG_PTR)
+            /* movd %xmm3,params.args[3](%rsp) */
+        };
+
+        memcpy( p, save_xmm3, sizeof(save_xmm3) );
+        p += sizeof(save_xmm3);
     }
 
     *p++ = 0x48;
