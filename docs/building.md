@@ -168,6 +168,14 @@ trace diagnostics without being reported as warnings:
   ~/.switchyard/runtimes/<runtime-id>
 ```
 
+Verify that the 32-bit APIs hooked by the Steam overlay retain their supported
+hotpatch entry sequence:
+
+```sh
+./switchyard/tests/steam_overlay_hotpatch_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
+
 For a runtime with the GPTK overlay, exercise D3DMetal's shared DXGI resource
 callbacks from a fresh prefix with:
 

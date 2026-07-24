@@ -4941,8 +4941,9 @@ BOOL WINAPI SetupDiEnumDriverInfoW(HDEVINFO devinfo, SP_DEVINFO_DATA *device_dat
 /***********************************************************************
  *              SetupDiEnumDriverInfoA (SETUPAPI.@)
  */
-BOOL WINAPI SetupDiEnumDriverInfoA(HDEVINFO devinfo, SP_DEVINFO_DATA *device_data,
-        DWORD type, DWORD index, SP_DRVINFO_DATA_A *driver_data)
+BOOL WINAPI DECLSPEC_HOTPATCH SetupDiEnumDriverInfoA(HDEVINFO devinfo,
+        SP_DEVINFO_DATA *device_data, DWORD type, DWORD index,
+        SP_DRVINFO_DATA_A *driver_data)
 {
     SP_DRVINFO_DATA_W driver_dataW;
     BOOL ret;

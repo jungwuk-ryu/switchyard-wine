@@ -160,8 +160,9 @@ static void copy_bits( unsigned char *dst, const unsigned char *src, int count, 
     *dst = (bits & mask) | (*dst & ~mask);
 }
 
-NTSTATUS WINAPI HidP_GetButtonCaps( HIDP_REPORT_TYPE report_type, HIDP_BUTTON_CAPS *caps, USHORT *caps_count,
-                                    PHIDP_PREPARSED_DATA preparsed_data )
+NTSTATUS WINAPI DECLSPEC_HOTPATCH HidP_GetButtonCaps( HIDP_REPORT_TYPE report_type, HIDP_BUTTON_CAPS *caps,
+                                                      USHORT *caps_count,
+                                                      PHIDP_PREPARSED_DATA preparsed_data )
 {
     return HidP_GetSpecificButtonCaps( report_type, 0, 0, 0, caps, caps_count, preparsed_data );
 }
@@ -302,8 +303,10 @@ NTSTATUS WINAPI HidP_GetScaledUsageValue( HIDP_REPORT_TYPE report_type, USAGE us
     return enum_value_caps( preparsed, report_type, report_len, &filter, get_scaled_usage_value, &params, &count );
 }
 
-NTSTATUS WINAPI HidP_GetUsageValue( HIDP_REPORT_TYPE report_type, USAGE usage_page, USHORT collection, USAGE usage,
-                                    ULONG *value, PHIDP_PREPARSED_DATA preparsed_data, char *report_buf, ULONG report_len )
+NTSTATUS WINAPI DECLSPEC_HOTPATCH HidP_GetUsageValue( HIDP_REPORT_TYPE report_type, USAGE usage_page,
+                                                      USHORT collection, USAGE usage, ULONG *value,
+                                                      PHIDP_PREPARSED_DATA preparsed_data,
+                                                      char *report_buf, ULONG report_len )
 {
     struct usage_value_params params = {.usage = usage, .value_buf = value, .value_len = sizeof(*value), .report_buf = report_buf};
     struct hid_preparsed_data *preparsed = (struct hid_preparsed_data *)preparsed_data;
@@ -381,8 +384,10 @@ static NTSTATUS get_usage( const struct hid_value_caps *caps, void *user )
     return HIDP_STATUS_SUCCESS;
 }
 
-NTSTATUS WINAPI HidP_GetUsages( HIDP_REPORT_TYPE report_type, USAGE usage_page, USHORT collection, USAGE *usages,
-                                ULONG *usages_len, PHIDP_PREPARSED_DATA preparsed_data, char *report_buf, ULONG report_len )
+NTSTATUS WINAPI DECLSPEC_HOTPATCH HidP_GetUsages( HIDP_REPORT_TYPE report_type, USAGE usage_page,
+                                                  USHORT collection, USAGE *usages, ULONG *usages_len,
+                                                  PHIDP_PREPARSED_DATA preparsed_data,
+                                                  char *report_buf, ULONG report_len )
 {
     struct hid_preparsed_data *preparsed = (struct hid_preparsed_data *)preparsed_data;
     struct get_usage_params params = {.usages = usages, .usages_end = usages + *usages_len, .report_buf = report_buf};
@@ -405,8 +410,9 @@ NTSTATUS WINAPI HidP_GetUsages( HIDP_REPORT_TYPE report_type, USAGE usage_page, 
     return status;
 }
 
-NTSTATUS WINAPI HidP_GetValueCaps( HIDP_REPORT_TYPE report_type, HIDP_VALUE_CAPS *caps, USHORT *caps_count,
-                                   PHIDP_PREPARSED_DATA preparsed_data )
+NTSTATUS WINAPI DECLSPEC_HOTPATCH HidP_GetValueCaps( HIDP_REPORT_TYPE report_type, HIDP_VALUE_CAPS *caps,
+                                                     USHORT *caps_count,
+                                                     PHIDP_PREPARSED_DATA preparsed_data )
 {
     return HidP_GetSpecificValueCaps( report_type, 0, 0, 0, caps, caps_count, preparsed_data );
 }
@@ -979,8 +985,9 @@ static NTSTATUS find_all_data( const struct hid_value_caps *caps, void *user )
     return HIDP_STATUS_SUCCESS;
 }
 
-NTSTATUS WINAPI HidP_GetData( HIDP_REPORT_TYPE report_type, HIDP_DATA *data, ULONG *data_len,
-                              PHIDP_PREPARSED_DATA preparsed_data, char *report_buf, ULONG report_len )
+NTSTATUS WINAPI DECLSPEC_HOTPATCH HidP_GetData( HIDP_REPORT_TYPE report_type, HIDP_DATA *data,
+                                                ULONG *data_len, PHIDP_PREPARSED_DATA preparsed_data,
+                                                char *report_buf, ULONG report_len )
 {
     struct find_all_data_params params = {.data = data, .data_end = data + *data_len, .report_buf = report_buf};
     struct hid_preparsed_data *preparsed = (struct hid_preparsed_data *)preparsed_data;
