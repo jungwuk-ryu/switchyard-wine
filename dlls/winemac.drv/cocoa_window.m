@@ -4591,6 +4591,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     BOOL present_scheduled;
     BOOL surface_opaque;
     CGRect layer_bounds;
+    CGSize attached_size;
     IOSurfaceRef pending_surface;
     CGRect pending_bounds;
     uint64_t next_present_serial;
@@ -4709,7 +4710,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     CGRect new_bounds = CGRectMake(0, 0, bounds.size.width, bounds.size.height);
     IOSurfaceRef replaced_surface = NULL;
     uint64_t serial;
-    BOOL create_host = NO, schedule = NO;
+    BOOL create_host = NO, resize_host = NO, schedule = NO;
 
     if (!surface) return;
     CFRetain(surface);
@@ -4734,6 +4735,17 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
             pending_bounds = new_bounds;
             pending_present_serial = serial;
             surface = NULL; /* pending_surface owns the retain */
+            /* The CAContext survives WGL backing generations, while its host
+               caches the endpoint size supplied at attach time. Refresh that
+               geometry before publishing a resized IOSurface; otherwise the
+               host stretches the new pixels to the stale frame and input
+               remains in the HWND's unscaled client coordinates. */
+            if (registered && !registering &&
+                !CGSizeEqualToSize(attached_size, new_bounds.size))
+            {
+                registering = YES;
+                resize_host = YES;
+            }
             if (registered && !present_scheduled)
             {
                 present_scheduled = YES;
@@ -4772,7 +4784,11 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
                 registered = NO;
                 release_attached = attached;
             }
-            else registered = attached;
+            else
+            {
+                registered = attached;
+                if (attached) attached_size = new_bounds.size;
+            }
             registering = NO;
             if (registered && pending_surface)
             {
@@ -4787,6 +4803,30 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
             macdrv_release_remote_layer(source_hwnd, context_id, true);
         if (schedule) OnMainThreadAsync(^{ [self drainPendingSurface]; });
         return;
+    }
+
+    if (resize_host)
+    {
+        BOOL attached = macdrv_attach_remote_layer(source_hwnd, context_id, true,
+                                                   new_bounds.size);
+        BOOL release_attached = NO;
+
+        @synchronized(self)
+        {
+            if (invalidated)
+            {
+                registered = NO;
+                release_attached = attached;
+            }
+            else
+            {
+                registered = attached;
+                if (attached) attached_size = new_bounds.size;
+            }
+            registering = NO;
+        }
+        if (release_attached)
+            macdrv_release_remote_layer(source_hwnd, context_id, true);
     }
 
     if (schedule) OnMainThreadAsync(^{ [self drainPendingSurface]; });

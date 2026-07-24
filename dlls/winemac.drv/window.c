@@ -2474,6 +2474,9 @@ static BOOL remote_layer_attach(HWND source, unsigned int context_id,
     entry->endpoint_dirty = TRUE;
     entry->refresh_ticket++;
     node_id = entry->node_id;
+    TRACE("source %p context %u plane %u endpoint %dx%d node %s\n",
+          source, context_id, plane, endpoint_size.cx, endpoint_size.cy,
+          wine_dbgstr_longlong(node_id));
     if (stale)
         remote_layer_remove_cocoa(stale->node_id, ++stale->revision, TRUE);
     pthread_mutex_unlock(&remote_layer_mutex);
