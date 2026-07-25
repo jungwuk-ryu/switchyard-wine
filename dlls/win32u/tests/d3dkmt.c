@@ -29,6 +29,7 @@
 #include "winuser.h"
 #include "winternl.h"
 #include "dwmapi.h"
+#include "d3dkmdt.h"
 #include "ddk/d3dkmthk.h"
 #include "initguid.h"
 #include "setupapi.h"
@@ -1579,6 +1580,7 @@ static void test_D3DKMTQueryAdapterInfo(void)
     {
         {KMTQAITYPE_CHECKDRIVERUPDATESTATUS, sizeof(BOOL)},
         {KMTQAITYPE_DRIVERVERSION, sizeof(D3DKMT_DRIVERVERSION)},
+        {KMTQAITYPE_WDDM_2_7_CAPS, sizeof(D3DKMT_WDDM_2_7_CAPS)},
     };
 
     ret = get_primary_adapter_name( open_adapter_desc.DeviceName );
@@ -1629,6 +1631,12 @@ static void test_D3DKMTQueryAdapterInfo(void)
             D3DKMT_DRIVERVERSION *value = query_adapter_info.pPrivateDriverData;
             ok( *value >= KMT_DRIVERVERSION_WDDM_3_1 || broken( *value >= KMT_DRIVERVERSION_WDDM_1_3 ),
                 "Expected %d >= %d.\n", *value, KMT_DRIVERVERSION_WDDM_3_1 );
+            break;
+        }
+        case KMTQAITYPE_WDDM_2_7_CAPS:
+        {
+            D3DKMT_WDDM_2_7_CAPS *value = query_adapter_info.pPrivateDriverData;
+            ok( !(value->Value & ~0xf), "Got unexpected capabilities %#x.\n", value->Value );
             break;
         }
         default:
