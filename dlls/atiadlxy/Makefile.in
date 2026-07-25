@@ -1,0 +1,7 @@
+MODULE    = atiadlxy.dll
+PARENTSRC = ../atiadlxx
+
+EXTRADLLFLAGS = -Wb,--prefer-native
+
+SOURCES = \
+	atiadlxx.c

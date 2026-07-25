@@ -1,0 +1,6 @@
+MODULE    = atiadlxx.dll
+
+EXTRADLLFLAGS = -Wb,--prefer-native
+
+SOURCES = \
+	atiadlxx.c

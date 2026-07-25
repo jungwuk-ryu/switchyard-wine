@@ -527,6 +527,7 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
                                const struct pe_mapping_info *pe_mapping )
 {
     static const WCHAR prefixW[] = {'\\','?','?','\\'};
+    static const WCHAR amd_ags_x64W[] = {'a','m','d','_','a','g','s','_','x','6','4',0};
     static const WCHAR opengl32W[] = {'o','p','e','n','g','l','3','2',0};
     static const WCHAR libgalliumW[] = {'l','i','b','g','a','l','l','i','u','m','_','w','g','l',0};
     enum loadorder ret = LO_INVALID;
@@ -567,6 +568,20 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
         /* module basename without '*' */
         if (((ret = get_load_order_value( std_key, app_key, basename )) != LO_INVALID))
             goto done;
+
+        if (!wcsicmp( basename, amd_ags_x64W ))
+        {
+            /*
+             * The native AGS driver extension path requires an AMD user-mode
+             * driver.  Prefer Wine's compatibility implementation when it is
+             * available, while preserving native fallback and explicit
+             * per-application overrides.
+             */
+            ret = LO_BUILTIN_NATIVE;
+            TRACE( "using compatibility module %s for %s\n",
+                   debugstr_loadorder(ret), debugstr_us(nt_name) );
+            goto done;
+        }
 
         if (switchyard_mesa &&
             (!wcsicmp( basename, opengl32W ) || !wcsicmp( basename, libgalliumW )))
