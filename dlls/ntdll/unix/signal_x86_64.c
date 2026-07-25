@@ -516,6 +516,7 @@ struct amd64_thread_data
     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
     char                  syscall_dispatch; /* 0340 */
     DWORD                 native_callback_depth; /* 0344 Switchyard native callback nesting */
+    DWORD                 native_callback_exception_depth; /* 0348 Native callback exception dispatch */
 };
 
 C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
@@ -526,6 +527,8 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs 
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, native_callback_depth ) == 0x344 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) +
+          offsetof( struct amd64_thread_data, native_callback_exception_depth ) == 0x348 );
 
 static inline struct amd64_thread_data *amd64_thread_data( struct thread_data *data )
 {
@@ -777,6 +780,16 @@ __ASM_GLOBAL_FUNC( clear_alignment_flag,
                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
                    "ret" )
 
+#ifdef __APPLE__
+extern void switchyard_native_callback_exception_dispatcher(void);
+__ASM_GLOBAL_FUNC( switchyard_native_callback_exception_dispatcher,
+                   "movq %r13,%rdi\n\t"       /* teb */
+                   "xorl %esi,%esi\n\t"
+                   "movl $0x3000003,%eax\n\t" /* _thread_set_tsd_base */
+                   "syscall\n\t"
+                   "jmp *%r12" )              /* KiUserExceptionDispatcher */
+#endif
+
 
 /***********************************************************************
  *           init_handler
@@ -826,7 +839,9 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
 #elif defined __APPLE__
     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
         !is_inside_syscall( data, RSP_sig(sigcontext )))
-        _thread_set_tsd_base( (uint64_t)(amd64_data->native_callback_depth ? amd64_data->pthread_teb : data->teb) );
+        _thread_set_tsd_base( (uint64_t)(amd64_data->native_callback_depth &&
+                                        !amd64_data->native_callback_exception_depth ?
+                                        amd64_data->pthread_teb : data->teb) );
 #endif
     if (is_16bit( sigcontext )) return;
 #ifdef DS_sig
@@ -1548,6 +1563,17 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
     CS_sig(sigcontext)  = cs64_sel;
     RIP_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
     RSP_sig(sigcontext) = (ULONG_PTR)stack;
+#ifdef __APPLE__
+    if (amd64_thread_data( data )->native_callback_depth)
+    {
+        if (!amd64_thread_data( data )->native_callback_exception_depth)
+            amd64_thread_data( data )->native_callback_exception_depth =
+                amd64_thread_data( data )->native_callback_depth;
+        R12_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
+        R13_sig(sigcontext) = (ULONG_PTR)data->teb;
+        RIP_sig(sigcontext) = (ULONG_PTR)switchyard_native_callback_exception_dispatcher;
+    }
+#endif
     /* clear single-step, direction, and align check flag */
     EFL_sig(sigcontext) &= ~(0x100|0x400|0x40000);
     if ((callback = instrumentation_callback))
@@ -3861,6 +3887,8 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "movq %rax,%rdx\n\t"
                    "movq %rcx,%r14\n\t"
                    "movq %r13,%rdi\n\t"            /* teb */
+                   "cmpl $0,0x348(%r13)\n\t"       /* amd64_thread_data()->native_callback_exception_depth */
+                   "jne 1f\n\t"
                    "cmpl $1,0x344(%r13)\n\t"       /* amd64_thread_data()->native_callback_depth */
                    "jbe 1f\n\t"
                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
