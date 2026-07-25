@@ -3727,6 +3727,14 @@ static void switchyard_init_native_callback_recovery(void)
         switchyard_get_teb_from_pthread = params.get_teb_from_pthread;
 }
 
+static void switchyard_clear_native_callback_exception( DWORD *native_callback_depth )
+{
+    DWORD depth;
+
+    if (!native_callback_depth || !(depth = *native_callback_depth)) return;
+    if (native_callback_depth[1] == depth) native_callback_depth[1] = 0;
+}
+
 static BOOL switchyard_recover_native_callback_context( TEB **teb, void **pthread_teb,
                                                         DWORD **native_callback_depth )
 {
@@ -3861,9 +3869,11 @@ static void CALLBACK switchyard_leave_native_callback( BOOL normal, void *ctx )
     (void)normal;
     if (scope->left) return;
     scope->left = TRUE;
+    switchyard_clear_native_callback_exception( scope->native_callback_depth );
     if (scope->native_callback_depth && *scope->native_callback_depth)
         --*scope->native_callback_depth;
-    switchyard_set_macos_tsd_base( scope->native_callback_depth && *scope->native_callback_depth ?
+    switchyard_set_macos_tsd_base( scope->native_callback_depth && *scope->native_callback_depth &&
+                                   !scope->native_callback_depth[1] ?
                                    scope->pthread_teb : scope->teb );
 }
 
@@ -3874,9 +3884,12 @@ static void CALLBACK switchyard_leave_recovered_native_callback( BOOL normal, vo
     (void)normal;
     if (scope->left) return;
     scope->left = TRUE;
+    switchyard_clear_native_callback_exception( scope->native_callback_depth );
     if (scope->native_callback_depth && *scope->native_callback_depth)
         --*scope->native_callback_depth;
-    switchyard_set_macos_tsd_base( scope->pthread_teb );
+    switchyard_set_macos_tsd_base( scope->native_callback_depth &&
+                                   scope->native_callback_depth[1] ?
+                                   scope->teb : scope->pthread_teb );
 }
 
 static BOOL switchyard_enter_native_callback_scope( struct switchyard_native_callback_scope *scope )
