@@ -52,10 +52,17 @@ x86_64-w64-mingw32-gcc -Wall -Wextra -Werror -Os -s \
   "$ROOT_DIR/switchyard/tests/native_callback_exception.c" -ld3d11
 
 log="$work/native-callback-exception.log"
-env -u WINE_OPENGL_DRIVER "${gptk_env[@]}" \
-  WINEPREFIX="$prefix" WINEDLLOVERRIDES="winedbg.exe=d" WINEDEBUG=-all \
-  "$RUNTIME/bin/switchyard-wine" "$work/native-callback-exception.exe" \
-  >"$log" 2>&1 &
+if [ -n "$GPTK_PATH" ]; then
+  env -u WINE_OPENGL_DRIVER "${gptk_env[@]}" \
+    WINEPREFIX="$prefix" WINEDLLOVERRIDES="winedbg.exe=d" WINEDEBUG=-all \
+    "$RUNTIME/bin/switchyard-wine" "$work/native-callback-exception.exe" \
+    >"$log" 2>&1 &
+else
+  env -u WINE_OPENGL_DRIVER \
+    WINEPREFIX="$prefix" WINEDLLOVERRIDES="winedbg.exe=d" WINEDEBUG=-all \
+    "$RUNTIME/bin/switchyard-wine" "$work/native-callback-exception.exe" \
+    >"$log" 2>&1 &
+fi
 wine_pid=$!
 (
   sleep 60

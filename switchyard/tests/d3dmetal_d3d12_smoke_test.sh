@@ -54,9 +54,15 @@ x86_64-w64-mingw32-gcc -o "$work/d3dmetal-d3d12-smoke.exe" \
 run_smoke() {
   local description="$1"
   shift
-  env -u WINE_OPENGL_DRIVER "${gptk_env[@]}" \
-    WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winedbg.exe=d" \
-    "$RUNTIME/bin/switchyard-wine" "$work/d3dmetal-d3d12-smoke.exe" "$@" &
+  if [ -n "$GPTK_PATH" ]; then
+    env -u WINE_OPENGL_DRIVER "${gptk_env[@]}" \
+      WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winedbg.exe=d" \
+      "$RUNTIME/bin/switchyard-wine" "$work/d3dmetal-d3d12-smoke.exe" "$@" &
+  else
+    env -u WINE_OPENGL_DRIVER \
+      WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winedbg.exe=d" \
+      "$RUNTIME/bin/switchyard-wine" "$work/d3dmetal-d3d12-smoke.exe" "$@" &
+  fi
   wine_pid=$!
   (
     sleep 120
