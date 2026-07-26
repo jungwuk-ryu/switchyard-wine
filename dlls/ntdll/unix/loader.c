@@ -88,6 +88,7 @@
 #include "unix_private.h"
 #include "wine/list.h"
 #include "wine/debug.h"
+#include "msync.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(module);
 
@@ -2199,6 +2200,7 @@ static void start_main_thread(void)
 
     dbg_init();
     startup_info_size = server_init_process();
+    msync_init();
     virtual_map_user_shared_data();
     init_cpu_info();
     init_files();
