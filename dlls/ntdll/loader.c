@@ -3549,13 +3549,20 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 
 static BYTE *native_callback_thunk_ptr;
 static BYTE *native_callback_thunk_end;
+static BYTE *native_callback_shared_thunk_ptr;
+static BYTE *native_callback_shared_thunk_end;
+#define SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_SIZE 0x10000
+#define SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_BUCKETS 256
+#define SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_MAGIC 0x53595754484e4b52ULL
 struct switchyard_native_callback_thunk_region
 {
+    ULONGLONG magic;
     struct switchyard_native_callback_thunk_region *next;
     BYTE *base;
     BYTE *end;
 };
-static struct switchyard_native_callback_thunk_region *native_callback_thunk_regions;
+static struct switchyard_native_callback_thunk_region *
+    native_callback_thunk_region_buckets[SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_BUCKETS];
 static const BYTE native_callback_thunk_marker[] = { 0x66, 0x90, 0x66, 0x90, 0x66, 0x90, 0x66, 0x90 };
 static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0x1f, 0x40, 0x00 };
 #define SWITCHYARD_NATIVE_CALLBACK_E_FAIL ((ULONG_PTR)0x80004005)
@@ -3587,6 +3594,11 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI 0x100000
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D_BLOB_OUTPUT_VTABLE 0x200000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_CLEAR_DEPTH_STENCIL_VIEW 0x400000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_MAP 0x1000000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_UNMAP 0x2000000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_END_QUERY 0x4000000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_RESOLVE_QUERY 0x8000000
+#define SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK 0x80000000u
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
@@ -3632,6 +3644,39 @@ struct switchyard_native_callback_params
     ULONG_PTR args[SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS];
 };
 
+#define SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS 2048
+#define SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS 256
+#define SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS 256
+#define SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_VALUES 64
+
+struct switchyard_d3d12_timestamp_query
+{
+    void *heap;
+    ULONG index;
+    ULONGLONG value;
+};
+
+struct switchyard_d3d12_timestamp_resource
+{
+    void *resource;
+    BYTE *mapped;
+};
+
+struct switchyard_d3d12_timestamp_resolve
+{
+    void *resource;
+    ULONGLONG offset;
+    ULONG count;
+    ULONGLONG values[SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_VALUES];
+};
+
+static struct switchyard_d3d12_timestamp_query
+    switchyard_d3d12_timestamp_queries[SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS];
+static struct switchyard_d3d12_timestamp_resource
+    switchyard_d3d12_timestamp_resources[SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS];
+static struct switchyard_d3d12_timestamp_resolve
+    switchyard_d3d12_timestamp_resolves[SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS];
+
 #define SWITCHYARD_NATIVE_CALLBACK_THUNK_INFO_MAGIC 0x53595754484e4b31ULL
 struct switchyard_native_callback_thunk_info
 {
@@ -3639,8 +3684,12 @@ struct switchyard_native_callback_thunk_info
     void *target;
     ULONG argc;
     ULONG flags;
-    ULONGLONG reserved;
+    struct switchyard_native_callback_thunk_info *cache_next;
 };
+
+#define SWITCHYARD_NATIVE_CALLBACK_THUNK_CACHE_BUCKETS 1024
+static struct switchyard_native_callback_thunk_info *
+    native_callback_thunk_cache[SWITCHYARD_NATIVE_CALLBACK_THUNK_CACHE_BUCKETS];
 
 C_ASSERT( FIELD_OFFSET( struct switchyard_pe_callback_params, func ) == SWITCHYARD_PE_CALLBACK_FUNC_OFFSET );
 C_ASSERT( FIELD_OFFSET( struct switchyard_pe_callback_params, argc ) == SWITCHYARD_PE_CALLBACK_ARGC_OFFSET );
@@ -4525,16 +4574,18 @@ static ULONG switchyard_d3d12_device_vtable_entry_flags( unsigned int index )
         break;
 
     default:
-        return 0;
+        return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK;
     }
 
-    return switchyard_d3d12_output_flags( output_arg );
+    return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
+           switchyard_d3d12_output_flags( output_arg );
 }
 
 static ULONG switchyard_d3d12_device_child_vtable_entry_flags( unsigned int index )
 {
     /* All ID3D12DeviceChild interfaces expose GetDevice at slot 7. */
-    return index == 0 || index == 7 ? switchyard_d3d12_output_flags( 2 ) : 0;
+    return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
+           (index == 0 || index == 7 ? switchyard_d3d12_output_flags( 2 ) : 0);
 }
 
 static ULONG switchyard_d3d12_pipeline_library_vtable_entry_flags( unsigned int index )
@@ -4550,6 +4601,8 @@ static ULONG switchyard_d3d12_resource_vtable_entry_flags( unsigned int index )
 {
     ULONG flags = switchyard_d3d12_device_child_vtable_entry_flags( index );
 
+    if (index == 8) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_MAP;
+    if (index == 9) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_UNMAP;
     if (index == 15) flags |= switchyard_d3d12_output_flags( 2 );
     return flags;
 }
@@ -5971,7 +6024,8 @@ static const struct switchyard_d3d12_interface_info switchyard_d3d12_interfaces[
 
 static ULONG switchyard_d3d12_object_vtable_entry_flags( unsigned int index )
 {
-    return index == 0 ? switchyard_d3d12_output_flags( 2 ) : 0;
+    return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
+           (index == 0 ? switchyard_d3d12_output_flags( 2 ) : 0);
 }
 
 static ULONG switchyard_d3d12_pipeline_state_vtable_entry_flags( unsigned int index )
@@ -5996,6 +6050,15 @@ static BOOL switchyard_d3d12_graphics_command_list_entry_uses_scalar_float( unsi
      * floats in XMM registers.  The generic integer callback relay deliberately
      * leaves them direct, matching the existing D3D11 treatment for such methods. */
     return index == 47 || index == 62 || index == 82;
+}
+
+static ULONG switchyard_d3d12_graphics_command_list_vtable_entry_flags( unsigned int index )
+{
+    ULONG flags = switchyard_d3d12_device_child_vtable_entry_flags( index );
+
+    if (index == 53) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_END_QUERY;
+    if (index == 54) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_RESOLVE_QUERY;
+    return flags;
 }
 
 static const struct switchyard_d3d12_interface_info *switchyard_find_d3d12_interface( const GUID *iid )
@@ -6047,7 +6110,7 @@ static void switchyard_wrap_d3d12_output_vtable(
         entry_flags = switchyard_d3d12_device_vtable_entry_flags;
         break;
     case SWITCHYARD_D3D12_GRAPHICS_COMMAND_LIST:
-        entry_flags = switchyard_d3d12_device_child_vtable_entry_flags;
+        entry_flags = switchyard_d3d12_graphics_command_list_vtable_entry_flags;
         uses_scalar_float = switchyard_d3d12_graphics_command_list_entry_uses_scalar_float;
         break;
     case SWITCHYARD_D3D12_PIPELINE_LIBRARY:
@@ -6356,6 +6419,248 @@ static ULONG_PTR switchyard_call_native_callback_args(
     }
 }
 
+static unsigned int switchyard_d3d12_timestamp_hash( const void *object, ULONGLONG value,
+                                                     unsigned int slots )
+{
+    ULONG_PTR hash = (ULONG_PTR)object >> 4;
+
+    hash ^= (ULONG_PTR)value;
+    hash ^= (ULONG_PTR)(value >> 32);
+    hash ^= hash >> 16;
+    return hash & (slots - 1);
+}
+
+static ULONGLONG switchyard_d3d12_timestamp_now(void)
+{
+    LARGE_INTEGER counter, frequency;
+    ULONGLONG seconds, remainder;
+
+    if (NtQueryPerformanceCounter( &counter, &frequency ) || frequency.QuadPart <= 0)
+        return 1;
+
+    /* D3DMetal advertises a 60 Hz command-queue timestamp frequency. */
+    seconds = counter.QuadPart / frequency.QuadPart;
+    remainder = counter.QuadPart % frequency.QuadPart;
+    return seconds * 60 + remainder * 60 / frequency.QuadPart;
+}
+
+static void switchyard_d3d12_store_timestamp_query_locked( void *heap, ULONG index,
+                                                            ULONGLONG value )
+{
+    unsigned int start, i;
+    struct switchyard_d3d12_timestamp_query *query;
+
+    start = switchyard_d3d12_timestamp_hash(
+        heap, index, SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS );
+    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS; ++i)
+    {
+        query = &switchyard_d3d12_timestamp_queries[
+            (start + i) & (SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS - 1)];
+        if (!query->heap || (query->heap == heap && query->index == index))
+        {
+            query->heap = heap;
+            query->index = index;
+            query->value = value;
+            return;
+        }
+    }
+
+    query = &switchyard_d3d12_timestamp_queries[start];
+    query->heap = heap;
+    query->index = index;
+    query->value = value;
+}
+
+static ULONGLONG switchyard_d3d12_get_timestamp_query_locked( void *heap, ULONG index )
+{
+    unsigned int start, i;
+    const struct switchyard_d3d12_timestamp_query *query;
+
+    start = switchyard_d3d12_timestamp_hash(
+        heap, index, SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS );
+    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS; ++i)
+    {
+        query = &switchyard_d3d12_timestamp_queries[
+            (start + i) & (SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS - 1)];
+        if (!query->heap) break;
+        if (query->heap == heap && query->index == index) return query->value;
+    }
+    return 0;
+}
+
+static struct switchyard_d3d12_timestamp_resource *
+switchyard_d3d12_get_timestamp_resource_locked( void *resource, BOOL create )
+{
+    struct switchyard_d3d12_timestamp_resource *entry;
+    unsigned int start, i;
+
+    start = switchyard_d3d12_timestamp_hash(
+        resource, 0, SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS );
+    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS; ++i)
+    {
+        entry = &switchyard_d3d12_timestamp_resources[
+            (start + i) & (SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS - 1)];
+        if (entry->resource == resource) return entry;
+        if (!entry->resource)
+        {
+            if (create) entry->resource = resource;
+            return create ? entry : NULL;
+        }
+    }
+
+    if (!create) return NULL;
+    entry = &switchyard_d3d12_timestamp_resources[start];
+    entry->resource = resource;
+    entry->mapped = NULL;
+    return entry;
+}
+
+static void switchyard_d3d12_write_timestamp_resolve_locked(
+    struct switchyard_d3d12_timestamp_resolve *resolve, BYTE *mapped )
+{
+    if (!resolve->resource || !mapped || !resolve->count) return;
+
+    __TRY
+    {
+        memcpy( mapped + resolve->offset, resolve->values,
+                resolve->count * sizeof(resolve->values[0]) );
+        resolve->resource = NULL;
+        resolve->count = 0;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+}
+
+static void switchyard_d3d12_store_timestamp_resolve_locked(
+    void *resource, ULONGLONG offset, ULONG count, const ULONGLONG *values )
+{
+    struct switchyard_d3d12_timestamp_resource *resource_entry;
+    struct switchyard_d3d12_timestamp_resolve *resolve;
+    unsigned int start, i;
+
+    resource_entry = switchyard_d3d12_get_timestamp_resource_locked( resource, TRUE );
+    start = switchyard_d3d12_timestamp_hash(
+        resource, offset >> 3, SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS );
+    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS; ++i)
+    {
+        resolve = &switchyard_d3d12_timestamp_resolves[
+            (start + i) & (SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS - 1)];
+        if (!resolve->resource ||
+            (resolve->resource == resource && resolve->offset == offset))
+            break;
+    }
+    if (i == SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS)
+        resolve = &switchyard_d3d12_timestamp_resolves[start];
+
+    resolve->resource = resource;
+    resolve->offset = offset;
+    resolve->count = count;
+    memcpy( resolve->values, values, count * sizeof(*values) );
+    if (resource_entry && resource_entry->mapped)
+        switchyard_d3d12_write_timestamp_resolve_locked(
+            resolve, resource_entry->mapped );
+}
+
+static void switchyard_d3d12_map_timestamp_resource_locked( void *resource, BYTE *mapped )
+{
+    struct switchyard_d3d12_timestamp_resource *entry;
+    unsigned int i;
+
+    if (!(entry = switchyard_d3d12_get_timestamp_resource_locked( resource, TRUE )))
+        return;
+    entry->mapped = mapped;
+    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS; ++i)
+    {
+        struct switchyard_d3d12_timestamp_resolve *resolve =
+            &switchyard_d3d12_timestamp_resolves[i];
+
+        if (resolve->resource == resource)
+            switchyard_d3d12_write_timestamp_resolve_locked( resolve, mapped );
+    }
+}
+
+static void switchyard_postprocess_d3d12_timestamp(
+    const struct switchyard_native_callback_params *params, ULONG_PTR ret )
+{
+    ULONGLONG values[SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_VALUES];
+    struct switchyard_d3d12_timestamp_resource *resource_entry;
+    ULONG start_index, count, chunk, i;
+    ULONGLONG offset, now;
+    BYTE *mapped = NULL;
+    void *resource;
+
+    if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_END_QUERY)
+    {
+        if (params->args[2] != 2 || !params->args[1]) return;
+        now = switchyard_d3d12_timestamp_now();
+        RtlEnterCriticalSection( &loader_section );
+        switchyard_d3d12_store_timestamp_query_locked(
+            (void *)params->args[1], params->args[3], now );
+        RtlLeaveCriticalSection( &loader_section );
+        return;
+    }
+
+    if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_RESOLVE_QUERY)
+    {
+        if (params->args[2] != 2 || !params->args[1] || !params->args[5])
+            return;
+        start_index = params->args[3];
+        count = params->args[4];
+        resource = (void *)params->args[5];
+        offset = params->args[6];
+        while (count)
+        {
+            chunk = min( count, (ULONG)ARRAY_SIZE(values) );
+            now = switchyard_d3d12_timestamp_now();
+            RtlEnterCriticalSection( &loader_section );
+            for (i = 0; i < chunk; ++i)
+            {
+                values[i] = switchyard_d3d12_get_timestamp_query_locked(
+                    (void *)params->args[1], start_index + i );
+                if (!values[i]) values[i] = now;
+            }
+            switchyard_d3d12_store_timestamp_resolve_locked(
+                resource, offset, chunk, values );
+            RtlLeaveCriticalSection( &loader_section );
+            start_index += chunk;
+            count -= chunk;
+            offset += chunk * sizeof(values[0]);
+        }
+        return;
+    }
+
+    if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_MAP)
+    {
+        if ((LONG)ret < 0 || !params->args[0] || !params->args[3]) return;
+        __TRY
+        {
+            mapped = *(BYTE **)params->args[3];
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+        }
+        __ENDTRY
+        if (!mapped) return;
+        RtlEnterCriticalSection( &loader_section );
+        switchyard_d3d12_map_timestamp_resource_locked(
+            (void *)params->args[0], mapped );
+        RtlLeaveCriticalSection( &loader_section );
+        return;
+    }
+
+    if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_UNMAP)
+    {
+        if (!params->args[0]) return;
+        RtlEnterCriticalSection( &loader_section );
+        resource_entry = switchyard_d3d12_get_timestamp_resource_locked(
+            (void *)params->args[0], FALSE );
+        if (resource_entry) resource_entry->mapped = NULL;
+        RtlLeaveCriticalSection( &loader_section );
+    }
+}
+
 static ULONG_PTR switchyard_native_callback_args_on_user_stack(
     const struct switchyard_native_callback_params *params, TEB *teb, void *pthread_teb,
     DWORD *native_callback_depth )
@@ -6386,6 +6691,7 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
             ret = switchyard_call_native_callback_args( params );
             switchyard_leave_native_callback( TRUE, &scope );
             switchyard_restore_com_vtable( TRUE, &input_vtable_scope );
+            switchyard_postprocess_d3d12_timestamp( params, ret );
             if (params->flags & SWITCHYARD_NATIVE_CALLBACK_DXGI_RESOURCE_GET_SHARED_HANDLE)
                 ret = switchyard_get_d3d_shared_handle( params, ret );
             if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_OPEN_SHARED_RESOURCE)
@@ -6676,39 +6982,54 @@ static BOOL is_pe_callback_thunk( const void *ptr )
     return ret;
 }
 
-static BYTE *alloc_native_callback_thunk( SIZE_T size )
+static BYTE *alloc_native_callback_thunk( SIZE_T size, BOOL shared )
 {
     struct switchyard_native_callback_thunk_region *new_region;
+    BYTE **current_ptr = shared ? &native_callback_shared_thunk_ptr :
+                                 &native_callback_thunk_ptr;
+    BYTE **current_end = shared ? &native_callback_shared_thunk_end :
+                                 &native_callback_thunk_end;
     void *new_region_base = NULL;
     SIZE_T new_region_size = 0;
     BYTE *ret = NULL;
     SIZE_T aligned_size = (size + 15) & ~15;
 
     RtlEnterCriticalSection( &loader_section );
-    if (!native_callback_thunk_ptr || native_callback_thunk_ptr + aligned_size > native_callback_thunk_end)
+    if (!*current_ptr || *current_ptr + aligned_size > *current_end)
     {
         void *base = NULL;
-        SIZE_T alloc_size = 0x1000;
+        SIZE_T alloc_size = SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_SIZE;
+        ULONG allocation_type = MEM_RESERVE | MEM_COMMIT;
+
+        /* Shared entry points are intentionally hotpatchable by overlays and
+         * middleware.  Keep them out of the heavily fragmented low address
+         * range used by large games so x64 hook libraries can reserve a nearby
+         * relay page within their signed 32-bit branch window. */
+        if (shared) allocation_type |= MEM_TOP_DOWN;
 
         if (!NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &alloc_size,
-                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE ))
+                                      allocation_type, PAGE_EXECUTE_READWRITE ))
         {
+            unsigned int bucket =
+                ((ULONG_PTR)base >> 16) % SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_BUCKETS;
+
             new_region = base;
-            new_region->next = native_callback_thunk_regions;
+            new_region->magic = SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_MAGIC;
+            new_region->next = native_callback_thunk_region_buckets[bucket];
+            new_region->base = (BYTE *)base +
+                               ((sizeof(*new_region) + 15) & ~15);
             new_region->end = (BYTE *)base + alloc_size;
-            native_callback_thunk_regions = new_region;
-            native_callback_thunk_ptr = (BYTE *)base +
-                                        ((sizeof(*new_region) + 15) & ~15);
-            new_region->base = native_callback_thunk_ptr;
-            native_callback_thunk_end = (BYTE *)base + alloc_size;
+            native_callback_thunk_region_buckets[bucket] = new_region;
+            *current_ptr = new_region->base;
+            *current_end = (BYTE *)base + alloc_size;
             new_region_base = base;
             new_region_size = alloc_size;
         }
     }
-    if (native_callback_thunk_ptr && native_callback_thunk_ptr + aligned_size <= native_callback_thunk_end)
+    if (*current_ptr && *current_ptr + aligned_size <= *current_end)
     {
-        ret = native_callback_thunk_ptr;
-        native_callback_thunk_ptr += aligned_size;
+        ret = *current_ptr;
+        *current_ptr += aligned_size;
     }
     RtlLeaveCriticalSection( &loader_section );
     if (new_region_base) register_native_callback_thunk_region( new_region_base, new_region_size );
@@ -6717,13 +7038,31 @@ static BYTE *alloc_native_callback_thunk( SIZE_T size )
 
 static BOOL switchyard_is_native_callback_thunk_address( const void *ptr )
 {
+    const struct switchyard_native_callback_thunk_region *candidate =
+        (const void *)((ULONG_PTR)ptr &
+                       ~((ULONG_PTR)SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_SIZE - 1));
     const struct switchyard_native_callback_thunk_region *region;
+    unsigned int bucket =
+        ((ULONG_PTR)candidate >> 16) % SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_BUCKETS;
     ULONG_PTR address = (ULONG_PTR)ptr;
+    BOOL ret = FALSE;
 
-    for (region = native_callback_thunk_regions; region; region = region->next)
-        if (address >= (ULONG_PTR)region->base && address < (ULONG_PTR)region->end)
-            return TRUE;
-    return FALSE;
+    /* Do not probe the aligned candidate address directly.  Native function
+     * pointers may live in a partially mapped 64K range, and an application
+     * vectored exception handler observes the resulting page fault before our
+     * structured exception handler can recover from it.  Look up only region
+     * headers allocated by us instead. */
+    RtlEnterCriticalSection( &loader_section );
+    for (region = native_callback_thunk_region_buckets[bucket]; region;
+         region = region->next)
+    {
+        if (region != candidate) continue;
+        ret = region->magic == SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_MAGIC &&
+              address >= (ULONG_PTR)region->base && address < (ULONG_PTR)region->end;
+        break;
+    }
+    RtlLeaveCriticalSection( &loader_section );
+    return ret;
 }
 
 static BYTE *alloc_native_callback_thunk_with_info(
@@ -6731,12 +7070,15 @@ static BYTE *alloc_native_callback_thunk_with_info(
 {
     struct switchyard_native_callback_thunk_info *info;
 
-    if (!(info = (void *)alloc_native_callback_thunk( sizeof(*info) + size ))) return NULL;
+    if (!(info = (void *)alloc_native_callback_thunk(
+              sizeof(*info) + size,
+              !!(flags & SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK) )))
+        return NULL;
     info->magic = SWITCHYARD_NATIVE_CALLBACK_THUNK_INFO_MAGIC;
     info->target = target;
     info->argc = argc;
     info->flags = flags;
-    info->reserved = 0;
+    info->cache_next = NULL;
     return (BYTE *)(info + 1);
 }
 
@@ -6862,7 +7204,7 @@ static void *create_pe_callback_thunk( void *func, unsigned int argc )
     SIZE_T size = 240;
 
     if (argc > SWITCHYARD_PE_CALLBACK_MAX_ARGS) return NULL;
-    if (!(code = alloc_native_callback_thunk( size ))) return NULL;
+    if (!(code = alloc_native_callback_thunk( size, FALSE ))) return NULL;
 
     p = code;
     memcpy( p, pe_callback_thunk_marker, sizeof(pe_callback_thunk_marker) );
@@ -7003,7 +7345,8 @@ static void *create_native_callback_args_thunk( void *func, unsigned int argc, U
     return code;
 }
 
-static void *create_native_callback_thunk( void *func, unsigned int argc, ULONG flags )
+static void *create_native_callback_thunk_uncached(
+    void *func, unsigned int argc, ULONG flags )
 {
     BYTE *code, *p;
     SIZE_T size = 64;
@@ -7051,6 +7394,48 @@ static void *create_native_callback_thunk( void *func, unsigned int argc, ULONG 
 
     *p++ = 0xc3;           /* ret */
     return code;
+}
+
+static unsigned int switchyard_native_callback_thunk_cache_hash(
+    void *func, unsigned int argc, ULONG flags )
+{
+    ULONG_PTR value = (ULONG_PTR)func >> 4;
+
+    value ^= (ULONG_PTR)argc << 5;
+    value ^= flags;
+    value ^= value >> 32;
+    return value % SWITCHYARD_NATIVE_CALLBACK_THUNK_CACHE_BUCKETS;
+}
+
+static void *create_native_callback_thunk( void *func, unsigned int argc, ULONG flags )
+{
+    struct switchyard_native_callback_thunk_info *info;
+    unsigned int hash;
+    void *implementation = NULL;
+
+    if (!func || argc > SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS) return NULL;
+    if (!(flags & SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK))
+        return create_native_callback_thunk_uncached( func, argc, flags );
+    hash = switchyard_native_callback_thunk_cache_hash( func, argc, flags );
+
+    RtlEnterCriticalSection( &loader_section );
+    for (info = native_callback_thunk_cache[hash]; info; info = info->cache_next)
+    {
+        if (info->target == func && info->argc == argc && info->flags == flags)
+        {
+            implementation = info + 1;
+            break;
+        }
+    }
+    if (!implementation &&
+        (implementation = create_native_callback_thunk_uncached( func, argc, flags )))
+    {
+        info = (struct switchyard_native_callback_thunk_info *)implementation - 1;
+        info->cache_next = native_callback_thunk_cache[hash];
+        native_callback_thunk_cache[hash] = info;
+    }
+    RtlLeaveCriticalSection( &loader_section );
+    return implementation;
 }
 
 static BOOL is_native_callback_target( void *func )

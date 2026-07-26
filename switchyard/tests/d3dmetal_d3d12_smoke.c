@@ -389,6 +389,7 @@ int main(int argc, char **argv)
     ID3D12GraphicsCommandList *command_list10 = NULL;
     ID3D12DescriptorHeap *descriptor_heap = NULL;
     ID3D12CommandAllocator *allocator = NULL;
+    ID3D12CommandQueue *second_queue = NULL;
     ID3D12CommandQueue *queue = NULL;
     ID3D12Pageable *pageable = NULL;
     ID3D12Resource *resource = NULL;
@@ -605,6 +606,36 @@ int main(int argc, char **argv)
     hr = ID3D12Device_CreateCommandQueue( device, &queue_desc,
                                           &IID_ID3D12CommandQueue, (void **)&queue );
     if (!check_result( "ID3D12Device::CreateCommandQueue", hr )) goto done;
+    hr = ID3D12Device_CreateCommandQueue( device, &queue_desc,
+                                          &IID_ID3D12CommandQueue,
+                                          (void **)&second_queue );
+    if (!check_result( "ID3D12Device::CreateCommandQueue (second)", hr ))
+        goto done;
+    if ((*(void ***)queue)[10] != (*(void ***)second_queue)[10] ||
+        (*(void ***)queue)[14] != (*(void ***)second_queue)[14])
+    {
+        fprintf( stderr,
+                 "D3D12 command queues did not share hookable "
+                 "ExecuteCommandLists/Signal entry points.\n" );
+        goto done;
+    }
+    if ((*(void ***)queue)[10] == (*(void ***)queue)[14])
+    {
+        fprintf( stderr,
+                 "D3D12 command queue methods incorrectly shared one "
+                 "hook entry point.\n" );
+        goto done;
+    }
+#ifdef _WIN64
+    if ((ULONG_PTR)(*(void ***)queue)[10] <= MAXDWORD ||
+        (ULONG_PTR)(*(void ***)queue)[14] <= MAXDWORD)
+    {
+        fprintf( stderr,
+                 "D3D12 command queue hook entry points were allocated "
+                 "in the fragmented low address range.\n" );
+        goto done;
+    }
+#endif
     returned_queue_desc = ID3D12CommandQueue_GetDesc( queue );
     if (returned_queue_desc.Type != queue_desc.Type ||
         returned_queue_desc.Priority != queue_desc.Priority)
@@ -857,6 +888,7 @@ done:
     if (allocator) ID3D12CommandAllocator_Release( allocator );
     if (pageable) ID3D12Pageable_Release( pageable );
     if (queue_device) ID3D12Device_Release( queue_device );
+    if (second_queue) ID3D12CommandQueue_Release( second_queue );
     if (queue) ID3D12CommandQueue_Release( queue );
     if (device) ID3D12Device_Release( device );
     if (base_device) ID3D12Device_Release( base_device );
