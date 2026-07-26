@@ -3588,6 +3588,8 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 
 static BYTE *native_callback_thunk_ptr;
 static BYTE *native_callback_thunk_end;
+static BYTE *native_callback_shared_thunk_ptr;
+static BYTE *native_callback_shared_thunk_end;
 #define SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_SIZE 0x10000
 #define SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_BUCKETS 256
 #define SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_MAGIC 0x53595754484e4b52ULL
@@ -7032,29 +7034,33 @@ static BOOL is_pe_callback_thunk( const void *ptr )
     return ret;
 }
 
-static BYTE *alloc_native_callback_thunk( SIZE_T size )
+static BYTE *alloc_native_callback_thunk( SIZE_T size, BOOL shared )
 {
     struct switchyard_native_callback_thunk_region *new_region;
+    BYTE **current_ptr = shared ? &native_callback_shared_thunk_ptr :
+                                 &native_callback_thunk_ptr;
+    BYTE **current_end = shared ? &native_callback_shared_thunk_end :
+                                 &native_callback_thunk_end;
     void *new_region_base = NULL;
     SIZE_T new_region_size = 0;
     BYTE *ret = NULL;
     SIZE_T aligned_size = (size + 15) & ~15;
 
     RtlEnterCriticalSection( &loader_section );
-    if (!native_callback_thunk_ptr ||
-        native_callback_thunk_ptr + aligned_size > native_callback_thunk_end)
+    if (!*current_ptr || *current_ptr + aligned_size > *current_end)
     {
         void *base = NULL;
         SIZE_T alloc_size = SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_SIZE;
+        ULONG allocation_type = MEM_RESERVE | MEM_COMMIT;
 
-        /*
-         * Keep callback thunks in the bottom-up low address range. GTA V
-         * Enhanced leaves D3D12 initialization pending when shared command
-         * queue entries are moved to a separate top-down allocation.
-         */
+        /* Shared entry points are intentionally hotpatchable by overlays and
+         * middleware.  Keep them out of the heavily fragmented low address
+         * range used by large games so x64 hook libraries can reserve a nearby
+         * relay page within their signed 32-bit branch window. */
+        if (shared) allocation_type |= MEM_TOP_DOWN;
 
         if (!NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &alloc_size,
-                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE ))
+                                      allocation_type, PAGE_EXECUTE_READWRITE ))
         {
             unsigned int bucket =
                 ((ULONG_PTR)base >> 16) % SWITCHYARD_NATIVE_CALLBACK_THUNK_REGION_BUCKETS;
@@ -7066,17 +7072,16 @@ static BYTE *alloc_native_callback_thunk( SIZE_T size )
                                ((sizeof(*new_region) + 15) & ~15);
             new_region->end = (BYTE *)base + alloc_size;
             native_callback_thunk_region_buckets[bucket] = new_region;
-            native_callback_thunk_ptr = new_region->base;
-            native_callback_thunk_end = (BYTE *)base + alloc_size;
+            *current_ptr = new_region->base;
+            *current_end = (BYTE *)base + alloc_size;
             new_region_base = base;
             new_region_size = alloc_size;
         }
     }
-    if (native_callback_thunk_ptr &&
-        native_callback_thunk_ptr + aligned_size <= native_callback_thunk_end)
+    if (*current_ptr && *current_ptr + aligned_size <= *current_end)
     {
-        ret = native_callback_thunk_ptr;
-        native_callback_thunk_ptr += aligned_size;
+        ret = *current_ptr;
+        *current_ptr += aligned_size;
     }
     RtlLeaveCriticalSection( &loader_section );
     if (new_region_base) register_native_callback_thunk_region( new_region_base, new_region_size );
@@ -7117,7 +7122,9 @@ static BYTE *alloc_native_callback_thunk_with_info(
 {
     struct switchyard_native_callback_thunk_info *info;
 
-    if (!(info = (void *)alloc_native_callback_thunk( sizeof(*info) + size )))
+    if (!(info = (void *)alloc_native_callback_thunk(
+              sizeof(*info) + size,
+              !!(flags & SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK) )))
         return NULL;
     info->magic = SWITCHYARD_NATIVE_CALLBACK_THUNK_INFO_MAGIC;
     info->target = target;
@@ -7249,7 +7256,7 @@ static void *create_pe_callback_thunk( void *func, unsigned int argc )
     SIZE_T size = 240;
 
     if (argc > SWITCHYARD_PE_CALLBACK_MAX_ARGS) return NULL;
-    if (!(code = alloc_native_callback_thunk( size ))) return NULL;
+    if (!(code = alloc_native_callback_thunk( size, FALSE ))) return NULL;
 
     p = code;
     memcpy( p, pe_callback_thunk_marker, sizeof(pe_callback_thunk_marker) );

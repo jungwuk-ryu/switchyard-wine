@@ -629,12 +629,12 @@ int main(int argc, char **argv)
     printf( "D3D12 command queue hook entries: %p, %p.\n",
             (*(void ***)queue)[10], (*(void ***)queue)[14] );
 #ifdef _WIN64
-    if ((ULONG_PTR)(*(void ***)queue)[10] > MAXDWORD ||
-        (ULONG_PTR)(*(void ***)queue)[14] > MAXDWORD)
+    if ((ULONG_PTR)(*(void ***)queue)[10] <= MAXDWORD ||
+        (ULONG_PTR)(*(void ***)queue)[14] <= MAXDWORD)
     {
         fprintf( stderr,
                  "D3D12 command queue hook entry points were allocated "
-                 "outside the low 32-bit compatibility range.\n" );
+                 "in the fragmented low address range.\n" );
         goto done;
     }
 #endif
