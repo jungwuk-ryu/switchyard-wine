@@ -1039,6 +1039,8 @@ static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     add_path_var( env, pos, size, "WINEHOMEDIR", home_dir );
     add_path_var( env, pos, size, "WINECONFIGDIR", config_dir );
     add_path_var( env, pos, size, "WINELOADER", wineloader );
+    add_path_var( env, pos, size, "SWITCHYARD_GPTK_DLL_NT_PATH",
+                  switchyard_gptk_dll_path );
     for (i = 0; dll_paths[i]; i++)
     {
         snprintf( str, sizeof(str), "WINEDLLDIR%u", i );

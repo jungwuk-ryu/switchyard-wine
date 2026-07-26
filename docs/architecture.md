@@ -20,6 +20,12 @@ The runtime carries an unmodified, hash-pinned Noto font baseline under the SIL 
 
 Apple Game Porting Toolkit components are outside both repositories. When a user selects a local GPTK installation, the runtime builder fingerprints and overlays the selected redistributable files into that user's local runtime. Those files are never downloaded, committed, or published here.
 
+## Runtime-selected GPTK graphics
+
+A redistributable Wine-only runtime can also use a GPTK 3 or GPTK 4 installation selected at launch time without copying Apple files into the runtime. `SWITCHYARD_GPTK_PATH` identifies that installation, while `WINEDLLPATH` remains available for Wine's ordinary external module search. The loader canonicalizes the selected GPTK directory and gives only its graphics modules (`d3d10`, `d3d11`, `dxgi`, and the vendor identity libraries) priority over the Wine copies built into the runtime. This prevents the runtime's compiled-in library directory from silently defeating the user's GPTK selection.
+
+Direct3D 12 keeps Switchyard's Wine-built Agility SDK proxy in front of the graphics backend. When that proxy requests `d3dmt.dll`, the loader maps the selected GPTK's original `d3d12.dll` and matching Unix module under the private `d3dmt` identity, including in a fresh prefix where no placeholder file exists. The canonical path check prevents an unrelated application-provided `d3d12.dll` from being mistaken for the selected backend. Chromium GPU subprocesses retain the Wine graphics fallback and take precedence over this selection.
+
 ## Selectable OpenGL driver
 
 The runtime keeps Wine's macOS OpenGL implementation as its default and also carries hash-pinned i386 and x86_64 Mesa llvmpipe DLLs. Setting `WINE_OPENGL_DRIVER=llvmpipe` on a container selects the software driver for its complete Windows process tree; leaving the variable unset, or setting it to `wine`, preserves Wine's built-in driver. The loader resolves the selected runtime DLL directory by architecture and does not inspect executable names, paths, versions, or vendors.

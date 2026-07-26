@@ -122,6 +122,7 @@ const char *data_dir = NULL;
 const char *build_dir = NULL;
 const char *config_dir = NULL;
 const char *wineloader = NULL;
+const char *switchyard_gptk_dll_path = NULL;
 const char **dll_paths = NULL;
 const char **system_dll_paths = NULL;
 const char *user_name = NULL;
@@ -294,8 +295,20 @@ static WORD get_alt_machine( WORD machine )
 
 static void set_dll_path(void)
 {
+    const char *gptk_path = getenv( "SWITCHYARD_GPTK_PATH" );
     char *p, *path = getenv( "WINEDLLPATH" );
     int i, count = 0;
+
+    if (gptk_path && *gptk_path)
+    {
+        char *candidate;
+
+        if (asprintf( &candidate, "%s/redist/lib/wine", gptk_path ) >= 0)
+        {
+            switchyard_gptk_dll_path = realpath( candidate, NULL );
+            free( candidate );
+        }
+    }
 
     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
 
@@ -312,6 +325,8 @@ static void set_dll_path(void)
     }
 
     for (i = 0; i < count; i++) dll_path_maxlen = max( dll_path_maxlen, strlen(dll_paths[i]) );
+    if (switchyard_gptk_dll_path)
+        dll_path_maxlen = max( dll_path_maxlen, strlen(switchyard_gptk_dll_path) );
     dll_paths[count] = NULL;
 }
 
@@ -1402,6 +1417,68 @@ static BOOL switchyard_is_graphics_dll( const char *name )
             || !strcmp( name, "dxgi.dll" );
 }
 
+static const char *switchyard_get_gptk_graphics_dll( const char *name )
+{
+    if (!strcmp( name, "atidxx64.dll" )
+            || !strcmp( name, "d3d10.dll" )
+            || !strcmp( name, "d3d11.dll" )
+            || !strcmp( name, "dxgi.dll" )
+            || !strcmp( name, "nvapi64.dll" )
+            || !strcmp( name, "nvngx-on-metalfx.dll" ))
+        return name;
+    return NULL;
+}
+
+static BOOL switchyard_nt_name_has_basename( const UNICODE_STRING *nt_name, const char *name )
+{
+    unsigned int i, name_len = strlen( name );
+    unsigned int len = nt_name->Length / sizeof(WCHAR);
+    const WCHAR *base;
+
+    if (len < name_len) return FALSE;
+    base = nt_name->Buffer + len - name_len;
+    if (base != nt_name->Buffer && base[-1] != '/' && base[-1] != '\\') return FALSE;
+
+    for (i = 0; i < name_len; ++i)
+    {
+        WCHAR ch = base[i];
+
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+        if (ch != (unsigned char)name[i]) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL switchyard_nt_name_is_selected_gptk_module( const UNICODE_STRING *nt_name,
+                                                        const char *arch_dir,
+                                                        const char *name )
+{
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING true_nt_name = {0};
+    char *canonical_name = NULL, *expected = NULL, *unix_name = NULL;
+    BOOL ret = FALSE;
+
+    if (!switchyard_gptk_dll_path) return FALSE;
+
+    InitializeObjectAttributes( &attr, (UNICODE_STRING *)nt_name, OBJ_CASE_INSENSITIVE, 0, 0 );
+    if (get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE ))
+        goto done;
+    if (asprintf( &expected, "%s%s/%s", switchyard_gptk_dll_path, arch_dir, name ) < 0)
+        goto done;
+    if (!(canonical_name = realpath( unix_name, NULL ))) goto done;
+    ret = !strcmp( canonical_name, expected );
+    if (ret)
+        TRACE( "Switchyard matched selected GPTK module path %s.\n",
+               debugstr_a(canonical_name) );
+
+done:
+    free( canonical_name );
+    free( expected );
+    free( unix_name );
+    free( true_nt_name.Buffer );
+    return ret;
+}
+
 static BOOL switchyard_should_use_wine_graphics_fallback( const char *name )
 {
     if (!switchyard_is_chromium_gpu_process())
@@ -1448,6 +1525,8 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
     const char *pe_dir = get_pe_dir( search_machine );
     const char *so_dir = get_so_dir( current_machine );
     const char *pe_build_dir = build_dir;
+    const char *switchyard_gptk_module;
+    BOOL switchyard_d3dmetal_alias;
     OBJECT_ATTRIBUTES attr;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     BOOL found_image = FALSE;
@@ -1498,6 +1577,10 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
 
     TRACE( "looking for %s for file %s\n", debugstr_a(file + pos + 1), debugstr_us(nt_name) );
     switchyard_use_graphics_fallback = switchyard_should_use_wine_graphics_fallback( file + pos + 1 );
+    switchyard_d3dmetal_alias = switchyard_nt_name_has_basename( nt_name, "d3dmt.dll" )
+            || (!strcmp( file + pos + 1, "d3d12.dll" )
+                && switchyard_nt_name_is_selected_gptk_module(
+                    nt_name, pe_dir, "d3d12.dll" ));
 
     if (build_dir)
     {
@@ -1522,6 +1605,45 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
         if (status != STATUS_DLL_NOT_FOUND) goto done;
     }
 
+    switchyard_gptk_module = switchyard_d3dmetal_alias
+            ? "d3d12.dll" : switchyard_get_gptk_graphics_dll( file + pos + 1 );
+    if (!switchyard_use_graphics_fallback && switchyard_gptk_dll_path
+            && switchyard_gptk_module)
+    {
+        const char *requested_name = file + pos + 1;
+        char original_name[sizeof("d3dmt.dll")];
+        BOOL renamed = strcmp( switchyard_gptk_module, requested_name );
+
+        if (renamed)
+        {
+            if (!switchyard_d3dmetal_alias || len >= sizeof(original_name)
+                    || len != strlen(switchyard_gptk_module))
+                goto skip_gptk_module;
+            memcpy( original_name, requested_name, len + 1 );
+            memcpy( file + pos + 1, switchyard_gptk_module, len );
+        }
+        ptr = file + pos;
+        ptr = prepend( ptr, pe_dir, strlen(pe_dir) );
+        ptr = prepend( ptr, switchyard_gptk_dll_path, strlen(switchyard_gptk_dll_path) );
+        status = open_builtin_pe_file( ptr, &attr, module, size_ptr, image_info,
+                                       limit_low, limit_high, load_machine, prefer_native, offset );
+        if (status != STATUS_DLL_NOT_FOUND)
+        {
+            if (!status)
+                TRACE( "Switchyard selected external GPTK module %s for %s from %s.\n",
+                       debugstr_a(switchyard_gptk_module),
+                       debugstr_a(switchyard_d3dmetal_alias ? "d3dmt.dll" : requested_name),
+                       debugstr_a(ptr) );
+            ptr = file + pos;
+            ptr = prepend( ptr, so_dir, strlen(so_dir) );
+            ptr = prepend( ptr, switchyard_gptk_dll_path, strlen(switchyard_gptk_dll_path) );
+            goto done;
+        }
+        if (renamed)
+            memcpy( file + pos + 1, original_name, len );
+    }
+
+skip_gptk_module:
     for (i = 0; dll_paths[i]; i++)
     {
         if (switchyard_use_graphics_fallback)

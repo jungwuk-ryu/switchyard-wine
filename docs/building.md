@@ -160,6 +160,20 @@ untouched. Developers investigating the HUD itself can explicitly restore the
 unsafe behavior with `SWITCHYARD_ALLOW_UNSAFE_METAL_HUD=1`; production
 containers should leave that override unset.
 
+For a Wine-only runtime using a GPTK selected at launch, verify both the D3D11
+native-callback path and the Agility-compatible D3D12/D3DMetal path from fresh
+prefixes. Run these commands once for each supported GPTK installation:
+
+```sh
+./switchyard/tests/native_callback_exception_test.sh \
+  ~/.switchyard/runtimes/<wine-only-runtime-id> "$GPTK_PATH"
+./switchyard/tests/d3dmetal_d3d12_smoke_test.sh \
+  ~/.switchyard/runtimes/<wine-only-runtime-id> "$GPTK_PATH"
+```
+
+The D3D12 test also starts a Chromium-style GPU probe and requires it to remain
+on the Wine graphics fallback.
+
 Verify that expected missing-file and missing-export probes remain available as
 trace diagnostics without being reported as warnings:
 

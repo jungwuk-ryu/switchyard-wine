@@ -3253,6 +3253,40 @@ static NTSTATUS switchyard_find_mesa_opengl_dll(
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS switchyard_find_gptk_d3dmetal_dll(
+    const WCHAR *libname, UNICODE_STRING *nt_name, WINE_MODREF **pwm,
+    HANDLE *mapping, SECTION_IMAGE_INFORMATION *image_info, struct file_id *id )
+{
+    UNICODE_STRING gptk_path;
+    NTSTATUS status;
+
+    if (contains_path( libname ) || wcsicmp( libname, L"d3dmt.dll" ))
+        return STATUS_DLL_NOT_FOUND;
+    if (get_env_var( L"SWITCHYARD_GPTK_DLL_NT_PATH",
+                     wcslen(pe_dir) + ARRAY_SIZE(L"d3d12.dll"), &gptk_path ))
+        return STATUS_DLL_NOT_FOUND;
+    if (!gptk_path.Length)
+    {
+        RtlFreeUnicodeString( &gptk_path );
+        return STATUS_DLL_NOT_FOUND;
+    }
+
+    RtlAppendUnicodeToString( &gptk_path, pe_dir );
+    RtlAppendUnicodeToString( &gptk_path, L"\\d3d12.dll" );
+    status = open_dll_file( &gptk_path, pwm, mapping, image_info, id );
+    if (status)
+    {
+        RtlFreeUnicodeString( &gptk_path );
+        return status;
+    }
+
+    TRACE( "redirected %s to selected GPTK module %s\n",
+           debugstr_w(libname), debugstr_us(&gptk_path) );
+    RtlFreeUnicodeString( &gptk_path );
+    build_sysdir_nt_name( libname, nt_name );
+    return STATUS_SUCCESS;
+}
+
 
 /***********************************************************************
  *	find_builtin_without_file
@@ -3400,6 +3434,11 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
     {
         status = switchyard_find_mesa_opengl_dll( libname, nt_name, pwm, mapping,
                                                   image_info, id );
+        if (!status) return status;
+        if (status != STATUS_DLL_NOT_FOUND) return status;
+
+        status = switchyard_find_gptk_d3dmetal_dll( libname, nt_name, pwm, mapping,
+                                                    image_info, id );
         if (!status) return status;
         if (status != STATUS_DLL_NOT_FOUND) return status;
 
