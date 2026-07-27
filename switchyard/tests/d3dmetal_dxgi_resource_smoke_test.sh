@@ -3,12 +3,28 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME="${1:-}"
-[ -n "$RUNTIME" ] || { echo "usage: $0 RUNTIME" >&2; exit 2; }
+GPTK_PATH="${2:-}"
+[ -n "$RUNTIME" ] || { echo "usage: $0 RUNTIME [GPTK_PATH]" >&2; exit 2; }
 [ -x "$RUNTIME/bin/switchyard-wine" ] || { echo "runtime launcher is missing" >&2; exit 1; }
-[ -f "$RUNTIME/lib/external/D3DMetal.framework/D3DMetal" ] || {
-  echo "runtime does not contain the D3DMetal overlay" >&2
-  exit 1
-}
+
+gptk_env=()
+if [ -n "$GPTK_PATH" ]; then
+  [ -f "$GPTK_PATH/redist/lib/external/D3DMetal.framework/D3DMetal" ] || {
+    echo "selected GPTK does not contain D3DMetal" >&2
+    exit 1
+  }
+  gptk_env=(
+    "WINEDLLPATH=$GPTK_PATH/redist/lib/wine"
+    "DYLD_FRAMEWORK_PATH=$GPTK_PATH/redist/lib/external"
+    "DYLD_LIBRARY_PATH=$GPTK_PATH/redist/lib/external"
+    "SWITCHYARD_GPTK_PATH=$GPTK_PATH"
+  )
+else
+  [ -f "$RUNTIME/lib/external/D3DMetal.framework/D3DMetal" ] || {
+    echo "runtime does not contain the D3DMetal overlay" >&2
+    exit 1
+  }
+fi
 command -v x86_64-w64-mingw32-gcc >/dev/null || {
   echo "x86_64-w64-mingw32-gcc is required" >&2
   exit 1
@@ -26,7 +42,7 @@ trap cleanup EXIT
 
 x86_64-w64-mingw32-gcc -o "$work/d3dmetal-dxgi-resource-smoke.exe" \
   "$ROOT_DIR/switchyard/tests/d3dmetal_dxgi_resource_smoke.c" -ld3d11 -ldxgi -luuid
-WINEPREFIX="$prefix" WINEDEBUG=-all \
+env "${gptk_env[@]}" WINEPREFIX="$prefix" WINEDEBUG=-all \
   "$RUNTIME/bin/switchyard-wine" "$work/d3dmetal-dxgi-resource-smoke.exe" &
 wine_pid=$!
 (

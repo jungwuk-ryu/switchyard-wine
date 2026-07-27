@@ -165,19 +165,28 @@ native-callback path and the Agility-compatible D3D12/D3DMetal path from fresh
 prefixes. Run these commands once for each supported GPTK installation:
 
 ```sh
+./switchyard/tests/gpu_capability_policy_test.sh
+./switchyard/tests/graphics_adapter_identity_test.sh \
+  ~/.switchyard/runtimes/<wine-only-runtime-id> "$GPTK_PATH"
 ./switchyard/tests/native_callback_exception_test.sh \
+  ~/.switchyard/runtimes/<wine-only-runtime-id> "$GPTK_PATH"
+./switchyard/tests/d3dmetal_dxgi_resource_smoke_test.sh \
   ~/.switchyard/runtimes/<wine-only-runtime-id> "$GPTK_PATH"
 ./switchyard/tests/d3dmetal_d3d12_smoke_test.sh \
   ~/.switchyard/runtimes/<wine-only-runtime-id> "$GPTK_PATH"
-./switchyard/tests/atiadl_process_scope_test.sh \
+./switchyard/tests/atiadl_provider_policy_test.sh \
+  ~/.switchyard/runtimes/<wine-only-runtime-id> "$GPTK_PATH"
+./switchyard/tests/amd_umd_loader_policy_test.sh \
   ~/.switchyard/runtimes/<wine-only-runtime-id> "$GPTK_PATH"
 ```
 
 The D3D12 test also starts a Chromium-style GPU probe and requires it to remain
-on the Wine graphics fallback. The ADL test verifies that GTA V Enhanced keeps
-the synthetic Radeon driver version required by its minimum-driver check while
-unrelated processes, including Overwatch, cannot select Radeon driver-private
-entry points through that compatibility shim.
+on the Wine graphics fallback. The identity test first verifies that the
+launcher leaves D3DMetal's provider-selected DXGI identity untouched, then
+verifies that a complete explicit diagnostic identity is applied coherently.
+The ADL and UMD tests verify that an incomplete Radeon driver contract remains
+unavailable independently of process name or provider-selected compatibility
+identity, while preserving an explicit native DLL override for diagnostics.
 
 Verify that expected missing-file and missing-export probes remain available as
 trace diagnostics without being reported as warnings:
@@ -202,3 +211,6 @@ callbacks from a fresh prefix with:
 ./switchyard/tests/d3dmetal_dxgi_resource_smoke_test.sh \
   ~/.switchyard/runtimes/<runtime-id>
 ```
+
+For a Wine-only runtime, pass the selected GPTK path as the second argument and
+run the same test once for every supported GPTK installation.

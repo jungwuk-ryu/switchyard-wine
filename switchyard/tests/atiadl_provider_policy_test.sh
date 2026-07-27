@@ -22,7 +22,7 @@ command -v x86_64-w64-mingw32-gcc >/dev/null || {
   exit 1
 }
 
-work="$(/usr/bin/mktemp -d /tmp/switchyard-atiadl-scope.XXXXXX)"
+work="$(/usr/bin/mktemp -d /tmp/switchyard-atiadl-provider.XXXXXX)"
 prefix="$work/prefix"
 gptk_env=(
   "WINEDLLPATH=$GPTK_PATH/redist/lib/wine"
@@ -51,24 +51,30 @@ run_case() {
   fi
 
   echo "[test] $label"
-  env -u SWITCHYARD_ADL_COMPAT "${gptk_env[@]}" "$@" WINEPREFIX="$prefix" WINEDEBUG=-all \
+  env "${gptk_env[@]}" "$@" WINEPREFIX="$prefix" WINEDEBUG=-all \
     WINEDLLOVERRIDES="atiadlxx=b" \
     "$RUNTIME/bin/switchyard-wine" "$work/$executable" "${probe_args[@]}"
 }
 
 x86_64-w64-mingw32-gcc -Wall -Wextra -Werror \
   -o "$work/atiadl_info_probe.exe" "$ROOT_DIR/switchyard/tests/atiadl_info_probe.c"
+x86_64-w64-mingw32-gcc -Wall -Wextra -Werror \
+  -o "$work/atiadl-native-provider-probe.exe" \
+  "$ROOT_DIR/switchyard/tests/atiadl_native_provider_probe.c"
+x86_64-w64-mingw32-gcc -Wall -Wextra -Werror -shared \
+  -o "$work/atiadlxx.dll" \
+  "$ROOT_DIR/switchyard/tests/atiadl_native_provider.c"
 cp "$work/atiadl_info_probe.exe" "$work/Overwatch.exe"
 cp "$work/atiadl_info_probe.exe" "$work/GTA5_Enhanced.exe"
 cp "$work/atiadl_info_probe.exe" "$work/PlayGTAV.exe"
 
-run_case "generic_process_is_unavailable" atiadl_info_probe.exe unavailable
-run_case "overwatch_is_unavailable" Overwatch.exe unavailable
-run_case "gta_enhanced_receives_compatibility_version" GTA5_Enhanced.exe ""
-run_case "gta_launcher_receives_compatibility_version" PlayGTAV.exe ""
-run_case "explicit_opt_in_receives_compatibility_version" atiadl_info_probe.exe "" \
-  SWITCHYARD_ADL_COMPAT=1
-run_case "explicit_opt_out_overrides_gta_allowlist" GTA5_Enhanced.exe unavailable \
-  SWITCHYARD_ADL_COMPAT=0
+echo "[test] native_provider_remains_preferred"
+env "${gptk_env[@]}" WINEPREFIX="$prefix" WINEDEBUG=-all \
+  "$RUNTIME/bin/switchyard-wine" "$work/atiadl-native-provider-probe.exe"
 
-echo "[test] atiadl process scope test passed"
+run_case "generic_process_is_unavailable" atiadl_info_probe.exe unavailable
+run_case "overwatch_name_does_not_change_provider_policy" Overwatch.exe unavailable
+run_case "gta_game_name_does_not_change_provider_policy" GTA5_Enhanced.exe unavailable
+run_case "gta_launcher_name_does_not_change_provider_policy" PlayGTAV.exe unavailable
+
+echo "[test] atiadl provider policy passed"

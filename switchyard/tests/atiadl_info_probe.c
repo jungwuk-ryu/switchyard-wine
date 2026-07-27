@@ -129,6 +129,12 @@ int main(int argc, char **argv)
     printf("ADL2_Main_Control_Create result: %d.\n", result);
     if (result)
     {
+        if (context)
+        {
+            fprintf(stderr, "ADL returned a context after failed initialization.\n");
+            FreeLibrary(module);
+            return 1;
+        }
         FreeLibrary(module);
         return argc == 3 && !strcmp(argv[2], "unavailable") ? 0 : 1;
     }

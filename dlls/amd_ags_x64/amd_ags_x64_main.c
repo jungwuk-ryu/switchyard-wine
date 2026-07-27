@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -29,6 +30,16 @@ WINE_DEFAULT_DEBUG_CHANNEL(amd_ags);
 
 static const char driver_version[] = "99.19.02-230831a-396538C-AMD-Software-Adrenalin-Edition";
 static const char radeon_version[] = "99.10.2";
+
+static BOOL amd_driver_extensions_available(void)
+{
+    const char *capability = getenv("SWITCHYARD_GPU_AMD_AGS_EXTENSIONS");
+    const char *backend = getenv("SWITCHYARD_GPU_BACKEND");
+
+    if (capability)
+        return !strcmp(capability, "1");
+    return !backend || strcmp(backend, "d3dmetal");
+}
 
 enum amd_ags_version
 {
@@ -1338,6 +1349,13 @@ AGSReturnCode WINAPI agsGetDriverVersionInfo(AGSContext *context, struct AGSDriv
 static void get_dx11_extensions_supported(ID3D11Device *device, AGSDX11ExtensionsSupported_600 *extensions)
 {
     ID3D11VkExtDevice *ext_device;
+
+    memset(extensions, 0, sizeof(*extensions));
+    if (!amd_driver_extensions_available())
+    {
+        TRACE("AMD D3D11 driver extensions are unavailable for the selected graphics backend.\n");
+        return;
+    }
 
     if (FAILED(ID3D11Device_QueryInterface(device, &IID_ID3D11VkExtDevice, (void **)&ext_device)))
     {

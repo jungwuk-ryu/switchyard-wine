@@ -179,6 +179,43 @@ static BOOL wcs_contains_ascii( const WCHAR *str, const char *ascii )
     return FALSE;
 }
 
+static BOOL wcs_equal_ascii( const WCHAR *str, const char *ascii )
+{
+    while (*str && *ascii)
+    {
+        WCHAR ch = *str++;
+        unsigned char expected = *ascii++;
+
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+        if (expected >= 'A' && expected <= 'Z') expected += 'a' - 'A';
+        if (ch != expected) return FALSE;
+    }
+    return !*str && !*ascii;
+}
+
+static BOOL is_amd_d3d_user_mode_driver( const WCHAR *module )
+{
+    return wcs_equal_ascii( module, "atidxx32" )
+            || wcs_equal_ascii( module, "atidxx64" );
+}
+
+static BOOL switchyard_blocks_amd_d3d_user_mode_driver(void)
+{
+    const char *capability = getenv( "SWITCHYARD_GPU_AMD_UMD" );
+    const char *backend = getenv( "SWITCHYARD_GPU_BACKEND" );
+    const char *gptk_path = getenv( "SWITCHYARD_GPTK_PATH" );
+
+    /*
+     * D3DMetal does not provide the Radeon kernel/UMD contract.  Also fail
+     * closed when an older caller selected GPTK without the launcher's
+     * capability descriptor.  Explicit DLL overrides are evaluated before
+     * this policy and remain available for diagnostics.
+     */
+    if (capability) return strcmp( capability, "1" ) != 0;
+    return (backend && !strcmp( backend, "d3dmetal" ))
+            || (gptk_path && *gptk_path);
+}
+
 /***************************************************************************
  *	remove_dll_ext
  *
@@ -568,7 +605,19 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
         /* module basename without '*' */
         if (((ret = get_load_order_value( std_key, app_key, basename )) != LO_INVALID))
             goto done;
+    }
 
+    if (is_amd_d3d_user_mode_driver( basename )
+            && switchyard_blocks_amd_d3d_user_mode_driver())
+    {
+        ret = LO_DISABLED;
+        TRACE( "disabled AMD D3D user-mode driver %s for the selected graphics backend\n",
+               debugstr_us(nt_name) );
+        goto done;
+    }
+
+    if (!is_system_dir)
+    {
         if (!wcsicmp( basename, amd_ags_x64W ))
         {
             /*

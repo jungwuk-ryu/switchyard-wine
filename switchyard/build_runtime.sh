@@ -1517,6 +1517,8 @@ runtime_is_complete_at() {
   [ -x "$prefix/bin/switchyard-wine" ] || return 1
   [ "$(readlink "$prefix/bin/switchyard-wine" 2>/dev/null || true)" = "wine" ] || return 1
   [ -f "$prefix/share/switchyard/metal_hud_safety.sh" ] || return 1
+  [ -f "$prefix/share/switchyard/gpu_capability_policy.sh" ] || return 1
+  [ -x "$prefix/libexec/switchyard-host-gpu-info" ] || return 1
   [ -x "$prefix/lib/wine/x86_64-unix/wine" ] || return 1
   [ -f "$prefix/lib/wine/i386-windows/ntdll.dll" ] || return 1
   [ -f "$prefix/lib/wine/x86_64-windows/ntdll.dll" ] || return 1
@@ -1855,6 +1857,15 @@ install -m 0644 "$ROOT_DIR/docs/provenance.md" "$wine_notice_root/PROVENANCE.md"
 mkdir -p "$WINE_INSTALL_PREFIX/share/switchyard"
 install -m 0644 "$ROOT_DIR/switchyard/lib/metal_hud_safety.sh" \
   "$WINE_INSTALL_PREFIX/share/switchyard/metal_hud_safety.sh"
+install -m 0644 "$ROOT_DIR/switchyard/lib/gpu_capability_policy.sh" \
+  "$WINE_INSTALL_PREFIX/share/switchyard/gpu_capability_policy.sh"
+mkdir -p "$WINE_INSTALL_PREFIX/libexec"
+echo "building the D3DMetal host GPU identity helper"
+arch -x86_64 clang -arch x86_64 -fobjc-arc -Wall -Wextra -Werror \
+  -mmacosx-version-min="$TLS_MIN_MACOS_VERSION" \
+  "$ROOT_DIR/switchyard/host_gpu_info.m" \
+  -framework Foundation -framework IOKit -framework Metal \
+  -o "$WINE_INSTALL_PREFIX/libexec/switchyard-host-gpu-info"
 cat >"$wine_notice_root/CORRESPONDING-SOURCE.txt" <<EOF
 Switchyard Wine runtime corresponding source
 
@@ -1903,6 +1914,7 @@ font_root="$runtime_dir/lib/switchyard-fonts"
 font_lib="$font_root/lib"
 mesa_gl_root="$runtime_dir/lib/switchyard-mesa"
 metal_hud_safety="$runtime_dir/share/switchyard/metal_hud_safety.sh"
+gpu_capability_policy="$runtime_dir/share/switchyard/gpu_capability_policy.sh"
 
 prepend_path() {
   local value="$1"
@@ -1935,6 +1947,13 @@ fi
 # shellcheck source=/dev/null
 source "$metal_hud_safety"
 switchyard_configure_metal_hud
+if [ ! -f "$gpu_capability_policy" ]; then
+  echo "Switchyard runtime is missing its D3DMetal GPU capability policy." >&2
+  exit 127
+fi
+# shellcheck source=/dev/null
+source "$gpu_capability_policy"
+switchyard_configure_d3dmetal_gpu "$runtime_dir"
 if [ -n "${VK_ICD_FILENAMES:-}" ]; then
   export SWITCHYARD_HOST_VK_ICD_FILENAMES="$VK_ICD_FILENAMES"
 fi

@@ -22,9 +22,32 @@ Apple Game Porting Toolkit components are outside both repositories. When a user
 
 ## Runtime-selected GPTK graphics
 
-A redistributable Wine-only runtime can also use a GPTK 3 or GPTK 4 installation selected at launch time without copying Apple files into the runtime. `SWITCHYARD_GPTK_PATH` identifies that installation, while `WINEDLLPATH` remains available for Wine's ordinary external module search. The loader canonicalizes the selected GPTK directory and gives only its graphics modules (`d3d10`, `d3d11`, `dxgi`, and the vendor identity libraries) priority over the Wine copies built into the runtime. This prevents the runtime's compiled-in library directory from silently defeating the user's GPTK selection.
+A redistributable Wine-only runtime can also use a GPTK 3 or GPTK 4 installation selected at launch time without copying Apple files into the runtime. `SWITCHYARD_GPTK_PATH` identifies that installation, while `WINEDLLPATH` remains available for Wine's ordinary external module search. The loader canonicalizes the selected GPTK directory and gives its public graphics modules priority over the Wine copies built into the runtime. This prevents the runtime's compiled-in library directory from silently defeating the user's GPTK selection.
 
 Direct3D 12 keeps Switchyard's Wine-built Agility SDK proxy in front of the graphics backend. When that proxy requests `d3dmt.dll`, the loader maps the selected GPTK's original `d3d12.dll` and matching Unix module under the private `d3dmt` identity, including in a fresh prefix where no placeholder file exists. The canonical path check prevents an unrelated application-provided `d3d12.dll` from being mistaken for the selected backend. Chromium GPU subprocesses retain the Wine graphics fallback and take precedence over this selection.
+
+Before Wine starts, a small native helper resolves Metal's system-default device
+to its IOKit registry entry. It reports the same vendor, device, subsystem,
+revision, and model information used by winemac. The launcher publishes that
+physical identity as observational metadata, but leaves D3DMetal's
+application-facing DXGI identity under provider control by default. This
+preserves the compatibility identity and feature-selection contract of the
+selected GPTK version. A manual `D3DM_*` identity override remains available
+for diagnostics, but it must provide the complete five-field tuple; partial
+overrides are rejected so the adapter description and numeric identity cannot
+silently disagree.
+
+Capabilities describe the selected graphics provider, not the executable.
+D3DMetal declares AMD ADL, AMD AGS driver extensions, and AMD D3D user-mode
+drivers unavailable independently of the DXGI compatibility identity selected
+by the provider. The builtin ADL module therefore fails initialization
+unless a real native ADL provider wins through Wine's native-preferred load
+order. AGS may still provide its standard cross-vendor device bridge, but it
+does not advertise AMD-private extensions. The loader blocks `atidxx` by
+default under D3DMetal, including stale application or prefix copies; an
+explicit Wine DLL override remains available for diagnostics. This policy
+does not inspect process names, import sets, call sequences, or application
+versions.
 
 ## Selectable OpenGL driver
 

@@ -19,9 +19,7 @@
  */
 
 #include <stdarg.h>
-#include <stdio.h>
 #include <string.h>
-#include <wchar.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -38,14 +36,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(atiadl);
 #define ADL_ERR_NOT_SUPPORTED         -8
 
 #define ADL_MAX_PATH 256
-
-/*
- * D3DMetal intentionally presents an AMD-compatible DXGI adapter. Radeon
- * software version checks use ADL separately, so expose the oldest baseline
- * currently required by that compatibility path instead of claiming support
- * for capabilities from an arbitrarily newer Radeon driver.
- */
-static const char compatibility_driver_version[] = "24.12.1";
 
 typedef void *(CALLBACK *adl_malloc_callback)(int size);
 
@@ -114,106 +104,24 @@ struct adl_context
 
 static struct adl_context *legacy_context;
 
-static BOOL is_switchyard_gptk_runtime(void)
-{
-    WCHAR *gptk_path = NULL, *wine_dll_path = NULL;
-    DWORD gptk_path_size, wine_dll_path_size;
-    BOOL ret = FALSE;
-
-    gptk_path_size = GetEnvironmentVariableW(L"SWITCHYARD_GPTK_PATH", NULL, 0);
-    wine_dll_path_size = GetEnvironmentVariableW(L"WINEDLLPATH", NULL, 0);
-    if (!gptk_path_size || !wine_dll_path_size)
-        return FALSE;
-
-    if (!(gptk_path = HeapAlloc(GetProcessHeap(), 0, gptk_path_size * sizeof(*gptk_path)))
-            || !(wine_dll_path = HeapAlloc(GetProcessHeap(), 0,
-                    wine_dll_path_size * sizeof(*wine_dll_path))))
-        goto done;
-
-    if (GetEnvironmentVariableW(L"SWITCHYARD_GPTK_PATH", gptk_path, gptk_path_size)
-                != gptk_path_size - 1
-            || GetEnvironmentVariableW(L"WINEDLLPATH", wine_dll_path, wine_dll_path_size)
-                != wine_dll_path_size - 1)
-        goto done;
-
-    /*
-     * ADL is queried while some applications are still constructing their
-     * first DXGI factory.  Calling back into DXGI here recursively initializes
-     * D3DMetal and can leave the application's graphics device unusable.
-     *
-     * Switchyard selects D3DMetal by putting the selected GPTK Wine directory
-     * first in WINEDLLPATH.  Use that already-established launch decision
-     * instead of touching any graphics API from the driver information shim.
-     */
-    ret = wcsstr(wine_dll_path, gptk_path)
-            && (wcsstr(wine_dll_path, L"/redist/lib/wine")
-                || wcsstr(wine_dll_path, L"\\redist\\lib\\wine"));
-
-done:
-    HeapFree(GetProcessHeap(), 0, wine_dll_path);
-    HeapFree(GetProcessHeap(), 0, gptk_path);
-    return ret;
-}
-
-static BOOL needs_compatibility_driver_version(void)
-{
-    WCHAR process_path[MAX_PATH], setting[2];
-    const WCHAR *process_name;
-    DWORD length;
-
-    /*
-     * This synthetic Radeon version exists for GTA V Enhanced's minimum
-     * driver check.  Advertising ADL to unrelated applications can make them
-     * select Radeon driver-private entry points which D3DMetal does not
-     * provide.  In particular, Overwatch then calls a missing atidxx64 entry
-     * point instead of using the ordinary D3D11 path.
-     *
-     * Keep an explicit opt-in for probes and future narrowly-scoped launch
-     * policy.  Any non-empty value other than "1" explicitly disables it.
-     */
-    length = GetEnvironmentVariableW(L"SWITCHYARD_ADL_COMPAT", setting, ARRAY_SIZE(setting));
-    if (length)
-        return length == 1 && setting[0] == L'1';
-
-    length = GetModuleFileNameW(NULL, process_path, ARRAY_SIZE(process_path));
-    if (!length || length >= ARRAY_SIZE(process_path))
-        return FALSE;
-
-    process_name = wcsrchr(process_path, L'\\');
-    process_name = process_name ? process_name + 1 : process_path;
-
-    return !lstrcmpiW(process_name, L"GTA5_Enhanced.exe")
-            || !lstrcmpiW(process_name, L"PlayGTAV.exe");
-}
-
 static int create_context(adl_malloc_callback callback, struct adl_context **context)
 {
-    struct adl_context *object;
-
     if (!callback || !context)
         return ADL_ERR_INVALID_PARAM;
 
     *context = NULL;
-    if (!is_switchyard_gptk_runtime())
-    {
-        TRACE("No Switchyard GPTK runtime was selected.\n");
-        return ADL_ERR;
-    }
-
-    if (!needs_compatibility_driver_version())
-    {
-        TRACE("Synthetic Radeon driver information is disabled for this process.\n");
-        return ADL_ERR;
-    }
-
-    if (!(object = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*object))))
-        return ADL_ERR;
-
-    object->malloc_callback = callback;
-    *context = object;
-
-    TRACE("Created version-information context %p without a physical AMD adapter.\n", object);
-    return ADL_OK;
+    /*
+     * This builtin is not an AMD display driver.  In particular, D3DMetal
+     * cannot provide the Radeon kernel service, ADL escape interface, and
+     * matching Windows user-mode driver that make an ADL context valid.
+     *
+     * Returning a synthetic driver version made applications select
+     * Radeon-private entry points based only on an emulated DXGI vendor ID.
+     * Keep ADL unavailable and let a real native ADL DLL win through the
+     * module's prefer-native load order when a complete AMD stack exists.
+     */
+    TRACE("No complete AMD ADL provider is available.\n");
+    return ADL_ERR;
 }
 
 static int destroy_context(struct adl_context *context)
@@ -221,23 +129,7 @@ static int destroy_context(struct adl_context *context)
     if (!context)
         return ADL_ERR_INVALID_PARAM;
 
-    HeapFree(GetProcessHeap(), 0, context);
-    return ADL_OK;
-}
-
-static void fill_versions_info(struct adl_versions_info *info)
-{
-    memset(info, 0, sizeof(*info));
-    strcpy(info->driver_version, compatibility_driver_version);
-    strcpy(info->catalyst_version, compatibility_driver_version);
-}
-
-static void fill_versions_info_x2(struct adl_versions_info_x2 *info)
-{
-    memset(info, 0, sizeof(*info));
-    strcpy(info->driver_version, compatibility_driver_version);
-    strcpy(info->catalyst_version, compatibility_driver_version);
-    strcpy(info->crimson_version, compatibility_driver_version);
+    return ADL_ERR_INVALID_PARAM;
 }
 
 int CDECL ADL2_Main_Control_Create(adl_malloc_callback callback, int enum_connected_adapters,
@@ -335,8 +227,8 @@ int CDECL ADL2_Graphics_Versions_Get(struct adl_context *context,
     if (!context || !info)
         return ADL_ERR_INVALID_PARAM;
 
-    fill_versions_info(info);
-    return ADL_OK;
+    memset(info, 0, sizeof(*info));
+    return ADL_ERR;
 }
 
 int CDECL ADL2_Graphics_VersionsX2_Get(struct adl_context *context,
@@ -347,8 +239,8 @@ int CDECL ADL2_Graphics_VersionsX2_Get(struct adl_context *context,
     if (!context || !info)
         return ADL_ERR_INVALID_PARAM;
 
-    fill_versions_info_x2(info);
-    return ADL_OK;
+    memset(info, 0, sizeof(*info));
+    return ADL_ERR;
 }
 
 int CDECL ADL_Main_Control_Create(adl_malloc_callback callback, int enum_connected_adapters)
@@ -401,8 +293,8 @@ int CDECL ADL_Graphics_Versions_Get(struct adl_versions_info *info)
     if (!legacy_context || !info)
         return ADL_ERR_INVALID_PARAM;
 
-    fill_versions_info(info);
-    return ADL_OK;
+    memset(info, 0, sizeof(*info));
+    return ADL_ERR;
 }
 
 int CDECL ADL_Graphics_VersionsX2_Get(struct adl_versions_info_x2 *info)
@@ -412,8 +304,8 @@ int CDECL ADL_Graphics_VersionsX2_Get(struct adl_versions_info_x2 *info)
     if (!legacy_context || !info)
         return ADL_ERR_INVALID_PARAM;
 
-    fill_versions_info_x2(info);
-    return ADL_OK;
+    memset(info, 0, sizeof(*info));
+    return ADL_ERR;
 }
 
 #define ADL_UNSUPPORTED(name) \
