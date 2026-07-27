@@ -155,6 +155,37 @@ done:
     return ret;
 }
 
+static BOOL needs_compatibility_driver_version(void)
+{
+    WCHAR process_path[MAX_PATH], setting[2];
+    const WCHAR *process_name;
+    DWORD length;
+
+    /*
+     * This synthetic Radeon version exists for GTA V Enhanced's minimum
+     * driver check.  Advertising ADL to unrelated applications can make them
+     * select Radeon driver-private entry points which D3DMetal does not
+     * provide.  In particular, Overwatch then calls a missing atidxx64 entry
+     * point instead of using the ordinary D3D11 path.
+     *
+     * Keep an explicit opt-in for probes and future narrowly-scoped launch
+     * policy.  Any non-empty value other than "1" explicitly disables it.
+     */
+    length = GetEnvironmentVariableW(L"SWITCHYARD_ADL_COMPAT", setting, ARRAY_SIZE(setting));
+    if (length)
+        return length == 1 && setting[0] == L'1';
+
+    length = GetModuleFileNameW(NULL, process_path, ARRAY_SIZE(process_path));
+    if (!length || length >= ARRAY_SIZE(process_path))
+        return FALSE;
+
+    process_name = wcsrchr(process_path, L'\\');
+    process_name = process_name ? process_name + 1 : process_path;
+
+    return !lstrcmpiW(process_name, L"GTA5_Enhanced.exe")
+            || !lstrcmpiW(process_name, L"PlayGTAV.exe");
+}
+
 static int create_context(adl_malloc_callback callback, struct adl_context **context)
 {
     struct adl_context *object;
@@ -163,15 +194,20 @@ static int create_context(adl_malloc_callback callback, struct adl_context **con
         return ADL_ERR_INVALID_PARAM;
 
     *context = NULL;
-    if (!(object = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*object))))
-        return ADL_ERR;
-
     if (!is_switchyard_gptk_runtime())
     {
         TRACE("No Switchyard GPTK runtime was selected.\n");
-        HeapFree(GetProcessHeap(), 0, object);
         return ADL_ERR;
     }
+
+    if (!needs_compatibility_driver_version())
+    {
+        TRACE("Synthetic Radeon driver information is disabled for this process.\n");
+        return ADL_ERR;
+    }
+
+    if (!(object = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*object))))
+        return ADL_ERR;
 
     object->malloc_callback = callback;
     *context = object;
