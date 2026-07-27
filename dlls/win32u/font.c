@@ -1507,6 +1507,16 @@ static void add_gdi_font_link_entry( struct gdi_font_link *link, const WCHAR *fa
 {
     struct gdi_font_link_entry *entry;
 
+    LIST_FOR_EACH_ENTRY( entry, &link->links, struct gdi_font_link_entry, entry )
+    {
+        if (facename_compare( entry->family_name, family_name, LF_FACESIZE - 1 )) continue;
+        entry->fs.fsCsb[0] |= fs.fsCsb[0];
+        entry->fs.fsCsb[1] |= fs.fsCsb[1];
+        link->fs.fsCsb[0] |= fs.fsCsb[0];
+        link->fs.fsCsb[1] |= fs.fsCsb[1];
+        return;
+    }
+
     entry = malloc( sizeof(*entry) );
     lstrcpynW( entry->family_name, family_name, LF_FACESIZE );
     entry->fs = fs;
@@ -1519,6 +1529,8 @@ static const WCHAR lucida_sans_unicodeW[] =
     {'L','u','c','i','d','a',' ','S','a','n','s',' ','U','n','i','c','o','d','e',0};
 static const WCHAR microsoft_sans_serifW[] =
     {'M','i','c','r','o','s','o','f','t',' ','S','a','n','s',' ','S','e','r','i','f',0};
+static const WCHAR noto_sansW[] =
+    {'N','o','t','o',' ','S','a','n','s',0};
 static const WCHAR tahomaW[] =
     {'T','a','h','o','m','a',0};
 static const WCHAR ms_gothicW[] =
@@ -1582,6 +1594,7 @@ static const WCHAR * const font_links_list[] =
 {
     lucida_sans_unicodeW,
     microsoft_sans_serifW,
+    noto_sansW,
     tahomaW
 };
 
@@ -1993,6 +2006,14 @@ default_system_link[] =
     },
     {
         lucida_sans_unicodeW, TRUE,
+        system_link_tahoma_non_cjk, sizeof(system_link_tahoma_non_cjk),
+        system_link_tahoma_sc,      sizeof(system_link_tahoma_sc),
+        system_link_tahoma_tc,      sizeof(system_link_tahoma_tc),
+        system_link_tahoma_jp,      sizeof(system_link_tahoma_jp),
+        system_link_tahoma_kr,      sizeof(system_link_tahoma_kr),
+    },
+    {
+        noto_sansW, TRUE,
         system_link_tahoma_non_cjk, sizeof(system_link_tahoma_non_cjk),
         system_link_tahoma_sc,      sizeof(system_link_tahoma_sc),
         system_link_tahoma_tc,      sizeof(system_link_tahoma_tc),
@@ -2809,15 +2830,72 @@ static void add_child_font( struct gdi_font *font, const WCHAR *family_name )
     TRACE( "created child font %p for base %p\n", child, font );
 }
 
-static void create_child_font_list( struct gdi_font *font )
+static struct gdi_font_link *find_gdi_font_link_from_subst( const WCHAR *name, int charset )
+{
+    struct
+    {
+        const WCHAR *name;
+        int charset;
+    } seen[16];
+    struct gdi_font_link *font_link;
+    unsigned int count = 0, i;
+    int next_charset;
+
+    while (name && count < ARRAY_SIZE(seen))
+    {
+        for (i = 0; i < count; i++)
+            if (seen[i].charset == charset && !facename_compare( seen[i].name, name, -1 )) return NULL;
+        seen[count].name = name;
+        seen[count++].charset = charset;
+
+        if ((font_link = find_gdi_font_link( name ))) return font_link;
+        next_charset = -1;
+        name = get_gdi_font_subst( name, charset, &next_charset );
+        if (next_charset != -1) charset = next_charset;
+    }
+    return NULL;
+}
+
+static struct gdi_font_link *find_gdi_font_link_for_font( const struct gdi_font *font,
+                                                          const WCHAR *physical_family_name )
+{
+    const WCHAR *family_name = (const WCHAR *)font->otm.otmpFamilyName;
+    const WCHAR *face_name = (const WCHAR *)font->otm.otmpFaceName;
+    struct gdi_font_link *font_link;
+
+    /* Keep face-specific links ahead of family links.  The family reported to
+     * applications may be a replacement alias, so fall back to the family of
+     * the face that was actually selected. */
+    if ((font_link = find_gdi_font_link( face_name ))) return font_link;
+    if ((font_link = find_gdi_font_link( family_name ))) return font_link;
+    if (font->lf.lfFaceName[0] && facename_compare( family_name, font->lf.lfFaceName, -1 ) &&
+        (font_link = find_gdi_font_link( font->lf.lfFaceName )))
+        return font_link;
+    if (facename_compare( family_name, physical_family_name, -1 ) &&
+        (font_link = find_gdi_font_link( physical_family_name )))
+        return font_link;
+
+    if ((font_link = find_gdi_font_link_from_subst( family_name, font->lf.lfCharSet )))
+        return font_link;
+    if (facename_compare( family_name, physical_family_name, -1 ) &&
+        (font_link = find_gdi_font_link_from_subst( physical_family_name, font->lf.lfCharSet )))
+        return font_link;
+    if (font->lf.lfFaceName[0] && facename_compare( family_name, font->lf.lfFaceName, -1 ) &&
+        facename_compare( physical_family_name, font->lf.lfFaceName, -1 ) &&
+        (font_link = find_gdi_font_link_from_subst( font->lf.lfFaceName, font->lf.lfCharSet )))
+        return font_link;
+    return NULL;
+}
+
+static void create_child_font_list( struct gdi_font *font, const WCHAR *physical_family_name )
 {
     struct gdi_font_link *font_link;
     struct gdi_font_link_entry *entry;
-    const WCHAR* font_name = (WCHAR *)font->otm.otmpFaceName;
+    const WCHAR *font_name = (WCHAR *)font->otm.otmpFaceName;
 
-    if ((font_link = find_gdi_font_link( font_name )))
+    if ((font_link = find_gdi_font_link_for_font( font, physical_family_name )))
     {
-        TRACE("found entry in system list\n");
+        TRACE( "found %s entry in system list\n", debugstr_w(font_link->name) );
         LIST_FOR_EACH_ENTRY( entry, &font_link->links, struct gdi_font_link_entry, entry )
             add_child_font( font, entry->family_name );
     }
@@ -4593,7 +4671,7 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
     if (face->flags & ADDFONT_VERTICAL_FONT) /* We need to try to load the GSUB table */
         font->vert_feature = get_GSUB_vert_feature( font );
 
-    create_child_font_list( font );
+    create_child_font_list( font, face->family->family_name );
 
     TRACE( "caching: gdiFont=%p\n", font );
     cache_gdi_font( font );
