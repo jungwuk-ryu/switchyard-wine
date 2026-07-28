@@ -15,7 +15,7 @@ fi
 
 upstream_base="$(tr -d '[:space:]' < "$UPSTREAM_BASE_FILE")"
 git -C "$ROOT_DIR" cat-file -e "${upstream_base}^{commit}" 2>/dev/null ||
-  fail "upstream base $upstream_base is unavailable; fetch at least 256 commits"
+  fail "upstream base $upstream_base is unavailable; fetch enough history to include it"
 git -C "$ROOT_DIR" merge-base --is-ancestor "$upstream_base" HEAD ||
   fail "HEAD is not descended from upstream base $upstream_base"
 

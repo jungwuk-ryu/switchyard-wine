@@ -18,6 +18,17 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 256
+      - name: Deepen source history through upstream base
+        shell: bash
+        run: |
+          upstream_base="$(tr -d '[:space:]' < switchyard/upstream-base.txt)"
+          while ! git merge-base --is-ancestor "$upstream_base" HEAD 2>/dev/null; do
+            if [ "$(git rev-parse --is-shallow-repository)" != "true" ]; then
+              echo "source history does not contain upstream base $upstream_base" >&2
+              exit 1
+            fi
+            git fetch --no-tags --deepen=256 origin "$GITHUB_REF"
+          done
       - name: Verify downstream history and source policy
         run: ./switchyard/verify_source.sh
       - name: Check runtime tooling syntax
