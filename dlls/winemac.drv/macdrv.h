@@ -116,6 +116,7 @@ struct macdrv_thread_data
     CGEventFlags                last_modifiers;
     UInt32                      dead_key_state;
     HKL                         active_keyboard_layout;
+    bool                        active_input_source_is_ime;
     WORD                        keyc2vkey[128];
     WORD                        keyc2scan[128];
 };
@@ -171,6 +172,7 @@ extern BOOL macdrv_RegisterHotKey(HWND hwnd, UINT mod_flags, UINT vkey);
 extern void macdrv_UnregisterHotKey(HWND hwnd, UINT modifiers, UINT vkey);
 extern SHORT macdrv_VkKeyScanEx(WCHAR wChar, HKL hkl);
 extern UINT macdrv_ImeToAsciiEx(UINT vkey, UINT vsc, const BYTE *state, HIMC himc);
+extern enum wine_ime_open_status macdrv_QueryHostIMEOpenStatus(HWND hwnd, HKL hkl);
 extern UINT macdrv_MapVirtualKeyEx(UINT wCode, UINT wMapType, HKL hkl);
 extern INT macdrv_ToUnicodeEx(UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
                               LPWSTR bufW, int bufW_size, UINT flags, HKL hkl);

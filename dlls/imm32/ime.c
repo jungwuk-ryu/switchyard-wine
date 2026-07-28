@@ -54,6 +54,13 @@ static BOOL is_ime_hkl( HKL hkl )
 
 struct ime_private
 {
+    enum
+    {
+        IME_PRIVATE_UNINITIALIZED,
+        IME_PRIVATE_INITIALIZING,
+        IME_PRIVATE_INITIALIZED,
+    } state;
+    BOOL host_open_status_managed;
     BOOL in_composition;
     HFONT hfont;
 };
@@ -512,23 +519,104 @@ BOOL WINAPI ImeDestroy( UINT force )
 
 BOOL WINAPI ImeSelect( HIMC himc, BOOL select )
 {
+    HIMCC private;
     struct ime_private *priv;
     INPUTCONTEXT *ctx;
+    enum wine_ime_open_status open_status = WINE_IME_OPEN_STATUS_CLOSED;
+    HKL hkl;
+    HWND hwnd;
+    BOOL managed = FALSE;
 
     TRACE( "himc %p, select %u\n", himc, select );
 
     if (!himc || !select) return TRUE;
     if (!(ctx = ImmLockIMC( himc ))) return FALSE;
 
-    ImmSetOpenStatus( himc, FALSE );
-
-    if ((priv = ImmLockIMCC( ctx->hPrivate )))
+    hwnd = ctx->hWnd;
+    hkl = GetKeyboardLayout( 0 );
+    private = ctx->hPrivate;
+    if (!(priv = ImmLockIMCC( private )))
     {
-        memset( priv, 0, sizeof(*priv) );
-        ImmUnlockIMCC( ctx->hPrivate );
+        ImmUnlockIMC( himc );
+        return FALSE;
     }
 
+    if (priv->state == IME_PRIVATE_INITIALIZED)
+    {
+        managed = priv->host_open_status_managed;
+        memset( priv, 0, sizeof(*priv) );
+        priv->state = IME_PRIVATE_INITIALIZED;
+        priv->host_open_status_managed = managed;
+        ImmUnlockIMCC( private );
+        ImmUnlockIMC( himc );
+        return TRUE;
+    }
+    if (priv->state == IME_PRIVATE_INITIALIZING)
+    {
+        ImmUnlockIMCC( private );
+        ImmUnlockIMC( himc );
+        return TRUE;
+    }
+    priv->state = IME_PRIVATE_INITIALIZING;
+
+    ImmUnlockIMCC( private );
     ImmUnlockIMC( himc );
+
+    if (is_ime_hkl( hkl ))
+    {
+        LRESULT result = NtUserMessageCall( hwnd, WINE_IME_QUERY_HOST_OPEN_STATUS, (WPARAM)hkl, 0, NULL,
+                                           NtUserImeDriverCall, FALSE );
+
+        if (result == WINE_IME_OPEN_STATUS_CLOSED || result == WINE_IME_OPEN_STATUS_OPEN)
+        {
+            open_status = result;
+            managed = TRUE;
+        }
+    }
+
+    if (!(ctx = ImmLockIMC( himc )))
+    {
+        if ((priv = ImmLockIMCC( private )))
+        {
+            if (priv->state == IME_PRIVATE_INITIALIZING)
+                priv->state = IME_PRIVATE_UNINITIALIZED;
+            ImmUnlockIMCC( private );
+        }
+        return FALSE;
+    }
+    if (GetKeyboardLayout( 0 ) != hkl || ctx->hPrivate != private)
+    {
+        ImmUnlockIMC( himc );
+        if ((priv = ImmLockIMCC( private )))
+        {
+            if (priv->state == IME_PRIVATE_INITIALIZING)
+                priv->state = IME_PRIVATE_UNINITIALIZED;
+            ImmUnlockIMCC( private );
+        }
+        return TRUE;
+    }
+    if (!(priv = ImmLockIMCC( private )))
+    {
+        ImmUnlockIMC( himc );
+        return FALSE;
+    }
+
+    if (priv->state == IME_PRIVATE_INITIALIZING)
+    {
+        memset( priv, 0, sizeof(*priv) );
+        priv->state = IME_PRIVATE_INITIALIZED;
+        priv->host_open_status_managed = managed;
+        if (managed)
+        {
+            ctx->fOpen = open_status == WINE_IME_OPEN_STATUS_OPEN;
+        }
+    }
+
+    ImmUnlockIMCC( private );
+    ImmUnlockIMC( himc );
+
+    TRACE( "initial open status %d, host managed %u\n", open_status, managed );
+    if (!managed) ImmSetOpenStatus( himc, FALSE );
     return TRUE;
 }
 
@@ -552,7 +640,9 @@ BOOL WINAPI ImeSetActiveContext( HIMC himc, BOOL flag )
 
 BOOL WINAPI ImeProcessKey( HIMC himc, UINT vkey, LPARAM lparam, BYTE *state )
 {
+    struct ime_private *priv;
     INPUTCONTEXT *ctx;
+    BOOL host_open_status_managed = FALSE;
     LRESULT ret;
 
     TRACE( "himc %p, vkey %#x, lparam %#Ix, state %p\n", himc, vkey, lparam, state );
@@ -560,7 +650,12 @@ BOOL WINAPI ImeProcessKey( HIMC himc, UINT vkey, LPARAM lparam, BYTE *state )
     if (!is_ime_hkl( GetKeyboardLayout( 0 ) )) return FALSE;
 
     if (!(ctx = ImmLockIMC( himc ))) return FALSE;
-    ret = TRUE; /* TODO: should be ctx->fOpen */
+    if ((priv = ImmLockIMCC( ctx->hPrivate )))
+    {
+        host_open_status_managed = priv->host_open_status_managed;
+        ImmUnlockIMCC( ctx->hPrivate );
+    }
+    ret = !host_open_status_managed || ctx->fOpen;
     switch (LOWORD(vkey))
     {
         case VK_SHIFT:

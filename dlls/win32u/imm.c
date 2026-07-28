@@ -662,6 +662,8 @@ LRESULT ime_driver_call( HWND hwnd, enum wine_ime_call call, WPARAM wparam, LPAR
 
     switch (call)
     {
+    case WINE_IME_QUERY_HOST_OPEN_STATUS:
+        return user_driver->pQueryHostIMEOpenStatus( hwnd, (HKL)wparam );
     case WINE_IME_TO_ASCII_EX:
         if (params->state)
         {

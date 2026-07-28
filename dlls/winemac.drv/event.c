@@ -305,6 +305,35 @@ BOOL macdrv_SetIMECompositionRect(HWND hwnd, RECT rect)
 
 
 /***********************************************************************
+ *      QueryHostIMEOpenStatus (MACDRV.@)
+ */
+enum wine_ime_open_status macdrv_QueryHostIMEOpenStatus( HWND hwnd, HKL hkl )
+{
+    struct macdrv_thread_data *thread_data = macdrv_thread_data();
+    TISInputSourceRef input_source;
+    bool is_ime;
+    HKL current_hkl;
+
+    (void)hwnd;
+    if (thread_data && thread_data->active_keyboard_layout == hkl)
+        return thread_data->active_input_source_is_ime ? WINE_IME_OPEN_STATUS_OPEN
+                                                       : WINE_IME_OPEN_STATUS_CLOSED;
+
+    if (!(input_source = macdrv_copy_current_input_source( &is_ime )))
+        return WINE_IME_OPEN_STATUS_UNKNOWN;
+
+    current_hkl = macdrv_get_hkl_from_source( input_source );
+    CFRelease( input_source );
+    if (!current_hkl || current_hkl != hkl)
+    {
+        TRACE_(imm)( "host input source HKL %p does not match expected HKL %p\n", current_hkl, hkl );
+        return WINE_IME_OPEN_STATUS_UNKNOWN;
+    }
+
+    return is_ime ? WINE_IME_OPEN_STATUS_OPEN : WINE_IME_OPEN_STATUS_CLOSED;
+}
+
+/***********************************************************************
  *      NotifyIMEStatus (MACDRV.@)
  */
 void macdrv_NotifyIMEStatus( HWND hwnd, UINT status )

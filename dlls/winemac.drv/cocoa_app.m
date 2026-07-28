@@ -95,6 +95,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
 @end
 
 
+static BOOL InputSourceIsInputMethod(TISInputSourceRef inputSource);
+
 @interface WineApplicationController ()
 
 @property (readwrite, copy, nonatomic) NSEvent* lastFlagsChanged;
@@ -721,6 +723,7 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
                 event->keyboard_changed.keyboard_type = self.keyboardType;
                 event->keyboard_changed.iso_keyboard = (KBGetLayoutType(self.keyboardType) == kKeyboardISO);
                 event->keyboard_changed.uchr = CFDataCreateCopy(NULL, uchr);
+                event->keyboard_changed.input_source_is_ime = InputSourceIsInputMethod(inputSource);
                 event->keyboard_changed.input_source = (TISInputSourceRef)CFRetain(inputSource);
 
                 if (event->keyboard_changed.uchr)
@@ -2274,6 +2277,7 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
         };
 
         CFStringRef sourceID = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceID);
+        if (!sourceID) return NO;
         for (int i = 0; i < sizeof(ignoredIDs) / sizeof(CFStringRef); i++)
         {
             if (CFEqual(sourceID, ignoredIDs[i]))
@@ -2281,6 +2285,15 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
         }
 
         return NO;
+    }
+
+    static BOOL InputSourceIsInputMethod(TISInputSourceRef inputSource)
+    {
+        CFStringRef type;
+
+        if (!inputSource || InputSourceShouldBeIgnored(inputSource)) return NO;
+        type = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceType);
+        return type && !CFEqual(type, kTISTypeKeyboardLayout);
     }
 
     - (BOOL) inputSourceIsInputMethod
@@ -2310,7 +2323,7 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
 
             /* kTISTypeKeyboardLayout is for physical keyboards. Any type other
                than that is an IME. */
-            if (!CFEqual(type, kTISTypeKeyboardLayout) && !InputSourceShouldBeIgnored(source))
+            if (type && !CFEqual(type, kTISTypeKeyboardLayout) && !InputSourceShouldBeIgnored(source))
             {
                 ret = YES;
                 break;
@@ -2622,8 +2635,12 @@ void macdrv_window_rejected_focus(const macdrv_event *event)
  *
  * Returns the keyboard layout uchr data, keyboard type and input source.
  */
-void macdrv_get_input_source_info(CFDataRef* uchr, CGEventSourceKeyboardType* keyboard_type, bool* is_iso, TISInputSourceRef* input_source)
+void macdrv_get_input_source_info(CFDataRef* uchr, CGEventSourceKeyboardType* keyboard_type, bool* is_iso,
+                                  TISInputSourceRef* input_source, bool* input_source_is_ime)
 {
+    if (input_source) *input_source = NULL;
+    if (input_source_is_ime) *input_source_is_ime = false;
+
     OnMainThread(^{
         TISInputSourceRef inputSourceLayout;
 
@@ -2637,8 +2654,15 @@ void macdrv_get_input_source_info(CFDataRef* uchr, CGEventSourceKeyboardType* ke
 
             *keyboard_type = [WineApplicationController sharedController].keyboardType;
             *is_iso = (KBGetLayoutType(*keyboard_type) == kKeyboardISO);
-            if (input_source)
-                *input_source = TISCopyCurrentKeyboardInputSource();
+            if (input_source || input_source_is_ime)
+            {
+                TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+
+                if (input_source_is_ime)
+                    *input_source_is_ime = InputSourceIsInputMethod(source);
+                if (input_source) *input_source = source;
+                else if (source) CFRelease(source);
+            }
         }
     });
 }
@@ -2849,16 +2873,19 @@ void macdrv_quit_reply(int reply)
 }
 
 /***********************************************************************
- *              macdrv_using_input_method
+ *              macdrv_copy_current_input_source
  */
-bool macdrv_using_input_method(void)
+TISInputSourceRef macdrv_copy_current_input_source(bool *is_ime)
 {
-    __block bool ret;
+    __block TISInputSourceRef ret = NULL;
+    __block bool input_method = false;
 
     OnMainThread(^{
-        ret = [[WineApplicationController sharedController] inputSourceIsInputMethod];
+        ret = TISCopyCurrentKeyboardInputSource();
+        input_method = InputSourceIsInputMethod(ret);
     });
 
+    if (is_ime) *is_ime = input_method;
     return ret;
 }
 
@@ -2925,14 +2952,17 @@ CFArrayRef macdrv_create_input_source_list(void)
     return ret;
 }
 
-bool macdrv_select_input_source(TISInputSourceRef input_source)
+bool macdrv_select_input_source(TISInputSourceRef input_source, bool* input_source_is_ime)
 {
     __block bool ret = false;
+    __block bool input_method = false;
 
     OnMainThread(^{
+        input_method = InputSourceIsInputMethod(input_source);
         ret = (TISSelectInputSource(input_source) == noErr);
     });
 
+    if (input_source_is_ime) *input_source_is_ime = input_method;
     return ret;
 }
 

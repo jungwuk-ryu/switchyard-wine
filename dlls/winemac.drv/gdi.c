@@ -279,6 +279,7 @@ static const struct user_driver_funcs macdrv_funcs =
     .pUpdateLayeredWindow = macdrv_UpdateLayeredWindow,
     .pVkKeyScanEx = macdrv_VkKeyScanEx,
     .pImeToAsciiEx = macdrv_ImeToAsciiEx,
+    .pQueryHostIMEOpenStatus = macdrv_QueryHostIMEOpenStatus,
     .pNotifyIMEStatus = macdrv_NotifyIMEStatus,
     .pSetIMECompositionRect = macdrv_SetIMECompositionRect,
     .pWindowMessage = macdrv_WindowMessage,

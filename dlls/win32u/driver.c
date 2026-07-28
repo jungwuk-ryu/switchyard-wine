@@ -675,6 +675,11 @@ static UINT nulldrv_ImeToAsciiEx( UINT vkey, UINT vsc, const BYTE *state, HIMC h
     return STATUS_NOT_IMPLEMENTED;
 }
 
+static enum wine_ime_open_status nulldrv_QueryHostIMEOpenStatus( HWND hwnd, HKL hkl )
+{
+    return WINE_IME_OPEN_STATUS_UNKNOWN;
+}
+
 static void nulldrv_NotifyIMEStatus( HWND hwnd, UINT status )
 {
 }
@@ -1131,6 +1136,11 @@ static UINT loaderdrv_ImeToAsciiEx( UINT vkey, UINT vsc,const BYTE *state, HIMC 
     return load_driver()->pImeToAsciiEx( vkey, vsc, state, himc );
 }
 
+static enum wine_ime_open_status loaderdrv_QueryHostIMEOpenStatus( HWND hwnd, HKL hkl )
+{
+    return load_driver()->pQueryHostIMEOpenStatus( hwnd, hkl );
+}
+
 static void loaderdrv_NotifyIMEStatus( HWND hwnd, UINT status )
 {
     return load_driver()->pNotifyIMEStatus( hwnd, status );
@@ -1284,6 +1294,7 @@ static const struct user_driver_funcs lazy_load_driver =
     loaderdrv_KbdLayerDescriptor,
     loaderdrv_ReleaseKbdTables,
     loaderdrv_ImeToAsciiEx,
+    loaderdrv_QueryHostIMEOpenStatus,
     loaderdrv_NotifyIMEStatus,
     loaderdrv_SetIMECompositionRect,
     /* cursor/icon functions */
@@ -1389,6 +1400,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(KbdLayerDescriptor);
     SET_USER_FUNC(ReleaseKbdTables);
     SET_USER_FUNC(ImeToAsciiEx);
+    SET_USER_FUNC(QueryHostIMEOpenStatus);
     SET_USER_FUNC(NotifyIMEStatus);
     SET_USER_FUNC(SetIMECompositionRect);
     SET_USER_FUNC(DestroyCursorIcon);

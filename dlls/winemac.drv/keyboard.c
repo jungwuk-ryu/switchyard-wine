@@ -1040,11 +1040,14 @@ void macdrv_keyboard_changed(const macdrv_event *event)
     thread_data->keyboard_type = event->keyboard_changed.keyboard_type;
     thread_data->iso_keyboard = event->keyboard_changed.iso_keyboard;
     thread_data->active_keyboard_layout = macdrv_get_hkl_from_source(event->keyboard_changed.input_source);
+    thread_data->active_input_source_is_ime = event->keyboard_changed.input_source_is_ime;
     thread_data->dead_key_state = 0;
 
     macdrv_compute_keyboard_layout(thread_data);
 
     NtUserActivateKeyboardLayout(thread_data->active_keyboard_layout, 0);
+    NtUserPostMessage( NULL, WM_WINE_IME_NOTIFY, IMN_WINE_SET_OPEN_STATUS,
+                       thread_data->active_input_source_is_ime );
 
     send_message(get_active_window(), WM_CANCELMODE, 0, 0);
 }
@@ -1289,13 +1292,12 @@ UINT macdrv_ImeToAsciiEx(UINT vkey, UINT vsc, const BYTE *state, HIMC himc)
  */
 BOOL macdrv_ActivateKeyboardLayout(HKL hkl, UINT flags)
 {
+    bool input_source_is_ime;
     BOOL ret = FALSE;
     struct macdrv_thread_data *thread_data = macdrv_init_thread_data();
     struct layout *layout;
 
     TRACE("hkl %p flags %04x\n", hkl, flags);
-
-    NtUserPostMessage( NULL, WM_WINE_IME_NOTIFY, IMN_WINE_SET_OPEN_STATUS, is_ime_hkl(hkl) );
 
     if (hkl == thread_data->active_keyboard_layout)
         return TRUE;
@@ -1305,20 +1307,23 @@ BOOL macdrv_ActivateKeyboardLayout(HKL hkl, UINT flags)
 
     LIST_FOR_EACH_ENTRY(layout, &layout_list, struct layout, entry)
     {
-        if (HIWORD(hkl) == layout->layout_id ? layout->layout_id : layout->lang)
+        if (HIWORD(hkl) == (layout->layout_id ? layout->layout_id : layout->lang))
         {
-            if (macdrv_select_input_source(layout->input_source))
+            if (macdrv_select_input_source(layout->input_source, &input_source_is_ime))
             {
                 ret = TRUE;
                 if (thread_data->keyboard_layout_uchr)
                     CFRelease(thread_data->keyboard_layout_uchr);
 
                 macdrv_get_input_source_info(&thread_data->keyboard_layout_uchr, &thread_data->keyboard_type,
-                                             &thread_data->iso_keyboard, NULL);
+                                             &thread_data->iso_keyboard, NULL, NULL);
                 thread_data->active_keyboard_layout = hkl;
+                thread_data->active_input_source_is_ime = input_source_is_ime;
                 thread_data->dead_key_state = 0;
 
                 macdrv_compute_keyboard_layout(thread_data);
+                NtUserPostMessage( NULL, WM_WINE_IME_NOTIFY, IMN_WINE_SET_OPEN_STATUS,
+                                   input_source_is_ime );
             }
             break;
         }

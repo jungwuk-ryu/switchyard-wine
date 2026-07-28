@@ -212,7 +212,7 @@ extern void macdrv_window_rejected_focus(const struct macdrv_event *event);
 extern void macdrv_beep(void);
 extern void macdrv_set_application_icon(CFArrayRef images);
 extern void macdrv_quit_reply(int reply);
-extern bool macdrv_using_input_method(void);
+extern TISInputSourceRef macdrv_copy_current_input_source(bool *is_ime);
 extern void macdrv_set_mouse_capture_window(macdrv_window window);
 extern void macdrv_set_cocoa_retina_mode(bool new_mode);
 
@@ -361,6 +361,7 @@ typedef struct macdrv_event {
             CFDataRef                   uchr;
             CGEventSourceKeyboardType   keyboard_type;
             bool                        iso_keyboard;
+            bool                        input_source_is_ime;
             TISInputSourceRef           input_source;
         }                                           keyboard_changed;
         struct {
@@ -587,9 +588,9 @@ extern bool macdrv_is_any_wine_window_visible(void);
 
 /* keyboard */
 extern void macdrv_get_input_source_info(CFDataRef* uchr,CGEventSourceKeyboardType* keyboard_type, bool* is_iso,
-                                         TISInputSourceRef* input_source);
+                                         TISInputSourceRef* input_source, bool* input_source_is_ime);
 extern CFArrayRef macdrv_create_input_source_list(void);
-extern bool macdrv_select_input_source(TISInputSourceRef input_source);
+extern bool macdrv_select_input_source(TISInputSourceRef input_source, bool* input_source_is_ime);
 extern const CFStringRef macdrv_input_source_input_key;
 extern const CFStringRef macdrv_input_source_type_key;
 extern const CFStringRef macdrv_input_source_lang_key;

@@ -520,6 +520,7 @@ struct macdrv_thread_data *macdrv_init_thread_data(void)
 {
     struct macdrv_thread_data *data = macdrv_thread_data();
     TISInputSourceRef input_source;
+    bool input_source_is_ime;
 
     if (data) return data;
 
@@ -535,8 +536,10 @@ struct macdrv_thread_data *macdrv_init_thread_data(void)
         NtTerminateProcess(0, 1);
     }
 
-    macdrv_get_input_source_info(&data->keyboard_layout_uchr, &data->keyboard_type, &data->iso_keyboard, &input_source);
+    macdrv_get_input_source_info(&data->keyboard_layout_uchr, &data->keyboard_type, &data->iso_keyboard,
+                                 &input_source, &input_source_is_ime);
     data->active_keyboard_layout = macdrv_get_hkl_from_source(input_source);
+    data->active_input_source_is_ime = input_source_is_ime;
     CFRelease(input_source);
     macdrv_compute_keyboard_layout(data);
 

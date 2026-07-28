@@ -665,6 +665,14 @@ enum wine_ime_call
 {
     WINE_IME_TO_ASCII_EX,
     WINE_IME_POST_UPDATE,  /* for the user drivers */
+    WINE_IME_QUERY_HOST_OPEN_STATUS,
+};
+
+enum wine_ime_open_status
+{
+    WINE_IME_OPEN_STATUS_UNKNOWN = -1,
+    WINE_IME_OPEN_STATUS_CLOSED,
+    WINE_IME_OPEN_STATUS_OPEN,
 };
 
 /* NtUserImeDriverCall params */
