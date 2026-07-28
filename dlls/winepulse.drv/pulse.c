@@ -1142,6 +1142,16 @@ static NTSTATUS pulse_create_stream(void *args)
     HRESULT hr;
     char *name;
 
+    /* mmdevapi spatial streams use a private dry-object transport channel.
+     * Do not expose that channel as a physical speaker on backends which do
+     * not implement the corresponding bed/dry split. */
+    if (params->spatial)
+    {
+        WARN("Spatial audio transport is not supported by the PulseAudio backend.\n");
+        params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
+        return STATUS_SUCCESS;
+    }
+
     if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE) {
         params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
         return STATUS_SUCCESS;
@@ -2619,6 +2629,8 @@ static NTSTATUS pulse_wow64_create_stream(void *args)
         EDataFlow flow;
         AUDCLNT_SHAREMODE share;
         DWORD flags;
+        BOOL spatial;
+        UINT32 spatial_static_mask;
         REFERENCE_TIME duration;
         REFERENCE_TIME period;
         PTR32 fmt;
@@ -2633,6 +2645,8 @@ static NTSTATUS pulse_wow64_create_stream(void *args)
         .flow = params32->flow,
         .share = params32->share,
         .flags = params32->flags,
+        .spatial = params32->spatial,
+        .spatial_static_mask = params32->spatial_static_mask,
         .duration = params32->duration,
         .period = params32->period,
         .fmt = ULongToPtr(params32->fmt),

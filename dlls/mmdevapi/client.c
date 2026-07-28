@@ -377,7 +377,8 @@ HRESULT validate_fmt(const WAVEFORMATEXTENSIBLE *fmt, BOOL compatible)
 static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_period,
                            const AUDCLNT_SHAREMODE mode, const DWORD flags,
                            REFERENCE_TIME duration, REFERENCE_TIME period,
-                           const WAVEFORMATEX *fmt, const GUID *sessionguid)
+                           const WAVEFORMATEX *fmt, const GUID *sessionguid,
+                           BOOL spatial, UINT32 spatial_static_mask)
 {
     struct create_stream_params params;
     UINT32 i, channel_count;
@@ -490,6 +491,8 @@ static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_
     params.flow          = client->dataflow;
     params.share         = mode;
     params.flags         = flags;
+    params.spatial       = spatial;
+    params.spatial_static_mask = spatial_static_mask;
     params.duration      = duration;
     params.period        = period;
     params.fmt           = fmt;
@@ -724,7 +727,8 @@ static HRESULT WINAPI client_Initialize(IAudioClient3 *iface, AUDCLNT_SHAREMODE 
                                                wine_dbgstr_longlong(period), fmt,
                                                debugstr_guid(sessionguid));
 
-    return stream_init(This, TRUE, mode, flags, duration, period, fmt, sessionguid);
+    return stream_init(This, TRUE, mode, flags, duration, period, fmt, sessionguid,
+            FALSE, 0);
 }
 
 static HRESULT WINAPI client_GetBufferSize(IAudioClient3 *iface, UINT32 *out)
@@ -1171,7 +1175,21 @@ static HRESULT WINAPI client_InitializeSharedAudioStream(IAudioClient3 *iface, D
 
     period = period_frames * (REFERENCE_TIME)10000000 / format->nSamplesPerSec;
 
-    return stream_init(This, FALSE, AUDCLNT_SHAREMODE_SHARED, flags, 0, period, format, session_guid);
+    return stream_init(This, FALSE, AUDCLNT_SHAREMODE_SHARED, flags, 0, period, format,
+            session_guid, FALSE, 0);
+}
+
+HRESULT audio_client_initialize_spatial(IAudioClient *iface, DWORD flags,
+        REFERENCE_TIME duration, REFERENCE_TIME period, const WAVEFORMATEX *format,
+        const GUID *session_guid, AudioObjectType static_object_mask)
+{
+    struct audio_client *client = impl_from_IAudioClient3((IAudioClient3 *)iface);
+
+    if (client->dataflow != eRender)
+        return E_INVALIDARG;
+
+    return stream_init(client, TRUE, AUDCLNT_SHAREMODE_SHARED, flags, duration, period,
+            format, session_guid, TRUE, static_object_mask);
 }
 
 const IAudioClient3Vtbl AudioClient3_Vtbl =

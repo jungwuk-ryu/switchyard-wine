@@ -19,6 +19,7 @@
 
 #include "audioclient.h"
 #include "mmdeviceapi.h"
+#include "spatialaudioclient.h"
 
 #ifdef WINE_UNIX_LIB
 /* helper to create a thread on the Unix side */
@@ -40,6 +41,34 @@ static inline NTSTATUS create_unix_thread( HANDLE *handle, const WCHAR *name,
 #endif
 
 typedef UINT64 stream_handle;
+
+/*
+ * Spatial streams use a WAVEFORMATEXTENSIBLE transport between mmdevapi and
+ * the Unix audio backend. AudioObjectType has four bottom speakers which do
+ * not have WAVE speaker-mask equivalents, so give them otherwise-unused WAVE
+ * slots. These values are private transport identifiers; backends must not
+ * expose their normal WAVE meanings to a device.
+ */
+#define SPATIAL_AUDIO_BOTTOM_FRONT_LEFT_SPEAKER  SPEAKER_FRONT_LEFT_OF_CENTER
+#define SPATIAL_AUDIO_BOTTOM_FRONT_RIGHT_SPEAKER SPEAKER_FRONT_RIGHT_OF_CENTER
+#define SPATIAL_AUDIO_BOTTOM_BACK_LEFT_SPEAKER   SPEAKER_TOP_FRONT_CENTER
+#define SPATIAL_AUDIO_BOTTOM_BACK_RIGHT_SPEAKER  SPEAKER_TOP_BACK_CENTER
+#define SPATIAL_AUDIO_DRY_SPEAKER                SPEAKER_TOP_CENTER
+#define SPATIAL_AUDIO_PRIVATE_BED_SPEAKERS       \
+        (SPATIAL_AUDIO_BOTTOM_FRONT_LEFT_SPEAKER | \
+         SPATIAL_AUDIO_BOTTOM_FRONT_RIGHT_SPEAKER | \
+         SPATIAL_AUDIO_BOTTOM_BACK_LEFT_SPEAKER | \
+         SPATIAL_AUDIO_BOTTOM_BACK_RIGHT_SPEAKER)
+#define SPATIAL_AUDIO_STATIC_OBJECT_MASK          \
+        (AudioObjectType_FrontLeft | AudioObjectType_FrontRight | \
+         AudioObjectType_FrontCenter | AudioObjectType_LowFrequency | \
+         AudioObjectType_SideLeft | AudioObjectType_SideRight | \
+         AudioObjectType_BackLeft | AudioObjectType_BackRight | \
+         AudioObjectType_TopFrontLeft | AudioObjectType_TopFrontRight | \
+         AudioObjectType_TopBackLeft | AudioObjectType_TopBackRight | \
+         AudioObjectType_BottomFrontLeft | AudioObjectType_BottomFrontRight | \
+         AudioObjectType_BottomBackLeft | AudioObjectType_BottomBackRight | \
+         AudioObjectType_BackCenter)
 
 enum driver_priority
 {
@@ -72,6 +101,8 @@ struct create_stream_params
     EDataFlow flow;
     AUDCLNT_SHAREMODE share;
     DWORD flags;
+    BOOL spatial;
+    UINT32 spatial_static_mask;
     REFERENCE_TIME duration;
     REFERENCE_TIME period;
     const WAVEFORMATEX *fmt;

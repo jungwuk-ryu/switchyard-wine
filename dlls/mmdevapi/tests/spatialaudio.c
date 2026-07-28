@@ -37,6 +37,15 @@ static ISpatialAudioClient *sac = NULL;
 static UINT32 max_dyn_count;
 static HANDLE event;
 static WAVEFORMATEX format;
+static BOOL spatial_stream_supported = TRUE;
+
+#define ALL_STATIC_OBJECTS (AudioObjectType_FrontLeft | AudioObjectType_FrontRight | \
+        AudioObjectType_FrontCenter | AudioObjectType_LowFrequency | AudioObjectType_SideLeft | \
+        AudioObjectType_SideRight | AudioObjectType_BackLeft | AudioObjectType_BackRight | \
+        AudioObjectType_TopFrontLeft | AudioObjectType_TopFrontRight | AudioObjectType_TopBackLeft | \
+        AudioObjectType_TopBackRight | AudioObjectType_BottomFrontLeft | \
+        AudioObjectType_BottomFrontRight | AudioObjectType_BottomBackLeft | \
+        AudioObjectType_BottomBackRight | AudioObjectType_BackCenter)
 
 static void test_formats(void)
 {
@@ -90,21 +99,65 @@ static void test_formats(void)
     IAudioFormatEnumerator_Release(afe);
 }
 
+static void test_static_object_properties(void)
+{
+    static const AudioObjectType types[] =
+    {
+        AudioObjectType_FrontLeft,
+        AudioObjectType_FrontRight,
+        AudioObjectType_FrontCenter,
+        AudioObjectType_LowFrequency,
+        AudioObjectType_SideLeft,
+        AudioObjectType_SideRight,
+        AudioObjectType_BackLeft,
+        AudioObjectType_BackRight,
+        AudioObjectType_TopFrontLeft,
+        AudioObjectType_TopFrontRight,
+        AudioObjectType_TopBackLeft,
+        AudioObjectType_TopBackRight,
+        AudioObjectType_BottomFrontLeft,
+        AudioObjectType_BottomFrontRight,
+        AudioObjectType_BottomBackLeft,
+        AudioObjectType_BottomBackRight,
+        AudioObjectType_BackCenter,
+    };
+    AudioObjectType mask;
+    float x, y, z;
+    unsigned int i;
+    HRESULT hr;
+
+    hr = ISpatialAudioClient_GetNativeStaticObjectTypeMask(sac, &mask);
+    ok(hr == S_OK, "Failed to get native static object mask: %#lx.\n", hr);
+    if (hr == S_OK)
+    {
+        ok(mask != AudioObjectType_None, "Expected at least one native static object.\n");
+        ok(!(mask & AudioObjectType_Dynamic), "Got dynamic object in native mask %#x.\n", mask);
+        ok(!(mask & ~ALL_STATIC_OBJECTS), "Got unknown static objects in native mask %#x.\n", mask);
+        ok(mask == ALL_STATIC_OBJECTS, "Expected all static objects, got %#x.\n", mask);
+    }
+
+    for (i = 0; i < ARRAY_SIZE(types); ++i)
+    {
+        x = y = z = NAN;
+        hr = ISpatialAudioClient_GetStaticObjectPosition(sac, types[i], &x, &y, &z);
+        ok(hr == S_OK, "Failed to get position for object %#x: %#lx.\n", types[i], hr);
+        if (hr == S_OK)
+            ok(isfinite(x) && isfinite(y) && isfinite(z),
+                    "Got invalid position {%f, %f, %f} for object %#x.\n", x, y, z, types[i]);
+    }
+
+    hr = ISpatialAudioClient_GetStaticObjectPosition(sac, AudioObjectType_None, &x, &y, &z);
+    ok(hr == E_INVALIDARG, "Got %#lx for a non-spatialized object.\n", hr);
+    hr = ISpatialAudioClient_GetStaticObjectPosition(sac, AudioObjectType_Dynamic, &x, &y, &z);
+    ok(hr == E_INVALIDARG, "Got %#lx for a dynamic object.\n", hr);
+    hr = ISpatialAudioClient_GetStaticObjectPosition(sac,
+            AudioObjectType_FrontLeft | AudioObjectType_FrontRight, &x, &y, &z);
+    ok(hr == E_INVALIDARG, "Got %#lx for a combined object mask.\n", hr);
+}
+
 static void fill_activation_params(SpatialAudioObjectRenderStreamActivationParams *activation_params)
 {
-    activation_params->StaticObjectTypeMask =  \
-                AudioObjectType_FrontLeft     |
-                AudioObjectType_FrontRight    |
-                AudioObjectType_FrontCenter   |
-                AudioObjectType_LowFrequency  |
-                AudioObjectType_SideLeft      |
-                AudioObjectType_SideRight     |
-                AudioObjectType_BackLeft      |
-                AudioObjectType_BackRight     |
-                AudioObjectType_TopFrontLeft  |
-                AudioObjectType_TopFrontRight |
-                AudioObjectType_TopBackLeft   |
-                AudioObjectType_TopBackRight;
+    activation_params->StaticObjectTypeMask = ALL_STATIC_OBJECTS;
 
     activation_params->MinDynamicObjectCount = 0;
     activation_params->MaxDynamicObjectCount = 0;
@@ -168,6 +221,7 @@ static void test_stream_activation(void)
     HRESULT hr;
     WAVEFORMATEX wrong_format;
     ISpatialAudioObjectRenderStream *sas = NULL;
+    ISpatialAudioObject *object;
 
     SpatialAudioObjectRenderStreamActivationParams activation_params;
     PROPVARIANT activation_params_prop;
@@ -181,8 +235,40 @@ static void test_stream_activation(void)
     /* correct params */
     fill_activation_params(&activation_params);
     hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
-    ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
-    ok(ISpatialAudioObjectRenderStream_Release(sas) == 0, "Expected to release the last reference\n");
+    if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT)
+    {
+        win_skip("The audio backend does not support spatial render streams.\n");
+        spatial_stream_supported = FALSE;
+    }
+    else
+    {
+        ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
+        spatial_stream_supported = hr == S_OK;
+        if (hr == S_OK)
+            ok(ISpatialAudioObjectRenderStream_Release(sas) == 0,
+                    "Expected to release the last reference\n");
+    }
+    sas = NULL;
+
+    /* AudioObjectType_None is independent of the static spatial channel mask. */
+    if (spatial_stream_supported)
+    {
+        fill_activation_params(&activation_params);
+        activation_params.StaticObjectTypeMask = AudioObjectType_None;
+        hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+                &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+        ok(hr == S_OK, "Failed to activate a non-spatial-only stream: %#lx.\n", hr);
+        if (hr == S_OK)
+        {
+            hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+                    AudioObjectType_None, &object);
+            ok(hr == S_OK, "Failed to activate a non-spatialized object: %#lx.\n", hr);
+            if (hr == S_OK)
+                ISpatialAudioObject_Release(object);
+            ISpatialAudioObjectRenderStream_Release(sas);
+        }
+        sas = NULL;
+    }
 
     /* event handle */
     fill_activation_params(&activation_params);
@@ -229,15 +315,24 @@ static void test_stream_activation(void)
     notify_object.ISpatialAudioObjectRenderStreamNotify_iface.lpVtbl = &notifyobjvtbl;
     notify_object.ref = 0;
     activation_params.NotifyObject = &notify_object.ISpatialAudioObjectRenderStreamNotify_iface;
-    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
-    ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
-    ok(notify_object.ref == 1, "Expected to get increased NotifyObject's ref count\n");
-    ok(ISpatialAudioObjectRenderStream_Release(sas) == 0, "Expected to release the last reference\n");
-    ok(notify_object.ref == 0, "Expected to get lowered NotifyObject's ref count\n");
+    if (spatial_stream_supported)
+    {
+        hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+                &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+        ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
+        if (hr == S_OK)
+        {
+            ok(notify_object.ref == 1, "Expected to get increased NotifyObject's ref count\n");
+            ok(ISpatialAudioObjectRenderStream_Release(sas) == 0,
+                    "Expected to release the last reference\n");
+            ok(notify_object.ref == 0, "Expected to get lowered NotifyObject's ref count\n");
+        }
+    }
 }
 
 static void test_audio_object_activation(void)
 {
+    AudioObjectType type;
     HRESULT hr;
     BOOL is_active;
     ISpatialAudioObjectRenderStream *sas = NULL;
@@ -245,6 +340,12 @@ static void test_audio_object_activation(void)
 
     SpatialAudioObjectRenderStreamActivationParams activation_params;
     PROPVARIANT activation_params_prop;
+
+    if (!spatial_stream_supported)
+    {
+        win_skip("The audio backend does not support spatial audio objects.\n");
+        return;
+    }
 
     PropVariantInit(&activation_params_prop);
     activation_params_prop.vt = VT_BLOB;
@@ -255,11 +356,18 @@ static void test_audio_object_activation(void)
     activation_params.StaticObjectTypeMask &= ~AudioObjectType_FrontRight;
     hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
     ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
+    if (hr != S_OK)
+        return;
 
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontLeft, &sao1);
     ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
+    if (hr != S_OK)
+    {
+        ISpatialAudioObjectRenderStream_Release(sas);
+        return;
+    }
     hr = ISpatialAudioObject_IsActive(sao1, &is_active);
-    todo_wine ok(hr == S_OK, "Failed to check if spatial audio object is active: 0x%08lx\n", hr);
+    ok(hr == S_OK, "Failed to check if spatial audio object is active: 0x%08lx\n", hr);
     if (hr == S_OK)
         ok(is_active, "Expected spatial audio object to be active\n");
 
@@ -271,6 +379,29 @@ static void test_audio_object_activation(void)
 
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_Dynamic, &sao2);
     ok(hr == SPTLAUDCLNT_E_NO_MORE_OBJECTS, "Expected to not have no more dynamic objects: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+            AudioObjectType_None, &sao2);
+    ok(hr == S_OK, "Failed to activate a non-spatialized audio object: %#lx.\n", hr);
+    if (hr == S_OK)
+    {
+        hr = ISpatialAudioObject_GetAudioObjectType(sao2, &type);
+        ok(hr == S_OK, "Failed to query non-spatialized object type: %#lx.\n", hr);
+        ok(type == AudioObjectType_None, "Got unexpected object type %#x.\n", type);
+        ISpatialAudioObject_Release(sao2);
+    }
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+            AudioObjectType_BottomBackRight, &sao2);
+    ok(hr == S_OK, "Failed to activate a bottom spatial audio object: %#lx.\n", hr);
+    if (hr == S_OK)
+    {
+        hr = ISpatialAudioObject_GetAudioObjectType(sao2, &type);
+        ok(hr == S_OK, "Failed to query bottom spatial audio object type: %#lx.\n", hr);
+        ok(type == AudioObjectType_BottomBackRight,
+                "Got unexpected object type %#x.\n", type);
+        ISpatialAudioObject_Release(sao2);
+    }
 
     ISpatialAudioObject_Release(sao1);
     ISpatialAudioObjectRenderStream_Release(sas);
@@ -296,9 +427,16 @@ static void test_audio_object_buffers(void)
     ISpatialAudioObjectRenderStream *sas = NULL;
     PROPVARIANT activation_params_prop;
     ISpatialAudioObject *sao[4];
+    BOOL is_active;
     BYTE *buffer;
     INT i, j, k;
     HRESULT hr;
+
+    if (!spatial_stream_supported)
+    {
+        win_skip("The audio backend does not support spatial object buffers.\n");
+        return;
+    }
 
     PropVariantInit(&activation_params_prop);
     activation_params_prop.vt = VT_BLOB;
@@ -308,6 +446,8 @@ static void test_audio_object_buffers(void)
     fill_activation_params(&activation_params);
     hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
     ok(hr == S_OK, "Failed to activate spatial audio stream: 0x%08lx\n", hr);
+    if (hr != S_OK)
+        return;
 
     hr = ISpatialAudioObjectRenderStream_Reset(sas);
     ok(hr == S_OK, "got %#lx.\n", hr);
@@ -325,6 +465,11 @@ static void test_audio_object_buffers(void)
 
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontLeft, &sao[0]);
     ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObject_SetVolume(sao[0], 0.5f);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Got %#lx outside an update pass.\n", hr);
+    hr = ISpatialAudioObject_SetPosition(sao[0], 0.0f, 0.0f, 0.0f);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Got %#lx outside an update pass.\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_Start(sas);
     ok(hr == S_OK, "Failed to activate spatial audio render stream: 0x%08lx\n", hr);
@@ -355,6 +500,16 @@ static void test_audio_object_buffers(void)
            frame_count * format.wBitsPerSample / 8, buffer_length);
         ok(is_buffer_zeroed(buffer, buffer_length), "Expected audio object's buffer to be zeroed\n");
     }
+
+    hr = ISpatialAudioObject_SetVolume(sao[0], 0.5f);
+    ok(hr == S_OK, "Failed to set spatial audio object volume: %#lx.\n", hr);
+    hr = ISpatialAudioObject_SetVolume(sao[0], -0.1f);
+    ok(hr == E_INVALIDARG, "Got %#lx for an invalid volume.\n", hr);
+    hr = ISpatialAudioObject_SetVolume(sao[0], 1.1f);
+    ok(hr == E_INVALIDARG, "Got %#lx for an invalid volume.\n", hr);
+    hr = ISpatialAudioObject_SetPosition(sao[0], 0.0f, 0.0f, 0.0f);
+    ok(hr == SPTLAUDCLNT_E_PROPERTY_NOT_SUPPORTED,
+            "Got %#lx when positioning a static object.\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
     ok(hr == S_OK, "Failed to end updating audio objects: 0x%08lx\n", hr);
@@ -431,13 +586,13 @@ static void test_audio_object_buffers(void)
 
     /* ending the stream */
     hr = ISpatialAudioObject_SetEndOfStream(sao[0], 0);
-    todo_wine ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Expected that ending the stream at this point won't be allowed: 0x%08lx\n", hr);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Expected that ending the stream at this point won't be allowed: 0x%08lx\n", hr);
 
     hr = WaitForSingleObject(event, 200);
     ok(hr == WAIT_OBJECT_0, "Expected event to be flagged: 0x%08lx\n", hr);
 
     hr = ISpatialAudioObject_SetEndOfStream(sao[0], 0);
-    todo_wine ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Expected that ending the stream at this point won't be allowed: 0x%08lx\n", hr);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Expected that ending the stream at this point won't be allowed: 0x%08lx\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, &dyn_object_count, &frame_count);
     ok(hr == S_OK, "Failed to begin updating audio objects: 0x%08lx\n", hr);
@@ -445,7 +600,7 @@ static void test_audio_object_buffers(void)
 
     /* expect the object that was not updated last cycle to be invalidated */
     hr = ISpatialAudioObject_GetBuffer(sao[ARRAYSIZE(sao) - 1], &buffer, &buffer_length);
-    todo_wine ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected audio object to be invalidated: 0x%08lx\n", hr);
+    ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected audio object to be invalidated: 0x%08lx\n", hr);
 
     for (i = 0; i < ARRAYSIZE(sao) - 1; i++)
     {
@@ -453,14 +608,27 @@ static void test_audio_object_buffers(void)
         ok(hr == S_OK, "Expected to be able to get buffers for audio object: 0x%08lx\n", hr);
 
         hr = ISpatialAudioObject_SetEndOfStream(sao[i], 0);
-        todo_wine ok(hr == S_OK, "Failed to end the stream: 0x%08lx\n", hr);
+        ok(hr == S_OK, "Failed to end the stream: 0x%08lx\n", hr);
 
         hr = ISpatialAudioObject_GetBuffer(sao[i], &buffer, &buffer_length);
-        todo_wine ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected audio object to be invalidated: 0x%08lx\n", hr);
+        ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED, "Expected audio object to be invalidated: 0x%08lx\n", hr);
+
+        hr = ISpatialAudioObject_IsActive(sao[i], &is_active);
+        ok(hr == S_OK, "Failed to query object activity: %#lx.\n", hr);
+        ok(!is_active, "Expected an ended object to be inactive.\n");
     }
+
+    /* Applications may release an object immediately after submitting its
+     * final buffer. The renderer must retain that buffer through this pass. */
+    ISpatialAudioObject_Release(sao[0]);
+    sao[0] = NULL;
 
     hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
     ok(hr == S_OK, "Failed to end updating audio objects: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+            AudioObjectType_FrontLeft, &sao[0]);
+    ok(hr == S_OK, "Failed to reactivate released spatial audio object: 0x%08lx\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_Reset(sas);
     ok(hr == SPTLAUDCLNT_E_STREAM_NOT_STOPPED, "got %#lx.\n", hr);
@@ -471,8 +639,16 @@ static void test_audio_object_buffers(void)
     hr = ISpatialAudioObjectRenderStream_Reset(sas);
     ok(hr == S_OK, "got %#lx.\n", hr);
 
+    hr = ISpatialAudioObject_IsActive(sao[0], &is_active);
+    ok(hr == S_OK, "Failed to query reset object activity: %#lx.\n", hr);
+    ok(!is_active, "Expected reset to revoke the active spatial audio object.\n");
+
     hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, &dyn_object_count, &frame_count);
     ok(hr == S_OK, "got %#lx.\n", hr);
+
+    hr = ISpatialAudioObject_GetBuffer(sao[0], &buffer, &buffer_length);
+    ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED,
+            "Expected the reset object to remain invalidated, got %#lx.\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_Reset(sas);
     todo_wine ok(hr == S_OK, "got %#lx.\n", hr);
@@ -535,6 +711,7 @@ START_TEST(spatialaudio)
     /* ok(max_dyn_count == 0, "expected max dynamic object count to be 0 got %u\n", max_dyn_count); */
 
     test_formats();
+    test_static_object_properties();
     test_stream_activation();
     test_audio_object_activation();
     test_audio_object_buffers();

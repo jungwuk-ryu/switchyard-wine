@@ -119,6 +119,9 @@ static inline void wine_unix_call(const unsigned int code, void *args)
 }
 
 extern HRESULT AudioClient_Create(GUID *guid, IMMDevice *device, IAudioClient **out);
+extern HRESULT audio_client_initialize_spatial(IAudioClient *client, DWORD flags,
+        REFERENCE_TIME duration, REFERENCE_TIME period, const WAVEFORMATEX *format,
+        const GUID *session_guid, AudioObjectType static_object_mask);
 extern HRESULT AudioEndpointVolume_Create(MMDevice *parent, IAudioEndpointVolumeEx **ppv);
 extern HRESULT AudioSessionManager_Create(IMMDevice *device, IAudioSessionManager2 **ppv);
 extern HRESULT SpatialAudioClient_Create(IMMDevice *device, ISpatialAudioClient **out);
