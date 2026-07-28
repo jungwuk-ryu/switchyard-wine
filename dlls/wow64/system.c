@@ -239,10 +239,29 @@ NTSTATUS WINAPI wow64_NtPowerInformation( UINT *args )
 
     switch (level)
     {
+    case SystemPowerPolicyAc:   /* SYSTEM_POWER_POLICY */
+    case SystemPowerPolicyDc:   /* SYSTEM_POWER_POLICY */
+    case VerifySystemPolicyAc:   /* SYSTEM_POWER_POLICY */
+    case VerifySystemPolicyDc:   /* SYSTEM_POWER_POLICY */
     case SystemPowerCapabilities:   /* SYSTEM_POWER_CAPABILITIES */
     case SystemBatteryState:   /* SYSTEM_BATTERY_STATE */
-    case SystemExecutionState:   /* ULONG */
+    case SystemPowerStateHandler:
+    case ProcessorStateHandler:
+    case SystemPowerPolicyCurrent:   /* SYSTEM_POWER_POLICY */
+    case AdministratorPowerPolicy:   /* ADMINISTRATOR_POWER_POLICY */
+    case SystemReserveHiberFile:   /* BOOLEAN */
     case ProcessorInformation:   /* PROCESSOR_POWER_INFORMATION */
+    case SystemPowerInformation:   /* SYSTEM_POWER_INFORMATION */
+    case ProcessorStateHandler2:
+    case LastWakeTime:   /* ULONGLONG */
+    case LastSleepTime:   /* ULONGLONG */
+    case SystemExecutionState:   /* EXECUTION_STATE */
+    case SystemPowerStateNotifyHandler:
+    case ProcessorPowerPolicyAc:   /* PROCESSOR_POWER_POLICY */
+    case ProcessorPowerPolicyDc:   /* PROCESSOR_POWER_POLICY */
+    case VerifyProcessorPowerPolicyAc:   /* PROCESSOR_POWER_POLICY */
+    case VerifyProcessorPowerPolicyDc:   /* PROCESSOR_POWER_POLICY */
+    case ProcessorPowerPolicyCurrent:   /* PROCESSOR_POWER_POLICY */
         return NtPowerInformation( level, in_buf, in_len, out_buf, out_len );
 
     default:

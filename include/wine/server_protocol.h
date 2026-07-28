@@ -1434,6 +1434,50 @@ struct get_thread_info_reply
 
 
 
+struct set_thread_execution_state_request
+{
+    struct request_header __header;
+    unsigned int state;
+};
+struct set_thread_execution_state_reply
+{
+    struct reply_header __header;
+    unsigned int old_state;
+    char __pad_12[4];
+};
+
+
+
+struct get_system_execution_state_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct get_system_execution_state_reply
+{
+    struct reply_header __header;
+    unsigned int state;
+    char __pad_12[4];
+};
+
+
+
+struct system_power_policy_request
+{
+    struct request_header __header;
+    unsigned int source;
+    unsigned int set;
+    /* VARARG(policy,bytes); */
+    char __pad_20[4];
+};
+struct system_power_policy_reply
+{
+    struct reply_header __header;
+    /* VARARG(policy,bytes); */
+};
+
+
+
 struct get_thread_cpu_sets_request
 {
     struct request_header __header;
@@ -6376,6 +6420,9 @@ enum request
     REQ_get_process_cpu_sets,
     REQ_set_process_info,
     REQ_get_thread_info,
+    REQ_set_thread_execution_state,
+    REQ_get_system_execution_state,
+    REQ_system_power_policy,
     REQ_get_thread_cpu_sets,
     REQ_get_thread_times,
     REQ_get_thread_native_info,
@@ -6699,6 +6746,9 @@ union generic_request
     struct get_process_cpu_sets_request get_process_cpu_sets_request;
     struct set_process_info_request set_process_info_request;
     struct get_thread_info_request get_thread_info_request;
+    struct set_thread_execution_state_request set_thread_execution_state_request;
+    struct get_system_execution_state_request get_system_execution_state_request;
+    struct system_power_policy_request system_power_policy_request;
     struct get_thread_cpu_sets_request get_thread_cpu_sets_request;
     struct get_thread_times_request get_thread_times_request;
     struct get_thread_native_info_request get_thread_native_info_request;
@@ -7020,6 +7070,9 @@ union generic_reply
     struct get_process_cpu_sets_reply get_process_cpu_sets_reply;
     struct set_process_info_reply set_process_info_reply;
     struct get_thread_info_reply get_thread_info_reply;
+    struct set_thread_execution_state_reply set_thread_execution_state_reply;
+    struct get_system_execution_state_reply get_system_execution_state_reply;
+    struct system_power_policy_reply system_power_policy_reply;
     struct get_thread_cpu_sets_reply get_thread_cpu_sets_reply;
     struct get_thread_times_reply get_thread_times_reply;
     struct get_thread_native_info_reply get_thread_native_info_reply;
@@ -7321,6 +7374,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 957
+#define SERVER_PROTOCOL_VERSION 958
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

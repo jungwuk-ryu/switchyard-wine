@@ -316,6 +316,37 @@ static void dump_get_thread_info_reply( const struct get_thread_info_reply *req 
     dump_varargs_unicode_str( ", desc=", cur_size );
 }
 
+static void dump_set_thread_execution_state_request( const struct set_thread_execution_state_request *req )
+{
+    fprintf( stderr, " state=%08x", req->state );
+}
+
+static void dump_set_thread_execution_state_reply( const struct set_thread_execution_state_reply *req )
+{
+    fprintf( stderr, " old_state=%08x", req->old_state );
+}
+
+static void dump_get_system_execution_state_request( const struct get_system_execution_state_request *req )
+{
+}
+
+static void dump_get_system_execution_state_reply( const struct get_system_execution_state_reply *req )
+{
+    fprintf( stderr, " state=%08x", req->state );
+}
+
+static void dump_system_power_policy_request( const struct system_power_policy_request *req )
+{
+    fprintf( stderr, " source=%08x", req->source );
+    fprintf( stderr, ", set=%08x", req->set );
+    dump_varargs_bytes( ", policy=", cur_size );
+}
+
+static void dump_system_power_policy_reply( const struct system_power_policy_reply *req )
+{
+    dump_varargs_bytes( " policy=", cur_size );
+}
+
 static void dump_get_thread_cpu_sets_request( const struct get_thread_cpu_sets_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
@@ -3644,6 +3675,9 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_process_cpu_sets_request,
     (dump_func)dump_set_process_info_request,
     (dump_func)dump_get_thread_info_request,
+    (dump_func)dump_set_thread_execution_state_request,
+    (dump_func)dump_get_system_execution_state_request,
+    (dump_func)dump_system_power_policy_request,
     (dump_func)dump_get_thread_cpu_sets_request,
     (dump_func)dump_get_thread_times_request,
     (dump_func)dump_get_thread_native_info_request,
@@ -3964,6 +3998,9 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_process_cpu_sets_reply,
     NULL,
     (dump_func)dump_get_thread_info_reply,
+    (dump_func)dump_set_thread_execution_state_reply,
+    (dump_func)dump_get_system_execution_state_reply,
+    (dump_func)dump_system_power_policy_reply,
     (dump_func)dump_get_thread_cpu_sets_reply,
     (dump_func)dump_get_thread_times_reply,
     (dump_func)dump_get_thread_native_info_reply,
@@ -4284,6 +4321,9 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_process_cpu_sets",
     "set_process_info",
     "get_thread_info",
+    "set_thread_execution_state",
+    "get_system_execution_state",
+    "system_power_policy",
     "get_thread_cpu_sets",
     "get_thread_times",
     "get_thread_native_info",

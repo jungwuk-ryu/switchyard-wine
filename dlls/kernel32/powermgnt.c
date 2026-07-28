@@ -133,7 +133,7 @@ EXECUTION_STATE WINAPI SetThreadExecutionState(EXECUTION_STATE flags)
 {
     EXECUTION_STATE old;
 
-    NtSetThreadExecutionState(flags, &old);
+    if (!set_ntstatus( NtSetThreadExecutionState(flags, &old) )) return 0;
 
     return old;
 }

@@ -24,6 +24,9 @@ DECL_HANDLER(get_process_vm_counters);
 DECL_HANDLER(get_process_cpu_sets);
 DECL_HANDLER(set_process_info);
 DECL_HANDLER(get_thread_info);
+DECL_HANDLER(set_thread_execution_state);
+DECL_HANDLER(get_system_execution_state);
+DECL_HANDLER(system_power_policy);
 DECL_HANDLER(get_thread_cpu_sets);
 DECL_HANDLER(get_thread_times);
 DECL_HANDLER(get_thread_native_info);
@@ -344,6 +347,9 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_process_cpu_sets,
     (req_handler)req_set_process_info,
     (req_handler)req_get_thread_info,
+    (req_handler)req_set_thread_execution_state,
+    (req_handler)req_get_system_execution_state,
+    (req_handler)req_system_power_policy,
     (req_handler)req_get_thread_cpu_sets,
     (req_handler)req_get_thread_times,
     (req_handler)req_get_thread_native_info,
@@ -844,6 +850,17 @@ C_ASSERT( offsetof(struct get_thread_info_reply, suspend_count) == 52 );
 C_ASSERT( offsetof(struct get_thread_info_reply, flags) == 56 );
 C_ASSERT( offsetof(struct get_thread_info_reply, desc_len) == 60 );
 C_ASSERT( sizeof(struct get_thread_info_reply) == 64 );
+C_ASSERT( offsetof(struct set_thread_execution_state_request, state) == 12 );
+C_ASSERT( sizeof(struct set_thread_execution_state_request) == 16 );
+C_ASSERT( offsetof(struct set_thread_execution_state_reply, old_state) == 8 );
+C_ASSERT( sizeof(struct set_thread_execution_state_reply) == 16 );
+C_ASSERT( sizeof(struct get_system_execution_state_request) == 16 );
+C_ASSERT( offsetof(struct get_system_execution_state_reply, state) == 8 );
+C_ASSERT( sizeof(struct get_system_execution_state_reply) == 16 );
+C_ASSERT( offsetof(struct system_power_policy_request, source) == 12 );
+C_ASSERT( offsetof(struct system_power_policy_request, set) == 16 );
+C_ASSERT( sizeof(struct system_power_policy_request) == 24 );
+C_ASSERT( sizeof(struct system_power_policy_reply) == 8 );
 C_ASSERT( offsetof(struct get_thread_cpu_sets_request, handle) == 12 );
 C_ASSERT( sizeof(struct get_thread_cpu_sets_request) == 16 );
 C_ASSERT( offsetof(struct get_thread_cpu_sets_reply, cpu_sets) == 8 );

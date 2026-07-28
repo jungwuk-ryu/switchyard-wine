@@ -60,6 +60,8 @@
 #ifdef __APPLE__
 # include <CoreFoundation/CoreFoundation.h>
 # include <IOKit/IOKitLib.h>
+# include <IOKit/pwr_mgt/IOPM.h>
+# include <IOKit/pwr_mgt/IOPMLib.h>
 # include <IOKit/ps/IOPSKeys.h>
 # include <IOKit/ps/IOPowerSources.h>
 # include <mach/mach.h>
@@ -4609,6 +4611,7 @@ static NTSTATUS fill_battery_state( SYSTEM_BATTERY_STATE *bs )
     }
 
     bs->BatteryPresent = TRUE;
+    bs->EstimatedTime = ~0u;
 
     prop = CFDictionaryGetValue( source, CFSTR(kIOPSIsChargingKey) );
     is_charging = CFBooleanGetValue( prop );
@@ -4723,6 +4726,352 @@ static NTSTATUS fill_battery_state( SYSTEM_BATTERY_STATE *bs )
 
 #endif
 
+C_ASSERT( sizeof(SYSTEM_POWER_POLICY) == 232 );
+
+static void init_system_power_policy( SYSTEM_POWER_POLICY *policy, unsigned int source )
+{
+    memset( policy, 0, sizeof(*policy) );
+    policy->Revision = 1;
+    policy->PowerButton.Action = PowerActionHibernate;
+    policy->SleepButton.Action = PowerActionSleep;
+    policy->LidClose.Action = PowerActionSleep;
+    policy->LidOpenWake = PowerSystemWorking;
+    policy->Idle.Action = PowerActionSleep;
+    policy->IdleSensitivity = 90;
+    policy->MinSleep = PowerSystemSleeping3;
+    policy->MaxSleep = PowerSystemSleeping3;
+    policy->ReducedLatencySleep = PowerSystemSleeping3;
+    policy->WinLogonFlags = 1;
+    policy->BroadcastCapacityResolution = 1;
+    policy->DischargePolicy[0].Enable = TRUE;
+    policy->DischargePolicy[0].BatteryLevel = 5;
+    policy->DischargePolicy[0].PowerPolicy.Action = PowerActionHibernate;
+    policy->DischargePolicy[0].PowerPolicy.EventCode = 1;
+    policy->DischargePolicy[0].MinSystemState = PowerSystemSleeping3;
+    policy->DischargePolicy[1].BatteryLevel = 10;
+    policy->DischargePolicy[1].PowerPolicy.EventCode = 1;
+    policy->DischargePolicy[1].MinSystemState = PowerSystemSleeping3;
+    policy->DischargePolicy[2].MinSystemState = PowerSystemSleeping3;
+    policy->DischargePolicy[3].MinSystemState = PowerSystemSleeping3;
+    policy->OptimizeForPower = source != 0;
+
+#ifdef __APPLE__
+    {
+        io_connect_t power = IOPMFindPowerManagement( MACH_PORT_NULL );
+        unsigned long value;
+
+        if (power)
+        {
+            if (IOPMGetAggressiveness( power, kPMMinutesToSleep, &value ) == kIOReturnSuccess)
+                policy->IdleTimeout = value * 60;
+            if (IOPMGetAggressiveness( power, kPMMinutesToDim, &value ) == kIOReturnSuccess)
+            {
+                policy->VideoTimeout = value * 60;
+                policy->VideoDimDisplay = value != 0;
+            }
+            if (IOPMGetAggressiveness( power, kPMMinutesToSpinDown, &value ) == kIOReturnSuccess)
+                policy->SpindownTimeout = value * 60;
+            IOServiceClose( power );
+        }
+    }
+#endif
+}
+
+static NTSTATUS request_system_power_policy( unsigned int source,
+                                             const SYSTEM_POWER_POLICY *new_policy,
+                                             SYSTEM_POWER_POLICY *policy )
+{
+    SYSTEM_POWER_POLICY defaults;
+    NTSTATUS status;
+
+    init_system_power_policy( &defaults, source );
+    SERVER_START_REQ( system_power_policy )
+    {
+        req->source = source;
+        req->set = !!new_policy;
+        wine_server_add_data( req, new_policy ? new_policy : &defaults, sizeof(defaults) );
+        if (policy) wine_server_set_reply( req, policy, sizeof(*policy) );
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return status;
+}
+
+static unsigned int get_current_power_policy_source(void)
+{
+    SYSTEM_BATTERY_STATE battery = {0};
+
+    if (!fill_battery_state( &battery ) && battery.BatteryPresent && !battery.AcOnLine)
+        return 1;
+    return 0;
+}
+
+static NTSTATUS verify_system_power_policy( unsigned int source,
+                                            const SYSTEM_POWER_POLICY *input,
+                                            SYSTEM_POWER_POLICY *output )
+{
+    SYSTEM_POWER_POLICY current, verified;
+    POWER_ACTION_POLICY *actions[] =
+    {
+        &verified.PowerButton,
+        &verified.SleepButton,
+        &verified.LidClose,
+        &verified.Idle,
+        &verified.DischargePolicy[0].PowerPolicy,
+        &verified.DischargePolicy[1].PowerPolicy,
+        &verified.DischargePolicy[2].PowerPolicy,
+        &verified.DischargePolicy[3].PowerPolicy,
+        &verified.OverThrottled,
+    };
+    NTSTATUS status;
+    unsigned int i;
+
+    memcpy( &verified, input, sizeof(verified) );
+    if (verified.Revision != 1) return STATUS_INVALID_PARAMETER;
+    status = request_system_power_policy( source, NULL, &current );
+    if (status) return status;
+
+    for (i = 0; i < ARRAY_SIZE(actions); ++i)
+        if (actions[i]->Action == PowerActionReserved) actions[i]->Action = PowerActionSleep;
+
+    if (verified.IdleTimeout && verified.IdleTimeout < 60) verified.IdleTimeout = 60;
+    if (verified.DozeS4Timeout && verified.DozeS4Timeout < 60) verified.DozeS4Timeout = 60;
+    if (verified.IdleSensitivity > current.IdleSensitivity)
+        verified.IdleSensitivity = current.IdleSensitivity;
+
+    if (verified.MinSleep < current.MinSleep) verified.MinSleep = current.MinSleep;
+    else if (verified.MinSleep > current.MaxSleep) verified.MinSleep = current.MaxSleep;
+    if (verified.MaxSleep < current.MinSleep) verified.MaxSleep = current.MinSleep;
+    else if (verified.MaxSleep > current.MaxSleep) verified.MaxSleep = current.MaxSleep;
+
+    if (verified.ReducedLatencySleep >= PowerSystemSleeping1)
+    {
+        if (verified.ReducedLatencySleep < verified.MinSleep)
+            verified.ReducedLatencySleep = verified.MinSleep;
+        else if (verified.ReducedLatencySleep > verified.MaxSleep)
+            verified.ReducedLatencySleep = verified.MaxSleep;
+    }
+    if (verified.LidOpenWake >= PowerSystemSleeping1 &&
+        verified.LidOpenWake < verified.MinSleep)
+        verified.LidOpenWake = verified.MinSleep;
+
+    if (!verified.BroadcastCapacityResolution) verified.BroadcastCapacityResolution = 1;
+    for (i = 0; i < ARRAY_SIZE(verified.DischargePolicy); ++i)
+    {
+        SYSTEM_POWER_LEVEL *policy = &verified.DischargePolicy[i];
+
+        if (policy->BatteryLevel > 100) policy->BatteryLevel = 100;
+        /* Windows only preserves flag bit 0x10 on the critical discharge policy. */
+        if (i) policy->PowerPolicy.Flags &= ~0x10u;
+        if (policy->MinSystemState >= PowerSystemSleeping1 &&
+            policy->MinSystemState < verified.MinSleep)
+            policy->MinSystemState = verified.MinSleep;
+    }
+
+    memcpy( output, &verified, sizeof(verified) );
+    return STATUS_SUCCESS;
+}
+
+static void fill_administrator_power_policy( ADMINISTRATOR_POWER_POLICY *policy )
+{
+    policy->MinSleep = PowerSystemSleeping1;
+    policy->MaxSleep = PowerSystemHibernate;
+    policy->MinVideoTimeout = 0;
+    policy->MaxVideoTimeout = ~0u;
+    policy->MinSpindownTimeout = 0;
+    policy->MaxSpindownTimeout = ~0u;
+}
+
+static void fill_power_capabilities( SYSTEM_POWER_CAPABILITIES *caps )
+{
+    SYSTEM_BATTERY_STATE battery = {0};
+
+    memset( caps, 0, sizeof(*caps) );
+    caps->PowerButtonPresent = TRUE;
+    caps->SystemS3 = TRUE;
+    caps->SystemS5 = TRUE;
+    caps->FullWake = TRUE;
+    caps->ProcessorMinThrottle = 100;
+    caps->ProcessorMaxThrottle = 100;
+    caps->AcOnLineWake = PowerSystemUnspecified;
+    caps->SoftLidWake = PowerSystemUnspecified;
+    caps->RtcWake = PowerSystemSleeping3;
+    caps->MinDeviceWakeState = PowerSystemUnspecified;
+    caps->DefaultLowLatencyWake = PowerSystemUnspecified;
+
+    if (!fill_battery_state( &battery ))
+    {
+        caps->LidPresent = battery.BatteryPresent;
+        caps->SystemBatteriesPresent = battery.BatteryPresent;
+        if (battery.BatteryPresent)
+        {
+            caps->BatteryScale[0].Granularity = battery.MaxCapacity / 100;
+            caps->BatteryScale[0].Capacity = battery.MaxCapacity;
+        }
+    }
+
+#ifdef __APPLE__
+    {
+        CFDictionaryRef cpu_status = NULL;
+        io_connect_t power = IOPMFindPowerManagement( MACH_PORT_NULL );
+        unsigned long value;
+        uint32_t thermal;
+
+        caps->SystemS3 = IOPMSleepEnabled();
+        if (power)
+        {
+            caps->VideoDimPresent =
+                IOPMGetAggressiveness( power, kPMMinutesToDim, &value ) == kIOReturnSuccess;
+            caps->DiskSpinDown =
+                IOPMGetAggressiveness( power, kPMMinutesToSpinDown, &value ) == kIOReturnSuccess;
+            IOServiceClose( power );
+        }
+        caps->ThermalControl = IOPMGetThermalWarningLevel( &thermal ) == kIOReturnSuccess;
+        if (IOPMCopyCPUPowerStatus( &cpu_status ) == kIOReturnSuccess)
+        {
+            caps->ProcessorThrottle = TRUE;
+            caps->ProcessorMinThrottle = 0;
+            if (cpu_status) CFRelease( cpu_status );
+        }
+    }
+#else
+    caps->SystemS4 = TRUE;
+    caps->HiberFilePresent = TRUE;
+    caps->DiskSpinDown = TRUE;
+#endif
+}
+
+static ULONG query_system_idleness(void)
+{
+    double load;
+    unsigned int processors = peb->NumberOfProcessors ? peb->NumberOfProcessors : 1;
+    double busy;
+
+    if (getloadavg( &load, 1 ) != 1) return 0;
+    busy = load * 100.0 / processors;
+    if (busy >= 100.0) return 0;
+    return 100 - busy;
+}
+
+#ifdef __APPLE__
+static ULONGLONG query_input_idle_seconds(void)
+{
+    io_service_t service;
+    CFTypeRef value;
+    int64_t nanoseconds = 0;
+
+    service = IOServiceGetMatchingService( MACH_PORT_NULL, IOServiceMatching("IOHIDSystem") );
+    if (!service) return 0;
+    value = IORegistryEntryCreateCFProperty( service, CFSTR("HIDIdleTime"),
+                                            kCFAllocatorDefault, 0 );
+    IOObjectRelease( service );
+    if (!value) return 0;
+    if (CFGetTypeID( value ) == CFNumberGetTypeID())
+        CFNumberGetValue( value, kCFNumberSInt64Type, &nanoseconds );
+    CFRelease( value );
+    return nanoseconds > 0 ? nanoseconds / 1000000000 : 0;
+}
+
+static UCHAR query_cooling_mode(void)
+{
+    uint32_t thermal;
+
+    if (IOPMGetThermalWarningLevel( &thermal ) != kIOReturnSuccess) return 2;
+    return thermal == kIOPMThermalWarningLevelNormal ? 0 : 1;
+}
+
+static NTSTATUS query_last_power_event( const char *name, ULONGLONG *value )
+{
+    struct timeval boot, event;
+    size_t size;
+    time_t seconds;
+    suseconds_t microseconds;
+
+    size = sizeof(boot);
+    if (sysctlbyname( "kern.boottime", &boot, &size, NULL, 0 ) == -1)
+        goto failed;
+    if (size != sizeof(boot)) return STATUS_UNSUCCESSFUL;
+    size = sizeof(event);
+    if (sysctlbyname( name, &event, &size, NULL, 0 ) == -1)
+        goto failed;
+    if (size != sizeof(event)) return STATUS_UNSUCCESSFUL;
+
+    *value = 0;
+    if (!event.tv_sec && !event.tv_usec) return STATUS_SUCCESS;
+    if (event.tv_sec < boot.tv_sec ||
+        (event.tv_sec == boot.tv_sec && event.tv_usec < boot.tv_usec))
+        return STATUS_SUCCESS;
+
+    seconds = event.tv_sec - boot.tv_sec;
+    microseconds = event.tv_usec - boot.tv_usec;
+    if (microseconds < 0)
+    {
+        seconds--;
+        microseconds += 1000000;
+    }
+    *value = seconds * (ULONGLONG)TICKSPERSEC + microseconds * 10;
+    return STATUS_SUCCESS;
+
+failed:
+    if (errno == ENOENT) return STATUS_NOT_IMPLEMENTED;
+    if (errno == EACCES || errno == EPERM) return STATUS_ACCESS_DENIED;
+    return STATUS_UNSUCCESSFUL;
+}
+#else
+static ULONGLONG query_input_idle_seconds(void)
+{
+    return 0;
+}
+
+static UCHAR query_cooling_mode(void)
+{
+    return 2;
+}
+
+static NTSTATUS query_last_power_event( const char *name, ULONGLONG *value )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+#endif
+
+static void fill_system_power_information( SYSTEM_POWER_INFORMATION *info,
+                                           const SYSTEM_POWER_POLICY *policy )
+{
+    ULONGLONG idle = query_input_idle_seconds();
+
+    memset( info, 0, sizeof(*info) );
+    info->Idleness = query_system_idleness();
+    info->CoolingMode = query_cooling_mode();
+    if (policy->IdleTimeout)
+    {
+        info->MaxIdlenessAllowed = policy->IdleSensitivity;
+        info->TimeRemaining = idle < policy->IdleTimeout ? policy->IdleTimeout - idle : 0;
+    }
+}
+
+static NTSTATUS query_system_execution_state( EXECUTION_STATE *state )
+{
+    NTSTATUS status;
+
+    SERVER_START_REQ( get_system_execution_state )
+    {
+        status = wine_server_call( req );
+        if (!status) *state = reply->state;
+    }
+    SERVER_END_REQ;
+    return status;
+}
+
+static NTSTATUS validate_power_query( const void *input, ULONG in_size, const void *output,
+                                      ULONG out_size, ULONG required_size, NTSTATUS input_status )
+{
+    if (in_size) return input ? input_status : STATUS_INVALID_PARAMETER;
+    if (!out_size) return STATUS_INVALID_PARAMETER;
+    if (out_size < required_size) return STATUS_BUFFER_TOO_SMALL;
+    if (!output) return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+}
+
 /******************************************************************************
  *              NtPowerInformation  (NTDLL.@)
  */
@@ -4732,62 +5081,82 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input, 
     TRACE( "(%d,%p,%d,%p,%d)\n", level, input, in_size, output, out_size );
     switch (level)
     {
+    case SystemPowerPolicyAc:
+    case SystemPowerPolicyDc:
+    {
+        SYSTEM_POWER_POLICY policy;
+        NTSTATUS status;
+        unsigned int source = level == SystemPowerPolicyDc;
+
+        if (!input && in_size) return STATUS_INVALID_PARAMETER;
+        if (input && in_size && in_size < sizeof(policy)) return STATUS_BUFFER_TOO_SMALL;
+        if (!output && !in_size) return STATUS_INVALID_PARAMETER;
+        if (output && !out_size) return STATUS_INVALID_PARAMETER;
+        if (output && out_size < sizeof(policy)) return STATUS_BUFFER_TOO_SMALL;
+        if (!output && out_size) return STATUS_INVALID_PARAMETER;
+
+        status = request_system_power_policy( source, in_size ? input : NULL, &policy );
+        if (!status && output) memcpy( output, &policy, sizeof(policy) );
+        return status;
+    }
+
+    case VerifySystemPolicyAc:
+    case VerifySystemPolicyDc:
+        if (!input || !in_size || !output || !out_size) return STATUS_INVALID_PARAMETER;
+        if (in_size < sizeof(SYSTEM_POWER_POLICY) || out_size < sizeof(SYSTEM_POWER_POLICY))
+            return STATUS_BUFFER_TOO_SMALL;
+        return verify_system_power_policy( level == VerifySystemPolicyDc, input, output );
+
     case SystemPowerCapabilities:
     {
-        PSYSTEM_POWER_CAPABILITIES PowerCaps = output;
-        FIXME("semi-stub: SystemPowerCapabilities\n");
-        if (out_size < sizeof(SYSTEM_POWER_CAPABILITIES)) return STATUS_BUFFER_TOO_SMALL;
-        /* FIXME: These values are based off a native XP desktop, should probably use APM/ACPI to get the 'real' values */
-        PowerCaps->PowerButtonPresent = TRUE;
-        PowerCaps->SleepButtonPresent = FALSE;
-        PowerCaps->LidPresent = FALSE;
-        PowerCaps->SystemS1 = TRUE;
-        PowerCaps->SystemS2 = FALSE;
-        PowerCaps->SystemS3 = FALSE;
-        PowerCaps->SystemS4 = TRUE;
-        PowerCaps->SystemS5 = TRUE;
-        PowerCaps->HiberFilePresent = TRUE;
-        PowerCaps->FullWake = TRUE;
-        PowerCaps->VideoDimPresent = FALSE;
-        PowerCaps->ApmPresent = FALSE;
-        PowerCaps->UpsPresent = FALSE;
-        PowerCaps->ThermalControl = FALSE;
-        PowerCaps->ProcessorThrottle = FALSE;
-        PowerCaps->ProcessorMinThrottle = 100;
-        PowerCaps->ProcessorMaxThrottle = 100;
-        PowerCaps->DiskSpinDown = TRUE;
-        PowerCaps->SystemBatteriesPresent = FALSE;
-        PowerCaps->BatteriesAreShortTerm = FALSE;
-        PowerCaps->BatteryScale[0].Granularity = 0;
-        PowerCaps->BatteryScale[0].Capacity = 0;
-        PowerCaps->BatteryScale[1].Granularity = 0;
-        PowerCaps->BatteryScale[1].Capacity = 0;
-        PowerCaps->BatteryScale[2].Granularity = 0;
-        PowerCaps->BatteryScale[2].Capacity = 0;
-        PowerCaps->AcOnLineWake = PowerSystemUnspecified;
-        PowerCaps->SoftLidWake = PowerSystemUnspecified;
-        PowerCaps->RtcWake = PowerSystemSleeping1;
-        PowerCaps->MinDeviceWakeState = PowerSystemUnspecified;
-        PowerCaps->DefaultLowLatencyWake = PowerSystemUnspecified;
+        NTSTATUS status = validate_power_query( input, in_size, output, out_size,
+                                                sizeof(SYSTEM_POWER_CAPABILITIES),
+                                                STATUS_PRIVILEGE_NOT_HELD );
+        if (status) return status;
+        fill_power_capabilities( output );
         return STATUS_SUCCESS;
     }
 
     case SystemBatteryState:
     {
-        if (out_size < sizeof(SYSTEM_BATTERY_STATE)) return STATUS_BUFFER_TOO_SMALL;
-        memset(output, 0, sizeof(SYSTEM_BATTERY_STATE));
-        return fill_battery_state(output);
+        NTSTATUS status = validate_power_query( input, in_size, output, out_size,
+                                                sizeof(SYSTEM_BATTERY_STATE),
+                                                STATUS_PRIVILEGE_NOT_HELD );
+        if (status) return status;
+        memset( output, 0, sizeof(SYSTEM_BATTERY_STATE) );
+        return fill_battery_state( output );
     }
 
-    case SystemExecutionState:
+    case SystemPowerStateHandler:
+    case ProcessorStateHandler:
+    case SystemPowerStateNotifyHandler:
+        return STATUS_ACCESS_DENIED;
+
+    case SystemPowerPolicyCurrent:
     {
-        ULONG *state = output;
-        WARN("semi-stub: SystemExecutionState\n"); /* Needed for .NET Framework, but using a FIXME is really noisy. */
-        if (input != NULL) return STATUS_INVALID_PARAMETER;
-        /* FIXME: The actual state should be the value set by SetThreadExecutionState which is not currently implemented. */
-        *state = ES_USER_PRESENT;
+        SYSTEM_POWER_POLICY policy;
+        NTSTATUS status;
+
+        status = validate_power_query( input, in_size, output, out_size, sizeof(policy),
+                                       STATUS_PRIVILEGE_NOT_HELD );
+        if (status) return status;
+        status = request_system_power_policy( get_current_power_policy_source(), NULL, &policy );
+        if (!status) memcpy( output, &policy, sizeof(policy) );
+        return status;
+    }
+
+    case AdministratorPowerPolicy:
+    {
+        NTSTATUS status = validate_power_query( input, in_size, output, out_size,
+                                                sizeof(ADMINISTRATOR_POWER_POLICY),
+                                                STATUS_ACCESS_DENIED );
+        if (status) return status;
+        fill_administrator_power_policy( output );
         return STATUS_SUCCESS;
     }
+
+    case SystemReserveHiberFile:
+        return STATUS_INVALID_PARAMETER;
 
     case ProcessorInformation:
     {
@@ -4795,6 +5164,7 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input, 
         PROCESSOR_POWER_INFORMATION* cpu_power = output;
         int i, out_cpus;
 
+        if (in_size) return input ? STATUS_PRIVILEGE_NOT_HELD : STATUS_INVALID_PARAMETER;
         if ((output == NULL) || (out_size == 0)) return STATUS_INVALID_PARAMETER;
         out_cpus = peb->NumberOfProcessors;
         if ((out_size / sizeof(PROCESSOR_POWER_INFORMATION)) < out_cpus) return STATUS_BUFFER_TOO_SMALL;
@@ -4902,8 +5272,52 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input, 
         return STATUS_SUCCESS;
     }
 
+    case SystemPowerInformation:
+    {
+        SYSTEM_POWER_POLICY policy;
+        NTSTATUS status;
+
+        status = validate_power_query( input, in_size, output, out_size,
+                                       sizeof(SYSTEM_POWER_INFORMATION),
+                                       STATUS_PRIVILEGE_NOT_HELD );
+        if (status) return status;
+        if ((status = request_system_power_policy( get_current_power_policy_source(), NULL, &policy )))
+            return status;
+        fill_system_power_information( output, &policy );
+        return STATUS_SUCCESS;
+    }
+
+    case ProcessorStateHandler2:
+        return STATUS_NOT_IMPLEMENTED;
+
+    case LastWakeTime:
+    case LastSleepTime:
+    {
+        NTSTATUS status = validate_power_query( input, in_size, output, out_size,
+                                                sizeof(ULONGLONG),
+                                                STATUS_PRIVILEGE_NOT_HELD );
+        if (status) return status;
+        return query_last_power_event( level == LastWakeTime ? "kern.waketime" : "kern.sleeptime",
+                                       output );
+    }
+
+    case SystemExecutionState:
+    {
+        NTSTATUS status = validate_power_query( input, in_size, output, out_size,
+                                                sizeof(EXECUTION_STATE),
+                                                STATUS_PRIVILEGE_NOT_HELD );
+        if (status) return status;
+        return query_system_execution_state( output );
+    }
+
+    case ProcessorPowerPolicyAc:
+    case ProcessorPowerPolicyDc:
+    case VerifyProcessorPowerPolicyAc:
+    case VerifyProcessorPowerPolicyDc:
+    case ProcessorPowerPolicyCurrent:
+        return STATUS_NOT_IMPLEMENTED;
+
     default:
-        /* FIXME: Needed by .NET Framework */
         WARN( "Unimplemented NtPowerInformation action: %d\n", level );
         return STATUS_NOT_IMPLEMENTED;
     }
@@ -4968,10 +5382,24 @@ NTSTATUS WINAPI NtInitiatePowerAction( POWER_ACTION action, SYSTEM_POWER_STATE s
  */
 NTSTATUS WINAPI NtSetThreadExecutionState( EXECUTION_STATE new_state, EXECUTION_STATE *old_state )
 {
-    static EXECUTION_STATE current = ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_USER_PRESENT;
+    const EXECUTION_STATE requirements =
+        ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_AWAYMODE_REQUIRED;
+    NTSTATUS status;
 
-    WARN( "(0x%x, %p): stub, harmless.\n", new_state, old_state );
-    *old_state = current;
-    if (!(current & ES_CONTINUOUS) || (new_state & ES_CONTINUOUS)) current = new_state;
-    return STATUS_SUCCESS;
+    TRACE( "(0x%x, %p)\n", new_state, old_state );
+
+    if (!virtual_check_buffer_for_write( old_state, sizeof(*old_state) ))
+        return STATUS_ACCESS_VIOLATION;
+    if (!new_state || (new_state & ~(ES_CONTINUOUS | requirements)) ||
+        ((new_state & ES_AWAYMODE_REQUIRED) && !(new_state & ES_CONTINUOUS)))
+        return STATUS_INVALID_PARAMETER;
+
+    SERVER_START_REQ( set_thread_execution_state )
+    {
+        req->state = new_state;
+        status = wine_server_call( req );
+        if (!status) *old_state = reply->old_state;
+    }
+    SERVER_END_REQ;
+    return status;
 }

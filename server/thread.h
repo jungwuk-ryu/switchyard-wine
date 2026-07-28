@@ -91,6 +91,7 @@ struct thread
     unsigned int           page_priority; /* memory page priority hint */
     unsigned int           power_control; /* power throttling control mask */
     unsigned int           power_state;   /* power throttling state mask */
+    unsigned int           execution_state; /* power execution requirements */
     int                    suspend;       /* suspend count */
     bool                   is_system;     /* system thread (kernel mode only) */
     bool                   dbg_hidden;    /* hidden from debugger */

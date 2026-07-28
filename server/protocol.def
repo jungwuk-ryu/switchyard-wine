@@ -1345,6 +1345,31 @@ typedef volatile struct
 #define GET_THREAD_INFO_FLAG_DISABLE_BOOST 0x08
 
 
+/* Set the calling thread's power execution requirements */
+@REQ(set_thread_execution_state)
+    unsigned int state;          /* execution state flags */
+@REPLY
+    unsigned int old_state;      /* previous calling thread state */
+@END
+
+
+/* Retrieve the aggregate power execution requirements */
+@REQ(get_system_execution_state)
+@REPLY
+    unsigned int state;          /* aggregate system execution state */
+@END
+
+
+/* Query or update a live system power policy */
+@REQ(system_power_policy)
+    unsigned int source;         /* 0 for AC, 1 for DC */
+    unsigned int set;            /* update the live policy */
+    VARARG(policy,bytes);         /* new policy, or initialization defaults */
+@REPLY
+    VARARG(policy,bytes);         /* current live policy */
+@END
+
+
 /* Retrieve the selected CPU set assignment of a thread */
 @REQ(get_thread_cpu_sets)
     obj_handle_t handle;       /* thread handle */

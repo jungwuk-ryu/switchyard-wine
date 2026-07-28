@@ -41,6 +41,8 @@
 #include <sys/resource.h>
 #endif
 #ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #include <mach/mach_init.h>
 #include <mach/mach_time.h>
 #include <mach/mach_port.h>
@@ -234,6 +236,117 @@ static const struct fd_ops thread_fd_ops =
 };
 
 static struct list thread_list = LIST_INIT(thread_list);
+#define SYSTEM_POWER_POLICY_SIZE 232
+static unsigned char system_power_policies[2][SYSTEM_POWER_POLICY_SIZE];
+static int system_power_policy_initialized[2];
+
+#define EXECUTION_REQUIREMENT_MASK \
+    (ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED | ES_AWAYMODE_REQUIRED)
+
+static unsigned int get_system_execution_state(void)
+{
+    struct thread *thread;
+    unsigned int state = 0;
+
+    LIST_FOR_EACH_ENTRY( thread, &thread_list, struct thread, entry )
+        if (thread->state != TERMINATED)
+            state |= thread->execution_state & EXECUTION_REQUIREMENT_MASK;
+    return state;
+}
+
+#ifdef __APPLE__
+static IOPMAssertionID system_sleep_assertion = kIOPMNullAssertionID;
+static IOPMAssertionID display_sleep_assertion = kIOPMNullAssertionID;
+static IOPMAssertionID system_activity_assertion = kIOPMNullAssertionID;
+static IOPMAssertionID display_activity_assertion = kIOPMNullAssertionID;
+
+static void update_host_execution_state( unsigned int state )
+{
+    IOPMAssertionID id;
+    IOReturn ret;
+
+    if ((state & (ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)) &&
+        system_sleep_assertion == kIOPMNullAssertionID)
+    {
+        id = kIOPMNullAssertionID;
+        ret = IOPMAssertionCreateWithName( kIOPMAssertionTypePreventUserIdleSystemSleep,
+                                           kIOPMAssertionLevelOn,
+                                           CFSTR("Wine application system execution requirement"),
+                                           &id );
+        if (ret == kIOReturnSuccess)
+            system_sleep_assertion = id;
+        else
+            fprintf( stderr, "wineserver: failed to create system sleep assertion, error %#x\n",
+                     (unsigned int)ret );
+    }
+    else if (!(state & (ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)) &&
+             system_sleep_assertion != kIOPMNullAssertionID)
+    {
+        ret = IOPMAssertionRelease( system_sleep_assertion );
+        if (ret == kIOReturnSuccess)
+            system_sleep_assertion = kIOPMNullAssertionID;
+        else
+            fprintf( stderr, "wineserver: failed to release system sleep assertion, error %#x\n",
+                     (unsigned int)ret );
+    }
+
+    if ((state & ES_DISPLAY_REQUIRED) &&
+        display_sleep_assertion == kIOPMNullAssertionID)
+    {
+        id = kIOPMNullAssertionID;
+        ret = IOPMAssertionCreateWithName( kIOPMAssertionTypePreventUserIdleDisplaySleep,
+                                           kIOPMAssertionLevelOn,
+                                           CFSTR("Wine application display execution requirement"),
+                                           &id );
+        if (ret == kIOReturnSuccess)
+            display_sleep_assertion = id;
+        else
+            fprintf( stderr, "wineserver: failed to create display sleep assertion, error %#x\n",
+                     (unsigned int)ret );
+    }
+    else if (!(state & ES_DISPLAY_REQUIRED) &&
+             display_sleep_assertion != kIOPMNullAssertionID)
+    {
+        ret = IOPMAssertionRelease( display_sleep_assertion );
+        if (ret == kIOReturnSuccess)
+            display_sleep_assertion = kIOPMNullAssertionID;
+        else
+            fprintf( stderr, "wineserver: failed to release display sleep assertion, error %#x\n",
+                     (unsigned int)ret );
+    }
+}
+
+static void declare_host_execution_activity( unsigned int state )
+{
+    IOReturn ret;
+
+    if (state & (ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED))
+    {
+        ret = IOPMDeclareNetworkClientActivity( CFSTR("Wine application system activity"),
+                                                &system_activity_assertion );
+        if (ret != kIOReturnSuccess)
+            fprintf( stderr, "wineserver: failed to declare system activity, error %#x\n",
+                     (unsigned int)ret );
+    }
+    if (state & ES_DISPLAY_REQUIRED)
+    {
+        ret = IOPMAssertionDeclareUserActivity( CFSTR("Wine application display activity"),
+                                                kIOPMUserActiveLocal,
+                                                &display_activity_assertion );
+        if (ret != kIOReturnSuccess)
+            fprintf( stderr, "wineserver: failed to declare display activity, error %#x\n",
+                     (unsigned int)ret );
+    }
+}
+#else
+static void update_host_execution_state( unsigned int state )
+{
+}
+
+static void declare_host_execution_activity( unsigned int state )
+{
+}
+#endif
 
 #if defined(__linux__) && defined(RLIMIT_NICE)
 static int nice_limit;
@@ -531,6 +644,7 @@ static inline void init_thread_structure( struct thread *thread )
     thread->page_priority   = 5;
     thread->power_control   = 0;
     thread->power_state     = 0;
+    thread->execution_state = ES_CONTINUOUS;
     thread->suspend         = 0;
     thread->dbg_hidden      = 0;
     thread->bypass_proc_suspend = 0;
@@ -1743,6 +1857,7 @@ void kill_thread( struct thread *thread, int violent_death )
 {
     if (thread->state == TERMINATED) return;  /* already killed */
     thread->state = TERMINATED;
+    update_host_execution_state( get_system_execution_state() );
     thread->exit_time = current_time;
     if (current == thread) current = NULL;
     if (debug_level)
@@ -2092,6 +2207,57 @@ DECL_HANDLER(set_thread_native_info)
         }
         release_object( thread );
     }
+}
+
+DECL_HANDLER(set_thread_execution_state)
+{
+    if (!req->state || (req->state & ~(ES_CONTINUOUS | EXECUTION_REQUIREMENT_MASK)) ||
+        ((req->state & ES_AWAYMODE_REQUIRED) && !(req->state & ES_CONTINUOUS)))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+
+    reply->old_state = current->execution_state;
+
+    if (req->state & ES_CONTINUOUS)
+    {
+        current->execution_state = req->state;
+        update_host_execution_state( get_system_execution_state() );
+    }
+    else
+        declare_host_execution_activity( req->state );
+}
+
+DECL_HANDLER(get_system_execution_state)
+{
+    reply->state = get_system_execution_state();
+}
+
+DECL_HANDLER(system_power_policy)
+{
+    if (req->source >= ARRAY_SIZE(system_power_policies))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (get_req_data_size() != sizeof(system_power_policies[0]))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+
+    if (!system_power_policy_initialized[req->source])
+    {
+        memcpy( system_power_policies[req->source], get_req_data(),
+                sizeof(system_power_policies[req->source]) );
+        system_power_policy_initialized[req->source] = 1;
+    }
+    if (req->set)
+        memcpy( system_power_policies[req->source], get_req_data(),
+                sizeof(system_power_policies[req->source]) );
+    set_reply_data( system_power_policies[req->source],
+                    sizeof(system_power_policies[req->source]) );
 }
 
 /* set information about a thread */

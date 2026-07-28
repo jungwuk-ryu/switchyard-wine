@@ -38,6 +38,7 @@ static NTSTATUS (WINAPI * pNtSetSystemInformation)(SYSTEM_INFORMATION_CLASS, PVO
 static NTSTATUS (WINAPI * pRtlGetNativeSystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 static NTSTATUS (WINAPI * pNtQuerySystemInformationEx)(SYSTEM_INFORMATION_CLASS, void*, ULONG, void*, ULONG, ULONG*);
 static NTSTATUS (WINAPI * pNtPowerInformation)(POWER_INFORMATION_LEVEL, PVOID, ULONG, PVOID, ULONG);
+static NTSTATUS (WINAPI * pNtSetThreadExecutionState)(EXECUTION_STATE, EXECUTION_STATE *);
 static NTSTATUS (WINAPI * pNtQueryInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
 static NTSTATUS (WINAPI * pNtSetInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG);
 static NTSTATUS (WINAPI * pNtSetInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG);
@@ -98,6 +99,7 @@ static void InitFunctionPtrs(void)
     NTDLL_GET_PROC(NtSetSystemInformation);
     NTDLL_GET_PROC(RtlGetNativeSystemInformation);
     NTDLL_GET_PROC(NtPowerInformation);
+    NTDLL_GET_PROC(NtSetThreadExecutionState);
     NTDLL_GET_PROC(NtQueryInformationThread);
     NTDLL_GET_PROC(NtSetInformationProcess);
     NTDLL_GET_PROC(NtSetInformationThread);
@@ -1720,6 +1722,522 @@ static void test_query_secure_boot(void)
     ok(!info.enabled || info.capable, "Secure boot is enabled but not capable\n");
 }
 
+static void test_power_query_buffers(void)
+{
+    static const struct
+    {
+        POWER_INFORMATION_LEVEL level;
+        ULONG size;
+        NTSTATUS input_status;
+        BOOL may_be_unimplemented;
+    }
+    tests[] =
+    {
+        {SystemPowerCapabilities, sizeof(SYSTEM_POWER_CAPABILITIES), STATUS_PRIVILEGE_NOT_HELD},
+        {SystemBatteryState, sizeof(SYSTEM_BATTERY_STATE), STATUS_PRIVILEGE_NOT_HELD, TRUE},
+        {SystemPowerPolicyCurrent, sizeof(SYSTEM_POWER_POLICY), STATUS_PRIVILEGE_NOT_HELD},
+        {AdministratorPowerPolicy, sizeof(ADMINISTRATOR_POWER_POLICY), STATUS_ACCESS_DENIED, TRUE},
+        {SystemPowerInformation, sizeof(SYSTEM_POWER_INFORMATION), STATUS_PRIVILEGE_NOT_HELD},
+        {LastWakeTime, sizeof(ULONGLONG), STATUS_PRIVILEGE_NOT_HELD, TRUE},
+        {LastSleepTime, sizeof(ULONGLONG), STATUS_PRIVILEGE_NOT_HELD, TRUE},
+        {SystemExecutionState, sizeof(EXECUTION_STATE), STATUS_PRIVILEGE_NOT_HELD},
+    };
+    unsigned char buffer[sizeof(SYSTEM_POWER_POLICY) + 16], input = 0xa5;
+    NTSTATUS status;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        winetest_push_context("level %u", tests[i].level);
+
+        status = pNtPowerInformation(tests[i].level, NULL, 0, NULL, 0);
+        ok(status == STATUS_INVALID_PARAMETER, "expected STATUS_INVALID_PARAMETER, got %08lx\n", status);
+
+        memset(buffer, 0xcc, sizeof(buffer));
+        status = pNtPowerInformation(tests[i].level, NULL, 0, buffer, 0);
+        ok(status == STATUS_INVALID_PARAMETER, "expected STATUS_INVALID_PARAMETER, got %08lx\n", status);
+        ok(buffer[0] == 0xcc, "zero-sized query modified the output buffer\n");
+
+        memset(buffer, 0xcc, sizeof(buffer));
+        status = pNtPowerInformation(tests[i].level, NULL, 0, buffer, tests[i].size - 1);
+        ok(status == STATUS_BUFFER_TOO_SMALL, "expected STATUS_BUFFER_TOO_SMALL, got %08lx\n", status);
+        ok(buffer[0] == 0xcc && buffer[tests[i].size - 1] == 0xcc,
+           "short query modified the output buffer\n");
+
+        memset(buffer, 0xcc, sizeof(buffer));
+        status = pNtPowerInformation(tests[i].level, &input, 1, buffer, tests[i].size);
+        ok(status == tests[i].input_status ||
+           broken(tests[i].may_be_unimplemented && status == STATUS_NOT_IMPLEMENTED),
+           "expected %08lx, got %08lx\n", tests[i].input_status, status);
+        ok(buffer[0] == 0xcc, "failed input query modified the output buffer\n");
+
+        memset(buffer, 0xcc, sizeof(buffer));
+        status = pNtPowerInformation(tests[i].level, &input, 0, buffer, tests[i].size + 1);
+        if (tests[i].may_be_unimplemented && status == STATUS_NOT_IMPLEMENTED)
+        {
+            win_skip("level is not implemented on this platform\n");
+            winetest_pop_context();
+            continue;
+        }
+        ok(status == STATUS_SUCCESS, "expected STATUS_SUCCESS, got %08lx\n", status);
+        if (!status)
+            ok(buffer[tests[i].size] == 0xcc, "query wrote beyond the documented structure\n");
+
+        winetest_pop_context();
+    }
+}
+
+static void test_power_status_matrix(void)
+{
+    static const struct
+    {
+        POWER_INFORMATION_LEVEL level;
+        NTSTATUS status;
+    }
+    tests[] =
+    {
+        {VerifySystemPolicyAc, STATUS_INVALID_PARAMETER},
+        {VerifySystemPolicyDc, STATUS_INVALID_PARAMETER},
+        {SystemPowerStateHandler, STATUS_ACCESS_DENIED},
+        {ProcessorStateHandler, STATUS_ACCESS_DENIED},
+        {SystemReserveHiberFile, STATUS_INVALID_PARAMETER},
+        {ProcessorStateHandler2, STATUS_NOT_IMPLEMENTED},
+        {SystemPowerStateNotifyHandler, STATUS_ACCESS_DENIED},
+        {ProcessorPowerPolicyAc, STATUS_NOT_IMPLEMENTED},
+        {ProcessorPowerPolicyDc, STATUS_NOT_IMPLEMENTED},
+        {VerifyProcessorPowerPolicyAc, STATUS_NOT_IMPLEMENTED},
+        {VerifyProcessorPowerPolicyDc, STATUS_NOT_IMPLEMENTED},
+        {ProcessorPowerPolicyCurrent, STATUS_NOT_IMPLEMENTED},
+    };
+    NTSTATUS status;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        status = pNtPowerInformation(tests[i].level, NULL, 0, NULL, 0);
+        ok(status == tests[i].status, "level %u: expected %08lx, got %08lx\n",
+           tests[i].level, tests[i].status, status);
+    }
+}
+
+static void test_power_policies(void)
+{
+    SYSTEM_POWER_POLICY ac = {0}, dc = {0}, current = {0};
+    ADMINISTRATOR_POWER_POLICY admin;
+    unsigned char buffer[sizeof(SYSTEM_POWER_POLICY)];
+    BYTE input = 0xa5;
+    NTSTATUS status;
+
+    memset(buffer, 0xcc, sizeof(buffer));
+    status = pNtPowerInformation(SystemPowerPolicyAc, NULL, 0, buffer, 0);
+    ok(status == STATUS_INVALID_PARAMETER, "expected STATUS_INVALID_PARAMETER, got %08lx\n", status);
+
+    status = pNtPowerInformation(SystemPowerPolicyAc, NULL, 0, &ac, sizeof(ac) - 1);
+    ok(status == STATUS_BUFFER_TOO_SMALL, "expected STATUS_BUFFER_TOO_SMALL, got %08lx\n", status);
+    status = pNtPowerInformation(SystemPowerPolicyAc, NULL, 0, &ac, sizeof(ac));
+    ok(status == STATUS_SUCCESS, "SystemPowerPolicyAc failed, status %08lx\n", status);
+    status = pNtPowerInformation(SystemPowerPolicyAc, &input, 0, &ac, sizeof(ac));
+    ok(status == STATUS_SUCCESS, "zero-sized input query failed, status %08lx\n", status);
+    status = pNtPowerInformation(SystemPowerPolicyDc, NULL, 0, &dc, sizeof(dc));
+    ok(status == STATUS_SUCCESS, "SystemPowerPolicyDc failed, status %08lx\n", status);
+    status = pNtPowerInformation(SystemPowerPolicyCurrent, NULL, 0, &current, sizeof(current));
+    ok(status == STATUS_SUCCESS, "SystemPowerPolicyCurrent failed, status %08lx\n", status);
+    if (!status)
+    {
+        ok(current.Revision == 1, "unexpected policy revision %lu\n", current.Revision);
+        ok(current.IdleSensitivity <= 100, "unexpected idle sensitivity %u\n",
+           current.IdleSensitivity);
+    }
+    ok(ac.Revision == 1, "unexpected AC policy revision %lu\n", ac.Revision);
+    ok(dc.Revision == 1, "unexpected DC policy revision %lu\n", dc.Revision);
+
+    status = pNtPowerInformation(AdministratorPowerPolicy, NULL, 0, &admin, sizeof(admin));
+    ok(status == STATUS_SUCCESS || broken(status == STATUS_NOT_IMPLEMENTED),
+       "AdministratorPowerPolicy failed, status %08lx\n", status);
+    if (!status)
+    {
+        ok(admin.MinSleep <= admin.MaxSleep, "invalid sleep limits %u, %u\n",
+           admin.MinSleep, admin.MaxSleep);
+        ok(admin.MinVideoTimeout <= admin.MaxVideoTimeout, "invalid video timeout limits\n");
+        ok(admin.MinSpindownTimeout <= admin.MaxSpindownTimeout, "invalid disk timeout limits\n");
+    }
+}
+
+static void check_verified_system_power_policy(POWER_INFORMATION_LEVEL level,
+                                               SYSTEM_POWER_POLICY *input,
+                                               const SYSTEM_POWER_POLICY *expected,
+                                               NTSTATUS expected_status, const char *name)
+{
+    SYSTEM_POWER_POLICY input_copy;
+    unsigned char output[sizeof(*input) + 1], unchanged[sizeof(output)];
+    NTSTATUS status;
+
+    memcpy(&input_copy, input, sizeof(input_copy));
+    memset(output, 0xcc, sizeof(output));
+    memcpy(unchanged, output, sizeof(unchanged));
+
+    winetest_push_context("%s", name);
+    status = pNtPowerInformation(level, input, sizeof(*input), output, sizeof(*input));
+    ok(status == expected_status, "expected %08lx, got %08lx\n", expected_status, status);
+    ok(!memcmp(input, &input_copy, sizeof(input_copy)), "input policy was modified\n");
+    if (!status)
+    {
+        ok(!!expected, "missing expected output policy\n");
+        if (expected)
+            ok(!memcmp(output, expected, sizeof(*expected)),
+               "verification returned an unexpected policy\n");
+        ok(output[sizeof(*input)] == 0xcc, "verification wrote beyond the policy\n");
+    }
+    else
+        ok(!memcmp(output, unchanged, sizeof(output)),
+           "failed verification modified the output buffer\n");
+    winetest_pop_context();
+}
+
+static void test_verify_system_power_policy(void)
+{
+    static const POWER_INFORMATION_LEVEL query_levels[] =
+    {
+        SystemPowerPolicyAc, SystemPowerPolicyDc
+    };
+    static const POWER_INFORMATION_LEVEL verify_levels[] =
+    {
+        VerifySystemPolicyAc, VerifySystemPolicyDc
+    };
+    static const struct
+    {
+        BOOL pointer;
+        ULONG size;
+    }
+    inputs[] =
+    {
+        {FALSE, 0},
+        {FALSE, 1},
+        {FALSE, sizeof(SYSTEM_POWER_POLICY) - 1},
+        {FALSE, sizeof(SYSTEM_POWER_POLICY)},
+        {FALSE, sizeof(SYSTEM_POWER_POLICY) + 1},
+        {TRUE, 0},
+        {TRUE, 1},
+        {TRUE, sizeof(SYSTEM_POWER_POLICY) - 1},
+        {TRUE, sizeof(SYSTEM_POWER_POLICY)},
+        {TRUE, sizeof(SYSTEM_POWER_POLICY) + 1},
+    },
+    outputs[] =
+    {
+        {FALSE, 0},
+        {FALSE, 1},
+        {FALSE, sizeof(SYSTEM_POWER_POLICY) - 1},
+        {FALSE, sizeof(SYSTEM_POWER_POLICY)},
+        {FALSE, sizeof(SYSTEM_POWER_POLICY) + 1},
+        {TRUE, 0},
+        {TRUE, 1},
+        {TRUE, sizeof(SYSTEM_POWER_POLICY) - 1},
+        {TRUE, sizeof(SYSTEM_POWER_POLICY)},
+        {TRUE, sizeof(SYSTEM_POWER_POLICY) + 1},
+    };
+    unsigned char input[sizeof(SYSTEM_POWER_POLICY) + 1], input_copy[sizeof(input)];
+    unsigned char output[sizeof(SYSTEM_POWER_POLICY) + 1], unchanged[sizeof(output)];
+    SYSTEM_POWER_POLICY policy, expected_policy, mutated;
+    NTSTATUS status, expected;
+    unsigned int level, i, j;
+
+    for (level = 0; level < ARRAY_SIZE(query_levels); level++)
+    {
+        status = pNtPowerInformation(query_levels[level], NULL, 0, &policy, sizeof(policy));
+        ok(status == STATUS_SUCCESS, "level %u policy query failed, status %08lx\n",
+           query_levels[level], status);
+        if (status) continue;
+
+        for (i = 0; i < ARRAY_SIZE(inputs); i++)
+        {
+            for (j = 0; j < ARRAY_SIZE(outputs); j++)
+            {
+                memset(input, 0xa5, sizeof(input));
+                memcpy(input, &policy, sizeof(policy));
+                memcpy(input_copy, input, sizeof(input));
+                memset(output, 0xcc, sizeof(output));
+                memcpy(unchanged, output, sizeof(output));
+
+                if (!inputs[i].pointer || !inputs[i].size ||
+                    !outputs[j].pointer || !outputs[j].size)
+                    expected = STATUS_INVALID_PARAMETER;
+                else if (inputs[i].size < sizeof(policy) || outputs[j].size < sizeof(policy))
+                    expected = STATUS_BUFFER_TOO_SMALL;
+                else
+                    expected = STATUS_SUCCESS;
+
+                winetest_push_context("level %u, input %s/%lu, output %s/%lu",
+                                      verify_levels[level],
+                                      inputs[i].pointer ? "buffer" : "NULL", inputs[i].size,
+                                      outputs[j].pointer ? "buffer" : "NULL", outputs[j].size);
+                status = pNtPowerInformation(verify_levels[level],
+                                             inputs[i].pointer ? input : NULL, inputs[i].size,
+                                             outputs[j].pointer ? output : NULL, outputs[j].size);
+                ok(status == expected, "expected %08lx, got %08lx\n", expected, status);
+                ok(!memcmp(input, input_copy, sizeof(input)), "input policy was modified\n");
+                if (status == STATUS_SUCCESS)
+                {
+                    ok(!memcmp(output, input, sizeof(policy)), "verified policy does not match input\n");
+                    ok(output[sizeof(policy)] == 0xcc,
+                       "query wrote beyond the policy structure\n");
+                }
+                else
+                    ok(!memcmp(output, unchanged, sizeof(output)),
+                       "failed verification modified the output buffer\n");
+                winetest_pop_context();
+            }
+        }
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.Revision = 0;
+        check_verified_system_power_policy(verify_levels[level], &mutated, NULL,
+                                           STATUS_INVALID_PARAMETER, "invalid revision");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.IdleSensitivity = 101;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.IdleSensitivity = policy.IdleSensitivity;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "idle sensitivity");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.MinSleep = PowerSystemMaximum + 1;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.MinSleep = policy.MaxSleep;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "minimum sleep state");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.MaxSleep = PowerSystemUnspecified;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.MaxSleep = policy.MinSleep;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "maximum sleep state");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.ReducedLatencySleep = PowerSystemMaximum + 1;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.ReducedLatencySleep = policy.MaxSleep;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "reduced latency sleep state");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.LidOpenWake = PowerSystemSleeping1;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        if (expected_policy.LidOpenWake < policy.MinSleep)
+            expected_policy.LidOpenWake = policy.MinSleep;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "lid wake state");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.PowerButton.Action = PowerActionReserved;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.PowerButton.Action = PowerActionSleep;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "reserved power action");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.IdleTimeout = 1;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.IdleTimeout = 60;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "idle timeout");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.DozeS4Timeout = 1;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.DozeS4Timeout = 60;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "doze timeout");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.BroadcastCapacityResolution = 0;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.BroadcastCapacityResolution = 1;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "capacity resolution");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.DischargePolicy[0].BatteryLevel = 101;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.DischargePolicy[0].BatteryLevel = 100;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "discharge battery level");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.DischargePolicy[1].PowerPolicy.Flags = ~0u;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.DischargePolicy[1].PowerPolicy.Flags &= ~0x10u;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "discharge policy flags");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.DischargePolicy[2].PowerPolicy.Action = PowerActionReserved;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        expected_policy.DischargePolicy[2].PowerPolicy.Action = PowerActionSleep;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "discharge power action");
+
+        memcpy(&mutated, &policy, sizeof(mutated));
+        mutated.DischargePolicy[3].MinSystemState = PowerSystemSleeping1;
+        memcpy(&expected_policy, &mutated, sizeof(expected_policy));
+        if (expected_policy.DischargePolicy[3].MinSystemState < policy.MinSleep)
+            expected_policy.DischargePolicy[3].MinSystemState = policy.MinSleep;
+        check_verified_system_power_policy(verify_levels[level], &mutated, &expected_policy,
+                                           STATUS_SUCCESS, "discharge sleep state");
+    }
+}
+
+static void test_query_system_power_info(void)
+{
+    SYSTEM_POWER_INFORMATION info;
+    NTSTATUS status;
+
+    memset(&info, 0xcc, sizeof(info));
+    status = pNtPowerInformation(SystemPowerInformation, NULL, 0, &info, sizeof(info));
+    ok(status == STATUS_SUCCESS, "SystemPowerInformation failed, status %08lx\n", status);
+    if (status) return;
+    ok(info.MaxIdlenessAllowed <= 100, "unexpected maximum idleness %lu\n",
+       info.MaxIdlenessAllowed);
+    ok(info.Idleness <= 100, "unexpected idleness %lu\n", info.Idleness);
+    ok(info.CoolingMode <= 2, "unexpected cooling mode %u\n", info.CoolingMode);
+}
+
+static void test_last_sleep_wake_time(void)
+{
+    ULONGLONG sleep_time = 0, wake_time = 0, now = GetTickCount64() * 10000;
+    NTSTATUS sleep_status, wake_status;
+
+    wake_status = pNtPowerInformation(LastWakeTime, NULL, 0, &wake_time, sizeof(wake_time));
+    sleep_status = pNtPowerInformation(LastSleepTime, NULL, 0, &sleep_time, sizeof(sleep_time));
+    if (wake_status == STATUS_NOT_IMPLEMENTED || sleep_status == STATUS_NOT_IMPLEMENTED)
+    {
+        win_skip("last sleep/wake time is not implemented on this platform\n");
+        return;
+    }
+
+    ok(wake_status == STATUS_SUCCESS, "LastWakeTime failed, status %08lx\n", wake_status);
+    ok(sleep_status == STATUS_SUCCESS, "LastSleepTime failed, status %08lx\n", sleep_status);
+    ok(!wake_time || wake_time <= now + 10000000, "wake time %s exceeds interrupt time %s\n",
+       wine_dbgstr_longlong(wake_time), wine_dbgstr_longlong(now));
+    ok(!sleep_time || sleep_time <= now + 10000000, "sleep time %s exceeds interrupt time %s\n",
+       wine_dbgstr_longlong(sleep_time), wine_dbgstr_longlong(now));
+    ok(!sleep_time || !wake_time || sleep_time <= wake_time,
+       "last sleep time %s exceeds last wake time %s\n",
+       wine_dbgstr_longlong(sleep_time), wine_dbgstr_longlong(wake_time));
+}
+
+struct execution_state_thread
+{
+    HANDLE ready;
+    HANDLE release;
+    NTSTATUS status;
+};
+
+static DWORD WINAPI execution_state_thread_proc(void *arg)
+{
+    struct execution_state_thread *thread = arg;
+    EXECUTION_STATE old_state;
+
+    thread->status = pNtSetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED, &old_state);
+    SetEvent(thread->ready);
+    WaitForSingleObject(thread->release, 10000);
+    return 0;
+}
+
+static void test_execution_state(void)
+{
+    struct execution_state_thread context;
+    EXECUTION_STATE before = 0, state, old_state, restore_state;
+    HANDLE thread;
+    DWORD wait;
+    NTSTATUS status;
+
+    if (!pNtSetThreadExecutionState)
+    {
+        win_skip("NtSetThreadExecutionState is not available\n");
+        return;
+    }
+
+    status = pNtPowerInformation(SystemExecutionState, NULL, 0, &before, sizeof(before));
+    ok(status == STATUS_SUCCESS, "initial SystemExecutionState failed, status %08lx\n", status);
+    if (status) return;
+
+    old_state = 0xcccccccc;
+    status = pNtSetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED, &old_state);
+    ok(status == STATUS_SUCCESS, "setting display requirement failed, status %08lx\n", status);
+    ok(old_state == ES_CONTINUOUS, "unexpected initial thread state %#lx\n", old_state);
+    status = pNtPowerInformation(SystemExecutionState, NULL, 0, &state, sizeof(state));
+    ok(status == STATUS_SUCCESS, "SystemExecutionState failed, status %08lx\n", status);
+    ok(state & ES_DISPLAY_REQUIRED, "display requirement is missing from system state %#lx\n", state);
+
+    restore_state = 0;
+    status = pNtSetThreadExecutionState(old_state, &restore_state);
+    ok(status == STATUS_SUCCESS, "restoring execution state failed, status %08lx\n", status);
+
+    status = pNtPowerInformation(SystemExecutionState, NULL, 0, &state, sizeof(state));
+    ok(status == STATUS_SUCCESS, "SystemExecutionState failed, status %08lx\n", status);
+    old_state = 0;
+    status = pNtSetThreadExecutionState(ES_SYSTEM_REQUIRED, &old_state);
+    ok(status == STATUS_SUCCESS, "transient execution state failed, status %08lx\n", status);
+    status = pNtPowerInformation(SystemExecutionState, NULL, 0, &restore_state, sizeof(restore_state));
+    ok(status == STATUS_SUCCESS, "SystemExecutionState failed, status %08lx\n", status);
+    ok(restore_state == state, "transient request changed persistent state from %#lx to %#lx\n",
+       state, restore_state);
+
+    old_state = 0xcccccccc;
+    status = pNtSetThreadExecutionState(ES_USER_PRESENT | ES_SYSTEM_REQUIRED, &old_state);
+    ok(status == STATUS_INVALID_PARAMETER, "expected STATUS_INVALID_PARAMETER, got %08lx\n", status);
+    ok(old_state == 0xcccccccc, "failed call changed old state to %#lx\n", old_state);
+
+    status = pNtSetThreadExecutionState(ES_CONTINUOUS, NULL);
+    ok(status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %08lx\n", status);
+
+    context.ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    context.release = CreateEventW(NULL, TRUE, FALSE, NULL);
+    context.status = 0xcccccccc;
+    ok(!!context.ready && !!context.release, "failed to create events, error %lu\n",
+       GetLastError());
+    thread = context.ready && context.release
+        ? CreateThread(NULL, 0, execution_state_thread_proc, &context, 0, NULL) : NULL;
+    if (context.ready && context.release)
+        ok(!!thread, "failed to create execution-state thread, error %lu\n", GetLastError());
+    if (thread)
+    {
+        wait = WaitForSingleObject(context.ready, 10000);
+        ok(wait == WAIT_OBJECT_0, "timed out waiting for execution-state thread, wait %lu\n", wait);
+        if (wait == WAIT_OBJECT_0)
+        {
+            ok(context.status == STATUS_SUCCESS, "thread request failed, status %08lx\n",
+               context.status);
+            status = pNtPowerInformation(SystemExecutionState, NULL, 0, &state, sizeof(state));
+            ok(status == STATUS_SUCCESS, "SystemExecutionState failed, status %08lx\n", status);
+            ok(state & ES_DISPLAY_REQUIRED,
+               "thread display requirement is missing from %#lx\n", state);
+        }
+        SetEvent(context.release);
+        wait = WaitForSingleObject(thread, 10000);
+        ok(wait == WAIT_OBJECT_0, "timed out stopping execution-state thread, wait %lu\n", wait);
+        CloseHandle(thread);
+
+        if (wait == WAIT_OBJECT_0 && !(before & ES_DISPLAY_REQUIRED))
+        {
+            status = pNtPowerInformation(SystemExecutionState, NULL, 0, &state, sizeof(state));
+            ok(status == STATUS_SUCCESS, "SystemExecutionState failed, status %08lx\n", status);
+            ok(!(state & ES_DISPLAY_REQUIRED),
+               "thread exit left a display requirement in system state %#lx\n", state);
+        }
+    }
+    if (context.ready) CloseHandle(context.ready);
+    if (context.release) CloseHandle(context.release);
+
+    SetLastError(0xdeadbeef);
+    old_state = SetThreadExecutionState(ES_USER_PRESENT | ES_SYSTEM_REQUIRED);
+    ok(!old_state, "invalid SetThreadExecutionState returned %#lx\n", old_state);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER,
+       "expected ERROR_INVALID_PARAMETER, got %lu\n", GetLastError());
+}
+
 static void test_query_battery(void)
 {
     SYSTEM_BATTERY_STATE bs;
@@ -1767,6 +2285,7 @@ static void test_query_battery(void)
 
 static void test_query_processor_power_info(void)
 {
+    BYTE input = 0xa5;
     NTSTATUS status;
     PROCESSOR_POWER_INFORMATION* ppi;
     ULONG size;
@@ -1776,6 +2295,16 @@ static void test_query_processor_power_info(void)
     GetSystemInfo(&si);
     size = si.dwNumberOfProcessors * sizeof(PROCESSOR_POWER_INFORMATION);
     ppi = HeapAlloc(GetProcessHeap(), 0, size);
+
+    status = pNtPowerInformation(ProcessorInformation, &input, 1, ppi, size);
+    ok(status == STATUS_PRIVILEGE_NOT_HELD ||
+       broken(status == STATUS_INVALID_PARAMETER),
+       "Expected STATUS_PRIVILEGE_NOT_HELD, got %08lx\n", status);
+    status = pNtPowerInformation(ProcessorInformation, NULL, 1, ppi, size);
+    ok(status == STATUS_INVALID_PARAMETER, "Expected STATUS_INVALID_PARAMETER, got %08lx\n",
+       status);
+    status = pNtPowerInformation(ProcessorInformation, &input, 0, ppi, size);
+    ok(status == STATUS_SUCCESS, "Expected STATUS_SUCCESS, got %08lx\n", status);
 
     /* If size < (sizeof(PROCESSOR_POWER_INFORMATION) * NumberOfProcessors), Win7 returns
      * STATUS_BUFFER_TOO_SMALL. WinXP returns STATUS_SUCCESS for any value of size.  It copies as
@@ -4649,6 +5178,13 @@ START_TEST(info)
     test_query_data_alignment();
 
     /* NtPowerInformation */
+    test_power_query_buffers();
+    test_power_status_matrix();
+    test_power_policies();
+    test_verify_system_power_policy();
+    test_query_system_power_info();
+    test_last_sleep_wake_time();
+    test_execution_state();
     test_query_battery();
     test_query_processor_power_info();
 
