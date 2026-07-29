@@ -476,6 +476,8 @@ void macdrv_ThreadDetach(void)
         macdrv_destroy_event_queue(data->queue);
         if (data->keyboard_layout_uchr)
             CFRelease(data->keyboard_layout_uchr);
+        if (data->raw_keyboard_layout_uchr)
+            CFRelease(data->raw_keyboard_layout_uchr);
         free(data);
         /* clear data in case we get re-entered from user32 before the thread is truly dead */
         pthread_setspecific( macdrv_thread_data_key, NULL );
@@ -536,11 +538,14 @@ struct macdrv_thread_data *macdrv_init_thread_data(void)
         NtTerminateProcess(0, 1);
     }
 
-    macdrv_get_input_source_info(&data->keyboard_layout_uchr, &data->keyboard_type, &data->iso_keyboard,
-                                 &input_source, &input_source_is_ime);
-    data->active_keyboard_layout = macdrv_get_hkl_from_source(input_source);
+    macdrv_get_input_source_info(&data->keyboard_layout_uchr, &data->raw_keyboard_layout_uchr,
+                                 &data->keyboard_type, &data->iso_keyboard, &input_source,
+                                 &input_source_is_ime);
+    if (input_source)
+        data->active_keyboard_layout = macdrv_get_hkl_from_source(input_source);
     data->active_input_source_is_ime = input_source_is_ime;
-    CFRelease(input_source);
+    if (input_source)
+        CFRelease(input_source);
     macdrv_compute_keyboard_layout(data);
 
     set_queue_display_fd(macdrv_get_event_queue_fd(data->queue));

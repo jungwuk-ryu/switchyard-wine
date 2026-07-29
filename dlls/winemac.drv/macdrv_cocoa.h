@@ -314,6 +314,14 @@ enum {
     NUM_EVENT_TYPES
 };
 
+enum macdrv_ime_operation
+{
+    MACDRV_IME_SET_MARKED,
+    MACDRV_IME_COMMIT,
+    MACDRV_IME_UNMARK,
+    MACDRV_IME_CANCEL,
+};
+
 enum {
     QUIT_REASON_NONE,
     QUIT_REASON_LOGOUT,
@@ -347,10 +355,14 @@ typedef struct macdrv_event {
         }                                           hotkey_press;
         struct {
             void           *himc;
-            CFStringRef     text;       /* new text or NULL if just completing existing text */
-            unsigned int    cursor_begin;
-            unsigned int    cursor_end;
-            bool            complete;   /* is completing text? */
+            CFStringRef     text;        /* exact NSTextInputClient callback text */
+            CFStringRef     legacy_text; /* complete marked string for the IMM fallback */
+            uint64_t        selected_location;
+            uint64_t        selected_length;
+            uint64_t        replacement_location;
+            uint64_t        replacement_length;
+            enum macdrv_ime_operation operation;
+            bool            replacement_relative;
         }                                           im_set_text;
         struct {
             CGKeyCode                   keycode;
@@ -359,6 +371,7 @@ typedef struct macdrv_event {
         }                                           key;
         struct {
             CFDataRef                   uchr;
+            CFDataRef                   raw_uchr;
             CGEventSourceKeyboardType   keyboard_type;
             bool                        iso_keyboard;
             bool                        input_source_is_ime;
@@ -582,12 +595,15 @@ extern void macdrv_destroy_iosurface_layer(macdrv_iosurface_layer layer);
 extern bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2]);
 extern void macdrv_set_view_backing_size(macdrv_view v, const int backing_size[2]);
 extern uint32_t macdrv_window_background_color(void);
-extern bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat, void *data);
+extern bool macdrv_send_keydown_to_input_source(macdrv_window window, int keyc,
+                                                unsigned int flags, int repeat,
+                                                void *himc);
 extern bool macdrv_is_any_wine_window_visible(void);
 
 
 /* keyboard */
-extern void macdrv_get_input_source_info(CFDataRef* uchr,CGEventSourceKeyboardType* keyboard_type, bool* is_iso,
+extern void macdrv_get_input_source_info(CFDataRef* uchr, CFDataRef* raw_uchr,
+                                         CGEventSourceKeyboardType* keyboard_type, bool* is_iso,
                                          TISInputSourceRef* input_source, bool* input_source_is_ime);
 extern CFArrayRef macdrv_create_input_source_list(void);
 extern bool macdrv_select_input_source(TISInputSourceRef input_source, bool* input_source_is_ime);

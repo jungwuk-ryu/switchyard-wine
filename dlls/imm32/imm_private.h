@@ -46,6 +46,8 @@ extern UINT WM_MSIME_RECONVERT;
 extern UINT WM_MSIME_QUERYPOSITION;
 extern UINT WM_MSIME_DOCUMENTFEED;
 
+extern BOOL host_ime_apply_async_update( HWND hwnd, ULONG id );
+
 static const char *debugstr_wm_ime( UINT msg )
 {
     switch (msg)

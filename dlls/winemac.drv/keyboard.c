@@ -552,6 +552,19 @@ HKL macdrv_get_hkl_from_source(TISInputSourceRef input)
 }
 
 
+static const UCKeyboardLayout *get_raw_keyboard_layout(const struct macdrv_thread_data *thread_data)
+{
+    CFDataRef uchr;
+
+    if (thread_data->raw_keyboard_layout_uchr)
+        uchr = thread_data->raw_keyboard_layout_uchr;
+    else
+        uchr = thread_data->keyboard_layout_uchr;
+    if (!uchr) return NULL;
+    return (const UCKeyboardLayout *)CFDataGetBytePtr(uchr);
+}
+
+
 /***********************************************************************
  *              macdrv_compute_keyboard_layout
  */
@@ -663,7 +676,7 @@ void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data)
     };
     int vkey_range;
 
-    if (!thread_data->keyboard_layout_uchr)
+    if (!(uchr = get_raw_keyboard_layout(thread_data)))
     {
         ERR("no keyboard layout UCHR data\n");
         return;
@@ -702,8 +715,6 @@ void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data)
         thread_data->keyc2scan[kVK_ANSI_Grave] = thread_data->keyc2scan[kVK_ISO_Section];
         thread_data->keyc2scan[kVK_ISO_Section] = temp;
     }
-
-    uchr = (const UCKeyboardLayout*)CFDataGetBytePtr(thread_data->keyboard_layout_uchr);
 
     LocaleRefFromLocaleString("POSIX", &localeRef);
     UCCreateCollator(localeRef, 0, collateOptions, &collatorRef);
@@ -1031,17 +1042,24 @@ void macdrv_keyboard_changed(const macdrv_event *event)
 {
     struct macdrv_thread_data *thread_data = macdrv_thread_data();
 
-    TRACE("new keyboard layout uchr data %p, type %u, iso %d\n", event->keyboard_changed.uchr,
+    TRACE("new keyboard layout uchr data %p, raw uchr data %p, type %u, iso %d\n",
+          event->keyboard_changed.uchr, event->keyboard_changed.raw_uchr,
           event->keyboard_changed.keyboard_type, event->keyboard_changed.iso_keyboard);
 
     if (thread_data->keyboard_layout_uchr)
         CFRelease(thread_data->keyboard_layout_uchr);
     thread_data->keyboard_layout_uchr = CFDataCreateCopy(NULL, event->keyboard_changed.uchr);
+    if (thread_data->raw_keyboard_layout_uchr)
+        CFRelease(thread_data->raw_keyboard_layout_uchr);
+    if (event->keyboard_changed.uchr == event->keyboard_changed.raw_uchr)
+        thread_data->raw_keyboard_layout_uchr = (CFDataRef)CFRetain(thread_data->keyboard_layout_uchr);
+    else
+        thread_data->raw_keyboard_layout_uchr = CFDataCreateCopy(NULL, event->keyboard_changed.raw_uchr);
     thread_data->keyboard_type = event->keyboard_changed.keyboard_type;
     thread_data->iso_keyboard = event->keyboard_changed.iso_keyboard;
     thread_data->active_keyboard_layout = macdrv_get_hkl_from_source(event->keyboard_changed.input_source);
     thread_data->active_input_source_is_ime = event->keyboard_changed.input_source_is_ime;
-    thread_data->dead_key_state = 0;
+    thread_data->raw_dead_key_state = 0;
 
     macdrv_compute_keyboard_layout(thread_data);
 
@@ -1227,9 +1245,11 @@ void macdrv_hotkey_press(const macdrv_event *event)
 /***********************************************************************
  *              ImeToAsciiEx (MACDRV.@)
  */
-UINT macdrv_ImeToAsciiEx(UINT vkey, UINT vsc, const BYTE *state, HIMC himc)
+UINT macdrv_ImeToAsciiEx(HWND hwnd, UINT vkey, UINT vsc,
+                        const BYTE *state, HIMC himc)
 {
     struct macdrv_thread_data *thread_data = macdrv_thread_data();
+    macdrv_window window;
     unsigned int flags;
     int keyc;
     bool ret;
@@ -1281,7 +1301,11 @@ UINT macdrv_ImeToAsciiEx(UINT vkey, UINT vsc, const BYTE *state, HIMC himc)
     if (keyc >= ARRAY_SIZE(thread_data->keyc2vkey)) return 0;
 
     TRACE("flags 0x%08x keyc 0x%04x\n", flags, keyc);
-    ret = macdrv_send_keydown_to_input_source(keyc, flags, repeat, himc);
+    if (!(window = macdrv_get_cocoa_window(hwnd, FALSE)))
+        return STATUS_NOT_IMPLEMENTED;
+    macdrv_retain_cocoa_window(window);
+    ret = macdrv_send_keydown_to_input_source(window, keyc, flags, repeat, himc);
+    macdrv_release_cocoa_window(window);
     NtUserMsgWaitForMultipleObjectsEx(0, NULL, 0, QS_POSTMESSAGE | QS_SENDMESSAGE, 0);
     return ret ? STATUS_SUCCESS : STATUS_NOT_IMPLEMENTED;
 }
@@ -1314,12 +1338,16 @@ BOOL macdrv_ActivateKeyboardLayout(HKL hkl, UINT flags)
                 ret = TRUE;
                 if (thread_data->keyboard_layout_uchr)
                     CFRelease(thread_data->keyboard_layout_uchr);
+                if (thread_data->raw_keyboard_layout_uchr)
+                    CFRelease(thread_data->raw_keyboard_layout_uchr);
 
-                macdrv_get_input_source_info(&thread_data->keyboard_layout_uchr, &thread_data->keyboard_type,
+                macdrv_get_input_source_info(&thread_data->keyboard_layout_uchr,
+                                             &thread_data->raw_keyboard_layout_uchr,
+                                             &thread_data->keyboard_type,
                                              &thread_data->iso_keyboard, NULL, NULL);
                 thread_data->active_keyboard_layout = hkl;
                 thread_data->active_input_source_is_ime = input_source_is_ime;
-                thread_data->dead_key_state = 0;
+                thread_data->raw_dead_key_state = 0;
 
                 macdrv_compute_keyboard_layout(thread_data);
                 NtUserPostMessage( NULL, WM_WINE_IME_NOTIFY, IMN_WINE_SET_OPEN_STATUS,
@@ -1363,9 +1391,12 @@ INT macdrv_GetKeyNameText(LONG lparam, LPWSTR buffer, INT size)
             unsigned int vkey;
             int i;
 
-            uchr = (const UCKeyboardLayout*)CFDataGetBytePtr(thread_data->keyboard_layout_uchr);
-            status = UCKeyTranslate(uchr, keyc, kUCKeyActionDisplay, 0, thread_data->keyboard_type,
-                                    0, &deadKeyState, size - 1, &len, (UniChar*)buffer);
+            uchr = get_raw_keyboard_layout(thread_data);
+            if (uchr)
+                status = UCKeyTranslate(uchr, keyc, kUCKeyActionDisplay, 0, thread_data->keyboard_type,
+                                        0, &deadKeyState, size - 1, &len, (UniChar*)buffer);
+            else
+                status = paramErr;
             if (status != noErr)
                 len = 0;
             if (len && buffer[0] > 32)
@@ -1557,13 +1588,11 @@ UINT macdrv_MapVirtualKeyEx(UINT wCode, UINT wMapType, HKL hkl)
                 (VK_F1 <= wCode && wCode <= VK_F24))
                 break;
 
-            if (!thread_data || !thread_data->keyboard_layout_uchr)
+            if (!thread_data || !(uchr = get_raw_keyboard_layout(thread_data)))
             {
                 WARN("No keyboard layout uchr data\n");
                 break;
             }
-
-            uchr = (const UCKeyboardLayout*)CFDataGetBytePtr(thread_data->keyboard_layout_uchr);
 
             /* Find the Mac keycode corresponding to the vkey */
             for (keyc = 0; keyc < ARRAY_SIZE(thread_data->keyc2vkey); keyc++)
@@ -1741,10 +1770,8 @@ INT macdrv_ToUnicodeEx(UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
         }
     }
 
-    if (thread_data->keyboard_layout_uchr)
-        uchr = (const UCKeyboardLayout*)CFDataGetBytePtr(thread_data->keyboard_layout_uchr);
-    else
-        uchr = NULL;
+    if (!(uchr = get_raw_keyboard_layout(thread_data)))
+        goto done;
 
     keyAction = (scanCode & 0x8000) ? kUCKeyActionUp : kUCKeyActionDown;
 
@@ -1784,7 +1811,7 @@ INT macdrv_ToUnicodeEx(UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
     else
     {
         options = 0;
-        deadKeyState = thread_data->dead_key_state;
+        deadKeyState = thread_data->raw_dead_key_state;
     }
     savedDeadKeyState = deadKeyState;
     status = UCKeyTranslate(uchr, keyc, keyAction, modifierKeyState,
@@ -1797,10 +1824,10 @@ INT macdrv_ToUnicodeEx(UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
     }
     if (!is_menu)
     {
-        if (keyAction != kUCKeyActionUp && len > 0 && deadKeyState == thread_data->dead_key_state)
-            thread_data->dead_key_state = 0;
+        if (keyAction != kUCKeyActionUp && len > 0 && deadKeyState == thread_data->raw_dead_key_state)
+            thread_data->raw_dead_key_state = 0;
         else
-            thread_data->dead_key_state = deadKeyState;
+            thread_data->raw_dead_key_state = deadKeyState;
 
         if (keyAction == kUCKeyActionUp)
             goto done;
@@ -1875,7 +1902,7 @@ SHORT macdrv_VkKeyScanEx(WCHAR wChar, HKL hkl)
 
     TRACE("%04x, %p\n", wChar, hkl);
 
-    uchr = (const UCKeyboardLayout*)CFDataGetBytePtr(thread_data->keyboard_layout_uchr);
+    uchr = get_raw_keyboard_layout(thread_data);
     if (!uchr)
     {
         TRACE("no keyboard layout UCHR data; returning -1\n");

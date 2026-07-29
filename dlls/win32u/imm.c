@@ -24,6 +24,7 @@
 #pragma makedep unix
 #endif
 
+#include <limits.h>
 #include <pthread.h>
 #include "ntstatus.h"
 #include "win32u_private.h"
@@ -39,7 +40,20 @@ struct ime_update
     WORD vkey;
     WORD scan;
     BOOL key_consumed;
+    enum wine_host_ime_operation host_operation;
+    HWND host_hwnd;
+    HIMC host_himc;
+    DWORD host_thread_id;
+    ULONG host_update_id;
+    ULONG host_flags;
+    ULONG64 transaction_id;
+    ULONG64 focus_generation;
+    ULONG64 callback_serial;
+    struct wine_host_ime_range selected_range;
+    struct wine_host_ime_range replacement_range;
     DWORD cursor_pos;
+    UINT comp_length;
+    UINT result_length;
     WCHAR *comp_str;
     WCHAR *result_str;
     WCHAR buffer[];
@@ -61,12 +75,27 @@ struct imm_thread_data
     WORD  ime_process_scan;    /* scan code of the key being processed */
     WORD  ime_process_vkey;    /* vkey of the key being processed */
     struct ime_update *update; /* result of ImeProcessKey */
+    BOOL host_processing;
+    BOOL host_key_consumed;
+    HWND host_hwnd;
+    HIMC host_himc;
+    ULONG64 host_transaction_id;
+    ULONG64 host_focus_generation;
+    ULONG64 host_callback_serial;
+    BOOL host_route_active;
+    HWND host_root;
+    struct list host_updates;
 };
 
 static struct list thread_data_list = LIST_INIT( thread_data_list );
 static pthread_mutex_t imm_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct list ime_updates = LIST_INIT( ime_updates );
+static struct list host_async_updates = LIST_INIT( host_async_updates );
+static ULONG host_async_update_count;
 static BOOL disable_ime;
+
+static void update_host_ime_route( struct imm_thread_data *data,
+                                   enum wine_host_ime_operation operation );
 
 static struct imc *get_imc_ptr( HIMC handle )
 {
@@ -262,6 +291,7 @@ static struct imm_thread_data *get_imm_thread_data(void)
         struct imm_thread_data *data;
         if (!(data = calloc( 1, sizeof( *data )))) return NULL;
         data->thread_id = GetCurrentThreadId();
+        list_init( &data->host_updates );
 
         pthread_mutex_lock( &imm_mutex );
         list_add_tail( &thread_data_list, &data->entry );
@@ -407,9 +437,27 @@ void cleanup_imm_thread(void)
 
     if (thread_info->imm_thread_data)
     {
+        struct ime_update *update, *next;
+
         pthread_mutex_lock( &imm_mutex );
         list_remove( &thread_info->imm_thread_data->entry );
+        LIST_FOR_EACH_ENTRY_SAFE( update, next, &host_async_updates,
+                                  struct ime_update, entry )
+        {
+            if (update->host_thread_id !=
+                thread_info->imm_thread_data->thread_id)
+                continue;
+            list_remove( &update->entry );
+            free( update );
+        }
         pthread_mutex_unlock( &imm_mutex );
+        free( thread_info->imm_thread_data->update );
+        LIST_FOR_EACH_ENTRY_SAFE( update, next, &thread_info->imm_thread_data->host_updates,
+                                  struct ime_update, entry )
+        {
+            list_remove( &update->entry );
+            free( update );
+        }
         free( thread_info->imm_thread_data );
         thread_info->imm_thread_data = NULL;
     }
@@ -457,6 +505,41 @@ static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR 
     comp_len = comp_str ? wcslen( comp_str ) + 1 : 0;
     result_len = result_str ? wcslen( result_str ) + 1 : 0;
 
+    if (data->host_processing)
+    {
+        if (!(update = calloc( 1, offsetof(struct ime_update,
+                buffer[comp_len + result_len]) ) )) return;
+        update->host_hwnd = data->host_hwnd;
+        update->host_himc = data->host_himc;
+        update->host_thread_id = data->thread_id;
+        update->transaction_id = data->host_transaction_id;
+        update->focus_generation = data->host_focus_generation;
+        update->callback_serial = ++data->host_callback_serial;
+        update->cursor_pos = cursor_pos;
+        update->comp_length = comp_len ? comp_len - 1 : 0;
+        update->result_length = result_len ? result_len - 1 : 0;
+        update->comp_str = comp_str ? memcpy( update->buffer, comp_str,
+                comp_len * sizeof(WCHAR) ) : NULL;
+        update->result_str = result_str ? memcpy( update->buffer + comp_len,
+                result_str, result_len * sizeof(WCHAR) ) : NULL;
+        if (result_str) update->host_operation = WINE_HOST_IME_COMMIT;
+        else if (comp_str) update->host_operation = WINE_HOST_IME_SET_MARKED;
+        else update->host_operation = WINE_HOST_IME_UNMARK_EXISTING;
+        update->selected_range.location = WINE_HOST_IME_RANGE_NOT_FOUND;
+        update->replacement_range.location = WINE_HOST_IME_RANGE_NOT_FOUND;
+        if (update->host_operation == WINE_HOST_IME_SET_MARKED)
+        {
+            UINT begin = LOWORD(cursor_pos), end = HIWORD(cursor_pos);
+
+            if (end < begin) end = begin;
+            update->selected_range.location = begin;
+            update->selected_range.length = end - begin;
+        }
+        update_host_ime_route( data, update->host_operation );
+        list_add_tail( &data->host_updates, &update->entry );
+        return;
+    }
+
     /* prepend or keep the previous result string, if there was any */
     if (!data->ime_process_vkey || !data->update) prev_result_str = NULL;
     else prev_result_str = data->update->result_str;
@@ -477,6 +560,8 @@ static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR 
         return;
     }
     update->cursor_pos = cursor_pos;
+    update->comp_length = comp_len ? comp_len - 1 : 0;
+    update->result_length = result_len ? result_len - 1 : 0;
     update->comp_str = comp_str ? memcpy( update->buffer, comp_str, comp_len * sizeof(WCHAR) ) : NULL;
     update->result_str = result_str ? memcpy( update->buffer + comp_len, result_str, result_len * sizeof(WCHAR) ) : NULL;
 
@@ -499,6 +584,121 @@ static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR 
     }
 
     free( tmp );
+}
+
+static BOOL validate_host_ime_packet( const struct wine_host_ime_event *event,
+                                      ULONG size )
+{
+    SIZE_T required;
+
+    if (!event || size < offsetof(struct wine_host_ime_event, text) ||
+        event->version != WINE_HOST_IME_EVENT_VERSION ||
+        event->size != size ||
+        event->operation > WINE_HOST_IME_CONSUMED_NO_TEXT)
+        return FALSE;
+    if ((SIZE_T)event->text_length >
+        (size - offsetof(struct wine_host_ime_event, text)) / sizeof(WCHAR))
+        return FALSE;
+    required = offsetof(struct wine_host_ime_event, text) +
+               event->text_length * sizeof(WCHAR);
+    return required == size;
+}
+
+static struct ime_update *create_host_ime_update(
+        const struct wine_host_ime_event *event, HWND hwnd, HIMC himc,
+        DWORD thread_id, ULONG64 transaction_id, ULONG64 focus_generation,
+        ULONG64 callback_serial)
+{
+    struct ime_update *update;
+
+#if SIZE_MAX == UINT_MAX
+    if (event->text_length >
+        (SIZE_MAX - offsetof(struct ime_update, buffer)) / sizeof(WCHAR))
+        return NULL;
+#endif
+    if (!(update = calloc( 1, offsetof(struct ime_update,
+                                      buffer[event->text_length]) )))
+        return NULL;
+    update->host_operation = event->operation;
+    update->host_hwnd = hwnd;
+    update->host_himc = himc;
+    update->host_thread_id = thread_id;
+    update->host_flags = event->flags;
+    update->transaction_id = transaction_id;
+    update->focus_generation = focus_generation;
+    update->callback_serial = callback_serial;
+    update->selected_range = event->selected_range;
+    update->replacement_range = event->replacement_range;
+    update->comp_length = event->text_length;
+    if (event->text_length)
+        update->comp_str = memcpy( update->buffer, event->text,
+                                   event->text_length * sizeof(WCHAR) );
+    return update;
+}
+
+static void update_host_ime_route( struct imm_thread_data *data,
+                                   enum wine_host_ime_operation operation )
+{
+    if (operation == WINE_HOST_IME_SET_MARKED)
+        data->host_route_active = TRUE;
+    else if (operation == WINE_HOST_IME_COMMIT ||
+             operation == WINE_HOST_IME_UNMARK_EXISTING ||
+             operation == WINE_HOST_IME_CANCEL)
+        data->host_route_active = FALSE;
+}
+
+static NTSTATUS post_host_ime_update( HWND hwnd,
+                                     const struct ime_driver_call_params *params )
+{
+    const struct wine_host_ime_event *event = params->host_event;
+    struct imm_thread_data *data = get_imm_thread_data();
+    struct ime_update *update;
+    HWND root;
+    ULONG id;
+
+    if (!data || !validate_host_ime_packet( event, params->host_event_size ))
+        return STATUS_INVALID_PARAMETER;
+    if (!hwnd || !(root = NtUserGetAncestor( hwnd, GA_ROOT ))) root = hwnd;
+
+    /*
+     * A Cocoa callback may only join the route that fed its input context.
+     * In particular, never retarget delayed marked text to whichever window
+     * happens to be focused when the callback reaches the Wine UI thread.
+     */
+    if ((!data->host_processing && !data->host_route_active) ||
+        params->himc != data->host_himc || root != data->host_root)
+        return STATUS_NOT_FOUND;
+
+    if (!(update = create_host_ime_update( event, data->host_hwnd,
+            data->host_himc, data->thread_id, data->host_transaction_id,
+            data->host_focus_generation, ++data->host_callback_serial )))
+        return STATUS_SUCCESS; /* Never mix IMM into a live TSF composition. */
+
+    if (data->host_processing)
+    {
+        update_host_ime_route( data, update->host_operation );
+        list_add_tail( &data->host_updates, &update->entry );
+        return STATUS_SUCCESS;
+    }
+
+    pthread_mutex_lock( &imm_mutex );
+    do id = ++host_async_update_count;
+    while (!id);
+    update->host_update_id = id;
+    list_add_tail( &host_async_updates, &update->entry );
+    pthread_mutex_unlock( &imm_mutex );
+
+    if (!NtUserPostMessage( data->host_hwnd, WM_WINE_IME_NOTIFY,
+                            IMN_WINE_APPLY_HOST_UPDATE, id ))
+    {
+        pthread_mutex_lock( &imm_mutex );
+        list_remove( &update->entry );
+        pthread_mutex_unlock( &imm_mutex );
+        free( update );
+        return STATUS_SUCCESS; /* The captured target is no longer routable. */
+    }
+    update_host_ime_route( data, update->host_operation );
+    return STATUS_SUCCESS;
 }
 
 static UINT get_comp_clause_count( UINT comp_len, UINT cursor_begin, UINT cursor_end )
@@ -655,6 +855,119 @@ static UINT ime_to_tascii_ex( UINT vkey, UINT lparam, const BYTE *state, COMPOSI
     return 0;
 }
 
+static void clear_host_ime_updates( struct imm_thread_data *data )
+{
+    struct ime_update *update, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( update, next, &data->host_updates,
+                              struct ime_update, entry )
+    {
+        list_remove( &update->entry );
+        free( update );
+    }
+}
+
+static NTSTATUS copy_host_ime_update_entry(
+        const struct ime_update *update,
+        struct ime_driver_call_params *params )
+{
+    const WCHAR *text;
+    struct wine_host_ime_event *event;
+    ULONG required, text_length;
+
+    if (update->host_operation == WINE_HOST_IME_SET_MARKED)
+    {
+        text = update->comp_str;
+        text_length = update->comp_length;
+    }
+    else if (update->host_operation == WINE_HOST_IME_COMMIT)
+    {
+        if (update->result_str)
+        {
+            text = update->result_str;
+            text_length = update->result_length;
+        }
+        else
+        {
+            text = update->comp_str;
+            text_length = update->comp_length;
+        }
+    }
+    else
+    {
+        text = NULL;
+        text_length = 0;
+    }
+
+    if (text_length > (UINT_MAX - offsetof(struct wine_host_ime_event, text)) /
+                      sizeof(WCHAR))
+        return STATUS_INTEGER_OVERFLOW;
+    required = offsetof(struct wine_host_ime_event, text) +
+               text_length * sizeof(WCHAR);
+    if (params->host_event_required) *params->host_event_required = required;
+    if (!params->host_event || params->host_event_size < required)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    event = params->host_event;
+    memset( event, 0, required );
+    event->size = required;
+    event->version = WINE_HOST_IME_EVENT_VERSION;
+    event->hwnd = (UINT_PTR)update->host_hwnd;
+    event->himc = (UINT_PTR)update->host_himc;
+    event->thread_id = update->host_thread_id;
+    event->operation = update->host_operation;
+    event->transaction_id = update->transaction_id;
+    event->focus_generation = update->focus_generation;
+    event->callback_serial = update->callback_serial;
+    event->selected_range = update->selected_range;
+    event->replacement_range = update->replacement_range;
+    event->text_length = text_length;
+    event->flags = update->host_flags;
+    if (text_length) memcpy( event->text, text, text_length * sizeof(WCHAR) );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS copy_host_ime_update( struct imm_thread_data *data,
+                                     struct ime_driver_call_params *params )
+{
+    struct ime_update *update;
+    NTSTATUS status;
+
+    if (list_empty( &data->host_updates )) return STATUS_NOT_FOUND;
+    update = LIST_ENTRY( data->host_updates.next, struct ime_update, entry );
+    if ((status = copy_host_ime_update_entry( update, params )) != STATUS_SUCCESS)
+        return status;
+    list_remove( &update->entry );
+    free( update );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS get_async_host_ime_update(
+        ULONG id, struct ime_driver_call_params *params )
+{
+    struct ime_update *update;
+    NTSTATUS status = STATUS_NOT_FOUND;
+    DWORD thread_id = GetCurrentThreadId();
+
+    pthread_mutex_lock( &imm_mutex );
+    LIST_FOR_EACH_ENTRY( update, &host_async_updates,
+                         struct ime_update, entry )
+    {
+        if (update->host_update_id != id ||
+            update->host_thread_id != thread_id)
+            continue;
+        status = copy_host_ime_update_entry( update, params );
+        if (status == STATUS_SUCCESS)
+        {
+            list_remove( &update->entry );
+            free( update );
+        }
+        break;
+    }
+    pthread_mutex_unlock( &imm_mutex );
+    return status;
+}
+
 LRESULT ime_driver_call( HWND hwnd, enum wine_ime_call call, WPARAM wparam, LPARAM lparam,
                          struct ime_driver_call_params *params )
 {
@@ -668,10 +981,13 @@ LRESULT ime_driver_call( HWND hwnd, enum wine_ime_call call, WPARAM wparam, LPAR
         if (params->state)
         {
             struct imm_thread_data *data = get_imm_thread_data();
+            HWND target = NtUserGetAncestor( hwnd, GA_ROOT );
 
+            if (!target) target = hwnd;
             data->ime_process_scan = LOWORD(lparam);
             data->ime_process_vkey = LOWORD(wparam);
-            res = user_driver->pImeToAsciiEx( wparam, lparam, params->state, params->himc );
+            res = user_driver->pImeToAsciiEx( target, wparam, lparam,
+                                              params->state, params->himc );
             data->ime_process_vkey = data->ime_process_scan = 0;
 
             if (data->update)
@@ -688,6 +1004,59 @@ LRESULT ime_driver_call( HWND hwnd, enum wine_ime_call call, WPARAM wparam, LPAR
             if (res) return res;
         }
         return ime_to_tascii_ex( wparam, lparam, params->state, params->compstr, params->key_consumed, params->himc );
+    case WINE_IME_HOST_PROCESS_KEY:
+        {
+            struct imm_thread_data *data = get_imm_thread_data();
+
+            if (!data) return STATUS_NO_MEMORY;
+            if (params->state)
+            {
+                struct ime_update *update;
+
+                clear_host_ime_updates( data );
+                data->host_processing = TRUE;
+                data->host_hwnd = hwnd;
+                data->host_himc = params->himc;
+                data->host_transaction_id = params->transaction_id;
+                data->host_focus_generation = params->focus_generation;
+                data->host_callback_serial = params->callback_serial;
+                data->host_root = NtUserGetAncestor( hwnd, GA_ROOT );
+                if (!data->host_root) data->host_root = hwnd;
+                data->host_route_active = params->host_composing;
+                res = user_driver->pImeToAsciiEx( data->host_root, wparam,
+                                                  lparam, params->state,
+                                                  params->himc );
+                data->host_processing = FALSE;
+                data->host_key_consumed = !res;
+                LIST_FOR_EACH_ENTRY( update, &data->host_updates,
+                                     struct ime_update, entry )
+                    update->key_consumed = data->host_key_consumed;
+                if (list_empty( &data->host_updates ))
+                {
+                    if (res) return res;
+                    if (!(update = calloc( 1, sizeof(*update) )))
+                        return STATUS_NO_MEMORY;
+                    update->host_operation = WINE_HOST_IME_CONSUMED_NO_TEXT;
+                    update->host_hwnd = hwnd;
+                    update->host_himc = params->himc;
+                    update->host_thread_id = data->thread_id;
+                    update->transaction_id = params->transaction_id;
+                    update->focus_generation = params->focus_generation;
+                    update->callback_serial = ++data->host_callback_serial;
+                    update->key_consumed = TRUE;
+                    update->selected_range.location =
+                            WINE_HOST_IME_RANGE_NOT_FOUND;
+                    update->replacement_range.location =
+                            WINE_HOST_IME_RANGE_NOT_FOUND;
+                    list_add_tail( &data->host_updates, &update->entry );
+                }
+            }
+            return copy_host_ime_update( data, params );
+        }
+    case WINE_IME_POST_HOST_UPDATE:
+        return post_host_ime_update( hwnd, params );
+    case WINE_IME_GET_HOST_UPDATE:
+        return get_async_host_ime_update( (ULONG)lparam, params );
     case WINE_IME_POST_UPDATE:
         post_ime_update( hwnd, wparam, (WCHAR *)lparam, (WCHAR *)params );
         return 0;

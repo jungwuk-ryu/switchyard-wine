@@ -157,30 +157,149 @@ static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR 
                        result_str, NtUserImeDriverCall, FALSE );
 }
 
+static WCHAR *copy_cf_ime_string( CFStringRef string, CFIndex *length )
+{
+    WCHAR *ret;
+
+    *length = string ? CFStringGetLength( string ) : 0;
+    if (!string) return NULL;
+    if (*length < 0 || (SIZE_T)*length > (SIZE_MAX / sizeof(*ret)) - 1)
+        return NULL;
+    if (!(ret = malloc( (*length + 1) * sizeof(*ret) ))) return NULL;
+    if (*length)
+        CFStringGetCharacters( string, CFRangeMake( 0, *length ), ret );
+    ret[*length] = 0;
+    return ret;
+}
+
+static NTSTATUS post_host_ime_update( HWND hwnd, const macdrv_event *event )
+{
+    const CFStringRef string = event->im_set_text.text;
+    struct wine_host_ime_event *packet;
+    struct ime_driver_call_params params;
+    enum wine_host_ime_operation operation;
+    CFIndex length = string ? CFStringGetLength( string ) : 0;
+    SIZE_T size;
+    NTSTATUS status;
+
+    if (length < 0 || (ULONG64)length > UINT_MAX) return STATUS_INTEGER_OVERFLOW;
+    if ((SIZE_T)length > (SIZE_MAX - offsetof(struct wine_host_ime_event, text)) /
+                         sizeof(WCHAR))
+        return STATUS_INTEGER_OVERFLOW;
+    size = offsetof(struct wine_host_ime_event, text) + length * sizeof(WCHAR);
+    if (size > UINT_MAX || !(packet = calloc( 1, size )))
+        return STATUS_NO_MEMORY;
+
+    switch (event->im_set_text.operation)
+    {
+    case MACDRV_IME_SET_MARKED:
+        operation = WINE_HOST_IME_SET_MARKED;
+        break;
+    case MACDRV_IME_COMMIT:
+        operation = WINE_HOST_IME_COMMIT;
+        break;
+    case MACDRV_IME_UNMARK:
+        operation = WINE_HOST_IME_UNMARK_EXISTING;
+        break;
+    case MACDRV_IME_CANCEL:
+        operation = WINE_HOST_IME_CANCEL;
+        break;
+    default:
+        free( packet );
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    packet->size = size;
+    packet->version = WINE_HOST_IME_EVENT_VERSION;
+    packet->hwnd = (UINT_PTR)hwnd;
+    packet->himc = (UINT_PTR)event->im_set_text.himc;
+    packet->thread_id = GetCurrentThreadId();
+    packet->operation = operation;
+    packet->selected_range.location = event->im_set_text.selected_location;
+    packet->selected_range.length = event->im_set_text.selected_length;
+    packet->replacement_range.location = event->im_set_text.replacement_location;
+    packet->replacement_range.length = event->im_set_text.replacement_length;
+    packet->text_length = length;
+    if (event->im_set_text.replacement_relative)
+        packet->flags |= WINE_HOST_IME_EVENT_REPLACEMENT_RELATIVE;
+    if (length)
+        CFStringGetCharacters( string, CFRangeMake( 0, length ), packet->text );
+
+    memset( &params, 0, sizeof(params) );
+    params.himc = event->im_set_text.himc;
+    params.host_event = packet;
+    params.host_event_size = size;
+    status = NtUserMessageCall( hwnd, WINE_IME_POST_HOST_UPDATE, 0, 0,
+                                &params, NtUserImeDriverCall, FALSE );
+    free( packet );
+    return status;
+}
+
 /***********************************************************************
  *              macdrv_im_set_text
  */
 static void macdrv_im_set_text(const macdrv_event *event)
 {
     HWND hwnd = macdrv_get_window_hwnd(event->window);
-    WCHAR *text = NULL;
+    WCHAR *text = NULL, *legacy_text = NULL;
+    CFIndex text_length, legacy_length;
+    UINT cursor_begin, cursor_end;
+    NTSTATUS status;
 
-    TRACE_(imm)("win %p/%p himc %p text %s complete %u\n", hwnd, event->window, event->im_set_text.himc,
-                debugstr_cf(event->im_set_text.text), event->im_set_text.complete);
+    TRACE_(imm)("win %p/%p himc %p operation %u text %s selected %s:%s replacement %s:%s relative %u\n",
+                hwnd, event->window, event->im_set_text.himc,
+                event->im_set_text.operation, debugstr_cf(event->im_set_text.text),
+                wine_dbgstr_longlong(event->im_set_text.selected_location),
+                wine_dbgstr_longlong(event->im_set_text.selected_length),
+                wine_dbgstr_longlong(event->im_set_text.replacement_location),
+                wine_dbgstr_longlong(event->im_set_text.replacement_length),
+                event->im_set_text.replacement_relative);
 
-    if (event->im_set_text.text)
+    status = post_host_ime_update( hwnd, event );
+    if (status == STATUS_SUCCESS) return;
+    if (status != STATUS_NOT_FOUND)
+        WARN_(imm)("Host IME packet failed with status %#x; using IMM fallback.\n",
+                   status);
+
+    text = copy_cf_ime_string( event->im_set_text.text, &text_length );
+    legacy_text = copy_cf_ime_string( event->im_set_text.legacy_text,
+                                      &legacy_length );
+    if ((event->im_set_text.text && !text) ||
+        (event->im_set_text.legacy_text && !legacy_text))
+        goto done;
+
+    switch (event->im_set_text.operation)
     {
-        CFIndex length = CFStringGetLength(event->im_set_text.text);
-        if (!(text = malloc((length + 1) * sizeof(WCHAR)))) return;
-        if (length) CFStringGetCharacters(event->im_set_text.text, CFRangeMake(0, length), text);
-        text[length] = 0;
+    case MACDRV_IME_SET_MARKED:
+        if (event->im_set_text.selected_location ==
+            WINE_HOST_IME_RANGE_NOT_FOUND)
+            cursor_begin = cursor_end = min( legacy_length, 0xffff );
+        else
+        {
+            ULONG64 selection_end = event->im_set_text.selected_location +
+                                    event->im_set_text.selected_length;
+
+            if (selection_end < event->im_set_text.selected_location)
+                selection_end = ~(ULONG64)0;
+            cursor_begin = min( event->im_set_text.selected_location, 0xffff );
+            cursor_end = min( selection_end, 0xffff );
+        }
+        post_ime_update( hwnd, MAKELONG(cursor_begin, cursor_end),
+                         legacy_text, NULL );
+        break;
+    case MACDRV_IME_COMMIT:
+        post_ime_update( hwnd, -1, NULL, text );
+        break;
+    case MACDRV_IME_UNMARK:
+        post_ime_update( hwnd, -1, NULL, legacy_text );
+        break;
+    case MACDRV_IME_CANCEL:
+        post_ime_update( hwnd, -1, NULL, NULL );
+        break;
     }
 
-    if (event->im_set_text.complete) post_ime_update(hwnd, -1, NULL, text);
-    else post_ime_update(hwnd,
-                         MAKELONG(event->im_set_text.cursor_begin, event->im_set_text.cursor_end),
-                         text, NULL);
-
+done:
+    free(legacy_text);
     free(text);
 }
 

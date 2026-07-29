@@ -1145,14 +1145,12 @@ static void WineCompositorDetachView(WineContentView* view)
         [self invalidateHasGLDescendant];
     }
 
-    - (void) clearMarkedText
-    {
-        [markedText deleteCharactersInRange:NSMakeRange(0, [markedText length])];
-        markedTextSelection = NSMakeRange(0, 0);
-        [[self inputContext] discardMarkedText];
-    }
-
-    - (void) completeText:(NSString*)text
+    - (void) postIMEOperation:(enum macdrv_ime_operation)operation
+                         text:(NSString*)text
+                   legacyText:(NSString*)legacyText
+                selectedRange:(NSRange)selectedRange
+             replacementRange:(NSRange)replacementRange
+          replacementRelative:(BOOL)replacementRelative
     {
         macdrv_event* event;
         WineWindow* window = (WineWindow*)[self window];
@@ -1160,13 +1158,53 @@ static void WineCompositorDetachView(WineContentView* view)
         event = macdrv_create_event(IM_SET_TEXT, window);
         event->im_set_text.himc = [window himc];
         event->im_set_text.text = (CFStringRef)[text copy];
-        event->im_set_text.complete = true;
+        event->im_set_text.legacy_text = (CFStringRef)[legacyText copy];
+        event->im_set_text.operation = operation;
+        event->im_set_text.selected_location =
+            selectedRange.location == NSNotFound ? ~(uint64_t)0 : selectedRange.location;
+        event->im_set_text.selected_length =
+            selectedRange.location == NSNotFound ? 0 : selectedRange.length;
+        event->im_set_text.replacement_location =
+            replacementRange.location == NSNotFound ? ~(uint64_t)0 : replacementRange.location;
+        event->im_set_text.replacement_length =
+            replacementRange.location == NSNotFound ? 0 : replacementRange.length;
+        event->im_set_text.replacement_relative = replacementRelative;
 
         [[window queue] postEvent:event];
-
         macdrv_release_event(event);
+    }
 
-        [self clearMarkedText];
+    - (void) resetMarkedText
+    {
+        [markedText deleteCharactersInRange:NSMakeRange(0, [markedText length])];
+        markedTextSelection = NSMakeRange(0, 0);
+        [[self inputContext] discardMarkedText];
+    }
+
+    - (void) clearMarkedText
+    {
+        if ([markedText length])
+            [self postIMEOperation:MACDRV_IME_CANCEL
+                              text:nil
+                        legacyText:nil
+                     selectedRange:NSMakeRange(NSNotFound, 0)
+                  replacementRange:NSMakeRange(NSNotFound, 0)
+               replacementRelative:NO];
+        [self resetMarkedText];
+    }
+
+    - (void) completeText:(NSString*)text replacementRange:(NSRange)replacementRange
+    {
+        BOOL relative = [markedText length] &&
+                        replacementRange.location != NSNotFound;
+
+        [self postIMEOperation:MACDRV_IME_COMMIT
+                          text:text
+                    legacyText:text
+                 selectedRange:NSMakeRange(NSNotFound, 0)
+              replacementRange:replacementRange
+           replacementRelative:relative];
+        [self resetMarkedText];
     }
 
     - (void) didAddSubview:(NSView*)subview
@@ -1215,7 +1253,7 @@ static void WineCompositorDetachView(WineContentView* view)
             string = [string string];
 
         if ([string isKindOfClass:[NSString class]])
-            [self completeText:string];
+            [self completeText:string replacementRange:replacementRange];
     }
 
     - (void) doCommandBySelector:(SEL)aSelector
@@ -1230,26 +1268,39 @@ static void WineCompositorDetachView(WineContentView* view)
 
         if ([string isKindOfClass:[NSString class]])
         {
-            macdrv_event* event;
-            WineWindow* window = (WineWindow*)[self window];
+            BOOL hadMarkedText = [markedText length] != 0;
+            NSRange callbackReplacementRange = replacementRange;
+            NSRange localReplacementRange;
 
             if (replacementRange.location == NSNotFound)
-                replacementRange = NSMakeRange(0, [markedText length]);
+                localReplacementRange = NSMakeRange(0, [markedText length]);
+            else if (!hadMarkedText)
+                localReplacementRange = NSMakeRange(0, 0);
+            else if (NSMaxRange(replacementRange) <= [markedText length])
+                localReplacementRange = replacementRange;
+            else
+            {
+                ERR(@"Ignoring invalid marked-text replacement range %lu:%lu for length %lu.\n",
+                    (unsigned long)replacementRange.location,
+                    (unsigned long)replacementRange.length,
+                    (unsigned long)[markedText length]);
+                return;
+            }
 
-            [markedText replaceCharactersInRange:replacementRange withString:string];
+            [markedText replaceCharactersInRange:localReplacementRange withString:string];
             markedTextSelection = selectedRange;
-            markedTextSelection.location += replacementRange.location;
+            if (markedTextSelection.location == NSNotFound)
+                markedTextSelection = NSMakeRange([markedText length], 0);
+            else
+                markedTextSelection.location += localReplacementRange.location;
 
-            event = macdrv_create_event(IM_SET_TEXT, window);
-            event->im_set_text.himc = [window himc];
-            event->im_set_text.text = (CFStringRef)[[markedText string] copy];
-            event->im_set_text.complete = false;
-            event->im_set_text.cursor_begin = markedTextSelection.location;
-            event->im_set_text.cursor_end = markedTextSelection.location + markedTextSelection.length;
-
-            [[window queue] postEvent:event];
-
-            macdrv_release_event(event);
+            [self postIMEOperation:MACDRV_IME_SET_MARKED
+                              text:string
+                        legacyText:[markedText string]
+                     selectedRange:selectedRange
+                  replacementRange:callbackReplacementRange
+               replacementRelative:hadMarkedText &&
+                                   callbackReplacementRange.location != NSNotFound];
 
             [[self inputContext] invalidateCharacterCoordinates];
         }
@@ -1257,7 +1308,14 @@ static void WineCompositorDetachView(WineContentView* view)
 
     - (void) unmarkText
     {
-        [self completeText:nil];
+        if ([markedText length])
+            [self postIMEOperation:MACDRV_IME_UNMARK
+                              text:nil
+                        legacyText:[markedText string]
+                     selectedRange:NSMakeRange(NSNotFound, 0)
+                  replacementRange:NSMakeRange(NSNotFound, 0)
+               replacementRelative:NO];
+        [self resetMarkedText];
     }
 
     - (NSRange) selectedRange
@@ -5474,20 +5532,16 @@ uint32_t macdrv_window_background_color(void)
  * processed by input sources (AKA IMEs). This is only called when there is an
  * active non-keyboard input source.
  */
-bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat, void *himc)
+bool macdrv_send_keydown_to_input_source(macdrv_window mac_window, int keyc,
+                                         unsigned int flags, int repeat,
+                                         void *himc)
 {
-    __block bool ret;
+    __block bool ret = false;
 
     OnMainThread(^{
-        WineWindow* window = (WineWindow*)[NSApp keyWindow];
-        if (![window isKindOfClass:[WineWindow class]])
-        {
-            window = (WineWindow*)[NSApp mainWindow];
-            if (![window isKindOfClass:[WineWindow class]])
-                window = [[WineApplicationController sharedController] frontWineWindow];
-        }
+        WineWindow* window = (WineWindow*)mac_window;
 
-        if (window)
+        if ([window isKindOfClass:[WineWindow class]])
         {
             NSUInteger localFlags = flags;
             CGEventRef c;

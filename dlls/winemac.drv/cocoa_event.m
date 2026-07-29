@@ -669,9 +669,12 @@ void macdrv_release_event(macdrv_event *event)
             case IM_SET_TEXT:
                 if (event->im_set_text.text)
                     CFRelease(event->im_set_text.text);
+                if (event->im_set_text.legacy_text)
+                    CFRelease(event->im_set_text.legacy_text);
                 break;
             case KEYBOARD_CHANGED:
                 CFRelease(event->keyboard_changed.uchr);
+                CFRelease(event->keyboard_changed.raw_uchr);
                 CFRelease(event->keyboard_changed.input_source);
                 break;
             case QUERY_EVENT:

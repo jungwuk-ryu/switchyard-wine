@@ -52,6 +52,7 @@ enum {
 
     TISInputSourceRef lastKeyboardInputSource;
     TISInputSourceRef lastKeyboardLayoutInputSource;
+    TISInputSourceRef lastRawKeyboardLayoutInputSource;
     CGEventSourceKeyboardType keyboardType;
     NSEvent* lastFlagsChanged;
     BOOL inputSourceIsInputMethod;

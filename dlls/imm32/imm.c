@@ -88,6 +88,19 @@ struct imc
     struct ime *ime;
     UINT vkey;
 
+    enum
+    {
+        HOST_IME_ROUTE_NONE,
+        HOST_IME_ROUTE_TSF_SINK,
+        HOST_IME_ROUTE_COCOA,
+    } host_route;
+    HWND host_target;
+    HWND host_root;
+    ULONG64 host_focus_generation;
+    ULONG64 host_transaction_id;
+    ULONG64 host_callback_serial;
+    BOOL host_composing;
+
     HWND ui_hwnd; /* IME UI window, on the default input context */
 };
 
@@ -116,6 +129,32 @@ static CRITICAL_SECTION_DEBUG ime_cs_debug =
 };
 static CRITICAL_SECTION ime_cs = { &ime_cs_debug, -1, 0, 0, 0, 0 };
 static struct list ime_list = LIST_INIT( ime_list );
+static struct list text_frame_service_disabled_threads =
+        LIST_INIT( text_frame_service_disabled_threads );
+static BOOL text_frame_service_disabled_process;
+static LONG64 host_ime_transaction;
+static LONG64 host_ime_focus_generation;
+
+struct disabled_text_frame_service_thread
+{
+    struct list entry;
+    DWORD id;
+};
+
+typedef HRESULT (WINAPI *host_ime_query_func)(HWND, ULONG64, DWORD, DWORD *);
+typedef HRESULT (WINAPI *host_ime_process_key_func)(HWND, WPARAM, LPARAM,
+        ULONG64, ULONG64, BOOL *);
+typedef HRESULT (WINAPI *host_ime_apply_func)(const struct wine_host_ime_event *,
+        ULONG);
+typedef HRESULT (WINAPI *host_ime_reset_func)(HWND, ULONG64, DWORD);
+
+struct host_ime_api
+{
+    host_ime_query_func query;
+    host_ime_process_key_func process_key;
+    host_ime_apply_func apply;
+    host_ime_reset_func reset;
+};
 
 static const WCHAR layouts_formatW[] = L"System\\CurrentControlSet\\Control\\Keyboard Layouts\\%08lx";
 
@@ -759,11 +798,24 @@ static void input_context_init( INPUTCONTEXT *ctx )
 
 static void IMM_FreeThreadData(void)
 {
+    struct disabled_text_frame_service_thread *thread, *next;
     struct coinit_spy *spy;
     HIMC default_imc = (HIMC)NtUserGetThreadState( UserThreadStateDefaultInputContext );
+    DWORD id = GetCurrentThreadId();
 
     free_input_context_data( default_imc );
     if ((spy = get_thread_coinit_spy())) IInitializeSpy_Release( &spy->IInitializeSpy_iface );
+
+    EnterCriticalSection( &ime_cs );
+    LIST_FOR_EACH_ENTRY_SAFE( thread, next,
+                              &text_frame_service_disabled_threads,
+                              struct disabled_text_frame_service_thread, entry )
+    {
+        if (thread->id != id) continue;
+        list_remove( &thread->entry );
+        free( thread );
+    }
+    LeaveCriticalSection( &ime_cs );
 }
 
 static void IMM_FreeAllImmHkl(void)
@@ -787,6 +839,18 @@ static void IMM_FreeAllImmHkl(void)
     }
 }
 
+static void IMM_FreeTextFrameServiceState(void)
+{
+    struct disabled_text_frame_service_thread *thread, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( thread, next, &text_frame_service_disabled_threads,
+                              struct disabled_text_frame_service_thread, entry )
+    {
+        list_remove( &thread->entry );
+        free( thread );
+    }
+}
+
 BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
 {
     TRACE( "instance %p, reason %lx, reserved %p\n", instance, reason, reserved );
@@ -806,6 +870,7 @@ BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
         if (reserved) break;
         IMM_FreeThreadData();
         IMM_FreeAllImmHkl();
+        IMM_FreeTextFrameServiceState();
         break;
     }
 
@@ -2105,7 +2170,17 @@ UINT WINAPI ImmGetVirtualKey( HWND hwnd )
 
     TRACE( "%p\n", hwnd );
 
-    if ((imc = get_imc_data( himc ))) return imc->vkey;
+    if ((imc = get_imc_data( himc )))
+    {
+        /*
+         * A host TSF transaction already owns this key.  Returning the
+         * physical key here would let callers replace VK_PROCESSKEY and run
+         * ToUnicodeEx on it, duplicating the host-composed text as raw Jamo or
+         * another layout character.
+         */
+        if (imc->host_route != HOST_IME_ROUTE_NONE) return VK_PROCESSKEY;
+        return imc->vkey;
+    }
     return VK_PROCESSKEY;
 }
 
@@ -3060,6 +3135,256 @@ DWORD WINAPI ImmGetIMCCSize(HIMCC imcc)
     return GlobalSize(imcc);
 }
 
+static BOOL text_frame_service_is_disabled(void)
+{
+    struct disabled_text_frame_service_thread *thread;
+    DWORD id = GetCurrentThreadId();
+    BOOL disabled;
+
+    EnterCriticalSection( &ime_cs );
+    disabled = text_frame_service_disabled_process;
+    LIST_FOR_EACH_ENTRY( thread, &text_frame_service_disabled_threads,
+                         struct disabled_text_frame_service_thread, entry )
+    {
+        if (thread->id == id)
+        {
+            disabled = TRUE;
+            break;
+        }
+    }
+    LeaveCriticalSection( &ime_cs );
+    return disabled;
+}
+
+static BOOL get_host_ime_api(struct host_ime_api *api)
+{
+    HMODULE module;
+
+    memset( api, 0, sizeof(*api) );
+    /*
+     * Do not load msctf here.  The bridge is available only when the
+     * application has already created its TSF thread manager and text store.
+     */
+    if (!(module = GetModuleHandleW( L"msctf.dll" ))) return FALSE;
+    api->query = (void *)GetProcAddress( module, "TF_WineHostIMEQuery" );
+    api->process_key = (void *)GetProcAddress( module,
+            "TF_WineHostIMEProcessKey" );
+    api->apply = (void *)GetProcAddress( module, "TF_WineHostIMEApply" );
+    api->reset = (void *)GetProcAddress( module, "TF_WineHostIMEReset" );
+    return api->query && api->process_key && api->apply && api->reset;
+}
+
+static BOOL host_ime_prepare_generation(struct imc *imc, HWND hwnd,
+        const struct host_ime_api *api)
+{
+    HWND root = GetAncestor( hwnd, GA_ROOT );
+
+    if (!root) root = hwnd;
+    if (imc->host_root != root || imc->host_target != hwnd)
+    {
+        ULONG64 generation;
+
+        if (imc->host_root)
+        {
+            HRESULT hr = api->reset( imc->host_root,
+                    imc->host_focus_generation,
+                    imc->host_composing ? WINE_HOST_IME_RESET_CANCEL : 0 );
+
+            if (imc->host_composing && hr != S_OK)
+            {
+                WARN( "Failed to cancel host composition for root %p, hr %#lx.\n",
+                      imc->host_root, hr );
+                return FALSE;
+            }
+        }
+        generation = InterlockedIncrement64( &host_ime_focus_generation );
+        imc->host_target = hwnd;
+        imc->host_root = root;
+        imc->host_focus_generation = generation;
+        imc->host_callback_serial = 0;
+        imc->host_composing = FALSE;
+    }
+    else if (!imc->host_focus_generation)
+        imc->host_focus_generation =
+                InterlockedIncrement64( &host_ime_focus_generation );
+    return TRUE;
+}
+
+static HRESULT host_ime_apply_event(struct imc *imc,
+        const struct wine_host_ime_event *event,
+        const struct host_ime_api *api)
+{
+    HRESULT hr = api->apply( event, event->size );
+
+    if (FAILED(hr))
+        WARN( "Host TSF operation %#lx failed, hr %#lx.\n",
+              event->operation, hr );
+    if (hr != S_FALSE &&
+        event->callback_serial > imc->host_callback_serial)
+        imc->host_callback_serial = event->callback_serial;
+    if (FAILED(hr) || hr == S_FALSE) return hr;
+    if (event->operation == WINE_HOST_IME_SET_MARKED)
+        imc->host_composing = TRUE;
+    else if (event->operation == WINE_HOST_IME_COMMIT ||
+             event->operation == WINE_HOST_IME_UNMARK_EXISTING ||
+             event->operation == WINE_HOST_IME_CANCEL)
+        imc->host_composing = FALSE;
+    return hr;
+}
+
+static BOOL host_ime_process_cocoa_key(struct imc *imc, HWND hwnd, UINT vkey,
+        LPARAM lparam, const BYTE *state, const struct host_ime_api *api)
+{
+    BYTE stack_buffer[offsetof(struct wine_host_ime_event, text) +
+                      64 * sizeof(WCHAR)];
+    struct wine_host_ime_event *event = (void *)stack_buffer;
+    struct ime_driver_call_params params =
+    {
+        .himc = imc->handle,
+        .state = state,
+        .host_event = event,
+        .host_event_size = sizeof(stack_buffer),
+        .host_event_required = NULL,
+        .host_composing = imc->host_composing,
+    };
+    ULONG required = 0;
+    BOOL processed = FALSE;
+    NTSTATUS status;
+    UINT scan = HIWORD(lparam);
+
+    params.host_event_required = &required;
+    params.transaction_id = imc->host_transaction_id;
+    params.focus_generation = imc->host_focus_generation;
+    params.callback_serial = imc->host_callback_serial;
+
+    for (;;)
+    {
+        status = NtUserMessageCall( hwnd, WINE_IME_HOST_PROCESS_KEY, vkey,
+                scan, &params, NtUserImeDriverCall, FALSE );
+        if (status == STATUS_BUFFER_TOO_SMALL)
+        {
+            struct wine_host_ime_event *larger;
+
+            if (required < offsetof(struct wine_host_ime_event, text) ||
+                !(larger = malloc(required)))
+            {
+                if (event != (void *)stack_buffer) free( event );
+                return TRUE; /* Cocoa was already fed; never feed it twice. */
+            }
+            if (event != (void *)stack_buffer) free( event );
+            event = larger;
+            params.host_event = event;
+            params.host_event_size = required;
+            params.state = NULL;
+            continue;
+        }
+        if (status == STATUS_NOT_FOUND) break;
+        if (status != STATUS_SUCCESS)
+        {
+            if (event != (void *)stack_buffer) free( event );
+            return processed;
+        }
+
+        processed = TRUE;
+        host_ime_apply_event( imc, event, api );
+
+        params.state = NULL;
+        params.host_event = event;
+        params.host_event_size = event == (void *)stack_buffer ?
+                                 sizeof(stack_buffer) : required;
+    }
+    if (event != (void *)stack_buffer) free( event );
+    return processed;
+}
+
+BOOL host_ime_apply_async_update(HWND hwnd, ULONG id)
+{
+    BYTE stack_buffer[offsetof(struct wine_host_ime_event, text) +
+                      64 * sizeof(WCHAR)];
+    struct wine_host_ime_event *event = (void *)stack_buffer;
+    struct ime_driver_call_params params =
+    {
+        .host_event = event,
+        .host_event_size = sizeof(stack_buffer),
+    };
+    struct host_ime_api api;
+    struct imc *imc;
+    ULONG required = 0;
+    NTSTATUS status;
+    HIMC himc;
+    HWND target, root;
+
+    params.host_event_required = &required;
+    for (;;)
+    {
+        status = NtUserMessageCall( hwnd, WINE_IME_GET_HOST_UPDATE, 0, id,
+                                    &params, NtUserImeDriverCall, FALSE );
+        if (status != STATUS_BUFFER_TOO_SMALL) break;
+        if (required < offsetof(struct wine_host_ime_event, text))
+            return FALSE;
+        if (event != (void *)stack_buffer) free( event );
+        if (!(event = malloc(required))) return FALSE;
+        params.host_event = event;
+        params.host_event_size = required;
+    }
+    if (status != STATUS_SUCCESS) goto done;
+    target = (HWND)(UINT_PTR)event->hwnd;
+    himc = (HIMC)(UINT_PTR)event->himc;
+    if ((ULONG64)(UINT_PTR)target != event->hwnd ||
+        (ULONG64)(UINT_PTR)himc != event->himc ||
+        event->thread_id != GetCurrentThreadId() || !target ||
+        GetWindowThreadProcessId( target, NULL ) !=
+                   GetCurrentThreadId() ||
+        !(imc = get_imc_data( himc )) ||
+        event->focus_generation != imc->host_focus_generation)
+        goto done;
+    root = GetAncestor( target, GA_ROOT );
+    if (!root) root = target;
+    if (target != imc->host_target || root != imc->host_root ||
+        !get_host_ime_api( &api ))
+        goto done;
+
+    host_ime_apply_event( imc, event, &api );
+
+done:
+    if (event != (void *)stack_buffer) free( event );
+    return status == STATUS_SUCCESS;
+}
+
+static BOOL host_ime_process_key(struct imc *imc, HWND hwnd, UINT vkey,
+        LPARAM lparam, const BYTE *state, BOOL *attempted)
+{
+    struct host_ime_api api;
+    DWORD capabilities;
+    BOOL eaten = FALSE;
+    HRESULT hr;
+
+    *attempted = FALSE;
+    if ((lparam & 0x80000000) || text_frame_service_is_disabled() ||
+        !get_host_ime_api( &api ))
+        return FALSE;
+    if (!host_ime_prepare_generation( imc, hwnd, &api )) return FALSE;
+    if (api.query( hwnd, imc->host_focus_generation, 0,
+                   &capabilities ) != S_OK ||
+        !(capabilities & WINE_HOST_IME_CAP_COMPOSITION))
+        return FALSE;
+
+    *attempted = TRUE;
+    imc->host_transaction_id = InterlockedIncrement64( &host_ime_transaction );
+    hr = api.process_key( hwnd, vkey, lparam, imc->host_transaction_id,
+                          imc->host_focus_generation, &eaten );
+    if (hr == S_OK && eaten)
+    {
+        imc->host_route = HOST_IME_ROUTE_TSF_SINK;
+        return TRUE;
+    }
+
+    if (!host_ime_process_cocoa_key( imc, hwnd, vkey, lparam, state, &api ))
+        return FALSE;
+    imc->host_route = HOST_IME_ROUTE_COCOA;
+    return TRUE;
+}
+
 /***********************************************************************
 *		ImmGenerateMessage(IMM32.@)
 */
@@ -3117,6 +3442,14 @@ BOOL WINAPI ImmTranslateMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 
     if (msg < WM_KEYDOWN || msg > WM_KEYUP) return FALSE;
     if (!(data = get_imc_data( ImmGetContext( hwnd ) ))) return FALSE;
+    if (data->host_route != HOST_IME_ROUTE_NONE)
+    {
+        TRACE( "suppressing duplicate translation for host transaction %s\n",
+               wine_dbgstr_longlong(data->host_transaction_id) );
+        data->host_route = HOST_IME_ROUTE_NONE;
+        data->vkey = VK_PROCESSKEY;
+        return TRUE;
+    }
     if (!(ime = imc_select_ime( data ))) return FALSE;
 
     if ((vkey = data->vkey) == VK_PROCESSKEY) return FALSE;
@@ -3149,6 +3482,7 @@ BOOL WINAPI ImmProcessKey( HWND hwnd, HKL hkl, UINT vkey, LPARAM lparam, DWORD u
     struct imc *imc;
     struct ime *ime;
     BYTE state[256];
+    BOOL host_attempted = FALSE;
     BOOL ret;
 
     TRACE( "hwnd %p, hkl %p, vkey %#x, lparam %#Ix, unknown %#lx\n", hwnd, hkl, vkey, lparam, unknown );
@@ -3159,7 +3493,14 @@ BOOL WINAPI ImmProcessKey( HWND hwnd, HKL hkl, UINT vkey, LPARAM lparam, DWORD u
 
     GetKeyboardState( state );
 
+    imc->host_route = HOST_IME_ROUTE_NONE;
     ret = ime->pImeProcessKey( imc->handle, vkey, lparam, state );
+    if (ret)
+    {
+        BOOL host_handled = host_ime_process_key( imc, hwnd, vkey, lparam,
+                                                  state, &host_attempted );
+        if (host_attempted) ret = host_handled;
+    }
     imc->vkey = ret ? vkey : VK_PROCESSKEY;
 
     return ret;
@@ -3170,8 +3511,52 @@ BOOL WINAPI ImmProcessKey( HWND hwnd, HKL hkl, UINT vkey, LPARAM lparam, DWORD u
 */
 BOOL WINAPI ImmDisableTextFrameService(DWORD idThread)
 {
-    FIXME("Stub\n");
-    return FALSE;
+    struct disabled_text_frame_service_thread *thread;
+    HANDLE handle = NULL;
+    DWORD id = idThread;
+
+    TRACE( "thread %lu\n", idThread );
+    if (idThread == ~0u)
+    {
+        EnterCriticalSection( &ime_cs );
+        text_frame_service_disabled_process = TRUE;
+        LeaveCriticalSection( &ime_cs );
+        return TRUE;
+    }
+    if (!id) id = GetCurrentThreadId();
+    if (id != GetCurrentThreadId())
+    {
+        if (!(handle = OpenThread( THREAD_QUERY_LIMITED_INFORMATION, FALSE, id )))
+            return FALSE;
+        if (GetProcessIdOfThread( handle ) != GetCurrentProcessId())
+        {
+            CloseHandle( handle );
+            SetLastError( ERROR_ACCESS_DENIED );
+            return FALSE;
+        }
+        CloseHandle( handle );
+    }
+
+    EnterCriticalSection( &ime_cs );
+    LIST_FOR_EACH_ENTRY( thread, &text_frame_service_disabled_threads,
+                         struct disabled_text_frame_service_thread, entry )
+    {
+        if (thread->id == id)
+        {
+            LeaveCriticalSection( &ime_cs );
+            return TRUE;
+        }
+    }
+    if (!(thread = malloc( sizeof(*thread) )))
+    {
+        LeaveCriticalSection( &ime_cs );
+        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+        return FALSE;
+    }
+    thread->id = id;
+    list_add_tail( &text_frame_service_disabled_threads, &thread->entry );
+    LeaveCriticalSection( &ime_cs );
+    return TRUE;
 }
 
 /***********************************************************************
@@ -3345,9 +3730,18 @@ LRESULT WINAPI __wine_ime_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
  */
 BOOL WINAPI CtfImmIsCiceroEnabled(void)
 {
-    FIXME("(): stub\n");
-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-    return FALSE;
+    HRESULT (WINAPI *get_thread_mgr)(IUnknown **);
+    IUnknown *manager = NULL;
+    HMODULE module;
+    HRESULT hr;
+
+    if (text_frame_service_is_disabled() ||
+        !(module = GetModuleHandleW( L"msctf.dll" )) ||
+        !(get_thread_mgr = (void *)GetProcAddress( module, "TF_GetThreadMgr" )))
+        return FALSE;
+    hr = get_thread_mgr( &manager );
+    if (manager) IUnknown_Release( manager );
+    return SUCCEEDED(hr) && manager != NULL;
 }
 
 /***********************************************************************

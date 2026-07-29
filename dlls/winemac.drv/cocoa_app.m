@@ -96,6 +96,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
 
 static BOOL InputSourceIsInputMethod(TISInputSourceRef inputSource);
+static TISInputSourceRef CopyRawKeyboardLayoutInputSource(TISInputSourceRef inputSource,
+                                                         TISInputSourceRef inputSourceLayout);
+static void CopyKeyboardLayoutDataForInputSource(TISInputSourceRef inputSourceLayout,
+                                                 TISInputSourceRef rawInputSourceLayout,
+                                                 CFDataRef *uchr, CFDataRef *rawUchr);
 
 @interface WineApplicationController ()
 
@@ -302,6 +307,9 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
         [eventQueuesLock release];
         if (requestsManipQueue) dispatch_release(requestsManipQueue);
         [requests release];
+        if (lastRawKeyboardLayoutInputSource) CFRelease(lastRawKeyboardLayoutInputSource);
+        if (lastKeyboardLayoutInputSource) CFRelease(lastKeyboardLayoutInputSource);
+        if (lastKeyboardInputSource) CFRelease(lastKeyboardInputSource);
         if (requestSource)
         {
             CFRunLoopSourceInvalidate(requestSource);
@@ -683,7 +691,7 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
 
     - (void) keyboardSelectionDidChange:(BOOL)force
     {
-        TISInputSourceRef inputSource, inputSourceLayout;
+        TISInputSourceRef inputSource, inputSourceLayout, rawInputSourceLayout;
 
         if (!force)
         {
@@ -694,11 +702,14 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
 
         inputSource = TISCopyCurrentKeyboardInputSource();
         inputSourceLayout = TISCopyCurrentKeyboardLayoutInputSource();
+        rawInputSourceLayout = CopyRawKeyboardLayoutInputSource(inputSource, inputSourceLayout);
         if (!force && EqualInputSource(inputSource, lastKeyboardInputSource) &&
-            EqualInputSource(inputSourceLayout, lastKeyboardLayoutInputSource))
+            EqualInputSource(inputSourceLayout, lastKeyboardLayoutInputSource) &&
+            EqualInputSource(rawInputSourceLayout, lastRawKeyboardLayoutInputSource))
         {
             if (inputSource) CFRelease(inputSource);
             if (inputSourceLayout) CFRelease(inputSourceLayout);
+            if (rawInputSourceLayout) CFRelease(rawInputSourceLayout);
             return;
         }
 
@@ -708,13 +719,17 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
         if (lastKeyboardLayoutInputSource)
             CFRelease(lastKeyboardLayoutInputSource);
         lastKeyboardLayoutInputSource = inputSourceLayout;
+        if (lastRawKeyboardLayoutInputSource)
+            CFRelease(lastRawKeyboardLayoutInputSource);
+        lastRawKeyboardLayoutInputSource = rawInputSourceLayout;
 
         if (inputSourceLayout)
         {
-            CFDataRef uchr;
-            uchr = TISGetInputSourceProperty(inputSourceLayout,
-                    kTISPropertyUnicodeKeyLayoutData);
-            if (uchr)
+            CFDataRef uchr, rawUchr;
+
+            CopyKeyboardLayoutDataForInputSource(inputSourceLayout, rawInputSourceLayout,
+                                                 &uchr, &rawUchr);
+            if (uchr && rawUchr)
             {
                 macdrv_event* event;
                 WineEventQueue* queue;
@@ -722,21 +737,24 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
                 event = macdrv_create_event(KEYBOARD_CHANGED, nil);
                 event->keyboard_changed.keyboard_type = self.keyboardType;
                 event->keyboard_changed.iso_keyboard = (KBGetLayoutType(self.keyboardType) == kKeyboardISO);
-                event->keyboard_changed.uchr = CFDataCreateCopy(NULL, uchr);
+                event->keyboard_changed.uchr = uchr;
+                event->keyboard_changed.raw_uchr = rawUchr;
                 event->keyboard_changed.input_source_is_ime = InputSourceIsInputMethod(inputSource);
                 event->keyboard_changed.input_source = (TISInputSourceRef)CFRetain(inputSource);
 
-                if (event->keyboard_changed.uchr)
-                {
-                    [eventQueuesLock lock];
+                [eventQueuesLock lock];
 
-                    for (queue in eventQueues)
-                        [queue postEvent:event];
+                for (queue in eventQueues)
+                    [queue postEvent:event];
 
-                    [eventQueuesLock unlock];
-                }
+                [eventQueuesLock unlock];
 
                 macdrv_release_event(event);
+            }
+            else
+            {
+                if (uchr) CFRelease(uchr);
+                if (rawUchr) CFRelease(rawUchr);
             }
         }
     }
@@ -2296,6 +2314,55 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
         return type && !CFEqual(type, kTISTypeKeyboardLayout);
     }
 
+    static BOOL InputSourceIsASCIICapable(TISInputSourceRef inputSource)
+    {
+        CFTypeRef value;
+
+        if (!inputSource) return NO;
+        value = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceIsASCIICapable);
+        return value && CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value);
+    }
+
+    static CFDataRef CopyKeyboardLayoutData(TISInputSourceRef inputSource)
+    {
+        CFTypeRef value;
+
+        if (!inputSource) return NULL;
+        value = TISGetInputSourceProperty(inputSource, kTISPropertyUnicodeKeyLayoutData);
+        if (!value || CFGetTypeID(value) != CFDataGetTypeID()) return NULL;
+        return CFDataCreateCopy(NULL, value);
+    }
+
+    static TISInputSourceRef CopyRawKeyboardLayoutInputSource(TISInputSourceRef inputSource,
+                                                             TISInputSourceRef inputSourceLayout)
+    {
+        if (InputSourceIsInputMethod(inputSource) && !InputSourceIsASCIICapable(inputSourceLayout))
+            return TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
+        return NULL;
+    }
+
+    static void CopyKeyboardLayoutDataForInputSource(TISInputSourceRef inputSourceLayout,
+                                                     TISInputSourceRef rawInputSourceLayout,
+                                                     CFDataRef *uchr, CFDataRef *rawUchr)
+    {
+        *uchr = CopyKeyboardLayoutData(inputSourceLayout);
+
+        /* Input methods such as Korean 2-Set and Japanese Kana expose a
+           non-ASCII keyboard layout for composition.  When an application
+           declines IME processing and asks for raw Win32 translation, use the
+           ASCII-capable backing layout selected by macOS instead.  Do not do
+           this for non-IME keyboard layouts such as Russian. */
+        if (rawInputSourceLayout)
+            *rawUchr = CopyKeyboardLayoutData(rawInputSourceLayout);
+        else if (*uchr)
+            *rawUchr = (CFDataRef)CFRetain(*uchr);
+        else
+            *rawUchr = NULL;
+
+        if (!*rawUchr && *uchr)
+            *rawUchr = (CFDataRef)CFRetain(*uchr);
+    }
+
     - (BOOL) inputSourceIsInputMethod
     {
         static dispatch_once_t onceToken;
@@ -2635,9 +2702,12 @@ void macdrv_window_rejected_focus(const macdrv_event *event)
  *
  * Returns the keyboard layout uchr data, keyboard type and input source.
  */
-void macdrv_get_input_source_info(CFDataRef* uchr, CGEventSourceKeyboardType* keyboard_type, bool* is_iso,
+void macdrv_get_input_source_info(CFDataRef* uchr, CFDataRef* raw_uchr,
+                                  CGEventSourceKeyboardType* keyboard_type, bool* is_iso,
                                   TISInputSourceRef* input_source, bool* input_source_is_ime)
 {
+    *uchr = NULL;
+    *raw_uchr = NULL;
     if (input_source) *input_source = NULL;
     if (input_source_is_ime) *input_source_is_ime = false;
 
@@ -2647,22 +2717,21 @@ void macdrv_get_input_source_info(CFDataRef* uchr, CGEventSourceKeyboardType* ke
         inputSourceLayout = TISCopyCurrentKeyboardLayoutInputSource();
         if (inputSourceLayout)
         {
-            CFDataRef data = TISGetInputSourceProperty(inputSourceLayout,
-                                kTISPropertyUnicodeKeyLayoutData);
-            *uchr = CFDataCreateCopy(NULL, data);
-            CFRelease(inputSourceLayout);
+            TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+            TISInputSourceRef rawSource = CopyRawKeyboardLayoutInputSource(source, inputSourceLayout);
+
+            CopyKeyboardLayoutDataForInputSource(inputSourceLayout, rawSource, uchr, raw_uchr);
 
             *keyboard_type = [WineApplicationController sharedController].keyboardType;
             *is_iso = (KBGetLayoutType(*keyboard_type) == kKeyboardISO);
-            if (input_source || input_source_is_ime)
-            {
-                TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
 
-                if (input_source_is_ime)
-                    *input_source_is_ime = InputSourceIsInputMethod(source);
-                if (input_source) *input_source = source;
-                else if (source) CFRelease(source);
-            }
+            if (input_source_is_ime)
+                *input_source_is_ime = InputSourceIsInputMethod(source);
+            if (input_source) *input_source = source;
+            else if (source) CFRelease(source);
+
+            if (rawSource) CFRelease(rawSource);
+            CFRelease(inputSourceLayout);
         }
     });
 }

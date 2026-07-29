@@ -670,7 +670,8 @@ static void nulldrv_ReleaseKbdTables( const KBDTABLES *tables )
 {
 }
 
-static UINT nulldrv_ImeToAsciiEx( UINT vkey, UINT vsc, const BYTE *state, HIMC himc )
+static UINT nulldrv_ImeToAsciiEx( HWND hwnd, UINT vkey, UINT vsc,
+                                 const BYTE *state, HIMC himc )
 {
     return STATUS_NOT_IMPLEMENTED;
 }
@@ -1131,9 +1132,10 @@ static void loaderdrv_ReleaseKbdTables( const KBDTABLES *tables )
     return load_driver()->pReleaseKbdTables( tables );
 }
 
-static UINT loaderdrv_ImeToAsciiEx( UINT vkey, UINT vsc,const BYTE *state, HIMC himc )
+static UINT loaderdrv_ImeToAsciiEx( HWND hwnd, UINT vkey, UINT vsc,
+                                   const BYTE *state, HIMC himc )
 {
-    return load_driver()->pImeToAsciiEx( vkey, vsc, state, himc );
+    return load_driver()->pImeToAsciiEx( hwnd, vkey, vsc, state, himc );
 }
 
 static enum wine_ime_open_status loaderdrv_QueryHostIMEOpenStatus( HWND hwnd, HKL hkl )

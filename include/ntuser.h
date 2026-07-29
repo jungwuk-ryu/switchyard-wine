@@ -272,6 +272,69 @@ struct imm_translate_message_params
     LPARAM key_data;
 };
 
+/*
+ * Private host IME -> TSF operation packet.
+ *
+ * Cocoa NSString ranges and lengths are UTF-16 code-unit offsets.  Keep them
+ * 64-bit until the target TSF text store has accepted and bounds-checked them;
+ * narrowing them in the driver would corrupt long documents and replacement
+ * ranges.  The text immediately follows this fixed header and is not
+ * NUL-terminated.
+ */
+#define WINE_HOST_IME_EVENT_VERSION 1
+#define WINE_HOST_IME_RANGE_NOT_FOUND (~(ULONG64)0)
+
+enum wine_host_ime_operation
+{
+    WINE_HOST_IME_SET_MARKED,
+    WINE_HOST_IME_COMMIT,
+    WINE_HOST_IME_UNMARK_EXISTING,
+    WINE_HOST_IME_CANCEL,
+    WINE_HOST_IME_CONSUMED_NO_TEXT,
+};
+
+struct wine_host_ime_range
+{
+    ULONG64 location;
+    ULONG64 length;
+};
+
+struct wine_host_ime_event
+{
+    ULONG size;
+    ULONG version;
+    ULONG64 hwnd;
+    ULONG64 himc;
+    DWORD thread_id;
+    DWORD operation;
+    ULONG64 transaction_id;
+    ULONG64 focus_generation;
+    ULONG64 callback_serial;
+    struct wine_host_ime_range selected_range;
+    struct wine_host_ime_range replacement_range;
+    ULONG text_length;
+    ULONG flags;
+    WCHAR text[1];
+};
+C_ASSERT( offsetof(struct wine_host_ime_event, text) == 96 );
+
+#define WINE_HOST_IME_CAP_COMPOSITION 0x00000001
+#define WINE_HOST_IME_CAP_REPLACEMENT 0x00000002
+#define WINE_HOST_IME_CAP_EXACT_UTF16 0x00000004
+
+#define WINE_HOST_IME_QUERY_DISABLED 0x00000001
+
+/*
+ * NSTextInputClient replacement ranges are relative to the current marked
+ * range while a composition is active.  Keep that coordinate space explicit;
+ * treating such a range as a document ACP offset can overwrite unrelated
+ * application text.
+ */
+#define WINE_HOST_IME_EVENT_REPLACEMENT_RELATIVE 0x00000001
+
+/* Restore the pre-composition text and selection before dropping the route. */
+#define WINE_HOST_IME_RESET_CANCEL 0x00000001
+
 /* NtUserLoadImage params */
 struct load_image_params
 {
@@ -656,6 +719,7 @@ enum wine_internal_message
 /* internal WM_IME_NOTIFY wparams, not compatible with Windows */
 #define IMN_WINE_SET_OPEN_STATUS  0x000f
 #define IMN_WINE_SET_COMP_STRING  0x0010
+#define IMN_WINE_APPLY_HOST_UPDATE 0x0011
 
 /* not compatible with Windows */
 #define MAKE_FNID(index) ((WORD)(0x8000 | (index)))
@@ -666,6 +730,9 @@ enum wine_ime_call
     WINE_IME_TO_ASCII_EX,
     WINE_IME_POST_UPDATE,  /* for the user drivers */
     WINE_IME_QUERY_HOST_OPEN_STATUS,
+    WINE_IME_HOST_PROCESS_KEY,
+    WINE_IME_POST_HOST_UPDATE,
+    WINE_IME_GET_HOST_UPDATE,
 };
 
 enum wine_ime_open_status
@@ -682,6 +749,13 @@ struct ime_driver_call_params
     const BYTE *state;
     COMPOSITIONSTRING *compstr;
     BOOL *key_consumed;
+    struct wine_host_ime_event *host_event;
+    ULONG host_event_size;
+    ULONG *host_event_required;
+    ULONG64 transaction_id;
+    ULONG64 focus_generation;
+    ULONG64 callback_serial;
+    BOOL host_composing;
 };
 
 /* NtUserSystemTrayCall calls */

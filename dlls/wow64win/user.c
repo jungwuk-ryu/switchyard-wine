@@ -3723,6 +3723,13 @@ NTSTATUS WINAPI wow64_NtUserMessageCall( UINT *args )
                 ULONG state;
                 ULONG compstr;
                 ULONG key_consumed;
+                ULONG host_event;
+                ULONG host_event_size;
+                ULONG host_event_required;
+                ULONG64 transaction_id;
+                ULONG64 focus_generation;
+                ULONG64 callback_serial;
+                BOOL host_composing;
             } *params32 = result_info;
             struct ime_driver_call_params params;
             if (msg == WINE_IME_QUERY_HOST_OPEN_STATUS)
@@ -3732,6 +3739,13 @@ NTSTATUS WINAPI wow64_NtUserMessageCall( UINT *args )
             params.state = UlongToPtr( params32->state );
             params.compstr = UlongToPtr( params32->compstr );
             params.key_consumed = UlongToPtr( params32->key_consumed );
+            params.host_event = UlongToPtr( params32->host_event );
+            params.host_event_size = params32->host_event_size;
+            params.host_event_required = UlongToPtr( params32->host_event_required );
+            params.transaction_id = params32->transaction_id;
+            params.focus_generation = params32->focus_generation;
+            params.callback_serial = params32->callback_serial;
+            params.host_composing = params32->host_composing;
             return NtUserMessageCall( hwnd, msg, wparam, lparam, &params, type, ansi );
         }
 

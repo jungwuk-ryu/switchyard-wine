@@ -1640,7 +1640,7 @@ void macdrv_ActivateWindow(HWND hwnd, HWND previous)
     TRACE("%p\n", hwnd);
 
     if (!thread_data) return;
-    thread_data->dead_key_state = 0;
+    thread_data->raw_dead_key_state = 0;
     set_focus(hwnd, TRUE);
 }
 

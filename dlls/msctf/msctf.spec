@@ -23,6 +23,10 @@
 @ stub TF_GetMlngIconIndex
 @ stub TF_GetThreadFlags
 @ stdcall TF_GetThreadMgr(ptr)
+@ stdcall -private TF_WineHostIMEApply(ptr long)
+@ stdcall -private TF_WineHostIMEProcessKey(ptr long long int64 int64 ptr)
+@ stdcall -private TF_WineHostIMEQuery(ptr int64 long ptr)
+@ stdcall -private TF_WineHostIMEReset(ptr int64 long)
 @ stub TF_InatExtractIcon
 @ stdcall TF_InitMlngInfo()
 @ stub TF_InitSystem

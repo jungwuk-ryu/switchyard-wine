@@ -9,6 +9,7 @@ SOURCES = \
 	context.c \
 	displayattributemgr.c \
 	documentmgr.c \
+	hostime.c \
 	inputprocessor.c \
 	langbarmgr.c \
 	msctf.c \

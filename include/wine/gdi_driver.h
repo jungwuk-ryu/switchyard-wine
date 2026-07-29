@@ -218,7 +218,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 112
+#define WINE_GDI_DRIVER_VERSION 113
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -374,7 +374,7 @@ struct user_driver_funcs
     const KBDTABLES *(*pKbdLayerDescriptor)(HKL);
     void    (*pReleaseKbdTables)(const KBDTABLES *);
     /* IME functions */
-    UINT    (*pImeToAsciiEx)(UINT,UINT,const BYTE*,HIMC);
+    UINT    (*pImeToAsciiEx)(HWND,UINT,UINT,const BYTE*,HIMC);
     enum wine_ime_open_status (*pQueryHostIMEOpenStatus)(HWND,HKL);
     void    (*pNotifyIMEStatus)(HWND,UINT);
     BOOL    (*pSetIMECompositionRect)(HWND,RECT);
