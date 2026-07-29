@@ -45,7 +45,7 @@ extern HRESULT DocumentMgr_Constructor(ITfThreadMgrEventSink*, ITfDocumentMgr **
 extern HRESULT Context_Constructor(TfClientId tidOwner, IUnknown *punk, ITfDocumentMgr *mgr, ITfContext **ppOut, TfEditCookie *pecTextStore);
 extern HRESULT InputProcessorProfiles_Constructor(IUnknown *pUnkOuter, IUnknown **ppOut);
 extern HRESULT CategoryMgr_Constructor(IUnknown *pUnkOuter, IUnknown **ppOut);
-extern HRESULT Range_Constructor(ITfContext *context, DWORD anchorStart, DWORD anchorEnd, ITfRange **ppOut);
+extern HRESULT Range_Constructor(ITfContext *context, LONG anchorStart, LONG anchorEnd, ITfRange **ppOut);
 extern HRESULT CompartmentMgr_Constructor(IUnknown *pUnkOuter, REFIID riid, IUnknown **ppOut);
 extern HRESULT CompartmentMgr_Destructor(ITfCompartmentMgr *This);
 extern HRESULT LangBarMgr_Constructor(IUnknown *pUnkOuter, IUnknown **ppOut);
@@ -55,6 +55,10 @@ extern HRESULT Context_Initialize(ITfContext *cxt, ITfDocumentMgr *manager);
 extern HRESULT Context_Uninitialize(ITfContext *cxt);
 extern void    ThreadMgr_OnDocumentMgrDestruction(ITfThreadMgr *tm, ITfDocumentMgr *mgr);
 extern HRESULT TF_SELECTION_to_TS_SELECTION_ACP(const TF_SELECTION *tf, TS_SELECTION_ACP *tsAcp);
+extern BOOL Context_IsValidCookie(ITfContext *context, TfEditCookie cookie, DWORD lock_type);
+extern HRESULT Context_GetTextStore(ITfContext *context, TfEditCookie cookie, DWORD lock_type,
+        ITextStoreACP **store);
+extern void Context_RecordTextChange(ITfContext *context, const TS_TEXTCHANGE *change);
 
 /* cookie function */
 extern DWORD  generate_Cookie(DWORD magic, LPVOID data);

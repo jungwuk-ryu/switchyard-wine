@@ -57,7 +57,7 @@ cpp_quote("EXTERN_C const GUID GUID_PROP_TEXTOWNER;")
 cpp_quote("DEFINE_GUID(GUID_PROP_ATTRIBUTE,0x34b45670,0x7526,0x11d2,0xa1,0x47,0x00,0x10,0x5a,0x27,0x99,0xb5);")
 cpp_quote("EXTERN_C const GUID GUID_PROP_LANGID;")
 cpp_quote("EXTERN_C const GUID GUID_PROP_READING;")
-cpp_quote("EXTERN_C const GUID GUID_PROP_COMPOSING;")
+cpp_quote("DEFINE_GUID(GUID_PROP_COMPOSING,0xe12ac060,0xaf15,0x11d2,0xaf,0xc5,0x00,0x10,0x5a,0x27,0x99,0xb5);")
 
 cpp_quote("EXTERN_C const CLSID CLSID_TF_ThreadMgr;")
 cpp_quote("EXTERN_C const CLSID CLSID_TF_InputProcessorProfiles;")

@@ -974,38 +974,142 @@ static HRESULT WINAPI KeystrokeMgr_GetForeground(ITfKeystrokeMgr *iface,
     return S_OK;
 }
 
+static HRESULT keystroke_get_focused_context(ThreadMgr *This, ITfContext **context)
+{
+    if (!This->focus)
+    {
+        *context = NULL;
+        return S_FALSE;
+    }
+    return ITfDocumentMgr_GetTop(This->focus, context);
+}
+
+static void keystroke_notify_trace_sinks(ThreadMgr *This, BOOL key_down,
+        WPARAM wparam, LPARAM lparam)
+{
+    ITfKeyTraceEventSink **sinks = NULL, *sink;
+    struct list *cursor;
+    unsigned int count = 0, i = 0;
+
+    LIST_FOR_EACH(cursor, &This->KeyTraceEventSink) ++count;
+    if (count && !(sinks = calloc(count, sizeof(*sinks))))
+    {
+        WARN("Failed to snapshot %u key trace sinks.\n", count);
+        return;
+    }
+    LIST_FOR_EACH(cursor, &This->KeyTraceEventSink)
+    {
+        sink = (ITfKeyTraceEventSink *)SINK_ENTRY(cursor, IUnknown);
+        sinks[i++] = sink;
+        ITfKeyTraceEventSink_AddRef(sink);
+    }
+    for (i = 0; i < count; ++i)
+    {
+        if (key_down)
+            ITfKeyTraceEventSink_OnKeyTraceDown(sinks[i], wparam, lparam);
+        else
+            ITfKeyTraceEventSink_OnKeyTraceUp(sinks[i], wparam, lparam);
+        ITfKeyTraceEventSink_Release(sinks[i]);
+    }
+    free(sinks);
+}
+
 static HRESULT WINAPI KeystrokeMgr_TestKeyDown(ITfKeystrokeMgr *iface,
         WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
     ThreadMgr *This = impl_from_ITfKeystrokeMgr(iface);
-    FIXME("STUB:(%p)\n",This);
+    ITfKeyEventSink *sink;
+    ITfContext *context;
+    HRESULT hr;
+
+    TRACE("(%p) %#Ix %#Ix %p.\n", This, wParam, lParam, pfEaten);
+    if (!pfEaten) return E_INVALIDARG;
     *pfEaten = FALSE;
-    return S_OK;
+    if (!(sink = This->foregroundKeyEventSink)) return S_FALSE;
+    ITfKeyEventSink_AddRef(sink);
+    if (FAILED(hr = keystroke_get_focused_context(This, &context)) || !context)
+    {
+        ITfKeyEventSink_Release(sink);
+        return FAILED(hr) ? hr : S_FALSE;
+    }
+    hr = ITfKeyEventSink_OnTestKeyDown(sink, context, wParam, lParam, pfEaten);
+    ITfContext_Release(context);
+    ITfKeyEventSink_Release(sink);
+    return hr;
 }
 
 static HRESULT WINAPI KeystrokeMgr_TestKeyUp(ITfKeystrokeMgr *iface,
         WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
     ThreadMgr *This = impl_from_ITfKeystrokeMgr(iface);
-    FIXME("STUB:(%p)\n",This);
+    ITfKeyEventSink *sink;
+    ITfContext *context;
+    HRESULT hr;
+
+    TRACE("(%p) %#Ix %#Ix %p.\n", This, wParam, lParam, pfEaten);
+    if (!pfEaten) return E_INVALIDARG;
     *pfEaten = FALSE;
-    return S_OK;
+    if (!(sink = This->foregroundKeyEventSink)) return S_FALSE;
+    ITfKeyEventSink_AddRef(sink);
+    if (FAILED(hr = keystroke_get_focused_context(This, &context)) || !context)
+    {
+        ITfKeyEventSink_Release(sink);
+        return FAILED(hr) ? hr : S_FALSE;
+    }
+    hr = ITfKeyEventSink_OnTestKeyUp(sink, context, wParam, lParam, pfEaten);
+    ITfContext_Release(context);
+    ITfKeyEventSink_Release(sink);
+    return hr;
 }
 
 static HRESULT WINAPI KeystrokeMgr_KeyDown(ITfKeystrokeMgr *iface,
         WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
     ThreadMgr *This = impl_from_ITfKeystrokeMgr(iface);
-    FIXME("STUB:(%p)\n",This);
-    return E_NOTIMPL;
+    ITfKeyEventSink *sink;
+    ITfContext *context;
+    HRESULT hr;
+
+    TRACE("(%p) %#Ix %#Ix %p.\n", This, wParam, lParam, pfEaten);
+    if (!pfEaten) return E_INVALIDARG;
+    *pfEaten = FALSE;
+    if (!(sink = This->foregroundKeyEventSink)) return S_FALSE;
+    ITfKeyEventSink_AddRef(sink);
+    if (FAILED(hr = keystroke_get_focused_context(This, &context)) || !context)
+    {
+        ITfKeyEventSink_Release(sink);
+        return FAILED(hr) ? hr : S_FALSE;
+    }
+    keystroke_notify_trace_sinks(This, TRUE, wParam, lParam);
+    hr = ITfKeyEventSink_OnKeyDown(sink, context, wParam, lParam, pfEaten);
+    ITfContext_Release(context);
+    ITfKeyEventSink_Release(sink);
+    return hr;
 }
 
 static HRESULT WINAPI KeystrokeMgr_KeyUp(ITfKeystrokeMgr *iface,
         WPARAM wParam, LPARAM lParam, BOOL *pfEaten)
 {
     ThreadMgr *This = impl_from_ITfKeystrokeMgr(iface);
-    FIXME("STUB:(%p)\n",This);
-    return E_NOTIMPL;
+    ITfKeyEventSink *sink;
+    ITfContext *context;
+    HRESULT hr;
+
+    TRACE("(%p) %#Ix %#Ix %p.\n", This, wParam, lParam, pfEaten);
+    if (!pfEaten) return E_INVALIDARG;
+    *pfEaten = FALSE;
+    if (!(sink = This->foregroundKeyEventSink)) return S_FALSE;
+    ITfKeyEventSink_AddRef(sink);
+    if (FAILED(hr = keystroke_get_focused_context(This, &context)) || !context)
+    {
+        ITfKeyEventSink_Release(sink);
+        return FAILED(hr) ? hr : S_FALSE;
+    }
+    keystroke_notify_trace_sinks(This, FALSE, wParam, lParam);
+    hr = ITfKeyEventSink_OnKeyUp(sink, context, wParam, lParam, pfEaten);
+    ITfContext_Release(context);
+    ITfKeyEventSink_Release(sink);
+    return hr;
 }
 
 static HRESULT WINAPI KeystrokeMgr_GetPreservedKey(ITfKeystrokeMgr *iface,

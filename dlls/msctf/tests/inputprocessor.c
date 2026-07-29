@@ -84,6 +84,10 @@ static INT  test_DoEditSession = SINK_UNEXPECTED;
 static INT  test_ACP_InsertTextAtSelection = SINK_UNEXPECTED;
 static INT  test_ACP_SetSelection = SINK_UNEXPECTED;
 static INT  test_OnEndEdit = SINK_UNEXPECTED;
+static BOOL core_edit_record_expected;
+static unsigned int core_edit_stage;
+static ITfEditSession *core_reentrant_session;
+static BOOL core_defer_locks;
 
 DEFINE_GUID(CLSID_FakeService, 0xEDE1A7AD,0x66DE,0x47E0,0xB6,0x20,0x3E,0x92,0xF8,0x24,0x6B,0xF3);
 
@@ -177,6 +181,9 @@ typedef struct tagTextStoreACP
 {
     ITextStoreACP ITextStoreACP_iface;
     LONG refCount;
+    WCHAR text[256];
+    LONG length;
+    TS_SELECTION_ACP selection;
 
 } TextStoreACP;
 
@@ -274,6 +281,11 @@ static HRESULT WINAPI TextStoreACP_RequestLock(ITextStoreACP *iface,
 {
     if (winetest_debug > 1) trace("ITextStoreACP::RequestLock(flags %#lx)\n", flags);
     sink_fire_ok(&test_ACP_RequestLock,"TextStoreACP_RequestLock");
+    if (core_defer_locks)
+    {
+        *session_hr = TS_S_ASYNC;
+        return S_OK;
+    }
     *session_hr = ITextStoreACPSink_OnLockGranted(ACPSink, flags);
     return S_OK;
 }
@@ -287,19 +299,25 @@ static HRESULT WINAPI TextStoreACP_GetStatus(ITextStoreACP *iface,
 static HRESULT WINAPI TextStoreACP_QueryInsert(ITextStoreACP *iface, LONG start,
         LONG end, ULONG len, LONG *ret_start, LONG *ret_end)
 {
+    TextStoreACP *This = impl_from_ITextStoreACP(iface);
+
     if (winetest_debug > 1) trace("ITextStoreACP::QueryInsert(start %ld, end %ld, len %ld)\n", start, end, len);
+    if (!ret_start || !ret_end || start < 0 || end < start || end > This->length ||
+            len > LONG_MAX - start)
+        return E_INVALIDARG;
+    *ret_start = start;
+    *ret_end = start + len;
     return S_OK;
 }
 static HRESULT WINAPI TextStoreACP_GetSelection(ITextStoreACP *iface,
         ULONG index, ULONG count, TS_SELECTION_ACP *pSelection, ULONG *pcFetched)
 {
+    TextStoreACP *This = impl_from_ITextStoreACP(iface);
+
     if (winetest_debug > 1) trace("ITextStoreACP::GetSelection(index %ld)\n", index);
     sink_fire_ok(&test_ACP_GetSelection,"TextStoreACP_GetSelection");
 
-    pSelection->acpStart = 10;
-    pSelection->acpEnd = 20;
-    pSelection->style.fInterimChar = 0;
-    pSelection->style.ase = TS_AE_NONE;
+    *pSelection = This->selection;
     *pcFetched = 1;
 
     return S_OK;
@@ -307,22 +325,64 @@ static HRESULT WINAPI TextStoreACP_GetSelection(ITextStoreACP *iface,
 static HRESULT WINAPI TextStoreACP_SetSelection(ITextStoreACP *iface,
     ULONG ulCount, const TS_SELECTION_ACP *pSelection)
 {
+    TextStoreACP *This = impl_from_ITextStoreACP(iface);
+
     if (winetest_debug > 1) trace("ITextStoreACP::SetSelection()\n");
     sink_fire_ok(&test_ACP_SetSelection,"TextStoreACP_SetSelection");
+    if (!ulCount || !pSelection)
+        return E_INVALIDARG;
+    This->selection = pSelection[0];
     return S_OK;
 }
 static HRESULT WINAPI TextStoreACP_GetText(ITextStoreACP *iface, LONG start, LONG end,
         WCHAR *plain, ULONG plain_len, ULONG *plain_ret_len, TS_RUNINFO *runinfo,
         ULONG runinfo_count, ULONG *runinfo_ret_count, LONG *next)
 {
+    TextStoreACP *This = impl_from_ITextStoreACP(iface);
+    LONG limit, copied;
+
     if (winetest_debug > 1) trace("ITextStoreACP::GetText(start %ld, end %ld)\n", start, end);
+    if (start < 0 || start > This->length || (end != -1 && (end < start || end > This->length)))
+        return TS_E_INVALIDPOS;
+    limit = end == -1 ? This->length : end;
+    copied = min(limit - start, (LONG)plain_len);
+    if (copied && plain)
+        memcpy(plain, This->text + start, copied * sizeof(WCHAR));
+    if (plain_ret_len) *plain_ret_len = copied;
+    if (runinfo_ret_count) *runinfo_ret_count = 0;
+    if (runinfo && runinfo_count && copied)
+    {
+        runinfo[0].uCount = copied;
+        runinfo[0].type = TS_RT_PLAIN;
+        if (runinfo_ret_count) *runinfo_ret_count = 1;
+    }
+    if (next) *next = start + copied;
     return S_OK;
 }
 static HRESULT WINAPI TextStoreACP_SetText(ITextStoreACP *iface, DWORD flags,
         LONG start, LONG end, const WCHAR *text, ULONG len, TS_TEXTCHANGE *textchange)
 {
+    TextStoreACP *This = impl_from_ITextStoreACP(iface);
+    LONG old_length;
+
     if (winetest_debug > 1) trace("ITextStoreACP::SetText(flags %#lx, start %ld, end %ld, text %s)\n",
             flags, start, end, wine_dbgstr_wn(text, len));
+    if (start < 0 || end < start || end > This->length || len > ARRAY_SIZE(This->text) ||
+        This->length - (end - start) + len > ARRAY_SIZE(This->text))
+        return TS_E_INVALIDPOS;
+    old_length = This->length;
+    memmove(This->text + start + len, This->text + end,
+            (This->length - end) * sizeof(WCHAR));
+    if (len) memcpy(This->text + start, text, len * sizeof(WCHAR));
+    This->length += len - (end - start);
+    if (textchange)
+    {
+        textchange->acpStart = start;
+        textchange->acpOldEnd = end;
+        textchange->acpNewEnd = start + len;
+    }
+    if (This->selection.acpStart > old_length) This->selection.acpStart = This->length;
+    if (This->selection.acpEnd > old_length) This->selection.acpEnd = This->length;
     return S_OK;
 }
 static HRESULT WINAPI TextStoreACP_GetFormattedText(ITextStoreACP *iface,
@@ -353,10 +413,23 @@ static HRESULT WINAPI TextStoreACP_InsertEmbedded(ITextStoreACP *iface, DWORD fl
 static HRESULT WINAPI TextStoreACP_InsertTextAtSelection(ITextStoreACP *iface, DWORD flags,
         const WCHAR *text, ULONG len, LONG *start, LONG *end, TS_TEXTCHANGE *textchange)
 {
+    TextStoreACP *This = impl_from_ITextStoreACP(iface);
+    LONG selection_start, selection_end;
+    HRESULT hr;
+
     if (winetest_debug > 1) trace("ITextStoreACP::InsertTextAtSelection(flags %#lx, text %s)\n",
             flags, wine_dbgstr_wn(text, len));
     sink_fire_ok(&test_ACP_InsertTextAtSelection,"TextStoreACP_InsertTextAtSelection");
-    return S_OK;
+    selection_start = This->selection.acpStart;
+    selection_end = This->selection.acpEnd;
+    hr = TextStoreACP_SetText(iface, 0, selection_start, selection_end, text, len, textchange);
+    if (SUCCEEDED(hr))
+    {
+        if (start) *start = selection_start;
+        if (end) *end = selection_start + len;
+        This->selection.acpStart = This->selection.acpEnd = selection_start + len;
+    }
+    return hr;
 }
 static HRESULT WINAPI TextStoreACP_InsertEmbeddedAtSelection(ITextStoreACP *iface,
         DWORD flags, IDataObject *object, LONG *start, LONG *end, TS_TEXTCHANGE *textchange)
@@ -399,8 +472,12 @@ static HRESULT WINAPI TextStoreACP_RetrieveRequestedAttrs(ITextStoreACP *iface,
 static HRESULT WINAPI TextStoreACP_GetEndACP(ITextStoreACP *iface,
     LONG *pacp)
 {
+    TextStoreACP *This = impl_from_ITextStoreACP(iface);
+
     if (winetest_debug > 1) trace("ITextStoreACP::GetEndACP()\n");
     sink_fire_ok(&test_ACP_GetEndACP,"TextStoreACP_GetEndACP");
+    if (!pacp) return E_INVALIDARG;
+    *pacp = This->length;
     return S_OK;
 }
 static HRESULT WINAPI TextStoreACP_GetActiveView(ITextStoreACP *iface, TsViewCookie *view)
@@ -477,6 +554,12 @@ static HRESULT TextStoreACP_Constructor(IUnknown **ppOut)
 
     This->ITextStoreACP_iface.lpVtbl = &TextStoreACP_TextStoreACPVtbl;
     This->refCount = 1;
+    This->length = 20;
+    memcpy(This->text, L"01234567890123456789", This->length * sizeof(WCHAR));
+    This->selection.acpStart = 10;
+    This->selection.acpEnd = 20;
+    This->selection.style.fInterimChar = FALSE;
+    This->selection.style.ase = TS_AE_NONE;
 
     *ppOut = (IUnknown*)&This->ITextStoreACP_iface;
     return S_OK;
@@ -1665,6 +1748,64 @@ static ULONG WINAPI TextEditSink_Release(ITfTextEditSink *iface)
 static HRESULT WINAPI TextEditSink_OnEndEdit(ITfTextEditSink *iface,
     ITfContext *pic, TfEditCookie ecReadOnly, ITfEditRecord *pEditRecord)
 {
+    if (core_edit_record_expected)
+    {
+        const GUID *properties[] = {&GUID_PROP_COMPOSING, &GUID_PROP_ATTRIBUTE};
+        IEnumTfRanges *ranges;
+        ITfRange *range;
+        ULONG count;
+        HRESULT session_hr, hr;
+        BOOL changed;
+
+        ok(pEditRecord != NULL, "Expected a non-NULL edit record.\n");
+        if (pEditRecord)
+        {
+            changed = 0xdeadbeef;
+            hr = ITfEditRecord_GetSelectionStatus(pEditRecord, &changed);
+            ok(hr == S_OK, "GetSelectionStatus returned %#lx.\n", hr);
+            ok(changed == (core_edit_stage == 1), "Unexpected selection status %d at stage %u.\n",
+                    changed, core_edit_stage);
+
+            ranges = NULL;
+            hr = ITfEditRecord_GetTextAndPropertyUpdates(pEditRecord, TF_GTP_INCL_TEXT,
+                    NULL, 0, &ranges);
+            ok(hr == S_OK, "GetTextAndPropertyUpdates returned %#lx.\n", hr);
+            if (SUCCEEDED(hr))
+            {
+                range = NULL;
+                hr = IEnumTfRanges_Next(ranges, 1, &range, NULL);
+                ok(hr == (core_edit_stage == 1 ? S_OK : S_FALSE),
+                        "Unexpected text update result %#lx at stage %u.\n", hr, core_edit_stage);
+                if (range) ITfRange_Release(range);
+                IEnumTfRanges_Release(ranges);
+            }
+
+            ranges = NULL;
+            hr = ITfEditRecord_GetTextAndPropertyUpdates(pEditRecord, 0, properties,
+                    ARRAY_SIZE(properties), &ranges);
+            ok(hr == S_OK, "Property GetTextAndPropertyUpdates returned %#lx.\n", hr);
+            if (SUCCEEDED(hr))
+            {
+                count = 0;
+                while (IEnumTfRanges_Next(ranges, 1, &range, NULL) == S_OK)
+                {
+                    ++count;
+                    ITfRange_Release(range);
+                }
+                ok(count == (core_edit_stage == 1 ? 2 : 1),
+                        "Unexpected property update count %lu at stage %u.\n",
+                        count, core_edit_stage);
+                IEnumTfRanges_Release(ranges);
+            }
+        }
+
+        session_hr = 0xdeadbeef;
+        hr = ITfContext_RequestEditSession(pic, tid, core_reentrant_session,
+                TF_ES_SYNC | TF_ES_READWRITE, &session_hr);
+        ok(hr == S_OK, "Reentrant RequestEditSession returned %#lx.\n", hr);
+        ok(session_hr == TF_E_SYNCHRONOUS,
+                "Expected TF_E_SYNCHRONOUS, got %#lx.\n", session_hr);
+    }
     sink_fire_ok(&test_OnEndEdit,"TextEditSink_OnEndEdit");
     return S_OK;
 }
@@ -2031,6 +2172,8 @@ typedef struct tagEditSession
 {
     ITfEditSession ITfEditSession_iface;
     LONG refCount;
+    HRESULT (*callback)(TfEditCookie cookie, void *data);
+    void *data;
 } EditSession;
 
 static inline EditSession *impl_from_ITfEditSession(ITfEditSession *iface)
@@ -2098,6 +2241,7 @@ static void test_InsertAtSelection(TfEditCookie ec, ITfContext *cxt)
 static HRESULT WINAPI EditSession_DoEditSession(ITfEditSession *iface,
 TfEditCookie ec)
 {
+    EditSession *This = impl_from_ITfEditSession(iface);
     ITfContext *cxt, *context2;
     ITfDocumentMgr *dm;
     ITfRange *range;
@@ -2107,6 +2251,8 @@ TfEditCookie ec)
     HRESULT hr;
 
     sink_fire_ok(&test_DoEditSession,"EditSession_DoEditSession");
+    if (This->callback)
+        return This->callback(ec, This->data);
     sink_check_ok(&test_ACP_RequestLock,"RequestLock");
 
     ITfThreadMgr_GetFocus(g_tm, &dm);
@@ -2205,6 +2351,429 @@ static HRESULT EditSession_Constructor(ITfEditSession **ppOut)
 
     *ppOut = &This->ITfEditSession_iface;
     return S_OK;
+}
+
+typedef struct core_context_test
+{
+    ITfContext *context;
+    ITfComposition *composition;
+    unsigned int stage;
+} core_context_test;
+
+typedef struct core_async_test
+{
+    unsigned int id;
+    unsigned int *count;
+    unsigned int *order;
+} core_async_test;
+
+static HRESULT core_async_edit(TfEditCookie cookie, void *data)
+{
+    core_async_test *test = data;
+
+    test->order[(*test->count)++] = test->id;
+    return S_OK;
+}
+
+static ULONG count_compositions(ITfContextComposition *context_composition)
+{
+    IEnumITfCompositionView *enumerator;
+    ITfCompositionView *view;
+    ULONG count = 0;
+    HRESULT hr;
+
+    hr = ITfContextComposition_EnumCompositions(context_composition, &enumerator);
+    ok(hr == S_OK, "EnumCompositions returned %#lx.\n", hr);
+    if (FAILED(hr)) return 0;
+    while (IEnumITfCompositionView_Next(enumerator, 1, &view, NULL) == S_OK)
+    {
+        ++count;
+        ITfCompositionView_Release(view);
+    }
+    IEnumITfCompositionView_Release(enumerator);
+    return count;
+}
+
+static HRESULT core_context_edit(TfEditCookie cookie, void *data)
+{
+    core_context_test *test = data;
+    ITfContextComposition *context_composition;
+    ITfContextOwnerCompositionServices *owner_services;
+    HRESULT hr;
+
+    hr = ITfContext_QueryInterface(test->context, &IID_ITfContextComposition,
+            (void **)&context_composition);
+    ok(hr == S_OK, "QueryInterface(ITfContextComposition) returned %#lx.\n", hr);
+    if (FAILED(hr)) return hr;
+    hr = ITfContext_QueryInterface(test->context, &IID_ITfContextOwnerCompositionServices,
+            (void **)&owner_services);
+    ok(hr == S_OK, "QueryInterface(ITfContextOwnerCompositionServices) returned %#lx.\n", hr);
+    if (SUCCEEDED(hr)) ITfContextOwnerCompositionServices_Release(owner_services);
+
+    if (!test->stage)
+    {
+        const GUID *tracked_guids[] = {&GUID_PROP_COMPOSING, &GUID_PROP_ATTRIBUTE};
+        ITfReadOnlyProperty *tracking_property = NULL;
+        IEnumTfPropertyValue *value_enumerator;
+        IEnumTfRanges *range_enumerator;
+        ITfProperty *composing_property, *attribute_property;
+        ITfCompositionView *view;
+        IEnumITfCompositionView *composition_enumerator;
+        ITfRangeACP *range_acp;
+        ITfRange *range, *target, *end_range, *value_range;
+        TF_PROPERTYVAL property_value;
+        TF_SELECTION selection;
+        VARIANT value, tracking_value;
+        LONG start, length, document_end = 0;
+        ULONG composition_count, property_count, range_index;
+        BOOL found_composing = FALSE, found_attribute = FALSE;
+
+        hr = ITfContext_GetStart(test->context, cookie, &range);
+        ok(hr == S_OK, "GetStart returned %#lx.\n", hr);
+        if (FAILED(hr)) goto stage_done;
+        hr = ITfRange_QueryInterface(range, &IID_ITfRangeACP, (void **)&range_acp);
+        ok(hr == S_OK, "QueryInterface(ITfRangeACP) returned %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = ITfRangeACP_SetExtent(range_acp, 2, 3);
+            ok(hr == S_OK, "SetExtent returned %#lx.\n", hr);
+            ITfRangeACP_Release(range_acp);
+        }
+
+        hr = ITfContextComposition_StartComposition(context_composition, cookie, range,
+                NULL, &test->composition);
+        ok(hr == S_OK, "StartComposition returned %#lx.\n", hr);
+        ok(test->composition != NULL, "Expected a composition.\n");
+        composition_count = count_compositions(context_composition);
+        ok(composition_count == 1, "Expected one composition, got %lu.\n", composition_count);
+
+        hr = ITfContextComposition_FindComposition(context_composition, cookie, NULL,
+                &composition_enumerator);
+        ok(hr == S_OK, "FindComposition(NULL) returned %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            composition_count = 0;
+            while (IEnumITfCompositionView_Next(composition_enumerator, 1, &view, NULL) == S_OK)
+            {
+                ++composition_count;
+                ITfCompositionView_Release(view);
+            }
+            ok(composition_count == 1, "Expected one found composition, got %lu.\n",
+                    composition_count);
+            IEnumITfCompositionView_Release(composition_enumerator);
+        }
+
+        hr = ITfContextComposition_EnumCompositions(context_composition, &composition_enumerator);
+        ok(hr == S_OK, "EnumCompositions returned %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            view = NULL;
+            hr = IEnumITfCompositionView_Next(composition_enumerator, 1, &view, NULL);
+            ok(hr == S_OK, "Composition Next returned %#lx.\n", hr);
+            if (view)
+            {
+                ITfRange *composition_range;
+                hr = ITfCompositionView_GetRange(view, &composition_range);
+                ok(hr == S_OK, "Composition GetRange returned %#lx.\n", hr);
+                if (SUCCEEDED(hr))
+                {
+                    hr = ITfRange_QueryInterface(composition_range, &IID_ITfRangeACP,
+                            (void **)&range_acp);
+                    ok(hr == S_OK, "QueryInterface(ITfRangeACP) returned %#lx.\n", hr);
+                    if (SUCCEEDED(hr))
+                    {
+                        hr = ITfRangeACP_GetExtent(range_acp, &start, &length);
+                        ok(hr == S_OK, "GetExtent returned %#lx.\n", hr);
+                        ok(start == 2 && length == 3, "Unexpected composition extent %ld,%ld.\n",
+                                start, length);
+                        ITfRangeACP_Release(range_acp);
+                    }
+                    ITfRange_Release(composition_range);
+                }
+                ITfCompositionView_Release(view);
+            }
+            IEnumITfCompositionView_Release(composition_enumerator);
+        }
+
+        hr = ITfContext_GetProperty(test->context, &GUID_PROP_COMPOSING,
+                &composing_property);
+        ok(hr == S_OK, "GetProperty(COMPOSING) returned %#lx.\n", hr);
+        VariantInit(&value);
+        if (SUCCEEDED(hr))
+        {
+            hr = ITfProperty_GetValue(composing_property, cookie, range, &value);
+            ok(hr == S_OK, "COMPOSING GetValue returned %#lx.\n", hr);
+            ok(V_VT(&value) == VT_I4 && V_I4(&value) == TRUE,
+                    "Unexpected COMPOSING value type %u value %ld.\n",
+                    V_VT(&value), V_I4(&value));
+            VariantClear(&value);
+            ITfProperty_Release(composing_property);
+        }
+
+        hr = ITfContext_GetProperty(test->context, &GUID_PROP_ATTRIBUTE,
+                &attribute_property);
+        ok(hr == S_OK, "GetProperty(ATTRIBUTE) returned %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            VariantInit(&value);
+            V_VT(&value) = VT_I4;
+            V_I4(&value) = 0x1234;
+            hr = ITfProperty_SetValue(attribute_property, cookie, range, &value);
+            ok(hr == S_OK, "ATTRIBUTE SetValue returned %#lx.\n", hr);
+            ITfProperty_Release(attribute_property);
+        }
+
+        hr = ITfContext_TrackProperties(test->context, tracked_guids, 2, NULL, 0,
+                &tracking_property);
+        ok(hr == S_OK, "TrackProperties returned %#lx.\n", hr);
+        target = end_range = NULL;
+        hr = ITfContext_GetStart(test->context, cookie, &target);
+        ok(hr == S_OK, "GetStart returned %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            test_ACP_GetEndACP = SINK_EXPECTED;
+            hr = ITfContext_GetEnd(test->context, cookie, &end_range);
+            ok(hr == S_OK, "GetEnd returned %#lx.\n", hr);
+            sink_check_ok(&test_ACP_GetEndACP, "GetEndACP");
+        }
+        if (target && end_range)
+        {
+            hr = ITfRange_ShiftEndToRange(target, cookie, end_range, TF_ANCHOR_END);
+            ok(hr == S_OK, "ShiftEndToRange returned %#lx.\n", hr);
+            hr = ITfRange_QueryInterface(target, &IID_ITfRangeACP, (void **)&range_acp);
+            ok(hr == S_OK, "Tracking target QI returned %#lx.\n", hr);
+            if (SUCCEEDED(hr))
+            {
+                hr = ITfRangeACP_GetExtent(range_acp, &start, &length);
+                ok(hr == S_OK, "Tracking target GetExtent returned %#lx.\n", hr);
+                if (SUCCEEDED(hr)) document_end = start + length;
+                ITfRangeACP_Release(range_acp);
+            }
+        }
+        if (tracking_property && target)
+        {
+            hr = ITfReadOnlyProperty_EnumRanges(tracking_property, cookie,
+                    &range_enumerator, target);
+            ok(hr == S_OK, "Tracking EnumRanges returned %#lx.\n", hr);
+            if (SUCCEEDED(hr))
+            {
+                range_index = 0;
+                while (IEnumTfRanges_Next(range_enumerator, 1, &value_range, NULL) == S_OK)
+                {
+                    const LONG expected_start[] = {0, 2, 5};
+                    const LONG expected_length[] = {2, 3, document_end - 5};
+
+                    hr = ITfRange_QueryInterface(value_range, &IID_ITfRangeACP,
+                            (void **)&range_acp);
+                    ok(hr == S_OK, "Tracking range QI returned %#lx.\n", hr);
+                    if (SUCCEEDED(hr))
+                    {
+                        hr = ITfRangeACP_GetExtent(range_acp, &start, &length);
+                        ok(hr == S_OK, "Tracking range GetExtent returned %#lx.\n", hr);
+                        ok(range_index < ARRAY_SIZE(expected_start),
+                                "Unexpected extra tracking range %lu.\n", range_index);
+                        if (range_index < ARRAY_SIZE(expected_start))
+                            ok(start == expected_start[range_index] &&
+                                    length == expected_length[range_index],
+                                    "Unexpected tracking extent %ld,%ld at index %lu.\n",
+                                    start, length, range_index);
+                        ITfRangeACP_Release(range_acp);
+                    }
+
+                    VariantInit(&tracking_value);
+                    hr = ITfReadOnlyProperty_GetValue(tracking_property, cookie,
+                            value_range, &tracking_value);
+                    ok(hr == S_OK, "Tracking GetValue returned %#lx.\n", hr);
+                    ok(V_VT(&tracking_value) == VT_UNKNOWN,
+                            "Unexpected tracking value type %u.\n", V_VT(&tracking_value));
+                    if (V_VT(&tracking_value) == VT_UNKNOWN)
+                    {
+                        hr = IUnknown_QueryInterface(V_UNKNOWN(&tracking_value),
+                                &IID_IEnumTfPropertyValue, (void **)&value_enumerator);
+                        ok(hr == S_OK, "Tracking value QI returned %#lx.\n", hr);
+                        if (SUCCEEDED(hr))
+                        {
+                            property_count = 0;
+                            while (IEnumTfPropertyValue_Next(value_enumerator, 1,
+                                    &property_value, NULL) == S_OK)
+                            {
+                                ++property_count;
+                                if (IsEqualGUID(&property_value.guidId, &GUID_PROP_COMPOSING))
+                                {
+                                    found_composing = TRUE;
+                                    ok(V_VT(&property_value.varValue) == VT_I4 &&
+                                            V_I4(&property_value.varValue) == TRUE,
+                                            "Unexpected COMPOSING tracked value.\n");
+                                }
+                                if (IsEqualGUID(&property_value.guidId, &GUID_PROP_ATTRIBUTE))
+                                {
+                                    found_attribute = TRUE;
+                                    ok(V_VT(&property_value.varValue) == VT_I4 &&
+                                            V_I4(&property_value.varValue) == 0x1234,
+                                            "Unexpected ATTRIBUTE tracked value.\n");
+                                }
+                                VariantClear(&property_value.varValue);
+                            }
+                            ok(property_count == (range_index == 1 ? 2 : 0),
+                                    "Unexpected tracked property count %lu at range %lu.\n",
+                                    property_count, range_index);
+                            IEnumTfPropertyValue_Release(value_enumerator);
+                        }
+                    }
+                    VariantClear(&tracking_value);
+                    ITfRange_Release(value_range);
+                    ++range_index;
+                }
+                ok(range_index == 3, "Expected three tracking ranges, got %lu.\n",
+                        range_index);
+                IEnumTfRanges_Release(range_enumerator);
+            }
+            ok(found_composing, "Did not enumerate the COMPOSING property.\n");
+            ok(found_attribute, "Did not enumerate the ATTRIBUTE property.\n");
+        }
+        if (tracking_property) ITfReadOnlyProperty_Release(tracking_property);
+        if (end_range) ITfRange_Release(end_range);
+        if (target) ITfRange_Release(target);
+
+        hr = ITfRange_SetText(range, cookie, 0, L"abc", 3);
+        ok(hr == S_OK, "Range SetText returned %#lx.\n", hr);
+        selection.range = range;
+        selection.style.ase = TF_AE_END;
+        selection.style.fInterimChar = FALSE;
+        test_ACP_SetSelection = SINK_EXPECTED;
+        hr = ITfContext_SetSelection(test->context, cookie, 1, &selection);
+        ok(hr == S_OK, "SetSelection returned %#lx.\n", hr);
+        sink_check_ok(&test_ACP_SetSelection, "SetSelection");
+        ITfRange_Release(range);
+    }
+    else
+    {
+        ITfRange *range;
+        ULONG composition_count = count_compositions(context_composition);
+        ok(composition_count == 1, "Expected one active composition, got %lu.\n",
+                composition_count);
+        hr = ITfComposition_EndComposition(test->composition, cookie);
+        ok(hr == S_OK, "EndComposition returned %#lx.\n", hr);
+        composition_count = count_compositions(context_composition);
+        ok(!composition_count, "Expected no active compositions, got %lu.\n",
+                composition_count);
+
+        range = (ITfRange *)0xdeadbeef;
+        hr = ITfComposition_GetRange(test->composition, &range);
+        ok(hr == E_UNEXPECTED, "Post-end GetRange returned %#lx.\n", hr);
+        ok(range == NULL, "Post-end GetRange returned %p.\n", range);
+        hr = ITfContext_GetStart(test->context, cookie, &range);
+        ok(hr == S_OK, "GetStart returned %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = ITfComposition_ShiftStart(test->composition, cookie, range);
+            ok(hr == E_UNEXPECTED, "Post-end ShiftStart returned %#lx.\n", hr);
+            hr = ITfComposition_ShiftEnd(test->composition, cookie, range);
+            ok(hr == E_UNEXPECTED, "Post-end ShiftEnd returned %#lx.\n", hr);
+            ITfRange_Release(range);
+        }
+        hr = ITfComposition_EndComposition(test->composition, cookie);
+        ok(hr == E_UNEXPECTED, "Second EndComposition returned %#lx.\n", hr);
+    }
+
+stage_done:
+    ++test->stage;
+    core_edit_stage = test->stage;
+    ITfContextComposition_Release(context_composition);
+    return S_OK;
+}
+
+static void test_context_core(void)
+{
+    core_context_test test = {0};
+    core_async_test async_tests[2];
+    EditSession *session_impl;
+    ITfEditSession *async_sessions[2], *session;
+    ITfTextEditSink *sink;
+    ITfSource *source;
+    ITfDocumentMgr *dm;
+    DWORD sink_cookie;
+    HRESULT session_hr, hr;
+    unsigned int async_count = 0, async_order[2] = {0}, i;
+
+    hr = ITfThreadMgr_GetFocus(g_tm, &dm);
+    ok(hr == S_OK, "GetFocus returned %#lx.\n", hr);
+    hr = ITfDocumentMgr_GetTop(dm, &test.context);
+    ok(hr == S_OK, "GetTop returned %#lx.\n", hr);
+    hr = EditSession_Constructor(&session);
+    ok(hr == S_OK, "EditSession_Constructor returned %#lx.\n", hr);
+    session_impl = impl_from_ITfEditSession(session);
+    session_impl->callback = core_context_edit;
+    session_impl->data = &test;
+    core_reentrant_session = session;
+
+    hr = TextEditSink_Constructor(&sink);
+    ok(hr == S_OK, "TextEditSink_Constructor returned %#lx.\n", hr);
+    hr = ITfContext_QueryInterface(test.context, &IID_ITfSource, (void **)&source);
+    ok(hr == S_OK, "QueryInterface(ITfSource) returned %#lx.\n", hr);
+    hr = ITfSource_AdviseSink(source, &IID_ITfTextEditSink, (IUnknown *)sink, &sink_cookie);
+    ok(hr == S_OK, "AdviseSink returned %#lx.\n", hr);
+
+    core_edit_record_expected = TRUE;
+    core_edit_stage = 0;
+    for (i = 0; i < 2; ++i)
+    {
+        test_ACP_RequestLock = SINK_EXPECTED;
+        test_DoEditSession = SINK_EXPECTED;
+        test_OnEndEdit = SINK_EXPECTED;
+        session_hr = 0xdeadbeef;
+        hr = ITfContext_RequestEditSession(test.context, tid, session,
+                TF_ES_SYNC | TF_ES_READWRITE, &session_hr);
+        ok(hr == S_OK, "RequestEditSession returned %#lx.\n", hr);
+        ok(session_hr == S_OK, "Edit session returned %#lx.\n", session_hr);
+        sink_check_ok(&test_ACP_RequestLock, "RequestLock");
+        sink_check_ok(&test_DoEditSession, "DoEditSession");
+        sink_check_ok(&test_OnEndEdit, "OnEndEdit");
+    }
+    core_edit_record_expected = FALSE;
+    core_reentrant_session = NULL;
+
+    hr = ITfSource_UnadviseSink(source, sink_cookie);
+    ok(hr == S_OK, "UnadviseSink returned %#lx.\n", hr);
+    core_defer_locks = TRUE;
+    for (i = 0; i < ARRAY_SIZE(async_sessions); ++i)
+    {
+        hr = EditSession_Constructor(&async_sessions[i]);
+        ok(hr == S_OK, "Async EditSession_Constructor returned %#lx.\n", hr);
+        session_impl = impl_from_ITfEditSession(async_sessions[i]);
+        async_tests[i].id = i + 1;
+        async_tests[i].count = &async_count;
+        async_tests[i].order = async_order;
+        session_impl->callback = core_async_edit;
+        session_impl->data = &async_tests[i];
+
+        test_ACP_RequestLock = SINK_EXPECTED;
+        session_hr = 0xdeadbeef;
+        hr = ITfContext_RequestEditSession(test.context, tid, async_sessions[i],
+                TF_ES_ASYNC | TF_ES_READWRITE, &session_hr);
+        ok(hr == S_OK, "Async RequestEditSession returned %#lx.\n", hr);
+        ok(session_hr == TS_S_ASYNC, "Expected TS_S_ASYNC, got %#lx.\n", session_hr);
+        sink_check_ok(&test_ACP_RequestLock, "Async RequestLock");
+    }
+    core_defer_locks = FALSE;
+    for (i = 0; i < ARRAY_SIZE(async_sessions); ++i)
+    {
+        test_DoEditSession = SINK_EXPECTED;
+        hr = ITextStoreACPSink_OnLockGranted(ACPSink, TS_LF_READWRITE);
+        ok(hr == S_OK, "Deferred OnLockGranted returned %#lx.\n", hr);
+        sink_check_ok(&test_DoEditSession, "Deferred DoEditSession");
+        ITfEditSession_Release(async_sessions[i]);
+    }
+    ok(async_count == 2, "Expected two deferred sessions, got %u.\n", async_count);
+    ok(async_order[0] == 1 && async_order[1] == 2,
+            "Unexpected deferred order %u,%u.\n", async_order[0], async_order[1]);
+
+    if (test.composition) ITfComposition_Release(test.composition);
+    ITfSource_Release(source);
+    ITfTextEditSink_Release(sink);
+    ITfEditSession_Release(session);
+    ITfContext_Release(test.context);
+    ITfDocumentMgr_Release(dm);
 }
 
 static void test_TStoApplicationText(void)
@@ -2670,6 +3239,7 @@ START_TEST(inputprocessor)
         test_ClientId();
         test_KeystrokeMgr();
         test_TStoApplicationText();
+        test_context_core();
         test_Compartments();
         test_AssociateFocus();
         test_endSession();
@@ -2684,7 +3254,9 @@ START_TEST(inputprocessor)
         test_function_provider();
 
         ITextStoreACPSink_Release(ACPSink);
+        test_ACP_UnadviseSink = SINK_EXPECTED;
         ITfDocumentMgr_Release(g_dm);
+        sink_check_ok(&test_ACP_UnadviseSink, "TextStoreACP_UnadviseSink");
     }
     else
         skip("Unable to create InputProcessor\n");

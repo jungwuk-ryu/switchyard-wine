@@ -91,9 +91,15 @@ static void DocumentMgr_Destructor(DocumentMgr *This)
     if (This->initialContext)
         ITfContext_Release(This->initialContext);
     if (This->contextStack[0])
+    {
+        Context_Uninitialize(This->contextStack[0]);
         ITfContext_Release(This->contextStack[0]);
+    }
     if (This->contextStack[1])
+    {
+        Context_Uninitialize(This->contextStack[1]);
         ITfContext_Release(This->contextStack[1]);
+    }
     free_sinks(&This->TransitoryExtensionSink);
     CompartmentMgr_Destructor(This->CompartmentMgr);
     free(This);
