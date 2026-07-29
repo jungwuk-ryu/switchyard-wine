@@ -80,6 +80,8 @@ run_smoke() {
 }
 
 run_smoke "D3DMetal D3D12 callback smoke test"
+run_smoke "D3DMetal D3D12 descriptor-churn stress test" \
+  --switchyard-d3d12-descriptor-stress
 run_smoke "Chromium GPU D3D12 fallback probe" \
   --switchyard-chromium-gpu-probe \
   --type=gpu-process \

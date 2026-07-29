@@ -3888,10 +3888,12 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_END_QUERY 0x4000000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_RESOLVE_QUERY 0x8000000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE 0x10000000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_DESCRIPTOR_HEAP_CREATE \
+    SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY 0x20000000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_DESC_ARG1 \
     SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY
-#define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE 0x40000000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_RELEASE 0x40000000
 #define SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK 0x80000000u
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
@@ -3951,13 +3953,11 @@ struct switchyard_native_callback_params
     ULONG_PTR args[SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS];
 };
 
-#define SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS 2048
-#define SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS 256
-#define SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS 256
 #define SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_VALUES 64
 
 struct switchyard_d3d12_timestamp_query
 {
+    RTL_BALANCED_NODE node;
     void *heap;
     ULONG index;
     ULONGLONG value;
@@ -3965,38 +3965,45 @@ struct switchyard_d3d12_timestamp_query
 
 struct switchyard_d3d12_timestamp_resource
 {
+    RTL_BALANCED_NODE node;
     void *resource;
     BYTE *mapped;
+    struct list resolves;
 };
 
 struct switchyard_d3d12_timestamp_resolve
 {
-    void *resource;
+    struct list entry;
     ULONGLONG offset;
     ULONG count;
     ULONGLONG values[SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_VALUES];
 };
 
-static struct switchyard_d3d12_timestamp_query
-    switchyard_d3d12_timestamp_queries[SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS];
-static struct switchyard_d3d12_timestamp_resource
-    switchyard_d3d12_timestamp_resources[SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS];
-static struct switchyard_d3d12_timestamp_resolve
-    switchyard_d3d12_timestamp_resolves[SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS];
-
-#define SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS 16384
-#define SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS 4096
+static RTL_RB_TREE switchyard_d3d12_timestamp_queries;
+static RTL_RB_TREE switchyard_d3d12_timestamp_resources;
 
 struct switchyard_d3d12_descriptor_format
 {
+    RTL_BALANCED_NODE node;
     ULONG_PTR handle;
+    ULONGLONG epoch;
     ULONG format;
 };
 
 struct switchyard_d3d12_resource_format
 {
+    RTL_BALANCED_NODE node;
     void *resource;
     ULONG format;
+};
+
+struct switchyard_d3d12_descriptor_heap
+{
+    RTL_BALANCED_NODE node;
+    void *heap;
+    ULONG_PTR first;
+    ULONG_PTR last;
+    ULONG increment;
 };
 
 struct switchyard_d3d12_resource_desc
@@ -4022,10 +4029,21 @@ struct switchyard_d3d12_descriptor_copy
     ULONG format;
 };
 
-static struct switchyard_d3d12_descriptor_format
-    switchyard_d3d12_descriptor_formats[SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS];
-static struct switchyard_d3d12_resource_format
-    switchyard_d3d12_resource_formats[SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS];
+static RTL_RB_TREE switchyard_d3d12_descriptor_formats;
+static RTL_RB_TREE switchyard_d3d12_resource_formats;
+static RTL_RB_TREE switchyard_d3d12_descriptor_heaps;
+static ULONGLONG switchyard_d3d12_descriptor_format_epoch = 1;
+
+static RTL_CRITICAL_SECTION switchyard_d3d12_tracking_section;
+static RTL_CRITICAL_SECTION_DEBUG switchyard_d3d12_tracking_section_debug =
+{
+    0, 0, &switchyard_d3d12_tracking_section,
+    { &switchyard_d3d12_tracking_section_debug.ProcessLocksList,
+      &switchyard_d3d12_tracking_section_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": switchyard_d3d12_tracking_section") }
+};
+static RTL_CRITICAL_SECTION switchyard_d3d12_tracking_section =
+    { &switchyard_d3d12_tracking_section_debug, -1, 0, 0, 0, 0 };
 
 C_ASSERT( sizeof(struct switchyard_d3d12_resource_desc) == 56 );
 C_ASSERT( FIELD_OFFSET(struct switchyard_d3d12_resource_desc, format) == 32 );
@@ -4972,6 +4990,10 @@ static ULONG switchyard_d3d12_device_vtable_entry_flags( unsigned int index )
             switchyard_d3d12_output_flags( output_arg );
     switch (index)
     {
+    case 14: /* CreateDescriptorHeap */
+        flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_DESCRIPTOR_HEAP_CREATE;
+        break;
+
     case 27: /* CreateCommittedResource */
     case 29: /* CreatePlacedResource */
     case 30: /* CreateReservedResource */
@@ -4999,6 +5021,14 @@ static ULONG switchyard_d3d12_device_child_vtable_entry_flags( unsigned int inde
            (index == 0 || index == 7 ? switchyard_d3d12_output_flags( 2 ) : 0);
 }
 
+static ULONG switchyard_d3d12_tracked_heap_vtable_entry_flags( unsigned int index )
+{
+    ULONG flags = switchyard_d3d12_device_child_vtable_entry_flags( index );
+
+    if (index == 2) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RELEASE;
+    return flags;
+}
+
 static ULONG switchyard_d3d12_pipeline_library_vtable_entry_flags( unsigned int index )
 {
     ULONG flags = switchyard_d3d12_device_child_vtable_entry_flags( index );
@@ -5013,7 +5043,7 @@ static ULONG switchyard_d3d12_resource_vtable_entry_flags( unsigned int index )
     ULONG flags = switchyard_d3d12_device_child_vtable_entry_flags( index );
 
     if (index == 0) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY;
-    if (index == 2) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE;
+    if (index == 2) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RELEASE;
     if (index == 8) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_MAP;
     if (index == 9) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_UNMAP;
     if (index == 15) flags |= switchyard_d3d12_output_flags( 2 );
@@ -6046,6 +6076,7 @@ struct switchyard_com_vtable_clone_header
 {
     ULONG_PTR magic;
     void **original;
+    ULONG_PTR signature;
     unsigned int entries;
 };
 
@@ -6054,6 +6085,74 @@ static const ULONG_PTR switchyard_com_vtable_clone_magic =
 /* Preserve native C++ RTTI and this-adjustment metadata preceding the vtable. */
 #define SWITCHYARD_COM_VTABLE_PREFIX_SIZE 0x30
 #define SWITCHYARD_COM_VTABLE_MAX_ENTRIES 256
+
+struct switchyard_com_vtable_clone_cache_entry
+{
+    struct list entry;
+    void **original;
+    void **copy;
+    ULONG_PTR signature;
+    unsigned int entries;
+};
+
+static struct list switchyard_com_vtable_clone_cache =
+    LIST_INIT( switchyard_com_vtable_clone_cache );
+
+static struct switchyard_com_vtable_clone_header *
+switchyard_get_com_vtable_clone_header( void **vtable )
+{
+    struct switchyard_com_vtable_clone_header *header;
+
+    header = (struct switchyard_com_vtable_clone_header *)
+             ((BYTE *)vtable - SWITCHYARD_COM_VTABLE_PREFIX_SIZE) - 1;
+    if (header->magic != switchyard_com_vtable_clone_magic ||
+        !header->original)
+        return NULL;
+    return header;
+}
+
+static void **switchyard_find_com_vtable_clone_locked( void **original,
+                                                       unsigned int entries,
+                                                       ULONG_PTR signature )
+{
+    struct switchyard_com_vtable_clone_cache_entry *entry;
+
+    LIST_FOR_EACH_ENTRY( entry, &switchyard_com_vtable_clone_cache,
+                         struct switchyard_com_vtable_clone_cache_entry, entry )
+    {
+        if (entry->original == original && entry->entries == entries &&
+            entry->signature == signature)
+            return entry->copy;
+    }
+    return NULL;
+}
+
+static ULONG_PTR switchyard_com_vtable_signature_mix( ULONG_PTR signature,
+                                                      ULONG_PTR value )
+{
+    signature ^= value + (ULONG_PTR)0x9e3779b97f4a7c15ULL +
+                 (signature << 6) + (signature >> 2);
+    return signature ? signature : (ULONG_PTR)0x5359575654424c45ULL;
+}
+
+static ULONG_PTR switchyard_com_vtable_wrapper_signature_seed(
+    unsigned int entries, BOOL preserve_callable_tail )
+{
+    ULONG_PTR signature = (ULONG_PTR)0xcbf29ce484222325ULL;
+
+    signature = switchyard_com_vtable_signature_mix( signature, entries );
+    signature = switchyard_com_vtable_signature_mix(
+        signature, preserve_callable_tail ? 1 : 0 );
+    return signature;
+}
+
+static ULONG_PTR switchyard_com_vtable_wrapper_signature_step(
+    ULONG_PTR signature, unsigned int index, ULONG argc, ULONG flags )
+{
+    signature = switchyard_com_vtable_signature_mix( signature, index );
+    signature = switchyard_com_vtable_signature_mix( signature, argc );
+    return switchyard_com_vtable_signature_mix( signature, flags );
+}
 
 static BOOL switchyard_com_vtable_entry_is_callable( void *entry )
 {
@@ -6098,7 +6197,8 @@ static unsigned int switchyard_get_preserved_com_vtable_entries(
 
 static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vtable,
                                                         unsigned int entries,
-                                                        BOOL preserve_callable_tail )
+                                                        BOOL preserve_callable_tail,
+                                                        ULONG_PTR signature )
 {
     struct switchyard_com_vtable_clone_header *existing_header;
     struct switchyard_com_vtable_clone_header *header = NULL;
@@ -6106,17 +6206,24 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     void *base = NULL;
     void **copy = NULL;
     SIZE_T size;
+    BOOL assigned;
 
     if (!object || !vtable || !entries) return NULL;
 
     __TRY
     {
-        existing_header = (struct switchyard_com_vtable_clone_header *)
-                          ((BYTE *)vtable - SWITCHYARD_COM_VTABLE_PREFIX_SIZE) - 1;
-        if (existing_header->magic == switchyard_com_vtable_clone_magic &&
-            existing_header->original)
+        existing_header = switchyard_get_com_vtable_clone_header( vtable );
+        if (existing_header)
         {
-            if (existing_header->entries >= entries) return vtable;
+            /* QueryInterface may return the same COM identity for a narrower
+             * base interface.  Keep the wider clone installed and let the
+             * wrapping pass below monotonically add any missing hooks.  Going
+             * back to the original vtable here can truncate derived methods
+             * such as ID3D12CommandQueue::ExecuteCommandLists. */
+            if (existing_header->entries >= entries &&
+                (preserve_callable_tail ||
+                 existing_header->signature == signature))
+                return vtable;
             vtable = existing_header->original;
         }
     }
@@ -6134,6 +6241,28 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
         copied_entries = switchyard_get_preserved_com_vtable_entries(
             vtable, copied_entries );
 
+    RtlEnterCriticalSection( &loader_section );
+    copy = switchyard_find_com_vtable_clone_locked(
+        vtable, copied_entries, signature );
+    RtlLeaveCriticalSection( &loader_section );
+    if (copy)
+    {
+        assigned = FALSE;
+        __TRY
+        {
+            *(void ***)object = copy;
+            assigned = TRUE;
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+        }
+        __ENDTRY
+        if (!assigned) return NULL;
+        TRACE( "reused COM object %p vtable %p -> %p entries %u, preserved %u\n",
+               object, vtable, copy, entries, copied_entries );
+        return copy;
+    }
+
     size = sizeof(struct switchyard_com_vtable_clone_header) +
            SWITCHYARD_COM_VTABLE_PREFIX_SIZE +
            copied_entries * sizeof(*copy);
@@ -6147,6 +6276,7 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     {
         header->magic = switchyard_com_vtable_clone_magic;
         header->original = vtable;
+        header->signature = signature;
         header->entries = copied_entries;
         memcpy( (BYTE *)copy - SWITCHYARD_COM_VTABLE_PREFIX_SIZE,
                 (BYTE *)vtable - SWITCHYARD_COM_VTABLE_PREFIX_SIZE,
@@ -6169,6 +6299,70 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     return copy;
 }
 
+static void **switchyard_publish_com_vtable_clone_for_wrapping( void *object,
+                                                                void **vtable )
+{
+    struct switchyard_com_vtable_clone_cache_entry *entry;
+    struct switchyard_com_vtable_clone_header *header = NULL;
+    void **cached = NULL;
+    BOOL assigned = FALSE;
+
+    if (!object || !vtable) return vtable;
+
+    __TRY
+    {
+        header = switchyard_get_com_vtable_clone_header( vtable );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+    if (!header) return vtable;
+
+    RtlEnterCriticalSection( &loader_section );
+    cached = switchyard_find_com_vtable_clone_locked( header->original,
+                                                      header->entries,
+                                                      header->signature );
+    if (!cached)
+    {
+        if ((entry = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*entry) )))
+        {
+            entry->original = header->original;
+            entry->copy = vtable;
+            entry->signature = header->signature;
+            entry->entries = header->entries;
+            list_add_tail( &switchyard_com_vtable_clone_cache, &entry->entry );
+            cached = vtable;
+            TRACE( "published COM vtable clone %p -> %p entries %u\n",
+                   header->original, vtable, header->entries );
+        }
+    }
+    RtlLeaveCriticalSection( &loader_section );
+
+    if (!cached || cached == vtable) return vtable;
+
+    __TRY
+    {
+        assigned = InterlockedCompareExchangePointer( (void *volatile *)object,
+                                                       cached, vtable ) == vtable;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+    if (assigned)
+    {
+        /* A concurrent caller may have observed the duplicate while it was
+         * installed on the object.  Keep process-lifetime clones mapped rather
+         * than reclaiming one while such a caller can still use it. */
+        TRACE( "replaced duplicate COM vtable clone %p with cached %p, retaining duplicate\n",
+               vtable, cached );
+        return cached;
+    }
+
+    return vtable;
+}
+
 enum switchyard_dxgi_format
 {
     SWITCHYARD_DXGI_FORMAT_R16G16B16A16_FLOAT = 0x0a,
@@ -6187,147 +6381,253 @@ static BOOL switchyard_d3d12_format_needs_narrow_float_fixup( ULONG format )
            format == SWITCHYARD_DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
 }
 
-static unsigned int switchyard_d3d12_descriptor_format_hash( ULONG_PTR handle )
+static int switchyard_d3d12_descriptor_format_compare(
+    const void *key, const RTL_BALANCED_NODE *node )
 {
-    handle >>= 4;
-    handle ^= handle >> 16;
-    handle ^= handle >> 32;
-    return handle & (SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS - 1);
+    const struct switchyard_d3d12_descriptor_format *entry =
+        CONTAINING_RECORD( node, struct switchyard_d3d12_descriptor_format, node );
+    ULONG_PTR handle = (ULONG_PTR)key;
+
+    if (handle < entry->handle) return -1;
+    if (handle > entry->handle) return 1;
+    return 0;
+}
+
+static struct switchyard_d3d12_descriptor_format *
+switchyard_d3d12_get_descriptor_format_entry_locked( ULONG_PTR handle )
+{
+    RTL_BALANCED_NODE *node;
+
+    if (!handle) return NULL;
+    node = rtl_rb_tree_get( &switchyard_d3d12_descriptor_formats,
+                            (const void *)handle,
+                            switchyard_d3d12_descriptor_format_compare );
+    return node ? CONTAINING_RECORD(
+        node, struct switchyard_d3d12_descriptor_format, node ) : NULL;
 }
 
 static void switchyard_d3d12_store_descriptor_format_locked( ULONG_PTR handle,
                                                               ULONG format )
 {
-    struct switchyard_d3d12_descriptor_format *entry, *available = NULL;
-    const ULONG_PTR tombstone = ~(ULONG_PTR)0;
-    unsigned int start, i;
+    struct switchyard_d3d12_descriptor_format *entry;
 
-    if (!handle || handle == tombstone) return;
-
-    start = switchyard_d3d12_descriptor_format_hash( handle );
-    for (i = 0; i < SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS; ++i)
+    if (!handle) return;
+    if ((entry = switchyard_d3d12_get_descriptor_format_entry_locked( handle )))
     {
-        entry = &switchyard_d3d12_descriptor_formats[
-            (start + i) & (SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS - 1)];
-        if (entry->handle == tombstone)
+        if (switchyard_d3d12_format_needs_narrow_float_fixup( format ))
         {
-            if (!available) available = entry;
-            continue;
+            entry->epoch = switchyard_d3d12_descriptor_format_epoch;
+            entry->format = format;
         }
-        if (entry->handle == handle)
+        else
         {
-            if (switchyard_d3d12_format_needs_narrow_float_fixup( format ))
-                entry->format = format;
-            else
-            {
-                entry->handle = tombstone;
-                entry->format = 0;
-            }
-            return;
+            RtlRbRemoveNode( &switchyard_d3d12_descriptor_formats, &entry->node );
+            RtlFreeHeap( GetProcessHeap(), 0, entry );
         }
-        if (entry->handle) continue;
-        if (!switchyard_d3d12_format_needs_narrow_float_fixup( format ))
-            return;
-        if (!available) available = entry;
-        break;
+        return;
     }
 
     if (!switchyard_d3d12_format_needs_narrow_float_fixup( format ))
         return;
-    if (!available) available = &switchyard_d3d12_descriptor_formats[start];
-    available->handle = handle;
-    available->format = format;
+    if (!(entry = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*entry) )))
+        return;
+    entry->handle = handle;
+    entry->epoch = switchyard_d3d12_descriptor_format_epoch;
+    entry->format = format;
+    if (rtl_rb_tree_put( &switchyard_d3d12_descriptor_formats,
+                         (const void *)handle, &entry->node,
+                         switchyard_d3d12_descriptor_format_compare ))
+        RtlFreeHeap( GetProcessHeap(), 0, entry );
 }
 
 static ULONG switchyard_d3d12_get_descriptor_format_locked( ULONG_PTR handle )
 {
-    const struct switchyard_d3d12_descriptor_format *entry;
-    const ULONG_PTR tombstone = ~(ULONG_PTR)0;
-    unsigned int start, i;
+    const struct switchyard_d3d12_descriptor_format *entry =
+        switchyard_d3d12_get_descriptor_format_entry_locked( handle );
 
-    if (!handle || handle == tombstone) return 0;
+    return entry && entry->epoch == switchyard_d3d12_descriptor_format_epoch ?
+           entry->format : 0;
+}
 
-    start = switchyard_d3d12_descriptor_format_hash( handle );
-    for (i = 0; i < SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS; ++i)
-    {
-        entry = &switchyard_d3d12_descriptor_formats[
-            (start + i) & (SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS - 1)];
-        if (!entry->handle) break;
-        if (entry->handle == tombstone) continue;
-        if (entry->handle == handle) return entry->format;
-    }
+static void switchyard_d3d12_invalidate_descriptor_formats_locked(void)
+{
+    if (!++switchyard_d3d12_descriptor_format_epoch)
+        switchyard_d3d12_descriptor_format_epoch = 1;
+}
+
+static int switchyard_d3d12_resource_format_compare(
+    const void *key, const RTL_BALANCED_NODE *node )
+{
+    const struct switchyard_d3d12_resource_format *entry =
+        CONTAINING_RECORD( node, struct switchyard_d3d12_resource_format, node );
+    ULONG_PTR resource = (ULONG_PTR)key;
+
+    if (resource < (ULONG_PTR)entry->resource) return -1;
+    if (resource > (ULONG_PTR)entry->resource) return 1;
     return 0;
 }
 
-static unsigned int switchyard_d3d12_resource_format_hash( const void *resource )
+static struct switchyard_d3d12_resource_format *
+switchyard_d3d12_get_resource_format_entry_locked( const void *resource )
 {
-    ULONG_PTR hash = (ULONG_PTR)resource >> 4;
+    RTL_BALANCED_NODE *node;
 
-    hash ^= hash >> 16;
-    hash ^= hash >> 32;
-    return hash & (SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS - 1);
+    if (!resource) return NULL;
+    node = rtl_rb_tree_get( &switchyard_d3d12_resource_formats, resource,
+                            switchyard_d3d12_resource_format_compare );
+    return node ? CONTAINING_RECORD(
+        node, struct switchyard_d3d12_resource_format, node ) : NULL;
 }
 
 static void switchyard_d3d12_store_resource_format_locked( void *resource,
                                                             ULONG format )
 {
-    struct switchyard_d3d12_resource_format *entry, *available = NULL;
-    void *const tombstone = (void *)~(ULONG_PTR)0;
-    unsigned int start, i;
+    struct switchyard_d3d12_resource_format *entry;
 
-    if (!resource || resource == tombstone) return;
-
-    start = switchyard_d3d12_resource_format_hash( resource );
-    for (i = 0; i < SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS; ++i)
+    if (!resource) return;
+    if ((entry = switchyard_d3d12_get_resource_format_entry_locked( resource )))
     {
-        entry = &switchyard_d3d12_resource_formats[
-            (start + i) & (SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS - 1)];
-        if (entry->resource == tombstone)
+        if (switchyard_d3d12_format_needs_narrow_float_fixup( format ))
+            entry->format = format;
+        else
         {
-            if (!available) available = entry;
-            continue;
+            RtlRbRemoveNode( &switchyard_d3d12_resource_formats, &entry->node );
+            RtlFreeHeap( GetProcessHeap(), 0, entry );
         }
-        if (entry->resource == resource)
-        {
-            if (format)
-                entry->format = format;
-            else
-            {
-                entry->resource = tombstone;
-                entry->format = 0;
-            }
-            return;
-        }
-        if (entry->resource) continue;
-        if (!format) return;
-        if (!available) available = entry;
-        break;
+        return;
     }
 
-    if (!format) return;
-    if (!available) available = &switchyard_d3d12_resource_formats[start];
-    available->resource = resource;
-    available->format = format;
+    if (!switchyard_d3d12_format_needs_narrow_float_fixup( format ))
+        return;
+    if (!(entry = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*entry) )))
+        return;
+    entry->resource = resource;
+    entry->format = format;
+    if (rtl_rb_tree_put( &switchyard_d3d12_resource_formats, resource,
+                         &entry->node,
+                         switchyard_d3d12_resource_format_compare ))
+        RtlFreeHeap( GetProcessHeap(), 0, entry );
 }
 
 static ULONG switchyard_d3d12_get_resource_format_locked( const void *resource )
 {
-    const struct switchyard_d3d12_resource_format *entry;
-    void *const tombstone = (void *)~(ULONG_PTR)0;
-    unsigned int start, i;
+    const struct switchyard_d3d12_resource_format *entry =
+        switchyard_d3d12_get_resource_format_entry_locked( resource );
 
-    if (!resource || resource == tombstone) return 0;
+    return entry ? entry->format : 0;
+}
 
-    start = switchyard_d3d12_resource_format_hash( resource );
-    for (i = 0; i < SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS; ++i)
+static RTL_BALANCED_NODE *switchyard_d3d12_descriptor_format_lower_bound_locked(
+    ULONG_PTR handle )
+{
+    RTL_BALANCED_NODE *node = switchyard_d3d12_descriptor_formats.root;
+    RTL_BALANCED_NODE *ret = NULL;
+
+    while (node)
     {
-        entry = &switchyard_d3d12_resource_formats[
-            (start + i) & (SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS - 1)];
-        if (!entry->resource) break;
-        if (entry->resource == tombstone) continue;
-        if (entry->resource == resource) return entry->format;
+        const struct switchyard_d3d12_descriptor_format *entry =
+            CONTAINING_RECORD( node, struct switchyard_d3d12_descriptor_format, node );
+
+        if (entry->handle >= handle)
+        {
+            ret = node;
+            node = node->Left;
+        }
+        else node = node->Right;
     }
+    return ret;
+}
+
+static void switchyard_d3d12_remove_descriptor_range_locked(
+    ULONG_PTR first, ULONG_PTR last, ULONG increment )
+{
+    struct switchyard_d3d12_descriptor_format *entry;
+    RTL_BALANCED_NODE *node;
+    ULONG_PTR cursor = first;
+
+    if (!increment) return;
+    while ((node = switchyard_d3d12_descriptor_format_lower_bound_locked( cursor )))
+    {
+        entry = CONTAINING_RECORD(
+            node, struct switchyard_d3d12_descriptor_format, node );
+        if (entry->handle > last) break;
+        if (!((entry->handle - first) % increment))
+        {
+            RtlRbRemoveNode( &switchyard_d3d12_descriptor_formats, &entry->node );
+            RtlFreeHeap( GetProcessHeap(), 0, entry );
+        }
+        else
+        {
+            if (entry->handle == ~(ULONG_PTR)0) break;
+            cursor = entry->handle + 1;
+        }
+    }
+}
+
+static int switchyard_d3d12_descriptor_heap_compare(
+    const void *key, const RTL_BALANCED_NODE *node )
+{
+    const struct switchyard_d3d12_descriptor_heap *entry =
+        CONTAINING_RECORD( node, struct switchyard_d3d12_descriptor_heap, node );
+    ULONG_PTR heap = (ULONG_PTR)key;
+
+    if (heap < (ULONG_PTR)entry->heap) return -1;
+    if (heap > (ULONG_PTR)entry->heap) return 1;
     return 0;
+}
+
+static struct switchyard_d3d12_descriptor_heap *
+switchyard_d3d12_get_descriptor_heap_locked( const void *heap )
+{
+    RTL_BALANCED_NODE *node;
+
+    if (!heap) return NULL;
+    node = rtl_rb_tree_get( &switchyard_d3d12_descriptor_heaps, heap,
+                            switchyard_d3d12_descriptor_heap_compare );
+    return node ? CONTAINING_RECORD(
+        node, struct switchyard_d3d12_descriptor_heap, node ) : NULL;
+}
+
+static void switchyard_d3d12_store_descriptor_heap_locked(
+    void *heap, ULONG_PTR first, ULONG_PTR last, ULONG increment )
+{
+    struct switchyard_d3d12_descriptor_heap *entry;
+
+    if (!heap || !first || last < first || !increment) return;
+    if ((entry = switchyard_d3d12_get_descriptor_heap_locked( heap )))
+    {
+        if (entry->first != first || entry->last != last ||
+            entry->increment != increment)
+            switchyard_d3d12_remove_descriptor_range_locked(
+                entry->first, entry->last, entry->increment );
+        entry->first = first;
+        entry->last = last;
+        entry->increment = increment;
+        return;
+    }
+
+    if (!(entry = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*entry) )))
+        return;
+    entry->heap = heap;
+    entry->first = first;
+    entry->last = last;
+    entry->increment = increment;
+    if (rtl_rb_tree_put( &switchyard_d3d12_descriptor_heaps, heap,
+                         &entry->node,
+                         switchyard_d3d12_descriptor_heap_compare ))
+        RtlFreeHeap( GetProcessHeap(), 0, entry );
+}
+
+static void switchyard_d3d12_remove_descriptor_heap_locked( void *heap )
+{
+    struct switchyard_d3d12_descriptor_heap *entry;
+
+    if (!(entry = switchyard_d3d12_get_descriptor_heap_locked( heap )))
+        return;
+    switchyard_d3d12_remove_descriptor_range_locked(
+        entry->first, entry->last, entry->increment );
+    RtlRbRemoveNode( &switchyard_d3d12_descriptor_heaps, &entry->node );
+    RtlFreeHeap( GetProcessHeap(), 0, entry );
 }
 
 static void *switchyard_get_wrapped_com_vtable_entry( void *object,
@@ -6356,9 +6656,9 @@ static ULONG switchyard_d3d12_get_resource_format( void *resource )
 {
     ULONG format;
 
-    RtlEnterCriticalSection( &loader_section );
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
     format = switchyard_d3d12_get_resource_format_locked( resource );
-    RtlLeaveCriticalSection( &loader_section );
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
     return format;
 }
 
@@ -6381,6 +6681,64 @@ static ULONG switchyard_d3d12_get_descriptor_increment( void *device,
     }
     __ENDTRY
     return increment;
+}
+
+struct switchyard_d3d12_descriptor_heap_desc
+{
+    ULONG type;
+    ULONG count;
+    ULONG flags;
+    ULONG node_mask;
+};
+
+struct switchyard_d3d12_cpu_descriptor_handle
+{
+    ULONG_PTR ptr;
+};
+
+static void switchyard_d3d12_register_descriptor_heap(
+    void *heap, void *device,
+    const struct switchyard_d3d12_descriptor_heap_desc *desc_ptr, TEB *teb )
+{
+    typedef struct switchyard_d3d12_cpu_descriptor_handle
+        (WINAPI *get_start_func)(void *heap);
+    struct switchyard_d3d12_descriptor_heap_desc desc = {0};
+    struct switchyard_d3d12_cpu_descriptor_handle start = {0};
+    get_start_func get_start;
+    ULONG increment = 0;
+    ULONG_PTR last;
+    BOOL valid = TRUE;
+
+    if (!heap || !device || !desc_ptr ||
+        !(get_start = switchyard_get_wrapped_com_vtable_entry( heap, 9 )))
+        return;
+
+    __TRY
+    {
+        desc = *desc_ptr;
+        start = get_start( heap );
+        switchyard_set_macos_tsd_base( teb );
+        increment = switchyard_d3d12_get_descriptor_increment(
+            device, desc.type );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        valid = FALSE;
+    }
+    __ENDTRY
+    /* Nested wrapped calls in a recovered callback can restore the pthread
+     * TSD base while the outer postprocessing scope still needs the TEB. */
+    switchyard_set_macos_tsd_base( teb );
+
+    if (!valid || !desc.count || !start.ptr || !increment ||
+        desc.count - 1 > (~(ULONG_PTR)0 - start.ptr) / increment)
+        return;
+    last = start.ptr + (ULONG_PTR)(desc.count - 1) * increment;
+
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
+    switchyard_d3d12_store_descriptor_heap_locked(
+        heap, start.ptr, last, increment );
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
 }
 
 static BOOL switchyard_float_is_finite( float value )
@@ -6502,9 +6860,9 @@ static BOOL switchyard_prepare_d3d12_narrow_float_clear(
         return FALSE;
     }
 
-    RtlEnterCriticalSection( &loader_section );
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
     format = switchyard_d3d12_get_descriptor_format_locked( handle );
-    RtlLeaveCriticalSection( &loader_section );
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
     if (!switchyard_d3d12_clamp_clear_color(
             format, (const float *)params->args[values_arg], color ))
         return FALSE;
@@ -6519,27 +6877,38 @@ static void switchyard_d3d12_apply_descriptor_copies(
 {
     SIZE_T i;
 
-    RtlEnterCriticalSection( &loader_section );
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
     for (i = 0; i < count; ++i)
         copies[i].format =
             switchyard_d3d12_get_descriptor_format_locked( copies[i].src );
     for (i = 0; i < count; ++i)
         switchyard_d3d12_store_descriptor_format_locked(
             copies[i].dst, copies[i].format );
-    RtlLeaveCriticalSection( &loader_section );
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
 }
 
-static void switchyard_d3d12_copy_descriptor_formats_simple(
+static void switchyard_d3d12_invalidate_descriptor_formats(void)
+{
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
+    switchyard_d3d12_invalidate_descriptor_formats_locked();
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
+}
+
+static BOOL switchyard_d3d12_copy_descriptor_formats_simple(
     ULONG_PTR dst, ULONG_PTR src, ULONG count, ULONG increment )
 {
     struct switchyard_d3d12_descriptor_copy *copies;
     SIZE_T size, i;
 
-    if (!count || !increment) return;
+    if (!count) return TRUE;
+    if (!increment ||
+        count - 1 > (~(ULONG_PTR)0 - dst) / increment ||
+        count - 1 > (~(ULONG_PTR)0 - src) / increment)
+        return FALSE;
     size = count * sizeof(*copies);
-    if (size / sizeof(*copies) != count) return;
+    if (size / sizeof(*copies) != count) return FALSE;
     if (!(copies = RtlAllocateHeap( GetProcessHeap(), 0, size )))
-        return;
+        return FALSE;
 
     for (i = 0; i < count; ++i)
     {
@@ -6548,6 +6917,7 @@ static void switchyard_d3d12_copy_descriptor_formats_simple(
     }
     switchyard_d3d12_apply_descriptor_copies( copies, count );
     RtlFreeHeap( GetProcessHeap(), 0, copies );
+    return TRUE;
 }
 
 static BOOL switchyard_d3d12_get_descriptor_range_count(
@@ -6580,7 +6950,7 @@ static BOOL switchyard_d3d12_get_descriptor_range_count(
     return valid;
 }
 
-static void switchyard_d3d12_copy_descriptor_formats(
+static BOOL switchyard_d3d12_copy_descriptor_formats(
     ULONG dst_range_count, const ULONG_PTR *dst_starts, const ULONG *dst_sizes,
     ULONG src_range_count, const ULONG_PTR *src_starts, const ULONG *src_sizes,
     ULONG increment )
@@ -6597,13 +6967,15 @@ static void switchyard_d3d12_copy_descriptor_formats(
             dst_range_count, dst_sizes, &dst_count ) ||
         !switchyard_d3d12_get_descriptor_range_count(
             src_range_count, src_sizes, &src_count ) ||
-        dst_count != src_count || !dst_count ||
-        dst_count > ~(SIZE_T)0 / sizeof(*copies))
-        return;
+        dst_count != src_count)
+        return FALSE;
+    if (!dst_count) return TRUE;
+    if (dst_count > ~(SIZE_T)0 / sizeof(*copies))
+        return FALSE;
 
     size = dst_count * sizeof(*copies);
     if (!(copies = RtlAllocateHeap( GetProcessHeap(), 0, size )))
-        return;
+        return FALSE;
 
     __TRY
     {
@@ -6629,8 +7001,16 @@ static void switchyard_d3d12_copy_descriptor_formats(
                 break;
             }
 
-            copies[i].dst = dst_starts[dst_range] + dst_offset * increment;
-            copies[i].src = src_starts[src_range] + src_offset * increment;
+            if (dst_offset > (~(ULONG_PTR)0 - dst_starts[dst_range]) / increment ||
+                src_offset > (~(ULONG_PTR)0 - src_starts[src_range]) / increment)
+            {
+                valid = FALSE;
+                break;
+            }
+            copies[i].dst = dst_starts[dst_range] +
+                            (ULONG_PTR)dst_offset * increment;
+            copies[i].src = src_starts[src_range] +
+                            (ULONG_PTR)src_offset * increment;
             ++dst_offset;
             ++src_offset;
         }
@@ -6644,6 +7024,7 @@ static void switchyard_d3d12_copy_descriptor_formats(
     if (valid)
         switchyard_d3d12_apply_descriptor_copies( copies, dst_count );
     RtlFreeHeap( GetProcessHeap(), 0, copies );
+    return valid;
 }
 
 static void switchyard_postprocess_d3d12_narrow_float(
@@ -6675,12 +7056,13 @@ static void switchyard_postprocess_d3d12_narrow_float(
         descriptor_increment = switchyard_d3d12_get_descriptor_increment(
             (void *)params->args[0], heap_type );
         switchyard_set_macos_tsd_base( teb );
-        switchyard_d3d12_copy_descriptor_formats(
-            params->args[1], (const ULONG_PTR *)params->args[2],
-            (const ULONG *)params->args[3],
-            params->args[4], (const ULONG_PTR *)params->args[5],
-            (const ULONG *)params->args[6],
-            descriptor_increment );
+        if (!switchyard_d3d12_copy_descriptor_formats(
+                params->args[1], (const ULONG_PTR *)params->args[2],
+                (const ULONG *)params->args[3],
+                params->args[4], (const ULONG_PTR *)params->args[5],
+                (const ULONG *)params->args[6],
+                descriptor_increment ))
+            switchyard_d3d12_invalidate_descriptor_formats();
         return;
     }
     else if (action == SWITCHYARD_D3D12_NARROW_FLOAT_COPY_DESCRIPTORS_SIMPLE)
@@ -6690,9 +7072,10 @@ static void switchyard_postprocess_d3d12_narrow_float(
         descriptor_increment = switchyard_d3d12_get_descriptor_increment(
             (void *)params->args[0], heap_type );
         switchyard_set_macos_tsd_base( teb );
-        switchyard_d3d12_copy_descriptor_formats_simple(
-            params->args[2], params->args[3], params->args[1],
-            descriptor_increment );
+        if (!switchyard_d3d12_copy_descriptor_formats_simple(
+                params->args[2], params->args[3], params->args[1],
+                descriptor_increment ))
+            switchyard_d3d12_invalidate_descriptor_formats();
         return;
     }
     else
@@ -6718,10 +7101,15 @@ static void switchyard_postprocess_d3d12_narrow_float(
             (void *)params->args[1] );
     }
 
-    if (!valid || !handle) return;
-    RtlEnterCriticalSection( &loader_section );
+    if (!valid)
+    {
+        switchyard_d3d12_invalidate_descriptor_formats();
+        return;
+    }
+    if (!handle) return;
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
     switchyard_d3d12_store_descriptor_format_locked( handle, format );
-    RtlLeaveCriticalSection( &loader_section );
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
 }
 
 static void switchyard_postprocess_d3d12_resource_format(
@@ -6733,20 +7121,17 @@ static void switchyard_postprocess_d3d12_resource_format(
     ULONG format = 0;
     BOOL valid = TRUE;
 
-    if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE)
-    {
-        if (ret) return;
-        RtlEnterCriticalSection( &loader_section );
-        switchyard_d3d12_store_resource_format_locked(
-            (void *)params->args[0], 0 );
-        RtlLeaveCriticalSection( &loader_section );
+    if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RELEASE)
         return;
-    }
 
     if ((LONG)ret < 0) return;
     output_arg = (params->flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) >>
                  SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT;
     if (!output_arg || output_arg >= params->argc || !params->args[output_arg])
+        return;
+    if ((params->flags &
+         SWITCHYARD_NATIVE_CALLBACK_D3D12_DESCRIPTOR_HEAP_CREATE) &&
+        output_arg == 3)
         return;
 
     __TRY
@@ -6773,13 +7158,13 @@ static void switchyard_postprocess_d3d12_resource_format(
     __ENDTRY
     if (!valid || !resource) return;
 
-    RtlEnterCriticalSection( &loader_section );
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
     if ((params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY) &&
         !(params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE))
         format = switchyard_d3d12_get_resource_format_locked(
             (void *)params->args[0] );
     switchyard_d3d12_store_resource_format_locked( resource, format );
-    RtlLeaveCriticalSection( &loader_section );
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
 }
 
 struct switchyard_com_vtable_scope
@@ -6849,6 +7234,7 @@ static void switchyard_wrap_com_vtable_jump_targets(
     ULONG (*entry_flags)(unsigned int) )
 {
     void **vtable, **wrapped_vtable;
+    ULONG_PTR signature;
     unsigned int i;
 
     if (!object) return;
@@ -6857,8 +7243,25 @@ static void switchyard_wrap_com_vtable_jump_targets(
     {
         vtable = *(void ***)object;
         if (!vtable) return;
+        signature = switchyard_com_vtable_wrapper_signature_seed(
+            entries, preserve_callable_tail );
+        for (i = 0; i < entries; ++i)
+        {
+            ULONG flags = switchyard_com_vtable_entry_flags( i );
+            unsigned int argc = SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS;
+
+            if (uses_scalar_float && uses_scalar_float( i ))
+            {
+                argc = 0;
+                flags = 0;
+            }
+            else if (entry_flags)
+                flags |= entry_flags( i );
+            signature = switchyard_com_vtable_wrapper_signature_step(
+                signature, i, argc, flags );
+        }
         wrapped_vtable = switchyard_clone_com_vtable_for_wrapping(
-            object, vtable, entries, preserve_callable_tail );
+            object, vtable, entries, preserve_callable_tail, signature );
         if (!wrapped_vtable) return;
         vtable = wrapped_vtable;
         TRACE( "checking COM object %p vtable %p entries %u\n", object, vtable, entries );
@@ -6873,6 +7276,7 @@ static void switchyard_wrap_com_vtable_jump_targets(
                                                          SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS,
                                                          flags );
         }
+        switchyard_publish_com_vtable_clone_for_wrapping( object, vtable );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -6915,6 +7319,8 @@ enum switchyard_d3d12_interface_kind
     SWITCHYARD_D3D12_PROTECTED_SESSION,
     SWITCHYARD_D3D12_RESOURCE,
     SWITCHYARD_D3D12_HEAP,
+    SWITCHYARD_D3D12_DESCRIPTOR_HEAP,
+    SWITCHYARD_D3D12_QUERY_HEAP,
 };
 
 struct switchyard_d3d12_interface_info
@@ -6945,9 +7351,9 @@ static const struct switchyard_d3d12_interface_info switchyard_d3d12_interfaces[
     SWITCHYARD_D3D12_INTERFACE( 0x7116d91c, 0xe7e4, 0x47ce, 0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5,
                                 9, SWITCHYARD_D3D12_DEVICE_CHILD, "ID3D12CommandList" ),
     SWITCHYARD_D3D12_INTERFACE( 0x8efb471d, 0x616c, 0x4f49, 0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51,
-                                11, SWITCHYARD_D3D12_DEVICE_CHILD, "ID3D12DescriptorHeap" ),
+                                11, SWITCHYARD_D3D12_DESCRIPTOR_HEAP, "ID3D12DescriptorHeap" ),
     SWITCHYARD_D3D12_INTERFACE( 0x0d9658ae, 0xed45, 0x469e, 0xa6, 0x1d, 0x97, 0x0e, 0xc5, 0x83, 0xca, 0xb4,
-                                8, SWITCHYARD_D3D12_DEVICE_CHILD, "ID3D12QueryHeap" ),
+                                8, SWITCHYARD_D3D12_QUERY_HEAP, "ID3D12QueryHeap" ),
     SWITCHYARD_D3D12_INTERFACE( 0xc36a797c, 0xec80, 0x4f0a, 0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1,
                                 8, SWITCHYARD_D3D12_DEVICE_CHILD, "ID3D12CommandSignature" ),
     SWITCHYARD_D3D12_INTERFACE( 0x5b160d0f, 0xac1b, 0x4185, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55,
@@ -7106,7 +7512,8 @@ static const struct switchyard_d3d12_interface_info *switchyard_find_d3d12_inter
 }
 
 static void switchyard_wrap_d3d12_output_vtable(
-    const struct switchyard_native_callback_params *params )
+    const struct switchyard_native_callback_params *params,
+    TEB *teb, BOOL tracked_heaps_only )
 {
     const struct switchyard_d3d12_interface_info *info;
     ULONG (*entry_flags)(unsigned int);
@@ -7137,6 +7544,10 @@ static void switchyard_wrap_d3d12_output_vtable(
                debugstr_guid( &iid ) );
         return;
     }
+    if (tracked_heaps_only &&
+        info->kind != SWITCHYARD_D3D12_DESCRIPTOR_HEAP &&
+        info->kind != SWITCHYARD_D3D12_QUERY_HEAP)
+        return;
 
     switch (info->kind)
     {
@@ -7162,6 +7573,10 @@ static void switchyard_wrap_d3d12_output_vtable(
     case SWITCHYARD_D3D12_HEAP:
         entry_flags = switchyard_d3d12_heap_vtable_entry_flags;
         break;
+    case SWITCHYARD_D3D12_DESCRIPTOR_HEAP:
+    case SWITCHYARD_D3D12_QUERY_HEAP:
+        entry_flags = switchyard_d3d12_tracked_heap_vtable_entry_flags;
+        break;
     case SWITCHYARD_D3D12_DEVICE_CHILD:
         entry_flags = switchyard_d3d12_device_child_vtable_entry_flags;
         break;
@@ -7174,6 +7589,27 @@ static void switchyard_wrap_d3d12_output_vtable(
            (void *)params->args[output_arg], info->entries );
     switchyard_wrap_com_output_vtable_jump_targets(
         params->args[output_arg], info->entries, TRUE, uses_scalar_float, entry_flags );
+    if (info->kind == SWITCHYARD_D3D12_DESCRIPTOR_HEAP)
+    {
+        void *heap = NULL;
+
+        __TRY
+        {
+            heap = *(void **)params->args[output_arg];
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+        }
+        __ENDTRY
+        if (heap &&
+            (params->flags &
+             SWITCHYARD_NATIVE_CALLBACK_D3D12_DESCRIPTOR_HEAP_CREATE) &&
+            output_arg == 3 && params->argc == 4)
+            switchyard_d3d12_register_descriptor_heap(
+                heap, (void *)params->args[0],
+                (const struct switchyard_d3d12_descriptor_heap_desc *)
+                params->args[1], teb );
+    }
 }
 
 static void switchyard_wrap_d3d11_create_device_output_vtables(
@@ -7229,6 +7665,7 @@ static void switchyard_wrap_dxgi_factory_output_vtable(
         5, 1, 4, 3, 4, 5, 3, 2
     };
     void **vtable, **wrapped_vtable;
+    ULONG_PTR signature;
     void *object;
     unsigned int i;
 
@@ -7239,8 +7676,22 @@ static void switchyard_wrap_dxgi_factory_output_vtable(
     {
         object = *(void **)params->args[2];
         if (!object || !(vtable = *(void ***)object)) return;
+        signature = switchyard_com_vtable_wrapper_signature_seed(
+            ARRAY_SIZE(argc), FALSE );
+        for (i = 0; i < ARRAY_SIZE(argc); ++i)
+        {
+            ULONG flags = switchyard_com_vtable_entry_flags( i ) |
+                          switchyard_dxgi_factory_vtable_entry_flags( i );
+
+            if (i == 7 || i == 11 || i == 12 || i == 26 || i == 27 || i == 29)
+                flags |= SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_ADAPTER_OUTPUT_VTABLE;
+            if (i == 10 || i == 15 || i == 16 || i == 24)
+                flags |= SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE;
+            signature = switchyard_com_vtable_wrapper_signature_step(
+                signature, i, argc[i], flags );
+        }
         wrapped_vtable = switchyard_clone_com_vtable_for_wrapping(
-            object, vtable, ARRAY_SIZE(argc), FALSE );
+            object, vtable, ARRAY_SIZE(argc), FALSE, signature );
         if (!wrapped_vtable) return;
         vtable = wrapped_vtable;
 
@@ -7256,6 +7707,7 @@ static void switchyard_wrap_dxgi_factory_output_vtable(
 
             switchyard_wrap_native_callback_vtable_slot( &vtable[i], argc[i], flags );
         }
+        switchyard_publish_com_vtable_clone_for_wrapping( object, vtable );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -7274,6 +7726,7 @@ static void switchyard_wrap_dxgi_output_output_vtable(
         4, 5, 6, 2, 2
     };
     void **vtable, **wrapped_vtable;
+    ULONG_PTR signature;
     void *object;
     unsigned int i;
 
@@ -7282,8 +7735,18 @@ static void switchyard_wrap_dxgi_output_output_vtable(
     {
         object = *(void **)params->args[params->argc - 1];
         if (!object || !(vtable = *(void ***)object)) return;
+        signature = switchyard_com_vtable_wrapper_signature_seed(
+            ARRAY_SIZE(argc), FALSE );
+        for (i = 0; i < ARRAY_SIZE(argc); ++i)
+        {
+            ULONG flags = switchyard_com_vtable_entry_flags( i ) |
+                          switchyard_dxgi_output_vtable_entry_flags( i );
+
+            signature = switchyard_com_vtable_wrapper_signature_step(
+                signature, i, argc[i], flags );
+        }
         wrapped_vtable = switchyard_clone_com_vtable_for_wrapping(
-            object, vtable, ARRAY_SIZE(argc), FALSE );
+            object, vtable, ARRAY_SIZE(argc), FALSE, signature );
         if (!wrapped_vtable) return;
         vtable = wrapped_vtable;
 
@@ -7291,6 +7754,7 @@ static void switchyard_wrap_dxgi_output_output_vtable(
             switchyard_wrap_native_callback_vtable_slot(
                 &vtable[i], argc[i], switchyard_com_vtable_entry_flags( i ) |
                                          switchyard_dxgi_output_vtable_entry_flags( i ) );
+        switchyard_publish_com_vtable_clone_for_wrapping( object, vtable );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -7344,6 +7808,7 @@ static void switchyard_wrap_dxgi_swapchain_output_vtable(
 {
     enum { dxgi_swapchain_vtable_entries = 41 };
     void **vtable, **wrapped_vtable;
+    ULONG_PTR signature;
     void *object;
     unsigned int i;
 
@@ -7352,8 +7817,18 @@ static void switchyard_wrap_dxgi_swapchain_output_vtable(
     {
         object = *(void **)params->args[params->argc - 1];
         if (!object || !(vtable = *(void ***)object)) return;
+        signature = switchyard_com_vtable_wrapper_signature_seed(
+            dxgi_swapchain_vtable_entries, FALSE );
+        for (i = 0; i < dxgi_swapchain_vtable_entries; ++i)
+        {
+            ULONG flags = switchyard_com_vtable_entry_flags( i ) |
+                          switchyard_dxgi_swapchain_vtable_entry_flags( i );
+
+            signature = switchyard_com_vtable_wrapper_signature_step(
+                signature, i, SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS, flags );
+        }
         wrapped_vtable = switchyard_clone_com_vtable_for_wrapping(
-            object, vtable, dxgi_swapchain_vtable_entries, FALSE );
+            object, vtable, dxgi_swapchain_vtable_entries, FALSE, signature );
         if (!wrapped_vtable) return;
         vtable = wrapped_vtable;
 
@@ -7362,6 +7837,7 @@ static void switchyard_wrap_dxgi_swapchain_output_vtable(
                                                          SWITCHYARD_NATIVE_CALLBACK_MAX_ARGS,
                                                          switchyard_com_vtable_entry_flags( i ) |
                                                          switchyard_dxgi_swapchain_vtable_entry_flags( i ) );
+        switchyard_publish_com_vtable_clone_for_wrapping( object, vtable );
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -7453,21 +7929,10 @@ static ULONG_PTR switchyard_call_native_callback_args_raw(
     }
 }
 
-static unsigned int switchyard_d3d12_timestamp_hash( const void *object, ULONGLONG value,
-                                                     unsigned int slots )
-{
-    ULONG_PTR hash = (ULONG_PTR)object >> 4;
-
-    hash ^= (ULONG_PTR)value;
-    hash ^= (ULONG_PTR)(value >> 32);
-    hash ^= hash >> 16;
-    return hash & (slots - 1);
-}
-
 static ULONGLONG switchyard_d3d12_timestamp_now(void)
 {
     LARGE_INTEGER counter, frequency;
-    ULONGLONG seconds, remainder;
+    ULONGLONG seconds, remainder, value;
 
     if (NtQueryPerformanceCounter( &counter, &frequency ) || frequency.QuadPart <= 0)
         return 1;
@@ -7475,144 +7940,259 @@ static ULONGLONG switchyard_d3d12_timestamp_now(void)
     /* D3DMetal advertises a 60 Hz command-queue timestamp frequency. */
     seconds = counter.QuadPart / frequency.QuadPart;
     remainder = counter.QuadPart % frequency.QuadPart;
-    return seconds * 60 + remainder * 60 / frequency.QuadPart;
+    value = seconds * 60 + remainder * 60 / frequency.QuadPart;
+    return value ? value : 1;
+}
+
+struct switchyard_d3d12_timestamp_query_key
+{
+    void *heap;
+    ULONG index;
+};
+
+static int switchyard_d3d12_timestamp_query_compare(
+    const void *key, const RTL_BALANCED_NODE *node )
+{
+    const struct switchyard_d3d12_timestamp_query_key *query_key = key;
+    const struct switchyard_d3d12_timestamp_query *query =
+        CONTAINING_RECORD( node, struct switchyard_d3d12_timestamp_query, node );
+
+    if ((ULONG_PTR)query_key->heap < (ULONG_PTR)query->heap) return -1;
+    if ((ULONG_PTR)query_key->heap > (ULONG_PTR)query->heap) return 1;
+    if (query_key->index < query->index) return -1;
+    if (query_key->index > query->index) return 1;
+    return 0;
+}
+
+static struct switchyard_d3d12_timestamp_query *
+switchyard_d3d12_get_timestamp_query_entry_locked( void *heap, ULONG index )
+{
+    const struct switchyard_d3d12_timestamp_query_key key = { heap, index };
+    RTL_BALANCED_NODE *node;
+
+    node = rtl_rb_tree_get( &switchyard_d3d12_timestamp_queries, &key,
+                            switchyard_d3d12_timestamp_query_compare );
+    return node ? CONTAINING_RECORD(
+        node, struct switchyard_d3d12_timestamp_query, node ) : NULL;
 }
 
 static void switchyard_d3d12_store_timestamp_query_locked( void *heap, ULONG index,
                                                             ULONGLONG value )
 {
-    unsigned int start, i;
+    const struct switchyard_d3d12_timestamp_query_key key = { heap, index };
     struct switchyard_d3d12_timestamp_query *query;
 
-    start = switchyard_d3d12_timestamp_hash(
-        heap, index, SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS );
-    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS; ++i)
+    if ((query = switchyard_d3d12_get_timestamp_query_entry_locked(
+             heap, index )))
     {
-        query = &switchyard_d3d12_timestamp_queries[
-            (start + i) & (SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS - 1)];
-        if (!query->heap || (query->heap == heap && query->index == index))
-        {
-            query->heap = heap;
-            query->index = index;
-            query->value = value;
-            return;
-        }
+        query->value = value;
+        return;
     }
 
-    query = &switchyard_d3d12_timestamp_queries[start];
+    if (!(query = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*query) )))
+        return;
     query->heap = heap;
     query->index = index;
     query->value = value;
+    if (rtl_rb_tree_put( &switchyard_d3d12_timestamp_queries, &key,
+                         &query->node,
+                         switchyard_d3d12_timestamp_query_compare ))
+        RtlFreeHeap( GetProcessHeap(), 0, query );
 }
 
 static ULONGLONG switchyard_d3d12_get_timestamp_query_locked( void *heap, ULONG index )
 {
-    unsigned int start, i;
-    const struct switchyard_d3d12_timestamp_query *query;
+    const struct switchyard_d3d12_timestamp_query *query =
+        switchyard_d3d12_get_timestamp_query_entry_locked( heap, index );
 
-    start = switchyard_d3d12_timestamp_hash(
-        heap, index, SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS );
-    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS; ++i)
-    {
-        query = &switchyard_d3d12_timestamp_queries[
-            (start + i) & (SWITCHYARD_D3D12_TIMESTAMP_QUERY_SLOTS - 1)];
-        if (!query->heap) break;
-        if (query->heap == heap && query->index == index) return query->value;
-    }
+    return query ? query->value : 0;
+}
+
+static int switchyard_d3d12_timestamp_resource_compare(
+    const void *key, const RTL_BALANCED_NODE *node )
+{
+    const struct switchyard_d3d12_timestamp_resource *entry =
+        CONTAINING_RECORD( node, struct switchyard_d3d12_timestamp_resource, node );
+
+    if ((ULONG_PTR)key < (ULONG_PTR)entry->resource) return -1;
+    if ((ULONG_PTR)key > (ULONG_PTR)entry->resource) return 1;
     return 0;
 }
 
 static struct switchyard_d3d12_timestamp_resource *
 switchyard_d3d12_get_timestamp_resource_locked( void *resource, BOOL create )
 {
+    RTL_BALANCED_NODE *node;
     struct switchyard_d3d12_timestamp_resource *entry;
-    unsigned int start, i;
 
-    start = switchyard_d3d12_timestamp_hash(
-        resource, 0, SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS );
-    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS; ++i)
-    {
-        entry = &switchyard_d3d12_timestamp_resources[
-            (start + i) & (SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS - 1)];
-        if (entry->resource == resource) return entry;
-        if (!entry->resource)
-        {
-            if (create) entry->resource = resource;
-            return create ? entry : NULL;
-        }
-    }
+    if (!resource) return NULL;
+    node = rtl_rb_tree_get( &switchyard_d3d12_timestamp_resources, resource,
+                            switchyard_d3d12_timestamp_resource_compare );
+    if (node) return CONTAINING_RECORD(
+        node, struct switchyard_d3d12_timestamp_resource, node );
 
     if (!create) return NULL;
-    entry = &switchyard_d3d12_timestamp_resources[start];
+    if (!(entry = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*entry) )))
+        return NULL;
     entry->resource = resource;
     entry->mapped = NULL;
+    list_init( &entry->resolves );
+    if (rtl_rb_tree_put( &switchyard_d3d12_timestamp_resources, resource,
+                         &entry->node,
+                         switchyard_d3d12_timestamp_resource_compare ))
+    {
+        RtlFreeHeap( GetProcessHeap(), 0, entry );
+        return NULL;
+    }
     return entry;
 }
 
-static void switchyard_d3d12_write_timestamp_resolve_locked(
+static BOOL switchyard_d3d12_write_timestamp_resolve_locked(
     struct switchyard_d3d12_timestamp_resolve *resolve, BYTE *mapped )
 {
-    if (!resolve->resource || !mapped || !resolve->count) return;
+    BOOL written = FALSE;
+
+    if (!mapped || !resolve->count) return FALSE;
 
     __TRY
     {
         memcpy( mapped + resolve->offset, resolve->values,
                 resolve->count * sizeof(resolve->values[0]) );
-        resolve->resource = NULL;
-        resolve->count = 0;
+        written = TRUE;
     }
     __EXCEPT_PAGE_FAULT
     {
     }
     __ENDTRY
+    return written;
 }
 
 static void switchyard_d3d12_store_timestamp_resolve_locked(
     void *resource, ULONGLONG offset, ULONG count, const ULONGLONG *values )
 {
     struct switchyard_d3d12_timestamp_resource *resource_entry;
-    struct switchyard_d3d12_timestamp_resolve *resolve;
-    unsigned int start, i;
+    struct switchyard_d3d12_timestamp_resolve *resolve, *cursor;
 
-    resource_entry = switchyard_d3d12_get_timestamp_resource_locked( resource, TRUE );
-    start = switchyard_d3d12_timestamp_hash(
-        resource, offset >> 3, SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS );
-    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS; ++i)
+    if (!(resource_entry = switchyard_d3d12_get_timestamp_resource_locked(
+              resource, TRUE )))
+        return;
+
+    resolve = NULL;
+    LIST_FOR_EACH_ENTRY( cursor, &resource_entry->resolves,
+                         struct switchyard_d3d12_timestamp_resolve, entry )
     {
-        resolve = &switchyard_d3d12_timestamp_resolves[
-            (start + i) & (SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS - 1)];
-        if (!resolve->resource ||
-            (resolve->resource == resource && resolve->offset == offset))
+        if (cursor->offset == offset)
+        {
+            resolve = cursor;
             break;
+        }
     }
-    if (i == SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS)
-        resolve = &switchyard_d3d12_timestamp_resolves[start];
+    if (!resolve)
+    {
+        if (!(resolve = RtlAllocateHeap(
+                  GetProcessHeap(), 0, sizeof(*resolve) )))
+            return;
+    }
+    else list_remove( &resolve->entry );
 
-    resolve->resource = resource;
     resolve->offset = offset;
     resolve->count = count;
     memcpy( resolve->values, values, count * sizeof(*values) );
-    if (resource_entry && resource_entry->mapped)
+    list_add_tail( &resource_entry->resolves, &resolve->entry );
+    if (resource_entry->mapped &&
         switchyard_d3d12_write_timestamp_resolve_locked(
-            resolve, resource_entry->mapped );
+            resolve, resource_entry->mapped ))
+    {
+        list_remove( &resolve->entry );
+        RtlFreeHeap( GetProcessHeap(), 0, resolve );
+    }
 }
 
 static void switchyard_d3d12_map_timestamp_resource_locked( void *resource, BYTE *mapped )
 {
     struct switchyard_d3d12_timestamp_resource *entry;
-    unsigned int i;
+    struct switchyard_d3d12_timestamp_resolve *resolve, *next;
 
     if (!(entry = switchyard_d3d12_get_timestamp_resource_locked( resource, TRUE )))
         return;
     entry->mapped = mapped;
-    for (i = 0; i < SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS; ++i)
+    LIST_FOR_EACH_ENTRY_SAFE( resolve, next, &entry->resolves,
+                              struct switchyard_d3d12_timestamp_resolve, entry )
     {
-        struct switchyard_d3d12_timestamp_resolve *resolve =
-            &switchyard_d3d12_timestamp_resolves[i];
-
-        if (resolve->resource == resource)
-            switchyard_d3d12_write_timestamp_resolve_locked( resolve, mapped );
+        if (switchyard_d3d12_write_timestamp_resolve_locked( resolve, mapped ))
+        {
+            list_remove( &resolve->entry );
+            RtlFreeHeap( GetProcessHeap(), 0, resolve );
+        }
     }
+}
+
+static RTL_BALANCED_NODE *switchyard_d3d12_timestamp_query_lower_bound_locked(
+    void *heap )
+{
+    const struct switchyard_d3d12_timestamp_query_key key = { heap, 0 };
+    RTL_BALANCED_NODE *node = switchyard_d3d12_timestamp_queries.root;
+    RTL_BALANCED_NODE *ret = NULL;
+
+    while (node)
+    {
+        if (switchyard_d3d12_timestamp_query_compare( &key, node ) <= 0)
+        {
+            ret = node;
+            node = node->Left;
+        }
+        else node = node->Right;
+    }
+    return ret;
+}
+
+static void switchyard_d3d12_remove_timestamp_queries_locked( void *heap )
+{
+    struct switchyard_d3d12_timestamp_query *query;
+    RTL_BALANCED_NODE *node;
+
+    while ((node = switchyard_d3d12_timestamp_query_lower_bound_locked( heap )))
+    {
+        query = CONTAINING_RECORD(
+            node, struct switchyard_d3d12_timestamp_query, node );
+        if (query->heap != heap) break;
+        RtlRbRemoveNode( &switchyard_d3d12_timestamp_queries, &query->node );
+        RtlFreeHeap( GetProcessHeap(), 0, query );
+    }
+}
+
+static void switchyard_d3d12_remove_timestamp_resource_locked( void *resource )
+{
+    struct switchyard_d3d12_timestamp_resolve *resolve, *next;
+    struct switchyard_d3d12_timestamp_resource *entry;
+
+    if (!(entry = switchyard_d3d12_get_timestamp_resource_locked(
+              resource, FALSE )))
+        return;
+    LIST_FOR_EACH_ENTRY_SAFE( resolve, next, &entry->resolves,
+                              struct switchyard_d3d12_timestamp_resolve, entry )
+    {
+        list_remove( &resolve->entry );
+        RtlFreeHeap( GetProcessHeap(), 0, resolve );
+    }
+    RtlRbRemoveNode( &switchyard_d3d12_timestamp_resources, &entry->node );
+    RtlFreeHeap( GetProcessHeap(), 0, entry );
+}
+
+static void switchyard_finalize_d3d12_release(
+    const struct switchyard_native_callback_params *params, ULONG_PTR ret )
+{
+    void *object;
+
+    if (!(params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RELEASE) || ret)
+        return;
+    object = (void *)params->args[0];
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
+    switchyard_d3d12_store_resource_format_locked( object, 0 );
+    switchyard_d3d12_remove_descriptor_heap_locked( object );
+    switchyard_d3d12_remove_timestamp_queries_locked( object );
+    switchyard_d3d12_remove_timestamp_resource_locked( object );
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
 }
 
 static void switchyard_postprocess_d3d12_timestamp(
@@ -7629,10 +8209,10 @@ static void switchyard_postprocess_d3d12_timestamp(
     {
         if (params->args[2] != 2 || !params->args[1]) return;
         now = switchyard_d3d12_timestamp_now();
-        RtlEnterCriticalSection( &loader_section );
+        RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
         switchyard_d3d12_store_timestamp_query_locked(
             (void *)params->args[1], params->args[3], now );
-        RtlLeaveCriticalSection( &loader_section );
+        RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
         return;
     }
 
@@ -7648,7 +8228,7 @@ static void switchyard_postprocess_d3d12_timestamp(
         {
             chunk = min( count, (ULONG)ARRAY_SIZE(values) );
             now = switchyard_d3d12_timestamp_now();
-            RtlEnterCriticalSection( &loader_section );
+            RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
             for (i = 0; i < chunk; ++i)
             {
                 values[i] = switchyard_d3d12_get_timestamp_query_locked(
@@ -7657,7 +8237,7 @@ static void switchyard_postprocess_d3d12_timestamp(
             }
             switchyard_d3d12_store_timestamp_resolve_locked(
                 resource, offset, chunk, values );
-            RtlLeaveCriticalSection( &loader_section );
+            RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
             start_index += chunk;
             count -= chunk;
             offset += chunk * sizeof(values[0]);
@@ -7677,21 +8257,21 @@ static void switchyard_postprocess_d3d12_timestamp(
         }
         __ENDTRY
         if (!mapped) return;
-        RtlEnterCriticalSection( &loader_section );
+        RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
         switchyard_d3d12_map_timestamp_resource_locked(
             (void *)params->args[0], mapped );
-        RtlLeaveCriticalSection( &loader_section );
+        RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
         return;
     }
 
     if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_UNMAP)
     {
         if (!params->args[0]) return;
-        RtlEnterCriticalSection( &loader_section );
+        RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
         resource_entry = switchyard_d3d12_get_timestamp_resource_locked(
             (void *)params->args[0], FALSE );
         if (resource_entry) resource_entry->mapped = NULL;
-        RtlLeaveCriticalSection( &loader_section );
+        RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
     }
 }
 
@@ -7735,7 +8315,7 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
             if (params->flags &
                 (SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE |
                  SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY |
-                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE))
+                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RELEASE))
                 switchyard_postprocess_d3d12_resource_format( params, ret );
             if (params->flags &
                 SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP)
@@ -7766,7 +8346,7 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_COM_IUNKNOWN_OUTPUT_VTABLE)
                     switchyard_wrap_com_iunknown_output_vtable( params );
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D12_OUTPUT_VTABLE)
-                    switchyard_wrap_d3d12_output_vtable( params );
+                    switchyard_wrap_d3d12_output_vtable( params, teb, FALSE );
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_FACTORY_OUTPUT_VTABLE)
                     switchyard_wrap_dxgi_factory_output_vtable( params );
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_DXGI_SWAPCHAIN_OUTPUT_VTABLE)
@@ -7780,6 +8360,7 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
                 if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_GFXT_DEFERRED_VTABLE)
                     switchyard_wrap_gfxt_deferred_vtable_jump_targets();
             }
+            switchyard_finalize_d3d12_release( params, ret );
         }
         __EXCEPT_CTX( switchyard_native_callback_exception_filter, &exception )
         {
@@ -7924,11 +8505,17 @@ static ULONG_PTR WINAPI native_callback_bridge_args( struct switchyard_native_ca
             if (params->flags &
                 (SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE |
                  SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY |
-                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE))
+                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RELEASE))
                 switchyard_postprocess_d3d12_resource_format( params, ret );
             if (params->flags &
                 SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP)
                 switchyard_postprocess_d3d12_narrow_float( params, teb );
+            switchyard_postprocess_d3d12_timestamp( params, ret );
+            if ((LONG)ret >= 0 &&
+                (params->flags &
+                 SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D12_OUTPUT_VTABLE))
+                switchyard_wrap_d3d12_output_vtable( params, teb, TRUE );
+            switchyard_finalize_d3d12_release( params, ret );
         }
         __FINALLY_CTX( switchyard_leave_recovered_native_callback, &scope )
         return ret;

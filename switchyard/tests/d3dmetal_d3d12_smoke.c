@@ -8,6 +8,7 @@
 #include <float.h>
 #include <process.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define TEST_D3D12_SDK_VERSION 611
@@ -388,9 +389,11 @@ static float narrow_float_value_from_bits( DWORD bits )
     return value.value;
 }
 
-static int run_narrow_float_clear_case( ID3D12Device *device,
-                                        ID3D12CommandQueue *queue,
-                                        const struct narrow_float_clear_case *test )
+static int run_narrow_float_clear_case_with_objects(
+    ID3D12Device *device, ID3D12CommandQueue *queue,
+    const struct narrow_float_clear_case *test,
+    ID3D12Resource *provided_texture,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *provided_handle )
 {
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {0};
     D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {0};
@@ -403,7 +406,7 @@ static int run_narrow_float_clear_case( ID3D12Device *device,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {0};
     D3D12_TEXTURE_COPY_LOCATION source_location = {0};
     D3D12_TEXTURE_COPY_LOCATION destination_location = {0};
-    D3D12_CPU_DESCRIPTOR_HANDLE source_handle, clear_handle;
+    D3D12_CPU_DESCRIPTOR_HANDLE source_handle = {0}, clear_handle = {0};
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle = {0};
     ID3D12DescriptorHeap *descriptor_heap = NULL;
     ID3D12CommandAllocator *allocator = NULL;
@@ -428,19 +431,32 @@ static int run_narrow_float_clear_case( ID3D12Device *device,
     HRESULT hr;
     int ret = 0;
 
+    if (provided_handle &&
+        (!provided_handle->ptr || test->unordered_access ||
+         test->descriptor_copy != NARROW_FLOAT_DESCRIPTOR_DIRECT))
+    {
+        fprintf( stderr, "%s received an incompatible descriptor handle.\n",
+                 test->name );
+        goto done;
+    }
+
     descriptor_type = test->unordered_access
         ? D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         : D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    descriptor_heap_desc.Type = descriptor_type;
-    descriptor_heap_desc.NumDescriptors =
-        test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_DIRECT ? 1 : 2;
-    if (test->unordered_access)
-        descriptor_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    hr = ID3D12Device_CreateDescriptorHeap(
-        device, &descriptor_heap_desc, &IID_ID3D12DescriptorHeap,
-        (void **)&descriptor_heap );
-    if (!check_result( test->name, hr )) goto done;
-    fprintf( stderr, "  descriptor heap created.\n" );
+    if (!provided_handle)
+    {
+        descriptor_heap_desc.Type = descriptor_type;
+        descriptor_heap_desc.NumDescriptors =
+            test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_DIRECT ? 1 : 2;
+        if (test->unordered_access)
+            descriptor_heap_desc.Flags =
+                D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = ID3D12Device_CreateDescriptorHeap(
+            device, &descriptor_heap_desc, &IID_ID3D12DescriptorHeap,
+            (void **)&descriptor_heap );
+        if (!check_result( test->name, hr )) goto done;
+        fprintf( stderr, "  descriptor heap created.\n" );
+    }
 
     default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -461,14 +477,27 @@ static int run_narrow_float_clear_case( ID3D12Device *device,
         texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         initial_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
-    hr = ID3D12Device_CreateCommittedResource(
-        device, &default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
-        initial_state, NULL, &IID_ID3D12Resource, (void **)&texture );
-    if (!check_result( test->name, hr )) goto done;
-    fprintf( stderr, "  texture created.\n" );
+    if (provided_texture)
+    {
+        texture = provided_texture;
+        ID3D12Resource_AddRef( texture );
+        fprintf( stderr, "  provided texture retained.\n" );
+    }
+    else
+    {
+        hr = ID3D12Device_CreateCommittedResource(
+            device, &default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+            initial_state, NULL, &IID_ID3D12Resource, (void **)&texture );
+        if (!check_result( test->name, hr )) goto done;
+        fprintf( stderr, "  texture created.\n" );
+    }
 
-    source_handle =
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart( descriptor_heap );
+    if (provided_handle)
+        source_handle = *provided_handle;
+    else
+        source_handle =
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+                descriptor_heap );
     clear_handle = source_handle;
     descriptor_increment =
         ID3D12Device_GetDescriptorHandleIncrementSize( device, descriptor_type );
@@ -635,8 +664,34 @@ done:
     return ret;
 }
 
+static int run_narrow_float_clear_case(
+    ID3D12Device *device, ID3D12CommandQueue *queue,
+    const struct narrow_float_clear_case *test )
+{
+    return run_narrow_float_clear_case_with_objects(
+        device, queue, test, NULL, NULL );
+}
+
+static int run_narrow_float_clear_case_with_handle(
+    ID3D12Device *device, ID3D12CommandQueue *queue,
+    const struct narrow_float_clear_case *test,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *provided_handle )
+{
+    return run_narrow_float_clear_case_with_objects(
+        device, queue, test, NULL, provided_handle );
+}
+
+static int run_narrow_float_clear_case_with_resource(
+    ID3D12Device *device, ID3D12CommandQueue *queue,
+    const struct narrow_float_clear_case *test,
+    ID3D12Resource *provided_texture )
+{
+    return run_narrow_float_clear_case_with_objects(
+        device, queue, test, provided_texture, NULL );
+}
+
 static int verify_narrow_float_clear_conversion( ID3D12Device *device,
-                                                  ID3D12CommandQueue *queue )
+                                                ID3D12CommandQueue *queue )
 {
     struct narrow_float_clear_case tests[] =
     {
@@ -741,8 +796,406 @@ static int verify_narrow_float_clear_conversion( ID3D12Device *device,
     return 1;
 }
 
+static ULONGLONG count_small_private_rw_regions( void )
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONGLONG count = 0;
+    SYSTEM_INFO system_info = {0};
+    UINT_PTR address;
+    UINT_PTR max_address;
+    const SIZE_T small_region_size_limit = 65536;
+
+    GetSystemInfo( &system_info );
+    max_address = (UINT_PTR)system_info.lpMaximumApplicationAddress;
+    for (address = 0; address <= max_address; )
+    {
+        SIZE_T info_size = VirtualQuery( (LPCVOID)address, &mbi, sizeof( mbi ));
+        if (!info_size)
+            break;
+
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+            (mbi.Protect & 0xff) == PAGE_READWRITE &&
+            mbi.RegionSize <= small_region_size_limit)
+            ++count;
+
+        address += mbi.RegionSize;
+        if (!mbi.RegionSize)
+            break;
+    }
+
+    return count;
+}
+
+static void emit_vmq_marker( const char *label, ULONGLONG from_count,
+                            ULONGLONG to_count )
+{
+    const char *pause_env = getenv( "SWITCHYARD_D3D12_DESCRIPTOR_STRESS_VMQ_PAUSE_MS" );
+    int pause_ms = 0;
+    if (pause_env) pause_ms = atoi( pause_env );
+    fprintf( stderr, "D3D12 descriptor stress VMQ marker %s: %llu -> %llu.\n",
+             label, from_count, to_count );
+    if (pause_ms > 0)
+    {
+        if (pause_ms > 600000)
+            pause_ms = 600000;
+        fprintf( stderr,
+                 "D3D12 descriptor stress VMQ pause requested for %d ms at marker %s.\n",
+                 pause_ms, label );
+        Sleep( (DWORD)pause_ms );
+    }
+}
+
+static unsigned int legacy_d3d12_resource_format_hash( const void *resource )
+{
+    ULONG_PTR hash = (ULONG_PTR)resource >> 4;
+
+    hash ^= hash >> 16;
+    hash ^= hash >> 32;
+    return hash & (4096 - 1);
+}
+
+static int run_descriptor_handle_reuse_stress( ID3D12Device *device,
+                                              ID3D12CommandQueue *queue )
+{
+    const unsigned int resource_live_count = 4097;
+    const unsigned int descriptor_warm_count = 1024;
+    const unsigned int descriptor_fill_count = 16384;
+    const unsigned int descriptor_post_count = 1024;
+    const unsigned int descriptor_total_count =
+        descriptor_fill_count + descriptor_post_count;
+    const unsigned int release_churn_iterations = 256;
+    D3D12_HEAP_PROPERTIES heap_properties = {0};
+    D3D12_RESOURCE_DESC resource_desc = {0};
+    D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {0};
+    D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {0};
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor_heap_start = {0};
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    LARGE_INTEGER qpc_frequency;
+    LARGE_INTEGER qpc_start;
+    LARGE_INTEGER qpc_end;
+    LARGE_INTEGER qpc_post_start;
+    LARGE_INTEGER qpc_post_end;
+    UINT descriptor_increment;
+    struct narrow_float_clear_case baseline_case = {
+        "R16G16 RTV finite clear (after churn)",
+        DXGI_FORMAT_R16G16_FLOAT,
+        { FLT_MAX, -FLT_MAX, 0.0f, 0.0f },
+        0xfbff7bff, FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+    };
+    struct narrow_float_clear_case reuse_case = {
+        "R32 RTV finite clear (reused stress descriptor)",
+        DXGI_FORMAT_R32_FLOAT,
+        { FLT_MAX, 0.0f, 0.0f, 0.0f },
+        0x7f7fffff, FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+    };
+    struct narrow_float_clear_case live_resource_case = {
+        "R16G16 RTV default view clear (legacy-table eviction victim)",
+        DXGI_FORMAT_R16G16_FLOAT,
+        { FLT_MAX, -FLT_MAX, 0.0f, 0.0f },
+        0xfbff7bff, FALSE, TRUE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+    };
+    struct narrow_float_clear_case retained_resource_case = {
+        "R16G16 RTV default view clear (resource 1 after non-final release)",
+        DXGI_FORMAT_R16G16_FLOAT,
+        { FLT_MAX, -FLT_MAX, 0.0f, 0.0f },
+        0xfbff7bff, FALSE, TRUE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+    };
+    ID3D12Resource **resources = NULL;
+    ID3D12Resource **legacy_slots = NULL;
+    ID3D12Resource *legacy_evicted_resource = NULL;
+    ID3D12Resource *resource = NULL;
+    ID3D12Resource *temp_resource = NULL;
+    ID3D12DescriptorHeap *descriptor_heap = NULL;
+    HRESULT hr;
+    ULONG refcount;
+    unsigned int i, probe, start;
+    double warm_ms;
+    double post_ms;
+    double ratio;
+    ULONGLONG warm_ticks;
+    ULONGLONG post_ticks;
+    ULONGLONG warm_count = 0;
+    ULONGLONG post_count = descriptor_post_count;
+    ULONGLONG vmq_baseline_count = 0;
+    ULONGLONG vmq_post_create_count = 0;
+    ULONGLONG vmq_post_release_count = 0;
+    int ret = 0;
+    int performance_failed = 0;
+    int vmq_failed = 0;
+
+    printf( "D3D12 descriptor stress start (resources=%u descriptors=%u warm=%u fill=%u post=%u).\n",
+            resource_live_count, descriptor_total_count, descriptor_warm_count,
+            descriptor_fill_count, descriptor_post_count );
+    if (!QueryPerformanceFrequency( &qpc_frequency ))
+    {
+        fprintf( stderr, "QueryPerformanceFrequency failed: %lu\n", GetLastError() );
+        return 0;
+    }
+    vmq_baseline_count = count_small_private_rw_regions();
+    emit_vmq_marker( "baseline", vmq_baseline_count, vmq_baseline_count );
+
+    resources = calloc( resource_live_count, sizeof( *resources ));
+    if (!resources)
+    {
+        fprintf( stderr, "Failed to allocate resource tracking array.\n" );
+        goto done;
+    }
+
+    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    resource_desc.Width = 1;
+    resource_desc.Height = 1;
+    resource_desc.DepthOrArraySize = 1;
+    resource_desc.MipLevels = 1;
+    resource_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    resource_desc.SampleDesc.Count = 1;
+    resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    resource_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rtv_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rtv_desc.Texture2D.MipSlice = 0;
+    rtv_desc.Texture2D.PlaneSlice = 0;
+
+    for (i = 0; i < resource_live_count; ++i)
+    {
+        hr = ID3D12Device_CreateCommittedResource(
+            device, &heap_properties, D3D12_HEAP_FLAG_NONE, &resource_desc,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource,
+            (void **)&resource );
+        if (!check_result( "D3D12Device_CreateCommittedResource live resource", hr ))
+            goto done;
+
+        resources[i] = resource;
+        resource = NULL;
+    }
+    vmq_post_create_count = count_small_private_rw_regions();
+    emit_vmq_marker( "after-create", vmq_baseline_count, vmq_post_create_count );
+
+    if (!(legacy_slots = calloc( 4096, sizeof(*legacy_slots) )))
+    {
+        fprintf( stderr,
+                 "Failed to allocate the legacy resource tracking model.\n" );
+        goto done;
+    }
+    for (i = 0; i < 4096; ++i)
+    {
+        start = legacy_d3d12_resource_format_hash( resources[i] );
+        for (probe = 0; probe < 4096; ++probe)
+        {
+            unsigned int slot = (start + probe) & (4096 - 1);
+
+            if (legacy_slots[slot]) continue;
+            legacy_slots[slot] = resources[i];
+            break;
+        }
+        if (probe == 4096)
+        {
+            fprintf( stderr,
+                     "Legacy resource tracking model filled unexpectedly early.\n" );
+            goto done;
+        }
+    }
+    start = legacy_d3d12_resource_format_hash( resources[4096] );
+    legacy_evicted_resource = legacy_slots[start];
+    if (!legacy_evicted_resource)
+    {
+        fprintf( stderr,
+                 "Legacy resource tracking model did not identify an eviction victim.\n" );
+        goto done;
+    }
+
+    if (!run_narrow_float_clear_case_with_resource(
+            device, queue, &live_resource_case, legacy_evicted_resource ))
+    {
+        fprintf( stderr,
+                 "D3D12 descriptor stress lost the legacy-table eviction victim.\n" );
+        goto done;
+    }
+
+    ID3D12Resource_AddRef( resources[1] );
+    refcount = ID3D12Resource_Release( resources[1] );
+    if (!refcount)
+    {
+        fprintf( stderr,
+                 "D3D12 descriptor stress resource Release was unexpectedly final.\n" );
+        resources[1] = NULL;
+        goto done;
+    }
+    if (!run_narrow_float_clear_case_with_resource(
+            device, queue, &retained_resource_case, resources[1] ))
+    {
+        fprintf( stderr,
+                 "D3D12 descriptor stress lost a resource after non-final Release.\n" );
+        goto done;
+    }
+
+    descriptor_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    descriptor_heap_desc.NumDescriptors = descriptor_total_count;
+    descriptor_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    hr = ID3D12Device_CreateDescriptorHeap(
+        device, &descriptor_heap_desc, &IID_ID3D12DescriptorHeap,
+        (void **)&descriptor_heap );
+    if (!check_result( "D3D12Device_CreateDescriptorHeap (single descriptor table)", hr ))
+        goto done;
+    descriptor_heap_start = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart( descriptor_heap );
+    if (!descriptor_heap_start.ptr)
+    {
+        fprintf( stderr, "Null CPU descriptor handle for descriptor heap.\n" );
+        goto done;
+    }
+    descriptor_increment = ID3D12Device_GetDescriptorHandleIncrementSize(
+        device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV );
+
+    QueryPerformanceCounter( &qpc_start );
+    for (i = 0; i < descriptor_warm_count; ++i)
+    {
+        handle.ptr = descriptor_heap_start.ptr + (UINT_PTR)i * descriptor_increment;
+        ID3D12Device_CreateRenderTargetView(
+            device, resources[i % resource_live_count], &rtv_desc, handle );
+    }
+    QueryPerformanceCounter( &qpc_end );
+
+    for (i = descriptor_warm_count; i < descriptor_fill_count; ++i)
+        ID3D12Device_CreateRenderTargetView(
+            device, resources[i % resource_live_count], &rtv_desc,
+            (D3D12_CPU_DESCRIPTOR_HANDLE){
+                .ptr = descriptor_heap_start.ptr + (UINT_PTR)i * descriptor_increment } );
+
+    QueryPerformanceCounter( &qpc_post_start );
+    for (i = descriptor_fill_count;
+         i < descriptor_fill_count + descriptor_post_count; ++i)
+    {
+        handle.ptr = descriptor_heap_start.ptr + (UINT_PTR)i * descriptor_increment;
+        ID3D12Device_CreateRenderTargetView(
+            device, resources[i % resource_live_count], &rtv_desc, handle );
+    }
+    QueryPerformanceCounter( &qpc_post_end );
+
+    warm_ticks = (ULONGLONG)(qpc_end.QuadPart - qpc_start.QuadPart);
+    post_ticks = (ULONGLONG)(qpc_post_end.QuadPart - qpc_post_start.QuadPart);
+    warm_count = descriptor_warm_count;
+    if (!warm_ticks)
+    {
+        fprintf( stderr, "Descriptor warm timing measured zero ticks.\n" );
+        goto done;
+    }
+    if (post_ticks * warm_count > warm_ticks * post_count * 5)
+    {
+        warm_ms = ((double)warm_ticks * 1000.0) / (double)qpc_frequency.QuadPart;
+        post_ms = ((double)post_ticks * 1000.0) / (double)qpc_frequency.QuadPart;
+        ratio = ((double)post_ticks / (double)post_count)
+            / ((double)warm_ticks / (double)warm_count);
+        fprintf( stderr, "Descriptor benchmark ratio %.2fx exceeded 5x threshold.\n", ratio );
+        fprintf( stderr,
+                 "Warm: %.3f ms for %llu descriptors, "
+                 "fill: %u descriptors (untimed), Post: %.3f ms for %llu descriptors.\n",
+                 warm_ms, warm_count, descriptor_fill_count - descriptor_warm_count,
+                 post_ms, post_count );
+        performance_failed = 1;
+    }
+    else
+    {
+        warm_ms = ((double)warm_ticks * 1000.0) / (double)qpc_frequency.QuadPart;
+        post_ms = ((double)post_ticks * 1000.0) / (double)qpc_frequency.QuadPart;
+        ratio = ((double)post_ticks / (double)post_count) / ((double)warm_ticks / (double)warm_count);
+        printf( "D3D12 descriptor benchmark timings: warm=%.3f ms for %llu, "
+                "fill=%u (untimed), post=%.3f ms for %llu, ratio=%.2fx.\n",
+                warm_ms, warm_count, descriptor_fill_count - descriptor_warm_count,
+                post_ms, post_count, ratio );
+    }
+
+    if (!run_narrow_float_clear_case( device, queue, &baseline_case ))
+    {
+        fprintf( stderr, "D3D12 descriptor stress failed narrow-float clear after writes.\n" );
+        goto done;
+    }
+
+    handle.ptr = descriptor_heap_start.ptr;
+    if (!run_narrow_float_clear_case_with_handle(
+            device, queue, &reuse_case, &handle ))
+    {
+        fprintf( stderr, "D3D12 descriptor stress failed pointer/handle reuse check.\n" );
+        goto done;
+    }
+
+    refcount = ID3D12DescriptorHeap_Release( descriptor_heap );
+    descriptor_heap = NULL;
+    if (refcount)
+    {
+        fprintf( stderr,
+                 "D3D12 descriptor stress heap Release retained %lu references.\n",
+                 refcount );
+        goto done;
+    }
+
+    for (i = 0; i < release_churn_iterations; ++i)
+    {
+        hr = ID3D12Device_CreateCommittedResource(
+            device, &heap_properties, D3D12_HEAP_FLAG_NONE, &resource_desc,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource,
+            (void **)&temp_resource );
+        if (!check_result( "D3D12Device_CreateCommittedResource release churn", hr ))
+            goto done;
+        ID3D12Resource_AddRef( temp_resource );
+        ID3D12Resource_AddRef( temp_resource );
+        ID3D12Resource_Release( temp_resource );
+        ID3D12Resource_Release( temp_resource );
+        ID3D12Resource_Release( temp_resource );
+        temp_resource = NULL;
+    }
+
+    for (i = 0; i < resource_live_count; ++i)
+    {
+        if (resources[i])
+        {
+            ID3D12Resource_Release( resources[i] );
+            resources[i] = NULL;
+        }
+    }
+    vmq_post_release_count = count_small_private_rw_regions();
+    emit_vmq_marker( "after-release", vmq_post_create_count, vmq_post_release_count );
+    printf( "D3D12 descriptor stress VMQ counts: baseline=%llu create=%llu release=%llu.\n",
+            vmq_baseline_count, vmq_post_create_count, vmq_post_release_count );
+
+    if (vmq_post_create_count >= vmq_baseline_count + 1024)
+    {
+        ULONGLONG create_delta = vmq_post_create_count - vmq_baseline_count;
+        ULONGLONG release_delta = vmq_post_release_count > vmq_baseline_count
+            ? vmq_post_release_count - vmq_baseline_count : 0;
+        if (release_delta * 2 > create_delta)
+        {
+            vmq_failed = 1;
+            fprintf( stderr,
+                     "D3D12 descriptor stress VMQ leak gate triggered: "
+                     "create_delta=%llu release_delta=%llu.\n",
+                    create_delta, release_delta );
+        }
+    }
+    else
+    {
+        fprintf( stderr, "D3D12 descriptor stress VMQ gate skipped (delta=%llu < 1024, marker).\n",
+                 vmq_post_create_count > vmq_baseline_count
+                 ? vmq_post_create_count - vmq_baseline_count
+                 : 0 );
+    }
+
+    if (!performance_failed && !vmq_failed)
+        ret = 1;
+
+done:
+    for (i = 0; i < resource_live_count; ++i)
+        if (resources && resources[i]) ID3D12Resource_Release( resources[i] );
+    free( legacy_slots );
+    free( resources );
+    if (temp_resource) ID3D12Resource_Release( temp_resource );
+    if (resource) ID3D12Resource_Release( resource );
+    if (descriptor_heap) ID3D12DescriptorHeap_Release( descriptor_heap );
+    return ret;
+}
+
 int main(int argc, char **argv)
 {
+    BOOL descriptor_stress_test = FALSE;
     D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {0};
     D3D12_DESCRIPTOR_HEAP_DESC returned_descriptor_heap_desc;
@@ -802,6 +1255,8 @@ int main(int argc, char **argv)
     setvbuf( stdout, NULL, _IONBF, 0 );
     if (argc > 1 && !strcmp( argv[1], "--switchyard-chromium-gpu-probe" ))
         return run_chromium_gpu_probe();
+    if (argc > 1 && !strcmp( argv[1], "--switchyard-d3d12-descriptor-stress" ))
+        descriptor_stress_test = TRUE;
 
     if (!verify_agility_contract()) goto done;
 
@@ -1012,6 +1467,8 @@ int main(int argc, char **argv)
     }
     printf( "D3D12 command queue hook entries: %p, %p.\n",
             (*(void ***)queue)[10], (*(void ***)queue)[14] );
+    if (descriptor_stress_test && !run_descriptor_handle_reuse_stress( device, queue ))
+        goto done;
     if (!verify_narrow_float_clear_conversion( device, queue )) goto done;
 #ifdef _WIN64
     if ((ULONG_PTR)(*(void ***)queue)[10] <= MAXDWORD ||
