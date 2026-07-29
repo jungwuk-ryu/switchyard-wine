@@ -358,6 +358,389 @@ static int run_chromium_gpu_probe(void)
     return 0;
 }
 
+enum narrow_float_descriptor_copy
+{
+    NARROW_FLOAT_DESCRIPTOR_DIRECT,
+    NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE,
+    NARROW_FLOAT_DESCRIPTOR_COPY_RANGES,
+};
+
+struct narrow_float_clear_case
+{
+    const char *name;
+    DXGI_FORMAT format;
+    float values[4];
+    DWORD expected;
+    BOOL unordered_access;
+    BOOL null_view_desc;
+    enum narrow_float_descriptor_copy descriptor_copy;
+};
+
+static float narrow_float_value_from_bits( DWORD bits )
+{
+    union
+    {
+        DWORD bits;
+        float value;
+    } value;
+
+    value.bits = bits;
+    return value.value;
+}
+
+static int run_narrow_float_clear_case( ID3D12Device *device,
+                                        ID3D12CommandQueue *queue,
+                                        const struct narrow_float_clear_case *test )
+{
+    D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {0};
+    D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {0};
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {0};
+    D3D12_HEAP_PROPERTIES default_heap = {0};
+    D3D12_HEAP_PROPERTIES readback_heap = {0};
+    D3D12_RESOURCE_DESC texture_desc = {0};
+    D3D12_RESOURCE_DESC buffer_desc = {0};
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {0};
+    D3D12_TEXTURE_COPY_LOCATION source_location = {0};
+    D3D12_TEXTURE_COPY_LOCATION destination_location = {0};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_handle, clear_handle;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle = {0};
+    ID3D12DescriptorHeap *descriptor_heap = NULL;
+    ID3D12CommandAllocator *allocator = NULL;
+    ID3D12GraphicsCommandList *command_list = NULL;
+    ID3D12Resource *texture = NULL;
+    ID3D12Resource *readback = NULL;
+    ID3D12Fence *fence = NULL;
+    ID3D12CommandList *command_lists[1];
+    ID3D12DescriptorHeap *descriptor_heaps[1];
+    D3D12_CPU_DESCRIPTOR_HANDLE destination_starts[1];
+    D3D12_CPU_DESCRIPTOR_HANDLE source_starts[1];
+    D3D12_RANGE read_range, written_range = {0};
+    UINT descriptor_range_sizes[1] = {1};
+    UINT descriptor_increment;
+    UINT row_count;
+    UINT64 row_size, total_size;
+    D3D12_RESOURCE_STATES initial_state;
+    D3D12_DESCRIPTOR_HEAP_TYPE descriptor_type;
+    HANDLE fence_event = NULL;
+    void *mapped = NULL;
+    DWORD actual;
+    HRESULT hr;
+    int ret = 0;
+
+    descriptor_type = test->unordered_access
+        ? D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        : D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    descriptor_heap_desc.Type = descriptor_type;
+    descriptor_heap_desc.NumDescriptors =
+        test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_DIRECT ? 1 : 2;
+    if (test->unordered_access)
+        descriptor_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = ID3D12Device_CreateDescriptorHeap(
+        device, &descriptor_heap_desc, &IID_ID3D12DescriptorHeap,
+        (void **)&descriptor_heap );
+    if (!check_result( test->name, hr )) goto done;
+    fprintf( stderr, "  descriptor heap created.\n" );
+
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Width = 1;
+    texture_desc.Height = 1;
+    texture_desc.DepthOrArraySize = 1;
+    texture_desc.MipLevels = 1;
+    texture_desc.Format = test->format;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (test->unordered_access)
+    {
+        texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        initial_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    else
+    {
+        texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        initial_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    hr = ID3D12Device_CreateCommittedResource(
+        device, &default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+        initial_state, NULL, &IID_ID3D12Resource, (void **)&texture );
+    if (!check_result( test->name, hr )) goto done;
+    fprintf( stderr, "  texture created.\n" );
+
+    source_handle =
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart( descriptor_heap );
+    clear_handle = source_handle;
+    descriptor_increment =
+        ID3D12Device_GetDescriptorHandleIncrementSize( device, descriptor_type );
+    if (test->descriptor_copy != NARROW_FLOAT_DESCRIPTOR_DIRECT)
+        clear_handle.ptr += descriptor_increment;
+
+    if (test->unordered_access)
+    {
+        uav_desc.Format = test->format;
+        uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        ID3D12Device_CreateUnorderedAccessView(
+            device, texture, NULL, test->null_view_desc ? NULL : &uav_desc,
+            source_handle );
+    }
+    else
+    {
+        rtv_desc.Format = test->format;
+        rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        ID3D12Device_CreateRenderTargetView(
+            device, texture, test->null_view_desc ? NULL : &rtv_desc,
+            source_handle );
+    }
+    fprintf( stderr, "  view created.\n" );
+
+    if (test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE)
+    {
+        ID3D12Device_CopyDescriptorsSimple(
+            device, 1, clear_handle, source_handle, descriptor_type );
+    }
+    else if (test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_RANGES)
+    {
+        destination_starts[0] = clear_handle;
+        source_starts[0] = source_handle;
+        ID3D12Device_CopyDescriptors(
+            device, 1, destination_starts, descriptor_range_sizes,
+            1, source_starts, descriptor_range_sizes, descriptor_type );
+    }
+    fprintf( stderr, "  descriptor ready.\n" );
+
+    hr = ID3D12Device_CreateCommandAllocator(
+        device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        &IID_ID3D12CommandAllocator, (void **)&allocator );
+    if (!check_result( test->name, hr )) goto done;
+    hr = ID3D12Device_CreateCommandList(
+        device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL,
+        &IID_ID3D12GraphicsCommandList, (void **)&command_list );
+    if (!check_result( test->name, hr )) goto done;
+    fprintf( stderr, "  command list created.\n" );
+
+    if (test->unordered_access)
+    {
+        gpu_handle =
+            ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart( descriptor_heap );
+        if (test->descriptor_copy != NARROW_FLOAT_DESCRIPTOR_DIRECT)
+            gpu_handle.ptr += descriptor_increment;
+        descriptor_heaps[0] = descriptor_heap;
+        ID3D12GraphicsCommandList_SetDescriptorHeaps(
+            command_list, 1, descriptor_heaps );
+        ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(
+            command_list, gpu_handle, clear_handle, texture, test->values,
+            0, NULL );
+    }
+    else
+    {
+        ID3D12GraphicsCommandList_ClearRenderTargetView(
+            command_list, clear_handle, test->values, 0, NULL );
+    }
+    fprintf( stderr, "  clear recorded.\n" );
+
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = initial_state;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier( command_list, 1, &barrier );
+
+    ID3D12Device_GetCopyableFootprints(
+        device, &texture_desc, 0, 1, 0, &footprint, &row_count,
+        &row_size, &total_size );
+    if (!total_size)
+    {
+        fprintf( stderr, "%s returned an empty copy footprint.\n", test->name );
+        goto done;
+    }
+
+    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total_size;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    hr = ID3D12Device_CreateCommittedResource(
+        device, &readback_heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+        (void **)&readback );
+    if (!check_result( test->name, hr )) goto done;
+
+    source_location.pResource = texture;
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination_location.pResource = readback;
+    destination_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination_location.PlacedFootprint = footprint;
+    ID3D12GraphicsCommandList_CopyTextureRegion(
+        command_list, &destination_location, 0, 0, 0,
+        &source_location, NULL );
+
+    hr = ID3D12Device_CreateFence(
+        device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence,
+        (void **)&fence );
+    if (!check_result( test->name, hr )) goto done;
+    if (!(fence_event = CreateEventW( NULL, FALSE, FALSE, NULL )))
+    {
+        fprintf( stderr, "%s CreateEvent failed: %lu\n",
+                 test->name, GetLastError() );
+        goto done;
+    }
+
+    hr = ID3D12GraphicsCommandList_Close( command_list );
+    if (!check_result( test->name, hr )) goto done;
+    fprintf( stderr, "  command list closed.\n" );
+    command_lists[0] = (ID3D12CommandList *)command_list;
+    ID3D12CommandQueue_ExecuteCommandLists( queue, 1, command_lists );
+    fprintf( stderr, "  command list submitted.\n" );
+    hr = ID3D12CommandQueue_Signal( queue, fence, 1 );
+    if (!check_result( test->name, hr )) goto done;
+    fprintf( stderr, "  fence signaled.\n" );
+    hr = ID3D12Fence_SetEventOnCompletion( fence, 1, fence_event );
+    if (!check_result( test->name, hr )) goto done;
+    fprintf( stderr, "  fence event armed.\n" );
+    if (WaitForSingleObject( fence_event, 30000 ) != WAIT_OBJECT_0)
+    {
+        fprintf( stderr, "%s timed out waiting for the clear.\n", test->name );
+        goto done;
+    }
+
+    read_range.Begin = footprint.Offset;
+    read_range.End = footprint.Offset + sizeof(actual);
+    hr = ID3D12Resource_Map( readback, 0, &read_range, &mapped );
+    if (!check_result( test->name, hr ) || !mapped) goto done;
+    actual = *(const DWORD *)((const BYTE *)mapped + footprint.Offset);
+    ID3D12Resource_Unmap( readback, 0, &written_range );
+    mapped = NULL;
+    if (actual != test->expected)
+    {
+        fprintf( stderr, "%s produced %#lx instead of %#lx.\n",
+                 test->name, actual, test->expected );
+        goto done;
+    }
+
+    printf( "%s produced %#lx.\n", test->name, actual );
+    ret = 1;
+
+done:
+    if (mapped) ID3D12Resource_Unmap( readback, 0, &written_range );
+    if (fence_event) CloseHandle( fence_event );
+    if (fence) ID3D12Fence_Release( fence );
+    if (readback) ID3D12Resource_Release( readback );
+    if (texture) ID3D12Resource_Release( texture );
+    if (command_list) ID3D12GraphicsCommandList_Release( command_list );
+    if (allocator) ID3D12CommandAllocator_Release( allocator );
+    if (descriptor_heap) ID3D12DescriptorHeap_Release( descriptor_heap );
+    return ret;
+}
+
+static int verify_narrow_float_clear_conversion( ID3D12Device *device,
+                                                  ID3D12CommandQueue *queue )
+{
+    struct narrow_float_clear_case tests[] =
+    {
+        {
+            "R16G16 RTV finite clear", DXGI_FORMAT_R16G16_FLOAT,
+            { FLT_MAX, -FLT_MAX, 0.0f, 0.0f }, 0xfbff7bff,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R16G16 RTV default view clear", DXGI_FORMAT_R16G16_FLOAT,
+            { FLT_MAX, -FLT_MAX, 0.0f, 0.0f }, 0xfbff7bff,
+            FALSE, TRUE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R16G16 RTV simple descriptor copy", DXGI_FORMAT_R16G16_FLOAT,
+            { FLT_MAX, -FLT_MAX, 0.0f, 0.0f }, 0xfbff7bff,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE
+        },
+        {
+            "R16G16 RTV descriptor range copy", DXGI_FORMAT_R16G16_FLOAT,
+            { 0.0f, 0.0f, 0.0f, 0.0f }, 0xfc007c00,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_COPY_RANGES
+        },
+        {
+            "R32 RTV finite clear", DXGI_FORMAT_R32_FLOAT,
+            { FLT_MAX, 0.0f, 0.0f, 0.0f }, 0x7f7fffff,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R16G16 UAV finite clear", DXGI_FORMAT_R16G16_FLOAT,
+            { FLT_MAX, -FLT_MAX, 0.0f, 0.0f }, 0xfbff7bff,
+            TRUE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R16G16 UAV default view descriptor copy",
+            DXGI_FORMAT_R16G16_FLOAT,
+            { FLT_MAX, -FLT_MAX, 0.0f, 0.0f }, 0xfbff7bff,
+            TRUE, TRUE, NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE
+        },
+        {
+            "R11G11B10 RTV finite clear", DXGI_FORMAT_R11G11B10_FLOAT,
+            { FLT_MAX, -FLT_MAX, FLT_MAX, 0.0f }, 0xf7c007bf,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R11G11B10 RTV infinity clear", DXGI_FORMAT_R11G11B10_FLOAT,
+            { 0.0f, 0.0f, 0.0f, 0.0f }, 0xf80007c0,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R9G9B9E5 RTV finite clear", DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+            { FLT_MAX, -FLT_MAX, FLT_MAX, 0.0f }, 0xfffc01ff,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R9G9B9E5 RTV infinity clear", DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+            { 0.0f, 0.0f, 0.0f, 0.0f }, 0xf80001ff,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R11G11B10 UAV finite clear", DXGI_FORMAT_R11G11B10_FLOAT,
+            { FLT_MAX, -FLT_MAX, FLT_MAX, 0.0f }, 0xf7c007bf,
+            TRUE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R11G11B10 UAV infinity clear", DXGI_FORMAT_R11G11B10_FLOAT,
+            { 0.0f, 0.0f, 0.0f, 0.0f }, 0xf80007c0,
+            TRUE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R9G9B9E5 UAV finite clear", DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+            { FLT_MAX, -FLT_MAX, FLT_MAX, 0.0f }, 0xfffc01ff,
+            TRUE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+        {
+            "R9G9B9E5 UAV infinity clear", DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+            { 0.0f, 0.0f, 0.0f, 0.0f }, 0xf80001ff,
+            TRUE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
+        },
+    };
+    unsigned int i;
+
+    tests[3].values[0] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[3].values[1] = narrow_float_value_from_bits( 0xff800000 );
+    tests[8].values[0] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[8].values[1] = narrow_float_value_from_bits( 0xff800000 );
+    tests[8].values[2] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[10].values[0] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[10].values[1] = narrow_float_value_from_bits( 0xff800000 );
+    tests[12].values[0] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[12].values[1] = narrow_float_value_from_bits( 0xff800000 );
+    tests[12].values[2] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[14].values[0] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[14].values[1] = narrow_float_value_from_bits( 0xff800000 );
+    for (i = 0; i < ARRAYSIZE(tests); ++i)
+    {
+        fprintf( stderr, "Running %s.\n", tests[i].name );
+        if (!run_narrow_float_clear_case( device, queue, &tests[i] ))
+            return 0;
+    }
+
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
@@ -416,6 +799,7 @@ int main(int argc, char **argv)
     HRESULT hr;
     int ret = 1;
 
+    setvbuf( stdout, NULL, _IONBF, 0 );
     if (argc > 1 && !strcmp( argv[1], "--switchyard-chromium-gpu-probe" ))
         return run_chromium_gpu_probe();
 
@@ -628,6 +1012,7 @@ int main(int argc, char **argv)
     }
     printf( "D3D12 command queue hook entries: %p, %p.\n",
             (*(void ***)queue)[10], (*(void ***)queue)[14] );
+    if (!verify_narrow_float_clear_conversion( device, queue )) goto done;
 #ifdef _WIN64
     if ((ULONG_PTR)(*(void ***)queue)[10] <= MAXDWORD ||
         (ULONG_PTR)(*(void ***)queue)[14] <= MAXDWORD)

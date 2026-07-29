@@ -3882,14 +3882,33 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI 0x100000
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D_BLOB_OUTPUT_VTABLE 0x200000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_CLEAR_DEPTH_STENCIL_VIEW 0x400000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP 0x800000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_MAP 0x1000000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_UNMAP 0x2000000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_END_QUERY 0x4000000
 #define SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_RESOLVE_QUERY 0x8000000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE 0x10000000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY 0x20000000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_DESC_ARG1 \
+    SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY
+#define SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE 0x40000000
 #define SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK 0x80000000u
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
+
+enum switchyard_d3d12_narrow_float_action
+{
+    SWITCHYARD_D3D12_NARROW_FLOAT_CREATE_UAV = 1,
+    SWITCHYARD_D3D12_NARROW_FLOAT_CREATE_RTV,
+    SWITCHYARD_D3D12_NARROW_FLOAT_COPY_DESCRIPTORS,
+    SWITCHYARD_D3D12_NARROW_FLOAT_COPY_DESCRIPTORS_SIMPLE,
+    SWITCHYARD_D3D12_NARROW_FLOAT_CLEAR_RTV,
+    SWITCHYARD_D3D12_NARROW_FLOAT_CLEAR_UAV,
+};
+
+#define SWITCHYARD_D3D12_NARROW_FLOAT_ACTION(action) \
+    SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(action)
 #define SWITCHYARD_PE_CALLBACK_MAX_ARGS 9
 #define SWITCHYARD_PE_CALLBACK_FRAME_SIZE 0xa8
 #define SWITCHYARD_PE_CALLBACK_PARAMS_OFFSET 0x20
@@ -3964,6 +3983,52 @@ static struct switchyard_d3d12_timestamp_resource
     switchyard_d3d12_timestamp_resources[SWITCHYARD_D3D12_TIMESTAMP_RESOURCE_SLOTS];
 static struct switchyard_d3d12_timestamp_resolve
     switchyard_d3d12_timestamp_resolves[SWITCHYARD_D3D12_TIMESTAMP_RESOLVE_SLOTS];
+
+#define SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS 16384
+#define SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS 4096
+
+struct switchyard_d3d12_descriptor_format
+{
+    ULONG_PTR handle;
+    ULONG format;
+};
+
+struct switchyard_d3d12_resource_format
+{
+    void *resource;
+    ULONG format;
+};
+
+struct switchyard_d3d12_resource_desc
+{
+    ULONG dimension;
+    ULONG padding;
+    ULONGLONG alignment;
+    ULONGLONG width;
+    ULONG height;
+    USHORT depth_or_array_size;
+    USHORT mip_levels;
+    ULONG format;
+    ULONG sample_count;
+    ULONG sample_quality;
+    ULONG layout;
+    ULONG flags;
+};
+
+struct switchyard_d3d12_descriptor_copy
+{
+    ULONG_PTR dst;
+    ULONG_PTR src;
+    ULONG format;
+};
+
+static struct switchyard_d3d12_descriptor_format
+    switchyard_d3d12_descriptor_formats[SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS];
+static struct switchyard_d3d12_resource_format
+    switchyard_d3d12_resource_formats[SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS];
+
+C_ASSERT( sizeof(struct switchyard_d3d12_resource_desc) == 56 );
+C_ASSERT( FIELD_OFFSET(struct switchyard_d3d12_resource_desc, format) == 32 );
 
 #define SWITCHYARD_NATIVE_CALLBACK_THUNK_INFO_MAGIC 0x53595754484e4b31ULL
 struct switchyard_native_callback_thunk_info
@@ -4805,6 +4870,31 @@ static ULONG switchyard_d3d11_device_context_vtable_entry_flags( unsigned int in
 static ULONG switchyard_d3d12_device_vtable_entry_flags( unsigned int index )
 {
     unsigned int output_arg;
+    ULONG flags;
+
+    switch (index)
+    {
+    case 19: /* CreateUnorderedAccessView */
+        return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
+               SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP |
+               SWITCHYARD_D3D12_NARROW_FLOAT_ACTION(
+                   SWITCHYARD_D3D12_NARROW_FLOAT_CREATE_UAV );
+    case 20: /* CreateRenderTargetView */
+        return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
+               SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP |
+               SWITCHYARD_D3D12_NARROW_FLOAT_ACTION(
+                   SWITCHYARD_D3D12_NARROW_FLOAT_CREATE_RTV );
+    case 23: /* CopyDescriptors */
+        return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
+               SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP |
+               SWITCHYARD_D3D12_NARROW_FLOAT_ACTION(
+                   SWITCHYARD_D3D12_NARROW_FLOAT_COPY_DESCRIPTORS );
+    case 24: /* CopyDescriptorsSimple */
+        return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
+               SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP |
+               SWITCHYARD_D3D12_NARROW_FLOAT_ACTION(
+                   SWITCHYARD_D3D12_NARROW_FLOAT_COPY_DESCRIPTORS_SIMPLE );
+    }
 
     switch (index)
     {
@@ -4878,8 +4968,28 @@ static ULONG switchyard_d3d12_device_vtable_entry_flags( unsigned int index )
         return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK;
     }
 
-    return SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
-           switchyard_d3d12_output_flags( output_arg );
+    flags = SWITCHYARD_NATIVE_CALLBACK_SHARE_THUNK |
+            switchyard_d3d12_output_flags( output_arg );
+    switch (index)
+    {
+    case 27: /* CreateCommittedResource */
+    case 29: /* CreatePlacedResource */
+    case 30: /* CreateReservedResource */
+    case 53: /* CreateCommittedResource1 */
+    case 55: /* CreateReservedResource1 */
+    case 69: /* CreateCommittedResource2 */
+    case 70: /* CreatePlacedResource1 */
+    case 76: /* CreateCommittedResource3 */
+    case 77: /* CreatePlacedResource2 */
+        flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE;
+        break;
+
+    case 78: /* CreateReservedResource2 */
+        flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE |
+                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_DESC_ARG1;
+        break;
+    }
+    return flags;
 }
 
 static ULONG switchyard_d3d12_device_child_vtable_entry_flags( unsigned int index )
@@ -4902,6 +5012,8 @@ static ULONG switchyard_d3d12_resource_vtable_entry_flags( unsigned int index )
 {
     ULONG flags = switchyard_d3d12_device_child_vtable_entry_flags( index );
 
+    if (index == 0) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY;
+    if (index == 2) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE;
     if (index == 8) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_MAP;
     if (index == 9) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_UNMAP;
     if (index == 15) flags |= switchyard_d3d12_output_flags( 2 );
@@ -6057,6 +6169,619 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     return copy;
 }
 
+enum switchyard_dxgi_format
+{
+    SWITCHYARD_DXGI_FORMAT_R16G16B16A16_FLOAT = 0x0a,
+    SWITCHYARD_DXGI_FORMAT_R11G11B10_FLOAT = 0x1a,
+    SWITCHYARD_DXGI_FORMAT_R16G16_FLOAT = 0x22,
+    SWITCHYARD_DXGI_FORMAT_R16_FLOAT = 0x36,
+    SWITCHYARD_DXGI_FORMAT_R9G9B9E5_SHAREDEXP = 0x43,
+};
+
+static BOOL switchyard_d3d12_format_needs_narrow_float_fixup( ULONG format )
+{
+    return format == SWITCHYARD_DXGI_FORMAT_R16_FLOAT ||
+           format == SWITCHYARD_DXGI_FORMAT_R16G16_FLOAT ||
+           format == SWITCHYARD_DXGI_FORMAT_R16G16B16A16_FLOAT ||
+           format == SWITCHYARD_DXGI_FORMAT_R11G11B10_FLOAT ||
+           format == SWITCHYARD_DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+}
+
+static unsigned int switchyard_d3d12_descriptor_format_hash( ULONG_PTR handle )
+{
+    handle >>= 4;
+    handle ^= handle >> 16;
+    handle ^= handle >> 32;
+    return handle & (SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS - 1);
+}
+
+static void switchyard_d3d12_store_descriptor_format_locked( ULONG_PTR handle,
+                                                              ULONG format )
+{
+    struct switchyard_d3d12_descriptor_format *entry, *available = NULL;
+    const ULONG_PTR tombstone = ~(ULONG_PTR)0;
+    unsigned int start, i;
+
+    if (!handle || handle == tombstone) return;
+
+    start = switchyard_d3d12_descriptor_format_hash( handle );
+    for (i = 0; i < SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS; ++i)
+    {
+        entry = &switchyard_d3d12_descriptor_formats[
+            (start + i) & (SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS - 1)];
+        if (entry->handle == tombstone)
+        {
+            if (!available) available = entry;
+            continue;
+        }
+        if (entry->handle == handle)
+        {
+            if (switchyard_d3d12_format_needs_narrow_float_fixup( format ))
+                entry->format = format;
+            else
+            {
+                entry->handle = tombstone;
+                entry->format = 0;
+            }
+            return;
+        }
+        if (entry->handle) continue;
+        if (!switchyard_d3d12_format_needs_narrow_float_fixup( format ))
+            return;
+        if (!available) available = entry;
+        break;
+    }
+
+    if (!switchyard_d3d12_format_needs_narrow_float_fixup( format ))
+        return;
+    if (!available) available = &switchyard_d3d12_descriptor_formats[start];
+    available->handle = handle;
+    available->format = format;
+}
+
+static ULONG switchyard_d3d12_get_descriptor_format_locked( ULONG_PTR handle )
+{
+    const struct switchyard_d3d12_descriptor_format *entry;
+    const ULONG_PTR tombstone = ~(ULONG_PTR)0;
+    unsigned int start, i;
+
+    if (!handle || handle == tombstone) return 0;
+
+    start = switchyard_d3d12_descriptor_format_hash( handle );
+    for (i = 0; i < SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS; ++i)
+    {
+        entry = &switchyard_d3d12_descriptor_formats[
+            (start + i) & (SWITCHYARD_D3D12_DESCRIPTOR_FORMAT_SLOTS - 1)];
+        if (!entry->handle) break;
+        if (entry->handle == tombstone) continue;
+        if (entry->handle == handle) return entry->format;
+    }
+    return 0;
+}
+
+static unsigned int switchyard_d3d12_resource_format_hash( const void *resource )
+{
+    ULONG_PTR hash = (ULONG_PTR)resource >> 4;
+
+    hash ^= hash >> 16;
+    hash ^= hash >> 32;
+    return hash & (SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS - 1);
+}
+
+static void switchyard_d3d12_store_resource_format_locked( void *resource,
+                                                            ULONG format )
+{
+    struct switchyard_d3d12_resource_format *entry, *available = NULL;
+    void *const tombstone = (void *)~(ULONG_PTR)0;
+    unsigned int start, i;
+
+    if (!resource || resource == tombstone) return;
+
+    start = switchyard_d3d12_resource_format_hash( resource );
+    for (i = 0; i < SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS; ++i)
+    {
+        entry = &switchyard_d3d12_resource_formats[
+            (start + i) & (SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS - 1)];
+        if (entry->resource == tombstone)
+        {
+            if (!available) available = entry;
+            continue;
+        }
+        if (entry->resource == resource)
+        {
+            if (format)
+                entry->format = format;
+            else
+            {
+                entry->resource = tombstone;
+                entry->format = 0;
+            }
+            return;
+        }
+        if (entry->resource) continue;
+        if (!format) return;
+        if (!available) available = entry;
+        break;
+    }
+
+    if (!format) return;
+    if (!available) available = &switchyard_d3d12_resource_formats[start];
+    available->resource = resource;
+    available->format = format;
+}
+
+static ULONG switchyard_d3d12_get_resource_format_locked( const void *resource )
+{
+    const struct switchyard_d3d12_resource_format *entry;
+    void *const tombstone = (void *)~(ULONG_PTR)0;
+    unsigned int start, i;
+
+    if (!resource || resource == tombstone) return 0;
+
+    start = switchyard_d3d12_resource_format_hash( resource );
+    for (i = 0; i < SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS; ++i)
+    {
+        entry = &switchyard_d3d12_resource_formats[
+            (start + i) & (SWITCHYARD_D3D12_RESOURCE_FORMAT_SLOTS - 1)];
+        if (!entry->resource) break;
+        if (entry->resource == tombstone) continue;
+        if (entry->resource == resource) return entry->format;
+    }
+    return 0;
+}
+
+static void *switchyard_get_wrapped_com_vtable_entry( void *object,
+                                                       unsigned int index )
+{
+    void **vtable;
+    void *ret = NULL;
+
+    if (!object) return NULL;
+
+    __TRY
+    {
+        vtable = *(void ***)object;
+        if (!vtable) return NULL;
+        if (is_native_callback_thunk( vtable[index] ))
+            ret = vtable[index];
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+    return ret;
+}
+
+static ULONG switchyard_d3d12_get_resource_format( void *resource )
+{
+    ULONG format;
+
+    RtlEnterCriticalSection( &loader_section );
+    format = switchyard_d3d12_get_resource_format_locked( resource );
+    RtlLeaveCriticalSection( &loader_section );
+    return format;
+}
+
+static ULONG switchyard_d3d12_get_descriptor_increment( void *device,
+                                                         ULONG heap_type )
+{
+    typedef ULONG (WINAPI *get_increment_func)(void *device, ULONG heap_type);
+    get_increment_func get_increment;
+    ULONG increment = 0;
+
+    if (!(get_increment = switchyard_get_wrapped_com_vtable_entry( device, 15 )))
+        return 0;
+
+    __TRY
+    {
+        increment = get_increment( device, heap_type );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+    return increment;
+}
+
+static BOOL switchyard_float_is_finite( float value )
+{
+    union
+    {
+        float f;
+        ULONG u;
+    } bits = { value };
+
+    return (bits.u & 0x7f800000) != 0x7f800000;
+}
+
+static BOOL switchyard_float_is_nan( float value )
+{
+    union
+    {
+        float f;
+        ULONG u;
+    } bits = { value };
+
+    return (bits.u & 0x7fffffff) > 0x7f800000;
+}
+
+static float switchyard_clamp_float_to_narrow( float value, float max_finite,
+                                                BOOL unsigned_float,
+                                                BOOL flush_nan_inf )
+{
+    if (unsigned_float && value < 0.0f)
+        return 0.0f;
+    if (switchyard_float_is_nan( value ))
+        return flush_nan_inf ? 0.0f : value;
+    if (!switchyard_float_is_finite( value ))
+        return flush_nan_inf ? max_finite : value;
+    if (value > max_finite)
+        return max_finite;
+    if (!unsigned_float && value < -max_finite)
+        return -max_finite;
+    return value;
+}
+
+static BOOL switchyard_d3d12_clamp_clear_color( ULONG format, const float *values,
+                                                 float color[4] )
+{
+    float input[4];
+    unsigned int i;
+
+    if (!values) return FALSE;
+    __TRY
+    {
+        memcpy( input, values, sizeof(input) );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        return FALSE;
+    }
+    __ENDTRY
+
+    switch (format)
+    {
+    case SWITCHYARD_DXGI_FORMAT_R16_FLOAT:
+    case SWITCHYARD_DXGI_FORMAT_R16G16_FLOAT:
+    case SWITCHYARD_DXGI_FORMAT_R16G16B16A16_FLOAT:
+        for (i = 0; i < ARRAY_SIZE(input); ++i)
+            color[i] = switchyard_clamp_float_to_narrow(
+                input[i], 65504.0f, FALSE, FALSE );
+        return TRUE;
+
+    case SWITCHYARD_DXGI_FORMAT_R11G11B10_FLOAT:
+        color[0] = switchyard_clamp_float_to_narrow(
+            input[0], 65024.0f, TRUE, FALSE );
+        color[1] = switchyard_clamp_float_to_narrow(
+            input[1], 65024.0f, TRUE, FALSE );
+        color[2] = switchyard_clamp_float_to_narrow(
+            input[2], 64512.0f, TRUE, FALSE );
+        color[3] = 0.0f;
+        return TRUE;
+
+    case SWITCHYARD_DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+        for (i = 0; i < 3; ++i)
+            color[i] = switchyard_clamp_float_to_narrow(
+                input[i], 65408.0f, TRUE, TRUE );
+        color[3] = 0.0f;
+        return TRUE;
+
+    default:
+        return FALSE;
+    }
+}
+
+static unsigned int switchyard_d3d12_narrow_float_action(
+    const struct switchyard_native_callback_params *params )
+{
+    return (params->flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) >>
+           SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT;
+}
+
+static BOOL switchyard_prepare_d3d12_narrow_float_clear(
+    const struct switchyard_native_callback_params *params,
+    struct switchyard_native_callback_params *fixed_params, float color[4] )
+{
+    unsigned int action, values_arg;
+    ULONG_PTR handle;
+    ULONG format;
+
+    action = switchyard_d3d12_narrow_float_action( params );
+    if (action == SWITCHYARD_D3D12_NARROW_FLOAT_CLEAR_RTV)
+    {
+        handle = params->args[1];
+        values_arg = 2;
+    }
+    else if (action == SWITCHYARD_D3D12_NARROW_FLOAT_CLEAR_UAV)
+    {
+        handle = params->args[2];
+        values_arg = 4;
+    }
+    else
+    {
+        return FALSE;
+    }
+
+    RtlEnterCriticalSection( &loader_section );
+    format = switchyard_d3d12_get_descriptor_format_locked( handle );
+    RtlLeaveCriticalSection( &loader_section );
+    if (!switchyard_d3d12_clamp_clear_color(
+            format, (const float *)params->args[values_arg], color ))
+        return FALSE;
+
+    *fixed_params = *params;
+    fixed_params->args[values_arg] = (ULONG_PTR)color;
+    return TRUE;
+}
+
+static void switchyard_d3d12_apply_descriptor_copies(
+    struct switchyard_d3d12_descriptor_copy *copies, SIZE_T count )
+{
+    SIZE_T i;
+
+    RtlEnterCriticalSection( &loader_section );
+    for (i = 0; i < count; ++i)
+        copies[i].format =
+            switchyard_d3d12_get_descriptor_format_locked( copies[i].src );
+    for (i = 0; i < count; ++i)
+        switchyard_d3d12_store_descriptor_format_locked(
+            copies[i].dst, copies[i].format );
+    RtlLeaveCriticalSection( &loader_section );
+}
+
+static void switchyard_d3d12_copy_descriptor_formats_simple(
+    ULONG_PTR dst, ULONG_PTR src, ULONG count, ULONG increment )
+{
+    struct switchyard_d3d12_descriptor_copy *copies;
+    SIZE_T size, i;
+
+    if (!count || !increment) return;
+    size = count * sizeof(*copies);
+    if (size / sizeof(*copies) != count) return;
+    if (!(copies = RtlAllocateHeap( GetProcessHeap(), 0, size )))
+        return;
+
+    for (i = 0; i < count; ++i)
+    {
+        copies[i].dst = dst + i * increment;
+        copies[i].src = src + i * increment;
+    }
+    switchyard_d3d12_apply_descriptor_copies( copies, count );
+    RtlFreeHeap( GetProcessHeap(), 0, copies );
+}
+
+static BOOL switchyard_d3d12_get_descriptor_range_count(
+    ULONG range_count, const ULONG *range_sizes, SIZE_T *descriptor_count )
+{
+    SIZE_T total = 0;
+    ULONG size, i;
+    BOOL valid = TRUE;
+
+    __TRY
+    {
+        for (i = 0; i < range_count; ++i)
+        {
+            size = range_sizes ? range_sizes[i] : 1;
+            if (size > ~(SIZE_T)0 - total)
+            {
+                valid = FALSE;
+                break;
+            }
+            total += size;
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        valid = FALSE;
+    }
+    __ENDTRY
+
+    if (valid) *descriptor_count = total;
+    return valid;
+}
+
+static void switchyard_d3d12_copy_descriptor_formats(
+    ULONG dst_range_count, const ULONG_PTR *dst_starts, const ULONG *dst_sizes,
+    ULONG src_range_count, const ULONG_PTR *src_starts, const ULONG *src_sizes,
+    ULONG increment )
+{
+    struct switchyard_d3d12_descriptor_copy *copies;
+    SIZE_T dst_count, src_count, size, i;
+    ULONG dst_range = 0, src_range = 0;
+    ULONG dst_offset = 0, src_offset = 0;
+    ULONG dst_size = 0, src_size = 0;
+    BOOL valid = TRUE;
+
+    if (!increment ||
+        !switchyard_d3d12_get_descriptor_range_count(
+            dst_range_count, dst_sizes, &dst_count ) ||
+        !switchyard_d3d12_get_descriptor_range_count(
+            src_range_count, src_sizes, &src_count ) ||
+        dst_count != src_count || !dst_count ||
+        dst_count > ~(SIZE_T)0 / sizeof(*copies))
+        return;
+
+    size = dst_count * sizeof(*copies);
+    if (!(copies = RtlAllocateHeap( GetProcessHeap(), 0, size )))
+        return;
+
+    __TRY
+    {
+        for (i = 0; i < dst_count; ++i)
+        {
+            while (dst_range < dst_range_count)
+            {
+                dst_size = dst_sizes ? dst_sizes[dst_range] : 1;
+                if (dst_offset < dst_size) break;
+                ++dst_range;
+                dst_offset = 0;
+            }
+            while (src_range < src_range_count)
+            {
+                src_size = src_sizes ? src_sizes[src_range] : 1;
+                if (src_offset < src_size) break;
+                ++src_range;
+                src_offset = 0;
+            }
+            if (dst_range == dst_range_count || src_range == src_range_count)
+            {
+                valid = FALSE;
+                break;
+            }
+
+            copies[i].dst = dst_starts[dst_range] + dst_offset * increment;
+            copies[i].src = src_starts[src_range] + src_offset * increment;
+            ++dst_offset;
+            ++src_offset;
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        valid = FALSE;
+    }
+    __ENDTRY
+
+    if (valid)
+        switchyard_d3d12_apply_descriptor_copies( copies, dst_count );
+    RtlFreeHeap( GetProcessHeap(), 0, copies );
+}
+
+static void switchyard_postprocess_d3d12_narrow_float(
+    const struct switchyard_native_callback_params *params, TEB *teb )
+{
+    const void *view_desc;
+    unsigned int action;
+    ULONG_PTR handle;
+    ULONG format = 0;
+    ULONG descriptor_increment;
+    ULONG heap_type;
+    BOOL valid = TRUE;
+
+    action = switchyard_d3d12_narrow_float_action( params );
+    if (action == SWITCHYARD_D3D12_NARROW_FLOAT_CREATE_UAV)
+    {
+        view_desc = (const void *)params->args[3];
+        handle = params->args[4];
+    }
+    else if (action == SWITCHYARD_D3D12_NARROW_FLOAT_CREATE_RTV)
+    {
+        view_desc = (const void *)params->args[2];
+        handle = params->args[3];
+    }
+    else if (action == SWITCHYARD_D3D12_NARROW_FLOAT_COPY_DESCRIPTORS)
+    {
+        heap_type = params->args[7];
+        if (heap_type != 0 && heap_type != 2) return;
+        descriptor_increment = switchyard_d3d12_get_descriptor_increment(
+            (void *)params->args[0], heap_type );
+        switchyard_set_macos_tsd_base( teb );
+        switchyard_d3d12_copy_descriptor_formats(
+            params->args[1], (const ULONG_PTR *)params->args[2],
+            (const ULONG *)params->args[3],
+            params->args[4], (const ULONG_PTR *)params->args[5],
+            (const ULONG *)params->args[6],
+            descriptor_increment );
+        return;
+    }
+    else if (action == SWITCHYARD_D3D12_NARROW_FLOAT_COPY_DESCRIPTORS_SIMPLE)
+    {
+        heap_type = params->args[4];
+        if (heap_type != 0 && heap_type != 2) return;
+        descriptor_increment = switchyard_d3d12_get_descriptor_increment(
+            (void *)params->args[0], heap_type );
+        switchyard_set_macos_tsd_base( teb );
+        switchyard_d3d12_copy_descriptor_formats_simple(
+            params->args[2], params->args[3], params->args[1],
+            descriptor_increment );
+        return;
+    }
+    else
+    {
+        return;
+    }
+
+    if (view_desc)
+    {
+        __TRY
+        {
+            format = *(const ULONG *)view_desc;
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+            valid = FALSE;
+        }
+        __ENDTRY
+    }
+    else
+    {
+        format = switchyard_d3d12_get_resource_format(
+            (void *)params->args[1] );
+    }
+
+    if (!valid || !handle) return;
+    RtlEnterCriticalSection( &loader_section );
+    switchyard_d3d12_store_descriptor_format_locked( handle, format );
+    RtlLeaveCriticalSection( &loader_section );
+}
+
+static void switchyard_postprocess_d3d12_resource_format(
+    const struct switchyard_native_callback_params *params, ULONG_PTR ret )
+{
+    const struct switchyard_d3d12_resource_desc *desc;
+    unsigned int output_arg, desc_arg;
+    void *resource = NULL;
+    ULONG format = 0;
+    BOOL valid = TRUE;
+
+    if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE)
+    {
+        if (ret) return;
+        RtlEnterCriticalSection( &loader_section );
+        switchyard_d3d12_store_resource_format_locked(
+            (void *)params->args[0], 0 );
+        RtlLeaveCriticalSection( &loader_section );
+        return;
+    }
+
+    if ((LONG)ret < 0) return;
+    output_arg = (params->flags & SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK) >>
+                 SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT;
+    if (!output_arg || output_arg >= params->argc || !params->args[output_arg])
+        return;
+
+    __TRY
+    {
+        resource = *(void **)params->args[output_arg];
+        if (params->flags &
+            SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE)
+        {
+            desc_arg = params->flags &
+                       SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_DESC_ARG1
+                       ? 1 : output_arg <= 6 ? 1 : 3;
+            desc = (const struct switchyard_d3d12_resource_desc *)
+                   params->args[desc_arg];
+            if (!desc)
+                valid = FALSE;
+            else
+                format = desc->format;
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        valid = FALSE;
+    }
+    __ENDTRY
+    if (!valid || !resource) return;
+
+    RtlEnterCriticalSection( &loader_section );
+    if ((params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY) &&
+        !(params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE))
+        format = switchyard_d3d12_get_resource_format_locked(
+            (void *)params->args[0] );
+    switchyard_d3d12_store_resource_format_locked( resource, format );
+    RtlLeaveCriticalSection( &loader_section );
+}
+
 struct switchyard_com_vtable_scope
 {
     void *object;
@@ -6357,6 +7082,14 @@ static ULONG switchyard_d3d12_graphics_command_list_vtable_entry_flags( unsigned
 {
     ULONG flags = switchyard_d3d12_device_child_vtable_entry_flags( index );
 
+    if (index == 48)
+        flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP |
+                 SWITCHYARD_D3D12_NARROW_FLOAT_ACTION(
+                     SWITCHYARD_D3D12_NARROW_FLOAT_CLEAR_RTV );
+    if (index == 50)
+        flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP |
+                 SWITCHYARD_D3D12_NARROW_FLOAT_ACTION(
+                     SWITCHYARD_D3D12_NARROW_FLOAT_CLEAR_UAV );
     if (index == 53) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_END_QUERY;
     if (index == 54) flags |= SWITCHYARD_NATIVE_CALLBACK_D3D12_TIMESTAMP_RESOLVE_QUERY;
     return flags;
@@ -6636,7 +7369,7 @@ static void switchyard_wrap_dxgi_swapchain_output_vtable(
     __ENDTRY
 }
 
-static ULONG_PTR switchyard_call_native_callback_args(
+static ULONG_PTR switchyard_call_native_callback_args_raw(
     const struct switchyard_native_callback_params *params )
 {
     typedef void (WINAPI *d3d11_clear_depth_stencil_view_func)(
@@ -6973,10 +7706,17 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
         SWITCHYARD_NATIVE_CALLBACK_E_FAIL,
         &scope
     };
+    struct switchyard_native_callback_params fixed_params;
+    const struct switchyard_native_callback_params *call_params = params;
     struct switchyard_com_vtable_scope input_vtable_scope;
+    float clear_color[4];
     ULONG_PTR ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
 
     memset( &input_vtable_scope, 0, sizeof(input_vtable_scope) );
+    if ((params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP) &&
+        switchyard_prepare_d3d12_narrow_float_clear(
+            params, &fixed_params, clear_color ))
+        call_params = &fixed_params;
     ++*native_callback_depth;
     __TRY
     {
@@ -6989,9 +7729,17 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
             if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE)
                 switchyard_upload_all_d3d_shared_textures( params );
             switchyard_set_macos_tsd_base( pthread_teb );
-            ret = switchyard_call_native_callback_args( params );
+            ret = switchyard_call_native_callback_args_raw( call_params );
             switchyard_leave_native_callback( TRUE, &scope );
             switchyard_restore_com_vtable( TRUE, &input_vtable_scope );
+            if (params->flags &
+                (SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE |
+                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY |
+                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE))
+                switchyard_postprocess_d3d12_resource_format( params, ret );
+            if (params->flags &
+                SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP)
+                switchyard_postprocess_d3d12_narrow_float( params, teb );
             switchyard_postprocess_d3d12_timestamp( params, ret );
             if (params->flags & SWITCHYARD_NATIVE_CALLBACK_DXGI_RESOURCE_GET_SHARED_HANDLE)
                 ret = switchyard_get_d3d_shared_handle( params, ret );
@@ -7132,10 +7880,13 @@ static ULONG_PTR WINAPI pe_callback_bridge( struct switchyard_pe_callback_params
 
 static ULONG_PTR WINAPI native_callback_bridge_args( struct switchyard_native_callback_params *params )
 {
+    struct switchyard_native_callback_params fixed_params;
+    const struct switchyard_native_callback_params *call_params = params;
     struct switchyard_native_callback_scope scope;
     TEB *teb;
     void *pthread_teb;
     DWORD *native_callback_depth;
+    float clear_color[4];
     BOOL recovered = FALSE;
     ULONG_PTR ret = SWITCHYARD_NATIVE_CALLBACK_E_FAIL;
 
@@ -7147,7 +7898,7 @@ static ULONG_PTR WINAPI native_callback_bridge_args( struct switchyard_native_ca
     {
         if (!switchyard_recover_native_callback_context( &teb, &pthread_teb,
                                                          &native_callback_depth ))
-            return switchyard_call_native_callback_args( params );
+            return switchyard_call_native_callback_args_raw( params );
         recovered = TRUE;
     }
 
@@ -7161,8 +7912,23 @@ static ULONG_PTR WINAPI native_callback_bridge_args( struct switchyard_native_ca
         ++*native_callback_depth;
         __TRY
         {
+            switchyard_set_macos_tsd_base( teb );
+            if ((params->flags &
+                 SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP) &&
+                switchyard_prepare_d3d12_narrow_float_clear(
+                    params, &fixed_params, clear_color ))
+                call_params = &fixed_params;
             switchyard_set_macos_tsd_base( pthread_teb );
-            ret = switchyard_call_native_callback_args( params );
+            ret = switchyard_call_native_callback_args_raw( call_params );
+            switchyard_set_macos_tsd_base( teb );
+            if (params->flags &
+                (SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_CREATE |
+                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_COPY |
+                 SWITCHYARD_NATIVE_CALLBACK_D3D12_RESOURCE_FORMAT_RELEASE))
+                switchyard_postprocess_d3d12_resource_format( params, ret );
+            if (params->flags &
+                SWITCHYARD_NATIVE_CALLBACK_D3D12_NARROW_FLOAT_FIXUP)
+                switchyard_postprocess_d3d12_narrow_float( params, teb );
         }
         __FINALLY_CTX( switchyard_leave_recovered_native_callback, &scope )
         return ret;
