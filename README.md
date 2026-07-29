@@ -4,58 +4,47 @@
 
 # Switchyard Wine
 
-Switchyard Wine is the public downstream Wine source used by the Switchyard macOS compatibility manager for Windows games and their launchers on Apple Silicon.
+Public downstream Wine runtime for the
+[Switchyard](https://github.com/jungwuk-ryu/Switchyard) macOS app.
 
-This repository keeps each Switchyard compatibility change as a reviewable commit on top of a pinned WineHQ revision. It also contains the local runtime builder and the provenance required to reproduce a matching runtime.
+## Preview
 
-Switchyard Wine is an independent downstream project. It is not affiliated with or endorsed by WineHQ, Apple, Valve, Epic Games, GOG, Blizzard Entertainment, Google, or Microsoft.
+<p align="center">
+  <img src="docs/assets/switchyard-container-library.png" alt="Switchyard container library showing Windows games and launchers on macOS" width="100%">
+</p>
 
-## Why Switchyard Wine
+## Running on macOS
 
-Switchyard Wine grew out of the repeated friction of running Windows games on macOS. Installing Wine was rarely the end of the setup: users might need launcher-specific workarounds such as `--disable-gpu`, while storefronts such as Steam or Battle.net could fail before the game itself started. Earlier experience with Wine on Linux exposed the same pattern in another form, with users expected to find a suitable Wine version for each game and install fonts or other runtime pieces by hand.
+<p align="center">
+  <img src="docs/assets/switchyard-session-workspace.png" alt="Grand Theft Auto V Enhanced and Rockstar Games Launcher running in Switchyard" width="100%">
+</p>
 
-Switchyard moves that recurring compatibility work out of each user's setup and into a maintained Wine runtime. When practical, the project fixes Wine or the integrated runtime instead of asking every user to reproduce the same per-application workaround. The goal is for a user to install the current Switchyard runtime, select a Windows executable, and run it with as little manual configuration as possible.
+<p align="center">
+  <sub>Grand Theft Auto V Enhanced and Rockstar Games Launcher in one managed Wine session.</sub>
+</p>
 
-## Compatibility over version numbers
+## Runtime
 
-Switchyard Wine is not a rolling mirror of the latest WineHQ release. A newer upstream revision is adopted only when it can preserve the launcher and game workflows that already work in Switchyard. Individual upstream fixes may be cherry-picked or adapted, and Switchyard-specific fixes may remain downstream. Maintaining a downstream branch also lets Switchyard iterate on integrated fixes without requiring every change to be generalized or prepared for upstream review first. Advancing the upstream base is a compatibility decision, not a release-calendar obligation.
-
-## Important boundaries
-
-- Wine and Switchyard's Wine modifications are LGPL-2.1-or-later source.
+- Compatibility patches stay reviewable on top of a pinned WineHQ revision.
+- Signed and notarized Wine-only archives are available from
+  [GitHub Releases](https://github.com/jungwuk-ryu/switchyard-wine/releases).
+- Verified application results and exact runtime revisions are recorded in
+  [`docs/compatibility.md`](docs/compatibility.md).
 - Apple Game Porting Toolkit is user-provided software and is not included here.
-- No launcher binaries, game assets, credentials, runtime caches, or locally built runtimes belong in this repository.
-- The Switchyard macOS app does not link against Wine; it launches this runtime through an external runner.
 
-## Repository layout
+## Build
 
-- `switchyard/`: source verification and reproducible local runtime build tooling
-- `docs/architecture.md`: application, runtime, and user-provided software boundaries
-- `docs/building.md`: supported local build workflow
-- `docs/compatibility.md`: reported application compatibility, runtime identity, and
-  reference environment
-- `docs/provenance.md`: upstream base, commit history, and licensing provenance
-- `docs/troubleshooting-unity-games.md`: a reusable crash-triage case study for
-  Unity, D3DMetal, DbgHelp, and long managed-runtime paths
-
-Start with:
-
-```sh
+```shell
 ./switchyard/verify_source.sh
 ./switchyard/build_runtime.sh
 ```
 
-See `CONTRIBUTING.md` before proposing changes. Developer ID signed and
-notarized Wine-only runtime archives are published on the
-[GitHub Releases](https://github.com/jungwuk-ryu/switchyard-wine/releases)
-page. Each archive is tied to an exact source revision and includes a release
-manifest, SHA-256 checksum, dependency notices, and corresponding-source
-instructions. The Switchyard app installs only the release matching its bundled
-compatibility revision.
+See [`docs/building.md`](docs/building.md) and
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-Game Porting Toolkit is never part of those archives. Users obtain it directly
-from Apple and may let Switchyard import their local copy after accepting
-Apple's terms.
+Wine and Switchyard Wine changes are licensed under LGPL-2.1-or-later.
+Switchyard Wine is independent and is not endorsed by WineHQ, Apple, or the
+products shown above.
 
 ## Upstream Wine documentation
 
