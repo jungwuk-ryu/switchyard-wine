@@ -1,0 +1,5 @@
+@ cdecl cef_api_hash(long)
+@ cdecl cef_browser_host_create_browser_sync(ptr ptr ptr ptr ptr ptr)
+@ cdecl cef_initialize(ptr ptr ptr ptr)
+@ cdecl cef_test_get_last_call(ptr long ptr)
+@ cdecl cef_test_set_hash(long)

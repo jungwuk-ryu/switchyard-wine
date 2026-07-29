@@ -1088,6 +1088,247 @@ static int find_name_in_exports( HMODULE module, const IMAGE_EXPORT_DIRECTORY *e
     return -1;
 }
 
+#ifdef _WIN64
+struct switchyard_cef_string
+{
+    WCHAR *str;
+    SIZE_T length;
+    void (*dtor)(WCHAR *);
+};
+
+struct switchyard_cef_window_info
+{
+    DWORD ex_style;
+    struct switchyard_cef_string window_name;
+    DWORD style;
+    int x;
+    int y;
+    int width;
+    int height;
+    HANDLE parent_window;
+    HANDLE menu;
+    int windowless_rendering_enabled;
+    int shared_texture_enabled;
+    int external_begin_frame_enabled;
+    HANDLE window;
+};
+
+struct switchyard_cef_base_ref_counted
+{
+    SIZE_T size;
+    void (WINAPI *add_ref)(struct switchyard_cef_base_ref_counted *);
+    int (WINAPI *release)(struct switchyard_cef_base_ref_counted *);
+    int (WINAPI *has_one_ref)(struct switchyard_cef_base_ref_counted *);
+    int (WINAPI *has_at_least_one_ref)(struct switchyard_cef_base_ref_counted *);
+};
+
+struct switchyard_cef_render_handler
+{
+    struct switchyard_cef_base_ref_counted base;
+    void *get_accessibility_handler;
+    void *get_root_screen_rect;
+    void *get_view_rect;
+    void *get_screen_point;
+    void *get_screen_info;
+    void *on_popup_show;
+    void *on_popup_size;
+    void *on_paint;
+};
+
+struct switchyard_cef_client
+{
+    struct switchyard_cef_base_ref_counted base;
+    void *handlers_before_render[13];
+    struct switchyard_cef_render_handler *(WINAPI *get_render_handler)(
+        struct switchyard_cef_client *);
+};
+
+typedef void *(__cdecl *switchyard_cef_create_browser_sync_func)(
+    const struct switchyard_cef_window_info *, struct switchyard_cef_client *,
+    const void *, const void *, void *, void *);
+typedef const char *(__cdecl *switchyard_cef_api_hash_func)(int);
+
+static switchyard_cef_create_browser_sync_func switchyard_cef_create_browser_sync;
+static switchyard_cef_api_hash_func switchyard_cef_api_hash;
+static HMODULE switchyard_cef_module;
+
+C_ASSERT( FIELD_OFFSET( struct switchyard_cef_window_info, parent_window ) == 56 );
+C_ASSERT( FIELD_OFFSET( struct switchyard_cef_window_info, windowless_rendering_enabled ) == 72 );
+C_ASSERT( FIELD_OFFSET( struct switchyard_cef_window_info, window ) == 88 );
+C_ASSERT( sizeof(struct switchyard_cef_window_info) == 96 );
+C_ASSERT( sizeof(struct switchyard_cef_base_ref_counted) == 40 );
+C_ASSERT( FIELD_OFFSET( struct switchyard_cef_client, get_render_handler ) == 144 );
+C_ASSERT( sizeof(struct switchyard_cef_client) == 152 );
+C_ASSERT( FIELD_OFFSET( struct switchyard_cef_render_handler, get_view_rect ) == 56 );
+C_ASSERT( FIELD_OFFSET( struct switchyard_cef_render_handler, on_paint ) == 96 );
+C_ASSERT( sizeof(struct switchyard_cef_render_handler) == 104 );
+
+static BOOL switchyard_cef_osr_fallback_enabled(void)
+{
+    UNICODE_STRING name =
+        RTL_CONSTANT_STRING( L"SWITCHYARD_DISABLE_CEF_OSR_FALLBACK" );
+    WCHAR buffer[2];
+    UNICODE_STRING value = { 0, sizeof(buffer), buffer };
+
+    return RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ==
+           STATUS_VARIABLE_NOT_FOUND;
+}
+
+static BOOL switchyard_is_supported_cef_abi(
+    switchyard_cef_api_hash_func api_hash )
+{
+    static const char platform_api_hash[] =
+        "4150bd26e7bf639a9b1f3e5860af8c76eeae8570";
+    static const char universal_api_hash[] =
+        "d026196d35d8894a836ab3a3d033b84195cdb835";
+    const char *platform_hash, *universal_hash;
+
+    if (!api_hash || !(platform_hash = api_hash( 0 )) ||
+        !(universal_hash = api_hash( 1 )))
+        return FALSE;
+    return !strcmp( platform_hash, platform_api_hash ) &&
+           !strcmp( universal_hash, universal_api_hash );
+}
+
+static BOOL switchyard_cef_client_supports_windowless_rendering(
+    struct switchyard_cef_client *client )
+{
+    struct switchyard_cef_render_handler *handler;
+    BOOL supported = FALSE;
+
+    if (!client || client->base.size < sizeof(*client) ||
+        !client->get_render_handler)
+        return FALSE;
+    if (!(handler = client->get_render_handler( client ))) return FALSE;
+
+    if (handler->base.size >= sizeof(*handler) && handler->base.release &&
+        handler->get_view_rect && handler->on_paint)
+        supported = TRUE;
+    if (handler->base.release) handler->base.release( &handler->base );
+    return supported;
+}
+
+static BOOL switchyard_prepare_cef_windowless_info(
+    const struct switchyard_cef_window_info *window_info,
+    struct switchyard_cef_client *client,
+    struct switchyard_cef_window_info *windowless_info )
+{
+    if (!switchyard_cef_osr_fallback_enabled() ||
+        !switchyard_is_supported_cef_abi( switchyard_cef_api_hash ) ||
+        !window_info || !window_info->parent_window ||
+        !(window_info->style & 0x40000000) || /* WS_CHILD */
+        window_info->width <= 1 || window_info->height <= 1 ||
+        window_info->windowless_rendering_enabled ||
+        window_info->shared_texture_enabled ||
+        window_info->external_begin_frame_enabled ||
+        window_info->window ||
+        !switchyard_cef_client_supports_windowless_rendering( client ))
+        return FALSE;
+
+    *windowless_info = *window_info;
+    /*
+     * A forced OSR browser must not report its former native child parent as
+     * the browser window. Hosts that support both modes commonly use that
+     * handle to choose between native input and their OSR input path.
+     */
+    windowless_info->parent_window = NULL;
+    windowless_info->windowless_rendering_enabled = 1;
+    return TRUE;
+}
+
+static void *__cdecl switchyard_cef_create_browser_sync_wrapper(
+    const struct switchyard_cef_window_info *window_info,
+    struct switchyard_cef_client *client, const void *url,
+    const void *settings, void *extra_info, void *request_context )
+{
+    struct switchyard_cef_window_info windowless_info;
+
+    if (!switchyard_prepare_cef_windowless_info(
+            window_info, client, &windowless_info ))
+        return switchyard_cef_create_browser_sync(
+            window_info, client, url, settings, extra_info, request_context );
+
+    WARN( "using CEF windowless rendering for a compatible native child browser.\n" );
+    return switchyard_cef_create_browser_sync(
+        &windowless_info, client, url, settings, extra_info, request_context );
+}
+
+static FARPROC switchyard_get_raw_export( HMODULE module,
+                                          const IMAGE_EXPORT_DIRECTORY *exports,
+                                          DWORD exp_size, const char *name )
+{
+    const DWORD *functions = get_rva( module, exports->AddressOfFunctions );
+    int ordinal;
+    FARPROC proc;
+
+    if ((ordinal = find_name_in_exports( module, exports, name )) == -1 ||
+        ordinal >= exports->NumberOfFunctions || !functions[ordinal])
+        return NULL;
+
+    proc = get_rva( module, functions[ordinal] );
+    if ((const char *)proc >= (const char *)exports &&
+        (const char *)proc < (const char *)exports + exp_size)
+        return NULL;
+    return proc;
+}
+
+static BOOL switchyard_prepare_cef_module(
+    HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports, DWORD exp_size )
+{
+    static const UNICODE_STRING libcef = RTL_CONSTANT_STRING( L"libcef.dll" );
+    switchyard_cef_api_hash_func api_hash;
+    WINE_MODREF *wm;
+
+    if (switchyard_cef_module) return switchyard_cef_module == module;
+    if (!(wm = get_modref( module )) ||
+        !RtlEqualUnicodeString( &wm->ldr.BaseDllName, &libcef, TRUE ))
+        return FALSE;
+    api_hash = (switchyard_cef_api_hash_func)switchyard_get_raw_export(
+        module, exports, exp_size, "cef_api_hash" );
+    /*
+     * cef_window_info_t has no size member.  Install no wrapper at all unless
+     * both API hashes identify the exact layout used below, leaving every
+     * other CEF ABI with its original export addresses and behavior.
+     */
+    if (!switchyard_is_supported_cef_abi( api_hash ))
+        return FALSE;
+    switchyard_cef_api_hash = api_hash;
+    switchyard_cef_module = module;
+    return TRUE;
+}
+
+static FARPROC switchyard_wrap_cef_export( HMODULE module,
+                                           const IMAGE_EXPORT_DIRECTORY *exports,
+                                           DWORD exp_size, const char *name,
+                                           FARPROC proc )
+{
+    if (!proc ||
+        strcmp( name, "cef_browser_host_create_browser_sync" ) ||
+        !switchyard_prepare_cef_module( module, exports, exp_size ))
+        return proc;
+
+    if (switchyard_cef_create_browser_sync &&
+        switchyard_cef_create_browser_sync !=
+            (switchyard_cef_create_browser_sync_func)proc)
+        return proc;
+    switchyard_cef_create_browser_sync =
+        (switchyard_cef_create_browser_sync_func)proc;
+    return (FARPROC)switchyard_cef_create_browser_sync_wrapper;
+}
+#else
+static FARPROC switchyard_wrap_cef_export( HMODULE module,
+                                           const IMAGE_EXPORT_DIRECTORY *exports,
+                                           DWORD exp_size, const char *name,
+                                           FARPROC proc )
+{
+    (void)module;
+    (void)exports;
+    (void)exp_size;
+    (void)name;
+    return proc;
+}
+#endif
+
 
 /*************************************************************************
  *		find_named_export
@@ -1101,6 +1342,7 @@ static FARPROC find_named_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *
 {
     const WORD *ordinals = get_rva( module, exports->AddressOfNameOrdinals );
     const DWORD *names = get_rva( module, exports->AddressOfNames );
+    FARPROC proc;
     int ordinal;
 
     /* first check the hint */
@@ -1108,12 +1350,19 @@ static FARPROC find_named_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *
     {
         char *ename = get_rva( module, names[hint] );
         if (!strcmp( ename, name ))
-            return find_ordinal_export( module, exports, exp_size, ordinals[hint], load_path, importer, is_dynamic );
+        {
+            proc = find_ordinal_export( module, exports, exp_size, ordinals[hint],
+                                        load_path, importer, is_dynamic );
+            return switchyard_wrap_cef_export( module, exports, exp_size, name,
+                                               proc );
+        }
     }
 
     /* then do a binary search */
     if ((ordinal = find_name_in_exports( module, exports, name )) == -1) return NULL;
-    return find_ordinal_export( module, exports, exp_size, ordinal, load_path, importer, is_dynamic );
+    proc = find_ordinal_export( module, exports, exp_size, ordinal, load_path,
+                                importer, is_dynamic );
+    return switchyard_wrap_cef_export( module, exports, exp_size, name, proc );
 
 }
 
@@ -1141,7 +1390,7 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
     if (((const char *)proc >= (const char *)exports) &&
         ((const char *)proc < (const char *)exports + exp_size))
         return NULL;
-    return proc;
+    return switchyard_wrap_cef_export( module, exports, exp_size, name, proc );
 }
 
 

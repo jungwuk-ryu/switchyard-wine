@@ -13,6 +13,9 @@ SOURCES = \
 	generated.c \
 	info.c \
 	large_int.c \
+	libcef.c \
+	libcef.spec \
+	loader.c \
 	om.c \
 	path.c \
 	pipe.c \
