@@ -3494,6 +3494,11 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE 0x40000
 #define SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D12_OUTPUT_VTABLE 0x80000
 #define SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI 0x100000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_SHIFT 21
+#define SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_MASK 0x03e00000
+#define SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE(op) \
+    (((ULONG)(op) << SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_SHIFT) & \
+     SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_MASK)
 #define SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG(index) \
     (((ULONG)(index) << SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_SHIFT) & \
      SWITCHYARD_NATIVE_CALLBACK_OUTPUT_ARG_MASK)
@@ -3504,6 +3509,27 @@ static const BYTE pe_callback_thunk_marker[] = { 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0
 #define SWITCHYARD_PE_CALLBACK_FUNC_OFFSET 0x00
 #define SWITCHYARD_PE_CALLBACK_ARGC_OFFSET 0x08
 #define SWITCHYARD_PE_CALLBACK_ARGS_OFFSET 0x10
+
+enum switchyard_d3d_frame_trace_op
+{
+    SWITCHYARD_D3D_FRAME_TRACE_NONE,
+    SWITCHYARD_D3D_FRAME_TRACE_CREATE_TEXTURE2D,
+    SWITCHYARD_D3D_FRAME_TRACE_MAP,
+    SWITCHYARD_D3D_FRAME_TRACE_UNMAP,
+    SWITCHYARD_D3D_FRAME_TRACE_COPY_RESOURCE,
+    SWITCHYARD_D3D_FRAME_TRACE_COPY_SUBRESOURCE_REGION,
+    SWITCHYARD_D3D_FRAME_TRACE_UPDATE_SUBRESOURCE,
+    SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED,
+    SWITCHYARD_D3D_FRAME_TRACE_DRAW,
+    SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED_INSTANCED,
+    SWITCHYARD_D3D_FRAME_TRACE_DRAW_INSTANCED,
+    SWITCHYARD_D3D_FRAME_TRACE_DRAW_AUTO,
+    SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED_INSTANCED_INDIRECT,
+    SWITCHYARD_D3D_FRAME_TRACE_DRAW_INSTANCED_INDIRECT,
+    SWITCHYARD_D3D_FRAME_TRACE_PRESENT,
+    SWITCHYARD_D3D_FRAME_TRACE_PRESENT1,
+    SWITCHYARD_D3D_FRAME_TRACE_RELEASE
+};
 
 static inline void switchyard_set_macos_tsd_base( void *base )
 {
@@ -3558,6 +3584,9 @@ C_ASSERT( FIELD_OFFSET( struct switchyard_native_callback_params, argc ) == SWIT
 C_ASSERT( FIELD_OFFSET( struct switchyard_native_callback_params, flags ) == SWITCHYARD_NATIVE_CALLBACK_FLAGS_OFFSET );
 C_ASSERT( FIELD_OFFSET( struct switchyard_native_callback_params, args ) == SWITCHYARD_NATIVE_CALLBACK_ARGS_OFFSET );
 C_ASSERT( sizeof(struct switchyard_native_callback_thunk_info) == 32 );
+C_ASSERT( SWITCHYARD_D3D_FRAME_TRACE_RELEASE <=
+          (SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_MASK >>
+           SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_SHIFT) );
 
 static void wrap_native_callback_entry_with_flags( void **slot, unsigned int argc, ULONG flags );
 static BOOL is_native_callback_thunk( const void *ptr );
@@ -3565,7 +3594,12 @@ static BOOL is_native_callback_target( void *func );
 static BOOL switchyard_get_native_callback_thunk_info(
     void *thunk, void **target, unsigned int *argc, ULONG *flags );
 static void *create_native_callback_thunk( void *func, unsigned int argc, ULONG flags );
+static void switchyard_d3d_frame_trace_pre(
+    const struct switchyard_native_callback_params *params );
+static void switchyard_d3d_frame_trace_post(
+    const struct switchyard_native_callback_params *params, ULONG_PTR ret );
 static void **switchyard_gfxt_deferred_vtable;
+static LONG switchyard_d3d_frame_trace_enabled = -1;
 
 struct switchyard_pe_callback_scope
 {
@@ -3914,6 +3948,29 @@ static BOOL switchyard_wstr_equals_ascii( const WCHAR *value, ULONG len, const c
     return i == len && !ascii[i];
 }
 
+static BOOL switchyard_d3d_frame_trace_is_enabled(void)
+{
+    UNICODE_STRING name =
+        RTL_CONSTANT_STRING( L"SWITCHYARD_D3D_FRAME_TRACE" );
+    WCHAR buffer[8];
+    UNICODE_STRING value = { 0, sizeof(buffer), buffer };
+    LONG enabled;
+
+    enabled = InterlockedCompareExchange( &switchyard_d3d_frame_trace_enabled, -1, -1 );
+    if (enabled >= 0) return enabled;
+
+    enabled = !RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+              value.Length == sizeof(WCHAR) && value.Buffer[0] == '1';
+    InterlockedCompareExchange( &switchyard_d3d_frame_trace_enabled, enabled, -1 );
+    return InterlockedCompareExchange( &switchyard_d3d_frame_trace_enabled, -1, -1 );
+}
+
+static ULONG switchyard_d3d_frame_trace_flag( enum switchyard_d3d_frame_trace_op op )
+{
+    return switchyard_d3d_frame_trace_is_enabled() ?
+           SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE( op ) : 0;
+}
+
 static BOOL switchyard_parse_gfxt_deferred_vtable_index( const WCHAR **cursor,
                                                          const WCHAR *end, unsigned int *value )
 {
@@ -4243,7 +4300,11 @@ static ULONG switchyard_dxgi_swapchain_vtable_entry_flags( unsigned int index )
                switchyard_com_iunknown_output_flags( 1 );
 
     default:
-        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI;
+        return SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI |
+               (index == 8 ? switchyard_d3d_frame_trace_flag(
+                                 SWITCHYARD_D3D_FRAME_TRACE_PRESENT ) :
+                index == 22 ? switchyard_d3d_frame_trace_flag(
+                                  SWITCHYARD_D3D_FRAME_TRACE_PRESENT1 ) : 0);
     }
 }
 
@@ -4325,6 +4386,9 @@ static ULONG switchyard_d3d11_device_vtable_entry_flags( unsigned int index )
     flags = switchyard_d3d11_device_child_output_flags( output_arg );
     if (index == 28)
         flags |= SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_OPEN_SHARED_RESOURCE;
+    if (index == 5)
+        flags |= switchyard_d3d_frame_trace_flag(
+            SWITCHYARD_D3D_FRAME_TRACE_CREATE_TEXTURE2D );
     return flags;
 }
 
@@ -4332,15 +4396,47 @@ static ULONG switchyard_d3d11_device_context_vtable_entry_flags( unsigned int in
 {
     switch (index)
     {
+    case 14: /* Map */
+        return switchyard_d3d_frame_trace_flag( SWITCHYARD_D3D_FRAME_TRACE_MAP );
+    case 15: /* Unmap */
+        return switchyard_d3d_frame_trace_flag( SWITCHYARD_D3D_FRAME_TRACE_UNMAP );
+    case 46: /* CopySubresourceRegion */
+        return switchyard_d3d_frame_trace_flag(
+            SWITCHYARD_D3D_FRAME_TRACE_COPY_SUBRESOURCE_REGION );
+    case 47: /* CopyResource */
+        return switchyard_d3d_frame_trace_flag(
+            SWITCHYARD_D3D_FRAME_TRACE_COPY_RESOURCE );
     case 48: /* UpdateSubresource */
-        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_UPDATE_SUBRESOURCE;
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_UPDATE_SUBRESOURCE |
+               switchyard_d3d_frame_trace_flag(
+                   SWITCHYARD_D3D_FRAME_TRACE_UPDATE_SUBRESOURCE );
     case 12: /* DrawIndexed */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE |
+               switchyard_d3d_frame_trace_flag(
+                   SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED );
     case 13: /* Draw */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE |
+               switchyard_d3d_frame_trace_flag( SWITCHYARD_D3D_FRAME_TRACE_DRAW );
     case 20: /* DrawIndexedInstanced */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE |
+               switchyard_d3d_frame_trace_flag(
+                   SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED_INSTANCED );
     case 21: /* DrawInstanced */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE |
+               switchyard_d3d_frame_trace_flag(
+                   SWITCHYARD_D3D_FRAME_TRACE_DRAW_INSTANCED );
     case 38: /* DrawAuto */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE |
+               switchyard_d3d_frame_trace_flag(
+                   SWITCHYARD_D3D_FRAME_TRACE_DRAW_AUTO );
     case 39: /* DrawIndexedInstancedIndirect */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE |
+               switchyard_d3d_frame_trace_flag(
+                   SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED_INSTANCED_INDIRECT );
     case 40: /* DrawInstancedIndirect */
+        return SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE |
+               switchyard_d3d_frame_trace_flag(
+                   SWITCHYARD_D3D_FRAME_TRACE_DRAW_INSTANCED_INDIRECT );
     case 41: /* Dispatch */
     case 42: /* DispatchIndirect */
     case 58: /* ExecuteCommandList */
@@ -4482,6 +4578,7 @@ static void switchyard_wrap_com_iunknown_output_vtable(
     unsigned int dxgi_resource_entries = 0;
     BOOL d3d11_texture2d = FALSE;
     ULONG query_interface_flags = switchyard_com_vtable_entry_flags( 0 );
+    ULONG release_flags = 0;
     void **vtable;
     void *object;
 
@@ -4495,14 +4592,16 @@ static void switchyard_wrap_com_iunknown_output_vtable(
         TRACE( "wrapping COM output %p object %p IUnknown vtable %p\n",
                (void *)params->args[output_arg], object, vtable );
         if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE)
+        {
             query_interface_flags |=
                 SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE;
+            release_flags = SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_CHILD_RELEASE |
+                            switchyard_d3d_frame_trace_flag(
+                                SWITCHYARD_D3D_FRAME_TRACE_RELEASE );
+        }
         switchyard_wrap_native_callback_vtable_slot( &vtable[0], 3, query_interface_flags );
         switchyard_wrap_native_callback_vtable_slot( &vtable[1], 1, 0 );
-        switchyard_wrap_native_callback_vtable_slot(
-            &vtable[2], 1, params->flags &
-                              SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE ?
-                              SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_CHILD_RELEASE : 0 );
+        switchyard_wrap_native_callback_vtable_slot( &vtable[2], 1, release_flags );
         if (params->flags & SWITCHYARD_NATIVE_CALLBACK_WRAP_D3D11_DEVICE_CHILD_OUTPUT_VTABLE)
         {
             unsigned int i;
@@ -4565,6 +4664,10 @@ static void switchyard_wrap_com_iunknown_output_vtable(
 #define SWITCHYARD_D3D11_RESOURCE_MISC_SHARED_NTHANDLE 0x00000800
 #define SWITCHYARD_D3D11_BIND_SHADER_RESOURCE 0x00000008
 #define SWITCHYARD_D3D11_BIND_RENDER_TARGET 0x00000020
+#define SWITCHYARD_D3D11_CPU_ACCESS_WRITE 0x00010000
+#define SWITCHYARD_D3D11_CPU_ACCESS_READ 0x00020000
+#define SWITCHYARD_D3D11_USAGE_STAGING 3
+#define SWITCHYARD_D3D11_MAP_READ_WRITE 3
 #define SWITCHYARD_DXGI_FORMAT_B8G8R8A8_UNORM 87
 #define SWITCHYARD_D3D_SHARED_TOKEN_MASK 0xf0000000u
 #define SWITCHYARD_D3D_SHARED_TOKEN_TAG 0xe0000000u
@@ -4586,6 +4689,762 @@ struct switchyard_d3d11_texture2d_desc
     UINT cpu_access_flags;
     UINT misc_flags;
 };
+
+struct switchyard_d3d11_box
+{
+    UINT left;
+    UINT top;
+    UINT front;
+    UINT right;
+    UINT bottom;
+    UINT back;
+};
+
+struct switchyard_d3d11_mapped_subresource
+{
+    void *data;
+    UINT row_pitch;
+    UINT depth_pitch;
+};
+
+struct switchyard_dxgi_present_parameters
+{
+    UINT dirty_rect_count;
+    const void *dirty_rects;
+    const void *scroll_rect;
+    const void *scroll_offset;
+};
+
+#define SWITCHYARD_D3D_FRAME_TRACE_DETAIL_LIMIT 64
+#define SWITCHYARD_D3D_FRAME_TRACE_LINE_LIMIT 256
+#define SWITCHYARD_D3D_FRAME_TRACE_MAP_MODE_COUNT 6
+#define SWITCHYARD_D3D_FRAME_TRACE_DRAW_KIND_COUNT 7
+#define SWITCHYARD_D3D_FRAME_TRACE_TEXTURE_LIMIT 64
+#define SWITCHYARD_D3D_FRAME_TRACE_FINGERPRINT_LIMIT 32
+#define SWITCHYARD_D3D_FRAME_TRACE_SAMPLE_ROW_LIMIT 64
+#define SWITCHYARD_D3D_FRAME_TRACE_SAMPLE_PIXEL_LIMIT 4096
+
+/* Keep this diagnostic bounded and metadata-only.  The fixed texture table
+ * retains object identity and mapped data only until Unmap/release; neither
+ * those pointers nor source contents are ever printed. */
+struct switchyard_d3d_frame_trace_counters
+{
+    ULONG create_texture2d;
+    ULONG map;
+    ULONG map_modes[SWITCHYARD_D3D_FRAME_TRACE_MAP_MODE_COUNT];
+    ULONG unmap;
+    ULONG copy_resource;
+    ULONG copy_subresource_region;
+    ULONG update_subresource;
+    ULONG draw;
+    ULONG draw_kinds[SWITCHYARD_D3D_FRAME_TRACE_DRAW_KIND_COUNT];
+    ULONG present;
+    ULONG present1;
+};
+
+struct switchyard_d3d_frame_trace_decision
+{
+    BOOL log;
+    ULONG event;
+    ULONG frame;
+    struct switchyard_d3d_frame_trace_counters frame_counts;
+    struct switchyard_d3d_frame_trace_counters total_counts;
+};
+
+struct switchyard_d3d_frame_trace_texture
+{
+    void *object;
+    struct switchyard_d3d11_texture2d_desc desc;
+    void *mapped_data;
+    UINT mapped_subresource;
+    UINT mapped_row_pitch;
+};
+
+struct switchyard_d3d_frame_trace_fingerprint
+{
+    const BYTE *data;
+    UINT width;
+    UINT height;
+    UINT row_pitch;
+    ULONG index;
+};
+
+static RTL_CRITICAL_SECTION switchyard_d3d_frame_trace_section;
+static RTL_CRITICAL_SECTION_DEBUG switchyard_d3d_frame_trace_section_debug =
+{
+    0, 0, &switchyard_d3d_frame_trace_section,
+    { &switchyard_d3d_frame_trace_section_debug.ProcessLocksList,
+      &switchyard_d3d_frame_trace_section_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": switchyard_d3d_frame_trace_section") }
+};
+static RTL_CRITICAL_SECTION switchyard_d3d_frame_trace_section =
+    { &switchyard_d3d_frame_trace_section_debug, -1, 0, 0, 0, 0 };
+static struct switchyard_d3d_frame_trace_counters switchyard_d3d_frame_trace_total_counts;
+static struct switchyard_d3d_frame_trace_counters switchyard_d3d_frame_trace_frame_counts;
+static ULONG switchyard_d3d_frame_trace_event_count;
+static ULONG switchyard_d3d_frame_trace_frame_count;
+static ULONG switchyard_d3d_frame_trace_line_count;
+static struct switchyard_d3d_frame_trace_texture
+    switchyard_d3d_frame_trace_textures[SWITCHYARD_D3D_FRAME_TRACE_TEXTURE_LIMIT];
+static ULONG switchyard_d3d_frame_trace_next_texture;
+static ULONG switchyard_d3d_frame_trace_fingerprint_count;
+
+static enum switchyard_d3d_frame_trace_op switchyard_d3d_frame_trace_get_op( ULONG flags )
+{
+    return (flags & SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_MASK) >>
+           SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_SHIFT;
+}
+
+static void switchyard_d3d_frame_trace_count(
+    struct switchyard_d3d_frame_trace_counters *counts,
+    enum switchyard_d3d_frame_trace_op op, UINT map_mode )
+{
+    unsigned int index;
+
+    switch (op)
+    {
+    case SWITCHYARD_D3D_FRAME_TRACE_CREATE_TEXTURE2D:
+        ++counts->create_texture2d;
+        break;
+    case SWITCHYARD_D3D_FRAME_TRACE_MAP:
+        ++counts->map;
+        index = map_mode >= 1 && map_mode <= 5 ? map_mode - 1 : 5;
+        ++counts->map_modes[index];
+        break;
+    case SWITCHYARD_D3D_FRAME_TRACE_UNMAP:
+        ++counts->unmap;
+        break;
+    case SWITCHYARD_D3D_FRAME_TRACE_COPY_RESOURCE:
+        ++counts->copy_resource;
+        break;
+    case SWITCHYARD_D3D_FRAME_TRACE_COPY_SUBRESOURCE_REGION:
+        ++counts->copy_subresource_region;
+        break;
+    case SWITCHYARD_D3D_FRAME_TRACE_UPDATE_SUBRESOURCE:
+        ++counts->update_subresource;
+        break;
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED:
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW:
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED_INSTANCED:
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INSTANCED:
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_AUTO:
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED_INSTANCED_INDIRECT:
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INSTANCED_INDIRECT:
+        ++counts->draw;
+        index = op - SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED;
+        ++counts->draw_kinds[index];
+        break;
+    case SWITCHYARD_D3D_FRAME_TRACE_PRESENT:
+        ++counts->present;
+        break;
+    case SWITCHYARD_D3D_FRAME_TRACE_PRESENT1:
+        ++counts->present1;
+        break;
+    default:
+        break;
+    }
+}
+
+static void switchyard_d3d_frame_trace_record(
+    enum switchyard_d3d_frame_trace_op op, UINT map_mode,
+    struct switchyard_d3d_frame_trace_decision *decision )
+{
+    BOOL present = op == SWITCHYARD_D3D_FRAME_TRACE_PRESENT ||
+                   op == SWITCHYARD_D3D_FRAME_TRACE_PRESENT1;
+
+    memset( decision, 0, sizeof(*decision) );
+    RtlEnterCriticalSection( &switchyard_d3d_frame_trace_section );
+    decision->event = ++switchyard_d3d_frame_trace_event_count;
+    switchyard_d3d_frame_trace_count( &switchyard_d3d_frame_trace_total_counts,
+                                      op, map_mode );
+    switchyard_d3d_frame_trace_count( &switchyard_d3d_frame_trace_frame_counts,
+                                      op, map_mode );
+    if (present)
+    {
+        decision->frame = ++switchyard_d3d_frame_trace_frame_count;
+        decision->frame_counts = switchyard_d3d_frame_trace_frame_counts;
+        decision->total_counts = switchyard_d3d_frame_trace_total_counts;
+        memset( &switchyard_d3d_frame_trace_frame_counts, 0,
+                sizeof(switchyard_d3d_frame_trace_frame_counts) );
+        if (switchyard_d3d_frame_trace_line_count <
+            SWITCHYARD_D3D_FRAME_TRACE_LINE_LIMIT)
+        {
+            ++switchyard_d3d_frame_trace_line_count;
+            decision->log = TRUE;
+        }
+    }
+    else if (decision->event <= SWITCHYARD_D3D_FRAME_TRACE_DETAIL_LIMIT &&
+             switchyard_d3d_frame_trace_line_count <
+             SWITCHYARD_D3D_FRAME_TRACE_LINE_LIMIT)
+    {
+        ++switchyard_d3d_frame_trace_line_count;
+        decision->log = TRUE;
+    }
+    RtlLeaveCriticalSection( &switchyard_d3d_frame_trace_section );
+}
+
+static BOOL switchyard_d3d_frame_trace_fingerprint_desc(
+    const struct switchyard_d3d11_texture2d_desc *desc )
+{
+    return desc->format == SWITCHYARD_DXGI_FORMAT_B8G8R8A8_UNORM &&
+           desc->usage == SWITCHYARD_D3D11_USAGE_STAGING &&
+           desc->mip_levels == 1 && desc->array_size == 1 &&
+           desc->sample_count == 1 &&
+           desc->cpu_access_flags == (SWITCHYARD_D3D11_CPU_ACCESS_READ |
+                                      SWITCHYARD_D3D11_CPU_ACCESS_WRITE);
+}
+
+static struct switchyard_d3d_frame_trace_texture *
+switchyard_d3d_frame_trace_find_texture_locked( void *object )
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(switchyard_d3d_frame_trace_textures); ++i)
+        if (switchyard_d3d_frame_trace_textures[i].object == object)
+            return &switchyard_d3d_frame_trace_textures[i];
+    return NULL;
+}
+
+static void switchyard_d3d_frame_trace_track_texture(
+    void *object, const struct switchyard_d3d11_texture2d_desc *desc )
+{
+    struct switchyard_d3d_frame_trace_texture *entry = NULL;
+    unsigned int i;
+
+    if (!object || !desc) return;
+    RtlEnterCriticalSection( &switchyard_d3d_frame_trace_section );
+    entry = switchyard_d3d_frame_trace_find_texture_locked( object );
+    if (!switchyard_d3d_frame_trace_fingerprint_desc( desc ))
+    {
+        if (entry) memset( entry, 0, sizeof(*entry) );
+        RtlLeaveCriticalSection( &switchyard_d3d_frame_trace_section );
+        return;
+    }
+    if (!entry)
+    {
+        for (i = 0; i < ARRAY_SIZE(switchyard_d3d_frame_trace_textures); ++i)
+        {
+            if (switchyard_d3d_frame_trace_textures[i].object) continue;
+            entry = &switchyard_d3d_frame_trace_textures[i];
+            break;
+        }
+    }
+    if (!entry)
+    {
+        i = switchyard_d3d_frame_trace_next_texture++ %
+            ARRAY_SIZE(switchyard_d3d_frame_trace_textures);
+        entry = &switchyard_d3d_frame_trace_textures[i];
+    }
+    memset( entry, 0, sizeof(*entry) );
+    entry->object = object;
+    entry->desc = *desc;
+    RtlLeaveCriticalSection( &switchyard_d3d_frame_trace_section );
+}
+
+static void switchyard_d3d_frame_trace_note_map(
+    void *object, UINT subresource, UINT map_mode,
+    const struct switchyard_d3d11_mapped_subresource *mapped )
+{
+    struct switchyard_d3d_frame_trace_texture *entry;
+
+    if (!object) return;
+    RtlEnterCriticalSection( &switchyard_d3d_frame_trace_section );
+    if ((entry = switchyard_d3d_frame_trace_find_texture_locked( object )))
+    {
+        entry->mapped_data = NULL;
+        entry->mapped_subresource = 0;
+        entry->mapped_row_pitch = 0;
+        if (map_mode == SWITCHYARD_D3D11_MAP_READ_WRITE && mapped &&
+            mapped->data && mapped->row_pitch)
+        {
+            entry->mapped_data = mapped->data;
+            entry->mapped_subresource = subresource;
+            entry->mapped_row_pitch = mapped->row_pitch;
+        }
+    }
+    RtlLeaveCriticalSection( &switchyard_d3d_frame_trace_section );
+}
+
+static void switchyard_d3d_frame_trace_forget_texture( void *object )
+{
+    struct switchyard_d3d_frame_trace_texture *entry;
+
+    if (!object) return;
+    RtlEnterCriticalSection( &switchyard_d3d_frame_trace_section );
+    if ((entry = switchyard_d3d_frame_trace_find_texture_locked( object )))
+        memset( entry, 0, sizeof(*entry) );
+    RtlLeaveCriticalSection( &switchyard_d3d_frame_trace_section );
+}
+
+static BOOL switchyard_d3d_frame_trace_prepare_fingerprint(
+    void *object, UINT subresource,
+    struct switchyard_d3d_frame_trace_fingerprint *fingerprint )
+{
+    struct switchyard_d3d_frame_trace_texture *entry;
+    BOOL ret = FALSE;
+
+    memset( fingerprint, 0, sizeof(*fingerprint) );
+    if (!object) return FALSE;
+    RtlEnterCriticalSection( &switchyard_d3d_frame_trace_section );
+    entry = switchyard_d3d_frame_trace_find_texture_locked( object );
+    if (entry && entry->mapped_data &&
+        entry->mapped_subresource == subresource)
+    {
+        if (subresource == 0)
+        {
+            fingerprint->data = entry->mapped_data;
+            fingerprint->width = entry->desc.width;
+            fingerprint->height = entry->desc.height;
+            fingerprint->row_pitch = entry->mapped_row_pitch;
+        }
+        entry->mapped_data = NULL;
+        entry->mapped_subresource = 0;
+        entry->mapped_row_pitch = 0;
+        /* Matching CEF textures may be created after the general detail-event
+         * budget is exhausted, so fingerprints have their own stricter cap. */
+        if (subresource == 0 &&
+            switchyard_d3d_frame_trace_fingerprint_count <
+                SWITCHYARD_D3D_FRAME_TRACE_FINGERPRINT_LIMIT &&
+            switchyard_d3d_frame_trace_line_count <
+                SWITCHYARD_D3D_FRAME_TRACE_LINE_LIMIT)
+        {
+            fingerprint->index =
+                ++switchyard_d3d_frame_trace_fingerprint_count;
+            ++switchyard_d3d_frame_trace_line_count;
+            ret = TRUE;
+        }
+    }
+    RtlLeaveCriticalSection( &switchyard_d3d_frame_trace_section );
+    return ret;
+}
+
+static void switchyard_d3d_frame_trace_log_fingerprint(
+    ULONG event, const struct switchyard_d3d_frame_trace_fingerprint *fingerprint )
+{
+    static const ULONGLONG fnv_offset = 14695981039346656037ULL;
+    static const ULONGLONG fnv_prime = 1099511628211ULL;
+    BYTE first[4] = { 0 }, minimum[4] = { 255, 255, 255, 255 };
+    BYTE maximum[4] = { 0, 0, 0, 0 };
+    UINT rows, columns, sampled = 0, nonuniform = 0;
+    ULONGLONG hash = fnv_offset;
+    BOOL valid = TRUE;
+    unsigned int i, j, channel;
+
+    /* Fixed work bound: at most 4,096 sampled pixels / 16,384 byte reads,
+     * spread across no more than 64 rows.  This uses only fixed stack storage. */
+    if (!fingerprint->data || !fingerprint->width || !fingerprint->height ||
+        fingerprint->width > ~(UINT)0 / 4 ||
+        fingerprint->row_pitch < fingerprint->width * 4)
+        valid = FALSE;
+
+    rows = min( fingerprint->height,
+                (UINT)SWITCHYARD_D3D_FRAME_TRACE_SAMPLE_ROW_LIMIT );
+    columns = rows ? min( fingerprint->width,
+                          (UINT)SWITCHYARD_D3D_FRAME_TRACE_SAMPLE_PIXEL_LIMIT /
+                          rows ) : 0;
+    if (!rows || !columns) valid = FALSE;
+
+    if (valid)
+    {
+        __TRY
+        {
+            for (i = 0; i < rows; ++i)
+            {
+                UINT y = rows == 1 ? 0 :
+                         (UINT)((ULONGLONG)i * (fingerprint->height - 1) /
+                                (rows - 1));
+                SIZE_T row_offset;
+
+                if ((SIZE_T)y > ~(SIZE_T)0 / fingerprint->row_pitch)
+                {
+                    valid = FALSE;
+                    break;
+                }
+                row_offset = (SIZE_T)y * fingerprint->row_pitch;
+                for (j = 0; j < columns; ++j)
+                {
+                    UINT x = columns == 1 ? 0 :
+                             (UINT)((ULONGLONG)j * (fingerprint->width - 1) /
+                                    (columns - 1));
+                    SIZE_T offset = row_offset + (SIZE_T)x * 4;
+                    BYTE values[4];
+                    const BYTE *pixel;
+
+                    if (offset < row_offset ||
+                        (ULONG_PTR)fingerprint->data >
+                        ~(ULONG_PTR)0 - offset)
+                    {
+                        valid = FALSE;
+                        break;
+                    }
+                    pixel = (const BYTE *)((ULONG_PTR)fingerprint->data +
+                                           offset);
+                    memcpy( values, pixel, sizeof(values) );
+                    if (!sampled) memcpy( first, values, sizeof(first) );
+                    else if (memcmp( first, values, sizeof(first) ))
+                        ++nonuniform;
+                    for (channel = 0; channel < ARRAY_SIZE(first); ++channel)
+                    {
+                        BYTE value = values[channel];
+
+                        minimum[channel] = min( minimum[channel], value );
+                        maximum[channel] = max( maximum[channel], value );
+                        hash ^= value;
+                        hash *= fnv_prime;
+                    }
+                    ++sampled;
+                }
+                if (!valid) break;
+            }
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+            valid = FALSE;
+        }
+        __ENDTRY
+    }
+
+    TRACE( "d3d-frame-trace event=%lu fingerprint=%lu op=UnmapFingerprint "
+           "width=%u height=%u row_pitch=%u sampled=%u sample_limit=%u "
+           "sample_rows=%u fnv1a64=%016I64x "
+           "b=%u-%u g=%u-%u r=%u-%u a=%u-%u "
+           "nonuniform_vs_first=%u/%u valid=%u\n",
+           event, fingerprint->index, fingerprint->width,
+           fingerprint->height, fingerprint->row_pitch, sampled,
+           SWITCHYARD_D3D_FRAME_TRACE_SAMPLE_PIXEL_LIMIT, rows, hash,
+           minimum[0], maximum[0], minimum[1], maximum[1],
+           minimum[2], maximum[2], minimum[3], maximum[3],
+           nonuniform, sampled, valid );
+}
+
+static BOOL switchyard_d3d_frame_trace_copy_box(
+    ULONG_PTR pointer, struct switchyard_d3d11_box *box )
+{
+    BOOL valid = FALSE;
+
+    if (!pointer) return FALSE;
+    __TRY
+    {
+        *box = *(const struct switchyard_d3d11_box *)pointer;
+        valid = TRUE;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+    }
+    __ENDTRY
+    return valid;
+}
+
+static void switchyard_d3d_frame_trace_log_box(
+    const char *op, ULONG event, UINT dst_subresource, UINT dst_x, UINT dst_y,
+    UINT dst_z, UINT src_subresource, ULONG_PTR box_pointer, UINT row_pitch,
+    UINT depth_pitch )
+{
+    struct switchyard_d3d11_box box;
+
+    if (!box_pointer)
+    {
+        TRACE( "d3d-frame-trace event=%lu op=%s dst_subresource=%u dst=%u,%u,%u "
+               "src_subresource=%u box=all row_pitch=%u depth_pitch=%u\n",
+               event, op, dst_subresource, dst_x, dst_y, dst_z,
+               src_subresource, row_pitch, depth_pitch );
+    }
+    else if (switchyard_d3d_frame_trace_copy_box( box_pointer, &box ))
+    {
+        TRACE( "d3d-frame-trace event=%lu op=%s dst_subresource=%u dst=%u,%u,%u "
+               "src_subresource=%u box=%u,%u,%u-%u,%u,%u "
+               "row_pitch=%u depth_pitch=%u\n",
+               event, op, dst_subresource, dst_x, dst_y, dst_z,
+               src_subresource, box.left, box.top, box.front, box.right,
+               box.bottom, box.back, row_pitch, depth_pitch );
+    }
+    else
+    {
+        TRACE( "d3d-frame-trace event=%lu op=%s dst_subresource=%u dst=%u,%u,%u "
+               "src_subresource=%u box=unavailable row_pitch=%u depth_pitch=%u\n",
+               event, op, dst_subresource, dst_x, dst_y, dst_z,
+               src_subresource, row_pitch, depth_pitch );
+    }
+}
+
+static void switchyard_d3d_frame_trace_log_present(
+    const struct switchyard_d3d_frame_trace_decision *decision,
+    enum switchyard_d3d_frame_trace_op op, UINT sync_interval, UINT flags,
+    UINT dirty_rect_count, BOOL dirty_rect_count_valid, HRESULT hr )
+{
+    const struct switchyard_d3d_frame_trace_counters *frame =
+        &decision->frame_counts;
+    const struct switchyard_d3d_frame_trace_counters *total =
+        &decision->total_counts;
+    const char *name = op == SWITCHYARD_D3D_FRAME_TRACE_PRESENT1 ?
+                       "Present1" : "Present";
+
+    TRACE( "d3d-frame-trace event=%lu frame=%lu op=%s sync=%u flags=%#x "
+           "dirty_rects=%u dirty_known=%u hr=%#lx "
+           "frame_counts=tex:%lu,map:%lu,map_modes_r_w_rw_discard_nooverwrite_other:"
+           "%lu/%lu/%lu/%lu/%lu/%lu,unmap:%lu,copy:%lu,region:%lu,update:%lu,"
+           "draw:%lu,draw_kinds_indexed_plain_indexedinst_inst_auto_indexedindirect_"
+           "instindirect:%lu/%lu/%lu/%lu/%lu/%lu/%lu,present:%lu,present1:%lu "
+           "total_counts=tex:%lu,map:%lu,unmap:%lu,copy:%lu,region:%lu,update:%lu,"
+           "draw:%lu,present:%lu,present1:%lu\n",
+           decision->event, decision->frame, name, sync_interval, flags,
+           dirty_rect_count, dirty_rect_count_valid, (ULONG)hr,
+           frame->create_texture2d, frame->map,
+           frame->map_modes[0], frame->map_modes[1], frame->map_modes[2],
+           frame->map_modes[3], frame->map_modes[4], frame->map_modes[5],
+           frame->unmap, frame->copy_resource, frame->copy_subresource_region,
+           frame->update_subresource, frame->draw,
+           frame->draw_kinds[0], frame->draw_kinds[1], frame->draw_kinds[2],
+           frame->draw_kinds[3], frame->draw_kinds[4], frame->draw_kinds[5],
+           frame->draw_kinds[6], frame->present, frame->present1,
+           total->create_texture2d, total->map, total->unmap,
+           total->copy_resource, total->copy_subresource_region,
+           total->update_subresource, total->draw, total->present,
+           total->present1 );
+}
+
+static void switchyard_d3d_frame_trace_pre(
+    const struct switchyard_native_callback_params *params )
+{
+    struct switchyard_d3d_frame_trace_decision decision;
+    struct switchyard_d3d_frame_trace_fingerprint fingerprint;
+    enum switchyard_d3d_frame_trace_op op =
+        switchyard_d3d_frame_trace_get_op( params->flags );
+
+    switch (op)
+    {
+    case SWITCHYARD_D3D_FRAME_TRACE_UNMAP:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=Unmap subresource=%u\n",
+                   decision.event, (UINT)params->args[2] );
+        if (switchyard_d3d_frame_trace_prepare_fingerprint(
+                (void *)params->args[1], (UINT)params->args[2],
+                &fingerprint ))
+            switchyard_d3d_frame_trace_log_fingerprint(
+                decision.event, &fingerprint );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_COPY_RESOURCE:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=CopyResource\n",
+                   decision.event );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_COPY_SUBRESOURCE_REGION:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            switchyard_d3d_frame_trace_log_box(
+                "CopySubresourceRegion", decision.event,
+                (UINT)params->args[2], (UINT)params->args[3],
+                (UINT)params->args[4], (UINT)params->args[5],
+                (UINT)params->args[7], params->args[8], 0, 0 );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_UPDATE_SUBRESOURCE:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            switchyard_d3d_frame_trace_log_box(
+                "UpdateSubresource", decision.event,
+                (UINT)params->args[2], 0, 0, 0, 0, params->args[3],
+                (UINT)params->args[5], (UINT)params->args[6] );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=DrawIndexed indices=%u "
+                   "start_index=%u base_vertex=%d\n",
+                   decision.event, (UINT)params->args[1],
+                   (UINT)params->args[2], (INT)params->args[3] );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=Draw vertices=%u start_vertex=%u\n",
+                   decision.event, (UINT)params->args[1],
+                   (UINT)params->args[2] );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED_INSTANCED:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=DrawIndexedInstanced "
+                   "indices_per_instance=%u instances=%u start_index=%u "
+                   "base_vertex=%d start_instance=%u\n",
+                   decision.event, (UINT)params->args[1],
+                   (UINT)params->args[2], (UINT)params->args[3],
+                   (INT)params->args[4], (UINT)params->args[5] );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INSTANCED:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=DrawInstanced "
+                   "vertices_per_instance=%u instances=%u start_vertex=%u "
+                   "start_instance=%u\n",
+                   decision.event, (UINT)params->args[1],
+                   (UINT)params->args[2], (UINT)params->args[3],
+                   (UINT)params->args[4] );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_AUTO:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=DrawAuto count=auto\n",
+                   decision.event );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INDEXED_INSTANCED_INDIRECT:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=DrawIndexedInstancedIndirect "
+                   "argument_offset=%u\n", decision.event,
+                   (UINT)params->args[2] );
+        break;
+
+    case SWITCHYARD_D3D_FRAME_TRACE_DRAW_INSTANCED_INDIRECT:
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            TRACE( "d3d-frame-trace event=%lu op=DrawInstancedIndirect "
+                   "argument_offset=%u\n", decision.event,
+                   (UINT)params->args[2] );
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void switchyard_d3d_frame_trace_post(
+    const struct switchyard_native_callback_params *params, ULONG_PTR ret )
+{
+    struct switchyard_d3d_frame_trace_decision decision;
+    enum switchyard_d3d_frame_trace_op op =
+        switchyard_d3d_frame_trace_get_op( params->flags );
+    HRESULT hr = (HRESULT)ret;
+
+    if (op == SWITCHYARD_D3D_FRAME_TRACE_RELEASE)
+    {
+        if (!ret) switchyard_d3d_frame_trace_forget_texture(
+            (void *)params->args[0] );
+        return;
+    }
+
+    if (op == SWITCHYARD_D3D_FRAME_TRACE_CREATE_TEXTURE2D)
+    {
+        struct switchyard_d3d11_texture2d_desc desc;
+        void *object = NULL;
+        BOOL valid = FALSE;
+
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (params->args[1])
+        {
+            __TRY
+            {
+                desc = *(const struct switchyard_d3d11_texture2d_desc *)
+                       params->args[1];
+                valid = TRUE;
+            }
+            __EXCEPT_PAGE_FAULT
+            {
+            }
+            __ENDTRY
+        }
+        if (valid && SUCCEEDED(hr) && params->args[3])
+        {
+            __TRY
+            {
+                object = *(void **)params->args[3];
+            }
+            __EXCEPT_PAGE_FAULT
+            {
+                object = NULL;
+            }
+            __ENDTRY
+        }
+        if (object)
+            switchyard_d3d_frame_trace_track_texture( object, &desc );
+        if (!decision.log) return;
+        if (valid)
+            TRACE( "d3d-frame-trace event=%lu op=CreateTexture2D width=%u height=%u "
+                   "mips=%u array=%u format=%u sample_count=%u sample_quality=%u "
+                   "usage=%u bind=%#x cpu=%#x misc=%#x hr=%#lx\n",
+                   decision.event, desc.width, desc.height, desc.mip_levels,
+                   desc.array_size, desc.format, desc.sample_count,
+                   desc.sample_quality, desc.usage, desc.bind_flags,
+                   desc.cpu_access_flags, desc.misc_flags, (ULONG)hr );
+        else
+            TRACE( "d3d-frame-trace event=%lu op=CreateTexture2D "
+                   "desc=unavailable hr=%#lx\n", decision.event, (ULONG)hr );
+        return;
+    }
+
+    if (op == SWITCHYARD_D3D_FRAME_TRACE_MAP)
+    {
+        struct switchyard_d3d11_mapped_subresource mapped;
+        UINT map_mode = (UINT)params->args[3];
+        BOOL valid = FALSE;
+
+        switchyard_d3d_frame_trace_record( op, map_mode, &decision );
+        if (SUCCEEDED(hr) && params->args[5] &&
+            (decision.log || map_mode == SWITCHYARD_D3D11_MAP_READ_WRITE))
+        {
+            __TRY
+            {
+                mapped = *(const struct switchyard_d3d11_mapped_subresource *)
+                         params->args[5];
+                valid = TRUE;
+            }
+            __EXCEPT_PAGE_FAULT
+            {
+            }
+            __ENDTRY
+        }
+        if (SUCCEEDED(hr))
+            switchyard_d3d_frame_trace_note_map(
+                (void *)params->args[1], (UINT)params->args[2],
+                map_mode, valid ? &mapped : NULL );
+        if (!decision.log) return;
+        TRACE( "d3d-frame-trace event=%lu op=Map subresource=%u mode=%u "
+               "flags=%#x hr=%#lx mapped=%u row_pitch=%u\n",
+               decision.event, (UINT)params->args[2], map_mode,
+               (UINT)params->args[4], (ULONG)hr, valid,
+               valid ? mapped.row_pitch : 0 );
+        return;
+    }
+
+    if (op == SWITCHYARD_D3D_FRAME_TRACE_PRESENT ||
+        op == SWITCHYARD_D3D_FRAME_TRACE_PRESENT1)
+    {
+        UINT dirty_rect_count = 0;
+        BOOL dirty_rect_count_valid =
+            op == SWITCHYARD_D3D_FRAME_TRACE_PRESENT;
+
+        if (op == SWITCHYARD_D3D_FRAME_TRACE_PRESENT1 && params->args[3])
+        {
+            __TRY
+            {
+                dirty_rect_count =
+                    ((const struct switchyard_dxgi_present_parameters *)
+                     params->args[3])->dirty_rect_count;
+                dirty_rect_count_valid = TRUE;
+            }
+            __EXCEPT_PAGE_FAULT
+            {
+            }
+            __ENDTRY
+        }
+        switchyard_d3d_frame_trace_record( op, 0, &decision );
+        if (decision.log)
+            switchyard_d3d_frame_trace_log_present(
+                &decision, op, (UINT)params->args[1],
+                (UINT)params->args[2], dirty_rect_count,
+                dirty_rect_count_valid, hr );
+    }
+}
 
 struct switchyard_d3d_shared_section
 {
@@ -5018,7 +5877,8 @@ static void switchyard_release_d3d11_device_child( void *object, ULONG_PTR refs 
 {
     struct switchyard_d3d_shared_texture *texture = NULL;
 
-    if (refs > 1 || !object) return;
+    if (!object) return;
+    if (refs > 1) return;
     RtlEnterCriticalSection( &switchyard_d3d_shared_section );
     if (switchyard_d3d_shared_registry_initialized)
     {
@@ -5271,7 +6131,7 @@ static void CALLBACK switchyard_leave_d3d_shared_section( BOOL normal, void *ctx
     RtlLeaveCriticalSection( ctx );
 }
 
-static void CALLBACK switchyard_restore_windows_teb( BOOL normal, void *ctx )
+static void CALLBACK switchyard_restore_macos_tsd_base( BOOL normal, void *ctx )
 {
     (void)normal;
     switchyard_set_macos_tsd_base( ctx );
@@ -5314,7 +6174,7 @@ static BOOL switchyard_call_native_update_subresource(
         ((update_subresource_func)target)( context, texture, 0, NULL, source,
                                           row_pitch, 0 );
     }
-    __FINALLY_CTX( switchyard_restore_windows_teb, teb )
+    __FINALLY_CTX( switchyard_restore_macos_tsd_base, teb )
     return TRUE;
 }
 
@@ -6114,10 +6974,26 @@ static ULONG_PTR switchyard_native_callback_args_on_user_stack(
                                                &input_vtable_scope );
             if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_CONTEXT_EXECUTE)
                 switchyard_upload_all_d3d_shared_textures( params );
+            if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_MASK)
+                switchyard_d3d_frame_trace_pre( params );
             switchyard_set_macos_tsd_base( pthread_teb );
             ret = switchyard_call_native_callback_args( params );
             switchyard_leave_native_callback( TRUE, &scope );
             switchyard_restore_com_vtable( TRUE, &input_vtable_scope );
+            if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D_FRAME_TRACE_MASK)
+            {
+                if (scope.native_callback_depth && *scope.native_callback_depth)
+                {
+                    switchyard_set_macos_tsd_base( scope.teb );
+                    __TRY
+                    {
+                        switchyard_d3d_frame_trace_post( params, ret );
+                    }
+                    __FINALLY_CTX( switchyard_restore_macos_tsd_base,
+                                   scope.pthread_teb )
+                }
+                else switchyard_d3d_frame_trace_post( params, ret );
+            }
             if (params->flags & SWITCHYARD_NATIVE_CALLBACK_DXGI_RESOURCE_GET_SHARED_HANDLE)
                 ret = switchyard_get_d3d_shared_handle( params, ret );
             if (params->flags & SWITCHYARD_NATIVE_CALLBACK_D3D11_DEVICE_OPEN_SHARED_RESOURCE)
