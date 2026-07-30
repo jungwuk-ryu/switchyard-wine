@@ -2204,7 +2204,7 @@ static void test_knownFolders(void)
     KNOWNFOLDERID folderId, *folders;
     KF_CATEGORY cat = 0;
     KNOWNFOLDER_DEFINITION kfDefinition, kfSubDefinition;
-    int csidl, i;
+    int csidl, i, j;
     UINT nCount = 0;
     LPWSTR folderPath, errorMsg;
     KF_REDIRECTION_CAPABILITIES redirectionCapabilities = 1;
@@ -2327,7 +2327,12 @@ static void test_knownFolders(void)
         hr = IKnownFolderManager_GetFolderIds(mgr, &folders, &nCount);
         ok(hr == S_OK, "failed to get known folders: 0x%08lx\n", hr);
         for(i=0;i<nCount;++i)
+        {
+            for(j=0;j<i;++j)
+                ok(!IsEqualGUID(&folders[i], &folders[j]), "duplicate known folder %s at %d and %d\n",
+                        wine_dbgstr_guid(&folders[i]), j, i);
             check_known_folder(mgr, &folders[i]);
+        }
 
         for(i=0; i < ARRAY_SIZE(known_folder_found); ++i)
             if(!known_folder_found[i])

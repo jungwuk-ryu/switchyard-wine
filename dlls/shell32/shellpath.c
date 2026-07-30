@@ -4589,22 +4589,20 @@ static HRESULT foldermanager_create( void **ppv )
     fm->refs = 1;
     fm->num_ids = 0;
 
-    for (i = 0; i < ARRAY_SIZE(CSIDL_Data); i++)
-    {
-        if (!IsEqualGUID( CSIDL_Data[i].id, &GUID_NULL )) fm->num_ids++;
-    }
-    fm->ids = malloc( fm->num_ids * sizeof(KNOWNFOLDERID) );
+    fm->ids = malloc( ARRAY_SIZE(CSIDL_Data) * sizeof(KNOWNFOLDERID) );
     if (!fm->ids)
     {
         free( fm );
         return E_OUTOFMEMORY;
     }
-    for (i = j = 0; i < ARRAY_SIZE(CSIDL_Data); i++)
+    for (i = 0; i < ARRAY_SIZE(CSIDL_Data); i++)
     {
         if (!IsEqualGUID( CSIDL_Data[i].id, &GUID_NULL ))
         {
-            fm->ids[j] = *CSIDL_Data[i].id;
-            j++;
+            for (j = 0; j < fm->num_ids; j++)
+                if (IsEqualGUID( &fm->ids[j], CSIDL_Data[i].id )) break;
+            if (j == fm->num_ids)
+                fm->ids[fm->num_ids++] = *CSIDL_Data[i].id;
         }
     }
     TRACE("found %u known folders\n", fm->num_ids);
