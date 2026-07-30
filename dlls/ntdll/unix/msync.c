@@ -48,7 +48,6 @@
 #include <mach/semaphore.h>
 #include <mach/mach_error.h>
 #include <servers/bootstrap.h>
-#include <os/lock.h>
 #include <AvailabilityMacros.h>
 #include <dlfcn.h>
 #include <sched.h>
@@ -215,10 +214,16 @@ static int *shm_tid_map;
 
 static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
 
-static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, const int *objs,
-                                void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
+static DECLSPEC_NORETURN void msync_server_error( const char *operation, mach_msg_return_t mr )
 {
-    int i, is_mutex;
+    ERR( "%s failed: %#x (%s)\n", operation, mr, mach_error_string( mr ) );
+    abort_thread( mr == MACH_SEND_INVALID_DEST ? 0 : 1 );
+}
+
+static inline void server_register_wait( unsigned int msgh_id, const int *objs,
+                                         void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
+{
+    int i, is_mutex, object_count = count;
     mach_msg_return_t mr;
     __thread static mach_register_message_t message;
 
@@ -247,12 +252,24 @@ static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, cons
                                count * sizeof(unsigned int);
 
     mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
-                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+                    0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 
     if (mr != MACH_MSG_SUCCESS)
-        ERR("Failed to send server register wait: %#x\n", mr);
+    {
+        for (i = 0; i < object_count; i++)
+        {
+            struct event *obj = (struct event *)objs_shm[i];
 
-    return mr;
+            __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST );
+        }
+        if (alert_obj)
+        {
+            struct event *obj = (struct event *)alert_obj_shm;
+
+            __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST );
+        }
+        msync_server_error( "registering a wait with the MSync server", mr );
+    }
 }
 
 static inline void server_remove_wait( unsigned int msgh_id, const int *objs, void **objs_shm,
@@ -295,7 +312,7 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 
     if (mr != MACH_MSG_SUCCESS)
-        ERR("Failed to send server remove wait: %#x\n", mr);
+        msync_server_error( "removing a wait from the MSync server", mr );
 }
 
 static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
@@ -362,16 +379,12 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
     int ret, val;
     int *addr = shm_tid_map + tid;
     ULONGLONG ns_timeleft = 0;
-    mach_msg_return_t mr;
     unsigned int msgh_id;
     int total_count = count + (alert_obj ? 1 : 0);
 
     __atomic_store_n( addr, 2, __ATOMIC_RELEASE );
     msgh_id = (tid << 8) | total_count;
-    mr = server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
-
-    if (mr != MACH_MSG_SUCCESS)
-        return STATUS_PENDING;
+    server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
 
     while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
     {
@@ -429,7 +442,7 @@ int do_msync(void)
 
 static const mach_vm_size_t shm_tid_size = 64 * 1024 * 1024; /* 64 MB to index 24 bit tids */
 static void **shm_addrs;
-static int shm_addrs_size;  /* length of the allocated shm_addrs array */
+static unsigned int shm_addrs_size;  /* length of the fixed shm_addrs array */
 static long pagesize;
 
 typedef struct
@@ -445,6 +458,21 @@ typedef struct
     mach_msg_port_descriptor_t descriptor;
     mach_msg_trailer_t trailer;
 } mach_map_message_reply_t;
+
+static void destroy_reply_port( mach_port_t port, BOOL has_send_right )
+{
+    if (has_send_right) mach_port_deallocate( mach_task_self(), port );
+    mach_port_mod_refs( mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1 );
+}
+
+static void destroy_received_port( mach_port_t port, mach_msg_type_name_t disposition )
+{
+    if (port == MACH_PORT_NULL) return;
+    if (disposition == MACH_MSG_TYPE_PORT_RECEIVE)
+        mach_port_mod_refs( mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1 );
+    else
+        mach_port_deallocate( mach_task_self(), port );
+}
 
 static void *request_shm_from_server( int entry, int tid )
 {
@@ -470,7 +498,7 @@ static void *request_shm_from_server( int entry, int tid )
     if (kr != KERN_SUCCESS)
     {
         ERR( "Failed to insert right into reply port: %s\n", mach_error_string( kr ) );
-        mach_port_deallocate( mach_task_self(), reply_port );
+        destroy_reply_port( reply_port, FALSE );
         return NULL;
     }
 
@@ -480,6 +508,7 @@ static void *request_shm_from_server( int entry, int tid )
     send_message.header.msgh_remote_port = server_port;
     send_message.header.msgh_local_port = reply_port;
     send_message.entry = entry;
+    memset( &receive_message, 0, sizeof(receive_message) );
 
     mr = mach_msg_overwrite( &send_message.header, MACH_SEND_MSG | MACH_RCV_MSG,
                send_message.header.msgh_size, sizeof(receive_message), reply_port,
@@ -487,9 +516,34 @@ static void *request_shm_from_server( int entry, int tid )
 
     if (mr != MACH_MSG_SUCCESS)
     {
-        ERR( "Failed to send/receive shm map request: %#x\n", mr );
+        destroy_reply_port( reply_port, TRUE );
+        msync_server_error( "requesting shared memory from the MSync server", mr );
     }
-    else
+
+    if (receive_message.header.msgh_size != FIELD_OFFSET(mach_map_message_reply_t, trailer) ||
+        !(receive_message.header.msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
+        receive_message.body.msgh_descriptor_count != 1 ||
+        receive_message.descriptor.type != MACH_MSG_PORT_DESCRIPTOR ||
+        receive_message.descriptor.disposition != MACH_MSG_TYPE_PORT_SEND ||
+        receive_message.descriptor.name == MACH_PORT_NULL ||
+        receive_message.descriptor.name == MACH_PORT_DEAD)
+    {
+        if ((receive_message.header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+            receive_message.header.msgh_size >=
+                FIELD_OFFSET(mach_map_message_reply_t, descriptor) + sizeof(receive_message.descriptor) &&
+            receive_message.body.msgh_descriptor_count >= 1 &&
+            receive_message.descriptor.type == MACH_MSG_PORT_DESCRIPTOR &&
+            receive_message.descriptor.name != MACH_PORT_NULL &&
+            (receive_message.descriptor.disposition == MACH_MSG_TYPE_PORT_SEND ||
+             receive_message.descriptor.disposition == MACH_MSG_TYPE_PORT_SEND_ONCE ||
+             receive_message.descriptor.disposition == MACH_MSG_TYPE_PORT_RECEIVE))
+            destroy_received_port( receive_message.descriptor.name,
+                                   receive_message.descriptor.disposition );
+        destroy_reply_port( reply_port, TRUE );
+        ERR( "Invalid shared memory reply from the MSync server\n" );
+        abort_thread(1);
+    }
+
     {
         mach_vm_size_t size = tid ? shm_tid_size : pagesize;
 
@@ -506,59 +560,54 @@ static void *request_shm_from_server( int entry, int tid )
         }
     }
 
-    mach_port_deallocate( mach_task_self(), reply_port );
-    mach_port_deallocate( mach_task_self(), receive_message.descriptor.name );
+    destroy_reply_port( reply_port, TRUE );
+    if (receive_message.descriptor.name != MACH_PORT_NULL)
+        mach_port_deallocate( mach_task_self(), receive_message.descriptor.name );
     return (void *)map_address;
 }
 
-static os_unfair_lock shm_addrs_lock = OS_UNFAIR_LOCK_INIT;
-
 static void *get_shm_slow( unsigned int idx )
 {
-    int entry  = (idx * 16) / pagesize;
-    int offset = (idx * 16) % pagesize;
-    void *ret;
-
-    os_unfair_lock_lock( &shm_addrs_lock );
+    unsigned int entry = idx >> (vm_kernel_page_shift - 4);
+    unsigned int offset = (idx << 4) & vm_kernel_page_mask;
+    void *addr, *expected = NULL;
 
     if (entry >= shm_addrs_size)
     {
-        int new_size = max(shm_addrs_size * 2, entry + 1);
-
-        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
-            ERR("Failed to grow shm_addrs array to size %d.\n", shm_addrs_size);
-        memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
-        shm_addrs_size = new_size;
+        ERR( "Invalid MSync shared memory index %u.\n", idx );
+        abort_thread(1);
     }
+    if ((addr = __atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE )))
+        return (void *)((unsigned long)addr + offset);
 
-    if (!shm_addrs[entry])
+    if (!(addr = request_shm_from_server( entry, 0 )))
     {
-        void *addr = request_shm_from_server( entry, 0 );
-        if (!addr)
-            ERR("Failed to map page %d (offset %#lx).\n", entry, entry * pagesize);
-
-        TRACE("Mapping page %d at %p.\n", entry, addr);
-
-        if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, addr ))
-            mach_vm_deallocate( mach_task_self(), (mach_vm_address_t)addr, pagesize ); /* someone beat us to it */
+        ERR("Failed to map page %d (offset %#lx).\n", entry, entry * pagesize);
+        abort_thread(1);
     }
 
-    ret = (void *)((unsigned long)shm_addrs[entry] + offset);
+    TRACE("Mapping page %u at %p.\n", entry, addr);
 
-    os_unfair_lock_unlock( &shm_addrs_lock );
+    if (!__atomic_compare_exchange_n( &shm_addrs[entry], &expected, addr, FALSE,
+                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ))
+    {
+        mach_vm_deallocate( mach_task_self(), (mach_vm_address_t)addr, pagesize );
+        addr = expected;
+    }
 
-    return ret;
+    return (void *)((unsigned long)addr + offset);
 }
 
 static inline void *get_shm( const unsigned int idx )
 {
     int entry = idx >> (vm_kernel_page_shift - 4);
     int offset = (idx << 4) & vm_kernel_page_mask;
+    void *addr;
 
-    if (entry >= shm_addrs_size || !shm_addrs[entry])
+    if (entry >= shm_addrs_size || !(addr = __atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE )))
         return get_shm_slow( idx );
 
-    return (void *)((unsigned long)shm_addrs[entry] + offset);
+    return (void *)((unsigned long)addr + offset);
 }
 
 void msync_close( int obj )
@@ -577,7 +626,7 @@ void msync_close( int obj )
                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
 
     if (mr != MACH_MSG_SUCCESS)
-        ERR( "Failed to send message to server to close msync object %d: %#x\n", obj, mr );
+        msync_server_error( "closing an MSync object", mr );
 }
 
 void msync_init(void)
@@ -618,8 +667,13 @@ void msync_init(void)
 
     pagesize = (long)vm_kernel_page_size;
 
-    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
-    shm_addrs_size = 128;
+    /* Bits 28 and 29 are reserved for MSync Mach message flags. */
+    shm_addrs_size = (1u << 28) >> (vm_kernel_page_shift - 4);
+    if (!(shm_addrs = calloc( shm_addrs_size, sizeof(shm_addrs[0]) )))
+    {
+        ERR( "Failed to allocate the MSync shared memory map.\n" );
+        exit(1);
+    }
 
     /* Bootstrap mach wineserver communication */
 
@@ -653,6 +707,7 @@ static inline void signal_all( void *shm, unsigned int shm_idx )
 {
     __thread static mach_msg_header_t send_header;
     struct event *event_obj = (struct event *)shm;
+    mach_msg_return_t mr;
 
     __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, shm, 0 );
 
@@ -664,8 +719,10 @@ static inline void signal_all( void *shm, unsigned int shm_idx )
     send_header.msgh_size = sizeof(send_header);
     send_header.msgh_remote_port = server_port;
 
-    mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
-               MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+    mr = mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
+                    MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+    if (mr != MACH_MSG_SUCCESS)
+        msync_server_error( "signalling the MSync server", mr );
 }
 
 NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
