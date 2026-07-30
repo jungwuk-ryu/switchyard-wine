@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <assert.h>
+#include <limits.h>
 #include <wchar.h>
 
 #include "windef.h"
@@ -1568,6 +1569,9 @@ BOOL WINAPI InternetGetConnectedStateExW(LPDWORD lpdwStatus, LPWSTR lpszConnecti
 
     TRACE("(%p, %p, %ld, 0x%08lx)\n", lpdwStatus, lpszConnectionName, dwNameLen, dwReserved);
 
+    if (lpdwStatus) *lpdwStatus = 0;
+    if (lpszConnectionName) *lpszConnectionName = 0;
+
     /* Must be zero */
     if(dwReserved)
     {
@@ -1608,7 +1612,6 @@ BOOL WINAPI InternetGetConnectedStateExW(LPDWORD lpdwStatus, LPWSTR lpszConnecti
         /* Connected to internet */
         if (aa->FirstGatewayAddress)
         {
-            WARN("always returning LAN connection.\n");
             status &= ~INTERNET_CONNECTION_OFFLINE;
             status |= INTERNET_CONNECTION_LAN;
             break;
@@ -1622,9 +1625,11 @@ BOOL WINAPI InternetGetConnectedStateExW(LPDWORD lpdwStatus, LPWSTR lpszConnecti
      * the resource, avoid it as we must not change the buffer in this case */
     if (lpszConnectionName && dwNameLen)
     {
+        int name_len = min(dwNameLen, INT_MAX);
+
         *lpszConnectionName = '\0';
         if (status & INTERNET_CONNECTION_LAN)
-            LoadStringW(WININET_hModule, IDS_LANCONNECTION, lpszConnectionName, dwNameLen);
+            LoadStringW(WININET_hModule, IDS_LANCONNECTION, lpszConnectionName, name_len);
     }
 
     if (!(status & (INTERNET_CONNECTION_LAN | INTERNET_CONNECTION_MODEM | INTERNET_CONNECTION_PROXY)))
@@ -1643,14 +1648,31 @@ BOOL WINAPI InternetGetConnectedStateExA(LPDWORD lpdwStatus, LPSTR lpszConnectio
                                          DWORD dwNameLen, DWORD dwReserved)
 {
     LPWSTR lpwszConnectionName = NULL;
+    DWORD status;
     BOOL rc;
 
     TRACE("(%p, %p, %ld, 0x%08lx)\n", lpdwStatus, lpszConnectionName, dwNameLen, dwReserved);
 
-    if (lpszConnectionName && dwNameLen > 0)
-        lpwszConnectionName = malloc(dwNameLen * sizeof(WCHAR));
+    if (lpdwStatus) *lpdwStatus = 0;
+    if (lpszConnectionName && dwNameLen) *lpszConnectionName = 0;
 
-    rc = InternetGetConnectedStateExW(lpdwStatus,lpwszConnectionName, dwNameLen,
+    if (dwReserved)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if (lpszConnectionName && dwNameLen)
+    {
+        if (dwNameLen > INT_MAX ||
+            !(lpwszConnectionName = malloc((SIZE_T)dwNameLen * sizeof(WCHAR))))
+        {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+    }
+
+    rc = InternetGetConnectedStateExW(lpdwStatus ? lpdwStatus : &status, lpwszConnectionName, dwNameLen,
                                       dwReserved);
     if (rc && lpwszConnectionName)
     {
@@ -1658,6 +1680,8 @@ BOOL WINAPI InternetGetConnectedStateExA(LPDWORD lpdwStatus, LPSTR lpszConnectio
                             dwNameLen, NULL, NULL);
         /* Yes, blindly truncate double-byte characters */
         lpszConnectionName[dwNameLen - 1] = '\0';
+        if (dwNameLen == 1 && (*(lpdwStatus ? lpdwStatus : &status) & INTERNET_CONNECTION_LAN))
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
     }
 
     free(lpwszConnectionName);

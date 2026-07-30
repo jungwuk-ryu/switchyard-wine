@@ -1789,6 +1789,15 @@ static void test_InternetGetConnectedStateExA(void)
         return;
     }
 
+    buffer[0] = 'z';
+    flags = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    res = pInternetGetConnectedStateExA(&flags, buffer, 1, 1);
+    ok(res == FALSE, "Expected FALSE, got %d\n", res);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected gle %lu\n", GetLastError());
+    ok(!flags, "Expected flags to be cleared, got %#lx\n", flags);
+    ok(!buffer[0], "Expected an empty connection name, got %02X\n", buffer[0]);
+
     flags = 0;
     buffer[0] = 0;
     res = pInternetGetConnectedStateExA(&flags, buffer, sizeof(buffer), 0);
@@ -1816,12 +1825,12 @@ static void test_InternetGetConnectedStateExA(void)
         ok(flags & ~INTERNET_CONNECTION_MODEM, "Mixed Modem and LAN flags\n");
     }
 
-    buffer[0] = 0;
+    buffer[0] = 'z';
     flags = 0;
     res = pInternetGetConnectedStateExA(&flags, buffer, 0, 0);
     ok(res == TRUE, "Expected TRUE, got %d\n", res);
     ok(flags, "Expected at least one flag set\n");
-    ok(!buffer[0], "Buffer must not change, got %02X\n", buffer[0]);
+    ok(buffer[0] == 'z', "Buffer must not change, got %02X\n", buffer[0]);
 
     buffer[0] = 0;
     res = pInternetGetConnectedStateExA(NULL, buffer, sizeof(buffer), 0);
@@ -1869,10 +1878,12 @@ static void test_InternetGetConnectedStateExA(void)
     memset(buffer, 'z', sizeof(buffer) - 1);
     buffer[sizeof(buffer) - 1] = 0;
     flags = 0;
+    SetLastError(0xdeadbeef);
     res = pInternetGetConnectedStateExA(&flags, buffer, 1, 0);
     ok(res == TRUE, "Expected TRUE, got %d\n", res);
     ok(flags, "Expected at least one flag set\n");
     ok(!buffer[0], "Expected len 0, got %Iu: %s\n", strlen(buffer), wine_dbgstr_a(buffer));
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "Unexpected gle %lu\n", GetLastError());
 }
 
 static void test_InternetGetConnectedStateExW(void)
@@ -1885,6 +1896,20 @@ static void test_InternetGetConnectedStateExW(void)
         win_skip("InternetGetConnectedStateExW is not supported\n");
         return;
     }
+
+    SetLastError(0xdeadbeef);
+    res = pInternetGetConnectedStateExW(NULL, NULL, 0, 1);
+    ok(res == FALSE, "Expected FALSE, got %d\n", res);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected gle %lu\n", GetLastError());
+
+    buffer[0] = 'z';
+    flags = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    res = pInternetGetConnectedStateExW(&flags, buffer, 0, 1);
+    ok(res == FALSE, "Expected FALSE, got %d\n", res);
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected gle %lu\n", GetLastError());
+    ok(!flags, "Expected flags to be cleared, got %#lx\n", flags);
+    ok(!buffer[0] || broken(buffer[0] == 'z'), "Expected an empty connection name, got %04x\n", buffer[0]);
 
     flags = 0;
     wcscpy(buffer, L"wine");
@@ -1904,11 +1929,6 @@ static void test_InternetGetConnectedStateExW(void)
     res = pInternetGetConnectedStateExW(NULL, NULL, 0, 0);
     ok(res == TRUE, "Expected TRUE, got %d\n", res);
 
-    SetLastError(0xdeadbeef);
-    res = pInternetGetConnectedStateExW(NULL, NULL, 0, 1);
-    ok(res == FALSE, "Expected TRUE, got %d\n", res);
-    ok(GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected gle %lu\n", GetLastError());
-
     flags = 0;
     res = pInternetGetConnectedStateExW(&flags, NULL, 0, 0);
     ok(res == TRUE, "Expected TRUE, got %d\n", res);
@@ -1923,12 +1943,12 @@ static void test_InternetGetConnectedStateExW(void)
         ok(flags & ~INTERNET_CONNECTION_MODEM, "Mixed Modem and LAN flags\n");
     }
 
-    buffer[0] = 0;
+    buffer[0] = 'z';
     flags = 0;
     res = pInternetGetConnectedStateExW(&flags, buffer, 0, 0);
     ok(res == TRUE, "Expected TRUE, got %d\n", res);
     ok(flags, "Expected at least one flag set\n");
-    ok(!buffer[0], "Buffer must not change, got %02X\n", buffer[0]);
+    ok(!buffer[0] || broken(buffer[0] == 'z'), "Expected an empty connection name, got %04x\n", buffer[0]);
 
     buffer[0] = 0;
     res = pInternetGetConnectedStateExW(NULL, buffer, ARRAY_SIZE(buffer), 0);
