@@ -227,6 +227,30 @@ struct bound_addr
     int reuse_count;
 };
 
+#ifdef __APPLE__
+/* Darwin discards the TCP protocol control block after a failed connection.
+ * Preserve enough state to replace the native socket while keeping the
+ * Windows socket object alive. */
+#define MAX_RECONNECT_OPTIONS 24
+#define MAX_RECONNECT_OPTION_SIZE 64
+
+struct reconnect_option
+{
+    int level;
+    int option;
+    socklen_t len;
+    unsigned char value[MAX_RECONNECT_OPTION_SIZE];
+};
+
+struct reconnect_snapshot
+{
+    union unix_sockaddr local_addr;
+    socklen_t local_len;
+    unsigned int option_count;
+    struct reconnect_option options[MAX_RECONNECT_OPTIONS];
+};
+#endif
+
 #define MAX_ICMP_HISTORY_LENGTH 8
 
 #define MIN_RCVBUF 65536
@@ -236,6 +260,9 @@ struct sock
     struct object       obj;         /* object header */
     struct fd          *fd;          /* socket file descriptor */
     enum connection_state state;     /* connection state */
+#ifdef __APPLE__
+    struct reconnect_snapshot *reconnect; /* state needed to replace a failed Darwin socket */
+#endif
     unsigned int        mask;        /* event mask */
     /* pending AFD_POLL_* events which have not yet been reported to the application */
     unsigned int        pending_events;
@@ -295,6 +322,9 @@ struct sock
     unsigned int        aborted : 1; /* did we get a POLLERR or irregular POLLHUP? */
     unsigned int        nonblocking : 1; /* is the socket nonblocking? */
     unsigned int        bound : 1;   /* is the socket bound? */
+#ifdef __APPLE__
+    unsigned int        connect_failed : 1; /* does the Darwin socket need replacement? */
+#endif
     unsigned int        reset : 1;   /* did we get a TCP reset? */
     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
@@ -468,6 +498,9 @@ static void sock_release_ifchange( struct sock *sock );
 static int sock_get_poll_events( struct fd *fd );
 static void sock_poll_event( struct fd *fd, int event );
 static enum server_fd_type sock_get_fd_type( struct fd *fd );
+#ifdef __APPLE__
+static int replace_failed_socket( struct sock *sock );
+#endif
 static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async );
 static void sock_cancel_async( struct fd *fd, struct async *async );
 static void sock_reselect_async( struct fd *fd, struct async_queue *queue );
@@ -1431,6 +1464,9 @@ static void sock_poll_event( struct fd *fd, int event )
         if (event & (POLLERR|POLLHUP))
         {
             sock->state = SOCK_UNCONNECTED;
+#ifdef __APPLE__
+            sock->connect_failed = 1;
+#endif
             event &= ~POLLOUT;
         }
         else if (event & POLLOUT)
@@ -1438,6 +1474,12 @@ static void sock_poll_event( struct fd *fd, int event )
             sock->state = SOCK_CONNECTED;
             sock->connect_time = current_time;
             sock->errors[AFD_POLL_BIT_CONNECT_ERR] = 0;
+#ifdef __APPLE__
+            free( sock->reconnect );
+            sock->reconnect = NULL;
+            sock->connect_failed = 0;
+            allow_fd_caching( sock->fd );
+#endif
         }
         break;
 
@@ -1777,6 +1819,9 @@ static void sock_destroy( struct object *obj )
     free_async_queue( &sock->poll_q );
     if (sock->event) release_object( sock->event );
     if (sock->fd) release_object( sock->fd );
+#ifdef __APPLE__
+    free( sock->reconnect );
+#endif
 }
 
 static struct sock *create_socket(void)
@@ -1786,6 +1831,9 @@ static struct sock *create_socket(void)
     if (!(sock = alloc_object( &sock_ops ))) return NULL;
     sock->fd      = NULL;
     sock->state   = SOCK_UNCONNECTED;
+#ifdef __APPLE__
+    sock->reconnect = NULL;
+#endif
     sock->mask    = 0;
     sock->pending_events = 0;
     sock->reported_events = 0;
@@ -1813,6 +1861,9 @@ static struct sock *create_socket(void)
     sock->aborted = 0;
     sock->nonblocking = 0;
     sock->bound = 0;
+#ifdef __APPLE__
+    sock->connect_failed = 0;
+#endif
     sock->reset = 0;
     sock->reuseaddr = 0;
     sock->exclusiveaddruse = 0;
@@ -2071,6 +2122,150 @@ static int init_socket( struct sock *sock, int family, int type, int protocol )
     return 0;
 }
 
+#ifdef __APPLE__
+static void snapshot_socket_option( struct reconnect_snapshot *snapshot, int fd, int level, int option )
+{
+    struct reconnect_option *entry;
+    socklen_t len;
+
+    assert( snapshot->option_count < MAX_RECONNECT_OPTIONS );
+    entry = &snapshot->options[snapshot->option_count];
+    len = sizeof(entry->value);
+    if (getsockopt( fd, level, option, entry->value, &len ) || !len) return;
+
+    assert( len <= sizeof(entry->value) );
+    entry->level = level;
+    entry->option = option;
+    entry->len = len;
+    ++snapshot->option_count;
+}
+
+static void snapshot_socket_address( struct reconnect_snapshot *snapshot, int fd )
+{
+    union unix_sockaddr local_addr;
+    socklen_t len = sizeof(local_addr);
+    int has_port;
+
+    if (getsockname( fd, &local_addr.addr, &len )) return;
+    has_port = (local_addr.addr.sa_family == AF_INET && local_addr.in.sin_port)
+             || (local_addr.addr.sa_family == AF_INET6 && local_addr.in6.sin6_port);
+    if (!has_port) return;
+
+    snapshot->local_addr = local_addr;
+    snapshot->local_len = len;
+}
+
+static int snapshot_socket( struct sock *sock )
+{
+    struct reconnect_snapshot *snapshot;
+    int fd = get_unix_fd( sock->fd );
+
+    if (!(snapshot = mem_alloc( sizeof(*snapshot) ))) return -1;
+    snapshot->local_len = 0;
+    snapshot->option_count = 0;
+    snapshot_socket_address( snapshot, fd );
+
+#define SNAPSHOT_OPTION(level, option) snapshot_socket_option( snapshot, fd, level, option )
+
+    SNAPSHOT_OPTION( SOL_SOCKET, SO_REUSEADDR );
+#ifdef SO_REUSEPORT
+    SNAPSHOT_OPTION( SOL_SOCKET, SO_REUSEPORT );
+#endif
+    SNAPSHOT_OPTION( SOL_SOCKET, SO_KEEPALIVE );
+    SNAPSHOT_OPTION( SOL_SOCKET, SO_LINGER );
+    SNAPSHOT_OPTION( SOL_SOCKET, SO_OOBINLINE );
+    SNAPSHOT_OPTION( SOL_SOCKET, SO_RCVBUF );
+    SNAPSHOT_OPTION( SOL_SOCKET, SO_SNDBUF );
+#ifdef SO_NOSIGPIPE
+    SNAPSHOT_OPTION( SOL_SOCKET, SO_NOSIGPIPE );
+#endif
+
+#ifdef IP_DONTFRAG
+    SNAPSHOT_OPTION( IPPROTO_IP, IP_DONTFRAG );
+#endif
+    SNAPSHOT_OPTION( IPPROTO_IP, IP_OPTIONS );
+    SNAPSHOT_OPTION( IPPROTO_IP, IP_TOS );
+    SNAPSHOT_OPTION( IPPROTO_IP, IP_TTL );
+#ifdef IP_BOUND_IF
+    SNAPSHOT_OPTION( IPPROTO_IP, IP_BOUND_IF );
+#endif
+
+#ifdef IPV6_DONTFRAG
+    SNAPSHOT_OPTION( IPPROTO_IPV6, IPV6_DONTFRAG );
+#endif
+    SNAPSHOT_OPTION( IPPROTO_IPV6, IPV6_UNICAST_HOPS );
+    SNAPSHOT_OPTION( IPPROTO_IPV6, IPV6_V6ONLY );
+#ifdef IPV6_BOUND_IF
+    SNAPSHOT_OPTION( IPPROTO_IPV6, IPV6_BOUND_IF );
+#endif
+
+    SNAPSHOT_OPTION( IPPROTO_TCP, TCP_NODELAY );
+#ifdef TCP_KEEPALIVE
+    SNAPSHOT_OPTION( IPPROTO_TCP, TCP_KEEPALIVE );
+#endif
+#ifdef TCP_KEEPINTVL
+    SNAPSHOT_OPTION( IPPROTO_TCP, TCP_KEEPINTVL );
+#endif
+#ifdef TCP_KEEPCNT
+    SNAPSHOT_OPTION( IPPROTO_TCP, TCP_KEEPCNT );
+#endif
+
+#undef SNAPSHOT_OPTION
+
+    free( sock->reconnect );
+    sock->reconnect = snapshot;
+    return 0;
+}
+
+static int replace_failed_socket( struct sock *sock )
+{
+    struct reconnect_snapshot *snapshot = sock->reconnect;
+    int old_unix_fd = get_unix_fd( sock->fd );
+    int new_unix_fd, unix_family, unix_type, unix_protocol, saved_errno;
+    unsigned int i;
+
+    assert( snapshot );
+
+    unix_family = get_unix_family( sock->family );
+    unix_type = get_unix_type( sock->type );
+    unix_protocol = get_unix_protocol( sock->family, sock->proto );
+    if ((new_unix_fd = socket( unix_family, unix_type, unix_protocol )) == -1)
+        goto error;
+    if (fcntl( new_unix_fd, F_SETFL, O_NONBLOCK ) == -1)
+        goto close_error;
+
+    for (i = 0; i < snapshot->option_count; ++i)
+    {
+        const struct reconnect_option *entry = &snapshot->options[i];
+
+        if (setsockopt( new_unix_fd, entry->level, entry->option, entry->value, entry->len ))
+            goto close_error;
+    }
+
+    if (snapshot->local_len &&
+        bind( new_unix_fd, &snapshot->local_addr.addr, snapshot->local_len ))
+        goto close_error;
+
+    /* Keep the server fd object, its completion association, and all handles.
+     * Stream sockets are not cacheable until the connection succeeds, so no
+     * client can retain the discarded file description. */
+    sock_reselect( sock );
+    if (dup2( new_unix_fd, old_unix_fd ) == -1)
+        goto close_error;
+    close( new_unix_fd );
+    sock->connect_failed = 0;
+    return 0;
+
+close_error:
+    saved_errno = errno;
+    close( new_unix_fd );
+    errno = saved_errno;
+error:
+    set_error( sock_get_ntstatus( errno ) );
+    return -1;
+}
+#endif
+
 /* accepts a socket and inits it */
 static int accept_new_fd( struct sock *sock )
 {
@@ -2203,6 +2398,11 @@ static int accept_into_socket( struct sock *sock, struct sock *acceptsock )
     fd_copy_completion( acceptsock->fd, newfd );
     release_object( acceptsock->fd );
     acceptsock->fd = newfd;
+#ifdef __APPLE__
+    free( acceptsock->reconnect );
+    acceptsock->reconnect = NULL;
+    acceptsock->connect_failed = 0;
+#endif
 
     unix_len = sizeof(unix_addr);
     if (!getsockname( get_unix_fd( newfd ), &unix_addr.addr, &unix_len ))
@@ -2667,6 +2867,12 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             return;
         }
 
+#ifdef __APPLE__
+        if (sock->connect_failed && replace_failed_socket( sock ) < 0)
+            return;
+        unix_fd = get_unix_fd( sock->fd );
+#endif
+
         if (listen( unix_fd, params->backlog ) < 0)
         {
             set_error( sock_get_ntstatus( errno ) );
@@ -2674,6 +2880,11 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         }
 
         sock->state = SOCK_LISTENING;
+#ifdef __APPLE__
+        free( sock->reconnect );
+        sock->reconnect = NULL;
+        sock->connect_failed = 0;
+#endif
 
         /* a listening socket can no longer be accepted into */
         allow_fd_caching( sock->fd );
@@ -2748,6 +2959,16 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         }
         if (sock->state == SOCK_UNCONNECTED) /* clear events */
         {
+#ifdef __APPLE__
+            if (sock->type == WS_SOCK_STREAM)
+            {
+                if (sock->connect_failed && replace_failed_socket( sock ) < 0)
+                    return;
+                if (snapshot_socket( sock ) < 0)
+                    return;
+                unix_fd = get_unix_fd( sock->fd );
+            }
+#endif
             sock->pending_events &= ~AFD_POLL_CONNECT_ERR;
             sock->reported_events &= ~AFD_POLL_CONNECT_ERR;
         }
@@ -2756,6 +2977,11 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         memcpy( &peer_addr, &unix_addr, sizeof(unix_addr) );
         ret = connect( unix_fd, &unix_addr.addr, unix_len );
+#ifdef __APPLE__
+        if (sock->type == WS_SOCK_STREAM)
+            snapshot_socket_address( sock->reconnect, unix_fd );
+#endif
+#ifndef __APPLE__
         if (ret < 0 && errno == ECONNABORTED)
         {
             /* On Linux with nonblocking socket if the previous connect() failed for any reason (including
@@ -2766,6 +2992,7 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
              * sufficient. */
             ret = connect( unix_fd, &unix_addr.addr, unix_len );
         }
+#endif
 
         if (ret < 0 && errno == EACCES && sock->state == SOCK_CONNECTIONLESS && unix_addr.addr.sa_family == AF_INET)
         {
@@ -2788,11 +3015,26 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         if (ret < 0 && errno != EINPROGRESS)
         {
+#ifdef __APPLE__
+            if (sock->type == WS_SOCK_STREAM)
+            {
+                int connect_errno = errno;
+
+                sock->connect_failed = 1;
+                replace_failed_socket( sock );
+                errno = connect_errno;
+            }
+#endif
             set_error( sock_get_ntstatus( errno ) );
             return;
         }
 
         /* a connected or connecting socket can no longer be accepted into */
+#ifdef __APPLE__
+        /* A failed Darwin stream socket may need to be replaced, so do not let
+         * clients cache its file description until it is connected. */
+        if (!ret || sock->type != WS_SOCK_STREAM)
+#endif
         allow_fd_caching( sock->fd );
 
         unix_len = sizeof(unix_addr);
@@ -2808,6 +3050,11 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             {
                 sock->state = SOCK_CONNECTED;
                 sock->connect_time = current_time;
+#ifdef __APPLE__
+                free( sock->reconnect );
+                sock->reconnect = NULL;
+                sock->connect_failed = 0;
+#endif
             }
 
             if (!send_len) return;
