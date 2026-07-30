@@ -2705,6 +2705,30 @@ static VkFormat vk_format_from_component_type(enum wined3d_component_type compon
     return VK_FORMAT_UNDEFINED;
 }
 
+static VkFormat vk_vertex_format_from_wined3d(const struct wined3d_format *format,
+        const struct wined3d_shader *vertex_shader)
+{
+    if (!vertex_shader || vertex_shader->reg_maps.shader_version.major < 4)
+    {
+        switch (format->id)
+        {
+            case WINED3DFMT_R8G8B8A8_UINT:
+                return VK_FORMAT_R8G8B8A8_USCALED;
+
+            case WINED3DFMT_R16G16_SINT:
+                return VK_FORMAT_R16G16_SSCALED;
+
+            case WINED3DFMT_R16G16B16A16_SINT:
+                return VK_FORMAT_R16G16B16A16_SSCALED;
+
+            default:
+                break;
+        }
+    }
+
+    return wined3d_format_vk(format)->vk_format;
+}
+
 static bool wined3d_context_vk_update_graphics_pipeline_key(struct wined3d_context_vk *context_vk,
         const struct wined3d_state *state, VkPipelineLayout vk_pipeline_layout, uint32_t *null_buffer_binding)
 {
@@ -2749,6 +2773,7 @@ static bool wined3d_context_vk_update_graphics_pipeline_key(struct wined3d_conte
         VkVertexInputBindingDescription *b;
 
         wined3d_stream_info_from_declaration(&stream_info, state, d3d_info);
+        vertex_shader = state->shader[WINED3D_SHADER_TYPE_VERTEX];
         divisor_count = 0;
         for (i = 0, mask = 0, attribute_count = 0, binding_count = 0; i < ARRAY_SIZE(stream_info.elements); ++i)
         {
@@ -2765,7 +2790,7 @@ static bool wined3d_context_vk_update_graphics_pipeline_key(struct wined3d_conte
 
             a->location = i;
             a->binding = binding;
-            a->format = wined3d_format_vk(e->format)->vk_format;
+            a->format = vk_vertex_format_from_wined3d(e->format, vertex_shader);
             a->offset = (UINT_PTR)e->data.addr - state->streams[binding].offset;
 
             if (mask & (1u << binding))
@@ -2785,7 +2810,6 @@ static bool wined3d_context_vk_update_graphics_pipeline_key(struct wined3d_conte
             }
         }
 
-        vertex_shader = state->shader[WINED3D_SHADER_TYPE_VERTEX];
         if (vertex_shader && (mask = ~stream_info.use_map & vertex_shader->reg_maps.input_registers))
         {
             struct wined3d_shader_signature_element *element;
