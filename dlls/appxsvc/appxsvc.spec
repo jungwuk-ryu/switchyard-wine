@@ -1,1 +1,5 @@
 @ stdcall -private wine_appx_validate_archive_path(ptr long long ptr ptr)
+@ stdcall -private wine_appx_archive_open(ptr ptr long ptr)
+@ stdcall -private wine_appx_archive_close(ptr)
+@ stdcall -private wine_appx_archive_get_count(ptr ptr)
+@ stdcall -private wine_appx_archive_get_entry(ptr long ptr ptr ptr)

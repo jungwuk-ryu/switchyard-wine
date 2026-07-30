@@ -167,6 +167,10 @@ static void test_archive_path( void )
         "LPT1",
         "LPT9 .x",
         "lpt9.txt",
+        "xn--payload.exe",
+        "Dir/XN--name",
+        "_rels/item.rels",
+        "a/_RELS/b.RELS",
     };
     static const BYTE embedded_nul[] = {'a', 0, 'b'};
     static const BYTE control[] = {'a', 0x1f, 'b'};
@@ -174,6 +178,8 @@ static void test_archive_path( void )
     static const BYTE invalid_utf8_2[] = {0xed, 0xa0, 0x80};
     static const BYTE decomposed[] = {'c', 'a', 'f', 'e', 0xcc, 0x81};
     static const BYTE superscript_com[] = {'C', 'O', 'M', 0xc2, 0xb9};
+    static const BYTE noncharacter_fffe[] = {0xef, 0xbf, 0xbe};
+    static const BYTE noncharacter_ffff[] = {0xef, 0xbf, 0xbf};
     char component[WINE_APPX_MAX_COMPONENT_CHARS + 2];
     WCHAR wide_component[WINE_APPX_MAX_COMPONENT_CHARS + 1];
     WCHAR buffer[8];
@@ -185,6 +191,8 @@ static void test_archive_path( void )
     check_valid_path( "VFS/ProgramFilesX64/Example/app.exe", 0,
                       L"VFS\\ProgramFilesX64\\Example\\app.exe" );
     check_valid_path( "caf\xc3\xa9.txt", 0, L"caf\u00e9.txt" );
+    check_valid_path( "a\x7f" "b", 0, L"a\u007fb" );
+    check_valid_path( "_rels/item.txt", 0, L"_rels\\item.txt" );
     check_valid_path( "Assets/", WINE_APPX_PATH_DIRECTORY, L"Assets" );
 
     for (i = 0; i < ARRAY_SIZE(invalid_paths); i++)
@@ -195,6 +203,8 @@ static void test_archive_path( void )
     check_invalid_path( invalid_utf8_2, sizeof(invalid_utf8_2), 0 );
     check_invalid_path( decomposed, sizeof(decomposed), 0 );
     check_invalid_path( superscript_com, sizeof(superscript_com), 0 );
+    check_invalid_path( noncharacter_fffe, sizeof(noncharacter_fffe), 0 );
+    check_invalid_path( noncharacter_ffff, sizeof(noncharacter_ffff), 0 );
     check_invalid_path( (const BYTE *)"Assets", strlen("Assets"), WINE_APPX_PATH_DIRECTORY );
     check_invalid_path( (const BYTE *)"Assets//", strlen("Assets//"), WINE_APPX_PATH_DIRECTORY );
 

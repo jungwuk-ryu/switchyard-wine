@@ -73,12 +73,15 @@ static BOOL validate_component( const WCHAR *component, UINT32 length )
         return FALSE;
     if (component[length - 1] == '.' || component[length - 1] == ' ') return FALSE;
     if (is_reserved_component( component, length )) return FALSE;
+    if (length >= 4 && CompareStringOrdinal( component, 4, L"xn--", 4, TRUE ) == CSTR_EQUAL)
+        return FALSE;
 
     for (i = 0; i < length; i++)
     {
         WCHAR ch = component[i];
 
-        if (ch < 0x20 || ch == 0x7f || ch == '<' || ch == '>' || ch == ':' || ch == '"' ||
+        if (ch < 0x20 || ch == 0xfffe || ch == 0xffff ||
+            ch == '<' || ch == '>' || ch == ':' || ch == '"' ||
             ch == '\\' || ch == '|' || ch == '?' || ch == '*' || ch == 0)
             return FALSE;
     }
@@ -92,6 +95,7 @@ HRESULT WINAPI wine_appx_validate_archive_path( const BYTE *utf8, UINT32 utf8_le
     UINT32 component_start, i, input_length, required, capacity;
     WCHAR *decoded;
     int count;
+    BOOL has_relationships_directory = FALSE;
 
     TRACE( "utf8 %p, utf8_length %u, flags %#x, path_length %p, path %p.\n",
            utf8, utf8_length, flags, path_length, path );
@@ -154,7 +158,16 @@ HRESULT WINAPI wine_appx_validate_archive_path( const BYTE *utf8, UINT32 utf8_le
             HeapFree( GetProcessHeap(), 0, decoded );
             return APPX_E_INVALID_PACKAGING_LAYOUT;
         }
+        if (equal_name( decoded + component_start, i - component_start, L"_rels" ))
+            has_relationships_directory = TRUE;
         component_start = i + 1;
+    }
+
+    if (has_relationships_directory && count >= 5 &&
+        CompareStringOrdinal( decoded + count - 5, 5, L".rels", 5, TRUE ) == CSTR_EQUAL)
+    {
+        HeapFree( GetProcessHeap(), 0, decoded );
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
     }
 
     required = count + 1;

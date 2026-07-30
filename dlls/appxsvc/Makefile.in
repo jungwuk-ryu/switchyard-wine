@@ -3,5 +3,6 @@ IMPORTLIB = appxsvc
 IMPORTS   = kernelbase
 
 SOURCES = \
+	archive.c \
 	main.c \
 	path.c
