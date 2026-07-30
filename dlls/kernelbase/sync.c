@@ -1527,13 +1527,11 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetNamedPipeHandleStateW( HANDLE pipe, DWORD *stat
                                                         DWORD *max_count, DWORD *timeout,
                                                         WCHAR *user, DWORD size )
 {
+    FILE_PIPE_LOCAL_INFORMATION local_info;
     IO_STATUS_BLOCK io;
+    BOOL have_local_info = FALSE;
 
-    FIXME( "%p %p %p %p %p %p %ld: semi-stub\n", pipe, state, instances, max_count, timeout, user, size );
-
-    if (max_count) *max_count = 0;
-    if (timeout) *timeout = 0;
-    if (user && size && !GetEnvironmentVariableW( L"WINEUSERNAME", user, size )) user[0] = 0;
+    TRACE( "%p %p %p %p %p %p %ld\n", pipe, state, instances, max_count, timeout, user, size );
 
     if (state)
     {
@@ -1547,13 +1545,31 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetNamedPipeHandleStateW( HANDLE pipe, DWORD *stat
     }
     if (instances)
     {
-        FILE_PIPE_LOCAL_INFORMATION info;
-
-        if (!set_ntstatus( NtQueryInformationFile( pipe, &io, &info, sizeof(info),
+        if (!set_ntstatus( NtQueryInformationFile( pipe, &io, &local_info, sizeof(local_info),
                                                    FilePipeLocalInformation)))
             return FALSE;
-        *instances = info.CurrentInstances;
+        have_local_info = TRUE;
+        *instances = local_info.CurrentInstances;
     }
+
+    if (max_count || timeout || user)
+    {
+        if (!have_local_info &&
+            !set_ntstatus( NtQueryInformationFile( pipe, &io, &local_info, sizeof(local_info),
+                                                   FilePipeLocalInformation )))
+            return FALSE;
+
+        if (max_count || timeout)
+        {
+            RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
+            return FALSE;
+        }
+
+        RtlSetLastWin32Error( local_info.NamedPipeEnd == FILE_PIPE_SERVER_END
+                             ? ERROR_CANNOT_IMPERSONATE : ERROR_INVALID_FUNCTION );
+        return FALSE;
+    }
+
     return TRUE;
 }
 

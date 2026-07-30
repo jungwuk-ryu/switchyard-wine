@@ -2422,12 +2422,81 @@ static void test_overlapped_error(void)
     CloseHandle(event);
 }
 
+static void check_named_pipe_username_state(HANDLE pipe, DWORD expected_error)
+{
+    static const DWORD sizes[] = {0, 1, 4};
+    WCHAR userW[4];
+    char userA[4];
+    DWORD i;
+    BOOL ret;
+
+    for (i = 0; i < ARRAY_SIZE(sizes); i++)
+    {
+        memset(userA, 'z', sizeof(userA));
+        SetLastError(0xdeadbeef);
+        ret = GetNamedPipeHandleStateA(pipe, NULL, NULL, NULL, NULL, userA, sizes[i]);
+        ok(!ret && GetLastError() == expected_error, "size %lu expected error %lu, got %lu\n",
+           sizes[i], expected_error, GetLastError());
+        ok(userA[0] == 'z', "size %lu changed the ANSI username buffer to %02x\n",
+           sizes[i], (unsigned char)userA[0]);
+
+        memset(userW, 'z', sizeof(userW));
+        SetLastError(0xdeadbeef);
+        ret = GetNamedPipeHandleStateW(pipe, NULL, NULL, NULL, NULL, userW, sizes[i]);
+        ok(!ret && GetLastError() == expected_error, "size %lu expected error %lu, got %lu\n",
+           sizes[i], expected_error, GetLastError());
+        ok(userW[0] == 0x7a7a, "size %lu changed the Unicode username buffer to %04x\n",
+           sizes[i], userW[0]);
+    }
+
+    SetLastError(0xdeadbeef);
+    ret = GetNamedPipeHandleStateA(pipe, NULL, NULL, NULL, NULL, NULL, ARRAY_SIZE(userA));
+    ok(ret, "NULL ANSI username failed: %lu\n", GetLastError());
+    ok(GetLastError() == 0xdeadbeef, "NULL ANSI username changed last error to %lu\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = GetNamedPipeHandleStateW(pipe, NULL, NULL, NULL, NULL, NULL, ARRAY_SIZE(userW));
+    ok(ret, "NULL Unicode username failed: %lu\n", GetLastError());
+    ok(GetLastError() == 0xdeadbeef, "NULL Unicode username changed last error to %lu\n", GetLastError());
+}
+
 static void test_NamedPipeHandleState(void)
 {
-    HANDLE server, client;
+    HANDLE server, client, file;
     BOOL ret;
-    DWORD state, instances, maxCollectionCount, collectDataTimeout;
+    DWORD state, instances, maxCollectionCount, collectDataTimeout, len;
     char userName[MAX_PATH];
+
+    SetLastError(0xdeadbeef);
+    ret = GetNamedPipeHandleStateA(INVALID_HANDLE_VALUE, NULL, NULL, NULL, NULL, NULL, 0);
+    ok(ret, "all-NULL ANSI query failed for an invalid handle: %lu\n", GetLastError());
+    ok(GetLastError() == 0xdeadbeef, "all-NULL ANSI query changed last error to %lu\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = GetNamedPipeHandleStateW(INVALID_HANDLE_VALUE, NULL, NULL, NULL, NULL, NULL, 0);
+    ok(ret, "all-NULL Unicode query failed for an invalid handle: %lu\n", GetLastError());
+    ok(GetLastError() == 0xdeadbeef, "all-NULL Unicode query changed last error to %lu\n", GetLastError());
+
+    len = GetModuleFileNameA(NULL, userName, ARRAY_SIZE(userName));
+    ok(len && len < ARRAY_SIZE(userName), "GetModuleFileName failed: %lu\n", GetLastError());
+    file = INVALID_HANDLE_VALUE;
+    if (len && len < ARRAY_SIZE(userName))
+        file = CreateFileA(userName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    ok(file != INVALID_HANDLE_VALUE, "failed to open the test executable: %lu\n", GetLastError());
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        SetLastError(0xdeadbeef);
+        ret = GetNamedPipeHandleStateA(file, NULL, NULL, NULL, NULL, NULL, 0);
+        ok(ret, "all-NULL ANSI query failed for a regular file: %lu\n", GetLastError());
+        ok(GetLastError() == 0xdeadbeef, "all-NULL ANSI query changed last error to %lu\n", GetLastError());
+
+        SetLastError(0xdeadbeef);
+        ret = GetNamedPipeHandleStateW(file, NULL, NULL, NULL, NULL, NULL, 0);
+        ok(ret, "all-NULL Unicode query failed for a regular file: %lu\n", GetLastError());
+        ok(GetLastError() == 0xdeadbeef, "all-NULL Unicode query changed last error to %lu\n", GetLastError());
+        CloseHandle(file);
+    }
 
     server = CreateNamedPipeA(PIPENAME, PIPE_ACCESS_DUPLEX,
         /* dwOpenMode */ PIPE_TYPE_BYTE | PIPE_WAIT,
@@ -2450,12 +2519,18 @@ static void test_NamedPipeHandleState(void)
     /* Some parameters have no meaning, and therefore can't be retrieved,
      * on a local pipe.
      */
+    state = instances = maxCollectionCount = collectDataTimeout = 0xdeadbeef;
+    memset(userName, 'z', sizeof(userName));
     SetLastError(0xdeadbeef);
     ret = GetNamedPipeHandleStateA(server, &state, &instances, &maxCollectionCount,
         &collectDataTimeout, userName, ARRAY_SIZE(userName));
-    todo_wine
     ok(!ret && GetLastError() == ERROR_INVALID_PARAMETER,
        "expected ERROR_INVALID_PARAMETER, got %ld\n", GetLastError());
+    ok(!state, "unexpected state %08lx\n", state);
+    ok(instances == 1, "expected 1 instance, got %ld\n", instances);
+    ok(maxCollectionCount == 0xdeadbeef, "max collection count changed to %lu\n", maxCollectionCount);
+    ok(collectDataTimeout == 0xdeadbeef, "collection timeout changed to %lu\n", collectDataTimeout);
+    ok(userName[0] == 'z', "username buffer changed to %02x\n", (unsigned char)userName[0]);
     /* A byte-mode pipe server can't be changed to message mode. */
     state = PIPE_READMODE_MESSAGE;
     SetLastError(0xdeadbeef);
@@ -2466,6 +2541,9 @@ static void test_NamedPipeHandleState(void)
     client = CreateFileA(PIPENAME, GENERIC_READ|GENERIC_WRITE, 0, NULL,
         OPEN_EXISTING, 0, NULL);
     ok(client != INVALID_HANDLE_VALUE, "cf failed\n");
+
+    check_named_pipe_username_state(server, ERROR_CANNOT_IMPERSONATE);
+    check_named_pipe_username_state(client, ERROR_INVALID_FUNCTION);
 
     state = PIPE_READMODE_BYTE;
     ret = SetNamedPipeHandleState(client, &state, NULL, NULL);
@@ -2517,6 +2595,21 @@ static void test_NamedPipeHandleState(void)
     state = PIPE_READMODE_BYTE;
     ret = SetNamedPipeHandleState(client, &state, NULL, NULL);
     ok(ret, "SetNamedPipeHandleState failed: %ld\n", GetLastError());
+
+    CloseHandle(client);
+    CloseHandle(server);
+
+    ret = CreatePipe(&server, &client, NULL, 4096);
+    ok(ret, "CreatePipe failed: %ld\n", GetLastError());
+
+    state = instances = 0xdeadbeef;
+    ret = GetNamedPipeHandleStateA(server, &state, &instances, NULL, NULL, NULL, 0);
+    ok(ret, "GetNamedPipeHandleState failed: %ld\n", GetLastError());
+    ok(!state, "unexpected state %08lx\n", state);
+    ok(instances == 1, "expected 1 instance, got %ld\n", instances);
+
+    check_named_pipe_username_state(server, ERROR_CANNOT_IMPERSONATE);
+    check_named_pipe_username_state(client, ERROR_INVALID_FUNCTION);
 
     CloseHandle(client);
     CloseHandle(server);

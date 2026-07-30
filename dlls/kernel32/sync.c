@@ -564,20 +564,30 @@ BOOL WINAPI GetNamedPipeHandleStateA(
     LPSTR lpUsername, DWORD nUsernameMaxSize)
 {
     WCHAR *username = NULL;
+    WCHAR dummy;
     BOOL ret;
 
-    WARN("%p %p %p %p %p %p %ld: semi-stub\n", hNamedPipe, lpState, lpCurInstances,
-         lpMaxCollectionCount, lpCollectDataTimeout, lpUsername, nUsernameMaxSize);
+    TRACE("%p %p %p %p %p %p %ld\n", hNamedPipe, lpState, lpCurInstances,
+          lpMaxCollectionCount, lpCollectDataTimeout, lpUsername, nUsernameMaxSize);
 
-    if (lpUsername && nUsernameMaxSize &&
-        !(username = HeapAlloc(GetProcessHeap(), 0, nUsernameMaxSize * sizeof(WCHAR)))) return FALSE;
+    if (lpUsername)
+    {
+        if (!nUsernameMaxSize) username = &dummy;
+        else if (nUsernameMaxSize > ~(SIZE_T)0 / sizeof(WCHAR) ||
+                 !(username = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)nUsernameMaxSize * sizeof(WCHAR))))
+        {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+    }
 
     ret = GetNamedPipeHandleStateW(hNamedPipe, lpState, lpCurInstances, lpMaxCollectionCount,
                                    lpCollectDataTimeout, username, nUsernameMaxSize);
-    if (ret && username)
-        WideCharToMultiByte(CP_ACP, 0, username, -1, lpUsername, nUsernameMaxSize, NULL, NULL);
+    if (ret && username && nUsernameMaxSize)
+        ret = WideCharToMultiByte(CP_ACP, 0, username, -1, lpUsername,
+                                  nUsernameMaxSize, NULL, NULL) != 0;
 
-    HeapFree(GetProcessHeap(), 0, username);
+    if (username && username != &dummy) HeapFree(GetProcessHeap(), 0, username);
     return ret;
 }
 
