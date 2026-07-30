@@ -4221,6 +4221,7 @@ static void init_vulkan_format_info(struct wined3d_adapter *adapter, struct wine
         {WINED3DFMT_R32_FLOAT_X8X24_TYPELESS,   VK_FORMAT_D32_SFLOAT_S8_UINT,      },
         {WINED3DFMT_X32_TYPELESS_G8X24_UINT,    VK_FORMAT_D32_SFLOAT_S8_UINT,      },
         {WINED3DFMT_D24_UNORM_S8_UINT,          VK_FORMAT_D24_UNORM_S8_UINT,       },
+        {WINED3DFMT_X8D24_UNORM,                VK_FORMAT_D24_UNORM_S8_UINT,       },
         {WINED3DFMT_NV12_PLANAR,                VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,},
     };
     const struct wined3d_d3d_info *d3d_info = &adapter->d3d_info;
