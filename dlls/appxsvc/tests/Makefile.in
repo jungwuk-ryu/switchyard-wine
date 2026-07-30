@@ -1,0 +1,4 @@
+TESTDLL = appxsvc.dll
+
+SOURCES = \
+	path.c

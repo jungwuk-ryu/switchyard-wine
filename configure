@@ -1005,6 +1005,7 @@ enable_apisetschema
 enable_apphelp
 enable_appwiz_cpl
 enable_appxdeploymentclient
+enable_appxsvc
 enable_atiadlxx
 enable_atiadlxy
 enable_atl
@@ -22182,6 +22183,8 @@ wine_fn_config_makefile dlls/apphelp enable_apphelp
 wine_fn_config_makefile dlls/apphelp/tests enable_tests
 wine_fn_config_makefile dlls/appwiz.cpl enable_appwiz_cpl
 wine_fn_config_makefile dlls/appxdeploymentclient enable_appxdeploymentclient
+wine_fn_config_makefile dlls/appxsvc enable_appxsvc
+wine_fn_config_makefile dlls/appxsvc/tests enable_tests
 wine_fn_config_makefile dlls/atiadlxx enable_atiadlxx
 wine_fn_config_makefile dlls/atiadlxy enable_atiadlxy
 wine_fn_config_makefile dlls/atl enable_atl

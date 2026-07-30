@@ -1,0 +1,7 @@
+MODULE    = appxsvc.dll
+IMPORTLIB = appxsvc
+IMPORTS   = kernelbase
+
+SOURCES = \
+	main.c \
+	path.c
