@@ -11,10 +11,47 @@
 
 #define RING_SIZE 96
 #define ITERATIONS 40000
+#define ALERTABLE_WAIT_ITERATIONS 10000
 
 static HANDLE free_slots, filled_slots;
 static volatile LONG failures;
+static volatile LONG apc_count;
 static DWORD values[RING_SIZE];
+
+struct alertable_wait_context
+{
+    HANDLE waiting_thread;
+    HANDLE semaphores[2];
+};
+
+static VOID CALLBACK count_apc(ULONG_PTR arg)
+{
+    (void)arg;
+    InterlockedIncrement(&apc_count);
+}
+
+static DWORD WINAPI alertable_signal_thread(void *arg)
+{
+    struct alertable_wait_context *context = arg;
+    unsigned int i;
+
+    for (i = 0; i < ALERTABLE_WAIT_ITERATIONS; ++i)
+    {
+        if (!ReleaseSemaphore(context->semaphores[i & 1], 1, NULL))
+        {
+            InterlockedIncrement(&failures);
+            return 1;
+        }
+        if (!(i & 15) && !QueueUserAPC(count_apc, context->waiting_thread, 0))
+        {
+            InterlockedIncrement(&failures);
+            return 1;
+        }
+        if (!(i & 127)) SwitchToThread();
+    }
+
+    return 0;
+}
 
 static DWORD WINAPI producer_thread(void *arg)
 {
@@ -128,11 +165,88 @@ static int test_abandoned_mutex(void)
     return ret != WAIT_ABANDONED;
 }
 
-int main(void)
+static int test_alertable_wait_churn(void)
+{
+    struct alertable_wait_context context = {0};
+    HANDLE thread = NULL;
+    DWORD consumed = 0, ret;
+    int result = 1;
+
+    context.semaphores[0] = CreateSemaphoreW(NULL, 0, ALERTABLE_WAIT_ITERATIONS, NULL);
+    context.semaphores[1] = CreateSemaphoreW(NULL, 0, ALERTABLE_WAIT_ITERATIONS, NULL);
+    if (!context.semaphores[0] || !context.semaphores[1])
+    {
+        fprintf(stderr, "failed to create alertable wait semaphores\n");
+        goto done;
+    }
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                         &context.waiting_thread, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        fprintf(stderr, "failed to duplicate the waiting thread handle\n");
+        goto done;
+    }
+
+    apc_count = 0;
+    failures = 0;
+    thread = CreateThread(NULL, 0, alertable_signal_thread, &context, 0, NULL);
+    if (!thread)
+    {
+        fprintf(stderr, "failed to create the alertable signal thread\n");
+        goto done;
+    }
+
+    while (consumed < ALERTABLE_WAIT_ITERATIONS)
+    {
+        ret = WaitForMultipleObjectsEx(2, context.semaphores, FALSE, 10000, TRUE);
+        if (ret == WAIT_OBJECT_0 || ret == WAIT_OBJECT_0 + 1)
+            ++consumed;
+        else if (ret != WAIT_IO_COMPLETION)
+        {
+            fprintf(stderr, "alertable multiple wait failed: %lu after %lu signals\n",
+                    (unsigned long)ret, (unsigned long)consumed);
+            InterlockedIncrement(&failures);
+            break;
+        }
+    }
+
+    do
+        ret = WaitForSingleObjectEx(thread, 10000, TRUE);
+    while (ret == WAIT_IO_COMPLETION);
+    while (SleepEx(0, TRUE) == WAIT_IO_COMPLETION)
+        ;
+
+    if (ret != WAIT_OBJECT_0 || failures || !apc_count)
+    {
+        fprintf(stderr, "alertable churn failed: wait %lu, failures %ld, APCs %ld\n",
+                (unsigned long)ret, failures, apc_count);
+        goto done;
+    }
+
+    printf("msync alertable wait churn ok: %u signals, %ld APCs\n",
+           ALERTABLE_WAIT_ITERATIONS, apc_count);
+    result = 0;
+
+done:
+    if (thread) CloseHandle(thread);
+    if (context.waiting_thread) CloseHandle(context.waiting_thread);
+    if (context.semaphores[0]) CloseHandle(context.semaphores[0]);
+    if (context.semaphores[1]) CloseHandle(context.semaphores[1]);
+    return result;
+}
+
+int main(int argc, char **argv)
 {
     HANDLE producer, consumer;
     DWORD start = GetTickCount();
     DWORD ret;
+
+    if (argc == 2 && !strcmp(argv[1], "--alertable-race"))
+        return test_alertable_wait_churn();
+    if (argc != 1)
+    {
+        fprintf(stderr, "usage: %s [--alertable-race]\n", argv[0]);
+        return 2;
+    }
 
     free_slots = CreateSemaphoreW(NULL, RING_SIZE, RING_SIZE, NULL);
     filled_slots = CreateSemaphoreW(NULL, 0, RING_SIZE, NULL);
