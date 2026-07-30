@@ -4,6 +4,8 @@
 
 # Switchyard Wine
 
+[![GitHub Stars](https://img.shields.io/github/stars/jungwuk-ryu/switchyard-wine?style=flat&logo=github&label=Stars)](https://github.com/jungwuk-ryu/switchyard-wine/stargazers)
+
 Public downstream Wine runtime for the
 [Switchyard](https://github.com/jungwuk-ryu/Switchyard) macOS app.
 
