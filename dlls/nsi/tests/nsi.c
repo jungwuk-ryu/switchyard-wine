@@ -708,8 +708,8 @@ static void test_ip_forward( int family )
     MIB_IPFORWARD_TABLE2 *table;
     const NPI_MODULEID *mod = (family == AF_INET) ? &NPI_MS_IPV4_MODULEID : &NPI_MS_IPV6_MODULEID;
     DWORD key_size = (family == AF_INET) ? sizeof(*key4) : sizeof(*key6);
-    DWORD err, count, i, rw_size, dyn_size;
-    BOOL ipv4_loopback_mask_found = FALSE, ipv4_loopback_found = FALSE;
+    DWORD err, count, enum_count, i, rw_size, dyn_size;
+    BOOL ipv4_loopback_mask_found = FALSE, ipv4_loopback_found = FALSE, ipv6_loopback_found = FALSE;
 
     winetest_push_context( family == AF_INET ? "AF_INET" : "AF_INET6" );
 
@@ -733,7 +733,23 @@ static void test_ip_forward( int family )
         if (!err) break;
     }
     ok( !err, "got %ld\n", err );
+    if (err) { winetest_pop_context(); return; }
     dyn_size = dyn_sizes[i];
+
+    enum_count = 0;
+    err = NsiEnumerateObjectsAllParameters( 1, 1, mod, NSI_IP_FORWARD_TABLE, NULL, 0, NULL, 0,
+                                            NULL, 0, NULL, 0, &enum_count );
+    ok( !err, "got %ld\n", err );
+    if (count) ok( enum_count, "no routes enumerated\n" );
+
+    if (enum_count)
+    {
+        enum_count = 0;
+        err = NsiEnumerateObjectsAllParameters( 1, 1, mod, NSI_IP_FORWARD_TABLE, key_tbl, key_size,
+                                                NULL, 0, NULL, 0, NULL, 0, &enum_count );
+        ok( err == ERROR_MORE_DATA, "got %ld\n", err );
+        ok( !enum_count, "got %lu\n", enum_count );
+    }
 
     err = GetIpForwardTable2( family, &table );
     ok( !err, "got %ld\n", err );
@@ -753,6 +769,7 @@ static void test_ip_forward( int family )
             key4 = key_tbl + i;
             dyn4 = (struct nsi_ipv4_forward_dynamic *)((BYTE *)dyn_tbl + i * dyn_size);
 
+            ok( key4->prefix_len <= 32, "invalid prefix length %u\n", key4->prefix_len );
             ok( row->InterfaceLuid.Value == key4->luid.Value, "mismatch\n" );
             ok( row->InterfaceLuid.Value == key4->luid2.Value, "mismatch\n" );
             ok( row->DestinationPrefix.Prefix.Ipv4.sin_addr.s_addr == key4->prefix.s_addr, "mismatch\n" );
@@ -779,6 +796,9 @@ static void test_ip_forward( int family )
             key6 = (struct nsi_ipv6_forward_key *)key_tbl + i;
             dyn6 = (struct nsi_ipv6_forward_dynamic *)((BYTE *)dyn_tbl + i * dyn_size);
 
+            ok( key6->prefix_len <= 128, "invalid prefix length %u\n", key6->prefix_len );
+            if (!key6->prefix_len)
+                ok( IN6_IS_ADDR_UNSPECIFIED( &key6->prefix ), "default route prefix is not unspecified\n" );
             ok( row->InterfaceLuid.Value == key6->luid.Value, "mismatch\n" );
             ok( row->InterfaceLuid.Value == key6->luid2.Value, "mismatch\n" );
             ok( !memcmp( &row->DestinationPrefix.Prefix.Ipv6.sin6_addr, &key6->prefix, sizeof(key6->prefix) ),
@@ -792,6 +812,22 @@ static void test_ip_forward( int family )
             ok( row->NextHop.Ipv6.sin6_flowinfo == 0, "mismatch\n" );
             ok( row->NextHop.Ipv6.sin6_scope_id == 0, "mismatch\n" );
             ok( row->Age == dyn6->age, "mismatch\n" );
+
+            if (IN6_IS_ADDR_LINKLOCAL( &key6->prefix ))
+                ok( !key6->prefix.u.Byte[2] && !key6->prefix.u.Byte[3],
+                    "destination contains embedded scope %02x%02x\n",
+                    key6->prefix.u.Byte[2], key6->prefix.u.Byte[3] );
+            if (IN6_IS_ADDR_LINKLOCAL( &key6->next_hop ))
+                ok( !key6->next_hop.u.Byte[2] && !key6->next_hop.u.Byte[3],
+                    "next hop contains embedded scope %02x%02x\n",
+                    key6->next_hop.u.Byte[2], key6->next_hop.u.Byte[3] );
+            if (IN6_IS_ADDR_LOOPBACK( &key6->prefix ))
+            {
+                ipv6_loopback_found = TRUE;
+                ok( key6->prefix_len == 128, "got %u\n", key6->prefix_len );
+                ok( IN6_IS_ADDR_UNSPECIFIED( &key6->next_hop ), "loopback next hop is not unspecified\n" );
+                ok( rw->loopback, "loopback route is not marked loopback\n" );
+            }
         }
 
         ok( row->InterfaceIndex == stat->if_index, "mismatch\n" );
@@ -814,6 +850,8 @@ static void test_ip_forward( int family )
         ok( ipv4_loopback_mask_found, "127.0.0.0/8 not found.\n" );
         ok( ipv4_loopback_found, "127.0.0.1/32 not found.\n" );
     }
+    else if (count)
+        ok( ipv6_loopback_found, "::1/128 not found.\n" );
 
     FreeMibTable( table );
     NsiFreeTable( key_tbl, rw_tbl, dyn_tbl, stat_tbl );

@@ -23,6 +23,7 @@
 #endif
 
 #include "config.h"
+#include <errno.h>
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -190,6 +191,201 @@ static UINT mask_v6_to_prefix( struct in6_addr *addr )
     ret += nsi_popcount( *(UINT *)(addr->s6_addr + 12) );
     return ret;
 }
+
+#if defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP)
+
+/* XNU routing messages use ROUNDUP32(), independently of the native word size. */
+#ifdef __APPLE__
+#define ROUTE_SA_ALIGNMENT sizeof(UINT32)
+#else
+#define ROUTE_SA_ALIGNMENT sizeof(long)
+#endif
+
+struct route_message
+{
+    const struct rt_msghdr *header;
+    const struct sockaddr *addr[RTAX_MAX];
+};
+
+enum route_message_result
+{
+    ROUTE_MESSAGE_END,
+    ROUTE_MESSAGE_VALID,
+    ROUTE_MESSAGE_INVALID
+};
+
+static NTSTATUS get_route_table( int family, char **buffer, size_t *size )
+{
+    int mib[] = { CTL_NET, PF_ROUTE, 0, family, NET_RT_DUMP, 0 };
+    unsigned int attempt;
+
+    *buffer = NULL;
+    *size = 0;
+
+    for (attempt = 0; attempt < 10; ++attempt)
+    {
+        size_t allocated, extra, needed = 0;
+        int error;
+        char *data;
+
+        if (sysctl( mib, ARRAY_SIZE(mib), NULL, &needed, NULL, 0 ) < 0)
+            return STATUS_NOT_SUPPORTED;
+        if (!needed) return STATUS_SUCCESS;
+
+        extra = needed / 2;
+        allocated = needed <= ~(size_t)0 - extra ? needed + extra : needed;
+        if (!(data = malloc( allocated ))) return STATUS_NO_MEMORY;
+
+        needed = allocated;
+        if (!sysctl( mib, ARRAY_SIZE(mib), data, &needed, NULL, 0 ))
+        {
+            *buffer = data;
+            *size = needed;
+            return STATUS_SUCCESS;
+        }
+
+        error = errno;
+        free( data );
+        if (error != ENOMEM) return STATUS_NOT_SUPPORTED;
+    }
+
+    return STATUS_NOT_SUPPORTED;
+}
+
+static enum route_message_result route_message_parse( const char **cursor, const char *limit,
+                                                       struct route_message *message )
+{
+    const char *start = *cursor, *end, *ptr;
+    size_t remaining;
+    unsigned short msglen;
+    unsigned int i;
+
+    memset( message, 0, sizeof(*message) );
+    if (start == limit) return ROUTE_MESSAGE_END;
+    if (start > limit)
+    {
+        *cursor = limit;
+        return ROUTE_MESSAGE_INVALID;
+    }
+
+    remaining = limit - start;
+    if (remaining < sizeof(msglen))
+    {
+        *cursor = limit;
+        return ROUTE_MESSAGE_INVALID;
+    }
+    memcpy( &msglen, start, sizeof(msglen) );
+
+    if (msglen < sizeof(struct rt_msghdr) || msglen > remaining)
+    {
+        *cursor = limit;
+        return ROUTE_MESSAGE_INVALID;
+    }
+
+    end = start + msglen;
+    *cursor = end;
+    if (((UINT_PTR)start & (ROUTE_SA_ALIGNMENT - 1)) ||
+        (msglen & (ROUTE_SA_ALIGNMENT - 1)))
+        return ROUTE_MESSAGE_INVALID;
+
+    message->header = (const struct rt_msghdr *)start;
+    if ((unsigned int)message->header->rtm_addrs & ~((1u << RTAX_MAX) - 1))
+        return ROUTE_MESSAGE_INVALID;
+
+    ptr = (const char *)(message->header + 1);
+    for (i = 0; i < RTAX_MAX; ++i)
+    {
+        const struct sockaddr *sa;
+        size_t len, aligned;
+
+        if (!(message->header->rtm_addrs & (1u << i))) continue;
+        remaining = end - ptr;
+        if (remaining < FIELD_OFFSET(struct sockaddr, sa_data))
+            return ROUTE_MESSAGE_INVALID;
+
+        sa = (const struct sockaddr *)ptr;
+        len = sa->sa_len;
+        if (len && len < FIELD_OFFSET(struct sockaddr, sa_data))
+            return ROUTE_MESSAGE_INVALID;
+
+        aligned = len ? (len + ROUTE_SA_ALIGNMENT - 1) & ~(ROUTE_SA_ALIGNMENT - 1)
+                      : ROUTE_SA_ALIGNMENT;
+        if (len > remaining || aligned > remaining)
+            return ROUTE_MESSAGE_INVALID;
+
+        message->addr[i] = sa;
+        ptr += aligned;
+    }
+
+    if (ptr != end) return ROUTE_MESSAGE_INVALID;
+    return ROUTE_MESSAGE_VALID;
+}
+
+static BOOL route_get_ipv4_addr( const struct sockaddr *sa, struct in_addr *addr )
+{
+    struct sockaddr_in sin = {0};
+
+    if (!sa || sa->sa_family != AF_INET ||
+        sa->sa_len < FIELD_OFFSET(struct sockaddr_in, sin_addr) + sizeof(sin.sin_addr))
+        return FALSE;
+
+    memcpy( &sin, sa, min( sizeof(sin), sa->sa_len ) );
+    *addr = sin.sin_addr;
+    return TRUE;
+}
+
+static BOOL route_get_ipv6_addr( const struct sockaddr *sa, struct in6_addr *addr )
+{
+    struct sockaddr_in6 sin6 = {0};
+
+    if (!sa || sa->sa_family != AF_INET6 ||
+        sa->sa_len < FIELD_OFFSET(struct sockaddr_in6, sin6_addr) + sizeof(sin6.sin6_addr))
+        return FALSE;
+
+    memcpy( &sin6, sa, min( sizeof(sin6), sa->sa_len ) );
+    *addr = sin6.sin6_addr;
+    return TRUE;
+}
+
+static UINT route_get_prefix_len( const struct sockaddr *sa, int family )
+{
+    size_t offset, len;
+
+    if (!sa || !sa->sa_len) return 0;
+
+    if (family == AF_INET)
+    {
+        struct in_addr mask = {0};
+
+        offset = FIELD_OFFSET(struct sockaddr_in, sin_addr);
+        if (sa->sa_len <= offset) return 0;
+        len = min( sizeof(mask), sa->sa_len - offset );
+        memcpy( &mask, (const char *)sa + offset, len );
+        return mask_v4_to_prefix( &mask );
+    }
+    else
+    {
+        struct in6_addr mask = {0};
+
+        offset = FIELD_OFFSET(struct sockaddr_in6, sin6_addr);
+        if (sa->sa_len <= offset) return 0;
+        len = min( sizeof(mask), sa->sa_len - offset );
+        memcpy( &mask, (const char *)sa + offset, len );
+        return mask_v6_to_prefix( &mask );
+    }
+}
+
+static void route_clear_ipv6_scope( struct in6_addr *addr )
+{
+    if (IN6_IS_ADDR_LINKLOCAL( addr ) || IN6_IS_ADDR_MC_NODELOCAL( addr ) ||
+        IN6_IS_ADDR_MC_LINKLOCAL( addr ))
+    {
+        addr->s6_addr[2] = 0;
+        addr->s6_addr[3] = 0;
+    }
+}
+
+#endif
 
 static ULONG64 get_boot_time( void )
 {
@@ -1446,6 +1642,98 @@ struct ipv4_route_data
     BYTE loopback;
 };
 
+#if defined(__linux__) || (defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP))
+struct ipv6_route_data
+{
+    NET_LUID luid;
+    UINT if_index;
+    struct in6_addr prefix;
+    UINT prefix_len;
+    struct in6_addr next_hop;
+    UINT metric;
+    UINT protocol;
+    BYTE loopback;
+};
+#endif
+
+#if defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP)
+
+static BOOL route_message_to_ipv4( const struct route_message *message, struct ipv4_route_data *entry )
+{
+    const struct rt_msghdr *rtm = message->header;
+    const struct sockaddr *gateway = message->addr[RTAX_GATEWAY];
+
+    memset( entry, 0, sizeof(*entry) );
+    if ((rtm->rtm_flags & RTF_GATEWAY) && (rtm->rtm_flags & RTF_MULTICAST))
+        return FALSE;
+    if (!route_get_ipv4_addr( message->addr[RTAX_DST], &entry->prefix ))
+        return FALSE;
+
+    entry->if_index = rtm->rtm_index;
+    entry->protocol = (rtm->rtm_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
+    entry->metric = rtm->rtm_rmx.rmx_hopcount;
+    entry->prefix_len = (rtm->rtm_flags & RTF_HOST) ? 32 :
+                        route_get_prefix_len( message->addr[RTAX_NETMASK], AF_INET );
+
+    if (gateway && entry->protocol == MIB_IPPROTO_NETMGMT)
+    {
+        if (gateway->sa_family == AF_INET)
+        {
+            if (!route_get_ipv4_addr( gateway, &entry->next_hop )) return FALSE;
+        }
+#ifdef AF_LINK
+        else if (gateway->sa_family == AF_LINK)
+        {
+            entry->next_hop = entry->prefix;
+        }
+#endif
+        else return FALSE;
+    }
+
+    entry->loopback = entry->protocol == MIB_IPPROTO_LOCAL && entry->prefix_len == 32;
+    return TRUE;
+}
+
+static BOOL route_message_to_ipv6( const struct route_message *message, struct ipv6_route_data *entry )
+{
+    const struct rt_msghdr *rtm = message->header;
+    const struct sockaddr *gateway = message->addr[RTAX_GATEWAY];
+
+    memset( entry, 0, sizeof(*entry) );
+    if ((rtm->rtm_flags & RTF_GATEWAY) && (rtm->rtm_flags & RTF_MULTICAST))
+        return FALSE;
+    if (!route_get_ipv6_addr( message->addr[RTAX_DST], &entry->prefix ))
+        return FALSE;
+
+    route_clear_ipv6_scope( &entry->prefix );
+    entry->if_index = rtm->rtm_index;
+    entry->protocol = (rtm->rtm_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
+    entry->metric = rtm->rtm_rmx.rmx_hopcount;
+    entry->prefix_len = (rtm->rtm_flags & RTF_HOST) ? 128 :
+                        route_get_prefix_len( message->addr[RTAX_NETMASK], AF_INET6 );
+
+    if (gateway && entry->protocol == MIB_IPPROTO_NETMGMT)
+    {
+        if (gateway->sa_family == AF_INET6)
+        {
+            if (!route_get_ipv6_addr( gateway, &entry->next_hop )) return FALSE;
+            route_clear_ipv6_scope( &entry->next_hop );
+        }
+#ifdef AF_LINK
+        else if (gateway->sa_family == AF_LINK)
+        {
+            entry->next_hop = entry->prefix;
+        }
+#endif
+        else return FALSE;
+    }
+
+    entry->loopback = entry->prefix_len == 128 && IN6_IS_ADDR_LOOPBACK( &entry->prefix );
+    return TRUE;
+}
+
+#endif
+
 static void ipv4_forward_fill_entry( struct ipv4_route_data *entry, struct nsi_ipv4_forward_key *key,
                                      struct nsi_ip_forward_rw *rw, struct nsi_ipv4_forward_dynamic *dyn,
                                      struct nsi_ip_forward_static *stat )
@@ -1585,115 +1873,42 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void 
     }
 #elif defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP)
     {
-        int mib[6] = { CTL_NET, PF_ROUTE, 0, PF_INET, NET_RT_DUMP, 0 };
         size_t needed;
-        char *buf = NULL, *lim, *next, *addr_ptr;
-        struct rt_msghdr *rtm;
+        char *buf;
+        const char *lim, *next;
 
-        if (sysctl( mib, ARRAY_SIZE(mib), NULL, &needed, NULL, 0 ) < 0) return STATUS_NOT_SUPPORTED;
+        if ((status = get_route_table( AF_INET, &buf, &needed ))) return status;
 
-        buf = malloc( needed );
-        if (!buf) return STATUS_NO_MEMORY;
-
-        if (sysctl( mib, 6, buf, &needed, NULL, 0 ) < 0)
+        if (buf)
         {
-            free( buf );
-            return STATUS_NOT_SUPPORTED;
-        }
-
-        lim = buf + needed;
-        for (next = buf; next < lim; next += rtm->rtm_msglen)
-        {
-            int i;
-            sa_family_t dst_family = AF_UNSPEC;
-
-            rtm = (struct rt_msghdr *)next;
-
-            if (rtm->rtm_type != RTM_GET)
+            lim = buf + needed;
+            next = buf;
+            for (;;)
             {
-                WARN( "Got unexpected message type 0x%x!\n", rtm->rtm_type );
-                continue;
+                struct route_message message;
+                enum route_message_result result = route_message_parse( &next, lim, &message );
+
+                if (result == ROUTE_MESSAGE_END) break;
+                if (result == ROUTE_MESSAGE_INVALID)
+                {
+                    WARN( "Ignoring malformed IPv4 routing message\n" );
+                    continue;
+                }
+                if (message.header->rtm_version != RTM_VERSION || message.header->rtm_type != RTM_GET)
+                    continue;
+                if (!route_message_to_ipv4( &message, &entry )) continue;
+                if (!convert_index_to_luid( entry.if_index, &entry.luid )) continue;
+
+                if (num < *count)
+                {
+                    ipv4_forward_fill_entry( &entry, key_data, rw_data, dynamic_data, static_data );
+                    key_data = (BYTE *)key_data + key_size;
+                    rw_data = (BYTE *)rw_data + rw_size;
+                    dynamic_data = (BYTE *)dynamic_data + dynamic_size;
+                    static_data = (BYTE *)static_data + static_size;
+                }
+                num++;
             }
-
-            /* Ignore gateway routes which are multicast */
-            if ((rtm->rtm_flags & RTF_GATEWAY) && (rtm->rtm_flags & RTF_MULTICAST)) continue;
-
-            entry.if_index = rtm->rtm_index;
-            if (!convert_index_to_luid( entry.if_index, &entry.luid )) continue;
-            entry.protocol = (rtm->rtm_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
-            entry.metric = rtm->rtm_rmx.rmx_hopcount;
-
-            addr_ptr = (char *)(rtm + 1);
-
-            for (i = 1; i; i <<= 1)
-            {
-                struct sockaddr *sa;
-                struct in_addr addr;
-
-                if (!(i & rtm->rtm_addrs)) continue;
-
-                sa = (struct sockaddr *)addr_ptr;
-                if (addr_ptr + sa->sa_len > next + rtm->rtm_msglen)
-                {
-                    ERR( "struct sockaddr extends beyond the route message, %p > %p\n",
-                         addr_ptr + sa->sa_len, next + rtm->rtm_msglen );
-                }
-
-                if (sa->sa_len) addr_ptr += (sa->sa_len + sizeof(int)-1) & ~(sizeof(int)-1);
-                else addr_ptr += sizeof(int);
-                /* Apple's netstat prints the netmask together with the destination
-                 * and only looks at the destination's address family. The netmask's
-                 * sa_family sometimes contains the non-existent value 0xff. */
-                switch (i == RTA_NETMASK ? dst_family : sa->sa_family)
-                {
-                case AF_INET:
-                {
-                    /* Netmasks (and possibly other addresses) have only enough size
-                     * to represent the non-zero bits, e.g. a netmask of 255.0.0.0 has
-                     * 5 bytes (1 sa_len, 1 sa_family, 2 sa_port and 1 for the first
-                     * byte of sin_addr). */
-                    struct sockaddr_in sin = {0};
-                    memcpy( &sin, sa, sa->sa_len );
-                    addr = sin.sin_addr;
-                    break;
-                }
-#ifdef AF_LINK
-                case AF_LINK:
-                    if (i == RTA_GATEWAY && entry.protocol ==  MIB_IPPROTO_NETMGMT)
-                    {
-                        /* For direct route we may simply use dest addr as next hop */
-                        C_ASSERT(RTA_DST < RTA_GATEWAY);
-                        addr = entry.prefix;
-                        break;
-                    }
-                    /* fallthrough */
-#endif
-                default:
-                    WARN( "Received unsupported sockaddr family 0x%x\n", sa->sa_family );
-                    addr.s_addr = 0;
-                }
-                switch (i)
-                {
-                case RTA_DST:
-                    entry.prefix = addr;
-                    dst_family = sa->sa_family;
-                    break;
-                case RTA_GATEWAY: entry.next_hop = addr; break;
-                case RTA_NETMASK: entry.prefix_len = mask_v4_to_prefix( &addr ); break;
-                default:
-                    WARN( "Unexpected address type 0x%x\n", i );
-                }
-            }
-
-            if (num < *count)
-            {
-                ipv4_forward_fill_entry( &entry, key_data, rw_data, dynamic_data, static_data );
-                key_data = (BYTE *)key_data + key_size;
-                rw_data = (BYTE *)rw_data + rw_size;
-                dynamic_data = (BYTE *)dynamic_data + dynamic_size;
-                static_data = (BYTE *)static_data + static_size;
-            }
-            num++;
         }
         free( buf );
     }
@@ -1708,19 +1923,7 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void 
     return status;
 }
 
-#ifdef __linux__
-struct ipv6_route_data
-{
-    NET_LUID luid;
-    UINT if_index;
-    struct in6_addr prefix;
-    UINT prefix_len;
-    struct in6_addr next_hop;
-    UINT metric;
-    UINT protocol;
-    BYTE loopback;
-};
-
+#if defined(__linux__) || (defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP))
 static void ipv6_forward_fill_entry( struct ipv6_route_data *entry, struct nsi_ipv6_forward_key *key,
                                      struct nsi_ip_forward_rw *rw, struct nsi_ipv6_forward_dynamic *dyn,
                                      struct nsi_ip_forward_static *stat )
@@ -1766,11 +1969,13 @@ static void ipv6_forward_fill_entry( struct ipv6_route_data *entry, struct nsi_i
 }
 #endif
 
-struct in6_addr str_to_in6_addr(char *nptr, char **endptr)
+#ifdef __linux__
+static struct in6_addr str_to_in6_addr( char *nptr, char **endptr )
 {
-    struct in6_addr ret;
+    struct in6_addr ret = {0};
+    unsigned int i;
 
-    for (int i = 0; i < sizeof(ret); i++)
+    for (i = 0; i < sizeof(ret.s6_addr); i++)
     {
         if (!isxdigit( *nptr ) || !isxdigit( *(nptr + 1) ))
         {
@@ -1787,6 +1992,7 @@ struct in6_addr str_to_in6_addr(char *nptr, char **endptr)
 
     return ret;
 }
+#endif
 
 static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void *rw_data, UINT rw_size,
                                             void *dynamic_data, UINT dynamic_size,
@@ -1814,6 +2020,7 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void 
 
         while ((ptr = fgets( buf, sizeof(buf), fp )))
         {
+            memset( &entry, 0, sizeof(entry) );
             entry.prefix = str_to_in6_addr( ptr, &ptr );
             entry.prefix_len = strtoul( ptr + 1, &ptr, 16 );
             str_to_in6_addr( ptr + 1, &ptr ); /* source network, skip */
@@ -1822,10 +2029,10 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void 
             entry.metric = strtoul( ptr + 1, &ptr, 16 );
             strtoul( ptr + 1, &ptr, 16 ); /* refcount, skip */
             strtoul( ptr + 1, &ptr, 16 ); /* use, skip */
-            rtf_flags = strtoul( ptr + 1, &ptr, 16);
+            rtf_flags = strtoul( ptr + 1, &ptr, 16 );
             if (!(rtf_flags & RTF_UP)) continue;
             entry.protocol = (rtf_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
-            entry.loopback = entry.prefix_len == 128 && IN6_IS_ADDR_LOOPBACK(&entry.prefix);
+            entry.loopback = entry.prefix_len == 128 && IN6_IS_ADDR_LOOPBACK( &entry.prefix );
 
             while (isspace( *ptr )) ptr++;
             end = ptr;
@@ -1844,7 +2051,49 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void 
             }
             num++;
         }
-        fclose(fp);
+        fclose( fp );
+    }
+#elif defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP)
+    {
+        struct ipv6_route_data entry;
+        size_t needed;
+        char *buf;
+        const char *lim, *next;
+
+        if ((status = get_route_table( AF_INET6, &buf, &needed ))) return status;
+
+        if (buf)
+        {
+            lim = buf + needed;
+            next = buf;
+            for (;;)
+            {
+                struct route_message message;
+                enum route_message_result result = route_message_parse( &next, lim, &message );
+
+                if (result == ROUTE_MESSAGE_END) break;
+                if (result == ROUTE_MESSAGE_INVALID)
+                {
+                    WARN( "Ignoring malformed IPv6 routing message\n" );
+                    continue;
+                }
+                if (message.header->rtm_version != RTM_VERSION || message.header->rtm_type != RTM_GET)
+                    continue;
+                if (!route_message_to_ipv6( &message, &entry )) continue;
+                if (!convert_index_to_luid( entry.if_index, &entry.luid )) continue;
+
+                if (num < *count)
+                {
+                    ipv6_forward_fill_entry( &entry, key_data, rw_data, dynamic_data, static_data );
+                    key_data = (BYTE *)key_data + key_size;
+                    rw_data = (BYTE *)rw_data + rw_size;
+                    dynamic_data = (BYTE *)dynamic_data + dynamic_size;
+                    static_data = (BYTE *)static_data + static_size;
+                }
+                num++;
+            }
+        }
+        free( buf );
     }
 #else
     FIXME( "not implemented\n" );
