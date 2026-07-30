@@ -4678,6 +4678,115 @@ static void test_LOGFONT_charset(void)
     ok(ncm.lfSmCaptionFont.lfCharSet == DEFAULT_CHARSET, "got %d\n", ncm.lfSmCaptionFont.lfCharSet);
 }
 
+static void test_high_contrast(void)
+{
+    static const UINT w_params[] = {0, 1, sizeof(HIGHCONTRASTW)};
+    static const UINT a_params[] = {0, 1, sizeof(HIGHCONTRASTA)};
+    HIGHCONTRASTW high_contrastW;
+    HIGHCONTRASTA high_contrastA;
+    WCHAR *schemeW;
+    char *schemeA, *expected;
+    BOOL ret;
+    UINT i;
+    int len;
+
+    memset( &high_contrastW, 0xcc, sizeof(high_contrastW) );
+    high_contrastW.cbSize = 0;
+    schemeW = high_contrastW.lpszDefaultScheme;
+    SetLastError( 0xdeadbeef );
+    ret = SystemParametersInfoW( SPI_GETHIGHCONTRAST, 0, &high_contrastW, 0 );
+    ok( !ret, "SystemParametersInfoW succeeded with a zero structure size\n" );
+    ok( GetLastError() == 0xdeadbeef, "got error %lu\n", GetLastError() );
+    ok( high_contrastW.dwFlags == 0xcccccccc, "got flags %#lx\n", high_contrastW.dwFlags );
+    ok( high_contrastW.lpszDefaultScheme == schemeW, "got scheme pointer %p, expected %p\n",
+        high_contrastW.lpszDefaultScheme, schemeW );
+
+    high_contrastW.cbSize = sizeof(high_contrastW) - 1;
+    ret = SystemParametersInfoW( SPI_GETHIGHCONTRAST, sizeof(high_contrastW), &high_contrastW, 0 );
+    ok( !ret, "SystemParametersInfoW succeeded with a short structure\n" );
+    high_contrastW.cbSize = sizeof(high_contrastW) + 1;
+    ret = SystemParametersInfoW( SPI_GETHIGHCONTRAST, sizeof(high_contrastW), &high_contrastW, 0 );
+    ok( !ret, "SystemParametersInfoW succeeded with a long structure\n" );
+
+    SetLastError( 0xdeadbeef );
+    ret = SystemParametersInfoW( SPI_GETHIGHCONTRAST, sizeof(high_contrastW), NULL, 0 );
+    ok( !ret, "SystemParametersInfoW succeeded with a NULL structure\n" );
+    ok( GetLastError() == 0xdeadbeef, "got error %lu\n", GetLastError() );
+
+    for (i = 0; i < ARRAY_SIZE(w_params); i++)
+    {
+        memset( &high_contrastW, 0xcc, sizeof(high_contrastW) );
+        high_contrastW.cbSize = sizeof(high_contrastW);
+        SetLastError( 0xdeadbeef );
+        ret = SystemParametersInfoW( SPI_GETHIGHCONTRAST, w_params[i], &high_contrastW, 0 );
+        ok( ret, "SystemParametersInfoW failed for uiParam %u, error %lu\n",
+            w_params[i], GetLastError() );
+        if (!ret) continue;
+        ok( high_contrastW.lpszDefaultScheme != NULL, "got a NULL scheme pointer\n" );
+        if (!high_contrastW.lpszDefaultScheme) continue;
+        ok( LocalSize( high_contrastW.lpszDefaultScheme ) ==
+            max( 256, (lstrlenW( high_contrastW.lpszDefaultScheme ) + 1) * sizeof(WCHAR) ),
+            "got scheme allocation size %Iu\n", LocalSize( high_contrastW.lpszDefaultScheme ) );
+        ok( LocalFlags( high_contrastW.lpszDefaultScheme ) != LMEM_INVALID_HANDLE,
+            "scheme is not a local allocation\n" );
+        ok( LocalFree( high_contrastW.lpszDefaultScheme ) == NULL, "LocalFree failed\n" );
+    }
+
+    memset( &high_contrastA, 0xcc, sizeof(high_contrastA) );
+    high_contrastA.cbSize = 0;
+    schemeA = high_contrastA.lpszDefaultScheme;
+    SetLastError( 0xdeadbeef );
+    ret = SystemParametersInfoA( SPI_GETHIGHCONTRAST, 0, &high_contrastA, 0 );
+    ok( !ret, "SystemParametersInfoA succeeded with a zero structure size\n" );
+    ok( GetLastError() == 0xdeadbeef, "got error %lu\n", GetLastError() );
+    ok( high_contrastA.dwFlags == 0xcccccccc, "got flags %#lx\n", high_contrastA.dwFlags );
+    ok( high_contrastA.lpszDefaultScheme == schemeA, "got scheme pointer %p, expected %p\n",
+        high_contrastA.lpszDefaultScheme, schemeA );
+
+    for (i = 0; i < ARRAY_SIZE(a_params); i++)
+    {
+        memset( &high_contrastW, 0xcc, sizeof(high_contrastW) );
+        high_contrastW.cbSize = sizeof(high_contrastW);
+        ret = SystemParametersInfoW( SPI_GETHIGHCONTRAST, 0, &high_contrastW, 0 );
+        ok( ret, "SystemParametersInfoW failed, error %lu\n", GetLastError() );
+        if (!ret) break;
+
+        len = WideCharToMultiByte( CP_ACP, 0, high_contrastW.lpszDefaultScheme, -1,
+                                   NULL, 0, NULL, NULL );
+        expected = len ? malloc( len ) : NULL;
+        ok( expected != NULL, "failed to allocate an expected scheme string\n" );
+        if (expected)
+            WideCharToMultiByte( CP_ACP, 0, high_contrastW.lpszDefaultScheme, -1,
+                                 expected, len, NULL, NULL );
+
+        memset( &high_contrastA, 0xcc, sizeof(high_contrastA) );
+        high_contrastA.cbSize = sizeof(high_contrastA);
+        ret = SystemParametersInfoA( SPI_GETHIGHCONTRAST, a_params[i], &high_contrastA, 0 );
+        ok( ret, "SystemParametersInfoA failed for uiParam %u, error %lu\n",
+            a_params[i], GetLastError() );
+        if (ret)
+        {
+            ok( high_contrastA.dwFlags == high_contrastW.dwFlags,
+                "got flags %#lx, expected %#lx\n", high_contrastA.dwFlags, high_contrastW.dwFlags );
+            ok( high_contrastA.lpszDefaultScheme != NULL, "got a NULL scheme pointer\n" );
+            if (high_contrastA.lpszDefaultScheme)
+            {
+                if (expected) ok( !strcmp( high_contrastA.lpszDefaultScheme, expected ),
+                                  "got scheme %s, expected %s\n",
+                                  debugstr_a(high_contrastA.lpszDefaultScheme), debugstr_a(expected) );
+                ok( LocalSize( high_contrastA.lpszDefaultScheme ) ==
+                    max( 256, lstrlenA( high_contrastA.lpszDefaultScheme ) + 1 ),
+                    "got scheme allocation size %Iu\n", LocalSize( high_contrastA.lpszDefaultScheme ) );
+                ok( LocalFlags( high_contrastA.lpszDefaultScheme ) != LMEM_INVALID_HANDLE,
+                    "scheme is not a local allocation\n" );
+                ok( LocalFree( high_contrastA.lpszDefaultScheme ) == NULL, "LocalFree failed\n" );
+            }
+        }
+        free( expected );
+        LocalFree( high_contrastW.lpszDefaultScheme );
+    }
+}
+
 START_TEST(sysparams)
 {
     int argc;
@@ -4717,6 +4826,8 @@ START_TEST(sysparams)
     dpi = GetDeviceCaps( hdc, LOGPIXELSY);
     real_dpi = get_real_dpi();
     ReleaseDC( 0, hdc);
+
+    test_high_contrast();
 
     /* This test requires interactivity, if we don't have it, give up */
     if (!SystemParametersInfoA( SPI_SETBEEP, TRUE, 0, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE ) &&

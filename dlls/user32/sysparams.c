@@ -41,6 +41,49 @@ static CRITICAL_SECTION display_dc_section = { &critsect_debug, -1 ,0, 0, 0, 0 }
 /* System parameters storage */
 static UINT system_dpi;
 
+static WCHAR *get_high_contrast_scheme(void)
+{
+    static const WCHAR keyW[] = L"Control Panel\\Accessibility\\HighContrast";
+    static const WCHAR valueW[] = L"High Contrast Scheme";
+    WCHAR *scheme;
+    DWORD capacity, size;
+    LSTATUS status;
+    unsigned int attempt;
+
+    for (attempt = 0; attempt < 4; attempt++)
+    {
+        size = 0;
+        status = RegGetValueW( HKEY_CURRENT_USER, keyW, valueW, RRF_RT_REG_SZ, NULL, NULL, &size );
+        if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND || status == ERROR_UNSUPPORTED_TYPE)
+            size = sizeof(WCHAR);
+        else if (status && status != ERROR_MORE_DATA)
+            size = sizeof(WCHAR);
+        else if (size < sizeof(WCHAR))
+            size = sizeof(WCHAR);
+
+        capacity = max( size, 256u );
+        if (!(scheme = LocalAlloc( LMEM_FIXED, capacity )))
+        {
+            SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+            return NULL;
+        }
+        scheme[0] = 0;
+
+        size = capacity;
+        status = RegGetValueW( HKEY_CURRENT_USER, keyW, valueW, RRF_RT_REG_SZ, NULL, scheme, &size );
+        if (!status) return scheme;
+        if (status != ERROR_MORE_DATA)
+        {
+            scheme[0] = 0;
+            return scheme;
+        }
+        LocalFree( scheme );
+    }
+
+    SetLastError( ERROR_MORE_DATA );
+    return NULL;
+}
+
 static void SYSPARAMS_LogFont32WTo32A( const LOGFONTW* font32W, LPLOGFONTA font32A )
 {
     font32A->lfHeight = font32W->lfHeight;
@@ -247,7 +290,22 @@ BOOL WINAPI SystemParametersInfoForDpi( UINT action, UINT val, PVOID ptr, UINT w
  */
 BOOL WINAPI SystemParametersInfoW( UINT action, UINT val, void *ptr, UINT winini )
 {
-    BOOL ret = NtUserSystemParametersInfo( action, val, ptr, winini );
+    BOOL ret;
+
+    if (action == SPI_GETHIGHCONTRAST)
+    {
+        HIGHCONTRASTW *high_contrast = ptr, tmp = {.cbSize = sizeof(tmp)};
+        WCHAR *scheme;
+
+        if (!high_contrast || high_contrast->cbSize != sizeof(*high_contrast)) return FALSE;
+        if (!NtUserSystemParametersInfo( action, val, &tmp, winini )) return FALSE;
+        if (!(scheme = get_high_contrast_scheme())) return FALSE;
+        high_contrast->dwFlags = tmp.dwFlags;
+        high_contrast->lpszDefaultScheme = scheme;
+        return TRUE;
+    }
+
+    ret = NtUserSystemParametersInfo( action, val, ptr, winini );
     if (ret && (action == SPI_SETDESKWALLPAPER || action == SPI_SETDESKPATTERN))
         ret = update_desktop_wallpaper();
     return ret;
@@ -360,21 +418,40 @@ BOOL WINAPI SystemParametersInfoA( UINT uiAction, UINT uiParam,
 
     case SPI_GETHIGHCONTRAST:			/*     66  WINVER >= 0x400 */
     {
-	HIGHCONTRASTW tmp;
+        HIGHCONTRASTW tmp = {.cbSize = sizeof(tmp)};
         LPHIGHCONTRASTA lphcA = pvParam;
-	if (lphcA && lphcA->cbSize == sizeof(HIGHCONTRASTA))
-	{
-	    tmp.cbSize = sizeof(HIGHCONTRASTW);
-	    ret = SystemParametersInfoW( uiAction, uiParam, &tmp, fuWinIni );
-	    if (ret)
-	    {
-		lphcA->dwFlags = tmp.dwFlags;
-		lphcA->lpszDefaultScheme = NULL;  /* FIXME? */
-	    }
-	}
-	else
-	    ret = FALSE;
-	break;
+        char *scheme;
+        SIZE_T capacity;
+        int size;
+
+        if (!lphcA || lphcA->cbSize != sizeof(*lphcA))
+        {
+            ret = FALSE;
+            break;
+        }
+        if (!(ret = SystemParametersInfoW( uiAction, uiParam, &tmp, fuWinIni ))) break;
+
+        size = WideCharToMultiByte( CP_ACP, 0, tmp.lpszDefaultScheme, -1, NULL, 0, NULL, NULL );
+        capacity = max( size, 256 );
+        if (!size || !(scheme = LocalAlloc( LMEM_FIXED, capacity )))
+        {
+            if (size) SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+            LocalFree( tmp.lpszDefaultScheme );
+            ret = FALSE;
+            break;
+        }
+        if (!WideCharToMultiByte( CP_ACP, 0, tmp.lpszDefaultScheme, -1, scheme, size, NULL, NULL ))
+        {
+            LocalFree( scheme );
+            LocalFree( tmp.lpszDefaultScheme );
+            ret = FALSE;
+            break;
+        }
+
+        LocalFree( tmp.lpszDefaultScheme );
+        lphcA->dwFlags = tmp.dwFlags;
+        lphcA->lpszDefaultScheme = scheme;
+        break;
     }
 
     case SPI_GETDESKWALLPAPER:                  /*     115 */

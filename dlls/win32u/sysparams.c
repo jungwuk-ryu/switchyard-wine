@@ -191,6 +191,7 @@ enum parameter_key
     KEYBOARDPREF_KEY,
     SCREENREADER_KEY,
     AUDIODESC_KEY,
+    HIGHCONTRAST_KEY,
     NB_PARAM_KEYS
 };
 
@@ -207,6 +208,7 @@ static const char *parameter_key_names[NB_PARAM_KEYS] =
     "Control Panel\\Accessibility\\Keyboard Preference",
     "Control Panel\\Accessibility\\Blind Access",
     "Control Panel\\Accessibility\\AudioDescription",
+    "Control Panel\\Accessibility\\HighContrast",
 };
 
 /* System parameters storage */
@@ -5613,6 +5615,9 @@ static UINT_ENTRY( MOUSETRAILS, 0, MOUSE_KEY, "MouseTrails" );
 static UINT_ENTRY( SCREENSAVETIMEOUT, 300, DESKTOP_KEY, "ScreenSaveTimeOut" );
 static UINT_ENTRY( WHEELSCROLLCHARS, 3, DESKTOP_KEY, "WheelScrollChars" );
 static UINT_ENTRY( WHEELSCROLLLINES, 3, DESKTOP_KEY, "WheelScrollLines" );
+static UINT_ENTRY( HIGHCONTRAST_FLAGS, HCF_AVAILABLE | HCF_HOTKEYACTIVE | HCF_CONFIRMHOTKEY |
+                   HCF_HOTKEYSOUND | HCF_INDICATOR | HCF_HOTKEYAVAILABLE,
+                   HIGHCONTRAST_KEY, "Flags" );
 static UINT_ENTRY_MIRROR( DOUBLECLKHEIGHT, 4, MOUSE_KEY, "DoubleClickHeight", DESKTOP_KEY );
 static UINT_ENTRY_MIRROR( DOUBLECLKWIDTH, 4, MOUSE_KEY, "DoubleClickWidth", DESKTOP_KEY );
 static UINT_ENTRY_MIRROR( MENUDROPALIGNMENT, 0, DESKTOP_KEY, "MenuDropAlignment", VERSION_KEY );
@@ -5776,6 +5781,7 @@ static union sysparam_all_entry * const default_entries[] =
     (union sysparam_all_entry *)&entry_FONTSMOOTHINGTYPE,
     (union sysparam_all_entry *)&entry_FOREGROUNDFLASHCOUNT,
     (union sysparam_all_entry *)&entry_FOREGROUNDLOCKTIMEOUT,
+    (union sysparam_all_entry *)&entry_HIGHCONTRAST_FLAGS,
     (union sysparam_all_entry *)&entry_ICONHORIZONTALSPACING,
     (union sysparam_all_entry *)&entry_ICONTITLEWRAP,
     (union sysparam_all_entry *)&entry_ICONVERTICALSPACING,
@@ -6514,15 +6520,15 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
     case SPI_GETHIGHCONTRAST:
     {
         HIGHCONTRASTW *high_contrast = ptr;
-	WARN("SPI_GETHIGHCONTRAST not fully implemented\n");
-	if (high_contrast && high_contrast->cbSize == sizeof(HIGHCONTRASTW))
-	{
-	    /* Indicate that no high contrast feature available */
-	    high_contrast->dwFlags = 0;
-	    high_contrast->lpszDefaultScheme = NULL;
+
+        if (high_contrast && high_contrast->cbSize == sizeof(*high_contrast) &&
+            get_entry( &entry_HIGHCONTRAST_FLAGS, 0, &high_contrast->dwFlags ))
+        {
+            /* The public user32 entry point supplies the caller-owned scheme allocation. */
+            high_contrast->lpszDefaultScheme = NULL;
             ret = TRUE;
-	}
-	break;
+        }
+        break;
     }
 
     WINE_SPI_FIXME(SPI_SETHIGHCONTRAST);

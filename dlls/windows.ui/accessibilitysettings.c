@@ -107,6 +107,7 @@ static HRESULT WINAPI accessibilitysettings_get_HighContrast(IAccessibilitySetti
         return E_FAIL;
 
     *value = !!(high_contrast.dwFlags & HCF_HIGHCONTRASTON);
+    LocalFree(high_contrast.lpszDefaultScheme);
     return S_OK;
 }
 

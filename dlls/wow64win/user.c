@@ -4859,13 +4859,12 @@ NTSTATUS WINAPI wow64_NtUserSystemParametersInfo( UINT *args )
                 DWORD dwFlags;
                 ULONG lpszDefaultScheme;
             } *info32 = ptr;
-            HIGHCONTRASTW info;
+            HIGHCONTRASTW info = {.cbSize = sizeof(info)};
 
             if (info32->cbSize != sizeof(*info32)) return FALSE;
-            info.cbSize = sizeof(info);
             if (!NtUserSystemParametersInfo( action, val, &info, winini )) return FALSE;
             info32->dwFlags = info.dwFlags;
-            info32->lpszDefaultScheme = PtrToUlong( info.lpszDefaultScheme );
+            info32->lpszDefaultScheme = 0;
             return TRUE;
         }
         break;

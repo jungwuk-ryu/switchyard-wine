@@ -509,6 +509,7 @@ static void test_AccessibilitySettings(void)
     ret = SystemParametersInfoW( SPI_GETHIGHCONTRAST, sizeof(high_contrast), &high_contrast, 0 );
     ok( ret, "SystemParametersInfoW failed, error %lu.\n", GetLastError() );
     ok( value == !!(high_contrast.dwFlags & HCF_HIGHCONTRASTON), "Got unexpected high contrast value.\n" );
+    LocalFree( high_contrast.lpszDefaultScheme );
 
     IAccessibilitySettings_Release( settings );
     IInspectable_Release( inspectable );
