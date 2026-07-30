@@ -148,6 +148,14 @@ PE architectures:
   ~/.switchyard/runtimes/<runtime-id>
 ```
 
+Verify that dynamically generated Windows code can execute from Wine's
+low-address and top-down reserved address spaces:
+
+```sh
+./switchyard/tests/executable_memory_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
+
 At launch time, set `WINE_OPENGL_DRIVER=llvmpipe` in a container's
 environment overrides to select the software OpenGL backend for its complete
 Windows process tree. Use `WINE_OPENGL_DRIVER=wine`, or leave it unset,
