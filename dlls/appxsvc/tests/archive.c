@@ -23,7 +23,9 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winerror.h"
+#include "bcrypt.h"
 
+#include "../signature.h"
 #include "wine/appxsvc.h"
 #include "wine/test.h"
 
@@ -48,6 +50,17 @@ static HRESULT (WINAPI *p_wine_appx_archive_find_entry)( WINE_APPX_ARCHIVE *, co
 static HRESULT (WINAPI *p_wine_appx_archive_get_entry)( WINE_APPX_ARCHIVE *, UINT32,
                                                         WINE_APPX_ARCHIVE_ENTRY *,
                                                         UINT32 *, WCHAR * );
+static HRESULT (WINAPI *p_appx_archive_calculate_digest_set)(
+    WINE_APPX_ARCHIVE *, struct appx_signature_digest_set * );
+
+static NTSTATUS (WINAPI *p_BCryptOpenAlgorithmProvider)(
+    BCRYPT_ALG_HANDLE *, const WCHAR *, const WCHAR *, ULONG );
+static NTSTATUS (WINAPI *p_BCryptCreateHash)(
+    BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE *, BYTE *, ULONG, BYTE *, ULONG, ULONG );
+static NTSTATUS (WINAPI *p_BCryptHashData)( BCRYPT_HASH_HANDLE, BYTE *, ULONG, ULONG );
+static NTSTATUS (WINAPI *p_BCryptFinishHash)( BCRYPT_HASH_HANDLE, BYTE *, ULONG, ULONG );
+static NTSTATUS (WINAPI *p_BCryptDestroyHash)( BCRYPT_HASH_HANDLE );
+static NTSTATUS (WINAPI *p_BCryptCloseAlgorithmProvider)( BCRYPT_ALG_HANDLE, ULONG );
 
 struct buffer
 {
@@ -109,6 +122,41 @@ static UINT32 read_uint32( const BYTE *buffer )
 {
     return buffer[0] | ((UINT32)buffer[1] << 8) | ((UINT32)buffer[2] << 16) |
            ((UINT32)buffer[3] << 24);
+}
+
+static BOOL sha256_buffer( const BYTE *data, UINT32 size,
+                           BYTE digest[APPX_SIGNATURE_SHA256_SIZE] )
+{
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    NTSTATUS status;
+    BOOL result = FALSE;
+
+    if ((status = p_BCryptOpenAlgorithmProvider( &algorithm,
+                                                 BCRYPT_SHA256_ALGORITHM, NULL, 0 )))
+        goto done;
+    if ((status = p_BCryptCreateHash( algorithm, &hash, NULL, 0, NULL, 0, 0 )))
+        goto done;
+    if (size && (status = p_BCryptHashData( hash, (BYTE *)data, size, 0 )))
+        goto done;
+    if ((status = p_BCryptFinishHash( hash, digest,
+                                      APPX_SIGNATURE_SHA256_SIZE, 0 )))
+        goto done;
+    result = TRUE;
+
+done:
+    if (hash) p_BCryptDestroyHash( hash );
+    if (algorithm) p_BCryptCloseAlgorithmProvider( algorithm, 0 );
+    return result;
+}
+
+static BOOL digest_set_is_zero( const struct appx_signature_digest_set *set )
+{
+    const BYTE *bytes = (const BYTE *)set;
+    SIZE_T i;
+
+    for (i = 0; i < sizeof(*set); i++) if (bytes[i]) return FALSE;
+    return TRUE;
 }
 
 static BOOL reserve( struct buffer *buffer, UINT32 length )
@@ -291,12 +339,18 @@ static struct test_entry *add_entry( struct zip_builder *builder, const char *na
                                   NULL, 0, NULL, 0 );
 }
 
-static BOOL finish_archive( struct zip_builder *builder, BOOL zip64_directory )
+static BOOL finish_archive_with_zip64_extensible( struct zip_builder *builder,
+                                                  BOOL zip64_directory,
+                                                  const BYTE *extensible,
+                                                  UINT32 extensible_size )
 {
     UINT64 central_size;
     UINT32 i;
     BYTE *header, *extra;
 
+    if ((!zip64_directory && extensible_size) ||
+        (extensible_size && !extensible) || extensible_size > MAXDWORD - 44)
+        return FALSE;
     builder->central_offset = builder->buffer.size;
     for (i = 0; i < builder->count; i++)
     {
@@ -345,7 +399,7 @@ static BOOL finish_archive( struct zip_builder *builder, BOOL zip64_directory )
         UINT64 zip64_offset = builder->buffer.size;
 
         if (!append_uint32( &builder->buffer, ZIP64_END_DIRECTORY_SIGNATURE ) ||
-            !append_uint64( &builder->buffer, 44 ) ||
+            !append_uint64( &builder->buffer, 44 + extensible_size ) ||
             !append_uint32( &builder->buffer, 45 | (45 << 16) ) ||
             !append_uint32( &builder->buffer, 0 ) ||
             !append_uint32( &builder->buffer, 0 ) ||
@@ -353,6 +407,7 @@ static BOOL finish_archive( struct zip_builder *builder, BOOL zip64_directory )
             !append_uint64( &builder->buffer, builder->count ) ||
             !append_uint64( &builder->buffer, central_size ) ||
             !append_uint64( &builder->buffer, builder->central_offset ) ||
+            !append_bytes( &builder->buffer, extensible, extensible_size ) ||
             !append_uint32( &builder->buffer, ZIP64_END_DIRECTORY_LOCATOR_SIGNATURE ) ||
             !append_uint32( &builder->buffer, 0 ) ||
             !append_uint64( &builder->buffer, zip64_offset ) ||
@@ -371,6 +426,11 @@ static BOOL finish_archive( struct zip_builder *builder, BOOL zip64_directory )
     return TRUE;
 }
 
+static BOOL finish_archive( struct zip_builder *builder, BOOL zip64_directory )
+{
+    return finish_archive_with_zip64_extensible( builder, zip64_directory, NULL, 0 );
+}
+
 static void add_required_entries( struct zip_builder *builder )
 {
     static const char *names[] =
@@ -384,6 +444,29 @@ static void add_required_entries( struct zip_builder *builder )
 
     for (i = 0; i < ARRAY_SIZE(names); i++)
         add_entry( builder, names[i], NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
+}
+
+static struct test_entry *add_digest_entries( struct zip_builder *builder,
+                                              BOOL code_integrity, BOOL signature )
+{
+    /* Raw DEFLATE encoding of the uncompressed bytes "123456789". */
+    static const BYTE metadata_deflate[] =
+        {0x33,0x34,0x32,0x36,0x31,0x35,0x33,0xb7,0xb0,0x04,0x00};
+    struct test_entry *block_map;
+
+    add_entry( builder, "AppxManifest.xml", NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
+    block_map = add_entry( builder, "AppxBlockMap.xml", metadata_deflate,
+                           sizeof(metadata_deflate), 8, 9, 0xcbf43926,
+                           0, FALSE, FALSE );
+    add_entry( builder, "[Content_Types].xml", metadata_deflate,
+               sizeof(metadata_deflate), 8, 9, 0xcbf43926, 0, FALSE, FALSE );
+    if (code_integrity)
+        add_entry( builder, "AppxMetadata/CodeIntegrity.cat",
+                   metadata_deflate, sizeof(metadata_deflate), 8, 9,
+                   0xcbf43926, 0, FALSE, FALSE );
+    if (signature)
+        add_entry( builder, "AppxSignature.p7x", NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
+    return block_map;
 }
 
 static HANDLE create_archive_file( const struct buffer *buffer, WCHAR *path )
@@ -1016,6 +1099,248 @@ static void test_resource_limits( void )
     free_builder( &builder );
 }
 
+static void check_digest( const BYTE actual[APPX_SIGNATURE_SHA256_SIZE],
+                          const BYTE expected[APPX_SIGNATURE_SHA256_SIZE],
+                          const char *name )
+{
+    ok( !memcmp( actual, expected, APPX_SIGNATURE_SHA256_SIZE ),
+        "%s digest did not match.\n", name );
+}
+
+static void test_package_digest_extensible( BOOL zip64, BOOL code_integrity,
+                                            const BYTE *extensible,
+                                            UINT32 extensible_size )
+{
+    static const BYTE metadata[] = "123456789";
+    struct appx_signature_digest_set set;
+    struct zip_builder unsigned_builder = {0}, signed_builder = {0};
+    BYTE package_contents[APPX_SIGNATURE_SHA256_SIZE];
+    BYTE central_directory[APPX_SIGNATURE_SHA256_SIZE];
+    BYTE metadata_digest[APPX_SIGNATURE_SHA256_SIZE];
+    WINE_APPX_ARCHIVE *archive = NULL;
+    UINT32 expected_flags;
+    HRESULT hr;
+
+    /*
+     * The signed fixture appends only AppxSignature.p7x.  The unsigned
+     * fixture therefore provides the exact AXPC file-record image and AXCD
+     * central-directory-plus-footer image that signing must have covered.
+     */
+    add_digest_entries( &unsigned_builder, code_integrity, FALSE );
+    if (!finish_archive_with_zip64_extensible( &unsigned_builder, zip64,
+                                               extensible, extensible_size ))
+    {
+        ok( 0, "failed to finish unsigned ZIP%s archive.\n", zip64 ? "64" : "32" );
+        goto done;
+    }
+    add_digest_entries( &signed_builder, code_integrity, TRUE );
+    if (!finish_archive_with_zip64_extensible( &signed_builder, zip64,
+                                               extensible, extensible_size ))
+    {
+        ok( 0, "failed to finish signed ZIP%s archive.\n", zip64 ? "64" : "32" );
+        goto done;
+    }
+
+    ok( unsigned_builder.central_offset <= unsigned_builder.buffer.size,
+        "invalid unsigned central-directory offset.\n" );
+    if (unsigned_builder.central_offset > unsigned_builder.buffer.size) goto done;
+    if (!sha256_buffer( unsigned_builder.buffer.data,
+                        (UINT32)unsigned_builder.central_offset, package_contents ) ||
+        !sha256_buffer( unsigned_builder.buffer.data + unsigned_builder.central_offset,
+                        unsigned_builder.buffer.size -
+                        (UINT32)unsigned_builder.central_offset, central_directory ) ||
+        !sha256_buffer( metadata, sizeof(metadata) - 1, metadata_digest ))
+    {
+        ok( 0, "failed to calculate expected SHA-256 digests.\n" );
+        goto done;
+    }
+
+    hr = open_builder( &signed_builder, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, &archive );
+    ok( hr == S_OK, "failed to open signed ZIP%s archive, hr %#lx.\n",
+        zip64 ? "64" : "32", hr );
+    if (FAILED(hr)) goto done;
+
+    memset( &set, 0xcc, sizeof(set) );
+    hr = p_appx_archive_calculate_digest_set( archive, &set );
+    ok( hr == S_OK, "ZIP%s digest calculation returned %#lx.\n",
+        zip64 ? "64" : "32", hr );
+    if (FAILED(hr)) goto done;
+
+    expected_flags = APPX_SIGNATURE_DIGEST_REQUIRED;
+    if (code_integrity) expected_flags |= APPX_SIGNATURE_DIGEST_CODE_INTEGRITY;
+    ok( set.flags == expected_flags, "ZIP%s digest flags %#x, expected %#x.\n",
+        zip64 ? "64" : "32", set.flags, expected_flags );
+    check_digest( set.package_contents, package_contents, "AXPC" );
+    check_digest( set.central_directory, central_directory, "AXCD" );
+    check_digest( set.content_types, metadata_digest, "AXCT" );
+    check_digest( set.block_map, metadata_digest, "AXBM" );
+    if (code_integrity)
+        check_digest( set.code_integrity, metadata_digest, "AXCI" );
+    else
+    {
+        BYTE zero[APPX_SIGNATURE_SHA256_SIZE] = {0};
+
+        check_digest( set.code_integrity, zero, "omitted AXCI" );
+    }
+
+done:
+    if (archive) p_wine_appx_archive_close( archive );
+    free_builder( &signed_builder );
+    free_builder( &unsigned_builder );
+}
+
+static void test_package_digest( BOOL zip64, BOOL code_integrity )
+{
+    test_package_digest_extensible( zip64, code_integrity, NULL, 0 );
+}
+
+static void test_package_digest_zip64_extensible( void )
+{
+    static const BYTE extensible[] =
+    {
+        0x53,0x57,0x49,0x54,0x43,0x48,0x59,0x41,
+        0x52,0x44,0x00,0xff,0x50,0x4b,0x06,0x06,
+    };
+
+    test_package_digest_extensible( TRUE, TRUE, extensible, sizeof(extensible) );
+}
+
+static BOOL swap_last_central_records( struct zip_builder *builder,
+                                       const struct test_entry *left,
+                                       const struct test_entry *right )
+{
+    BYTE *temporary;
+    UINT32 left_offset, right_offset, left_size, right_size, total_size;
+
+    if (left->central_offset >= right->central_offset ||
+        right->central_offset >= builder->eocd_offset ||
+        builder->eocd_offset > builder->buffer.size ||
+        left->central_offset > MAXDWORD || right->central_offset > MAXDWORD ||
+        builder->eocd_offset > MAXDWORD)
+        return FALSE;
+
+    left_offset = left->central_offset;
+    right_offset = right->central_offset;
+    left_size = right_offset - left_offset;
+    right_size = (UINT32)builder->eocd_offset - right_offset;
+    if (left_size > MAXDWORD - right_size) return FALSE;
+    total_size = left_size + right_size;
+    if (!(temporary = HeapAlloc( GetProcessHeap(), 0, total_size ))) return FALSE;
+
+    memcpy( temporary, builder->buffer.data + right_offset, right_size );
+    memcpy( temporary + right_size, builder->buffer.data + left_offset, left_size );
+    memcpy( builder->buffer.data + left_offset, temporary, total_size );
+    HeapFree( GetProcessHeap(), 0, temporary );
+    return TRUE;
+}
+
+static void expect_digest_layout_failure( struct zip_builder *builder )
+{
+    struct appx_signature_digest_set set;
+    WINE_APPX_ARCHIVE *archive = NULL;
+    HRESULT hr;
+
+    hr = open_builder( builder, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, &archive );
+    ok( hr == S_OK, "failed to open digest layout fixture, hr %#lx.\n", hr );
+    if (FAILED(hr)) return;
+
+    memset( &set, 0xcc, sizeof(set) );
+    hr = p_appx_archive_calculate_digest_set( archive, &set );
+    ok( hr == APPX_E_INVALID_PACKAGING_LAYOUT,
+        "invalid signature ordering returned %#lx.\n", hr );
+    ok( digest_set_is_zero( &set ), "failed digest calculation left output data.\n" );
+    p_wine_appx_archive_close( archive );
+}
+
+static void test_package_digest_ordering( void )
+{
+    struct zip_builder builder = {0};
+    struct test_entry *left, *right;
+
+    add_digest_entries( &builder, FALSE, TRUE );
+    ok( finish_archive( &builder, FALSE ), "failed to finish central-order fixture.\n" );
+    left = builder.entries + builder.count - 2;
+    right = builder.entries + builder.count - 1;
+    ok( swap_last_central_records( &builder, left, right ),
+        "failed to move the signature central record.\n" );
+    expect_digest_layout_failure( &builder );
+    free_builder( &builder );
+
+    add_digest_entries( &builder, FALSE, FALSE );
+    left = add_entry( &builder, "AppxSignature.p7x", NULL, 0, 0, 0, 0,
+                      0, FALSE, FALSE );
+    right = add_entry( &builder, "Assets/Test12.bin", NULL, 0, 0, 0, 0,
+                       0, FALSE, FALSE );
+    ok( finish_archive( &builder, FALSE ), "failed to finish local-order fixture.\n" );
+    ok( swap_last_central_records( &builder, left, right ),
+        "failed to move the signature central record last.\n" );
+    expect_digest_layout_failure( &builder );
+    free_builder( &builder );
+}
+
+static void test_package_digest_corruption( void )
+{
+    struct appx_signature_digest_set set;
+    struct zip_builder builder = {0};
+    struct test_entry *block_map;
+    WINE_APPX_ARCHIVE *archive = NULL;
+    UINT64 data_offset;
+    HRESULT hr;
+
+    block_map = add_digest_entries( &builder, TRUE, TRUE );
+    ok( finish_archive( &builder, FALSE ), "failed to finish corrupt digest fixture.\n" );
+    data_offset = block_map->local_offset + 30 + block_map->name_length;
+    ok( data_offset < builder.buffer.size, "invalid block-map data offset.\n" );
+    if (data_offset >= builder.buffer.size) goto done;
+    builder.buffer.data[(SIZE_T)data_offset] ^= 1;
+
+    hr = open_builder( &builder, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, &archive );
+    ok( hr == S_OK, "failed to open corrupt digest fixture, hr %#lx.\n", hr );
+    if (FAILED(hr)) goto done;
+
+    memset( &set, 0xcc, sizeof(set) );
+    hr = p_appx_archive_calculate_digest_set( archive, &set );
+    ok( hr == APPX_E_CORRUPT_CONTENT, "corrupt block map returned %#lx.\n", hr );
+    ok( digest_set_is_zero( &set ), "CRC failure left output digest data.\n" );
+
+done:
+    if (archive) p_wine_appx_archive_close( archive );
+    free_builder( &builder );
+}
+
+static void test_package_digest_arguments( void )
+{
+    struct appx_signature_digest_set set;
+    struct zip_builder builder = {0};
+    WINE_APPX_ARCHIVE *archive = NULL;
+    HRESULT hr;
+
+    memset( &set, 0xcc, sizeof(set) );
+    hr = p_appx_archive_calculate_digest_set( NULL, &set );
+    ok( hr == E_INVALIDARG, "NULL archive returned %#lx.\n", hr );
+    ok( digest_set_is_zero( &set ), "NULL archive left output digest data.\n" );
+    hr = p_appx_archive_calculate_digest_set( NULL, NULL );
+    ok( hr == E_INVALIDARG, "NULL output returned %#lx.\n", hr );
+
+    add_digest_entries( &builder, FALSE, FALSE );
+    ok( finish_archive( &builder, FALSE ), "failed to finish unsigned digest fixture.\n" );
+    hr = open_builder( &builder, NULL, 0, &archive );
+    ok( hr == S_OK, "failed to open unsigned digest fixture, hr %#lx.\n", hr );
+    if (FAILED(hr)) goto done;
+
+    hr = p_appx_archive_calculate_digest_set( archive, NULL );
+    ok( hr == E_INVALIDARG, "NULL digest output returned %#lx.\n", hr );
+    memset( &set, 0xcc, sizeof(set) );
+    hr = p_appx_archive_calculate_digest_set( archive, &set );
+    ok( hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND),
+        "missing package signature returned %#lx.\n", hr );
+    ok( digest_set_is_zero( &set ), "missing signature left output digest data.\n" );
+
+done:
+    if (archive) p_wine_appx_archive_close( archive );
+    free_builder( &builder );
+}
+
 static void test_arguments( void )
 {
     WINE_APPX_ARCHIVE_ENTRY entry;
@@ -1046,11 +1371,18 @@ static void test_arguments( void )
 
 START_TEST(archive)
 {
-    HMODULE module = LoadLibraryW( L"appxsvc.dll" );
+    HMODULE bcrypt, module = LoadLibraryW( L"appxsvc.dll" );
 
     if (!module)
     {
         ok( 0, "appxsvc.dll is not available, error %lu.\n", GetLastError() );
+        return;
+    }
+    bcrypt = LoadLibraryW( L"bcrypt.dll" );
+    if (!bcrypt)
+    {
+        ok( 0, "bcrypt.dll is not available, error %lu.\n", GetLastError() );
+        FreeLibrary( module );
         return;
     }
 
@@ -1062,11 +1394,25 @@ START_TEST(archive)
         (void *)GetProcAddress( module, "wine_appx_archive_find_entry" );
     p_wine_appx_archive_get_entry =
         (void *)GetProcAddress( module, "wine_appx_archive_get_entry" );
+    p_appx_archive_calculate_digest_set =
+        (void *)GetProcAddress( module, "appx_archive_calculate_digest_set" );
+    p_BCryptOpenAlgorithmProvider =
+        (void *)GetProcAddress( bcrypt, "BCryptOpenAlgorithmProvider" );
+    p_BCryptCreateHash = (void *)GetProcAddress( bcrypt, "BCryptCreateHash" );
+    p_BCryptHashData = (void *)GetProcAddress( bcrypt, "BCryptHashData" );
+    p_BCryptFinishHash = (void *)GetProcAddress( bcrypt, "BCryptFinishHash" );
+    p_BCryptDestroyHash = (void *)GetProcAddress( bcrypt, "BCryptDestroyHash" );
+    p_BCryptCloseAlgorithmProvider =
+        (void *)GetProcAddress( bcrypt, "BCryptCloseAlgorithmProvider" );
     if (!p_wine_appx_archive_open || !p_wine_appx_archive_close ||
         !p_wine_appx_archive_get_count || !p_wine_appx_archive_find_entry ||
-        !p_wine_appx_archive_get_entry)
+        !p_wine_appx_archive_get_entry || !p_appx_archive_calculate_digest_set ||
+        !p_BCryptOpenAlgorithmProvider || !p_BCryptCreateHash ||
+        !p_BCryptHashData || !p_BCryptFinishHash || !p_BCryptDestroyHash ||
+        !p_BCryptCloseAlgorithmProvider)
     {
         ok( 0, "archive exports are not available, error %lu.\n", GetLastError() );
+        FreeLibrary( bcrypt );
         FreeLibrary( module );
         return;
     }
@@ -1086,7 +1432,16 @@ START_TEST(archive)
     test_header_validation();
     test_directory_records();
     test_resource_limits();
+    test_package_digest( FALSE, FALSE );
+    test_package_digest( FALSE, TRUE );
+    test_package_digest( TRUE, FALSE );
+    test_package_digest( TRUE, TRUE );
+    test_package_digest_zip64_extensible();
+    test_package_digest_ordering();
+    test_package_digest_corruption();
+    test_package_digest_arguments();
     test_arguments();
 
+    FreeLibrary( bcrypt );
     FreeLibrary( module );
 }

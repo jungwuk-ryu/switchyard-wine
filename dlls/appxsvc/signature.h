@@ -23,6 +23,7 @@
 
 #include "windef.h"
 #include "winerror.h"
+#include "wine/appxsvc.h"
 
 #define APPX_SIGNATURE_MAX_SIZE                    (2 * 1024 * 1024)
 #define APPX_SIGNATURE_SHA256_SIZE                 32
@@ -97,5 +98,14 @@ HRESULT WINAPI appx_signature_verify_digest_set(
 HRESULT WINAPI appx_signature_compare_digest_sets(
     const struct appx_signature_digest_set *signed_set,
     const struct appx_signature_digest_set *recalculated );
+
+/*
+ * Recalculate the package digests that are signed by AppxSignature.p7x.
+ * AXPC and AXCD are computed from the raw ZIP file-record and central-directory
+ * byte image; AXCT, AXBM, and optional AXCI are computed from the verified
+ * uncompressed part streams.
+ */
+HRESULT WINAPI appx_archive_calculate_digest_set(
+    WINE_APPX_ARCHIVE *archive, struct appx_signature_digest_set *set );
 
 #endif /* __WINE_APPXSVC_SIGNATURE_H */

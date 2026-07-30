@@ -39,3 +39,4 @@
 @ stdcall -private appx_signature_decode_indirect_data(ptr long ptr)
 @ stdcall -private appx_signature_verify_digest_set(ptr ptr)
 @ stdcall -private appx_signature_compare_digest_sets(ptr ptr)
+@ stdcall -private appx_archive_calculate_digest_set(ptr ptr)

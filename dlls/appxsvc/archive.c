@@ -25,7 +25,9 @@
 #include "winbase.h"
 #include "winnls.h"
 #include "winerror.h"
+#include "bcrypt.h"
 
+#include "signature.h"
 #include "wine/appxsvc.h"
 #include "wine/debug.h"
 
@@ -68,6 +70,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 #define DEFAULT_MAX_COMPRESSION_RATIO             1000
 #define DEFAULT_COMPRESSION_RATIO_SLACK           (1024 * 1024)
 
+#define HASH_IO_BUFFER_SIZE                       (64 * 1024)
+
 struct archive_entry
 {
     WCHAR *path;
@@ -84,6 +88,8 @@ struct archive_entry
     UINT64 compressed_size;
     UINT64 uncompressed_size;
     UINT64 local_header_offset;
+    UINT64 central_header_offset;
+    UINT64 central_header_size;
     UINT64 data_offset;
     UINT64 record_end;
     BOOL zip64_sizes;
@@ -93,7 +99,14 @@ struct wine_appx_archive
 {
     HANDLE file;
     UINT64 file_size;
+    UINT64 central_directory_offset;
+    UINT64 central_directory_size;
+    UINT64 zip64_extensible_offset;
+    UINT64 zip64_extensible_size;
     UINT32 count;
+    UINT16 zip64_version_made;
+    UINT16 zip64_version_needed;
+    BOOL zip64_directory;
     struct archive_entry *entries;
 };
 
@@ -103,6 +116,11 @@ struct directory_info
     UINT64 size;
     UINT64 entries;
     UINT64 boundary;
+    UINT64 zip64_extensible_offset;
+    UINT64 zip64_extensible_size;
+    UINT16 zip64_version_made;
+    UINT16 zip64_version_needed;
+    BOOL zip64;
 };
 
 static UINT16 read_uint16( const BYTE *buffer )
@@ -118,6 +136,24 @@ static UINT32 read_uint32( const BYTE *buffer )
 static UINT64 read_uint64( const BYTE *buffer )
 {
     return read_uint32( buffer ) | ((UINT64)read_uint32( buffer + 4 ) << 32);
+}
+
+static void write_uint16( BYTE *buffer, UINT16 value )
+{
+    buffer[0] = value;
+    buffer[1] = value >> 8;
+}
+
+static void write_uint32( BYTE *buffer, UINT32 value )
+{
+    write_uint16( buffer, value );
+    write_uint16( buffer + 2, value >> 16 );
+}
+
+static void write_uint64( BYTE *buffer, UINT64 value )
+{
+    write_uint32( buffer, value );
+    write_uint32( buffer + 4, value >> 32 );
 }
 
 static BOOL add_uint64( UINT64 left, UINT64 right, UINT64 *result )
@@ -173,6 +209,115 @@ static HRESULT read_at( HANDLE file, UINT64 offset, void *buffer, SIZE_T size )
         offset += read;
     }
     CloseHandle( overlapped.hEvent );
+    return hr;
+}
+
+struct sha256_context
+{
+    BCRYPT_ALG_HANDLE algorithm;
+    BCRYPT_HASH_HANDLE hash;
+};
+
+static HRESULT sha256_init( struct sha256_context *context )
+{
+    NTSTATUS status;
+
+    memset( context, 0, sizeof(*context) );
+    if ((status = BCryptOpenAlgorithmProvider( &context->algorithm,
+                                               BCRYPT_SHA256_ALGORITHM, NULL, 0 )))
+        return HRESULT_FROM_NT( status );
+    if ((status = BCryptCreateHash( context->algorithm, &context->hash,
+                                    NULL, 0, NULL, 0, 0 )))
+    {
+        BCryptCloseAlgorithmProvider( context->algorithm, 0 );
+        context->algorithm = NULL;
+        return HRESULT_FROM_NT( status );
+    }
+    return S_OK;
+}
+
+static void sha256_destroy( struct sha256_context *context )
+{
+    if (context->hash) BCryptDestroyHash( context->hash );
+    if (context->algorithm) BCryptCloseAlgorithmProvider( context->algorithm, 0 );
+}
+
+static HRESULT sha256_update( struct sha256_context *context, const void *data, UINT32 size )
+{
+    NTSTATUS status;
+
+    if ((status = BCryptHashData( context->hash, (BYTE *)data, size, 0 )))
+        return HRESULT_FROM_NT( status );
+    return S_OK;
+}
+
+static HRESULT sha256_finish( struct sha256_context *context,
+                              BYTE digest[APPX_SIGNATURE_SHA256_SIZE] )
+{
+    NTSTATUS status;
+
+    if ((status = BCryptFinishHash( context->hash, digest,
+                                    APPX_SIGNATURE_SHA256_SIZE, 0 )))
+        return HRESULT_FROM_NT( status );
+    return S_OK;
+}
+
+static HRESULT hash_file_range( HANDLE file, UINT64 offset, UINT64 size,
+                                struct sha256_context *hash )
+{
+    OVERLAPPED overlapped = {0};
+    BYTE *buffer;
+    HRESULT hr;
+
+    if (!(buffer = HeapAlloc( GetProcessHeap(), 0, HASH_IO_BUFFER_SIZE )))
+        return E_OUTOFMEMORY;
+    if (!(overlapped.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL )))
+    {
+        hr = HRESULT_FROM_WIN32( GetLastError() );
+        goto done;
+    }
+    hr = S_OK;
+
+    while (size)
+    {
+        UINT32 chunk = size > HASH_IO_BUFFER_SIZE ? HASH_IO_BUFFER_SIZE : (UINT32)size;
+        DWORD error, read = 0;
+        UINT64 next_offset;
+
+        if (!add_uint64( offset, chunk, &next_offset ))
+        {
+            hr = APPX_E_INVALID_PACKAGING_LAYOUT;
+            break;
+        }
+
+        overlapped.Offset = offset;
+        overlapped.OffsetHigh = offset >> 32;
+        ResetEvent( overlapped.hEvent );
+        if (!ReadFile( file, buffer, chunk, &read, &overlapped ))
+        {
+            error = GetLastError();
+            if (error != ERROR_IO_PENDING ||
+                !GetOverlappedResult( file, &overlapped, &read, TRUE ))
+            {
+                error = GetLastError();
+                hr = error == ERROR_HANDLE_EOF ? APPX_E_INVALID_PACKAGING_LAYOUT :
+                                                 HRESULT_FROM_WIN32( error );
+                break;
+            }
+        }
+        if (read != chunk)
+        {
+            hr = APPX_E_INVALID_PACKAGING_LAYOUT;
+            break;
+        }
+        if (FAILED(hr = sha256_update( hash, buffer, chunk ))) break;
+        offset = next_offset;
+        size -= chunk;
+    }
+
+done:
+    if (overlapped.hEvent) CloseHandle( overlapped.hEvent );
+    HeapFree( GetProcessHeap(), 0, buffer );
     return hr;
 }
 
@@ -287,6 +432,11 @@ static HRESULT find_directory( HANDLE file, UINT64 file_size, struct directory_i
         directory->size = size32;
         directory->offset = offset32;
         directory->boundary = eocd_offset;
+        directory->zip64_extensible_offset = 0;
+        directory->zip64_extensible_size = 0;
+        directory->zip64_version_made = 0;
+        directory->zip64_version_needed = 0;
+        directory->zip64 = FALSE;
     }
     else
     {
@@ -319,6 +469,14 @@ static HRESULT find_directory( HANDLE file, UINT64 file_size, struct directory_i
         directory->size = read_uint64( zip64 + 40 );
         directory->offset = read_uint64( zip64 + 48 );
         directory->boundary = zip64_offset;
+        if (!add_uint64( zip64_offset, ZIP64_END_DIRECTORY_MIN_SIZE,
+                         &directory->zip64_extensible_offset ))
+            return APPX_E_INVALID_PACKAGING_LAYOUT;
+        directory->zip64_extensible_size = zip64_size -
+                                           (ZIP64_END_DIRECTORY_MIN_SIZE - 12);
+        directory->zip64_version_made = read_uint16( zip64 + 12 );
+        directory->zip64_version_needed = read_uint16( zip64 + 14 );
+        directory->zip64 = TRUE;
 
         if ((entries16 != 0xffff && entries16 != entries64) ||
             (size32 != 0xffffffff && size32 != directory->size) ||
@@ -598,6 +756,19 @@ static struct archive_entry *find_path( struct archive_entry *entries, UINT32 co
         else low = middle + 1;
     }
     return NULL;
+}
+
+static HRESULT find_file_entry( WINE_APPX_ARCHIVE *archive, const WCHAR *path,
+                                struct archive_entry **entry, UINT32 *index )
+{
+    UINT32 length = lstrlenW( path );
+
+    if (!(*entry = find_path( archive->entries, archive->count, path, length )))
+        return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
+    if ((*entry)->flags & WINE_APPX_ENTRY_DIRECTORY)
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
+    if (index) *index = *entry - archive->entries;
+    return S_OK;
 }
 
 static HRESULT validate_paths( struct archive_entry *entries, UINT32 count, UINT32 flags )
@@ -949,6 +1120,8 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
         if (FAILED(hr = parse_central_entry( central + cursor, directory.size - cursor, &limits,
                                              entries + i, &consumed, &total_uncompressed )))
             goto done;
+        entries[i].central_header_offset = directory.offset + cursor;
+        entries[i].central_header_size = consumed;
         cursor += consumed;
     }
     if (cursor != directory.size)
@@ -977,7 +1150,14 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
     }
     object->file = duplicate;
     object->file_size = size.QuadPart;
+    object->central_directory_offset = directory.offset;
+    object->central_directory_size = directory.size;
+    object->zip64_extensible_offset = directory.zip64_extensible_offset;
+    object->zip64_extensible_size = directory.zip64_extensible_size;
     object->count = directory.entries;
+    object->zip64_version_made = directory.zip64_version_made;
+    object->zip64_version_needed = directory.zip64_version_needed;
+    object->zip64_directory = directory.zip64;
     object->entries = entries;
     entries = NULL;
     duplicate = INVALID_HANDLE_VALUE;
@@ -1084,4 +1264,245 @@ HRESULT WINAPI wine_appx_archive_get_entry( WINE_APPX_ARCHIVE *archive, UINT32 i
         return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
     memcpy( path, source->path, source->path_length * sizeof(*path) );
     return S_OK;
+}
+
+static void write_appx_zip32_presignature_footer( BYTE *buffer, UINT16 entries,
+                                                  UINT32 directory_size,
+                                                  UINT32 directory_offset )
+{
+    write_uint32( buffer, ZIP_END_DIRECTORY_SIGNATURE );
+    write_uint16( buffer + 4, 0 );
+    write_uint16( buffer + 6, 0 );
+    write_uint16( buffer + 8, entries );
+    write_uint16( buffer + 10, entries );
+    write_uint32( buffer + 12, directory_size );
+    write_uint32( buffer + 16, directory_offset );
+    write_uint16( buffer + 20, 0 );
+}
+
+static void write_appx_zip64_presignature_header( BYTE *buffer, UINT64 record_size,
+                                                  UINT16 version_made,
+                                                  UINT16 version_needed,
+                                                  UINT64 entries,
+                                                  UINT64 directory_size,
+                                                  UINT64 directory_offset )
+{
+    write_uint32( buffer, ZIP64_END_DIRECTORY_SIGNATURE );
+    write_uint64( buffer + 4, record_size );
+    write_uint16( buffer + 12, version_made );
+    write_uint16( buffer + 14, version_needed );
+    write_uint32( buffer + 16, 0 );
+    write_uint32( buffer + 20, 0 );
+    write_uint64( buffer + 24, entries );
+    write_uint64( buffer + 32, entries );
+    write_uint64( buffer + 40, directory_size );
+    write_uint64( buffer + 48, directory_offset );
+}
+
+static void write_appx_zip64_presignature_locator( BYTE *buffer, UINT64 zip64_offset )
+{
+    write_uint32( buffer, ZIP64_END_DIRECTORY_LOCATOR_SIGNATURE );
+    write_uint32( buffer + 4, 0 );
+    write_uint64( buffer + 8, zip64_offset );
+    write_uint32( buffer + 16, 1 );
+}
+
+static void write_appx_zip64_presignature_eocd( BYTE *buffer )
+{
+    write_uint32( buffer, ZIP_END_DIRECTORY_SIGNATURE );
+    write_uint16( buffer + 4, 0 );
+    write_uint16( buffer + 6, 0 );
+    write_uint16( buffer + 8, 0xffff );
+    write_uint16( buffer + 10, 0xffff );
+    write_uint32( buffer + 12, 0xffffffff );
+    write_uint32( buffer + 16, 0xffffffff );
+    write_uint16( buffer + 20, 0 );
+}
+
+static HRESULT calculate_presignature_central_digest(
+    WINE_APPX_ARCHIVE *archive, const struct archive_entry *signature,
+    BYTE digest[APPX_SIGNATURE_SHA256_SIZE] )
+{
+    BYTE zip64_header[ZIP64_END_DIRECTORY_MIN_SIZE];
+    BYTE locator[ZIP64_END_DIRECTORY_LOCATOR_SIZE];
+    BYTE eocd[ZIP_END_DIRECTORY_SIZE];
+    struct sha256_context hash;
+    UINT64 directory_end, signature_end, directory_size, zip64_offset;
+    UINT64 zip64_record_size;
+    UINT32 entries;
+    HRESULT hr;
+
+    if (archive->count < 2 ||
+        signature->record_end != archive->central_directory_offset ||
+        !add_uint64( archive->central_directory_offset,
+                     archive->central_directory_size, &directory_end ) ||
+        !add_uint64( signature->central_header_offset,
+                     signature->central_header_size, &signature_end ) ||
+        signature_end != directory_end ||
+        signature->central_header_offset < archive->central_directory_offset)
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
+
+    entries = archive->count - 1;
+    directory_size = signature->central_header_offset -
+                     archive->central_directory_offset;
+    if (!add_uint64( signature->local_header_offset, directory_size, &zip64_offset ))
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
+
+    if (FAILED(hr = sha256_init( &hash ))) return hr;
+    if (FAILED(hr = hash_file_range( archive->file, archive->central_directory_offset,
+                                     directory_size, &hash )))
+        goto done;
+
+    if (!archive->zip64_directory)
+    {
+        if (entries > 0xffff || directory_size > MAXDWORD ||
+            signature->local_header_offset > MAXDWORD)
+        {
+            hr = APPX_E_INVALID_PACKAGING_LAYOUT;
+            goto done;
+        }
+        write_appx_zip32_presignature_footer( eocd, (UINT16)entries,
+                                              (UINT32)directory_size,
+                                              (UINT32)signature->local_header_offset );
+        if (SUCCEEDED(hr = sha256_update( &hash, eocd, sizeof(eocd) )))
+            hr = sha256_finish( &hash, digest );
+    }
+    else
+    {
+        if (!add_uint64( ZIP64_END_DIRECTORY_MIN_SIZE - 12,
+                         archive->zip64_extensible_size, &zip64_record_size ))
+        {
+            hr = APPX_E_INVALID_PACKAGING_LAYOUT;
+            goto done;
+        }
+        write_appx_zip64_presignature_header(
+            zip64_header, zip64_record_size, archive->zip64_version_made,
+            archive->zip64_version_needed, entries, directory_size,
+            signature->local_header_offset );
+        write_appx_zip64_presignature_locator( locator, zip64_offset );
+        write_appx_zip64_presignature_eocd( eocd );
+
+        if (FAILED(hr = sha256_update( &hash, zip64_header, sizeof(zip64_header) )) ||
+            FAILED(hr = hash_file_range( archive->file,
+                                         archive->zip64_extensible_offset,
+                                         archive->zip64_extensible_size, &hash )) ||
+            FAILED(hr = sha256_update( &hash, locator, sizeof(locator) )) ||
+            FAILED(hr = sha256_update( &hash, eocd, sizeof(eocd) )))
+            goto done;
+        if (SUCCEEDED(hr))
+            hr = sha256_finish( &hash, digest );
+    }
+
+done:
+    sha256_destroy( &hash );
+    return hr;
+}
+
+static HRESULT calculate_raw_range_digest( WINE_APPX_ARCHIVE *archive, UINT64 offset,
+                                           UINT64 size,
+                                           BYTE digest[APPX_SIGNATURE_SHA256_SIZE] )
+{
+    struct sha256_context hash;
+    HRESULT hr;
+
+    if (FAILED(hr = sha256_init( &hash ))) return hr;
+    if (SUCCEEDED(hr = hash_file_range( archive->file, offset, size, &hash )))
+        hr = sha256_finish( &hash, digest );
+    sha256_destroy( &hash );
+    return hr;
+}
+
+static HRESULT calculate_entry_digest( WINE_APPX_ARCHIVE *archive, UINT32 index,
+                                       BYTE digest[APPX_SIGNATURE_SHA256_SIZE] )
+{
+    BYTE buffer[HASH_IO_BUFFER_SIZE];
+    struct sha256_context hash;
+    WINE_APPX_ARCHIVE_STREAM *stream = NULL;
+    HRESULT hr;
+
+    if (FAILED(hr = sha256_init( &hash ))) return hr;
+    if (FAILED(hr = wine_appx_archive_stream_open( archive, index, &stream )))
+        goto done;
+
+    for (;;)
+    {
+        UINT32 read = 0;
+
+        hr = wine_appx_archive_stream_read( stream, buffer, sizeof(buffer), &read );
+        if (hr == S_FALSE)
+        {
+            hr = sha256_finish( &hash, digest );
+            break;
+        }
+        if (FAILED(hr)) break;
+        if (!read)
+        {
+            hr = APPX_E_CORRUPT_CONTENT;
+            break;
+        }
+        if (FAILED(hr = sha256_update( &hash, buffer, read ))) break;
+    }
+
+done:
+    if (stream) wine_appx_archive_stream_close( stream );
+    sha256_destroy( &hash );
+    return hr;
+}
+
+HRESULT WINAPI appx_archive_calculate_digest_set(
+    WINE_APPX_ARCHIVE *archive, struct appx_signature_digest_set *set )
+{
+    static const WCHAR signature_path[] =
+        {'A','p','p','x','S','i','g','n','a','t','u','r','e','.','p','7','x',0};
+    static const WCHAR content_types_path[] =
+        {'[','C','o','n','t','e','n','t','_','T','y','p','e','s',']','.','x','m','l',0};
+    static const WCHAR block_map_path[] =
+        {'A','p','p','x','B','l','o','c','k','M','a','p','.','x','m','l',0};
+    static const WCHAR code_integrity_path[] =
+        {'A','p','p','x','M','e','t','a','d','a','t','a','\\',
+         'C','o','d','e','I','n','t','e','g','r','i','t','y','.','c','a','t',0};
+    struct archive_entry *signature, *entry;
+    UINT32 index;
+    HRESULT hr;
+
+    if (!set) return E_INVALIDARG;
+    memset( set, 0, sizeof(*set) );
+    if (!archive) return E_INVALIDARG;
+
+    if (FAILED(hr = find_file_entry( archive, signature_path, &signature, NULL )))
+        goto failed;
+    /* Validate the signature position before hashing a potentially huge AXPC range. */
+    if (FAILED(hr = calculate_presignature_central_digest(
+            archive, signature, set->central_directory )))
+        goto failed;
+    set->flags |= APPX_SIGNATURE_DIGEST_CENTRAL_DIRECTORY;
+
+    if (FAILED(hr = calculate_raw_range_digest( archive, 0,
+                                                signature->local_header_offset,
+                                                set->package_contents )))
+        goto failed;
+    set->flags |= APPX_SIGNATURE_DIGEST_PACKAGE_CONTENTS;
+
+    if (FAILED(hr = find_file_entry( archive, content_types_path, &entry, &index )) ||
+        FAILED(hr = calculate_entry_digest( archive, index, set->content_types )))
+        goto failed;
+    set->flags |= APPX_SIGNATURE_DIGEST_CONTENT_TYPES;
+
+    if (FAILED(hr = find_file_entry( archive, block_map_path, &entry, &index )) ||
+        FAILED(hr = calculate_entry_digest( archive, index, set->block_map )))
+        goto failed;
+    set->flags |= APPX_SIGNATURE_DIGEST_BLOCK_MAP;
+
+    hr = find_file_entry( archive, code_integrity_path, &entry, &index );
+    if (hr == HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ))
+        return S_OK;
+    if (FAILED(hr) || FAILED(hr = calculate_entry_digest( archive, index,
+                                                          set->code_integrity )))
+        goto failed;
+    set->flags |= APPX_SIGNATURE_DIGEST_CODE_INTEGRITY;
+    return S_OK;
+
+failed:
+    memset( set, 0, sizeof(*set) );
+    return hr;
 }
