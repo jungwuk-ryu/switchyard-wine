@@ -48,11 +48,13 @@ typedef struct {
 static nsresult handle_blur(HTMLDocumentNode*,nsIDOMEvent*);
 static nsresult handle_focus(HTMLDocumentNode*,nsIDOMEvent*);
 static nsresult handle_keypress(HTMLDocumentNode*,nsIDOMEvent*);
+static nsresult handle_dom_content_loaded(HTMLDocumentNode*,nsIDOMEvent*);
 static nsresult handle_pageshow(HTMLDocumentNode*,nsIDOMEvent*);
 static nsresult handle_pagehide(HTMLDocumentNode*,nsIDOMEvent*);
 static nsresult handle_load(HTMLDocumentNode*,nsIDOMEvent*);
 static nsresult handle_beforeunload(HTMLDocumentNode*,nsIDOMEvent*);
 static nsresult handle_unload(HTMLDocumentNode*,nsIDOMEvent*);
+static nsresult handle_htmlevent(HTMLDocumentNode*,nsIDOMEvent*);
 
 enum doc_event_listener_flags {
     BUBBLES  = 0x0001,
@@ -67,6 +69,7 @@ static const struct {
     { EVENTID_BLUR,             0,                  handle_blur },
     { EVENTID_FOCUS,            0,                  handle_focus },
     { EVENTID_KEYPRESS,         BUBBLES,            handle_keypress },
+    { EVENTID_DOMCONTENTLOADED, OVERRIDE,           handle_dom_content_loaded },
     { EVENTID_PAGESHOW,         OVERRIDE,           handle_pageshow },
     { EVENTID_PAGEHIDE,         OVERRIDE,           handle_pagehide },
     { EVENTID_LOAD,             OVERRIDE,           handle_load },
@@ -232,6 +235,13 @@ static nsresult handle_keypress(HTMLDocumentNode *doc, nsIDOMEvent *event)
         handle_edit_event(doc, event);
 
     return NS_OK;
+}
+
+static nsresult handle_dom_content_loaded(HTMLDocumentNode *doc, nsIDOMEvent *event)
+{
+    if(!prepare_for_dom_content_loaded(doc))
+        return NS_OK;
+    return handle_htmlevent(doc, event);
 }
 
 static nsresult handle_pageshow(HTMLDocumentNode *doc, nsIDOMEvent *nsevent)

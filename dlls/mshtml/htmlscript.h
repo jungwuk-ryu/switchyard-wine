@@ -26,6 +26,7 @@ struct HTMLScriptElement {
     nsIDOMHTMLScriptElement *nsscript;
     BOOL parsed;
     BOOL parse_on_bind;
+    BOOL parser_deferred;
     BOOL pending_readystatechange_event;
     READYSTATE readystate;
     WCHAR *src_text; /* sctipt text downloaded from src */
@@ -44,6 +45,9 @@ HRESULT load_script(HTMLScriptElement*,const WCHAR*,BOOL);
 void release_script_hosts(HTMLInnerWindow*);
 void connect_scripts(HTMLInnerWindow*);
 void doc_insert_script(HTMLInnerWindow*,HTMLScriptElement*,BOOL);
+BOOL execute_deferred_scripts(HTMLInnerWindow*);
+void resume_deferred_document_load(HTMLDocumentNode*);
+BOOL prepare_for_dom_content_loaded(HTMLDocumentNode*);
 IDispatch *script_parse_event(HTMLInnerWindow*,LPCWSTR);
 HRESULT exec_script(HTMLInnerWindow*,const WCHAR*,const WCHAR*,VARIANT*);
 void update_browser_script_mode(GeckoBrowser*,IUri*);

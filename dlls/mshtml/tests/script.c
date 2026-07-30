@@ -5205,6 +5205,7 @@ static void run_js_tests(void)
 {
     run_js_script("jstest.html");
     run_js_script("exectest.html");
+    run_js_script("deferscript.html");
     run_js_script("events.html");
 
     SET_EXPECT(GetTypeInfo);

@@ -823,7 +823,11 @@ struct HTMLInnerWindow {
 
     unsigned blocking_depth;
     unsigned parser_callback_cnt;
+    BOOL deferred_scripts_ready;
+    BOOL deferred_document_load_pending;
+    BOOL deferred_dom_content_loaded_pending;
     struct list script_queue;
+    struct list deferred_script_queue;
 
     global_prop_t *global_props;
     DWORD global_prop_cnt;
@@ -1194,6 +1198,7 @@ struct HTMLDocumentNode {
     struct list selection_list;
     struct list range_list;
     struct list plugin_hosts;
+    struct list mutation_observers;
 };
 
 HRESULT HTMLDocument_Create(IUnknown*,REFIID,void**);
@@ -1247,6 +1252,7 @@ compat_mode_t lock_document_mode(HTMLDocumentNode*);
 void init_mutation(nsIComponentManager*);
 void init_document_mutation(HTMLDocumentNode*);
 void release_document_mutation(HTMLDocumentNode*);
+void traverse_document_mutation_observers(HTMLDocumentNode*,nsCycleCollectionTraversalCallback*);
 JSContext *get_context_from_document(nsIDOMDocument*);
 
 void HTMLDocument_LockContainer(HTMLDocumentObj*,BOOL);

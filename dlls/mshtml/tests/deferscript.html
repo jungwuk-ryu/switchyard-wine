@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="X-UA-Compatible" content="IE=10">
+<script>
+function ok(condition, message) {
+    return external.ok(condition, message);
+}
+
+var defer_order = ["head-before"];
+var defer_count = 0;
+var deferred_dom_content_loaded = false;
+</script>
+<script defer src="deferscript.js"></script>
+<script defer src="deferscript.js"></script>
+<script>
+defer_order.push("head-after");
+ok(defer_count === 0, "deferred scripts executed while parsing the head");
+</script>
+</head>
+<body>
+<div id="defer-target"></div>
+<script>
+defer_order.push("body");
+ok(defer_count === 0, "deferred scripts executed before the body was parsed");
+
+window.onload = function() {
+    ok(defer_count === 2, "defer_count = " + defer_count);
+    ok(deferred_dom_content_loaded, "deferred DOMContentLoaded listener was not called");
+    ok(defer_order.join(",") === "head-before,head-after,body,deferred-1,deferred-2,DOMContentLoaded",
+       "defer_order = " + defer_order.join(","));
+    external.reportSuccess();
+};
+</script>
+</body>
+</html>

@@ -1038,8 +1038,19 @@ static void script_file_available(ScriptBSC *bsc)
     assert(window != NULL);
 
     hres = get_binding_text(bsc, &script_elem->src_text);
-    if(FAILED(hres))
+    if(FAILED(hres)) {
+        if(script_elem->parser_deferred && window->deferred_scripts_ready
+           && execute_deferred_scripts(window))
+            resume_deferred_document_load(window->doc);
         return;
+    }
+
+    if(script_elem->parser_deferred) {
+        TRACE("Deferred parser script is ready\n");
+        if(window->deferred_scripts_ready && execute_deferred_scripts(window))
+            resume_deferred_document_load(window->doc);
+        return;
+    }
 
     script_host = get_elem_script_host(window, script_elem);
     if(!script_host)
@@ -1135,12 +1146,14 @@ static HRESULT ScriptBSC_start_binding(BSCallback *bsc)
 static HRESULT ScriptBSC_stop_binding(BSCallback *bsc, HRESULT result)
 {
     ScriptBSC *This = impl_from_BSCallback(bsc);
+    BOOL parser_deferred;
     nsresult nsres;
 
     if(SUCCEEDED(result) && !This->script_elem)
         result = E_UNEXPECTED;
 
     assert(FAILED(result) || This->script_elem->binding == &This->bsc);
+    parser_deferred = This->script_elem->parser_deferred;
     This->script_elem->binding = NULL;
 
     if(This->script_elem->readystate == READYSTATE_LOADING)
@@ -1153,6 +1166,9 @@ static HRESULT ScriptBSC_stop_binding(BSCallback *bsc, HRESULT result)
         free(This->buf);
         This->buf = NULL;
         This->size = 0;
+        if(parser_deferred && This->bsc.window->deferred_scripts_ready
+           && execute_deferred_scripts(This->bsc.window))
+            resume_deferred_document_load(This->bsc.window->doc);
     }
 
     if(This->request) {
@@ -1493,6 +1509,26 @@ void doc_insert_script(HTMLInnerWindow *window, HTMLScriptElement *script_elem, 
 
     if(is_complete)
         set_script_elem_readystate(script_elem, READYSTATE_COMPLETE);
+}
+
+BOOL execute_deferred_scripts(HTMLInnerWindow *window)
+{
+    script_queue_entry_t *queue;
+
+    while(!list_empty(&window->deferred_script_queue)) {
+        queue = LIST_ENTRY(list_head(&window->deferred_script_queue), script_queue_entry_t, entry);
+        if(queue->script->binding)
+            return FALSE;
+
+        list_remove(&queue->entry);
+        queue->script->parser_deferred = FALSE;
+        if(queue->script->src_text)
+            doc_insert_script(window, queue->script, TRUE);
+        IHTMLScriptElement_Release(&queue->script->IHTMLScriptElement_iface);
+        free(queue);
+    }
+
+    return TRUE;
 }
 
 IDispatch *script_parse_event(HTMLInnerWindow *window, LPCWSTR text)
@@ -1984,6 +2020,15 @@ void release_script_hosts(HTMLInnerWindow *window)
         queue_iter = LIST_ENTRY(list_head(&window->script_queue), script_queue_entry_t, entry);
 
         list_remove(&queue_iter->entry);
+        IHTMLScriptElement_Release(&queue_iter->script->IHTMLScriptElement_iface);
+        free(queue_iter);
+    }
+
+    while(!list_empty(&window->deferred_script_queue)) {
+        queue_iter = LIST_ENTRY(list_head(&window->deferred_script_queue), script_queue_entry_t, entry);
+
+        list_remove(&queue_iter->entry);
+        queue_iter->script->parser_deferred = FALSE;
         IHTMLScriptElement_Release(&queue_iter->script->IHTMLScriptElement_iface);
         free(queue_iter);
     }

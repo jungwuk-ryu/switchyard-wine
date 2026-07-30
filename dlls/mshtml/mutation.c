@@ -53,6 +53,15 @@ static const IID NS_ICONTENTUTILS_CID =
 
 static nsIContentUtils *content_utils;
 
+enum mutation_type {
+    MUTATION_ATTRIBUTES,
+    MUTATION_CHARACTER_DATA,
+    MUTATION_CHILD_LIST
+};
+
+static void notify_mutation_observers(HTMLDocumentNode*, nsIDOMNode*, enum mutation_type);
+static void clear_document_mutation_observers(HTMLDocumentNode*);
+
 static BOOL is_iexplore(void)
 {
     static volatile char cache = -1;
@@ -289,6 +298,22 @@ static void parse_complete(HTMLDocumentObj *doc)
     /* FIXME: IE7 calls EnableModelless(TRUE), EnableModelless(FALSE) and sets interactive state here */
 }
 
+static void dispatch_pending_dom_content_loaded(HTMLDocumentNode *doc)
+{
+    DOMEvent *event;
+    HRESULT hres;
+
+    if(!doc->window->deferred_dom_content_loaded_pending || !doc->dom_document)
+        return;
+    doc->window->deferred_dom_content_loaded_pending = FALSE;
+
+    hres = create_document_event(doc, EVENTID_DOMCONTENTLOADED, &event);
+    if(SUCCEEDED(hres)) {
+        dispatch_event(&doc->node.event_target, event);
+        IDOMEvent_Release(&event->IDOMEvent_iface);
+    }
+}
+
 static nsresult run_end_load(HTMLDocumentNode *This, nsISupports *arg1, nsISupports *arg2)
 {
     HTMLDocumentObj *doc_obj = This->doc_obj;
@@ -301,6 +326,15 @@ static nsresult run_end_load(HTMLDocumentNode *This, nsISupports *arg1, nsISuppo
     IHTMLWindow2_AddRef(&window->base.IHTMLWindow2_iface);
 
     if(This == doc_obj->doc_node) {
+        window->deferred_scripts_ready = TRUE;
+        if(!execute_deferred_scripts(window)) {
+            window->deferred_document_load_pending = TRUE;
+            IHTMLWindow2_Release(&window->base.IHTMLWindow2_iface);
+            return NS_OK;
+        }
+        window->deferred_scripts_ready = FALSE;
+        window->deferred_document_load_pending = FALSE;
+
         /*
          * This should be done in the worker thread that parses HTML,
          * but we don't have such thread (Gecko parses HTML for us).
@@ -315,9 +349,42 @@ static nsresult run_end_load(HTMLDocumentNode *This, nsISupports *arg1, nsISuppo
     if(This->window == window && window->base.outer_window) {
         window->dom_interactive_time = get_time_stamp();
         set_ready_state(window->base.outer_window, READYSTATE_INTERACTIVE);
+        dispatch_pending_dom_content_loaded(This);
     }
     IHTMLWindow2_Release(&window->base.IHTMLWindow2_iface);
     return NS_OK;
+}
+
+static BOOL is_parser_deferred_script(HTMLScriptElement *script_elem)
+{
+    cpp_bool async = FALSE, defer = FALSE;
+    const PRUnichar *src;
+    nsAString src_str;
+    nsresult nsres;
+    BOOL ret;
+
+    nsres = nsIDOMHTMLScriptElement_GetDefer(script_elem->nsscript, &defer);
+    if(NS_FAILED(nsres) || !defer)
+        return FALSE;
+
+    nsres = nsIDOMHTMLScriptElement_GetAsync(script_elem->nsscript, &async);
+    if(NS_FAILED(nsres) || async)
+        return FALSE;
+
+    if(script_elem->binding || script_elem->parsed || script_elem->parse_on_bind)
+        return FALSE;
+
+    nsAString_Init(&src_str, NULL);
+    nsres = nsIDOMHTMLScriptElement_GetSrc(script_elem->nsscript, &src_str);
+    if(NS_FAILED(nsres)) {
+        nsAString_Finish(&src_str);
+        return FALSE;
+    }
+
+    nsAString_GetData(&src_str, &src);
+    ret = *src != 0;
+    nsAString_Finish(&src_str);
+    return ret;
 }
 
 static nsresult run_insert_script(HTMLDocumentNode *doc, nsISupports *script_iface, nsISupports *parser_iface)
@@ -327,6 +394,7 @@ static nsresult run_insert_script(HTMLDocumentNode *doc, nsISupports *script_ifa
     nsIParser *nsparser = NULL;
     script_queue_entry_t *iter;
     HTMLInnerWindow *window;
+    BOOL parser_deferred = FALSE;
     nsresult nsres;
     HRESULT hres;
 
@@ -358,7 +426,18 @@ static nsresult run_insert_script(HTMLDocumentNode *doc, nsISupports *script_ifa
         return NS_ERROR_FAILURE;
     }
 
-    if(nsparser) {
+    if(is_parser_deferred_script(script_elem)) {
+        iter = malloc(sizeof(*iter));
+        if(iter) {
+            script_elem->parser_deferred = TRUE;
+            IHTMLScriptElement_AddRef(&script_elem->IHTMLScriptElement_iface);
+            iter->script = script_elem;
+            list_add_tail(&window->deferred_script_queue, &iter->entry);
+            parser_deferred = TRUE;
+        }
+    }
+
+    if(nsparser && !parser_deferred) {
         nsIParser_BeginEvaluatingParserInsertedScript(nsparser);
         window->parser_callback_cnt++;
     }
@@ -376,11 +455,12 @@ static nsresult run_insert_script(HTMLDocumentNode *doc, nsISupports *script_ifa
         free(iter);
     }
 
-    if(nsparser) {
+    if(nsparser && !parser_deferred) {
         window->parser_callback_cnt--;
         nsIParser_EndEvaluatingParserInsertedScript(nsparser);
-        nsIParser_Release(nsparser);
     }
+    if(nsparser)
+        nsIParser_Release(nsparser);
 
     IHTMLWindow2_Release(&window->base.IHTMLWindow2_iface);
     IHTMLScriptElement_Release(&script_elem->IHTMLScriptElement_iface);
@@ -728,6 +808,34 @@ static void add_script_runner(HTMLDocumentNode *This, runnable_proc_t proc, nsIS
     nsIRunnable_Release(&runnable->nsIRunnable_iface);
 }
 
+static nsresult run_resume_deferred_document_load(HTMLDocumentNode *doc, nsISupports *arg1, nsISupports *arg2)
+{
+    if(doc->window && doc->window->deferred_document_load_pending)
+        return run_end_load(doc, NULL, NULL);
+    return NS_OK;
+}
+
+void resume_deferred_document_load(HTMLDocumentNode *doc)
+{
+    if(doc)
+        add_script_runner(doc, run_resume_deferred_document_load, NULL, NULL);
+}
+
+BOOL prepare_for_dom_content_loaded(HTMLDocumentNode *doc)
+{
+    HTMLInnerWindow *window = doc->window;
+
+    if(!window || (list_empty(&window->deferred_script_queue) && !window->deferred_document_load_pending))
+        return TRUE;
+
+    window->deferred_dom_content_loaded_pending = TRUE;
+    if(!window->deferred_scripts_ready || !execute_deferred_scripts(window))
+        return FALSE;
+
+    run_end_load(doc, NULL, NULL);
+    return FALSE;
+}
+
 static inline HTMLDocumentNode *impl_from_nsIDocumentObserver(nsIDocumentObserver *iface)
 {
     return CONTAINING_RECORD(iface, HTMLDocumentNode, nsIDocumentObserver_iface);
@@ -777,6 +885,19 @@ static void NSAPI nsDocumentObserver_CharacterDataWillChange(nsIDocumentObserver
 static void NSAPI nsDocumentObserver_CharacterDataChanged(nsIDocumentObserver *iface,
         nsIDocument *aDocument, nsIContent *aContent, void /*CharacterDataChangeInfo*/ *aInfo)
 {
+    HTMLDocumentNode *This = impl_from_nsIDocumentObserver(iface);
+    nsIDOMNode *node;
+    nsresult nsres;
+
+    TRACE("(%p)->(%p)\n", This, aContent);
+
+    if(!aContent)
+        return;
+    nsres = nsIContent_QueryInterface(aContent, &IID_nsIDOMNode, (void**)&node);
+    if(NS_SUCCEEDED(nsres)) {
+        notify_mutation_observers(This, node, MUTATION_CHARACTER_DATA);
+        nsIDOMNode_Release(node);
+    }
 }
 
 static void NSAPI nsDocumentObserver_AttributeWillChange(nsIDocumentObserver *iface, nsIDocument *aDocument,
@@ -804,6 +925,7 @@ static void NSAPI nsDocumentObserver_AttributeChanged(nsIDocumentObserver *iface
     assert(nsres == NS_OK);
 
     event_attr_changed(This, elem, name);
+    notify_mutation_observers(This, (nsIDOMNode*)elem, MUTATION_ATTRIBUTES);
     nsAString_Finish(&name_str);
     nsIDOMElement_Release(elem);
 }
@@ -821,17 +943,50 @@ static void NSAPI nsDocumentObserver_AttributeSetToCurrentValue(nsIDocumentObser
 static void NSAPI nsDocumentObserver_ContentAppended(nsIDocumentObserver *iface, nsIDocument *aDocument,
         nsIContent *aContainer, nsIContent *aFirstNewContent, LONG aNewIndexInContainer)
 {
+    HTMLDocumentNode *This = impl_from_nsIDocumentObserver(iface);
+    nsIDOMNode *node;
+    nsresult nsres;
+
+    if(!aContainer)
+        return;
+    nsres = nsIContent_QueryInterface(aContainer, &IID_nsIDOMNode, (void**)&node);
+    if(NS_SUCCEEDED(nsres)) {
+        notify_mutation_observers(This, node, MUTATION_CHILD_LIST);
+        nsIDOMNode_Release(node);
+    }
 }
 
 static void NSAPI nsDocumentObserver_ContentInserted(nsIDocumentObserver *iface, nsIDocument *aDocument,
         nsIContent *aContainer, nsIContent *aChild, LONG aIndexInContainer)
 {
+    HTMLDocumentNode *This = impl_from_nsIDocumentObserver(iface);
+    nsIDOMNode *node;
+    nsresult nsres;
+
+    if(!aContainer)
+        return;
+    nsres = nsIContent_QueryInterface(aContainer, &IID_nsIDOMNode, (void**)&node);
+    if(NS_SUCCEEDED(nsres)) {
+        notify_mutation_observers(This, node, MUTATION_CHILD_LIST);
+        nsIDOMNode_Release(node);
+    }
 }
 
 static void NSAPI nsDocumentObserver_ContentRemoved(nsIDocumentObserver *iface, nsIDocument *aDocument,
         nsIContent *aContainer, nsIContent *aChild, LONG aIndexInContainer,
         nsIContent *aProviousSibling)
 {
+    HTMLDocumentNode *This = impl_from_nsIDocumentObserver(iface);
+    nsIDOMNode *node;
+    nsresult nsres;
+
+    if(!aContainer)
+        return;
+    nsres = nsIContent_QueryInterface(aContainer, &IID_nsIDOMNode, (void**)&node);
+    if(NS_SUCCEEDED(nsres)) {
+        notify_mutation_observers(This, node, MUTATION_CHILD_LIST);
+        nsIDOMNode_Release(node);
+    }
 }
 
 static void NSAPI nsDocumentObserver_NodeWillBeDestroyed(nsIDocumentObserver *iface, const nsINode *aNode)
@@ -1058,6 +1213,7 @@ void init_document_mutation(HTMLDocumentNode *doc)
     nsIDocument *nsdoc;
     nsresult nsres;
 
+    list_init(&doc->mutation_observers);
     doc->nsIDocumentObserver_iface.lpVtbl = &nsDocumentObserverVtbl;
 
     nsres = nsIDOMDocument_QueryInterface(doc->dom_document, &IID_nsIDocument, (void**)&nsdoc);
@@ -1074,6 +1230,8 @@ void release_document_mutation(HTMLDocumentNode *doc)
 {
     nsIDocument *nsdoc;
     nsresult nsres;
+
+    clear_document_mutation_observers(doc);
 
     nsres = nsIDOMDocument_QueryInterface(doc->dom_document, &IID_nsIDocument, (void**)&nsdoc);
     if(NS_FAILED(nsres)) {
@@ -1132,6 +1290,31 @@ struct mutation_observer {
 
     DispatchEx dispex;
     IDispatch *callback;
+
+    struct list registrations;
+    BOOL callback_pending;
+    BOOL has_records;
+};
+
+struct mutation_registration {
+    struct list observer_entry;
+    struct list document_entry;
+
+    struct mutation_observer *observer;
+    HTMLDocumentNode *document;
+    nsIDOMNode *target;
+    nsINode *mutation_target;
+
+    BOOL attributes;
+    BOOL character_data;
+    BOOL child_list;
+    BOOL subtree;
+};
+
+struct mutation_observer_task {
+    event_task_t header;
+    struct mutation_observer *observer;
+    BOOL ran;
 };
 
 static inline struct mutation_observer *impl_from_IWineMSHTMLMutationObserver(IWineMSHTMLMutationObserver *iface)
@@ -1142,32 +1325,315 @@ static inline struct mutation_observer *impl_from_IWineMSHTMLMutationObserver(IW
 DISPEX_IDISPATCH_IMPL(MutationObserver, IWineMSHTMLMutationObserver,
                       impl_from_IWineMSHTMLMutationObserver(iface)->dispex)
 
+static void remove_mutation_registration(struct mutation_registration *registration)
+{
+    struct mutation_observer *observer = registration->observer;
+
+    nsIContentUtils_RemoveMutationObserver(content_utils, registration->mutation_target,
+            (nsIMutationObserver*)&registration->document->nsIDocumentObserver_iface);
+    list_remove(&registration->observer_entry);
+    list_remove(&registration->document_entry);
+    nsISupports_Release((nsISupports*)registration->mutation_target);
+    nsIDOMNode_Release(registration->target);
+    free(registration);
+
+    if(list_empty(&observer->registrations))
+        observer->has_records = FALSE;
+    IWineMSHTMLMutationObserver_Release(&observer->IWineMSHTMLMutationObserver_iface);
+}
+
+static void disconnect_mutation_observer(struct mutation_observer *observer)
+{
+    struct mutation_registration *registration, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE(registration, next, &observer->registrations,
+                             struct mutation_registration, observer_entry)
+        remove_mutation_registration(registration);
+    observer->has_records = FALSE;
+}
+
 static HRESULT WINAPI MutationObserver_disconnect(IWineMSHTMLMutationObserver *iface)
 {
     struct mutation_observer *This = impl_from_IWineMSHTMLMutationObserver(iface);
 
-    FIXME("(%p), stub\n", This);
+    TRACE("(%p)\n", This);
 
+    IWineMSHTMLMutationObserver_AddRef(iface);
+    disconnect_mutation_observer(This);
+    IWineMSHTMLMutationObserver_Release(iface);
     return S_OK;
+}
+
+static HRESULT get_mutation_option(IDispatch *options, const WCHAR *name, BOOL *ret)
+{
+    DISPPARAMS params = {0};
+    WCHAR *option_name = (WCHAR*)name;
+    VARIANT value, converted;
+    DISPID dispid;
+    HRESULT hres;
+
+    *ret = FALSE;
+    hres = IDispatch_GetIDsOfNames(options, &IID_NULL, &option_name, 1,
+                                   GetUserDefaultLCID(), &dispid);
+    if(hres == DISP_E_UNKNOWNNAME)
+        return S_OK;
+    if(FAILED(hres))
+        return hres;
+
+    VariantInit(&value);
+    hres = IDispatch_Invoke(options, dispid, &IID_NULL, GetUserDefaultLCID(),
+                            DISPATCH_PROPERTYGET, &params, &value, NULL, NULL);
+    if(FAILED(hres))
+        return hres;
+
+    if(V_VT(&value) == VT_EMPTY || V_VT(&value) == VT_NULL) {
+        hres = S_OK;
+    }else if(V_VT(&value) == VT_BOOL) {
+        *ret = V_BOOL(&value) != VARIANT_FALSE;
+        hres = S_OK;
+    }else {
+        VariantInit(&converted);
+        hres = VariantChangeType(&converted, &value, 0, VT_BOOL);
+        if(SUCCEEDED(hres))
+            *ret = V_BOOL(&converted) != VARIANT_FALSE;
+        VariantClear(&converted);
+    }
+
+    VariantClear(&value);
+    return hres;
 }
 
 static HRESULT WINAPI MutationObserver_observe(IWineMSHTMLMutationObserver *iface, IHTMLDOMNode *target,
                                                IDispatch *options)
 {
     struct mutation_observer *This = impl_from_IWineMSHTMLMutationObserver(iface);
+    struct mutation_registration *registration;
+    BOOL attributes, character_data, child_list, subtree;
+    nsINode *mutation_target;
+    HTMLDOMNode *node;
+    nsresult nsres;
+    HRESULT hres;
 
-    FIXME("(%p)->(%p %p), stub\n", This, target, options);
+    TRACE("(%p)->(%p %p)\n", This, target, options);
 
+    if(!target || !options || !(node = unsafe_impl_from_IHTMLDOMNode(target)) ||
+       !node->doc || !node->nsnode)
+        return E_INVALIDARG;
+
+    if(FAILED(hres = get_mutation_option(options, L"attributes", &attributes)) ||
+       FAILED(hres = get_mutation_option(options, L"characterData", &character_data)) ||
+       FAILED(hres = get_mutation_option(options, L"childList", &child_list)) ||
+       FAILED(hres = get_mutation_option(options, L"subtree", &subtree)))
+        return hres;
+    if(!attributes && !character_data && !child_list)
+        return E_INVALIDARG;
+
+    LIST_FOR_EACH_ENTRY(registration, &This->registrations,
+                        struct mutation_registration, observer_entry) {
+        if(registration->target == node->nsnode) {
+            registration->attributes = attributes;
+            registration->character_data = character_data;
+            registration->child_list = child_list;
+            registration->subtree = subtree;
+            return S_OK;
+        }
+    }
+
+    if(!(registration = calloc(1, sizeof(*registration))))
+        return E_OUTOFMEMORY;
+
+    nsres = nsIDOMNode_QueryInterface(node->nsnode, &IID_nsIContent, (void**)&mutation_target);
+    if(NS_FAILED(nsres))
+        nsres = nsIDOMNode_QueryInterface(node->nsnode, &IID_nsIDocument, (void**)&mutation_target);
+    if(NS_FAILED(nsres)) {
+        free(registration);
+        return map_nsresult(nsres);
+    }
+
+    nsres = nsIContentUtils_AddMutationObserver(content_utils, mutation_target,
+            (nsIMutationObserver*)&node->doc->nsIDocumentObserver_iface);
+    if(NS_FAILED(nsres)) {
+        nsISupports_Release((nsISupports*)mutation_target);
+        free(registration);
+        return map_nsresult(nsres);
+    }
+
+    registration->observer = This;
+    registration->document = node->doc;
+    registration->target = node->nsnode;
+    registration->mutation_target = mutation_target;
+    registration->attributes = attributes;
+    registration->character_data = character_data;
+    registration->child_list = child_list;
+    registration->subtree = subtree;
+    nsIDOMNode_AddRef(registration->target);
+    IWineMSHTMLMutationObserver_AddRef(iface);
+    list_add_tail(&This->registrations, &registration->observer_entry);
+    list_add_tail(&node->doc->mutation_observers, &registration->document_entry);
     return S_OK;
 }
 
 static HRESULT WINAPI MutationObserver_takeRecords(IWineMSHTMLMutationObserver *iface, IDispatch **ret)
 {
     struct mutation_observer *This = impl_from_IWineMSHTMLMutationObserver(iface);
+    IWineJSDispatch *records;
+    HTMLInnerWindow *window;
+    HRESULT hres;
 
-    FIXME("(%p)->(%p), stub\n", This, ret);
+    TRACE("(%p)->(%p)\n", This, ret);
 
-    return E_NOTIMPL;
+    if(!ret)
+        return E_POINTER;
+    *ret = NULL;
+
+    if(!(window = get_script_global(&This->dispex)) || !window->jscript) {
+        if(window)
+            IHTMLWindow2_Release(&window->base.IHTMLWindow2_iface);
+        return E_UNEXPECTED;
+    }
+
+    hres = IWineJScript_CreateArray(window->jscript, 0, &records);
+    IHTMLWindow2_Release(&window->base.IHTMLWindow2_iface);
+    if(FAILED(hres))
+        return hres;
+
+    This->has_records = FALSE;
+    *ret = (IDispatch*)records;
+    return S_OK;
+}
+
+static void mutation_observer_task_proc(event_task_t *event_task)
+{
+    struct mutation_observer_task *task = (struct mutation_observer_task*)event_task;
+    struct mutation_observer *observer = task->observer;
+    IWineJSDispatch *records;
+    DISPPARAMS params;
+    VARIANT args[2], result;
+    HRESULT hres;
+
+    task->ran = TRUE;
+    observer->callback_pending = FALSE;
+    if(!observer->has_records || !observer->callback)
+        return;
+    observer->has_records = FALSE;
+
+    if(!task->header.window->jscript)
+        return;
+    hres = IWineJScript_CreateArray(task->header.window->jscript, 0, &records);
+    if(FAILED(hres))
+        return;
+
+    VariantInit(args);
+    V_VT(args) = VT_DISPATCH;
+    V_DISPATCH(args) = (IDispatch*)&observer->IWineMSHTMLMutationObserver_iface;
+    VariantInit(args + 1);
+    V_VT(args + 1) = VT_DISPATCH;
+    V_DISPATCH(args + 1) = (IDispatch*)records;
+
+    params.rgvarg = args;
+    params.rgdispidNamedArgs = NULL;
+    params.cArgs = ARRAY_SIZE(args);
+    params.cNamedArgs = 0;
+    VariantInit(&result);
+    hres = call_disp_func(observer->callback, &params, &result);
+    if(FAILED(hres))
+        WARN("MutationObserver callback failed: %08lx\n", hres);
+    VariantClear(&result);
+    IWineJSDispatch_Release(records);
+}
+
+static void mutation_observer_task_destr(event_task_t *event_task)
+{
+    struct mutation_observer_task *task = (struct mutation_observer_task*)event_task;
+
+    if(!task->ran)
+        task->observer->callback_pending = FALSE;
+    IWineMSHTMLMutationObserver_Release(&task->observer->IWineMSHTMLMutationObserver_iface);
+}
+
+static void queue_mutation_observer(struct mutation_observer *observer, HTMLDocumentNode *document)
+{
+    struct mutation_observer_task *task;
+    HRESULT hres;
+
+    TRACE("(%p %p)\n", observer, document);
+
+    observer->has_records = TRUE;
+    if(observer->callback_pending || !document->window)
+        return;
+
+    if(!(task = calloc(1, sizeof(*task))))
+        return;
+
+    task->observer = observer;
+    IWineMSHTMLMutationObserver_AddRef(&observer->IWineMSHTMLMutationObserver_iface);
+    observer->callback_pending = TRUE;
+    hres = push_event_task(&task->header, document->window, mutation_observer_task_proc,
+                           mutation_observer_task_destr, document->window->task_magic);
+    if(FAILED(hres))
+        WARN("Could not queue MutationObserver callback: %08lx\n", hres);
+}
+
+static BOOL mutation_registration_matches(const struct mutation_registration *registration,
+                                          nsIDOMNode *target, enum mutation_type type)
+{
+    cpp_bool contains = FALSE;
+    nsresult nsres;
+
+    switch(type) {
+    case MUTATION_ATTRIBUTES:
+        if(!registration->attributes)
+            return FALSE;
+        break;
+    case MUTATION_CHARACTER_DATA:
+        if(!registration->character_data)
+            return FALSE;
+        break;
+    case MUTATION_CHILD_LIST:
+        if(!registration->child_list)
+            return FALSE;
+        break;
+    }
+
+    if(registration->target == target)
+        return TRUE;
+    if(!registration->subtree)
+        return FALSE;
+
+    nsres = nsIDOMNode_Contains(registration->target, target, &contains);
+    return NS_SUCCEEDED(nsres) && contains;
+}
+
+static void notify_mutation_observers(HTMLDocumentNode *document, nsIDOMNode *target,
+                                      enum mutation_type type)
+{
+    struct mutation_registration *registration;
+
+    LIST_FOR_EACH_ENTRY(registration, &document->mutation_observers,
+                        struct mutation_registration, document_entry) {
+        if(mutation_registration_matches(registration, target, type))
+            queue_mutation_observer(registration->observer, document);
+    }
+}
+
+void traverse_document_mutation_observers(HTMLDocumentNode *document,
+                                          nsCycleCollectionTraversalCallback *cb)
+{
+    struct mutation_registration *registration;
+
+    LIST_FOR_EACH_ENTRY(registration, &document->mutation_observers,
+                        struct mutation_registration, document_entry)
+        note_cc_edge((nsISupports*)&registration->observer->IWineMSHTMLMutationObserver_iface,
+                     "mutation_observer", cb);
+}
+
+static void clear_document_mutation_observers(HTMLDocumentNode *document)
+{
+    struct mutation_registration *registration, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE(registration, next, &document->mutation_observers,
+                             struct mutation_registration, document_entry)
+        remove_mutation_registration(registration);
 }
 
 static const IWineMSHTMLMutationObserverVtbl WineMSHTMLMutationObserverVtbl = {
@@ -1201,19 +1667,30 @@ static void *mutation_observer_query_interface(DispatchEx *dispex, REFIID riid)
 static void mutation_observer_traverse(DispatchEx *dispex, nsCycleCollectionTraversalCallback *cb)
 {
     struct mutation_observer *This = mutation_observer_from_DispatchEx(dispex);
+    struct mutation_registration *registration;
+
     if(This->callback)
         note_cc_edge((nsISupports*)This->callback, "callback", cb);
+    LIST_FOR_EACH_ENTRY(registration, &This->registrations,
+                        struct mutation_registration, observer_entry)
+        note_cc_edge((nsISupports*)registration->target, "target", cb);
 }
 
 static void mutation_observer_unlink(DispatchEx *dispex)
 {
     struct mutation_observer *This = mutation_observer_from_DispatchEx(dispex);
+
+    IWineMSHTMLMutationObserver_AddRef(&This->IWineMSHTMLMutationObserver_iface);
+    disconnect_mutation_observer(This);
     unlink_ref(&This->callback);
+    IWineMSHTMLMutationObserver_Release(&This->IWineMSHTMLMutationObserver_iface);
 }
 
 static void mutation_observer_destructor(DispatchEx *dispex)
 {
     struct mutation_observer *This = mutation_observer_from_DispatchEx(dispex);
+
+    assert(list_empty(&This->registrations));
     free(This);
 }
 
@@ -1255,6 +1732,7 @@ static HRESULT create_mutation_observer(DispatchEx *owner, IDispatch *callback,
 
     obj->IWineMSHTMLMutationObserver_iface.lpVtbl = &WineMSHTMLMutationObserverVtbl;
     init_dispatch_with_owner(&obj->dispex, &MutationObserver_dispex, owner);
+    list_init(&obj->registrations);
 
     IDispatch_AddRef(callback);
     obj->callback = callback;

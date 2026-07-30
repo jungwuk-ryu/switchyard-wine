@@ -1986,6 +1986,9 @@ void abort_window_bindings(HTMLInnerWindow *window)
     BSCallback *iter;
 
     remove_target_tasks(window->task_magic);
+    window->deferred_scripts_ready = FALSE;
+    window->deferred_document_load_pending = FALSE;
+    window->deferred_dom_content_loaded_pending = FALSE;
 
     while(!list_empty(&window->bindings)) {
         iter = LIST_ENTRY(window->bindings.next, BSCallback, entry);

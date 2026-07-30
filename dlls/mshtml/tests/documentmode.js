@@ -790,6 +790,24 @@ sync_test("attr_props", function() {
         ok(attr === null, "tabIndex attr not null.");
 });
 
+sync_test("localName", function() {
+    var v = document.documentMode, elem, attr, local_name;
+
+    if(v < 9)
+        return;
+
+    elem = document.createElement("div");
+    local_name = elem.localName;
+    ok(typeof local_name === "string" && local_name.toLowerCase() === "div",
+       "element.localName = " + local_name);
+
+    elem.setAttribute("data-test", "wine");
+    attr = elem.getAttributeNode("data-test");
+    local_name = attr.localName;
+    ok(typeof local_name === "string" && local_name.toLowerCase() === "data-test",
+       "attribute.localName = " + local_name);
+});
+
 sync_test("doc_props", function() {
     function test_exposed(prop, expect, is_todo) {
         var ok_ = is_todo ? todo_wine.ok : ok;
@@ -3876,6 +3894,35 @@ sync_test("MutationObserver", function() {
     test_exposed("observe");
     test_exposed("disconnect");
     test_exposed("takeRecords");
+});
+
+async_test("MutationObserver notification", function() {
+    var called = false, observer, records, text;
+
+    if (!window.MutationObserver) {
+        next_test();
+        return;
+    }
+
+    text = document.createTextNode("");
+    observer = new MutationObserver(function(records, source) {
+        ok(!called, "MutationObserver callback called more than once.");
+        called = true;
+        ok(Object.prototype.toString.call(records) === "[object Array]",
+           "MutationObserver records is not an Array.");
+        ok(source === observer, "MutationObserver callback source does not match observer.");
+        observer.disconnect();
+        next_test();
+    });
+
+    records = observer.takeRecords();
+    ok(Object.prototype.toString.call(records) === "[object Array]",
+       "takeRecords result is not an Array.");
+    ok(records.length === 0, "takeRecords returned " + records.length + " records.");
+
+    observer.observe(text, {characterData: true});
+    text.data = "changed";
+    ok(!called, "MutationObserver callback was synchronous.");
 });
 
 sync_test("initMessageEvent", function() {

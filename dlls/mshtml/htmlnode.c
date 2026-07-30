@@ -895,8 +895,14 @@ static HRESULT WINAPI HTMLDOMNode3_get_prefix(IHTMLDOMNode3 *iface, VARIANT *p)
 static HRESULT WINAPI HTMLDOMNode3_get_localName(IHTMLDOMNode3 *iface, VARIANT *p)
 {
     HTMLDOMNode *This = impl_from_IHTMLDOMNode3(iface);
-    FIXME("(%p)->(%p)\n", This, p);
-    return E_NOTIMPL;
+    nsAString nsstr;
+    nsresult nsres;
+
+    TRACE("(%p)->(%p)\n", This, p);
+
+    nsAString_Init(&nsstr, NULL);
+    nsres = nsIDOMNode_GetLocalName(This->nsnode, &nsstr);
+    return return_nsstr_variant(nsres, &nsstr, 0, p);
 }
 
 static HRESULT WINAPI HTMLDOMNode3_get_namespaceURI(IHTMLDOMNode3 *iface, VARIANT *p)

@@ -5427,6 +5427,8 @@ static void HTMLDocumentNode_traverse(DispatchEx *dispex, nsCycleCollectionTrave
         note_cc_edge((nsISupports*)This->dom_implementation, "dom_implementation", cb);
     if(This->namespaces)
         note_cc_edge((nsISupports*)This->namespaces, "namespaces", cb);
+    if(This->dom_document)
+        traverse_document_mutation_observers(This, cb);
 }
 
 static void HTMLDocumentNode_unlink(DispatchEx *dispex)

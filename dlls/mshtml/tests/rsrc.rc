@@ -22,6 +22,12 @@ winetest.js HTML "winetest.js"
 /* @makedep: exectest.html */
 exectest.html HTML "exectest.html"
 
+/* @makedep: deferscript.html */
+deferscript.html HTML "deferscript.html"
+
+/* @makedep: deferscript.js */
+deferscript.js HTML "deferscript.js"
+
 /* @makedep: asyncscriptload.js */
 asyncscriptload.js HTML "asyncscriptload.js"
 
