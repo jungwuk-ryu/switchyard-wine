@@ -456,6 +456,8 @@ static ULONG STDMETHODCALLTYPE device_AddRef(IDCompositionDevice *iface)
     return ref;
 }
 
+static void rgba_bgra_converter_destroy_all(struct composition_device *device);
+
 static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
 {
     struct composition_device *device = impl_from_IDCompositionDevice(iface);
@@ -470,14 +472,96 @@ static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
             WaitForSingleObject(device->thread, INFINITE);
             CloseHandle(device->thread);
         }
+        rgba_bgra_converter_destroy_all(device);
         free(device);
     }
 
     return ref;
 }
 
-/* TODO: Optimize this. There is plenty of room */
-static HRESULT create_bgra_surface_from_rgba(IDXGISurface *rgba_surface, IDXGISurface **bgra_surface)
+struct rgba_bgra_vertex
+{
+    float position[2];
+    float texcoord[2];
+};
+
+struct rgba_bgra_converter
+{
+    struct list entry;
+    IUnknown *device_identity;
+    ID3D11Device1 *device;
+    ID3DDeviceContextState *state;
+    ID3D11InputLayout *input_layout;
+    ID3D11VertexShader *vs;
+    ID3D11PixelShader *ps;
+    ID3D11Buffer *vb;
+    ID3D11SamplerState *sampler;
+    ID3D11Texture2D *scratch_texture;
+    IDXGISurface *scratch_surface;
+    ID3D11RenderTargetView *scratch_rtv;
+    UINT scratch_width;
+    UINT scratch_height;
+    DXGI_FORMAT scratch_format;
+};
+
+static void rgba_bgra_converter_release_scratch(struct rgba_bgra_converter *converter)
+{
+    if (converter->scratch_surface)
+    {
+        IDXGISurface_Release(converter->scratch_surface);
+        converter->scratch_surface = NULL;
+    }
+    if (converter->scratch_rtv)
+    {
+        ID3D11RenderTargetView_Release(converter->scratch_rtv);
+        converter->scratch_rtv = NULL;
+    }
+    if (converter->scratch_texture)
+    {
+        ID3D11Texture2D_Release(converter->scratch_texture);
+        converter->scratch_texture = NULL;
+    }
+    converter->scratch_width = 0;
+    converter->scratch_height = 0;
+    converter->scratch_format = DXGI_FORMAT_UNKNOWN;
+}
+
+static void rgba_bgra_converter_destroy(struct rgba_bgra_converter *converter)
+{
+    rgba_bgra_converter_release_scratch(converter);
+    if (converter->state)
+        ID3DDeviceContextState_Release(converter->state);
+    if (converter->sampler)
+        ID3D11SamplerState_Release(converter->sampler);
+    if (converter->vb)
+        ID3D11Buffer_Release(converter->vb);
+    if (converter->input_layout)
+        ID3D11InputLayout_Release(converter->input_layout);
+    if (converter->ps)
+        ID3D11PixelShader_Release(converter->ps);
+    if (converter->vs)
+        ID3D11VertexShader_Release(converter->vs);
+    if (converter->device)
+        ID3D11Device1_Release(converter->device);
+    if (converter->device_identity)
+        IUnknown_Release(converter->device_identity);
+    free(converter);
+}
+
+static void rgba_bgra_converter_destroy_all(struct composition_device *device)
+{
+    struct rgba_bgra_converter *converter, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE(converter, next, &device->rgba_bgra_converters,
+            struct rgba_bgra_converter, entry)
+    {
+        list_remove(&converter->entry);
+        rgba_bgra_converter_destroy(converter);
+    }
+}
+
+static HRESULT rgba_bgra_converter_create(ID3D11Device1 *d3d11_device,
+        IUnknown *device_identity, struct rgba_bgra_converter **out)
 {
     static const D3D11_INPUT_ELEMENT_DESC layout_desc[] =
     {
@@ -503,44 +587,13 @@ static HRESULT create_bgra_surface_from_rgba(IDXGISurface *rgba_surface, IDXGISu
         "    return src_texture.Sample(sam_linear, uv);\n"
         "}";
 
-    struct vec2
+    static const struct rgba_bgra_vertex quad[] =
     {
-        float x, y;
+        {{-1.0f, 1.0f}, {0.0f, 0.0f}},
+        {{1.0f, 1.0f}, {1.0f, 0.0f}},
+        {{-1.0f, -1.0f}, {0.0f, 1.0f}},
+        {{1.0f, -1.0f}, {1.0f, 1.0f}},
     };
-
-    static const struct
-    {
-        struct vec2 position;
-        struct vec2 texcoord;
-    } quad[] =
-    {
-        {{-1.0f, 1.0f}, {0.0f, 0.0f}},   /* Top-Left */
-        {{1.0f, 1.0f}, {1.0f, 0.0f}},    /* Top-Right */
-        {{-1.0f, -1.0f}, {0.0f, 1.0f}},  /* Bottom-Left */
-        {{1.0f, -1.0f}, {1.0f, 1.0f}},   /* Bottom-Right */
-    };
-
-    ID3D11Texture2D *src_texture = NULL, *dst_texture = NULL;
-    ID3DDeviceContextState *state = NULL, *old_state = NULL;
-    ID3D11DeviceContext1 *d3d11_device_context1 = NULL;
-    ID3D11DeviceContext *d3d11_device_context = NULL;
-    static ID3D10Blob *vs_blob = NULL, *ps_blob = NULL;
-    ID3D11InputLayout *input_layout = NULL;
-    D3D11_SAMPLER_DESC sampler_desc = {0};
-    D3D11_SUBRESOURCE_DATA resource_data;
-    ID3D11ShaderResourceView *srv = NULL;
-    ID3D11Device1 *d3d11_device = NULL;
-    ID3D11RenderTargetView *rtv = NULL;
-    ID3D11SamplerState *sampler = NULL;
-    D3D11_TEXTURE2D_DESC texture_desc;
-    DXGI_SURFACE_DESC surface_desc;
-    D3D11_BUFFER_DESC buffer_desc;
-    ID3D11VertexShader *vs = NULL;
-    ID3D11PixelShader *ps = NULL;
-    unsigned int stride, offset;
-    ID3D11Buffer *vb = NULL;
-    D3D11_VIEWPORT vp;
-    HRESULT hr;
 
     static const D3D_FEATURE_LEVEL feature_levels[] =
     {
@@ -550,117 +603,64 @@ static HRESULT create_bgra_surface_from_rgba(IDXGISurface *rgba_surface, IDXGISu
         D3D_FEATURE_LEVEL_10_0,
     };
 
-    hr = IDXGISurface_QueryInterface(rgba_surface, &IID_ID3D11Texture2D, (void **)&src_texture);
-    if (FAILED(hr))
-    {
-        ERR("Failed to get a ID3D11Texture2D, hr %#lx.\n", hr);
-        goto done;
-    }
+    struct rgba_bgra_converter *converter;
+    ID3D10Blob *vs_blob = NULL, *ps_blob = NULL;
+    D3D11_SAMPLER_DESC sampler_desc = {0};
+    D3D11_SUBRESOURCE_DATA resource_data;
+    D3D11_BUFFER_DESC buffer_desc;
+    HRESULT hr;
 
-    hr = IDXGISurface_GetDevice(rgba_surface, &IID_ID3D11Device1, (void **)&d3d11_device);
-    if (FAILED(hr))
-    {
-        ERR("Failed to get device, hr %#lx.\n", hr);
-        goto done;
-    }
+    *out = NULL;
 
-    hr = IDXGISurface_GetDesc(rgba_surface, &surface_desc);
-    if (FAILED(hr))
-    {
-        ERR("Failed to get the dxgi surface description, hr %#lx.\n", hr);
-        goto done;
-    }
+    if (!(converter = calloc(1, sizeof(*converter))))
+        return E_OUTOFMEMORY;
 
-    texture_desc.Width = surface_desc.Width;
-    texture_desc.Height = surface_desc.Height;
-    texture_desc.MipLevels = 1;
-    texture_desc.ArraySize = 1;
-    texture_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    texture_desc.SampleDesc.Count = 1;
-    texture_desc.SampleDesc.Quality = 0;
-    texture_desc.Usage = D3D11_USAGE_DEFAULT;
-    texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-    texture_desc.CPUAccessFlags = 0;
-    texture_desc.MiscFlags = D3D11_RESOURCE_MISC_GUARDED | D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
-    hr = ID3D11Device1_CreateTexture2D(d3d11_device, &texture_desc, NULL, &dst_texture);
-    if (FAILED(hr))
-    {
-        ERR("Failed to create a ID3D11Texture2D, hr %#lx.\n", hr);
-        goto done;
-    }
-
-    hr = ID3D11Device1_CreateShaderResourceView(d3d11_device, (ID3D11Resource *)src_texture, NULL, &srv);
-    if (FAILED(hr))
-    {
-        ERR("Failed to create a SRV, hr %#lx.\n", hr);
-        goto done;
-    }
-
-    hr = ID3D11Device1_CreateRenderTargetView(d3d11_device, (ID3D11Resource *)dst_texture, NULL, &rtv);
-    if (FAILED(hr))
-    {
-        ERR("Failed to create a RTV, hr %#lx.\n", hr);
-        goto done;
-    }
-
-    ID3D11Device1_GetImmediateContext(d3d11_device, &d3d11_device_context);
-    if (FAILED(hr = ID3D11DeviceContext_QueryInterface(d3d11_device_context, &IID_ID3D11DeviceContext1,
-                                                       (void **)&d3d11_device_context1)))
-    {
-        ERR("Failed to query ID3D11DeviceContext1, hr %#lx.\n", hr);
-        goto done;
-    }
+    list_init(&converter->entry);
+    converter->device = d3d11_device;
+    ID3D11Device1_AddRef(converter->device);
+    converter->device_identity = device_identity;
+    IUnknown_AddRef(converter->device_identity);
 
     if (FAILED(hr = ID3D11Device1_CreateDeviceContextState(d3d11_device, 0, feature_levels,
-                                                           ARRAY_SIZE(feature_levels), D3D11_SDK_VERSION,
-                                                           &IID_ID3D11Device1, NULL, &state)))
+            ARRAY_SIZE(feature_levels), D3D11_SDK_VERSION, &IID_ID3D11Device1, NULL, &converter->state)))
     {
         ERR("Failed to create device context state, hr %#lx.\n", hr);
         goto done;
     }
-    ID3D11DeviceContext1_SwapDeviceContextState(d3d11_device_context1, state, &old_state);
 
-    ID3D11DeviceContext1_OMSetRenderTargets(d3d11_device_context1, 1, &rtv, NULL);
-    ID3D11DeviceContext1_PSSetShaderResources(d3d11_device_context1, 0, 1, &srv);
-
-    /* Move this to dcomp device instance ? */
-    if (vs_blob == NULL)
+    if (FAILED(hr = D3DCompile(vs_code, sizeof(vs_code) - 1, "dcomp_rgba_bgra_vs",
+            NULL, NULL, "main", "vs_4_0", 0, 0, &vs_blob, NULL)))
     {
-        hr = D3DCompile(vs_code, sizeof(vs_code) - 1, "vs", NULL, NULL, "main", "vs_4_0", 0, 0, &vs_blob, NULL);
-        if (FAILED(hr))
-        {
-            ERR("Failed to compile vertex shader, hr %#lx.\n", hr);
-            goto done;
-        }
-
-        hr = D3DCompile(ps_code, sizeof(ps_code) - 1, "ps", NULL, NULL, "main", "ps_4_0", 0, 0, &ps_blob, NULL);
-        if (FAILED(hr))
-        {
-            ERR("Failed to compile pixel shader, hr %#lx.\n", hr);
-            goto done;
-        }
+        ERR("Failed to compile vertex shader, hr %#lx.\n", hr);
+        goto done;
     }
 
-    hr = ID3D11Device1_CreateVertexShader(d3d11_device, ID3D10Blob_GetBufferPointer(vs_blob),
-                                          ID3D10Blob_GetBufferSize(vs_blob), NULL, &vs);
-    if (FAILED(hr))
+    if (FAILED(hr = D3DCompile(ps_code, sizeof(ps_code) - 1, "dcomp_rgba_bgra_ps",
+            NULL, NULL, "main", "ps_4_0", 0, 0, &ps_blob, NULL)))
+    {
+        ERR("Failed to compile pixel shader, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (FAILED(hr = ID3D11Device1_CreateVertexShader(d3d11_device,
+            ID3D10Blob_GetBufferPointer(vs_blob), ID3D10Blob_GetBufferSize(vs_blob),
+            NULL, &converter->vs)))
     {
         ERR("Failed to create vertex shader, hr %#lx.\n", hr);
         goto done;
     }
 
-    hr = ID3D11Device1_CreatePixelShader(d3d11_device, ID3D10Blob_GetBufferPointer(ps_blob),
-                                         ID3D10Blob_GetBufferSize(ps_blob), NULL, &ps);
-    if (FAILED(hr))
+    if (FAILED(hr = ID3D11Device1_CreatePixelShader(d3d11_device,
+            ID3D10Blob_GetBufferPointer(ps_blob), ID3D10Blob_GetBufferSize(ps_blob),
+            NULL, &converter->ps)))
     {
         ERR("Failed to create pixel shader, hr %#lx.\n", hr);
         goto done;
     }
 
-    hr = ID3D11Device1_CreateInputLayout(d3d11_device, layout_desc, ARRAY_SIZE(layout_desc),
-                                         ID3D10Blob_GetBufferPointer(vs_blob),
-                                         ID3D10Blob_GetBufferSize(vs_blob), &input_layout);
-    if (FAILED(hr))
+    if (FAILED(hr = ID3D11Device1_CreateInputLayout(d3d11_device, layout_desc,
+            ARRAY_SIZE(layout_desc), ID3D10Blob_GetBufferPointer(vs_blob),
+            ID3D10Blob_GetBufferSize(vs_blob), &converter->input_layout)))
     {
         ERR("Failed to create input layout, hr %#lx.\n", hr);
         goto done;
@@ -675,8 +675,8 @@ static HRESULT create_bgra_surface_from_rgba(IDXGISurface *rgba_surface, IDXGISu
     resource_data.pSysMem = quad;
     resource_data.SysMemPitch = 0;
     resource_data.SysMemSlicePitch = 0;
-    hr = ID3D11Device1_CreateBuffer(d3d11_device, &buffer_desc, &resource_data, &vb);
-    if (FAILED(hr))
+    if (FAILED(hr = ID3D11Device1_CreateBuffer(d3d11_device, &buffer_desc,
+            &resource_data, &converter->vb)))
     {
         ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
         goto done;
@@ -690,22 +690,184 @@ static HRESULT create_bgra_surface_from_rgba(IDXGISurface *rgba_surface, IDXGISu
     sampler_desc.MinLOD = 0;
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
 
-    hr = ID3D11Device1_CreateSamplerState(d3d11_device, &sampler_desc, &sampler);
-    if (FAILED(hr))
+    if (FAILED(hr = ID3D11Device1_CreateSamplerState(d3d11_device, &sampler_desc,
+            &converter->sampler)))
     {
         ERR("Failed to create sampler state, hr %#lx.\n", hr);
         goto done;
     }
-    ID3D11DeviceContext1_PSSetSamplers(d3d11_device_context1, 0, 1, &sampler);
 
-    ID3D11DeviceContext1_IASetInputLayout(d3d11_device_context1, input_layout);
-    ID3D11DeviceContext1_IASetPrimitiveTopology(d3d11_device_context1, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+done:
+    if (ps_blob)
+        ID3D10Blob_Release(ps_blob);
+    if (vs_blob)
+        ID3D10Blob_Release(vs_blob);
+    if (FAILED(hr))
+        rgba_bgra_converter_destroy(converter);
+    else
+        *out = converter;
+    return hr;
+}
 
-    stride = sizeof(quad[0]);
+static HRESULT rgba_bgra_converter_get(struct composition_device *device, ID3D11Device1 *d3d11_device,
+        struct rgba_bgra_converter **converter)
+{
+    struct rgba_bgra_converter *entry, *new_converter;
+    IUnknown *device_identity;
+    HRESULT hr;
+
+    *converter = NULL;
+
+    if (FAILED(hr = ID3D11Device1_QueryInterface(d3d11_device, &IID_IUnknown, (void **)&device_identity)))
+    {
+        ERR("Failed to get D3D11 device identity, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    LIST_FOR_EACH_ENTRY(entry, &device->rgba_bgra_converters, struct rgba_bgra_converter, entry)
+    {
+        if (entry->device_identity == device_identity)
+        {
+            *converter = entry;
+            IUnknown_Release(device_identity);
+            return S_OK;
+        }
+    }
+
+    hr = rgba_bgra_converter_create(d3d11_device, device_identity, &new_converter);
+    IUnknown_Release(device_identity);
+    if (FAILED(hr))
+    {
+        ERR("Failed to create cached RGBA to BGRA converter, hr %#lx.\n", hr);
+        return hr;
+    }
+
+    list_add_tail(&device->rgba_bgra_converters, &new_converter->entry);
+    *converter = new_converter;
+    return S_OK;
+}
+
+static HRESULT rgba_bgra_converter_ensure_scratch(struct rgba_bgra_converter *converter,
+        const DXGI_SURFACE_DESC *surface_desc)
+{
+    D3D11_TEXTURE2D_DESC texture_desc;
+    HRESULT hr;
+
+    if (converter->scratch_texture && converter->scratch_surface && converter->scratch_rtv
+            && converter->scratch_width == surface_desc->Width
+            && converter->scratch_height == surface_desc->Height
+            && converter->scratch_format == DXGI_FORMAT_B8G8R8A8_UNORM)
+        return S_OK;
+
+    rgba_bgra_converter_release_scratch(converter);
+
+    texture_desc.Width = surface_desc->Width;
+    texture_desc.Height = surface_desc->Height;
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.SampleDesc.Quality = 0;
+    texture_desc.Usage = D3D11_USAGE_DEFAULT;
+    texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    texture_desc.CPUAccessFlags = 0;
+    texture_desc.MiscFlags = D3D11_RESOURCE_MISC_GUARDED | D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+
+    if (FAILED(hr = ID3D11Device1_CreateTexture2D(converter->device, &texture_desc, NULL,
+            &converter->scratch_texture)))
+    {
+        ERR("Failed to create cached BGRA scratch texture, hr %#lx.\n", hr);
+        goto failed;
+    }
+
+    if (FAILED(hr = ID3D11Device1_CreateRenderTargetView(converter->device,
+            (ID3D11Resource *)converter->scratch_texture, NULL, &converter->scratch_rtv)))
+    {
+        ERR("Failed to create cached BGRA scratch RTV, hr %#lx.\n", hr);
+        goto failed;
+    }
+
+    if (FAILED(hr = ID3D11Texture2D_QueryInterface(converter->scratch_texture,
+            &IID_IDXGISurface, (void **)&converter->scratch_surface)))
+    {
+        ERR("Failed to get cached BGRA scratch surface, hr %#lx.\n", hr);
+        goto failed;
+    }
+
+    converter->scratch_width = surface_desc->Width;
+    converter->scratch_height = surface_desc->Height;
+    converter->scratch_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    return S_OK;
+
+failed:
+    rgba_bgra_converter_release_scratch(converter);
+    return hr;
+}
+
+static HRESULT create_bgra_surface_from_rgba(struct composition_device *device,
+        ID3D11Device1 *d3d11_device, ID3D11DeviceContext1 *d3d11_device_context1,
+        IDXGISurface *rgba_surface, IDXGISurface **bgra_surface)
+{
+    struct rgba_bgra_converter *converter = NULL;
+    ID3DDeviceContextState *old_state = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    ID3D11Texture2D *src_texture = NULL;
+    DXGI_SURFACE_DESC surface_desc;
+    unsigned int stride, offset;
+    BOOL state_swapped = FALSE;
+    D3D11_VIEWPORT vp;
+    HRESULT hr;
+
+    *bgra_surface = NULL;
+
+    if (FAILED(hr = IDXGISurface_QueryInterface(rgba_surface, &IID_ID3D11Texture2D, (void **)&src_texture)))
+    {
+        ERR("Failed to get a ID3D11Texture2D, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (FAILED(hr = IDXGISurface_GetDesc(rgba_surface, &surface_desc)))
+    {
+        ERR("Failed to get the dxgi surface description, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (FAILED(hr = rgba_bgra_converter_get(device, d3d11_device, &converter)))
+        goto done;
+
+    if (FAILED(hr = ID3D11Device1_GetDeviceRemovedReason(d3d11_device)))
+    {
+        ERR("D3D11 device was removed, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (FAILED(hr = rgba_bgra_converter_ensure_scratch(converter, &surface_desc)))
+        goto done;
+
+    if (FAILED(hr = ID3D11Device1_CreateShaderResourceView(d3d11_device,
+            (ID3D11Resource *)src_texture, NULL, &srv)))
+    {
+        ERR("Failed to create a SRV, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    ID3D11DeviceContext1_SwapDeviceContextState(d3d11_device_context1, converter->state, &old_state);
+    state_swapped = TRUE;
+
+    ID3D11DeviceContext1_OMSetRenderTargets(d3d11_device_context1, 1, &converter->scratch_rtv, NULL);
+    ID3D11DeviceContext1_PSSetShaderResources(d3d11_device_context1, 0, 1, &srv);
+    ID3D11DeviceContext1_PSSetSamplers(d3d11_device_context1, 0, 1, &converter->sampler);
+
+    ID3D11DeviceContext1_IASetInputLayout(d3d11_device_context1, converter->input_layout);
+    ID3D11DeviceContext1_IASetPrimitiveTopology(d3d11_device_context1,
+            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+    stride = sizeof(struct rgba_bgra_vertex);
     offset = 0;
-    ID3D11DeviceContext1_IASetVertexBuffers(d3d11_device_context1, 0, 1, &vb, &stride, &offset);
-    ID3D11DeviceContext1_VSSetShader(d3d11_device_context1, vs, NULL, 0);
-    ID3D11DeviceContext1_PSSetShader(d3d11_device_context1, ps, NULL, 0);
+    ID3D11DeviceContext1_IASetVertexBuffers(d3d11_device_context1, 0, 1, &converter->vb,
+            &stride, &offset);
+    ID3D11DeviceContext1_VSSetShader(d3d11_device_context1, converter->vs, NULL, 0);
+    ID3D11DeviceContext1_PSSetShader(d3d11_device_context1, converter->ps, NULL, 0);
 
     vp.TopLeftX = 0;
     vp.TopLeftY = 0;
@@ -717,43 +879,27 @@ static HRESULT create_bgra_surface_from_rgba(IDXGISurface *rgba_surface, IDXGISu
     ID3D11DeviceContext1_Draw(d3d11_device_context1, 4, 0);
     ID3D11DeviceContext1_Flush(d3d11_device_context1);
 
-    hr = ID3D11Texture2D_QueryInterface(dst_texture, &IID_IDXGISurface, (void **)bgra_surface);
-    if (FAILED(hr))
-    {
-        ERR("Failed to get bgra surface, hr %#lx.\n", hr);
-        goto done;
-    }
+    IDXGISurface_AddRef(converter->scratch_surface);
+    *bgra_surface = converter->scratch_surface;
+    hr = S_OK;
 
 done:
-    if (old_state)
+    if (state_swapped)
     {
-        ID3D11DeviceContext1_SwapDeviceContextState(d3d11_device_context1, old_state, NULL);
-        ID3DDeviceContextState_Release(old_state);
+        ID3D11DeviceContext1_ClearState(d3d11_device_context1);
+        if (old_state)
+        {
+            ID3D11DeviceContext1_SwapDeviceContextState(d3d11_device_context1, old_state, NULL);
+            ID3DDeviceContextState_Release(old_state);
+        }
     }
-    if (state)
-        ID3DDeviceContextState_Release(state);
-    if (vb)
-        ID3D11Buffer_Release(vb);
-    if (sampler)
-        ID3D11SamplerState_Release(sampler);
-    if (input_layout)
-        ID3D11InputLayout_Release(input_layout);
-    if (ps)
-        ID3D11PixelShader_Release(ps);
-    if (vs)
-        ID3D11VertexShader_Release(vs);
-    if (d3d11_device_context1)
-        ID3D11DeviceContext1_Release(d3d11_device_context1);
-    if (d3d11_device_context)
-        ID3D11DeviceContext_Release(d3d11_device_context);
-    if (rtv)
-        ID3D11RenderTargetView_Release(rtv);
+    if (FAILED(hr) && converter)
+    {
+        list_remove(&converter->entry);
+        rgba_bgra_converter_destroy(converter);
+    }
     if (srv)
         ID3D11ShaderResourceView_Release(srv);
-    if (dst_texture)
-        ID3D11Texture2D_Release(dst_texture);
-    if (d3d11_device)
-        ID3D11Device1_Release(d3d11_device);
     if (src_texture)
         ID3D11Texture2D_Release(src_texture);
     return hr;
@@ -834,6 +980,7 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
                                       IDCompositionDynamicTexture *dynamic_texture,
                                       float offset_x, float offset_y, HDC target_dc)
 {
+    struct composition_device *composition_device = impl_from_IDCompositionDevice(target->device);
     ID3DDeviceContextState *state = NULL, *old_state = NULL;
     ID3D11DeviceContext1 *d3d11_device_context1 = NULL;
     ID3D11DeviceContext *d3d11_device_context = NULL;
@@ -913,7 +1060,8 @@ static void do_composite_dxgi_surface(const struct composition_target *target,
     /* Convert DXGI_FORMAT_R8G8B8A8_UNORM to DXGI_FORMAT_B8G8R8A8_UNORM */
     if (surface_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM)
     {
-        hr = create_bgra_surface_from_rgba(dxgi_surface, &bgra_surface);
+        hr = create_bgra_surface_from_rgba(composition_device, d3d11_device,
+                d3d11_device_context1, dxgi_surface, &bgra_surface);
         if (FAILED(hr))
         {
             ERR("Failed to convert DXGI_FORMAT_R8G8B8A8_UNORM surface to DXGI_FORMAT_B8G8R8A8_UNORM, hr %#lx.\n", hr);
@@ -2726,6 +2874,7 @@ static HRESULT create_device(int version, REFIID iid, void **out)
         return E_OUTOFMEMORY;
 
     list_init(&device->targets);
+    list_init(&device->rgba_bgra_converters);
     device->IDCompositionDevice_iface.lpVtbl = &device_vtbl;
     device->IDCompositionDeviceUnknown_iface.lpVtbl = &desktop_device_vtbl;
     device->version = version;
