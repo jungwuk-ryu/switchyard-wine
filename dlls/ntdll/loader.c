@@ -7210,26 +7210,41 @@ static void switchyard_d3d12_invalidate_descriptor_formats(void)
 static BOOL switchyard_d3d12_copy_descriptor_formats_simple(
     ULONG_PTR dst, ULONG_PTR src, ULONG count, ULONG increment )
 {
-    struct switchyard_d3d12_descriptor_copy *copies;
-    SIZE_T size, i;
+    ULONG_PTR dst_handle, src_handle, src_last;
+    ULONG format;
+    SIZE_T i;
 
     if (!count) return TRUE;
     if (!increment ||
         count - 1 > (~(ULONG_PTR)0 - dst) / increment ||
         count - 1 > (~(ULONG_PTR)0 - src) / increment)
         return FALSE;
-    size = count * sizeof(*copies);
-    if (size / sizeof(*copies) != count) return FALSE;
-    if (!(copies = RtlAllocateHeap( GetProcessHeap(), 0, size )))
-        return FALSE;
 
-    for (i = 0; i < count; ++i)
+    src_last = src + (ULONG_PTR)(count - 1) * increment;
+    RtlEnterCriticalSection( &switchyard_d3d12_tracking_section );
+    /* Preserve the previous source snapshot semantics for overlapping linear
+     * ranges without materializing every descriptor pair. */
+    if (dst > src && dst <= src_last)
     {
-        copies[i].dst = dst + i * increment;
-        copies[i].src = src + i * increment;
+        for (i = count; i; --i)
+        {
+            dst_handle = dst + (i - 1) * increment;
+            src_handle = src + (i - 1) * increment;
+            format = switchyard_d3d12_get_descriptor_format_locked( src_handle );
+            switchyard_d3d12_store_descriptor_format_locked( dst_handle, format );
+        }
     }
-    switchyard_d3d12_apply_descriptor_copies( copies, count );
-    RtlFreeHeap( GetProcessHeap(), 0, copies );
+    else
+    {
+        for (i = 0; i < count; ++i)
+        {
+            dst_handle = dst + i * increment;
+            src_handle = src + i * increment;
+            format = switchyard_d3d12_get_descriptor_format_locked( src_handle );
+            switchyard_d3d12_store_descriptor_format_locked( dst_handle, format );
+        }
+    }
+    RtlLeaveCriticalSection( &switchyard_d3d12_tracking_section );
     return TRUE;
 }
 
@@ -7268,11 +7283,14 @@ static BOOL switchyard_d3d12_copy_descriptor_formats(
     ULONG src_range_count, const ULONG_PTR *src_starts, const ULONG *src_sizes,
     ULONG increment )
 {
-    struct switchyard_d3d12_descriptor_copy *copies;
+    enum { stack_copy_count = 64 };
+    struct switchyard_d3d12_descriptor_copy stack_copies[stack_copy_count];
+    struct switchyard_d3d12_descriptor_copy *copies = stack_copies;
     SIZE_T dst_count, src_count, size, i;
     ULONG dst_range = 0, src_range = 0;
     ULONG dst_offset = 0, src_offset = 0;
     ULONG dst_size = 0, src_size = 0;
+    BOOL heap_allocated = FALSE;
     BOOL valid = TRUE;
 
     if (!increment ||
@@ -7283,12 +7301,16 @@ static BOOL switchyard_d3d12_copy_descriptor_formats(
         dst_count != src_count)
         return FALSE;
     if (!dst_count) return TRUE;
-    if (dst_count > ~(SIZE_T)0 / sizeof(*copies))
-        return FALSE;
 
-    size = dst_count * sizeof(*copies);
-    if (!(copies = RtlAllocateHeap( GetProcessHeap(), 0, size )))
-        return FALSE;
+    if (dst_count > ARRAY_SIZE(stack_copies))
+    {
+        if (dst_count > ~(SIZE_T)0 / sizeof(*copies))
+            return FALSE;
+        size = dst_count * sizeof(*copies);
+        if (!(copies = RtlAllocateHeap( GetProcessHeap(), 0, size )))
+            return FALSE;
+        heap_allocated = TRUE;
+    }
 
     __TRY
     {
@@ -7336,7 +7358,8 @@ static BOOL switchyard_d3d12_copy_descriptor_formats(
 
     if (valid)
         switchyard_d3d12_apply_descriptor_copies( copies, dst_count );
-    RtlFreeHeap( GetProcessHeap(), 0, copies );
+    if (heap_allocated)
+        RtlFreeHeap( GetProcessHeap(), 0, copies );
     return valid;
 }
 

@@ -364,6 +364,8 @@ enum narrow_float_descriptor_copy
     NARROW_FLOAT_DESCRIPTOR_DIRECT,
     NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE,
     NARROW_FLOAT_DESCRIPTOR_COPY_RANGES,
+    NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE_64,
+    NARROW_FLOAT_DESCRIPTOR_COPY_RANGES_65,
 };
 
 struct narrow_float_clear_case
@@ -406,7 +408,7 @@ static int run_narrow_float_clear_case_with_objects(
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {0};
     D3D12_TEXTURE_COPY_LOCATION source_location = {0};
     D3D12_TEXTURE_COPY_LOCATION destination_location = {0};
-    D3D12_CPU_DESCRIPTOR_HANDLE source_handle = {0}, clear_handle = {0};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_handle = {0}, clear_handle = {0}, view_handle;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle = {0};
     ID3D12DescriptorHeap *descriptor_heap = NULL;
     ID3D12CommandAllocator *allocator = NULL;
@@ -420,7 +422,9 @@ static int run_narrow_float_clear_case_with_objects(
     D3D12_CPU_DESCRIPTOR_HANDLE source_starts[1];
     D3D12_RANGE read_range, written_range = {0};
     UINT descriptor_range_sizes[1] = {1};
+    UINT descriptor_copy_count;
     UINT descriptor_increment;
+    UINT i;
     UINT row_count;
     UINT64 row_size, total_size;
     D3D12_RESOURCE_STATES initial_state;
@@ -443,11 +447,18 @@ static int run_narrow_float_clear_case_with_objects(
     descriptor_type = test->unordered_access
         ? D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         : D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    if (test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE_64)
+        descriptor_copy_count = 64;
+    else if (test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_RANGES_65)
+        descriptor_copy_count = 65;
+    else
+        descriptor_copy_count = 1;
     if (!provided_handle)
     {
         descriptor_heap_desc.Type = descriptor_type;
         descriptor_heap_desc.NumDescriptors =
-            test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_DIRECT ? 1 : 2;
+            test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_DIRECT ?
+            1 : descriptor_copy_count * 2;
         if (test->unordered_access)
             descriptor_heap_desc.Flags =
                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
@@ -502,35 +513,49 @@ static int run_narrow_float_clear_case_with_objects(
     descriptor_increment =
         ID3D12Device_GetDescriptorHandleIncrementSize( device, descriptor_type );
     if (test->descriptor_copy != NARROW_FLOAT_DESCRIPTOR_DIRECT)
-        clear_handle.ptr += descriptor_increment;
-
-    if (test->unordered_access)
     {
-        uav_desc.Format = test->format;
-        uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        ID3D12Device_CreateUnorderedAccessView(
-            device, texture, NULL, test->null_view_desc ? NULL : &uav_desc,
-            source_handle );
+        clear_handle.ptr += (UINT_PTR)(descriptor_copy_count * 2 - 1) *
+                            descriptor_increment;
     }
-    else
+
+    for (i = 0; i < descriptor_copy_count; ++i)
     {
-        rtv_desc.Format = test->format;
-        rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        ID3D12Device_CreateRenderTargetView(
-            device, texture, test->null_view_desc ? NULL : &rtv_desc,
-            source_handle );
+        view_handle = source_handle;
+        view_handle.ptr += (UINT_PTR)i * descriptor_increment;
+        if (test->unordered_access)
+        {
+            uav_desc.Format = test->format;
+            uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            ID3D12Device_CreateUnorderedAccessView(
+                device, texture, NULL, test->null_view_desc ? NULL : &uav_desc,
+                view_handle );
+        }
+        else
+        {
+            rtv_desc.Format = test->format;
+            rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            ID3D12Device_CreateRenderTargetView(
+                device, texture, test->null_view_desc ? NULL : &rtv_desc,
+                view_handle );
+        }
     }
     fprintf( stderr, "  view created.\n" );
 
-    if (test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE)
+    destination_starts[0] = source_handle;
+    destination_starts[0].ptr +=
+        (UINT_PTR)descriptor_copy_count * descriptor_increment;
+    if (test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE ||
+        test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE_64)
     {
         ID3D12Device_CopyDescriptorsSimple(
-            device, 1, clear_handle, source_handle, descriptor_type );
+            device, descriptor_copy_count, destination_starts[0],
+            source_handle, descriptor_type );
     }
-    else if (test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_RANGES)
+    else if (test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_RANGES ||
+             test->descriptor_copy == NARROW_FLOAT_DESCRIPTOR_COPY_RANGES_65)
     {
-        destination_starts[0] = clear_handle;
         source_starts[0] = source_handle;
+        descriptor_range_sizes[0] = descriptor_copy_count;
         ID3D12Device_CopyDescriptors(
             device, 1, destination_starts, descriptor_range_sizes,
             1, source_starts, descriptor_range_sizes, descriptor_type );
@@ -552,7 +577,8 @@ static int run_narrow_float_clear_case_with_objects(
         gpu_handle =
             ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart( descriptor_heap );
         if (test->descriptor_copy != NARROW_FLOAT_DESCRIPTOR_DIRECT)
-            gpu_handle.ptr += descriptor_increment;
+            gpu_handle.ptr += (UINT_PTR)(descriptor_copy_count * 2 - 1) *
+                              descriptor_increment;
         descriptor_heaps[0] = descriptor_heap;
         ID3D12GraphicsCommandList_SetDescriptorHeaps(
             command_list, 1, descriptor_heaps );
@@ -716,6 +742,16 @@ static int verify_narrow_float_clear_conversion( ID3D12Device *device,
             FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_COPY_RANGES
         },
         {
+            "R16G16 RTV 64-descriptor simple copy", DXGI_FORMAT_R16G16_FLOAT,
+            { FLT_MAX, -FLT_MAX, 0.0f, 0.0f }, 0xfbff7bff,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_COPY_SIMPLE_64
+        },
+        {
+            "R16G16 RTV 65-descriptor range copy", DXGI_FORMAT_R16G16_FLOAT,
+            { FLT_MAX, -FLT_MAX, 0.0f, 0.0f }, 0xfbff7bff,
+            FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_COPY_RANGES_65
+        },
+        {
             "R32 RTV finite clear", DXGI_FORMAT_R32_FLOAT,
             { FLT_MAX, 0.0f, 0.0f, 0.0f }, 0x7f7fffff,
             FALSE, FALSE, NARROW_FLOAT_DESCRIPTOR_DIRECT
@@ -776,16 +812,16 @@ static int verify_narrow_float_clear_conversion( ID3D12Device *device,
 
     tests[3].values[0] = narrow_float_value_from_bits( 0x7f800000 );
     tests[3].values[1] = narrow_float_value_from_bits( 0xff800000 );
-    tests[8].values[0] = narrow_float_value_from_bits( 0x7f800000 );
-    tests[8].values[1] = narrow_float_value_from_bits( 0xff800000 );
-    tests[8].values[2] = narrow_float_value_from_bits( 0x7f800000 );
     tests[10].values[0] = narrow_float_value_from_bits( 0x7f800000 );
     tests[10].values[1] = narrow_float_value_from_bits( 0xff800000 );
+    tests[10].values[2] = narrow_float_value_from_bits( 0x7f800000 );
     tests[12].values[0] = narrow_float_value_from_bits( 0x7f800000 );
     tests[12].values[1] = narrow_float_value_from_bits( 0xff800000 );
-    tests[12].values[2] = narrow_float_value_from_bits( 0x7f800000 );
     tests[14].values[0] = narrow_float_value_from_bits( 0x7f800000 );
     tests[14].values[1] = narrow_float_value_from_bits( 0xff800000 );
+    tests[14].values[2] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[16].values[0] = narrow_float_value_from_bits( 0x7f800000 );
+    tests[16].values[1] = narrow_float_value_from_bits( 0xff800000 );
     for (i = 0; i < ARRAYSIZE(tests); ++i)
     {
         fprintf( stderr, "Running %s.\n", tests[i].name );
