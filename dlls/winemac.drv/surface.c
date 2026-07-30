@@ -80,8 +80,25 @@ struct macdrv_window_surface
 
 static pthread_mutex_t dib_endpoints_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct macdrv_dib_endpoint *dib_endpoints;
+static CGColorSpaceRef srgb_colorspace;
 
 static struct macdrv_window_surface *get_mac_surface(struct window_surface *surface);
+
+static CGColorSpaceRef get_srgb_colorspace(void)
+{
+    CGColorSpaceRef colorspace, cached;
+
+    if ((cached = InterlockedCompareExchangePointer((void **)&srgb_colorspace, NULL, NULL)))
+        return cached;
+    if (!(colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB)))
+        return NULL;
+    if ((cached = InterlockedCompareExchangePointer((void **)&srgb_colorspace, colorspace, NULL)))
+    {
+        CGColorSpaceRelease(colorspace);
+        return cached;
+    }
+    return colorspace;
+}
 
 static void dib_endpoint_add_ref(struct macdrv_dib_endpoint *endpoint)
 {
@@ -389,7 +406,7 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
         if (surface->dib_endpoint) pthread_mutex_unlock(&surface->dib_endpoint->mutex);
         return TRUE;
     }
-    if (!(colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB)))
+    if (!(colorspace = get_srgb_colorspace()))
     {
         CGDataProviderRelease(provider);
         if (surface->dib_endpoint) pthread_mutex_unlock(&surface->dib_endpoint->mutex);
@@ -400,7 +417,6 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
                           image_size / abs(color_info->bmiHeader.biHeight), colorspace,
                           alpha_info | kCGBitmapByteOrder32Little, provider, NULL,
                           retina_on, kCGRenderingIntentDefault);
-    CGColorSpaceRelease(colorspace);
     CGDataProviderRelease(provider);
     if (!image)
     {
