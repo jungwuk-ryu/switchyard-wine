@@ -61,10 +61,10 @@ created.
    records outside the file.
 3. Enforce limits before decompression:
    - 65,536 entries;
-   - 1 MiB per encoded entry name;
+   - 32,767 bytes per encoded entry name;
    - 256 MiB per metadata document;
    - 16 GiB per payload file;
-   - 128 GiB total expanded data;
+   - 64 GiB total expanded data;
    - a configurable prefix quota and host free-space floor; and
    - bounded compression ratios and decompressor progress.
 4. Decode UTF-8 names strictly. Reject rather than normalize absolute paths,

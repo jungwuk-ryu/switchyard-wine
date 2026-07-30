@@ -35,6 +35,7 @@
 #define WINE_APPX_ENTRY_DATA_DESCRIPTOR 0x00000002
 
 typedef struct wine_appx_archive WINE_APPX_ARCHIVE;
+typedef struct wine_appx_archive_stream WINE_APPX_ARCHIVE_STREAM;
 
 typedef struct
 {
@@ -76,5 +77,20 @@ HRESULT WINAPI wine_appx_archive_get_count( WINE_APPX_ARCHIVE *archive, UINT32 *
 HRESULT WINAPI wine_appx_archive_get_entry( WINE_APPX_ARCHIVE *archive, UINT32 index,
                                             WINE_APPX_ARCHIVE_ENTRY *entry,
                                             UINT32 *path_length, WCHAR *path );
+HRESULT WINAPI wine_appx_archive_stream_open( WINE_APPX_ARCHIVE *archive, UINT32 index,
+                                              WINE_APPX_ARCHIVE_STREAM **stream );
+/*
+ * A successful read returns S_OK with bytes.  S_FALSE is the only indication
+ * that compression framing, exact sizes, and CRC have all been verified.
+ * Consumers must keep every S_OK chunk in transaction staging and must not
+ * publish it unless a later read returns S_FALSE.  Reads are single-consumer;
+ * cancel and close may drain a read already in progress, but no operation may
+ * begin after close starts.  Cancellation is cooperative: close must wait for
+ * a host filesystem request that the operating system does not cancel promptly.
+ */
+HRESULT WINAPI wine_appx_archive_stream_read( WINE_APPX_ARCHIVE_STREAM *stream,
+                                              void *buffer, UINT32 capacity, UINT32 *read );
+void WINAPI wine_appx_archive_stream_cancel( WINE_APPX_ARCHIVE_STREAM *stream );
+void WINAPI wine_appx_archive_stream_close( WINE_APPX_ARCHIVE_STREAM *stream );
 
 #endif /* __WINE_APPXSVC_H */

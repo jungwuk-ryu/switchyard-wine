@@ -434,7 +434,7 @@ static void expect_invalid( struct zip_builder *builder, UINT32 flags )
 static void init_limits( WINE_APPX_ARCHIVE_LIMITS *limits )
 {
     limits->size = sizeof(*limits);
-    limits->max_entries = 100000;
+    limits->max_entries = 65536;
     limits->max_archive_size = 128ULL * 1024 * 1024 * 1024;
     limits->max_central_directory_size = 64ULL * 1024 * 1024;
     limits->max_entry_compressed_size = 16ULL * 1024 * 1024 * 1024;

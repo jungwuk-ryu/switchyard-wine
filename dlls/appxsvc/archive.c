@@ -59,7 +59,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 #define ZIP_METHOD_DEFLATE                        8
 #define ZIP_EXTRA_ZIP64                           0x0001
 
-#define DEFAULT_MAX_ENTRIES                       100000
+#define DEFAULT_MAX_ENTRIES                       65536
 #define DEFAULT_MAX_ARCHIVE_SIZE                  (128ULL * 1024 * 1024 * 1024)
 #define DEFAULT_MAX_CENTRAL_DIRECTORY_SIZE        (64ULL * 1024 * 1024)
 #define DEFAULT_MAX_ENTRY_COMPRESSED_SIZE         (16ULL * 1024 * 1024 * 1024)
@@ -397,6 +397,7 @@ static HRESULT read_zip64_extra( const BYTE *extra, UINT16 extra_length,
             }
             if (position != size) return APPX_E_INVALID_PACKAGING_LAYOUT;
         }
+        /* No downstream extractor may reinterpret an alternate metadata field. */
         else
             return APPX_E_INVALID_PACKAGING_LAYOUT;
         cursor = end;
@@ -1006,6 +1007,42 @@ HRESULT WINAPI wine_appx_archive_get_count( WINE_APPX_ARCHIVE *archive, UINT32 *
     return S_OK;
 }
 
+static void copy_entry_info( const struct archive_entry *source,
+                             WINE_APPX_ARCHIVE_ENTRY *entry )
+{
+    memset( entry, 0, sizeof(*entry) );
+    entry->size = sizeof(*entry);
+    entry->flags = source->flags;
+    entry->crc32 = source->crc32;
+    entry->compression_method = source->compression_method;
+    entry->compressed_size = source->compressed_size;
+    entry->uncompressed_size = source->uncompressed_size;
+    entry->local_header_offset = source->local_header_offset;
+    entry->data_offset = source->data_offset;
+}
+
+HRESULT appx_archive_acquire_entry_source( WINE_APPX_ARCHIVE *archive, UINT32 index,
+                                           WINE_APPX_ARCHIVE_ENTRY *entry, HANDLE *file )
+{
+    if (!archive || !entry || !file) return E_INVALIDARG;
+    *file = INVALID_HANDLE_VALUE;
+    if (index >= archive->count) return E_BOUNDS;
+
+    copy_entry_info( archive->entries + index, entry );
+    /*
+     * Use a distinct file object rather than DuplicateHandle().  Besides
+     * keeping the file position independent, this scopes CancelIoEx() from an
+     * entry stream to that stream's I/O instead of another stream or archive
+     * read using the same underlying handle.
+     */
+    *file = ReOpenFile( archive->file, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_FLAG_OVERLAPPED );
+    if (*file == INVALID_HANDLE_VALUE)
+        return HRESULT_FROM_WIN32( GetLastError() );
+    return S_OK;
+}
+
 HRESULT WINAPI wine_appx_archive_get_entry( WINE_APPX_ARCHIVE *archive, UINT32 index,
                                             WINE_APPX_ARCHIVE_ENTRY *entry,
                                             UINT32 *path_length, WCHAR *path )
@@ -1020,15 +1057,7 @@ HRESULT WINAPI wine_appx_archive_get_entry( WINE_APPX_ARCHIVE *archive, UINT32 i
     source = archive->entries + index;
     capacity = *path_length;
     *path_length = source->path_length;
-    memset( entry, 0, sizeof(*entry) );
-    entry->size = sizeof(*entry);
-    entry->flags = source->flags;
-    entry->crc32 = source->crc32;
-    entry->compression_method = source->compression_method;
-    entry->compressed_size = source->compressed_size;
-    entry->uncompressed_size = source->uncompressed_size;
-    entry->local_header_offset = source->local_header_offset;
-    entry->data_offset = source->data_offset;
+    copy_entry_info( source, entry );
 
     if (!path || capacity < source->path_length)
         return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );

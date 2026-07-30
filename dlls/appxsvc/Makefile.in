@@ -1,8 +1,10 @@
 MODULE    = appxsvc.dll
 IMPORTLIB = appxsvc
-IMPORTS   = kernelbase
+IMPORTS   = $(ZLIB_PE_LIBS) kernelbase
+EXTRAINCL = $(ZLIB_PE_CFLAGS)
 
 SOURCES = \
 	archive.c \
 	main.c \
-	path.c
+	path.c \
+	stream.c

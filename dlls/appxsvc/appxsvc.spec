@@ -3,3 +3,7 @@
 @ stdcall -private wine_appx_archive_close(ptr)
 @ stdcall -private wine_appx_archive_get_count(ptr ptr)
 @ stdcall -private wine_appx_archive_get_entry(ptr long ptr ptr ptr)
+@ stdcall -private wine_appx_archive_stream_open(ptr long ptr)
+@ stdcall -private wine_appx_archive_stream_read(ptr ptr long ptr)
+@ stdcall -private wine_appx_archive_stream_cancel(ptr)
+@ stdcall -private wine_appx_archive_stream_close(ptr)
