@@ -2,5 +2,7 @@ TESTDLL = appxsvc.dll
 
 SOURCES = \
 	archive.c \
+	blockmap.c \
+	manifest.c \
 	path.c \
 	stream.c

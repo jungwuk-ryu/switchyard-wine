@@ -74,6 +74,8 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
                                       UINT32 flags, WINE_APPX_ARCHIVE **archive );
 void WINAPI wine_appx_archive_close( WINE_APPX_ARCHIVE *archive );
 HRESULT WINAPI wine_appx_archive_get_count( WINE_APPX_ARCHIVE *archive, UINT32 *count );
+HRESULT WINAPI wine_appx_archive_find_entry( WINE_APPX_ARCHIVE *archive, const WCHAR *path,
+                                             UINT32 *index );
 HRESULT WINAPI wine_appx_archive_get_entry( WINE_APPX_ARCHIVE *archive, UINT32 index,
                                             WINE_APPX_ARCHIVE_ENTRY *entry,
                                             UINT32 *path_length, WCHAR *path );

@@ -1007,6 +1007,27 @@ HRESULT WINAPI wine_appx_archive_get_count( WINE_APPX_ARCHIVE *archive, UINT32 *
     return S_OK;
 }
 
+HRESULT WINAPI wine_appx_archive_find_entry( WINE_APPX_ARCHIVE *archive, const WCHAR *path,
+                                             UINT32 *index )
+{
+    struct archive_entry *entry;
+    UINT32 length = 0;
+
+    if (!archive || !path || !index) return E_INVALIDARG;
+    *index = 0;
+    while (length < WINE_APPX_MAX_PATH_CHARS && path[length])
+    {
+        if (path[length] == '/') return E_INVALIDARG;
+        length++;
+    }
+    if (!length || length == WINE_APPX_MAX_PATH_CHARS) return E_INVALIDARG;
+
+    if (!(entry = find_path( archive->entries, archive->count, path, length )))
+        return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
+    *index = entry - archive->entries;
+    return S_OK;
+}
+
 static void copy_entry_info( const struct archive_entry *source,
                              WINE_APPX_ARCHIVE_ENTRY *entry )
 {

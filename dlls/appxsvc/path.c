@@ -89,10 +89,19 @@ static BOOL validate_component( const WCHAR *component, UINT32 length )
     return TRUE;
 }
 
+static int hex_value( BYTE ch )
+{
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
 HRESULT WINAPI wine_appx_validate_archive_path( const BYTE *utf8, UINT32 utf8_length, UINT32 flags,
                                                 UINT32 *path_length, WCHAR *path )
 {
-    UINT32 component_start, i, input_length, required, capacity;
+    UINT32 component_start, decoded_length = 0, i, input_length, required, capacity;
+    BYTE *decoded_utf8;
     WCHAR *decoded;
     int count;
     BOOL has_relationships_directory = FALSE;
@@ -123,16 +132,58 @@ HRESULT WINAPI wine_appx_validate_archive_path( const BYTE *utf8, UINT32 utf8_le
     if (!input_length || utf8[0] == '/' || utf8[0] == '\\')
         return APPX_E_INVALID_PACKAGING_LAYOUT;
 
-    count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)utf8, input_length, NULL, 0 );
-    if (!count || count >= WINE_APPX_MAX_PATH_CHARS) return APPX_E_INVALID_PACKAGING_LAYOUT;
+    if (!(decoded_utf8 = HeapAlloc( GetProcessHeap(), 0, input_length ))) return E_OUTOFMEMORY;
+    for (i = 0; i < input_length; i++)
+    {
+        BYTE ch = utf8[i];
 
-    if (!(decoded = HeapAlloc( GetProcessHeap(), 0, count * sizeof(*decoded) ))) return E_OUTOFMEMORY;
-    if (MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)utf8, input_length,
+        if (ch == '%')
+        {
+            int high, low;
+
+            if (input_length - i < 3 || (high = hex_value( utf8[i + 1] )) < 0 ||
+                (low = hex_value( utf8[i + 2] )) < 0)
+            {
+                HeapFree( GetProcessHeap(), 0, decoded_utf8 );
+                return APPX_E_INVALID_PACKAGING_LAYOUT;
+            }
+            ch = (high << 4) | low;
+            i += 2;
+            /*
+             * Encoded separators must not introduce an alternate hierarchy,
+             * and an encoded NUL must not truncate a later Win32 path.
+             */
+            if (!ch || ch == '/' || ch == '\\')
+            {
+                HeapFree( GetProcessHeap(), 0, decoded_utf8 );
+                return APPX_E_INVALID_PACKAGING_LAYOUT;
+            }
+        }
+        decoded_utf8[decoded_length++] = ch;
+    }
+
+    count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)decoded_utf8,
+                                 decoded_length, NULL, 0 );
+    if (!count || count >= WINE_APPX_MAX_PATH_CHARS)
+    {
+        HeapFree( GetProcessHeap(), 0, decoded_utf8 );
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
+    }
+
+    if (!(decoded = HeapAlloc( GetProcessHeap(), 0, count * sizeof(*decoded) )))
+    {
+        HeapFree( GetProcessHeap(), 0, decoded_utf8 );
+        return E_OUTOFMEMORY;
+    }
+    if (MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)decoded_utf8,
+                             decoded_length,
                              decoded, count ) != count)
     {
+        HeapFree( GetProcessHeap(), 0, decoded_utf8 );
         HeapFree( GetProcessHeap(), 0, decoded );
         return APPX_E_INVALID_PACKAGING_LAYOUT;
     }
+    HeapFree( GetProcessHeap(), 0, decoded_utf8 );
 
     if (!IsNormalizedString( NormalizationC, decoded, count ))
     {

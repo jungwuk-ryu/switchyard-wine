@@ -171,6 +171,16 @@ static void test_archive_path( void )
         "Dir/XN--name",
         "_rels/item.rels",
         "a/_RELS/b.RELS",
+        "%",
+        "%2",
+        "%gg",
+        "%00",
+        "%2fabsolute",
+        "%5Cabsolute",
+        "a/%2e%2e/b",
+        "%2e",
+        "%2E%2e",
+        "a%3ab",
     };
     static const BYTE embedded_nul[] = {'a', 0, 'b'};
     static const BYTE control[] = {'a', 0x1f, 'b'};
@@ -191,6 +201,12 @@ static void test_archive_path( void )
     check_valid_path( "VFS/ProgramFilesX64/Example/app.exe", 0,
                       L"VFS\\ProgramFilesX64\\Example\\app.exe" );
     check_valid_path( "caf\xc3\xa9.txt", 0, L"caf\u00e9.txt" );
+    check_valid_path( "Assets/My%20File.txt", 0, L"Assets\\My File.txt" );
+    check_valid_path( "caf%C3%A9.txt", 0, L"caf\u00e9.txt" );
+    check_valid_path( "caf%c3%a9.txt", 0, L"caf\u00e9.txt" );
+    check_valid_path( "100%25.txt", 0, L"100%.txt" );
+    check_valid_path( "%41ssets/logo.png", 0, L"Assets\\logo.png" );
+    check_valid_path( "%252e.txt", 0, L"%2e.txt" );
     check_valid_path( "a\x7f" "b", 0, L"a\u007fb" );
     check_valid_path( "_rels/item.txt", 0, L"_rels\\item.txt" );
     check_valid_path( "Assets/", WINE_APPX_PATH_DIRECTORY, L"Assets" );

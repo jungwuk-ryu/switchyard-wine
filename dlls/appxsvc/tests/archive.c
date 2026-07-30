@@ -43,6 +43,8 @@ static HRESULT (WINAPI *p_wine_appx_archive_open)( HANDLE, const WINE_APPX_ARCHI
                                                    UINT32, WINE_APPX_ARCHIVE ** );
 static void (WINAPI *p_wine_appx_archive_close)( WINE_APPX_ARCHIVE * );
 static HRESULT (WINAPI *p_wine_appx_archive_get_count)( WINE_APPX_ARCHIVE *, UINT32 * );
+static HRESULT (WINAPI *p_wine_appx_archive_find_entry)( WINE_APPX_ARCHIVE *, const WCHAR *,
+                                                         UINT32 * );
 static HRESULT (WINAPI *p_wine_appx_archive_get_entry)( WINE_APPX_ARCHIVE *, UINT32,
                                                         WINE_APPX_ARCHIVE_ENTRY *,
                                                         UINT32 *, WCHAR * );
@@ -451,7 +453,7 @@ static void test_valid_archive( BOOL zip64_directory, BOOL zip64_entry )
     WINE_APPX_ARCHIVE_ENTRY entry;
     WINE_APPX_ARCHIVE *archive;
     WCHAR path[64];
-    UINT32 count, length, i;
+    UINT32 count, index, length, i;
     HRESULT hr;
     BOOL found = FALSE;
 
@@ -495,6 +497,41 @@ static void test_valid_archive( BOOL zip64_directory, BOOL zip64_entry )
             }
         }
         ok( found, "payload entry was not found.\n" );
+
+        index = 0xdeadbeef;
+        hr = p_wine_appx_archive_find_entry( archive,
+                                             L"VFS\\ProgramFilesX64\\App\\app.exe", &index );
+        ok( hr == S_OK, "got find hr %#lx.\n", hr );
+        ok( index < count, "got index %u.\n", index );
+        length = ARRAY_SIZE(path);
+        entry.size = sizeof(entry);
+        hr = p_wine_appx_archive_get_entry( archive, index, &entry, &length, path );
+        ok( hr == S_OK, "got entry hr %#lx.\n", hr );
+        ok( !lstrcmpW( path, L"VFS\\ProgramFilesX64\\App\\app.exe" ),
+            "got path %s.\n", debugstr_w(path) );
+
+        i = index;
+        index = 0xdeadbeef;
+        hr = p_wine_appx_archive_find_entry( archive,
+                                             L"vfs\\programfilesx64\\app\\APP.EXE", &index );
+        ok( hr == S_OK, "got case-insensitive find hr %#lx.\n", hr );
+        ok( index == i, "got index %u, expected %u.\n", index, i );
+
+        index = 0xdeadbeef;
+        hr = p_wine_appx_archive_find_entry( archive, L"missing.bin", &index );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), "got missing hr %#lx.\n", hr );
+        ok( !index, "got missing index %u.\n", index );
+
+        index = 0xdeadbeef;
+        hr = p_wine_appx_archive_find_entry( archive, L"VFS/App/app.exe", &index );
+        ok( hr == E_INVALIDARG, "got noncanonical path hr %#lx.\n", hr );
+        ok( !index, "got noncanonical index %u.\n", index );
+        hr = p_wine_appx_archive_find_entry( archive, NULL, &index );
+        ok( hr == E_INVALIDARG, "got null path hr %#lx.\n", hr );
+        hr = p_wine_appx_archive_find_entry( archive, L"", &index );
+        ok( hr == E_INVALIDARG, "got empty path hr %#lx.\n", hr );
+        hr = p_wine_appx_archive_find_entry( archive, L"AppxManifest.xml", NULL );
+        ok( hr == E_INVALIDARG, "got null index hr %#lx.\n", hr );
 
         entry.size = sizeof(entry);
         length = ARRAY_SIZE(path);
@@ -774,6 +811,20 @@ static void test_path_sets( void )
     free_builder( &builder );
 
     add_required_entries( &builder );
+    add_entry( &builder, "Assets/My%20File.txt", NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
+    add_entry( &builder, "assets/my file.TXT", NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
+    ok( finish_archive( &builder, FALSE ), "failed to finish archive.\n" );
+    expect_invalid( &builder, WINE_APPX_ARCHIVE_OPEN_PACKAGE );
+    free_builder( &builder );
+
+    add_required_entries( &builder );
+    add_entry( &builder, "Assets/caf%C3%A9.txt", NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
+    add_entry( &builder, "assets/caf\xc3\xa9.TXT", NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
+    ok( finish_archive( &builder, FALSE ), "failed to finish archive.\n" );
+    expect_invalid( &builder, WINE_APPX_ARCHIVE_OPEN_PACKAGE );
+    free_builder( &builder );
+
+    add_required_entries( &builder );
     add_entry( &builder, "Assets", NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
     add_entry( &builder, "Assets/logo.png", NULL, 0, 0, 0, 0, 0, FALSE, FALSE );
     ok( finish_archive( &builder, FALSE ), "failed to finish archive.\n" );
@@ -986,6 +1037,8 @@ static void test_arguments( void )
 
     hr = p_wine_appx_archive_get_count( NULL, &length );
     ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
+    hr = p_wine_appx_archive_find_entry( NULL, L"file", &length );
+    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
     hr = p_wine_appx_archive_get_entry( NULL, 0, &entry, &length, NULL );
     ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
     p_wine_appx_archive_close( NULL );
@@ -1005,10 +1058,13 @@ START_TEST(archive)
     p_wine_appx_archive_close = (void *)GetProcAddress( module, "wine_appx_archive_close" );
     p_wine_appx_archive_get_count =
         (void *)GetProcAddress( module, "wine_appx_archive_get_count" );
+    p_wine_appx_archive_find_entry =
+        (void *)GetProcAddress( module, "wine_appx_archive_find_entry" );
     p_wine_appx_archive_get_entry =
         (void *)GetProcAddress( module, "wine_appx_archive_get_entry" );
     if (!p_wine_appx_archive_open || !p_wine_appx_archive_close ||
-        !p_wine_appx_archive_get_count || !p_wine_appx_archive_get_entry)
+        !p_wine_appx_archive_get_count || !p_wine_appx_archive_find_entry ||
+        !p_wine_appx_archive_get_entry)
     {
         ok( 0, "archive exports are not available, error %lu.\n", GetLastError() );
         FreeLibrary( module );
