@@ -148,49 +148,77 @@ struct tid_node
 {
     struct tid_node *next;
     int tid;
+    unsigned int pooled;
 };
 
 #define MAX_POOL_NODES 0x80000
+#define POOL_CHUNK_NODES 4095
+
+struct node_pool_chunk
+{
+    struct node_pool_chunk *next;
+    struct tid_node nodes[POOL_CHUNK_NODES];
+};
+C_ASSERT( sizeof(struct node_pool_chunk) <= 64 * 1024 );
 
 struct node_memory_pool
 {
-    struct tid_node *nodes;
-    struct tid_node **free_nodes;
+    struct node_pool_chunk *chunks;
+    struct tid_node *free_nodes;
     unsigned int count;
 };
 
-static struct node_memory_pool *pool;
+static struct node_memory_pool pool;
 
-static void pool_init(void)
+static void pool_grow(void)
 {
+    struct node_pool_chunk *chunk;
     unsigned int i;
-    pool = malloc( sizeof(struct node_memory_pool) );
-    pool->nodes = malloc( MAX_POOL_NODES * sizeof(struct tid_node) );
-    pool->free_nodes = malloc( MAX_POOL_NODES * sizeof(struct tid_node *) );
-    pool->count = MAX_POOL_NODES;
 
-    for (i = 0; i < MAX_POOL_NODES; i++)
-        pool->free_nodes[i] = &pool->nodes[i];
+    if (!(chunk = malloc( sizeof(*chunk) )))
+        fatal_error( "could not grow MSync waiter pool\n" );
+
+    chunk->next = pool.chunks;
+    pool.chunks = chunk;
+    for (i = 0; i < ARRAY_SIZE(chunk->nodes); ++i)
+    {
+        chunk->nodes[i].pooled = 1;
+        chunk->nodes[i].next = pool.free_nodes;
+        pool.free_nodes = chunk->nodes + i;
+    }
+    pool.count += ARRAY_SIZE(chunk->nodes);
 }
 
 static inline struct tid_node *pool_alloc(void)
 {
-    if (pool->count == 0)
+    struct tid_node *node;
+
+    if (!pool.free_nodes)
     {
-        fprintf( stderr, "msync: warn: node memory pool exhausted\n" );
-        return malloc( sizeof(struct tid_node) );
+        if (pool.count + POOL_CHUNK_NODES <= MAX_POOL_NODES)
+            pool_grow();
+        else
+        {
+            if (!(node = malloc( sizeof(*node) )))
+                fatal_error( "could not allocate MSync waiter node\n" );
+            node->pooled = 0;
+            return node;
+        }
     }
-    return pool->free_nodes[--pool->count];
+    node = pool.free_nodes;
+    pool.free_nodes = node->next;
+    return node;
 }
 
 static inline void pool_free( struct tid_node *node )
 {
-    if (node < pool->nodes || node >= pool->nodes + MAX_POOL_NODES)
+    if (!node->pooled)
     {
-        free(node);
+        free( node );
         return;
     }
-    pool->free_nodes[pool->count++] = node;
+    node->next = pool.free_nodes;
+    pool.free_nodes = node;
 }
 
 struct tid_list
@@ -662,8 +690,6 @@ void msync_init(void)
     MACH_CHECK_ERROR(task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap_port), "task_get_special_port");
 
     MACH_CHECK_ERROR(bootstrap_register2(bootstrap_port, message_port_name, receive_port, 0), "bootstrap_register2");
-
-    pool_init();
 
     if (pthread_create( &message_thread, NULL, mach_message_pump, NULL ))
     {
