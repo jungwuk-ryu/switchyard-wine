@@ -1660,7 +1660,7 @@ static void set_input_key_state( volatile unsigned char *keystate, unsigned char
 
 /* update the input key state for a keyboard message */
 static void update_key_state( volatile unsigned char *keystate, unsigned int msg,
-                              lparam_t wparam, int desktop )
+                              lparam_t wparam, int desktop, int shift_lock )
 {
     unsigned char key, down = 0, down_val = desktop ? 0xc0 : 0x80;
 
@@ -1698,7 +1698,12 @@ static void update_key_state( volatile unsigned char *keystate, unsigned int msg
     case WM_KEYUP:
     case WM_SYSKEYUP:
         key = (unsigned char)wparam;
-        set_input_key_state( keystate, key, down );
+        if (key == VK_CAPITAL && down && shift_lock)
+        {
+            if (!(keystate[key] & 0x80)) keystate[key] |= 0x01;
+            keystate[key] |= down;
+        }
+        else set_input_key_state( keystate, key, down );
         switch(key)
         {
         case VK_LCONTROL:
@@ -1715,27 +1720,30 @@ static void update_key_state( volatile unsigned char *keystate, unsigned int msg
         case VK_RSHIFT:
             down = (keystate[VK_LSHIFT] | keystate[VK_RSHIFT]) & 0x80;
             set_input_key_state( keystate, VK_SHIFT, down );
+            if (down && shift_lock) keystate[VK_CAPITAL] &= ~0x01;
             break;
         }
         break;
     }
 }
 
-static void update_thread_input_key_state( struct thread_input *input, unsigned int msg, lparam_t wparam )
+static void update_thread_input_key_state( struct thread_input *input, unsigned int msg,
+                                           lparam_t wparam, int shift_lock )
 {
     input_shm_t *input_shm = input->shared;
     SHARED_WRITE_BEGIN( input_shm, input_shm_t )
     {
-        update_key_state( shared->keystate, msg, wparam, 0 );
+        update_key_state( shared->keystate, msg, wparam, 0, shift_lock );
     }
     SHARED_WRITE_END;
 }
 
-static void update_desktop_key_state( struct desktop *desktop, unsigned int msg, lparam_t wparam )
+static void update_desktop_key_state( struct desktop *desktop, unsigned int msg,
+                                      lparam_t wparam, int shift_lock )
 {
     SHARED_WRITE_BEGIN( desktop->shared, desktop_shm_t )
     {
-        update_key_state( shared->keystate, msg, wparam, 1 );
+        update_key_state( shared->keystate, msg, wparam, 1, shift_lock );
         ++shared->keystate_serial;
     }
     SHARED_WRITE_END;
@@ -1746,6 +1754,7 @@ static void release_hardware_message( struct msg_queue *queue, unsigned int hw_i
 {
     struct thread_input *input = queue->input;
     struct message *msg, *other;
+    struct hardware_msg_data *msg_data;
     int clr_bit;
 
     LIST_FOR_EACH_ENTRY( msg, &input->msg_list, struct message, entry )
@@ -1766,7 +1775,8 @@ static void release_hardware_message( struct msg_queue *queue, unsigned int hw_i
     }
     if (clr_bit) clear_queue_bits( queue, clr_bit );
 
-    update_thread_input_key_state( input, msg->msg, msg->wparam );
+    msg_data = msg->data;
+    update_thread_input_key_state( input, msg->msg, msg->wparam, msg_data->shift_lock );
     list_remove( &msg->entry );
     free_message( msg );
 }
@@ -1896,7 +1906,8 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
     unsigned int msg_code;
     int flags, msg_bit;
 
-    update_desktop_key_state( desktop, msg->msg, msg->wparam );
+    msg_data->shift_lock = desktop->shift_lock;
+    update_desktop_key_state( desktop, msg->msg, msg->wparam, msg_data->shift_lock );
     last_input_time = get_tick_count();
     if (msg->msg != WM_MOUSEMOVE) always_queue = 1;
 
@@ -1940,7 +1951,8 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
 
     if (!win || !thread || (flags & RIDEV_NOLEGACY))
     {
-        if (input && !(flags & RIDEV_NOLEGACY)) update_thread_input_key_state( input, msg->msg, msg->wparam );
+        if (input && !(flags & RIDEV_NOLEGACY))
+            update_thread_input_key_state( input, msg->msg, msg->wparam, msg_data->shift_lock );
         free_message( msg );
         if (thread) release_object( thread );
         return;
@@ -2747,7 +2759,7 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
         if (!win || !win_thread)
         {
             /* no window at all, remove it */
-            update_thread_input_key_state( input, msg->msg, msg->wparam );
+            update_thread_input_key_state( input, msg->msg, msg->wparam, data->shift_lock );
             list_remove( &msg->entry );
             free_message( msg );
             continue;
@@ -2763,7 +2775,7 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
             else
             {
                 /* for another thread input, drop it */
-                update_thread_input_key_state( input, msg->msg, msg->wparam );
+                update_thread_input_key_state( input, msg->msg, msg->wparam, data->shift_lock );
                 list_remove( &msg->entry );
                 free_message( msg );
             }
@@ -3804,6 +3816,18 @@ DECL_HANDLER(set_key_state)
             ++shared->keystate_serial;
         }
         SHARED_WRITE_END;
+        release_object( desktop );
+    }
+}
+
+/* set the desktop Caps Lock release mode */
+DECL_HANDLER(set_keyboard_lock_mode)
+{
+    struct desktop *desktop;
+
+    if ((desktop = get_thread_desktop( current, 0 )))
+    {
+        desktop->shift_lock = !!req->shift_lock;
         release_object( desktop );
     }
 }

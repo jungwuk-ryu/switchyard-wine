@@ -82,6 +82,7 @@ struct desktop
     process_id_t         foreground_pid;   /* id of the foreground process */
     unsigned int         users;            /* processes and threads using this desktop */
     unsigned char        alt_pressed;      /* last key press was Alt (used to determine msg on release) */
+    unsigned char        shift_lock;       /* whether Shift releases Caps Lock */
     struct key_repeat    key_repeat;       /* key auto-repeat */
     unsigned int         clip_flags;       /* last cursor clip flags */
     user_handle_t        cursor_win;       /* window that contains the cursor */

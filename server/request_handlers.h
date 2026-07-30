@@ -208,6 +208,7 @@ DECL_HANDLER(get_thread_input);
 DECL_HANDLER(set_user_input_time);
 DECL_HANDLER(get_key_state);
 DECL_HANDLER(set_key_state);
+DECL_HANDLER(set_keyboard_lock_mode);
 DECL_HANDLER(set_foreground_window);
 DECL_HANDLER(set_focus_window);
 DECL_HANDLER(set_active_window);
@@ -531,6 +532,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_set_user_input_time,
     (req_handler)req_get_key_state,
     (req_handler)req_set_key_state,
+    (req_handler)req_set_keyboard_lock_mode,
     (req_handler)req_set_foreground_window,
     (req_handler)req_set_focus_window,
     (req_handler)req_set_active_window,
@@ -1830,6 +1832,8 @@ C_ASSERT( offsetof(struct get_key_state_reply, state) == 8 );
 C_ASSERT( sizeof(struct get_key_state_reply) == 16 );
 C_ASSERT( offsetof(struct set_key_state_request, async) == 12 );
 C_ASSERT( sizeof(struct set_key_state_request) == 16 );
+C_ASSERT( offsetof(struct set_keyboard_lock_mode_request, shift_lock) == 12 );
+C_ASSERT( sizeof(struct set_keyboard_lock_mode_request) == 16 );
 C_ASSERT( offsetof(struct set_foreground_window_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_foreground_window_request, internal) == 16 );
 C_ASSERT( sizeof(struct set_foreground_window_request) == 24 );

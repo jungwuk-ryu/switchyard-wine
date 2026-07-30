@@ -291,7 +291,7 @@ struct hardware_msg_data
 {
     lparam_t             info;
     data_size_t          size;
-    int                  __pad;
+    int                  shift_lock;
     unsigned int         hw_id;
     unsigned int         flags;
     struct hw_msg_source source;
@@ -4465,6 +4465,17 @@ struct set_key_state_reply
 };
 
 
+struct set_keyboard_lock_mode_request
+{
+    struct request_header __header;
+    int            shift_lock;
+};
+struct set_keyboard_lock_mode_reply
+{
+    struct reply_header __header;
+};
+
+
 struct set_foreground_window_request
 {
     struct request_header __header;
@@ -6604,6 +6615,7 @@ enum request
     REQ_set_user_input_time,
     REQ_get_key_state,
     REQ_set_key_state,
+    REQ_set_keyboard_lock_mode,
     REQ_set_foreground_window,
     REQ_set_focus_window,
     REQ_set_active_window,
@@ -6930,6 +6942,7 @@ union generic_request
     struct set_user_input_time_request set_user_input_time_request;
     struct get_key_state_request get_key_state_request;
     struct set_key_state_request set_key_state_request;
+    struct set_keyboard_lock_mode_request set_keyboard_lock_mode_request;
     struct set_foreground_window_request set_foreground_window_request;
     struct set_focus_window_request set_focus_window_request;
     struct set_active_window_request set_active_window_request;
@@ -7254,6 +7267,7 @@ union generic_reply
     struct set_user_input_time_reply set_user_input_time_reply;
     struct get_key_state_reply get_key_state_reply;
     struct set_key_state_reply set_key_state_reply;
+    struct set_keyboard_lock_mode_reply set_keyboard_lock_mode_reply;
     struct set_foreground_window_reply set_foreground_window_reply;
     struct set_focus_window_reply set_focus_window_reply;
     struct set_active_window_reply set_active_window_reply;
@@ -7374,6 +7388,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 958
+#define SERVER_PROTOCOL_VERSION 959
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

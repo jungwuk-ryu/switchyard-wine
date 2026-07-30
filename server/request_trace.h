@@ -2345,6 +2345,11 @@ static void dump_set_key_state_request( const struct set_key_state_request *req 
     dump_varargs_bytes( ", keystate=", cur_size );
 }
 
+static void dump_set_keyboard_lock_mode_request( const struct set_keyboard_lock_mode_request *req )
+{
+    fprintf( stderr, " shift_lock=%d", req->shift_lock );
+}
+
 static void dump_set_foreground_window_request( const struct set_foreground_window_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -3859,6 +3864,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_user_input_time_request,
     (dump_func)dump_get_key_state_request,
     (dump_func)dump_set_key_state_request,
+    (dump_func)dump_set_keyboard_lock_mode_request,
     (dump_func)dump_set_foreground_window_request,
     (dump_func)dump_set_focus_window_request,
     (dump_func)dump_set_active_window_request,
@@ -4181,6 +4187,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_thread_input_reply,
     (dump_func)dump_set_user_input_time_reply,
     (dump_func)dump_get_key_state_reply,
+    NULL,
     NULL,
     (dump_func)dump_set_foreground_window_reply,
     (dump_func)dump_set_focus_window_reply,
@@ -4505,6 +4512,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "set_user_input_time",
     "get_key_state",
     "set_key_state",
+    "set_keyboard_lock_mode",
     "set_foreground_window",
     "set_focus_window",
     "set_active_window",

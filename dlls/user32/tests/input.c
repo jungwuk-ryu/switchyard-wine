@@ -3677,6 +3677,250 @@ static DWORD CALLBACK test_ActivateKeyboardLayout_thread_proc( void *arg )
     return 0;
 }
 
+static BOOL keyboard_lock_key( UINT vkey )
+{
+    INPUT input[2] =
+    {
+        {.type = INPUT_KEYBOARD, .ki = {.wVk = vkey}},
+        {.type = INPUT_KEYBOARD, .ki = {.wVk = vkey, .dwFlags = KEYEVENTF_KEYUP}},
+    };
+    UINT ret;
+
+    ret = SendInput( ARRAY_SIZE(input), input, sizeof(*input) );
+    if (ret != ARRAY_SIZE(input))
+    {
+        INPUT release = {.type = INPUT_KEYBOARD, .ki = {.wVk = vkey, .dwFlags = KEYEVENTF_KEYUP}};
+        DWORD error = GetLastError();
+
+        SendInput( 1, &release, sizeof(release) );
+        skip( "SendInput returned %u, error %lu\n", ret, error );
+        return FALSE;
+    }
+    wait_messages( 50, FALSE );
+    return TRUE;
+}
+
+static BOOL keyboard_caps_lock_on(void)
+{
+    return !!(GetKeyState( VK_CAPITAL ) & 1);
+}
+
+static BOOL set_keyboard_caps_lock( BOOL on, BOOL shift_lock )
+{
+    if (keyboard_caps_lock_on() == on) return TRUE;
+    if (!keyboard_lock_key( on || !shift_lock ? VK_CAPITAL : VK_LSHIFT )) return FALSE;
+    return keyboard_caps_lock_on() == on;
+}
+
+static void restore_keyboard_caps_lock_unknown_mode( BOOL on )
+{
+    if (keyboard_caps_lock_on() == on) return;
+    if (!keyboard_lock_key( VK_CAPITAL ) || keyboard_caps_lock_on() == on) return;
+    keyboard_lock_key( VK_LSHIFT );
+}
+
+static BOOL check_keyboard_lock_mode( BOOL shift_lock, const char *context )
+{
+    BOOL caps_lock;
+
+    if (!set_keyboard_caps_lock( TRUE, shift_lock )) return FALSE;
+    if (!keyboard_lock_key( VK_LSHIFT )) return FALSE;
+    caps_lock = keyboard_caps_lock_on();
+    ok( caps_lock != shift_lock, "%s: Caps Lock is %s after left Shift\n",
+        context, caps_lock ? "on" : "off" );
+    if (!set_keyboard_caps_lock( FALSE, shift_lock )) return FALSE;
+    return TRUE;
+}
+
+static void test_pending_keyboard_lock_mode( HWND hwnd, HKL layout, BOOL shift_lock )
+{
+    INPUT input = {.type = INPUT_KEYBOARD, .ki = {.wVk = VK_CAPITAL}};
+    MSG peeked, removed;
+    BOOL found = FALSE, mode_changed = FALSE;
+    HKL ret;
+    UINT i;
+
+    ret = ActivateKeyboardLayout( layout, KLF_RESET | (shift_lock ? KLF_SHIFTLOCK : 0) );
+    ok( ret == layout, "failed to set the queued-message lock mode, got layout %p\n", ret );
+    if (!ret || !set_keyboard_caps_lock( TRUE, shift_lock )) return;
+
+    empty_message_queue();
+    if (SendInput( 1, &input, sizeof(input) ) != 1)
+    {
+        skip( "failed to queue Caps Lock key-down, error %lu\n", GetLastError() );
+        goto release;
+    }
+
+    for (i = 0; i < 50; i++)
+    {
+        if (PeekMessageW( &peeked, hwnd, WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE ))
+        {
+            found = TRUE;
+            break;
+        }
+        Sleep( 10 );
+    }
+    if (!found)
+    {
+        skip( "no queued Caps Lock message was available\n" );
+        goto release;
+    }
+    ok( peeked.message == WM_KEYDOWN && peeked.wParam == VK_CAPITAL,
+        "got queued message %#x, wparam %#Ix\n", peeked.message, peeked.wParam );
+
+    ret = ActivateKeyboardLayout( layout, KLF_RESET | (!shift_lock ? KLF_SHIFTLOCK : 0) );
+    ok( ret == layout, "failed to change the pending-message lock mode, got layout %p\n", ret );
+    if (!ret) goto release;
+    mode_changed = TRUE;
+
+    found = PeekMessageW( &removed, hwnd, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE );
+    ok( found, "failed to remove the queued Caps Lock message\n" );
+    if (found)
+        ok( removed.message == peeked.message && removed.wParam == peeked.wParam,
+            "removed message %#x, wparam %#Ix, expected %#x, %#Ix\n",
+            removed.message, removed.wParam, peeked.message, peeked.wParam );
+    ok( keyboard_caps_lock_on() == shift_lock,
+        "pending Caps Lock key-down used the mode active at message removal\n" );
+
+release:
+    input.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput( 1, &input, sizeof(input) );
+    wait_messages( 50, FALSE );
+    set_keyboard_caps_lock( FALSE, mode_changed ? !shift_lock : shift_lock );
+}
+
+static void test_keyboard_shift_lock_child(void)
+{
+    BOOL original_caps_lock = keyboard_caps_lock_on();
+
+    if (!set_keyboard_caps_lock( TRUE, TRUE )) goto done;
+    if (!keyboard_lock_key( VK_LSHIFT )) goto done;
+    ok( !keyboard_caps_lock_on(), "left Shift did not release Caps Lock in child process\n" );
+
+    if (!set_keyboard_caps_lock( TRUE, TRUE )) goto done;
+    if (!keyboard_lock_key( VK_CAPITAL )) goto done;
+    ok( keyboard_caps_lock_on(), "Caps Lock released itself in shift-lock mode in child process\n" );
+
+done:
+    restore_keyboard_caps_lock_unknown_mode( original_caps_lock );
+    empty_message_queue();
+}
+
+static void test_keyboard_lock_modes( char **argv, HWND hwnd, HKL layout )
+{
+    BOOL original_caps_lock = keyboard_caps_lock_on(), original_shift_lock;
+    BOOL was_topmost = hwnd && (GetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_TOPMOST);
+    HKL ret;
+
+    /* Determine the existing desktop-wide mode so that it can be restored. */
+    if (!set_keyboard_caps_lock( TRUE, FALSE )) goto restore_unknown;
+    if (!keyboard_lock_key( VK_LSHIFT )) goto restore_unknown;
+    original_shift_lock = !keyboard_caps_lock_on();
+    if (!set_keyboard_caps_lock( FALSE, original_shift_lock )) goto restore;
+
+    if (hwnd)
+    {
+        ShowWindow( hwnd, SW_SHOW );
+        SetWindowPos( hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE );
+        SetForegroundWindow( hwnd );
+        SetFocus( hwnd );
+        UpdateWindow( hwnd );
+        wait_messages( 100, FALSE );
+        empty_message_queue();
+    }
+
+    if (!set_keyboard_caps_lock( TRUE, original_shift_lock )) goto restore;
+    ret = ActivateKeyboardLayout( layout, KLF_RESET );
+    ok( ret == layout, "KLF_RESET returned layout %p, expected %p\n", ret, layout );
+    if (!ret) goto restore;
+    ok( keyboard_caps_lock_on(), "KLF_RESET changed the Caps Lock state\n" );
+    if (!set_keyboard_caps_lock( FALSE, FALSE )) goto restore;
+
+    if (!set_keyboard_caps_lock( TRUE, FALSE )) goto restore;
+    if (!keyboard_lock_key( VK_LSHIFT )) goto restore;
+    ok( keyboard_caps_lock_on(), "left Shift released Caps Lock without KLF_SHIFTLOCK\n" );
+    if (!keyboard_lock_key( VK_RSHIFT )) goto restore;
+    ok( keyboard_caps_lock_on(), "right Shift released Caps Lock without KLF_SHIFTLOCK\n" );
+    if (!keyboard_lock_key( VK_CAPITAL )) goto restore;
+    ok( !keyboard_caps_lock_on(), "Caps Lock did not release itself without KLF_SHIFTLOCK\n" );
+
+    test_pending_keyboard_lock_mode( hwnd, layout, FALSE );
+    test_pending_keyboard_lock_mode( hwnd, layout, TRUE );
+    ret = ActivateKeyboardLayout( layout, KLF_RESET );
+    ok( ret == layout, "failed to restore reset mode after pending-message tests, got layout %p\n", ret );
+    if (!ret) goto restore;
+
+    ret = ActivateKeyboardLayout( layout, KLF_SHIFTLOCK );
+    ok( ret == layout, "KLF_SHIFTLOCK returned layout %p, expected %p\n", ret, layout );
+    if (!ret || !check_keyboard_lock_mode( FALSE, "KLF_SHIFTLOCK after KLF_RESET" )) goto restore;
+    ret = ActivateKeyboardLayout( layout, 0 );
+    ok( ret == layout, "flags 0 returned layout %p, expected %p\n", ret, layout );
+    if (!ret || !check_keyboard_lock_mode( FALSE, "flags 0 after KLF_RESET" )) goto restore;
+
+    if (!set_keyboard_caps_lock( TRUE, FALSE )) goto restore;
+    ret = ActivateKeyboardLayout( layout, KLF_RESET | KLF_SHIFTLOCK );
+    ok( ret == layout, "KLF_RESET | KLF_SHIFTLOCK returned layout %p, expected %p\n", ret, layout );
+    if (!ret) goto restore;
+    ok( keyboard_caps_lock_on(), "KLF_RESET | KLF_SHIFTLOCK changed the Caps Lock state\n" );
+    if (!set_keyboard_caps_lock( FALSE, TRUE )) goto restore;
+
+    if (!set_keyboard_caps_lock( TRUE, TRUE )) goto restore;
+    if (!keyboard_lock_key( VK_LSHIFT )) goto restore;
+    ok( !keyboard_caps_lock_on(), "left Shift did not release Caps Lock with KLF_SHIFTLOCK\n" );
+    if (!set_keyboard_caps_lock( TRUE, TRUE )) goto restore;
+    if (!keyboard_lock_key( VK_RSHIFT )) goto restore;
+    ok( !keyboard_caps_lock_on(), "right Shift did not release Caps Lock with KLF_SHIFTLOCK\n" );
+    if (!set_keyboard_caps_lock( TRUE, TRUE )) goto restore;
+    if (!keyboard_lock_key( VK_CAPITAL )) goto restore;
+    ok( keyboard_caps_lock_on(), "Caps Lock released itself with KLF_SHIFTLOCK\n" );
+    set_keyboard_caps_lock( FALSE, TRUE );
+
+    ret = ActivateKeyboardLayout( layout, KLF_SHIFTLOCK );
+    ok( ret == layout, "KLF_SHIFTLOCK returned layout %p, expected %p\n", ret, layout );
+    if (!ret || !check_keyboard_lock_mode( TRUE, "KLF_SHIFTLOCK after KLF_RESET | KLF_SHIFTLOCK" ))
+        goto restore;
+    ret = ActivateKeyboardLayout( layout, 0 );
+    ok( ret == layout, "flags 0 returned layout %p, expected %p\n", ret, layout );
+    if (!ret || !check_keyboard_lock_mode( TRUE, "flags 0 after KLF_RESET | KLF_SHIFTLOCK" ))
+        goto restore;
+
+    run_in_process( argv, "test_keyboard_shift_lock_child" );
+
+restore:
+    ret = ActivateKeyboardLayout( layout, KLF_RESET | (original_shift_lock ? KLF_SHIFTLOCK : 0) );
+    ok( ret == layout, "failed to restore keyboard lock mode, got layout %p\n", ret );
+    ok( set_keyboard_caps_lock( original_caps_lock, original_shift_lock ),
+        "failed to restore Caps Lock state\n" );
+    if (hwnd && !was_topmost)
+        SetWindowPos( hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                      SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE );
+    empty_message_queue();
+    return;
+
+restore_unknown:
+    restore_keyboard_caps_lock_unknown_mode( original_caps_lock );
+    if (hwnd && !was_topmost)
+        SetWindowPos( hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                      SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE );
+    empty_message_queue();
+}
+
+static void test_keyboard_lock_modes_process( char **argv )
+{
+    HWND hwnd;
+
+    hwnd = CreateWindowA( "static", "static", WS_VISIBLE | WS_POPUP,
+                          100, 100, 100, 100, 0, NULL, NULL, NULL );
+    if (hwnd)
+    {
+        SetForegroundWindow( hwnd );
+        SetFocus( hwnd );
+        empty_message_queue();
+    }
+    test_keyboard_lock_modes( argv, hwnd, GetKeyboardLayout( 0 ) );
+    if (hwnd) DestroyWindow( hwnd );
+}
+
 static void test_ActivateKeyboardLayout( char **argv )
 {
     HKL layout, tmp_layout, *layouts;
@@ -3704,6 +3948,8 @@ static void test_ActivateKeyboardLayout( char **argv )
                            100, 100, 100, 100, 0, NULL, NULL, NULL );
     ok( !!hwnd1, "CreateWindow failed, error %lu\n", GetLastError() );
     empty_message_queue();
+
+    test_keyboard_lock_modes( argv, hwnd1, layout );
 
     SetWindowLongPtrA( hwnd1, GWLP_WNDPROC, (LONG_PTR)test_ActivateKeyboardLayout_window_proc );
 
@@ -6621,6 +6867,10 @@ START_TEST(input)
         return test_system_messages_with_rawinput_nolegacy();
     if (argc >= 3 && !strcmp( argv[2], "test_SetFocus" ))
         return test_SetFocus_process();
+    if (argc >= 3 && !strcmp( argv[2], "test_keyboard_shift_lock_child" ))
+        return test_keyboard_shift_lock_child();
+    if (argc >= 3 && !strcmp( argv[2], "test_keyboard_lock_modes" ))
+        return test_keyboard_lock_modes_process( argv );
 
     run_in_desktop( argv, "test_input_desktop", 1 );
     test_keynames();

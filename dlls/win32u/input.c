@@ -1334,7 +1334,8 @@ HKL WINAPI NtUserActivateKeyboardLayout( HKL layout, UINT flags )
 
     TRACE_(keyboard)( "layout %p, flags %x\n", layout, flags );
 
-    if (flags) FIXME_(keyboard)( "flags %x not supported\n", flags );
+    if (flags & ~(KLF_RESET | KLF_SHIFTLOCK))
+        FIXME_(keyboard)( "flags %x not supported\n", flags & ~(KLF_RESET | KLF_SHIFTLOCK) );
 
     if (layout == (HKL)HKL_NEXT || layout == (HKL)HKL_PREV)
     {
@@ -1353,6 +1354,16 @@ HKL WINAPI NtUserActivateKeyboardLayout( HKL layout, UINT flags )
 
     if (!user_driver->pActivateKeyboardLayout( layout, flags ))
         return 0;
+
+    if (flags & KLF_RESET)
+    {
+        SERVER_START_REQ( set_keyboard_lock_mode )
+        {
+            req->shift_lock = !!(flags & KLF_SHIFTLOCK);
+            wine_server_call( req );
+        }
+        SERVER_END_REQ;
+    }
 
     old_layout = info->kbd_layout;
     if (old_layout != layout)
