@@ -13,3 +13,12 @@ Wine and the downstream modifications in this repository are licensed under the 
 This repository contains no Apple Game Porting Toolkit binaries or source, no launcher binaries or assets, and no user credentials. References to GPTK, Steam, Battle.net, Chrome, or other software describe compatibility work and local interoperability testing only.
 
 The optional Mesa llvmpipe OpenGL backend is also an external build input rather than tracked binary source. The runtime builder downloads a pinned Mesa Windows distribution, verifies the archive and extracted i386/x86_64 DLL hashes, and records the Mesa source and distributor revisions. Mesa, LLVM, and distributor license notices are retained under `lib/switchyard-mesa/share/doc/switchyard-mesa` in every generated runtime.
+
+The GStreamer media backend is an external build input from the official
+GStreamer macOS distribution. The runtime builder pins and verifies both the
+runtime and development package hashes, retains only the plugins needed by
+Wine Media Foundation, and records their identity in the runtime manifest.
+GStreamer, FFmpeg, and dependency license notices are retained under
+`lib/switchyard-gstreamer/share` in every generated runtime. Restricted codec
+plugins can be subject to patent requirements in some jurisdictions; the
+upstream installer notice is preserved with the generated runtime.

@@ -100,6 +100,11 @@ for required_notice in \
   lib/switchyard-mesa/share/doc/switchyard-mesa/MESA-LICENSE.rst \
   lib/switchyard-mesa/share/doc/switchyard-mesa/LLVM-LICENSE.txt \
   lib/switchyard-mesa/share/doc/switchyard-mesa/DISTRIBUTOR-LICENSE.txt \
+  lib/switchyard-gstreamer/share/doc/switchyard-gstreamer/README.txt \
+  lib/switchyard-gstreamer/share/doc/switchyard-gstreamer/INSTALLER-LICENSE.txt \
+  lib/switchyard-gstreamer/share/doc/switchyard-gstreamer/packages.tsv \
+  lib/switchyard-gstreamer/share/licenses/gstreamer-1.0/LGPL-2.0-or-later.txt \
+  lib/switchyard-gstreamer/share/licenses/ffmpeg/LGPL-2.1-or-later.txt \
   lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv \
   lib/switchyard-tls/share/doc/switchyard-tls/sources.tsv; do
   [ -f "$RUNTIME/$required_notice" ] || {
@@ -113,10 +118,15 @@ if /usr/bin/find "$RUNTIME" \( -iname '*d3dmetal*' -o -iname '*metalirconverter*
   echo "release runtime contains a user-provided Apple graphics component" >&2
   exit 1
 fi
-if /usr/bin/grep -R -I -l -E '/Users/[^/]+/.+(Game.Porting.Toolkit|heroic)' \
-     "$RUNTIME/switchyard-runtime.json" "$RUNTIME/lib/switchyard-tls/share/doc" 2>/dev/null |
-   /usr/bin/grep -q .; then
+if /usr/bin/grep -R -I -q -E '/Users/[^/]+/.+(Game.Porting.Toolkit|heroic)' \
+     "$RUNTIME/switchyard-runtime.json" "$RUNTIME/lib/switchyard-gstreamer/share/doc" \
+     "$RUNTIME/lib/switchyard-tls/share/doc" 2>/dev/null; then
   echo "release runtime contains a user-local toolkit provenance path" >&2
+  exit 1
+fi
+if /usr/bin/grep -R -I -q -E '/Users/[^/]+' \
+     "$RUNTIME/lib/switchyard-gstreamer" 2>/dev/null; then
+  echo "release runtime contains a user-local GStreamer build path" >&2
   exit 1
 fi
 

@@ -8,9 +8,9 @@ UPSTREAM_BASE_FILE="$ROOT_DIR/switchyard/upstream-base.txt"
 MODE="${1:-build}"
 
 case "$MODE" in
-  build|--ensure|--source-info|--verify-mesa|--verify-tls) ;;
+  build|--ensure|--source-info|--verify-media|--verify-mesa|--verify-tls) ;;
   *)
-    echo "usage: $0 [--ensure|--source-info|--verify-mesa|--verify-tls]" >&2
+    echo "usage: $0 [--ensure|--source-info|--verify-media|--verify-mesa|--verify-tls]" >&2
     exit 2
     ;;
 esac
@@ -95,6 +95,52 @@ TLS_RUNTIME_LAYOUT_VERSION="5"
 TLS_MIN_MACOS_VERSION="14.0"
 TLS_PACKAGE_CACHE_DIR="${TLS_PACKAGE_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/TLS/packages}"
 TLS_DEPS_CACHE_DIR="${TLS_DEPS_CACHE_DIR:-${HOME}/.switchyard/deps/tls}"
+GSTREAMER_VERSION="1.28.5"
+GSTREAMER_RUNTIME_LAYOUT_VERSION="4"
+GSTREAMER_PACKAGE_BASE_URL="https://gstreamer.freedesktop.org/data/pkg/osx/${GSTREAMER_VERSION}"
+GSTREAMER_RUNTIME_PACKAGE="gstreamer-1.0-${GSTREAMER_VERSION}-universal.pkg"
+GSTREAMER_RUNTIME_PACKAGE_SHA256="0a8fc7a1cf8d7bac833ca0ebe2fd196a199c2465e810cd5b1e4b4f720c258f43"
+GSTREAMER_DEVEL_PACKAGE="gstreamer-1.0-devel-${GSTREAMER_VERSION}-universal.pkg"
+GSTREAMER_DEVEL_PACKAGE_SHA256="6f7b55e8fb86dcc615c9cae46b79b7785851e5c77f79a938648a81dfa2603729"
+GSTREAMER_PACKAGE_CACHE_DIR="${GSTREAMER_PACKAGE_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Media/GStreamer}"
+GSTREAMER_DEPS_PREFIX="${GSTREAMER_DEPS_PREFIX:-${HOME}/.switchyard/deps/media/gstreamer-${GSTREAMER_VERSION}-universal-curated-v${GSTREAMER_RUNTIME_LAYOUT_VERSION}}"
+GSTREAMER_RUNTIME_COMPONENTS=(
+  "base-system-1.0-${GSTREAMER_VERSION}-universal.pkg"
+  "base-crypto-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-core-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-playback-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-codecs-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-codecs-restricted-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-effects-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-libav-${GSTREAMER_VERSION}-universal.pkg"
+)
+GSTREAMER_DEVEL_COMPONENTS=(
+  "base-system-1.0-devel-${GSTREAMER_VERSION}-universal.pkg"
+  "base-crypto-devel-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-core-devel-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-playback-devel-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-codecs-devel-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-codecs-restricted-devel-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-effects-devel-${GSTREAMER_VERSION}-universal.pkg"
+  "gstreamer-1.0-libav-devel-${GSTREAMER_VERSION}-universal.pkg"
+)
+GSTREAMER_PLUGIN_FILES=(
+  "libgstapp.dylib"
+  "libgstasf.dylib"
+  "libgstaudioconvert.dylib"
+  "libgstaudiorate.dylib"
+  "libgstaudioresample.dylib"
+  "libgstcoreelements.dylib"
+  "libgstdeinterlace.dylib"
+  "libgstlibav.dylib"
+  "libgstplayback.dylib"
+  "libgsttypefindfunctions.dylib"
+  "libgstvideoconvertscale.dylib"
+  "libgstvideofilter.dylib"
+  "libgstvideoparsersbad.dylib"
+  "libgstvideorate.dylib"
+  "libgstvolume.dylib"
+)
 USER_SET_WINE_BUILD_DIR="${WINE_BUILD_DIR+x}"
 WINE_BUILD_DIR="${WINE_BUILD_DIR:-}"
 USER_SET_WINE_INSTALL_PREFIX="${WINE_INSTALL_PREFIX+x}"
@@ -174,6 +220,7 @@ require_command bsdtar
 require_command unzip
 require_command zstd
 require_command install_name_tool
+require_command pkgutil
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
@@ -1374,6 +1421,281 @@ EOF
   printf '%s\n' "$tls_deps_prefix"
 }
 
+download_gstreamer_package() {
+  local filename="$1"
+  local expected_hash="$2"
+  local cached_file="$GSTREAMER_PACKAGE_CACHE_DIR/$filename"
+  local actual_hash
+  local temporary_file
+
+  mkdir -p "$GSTREAMER_PACKAGE_CACHE_DIR"
+  if [ -f "$cached_file" ]; then
+    actual_hash="$(sha256_file "$cached_file")"
+    if [ "$actual_hash" = "$expected_hash" ]; then
+      printf '%s\n' "$cached_file"
+      return 0
+    fi
+    echo "cached GStreamer package $filename has unexpected sha256 $actual_hash; downloading again." >&2
+    rm -f "$cached_file"
+  fi
+
+  temporary_file="${cached_file}.tmp.$$"
+  echo "downloading GStreamer $GSTREAMER_VERSION package $filename" >&2
+  curl -fL --retry 3 --retry-delay 1 --connect-timeout 20 \
+    --proto '=https' --tlsv1.2 \
+    -o "$temporary_file" "$GSTREAMER_PACKAGE_BASE_URL/$filename"
+  actual_hash="$(sha256_file "$temporary_file")"
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    rm -f "$temporary_file"
+    echo "GStreamer package sha256 mismatch for $filename: expected $expected_hash, got $actual_hash" >&2
+    exit 1
+  fi
+  mv "$temporary_file" "$cached_file"
+  printf '%s\n' "$cached_file"
+}
+
+gstreamer_plugin_is_selected() {
+  local candidate="$1"
+  local selected
+
+  for selected in "${GSTREAMER_PLUGIN_FILES[@]}"; do
+    if [ "$candidate" = "$selected" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+verify_gstreamer_runtime() {
+  local prefix="$1"
+  local smoke_asset="${2:-}"
+  local registry_dir
+  local registry_path
+  local feature
+
+  registry_dir="$(mktemp -d)"
+  registry_path="$registry_dir/registry-x86_64.bin"
+  for feature in \
+    asfdemux avdec_wmv3 avdec_wmapro audioconvert audioresample \
+    decodebin deinterlace videoconvert videoflip; do
+    env -i \
+      HOME="$HOME" \
+      PATH="/usr/bin:/bin" \
+      TMPDIR="${TMPDIR:-/tmp}" \
+      GST_PLUGIN_SYSTEM_PATH_1_0="$prefix/lib/gstreamer-1.0" \
+      GST_PLUGIN_PATH_1_0= \
+      GST_PLUGIN_SCANNER_1_0="$prefix/libexec/gstreamer-1.0/gst-plugin-scanner" \
+      GST_REGISTRY_1_0="$registry_path" \
+      GST_REGISTRY_FORK=no \
+      arch -x86_64 "$prefix/bin/gst-inspect-1.0" "$feature" >/dev/null
+  done
+
+  if [ -n "$smoke_asset" ]; then
+    if [ ! -f "$smoke_asset" ]; then
+      echo "GStreamer media smoke asset does not exist: $smoke_asset" >&2
+      rm -rf "$registry_dir"
+      return 1
+    fi
+    echo "decoding the complete WMV3 video stream from $smoke_asset" >&2
+    env -i \
+      HOME="$HOME" \
+      PATH="/usr/bin:/bin" \
+      TMPDIR="${TMPDIR:-/tmp}" \
+      GST_PLUGIN_SYSTEM_PATH_1_0="$prefix/lib/gstreamer-1.0" \
+      GST_PLUGIN_PATH_1_0= \
+      GST_PLUGIN_SCANNER_1_0="$prefix/libexec/gstreamer-1.0/gst-plugin-scanner" \
+      GST_REGISTRY_1_0="$registry_path" \
+      GST_REGISTRY_FORK=no \
+      arch -x86_64 "$prefix/bin/gst-launch-1.0" -q \
+        filesrc location="$smoke_asset" ! asfdemux name=demux \
+        demux.video_0 ! queue ! avdec_wmv3 ! videoconvert ! fakesink sync=false
+  fi
+  rm -rf "$registry_dir"
+}
+
+gstreamer_deps_are_complete() {
+  local prefix="$1"
+  local plugin
+
+  content_tree_is_verified "$prefix" || return 1
+  [ -x "$prefix/bin/gst-inspect-1.0" ] || return 1
+  [ -x "$prefix/bin/gst-launch-1.0" ] || return 1
+  [ -x "$prefix/libexec/gstreamer-1.0/gst-plugin-scanner" ] || return 1
+  [ -f "$prefix/include/gstreamer-1.0/gst/gst.h" ] || return 1
+  [ -f "$prefix/lib/pkgconfig/gstreamer-1.0.pc" ] || return 1
+  grep -F 'prefix=${pcfiledir}/../..' \
+    "$prefix/lib/pkgconfig/gstreamer-1.0.pc" >/dev/null || return 1
+  if grep -R -I -q -E '^prefix=/Users/' "$prefix/lib/pkgconfig" 2>/dev/null; then
+    return 1
+  fi
+  if grep -R -I -q -E '/Users/[^/]+' "$prefix" 2>/dev/null; then
+    return 1
+  fi
+  [ -f "$prefix/share/doc/switchyard-gstreamer/INSTALLER-LICENSE.txt" ] || return 1
+  [ -f "$prefix/share/doc/switchyard-gstreamer/packages.tsv" ] || return 1
+  [ "$(tr -d '[:space:]' < "$prefix/share/doc/switchyard-gstreamer/VERSION")" = "$GSTREAMER_VERSION" ] || return 1
+  file "$prefix/lib/libgstreamer-1.0.0.dylib" | grep "x86_64" >/dev/null || return 1
+  for plugin in "${GSTREAMER_PLUGIN_FILES[@]}"; do
+    [ -f "$prefix/lib/gstreamer-1.0/$plugin" ] || return 1
+    file "$prefix/lib/gstreamer-1.0/$plugin" | grep "x86_64" >/dev/null || return 1
+  done
+}
+
+stage_gstreamer_deps() {
+  local runtime_package
+  local devel_package
+  local extraction_root
+  local runtime_expanded
+  local devel_expanded
+  local temporary_prefix
+  local component
+  local payload
+  local plugin_path
+  local plugin_name
+  local devel_base
+  local devel_core
+
+  if gstreamer_deps_are_complete "$GSTREAMER_DEPS_PREFIX"; then
+    printf '%s\n' "$GSTREAMER_DEPS_PREFIX"
+    return 0
+  fi
+
+  runtime_package="$(download_gstreamer_package \
+    "$GSTREAMER_RUNTIME_PACKAGE" "$GSTREAMER_RUNTIME_PACKAGE_SHA256")"
+  devel_package="$(download_gstreamer_package \
+    "$GSTREAMER_DEVEL_PACKAGE" "$GSTREAMER_DEVEL_PACKAGE_SHA256")"
+  extraction_root="$(mktemp -d)"
+  runtime_expanded="$extraction_root/runtime"
+  devel_expanded="$extraction_root/devel"
+  echo "extracting pinned GStreamer runtime and development packages" >&2
+  pkgutil --expand-full "$runtime_package" "$runtime_expanded"
+  pkgutil --expand-full "$devel_package" "$devel_expanded"
+
+  mkdir -p "$(dirname "$GSTREAMER_DEPS_PREFIX")"
+  temporary_prefix="${GSTREAMER_DEPS_PREFIX}.tmp.$$"
+  rm -rf "$temporary_prefix"
+  mkdir -p "$temporary_prefix"
+
+  for component in "${GSTREAMER_RUNTIME_COMPONENTS[@]}"; do
+    payload="$runtime_expanded/$component/Payload"
+    if [ ! -d "$payload" ]; then
+      echo "GStreamer runtime package is missing component $component." >&2
+      exit 1
+    fi
+    ditto "$payload" "$temporary_prefix"
+  done
+  # Upstream developer helpers contain Cerbero builder paths and are not used
+  # by Wine. Fontconfig is supplied by Switchyard's separate font runtime.
+  rm -rf "$temporary_prefix/etc/fonts"
+  rm -f "$temporary_prefix/share/gstreamer/gst-env"
+
+  for plugin_path in "$temporary_prefix"/lib/gstreamer-1.0/*; do
+    [ -e "$plugin_path" ] || continue
+    plugin_name="$(basename "$plugin_path")"
+    if ! gstreamer_plugin_is_selected "$plugin_name"; then
+      rm -rf "$plugin_path"
+    fi
+  done
+
+  devel_base="$devel_expanded/base-system-1.0-devel-${GSTREAMER_VERSION}-universal.pkg/Payload"
+  devel_core="$devel_expanded/gstreamer-1.0-core-devel-${GSTREAMER_VERSION}-universal.pkg/Payload"
+  for payload in "$devel_base" "$devel_core"; do
+    if [ ! -d "$payload/include" ] || [ ! -d "$payload/lib/pkgconfig" ]; then
+      echo "GStreamer development package is missing headers or pkg-config metadata under $payload." >&2
+      exit 1
+    fi
+    ditto "$payload/include" "$temporary_prefix/include"
+    ditto "$payload/lib/pkgconfig" "$temporary_prefix/lib/pkgconfig"
+  done
+  ditto "$devel_base/lib/glib-2.0/include" "$temporary_prefix/lib/glib-2.0/include"
+  ditto "$devel_core/lib/gstreamer-1.0/include" "$temporary_prefix/lib/gstreamer-1.0/include"
+  for payload in "$temporary_prefix"/lib/pkgconfig/*.pc; do
+    [ -f "$payload" ] || continue
+    perl -0pi -e 's#^prefix=.*$#prefix=\${pcfiledir}/../..#m' "$payload"
+  done
+
+  mkdir -p "$temporary_prefix/share/licenses" \
+    "$temporary_prefix/share/doc/switchyard-gstreamer"
+  for component in "${GSTREAMER_DEVEL_COMPONENTS[@]}"; do
+    payload="$devel_expanded/$component/Payload"
+    if [ ! -d "$payload" ]; then
+      echo "GStreamer development package is missing component $component." >&2
+      exit 1
+    fi
+    if [ -d "$payload/share/licenses" ]; then
+      ditto "$payload/share/licenses" "$temporary_prefix/share/licenses"
+    fi
+  done
+  install -m 0644 "$runtime_expanded/Resources/license.txt" \
+    "$temporary_prefix/share/doc/switchyard-gstreamer/INSTALLER-LICENSE.txt"
+  printf '%s\n' "$GSTREAMER_VERSION" \
+    > "$temporary_prefix/share/doc/switchyard-gstreamer/VERSION"
+  {
+    printf 'kind\tfile\tsha256\turl\n'
+    printf 'runtime\t%s\t%s\t%s/%s\n' \
+      "$GSTREAMER_RUNTIME_PACKAGE" "$GSTREAMER_RUNTIME_PACKAGE_SHA256" \
+      "$GSTREAMER_PACKAGE_BASE_URL" "$GSTREAMER_RUNTIME_PACKAGE"
+    printf 'development\t%s\t%s\t%s/%s\n' \
+      "$GSTREAMER_DEVEL_PACKAGE" "$GSTREAMER_DEVEL_PACKAGE_SHA256" \
+      "$GSTREAMER_PACKAGE_BASE_URL" "$GSTREAMER_DEVEL_PACKAGE"
+  } > "$temporary_prefix/share/doc/switchyard-gstreamer/packages.tsv"
+  {
+    printf 'Switchyard GStreamer media runtime\n\n'
+    printf 'Version: %s\n' "$GSTREAMER_VERSION"
+    printf 'Architecture: universal package; Wine consumes the x86_64 slices under Rosetta\n'
+    printf 'Selected plugins:\n'
+    printf '  %s\n' "${GSTREAMER_PLUGIN_FILES[@]}"
+    printf '\nThe runtime is restricted to the plugins needed by Wine Media Foundation.\n'
+    printf 'It provides ASF demuxing and libav WMV3/WMA Pro decoding without using a\n'
+    printf 'host GStreamer installation. Preserve packages.tsv, INSTALLER-LICENSE.txt,\n'
+    printf 'and share/licenses when redistributing the runtime.\n'
+  } > "$temporary_prefix/share/doc/switchyard-gstreamer/README.txt"
+
+  chmod -R u+rwX "$temporary_prefix"
+  verify_gstreamer_runtime "$temporary_prefix"
+  write_content_tree_digest "$temporary_prefix"
+  atomic_replace_directory "$temporary_prefix" "$GSTREAMER_DEPS_PREFIX" cache
+  rm -rf "$extraction_root"
+  printf '%s\n' "$GSTREAMER_DEPS_PREFIX"
+}
+
+relocate_winegstreamer_for_runtime() {
+  local runtime_root="$1"
+  local build_prefix="$2"
+  local runtime_rpath="@loader_path/../../switchyard-gstreamer/lib"
+  local module
+  local module_count=0
+  local rpath
+
+  while IFS= read -r -d '' module; do
+    module_count=$((module_count + 1))
+    while IFS= read -r rpath; do
+      case "$rpath" in
+        "$build_prefix"/*)
+          install_name_tool -delete_rpath "$rpath" "$module"
+          ;;
+      esac
+    done < <(otool -l "$module" |
+      awk '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')
+    if ! otool -l "$module" | grep -F "$runtime_rpath" >/dev/null 2>&1; then
+      install_name_tool -add_rpath "$runtime_rpath" "$module"
+    fi
+    if otool -l "$module" | grep -F "$build_prefix" >/dev/null 2>&1; then
+      echo "Wine GStreamer backend retains a build-cache rpath: $module" >&2
+      return 1
+    fi
+    if ! otool -L "$module" | grep -F '@rpath/libgstreamer-1.0.0.dylib' >/dev/null 2>&1; then
+      echo "Wine GStreamer backend does not link the staged GStreamer runtime: $module" >&2
+      return 1
+    fi
+  done < <(find "$runtime_root/lib/wine" -type f -path '*-unix/winegstreamer.so' -print0)
+
+  if [ "$module_count" -eq 0 ]; then
+    echo "Wine was built without its Unix GStreamer backend." >&2
+    return 1
+  fi
+}
+
 if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
   echo "Rosetta is required to build and run the x86_64 Switchyard Wine runtime." >&2
   echo "Install it with: softwareupdate --install-rosetta --agree-to-license" >&2
@@ -1449,6 +1771,14 @@ if [ "$MODE" = "--verify-tls" ]; then
   exit 0
 fi
 
+if [ "$MODE" = "--verify-media" ]; then
+  gstreamer_deps_prefix="$(stage_gstreamer_deps)"
+  verify_gstreamer_runtime "$gstreamer_deps_prefix" "${SWITCHYARD_MEDIA_SMOKE_ASSET:-}"
+  echo "verified pinned x86_64 GStreamer media runtime at $gstreamer_deps_prefix"
+  echo "gstreamerRuntimeDigest=$(content_tree_digest "$gstreamer_deps_prefix")"
+  exit 0
+fi
+
 if [ "$MODE" = "--verify-mesa" ]; then
   mesa_windows_prefix="$(stage_mesa_windows_opengl)"
   echo "verified pinned i386/x86_64 Mesa Windows OpenGL runtime at $mesa_windows_prefix"
@@ -1458,6 +1788,8 @@ fi
 
 wine_mono_path="$(download_wine_mono)"
 wine_mono_digest="$(sha256_file "$wine_mono_path")"
+gstreamer_deps_prefix="$(stage_gstreamer_deps)"
+gstreamer_deps_digest="$(content_tree_digest "$gstreamer_deps_prefix")"
 vulkan_deps_prefix="$(stage_vulkan_deps)"
 vulkan_deps_digest="$(content_tree_digest "$vulkan_deps_prefix")"
 mesa_windows_prefix="$(stage_mesa_windows_opengl)"
@@ -1476,7 +1808,7 @@ else
   tls_dlopen_digest="none"
 fi
 
-runtime_id="switchyard-local-wow64-x86_64-${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${vulkan_deps_digest}-${mesa_windows_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
+runtime_id="switchyard-local-wow64-x86_64-${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${gstreamer_deps_digest}-${vulkan_deps_digest}-${mesa_windows_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
 if [ -z "$USER_SET_WINE_INSTALL_PREFIX" ]; then
   WINE_INSTALL_PREFIX="${HOME}/.switchyard/runtimes/$runtime_id"
 fi
@@ -1499,6 +1831,7 @@ runtime_is_complete_at() {
   local expected_i386_ntdll_sha
   local expected_x86_64_ntdll_sha
   local manifest_font_assets_digest
+  local manifest_gstreamer_digest
   local manifest_mesa_digest
   local kind
   local name
@@ -1506,6 +1839,7 @@ runtime_is_complete_at() {
   local url
   local extra
   local asset_path
+  local plugin
 
   [ -f "$manifest" ] || return 1
   manifest_id="$(/usr/bin/plutil -extract id raw -o - "$manifest" 2>/dev/null || true)"
@@ -1531,6 +1865,19 @@ runtime_is_complete_at() {
     [ "$(sha256_file "$prefix/lib/wine/i386-windows/ntdll.dll")" = "$expected_i386_ntdll_sha" ] || return 1
   [ -n "$expected_x86_64_ntdll_sha" ] &&
     [ "$(sha256_file "$prefix/lib/wine/x86_64-windows/ntdll.dll")" = "$expected_x86_64_ntdll_sha" ] || return 1
+  manifest_gstreamer_digest="$(/usr/bin/plutil -extract gstreamerRuntime.digest raw -o - "$manifest" 2>/dev/null || true)"
+  [ "$manifest_gstreamer_digest" = "$gstreamer_deps_digest" ] || return 1
+  content_tree_is_verified "$prefix/lib/switchyard-gstreamer" || return 1
+  [ "$(content_tree_digest "$prefix/lib/switchyard-gstreamer")" = "$gstreamer_deps_digest" ] || return 1
+  [ -x "$prefix/lib/switchyard-gstreamer/libexec/gstreamer-1.0/gst-plugin-scanner" ] || return 1
+  for plugin in "${GSTREAMER_PLUGIN_FILES[@]}"; do
+    [ -f "$prefix/lib/switchyard-gstreamer/lib/gstreamer-1.0/$plugin" ] || return 1
+  done
+  [ -f "$prefix/lib/wine/x86_64-unix/winegstreamer.so" ] || return 1
+  otool -L "$prefix/lib/wine/x86_64-unix/winegstreamer.so" |
+    grep -F '@rpath/libgstreamer-1.0.0.dylib' >/dev/null || return 1
+  otool -l "$prefix/lib/wine/x86_64-unix/winegstreamer.so" |
+    grep -F '@loader_path/../../switchyard-gstreamer/lib' >/dev/null || return 1
   manifest_mesa_digest="$(/usr/bin/plutil -extract mesaOpenGL.digest raw -o - "$manifest" 2>/dev/null || true)"
   [ "$manifest_mesa_digest" = "$mesa_windows_digest" ] || return 1
   content_tree_is_verified "$prefix/lib/switchyard-mesa" || return 1
@@ -1615,7 +1962,7 @@ if [ "$configured" -eq 1 ]; then
     echo "existing Wine build is missing the expected GnuTLS dlopen name; reconfiguring"
     RECONFIGURE=1
   fi
-  for dependency_prefix in "$font_deps_prefix" "$vulkan_deps_prefix"; do
+  for dependency_prefix in "$font_deps_prefix" "$gstreamer_deps_prefix" "$vulkan_deps_prefix"; do
     if ! grep -F "$dependency_prefix" "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
       echo "existing Wine build does not reference dependency prefix $dependency_prefix; reconfiguring"
       RECONFIGURE=1
@@ -1636,7 +1983,7 @@ if [ "$configured" -eq 0 ]; then
   echo "configuring Switchyard Wine in $WINE_BUILD_DIR"
   configure_cppflags="-I${font_deps_prefix}/include -I${font_deps_prefix}/include/freetype2 -I${vulkan_deps_prefix}/include"
   configure_ldflags="-L${font_deps_prefix}/lib -Wl,-rpath,${font_deps_prefix}/lib -L${vulkan_deps_prefix}/lib -Wl,-rpath,${vulkan_deps_prefix}/lib"
-  configure_pkg_config_path="${font_deps_prefix}/lib/pkgconfig:${vulkan_deps_prefix}/lib/pkgconfig"
+  configure_pkg_config_path="${gstreamer_deps_prefix}/lib/pkgconfig:${font_deps_prefix}/lib/pkgconfig:${vulkan_deps_prefix}/lib/pkgconfig"
   if [ -n "$tls_deps_prefix" ]; then
     configure_cppflags="-I${tls_deps_prefix}/include ${configure_cppflags}"
     configure_ldflags="-L${tls_deps_prefix}/lib -Wl,-rpath,${tls_deps_prefix}/lib ${configure_ldflags}"
@@ -1669,7 +2016,7 @@ if [ "$configured" -eq 0 ]; then
       --with-freetype \
       --without-gphoto \
       --without-gssapi \
-      --without-gstreamer \
+      --with-gstreamer \
       --without-inotify \
       --without-krb5 \
       --without-netapi \
@@ -1711,6 +2058,12 @@ if [ "$configured" -eq 0 ]; then
      ! grep -F "#define SONAME_LIBGNUTLS \"$TLS_DLOPEN_NAME\"" "$WINE_BUILD_DIR/include/config.h" >/dev/null 2>&1; then
     echo "Wine configure did not record the expected GnuTLS dylib name." >&2
     echo "Refusing to build a Wine runtime that would fail to dlopen GnuTLS for schannel." >&2
+    exit 1
+  fi
+  if ! grep -F "GSTREAMER_LIBS = -L${gstreamer_deps_prefix}/lib/pkgconfig/../../lib" \
+       "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
+    echo "Wine configure did not enable the staged GStreamer development runtime." >&2
+    echo "Refusing to build a Wine runtime without its Media Foundation backend." >&2
     exit 1
   fi
 fi
@@ -1812,6 +2165,12 @@ echo "installing Wine Mono addon $WINE_MONO_FILE"
 mkdir -p "$WINE_INSTALL_PREFIX/share/wine/mono"
 install -m 0644 "$wine_mono_path" "$WINE_INSTALL_PREFIX/share/wine/mono/$WINE_MONO_FILE"
 
+echo "installing the pinned GStreamer media runtime"
+rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer"
+mkdir -p "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer"
+ditto "$gstreamer_deps_prefix" "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer"
+relocate_winegstreamer_for_runtime "$WINE_INSTALL_PREFIX" "$gstreamer_deps_prefix"
+
 echo "installing x86_64 Vulkan loader and MoltenVK runtime"
 rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan"
 mkdir -p "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan"
@@ -1911,6 +2270,11 @@ vulkan_lib="$vulkan_root/lib"
 vulkan_icd="$vulkan_root/etc/vulkan/icd.d/MoltenVK_icd.json"
 tls_root="$runtime_dir/lib/switchyard-tls"
 tls_lib="$tls_root/lib"
+gstreamer_root="$runtime_dir/lib/switchyard-gstreamer"
+gstreamer_lib="$gstreamer_root/lib"
+gstreamer_plugins="$gstreamer_lib/gstreamer-1.0"
+gstreamer_scanner="$gstreamer_root/libexec/gstreamer-1.0/gst-plugin-scanner"
+gstreamer_version_file="$gstreamer_root/share/doc/switchyard-gstreamer/VERSION"
 font_root="$runtime_dir/lib/switchyard-fonts"
 font_lib="$font_root/lib"
 mesa_gl_root="$runtime_dir/lib/switchyard-mesa"
@@ -1936,6 +2300,34 @@ fi
 if [ -d "$tls_lib" ]; then
   export DYLD_LIBRARY_PATH="$(prepend_path "$tls_lib" "${DYLD_LIBRARY_PATH:-}")"
   export DYLD_FALLBACK_LIBRARY_PATH="$(prepend_path "$tls_lib" "${DYLD_FALLBACK_LIBRARY_PATH:-}")"
+fi
+if [ ! -d "$gstreamer_plugins" ] || [ ! -x "$gstreamer_scanner" ] ||
+   [ ! -f "$gstreamer_version_file" ]; then
+  echo "Switchyard runtime is missing its GStreamer media backend." >&2
+  exit 127
+fi
+gstreamer_version="$(tr -d '[:space:]' < "$gstreamer_version_file")"
+case "$gstreamer_version" in
+  *[!0-9.]*|'')
+    echo "Switchyard runtime has invalid GStreamer version metadata." >&2
+    exit 127
+    ;;
+esac
+gstreamer_registry_dir="${WINEPREFIX:-${HOME}/.wine}/.switchyard/gstreamer-$gstreamer_version"
+mkdir -p "$gstreamer_registry_dir"
+export GST_PLUGIN_SYSTEM_PATH="$gstreamer_plugins"
+export GST_PLUGIN_SYSTEM_PATH_1_0="$gstreamer_plugins"
+export GST_PLUGIN_PATH=
+export GST_PLUGIN_PATH_1_0=
+export GST_PLUGIN_SCANNER="$gstreamer_scanner"
+export GST_PLUGIN_SCANNER_1_0="$gstreamer_scanner"
+export GST_REGISTRY="$gstreamer_registry_dir/registry-x86_64.bin"
+export GST_REGISTRY_1_0="$GST_REGISTRY"
+# Forked plugin discovery can stall when both sides are translated by Rosetta.
+# The curated plugin set is small enough to register safely in the Wine process.
+export GST_REGISTRY_FORK=no
+if [ -d "$gstreamer_lib/gio/modules" ]; then
+  export GIO_EXTRA_MODULES="$gstreamer_lib/gio/modules"
 fi
 if [ -f "$font_root/etc/fonts/fonts.conf" ]; then
   export FONTCONFIG_FILE="${FONTCONFIG_FILE:-$font_root/etc/fonts/fonts.conf}"
@@ -2070,6 +2462,33 @@ x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows
   printf '    "file": %s,\n' "$(json_string "share/wine/mono/$WINE_MONO_FILE")"
   printf '    "sha256": %s,\n' "$(json_string "$wine_mono_digest")"
   printf '    "source": %s\n' "$(json_string "$WINE_MONO_URL")"
+  printf '  },\n'
+  printf '  "gstreamerRuntime": {\n'
+  printf '    "root": "lib/switchyard-gstreamer",\n'
+  printf '    "digest": %s,\n' "$(json_string "$gstreamer_deps_digest")"
+  printf '    "version": %s,\n' "$(json_string "$GSTREAMER_VERSION")"
+  printf '    "architecture": "universal (x86_64 used by Wine under Rosetta)",\n'
+  printf '    "runtimePackage": %s,\n' "$(json_string "$GSTREAMER_RUNTIME_PACKAGE")"
+  printf '    "runtimePackageUrl": %s,\n' \
+    "$(json_string "$GSTREAMER_PACKAGE_BASE_URL/$GSTREAMER_RUNTIME_PACKAGE")"
+  printf '    "runtimePackageSha256": %s,\n' "$(json_string "$GSTREAMER_RUNTIME_PACKAGE_SHA256")"
+  printf '    "developmentPackage": %s,\n' "$(json_string "$GSTREAMER_DEVEL_PACKAGE")"
+  printf '    "developmentPackageUrl": %s,\n' \
+    "$(json_string "$GSTREAMER_PACKAGE_BASE_URL/$GSTREAMER_DEVEL_PACKAGE")"
+  printf '    "developmentPackageSha256": %s,\n' "$(json_string "$GSTREAMER_DEVEL_PACKAGE_SHA256")"
+  printf '    "pluginScanner": "lib/switchyard-gstreamer/libexec/gstreamer-1.0/gst-plugin-scanner",\n'
+  printf '    "plugins": [\n'
+  for index in "${!GSTREAMER_PLUGIN_FILES[@]}"; do
+    if [ "$index" -lt "$((${#GSTREAMER_PLUGIN_FILES[@]} - 1))" ]; then
+      printf '      %s,\n' "$(json_string "${GSTREAMER_PLUGIN_FILES[$index]}")"
+    else
+      printf '      %s\n' "$(json_string "${GSTREAMER_PLUGIN_FILES[$index]}")"
+    fi
+  done
+  printf '    ],\n'
+  printf '    "license": "LGPL and permissive dependency licenses; restricted codecs can be patent-encumbered in some jurisdictions",\n'
+  printf '    "documentation": "lib/switchyard-gstreamer/share/doc/switchyard-gstreamer",\n'
+  printf '    "licenseDirectory": "lib/switchyard-gstreamer/share/licenses"\n'
   printf '  },\n'
   printf '  "mesaOpenGL": {\n'
   printf '    "root": "lib/switchyard-mesa",\n'

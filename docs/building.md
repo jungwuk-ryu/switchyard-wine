@@ -36,7 +36,7 @@ Inspect the source identity that would be written to a runtime manifest with:
 ./switchyard/build_runtime.sh
 ```
 
-The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, a pinned x86_64 GnuTLS dependency closure, a pinned i386/x86_64 Mesa Windows OpenGL package, and the pinned redistributable Noto font set into user-local caches. GnuTLS packages come from conda-forge; the legacy libunistring ABI is rebuilt from pinned GNU source so the resulting library can be Developer ID signed and translated reliably by Rosetta. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, font-asset, Mesa, and core-binary integrity metadata.
+The builder downloads and verifies Wine Mono, required open-source Homebrew bottles, a pinned official GStreamer macOS runtime and development package, a pinned x86_64 GnuTLS dependency closure, a pinned i386/x86_64 Mesa Windows OpenGL package, and the pinned redistributable Noto font set into user-local caches. GStreamer is restricted to the plugins Wine Media Foundation needs for local playback, including ASF demuxing and libav WMV3/WMA Pro decoding; the host GStreamer installation is never used. GnuTLS packages come from conda-forge; the legacy libunistring ABI is rebuilt from pinned GNU source so the resulting library can be Developer ID signed and translated reliably by Rosetta. Cached dependency trees are accepted only when their complete file and symbolic-link digest still matches. The runtime is assembled and verified in a sibling staging directory, then atomically swapped into `~/.switchyard/runtimes/`; an interrupted build cannot mutate the active runtime. The resulting `switchyard-runtime.json` records source, dependency, media, font-asset, Mesa, and core-binary integrity metadata.
 
 The font set supplies regular faces for every Noto family referenced by Wine's DirectWrite fallback table, common bold faces, symbols, and the Japanese, Korean, Simplified Chinese, Traditional Chinese, and Hong Kong faces from Noto Sans CJK. The unmodified files are installed in `share/wine/fonts`, so they are visible to every prefix without copying fonts into `C:\\Windows\\Fonts`. Their pinned URLs and SHA-256 values live in `switchyard/font-assets.tsv`; SIL Open Font License 1.1 notices are copied into the runtime.
 
@@ -51,6 +51,21 @@ Verify the pinned Mesa archive, both PE architectures, hashes, and license notic
 
 ```sh
 ./switchyard/build_runtime.sh --verify-mesa
+```
+
+Verify the pinned GStreamer packages, x86_64 plugin slices, and the required
+ASF/WMV3/WMA Pro feature set with:
+
+```sh
+./switchyard/build_runtime.sh --verify-media
+```
+
+To decode a complete known ASF/WMV3 asset as part of that check, provide its
+path without copying the asset into the repository:
+
+```sh
+SWITCHYARD_MEDIA_SMOKE_ASSET="/path/to/video.resource" \
+  ./switchyard/build_runtime.sh --verify-media
 ```
 
 An existing custom install prefix is replaced only when it is a child of Switchyard's managed runtime root or contains a valid Switchyard runtime manifest for that exact path. Existing cache directories require a regular Switchyard ownership marker; an intact full-content digest is required for reuse, while an owned cache with damaged content is safely replaced. The builder refuses symbolic-link destinations, unmanaged directories, the managed root itself, the home directory, and dangerous ancestor paths.
@@ -70,6 +85,8 @@ Useful overrides include:
 - `MESA_WINDOWS_CACHE_DIR`: cache for the pinned Mesa Windows package and notices;
 - `MESA_WINDOWS_DEPS_PREFIX`: verified staging prefix for the i386/x86_64 Mesa DLLs;
 - `FONT_ASSET_DOWNLOAD_CACHE_DIR`: cache for the verified redistributable font files;
+- `GSTREAMER_PACKAGE_CACHE_DIR`: cache for the pinned official GStreamer packages;
+- `GSTREAMER_DEPS_PREFIX`: verified staging prefix for the curated media runtime;
 - `TLS_PACKAGE_CACHE_DIR`: cache for the pinned, hash-verified x86_64 TLS packages and source archives.
 
 To reuse a complete runtime with exactly matching inputs:
@@ -113,6 +130,14 @@ implementation with:
 
 ```sh
 ./switchyard/tests/runtime_tls_smoke_test.sh ~/.switchyard/runtimes/<runtime-id>
+```
+
+Verify Wine's runtime-relative GStreamer linkage and its media plugins, with an
+optional ASF/WMV3 asset for full video-stream decoding, with:
+
+```sh
+./switchyard/tests/runtime_media_smoke_test.sh \
+  ~/.switchyard/runtimes/<runtime-id> /path/to/video.resource
 ```
 
 Verify that WoW64 processes receive the upper 2 GiB of virtual address space by
