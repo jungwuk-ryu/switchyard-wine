@@ -5188,7 +5188,7 @@ static enum vkd3d_result io_normaliser_init_misctype(struct vsir_program_iterato
         }
         vsir_dst_operand_init_ssa_f32v4(&ins->dst[0], normaliser->vpos_ssa);
         vsir_src_operand_init_io(&ins->src[0], VKD3DSPR_INPUT, element, 1);
-        ins->src[0].reg.idx[0].offset = signature_idx;
+        ins->src[0].reg.idx[0].offset = element->register_index;
         vsir_program_iterator_next(it);
     }
 
@@ -5209,7 +5209,7 @@ static enum vkd3d_result io_normaliser_init_misctype(struct vsir_program_iterato
         }
         vsir_dst_operand_init_ssa_f32v4(&ins->dst[0], normaliser->vface_ssa);
         vsir_src_operand_init_io(&ins->src[0], VKD3DSPR_INPUT, element, 1);
-        ins->src[0].reg.idx[0].offset = signature_idx;
+        ins->src[0].reg.idx[0].offset = element->register_index;
         ins->src[0].reg.data_type = VSIR_DATA_U32;
         vsir_src_operand_init_const_f32(&ins->src[1], 1.0f);
         vsir_src_operand_init_const_f32(&ins->src[2], -1.0f);

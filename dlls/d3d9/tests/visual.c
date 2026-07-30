@@ -10681,6 +10681,9 @@ static void test_fragment_coords(void)
     static const DWORD shader_code[] =
     {
         0xffff0300,                                                             /* ps_3_0                     */
+        0x0200001f, 0x80050005, 0x90080000,                                     /* dcl_texcoord5 v0.w         */
+        0x0200001f, 0x80000005, 0x90030001,                                     /* dcl_texcoord0 v1.xy        */
+        0x0200001f, 0x80010005, 0x90030002,                                     /* dcl_texcoord1 v2.xy        */
         0x0200001f, 0x80000000, 0x90031000,                                     /* dcl vPos.xy                */
         0x03000002, 0x80030000, 0x90541000, 0xa1fe0000,                         /* sub r0.xy, vPos.xy, c0.zw  */
         0x02000001, 0x800f0001, 0xa0e40000,                                     /* mov r1, c0                 */
