@@ -5,4 +5,5 @@ SOURCES = \
 	blockmap.c \
 	manifest.c \
 	path.c \
+	signature.c \
 	stream.c

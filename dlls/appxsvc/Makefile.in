@@ -1,6 +1,6 @@
 MODULE    = appxsvc.dll
 IMPORTLIB = appxsvc
-IMPORTS   = $(XML2_PE_LIBS) $(ZLIB_PE_LIBS) bcrypt kernelbase
+IMPORTS   = $(XML2_PE_LIBS) $(ZLIB_PE_LIBS) bcrypt crypt32 kernelbase
 EXTRAINCL = $(XML2_PE_CFLAGS) $(ZLIB_PE_CFLAGS)
 
 SOURCES = \
@@ -9,4 +9,5 @@ SOURCES = \
 	main.c \
 	manifest.c \
 	path.c \
+	signature.c \
 	stream.c
