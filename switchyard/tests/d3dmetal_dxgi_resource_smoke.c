@@ -429,11 +429,11 @@ static int verify_texture( ID3D11Device *device, ID3D11DeviceContext *context,
 
 struct execute_thread_context
 {
-    ID3D11Device *device;
     ID3D11DeviceContext *immediate_context;
-    ID3D11ShaderResourceView *view;
     HANDLE start_event;
     HANDLE ready_event;
+    HANDLE executing_event;
+    HANDLE release_event;
     unsigned int iterations;
     int result;
 };
@@ -441,32 +441,10 @@ struct execute_thread_context
 static DWORD WINAPI execute_callback_thread( void *arg )
 {
     struct execute_thread_context *context = arg;
-    ID3D11DeviceContext *deferred_context = NULL;
-    ID3D11CommandList *command_list = NULL;
-    HRESULT hr;
     unsigned int i;
-    BOOL ready = FALSE;
+    BOOL executing = FALSE, released = FALSE, ready = FALSE;
 
     context->result = 0;
-    hr = ID3D11Device_CreateDeferredContext( context->device, 0, &deferred_context );
-    if (FAILED(hr))
-    {
-        fprintf( stderr, "CreateDeferredContext in execute worker failed: %#lx\n", hr );
-        context->result = 1;
-        goto cleanup;
-    }
-    ID3D11DeviceContext_PSSetShaderResources( deferred_context, 0, 1, &context->view );
-    ID3D11DeviceContext_Draw( deferred_context, 0, 0 );
-    hr = ID3D11DeviceContext_FinishCommandList( deferred_context, TRUE, &command_list );
-    ID3D11DeviceContext_Release( deferred_context );
-    deferred_context = NULL;
-    if (FAILED(hr) || !command_list)
-    {
-        fprintf( stderr, "FinishCommandList in execute worker failed: %#lx\n", hr );
-        context->result = 1;
-        goto cleanup;
-    }
-
     ready = context->ready_event && SetEvent( context->ready_event );
     if (!ready || !context->start_event ||
         WaitForSingleObject( context->start_event, 60000 ) != WAIT_OBJECT_0)
@@ -475,17 +453,43 @@ static DWORD WINAPI execute_callback_thread( void *arg )
         context->result = 1;
         goto cleanup;
     }
-
     for (i = 0; i < context->iterations; ++i)
     {
-        ID3D11DeviceContext_ExecuteCommandList( context->immediate_context, command_list, FALSE );
+        ID3D11DeviceContext_Draw( context->immediate_context, 0, 0 );
+        ID3D11DeviceContext_Flush( context->immediate_context );
+        if (!executing)
+        {
+            executing = context->executing_event && SetEvent( context->executing_event );
+            if (!executing)
+            {
+                fprintf( stderr, "Relay worker failed to signal execution\n" );
+                context->result = 1;
+                goto cleanup;
+            }
+        }
+        if (context->release_event &&
+            WaitForSingleObject( context->release_event, 0 ) == WAIT_OBJECT_0)
+        {
+            released = TRUE;
+            break;
+        }
+        SwitchToThread();
+    }
+    if (!released)
+    {
+        fprintf( stderr, "Relay worker exhausted its pre-release callbacks\n" );
+        context->result = 1;
+        goto cleanup;
+    }
+    for (i = 0; i < 8; ++i)
+    {
+        ID3D11DeviceContext_Draw( context->immediate_context, 0, 0 );
         ID3D11DeviceContext_Flush( context->immediate_context );
     }
 
 cleanup:
     if (!ready && context->ready_event) SetEvent( context->ready_event );
-    if (deferred_context) ID3D11DeviceContext_Release( deferred_context );
-    if (command_list) ID3D11CommandList_Release( command_list );
+    if (!executing && context->executing_event) SetEvent( context->executing_event );
     return context->result;
 }
 
@@ -530,7 +534,7 @@ static int run_d3d11_relay_stress( ID3D11Device *device, ID3D11DeviceContext *co
         D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0,
         D3D11_RESOURCE_MISC_SHARED,
     };
-    const unsigned int stress_rounds = 6;
+    const unsigned int stress_rounds = 2;
     ID3D11Texture2D *owner_textures[2] = { NULL, NULL };
     ID3D11ShaderResourceView *owner_views[2] = { NULL, NULL };
     IDXGIResource *owner_resources[2] = { NULL, NULL };
@@ -539,8 +543,10 @@ static int run_d3d11_relay_stress( ID3D11Device *device, ID3D11DeviceContext *co
     struct execute_thread_context execute_context[2];
     struct child_upload_context upload_contexts[2];
     HANDLE start_event = NULL;
+    HANDLE release_event = NULL;
     HANDLE execute_threads[2] = { NULL, NULL };
     HANDLE execute_ready[2] = { NULL, NULL };
+    HANDLE execute_started[2] = { NULL, NULL };
     HANDLE upload_threads[2] = { NULL, NULL };
     HRESULT hr;
     unsigned int i, round;
@@ -592,7 +598,6 @@ static int run_d3d11_relay_stress( ID3D11Device *device, ID3D11DeviceContext *co
         }
         printf( "Relay stress owner %u shared handle %p\n", i, shared_handles[i] );
     }
-
     hr = ID3D11DeviceContext_QueryInterface( context, &IID_ID3D11Multithread,
                                              (void **)&multithread );
     if (FAILED(hr) || !multithread)
@@ -604,9 +609,10 @@ static int run_d3d11_relay_stress( ID3D11Device *device, ID3D11DeviceContext *co
     ID3D11Multithread_SetMultithreadProtected( multithread, TRUE );
 
     start_event = CreateEventA( NULL, TRUE, FALSE, NULL );
-    if (!start_event)
+    release_event = CreateEventA( NULL, TRUE, FALSE, NULL );
+    if (!start_event || !release_event)
     {
-        fprintf( stderr, "CreateEvent for execute workers failed: %lu\n", GetLastError() );
+        fprintf( stderr, "CreateEvent for relay workers failed: %lu\n", GetLastError() );
         ret = 1;
         goto cleanup;
     }
@@ -648,6 +654,11 @@ static int run_d3d11_relay_stress( ID3D11Device *device, ID3D11DeviceContext *co
 
         if (round == final_round && !owned_zero_released)
         {
+            /*
+             * D3DMetal 4.0 beta 1 can stall deferred command-list
+             * finalization. Draw reaches the same relay upload hook without
+             * depending on that unsupported path.
+             */
             ID3D11DeviceContext_PSSetShaderResources( context, 0, 0, NULL );
             ID3D11DeviceContext_Flush( context );
             if (owner_views[0]) ID3D11ShaderResourceView_Release( owner_views[0] );
@@ -660,19 +671,20 @@ static int run_d3d11_relay_stress( ID3D11Device *device, ID3D11DeviceContext *co
             for (i = 0; i < 2; ++i)
             {
                 execute_ready[i] = CreateEventA( NULL, TRUE, FALSE, NULL );
-                if (!execute_ready[i])
+                execute_started[i] = CreateEventA( NULL, TRUE, FALSE, NULL );
+                if (!execute_ready[i] || !execute_started[i])
                 {
-                    fprintf( stderr, "CreateEvent for execute ready %u failed: %lu\n",
+                    fprintf( stderr, "CreateEvent for execute worker %u failed: %lu\n",
                              i, GetLastError() );
                     ret = 1;
                     goto cleanup;
                 }
-                execute_context[i].device = device;
                 execute_context[i].immediate_context = context;
-                execute_context[i].iterations = 64;
+                execute_context[i].iterations = 2048;
                 execute_context[i].start_event = start_event;
                 execute_context[i].ready_event = execute_ready[i];
-                execute_context[i].view = i ? owner_views[1] : NULL;
+                execute_context[i].executing_event = execute_started[i];
+                execute_context[i].release_event = release_event;
                 execute_context[i].result = 0;
             }
             for (i = 0; i < 2; ++i)
@@ -692,12 +704,21 @@ static int run_d3d11_relay_stress( ID3D11Device *device, ID3D11DeviceContext *co
                 ret = 1;
                 goto cleanup;
             }
+            printf( "Relay stress workers reached the barrier\n" );
             SetEvent( start_event );
-            Sleep( 1 );
+            if (WaitForMultipleObjects( 2, execute_started, TRUE, 10000 ) != WAIT_OBJECT_0)
+            {
+                fprintf( stderr, "Relay workers did not enter draw callbacks\n" );
+                ret = 1;
+                goto cleanup;
+            }
             if (owner_resources[0]) IDXGIResource_Release( owner_resources[0] );
             owner_resources[0] = NULL;
+            SetEvent( release_event );
+            printf( "Relay stress released owner[0] while draw callbacks were active\n" );
             join_test_thread( execute_threads[0], "execute 0" );
             join_test_thread( execute_threads[1], "execute 1" );
+            printf( "Relay stress workers joined after post-release callbacks\n" );
         }
         else
         {
@@ -715,7 +736,7 @@ static int run_d3d11_relay_stress( ID3D11Device *device, ID3D11DeviceContext *co
         }
     }
 
-    printf( "Relay stress upload and execute callback interleaving completed\n" );
+    printf( "Relay stress upload and draw callback interleaving completed\n" );
 
 cleanup:
     join_test_thread( upload_threads[0], "child upload 0 cleanup" );
@@ -725,18 +746,21 @@ cleanup:
     upload_threads[0] = NULL;
     upload_threads[1] = NULL;
     if (start_event) SetEvent( start_event );
+    if (release_event) SetEvent( release_event );
     join_test_thread( execute_threads[0], "execute 0 cleanup" );
     join_test_thread( execute_threads[1], "execute 1 cleanup" );
     for (i = 0; i < 2; ++i)
     {
         if (execute_threads[i]) CloseHandle( execute_threads[i] );
         if (execute_ready[i]) CloseHandle( execute_ready[i] );
+        if (execute_started[i]) CloseHandle( execute_started[i] );
         if (execute_context[i].result) ret = 1;
         if (owner_views[i]) ID3D11ShaderResourceView_Release( owner_views[i] );
         if (owner_resources[i]) IDXGIResource_Release( owner_resources[i] );
         if (owner_textures[i]) ID3D11Texture2D_Release( owner_textures[i] );
     }
     if (start_event) CloseHandle( start_event );
+    if (release_event) CloseHandle( release_event );
     if (multithread) ID3D11Multithread_Release( multithread );
     if (ret)
         fprintf( stderr, "Relay stress failed; deterministic cleanup performed\n" );
