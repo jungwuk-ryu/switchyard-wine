@@ -457,6 +457,7 @@ static ULONG STDMETHODCALLTYPE device_AddRef(IDCompositionDevice *iface)
 }
 
 static void rgba_bgra_converter_destroy_all(struct composition_device *device);
+static void dcomp_present_frames_destroy_all(struct list *frames);
 
 static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
 {
@@ -472,6 +473,7 @@ static ULONG STDMETHODCALLTYPE device_Release(IDCompositionDevice *iface)
             WaitForSingleObject(device->thread, INFINITE);
             CloseHandle(device->thread);
         }
+        dcomp_present_frames_destroy_all(&device->present_frames);
         rgba_bgra_converter_destroy_all(device);
         free(device);
     }
@@ -1239,6 +1241,8 @@ struct dcomp_present_frame
     struct list entry;
     HWND hwnd;
     struct dcomp_target_frame frame;
+    BOOL used;
+    BOOL ready;
 };
 
 static void destroy_target_frame(struct dcomp_target_frame *frame)
@@ -1260,30 +1264,17 @@ static void destroy_target_frame(struct dcomp_target_frame *frame)
     }
 }
 
-static BOOL create_target_frame(HWND hwnd, struct dcomp_target_frame *frame)
+static BOOL create_target_frame(const RECT *client_rect, struct dcomp_target_frame *frame)
 {
     BITMAPINFO info;
     void *bits = NULL;
     int width, height;
 
     memset(frame, 0, sizeof(*frame));
-
-    if (!GetClientRect(hwnd, &frame->client_rect))
-    {
-        DWORD error = GetLastError();
-
-        if (error == ERROR_INVALID_WINDOW_HANDLE)
-            TRACE("Skipping destroyed composition hwnd %p.\n", hwnd);
-        else
-            WARN("Failed to get target client rect for composition hwnd %p, error %lu.\n",
-                    hwnd, error);
-        return FALSE;
-    }
+    frame->client_rect = *client_rect;
 
     width = frame->client_rect.right - frame->client_rect.left;
     height = frame->client_rect.bottom - frame->client_rect.top;
-    if (width <= 0 || height <= 0)
-        return FALSE;
 
     memset(&info, 0, sizeof(info));
     info.bmiHeader.biSize = sizeof(info.bmiHeader);
@@ -1320,6 +1311,33 @@ static BOOL create_target_frame(HWND hwnd, struct dcomp_target_frame *frame)
     return TRUE;
 }
 
+static BOOL get_target_client_rect(HWND hwnd, RECT *client_rect)
+{
+    int width, height;
+
+    if (!GetClientRect(hwnd, client_rect))
+    {
+        DWORD error = GetLastError();
+
+        if (error == ERROR_INVALID_WINDOW_HANDLE)
+            TRACE("Skipping destroyed composition hwnd %p.\n", hwnd);
+        else
+            WARN("Failed to get target client rect for composition hwnd %p, error %lu.\n",
+                    hwnd, error);
+        return FALSE;
+    }
+
+    width = client_rect->right - client_rect->left;
+    height = client_rect->bottom - client_rect->top;
+    return width > 0 && height > 0;
+}
+
+static BOOL dcomp_rect_equal(const RECT *a, const RECT *b)
+{
+    return a->left == b->left && a->top == b->top
+            && a->right == b->right && a->bottom == b->bottom;
+}
+
 static BOOL present_target_frame(const struct dcomp_present_frame *present)
 {
     DWORD style = DCX_USESTYLE | DCX_CACHE;
@@ -1347,16 +1365,19 @@ static BOOL present_target_frame(const struct dcomp_present_frame *present)
     return ret;
 }
 
-static void destroy_present_frames(struct list *frames)
+static void destroy_present_frame(struct dcomp_present_frame *present)
+{
+    list_remove(&present->entry);
+    destroy_target_frame(&present->frame);
+    free(present);
+}
+
+static void dcomp_present_frames_destroy_all(struct list *frames)
 {
     struct dcomp_present_frame *present, *next;
 
     LIST_FOR_EACH_ENTRY_SAFE(present, next, frames, struct dcomp_present_frame, entry)
-    {
-        list_remove(&present->entry);
-        destroy_target_frame(&present->frame);
-        free(present);
-    }
+        destroy_present_frame(present);
 }
 
 static struct dcomp_present_frame *find_present_frame(struct list *frames, HWND hwnd)
@@ -1370,12 +1391,82 @@ static struct dcomp_present_frame *find_present_frame(struct list *frames, HWND 
     return NULL;
 }
 
-static void clear_composition_target(const struct composition_target *target, struct dcomp_target_frame *frame)
+static void reset_present_frames(struct list *frames)
+{
+    struct dcomp_present_frame *present;
+
+    LIST_FOR_EACH_ENTRY(present, frames, struct dcomp_present_frame, entry)
+    {
+        present->used = FALSE;
+        present->ready = FALSE;
+    }
+}
+
+static void prune_unused_present_frames(struct list *frames)
+{
+    struct dcomp_present_frame *present, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE(present, next, frames, struct dcomp_present_frame, entry)
+    {
+        if (!present->used)
+            destroy_present_frame(present);
+    }
+}
+
+static void clear_composition_target(struct dcomp_target_frame *frame)
 {
     if (!frame->dc || !frame->bits)
         return;
 
     memset(frame->bits, 0, frame->bits_size);
+}
+
+static BOOL get_present_frame(struct list *frames, HWND hwnd, struct dcomp_present_frame **frame)
+{
+    struct dcomp_present_frame *present;
+    RECT client_rect;
+
+    *frame = NULL;
+
+    if ((present = find_present_frame(frames, hwnd)) && present->used)
+    {
+        *frame = present;
+        return TRUE;
+    }
+
+    if (!get_target_client_rect(hwnd, &client_rect))
+    {
+        if (present)
+            destroy_present_frame(present);
+        return FALSE;
+    }
+
+    if (!present)
+    {
+        if (!(present = calloc(1, sizeof(*present))))
+        {
+            ERR("Failed to allocate composition present frame.\n");
+            return FALSE;
+        }
+        present->hwnd = hwnd;
+        list_add_tail(frames, &present->entry);
+    }
+
+    if (!present->frame.dc || !dcomp_rect_equal(&present->frame.client_rect, &client_rect))
+    {
+        destroy_target_frame(&present->frame);
+        if (!create_target_frame(&client_rect, &present->frame))
+        {
+            destroy_present_frame(present);
+            return FALSE;
+        }
+    }
+
+    clear_composition_target(&present->frame);
+    present->used = TRUE;
+    present->ready = FALSE;
+    *frame = present;
+    return TRUE;
 }
 
 static HRESULT do_composite(const struct composition_target *target, struct composition_visual *visual,
@@ -1537,7 +1628,6 @@ static DWORD WINAPI composite_thread_proc(void *iface)
 
     while (TRUE)
     {
-        struct list present_frames = LIST_INIT(present_frames);
         BOOL has_active_target = FALSE;
         struct dcomp_present_frame *present;
         unsigned int plane;
@@ -1545,6 +1635,7 @@ static DWORD WINAPI composite_thread_proc(void *iface)
         dcomp_lock();
 
         count = 0;
+        reset_present_frames(&device->present_frames);
         /* Both target kinds may be attached to the same HWND.  Composite the
          * non-topmost plane first and alpha-blend the topmost plane into the
          * same client frame so transparent topmost pixels preserve content
@@ -1555,7 +1646,6 @@ static DWORD WINAPI composite_thread_proc(void *iface)
             LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
             {
                 struct dcomp_present_frame *frame;
-                BOOL new_frame = FALSE;
 
                 if (!!target->topmost != !!plane) continue;
                 if (!target->root)
@@ -1572,43 +1662,32 @@ static DWORD WINAPI composite_thread_proc(void *iface)
                 has_active_target = TRUE;
                 visual = impl_from_IDCompositionVisual(target->root);
 
-                if (!(frame = find_present_frame(&present_frames, target->hwnd)))
-                {
-                    if (!(frame = calloc(1, sizeof(*frame))))
-                    {
-                        ERR("Failed to allocate composition present frame.\n");
-                        continue;
-                    }
-                    if (!create_target_frame(target->hwnd, &frame->frame))
-                    {
-                        free(frame);
-                        continue;
-                    }
-                    frame->hwnd = target->hwnd;
-                    clear_composition_target(target, &frame->frame);
-                    list_add_tail(&present_frames, &frame->entry);
-                    new_frame = TRUE;
-                }
+                if (!get_present_frame(&device->present_frames, target->hwnd, &frame))
+                    continue;
 
-                if (FAILED(do_composite(target, visual, frame->frame.dc, 0.0f, 0.0f)) && new_frame)
+                if (FAILED(do_composite(target, visual, frame->frame.dc, 0.0f, 0.0f)))
                 {
-                    list_remove(&frame->entry);
-                    destroy_target_frame(&frame->frame);
-                    free(frame);
+                    if (!frame->ready)
+                        frame->used = FALSE;
+                    continue;
                 }
+                frame->ready = TRUE;
             }
         }
 
-        LIST_FOR_EACH_ENTRY(present, &present_frames, struct dcomp_present_frame, entry)
+        prune_unused_present_frames(&device->present_frames);
+        LIST_FOR_EACH_ENTRY(present, &device->present_frames, struct dcomp_present_frame, entry)
         {
+            if (!present->ready)
+                continue;
             if (present_target_frame(present))
                 count++;
         }
-        destroy_present_frames(&present_frames);
 
         if (!count && !has_active_target)
         {
             TRACE("Composition thread exited.\n");
+            dcomp_present_frames_destroy_all(&device->present_frames);
             device->thread_exited = TRUE;
             dcomp_unlock();
             break;
@@ -1622,6 +1701,7 @@ static DWORD WINAPI composite_thread_proc(void *iface)
         Sleep(refresh_period);
     }
 
+    dcomp_present_frames_destroy_all(&device->present_frames);
     return 0;
 }
 
@@ -2875,6 +2955,7 @@ static HRESULT create_device(int version, REFIID iid, void **out)
 
     list_init(&device->targets);
     list_init(&device->rgba_bgra_converters);
+    list_init(&device->present_frames);
     device->IDCompositionDevice_iface.lpVtbl = &device_vtbl;
     device->IDCompositionDeviceUnknown_iface.lpVtbl = &desktop_device_vtbl;
     device->version = version;

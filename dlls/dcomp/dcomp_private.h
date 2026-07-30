@@ -32,6 +32,7 @@ struct composition_device
     IDCompositionSurfaceUnknown *drawing_surface;
     struct list targets;
     struct list rgba_bgra_converters;
+    struct list present_frames;
     HANDLE thread;
     BOOL exit_thread;
     BOOL thread_exited;
