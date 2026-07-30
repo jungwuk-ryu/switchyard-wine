@@ -35,6 +35,7 @@
 @ stdcall -private appx_signature_free(ptr)
 @ stdcall -private appx_signature_get_digest_set(ptr)
 @ stdcall -private appx_signature_get_signer_subject(ptr)
+@ stdcall -private appx_signature_check_publisher(ptr wstr)
 @ stdcall -private appx_signature_decode_digest_set(ptr long ptr)
 @ stdcall -private appx_signature_decode_indirect_data(ptr long ptr)
 @ stdcall -private appx_signature_verify_digest_set(ptr ptr)

@@ -76,6 +76,9 @@ void WINAPI appx_signature_free( APPX_SIGNATURE *signature );
 const struct appx_signature_digest_set * WINAPI appx_signature_get_digest_set(
     const APPX_SIGNATURE *signature );
 const WCHAR * WINAPI appx_signature_get_signer_subject( const APPX_SIGNATURE *signature );
+/* Bind a manifest Identity Publisher DN to the verified signer subject. */
+HRESULT WINAPI appx_signature_check_publisher( const APPX_SIGNATURE *signature,
+                                               const WCHAR *publisher );
 
 /*
  * Decode the fixed APPX/AXP* digest stream.  This helper is intentionally
