@@ -3,6 +3,7 @@ TESTDLL = appxsvc.dll
 SOURCES = \
 	archive.c \
 	blockmap.c \
+	content_types.c \
 	manifest.c \
 	path.c \
 	signature.c \
