@@ -561,6 +561,19 @@ static uint64_t WineCompositorKnownRevision(NSNumber* key)
     return value ? [value unsignedLongLongValue] : 0;
 }
 
+static void WineCompositorReleaseSharedSurface(WineCompositorNode* node)
+{
+    node->sharedSurfaceLayer.hidden = YES;
+    node->sharedSurfaceLayer.contents = nil;
+    if (node->sharedSurface)
+    {
+        CFRelease(node->sharedSurface);
+        node->sharedSurface = NULL;
+    }
+    node->remoteHost.hidden = NO;
+    [node->remoteHost setNeedsDisplay];
+}
+
 static WineCompositorNode* WineCompositorCreateNode(void)
 {
     NSDictionary* disabledActions = [NSDictionary dictionaryWithObjectsAndKeys:
@@ -644,6 +657,7 @@ static void WineCompositorApplyNode(WineContentView* view, uint64_t nodeId,
     if (!displayed || !view || CGRectIsEmpty(clipFrame))
     {
         [node->clipContainer removeFromSuperlayer];
+        WineCompositorReleaseSharedSurface(node);
         node->view = nil;
     }
     else
@@ -713,6 +727,8 @@ static void WineCompositorRemoveNode(uint64_t nodeId, uint64_t newRevision, BOOL
            arrive behind it and the tombstone no longer needs to be retained. */
         [compositorRevisions removeObjectForKey:key];
     }
+    else
+        WineCompositorReleaseSharedSurface(node);
     [CATransaction commit];
     [CATransaction flush];
 }
@@ -778,6 +794,7 @@ static void WineCompositorDetachView(WineContentView* view)
     {
         if (node->view != view) continue;
         [node->clipContainer removeFromSuperlayer];
+        WineCompositorReleaseSharedSurface(node);
         node->view = nil;
     }
     [nodes release];
