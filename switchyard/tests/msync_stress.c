@@ -8,10 +8,13 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 
 #define RING_SIZE 96
 #define ITERATIONS 40000
 #define ALERTABLE_WAIT_ITERATIONS 10000
+#define ALLOCATOR_CHURN_HANDLES 12000
+#define ALLOCATOR_CHURN_ROUNDS 4
 
 static HANDLE free_slots, filled_slots;
 static volatile LONG failures;
@@ -234,6 +237,55 @@ done:
     return result;
 }
 
+static int test_allocator_churn(void)
+{
+    HANDLE *events;
+    DWORD elapsed, round, start;
+    unsigned int i;
+
+    events = HeapAlloc(GetProcessHeap(), 0, ALLOCATOR_CHURN_HANDLES * sizeof(*events));
+    if (!events)
+    {
+        fprintf(stderr, "failed to allocate the event handle array\n");
+        return 1;
+    }
+
+    for (round = 0; round < ALLOCATOR_CHURN_ROUNDS; ++round)
+    {
+        start = GetTickCount();
+        for (i = 0; i < ALLOCATOR_CHURN_HANDLES; ++i)
+        {
+            events[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
+            if (!events[i])
+            {
+                fprintf(stderr, "round %lu failed to create event %u\n",
+                        (unsigned long)round, i);
+                while (i) CloseHandle(events[--i]);
+                HeapFree(GetProcessHeap(), 0, events);
+                return 1;
+            }
+        }
+        elapsed = GetTickCount() - start;
+        printf("msync allocator churn round %lu: %u handles, %lu ms\n",
+               (unsigned long)round, ALLOCATOR_CHURN_HANDLES,
+               (unsigned long)elapsed);
+
+        /*
+         * Closing in reverse order makes the lowest shared-memory index the
+         * last reclaimed one. A single stale low-index hint then repeatedly
+         * rescans all previously reused live entries on the following round.
+         */
+        for (i = ALLOCATOR_CHURN_HANDLES; i; --i)
+            CloseHandle(events[i - 1]);
+
+        /* Destroy notifications use the ordered Mach message queue. */
+        Sleep(100);
+    }
+
+    HeapFree(GetProcessHeap(), 0, events);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     HANDLE producer, consumer;
@@ -242,9 +294,11 @@ int main(int argc, char **argv)
 
     if (argc == 2 && !strcmp(argv[1], "--alertable-race"))
         return test_alertable_wait_churn();
+    if (argc == 2 && !strcmp(argv[1], "--allocator-churn"))
+        return test_allocator_churn();
     if (argc != 1)
     {
-        fprintf(stderr, "usage: %s [--alertable-race]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--allocator-churn|--alertable-race]\n", argv[0]);
         return 2;
     }
 

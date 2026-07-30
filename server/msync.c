@@ -374,8 +374,35 @@ struct msync_shm
     int multiple_waiters;
 };
 
+static pthread_mutex_t free_shm_indices_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int free_shm_indices;
 static unsigned int last_allocated_idx = 1;
-static unsigned int last_destroyed_idx = UINT32_MAX;
+
+static void recycle_shm_index( unsigned int shm_idx, struct msync_shm *shm )
+{
+    pthread_mutex_lock( &free_shm_indices_mutex );
+    shm->low = free_shm_indices;
+    free_shm_indices = shm_idx;
+    pthread_mutex_unlock( &free_shm_indices_mutex );
+}
+
+static int reuse_shm_index( unsigned int *shm_idx )
+{
+    int found = 0;
+    struct msync_shm *shm;
+
+    pthread_mutex_lock( &free_shm_indices_mutex );
+    if (free_shm_indices)
+    {
+        *shm_idx = free_shm_indices;
+        /* Recycled indices refer to pages which remain mapped for the server lifetime. */
+        shm = get_shm( *shm_idx );
+        free_shm_indices = shm->low;
+        found = 1;
+    }
+    pthread_mutex_unlock( &free_shm_indices_mutex );
+    return found;
+}
 
 static inline void destroy_all_internal( unsigned int shm_idx )
 {
@@ -390,7 +417,7 @@ static inline void destroy_all_internal( unsigned int shm_idx )
 
     refcount = __atomic_sub_fetch( &obj->refcount, 1, __ATOMIC_SEQ_CST );
 
-    if (!refcount) last_destroyed_idx = shm_idx;
+    if (!refcount) recycle_shm_index( shm_idx, obj );
 }
 
 /*
@@ -707,19 +734,18 @@ static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
     unsigned int shm_idx;
     struct msync_shm *shm;
 
-    shm_idx = min( last_destroyed_idx, last_allocated_idx + 1 );
-
-    for(;;)
+    while (reuse_shm_index( &shm_idx ))
     {
         shm = get_shm( shm_idx );
         if (!__atomic_load_n( &shm->refcount, __ATOMIC_SEQ_CST ))
-            break;
-
-        shm_idx++;
+            goto found;
+        fprintf( stderr, "msync: error: recycled live shm idx %u\n", shm_idx );
     }
 
-    last_allocated_idx = shm_idx;
+    shm_idx = ++last_allocated_idx;
+    shm = get_shm( shm_idx );
 
+found:
     assert(shm);
     shm->low = low;
     shm->high = high;
