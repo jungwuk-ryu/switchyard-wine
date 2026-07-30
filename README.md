@@ -42,6 +42,11 @@ Public downstream Wine runtime for the
 See [`docs/building.md`](docs/building.md) and
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+## Community
+
+Join the [Switchyard Discord](https://discord.gg/USNfzUza7B) for runtime
+testing, compatibility reports, and development discussion.
+
 Wine and Switchyard Wine changes are licensed under LGPL-2.1-or-later.
 Switchyard Wine is independent and is not endorsed by WineHQ, Apple, or the
 products shown above.
