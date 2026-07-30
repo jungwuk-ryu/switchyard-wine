@@ -351,6 +351,23 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     struct macdrv_dib_endpoint *replaced_endpoint = NULL;
     size_t image_size = color_info->bmiHeader.biSizeImage;
     BOOL presented = TRUE;
+    BOOL pending_replacement = !!surface->replaced_surface;
+
+    if (IsRectEmpty(dirty))
+    {
+        if (surface->dib_endpoint)
+        {
+            pthread_mutex_lock(&surface->dib_endpoint->mutex);
+            pending_replacement |= !!surface->dib_endpoint->replaced_endpoint;
+            pthread_mutex_unlock(&surface->dib_endpoint->mutex);
+        }
+
+        if (!pending_replacement)
+        {
+            if (!shape_changed) return TRUE;
+            goto shape_only;
+        }
+    }
 
     TRACE("Switchyard submitting %s frame source %p rect %s dirty %s\n",
           surface->dib_endpoint ? "remote-DIB" : "native-root", window_surface->hwnd,
@@ -416,6 +433,7 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
         surface->replaced_surface = NULL;
     }
 
+shape_only:
     if (shape_changed && surface->window)
     {
         if (!shape_bits)
