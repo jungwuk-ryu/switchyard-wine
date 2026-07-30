@@ -1572,6 +1572,7 @@ runtime_is_complete() {
 if [ "$MODE" = "--ensure" ] && runtime_is_complete; then
   wine_executable="$FINAL_WINE_INSTALL_PREFIX/bin/switchyard-wine"
   defaults write dev.switchyard.Switchyard winePath "$wine_executable"
+  defaults write dev.switchyard.Switchyard 'activeRuntimeSourceRevision.v1' "$wine_revision"
   echo "Switchyard Wine runtime is current ($runtime_id): $wine_executable"
   exit 0
 fi
@@ -2177,6 +2178,7 @@ INSTALL_STAGE_ROOT=""
 
 if [ "$MODE" = "--ensure" ]; then
   defaults write dev.switchyard.Switchyard winePath "$wine_executable"
+  defaults write dev.switchyard.Switchyard 'activeRuntimeSourceRevision.v1' "$wine_revision"
   echo "configured Switchyard winePath=$wine_executable"
 else
   echo "built Switchyard Wine runtime at $FINAL_WINE_INSTALL_PREFIX"
