@@ -59,6 +59,15 @@ This option is intended for programs that require a newer desktop OpenGL version
 
 Every generated `switchyard-runtime.json` records the source repository and commit, upstream Wine revision, dirty-tree state and digest, dependency digests, supported PE architectures, installed executable, and hashes of core Wine/PE binaries. A runtime directory name includes the same immutable inputs. Builds happen outside the live path and are promoted with an atomic directory swap only after verification, so changing source or dependencies cannot partially mutate an existing installation.
 
+## Packaged desktop applications
+
+MSIX deployment and packaged desktop execution use a per-prefix transactional
+store, immutable package graphs, and a null-cost unpackaged fast path. Hostile
+package parsing stays outside wineserver, and installed payloads are published
+only after signature, block-map, manifest, path, and resource-limit validation.
+The complete implementation and verification contract is documented in
+[`docs/msix.md`](msix.md).
+
 ## Release model
 
 The `main` branch is a linear downstream branch rooted at the revision in `switchyard/upstream-base.txt`. That revision is a compatibility baseline, not a promise to follow WineHQ's release cadence. Upstream fixes may be cherry-picked or adapted individually, and the base advances only after established Switchyard launcher and game workflows have been checked for regressions. Preserving known-working behavior takes priority over adopting a newer Wine version.
