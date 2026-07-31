@@ -68,6 +68,7 @@
 @ varargs EtwTraceMessage(int64 long ptr long)
 @ stdcall EtwTraceMessageVa(int64 long ptr long ptr)
 @ stdcall EtwUnregisterTraceGuids(int64)
+@ stdcall FlsGetValue2(long)
 # @ stub KiFastSystemCall
 # @ stub KiFastSystemCallRet
 # @ stub KiIntSystemCall

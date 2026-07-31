@@ -37,7 +37,9 @@ static BOOL (WINAPI *pIsThreadAFiber)(void);
 static DWORD (WINAPI *pFlsAlloc)(PFLS_CALLBACK_FUNCTION);
 static BOOL (WINAPI *pFlsFree)(DWORD);
 static PVOID (WINAPI *pFlsGetValue)(DWORD);
+static PVOID (WINAPI *pFlsGetValue2)(DWORD);
 static BOOL (WINAPI *pFlsSetValue)(DWORD,PVOID);
+static PVOID (WINAPI *pTlsGetValue2)(DWORD);
 static void (WINAPI *pRtlAcquirePebLock)(void);
 static void (WINAPI *pRtlReleasePebLock)(void);
 static NTSTATUS (WINAPI *pRtlFlsAlloc)(PFLS_CALLBACK_FUNCTION,DWORD*);
@@ -70,7 +72,9 @@ static VOID init_funcs(void)
     X(FlsAlloc);
     X(FlsFree);
     X(FlsGetValue);
+    X(FlsGetValue2);
     X(FlsSetValue);
+    X(TlsGetValue2);
 #undef X
 
 #define X(f) p##f = (void*)GetProcAddress(hntdll, #f);
@@ -698,6 +702,105 @@ static void test_FiberLocalStorage(void)
     pFlsFree( fls_2 );
 }
 
+static void test_GetValue2(void)
+{
+    static const DWORD fls_indices[] = {0, 127, 128, ~0u};
+    static const DWORD tls_indices[] = {0, TLS_MINIMUM_AVAILABLE - 1,
+                                       TLS_MINIMUM_AVAILABLE,
+                                       TLS_MINIMUM_AVAILABLE + 1, ~0u};
+    const DWORD error = 0xdeadbeef;
+    DWORD index, i;
+    void *value;
+    BOOL ret;
+
+    if (!pFlsGetValue2)
+        win_skip("FlsGetValue2 is not available.\n");
+    else
+    {
+        index = pFlsAlloc(NULL);
+        ok(index != FLS_OUT_OF_INDEXES, "FlsAlloc failed, error %lu.\n", GetLastError());
+        if (index != FLS_OUT_OF_INDEXES)
+        {
+            SetLastError(error);
+            value = pFlsGetValue2(index);
+            ok(!value, "FlsGetValue2 returned %p for a new slot.\n", value);
+            ok(GetLastError() == error, "FlsGetValue2 changed last error to %lu.\n",
+               GetLastError());
+
+            ret = pFlsSetValue(index, (void *)0x12345678);
+            ok(ret, "FlsSetValue failed, error %lu.\n", GetLastError());
+            SetLastError(error);
+            value = pFlsGetValue2(index);
+            ok(value == (void *)0x12345678, "FlsGetValue2 returned %p.\n", value);
+            ok(GetLastError() == error, "FlsGetValue2 changed last error to %lu.\n",
+               GetLastError());
+
+            ret = pFlsFree(index);
+            ok(ret, "FlsFree failed, error %lu.\n", GetLastError());
+            SetLastError(error);
+            value = pFlsGetValue2(index);
+            ok(!value, "FlsGetValue2 returned %p for a freed slot.\n", value);
+            ok(GetLastError() == error, "FlsGetValue2 changed last error to %lu.\n",
+               GetLastError());
+        }
+
+        for (i = 0; i < ARRAY_SIZE(fls_indices); ++i)
+        {
+            SetLastError(error);
+            value = pFlsGetValue2(fls_indices[i]);
+            if (!fls_indices[i] || fls_indices[i] >= 128)
+                ok(!value, "FlsGetValue2(%lu) returned %p.\n", fls_indices[i], value);
+            ok(GetLastError() == error, "FlsGetValue2(%lu) changed last error to %lu.\n",
+               fls_indices[i], GetLastError());
+        }
+    }
+
+    if (!pTlsGetValue2)
+        win_skip("TlsGetValue2 is not available.\n");
+    else
+    {
+        index = TlsAlloc();
+        ok(index != TLS_OUT_OF_INDEXES, "TlsAlloc failed, error %lu.\n", GetLastError());
+        if (index != TLS_OUT_OF_INDEXES)
+        {
+            SetLastError(error);
+            value = pTlsGetValue2(index);
+            ok(!value, "TlsGetValue2 returned %p for a new slot.\n", value);
+            ok(GetLastError() == error, "TlsGetValue2 changed last error to %lu.\n",
+               GetLastError());
+
+            ret = TlsSetValue(index, (void *)0x12345678);
+            ok(ret, "TlsSetValue failed, error %lu.\n", GetLastError());
+            SetLastError(error);
+            value = pTlsGetValue2(index);
+            ok(value == (void *)0x12345678, "TlsGetValue2 returned %p.\n", value);
+            ok(GetLastError() == error, "TlsGetValue2 changed last error to %lu.\n",
+               GetLastError());
+
+            ret = TlsFree(index);
+            ok(ret, "TlsFree failed, error %lu.\n", GetLastError());
+            SetLastError(error);
+            value = pTlsGetValue2(index);
+            ok(!value, "TlsGetValue2 returned %p for a freed slot.\n", value);
+            ok(GetLastError() == error, "TlsGetValue2 changed last error to %lu.\n",
+               GetLastError());
+        }
+
+        for (i = 0; i < ARRAY_SIZE(tls_indices); ++i)
+        {
+            SetLastError(error);
+            pTlsGetValue2(tls_indices[i]);
+            ok(GetLastError() == error, "TlsGetValue2(%lu) changed last error to %lu.\n",
+               tls_indices[i], GetLastError());
+        }
+        SetLastError(error);
+        value = pTlsGetValue2(~0u);
+        ok(!value, "TlsGetValue2(~0u) returned %p.\n", value);
+        ok(GetLastError() == error, "TlsGetValue2(~0u) changed last error to %lu.\n",
+           GetLastError());
+    }
+}
+
 static void test_FiberLocalStorageCallback(PFLS_CALLBACK_FUNCTION cbfunc)
 {
     DWORD fls;
@@ -1099,6 +1202,7 @@ START_TEST(fiber)
     }
 
     init_funcs();
+    test_GetValue2();
 
     if (!pCreateFiber)
     {

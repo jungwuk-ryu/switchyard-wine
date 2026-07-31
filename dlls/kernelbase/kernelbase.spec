@@ -388,6 +388,7 @@
 @ stdcall FlsAlloc(ptr)
 @ stdcall FlsFree(long)
 @ stdcall FlsGetValue(long)
+@ stdcall FlsGetValue2(long) ntdll.FlsGetValue2
 @ stdcall FlsSetValue(long ptr)
 @ stdcall FlushConsoleInputBuffer(long)
 @ stdcall FlushFileBuffers(long)
@@ -1651,6 +1652,7 @@
 @ stdcall TlsAlloc()
 @ stdcall TlsFree(long)
 @ stdcall TlsGetValue(long)
+@ stdcall TlsGetValue2(long)
 @ stdcall TlsSetValue(long ptr)
 @ stdcall TraceEvent(int64 ptr) ntdll.EtwLogTraceEvent
 @ varargs TraceMessage(int64 long ptr long) ntdll.EtwTraceMessage

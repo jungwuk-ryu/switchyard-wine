@@ -524,6 +524,7 @@
 @ stdcall -import FlsAlloc(ptr)
 @ stdcall -import FlsFree(long)
 @ stdcall -import FlsGetValue(long)
+@ stdcall -import FlsGetValue2(long)
 @ stdcall -import FlsSetValue(long ptr)
 @ stdcall -import FlushConsoleInputBuffer(long)
 @ stdcall -import FlushFileBuffers(long)
@@ -1557,6 +1558,7 @@
 @ stdcall -import TlsFree(long)
 @ stdcall -import TlsFreeInternal(long) TlsFree
 @ stdcall -import TlsGetValue(long)
+@ stdcall -import TlsGetValue2(long)
 @ stdcall -import TlsSetValue(long ptr)
 @ stdcall Toolhelp32ReadProcessMemory(long ptr ptr long ptr)
 @ stdcall -import TransactNamedPipe(long ptr long ptr long ptr ptr)

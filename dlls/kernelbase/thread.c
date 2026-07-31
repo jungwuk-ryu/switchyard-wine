@@ -899,6 +899,19 @@ LPVOID WINAPI DECLSPEC_HOTPATCH TlsGetValue( DWORD index )
     return NtCurrentTeb()->TlsExpansionSlots[index];
 }
 
+/**********************************************************************
+ *           TlsGetValue2   (kernelbase.@)
+ */
+LPVOID WINAPI DECLSPEC_HOTPATCH TlsGetValue2( DWORD index )
+{
+    if (index < TLS_MINIMUM_AVAILABLE) return NtCurrentTeb()->TlsSlots[index];
+
+    index -= TLS_MINIMUM_AVAILABLE;
+    if (index >= 8 * sizeof(NtCurrentTeb()->Peb->TlsExpansionBitmapBits)) return NULL;
+    if (!NtCurrentTeb()->TlsExpansionSlots) return NULL;
+    return NtCurrentTeb()->TlsExpansionSlots[index];
+}
+
 
 /**********************************************************************
  *           TlsSetValue   (kernelbase.@)

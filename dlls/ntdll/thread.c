@@ -696,6 +696,17 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH RtlFlsGetValue( ULONG index, void **data )
     return STATUS_SUCCESS;
 }
 
+/***********************************************************************
+ *              FlsGetValue2 (NTDLL.@)
+ */
+void * WINAPI DECLSPEC_HOTPATCH FlsGetValue2( ULONG index )
+{
+    void *data = NULL;
+
+    RtlFlsGetValue( index, &data );
+    return data;
+}
+
 
 /***********************************************************************
  *              RtlProcessFlsData (NTDLL.@)
