@@ -6,6 +6,7 @@ SOURCES = \
 	bundle_manifest.c \
 	catalog.c \
 	content_types.c \
+	graph.c \
 	manifest.c \
 	package.c \
 	path.c \
