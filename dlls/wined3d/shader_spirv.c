@@ -745,6 +745,12 @@ static bool shader_spirv_resource_bindings_init(struct shader_spirv_resource_bin
         if (!(shader_mask & (1u << shader_type)) || !(shader = state->shader[shader_type]))
             continue;
 
+        if (!shader->backend_data)
+        {
+            WARN("Shader %p of type %#x has no SPIR-V backend data.\n", shader, shader_type);
+            return false;
+        }
+
         if (shader_type == WINED3D_SHADER_TYPE_COMPUTE)
         {
             descriptor_info = &((struct shader_spirv_compute_program_vk *)shader->backend_data)->descriptor_info;
