@@ -6,9 +6,12 @@ EXTRAINCL = $(XML2_PE_CFLAGS) $(ZLIB_PE_CFLAGS)
 SOURCES = \
 	archive.c \
 	blockmap.c \
+	bundle_manifest.c \
+	catalog.c \
 	content_types.c \
 	main.c \
 	manifest.c \
+	package.c \
 	path.c \
 	signature.c \
 	stream.c
