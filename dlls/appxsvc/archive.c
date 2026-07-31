@@ -825,11 +825,11 @@ static HRESULT validate_paths( struct archive_entry *entries, UINT32 count, UINT
 }
 
 static BOOL data_descriptor_matches( const BYTE *descriptor, UINT32 cursor,
-                                     const struct archive_entry *entry )
+                                     const struct archive_entry *entry, BOOL zip64 )
 {
     if (read_uint32( descriptor + cursor ) != entry->crc32) return FALSE;
     cursor += 4;
-    if (entry->zip64_sizes)
+    if (zip64)
     {
         if (read_uint64( descriptor + cursor ) != entry->compressed_size ||
             read_uint64( descriptor + cursor + 8 ) != entry->uncompressed_size)
@@ -844,40 +844,63 @@ static BOOL data_descriptor_matches( const BYTE *descriptor, UINT32 cursor,
     return TRUE;
 }
 
-static HRESULT validate_data_descriptor( HANDLE file, UINT64 file_size,
-                                         struct archive_entry *entry, UINT64 data_end,
+static HRESULT validate_data_descriptor( HANDLE file, struct archive_entry *entry,
+                                         UINT64 data_end, UINT64 record_limit,
                                          UINT64 *record_end )
 {
     BYTE descriptor[24];
-    UINT32 size = entry->zip64_sizes ? 20 : 12;
-    UINT64 end;
+    UINT64 remaining;
+    UINT32 descriptor_size;
+    UINT32 cursor;
+    BOOL zip64;
     HRESULT hr;
 
-    if (!add_uint64( data_end, size, &end ) || end > file_size)
+    if (data_end > record_limit)
         return APPX_E_INVALID_PACKAGING_LAYOUT;
-    if (FAILED(hr = read_at( file, data_end, descriptor, size ))) return hr;
-
-    if (read_uint32( descriptor ) == ZIP_DATA_DESCRIPTOR_SIGNATURE)
+    remaining = record_limit - data_end;
+    switch (remaining)
     {
-        if (add_uint64( data_end, size + 4, &end ) && end <= file_size)
-        {
-            if (FAILED(hr = read_at( file, data_end, descriptor, size + 4 ))) return hr;
-            if (data_descriptor_matches( descriptor, 4, entry ))
-            {
-                *record_end = end;
-                return S_OK;
-            }
-        }
+    case 12:
+        descriptor_size = 12;
+        cursor = 0;
+        zip64 = FALSE;
+        break;
+    case 16:
+        descriptor_size = 16;
+        cursor = 4;
+        zip64 = FALSE;
+        break;
+    case 20:
+        descriptor_size = 20;
+        cursor = 0;
+        zip64 = TRUE;
+        break;
+    case 24:
+        descriptor_size = 24;
+        cursor = 4;
+        zip64 = TRUE;
+        break;
+    default:
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
     }
 
-    if (!data_descriptor_matches( descriptor, 0, entry ))
+    if (entry->zip64_sizes && !zip64)
         return APPX_E_INVALID_PACKAGING_LAYOUT;
-    *record_end = data_end + size;
+    /* ZIP64 descriptors may be used even when the central sizes fit in 32 bits.
+     * Version 4.5 is still required so consumers know to read eight-byte sizes. */
+    if (zip64 && entry->version_needed < 45)
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
+    if (FAILED(hr = read_at( file, data_end, descriptor, descriptor_size ))) return hr;
+    if (cursor && read_uint32( descriptor ) != ZIP_DATA_DESCRIPTOR_SIGNATURE)
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
+    if (!data_descriptor_matches( descriptor, cursor, entry, zip64 ))
+        return APPX_E_INVALID_PACKAGING_LAYOUT;
+    *record_end = record_limit;
     return S_OK;
 }
 
-static HRESULT validate_local_entry( HANDLE file, UINT64 file_size, UINT64 directory_offset,
-                                     struct archive_entry *entry )
+static HRESULT validate_local_entry( HANDLE file, UINT64 directory_offset,
+                                     UINT64 record_limit, struct archive_entry *entry )
 {
     BYTE header[ZIP_LOCAL_FILE_HEADER_SIZE], *variable = NULL;
     UINT32 crc32, compressed32, uncompressed32, variable_length;
@@ -887,8 +910,9 @@ static HRESULT validate_local_entry( HANDLE file, UINT64 file_size, UINT64 direc
     BOOL used_sizes;
     HRESULT hr;
 
-    if (entry->local_header_offset >= directory_offset ||
-        directory_offset - entry->local_header_offset < sizeof(header))
+    if (record_limit > directory_offset ||
+        entry->local_header_offset >= record_limit ||
+        record_limit - entry->local_header_offset < sizeof(header))
         return APPX_E_INVALID_PACKAGING_LAYOUT;
     if (FAILED(hr = read_at( file, entry->local_header_offset, header, sizeof(header) ))) return hr;
     if (read_uint32( header ) != ZIP_LOCAL_FILE_HEADER_SIGNATURE)
@@ -911,7 +935,7 @@ static HRESULT validate_local_entry( HANDLE file, UINT64 file_size, UINT64 direc
         return APPX_E_INVALID_PACKAGING_LAYOUT;
     if (!add_uint64( entry->local_header_offset, sizeof(header), &entry->data_offset ) ||
         !add_uint64( entry->data_offset, variable_length, &entry->data_offset ) ||
-        entry->data_offset > directory_offset)
+        entry->data_offset > record_limit)
         return APPX_E_INVALID_PACKAGING_LAYOUT;
 
     if (!(variable = HeapAlloc( GetProcessHeap(), 0, variable_length ? variable_length : 1 )))
@@ -954,13 +978,14 @@ static HRESULT validate_local_entry( HANDLE file, UINT64 file_size, UINT64 direc
     }
 
     if (!add_uint64( entry->data_offset, entry->compressed_size, &data_end ) ||
-        data_end > directory_offset)
+        data_end > record_limit)
     {
         hr = APPX_E_INVALID_PACKAGING_LAYOUT;
         goto done;
     }
     if (flags & ZIP_FLAG_DATA_DESCRIPTOR)
-        hr = validate_data_descriptor( file, file_size, entry, data_end, &entry->record_end );
+        hr = validate_data_descriptor( file, entry, data_end, record_limit,
+                                       &entry->record_end );
     else
     {
         entry->record_end = data_end;
@@ -972,7 +997,7 @@ done:
     return hr;
 }
 
-static HRESULT validate_local_layout( HANDLE file, UINT64 file_size, UINT64 directory_offset,
+static HRESULT validate_local_layout( HANDLE file, UINT64 directory_offset,
                                       struct archive_entry *entries, UINT32 count )
 {
     struct archive_entry **ordered;
@@ -981,12 +1006,7 @@ static HRESULT validate_local_layout( HANDLE file, UINT64 file_size, UINT64 dire
 
     if (!(ordered = HeapAlloc( GetProcessHeap(), 0, count * sizeof(*ordered) )))
         return E_OUTOFMEMORY;
-    for (i = 0; i < count; i++)
-    {
-        if (FAILED(hr = validate_local_entry( file, file_size, directory_offset, entries + i )))
-            goto done;
-        ordered[i] = entries + i;
-    }
+    for (i = 0; i < count; i++) ordered[i] = entries + i;
 
     qsort( ordered, count, sizeof(*ordered), compare_offset );
     if (ordered[0]->local_header_offset)
@@ -994,16 +1014,20 @@ static HRESULT validate_local_layout( HANDLE file, UINT64 file_size, UINT64 dire
         hr = APPX_E_INVALID_PACKAGING_LAYOUT;
         goto done;
     }
-    for (i = 1; i < count; i++)
+    for (i = 0; i < count; i++)
     {
-        if (ordered[i - 1]->record_end != ordered[i]->local_header_offset)
+        UINT64 record_limit = i + 1 < count ? ordered[i + 1]->local_header_offset :
+                                             directory_offset;
+
+        if (record_limit <= ordered[i]->local_header_offset ||
+            FAILED(hr = validate_local_entry( file, directory_offset, record_limit,
+                                              ordered[i] )) ||
+            ordered[i]->record_end != record_limit)
         {
-            hr = APPX_E_INVALID_PACKAGING_LAYOUT;
+            if (SUCCEEDED(hr)) hr = APPX_E_INVALID_PACKAGING_LAYOUT;
             goto done;
         }
     }
-    if (ordered[count - 1]->record_end != directory_offset)
-        hr = APPX_E_INVALID_PACKAGING_LAYOUT;
 
 done:
     HeapFree( GetProcessHeap(), 0, ordered );
@@ -1130,8 +1154,8 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
         goto done;
     }
     if (FAILED(hr = validate_paths( entries, directory.entries, flags ))) goto done;
-    if (FAILED(hr = validate_local_layout( duplicate, size.QuadPart, directory.offset,
-                                           entries, directory.entries )))
+    if (FAILED(hr = validate_local_layout( duplicate, directory.offset, entries,
+                                           directory.entries )))
         goto done;
     if (!GetFileSizeEx( duplicate, &current_size ))
     {

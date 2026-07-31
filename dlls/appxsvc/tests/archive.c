@@ -88,6 +88,7 @@ struct test_entry
     UINT16 local_extra_length;
     UINT16 central_extra_length;
     BOOL descriptor_signature;
+    BOOL zip64_descriptor;
     BOOL zip64;
 };
 
@@ -98,6 +99,7 @@ struct zip_builder
     UINT32 count;
     UINT64 central_offset;
     UINT64 eocd_offset;
+    BOOL force_zip64_descriptors;
 };
 
 static void put_uint16( BYTE *buffer, UINT16 value )
@@ -239,6 +241,9 @@ static struct test_entry *add_entry_with_extras( struct zip_builder *builder, co
 {
     struct test_entry *entry;
     BYTE *header, *extra;
+    BOOL zip64_descriptor = zip64 ||
+                            (builder->force_zip64_descriptors &&
+                             (flags & ZIP_FLAG_DATA_DESCRIPTOR));
     UINT32 total_extra_length = (zip64 && !(flags & ZIP_FLAG_DATA_DESCRIPTOR) ? 20 : 0) +
                                 local_extra_length;
     UINT16 extra_length;
@@ -265,6 +270,7 @@ static struct test_entry *add_entry_with_extras( struct zip_builder *builder, co
     entry->central_extra = central_extra;
     entry->central_extra_length = central_extra_length;
     entry->descriptor_signature = descriptor_signature;
+    entry->zip64_descriptor = zip64_descriptor;
     entry->zip64 = zip64;
     entry->local_offset = builder->buffer.size;
 
@@ -272,7 +278,7 @@ static struct test_entry *add_entry_with_extras( struct zip_builder *builder, co
     ok( !!header, "failed to append local header.\n" );
     if (!header) return NULL;
     put_uint32( header, ZIP_LOCAL_FILE_HEADER_SIGNATURE );
-    put_uint16( header + 4, zip64 ? 45 : method == 8 ? 20 : 10 );
+    put_uint16( header + 4, zip64_descriptor ? 45 : method == 8 ? 20 : 10 );
     put_uint16( header + 6, flags );
     put_uint16( header + 8, method );
     if (flags & ZIP_FLAG_DATA_DESCRIPTOR)
@@ -311,7 +317,7 @@ static struct test_entry *add_entry_with_extras( struct zip_builder *builder, co
             ok( append_uint32( &builder->buffer, ZIP_DATA_DESCRIPTOR_SIGNATURE ),
                 "failed to append descriptor signature.\n" );
         ok( append_uint32( &builder->buffer, crc32 ), "failed to append descriptor CRC.\n" );
-        if (zip64)
+        if (zip64_descriptor)
         {
             ok( append_uint64( &builder->buffer, data_length ),
                 "failed to append ZIP64 descriptor size.\n" );
@@ -367,7 +373,8 @@ static BOOL finish_archive_with_zip64_extensible( struct zip_builder *builder,
         if (!header) return FALSE;
         put_uint32( header, ZIP_CENTRAL_DIRECTORY_SIGNATURE );
         put_uint16( header + 4, 20 );
-        put_uint16( header + 6, entry->zip64 ? 45 : entry->method == 8 ? 20 : 10 );
+        put_uint16( header + 6, entry->zip64_descriptor ? 45 :
+                    entry->method == 8 ? 20 : 10 );
         put_uint16( header + 8, entry->flags );
         put_uint16( header + 10, entry->method );
         put_uint32( header + 16, entry->crc32 );
@@ -658,6 +665,56 @@ static void test_descriptor_signature_crc( void )
     hr = open_builder( &builder, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, &archive );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
     if (SUCCEEDED(hr)) p_wine_appx_archive_close( archive );
+    free_builder( &builder );
+}
+
+static void test_zip64_descriptors_with_zip32_sizes( void )
+{
+    static const BYTE data[] = {'x'};
+    struct zip_builder builder = {0};
+    struct test_entry *empty, *payload;
+    WINE_APPX_ARCHIVE *archive;
+    HRESULT hr;
+
+    builder.force_zip64_descriptors = TRUE;
+    add_required_entries( &builder );
+    empty = add_entry( &builder, "Assets/empty64.dat", NULL, 0, 0, 0, 0,
+                       ZIP_FLAG_DATA_DESCRIPTOR, TRUE, FALSE );
+    payload = add_entry( &builder, "Assets/payload64.dat", data, sizeof(data), 0,
+                         sizeof(data), 0x8cdc1683, ZIP_FLAG_DATA_DESCRIPTOR,
+                         FALSE, FALSE );
+    add_entry( &builder, "Assets/ambiguous64.dat", NULL, 0, 0, 0,
+               ZIP_DATA_DESCRIPTOR_SIGNATURE, ZIP_FLAG_DATA_DESCRIPTOR,
+               FALSE, FALSE );
+    ok( finish_archive( &builder, TRUE ), "failed to finish mixed ZIP64 archive.\n" );
+    ok( read_uint32( builder.buffer.data + empty->central_offset + 20 ) == 0,
+        "empty entry unexpectedly used a ZIP64 central size.\n" );
+    ok( read_uint32( builder.buffer.data + payload->central_offset + 20 ) == sizeof(data),
+        "payload entry unexpectedly used a ZIP64 central size.\n" );
+    hr = open_builder( &builder, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, &archive );
+    ok( hr == S_OK, "mixed ZIP64 descriptors returned %#lx.\n", hr );
+    if (SUCCEEDED(hr)) p_wine_appx_archive_close( archive );
+
+    put_uint32( builder.buffer.data + empty->descriptor_offset + 12, 1 );
+    expect_invalid( &builder, WINE_APPX_ARCHIVE_OPEN_PACKAGE );
+    free_builder( &builder );
+
+    add_required_entries( &builder );
+    empty = add_entry( &builder, "Assets/padded32.dat", NULL, 0, 0, 0, 0,
+                       ZIP_FLAG_DATA_DESCRIPTOR, FALSE, FALSE );
+    ok( !!append( &builder.buffer, 8 ), "failed to append descriptor padding.\n" );
+    ok( finish_archive( &builder, FALSE ), "failed to finish padded descriptor archive.\n" );
+    expect_invalid( &builder, WINE_APPX_ARCHIVE_OPEN_PACKAGE );
+    free_builder( &builder );
+
+    builder.force_zip64_descriptors = TRUE;
+    add_required_entries( &builder );
+    empty = add_entry( &builder, "Assets/unadvertised64.dat", NULL, 0, 0, 0, 0,
+                       ZIP_FLAG_DATA_DESCRIPTOR, TRUE, FALSE );
+    ok( finish_archive( &builder, TRUE ), "failed to finish version fixture.\n" );
+    put_uint16( builder.buffer.data + empty->local_offset + 4, 10 );
+    put_uint16( builder.buffer.data + empty->central_offset + 6, 10 );
+    expect_invalid( &builder, WINE_APPX_ARCHIVE_OPEN_PACKAGE );
     free_builder( &builder );
 }
 
@@ -1423,6 +1480,7 @@ START_TEST(archive)
     test_descriptors( FALSE );
     test_descriptors( TRUE );
     test_descriptor_signature_crc();
+    test_zip64_descriptors_with_zip32_sizes();
     test_descriptor_metadata();
     test_extra_fields();
     test_file_position();
