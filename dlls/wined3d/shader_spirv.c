@@ -23,6 +23,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(d3d_shader);
 
 static const struct wined3d_shader_backend_ops spirv_shader_backend_vk;
+static bool shader_spirv_precompile_shader(void *shader_priv, struct wined3d_shader *shader);
 static void shader_spirv_precompile(void *shader_priv, struct wined3d_shader *shader);
 
 struct shader_spirv_resource_bindings
@@ -747,11 +748,9 @@ static bool shader_spirv_resource_bindings_init(struct shader_spirv_priv *priv,
         if (!(shader_mask & (1u << shader_type)) || !(shader = state->shader[shader_type]))
             continue;
 
-        if (!shader->backend_data)
-            shader_spirv_precompile(priv, shader);
-        if (!shader->backend_data)
+        if (!shader_spirv_precompile_shader(priv, shader))
         {
-            WARN("Shader %p of type %#x has no SPIR-V backend data.\n", shader, shader_type);
+            WARN("Failed to create SPIR-V backend data for shader %p of type %#x.\n", shader, shader_type);
             return false;
         }
 
@@ -838,13 +837,13 @@ static bool shader_spirv_resource_bindings_init(struct shader_spirv_priv *priv,
     return true;
 }
 
-static void shader_spirv_scan_shader(struct wined3d_shader *shader,
+static bool shader_spirv_scan_shader(struct wined3d_shader *shader,
         struct vkd3d_shader_scan_descriptor_info *descriptor_info,
         struct vkd3d_shader_scan_signature_info *signature_info)
 {
     const struct shader_spirv_priv *priv = shader->device->shader_priv;
     struct vkd3d_shader_compile_info info;
-    char *messages;
+    char *messages = NULL;
     int ret;
 
     memset(descriptor_info, 0, sizeof(*descriptor_info));
@@ -892,48 +891,67 @@ static void shader_spirv_scan_shader(struct wined3d_shader *shader,
         FIXME("\n");
     }
     vkd3d_shader_free_messages(messages);
+
+    if (ret < 0)
+        return false;
+
+    return true;
 }
 
-static void shader_spirv_precompile_compute(struct wined3d_shader *shader)
+static bool shader_spirv_precompile_compute(struct wined3d_shader *shader)
 {
     struct shader_spirv_compute_program_vk *program_vk;
 
-    if (!(program_vk = shader->backend_data))
+    if (shader->backend_data)
+        return true;
+
+    if (!(program_vk = calloc(1, sizeof(*program_vk))))
     {
-        if (!(program_vk = calloc(1, sizeof(*program_vk))))
-        {
-            ERR("Failed to allocate program.\n");
-            return;
-        }
-        shader->backend_data = program_vk;
+        ERR("Failed to allocate program.\n");
+        return false;
     }
 
-    shader_spirv_scan_shader(shader, &program_vk->descriptor_info, NULL);
+    if (!shader_spirv_scan_shader(shader, &program_vk->descriptor_info, NULL))
+    {
+        free(program_vk);
+        return false;
+    }
+
+    shader->backend_data = program_vk;
+    return true;
 }
 
-static void shader_spirv_precompile(void *shader_priv, struct wined3d_shader *shader)
+static bool shader_spirv_precompile_shader(void *shader_priv, struct wined3d_shader *shader)
 {
     struct shader_spirv_graphics_program_vk *program_vk;
 
     TRACE("shader_priv %p, shader %p.\n", shader_priv, shader);
 
+    if (shader->backend_data)
+        return true;
+
     if (shader->reg_maps.shader_version.type == WINED3D_SHADER_TYPE_COMPUTE)
+        return shader_spirv_precompile_compute(shader);
+
+    if (!(program_vk = calloc(1, sizeof(*program_vk))))
     {
-        shader_spirv_precompile_compute(shader);
-        return;
+        ERR("Failed to allocate program.\n");
+        return false;
     }
 
-    if (!(program_vk = shader->backend_data))
+    if (!shader_spirv_scan_shader(shader, &program_vk->descriptor_info, &program_vk->signature_info))
     {
-        if (!(program_vk = calloc(1, sizeof(*program_vk))))
-        {
-            ERR("Failed to allocate program.\n");
-            return;
-        }
-        shader->backend_data = program_vk;
+        free(program_vk);
+        return false;
     }
 
-    shader_spirv_scan_shader(shader, &program_vk->descriptor_info, &program_vk->signature_info);
+    shader->backend_data = program_vk;
+    return true;
+}
+
+static void shader_spirv_precompile(void *shader_priv, struct wined3d_shader *shader)
+{
+    shader_spirv_precompile_shader(shader_priv, shader);
 }
 
 static void shader_spirv_apply_draw_state(void *shader_priv, struct wined3d_context *context,
@@ -1005,9 +1023,11 @@ static void shader_spirv_apply_compute_state(void *shader_priv,
 
     if (!shader_spirv_resource_bindings_init(priv, &priv->bindings,
             &context_vk->compute.bindings, state, 1u << WINED3D_SHADER_TYPE_COMPUTE))
+    {
         ERR("Failed to initialise shader resource bindings.\n");
-
-    if ((shader = state->shader[WINED3D_SHADER_TYPE_COMPUTE]))
+        program = NULL;
+    }
+    else if ((shader = state->shader[WINED3D_SHADER_TYPE_COMPUTE]))
         program = shader_spirv_find_compute_program_vk(priv, context_vk, shader, &priv->bindings);
     else
         program = NULL;
