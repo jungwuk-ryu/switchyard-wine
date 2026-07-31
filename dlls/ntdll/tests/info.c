@@ -2242,6 +2242,7 @@ static void test_query_battery(void)
 {
     SYSTEM_BATTERY_STATE bs;
     NTSTATUS status;
+    ULONGLONG estimate;
     DWORD time_left;
 
     memset(&bs, 0x23, sizeof(bs));
@@ -2272,15 +2273,37 @@ static void test_query_battery(void)
     ok(bs.MaxCapacity >= bs.RemainingCapacity,
        "expected MaxCapacity %lu to be greater than or equal to RemainingCapacity %lu\n",
        bs.MaxCapacity, bs.RemainingCapacity);
+    ok(!(bs.Charging && bs.Discharging),
+       "battery cannot be charging and discharging at the same time\n");
+    if (bs.Charging)
+    {
+        ok(bs.AcOnLine, "charging battery should be on AC power\n");
+        ok((LONG)bs.Rate >= 0, "charging battery should not have negative rate %ld\n", (LONG)bs.Rate);
+    }
+    if (bs.Discharging)
+    {
+        ok((LONG)bs.Rate <= 0, "discharging battery should not have positive rate %ld\n", (LONG)bs.Rate);
+    }
 
-    if (!bs.BatteryPresent)
-        time_left = 0;
-    else if (!bs.Charging && (LONG)bs.Rate < 0)
-        time_left = 3600 * bs.RemainingCapacity / -(LONG)bs.Rate;
+    if (bs.BatteryPresent && bs.Discharging && !(LONG)bs.Rate)
+    {
+        ok(!bs.EstimatedTime || bs.EstimatedTime == MAXDWORD,
+           "zero-rate discharging battery has unexpected estimated time %lu\n", bs.EstimatedTime);
+    }
     else
-        time_left = ~0u;
-    ok(bs.EstimatedTime == time_left,
-       "expected %lu minutes remaining got %lu minutes\n", time_left, bs.EstimatedTime);
+    {
+        if (!bs.BatteryPresent)
+            time_left = 0;
+        else if (!bs.Charging && (LONG)bs.Rate < 0)
+        {
+            estimate = 3600 * (ULONGLONG)bs.RemainingCapacity / -(LONG64)(LONG)bs.Rate;
+            time_left = estimate > MAXDWORD ? MAXDWORD : estimate;
+        }
+        else
+            time_left = ~0u;
+        ok(bs.EstimatedTime == time_left,
+           "expected %lu seconds remaining got %lu seconds\n", time_left, bs.EstimatedTime);
+    }
 }
 
 static void test_query_processor_power_info(void)

@@ -4565,109 +4565,373 @@ static NTSTATUS fill_battery_state( SYSTEM_BATTERY_STATE *bs )
 
 #elif defined(__APPLE__)
 
-static NTSTATUS fill_battery_state( SYSTEM_BATTERY_STATE *bs )
+struct apple_power_snapshot
 {
-    CFTypeRef blob = IOPSCopyPowerSourcesInfo();
-    CFArrayRef sources = IOPSCopyPowerSourcesList( blob );
-    CFIndex count, i;
-    CFDictionaryRef source = NULL;
-    CFTypeRef prop;
-    Boolean is_charging, is_internal, is_present;
-    int32_t value, voltage;
+    BOOL battery_present;
+    BOOL ac_online;
+    BOOL charging;
+    BOOL discharging;
+    BOOL physical_capacity;
+    BOOL amperage_valid;
+    BOOL time_to_empty_valid;
+    BOOL time_to_full_valid;
+    int32_t max_capacity;
+    int32_t remaining_capacity;
+    int32_t physical_max_capacity;
+    int32_t physical_remaining_capacity;
+    int32_t voltage_mv;
+    int32_t amperage_ma;
+    int32_t time_to_empty_minutes;
+    int32_t time_to_full_minutes;
+};
 
-    if (!sources)
-    {
-        if (blob) CFRelease( blob );
-        return STATUS_ACCESS_DENIED;
-    }
+static CFTypeRef apple_dictionary_get_typed_value( CFDictionaryRef dictionary, CFStringRef key,
+                                                    CFTypeID type )
+{
+    CFTypeRef value = CFDictionaryGetValue( dictionary, key );
+
+    return value && CFGetTypeID( value ) == type ? value : NULL;
+}
+
+static BOOL apple_dictionary_get_boolean( CFDictionaryRef dictionary, CFStringRef key, BOOL *result )
+{
+    CFBooleanRef value = apple_dictionary_get_typed_value( dictionary, key, CFBooleanGetTypeID() );
+
+    if (!value) return FALSE;
+    *result = CFBooleanGetValue( value );
+    return TRUE;
+}
+
+static BOOL apple_dictionary_get_int32( CFDictionaryRef dictionary, CFStringRef key, int32_t *result )
+{
+    CFNumberRef value = apple_dictionary_get_typed_value( dictionary, key, CFNumberGetTypeID() );
+
+    if (!value || CFNumberIsFloatType( value )) return FALSE;
+    return CFNumberGetValue( value, kCFNumberSInt32Type, result );
+}
+
+static BOOL apple_dictionary_get_string( CFDictionaryRef dictionary, CFStringRef key,
+                                         CFStringRef *result )
+{
+    CFStringRef value = apple_dictionary_get_typed_value( dictionary, key, CFStringGetTypeID() );
+
+    if (!value) return FALSE;
+    *result = value;
+    return TRUE;
+}
+
+static BOOL apple_string_equal( CFStringRef value, CFStringRef expected )
+{
+    return !CFStringCompare( value, expected, 0 );
+}
+
+static BOOL apple_source_is_internal_battery( CFDictionaryRef source )
+{
+    CFStringRef transport, type;
+    BOOL present;
+
+    return apple_dictionary_get_string( source, CFSTR(kIOPSTransportTypeKey), &transport ) &&
+           apple_string_equal( transport, CFSTR(kIOPSInternalType) ) &&
+           apple_dictionary_get_string( source, CFSTR(kIOPSTypeKey), &type ) &&
+           apple_string_equal( type, CFSTR(kIOPSInternalBatteryType) ) &&
+           apple_dictionary_get_boolean( source, CFSTR(kIOPSIsPresentKey), &present ) && present;
+}
+
+static CFDictionaryRef apple_find_internal_battery( CFTypeRef info, CFArrayRef sources )
+{
+    CFDictionaryRef source;
+    CFTypeRef handle;
+    CFIndex count, i;
 
     count = CFArrayGetCount( sources );
-
-    for (i = 0; i < count; i++)
+    for (i = 0; i < count; ++i)
     {
-        source = IOPSGetPowerSourceDescription( blob, CFArrayGetValueAtIndex( sources, i ) );
-
-        if (!source)
-            continue;
-
-        prop = CFDictionaryGetValue( source, CFSTR(kIOPSTransportTypeKey) );
-        is_internal = !CFStringCompare( prop, CFSTR(kIOPSInternalType), 0 );
-
-        prop = CFDictionaryGetValue( source, CFSTR(kIOPSIsPresentKey) );
-        is_present = CFBooleanGetValue( prop );
-
-        if (is_internal && is_present)
-            break;
+        if (!(handle = CFArrayGetValueAtIndex( sources, i ))) continue;
+        if (!(source = IOPSGetPowerSourceDescription( info, handle ))) continue;
+        if (CFGetTypeID( source ) != CFDictionaryGetTypeID()) continue;
+        if (apple_source_is_internal_battery( source )) return source;
     }
 
-    CFRelease( blob );
+    return NULL;
+}
 
-    if (!source)
+static BOOL apple_percentages_match( int32_t remaining1, int32_t max1,
+                                     int32_t remaining2, int32_t max2 )
+{
+    ULONG64 percent1 = ((ULONG64)remaining1 * 100 + max1 / 2) / max1;
+    ULONG64 percent2 = ((ULONG64)remaining2 * 100 + max2 / 2) / max2;
+
+    return percent1 > percent2 ? percent1 - percent2 <= 5 : percent2 - percent1 <= 5;
+}
+
+static void apple_read_physical_battery( CFDictionaryRef source,
+                                         struct apple_power_snapshot *snapshot )
+{
+    CFDictionaryRef battery = NULL, value;
+    CFArrayRef batteries = NULL;
+    CFIndex count, i;
+    int32_t flags, max_capacity, remaining_capacity, voltage, amperage;
+    unsigned int installed_count = 0;
+
+    if (IOPMCopyBatteryInfo( MACH_PORT_NULL, &batteries ) != kIOReturnSuccess || !batteries)
+        goto done;
+    if (CFGetTypeID( batteries ) != CFArrayGetTypeID()) goto done;
+
+    count = CFArrayGetCount( batteries );
+    for (i = 0; i < count; ++i)
     {
-        /* Just assume we're on AC with no internal power source. */
-        bs->AcOnLine = TRUE;
-        CFRelease( sources );
-        return STATUS_SUCCESS;
+        value = CFArrayGetValueAtIndex( batteries, i );
+        if (!value || CFGetTypeID( value ) != CFDictionaryGetTypeID()) goto done;
+        if (!apple_dictionary_get_int32( value, CFSTR(kIOBatteryFlagsKey), &flags )) goto done;
+        if (!(flags & kIOBatteryInstalled)) continue;
+        battery = value;
+        ++installed_count;
     }
+
+    /* The legacy API has no stable identifier with which to match multiple
+     * installed batteries to an IOPowerSources entry. */
+    if (installed_count != 1) goto done;
+    if (!apple_dictionary_get_int32( battery, CFSTR(kIOBatteryCapacityKey), &max_capacity ) ||
+        !apple_dictionary_get_int32( battery, CFSTR(kIOBatteryCurrentChargeKey),
+                                     &remaining_capacity ) ||
+        max_capacity <= 100 || remaining_capacity < 0 || remaining_capacity > max_capacity)
+        goto done;
+
+    if (!apple_dictionary_get_int32( battery, CFSTR(kIOBatteryVoltageKey), &voltage ) &&
+        !apple_dictionary_get_int32( source, CFSTR(kIOPSVoltageKey), &voltage ))
+        goto done;
+    if (voltage <= 0) goto done;
+
+    /* Do not combine physical values from a stale or unrelated legacy entry
+     * with the normalized percentage from IOPowerSources. */
+    if (!apple_percentages_match( snapshot->remaining_capacity, snapshot->max_capacity,
+                                  remaining_capacity, max_capacity ))
+        goto done;
+
+    snapshot->physical_capacity = TRUE;
+    snapshot->physical_max_capacity = max_capacity;
+    snapshot->physical_remaining_capacity = remaining_capacity;
+    snapshot->voltage_mv = voltage;
+
+    if (apple_dictionary_get_int32( battery, CFSTR(kIOBatteryAmperageKey), &amperage ) ||
+        apple_dictionary_get_int32( source, CFSTR(kIOPSCurrentKey), &amperage ))
+    {
+        snapshot->amperage_valid = TRUE;
+        snapshot->amperage_ma = amperage;
+    }
+
+done:
+    if (batteries) CFRelease( batteries );
+}
+
+static NTSTATUS apple_get_power_snapshot( struct apple_power_snapshot *snapshot )
+{
+    CFDictionaryRef source;
+    CFStringRef state;
+    CFArrayRef sources = NULL;
+    CFTypeRef info = NULL;
+    NTSTATUS status = STATUS_ACCESS_DENIED;
+    BOOL is_charging;
+    int32_t value;
+
+    memset( snapshot, 0, sizeof(*snapshot) );
+    snapshot->ac_online = TRUE;
+
+    if (!(info = IOPSCopyPowerSourcesInfo())) goto done;
+    if (!(sources = IOPSCopyPowerSourcesList( info ))) goto done;
+    if (CFGetTypeID( sources ) != CFArrayGetTypeID()) goto done;
+
+    if (!(source = apple_find_internal_battery( info, sources )))
+    {
+        status = STATUS_SUCCESS;
+        goto done;
+    }
+
+    if (!apple_dictionary_get_boolean( source, CFSTR(kIOPSIsChargingKey), &is_charging ) ||
+        !apple_dictionary_get_string( source, CFSTR(kIOPSPowerSourceStateKey), &state ) ||
+        !apple_dictionary_get_int32( source, CFSTR(kIOPSMaxCapacityKey),
+                                     &snapshot->max_capacity ) ||
+        !apple_dictionary_get_int32( source, CFSTR(kIOPSCurrentCapacityKey),
+                                     &snapshot->remaining_capacity ) ||
+        snapshot->max_capacity <= 0 || snapshot->max_capacity > 100 ||
+        snapshot->remaining_capacity < 0)
+        goto done;
+
+    if (snapshot->remaining_capacity > snapshot->max_capacity)
+        snapshot->remaining_capacity = snapshot->max_capacity;
+
+    if (apple_string_equal( state, CFSTR(kIOPSACPowerValue) ))
+    {
+        snapshot->charging = is_charging;
+    }
+    else if (apple_string_equal( state, CFSTR(kIOPSBatteryPowerValue) ))
+    {
+        if (is_charging) goto done;
+        snapshot->ac_online = FALSE;
+        snapshot->discharging = TRUE;
+    }
+    else
+        goto done;
+
+    snapshot->battery_present = TRUE;
+
+    if (apple_dictionary_get_int32( source, CFSTR(kIOPSTimeToEmptyKey), &value ) && value >= 0)
+    {
+        snapshot->time_to_empty_valid = TRUE;
+        snapshot->time_to_empty_minutes = value;
+    }
+    if (apple_dictionary_get_int32( source, CFSTR(kIOPSTimeToFullChargeKey), &value ) && value >= 0)
+    {
+        snapshot->time_to_full_valid = TRUE;
+        snapshot->time_to_full_minutes = value;
+    }
+
+    /* Apple documents the IOPowerSources capacity values as percentages.
+     * Its design and nominal capacity keys use the same implementation-defined
+     * unit domain, so they cannot establish a physical capacity either.
+     * IOPMCopyBatteryInfo is a supported source of physical mAh values on
+     * systems where it is available; recent systems may not implement it. */
+    apple_read_physical_battery( source, snapshot );
+    status = STATUS_SUCCESS;
+
+done:
+    if (sources) CFRelease( sources );
+    if (info) CFRelease( info );
+    return status;
+}
+
+static ULONG apple_multiply_divide_round( ULONG64 value, ULONG64 multiplier,
+                                          ULONG64 divisor, ULONG limit )
+{
+    ULONG64 result;
+
+    if (!divisor) return 0;
+    if (value && multiplier > (~(ULONG64)0 - divisor / 2) / value) return limit;
+    result = (value * multiplier + divisor / 2) / divisor;
+    return result > limit ? limit : result;
+}
+
+static ULONG apple_multiply_divide_floor( ULONG64 value, ULONG64 multiplier,
+                                          ULONG64 divisor )
+{
+    ULONG64 result;
+
+    if (!divisor) return MAXDWORD;
+    if (value && multiplier > ~(ULONG64)0 / value) return MAXDWORD;
+    result = value * multiplier / divisor;
+    return result > MAXDWORD ? MAXDWORD : result;
+}
+
+static ULONG apple_minutes_to_seconds( int32_t minutes )
+{
+    return apple_multiply_divide_round( minutes, 60, 1, MAXDWORD );
+}
+
+static ULONG apple_capacity_to_mwh( int32_t capacity_mah, int32_t voltage_mv )
+{
+    return apple_multiply_divide_round( capacity_mah, voltage_mv, 1000, MAXDWORD );
+}
+
+static ULONG apple_current_to_mw( int32_t current_ma, int32_t voltage_mv )
+{
+    ULONG64 current = current_ma < 0 ? -(LONG64)current_ma : current_ma;
+
+    return apple_multiply_divide_round( current, voltage_mv, 1000, MAXLONG );
+}
+
+static void apple_set_discharging_time( SYSTEM_BATTERY_STATE *bs, ULONG seconds )
+{
+    ULONG rate;
+
+    if (!seconds)
+    {
+        /* Zero minutes is a valid IOPowerSources estimate, distinct from the
+         * -1 value used while the estimate is still being calculated. */
+        bs->EstimatedTime = 0;
+        return;
+    }
+    if (!(rate = apple_multiply_divide_round( bs->RemainingCapacity, 3600, seconds, MAXLONG )))
+        return;
+
+    bs->Rate = (ULONG)-(LONG)rate;
+    bs->EstimatedTime = apple_multiply_divide_floor( bs->RemainingCapacity, 3600, rate );
+}
+
+static NTSTATUS fill_battery_state( SYSTEM_BATTERY_STATE *bs )
+{
+    struct apple_power_snapshot snapshot;
+    ULONG max_capacity, remaining_capacity, seconds, rate;
+    NTSTATUS status;
+
+    if ((status = apple_get_power_snapshot( &snapshot ))) return status;
+
+    bs->AcOnLine = snapshot.ac_online;
+    if (!snapshot.battery_present) return STATUS_SUCCESS;
 
     bs->BatteryPresent = TRUE;
-    bs->EstimatedTime = ~0u;
+    bs->Charging = snapshot.charging;
+    bs->Discharging = snapshot.discharging;
+    bs->EstimatedTime = MAXDWORD;
 
-    prop = CFDictionaryGetValue( source, CFSTR(kIOPSIsChargingKey) );
-    is_charging = CFBooleanGetValue( prop );
-
-    prop = CFDictionaryGetValue( source, CFSTR(kIOPSPowerSourceStateKey) );
-
-    if (!CFStringCompare( prop, CFSTR(kIOPSACPowerValue), 0 ))
+    if (snapshot.physical_capacity)
     {
-        bs->AcOnLine = TRUE;
-        if (is_charging)
-            bs->Charging = TRUE;
+        max_capacity = apple_capacity_to_mwh( snapshot.physical_max_capacity, snapshot.voltage_mv );
+        remaining_capacity = apple_capacity_to_mwh( snapshot.physical_remaining_capacity,
+                                                    snapshot.voltage_mv );
+        /* Avoid mixing a saturated physical value with an unsaturated one. */
+        if (max_capacity != MAXDWORD)
+        {
+            bs->MaxCapacity = max_capacity;
+            bs->RemainingCapacity = min( remaining_capacity, max_capacity );
+        }
     }
-    else
-        bs->Discharging = TRUE;
 
-    /* We'll need the voltage to be able to interpret the other values. */
-    prop = CFDictionaryGetValue( source, CFSTR(kIOPSVoltageKey) );
-    if (prop)
-        CFNumberGetValue( prop, kCFNumberIntType, &voltage );
-    else
-        /* kIOPSVoltageKey is optional and might not be populated.
-         * Assume 11.4 V then, which is a common value for Apple laptops. */
-        voltage = 11400;
+    /* Keep normalized capacity and rate values in the same domain when no
+     * complete, representable physical-capacity tuple is available. */
+    if (!bs->MaxCapacity)
+    {
+        snapshot.physical_capacity = FALSE;
+        bs->MaxCapacity = snapshot.max_capacity;
+        bs->RemainingCapacity = snapshot.remaining_capacity;
+    }
 
-    prop = CFDictionaryGetValue( source, CFSTR(kIOPSMaxCapacityKey) );
-    CFNumberGetValue( prop, kCFNumberIntType, &value );
-    bs->MaxCapacity = value * voltage;
-    /* Apple uses "estimated time < 10:00" and "22%" for these, but we'll follow
-     * Windows for now (5% and 33%). */
+    /* Apple uses time-based warnings, but Windows exposes capacity-based
+     * defaults. Keep Wine's established 5% and 33% thresholds. */
     bs->DefaultAlert1 = bs->MaxCapacity / 20;
     bs->DefaultAlert2 = bs->MaxCapacity / 3;
 
-    prop = CFDictionaryGetValue( source, CFSTR(kIOPSCurrentCapacityKey) );
-    CFNumberGetValue( prop, kCFNumberIntType, &value );
-    bs->RemainingCapacity = value * voltage;
-
-    prop = CFDictionaryGetValue( source, CFSTR(kIOPSCurrentKey) );
-    if (prop)
-        CFNumberGetValue( prop, kCFNumberIntType, &value );
-    else
-        /* kIOPSCurrentKey is optional and might not be populated. */
-        value = 0;
-
-    bs->Rate = value * voltage / 1000;
-
-    prop = CFDictionaryGetValue( source, CFSTR(kIOPSTimeToEmptyKey) );
-    if (prop)
+    if (bs->Discharging)
     {
-        CFNumberGetValue( prop, kCFNumberIntType, &value );
-        if (value > 0)
-            /*  A value of -1 indicates "Still Calculating the Time",
-             * otherwise estimated minutes left on the battery. */
-            bs->EstimatedTime = value * 60;
+        if (snapshot.time_to_empty_valid)
+        {
+            seconds = apple_minutes_to_seconds( snapshot.time_to_empty_minutes );
+            apple_set_discharging_time( bs, seconds );
+        }
+        else if (snapshot.physical_capacity && snapshot.amperage_valid &&
+                 snapshot.amperage_ma < 0 &&
+                 (rate = apple_current_to_mw( snapshot.amperage_ma, snapshot.voltage_mv )))
+        {
+            bs->Rate = (ULONG)-(LONG)rate;
+            bs->EstimatedTime = apple_multiply_divide_floor( bs->RemainingCapacity, 3600, rate );
+        }
+        return STATUS_SUCCESS;
     }
 
-    CFRelease( sources );
+    if (!bs->Charging) return STATUS_SUCCESS;
+
+    if (snapshot.time_to_full_valid)
+    {
+        seconds = apple_minutes_to_seconds( snapshot.time_to_full_minutes );
+        if (seconds && bs->RemainingCapacity < bs->MaxCapacity)
+            bs->Rate = apple_multiply_divide_round( bs->MaxCapacity - bs->RemainingCapacity,
+                                                    3600, seconds, MAXLONG );
+    }
+    else if (snapshot.physical_capacity && snapshot.amperage_valid && snapshot.amperage_ma > 0)
+    {
+        rate = apple_current_to_mw( snapshot.amperage_ma, snapshot.voltage_mv );
+        bs->Rate = rate;
+    }
+
     return STATUS_SUCCESS;
 }
 
