@@ -953,9 +953,29 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetPriorityClass( HANDLE process )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH GetProcessGroupAffinity( HANDLE process, USHORT *count, USHORT *array )
 {
-    FIXME( "(%p,%p,%p): stub\n", process, count, array );
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
-    return FALSE;
+    ULONG_PTR affinity;
+    USHORT capacity = *count;
+
+    if (!set_ntstatus( NtQueryInformationProcess( process, ProcessAffinityMask, &affinity,
+                                                  sizeof(affinity), NULL )))
+        return FALSE;
+
+    /* Wine currently exposes a single processor group. */
+    if (!capacity)
+    {
+        *count = 1;
+        SetLastError( ERROR_INSUFFICIENT_BUFFER );
+        return FALSE;
+    }
+    if (!array)
+    {
+        SetLastError( ERROR_NOACCESS );
+        return FALSE;
+    }
+
+    array[0] = 0;
+    *count = 1;
+    return TRUE;
 }
 
 

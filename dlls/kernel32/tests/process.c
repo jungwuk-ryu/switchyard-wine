@@ -98,6 +98,7 @@ static BOOL   (WINAPI *pUpdateProcThreadAttribute)(struct _PROC_THREAD_ATTRIBUTE
 static void   (WINAPI *pDeleteProcThreadAttributeList)(struct _PROC_THREAD_ATTRIBUTE_LIST*);
 static DWORD  (WINAPI *pGetActiveProcessorCount)(WORD);
 static DWORD  (WINAPI *pGetMaximumProcessorCount)(WORD);
+static BOOL   (WINAPI *pGetProcessGroupAffinity)(HANDLE, USHORT *, USHORT *);
 static BOOL   (WINAPI *pGetProcessInformation)(HANDLE,PROCESS_INFORMATION_CLASS,void*,DWORD);
 static void (WINAPI *pClosePseudoConsole)(HPCON);
 static HRESULT (WINAPI *pCreatePseudoConsole)(COORD,HANDLE,HANDLE,DWORD,HPCON*);
@@ -290,6 +291,7 @@ static BOOL init(void)
     pDeleteProcThreadAttributeList = (void *)GetProcAddress(hkernel32, "DeleteProcThreadAttributeList");
     pGetActiveProcessorCount = (void *)GetProcAddress(hkernel32, "GetActiveProcessorCount");
     pGetMaximumProcessorCount = (void *)GetProcAddress(hkernel32, "GetMaximumProcessorCount");
+    pGetProcessGroupAffinity = (void *)GetProcAddress(hkernel32, "GetProcessGroupAffinity");
     pGetProcessInformation = (void *)GetProcAddress(hkernel32, "GetProcessInformation");
     pCreatePseudoConsole = (void *)GetProcAddress(hkernel32, "CreatePseudoConsole");
     pClosePseudoConsole = (void *)GetProcAddress(hkernel32, "ClosePseudoConsole");
@@ -2457,6 +2459,118 @@ static void test_ProcessorCount(void)
     ok(active <= maximum,
        "Number of active processors %li is greater than maximum number of processors %li\n",
        active, maximum);
+}
+
+static void test_GetProcessGroupAffinity(void)
+{
+    const DWORD error = 0xdeadbeef;
+    USHORT count, groups[2];
+    HANDLE process, event;
+    BOOL ret;
+
+    if (!pGetProcessGroupAffinity)
+    {
+        win_skip("GetProcessGroupAffinity is not available\n");
+        return;
+    }
+
+    groups[0] = groups[1] = 0xcccc;
+    count = 0;
+    SetLastError(error);
+    ret = pGetProcessGroupAffinity(GetCurrentProcess(), &count, groups);
+    ok(!ret, "GetProcessGroupAffinity succeeded with a zero capacity.\n");
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "Got error %lu.\n", GetLastError());
+    ok(count == 1, "Got required count %u.\n", count);
+    ok(groups[0] == 0xcccc && groups[1] == 0xcccc, "Group array was modified.\n");
+
+    count = 0;
+    SetLastError(error);
+    ret = pGetProcessGroupAffinity(GetCurrentProcess(), &count, NULL);
+    ok(!ret, "GetProcessGroupAffinity succeeded with a zero capacity and NULL array.\n");
+    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "Got error %lu.\n", GetLastError());
+    ok(count == 1, "Got required count %u.\n", count);
+
+    count = 1;
+    SetLastError(error);
+    ret = pGetProcessGroupAffinity(GetCurrentProcess(), &count, NULL);
+    ok(!ret, "GetProcessGroupAffinity succeeded with a NULL array.\n");
+    ok(GetLastError() == ERROR_NOACCESS, "Got error %lu.\n", GetLastError());
+    ok(count == 1, "Count changed to %u.\n", count);
+
+    groups[0] = groups[1] = 0xcccc;
+    count = 1;
+    SetLastError(error);
+    ret = pGetProcessGroupAffinity(GetCurrentProcess(), &count, groups);
+    ok(ret, "GetProcessGroupAffinity failed, error %lu.\n", GetLastError());
+    ok(GetLastError() == error, "Last error changed to %lu.\n", GetLastError());
+    ok(count == 1, "Got count %u.\n", count);
+    ok(groups[0] == 0 && groups[1] == 0xcccc, "Got groups {%u, %u}.\n",
+       groups[0], groups[1]);
+
+    groups[0] = groups[1] = 0xcccc;
+    count = ARRAY_SIZE(groups);
+    SetLastError(error);
+    ret = pGetProcessGroupAffinity(GetCurrentProcess(), &count, groups);
+    ok(ret, "GetProcessGroupAffinity failed, error %lu.\n", GetLastError());
+    ok(GetLastError() == error, "Last error changed to %lu.\n", GetLastError());
+    ok(count == 1, "Got count %u.\n", count);
+    ok(groups[0] == 0 && groups[1] == 0xcccc, "Got groups {%u, %u}.\n",
+       groups[0], groups[1]);
+
+    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentProcessId());
+    if (!process)
+        win_skip("PROCESS_QUERY_LIMITED_INFORMATION is not available, error %lu.\n",
+                 GetLastError());
+    else
+    {
+        count = 1;
+        groups[0] = 0xcccc;
+        SetLastError(error);
+        ret = pGetProcessGroupAffinity(process, &count, groups);
+        ok(ret, "GetProcessGroupAffinity failed, error %lu.\n", GetLastError());
+        ok(GetLastError() == error, "Last error changed to %lu.\n", GetLastError());
+        ok(count == 1 && groups[0] == 0, "Got count %u, group %u.\n", count, groups[0]);
+        CloseHandle(process);
+    }
+
+    process = NULL;
+    SetLastError(error);
+    ret = DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+                          &process, 0, FALSE, 0);
+    ok(ret, "DuplicateHandle failed, error %lu.\n", GetLastError());
+    if (ret)
+    {
+        count = 1;
+        groups[0] = 0xcccc;
+        SetLastError(error);
+        ret = pGetProcessGroupAffinity(process, &count, groups);
+        ok(!ret, "GetProcessGroupAffinity succeeded without query access.\n");
+        ok(GetLastError() == ERROR_ACCESS_DENIED, "Got error %lu.\n", GetLastError());
+        ok(count == 1 && groups[0] == 0xcccc, "Outputs were modified.\n");
+        CloseHandle(process);
+    }
+
+    event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(!!event, "CreateEventW failed, error %lu.\n", GetLastError());
+    if (event)
+    {
+        count = 1;
+        groups[0] = 0xcccc;
+        SetLastError(error);
+        ret = pGetProcessGroupAffinity(event, &count, groups);
+        ok(!ret, "GetProcessGroupAffinity succeeded with an event handle.\n");
+        ok(GetLastError() == ERROR_INVALID_HANDLE, "Got error %lu.\n", GetLastError());
+        ok(count == 1 && groups[0] == 0xcccc, "Outputs were modified.\n");
+        CloseHandle(event);
+    }
+
+    count = 1;
+    groups[0] = 0xcccc;
+    SetLastError(error);
+    ret = pGetProcessGroupAffinity(NULL, &count, groups);
+    ok(!ret, "GetProcessGroupAffinity succeeded with a NULL handle.\n");
+    ok(GetLastError() == ERROR_INVALID_HANDLE, "Got error %lu.\n", GetLastError());
+    ok(count == 1 && groups[0] == 0xcccc, "Outputs were modified.\n");
 }
 
 static void test_RegistryQuota(void)
@@ -5964,6 +6078,7 @@ START_TEST(process)
     test_IsWow64Process2();
     test_SystemInfo();
     test_ProcessorCount();
+    test_GetProcessGroupAffinity();
     test_RegistryQuota();
     test_DuplicateHandle();
     test_StdHandleInheritance();
