@@ -11623,9 +11623,9 @@ done:
 
 static void multiple_rendertargets_test(void)
 {
-    IDirect3DSurface9 *surf1, *surf2, *backbuf, *readback;
-    IDirect3DPixelShader9 *ps1, *ps2;
-    IDirect3DTexture9 *tex1, *tex2;
+    IDirect3DSurface9 *surf1, *surf2, *backbuf, *readback, *alpha_surf = NULL;
+    IDirect3DPixelShader9 *ps1, *ps2, *ps_alpha = NULL;
+    IDirect3DTexture9 *tex1, *tex2, *alpha_tex = NULL;
     IDirect3DVertexShader9 *vs;
     IDirect3DDevice9 *device;
     unsigned int color, i, j;
@@ -11658,6 +11658,15 @@ static void multiple_rendertargets_test(void)
         0x02000001, 0x800f0800, 0xa0e40000,                                     /* mov oC0, c0                */
         0x02000001, 0x800f0801, 0xa0e40001,                                     /* mov oC1, c1                */
         0x0000ffff                                                              /* end                        */
+    };
+    static const DWORD pshader_alpha_code[] =
+    {
+        0xffff0300,                                                             /* ps_3_0                          */
+        0x05000051, 0xa00f0000, 0x3e800000, 0x3f000000, 0x3f400000, 0x3e000000, /* def c0, 0.25, 0.5, 0.75, 0.125  */
+        0x05000051, 0xa00f0001, 0x00000000, 0x00000000, 0x00000000, 0x3f600000, /* def c1, 0.0, 0.0, 0.0, 0.875    */
+        0x02000001, 0x800f0800, 0xa0e40000,                                     /* mov oC0, c0                     */
+        0x02000001, 0x800f0801, 0xa0e40001,                                     /* mov oC1, c1                     */
+        0x0000ffff                                                              /* end                             */
     };
     static const float quad[] =
     {
@@ -11752,6 +11761,40 @@ static void multiple_rendertargets_test(void)
     ok(color_match(color, D3DCOLOR_ARGB(0xff, 0x00, 0x00, 0xff), 0),
             "Expected color 0x000000ff, got 0x%08x.\n", color);
 
+    if (!(caps.PrimitiveMiscCaps & D3DPMISCCAPS_MRTINDEPENDENTBITDEPTHS))
+    {
+        skip("Independent MRT bit depths are not supported, skipping alpha MRT test.\n");
+    }
+    else if (FAILED(hr = IDirect3DDevice9_CreateTexture(device, 16, 16, 1, D3DUSAGE_RENDERTARGET,
+            D3DFMT_A8, D3DPOOL_DEFAULT, &alpha_tex, NULL)))
+    {
+        skip("A8 render target textures are not supported, skipping alpha MRT test.\n");
+    }
+    else
+    {
+        hr = IDirect3DTexture9_GetSurfaceLevel(alpha_tex, 0, &alpha_surf);
+        ok(SUCCEEDED(hr), "GetSurfaceLevel failed, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_CreatePixelShader(device, pshader_alpha_code, &ps_alpha);
+        ok(SUCCEEDED(hr), "Failed to create pixel shader, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetRenderTarget(device, 1, alpha_surf);
+        ok(SUCCEEDED(hr), "Failed to set A8 render target, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetPixelShader(device, ps_alpha);
+        ok(SUCCEEDED(hr), "Failed to set pixel shader, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_BeginScene(device);
+        ok(SUCCEEDED(hr), "BeginScene failed, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, 3 * sizeof(float));
+        ok(SUCCEEDED(hr), "DrawPrimitiveUP failed, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_EndScene(device);
+        ok(SUCCEEDED(hr), "EndScene failed, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_GetRenderTargetData(device, surf1, readback);
+        ok(SUCCEEDED(hr), "GetRenderTargetData failed, hr %#lx.\n", hr);
+        color = getPixelColorFromSurface(readback, 8, 8);
+        ok(color_match(color, D3DCOLOR_ARGB(0x20, 0x40, 0x80, 0xbf), 0),
+                "Expected color 0x204080bf, got 0x%08x.\n", color);
+        hr = IDirect3DDevice9_SetRenderTarget(device, 1, surf2);
+        ok(SUCCEEDED(hr), "Failed to restore render target, hr %#lx.\n", hr);
+    }
+
     /* Render targets not written by the pixel shader should be unmodified. */
     hr = IDirect3DDevice9_SetPixelShader(device, ps1);
     ok(SUCCEEDED(hr), "Failed to set pixel shader, hr %#lx.\n", hr);
@@ -11834,11 +11877,17 @@ static void multiple_rendertargets_test(void)
 
     IDirect3DPixelShader9_Release(ps2);
     IDirect3DPixelShader9_Release(ps1);
+    if (ps_alpha)
+        IDirect3DPixelShader9_Release(ps_alpha);
     IDirect3DVertexShader9_Release(vs);
     IDirect3DTexture9_Release(tex1);
     IDirect3DTexture9_Release(tex2);
+    if (alpha_tex)
+        IDirect3DTexture9_Release(alpha_tex);
     IDirect3DSurface9_Release(surf1);
     IDirect3DSurface9_Release(surf2);
+    if (alpha_surf)
+        IDirect3DSurface9_Release(alpha_surf);
     IDirect3DSurface9_Release(backbuf);
     IDirect3DSurface9_Release(readback);
     refcount = IDirect3DDevice9_Release(device);
