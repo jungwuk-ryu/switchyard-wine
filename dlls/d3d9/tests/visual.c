@@ -27537,6 +27537,89 @@ static void test_filling_convention(void)
     DestroyWindow(window);
 }
 
+static void test_shader_reset(void)
+{
+    struct d3d9_test_context context;
+    IDirect3DPixelShader9 *shader;
+    IDirect3DDevice9 *device;
+    unsigned int color, i;
+    D3DCAPS9 caps;
+    HRESULT hr;
+
+    static const DWORD shader_code[] =
+    {
+        0xffff0200,                                                             /* ps_2_0                     */
+        0x05000051, 0xa00f0000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, /* def c0, 0.0, 1.0, 0.0, 1.0 */
+        0x02000001, 0x800f0800, 0xa0e40000,                                     /* mov oC0, c0                */
+        0x0000ffff                                                              /* end                        */
+    };
+    static const struct vec3 quad[] =
+    {
+        {-1.0f, -1.0f, 0.0f},
+        {-1.0f,  1.0f, 0.0f},
+        { 1.0f, -1.0f, 0.0f},
+        { 1.0f,  1.0f, 0.0f},
+    };
+
+    if (!init_test_context(&context))
+        return;
+    device = context.device;
+
+    hr = IDirect3DDevice9_GetDeviceCaps(device, &caps);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (caps.PixelShaderVersion < D3DPS_VERSION(2, 0))
+    {
+        skip("No ps_2_0 support, skipping shader reset test.\n");
+        release_test_context(&context);
+        return;
+    }
+
+    hr = IDirect3DDevice9_CreatePixelShader(device, shader_code, &shader);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        release_test_context(&context);
+        return;
+    }
+
+    for (i = 0; i < 2; ++i)
+    {
+        hr = IDirect3DDevice9_SetRenderState(device, D3DRS_ZENABLE, FALSE);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetRenderState(device, D3DRS_LIGHTING, FALSE);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetFVF(device, D3DFVF_XYZ);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetPixelShader(device, shader);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+        hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xffff0000, 0.0f, 0);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_BeginScene(device);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(*quad));
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_EndScene(device);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+        color = getPixelColor(device, 320, 240);
+        ok(color == 0x0000ff00, "Got color 0x%08x before reset iteration %u.\n", color, i);
+
+        if (!i)
+        {
+            hr = reset_device(&context);
+            ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        }
+    }
+
+    hr = IDirect3DDevice9_SetPixelShader(device, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    IDirect3DPixelShader9_Release(shader);
+    release_test_context(&context);
+}
+
 static void test_managed_reset(void)
 {
     struct d3d9_test_context context;
@@ -29453,6 +29536,7 @@ START_TEST(visual)
     test_sample_mask();
     test_dynamic_map_synchronization();
     test_filling_convention();
+    test_shader_reset();
     test_managed_reset();
     test_managed_generate_mipmap();
     test_mipmap_upload();
