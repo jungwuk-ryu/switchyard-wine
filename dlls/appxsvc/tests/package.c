@@ -45,6 +45,8 @@ static UINT64 (WINAPI *p_appx_package_inspection_get_expanded_size)(
     const APPX_PACKAGE_INSPECTION * );
 static HRESULT (WINAPI *p_appx_package_inspection_get_content_id)(
     const APPX_PACKAGE_INSPECTION *, BYTE *, UINT32 );
+static HRESULT (WINAPI *p_appx_package_inspection_get_signer_id)(
+    const APPX_PACKAGE_INSPECTION *, BYTE *, UINT32 );
 static HRESULT (WINAPI *p_appx_package_inspection_open_stream)(
     const APPX_PACKAGE_INSPECTION *, UINT32, WINE_APPX_ARCHIVE_STREAM ** );
 static HRESULT (WINAPI *p_wine_appx_archive_stream_read)(
@@ -271,7 +273,8 @@ static void test_signed_package( void )
     const APPX_MANIFEST *manifest;
     WINE_APPX_ARCHIVE_STREAM *stream;
     WCHAR path[MAX_PATH] = {0};
-    BYTE buffer[4096], content_id[APPX_PACKAGE_CONTENT_ID_SIZE], byte;
+    BYTE buffer[4096], content_id[APPX_PACKAGE_CONTENT_ID_SIZE];
+    BYTE signer_id[APPX_PACKAGE_SIGNER_ID_SIZE], byte;
     LARGE_INTEGER offset;
     UINT64 streamed;
     UINT32 count, i;
@@ -312,6 +315,13 @@ static void test_signed_package( void )
     for (i = 0; i < sizeof(content_id); i++)
         if (content_id[i]) break;
     ok( i != sizeof(content_id), "content id is all zero.\n" );
+    memset( signer_id, 0, sizeof(signer_id) );
+    hr = p_appx_package_inspection_get_signer_id(
+        inspection, signer_id, sizeof(signer_id) );
+    ok( hr == S_OK, "signer id returned %#lx.\n", hr );
+    for (i = 0; i < sizeof(signer_id); i++)
+        if (signer_id[i]) break;
+    ok( i != sizeof(signer_id), "signer id is all zero.\n" );
     for (i = 0; i < count; i++)
     {
         file_info = p_appx_package_inspection_get_file( inspection, i );
@@ -396,6 +406,7 @@ START_TEST(package)
     LOAD(appx_package_inspection_get_file);
     LOAD(appx_package_inspection_get_expanded_size);
     LOAD(appx_package_inspection_get_content_id);
+    LOAD(appx_package_inspection_get_signer_id);
     LOAD(appx_package_inspection_open_stream);
     LOAD(appx_manifest_get_identity);
     LOAD(wine_appx_archive_stream_read);
@@ -407,6 +418,8 @@ START_TEST(package)
         E_INVALIDARG, "invalid arguments were accepted.\n" );
     ok( p_appx_package_inspection_get_content_id( NULL, NULL, 0 ) ==
         E_INVALIDARG, "invalid content-id arguments were accepted.\n" );
+    ok( p_appx_package_inspection_get_signer_id( NULL, NULL, 0 ) ==
+        E_INVALIDARG, "invalid signer-id arguments were accepted.\n" );
     test_signed_package();
     FreeLibrary( module );
 }

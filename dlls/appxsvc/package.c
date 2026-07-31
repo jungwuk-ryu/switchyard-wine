@@ -55,6 +55,7 @@ struct appx_package_inspection
     UINT32 file_count;
     UINT64 expanded_size;
     BYTE content_id[APPX_PACKAGE_CONTENT_ID_SIZE];
+    BYTE signer_id[APPX_PACKAGE_SIGNER_ID_SIZE];
 };
 
 struct hash_engine
@@ -770,6 +771,9 @@ HRESULT WINAPI appx_package_inspect( HANDLE file,
     }
     memcpy( inspection->content_id, digests.package_contents,
             sizeof(inspection->content_id) );
+    if (FAILED(hr = appx_signature_get_signer_certificate_id(
+        signature, inspection->signer_id, sizeof(inspection->signer_id) )))
+        goto done;
     if (FAILED(hr = validate_block_map( archive, block_map, types,
                                         &inspection->files,
                                         &inspection->file_count,
@@ -838,6 +842,15 @@ HRESULT WINAPI appx_package_inspection_get_content_id(
     if (!inspection || !content_id || size != APPX_PACKAGE_CONTENT_ID_SIZE)
         return E_INVALIDARG;
     memcpy( content_id, inspection->content_id, size );
+    return S_OK;
+}
+
+HRESULT WINAPI appx_package_inspection_get_signer_id(
+    const APPX_PACKAGE_INSPECTION *inspection, BYTE *signer_id, UINT32 size )
+{
+    if (!inspection || !signer_id || size != APPX_PACKAGE_SIGNER_ID_SIZE)
+        return E_INVALIDARG;
+    memcpy( signer_id, inspection->signer_id, size );
     return S_OK;
 }
 

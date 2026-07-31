@@ -27,6 +27,7 @@
 
 #define APPX_SIGNATURE_MAX_SIZE                    (2 * 1024 * 1024)
 #define APPX_SIGNATURE_SHA256_SIZE                 32
+#define APPX_SIGNATURE_CERTIFICATE_ID_SIZE          APPX_SIGNATURE_SHA256_SIZE
 
 #define APPX_SIGNATURE_VERIFY_ALLOW_UNTRUSTED_CHAIN 0x00000001
 
@@ -76,6 +77,13 @@ void WINAPI appx_signature_free( APPX_SIGNATURE *signature );
 const struct appx_signature_digest_set * WINAPI appx_signature_get_digest_set(
     const APPX_SIGNATURE *signature );
 const WCHAR * WINAPI appx_signature_get_signer_subject( const APPX_SIGNATURE *signature );
+/*
+ * Return the SHA-256 digest of the exact DER signer certificate selected by
+ * the CMS signer identifier.  Publisher names alone are not a signer identity:
+ * bundle and inner-package trust binding must compare this value.
+ */
+HRESULT WINAPI appx_signature_get_signer_certificate_id(
+    const APPX_SIGNATURE *signature, BYTE *certificate_id, UINT32 size );
 /* Bind a manifest Identity Publisher DN to the verified signer subject. */
 HRESULT WINAPI appx_signature_check_publisher( const APPX_SIGNATURE *signature,
                                                const WCHAR *publisher );

@@ -41,6 +41,8 @@ static const struct appx_signature_digest_set *(WINAPI
     *p_appx_signature_get_digest_set)( const APPX_SIGNATURE * );
 static const WCHAR *(WINAPI *p_appx_signature_get_signer_subject)(
     const APPX_SIGNATURE * );
+static HRESULT (WINAPI *p_appx_signature_get_signer_certificate_id)(
+    const APPX_SIGNATURE *, BYTE *, UINT32 );
 static HRESULT (WINAPI *p_appx_signature_check_publisher)(
     const APPX_SIGNATURE *, const WCHAR * );
 static HRESULT (WINAPI *p_appx_signature_decode_digest_set)(
@@ -530,6 +532,7 @@ static void test_real_signature( void )
     struct appx_signature_digest_set recalculated;
     const struct appx_signature_digest_set *signed_set;
     BYTE signature_bytes[1655], tampered[1655];
+    BYTE signer_id[APPX_SIGNATURE_CERTIFICATE_ID_SIZE];
     const WCHAR *subject;
     APPX_SIGNATURE *signature = NULL;
     SIZE_T signature_size = 0, i;
@@ -576,6 +579,16 @@ static void test_real_signature( void )
     subject = p_appx_signature_get_signer_subject( signature );
     ok( subject && wcsstr( subject, L"CN=Microsoft Corporation" ),
         "got signer subject %s.\n", wine_dbgstr_w( subject ) );
+    memset( signer_id, 0, sizeof(signer_id) );
+    hr = p_appx_signature_get_signer_certificate_id(
+        signature, signer_id, sizeof(signer_id) );
+    ok( hr == S_OK, "signer certificate id returned %#lx.\n", hr );
+    for (i = 0; i < sizeof(signer_id); i++)
+        if (signer_id[i]) break;
+    ok( i != sizeof(signer_id), "signer certificate id is all zero.\n" );
+    ok( p_appx_signature_get_signer_certificate_id(
+            signature, signer_id, sizeof(signer_id) - 1 ) == E_INVALIDARG,
+        "accepted a short signer certificate id buffer.\n" );
     hr = p_appx_signature_check_publisher(
         signature,
         L"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" );
@@ -656,6 +669,9 @@ START_TEST( signature )
         (void *)GetProcAddress( module, "appx_signature_get_digest_set" );
     p_appx_signature_get_signer_subject =
         (void *)GetProcAddress( module, "appx_signature_get_signer_subject" );
+    p_appx_signature_get_signer_certificate_id =
+        (void *)GetProcAddress( module,
+                               "appx_signature_get_signer_certificate_id" );
     p_appx_signature_check_publisher =
         (void *)GetProcAddress( module, "appx_signature_check_publisher" );
     p_appx_signature_decode_digest_set =
@@ -669,6 +685,7 @@ START_TEST( signature )
     if (!p_appx_signature_parse_and_verify || !p_appx_signature_free ||
         !p_appx_signature_get_digest_set ||
         !p_appx_signature_get_signer_subject ||
+        !p_appx_signature_get_signer_certificate_id ||
         !p_appx_signature_check_publisher ||
         !p_appx_signature_decode_digest_set ||
         !p_appx_signature_decode_indirect_data ||
@@ -688,6 +705,8 @@ START_TEST( signature )
     p_appx_signature_free( NULL );
     ok( !p_appx_signature_get_digest_set( NULL ), "NULL signature returned digests.\n" );
     ok( !p_appx_signature_get_signer_subject( NULL ), "NULL signature returned a subject.\n" );
+    ok( p_appx_signature_get_signer_certificate_id( NULL, NULL, 0 ) ==
+        E_INVALIDARG, "accepted invalid signer certificate id arguments.\n" );
     ok( p_appx_signature_verify_digest_set( NULL, NULL ) == E_INVALIDARG,
         "accepted NULL signature digest comparison.\n" );
     FreeLibrary( module );

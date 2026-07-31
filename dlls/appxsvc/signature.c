@@ -63,6 +63,7 @@ static const WCHAR sha256_algorithm[] = { 'S', 'H', 'A', '2', '5', '6', 0 };
 struct appx_signature
 {
     struct appx_signature_digest_set digests;
+    BYTE signer_certificate_id[APPX_SIGNATURE_CERTIFICATE_ID_SIZE];
     WCHAR *signer_subject;
     CERT_NAME_BLOB signer_subject_name;
 };
@@ -906,6 +907,21 @@ static HRESULT copy_signer_subject( PCCERT_CONTEXT certificate,
     return S_OK;
 }
 
+static HRESULT copy_signer_certificate_id( PCCERT_CONTEXT certificate,
+                                           struct appx_signature *signature )
+{
+    DWORD size = sizeof(signature->signer_certificate_id);
+
+    if (!certificate->pbCertEncoded || !certificate->cbCertEncoded ||
+        !CryptHashCertificate2( sha256_algorithm, 0, NULL,
+                                certificate->pbCertEncoded,
+                                certificate->cbCertEncoded,
+                                signature->signer_certificate_id, &size ) ||
+        size != sizeof(signature->signer_certificate_id))
+        return crypto_error( TRUST_E_SUBJECT_NOT_TRUSTED );
+    return S_OK;
+}
+
 HRESULT WINAPI appx_signature_decode_digest_set(
     const BYTE *data, SIZE_T size, struct appx_signature_digest_set *set )
 {
@@ -1075,6 +1091,8 @@ HRESULT WINAPI appx_signature_parse_and_verify( const BYTE *data, SIZE_T size,
     }
     if (FAILED( hr = verify_certificate_chain( signer_certificate,
                                              certificate_store, flags ) ) ||
+        FAILED( hr = copy_signer_certificate_id( signer_certificate,
+                                                 signature ) ) ||
         FAILED( hr = copy_signer_subject( signer_certificate, signature ) ))
         goto done;
 
@@ -1112,6 +1130,16 @@ const WCHAR * WINAPI appx_signature_get_signer_subject(
     const APPX_SIGNATURE *signature )
 {
     return signature ? signature->signer_subject : NULL;
+}
+
+HRESULT WINAPI appx_signature_get_signer_certificate_id(
+    const APPX_SIGNATURE *signature, BYTE *certificate_id, UINT32 size )
+{
+    if (!signature || !certificate_id ||
+        size != APPX_SIGNATURE_CERTIFICATE_ID_SIZE)
+        return E_INVALIDARG;
+    memcpy( certificate_id, signature->signer_certificate_id, size );
+    return S_OK;
 }
 
 static HRESULT cert_str_to_name_supports_reverse( BOOL *supported )

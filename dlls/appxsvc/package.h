@@ -35,6 +35,7 @@
 #define APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN 0x00000001
 #define APPX_PACKAGE_MAX_CODE_INTEGRITY_SIZE       (256u * 1024 * 1024)
 #define APPX_PACKAGE_CONTENT_ID_SIZE               32
+#define APPX_PACKAGE_SIGNER_ID_SIZE                32
 
 typedef struct appx_package_inspection APPX_PACKAGE_INSPECTION;
 
@@ -70,6 +71,8 @@ UINT64 WINAPI appx_package_inspection_get_expanded_size(
     const APPX_PACKAGE_INSPECTION *inspection );
 HRESULT WINAPI appx_package_inspection_get_content_id(
     const APPX_PACKAGE_INSPECTION *inspection, BYTE *content_id, UINT32 size );
+HRESULT WINAPI appx_package_inspection_get_signer_id(
+    const APPX_PACKAGE_INSPECTION *inspection, BYTE *signer_id, UINT32 size );
 
 /*
  * Streams are available only for files in the fully reconciled block map.
