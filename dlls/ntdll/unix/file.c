@@ -6972,57 +6972,47 @@ NTSTATUS WINAPI NtCancelSynchronousIoFile( HANDLE handle, IO_STATUS_BLOCK *io, I
  */
 NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void* apc_user,
                             IO_STATUS_BLOCK *io_status, LARGE_INTEGER *offset,
-                            LARGE_INTEGER *count, ULONG *key, BOOLEAN dont_wait, BOOLEAN exclusive )
+                            LARGE_INTEGER *count, ULONG key, BOOLEAN dont_wait, BOOLEAN exclusive )
 {
-    static int warn;
-    unsigned int ret;
-    HANDLE handle;
-    BOOLEAN async;
+    struct file_lock_params params;
+    struct async_irp *async;
+    unsigned int status;
+    HANDLE wait_handle;
+    ULONG options;
 
-    if (apc || io_status || key)
-    {
-        FIXME("Unimplemented yet parameter\n");
-        return STATUS_NOT_IMPLEMENTED;
-    }
-    if (apc_user && !warn++) FIXME("I/O completion on lock not implemented yet\n");
+    TRACE( "(%p,%p,%p,%p,%p,%s,%s,%x,%u,%u)\n", file, event, apc, apc_user,
+           io_status, wine_dbgstr_longlong( offset->QuadPart ),
+           wine_dbgstr_longlong( count->QuadPart ), key, dont_wait, exclusive );
 
-    for (;;)
+    if (!io_status) return STATUS_ACCESS_VIOLATION;
+    if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion, file )))
+        return STATUS_NO_MEMORY;
+    async->buffer = NULL;
+    async->size = 0;
+    params.offset = offset->QuadPart;
+    params.count = count->QuadPart;
+    params.key = key;
+    params.shared = !exclusive;
+
+    SERVER_START_REQ( lock_file )
     {
-        SERVER_START_REQ( lock_file )
+        req->async  = server_async( file, &async->io, event, apc, apc_user,
+                                    iosb_client_ptr( io_status ));
+        req->wait   = !dont_wait;
+        wine_server_add_data( req, &params, sizeof(params) );
+        status = wine_server_call( req );
+        wait_handle = wine_server_ptr_handle( reply->wait );
+        options = reply->options;
+        if (reply->completed)
         {
-            req->handle      = wine_server_obj_handle( file );
-            req->offset      = offset->QuadPart;
-            req->count       = count->QuadPart;
-            req->shared      = !exclusive;
-            req->wait        = !dont_wait;
-            ret = wine_server_call( req );
-            handle = wine_server_ptr_handle( reply->handle );
-            async  = reply->overlapped;
-        }
-        SERVER_END_REQ;
-        if (ret != STATUS_PENDING)
-        {
-            if (!ret && event) NtSetEvent( event, NULL );
-            return ret;
-        }
-        if (async)
-        {
-            FIXME( "Async I/O lock wait not implemented, might deadlock\n" );
-            if (handle) NtClose( handle );
-            return STATUS_PENDING;
-        }
-        if (handle)
-        {
-            NtWaitForSingleObject( handle, FALSE, NULL );
-            NtClose( handle );
-        }
-        else  /* Unix lock conflict, sleep a bit and retry */
-        {
-            LARGE_INTEGER time;
-            time.QuadPart = -100 * (ULONGLONG)10000;
-            NtDelayExecution( FALSE, &time );
+            set_sync_iosb( io_status, status, 0, options );
         }
     }
+    SERVER_END_REQ;
+
+    if (status != STATUS_PENDING) free( async );
+    if (wait_handle) status = wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+    return status;
 }
 
 
@@ -7030,25 +7020,22 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
  *           NtUnlockFile   (NTDLL.@)
  */
 NTSTATUS WINAPI NtUnlockFile( HANDLE handle, IO_STATUS_BLOCK *io_status, LARGE_INTEGER *offset,
-                              LARGE_INTEGER *count, ULONG *key )
+                              LARGE_INTEGER *count, ULONG key )
 {
     unsigned int status;
 
     TRACE( "%p %p %s %s\n",
            handle, io_status, wine_dbgstr_longlong(offset->QuadPart), wine_dbgstr_longlong(count->QuadPart) );
 
+    if (!io_status) return STATUS_ACCESS_VIOLATION;
     io_status->Information = 0;
-    if (key)
-    {
-        FIXME("Unimplemented yet parameter\n");
-        return (io_status->Status = STATUS_NOT_IMPLEMENTED);
-    }
 
     SERVER_START_REQ( unlock_file )
     {
         req->handle = wine_server_obj_handle( handle );
         req->offset = offset->QuadPart;
         req->count  = count->QuadPart;
+        req->key    = key;
         status = wine_server_call( req );
     }
     SERVER_END_REQ;

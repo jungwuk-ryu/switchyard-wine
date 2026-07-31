@@ -830,17 +830,16 @@ static void dump_get_volume_info_reply( const struct get_volume_info_reply *req 
 
 static void dump_lock_file_request( const struct lock_file_request *req )
 {
-    fprintf( stderr, " handle=%04x", req->handle );
-    dump_uint64( ", offset=", &req->offset );
-    dump_uint64( ", count=", &req->count );
-    fprintf( stderr, ", shared=%d", req->shared );
+    dump_async_data( " async=", &req->async );
     fprintf( stderr, ", wait=%d", req->wait );
+    dump_varargs_bytes( ", params=", cur_size );
 }
 
 static void dump_lock_file_reply( const struct lock_file_reply *req )
 {
-    fprintf( stderr, " handle=%04x", req->handle );
-    fprintf( stderr, ", overlapped=%d", req->overlapped );
+    fprintf( stderr, " wait=%04x", req->wait );
+    fprintf( stderr, ", options=%08x", req->options );
+    fprintf( stderr, ", completed=%d", req->completed );
 }
 
 static void dump_unlock_file_request( const struct unlock_file_request *req )
@@ -848,6 +847,7 @@ static void dump_unlock_file_request( const struct unlock_file_request *req )
     fprintf( stderr, " handle=%04x", req->handle );
     dump_uint64( ", offset=", &req->offset );
     dump_uint64( ", count=", &req->count );
+    fprintf( stderr, ", key=%08x", req->key );
 }
 
 static void dump_recv_socket_request( const struct recv_socket_request *req )
@@ -4703,6 +4703,7 @@ static const struct
     { "INVALID_IMAGE_PROTECT",       STATUS_INVALID_IMAGE_PROTECT },
     { "INVALID_IMAGE_WIN_16",        STATUS_INVALID_IMAGE_WIN_16 },
     { "INVALID_IMAGE_WIN_64",        STATUS_INVALID_IMAGE_WIN_64 },
+    { "INVALID_LOCK_RANGE",          STATUS_INVALID_LOCK_RANGE },
     { "INVALID_LOCK_SEQUENCE",       STATUS_INVALID_LOCK_SEQUENCE },
     { "INVALID_OWNER",               STATUS_INVALID_OWNER },
     { "INVALID_PARAMETER",           STATUS_INVALID_PARAMETER },
@@ -4716,6 +4717,7 @@ static const struct
     { "IO_TIMEOUT",                  STATUS_IO_TIMEOUT },
     { "KERNEL_APC",                  STATUS_KERNEL_APC },
     { "KEY_DELETED",                 STATUS_KEY_DELETED },
+    { "LOCK_NOT_GRANTED",            STATUS_LOCK_NOT_GRANTED },
     { "MAPPED_FILE_SIZE_ZERO",       STATUS_MAPPED_FILE_SIZE_ZERO },
     { "MORE_ENTRIES",                STATUS_MORE_ENTRIES },
     { "MUTANT_NOT_OWNED",            STATUS_MUTANT_NOT_OWNED },

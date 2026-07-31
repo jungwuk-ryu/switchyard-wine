@@ -694,12 +694,30 @@ DECL_HANDLER(alloc_file_handle)
 /* lock a region of a file */
 DECL_HANDLER(lock_file)
 {
+    const struct file_lock_params *params = get_req_data();
     struct file *file;
+    struct async *async;
 
-    if ((file = get_file_obj( current->process, req->handle, 0 )))
+    reply->completed = 0;
+    if (get_req_data_size() != sizeof(*params))
     {
-        reply->handle = lock_fd( file->fd, req->offset, req->count, req->shared, req->wait );
-        reply->overlapped = is_fd_overlapped( file->fd );
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+
+    if ((file = get_file_obj( current->process, req->async.handle, 0 )))
+    {
+        if ((async = create_request_async( file->fd, get_fd_comp_flags( file->fd ),
+                                           &req->async, 0 )))
+        {
+            lock_fd( file->fd, async, params->offset, params->count, params->key,
+                     params->shared, req->wait );
+            if (get_error() != STATUS_PENDING) async_clear_user_apc( async );
+            reply->wait = async_handoff( async, NULL, 0 );
+            reply->options = get_fd_options( file->fd );
+            reply->completed = get_error() != STATUS_PENDING;
+            release_object( async );
+        }
         release_object( file );
     }
 }
@@ -711,7 +729,7 @@ DECL_HANDLER(unlock_file)
 
     if ((file = get_file_obj( current->process, req->handle, 0 )))
     {
-        unlock_fd( file->fd, req->offset, req->count );
+        unlock_fd( file->fd, req->offset, req->count, req->key );
         release_object( file );
     }
 }

@@ -142,6 +142,7 @@ struct fd
     struct closed_fd    *closed;      /* structure to store the unix fd at destroy time */
     struct object       *user;        /* object using this file descriptor */
     struct list          locks;       /* list of locks on this fd */
+    struct list          lock_waiters;/* list of pending locks on this fd */
     client_ptr_t         map_addr;    /* default mapping address for PE files */
     mem_size_t           map_size;    /* mapping size for PE files */
     unsigned int         access;      /* file access (FILE_READ_DATA etc.) */
@@ -244,7 +245,15 @@ struct inode
     ino_t               ino;        /* inode number */
     struct list         open;       /* list of open file descriptors */
     struct list         locks;      /* list of file locks */
+    struct list         lock_waiters; /* list of pending file locks */
     struct list         closed;     /* list of file descriptors to close at destroy time */
+    struct list         process_lock_retry_entry; /* process cleanup retry list entry */
+    struct timeout_user *lock_timeout; /* retry timer for external Unix locks */
+    struct fd          *process_lock_fd; /* fd retained during process lock cleanup */
+    file_pos_t          process_lock_start; /* cleanup range start */
+    file_pos_t          process_lock_end; /* inclusive cleanup range end */
+    unsigned int        process_lock_retry_pending : 1;
+    unsigned int        process_lock_have_range : 1;
 };
 
 static void inode_dump( struct object *obj, int verbose );
@@ -280,33 +289,46 @@ static const struct object_ops inode_ops =
 struct file_lock
 {
     struct object       obj;         /* object header */
-    struct object      *sync;        /* sync object for wait/signal */
     struct fd          *fd;          /* fd owning this lock */
     struct list         fd_entry;    /* entry in list of locks on a given fd */
     struct list         inode_entry; /* entry in inode list of locks */
     int                 shared;      /* shared lock? */
     file_pos_t          start;       /* locked region is interval [start;end) */
     file_pos_t          end;
+    unsigned int        key;         /* caller-supplied lock key */
     struct process     *process;     /* process owning this lock */
     struct list         proc_entry;  /* entry in list of locks owned by the process */
 };
 
+struct file_lock_wait
+{
+    struct list         inode_entry; /* entry in inode pending lock list */
+    struct list         fd_entry;    /* entry in fd pending lock list */
+    struct inode       *inode;       /* inode being locked */
+    struct fd          *fd;          /* fd being locked, NULL after fd teardown */
+    struct process     *process;     /* process that requested the lock */
+    struct async       *async;       /* async request, owned by fd wait queue */
+    file_pos_t          start;       /* requested interval [start;end) */
+    file_pos_t          end;
+    unsigned int        key;
+    unsigned int        shared : 1;
+    unsigned int        active : 1;  /* present in inode and fd lists */
+};
+
 static void file_lock_dump( struct object *obj, int verbose );
-static struct object *file_lock_get_sync( struct object *obj );
-static void file_lock_destroy( struct object *obj );
 
 static const struct object_ops file_lock_ops =
 {
     sizeof(struct file_lock),   /* size */
     &no_type,                   /* type */
     file_lock_dump,             /* dump */
-    NULL,                       /* add_queue */
+    no_add_queue,               /* add_queue */
     NULL,                       /* remove_queue */
     NULL,                       /* signaled */
     NULL,                       /* satisfied */
     no_signal,                  /* signal */
     no_get_fd,                  /* get_fd */
-    file_lock_get_sync,         /* get_sync */
+    default_get_sync,           /* get_sync */
     default_map_access,         /* map_access */
     default_get_sd,             /* get_sd */
     default_set_sd,             /* set_sd */
@@ -317,7 +339,7 @@ static const struct object_ops file_lock_ops =
     no_open_file,               /* open_file */
     no_kernel_obj_list,         /* get_kernel_obj_list */
     no_close_handle,            /* close_handle */
-    file_lock_destroy,          /* destroy */
+    no_destroy                  /* destroy */
 };
 
 
@@ -1167,6 +1189,11 @@ static void inode_destroy( struct object *obj )
 
     assert( list_empty(&inode->open) );
     assert( list_empty(&inode->locks) );
+    assert( list_empty(&inode->lock_waiters) );
+    assert( !inode->lock_timeout );
+    assert( !inode->process_lock_retry_pending );
+    assert( !inode->process_lock_fd );
+    assert( !inode->process_lock_have_range );
 
     list_remove( &inode->entry );
 
@@ -1208,7 +1235,15 @@ static struct inode *get_inode( dev_t dev, ino_t ino, int unix_fd )
         inode->ino    = ino;
         list_init( &inode->open );
         list_init( &inode->locks );
+        list_init( &inode->lock_waiters );
         list_init( &inode->closed );
+        list_init( &inode->process_lock_retry_entry );
+        inode->lock_timeout = NULL;
+        inode->process_lock_fd = NULL;
+        inode->process_lock_start = FILE_POS_T_MAX;
+        inode->process_lock_end = 0;
+        inode->process_lock_retry_pending = 0;
+        inode->process_lock_have_range = 0;
         list_add_head( &device->inode_hash[hash], &inode->entry );
     }
     else release_object( device );
@@ -1263,26 +1298,12 @@ static void inode_add_closed_fd( struct inode *inode, struct closed_fd *fd )
 static void file_lock_dump( struct object *obj, int verbose )
 {
     struct file_lock *lock = (struct file_lock *)obj;
-    fprintf( stderr, "Lock %s fd=%p proc=%p start=",
-             lock->shared ? "shared" : "excl", lock->fd, lock->process );
+    fprintf( stderr, "Lock %s fd=%p proc=%p key=%08x start=",
+             lock->shared ? "shared" : "excl", lock->fd, lock->process, lock->key );
     DUMP_LONG_LONG( lock->start );
     fprintf( stderr, " end=" );
     DUMP_LONG_LONG( lock->end );
     fprintf( stderr, "\n" );
-}
-
-static struct object *file_lock_get_sync( struct object *obj )
-{
-    struct file_lock *lock = (struct file_lock *)obj;
-    assert( obj->ops == &file_lock_ops );
-    return grab_object( lock->sync );
-}
-
-static void file_lock_destroy( struct object *obj )
-{
-    struct file_lock *lock = (struct file_lock *)obj;
-    assert( obj->ops == &file_lock_ops );
-    if (lock->sync) release_object( lock->sync );
 }
 
 /* set (or remove) a Unix lock if possible for the given range */
@@ -1350,34 +1371,53 @@ static int set_unix_lock( struct fd *fd, file_pos_t start, file_pos_t end, int t
     }
 }
 
-/* check if interval [start;end) overlaps the lock */
-static inline int lock_overlaps( struct file_lock *lock, file_pos_t start, file_pos_t end )
+static inline int lock_ranges_overlap( file_pos_t first_start, file_pos_t first_end,
+                                       file_pos_t second_start, file_pos_t second_end )
 {
-    if (lock->end && start >= lock->end) return 0;
-    if (end && lock->start >= end) return 0;
+    /* {0,0} is a point at the beginning of the file, not an unbounded range. */
+    if ((!first_start && !first_end) || (!second_start && !second_end)) return 0;
+    if (first_end && second_start >= first_end) return 0;
+    if (second_end && first_start >= second_end) return 0;
     return 1;
 }
 
-/* remove Unix locks for all bytes in the specified area that are no longer locked */
-static void remove_unix_locks( struct fd *fd, file_pos_t start, file_pos_t end )
+/* check if interval [start;end) overlaps the lock */
+static inline int lock_overlaps( struct file_lock *lock, file_pos_t start, file_pos_t end )
 {
-    struct hole
-    {
-        struct hole *next;
-        struct hole *prev;
-        file_pos_t   start;
-        file_pos_t   end;
-    } *first, *cur, *next, *buffer;
+    return lock_ranges_overlap( lock->start, lock->end, start, end );
+}
 
+struct lock_interval
+{
+    file_pos_t start;
+    file_pos_t end;
+};
+
+static int compare_lock_intervals( const void *left, const void *right )
+{
+    const struct lock_interval *a = left;
+    const struct lock_interval *b = right;
+
+    if (a->start != b->start) return (a->start > b->start) - (a->start < b->start);
+    return (a->end > b->end) - (a->end < b->end);
+}
+
+/*
+ * Apply a Unix lock to portions of a range not already covered by a server
+ * lock.  Sort and merge the covered ranges so fragmented lock sets do not
+ * require repeatedly scanning a growing list of holes.
+ */
+static int set_unix_lock_holes( struct fd *fd, file_pos_t start, file_pos_t end, int type )
+{
+    struct lock_interval *ranges, *holes;
     struct file_lock *lock;
-    int count = 0;
+    file_pos_t cursor;
+    size_t count = 0, hole_count = 0, i;
+    unsigned int status;
 
-    if (!fd->inode) return;
-    if (!fd->fs_locks) return;
-    if (start == end || start > max_unix_offset) return;
+    if (!fd->inode || !fd->fs_locks) return 1;
+    if (start == end || start > max_unix_offset) return 1;
     if (!end || end > max_unix_offset) end = max_unix_offset + 1;
-
-    /* count the number of locks overlapping the specified area */
 
     LIST_FOR_EACH_ENTRY( lock, &fd->inode->locks, struct file_lock, inode_entry )
     {
@@ -1385,93 +1425,114 @@ static void remove_unix_locks( struct fd *fd, file_pos_t start, file_pos_t end )
         if (lock_overlaps( lock, start, end )) count++;
     }
 
-    if (!count)  /* no locks at all, we can unlock everything */
+    if (!count) return set_unix_lock( fd, start, end, type );
+    if (count == ~(size_t)0 || count + 1 > ~(size_t)0 / sizeof(*holes) ||
+        count > ~(size_t)0 / sizeof(*ranges))
     {
-        set_unix_lock( fd, start, end, F_UNLCK );
-        return;
+        set_error( STATUS_NO_MEMORY );
+        return 0;
+    }
+    if (!(ranges = mem_alloc( sizeof(*ranges) * count ))) return 0;
+    if (!(holes = mem_alloc( sizeof(*holes) * (count + 1) )))
+    {
+        free( ranges );
+        return 0;
     }
 
-    /* allocate space for the list of holes */
-    /* max. number of holes is number of locks + 1 */
-
-    if (!(buffer = malloc( sizeof(*buffer) * (count+1) ))) return;
-    first = buffer;
-    first->next  = NULL;
-    first->prev  = NULL;
-    first->start = start;
-    first->end   = end;
-    next = first + 1;
-
-    /* build a sorted list of unlocked holes in the specified area */
-
+    i = 0;
     LIST_FOR_EACH_ENTRY( lock, &fd->inode->locks, struct file_lock, inode_entry )
     {
         if (lock->start == lock->end) continue;
         if (!lock_overlaps( lock, start, end )) continue;
+        ranges[i].start = lock->start > start ? lock->start : start;
+        ranges[i].end = !lock->end || lock->end > end ? end : lock->end;
+        i++;
+    }
+    assert( i == count );
+    qsort( ranges, count, sizeof(*ranges), compare_lock_intervals );
 
-        /* go through all the holes touched by this lock */
-        for (cur = first; cur; cur = cur->next)
+    cursor = start;
+    for (i = 0; i < count && cursor < end; i++)
+    {
+        if (ranges[i].start > cursor)
         {
-            if (cur->end <= lock->start) continue; /* hole is before start of lock */
-            if (lock->end && cur->start >= lock->end) break;  /* hole is after end of lock */
-
-            /* now we know that lock is overlapping hole */
-
-            if (cur->start >= lock->start)  /* lock starts before hole, shrink from start */
-            {
-                cur->start = lock->end;
-                if (cur->start && cur->start < cur->end) break;  /* done with this lock */
-                /* now hole is empty, remove it */
-                if (cur->next) cur->next->prev = cur->prev;
-                if (cur->prev) cur->prev->next = cur->next;
-                else if (!(first = cur->next)) goto done;  /* no more holes at all */
-            }
-            else if (!lock->end || cur->end <= lock->end)  /* lock larger than hole, shrink from end */
-            {
-                cur->end = lock->start;
-                assert( cur->start < cur->end );
-            }
-            else  /* lock is in the middle of hole, split hole in two */
-            {
-                next->prev = cur;
-                next->next = cur->next;
-                cur->next = next;
-                next->start = lock->end;
-                next->end = cur->end;
-                cur->end = lock->start;
-                assert( next->start < next->end );
-                assert( cur->end < next->start );
-                next++;
-                break;  /* done with this lock */
-            }
+            holes[hole_count].start = cursor;
+            holes[hole_count++].end = ranges[i].start;
         }
+        if (ranges[i].end > cursor) cursor = ranges[i].end;
+    }
+    if (cursor < end)
+    {
+        holes[hole_count].start = cursor;
+        holes[hole_count++].end = end;
     }
 
-    /* clear Unix locks for all the holes */
+    for (i = 0; i < hole_count; i++)
+    {
+        if (set_unix_lock( fd, holes[i].start, holes[i].end, type )) continue;
 
-    for (cur = first; cur; cur = cur->next)
-        set_unix_lock( fd, cur->start, cur->end, F_UNLCK );
+        status = get_error();
+        if (type != F_UNLCK)
+        {
+            while (i)
+            {
+                i--;
+                set_unix_lock( fd, holes[i].start, holes[i].end, F_UNLCK );
+            }
+        }
+        free( holes );
+        free( ranges );
+        set_error( status );
+        return 0;
+    }
 
- done:
-    free( buffer );
+    free( holes );
+    free( ranges );
+    return 1;
+}
+
+/*
+ * Reapplying a read lock over read-locked bytes is safe.  Only build coverage
+ * holes when an overlapping exclusive lock would otherwise be downgraded.
+ */
+static int set_unix_shared_lock( struct fd *fd, file_pos_t start, file_pos_t end )
+{
+    struct file_lock *lock;
+
+    if (fd->inode && (!(fd->access & FILE_UNIX_WRITE_ACCESS) ||
+                      (fd->access & FILE_UNIX_READ_ACCESS)))
+    {
+        LIST_FOR_EACH_ENTRY( lock, &fd->inode->locks, struct file_lock, inode_entry )
+        {
+            if (lock->shared || lock->start == lock->end) continue;
+            if (lock_overlaps( lock, start, end ))
+                return set_unix_lock_holes( fd, start, end, F_RDLCK );
+        }
+        return set_unix_lock( fd, start, end, F_RDLCK );
+    }
+    return set_unix_lock_holes( fd, start, end, F_RDLCK );
 }
 
 /* create a new lock on a fd */
-static struct file_lock *add_lock( struct fd *fd, int shared, file_pos_t start, file_pos_t end )
+static struct file_lock *add_lock( struct fd *fd, struct process *process, unsigned int key,
+                                   int shared, file_pos_t start, file_pos_t end )
 {
     struct file_lock *lock;
 
     if (!(lock = alloc_object( &file_lock_ops ))) return NULL;
-    lock->sync    = NULL;
     lock->shared  = shared;
     lock->start   = start;
     lock->end     = end;
+    lock->key     = key;
     lock->fd      = fd;
-    lock->process = current->process;
+    lock->process = process;
 
-    if (!(lock->sync = create_internal_sync( 1, 0 ))) goto error;
     /* now try to set a Unix lock */
-    if (!set_unix_lock( lock->fd, lock->start, lock->end, lock->shared ? F_RDLCK : F_WRLCK )) goto error;
+    if (lock->shared)
+    {
+        if (!set_unix_shared_lock( lock->fd, lock->start, lock->end )) goto error;
+    }
+    else if (!set_unix_lock( lock->fd, lock->start, lock->end, F_WRLCK )) goto error;
     list_add_tail( &fd->locks, &lock->fd_entry );
     list_add_tail( &fd->inode->locks, &lock->inode_entry );
     list_add_tail( &lock->process->locks, &lock->proc_entry );
@@ -1482,30 +1543,557 @@ error:
     return NULL;
 }
 
+struct lock_range_event
+{
+    file_pos_t pos;
+    unsigned int shared : 1;
+    unsigned int start : 1;
+};
+
+static int compare_lock_range_events( const void *left, const void *right )
+{
+    const struct lock_range_event *a = left;
+    const struct lock_range_event *b = right;
+
+    return (a->pos > b->pos) - (a->pos < b->pos);
+}
+
+static int fd_supports_unix_lock( struct fd *fd, int type )
+{
+    if (fd->unix_fd == -1 || !fd->fs_locks) return 0;
+    if (type == F_UNLCK) return 1;
+    if (type == F_RDLCK)
+        return !(fd->access & FILE_UNIX_WRITE_ACCESS) ||
+               (fd->access & FILE_UNIX_READ_ACCESS);
+    return !!(fd->access & FILE_UNIX_WRITE_ACCESS);
+}
+
+static struct fd *find_unix_lock_fd( struct inode *inode, struct fd *preferred, int type )
+{
+    struct fd *fd;
+
+    if (fd_supports_unix_lock( preferred, type )) return preferred;
+
+    LIST_FOR_EACH_ENTRY( fd, &inode->open, struct fd, inode_entry )
+    {
+        if (fd_supports_unix_lock( fd, type )) return fd;
+    }
+    return NULL;
+}
+
+static void set_reconciled_unix_lock( struct fd *unlock_fd, struct fd *read_fd,
+                                      struct fd *write_fd, file_pos_t start, file_pos_t end,
+                                      size_t shared_count, size_t exclusive_count )
+{
+    struct fd *lock_fd;
+
+    if (exclusive_count)
+    {
+        if ((lock_fd = write_fd ? write_fd : read_fd))
+            set_unix_lock( lock_fd, start, end, F_WRLCK );
+    }
+    else if (shared_count)
+    {
+        if (read_fd) set_unix_lock( read_fd, start, end, F_RDLCK );
+    }
+    else set_unix_lock( unlock_fd, start, end, F_UNLCK );
+}
+
+/*
+ * Rebuild the Unix lock strength after removing one or more server locks.
+ * Remaining exclusive segments use write locks, shared-only segments use
+ * read locks, and uncovered segments are unlocked.
+ */
+static void reconcile_unix_locks( struct fd *fd, file_pos_t start, file_pos_t end )
+{
+    struct lock_range_event *events;
+    struct file_lock *lock;
+    struct inode *inode = fd->inode;
+    struct fd *read_fd, *write_fd, *unlock_fd;
+    file_pos_t pos;
+    size_t count = 0, event_count, i, j;
+    size_t shared_count = 0, exclusive_count = 0;
+
+    if (!inode) return;
+    if (start == end || start > max_unix_offset) return;
+    if (!end || end > max_unix_offset) end = max_unix_offset + 1;
+    if (!(unlock_fd = find_unix_lock_fd( inode, fd, F_UNLCK ))) return;
+
+    LIST_FOR_EACH_ENTRY( lock, &inode->locks, struct file_lock, inode_entry )
+    {
+        if (lock->start == lock->end) continue;
+        if (lock_overlaps( lock, start, end )) count++;
+    }
+    if (!count)
+    {
+        set_unix_lock( unlock_fd, start, end, F_UNLCK );
+        return;
+    }
+    if (count > ~(size_t)0 / 2 ||
+        count * 2 > ~(size_t)0 / sizeof(*events))
+        return;
+
+    event_count = count * 2;
+    if (!(events = malloc( sizeof(*events) * event_count ))) return;
+    i = 0;
+    LIST_FOR_EACH_ENTRY( lock, &inode->locks, struct file_lock, inode_entry )
+    {
+        file_pos_t lock_start, lock_end;
+
+        if (lock->start == lock->end) continue;
+        if (!lock_overlaps( lock, start, end )) continue;
+        lock_start = lock->start > start ? lock->start : start;
+        lock_end = !lock->end || lock->end > end ? end : lock->end;
+        events[i].pos = lock_start;
+        events[i].shared = lock->shared;
+        events[i++].start = 1;
+        events[i].pos = lock_end;
+        events[i].shared = lock->shared;
+        events[i++].start = 0;
+    }
+    assert( i == event_count );
+    qsort( events, event_count, sizeof(*events), compare_lock_range_events );
+
+    read_fd = find_unix_lock_fd( inode, fd, F_RDLCK );
+    write_fd = find_unix_lock_fd( inode, fd, F_WRLCK );
+    pos = start;
+    for (i = 0; i < event_count; i = j)
+    {
+        if (events[i].pos > pos)
+        {
+            set_reconciled_unix_lock( unlock_fd, read_fd, write_fd, pos, events[i].pos,
+                                      shared_count, exclusive_count );
+            pos = events[i].pos;
+        }
+
+        for (j = i; j < event_count && events[j].pos == events[i].pos; j++)
+        {
+            size_t *active = events[j].shared ? &shared_count : &exclusive_count;
+
+            if (events[j].start) (*active)++;
+            else
+            {
+                assert( *active );
+                (*active)--;
+            }
+        }
+    }
+    if (pos < end)
+        set_reconciled_unix_lock( unlock_fd, read_fd, write_fd, pos, end,
+                                  shared_count, exclusive_count );
+    free( events );
+}
+
 /* remove an existing lock */
 static void remove_lock( struct file_lock *lock, int remove_unix )
 {
     struct inode *inode = lock->fd->inode;
+    unsigned int saved_error = get_error();
 
     list_remove( &lock->fd_entry );
     list_remove( &lock->inode_entry );
     list_remove( &lock->proc_entry );
-    if (remove_unix) remove_unix_locks( lock->fd, lock->start, lock->end );
+    if (remove_unix)
+    {
+        if (lock->shared)
+            set_unix_lock_holes( lock->fd, lock->start, lock->end, F_UNLCK );
+        else
+            reconcile_unix_locks( lock->fd, lock->start, lock->end );
+    }
+    set_error( saved_error );
     if (list_empty( &inode->locks )) inode_close_pending( inode, 1 );
     lock->process = NULL;
-    signal_sync( lock->sync );
     release_object( lock );
+}
+
+static void retry_inode_lock_waiters( struct inode *inode );
+
+static void remove_lock_waiter( struct file_lock_wait *wait )
+{
+    if (!wait->active) return;
+    list_remove( &wait->inode_entry );
+    list_remove( &wait->fd_entry );
+    wait->fd = NULL;
+    wait->active = 0;
+}
+
+static int lock_waiter_is_pending( struct file_lock_wait *wait )
+{
+    struct iosb *iosb = async_get_iosb( wait->async );
+    int pending = iosb && iosb->status == STATUS_PENDING;
+
+    if (iosb) release_object( iosb );
+    return pending;
+}
+
+static int lock_waiter_conflicts( struct inode *inode, file_pos_t start,
+                                  file_pos_t end, int shared )
+{
+    struct file_lock_wait *wait;
+
+    LIST_FOR_EACH_ENTRY( wait, &inode->lock_waiters, struct file_lock_wait, inode_entry )
+    {
+        if (!lock_waiter_is_pending( wait )) continue;
+        if (!lock_ranges_overlap( wait->start, wait->end, start, end )) continue;
+        if (shared && wait->shared) continue;
+        return 1;
+    }
+    return 0;
+}
+
+static void lock_waiter_completed( void *private )
+{
+    struct file_lock_wait *wait = private;
+    struct inode *inode = wait->inode;
+    int retry = wait->active;
+
+    remove_lock_waiter( wait );
+    if (retry) retry_inode_lock_waiters( inode );
+    release_object( wait->process );
+    release_object( inode );
+    free( wait );
+}
+
+/* Try to acquire a lock without changing the caller-visible server status. */
+static unsigned int try_lock_fd( struct fd *fd, struct process *process, file_pos_t start,
+                                 file_pos_t end, unsigned int key, int shared,
+                                 int *unix_conflict )
+{
+    struct file_lock *lock;
+    unsigned int status;
+
+    *unix_conflict = 0;
+
+    LIST_FOR_EACH_ENTRY( lock, &fd->inode->locks, struct file_lock, inode_entry )
+    {
+        if (!lock_overlaps( lock, start, end )) continue;
+        if (shared && (lock->shared || (lock->fd == fd && lock->key == key))) continue;
+        return STATUS_FILE_LOCK_CONFLICT;
+    }
+
+    clear_error();
+    if (add_lock( fd, process, key, shared, start, end )) return STATUS_SUCCESS;
+    status = get_error();
+    if (!status) status = STATUS_NO_MEMORY;
+    if (status == STATUS_FILE_LOCK_CONFLICT) *unix_conflict = 1;
+    return status;
+}
+
+#define FILE_LOCK_RETRY_TIMEOUT (-100 * 10000)
+
+static void lock_retry_timeout( void *private )
+{
+    struct inode *inode = private;
+
+    inode->lock_timeout = NULL;
+    retry_inode_lock_waiters( inode );
+    release_object( inode );
+}
+
+static int schedule_lock_retry( struct inode *inode )
+{
+    struct timeout_user *timeout;
+
+    if (inode->lock_timeout) return 1;
+    grab_object( inode );
+    if (!(timeout = add_timeout_user( FILE_LOCK_RETRY_TIMEOUT, lock_retry_timeout, inode )))
+    {
+        release_object( inode );
+        return 0;
+    }
+    inode->lock_timeout = timeout;
+    return 1;
+}
+
+static void cancel_lock_retry( struct inode *inode )
+{
+    if (!inode->lock_timeout) return;
+    remove_timeout_user( inode->lock_timeout );
+    inode->lock_timeout = NULL;
+    release_object( inode );
+}
+
+static void cancel_lock_retry_if_idle( struct inode *inode )
+{
+    if (!list_empty( &inode->lock_waiters ) || !inode->lock_timeout) return;
+    cancel_lock_retry( inode );
+}
+
+struct lock_reservation_cell
+{
+    file_pos_t max_end;
+    unsigned int unbounded;
+};
+
+struct lock_reservations
+{
+    file_pos_t *starts;
+    struct lock_reservation_cell *all;
+    struct lock_reservation_cell *exclusive;
+    size_t count;
+};
+
+static int compare_file_pos( const void *left, const void *right )
+{
+    file_pos_t a = *(const file_pos_t *)left;
+    file_pos_t b = *(const file_pos_t *)right;
+
+    return (a > b) - (a < b);
+}
+
+static void free_lock_reservations( struct lock_reservations *reservations )
+{
+    free( reservations->exclusive );
+    free( reservations->all );
+    free( reservations->starts );
+}
+
+/*
+ * Build a coordinate-compressed prefix-maximum tree.  This lets a retry pass
+ * reserve the ranges of earlier blocked waiters without scanning the prefix
+ * of the queue again for every waiter.
+ */
+static int init_lock_reservations( struct inode *inode, struct lock_reservations *reservations )
+{
+    struct file_lock_wait *wait;
+    size_t i, count = 0;
+
+    memset( reservations, 0, sizeof(*reservations) );
+    LIST_FOR_EACH_ENTRY( wait, &inode->lock_waiters, struct file_lock_wait, inode_entry )
+        count++;
+    if (!count) return 1;
+    if (count > ~(size_t)0 / sizeof(*reservations->starts)) return 0;
+
+    if (!(reservations->starts = malloc( count * sizeof(*reservations->starts) ))) return 0;
+    i = 0;
+    LIST_FOR_EACH_ENTRY( wait, &inode->lock_waiters, struct file_lock_wait, inode_entry )
+        reservations->starts[i++] = wait->start;
+    qsort( reservations->starts, count, sizeof(*reservations->starts), compare_file_pos );
+
+    reservations->count = 1;
+    for (i = 1; i < count; i++)
+        if (reservations->starts[i] != reservations->starts[reservations->count - 1])
+            reservations->starts[reservations->count++] = reservations->starts[i];
+
+    reservations->all = calloc( reservations->count + 1, sizeof(*reservations->all) );
+    reservations->exclusive = calloc( reservations->count + 1,
+                                      sizeof(*reservations->exclusive) );
+    if (!reservations->all || !reservations->exclusive)
+    {
+        free_lock_reservations( reservations );
+        memset( reservations, 0, sizeof(*reservations) );
+        return 0;
+    }
+    return 1;
+}
+
+static size_t lock_reservation_lower_bound( const struct lock_reservations *reservations,
+                                            file_pos_t value )
+{
+    size_t low = 0, high = reservations->count;
+
+    while (low < high)
+    {
+        size_t mid = low + (high - low) / 2;
+
+        if (reservations->starts[mid] < value) low = mid + 1;
+        else high = mid;
+    }
+    return low;
+}
+
+static int lock_reservation_conflicts( const struct lock_reservations *reservations,
+                                       file_pos_t start, file_pos_t end, int shared )
+{
+    const struct lock_reservation_cell *cells;
+    size_t index;
+
+    if (!start && !end) return 0;
+    if (!reservations->count) return 0;
+    index = end ? lock_reservation_lower_bound( reservations, end ) : reservations->count;
+    cells = shared ? reservations->exclusive : reservations->all;
+
+    while (index)
+    {
+        if (cells[index].unbounded || cells[index].max_end > start) return 1;
+        index &= index - 1;
+    }
+    return 0;
+}
+
+static void add_lock_reservation( struct lock_reservations *reservations,
+                                  file_pos_t start, file_pos_t end, int shared )
+{
+    struct lock_reservation_cell *cells;
+    size_t index;
+
+    if (!start && !end) return;
+    index = lock_reservation_lower_bound( reservations, start ) + 1;
+    for (cells = reservations->all; index <= reservations->count; index += index & -index)
+    {
+        if (!end) cells[index].unbounded = 1;
+        else if (cells[index].max_end < end) cells[index].max_end = end;
+    }
+    if (shared) return;
+
+    index = lock_reservation_lower_bound( reservations, start ) + 1;
+    for (cells = reservations->exclusive; index <= reservations->count; index += index & -index)
+    {
+        if (!end) cells[index].unbounded = 1;
+        else if (cells[index].max_end < end) cells[index].max_end = end;
+    }
+}
+
+static void retry_inode_lock_waiters( struct inode *inode )
+{
+    struct lock_reservations reservations;
+    struct file_lock_wait *wait, *next;
+    unsigned int saved_error = get_error();
+    int strict_fifo, have_reservations;
+    int need_timer = 0;
+
+    have_reservations = init_lock_reservations( inode, &reservations );
+    strict_fifo = 0;
+    LIST_FOR_EACH_ENTRY_SAFE( wait, next, &inode->lock_waiters,
+                              struct file_lock_wait, inode_entry )
+    {
+        unsigned int status;
+        int unix_conflict;
+
+        if (!lock_waiter_is_pending( wait ))
+        {
+            remove_lock_waiter( wait );
+            continue;
+        }
+
+        if (strict_fifo ||
+            (have_reservations && lock_reservation_conflicts( &reservations, wait->start,
+                                                               wait->end, wait->shared )))
+        {
+            if (have_reservations)
+                add_lock_reservation( &reservations, wait->start, wait->end, wait->shared );
+            continue;
+        }
+
+        status = try_lock_fd( wait->fd, wait->process, wait->start, wait->end,
+                              wait->key, wait->shared, &unix_conflict );
+        if (status == STATUS_SUCCESS)
+        {
+            remove_lock_waiter( wait );
+            async_request_complete( wait->async, STATUS_SUCCESS, 0, 0, NULL );
+        }
+        else if (status == STATUS_FILE_LOCK_CONFLICT)
+        {
+            need_timer |= unix_conflict;
+            if (have_reservations)
+                add_lock_reservation( &reservations, wait->start, wait->end, wait->shared );
+            else
+                strict_fifo = 1;
+        }
+        else
+        {
+            remove_lock_waiter( wait );
+            async_request_complete( wait->async, status, 0, 0, NULL );
+        }
+    }
+    free_lock_reservations( &reservations );
+
+    if (need_timer)
+    {
+        if (!schedule_lock_retry( inode ))
+        {
+            LIST_FOR_EACH_ENTRY_SAFE( wait, next, &inode->lock_waiters,
+                                      struct file_lock_wait, inode_entry )
+            {
+                remove_lock_waiter( wait );
+                async_request_complete( wait->async, STATUS_NO_MEMORY, 0, 0, NULL );
+            }
+        }
+    }
+    else if (inode->lock_timeout)
+    {
+        cancel_lock_retry( inode );
+    }
+    cancel_lock_retry_if_idle( inode );
+    set_error( saved_error );
+}
+
+static int queue_lock_waiter( struct fd *fd, struct async *async, struct process *process,
+                              file_pos_t start, file_pos_t end, unsigned int key, int shared,
+                              int unix_conflict )
+{
+    struct file_lock_wait *wait;
+
+    if (unix_conflict && !schedule_lock_retry( fd->inode )) return 0;
+    if (!(wait = mem_alloc( sizeof(*wait) )))
+    {
+        cancel_lock_retry_if_idle( fd->inode );
+        return 0;
+    }
+
+    wait->inode   = (struct inode *)grab_object( fd->inode );
+    wait->fd      = fd;
+    wait->process = (struct process *)grab_object( process );
+    wait->async   = async;
+    wait->start   = start;
+    wait->end     = end;
+    wait->key     = key;
+    wait->shared  = shared;
+    wait->active  = 1;
+    list_add_tail( &fd->inode->lock_waiters, &wait->inode_entry );
+    list_add_tail( &fd->lock_waiters, &wait->fd_entry );
+    async_set_completion_callback( async, lock_waiter_completed, wait );
+    queue_async( &fd->wait_q, async );
+    return 1;
 }
 
 /* remove all locks owned by a given process */
 void remove_process_locks( struct process *process )
 {
+    struct list retry_inodes;
     struct list *ptr;
 
+    list_init( &retry_inodes );
     while ((ptr = list_head( &process->locks )))
     {
         struct file_lock *lock = LIST_ENTRY( ptr, struct file_lock, proc_entry );
-        remove_lock( lock, 1 );  /* this removes it from the list */
+        struct inode *inode = lock->fd->inode;
+
+        if (!inode->process_lock_retry_pending)
+        {
+            inode->process_lock_retry_pending = 1;
+            inode->process_lock_fd = (struct fd *)grab_object( lock->fd );
+            inode->process_lock_start = FILE_POS_T_MAX;
+            inode->process_lock_end = 0;
+            inode->process_lock_have_range = 0;
+            list_add_tail( &retry_inodes, &inode->process_lock_retry_entry );
+            grab_object( inode );
+        }
+        if (lock->start != lock->end)
+        {
+            inode->process_lock_have_range = 1;
+            if (lock->start < inode->process_lock_start)
+                inode->process_lock_start = lock->start;
+            if (!lock->end || lock->end > inode->process_lock_end)
+                inode->process_lock_end = lock->end - 1;
+        }
+        remove_lock( lock, 0 );  /* this removes it from the list */
+    }
+
+    while ((ptr = list_head( &retry_inodes )))
+    {
+        struct inode *inode = LIST_ENTRY( ptr, struct inode, process_lock_retry_entry );
+
+        list_remove( &inode->process_lock_retry_entry );
+        if (inode->process_lock_have_range)
+            reconcile_unix_locks( inode->process_lock_fd, inode->process_lock_start,
+                                  inode->process_lock_end + 1 );
+        release_object( inode->process_lock_fd );
+        inode->process_lock_fd = NULL;
+        inode->process_lock_have_range = 0;
+        inode->process_lock_retry_pending = 0;
+        retry_inode_lock_waiters( inode );
+        release_object( inode );
     }
 }
 
@@ -1513,65 +2101,96 @@ void remove_process_locks( struct process *process )
 static void remove_fd_locks( struct fd *fd )
 {
     file_pos_t start = FILE_POS_T_MAX, end = 0;
+    int have_range = 0;
     struct list *ptr;
 
     while ((ptr = list_head( &fd->locks )))
     {
         struct file_lock *lock = LIST_ENTRY( ptr, struct file_lock, fd_entry );
-        if (lock->start < start) start = lock->start;
-        if (!lock->end || lock->end > end) end = lock->end - 1;
+        if (lock->start != lock->end)
+        {
+            have_range = 1;
+            if (lock->start < start) start = lock->start;
+            if (!lock->end || lock->end > end) end = lock->end - 1;
+        }
         remove_lock( lock, 0 );
     }
-    if (start < end) remove_unix_locks( fd, start, end + 1 );
+    if (have_range) reconcile_unix_locks( fd, start, end + 1 );
+    if (fd->inode) retry_inode_lock_waiters( fd->inode );
+}
+
+static void remove_fd_lock_waiters( struct fd *fd )
+{
+    struct file_lock_wait *wait;
+    struct inode *inode = fd->inode;
+    struct list *ptr;
+
+    while ((ptr = list_head( &fd->lock_waiters )))
+    {
+        wait = LIST_ENTRY( ptr, struct file_lock_wait, fd_entry );
+        remove_lock_waiter( wait );
+        async_request_complete( wait->async, STATUS_RANGE_NOT_LOCKED, 0, 0, NULL );
+    }
+    if (inode)
+    {
+        cancel_lock_retry_if_idle( inode );
+        retry_inode_lock_waiters( inode );
+    }
 }
 
 /* add a lock on an fd */
-/* returns handle to wait on */
-obj_handle_t lock_fd( struct fd *fd, file_pos_t start, file_pos_t count, int shared, int wait )
+void lock_fd( struct fd *fd, struct async *async, file_pos_t start, file_pos_t count,
+              unsigned int key, int shared, int wait )
 {
-    struct file_lock *lock;
+    struct process *process = async_get_thread( async )->process;
     file_pos_t end = start + count;
+    unsigned int status;
+    int unix_conflict;
 
     if (!fd->inode)  /* not a regular file */
     {
-        set_error( STATUS_INVALID_DEVICE_REQUEST );
-        return 0;
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        goto complete;
     }
 
     /* don't allow wrapping locks */
     if (end && end < start)
     {
-        set_error( STATUS_INVALID_PARAMETER );
-        return 0;
+        status = STATUS_INVALID_LOCK_RANGE;
+        goto complete;
     }
 
-    /* check if another lock on that file overlaps the area */
-    LIST_FOR_EACH_ENTRY( lock, &fd->inode->locks, struct file_lock, inode_entry )
+    if (lock_waiter_conflicts( fd->inode, start, end, shared ))
     {
-        if (!lock_overlaps( lock, start, end )) continue;
-        if (shared && (lock->shared || lock->fd == fd)) continue;
-        /* found one */
-        if (!wait)
+        status = STATUS_FILE_LOCK_CONFLICT;
+        unix_conflict = 0;
+    }
+    else
+    {
+        status = try_lock_fd( fd, process, start, end, key, shared, &unix_conflict );
+    }
+    if (status == STATUS_FILE_LOCK_CONFLICT && wait)
+    {
+        if (queue_lock_waiter( fd, async, process, start, end, key, shared, unix_conflict ))
         {
-            set_error( STATUS_FILE_LOCK_CONFLICT );
-            return 0;
+            set_error( STATUS_PENDING );
+            return;
         }
-        set_error( STATUS_PENDING );
-        return alloc_handle( current->process, lock, SYNCHRONIZE, 0 );
+        status = get_error();
+        if (!status) status = STATUS_NO_MEMORY;
+    }
+    else if (status == STATUS_FILE_LOCK_CONFLICT)
+    {
+        status = STATUS_LOCK_NOT_GRANTED;
     }
 
-    /* not found, add it */
-    if (add_lock( fd, shared, start, end )) return 0;
-    if (get_error() == STATUS_FILE_LOCK_CONFLICT)
-    {
-        /* Unix lock conflict -> tell client to wait and retry */
-        if (wait) set_error( STATUS_PENDING );
-    }
-    return 0;
+complete:
+    set_error( status );
+    async_request_complete( async, status, 0, 0, NULL );
 }
 
 /* remove a lock on an fd */
-void unlock_fd( struct fd *fd, file_pos_t start, file_pos_t count )
+void unlock_fd( struct fd *fd, file_pos_t start, file_pos_t count, unsigned int key )
 {
     struct file_lock *lock;
     file_pos_t end = start + count;
@@ -1579,9 +2198,10 @@ void unlock_fd( struct fd *fd, file_pos_t start, file_pos_t count )
     /* find an existing lock with the exact same parameters */
     LIST_FOR_EACH_ENTRY( lock, &fd->locks, struct file_lock, fd_entry )
     {
-        if ((lock->start == start) && (lock->end == end))
+        if (lock->start == start && lock->end == end && lock->key == key)
         {
             remove_lock( lock, 1 );
+            retry_inode_lock_waiters( fd->inode );
             return;
         }
     }
@@ -1610,6 +2230,7 @@ static void fd_destroy( struct object *obj )
 {
     struct fd *fd = (struct fd *)obj;
 
+    remove_fd_lock_waiters( fd );
     free_async_queue( &fd->read_q );
     free_async_queue( &fd->write_q );
     free_async_queue( &fd->wait_q );
@@ -1706,6 +2327,7 @@ static inline void unmount_fd( struct fd *fd )
 
     async_wake_up( &fd->read_q, STATUS_VOLUME_DISMOUNTED );
     async_wake_up( &fd->write_q, STATUS_VOLUME_DISMOUNTED );
+    async_wake_up( &fd->wait_q, STATUS_VOLUME_DISMOUNTED );
 
     if (fd->poll_index != -1) set_fd_events( fd, -1 );
 
@@ -1751,6 +2373,7 @@ static struct fd *alloc_fd_object(void)
     init_async_queue( &fd->wait_q );
     list_init( &fd->inode_entry );
     list_init( &fd->locks );
+    list_init( &fd->lock_waiters );
 
     if (!(fd->sync = create_internal_sync( 1, 1 ))) goto error;
     if ((fd->poll_index = add_poll_user( fd )) == -1) goto error;
@@ -1794,6 +2417,7 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
     init_async_queue( &fd->wait_q );
     list_init( &fd->inode_entry );
     list_init( &fd->locks );
+    list_init( &fd->lock_waiters );
 
     if (!(fd->sync = create_internal_sync( 1, 1 )))
     {

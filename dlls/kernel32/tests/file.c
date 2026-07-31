@@ -60,6 +60,7 @@ static void (WINAPI *pRtlInitAnsiString)(PANSI_STRING,PCSZ);
 static void (WINAPI *pRtlFreeUnicodeString)(PUNICODE_STRING);
 static BOOL (WINAPI *pSetFileCompletionNotificationModes)(HANDLE, UCHAR);
 static HANDLE (WINAPI *pFindFirstStreamW)(LPCWSTR filename, STREAM_INFO_LEVELS infolevel, void *data, DWORD flags);
+static BOOL (WINAPI *pCancelIoEx)(HANDLE, OVERLAPPED *);
 
 static char filename[MAX_PATH];
 static const char sillytext[] =
@@ -110,6 +111,7 @@ static void InitFunctionPointers(void)
     pReOpenFile = (void *) GetProcAddress(hkernel32, "ReOpenFile");
     pSetFileCompletionNotificationModes = (void *)GetProcAddress(hkernel32, "SetFileCompletionNotificationModes");
     pFindFirstStreamW = (void *)GetProcAddress(hkernel32, "FindFirstStreamW");
+    pCancelIoEx = (void *)GetProcAddress(hkernel32, "CancelIoEx");
 }
 
 static void create_file( const char *path )
@@ -2283,7 +2285,7 @@ static void test_offset_in_overlapped_structure(void)
 
 static void test_LockFile(void)
 {
-    HANDLE handle, handle2;
+    HANDLE event, handle, handle2;
     DWORD written;
     OVERLAPPED overlapped;
     int limited_LockFile;
@@ -2310,15 +2312,140 @@ static void test_LockFile(void)
         goto cleanup;
     }
 
-    count.QuadPart = 0;
     offset.QuadPart = 0;
-    status = NtUnlockFile( handle, NULL, &count, &offset, NULL );
+    count.QuadPart = 1;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( INVALID_HANDLE_VALUE, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0, TRUE, TRUE );
+    ok( status == STATUS_OBJECT_TYPE_MISMATCH, "got %#lx.\n", status );
+    ok( iosb.Status == 0xcccccccc, "got iosb status %#lx.\n", iosb.Status );
+    ok( iosb.Information == (ULONG_PTR)0xccccccccccccccccULL,
+        "got information %#Ix.\n", iosb.Information );
+
+    event = CreateEventW( NULL, FALSE, FALSE, NULL );
+    ok( !!event, "CreateEvent failed, error %lu.\n", GetLastError() );
+    if (event)
+    {
+        memset( &iosb, 0xcc, sizeof(iosb) );
+        status = NtLockFile( event, NULL, NULL, NULL, &iosb, &offset, &count,
+                             0, TRUE, TRUE );
+        ok( status == STATUS_OBJECT_TYPE_MISMATCH, "got %#lx.\n", status );
+        ok( iosb.Status == 0xcccccccc, "got iosb status %#lx.\n", iosb.Status );
+        ok( iosb.Information == (ULONG_PTR)0xccccccccccccccccULL,
+            "got information %#Ix.\n", iosb.Information );
+        CloseHandle( event );
+    }
+
+    count.QuadPart = 0;
+    status = NtUnlockFile( handle, NULL, &count, &offset, 0 );
     ok( status == STATUS_ACCESS_VIOLATION, "got %#lx.\n", status );
     memset( &iosb, 0xcc, sizeof(iosb) );
-    status = NtUnlockFile( handle, &iosb, &count, &offset, NULL );
+    status = NtUnlockFile( handle, &iosb, &count, &offset, 0 );
     ok( status == STATUS_RANGE_NOT_LOCKED, "got %#lx.\n", status );
     ok( iosb.Status == status, "got %lu.\n", iosb.Status);
     ok( !iosb.Information, "got %Iu.\n", iosb.Information);
+
+    offset.QuadPart = 0x1000;
+    count.QuadPart = 16;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0x12345678, TRUE, TRUE );
+    ok( !status, "got %#lx.\n", status );
+    ok( !iosb.Status, "got status %#lx.\n", iosb.Status );
+    ok( !iosb.Information, "got information %Iu.\n", iosb.Information );
+    status = NtUnlockFile( handle, &iosb, &offset, &count, 0 );
+    ok( status == STATUS_RANGE_NOT_LOCKED, "got %#lx.\n", status );
+    status = NtUnlockFile( handle, &iosb, &offset, &count, 0x12345678 );
+    ok( !status, "got %#lx.\n", status );
+
+    offset.QuadPart = 0x1100;
+    count.QuadPart = 16;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0x12345678, TRUE, TRUE );
+    ok( !status, "got %#lx.\n", status );
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0x87654321, TRUE, FALSE );
+    ok( status == STATUS_LOCK_NOT_GRANTED, "got %#lx.\n", status );
+    ok( iosb.Status == status, "got iosb status %#lx.\n", iosb.Status );
+    ok( !iosb.Information, "got information %Iu.\n", iosb.Information );
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle2, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0x12345678, TRUE, FALSE );
+    ok( status == STATUS_LOCK_NOT_GRANTED, "got %#lx.\n", status );
+    ok( iosb.Status == status, "got iosb status %#lx.\n", iosb.Status );
+    ok( !iosb.Information, "got information %Iu.\n", iosb.Information );
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0x12345678, TRUE, FALSE );
+    ok( !status, "got %#lx.\n", status );
+    status = NtUnlockFile( handle, &iosb, &offset, &count, 0x12345678 );
+    ok( !status, "got %#lx.\n", status );
+    status = NtUnlockFile( handle, &iosb, &offset, &count, 0x12345678 );
+    ok( !status, "got %#lx.\n", status );
+
+    ok( LockFile( handle, 0x1200, 0, 16, 0 ), "LockFile 0x1200,16 failed\n" );
+    memset( &overlapped, 0xcc, sizeof(overlapped) );
+    overlapped.Offset = 0x1200;
+    overlapped.OffsetHigh = 0;
+    overlapped.hEvent = 0;
+    SetLastError( 0xdeadbeef );
+    ret = LockFileEx( handle2, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                      0, 16, 0, &overlapped );
+    ok( !ret, "LockFileEx unexpectedly succeeded.\n" );
+    ok( GetLastError() == ERROR_LOCK_VIOLATION, "got error %lu.\n", GetLastError() );
+    ok( (NTSTATUS)overlapped.Internal == STATUS_LOCK_NOT_GRANTED,
+        "got status %#Ix.\n", overlapped.Internal );
+    ok( !overlapped.InternalHigh, "got information %Iu.\n", overlapped.InternalHigh );
+    ok( UnlockFile( handle, 0x1200, 0, 16, 0 ), "UnlockFile 0x1200,16 failed\n" );
+
+    offset.QuadPart = 0xfffffffffffffff0ULL;
+    count.QuadPart = 0x20;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0, TRUE, TRUE );
+    ok( status == STATUS_INVALID_LOCK_RANGE, "got %#lx.\n", status );
+
+    /* A zero-length lock is a point that conflicts only inside another range. */
+    offset.QuadPart = 0x2000;
+    count.QuadPart = 0;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0x87654321, TRUE, TRUE );
+    ok( !status, "got %#lx.\n", status );
+    ok( LockFile( handle2, 0x1fff, 0, 1, 0 ), "LockFile 0x1fff,1 failed\n" );
+    ok( UnlockFile( handle2, 0x1fff, 0, 1, 0 ), "UnlockFile 0x1fff,1 failed\n" );
+    ok( LockFile( handle2, 0x2000, 0, 1, 0 ), "LockFile 0x2000,1 failed\n" );
+    ok( UnlockFile( handle2, 0x2000, 0, 1, 0 ), "UnlockFile 0x2000,1 failed\n" );
+    ok( LockFile( handle2, 0x2000, 0, 0, 0 ), "LockFile 0x2000,0 failed\n" );
+    ok( UnlockFile( handle2, 0x2000, 0, 0, 0 ), "UnlockFile 0x2000,0 failed\n" );
+    ok( !LockFile( handle2, 0x1fff, 0, 2, 0 ), "LockFile 0x1fff,2 succeeded\n" );
+    status = NtUnlockFile( handle, &iosb, &offset, &count, 0 );
+    ok( status == STATUS_RANGE_NOT_LOCKED, "got %#lx.\n", status );
+    status = NtUnlockFile( handle, &iosb, &offset, &count, 0x87654321 );
+    ok( !status, "got %#lx.\n", status );
+
+    ok( LockFile( handle2, 0x1fff, 0, 2, 0 ), "LockFile 0x1fff,2 failed\n" );
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0x87654321, TRUE, TRUE );
+    ok( status == STATUS_LOCK_NOT_GRANTED, "got %#lx.\n", status );
+    ok( iosb.Status == status, "got iosb status %#lx.\n", iosb.Status );
+    ok( !iosb.Information, "got information %Iu.\n", iosb.Information );
+    ok( UnlockFile( handle2, 0x1fff, 0, 2, 0 ), "UnlockFile 0x1fff,2 failed\n" );
+
+    offset.QuadPart = 0;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    status = NtLockFile( handle, NULL, NULL, NULL, &iosb, &offset, &count,
+                         0x87654321, TRUE, TRUE );
+    ok( !status, "got %#lx.\n", status );
+    ok( LockFile( handle2, 0, 0, 1, 0 ), "LockFile 0,1 failed\n" );
+    ok( UnlockFile( handle2, 0, 0, 1, 0 ), "UnlockFile 0,1 failed\n" );
+    status = NtUnlockFile( handle, &iosb, &offset, &count, 0 );
+    ok( status == STATUS_RANGE_NOT_LOCKED, "got %#lx.\n", status );
+    status = NtUnlockFile( handle, &iosb, &offset, &count, 0x87654321 );
+    ok( !status, "got %#lx.\n", status );
 
     ok( WriteFile( handle, sillytext, strlen(sillytext), &written, NULL ), "write failed\n" );
 
@@ -2347,16 +2474,16 @@ static void test_LockFile(void)
     ok( ret, "got error %lu.\n", GetLastError() );
     count.QuadPart = 5;
     offset.QuadPart = 4;
-    status = NtUnlockFile( handle, &iosb, &count, &offset, NULL );
+    status = NtUnlockFile( handle, &iosb, &count, &offset, 0 );
     ok( status == STATUS_RANGE_NOT_LOCKED, "got %#lx.\n", status );
     count.QuadPart = 4;
     offset.QuadPart = 5;
-    status = NtUnlockFile( handle, &iosb, &count, &offset, NULL );
+    status = NtUnlockFile( handle, &iosb, &count, &offset, 0 );
     ok( status == STATUS_RANGE_NOT_LOCKED, "got %#lx.\n", status );
     count.QuadPart = 5;
     offset.QuadPart = 5;
     memset( &iosb, 0xcc, sizeof(iosb) );
-    status = NtUnlockFile( handle, &iosb, &count, &offset, NULL );
+    status = NtUnlockFile( handle, &iosb, &count, &offset, 0 );
     ok( !status, "got %#lx.\n", status );
     ok( iosb.Status == status, "got %lu.\n", iosb.Status);
     ok( !iosb.Information, "got %Iu.\n", iosb.Information);
@@ -2427,19 +2554,634 @@ static void test_LockFile(void)
     limited_UnLockFile || ok( UnlockFile( handle, ~0, ~0, 1, 0 ), "Unlockfile ~0,1 failed\n" );
 
     /* zero-byte lock */
-    ok( LockFile( handle, 100, 0, 0, 0 ), "LockFile 100,0 failed\n" );
-    if (!limited_LockFile) ok( !LockFile( handle, 98, 0, 4, 0 ), "LockFile 98,4 succeeded\n" );
-    ok( LockFile( handle, 90, 0, 10, 0 ), "LockFile 90,10 failed\n" );
-    if (!limited_LockFile) ok( !LockFile( handle, 100, 0, 10, 0 ), "LockFile 100,10 failed\n" );
+    ok( LockFile( handle, 0x4000, 0, 0, 0 ), "LockFile 0x4000,0 failed\n" );
+    if (!limited_LockFile)
+        ok( !LockFile( handle, 0x3ffe, 0, 4, 0 ), "LockFile 0x3ffe,4 succeeded\n" );
+    ok( LockFile( handle, 0x3ff6, 0, 10, 0 ), "LockFile 0x3ff6,10 failed\n" );
+    if (!limited_LockFile)
+    {
+        ret = LockFile( handle, 0x4000, 0, 10, 0 );
+        ok( ret, "LockFile 0x4000,10 failed\n" );
+        if (ret)
+            ok( UnlockFile( handle, 0x4000, 0, 10, 0 ), "UnlockFile 0x4000,10 failed\n" );
+    }
 
-    ok( UnlockFile( handle, 90, 0, 10, 0 ), "UnlockFile 90,10 failed\n" );
-    ok( !UnlockFile( handle, 100, 0, 10, 0 ), "UnlockFile 100,10 succeeded\n" );
+    ok( UnlockFile( handle, 0x3ff6, 0, 10, 0 ), "UnlockFile 0x3ff6,10 failed\n" );
 
-    ok( UnlockFile( handle, 100, 0, 0, 0 ), "UnlockFile 100,0 failed\n" );
+    ok( UnlockFile( handle, 0x4000, 0, 0, 0 ), "UnlockFile 0x4000,0 failed\n" );
 
     CloseHandle( handle2 );
 cleanup:
     CloseHandle( handle );
+    DeleteFileA( filename );
+}
+
+static BOOL submit_conflicting_lock( HANDLE waiter, DWORD flags, DWORD offset,
+                                     OVERLAPPED *overlapped, HANDLE event )
+{
+    BOOL ret;
+    DWORD error;
+
+    memset( overlapped, 0xcc, sizeof(*overlapped) );
+    overlapped->Offset = offset;
+    overlapped->OffsetHigh = 0;
+    overlapped->hEvent = event;
+    SetEvent( (HANDLE)((ULONG_PTR)event & ~(ULONG_PTR)1) );
+    SetLastError( 0xdeadbeef );
+    ret = LockFileEx( waiter, flags, 0, 16, 0, overlapped );
+    error = GetLastError();
+    ok( !ret, "LockFileEx unexpectedly succeeded\n" );
+    ok( error == ERROR_IO_PENDING, "got error %lu\n", error );
+    ok( overlapped->Internal == STATUS_PENDING, "got status %#Ix\n", overlapped->Internal );
+    ok( !overlapped->InternalHigh, "got information %Iu\n", overlapped->InternalHigh );
+    ok( WaitForSingleObject( (HANDLE)((ULONG_PTR)event & ~(ULONG_PTR)1), 0 ) == WAIT_TIMEOUT,
+        "event is signaled\n" );
+    if (ret)
+    {
+        ret = UnlockFileEx( waiter, 0, 16, 0, overlapped );
+        ok( ret, "UnlockFileEx failed, error %lu\n", GetLastError() );
+        return FALSE;
+    }
+    return !ret && error == ERROR_IO_PENDING;
+}
+
+static BOOL submit_pending_lock( HANDLE owner, HANDLE waiter, DWORD offset, OVERLAPPED *overlapped,
+                                 HANDLE event )
+{
+    BOOL ret;
+
+    ret = LockFile( owner, offset, 0, 16, 0 );
+    ok( ret, "LockFile failed, error %lu\n", GetLastError() );
+    if (!ret) return FALSE;
+    if (submit_conflicting_lock( waiter, LOCKFILE_EXCLUSIVE_LOCK, offset,
+                                 overlapped, event )) return TRUE;
+    ret = UnlockFile( owner, offset, 0, 16, 0 );
+    ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+    return FALSE;
+}
+
+#define EXIT_LOCK_OFFSET   160
+#define FIFO_LOCK_OFFSET   192
+#define APC_LOCK_OFFSET    224
+#define THREAD_LOCK_OFFSET 240
+#define DIRECT_LOCK_OFFSET 256
+
+static void lock_owner_process( const char *path, HANDLE ready, HANDLE release )
+{
+    HANDLE file;
+    BOOL ret;
+
+    file = CreateFileA( path, GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_EXISTING, 0, 0 );
+    ok( file != INVALID_HANDLE_VALUE, "CreateFile failed, error %lu\n", GetLastError() );
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        SetEvent( ready );
+        return;
+    }
+
+    ret = LockFile( file, EXIT_LOCK_OFFSET, 0, 16, 0 );
+    ok( ret, "LockFile failed, error %lu\n", GetLastError() );
+    SetEvent( ready );
+    if (ret)
+        ok( WaitForSingleObject( release, 5000 ) == WAIT_OBJECT_0, "release wait timed out\n" );
+}
+
+struct lock_apc_context
+{
+    IO_STATUS_BLOCK *iosb;
+    unsigned int count;
+};
+
+static void WINAPI lock_file_apc( void *arg, IO_STATUS_BLOCK *iosb, ULONG reserved )
+{
+    struct lock_apc_context *context = arg;
+
+    ok( iosb == context->iosb, "got iosb %p, expected %p\n", iosb, context->iosb );
+    ok( !reserved, "got reserved %#lx\n", reserved );
+    context->count++;
+}
+
+static void test_lock_file_apc( HANDLE owner )
+{
+    struct lock_apc_context context;
+    HANDLE file = INVALID_HANDLE_VALUE, event = NULL;
+    IO_STATUS_BLOCK iosb, unlock_iosb;
+    LARGE_INTEGER offset, count;
+    NTSTATUS status;
+    DWORD ret;
+    BOOL owner_locked = FALSE, waiter_locked = FALSE, immediate_locked = FALSE;
+
+    file = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0 );
+    ok( file != INVALID_HANDLE_VALUE, "CreateFile failed, error %lu\n", GetLastError() );
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!event, "CreateEvent failed, error %lu\n", GetLastError() );
+    if (!event) goto done;
+
+    ret = LockFile( owner, APC_LOCK_OFFSET, 0, 16, 0 );
+    ok( ret, "LockFile failed, error %lu\n", GetLastError() );
+    if (!ret) goto done;
+    owner_locked = TRUE;
+
+    offset.QuadPart = APC_LOCK_OFFSET;
+    count.QuadPart = 16;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    context.iosb = &iosb;
+    context.count = 0;
+    SetEvent( event );
+    status = NtLockFile( file, event, lock_file_apc, &context, &iosb, &offset, &count,
+                         0x12345678, FALSE, TRUE );
+    ok( status == STATUS_PENDING, "got status %#lx\n", status );
+    ok( iosb.Status == 0xcccccccc, "got iosb status %#lx\n", iosb.Status );
+    ok( !context.count, "APC ran %u times\n", context.count );
+    ok( WaitForSingleObject( event, 0 ) == WAIT_TIMEOUT, "event is signaled\n" );
+    if (status != STATUS_PENDING) goto done;
+
+    ret = UnlockFile( owner, APC_LOCK_OFFSET, 0, 16, 0 );
+    ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+    owner_locked = FALSE;
+    ret = SleepEx( 1000, TRUE );
+    ok( ret == WAIT_IO_COMPLETION, "got alertable wait result %#lx\n", ret );
+    ok( context.count == 1, "APC ran %u times\n", context.count );
+    ok( !iosb.Status, "got iosb status %#lx\n", iosb.Status );
+    trace( "pending NtLockFile information %#Ix\n", iosb.Information );
+    ok( WaitForSingleObject( event, 0 ) == WAIT_OBJECT_0, "event was not signaled\n" );
+    waiter_locked = !iosb.Status;
+    SleepEx( 0, TRUE );
+    ok( context.count == 1, "APC ran %u times\n", context.count );
+
+    status = NtUnlockFile( file, &unlock_iosb, &offset, &count, 0 );
+    ok( status == STATUS_RANGE_NOT_LOCKED, "got status %#lx\n", status );
+    status = NtUnlockFile( file, &unlock_iosb, &offset, &count, 0x12345678 );
+    ok( !status, "got status %#lx\n", status );
+    if (!status) waiter_locked = FALSE;
+
+    offset.QuadPart = APC_LOCK_OFFSET + 0x1000;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    context.iosb = &iosb;
+    context.count = 0;
+    ResetEvent( event );
+    status = NtLockFile( file, event, lock_file_apc, &context, &iosb, &offset, &count,
+                         0x12345678, FALSE, TRUE );
+    ok( !status, "got status %#lx\n", status );
+    ok( !iosb.Status, "got iosb status %#lx\n", iosb.Status );
+    ok( !iosb.Information, "got information %#Ix\n", iosb.Information );
+    immediate_locked = !status;
+    SleepEx( 0, TRUE );
+    ok( !context.count, "immediate lock queued %u APCs\n", context.count );
+    if (immediate_locked)
+    {
+        status = NtUnlockFile( file, &unlock_iosb, &offset, &count, 0x12345678 );
+        ok( !status, "got status %#lx\n", status );
+        if (!status) immediate_locked = FALSE;
+    }
+
+done:
+    if (immediate_locked)
+    {
+        offset.QuadPart = APC_LOCK_OFFSET + 0x1000;
+        count.QuadPart = 16;
+        NtUnlockFile( file, &unlock_iosb, &offset, &count, 0x12345678 );
+    }
+    if (waiter_locked)
+    {
+        offset.QuadPart = APC_LOCK_OFFSET;
+        count.QuadPart = 16;
+        NtUnlockFile( file, &unlock_iosb, &offset, &count, 0x12345678 );
+    }
+    if (owner_locked) UnlockFile( owner, APC_LOCK_OFFSET, 0, 16, 0 );
+    if (event) CloseHandle( event );
+    CloseHandle( file );
+}
+
+struct lock_thread_context
+{
+    HANDLE file;
+    HANDLE event;
+    IO_STATUS_BLOCK iosb;
+};
+
+static DWORD WINAPI lock_waiter_thread( void *arg )
+{
+    struct lock_thread_context *context = arg;
+    LARGE_INTEGER offset, count;
+    NTSTATUS status;
+
+    offset.QuadPart = THREAD_LOCK_OFFSET;
+    count.QuadPart = 16;
+    memset( &context->iosb, 0xcc, sizeof(context->iosb) );
+    status = NtLockFile( context->file, context->event, NULL, NULL, &context->iosb,
+                         &offset, &count, 0, FALSE, TRUE );
+    ok( status == STATUS_PENDING, "got status %#lx\n", status );
+    return 0;
+}
+
+static void test_lock_file_thread_exit( HANDLE owner )
+{
+    struct lock_thread_context context;
+    HANDLE thread = NULL;
+    DWORD ret;
+    BOOL owner_locked = FALSE;
+
+    context.file = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0 );
+    ok( context.file != INVALID_HANDLE_VALUE, "CreateFile failed, error %lu\n", GetLastError() );
+    if (context.file == INVALID_HANDLE_VALUE) return;
+
+    context.event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!context.event, "CreateEvent failed, error %lu\n", GetLastError() );
+    if (!context.event) goto done;
+
+    ret = LockFile( owner, THREAD_LOCK_OFFSET, 0, 16, 0 );
+    ok( ret, "LockFile failed, error %lu\n", GetLastError() );
+    if (!ret) goto done;
+    owner_locked = TRUE;
+
+    thread = CreateThread( NULL, 0, lock_waiter_thread, &context, 0, NULL );
+    ok( !!thread, "CreateThread failed, error %lu\n", GetLastError() );
+    if (!thread) goto done;
+    ok( WaitForSingleObject( thread, 1000 ) == WAIT_OBJECT_0, "thread did not exit\n" );
+    ok( WaitForSingleObject( context.event, 1000 ) == WAIT_OBJECT_0,
+        "event was not signaled\n" );
+    ok( context.iosb.Status == STATUS_CANCELLED, "got iosb status %#lx\n",
+        context.iosb.Status );
+    ok( !context.iosb.Information, "got information %#Ix\n", context.iosb.Information );
+
+done:
+    if (owner_locked) UnlockFile( owner, THREAD_LOCK_OFFSET, 0, 16, 0 );
+    if (thread) CloseHandle( thread );
+    if (context.event) CloseHandle( context.event );
+    CloseHandle( context.file );
+}
+
+static void test_lock_file_fifo( HANDLE owner )
+{
+    HANDLE exclusive = INVALID_HANDLE_VALUE, shared = INVALID_HANDLE_VALUE;
+    HANDLE exclusive_event = NULL, shared_event = NULL;
+    OVERLAPPED exclusive_overlapped, shared_overlapped, nonconflict;
+    BOOL owner_locked = FALSE, exclusive_locked = FALSE, shared_locked = FALSE;
+    BOOL exclusive_pending = FALSE, shared_pending = FALSE;
+    BOOL ret;
+
+    exclusive = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0 );
+    shared = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                          OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0 );
+    ok( exclusive != INVALID_HANDLE_VALUE && shared != INVALID_HANDLE_VALUE,
+        "CreateFile failed, error %lu\n", GetLastError() );
+    if (exclusive == INVALID_HANDLE_VALUE || shared == INVALID_HANDLE_VALUE) goto done;
+
+    exclusive_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    shared_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!exclusive_event && !!shared_event, "CreateEvent failed, error %lu\n", GetLastError() );
+    if (!exclusive_event || !shared_event) goto done;
+
+    ret = LockFile( owner, FIFO_LOCK_OFFSET, 0, 16, 0 );
+    ok( ret, "LockFile failed, error %lu\n", GetLastError() );
+    if (!ret) goto done;
+    owner_locked = TRUE;
+
+    exclusive_pending = submit_conflicting_lock( exclusive, LOCKFILE_EXCLUSIVE_LOCK,
+                                                  FIFO_LOCK_OFFSET, &exclusive_overlapped,
+                                                  exclusive_event );
+    shared_pending = submit_conflicting_lock( shared, 0, FIFO_LOCK_OFFSET,
+                                               &shared_overlapped, shared_event );
+    if (!exclusive_pending || !shared_pending) goto done;
+
+    memset( &nonconflict, 0, sizeof(nonconflict) );
+    nonconflict.Offset = FIFO_LOCK_OFFSET + 0x1000;
+    ret = LockFileEx( shared, 0, 0, 16, 0, &nonconflict );
+    ok( ret, "nonconflicting LockFileEx failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        ok( !nonconflict.Internal, "got status %#Ix\n", nonconflict.Internal );
+        ok( !nonconflict.InternalHigh, "got information %#Ix\n", nonconflict.InternalHigh );
+        ret = UnlockFileEx( shared, 0, 16, 0, &nonconflict );
+        ok( ret, "UnlockFileEx failed, error %lu\n", GetLastError() );
+    }
+
+    ret = UnlockFile( owner, FIFO_LOCK_OFFSET, 0, 16, 0 );
+    ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+    owner_locked = FALSE;
+    ok( WaitForSingleObject( exclusive_event, 1000 ) == WAIT_OBJECT_0,
+        "exclusive waiter did not complete\n" );
+    ok( !exclusive_overlapped.Internal, "got status %#Ix\n", exclusive_overlapped.Internal );
+    exclusive_locked = !exclusive_overlapped.Internal;
+    ok( WaitForSingleObject( shared_event, 0 ) == WAIT_TIMEOUT,
+        "shared waiter bypassed exclusive waiter\n" );
+
+    ret = UnlockFileEx( exclusive, 0, 16, 0, &exclusive_overlapped );
+    ok( ret, "UnlockFileEx failed, error %lu\n", GetLastError() );
+    if (ret) exclusive_locked = FALSE;
+    ok( WaitForSingleObject( shared_event, 1000 ) == WAIT_OBJECT_0,
+        "shared waiter did not complete\n" );
+    ok( !shared_overlapped.Internal, "got status %#Ix\n", shared_overlapped.Internal );
+    shared_locked = !shared_overlapped.Internal;
+    ret = UnlockFileEx( shared, 0, 16, 0, &shared_overlapped );
+    ok( ret, "UnlockFileEx failed, error %lu\n", GetLastError() );
+    if (ret) shared_locked = FALSE;
+
+done:
+    if (shared_locked) UnlockFileEx( shared, 0, 16, 0, &shared_overlapped );
+    if (exclusive_locked) UnlockFileEx( exclusive, 0, 16, 0, &exclusive_overlapped );
+    if (owner_locked) UnlockFile( owner, FIFO_LOCK_OFFSET, 0, 16, 0 );
+    if (shared != INVALID_HANDLE_VALUE) CloseHandle( shared );
+    if (exclusive != INVALID_HANDLE_VALUE) CloseHandle( exclusive );
+    if (shared_event) CloseHandle( shared_event );
+    if (exclusive_event) CloseHandle( exclusive_event );
+}
+
+static void test_direct_lock_file_iocp( HANDLE owner, HANDLE waiter, HANDLE event,
+                                        HANDLE port, ULONG_PTR completion_key )
+{
+    IO_STATUS_BLOCK iosb, unlock_iosb;
+    OVERLAPPED *completion_overlapped;
+    LARGE_INTEGER offset, count;
+    ULONG_PTR key;
+    NTSTATUS status;
+    DWORD size;
+    BOOL ret, owner_locked = FALSE, waiter_locked = FALSE;
+
+    ret = LockFile( owner, DIRECT_LOCK_OFFSET, 0, 16, 0 );
+    ok( ret, "LockFile failed, error %lu\n", GetLastError() );
+    if (!ret) return;
+    owner_locked = TRUE;
+
+    offset.QuadPart = DIRECT_LOCK_OFFSET;
+    count.QuadPart = 16;
+    memset( &iosb, 0xcc, sizeof(iosb) );
+    SetEvent( event );
+    status = NtLockFile( waiter, (HANDLE)((ULONG_PTR)event | 1), NULL, &iosb, &iosb,
+                         &offset, &count, 0x87654321, FALSE, TRUE );
+    ok( status == STATUS_PENDING, "got status %#lx\n", status );
+    ok( iosb.Status == 0xcccccccc, "got iosb status %#lx\n", iosb.Status );
+    ok( WaitForSingleObject( event, 0 ) == WAIT_TIMEOUT, "event is signaled\n" );
+    if (status != STATUS_PENDING) goto done;
+
+    ret = UnlockFile( owner, DIRECT_LOCK_OFFSET, 0, 16, 0 );
+    ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+    owner_locked = FALSE;
+    completion_overlapped = (OVERLAPPED *)0xdeadbeef;
+    size = 0xdeadbeef;
+    key = 0;
+    ret = GetQueuedCompletionStatus( port, &size, &key, &completion_overlapped, 1000 );
+    ok( ret, "GetQueuedCompletionStatus failed, error %lu\n", GetLastError() );
+    ok( key == completion_key, "got key %#Ix\n", key );
+    ok( completion_overlapped == (OVERLAPPED *)&iosb, "got completion context %p\n",
+        completion_overlapped );
+    ok( size == (DWORD)iosb.Information, "got size %lu, information %#Ix\n",
+        size, iosb.Information );
+    ok( !iosb.Status, "got iosb status %#lx\n", iosb.Status );
+    ok( WaitForSingleObject( event, 0 ) == WAIT_OBJECT_0, "event was not signaled\n" );
+    waiter_locked = !iosb.Status;
+
+    status = NtUnlockFile( waiter, &unlock_iosb, &offset, &count, 0 );
+    ok( status == STATUS_RANGE_NOT_LOCKED, "got status %#lx\n", status );
+    status = NtUnlockFile( waiter, &unlock_iosb, &offset, &count, 0x87654321 );
+    ok( !status, "got status %#lx\n", status );
+    if (!status) waiter_locked = FALSE;
+
+done:
+    if (waiter_locked)
+        NtUnlockFile( waiter, &unlock_iosb, &offset, &count, 0x87654321 );
+    if (owner_locked) UnlockFile( owner, DIRECT_LOCK_OFFSET, 0, 16, 0 );
+}
+
+static void test_async_LockFile(void)
+{
+    static const ULONG_PTR completion_key = 0x55667788;
+    HANDLE owner, waiter = INVALID_HANDLE_VALUE, close_waiter = INVALID_HANDLE_VALUE;
+    HANDLE event = NULL, port = NULL, ready = NULL, release = NULL;
+    OVERLAPPED overlapped;
+    OVERLAPPED *completion_overlapped;
+    PROCESS_INFORMATION process_info;
+    STARTUPINFOA startup_info;
+    SECURITY_ATTRIBUTES security;
+    char **argv, command[3 * MAX_PATH];
+    DWORD size, error;
+    ULONG_PTR key;
+    BOOL ret;
+
+    owner = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                         CREATE_ALWAYS, 0, 0 );
+    ok( owner != INVALID_HANDLE_VALUE, "CreateFile failed, error %lu\n", GetLastError() );
+    if (owner == INVALID_HANDLE_VALUE) return;
+
+    waiter = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                          OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0 );
+    ok( waiter != INVALID_HANDLE_VALUE, "CreateFile failed, error %lu\n", GetLastError() );
+    if (waiter == INVALID_HANDLE_VALUE) goto done;
+
+    event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!event, "CreateEvent failed, error %lu\n", GetLastError() );
+    if (!event) goto done;
+
+    if (submit_pending_lock( owner, waiter, 0, &overlapped, event ))
+    {
+        ret = UnlockFile( owner, 0, 0, 16, 0 );
+        ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+        ok( WaitForSingleObject( event, 1000 ) == WAIT_OBJECT_0, "event was not signaled\n" );
+        ok( !overlapped.Internal, "got status %#Ix\n", overlapped.Internal );
+        trace( "pending LockFileEx information %#Ix\n", overlapped.InternalHigh );
+        size = 0xdeadbeef;
+        ret = GetOverlappedResult( waiter, &overlapped, &size, FALSE );
+        ok( ret, "GetOverlappedResult failed, error %lu\n", GetLastError() );
+        ok( size == (DWORD)overlapped.InternalHigh, "got size %lu, information %#Ix\n",
+            size, overlapped.InternalHigh );
+        ret = UnlockFileEx( waiter, 0, 16, 0, &overlapped );
+        ok( ret, "UnlockFileEx failed, error %lu\n", GetLastError() );
+    }
+
+    port = CreateIoCompletionPort( waiter, NULL, completion_key, 0 );
+    ok( !!port, "CreateIoCompletionPort failed, error %lu\n", GetLastError() );
+    if (!port) goto done;
+
+    ResetEvent( event );
+    if (submit_pending_lock( owner, waiter, 32, &overlapped, event ))
+    {
+        ret = UnlockFile( owner, 32, 0, 16, 0 );
+        ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+        completion_overlapped = (OVERLAPPED *)0xdeadbeef;
+        size = 0xdeadbeef;
+        key = 0;
+        ret = GetQueuedCompletionStatus( port, &size, &key, &completion_overlapped, 1000 );
+        ok( ret, "GetQueuedCompletionStatus failed, error %lu\n", GetLastError() );
+        ok( key == completion_key, "got key %#Ix\n", key );
+        ok( completion_overlapped == &overlapped, "got overlapped %p\n", completion_overlapped );
+        ok( size == (DWORD)overlapped.InternalHigh, "got size %lu, information %#Ix\n",
+            size, overlapped.InternalHigh );
+        ok( WaitForSingleObject( event, 0 ) == WAIT_OBJECT_0, "event was not signaled\n" );
+        ok( !overlapped.Internal, "got status %#Ix\n", overlapped.Internal );
+        ret = UnlockFileEx( waiter, 0, 16, 0, &overlapped );
+        ok( ret, "UnlockFileEx failed, error %lu\n", GetLastError() );
+    }
+
+    ResetEvent( event );
+    if (submit_pending_lock( owner, waiter, 64, &overlapped,
+                             (HANDLE)((ULONG_PTR)event | 1) ))
+    {
+        ret = UnlockFile( owner, 64, 0, 16, 0 );
+        ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+        ok( WaitForSingleObject( event, 1000 ) == WAIT_OBJECT_0, "event was not signaled\n" );
+        size = 0xdeadbeef;
+        ret = GetOverlappedResult( waiter, &overlapped, &size, FALSE );
+        ok( ret, "GetOverlappedResult failed, error %lu\n", GetLastError() );
+        ok( size == (DWORD)overlapped.InternalHigh, "got size %lu, information %#Ix\n",
+            size, overlapped.InternalHigh );
+        completion_overlapped = (OVERLAPPED *)0xdeadbeef;
+        SetLastError( 0xdeadbeef );
+        ret = GetQueuedCompletionStatus( port, &size, &key, &completion_overlapped, 50 );
+        error = GetLastError();
+        ok( !ret, "GetQueuedCompletionStatus unexpectedly succeeded\n" );
+        ok( error == WAIT_TIMEOUT, "got error %lu\n", error );
+        ok( !completion_overlapped, "got overlapped %p\n", completion_overlapped );
+        ret = UnlockFileEx( waiter, 0, 16, 0, &overlapped );
+        ok( ret, "UnlockFileEx failed, error %lu\n", GetLastError() );
+    }
+
+    test_direct_lock_file_iocp( owner, waiter, event, port, completion_key );
+
+    if (pCancelIoEx)
+    {
+        ResetEvent( event );
+        if (submit_pending_lock( owner, waiter, 96, &overlapped, event ))
+        {
+            ret = pCancelIoEx( waiter, &overlapped );
+            ok( ret, "CancelIoEx failed, error %lu\n", GetLastError() );
+            ok( WaitForSingleObject( event, 1000 ) == WAIT_OBJECT_0, "event was not signaled\n" );
+            ok( (NTSTATUS)overlapped.Internal == STATUS_CANCELLED, "got status %#Ix\n",
+                overlapped.Internal );
+            ok( !overlapped.InternalHigh, "got information %Iu\n", overlapped.InternalHigh );
+            size = 0xdeadbeef;
+            SetLastError( 0xdeadbeef );
+            ret = GetOverlappedResult( waiter, &overlapped, &size, FALSE );
+            error = GetLastError();
+            ok( !ret, "GetOverlappedResult unexpectedly succeeded\n" );
+            ok( error == ERROR_OPERATION_ABORTED, "got error %lu\n", error );
+
+            completion_overlapped = (OVERLAPPED *)0xdeadbeef;
+            SetLastError( 0xdeadbeef );
+            ret = GetQueuedCompletionStatus( port, &size, &key, &completion_overlapped, 1000 );
+            error = GetLastError();
+            ok( !ret, "GetQueuedCompletionStatus unexpectedly succeeded\n" );
+            ok( error == ERROR_OPERATION_ABORTED, "got error %lu\n", error );
+            ok( completion_overlapped == &overlapped, "got overlapped %p\n", completion_overlapped );
+
+            ret = UnlockFile( owner, 96, 0, 16, 0 );
+            ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+            completion_overlapped = (OVERLAPPED *)0xdeadbeef;
+            SetLastError( 0xdeadbeef );
+            ret = GetQueuedCompletionStatus( port, &size, &key, &completion_overlapped, 50 );
+            ok( !ret && GetLastError() == WAIT_TIMEOUT,
+                "unexpected second completion, ret %d error %lu\n", ret, GetLastError() );
+        }
+    }
+    else win_skip( "CancelIoEx is not available\n" );
+
+    close_waiter = CreateFileA( filename, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0 );
+    ok( close_waiter != INVALID_HANDLE_VALUE, "CreateFile failed, error %lu\n", GetLastError() );
+    if (close_waiter != INVALID_HANDLE_VALUE)
+    {
+        ResetEvent( event );
+        if (submit_pending_lock( owner, close_waiter, 128, &overlapped, event ))
+        {
+            ret = CloseHandle( close_waiter );
+            close_waiter = INVALID_HANDLE_VALUE;
+            ok( ret, "CloseHandle failed, error %lu\n", GetLastError() );
+            ok( WaitForSingleObject( event, 1000 ) == WAIT_OBJECT_0, "event was not signaled\n" );
+            ok( (NTSTATUS)overlapped.Internal == STATUS_RANGE_NOT_LOCKED, "got status %#Ix\n",
+                overlapped.Internal );
+            ok( !overlapped.InternalHigh, "got information %Iu\n", overlapped.InternalHigh );
+            ret = UnlockFile( owner, 128, 0, 16, 0 );
+            ok( ret, "UnlockFile failed, error %lu\n", GetLastError() );
+        }
+        else
+        {
+            CloseHandle( close_waiter );
+            close_waiter = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    test_lock_file_apc( owner );
+    test_lock_file_thread_exit( owner );
+    test_lock_file_fifo( owner );
+
+    security.nLength = sizeof(security);
+    security.lpSecurityDescriptor = NULL;
+    security.bInheritHandle = TRUE;
+    ready = CreateEventA( &security, TRUE, FALSE, NULL );
+    release = CreateEventA( &security, TRUE, FALSE, NULL );
+    ok( !!ready && !!release, "CreateEvent failed, error %lu\n", GetLastError() );
+    if (ready && release)
+    {
+        memset( &startup_info, 0, sizeof(startup_info) );
+        startup_info.cb = sizeof(startup_info);
+        winetest_get_mainargs( &argv );
+        sprintf( command, "\"%s\" %s lock_owner \"%s\" %p %p",
+                 argv[0], argv[1], filename, ready, release );
+        ret = CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL,
+                              &startup_info, &process_info );
+        ok( ret, "CreateProcess failed, error %lu\n", GetLastError() );
+        if (ret)
+        {
+            ok( WaitForSingleObject( ready, 5000 ) == WAIT_OBJECT_0,
+                "lock owner did not become ready\n" );
+            ResetEvent( event );
+            if (submit_conflicting_lock( waiter, LOCKFILE_EXCLUSIVE_LOCK, EXIT_LOCK_OFFSET,
+                                          &overlapped, event ))
+            {
+                SetEvent( release );
+                ok( WaitForSingleObject( process_info.hProcess, 5000 ) == WAIT_OBJECT_0,
+                    "lock owner did not exit\n" );
+                ok( WaitForSingleObject( event, 5000 ) == WAIT_OBJECT_0,
+                    "event was not signaled\n" );
+                ok( !overlapped.Internal, "got status %#Ix\n", overlapped.Internal );
+                trace( "owner-exit LockFileEx information %#Ix\n", overlapped.InternalHigh );
+
+                completion_overlapped = (OVERLAPPED *)0xdeadbeef;
+                size = 0xdeadbeef;
+                key = 0;
+                ret = GetQueuedCompletionStatus( port, &size, &key,
+                                                 &completion_overlapped, 1000 );
+                ok( ret, "GetQueuedCompletionStatus failed, error %lu\n", GetLastError() );
+                ok( key == completion_key, "got key %#Ix\n", key );
+                ok( completion_overlapped == &overlapped,
+                    "got overlapped %p\n", completion_overlapped );
+                ok( size == (DWORD)overlapped.InternalHigh,
+                    "got size %lu, information %#Ix\n", size, overlapped.InternalHigh );
+                ret = UnlockFileEx( waiter, 0, 16, 0, &overlapped );
+                ok( ret, "UnlockFileEx failed, error %lu\n", GetLastError() );
+            }
+            else
+            {
+                SetEvent( release );
+                WaitForSingleObject( process_info.hProcess, 5000 );
+            }
+            CloseHandle( process_info.hThread );
+            CloseHandle( process_info.hProcess );
+        }
+    }
+
+done:
+    if (release) CloseHandle( release );
+    if (ready) CloseHandle( ready );
+    if (close_waiter != INVALID_HANDLE_VALUE) CloseHandle( close_waiter );
+    if (port) CloseHandle( port );
+    if (event) CloseHandle( event );
+    if (waiter != INVALID_HANDLE_VALUE) CloseHandle( waiter );
+    CloseHandle( owner );
     DeleteFileA( filename );
 }
 
@@ -6918,7 +7660,18 @@ static void test_posix_semantics(void)
 START_TEST(file)
 {
     char temp_path[MAX_PATH];
+    char **argv;
+    int argc;
     DWORD ret;
+
+    argc = winetest_get_mainargs( &argv );
+    if (argc == 6 && !strcmp( argv[2], "lock_owner" ))
+    {
+        lock_owner_process( argv[3],
+                            (HANDLE)(ULONG_PTR)strtoull( argv[4], NULL, 16 ),
+                            (HANDLE)(ULONG_PTR)strtoull( argv[5], NULL, 16 ) );
+        return;
+    }
 
     InitFunctionPointers();
 
@@ -6963,6 +7716,7 @@ START_TEST(file)
     test_FindFirstFileExA(FindExInfoStandard, FindExSearchLimitToDirectories, FIND_FIRST_EX_LARGE_FETCH);
     test_FindFirstFileExA(FindExInfoBasic, FindExSearchLimitToDirectories, 0);
     test_LockFile();
+    test_async_LockFile();
     test_file_sharing();
     test_offset_in_overlapped_structure();
     test_MapFile();

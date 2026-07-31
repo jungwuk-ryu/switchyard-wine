@@ -555,6 +555,11 @@ void async_set_completion_callback( struct async *async, async_completion_callba
     async->completion_callback_private = private;
 }
 
+void async_clear_user_apc( struct async *async )
+{
+    async->data.apc = 0;
+}
+
 static void add_async_completion( struct async *async, apc_param_t cvalue, unsigned int status,
                                   apc_param_t information )
 {

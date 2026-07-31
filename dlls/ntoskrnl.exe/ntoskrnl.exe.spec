@@ -807,7 +807,7 @@
 @ stdcall NtFreeVirtualMemory(long ptr ptr long)
 @ stdcall NtFsControlFile(long long ptr ptr ptr long ptr long ptr long)
 @ stub NtGlobalFlag
-@ stdcall NtLockFile(long long ptr ptr ptr ptr ptr ptr long long)
+@ stdcall NtLockFile(long long ptr ptr ptr ptr ptr long long long)
 @ stdcall NtMapViewOfSection(long long ptr long long ptr ptr long long long)
 @ stdcall NtNotifyChangeDirectoryFile(long long ptr ptr ptr ptr long long long)
 @ stdcall NtOpenFile(ptr long ptr ptr long long)
@@ -845,7 +845,7 @@
 @ stdcall NtShutdownSystem(long)
 @ stdcall NtTraceControl(long ptr long ptr long long)
 @ stub NtTraceEvent
-@ stdcall NtUnlockFile(long ptr ptr ptr ptr)
+@ stdcall NtUnlockFile(long ptr ptr ptr long)
 @ stub NtVdmControl
 @ stdcall NtWaitForSingleObject(long long ptr)
 @ stdcall NtWriteFile(long long ptr ptr ptr ptr long ptr ptr)
@@ -1453,7 +1453,7 @@
 @ stdcall -private ZwIsProcessInJob(long long) NtIsProcessInJob
 @ stdcall ZwLoadDriver(ptr)
 @ stdcall -private ZwLoadKey(ptr ptr) NtLoadKey
-@ stdcall -private ZwLockFile(long long ptr ptr ptr ptr ptr ptr long long) NtLockFile
+@ stdcall -private ZwLockFile(long long ptr ptr ptr ptr ptr long long long) NtLockFile
 @ stdcall -private ZwLockVirtualMemory(long ptr ptr long) NtLockVirtualMemory
 @ stdcall ZwMakePermanentObject(long) NtMakePermanentObject
 @ stdcall ZwMakeTemporaryObject(long) NtMakeTemporaryObject
@@ -1548,7 +1548,7 @@
 @ stub ZwTranslateFilePath
 @ stdcall ZwUnloadDriver(ptr)
 @ stdcall -private ZwUnloadKey(ptr) NtUnloadKey
-@ stdcall -private ZwUnlockFile(long ptr ptr ptr ptr) NtUnlockFile
+@ stdcall -private ZwUnlockFile(long ptr ptr ptr long) NtUnlockFile
 @ stdcall -private ZwUnlockVirtualMemory(long ptr ptr long) NtUnlockVirtualMemory
 @ stdcall ZwUnmapViewOfSection(long ptr) NtUnmapViewOfSection
 @ stdcall -private ZwWaitForMultipleObjects(long ptr long long ptr) NtWaitForMultipleObjects

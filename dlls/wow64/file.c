@@ -471,7 +471,7 @@ NTSTATUS WINAPI wow64_NtLockFile( UINT *args )
     IO_STATUS_BLOCK32 *io32 = get_ptr( &args );
     LARGE_INTEGER *offset = get_ptr( &args );
     LARGE_INTEGER *count = get_ptr( &args );
-    ULONG *key = get_ptr( &args );
+    ULONG key = get_ulong( &args );
     BOOLEAN dont_wait = get_ulong( &args );
     BOOLEAN exclusive = get_ulong( &args );
 
@@ -896,7 +896,7 @@ NTSTATUS WINAPI wow64_NtUnlockFile( UINT *args )
     IO_STATUS_BLOCK32 *io32 = get_ptr( &args );
     LARGE_INTEGER *offset = get_ptr( &args );
     LARGE_INTEGER *count = get_ptr( &args );
-    ULONG *key = get_ptr( &args );
+    ULONG key = get_ulong( &args );
 
     IO_STATUS_BLOCK io;
     NTSTATUS status;

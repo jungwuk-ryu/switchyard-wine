@@ -287,6 +287,15 @@ struct async_data
     apc_param_t     apc_context;   /* user APC context or completion value */
 };
 
+/* parameters supplied as extra data for lock_file */
+struct file_lock_params
+{
+    file_pos_t      offset;        /* offset of start of lock */
+    file_pos_t      count;         /* count of bytes to lock */
+    unsigned int    key;           /* caller-supplied lock key */
+    int             shared;        /* shared or exclusive lock? */
+};
+
 /* structures for extra message data */
 
 struct hw_msg_source
@@ -1801,14 +1810,13 @@ enum server_fd_type
 
 /* Lock a region of a file */
 @REQ(lock_file)
-    obj_handle_t handle;        /* handle to the file */
-    file_pos_t   offset;        /* offset of start of lock */
-    file_pos_t   count;         /* count of bytes to lock */
-    int          shared;        /* shared or exclusive lock? */
+    struct async_data async;    /* async I/O parameters */
     int          wait;          /* do we want to wait? */
+    VARARG(params,bytes);        /* file_lock_params */
 @REPLY
-    obj_handle_t handle;        /* handle to wait on */
-    int          overlapped;    /* is it an overlapped I/O handle? */
+    obj_handle_t wait;          /* handle to wait on for synchronous I/O */
+    unsigned int options;       /* device open options */
+    int          completed;     /* async request completed synchronously */
 @END
 
 
@@ -1817,6 +1825,7 @@ enum server_fd_type
     obj_handle_t handle;        /* handle to the file */
     file_pos_t   offset;        /* offset of start of unlock */
     file_pos_t   count;         /* count of bytes to unlock */
+    unsigned int key;           /* caller-supplied lock key */
 @END
 
 

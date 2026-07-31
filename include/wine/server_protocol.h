@@ -272,6 +272,15 @@ struct async_data
 };
 
 
+struct file_lock_params
+{
+    file_pos_t      offset;
+    file_pos_t      count;
+    unsigned int    key;
+    int             shared;
+};
+
+
 
 struct hw_msg_source
 {
@@ -2158,17 +2167,19 @@ struct get_volume_info_reply
 struct lock_file_request
 {
     struct request_header __header;
-    obj_handle_t handle;
-    file_pos_t   offset;
-    file_pos_t   count;
-    int          shared;
+    char __pad_12[4];
+    struct async_data async;
     int          wait;
+    /* VARARG(params,bytes); */
+    char __pad_60[4];
 };
 struct lock_file_reply
 {
     struct reply_header __header;
-    obj_handle_t handle;
-    int          overlapped;
+    obj_handle_t wait;
+    unsigned int options;
+    int          completed;
+    char __pad_20[4];
 };
 
 
@@ -2179,6 +2190,8 @@ struct unlock_file_request
     obj_handle_t handle;
     file_pos_t   offset;
     file_pos_t   count;
+    unsigned int key;
+    char __pad_36[4];
 };
 struct unlock_file_reply
 {
@@ -7388,6 +7401,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 959
+#define SERVER_PROTOCOL_VERSION 960
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

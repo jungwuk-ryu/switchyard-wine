@@ -3428,6 +3428,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH LockFile( HANDLE file, DWORD offset_low, DWORD off
                                         DWORD count_low, DWORD count_high )
 {
     LARGE_INTEGER count, offset;
+    IO_STATUS_BLOCK io;
 
     TRACE( "%p %lx%08lx %lx%08lx\n", file, offset_high, offset_low, count_high, count_low );
 
@@ -3435,7 +3436,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH LockFile( HANDLE file, DWORD offset_low, DWORD off
     count.u.HighPart = count_high;
     offset.u.LowPart = offset_low;
     offset.u.HighPart = offset_high;
-    return set_ntstatus( NtLockFile( file, 0, NULL, NULL, NULL, &offset, &count, NULL, TRUE, TRUE ));
+    return set_ntstatus( NtLockFile( file, 0, NULL, NULL, &io, &offset, &count, 0, TRUE, TRUE ));
 }
 
 
@@ -3462,10 +3463,12 @@ BOOL WINAPI DECLSPEC_HOTPATCH LockFileEx( HANDLE file, DWORD flags, DWORD reserv
     offset.u.LowPart = overlapped->Offset;
     offset.u.HighPart = overlapped->OffsetHigh;
 
+    overlapped->Internal = STATUS_PENDING;
+    overlapped->InternalHigh = 0;
     if (((ULONG_PTR)overlapped->hEvent & 1) == 0) cvalue = overlapped;
 
     return set_ntstatus( NtLockFile( file, overlapped->hEvent, NULL, cvalue,
-                                     NULL, &offset, &count, NULL,
+                                     (IO_STATUS_BLOCK *)overlapped, &offset, &count, 0,
                                      flags & LOCKFILE_FAIL_IMMEDIATELY,
                                      flags & LOCKFILE_EXCLUSIVE_LOCK ));
 }
@@ -3990,7 +3993,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH UnlockFile( HANDLE file, DWORD offset_low, DWORD o
     count.u.HighPart = count_high;
     offset.u.LowPart = offset_low;
     offset.u.HighPart = offset_high;
-    return set_ntstatus( NtUnlockFile( file, &io, &offset, &count, NULL ));
+    return set_ntstatus( NtUnlockFile( file, &io, &offset, &count, 0 ));
 }
 
 

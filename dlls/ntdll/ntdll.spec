@@ -267,7 +267,7 @@
 @ stdcall -syscall NtLoadKey2(ptr ptr long)
 @ stdcall -syscall NtLoadKey(ptr ptr)
 @ stdcall -syscall NtLoadKeyEx(ptr ptr long long long long ptr ptr)
-@ stdcall -syscall NtLockFile(long long ptr ptr ptr ptr ptr ptr long long)
+@ stdcall -syscall NtLockFile(long long ptr ptr ptr ptr ptr long long long)
 # @ stub NtLockProductActivationKeys
 # @ stub NtLockRegistryKey
 @ stdcall -syscall NtLockVirtualMemory(long ptr ptr long)
@@ -446,7 +446,7 @@
 @ stdcall -syscall NtUnloadDriver(ptr)
 @ stdcall -syscall NtUnloadKey(ptr)
 # @ stub NtUnloadKeyEx
-@ stdcall -syscall NtUnlockFile(long ptr ptr ptr ptr)
+@ stdcall -syscall NtUnlockFile(long ptr ptr ptr long)
 @ stdcall -syscall NtUnlockVirtualMemory(long ptr ptr long)
 @ stdcall -syscall=0x002a NtUnmapViewOfSection(long ptr)
 @ stdcall -syscall NtUnmapViewOfSectionEx(long ptr long)
@@ -1345,7 +1345,7 @@
 @ stdcall -private ZwLoadKey2(ptr ptr long) NtLoadKey2
 @ stdcall -private ZwLoadKey(ptr ptr) NtLoadKey
 @ stdcall -private ZwLoadKeyEx(ptr ptr long long long long ptr ptr) NtLoadKeyEx
-@ stdcall -private ZwLockFile(long long ptr ptr ptr ptr ptr ptr long long) NtLockFile
+@ stdcall -private ZwLockFile(long long ptr ptr ptr ptr ptr long long long) NtLockFile
 # @ stub ZwLockProductActivationKeys
 # @ stub ZwLockRegistryKey
 @ stdcall -private ZwLockVirtualMemory(long ptr ptr long) NtLockVirtualMemory
@@ -1524,7 +1524,7 @@
 @ stdcall -private ZwUnloadDriver(ptr) NtUnloadDriver
 @ stdcall -private ZwUnloadKey(ptr) NtUnloadKey
 # @ stub ZwUnloadKeyEx
-@ stdcall -private ZwUnlockFile(long ptr ptr ptr ptr) NtUnlockFile
+@ stdcall -private ZwUnlockFile(long ptr ptr ptr long) NtUnlockFile
 @ stdcall -private ZwUnlockVirtualMemory(long ptr ptr long) NtUnlockVirtualMemory
 @ stdcall -private ZwUnmapViewOfSection(long ptr) NtUnmapViewOfSection
 @ stdcall -private ZwUnmapViewOfSectionEx(long ptr long) NtUnmapViewOfSectionEx
