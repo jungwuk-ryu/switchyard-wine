@@ -76,7 +76,19 @@ static enum appx_manifest_unsupported_reason
     " MaxVersionTested=\"10.0.65535.0\"/>"
 #define REQUIRED_DEPENDENCIES \
     "<Dependencies>" TARGET_FAMILY "</Dependencies>"
-#define REQUIRED_STRUCTURE REQUIRED_PROPERTIES REQUIRED_DEPENDENCIES
+#define REQUIRED_RESOURCES "<Resources/>"
+#define REQUIRED_STRUCTURE \
+    REQUIRED_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+#define WINDOWS8_NAMESPACE \
+    "http://schemas.microsoft.com/appx/2010/manifest"
+#define WINDOWS8_IDENTITY \
+    "<Identity Name=\"Wine.Legacy\" Publisher=\"CN=Wine\"" \
+    " Version=\"1.2.3.4\"/>"
+#define WINDOWS8_RESOURCES \
+    "<Resources><Resource Language=\"en-us\"/></Resources>"
+#define WINDOWS8_PREREQUISITES \
+    "<Prerequisites><OSMinVersion>6.2</OSMinVersion>" \
+    "<OSMaxVersionTested>6.3.1</OSMaxVersionTested></Prerequisites>"
 
 static const char valid_manifest[] =
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
@@ -88,6 +100,7 @@ static const char valid_manifest[] =
     " Version=\"1.2.3.4\" ProcessorArchitecture=\"x64\"/>"
     "<Properties><DisplayName>Store</DisplayName><PublisherDisplayName>Microsoft</PublisherDisplayName>"
     "<Logo>Assets\\Logo.png</Logo></Properties>"
+    "<Resources/>"
     "<Dependencies><TargetDeviceFamily Name=\"Windows.Desktop\" MinVersion=\"10.0.0.0\""
     " MaxVersionTested=\"10.0.65535.0\"/></Dependencies>"
     "<Applications><Application Id=\"Store\" Executable=\"Store.exe\""
@@ -204,6 +217,268 @@ static void test_identity(void)
     p_appx_manifest_free( manifest );
 }
 
+static void test_windows8_manifest(void)
+{
+    static const char valid[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        "<Prerequisites><OSMaxVersionTested>6.3.1</OSMaxVersionTested>"
+        "<OSMinVersion>6.2</OSMinVersion></Prerequisites>"
+        "<Dependencies><PackageDependency Name=\"Wine.Framework\""
+        " Publisher=\"CN=Wine\"/></Dependencies></Package>";
+    static const char start_page[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Applications><Application Id=\"App\" StartPage=\"default.html\">"
+        "<VisualElements DisplayName=\"App\" Logo=\"logo.png\"/>"
+        "</Application></Applications></Package>";
+    static const char missing_resources[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_PREREQUISITES
+        "</Package>";
+    static const char empty_resources[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES "<Resources/>"
+        WINDOWS8_PREREQUISITES "</Package>";
+    static const char missing_maximum[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        "<Prerequisites><OSMinVersion>6.2</OSMinVersion></Prerequisites>"
+        "</Package>";
+    static const char leading_zero[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        "<Prerequisites><OSMinVersion>06.2</OSMinVersion>"
+        "<OSMaxVersionTested>6.3</OSMaxVersionTested></Prerequisites>"
+        "</Package>";
+    static const char reversed_versions[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        "<Prerequisites><OSMinVersion>6.3.1</OSMinVersion>"
+        "<OSMaxVersionTested>6.3</OSMaxVersionTested></Prerequisites>"
+        "</Package>";
+    static const char invalid_resource[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES
+        "<Resources><Resource Language=\"en-us\" Scale=\"100\"/></Resources>"
+        WINDOWS8_PREREQUISITES "</Package>";
+    static const char invalid_then_valid_resource[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES
+        "<Resources><Resource Scale=\"100\"/>"
+        "<Resource Language=\"en-us\"/></Resources>"
+        WINDOWS8_PREREQUISITES "</Package>";
+    static const char future_restricted_capability[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\""
+        " xmlns:rescap=\"http://schemas.microsoft.com/appx/manifest/"
+        "foundation/windows10/restrictedcapabilities\""
+        " IgnorableNamespaces=\"rescap\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Capabilities><rescap:Capability Name=\"runFullTrust\"/>"
+        "</Capabilities></Package>";
+    static const char executable_without_architecture[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Applications><Application Id=\"App\" Executable=\"app.exe\""
+        " EntryPoint=\"App.Main\"><VisualElements/>"
+        "</Application></Applications></Package>";
+    static const char unsupported_architecture[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        "<Identity Name=\"Wine.Legacy\" Publisher=\"CN=Wine\""
+        " Version=\"1.2.3.4\" ProcessorArchitecture=\"arm64\"/>"
+        REQUIRED_PROPERTIES WINDOWS8_RESOURCES WINDOWS8_PREREQUISITES
+        "</Package>";
+    static const char resource_package_property[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY
+        "<Properties><ResourcePackage>true</ResourcePackage>"
+        REQUIRED_PROPERTY_CHILDREN "</Properties>"
+        WINDOWS8_RESOURCES WINDOWS8_PREREQUISITES "</Package>";
+    static const char future_dependency_attribute[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Dependencies><PackageDependency Name=\"Wine.Framework\""
+        " MaxMajorVersionTested=\"2\"/></Dependencies></Package>";
+    static const char missing_visual_elements[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Applications><Application Id=\"App\" StartPage=\"default.html\"/>"
+        "</Applications></Package>";
+    static const char invalid_application_id[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Applications><Application Id=\"9App\" StartPage=\"default.html\">"
+        "<VisualElements/></Application></Applications></Package>";
+    static const char unsafe_start_page[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY REQUIRED_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Applications><Application Id=\"App\" StartPage=\"..\\default.html\">"
+        "<VisualElements/></Application></Applications></Package>";
+    static const char executable_uwp[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        "<Identity Name=\"Wine.Legacy\" Publisher=\"CN=Wine\""
+        " Version=\"1.2.3.4\" ProcessorArchitecture=\"x86\"/>"
+        REQUIRED_PROPERTIES WINDOWS8_RESOURCES WINDOWS8_PREREQUISITES
+        "<Applications><Application Id=\"App\" Executable=\"app.exe\""
+        " EntryPoint=\"windows.fullTrustApplication\"><VisualElements/>"
+        "</Application></Applications></Package>";
+    static const char framework[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY FRAMEWORK_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES "</Package>";
+    static const char framework_with_dependency[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY FRAMEWORK_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Dependencies><PackageDependency Name=\"Wine.Framework\"/>"
+        "</Dependencies></Package>";
+    static const char framework_with_capability[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY FRAMEWORK_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES
+        "<Capabilities><Capability Name=\"internetClient\"/>"
+        "</Capabilities></Package>";
+    static const char framework_with_extensions[] =
+        "<Package xmlns=\"" WINDOWS8_NAMESPACE "\">"
+        WINDOWS8_IDENTITY FRAMEWORK_PROPERTIES WINDOWS8_RESOURCES
+        WINDOWS8_PREREQUISITES "<Extensions/></Package>";
+    const struct appx_manifest_application *application;
+    const struct appx_manifest_dependency *dependency;
+    const struct appx_manifest_identity *identity;
+    APPX_MANIFEST *manifest = NULL;
+    HRESULT hr;
+
+    hr = parse_text( valid, &manifest );
+    ok( hr == S_OK, "Windows 8 manifest returned %#lx.\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        identity = p_appx_manifest_get_identity( manifest );
+        ok( identity->architecture == APPX_MANIFEST_ARCHITECTURE_NEUTRAL,
+            "got architecture %u.\n", identity->architecture );
+        ok( !lstrcmpW( identity->full_name,
+                        L"Wine.Legacy_1.2.3.4_neutral__cb087t8t9s0q4" ),
+            "got full name %s.\n", wine_dbgstr_w(identity->full_name) );
+        ok( p_appx_manifest_get_dependency_count( manifest ) == 1,
+            "got %u dependencies.\n",
+            p_appx_manifest_get_dependency_count( manifest ) );
+        dependency = p_appx_manifest_get_dependency( manifest, 0 );
+        ok( !dependency->min_version.major &&
+            !dependency->min_version.minor &&
+            !dependency->min_version.build &&
+            !dependency->min_version.revision,
+            "got default minimum version %u.%u.%u.%u.\n",
+            dependency->min_version.major, dependency->min_version.minor,
+            dependency->min_version.build, dependency->min_version.revision );
+        p_appx_manifest_free( manifest );
+    }
+
+    hr = parse_text( start_page, &manifest );
+    ok( hr == S_OK, "Windows 8 StartPage manifest returned %#lx.\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        application = p_appx_manifest_get_application( manifest, 0 );
+        ok( !!application, "StartPage application is missing.\n" );
+        ok( application && !application->executable,
+            "StartPage application unexpectedly has an executable.\n" );
+        ok( has_reason( manifest,
+                        APPX_MANIFEST_UNSUPPORTED_UWP_APPLICATION ),
+            "StartPage unsupported reason is missing.\n" );
+        p_appx_manifest_free( manifest );
+    }
+
+    hr = parse_text( missing_resources, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST, "missing resources returned %#lx.\n", hr );
+    hr = parse_text( empty_resources, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST, "empty resources returned %#lx.\n", hr );
+    hr = parse_text( missing_maximum, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST, "missing maximum returned %#lx.\n", hr );
+    hr = parse_text( leading_zero, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST, "leading-zero version returned %#lx.\n", hr );
+    hr = parse_text( reversed_versions, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST, "reversed versions returned %#lx.\n", hr );
+    hr = parse_text( invalid_resource, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST, "invalid resource returned %#lx.\n", hr );
+    hr = parse_text( invalid_then_valid_resource, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "invalid then valid resource returned %#lx.\n", hr );
+
+    hr = parse_text( future_restricted_capability, &manifest );
+    ok( hr == S_OK, "future restricted capability returned %#lx.\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        ok( !p_appx_manifest_has_run_full_trust( manifest ),
+            "Windows 10 capability changed Windows 8 trust semantics.\n" );
+        ok( has_reason( manifest,
+                        APPX_MANIFEST_UNSUPPORTED_IGNORABLE_CONTENT ),
+            "ignored-content reason is missing.\n" );
+        p_appx_manifest_free( manifest );
+    }
+
+    hr = parse_text( executable_without_architecture, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "executable without architecture returned %#lx.\n", hr );
+    hr = parse_text( unsupported_architecture, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "unsupported architecture returned %#lx.\n", hr );
+    hr = parse_text( resource_package_property, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "legacy ResourcePackage returned %#lx.\n", hr );
+    hr = parse_text( future_dependency_attribute, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "future dependency attribute returned %#lx.\n", hr );
+    hr = parse_text( missing_visual_elements, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "missing VisualElements returned %#lx.\n", hr );
+    hr = parse_text( invalid_application_id, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "invalid application id returned %#lx.\n", hr );
+    hr = parse_text( unsafe_start_page, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "unsafe StartPage returned %#lx.\n", hr );
+
+    hr = parse_text( executable_uwp, &manifest );
+    ok( hr == S_OK, "legacy executable UWP returned %#lx.\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        application = p_appx_manifest_get_application( manifest, 0 );
+        ok( application && application->activation_kind ==
+                APPX_MANIFEST_ACTIVATION_UNSUPPORTED,
+            "legacy executable has activation kind %u.\n",
+            application ? application->activation_kind : ~0u );
+        ok( !p_appx_manifest_has_run_full_trust( manifest ),
+            "legacy executable gained runFullTrust.\n" );
+        ok( has_reason( manifest,
+                        APPX_MANIFEST_UNSUPPORTED_UWP_APPLICATION ),
+            "legacy executable UWP reason is missing.\n" );
+        p_appx_manifest_free( manifest );
+    }
+
+    hr = parse_text( framework, &manifest );
+    ok( hr == S_OK, "legacy framework returned %#lx.\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        ok( p_appx_manifest_is_framework( manifest ),
+            "legacy framework flag is missing.\n" );
+        p_appx_manifest_free( manifest );
+    }
+    hr = parse_text( framework_with_dependency, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "legacy framework with dependency returned %#lx.\n", hr );
+    hr = parse_text( framework_with_capability, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "legacy framework with capability returned %#lx.\n", hr );
+    hr = parse_text( framework_with_extensions, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "legacy framework with extensions returned %#lx.\n", hr );
+}
+
 static void test_namespaces(void)
 {
     static const char prefixed_root[] =
@@ -214,6 +489,7 @@ static void test_namespaces(void)
         "<f:Properties><f:DisplayName>Wine</f:DisplayName>"
         "<f:PublisherDisplayName>Wine</f:PublisherDisplayName>"
         "<f:Logo>logo.png</f:Logo></f:Properties>"
+        "<f:Resources/>"
         "<f:Dependencies><f:TargetDeviceFamily Name=\"Windows.Desktop\""
         " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.65535.0\"/>"
         "</f:Dependencies>"
@@ -238,21 +514,21 @@ static void test_namespaces(void)
         " xmlns:x=\"urn:future\" IgnorableNamespaces=\"x\">"
         "<Identity Name=\"Wine.Test\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES REQUIRED_DEPENDENCIES
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
         "<x:ActivationOverride Mode=\"hosted\"/></Package>";
     static const char unknown_required[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\""
         " xmlns:x=\"urn:future\">"
         "<Identity Name=\"Wine.Test\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES REQUIRED_DEPENDENCIES
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
         "<x:FuturePackageKind/></Package>";
     static const char rebound_ignorable[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\""
         " xmlns:x=\"urn:declared\" IgnorableNamespaces=\"x\">"
         "<Identity Name=\"Wine.Test\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES REQUIRED_DEPENDENCIES
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
         "<x:FuturePackageKind xmlns:x=\"urn:rebound\"/></Package>";
     static const char wrong_root[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows8\"/>";
@@ -261,7 +537,7 @@ static void test_namespaces(void)
         REQUIRED_DEPENDENCIES
         "<Identity Name=\"Wine.Interleaved\" Publisher=\"CN=Wine\""
         " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES
         "</Package>";
     APPX_MANIFEST *manifest = NULL;
     HRESULT hr;
@@ -320,19 +596,25 @@ static void test_required_structure(void)
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.MissingProperties\" Publisher=\"CN=Wine\""
         " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
-        REQUIRED_DEPENDENCIES
+        REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
         "</Package>";
     static const char missing_dependencies[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.MissingDependencies\" Publisher=\"CN=Wine\""
         " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES
+        "</Package>";
+    static const char missing_resources[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.MissingResources\" Publisher=\"CN=Wine\""
+        " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_DEPENDENCIES
         "</Package>";
     static const char empty_dependencies[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.EmptyDependencies\" Publisher=\"CN=Wine\""
         " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES
         "<Dependencies/>"
         "</Package>";
     static const char missing_display_name[] =
@@ -342,7 +624,7 @@ static void test_required_structure(void)
         "<Properties><Framework>true</Framework>"
         "<PublisherDisplayName>Wine</PublisherDisplayName><Logo>logo.png</Logo>"
         "</Properties>"
-        REQUIRED_DEPENDENCIES
+        REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
         "</Package>";
     static const char missing_publisher_display_name[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
@@ -350,7 +632,7 @@ static void test_required_structure(void)
         " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
         "<Properties><Framework>true</Framework>"
         "<DisplayName>Wine</DisplayName><Logo>logo.png</Logo></Properties>"
-        REQUIRED_DEPENDENCIES
+        REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
         "</Package>";
     static const char missing_logo[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
@@ -359,13 +641,13 @@ static void test_required_structure(void)
         "<Properties><Framework>true</Framework>"
         "<DisplayName>Wine</DisplayName>"
         "<PublisherDisplayName>Wine</PublisherDisplayName></Properties>"
-        REQUIRED_DEPENDENCIES
+        REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
         "</Package>";
     static const char missing_max_version[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.MissingMaxVersion\" Publisher=\"CN=Wine\""
         " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES
         "<Dependencies><TargetDeviceFamily Name=\"Windows.Desktop\""
         " MinVersion=\"10.0.0.0\"/></Dependencies>"
         "</Package>";
@@ -373,6 +655,7 @@ static void test_required_structure(void)
     {
         missing_properties,
         missing_dependencies,
+        missing_resources,
         empty_dependencies,
         missing_display_name,
         missing_publisher_display_name,
@@ -612,10 +895,12 @@ static void test_dependencies_and_classes(void)
 {
     static const char manifest_text[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\""
-        " xmlns:uap6=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/6\">"
+        " xmlns:uap6=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/6\""
+        " xmlns:rescap=\"http://schemas.microsoft.com/appx/manifest/"
+        "foundation/windows10/restrictedcapabilities\">"
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"2.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES
+        REQUIRED_PROPERTIES REQUIRED_RESOURCES
         "<Dependencies>"
         "<TargetDeviceFamily Name=\"Windows.Universal\" MinVersion=\"10.0.17763.0\""
         " MaxVersionTested=\"10.0.22621.0\"/>"
@@ -623,6 +908,10 @@ static void test_dependencies_and_classes(void)
         " Publisher=\"CN=Microsoft Corporation\" MinVersion=\"8000.0.0.0\""
         " MaxMajorVersionTested=\"8000\" uap6:Optional=\"false\"/>"
         "</Dependencies>"
+        "<Applications><Application Id=\"App\" Executable=\"app.exe\""
+        " EntryPoint=\"windows.fullTrustApplication\"/></Applications>"
+        "<Capabilities><rescap:Capability Name=\"runFullTrust\"/>"
+        "</Capabilities>"
         "<Extensions><Extension Category=\"windows.activatableClass.inProcessServer\">"
         "<InProcessServer><Path>runtime\\server.dll</Path>"
         "<ActivatableClass ActivatableClassId=\"Wine.Runtime.Class\" ThreadingModel=\"both\"/>"
@@ -634,15 +923,17 @@ static void test_dependencies_and_classes(void)
         " xmlns:uap6=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/6\">"
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES
+        REQUIRED_PROPERTIES REQUIRED_RESOURCES
         "<Dependencies>" TARGET_FAMILY
         "<PackageDependency Name=\"Wine.Dependency\" Publisher=\"CN=Wine\""
-        " MinVersion=\"1.0.0.0\" uap6:Optional=\"true\"/></Dependencies></Package>";
+        " MinVersion=\"1.0.0.0\" uap6:Optional=\"true\"/></Dependencies>"
+        "<Applications><Application Id=\"App\" Executable=\"app.exe\""
+        " EntryPoint=\"windows.fullTrustApplication\"/></Applications></Package>";
     static const char duplicate_dependency[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES "<Dependencies>" TARGET_FAMILY
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES "<Dependencies>" TARGET_FAMILY
         "<PackageDependency Name=\"Wine.Dependency\" Publisher=\"CN=Wine\" MinVersion=\"1.0.0.0\"/>"
         "<PackageDependency Name=\"wine.dependency\" Publisher=\"cn=wine\" MinVersion=\"2.0.0.0\"/>"
         "</Dependencies></Package>";
@@ -650,7 +941,7 @@ static void test_dependencies_and_classes(void)
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES "<Dependencies>" TARGET_FAMILY
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES "<Dependencies>" TARGET_FAMILY
         "<PackageDependency Name=\"Wine.Dependency\" Publisher=\"CN=First\""
         " MinVersion=\"1.0.0.0\"/>"
         "<PackageDependency Name=\"wine.dependency\" Publisher=\"CN=Second\""
@@ -660,16 +951,49 @@ static void test_dependencies_and_classes(void)
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES "<Dependencies>" TARGET_FAMILY
+        REQUIRED_PROPERTIES REQUIRED_RESOURCES "<Dependencies>" TARGET_FAMILY
         "<PackageDependency Name=\"Wine.Unsigned\" MinVersion=\"1.0.0.0\"/>"
-        "</Dependencies></Package>";
+        "</Dependencies><Applications><Application Id=\"App\""
+        " Executable=\"app.exe\" EntryPoint=\"windows.fullTrustApplication\"/>"
+        "</Applications></Package>";
     static const char outproc[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES REQUIRED_DEPENDENCIES "<Extensions>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "<Extensions>"
         "<Extension Category=\"windows.activatableClass.outOfProcessServer\">"
         "<OutOfProcessServer/></Extension></Extensions></Package>";
+    static const char framework_dependency[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES "<Dependencies>" TARGET_FAMILY
+        "<PackageDependency Name=\"Wine.Dependency\" Publisher=\"CN=Wine\""
+        " MinVersion=\"1.0.0.0\"/></Dependencies></Package>";
+    static const char framework_capability[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "<Capabilities><Capability Name=\"internetClient\"/>"
+        "</Capabilities></Package>";
+    static const char framework_application[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "<Applications><Application Id=\"App\" Executable=\"app.exe\""
+        " EntryPoint=\"windows.fullTrustApplication\"/></Applications></Package>";
+    static const char inproc_without_architecture[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "<Extensions><Extension Category=\"windows.activatableClass.inProcessServer\">"
+        "<InProcessServer><Path>runtime\\server.dll</Path>"
+        "<ActivatableClass ActivatableClassId=\"Wine.Runtime.Class\""
+        " ThreadingModel=\"both\"/></InProcessServer></Extension>"
+        "</Extensions></Package>";
     const struct appx_manifest_inproc_class *class;
     const struct appx_manifest_dependency *dependency;
     APPX_MANIFEST *manifest = NULL;
@@ -680,7 +1004,8 @@ static void test_dependencies_and_classes(void)
     if (SUCCEEDED(hr))
     {
         ok( p_appx_manifest_is_supported( manifest ), "manifest is unsupported.\n" );
-        ok( p_appx_manifest_is_framework( manifest ), "framework flag is missing.\n" );
+        ok( !p_appx_manifest_is_framework( manifest ),
+            "unexpected framework flag.\n" );
         ok( p_appx_manifest_get_dependency_count( manifest ) == 1,
             "got %u dependencies.\n",
             p_appx_manifest_get_dependency_count( manifest ) );
@@ -723,6 +1048,18 @@ static void test_dependencies_and_classes(void)
     ok( hr == APPX_E_INVALID_MANIFEST, "got hr %#lx.\n", hr );
     hr = parse_text( duplicate_name_different_publisher, &manifest );
     ok( hr == APPX_E_INVALID_MANIFEST, "got hr %#lx.\n", hr );
+    hr = parse_text( framework_dependency, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "framework dependency returned %#lx.\n", hr );
+    hr = parse_text( framework_capability, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "framework capability returned %#lx.\n", hr );
+    hr = parse_text( framework_application, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "framework application returned %#lx.\n", hr );
+    hr = parse_text( inproc_without_architecture, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "in-process server without architecture returned %#lx.\n", hr );
 
     hr = parse_text( unsigned_dependency, &manifest );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
@@ -792,11 +1129,57 @@ static void test_security_and_limits(void)
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine\" Version=\"65536.0.0.0\""
         " ProcessorArchitecture=\"neutral\"/>"
         "<Properties><Framework>true</Framework></Properties></Package>";
+    static const char reserved_identity[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"CON.package\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "</Package>";
+    static const char trailing_dot_identity[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "</Package>";
+    static const char idn_identity[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.xn--bad\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "</Package>";
     static const char resource_package[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.Resources\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ResourceId=\"en-US\"/>"
+        RESOURCE_PROPERTIES
+        "<Resources><Resource Language=\"en-US\"/></Resources></Package>";
+    static const char resource_package_with_architecture[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.Resources\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
         " ProcessorArchitecture=\"neutral\" ResourceId=\"en-US\"/>"
-        RESOURCE_PROPERTIES REQUIRED_DEPENDENCIES "</Package>";
+        RESOURCE_PROPERTIES
+        "<Resources><Resource Language=\"en-US\"/></Resources></Package>";
+    static const char resource_package_with_dependencies[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.Resources\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ResourceId=\"en-US\"/>"
+        RESOURCE_PROPERTIES
+        "<Resources><Resource Language=\"en-US\"/></Resources>"
+        REQUIRED_DEPENDENCIES "</Package>";
+    static const char resource_package_mixed_element[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.Resources\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ResourceId=\"en-US\"/>"
+        RESOURCE_PROPERTIES
+        "<Resources><Resource Language=\"en-US\" Scale=\"100\"/>"
+        "</Resources></Package>";
+    static const char resource_package_mixed_types[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
+        "<Identity Name=\"Wine.Resources\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ResourceId=\"en-US\"/>"
+        RESOURCE_PROPERTIES
+        "<Resources><Resource Language=\"en-US\"/><Resource Scale=\"100\"/>"
+        "</Resources></Package>";
     static const BYTE invalid_utf8[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=\xc0\xaf\" Version=\"1.0.0.0\""
@@ -823,6 +1206,15 @@ static void test_security_and_limits(void)
     ok( hr == APPX_E_INVALID_MANIFEST, "got hr %#lx.\n", hr );
     hr = parse_text( overflow_version, &manifest );
     ok( hr == APPX_E_INVALID_MANIFEST, "got hr %#lx.\n", hr );
+    hr = parse_text( reserved_identity, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "reserved identity returned %#lx.\n", hr );
+    hr = parse_text( trailing_dot_identity, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "trailing-dot identity returned %#lx.\n", hr );
+    hr = parse_text( idn_identity, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "IDN identity returned %#lx.\n", hr );
 
     hr = parse_text( resource_package, &manifest );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
@@ -834,6 +1226,18 @@ static void test_security_and_limits(void)
             "resource-package reason is missing.\n" );
         p_appx_manifest_free( manifest );
     }
+    hr = parse_text( resource_package_with_architecture, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "resource package with architecture returned %#lx.\n", hr );
+    hr = parse_text( resource_package_with_dependencies, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "resource package with dependencies returned %#lx.\n", hr );
+    hr = parse_text( resource_package_mixed_element, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "resource package with mixed element returned %#lx.\n", hr );
+    hr = parse_text( resource_package_mixed_types, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "resource package with mixed qualifier types returned %#lx.\n", hr );
 
     many_applications = HeapAlloc( GetProcessHeap(), 0, 32768 );
     ok( !!many_applications, "allocation failed.\n" );
@@ -859,7 +1263,8 @@ static void test_embedded_nul_and_predefined_entity(void)
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.Framework\" Publisher=\"CN=Wine &amp; Project\""
         " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES REQUIRED_DEPENDENCIES "</Package>";
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "</Package>";
     static const BYTE embedded_nul[] =
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "\0</Package>";
@@ -868,7 +1273,7 @@ static void test_embedded_nul_and_predefined_entity(void)
         "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\">"
         "<Identity Name=\"Wine.Comment\" Publisher=\"CN=Wine\""
         " Version=\"1.0.0.0\" ProcessorArchitecture=\"neutral\"/>"
-        FRAMEWORK_PROPERTIES REQUIRED_DEPENDENCIES
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
         "</Package>";
     const struct appx_manifest_identity *identity;
     APPX_MANIFEST *manifest = NULL;
@@ -932,6 +1337,7 @@ START_TEST(manifest)
     }
     test_arguments();
     test_identity();
+    test_windows8_manifest();
     test_namespaces();
     test_required_structure();
     test_activation();

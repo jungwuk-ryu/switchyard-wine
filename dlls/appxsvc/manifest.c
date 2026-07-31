@@ -43,9 +43,16 @@
 #define XML_MAX_VALUE_BYTES              65536
 #define XML_MAX_INPROC_SERVERS           128
 #define XML_MAX_CLASSES_PER_SERVER       256
+#define XML_MAX_RESOURCES                200
+
+#define RESOURCE_QUALIFIER_LANGUAGE      0x00000001
+#define RESOURCE_QUALIFIER_SCALE         0x00000002
+#define RESOURCE_QUALIFIER_DX_FEATURE    0x00000004
 
 static const xmlChar foundation_namespace[] =
     "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+static const xmlChar windows8_namespace[] =
+    "http://schemas.microsoft.com/appx/2010/manifest";
 static const xmlChar uap_namespace[] =
     "http://schemas.microsoft.com/appx/manifest/uap/windows10";
 static const xmlChar uap6_namespace[] =
@@ -87,6 +94,7 @@ struct parser
 {
     xmlTextReaderPtr reader;
     APPX_MANIFEST *manifest;
+    const xmlChar *foundation_uri;
     struct ignorable_namespace ignorable[XML_MAX_IGNORABLE_NAMESPACES];
     UINT32 ignorable_count;
     UINT32 node_count;
@@ -96,6 +104,9 @@ struct parser
     BOOL identity_seen;
     BOOL properties_seen;
     BOOL resources_seen;
+    BOOL prerequisites_seen;
+    BOOL os_min_version_seen;
+    BOOL os_max_version_seen;
     BOOL dependencies_seen;
     BOOL applications_seen;
     BOOL capabilities_seen;
@@ -105,6 +116,14 @@ struct parser
     BOOL display_name_seen;
     BOOL publisher_display_name_seen;
     BOOL logo_seen;
+    BOOL windows8_schema;
+    BOOL architecture_seen;
+    BOOL executable_code_seen;
+    BOOL mixed_resource_qualifier;
+    UINT32 resource_count;
+    UINT32 resource_qualifier_types;
+    UINT16 os_min_version[3];
+    UINT16 os_max_version[3];
     HRESULT hr;
 };
 
@@ -138,6 +157,11 @@ static BOOL node_is( struct parser *parser, const xmlChar *uri, const char *loca
 {
     return xml_equal( xmlTextReaderConstNamespaceUri( parser->reader ), uri ) &&
            xml_equal( xmlTextReaderConstLocalName( parser->reader ), BAD_CAST local );
+}
+
+static BOOL foundation_node_is( struct parser *parser, const char *local )
+{
+    return node_is( parser, parser->foundation_uri, local );
 }
 
 static HRESULT parser_fail( struct parser *parser, HRESULT hr )
@@ -585,6 +609,8 @@ static BOOL is_ascii_identity_character( WCHAR character )
            character == '.' || character == '-';
 }
 
+static BOOL reserved_dos_component( const WCHAR *component, UINT32 length );
+
 static BOOL validate_identity_name( const WCHAR *name, UINT32 minimum, UINT32 maximum,
                                     BOOL allow_empty )
 {
@@ -594,6 +620,18 @@ static BOOL validate_identity_name( const WCHAR *name, UINT32 minimum, UINT32 ma
     if (length < minimum || length > maximum) return FALSE;
     for (i = 0; i < length; i++)
         if (!is_ascii_identity_character( name[i] )) return FALSE;
+    if (name[length - 1] == '.' ||
+        reserved_dos_component( name, length ) ||
+        (length >= 4 &&
+         CompareStringOrdinal( name, 4, L"xn--", 4, TRUE ) == CSTR_EQUAL))
+        return FALSE;
+    for (i = 0; i + 5 <= length; i++)
+    {
+        if (name[i] == '.' &&
+            CompareStringOrdinal( name + i + 1, 4, L"xn--", 4,
+                                  TRUE ) == CSTR_EQUAL)
+            return FALSE;
+    }
     return TRUE;
 }
 
@@ -674,7 +712,7 @@ static BOOL validate_package_relative_path( const WCHAR *path, UINT32 maximum,
         }
         if (ch < 0x20 || ch == 0xfffe || ch == 0xffff ||
             ch == ':' || ch == '*' || ch == '?' || ch == '"' ||
-            ch == '<' || ch == '>' || ch == '|')
+            ch == '<' || ch == '>' || ch == '|' || ch == '%')
             return FALSE;
     }
 
@@ -967,7 +1005,7 @@ static HRESULT handle_unknown_element( struct parser *parser, BOOL semantic )
         xmlTextReaderConstPrefix( parser->reader ) );
 
     if (xml_equal( uri, xinclude_namespace ) ||
-        !*uri || xml_equal( uri, foundation_namespace ))
+        !*uri || xml_equal( uri, parser->foundation_uri ))
         return parser_fail( parser, APPX_E_INVALID_MANIFEST );
     if (prefix_is_ignorable( parser, prefix, uri ))
     {
@@ -1044,7 +1082,7 @@ static HRESULT parse_ignorable_namespaces( struct parser *parser,
             !(declaration = find_namespace_declaration(
                   attributes, start, length )) ||
             !*declaration->value ||
-            xml_equal( declaration->value, foundation_namespace ) ||
+            xml_equal( declaration->value, parser->foundation_uri ) ||
             xml_equal( declaration->value, xmlns_namespace ))
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
 
@@ -1090,10 +1128,10 @@ static HRESULT parse_identity_element( struct parser *parser )
         FAILED(require_attribute( parser, &attributes, BAD_CAST "", "Publisher",
                                   &publisher )) ||
         FAILED(require_attribute( parser, &attributes, BAD_CAST "", "Version",
-                                  &version )) ||
-        FAILED(require_attribute( parser, &attributes, BAD_CAST "",
-                                  "ProcessorArchitecture", &architecture )))
+                                  &version )))
         goto done;
+    architecture = take_attribute( &attributes, BAD_CAST "",
+                                   "ProcessorArchitecture" );
     resource_id = take_attribute( &attributes, BAD_CAST "", "ResourceId" );
     if (FAILED(finish_attributes( parser, &attributes, TRUE ))) goto done;
 
@@ -1109,9 +1147,11 @@ static HRESULT parse_identity_element( struct parser *parser )
         goto done;
     if (resource_id)
     {
-        if (FAILED(xml_to_wstring( parser, resource_id->value, 0, 30,
+        if (FAILED(xml_to_wstring( parser, resource_id->value,
+                                   parser->windows8_schema ? 1 : 0, 30,
                                    (WCHAR **)&identity->resource_id )) ||
-            !validate_identity_name( identity->resource_id, 1, 30, TRUE ))
+            !validate_identity_name( identity->resource_id, 1, 30,
+                                     !parser->windows8_schema ))
         {
             parser_fail( parser, APPX_E_INVALID_MANIFEST );
             goto done;
@@ -1122,10 +1162,21 @@ static HRESULT parse_identity_element( struct parser *parser )
         parser_fail( parser, E_OUTOFMEMORY );
         goto done;
     }
+    identity->architecture = APPX_MANIFEST_ARCHITECTURE_NEUTRAL;
+    parser->architecture_seen = architecture != NULL;
     if (FAILED(parse_version( parser, version->value, &identity->version )) ||
-        FAILED(parse_architecture( parser, architecture->value,
-                                   &identity->architecture )) ||
-        FAILED(derive_publisher_id( parser, identity->publisher,
+        (architecture &&
+         FAILED(parse_architecture( parser, architecture->value,
+                                    &identity->architecture ))))
+        goto done;
+    if (parser->windows8_schema &&
+        (identity->architecture == APPX_MANIFEST_ARCHITECTURE_ARM64 ||
+         identity->architecture == APPX_MANIFEST_ARCHITECTURE_X86A64))
+    {
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        goto done;
+    }
+    if (FAILED(derive_publisher_id( parser, identity->publisher,
                                     (WCHAR **)&identity->publisher_id )) ||
         FAILED(make_identity_names( parser )) ||
         FAILED(consume_empty_element( parser )))
@@ -1213,25 +1264,25 @@ static HRESULT parse_properties_element( struct parser *parser )
             xmlTextReaderDepth( parser->reader ) != depth + 1)
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
 
-        if (node_is( parser, foundation_namespace, "DisplayName" ))
+        if (foundation_node_is( parser, "DisplayName" ))
         {
             if (FAILED(parse_required_property(
                     parser, &parser->display_name_seen, FALSE )))
                 return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "PublisherDisplayName" ))
+        else if (foundation_node_is( parser, "PublisherDisplayName" ))
         {
             if (FAILED(parse_required_property(
                     parser, &parser->publisher_display_name_seen, FALSE )))
                 return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Logo" ))
+        else if (foundation_node_is( parser, "Logo" ))
         {
             if (FAILED(parse_required_property(
                     parser, &parser->logo_seen, TRUE )))
                 return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Framework" ))
+        else if (foundation_node_is( parser, "Framework" ))
         {
             if (parser->framework_seen)
                 return parser_fail( parser, APPX_E_INVALID_MANIFEST );
@@ -1240,7 +1291,8 @@ static HRESULT parse_properties_element( struct parser *parser )
                     parser, &parser->manifest->framework )))
                 return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "ResourcePackage" ))
+        else if (!parser->windows8_schema &&
+                 foundation_node_is( parser, "ResourcePackage" ))
         {
             if (parser->resource_package_seen)
                 return parser_fail( parser, APPX_E_INVALID_MANIFEST );
@@ -1249,7 +1301,7 @@ static HRESULT parse_properties_element( struct parser *parser )
                     parser, &parser->manifest->resource_package )))
                 return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Description" ))
+        else if (foundation_node_is( parser, "Description" ))
         {
             if (FAILED(skip_current_element( parser ))) return parser->hr;
         }
@@ -1260,6 +1312,65 @@ static HRESULT parse_properties_element( struct parser *parser )
            parser_fail( parser, APPX_E_INVALID_MANIFEST );
 
 done:
+    hr = parser->hr;
+    free_attributes( &attributes );
+    return hr;
+}
+
+static HRESULT parse_resource_element( struct parser *parser )
+{
+    struct xml_attributes attributes;
+    struct xml_attribute *language, *scale = NULL, *dx_feature = NULL;
+    WCHAR *value = NULL;
+    HRESULT hr;
+
+    if (parser->resource_count >= XML_MAX_RESOURCES)
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
+    language = take_attribute( &attributes, BAD_CAST "", "Language" );
+    if (!parser->windows8_schema)
+    {
+        scale = take_attribute( &attributes, BAD_CAST "", "Scale" );
+        dx_feature = take_attribute( &attributes, BAD_CAST "",
+                                     "DXFeatureLevel" );
+    }
+    if ((!language && !scale && !dx_feature) ||
+        (parser->windows8_schema && !language))
+    {
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        goto done;
+    }
+    if (FAILED(finish_attributes( parser, &attributes, FALSE )))
+        goto done;
+    if (language)
+    {
+        parser->resource_qualifier_types |= RESOURCE_QUALIFIER_LANGUAGE;
+        if (FAILED(xml_to_wstring( parser, language->value, 1, 85, &value )))
+            goto done;
+        HeapFree( GetProcessHeap(), 0, value );
+        value = NULL;
+    }
+    if (scale)
+    {
+        parser->resource_qualifier_types |= RESOURCE_QUALIFIER_SCALE;
+        if (FAILED(xml_to_wstring( parser, scale->value, 1, 16, &value )))
+            goto done;
+        HeapFree( GetProcessHeap(), 0, value );
+        value = NULL;
+    }
+    if (dx_feature)
+    {
+        parser->resource_qualifier_types |= RESOURCE_QUALIFIER_DX_FEATURE;
+        if (FAILED(xml_to_wstring( parser, dx_feature->value, 1, 32, &value )))
+            goto done;
+    }
+    if (!!language + !!scale + !!dx_feature != 1)
+        parser->mixed_resource_qualifier = TRUE;
+    if (FAILED(consume_empty_element( parser ))) goto done;
+    parser->resource_count++;
+
+done:
+    HeapFree( GetProcessHeap(), 0, value );
     hr = parser->hr;
     free_attributes( &attributes );
     return hr;
@@ -1277,25 +1388,147 @@ static HRESULT parse_resources_element( struct parser *parser )
     if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
     if (FAILED(finish_attributes( parser, &attributes, FALSE ))) goto done;
     free_attributes( &attributes );
-    if (xmlTextReaderIsEmptyElement( parser->reader )) return S_OK;
+    if (xmlTextReaderIsEmptyElement( parser->reader ))
+        return parser->windows8_schema ?
+               parser_fail( parser, APPX_E_INVALID_MANIFEST ) : S_OK;
 
     while ((result = read_node( parser )) == 1)
     {
         type = xmlTextReaderNodeType( parser->reader );
         if (type == XML_READER_TYPE_END_ELEMENT &&
             xmlTextReaderDepth( parser->reader ) == depth)
-            return S_OK;
+            return !parser->windows8_schema || parser->resource_count ?
+                   S_OK : parser_fail( parser, APPX_E_INVALID_MANIFEST );
         if (type == XML_READER_TYPE_COMMENT || current_text_is_whitespace( parser ))
             continue;
         if (type != XML_READER_TYPE_ELEMENT ||
             xmlTextReaderDepth( parser->reader ) != depth + 1)
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
-        if (node_is( parser, foundation_namespace, "Resource" ))
+        if (foundation_node_is( parser, "Resource" ))
         {
-            if (FAILED(skip_current_element( parser ))) return parser->hr;
+            if (FAILED(parse_resource_element( parser ))) return parser->hr;
         }
         else if (FAILED(handle_unknown_element( parser, FALSE )))
             return parser->hr;
+    }
+    return FAILED(parser->hr) ? parser->hr :
+           parser_fail( parser, APPX_E_INVALID_MANIFEST );
+
+done:
+    hr = parser->hr;
+    free_attributes( &attributes );
+    return hr;
+}
+
+static HRESULT parse_os_version( struct parser *parser, const WCHAR *text,
+                                 UINT16 version[3] )
+{
+    const WCHAR *cursor = text;
+    UINT32 part;
+
+    memset( version, 0, 3 * sizeof(*version) );
+    for (part = 0; part < 3; part++)
+    {
+        UINT32 digits = 0, value = 0;
+
+        if (*cursor < '0' || *cursor > '9')
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        if (*cursor == '0' && cursor[1] >= '0' && cursor[1] <= '9')
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        while (*cursor >= '0' && *cursor <= '9')
+        {
+            value = value * 10 + (*cursor++ - '0');
+            if (++digits > 5 || value > 0xffff)
+                return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        }
+        version[part] = value;
+        if (!*cursor)
+            return part >= 1 ? S_OK :
+                   parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        if (*cursor++ != '.' || part == 2)
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    }
+    return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+}
+
+static HRESULT parse_os_version_element( struct parser *parser, BOOL *seen,
+                                         UINT16 version[3] )
+{
+    struct xml_attributes attributes;
+    WCHAR *text = NULL;
+    HRESULT hr;
+
+    if (*seen) return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    *seen = TRUE;
+    if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
+    if (FAILED(finish_attributes( parser, &attributes, TRUE ))) goto done;
+    if (FAILED(parse_simple_text( parser, 17, &text ))) goto done;
+    parse_os_version( parser, text, version );
+
+done:
+    HeapFree( GetProcessHeap(), 0, text );
+    hr = parser->hr;
+    free_attributes( &attributes );
+    return hr;
+}
+
+static HRESULT parse_prerequisites_element( struct parser *parser )
+{
+    struct xml_attributes attributes;
+    int depth = xmlTextReaderDepth( parser->reader ), result, type;
+    UINT32 i;
+    HRESULT hr;
+
+    if (parser->prerequisites_seen)
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    parser->prerequisites_seen = TRUE;
+    if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
+    if (FAILED(finish_attributes( parser, &attributes, TRUE ))) goto done;
+    free_attributes( &attributes );
+    if (xmlTextReaderIsEmptyElement( parser->reader ))
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+
+    while ((result = read_node( parser )) == 1)
+    {
+        type = xmlTextReaderNodeType( parser->reader );
+        if (type == XML_READER_TYPE_END_ELEMENT &&
+            xmlTextReaderDepth( parser->reader ) == depth)
+        {
+            if (!parser->os_min_version_seen ||
+                !parser->os_max_version_seen)
+                return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+            for (i = 0; i < 3; i++)
+            {
+                if (parser->os_min_version[i] <
+                    parser->os_max_version[i])
+                    return S_OK;
+                if (parser->os_min_version[i] >
+                    parser->os_max_version[i])
+                    return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+            }
+            return S_OK;
+        }
+        if (type == XML_READER_TYPE_COMMENT || current_text_is_whitespace( parser ))
+            continue;
+        if (type != XML_READER_TYPE_ELEMENT ||
+            xmlTextReaderDepth( parser->reader ) != depth + 1)
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        if (foundation_node_is( parser, "OSMinVersion" ))
+        {
+            if (FAILED(parse_os_version_element(
+                    parser, &parser->os_min_version_seen,
+                    parser->os_min_version )))
+                return parser->hr;
+        }
+        else if (foundation_node_is( parser, "OSMaxVersionTested" ))
+        {
+            if (FAILED(parse_os_version_element(
+                    parser, &parser->os_max_version_seen,
+                    parser->os_max_version )))
+                return parser->hr;
+        }
+        else
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
     }
     return FAILED(parser->hr) ? parser->hr :
            parser_fail( parser, APPX_E_INVALID_MANIFEST );
@@ -1359,20 +1592,28 @@ static HRESULT parse_package_dependency_element( struct parser *parser )
     if (!(dependency = append_dependency( parser ))) return parser->hr;
     if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
     name = publisher = min_version = max_major = optional = NULL;
-    if (FAILED(require_attribute( parser, &attributes, BAD_CAST "", "Name", &name )) ||
-        FAILED(require_attribute( parser, &attributes, BAD_CAST "", "MinVersion",
-                                  &min_version )))
+    if (FAILED(require_attribute( parser, &attributes, BAD_CAST "", "Name", &name )))
         goto done;
+    min_version = take_attribute( &attributes, BAD_CAST "", "MinVersion" );
+    if (!min_version && !parser->windows8_schema)
+    {
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        goto done;
+    }
     publisher = take_attribute( &attributes, BAD_CAST "", "Publisher" );
-    max_major = take_attribute( &attributes, BAD_CAST "", "MaxMajorVersionTested" );
-    optional = take_attribute( &attributes, uap6_namespace, "Optional" );
+    if (!parser->windows8_schema)
+        max_major = take_attribute( &attributes, BAD_CAST "",
+                                    "MaxMajorVersionTested" );
+    if (!parser->windows8_schema)
+        optional = take_attribute( &attributes, uap6_namespace, "Optional" );
     if (FAILED(finish_attributes( parser, &attributes, TRUE ))) goto done;
 
     if (FAILED(xml_to_wstring( parser, name->value, 3, 50,
                                (WCHAR **)&dependency->name )) ||
         !validate_identity_name( dependency->name, 3, 50, FALSE ) ||
-        FAILED(parse_version( parser, min_version->value,
-                              &dependency->min_version )))
+        (min_version &&
+         FAILED(parse_version( parser, min_version->value,
+                               &dependency->min_version ))))
     {
         parser_fail( parser, APPX_E_INVALID_MANIFEST );
         goto done;
@@ -1533,7 +1774,9 @@ static HRESULT parse_dependencies_element( struct parser *parser )
         type = xmlTextReaderNodeType( parser->reader );
         if (type == XML_READER_TYPE_END_ELEMENT &&
             xmlTextReaderDepth( parser->reader ) == depth)
-            return parser->manifest->target_family_count ? S_OK :
+            return (parser->windows8_schema ?
+                    parser->manifest->dependency_count :
+                    parser->manifest->target_family_count) ? S_OK :
                    parser_fail( parser, APPX_E_INVALID_MANIFEST );
         if (type == XML_READER_TYPE_COMMENT || current_text_is_whitespace( parser ))
             continue;
@@ -1541,12 +1784,13 @@ static HRESULT parse_dependencies_element( struct parser *parser )
             xmlTextReaderDepth( parser->reader ) != depth + 1)
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
 
-        if (node_is( parser, foundation_namespace, "PackageDependency" ))
+        if (foundation_node_is( parser, "PackageDependency" ))
         {
             if (FAILED(parse_package_dependency_element( parser )))
                 return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "TargetDeviceFamily" ))
+        else if (!parser->windows8_schema &&
+                 foundation_node_is( parser, "TargetDeviceFamily" ))
         {
             if (FAILED(parse_target_family_element( parser )))
                 return parser->hr;
@@ -1621,18 +1865,19 @@ static HRESULT parse_capabilities_element( struct parser *parser )
             xmlTextReaderDepth( parser->reader ) != depth + 1)
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
 
-        if (node_is( parser, foundation_namespace, "Capability" ) ||
-            node_is( parser, foundation_namespace, "DeviceCapability" ))
+        if (foundation_node_is( parser, "Capability" ) ||
+            foundation_node_is( parser, "DeviceCapability" ))
         {
             if (FAILED(parse_capability_element( parser, FALSE )))
                 return parser->hr;
         }
-        else if (node_is( parser, rescap_namespace, "Capability" ))
+        else if (!parser->windows8_schema &&
+                 node_is( parser, rescap_namespace, "Capability" ))
         {
             if (FAILED(parse_capability_element( parser, TRUE )))
                 return parser->hr;
         }
-        else if (FAILED(handle_unknown_element( parser, FALSE )))
+        else if (FAILED(handle_unknown_element( parser, TRUE )))
             return parser->hr;
     }
     return FAILED(parser->hr) ? parser->hr :
@@ -1777,7 +2022,7 @@ static HRESULT parse_inproc_server_element( struct parser *parser )
             goto done_no_attrs;
         }
 
-        if (node_is( parser, foundation_namespace, "Path" ))
+        if (foundation_node_is( parser, "Path" ))
         {
             if (path_seen)
             {
@@ -1787,7 +2032,7 @@ static HRESULT parse_inproc_server_element( struct parser *parser )
             path_seen = TRUE;
             if (FAILED(parse_path_element( parser, &path ))) goto done_no_attrs;
         }
-        else if (node_is( parser, foundation_namespace, "ActivatableClass" ))
+        else if (foundation_node_is( parser, "ActivatableClass" ))
         {
             if (manifest->class_count - start_class >= XML_MAX_CLASSES_PER_SERVER)
             {
@@ -1804,6 +2049,7 @@ static HRESULT parse_inproc_server_element( struct parser *parser )
         if (SUCCEEDED(parser->hr)) parser_fail( parser, APPX_E_INVALID_MANIFEST );
         goto done_no_attrs;
     }
+    parser->executable_code_seen = TRUE;
     for (i = start_class; i < manifest->class_count; i++)
     {
         if (!(manifest->classes[i].path = duplicate_wstring( path )))
@@ -1858,7 +2104,7 @@ static HRESULT parse_extension_element( struct parser *parser )
                 if (type != XML_READER_TYPE_ELEMENT ||
                     xmlTextReaderDepth( parser->reader ) != depth + 1)
                     return parser_fail( parser, APPX_E_INVALID_MANIFEST );
-                if (node_is( parser, foundation_namespace, "InProcessServer" ))
+                if (foundation_node_is( parser, "InProcessServer" ))
                 {
                     if (server_seen)
                         return parser_fail( parser, APPX_E_INVALID_MANIFEST );
@@ -1917,7 +2163,7 @@ static HRESULT parse_extensions_element( struct parser *parser, BOOL package_lev
         if (type != XML_READER_TYPE_ELEMENT ||
             xmlTextReaderDepth( parser->reader ) != depth + 1)
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
-        if (node_is( parser, foundation_namespace, "Extension" ))
+        if (foundation_node_is( parser, "Extension" ))
         {
             if (FAILED(parse_extension_element( parser ))) return parser->hr;
         }
@@ -1987,6 +2233,40 @@ static BOOL valid_application_id( const WCHAR *id )
     return TRUE;
 }
 
+static BOOL valid_windows8_application_id( const WCHAR *id )
+{
+    UINT32 component_start = 0, i, length = lstrlenW( id );
+
+    if (!length || length > 64) return FALSE;
+    for (i = 0; i <= length; i++)
+    {
+        WCHAR ch = i < length ? id[i] : '.';
+        UINT32 component_length;
+
+        if (ch == '.')
+        {
+            component_length = i - component_start;
+            if (!component_length ||
+                reserved_dos_component( id + component_start,
+                                        component_length ))
+                return FALSE;
+            component_start = i + 1;
+            continue;
+        }
+        if (i == component_start)
+        {
+            if (!((ch >= 'A' && ch <= 'Z') ||
+                  (ch >= 'a' && ch <= 'z')))
+                return FALSE;
+        }
+        else if (!((ch >= 'A' && ch <= 'Z') ||
+                   (ch >= 'a' && ch <= 'z') ||
+                   (ch >= '0' && ch <= '9')))
+            return FALSE;
+    }
+    return TRUE;
+}
+
 static HRESULT determine_application_activation(
     struct parser *parser, struct appx_manifest_application *application )
 {
@@ -1994,6 +2274,18 @@ static HRESULT determine_application_activation(
         application->entry_point, L"windows.fullTrustApplication" );
     BOOL runtime = application->runtime_behavior != NULL;
     BOOL trust = application->trust_level != NULL;
+
+    /*
+     * The Windows 8 schema describes AppContainer applications only.  A
+     * future namespace or an entry-point spelling must never promote one to
+     * the packaged-desktop activation path.
+     */
+    if (parser->windows8_schema)
+    {
+        application->activation_kind = APPX_MANIFEST_ACTIVATION_UNSUPPORTED;
+        return add_unsupported_reason(
+            parser, APPX_MANIFEST_UNSUPPORTED_UWP_APPLICATION );
+    }
 
     if (application->entry_point)
     {
@@ -2066,43 +2358,64 @@ static HRESULT parse_application_element( struct parser *parser )
     struct xml_attributes attributes;
     struct xml_attribute *id, *executable, *entry_point, *runtime_behavior;
     struct xml_attribute *trust_level, *parameters, *current_directory, *start_page;
+    WCHAR *start_page_path = NULL;
     int depth = xmlTextReaderDepth( parser->reader ), result, type;
-    BOOL extensions_seen = FALSE;
+    BOOL extensions_seen = FALSE, visual_elements_seen = FALSE;
     HRESULT hr;
 
     if (!(application = append_application( parser ))) return parser->hr;
     if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
     id = executable = entry_point = runtime_behavior = trust_level = NULL;
     parameters = current_directory = start_page = NULL;
-    if (FAILED(require_attribute( parser, &attributes, BAD_CAST "", "Id", &id )) ||
-        FAILED(require_attribute( parser, &attributes, BAD_CAST "", "Executable",
-                                  &executable )))
+    if (FAILED(require_attribute( parser, &attributes, BAD_CAST "", "Id", &id )))
         goto done;
+    executable = take_attribute( &attributes, BAD_CAST "", "Executable" );
     entry_point = take_attribute( &attributes, BAD_CAST "", "EntryPoint" );
-    runtime_behavior = take_attribute( &attributes, uap10_namespace,
-                                       "RuntimeBehavior" );
-    trust_level = take_attribute( &attributes, uap10_namespace, "TrustLevel" );
-    parameters = take_attribute( &attributes, uap11_namespace, "Parameters" );
-    current_directory = take_attribute( &attributes, uap11_namespace,
-                                        "CurrentDirectoryPath" );
+    if (!parser->windows8_schema)
+    {
+        runtime_behavior = take_attribute( &attributes, uap10_namespace,
+                                           "RuntimeBehavior" );
+        trust_level = take_attribute( &attributes, uap10_namespace,
+                                      "TrustLevel" );
+        parameters = take_attribute( &attributes, uap11_namespace,
+                                     "Parameters" );
+        current_directory = take_attribute( &attributes, uap11_namespace,
+                                            "CurrentDirectoryPath" );
+    }
     start_page = take_attribute( &attributes, BAD_CAST "", "StartPage" );
-    if (start_page && (entry_point || runtime_behavior || trust_level))
+    if ((start_page &&
+         (executable || entry_point || runtime_behavior || trust_level)) ||
+        (!start_page && !executable) ||
+        (parser->windows8_schema && !start_page && !entry_point))
     {
         parser_fail( parser, APPX_E_INVALID_MANIFEST );
         goto done;
     }
-    if (start_page && FAILED(add_unsupported_reason(
-            parser, APPX_MANIFEST_UNSUPPORTED_UWP_APPLICATION )))
-        goto done;
     if (FAILED(finish_attributes( parser, &attributes, TRUE ))) goto done;
 
     if (FAILED(xml_to_wstring( parser, id->value, 1, 64,
                                (WCHAR **)&application->id )) ||
-        !valid_application_id( application->id ) ||
-        FAILED(xml_to_wstring( parser, executable->value, 1, 256,
-                               (WCHAR **)&application->executable )) ||
-        !validate_package_relative_path(
-            application->executable, 256, L".exe" ))
+        !(parser->windows8_schema ?
+          valid_windows8_application_id( application->id ) :
+          valid_application_id( application->id )))
+    {
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        goto done;
+    }
+    if (executable &&
+        (FAILED(xml_to_wstring( parser, executable->value, 1, 256,
+                                (WCHAR **)&application->executable )) ||
+         !validate_package_relative_path(
+             application->executable, 256, L".exe" )))
+    {
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        goto done;
+    }
+    if (executable) parser->executable_code_seen = TRUE;
+    if (start_page &&
+        (FAILED(xml_to_wstring( parser, start_page->value, 1, 256,
+                                &start_page_path )) ||
+         !validate_package_relative_path( start_page_path, 256, NULL )))
     {
         parser_fail( parser, APPX_E_INVALID_MANIFEST );
         goto done;
@@ -2143,41 +2456,73 @@ static HRESULT parse_application_element( struct parser *parser )
     if (FAILED(determine_application_activation( parser, application ))) goto done;
     free_attributes( &attributes );
 
-    if (xmlTextReaderIsEmptyElement( parser->reader )) return S_OK;
+    if (xmlTextReaderIsEmptyElement( parser->reader ))
+    {
+        hr = parser->windows8_schema ?
+             parser_fail( parser, APPX_E_INVALID_MANIFEST ) : S_OK;
+        goto done_no_attrs;
+    }
     while ((result = read_node( parser )) == 1)
     {
         type = xmlTextReaderNodeType( parser->reader );
         if (type == XML_READER_TYPE_END_ELEMENT &&
             xmlTextReaderDepth( parser->reader ) == depth)
-            return S_OK;
+        {
+            hr = !parser->windows8_schema || visual_elements_seen ?
+                 S_OK : parser_fail( parser, APPX_E_INVALID_MANIFEST );
+            goto done_no_attrs;
+        }
         if (type == XML_READER_TYPE_COMMENT || current_text_is_whitespace( parser ))
             continue;
         if (type != XML_READER_TYPE_ELEMENT ||
             xmlTextReaderDepth( parser->reader ) != depth + 1)
-            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        {
+            parser_fail( parser, APPX_E_INVALID_MANIFEST );
+            goto done_no_attrs;
+        }
 
-        if (node_is( parser, foundation_namespace, "Extensions" ))
+        if (foundation_node_is( parser, "Extensions" ))
         {
             if (extensions_seen)
-                return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+            {
+                parser_fail( parser, APPX_E_INVALID_MANIFEST );
+                goto done_no_attrs;
+            }
             extensions_seen = TRUE;
             if (FAILED(parse_extensions_element( parser, FALSE )))
-                return parser->hr;
+                goto done_no_attrs;
         }
-        else if (node_is( parser, uap_namespace, "VisualElements" ))
+        else if ((!parser->windows8_schema &&
+                  node_is( parser, uap_namespace, "VisualElements" )) ||
+                 (parser->windows8_schema &&
+                  foundation_node_is( parser, "VisualElements" )))
         {
+            if (visual_elements_seen)
+            {
+                parser_fail( parser, APPX_E_INVALID_MANIFEST );
+                goto done_no_attrs;
+            }
+            visual_elements_seen = TRUE;
             /* This subtree changes presentation, not execution semantics. */
-            if (FAILED(skip_current_element( parser ))) return parser->hr;
+            if (FAILED(skip_current_element( parser ))) goto done_no_attrs;
+        }
+        else if (parser->windows8_schema &&
+                 foundation_node_is( parser, "ApplicationContentUriRules" ))
+        {
+            if (FAILED(skip_current_element( parser ))) goto done_no_attrs;
         }
         else if (FAILED(handle_unknown_element( parser, TRUE )))
-            return parser->hr;
+            goto done_no_attrs;
     }
-    return FAILED(parser->hr) ? parser->hr :
-           parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    hr = FAILED(parser->hr) ? parser->hr :
+         parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    goto done_no_attrs;
 
 done:
     hr = parser->hr;
     free_attributes( &attributes );
+done_no_attrs:
+    HeapFree( GetProcessHeap(), 0, start_page_path );
     return hr;
 }
 
@@ -2208,7 +2553,7 @@ static HRESULT parse_applications_element( struct parser *parser )
         if (type != XML_READER_TYPE_ELEMENT ||
             xmlTextReaderDepth( parser->reader ) != depth + 1)
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
-        if (node_is( parser, foundation_namespace, "Application" ))
+        if (foundation_node_is( parser, "Application" ))
         {
             if (FAILED(parse_application_element( parser ))) return parser->hr;
         }
@@ -2228,10 +2573,24 @@ static HRESULT parse_package_element( struct parser *parser )
 {
     struct xml_attributes attributes;
     struct xml_attribute *ignorable;
+    const xmlChar *namespace_uri;
     int depth = xmlTextReaderDepth( parser->reader ), result, type;
     HRESULT hr;
 
-    if (!node_is( parser, foundation_namespace, "Package" ) || depth != 0)
+    namespace_uri = empty_xml_string(
+        xmlTextReaderConstNamespaceUri( parser->reader ) );
+    if (!xml_equal( xmlTextReaderConstLocalName( parser->reader ),
+                    BAD_CAST "Package" ) ||
+        depth != 0)
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    if (xml_equal( namespace_uri, foundation_namespace ))
+        parser->foundation_uri = foundation_namespace;
+    else if (xml_equal( namespace_uri, windows8_namespace ))
+    {
+        parser->foundation_uri = windows8_namespace;
+        parser->windows8_schema = TRUE;
+    }
+    else
         return parser_fail( parser, APPX_E_INVALID_MANIFEST );
     if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
     ignorable = take_attribute( &attributes, BAD_CAST "", "IgnorableNamespaces" );
@@ -2255,43 +2614,82 @@ static HRESULT parse_package_element( struct parser *parser )
             xmlTextReaderDepth( parser->reader ) != depth + 1)
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
 
-        if (node_is( parser, foundation_namespace, "Identity" ))
+        if (foundation_node_is( parser, "Identity" ))
         {
             if (FAILED(parse_identity_element( parser ))) return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Properties" ))
+        else if (foundation_node_is( parser, "Properties" ))
         {
             if (FAILED(parse_properties_element( parser ))) return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Resources" ))
+        else if (foundation_node_is( parser, "Resources" ))
         {
             if (FAILED(parse_resources_element( parser ))) return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Dependencies" ))
+        else if (parser->windows8_schema &&
+                 foundation_node_is( parser, "Prerequisites" ))
+        {
+            if (FAILED(parse_prerequisites_element( parser )))
+                return parser->hr;
+        }
+        else if (foundation_node_is( parser, "Dependencies" ))
         {
             if (FAILED(parse_dependencies_element( parser ))) return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Capabilities" ))
+        else if (foundation_node_is( parser, "Capabilities" ))
         {
             if (FAILED(parse_capabilities_element( parser ))) return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Applications" ))
+        else if (foundation_node_is( parser, "Applications" ))
         {
             if (FAILED(parse_applications_element( parser ))) return parser->hr;
         }
-        else if (node_is( parser, foundation_namespace, "Extensions" ))
+        else if (foundation_node_is( parser, "Extensions" ))
         {
             if (FAILED(parse_extensions_element( parser, TRUE ))) return parser->hr;
         }
         else if (FAILED(handle_unknown_element( parser, TRUE )))
             return parser->hr;
     }
-    if (result != 1 || !parser->identity_seen || !parser->properties_seen ||
-        !parser->dependencies_seen || !parser->manifest->target_family_count)
+    if (result != 1 || !parser->identity_seen || !parser->properties_seen)
         return FAILED(parser->hr) ? parser->hr :
                parser_fail( parser, APPX_E_INVALID_MANIFEST );
-    if (!parser->manifest->application_count &&
-        !parser->manifest->framework && !parser->manifest->resource_package)
+    if (parser->windows8_schema)
+    {
+        if (!parser->resources_seen || !parser->resource_count ||
+            !parser->prerequisites_seen)
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        if (parser->manifest->framework &&
+            (parser->dependencies_seen || parser->capabilities_seen ||
+             parser->extensions_seen || parser->applications_seen))
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    }
+    else if (parser->manifest->resource_package)
+    {
+        if (!parser->resources_seen || parser->architecture_seen ||
+            parser->dependencies_seen || parser->capabilities_seen ||
+            parser->extensions_seen || parser->applications_seen ||
+            parser->manifest->framework ||
+            parser->mixed_resource_qualifier ||
+            !parser->resource_qualifier_types ||
+            (parser->resource_qualifier_types &
+             (parser->resource_qualifier_types - 1)))
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    }
+    else
+    {
+        if (!parser->resources_seen ||
+            !parser->dependencies_seen ||
+            !parser->manifest->target_family_count ||
+            (!parser->manifest->application_count &&
+             !parser->manifest->framework))
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    }
+    if (parser->executable_code_seen && !parser->architecture_seen)
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    if (!parser->windows8_schema && parser->manifest->framework &&
+        (parser->manifest->dependency_count || parser->capabilities_seen ||
+         parser->applications_seen))
         return parser_fail( parser, APPX_E_INVALID_MANIFEST );
     if (parser->manifest->framework && parser->manifest->resource_package)
         return parser_fail( parser, APPX_E_INVALID_MANIFEST );
