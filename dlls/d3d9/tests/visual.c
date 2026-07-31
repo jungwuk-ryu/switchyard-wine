@@ -10666,7 +10666,7 @@ cleanup:
 static void test_fragment_coords(void)
 {
     IDirect3DSurface9 *surface = NULL, *backbuffer;
-    IDirect3DPixelShader9 *shader, *shader_frac;
+    IDirect3DPixelShader9 *shader, *shader_frac, *shader_masked_io, *shader_unmasked_io;
     IDirect3DVertexShader9 *vshader;
     IDirect3DDevice9 *device;
     unsigned int color;
@@ -10706,15 +10706,39 @@ static void test_fragment_coords(void)
         0x02000001, 0x800f0800, 0x80e40000,                                     /* mov oC0, r0                */
         0x0000ffff                                                              /* end                        */
     };
+    static const DWORD shader_masked_io_code[] =
+    {
+        0xffff0300,                                                             /* ps_3_0                          */
+        0x0200001f, 0x80050005, 0x900c0000,                                     /* dcl_texcoord5 v0.zw             */
+        0x04000004, 0x80060000, 0x90f80000, 0xa0000000, 0xa0550000,             /* mad r0.yz, v0.xzww, c0.x, c0.y  */
+        0x02000001, 0x80010000, 0x80550000,                                     /* mov r0.x, r0.y                  */
+        0x02000001, 0x80020000, 0x80aa0000,                                     /* mov r0.y, r0.z                  */
+        0x02000001, 0x800c0000, 0xa0550000,                                     /* mov r0.zw, c0.y                 */
+        0x02000001, 0x800f0800, 0x80e40000,                                     /* mov oC0, r0                     */
+        0x0000ffff                                                              /* end                             */
+    };
+    static const DWORD shader_unmasked_io_code[] =
+    {
+        0xffff0300,                                                             /* ps_3_0                          */
+        0x05000051, 0xa00f0001, 0x00000000, 0x3f000000, 0x00000000, 0x00000000, /* def c1, 0.0, 0.5, 0.0, 0.0       */
+        0x0200001f, 0x80050005, 0x900c0000,                                     /* dcl_texcoord5 v0.zw             */
+        0x03000011, 0x80060000, 0x90f80000, 0xa0e40001,                         /* dst r0.yz, v0.xzww, c1          */
+        0x02000001, 0x80010000, 0x80550000,                                     /* mov r0.x, r0.y                  */
+        0x02000001, 0x80020000, 0x80aa0000,                                     /* mov r0.y, r0.z                  */
+        0x02000001, 0x800c0000, 0xa0000001,                                     /* mov r0.zw, c1.x                 */
+        0x02000001, 0x800f0800, 0x80e40000,                                     /* mov oC0, r0                     */
+        0x0000ffff                                                              /* end                             */
+    };
     static const DWORD vshader_code[] =
     {
-        0xfffe0300,                                                             /* vs_3_0               */
-        0x0200001f, 0x80000000, 0x900f0000,                                     /* dcl_position v0      */
-        0x0200001f, 0x80000000, 0xe00f0000,                                     /* dcl_position o0      */
-        0x0200001f, 0x80050005, 0xe00c0001,                                     /* dcl_texcoord5 o1.zw  */
-        0x02000001, 0xe00f0000, 0x90e40000,                                     /* mov o0, v0           */
-        0x02000001, 0xe00c0001, 0x90aa0000,                                     /* mov o1.zw, v0.zzzz   */
-        0x0000ffff                                                              /* end                  */
+        0xfffe0300,                                                             /* vs_3_0                              */
+        0x05000051, 0xa00f0000, 0x3e800000, 0x3f400000, 0x00000000, 0x00000000, /* def c0, 0.25, 0.75, 0.0, 0.0        */
+        0x0200001f, 0x80000000, 0x900f0000,                                     /* dcl_position v0                     */
+        0x0200001f, 0x80000000, 0xe00f0000,                                     /* dcl_position o0                     */
+        0x0200001f, 0x80050005, 0xe00c0001,                                     /* dcl_texcoord5 o1.zw                 */
+        0x02000001, 0xe00f0000, 0x90e40000,                                     /* mov o0, v0                          */
+        0x02000001, 0xe00c0001, 0xa0400000,                                     /* mov o1.zw, c0.xxxy                  */
+        0x0000ffff                                                              /* end                                 */
     };
     static const float quad[] =
     {
@@ -10751,6 +10775,10 @@ static void test_fragment_coords(void)
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     hr = IDirect3DDevice9_CreatePixelShader(device, shader_frac_code, &shader_frac);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_CreatePixelShader(device, shader_masked_io_code, &shader_masked_io);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_CreatePixelShader(device, shader_unmasked_io_code, &shader_unmasked_io);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
     hr = IDirect3DDevice9_SetPixelShader(device, shader);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     hr = IDirect3DDevice9_SetVertexShader(device, vshader);
@@ -10780,8 +10808,44 @@ static void test_fragment_coords(void)
     ok(color == 0x0000ffff, "vPos: Pixel 320,240 has color 0x%08x, expected 0x0000ffff\n", color);
     IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
 
+    hr = IDirect3DDevice9_SetPixelShader(device, shader_masked_io);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff0000ff, 1.0f, 0);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(SUCCEEDED(hr), "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetPixelShaderConstantF(device, 0, constant, 1);
+    ok(SUCCEEDED(hr), "Failed to set pixel shader constant, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(float) * 5);
+    ok(SUCCEEDED(hr), "Failed to draw, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(SUCCEEDED(hr), "Failed to end scene, hr %#lx.\n", hr);
+
+    color = getPixelColor(device, 320, 240);
+    ok(color_match(color, 0x0040bf00, 2),
+            "Masked input: Pixel 320,240 has color 0x%08x, expected 0x0040bf00\n", color);
+    IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
+
+    hr = IDirect3DDevice9_SetPixelShader(device, shader_unmasked_io);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff0000ff, 1.0f, 0);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(SUCCEEDED(hr), "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(float) * 5);
+    ok(SUCCEEDED(hr), "Failed to draw, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(SUCCEEDED(hr), "Failed to end scene, hr %#lx.\n", hr);
+
+    color = getPixelColor(device, 320, 240);
+    ok(color_match(color, 0x0020bf00, 2),
+            "Unmasked input: Pixel 320,240 has color 0x%08x, expected 0x0020bf00\n", color);
+    IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
+
     hr = IDirect3DDevice9_CreateRenderTarget(device, 32, 32, D3DFMT_X8R8G8B8, 0, 0, TRUE,
                                              &surface, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetPixelShader(device, shader);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     hr = IDirect3DDevice9_BeginScene(device);
     ok(SUCCEEDED(hr), "Failed to begin scene, hr %#lx.\n", hr);
@@ -10847,6 +10911,8 @@ static void test_fragment_coords(void)
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     IDirect3DPixelShader9_Release(shader);
     IDirect3DPixelShader9_Release(shader_frac);
+    IDirect3DPixelShader9_Release(shader_masked_io);
+    IDirect3DPixelShader9_Release(shader_unmasked_io);
     IDirect3DVertexShader9_Release(vshader);
     if(surface) IDirect3DSurface9_Release(surface);
     IDirect3DSurface9_Release(backbuffer);

@@ -4967,6 +4967,63 @@ static unsigned int vsir_operand_normalise_arrayed_addressing(struct vsir_operan
 
 static bool vsir_src_is_masked(enum vkd3d_shader_opcode opcode, unsigned int src_idx);
 
+static uint32_t vsir_src_get_io_read_mask(const struct vkd3d_shader_instruction *ins, unsigned int src_idx)
+{
+    const uint32_t x = VKD3DSP_WRITEMASK_0, y = VKD3DSP_WRITEMASK_1;
+    const uint32_t z = VKD3DSP_WRITEMASK_2, w = VKD3DSP_WRITEMASK_3;
+    const uint32_t dst_mask = ins->dst_count ? ins->dst[0].write_mask : 0;
+    uint32_t read_mask;
+
+    if (vsir_src_is_masked(ins->opcode, src_idx))
+    {
+        VKD3D_ASSERT(ins->dst_count);
+        return dst_mask;
+    }
+
+    switch (ins->opcode)
+    {
+        case VSIR_OP_CRS:
+        case VSIR_OP_NRM:
+            return x | y | z;
+
+        case VSIR_OP_DP2:
+            return x | y;
+
+        case VSIR_OP_DP2ADD:
+            return src_idx < 2 ? x | y : x;
+
+        case VSIR_OP_DP3:
+            return x | y | z;
+
+        case VSIR_OP_DP4:
+            return x | y | z | w;
+
+        case VSIR_OP_DST:
+            if (src_idx == 0)
+            {
+                read_mask = 0;
+                if (dst_mask & y)
+                    read_mask |= y;
+                if (dst_mask & z)
+                    read_mask |= z;
+                return read_mask ? read_mask : x;
+            }
+            if (src_idx == 1)
+            {
+                read_mask = 0;
+                if (dst_mask & y)
+                    read_mask |= y;
+                if (dst_mask & w)
+                    read_mask |= w;
+                return read_mask ? read_mask : x;
+            }
+            return x;
+
+        default:
+            return x;
+    }
+}
+
 static bool vsir_dst_operand_io_normalise(struct vsir_dst_operand *dst,
         struct io_normaliser *normaliser, struct vkd3d_shader_instruction *ins)
 {
@@ -5067,6 +5124,7 @@ static void vsir_src_operand_io_normalise(struct vsir_src_operand *src, unsigned
     const struct shader_signature *signature;
     struct vsir_operand *reg = &src->reg;
     const struct signature_element *e;
+    uint32_t read_mask;
 
     /* Input/output registers from one phase can be used as inputs in
      * subsequent phases. Specifically:
@@ -5135,14 +5193,17 @@ static void vsir_src_operand_io_normalise(struct vsir_src_operand *src, unsigned
     }
 
     id_idx = reg->idx_count - 1;
-    component_idx = 0;
-    if (vsir_src_is_masked(ins->opcode, src_idx))
+    read_mask = vsir_src_get_io_read_mask(ins, src_idx);
+    for (i = 0; i < VKD3D_VEC4_SIZE; ++i)
     {
-        VKD3D_ASSERT(ins->dst_count);
-        component_idx = vsir_write_mask_get_component_idx(ins->dst[0].write_mask);
+        if (!(read_mask & (VKD3DSP_WRITEMASK_0 << i)))
+            continue;
+
+        write_mask = VKD3DSP_WRITEMASK_0 << vsir_swizzle_get_component(src->swizzle, i);
+        if (shader_signature_find_element_for_reg(signature, reg_idx, write_mask, &element_idx))
+            break;
     }
-    write_mask = VKD3DSP_WRITEMASK_0 << vsir_swizzle_get_component(src->swizzle, component_idx);
-    if (!shader_signature_find_element_for_reg(signature, reg_idx, write_mask, &element_idx))
+    if (i == VKD3D_VEC4_SIZE)
     {
         vkd3d_shader_error(normaliser->message_context, &ins->location, VKD3D_SHADER_ERROR_VSIR_INVALID_SIGNATURE,
                 "Unable to resolve I/O register type %#x, index %u, swizzle %#x, to a signature element.",
@@ -5161,8 +5222,9 @@ static void vsir_src_operand_io_normalise(struct vsir_src_operand *src, unsigned
     {
         for (i = 0; i < VKD3D_VEC4_SIZE; ++i)
         {
-            if (vsir_swizzle_get_component(src->swizzle, i))
-                src->swizzle -= component_idx << VKD3D_SHADER_SWIZZLE_SHIFT(i);
+            unsigned int component = vsir_swizzle_get_component(src->swizzle, i);
+
+            vsir_swizzle_set_component(&src->swizzle, i, component >= component_idx ? component - component_idx : 0);
         }
     }
 }
