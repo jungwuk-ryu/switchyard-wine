@@ -9,6 +9,7 @@ SOURCES = \
 	bundle_manifest.c \
 	catalog.c \
 	content_types.c \
+	extract.c \
 	graph.c \
 	main.c \
 	manifest.c \

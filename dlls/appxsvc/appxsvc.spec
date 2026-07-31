@@ -39,6 +39,8 @@
 @ stdcall -private -ret64 appx_package_inspection_get_expanded_size(ptr)
 @ stdcall -private appx_package_inspection_get_content_id(ptr ptr long)
 @ stdcall -private appx_package_inspection_open_stream(ptr long ptr)
+@ stdcall -private appx_package_extract(ptr ptr ptr)
+@ stdcall -private appx_package_extract_with_test_source(ptr ptr ptr ptr ptr)
 @ stdcall -private appx_block_map_parse(ptr long ptr)
 @ stdcall -private appx_block_map_free(ptr)
 @ stdcall -private appx_block_map_get_file_count(ptr)
