@@ -10044,16 +10044,279 @@ static void test_fontsetbuilder(void)
     ok(!refcount, "Factory not released, %u.\n", refcount);
 }
 
+static IDWriteFontFace5 *find_variable_fontface(IDWriteFactory6 *factory)
+{
+    IDWriteFontCollection *collection;
+    IDWriteFontFace5 *fontface5;
+    IDWriteFontFace *fontface;
+    IDWriteFontFamily *family;
+    IDWriteFont *font;
+    UINT32 family_count, font_count, i, j;
+    HRESULT hr;
+
+    hr = IDWriteFactory_GetSystemFontCollection((IDWriteFactory *)factory, &collection, FALSE);
+    if (FAILED(hr))
+        return NULL;
+
+    family_count = IDWriteFontCollection_GetFontFamilyCount(collection);
+    for (i = 0; i < family_count; ++i)
+    {
+        if (FAILED(IDWriteFontCollection_GetFontFamily(collection, i, &family)))
+            continue;
+
+        font_count = IDWriteFontFamily_GetFontCount(family);
+        for (j = 0; j < font_count; ++j)
+        {
+            if (FAILED(IDWriteFontFamily_GetFont(family, j, &font)))
+                continue;
+
+            fontface = NULL;
+            hr = IDWriteFont_CreateFontFace(font, &fontface);
+            IDWriteFont_Release(font);
+            if (FAILED(hr))
+                continue;
+
+            fontface5 = NULL;
+            hr = IDWriteFontFace_QueryInterface(fontface, &IID_IDWriteFontFace5, (void **)&fontface5);
+            IDWriteFontFace_Release(fontface);
+            if (SUCCEEDED(hr))
+            {
+                if (IDWriteFontFace5_HasVariations(fontface5))
+                {
+                    IDWriteFontFamily_Release(family);
+                    IDWriteFontCollection_Release(collection);
+                    return fontface5;
+                }
+                IDWriteFontFace5_Release(fontface5);
+            }
+        }
+        IDWriteFontFamily_Release(family);
+    }
+
+    IDWriteFontCollection_Release(collection);
+    return NULL;
+}
+
+static void test_variable_font_axes(void)
+{
+    DWRITE_FONT_AXIS_VALUE requested[3], reference_values[3];
+    DWRITE_FONT_AXIS_VALUE *defaults, *values;
+    DWRITE_FONT_AXIS_RANGE *ranges;
+    DWRITE_GLYPH_METRICS metrics1, metrics2;
+    IDWriteFontFaceReference1 *reference;
+    IDWriteFontFace5 *enumerated_face, *default_face, *custom_face, *face;
+    IDWriteFontResource *resource;
+    IDWriteFactory6 *factory;
+    UINT32 count, i, other_index, variable_index = ~0u;
+    float custom_value;
+    BOOL different;
+    UINT16 glyph;
+    HRESULT hr;
+
+    if (!(factory = create_factory_iid(&IID_IDWriteFactory6)))
+    {
+        win_skip("IDWriteFactory6 is not supported.\n");
+        return;
+    }
+
+    if (!(enumerated_face = find_variable_fontface(factory)))
+    {
+        win_skip("No variable system font is available.\n");
+        IDWriteFactory6_Release(factory);
+        return;
+    }
+
+    hr = IDWriteFontFace5_GetFontResource(enumerated_face, &resource);
+    ok(hr == S_OK, "Failed to get variable font resource, hr %#lx.\n", hr);
+    IDWriteFontFace5_Release(enumerated_face);
+    if (FAILED(hr))
+    {
+        IDWriteFactory6_Release(factory);
+        return;
+    }
+
+    count = IDWriteFontResource_GetFontAxisCount(resource);
+    defaults = calloc(count, sizeof(*defaults));
+    ranges = calloc(count, sizeof(*ranges));
+    values = calloc(count + 1, sizeof(*values));
+    ok(defaults && ranges && values, "Failed to allocate axis arrays.\n");
+    if (!defaults || !ranges || !values)
+        goto done;
+
+    hr = IDWriteFontResource_GetDefaultFontAxisValues(resource, defaults, count);
+    ok(hr == S_OK, "Failed to get variable axis defaults, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+    hr = IDWriteFontResource_GetFontAxisRanges(resource, ranges, count);
+    ok(hr == S_OK, "Failed to get variable axis ranges, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    for (i = 0; i < count; ++i)
+    {
+        if ((IDWriteFontResource_GetFontAxisAttributes(resource, i) & DWRITE_FONT_AXIS_ATTRIBUTES_VARIABLE)
+                && ranges[i].minValue < ranges[i].maxValue)
+        {
+            variable_index = i;
+            break;
+        }
+    }
+    ok(variable_index != ~0u, "Variable resource has no variable axis.\n");
+    if (variable_index == ~0u)
+        goto done;
+
+    custom_value = defaults[variable_index].value != ranges[variable_index].minValue
+            ? ranges[variable_index].minValue : ranges[variable_index].maxValue;
+
+    hr = IDWriteFontResource_CreateFontFace(resource, DWRITE_FONT_SIMULATIONS_NONE, NULL, 0, &default_face);
+    ok(hr == S_OK, "Failed to create default variable face, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    hr = IDWriteFontFace5_GetFontAxisValues(default_face, values, count);
+    ok(hr == S_OK, "Failed to get default face axes, hr %#lx.\n", hr);
+    for (i = 0; i < count; ++i)
+    {
+        ok(values[i].axisTag == defaults[i].axisTag, "Unexpected default axis %u tag %#x.\n",
+                i, values[i].axisTag);
+        ok(values[i].value == defaults[i].value, "Unexpected default axis %u value %f, expected %f.\n",
+                i, values[i].value, defaults[i].value);
+    }
+
+    requested[0].axisTag = defaults[variable_index].axisTag;
+    requested[0].value = custom_value;
+    hr = IDWriteFontResource_CreateFontFace(resource, DWRITE_FONT_SIMULATIONS_NONE, requested, 1, &custom_face);
+    ok(hr == S_OK, "Failed to create custom variable face, hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        IDWriteFontFace5_Release(default_face);
+        goto done;
+    }
+
+    ok(custom_face != default_face, "Custom and default variable faces shared identity.\n");
+    ok(!IDWriteFontFace5_Equals(custom_face, (IDWriteFontFace *)default_face),
+            "Custom and default variable faces compare equal.\n");
+    hr = IDWriteFontFace5_GetFontAxisValues(custom_face, values, count);
+    ok(hr == S_OK, "Failed to get custom face axes, hr %#lx.\n", hr);
+    ok(values[variable_index].value == custom_value, "Unexpected custom value %f, expected %f.\n",
+            values[variable_index].value, custom_value);
+
+    if (count > 1)
+    {
+        other_index = variable_index ? 0 : 1;
+        requested[0].axisTag = defaults[variable_index].axisTag;
+        requested[0].value = custom_value;
+        requested[1] = defaults[other_index];
+        hr = IDWriteFontResource_CreateFontFace(resource, DWRITE_FONT_SIMULATIONS_NONE, requested, 2, &face);
+        ok(hr == S_OK, "Failed to create ordered variable face, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            ok(face == custom_face, "Equivalent ordered axes changed identity.\n");
+            IDWriteFontFace5_Release(face);
+        }
+        requested[2] = requested[0];
+        requested[0] = requested[1];
+        requested[1] = requested[2];
+        hr = IDWriteFontResource_CreateFontFace(resource, DWRITE_FONT_SIMULATIONS_NONE, requested, 2, &face);
+        ok(hr == S_OK, "Failed to create reordered variable face, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            ok(face == custom_face, "Reordered axes changed identity.\n");
+            IDWriteFontFace5_Release(face);
+        }
+    }
+
+    requested[0].axisTag = defaults[variable_index].axisTag;
+    requested[0].value = custom_value;
+    requested[1].axisTag = DWRITE_MAKE_OPENTYPE_TAG('u','n','k','n');
+    requested[1].value = 123.0f;
+    requested[2].axisTag = defaults[variable_index].axisTag;
+    requested[2].value = defaults[variable_index].value;
+    hr = IDWriteFontResource_CreateFontFaceReference(resource, DWRITE_FONT_SIMULATIONS_NONE, requested,
+            ARRAY_SIZE(requested), &reference);
+    ok(hr == S_OK, "Failed to create variable face reference, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        ok(IDWriteFontFaceReference1_GetFontAxisValueCount(reference) == ARRAY_SIZE(requested),
+                "Reference did not preserve requested count.\n");
+        memset(reference_values, 0, sizeof(reference_values));
+        hr = IDWriteFontFaceReference1_GetFontAxisValues(reference, reference_values, ARRAY_SIZE(reference_values));
+        ok(hr == S_OK, "Failed to get reference axes, hr %#lx.\n", hr);
+        ok(!memcmp(reference_values, requested, sizeof(requested)), "Reference did not preserve requested axes.\n");
+
+        hr = IDWriteFontFaceReference1_CreateFontFace(reference, &face);
+        ok(hr == S_OK, "Failed to create face from variable reference, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            ok(face == custom_face, "Equivalent variable instances were not cached, %p != %p.\n",
+                    face, custom_face);
+            IDWriteFontFace5_Release(face);
+        }
+        IDWriteFontFaceReference1_Release(reference);
+    }
+
+    requested[0].axisTag = DWRITE_MAKE_OPENTYPE_TAG('u','n','k','n');
+    requested[0].value = 456.0f;
+    hr = IDWriteFontResource_CreateFontFace(resource, DWRITE_FONT_SIMULATIONS_NONE, requested, 1, &face);
+    ok(hr == S_OK, "Failed to create face with unknown axis, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        ok(face == default_face, "Unknown axis changed face identity.\n");
+        IDWriteFontFace5_Release(face);
+    }
+
+    requested[0].axisTag = defaults[variable_index].axisTag;
+    requested[0].value = ranges[variable_index].maxValue + 1000.0f;
+    hr = IDWriteFontResource_CreateFontFace(resource, DWRITE_FONT_SIMULATIONS_NONE, requested, 1, &face);
+    ok(hr == S_OK, "Failed to create clamped variable face, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        hr = IDWriteFontFace5_GetFontAxisValues(face, values, count);
+        ok(hr == S_OK, "Failed to get clamped face axes, hr %#lx.\n", hr);
+        ok(values[variable_index].value == ranges[variable_index].maxValue,
+                "Axis was not clamped, got %f, expected %f.\n", values[variable_index].value,
+                ranges[variable_index].maxValue);
+        IDWriteFontFace5_Release(face);
+    }
+
+    different = FALSE;
+    count = min(IDWriteFontFace5_GetGlyphCount(default_face), 512);
+    for (i = 0; i < count; ++i)
+    {
+        glyph = i;
+        if (FAILED(IDWriteFontFace5_GetDesignGlyphMetrics(default_face, &glyph, 1, &metrics1, FALSE))
+                || FAILED(IDWriteFontFace5_GetDesignGlyphMetrics(custom_face, &glyph, 1, &metrics2, FALSE)))
+            continue;
+        if (memcmp(&metrics1, &metrics2, sizeof(metrics1)))
+        {
+            different = TRUE;
+            break;
+        }
+    }
+    if (!different)
+        win_skip("Selected variable axis did not change metrics for the first %u glyphs.\n", count);
+
+    IDWriteFontFace5_Release(custom_face);
+    IDWriteFontFace5_Release(default_face);
+
+done:
+    free(values);
+    free(ranges);
+    free(defaults);
+    IDWriteFontResource_Release(resource);
+    IDWriteFactory6_Release(factory);
+}
+
 static void test_font_resource(void)
 {
     IDWriteFontFaceReference1 *reference, *reference2;
     IDWriteFontResource *resource, *resource2;
     IDWriteFontFile *fontfile, *fontfile2;
-    DWRITE_FONT_AXIS_VALUE axis_values[2];
-    IDWriteFontFace5 *fontface5;
+    DWRITE_FONT_AXIS_VALUE axis_values[8], default_axis_values[8], requested_values[4];
+    IDWriteFontFace5 *fontface5, *fontface5_2;
     IDWriteFontFace *fontface;
     IDWriteFactory6 *factory;
-    UINT32 count, index;
+    UINT32 count, axis_count, index, i;
     HRESULT hr;
     ULONG ref;
     BOOL ret;
@@ -10089,6 +10352,26 @@ static void test_font_resource(void)
     ret = IDWriteFontResource_HasVariations(resource);
     ok(!ret, "Expected a non-variable font.\n");
 
+    axis_count = IDWriteFontResource_GetFontAxisCount(resource);
+    ok(axis_count == 4, "Unexpected static axis count %u.\n", axis_count);
+    memset(default_axis_values, 0, sizeof(default_axis_values));
+    if (axis_count <= ARRAY_SIZE(default_axis_values))
+    {
+        hr = IDWriteFontResource_GetDefaultFontAxisValues(resource, default_axis_values, axis_count);
+        ok(hr == S_OK, "Failed to get default axis values, hr %#lx.\n", hr);
+        if (axis_count == 4)
+        {
+            ok(default_axis_values[0].axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT, "Unexpected axis 0 tag %#x.\n",
+                    default_axis_values[0].axisTag);
+            ok(default_axis_values[1].axisTag == DWRITE_FONT_AXIS_TAG_WIDTH, "Unexpected axis 1 tag %#x.\n",
+                    default_axis_values[1].axisTag);
+            ok(default_axis_values[2].axisTag == DWRITE_FONT_AXIS_TAG_ITALIC, "Unexpected axis 2 tag %#x.\n",
+                    default_axis_values[2].axisTag);
+            ok(default_axis_values[3].axisTag == DWRITE_FONT_AXIS_TAG_SLANT, "Unexpected axis 3 tag %#x.\n",
+                    default_axis_values[3].axisTag);
+        }
+    }
+
     /* Specify axis value, font has no variations. */
     axis_values[0].axisTag = DWRITE_FONT_AXIS_TAG_WEIGHT;
     axis_values[0].value = 400.0f;
@@ -10114,6 +10397,8 @@ static void test_font_resource(void)
     hr = IDWriteFontResource_CreateFontFaceReference(resource, DWRITE_FONT_SIMULATIONS_NONE, NULL, 0, &reference2);
     ok(hr == S_OK, "Failed to create reference object, hr %#lx.\n", hr);
     ok(reference != reference2, "Unexpected reference instance.\n");
+    hr = IDWriteFontFaceReference1_GetFontAxisValues(reference, NULL, 0);
+    ok(hr == S_OK, "Unexpected zero-axis reference hr %#lx.\n", hr);
     IDWriteFontFaceReference1_Release(reference2);
     IDWriteFontFaceReference1_Release(reference);
 
@@ -10122,6 +10407,61 @@ static void test_font_resource(void)
 
     ret = IDWriteFontFace5_HasVariations(fontface5);
     ok(!ret, "Expected a non-variable font.\n");
+
+    count = IDWriteFontFace5_GetFontAxisValueCount(fontface5);
+    ok(count == axis_count, "Unexpected face axis count %u, expected %u.\n", count, axis_count);
+
+    if (count && count < ARRAY_SIZE(axis_values) && count <= ARRAY_SIZE(default_axis_values))
+    {
+        memset(axis_values, 0xcc, sizeof(axis_values));
+        hr = IDWriteFontFace5_GetFontAxisValues(fontface5, axis_values, 0);
+        ok(hr == E_NOT_SUFFICIENT_BUFFER, "Unexpected zero-count hr %#lx.\n", hr);
+        hr = IDWriteFontFace5_GetFontAxisValues(fontface5, NULL, 0);
+        ok(hr == E_NOT_SUFFICIENT_BUFFER, "Unexpected NULL zero-count hr %#lx.\n", hr);
+        hr = IDWriteFontFace5_GetFontAxisValues(fontface5, axis_values, count - 1);
+        ok(hr == E_NOT_SUFFICIENT_BUFFER, "Unexpected short-buffer hr %#lx.\n", hr);
+        ok(axis_values[0].axisTag == 0xcccccccc, "Short-buffer call modified output.\n");
+
+        hr = IDWriteFontFace5_GetFontAxisValues(fontface5, axis_values, count + 1);
+        ok(hr == S_OK, "Failed to get axis values with extra space, hr %#lx.\n", hr);
+        for (i = 0; i < count; ++i)
+        {
+            ok(axis_values[i].axisTag == default_axis_values[i].axisTag,
+                    "Unexpected axis %u tag %#x, expected %#x.\n", i, axis_values[i].axisTag,
+                    default_axis_values[i].axisTag);
+            ok(axis_values[i].value == default_axis_values[i].value,
+                    "Unexpected axis %u value %f, expected %f.\n", i, axis_values[i].value,
+                    default_axis_values[i].value);
+        }
+        ok(!axis_values[count].axisTag && axis_values[count].value == 0.0f,
+                "Oversized call did not clear trailing value.\n");
+    }
+
+    requested_values[0].axisTag = DWRITE_MAKE_OPENTYPE_TAG('u','n','k','n');
+    requested_values[0].value = 123.0f;
+    requested_values[1].axisTag = DWRITE_FONT_AXIS_TAG_WEIGHT;
+    requested_values[1].value = default_axis_values[0].value + 1000.0f;
+    requested_values[2].axisTag = DWRITE_FONT_AXIS_TAG_WEIGHT;
+    requested_values[2].value = default_axis_values[0].value - 1000.0f;
+    requested_values[3].axisTag = DWRITE_FONT_AXIS_TAG_WIDTH;
+    requested_values[3].value = -1000.0f;
+    hr = IDWriteFontResource_CreateFontFace(resource, DWRITE_FONT_SIMULATIONS_NONE, requested_values,
+            ARRAY_SIZE(requested_values), &fontface5_2);
+    ok(hr == S_OK, "Failed to create static face with ignored axes, hr %#lx.\n", hr);
+    ok(fontface5_2 == fontface5, "Equivalent static instances were not cached, %p != %p.\n",
+            fontface5_2, fontface5);
+    ret = IDWriteFontFace5_Equals(fontface5_2, (IDWriteFontFace *)fontface5);
+    ok(ret, "Equivalent static instances do not compare equal.\n");
+    IDWriteFontFace5_Release(fontface5_2);
+
+    hr = IDWriteFontResource_CreateFontFace(resource, DWRITE_FONT_SIMULATIONS_BOLD, NULL, 0, &fontface5_2);
+    ok(hr == S_OK, "Failed to create simulated static face, hr %#lx.\n", hr);
+    ok(fontface5_2 != fontface5, "Simulated and unsimulated faces shared identity.\n");
+    ret = IDWriteFontFace5_Equals(fontface5_2, (IDWriteFontFace *)fontface5);
+    ok(!ret, "Simulated and unsimulated faces compare equal.\n");
+    ok(IDWriteFontFace5_GetSimulations(fontface5_2) == DWRITE_FONT_SIMULATIONS_BOLD,
+            "Unexpected simulations %#x.\n", IDWriteFontFace5_GetSimulations(fontface5_2));
+    IDWriteFontFace5_Release(fontface5_2);
 
     hr = IDWriteFontFace5_GetFontResource(fontface5, &resource2);
     ok(hr == S_OK, "Failed to get font resource, hr %#lx.\n", hr);
@@ -10193,6 +10533,14 @@ static void test_font_resource(void)
     hr = IDWriteFontFaceReference1_GetFontAxisValues(reference, axis_values, 2);
     ok(hr == S_OK, "Failed to get axis values, hr %#lx.\n", hr);
     ok(axis_values[0].axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT, "Unexpected axis tag.\n");
+
+    count = IDWriteFontFaceReference1_GetFontAxisValueCount(reference);
+    memset(axis_values, 0xcc, sizeof(axis_values));
+    hr = IDWriteFontFaceReference1_GetFontAxisValues(reference, axis_values, count + 1);
+    ok(hr == S_OK, "Failed to get oversized axis values, hr %#lx.\n", hr);
+    ok(axis_values[0].axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT, "Unexpected axis tag.\n");
+    ok(!axis_values[count].axisTag && axis_values[count].value == 0.0f,
+            "Oversized call did not clear trailing value.\n");
 
     hr = IDWriteFontFaceReference1_CreateFontFace(reference, &fontface5);
     ok(hr == S_OK, "Failed to create a font face, hr %#lx.\n", hr);
@@ -10781,6 +11129,7 @@ START_TEST(font)
     test_AnalyzeContainerType();
     test_fontsetbuilder();
     test_font_resource();
+    test_variable_font_axes();
     test_IsColorFont();
     test_GetVerticalGlyphVariants();
     test_expiration_event();

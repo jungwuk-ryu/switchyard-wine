@@ -942,7 +942,8 @@ void factory_unlock(IDWriteFactory7 *iface)
 }
 
 HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * const *font_files, UINT32 index,
-        DWRITE_FONT_SIMULATIONS simulations, struct list **cached_list, REFIID riid, void **obj)
+        DWRITE_FONT_SIMULATIONS simulations, const DWRITE_FONT_AXIS_VALUE *axis_values,
+        unsigned int axis_values_count, struct list **cached_list, REFIID riid, void **obj)
 {
     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
     struct fontfacecached *cached;
@@ -981,10 +982,12 @@ HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * co
 
     /* search through cache list */
     LIST_FOR_EACH_ENTRY(cached, fontfaces, struct fontfacecached, entry) {
+        struct dwrite_fontface *cached_face = unsafe_impl_from_IDWriteFontFace((IDWriteFontFace *)cached->fontface);
         UINT32 cached_key_size, count = 1, cached_face_index;
         DWRITE_FONT_SIMULATIONS cached_simulations;
         const void *cached_key;
         IDWriteFontFile *file;
+        unsigned int i;
 
         cached_face_index = IDWriteFontFace5_GetIndex(cached->fontface);
         cached_simulations = IDWriteFontFace5_GetSimulations(cached->fontface);
@@ -992,6 +995,26 @@ HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * co
         /* skip earlier */
         if (cached_face_index != index || cached_simulations != simulations)
             continue;
+
+        if (!axis_values_count)
+        {
+            if (!cached_face->axis_values_are_default)
+                continue;
+        }
+        else
+        {
+            if (cached_face->axis_values_count != axis_values_count)
+                continue;
+
+            for (i = 0; i < axis_values_count; ++i)
+            {
+                if (cached_face->axis_values[i].axisTag != axis_values[i].axisTag
+                        || cached_face->axis_values[i].value != axis_values[i].value)
+                    break;
+            }
+            if (i != axis_values_count)
+                continue;
+        }
 
         hr = IDWriteFontFace5_GetFiles(cached->fontface, &count, &file);
         if (FAILED(hr))
@@ -1082,7 +1105,7 @@ static HRESULT WINAPI dwritefactory_CreateFontFace(IDWriteFactory7 *iface, DWRIT
         goto failed;
     }
 
-    hr = factory_get_cached_fontface(iface, font_files, index, simulations, &fontfaces,
+    hr = factory_get_cached_fontface(iface, font_files, index, simulations, NULL, 0, &fontfaces,
             &IID_IDWriteFontFace, (void **)fontface);
     if (hr != S_FALSE)
         goto failed;
@@ -1094,6 +1117,8 @@ static HRESULT WINAPI dwritefactory_CreateFontFace(IDWriteFactory7 *iface, DWRIT
     desc.index = index;
     desc.simulations = simulations;
     desc.font_data = NULL;
+    desc.axis_values = NULL;
+    desc.axis_values_count = 0;
     hr = create_fontface(&desc, fontfaces, (IDWriteFontFace5 **)fontface);
 
 failed:

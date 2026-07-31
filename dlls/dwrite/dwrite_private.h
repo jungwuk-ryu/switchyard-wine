@@ -175,6 +175,8 @@ struct fontface_desc
     UINT32 index;
     DWRITE_FONT_SIMULATIONS simulations;
     struct dwrite_font_data *font_data; /* could be NULL when face is created directly with IDWriteFactory::CreateFontFace() */
+    const DWRITE_FONT_AXIS_VALUE *axis_values;
+    unsigned int axis_values_count;
 };
 
 struct dwrite_fonttable
@@ -282,6 +284,10 @@ struct dwrite_fontface
 
     USHORT simulations;
     DWRITE_FONT_FACE_TYPE type;
+    DWRITE_FONT_AXIS_VALUE *axis_values;
+    unsigned int axis_values_count;
+    unsigned int variable_axis_count;
+    BOOL axis_values_are_default;
     DWRITE_FONT_METRICS1 metrics;
     DWRITE_CARET_METRICS caret;
     struct
@@ -361,7 +367,8 @@ extern HRESULT create_fontfacereference(IDWriteFactory7 *factory, IDWriteFontFil
         DWRITE_FONT_SIMULATIONS simulations, DWRITE_FONT_AXIS_VALUE const *axis_values, UINT32 axis_values_count,
         IDWriteFontFaceReference1 **reference);
 extern HRESULT factory_get_cached_fontface(IDWriteFactory7 *factory, IDWriteFontFile * const *files, UINT32 num_files,
-        DWRITE_FONT_SIMULATIONS simulations, struct list **cache, REFIID riid, void **obj);
+        DWRITE_FONT_SIMULATIONS simulations, const DWRITE_FONT_AXIS_VALUE *axis_values,
+        unsigned int axis_values_count, struct list **cache, REFIID riid, void **obj);
 extern void factory_detach_fontcollection(IDWriteFactory7 *factory, IDWriteFontCollection3 *collection);
 extern void factory_detach_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 *interop);
 extern struct fontfacecached *factory_cache_fontface(IDWriteFactory7 *factory, struct list *fontfaces,

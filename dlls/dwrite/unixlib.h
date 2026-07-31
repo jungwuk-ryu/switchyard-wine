@@ -28,6 +28,9 @@ struct create_font_object_params
     const void *data;
     UINT64 size;
     unsigned int index;
+    const DWRITE_FONT_AXIS_VALUE *axis_values;
+    unsigned int axis_values_count;
+    BOOL axis_values_are_default;
     UINT64 *object;
 };
 

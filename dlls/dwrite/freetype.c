@@ -34,6 +34,7 @@
 #include FT_OUTLINE_H
 #include FT_TRUETYPE_TABLES_H
 #include FT_SIZES_H
+#include FT_MULTIPLE_MASTERS_H
 #endif /* HAVE_FT2BUILD_H */
 
 #include "ntstatus.h"
@@ -85,6 +86,7 @@ MAKE_FUNCPTR(FT_Outline_New);
 MAKE_FUNCPTR(FT_Outline_Transform);
 MAKE_FUNCPTR(FT_Outline_Translate);
 MAKE_FUNCPTR(FT_Set_Pixel_Sizes);
+MAKE_FUNCPTR(FT_Set_Var_Design_Coordinates);
 #undef MAKE_FUNCPTR
 
 #define FaceFromObject(o) ((FT_Face)(ULONG_PTR)(o))
@@ -153,6 +155,8 @@ static NTSTATUS process_attach(void *args)
     LOAD_FUNCPTR(FT_Set_Pixel_Sizes)
 #undef LOAD_FUNCPTR
 
+    pFT_Set_Var_Design_Coordinates = dlsym(ft_handle, "FT_Set_Var_Design_Coordinates");
+
     if (pFT_Init_FreeType(&library) != 0)
     {
         ERR("Can't init FreeType library\n");
@@ -181,14 +185,50 @@ static NTSTATUS process_detach(void *args)
 static NTSTATUS create_font_object(void *args)
 {
     struct create_font_object_params *params = args;
+    FT_Fixed *coordinates = NULL;
     FT_Face face = NULL;
     FT_Error fterror;
+    unsigned int i;
+
+    *params->object = 0;
 
     fterror = pFT_New_Memory_Face(library, params->data, params->size, params->index, &face);
     if (fterror != FT_Err_Ok)
     {
         WARN("Failed to create a face object, error %d.\n", fterror);
         return STATUS_UNSUCCESSFUL;
+    }
+
+    if (params->axis_values_count)
+    {
+        if (!pFT_Set_Var_Design_Coordinates)
+        {
+            if (!params->axis_values_are_default)
+            {
+                WARN("FreeType does not support variable font coordinates.\n");
+                pFT_Done_Face(face);
+                return STATUS_NOT_SUPPORTED;
+            }
+        }
+        else if (!(coordinates = calloc(params->axis_values_count, sizeof(*coordinates))))
+        {
+            pFT_Done_Face(face);
+            return STATUS_NO_MEMORY;
+        }
+        else
+        {
+            for (i = 0; i < params->axis_values_count; ++i)
+                coordinates[i] = params->axis_values[i].value * 65536.0f;
+
+            fterror = pFT_Set_Var_Design_Coordinates(face, params->axis_values_count, coordinates);
+            free(coordinates);
+            if (fterror != FT_Err_Ok && !params->axis_values_are_default)
+            {
+                WARN("Failed to set variable font coordinates, error %d.\n", fterror);
+                pFT_Done_Face(face);
+                return STATUS_UNSUCCESSFUL;
+            }
+        }
     }
 
     *params->object = (ULONG_PTR)face;
@@ -748,6 +788,9 @@ static NTSTATUS process_detach(void *args)
 
 static NTSTATUS create_font_object(void *args)
 {
+    struct create_font_object_params *params = args;
+
+    *params->object = 0;
     return STATUS_NOT_IMPLEMENTED;
 }
 
@@ -822,6 +865,9 @@ static NTSTATUS wow64_create_font_object(void *args)
         PTR32 data;
         UINT64 size;
         ULONG index;
+        PTR32 axis_values;
+        ULONG axis_values_count;
+        ULONG axis_values_are_default;
         PTR32 object;
     } const *params32 = args;
     struct create_font_object_params params =
@@ -829,6 +875,9 @@ static NTSTATUS wow64_create_font_object(void *args)
         ULongToPtr(params32->data),
         params32->size,
         params32->index,
+        ULongToPtr(params32->axis_values),
+        params32->axis_values_count,
+        params32->axis_values_are_default,
         ULongToPtr(params32->object),
     };
 

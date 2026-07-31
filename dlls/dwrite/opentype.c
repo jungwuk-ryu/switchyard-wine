@@ -6738,9 +6738,9 @@ HRESULT opentype_get_font_var_axis(const struct file_stream_desc *stream_desc, s
         200.0f, /* DWRITE_FONT_STRETCH_ULTRA_EXPANDED */
     };
     BOOL has_wght = FALSE, has_wdth = FALSE, has_slnt = FALSE, has_ital = FALSE;
-    const struct var_axis_record *records;
+    const struct var_axis_record *records = NULL;
     const struct fvar_header *header;
-    unsigned int i, count, tag, size;
+    unsigned int i, count = 0, tag, size;
     struct dwrite_font_props props;
     struct dwrite_fonttable fvar;
     HRESULT hr = S_OK;
@@ -6750,18 +6750,22 @@ HRESULT opentype_get_font_var_axis(const struct file_stream_desc *stream_desc, s
 
     opentype_get_font_table(stream_desc, MS_FVAR_TAG, &fvar);
 
-    if (!(header = table_read_ensure(&fvar, 0, sizeof(*header)))) goto done;
-    if (!(GET_BE_WORD(header->major_version) == 1 && GET_BE_WORD(header->minor_version) == 0))
+    if ((header = table_read_ensure(&fvar, 0, sizeof(*header))))
     {
-        WARN("Unexpected fvar version.\n");
-        goto done;
+        if (GET_BE_WORD(header->major_version) == 1 && GET_BE_WORD(header->minor_version) == 0)
+        {
+            count = GET_BE_WORD(header->axis_count);
+            size = GET_BE_WORD(header->axis_size);
+
+            if (!count || size != sizeof(*records)
+                    || !(records = table_read_ensure(&fvar, GET_BE_WORD(header->axes_array_offset), size * count)))
+                count = 0;
+        }
+        else
+        {
+            WARN("Unexpected fvar version.\n");
+        }
     }
-
-    count = GET_BE_WORD(header->axis_count);
-    size = GET_BE_WORD(header->axis_size);
-
-    if (!count || size != sizeof(*records)) goto done;
-    if (!(records = table_read_ensure(&fvar, GET_BE_WORD(header->axes_array_offset), size * count))) goto done;
 
     if (!(*axis = calloc(count + 4, sizeof(**axis))))
     {
@@ -6775,9 +6779,9 @@ HRESULT opentype_get_font_var_axis(const struct file_stream_desc *stream_desc, s
         (*axis)[i].default_value = GET_BE_FIXED(records[i].default_value);
         (*axis)[i].min_value = GET_BE_FIXED(records[i].min_value);
         (*axis)[i].max_value = GET_BE_FIXED(records[i].max_value);
-        if (GET_BE_WORD(records[i].flags & 0x1))
+        (*axis)[i].attributes = DWRITE_FONT_AXIS_ATTRIBUTES_VARIABLE;
+        if (GET_BE_WORD(records[i].flags) & 0x1)
             (*axis)[i].attributes |= DWRITE_FONT_AXIS_ATTRIBUTES_HIDDEN;
-        /* FIXME: set DWRITE_FONT_AXIS_ATTRIBUTES_VARIABLE */
 
         if (tag == DWRITE_FONT_AXIS_TAG_WEIGHT) has_wght = TRUE;
         if (tag == DWRITE_FONT_AXIS_TAG_WIDTH) has_wdth = TRUE;
@@ -6789,10 +6793,10 @@ HRESULT opentype_get_font_var_axis(const struct file_stream_desc *stream_desc, s
     {
         opentype_get_font_properties(stream_desc, &props);
         if (!has_wght) opentype_font_var_add_static_axis(axis, &count, DWRITE_FONT_AXIS_TAG_WEIGHT, props.weight);
-        if (!has_ital) opentype_font_var_add_static_axis(axis, &count, DWRITE_FONT_AXIS_TAG_ITALIC,
-                props.style == DWRITE_FONT_STYLE_ITALIC ? 1.0f : 0.0f);
         if (!has_wdth) opentype_font_var_add_static_axis(axis, &count, DWRITE_FONT_AXIS_TAG_WIDTH,
                 width_axis_values[props.stretch]);
+        if (!has_ital) opentype_font_var_add_static_axis(axis, &count, DWRITE_FONT_AXIS_TAG_ITALIC,
+                props.style == DWRITE_FONT_STYLE_ITALIC ? 1.0f : 0.0f);
         if (!has_slnt) opentype_font_var_add_static_axis(axis, &count, DWRITE_FONT_AXIS_TAG_SLANT, props.slant_angle);
     }
 
