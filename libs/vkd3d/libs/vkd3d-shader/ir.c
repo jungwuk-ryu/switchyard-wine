@@ -4965,6 +4965,8 @@ static unsigned int vsir_operand_normalise_arrayed_addressing(struct vsir_operan
     return id_idx;
 }
 
+static bool vsir_src_is_masked(enum vkd3d_shader_opcode opcode, unsigned int src_idx);
+
 static bool vsir_dst_operand_io_normalise(struct vsir_dst_operand *dst,
         struct io_normaliser *normaliser, struct vkd3d_shader_instruction *ins)
 {
@@ -5058,7 +5060,7 @@ static bool vsir_dst_operand_io_normalise(struct vsir_dst_operand *dst,
     return true;
 }
 
-static void vsir_src_operand_io_normalise(struct vsir_src_operand *src,
+static void vsir_src_operand_io_normalise(struct vsir_src_operand *src, unsigned int src_idx,
         struct io_normaliser *normaliser, struct vkd3d_shader_instruction *ins)
 {
     unsigned int i, id_idx, reg_idx, write_mask, element_idx, component_idx;
@@ -5133,7 +5135,13 @@ static void vsir_src_operand_io_normalise(struct vsir_src_operand *src,
     }
 
     id_idx = reg->idx_count - 1;
-    write_mask = VKD3DSP_WRITEMASK_0 << vsir_swizzle_get_component(src->swizzle, 0);
+    component_idx = 0;
+    if (vsir_src_is_masked(ins->opcode, src_idx))
+    {
+        VKD3D_ASSERT(ins->dst_count);
+        component_idx = vsir_write_mask_get_component_idx(ins->dst[0].write_mask);
+    }
+    write_mask = VKD3DSP_WRITEMASK_0 << vsir_swizzle_get_component(src->swizzle, component_idx);
     if (!shader_signature_find_element_for_reg(signature, reg_idx, write_mask, &element_idx))
     {
         vkd3d_shader_error(normaliser->message_context, &ins->location, VKD3D_SHADER_ERROR_VSIR_INVALID_SIGNATURE,
@@ -5243,7 +5251,7 @@ static void shader_instruction_normalise_io_params(struct vkd3d_shader_instructi
             }
             for (i = 0; i < ins->src_count; ++i)
             {
-                vsir_src_operand_io_normalise(&ins->src[i], normaliser, ins);
+                vsir_src_operand_io_normalise(&ins->src[i], i, normaliser, ins);
             }
             break;
     }

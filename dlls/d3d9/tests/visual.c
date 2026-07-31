@@ -10681,16 +10681,18 @@ static void test_fragment_coords(void)
     static const DWORD shader_code[] =
     {
         0xffff0300,                                                             /* ps_3_0                     */
-        0x0200001f, 0x80050005, 0x90080000,                                     /* dcl_texcoord5 v0.w         */
+        0x0200001f, 0x80050005, 0x900c0000,                                     /* dcl_texcoord5 v0.zw        */
         0x0200001f, 0x80000005, 0x90030001,                                     /* dcl_texcoord0 v1.xy        */
         0x0200001f, 0x80010005, 0x90030002,                                     /* dcl_texcoord1 v2.xy        */
         0x0200001f, 0x80000000, 0x90031000,                                     /* dcl vPos.xy                */
+        0x04000004, 0x80060003, 0x90f80000, 0xa0000000, 0xa0000000,             /* mad r3.yz, v0.xzww, c0.x, c0.x */
         0x03000002, 0x80030000, 0x90541000, 0xa1fe0000,                         /* sub r0.xy, vPos.xy, c0.zw  */
         0x02000001, 0x800f0001, 0xa0e40000,                                     /* mov r1, c0                 */
         0x02000001, 0x80080002, 0xa0550000,                                     /* mov r2.a, c0.y             */
         0x02000001, 0x80010002, 0xa0550000,                                     /* mov r2.r, c0.y             */
         0x04000058, 0x80020002, 0x80000000, 0x80000001, 0x80550001,             /* cmp r2.g, r0.x, r1.x, r1.y */
         0x04000058, 0x80040002, 0x80550000, 0x80000001, 0x80550001,             /* cmp r2.b, r0.y, r1.x, r1.y */
+        0x04000004, 0x80060002, 0x80e40003, 0xa0550000, 0x80e40002,             /* mad r2.yz, r3, c0.y, r2    */
         0x02000001, 0x800f0800, 0x80e40002,                                     /* mov oC0, r2                */
         0x0000ffff                                                              /* end                        */
     };
@@ -10709,7 +10711,9 @@ static void test_fragment_coords(void)
         0xfffe0300,                                                             /* vs_3_0               */
         0x0200001f, 0x80000000, 0x900f0000,                                     /* dcl_position v0      */
         0x0200001f, 0x80000000, 0xe00f0000,                                     /* dcl_position o0      */
+        0x0200001f, 0x80050005, 0xe00c0001,                                     /* dcl_texcoord5 o1.zw  */
         0x02000001, 0xe00f0000, 0x90e40000,                                     /* mov o0, v0           */
+        0x02000001, 0xe00c0001, 0x90aa0000,                                     /* mov o1.zw, v0.zzzz   */
         0x0000ffff                                                              /* end                  */
     };
     static const float quad[] =
