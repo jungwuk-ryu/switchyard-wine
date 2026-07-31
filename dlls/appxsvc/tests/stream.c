@@ -492,6 +492,206 @@ static void test_cancellation( void )
     p_wine_appx_archive_stream_close( NULL );
 }
 
+struct cancel_thread_context
+{
+    WINE_APPX_ARCHIVE_STREAM *stream;
+    const BYTE *source;
+    UINT32 source_size;
+    UINT32 pause_after;
+    HANDLE race_event;
+    HANDLE reader_progress_event;
+    LONG reached_barrier;
+    LONG contract_error;
+    UINT32 total_read;
+    HRESULT terminal_hr;
+};
+
+static DWORD WINAPI cancel_thread_proc( void *arg )
+{
+    struct cancel_thread_context *context = arg;
+    UINT32 i;
+
+    WaitForSingleObject( context->race_event, INFINITE );
+    for (i = 0; i < 64; i++)
+        p_wine_appx_archive_stream_cancel( context->stream );
+    return 0;
+}
+
+static DWORD WINAPI read_thread_proc( void *arg )
+{
+    struct cancel_thread_context *context = arg;
+    BYTE output;
+    UINT32 read;
+    HRESULT hr;
+
+    for (;;)
+    {
+        read = 0xdeadbeef;
+        hr = p_wine_appx_archive_stream_read( context->stream, &output, 1, &read );
+        if (hr != S_OK)
+        {
+            if (read) InterlockedOr( &context->contract_error, 4 );
+            context->terminal_hr = hr;
+            break;
+        }
+        if (read != 1)
+        {
+            InterlockedOr( &context->contract_error, 1 );
+            context->terminal_hr = E_UNEXPECTED;
+            break;
+        }
+        if (context->total_read >= context->source_size ||
+            output != context->source[context->total_read])
+        {
+            InterlockedOr( &context->contract_error, 2 );
+            context->terminal_hr = E_UNEXPECTED;
+            break;
+        }
+
+        context->total_read++;
+        if (context->total_read == context->pause_after)
+        {
+            InterlockedExchange( &context->reached_barrier, 1 );
+            SetEvent( context->reader_progress_event );
+            /*
+             * The cancellation threads were created before this reader and
+             * share race_event.  Releasing them together makes the next
+             * one-byte read race cancellation without relying on sleeps.
+             */
+            WaitForSingleObject( context->race_event, INFINITE );
+        }
+    }
+
+    SetEvent( context->reader_progress_event );
+    return 0;
+}
+
+static void test_concurrent_cancellation( void )
+{
+    struct cancel_thread_context *context;
+    HANDLE cancel_threads[4] = {0}, all_threads[5], reader_thread = NULL;
+    BYTE *source, output;
+    WINE_APPX_ARCHIVE_STREAM *stream;
+    WINE_APPX_ARCHIVE *archive;
+    DWORD wait;
+    UINT32 count = 0, i, read;
+    HRESULT hr;
+
+    context = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*context) );
+    ok( !!context, "failed to allocate cancellation context.\n" );
+    if (!context) return;
+    context->source_size = 1024 * 1024;
+    context->pause_after = 4096;
+    context->terminal_hr = E_PENDING;
+    source = HeapAlloc( GetProcessHeap(), 0, context->source_size );
+    ok( !!source, "failed to allocate source.\n" );
+    if (!source)
+    {
+        HeapFree( GetProcessHeap(), 0, context );
+        return;
+    }
+    for (i = 0; i < context->source_size; i++) source[i] = i * 17 + (i >> 11);
+
+    hr = open_stream( "concurrent-cancel.bin", ZIP_METHOD_STORE, source,
+                      context->source_size, context->source_size,
+                      calculate_crc32( source, context->source_size ),
+                      &archive, &stream );
+    ok( hr == S_OK, "failed to open stream, hr %#lx.\n", hr );
+    if (FAILED(hr))
+    {
+        close_stream( archive, stream );
+        HeapFree( GetProcessHeap(), 0, source );
+        HeapFree( GetProcessHeap(), 0, context );
+        return;
+    }
+
+    context->stream = stream;
+    context->source = source;
+    context->race_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    context->reader_progress_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( context->race_event && context->reader_progress_event,
+        "failed to create synchronization events, error %lu.\n", GetLastError() );
+    if (!context->race_event || !context->reader_progress_event)
+    {
+        if (context->reader_progress_event) CloseHandle( context->reader_progress_event );
+        if (context->race_event) CloseHandle( context->race_event );
+        close_stream( archive, stream );
+        HeapFree( GetProcessHeap(), 0, source );
+        HeapFree( GetProcessHeap(), 0, context );
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(cancel_threads); i++)
+    {
+        cancel_threads[count] = CreateThread( NULL, 0, cancel_thread_proc, context, 0, NULL );
+        ok( !!cancel_threads[count], "failed to create cancellation thread %u, error %lu.\n",
+            i, GetLastError() );
+        if (cancel_threads[count]) count++;
+    }
+
+    reader_thread = CreateThread( NULL, 0, read_thread_proc, context, 0, NULL );
+    ok( !!reader_thread, "failed to create reader thread, error %lu.\n", GetLastError() );
+    if (reader_thread)
+    {
+        wait = WaitForSingleObject( context->reader_progress_event, 10000 );
+        ok( wait == WAIT_OBJECT_0, "reader progress wait returned %#lx.\n", wait );
+        ok( context->reached_barrier, "reader did not reach the race barrier.\n" );
+    }
+
+    SetEvent( context->race_event );
+    for (i = 0; i < count; i++) all_threads[i] = cancel_threads[i];
+    if (reader_thread) all_threads[count++] = reader_thread;
+    if (count)
+    {
+        wait = WaitForMultipleObjects( count, all_threads, TRUE, 10000 );
+        ok( wait == WAIT_OBJECT_0, "reader/cancellation threads wait returned %#lx.\n", wait );
+        if (wait != WAIT_OBJECT_0)
+        {
+            /*
+             * A deadlock regression must fail the test instead of wedging the
+             * entire suite.  Terminated workers may own stream locks, so leak
+             * the stream and heap context on this failure-only path.
+             */
+            for (i = 0; i < count; i++) TerminateThread( all_threads[i], 0 );
+            WaitForMultipleObjects( count, all_threads, TRUE, 2000 );
+            for (i = 0; i < ARRAY_SIZE(cancel_threads); i++)
+                if (cancel_threads[i]) CloseHandle( cancel_threads[i] );
+            if (reader_thread) CloseHandle( reader_thread );
+            p_wine_appx_archive_close( archive );
+            return;
+        }
+    }
+    for (i = 0; i < ARRAY_SIZE(cancel_threads); i++)
+        if (cancel_threads[i]) CloseHandle( cancel_threads[i] );
+    if (reader_thread) CloseHandle( reader_thread );
+
+    ok( !context->contract_error, "reader byte contract error mask %#lx.\n",
+        context->contract_error );
+    ok( context->terminal_hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) ||
+        context->terminal_hr == S_FALSE, "unexpected reader terminal hr %#lx.\n",
+        context->terminal_hr );
+    ok( context->total_read >= context->pause_after, "reader stopped after only %u bytes.\n",
+        context->total_read );
+    ok( context->total_read <= context->source_size, "reader returned %u of %u bytes.\n",
+        context->total_read, context->source_size );
+    if (context->terminal_hr == S_FALSE)
+        ok( context->total_read == context->source_size,
+            "EOF after %u of %u bytes.\n", context->total_read, context->source_size );
+
+    /* Also makes cleanup deterministic if every CreateThread() call failed. */
+    p_wine_appx_archive_stream_cancel( stream );
+    read = 0xdeadbeef;
+    hr = p_wine_appx_archive_stream_read( stream, &output, 1, &read );
+    ok( hr == HRESULT_FROM_WIN32(ERROR_CANCELLED), "got cancellation hr %#lx.\n", hr );
+    ok( !read, "read %u bytes.\n", read );
+
+    CloseHandle( context->reader_progress_event );
+    CloseHandle( context->race_event );
+    close_stream( archive, stream );
+    HeapFree( GetProcessHeap(), 0, source );
+    HeapFree( GetProcessHeap(), 0, context );
+}
+
 static void test_archive_lifetime( void )
 {
     static const BYTE payload[] = "independent stream";
@@ -605,6 +805,7 @@ START_TEST(stream)
     test_corrupt_content();
     test_partial_crc_failure();
     test_cancellation();
+    test_concurrent_cancellation();
     test_archive_lifetime();
     test_arguments();
 

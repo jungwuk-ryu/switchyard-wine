@@ -33,11 +33,16 @@ WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 #define ZIP_METHOD_STORE                  0
 #define ZIP_METHOD_DEFLATE                8
 #define STREAM_INPUT_SIZE                 (64 * 1024)
+#define STREAM_CANCEL_ATTEMPTS             16
+#define STREAM_CANCEL_RETRY_MS              1
 
 enum stream_io_state
 {
+    /* No ReadFile call or registered overlapped request exists. */
     STREAM_IO_IDLE,
+    /* OVERLAPPED and io_thread_id are published; ReadFile has not returned. */
     STREAM_IO_STARTING,
+    /* ReadFile returned ERROR_IO_PENDING; CancelIoEx can target the request. */
     STREAM_IO_PENDING,
 };
 
@@ -74,6 +79,7 @@ struct wine_appx_archive_stream
     UINT64 compressed_loaded;
     UINT64 compressed_consumed;
     UINT64 uncompressed_read;
+    DWORD io_thread_id;
     enum stream_io_state io_state;
     BOOL inflate_initialized;
     BOOL completed;
@@ -158,12 +164,14 @@ static HRESULT stream_read_at( WINE_APPX_ARCHIVE_STREAM *stream, UINT64 offset,
     stream->io.OffsetHigh = offset >> 32;
     stream->io.hEvent = stream->event;
     ResetEvent( stream->event );
+    stream->io_thread_id = GetCurrentThreadId();
     stream->io_state = STREAM_IO_STARTING;
     LeaveCriticalSection( &stream->io_cs );
 
     EnterCriticalSection( &stream->io_cs );
     if (stream_is_cancelled( stream ))
     {
+        stream->io_thread_id = 0;
         stream->io_state = STREAM_IO_IDLE;
         LeaveCriticalSection( &stream->io_cs );
         return HRESULT_FROM_WIN32( ERROR_CANCELLED );
@@ -183,6 +191,7 @@ static HRESULT stream_read_at( WINE_APPX_ARCHIVE_STREAM *stream, UINT64 offset,
         error = ERROR_SUCCESS;
         stream->io_state = STREAM_IO_IDLE;
     }
+    stream->io_thread_id = 0;
     if (pending && stream_is_cancelled( stream ))
         CancelIoEx( stream->file, &stream->io );
     LeaveCriticalSection( &stream->io_cs );
@@ -210,11 +219,45 @@ static HRESULT stream_read_at( WINE_APPX_ARCHIVE_STREAM *stream, UINT64 offset,
 
 static void stream_cancel_io( WINE_APPX_ARCHIVE_STREAM *stream )
 {
+    enum stream_io_state state;
+    HANDLE thread;
+    UINT32 attempt;
+
     InterlockedExchange( &stream->cancelled, 1 );
-    EnterCriticalSection( &stream->io_cs );
-    if (stream->io_state != STREAM_IO_IDLE)
-        CancelIoEx( stream->file, &stream->io );
-    LeaveCriticalSection( &stream->io_cs );
+    for (attempt = 0; attempt < STREAM_CANCEL_ATTEMPTS; attempt++)
+    {
+        EnterCriticalSection( &stream->io_cs );
+        state = stream->io_state;
+        if (state != STREAM_IO_IDLE)
+            CancelIoEx( stream->file, &stream->io );
+        if (state == STREAM_IO_STARTING && stream->io_thread_id)
+        {
+            /*
+             * Keep io_cs held until the cancellation call returns.  Otherwise
+             * the reader could leave stream_read_at() and begin unrelated
+             * synchronous I/O before the thread handle is cancelled.
+             */
+            if ((thread = OpenThread( THREAD_TERMINATE, FALSE,
+                                      stream->io_thread_id )))
+            {
+                CancelSynchronousIo( thread );
+                CloseHandle( thread );
+            }
+        }
+        LeaveCriticalSection( &stream->io_cs );
+
+        if (state != STREAM_IO_STARTING) break;
+
+        /*
+         * CancelIoEx() can run just before ReadFile() registers its request,
+         * and CancelSynchronousIo() can run just before the target enters the
+         * syscall.  Give that transition a short finite handoff window.  The
+         * reader also observes the sticky cancelled flag and cancels a newly
+         * pending request after ReadFile() returns.  Public cancel therefore
+         * remains bounded even if a host filesystem ignores both mechanisms.
+         */
+        Sleep( STREAM_CANCEL_RETRY_MS );
+    }
 }
 
 static HRESULT stream_finish( WINE_APPX_ARCHIVE_STREAM *stream )
