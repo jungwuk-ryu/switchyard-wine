@@ -145,6 +145,8 @@ static void wined3d_query_init(struct wined3d_query *query, struct wined3d_devic
     query->data = data;
     query->data_size = data_size;
     query->query_ops = query_ops;
+    query->retrieval_waiters = 0;
+    query->last_flush_poll_generation = -1;
     query->poll_in_cs = !!device->cs->thread;
     list_init(&query->poll_list_entry);
 }
@@ -447,6 +449,33 @@ ULONG CDECL wined3d_query_decref(struct wined3d_query *query)
     }
 
     return refcount;
+}
+
+void wined3d_query_signal_retrieved(struct wined3d_query *query)
+{
+    InterlockedIncrement(&query->counter_retrieved);
+    if (InterlockedCompareExchange(&query->retrieval_waiters, 0, 0))
+        RtlWakeAddressAll(&query->counter_retrieved);
+}
+
+void CDECL wined3d_query_wait_for_retrieval(struct wined3d_query *query)
+{
+    static const LARGE_INTEGER timeout = {.QuadPart = -1000};
+    struct wined3d_cs *cs = query->device->cs;
+    LONG main = query->counter_main;
+    LONG retrieved = query->counter_retrieved;
+
+    if (!query->poll_in_cs || cs->thread_id == GetCurrentThreadId())
+        return;
+
+    if (main != retrieved && InterlockedExchange(&query->last_flush_poll_generation, main) == main)
+    {
+        /* Keep the first flush poll for a query generation nonblocking. Tight
+         * poll loops wait for the completion signal on subsequent probes. */
+        InterlockedIncrement(&query->retrieval_waiters);
+        RtlWaitOnAddress(&query->counter_retrieved, &retrieved, sizeof(retrieved), &timeout);
+        InterlockedDecrement(&query->retrieval_waiters);
+    }
 }
 
 HRESULT CDECL wined3d_query_get_data(struct wined3d_query *query,

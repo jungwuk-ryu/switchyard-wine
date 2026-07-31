@@ -1831,6 +1831,8 @@ struct wined3d_query
     const struct wined3d_query_ops *query_ops;
 
     LONG counter_main, counter_retrieved;
+    LONG retrieval_waiters;
+    LONG last_flush_poll_generation;
     struct list poll_list_entry;
 
     /* FIXME: This is GL-specific. */
@@ -1838,6 +1840,8 @@ struct wined3d_query
     UINT64 *map_ptr;
     bool poll_in_cs;
 };
+
+void wined3d_query_signal_retrieved(struct wined3d_query *query);
 
 #define WINED3D_QUERY_POOL_SIZE 256
 

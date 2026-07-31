@@ -154,6 +154,9 @@ static HRESULT WINAPI d3d9_query_GetData(IDirect3DQuery9 *iface, void *data, DWO
     }
     wined3d_mutex_unlock();
 
+    if (hr == S_FALSE && flags & D3DGETDATA_FLUSH)
+        wined3d_query_wait_for_retrieval(query->wined3d_query);
+
     if (hr == D3DERR_INVALIDCALL)
     {
         if (data)

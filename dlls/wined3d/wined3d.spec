@@ -192,6 +192,7 @@
 @ cdecl wined3d_query_get_type(ptr)
 @ cdecl wined3d_query_incref(ptr)
 @ cdecl wined3d_query_issue(ptr long)
+@ cdecl wined3d_query_wait_for_retrieval(ptr)
 
 @ cdecl wined3d_rasterizer_state_create(ptr ptr ptr ptr ptr)
 @ cdecl wined3d_rasterizer_state_decref(ptr)

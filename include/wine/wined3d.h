@@ -2661,6 +2661,7 @@ void * __cdecl wined3d_query_get_parent(const struct wined3d_query *query);
 enum wined3d_query_type __cdecl wined3d_query_get_type(const struct wined3d_query *query);
 ULONG __cdecl wined3d_query_incref(struct wined3d_query *query);
 HRESULT __cdecl wined3d_query_issue(struct wined3d_query *query, uint32_t flags);
+void __cdecl wined3d_query_wait_for_retrieval(struct wined3d_query *query);
 
 static inline void wined3d_private_store_init(struct wined3d_private_store *store)
 {
