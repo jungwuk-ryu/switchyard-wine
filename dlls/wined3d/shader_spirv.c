@@ -961,6 +961,11 @@ static void shader_spirv_apply_draw_state(void *shader_priv, struct wined3d_cont
     }
     if (context->shader_update_mask & (1u << WINED3D_SHADER_TYPE_GEOMETRY))
         context->shader_update_mask |= 1u << bindings->so_stage;
+    if ((context->shader_update_mask & (1u << WINED3D_SHADER_TYPE_PIXEL))
+            && (shader = state->shader[WINED3D_SHADER_TYPE_VERTEX])
+            && shader->source_type == VKD3D_SHADER_SOURCE_D3D_BYTECODE
+            && shader->reg_maps.shader_version.major < 4)
+        context->shader_update_mask |= 1u << WINED3D_SHADER_TYPE_VERTEX;
 
     layout_vk = wined3d_context_vk_get_pipeline_layout(context_vk, bindings->vk_bindings, bindings->vk_binding_count);
     context_vk->graphics.vk_set_layout = layout_vk->vk_set_layout;

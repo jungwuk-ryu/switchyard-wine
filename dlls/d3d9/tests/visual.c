@@ -29386,6 +29386,163 @@ static void test_blit_format_conversion(void)
     release_test_context(&context);
 }
 
+static void test_vshader_ps_switch_inputs(void)
+{
+    IDirect3DVertexShader9 *vshader = NULL;
+    IDirect3DPixelShader9 *ps_color = NULL;
+    IDirect3DPixelShader9 *ps_texcoord = NULL;
+    IDirect3DDevice9 *device = NULL;
+    IDirect3D9 *d3d = NULL;
+    unsigned int color;
+    ULONG refcount;
+    D3DCAPS9 caps;
+    HWND window;
+    HRESULT hr;
+
+    static const DWORD vertex_shader_code[] =
+    {
+        0xfffe0300,                                         /* vs_3_0                     */
+        0x0200001f, 0x80000000, 0x900f0000,                 /* dcl_position v0             */
+        0x0200001f, 0x80000000, 0xe00f0000,                 /* dcl_position o0             */
+        0x0200001f, 0x8000000a, 0xe00f0001,                 /* dcl_color0 o1               */
+        0x0200001f, 0x80000005, 0xe00f0002,                 /* dcl_texcoord0 o2            */
+        0x02000001, 0xe00f0000, 0x90e40000,                 /* mov o0, v0                  */
+        0x02000001, 0xe00f0001, 0xa0e40000,                 /* mov o1, c0                  */
+        0x02000001, 0xe00f0002, 0xa0e40001,                 /* mov o2, c1                  */
+        0x0000ffff                                          /* end                        */
+    };
+    static const DWORD pixel_shader_color_code[] =
+    {
+        0xffff0200,                                         /* ps_2_0                     */
+        0x0200001f, 0x80000000, 0x900f0000,                 /* dcl v0                     */
+        0x02000001, 0x800f0800, 0x90e40000,                 /* mov oC0, v0                 */
+        0x0000ffff                                          /* end                        */
+    };
+    static const DWORD pixel_shader_texcoord_code[] =
+    {
+        0xffff0200,                                         /* ps_2_0                     */
+        0x0200001f, 0x80000000, 0xb00f0000,                 /* dcl t0                     */
+        0x02000001, 0x800f0800, 0xb0e40000,                 /* mov oC0, t0                */
+        0x0000ffff                                          /* end                        */
+    };
+    static const float quad[] =
+    {
+        -1.0f, -1.0f, 0.5f,
+        -1.0f,  1.0f, 0.5f,
+         1.0f, -1.0f, 0.5f,
+         1.0f,  1.0f, 0.5f,
+    };
+    static const float color_color[] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    static const float texcoord_color[] = { 0.0f, 1.0f, 0.0f, 0.0f };
+
+    window = create_window();
+    d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    ok(!!d3d, "Failed to create a D3D object.\n");
+    if (!d3d)
+        goto done;
+    if (!(device = create_device(d3d, window, window, TRUE)))
+    {
+        skip("Failed to create a D3D device, skipping tests.\n");
+        goto done;
+    }
+
+    hr = IDirect3DDevice9_GetDeviceCaps(device, &caps);
+    ok(SUCCEEDED(hr), "Failed to get device caps, hr %#lx.\n", hr);
+    if (caps.VertexShaderVersion < D3DVS_VERSION(3, 0))
+    {
+        skip("No vs_3_0 support, skipping tests.\n");
+        goto done;
+    }
+    if (caps.PixelShaderVersion < D3DPS_VERSION(2, 0))
+    {
+        skip("No ps_2_0 support, skipping tests.\n");
+        goto done;
+    }
+
+    hr = IDirect3DDevice9_CreateVertexShader(device, vertex_shader_code, &vshader);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (hr != S_OK)
+        goto done;
+    hr = IDirect3DDevice9_CreatePixelShader(device, pixel_shader_color_code, &ps_color);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (hr != S_OK)
+        goto done;
+    hr = IDirect3DDevice9_CreatePixelShader(device, pixel_shader_texcoord_code, &ps_texcoord);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (hr != S_OK)
+        goto done;
+
+    hr = IDirect3DDevice9_SetVertexShader(device, vshader);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetVertexShaderConstantF(device, 0, color_color, 1);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetVertexShaderConstantF(device, 1, texcoord_color, 1);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetFVF(device, D3DFVF_XYZ);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff00ff00, 0.0f, 0);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(SUCCEEDED(hr), "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetPixelShader(device, ps_color);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, 3 * sizeof(float));
+    ok(SUCCEEDED(hr), "Failed to draw, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(SUCCEEDED(hr), "Failed to end scene, hr %#lx.\n", hr);
+    color = getPixelColor(device, 320, 240);
+    ok(color == 0x00ff0000, "Got color 0x%08x for color output, expected 0x00ff0000.\n", color);
+    hr = IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff00ff00, 0.0f, 0);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(SUCCEEDED(hr), "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetPixelShader(device, ps_texcoord);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, 3 * sizeof(float));
+    ok(SUCCEEDED(hr), "Failed to draw, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(SUCCEEDED(hr), "Failed to end scene, hr %#lx.\n", hr);
+    color = getPixelColor(device, 320, 240);
+    ok(color == 0x0000ff00, "Got color 0x%08x for texcoord output, expected 0x0000ff00.\n", color);
+    hr = IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff00ff00, 0.0f, 0);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(SUCCEEDED(hr), "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetPixelShader(device, ps_color);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, 3 * sizeof(float));
+    ok(SUCCEEDED(hr), "Failed to draw, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(SUCCEEDED(hr), "Failed to end scene, hr %#lx.\n", hr);
+    color = getPixelColor(device, 320, 240);
+    ok(color == 0x00ff0000, "Got color 0x%08x after switching back to color output, expected 0x00ff0000.\n", color);
+    hr = IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+done:
+    if (ps_texcoord)
+        IDirect3DPixelShader9_Release(ps_texcoord);
+    if (ps_color)
+        IDirect3DPixelShader9_Release(ps_color);
+    if (vshader)
+        IDirect3DVertexShader9_Release(vshader);
+    if (device)
+    {
+        refcount = IDirect3DDevice9_Release(device);
+        ok(!refcount, "Device has %lu references left.\n", refcount);
+    }
+    if (d3d)
+        IDirect3D9_Release(d3d);
+    DestroyWindow(window);
+}
+
 START_TEST(visual)
 {
     D3DADAPTER_IDENTIFIER9 identifier;
@@ -29456,6 +29613,7 @@ START_TEST(visual)
     sgn_test();
     clip_planes_test();
     test_vshader_input();
+    test_vshader_ps_switch_inputs();
     test_vshader_float16();
     stream_test();
     fog_with_shader_test();
