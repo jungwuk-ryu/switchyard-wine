@@ -127,6 +127,7 @@ static NTSTATUS  (WINAPI *pLdrEnumerateLoadedModules)(void *, void *, void *);
 static NTSTATUS  (WINAPI *pLdrRegisterDllNotification)(ULONG, PLDR_DLL_NOTIFICATION_FUNCTION, void *, void **);
 static NTSTATUS  (WINAPI *pLdrUnregisterDllNotification)(void *);
 static VOID      (WINAPI *pRtlGetDeviceFamilyInfoEnum)(ULONGLONG *,DWORD *,DWORD *);
+static NTSTATUS  (WINAPI *pRtlGetVersion)(RTL_OSVERSIONINFOEXW *);
 static void      (WINAPI *pRtlRbInsertNodeEx)(RTL_RB_TREE *, RTL_BALANCED_NODE *, BOOLEAN, RTL_BALANCED_NODE *);
 static void      (WINAPI *pRtlRbRemoveNode)(RTL_RB_TREE *, RTL_BALANCED_NODE *);
 static DWORD     (WINAPI *pRtlConvertDeviceFamilyInfoToString)(DWORD *, DWORD *, WCHAR *, WCHAR *);
@@ -203,6 +204,7 @@ static void InitFunctionPtrs(void)
         pRtlCreateServiceSid = (void *)GetProcAddress(hntdll, "RtlCreateServiceSid");
         pRtlDeriveCapabilitySidsFromName = (void *)GetProcAddress(hntdll, "RtlDeriveCapabilitySidsFromName");
         pRtlGetDeviceFamilyInfoEnum = (void *)GetProcAddress(hntdll, "RtlGetDeviceFamilyInfoEnum");
+        pRtlGetVersion = (void *)GetProcAddress(hntdll, "RtlGetVersion");
         pRtlRbInsertNodeEx = (void *)GetProcAddress(hntdll, "RtlRbInsertNodeEx");
         pRtlRbRemoveNode = (void *)GetProcAddress(hntdll, "RtlRbRemoveNode");
         pRtlConvertDeviceFamilyInfoToString = (void *)GetProcAddress(hntdll, "RtlConvertDeviceFamilyInfoToString");
@@ -3828,8 +3830,12 @@ static void test_RtlFindExportedRoutineByName(void)
 
 static void test_RtlGetDeviceFamilyInfoEnum(void)
 {
-    ULONGLONG version;
-    DWORD family, form;
+    RTL_OSVERSIONINFOEXW info = { sizeof(info) };
+    ULONGLONG expected_version, version;
+    DWORD expected_revision = 0, family, form;
+    DWORD size, type;
+    HKEY key;
+    unsigned int i;
 
     if (!pRtlGetDeviceFamilyInfoEnum)
     {
@@ -3837,13 +3843,50 @@ static void test_RtlGetDeviceFamilyInfoEnum(void)
         return;
     }
 
-    version = 0x1234567;
-    family = 1234567;
-    form = 1234567;
-    pRtlGetDeviceFamilyInfoEnum(&version, &family, &form);
-    ok( version != 0x1234567, "got unexpected unchanged value 0x1234567\n" );
-    ok( family <= DEVICEFAMILYINFOENUM_MAX, "got unexpected %lu\n", family );
-    ok( form <= DEVICEFAMILYDEVICEFORM_MAX, "got unexpected %lu\n", form );
+    pRtlGetVersion(&info);
+    size = sizeof(expected_revision);
+    if (!RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion",
+                       0, KEY_QUERY_VALUE, &key))
+    {
+        if (RegQueryValueExW(key, L"UBR", NULL, &type, (BYTE *)&expected_revision, &size) ||
+            type != REG_DWORD || size != sizeof(expected_revision))
+            expected_revision = 0;
+        RegCloseKey(key);
+    }
+    expected_version = ((ULONGLONG)(info.dwMajorVersion & 0xffff) << 48) |
+                       ((ULONGLONG)(info.dwMinorVersion & 0xffff) << 32) |
+                       ((ULONGLONG)(info.dwBuildNumber & 0xffff) << 16) |
+                       (expected_revision & 0xffff);
+
+    for (i = 0; i < 8; ++i)
+    {
+        version = 0x1111222233334444;
+        family = 0x55556666;
+        form = 0x77778888;
+        SetLastError(0xdeadbeef);
+        pRtlGetDeviceFamilyInfoEnum(i & 1 ? &version : NULL, i & 2 ? &family : NULL,
+                                    i & 4 ? &form : NULL);
+        ok(GetLastError() == 0xdeadbeef, "%u: last error %#lx\n", i, GetLastError());
+        ok(version == (i & 1 ? expected_version : 0x1111222233334444),
+           "%u: version %#I64x, expected %#I64x\n", i, version,
+           i & 1 ? expected_version : 0x1111222233334444);
+        if (i & 2)
+            ok(family <= DEVICEFAMILYINFOENUM_MAX, "%u: unexpected family %lu\n", i, family);
+        else
+            ok(family == 0x55556666, "%u: family changed to %lu\n", i, family);
+        if (i & 4)
+            ok(form <= DEVICEFAMILYDEVICEFORM_MAX, "%u: unexpected form %lu\n", i, form);
+        else
+            ok(form == 0x77778888, "%u: form changed to %lu\n", i, form);
+    }
+
+    if (!strcmp(winetest_platform, "wine"))
+    {
+        ok(family == (info.wProductType == VER_NT_WORKSTATION ? DEVICEFAMILYINFOENUM_DESKTOP
+                                                              : DEVICEFAMILYINFOENUM_SERVER),
+           "got unexpected family %lu\n", family);
+        ok(form == DEVICEFAMILYDEVICEFORM_UNKNOWN, "got unexpected form %lu\n", form);
+    }
     trace( "UAP version is %#I64x, device family is %lu, form factor is %lu\n", version, family, form );
 }
 

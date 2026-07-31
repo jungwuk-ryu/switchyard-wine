@@ -1639,15 +1639,57 @@ char WINAPI RtlQueryProcessPlaceholderCompatibilityMode(void)
     return PHCM_APPLICATION_DEFAULT;
 }
 
+static RTL_RUN_ONCE device_family_info_once = RTL_RUN_ONCE_INIT;
+static DWORD device_family_revision;
+
+static DWORD WINAPI init_device_family_info(RTL_RUN_ONCE *once, void *param, void **context)
+{
+    union
+    {
+        KEY_VALUE_PARTIAL_INFORMATION info;
+        BYTE buffer[offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(DWORD)];
+    } value;
+    static const WCHAR current_versionW[] =
+        L"\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion";
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    ULONG size;
+    HANDLE key;
+
+    RtlInitUnicodeString(&name, current_versionW);
+    InitializeObjectAttributes(&attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (!NtOpenKey(&key, KEY_QUERY_VALUE, &attr))
+    {
+        RtlInitUnicodeString(&name, L"UBR");
+        if (!NtQueryValueKey(key, &name, KeyValuePartialInformation, value.buffer,
+                             sizeof(value.buffer), &size) &&
+            value.info.Type == REG_DWORD && value.info.DataLength == sizeof(DWORD))
+            device_family_revision = *(DWORD *)value.info.Data;
+        NtClose(key);
+    }
+    return TRUE;
+}
+
 /*********************************************************************
  *           RtlGetDeviceFamilyInfoEnum [NTDLL.@]
  */
 void WINAPI RtlGetDeviceFamilyInfoEnum(ULONGLONG *version, DWORD *family, DWORD *form)
 {
-    FIXME("%p %p %p: stub\n", version, family, form);
+    RTL_OSVERSIONINFOEXW info = { sizeof(info) };
 
-    if (version) *version = 0;
-    if (family) *family = DEVICEFAMILYINFOENUM_DESKTOP;
+    TRACE("%p %p %p\n", version, family, form);
+
+    RtlGetVersion(&info);
+    RtlRunOnceExecuteOnce(&device_family_info_once, init_device_family_info, NULL, NULL);
+
+    if (version)
+        *version = ((ULONGLONG)(info.dwMajorVersion & 0xffff) << 48) |
+                   ((ULONGLONG)(info.dwMinorVersion & 0xffff) << 32) |
+                   ((ULONGLONG)(info.dwBuildNumber & 0xffff) << 16) |
+                   (device_family_revision & 0xffff);
+    if (family)
+        *family = info.wProductType == VER_NT_WORKSTATION ? DEVICEFAMILYINFOENUM_DESKTOP
+                                                         : DEVICEFAMILYINFOENUM_SERVER;
     if (form) *form = DEVICEFAMILYDEVICEFORM_UNKNOWN;
 }
 
