@@ -31,6 +31,7 @@ SOURCES = \
 	display.c \
 	dllmain.c \
 	event.c \
+	frame_scheduler.c \
 	gdi.c \
 	image.c \
 	keyboard.c \

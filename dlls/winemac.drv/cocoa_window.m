@@ -35,6 +35,7 @@
 #import "cocoa_app.h"
 #import "cocoa_event.h"
 #import "cocoa_opengl.h"
+#include "frame_scheduler.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -112,6 +113,28 @@ static NSScreen* screen_covered_by_rect(NSRect rect, NSArray* screens)
             return screen;
     }
     return nil;
+}
+
+static CGDirectDisplayID display_with_largest_intersection(NSRect rect, CGDirectDisplayID current)
+{
+    CGDirectDisplayID displayIDs[32], selected;
+    CGRect displayBounds[32];
+    NSArray *screens = [NSScreen screens];
+    unsigned int displayCount = 0;
+    BOOL intersects = FALSE;
+
+    for (NSScreen *screen in screens)
+    {
+        if (displayCount == sizeof(displayIDs) / sizeof(displayIDs[0])) break;
+        displayIDs[displayCount] = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+        displayBounds[displayCount++] = NSRectToCGRect(screen.frame);
+        if (NSIntersectsRect(rect, screen.frame)) intersects = TRUE;
+    }
+    if (!displayCount || !intersects) return 0;
+    selected = macdrv_frame_select_display(NSRectToCGRect(rect), current,
+                                           CGMainDisplayID(), displayIDs,
+                                           displayBounds, displayCount);
+    return selected;
 }
 
 
@@ -205,141 +228,374 @@ static inline BOOL stage_manager_enabled(void)
     - (void) setContentsChanged;
 @end
 
+@class WineDisplayLink;
+
+@interface WineWindow (WineDisplayLinkFallback)
+    - (void) fallBackFromDisplayLink:(CGDirectDisplayID)displayID;
+@end
+
+struct wine_display_link_callback_context
+{
+    WineDisplayLink *owner;
+    dispatch_source_t redraw_source;
+    struct macdrv_frame_clock *clock;
+};
+
+static BOOL wine_display_links_sleeping;
+
 @interface WineDisplayLink : NSObject
 {
     CGDirectDisplayID _displayID;
     CVDisplayLinkRef _link;
     NSMutableSet* _windows;
-
-    NSTimeInterval _actualRefreshPeriod;
-    NSTimeInterval _nominalRefreshPeriod;
+    NSArray* _windowSnapshot;
+    struct macdrv_frame_clock* _clock;
+    struct wine_display_link_callback_context* _callbackContext;
 
     NSTimeInterval _lastDisplayTime;
 }
 
     - (id) initWithDisplayID:(CGDirectDisplayID)displayID;
 
-    - (void) addWindow:(WineWindow*)window;
+    - (BOOL) addWindow:(WineWindow*)window;
     - (void) removeWindow:(WineWindow*)window;
 
     - (NSTimeInterval) refreshPeriod;
 
-    - (void) start;
+    - (BOOL) start;
+    - (void) suspend;
+    - (BOOL) reconfigure;
+    - (void) invalidate;
 
 @end
 
 @implementation WineDisplayLink
 
 static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* inNow, const CVTimeStamp* inOutputTime, CVOptionFlags flagsIn, CVOptionFlags* flagsOut, void* displayLinkContext);
+static void WineDisplayLinkRedraw(void* context);
+static void WineDisplayLinkCancel(void* context);
+
+    - (uint64_t) fallbackRefreshPeriod
+    {
+        double period = 0.0;
+
+        if (_link)
+            period = CVDisplayLinkGetActualOutputVideoRefreshPeriod(_link);
+        if (!(period > 0.0) && _link)
+        {
+            CVTime time = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(_link);
+
+            if (!(time.flags & kCVTimeIsIndefinite) && time.timeScale)
+                period = time.timeValue / (double)time.timeScale;
+        }
+        if (!(period > 0.0)) period = 1.0 / 60.0;
+        return macdrv_frame_ticks_from_seconds(period);
+    }
+
+    - (BOOL) createDisplayLink
+    {
+        CVDisplayLinkRef link = NULL;
+        CVReturn status;
+
+        status = CVDisplayLinkCreateWithCGDisplay(_displayID, &link);
+        if (status == kCVReturnSuccess && !link)
+            status = kCVReturnError;
+        if (status == kCVReturnSuccess)
+        {
+            _link = link;
+            if (_clock)
+                macdrv_frame_clock_reset(_clock, [self fallbackRefreshPeriod]);
+            status = CVDisplayLinkSetOutputCallback(_link, WineDisplayLinkCallback,
+                                                    _callbackContext);
+        }
+        if (status != kCVReturnSuccess)
+        {
+            ERR(@"CVDisplayLink setup failed for display %u with status %d; using AppKit autodisplay.\n",
+                _displayID, status);
+            if (link) CVDisplayLinkRelease(link);
+            _link = NULL;
+            return FALSE;
+        }
+        return TRUE;
+    }
 
     - (id) initWithDisplayID:(CGDirectDisplayID)displayID
     {
         self = [super init];
         if (self)
         {
-            CVReturn status = CVDisplayLinkCreateWithCGDisplay(displayID, &_link);
-            if (status == kCVReturnSuccess && !_link)
-                status = kCVReturnError;
-            if (status == kCVReturnSuccess)
-                status = CVDisplayLinkSetOutputCallback(_link, WineDisplayLinkCallback, self);
-            if (status != kCVReturnSuccess)
+            dispatch_source_t source;
+
+            _displayID = displayID;
+            _windows = [[NSMutableSet alloc] init];
+            _callbackContext = calloc(1, sizeof(*_callbackContext));
+            source = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_OR, 0, 0,
+                                            dispatch_get_main_queue());
+            if (!_windows || !_callbackContext || !source)
             {
+                if (source)
+                {
+                    dispatch_source_cancel(source);
+                    dispatch_resume(source);
+                    dispatch_release(source);
+                }
+                free(_callbackContext);
+                _callbackContext = NULL;
                 [self release];
                 return nil;
             }
 
-            _displayID = displayID;
-            _windows = [[NSMutableSet alloc] init];
+            _callbackContext->owner = [self retain];
+            _callbackContext->redraw_source = source;
+            dispatch_set_context(source, _callbackContext);
+            dispatch_source_set_event_handler_f(source, WineDisplayLinkRedraw);
+            dispatch_source_set_cancel_handler_f(source, WineDisplayLinkCancel);
+            dispatch_resume(source);
+
+            if (!(_clock = macdrv_frame_clock_register(displayID,
+                    macdrv_frame_ticks_from_rate(60))))
+            {
+                [self invalidate];
+                [self release];
+                return nil;
+            }
+            _callbackContext->clock = _clock;
+            if (![self createDisplayLink])
+            {
+                [self invalidate];
+                [self release];
+                return nil;
+            }
         }
         return self;
     }
 
     - (void) dealloc
     {
+        /* Active instances are retained by their dispatch-source context.
+         * Invalidation cancels that source and releases the final retain only
+         * after every already-enqueued main-queue handler has drained. */
         if (_link)
         {
             CVDisplayLinkStop(_link);
             CVDisplayLinkRelease(_link);
         }
+        if (_clock) macdrv_frame_clock_unregister(_clock);
+        [_windowSnapshot release];
         [_windows release];
         [super dealloc];
     }
 
-    - (void) addWindow:(WineWindow*)window
+    - (BOOL) addWindow:(WineWindow*)window
     {
-        BOOL firstWindow;
-        @synchronized(self) {
-            firstWindow = !_windows.count;
+        BOOL firstWindow = !_windows.count;
+        BOOL hadWindow = [_windows containsObject:window];
+
+        if (!hadWindow)
+        {
+            NSArray *snapshot;
+
             [_windows addObject:window];
+            snapshot = [_windows allObjects];
+            [_windowSnapshot release];
+            _windowSnapshot = [snapshot retain];
         }
-        if (firstWindow || !CVDisplayLinkIsRunning(_link))
-            [self start];
+        if (firstWindow || (_link && !CVDisplayLinkIsRunning(_link)))
+            return [self start];
+        return TRUE;
     }
 
     - (void) removeWindow:(WineWindow*)window
     {
-        BOOL lastWindow = FALSE;
-        @synchronized(self) {
-            BOOL hadWindows = _windows.count > 0;
+        BOOL hadWindow = [_windows containsObject:window];
+
+        if (hadWindow)
+        {
+            NSArray *snapshot;
+
             [_windows removeObject:window];
-            if (hadWindows && !_windows.count)
-                lastWindow = TRUE;
+            snapshot = [_windows allObjects];
+            [_windowSnapshot release];
+            _windowSnapshot = [snapshot retain];
         }
-        if (lastWindow && CVDisplayLinkIsRunning(_link))
+        if (hadWindow && !_windows.count && _link && CVDisplayLinkIsRunning(_link))
             CVDisplayLinkStop(_link);
     }
 
     - (void) fire
     {
-        NSSet* windows;
-        @synchronized(self) {
-            windows = [_windows copy];
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            BOOL anyDisplayed = FALSE;
-            for (WineWindow* window in windows)
-            {
-                if ([window viewsNeedDisplay])
-                {
-                    [window displayIfNeeded];
-                    anyDisplayed = YES;
-                }
-            }
+        /* Membership changes rebuild this immutable array.  One retain keeps
+         * the current generation alive across any re-entrant AppKit callback;
+         * frame ticks never copy and retain the complete window set. */
+        NSArray *windows = [_windowSnapshot retain];
+        BOOL anyDisplayed = FALSE;
 
-            NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
-            if (anyDisplayed)
-                _lastDisplayTime = now;
-            else if (_lastDisplayTime + 2.0 < now)
-                CVDisplayLinkStop(_link);
-        });
+        for (WineWindow* window in windows)
+        {
+            if ([window viewsNeedDisplay])
+            {
+                [window displayIfNeeded];
+                anyDisplayed = YES;
+            }
+        }
+
+        NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
+        if (anyDisplayed)
+            _lastDisplayTime = now;
+        else if (_lastDisplayTime + 2.0 < now && _link)
+            CVDisplayLinkStop(_link);
         [windows release];
     }
 
     - (NSTimeInterval) refreshPeriod
     {
-        if (_actualRefreshPeriod || (_actualRefreshPeriod = CVDisplayLinkGetActualOutputVideoRefreshPeriod(_link)))
-            return _actualRefreshPeriod;
+        struct macdrv_frame_timing timing;
 
-        if (_nominalRefreshPeriod)
-            return _nominalRefreshPeriod;
-
-        CVTime time = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(_link);
-        if (time.flags & kCVTimeIsIndefinite)
-            return 1.0 / 60.0;
-        _nominalRefreshPeriod = time.timeValue / (double)time.timeScale;
-        return _nominalRefreshPeriod;
+        if (macdrv_frame_clock_snapshot(_clock, &timing) && timing.period)
+            return macdrv_frame_seconds_from_ticks(timing.period);
+        return 1.0 / 60.0;
     }
 
-    - (void) start
+    - (void) enableAutodisplayFallback
     {
-        _lastDisplayTime = [[NSProcessInfo processInfo] systemUptime];
-        CVDisplayLinkStart(_link);
+        NSArray *windows = [_windowSnapshot retain];
+
+        for (WineWindow *window in windows)
+            [window fallBackFromDisplayLink:_displayID];
+        [_windows removeAllObjects];
+        [_windowSnapshot release];
+        _windowSnapshot = nil;
+        [windows release];
     }
+
+    - (BOOL) start
+    {
+        CVReturn status;
+
+        if (wine_display_links_sleeping || !_windows.count) return TRUE;
+        if (!_link && ![self createDisplayLink])
+        {
+            [self enableAutodisplayFallback];
+            return FALSE;
+        }
+        _lastDisplayTime = [[NSProcessInfo processInfo] systemUptime];
+        if ((status = CVDisplayLinkStart(_link)) != kCVReturnSuccess)
+        {
+            /* A mode switch or wake can invalidate a link between creation
+             * and start.  Do not leave its windows dependent on a dead map
+             * entry; AppKit autodisplay is the safe retryable fallback. */
+            ERR(@"CVDisplayLink start failed for display %u with status %d; using AppKit autodisplay.\n",
+                _displayID, status);
+            CVDisplayLinkStop(_link);
+            CVDisplayLinkRelease(_link);
+            _link = NULL;
+            macdrv_frame_clock_reset(_clock, macdrv_frame_ticks_from_rate(60));
+            [self enableAutodisplayFallback];
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    - (void) suspend
+    {
+        if (_link && CVDisplayLinkIsRunning(_link)) CVDisplayLinkStop(_link);
+    }
+
+    - (BOOL) reconfigure
+    {
+        BOOL shouldStart = _windows.count && !wine_display_links_sleeping;
+
+        /* Reset has a single-writer contract with the Core Video callback. */
+        if (_link)
+        {
+            CVDisplayLinkStop(_link);
+            CVDisplayLinkRelease(_link);
+            _link = NULL;
+        }
+        macdrv_frame_clock_reset(_clock, macdrv_frame_ticks_from_rate(60));
+        if (![self createDisplayLink])
+        {
+            if (shouldStart) [self enableAutodisplayFallback];
+            return !shouldStart;
+        }
+        return !shouldStart || [self start];
+    }
+
+    - (void) invalidate
+    {
+        struct wine_display_link_callback_context *context = _callbackContext;
+
+        if (!context) return;
+
+        /* Quiesce the callback before publishing the unregistered slot. */
+        if (_link)
+        {
+            CVDisplayLinkStop(_link);
+            CVDisplayLinkRelease(_link);
+            _link = NULL;
+        }
+        if (_clock)
+        {
+            macdrv_frame_clock_unregister(_clock);
+            _clock = NULL;
+            context->clock = NULL;
+        }
+
+        _callbackContext = NULL;
+        dispatch_source_cancel(context->redraw_source);
+        dispatch_release(context->redraw_source);
+    }
+
+static void WineDisplayLinkRedraw(void* context)
+{
+    struct wine_display_link_callback_context* callbackContext = context;
+
+    @autoreleasepool
+    {
+        [callbackContext->owner fire];
+    }
+}
+
+static void WineDisplayLinkCancel(void* context)
+{
+    struct wine_display_link_callback_context* callbackContext = context;
+    WineDisplayLink* owner = callbackContext->owner;
+
+    callbackContext->owner = nil;
+    free(callbackContext);
+    [owner release];
+}
 
 static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* inNow, const CVTimeStamp* inOutputTime, CVOptionFlags flagsIn, CVOptionFlags* flagsOut, void* displayLinkContext)
 {
-    WineDisplayLink* link = displayLinkContext;
-    [link fire];
+    struct wine_display_link_callback_context* context = displayLinkContext;
+    uint64_t refreshPeriod = 0;
+
+    (void)displayLink;
+    (void)inNow;
+    (void)flagsIn;
+    (void)flagsOut;
+
+    /* This realtime callback only publishes atomics and merges a pre-created
+     * dispatch source.  It allocates nothing, logs nothing, enters no
+     * Objective-C lifetime machinery, and acquires no AppKit/window lock. */
+    if (inOutputTime && (inOutputTime->flags & kCVTimeStampHostTimeValid) &&
+        inOutputTime->hostTime)
+    {
+        if ((inOutputTime->flags & kCVTimeStampVideoRefreshPeriodValid) &&
+            inOutputTime->videoRefreshPeriod > 0 && inOutputTime->videoTimeScale > 0)
+        {
+            double seconds = inOutputTime->videoRefreshPeriod /
+                             (double)inOutputTime->videoTimeScale;
+
+            if ((inOutputTime->flags & kCVTimeStampRateScalarValid) &&
+                inOutputTime->rateScalar > 0.0 && isfinite(inOutputTime->rateScalar))
+                seconds /= inOutputTime->rateScalar;
+            refreshPeriod = macdrv_frame_ticks_from_seconds(seconds);
+        }
+        macdrv_frame_clock_publish(context->clock, inOutputTime->hostTime, refreshPeriod);
+    }
+    dispatch_source_merge_data(context->redraw_source, 1);
     return kCVReturnSuccess;
 }
 
@@ -1428,6 +1684,14 @@ static void WineCompositorDetachView(WineContentView* view)
     - (CALayer*) makeBackingLayer
     {
         CAMetalLayer *layer = [CAMetalLayer layer];
+
+        /* This layer is handed to D3DMetal or MoltenVK, whose command queue
+         * owns nextDrawable, presentation, and producer back-pressure.  Do
+         * not install CAMetalDisplayLink here: its update owns a drawable and
+         * would introduce a second drawable owner, changing queue depth and
+         * shutdown ordering.  Core Animation and WindowServer retain their
+         * normal compositing/scan-out decisions; Wine neither uses private
+         * direct-display APIs nor advertises direct-scan-out eligibility. */
         layer.device = _device;
         layer.framebufferOnly = YES;
         layer.magnificationFilter = kCAFilterNearest;
@@ -1456,6 +1720,13 @@ static void WineCompositorDetachView(WineContentView* view)
     @synthesize himc, commandDone;
     @synthesize contentViewMaskLayer;
     @synthesize applicationIcon;
+
+    - (void) fallBackFromDisplayLink:(CGDirectDisplayID)displayID
+    {
+        if (_lastDisplayID == displayID)
+            _lastDisplayID = 0;
+        [self setAutodisplay:YES];
+    }
 
     - (void) enqueueSurfaceImage:(CGImageRef)image rect:(CGRect)rect dirty:(CGRect)dirty
     {
@@ -2806,16 +3077,77 @@ static void WineCompositorDetachView(WineContentView* view)
         static NSMutableDictionary* displayIDToDisplayLinkMap;
         if (!displayIDToDisplayLinkMap)
         {
+            NSNotificationCenter *workspaceNotifications = [[NSWorkspace sharedWorkspace] notificationCenter];
+
             displayIDToDisplayLinkMap = [[NSMutableDictionary alloc] init];
 
             [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidChangeScreenParametersNotification
                                                               object:NSApp
-                                                               queue:nil
+                                                               queue:[NSOperationQueue mainQueue]
                                                           usingBlock:^(NSNotification *note){
                 NSMutableSet* badDisplayIDs = [NSMutableSet setWithArray:displayIDToDisplayLinkMap.allKeys];
                 NSSet* validDisplayIDs = [NSSet setWithArray:[[NSScreen screens] valueForKeyPath:@"deviceDescription.NSScreenNumber"]];
+
+                (void)note;
+                macdrv_frame_configuration_changed();
+                for (NSNumber *displayID in validDisplayIDs)
+                {
+                    WineDisplayLink *link = displayIDToDisplayLinkMap[displayID];
+
+                    if (link && ![link reconfigure])
+                    {
+                        [link invalidate];
+                        [displayIDToDisplayLinkMap removeObjectForKey:displayID];
+                    }
+                }
+
+                /* Window screen selection must run while obsolete links are
+                 * still present so each window can leave its old membership
+                 * before those links are invalidated. */
+                for (NSWindow *window in [NSApp windows])
+                    if ([window isKindOfClass:[WineWindow class]])
+                        [(WineWindow *)window checkWineDisplayLink];
+
                 [badDisplayIDs minusSet:validDisplayIDs];
+                for (NSNumber *displayID in badDisplayIDs)
+                    [displayIDToDisplayLinkMap[displayID] invalidate];
                 [displayIDToDisplayLinkMap removeObjectsForKeys:[badDisplayIDs allObjects]];
+            }];
+
+            [workspaceNotifications addObserverForName:NSWorkspaceWillSleepNotification
+                                                  object:nil
+                                                   queue:[NSOperationQueue mainQueue]
+                                              usingBlock:^(NSNotification *note){
+                (void)note;
+                wine_display_links_sleeping = TRUE;
+                for (WineDisplayLink *link in displayIDToDisplayLinkMap.allValues)
+                    [link suspend];
+            }];
+            [workspaceNotifications addObserverForName:NSWorkspaceDidWakeNotification
+                                                  object:nil
+                                                   queue:[NSOperationQueue mainQueue]
+                                              usingBlock:^(NSNotification *note){
+                (void)note;
+                wine_display_links_sleeping = FALSE;
+                macdrv_frame_configuration_changed();
+                {
+                    NSArray *displayIDs = [displayIDToDisplayLinkMap.allKeys copy];
+
+                    for (NSNumber *displayID in displayIDs)
+                    {
+                        WineDisplayLink *link = displayIDToDisplayLinkMap[displayID];
+
+                        if (link && ![link reconfigure])
+                        {
+                            [link invalidate];
+                            [displayIDToDisplayLinkMap removeObjectForKey:displayID];
+                        }
+                    }
+                    [displayIDs release];
+                }
+                for (NSWindow *window in [NSApp windows])
+                    if ([window isKindOfClass:[WineWindow class]])
+                        [(WineWindow *)window checkWineDisplayLink];
             }];
         }
         return displayIDToDisplayLinkMap;
@@ -2831,18 +3163,18 @@ static void WineCompositorDetachView(WineContentView* view)
 
     - (void) checkWineDisplayLink
     {
-        NSScreen* screen = self.screen;
-        if (![self isVisible] || ![self isOnActiveSpace] || [self isMiniaturized] || [self isEmptyShaped])
-            screen = nil;
-        if (!(self.occlusionState & NSWindowOcclusionStateVisible))
-            screen = nil;
+        CGDirectDisplayID displayID = 0;
 
-        NSNumber* displayIDNumber = screen.deviceDescription[@"NSScreenNumber"];
-        CGDirectDisplayID displayID = [displayIDNumber unsignedIntValue];
-        if (displayID == _lastDisplayID)
-            return;
+        if (![NSApp isHidden] && [self isVisible] && [self isOnActiveSpace] &&
+            ![self isMiniaturized] && ![self isEmptyShaped] &&
+            (self.occlusionState & NSWindowOcclusionStateVisible))
+            displayID = display_with_largest_intersection(self.frame, _lastDisplayID);
 
+        NSNumber* displayIDNumber = @(displayID);
         NSMutableDictionary* displayIDToDisplayLinkMap = [self displayIDToDisplayLinkMap];
+        if (displayID == _lastDisplayID &&
+            (!displayID || displayIDToDisplayLinkMap[displayIDNumber]))
+            return;
 
         if (_lastDisplayID)
         {
@@ -2855,10 +3187,25 @@ static void WineCompositorDetachView(WineContentView* view)
             if (!link)
             {
                 link = [[[WineDisplayLink alloc] initWithDisplayID:displayID] autorelease];
-                [displayIDToDisplayLinkMap setObject:link forKey:displayIDNumber];
+                if (link) [displayIDToDisplayLinkMap setObject:link forKey:displayIDNumber];
             }
-            [link addWindow:self];
-            [self displayIfNeeded];
+            if (link)
+            {
+                if ([link addWindow:self])
+                    [self displayIfNeeded];
+                else
+                {
+                    [link invalidate];
+                    [displayIDToDisplayLinkMap removeObjectForKey:displayIDNumber];
+                    [self setAutodisplay:YES];
+                    displayID = 0;
+                }
+            }
+            else
+            {
+                [self setAutodisplay:YES];
+                displayID = 0;
+            }
         }
         _lastDisplayID = displayID;
     }
@@ -3233,8 +3580,16 @@ static void WineCompositorDetachView(WineContentView* view)
                     [self setAutodisplay:YES];
                 else
                 {
-                    [link start];
-                    _lastDisplayTime = now;
+                    CGDirectDisplayID displayID = _lastDisplayID;
+
+                    if ([link start])
+                        _lastDisplayTime = now;
+                    else
+                    {
+                        [link invalidate];
+                        [[self displayIDToDisplayLinkMap] removeObjectForKey:@(displayID)];
+                        [self setAutodisplay:YES];
+                    }
                 }
             }
             else
@@ -3473,12 +3828,20 @@ static void WineCompositorDetachView(WineContentView* view)
     - (void) applicationWillHide
     {
         savedVisibleState = [self isVisible];
+        if (_lastDisplayID)
+        {
+            [[self wineDisplayLink] removeWindow:self];
+            _lastDisplayID = 0;
+        }
     }
 
     - (void) applicationDidUnhide
     {
         if ([self isVisible])
+        {
             [self becameEligibleParentOrChild];
+            [self checkWineDisplayLink];
+        }
     }
 
 
@@ -5244,6 +5607,13 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     }
 
     offscreen_layer.device = (id<MTLDevice>)device;
+
+    /* The exported CAMetalLayer remains owned by D3DMetal or MoltenVK.  A
+     * CAMetalDisplayLink update would itself own a drawable, violating the
+     * backend's existing queue and back-pressure contract.  Keep CAContext
+     * hosting purely compositional and leave any direct-display optimization
+     * to Core Animation/WindowServer; no private API or eligibility claim is
+     * made here. */
     ((WineRemoteMetalLayer*)offscreen_layer).compositorOwner = self;
     offscreen_layer.framebufferOnly = YES;
     offscreen_layer.magnificationFilter = kCAFilterNearest;

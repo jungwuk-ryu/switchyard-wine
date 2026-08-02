@@ -26,6 +26,7 @@
 #include "config.h"
 
 #include "macdrv.h"
+#include "frame_scheduler.h"
 
 #include "winuser.h"
 #include "winternl.h"
@@ -42,7 +43,6 @@
 #include <OpenGL/glu.h>
 #include <OpenGL/CGLRenderers.h>
 #include <dlfcn.h>
-#include <mach/mach_time.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 
@@ -133,14 +133,13 @@ struct foreign_surface_target
     pthread_mutex_t         pacing_mutex;
     pthread_mutex_t         present_mutex;
     unsigned int            present_count;
-    uint64_t                next_present_time;
+    struct macdrv_frame_scheduler scheduler; /* pacing_mutex ownership */
+    BOOL                    scheduler_presentable; /* pacing_mutex ownership */
     BOOL                    suspended;
 };
 
 static pthread_mutex_t foreign_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t foreign_surface_frame_period_once = PTHREAD_ONCE_INIT;
 static struct foreign_surface_target *foreign_surface_targets;
-static uint64_t foreign_surface_frame_period;
 
 static struct gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
 {
@@ -1517,48 +1516,86 @@ static void foreign_surface_target_retain(struct foreign_surface_target *target)
     InterlockedIncrement(&target->refs);
 }
 
-static void foreign_surface_frame_period_init(void)
+static BOOL foreign_surface_get_scheduler_state(struct foreign_surface_target *target,
+                                                CGRect *window_rect)
 {
-    mach_timebase_info_data_t timebase;
+    RECT rect;
+    LONG style;
 
-    if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.numer)
-        return;
-    foreign_surface_frame_period = ((1000000000ull / foreign_surface_max_frame_rate) *
-            timebase.denom + timebase.numer - 1) / timebase.numer;
+    if (!NtUserGetWindowRect(target->hwnd, &rect,
+                             NtUserGetWinMonitorDpi(target->hwnd, MDT_RAW_DPI)))
+    {
+        *window_rect = CGRectZero;
+        return FALSE;
+    }
+    *window_rect = cgrect_mac_from_win(cgrect_from_rect(rect));
+    style = NtUserGetWindowLongW(target->hwnd, GWL_STYLE);
+    return (style & (WS_VISIBLE | WS_MINIMIZE)) == WS_VISIBLE &&
+           window_rect->size.width > 0 && window_rect->size.height > 0;
 }
 
-static void foreign_surface_target_lock_present(struct foreign_surface_target *target)
+static unsigned int foreign_surface_swap_interval_magnitude(int swap_interval)
 {
-    uint64_t now;
+    if (swap_interval >= 0) return swap_interval;
 
-    if (!foreign_surface_max_frame_rate)
-    {
-        pthread_mutex_lock(&target->present_mutex);
-        return;
-    }
+    /* Windows exposes negative WGL intervals for adaptive-vsync extensions.
+     * Use the magnitude for pacing and handle INT_MIN without signed overflow. */
+    return swap_interval == INT_MIN ? (unsigned int)INT_MAX + 1u :
+            (unsigned int)-swap_interval;
+}
 
-    pthread_once(&foreign_surface_frame_period_once, foreign_surface_frame_period_init);
-    if (!foreign_surface_frame_period)
+static BOOL foreign_surface_target_lock_present(struct foreign_surface_target *target,
+                                                int swap_interval)
+{
+    CGRect window_rect;
+    BOOL presentable;
+    unsigned int scheduler_interval = foreign_surface_swap_interval_magnitude(swap_interval);
+    unsigned int maximum_frame_rate = foreign_surface_max_frame_rate;
+
+    if (!scheduler_interval && !foreign_surface_max_frame_rate)
     {
-        pthread_mutex_lock(&target->present_mutex);
-        return;
+        LONG style = NtUserGetWindowLongW(target->hwnd, GWL_STYLE);
+
+        if ((style & (WS_VISIBLE | WS_MINIMIZE)) == WS_VISIBLE)
+        {
+            pthread_mutex_lock(&target->present_mutex);
+            return TRUE;
+        }
     }
 
     /* Foreign WGL surfaces are not attached to a native CGL drawable, so the
-       native swap interval cannot provide back-pressure.  Serialize producers
-       while reserving an opt-in frame slot, but do not block resize or suspend
-       updates on present_mutex while waiting for the deadline. */
+       native swap interval cannot provide back-pressure.  Serialize producer
+       reservations and use the Cocoa display timeline when this helper owns
+       one for the target display.  Cross-process helpers use the public
+       display-mode fallback and periodically re-resolve display migration.
+       present_mutex is deliberately not held across the deadline wait. */
     pthread_mutex_lock(&target->pacing_mutex);
-    now = mach_absolute_time();
-    while (target->next_present_time > now)
+    presentable = foreign_surface_get_scheduler_state(target, &window_rect);
+    if (CGRectIsEmpty(window_rect) && target->scheduler.has_window_rect)
+        window_rect = target->scheduler.window_rect;
+    if (CGRectIsEmpty(window_rect)) window_rect = CGDisplayBounds(CGMainDisplayID());
+    if (target->scheduler_presentable != presentable)
     {
-        mach_wait_until(target->next_present_time);
-        now = mach_absolute_time();
+        target->scheduler_presentable = presentable;
+        macdrv_frame_scheduler_reset(&target->scheduler);
     }
+    /* An interval-using producer remains paced while its host is hidden or
+       minimized, at a coarse four-Hz maximum, but presentation work is
+       skipped below.  Otherwise loss of the compositing consumer would turn
+       an immediate render loop into a busy spin or retain 60/120-Hz wakeups
+       precisely while the application is in the background. */
+    if (!presentable)
+    {
+        scheduler_interval = 0;
+        if (!maximum_frame_rate || maximum_frame_rate > 4) maximum_frame_rate = 4;
+    }
+    macdrv_frame_scheduler_set_window(&target->scheduler, window_rect, TRUE);
+    macdrv_frame_scheduler_wait(&target->scheduler, scheduler_interval,
+                                maximum_frame_rate);
 
     pthread_mutex_lock(&target->present_mutex);
-    target->next_present_time = mach_absolute_time() + foreign_surface_frame_period;
     pthread_mutex_unlock(&target->pacing_mutex);
+    return presentable;
 }
 
 static void foreign_surface_target_release(struct foreign_surface_target *target)
@@ -1725,6 +1762,7 @@ static BOOL foreign_surface_target_acquire(HWND hwnd, int format,
         target->drawable_refs = 0;
         target->current = backing;
         target->suspended = !backing;
+        macdrv_frame_scheduler_init(&target->scheduler);
         pthread_mutex_init(&target->pacing_mutex, NULL);
         pthread_mutex_init(&target->present_mutex, NULL);
         if (!(target->layer = macdrv_create_iosurface_layer(
@@ -2967,9 +3005,22 @@ static BOOL foreign_surface_present(struct macdrv_context *context, struct gl_dr
         return FALSE;
     if (!(binding = foreign_surface_binding_find(context, gl))) return FALSE;
 
-    foreign_surface_target_lock_present(target);
+    if (!foreign_surface_target_lock_present(target, gl->base.interval))
+    {
+        pthread_mutex_unlock(&target->present_mutex);
+        return TRUE;
+    }
     backing = target->current;
-    if (target->suspended || !target->layer || !backing || binding->backing != backing ||
+    /* A zero-sized minimized/live-resize generation deliberately preserves
+       the last complete IOSurface.  SwapBuffers still succeeds, as it does
+       for an ordinary minimized Windows drawable, without copying or handing
+       an invalid generation to the cross-process CAContext host. */
+    if (target->suspended)
+    {
+        pthread_mutex_unlock(&target->present_mutex);
+        return TRUE;
+    }
+    if (!target->layer || !backing || binding->backing != backing ||
         !binding->source_read_fbo || !binding->present_fbos[0])
     {
         pthread_mutex_unlock(&target->present_mutex);
