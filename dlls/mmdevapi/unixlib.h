@@ -42,6 +42,29 @@ static inline NTSTATUS create_unix_thread( HANDLE *handle, const WCHAR *name,
 
 typedef UINT64 stream_handle;
 
+/* A snapshot of the endpoint properties which determine a spatial stream's
+ * processing quantum and PointSource budget. The generation is opaque to
+ * mmdevapi; the backend rejects activation if the endpoint changes between
+ * capability discovery and stream creation. */
+struct spatial_audio_capabilities
+{
+    UINT32 max_dynamic_objects;
+    UINT32 period_frames;
+    UINT32 sample_rate;
+    UINT32 endpoint_generation;
+};
+
+/* One entry per PointSource input bus, in bus order. Samples are transported
+ * in the corresponding private mono channel; active_frames limits the valid
+ * prefix for end-of-stream updates. */
+struct spatial_audio_object_state
+{
+    float x;
+    float y;
+    float z;
+    UINT32 active_frames;
+};
+
 /*
  * Spatial streams use a WAVEFORMATEXTENSIBLE transport between mmdevapi and
  * the Unix audio backend. AudioObjectType has four bottom speakers which do
@@ -103,6 +126,8 @@ struct create_stream_params
     DWORD flags;
     BOOL spatial;
     UINT32 spatial_static_mask;
+    UINT32 spatial_dynamic_objects;
+    UINT32 spatial_endpoint_generation;
     REFERENCE_TIME duration;
     REFERENCE_TIME period;
     const WAVEFORMATEX *fmt;
@@ -148,6 +173,8 @@ struct release_render_buffer_params
     stream_handle stream;
     UINT32 written_frames;
     UINT flags;
+    const struct spatial_audio_object_state *spatial_objects;
+    UINT32 spatial_object_count;
     HRESULT result;
 };
 
@@ -202,6 +229,13 @@ struct get_device_period_params
     HRESULT result;
     REFERENCE_TIME *def_period;
     REFERENCE_TIME *min_period;
+};
+
+struct get_spatial_audio_capabilities_params
+{
+    const char *device;
+    HRESULT result;
+    struct spatial_audio_capabilities capabilities;
 };
 
 struct get_buffer_size_params
@@ -389,5 +423,6 @@ enum unix_funcs
     midi_in_message,
     midi_notify_wait,
     aux_message,
+    get_spatial_audio_capabilities,
     funcs_count
 };

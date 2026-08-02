@@ -544,7 +544,9 @@ static NTSTATUS oss_create_stream(void *args)
      * not implement the corresponding bed/dry split. */
     if (params->spatial)
     {
-        WARN("Spatial audio transport is not supported by the OSS backend.\n");
+        WARN("Spatial audio transport with %u dynamic objects at endpoint generation %u "
+                "is not supported by the OSS backend.\n",
+                params->spatial_dynamic_objects, params->spatial_endpoint_generation);
         params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
         return STATUS_SUCCESS;
     }
@@ -987,6 +989,11 @@ static NTSTATUS oss_release_render_buffer(void *args)
     UINT32 written_frames = params->written_frames;
     UINT flags = params->flags;
     BYTE *buffer;
+
+    /* OSS rejects spatial streams at creation, so the optional spatial
+     * object-state payload must never be inspected by this backend. */
+    (void)params->spatial_objects;
+    (void)params->spatial_object_count;
 
     oss_lock(stream);
 
@@ -1679,6 +1686,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     oss_midi_in_message,
     oss_midi_notify_wait,
     oss_aux_message,
+    oss_not_implemented,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -1748,6 +1756,8 @@ static NTSTATUS oss_wow64_create_stream(void *args)
         UINT flags;
         BOOL spatial;
         UINT32 spatial_static_mask;
+        UINT32 spatial_dynamic_objects;
+        UINT32 spatial_endpoint_generation;
         REFERENCE_TIME duration;
         REFERENCE_TIME period;
         PTR32 fmt;
@@ -1764,6 +1774,8 @@ static NTSTATUS oss_wow64_create_stream(void *args)
         .flags = params32->flags,
         .spatial = params32->spatial,
         .spatial_static_mask = params32->spatial_static_mask,
+        .spatial_dynamic_objects = params32->spatial_dynamic_objects,
+        .spatial_endpoint_generation = params32->spatial_endpoint_generation,
         .duration = params32->duration,
         .period = params32->period,
         .fmt = ULongToPtr(params32->fmt),
@@ -1810,6 +1822,31 @@ static NTSTATUS oss_wow64_get_render_buffer(void *args)
     oss_get_render_buffer(&params);
     params32->result = params.result;
     *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS oss_wow64_release_render_buffer(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        UINT32 written_frames;
+        UINT flags;
+        PTR32 spatial_objects;
+        UINT32 spatial_object_count;
+        HRESULT result;
+    } *params32 = args;
+    struct release_render_buffer_params params =
+    {
+        .stream = params32->stream,
+        .written_frames = params32->written_frames,
+        .flags = params32->flags,
+        .spatial_objects = ULongToPtr(params32->spatial_objects),
+        .spatial_object_count = params32->spatial_object_count,
+    };
+
+    oss_release_render_buffer(&params);
+    params32->result = params.result;
     return STATUS_SUCCESS;
 }
 
@@ -2147,7 +2184,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     oss_stop,
     oss_reset,
     oss_wow64_get_render_buffer,
-    oss_release_render_buffer,
+    oss_wow64_release_render_buffer,
     oss_wow64_get_capture_buffer,
     oss_release_capture_buffer,
     oss_wow64_is_format_supported,
@@ -2173,6 +2210,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     oss_wow64_midi_in_message,
     oss_wow64_midi_notify_wait,
     oss_wow64_aux_message,
+    oss_not_implemented,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);

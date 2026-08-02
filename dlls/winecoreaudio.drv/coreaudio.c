@@ -33,6 +33,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,11 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <fenv.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/semaphore.h>
+#include <Block.h>
+#include <dispatch/dispatch.h>
 #include <unistd.h>
 
 #include <CoreAudio/CoreAudio.h>
@@ -76,10 +82,29 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(coreaudio);
 
+#define SPATIAL_AUDIO_MAX_DYNAMIC_OBJECTS 64
+#define SPATIAL_AUDIO_PROFILE_SAMPLES 65536
+#define SPATIAL_AUDIO_CACHE_LINE_SIZE 64
+
+struct coreaudio_stream;
+
+struct spatial_input_context
+{
+    struct coreaudio_stream *stream;
+    UINT32 slot;
+};
+
+struct coreaudio_spatial_object_state
+{
+    float azimuth;
+    float elevation;
+    float distance;
+    UINT32 active_frames;
+};
+
 struct coreaudio_stream
 {
     os_unfair_lock lock;
-    os_unfair_lock spatial_unit_lock;
     AudioComponentInstance unit;
     AudioComponentInstance spatial_unit;
     AudioConverterRef converter;
@@ -93,12 +118,20 @@ struct coreaudio_stream
     BOOL spatial_resetting;
     BOOL spatial;
     UINT32 spatial_static_mask;
+    UINT32 spatial_dynamic_objects;
+    UINT32 spatial_endpoint_generation;
+    BOOL spatial_native_output;
 
     EDataFlow flow;
     DWORD flags;
     AUDCLNT_SHAREMODE share;
     HANDLE event;
     HANDLE timer_thread;
+    semaphore_t event_semaphore;
+    BOOL event_semaphore_created;
+    semaphore_t callback_drain_semaphore;
+    BOOL callback_drain_semaphore_created;
+    UINT32 event_pending;
 
     BOOL playing, please_quit;
     REFERENCE_TIME period;
@@ -110,10 +143,44 @@ struct coreaudio_stream
     UINT64 written_frames;
     INT32 getbuf_last;
     WAVEFORMATEX *fmt;
-    float *spatial_volumes;
+    UINT32 *spatial_volume_bits;
     float *spatial_bed_buffer;
     float *spatial_dry_buffer;
     float *spatial_dry_delay_buffer;
+    float *spatial_dynamic_buffer;
+    struct spatial_input_context *spatial_input_contexts;
+    AudioUnitParameterEvent *spatial_parameter_events;
+    struct coreaudio_spatial_object_state *spatial_object_states;
+    UINT64 *spatial_metadata_sequences;
+    UINT32 spatial_metadata_capacity;
+    UINT32 spatial_parameter_event_capacity;
+    UINT32 spatial_dynamic_channel;
+    UINT32 spatial_render_frames;
+    UINT64 spatial_read_frames __attribute__((aligned(64)));
+    char spatial_read_frames_padding[SPATIAL_AUDIO_CACHE_LINE_SIZE -
+            sizeof(UINT64)];
+    UINT64 spatial_write_frames __attribute__((aligned(64)));
+    char spatial_write_frames_padding[SPATIAL_AUDIO_CACHE_LINE_SIZE -
+            sizeof(UINT64)];
+    UINT32 spatial_callbacks_inflight __attribute__((aligned(64)));
+    UINT32 spatial_callback_active;
+    char spatial_callback_padding[SPATIAL_AUDIO_CACHE_LINE_SIZE -
+            2 * sizeof(UINT32)];
+    UINT32 device_callbacks_inflight __attribute__((aligned(64)));
+    char device_callback_padding[SPATIAL_AUDIO_CACHE_LINE_SIZE -
+            sizeof(UINT32)];
+    BOOL shutting_down;
+    BOOL invalidated;
+    UINT32 device_listener_mask;
+    dispatch_queue_t device_listener_queue;
+    AudioObjectPropertyListenerBlock device_listener;
+    dispatch_block_t device_listener_detach;
+    UINT64 underruns;
+    UINT64 overruns;
+    UINT64 reentrant_callbacks;
+    BOOL profile_callbacks;
+    UINT32 callback_timing_count;
+    UINT64 *callback_timings;
     UINT32 spatial_bed_channels;
     UINT32 spatial_dry_capacity;
     UINT32 spatial_dry_channel;
@@ -124,16 +191,32 @@ struct coreaudio_stream
     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
 };
 
-static const REFERENCE_TIME def_period = 100000;
-static const REFERENCE_TIME min_period = 50000;
 static AudioDeviceID default_output_id = kAudioObjectUnknown;
 
 static ULONG_PTR zero_bits = 0;
+
+static const AudioObjectPropertyAddress spatial_device_properties[] =
+{
+    {kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain},
+    {kAudioDevicePropertyDeviceHasChanged, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain},
+    {kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain},
+    {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain},
+    {kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeOutput,
+            kAudioObjectPropertyElementMain},
+    {kAudioDevicePropertyIOStoppedAbnormally, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain},
+};
 
 static NTSTATUS unix_get_mix_format(void *args);
 static AudioDeviceID dev_id_from_device(const char *device);
 static UINT ca_channel_layout_to_channel_mask(const AudioChannelLayout *layout);
 static UINT32 count_channel_mask_bits(DWORD mask);
+static void wait_for_spatial_callbacks(struct coreaudio_stream *stream);
+static void wait_for_device_callbacks(struct coreaudio_stream *stream);
 
 static NTSTATUS unix_not_implemented(void *args)
 {
@@ -434,84 +517,404 @@ static OSStatus ca_render_cb(void *user, AudioUnitRenderActionFlags *flags,
     return noErr;
 }
 
-/* Spatial streams carry one private dry mono channel alongside their WAVE bed.
- * Pull and split both paths in a single callback so the spatial mixer and the
- * final dry injection consume exactly the same ring-buffer frames. */
-static OSStatus ca_render_spatial_bed(struct coreaudio_stream *stream, UInt32 nframes,
-        float *bed)
+static float load_spatial_volume(struct coreaudio_stream *stream, UINT32 channel)
 {
-    UINT32 bed_channel, channel, frame, source_frame, to_copy_frames;
+    UINT32 bits = __atomic_load_n(&stream->spatial_volume_bits[channel],
+            __ATOMIC_RELAXED);
+    float volume;
+
+    memcpy(&volume, &bits, sizeof(volume));
+    return volume;
+}
+
+static void spatial_position_to_parameters(
+        const struct spatial_audio_object_state *source,
+        struct coreaudio_spatial_object_state *target)
+{
+    double horizontal, radius;
+
+    horizontal = hypot((double)source->x, (double)source->z);
+    radius = hypot(horizontal, (double)source->y);
+    if (!isfinite(horizontal) || !isfinite(radius))
+    {
+        target->azimuth = target->elevation = target->distance = 0.0f;
+        target->active_frames = 0;
+        return;
+    }
+
+    target->azimuth = atan2((double)source->x, -(double)source->z) *
+            (180.0 / M_PI);
+    target->elevation = atan2((double)source->y, horizontal) *
+            (180.0 / M_PI);
+    target->distance = min(radius, 10000.0);
+    target->active_frames = source->active_frames;
+}
+
+static BOOL append_spatial_parameter_event(struct coreaudio_stream *stream,
+        UINT32 *event_count, UINT32 slot, AudioUnitParameterID parameter,
+        UINT32 offset, float value)
+{
+    AudioUnitParameterEvent *event;
+
+    if (*event_count >= stream->spatial_parameter_event_capacity)
+        return FALSE;
+    event = &stream->spatial_parameter_events[(*event_count)++];
+    event->scope = kAudioUnitScope_Input;
+    event->element = slot + 1;
+    event->parameter = parameter;
+    event->eventType = kParameterEvent_Immediate;
+    event->eventValues.immediate.bufferOffset = offset;
+    event->eventValues.immediate.value = value;
+    return TRUE;
+}
+
+static OSStatus schedule_spatial_positions(struct coreaudio_stream *stream,
+        UINT64 read_frame, UINT32 frames)
+{
+    UINT32 event_count = 0, offset = 0;
+
+    while (offset < frames)
+    {
+        UINT64 absolute = read_frame + offset;
+        UINT64 sequence = absolute / stream->period_frames;
+        UINT32 record = sequence % stream->spatial_metadata_capacity;
+        UINT32 next = min(frames, offset + stream->period_frames -
+                absolute % stream->period_frames);
+        const struct coreaudio_spatial_object_state *states;
+        UINT32 slot;
+
+        if (__atomic_load_n(&stream->spatial_metadata_sequences[record],
+                __ATOMIC_ACQUIRE) != sequence)
+            return kAudio_ParamError;
+        states = stream->spatial_object_states +
+                (size_t)record * stream->spatial_dynamic_objects;
+
+        for (slot = 0; slot < stream->spatial_dynamic_objects; ++slot)
+        {
+            const struct coreaudio_spatial_object_state *state = &states[slot];
+
+            if (!append_spatial_parameter_event(stream, &event_count, slot,
+                    kSpatialMixerParam_Azimuth, offset, state->azimuth) ||
+                    !append_spatial_parameter_event(stream, &event_count, slot,
+                    kSpatialMixerParam_Elevation, offset, state->elevation) ||
+                    !append_spatial_parameter_event(stream, &event_count, slot,
+                    kSpatialMixerParam_Distance, offset, state->distance))
+                return kAudio_ParamError;
+        }
+        offset = next;
+    }
+
+    return event_count ? AudioUnitScheduleParameters(stream->spatial_unit,
+            stream->spatial_parameter_events, event_count) : noErr;
+}
+
+static void signal_spatial_event(struct coreaudio_stream *stream)
+{
+    UINT32 expected = 0;
+
+    if (stream->event_semaphore_created &&
+            __atomic_compare_exchange_n(&stream->event_pending, &expected, 1,
+                    FALSE, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        semaphore_signal(stream->event_semaphore);
+}
+
+static void record_spatial_callback_time(struct coreaudio_stream *stream,
+        UINT64 started)
+{
+    UINT32 index;
+
+    if (!started)
+        return;
+    index = __atomic_fetch_add(&stream->callback_timing_count, 1,
+            __ATOMIC_RELAXED);
+    if (index < SPATIAL_AUDIO_PROFILE_SAMPLES)
+        stream->callback_timings[index] = mach_absolute_time() - started;
+}
+
+static void spatial_device_property_changed(struct coreaudio_stream *stream,
+        UInt32 count, const AudioObjectPropertyAddress addresses[])
+{
+    UInt32 i;
+
+    __atomic_add_fetch(&stream->device_callbacks_inflight, 1,
+            __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&stream->shutting_down, __ATOMIC_ACQUIRE))
+        goto done;
+
+    for (i = 0; i < count; ++i)
+    {
+        __atomic_store_n(&stream->invalidated, TRUE, __ATOMIC_RELEASE);
+    }
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+        signal_spatial_event(stream);
+done:
+    __atomic_sub_fetch(&stream->device_callbacks_inflight, 1,
+            __ATOMIC_RELEASE);
+}
+
+static HRESULT register_spatial_device_listeners(struct coreaudio_stream *stream)
+{
+    __block struct coreaudio_stream *target = stream;
+    AudioObjectPropertyListenerBlock listener;
+    dispatch_block_t detach;
+    UINT32 i;
+    OSStatus sc;
+
+    if (!(stream->device_listener_queue = dispatch_queue_create(
+            "org.winehq.wine.coreaudio.spatial-device", DISPATCH_QUEUE_SERIAL)))
+        return E_OUTOFMEMORY;
+    listener = Block_copy(^(UInt32 count,
+            const AudioObjectPropertyAddress addresses[])
+    {
+        struct coreaudio_stream *current = target;
+
+        if (current)
+            spatial_device_property_changed(current, count, addresses);
+    });
+    detach = Block_copy(^{ target = NULL; });
+    if (!listener || !detach)
+    {
+        if (listener) Block_release(listener);
+        if (detach) Block_release(detach);
+        return E_OUTOFMEMORY;
+    }
+    stream->device_listener = listener;
+    stream->device_listener_detach = detach;
+
+    for (i = 0; i < ARRAY_SIZE(spatial_device_properties); ++i)
+    {
+        sc = AudioObjectAddPropertyListenerBlock(stream->dev_id,
+                &spatial_device_properties[i], stream->device_listener_queue,
+                stream->device_listener);
+        if (sc == noErr)
+            stream->device_listener_mask |= 1u << i;
+        else if (i == 0 || i == 2 || i == 3)
+        {
+            WARN("Failed to register required spatial device listener %u: %x.\n",
+                    i, (int)sc);
+            return osstatus_to_hresult(sc);
+        }
+    }
+    return S_OK;
+}
+
+static void dispatch_barrier_noop(void *context)
+{
+    (void)context;
+}
+
+static void dispatch_invoke_block(void *context)
+{
+    ((dispatch_block_t)context)();
+}
+
+static void unregister_spatial_device_listeners(struct coreaudio_stream *stream)
+{
+    UINT32 i;
+    OSStatus sc;
+
+    if (stream->device_listener)
+        for (i = 0; i < ARRAY_SIZE(spatial_device_properties); ++i)
+            if (stream->device_listener_mask & (1u << i))
+            {
+                sc = AudioObjectRemovePropertyListenerBlock(stream->dev_id,
+                        &spatial_device_properties[i],
+                        stream->device_listener_queue,
+                        stream->device_listener);
+                if (sc != noErr)
+                    WARN("Failed to remove spatial device listener %u: %x.\n",
+                            i, (int)sc);
+            }
+    stream->device_listener_mask = 0;
+    /* Detach the captured stream on the listener's serial queue.  Even if a
+     * dead device refuses listener removal, any callback retained by
+     * CoreAudio after this barrier observes NULL instead of freed storage. */
+    if (stream->device_listener_queue && stream->device_listener_detach)
+        dispatch_sync_f(stream->device_listener_queue,
+                stream->device_listener_detach, dispatch_invoke_block);
+    else if (stream->device_listener_queue)
+        dispatch_sync_f(stream->device_listener_queue, NULL,
+                dispatch_barrier_noop);
+    wait_for_device_callbacks(stream);
+    if (stream->device_listener)
+    {
+        Block_release(stream->device_listener);
+        stream->device_listener = NULL;
+    }
+    if (stream->device_listener_detach)
+    {
+        Block_release(stream->device_listener_detach);
+        stream->device_listener_detach = NULL;
+    }
+    if (stream->device_listener_queue)
+    {
+        dispatch_release(stream->device_listener_queue);
+        stream->device_listener_queue = NULL;
+    }
+}
+
+/* Split the private interleaved transport exactly once for each output slice.
+ * The output callback is the sole ring consumer, so no callback-side lock is
+ * needed. The producer publishes metadata before the matching write cursor. */
+static OSStatus ca_prepare_spatial_inputs(struct coreaudio_stream *stream,
+        UInt32 nframes, UINT64 *consumed_read_frame, UINT32 *consumed_frames)
+{
+    const struct coreaudio_spatial_object_state *states = NULL;
+    UINT64 read_frame, write_frame;
+    UINT64 sequence = 0;
+    UINT32 bed_channel, channel, frame, in_quantum = 0, record;
+    UINT32 source_frame, to_copy_frames;
+    BOOL unity, playing;
 
     if (nframes > stream->spatial_dry_capacity)
         return kAudio_ParamError;
+    stream->spatial_render_frames = nframes;
 
-    os_unfair_lock_lock(&stream->lock);
+    read_frame = __atomic_load_n(&stream->spatial_read_frames,
+            __ATOMIC_RELAXED);
+    write_frame = __atomic_load_n(&stream->spatial_write_frames,
+            __ATOMIC_ACQUIRE);
+    playing = __atomic_load_n(&stream->playing, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&stream->spatial_resetting, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE);
+    to_copy_frames = playing && write_frame >= read_frame ?
+            min((UINT64)nframes, write_frame - read_frame) : 0;
+    if (playing && to_copy_frames < nframes)
+        __atomic_add_fetch(&stream->underruns, 1, __ATOMIC_RELAXED);
+    unity = __atomic_load_n(&stream->spatial_volumes_are_unity,
+            __ATOMIC_ACQUIRE);
+    source_frame = read_frame % stream->bufsize_frames;
+    if (stream->spatial_dynamic_objects && to_copy_frames)
+    {
+        sequence = read_frame / stream->period_frames;
+        in_quantum = read_frame - sequence * stream->period_frames;
+        record = sequence % stream->spatial_metadata_capacity;
+        if (__atomic_load_n(&stream->spatial_metadata_sequences[record],
+                __ATOMIC_ACQUIRE) == sequence)
+            states = stream->spatial_object_states +
+                    (size_t)record * stream->spatial_dynamic_objects;
+    }
 
-    to_copy_frames = stream->playing ? min(nframes, stream->held_frames) : 0;
     for (frame = 0; frame < to_copy_frames; ++frame)
     {
         const float *source;
+        UINT32 slot;
 
-        source_frame = stream->lcl_offs_frames + frame;
-        if (source_frame >= stream->bufsize_frames)
-            source_frame -= stream->bufsize_frames;
         source = (const float *)stream->local_buffer +
-                source_frame * stream->fmt->nChannels;
+                (size_t)source_frame * stream->fmt->nChannels;
 
         bed_channel = 0;
-        for (channel = 0; channel < stream->fmt->nChannels; ++channel)
+        for (channel = 0; channel < stream->spatial_dynamic_channel; ++channel)
         {
             float sample = source[channel];
 
-            if (!stream->spatial_volumes_are_unity)
-                sample *= stream->spatial_volumes[channel];
-
+            if (!unity)
+                sample *= load_spatial_volume(stream, channel);
             if (channel == stream->spatial_dry_channel)
                 stream->spatial_dry_buffer[frame] = sample;
             else
-                bed[frame * stream->spatial_bed_channels + bed_channel++] = sample;
+                stream->spatial_bed_buffer[frame *
+                        stream->spatial_bed_channels + bed_channel++] = sample;
         }
-    }
 
-    if (to_copy_frames)
-    {
-        stream->lcl_offs_frames += to_copy_frames;
-        stream->lcl_offs_frames %= stream->bufsize_frames;
-        stream->held_frames -= to_copy_frames;
+        for (slot = 0; slot < stream->spatial_dynamic_objects; ++slot)
+        {
+            float sample = source[stream->spatial_dynamic_channel + slot];
+
+            if (!states || in_quantum >= states[slot].active_frames)
+                sample = 0.0f;
+            else if (!unity)
+                sample *= load_spatial_volume(stream,
+                        stream->spatial_dynamic_channel + slot);
+            stream->spatial_dynamic_buffer[(size_t)slot *
+                    stream->spatial_dry_capacity + frame] = sample;
+        }
+
+        if (++source_frame == stream->bufsize_frames)
+            source_frame = 0;
+        if (stream->spatial_dynamic_objects &&
+                ++in_quantum == stream->period_frames)
+        {
+            in_quantum = 0;
+            ++sequence;
+            record = sequence % stream->spatial_metadata_capacity;
+            states = NULL;
+            if (frame + 1 < to_copy_frames &&
+                    __atomic_load_n(
+                            &stream->spatial_metadata_sequences[record],
+                            __ATOMIC_ACQUIRE) == sequence)
+                states = stream->spatial_object_states +
+                        (size_t)record * stream->spatial_dynamic_objects;
+        }
     }
 
     if (nframes > to_copy_frames)
     {
-        memset(bed + to_copy_frames * stream->spatial_bed_channels, 0,
-                (nframes - to_copy_frames) * stream->spatial_bed_channels * sizeof(*bed));
+        memset(stream->spatial_bed_buffer + (size_t)to_copy_frames *
+                stream->spatial_bed_channels, 0, (size_t)(nframes -
+                to_copy_frames) * stream->spatial_bed_channels * sizeof(float));
         memset(stream->spatial_dry_buffer + to_copy_frames, 0,
-                (nframes - to_copy_frames) * sizeof(*stream->spatial_dry_buffer));
+                (nframes - to_copy_frames) * sizeof(float));
+        for (channel = 0; channel < stream->spatial_dynamic_objects; ++channel)
+            memset(stream->spatial_dynamic_buffer + (size_t)channel *
+                    stream->spatial_dry_capacity + to_copy_frames, 0,
+                    (nframes - to_copy_frames) * sizeof(float));
     }
 
-    /* The spatial mixer reports a fixed processing latency. Delay the private
-     * non-spatial path by the same number of frames so dialogue remains sample
-     * aligned with the spatial bed. Do this while holding the stream lock so
-     * Reset cannot race the delay-line state. Native speaker output bypasses
-     * the spatial mixer and therefore has no delay line. */
-    if (stream->spatial_dry_delay_frames)
+    if (stream->spatial_dynamic_objects && to_copy_frames &&
+            schedule_spatial_positions(stream, read_frame, to_copy_frames) != noErr)
     {
-        UINT32 pos = stream->spatial_dry_delay_pos;
-
-        for (frame = 0; frame < nframes; ++frame)
-        {
-            float sample = stream->spatial_dry_buffer[frame];
-
-            stream->spatial_dry_buffer[frame] =
-                    stream->spatial_dry_delay_buffer[pos];
-            stream->spatial_dry_delay_buffer[pos] = sample;
-            if (++pos == stream->spatial_dry_delay_frames)
-                pos = 0;
-        }
-        stream->spatial_dry_delay_pos = pos;
+        __atomic_store_n(&stream->invalidated, TRUE, __ATOMIC_RELEASE);
+        signal_spatial_event(stream);
+        return kAudio_ParamError;
     }
-
-    os_unfair_lock_unlock(&stream->lock);
+    *consumed_read_frame = read_frame;
+    *consumed_frames = to_copy_frames;
     return noErr;
+}
+
+static void delay_spatial_dry_input(struct coreaudio_stream *stream,
+        UInt32 nframes)
+{
+    UINT32 frame, pos;
+
+    if (!stream->spatial_dry_delay_frames)
+        return;
+    pos = stream->spatial_dry_delay_pos;
+    for (frame = 0; frame < nframes; ++frame)
+    {
+        float sample = stream->spatial_dry_buffer[frame];
+
+        stream->spatial_dry_buffer[frame] =
+                stream->spatial_dry_delay_buffer[pos];
+        stream->spatial_dry_delay_buffer[pos] = sample;
+        if (++pos == stream->spatial_dry_delay_frames)
+            pos = 0;
+    }
+    stream->spatial_dry_delay_pos = pos;
+}
+
+static void commit_spatial_inputs(struct coreaudio_stream *stream,
+        UINT64 read_frame, UINT32 frames)
+{
+    UINT64 write_frame, queued_frames;
+
+    if (!frames)
+        return;
+    read_frame += frames;
+    __atomic_store_n(&stream->spatial_read_frames, read_frame,
+            __ATOMIC_RELEASE);
+
+    /* CoreAudio may request slices smaller than the Windows update quantum,
+     * especially while its output unit is converting sample rates.  Wake the
+     * producer only after an entire quantum fits; otherwise BeginUpdating()
+     * would be woken merely to fail GetBuffer(period_frames). */
+    write_frame = __atomic_load_n(&stream->spatial_write_frames,
+            __ATOMIC_ACQUIRE);
+    queued_frames = write_frame >= read_frame ? write_frame - read_frame : 0;
+    if (stream->bufsize_frames >= stream->period_frames &&
+            queued_frames <= stream->bufsize_frames - stream->period_frames)
+        signal_spatial_event(stream);
 }
 
 static OSStatus ca_spatial_bed_render_cb(void *user, AudioUnitRenderActionFlags *flags,
@@ -524,7 +927,8 @@ static OSStatus ca_spatial_bed_render_cb(void *user, AudioUnitRenderActionFlags 
     (void)ts;
     (void)bus;
 
-    if (nframes > stream->spatial_dry_capacity)
+    if (nframes != stream->spatial_render_frames ||
+            nframes > stream->spatial_dry_capacity)
         return kAudio_ParamError;
     bytes = nframes * stream->spatial_bed_channels * sizeof(float);
 
@@ -538,8 +942,43 @@ static OSStatus ca_spatial_bed_render_cb(void *user, AudioUnitRenderActionFlags 
     }
     else if (data->mBuffers[0].mDataByteSize < bytes)
         return kAudio_ParamError;
+    else
+        memcpy(data->mBuffers[0].mData, stream->spatial_bed_buffer, bytes);
+    return noErr;
+}
 
-    return ca_render_spatial_bed(stream, nframes, data->mBuffers[0].mData);
+static OSStatus ca_spatial_dynamic_render_cb(void *user,
+        AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
+        UInt32 nframes, AudioBufferList *data)
+{
+    struct spatial_input_context *context = user;
+    struct coreaudio_stream *stream = context->stream;
+    float *source;
+    UInt32 bytes;
+
+    (void)flags;
+    (void)ts;
+    (void)bus;
+
+    if (context->slot >= stream->spatial_dynamic_objects ||
+            nframes != stream->spatial_render_frames ||
+            nframes > stream->spatial_dry_capacity || data->mNumberBuffers != 1 ||
+            data->mBuffers[0].mNumberChannels != 1)
+        return kAudio_ParamError;
+
+    bytes = nframes * sizeof(float);
+    source = stream->spatial_dynamic_buffer +
+            (size_t)context->slot * stream->spatial_dry_capacity;
+    if (!data->mBuffers[0].mData)
+    {
+        data->mBuffers[0].mData = source;
+        data->mBuffers[0].mDataByteSize = bytes;
+    }
+    else if (data->mBuffers[0].mDataByteSize < bytes)
+        return kAudio_ParamError;
+    else
+        memcpy(data->mBuffers[0].mData, source, bytes);
+    return noErr;
 }
 
 static void mix_spatial_dry_planar(struct coreaudio_stream *stream,
@@ -561,96 +1000,145 @@ static OSStatus ca_spatial_render_cb(void *user, AudioUnitRenderActionFlags *fla
         const AudioTimeStamp *ts, UInt32 bus, UInt32 nframes, AudioBufferList *data)
 {
     struct coreaudio_stream *stream = user;
-    BOOL playing;
+    UINT64 consumed_read_frame = 0, started = 0;
+    UINT32 consumed_frames = 0;
+    UINT32 expected = 0;
     unsigned int i;
-    OSStatus sc;
+    OSStatus result = noErr;
 
     (void)bus;
 
-    if (nframes > stream->spatial_dry_capacity)
-        return kAudio_ParamError;
-
-    os_unfair_lock_lock(&stream->lock);
-    playing = stream->playing && !stream->spatial_resetting;
-    os_unfair_lock_unlock(&stream->lock);
-
-    if (!playing)
+    __atomic_add_fetch(&stream->spatial_callbacks_inflight, 1,
+            __ATOMIC_ACQUIRE);
+    if (!__atomic_compare_exchange_n(&stream->spatial_callback_active,
+            &expected, 1, FALSE, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
     {
-        for (i = 0; i < data->mNumberBuffers; ++i)
-            if (data->mBuffers[i].mData)
-                memset(data->mBuffers[i].mData, 0, data->mBuffers[i].mDataByteSize);
-        return noErr;
+        __atomic_add_fetch(&stream->reentrant_callbacks, 1, __ATOMIC_RELAXED);
+        result = kAudioUnitErr_CannotDoInCurrentContext;
+        goto done_inflight;
     }
+    if (stream->profile_callbacks)
+        started = mach_absolute_time();
 
-    os_unfair_lock_lock(&stream->spatial_unit_lock);
-    os_unfair_lock_lock(&stream->lock);
-    playing = stream->playing && !stream->spatial_resetting;
-    os_unfair_lock_unlock(&stream->lock);
-    if (!playing)
+    if (nframes > stream->spatial_dry_capacity ||
+            __atomic_load_n(&stream->shutting_down, __ATOMIC_ACQUIRE))
     {
-        for (i = 0; i < data->mNumberBuffers; ++i)
-            if (data->mBuffers[i].mData)
-                memset(data->mBuffers[i].mData, 0, data->mBuffers[i].mDataByteSize);
-        sc = noErr;
+        result = kAudio_ParamError;
         goto done;
     }
 
-    if ((sc = AudioUnitRender(stream->spatial_unit, flags, ts, 0, nframes, data)) != noErr)
+    if (!__atomic_load_n(&stream->playing, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&stream->spatial_resetting, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+    {
+        for (i = 0; i < data->mNumberBuffers; ++i)
+            if (data->mBuffers[i].mData)
+                memset(data->mBuffers[i].mData, 0, data->mBuffers[i].mDataByteSize);
+        goto done;
+    }
+
+    if ((result = ca_prepare_spatial_inputs(stream, nframes,
+            &consumed_read_frame, &consumed_frames)) != noErr)
+    {
+        for (i = 0; i < data->mNumberBuffers; ++i)
+            if (data->mBuffers[i].mData)
+                memset(data->mBuffers[i].mData, 0, data->mBuffers[i].mDataByteSize);
+        goto done;
+    }
+
+    if ((result = AudioUnitRender(stream->spatial_unit, flags, ts, 0, nframes,
+            data)) != noErr)
         goto done;
 
     if (data->mNumberBuffers < stream->dev_desc.mChannelsPerFrame)
     {
-        sc = kAudio_ParamError;
+        result = kAudio_ParamError;
         goto done;
     }
     for (i = 0; i < stream->dev_desc.mChannelsPerFrame; ++i)
         if (!data->mBuffers[i].mData || data->mBuffers[i].mNumberChannels != 1 ||
                 data->mBuffers[i].mDataByteSize < nframes * sizeof(float))
         {
-            sc = kAudio_ParamError;
+            result = kAudio_ParamError;
             goto done;
         }
 
+    delay_spatial_dry_input(stream, nframes);
     mix_spatial_dry_planar(stream, nframes, data);
-    sc = noErr;
+    commit_spatial_inputs(stream, consumed_read_frame, consumed_frames);
 
 done:
-    os_unfair_lock_unlock(&stream->spatial_unit_lock);
-    return sc;
+    __atomic_store_n(&stream->spatial_callback_active, 0, __ATOMIC_RELEASE);
+done_inflight:
+    record_spatial_callback_time(stream, started);
+    if (!__atomic_sub_fetch(&stream->spatial_callbacks_inflight, 1,
+            __ATOMIC_RELEASE) && stream->callback_drain_semaphore_created &&
+            (__atomic_load_n(&stream->shutting_down, __ATOMIC_ACQUIRE) ||
+             __atomic_load_n(&stream->spatial_resetting, __ATOMIC_ACQUIRE)))
+        semaphore_signal(stream->callback_drain_semaphore);
+    return result;
 }
 
 static OSStatus ca_native_spatial_render_cb(void *user, AudioUnitRenderActionFlags *flags,
         const AudioTimeStamp *ts, UInt32 bus, UInt32 nframes, AudioBufferList *data)
 {
     struct coreaudio_stream *stream = user;
+    UINT64 consumed_read_frame = 0, started = 0;
+    UINT32 consumed_frames = 0;
+    UINT32 expected = 0;
     float *output;
     UINT32 channel, frame;
     UInt32 bytes;
-    OSStatus sc;
+    OSStatus result = noErr;
 
     (void)flags;
     (void)ts;
     (void)bus;
 
-    if (nframes > stream->spatial_dry_capacity)
-        return kAudio_ParamError;
+    __atomic_add_fetch(&stream->spatial_callbacks_inflight, 1,
+            __ATOMIC_ACQUIRE);
+    if (!__atomic_compare_exchange_n(&stream->spatial_callback_active,
+            &expected, 1, FALSE, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    {
+        __atomic_add_fetch(&stream->reentrant_callbacks, 1, __ATOMIC_RELAXED);
+        result = kAudioUnitErr_CannotDoInCurrentContext;
+        goto done_inflight;
+    }
+    if (stream->profile_callbacks)
+        started = mach_absolute_time();
+    if (nframes > stream->spatial_dry_capacity ||
+            __atomic_load_n(&stream->shutting_down, __ATOMIC_ACQUIRE))
+    {
+        result = kAudio_ParamError;
+        goto done;
+    }
     bytes = nframes * stream->spatial_bed_channels * sizeof(float);
 
     if (data->mNumberBuffers != 1 ||
             data->mBuffers[0].mNumberChannels != stream->spatial_bed_channels)
-        return kAudio_ParamError;
+    {
+        result = kAudio_ParamError;
+        goto done;
+    }
     if (!data->mBuffers[0].mData)
     {
         data->mBuffers[0].mData = stream->spatial_bed_buffer;
         data->mBuffers[0].mDataByteSize = bytes;
     }
     else if (data->mBuffers[0].mDataByteSize < bytes)
-        return kAudio_ParamError;
+    {
+        result = kAudio_ParamError;
+        goto done;
+    }
 
     output = data->mBuffers[0].mData;
-    if ((sc = ca_render_spatial_bed(stream, nframes, output)) != noErr)
-        return sc;
+    if ((result = ca_prepare_spatial_inputs(stream, nframes,
+            &consumed_read_frame, &consumed_frames)) != noErr)
+        goto done;
+    if (output != stream->spatial_bed_buffer)
+        memcpy(output, stream->spatial_bed_buffer, bytes);
 
+    delay_spatial_dry_input(stream, nframes);
     for (channel = 0; channel < stream->spatial_dry_output_count; ++channel)
     {
         UINT32 index = stream->spatial_dry_output[channel];
@@ -659,7 +1147,17 @@ static OSStatus ca_native_spatial_render_cb(void *user, AudioUnitRenderActionFla
             output[frame * stream->spatial_bed_channels + index] +=
                     stream->spatial_dry_buffer[frame];
     }
-    return noErr;
+    commit_spatial_inputs(stream, consumed_read_frame, consumed_frames);
+done:
+    __atomic_store_n(&stream->spatial_callback_active, 0, __ATOMIC_RELEASE);
+done_inflight:
+    record_spatial_callback_time(stream, started);
+    if (!__atomic_sub_fetch(&stream->spatial_callbacks_inflight, 1,
+            __ATOMIC_RELEASE) && stream->callback_drain_semaphore_created &&
+            (__atomic_load_n(&stream->shutting_down, __ATOMIC_ACQUIRE) ||
+             __atomic_load_n(&stream->spatial_resetting, __ATOMIC_ACQUIRE)))
+        semaphore_signal(stream->callback_drain_semaphore);
+    return result;
 }
 
 static void ca_wrap_buffer(BYTE *dst, UINT32 dst_offs, UINT32 dst_bytes,
@@ -1180,7 +1678,8 @@ static DWORD spatial_static_mask_to_transport_mask(UINT32 static_mask)
 }
 
 static HRESULT get_spatial_bed_format(const WAVEFORMATEX *transport,
-        UINT32 static_mask, WAVEFORMATEXTENSIBLE *bed, UINT32 *dry_channel)
+        UINT32 static_mask, UINT32 dynamic_objects, WAVEFORMATEXTENSIBLE *bed,
+        UINT32 *dry_channel, UINT32 *dynamic_channel)
 {
     const WAVEFORMATEXTENSIBLE *ext = (const WAVEFORMATEXTENSIBLE *)transport;
 
@@ -1189,12 +1688,14 @@ static HRESULT get_spatial_bed_format(const WAVEFORMATEX *transport,
             transport->wBitsPerSample != 32 ||
             static_mask & ~SPATIAL_AUDIO_STATIC_OBJECT_MASK ||
             ext->dwChannelMask != spatial_static_mask_to_transport_mask(static_mask) ||
-            count_channel_mask_bits(ext->dwChannelMask) != transport->nChannels)
+            dynamic_objects > UINT16_MAX ||
+            count_channel_mask_bits(ext->dwChannelMask) + dynamic_objects !=
+                    transport->nChannels)
         return AUDCLNT_E_UNSUPPORTED_FORMAT;
 
     *bed = *ext;
     bed->dwChannelMask &= ~SPATIAL_AUDIO_DRY_SPEAKER;
-    --bed->Format.nChannels;
+    bed->Format.nChannels -= dynamic_objects + 1;
     bed->Format.nBlockAlign = bed->Format.nChannels * sizeof(float);
     bed->Format.nAvgBytesPerSec = bed->Format.nSamplesPerSec *
             bed->Format.nBlockAlign;
@@ -1207,6 +1708,7 @@ static HRESULT get_spatial_bed_format(const WAVEFORMATEX *transport,
 
     *dry_channel = count_channel_mask_bits(ext->dwChannelMask &
             (SPATIAL_AUDIO_DRY_SPEAKER - 1));
+    *dynamic_channel = count_channel_mask_bits(ext->dwChannelMask);
     return S_OK;
 }
 
@@ -1241,7 +1743,9 @@ static HRESULT configure_spatial_dry_output(struct coreaudio_stream *stream, DWO
 
 static HRESULT configure_spatial_max_frames(struct coreaudio_stream *stream)
 {
+    UINT32 metadata_capacity, parameter_events;
     UInt32 max_frames, size = sizeof(max_frames);
+    UINT64 count;
     OSStatus sc;
 
     sc = AudioUnitGetProperty(stream->unit, kAudioUnitProperty_MaximumFramesPerSlice,
@@ -1293,6 +1797,44 @@ static HRESULT configure_spatial_max_frames(struct coreaudio_stream *stream)
         return E_OUTOFMEMORY;
     }
     stream->spatial_dry_capacity = max_frames;
+
+    if (!stream->spatial_dynamic_objects)
+        return S_OK;
+
+    count = (UINT64)max_frames * stream->spatial_dynamic_objects;
+    if (count > SIZE_MAX / sizeof(*stream->spatial_dynamic_buffer) ||
+            !(stream->spatial_dynamic_buffer = calloc(count,
+                    sizeof(*stream->spatial_dynamic_buffer))))
+        return E_OUTOFMEMORY;
+
+    count = ((UINT64)stream->bufsize_frames + stream->period_frames - 1) /
+            stream->period_frames + 2;
+    if (count > UINT32_MAX)
+        return E_OUTOFMEMORY;
+    metadata_capacity = count;
+    if (metadata_capacity < 3)
+        metadata_capacity = 3;
+    count = (UINT64)metadata_capacity * stream->spatial_dynamic_objects;
+    if (count > SIZE_MAX / sizeof(*stream->spatial_object_states) ||
+            !(stream->spatial_object_states = calloc(count,
+                    sizeof(*stream->spatial_object_states))))
+        return E_OUTOFMEMORY;
+    if (!(stream->spatial_metadata_sequences = malloc(
+            metadata_capacity * sizeof(*stream->spatial_metadata_sequences))))
+        return E_OUTOFMEMORY;
+    for (size = 0; size < metadata_capacity; ++size)
+        stream->spatial_metadata_sequences[size] = UINT64_MAX;
+    stream->spatial_metadata_capacity = metadata_capacity;
+
+    count = (UINT64)(max_frames / stream->period_frames + 2) *
+            stream->spatial_dynamic_objects * 3;
+    if (count > UINT32_MAX ||
+            count > SIZE_MAX / sizeof(*stream->spatial_parameter_events) ||
+            !(parameter_events = count) ||
+            !(stream->spatial_parameter_events = malloc((size_t)parameter_events *
+                    sizeof(*stream->spatial_parameter_events))))
+        return E_OUTOFMEMORY;
+    stream->spatial_parameter_event_capacity = parameter_events;
     return S_OK;
 }
 
@@ -1534,11 +2076,11 @@ static HRESULT disable_spatial_head_tracking(AudioComponentInstance unit)
 static HRESULT ca_setup_spatial_audiounit(struct coreaudio_stream *stream, const char *device,
         const WAVEFORMATEXTENSIBLE *bed)
 {
-    AudioStreamBasicDescription input_desc, output_desc;
+    AudioStreamBasicDescription input_desc, dynamic_desc, output_desc;
     struct wave_channel_layout input_layout, output_layout;
     AURenderCallbackStruct callback;
     WAVEFORMATEXTENSIBLE mix;
-    UInt32 algorithm, input_layout_size, output_layout_size;
+    UInt32 algorithm, bus, input_layout_size, output_layout_size;
     UInt32 output_type, rendering_flags, source_mode, value;
     OSStatus sc;
     HRESULT hr;
@@ -1577,7 +2119,9 @@ static HRESULT ca_setup_spatial_audiounit(struct coreaudio_stream *stream, const
         return hr;
     }
 
-    value = 1;
+    if (stream->spatial_dynamic_objects == UINT32_MAX)
+        return E_INVALIDARG;
+    value = stream->spatial_dynamic_objects + 1;
     sc = AudioUnitSetProperty(stream->spatial_unit, kAudioUnitProperty_ElementCount,
             kAudioUnitScope_Input, 0, &value, sizeof(value));
     if (sc != noErr)
@@ -1703,6 +2247,92 @@ static HRESULT ca_setup_spatial_audiounit(struct coreaudio_stream *stream, const
         return osstatus_to_hresult(sc);
     }
 
+    if (stream->spatial_dynamic_objects)
+    {
+        UInt32 point_source_flags =
+                kSpatialMixerRenderingFlags_InterAuralDelay |
+                kSpatialMixerRenderingFlags_DistanceAttenuation;
+
+        if (!(stream->spatial_input_contexts = calloc(
+                stream->spatial_dynamic_objects,
+                sizeof(*stream->spatial_input_contexts))))
+            return E_OUTOFMEMORY;
+
+        dynamic_desc = input_desc;
+        dynamic_desc.mBytesPerPacket = sizeof(float);
+        dynamic_desc.mBytesPerFrame = sizeof(float);
+        dynamic_desc.mChannelsPerFrame = 1;
+        for (bus = 1; bus <= stream->spatial_dynamic_objects; ++bus)
+        {
+            struct spatial_input_context *context =
+                    &stream->spatial_input_contexts[bus - 1];
+
+            sc = AudioUnitSetProperty(stream->spatial_unit,
+                    kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input,
+                    bus, &dynamic_desc, sizeof(dynamic_desc));
+            if (sc != noErr)
+            {
+                WARN("Failed to configure PointSource %u format: %x.\n",
+                        bus - 1, (int)sc);
+                return osstatus_to_hresult(sc);
+            }
+
+            source_mode = kSpatialMixerSourceMode_PointSource;
+            sc = AudioUnitSetProperty(stream->spatial_unit,
+                    kAudioUnitProperty_SpatialMixerSourceMode,
+                    kAudioUnitScope_Input, bus, &source_mode,
+                    sizeof(source_mode));
+            if (sc == noErr)
+                sc = AudioUnitSetProperty(stream->spatial_unit,
+                        kAudioUnitProperty_SpatializationAlgorithm,
+                        kAudioUnitScope_Input, bus, &algorithm,
+                        sizeof(algorithm));
+            if (sc == noErr)
+                sc = AudioUnitSetProperty(stream->spatial_unit,
+                        kAudioUnitProperty_SpatialMixerRenderingFlags,
+                        kAudioUnitScope_Input, bus, &point_source_flags,
+                        sizeof(point_source_flags));
+            if (sc != noErr)
+            {
+                WARN("Failed to configure PointSource %u spatial mode: %x.\n",
+                        bus - 1, (int)sc);
+                return osstatus_to_hresult(sc);
+            }
+
+            context->stream = stream;
+            context->slot = bus - 1;
+            callback.inputProc = ca_spatial_dynamic_render_cb;
+            callback.inputProcRefCon = context;
+            sc = AudioUnitSetProperty(stream->spatial_unit,
+                    kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input,
+                    bus, &callback, sizeof(callback));
+            if (sc != noErr)
+            {
+                WARN("Failed to set PointSource %u callback: %x.\n",
+                        bus - 1, (int)sc);
+                return osstatus_to_hresult(sc);
+            }
+
+            sc = AudioUnitSetParameter(stream->spatial_unit,
+                    kSpatialMixerParam_Azimuth, kAudioUnitScope_Input,
+                    bus, 0.0f, 0);
+            if (sc == noErr)
+                sc = AudioUnitSetParameter(stream->spatial_unit,
+                        kSpatialMixerParam_Elevation, kAudioUnitScope_Input,
+                        bus, 0.0f, 0);
+            if (sc == noErr)
+                sc = AudioUnitSetParameter(stream->spatial_unit,
+                        kSpatialMixerParam_Distance, kAudioUnitScope_Input,
+                        bus, 0.0f, 0);
+            if (sc != noErr)
+            {
+                WARN("Failed to initialize PointSource %u position: %x.\n",
+                        bus - 1, (int)sc);
+                return osstatus_to_hresult(sc);
+            }
+        }
+    }
+
     sc = AudioUnitSetProperty(stream->unit, kAudioUnitProperty_StreamFormat,
             kAudioUnitScope_Input, 0, &output_desc, sizeof(output_desc));
     if (sc != noErr)
@@ -1734,8 +2364,9 @@ static HRESULT ca_setup_spatial_audiounit(struct coreaudio_stream *stream, const
         return hr;
 
     stream->dev_desc = output_desc;
-    TRACE("Using the spatial mixer for %u input and %u output channels (type %u, algorithm %u).\n",
-            bed->Format.nChannels, mix.Format.nChannels, output_type, algorithm);
+    TRACE("Using the spatial mixer for a %u-channel bed, %u PointSources, and %u output channels (type %u, algorithm %u).\n",
+            bed->Format.nChannels, stream->spatial_dynamic_objects,
+            mix.Format.nChannels, output_type, algorithm);
     return S_OK;
 }
 
@@ -1768,14 +2399,245 @@ static AudioDeviceID dev_id_from_device(const char *device)
     return id;
 }
 
+static UINT32 spatial_generation_hash(UINT32 hash, const void *data, size_t size)
+{
+    const BYTE *bytes = data;
+
+    while (size--)
+    {
+        hash ^= *bytes++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static HRESULT get_device_timing(AudioDeviceID dev_id, UINT32 *period_frames,
+        UINT32 *minimum_frames, UINT32 *sample_rate)
+{
+    AudioObjectPropertyAddress addr =
+    {
+        .mSelector = kAudioDevicePropertyDeviceIsAlive,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    AudioValueRange range;
+    Float64 rate;
+    UInt32 alive, frames, size;
+    OSStatus sc;
+
+    size = sizeof(alive);
+    sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size, &alive);
+    if (sc != noErr || !alive)
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+
+    addr.mSelector = kAudioDevicePropertyBufferFrameSize;
+    size = sizeof(frames);
+    if ((sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size,
+            &frames)) != noErr || !frames)
+        return sc == noErr ? E_FAIL : osstatus_to_hresult(sc);
+
+    addr.mSelector = kAudioDevicePropertyBufferFrameSizeRange;
+    size = sizeof(range);
+    if ((sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size,
+            &range)) != noErr || !isfinite(range.mMinimum) ||
+            range.mMinimum < 1.0 || range.mMinimum > UINT32_MAX)
+        return sc == noErr ? E_FAIL : osstatus_to_hresult(sc);
+
+    addr.mSelector = kAudioDevicePropertyNominalSampleRate;
+    size = sizeof(rate);
+    if ((sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size,
+            &rate)) != noErr || !isfinite(rate) || rate < 1.0 ||
+            rate > UINT32_MAX)
+        return sc == noErr ? E_FAIL : osstatus_to_hresult(sc);
+
+    *period_frames = frames;
+    *minimum_frames = (UINT32)ceil(range.mMinimum);
+    *sample_rate = (UINT32)llround(rate);
+    return S_OK;
+}
+
+static void release_spatial_probe(struct coreaudio_stream *stream)
+{
+    if (stream->unit_initialized)
+        AudioUnitUninitialize(stream->unit);
+    if (stream->spatial_unit_initialized)
+        AudioUnitUninitialize(stream->spatial_unit);
+    if (stream->spatial_unit)
+        AudioComponentInstanceDispose(stream->spatial_unit);
+    if (stream->unit)
+        AudioComponentInstanceDispose(stream->unit);
+    free(stream->spatial_bed_buffer);
+    free(stream->spatial_dry_buffer);
+    free(stream->spatial_dynamic_buffer);
+    free(stream->spatial_input_contexts);
+    free(stream->spatial_parameter_events);
+    free(stream->spatial_object_states);
+    free(stream->spatial_metadata_sequences);
+}
+
+static HRESULT validate_spatial_dynamic_capacity(const char *device,
+        AudioDeviceID dev_id, UINT32 endpoint_period_frames,
+        UINT32 endpoint_sample_rate, UINT32 dynamic_objects)
+{
+    struct coreaudio_stream probe = {0};
+    WAVEFORMATEXTENSIBLE bed = {0};
+    UINT64 period_time, object_period_frames;
+    HRESULT hr;
+    OSStatus sc;
+
+    /* Windows exposes one 48 kHz object format even when the endpoint runs at
+     * another nominal rate.  Probe the graph in that actual client format,
+     * leaving the output AudioUnit to perform its normal rate conversion. */
+    period_time = ((UINT64)endpoint_period_frames * 10000000 +
+            endpoint_sample_rate / 2) / endpoint_sample_rate;
+    object_period_frames = (period_time * 48000 + 5000000) / 10000000;
+    if (!object_period_frames || object_period_frames > UINT32_MAX / 3)
+        return E_INVALIDARG;
+
+    bed.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    bed.Format.nChannels = 2;
+    bed.Format.nSamplesPerSec = 48000;
+    bed.Format.wBitsPerSample = 32;
+    bed.Format.nBlockAlign = 2 * sizeof(float);
+    bed.Format.nAvgBytesPerSec = bed.Format.nSamplesPerSec *
+            bed.Format.nBlockAlign;
+    bed.Format.cbSize = sizeof(bed) - sizeof(bed.Format);
+    bed.Samples.wValidBitsPerSample = 32;
+    bed.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    bed.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+    probe.dev_id = dev_id;
+    probe.spatial = TRUE;
+    probe.spatial_dynamic_objects = dynamic_objects;
+    probe.spatial_bed_channels = bed.Format.nChannels;
+    probe.spatial_dry_channel = 2;
+    probe.spatial_dynamic_channel = 3;
+    probe.period_frames = object_period_frames;
+    probe.bufsize_frames = probe.period_frames * 3;
+    if (!(probe.unit = get_audiounit(eRender, dev_id, FALSE)))
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+
+    hr = ca_setup_spatial_audiounit(&probe, device, &bed);
+    if (SUCCEEDED(hr))
+    {
+        sc = AudioUnitInitialize(probe.spatial_unit);
+        if (sc == noErr)
+        {
+            probe.spatial_unit_initialized = TRUE;
+            sc = AudioUnitInitialize(probe.unit);
+        }
+        if (sc == noErr)
+            probe.unit_initialized = TRUE;
+        else
+            hr = osstatus_to_hresult(sc);
+    }
+    release_spatial_probe(&probe);
+    return hr;
+}
+
+static HRESULT query_spatial_audio_capabilities(const char *device,
+        struct spatial_audio_capabilities *capabilities, BOOL validate_graph)
+{
+    WAVEFORMATEXTENSIBLE mix, verify_mix;
+    AudioComponentInstance mixer;
+    AudioDeviceID dev_id;
+    UInt32 minimum_frames, verify_minimum, input_buses, size;
+    UINT32 candidate, low, high, verify_period, verify_rate;
+    UINT32 hash = 2166136261u;
+    OSStatus sc;
+    HRESULT hr;
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    if (!device || (dev_id = dev_id_from_device(device)) == kAudioObjectUnknown)
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+    if (FAILED(hr = get_device_timing(dev_id, &capabilities->period_frames,
+            &minimum_frames, &capabilities->sample_rate)) ||
+            FAILED(hr = get_device_mix_format(device, &mix)))
+        return hr;
+
+    hash = spatial_generation_hash(hash, &dev_id, sizeof(dev_id));
+    hash = spatial_generation_hash(hash, &capabilities->period_frames,
+            sizeof(capabilities->period_frames));
+    hash = spatial_generation_hash(hash, &minimum_frames,
+            sizeof(minimum_frames));
+    hash = spatial_generation_hash(hash, &capabilities->sample_rate,
+            sizeof(capabilities->sample_rate));
+    hash = spatial_generation_hash(hash, &mix.Format.nChannels,
+            sizeof(mix.Format.nChannels));
+    hash = spatial_generation_hash(hash, &mix.dwChannelMask,
+            sizeof(mix.dwChannelMask));
+    capabilities->endpoint_generation = hash ? hash : 1;
+
+    if (!(mixer = get_spatial_mixer()))
+        return S_OK;
+    size = sizeof(input_buses);
+    sc = AudioUnitGetProperty(mixer, kAudioUnitProperty_ElementCount,
+            kAudioUnitScope_Input, 0, &input_buses, &size);
+    AudioComponentInstanceDispose(mixer);
+    if (sc != noErr || input_buses <= 1)
+        return S_OK;
+
+    capabilities->max_dynamic_objects = min(input_buses - 1,
+            SPATIAL_AUDIO_MAX_DYNAMIC_OBJECTS);
+
+    if (!validate_graph || !capabilities->max_dynamic_objects)
+        return S_OK;
+
+    candidate = capabilities->max_dynamic_objects;
+    hr = validate_spatial_dynamic_capacity(device, dev_id,
+            capabilities->period_frames, capabilities->sample_rate, candidate);
+    if (FAILED(hr) && hr != E_OUTOFMEMORY)
+    {
+        /* ElementCount is only an upper bound.  Some AudioUnits expose more
+         * buses than a concrete endpoint can initialize, so find the highest
+         * viable PointSource count without turning a mixer limitation into a
+         * static-stream or timing failure. */
+        low = 0;
+        high = candidate - 1;
+        while (low < high)
+        {
+            candidate = low + (high - low + 1) / 2;
+            hr = validate_spatial_dynamic_capacity(device, dev_id,
+                    capabilities->period_frames, capabilities->sample_rate,
+                    candidate);
+            if (SUCCEEDED(hr))
+                low = candidate;
+            else if (hr == E_OUTOFMEMORY)
+                return hr;
+            else
+                high = candidate - 1;
+        }
+        capabilities->max_dynamic_objects = low;
+    }
+    else if (FAILED(hr))
+        return hr;
+
+    /* A graph error is a supported max=0 fallback only while the endpoint
+     * queried above is still the same endpoint at the same timing. */
+    if (FAILED(hr = get_device_timing(dev_id, &verify_period,
+            &verify_minimum, &verify_rate)) ||
+            FAILED(hr = get_device_mix_format(device, &verify_mix)))
+        return hr;
+    if (verify_period != capabilities->period_frames ||
+            verify_minimum != minimum_frames ||
+            verify_rate != capabilities->sample_rate ||
+            verify_mix.Format.nChannels != mix.Format.nChannels ||
+            verify_mix.dwChannelMask != mix.dwChannelMask)
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+    return S_OK;
+}
+
 static NTSTATUS unix_create_stream(void *args)
 {
     struct create_stream_params *params = args;
+    struct spatial_audio_capabilities capabilities;
     struct coreaudio_stream *stream;
-    WAVEFORMATEXTENSIBLE spatial_bed;
+    WAVEFORMATEXTENSIBLE spatial_bed = {0};
     AURenderCallbackStruct input;
+    kern_return_t kr;
     HRESULT hr;
     OSStatus sc;
+    int computed_frames;
     SIZE_T size;
 
     params->result = S_OK;
@@ -1792,19 +2654,22 @@ static NTSTATUS unix_create_stream(void *args)
     }
 
     stream->period = params->period;
-    stream->period_frames = muldiv(params->period, stream->fmt->nSamplesPerSec, 10000000);
-
-    if (stream->period_frames == 0)
+    computed_frames = muldiv(params->period, stream->fmt->nSamplesPerSec,
+            10000000);
+    if (computed_frames <= 0)
     {
         params->result = E_INVALIDARG;
         goto end;
     }
+    stream->period_frames = computed_frames;
 
     stream->dev_id = dev_id_from_device(params->device);
     stream->flow = params->flow;
     stream->flags = params->flags;
     stream->spatial = params->spatial;
     stream->spatial_static_mask = params->spatial_static_mask;
+    stream->spatial_dynamic_objects = params->spatial_dynamic_objects;
+    stream->spatial_endpoint_generation = params->spatial_endpoint_generation;
     stream->share = params->share;
     /* The DefaultOutput unit can migrate to a device with a different speaker
      * layout without giving us a safe point at which to rebuild the spatial
@@ -1815,6 +2680,29 @@ static NTSTATUS unix_create_stream(void *args)
 
     if (stream->spatial)
     {
+        kr = semaphore_create(mach_task_self(),
+                &stream->callback_drain_semaphore, SYNC_POLICY_FIFO, 0);
+        if (kr != KERN_SUCCESS)
+        {
+            params->result = E_OUTOFMEMORY;
+            goto end;
+        }
+        stream->callback_drain_semaphore_created = TRUE;
+    }
+    if (stream->spatial && (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
+    {
+        kr = semaphore_create(mach_task_self(), &stream->event_semaphore,
+                SYNC_POLICY_FIFO, 0);
+        if (kr != KERN_SUCCESS)
+        {
+            params->result = E_OUTOFMEMORY;
+            goto end;
+        }
+        stream->event_semaphore_created = TRUE;
+    }
+
+    if (stream->spatial)
+    {
         UINT32 i;
 
         if (stream->flow != eRender || stream->share != AUDCLNT_SHAREMODE_SHARED)
@@ -1822,24 +2710,66 @@ static NTSTATUS unix_create_stream(void *args)
             params->result = E_INVALIDARG;
             goto end;
         }
+        if (FAILED(params->result = query_spatial_audio_capabilities(
+                params->device, &capabilities, FALSE)))
+            goto end;
+        if (stream->spatial_endpoint_generation &&
+                stream->spatial_endpoint_generation !=
+                        capabilities.endpoint_generation)
+        {
+            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+            goto end;
+        }
+        if (stream->spatial_dynamic_objects >
+                capabilities.max_dynamic_objects)
+        {
+            params->result = SPTLAUDCLNT_E_NO_MORE_OBJECTS;
+            goto end;
+        }
         if (FAILED(params->result = get_spatial_bed_format(stream->fmt,
-                stream->spatial_static_mask,
-                &spatial_bed, &stream->spatial_dry_channel)))
+                stream->spatial_static_mask, stream->spatial_dynamic_objects,
+                &spatial_bed, &stream->spatial_dry_channel,
+                &stream->spatial_dynamic_channel)))
             goto end;
         stream->spatial_bed_channels = spatial_bed.Format.nChannels;
 
-        if (!(stream->spatial_volumes = malloc(stream->fmt->nChannels *
-                sizeof(*stream->spatial_volumes))))
+        if (!(stream->spatial_volume_bits = malloc(stream->fmt->nChannels *
+                sizeof(*stream->spatial_volume_bits))))
         {
             params->result = E_OUTOFMEMORY;
             goto end;
         }
         for (i = 0; i < stream->fmt->nChannels; ++i)
-            stream->spatial_volumes[i] = 1.0f;
+        {
+            float volume = 1.0f;
+
+            memcpy(&stream->spatial_volume_bits[i], &volume,
+                    sizeof(stream->spatial_volume_bits[i]));
+        }
         stream->spatial_volumes_are_unity = TRUE;
+        if (getenv("SWITCHYARD_SPATIAL_AUDIO_PROFILE"))
+        {
+            if (!(stream->callback_timings = calloc(
+                    SPATIAL_AUDIO_PROFILE_SAMPLES,
+                    sizeof(*stream->callback_timings))))
+            {
+                params->result = E_OUTOFMEMORY;
+                goto end;
+            }
+            stream->profile_callbacks = TRUE;
+        }
+        if (FAILED(params->result = register_spatial_device_listeners(stream)))
+            goto end;
     }
 
-    stream->bufsize_frames = muldiv(params->duration, stream->fmt->nSamplesPerSec, 10000000);
+    computed_frames = muldiv(params->duration, stream->fmt->nSamplesPerSec,
+            10000000);
+    if (computed_frames <= 0)
+    {
+        params->result = E_INVALIDARG;
+        goto end;
+    }
+    stream->bufsize_frames = computed_frames;
     if(params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
         stream->bufsize_frames -= stream->bufsize_frames % stream->period_frames;
 
@@ -1849,7 +2779,8 @@ static NTSTATUS unix_create_stream(void *args)
     }
 
     if (stream->spatial &&
-            (get_device_spatial_output_type(stream->dev_id) ==
+            (stream->spatial_dynamic_objects ||
+             get_device_spatial_output_type(stream->dev_id) ==
                     kSpatialMixerOutputType_Headphones ||
              (spatial_bed.dwChannelMask & SPATIAL_AUDIO_PRIVATE_BED_SPEAKERS) ||
              !device_supports_spatial_format(params->device, &spatial_bed.Format)))
@@ -1881,8 +2812,11 @@ static NTSTATUS unix_create_stream(void *args)
             sc = AudioUnitSetProperty(stream->unit, kAudioUnitProperty_SetRenderCallback,
                     kAudioUnitScope_Input, 0, &input, sizeof(input));
             if (stream->spatial)
+            {
+                stream->spatial_native_output = TRUE;
                 TRACE("Using lossless native output for a %u-channel spatial bed.\n",
                         spatial_bed.Format.nChannels);
+            }
         }
         if (sc != noErr)
         {
@@ -1933,7 +2867,12 @@ static NTSTATUS unix_create_stream(void *args)
     }
     stream->unit_started = TRUE;
 
-    size = stream->bufsize_frames * stream->fmt->nBlockAlign;
+    if (stream->bufsize_frames > SIZE_MAX / stream->fmt->nBlockAlign)
+    {
+        params->result = E_OUTOFMEMORY;
+        goto end;
+    }
+    size = (SIZE_T)stream->bufsize_frames * stream->fmt->nBlockAlign;
     if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, zero_bits,
                                &size, MEM_COMMIT, PAGE_READWRITE)){
         params->result = E_OUTOFMEMORY;
@@ -1941,24 +2880,98 @@ static NTSTATUS unix_create_stream(void *args)
     }
     silence_buffer(stream, stream->local_buffer, stream->bufsize_frames);
 
+    if (stream->spatial)
+    {
+        size = (SIZE_T)stream->bufsize_frames * stream->fmt->nBlockAlign;
+        if (NtAllocateVirtualMemory(GetCurrentProcess(),
+                (void **)&stream->tmp_buffer, zero_bits, &size, MEM_COMMIT,
+                PAGE_READWRITE))
+        {
+            params->result = E_OUTOFMEMORY;
+            goto end;
+        }
+        stream->tmp_buffer_frames = stream->bufsize_frames;
+    }
+
     if(stream->flow == eCapture){
         stream->cap_bufsize_frames = muldiv(params->duration, stream->dev_desc.mSampleRate, 10000000);
-        stream->cap_buffer = malloc(stream->cap_bufsize_frames * stream->fmt->nBlockAlign);
+        if (stream->cap_bufsize_frames > SIZE_MAX / stream->fmt->nBlockAlign ||
+                !(stream->cap_buffer = malloc((size_t)stream->cap_bufsize_frames *
+                        stream->fmt->nBlockAlign)))
+        {
+            params->result = E_OUTOFMEMORY;
+            goto end;
+        }
+    }
+    if (stream->spatial)
+    {
+        struct spatial_audio_capabilities verified;
+
+        /* Close the activation/listener registration window.  A device can
+         * change after the caller's capability snapshot but before the graph
+         * is constructed; re-snapshot after graph initialization, then drain
+         * every property callback queued before this point. */
+        params->result = query_spatial_audio_capabilities(params->device,
+                &verified, FALSE);
+        if (SUCCEEDED(params->result) && stream->device_listener_queue)
+            dispatch_sync_f(stream->device_listener_queue, NULL,
+                    dispatch_barrier_noop);
+        if (SUCCEEDED(params->result) &&
+                (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE) ||
+                 (stream->spatial_endpoint_generation &&
+                  verified.endpoint_generation !=
+                        stream->spatial_endpoint_generation) ||
+                 stream->spatial_dynamic_objects >
+                        verified.max_dynamic_objects))
+            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        if (FAILED(params->result))
+            goto end;
     }
     params->result = S_OK;
 
 end:
     if(FAILED(params->result)){
         if(stream->converter) AudioConverterDispose(stream->converter);
-        if (stream->unit_started) AudioOutputUnitStop(stream->unit);
+        __atomic_store_n(&stream->shutting_down, TRUE, __ATOMIC_RELEASE);
+        unregister_spatial_device_listeners(stream);
+        if (stream->unit_started)
+        {
+            AudioOutputUnitStop(stream->unit);
+            if (stream->spatial)
+                wait_for_spatial_callbacks(stream);
+        }
         if (stream->unit_initialized) AudioUnitUninitialize(stream->unit);
         if (stream->spatial_unit_initialized) AudioUnitUninitialize(stream->spatial_unit);
         if (stream->spatial_unit) AudioComponentInstanceDispose(stream->spatial_unit);
         if(stream->unit) AudioComponentInstanceDispose(stream->unit);
-        free(stream->spatial_volumes);
+        free(stream->spatial_volume_bits);
         free(stream->spatial_bed_buffer);
         free(stream->spatial_dry_buffer);
         free(stream->spatial_dry_delay_buffer);
+        free(stream->spatial_dynamic_buffer);
+        free(stream->spatial_input_contexts);
+        free(stream->spatial_parameter_events);
+        free(stream->spatial_object_states);
+        free(stream->spatial_metadata_sequences);
+        free(stream->callback_timings);
+        free(stream->cap_buffer);
+        if (stream->local_buffer)
+        {
+            size = 0;
+            NtFreeVirtualMemory(GetCurrentProcess(),
+                    (void **)&stream->local_buffer, &size, MEM_RELEASE);
+        }
+        if (stream->tmp_buffer)
+        {
+            size = 0;
+            NtFreeVirtualMemory(GetCurrentProcess(),
+                    (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
+        }
+        if (stream->event_semaphore_created)
+            semaphore_destroy(mach_task_self(), stream->event_semaphore);
+        if (stream->callback_drain_semaphore_created)
+            semaphore_destroy(mach_task_self(),
+                    stream->callback_drain_semaphore);
         free(stream->fmt);
         free(stream);
     } else {
@@ -1969,20 +2982,75 @@ end:
     return STATUS_SUCCESS;
 }
 
+static int compare_uint64(const void *left, const void *right)
+{
+    UINT64 a = *(const UINT64 *)left;
+    UINT64 b = *(const UINT64 *)right;
+
+    return a < b ? -1 : a > b;
+}
+
+static UINT64 spatial_profile_nanoseconds(UINT64 ticks,
+        const mach_timebase_info_data_t *timebase)
+{
+    long double value = (long double)ticks * timebase->numer / timebase->denom;
+
+    return (UINT64)value;
+}
+
+static void report_spatial_profile(struct coreaudio_stream *stream)
+{
+    mach_timebase_info_data_t timebase;
+    UINT32 count;
+
+    if (!stream->profile_callbacks)
+        return;
+    count = min(__atomic_load_n(&stream->callback_timing_count,
+            __ATOMIC_ACQUIRE), SPATIAL_AUDIO_PROFILE_SAMPLES);
+    if (!count || mach_timebase_info(&timebase) != KERN_SUCCESS)
+        return;
+
+    qsort(stream->callback_timings, count, sizeof(*stream->callback_timings),
+            compare_uint64);
+    TRACE("Spatial callback profile: native %u, dynamic objects %u, samples %u, p50 %llu ns, p95 %llu ns, p99 %llu ns, underruns %llu, overruns %llu, reentrant rejects %llu, callback allocations 0.\n",
+            stream->spatial_native_output, stream->spatial_dynamic_objects,
+            count, (unsigned long long)spatial_profile_nanoseconds(
+                    stream->callback_timings[(count - 1) * 50 / 100], &timebase),
+            (unsigned long long)spatial_profile_nanoseconds(
+                    stream->callback_timings[(count - 1) * 95 / 100], &timebase),
+            (unsigned long long)spatial_profile_nanoseconds(
+                    stream->callback_timings[(count - 1) * 99 / 100], &timebase),
+            (unsigned long long)__atomic_load_n(&stream->underruns,
+                    __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&stream->overruns,
+                    __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&stream->reentrant_callbacks,
+                    __ATOMIC_RELAXED));
+}
+
 static NTSTATUS unix_release_stream( void *args )
 {
     struct release_stream_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
     SIZE_T size;
 
+    __atomic_store_n(&stream->shutting_down, TRUE, __ATOMIC_RELEASE);
+    unregister_spatial_device_listeners(stream);
     if(stream->timer_thread){
-        stream->please_quit = TRUE;
+        __atomic_store_n(&stream->please_quit, TRUE, __ATOMIC_RELEASE);
+        if (stream->event_semaphore_created)
+            semaphore_signal(stream->event_semaphore);
         NtWaitForSingleObject(stream->timer_thread, FALSE, NULL);
         NtClose(stream->timer_thread);
     }
 
     if(stream->unit){
-        if (stream->unit_started) AudioOutputUnitStop(stream->unit);
+        if (stream->unit_started)
+        {
+            AudioOutputUnitStop(stream->unit);
+            if (stream->spatial)
+                wait_for_spatial_callbacks(stream);
+        }
         if (stream->unit_initialized) AudioUnitUninitialize(stream->unit);
     }
     if (stream->spatial_unit)
@@ -1993,11 +3061,23 @@ static NTSTATUS unix_release_stream( void *args )
     if (stream->unit)
         AudioComponentInstanceDispose(stream->unit);
 
+    report_spatial_profile(stream);
+
     if(stream->converter) AudioConverterDispose(stream->converter);
-    free(stream->spatial_volumes);
+    free(stream->spatial_volume_bits);
     free(stream->spatial_bed_buffer);
     free(stream->spatial_dry_buffer);
     free(stream->spatial_dry_delay_buffer);
+    free(stream->spatial_dynamic_buffer);
+    free(stream->spatial_input_contexts);
+    free(stream->spatial_parameter_events);
+    free(stream->spatial_object_states);
+    free(stream->spatial_metadata_sequences);
+    free(stream->callback_timings);
+    if (stream->event_semaphore_created)
+        semaphore_destroy(mach_task_self(), stream->event_semaphore);
+    if (stream->callback_drain_semaphore_created)
+        semaphore_destroy(mach_task_self(), stream->callback_drain_semaphore);
     free(stream->resamp_buffer);
     free(stream->wrap_buffer);
     free(stream->cap_buffer);
@@ -2295,14 +3375,39 @@ static NTSTATUS unix_is_format_supported(void *args)
 static NTSTATUS unix_get_device_period(void *args)
 {
     struct get_device_period_params *params = args;
+    AudioDeviceID dev_id;
+    UINT32 frames, minimum_frames, rate;
+    HRESULT hr;
+
+    if (!params->device ||
+            (dev_id = dev_id_from_device(params->device)) == kAudioObjectUnknown)
+    {
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        return STATUS_SUCCESS;
+    }
+    if (FAILED(hr = get_device_timing(dev_id, &frames, &minimum_frames,
+            &rate)))
+    {
+        params->result = hr;
+        return STATUS_SUCCESS;
+    }
 
     if (params->def_period)
-        *params->def_period = def_period;
+        *params->def_period = ((UINT64)frames * 10000000 + rate / 2) / rate;
     if (params->min_period)
-        *params->min_period = min_period;
-
+        *params->min_period = ((UINT64)minimum_frames * 10000000 + rate / 2) /
+                rate;
     params->result = S_OK;
 
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_get_spatial_audio_capabilities(void *args)
+{
+    struct get_spatial_audio_capabilities_params *params = args;
+
+    params->result = query_spatial_audio_capabilities(params->device,
+            &params->capabilities, TRUE);
     return STATUS_SUCCESS;
 }
 
@@ -2477,11 +3582,21 @@ static NTSTATUS unix_get_latency(void *args)
     struct get_latency_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
     AudioDeviceID dev_id;
-    UInt32 latency, stream_latency, size;
+    UINT32 period_frames, minimum_frames, sample_rate;
+    UInt32 latency, safety_offset, stream_latency, size;
+    UINT64 device_frames, latency_time;
     AudioObjectPropertyAddress addr;
+    HRESULT hr;
     OSStatus sc;
 
     os_unfair_lock_lock(&stream->lock);
+
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+    {
+        os_unfair_lock_unlock(&stream->lock);
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        return STATUS_SUCCESS;
+    }
 
     addr.mScope = get_scope(stream->flow);
     addr.mSelector = kAudioDevicePropertyLatency;
@@ -2503,13 +3618,56 @@ static NTSTATUS unix_get_latency(void *args)
         return STATUS_SUCCESS;
     }
 
-    latency += stream_latency;
-    /* pretend we process audio in Period chunks, so max latency includes
-     * the period time */
-    *params->latency = muldiv(latency, 10000000, stream->fmt->nSamplesPerSec) + stream->period;
+    addr.mSelector = kAudioDevicePropertySafetyOffset;
+    size = sizeof(safety_offset);
+    sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size,
+            &safety_offset);
+    if (sc != noErr)
+    {
+        WARN("Couldn't get _SafetyOffset property: %x\n", (int)sc);
+        os_unfair_lock_unlock(&stream->lock);
+        params->result = osstatus_to_hresult(sc);
+        return STATUS_SUCCESS;
+    }
+    if (FAILED(hr = get_device_timing(dev_id, &period_frames,
+            &minimum_frames, &sample_rate)))
+    {
+        os_unfair_lock_unlock(&stream->lock);
+        params->result = hr;
+        return STATUS_SUCCESS;
+    }
+
+    device_frames = (UINT64)latency + safety_offset + stream_latency;
+    if (device_frames > (~(UINT64)0 - sample_rate + 1) / 10000000)
+    {
+        os_unfair_lock_unlock(&stream->lock);
+        params->result = E_FAIL;
+        return STATUS_SUCCESS;
+    }
+    latency_time = (device_frames * 10000000 + sample_rate - 1) /
+            sample_rate;
+    if (latency_time > INT64_MAX - stream->period)
+    {
+        os_unfair_lock_unlock(&stream->lock);
+        params->result = E_FAIL;
+        return STATUS_SUCCESS;
+    }
+    /* Include one producer quantum in the worst-case stream latency. */
+    *params->latency = latency_time + stream->period;
     if (stream->spatial_dry_delay_frames)
-        *params->latency += muldiv(stream->spatial_dry_delay_frames, 10000000,
-                stream->fmt->nSamplesPerSec);
+    {
+        UINT64 spatial_time = ((UINT64)stream->spatial_dry_delay_frames *
+                10000000 + stream->fmt->nSamplesPerSec - 1) /
+                stream->fmt->nSamplesPerSec;
+
+        if (spatial_time > INT64_MAX - *params->latency)
+        {
+            os_unfair_lock_unlock(&stream->lock);
+            params->result = E_FAIL;
+            return STATUS_SUCCESS;
+        }
+        *params->latency += spatial_time;
+    }
 
     os_unfair_lock_unlock(&stream->lock);
     params->result = S_OK;
@@ -2518,6 +3676,17 @@ static NTSTATUS unix_get_latency(void *args)
 
 static UINT32 get_current_padding_nolock(struct coreaudio_stream *stream)
 {
+    if (stream->spatial)
+    {
+        UINT64 read_frame = __atomic_load_n(&stream->spatial_read_frames,
+                __ATOMIC_ACQUIRE);
+        UINT64 write_frame = __atomic_load_n(&stream->spatial_write_frames,
+                __ATOMIC_ACQUIRE);
+
+        if (write_frame < read_frame)
+            return 0;
+        return min(write_frame - read_frame, stream->bufsize_frames);
+    }
     if(stream->flow == eCapture) capture_resample(stream);
     return stream->held_frames;
 }
@@ -2528,9 +3697,14 @@ static NTSTATUS unix_get_current_padding(void *args)
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
 
     os_unfair_lock_lock(&stream->lock);
-    *params->padding = get_current_padding_nolock(stream);
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    else
+    {
+        *params->padding = get_current_padding_nolock(stream);
+        params->result = S_OK;
+    }
     os_unfair_lock_unlock(&stream->lock);
-    params->result = S_OK;
     return STATUS_SUCCESS;
 }
 
@@ -2540,11 +3714,26 @@ static void unix_timer_loop(void *args)
     LARGE_INTEGER delay, next, last;
     int adjust;
 
+    if (stream->spatial)
+    {
+        while (!__atomic_load_n(&stream->please_quit, __ATOMIC_ACQUIRE))
+        {
+            semaphore_wait(stream->event_semaphore);
+            if (__atomic_load_n(&stream->please_quit, __ATOMIC_ACQUIRE))
+                break;
+            __atomic_store_n(&stream->event_pending, 0, __ATOMIC_RELEASE);
+            if (__atomic_load_n(&stream->playing, __ATOMIC_ACQUIRE) &&
+                    stream->event)
+                NtSetEvent(stream->event, NULL);
+        }
+        return;
+    }
+
     delay.QuadPart = -stream->period;
     NtQueryPerformanceCounter(&last, NULL);
     next.QuadPart = last.QuadPart + stream->period;
 
-    while(!stream->please_quit){
+    while(!__atomic_load_n(&stream->please_quit, __ATOMIC_ACQUIRE)){
         NtSetEvent(stream->event, NULL);
         NtDelayExecution(FALSE, &delay);
         NtQueryPerformanceCounter(&last, NULL);
@@ -2565,20 +3754,36 @@ static NTSTATUS unix_start(void *args)
     struct start_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
     static const WCHAR name[] = {'a','u','d','i','o','_','c','l','i','e','n','t','_','t','i','m','e','r',0};
+    NTSTATUS status;
 
     os_unfair_lock_lock(&stream->lock);
 
-    if((stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->event)
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    else if((stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->event)
         params->result = AUDCLNT_E_EVENTHANDLE_NOT_SET;
-    else if(stream->playing)
+    else if(__atomic_load_n(&stream->playing, __ATOMIC_ACQUIRE))
         params->result = AUDCLNT_E_NOT_STOPPED;
     else{
-        stream->playing = TRUE;
+        __atomic_store_n(&stream->playing, TRUE, __ATOMIC_RELEASE);
         params->result = S_OK;
     }
 
     os_unfair_lock_unlock(&stream->lock);
-    if (!stream->timer_thread) create_unix_thread( &stream->timer_thread, name, unix_timer_loop, stream );
+    if (SUCCEEDED(params->result) &&
+            (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
+            !stream->timer_thread)
+    {
+        status = create_unix_thread(&stream->timer_thread, name,
+                unix_timer_loop, stream);
+        if (status)
+        {
+            __atomic_store_n(&stream->playing, FALSE, __ATOMIC_RELEASE);
+            params->result = HRESULT_FROM_NT(status);
+        }
+    }
+    if (SUCCEEDED(params->result) && stream->spatial)
+        signal_spatial_event(stream);
 
     return STATUS_SUCCESS;
 }
@@ -2590,16 +3795,35 @@ static NTSTATUS unix_stop(void *args)
 
     os_unfair_lock_lock(&stream->lock);
 
-    if(!stream->playing)
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    else if(!__atomic_load_n(&stream->playing, __ATOMIC_ACQUIRE))
         params->result = S_FALSE;
     else{
-        stream->playing = FALSE;
+        __atomic_store_n(&stream->playing, FALSE, __ATOMIC_RELEASE);
         params->result = S_OK;
     }
 
     os_unfair_lock_unlock(&stream->lock);
 
     return STATUS_SUCCESS;
+}
+
+static void wait_for_spatial_callbacks(struct coreaudio_stream *stream)
+{
+    while (__atomic_load_n(&stream->spatial_callbacks_inflight,
+            __ATOMIC_ACQUIRE))
+        semaphore_wait(stream->callback_drain_semaphore);
+}
+
+static void wait_for_device_callbacks(struct coreaudio_stream *stream)
+{
+    LARGE_INTEGER delay;
+
+    delay.QuadPart = -10000; /* One millisecond, off the real-time thread. */
+    while (__atomic_load_n(&stream->device_callbacks_inflight,
+            __ATOMIC_ACQUIRE))
+        NtDelayExecution(FALSE, &delay);
 }
 
 static NTSTATUS unix_reset(void *args)
@@ -2611,13 +3835,19 @@ static NTSTATUS unix_reset(void *args)
 
     os_unfair_lock_lock(&stream->lock);
 
-    if(stream->playing)
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    else if(__atomic_load_n(&stream->playing, __ATOMIC_ACQUIRE))
         params->result = AUDCLNT_E_NOT_STOPPED;
     else if(stream->getbuf_last)
         params->result = AUDCLNT_E_BUFFER_OPERATION_PENDING;
     else{
-        if (stream->spatial_unit)
-            reset_spatial = stream->spatial_resetting = TRUE;
+        if (stream->spatial)
+        {
+            reset_spatial = TRUE;
+            __atomic_store_n(&stream->spatial_resetting, TRUE,
+                    __ATOMIC_RELEASE);
+        }
         else
         {
             if(stream->flow == eRender)
@@ -2642,12 +3872,11 @@ static NTSTATUS unix_reset(void *args)
 
     os_unfair_lock_unlock(&stream->lock);
 
-    /* Do not hold the stream lock while resetting the audio unit: an in-flight
-     * render can still be finishing its input callback and taking that lock.
-     * New callbacks remain silent until the reset has completed. */
     if (reset_spatial)
     {
-        os_unfair_lock_lock(&stream->spatial_unit_lock);
+        UINT32 i;
+
+        wait_for_spatial_callbacks(stream);
         os_unfair_lock_lock(&stream->lock);
         stream->written_frames = 0;
         stream->held_frames = 0;
@@ -2662,13 +3891,16 @@ static NTSTATUS unix_reset(void *args)
                             sizeof(*stream->spatial_dry_delay_buffer));
             stream->spatial_dry_delay_pos = 0;
         }
+        __atomic_store_n(&stream->spatial_read_frames, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&stream->spatial_write_frames, 0, __ATOMIC_RELEASE);
+        for (i = 0; i < stream->spatial_metadata_capacity; ++i)
+            __atomic_store_n(&stream->spatial_metadata_sequences[i], UINT64_MAX,
+                    __ATOMIC_RELEASE);
         os_unfair_lock_unlock(&stream->lock);
 
-        sc = AudioUnitReset(stream->spatial_unit, kAudioUnitScope_Global, 0);
-        os_unfair_lock_lock(&stream->lock);
-        stream->spatial_resetting = FALSE;
-        os_unfair_lock_unlock(&stream->lock);
-        os_unfair_lock_unlock(&stream->spatial_unit_lock);
+        sc = stream->spatial_unit ? AudioUnitReset(stream->spatial_unit,
+                kAudioUnitScope_Global, 0) : noErr;
+        __atomic_store_n(&stream->spatial_resetting, FALSE, __ATOMIC_RELEASE);
         if (sc != noErr)
         {
             WARN("Failed to reset spatial mixer state: %x.\n", (int)sc);
@@ -2688,6 +3920,12 @@ static NTSTATUS unix_get_render_buffer(void *args)
 
     os_unfair_lock_lock(&stream->lock);
 
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+    {
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        goto end;
+    }
+
     pad = get_current_padding_nolock(stream);
 
     if(stream->getbuf_last){
@@ -2698,7 +3936,10 @@ static NTSTATUS unix_get_render_buffer(void *args)
         params->result = S_OK;
         goto end;
     }
-    if(pad + params->frames > stream->bufsize_frames){
+    if (pad > stream->bufsize_frames ||
+            params->frames > stream->bufsize_frames - pad){
+        if (stream->spatial)
+            __atomic_add_fetch(&stream->overruns, 1, __ATOMIC_RELAXED);
         params->result = AUDCLNT_E_BUFFER_TOO_LARGE;
         goto end;
     }
@@ -2740,11 +3981,18 @@ static NTSTATUS unix_release_render_buffer(void *args)
 {
     struct release_render_buffer_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
+    UINT64 spatial_write = 0, sequence;
+    UINT32 record, slot;
     BYTE *buffer;
 
     os_unfair_lock_lock(&stream->lock);
 
-    if(!params->written_frames){
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+    {
+        stream->getbuf_last = 0;
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    }
+    else if(!params->written_frames){
         stream->getbuf_last = 0;
         params->result = S_OK;
     }else if(!stream->getbuf_last)
@@ -2752,6 +4000,31 @@ static NTSTATUS unix_release_render_buffer(void *args)
     else if(params->written_frames > (stream->getbuf_last >= 0 ? stream->getbuf_last : -stream->getbuf_last))
         params->result = AUDCLNT_E_INVALID_SIZE;
     else{
+        if (stream->spatial)
+        {
+            spatial_write = __atomic_load_n(&stream->spatial_write_frames,
+                    __ATOMIC_RELAXED);
+            if (params->spatial_object_count !=
+                    stream->spatial_dynamic_objects ||
+                    (params->spatial_object_count && !params->spatial_objects) ||
+                    spatial_write % stream->period_frames ||
+                    params->written_frames != stream->period_frames)
+            {
+                params->result = E_INVALIDARG;
+                goto done;
+            }
+            for (slot = 0; slot < params->spatial_object_count; ++slot)
+                if (params->spatial_objects[slot].active_frames >
+                            params->written_frames ||
+                        !isfinite(params->spatial_objects[slot].x) ||
+                        !isfinite(params->spatial_objects[slot].y) ||
+                        !isfinite(params->spatial_objects[slot].z))
+                {
+                    params->result = E_INVALIDARG;
+                    goto done;
+                }
+        }
+
         if(stream->getbuf_last >= 0)
             buffer = stream->local_buffer + stream->wri_offs_frames * stream->fmt->nBlockAlign;
         else
@@ -2766,15 +4039,33 @@ static NTSTATUS unix_release_render_buffer(void *args)
                            stream->bufsize_frames * stream->fmt->nBlockAlign,
                            buffer, params->written_frames * stream->fmt->nBlockAlign);
 
+        if (stream->spatial_dynamic_objects)
+        {
+            sequence = spatial_write / stream->period_frames;
+            record = sequence % stream->spatial_metadata_capacity;
+            for (slot = 0; slot < stream->spatial_dynamic_objects; ++slot)
+                spatial_position_to_parameters(&params->spatial_objects[slot],
+                        &stream->spatial_object_states[(size_t)record *
+                                stream->spatial_dynamic_objects + slot]);
+            __atomic_store_n(&stream->spatial_metadata_sequences[record],
+                    sequence, __ATOMIC_RELEASE);
+        }
+
         stream->wri_offs_frames += params->written_frames;
         stream->wri_offs_frames %= stream->bufsize_frames;
-        stream->held_frames += params->written_frames;
+        if (!stream->spatial)
+            stream->held_frames += params->written_frames;
         stream->written_frames += params->written_frames;
         stream->getbuf_last = 0;
+
+        if (stream->spatial)
+            __atomic_store_n(&stream->spatial_write_frames,
+                    spatial_write + params->written_frames, __ATOMIC_RELEASE);
 
         params->result = S_OK;
     }
 
+done:
     os_unfair_lock_unlock(&stream->lock);
 
     return STATUS_SUCCESS;
@@ -2898,7 +4189,17 @@ static NTSTATUS unix_get_position(void *args)
 
     os_unfair_lock_lock(&stream->lock);
 
-    *params->pos = stream->written_frames - stream->held_frames;
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+    {
+        os_unfair_lock_unlock(&stream->lock);
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        return STATUS_SUCCESS;
+    }
+    if (stream->spatial)
+        *params->pos = __atomic_load_n(&stream->spatial_read_frames,
+                __ATOMIC_ACQUIRE);
+    else
+        *params->pos = stream->written_frames - stream->held_frames;
 
     if(stream->share == AUDCLNT_SHAREMODE_SHARED)
         *params->pos *= stream->fmt->nBlockAlign;
@@ -2933,7 +4234,9 @@ static NTSTATUS unix_is_started(void *args)
     struct is_started_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
 
-    if(stream->playing)
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    else if(__atomic_load_n(&stream->playing, __ATOMIC_ACQUIRE))
         params->result = S_OK;
     else
         params->result = S_FALSE;
@@ -2968,14 +4271,22 @@ static NTSTATUS unix_set_volumes(void *args)
 
     if (stream->spatial)
     {
-        stream->spatial_volumes_are_unity = params->master_volume == 1.0f;
+        BOOL unity = params->master_volume == 1.0f;
+
         for (i = 0; i < stream->fmt->nChannels; ++i)
         {
-            stream->spatial_volumes[i] = params->master_volume *
-                    params->session_volumes[i] * params->volumes[i];
-            if (stream->spatial_volumes[i] != 1.0f)
-                stream->spatial_volumes_are_unity = FALSE;
+            UINT32 bits;
+            float volume = params->master_volume * params->session_volumes[i] *
+                    params->volumes[i];
+
+            memcpy(&bits, &volume, sizeof(bits));
+            __atomic_store_n(&stream->spatial_volume_bits[i], bits,
+                    __ATOMIC_RELAXED);
+            if (volume != 1.0f)
+                unity = FALSE;
         }
+        __atomic_store_n(&stream->spatial_volumes_are_unity, unity,
+                __ATOMIC_RELEASE);
         os_unfair_lock_unlock(&stream->lock);
         return STATUS_SUCCESS;
     }
@@ -3011,7 +4322,9 @@ static NTSTATUS unix_set_event_handle(void *args)
     HRESULT hr = S_OK;
 
     os_unfair_lock_lock(&stream->lock);
-    if(!stream->unit)
+    if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+        hr = AUDCLNT_E_DEVICE_INVALIDATED;
+    else if(!stream->unit)
         hr = AUDCLNT_E_DEVICE_INVALIDATED;
     else if(!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
         hr = AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED;
@@ -3064,6 +4377,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     unix_midi_in_message,
     unix_midi_notify_wait,
     unix_not_implemented,
+    unix_get_spatial_audio_capabilities,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -3117,6 +4431,8 @@ static NTSTATUS unix_wow64_create_stream(void *args)
         DWORD flags;
         BOOL spatial;
         UINT32 spatial_static_mask;
+        UINT32 spatial_dynamic_objects;
+        UINT32 spatial_endpoint_generation;
         REFERENCE_TIME duration;
         REFERENCE_TIME period;
         PTR32 fmt;
@@ -3133,6 +4449,9 @@ static NTSTATUS unix_wow64_create_stream(void *args)
         .flags = params32->flags,
         .spatial = params32->spatial,
         .spatial_static_mask = params32->spatial_static_mask,
+        .spatial_dynamic_objects = params32->spatial_dynamic_objects,
+        .spatial_endpoint_generation =
+                params32->spatial_endpoint_generation,
         .duration = params32->duration,
         .period = params32->period,
         .fmt = ULongToPtr(params32->fmt),
@@ -3179,6 +4498,50 @@ static NTSTATUS unix_wow64_get_render_buffer(void *args)
     unix_get_render_buffer(&params);
     params32->result = params.result;
     *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_wow64_release_render_buffer(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        UINT32 written_frames;
+        UINT flags;
+        PTR32 spatial_objects;
+        UINT32 spatial_object_count;
+        HRESULT result;
+    } *params32 = args;
+    struct release_render_buffer_params params =
+    {
+        .stream = params32->stream,
+        .written_frames = params32->written_frames,
+        .flags = params32->flags,
+        .spatial_objects = ULongToPtr(params32->spatial_objects),
+        .spatial_object_count = params32->spatial_object_count,
+    };
+
+    unix_release_render_buffer(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_wow64_get_spatial_audio_capabilities(void *args)
+{
+    struct
+    {
+        PTR32 device;
+        HRESULT result;
+        struct spatial_audio_capabilities capabilities;
+    } *params32 = args;
+    struct get_spatial_audio_capabilities_params params =
+    {
+        .device = ULongToPtr(params32->device),
+    };
+
+    unix_get_spatial_audio_capabilities(&params);
+    params32->result = params.result;
+    params32->capabilities = params.capabilities;
     return STATUS_SUCCESS;
 }
 
@@ -3492,7 +4855,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     unix_stop,
     unix_reset,
     unix_wow64_get_render_buffer,
-    unix_release_render_buffer,
+    unix_wow64_release_render_buffer,
     unix_wow64_get_capture_buffer,
     unix_release_capture_buffer,
     unix_wow64_is_format_supported,
@@ -3518,6 +4881,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     unix_wow64_midi_in_message,
     unix_wow64_midi_notify_wait,
     unix_not_implemented,
+    unix_wow64_get_spatial_audio_capabilities,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);

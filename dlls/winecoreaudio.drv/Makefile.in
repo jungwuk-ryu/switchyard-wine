@@ -1,5 +1,6 @@
 UNIXLIB   = winecoreaudio.so
 UNIX_LIBS = $(COREAUDIO_LIBS)
+UNIX_CFLAGS = -fblocks
 
 SOURCES = \
 	coreaudio.c \

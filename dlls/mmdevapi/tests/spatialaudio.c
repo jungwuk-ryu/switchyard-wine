@@ -64,6 +64,11 @@ static void test_formats(void)
     hr = IAudioFormatEnumerator_GetFormat(afe, 0, &fmt);
     ok(hr == S_OK, "Getting format failed: 0x%08lx\n", hr);
     ok(fmt != NULL, "Expected to get non-NULL format\n");
+    if (!fmt)
+    {
+        IAudioFormatEnumerator_Release(afe);
+        return;
+    }
 
     ok(fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT, "Wrong format, expected WAVE_FORMAT_IEEE_FLOAT got %hx\n", fmt->wFormatTag);
     ok(fmt->nChannels == 1, "Wrong number of channels, expected 1 got %hu\n", fmt->nChannels);
@@ -232,6 +237,28 @@ static void test_stream_activation(void)
     activation_params_prop.blob.cbSize = sizeof(activation_params);
     activation_params_prop.blob.pBlobData = (BYTE*) &activation_params;
 
+    fill_activation_params(&activation_params);
+    activation_params_prop.vt = VT_EMPTY;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Expected a non-blob activation value to fail: %#lx.\n", hr);
+    ok(!sas, "Expected no stream for a malformed activation value.\n");
+
+    activation_params_prop.vt = VT_BLOB;
+    activation_params_prop.blob.cbSize = sizeof(activation_params) - 1;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Expected a truncated activation blob to fail: %#lx.\n", hr);
+    ok(!sas, "Expected no stream for a truncated activation blob.\n");
+
+    activation_params_prop.blob.cbSize = sizeof(activation_params);
+    activation_params_prop.blob.pBlobData = NULL;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Expected a null activation blob to fail: %#lx.\n", hr);
+    ok(!sas, "Expected no stream for a null activation blob.\n");
+    activation_params_prop.blob.pBlobData = (BYTE *)&activation_params;
+
     /* correct params */
     fill_activation_params(&activation_params);
     hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
@@ -292,23 +319,40 @@ static void test_stream_activation(void)
     ok(hr == AUDCLNT_E_UNSUPPORTED_FORMAT, "Expected format to be unsupported: 0x%08lx\n", hr);
     ok(sas == NULL, "Expected spatial audio stream to be set to NULL upon failed activation\n");
 
-    /* dynamic objects are not supported */
-    if (max_dyn_count == 0)
-    {
-        fill_activation_params(&activation_params);
-        activation_params.StaticObjectTypeMask |= AudioObjectType_Dynamic;
-        hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
-        ok(hr == E_INVALIDARG, "Expected dynamic objects type be invalid: 0x%08lx\n", hr);
-        ok(sas == NULL, "Expected spatial audio stream to be set to NULL upon failed activation\n");
-    }
+    /* Dynamic is an activatable object type, not a static-bed mask bit. */
+    fill_activation_params(&activation_params);
+    activation_params.StaticObjectTypeMask |= AudioObjectType_Dynamic;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Expected dynamic static-mask bit to be invalid: 0x%08lx\n", hr);
+    ok(sas == NULL, "Expected spatial audio stream to be set to NULL upon failed activation\n");
 
+    fill_activation_params(&activation_params);
     activation_params.MinDynamicObjectCount = max_dyn_count + 1;
     activation_params.MaxDynamicObjectCount = max_dyn_count + 1;
-    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop, &IID_ISpatialAudioObjectRenderStream, (void**)&sas);
-    if (max_dyn_count)
-        ok(hr == AUDCLNT_E_UNSUPPORTED_FORMAT, "Expected dynamic object count exceeding max to be unsupported: 0x%08lx\n", hr);
-    else
-        ok(hr == E_INVALIDARG, "Expected setting dynamic object count to be invalid: 0x%08lx\n", hr);
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == SPTLAUDCLNT_E_NO_MORE_OBJECTS,
+            "Expected an unsatisfied dynamic minimum to fail: 0x%08lx\n", hr);
+
+    fill_activation_params(&activation_params);
+    activation_params.MinDynamicObjectCount = 1;
+    activation_params.MaxDynamicObjectCount = 0;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == E_INVALIDARG, "Expected reversed dynamic range to be invalid: 0x%08lx\n", hr);
+
+    if (spatial_stream_supported)
+    {
+        fill_activation_params(&activation_params);
+        activation_params.MaxDynamicObjectCount = max_dyn_count + 1;
+        hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+                &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+        ok(hr == S_OK, "Expected dynamic maximum to be capped: 0x%08lx\n", hr);
+        if (hr == S_OK)
+            ISpatialAudioObjectRenderStream_Release(sas);
+        sas = NULL;
+    }
 
     /* ISpatialAudioObjectRenderStreamNotify */
     fill_activation_params(&activation_params);
@@ -336,7 +380,7 @@ static void test_audio_object_activation(void)
     HRESULT hr;
     BOOL is_active;
     ISpatialAudioObjectRenderStream *sas = NULL;
-    ISpatialAudioObject *sao1, *sao2;
+    ISpatialAudioObject *sao1, *sao2, *sao3;
 
     SpatialAudioObjectRenderStreamActivationParams activation_params;
     PROPVARIANT activation_params_prop;
@@ -377,6 +421,23 @@ static void test_audio_object_activation(void)
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontRight, &sao2);
     ok(hr == SPTLAUDCLNT_E_STATIC_OBJECT_NOT_AVAILABLE, "Expected static object to be not available: 0x%08lx\n", hr);
 
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+            AudioObjectType_FrontLeft | AudioObjectType_SideLeft, &sao2);
+    ok(hr == SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE,
+            "Expected a combined static object overlapping an active channel to fail: 0x%08lx\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+            AudioObjectType_SideLeft | AudioObjectType_SideRight, &sao2);
+    ok(hr == S_OK, "Failed to activate a combined static object: 0x%08lx\n", hr);
+    if (hr == S_OK)
+    {
+        hr = ISpatialAudioObject_GetAudioObjectType(sao2, &type);
+        ok(hr == S_OK, "Failed to query combined static object type: %#lx.\n", hr);
+        ok(type == (AudioObjectType_SideLeft | AudioObjectType_SideRight),
+                "Got unexpected combined object type %#x.\n", type);
+        ISpatialAudioObject_Release(sao2);
+    }
+
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_Dynamic, &sao2);
     ok(hr == SPTLAUDCLNT_E_NO_MORE_OBJECTS, "Expected to not have no more dynamic objects: 0x%08lx\n", hr);
 
@@ -388,6 +449,10 @@ static void test_audio_object_activation(void)
         hr = ISpatialAudioObject_GetAudioObjectType(sao2, &type);
         ok(hr == S_OK, "Failed to query non-spatialized object type: %#lx.\n", hr);
         ok(type == AudioObjectType_None, "Got unexpected object type %#x.\n", type);
+        hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+                AudioObjectType_None, &sao3);
+        ok(hr == SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE,
+                "Expected the non-spatialized slot to be bounded: %#lx.\n", hr);
         ISpatialAudioObject_Release(sao2);
     }
 
@@ -454,14 +519,7 @@ static void test_audio_object_buffers(void)
 
     hr = ISpatialAudioClient_GetMaxFrameCount(sac, &format, &max_frame_count);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    frame_count = format.nSamplesPerSec / 100; /* 10ms */
-    /* Most of the time the frame count matches the 10ms interval exactly.
-     * However (seen on some Testbot machines) it might be a bit higher for some reason. */
-    ok(max_frame_count <= frame_count + frame_count / 4, "Got unexpected frame count %u.\n", frame_count);
-
-    /* The tests below which check frame count from _BeginUpdatingAudioObjects fail on some Testbot machines
-     * with max_frame_count from _GetMaxFrameCount(). */
-    max_frame_count = frame_count + frame_count / 4;
+    ok(max_frame_count != 0, "Expected a nonzero endpoint processing quantum.\n");
 
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontLeft, &sao[0]);
     ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
@@ -473,6 +531,9 @@ static void test_audio_object_buffers(void)
 
     hr = ISpatialAudioObjectRenderStream_Start(sas);
     ok(hr == S_OK, "Failed to activate spatial audio render stream: 0x%08lx\n", hr);
+    hr = ISpatialAudioObjectRenderStream_Start(sas);
+    ok(hr == SPTLAUDCLNT_E_STREAM_NOT_STOPPED,
+            "Expected a second Start to report a running stream, got %#lx.\n", hr);
 
     hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas, AudioObjectType_FrontRight, &sao[1]);
     ok(hr == S_OK, "Failed to activate spatial audio object: 0x%08lx\n", hr);
@@ -667,6 +728,299 @@ static void test_audio_object_buffers(void)
     ISpatialAudioObjectRenderStream_Release(sas);
 }
 
+struct object_release_thread_context
+{
+    ISpatialAudioObject *object;
+    HANDLE ready_event;
+    HANDLE release_event;
+    ULONG release_ref;
+};
+
+static DWORD WINAPI object_release_thread(void *arg)
+{
+    struct object_release_thread_context *context = arg;
+    HRESULT hr;
+
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr))
+        return 3;
+    if (!SetEvent(context->ready_event))
+    {
+        CoUninitialize();
+        return 1;
+    }
+    if (WaitForSingleObject(context->release_event, 5000) != WAIT_OBJECT_0)
+    {
+        CoUninitialize();
+        return 2;
+    }
+
+    context->release_ref = ISpatialAudioObject_Release(context->object);
+    CoUninitialize();
+    return 0;
+}
+
+static void test_dynamic_audio_objects(void)
+{
+    SpatialAudioObjectRenderStreamActivationParams activation_params;
+    ISpatialAudioObjectRenderStream *sas = NULL;
+    ISpatialAudioObject **objects, *replacement = NULL, *excess = NULL;
+    PROPVARIANT activation_params_prop;
+    UINT32 available, frames, bytes, limit, i, j;
+    BOOL active;
+    BYTE *buffer;
+    HRESULT hr;
+
+    if (!spatial_stream_supported || !max_dyn_count)
+    {
+        win_skip("The endpoint does not expose dynamic spatial objects.\n");
+        return;
+    }
+
+    limit = max_dyn_count;
+    objects = calloc(limit, sizeof(*objects));
+    if (!objects)
+    {
+        skip("Not enough memory for %u dynamic object references.\n", limit);
+        return;
+    }
+    PropVariantInit(&activation_params_prop);
+    activation_params_prop.vt = VT_BLOB;
+    activation_params_prop.blob.cbSize = sizeof(activation_params);
+    activation_params_prop.blob.pBlobData = (BYTE *)&activation_params;
+
+    fill_activation_params(&activation_params);
+    activation_params.StaticObjectTypeMask = AudioObjectType_None;
+    activation_params.MinDynamicObjectCount = 1;
+    activation_params.MaxDynamicObjectCount = limit;
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &activation_params_prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)&sas);
+    ok(hr == S_OK, "Failed to activate a dynamic spatial stream: %#lx.\n", hr);
+    if (hr != S_OK)
+    {
+        free(objects);
+        return;
+    }
+
+    hr = ISpatialAudioObjectRenderStream_GetAvailableDynamicObjectCount(sas, &available);
+    ok(hr == S_OK, "Failed to query dynamic capacity: %#lx.\n", hr);
+    ok(available == limit, "Expected %u available objects, got %u.\n", limit, available);
+
+    for (i = 0; i < limit; ++i)
+    {
+        AudioObjectType type = AudioObjectType_None;
+
+        hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+                AudioObjectType_Dynamic, &objects[i]);
+        ok(hr == S_OK, "Failed to activate dynamic object %u: %#lx.\n", i, hr);
+        if (hr != S_OK)
+            goto cleanup;
+        hr = ISpatialAudioObject_GetAudioObjectType(objects[i], &type);
+        ok(hr == S_OK && type == AudioObjectType_Dynamic,
+                "Got type %#x and status %#lx for object %u.\n", type, hr, i);
+    }
+
+    hr = ISpatialAudioObjectRenderStream_GetAvailableDynamicObjectCount(sas, &available);
+    ok(hr == S_OK && !available, "Expected exhausted capacity, got %u and %#lx.\n",
+            available, hr);
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+            AudioObjectType_Dynamic, &excess);
+    ok(hr == SPTLAUDCLNT_E_NO_MORE_OBJECTS,
+            "Expected dynamic-object exhaustion, got %#lx.\n", hr);
+    ok(!excess, "Expected a null object on exhaustion.\n");
+
+    hr = ISpatialAudioObject_SetPosition(objects[0], 1.0f, 2.0f, 3.0f);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Got %#lx outside an update pass.\n", hr);
+    hr = ISpatialAudioObject_SetVolume(objects[0], 0.25f);
+    ok(hr == SPTLAUDCLNT_E_OUT_OF_ORDER, "Got %#lx outside an update pass.\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_Start(sas);
+    ok(hr == S_OK, "Failed to start dynamic stream: %#lx.\n", hr);
+    if (hr != S_OK)
+        goto cleanup;
+    hr = WaitForSingleObject(event, 500);
+    ok(hr == WAIT_OBJECT_0, "Timed out waiting for a dynamic update: %#lx.\n", hr);
+
+    hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, &available, &frames);
+    ok(hr == S_OK, "Failed to begin dynamic update: %#lx.\n", hr);
+    if (hr != S_OK)
+        goto cleanup;
+    ok(!available, "Expected no capacity while all slots are retained, got %u.\n", available);
+    ok(frames != 0, "Expected a nonzero dynamic update.\n");
+
+    for (i = 0; i < limit; ++i)
+    {
+        hr = ISpatialAudioObject_GetBuffer(objects[i], &buffer, &bytes);
+        ok(hr == S_OK, "Failed to get dynamic buffer %u: %#lx.\n", i, hr);
+        if (hr != S_OK)
+            continue;
+        ok(bytes == frames * format.nBlockAlign,
+                "Expected %u bytes, got %u for dynamic object %u.\n",
+                frames * format.nBlockAlign, bytes, i);
+        for (j = 0; j < frames; ++j)
+            ((float *)buffer)[j] = (float)(i + 1) / 16.0f;
+    }
+
+    hr = ISpatialAudioObject_SetPosition(objects[0], 1.25f, -0.5f, 3.0f);
+    ok(hr == S_OK, "Failed to position a dynamic object: %#lx.\n", hr);
+    hr = ISpatialAudioObject_SetPosition(objects[0], NAN, 0.0f, 0.0f);
+    ok(hr == E_INVALIDARG, "Expected NaN position to be rejected, got %#lx.\n", hr);
+    hr = ISpatialAudioObject_SetPosition(objects[0], 0.0f, INFINITY, 0.0f);
+    ok(hr == E_INVALIDARG, "Expected infinite position to be rejected, got %#lx.\n", hr);
+    hr = ISpatialAudioObject_SetVolume(objects[0], 0.25f);
+    ok(hr == S_OK, "Failed to set dynamic volume: %#lx.\n", hr);
+
+    if (limit > 1)
+    {
+        hr = ISpatialAudioObject_SetEndOfStream(objects[1], frames / 2);
+        ok(hr == S_OK, "Failed to end a dynamic object: %#lx.\n", hr);
+        hr = ISpatialAudioObject_IsActive(objects[1], &active);
+        ok(hr == S_OK && !active, "Expected ended object to be inactive, got %d, %#lx.\n",
+                active, hr);
+    }
+
+    hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
+    ok(hr == S_OK, "Failed to submit dynamic update: %#lx.\n", hr);
+
+    hr = WaitForSingleObject(event, 500);
+    ok(hr == WAIT_OBJECT_0, "Timed out waiting for a second dynamic update: %#lx.\n", hr);
+    hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, &available, &frames);
+    ok(hr == S_OK, "Failed to begin second dynamic update: %#lx.\n", hr);
+    if (hr != S_OK)
+        goto cleanup;
+
+    if (limit > 1)
+    {
+        hr = ISpatialAudioObject_GetBuffer(objects[1], &buffer, &bytes);
+        ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED,
+                "Expected ended object to reject buffers, got %#lx.\n", hr);
+        ISpatialAudioObject_Release(objects[1]);
+        objects[1] = NULL;
+        hr = ISpatialAudioObjectRenderStream_GetAvailableDynamicObjectCount(sas, &available);
+        ok(hr == S_OK && !available,
+                "A slot released during an update must remain retained until End, got %u, %#lx.\n",
+                available, hr);
+    }
+
+    /* Omit object zero after its lifetime started: this is implicit EOS. */
+    for (i = 1; i < limit; ++i)
+    {
+        if (!objects[i])
+            continue;
+        hr = ISpatialAudioObject_GetBuffer(objects[i], &buffer, &bytes);
+        ok(hr == S_OK, "Failed to preserve dynamic object %u: %#lx.\n", i, hr);
+    }
+    hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
+    ok(hr == S_OK, "Failed to submit implicit-EOS update: %#lx.\n", hr);
+    hr = ISpatialAudioObject_IsActive(objects[0], &active);
+    ok(hr == S_OK && !active, "Expected implicit EOS, got active %d and %#lx.\n", active, hr);
+
+    ISpatialAudioObject_Release(objects[0]);
+    objects[0] = NULL;
+    hr = ISpatialAudioObjectRenderStream_GetAvailableDynamicObjectCount(sas, &available);
+    ok(hr == S_OK && available == (limit > 1 ? 2 : 1),
+            "Expected released dynamic slots to be reusable, got %u, %#lx.\n", available, hr);
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(sas,
+            AudioObjectType_Dynamic, &replacement);
+    ok(hr == S_OK, "Failed to reuse a dynamic slot: %#lx.\n", hr);
+    if (hr == S_OK)
+    {
+        hr = WaitForSingleObject(event, 500);
+        ok(hr == WAIT_OBJECT_0, "Timed out waiting for reuse update: %#lx.\n", hr);
+        hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas, &available, &frames);
+        ok(hr == S_OK, "Failed to begin reuse update: %#lx.\n", hr);
+        if (hr == S_OK)
+        {
+            struct object_release_thread_context *release_context;
+            DWORD wait, exit_code = ~0u;
+            HANDLE thread = NULL;
+
+            hr = ISpatialAudioObject_GetBuffer(replacement, &buffer, &bytes);
+            ok(hr == S_OK, "Failed to get reused dynamic buffer: %#lx.\n", hr);
+            hr = ISpatialAudioObject_SetPosition(replacement, -2.0f, 1.0f, -4.0f);
+            ok(hr == S_OK, "Failed to position reused dynamic object: %#lx.\n", hr);
+            hr = ISpatialAudioObject_SetEndOfStream(replacement, frames);
+            ok(hr == S_OK, "Failed to end reused dynamic object: %#lx.\n", hr);
+
+            release_context = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*release_context));
+            ok(!!release_context, "Failed to allocate release thread context.\n");
+            if (release_context)
+            {
+                release_context->object = replacement;
+                release_context->ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+                release_context->release_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+            }
+            ok(release_context && release_context->ready_event && release_context->release_event,
+                    "Failed to create release barriers: %lu.\n", GetLastError());
+            if (release_context && release_context->ready_event && release_context->release_event)
+                thread = CreateThread(NULL, 0, object_release_thread,
+                        release_context, 0, NULL);
+            ok(!!thread, "Failed to create object-release thread: %lu.\n", GetLastError());
+
+            if (thread)
+            {
+                /* Transfer the sole object reference to the worker. Both
+                 * contenders leave this barrier together; either lock order
+                 * must retain the final buffer and free the slot once. */
+                replacement = NULL;
+                wait = WaitForSingleObject(release_context->ready_event, 5000);
+                ok(wait == WAIT_OBJECT_0,
+                        "Object-release thread did not reach its barrier: %#lx.\n", wait);
+                ok(SetEvent(release_context->release_event),
+                        "Failed to open object-release barrier: %lu.\n", GetLastError());
+                hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
+                ok(hr == S_OK, "Failed concurrent EndUpdatingAudioObjects: %#lx.\n", hr);
+                wait = WaitForSingleObject(thread, 5000);
+                ok(wait == WAIT_OBJECT_0, "Object-release thread timed out: %#lx.\n", wait);
+                ok(GetExitCodeThread(thread, &exit_code),
+                        "Failed to query object-release thread: %lu.\n", GetLastError());
+                ok(exit_code == 0, "Object-release thread failed: %lu.\n", exit_code);
+                ok(release_context->release_ref == 0,
+                        "Expected worker to release the last object reference, got %lu.\n",
+                        release_context->release_ref);
+                if (wait == WAIT_OBJECT_0 && exit_code != 0)
+                    ISpatialAudioObject_Release(release_context->object);
+                if (wait == WAIT_OBJECT_0)
+                    CloseHandle(thread);
+            }
+            else
+            {
+                ISpatialAudioObject_Release(replacement);
+                replacement = NULL;
+                hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
+                ok(hr == S_OK, "Failed fallback release-during-update buffer: %#lx.\n", hr);
+            }
+            if (!thread || wait == WAIT_OBJECT_0)
+            {
+                if (release_context && release_context->release_event)
+                    CloseHandle(release_context->release_event);
+                if (release_context && release_context->ready_event)
+                    CloseHandle(release_context->ready_event);
+                if (release_context)
+                    HeapFree(GetProcessHeap(), 0, release_context);
+            }
+            hr = ISpatialAudioObjectRenderStream_GetAvailableDynamicObjectCount(sas, &available);
+            ok(hr == S_OK && available == (limit > 1 ? 2 : 1),
+                    "Concurrent release leaked or duplicated a slot, got %u, %#lx.\n",
+                    available, hr);
+        }
+    }
+
+cleanup:
+    if (replacement)
+        ISpatialAudioObject_Release(replacement);
+    for (i = 0; i < limit; ++i)
+        if (objects[i])
+            ISpatialAudioObject_Release(objects[i]);
+    if (sas)
+    {
+        ISpatialAudioObjectRenderStream_Stop(sas);
+        ISpatialAudioObjectRenderStream_Release(sas);
+    }
+    free(objects);
+}
+
 START_TEST(spatialaudio)
 {
     HRESULT hr;
@@ -715,6 +1069,7 @@ START_TEST(spatialaudio)
     test_stream_activation();
     test_audio_object_activation();
     test_audio_object_buffers();
+    test_dynamic_audio_objects();
 
     ISpatialAudioClient_Release(sac);
 

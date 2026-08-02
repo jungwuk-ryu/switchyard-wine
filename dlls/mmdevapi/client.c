@@ -92,7 +92,6 @@ static inline struct audio_client *impl_from_IAudioStreamVolume(IAudioStreamVolu
 static HRESULT get_periods(struct audio_client *client,
                            REFERENCE_TIME *def_period, REFERENCE_TIME *min_period)
 {
-    static const REFERENCE_TIME min_def_period = 100000; /* 10 ms */
     struct get_device_period_params params;
 
     params.device     = client->device_name;
@@ -101,8 +100,6 @@ static HRESULT get_periods(struct audio_client *client,
     params.min_period = min_period;
 
     wine_unix_call(get_device_period, &params);
-
-    if (def_period) *def_period = max(*def_period, min_def_period);
 
     return params.result;
 }
@@ -378,7 +375,9 @@ static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_
                            const AUDCLNT_SHAREMODE mode, const DWORD flags,
                            REFERENCE_TIME duration, REFERENCE_TIME period,
                            const WAVEFORMATEX *fmt, const GUID *sessionguid,
-                           BOOL spatial, UINT32 spatial_static_mask)
+                           BOOL spatial, UINT32 spatial_static_mask,
+                           UINT32 spatial_dynamic_objects,
+                           UINT32 spatial_endpoint_generation)
 {
     struct create_stream_params params;
     UINT32 i, channel_count;
@@ -493,6 +492,8 @@ static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_
     params.flags         = flags;
     params.spatial       = spatial;
     params.spatial_static_mask = spatial_static_mask;
+    params.spatial_dynamic_objects = spatial_dynamic_objects;
+    params.spatial_endpoint_generation = spatial_endpoint_generation;
     params.duration      = duration;
     params.period        = period;
     params.fmt           = fmt;
@@ -728,7 +729,7 @@ static HRESULT WINAPI client_Initialize(IAudioClient3 *iface, AUDCLNT_SHAREMODE 
                                                debugstr_guid(sessionguid));
 
     return stream_init(This, TRUE, mode, flags, duration, period, fmt, sessionguid,
-            FALSE, 0);
+            FALSE, 0, 0, 0);
 }
 
 static HRESULT WINAPI client_GetBufferSize(IAudioClient3 *iface, UINT32 *out)
@@ -1176,12 +1177,13 @@ static HRESULT WINAPI client_InitializeSharedAudioStream(IAudioClient3 *iface, D
     period = period_frames * (REFERENCE_TIME)10000000 / format->nSamplesPerSec;
 
     return stream_init(This, FALSE, AUDCLNT_SHAREMODE_SHARED, flags, 0, period, format,
-            session_guid, FALSE, 0);
+            session_guid, FALSE, 0, 0, 0);
 }
 
 HRESULT audio_client_initialize_spatial(IAudioClient *iface, DWORD flags,
         REFERENCE_TIME duration, REFERENCE_TIME period, const WAVEFORMATEX *format,
-        const GUID *session_guid, AudioObjectType static_object_mask)
+        const GUID *session_guid, AudioObjectType static_object_mask,
+        UINT32 dynamic_object_count, UINT32 endpoint_generation)
 {
     struct audio_client *client = impl_from_IAudioClient3((IAudioClient3 *)iface);
 
@@ -1189,7 +1191,61 @@ HRESULT audio_client_initialize_spatial(IAudioClient *iface, DWORD flags,
         return E_INVALIDARG;
 
     return stream_init(client, TRUE, AUDCLNT_SHAREMODE_SHARED, flags, duration, period,
-            format, session_guid, TRUE, static_object_mask);
+            format, session_guid, TRUE, static_object_mask, dynamic_object_count,
+            endpoint_generation);
+}
+
+HRESULT audio_client_get_spatial_audio_capabilities(IMMDevice *iface,
+        struct spatial_audio_capabilities *capabilities)
+{
+    struct get_spatial_audio_capabilities_params params;
+    MMDevice *device;
+    EDataFlow flow;
+    char *name;
+
+    if (!iface || !capabilities)
+        return E_POINTER;
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    device = CONTAINING_RECORD(iface, MMDevice, IMMDevice_iface);
+    if (!get_device_name_from_guid(&device->devguid, &name, &flow))
+        return AUDCLNT_E_DEVICE_INVALIDATED;
+    if (flow != eRender)
+    {
+        free(name);
+        return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
+    }
+
+    params.device = name;
+    params.result = E_NOTIMPL;
+    memset(&params.capabilities, 0, sizeof(params.capabilities));
+    wine_unix_call(get_spatial_audio_capabilities, &params);
+    if (params.result == E_NOTIMPL)
+    {
+        struct get_device_period_params period_params;
+        REFERENCE_TIME period = 0;
+
+        period_params.device = name;
+        period_params.flow = flow;
+        period_params.def_period = &period;
+        period_params.min_period = NULL;
+        period_params.result = E_NOTIMPL;
+        wine_unix_call(get_device_period, &period_params);
+        if (SUCCEEDED(period_params.result) && period > 0)
+        {
+            params.capabilities.sample_rate = 48000;
+            params.capabilities.period_frames = MulDiv(period, 48000,
+                    10000000);
+            params.result = params.capabilities.period_frames ? S_OK : E_FAIL;
+        }
+        else
+            params.result = period_params.result;
+    }
+    free(name);
+
+    if (SUCCEEDED(params.result))
+        *capabilities = params.capabilities;
+    return params.result;
 }
 
 const IAudioClient3Vtbl AudioClient3_Vtbl =
@@ -1489,9 +1545,32 @@ static HRESULT WINAPI render_ReleaseBuffer(IAudioRenderClient *iface, UINT32 wri
     params.stream         = This->stream;
     params.written_frames = written_frames;
     params.flags          = flags;
+    params.spatial_objects = NULL;
+    params.spatial_object_count = 0;
 
     wine_unix_call(release_render_buffer, &params);
 
+    return params.result;
+}
+
+HRESULT audio_client_release_spatial_buffer(IAudioClient *iface,
+        UINT32 written_frames, DWORD flags,
+        const struct spatial_audio_object_state *objects, UINT32 object_count)
+{
+    struct audio_client *client = impl_from_IAudioClient3((IAudioClient3 *)iface);
+    struct release_render_buffer_params params;
+
+    if (!client->stream)
+        return AUDCLNT_E_NOT_INITIALIZED;
+    if (object_count && !objects)
+        return E_POINTER;
+
+    params.stream = client->stream;
+    params.written_frames = written_frames;
+    params.flags = flags;
+    params.spatial_objects = objects;
+    params.spatial_object_count = object_count;
+    wine_unix_call(release_render_buffer, &params);
     return params.result;
 }
 

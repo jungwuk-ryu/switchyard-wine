@@ -794,7 +794,9 @@ static NTSTATUS alsa_create_stream(void *args)
      * not implement the corresponding bed/dry split. */
     if (params->spatial)
     {
-        WARN("Spatial audio transport is not supported by the ALSA backend.\n");
+        WARN("Spatial audio transport with %u dynamic objects at endpoint generation %u "
+                "is not supported by the ALSA backend.\n",
+                params->spatial_dynamic_objects, params->spatial_endpoint_generation);
         params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
         return STATUS_SUCCESS;
     }
@@ -1732,6 +1734,11 @@ static NTSTATUS alsa_release_render_buffer(void *args)
     UINT32 written_frames = params->written_frames;
     BYTE *buffer;
 
+    /* ALSA rejects spatial streams at creation, so the optional spatial
+     * object-state payload must never be inspected by this backend. */
+    (void)params->spatial_objects;
+    (void)params->spatial_object_count;
+
     alsa_lock(stream);
 
     if(!written_frames){
@@ -2448,6 +2455,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     alsa_midi_in_message,
     alsa_midi_notify_wait,
     alsa_not_implemented,
+    alsa_not_implemented,
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -2501,6 +2509,8 @@ static NTSTATUS alsa_wow64_create_stream(void *args)
         DWORD flags;
         BOOL spatial;
         UINT32 spatial_static_mask;
+        UINT32 spatial_dynamic_objects;
+        UINT32 spatial_endpoint_generation;
         REFERENCE_TIME duration;
         REFERENCE_TIME period;
         PTR32 fmt;
@@ -2517,6 +2527,8 @@ static NTSTATUS alsa_wow64_create_stream(void *args)
         .flags = params32->flags,
         .spatial = params32->spatial,
         .spatial_static_mask = params32->spatial_static_mask,
+        .spatial_dynamic_objects = params32->spatial_dynamic_objects,
+        .spatial_endpoint_generation = params32->spatial_endpoint_generation,
         .duration = params32->duration,
         .period = params32->period,
         .fmt = ULongToPtr(params32->fmt),
@@ -2563,6 +2575,31 @@ static NTSTATUS alsa_wow64_get_render_buffer(void *args)
     alsa_get_render_buffer(&params);
     params32->result = params.result;
     *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS alsa_wow64_release_render_buffer(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        UINT32 written_frames;
+        UINT flags;
+        PTR32 spatial_objects;
+        UINT32 spatial_object_count;
+        HRESULT result;
+    } *params32 = args;
+    struct release_render_buffer_params params =
+    {
+        .stream = params32->stream,
+        .written_frames = params32->written_frames,
+        .flags = params32->flags,
+        .spatial_objects = ULongToPtr(params32->spatial_objects),
+        .spatial_object_count = params32->spatial_object_count,
+    };
+
+    alsa_release_render_buffer(&params);
+    params32->result = params.result;
     return STATUS_SUCCESS;
 }
 
@@ -2877,7 +2914,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     alsa_stop,
     alsa_reset,
     alsa_wow64_get_render_buffer,
-    alsa_release_render_buffer,
+    alsa_wow64_release_render_buffer,
     alsa_wow64_get_capture_buffer,
     alsa_release_capture_buffer,
     alsa_wow64_is_format_supported,
@@ -2902,6 +2939,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     alsa_wow64_midi_out_message,
     alsa_wow64_midi_in_message,
     alsa_wow64_midi_notify_wait,
+    alsa_not_implemented,
     alsa_not_implemented,
 };
 
