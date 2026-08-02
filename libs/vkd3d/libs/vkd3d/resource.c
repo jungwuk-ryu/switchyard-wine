@@ -446,7 +446,11 @@ struct d3d12_heap *unsafe_impl_from_ID3D12Heap(ID3D12Heap *iface)
 {
     if (!iface)
         return NULL;
-    VKD3D_ASSERT(iface->lpVtbl == &d3d12_heap_vtbl);
+    if (iface->lpVtbl != &d3d12_heap_vtbl)
+    {
+        WARN("Heap %p has an unexpected vtable.\n", iface);
+        return NULL;
+    }
     return impl_from_ID3D12Heap(iface);
 }
 
@@ -566,8 +570,13 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap,
         {
             heap->map_ptr = NULL;
             ERR("Failed to map memory, vr %d.\n", vr);
-            d3d12_heap_destroy(heap);
-            return hresult_from_vk_result(hr);
+            VK_CALL(vkFreeMemory(device->vk_device, heap->vk_memory, NULL));
+            heap->vk_memory = VK_NULL_HANDLE;
+            vkd3d_private_store_destroy(&heap->private_store);
+            vkd3d_mutex_destroy(&heap->mutex);
+            if (!heap->is_private)
+                d3d12_device_release(device);
+            return hresult_from_vk_result(vr);
         }
     }
 
@@ -776,7 +785,8 @@ static bool vkd3d_is_linear_tiling_supported(const struct d3d12_device *device, 
 
 static HRESULT vkd3d_create_image(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
-        const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource, VkImage *vk_image)
+        const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource,
+        bool aliasable, VkImage *vk_image)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     const struct vkd3d_format_compatibility_list *compat_list;
@@ -826,6 +836,13 @@ static HRESULT vkd3d_create_image(struct d3d12_device *device,
         image_info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
         image_info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT_KHR;
+
+    /* Placed textures may overlap other resources in the same D3D12 heap.
+     * Vulkan requires the alias bit at image creation time for such bindings.
+     * Allocation-info probe images also need to describe the placed-resource
+     * requirements rather than the more restrictive committed-resource case. */
+    if (!sparse_resource && aliasable)
+        image_info.flags |= VK_IMAGE_CREATE_ALIAS_BIT;
 
     if (sparse_resource)
     {
@@ -964,7 +981,8 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
     tiled = desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
 
     /* XXX: We have to create an image to get its memory requirements. */
-    if (SUCCEEDED(hr = vkd3d_create_image(device, tiled ? NULL : &heap_properties, 0, desc, NULL, &vk_image)))
+    if (SUCCEEDED(hr = vkd3d_create_image(device, tiled ? NULL : &heap_properties,
+            0, desc, NULL, !tiled, &vk_image)))
     {
         VK_CALL(vkGetImageMemoryRequirements(device->vk_device, vk_image, &requirements));
         VK_CALL(vkDestroyImage(device->vk_device, vk_image, NULL));
@@ -1772,7 +1790,11 @@ struct d3d12_resource *unsafe_impl_from_ID3D12Resource(ID3D12Resource *iface)
 {
     if (!iface)
         return NULL;
-    VKD3D_ASSERT(iface->lpVtbl == (ID3D12ResourceVtbl *)&d3d12_resource_vtbl);
+    if (iface->lpVtbl != (ID3D12ResourceVtbl *)&d3d12_resource_vtbl)
+    {
+        WARN("Resource %p has an unexpected vtable.\n", iface);
+        return NULL;
+    }
     return impl_from_ID3D12Resource(iface);
 }
 
@@ -1973,7 +1995,7 @@ static bool d3d12_resource_validate_heap_properties(const struct d3d12_resource 
 static HRESULT d3d12_resource_init(struct d3d12_resource *resource, struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value)
+        const D3D12_CLEAR_VALUE *optimized_clear_value, bool placed)
 {
     HRESULT hr;
 
@@ -2013,7 +2035,7 @@ static HRESULT d3d12_resource_init(struct d3d12_resource *resource, struct d3d12
         WARN("Ignoring optimized clear value.\n");
 
     resource->gpu_address = 0;
-    resource->flags = 0;
+    resource->flags = placed ? VKD3D_RESOURCE_PLACED : 0;
 
     if (FAILED(hr = d3d12_resource_validate_desc(&resource->desc, device, 0)))
         return hr;
@@ -2043,7 +2065,8 @@ static HRESULT d3d12_resource_init(struct d3d12_resource *resource, struct d3d12
                 resource->desc.MipLevels = max_miplevel_count(desc);
             resource->flags |= VKD3D_RESOURCE_INITIAL_STATE_TRANSITION;
             if (FAILED(hr = vkd3d_create_image(device, heap_properties, heap_flags,
-                    &resource->desc, resource, &resource->u.vk_image)))
+                    &resource->desc, resource, !!(resource->flags & VKD3D_RESOURCE_PLACED),
+                    &resource->u.vk_image)))
                 return hr;
             break;
 
@@ -2075,7 +2098,7 @@ static HRESULT d3d12_resource_init(struct d3d12_resource *resource, struct d3d12
 static HRESULT d3d12_resource_create(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value, struct d3d12_resource **resource)
+        const D3D12_CLEAR_VALUE *optimized_clear_value, bool placed, struct d3d12_resource **resource)
 {
     struct d3d12_resource *object;
     HRESULT hr;
@@ -2084,7 +2107,7 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device,
         return E_OUTOFMEMORY;
 
     if (FAILED(hr = d3d12_resource_init(object, device, heap_properties, heap_flags,
-            desc, initial_state, optimized_clear_value)))
+            desc, initial_state, optimized_clear_value, placed)))
     {
         vkd3d_free(object);
         return hr;
@@ -2130,7 +2153,7 @@ HRESULT d3d12_committed_resource_create(struct d3d12_device *device,
         FIXME("Protected session is not supported.\n");
 
     if (FAILED(hr = d3d12_resource_create(device, heap_properties, heap_flags,
-            desc, initial_state, optimized_clear_value, &object)))
+            desc, initial_state, optimized_clear_value, false, &object)))
         return hr;
 
     if (FAILED(hr = vkd3d_allocate_resource_memory(device, object, heap_properties, heap_flags)))
@@ -2223,7 +2246,7 @@ HRESULT d3d12_placed_resource_create(struct d3d12_device *device, struct d3d12_h
     HRESULT hr;
 
     if (FAILED(hr = d3d12_resource_create(device, &heap->desc.Properties, heap->desc.Flags,
-            desc, initial_state, optimized_clear_value, &object)))
+            desc, initial_state, optimized_clear_value, true, &object)))
         return hr;
 
     if (FAILED(hr = vkd3d_bind_heap_memory(device, object, heap, heap_offset)))
@@ -2247,7 +2270,7 @@ HRESULT d3d12_reserved_resource_create(struct d3d12_device *device,
     HRESULT hr;
 
     if (FAILED(hr = d3d12_resource_create(device, NULL, 0,
-            desc, initial_state, optimized_clear_value, &object)))
+            desc, initial_state, optimized_clear_value, false, &object)))
         return hr;
 
     if (!d3d12_resource_init_tiles(object, device))
@@ -2272,7 +2295,7 @@ HRESULT vkd3d_create_image_resource(ID3D12Device *device,
 
     TRACE("device %p, create_info %p, resource %p.\n", device, create_info, resource);
 
-    if (!create_info || !resource)
+    if (!d3d12_device || !create_info || !resource)
         return E_INVALIDARG;
     if (create_info->type != VKD3D_STRUCTURE_TYPE_IMAGE_RESOURCE_CREATE_INFO)
     {
@@ -2421,6 +2444,7 @@ static struct vkd3d_view *vkd3d_view_create(uint32_t magic, VkDescriptorType vk_
     view->h.refcount = 1;
     view->v.type = type;
     view->v.vk_counter_view = VK_NULL_HANDLE;
+    view->v.resource = NULL;
 
     return view;
 }
@@ -3179,9 +3203,13 @@ void d3d12_desc_create_cbv(struct d3d12_desc *descriptor,
         return;
     }
 
-    if (desc->SizeInBytes & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+    if ((desc->BufferLocation && !desc->SizeInBytes)
+            || desc->SizeInBytes & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)
+            || desc->BufferLocation & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
     {
-        WARN("Size is not %u bytes aligned.\n", D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        WARN("Invalid constant buffer size %#x or address %#"PRIx64".\n",
+                desc->SizeInBytes, desc->BufferLocation);
+        vkd3d_view_decref(cb_desc, device);
         return;
     }
 
@@ -3189,6 +3217,12 @@ void d3d12_desc_create_cbv(struct d3d12_desc *descriptor,
     if (desc->BufferLocation)
     {
         resource = vkd3d_gpu_va_allocator_dereference(&device->gpu_va_allocator, desc->BufferLocation);
+        if (!resource || !d3d12_resource_is_buffer(resource))
+        {
+            WARN("Invalid constant buffer address %#"PRIx64".\n", desc->BufferLocation);
+            vkd3d_view_decref(cb_desc, device);
+            return;
+        }
         buffer_info->buffer = resource->u.vk_buffer;
         buffer_info->offset = desc->BufferLocation - resource->gpu_address;
         buffer_info->range = min(desc->SizeInBytes, resource->desc.Width - buffer_info->offset);
@@ -3631,6 +3665,9 @@ void d3d12_desc_create_uav(struct d3d12_desc *descriptor, struct d3d12_device *d
             FIXME("Unexpected counter resource for texture view.\n");
         vkd3d_create_texture_uav(descriptor, device, resource, desc);
     }
+
+    if (descriptor->s.u.view)
+        descriptor->s.u.view->v.resource = resource;
 }
 
 bool vkd3d_create_raw_buffer_view(struct d3d12_device *device,
@@ -3655,7 +3692,11 @@ bool vkd3d_create_raw_buffer_view(struct d3d12_device *device,
     }
 
     resource = vkd3d_gpu_va_allocator_dereference(&device->gpu_va_allocator, gpu_address);
-    VKD3D_ASSERT(d3d12_resource_is_buffer(resource));
+    if (!resource || !d3d12_resource_is_buffer(resource))
+    {
+        WARN("Invalid root descriptor address %#"PRIx64".\n", gpu_address);
+        return false;
+    }
     return vkd3d_create_vk_buffer_view(device, resource->u.vk_buffer, format,
             gpu_address - resource->gpu_address, VK_WHOLE_SIZE, vk_buffer_view);
 }
@@ -3876,13 +3917,28 @@ HRESULT vkd3d_create_static_sampler(struct d3d12_device *device,
 }
 
 /* RTVs */
+static void d3d12_attachment_desc_replace(struct vkd3d_view * volatile *dst,
+        struct vkd3d_view *view, struct d3d12_device *device)
+{
+    if ((view = vkd3d_atomic_exchange_ptr((void * volatile *)dst, view)))
+        vkd3d_view_decref(view, device);
+}
+
 static void d3d12_rtv_desc_destroy(struct d3d12_rtv_desc *rtv, struct d3d12_device *device)
 {
-    if (!rtv->view)
+    d3d12_attachment_desc_replace(&rtv->view, NULL, device);
+}
+
+void d3d12_rtv_desc_copy(struct d3d12_rtv_desc *dst, const struct d3d12_rtv_desc *src,
+        struct d3d12_device *device)
+{
+    struct vkd3d_view *view;
+
+    if (dst == src)
         return;
 
-    vkd3d_view_decref(rtv->view, device);
-    memset(rtv, 0, sizeof(*rtv));
+    view = d3d12_attachment_desc_get_view_ref(&src->view, device);
+    d3d12_attachment_desc_replace(&dst->view, view, device);
 }
 
 void d3d12_rtv_desc_create_rtv(struct d3d12_rtv_desc *rtv_desc, struct d3d12_device *device,
@@ -3891,11 +3947,9 @@ void d3d12_rtv_desc_create_rtv(struct d3d12_rtv_desc *rtv_desc, struct d3d12_dev
     struct vkd3d_texture_view_desc vkd3d_desc;
     struct vkd3d_view *view;
 
-    d3d12_rtv_desc_destroy(rtv_desc, device);
-
     if (!resource)
     {
-        FIXME("NULL resource RTV not implemented.\n");
+        d3d12_rtv_desc_destroy(rtv_desc, device);
         return;
     }
 
@@ -3914,6 +3968,17 @@ void d3d12_rtv_desc_create_rtv(struct d3d12_rtv_desc *rtv_desc, struct d3d12_dev
     {
         switch (desc->ViewDimension)
         {
+            case D3D12_RTV_DIMENSION_TEXTURE1D:
+                vkd3d_desc.view_type = VK_IMAGE_VIEW_TYPE_1D;
+                vkd3d_desc.miplevel_idx = desc->u.Texture1D.MipSlice;
+                break;
+            case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+                vkd3d_desc.view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+                vkd3d_desc.miplevel_idx = desc->u.Texture1DArray.MipSlice;
+                vkd3d_desc.layer_idx = desc->u.Texture1DArray.FirstArraySlice;
+                vkd3d_desc.layer_count = desc->u.Texture1DArray.ArraySize;
+                vkd3d_texture_view_desc_normalise(&vkd3d_desc, &resource->desc);
+                break;
             case D3D12_RTV_DIMENSION_TEXTURE2D:
                 vkd3d_desc.miplevel_idx = desc->u.Texture2D.MipSlice;
                 if (desc->u.Texture2D.PlaneSlice)
@@ -3962,23 +4027,26 @@ void d3d12_rtv_desc_create_rtv(struct d3d12_rtv_desc *rtv_desc, struct d3d12_dev
     if (!vkd3d_create_texture_view(device, VKD3D_DESCRIPTOR_MAGIC_RTV, resource->u.vk_image, &vkd3d_desc, &view))
         return;
 
-    rtv_desc->sample_count = vk_samples_from_dxgi_sample_desc(&resource->desc.SampleDesc);
-    rtv_desc->format = vkd3d_desc.format;
-    rtv_desc->width = d3d12_resource_desc_get_width(&resource->desc, vkd3d_desc.miplevel_idx);
-    rtv_desc->height = d3d12_resource_desc_get_height(&resource->desc, vkd3d_desc.miplevel_idx);
-    rtv_desc->layer_count = vkd3d_desc.layer_count;
-    rtv_desc->view = view;
-    rtv_desc->resource = resource;
+    view->v.resource = resource;
+    d3d12_attachment_desc_replace(&rtv_desc->view, view, device);
 }
 
 /* DSVs */
 static void d3d12_dsv_desc_destroy(struct d3d12_dsv_desc *dsv, struct d3d12_device *device)
 {
-    if (!dsv->view)
+    d3d12_attachment_desc_replace(&dsv->view, NULL, device);
+}
+
+void d3d12_dsv_desc_copy(struct d3d12_dsv_desc *dst, const struct d3d12_dsv_desc *src,
+        struct d3d12_device *device)
+{
+    struct vkd3d_view *view;
+
+    if (dst == src)
         return;
 
-    vkd3d_view_decref(dsv->view, device);
-    memset(dsv, 0, sizeof(*dsv));
+    view = d3d12_attachment_desc_get_view_ref(&src->view, device);
+    d3d12_attachment_desc_replace(&dst->view, view, device);
 }
 
 void d3d12_dsv_desc_create_dsv(struct d3d12_dsv_desc *dsv_desc, struct d3d12_device *device,
@@ -3987,11 +4055,9 @@ void d3d12_dsv_desc_create_dsv(struct d3d12_dsv_desc *dsv_desc, struct d3d12_dev
     struct vkd3d_texture_view_desc vkd3d_desc;
     struct vkd3d_view *view;
 
-    d3d12_dsv_desc_destroy(dsv_desc, device);
-
     if (!resource)
     {
-        FIXME("NULL resource DSV not implemented.\n");
+        d3d12_dsv_desc_destroy(dsv_desc, device);
         return;
     }
 
@@ -4019,6 +4085,17 @@ void d3d12_dsv_desc_create_dsv(struct d3d12_dsv_desc *dsv_desc, struct d3d12_dev
 
         switch (desc->ViewDimension)
         {
+            case D3D12_DSV_DIMENSION_TEXTURE1D:
+                vkd3d_desc.view_type = VK_IMAGE_VIEW_TYPE_1D;
+                vkd3d_desc.miplevel_idx = desc->u.Texture1D.MipSlice;
+                break;
+            case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+                vkd3d_desc.view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+                vkd3d_desc.miplevel_idx = desc->u.Texture1DArray.MipSlice;
+                vkd3d_desc.layer_idx = desc->u.Texture1DArray.FirstArraySlice;
+                vkd3d_desc.layer_count = desc->u.Texture1DArray.ArraySize;
+                vkd3d_texture_view_desc_normalise(&vkd3d_desc, &resource->desc);
+                break;
             case D3D12_DSV_DIMENSION_TEXTURE2D:
                 vkd3d_desc.miplevel_idx = desc->u.Texture2D.MipSlice;
                 break;
@@ -4048,13 +4125,8 @@ void d3d12_dsv_desc_create_dsv(struct d3d12_dsv_desc *dsv_desc, struct d3d12_dev
     if (!vkd3d_create_texture_view(device, VKD3D_DESCRIPTOR_MAGIC_DSV, resource->u.vk_image, &vkd3d_desc, &view))
         return;
 
-    dsv_desc->sample_count = vk_samples_from_dxgi_sample_desc(&resource->desc.SampleDesc);
-    dsv_desc->format = vkd3d_desc.format;
-    dsv_desc->width = d3d12_resource_desc_get_width(&resource->desc, vkd3d_desc.miplevel_idx);
-    dsv_desc->height = d3d12_resource_desc_get_height(&resource->desc, vkd3d_desc.miplevel_idx);
-    dsv_desc->layer_count = vkd3d_desc.layer_count;
-    dsv_desc->view = view;
-    dsv_desc->resource = resource;
+    view->v.resource = resource;
+    d3d12_attachment_desc_replace(&dsv_desc->view, view, device);
 }
 
 /* ID3D12DescriptorHeap */
@@ -4603,7 +4675,11 @@ struct d3d12_query_heap *unsafe_impl_from_ID3D12QueryHeap(ID3D12QueryHeap *iface
 {
     if (!iface)
         return NULL;
-    VKD3D_ASSERT(iface->lpVtbl == &d3d12_query_heap_vtbl);
+    if (iface->lpVtbl != &d3d12_query_heap_vtbl)
+    {
+        WARN("Query heap %p has an unexpected vtable.\n", iface);
+        return NULL;
+    }
     return impl_from_ID3D12QueryHeap(iface);
 }
 
@@ -4613,17 +4689,28 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct d3d12_query_heap *object;
     VkQueryPoolCreateInfo pool_info;
-    unsigned int element_count;
+    size_t allocation_size, element_count;
     VkResult vr;
     HRESULT hr;
 
-    element_count = DIV_ROUND_UP(desc->Count, sizeof(*object->availability_mask) * CHAR_BIT);
-    if (!(object = vkd3d_malloc(offsetof(struct d3d12_query_heap, availability_mask[element_count]))))
+    if (!desc || !heap || !desc->Count)
+        return E_INVALIDARG;
+    *heap = NULL;
+
+    element_count = ((size_t)desc->Count + sizeof(*object->availability_mask) * CHAR_BIT - 1)
+            / (sizeof(*object->availability_mask) * CHAR_BIT);
+    if (element_count > (SIZE_MAX - offsetof(struct d3d12_query_heap, availability_mask))
+            / sizeof(*object->availability_mask))
+        return E_OUTOFMEMORY;
+    allocation_size = offsetof(struct d3d12_query_heap, availability_mask)
+            + element_count * sizeof(*object->availability_mask);
+    if (!(object = vkd3d_malloc(allocation_size)))
         return E_OUTOFMEMORY;
 
     object->ID3D12QueryHeap_iface.lpVtbl = &d3d12_query_heap_vtbl;
     object->refcount = 1;
     object->device = device;
+    object->desc = *desc;
     memset(object->availability_mask, 0, element_count * sizeof(*object->availability_mask));
 
     pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -4948,7 +5035,7 @@ HRESULT vkd3d_init_null_resources(struct vkd3d_null_resources *null_resources,
     resource_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
     if (FAILED(hr = vkd3d_create_image(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
-            &resource_desc, NULL, &null_resources->vk_2d_image)))
+            &resource_desc, NULL, false, &null_resources->vk_2d_image)))
         goto fail;
     if (FAILED(hr = vkd3d_allocate_image_memory(device, null_resources->vk_2d_image,
             &heap_properties, D3D12_HEAP_FLAG_NONE, &null_resources->vk_2d_image_memory, NULL, NULL)))
@@ -4968,8 +5055,9 @@ HRESULT vkd3d_init_null_resources(struct vkd3d_null_resources *null_resources,
             ? D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-    if (FAILED(hr = vkd3d_create_image(device, use_sparse_resources ? NULL : &heap_properties, D3D12_HEAP_FLAG_NONE,
-            &resource_desc, NULL, &null_resources->vk_2d_storage_image)))
+    if (FAILED(hr = vkd3d_create_image(device, use_sparse_resources ? NULL : &heap_properties,
+            D3D12_HEAP_FLAG_NONE, &resource_desc, NULL, false,
+            &null_resources->vk_2d_storage_image)))
         goto fail;
     if (!use_sparse_resources && FAILED(hr = vkd3d_allocate_image_memory(device, null_resources->vk_2d_storage_image,
             &heap_properties, D3D12_HEAP_FLAG_NONE, &null_resources->vk_2d_storage_image_memory, NULL, NULL)))

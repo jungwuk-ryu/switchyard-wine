@@ -68,6 +68,7 @@ static const struct vkd3d_optional_extension_info optional_instance_extensions[]
     VK_EXTENSION(KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2, KHR_get_physical_device_properties2),
     /* EXT extensions */
     VK_DEBUG_EXTENSION(EXT_DEBUG_REPORT, EXT_debug_report),
+    VK_EXTENSION(EXT_DEBUG_UTILS, EXT_debug_utils),
 };
 
 static const char * const required_device_extensions[] =
@@ -1397,11 +1398,23 @@ static void vkd3d_init_feature_level(struct vkd3d_vulkan_info *vk_info,
     bool have_11_0 = true;
 
 #define CHECK_MIN_REQUIREMENT(name, value) \
-    if (vk_info->device_limits.name < value) \
-        WARN(#name " does not meet feature level 11_0 requirements.\n");
+    do \
+    { \
+        if (vk_info->device_limits.name < value) \
+        { \
+            WARN(#name " does not meet feature level 11_0 requirements.\n"); \
+            have_11_0 = false; \
+        } \
+    } while (0)
 #define CHECK_MAX_REQUIREMENT(name, value) \
-    if (vk_info->device_limits.name > value) \
-        WARN(#name " does not meet feature level 11_0 requirements.\n");
+    do \
+    { \
+        if (vk_info->device_limits.name > value) \
+        { \
+            WARN(#name " does not meet feature level 11_0 requirements.\n"); \
+            have_11_0 = false; \
+        } \
+    } while (0)
 #define CHECK_FEATURE(name) \
     if (!features->name) \
     { \
@@ -1460,7 +1473,7 @@ static void vkd3d_init_feature_level(struct vkd3d_vulkan_info *vk_info,
 #undef CHECK_MAX_REQUIREMENT
 #undef CHECK_FEATURE
 
-    vk_info->max_feature_level = D3D_FEATURE_LEVEL_11_0;
+    vk_info->max_feature_level = have_11_0 ? D3D_FEATURE_LEVEL_11_0 : 0;
 
     if (have_11_0
             && d3d12_options->OutputMergerLogicOp
@@ -1591,6 +1604,8 @@ static HRESULT vkd3d_check_device_extensions(struct d3d12_device *device,
     {
         ERR("Failed to enumerate device extensions, vr %d.\n", vr);
         vkd3d_free(*vk_extensions);
+        *vk_extensions = NULL;
+        *vk_extension_count = 0;
         return hresult_from_vk_result(vr);
     }
 
@@ -1600,6 +1615,8 @@ static HRESULT vkd3d_check_device_extensions(struct d3d12_device *device,
         if (!(*user_extension_supported = vkd3d_calloc(optional_extensions->extension_count, sizeof(bool))))
         {
             vkd3d_free(*vk_extensions);
+            *vk_extensions = NULL;
+            *vk_extension_count = 0;
             return E_OUTOFMEMORY;
         }
     }
@@ -1835,7 +1852,9 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
 
     device->feature_options3.CopyQueueTimestampQueriesSupported = FALSE;
     device->feature_options3.CastingFullyTypedFormatSupported = FALSE;
-    device->feature_options3.WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
+    device->feature_options3.WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT
+            | D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE
+            | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
     device->feature_options3.ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
     device->feature_options3.BarycentricsSupported = FALSE;
 
@@ -2908,9 +2927,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_cache_session_FindValue(ID3D12ShaderCache
     TRACE("iface %p, key %p, key_size %#x, value %p, value_size %p.\n",
             iface, key, key_size, value, value_size);
 
-    if (!value_size)
+    if (!key || !key_size || !value_size)
     {
-        WARN("value_size is NULL, returning E_INVALIDARG.\n");
+        WARN("Invalid key or value size pointer, returning E_INVALIDARG.\n");
         return E_INVALIDARG;
     }
 
@@ -2942,7 +2961,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_cache_session_StoreValue(ID3D12ShaderCach
 
 static void STDMETHODCALLTYPE d3d12_cache_session_SetDeleteOnDestroy(ID3D12ShaderCacheSession *iface)
 {
-    FIXME("iface %p stub!\n", iface);
+    struct d3d12_cache_session *session = impl_from_ID3D12ShaderCacheSession(iface);
+
+    TRACE("iface %p.\n", iface);
+    /* Memory caches have no persistent backing and are unconditionally
+     * cleared when the final session reference is destroyed. */
+    (void)session;
 }
 
 static D3D12_SHADER_CACHE_SESSION_DESC * STDMETHODCALLTYPE d3d12_cache_session_GetDesc(
@@ -2990,7 +3014,7 @@ static HRESULT d3d12_cache_session_init(struct d3d12_cache_session *session,
     if (!session->desc.MaximumValueFileSizeBytes)
         session->desc.MaximumValueFileSizeBytes = 128 * 1024 * 1024;
     if (!session->desc.MaximumInMemoryCacheSizeBytes)
-        session->desc.MaximumInMemoryCacheSizeBytes = 1024 * 1024;
+        session->desc.MaximumInMemoryCacheSizeBytes = 1024;
     if (!session->desc.MaximumInMemoryCacheEntries)
         session->desc.MaximumInMemoryCacheEntries = 128;
 
@@ -3002,7 +3026,8 @@ static HRESULT d3d12_cache_session_init(struct d3d12_cache_session *session,
     /* We expect the number of open caches to be small. */
     LIST_FOR_EACH_ENTRY(i, &cache_list, struct d3d12_cache_session, cache_list_entry)
     {
-        if (!memcmp(&i->desc.Identifier, &desc->Identifier, sizeof(desc->Identifier)))
+        if (i->device == device
+                && !memcmp(&i->desc.Identifier, &desc->Identifier, sizeof(desc->Identifier)))
         {
             TRACE("Found an existing cache %p from session %p.\n", i->cache, i);
             if (desc->Version == i->desc.Version)
@@ -3023,10 +3048,9 @@ static HRESULT d3d12_cache_session_init(struct d3d12_cache_session *session,
 
     if (!session->cache)
     {
-        if (session->desc.Mode == D3D12_SHADER_CACHE_MODE_DISK)
-            FIXME("Disk caches are not yet implemented.\n");
-
-        ret = vkd3d_shader_open_cache(&session->cache);
+        ret = vkd3d_shader_open_cache(&session->cache,
+                session->desc.MaximumInMemoryCacheSizeBytes,
+                session->desc.MaximumInMemoryCacheEntries);
         if (ret)
         {
             WARN("Failed to open shader cache.\n");
@@ -3411,6 +3435,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(ID3D12Device9 
 
     TRACE("iface %p, feature %#x, feature_data %p, feature_data_size %u.\n",
             iface, feature, feature_data, feature_data_size);
+
+    if (!feature_data)
+    {
+        WARN("Feature data pointer is NULL.\n");
+        return E_INVALIDARG;
+    }
 
     switch (feature)
     {
@@ -4084,6 +4114,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(ID3D12Device9 
             if (feature_data_size != sizeof(*data))
             {
                 WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
             }
 
             data->AdvancedTextureOpsSupported = FALSE;
@@ -4103,6 +4134,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(ID3D12Device9 
             if (feature_data_size != sizeof(*data))
             {
                 WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
             }
 
             data->TriangleFanSupported = FALSE;
@@ -4120,6 +4152,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(ID3D12Device9 
             if (feature_data_size != sizeof(*data))
             {
                 WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
             }
 
             data->DynamicDepthBiasSupported = FALSE;
@@ -4137,6 +4170,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(ID3D12Device9 
             if (feature_data_size != sizeof(*data))
             {
                 WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
             }
 
             data->NonNormalizedCoordinateSamplersSupported = FALSE;
@@ -4154,6 +4188,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(ID3D12Device9 
             if (feature_data_size != sizeof(*data))
             {
                 WARN("Invalid size %u.\n", feature_data_size);
+                return E_INVALIDARG;
             }
 
             data->RenderPassesValid = FALSE;
@@ -4303,6 +4338,54 @@ static void STDMETHODCALLTYPE d3d12_device_CreateSampler(ID3D12Device9 *iface,
     d3d12_desc_write_atomic(d3d12_desc_from_cpu_handle(descriptor), &tmp, device);
 }
 
+static void d3d12_device_copy_rtv_dsv_descriptors(struct d3d12_device *device,
+        UINT dst_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_range_offsets,
+        const UINT *dst_range_sizes, UINT src_range_count,
+        const D3D12_CPU_DESCRIPTOR_HANDLE *src_range_offsets, const UINT *src_range_sizes,
+        D3D12_DESCRIPTOR_HEAP_TYPE heap_type)
+{
+    unsigned int dst_range_idx = 0, dst_idx = 0, src_range_idx = 0, src_idx = 0;
+    unsigned int dst_range_size, src_range_size;
+    SIZE_T descriptor_size;
+
+    descriptor_size = heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV
+            ? sizeof(struct d3d12_rtv_desc) : sizeof(struct d3d12_dsv_desc);
+
+    while (dst_range_idx < dst_range_count && src_range_idx < src_range_count)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = dst_range_offsets[dst_range_idx];
+        D3D12_CPU_DESCRIPTOR_HANDLE src = src_range_offsets[src_range_idx];
+
+        dst_range_size = dst_range_sizes ? dst_range_sizes[dst_range_idx] : 1;
+        src_range_size = src_range_sizes ? src_range_sizes[src_range_idx] : 1;
+
+        for (; dst_idx < dst_range_size && src_idx < src_range_size; ++dst_idx, ++src_idx)
+        {
+            if (heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+            {
+                d3d12_rtv_desc_copy((struct d3d12_rtv_desc *)(dst.ptr + dst_idx * descriptor_size),
+                        (const struct d3d12_rtv_desc *)(src.ptr + src_idx * descriptor_size), device);
+            }
+            else
+            {
+                d3d12_dsv_desc_copy((struct d3d12_dsv_desc *)(dst.ptr + dst_idx * descriptor_size),
+                        (const struct d3d12_dsv_desc *)(src.ptr + src_idx * descriptor_size), device);
+            }
+        }
+
+        if (dst_idx == dst_range_size)
+        {
+            ++dst_range_idx;
+            dst_idx = 0;
+        }
+        if (src_idx == src_range_size)
+        {
+            ++src_range_idx;
+            src_idx = 0;
+        }
+    }
+}
+
 static void STDMETHODCALLTYPE d3d12_device_CopyDescriptors(ID3D12Device9 *iface,
         UINT dst_descriptor_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_descriptor_range_offsets,
         const UINT *dst_descriptor_range_sizes,
@@ -4325,15 +4408,31 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptors(ID3D12Device9 *iface,
             dst_descriptor_range_sizes, src_descriptor_range_count, src_descriptor_range_offsets,
             src_descriptor_range_sizes, descriptor_heap_type);
 
+    if (!dst_descriptor_range_count || !src_descriptor_range_count)
+        return;
+
+    if (!dst_descriptor_range_offsets || !src_descriptor_range_offsets)
+    {
+        WARN("Descriptor range offset array is NULL.\n");
+        return;
+    }
+
+    if (descriptor_heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV
+            || descriptor_heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
+    {
+        d3d12_device_copy_rtv_dsv_descriptors(device,
+                dst_descriptor_range_count, dst_descriptor_range_offsets, dst_descriptor_range_sizes,
+                src_descriptor_range_count, src_descriptor_range_offsets, src_descriptor_range_sizes,
+                descriptor_heap_type);
+        return;
+    }
+
     if (descriptor_heap_type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
             && descriptor_heap_type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
     {
         FIXME("Unhandled descriptor heap type %#x.\n", descriptor_heap_type);
         return;
     }
-
-    if (!dst_descriptor_range_count)
-        return;
 
     dst_range_idx = dst_idx = 0;
     src_range_idx = src_idx = 0;
@@ -4617,7 +4716,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePlacedResource(ID3D12Device9
             iface, heap, heap_offset, desc, initial_state,
             optimized_clear_value, debugstr_guid(iid), resource);
 
-    heap_object = unsafe_impl_from_ID3D12Heap(heap);
+    if (!(heap_object = unsafe_impl_from_ID3D12Heap(heap)) || heap_object->device != device)
+    {
+        WARN("Invalid or foreign heap %p.\n", heap);
+        return E_INVALIDARG;
+    }
     d3d12_resource_desc1_from_desc(&resource_desc, desc);
 
     if (FAILED(hr = d3d12_placed_resource_create(device, heap_object, heap_offset,
@@ -4886,7 +4989,7 @@ static void STDMETHODCALLTYPE d3d12_device_GetResourceTiling(ID3D12Device9 *ifac
         UINT *sub_resource_tiling_count, UINT first_sub_resource_tiling,
         D3D12_SUBRESOURCE_TILING *sub_resource_tilings)
 {
-    const struct d3d12_resource *resource_impl = impl_from_ID3D12Resource(resource);
+    const struct d3d12_resource *resource_impl = unsafe_impl_from_ID3D12Resource(resource);
     struct d3d12_device *device = impl_from_ID3D12Device9(iface);
 
     TRACE("iface %p, resource %p, total_tile_count %p, packed_mip_info %p, "
@@ -4895,6 +4998,12 @@ static void STDMETHODCALLTYPE d3d12_device_GetResourceTiling(ID3D12Device9 *ifac
             iface, resource, total_tile_count, packed_mip_info, standard_tile_shape,
             sub_resource_tiling_count, first_sub_resource_tiling,
             sub_resource_tilings);
+
+    if (!resource_impl || resource_impl->device != device)
+    {
+        WARN("Invalid or foreign resource %p.\n", resource);
+        return;
+    }
 
     d3d12_resource_get_tiling(device, resource_impl, total_tile_count, packed_mip_info, standard_tile_shape,
             sub_resource_tiling_count, first_sub_resource_tiling, sub_resource_tilings);
@@ -4983,8 +5092,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_SetEventOnMultipleFenceCompletion(
         return E_NOTIMPL;
     }
 
-    if (!fence_count)
+    if (!fence_count || !fences || !values || fence_count == UINT32_MAX)
         return E_INVALIDARG;
+
+    for (i = 0; i < fence_count; ++i)
+    {
+        if (!(fence = unsafe_impl_from_ID3D12Fence(fences[i])) || fence->device != device)
+            return E_INVALIDARG;
+    }
 
     if (fence_count == 1)
         return ID3D12Fence_SetEventOnCompletion(fences[0], values[0], event);
@@ -5004,7 +5119,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_SetEventOnMultipleFenceCompletion(
     }
     s->event = event;
     s->signal = signal;
-    s->value = fence_count;
+    /* Keep the semaphore alive while fence callbacks are being registered.
+     * A fence may complete on another thread as soon as its callback is added. */
+    s->value = fence_count + 1;
 
     if (flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY)
         signal = waiting_event_semaphore_signal_first;
@@ -5038,9 +5155,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_SetEventOnMultipleFenceCompletion(
         vkd3d_mutex_unlock(&fence->mutex);
     }
 
+    waiting_event_semaphore_signal(s);
+
     if (event == &null_event)
     {
-        vkd3d_null_event_wait(&null_event);
+        if (SUCCEEDED(hr))
+            vkd3d_null_event_wait(&null_event);
         vkd3d_null_event_cleanup(&null_event);
     }
 
@@ -5362,7 +5482,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePlacedResource1(ID3D12Device
             iface, heap, heap_offset, resource_desc, initial_state,
             optimized_clear_value, debugstr_guid(iid), resource);
 
-    heap_object = unsafe_impl_from_ID3D12Heap(heap);
+    if (!(heap_object = unsafe_impl_from_ID3D12Heap(heap)) || heap_object->device != device)
+    {
+        WARN("Invalid or foreign heap %p.\n", heap);
+        return E_INVALIDARG;
+    }
 
     if (FAILED(hr = d3d12_placed_resource_create(device, heap_object, heap_offset,
             resource_desc, initial_state, optimized_clear_value, &object)))
@@ -5427,6 +5551,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateShaderCacheSession(ID3D12Dev
         WARN("Invalid mode %#x, returning E_INVALIDARG.\n", desc->Mode);
         return E_INVALIDARG;
     }
+    if (desc->Mode == D3D12_SHADER_CACHE_MODE_DISK)
+    {
+        WARN("Disk shader cache sessions are not supported.\n");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
     if (!session)
     {
         WARN("No output pointer, returning S_FALSE.\n");
@@ -5452,19 +5581,38 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateShaderCacheSession(ID3D12Dev
 static HRESULT STDMETHODCALLTYPE d3d12_device_ShaderCacheControl(ID3D12Device9 *iface,
         D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS control)
 {
-    FIXME("iface %p, kinds %#x control %#x stub!\n", iface, kinds, control);
+    struct d3d12_device *device = impl_from_ID3D12Device9(iface);
+    struct d3d12_cache_session *session;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, kinds %#x, control %#x.\n", iface, kinds, control);
+
+    if (kinds != D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED
+            || control != D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)
+    {
+        WARN("Unsupported shader cache control request.\n");
+        return E_NOTIMPL;
+    }
+
+    vkd3d_mutex_lock(&cache_list_mutex);
+    LIST_FOR_EACH_ENTRY(session, &cache_list, struct d3d12_cache_session, cache_list_entry)
+    {
+        if (session->device == device)
+            vkd3d_shader_cache_clear(session->cache);
+    }
+    vkd3d_mutex_unlock(&cache_list_mutex);
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandQueue1(ID3D12Device9 *iface,
         const D3D12_COMMAND_QUEUE_DESC *desc, REFIID creator_id, REFIID iid,
         void **command_queue)
 {
-    FIXME("iface %p, desc %p, creator %s, iid %s, queue %p stub!\n", iface, desc,
+    TRACE("iface %p, desc %p, creator %s, iid %s, queue %p.\n", iface, desc,
             debugstr_guid(creator_id), debugstr_guid(iid), command_queue);
 
-    return E_NOTIMPL;
+    WARN("Ignoring creator id %s.\n", debugstr_guid(creator_id));
+
+    return d3d12_device_CreateCommandQueue(iface, desc, iid, command_queue);
 }
 
 static const struct ID3D12Device9Vtbl d3d12_device_vtbl =
@@ -5563,7 +5711,11 @@ struct d3d12_device *unsafe_impl_from_ID3D12Device9(ID3D12Device9 *iface)
 {
     if (!iface)
         return NULL;
-    VKD3D_ASSERT(iface->lpVtbl == &d3d12_device_vtbl);
+    if (iface->lpVtbl != &d3d12_device_vtbl)
+    {
+        WARN("Device %p has an unexpected vtable.\n", iface);
+        return NULL;
+    }
     return impl_from_ID3D12Device9(iface);
 }
 

@@ -621,6 +621,38 @@ static inline bool vkd3d_atomic_compare_exchange_u32(uint32_t volatile *x, uint3
 #endif
 }
 
+static inline bool vkd3d_atomic_compare_exchange_u64(uint64_t volatile *x, uint64_t expected, uint64_t val)
+{
+#if HAVE_SYNC_BOOL_COMPARE_AND_SWAP
+    return __sync_bool_compare_and_swap(x, expected, val);
+#elif defined(_WIN32)
+    return InterlockedCompareExchange64((LONG64 *)x, val, expected) == expected;
+#else
+# error "vkd3d_atomic_compare_exchange_u64() not implemented for this platform"
+#endif
+}
+
+static inline uint64_t vkd3d_atomic_load_u64(uint64_t const volatile *x)
+{
+#if HAVE_SYNC_BOOL_COMPARE_AND_SWAP
+    return __sync_val_compare_and_swap((uint64_t volatile *)x, 0, 0);
+#elif defined(_WIN32)
+    return InterlockedCompareExchange64((LONG64 volatile *)x, 0, 0);
+#else
+# error "vkd3d_atomic_load_u64() not implemented for this platform"
+#endif
+}
+
+static inline void vkd3d_atomic_or_u64(uint64_t volatile *x, uint64_t val)
+{
+    uint64_t current;
+
+    do
+    {
+        current = vkd3d_atomic_load_u64(x);
+    } while (!vkd3d_atomic_compare_exchange_u64(x, current, current | val));
+}
+
 static inline bool vkd3d_atomic_compare_exchange_ptr(void * volatile *x, void *expected, void *val)
 {
 #if HAVE_SYNC_BOOL_COMPARE_AND_SWAP
@@ -629,6 +661,17 @@ static inline bool vkd3d_atomic_compare_exchange_ptr(void * volatile *x, void *e
     return InterlockedCompareExchangePointer(x, val, expected) == expected;
 #else
 # error "vkd3d_atomic_compare_exchange_ptr() not implemented for this platform"
+#endif
+}
+
+static inline void *vkd3d_atomic_load_ptr(void * const volatile *x)
+{
+#if HAVE_SYNC_BOOL_COMPARE_AND_SWAP
+    return __sync_val_compare_and_swap((void * volatile *)x, NULL, NULL);
+#elif defined(_WIN32)
+    return InterlockedCompareExchangePointer((void * volatile *)x, NULL, NULL);
+#else
+# error "vkd3d_atomic_load_ptr() not implemented for this platform"
 #endif
 }
 

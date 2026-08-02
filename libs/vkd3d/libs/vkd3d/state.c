@@ -194,7 +194,11 @@ struct d3d12_root_signature *unsafe_impl_from_ID3D12RootSignature(ID3D12RootSign
 {
     if (!iface)
         return NULL;
-    VKD3D_ASSERT(iface->lpVtbl == &d3d12_root_signature_vtbl);
+    if (iface->lpVtbl != &d3d12_root_signature_vtbl)
+    {
+        WARN("Root signature %p has an unexpected vtable.\n", iface);
+        return NULL;
+    }
     return impl_from_ID3D12RootSignature(iface);
 }
 
@@ -678,6 +682,7 @@ static HRESULT d3d12_root_signature_init_push_constants(struct d3d12_root_signat
         root_constant->stage_flags = push_constant_count == 1
                 ? push_constants[0].stageFlags : stage_flags_from_visibility(p->ShaderVisibility);
         root_constant->offset = offset;
+        root_constant->count = p->u.Constants.Num32BitValues;
 
         root_signature->root_constants[j].register_space = p->u.Constants.RegisterSpace;
         root_signature->root_constants[j].register_index = p->u.Constants.ShaderRegister;
@@ -2349,7 +2354,11 @@ struct d3d12_pipeline_state *unsafe_impl_from_ID3D12PipelineState(ID3D12Pipeline
 {
     if (!iface)
         return NULL;
-    VKD3D_ASSERT(iface->lpVtbl == &d3d12_pipeline_state_vtbl);
+    if (iface->lpVtbl != &d3d12_pipeline_state_vtbl)
+    {
+        WARN("Pipeline state %p has an unexpected vtable.\n", iface);
+        return NULL;
+    }
     return impl_from_ID3D12PipelineState(iface);
 }
 
@@ -2421,8 +2430,8 @@ static HRESULT create_shader_stage(struct d3d12_device *device,
     compile_info.log_level = VKD3D_SHADER_LOG_NONE;
     compile_info.source_name = NULL;
 
-    if ((ret = vkd3d_shader_parse_dxbc(&(struct vkd3d_shader_code){code->pShaderBytecode, code->BytecodeLength},
-            0, &dxbc_desc, NULL)) >= 0)
+    if (vkd3d_shader_parse_dxbc(&(struct vkd3d_shader_code){code->pShaderBytecode, code->BytecodeLength},
+            0, &dxbc_desc, NULL) >= 0)
     {
         sprintf(source_name, "%08x%08x%08x%08x", dxbc_desc.checksum[0],
                 dxbc_desc.checksum[1], dxbc_desc.checksum[2], dxbc_desc.checksum[3]);
@@ -2654,7 +2663,13 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
 
     memset(&state->uav_counters, 0, sizeof(state->uav_counters));
 
-    if (!(root_signature = unsafe_impl_from_ID3D12RootSignature(desc->root_signature)))
+    root_signature = unsafe_impl_from_ID3D12RootSignature(desc->root_signature);
+    if (desc->root_signature && (!root_signature || root_signature->device != device))
+    {
+        WARN("Invalid or foreign root signature %p.\n", desc->root_signature);
+        return E_INVALIDARG;
+    }
+    if (!root_signature)
     {
         TRACE("Root signature is NULL, looking for an embedded signature.\n");
         if (FAILED(hr = d3d12_root_signature_create(device,
@@ -3268,7 +3283,13 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
     }
 
     state->implicit_root_signature = NULL;
-    if (!(root_signature = unsafe_impl_from_ID3D12RootSignature(desc->root_signature)))
+    root_signature = unsafe_impl_from_ID3D12RootSignature(desc->root_signature);
+    if (desc->root_signature && (!root_signature || root_signature->device != device))
+    {
+        WARN("Invalid or foreign root signature %p.\n", desc->root_signature);
+        return E_INVALIDARG;
+    }
+    if (!root_signature)
     {
         TRACE("Root signature is NULL, looking for an embedded signature in the vertex shader.\n");
         if (FAILED(hr = d3d12_root_signature_create(device,

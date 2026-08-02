@@ -120,6 +120,7 @@ struct vkd3d_vulkan_info
     bool KHR_get_physical_device_properties2;
     /* EXT instance extensions */
     bool EXT_debug_report;
+    bool EXT_debug_utils;
 
     /* KHR device extensions */
     bool KHR_dedicated_allocation;
@@ -463,6 +464,7 @@ struct d3d12_heap *unsafe_impl_from_ID3D12Heap(ID3D12Heap *iface);
 #define VKD3D_RESOURCE_EXTERNAL       0x00000004
 #define VKD3D_RESOURCE_DEDICATED_HEAP 0x00000008
 #define VKD3D_RESOURCE_LINEAR_TILING  0x00000010
+#define VKD3D_RESOURCE_PLACED         0x00000020
 
 struct vkd3d_tiled_region_extent
 {
@@ -603,6 +605,7 @@ struct vkd3d_resource_view
     } u;
     VkBufferView vk_counter_view;
     const struct vkd3d_format *format;
+    struct d3d12_resource *resource;
     union
     {
         struct
@@ -686,7 +689,7 @@ static inline bool vkd3d_view_incref(void *desc)
     {
         refcount = h->refcount;
         /* Avoid incrementing a freed object. Reading the value is safe because objects are recycled. */
-        if (refcount <= 0)
+        if (!refcount || refcount == UINT_MAX)
             return false;
     }
     while (!vkd3d_atomic_compare_exchange_u32(&h->refcount, refcount, refcount + 1));
@@ -754,13 +757,7 @@ HRESULT vkd3d_create_static_sampler(struct d3d12_device *device,
 
 struct d3d12_rtv_desc
 {
-    VkSampleCountFlagBits sample_count;
-    const struct vkd3d_format *format;
-    uint64_t width;
-    unsigned int height;
-    unsigned int layer_count;
-    struct vkd3d_view *view;
-    struct d3d12_resource *resource;
+    struct vkd3d_view * volatile view;
 };
 
 static inline struct d3d12_rtv_desc *d3d12_rtv_desc_from_cpu_handle(D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle)
@@ -770,16 +767,12 @@ static inline struct d3d12_rtv_desc *d3d12_rtv_desc_from_cpu_handle(D3D12_CPU_DE
 
 void d3d12_rtv_desc_create_rtv(struct d3d12_rtv_desc *rtv_desc, struct d3d12_device *device,
         struct d3d12_resource *resource, const D3D12_RENDER_TARGET_VIEW_DESC *desc);
+void d3d12_rtv_desc_copy(struct d3d12_rtv_desc *dst, const struct d3d12_rtv_desc *src,
+        struct d3d12_device *device);
 
 struct d3d12_dsv_desc
 {
-    VkSampleCountFlagBits sample_count;
-    const struct vkd3d_format *format;
-    uint64_t width;
-    unsigned int height;
-    unsigned int layer_count;
-    struct vkd3d_view *view;
-    struct d3d12_resource *resource;
+    struct vkd3d_view * volatile view;
 };
 
 static inline struct d3d12_dsv_desc *d3d12_dsv_desc_from_cpu_handle(D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle)
@@ -789,6 +782,25 @@ static inline struct d3d12_dsv_desc *d3d12_dsv_desc_from_cpu_handle(D3D12_CPU_DE
 
 void d3d12_dsv_desc_create_dsv(struct d3d12_dsv_desc *dsv_desc, struct d3d12_device *device,
         struct d3d12_resource *resource, const D3D12_DEPTH_STENCIL_VIEW_DESC *desc);
+void d3d12_dsv_desc_copy(struct d3d12_dsv_desc *dst, const struct d3d12_dsv_desc *src,
+        struct d3d12_device *device);
+
+static inline struct vkd3d_view *d3d12_attachment_desc_get_view_ref(
+        struct vkd3d_view * const volatile *src, struct d3d12_device *device)
+{
+    struct vkd3d_view *view;
+
+    for (;;)
+    {
+        if (!(view = vkd3d_atomic_load_ptr((void * const volatile *)src)))
+            return NULL;
+        if (!vkd3d_view_incref(view))
+            continue;
+        if (view == vkd3d_atomic_load_ptr((void * const volatile *)src))
+            return view;
+        vkd3d_view_decref(view, device);
+    }
+}
 
 static inline VkDescriptorType vk_descriptor_type_from_vkd3d_descriptor_type(enum vkd3d_shader_descriptor_type type,
         bool is_buffer)
@@ -891,6 +903,7 @@ struct d3d12_query_heap
     VkQueryPool vk_query_pool;
 
     struct d3d12_device *device;
+    D3D12_QUERY_HEAP_DESC desc;
 
     struct vkd3d_private_store private_store;
 
@@ -909,7 +922,7 @@ static inline bool d3d12_query_heap_is_result_available(const struct d3d12_query
 {
     unsigned int index = query_index / (sizeof(*heap->availability_mask) * CHAR_BIT);
     unsigned int shift = query_index % (sizeof(*heap->availability_mask) * CHAR_BIT);
-    return heap->availability_mask[index] & ((uint64_t)1 << shift);
+    return vkd3d_atomic_load_u64(&heap->availability_mask[index]) & ((uint64_t)1 << shift);
 }
 
 static inline void d3d12_query_heap_mark_result_as_available(struct d3d12_query_heap *heap,
@@ -917,7 +930,7 @@ static inline void d3d12_query_heap_mark_result_as_available(struct d3d12_query_
 {
     unsigned int index = query_index / (sizeof(*heap->availability_mask) * CHAR_BIT);
     unsigned int shift = query_index % (sizeof(*heap->availability_mask) * CHAR_BIT);
-    heap->availability_mask[index] |= (uint64_t)1 << shift;
+    vkd3d_atomic_or_u64(&heap->availability_mask[index], (uint64_t)1 << shift);
 }
 
 struct d3d12_root_descriptor_table_range
@@ -946,6 +959,7 @@ struct d3d12_root_constant
 {
     VkShaderStageFlags stage_flags;
     uint32_t offset;
+    uint32_t count;
 };
 
 struct d3d12_root_descriptor
@@ -1285,6 +1299,8 @@ struct vkd3d_resource_list
     size_t capacity;
 };
 
+struct vkd3d_bundle_command;
+
 /* ID3D12CommandList */
 struct d3d12_command_list
 {
@@ -1296,7 +1312,9 @@ struct d3d12_command_list
 
     bool is_recording;
     bool is_valid;
+    HRESULT close_error;
     VkCommandBuffer vk_command_buffer;
+    unsigned int cpu_expanded_dispatch_count;
 
     uint32_t strides[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
     D3D12_PRIMITIVE_TOPOLOGY primitive_topology;
@@ -1320,6 +1338,7 @@ struct d3d12_command_list
     bool xfb_enabled;
     bool has_depth_bounds;
     bool is_predicated;
+    unsigned int debug_event_depth;
 
     VkFramebuffer current_framebuffer;
     VkPipeline current_pipeline;
@@ -1338,6 +1357,11 @@ struct d3d12_command_list
     struct d3d12_descriptor_heap *descriptor_heaps[64];
     unsigned int descriptor_heap_count;
 
+    unsigned char *bundle_commands;
+    size_t bundle_command_size;
+    size_t bundle_command_capacity;
+    ID3D12PipelineState *bundle_initial_pipeline_state;
+
     struct vkd3d_private_store private_store;
 };
 
@@ -1352,6 +1376,7 @@ struct vkd3d_queue
     struct vkd3d_mutex mutex;
 
     VkQueue vk_queue;
+    unsigned int debug_event_depth;
 
     uint64_t completed_sequence_number;
     uint64_t submitted_sequence_number;
@@ -1721,6 +1746,7 @@ void vkd3d_format_copy_data(const struct vkd3d_format *format, const uint8_t *sr
 const struct vkd3d_format *vkd3d_get_format(const struct d3d12_device *device,
         DXGI_FORMAT dxgi_format, bool depth_stencil);
 const struct vkd3d_format *vkd3d_find_uint_format(const struct d3d12_device *device, DXGI_FORMAT dxgi_format);
+bool vkd3d_formats_are_copy_compatible(DXGI_FORMAT left, DXGI_FORMAT right);
 
 HRESULT vkd3d_init_format_info(struct d3d12_device *device);
 void vkd3d_cleanup_format_info(struct d3d12_device *device);
@@ -1836,9 +1862,11 @@ static inline void vkd3d_prepend_struct(void *header, void *structure)
 
 struct vkd3d_shader_cache;
 
-int vkd3d_shader_open_cache(struct vkd3d_shader_cache **cache);
+int vkd3d_shader_open_cache(struct vkd3d_shader_cache **cache,
+        uint64_t maximum_memory_size, uint32_t maximum_entry_count);
 unsigned int vkd3d_shader_cache_incref(struct vkd3d_shader_cache *cache);
 unsigned int vkd3d_shader_cache_decref(struct vkd3d_shader_cache *cache);
+void vkd3d_shader_cache_clear(struct vkd3d_shader_cache *cache);
 int vkd3d_shader_cache_put(struct vkd3d_shader_cache *cache,
         const void *key, size_t key_size, const void *value, size_t value_size);
 int vkd3d_shader_cache_get(struct vkd3d_shader_cache *cache,

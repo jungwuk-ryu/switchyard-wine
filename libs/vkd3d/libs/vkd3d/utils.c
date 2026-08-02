@@ -244,6 +244,29 @@ vkd3d_format_compatibility_info[] =
     {DXGI_FORMAT_B8G8R8X8_UNORM,           DXGI_FORMAT_B8G8R8X8_TYPELESS},
 };
 
+static DXGI_FORMAT vkd3d_format_get_copy_compatibility_class(DXGI_FORMAT format)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(vkd3d_format_compatibility_info); ++i)
+    {
+        if (vkd3d_format_compatibility_info[i].format == format
+                || vkd3d_format_compatibility_info[i].typeless_format == format)
+            return vkd3d_format_compatibility_info[i].typeless_format;
+    }
+
+    return format;
+}
+
+bool vkd3d_formats_are_copy_compatible(DXGI_FORMAT left, DXGI_FORMAT right)
+{
+    if (left == DXGI_FORMAT_UNKNOWN || right == DXGI_FORMAT_UNKNOWN)
+        return false;
+
+    return vkd3d_format_get_copy_compatibility_class(left)
+            == vkd3d_format_get_copy_compatibility_class(right);
+}
+
 static bool dxgi_format_is_depth_stencil(DXGI_FORMAT dxgi_format)
 {
     unsigned int i;

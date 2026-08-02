@@ -208,7 +208,18 @@ VK_DEVICE_EXT_PFN(vkCmdBeginConditionalRenderingEXT)
 VK_DEVICE_EXT_PFN(vkCmdEndConditionalRenderingEXT)
 
 /* VK_EXT_debug_marker */
+VK_DEVICE_EXT_PFN(vkCmdDebugMarkerBeginEXT)
+VK_DEVICE_EXT_PFN(vkCmdDebugMarkerEndEXT)
+VK_DEVICE_EXT_PFN(vkCmdDebugMarkerInsertEXT)
 VK_DEVICE_EXT_PFN(vkDebugMarkerSetObjectNameEXT)
+
+/* VK_EXT_debug_utils */
+VK_DEVICE_EXT_PFN(vkCmdBeginDebugUtilsLabelEXT)
+VK_DEVICE_EXT_PFN(vkCmdEndDebugUtilsLabelEXT)
+VK_DEVICE_EXT_PFN(vkCmdInsertDebugUtilsLabelEXT)
+VK_DEVICE_EXT_PFN(vkQueueBeginDebugUtilsLabelEXT)
+VK_DEVICE_EXT_PFN(vkQueueEndDebugUtilsLabelEXT)
+VK_DEVICE_EXT_PFN(vkQueueInsertDebugUtilsLabelEXT)
 
 /* VK_EXT_transform_feedback */
 VK_DEVICE_EXT_PFN(vkCmdBeginQueryIndexedEXT)

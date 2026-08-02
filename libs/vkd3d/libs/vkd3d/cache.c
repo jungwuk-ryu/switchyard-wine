@@ -31,12 +31,18 @@ struct vkd3d_shader_cache
     struct vkd3d_mutex lock;
 
     struct rb_tree tree;
+    struct list lru_list;
+    uint64_t memory_size;
+    uint64_t maximum_memory_size;
+    uint32_t entry_count;
+    uint32_t maximum_entry_count;
 };
 
 struct shader_cache_entry
 {
     struct vkd3d_cache_entry_header h;
     struct rb_entry entry;
+    struct list lru_entry;
     uint8_t *payload;
 };
 
@@ -77,9 +83,11 @@ static void vkd3d_shader_cache_add_entry(struct vkd3d_shader_cache *cache,
     };
 
     rb_put(&cache->tree, &k, &e->entry);
+    list_add_tail(&cache->lru_list, &e->lru_entry);
 }
 
-int vkd3d_shader_open_cache(struct vkd3d_shader_cache **cache)
+int vkd3d_shader_open_cache(struct vkd3d_shader_cache **cache,
+        uint64_t maximum_memory_size, uint32_t maximum_entry_count)
 {
     struct vkd3d_shader_cache *object;
 
@@ -91,7 +99,12 @@ int vkd3d_shader_open_cache(struct vkd3d_shader_cache **cache)
 
     object->refcount = 1;
     rb_init(&object->tree, vkd3d_shader_cache_compare_key);
+    list_init(&object->lru_list);
     vkd3d_mutex_init(&object->lock);
+    object->memory_size = 0;
+    object->maximum_memory_size = maximum_memory_size;
+    object->entry_count = 0;
+    object->maximum_entry_count = maximum_entry_count;
 
     *cache = object;
 
@@ -110,6 +123,19 @@ static void vkd3d_shader_cache_destroy_entry(struct rb_entry *entry, void *conte
     struct shader_cache_entry *e = RB_ENTRY_VALUE(entry, struct shader_cache_entry, entry);
     vkd3d_free(e->payload);
     vkd3d_free(e);
+}
+
+void vkd3d_shader_cache_clear(struct vkd3d_shader_cache *cache)
+{
+    TRACE("cache %p.\n", cache);
+
+    vkd3d_mutex_lock(&cache->lock);
+    rb_destroy(&cache->tree, vkd3d_shader_cache_destroy_entry, NULL);
+    rb_init(&cache->tree, vkd3d_shader_cache_compare_key);
+    list_init(&cache->lru_list);
+    cache->memory_size = 0;
+    cache->entry_count = 0;
+    vkd3d_mutex_unlock(&cache->lock);
 }
 
 unsigned int vkd3d_shader_cache_decref(struct vkd3d_shader_cache *cache)
@@ -150,6 +176,20 @@ static void vkd3d_shader_cache_unlock(struct vkd3d_shader_cache *cache)
     vkd3d_mutex_unlock(&cache->lock);
 }
 
+static void vkd3d_shader_cache_remove_entry(struct vkd3d_shader_cache *cache,
+        struct shader_cache_entry *entry)
+{
+    uint64_t storage_size = entry->h.key_size + entry->h.value_size;
+
+    rb_remove(&cache->tree, &entry->entry);
+    list_remove(&entry->lru_entry);
+    VKD3D_ASSERT(cache->entry_count && cache->memory_size >= storage_size);
+    --cache->entry_count;
+    cache->memory_size -= storage_size;
+    vkd3d_free(entry->payload);
+    vkd3d_free(entry);
+}
+
 int vkd3d_shader_cache_put(struct vkd3d_shader_cache *cache,
         const void *key, size_t key_size, const void *value, size_t value_size)
 {
@@ -157,8 +197,20 @@ int vkd3d_shader_cache_put(struct vkd3d_shader_cache *cache,
     struct shader_cache_key k;
     struct rb_entry *entry;
     enum vkd3d_result ret;
+    uint64_t allocation_size, storage_size;
 
     TRACE("%p, %p, %#zx, %p, %#zx.\n", cache, key, key_size, value, value_size);
+
+    if (!key || !key_size || !value || !value_size)
+        return VKD3D_ERROR_INVALID_ARGUMENT;
+    if (key_size > UINT64_MAX - value_size
+            || key_size + (uint64_t)value_size > UINT64_MAX - sizeof(*e))
+        return VKD3D_ERROR_OUT_OF_MEMORY;
+
+    storage_size = (uint64_t)key_size + value_size;
+    allocation_size = sizeof(*e) + storage_size;
+    if (allocation_size > SIZE_MAX)
+        return VKD3D_ERROR_OUT_OF_MEMORY;
 
     k.hash = vkd3d_shader_cache_hash_key(key, key_size);
     k.key = key;
@@ -174,6 +226,21 @@ int vkd3d_shader_cache_put(struct vkd3d_shader_cache *cache,
         WARN("Key already exists, returning VKD3D_ERROR_KEY_ALREADY_EXISTS.\n");
         ret = VKD3D_ERROR_KEY_ALREADY_EXISTS;
         goto done;
+    }
+
+    if (!cache->maximum_entry_count || storage_size > cache->maximum_memory_size)
+    {
+        WARN("Shader cache entry exceeds the configured capacity.\n");
+        ret = VKD3D_ERROR_OUT_OF_MEMORY;
+        goto done;
+    }
+
+    while (cache->entry_count && (cache->entry_count >= cache->maximum_entry_count
+            || cache->memory_size > cache->maximum_memory_size
+            || storage_size > cache->maximum_memory_size - cache->memory_size))
+    {
+        e = LIST_ENTRY(list_head(&cache->lru_list), struct shader_cache_entry, lru_entry);
+        vkd3d_shader_cache_remove_entry(cache, e);
     }
 
     e = vkd3d_malloc(sizeof(*e));
@@ -197,6 +264,8 @@ int vkd3d_shader_cache_put(struct vkd3d_shader_cache *cache,
     memcpy(e->payload + key_size, value, value_size);
 
     vkd3d_shader_cache_add_entry(cache, e);
+    cache->memory_size += storage_size;
+    ++cache->entry_count;
     TRACE("Cache entry %#"PRIx64" stored.\n", k.hash);
     ret = VKD3D_OK;
 
@@ -216,6 +285,9 @@ int vkd3d_shader_cache_get(struct vkd3d_shader_cache *cache,
 
     TRACE("%p, %p, %#zx, %p, %p.\n", cache, key, key_size, value, value_size);
 
+    if (!key || !key_size || !value_size)
+        return VKD3D_ERROR_INVALID_ARGUMENT;
+
     size_in = *value_size;
 
     k.hash = vkd3d_shader_cache_hash_key(key, key_size);
@@ -233,6 +305,8 @@ int vkd3d_shader_cache_get(struct vkd3d_shader_cache *cache,
     }
 
     e = RB_ENTRY_VALUE(entry, struct shader_cache_entry, entry);
+    list_remove(&e->lru_entry);
+    list_add_tail(&cache->lru_list, &e->lru_entry);
 
     *value_size = e->h.value_size;
     if (!value)
