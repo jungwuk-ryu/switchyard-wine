@@ -892,6 +892,20 @@ static BOOL dxgi_1_4_supported(IUnknown *device, BOOL is_d3d12)
     return SUCCEEDED(hr);
 }
 
+static BOOL dxgi_1_5_supported(IUnknown *device, BOOL is_d3d12)
+{
+    IDXGIFactory5 *factory5;
+    IDXGIFactory *factory;
+    HRESULT hr;
+
+    get_factory(device, is_d3d12, &factory);
+    if (SUCCEEDED(hr = IDXGIFactory_QueryInterface(factory, &IID_IDXGIFactory5, (void **)&factory5)))
+        IDXGIFactory5_Release(factory5);
+    IDXGIFactory_Release(factory);
+
+    return SUCCEEDED(hr);
+}
+
 #define get_adapter(a, b) get_adapter_(__LINE__, a, b)
 static IDXGIAdapter *get_adapter_(unsigned int line, IUnknown *device, BOOL is_d3d12)
 {
@@ -912,6 +926,7 @@ static IDXGIAdapter *get_adapter_(unsigned int line, IUnknown *device, BOOL is_d
         hr = IDXGIFactory_QueryInterface(factory, &IID_IDXGIFactory4, (void **)&factory4);
         ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
         hr = IDXGIFactory4_EnumAdapterByLuid(factory4, luid, &IID_IDXGIAdapter, (void **)&adapter);
+        ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
         IDXGIFactory4_Release(factory4);
         IDXGIFactory_Release(factory);
     }
@@ -1495,6 +1510,13 @@ static void test_output(void)
 
     modes = calloc(mode_count + 10, sizeof(*modes));
     ok(!!modes, "Failed to allocate memory.\n");
+    if (!modes)
+    {
+        IDXGIOutput_Release(output);
+        IDXGIAdapter_Release(adapter);
+        IDXGIDevice_Release(device);
+        return;
+    }
 
     hr = IDXGIOutput_GetDisplayModeList(output, DXGI_FORMAT_R8G8B8A8_UNORM,
             DXGI_ENUM_MODES_SCALING, NULL, modes);
@@ -4616,7 +4638,7 @@ static void test_swapchain_resize(IUnknown *device, BOOL is_d3d12)
         if (flag == DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED)
             continue;
 
-        if (!is_dxgi_1_5_supported & (flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+        if (!is_dxgi_1_5_supported && (flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
                 || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_TO_ALL_HOLOGRAPHIC_DISPLAYS))
             continue;
 
@@ -4726,7 +4748,7 @@ static void test_swapchain_resize(IUnknown *device, BOOL is_d3d12)
             if (flag == DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED)
                 continue;
 
-            if (!is_dxgi_1_5_supported & (flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+            if (!is_dxgi_1_5_supported && (flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
                     || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_TO_ALL_HOLOGRAPHIC_DISPLAYS))
                 continue;
 
@@ -7266,6 +7288,7 @@ static void test_output_ownership(IUnknown *device, BOOL is_d3d12)
         return;
     }
 
+    output = NULL;
     hr = IDXGIAdapter_EnumOutputs(adapter, 0, &output);
     IDXGIAdapter_Release(adapter);
     if (hr == DXGI_ERROR_NOT_FOUND)
@@ -7275,6 +7298,13 @@ static void test_output_ownership(IUnknown *device, BOOL is_d3d12)
         return;
     }
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (FAILED(hr) || !output)
+    {
+        if (SUCCEEDED(hr))
+            ok(0, "EnumOutputs() returned success without an output.\n");
+        IDXGIFactory_Release(factory);
+        return;
+    }
 
     hr = IDXGIOutput_GetDesc(output, &output_desc);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
@@ -7747,6 +7777,12 @@ static void test_frame_latency_event(IUnknown *device, BOOL is_d3d12)
     hr = IDXGISwapChain2_SetMaximumFrameLatency(swapchain2, 0);
     todo_wine_if(!is_d3d12)
     ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
+    hr = IDXGISwapChain2_SetMaximumFrameLatency(swapchain2, MAX_FRAME_LATENCY + 1);
+    todo_wine_if(!is_d3d12)
+    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
+    hr = IDXGISwapChain2_GetMaximumFrameLatency(swapchain2, NULL);
+    todo_wine_if(!is_d3d12)
+    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
     hr = IDXGISwapChain2_GetMaximumFrameLatency(swapchain2, &frame_latency);
     todo_wine_if(!is_d3d12)
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
@@ -7887,9 +7923,122 @@ static void test_frame_latency_event(IUnknown *device, BOOL is_d3d12)
     ok(ref_count == !is_d3d12, "Factory has %lu references left.\n", ref_count);
 }
 
+static void test_restrict_to_output(IUnknown *device, BOOL is_d3d12)
+{
+    DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
+    IDXGISwapChain1 *swapchain;
+    IDXGIFactory2 *factory2;
+    IDXGIFactory *factory;
+    IDXGIAdapter *adapter;
+    IDXGIOutput *output, *returned_output;
+    ULONG refcount;
+    HWND window;
+    HRESULT hr;
+
+    get_factory(device, is_d3d12, &factory);
+    hr = IDXGIFactory_QueryInterface(factory, &IID_IDXGIFactory2, (void **)&factory2);
+    IDXGIFactory_Release(factory);
+    if (FAILED(hr))
+    {
+        win_skip("IDXGIFactory2 is not available.\n");
+        return;
+    }
+
+    adapter = get_adapter(device, is_d3d12);
+    if (!adapter)
+    {
+        skip("Failed to get the device adapter.\n");
+        IDXGIFactory2_Release(factory2);
+        return;
+    }
+
+    output = NULL;
+    hr = IDXGIAdapter_EnumOutputs(adapter, 0, &output);
+    IDXGIAdapter_Release(adapter);
+    if (hr == DXGI_ERROR_NOT_FOUND)
+    {
+        skip("No output is available.\n");
+        IDXGIFactory2_Release(factory2);
+        return;
+    }
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (FAILED(hr) || !output)
+    {
+        if (SUCCEEDED(hr))
+            ok(0, "EnumOutputs() returned success without an output.\n");
+        IDXGIFactory2_Release(factory2);
+        return;
+    }
+
+    window = create_window();
+    swapchain_desc.Width = 640;
+    swapchain_desc.Height = 480;
+    swapchain_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swapchain_desc.Stereo = FALSE;
+    swapchain_desc.SampleDesc.Count = 1;
+    swapchain_desc.SampleDesc.Quality = 0;
+    swapchain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swapchain_desc.BufferCount = 2;
+    swapchain_desc.Scaling = DXGI_SCALING_STRETCH;
+    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swapchain_desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+    swapchain_desc.Flags = 0;
+
+    hr = IDXGIFactory2_CreateSwapChainForHwnd(factory2, device, window,
+            &swapchain_desc, NULL, output, &swapchain);
+    ok(hr == S_OK, "Failed to create restricted swapchain, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        hr = IDXGISwapChain1_GetRestrictToOutput(swapchain, NULL);
+        ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+        returned_output = (IDXGIOutput *)0xdeadbeef;
+        hr = IDXGISwapChain1_GetRestrictToOutput(swapchain, &returned_output);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(!!returned_output, "Expected a restricted output.\n");
+        if (SUCCEEDED(hr) && returned_output && returned_output != (IDXGIOutput *)0xdeadbeef)
+        {
+            check_output_equal(output, returned_output);
+            IDXGIOutput_Release(returned_output);
+        }
+
+        hr = IDXGISwapChain1_Present(swapchain, 0,
+                DXGI_PRESENT_TEST | DXGI_PRESENT_RESTRICT_TO_OUTPUT);
+        ok(hr == S_OK, "Got unexpected restricted present hr %#lx.\n", hr);
+
+        refcount = IDXGISwapChain1_Release(swapchain);
+        ok(!refcount, "Swapchain has %lu references left.\n", refcount);
+    }
+
+    hr = IDXGIFactory2_CreateSwapChainForHwnd(factory2, device, window,
+            &swapchain_desc, NULL, NULL, &swapchain);
+    ok(hr == S_OK, "Failed to create unrestricted swapchain, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        returned_output = (IDXGIOutput *)0xdeadbeef;
+        hr = IDXGISwapChain1_GetRestrictToOutput(swapchain, &returned_output);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(!returned_output, "Got unexpected restricted output %p.\n", returned_output);
+
+        hr = IDXGISwapChain1_Present(swapchain, 0,
+                DXGI_PRESENT_TEST | DXGI_PRESENT_RESTRICT_TO_OUTPUT);
+        ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected unrestricted present hr %#lx.\n", hr);
+
+        refcount = IDXGISwapChain1_Release(swapchain);
+        ok(!refcount, "Swapchain has %lu references left.\n", refcount);
+    }
+
+    DestroyWindow(window);
+    IDXGIOutput_Release(output);
+    refcount = IDXGIFactory2_Release(factory2);
+    ok(refcount == !is_d3d12, "Factory has %lu references left.\n", refcount);
+}
+
 static void test_colour_space_support(IUnknown *device, BOOL is_d3d12)
 {
     DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
+    DXGI_HDR_METADATA_HDR10 hdr10;
+    IDXGISwapChain4 *swapchain4;
     IDXGISwapChain3 *swapchain3;
     IDXGISwapChain1 *swapchain1;
     IDXGIFactory2 *factory2;
@@ -7982,8 +8131,30 @@ static void test_colour_space_support(IUnknown *device, BOOL is_d3d12)
         }
 
         hr = IDXGISwapChain3_SetColorSpace1(swapchain3, colour_spaces[i]);
-        ok(hr == (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) ? S_OK : E_INVALIDARG,
+        ok(hr == ((support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) ? S_OK : E_INVALIDARG),
                 "Got unexpected hr %#lx for text %u.\n", hr, i);
+    }
+
+    hr = IDXGISwapChain3_QueryInterface(swapchain3, &IID_IDXGISwapChain4, (void **)&swapchain4);
+    if (hr == E_NOINTERFACE)
+        win_skip("IDXGISwapChain4 is not available.\n");
+    else
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        memset(&hdr10, 0, sizeof(hdr10));
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4, DXGI_HDR_METADATA_TYPE_NONE, 0, NULL);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                DXGI_HDR_METADATA_TYPE_NONE, sizeof(hdr10), &hdr10);
+        ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr10) - 1, &hdr10);
+        ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr10), NULL);
+        ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+        IDXGISwapChain4_Release(swapchain4);
     }
 
     ref_count = IDXGISwapChain3_Release(swapchain3);
@@ -9036,6 +9207,7 @@ START_TEST(dxgi)
     run_on_d3d12(test_output_ownership);
     run_on_d3d12(test_cursor_clipping);
     run_on_d3d12(test_frame_latency_event);
+    run_on_d3d12(test_restrict_to_output);
     run_on_d3d12(test_colour_space_support);
     run_on_d3d12(test_get_containing_output);
     run_on_d3d12(test_window_association);

@@ -294,9 +294,6 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForHwnd(IWineDXGIFa
     if (!dxgi_validate_swapchain_desc(desc))
         return DXGI_ERROR_INVALID_CALL;
 
-    if (output)
-        FIXME("Ignoring output %p.\n", output);
-
     if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_IWineDXGISwapChainFactory, (void **)&swapchain_factory)))
     {
         hr = IWineDXGISwapChainFactory_create_swapchain(swapchain_factory,
@@ -307,7 +304,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForHwnd(IWineDXGIFa
 
     if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_ID3D12CommandQueue, (void **)&command_queue)))
     {
-        hr = d3d12_swapchain_create(iface, command_queue, window, desc, fullscreen_desc, swapchain);
+        hr = d3d12_swapchain_create(iface, command_queue, window, desc, fullscreen_desc, output, swapchain);
         ID3D12CommandQueue_Release(command_queue);
         return hr;
     }
@@ -482,20 +479,109 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CheckFeatureSupport(IWineDXGIFacto
 static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapterByGpuPreference(IWineDXGIFactory *iface,
         UINT adapter_idx, DXGI_GPU_PREFERENCE gpu_preference, REFIID iid, void **adapter)
 {
+    struct adapter_candidate
+    {
+        IDXGIAdapter1 *adapter;
+        DXGI_ADAPTER_DESC1 desc;
+    };
+    struct adapter_candidate *candidates = NULL, *new_candidates;
     IDXGIAdapter1 *adapter_object;
-    HRESULT hr;
+    SIZE_T candidate_capacity = 0, new_capacity;
+    unsigned int candidate_count = 0, i, j;
+    HRESULT hr = S_OK;
 
     TRACE("iface %p, adapter_idx %u, gpu_preference %#x, iid %s, adapter %p.\n",
             iface, adapter_idx, gpu_preference, debugstr_guid(iid), adapter);
 
-    if (gpu_preference != DXGI_GPU_PREFERENCE_UNSPECIFIED)
-        FIXME("Ignoring GPU preference %#x.\n", gpu_preference);
+    if (!adapter)
+        return DXGI_ERROR_INVALID_CALL;
+    *adapter = NULL;
 
-    if (FAILED(hr = dxgi_factory_EnumAdapters1(iface, adapter_idx, &adapter_object)))
+    if (gpu_preference == DXGI_GPU_PREFERENCE_UNSPECIFIED)
+    {
+        if (FAILED(hr = dxgi_factory_EnumAdapters1(iface, adapter_idx, &adapter_object)))
+            return hr;
+
+        hr = IDXGIAdapter1_QueryInterface(adapter_object, iid, adapter);
+        IDXGIAdapter1_Release(adapter_object);
         return hr;
+    }
 
-    hr = IDXGIAdapter1_QueryInterface(adapter_object, iid, adapter);
-    IDXGIAdapter1_Release(adapter_object);
+    if (gpu_preference != DXGI_GPU_PREFERENCE_MINIMUM_POWER
+            && gpu_preference != DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+        return DXGI_ERROR_INVALID_CALL;
+
+    for (;;)
+    {
+        hr = dxgi_factory_EnumAdapters1(iface, candidate_count, &adapter_object);
+        if (hr == DXGI_ERROR_NOT_FOUND)
+            break;
+        if (FAILED(hr))
+            goto done;
+
+        if (candidate_count == candidate_capacity)
+        {
+            new_capacity = candidate_capacity ? candidate_capacity * 2 : 4;
+            if (new_capacity < candidate_capacity
+                    || new_capacity > ~(SIZE_T)0 / sizeof(*new_candidates)
+                    || !(new_candidates = realloc(candidates,
+                    new_capacity * sizeof(*new_candidates))))
+            {
+                IDXGIAdapter1_Release(adapter_object);
+                hr = E_OUTOFMEMORY;
+                goto done;
+            }
+            candidates = new_candidates;
+            candidate_capacity = new_capacity;
+        }
+
+        if (FAILED(hr = IDXGIAdapter1_GetDesc1(adapter_object,
+                &candidates[candidate_count].desc)))
+        {
+            IDXGIAdapter1_Release(adapter_object);
+            goto done;
+        }
+        candidates[candidate_count].adapter = adapter_object;
+        ++candidate_count;
+    }
+
+    for (i = 1; i < candidate_count; ++i)
+    {
+        struct adapter_candidate candidate = candidates[i];
+
+        for (j = i; j; --j)
+        {
+            const struct adapter_candidate *previous = &candidates[j - 1];
+            BOOL candidate_hardware = !(candidate.desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
+            BOOL previous_hardware = !(previous->desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
+            BOOL before;
+
+            if (candidate_hardware != previous_hardware)
+                before = candidate_hardware;
+            else if (gpu_preference == DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+                before = candidate.desc.DedicatedVideoMemory > previous->desc.DedicatedVideoMemory;
+            else
+                before = candidate.desc.DedicatedVideoMemory < previous->desc.DedicatedVideoMemory;
+
+            if (!before)
+                break;
+            candidates[j] = candidates[j - 1];
+        }
+        candidates[j] = candidate;
+    }
+
+    if (adapter_idx >= candidate_count)
+    {
+        hr = DXGI_ERROR_NOT_FOUND;
+        goto done;
+    }
+
+    hr = IDXGIAdapter1_QueryInterface(candidates[adapter_idx].adapter, iid, adapter);
+
+done:
+    for (i = 0; i < candidate_count; ++i)
+        IDXGIAdapter1_Release(candidates[i].adapter);
+    free(candidates);
     return hr;
 }
 
