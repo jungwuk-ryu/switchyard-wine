@@ -19,6 +19,9 @@ below.
   exact runtime revision, host, and launch or graphics path.
 - [`provenance.md`](provenance.md) records the upstream Wine base, downstream
   history policy, licenses, and external build inputs.
+- [`shader-cache.md`](shader-cache.md) documents D3D12 application shader-cache
+  persistence, its security and recovery invariants, and the provider-cache
+  capability boundary.
 - [`troubleshooting-unity-games.md`](troubleshooting-unity-games.md) covers the
   Unity startup failure modes currently documented for Switchyard.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) defines the downstream change policy,
