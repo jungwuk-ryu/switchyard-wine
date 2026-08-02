@@ -1758,6 +1758,8 @@ static NTSTATUS oss_wow64_create_stream(void *args)
         UINT32 spatial_static_mask;
         UINT32 spatial_dynamic_objects;
         UINT32 spatial_endpoint_generation;
+        PTR32 spatial_invalidation_event;
+        BOOL spatial_fault_invalidate_on_start;
         REFERENCE_TIME duration;
         REFERENCE_TIME period;
         PTR32 fmt;
@@ -1776,6 +1778,10 @@ static NTSTATUS oss_wow64_create_stream(void *args)
         .spatial_static_mask = params32->spatial_static_mask,
         .spatial_dynamic_objects = params32->spatial_dynamic_objects,
         .spatial_endpoint_generation = params32->spatial_endpoint_generation,
+        .spatial_invalidation_event = ULongToPtr(
+                params32->spatial_invalidation_event),
+        .spatial_fault_invalidate_on_start =
+                params32->spatial_fault_invalidate_on_start,
         .duration = params32->duration,
         .period = params32->period,
         .fmt = ULongToPtr(params32->fmt),

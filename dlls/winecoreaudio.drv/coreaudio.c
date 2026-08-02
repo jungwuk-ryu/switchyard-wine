@@ -127,6 +127,7 @@ struct coreaudio_stream
     AUDCLNT_SHAREMODE share;
     HANDLE event;
     HANDLE timer_thread;
+    HANDLE spatial_invalidation_event;
     semaphore_t event_semaphore;
     BOOL event_semaphore_created;
     semaphore_t callback_drain_semaphore;
@@ -179,6 +180,7 @@ struct coreaudio_stream
     UINT64 overruns;
     UINT64 reentrant_callbacks;
     BOOL profile_callbacks;
+    BOOL fault_invalidate_on_start;
     UINT32 callback_timing_count;
     UINT64 *callback_timings;
     UINT32 spatial_bed_channels;
@@ -217,6 +219,10 @@ static UINT ca_channel_layout_to_channel_mask(const AudioChannelLayout *layout);
 static UINT32 count_channel_mask_bits(DWORD mask);
 static void wait_for_spatial_callbacks(struct coreaudio_stream *stream);
 static void wait_for_device_callbacks(struct coreaudio_stream *stream);
+static void unix_timer_loop(void *args);
+
+static const WCHAR audio_client_timer_name[] =
+        {'a','u','d','i','o','_','c','l','i','e','n','t','_','t','i','m','e','r',0};
 
 static NTSTATUS unix_not_implemented(void *args)
 {
@@ -618,6 +624,12 @@ static void signal_spatial_event(struct coreaudio_stream *stream)
         semaphore_signal(stream->event_semaphore);
 }
 
+static void invalidate_spatial_stream_rt(struct coreaudio_stream *stream)
+{
+    __atomic_store_n(&stream->invalidated, TRUE, __ATOMIC_RELEASE);
+    signal_spatial_event(stream);
+}
+
 static void record_spatial_callback_time(struct coreaudio_stream *stream,
         UINT64 started)
 {
@@ -646,7 +658,11 @@ static void spatial_device_property_changed(struct coreaudio_stream *stream,
         __atomic_store_n(&stream->invalidated, TRUE, __ATOMIC_RELEASE);
     }
     if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE))
+    {
+        if (stream->spatial_invalidation_event)
+            NtSetEvent(stream->spatial_invalidation_event, NULL);
         signal_spatial_event(stream);
+    }
 done:
     __atomic_sub_fetch(&stream->device_callbacks_inflight, 1,
             __ATOMIC_RELEASE);
@@ -693,7 +709,7 @@ static HRESULT register_spatial_device_listeners(struct coreaudio_stream *stream
             if (i == 1 || i == 4)
                 topology_listener = TRUE;
         }
-        else if (i == 0 || i == 2 || i == 3)
+        else if (i == 0 || i == 2 || i == 3 || i == 5)
         {
             WARN("Failed to register required spatial device listener %u: %x.\n",
                     i, (int)sc);
@@ -761,6 +777,17 @@ static void unregister_spatial_device_listeners(struct coreaudio_stream *stream)
         dispatch_release(stream->device_listener_queue);
         stream->device_listener_queue = NULL;
     }
+}
+
+static HRESULT validate_spatial_device_listener_capability(AudioDeviceID dev_id)
+{
+    struct coreaudio_stream probe = {0};
+    HRESULT hr;
+
+    probe.dev_id = dev_id;
+    hr = register_spatial_device_listeners(&probe);
+    unregister_spatial_device_listeners(&probe);
+    return hr;
 }
 
 /* Split the private interleaved transport exactly once for each output slice.
@@ -1080,6 +1107,10 @@ static OSStatus ca_spatial_render_cb(void *user, AudioUnitRenderActionFlags *fla
 done:
     __atomic_store_n(&stream->spatial_callback_active, 0, __ATOMIC_RELEASE);
 done_inflight:
+    if (result != noErr && result != kAudioUnitErr_CannotDoInCurrentContext &&
+            !__atomic_load_n(&stream->shutting_down, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&stream->spatial_resetting, __ATOMIC_ACQUIRE))
+        invalidate_spatial_stream_rt(stream);
     record_spatial_callback_time(stream, started);
     if (!__atomic_sub_fetch(&stream->spatial_callbacks_inflight, 1,
             __ATOMIC_RELEASE) && stream->callback_drain_semaphore_created &&
@@ -1161,6 +1192,10 @@ static OSStatus ca_native_spatial_render_cb(void *user, AudioUnitRenderActionFla
 done:
     __atomic_store_n(&stream->spatial_callback_active, 0, __ATOMIC_RELEASE);
 done_inflight:
+    if (result != noErr && result != kAudioUnitErr_CannotDoInCurrentContext &&
+            !__atomic_load_n(&stream->shutting_down, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&stream->spatial_resetting, __ATOMIC_ACQUIRE))
+        invalidate_spatial_stream_rt(stream);
     record_spatial_callback_time(stream, started);
     if (!__atomic_sub_fetch(&stream->spatial_callbacks_inflight, 1,
             __ATOMIC_RELEASE) && stream->callback_drain_semaphore_created &&
@@ -2593,6 +2628,19 @@ static HRESULT query_spatial_audio_capabilities(const char *device,
     if (!validate_graph || !capabilities->max_dynamic_objects)
         return S_OK;
 
+    /* A positive count is useful only if an activated stream can subscribe to
+     * every property needed to revoke that capacity safely.  Probe with the
+     * same registration path used by stream creation so discovery and
+     * activation cannot disagree indefinitely on this endpoint. */
+    hr = validate_spatial_device_listener_capability(dev_id);
+    if (FAILED(hr))
+    {
+        if (hr == E_OUTOFMEMORY)
+            return hr;
+        capabilities->max_dynamic_objects = 0;
+        return S_OK;
+    }
+
     candidate = capabilities->max_dynamic_objects;
     hr = validate_spatial_dynamic_capacity(device, dev_id,
             capabilities->period_frames, capabilities->sample_rate, candidate);
@@ -2645,6 +2693,7 @@ static NTSTATUS unix_create_stream(void *args)
     WAVEFORMATEXTENSIBLE spatial_bed = {0};
     AURenderCallbackStruct input;
     kern_return_t kr;
+    NTSTATUS status;
     HRESULT hr;
     OSStatus sc;
     int computed_frames;
@@ -2680,6 +2729,7 @@ static NTSTATUS unix_create_stream(void *args)
     stream->spatial_static_mask = params->spatial_static_mask;
     stream->spatial_dynamic_objects = params->spatial_dynamic_objects;
     stream->spatial_endpoint_generation = params->spatial_endpoint_generation;
+    stream->spatial_invalidation_event = params->spatial_invalidation_event;
     stream->share = params->share;
     /* The DefaultOutput unit can migrate to a device with a different speaker
      * layout without giving us a safe point at which to rebuild the spatial
@@ -2768,6 +2818,10 @@ static NTSTATUS unix_create_stream(void *args)
             }
             stream->profile_callbacks = TRUE;
         }
+        stream->fault_invalidate_on_start =
+                stream->spatial_dynamic_objects &&
+                stream->spatial_invalidation_event &&
+                params->spatial_fault_invalidate_on_start;
         if (FAILED(params->result = register_spatial_device_listeners(stream)))
             goto end;
     }
@@ -2867,6 +2921,18 @@ static NTSTATUS unix_create_stream(void *args)
     }
     stream->unit_initialized = TRUE;
 
+    /* A spatial AudioUnit begins calling into us below, before the Windows
+     * stream is started.  Start the bounded Mach-semaphore relay first so a
+     * fatal callback or endpoint change in that window reaches the private
+     * invalidation event instead of remaining only in backend state. */
+    if (stream->spatial && stream->event_semaphore_created &&
+            (status = create_unix_thread(&stream->timer_thread,
+                    audio_client_timer_name, unix_timer_loop, stream)))
+    {
+        params->result = HRESULT_FROM_NT(status);
+        goto end;
+    }
+
     /* we play audio continuously because AudioOutputUnitStart sometimes takes
      * a while to return */
     sc = AudioOutputUnitStart(stream->unit);
@@ -2944,6 +3010,14 @@ end:
         if(stream->converter) AudioConverterDispose(stream->converter);
         __atomic_store_n(&stream->shutting_down, TRUE, __ATOMIC_RELEASE);
         unregister_spatial_device_listeners(stream);
+        if (stream->timer_thread)
+        {
+            __atomic_store_n(&stream->please_quit, TRUE, __ATOMIC_RELEASE);
+            if (stream->event_semaphore_created)
+                semaphore_signal(stream->event_semaphore);
+            NtWaitForSingleObject(stream->timer_thread, FALSE, NULL);
+            NtClose(stream->timer_thread);
+        }
         if (stream->unit_started)
         {
             AudioOutputUnitStop(stream->unit);
@@ -3732,6 +3806,9 @@ static void unix_timer_loop(void *args)
             if (__atomic_load_n(&stream->please_quit, __ATOMIC_ACQUIRE))
                 break;
             __atomic_store_n(&stream->event_pending, 0, __ATOMIC_RELEASE);
+            if (__atomic_load_n(&stream->invalidated, __ATOMIC_ACQUIRE) &&
+                    stream->spatial_invalidation_event)
+                NtSetEvent(stream->spatial_invalidation_event, NULL);
             if (__atomic_load_n(&stream->playing, __ATOMIC_ACQUIRE) &&
                     stream->event)
                 NtSetEvent(stream->event, NULL);
@@ -3763,7 +3840,6 @@ static NTSTATUS unix_start(void *args)
 {
     struct start_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
-    static const WCHAR name[] = {'a','u','d','i','o','_','c','l','i','e','n','t','_','t','i','m','e','r',0};
     NTSTATUS status;
 
     os_unfair_lock_lock(&stream->lock);
@@ -3784,7 +3860,8 @@ static NTSTATUS unix_start(void *args)
             (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
             !stream->timer_thread)
     {
-        status = create_unix_thread(&stream->timer_thread, name,
+        status = create_unix_thread(&stream->timer_thread,
+                audio_client_timer_name,
                 unix_timer_loop, stream);
         if (status)
         {
@@ -3793,7 +3870,12 @@ static NTSTATUS unix_start(void *args)
         }
     }
     if (SUCCEEDED(params->result) && stream->spatial)
+    {
         signal_spatial_event(stream);
+        if (__atomic_exchange_n(&stream->fault_invalidate_on_start, FALSE,
+                __ATOMIC_ACQ_REL))
+            invalidate_spatial_stream_rt(stream);
+    }
 
     return STATUS_SUCCESS;
 }
@@ -4443,6 +4525,8 @@ static NTSTATUS unix_wow64_create_stream(void *args)
         UINT32 spatial_static_mask;
         UINT32 spatial_dynamic_objects;
         UINT32 spatial_endpoint_generation;
+        PTR32 spatial_invalidation_event;
+        BOOL spatial_fault_invalidate_on_start;
         REFERENCE_TIME duration;
         REFERENCE_TIME period;
         PTR32 fmt;
@@ -4462,6 +4546,10 @@ static NTSTATUS unix_wow64_create_stream(void *args)
         .spatial_dynamic_objects = params32->spatial_dynamic_objects,
         .spatial_endpoint_generation =
                 params32->spatial_endpoint_generation,
+        .spatial_invalidation_event = ULongToPtr(
+                params32->spatial_invalidation_event),
+        .spatial_fault_invalidate_on_start =
+                params32->spatial_fault_invalidate_on_start,
         .duration = params32->duration,
         .period = params32->period,
         .fmt = ULongToPtr(params32->fmt),

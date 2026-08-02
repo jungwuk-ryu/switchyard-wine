@@ -187,6 +187,16 @@ struct SpatialAudioStreamImpl {
     UINT32 allocated_dynamic_objects;
     HRESULT invalidation_hr;
     BOOL invalidation_notified;
+    BOOL invalidation_armed;
+    HANDLE invalidation_event;
+    HANDLE invalidation_ready_event;
+    HANDLE invalidation_start_event;
+    HANDLE invalidation_thread;
+    DWORD invalidation_thread_id;
+    LONG invalidation_thread_quit;
+    BOOL fault_invalidate_on_start;
+    BOOL fault_invalidate_before_start;
+    HRESULT invalidation_thread_hr;
     struct spatial_audio_capabilities capabilities;
     WAVEFORMATEXTENSIBLE stream_fmtex;
 
@@ -239,20 +249,25 @@ static BOOL is_endpoint_resource_loss(HRESULT hr)
 /* Caller holds stream->lock. Object interfaces stay allocated until their
  * owners release them, but no object may remain renderable after the endpoint
  * or one of its graph resources disappears. */
-static BOOL revoke_stream_objects_locked(SpatialAudioStreamImpl *stream, HRESULT hr)
+static BOOL revoke_stream_objects_locked(SpatialAudioStreamImpl *stream,
+        HRESULT hr, BOOL allow_notify)
 {
     SpatialAudioObjectImpl *object;
     BOOL notify = FALSE;
 
     if (is_endpoint_resource_loss(hr) && SUCCEEDED(stream->invalidation_hr))
     {
-        stream->invalidation_hr = hr;
-        if (stream->max_dynamic_objects && stream->params.NotifyObject &&
-                !stream->invalidation_notified)
-        {
-            stream->invalidation_notified = TRUE;
-            notify = TRUE;
-        }
+        /* The transport may report an AUDCLNT_* endpoint error, but object
+         * methods expose the spatial-audio contract after revocation. */
+        stream->invalidation_hr = SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    }
+    if (allow_notify && stream->invalidation_armed &&
+            FAILED(stream->invalidation_hr) &&
+            stream->max_dynamic_objects && stream->params.NotifyObject &&
+            !stream->invalidation_notified)
+    {
+        stream->invalidation_notified = TRUE;
+        notify = TRUE;
     }
 
     LIST_FOR_EACH_ENTRY(object, &stream->objects, SpatialAudioObjectImpl, entry)
@@ -296,10 +311,66 @@ static void revoke_stream_objects(SpatialAudioStreamImpl *stream, HRESULT hr)
         return;
 
     EnterCriticalSection(&stream->lock);
-    notify = revoke_stream_objects_locked(stream, hr);
+    notify = revoke_stream_objects_locked(stream, hr, TRUE);
     LeaveCriticalSection(&stream->lock);
     if (notify)
         notify_dynamic_capacity_lost(stream);
+}
+
+/* Caller holds stream->lock. The auto-reset event is the authoritative bridge
+ * for endpoint loss before the notification worker is armed. Public methods
+ * consume it so stale capacity and objects are never observable; application
+ * callbacks remain suppressed until Start publishes invalidation_armed. */
+static BOOL poll_stream_invalidation_locked(SpatialAudioStreamImpl *stream)
+{
+    if (SUCCEEDED(stream->invalidation_hr) && stream->invalidation_event &&
+            WaitForSingleObject(stream->invalidation_event, 0) == WAIT_OBJECT_0)
+        return revoke_stream_objects_locked(stream,
+                SPTLAUDCLNT_E_RESOURCES_INVALIDATED,
+                stream->invalidation_armed);
+    return FALSE;
+}
+
+static BOOL spatial_stream_try_addref(SpatialAudioStreamImpl *stream)
+{
+    LONG ref = InterlockedCompareExchange(&stream->ref, 0, 0);
+
+    while (ref > 0 && ref < LONG_MAX)
+    {
+        LONG previous = InterlockedCompareExchange(&stream->ref, ref + 1, ref);
+
+        if (previous == ref)
+            return TRUE;
+        ref = previous;
+    }
+    return FALSE;
+}
+
+static DWORD WINAPI spatial_invalidation_thread(void *arg)
+{
+    SpatialAudioStreamImpl *stream = arg;
+    HRESULT hr;
+
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    stream->invalidation_thread_hr = hr;
+    SetEvent(stream->invalidation_ready_event);
+    if (FAILED(hr))
+    {
+        WARN("Failed to initialize the spatial invalidation MTA: %08lx.\n", hr);
+        return 0;
+    }
+    if (WaitForSingleObject(stream->invalidation_start_event, INFINITE) == WAIT_OBJECT_0 &&
+            !InterlockedCompareExchange(&stream->invalidation_thread_quit, 0, 0) &&
+            WaitForSingleObject(stream->invalidation_event, INFINITE) == WAIT_OBJECT_0 &&
+            !InterlockedCompareExchange(&stream->invalidation_thread_quit, 0, 0) &&
+            spatial_stream_try_addref(stream))
+    {
+        revoke_stream_objects(stream, SPTLAUDCLNT_E_RESOURCES_INVALIDATED);
+        ISpatialAudioObjectRenderStream_Release(
+                &stream->ISpatialAudioObjectRenderStream_iface);
+    }
+    CoUninitialize();
+    return 0;
 }
 
 static HRESULT WINAPI SAO_QueryInterface(ISpatialAudioObject *iface,
@@ -382,6 +453,8 @@ static HRESULT WINAPI SAO_GetBuffer(ISpatialAudioObject *iface,
         BYTE **buffer, UINT32 *bytes)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
+    BOOL notify;
+    HRESULT hr = S_OK;
 
     TRACE("(%p)->(%p, %p)\n", This, buffer, bytes);
 
@@ -390,64 +463,67 @@ static HRESULT WINAPI SAO_GetBuffer(ISpatialAudioObject *iface,
 
     EnterCriticalSection(&This->sa_stream->lock);
 
-    if (This->sa_stream->update_frames == ~0)
+    notify = poll_stream_invalidation_locked(This->sa_stream);
+    if (FAILED(This->sa_stream->invalidation_hr))
+        hr = This->sa_stream->invalidation_hr;
+    else if (This->sa_stream->update_frames == ~0)
+        hr = SPTLAUDCLNT_E_OUT_OF_ORDER;
+    else if (!This->active)
+        hr = SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    else
     {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_OUT_OF_ORDER;
+        *buffer = (BYTE *)This->buf;
+        *bytes = This->sa_stream->update_frames *
+            This->sa_stream->sa_client->object_fmtex.Format.nBlockAlign;
+        This->got_buffer = TRUE;
+        This->started = TRUE;
     }
-    if (!This->active)
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
-    }
-
-    *buffer = (BYTE *)This->buf;
-    *bytes = This->sa_stream->update_frames *
-        This->sa_stream->sa_client->object_fmtex.Format.nBlockAlign;
-    This->got_buffer = TRUE;
-    This->started = TRUE;
 
     LeaveCriticalSection(&This->sa_stream->lock);
+    if (notify)
+        notify_dynamic_capacity_lost(This->sa_stream);
 
-    return S_OK;
+    return hr;
 }
 
 static HRESULT WINAPI SAO_SetEndOfStream(ISpatialAudioObject *iface, UINT32 frames)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
+    BOOL notify;
+    HRESULT hr = S_OK;
 
     TRACE("(%p)->(%u)\n", This, frames);
 
     EnterCriticalSection(&This->sa_stream->lock);
 
-    if (This->sa_stream->update_frames == ~0)
+    notify = poll_stream_invalidation_locked(This->sa_stream);
+    if (FAILED(This->sa_stream->invalidation_hr))
+        hr = This->sa_stream->invalidation_hr;
+    else if (This->sa_stream->update_frames == ~0)
+        hr = SPTLAUDCLNT_E_OUT_OF_ORDER;
+    else if (!This->active)
+        hr = SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    else if (frames > This->sa_stream->update_frames)
+        hr = E_INVALIDARG;
+    else
     {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_OUT_OF_ORDER;
+        This->got_buffer = TRUE;
+        This->started = TRUE;
+        This->end_of_stream = TRUE;
+        This->end_of_stream_frames = frames;
+        This->active = FALSE;
     }
-    if (!This->active)
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
-    }
-    if (frames > This->sa_stream->update_frames)
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return E_INVALIDARG;
-    }
-    This->got_buffer = TRUE;
-    This->started = TRUE;
-    This->end_of_stream = TRUE;
-    This->end_of_stream_frames = frames;
-    This->active = FALSE;
 
     LeaveCriticalSection(&This->sa_stream->lock);
-    return S_OK;
+    if (notify)
+        notify_dynamic_capacity_lost(This->sa_stream);
+    return hr;
 }
 
 static HRESULT WINAPI SAO_IsActive(ISpatialAudioObject *iface, BOOL *active)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
+    BOOL notify;
 
     TRACE("(%p)->(%p)\n", This, active);
 
@@ -455,8 +531,11 @@ static HRESULT WINAPI SAO_IsActive(ISpatialAudioObject *iface, BOOL *active)
         return E_POINTER;
 
     EnterCriticalSection(&This->sa_stream->lock);
+    notify = poll_stream_invalidation_locked(This->sa_stream);
     *active = This->active;
     LeaveCriticalSection(&This->sa_stream->lock);
+    if (notify)
+        notify_dynamic_capacity_lost(This->sa_stream);
 
     return S_OK;
 }
@@ -480,66 +559,61 @@ static HRESULT WINAPI SAO_SetPosition(ISpatialAudioObject *iface, float x,
         float y, float z)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
+    BOOL notify;
+    HRESULT hr = S_OK;
 
     TRACE("(%p)->(%f, %f, %f)\n", This, x, y, z);
 
     EnterCriticalSection(&This->sa_stream->lock);
-    if (This->sa_stream->update_frames == ~0)
+    notify = poll_stream_invalidation_locked(This->sa_stream);
+    if (FAILED(This->sa_stream->invalidation_hr))
+        hr = This->sa_stream->invalidation_hr;
+    else if (This->sa_stream->update_frames == ~0)
+        hr = SPTLAUDCLNT_E_OUT_OF_ORDER;
+    else if (!This->active)
+        hr = SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    else if (This->type != AudioObjectType_Dynamic)
+        hr = SPTLAUDCLNT_E_PROPERTY_NOT_SUPPORTED;
+    else if (!isfinite(x) || !isfinite(y) || !isfinite(z))
+        hr = E_INVALIDARG;
+    else
     {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_OUT_OF_ORDER;
+        This->x = x;
+        This->y = y;
+        This->z = z;
     }
-    if (!This->active)
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
-    }
-    if (This->type != AudioObjectType_Dynamic)
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_PROPERTY_NOT_SUPPORTED;
-    }
-    if (!isfinite(x) || !isfinite(y) || !isfinite(z))
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return E_INVALIDARG;
-    }
-
-    This->x = x;
-    This->y = y;
-    This->z = z;
     LeaveCriticalSection(&This->sa_stream->lock);
+    if (notify)
+        notify_dynamic_capacity_lost(This->sa_stream);
 
-    return S_OK;
+    return hr;
 }
 
 static HRESULT WINAPI SAO_SetVolume(ISpatialAudioObject *iface, float vol)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
+    BOOL notify;
+    HRESULT hr = S_OK;
 
     TRACE("(%p)->(%f)\n", This, vol);
 
     EnterCriticalSection(&This->sa_stream->lock);
-    if (This->sa_stream->update_frames == ~0)
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_OUT_OF_ORDER;
-    }
-    if (!This->active)
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
-    }
-    if (!(vol >= 0.0f && vol <= 1.0f))
-    {
-        LeaveCriticalSection(&This->sa_stream->lock);
-        return E_INVALIDARG;
-    }
-
-    This->volume = vol;
+    notify = poll_stream_invalidation_locked(This->sa_stream);
+    if (FAILED(This->sa_stream->invalidation_hr))
+        hr = This->sa_stream->invalidation_hr;
+    else if (This->sa_stream->update_frames == ~0)
+        hr = SPTLAUDCLNT_E_OUT_OF_ORDER;
+    else if (!This->active)
+        hr = SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    else if (!(vol >= 0.0f && vol <= 1.0f))
+        hr = E_INVALIDARG;
+    else
+        This->volume = vol;
     LeaveCriticalSection(&This->sa_stream->lock);
+    if (notify)
+        notify_dynamic_capacity_lost(This->sa_stream);
 
-    return S_OK;
+    return hr;
 }
 
 static ISpatialAudioObjectVtbl ISpatialAudioObject_vtbl = {
@@ -596,6 +670,15 @@ static ULONG WINAPI SAORS_Release(ISpatialAudioObjectRenderStream *iface)
     TRACE("(%p) new ref %lu\n", This, ref);
     if (!ref)
     {
+        if (This->invalidation_thread)
+        {
+            InterlockedExchange(&This->invalidation_thread_quit, 1);
+            SetEvent(This->invalidation_start_event);
+            SetEvent(This->invalidation_event);
+            if (GetCurrentThreadId() != This->invalidation_thread_id)
+                WaitForSingleObject(This->invalidation_thread, INFINITE);
+            CloseHandle(This->invalidation_thread);
+        }
         IAudioClient_Stop(This->client);
         if (This->update_frames != ~0u && This->update_frames > 0)
         {
@@ -607,6 +690,12 @@ static ULONG WINAPI SAORS_Release(ISpatialAudioObjectRenderStream *iface)
         }
         IAudioRenderClient_Release(This->render);
         IAudioClient_Release(This->client);
+        if (This->invalidation_event)
+            CloseHandle(This->invalidation_event);
+        if (This->invalidation_ready_event)
+            CloseHandle(This->invalidation_ready_event);
+        if (This->invalidation_start_event)
+            CloseHandle(This->invalidation_start_event);
         if (This->params.NotifyObject)
             ISpatialAudioObjectRenderStreamNotify_Release(This->params.NotifyObject);
 
@@ -635,18 +724,24 @@ static HRESULT WINAPI SAORS_GetAvailableDynamicObjectCount(
         ISpatialAudioObjectRenderStream *iface, UINT32 *count)
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
+    BOOL notify;
+    HRESULT hr;
+
     TRACE("(%p)->(%p)\n", This, count);
 
     if (!count)
         return E_POINTER;
 
     EnterCriticalSection(&This->lock);
+    notify = poll_stream_invalidation_locked(This);
     if (FAILED(This->invalidation_hr))
     {
-        HRESULT hr = This->invalidation_hr;
+        hr = This->invalidation_hr;
 
         *count = 0;
         LeaveCriticalSection(&This->lock);
+        if (notify)
+            notify_dynamic_capacity_lost(This);
         return hr;
     }
     assert(This->allocated_dynamic_objects <= This->max_dynamic_objects);
@@ -671,38 +766,105 @@ static HRESULT WINAPI SAORS_GetService(ISpatialAudioObjectRenderStream *iface,
 static HRESULT WINAPI SAORS_Start(ISpatialAudioObjectRenderStream *iface)
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
+    BOOL notify;
     HRESULT hr;
 
     TRACE("(%p)->()\n", This);
 
+    SAORS_AddRef(iface);
     EnterCriticalSection(&This->lock);
+    notify = poll_stream_invalidation_locked(This);
     hr = This->invalidation_hr;
-    LeaveCriticalSection(&This->lock);
     if (FAILED(hr))
-        return hr;
-
-    hr = IAudioClient_Start(This->client);
-    if (hr == AUDCLNT_E_NOT_STOPPED)
-        return SPTLAUDCLNT_E_STREAM_NOT_STOPPED;
-    if(FAILED(hr)){
-        WARN("IAudioClient::Start failed: %08lx\n", hr);
-        revoke_stream_objects(This, hr);
+    {
+        /* A Start attempt is the publication boundary for endpoint loss that
+         * was recorded before playback could begin. */
+        This->invalidation_armed = TRUE;
+        notify |= revoke_stream_objects_locked(This, hr, TRUE);
+    }
+    LeaveCriticalSection(&This->lock);
+    if (notify)
+        notify_dynamic_capacity_lost(This);
+    if (FAILED(hr))
+    {
+        SAORS_Release(iface);
         return hr;
     }
 
+    hr = IAudioClient_Start(This->client);
+    if (hr == AUDCLNT_E_NOT_STOPPED)
+    {
+        SAORS_Release(iface);
+        return SPTLAUDCLNT_E_STREAM_NOT_STOPPED;
+    }
+    if(FAILED(hr)){
+        WARN("IAudioClient::Start failed: %08lx\n", hr);
+        if (is_endpoint_resource_loss(hr))
+        {
+            /* A backend can observe the sticky loss before its event relay
+             * runs.  Treat that resource failure as the same Start boundary
+             * as a pre-polled event, while leaving unrelated Start failures
+             * unarmed. */
+            EnterCriticalSection(&This->lock);
+            This->invalidation_armed = TRUE;
+            notify = revoke_stream_objects_locked(This, hr, TRUE);
+            LeaveCriticalSection(&This->lock);
+            if (notify)
+                notify_dynamic_capacity_lost(This);
+        }
+        SAORS_Release(iface);
+        return hr;
+    }
+
+    /* Do not expose callbacks while IAudioClient::Start is in progress.  A
+     * concurrent public call may record the event, but only this successful
+     * Start publishes the armed state and turns that record into a callback. */
+    EnterCriticalSection(&This->lock);
+    notify = poll_stream_invalidation_locked(This);
+    This->invalidation_armed = TRUE;
+    hr = This->invalidation_hr;
+    if (FAILED(hr))
+        notify |= revoke_stream_objects_locked(This, hr, TRUE);
+    LeaveCriticalSection(&This->lock);
+    if (notify)
+        notify_dynamic_capacity_lost(This);
+    if (FAILED(hr))
+    {
+        IAudioClient_Stop(This->client);
+        SAORS_Release(iface);
+        return hr;
+    }
+
+    /* Keep application callbacks impossible until activation has returned a
+     * fully published interface.  The listener may have already signaled the
+     * auto-reset event; arming here preserves that pending endpoint loss. */
+    if (This->invalidation_start_event && !SetEvent(This->invalidation_start_event))
+    {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        IAudioClient_Stop(This->client);
+        revoke_stream_objects(This, SPTLAUDCLNT_E_RESOURCES_INVALIDATED);
+        SAORS_Release(iface);
+        return hr;
+    }
+
+    SAORS_Release(iface);
     return S_OK;
 }
 
 static HRESULT WINAPI SAORS_Stop(ISpatialAudioObjectRenderStream *iface)
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
+    BOOL notify;
     HRESULT hr;
 
     TRACE("(%p)->()\n", This);
 
     EnterCriticalSection(&This->lock);
+    notify = poll_stream_invalidation_locked(This);
     hr = This->invalidation_hr;
     LeaveCriticalSection(&This->lock);
+    if (notify)
+        notify_dynamic_capacity_lost(This);
     if (FAILED(hr))
         return hr;
 
@@ -725,8 +887,11 @@ static HRESULT WINAPI SAORS_Reset(ISpatialAudioObjectRenderStream *iface)
     TRACE("(%p)->()\n", This);
 
     EnterCriticalSection(&This->lock);
+    notify = poll_stream_invalidation_locked(This);
     hr = This->invalidation_hr;
     LeaveCriticalSection(&This->lock);
+    if (notify)
+        notify_dynamic_capacity_lost(This);
     if (FAILED(hr))
         return hr;
 
@@ -736,7 +901,7 @@ static HRESULT WINAPI SAORS_Reset(ISpatialAudioObjectRenderStream *iface)
     if (SUCCEEDED(hr) || is_endpoint_resource_loss(hr))
     {
         EnterCriticalSection(&This->lock);
-        notify = revoke_stream_objects_locked(This, hr);
+        notify = revoke_stream_objects_locked(This, hr, TRUE);
         LeaveCriticalSection(&This->lock);
     }
     if (notify)
@@ -760,8 +925,12 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
 
     EnterCriticalSection(&This->lock);
 
+    notify = poll_stream_invalidation_locked(This);
+
     if(This->update_frames != ~0){
         LeaveCriticalSection(&This->lock);
+        if (notify)
+            notify_dynamic_capacity_lost(This);
         return SPTLAUDCLNT_E_OUT_OF_ORDER;
     }
     if (FAILED(This->invalidation_hr))
@@ -770,6 +939,8 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
         *dyn_count = 0;
         *frames = 0;
         LeaveCriticalSection(&This->lock);
+        if (notify)
+            notify_dynamic_capacity_lost(This);
         return hr;
     }
 
@@ -781,7 +952,7 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
             WARN("GetBuffer failed: %08lx\n", hr);
             This->update_frames = ~0;
             if (is_endpoint_resource_loss(hr))
-                notify = revoke_stream_objects_locked(This, hr);
+                notify = revoke_stream_objects_locked(This, hr, TRUE);
             LeaveCriticalSection(&This->lock);
             if (notify)
                 notify_dynamic_capacity_lost(This);
@@ -897,8 +1068,12 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
 
     EnterCriticalSection(&This->lock);
 
+    notify = poll_stream_invalidation_locked(This);
+
     if(This->update_frames == ~0){
         LeaveCriticalSection(&This->lock);
+        if (notify)
+            notify_dynamic_capacity_lost(This);
         return SPTLAUDCLNT_E_OUT_OF_ORDER;
     }
 
@@ -945,7 +1120,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
         {
             WARN("ReleaseBuffer failed: %08lx\n", hr);
             if (is_endpoint_resource_loss(hr))
-                notify = revoke_stream_objects_locked(This, hr);
+                notify |= revoke_stream_objects_locked(This, hr, TRUE);
         }
     }
     else
@@ -991,6 +1166,7 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
     SpatialAudioObjectImpl *obj, *existing;
+    BOOL notify;
     UINT32 slot;
 
     TRACE("(%p)->(0x%x, %p)\n", This, type, object);
@@ -1026,6 +1202,7 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
 
     EnterCriticalSection(&This->lock);
 
+    notify = poll_stream_invalidation_locked(This);
     if (FAILED(This->invalidation_hr))
     {
         HRESULT hr = This->invalidation_hr;
@@ -1033,6 +1210,8 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
         LeaveCriticalSection(&This->lock);
         free(obj->buf);
         free(obj);
+        if (notify)
+            notify_dynamic_capacity_lost(This);
         return hr;
     }
 
@@ -1336,9 +1515,10 @@ static HRESULT static_mask_to_channels(AudioObjectType static_mask, WORD *count,
 static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
 {
     WAVEFORMATEXTENSIBLE *object_fmtex = (WAVEFORMATEXTENSIBLE *)stream->params.ObjectFormat;
+    WCHAR profile[2];
     UINT64 value;
     HRESULT hr;
-    REFERENCE_TIME period;
+    REFERENCE_TIME latency, period;
 
     if(!(object_fmtex->Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
                 (object_fmtex->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
@@ -1427,7 +1607,9 @@ static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
             period, 0, &stream->stream_fmtex.Format, NULL,
             stream->params.StaticObjectTypeMask, stream->max_dynamic_objects,
-            stream->capabilities.endpoint_generation);
+            stream->capabilities.endpoint_generation,
+            stream->invalidation_event,
+            stream->fault_invalidate_on_start);
     if(FAILED(hr)){
         WARN("Initialize failed: %08lx\n", hr);
         IAudioClient_Release(stream->client);
@@ -1447,6 +1629,13 @@ static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
         IAudioClient_Release(stream->client);
         return hr;
     }
+
+    if (GetEnvironmentVariableW(L"SWITCHYARD_SPATIAL_AUDIO_PROFILE",
+            profile, ARRAY_SIZE(profile)) &&
+            SUCCEEDED(IAudioClient_GetStreamLatency(stream->client, &latency)))
+        TRACE("Spatial stream latency %s (period %s, %u frames).\n",
+                wine_dbgstr_longlong(latency), wine_dbgstr_longlong(period),
+                stream->period_frames);
 
     return S_OK;
 }
@@ -1570,6 +1759,46 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             return HRESULT_FROM_WIN32(GetLastError());
         }
 
+        if (dynamic_count)
+        {
+            WCHAR fault[2];
+
+            obj->invalidation_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+            if (obj->params.NotifyObject)
+            {
+                obj->invalidation_ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+                obj->invalidation_start_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+            }
+            if (!obj->invalidation_event || (obj->params.NotifyObject &&
+                    (!obj->invalidation_ready_event ||
+                     !obj->invalidation_start_event)))
+            {
+                hr = HRESULT_FROM_WIN32(GetLastError());
+                if (obj->invalidation_start_event)
+                    CloseHandle(obj->invalidation_start_event);
+                if (obj->invalidation_ready_event)
+                    CloseHandle(obj->invalidation_ready_event);
+                if (obj->invalidation_event)
+                    CloseHandle(obj->invalidation_event);
+                DeleteCriticalSection(&obj->lock);
+                free((void *)obj->params.ObjectFormat);
+                free(obj->dynamic_states);
+                free(obj->dynamic_slots);
+                CloseHandle(obj->params.EventHandle);
+                ISpatialAudioClient_Release(&obj->sa_client->ISpatialAudioClient_iface);
+                free(obj);
+                return hr;
+            }
+            if (GetEnvironmentVariableW(
+                    L"SWITCHYARD_SPATIAL_AUDIO_FAULT_INVALIDATE_ON_START",
+                    fault, ARRAY_SIZE(fault)) == 1 && fault[0] == '1')
+                obj->fault_invalidate_on_start = 1;
+            if (GetEnvironmentVariableW(
+                    L"SWITCHYARD_SPATIAL_AUDIO_FAULT_INVALIDATE_BEFORE_START",
+                    fault, ARRAY_SIZE(fault)) == 1 && fault[0] == '1')
+                obj->fault_invalidate_before_start = 1;
+        }
+
         if(obj->params.NotifyObject)
             ISpatialAudioObjectRenderStreamNotify_AddRef(obj->params.NotifyObject);
 
@@ -1591,13 +1820,47 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             free((void*)obj->params.ObjectFormat);
             free(obj->dynamic_states);
             free(obj->dynamic_slots);
+            if (obj->invalidation_event)
+                CloseHandle(obj->invalidation_event);
+            if (obj->invalidation_ready_event)
+                CloseHandle(obj->invalidation_ready_event);
+            if (obj->invalidation_start_event)
+                CloseHandle(obj->invalidation_start_event);
             CloseHandle(obj->params.EventHandle);
             ISpatialAudioClient_Release(&obj->sa_client->ISpatialAudioClient_iface);
             free(obj);
             return hr;
         }
 
+        if (obj->invalidation_start_event)
+        {
+            obj->invalidation_thread = CreateThread(NULL, 0,
+                    spatial_invalidation_thread, obj, 0,
+                    &obj->invalidation_thread_id);
+            if (!obj->invalidation_thread)
+            {
+                hr = HRESULT_FROM_WIN32(GetLastError());
+                SAORS_Release(&obj->ISpatialAudioObjectRenderStream_iface);
+                return hr;
+            }
+            if (WaitForSingleObject(obj->invalidation_ready_event, INFINITE) !=
+                    WAIT_OBJECT_0 || FAILED(obj->invalidation_thread_hr))
+            {
+                hr = FAILED(obj->invalidation_thread_hr) ?
+                        obj->invalidation_thread_hr : E_UNEXPECTED;
+                SAORS_Release(&obj->ISpatialAudioObjectRenderStream_iface);
+                return hr;
+            }
+        }
+        if (obj->invalidation_event &&
+                WaitForSingleObject(obj->invalidation_event, 0) == WAIT_OBJECT_0)
+        {
+            SAORS_Release(&obj->ISpatialAudioObjectRenderStream_iface);
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
         *stream = &obj->ISpatialAudioObjectRenderStream_iface;
+        if (obj->fault_invalidate_before_start)
+            SetEvent(obj->invalidation_event);
     }else{
         FIXME("Unsupported audio stream IID: %s\n", debugstr_guid(riid));
         return E_NOTIMPL;

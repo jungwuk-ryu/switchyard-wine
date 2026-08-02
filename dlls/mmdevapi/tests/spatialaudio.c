@@ -177,6 +177,13 @@ typedef struct NotifyObject
 {
     ISpatialAudioObjectRenderStreamNotify ISpatialAudioObjectRenderStreamNotify_iface;
     LONG ref;
+    LONG calls;
+    BOOL expect_notification;
+    BOOL reenter_stream;
+    BOOL release_stream;
+    HANDLE callback_event;
+    LONGLONG deadline;
+    UINT32 object_count;
 } NotifyObject;
 
 static WINAPI HRESULT notifyobj_QueryInterface(
@@ -184,6 +191,14 @@ static WINAPI HRESULT notifyobj_QueryInterface(
         REFIID riid,
         void **ppvObject)
 {
+    if (!ppvObject)
+        return E_POINTER;
+    *ppvObject = NULL;
+    if (!IsEqualIID(riid, &IID_IUnknown) &&
+            !IsEqualIID(riid, &IID_ISpatialAudioObjectRenderStreamNotify))
+        return E_NOINTERFACE;
+    *ppvObject = This;
+    ISpatialAudioObjectRenderStreamNotify_AddRef(This);
     return S_OK;
 }
 
@@ -209,8 +224,72 @@ static WINAPI HRESULT notifyobj_OnAvailableDynamicObjectCountChange(
         LONGLONG deadline,
         UINT32 object_count)
 {
-    ok(FALSE, "Expected to never be notified of dynamic object count change\n");
+    NotifyObject *obj = CONTAINING_RECORD(This, NotifyObject,
+            ISpatialAudioObjectRenderStreamNotify_iface);
+
+    if (!obj->expect_notification)
+        ok(FALSE, "Expected to never be notified of dynamic object count change\n");
+    obj->deadline = deadline;
+    obj->object_count = object_count;
+    InterlockedIncrement(&obj->calls);
+    if (obj->release_stream)
+        IUnknown_Release((IUnknown *)stream);
+    else if (obj->reenter_stream)
+    {
+        IUnknown_AddRef((IUnknown *)stream);
+        IUnknown_Release((IUnknown *)stream);
+    }
+    if (obj->callback_event)
+        SetEvent(obj->callback_event);
     return S_OK;
+}
+
+static HRESULT activate_fault_stream(const char *fault_name, NotifyObject *notify,
+        ISpatialAudioObjectRenderStream **stream)
+{
+    SpatialAudioObjectRenderStreamActivationParams params;
+    PROPVARIANT prop;
+    char *old_fault = NULL;
+    DWORD old_fault_len;
+    BOOL had_old_fault;
+    HRESULT hr;
+
+    *stream = NULL;
+    SetLastError(ERROR_SUCCESS);
+    old_fault_len = GetEnvironmentVariableA(fault_name, NULL, 0);
+    had_old_fault = old_fault_len || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+    if (old_fault_len)
+    {
+        old_fault = malloc(old_fault_len);
+        if (!old_fault)
+            return E_OUTOFMEMORY;
+        GetEnvironmentVariableA(fault_name, old_fault, old_fault_len);
+    }
+    if (!SetEnvironmentVariableA(fault_name, "1"))
+    {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        free(old_fault);
+        return hr;
+    }
+
+    fill_activation_params(&params);
+    params.StaticObjectTypeMask = AudioObjectType_None;
+    params.MinDynamicObjectCount = 1;
+    params.MaxDynamicObjectCount = 1;
+    params.NotifyObject = &notify->ISpatialAudioObjectRenderStreamNotify_iface;
+    PropVariantInit(&prop);
+    prop.vt = VT_BLOB;
+    prop.blob.cbSize = sizeof(params);
+    prop.blob.pBlobData = (BYTE *)&params;
+
+    hr = ISpatialAudioClient_ActivateSpatialAudioStream(sac, &prop,
+            &IID_ISpatialAudioObjectRenderStream, (void **)stream);
+    if (had_old_fault)
+        SetEnvironmentVariableA(fault_name, old_fault ? old_fault : "");
+    else
+        SetEnvironmentVariableA(fault_name, NULL);
+    free(old_fault);
+    return hr;
 }
 
 static const ISpatialAudioObjectRenderStreamNotifyVtbl notifyobjvtbl =
@@ -356,8 +435,9 @@ static void test_stream_activation(void)
 
     /* ISpatialAudioObjectRenderStreamNotify */
     fill_activation_params(&activation_params);
+    memset(&notify_object, 0, sizeof(notify_object));
     notify_object.ISpatialAudioObjectRenderStreamNotify_iface.lpVtbl = &notifyobjvtbl;
-    notify_object.ref = 0;
+    activation_params.MaxDynamicObjectCount = max_dyn_count ? 1 : 0;
     activation_params.NotifyObject = &notify_object.ISpatialAudioObjectRenderStreamNotify_iface;
     if (spatial_stream_supported)
     {
@@ -372,6 +452,225 @@ static void test_stream_activation(void)
             ok(notify_object.ref == 0, "Expected to get lowered NotifyObject's ref count\n");
         }
     }
+}
+
+static void test_proactive_invalidation(void)
+{
+    static const char fault_name[] =
+            "SWITCHYARD_SPATIAL_AUDIO_FAULT_INVALIDATE_ON_START";
+    ISpatialAudioObjectRenderStream *stream = NULL;
+    ISpatialAudioObject *object = NULL;
+    NotifyObject notify;
+    BYTE *buffer = NULL;
+    UINT32 available = ~0u;
+    UINT32 bytes = ~0u;
+    BOOL active = TRUE;
+    DWORD wait;
+    HRESULT hr;
+
+    if (!spatial_stream_supported || !max_dyn_count)
+    {
+        win_skip("Dynamic endpoint-loss notification is unavailable.\n");
+        return;
+    }
+
+    memset(&notify, 0, sizeof(notify));
+    notify.ISpatialAudioObjectRenderStreamNotify_iface.lpVtbl = &notifyobjvtbl;
+    notify.expect_notification = TRUE;
+    notify.reenter_stream = TRUE;
+    notify.callback_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(!!notify.callback_event, "Failed to create the notification event: %lu.\n",
+            GetLastError());
+    if (!notify.callback_event)
+        return;
+
+    hr = activate_fault_stream(fault_name, &notify, &stream);
+    ok(hr == S_OK, "Failed to activate the fault-injection stream: %#lx.\n", hr);
+    if (hr != S_OK || !stream)
+        goto done;
+
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(stream,
+            AudioObjectType_Dynamic, &object);
+    ok(hr == S_OK && object, "Failed to activate the endpoint-loss object: %#lx/%p.\n",
+            hr, object);
+    if (hr != S_OK || !object)
+        goto done;
+
+    hr = ISpatialAudioObjectRenderStream_Start(stream);
+    ok(hr == S_OK || hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED ||
+            hr == AUDCLNT_E_DEVICE_INVALIDATED ||
+            hr == AUDCLNT_E_RESOURCES_INVALIDATED,
+            "Unexpected fault-injection Start result: %#lx.\n", hr);
+    wait = WaitForSingleObject(notify.callback_event, 5000);
+    ok(wait == WAIT_OBJECT_0, "Timed out waiting for proactive notification: %#lx.\n",
+            wait);
+    if (wait == WAIT_OBJECT_0)
+    {
+        ok(notify.calls == 1, "Expected one notification, got %ld.\n", notify.calls);
+        ok(!notify.deadline, "Expected a zero deadline, got %s.\n",
+                wine_dbgstr_longlong(notify.deadline));
+        ok(!notify.object_count, "Expected zero available objects, got %u.\n",
+                notify.object_count);
+        hr = ISpatialAudioObject_IsActive(object, &active);
+        ok(hr == S_OK && !active,
+                "Expected the endpoint-loss object to be inactive, got %#lx/%d.\n",
+                hr, active);
+        hr = ISpatialAudioObject_SetPosition(object, 1.0f, 0.0f, -1.0f);
+        ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED,
+                "Expected invalidated position state, got %#lx.\n", hr);
+        hr = ISpatialAudioObject_GetBuffer(object, &buffer, &bytes);
+        ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED,
+                "Expected invalidated object buffer, got %#lx.\n", hr);
+        hr = ISpatialAudioObjectRenderStream_GetAvailableDynamicObjectCount(stream,
+                &available);
+        ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED && !available,
+                "Expected invalidated resources and zero objects, got %#lx/%u.\n",
+                hr, available);
+        wait = WaitForSingleObject(notify.callback_event, 100);
+        ok(wait == WAIT_TIMEOUT, "Expected a one-shot notification, got %#lx.\n", wait);
+    }
+
+    ISpatialAudioObject_Release(object);
+    object = NULL;
+    ISpatialAudioObjectRenderStream_Release(stream);
+    stream = NULL;
+    for (wait = 0; wait < 100 &&
+            InterlockedCompareExchange(&notify.ref, 0, 0); ++wait)
+        Sleep(1);
+    ok(!InterlockedCompareExchange(&notify.ref, 0, 0),
+            "Notification reference was not released, got %ld.\n",
+            InterlockedCompareExchange(&notify.ref, 0, 0));
+
+done:
+    if (object)
+        ISpatialAudioObject_Release(object);
+    if (stream)
+        ISpatialAudioObjectRenderStream_Release(stream);
+    CloseHandle(notify.callback_event);
+}
+
+static void test_proactive_reentrant_release(void)
+{
+    static const char fault_name[] =
+            "SWITCHYARD_SPATIAL_AUDIO_FAULT_INVALIDATE_ON_START";
+    ISpatialAudioObjectRenderStream *stream = NULL;
+    NotifyObject notify;
+    DWORD wait;
+    HRESULT hr;
+
+    if (!spatial_stream_supported || !max_dyn_count)
+    {
+        win_skip("Dynamic endpoint-loss notification is unavailable.\n");
+        return;
+    }
+
+    memset(&notify, 0, sizeof(notify));
+    notify.ISpatialAudioObjectRenderStreamNotify_iface.lpVtbl = &notifyobjvtbl;
+    notify.expect_notification = TRUE;
+    notify.release_stream = TRUE;
+    notify.callback_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(!!notify.callback_event, "Failed to create the notification event: %lu.\n",
+            GetLastError());
+    if (!notify.callback_event)
+        return;
+
+    hr = activate_fault_stream(fault_name, &notify, &stream);
+    ok(hr == S_OK, "Failed to activate the reentrant-release stream: %#lx.\n", hr);
+    if (hr != S_OK || !stream)
+        goto done;
+
+    hr = ISpatialAudioObjectRenderStream_Start(stream);
+    ok(hr == S_OK || hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED ||
+            hr == AUDCLNT_E_DEVICE_INVALIDATED ||
+            hr == AUDCLNT_E_RESOURCES_INVALIDATED,
+            "Unexpected reentrant-release Start result: %#lx.\n", hr);
+    wait = WaitForSingleObject(notify.callback_event, 5000);
+    ok(wait == WAIT_OBJECT_0,
+            "Timed out waiting for the reentrant-release notification: %#lx.\n",
+            wait);
+    if (wait == WAIT_OBJECT_0)
+    {
+        stream = NULL; /* The callback released the application's reference. */
+        ok(notify.calls == 1, "Expected one notification, got %ld.\n", notify.calls);
+    }
+
+done:
+    if (stream)
+        ISpatialAudioObjectRenderStream_Release(stream);
+    for (wait = 0; wait < 100 &&
+            InterlockedCompareExchange(&notify.ref, 0, 0); ++wait)
+        Sleep(1);
+    ok(!InterlockedCompareExchange(&notify.ref, 0, 0),
+            "Notification reference was not released, got %ld.\n",
+            InterlockedCompareExchange(&notify.ref, 0, 0));
+    CloseHandle(notify.callback_event);
+}
+
+static void test_prestart_invalidation(void)
+{
+    static const char fault_name[] =
+            "SWITCHYARD_SPATIAL_AUDIO_FAULT_INVALIDATE_BEFORE_START";
+    ISpatialAudioObjectRenderStream *stream = NULL;
+    ISpatialAudioObject *object = NULL;
+    NotifyObject notify;
+    UINT32 available = ~0u;
+    DWORD wait;
+    HRESULT hr;
+
+    if (!spatial_stream_supported || !max_dyn_count)
+    {
+        win_skip("Dynamic endpoint-loss notification is unavailable.\n");
+        return;
+    }
+
+    memset(&notify, 0, sizeof(notify));
+    notify.ISpatialAudioObjectRenderStreamNotify_iface.lpVtbl = &notifyobjvtbl;
+    notify.expect_notification = TRUE;
+    notify.callback_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(!!notify.callback_event, "Failed to create the notification event: %lu.\n",
+            GetLastError());
+    if (!notify.callback_event)
+        return;
+
+    hr = activate_fault_stream(fault_name, &notify, &stream);
+    ok(hr == S_OK, "Failed to activate the pre-start fault stream: %#lx.\n", hr);
+    if (hr != S_OK || !stream)
+        goto done;
+
+    hr = ISpatialAudioObjectRenderStream_GetAvailableDynamicObjectCount(stream,
+            &available);
+    ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED && !available,
+            "Expected pre-start invalidation and zero objects, got %#lx/%u.\n",
+            hr, available);
+    ok(!notify.calls, "Notification escaped before Start, got %ld calls.\n",
+            notify.calls);
+    hr = ISpatialAudioObjectRenderStream_ActivateSpatialAudioObject(stream,
+            AudioObjectType_Dynamic, &object);
+    ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED && !object,
+            "Expected object activation to observe endpoint loss, got %#lx/%p.\n",
+            hr, object);
+
+    hr = ISpatialAudioObjectRenderStream_Start(stream);
+    ok(hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED,
+            "Expected Start to report endpoint loss, got %#lx.\n", hr);
+    wait = WaitForSingleObject(notify.callback_event, 5000);
+    ok(wait == WAIT_OBJECT_0,
+            "Timed out waiting for the armed pre-start notification: %#lx.\n",
+            wait);
+    ok(notify.calls == 1, "Expected one notification, got %ld.\n", notify.calls);
+
+done:
+    if (object)
+        ISpatialAudioObject_Release(object);
+    if (stream)
+        ISpatialAudioObjectRenderStream_Release(stream);
+    for (wait = 0; wait < 100 &&
+            InterlockedCompareExchange(&notify.ref, 0, 0); ++wait)
+        Sleep(1);
+    ok(!InterlockedCompareExchange(&notify.ref, 0, 0),
+            "Notification reference was not released, got %ld.\n",
+            InterlockedCompareExchange(&notify.ref, 0, 0));
+    CloseHandle(notify.callback_event);
 }
 
 static void test_audio_object_activation(void)
@@ -766,7 +1065,7 @@ static void test_dynamic_audio_objects(void)
     ISpatialAudioObjectRenderStream *sas = NULL;
     ISpatialAudioObject **objects, *replacement = NULL, *excess = NULL;
     PROPVARIANT activation_params_prop;
-    UINT32 available, frames, bytes, limit, i, j;
+    UINT32 available, frames, bytes, limit, i, j, iteration;
     BOOL active;
     BYTE *buffer;
     HRESULT hr;
@@ -881,6 +1180,42 @@ static void test_dynamic_audio_objects(void)
 
     hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
     ok(hr == S_OK, "Failed to submit dynamic update: %#lx.\n", hr);
+
+    /* Keep the maximum-object graph busy long enough to exercise cursor and
+     * metadata wraparound and to provide a useful callback percentile sample.
+     * The ended slot stays retained but is not rendered. */
+    for (iteration = 0; iteration < 64; ++iteration)
+    {
+        hr = WaitForSingleObject(event, 500);
+        ok(hr == WAIT_OBJECT_0, "Timed out waiting for steady update %u: %#lx.\n",
+                iteration, hr);
+        if (hr != WAIT_OBJECT_0)
+            goto cleanup;
+        hr = ISpatialAudioObjectRenderStream_BeginUpdatingAudioObjects(sas,
+                &available, &frames);
+        ok(hr == S_OK, "Failed to begin steady update %u: %#lx.\n", iteration, hr);
+        if (hr != S_OK)
+            goto cleanup;
+        for (i = 0; i < limit; ++i)
+        {
+            if (i == 1 && limit > 1)
+                continue;
+            hr = ISpatialAudioObject_GetBuffer(objects[i], &buffer, &bytes);
+            ok(hr == S_OK, "Failed steady buffer %u/%u: %#lx.\n", iteration, i, hr);
+            if (hr == S_OK)
+                for (j = 0; j < frames; ++j)
+                    ((float *)buffer)[j] = (float)(i + 1) / 32.0f;
+        }
+        hr = ISpatialAudioObject_SetPosition(objects[0],
+                (iteration & 1) ? -1.0f : 1.0f,
+                (float)(iteration % 5) * 0.1f, -2.0f);
+        ok(hr == S_OK, "Failed steady position %u: %#lx.\n", iteration, hr);
+        hr = ISpatialAudioObject_SetVolume(objects[0],
+                0.25f + (float)(iteration % 4) * 0.125f);
+        ok(hr == S_OK, "Failed steady volume %u: %#lx.\n", iteration, hr);
+        hr = ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(sas);
+        ok(hr == S_OK, "Failed to submit steady update %u: %#lx.\n", iteration, hr);
+    }
 
     hr = WaitForSingleObject(event, 500);
     ok(hr == WAIT_OBJECT_0, "Timed out waiting for a second dynamic update: %#lx.\n", hr);
@@ -1069,6 +1404,9 @@ START_TEST(spatialaudio)
     test_stream_activation();
     test_audio_object_activation();
     test_audio_object_buffers();
+    test_proactive_invalidation();
+    test_proactive_reentrant_release();
+    test_prestart_invalidation();
     test_dynamic_audio_objects();
 
     ISpatialAudioClient_Release(sac);

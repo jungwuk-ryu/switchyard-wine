@@ -122,7 +122,8 @@ extern HRESULT AudioClient_Create(GUID *guid, IMMDevice *device, IAudioClient **
 extern HRESULT audio_client_initialize_spatial(IAudioClient *client, DWORD flags,
         REFERENCE_TIME duration, REFERENCE_TIME period, const WAVEFORMATEX *format,
         const GUID *session_guid, AudioObjectType static_object_mask,
-        UINT32 dynamic_object_count, UINT32 endpoint_generation);
+        UINT32 dynamic_object_count, UINT32 endpoint_generation,
+        HANDLE invalidation_event, BOOL fault_invalidate_on_start);
 extern HRESULT audio_client_get_spatial_audio_capabilities(IMMDevice *device,
         struct spatial_audio_capabilities *capabilities);
 extern HRESULT audio_client_release_spatial_buffer(IAudioClient *client,

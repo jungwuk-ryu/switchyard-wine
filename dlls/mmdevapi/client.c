@@ -377,7 +377,9 @@ static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_
                            const WAVEFORMATEX *fmt, const GUID *sessionguid,
                            BOOL spatial, UINT32 spatial_static_mask,
                            UINT32 spatial_dynamic_objects,
-                           UINT32 spatial_endpoint_generation)
+                           UINT32 spatial_endpoint_generation,
+                           HANDLE spatial_invalidation_event,
+                           BOOL spatial_fault_invalidate_on_start)
 {
     struct create_stream_params params;
     UINT32 i, channel_count;
@@ -494,6 +496,9 @@ static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_
     params.spatial_static_mask = spatial_static_mask;
     params.spatial_dynamic_objects = spatial_dynamic_objects;
     params.spatial_endpoint_generation = spatial_endpoint_generation;
+    params.spatial_invalidation_event = spatial_invalidation_event;
+    params.spatial_fault_invalidate_on_start =
+            spatial_fault_invalidate_on_start;
     params.duration      = duration;
     params.period        = period;
     params.fmt           = fmt;
@@ -729,7 +734,7 @@ static HRESULT WINAPI client_Initialize(IAudioClient3 *iface, AUDCLNT_SHAREMODE 
                                                debugstr_guid(sessionguid));
 
     return stream_init(This, TRUE, mode, flags, duration, period, fmt, sessionguid,
-            FALSE, 0, 0, 0);
+            FALSE, 0, 0, 0, NULL, FALSE);
 }
 
 static HRESULT WINAPI client_GetBufferSize(IAudioClient3 *iface, UINT32 *out)
@@ -1177,13 +1182,14 @@ static HRESULT WINAPI client_InitializeSharedAudioStream(IAudioClient3 *iface, D
     period = period_frames * (REFERENCE_TIME)10000000 / format->nSamplesPerSec;
 
     return stream_init(This, FALSE, AUDCLNT_SHAREMODE_SHARED, flags, 0, period, format,
-            session_guid, FALSE, 0, 0, 0);
+            session_guid, FALSE, 0, 0, 0, NULL, FALSE);
 }
 
 HRESULT audio_client_initialize_spatial(IAudioClient *iface, DWORD flags,
         REFERENCE_TIME duration, REFERENCE_TIME period, const WAVEFORMATEX *format,
         const GUID *session_guid, AudioObjectType static_object_mask,
-        UINT32 dynamic_object_count, UINT32 endpoint_generation)
+        UINT32 dynamic_object_count, UINT32 endpoint_generation,
+        HANDLE invalidation_event, BOOL fault_invalidate_on_start)
 {
     struct audio_client *client = impl_from_IAudioClient3((IAudioClient3 *)iface);
 
@@ -1192,7 +1198,8 @@ HRESULT audio_client_initialize_spatial(IAudioClient *iface, DWORD flags,
 
     return stream_init(client, TRUE, AUDCLNT_SHAREMODE_SHARED, flags, duration, period,
             format, session_guid, TRUE, static_object_mask, dynamic_object_count,
-            endpoint_generation);
+            endpoint_generation, invalidation_event,
+            fault_invalidate_on_start);
 }
 
 HRESULT audio_client_get_spatial_audio_capabilities(IMMDevice *iface,

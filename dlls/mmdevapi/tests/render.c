@@ -1322,11 +1322,13 @@ static void test_padding(void)
 {
     HRESULT hr;
     IAudioClient *ac;
+    IAudioClient3 *ac3;
     IAudioRenderClient *arc;
     WAVEFORMATEX *pwfx;
-    REFERENCE_TIME minp, defp;
+    REFERENCE_TIME minp, defp, engine_defp = 0;
     BYTE *buf, silence;
-    UINT32 psize, pad, written, i;
+    UINT32 psize, pad, written, i, default_frames, fundamental_frames,
+            min_frames, max_frames;
 
     hr = IMMDevice_Activate(dev, &IID_IAudioClient, CLSCTX_INPROC_SERVER,
             NULL, (void**)&ac);
@@ -1338,6 +1340,17 @@ static void test_padding(void)
     ok(hr == S_OK, "GetMixFormat failed: %08lx\n", hr);
     if(hr != S_OK)
         return;
+
+    hr = IAudioClient_QueryInterface(ac, &IID_IAudioClient3, (void **)&ac3);
+    if (hr == S_OK)
+    {
+        hr = IAudioClient3_GetSharedModeEnginePeriod(ac3, pwfx,
+                &default_frames, &fundamental_frames, &min_frames, &max_frames);
+        if (hr == S_OK)
+            engine_defp = ((UINT64)default_frames * 10000000 +
+                    pwfx->nSamplesPerSec / 2) / pwfx->nSamplesPerSec;
+        IAudioClient3_Release(ac3);
+    }
 
     hr = IAudioClient_Initialize(ac, AUDCLNT_SHAREMODE_SHARED,
             0, 5000000, 0, pwfx, NULL);
@@ -1357,9 +1370,17 @@ static void test_padding(void)
      * 441 observed with Vista, 448 with w7 on the same HW! */
     hr = IAudioClient_GetDevicePeriod(ac, &defp, &minp);
     ok(hr == S_OK, "GetDevicePeriod failed: %08lx\n", hr);
-    /* some wineXYZ.drv use 20ms, not seen on native */
-    ok(defp == 100000 || broken(defp == 101587) || defp == 200000,
-       "Expected 10ms default period: %lu\n", (ULONG)defp);
+    /* Modern backends expose the endpoint's actual shared engine quantum.
+     * Older Windows versions lack IAudioClient3 and historically report the
+     * fixed values below. */
+    if (engine_defp)
+        ok(defp == engine_defp || defp + 1 == engine_defp ||
+                defp == engine_defp + 1,
+                "Expected engine period %s, got %s\n",
+                wine_dbgstr_longlong(engine_defp), wine_dbgstr_longlong(defp));
+    else
+        ok(defp == 100000 || broken(defp == 101587) || defp == 200000,
+                "Expected a legacy default period: %lu\n", (ULONG)defp);
     ok(minp != 0, "Minimum period is 0\n");
     ok(minp <= defp, "Minimum period is greater than default period\n");
 

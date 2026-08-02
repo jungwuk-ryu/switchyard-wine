@@ -128,6 +128,8 @@ struct create_stream_params
     UINT32 spatial_static_mask;
     UINT32 spatial_dynamic_objects;
     UINT32 spatial_endpoint_generation;
+    HANDLE spatial_invalidation_event;
+    BOOL spatial_fault_invalidate_on_start;
     REFERENCE_TIME duration;
     REFERENCE_TIME period;
     const WAVEFORMATEX *fmt;
