@@ -17,7 +17,10 @@ Prefer fixing reusable behavior in Wine or the integrated runtime over requiring
 5. Build the affected Wine components or a complete runtime on Apple Silicon, and record relevant regression checks for established workloads.
 6. Open a pull request describing the interoperability workload without including proprietary binaries, credentials, or user data.
 
-Wine source commits should follow Wine's subsystem-oriented subject style. Repository tooling and documentation commits should use Conventional Commit subjects such as `build:`, `docs:`, or `chore:`.
+All commits, including repository tooling and documentation changes, should
+follow Wine's subsystem-oriented subject style:
+`<component>: <Imperative sentence>.` Do not add Conventional Commit types such
+as `feat`, `fix`, or `refactor`.
 
 Do not commit Apple Game Porting Toolkit components, downloaded launchers, proprietary SDK files, runtime caches, logs, prefixes, credentials, or generated runtime installations. GPTK must remain a user-selected local input.
 
