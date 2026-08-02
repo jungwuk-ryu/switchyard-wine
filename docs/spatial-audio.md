@@ -126,16 +126,18 @@ bus contexts, or Audio Units.
 
 Spatial streams are pinned to the endpoint used for activation. Device liveness,
 device-change, buffer-size, nominal-rate, output-layout, and abnormal-I/O-stop
-properties have public CoreAudio block listeners. A format, topology, liveness,
-unplug, or abnormal-stop change sets a sticky invalidation flag and wakes the
-Windows event thread; subsequent client operations return device invalidation
-and spatial objects are revoked. Replug, Bluetooth/USB transition, sleep/wake,
-or a new default endpoint is recovered by obtaining a new endpoint and
-reactivating a stream, which rebuilds and revalidates the graph. Existing
-streams are never silently moved onto a different layout. Processor-overload
-listeners are deliberately not registered through the block API because
-CoreAudio may deliver that selector on its I/O context; callback starvation is
-counted directly as an underrun instead.
+properties have public CoreAudio block listeners. Activation fails closed unless
+liveness, buffer-size, sample-rate, and at least one topology-change listener
+(`DeviceHasChanged` or output `StreamConfiguration`) are registered. A format,
+topology, liveness, unplug, or abnormal-stop change sets a sticky invalidation
+flag and wakes the Windows event thread; subsequent client operations return
+device invalidation and spatial objects are revoked. Replug, Bluetooth/USB
+transition, sleep/wake, or a new default endpoint is recovered by obtaining a
+new endpoint and reactivating a stream, which rebuilds and revalidates the
+graph. Existing streams are never silently moved onto a different layout.
+Processor-overload listeners are deliberately not registered through the block
+API because CoreAudio may deliver that selector on its I/O context; callback
+starvation is counted directly as an underrun instead.
 
 ## Security and resource boundaries
 

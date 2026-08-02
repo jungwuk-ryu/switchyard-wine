@@ -657,6 +657,7 @@ static HRESULT register_spatial_device_listeners(struct coreaudio_stream *stream
     __block struct coreaudio_stream *target = stream;
     AudioObjectPropertyListenerBlock listener;
     dispatch_block_t detach;
+    BOOL topology_listener = FALSE;
     UINT32 i;
     OSStatus sc;
 
@@ -687,13 +688,22 @@ static HRESULT register_spatial_device_listeners(struct coreaudio_stream *stream
                 &spatial_device_properties[i], stream->device_listener_queue,
                 stream->device_listener);
         if (sc == noErr)
+        {
             stream->device_listener_mask |= 1u << i;
+            if (i == 1 || i == 4)
+                topology_listener = TRUE;
+        }
         else if (i == 0 || i == 2 || i == 3)
         {
             WARN("Failed to register required spatial device listener %u: %x.\n",
                     i, (int)sc);
             return osstatus_to_hresult(sc);
         }
+    }
+    if (!topology_listener)
+    {
+        WARN("Failed to register a spatial topology-change listener.\n");
+        return AUDCLNT_E_DEVICE_INVALIDATED;
     }
     return S_OK;
 }
