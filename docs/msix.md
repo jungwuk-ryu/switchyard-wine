@@ -1,270 +1,321 @@
-# MSIX and Packaged Desktop Architecture
+# MSIX and Packaged Desktop Support
 
-This document defines the compatibility, security, persistence, and performance
-contract for MSIX support in Switchyard Wine. It is an implementation contract,
-not a compatibility claim. An application is listed as compatible only after the
-exact package and runtime revision have been tested and recorded in
-`docs/compatibility.md`.
+This document describes the MSIX behavior that is implemented in Switchyard
+Wine. It is not a promise of complete Windows package compatibility. An
+application is compatible only after its exact package and runtime revision
+have been tested and recorded in `docs/compatibility.md`.
 
-## Supported product boundary
+## Current scope
 
-The initial supported package is a per-user, full-trust desktop package whose
-selected payload architecture can run in the current Wine prefix. This includes
-ordinary Win32 packages and WinUI 3 applications that use the Windows App SDK,
-provided that every required framework package and API is supported.
+The current target is a signed, per-prefix, full-trust desktop MSIX/AppX
+package. Supported application declarations are the full-trust,
+`packagedClassicApp`, and `win32App` forms accepted by the manifest parser, with
+the `runFullTrust` capability. Standalone framework packages can be installed
+and resolved as static manifest dependencies.
 
-The following remain unsupported until their separate security and lifecycle
-contracts are implemented and tested:
+This work can provide the package identity, dependency graph, DLL search, and
+in-process WinRT activation needed by some Win32 and WinUI 3 applications. It
+does not imply that every Windows App SDK or application API used by such a
+package is implemented.
 
-- UWP and AppContainer processes;
-- Store licensing, purchase, entitlement, and encrypted packages;
-- machine-wide or provisioned packages;
-- sparse, optional, resource-only, modification, and related-set packages;
-- streaming installation and content groups;
-- hosted apps and out-of-process WinRT servers;
-- architecture emulation that is not already available in the runtime; and
-- manifest extensions or cryptographic algorithms that the parser does not
-  explicitly recognize.
+The following are explicitly outside the current target:
 
-Unsupported input must fail with a stable error. It must never be installed
-partially, reported as successful, or silently treated as an unpackaged
-executable.
+- UWP, AppContainer process creation, and AppContainer isolation;
+- Store purchase, entitlement, licensing, and encrypted package support;
+- machine-wide provisioning, multi-user deployment, and a shared system
+  package database;
+- sparse, optional, modification, resource-only, related-set, and streaming
+  deployment;
+- hosted applications and out-of-process WinRT activation;
+- loose or development-mode registration;
+- dynamic package dependencies or runtime package-graph mutation; and
+- CPU emulation not already provided by the selected Wine runtime.
 
-## Component boundaries
+Unsupported manifests, package kinds, options, and architectures fail instead
+of being treated as unpackaged applications.
 
-Package handling is divided into four layers.
+## Implemented components
 
-1. The deployment layer inspects archives, validates signatures and block maps,
-   parses manifests, resolves dependencies, stages payloads, and commits catalog
-   transactions. Hostile archive parsing never runs in wineserver.
-2. The catalog owns the per-prefix installed-package truth. Public deployment
-   and ApplicationModel APIs project immutable snapshots from this catalog.
-3. Wineserver owns only a bounded, pointer-free, immutable package graph attached
-   to a process. It never parses XML, ZIP, JSON, certificates, or package paths.
-4. The loader and WinRT activation code consume a process-local immutable graph
-   snapshot. They do not query the catalog or filesystem on the unpackaged path.
+Package support is divided between these components:
 
-The Switchyard application invokes a versioned helper contract. It does not
-parse packages, duplicate the installed-package catalog, or launch an extracted
-executable directly.
+1. `appxsvc.dll` contains the private archive, manifest, catalog, deployment,
+   recovery, graph-building, and launch implementation. It runs in the calling
+   Wine process; it is not a privileged or separately isolated service.
+2. `appxdeploymentclient.dll` exposes the implemented subset of
+   `Windows.Management.Deployment.PackageManager` over the private deployment
+   entry points.
+3. `wineappx.exe` exposes inspection, extraction, store administration, and a
+   private full-trust launch command.
+4. Wineserver accepts only a bounded, pointer-free package graph and the
+   handles needed to bind it to a process. It does not parse ZIP, XML,
+   certificates, manifests, or the installed catalog.
+5. Ntdll, KernelBase, the loader, `windows.applicationmodel.dll`, and combase
+   consume the immutable graph attached during process creation.
 
-## Package inspection pipeline
+The installed catalog is the per-prefix source of package state. Process
+identity is not inferred from an executable path, filename, environment
+variable, or registry entry.
 
-Every archive is untrusted. Inspection is completed before a destination path is
-created.
+## Inspection and extraction
 
-1. Resolve and open the input as a regular file. Reject devices, directories,
-   pipes, and reparse-point substitutions.
-2. Read the ZIP end record and central directory with checked 64-bit arithmetic.
-   Reject multi-disk archives, encryption, unsupported flags or methods,
-   overlapping records, inconsistent local headers, duplicate records, and
-   records outside the file.
-3. Enforce limits before decompression:
-   - 65,536 entries;
-   - 32,767 bytes per encoded entry name;
-   - 256 MiB per metadata document;
-   - 16 GiB per payload file;
-   - 64 GiB total expanded data;
-   - a configurable prefix quota and host free-space floor; and
-   - bounded compression ratios and decompressor progress.
-4. Decode UTF-8 names strictly. Reject rather than normalize absolute paths,
-   drive or UNC paths, device paths, alternate data streams, empty or dot
-   components, `..`, mixed separators, trailing dots or spaces, reserved DOS
-   names, case-insensitive duplicates, Unicode-normalization collisions, and
-   file/directory prefix collisions.
-5. Parse `AppxManifest.xml`, `AppxBlockMap.xml`, and
-   `[Content_Types].xml` with a pull parser. Network access, DTDs, external
-   entities, entity substitution, XInclude, schema loading, recovery mode, and
-   unbounded parser modes are prohibited. Element, depth, attribute, name, and
-   value limits are enforced by the package parser.
-6. Verify the CMS signature and certificate chain, then independently verify the
-   AppX package-digest binding. A generic successful `WinVerifyTrust` result is
-   not sufficient.
-7. Stream each payload through the declared block-map hash and ZIP CRC checks.
-   No unchecked payload bytes reach the installed store.
-8. Return a bounded inspection record containing identity, publisher and trust
-   state, selected architecture, dependencies, applications, capabilities,
-   expanded size, and explicit unsupported reasons.
+`wineappx inspect` and `wineappx unpack` accept signed MSIX/AppX packages and
+supported bundles. Inspection verifies the archive layout, signature and signed
+package digest, content types, manifest, block map, payload hashes, and ZIP CRCs.
+Bundle inspection selects one compatible application payload and rejects
+ambiguous, optional, resource, encrypted, unsupported-type, unsupported
+qualifier, and incompatible-architecture payloads.
 
-The bundled zlib and libxml2 libraries are used through their streaming APIs.
-Cryptographic operations use public BCrypt and Crypt32 APIs; private crypto
-implementation details are not linked directly.
+Archive entry names are validated before extraction. Absolute, drive, UNC,
+device, alternate-stream, dot-component, traversal, reserved-name,
+case-collision, Unicode-normalization-collision, and file/directory-prefix
+collision cases are rejected. XML parsing disables external entities, DTD
+loading, network access, XInclude, and recovery behavior. Archive, metadata,
+entry, expansion, and parser limits are enforced.
 
-## Safe filesystem publication
+Extraction creates a new destination and uses directory-relative handles
+without following reparse points. `unpack` only verifies and extracts content;
+it does not stage or register the resulting directory.
 
-Extraction uses directory-relative handles rooted in a newly created private
-staging directory. Every ancestor and leaf is opened without following reparse
-points and is verified after opening. String canonicalization is not a
-confinement mechanism.
+## Deployment store
 
-Installed payloads are immutable and content-addressed. A representative
-per-prefix layout is:
+The default store is:
 
 ```text
-drive_c/Program Files/WindowsApps/.wine-msix-store/
-  store.lock
-  catalog.bin
-  catalog.bin.pending-<transaction-id>
-  transactions/<transaction-id>.bin
-  staging/<transaction-id>/
-  payloads/<package-full-name>/<content-id>/
-  leases/pending/<launch-id>
-  leases/generations/<content-id>
+C:\Program Files\WindowsApps\.wine-msix-store
 ```
 
-Paths in catalog records are store-relative. Callers cannot choose a staging,
-payload, transaction, or catalog path. Files are flushed before their containing
-directory is flushed. Publication uses a same-directory atomic rename.
+`wineappx --store` can select another drive-absolute store path. The public
+`PackageManager` projection always uses the default path.
 
-`catalog.bin` is the only commit point. A package is installed only when the
-active catalog references a complete, verified payload. Registry entries and
-directory names are projections, never the source of truth.
-
-## Transaction and recovery contract
-
-Install and update transactions have these durable states:
+The implemented store contains:
 
 ```text
-created -> inspected -> staged -> payload-complete
-        -> catalog-prepared -> published -> cleaned
+store.lock
+catalog.bin
+catalog.bin.pending
+transactions/
+staging/
+payloads/
+quarantine/
+records/
+record-staging/
+record-quarantine/
+leases/pending/
+leases/generations/
 ```
 
-Removal transactions have these durable states:
+Install and update verify and extract a new payload generation before publishing
+it. The updater does not edit an active generation in place. Catalog
+publication uses a pending catalog and same-directory rename; `catalog.bin` is
+the package-state commit point. Paths held by the catalog are store-relative.
+
+Removal first publishes a catalog that no longer exposes the package. Payload
+and deployment-record reclamation is deferred while a process holds a validated
+generation lease. The recovery command reconciles interrupted journals around
+the catalog commit point, and garbage collection reclaims bounded,
+unreferenced generations and quarantined records. A store writer uses
+`store.lock`; catalog readers consume validated snapshots.
+
+## Full-trust launch and process graph
+
+The implemented launch entry point is private
+`appx_deployment_launch`, exposed by:
 
 ```text
-created -> dependency-checked -> catalog-prepared
-        -> unpublished -> garbage-collection-pending -> cleaned
+wineappx launch PACKAGE_FULL_NAME APP_ID
 ```
 
-An update verifies a new generation before replacing the active catalog
-reference. It never edits the old generation. Removal first prevents new
-queries and launches, then reclaims bytes only after no process lease references
-the generation.
+This path is distinct from `IAppListEntry::LaunchAsync`, which is not
+implemented.
 
-Recovery follows the catalog commit point:
+Launch performs these checks before `CreateProcessW`:
 
-- pre-publication staging and pending catalogs are discarded;
-- an unreferenced complete payload is quarantined for bounded garbage
-  collection;
-- after publication, the active catalog wins even if transaction cleanup was
-  interrupted;
-- a malformed catalog, unknown schema, or broken payload reference fails closed
-  and preserves evidence rather than guessing installed state.
+1. Open and validate the selected store and catalog.
+2. Resolve an exact active package full name and exact application ID.
+3. Reopen the declared executable below the published payload generation and
+   verify its stored file identity and content digest.
+4. Resolve the static manifest dependency graph for the selected target
+   architecture.
+5. Reopen and verify the loader and in-process WinRT files recorded for every
+   graph package.
+6. Open one validated generation-marker lease for every graph package.
+7. Build an immutable graph containing package identities and roots, the
+   application ID and AUMID, executable identity, dependency ordering, loader
+   inventory, loader search ranks, and in-process WinRT class declarations.
+8. Pass the graph, executable handle, and lease handles through the private
+   process-thread attribute before the child starts.
 
-Only one writer may publish in a prefix. Readers take a short-lived immutable
-catalog snapshot. Long parsing, hashing, extraction, and process launch do not
-hold the catalog lock.
+Wineserver validates the graph shape, every generation marker, and the exact
+main-image filesystem identity. It verifies the mapped executable again before
+process initialization completes. The server retains the generation leases
+until the process's last thread exits.
 
-Fault-injection tests cover every durable transition, including failure after
-file flush and before or after catalog rename.
+A normal packaged child can inherit a graph only when the creating process
+already owns the exact same server graph object. Selecting an unrelated
+packaged process as the nominal parent does not borrow that process's package
+identity. An explicitly supplied graph must carry a complete, independently
+validated image binding and lease set.
 
-## Identity and dependency graph
+The local, architecture-appropriate graph pointer is published through
+`RTL_USER_PROCESS_PARAMETERS.PackageDependencyData`. A process gets one
+immutable startup graph. There is currently no supported API that adds,
+removes, or replaces graph packages while the process is running.
 
-A package graph is a versioned packed record with checked offsets and counts. It
-contains:
+## Loader and in-process WinRT behavior
 
-- the main package identity and installed root;
-- the selected application ID and AUMID;
-- ordered dependency identities, ranks, and immutable roots;
-- in-process WinRT class declarations;
-- loader provenance needed by `LoadPackagedLibrary`; and
-- a catalog epoch and graph revision.
+The native loader validates the graph before using it. Packaged resolution
+participates after API-set and activation-context handling, loaded-module
+matching, and KnownDLL handling, and before ordinary ambient search where the
+Windows search path requires it.
 
-The authoritative record is created only from a validated catalog snapshot.
-Wineserver stores it as an immutable reference-counted object on `struct
-process`. A normal child inherits the graph of the effective parent selected by
-process creation, including `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` semantics.
-The object is released with the process.
+Each registered package DLL is bound to its exact package-relative path and
+filesystem object identity, change time, and size. If a PE file exists below a
+graph package root but is not registered at that exact graph-relative path, an
+ordinary load through that root fails with `STATUS_INVALID_IMAGE_HASH` instead
+of accepting the file through current-directory or basename fallback. A missing
+package-root candidate still permits the applicable system fallback, and an
+explicit absolute path outside every graph root retains ordinary loader
+behavior.
 
-The child obtains a bounded snapshot before its main image is loaded. The local
-snapshot is published through
-`RTL_USER_PROCESS_PARAMETERS.PackageDependencyData`, with architecture-correct
-native and WOW64 representations. Package identity is never inferred from an
-executable name, path, publisher, application version, or environment variable.
+`LoadPackagedLibrary` is graph-only. It does not fall back to arbitrary files or
+the registry and reports an unpackaged process as having no package.
 
-For an unpackaged process the server reference and local context are null.
-Current-process AppModel queries return `APPMODEL_ERROR_NO_PACKAGE` after a
-single local state check: no allocation, lock, server request, registry access,
-or filesystem access is allowed on that path.
+`RoGetActivationFactory` checks activation-context declarations first, then the
+package graph, followed by the existing builtin and registry paths. A graph
+class is loaded with `LoadPackagedLibrary`, so its module must be in the
+verified loader inventory. Only in-process WinRT server declarations are
+represented; out-of-process activation is not implemented.
 
-## Loader and WinRT activation
+## Public API status
 
-Packaged DLL resolution occurs after API-set/SxS redirection, the loaded-module
-list, and KnownDLLs, but before ordinary application, system, and ambient path
-search. Initial imports, delay imports, forwarded exports, and explicit loads
-use the same graph generation.
+### `Windows.Management.Deployment.PackageManager`
 
-`LoadPackagedLibrary` is a graph-only operation. Loaded-module provenance is
-retained so a same-basename module loaded from outside the package graph cannot
-be misreported as a packaged match. Removing a dependency affects future
-resolution but does not unload an already loaded module.
+The implemented deployment operations return real asynchronous operations with
+progress, completion, cancellation, and a `DeploymentResult`:
 
-WinRT activation first honors activation-context declarations, then consults
-the package graph before ambient registry fallback, subject to Windows
-conformance results. A higher-priority package declaration that is malformed or
-missing its binary fails; it does not fall through to an unrelated registration.
-Out-of-process activation remains unsupported.
+- `AddPackageAsync` accepts a local drive-absolute `file:` URI, an empty
+  dependency iterable, and `DeploymentOptions_None`.
+- `UpdatePackageAsync` has the same URI and dependency restrictions and accepts
+  only `DeploymentOptions_None` or
+  `DeploymentOptions_ForceUpdateFromAnyVersion`.
+- `RemovePackageAsync` removes one exact package full name.
+- `IPackageManager2::RemovePackageWithOptionsAsync` accepts only
+  `RemovalOptions_None`.
 
-Dynamic dependency changes publish a new immutable graph generation. Readers
-must not observe mixed generations, use freed nodes, wait under the loader lock,
-or accept stale/double-removed handles.
+Catalog-backed enumeration and lookup are implemented for all packages, exact
+full name, family name, and name plus publisher. The user-SID variants accept
+only the current user SID. Package-type filters accept the implemented main,
+framework, and resource flags; this does not add resource-package deployment
+support.
 
-## Public API behavior
+The following operations return `E_NOTIMPL`:
 
-Public surfaces are adapters over the same catalog and process state:
+- `StagePackageAsync` and `StagePackageWithOptionsAsync`;
+- `RegisterPackageAsync` and `RegisterPackageByFullNameAsync`;
+- user-data staging and cleanup; and
+- package-user enumeration and package-state mutation.
 
-- `Windows.Management.Deployment.PackageManager` implements inspect/register,
-  add, update, remove, and query operations with real asynchronous completion,
-  progress, cancellation, and error results.
-- `Windows.ApplicationModel.Package` implements package identity, installed
-  location, metadata, status, dependencies, and application list entries.
-- AppModel C APIs implement their documented two-call buffer contracts for
-  current and remote processes.
-- `IAppListEntry::LaunchAsync` resolves the catalog entry by full name and
-  application ID, acquires a generation lease, and creates the process with the
-  validated package graph attached before its first thread runs.
-- A command-line helper exposes inspect, query, install, update, remove, and
-  launch as a versioned machine-readable contract. JSON, when requested, is an
-  output encoding and not an internal trust boundary.
+Development-mode, external-location, deferred-registration, and other
+unimplemented deployment options are rejected. Dependency URI iterables must
+be empty; dependency packages are installed separately and resolved from their
+static manifest declarations.
 
-Synchronous argument errors are returned synchronously. Work accepted for
-asynchronous execution always reaches exactly one terminal state. Closing or
-cancelling an operation cannot publish a partial transaction.
+### `Windows.ApplicationModel.Package`
 
-## Performance contract
+Catalog and current-process package projections implement the package identity,
+installed location, framework/resource/development flags, and the dependency
+views that can be represented by the catalog or startup graph. The projection
+is intentionally partial.
 
-Performance changes are measured, not inferred.
+Display metadata, description, logo, package status, installed date, and
+application-list entries are not implemented where the required data is not
+present. `IPackage3::GetAppListEntriesAsync` returns `E_NOTIMPL`; no
+`IAppListEntry` object or `IAppListEntry::LaunchAsync` implementation is
+provided.
 
-- Unpackaged process creation and DLL loading add only predictable null checks.
-- Package graphs are parsed once, stored contiguously, and shared immutably
-  across ordinary child processes.
-- Loader lookup uses a precomputed basename index and performs no catalog,
-  registry, XML, or JSON work.
-- Catalog writers build replacements off-lock and publish atomically.
-- Archive reads, hashing, and decompression are streaming and bounded.
-- Package enumeration returns snapshots and does not hold store locks through
-  caller callbacks.
+### AppModel C APIs
 
-Benchmarks record wall time, CPU time, allocations, peak resident memory,
-filesystem operations, and graph-size scaling. Regression gates include
-unpackaged process startup, unpackaged DLL lookup, packaged cold start, repeated
-graph lookup, install throughput, and interrupted-transaction recovery.
+The startup graph backs the implemented current-process identity, family, full
+name, package ID, package path, application user model ID, and package-info
+queries. Remote-process full-name and family-name queries obtain an immutable
+graph snapshot from wineserver rather than reading the target PEB. Installed
+catalog queries and package-name/family conversion helpers are also implemented
+where exported by KernelBase.
 
-## Verification gates
+Unpackaged current-process queries take the no-graph path and return the
+appropriate `APPMODEL_ERROR_NO_PACKAGE` or
+`APPMODEL_ERROR_NO_APPLICATION`. A malformed graph fails as package-runtime
+corruption.
 
-Each implementation slice requires:
+The Windows dynamic-dependency creation, add, remove, and delete APIs are not
+implemented. Static manifest dependencies in the startup graph are not dynamic
+dependencies.
 
-- a Windows-observed or specification-backed behavioral expectation;
-- positive, negative, boundary, and failure-injection tests;
-- malformed-input and resource-limit tests for trust-boundary code;
-- architecture and WOW64 coverage where state crosses bitness;
-- concurrency tests for update, removal, launch, and graph replacement;
-- leak, handle, and cleanup checks;
-- performance evidence for process, loader, and filesystem hot paths; and
-- an independent review with all material findings resolved.
+## Command-line contract
 
-The end-to-end matrix uses fresh prefixes and covers loose registration, signed
-MSIX and bundle install, query, update with rollback, removal while in use,
-dependency resolution, full-trust launch, WinUI 3 framework loading, malformed
-archives, unsupported packages, and crash recovery. Compatibility is not
-claimed from unit tests alone.
+`wineappx` currently provides:
+
+```text
+inspect PACKAGE
+unpack PACKAGE DESTINATION
+initialize
+install PACKAGE
+update PACKAGE
+remove PACKAGE_FULL_NAME
+query PACKAGE_FULL_NAME
+list
+launch PACKAGE_FULL_NAME APP_ID
+recover
+gc
+```
+
+Successful standard output is stable escaped `key=value` data. Diagnostics are
+written to standard error. There is no JSON output mode, JSON registration
+format, or loose-registration command.
+
+The helper also exposes store, target-architecture, downgrade, weak-durability,
+archive-size, expanded-size, free-space-floor, and launch-wait options. These
+are private helper controls, not additional public Windows deployment APIs.
+
+## Security boundary
+
+The implementation assumes one trusted Unix user owns and operates a Wine
+prefix. The private deployment code runs with that user's normal host
+permissions. It is not a privileged package broker and does not provide
+security isolation from another process running as the same Unix UID with
+access to the prefix.
+
+The ntdll-to-wineserver graph handoff narrows this same-UID boundary. Its backing
+file must be a regular file owned by `getuid()`, mode `0600`, exact-sized,
+read-only at the server, and unlinked before it becomes process state. The
+server similarly requires current-UID, regular, read-only, single-link image
+and generation-marker files, validates marker content against each graph
+package, rejects duplicate lease objects and leases that permit write or delete
+sharing, and binds the graph to the exact executable object.
+
+These checks enforce object consistency and stop graph borrowing through an
+unrelated nominal parent in the normal process-creation path. They do not
+authenticate package identity against a hostile process running under the same
+Unix UID. They are not a cross-user authorization system, a machine-wide
+package trust service, or an AppContainer sandbox. A launched application is
+full trust and has the normal permissions of its Wine process.
+
+## Architecture boundary
+
+The public deployment projection and `wineappx` default the target architecture
+from `GetNativeSystemInfo`. A direct package or static dependency is compatible
+only when it is neutral or exactly matches the selected target architecture.
+Bundle deployment maps concrete x86, x64, ARM, and ARM64 targets and rejects a
+target it cannot map.
+
+`wineappx --arch` changes package and bundle selection; it does not provide an
+emulator or make an otherwise unrunnable executable valid. Native and WOW64
+process setup use architecture-correct graph representations, but the selected
+executable must still be runnable by the current Wine prefix and host runtime.
+
+## Compatibility claims
+
+Unit and conformance tests establish API and trust-boundary behavior, not
+application compatibility. Record an application result in
+`docs/compatibility.md` only after testing the exact package, Switchyard Wine
+revision, host environment, and launch path.

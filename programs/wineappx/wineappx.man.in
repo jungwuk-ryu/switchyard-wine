@@ -1,0 +1,179 @@
+.TH WINEAPPX 1 "July 31, 2026" "@PACKAGE_STRING@" "Wine Programs"
+.SH NAME
+wineappx \- verify, unpack, deploy, query, and launch MSIX/AppX packages
+.SH SYNOPSIS
+.B wineappx
+.RI [ options ]
+.B inspect
+.I package
+.br
+.B wineappx
+.RI [ options ]
+.B unpack
+.I package destination
+.br
+.B wineappx
+.RI [ options ]
+.BR initialize | list | recover | gc
+.br
+.B wineappx
+.RI [ options ]
+.BR install | update
+.I package
+.br
+.B wineappx
+.RI [ options ]
+.BR remove | query
+.I package_full_name
+.br
+.B wineappx
+.RI [ options ]
+.B launch
+.I package_full_name application_id
+.SH DESCRIPTION
+.B wineappx
+is a command-line client for Wine's private MSIX/AppX package service.
+It provides bounded, signed package inspection and extraction, transactional
+deployment-store operations, catalog queries, and full-trust application
+launch.
+.PP
+Inspection and extraction accept signed MSIX/AppX packages and signed
+MSIX/AppX bundles.  Before any payload is extracted, the service verifies the
+CMS signature and certificate chain, signed archive digests, block map,
+per-block hashes, CRC and compression framing, manifest identity, content
+types, and package layout.  The input file is opened without following a leaf
+reparse point.
+.PP
+The current bundle policy selects only one neutral or target-architecture
+application payload.  Bundles containing resource payloads, optional payloads,
+encrypted payloads, unsupported payload types or architectures, or unsupported
+qualifiers are rejected with exit status 1.  A bundle with no compatible
+application payload or an ambiguous best payload is also rejected.
+Installation and update accept both package files and bundles under the same
+policy.  Every embedded package is verified before the selected payload is
+published to the deployment store.
+.PP
+.B unpack
+requires a destination which does not exist.  It canonicalizes the destination
+to a drive-absolute Windows path, opens and retains every existing parent
+without following reparse points or permitting deletion while the leaf is
+created, and passes an exclusive handle for the new empty directory to the
+extractor.  A failed extraction attempts to remove the new directory if it is
+empty and reports any partial directory which must be discarded.
+.SH COMMANDS
+.IP "\fBinspect \fIpackage\fR"
+Verify a package or bundle and print its identity, selection, applications,
+dependencies, content identity, signer identity, and support status.
+.IP "\fBunpack \fIpackage destination\fR"
+Verify and extract a package, or the selected application payload of a bundle,
+into a new directory.
+.IP \fBinitialize\fR
+Create a deployment store or validate an existing one.
+.IP "\fBinstall \fIpackage\fR"
+Install a new package or supported app-only bundle family generation.
+.IP "\fBupdate \fIpackage\fR"
+Update an installed package family.  Downgrades require
+.BR --allow-downgrade .
+.IP "\fBremove \fIpackage_full_name\fR"
+Remove one exact installed package generation.  Active dependents and package
+leases prevent unsafe removal.
+.IP "\fBquery \fIpackage_full_name\fR"
+Query one exact installed package.
+.IP \fBlist\fR
+List all installed packages and their full-trust applications.
+.IP "\fBlaunch \fIpackage_full_name application_id\fR"
+Build the validated package graph, retain generation leases, and launch one
+declared full-trust application.
+.IP \fBrecover\fR
+Recover bounded interrupted deployment transactions.
+.IP \fBgc\fR
+Collect a bounded set of unpublished generations.
+.SH OPTIONS
+.IP "\fB--store \fIpath\fR"
+Use the specified drive-absolute deployment store.  The default is
+\fBC:\\Program Files\\WindowsApps\\.wine-msix-store\fR.
+.IP "\fB--arch \fIarchitecture\fR"
+Select \fBneutral\fR, \fBx86\fR, \fBx64\fR, \fBarm\fR, \fBarm64\fR, or
+\fBx86a64\fR.  The default is the native processor architecture.
+.IP \fB--allow-downgrade\fR
+Allow a lower-version update.  This option is rejected for other commands.
+.IP \fB--accept-weak-durability\fR
+Accept a host filesystem which cannot flush directory metadata.  The result
+remains atomically visible but may not survive sudden power loss.  Strict
+durability is the default for deployment operations.
+.IP "\fB--max-archive \fIbytes\fR"
+Limit the archive size.  The default is 32 GiB and the maximum is 128 GiB.
+.IP "\fB--max-expanded \fIbytes\fR"
+Limit total expanded payload bytes and the deployment package quota.  The
+default is 16 GiB and the maximum is 64 GiB.
+.IP "\fB--free-space-floor \fIbytes\fR"
+Require this many bytes to remain free.  The default is 2 GiB.
+.IP \fB--wait\fR
+Wait for the application started by
+.B launch
+and return its exit status.  This option is rejected for other commands.
+.IP \fB\-h\fR,\fB\ \-\-help\fR
+Show command help.
+.PP
+Byte limits are positive decimal integers with an optional binary
+\fBK\fR, \fBM\fR, \fBG\fR, or \fBT\fR suffix.  \fBKiB\fR-style suffixes are
+also accepted.  Options must precede the command; use \fB--\fR to end option
+processing explicitly.
+.SH OUTPUT
+Successful commands write a stable, line-oriented
+.B key=value
+schema to standard output.  Numeric values are decimal unless prefixed by
+\fB0x\fR.  Digests are lowercase hexadecimal.  Repeated records use zero-based
+bracketed indices, for example
+\fBpackage[0].application[1].id\fR.  String values escape backslash as
+\fB\\\\\fR and the control characters tab, carriage return, and line feed as
+\fB\\t\fR, \fB\\r\fR, and \fB\\n\fR.  Other control code units use
+\fB\\uNNNN\fR.  A parser should split each record at the first equals sign and
+then unescape the value.  Human-readable diagnostics are written only to
+standard error.
+.PP
+.B inspect
+starts with \fBcontainer=package\fR or \fBcontainer=bundle\fR and emits package
+identity, version, architecture, verification-derived content and signer
+identities, application and dependency records, and unsupported-reason
+records.  Bundle output additionally identifies the selected inner package.
+.PP
+.B unpack
+emits \fBextracted\fR and \fBdurability\fR.
+Deployment mutations emit the affected package name when applicable, catalog
+epoch, result flags, reclaimed entry and byte counts, and durability.
+.B list
+and
+.B query
+emit catalog epoch, package count, package records, and application records.
+.B launch
+emits the process identifier and, with \fB--wait\fR, the process exit status.
+.SH "EXIT STATUS"
+.IP 0
+The command completed successfully.
+.IP 1
+Input verification, extraction, deployment, query, launch, or waiting failed.
+.IP 2
+The command line, option value, or operand count was invalid.
+.IP 3
+The required private appxsvc API set was unavailable.
+.PP
+With
+.BR "launch --wait" ,
+the launched application's exit status is returned instead of the values
+above; \fBprocess_exit_code\fR records the same value on standard output.
+.SH BUGS
+Bugs can be reported on the
+.UR https://bugs.winehq.org
+.B Wine bug tracker
+.UE .
+.SH AVAILABILITY
+.B wineappx
+is part of the Wine distribution, which is available through WineHQ,
+the
+.UR https://www.winehq.org/
+.B Wine development headquarters
+.UE .
+.SH "SEE ALSO"
+.BR wine (1),
+.BR winepath (1)

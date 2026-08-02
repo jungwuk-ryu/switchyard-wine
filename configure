@@ -1807,6 +1807,7 @@ enable_view
 enable_wevtutil
 enable_where
 enable_whoami
+enable_wineappx
 enable_wineboot
 enable_winebrowser
 enable_winecfg
@@ -22183,6 +22184,7 @@ wine_fn_config_makefile dlls/apphelp enable_apphelp
 wine_fn_config_makefile dlls/apphelp/tests enable_tests
 wine_fn_config_makefile dlls/appwiz.cpl enable_appwiz_cpl
 wine_fn_config_makefile dlls/appxdeploymentclient enable_appxdeploymentclient
+wine_fn_config_makefile dlls/appxdeploymentclient/tests enable_tests
 wine_fn_config_makefile dlls/appxsvc enable_appxsvc
 wine_fn_config_makefile dlls/appxsvc/tests enable_tests
 wine_fn_config_makefile dlls/atiadlxx enable_atiadlxx
@@ -23380,6 +23382,8 @@ wine_fn_config_makefile programs/view enable_view
 wine_fn_config_makefile programs/wevtutil enable_wevtutil
 wine_fn_config_makefile programs/where enable_where
 wine_fn_config_makefile programs/whoami enable_whoami
+wine_fn_config_makefile programs/wineappx enable_wineappx
+wine_fn_config_makefile programs/wineappx/tests enable_tests
 wine_fn_config_makefile programs/wineboot enable_wineboot
 wine_fn_config_makefile programs/winebrowser enable_winebrowser
 wine_fn_config_makefile programs/winecfg enable_winecfg

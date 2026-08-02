@@ -1,0 +1,4 @@
+TESTDLL = wineappx.exe
+
+SOURCES = \
+	wineappx.c

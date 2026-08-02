@@ -1,0 +1,7 @@
+MODULE    = wineappx.exe
+
+EXTRADLLFLAGS = -mconsole -municode
+
+SOURCES = \
+	main.c \
+	wineappx.man.in
