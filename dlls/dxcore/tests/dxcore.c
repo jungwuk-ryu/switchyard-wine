@@ -90,12 +90,18 @@ static void test_DXCoreCreateAdapterFactory(void)
     hr = IDXCoreAdapterFactory_CreateAdapterList(factory, 0, NULL, &IID_IDXCoreAdapterList, (void **)&list);
     ok(hr == E_INVALIDARG, "got hr %#lx.\n", hr);
     ok(list == NULL, "got list %p.\n", list);
+    list = (void *)0xdeadbeef;
     hr = IDXCoreAdapterFactory_CreateAdapterList(factory, 0, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS, &IID_IDXCoreAdapterList, (void **)&list);
     ok(hr == E_INVALIDARG, "got hr %#lx.\n", hr);
+    ok(list == NULL, "got list %p.\n", list);
+    list = (void *)0xdeadbeef;
     hr = IDXCoreAdapterFactory_CreateAdapterList(factory, 1, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS, &IID_IDXCoreAdapterFactory, (void **)&list);
     ok(hr == E_NOINTERFACE, "got hr %#lx.\n", hr);
+    ok(list == NULL, "got list %p.\n", list);
+    list = (void *)0xdeadbeef;
     hr = IDXCoreAdapterFactory_CreateAdapterList(factory, 1, NULL, &IID_IDXCoreAdapterFactory, (void **)&list);
     ok(hr == E_INVALIDARG, "got hr %#lx.\n", hr);
+    ok(list == NULL, "got list %p.\n", list);
     hr = IDXCoreAdapterFactory_CreateAdapterList(factory, 1, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS, &IID_IDXCoreAdapterFactory, NULL);
     ok(hr == E_POINTER, "got hr %#lx.\n", hr);
 
@@ -129,6 +135,7 @@ static void test_DXCoreCreateAdapterFactory(void)
     ok(adapter == NULL, "got adapter %p.\n", adapter);
     hr = IDXCoreAdapterList_GetAdapter(list, 0, &IID_IDXCoreAdapterList, (void **)&adapter);
     ok(hr == E_NOINTERFACE, "got hr %#lx.\n", hr);
+    ok(adapter == NULL, "got adapter %p.\n", adapter);
 
     hr = IDXCoreAdapterList_GetAdapter(list, 0, &IID_IDXCoreAdapter, (void **)&adapter);
     ok(hr == S_OK, "got hr %#lx.\n", hr);
@@ -154,8 +161,334 @@ static void test_DXCoreCreateAdapterFactory(void)
     ok(refcount == 0, "got refcount %ld.\n", refcount);
 }
 
+static void test_GetFactory(void)
+{
+    IDXCoreAdapterFactory *factory2 = (void *)0xdeadbeef;
+    IDXCoreAdapterFactory *factory;
+    IDXCoreAdapterList *list;
+    IDXCoreAdapter *adapter;
+    void *factory_identity;
+    uint32_t count;
+    LONG refcount;
+    HRESULT hr;
+
+    if (FAILED(pDXCoreCreateAdapterFactory(&IID_IDXCoreAdapterFactory, (void **)&factory)))
+        return;
+
+    hr = IDXCoreAdapterFactory_CreateAdapterList(factory, 1, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS,
+            &IID_IDXCoreAdapterList, (void **)&list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
+
+    hr = IDXCoreAdapterList_GetFactory(list, &IID_IDXCoreAdapterFactory, NULL);
+    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+
+    hr = IDXCoreAdapterList_GetFactory(list, &IID_IDXCoreAdapter, (void **)&factory2);
+    ok(hr == E_NOINTERFACE, "Got hr %#lx.\n", hr);
+    ok(factory2 == NULL, "Got factory %p.\n", factory2);
+
+    hr = IDXCoreAdapterList_GetFactory(list, &IID_IDXCoreAdapterFactory, (void **)&factory2);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(factory2 == factory, "Got factory %p, expected %p.\n", factory2, factory);
+    if (SUCCEEDED(hr))
+    {
+        refcount = IDXCoreAdapterFactory_Release(factory2);
+        ok(refcount > 0, "Got refcount %ld.\n", refcount);
+    }
+
+    count = IDXCoreAdapterList_GetAdapterCount(list);
+    if (!count)
+    {
+        win_skip("No D3D12 graphics adapter is available.\n");
+        IDXCoreAdapterList_Release(list);
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
+
+    hr = IDXCoreAdapterList_GetAdapter(list, 0, &IID_IDXCoreAdapter, (void **)&adapter);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        IDXCoreAdapterList_Release(list);
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
+
+    ok(IDXCoreAdapter_IsValid(adapter), "Expected a valid adapter.\n");
+
+    hr = IDXCoreAdapter_GetFactory(adapter, &IID_IDXCoreAdapterFactory, NULL);
+    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+
+    factory2 = (void *)0xdeadbeef;
+    hr = IDXCoreAdapter_GetFactory(adapter, &IID_IDXCoreAdapter, (void **)&factory2);
+    ok(hr == E_NOINTERFACE, "Got hr %#lx.\n", hr);
+    ok(factory2 == NULL, "Got factory %p.\n", factory2);
+
+    factory_identity = factory;
+    refcount = IDXCoreAdapterFactory_Release(factory);
+    ok(refcount > 0, "Got refcount %ld.\n", refcount);
+
+    refcount = IDXCoreAdapterList_Release(list);
+    ok(refcount == 0, "Got refcount %ld.\n", refcount);
+
+    factory2 = (void *)0xdeadbeef;
+    hr = pDXCoreCreateAdapterFactory(&IID_IDXCoreAdapterFactory, (void **)&factory2);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(factory2 == factory_identity, "Got factory %p, expected %p.\n", factory2, factory_identity);
+    if (SUCCEEDED(hr))
+    {
+        refcount = IDXCoreAdapterFactory_Release(factory2);
+        ok(refcount > 0, "Got refcount %ld.\n", refcount);
+    }
+
+    factory2 = (void *)0xdeadbeef;
+    hr = IDXCoreAdapter_GetFactory(adapter, &IID_IDXCoreAdapterFactory, (void **)&factory2);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(factory2 == factory_identity, "Got factory %p, expected %p.\n", factory2, factory_identity);
+    if (SUCCEEDED(hr))
+    {
+        refcount = IDXCoreAdapterFactory_Release(factory2);
+        ok(refcount > 0, "Got refcount %ld.\n", refcount);
+    }
+
+    IDXCoreAdapter_Release(adapter);
+}
+
+static void test_Sort(void)
+{
+    static const DXCoreAdapterPreference preferences[] =
+    {
+        Hardware,
+        HighPerformance,
+        MinimumPower,
+    };
+    DXCoreAdapterPreference invalid_preference = 0xdeadbeef;
+    IDXCoreAdapterFactory *factory;
+    IDXCoreAdapterList *list;
+    IDXCoreAdapter *adapter;
+    LUID *order, luid;
+    BOOL saw_software;
+    BYTE is_hardware;
+    uint32_t count, i;
+    HRESULT hr;
+
+    if (FAILED(pDXCoreCreateAdapterFactory(&IID_IDXCoreAdapterFactory, (void **)&factory)))
+        return;
+
+    hr = IDXCoreAdapterFactory_CreateAdapterList(factory, 1, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS,
+            &IID_IDXCoreAdapterList, (void **)&list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
+
+    ok(IDXCoreAdapterList_IsAdapterPreferenceSupported(list, Hardware),
+            "Expected Hardware preference support.\n");
+    ok(IDXCoreAdapterList_IsAdapterPreferenceSupported(list, MinimumPower),
+            "Expected MinimumPower preference support.\n");
+    ok(IDXCoreAdapterList_IsAdapterPreferenceSupported(list, HighPerformance),
+            "Expected HighPerformance preference support.\n");
+    ok(!IDXCoreAdapterList_IsAdapterPreferenceSupported(list, invalid_preference),
+            "Unexpected invalid preference support.\n");
+
+    hr = IDXCoreAdapterList_Sort(list, 0, NULL);
+    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+    hr = IDXCoreAdapterList_Sort(list, 0, preferences);
+    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+    hr = IDXCoreAdapterList_Sort(list, 1, NULL);
+    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+
+    count = IDXCoreAdapterList_GetAdapterCount(list);
+    order = calloc(count, sizeof(*order));
+    ok(!count || !!order, "Failed to allocate adapter order.\n");
+    if (count && !order)
+    {
+        IDXCoreAdapterList_Release(list);
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
+
+    for (i = 0; i < count; ++i)
+    {
+        hr = IDXCoreAdapterList_GetAdapter(list, i, &IID_IDXCoreAdapter, (void **)&adapter);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = IDXCoreAdapter_GetProperty(adapter, InstanceLuid, sizeof(order[i]), &order[i]);
+            ok(hr == S_OK, "Got hr %#lx.\n", hr);
+            IDXCoreAdapter_Release(adapter);
+        }
+    }
+
+    hr = IDXCoreAdapterList_Sort(list, 1, &invalid_preference);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    for (i = 0; i < count; ++i)
+    {
+        hr = IDXCoreAdapterList_GetAdapter(list, i, &IID_IDXCoreAdapter, (void **)&adapter);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = IDXCoreAdapter_GetProperty(adapter, InstanceLuid, sizeof(luid), &luid);
+            ok(hr == S_OK, "Got hr %#lx.\n", hr);
+            ok(!memcmp(&luid, &order[i], sizeof(luid)), "Adapter order changed at index %u.\n", i);
+            IDXCoreAdapter_Release(adapter);
+        }
+    }
+
+    hr = IDXCoreAdapterList_Sort(list, ARRAY_SIZE(preferences), preferences);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    for (i = 0; i < count; ++i)
+    {
+        hr = IDXCoreAdapterList_GetAdapter(list, i, &IID_IDXCoreAdapter, (void **)&adapter);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = IDXCoreAdapter_GetProperty(adapter, InstanceLuid, sizeof(order[i]), &order[i]);
+            ok(hr == S_OK, "Got hr %#lx.\n", hr);
+            IDXCoreAdapter_Release(adapter);
+        }
+    }
+
+    hr = IDXCoreAdapterList_Sort(list, ARRAY_SIZE(preferences), preferences);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    saw_software = FALSE;
+    for (i = 0; i < count; ++i)
+    {
+        hr = IDXCoreAdapterList_GetAdapter(list, i, &IID_IDXCoreAdapter, (void **)&adapter);
+        ok(hr == S_OK, "Got hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = IDXCoreAdapter_GetProperty(adapter, InstanceLuid, sizeof(luid), &luid);
+            ok(hr == S_OK, "Got hr %#lx.\n", hr);
+            ok(!memcmp(&luid, &order[i], sizeof(luid)), "Adapter order changed at index %u.\n", i);
+
+            hr = IDXCoreAdapter_GetProperty(adapter, IsHardware, sizeof(is_hardware), &is_hardware);
+            ok(hr == S_OK, "Got hr %#lx.\n", hr);
+            if (is_hardware)
+                ok(!saw_software, "Found hardware adapter after a software adapter at index %u.\n", i);
+            else
+                saw_software = TRUE;
+            IDXCoreAdapter_Release(adapter);
+        }
+    }
+
+    ok(!IDXCoreAdapterList_IsStale(list), "Expected a fresh adapter list.\n");
+
+    free(order);
+    IDXCoreAdapterList_Release(list);
+    IDXCoreAdapterFactory_Release(factory);
+}
+
+static void test_QueryState(void)
+{
+    DXCoreAdapterMemoryBudgetNodeSegmentGroup details = {0, Local};
+    DXCoreAdapterMemoryBudget budget;
+    IDXCoreAdapterFactory *factory;
+    IDXCoreAdapterList *list;
+    IDXCoreAdapter *adapter;
+    BYTE update_in_progress;
+    HRESULT hr;
+
+    if (FAILED(pDXCoreCreateAdapterFactory(&IID_IDXCoreAdapterFactory, (void **)&factory)))
+        return;
+
+    hr = IDXCoreAdapterFactory_CreateAdapterList(factory, 1,
+            &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS,
+            &IID_IDXCoreAdapterList, (void **)&list);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
+
+    if (!IDXCoreAdapterList_GetAdapterCount(list))
+    {
+        win_skip("No D3D12 graphics adapter is available.\n");
+        IDXCoreAdapterList_Release(list);
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
+
+    hr = IDXCoreAdapterList_GetAdapter(list, 0, &IID_IDXCoreAdapter, (void **)&adapter);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        IDXCoreAdapterList_Release(list);
+        IDXCoreAdapterFactory_Release(factory);
+        return;
+    }
+
+    ok(IDXCoreAdapter_IsQueryStateSupported(adapter, IsDriverUpdateInProgress),
+            "Expected driver update state support.\n");
+    ok(IDXCoreAdapter_IsQueryStateSupported(adapter, AdapterMemoryBudget),
+            "Expected memory budget state support.\n");
+    ok(!IDXCoreAdapter_IsQueryStateSupported(adapter, 0xdeadbeef),
+            "Unexpected invalid state support.\n");
+
+    update_in_progress = 0xff;
+    hr = IDXCoreAdapter_QueryState(adapter, IsDriverUpdateInProgress,
+            0, NULL, sizeof(update_in_progress), &update_in_progress);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    ok(update_in_progress == FALSE || update_in_progress == TRUE,
+            "Got invalid update state %#x.\n", update_in_progress);
+
+    memset(&budget, 0xcc, sizeof(budget));
+    hr = IDXCoreAdapter_QueryState(adapter, AdapterMemoryBudget,
+            sizeof(details), &details, sizeof(budget), &budget);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        ok(budget.budget >= budget.availableForReservation,
+                "Budget %#I64x is smaller than available reservation %#I64x.\n",
+                budget.budget, budget.availableForReservation);
+    }
+
+    hr = IDXCoreAdapter_QueryState(adapter, AdapterMemoryBudget,
+            sizeof(details), NULL, sizeof(budget), &budget);
+    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+    hr = IDXCoreAdapter_QueryState(adapter, AdapterMemoryBudget,
+            sizeof(details) - 1, &details, sizeof(budget), &budget);
+    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+    hr = IDXCoreAdapter_QueryState(adapter, AdapterMemoryBudget,
+            sizeof(details), &details, sizeof(budget) - 1, &budget);
+    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+    hr = IDXCoreAdapter_QueryState(adapter, AdapterMemoryBudget,
+            sizeof(details), &details, sizeof(budget), NULL);
+    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+
+    details.segmentGroup = 0xdeadbeef;
+    hr = IDXCoreAdapter_QueryState(adapter, AdapterMemoryBudget,
+            sizeof(details), &details, sizeof(budget), &budget);
+    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+    hr = IDXCoreAdapter_QueryState(adapter, 0xdeadbeef,
+            0, NULL, sizeof(budget), &budget);
+    ok(hr == DXGI_ERROR_INVALID_CALL, "Got hr %#lx.\n", hr);
+
+    IDXCoreAdapter_Release(adapter);
+    IDXCoreAdapterList_Release(list);
+    IDXCoreAdapterFactory_Release(factory);
+}
+
 static void test_GetProperty(void)
 {
+    static const DXCoreAdapterProperty supported_properties[] =
+    {
+        InstanceLuid,
+        DriverVersion,
+        DriverDescription,
+        HardwareID,
+        DedicatedAdapterMemory,
+        DedicatedSystemMemory,
+        SharedSystemMemory,
+        IsHardware,
+    };
     IDXCoreAdapterFactory *factory;
     IDXCoreAdapterList *list;
     DXCoreHardwareID hwid[2];
@@ -187,6 +520,12 @@ static void test_GetProperty(void)
                 "Expected D3D12 graphics support.\n");
         ok(!IDXCoreAdapter_IsAttributeSupported(adapter, &IID_IDXCoreAdapter),
                 "Unexpected unknown attribute support.\n");
+
+        for (uint32_t j = 0; j < ARRAY_SIZE(supported_properties); ++j)
+            ok(IDXCoreAdapter_IsPropertySupported(adapter, supported_properties[j]),
+                    "Expected property %u support.\n", supported_properties[j]);
+        ok(!IDXCoreAdapter_IsPropertySupported(adapter, 0xdeadbeef),
+                "Unexpected invalid property support.\n");
 
         hr = IDXCoreAdapter_GetProperty(adapter, 0xdeadbeef, 0, hwid);
         ok(hr == DXGI_ERROR_INVALID_CALL, "Got hr %#lx.\n", hr);
@@ -361,7 +700,7 @@ static void test_GetProperty(void)
 
 static void test_GetAdapterByLuid(void)
 {
-    IDXCoreAdapter *adapter, *adapter2;
+    IDXCoreAdapter *adapter, *adapter2 = (void *)0xdeadbeef;
     IDXCoreAdapterFactory *factory;
     IDXCoreAdapterList *list;
     uint32_t count;
@@ -385,12 +724,29 @@ static void test_GetAdapterByLuid(void)
         hr = IDXCoreAdapter_GetProperty(adapter, InstanceLuid, sizeof(luid), &luid);
         ok(hr == S_OK, "Got hr %#lx.\n", hr);
 
+        hr = IDXCoreAdapterFactory_GetAdapterByLuid(factory, &luid, &IID_IDXCoreAdapter, NULL);
+        ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+
+        adapter2 = (void *)0xdeadbeef;
+        hr = IDXCoreAdapterFactory_GetAdapterByLuid(factory, &luid, &IID_IDXCoreAdapterList, (void **)&adapter2);
+        ok(hr == E_NOINTERFACE, "Got hr %#lx.\n", hr);
+        ok(adapter2 == NULL, "Got adapter %p.\n", adapter2);
+
         hr = IDXCoreAdapterFactory_GetAdapterByLuid(factory, &luid, &IID_IDXCoreAdapter, (void **)&adapter2);
         ok(hr == S_OK, "Got hr %#lx.\n", hr);
-        IDXCoreAdapter_Release(adapter2);
+        ok(adapter2 == adapter, "Got adapter %p, expected identity %p.\n", adapter2, adapter);
+        if (adapter2)
+            IDXCoreAdapter_Release(adapter2);
 
         IDXCoreAdapter_Release(adapter);
     }
+
+    luid.LowPart = 0xdeadbeef;
+    luid.HighPart = 0xdeadbeef;
+    adapter2 = (void *)0xdeadbeef;
+    hr = IDXCoreAdapterFactory_GetAdapterByLuid(factory, &luid, &IID_IDXCoreAdapter, (void **)&adapter2);
+    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+    ok(adapter2 == NULL, "Got adapter %p.\n", adapter2);
 
     IDXCoreAdapterList_Release(list);
 
@@ -420,6 +776,9 @@ START_TEST(dxcore)
     }
 
     test_DXCoreCreateAdapterFactory();
+    test_GetFactory();
+    test_Sort();
+    test_QueryState();
     test_GetProperty();
     test_GetAdapterByLuid();
 
