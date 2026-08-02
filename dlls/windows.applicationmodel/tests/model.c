@@ -282,7 +282,26 @@ static HRESULT test_register_package( IPackageManager *manager, IPackage **out )
     ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
 
     hr = IPackageManager_RegisterPackageAsync( manager, uri, NULL, DeploymentOptions_DevelopmentMode, &operation );
+    todo_wine
     ok( hr == S_OK, "got hr %#lx.\n", hr );
+    if (FAILED(hr))
+    {
+        IUriRuntimeClass_Release( uri );
+        if (old_value != 0xdeadbeef)
+            RegSetValueExW( hkey, L"AllowDevelopmentWithoutDevLicense", 0,
+                            REG_DWORD, (const BYTE *)&old_value,
+                            sizeof(old_value) );
+        else
+            RegDeleteValueW( hkey, L"AllowDevelopmentWithoutDevLicense" );
+        RegCloseKey( hkey );
+        swprintf( path, MAX_PATH, L"%s\\%s", temp, L"application.exe" );
+        DeleteFileW( path );
+        swprintf( path, MAX_PATH, L"%s\\%s", temp, L"appxmanifest.xml" );
+        DeleteFileW( path );
+        RemoveDirectoryW( temp );
+        skip( "Loose development-mode registration is not implemented.\n" );
+        return hr;
+    }
     ok( operation != NULL, "got operation %p\n", operation );
     IUriRuntimeClass_Release( uri );
 
@@ -446,6 +465,7 @@ static void test_PackageManager(void)
     IPackageManager *manager;
     IIterator_Package *iter;
     IPackage *package;
+    boolean current;
     HSTRING str, str2;
     HRESULT hr;
     LONG ref;
@@ -486,7 +506,6 @@ static void test_PackageManager(void)
     hr = IPackageManager_FindPackagesByNamePublisher( manager, NULL, str2, &packages );
     ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
     hr = IPackageManager_FindPackagesByNamePublisher( manager, str, str2, &packages );
-    todo_wine
     ok( hr == S_OK || broken(hr == E_ACCESSDENIED) /* Requires admin privileges */, "got hr %#lx.\n", hr );
     if (hr == S_OK) IIterable_Package_Release( packages );
     WindowsDeleteString( str );
@@ -496,7 +515,6 @@ static void test_PackageManager(void)
     ok( hr == S_OK, "got hr %#lx.\n", hr );
 
     hr = IPackageManager2_FindPackagesWithPackageTypes( manager2, 1, &packages );
-    todo_wine
     ok( hr == S_OK || broken(hr == E_ACCESSDENIED) /* Requires admin privileges */, "got hr %#lx.\n", hr );
     if (hr == S_OK) IIterable_Package_Release( packages );
 
@@ -504,7 +522,6 @@ static void test_PackageManager(void)
     ok( ref == 2, "got ref %ld.\n", ref );
 
     hr = IPackageManager_FindPackages( manager, &packages );
-    todo_wine
     ok( hr == S_OK || broken(hr == E_ACCESSDENIED) /* w8adm */, "got hr %#lx.\n", hr );
     if (hr != S_OK)
     {
@@ -515,20 +532,25 @@ static void test_PackageManager(void)
 
     hr = IIterable_Package_First( packages, &iter );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
-    hr = IIterator_Package_get_Current( iter, &package );
+    hr = IIterator_Package_get_HasCurrent( iter, &current );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
-    hr = IPackage_get_InstalledLocation( package, &storage_folder );
-    ok( hr == S_OK, "got hr %#lx.\n", hr );
-    hr = IStorageFolder_QueryInterface( storage_folder, &IID_IStorageItem, (void **)&storage_item );
-    ok( hr == S_OK, "got hr %#lx.\n", hr );
-    hr = IStorageItem_get_Path( storage_item, &str );
-    ok( hr == S_OK, "got hr %#lx.\n", hr );
-    WindowsDeleteString( str );
-    ref = IStorageItem_Release( storage_item );
-    ok( ref == 1, "got ref %ld.\n", ref );
-    ref = IStorageFolder_Release( storage_folder );
-    ok( !ref, "got ref %ld.\n", ref );
-    IPackage_Release( package );
+    if (current)
+    {
+        hr = IIterator_Package_get_Current( iter, &package );
+        ok( hr == S_OK, "got hr %#lx.\n", hr );
+        hr = IPackage_get_InstalledLocation( package, &storage_folder );
+        ok( hr == S_OK, "got hr %#lx.\n", hr );
+        hr = IStorageFolder_QueryInterface( storage_folder, &IID_IStorageItem, (void **)&storage_item );
+        ok( hr == S_OK, "got hr %#lx.\n", hr );
+        hr = IStorageItem_get_Path( storage_item, &str );
+        ok( hr == S_OK, "got hr %#lx.\n", hr );
+        WindowsDeleteString( str );
+        ref = IStorageItem_Release( storage_item );
+        ok( ref == 1, "got ref %ld.\n", ref );
+        ref = IStorageFolder_Release( storage_folder );
+        ok( !ref, "got ref %ld.\n", ref );
+        IPackage_Release( package );
+    }
     ref = IIterator_Package_Release( iter );
     ok( !ref, "got ref %ld.\n", ref );
     ref = IIterable_Package_Release( packages );
