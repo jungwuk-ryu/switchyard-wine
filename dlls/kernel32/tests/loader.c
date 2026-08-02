@@ -5169,20 +5169,21 @@ static void test_LoadPackagedLibrary(void)
     RTL_USER_PROCESS_PARAMETERS *params = NtCurrentTeb()->Peb->ProcessParameters;
     void *original_graph = params->PackageDependencyData;
     struct packaged_graph_mutator mutator;
-    BYTE *graph = NULL, *known_name_graph = NULL, *outside_graph = NULL;
+    BYTE *graph = NULL, *outside_graph = NULL;
     BYTE *unsorted_graph = NULL;
     BYTE *duplicate_graph = NULL, *case_mismatch_graph = NULL;
     BYTE *bad_path_graph = NULL, *forbidden_graph = NULL;
     WCHAR *long_name = NULL;
     WCHAR windows_dir[MAX_PATH], temp_path[MAX_PATH], temp_root[MAX_PATH];
+    WCHAR fixture_dir[MAX_PATH];
     WCHAR source_path[MAX_PATH], copied_known[MAX_PATH], loaded_path[MAX_PATH];
     UINT32 graph_size;
     void *noaccess = NULL;
     HANDLE thread = NULL;
     DWORD wait, length;
     unsigned int i;
-    HMODULE h, source_module;
-    BOOL ret, source_ready;
+    HMODULE h;
+    BOOL ret;
 
     if (!pLoadPackagedLibrary)
     {
@@ -5206,8 +5207,40 @@ static void test_LoadPackagedLibrary(void)
         return;
     }
     GetWindowsDirectoryW(windows_dir, ARRAY_SIZE(windows_dir));
-    graph = build_loader_package_graph(windows_dir, L"kernel32.dll",
-            L"system32\\kernel32.dll", 0, L"C:\\MissingPackage",
+    source_path[0] = temp_root[0] = fixture_dir[0] = copied_known[0] = 0;
+    length = GetSystemDirectoryW(source_path, ARRAY_SIZE(source_path));
+    ok(length && length + ARRAY_SIZE(L"\\version.dll") <=
+            ARRAY_SIZE(source_path),
+            "Could not get the system fixture path, error %lu.\n",
+            GetLastError());
+    if (!length || length + ARRAY_SIZE(L"\\version.dll") >
+            ARRAY_SIZE(source_path))
+        goto done;
+    lstrcatW(source_path, L"\\version.dll");
+    length = GetTempPathW(ARRAY_SIZE(temp_path), temp_path);
+    ok(length && length < ARRAY_SIZE(temp_path),
+            "Could not get the temporary path, error %lu.\n",
+            GetLastError());
+    if (!length || length >= ARRAY_SIZE(temp_path) ||
+        !GetTempFileNameW(temp_path, L"lpk", 0, temp_root))
+        goto done;
+    ret = DeleteFileW(temp_root) && CreateDirectoryW(temp_root, NULL);
+    ok(ret, "Could not create the package fixture root, error %lu.\n",
+            GetLastError());
+    if (!ret) goto done;
+    if (swprintf(fixture_dir, ARRAY_SIZE(fixture_dir), L"%s\\bin",
+            temp_root) <= 0 || !CreateDirectoryW(fixture_dir, NULL) ||
+        swprintf(copied_known, ARRAY_SIZE(copied_known),
+            L"%s\\kernel32.dll", fixture_dir) <= 0 ||
+        !CopyFileW(source_path, copied_known, FALSE))
+    {
+        ok(0, "Could not create the package DLL fixture, error %lu.\n",
+                GetLastError());
+        goto done;
+    }
+
+    graph = build_loader_package_graph(temp_root, L"kernel32.dll",
+            L"bin\\kernel32.dll", 0, L"C:\\MissingPackage",
             L"kernel32.dll", L"kernel32.dll", 1, 2, &graph_size);
     ok(!!graph, "Failed to build loader graph.\n");
     if (!graph) goto done;
@@ -5244,13 +5277,26 @@ static void test_LoadPackagedLibrary(void)
                 "Overlong name returned %p, error %lu.\n", h, GetLastError());
     }
 
+    /*
+     * The graph-selected target deliberately has a KnownDLL basename.  It
+     * must resolve to the exact package file, while its ordinary imports keep
+     * normal KnownDLL precedence.  A copied non-core DLL avoids conflating
+     * this with Wine's build-tree mapping for C:\\windows\\system32.
+     */
     h = pLoadPackagedLibrary(L"kernel32", 0);
     ok(!!h, "Implicit extension load failed, error %lu.\n", GetLastError());
-    if (h) FreeLibrary(h);
+    if (h)
+    {
+        length = GetModuleFileNameW(h, loaded_path, ARRAY_SIZE(loaded_path));
+        ok(length && !wcsicmp(loaded_path, copied_known),
+                "Package graph loaded %s instead of %s.\n",
+                wine_dbgstr_w(loaded_path), wine_dbgstr_w(copied_known));
+        FreeLibrary(h);
+    }
     h = pLoadPackagedLibrary(L"KERNEL32.DLL", 0);
     ok(!!h, "Case-insensitive load failed, error %lu.\n", GetLastError());
     if (h) FreeLibrary(h);
-    h = pLoadPackagedLibrary(L"system32\\kernel32", 0);
+    h = pLoadPackagedLibrary(L"bin\\kernel32", 0);
     ok(!!h, "Relative-path load failed, error %lu.\n", GetLastError());
     if (h) FreeLibrary(h);
     h = pLoadPackagedLibrary(L"kernel32.", 0);
@@ -5260,72 +5306,6 @@ static void test_LoadPackagedLibrary(void)
     ok(!h && GetLastError() == ERROR_MOD_NOT_FOUND,
             "Missing module returned %p, error %lu.\n", h, GetLastError());
 
-    /*
-     * LoadPackagedLibrary selects its target from the graph even when the
-     * selected basename is also a KnownDLL.  KnownDLL precedence still
-     * applies to the selected module's ordinary basename-only dependencies.
-     */
-    source_module = LoadLibraryW(L"version.dll");
-    ok(!!source_module, "Could not load the package fixture, error %lu.\n",
-            GetLastError());
-    source_path[0] = temp_root[0] = copied_known[0] = 0;
-    if (source_module)
-    {
-        length = GetModuleFileNameW(source_module, source_path,
-                ARRAY_SIZE(source_path));
-        source_ready = length && length < ARRAY_SIZE(source_path);
-        ok(source_ready,
-                "Could not locate the package fixture, error %lu.\n",
-                GetLastError());
-        length = GetTempPathW(ARRAY_SIZE(temp_path), temp_path);
-        ok(length && length < ARRAY_SIZE(temp_path),
-                "Could not get the temporary path, error %lu.\n",
-                GetLastError());
-        if (source_ready && length && length < ARRAY_SIZE(temp_path) &&
-            GetTempFileNameW(temp_path, L"lpk", 0, temp_root))
-        {
-            ret = DeleteFileW(temp_root) && CreateDirectoryW(temp_root, NULL);
-            ok(ret, "Could not create the package fixture root, error %lu.\n",
-                    GetLastError());
-            if (ret && swprintf(copied_known, ARRAY_SIZE(copied_known),
-                    L"%s\\kernel32.dll", temp_root) > 0)
-            {
-                ret = CopyFileW(source_path, copied_known, FALSE);
-                ok(ret, "Could not copy the KnownDLL-name fixture, error %lu.\n",
-                        GetLastError());
-                if (ret)
-                {
-                    known_name_graph = build_loader_package_graph(temp_root,
-                            L"kernel32.dll", L"kernel32.dll", 0,
-                            L"C:\\MissingPackage", L"", L"", 1, 1,
-                            &graph_size);
-                    ok(!!known_name_graph,
-                            "Failed to build the KnownDLL-name graph.\n");
-                    if (known_name_graph)
-                    {
-                        params->PackageDependencyData = known_name_graph;
-                        h = pLoadPackagedLibrary(L"kernel32.dll", 0);
-                        ok(!!h, "KnownDLL-name graph load failed, error %lu.\n",
-                                GetLastError());
-                        if (h)
-                        {
-                            length = GetModuleFileNameW(h, loaded_path,
-                                    ARRAY_SIZE(loaded_path));
-                            ok(length && !wcsicmp(loaded_path, copied_known),
-                                    "KnownDLL-name graph loaded %s instead of %s.\n",
-                                    wine_dbgstr_w(loaded_path),
-                                    wine_dbgstr_w(copied_known));
-                            FreeLibrary(h);
-                        }
-                    }
-                }
-            }
-        }
-        else
-            ok(0, "Could not reserve the package fixture root, error %lu.\n",
-                    GetLastError());
-        FreeLibrary(source_module);
-    }
     params->PackageDependencyData = graph;
 
     outside_graph = build_loader_package_graph(L"C:\\MissingPackage",
@@ -5449,9 +5429,9 @@ done:
     HeapFree(GetProcessHeap(), 0, duplicate_graph);
     HeapFree(GetProcessHeap(), 0, unsorted_graph);
     HeapFree(GetProcessHeap(), 0, outside_graph);
-    HeapFree(GetProcessHeap(), 0, known_name_graph);
     HeapFree(GetProcessHeap(), 0, graph);
     if (copied_known[0]) DeleteFileW(copied_known);
+    if (fixture_dir[0]) RemoveDirectoryW(fixture_dir);
     if (temp_root[0]) RemoveDirectoryW(temp_root);
 }
 

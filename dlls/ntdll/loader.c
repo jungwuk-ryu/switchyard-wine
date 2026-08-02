@@ -195,6 +195,15 @@ struct appx_loader_graph_cache
 
 static struct appx_loader_graph_cache appx_loader_graph_cache;
 
+/* Protected by loader_section, and inherited by recursive loader calls. */
+static const BYTE *appx_loader_graph_override;
+
+static const BYTE *get_current_appx_loader_graph(void)
+{
+    if (appx_loader_graph_override) return appx_loader_graph_override;
+    return NtCurrentTeb()->Peb->ProcessParameters->PackageDependencyData;
+}
+
 #define HASH_MAP_SIZE 32
 static LIST_ENTRY hash_table[HASH_MAP_SIZE];
 
@@ -3569,8 +3578,7 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm,
                                SECTION_IMAGE_INFORMATION *image_info,
                                struct file_id *id, BOOL *identity_bound )
 {
-    const BYTE *data = NtCurrentTeb()->Peb->ProcessParameters->
-                       PackageDependencyData;
+    const BYTE *data = get_current_appx_loader_graph();
 
     if (data)
         return open_appx_dll_candidate(
@@ -4606,13 +4614,24 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
                                struct file_id *id, BOOL *redirected,
                                BOOL *identity_bound, BOOL find_loaded )
 {
-    const BYTE *appx_data = NtCurrentTeb()->Peb->ProcessParameters->
-                            PackageDependencyData;
+    const BYTE *appx_data = get_current_appx_loader_graph();
     WCHAR *fullname = NULL;
     NTSTATUS status;
     ULONG wow64_old_value = 0;
     BOOL redirected_name = FALSE;
     BOOL original_has_path = contains_path( libname );
+
+    /*
+     * kernel32 is part of the loader bootstrap and must never be selected from
+     * a package graph.  Native Windows resolves it through KnownDLLs, but a
+     * Wine build tree does not necessarily expose a kernel32 KnownDLL section.
+     * Apply the ordinary system search before node_kernel32 exists so a
+     * package inventory entry with the same basename cannot replace the core
+     * runtime module during process initialization.
+     */
+    if (appx_data && !original_has_path && !node_kernel32 &&
+        !wcsicmp( libname, L"kernel32.dll" ))
+        appx_data = NULL;
 
     *pwm = NULL;
     *redirected = FALSE;
@@ -4681,13 +4700,14 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
             else
             {
                 /*
-                 * GetModuleHandle-style queries for the two core loader
-                 * nodes must remain usable even if a same-process graph
-                 * pointer is corrupt.  They are established before package
-                 * policy and are never package-selected; all package-only
-                 * loads below still fail closed on graph validation.
+                 * The two core loader nodes are established outside package
+                 * policy and can never be replaced by package inventory.
+                 * Return them for ordinary loads as well as
+                 * GetModuleHandle-style queries, even if a same-process graph
+                 * pointer is corrupt.  Package-only loads below still fail
+                 * closed on graph validation.
                  */
-                if (find_loaded && loaded &&
+                if (loaded &&
                     (loaded->ldr.DdagNode == node_ntdll ||
                      loaded->ldr.DdagNode == node_kernel32))
                 {
@@ -10803,11 +10823,9 @@ NTSTATUS CDECL wine_server_handle_to_fd( HANDLE handle, unsigned int access, int
     return WINE_UNIX_CALL( unix_wine_server_handle_to_fd, &params );
 }
 
-/******************************************************************
- *		LdrLoadDll (NTDLL.@)
- */
-NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_flags,
-                                             const UNICODE_STRING *libname, HMODULE* hModule)
+static NTSTATUS ldr_load_dll( LPCWSTR search_path, DWORD *load_flags,
+                              const UNICODE_STRING *libname, HMODULE *hModule,
+                              const BYTE *appx_graph )
 {
     const ULONG load_library_search_flags = LOAD_WITH_ALTERED_SEARCH_PATH | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
                 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS
@@ -10815,6 +10833,7 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
     WINE_MODREF *wm;
     NTSTATUS nts;
     ULONG flags = 0;
+    const BYTE *previous_appx_graph;
     WCHAR *dllname = append_dll_ext( libname->Buffer );
     WCHAR *path_name = NULL, *dummy;
 
@@ -10827,6 +10846,8 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
     else path_name = (WCHAR *)search_path;
 
     RtlEnterCriticalSection( &loader_section );
+    previous_appx_graph = appx_loader_graph_override;
+    if (appx_graph) appx_loader_graph_override = appx_graph;
 
     nts = load_dll( path_name, dllname ? dllname : libname->Buffer, flags, &wm, FALSE );
 
@@ -10841,10 +10862,39 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
     }
     if (wm) *hModule = wm->ldr.DllBase;
 
+    if (appx_graph) appx_loader_graph_override = previous_appx_graph;
     RtlLeaveCriticalSection( &loader_section );
     RtlFreeHeap( GetProcessHeap(), 0, dllname );
     if (path_name != search_path) RtlReleasePath( path_name );
     return nts;
+}
+
+
+/******************************************************************
+ *		LdrLoadDll (NTDLL.@)
+ */
+NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll( LPCWSTR search_path, DWORD *load_flags,
+                                              const UNICODE_STRING *libname,
+                                              HMODULE *hModule )
+{
+    return ldr_load_dll( search_path, load_flags, libname, hModule, NULL );
+}
+
+
+/******************************************************************
+ *		__wine_load_packaged_library (NTDLL.@)
+ *
+ * LoadPackagedLibrary validates and selects a record in kernelbase before
+ * entering ntdll.  Carry that exact immutable graph through the complete
+ * loader transaction so a concurrent replacement of the public PEB pointer
+ * cannot change the identity policy between selection and image mapping.
+ */
+NTSTATUS WINAPI __wine_load_packaged_library( const void *graph,
+                                               const UNICODE_STRING *name,
+                                               HMODULE *module )
+{
+    if (!graph || !name || !module) return STATUS_INVALID_PARAMETER;
+    return ldr_load_dll( NULL, NULL, name, module, graph );
 }
 
 

@@ -5599,6 +5599,9 @@ NTSYSAPI NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait );
  * caller.  Release *graph with NtFreeVirtualMemory(MEM_RELEASE) and size zero.
  */
 NTSYSAPI NTSTATUS WINAPI __wine_get_process_package_graph( HANDLE process, void **graph, ULONG *size );
+NTSYSAPI NTSTATUS WINAPI __wine_load_packaged_library( const void *graph,
+                                                       const UNICODE_STRING *name,
+                                                       HMODULE *module );
 
 /* The thread information for 16-bit threads */
 /* NtCurrentTeb()->SubSystemTib points to this */

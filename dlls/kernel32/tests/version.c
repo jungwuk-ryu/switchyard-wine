@@ -823,6 +823,8 @@ static void test_SystemFirmwareTable(void)
 #define TEST_GRAPH_ACTIVATION_OFFSET        68
 #define TEST_GRAPH_CLASS_COUNT_OFFSET       104
 #define TEST_GRAPH_CLASSES_OFFSET           108
+#define TEST_GRAPH_PACKAGE_CONTENT_ID_OFFSET 24
+#define TEST_GRAPH_PACKAGE_COUNT            3
 
 #define TEST_PACKAGE_FILTER_HEAD            0x00000010
 #define TEST_PACKAGE_FILTER_DIRECT          0x00000020
@@ -845,6 +847,40 @@ struct test_graph_builder
     BYTE *data;
     UINT32 size;
     UINT32 capacity;
+};
+
+static const WCHAR test_package0_full_name[] =
+        L"TestPackage_1.2.3.4_neutral__0abcdefghjkme";
+static const WCHAR test_package1_full_name[] =
+        L"TestFramework_5.6.7.8_neutral__0abcdefghjkme";
+static const WCHAR test_package2_full_name[] =
+        L"TestTransitive_9.10.11.12_neutral__0abcdefghjkme";
+static const WCHAR * const test_package_full_names[TEST_GRAPH_PACKAGE_COUNT] =
+{
+    test_package0_full_name,
+    test_package1_full_name,
+    test_package2_full_name,
+};
+static const BYTE test_package_content_ids[TEST_GRAPH_PACKAGE_COUNT][32] =
+{
+    {
+        0x13, 0x9d, 0x2a, 0x71, 0x84, 0x46, 0xc8, 0x35,
+        0xfa, 0x0b, 0x62, 0xde, 0x49, 0xa5, 0x17, 0x90,
+        0x3c, 0xe1, 0x7b, 0x56, 0xa8, 0x24, 0xd0, 0x6f,
+        0xb2, 0x45, 0x99, 0x0e, 0x73, 0xcd, 0x18, 0xe4,
+    },
+    {
+        0x7a, 0x21, 0xd4, 0x08, 0xbe, 0x63, 0x95, 0x4f,
+        0x12, 0xe8, 0x37, 0xca, 0x50, 0x9b, 0x06, 0xfd,
+        0x44, 0xa1, 0x6c, 0x83, 0x2e, 0xd7, 0x59, 0xb0,
+        0x15, 0xf2, 0x68, 0x9e, 0x31, 0xc5, 0x7d, 0x0a,
+    },
+    {
+        0xc6, 0x54, 0x0f, 0x92, 0x38, 0xeb, 0x61, 0xa7,
+        0x2d, 0x80, 0x14, 0xcf, 0x75, 0x49, 0xb3, 0x06,
+        0x9a, 0x27, 0xe5, 0x5c, 0xf1, 0x43, 0x8d, 0x10,
+        0x6b, 0xda, 0x32, 0x7f, 0xa4, 0x19, 0xce, 0x58,
+    },
 };
 
 static void test_graph_write_u16(BYTE *data, UINT16 value)
@@ -915,19 +951,19 @@ static BYTE *build_test_package_graph(UINT32 *graph_size)
     static const WCHAR * const package0_strings[] =
     {
         L"TestPackage", L"CN=Test Publisher", L"", L"0abcdefghjkme",
-        L"TestPackage_1.2.3.4_neutral__0abcdefghjkme",
+        test_package0_full_name,
         L"TestPackage_0abcdefghjkme", L"C:\\Packages\\TestPackage",
     };
     static const WCHAR * const package1_strings[] =
     {
         L"TestFramework", L"CN=Test Publisher", L"", L"0abcdefghjkme",
-        L"TestFramework_5.6.7.8_neutral__0abcdefghjkme",
+        test_package1_full_name,
         L"TestFramework_0abcdefghjkme", L"C:\\Packages\\TestFramework",
     };
     static const WCHAR * const package2_strings[] =
     {
         L"TestTransitive", L"CN=Test Publisher", L"", L"0abcdefghjkme",
-        L"TestTransitive_9.10.11.12_neutral__0abcdefghjkme",
+        test_package2_full_name,
         L"TestTransitive_0abcdefghjkme", L"C:\\Packages\\TestTransitive",
     };
     static const UINT32 package_ref_offsets[] = {56, 64, 72, 80, 88, 96, 104};
@@ -943,7 +979,8 @@ static BYTE *build_test_package_graph(UINT32 *graph_size)
     builder.capacity = 8192;
     if (!(builder.data = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, builder.capacity)))
         return NULL;
-    fixed_size = TEST_GRAPH_HEADER_SIZE + 3 * TEST_GRAPH_PACKAGE_SIZE;
+    fixed_size = TEST_GRAPH_HEADER_SIZE +
+            TEST_GRAPH_PACKAGE_COUNT * TEST_GRAPH_PACKAGE_SIZE;
     builder.size = fixed_size;
     package0 = builder.data + TEST_GRAPH_HEADER_SIZE;
     package1 = package0 + TEST_GRAPH_PACKAGE_SIZE;
@@ -973,7 +1010,8 @@ static BYTE *build_test_package_graph(UINT32 *graph_size)
     test_graph_write_u32(builder.data + 16, builder.size);
     test_graph_write_u32(builder.data + 40,
             WINE_APPX_GRAPH_CURRENT_ARCHITECTURE);
-    test_graph_write_u32(builder.data + TEST_GRAPH_PACKAGE_COUNT_OFFSET, 3);
+    test_graph_write_u32(builder.data + TEST_GRAPH_PACKAGE_COUNT_OFFSET,
+            TEST_GRAPH_PACKAGE_COUNT);
     test_graph_write_u32(builder.data + TEST_GRAPH_PACKAGES_OFFSET, TEST_GRAPH_HEADER_SIZE);
     test_graph_write_u32(builder.data + TEST_GRAPH_LOADER_COUNT_OFFSET, 0);
     test_graph_write_u32(builder.data + TEST_GRAPH_LOADERS_OFFSET, fixed_size);
@@ -997,17 +1035,23 @@ static BYTE *build_test_package_graph(UINT32 *graph_size)
     test_graph_write_u32(package0 + 8, 0);
     test_graph_write_u32(package0 + 12, 0x09);
     test_graph_write_u32(package0 + 16, 0);
+    memcpy(package0 + TEST_GRAPH_PACKAGE_CONTENT_ID_OFFSET,
+            test_package_content_ids[0], sizeof(test_package_content_ids[0]));
     test_graph_write_u64(package1, 5 | ((UINT64)6 << 16) |
             ((UINT64)7 << 32) | ((UINT64)8 << 48));
     test_graph_write_u32(package1 + 8, 0);
     test_graph_write_u32(package1 + 12,
             0x0b | (WINE_APPX_GRAPH_BLOB_VERSION > 1 ? 0x10 : 0));
     test_graph_write_u32(package1 + 16, 1);
+    memcpy(package1 + TEST_GRAPH_PACKAGE_CONTENT_ID_OFFSET,
+            test_package_content_ids[1], sizeof(test_package_content_ids[1]));
     test_graph_write_u64(package2, 9 | ((UINT64)10 << 16) |
             ((UINT64)11 << 32) | ((UINT64)12 << 48));
     test_graph_write_u32(package2 + 8, 0);
     test_graph_write_u32(package2 + 12, 0x0b);
     test_graph_write_u32(package2 + 16, 2);
+    memcpy(package2 + TEST_GRAPH_PACKAGE_CONTENT_ID_OFFSET,
+            test_package_content_ids[2], sizeof(test_package_content_ids[2]));
 
     if (!wine_appx_graph_validate_blob(builder.data, builder.size))
     {
@@ -1022,33 +1066,90 @@ failed:
     return NULL;
 }
 
+static BOOL write_test_package_marker(HANDLE marker, UINT32 package_index)
+{
+    BYTE header[40] = {'S', 'W', 'L', 'M', 1};
+    const WCHAR *full_name = test_package_full_names[package_index];
+    DWORD bytes = (lstrlenW(full_name) + 1) * sizeof(WCHAR), written;
+
+    memcpy(header + 8, test_package_content_ids[package_index],
+            sizeof(test_package_content_ids[package_index]));
+    return WriteFile(marker, header, sizeof(header), &written, NULL) &&
+            written == sizeof(header) &&
+            WriteFile(marker, full_name, bytes, &written, NULL) &&
+            written == bytes && FlushFileBuffers(marker);
+}
+
 static NTSTATUS create_remote_package_graph_process(const void *graph,
-        UINT32 graph_size, HANDLE *process, HANDLE *thread)
+        UINT32 graph_size, HANDLE *process, HANDLE *thread,
+        WCHAR marker_paths[TEST_GRAPH_PACKAGE_COUNT][MAX_PATH])
 {
     ULONG_PTR attr_buffer[offsetof(PS_ATTRIBUTE_LIST, Attributes[1]) /
             sizeof(ULONG_PTR)];
     PS_ATTRIBUTE_LIST *attr = (PS_ATTRIBUTE_LIST *)attr_buffer;
     struct wine_appx_graph_attach attach;
-    unsigned long long leases[3];
-    RTL_USER_PROCESS_PARAMETERS *params;
+    unsigned long long leases[TEST_GRAPH_PACKAGE_COUNT];
+    RTL_USER_PROCESS_PARAMETERS *params = NULL;
     WCHAR module[MAX_PATH], nt_path[MAX_PATH + 4], command_line[MAX_PATH + 32];
+    WCHAR temp_path[MAX_PATH];
     UNICODE_STRING image, command;
     PS_CREATE_INFO create_info;
-    DWORD module_length;
-    HANDLE lease;
+    DWORD module_length, temp_length;
+    HANDLE marker = INVALID_HANDLE_VALUE;
+    HANDLE lease_handles[TEST_GRAPH_PACKAGE_COUNT];
     UINT32 i;
-    NTSTATUS status;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
 
     *process = *thread = NULL;
+    for (i = 0; i < ARRAY_SIZE(lease_handles); ++i)
+    {
+        lease_handles[i] = INVALID_HANDLE_VALUE;
+        marker_paths[i][0] = 0;
+    }
     module_length = GetModuleFileNameW(NULL, module, ARRAY_SIZE(module));
     if (!module_length || module_length >= ARRAY_SIZE(module))
-        return STATUS_UNSUCCESSFUL;
-    if ((lease = CreateFileW(module, GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL, NULL)) == INVALID_HANDLE_VALUE)
-        return RtlGetLastNtStatus();
+        goto done;
+    temp_length = GetTempPathW(ARRAY_SIZE(temp_path), temp_path);
+    if (!temp_length || temp_length >= ARRAY_SIZE(temp_path))
+    {
+        status = STATUS_NAME_TOO_LONG;
+        goto done;
+    }
     for (i = 0; i < ARRAY_SIZE(leases); ++i)
-        leases[i] = (ULONG_PTR)lease;
+    {
+        if (!GetTempFileNameW(temp_path, L"pgl", 0, marker_paths[i]))
+        {
+            status = RtlGetLastNtStatus();
+            if (!status) status = STATUS_UNSUCCESSFUL;
+            goto done;
+        }
+        marker = CreateFileW(marker_paths[i], GENERIC_WRITE, FILE_SHARE_READ,
+                NULL, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (marker == INVALID_HANDLE_VALUE)
+        {
+            status = RtlGetLastNtStatus();
+            if (!status) status = STATUS_UNSUCCESSFUL;
+            goto done;
+        }
+        if (!write_test_package_marker(marker, i))
+        {
+            status = RtlGetLastNtStatus();
+            if (!status) status = STATUS_UNSUCCESSFUL;
+            goto done;
+        }
+        CloseHandle(marker);
+        marker = INVALID_HANDLE_VALUE;
+        lease_handles[i] = CreateFileW(marker_paths[i], GENERIC_READ,
+                FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL, NULL);
+        if (lease_handles[i] == INVALID_HANDLE_VALUE)
+        {
+            status = RtlGetLastNtStatus();
+            if (!status) status = STATUS_UNSUCCESSFUL;
+            goto done;
+        }
+        leases[i] = (ULONG_PTR)lease_handles[i];
+    }
     lstrcpyW(nt_path, L"\\??\\");
     lstrcatW(nt_path, module);
     swprintf(command_line, ARRAY_SIZE(command_line), L"\"%s\" version graph-remote-child",
@@ -1057,11 +1158,7 @@ static NTSTATUS create_remote_package_graph_process(const void *graph,
     RtlInitUnicodeString(&command, command_line);
     status = RtlCreateProcessParametersEx(&params, &image, NULL, NULL, &command,
             NULL, NULL, NULL, NULL, NULL, PROCESS_PARAMS_FLAG_NORMALIZED);
-    if (status)
-    {
-        CloseHandle(lease);
-        return status;
-    }
+    if (status) goto done;
 
     attach.tag = WINE_APPX_GRAPH_ATTACH_TAG;
     attach.version = WINE_APPX_GRAPH_ATTACH_VERSION;
@@ -1084,8 +1181,13 @@ static NTSTATUS create_remote_package_graph_process(const void *graph,
     status = NtCreateUserProcess(process, thread, PROCESS_ALL_ACCESS,
             THREAD_ALL_ACCESS, NULL, NULL, 0,
             THREAD_CREATE_FLAGS_CREATE_SUSPENDED, params, &create_info, attr);
-    RtlDestroyProcessParameters(params);
-    CloseHandle(lease);
+
+done:
+    if (params) RtlDestroyProcessParameters(params);
+    if (marker != INVALID_HANDLE_VALUE) CloseHandle(marker);
+    for (i = 0; i < ARRAY_SIZE(lease_handles); ++i)
+        if (lease_handles[i] != INVALID_HANDLE_VALUE)
+            CloseHandle(lease_handles[i]);
     return status;
 }
 
@@ -1105,6 +1207,7 @@ static void test_current_package_graph(void)
     BYTE *graph = NULL, *corrupt_graph = NULL, *id_buffer = NULL, *info_buffer = NULL;
     BYTE zero_capacity_buffer[1];
     WCHAR string_buffer[256];
+    WCHAR marker_paths[TEST_GRAPH_PACKAGE_COUNT][MAX_PATH] = {{0}};
     PACKAGE_ID *id;
     HANDLE process = NULL, process_thread = NULL, restricted = NULL, self;
     void *noaccess = NULL;
@@ -1446,7 +1549,7 @@ static void test_current_package_graph(void)
     }
 
     ret = create_remote_package_graph_process(graph, graph_size, &process,
-            &process_thread);
+            &process_thread, marker_paths);
     ok(!ret, "Failed to create packaged query process, status %#lx.\n", ret);
     if (!ret)
     {
@@ -1548,6 +1651,14 @@ done:
     if (restricted) CloseHandle(restricted);
     if (process_thread) CloseHandle(process_thread);
     if (process) CloseHandle(process);
+    for (i = 0; i < ARRAY_SIZE(marker_paths); ++i)
+    {
+        if (!marker_paths[i][0]) continue;
+        ok(DeleteFileW(marker_paths[i]),
+                "Failed to delete package marker %s, error %lu.\n",
+                debugstr_w(marker_paths[i]), GetLastError());
+        marker_paths[i][0] = 0;
+    }
     params->PackageDependencyData = original_graph;
     if (noaccess) VirtualFree(noaccess, 0, MEM_RELEASE);
     HeapFree(GetProcessHeap(), 0, info_buffer);

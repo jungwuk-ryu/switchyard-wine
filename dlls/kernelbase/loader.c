@@ -980,6 +980,7 @@ static HMODULE load_appx_graph_module( const struct appx_loader_graph *graph,
     UINT32 package_index, root_length, path_length, path_basename, separator;
     UINT32 full_length;
     WCHAR *full_path = NULL, *loaded_path = NULL;
+    UNICODE_STRING full_name;
     HMODULE module = NULL;
     DWORD loaded_length, error;
 
@@ -1036,7 +1037,10 @@ static HMODULE load_appx_graph_module( const struct appx_loader_graph *graph,
     memcpy( full_path + root_length + separator, relative_path,
             (path_length + 1) * sizeof(*full_path) );
 
-    if (!(module = LoadLibraryExW( full_path, 0, 0 ))) goto done;
+    RtlInitUnicodeString( &full_name, full_path );
+    if (!set_ntstatus( __wine_load_packaged_library(
+            graph->data, &full_name, &module )))
+        goto done;
     loaded_length = GetModuleFileNameW( module, loaded_path, full_length + 2 );
     if (loaded_length != full_length ||
         wcsnicmp( loaded_path, full_path, full_length ))

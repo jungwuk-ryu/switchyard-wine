@@ -1773,6 +1773,7 @@
 @ extern -private __wine_unixlib_handle
 @ stdcall __wine_get_unix_env(ptr ptr long)
 @ stdcall __wine_get_process_package_graph(long ptr ptr)
+@ stdcall __wine_load_packaged_library(ptr ptr ptr)
 
 # Debugging
 @ stdcall -norelay __wine_dbg_write(ptr long)

@@ -2179,6 +2179,19 @@ static void test_package_graph_loader(void)
         CloseHandle( writable_lease );
     }
 
+    CloseHandle( fixture.lease );
+    fixture.lease = CreateFileW(
+        fixture.lease_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
+    ok( fixture.lease != INVALID_HANDLE_VALUE,
+        "Could not reopen protected generation lease, error %lu.\n",
+        GetLastError() );
+    if (fixture.lease == INVALID_HANDLE_VALUE)
+    {
+        delete_package_loader_fixture( &fixture );
+        return;
+    }
+
     status = create_package_loader_process(
         L"happy", &fixture, TRUE, NULL,
         &packaged_process, &packaged_thread );
