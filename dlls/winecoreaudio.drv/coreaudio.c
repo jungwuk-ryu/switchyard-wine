@@ -796,14 +796,24 @@ static HRESULT validate_spatial_device_listener_capability(AudioDeviceID dev_id)
 static OSStatus ca_prepare_spatial_inputs(struct coreaudio_stream *stream,
         UInt32 nframes, UINT64 *consumed_read_frame, UINT32 *consumed_frames)
 {
+    const struct coreaudio_spatial_object_state * const object_states =
+            stream->spatial_object_states;
+    const UINT64 * const metadata_sequences =
+            stream->spatial_metadata_sequences;
+    float * const dynamic_buffer = stream->spatial_dynamic_buffer;
     const struct coreaudio_spatial_object_state *states = NULL;
     UINT64 read_frame, write_frame;
     UINT64 sequence = 0;
+    const UINT32 metadata_capacity = stream->spatial_metadata_capacity;
+    const UINT32 dynamic_objects = stream->spatial_dynamic_objects;
     UINT32 bed_channel, channel, frame, in_quantum = 0, record;
     UINT32 source_frame, to_copy_frames;
     BOOL unity, playing;
 
     if (nframes > stream->spatial_dry_capacity)
+        return kAudio_ParamError;
+    if (dynamic_objects && (!metadata_capacity || !metadata_sequences ||
+            !object_states || !dynamic_buffer))
         return kAudio_ParamError;
     stream->spatial_render_frames = nframes;
 
@@ -821,15 +831,15 @@ static OSStatus ca_prepare_spatial_inputs(struct coreaudio_stream *stream,
     unity = __atomic_load_n(&stream->spatial_volumes_are_unity,
             __ATOMIC_ACQUIRE);
     source_frame = read_frame % stream->bufsize_frames;
-    if (stream->spatial_dynamic_objects && to_copy_frames)
+    if (dynamic_objects && to_copy_frames)
     {
         sequence = read_frame / stream->period_frames;
         in_quantum = read_frame - sequence * stream->period_frames;
-        record = sequence % stream->spatial_metadata_capacity;
-        if (__atomic_load_n(&stream->spatial_metadata_sequences[record],
+        record = sequence % metadata_capacity;
+        if (__atomic_load_n(&metadata_sequences[record],
                 __ATOMIC_ACQUIRE) == sequence)
-            states = stream->spatial_object_states +
-                    (size_t)record * stream->spatial_dynamic_objects;
+            states = object_states +
+                    (size_t)record * dynamic_objects;
     }
 
     for (frame = 0; frame < to_copy_frames; ++frame)
@@ -854,7 +864,7 @@ static OSStatus ca_prepare_spatial_inputs(struct coreaudio_stream *stream,
                         stream->spatial_bed_channels + bed_channel++] = sample;
         }
 
-        for (slot = 0; slot < stream->spatial_dynamic_objects; ++slot)
+        for (slot = 0; slot < dynamic_objects; ++slot)
         {
             float sample = source[stream->spatial_dynamic_channel + slot];
 
@@ -863,25 +873,24 @@ static OSStatus ca_prepare_spatial_inputs(struct coreaudio_stream *stream,
             else if (!unity)
                 sample *= load_spatial_volume(stream,
                         stream->spatial_dynamic_channel + slot);
-            stream->spatial_dynamic_buffer[(size_t)slot *
+            dynamic_buffer[(size_t)slot *
                     stream->spatial_dry_capacity + frame] = sample;
         }
 
         if (++source_frame == stream->bufsize_frames)
             source_frame = 0;
-        if (stream->spatial_dynamic_objects &&
-                ++in_quantum == stream->period_frames)
+        if (dynamic_objects && ++in_quantum == stream->period_frames)
         {
             in_quantum = 0;
             ++sequence;
-            record = sequence % stream->spatial_metadata_capacity;
+            record = sequence % metadata_capacity;
             states = NULL;
             if (frame + 1 < to_copy_frames &&
                     __atomic_load_n(
-                            &stream->spatial_metadata_sequences[record],
+                            &metadata_sequences[record],
                             __ATOMIC_ACQUIRE) == sequence)
-                states = stream->spatial_object_states +
-                        (size_t)record * stream->spatial_dynamic_objects;
+                states = object_states +
+                        (size_t)record * dynamic_objects;
         }
     }
 
@@ -892,13 +901,13 @@ static OSStatus ca_prepare_spatial_inputs(struct coreaudio_stream *stream,
                 to_copy_frames) * stream->spatial_bed_channels * sizeof(float));
         memset(stream->spatial_dry_buffer + to_copy_frames, 0,
                 (nframes - to_copy_frames) * sizeof(float));
-        for (channel = 0; channel < stream->spatial_dynamic_objects; ++channel)
-            memset(stream->spatial_dynamic_buffer + (size_t)channel *
+        for (channel = 0; channel < dynamic_objects; ++channel)
+            memset(dynamic_buffer + (size_t)channel *
                     stream->spatial_dry_capacity + to_copy_frames, 0,
                     (nframes - to_copy_frames) * sizeof(float));
     }
 
-    if (stream->spatial_dynamic_objects && to_copy_frames &&
+    if (dynamic_objects && to_copy_frames &&
             schedule_spatial_positions(stream, read_frame, to_copy_frames) != noErr)
     {
         __atomic_store_n(&stream->invalidated, TRUE, __ATOMIC_RELEASE);
