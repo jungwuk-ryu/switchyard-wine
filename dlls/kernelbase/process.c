@@ -30,6 +30,7 @@
 #include "processsnapshot.h"
 
 #include "kernelbase.h"
+#include "wine/appx_package_graph.h"
 #include "wine/debug.h"
 #include "wine/condrv.h"
 
@@ -553,6 +554,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     HANDLE parent = 0, debug = 0;
     ULONG nt_flags = 0;
     USHORT machine = 0;
+    BOOL package_graph_seen = FALSE;
     NTSTATUS status;
 
     /* Process the AppName and/or CmdLine to get module name and path */
@@ -694,6 +696,20 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                     case PROC_THREAD_ATTRIBUTE_MACHINE_TYPE:
                         machine = *(USHORT *)attrs->attrs[i].value;
                         TRACE( "PROC_THREAD_ATTRIBUTE_MACHINE %x.\n", machine );
+                        break;
+                    case WINE_PROC_THREAD_ATTRIBUTE_PACKAGE_GRAPH:
+                        if (package_graph_seen ||
+                            attrs->attrs[i].size !=
+                                sizeof(struct wine_appx_graph_attach) ||
+                            !attrs->attrs[i].value)
+                        {
+                            status = STATUS_INVALID_PARAMETER;
+                            goto done;
+                        }
+                        package_graph_seen = TRUE;
+                        params->PackageDependencyData = attrs->attrs[i].value;
+                        TRACE( "WINE_PROC_THREAD_ATTRIBUTE_PACKAGE_GRAPH %p.\n",
+                               attrs->attrs[i].value );
                         break;
                     default:
                         FIXME("Unsupported attribute %#Ix.\n", attrs->attrs[i].attr);
@@ -1983,6 +1999,10 @@ static inline DWORD validate_proc_thread_attribute( DWORD_PTR attr, SIZE_T size 
         break;
     case PROC_THREAD_ATTRIBUTE_GROUP_AFFINITY:
         if (size != sizeof(GROUP_AFFINITY)) return ERROR_BAD_LENGTH;
+        break;
+    case WINE_PROC_THREAD_ATTRIBUTE_PACKAGE_GRAPH:
+        if (size != sizeof(struct wine_appx_graph_attach))
+            return ERROR_BAD_LENGTH;
         break;
     default:
         FIXME( "Unhandled attribute %Iu\n", attr & PROC_THREAD_ATTRIBUTE_NUMBER );

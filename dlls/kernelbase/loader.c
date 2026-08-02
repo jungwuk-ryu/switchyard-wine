@@ -29,6 +29,7 @@
 #include "winternl.h"
 #include "ddk/ntddk.h"
 #include "kernelbase.h"
+#include "wine/appx_package_graph.h"
 #include "wine/list.h"
 #include "wine/asm.h"
 #include "wine/debug.h"
@@ -583,15 +584,530 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
     return module;
 }
 
+enum appx_loader_wire_offset
+{
+    APPX_HEADER_PACKAGE_COUNT_OFFSET       = 44,
+    APPX_HEADER_PACKAGES_OFFSET            = 48,
+    APPX_HEADER_LOADER_COUNT_OFFSET        = 52,
+    APPX_HEADER_LOADERS_OFFSET             = 56,
+
+    APPX_PACKAGE_ROOT_REF_OFFSET           = 104,
+
+    APPX_LOADER_PACKAGE_INDEX_OFFSET       = 0,
+    APPX_LOADER_BASENAME_REF_OFFSET        = 8,
+    APPX_LOADER_PATH_REF_OFFSET            = 16,
+};
+
+struct appx_loader_graph
+{
+    const BYTE *data;
+    UINT32 size;
+    UINT32 package_count;
+    UINT32 packages_offset;
+    UINT32 loader_count;
+    UINT32 loaders_offset;
+};
+
+struct appx_loader_graph_cache
+{
+    const BYTE *data;
+    struct appx_loader_graph graph;
+};
+
+static struct appx_loader_graph_cache *appx_loader_graph_cache;
+
+static BOOL appx_validate_loader_graph_domain( const struct appx_loader_graph *graph );
+
+static BOOL get_appx_loader_graph( const BYTE *data, struct appx_loader_graph *graph )
+{
+    struct appx_loader_graph_cache *cache, *new_cache;
+    BOOL valid = FALSE;
+    UINT32 size;
+
+    cache = InterlockedCompareExchangePointer( (void **)&appx_loader_graph_cache,
+                                               NULL, NULL );
+    if (cache && cache->data == data)
+    {
+        *graph = cache->graph;
+        return TRUE;
+    }
+
+    __TRY
+    {
+        size = wine_appx_graph_read_u32( data + WINE_APPX_GRAPH_HEADER_TOTAL_SIZE_OFFSET );
+        if (wine_appx_graph_validate_blob( data, size ))
+        {
+            graph->data = data;
+            graph->size = size;
+            graph->package_count = wine_appx_graph_read_u32(
+                data + APPX_HEADER_PACKAGE_COUNT_OFFSET );
+            graph->packages_offset = wine_appx_graph_read_u32(
+                data + APPX_HEADER_PACKAGES_OFFSET );
+            graph->loader_count = wine_appx_graph_read_u32(
+                data + APPX_HEADER_LOADER_COUNT_OFFSET );
+            graph->loaders_offset = wine_appx_graph_read_u32(
+                data + APPX_HEADER_LOADERS_OFFSET );
+            if (appx_validate_loader_graph_domain( graph ))
+            {
+                if ((new_cache = HeapAlloc( GetProcessHeap(), 0,
+                                            sizeof(*new_cache) )))
+                {
+                    new_cache->data = data;
+                    new_cache->graph = *graph;
+                    if (InterlockedCompareExchangePointer(
+                            (void **)&appx_loader_graph_cache, new_cache, NULL ))
+                        HeapFree( GetProcessHeap(), 0, new_cache );
+                }
+                valid = TRUE;
+            }
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        valid = FALSE;
+    }
+    __ENDTRY
+    return valid;
+}
+
+static BOOL appx_path_component_is_reserved( const WCHAR *component, UINT32 length )
+{
+    WCHAR name[5];
+    UINT32 i, base_length = 0;
+
+    while (base_length < length && component[base_length] != '.') base_length++;
+    if (!base_length || base_length > 4) return FALSE;
+    for (i = 0; i < base_length; i++) name[i] = RtlUpcaseUnicodeChar( component[i] );
+    name[base_length] = 0;
+    if ((base_length == 3 && (!wcscmp( name, L"CON" ) ||
+                              !wcscmp( name, L"PRN" ) ||
+                              !wcscmp( name, L"AUX" ) ||
+                              !wcscmp( name, L"NUL" ))) ||
+        (base_length == 4 && (!wcsncmp( name, L"COM", 3 ) ||
+                              !wcsncmp( name, L"LPT", 3 )) &&
+         name[3] >= '1' && name[3] <= '9'))
+        return TRUE;
+    return FALSE;
+}
+
+static BOOL appx_validate_path_components( const WCHAR *path, UINT32 start,
+                                           UINT32 length )
+{
+    UINT32 component = start, i;
+
+    if (start == length) return TRUE;
+    for (i = start; i <= length; i++)
+    {
+        WCHAR ch = i == length ? '\\' : path[i];
+
+        if (ch == '/' || ch == ':' || ch == '"' || ch == '<' || ch == '>' ||
+            ch == '|' || ch == '?' || ch == '*' || ch < 0x20)
+            return FALSE;
+        if (ch != '\\') continue;
+        if (i == component ||
+            (i - component == 1 && path[component] == '.') ||
+            (i - component == 2 && path[component] == '.' &&
+             path[component + 1] == '.') ||
+            path[i - 1] == ' ' || path[i - 1] == '.' ||
+            i - component > 255 ||
+            appx_path_component_is_reserved( path + component, i - component ))
+            return FALSE;
+        component = i + 1;
+    }
+    return TRUE;
+}
+
+static BOOL appx_validate_package_root( const WCHAR *root, UINT32 chars )
+{
+    UINT32 length;
+
+    if (chars < 4 || chars > UNICODE_STRING_MAX_CHARS) return FALSE;
+    length = chars - 1;
+    if (!((root[0] >= 'A' && root[0] <= 'Z') ||
+          (root[0] >= 'a' && root[0] <= 'z')) ||
+        root[1] != ':' || root[2] != '\\')
+        return FALSE;
+    if (length > 3 && root[length - 1] == '\\') return FALSE;
+    return appx_validate_path_components( root, 3, length );
+}
+
+static BOOL appx_validate_relative_path( const WCHAR *path, UINT32 chars )
+{
+    if (chars < 2 || chars > UNICODE_STRING_MAX_CHARS || path[0] == '\\')
+        return FALSE;
+    return appx_validate_path_components( path, 0, chars - 1 );
+}
+
+static INT appx_compare_string_ci( const WCHAR *left, UINT32 left_length,
+                                   const BYTE *data,
+                                   struct wine_appx_graph_string_ref right )
+{
+    UINT32 right_length = right.chars - 1, length;
+    UINT32 i;
+
+    length = left_length < right_length ? left_length : right_length;
+    for (i = 0; i < length; i++)
+    {
+        WCHAR left_char = RtlUpcaseUnicodeChar( left[i] );
+        WCHAR right_char = RtlUpcaseUnicodeChar(
+            wine_appx_graph_read_u16( data + right.offset + i * sizeof(WCHAR) ) );
+
+        if (left_char != right_char) return left_char < right_char ? -1 : 1;
+    }
+    if (left_length == right_length) return 0;
+    return left_length < right_length ? -1 : 1;
+}
+
+static INT appx_compare_graph_refs_ci(
+    const BYTE *data, struct wine_appx_graph_string_ref left,
+    struct wine_appx_graph_string_ref right )
+{
+    return appx_compare_string_ci( (const WCHAR *)(data + left.offset),
+                                   left.chars - 1, data, right );
+}
+
+static BOOL appx_validate_loader_graph_domain( const struct appx_loader_graph *graph )
+{
+    struct wine_appx_graph_string_ref previous_basename = {0};
+    struct wine_appx_graph_string_ref previous_path = {0};
+    UINT32 previous_package = 0, previous_rank = 0, i;
+
+    for (i = 0; i < graph->package_count; i++)
+    {
+        const BYTE *record = graph->data + graph->packages_offset +
+                             i * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+        struct wine_appx_graph_string_ref root = wine_appx_graph_get_ref(
+            record, APPX_PACKAGE_ROOT_REF_OFFSET );
+
+        if (!appx_validate_package_root(
+                (const WCHAR *)(graph->data + root.offset), root.chars ))
+            return FALSE;
+    }
+
+    for (i = 0; i < graph->loader_count; i++)
+    {
+        const BYTE *record = graph->data + graph->loaders_offset +
+                             i * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        struct wine_appx_graph_string_ref basename = wine_appx_graph_get_ref(
+            record, APPX_LOADER_BASENAME_REF_OFFSET );
+        struct wine_appx_graph_string_ref path = wine_appx_graph_get_ref(
+            record, APPX_LOADER_PATH_REF_OFFSET );
+        const WCHAR *basename_string = (const WCHAR *)(graph->data + basename.offset);
+        const WCHAR *path_string = (const WCHAR *)(graph->data + path.offset);
+        UINT32 package_index = wine_appx_graph_read_u32(
+            record + APPX_LOADER_PACKAGE_INDEX_OFFSET );
+        UINT32 search_rank = wine_appx_graph_read_u32(
+            record + WINE_APPX_GRAPH_LOADER_SEARCH_RANK_OFFSET );
+        UINT64 change_time = wine_appx_graph_read_u64(
+            record + WINE_APPX_GRAPH_LOADER_CHANGE_TIME_OFFSET );
+        UINT64 file_size = wine_appx_graph_read_u64(
+            record + WINE_APPX_GRAPH_LOADER_FILE_SIZE_OFFSET );
+        UINT32 path_basename = path.chars - 1, j;
+        INT comparison;
+
+        if (package_index >= graph->package_count ||
+            (search_rank >= WINE_APPX_GRAPH_MAX_LOADER_SEARCH_PATHS &&
+             search_rank != WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY) ||
+            !change_time || (change_time >> 63) ||
+            !file_size || (file_size >> 63) ||
+            !appx_validate_relative_path( basename_string, basename.chars ) ||
+            !appx_validate_relative_path( path_string, path.chars ))
+            return FALSE;
+        for (j = 0; j + 1 < basename.chars; j++)
+            if (basename_string[j] == '\\') return FALSE;
+        while (path_basename && path_string[path_basename - 1] != '\\')
+            path_basename--;
+        if (path.chars - 1 - path_basename != basename.chars - 1)
+            return FALSE;
+        for (j = 0; j + 1 < basename.chars; j++)
+            if (path_string[path_basename + j] != basename_string[j])
+                return FALSE;
+
+        if (i)
+        {
+            comparison = appx_compare_graph_refs_ci(
+                graph->data, previous_basename, basename );
+            if (comparison > 0 ||
+                (!comparison && previous_package > package_index) ||
+                (!comparison && previous_package == package_index &&
+                 previous_rank > search_rank) ||
+                (!comparison && previous_package == package_index &&
+                 previous_rank == search_rank &&
+                 appx_compare_graph_refs_ci(
+                     graph->data, previous_path, path ) >= 0))
+                return FALSE;
+        }
+        previous_basename = basename;
+        previous_path = path;
+        previous_package = package_index;
+        previous_rank = search_rank;
+    }
+    return TRUE;
+}
+
+static BOOL appx_normalize_module_name( const WCHAR *name, WCHAR **normalized,
+                                        UINT32 *length, UINT32 *basename_offset,
+                                        BOOL *has_path )
+{
+    UINT32 input_length, output_length, basename = 0, i;
+    BOOL append_extension = TRUE;
+    WCHAR *result;
+
+    *normalized = NULL;
+    for (input_length = 0; input_length < UNICODE_STRING_MAX_CHARS;
+         input_length++)
+        if (!name[input_length]) break;
+    if (!input_length)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    if (input_length == UNICODE_STRING_MAX_CHARS)
+    {
+        SetLastError( ERROR_FILENAME_EXCED_RANGE );
+        return FALSE;
+    }
+    for (i = 0; i < input_length; i++)
+    {
+        if (name[i] == '/')
+        {
+            SetLastError( ERROR_INVALID_PARAMETER );
+            return FALSE;
+        }
+        if (name[i] == '\\') basename = i + 1;
+    }
+    if (!basename)
+        *has_path = FALSE;
+    else
+        *has_path = TRUE;
+    if (!appx_validate_relative_path( name, input_length + 1 ))
+    {
+        /*
+         * A final dot is a LoadPackagedLibrary sentinel that suppresses the
+         * implicit .dll extension.  Validate the path after removing it.
+         */
+        if (name[input_length - 1] != '.' || input_length == 1 ||
+            !appx_validate_relative_path( name, input_length ))
+        {
+            SetLastError( ERROR_INVALID_PARAMETER );
+            return FALSE;
+        }
+        input_length--;
+        append_extension = FALSE;
+    }
+    else
+    {
+        for (i = basename; i < input_length; i++)
+            if (name[i] == '.')
+            {
+                append_extension = FALSE;
+                break;
+            }
+    }
+    output_length = input_length + (append_extension ? 4 : 0);
+    if (output_length >= UNICODE_STRING_MAX_CHARS)
+    {
+        SetLastError( ERROR_FILENAME_EXCED_RANGE );
+        return FALSE;
+    }
+    if (!(result = HeapAlloc( GetProcessHeap(), 0,
+                              (output_length + 1) * sizeof(*result) )))
+    {
+        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+        return FALSE;
+    }
+    memcpy( result, name, input_length * sizeof(*result) );
+    if (append_extension) memcpy( result + input_length, L".dll", 5 * sizeof(WCHAR) );
+    else result[output_length] = 0;
+    *normalized = result;
+    *length = output_length;
+    *basename_offset = basename;
+    return TRUE;
+}
+
+static const BYTE *appx_find_loader_record( const struct appx_loader_graph *graph,
+                                            const WCHAR *name, UINT32 length,
+                                            UINT32 basename_offset, BOOL has_path )
+{
+    struct wine_appx_graph_string_ref basename, relative_path;
+    const BYTE *record;
+    UINT32 low = 0, high = graph->loader_count, middle;
+    INT comparison;
+
+    while (low < high)
+    {
+        middle = low + (high - low) / 2;
+        record = graph->data + graph->loaders_offset +
+                 middle * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        basename = wine_appx_graph_get_ref( record, APPX_LOADER_BASENAME_REF_OFFSET );
+        comparison = appx_compare_string_ci( name + basename_offset,
+                                             length - basename_offset,
+                                             graph->data, basename );
+        if (comparison > 0) low = middle + 1;
+        else high = middle;
+    }
+
+    while (low < graph->loader_count)
+    {
+        record = graph->data + graph->loaders_offset +
+                 low * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        basename = wine_appx_graph_get_ref( record, APPX_LOADER_BASENAME_REF_OFFSET );
+        if (appx_compare_string_ci( name + basename_offset, length - basename_offset,
+                                    graph->data, basename ))
+            break;
+        relative_path = wine_appx_graph_get_ref( record, APPX_LOADER_PATH_REF_OFFSET );
+        if ((!has_path &&
+             wine_appx_graph_read_u32(
+                 record + WINE_APPX_GRAPH_LOADER_SEARCH_RANK_OFFSET ) !=
+                 WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY) ||
+            (has_path && !appx_compare_string_ci(
+                name, length, graph->data, relative_path )))
+            return record;
+        low++;
+    }
+    return NULL;
+}
+
+static HMODULE load_appx_graph_module( const struct appx_loader_graph *graph,
+                                      const BYTE *loader_record,
+                                      const WCHAR *normalized_name,
+                                      UINT32 normalized_length,
+                                      UINT32 basename_offset )
+{
+    struct wine_appx_graph_string_ref root_ref, basename_ref, path_ref;
+    const WCHAR *root, *relative_path;
+    const BYTE *package_record;
+    UINT32 package_index, root_length, path_length, path_basename, separator;
+    UINT32 full_length;
+    WCHAR *full_path = NULL, *loaded_path = NULL;
+    HMODULE module = NULL;
+    DWORD loaded_length, error;
+
+    package_index = wine_appx_graph_read_u32(
+        loader_record + APPX_LOADER_PACKAGE_INDEX_OFFSET );
+    if (package_index >= graph->package_count)
+    {
+        SetLastError( APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT );
+        return NULL;
+    }
+    package_record = graph->data + graph->packages_offset +
+                     package_index * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+    root_ref = wine_appx_graph_get_ref( package_record, APPX_PACKAGE_ROOT_REF_OFFSET );
+    basename_ref = wine_appx_graph_get_ref(
+        loader_record, APPX_LOADER_BASENAME_REF_OFFSET );
+    path_ref = wine_appx_graph_get_ref( loader_record, APPX_LOADER_PATH_REF_OFFSET );
+    root = (const WCHAR *)(graph->data + root_ref.offset);
+    relative_path = (const WCHAR *)(graph->data + path_ref.offset);
+    path_basename = path_ref.chars - 1;
+    while (path_basename && relative_path[path_basename - 1] != '\\')
+        path_basename--;
+    if (!appx_validate_package_root( root, root_ref.chars ) ||
+        !appx_validate_relative_path( relative_path, path_ref.chars ) ||
+        appx_compare_string_ci( normalized_name + basename_offset,
+                                normalized_length - basename_offset,
+                                graph->data, basename_ref ) ||
+        appx_compare_string_ci( relative_path + path_basename,
+                                path_ref.chars - 1 - path_basename,
+                                graph->data, basename_ref ))
+    {
+        SetLastError( APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT );
+        return NULL;
+    }
+
+    path_length = path_ref.chars - 1;
+    root_length = root_ref.chars - 1;
+    separator = root[root_length - 1] != '\\';
+    if (root_length >= UNICODE_STRING_MAX_CHARS - path_length - separator)
+    {
+        SetLastError( ERROR_FILENAME_EXCED_RANGE );
+        return NULL;
+    }
+    full_length = root_length + separator + path_length;
+    if (!(full_path = HeapAlloc( GetProcessHeap(), 0,
+                                  (full_length + 1) * sizeof(*full_path) )) ||
+        !(loaded_path = HeapAlloc( GetProcessHeap(), 0,
+                                    (full_length + 2) * sizeof(*loaded_path) )))
+    {
+        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+        goto done;
+    }
+    memcpy( full_path, root, root_length * sizeof(*full_path) );
+    if (separator) full_path[root_length] = '\\';
+    memcpy( full_path + root_length + separator, relative_path,
+            (path_length + 1) * sizeof(*full_path) );
+
+    if (!(module = LoadLibraryExW( full_path, 0, 0 ))) goto done;
+    loaded_length = GetModuleFileNameW( module, loaded_path, full_length + 2 );
+    if (loaded_length != full_length ||
+        wcsnicmp( loaded_path, full_path, full_length ))
+    {
+        FreeLibrary( module );
+        module = NULL;
+        SetLastError( ERROR_INVALID_DATA );
+    }
+
+done:
+    error = GetLastError();
+    HeapFree( GetProcessHeap(), 0, loaded_path );
+    HeapFree( GetProcessHeap(), 0, full_path );
+    SetLastError( error );
+    return module;
+}
+
 
 /***********************************************************************
  *      LoadPackagedLibrary    (kernelbase.@)
  */
 HMODULE WINAPI /* DECLSPEC_HOTPATCH */ LoadPackagedLibrary( LPCWSTR name, DWORD reserved )
 {
-    FIXME( "semi-stub, name %s, reserved %#lx.\n", debugstr_w(name), reserved );
-    SetLastError( APPMODEL_ERROR_NO_PACKAGE );
-    return NULL;
+    const BYTE *data = NtCurrentTeb()->Peb->ProcessParameters->PackageDependencyData;
+    struct appx_loader_graph graph;
+    const BYTE *record;
+    WCHAR *normalized = NULL;
+    UINT32 length, basename_offset;
+    BOOL has_path;
+    HMODULE module;
+
+    if (!data)
+    {
+        SetLastError( APPMODEL_ERROR_NO_PACKAGE );
+        return NULL;
+    }
+    if (reserved || !name)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return NULL;
+    }
+    if (!get_appx_loader_graph( data, &graph ))
+    {
+        SetLastError( APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT );
+        return NULL;
+    }
+
+    __TRY
+    {
+        appx_normalize_module_name( name, &normalized, &length,
+                                    &basename_offset, &has_path );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+    }
+    __ENDTRY
+    if (!normalized) return NULL;
+
+    record = appx_find_loader_record( &graph, normalized, length,
+                                      basename_offset, has_path );
+    if (!record)
+    {
+        HeapFree( GetProcessHeap(), 0, normalized );
+        SetLastError( ERROR_MOD_NOT_FOUND );
+        return NULL;
+    }
+    module = load_appx_graph_module( &graph, record, normalized, length,
+                                     basename_offset );
+    HeapFree( GetProcessHeap(), 0, normalized );
+    return module;
 }
 
 

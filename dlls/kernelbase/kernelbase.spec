@@ -495,7 +495,9 @@
 @ stdcall GetCurrentPackageFullName(ptr ptr)
 @ stdcall GetCurrentPackageId(ptr ptr)
 @ stdcall GetCurrentPackageInfo(long ptr ptr ptr)
+@ stdcall GetCurrentPackageInfo2(long long ptr ptr ptr)
 @ stdcall GetCurrentPackagePath(ptr ptr)
+@ stdcall GetCurrentPackagePath2(long ptr ptr)
 # @ stub GetCurrentPackageResourcesContext
 # @ stub GetCurrentPackageSecurityContext
 @ stdcall -norelay GetCurrentProcess() kernelbase_GetCurrentProcess
@@ -640,6 +642,7 @@
 # @ stub GetPackageOSMaxVersionTested
 # @ stub GetPackagePath
 @ stdcall GetPackagePathByFullName(wstr ptr wstr)
+@ stdcall GetPackagePathByFullName2(wstr long ptr wstr)
 # @ stub GetPackagePathOnVolume
 # @ stub GetPackageProperty
 # @ stub GetPackagePropertyString
@@ -1050,14 +1053,14 @@
 @ stdcall OutputDebugStringA(str)
 @ stdcall OutputDebugStringW(wstr)
 # @ stub OverrideRoamingDataModificationTimesInRange
-# @ stub PackageFamilyNameFromFullName
-# @ stub PackageFamilyNameFromId
+@ stdcall PackageFamilyNameFromFullName(wstr ptr ptr)
+@ stdcall PackageFamilyNameFromId(ptr ptr ptr)
 # @ stub PackageFamilyNameFromProductId
-# @ stub PackageFullNameFromId
+@ stdcall PackageFullNameFromId(ptr ptr ptr)
 # @ stub PackageFullNameFromProductId
 @ stdcall PackageIdFromFullName(wstr long ptr ptr)
 # @ stub PackageIdFromProductId
-# @ stub PackageNameAndPublisherIdFromFamilyName
+@ stdcall PackageNameAndPublisherIdFromFamilyName(wstr ptr ptr ptr ptr)
 # @ stub PackageRelativeApplicationIdFromProductId
 # @ stub PackageSidFromFamilyName
 # @ stub PackageSidFromProductId

@@ -58,6 +58,9 @@
 #define PACKAGE_VERSION_MIN_LENGTH 7
 #define PACKAGE_VERSION_MAX_LENGTH 23
 
+#define PACKAGE_INFORMATION_BASIC 0x00000000
+#define PACKAGE_INFORMATION_FULL  0x00000100
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
@@ -94,6 +97,16 @@ typedef enum AppPolicyWindowingModel
     AppPolicyWindowingModel_ClassicPhone   = 3
 } AppPolicyWindowingModel;
 
+typedef enum PackagePathType
+{
+    PackagePathType_Install           = 0,
+    PackagePathType_Mutable           = 1,
+    PackagePathType_Effective         = 2,
+    PackagePathType_MachineExternal   = 3,
+    PackagePathType_UserExternal      = 4,
+    PackagePathType_EffectiveExternal = 5
+} PackagePathType;
+
 typedef struct PACKAGE_VERSION
 {
     union
@@ -129,7 +142,25 @@ LONG WINAPI AppPolicyGetProcessTerminationMethod(HANDLE token, AppPolicyProcessT
 LONG WINAPI AppPolicyGetShowDeveloperDiagnostic(HANDLE token, AppPolicyShowDeveloperDiagnostic *policy);
 LONG WINAPI AppPolicyGetThreadInitializationType(HANDLE token, AppPolicyThreadInitializationType *policy);
 LONG WINAPI AppPolicyGetWindowingModel(HANDLE processToken, AppPolicyWindowingModel *policy);
+LONG WINAPI GetCurrentPackageInfo2(UINT32 flags, PackagePathType package_path_type,
+                                   UINT32 *buffer_length, BYTE *buffer, UINT32 *count);
+LONG WINAPI GetCurrentPackagePath2(PackagePathType package_path_type, UINT32 *path_length,
+                                   WCHAR *path);
+LONG WINAPI GetPackagePathByFullName(const WCHAR *full_name, UINT32 *path_length, WCHAR *path);
+LONG WINAPI GetPackagePathByFullName2(const WCHAR *full_name, PackagePathType package_path_type,
+                                      UINT32 *path_length, WCHAR *path);
+LONG WINAPI GetPackagesByPackageFamily(const WCHAR *family_name, UINT32 *count,
+                                       WCHAR **full_names, UINT32 *buffer_length, WCHAR *buffer);
+LONG WINAPI PackageFamilyNameFromFullName(const WCHAR *full_name, UINT32 *family_name_length,
+                                          WCHAR *family_name);
+LONG WINAPI PackageFamilyNameFromId(const PACKAGE_ID *id, UINT32 *family_name_length,
+                                    WCHAR *family_name);
+LONG WINAPI PackageFullNameFromId(const PACKAGE_ID *id, UINT32 *full_name_length,
+                                  WCHAR *full_name);
 LONG WINAPI PackageIdFromFullName(const WCHAR *full_name, UINT32 flags, UINT32 *buffer_length, BYTE *buffer);
+LONG WINAPI PackageNameAndPublisherIdFromFamilyName(const WCHAR *family_name, UINT32 *name_length,
+                                                    WCHAR *name, UINT32 *publisher_id_length,
+                                                    WCHAR *publisher_id);
 
 #if defined(__cplusplus)
 }

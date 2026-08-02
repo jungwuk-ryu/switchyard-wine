@@ -22,13 +22,33 @@
 #define WIN32_NO_STATUS
 #include "wine/test.h"
 #include "winbase.h"
+#include "winioctl.h"
 #include "winternl.h"
 #include "appmodel.h"
+#include "wine/appx_package_graph.h"
 
 static BOOL (WINAPI * pGetProductInfo)(DWORD, DWORD, DWORD, DWORD, DWORD *);
 static UINT (WINAPI * pEnumSystemFirmwareTables)(DWORD, void *, DWORD);
 static UINT (WINAPI * pGetSystemFirmwareTable)(DWORD, DWORD, void *, DWORD);
+static LONG (WINAPI * pGetCurrentApplicationUserModelId)(UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetCurrentPackageFamilyName)(UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetCurrentPackageFullName)(UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetCurrentPackageId)(UINT32 *, BYTE *);
+static LONG (WINAPI * pGetCurrentPackageInfo)(UINT32, UINT32 *, BYTE *, UINT32 *);
+static LONG (WINAPI * pGetCurrentPackageInfo2)(UINT32, PackagePathType, UINT32 *, BYTE *, UINT32 *);
+static LONG (WINAPI * pGetCurrentPackagePath)(UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetCurrentPackagePath2)(PackagePathType, UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetPackageFamilyName)(HANDLE, UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetPackageFullName)(HANDLE, UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetPackagePathByFullName)(const WCHAR *, UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetPackagePathByFullName2)(const WCHAR *, PackagePathType, UINT32 *, WCHAR *);
+static LONG (WINAPI * pGetPackagesByPackageFamily)(const WCHAR *, UINT32 *, WCHAR **, UINT32 *, WCHAR *);
+static LONG (WINAPI * pPackageFamilyNameFromFullName)(const WCHAR *, UINT32 *, WCHAR *);
+static LONG (WINAPI * pPackageFamilyNameFromId)(const PACKAGE_ID *, UINT32 *, WCHAR *);
+static LONG (WINAPI * pPackageFullNameFromId)(const PACKAGE_ID *, UINT32 *, WCHAR *);
 static LONG (WINAPI * pPackageIdFromFullName)(const WCHAR *, UINT32, UINT32 *, BYTE *);
+static LONG (WINAPI * pPackageNameAndPublisherIdFromFamilyName)(const WCHAR *, UINT32 *, WCHAR *,
+                                                               UINT32 *, WCHAR *);
 static NTSTATUS (WINAPI * pNtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, void *, ULONG, ULONG *);
 static NTSTATUS (WINAPI * pRtlGetVersion)(RTL_OSVERSIONINFOEXW *);
 
@@ -49,7 +69,24 @@ static void init_function_pointers(void)
     GET_PROC(GetProductInfo);
     GET_PROC(EnumSystemFirmwareTables);
     GET_PROC(GetSystemFirmwareTable);
+    GET_PROC(GetCurrentApplicationUserModelId);
+    GET_PROC(GetCurrentPackageFamilyName);
+    GET_PROC(GetCurrentPackageFullName);
+    GET_PROC(GetCurrentPackageId);
+    GET_PROC(GetCurrentPackageInfo);
+    GET_PROC(GetCurrentPackageInfo2);
+    GET_PROC(GetCurrentPackagePath);
+    GET_PROC(GetCurrentPackagePath2);
+    GET_PROC(GetPackageFamilyName);
+    GET_PROC(GetPackageFullName);
+    GET_PROC(GetPackagePathByFullName);
+    GET_PROC(GetPackagePathByFullName2);
+    GET_PROC(GetPackagesByPackageFamily);
+    GET_PROC(PackageFamilyNameFromFullName);
+    GET_PROC(PackageFamilyNameFromId);
+    GET_PROC(PackageFullNameFromId);
     GET_PROC(PackageIdFromFullName);
+    GET_PROC(PackageNameAndPublisherIdFromFamilyName);
 
     hmod = GetModuleHandleA("ntdll.dll");
 
@@ -775,6 +812,750 @@ static void test_SystemFirmwareTable(void)
     HeapFree(GetProcessHeap(), 0, sfti);
 }
 
+#define TEST_GRAPH_HEADER_SIZE              WINE_APPX_GRAPH_BLOB_HEADER_SIZE
+#define TEST_GRAPH_PACKAGE_SIZE             WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE
+#define TEST_GRAPH_PACKAGE_COUNT_OFFSET     44
+#define TEST_GRAPH_PACKAGES_OFFSET          48
+#define TEST_GRAPH_LOADER_COUNT_OFFSET      52
+#define TEST_GRAPH_LOADERS_OFFSET           56
+#define TEST_GRAPH_STRINGS_OFFSET           60
+#define TEST_GRAPH_STRINGS_SIZE_OFFSET      64
+#define TEST_GRAPH_ACTIVATION_OFFSET        68
+#define TEST_GRAPH_CLASS_COUNT_OFFSET       104
+#define TEST_GRAPH_CLASSES_OFFSET           108
+
+#define TEST_PACKAGE_FILTER_HEAD            0x00000010
+#define TEST_PACKAGE_FILTER_DIRECT          0x00000020
+#define TEST_PACKAGE_FILTER_RESOURCE        0x00000040
+#define TEST_PACKAGE_FILTER_STATIC          0x00080000
+#define TEST_PACKAGE_FILTER_DYNAMIC         0x00100000
+
+struct test_package_info
+{
+    UINT32 reserved;
+    UINT32 flags;
+    WCHAR *path;
+    WCHAR *package_full_name;
+    WCHAR *package_family_name;
+    PACKAGE_ID package_id;
+};
+
+struct test_graph_builder
+{
+    BYTE *data;
+    UINT32 size;
+    UINT32 capacity;
+};
+
+static void test_graph_write_u16(BYTE *data, UINT16 value)
+{
+    data[0] = value;
+    data[1] = value >> 8;
+}
+
+static void test_graph_write_u32(BYTE *data, UINT32 value)
+{
+    test_graph_write_u16(data, value);
+    test_graph_write_u16(data + 2, value >> 16);
+}
+
+static void test_graph_write_u64(BYTE *data, UINT64 value)
+{
+    test_graph_write_u32(data, value);
+    test_graph_write_u32(data + 4, value >> 32);
+}
+
+static BOOL test_graph_append_string(struct test_graph_builder *builder,
+        UINT32 ref_offset, const WCHAR *string)
+{
+    UINT32 chars = lstrlenW(string) + 1, bytes = chars * sizeof(WCHAR);
+
+    if (builder->size > builder->capacity - bytes) return FALSE;
+    test_graph_write_u32(builder->data + ref_offset, builder->size);
+    test_graph_write_u32(builder->data + ref_offset + 4, chars);
+    memcpy(builder->data + builder->size, string, bytes);
+    builder->size += bytes;
+    return TRUE;
+}
+
+static BOOL test_graph_get_image_identity(DWORD *volume_serial,
+        DWORD *file_index_high, DWORD *file_index_low,
+        BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE])
+{
+    BY_HANDLE_FILE_INFORMATION info;
+    FILE_OBJECTID_BUFFER native_id;
+    IO_STATUS_BLOCK io;
+    WCHAR module[MAX_PATH];
+    HANDLE file;
+    BOOL ret;
+    UINT32 i;
+
+    if (!GetModuleFileNameW(NULL, module, ARRAY_SIZE(module))) return FALSE;
+    file = CreateFileW(module, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    ret = GetFileInformationByHandle(file, &info) &&
+            !NtFsControlFile(file, 0, NULL, NULL, &io, FSCTL_GET_OBJECT_ID,
+                    NULL, 0, &native_id, sizeof(native_id));
+    CloseHandle(file);
+    if (!ret || (!info.nFileIndexHigh && !info.nFileIndexLow)) return FALSE;
+    for (i = 0; i < WINE_APPX_GRAPH_OBJECT_ID_SIZE; i++)
+        if (native_id.ObjectId[i]) break;
+    if (i == WINE_APPX_GRAPH_OBJECT_ID_SIZE) return FALSE;
+    *volume_serial = info.dwVolumeSerialNumber;
+    *file_index_high = info.nFileIndexHigh;
+    *file_index_low = info.nFileIndexLow;
+    memcpy(object_id, native_id.ObjectId, WINE_APPX_GRAPH_OBJECT_ID_SIZE);
+    return TRUE;
+}
+
+static BYTE *build_test_package_graph(UINT32 *graph_size)
+{
+    static const WCHAR * const package0_strings[] =
+    {
+        L"TestPackage", L"CN=Test Publisher", L"", L"0abcdefghjkme",
+        L"TestPackage_1.2.3.4_neutral__0abcdefghjkme",
+        L"TestPackage_0abcdefghjkme", L"C:\\Packages\\TestPackage",
+    };
+    static const WCHAR * const package1_strings[] =
+    {
+        L"TestFramework", L"CN=Test Publisher", L"", L"0abcdefghjkme",
+        L"TestFramework_5.6.7.8_neutral__0abcdefghjkme",
+        L"TestFramework_0abcdefghjkme", L"C:\\Packages\\TestFramework",
+    };
+    static const WCHAR * const package2_strings[] =
+    {
+        L"TestTransitive", L"CN=Test Publisher", L"", L"0abcdefghjkme",
+        L"TestTransitive_9.10.11.12_neutral__0abcdefghjkme",
+        L"TestTransitive_0abcdefghjkme", L"C:\\Packages\\TestTransitive",
+    };
+    static const UINT32 package_ref_offsets[] = {56, 64, 72, 80, 88, 96, 104};
+    struct test_graph_builder builder;
+    BYTE *package0, *package1, *package2;
+    BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
+    DWORD volume_serial, file_index_high, file_index_low;
+    UINT32 fixed_size, i;
+
+    if (!test_graph_get_image_identity(&volume_serial, &file_index_high,
+            &file_index_low, object_id))
+        return NULL;
+    builder.capacity = 8192;
+    if (!(builder.data = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, builder.capacity)))
+        return NULL;
+    fixed_size = TEST_GRAPH_HEADER_SIZE + 3 * TEST_GRAPH_PACKAGE_SIZE;
+    builder.size = fixed_size;
+    package0 = builder.data + TEST_GRAPH_HEADER_SIZE;
+    package1 = package0 + TEST_GRAPH_PACKAGE_SIZE;
+    package2 = package1 + TEST_GRAPH_PACKAGE_SIZE;
+
+    if (!test_graph_append_string(&builder, 72, L"App") ||
+        !test_graph_append_string(&builder, 80, L"TestPackage_0abcdefghjkme!App") ||
+        !test_graph_append_string(&builder, 88, L"test.exe") ||
+        !test_graph_append_string(&builder, 96, L""))
+        goto failed;
+    for (i = 0; i < ARRAY_SIZE(package_ref_offsets); ++i)
+        if (!test_graph_append_string(&builder, TEST_GRAPH_HEADER_SIZE +
+                package_ref_offsets[i], package0_strings[i]))
+            goto failed;
+    for (i = 0; i < ARRAY_SIZE(package_ref_offsets); ++i)
+        if (!test_graph_append_string(&builder, TEST_GRAPH_HEADER_SIZE +
+                TEST_GRAPH_PACKAGE_SIZE + package_ref_offsets[i], package1_strings[i]))
+            goto failed;
+    for (i = 0; i < ARRAY_SIZE(package_ref_offsets); ++i)
+        if (!test_graph_append_string(&builder, TEST_GRAPH_HEADER_SIZE +
+                2 * TEST_GRAPH_PACKAGE_SIZE + package_ref_offsets[i], package2_strings[i]))
+            goto failed;
+
+    memcpy(builder.data, "SWXGRAPH", 8);
+    test_graph_write_u32(builder.data + 8, WINE_APPX_GRAPH_BLOB_VERSION);
+    test_graph_write_u32(builder.data + 12, TEST_GRAPH_HEADER_SIZE);
+    test_graph_write_u32(builder.data + 16, builder.size);
+    test_graph_write_u32(builder.data + 40,
+            WINE_APPX_GRAPH_CURRENT_ARCHITECTURE);
+    test_graph_write_u32(builder.data + TEST_GRAPH_PACKAGE_COUNT_OFFSET, 3);
+    test_graph_write_u32(builder.data + TEST_GRAPH_PACKAGES_OFFSET, TEST_GRAPH_HEADER_SIZE);
+    test_graph_write_u32(builder.data + TEST_GRAPH_LOADER_COUNT_OFFSET, 0);
+    test_graph_write_u32(builder.data + TEST_GRAPH_LOADERS_OFFSET, fixed_size);
+    test_graph_write_u32(builder.data + TEST_GRAPH_CLASS_COUNT_OFFSET, 0);
+    test_graph_write_u32(builder.data + TEST_GRAPH_CLASSES_OFFSET, fixed_size);
+    test_graph_write_u32(builder.data +
+            WINE_APPX_GRAPH_HEADER_VOLUME_SERIAL_OFFSET, volume_serial);
+    test_graph_write_u32(builder.data +
+            WINE_APPX_GRAPH_HEADER_FILE_INDEX_HIGH_OFFSET, file_index_high);
+    test_graph_write_u32(builder.data +
+            WINE_APPX_GRAPH_HEADER_FILE_INDEX_LOW_OFFSET, file_index_low);
+    memcpy(builder.data + WINE_APPX_GRAPH_HEADER_OBJECT_ID_OFFSET, object_id,
+            sizeof(object_id));
+    test_graph_write_u32(builder.data + TEST_GRAPH_STRINGS_OFFSET, fixed_size);
+    test_graph_write_u32(builder.data + TEST_GRAPH_STRINGS_SIZE_OFFSET,
+            builder.size - fixed_size);
+    test_graph_write_u32(builder.data + TEST_GRAPH_ACTIVATION_OFFSET, 1);
+
+    test_graph_write_u64(package0, 1 | ((UINT64)2 << 16) |
+            ((UINT64)3 << 32) | ((UINT64)4 << 48));
+    test_graph_write_u32(package0 + 8, 0);
+    test_graph_write_u32(package0 + 12, 0x09);
+    test_graph_write_u32(package0 + 16, 0);
+    test_graph_write_u64(package1, 5 | ((UINT64)6 << 16) |
+            ((UINT64)7 << 32) | ((UINT64)8 << 48));
+    test_graph_write_u32(package1 + 8, 0);
+    test_graph_write_u32(package1 + 12,
+            0x0b | (WINE_APPX_GRAPH_BLOB_VERSION > 1 ? 0x10 : 0));
+    test_graph_write_u32(package1 + 16, 1);
+    test_graph_write_u64(package2, 9 | ((UINT64)10 << 16) |
+            ((UINT64)11 << 32) | ((UINT64)12 << 48));
+    test_graph_write_u32(package2 + 8, 0);
+    test_graph_write_u32(package2 + 12, 0x0b);
+    test_graph_write_u32(package2 + 16, 2);
+
+    if (!wine_appx_graph_validate_blob(builder.data, builder.size))
+    {
+        ok(0, "constructed package graph is invalid.\n");
+        goto failed;
+    }
+    *graph_size = builder.size;
+    return builder.data;
+
+failed:
+    HeapFree(GetProcessHeap(), 0, builder.data);
+    return NULL;
+}
+
+static NTSTATUS create_remote_package_graph_process(const void *graph,
+        UINT32 graph_size, HANDLE *process, HANDLE *thread)
+{
+    ULONG_PTR attr_buffer[offsetof(PS_ATTRIBUTE_LIST, Attributes[1]) /
+            sizeof(ULONG_PTR)];
+    PS_ATTRIBUTE_LIST *attr = (PS_ATTRIBUTE_LIST *)attr_buffer;
+    struct wine_appx_graph_attach attach;
+    unsigned long long leases[3];
+    RTL_USER_PROCESS_PARAMETERS *params;
+    WCHAR module[MAX_PATH], nt_path[MAX_PATH + 4], command_line[MAX_PATH + 32];
+    UNICODE_STRING image, command;
+    PS_CREATE_INFO create_info;
+    DWORD module_length;
+    HANDLE lease;
+    UINT32 i;
+    NTSTATUS status;
+
+    *process = *thread = NULL;
+    module_length = GetModuleFileNameW(NULL, module, ARRAY_SIZE(module));
+    if (!module_length || module_length >= ARRAY_SIZE(module))
+        return STATUS_UNSUCCESSFUL;
+    if ((lease = CreateFileW(module, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, NULL)) == INVALID_HANDLE_VALUE)
+        return RtlGetLastNtStatus();
+    for (i = 0; i < ARRAY_SIZE(leases); ++i)
+        leases[i] = (ULONG_PTR)lease;
+    lstrcpyW(nt_path, L"\\??\\");
+    lstrcatW(nt_path, module);
+    swprintf(command_line, ARRAY_SIZE(command_line), L"\"%s\" version graph-remote-child",
+            module);
+    RtlInitUnicodeString(&image, nt_path);
+    RtlInitUnicodeString(&command, command_line);
+    status = RtlCreateProcessParametersEx(&params, &image, NULL, NULL, &command,
+            NULL, NULL, NULL, NULL, NULL, PROCESS_PARAMS_FLAG_NORMALIZED);
+    if (status)
+    {
+        CloseHandle(lease);
+        return status;
+    }
+
+    attach.tag = WINE_APPX_GRAPH_ATTACH_TAG;
+    attach.version = WINE_APPX_GRAPH_ATTACH_VERSION;
+    attach.size = graph_size;
+    attach.reserved = 0;
+    attach.blob = (ULONG_PTR)graph;
+    attach.leases = (ULONG_PTR)leases;
+    attach.lease_count = ARRAY_SIZE(leases);
+    attach.lease_reserved = 0;
+    params->PackageDependencyData = &attach;
+
+    memset(attr, 0, sizeof(attr_buffer));
+    attr->TotalLength = offsetof(PS_ATTRIBUTE_LIST, Attributes[1]);
+    attr->Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
+    attr->Attributes[0].Size = image.Length;
+    attr->Attributes[0].ValuePtr = image.Buffer;
+
+    memset(&create_info, 0, sizeof(create_info));
+    create_info.Size = sizeof(create_info);
+    status = NtCreateUserProcess(process, thread, PROCESS_ALL_ACCESS,
+            THREAD_ALL_ACCESS, NULL, NULL, 0,
+            THREAD_CREATE_FLAGS_CREATE_SUSPENDED, params, &create_info, attr);
+    RtlDestroyProcessParameters(params);
+    CloseHandle(lease);
+    return status;
+}
+
+static void test_current_package_graph(void)
+{
+    static const PackagePathType unavailable_path_types[] =
+    {
+        PackagePathType_Mutable,
+        PackagePathType_MachineExternal,
+        PackagePathType_UserExternal,
+        PackagePathType_EffectiveExternal,
+    };
+    RTL_USER_PROCESS_PARAMETERS *params = NtCurrentTeb()->Peb->ProcessParameters;
+    void *original_graph = params->PackageDependencyData;
+    struct test_package_info *info;
+    LARGE_INTEGER frequency, start, end;
+    BYTE *graph = NULL, *corrupt_graph = NULL, *id_buffer = NULL, *info_buffer = NULL;
+    BYTE zero_capacity_buffer[1];
+    WCHAR string_buffer[256];
+    PACKAGE_ID *id;
+    HANDLE process = NULL, process_thread = NULL, restricted = NULL, self;
+    void *noaccess = NULL;
+    UINT32 graph_size, length, size, count, original_size, original_count;
+    LONG ret = ERROR_SUCCESS;
+    unsigned int i;
+
+    if (strcmp(winetest_platform, "wine"))
+    {
+        skip("Wine package graph wire-format tests are not applicable on Windows.\n");
+        return;
+    }
+    if (!pGetCurrentApplicationUserModelId || !pGetCurrentPackageFamilyName ||
+        !pGetCurrentPackageFullName || !pGetCurrentPackageId ||
+        !pGetCurrentPackageInfo || !pGetCurrentPackageInfo2 ||
+        !pGetCurrentPackagePath || !pGetCurrentPackagePath2 ||
+        !pGetPackageFamilyName || !pGetPackageFullName)
+    {
+        win_skip("Package graph query APIs are unavailable.\n");
+        return;
+    }
+
+    params->PackageDependencyData = NULL;
+    ret = pGetCurrentPackageFullName((UINT32 *)1, (WCHAR *)1);
+    ok(ret == APPMODEL_ERROR_NO_PACKAGE, "Got unexpected no-package ret %ld.\n", ret);
+    ret = pGetCurrentPackageFamilyName((UINT32 *)1, (WCHAR *)1);
+    ok(ret == APPMODEL_ERROR_NO_PACKAGE, "Got unexpected no-package ret %ld.\n", ret);
+    ret = pGetCurrentApplicationUserModelId((UINT32 *)1, (WCHAR *)1);
+    ok(ret == APPMODEL_ERROR_NO_APPLICATION,
+            "Got unexpected no-application ret %ld.\n", ret);
+    ret = pGetCurrentPackageId((UINT32 *)1, (BYTE *)1);
+    ok(ret == APPMODEL_ERROR_NO_PACKAGE, "Got unexpected no-package ret %ld.\n", ret);
+    ret = pGetCurrentPackageInfo(~0u, (UINT32 *)1, (BYTE *)1, (UINT32 *)1);
+    ok(ret == APPMODEL_ERROR_NO_PACKAGE, "Got unexpected no-package ret %ld.\n", ret);
+    ret = pGetCurrentPackagePath((UINT32 *)1, (WCHAR *)1);
+    ok(ret == APPMODEL_ERROR_NO_PACKAGE, "Got unexpected no-package ret %ld.\n", ret);
+    ret = pGetCurrentPackageInfo2(~0u, (PackagePathType)~0u,
+            (UINT32 *)1, (BYTE *)1, (UINT32 *)1);
+    ok(ret == APPMODEL_ERROR_NO_PACKAGE,
+            "Got unexpected v2 package-info no-package ret %ld.\n", ret);
+    ret = pGetCurrentPackagePath2((PackagePathType)~0u,
+            (UINT32 *)1, (WCHAR *)1);
+    ok(ret == APPMODEL_ERROR_NO_PACKAGE,
+            "Got unexpected v2 path no-package ret %ld.\n", ret);
+
+    graph = build_test_package_graph(&graph_size);
+    ok(!!graph, "Failed to build the test package graph.\n");
+    if (!graph) goto done;
+    params->PackageDependencyData = graph;
+
+    length = 0;
+    ret = pGetCurrentPackageFullName(&length, NULL);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got full-name ret %ld.\n", ret);
+    ok(length == lstrlenW(L"TestPackage_1.2.3.4_neutral__0abcdefghjkme") + 1,
+            "Got full-name length %u.\n", length);
+    original_size = length;
+    length--;
+    string_buffer[0] = 0xcccc;
+    ret = pGetCurrentPackageFullName(&length, string_buffer);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got undersized full-name ret %ld.\n", ret);
+    ok(length == original_size, "Got undersized full-name length %u.\n", length);
+    ok(string_buffer[0] == 0xcccc, "Undersized call modified the buffer.\n");
+    length = ARRAY_SIZE(string_buffer);
+    ret = pGetCurrentPackageFullName(&length, string_buffer);
+    ok(ret == ERROR_SUCCESS, "Got full-name ret %ld.\n", ret);
+    ok(length == original_size, "Got oversized full-name length %u.\n", length);
+    ok(!lstrcmpW(string_buffer, L"TestPackage_1.2.3.4_neutral__0abcdefghjkme"),
+            "Got full name %s.\n", debugstr_w(string_buffer));
+
+    length = ARRAY_SIZE(string_buffer);
+    ret = pGetCurrentPackageFamilyName(&length, string_buffer);
+    ok(ret == ERROR_SUCCESS, "Got family-name ret %ld.\n", ret);
+    ok(!lstrcmpW(string_buffer, L"TestPackage_0abcdefghjkme"),
+            "Got family name %s.\n", debugstr_w(string_buffer));
+    length = ARRAY_SIZE(string_buffer);
+    ret = pGetCurrentApplicationUserModelId(&length, string_buffer);
+    ok(ret == ERROR_SUCCESS, "Got AUMID ret %ld.\n", ret);
+    ok(!lstrcmpW(string_buffer, L"TestPackage_0abcdefghjkme!App"),
+            "Got AUMID %s.\n", debugstr_w(string_buffer));
+    length = ARRAY_SIZE(string_buffer);
+    ret = pGetCurrentPackagePath(&length, string_buffer);
+    ok(ret == ERROR_SUCCESS, "Got path ret %ld.\n", ret);
+    ok(!lstrcmpW(string_buffer, L"C:\\Packages\\TestPackage"),
+            "Got package path %s.\n", debugstr_w(string_buffer));
+    length = ARRAY_SIZE(string_buffer);
+    ret = pGetCurrentPackagePath2(PackagePathType_Install,
+            &length, string_buffer);
+    ok(ret == ERROR_SUCCESS, "Got v2 install path ret %ld.\n", ret);
+    ok(!lstrcmpW(string_buffer, L"C:\\Packages\\TestPackage"),
+            "Got v2 install path %s.\n", debugstr_w(string_buffer));
+    length = ARRAY_SIZE(string_buffer);
+    ret = pGetCurrentPackagePath2(PackagePathType_Effective,
+            &length, string_buffer);
+    ok(ret == ERROR_SUCCESS, "Got v2 effective path ret %ld.\n", ret);
+    ok(!lstrcmpW(string_buffer, L"C:\\Packages\\TestPackage"),
+            "Got v2 effective path %s.\n", debugstr_w(string_buffer));
+    for (i = 0; i < ARRAY_SIZE(unavailable_path_types); i++)
+    {
+        length = 0x12345678;
+        string_buffer[0] = 0xcccc;
+        ret = pGetCurrentPackagePath2(unavailable_path_types[i],
+                &length, string_buffer);
+        ok(ret == ERROR_NOT_FOUND,
+                "Path type %u returned %ld.\n",
+                unavailable_path_types[i], ret);
+        ok(length == 0x12345678,
+                "Path type %u changed length to %u.\n",
+                unavailable_path_types[i], length);
+        ok(string_buffer[0] == 0xcccc,
+                "Path type %u modified the output.\n",
+                unavailable_path_types[i]);
+    }
+    length = 0x12345678;
+    string_buffer[0] = 0xcccc;
+    ret = pGetCurrentPackagePath2((PackagePathType)~0u,
+            &length, string_buffer);
+    ok(ret == ERROR_INVALID_PARAMETER,
+            "Invalid path type returned %ld.\n", ret);
+    ok(length == 0x12345678 && string_buffer[0] == 0xcccc,
+            "Invalid path type modified the output.\n");
+
+    size = 0;
+    ret = pGetCurrentPackageId(&size, NULL);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got package-id probe ret %ld.\n", ret);
+    ok(size > sizeof(*id), "Got package-id size %u.\n", size);
+    original_size = size;
+    zero_capacity_buffer[0] = 0xcc;
+    size--;
+    ret = pGetCurrentPackageId(&size, zero_capacity_buffer);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got undersized package-id ret %ld.\n", ret);
+    ok(size == original_size, "Got undersized package-id size %u.\n", size);
+    ok(zero_capacity_buffer[0] == 0xcc, "Undersized package-id call modified the buffer.\n");
+    id_buffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
+    ok(!!id_buffer, "Failed to allocate package-id buffer.\n");
+    if (id_buffer)
+    {
+        original_size = size;
+        ret = pGetCurrentPackageId(&size, id_buffer);
+        ok(ret == ERROR_SUCCESS, "Got package-id ret %ld.\n", ret);
+        ok(size == original_size, "Got package-id size %u.\n", size);
+        id = (PACKAGE_ID *)id_buffer;
+        ok(id->reserved == 0, "Got package-id reserved %#x.\n", id->reserved);
+        ok(id->processorArchitecture == PROCESSOR_ARCHITECTURE_NEUTRAL,
+                "Got package architecture %u.\n", id->processorArchitecture);
+        ok(id->version.Version == 0x0001000200030004,
+                "Got package version %s.\n", wine_dbgstr_longlong(id->version.Version));
+        ok(!lstrcmpW(id->name, L"TestPackage"), "Got package name %s.\n",
+                debugstr_w(id->name));
+        ok(!lstrcmpW(id->publisher, L"CN=Test Publisher"), "Got publisher %s.\n",
+                debugstr_w(id->publisher));
+        ok(!lstrcmpW(id->resourceId, L""), "Got resource id %s.\n",
+                debugstr_w(id->resourceId));
+        ok(!lstrcmpW(id->publisherId, L"0abcdefghjkme"), "Got publisher id %s.\n",
+                debugstr_w(id->publisherId));
+    }
+
+    size = count = 0;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_STATIC, &size, NULL, &count);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got package-info probe ret %ld.\n", ret);
+    ok(count == 3, "Got package-info count %u.\n", count);
+    ok(size >= 3 * sizeof(*info), "Got package-info size %u.\n", size);
+    info_buffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
+    ok(!!info_buffer, "Failed to allocate package-info buffer.\n");
+    if (info_buffer)
+    {
+        original_size = size;
+        count = 0;
+        ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_STATIC, &size,
+                info_buffer, &count);
+        ok(ret == ERROR_SUCCESS, "Got package-info ret %ld.\n", ret);
+        ok(size == original_size, "Got package-info size %u.\n", size);
+        ok(count == 3, "Got package-info count %u.\n", count);
+        info = (struct test_package_info *)info_buffer;
+        ok(!info[0].reserved && !info[0].flags,
+                "Got head flags %#x, reserved %#x.\n", info[0].flags, info[0].reserved);
+        ok((info[1].flags & 0x00080001) == 0x00080001,
+                "Got dependency flags %#x.\n", info[1].flags);
+        ok(!lstrcmpW(info[0].path, L"C:\\Packages\\TestPackage"),
+                "Got info path %s.\n", debugstr_w(info[0].path));
+        ok(!lstrcmpW(info[0].package_full_name,
+                L"TestPackage_1.2.3.4_neutral__0abcdefghjkme"),
+                "Got info full name %s.\n", debugstr_w(info[0].package_full_name));
+        ok(!lstrcmpW(info[0].package_family_name, L"TestPackage_0abcdefghjkme"),
+                "Got info family name %s.\n", debugstr_w(info[0].package_family_name));
+        ok(!lstrcmpW(info[1].package_id.name, L"TestFramework"),
+                "Got dependency name %s.\n", debugstr_w(info[1].package_id.name));
+        ok(!lstrcmpW(info[2].package_id.name, L"TestTransitive"),
+                "Got transitive name %s.\n", debugstr_w(info[2].package_id.name));
+        ok((BYTE *)info[0].path >= info_buffer + 3 * sizeof(*info) &&
+                (BYTE *)info[0].path < info_buffer + size,
+                "Got out-of-range path pointer %p.\n", info[0].path);
+    }
+
+    size = count = 0;
+    ret = pGetCurrentPackageInfo2(TEST_PACKAGE_FILTER_STATIC,
+            PackagePathType_Install, &size, NULL, &count);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER,
+            "Got v2 install package-info probe ret %ld.\n", ret);
+    ok(count == 3, "Got v2 install package-info count %u.\n", count);
+    original_size = size;
+    size = count = 0;
+    ret = pGetCurrentPackageInfo2(TEST_PACKAGE_FILTER_STATIC,
+            PackagePathType_Effective, &size, NULL, &count);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER,
+            "Got v2 effective package-info probe ret %ld.\n", ret);
+    ok(size == original_size && count == 3,
+            "Got v2 effective size %u and count %u.\n", size, count);
+    if (info_buffer && size <= original_size)
+    {
+        ret = pGetCurrentPackageInfo2(TEST_PACKAGE_FILTER_STATIC,
+                PackagePathType_Effective, &size, info_buffer, &count);
+        ok(ret == ERROR_SUCCESS,
+                "Got v2 effective package-info ret %ld.\n", ret);
+        info = (struct test_package_info *)info_buffer;
+        ok(!lstrcmpW(info[0].path, L"C:\\Packages\\TestPackage"),
+                "Got v2 effective info path %s.\n",
+                debugstr_w(info[0].path));
+    }
+    for (i = 0; i < ARRAY_SIZE(unavailable_path_types); i++)
+    {
+        size = 0x12345678;
+        count = 0x87654321;
+        ret = pGetCurrentPackageInfo2(TEST_PACKAGE_FILTER_STATIC,
+                unavailable_path_types[i], &size, info_buffer, &count);
+        ok(ret == ERROR_NOT_FOUND,
+                "Info path type %u returned %ld.\n",
+                unavailable_path_types[i], ret);
+        ok(size == 0x12345678 && count == 0x87654321,
+                "Info path type %u modified outputs to %u and %u.\n",
+                unavailable_path_types[i], size, count);
+    }
+    size = 0x12345678;
+    count = 0x87654321;
+    ret = pGetCurrentPackageInfo2(TEST_PACKAGE_FILTER_STATIC,
+            (PackagePathType)~0u, &size, info_buffer, &count);
+    ok(ret == ERROR_INVALID_PARAMETER,
+            "Invalid info path type returned %ld.\n", ret);
+    ok(size == 0x12345678 && count == 0x87654321,
+            "Invalid info path type modified outputs to %u and %u.\n",
+            size, count);
+
+    zero_capacity_buffer[0] = 0xcc;
+    size = 0;
+    count = 0xdeadbeef;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_STATIC, &size,
+            zero_capacity_buffer, &count);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got zero-capacity ret %ld.\n", ret);
+    ok(size >= 3 * sizeof(*info), "Got zero-capacity required size %u.\n", size);
+    ok(count == 3, "Got zero-capacity count %u.\n", count);
+    ok(zero_capacity_buffer[0] == 0xcc, "Zero-capacity call modified the buffer.\n");
+
+    size = 0;
+    count = 0;
+    ret = pGetCurrentPackageInfo(0, &size, NULL, &count);
+    if (WINE_APPX_GRAPH_BLOB_VERSION == 1)
+        ok(ret == ERROR_NOT_SUPPORTED, "Got v1 ALL_LOADED ret %ld.\n", ret);
+    else
+        ok(ret == ERROR_INSUFFICIENT_BUFFER && count == 2,
+                "Got ALL_LOADED ret %ld, count %u.\n", ret, count);
+    size = 0;
+    count = 0;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_HEAD, &size, NULL, &count);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER && count == 1,
+            "Got HEAD ret %ld, count %u.\n", ret, count);
+    size = 0;
+    count = 0;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_DIRECT, &size, NULL, &count);
+    if (WINE_APPX_GRAPH_BLOB_VERSION == 1)
+        ok(ret == ERROR_NOT_SUPPORTED, "Got v1 DIRECT ret %ld.\n", ret);
+    else
+        ok(ret == ERROR_INSUFFICIENT_BUFFER && count == 1,
+                "Got DIRECT ret %ld, count %u.\n", ret, count);
+    size = 0;
+    count = 0;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_HEAD | TEST_PACKAGE_FILTER_DIRECT,
+            &size, NULL, &count);
+    if (WINE_APPX_GRAPH_BLOB_VERSION == 1)
+        ok(ret == ERROR_NOT_SUPPORTED, "Got v1 HEAD|DIRECT ret %ld.\n", ret);
+    else
+        ok(ret == ERROR_INSUFFICIENT_BUFFER && count == 2,
+                "Got HEAD|DIRECT ret %ld, count %u.\n", ret, count);
+    size = 0xdeadbeef;
+    count = 0xdeadbeef;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_RESOURCE, &size, NULL, &count);
+    ok(ret == ERROR_SUCCESS && !size && !count,
+            "Got RESOURCE ret %ld, size %u, count %u.\n", ret, size, count);
+    size = 0;
+    count = 0;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_STATIC, &size, NULL, &count);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER && count == 3,
+            "Got STATIC ret %ld, count %u.\n", ret, count);
+    size = 0xdeadbeef;
+    count = 0xdeadbeef;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_DYNAMIC, &size, NULL, &count);
+    ok(ret == ERROR_SUCCESS && !size && !count,
+            "Got DYNAMIC ret %ld, size %u, count %u.\n", ret, size, count);
+    size = 0;
+    count = 0;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_STATIC |
+            TEST_PACKAGE_FILTER_DYNAMIC, &size, NULL, &count);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER && count == 3,
+            "Got STATIC|DYNAMIC ret %ld, count %u.\n", ret, count);
+    original_size = 0x12345678;
+    original_count = 0x87654321;
+    size = original_size;
+    count = original_count;
+    ret = pGetCurrentPackageInfo(0x80000000, &size, NULL, &count);
+    ok(ret == ERROR_INVALID_PARAMETER, "Got unknown-filter ret %ld.\n", ret);
+    ok(size == original_size && count == original_count,
+            "Unknown filter modified outputs to %u, %u.\n", size, count);
+    count = original_count;
+    ret = pGetCurrentPackageInfo(0, NULL, NULL, &count);
+    ok(ret == ERROR_INVALID_PARAMETER, "Got NULL size ret %ld.\n", ret);
+    ok(count == original_count, "NULL size modified count to %u.\n", count);
+    size = 0;
+    ret = pGetCurrentPackageInfo(TEST_PACKAGE_FILTER_STATIC, &size, NULL, NULL);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER && size,
+            "Got NULL count ret %ld, size %u.\n", ret, size);
+
+    length = ARRAY_SIZE(string_buffer);
+    ret = pGetPackageFullName(GetCurrentProcess(), &length, string_buffer);
+    ok(ret == ERROR_SUCCESS, "Got self process full-name ret %ld.\n", ret);
+    self = NULL;
+    ok(DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+            &self, PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0),
+            "DuplicateHandle failed, error %lu.\n", GetLastError());
+    if (self)
+    {
+        length = ARRAY_SIZE(string_buffer);
+        ret = pGetPackageFamilyName(self, &length, string_buffer);
+        /*
+         * Non-pseudo handles use the immutable server snapshot.  This test
+         * graph was installed only into the local PEB, so it must not leak
+         * across the remote-process query boundary.
+         */
+        ok(ret == APPMODEL_ERROR_NO_PACKAGE,
+                "Got duplicated-self family-name ret %ld.\n", ret);
+        CloseHandle(self);
+    }
+
+    ret = create_remote_package_graph_process(graph, graph_size, &process,
+            &process_thread);
+    ok(!ret, "Failed to create packaged query process, status %#lx.\n", ret);
+    if (!ret)
+    {
+        length = 0;
+        ret = pGetPackageFullName(process, &length, NULL);
+        ok(ret == ERROR_INSUFFICIENT_BUFFER,
+                "Got remote full-name probe ret %ld.\n", ret);
+        ok(length == lstrlenW(L"TestPackage_1.2.3.4_neutral__0abcdefghjkme") + 1,
+                "Got remote full-name length %u.\n", length);
+        length = ARRAY_SIZE(string_buffer);
+        ret = pGetPackageFullName(process, &length, string_buffer);
+        ok(ret == ERROR_SUCCESS, "Got remote full-name ret %ld.\n", ret);
+        ok(!lstrcmpW(string_buffer,
+                L"TestPackage_1.2.3.4_neutral__0abcdefghjkme"),
+                "Got remote full name %s.\n", debugstr_w(string_buffer));
+        length = ARRAY_SIZE(string_buffer);
+        ret = pGetPackageFamilyName(process, &length, string_buffer);
+        ok(ret == ERROR_SUCCESS, "Got remote family-name ret %ld.\n", ret);
+        ok(!lstrcmpW(string_buffer, L"TestPackage_0abcdefghjkme"),
+                "Got remote family name %s.\n", debugstr_w(string_buffer));
+
+        ok(DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(),
+                &restricted, SYNCHRONIZE, FALSE, 0),
+                "Failed to create restricted process handle, error %lu.\n",
+                GetLastError());
+        if (restricted)
+        {
+            length = ARRAY_SIZE(string_buffer);
+            ret = pGetPackageFullName(restricted, &length, string_buffer);
+            ok(ret == ERROR_ACCESS_DENIED,
+                    "Restricted remote query returned %ld.\n", ret);
+            CloseHandle(restricted);
+            restricted = NULL;
+        }
+
+        NtTerminateProcess(process, 0);
+        ok(WaitForSingleObject(process, 5000) == WAIT_OBJECT_0,
+                "Timed out terminating packaged query process.\n");
+        length = ARRAY_SIZE(string_buffer);
+        ret = pGetPackageFamilyName(process, &length, string_buffer);
+        ok(ret == ERROR_SUCCESS,
+                "Exited remote family-name query returned %ld.\n", ret);
+        CloseHandle(process_thread);
+        process_thread = NULL;
+        CloseHandle(process);
+        process = NULL;
+    }
+
+    length = ARRAY_SIZE(string_buffer);
+    ret = pGetPackageFullName((HANDLE)(ULONG_PTR)0xdeadbeef, &length,
+            string_buffer);
+    ok(ret == ERROR_INVALID_HANDLE, "Invalid remote handle returned %ld.\n", ret);
+
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    for (i = 0; i < 10000; ++i)
+    {
+        length = ARRAY_SIZE(string_buffer);
+        ret = pGetCurrentPackageFullName(&length, string_buffer);
+        if (ret) break;
+    }
+    QueryPerformanceCounter(&end);
+    ok(i == 10000, "Repeated package query failed at iteration %u, ret %ld.\n", i, ret);
+    trace("10000 cached package identity queries took %.3f ms.\n",
+            (double)(end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart);
+    ok(end.QuadPart - start.QuadPart < frequency.QuadPart * 2,
+            "Cached package queries took over two seconds.\n");
+
+    corrupt_graph = HeapAlloc(GetProcessHeap(), 0, graph_size);
+    ok(!!corrupt_graph, "Failed to allocate corrupt graph.\n");
+    if (corrupt_graph)
+    {
+        memcpy(corrupt_graph, graph, graph_size);
+        test_graph_write_u32(corrupt_graph + TEST_GRAPH_HEADER_SIZE + 88, graph_size - 1);
+        params->PackageDependencyData = corrupt_graph;
+        length = ARRAY_SIZE(string_buffer);
+        ret = pGetCurrentPackageFullName(&length, string_buffer);
+        ok(ret == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                "Got corrupt graph ret %ld.\n", ret);
+    }
+
+    noaccess = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+    ok(!!noaccess, "VirtualAlloc failed, error %lu.\n", GetLastError());
+    if (noaccess)
+    {
+        params->PackageDependencyData = noaccess;
+        length = ARRAY_SIZE(string_buffer);
+        ret = pGetCurrentPackageFullName(&length, string_buffer);
+        ok(ret == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                "Got inaccessible graph ret %ld.\n", ret);
+    }
+
+done:
+    if (process)
+    {
+        NtTerminateProcess(process, STATUS_UNSUCCESSFUL);
+        WaitForSingleObject(process, 5000);
+    }
+    if (restricted) CloseHandle(restricted);
+    if (process_thread) CloseHandle(process_thread);
+    if (process) CloseHandle(process);
+    params->PackageDependencyData = original_graph;
+    if (noaccess) VirtualFree(noaccess, 0, MEM_RELEASE);
+    HeapFree(GetProcessHeap(), 0, info_buffer);
+    HeapFree(GetProcessHeap(), 0, id_buffer);
+    HeapFree(GetProcessHeap(), 0, corrupt_graph);
+    HeapFree(GetProcessHeap(), 0, graph);
+}
+
 static const struct
 {
     UINT32 code;
@@ -788,6 +1569,7 @@ arch_data[] =
     {PROCESSOR_ARCHITECTURE_AMD64,   L"X64"},
     {PROCESSOR_ARCHITECTURE_NEUTRAL, L"Neutral"},
     {PROCESSOR_ARCHITECTURE_ARM64,   L"Arm64",   TRUE /* Before Win10. */},
+    {PROCESSOR_ARCHITECTURE_IA32_ON_ARM64, L"X86A64", TRUE /* Older Win10. */},
     {PROCESSOR_ARCHITECTURE_UNKNOWN, L"Unknown", TRUE /* Before Win10 1709. */},
 };
 
@@ -810,6 +1592,7 @@ static unsigned int get_package_str_size(const WCHAR *str)
 static unsigned int get_package_id_size(const PACKAGE_ID *id)
 {
     return sizeof(*id) + get_package_str_size(id->name)
+            + get_package_str_size(id->publisher)
             + get_package_str_size(id->resourceId) + 14 * sizeof(WCHAR);
 }
 
@@ -821,6 +1604,185 @@ static void packagefullname_from_packageid(WCHAR *buffer, size_t count, const PA
             id->publisherId);
 }
 
+static BOOL bytes_are_value(const void *buffer, SIZE_T size, BYTE value)
+{
+    const BYTE *bytes = buffer;
+    SIZE_T i;
+
+    for (i = 0; i < size; i++)
+        if (bytes[i] != value) return FALSE;
+    return TRUE;
+}
+
+static void test_package_identity_names(void)
+{
+    static const WCHAR publisher[] =
+            L"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US";
+    static const WCHAR family[] = L"Microsoft.WindowsStore_8wekyb3d8bbwe";
+    static const WCHAR full_name[] =
+            L"Microsoft.WindowsStore_1.2.3.4_x64__8wekyb3d8bbwe";
+    static const WCHAR missing_family[] = L"Wine.NoSuch.Contract_0000000000000";
+    static const WCHAR missing_full_name[] =
+            L"Wine.NoSuch.Contract_1.0.0.0_neutral__0000000000000";
+    PACKAGE_ID id =
+    {
+        0, PROCESSOR_ARCHITECTURE_AMD64,
+        {{.Major = 1, .Minor = 2, .Build = 3, .Revision = 4}},
+        (WCHAR *)L"Microsoft.WindowsStore", (WCHAR *)publisher,
+        NULL, NULL
+    };
+    WCHAR buffer[256], second[64];
+    WCHAR *names[2] = {(WCHAR *)0xdeadbeef, (WCHAR *)0xdeadbeef};
+    UINT32 length, second_length, required, count, buffer_length;
+    LONG ret;
+
+    if (!pPackageFamilyNameFromFullName || !pPackageFamilyNameFromId ||
+        !pPackageFullNameFromId || !pPackageNameAndPublisherIdFromFamilyName)
+    {
+        win_skip("Package identity name APIs are unavailable.\n");
+        return;
+    }
+
+    length = 0;
+    ret = pPackageFamilyNameFromFullName(full_name, &length, NULL);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got unexpected ret %ld.\n", ret);
+    required = lstrlenW(family) + 1;
+    ok(length == required, "Got length %u, expected %u.\n", length, required);
+
+    memset(buffer, 0xcc, sizeof(buffer));
+    length = required - 1;
+    ret = pPackageFamilyNameFromFullName(full_name, &length, buffer);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got unexpected ret %ld.\n", ret);
+    ok(length == required, "Got length %u, expected %u.\n", length, required);
+    ok(bytes_are_value(buffer, sizeof(buffer), 0xcc), "Output was partially written.\n");
+
+    length = ARRAY_SIZE(buffer);
+    ret = pPackageFamilyNameFromFullName(full_name, &length, buffer);
+    ok(ret == ERROR_SUCCESS, "Got unexpected ret %ld.\n", ret);
+    ok(length == required, "Got length %u, expected %u.\n", length, required);
+    ok(!lstrcmpW(buffer, family), "Got family %s.\n", debugstr_w(buffer));
+
+    length = 0;
+    ret = pPackageFamilyNameFromId(&id, &length, NULL);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got unexpected ret %ld.\n", ret);
+    ok(length == required, "Got length %u, expected %u.\n", length, required);
+    length = ARRAY_SIZE(buffer);
+    ret = pPackageFamilyNameFromId(&id, &length, buffer);
+    ok(ret == ERROR_SUCCESS, "Got unexpected ret %ld.\n", ret);
+    ok(!lstrcmpW(buffer, family), "Got family %s.\n", debugstr_w(buffer));
+
+    length = 0;
+    ret = pPackageFullNameFromId(&id, &length, NULL);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got unexpected ret %ld.\n", ret);
+    required = lstrlenW(full_name) + 1;
+    ok(length == required, "Got length %u, expected %u.\n", length, required);
+    length = ARRAY_SIZE(buffer);
+    ret = pPackageFullNameFromId(&id, &length, buffer);
+    ok(ret == ERROR_SUCCESS, "Got unexpected ret %ld.\n", ret);
+    ok(!lstrcmpW(buffer, full_name), "Got full name %s.\n", debugstr_w(buffer));
+
+    id.publisherId = (WCHAR *)L"0000000000000";
+    memset(buffer, 0xcc, sizeof(buffer));
+    length = ARRAY_SIZE(buffer);
+    ret = pPackageFullNameFromId(&id, &length, buffer);
+    ok(ret == ERROR_INVALID_PARAMETER, "Got unexpected ret %ld.\n", ret);
+    ok(length == ARRAY_SIZE(buffer), "Length changed to %u.\n", length);
+    ok(bytes_are_value(buffer, sizeof(buffer), 0xcc), "Invalid output was written.\n");
+    id.publisher = NULL;
+    id.publisherId = (WCHAR *)L"8WEKYB3D8BBWE";
+    id.processorArchitecture = PROCESSOR_ARCHITECTURE_IA32_ON_ARM64;
+    id.resourceId = (WCHAR *)L"en-US";
+    length = ARRAY_SIZE(buffer);
+    ret = pPackageFullNameFromId(&id, &length, buffer);
+    ok(ret == ERROR_SUCCESS || broken(ret == ERROR_INVALID_PARAMETER),
+            "Got unexpected ret %ld.\n", ret);
+    if (!ret)
+        ok(!lstrcmpW(buffer,
+                L"Microsoft.WindowsStore_1.2.3.4_x86a64_en-US_8WEKYB3D8BBWE"),
+                "Got full name %s.\n", debugstr_w(buffer));
+
+    length = second_length = 0;
+    ret = pPackageNameAndPublisherIdFromFamilyName(family, &length, NULL,
+            &second_length, NULL);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got unexpected ret %ld.\n", ret);
+    ok(length == lstrlenW(id.name) + 1, "Got name length %u.\n", length);
+    ok(second_length == 14, "Got publisher length %u.\n", second_length);
+
+    memset(buffer, 0xcc, sizeof(buffer));
+    memset(second, 0xcc, sizeof(second));
+    length--;
+    ret = pPackageNameAndPublisherIdFromFamilyName(family, &length, buffer,
+            &second_length, second);
+    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got unexpected ret %ld.\n", ret);
+    ok(bytes_are_value(buffer, sizeof(buffer), 0xcc), "Name was partially written.\n");
+    ok(bytes_are_value(second, sizeof(second), 0xcc), "Publisher ID was partially written.\n");
+
+    length = ARRAY_SIZE(buffer);
+    second_length = ARRAY_SIZE(second);
+    ret = pPackageNameAndPublisherIdFromFamilyName(family, &length, buffer,
+            &second_length, second);
+    ok(ret == ERROR_SUCCESS, "Got unexpected ret %ld.\n", ret);
+    ok(!lstrcmpW(buffer, L"Microsoft.WindowsStore"), "Got name %s.\n", debugstr_w(buffer));
+    ok(!lstrcmpW(second, L"8wekyb3d8bbwe"), "Got publisher ID %s.\n", debugstr_w(second));
+
+    if (pGetPackagesByPackageFamily)
+    {
+        count = ARRAY_SIZE(names);
+        buffer_length = ARRAY_SIZE(buffer);
+        ret = pGetPackagesByPackageFamily(missing_family, &count, names,
+                &buffer_length, buffer);
+        ok(ret == ERROR_SUCCESS, "Got unexpected ret %ld.\n", ret);
+        ok(!count, "Got package count %u.\n", count);
+        ok(!buffer_length, "Got buffer length %u.\n", buffer_length);
+
+        count = buffer_length = 0x12345678;
+        ret = pGetPackagesByPackageFamily(L"invalid", &count, names,
+                &buffer_length, buffer);
+        ok(ret == ERROR_INVALID_PARAMETER, "Got unexpected ret %ld.\n", ret);
+        ok(count == 0x12345678, "Count changed to %u.\n", count);
+        ok(buffer_length == 0x12345678, "Buffer length changed to %u.\n", buffer_length);
+    }
+
+    if (pGetPackagePathByFullName)
+    {
+        length = 0;
+        ret = pGetPackagePathByFullName(missing_full_name, &length, NULL);
+        ok(ret == ERROR_NOT_FOUND, "Got unexpected ret %ld.\n", ret);
+        length = 0x12345678;
+        ret = pGetPackagePathByFullName(L"invalid", &length, NULL);
+        ok(ret == ERROR_INVALID_PARAMETER, "Got unexpected ret %ld.\n", ret);
+        ok(length == 0x12345678, "Length changed to %u.\n", length);
+    }
+
+    if (pGetPackagePathByFullName2)
+    {
+        length = 0;
+        ret = pGetPackagePathByFullName2(missing_full_name,
+                PackagePathType_Install, &length, NULL);
+        ok(ret == ERROR_NOT_FOUND,
+                "Got v2 install path ret %ld.\n", ret);
+        ret = pGetPackagePathByFullName2(missing_full_name,
+                PackagePathType_Effective, &length, NULL);
+        ok(ret == ERROR_NOT_FOUND,
+                "Got v2 effective path ret %ld.\n", ret);
+        ret = pGetPackagePathByFullName2(missing_full_name,
+                PackagePathType_Mutable, &length, NULL);
+        ok(ret == ERROR_NOT_FOUND,
+                "Got v2 mutable path ret %ld.\n", ret);
+
+        length = 0x12345678;
+        memset(buffer, 0xcc, sizeof(buffer));
+        ret = pGetPackagePathByFullName2(missing_full_name,
+                (PackagePathType)~0u, &length, buffer);
+        ok(ret == ERROR_INVALID_PARAMETER,
+                "Got invalid v2 path type ret %ld.\n", ret);
+        ok(length == 0x12345678,
+                "Invalid v2 path type changed length to %u.\n", length);
+        ok(bytes_are_value(buffer, sizeof(buffer), 0xcc),
+                "Invalid v2 path type partially wrote output.\n");
+    }
+}
+
 static void test_PackageIdFromFullName(void)
 {
     static const PACKAGE_ID test_package_id =
@@ -830,6 +1792,25 @@ static void test_PackageIdFromFullName(void)
                 (WCHAR *)L"TestPackage", NULL,
                 (WCHAR *)L"TestResourceId", (WCHAR *)L"0abcdefghjkme"
     };
+    static const WCHAR * const invalid_full_names[] =
+    {
+        L"Ab_1.2.3.4_x86__0abcdefghjkme",
+        L"CON.package_1.2.3.4_x86__0abcdefghjkme",
+        L"Wine._1.2.3.4_x86__0abcdefghjkme",
+        L"Wine.xn--bad_1.2.3.4_x86__0abcdefghjkme",
+        L"Wine_bad_1.2.3.4_x86__0abcdefghjkme",
+        L"Wine.Package_1.2.3_x86__0abcdefghjkme",
+        L"Wine.Package_65536.2.3.4_x86__0abcdefghjkme",
+        L"Wine.Package_1..3.4_x86__0abcdefghjkme",
+        L"Wine.Package_1.2.3.4.5_x86__0abcdefghjkme",
+        L"Wine.Package_1.2.3.4_unknown__0abcdefghjkme",
+        L"Wine.Package_1.2.3.4_x86_abcdefghijklmnopqrstuvwxyz12345_0abcdefghjkme",
+        L"Wine.Package_1.2.3.4_x86__0abcdefgijkme",
+        L"Wine.Package_1.2.3.4_x86__0abcdefghjkm",
+        L"Wine.Package_1.2.3.4_x86__0abcdefghjkme_suffix",
+    };
+    static const WCHAR missing_full_name[] =
+            L"Wine.NoSuch.Contract_1.0.0.0_neutral__0000000000000";
     UINT32 size, expected_size;
     PACKAGE_ID test_id;
     WCHAR fullname[512];
@@ -905,6 +1886,13 @@ static void test_PackageIdFromFullName(void)
         packagefullname_from_packageid(fullname, ARRAY_SIZE(fullname), &test_id);
         size = expected_size;
         ret = pPackageIdFromFullName(fullname, 0, &size, id_buffer);
+        if (arch_data[i].code == PROCESSOR_ARCHITECTURE_UNKNOWN)
+        {
+            ok(ret == ERROR_INVALID_PARAMETER,
+                    "Got unexpected ret %lu for unsupported arch %S.\n",
+                    ret, arch_data[i].name);
+            continue;
+        }
         ok(ret == ERROR_SUCCESS || broken(arch_data[i].broken && ret == ERROR_INVALID_PARAMETER),
                 "Got unexpected ret %lu.\n", ret);
         if (ret != ERROR_SUCCESS)
@@ -942,6 +1930,51 @@ static void test_PackageIdFromFullName(void)
     size = sizeof(id_buffer);
     ret = pPackageIdFromFullName(L"TestPackage_1.2.3.4_X86_0abcdefghjkme", 0, &size, id_buffer);
     ok(ret == ERROR_INVALID_PARAMETER, "Got unexpected ret %lu.\n", ret);
+
+    size = sizeof(id_buffer);
+    ret = pPackageIdFromFullName(
+            L"TestPackage_1.2.3.4_X86A64_TestResourceId_0abcdefghjkme",
+            0, &size, id_buffer);
+    ok(ret == ERROR_SUCCESS || broken(ret == ERROR_INVALID_PARAMETER),
+            "Got unexpected ret %lu.\n", ret);
+    if (!ret)
+        ok(id->processorArchitecture == PROCESSOR_ARCHITECTURE_IA32_ON_ARM64,
+                "Got architecture %u.\n", id->processorArchitecture);
+
+    for (i = 0; i < ARRAY_SIZE(invalid_full_names); i++)
+    {
+        memset(id_buffer, 0xcc, sizeof(id_buffer));
+        size = sizeof(id_buffer);
+        ret = pPackageIdFromFullName(
+                invalid_full_names[i], PACKAGE_INFORMATION_BASIC,
+                &size, id_buffer);
+        ok(ret == ERROR_INVALID_PARAMETER ||
+                broken(wcsstr(invalid_full_names[i], L"_unknown_") &&
+                       ret == ERROR_SUCCESS),
+                "Name %s returned %ld.\n",
+                debugstr_w(invalid_full_names[i]), ret);
+        if (ret == ERROR_INVALID_PARAMETER)
+        {
+            ok(size == sizeof(id_buffer), "Name %s changed size to %u.\n",
+                    debugstr_w(invalid_full_names[i]), size);
+            ok(bytes_are_value(id_buffer, sizeof(id_buffer), 0xcc),
+                    "Name %s partially wrote output.\n",
+                    debugstr_w(invalid_full_names[i]));
+        }
+    }
+
+    memset(id_buffer, 0xcc, sizeof(id_buffer));
+    size = sizeof(id_buffer);
+    ret = pPackageIdFromFullName(fullname, 1, &size, id_buffer);
+    ok(ret == ERROR_INVALID_PARAMETER, "Got unexpected ret %ld.\n", ret);
+    ok(size == sizeof(id_buffer), "Size changed to %u.\n", size);
+    ok(bytes_are_value(id_buffer, sizeof(id_buffer), 0xcc),
+            "Unsupported flags partially wrote output.\n");
+
+    size = 0;
+    ret = pPackageIdFromFullName(missing_full_name, PACKAGE_INFORMATION_FULL,
+            &size, NULL);
+    ok(ret == ERROR_NOT_FOUND, "Got unexpected ret %ld.\n", ret);
 }
 
 #define TEST_VERSION_WIN7   1
@@ -1127,5 +2160,7 @@ START_TEST(version)
     test_VerifyVersionInfo();
     test_pe_os_version();
     test_SystemFirmwareTable();
+    test_current_package_graph();
+    test_package_identity_names();
     test_PackageIdFromFullName();
 }

@@ -39,7 +39,10 @@
 #include "appmodel.h"
 
 #include "kernelbase.h"
+#include "../appxsvc/query.h"
+#include "wine/appx_package_graph.h"
 #include "wine/debug.h"
+#include "wine/exception.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(ver);
 
@@ -1546,13 +1549,357 @@ BOOL WINAPI GetVersionExW( OSVERSIONINFOW *info )
     return TRUE;
 }
 
+/*
+ * PackageDependencyData is a pointer to an immutable, pointer-free package
+ * graph installed by ntdll during process startup.  Keep the wire offsets in
+ * one block until the shared graph header grows named field accessors.
+ */
+enum appx_graph_wire_offset
+{
+    GRAPH_HEADER_VERSION_OFFSET             = 8,
+    GRAPH_HEADER_PACKAGE_COUNT_OFFSET       = 44,
+    GRAPH_HEADER_PACKAGES_OFFSET            = 48,
+    GRAPH_HEADER_AUMID_REF_OFFSET           = 80,
+
+    GRAPH_PACKAGE_VERSION_OFFSET            = 0,
+    GRAPH_PACKAGE_ARCHITECTURE_OFFSET       = 8,
+    GRAPH_PACKAGE_FLAGS_OFFSET              = 12,
+    GRAPH_PACKAGE_NAME_REF_OFFSET           = 56,
+    GRAPH_PACKAGE_PUBLISHER_REF_OFFSET      = 64,
+    GRAPH_PACKAGE_RESOURCE_ID_REF_OFFSET    = 72,
+    GRAPH_PACKAGE_PUBLISHER_ID_REF_OFFSET   = 80,
+    GRAPH_PACKAGE_FULL_NAME_REF_OFFSET      = 88,
+    GRAPH_PACKAGE_FAMILY_NAME_REF_OFFSET    = 96,
+    GRAPH_PACKAGE_ROOT_REF_OFFSET           = 104,
+};
+
+#define GRAPH_PACKAGE_ACTIVE                  0x00000001
+#define GRAPH_PACKAGE_FRAMEWORK               0x00000002
+#define GRAPH_PACKAGE_RESOURCE                0x00000004
+#define GRAPH_PACKAGE_SIGNED                  0x00000008
+#define GRAPH_PACKAGE_DIRECT                  0x00000010
+
+#define PACKAGE_FILTER_HEAD                   0x00000010
+#define PACKAGE_FILTER_DIRECT                 0x00000020
+#define PACKAGE_FILTER_RESOURCE               0x00000040
+#define PACKAGE_FILTER_BUNDLE                 0x00000080
+#define PACKAGE_FILTER_OPTIONAL               0x00020000
+#define PACKAGE_FILTER_IS_IN_RELATED_SET      0x00040000
+#define PACKAGE_FILTER_STATIC                 0x00080000
+#define PACKAGE_FILTER_DYNAMIC                0x00100000
+#define PACKAGE_FILTER_HOSTRUNTIME            0x00200000
+#define PACKAGE_FILTER_KNOWN                  \
+    (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT | PACKAGE_FILTER_RESOURCE | \
+     PACKAGE_FILTER_BUNDLE | PACKAGE_FILTER_OPTIONAL | \
+     PACKAGE_FILTER_IS_IN_RELATED_SET | PACKAGE_FILTER_STATIC | \
+     PACKAGE_FILTER_DYNAMIC | PACKAGE_FILTER_HOSTRUNTIME)
+
+#define PACKAGE_PROPERTY_FRAMEWORK            0x00000001
+#define PACKAGE_PROPERTY_RESOURCE             0x00000002
+#define PACKAGE_PROPERTY_STATIC               0x00080000
+
+struct current_package_graph
+{
+    const BYTE *data;
+    UINT32 size;
+    UINT32 version;
+    UINT32 package_count;
+    UINT32 packages_offset;
+};
+
+struct current_package
+{
+    struct wine_appx_graph_string_ref name;
+    struct wine_appx_graph_string_ref publisher;
+    struct wine_appx_graph_string_ref resource_id;
+    struct wine_appx_graph_string_ref publisher_id;
+    struct wine_appx_graph_string_ref full_name;
+    struct wine_appx_graph_string_ref family_name;
+    struct wine_appx_graph_string_ref root;
+    UINT64 version;
+    UINT32 architecture;
+    UINT32 flags;
+};
+
+struct package_info_native
+{
+    UINT32 reserved;
+    UINT32 flags;
+    WCHAR *path;
+    WCHAR *package_full_name;
+    WCHAR *package_family_name;
+    PACKAGE_ID package_id;
+};
+
+enum current_graph_status
+{
+    CURRENT_GRAPH_NONE,
+    CURRENT_GRAPH_VALID,
+    CURRENT_GRAPH_CORRUPT,
+};
+
+struct current_package_graph_cache
+{
+    const BYTE *data;
+    struct current_package_graph graph;
+};
+
+static struct current_package_graph_cache *current_graph_cache;
+
+static UINT64 appx_graph_read_u64( const BYTE *data )
+{
+    return wine_appx_graph_read_u32( data ) |
+           ((UINT64)wine_appx_graph_read_u32( data + 4 ) << 32);
+}
+
+static BOOL appx_ref_length_between( struct wine_appx_graph_string_ref ref,
+                                     UINT32 minimum, UINT32 maximum )
+{
+    UINT32 length = ref.chars - 1;
+    return length >= minimum && length <= maximum;
+}
+
+static BOOL appx_validate_primary_identity( const struct current_package_graph *graph )
+{
+    const BYTE *record = graph->data + graph->packages_offset;
+    struct wine_appx_graph_string_ref application_id, aumid, family;
+    UINT32 family_length, application_length, i;
+
+    application_id = wine_appx_graph_get_ref( graph->data, 72 );
+    aumid = wine_appx_graph_get_ref( graph->data, GRAPH_HEADER_AUMID_REF_OFFSET );
+    family = wine_appx_graph_get_ref( record, GRAPH_PACKAGE_FAMILY_NAME_REF_OFFSET );
+    if (application_id.chars < PACKAGE_RELATIVE_APPLICATION_ID_MIN_LENGTH ||
+        application_id.chars > PACKAGE_RELATIVE_APPLICATION_ID_MAX_LENGTH ||
+        aumid.chars < APPLICATION_USER_MODEL_ID_MIN_LENGTH ||
+        aumid.chars > APPLICATION_USER_MODEL_ID_MAX_LENGTH ||
+        !appx_ref_length_between( family, PACKAGE_FAMILY_NAME_MIN_LENGTH,
+                                 PACKAGE_FAMILY_NAME_MAX_LENGTH ))
+        return FALSE;
+
+    family_length = family.chars - 1;
+    application_length = application_id.chars - 1;
+    if (aumid.chars != family_length + 1 + application_length + 1)
+        return FALSE;
+    for (i = 0; i < family_length; i++)
+        if (wine_appx_graph_read_u16( graph->data + family.offset + i * 2 ) !=
+            wine_appx_graph_read_u16( graph->data + aumid.offset + i * 2 ))
+            return FALSE;
+    if (wine_appx_graph_read_u16( graph->data + aumid.offset + family_length * 2 ) != '!')
+        return FALSE;
+    for (i = 0; i < application_length; i++)
+        if (wine_appx_graph_read_u16( graph->data + application_id.offset + i * 2 ) !=
+            wine_appx_graph_read_u16( graph->data + aumid.offset +
+                                      (family_length + 1 + i) * 2 ))
+            return FALSE;
+    return TRUE;
+}
+
+static enum current_graph_status validate_package_graph_data(
+    const BYTE *data, struct current_package_graph *graph )
+{
+    enum current_graph_status status = CURRENT_GRAPH_CORRUPT;
+    UINT32 size;
+
+    if (!data) return CURRENT_GRAPH_NONE;
+    __TRY
+    {
+        size = wine_appx_graph_read_u32(
+            data + WINE_APPX_GRAPH_HEADER_TOTAL_SIZE_OFFSET );
+        if (wine_appx_graph_validate_blob( data, size ))
+        {
+            graph->data = data;
+            graph->size = size;
+            graph->version = wine_appx_graph_read_u32(
+                data + GRAPH_HEADER_VERSION_OFFSET );
+            graph->package_count = wine_appx_graph_read_u32(
+                data + GRAPH_HEADER_PACKAGE_COUNT_OFFSET );
+            graph->packages_offset = wine_appx_graph_read_u32(
+                data + GRAPH_HEADER_PACKAGES_OFFSET );
+            if (appx_validate_primary_identity( graph ))
+                status = CURRENT_GRAPH_VALID;
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        status = CURRENT_GRAPH_CORRUPT;
+    }
+    __ENDTRY
+    return status;
+}
+
+static enum current_graph_status get_current_package_graph( struct current_package_graph *graph )
+{
+    const BYTE *data = NtCurrentTeb()->Peb->ProcessParameters->PackageDependencyData;
+    struct current_package_graph_cache *cache, *new_cache;
+    enum current_graph_status status;
+
+    if (!data) return CURRENT_GRAPH_NONE;
+    cache = InterlockedCompareExchangePointer( (void **)&current_graph_cache,
+                                               NULL, NULL );
+    if (cache && cache->data == data)
+    {
+        *graph = cache->graph;
+        return CURRENT_GRAPH_VALID;
+    }
+
+    status = validate_package_graph_data( data, graph );
+    if (status == CURRENT_GRAPH_VALID &&
+        (new_cache = HeapAlloc( GetProcessHeap(), 0, sizeof(*new_cache) )))
+    {
+        new_cache->data = data;
+        new_cache->graph = *graph;
+        if (InterlockedCompareExchangePointer(
+                (void **)&current_graph_cache, new_cache, NULL ))
+            HeapFree( GetProcessHeap(), 0, new_cache );
+    }
+    return status;
+}
+
+static BOOL get_current_package( const struct current_package_graph *graph,
+                                 UINT32 index, struct current_package *package )
+{
+    const BYTE *record;
+
+    if (index >= graph->package_count) return FALSE;
+    record = graph->data + graph->packages_offset +
+             index * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+    package->version = appx_graph_read_u64( record + GRAPH_PACKAGE_VERSION_OFFSET );
+    package->architecture = wine_appx_graph_read_u32(
+        record + GRAPH_PACKAGE_ARCHITECTURE_OFFSET );
+    package->flags = wine_appx_graph_read_u32( record + GRAPH_PACKAGE_FLAGS_OFFSET );
+    package->name = wine_appx_graph_get_ref( record, GRAPH_PACKAGE_NAME_REF_OFFSET );
+    package->publisher = wine_appx_graph_get_ref(
+        record, GRAPH_PACKAGE_PUBLISHER_REF_OFFSET );
+    package->resource_id = wine_appx_graph_get_ref(
+        record, GRAPH_PACKAGE_RESOURCE_ID_REF_OFFSET );
+    package->publisher_id = wine_appx_graph_get_ref(
+        record, GRAPH_PACKAGE_PUBLISHER_ID_REF_OFFSET );
+    package->full_name = wine_appx_graph_get_ref(
+        record, GRAPH_PACKAGE_FULL_NAME_REF_OFFSET );
+    package->family_name = wine_appx_graph_get_ref(
+        record, GRAPH_PACKAGE_FAMILY_NAME_REF_OFFSET );
+    package->root = wine_appx_graph_get_ref( record, GRAPH_PACKAGE_ROOT_REF_OFFSET );
+
+    return appx_ref_length_between( package->name, PACKAGE_NAME_MIN_LENGTH,
+                                    PACKAGE_NAME_MAX_LENGTH ) &&
+           appx_ref_length_between( package->publisher, PACKAGE_PUBLISHER_MIN_LENGTH,
+                                    PACKAGE_PUBLISHER_MAX_LENGTH ) &&
+           appx_ref_length_between( package->resource_id, PACKAGE_RESOURCEID_MIN_LENGTH,
+                                    PACKAGE_RESOURCEID_MAX_LENGTH ) &&
+           appx_ref_length_between( package->publisher_id,
+                                    PACKAGE_PUBLISHERID_MIN_LENGTH,
+                                    PACKAGE_PUBLISHERID_MAX_LENGTH ) &&
+           appx_ref_length_between( package->full_name, PACKAGE_FULL_NAME_MIN_LENGTH,
+                                    PACKAGE_FULL_NAME_MAX_LENGTH ) &&
+           appx_ref_length_between( package->family_name, PACKAGE_FAMILY_NAME_MIN_LENGTH,
+                                    PACKAGE_FAMILY_NAME_MAX_LENGTH ) &&
+           package->architecture <= 5 &&
+           !(package->flags & ~(GRAPH_PACKAGE_ACTIVE | GRAPH_PACKAGE_FRAMEWORK |
+                                GRAPH_PACKAGE_RESOURCE | GRAPH_PACKAGE_SIGNED |
+                                GRAPH_PACKAGE_DIRECT)) &&
+           (package->flags & (GRAPH_PACKAGE_ACTIVE | GRAPH_PACKAGE_SIGNED)) ==
+               (GRAPH_PACKAGE_ACTIVE | GRAPH_PACKAGE_SIGNED);
+}
+
+static LONG get_graph_or_error( struct current_package_graph *graph )
+{
+    switch (get_current_package_graph( graph ))
+    {
+    case CURRENT_GRAPH_NONE:
+        return APPMODEL_ERROR_NO_PACKAGE;
+    case CURRENT_GRAPH_CORRUPT:
+        return APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT;
+    default:
+        return ERROR_SUCCESS;
+    }
+}
+
+static LONG copy_graph_string( const struct current_package_graph *graph,
+                               struct wine_appx_graph_string_ref ref,
+                               UINT32 *length, WCHAR *buffer )
+{
+    UINT32 capacity;
+
+    if (!length) return ERROR_INVALID_PARAMETER;
+    capacity = *length;
+    *length = ref.chars;
+    if (!buffer || capacity < ref.chars) return ERROR_INSUFFICIENT_BUFFER;
+    memcpy( buffer, graph->data + ref.offset, ref.chars * sizeof(WCHAR) );
+    return ERROR_SUCCESS;
+}
+
+static UINT32 package_processor_architecture( UINT32 architecture )
+{
+    static const UINT32 architectures[] =
+    {
+        PROCESSOR_ARCHITECTURE_NEUTRAL,
+        PROCESSOR_ARCHITECTURE_INTEL,
+        PROCESSOR_ARCHITECTURE_AMD64,
+        PROCESSOR_ARCHITECTURE_ARM,
+        PROCESSOR_ARCHITECTURE_ARM64,
+        PROCESSOR_ARCHITECTURE_IA32_ON_ARM64,
+    };
+
+    return architecture < ARRAY_SIZE(architectures) ?
+           architectures[architecture] : PROCESSOR_ARCHITECTURE_UNKNOWN;
+}
+
+static BOOL add_package_size( UINT32 *size, UINT32 chars )
+{
+    UINT32 bytes;
+
+    if (chars > MAXDWORD / sizeof(WCHAR)) return FALSE;
+    bytes = chars * sizeof(WCHAR);
+    if (*size > MAXDWORD - bytes) return FALSE;
+    *size += bytes;
+    return TRUE;
+}
+
+static WCHAR *copy_package_string( WCHAR *destination,
+                                   const struct current_package_graph *graph,
+                                   struct wine_appx_graph_string_ref ref )
+{
+    memcpy( destination, graph->data + ref.offset, ref.chars * sizeof(WCHAR) );
+    return destination + ref.chars;
+}
+
+static void fill_package_id( PACKAGE_ID *id, WCHAR **strings,
+                             const struct current_package_graph *graph,
+                             const struct current_package *package )
+{
+    UINT64 version = package->version;
+
+    memset( id, 0, sizeof(*id) );
+    id->processorArchitecture = package_processor_architecture( package->architecture );
+    id->version.Major = version;
+    id->version.Minor = version >> 16;
+    id->version.Build = version >> 32;
+    id->version.Revision = version >> 48;
+    id->name = *strings;
+    *strings = copy_package_string( *strings, graph, package->name );
+    id->publisher = *strings;
+    *strings = copy_package_string( *strings, graph, package->publisher );
+    id->resourceId = *strings;
+    *strings = copy_package_string( *strings, graph, package->resource_id );
+    id->publisherId = *strings;
+    *strings = copy_package_string( *strings, graph, package->publisher_id );
+}
+
 /***********************************************************************
  *         GetCurrentApplicationUserModelId   (kernelbase.@)
  */
 LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *length, WCHAR *id )
 {
-    FIXME( "(%p %p): stub\n", length, id );
-    return APPMODEL_ERROR_NO_APPLICATION;
+    struct current_package_graph graph;
+    struct wine_appx_graph_string_ref aumid;
+    enum current_graph_status status;
+
+    status = get_current_package_graph( &graph );
+    if (status == CURRENT_GRAPH_NONE) return APPMODEL_ERROR_NO_APPLICATION;
+    if (status == CURRENT_GRAPH_CORRUPT)
+        return APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT;
+    aumid = wine_appx_graph_get_ref( graph.data, GRAPH_HEADER_AUMID_REF_OFFSET );
+    return copy_graph_string( &graph, aumid, length, id );
 }
 
 /***********************************************************************
@@ -1560,8 +1907,14 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *le
  */
 LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length, WCHAR *name )
 {
-    FIXME( "(%p %p): stub\n", length, name );
-    return APPMODEL_ERROR_NO_PACKAGE;
+    struct current_package_graph graph;
+    struct current_package package;
+    LONG ret;
+
+    if ((ret = get_graph_or_error( &graph ))) return ret;
+    if (!get_current_package( &graph, 0, &package ))
+        return APPMODEL_ERROR_PACKAGE_IDENTITY_CORRUPT;
+    return copy_graph_string( &graph, package.family_name, length, name );
 }
 
 
@@ -1570,8 +1923,14 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length,
  */
 LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, WCHAR *name )
 {
-    FIXME( "(%p %p): stub\n", length, name );
-    return APPMODEL_ERROR_NO_PACKAGE;
+    struct current_package_graph graph;
+    struct current_package package;
+    LONG ret;
+
+    if ((ret = get_graph_or_error( &graph ))) return ret;
+    if (!get_current_package( &graph, 0, &package ))
+        return APPMODEL_ERROR_PACKAGE_IDENTITY_CORRUPT;
+    return copy_graph_string( &graph, package.full_name, length, name );
 }
 
 
@@ -1580,26 +1939,205 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, W
  */
 LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageId( UINT32 *len, BYTE *buffer )
 {
-    FIXME( "(%p %p): stub\n", len, buffer );
-    return APPMODEL_ERROR_NO_PACKAGE;
+    struct current_package_graph graph;
+    struct current_package package;
+    UINT32 capacity, required = sizeof(PACKAGE_ID);
+    PACKAGE_ID *id;
+    WCHAR *strings;
+    LONG ret;
+
+    if ((ret = get_graph_or_error( &graph ))) return ret;
+    if (!get_current_package( &graph, 0, &package ))
+        return APPMODEL_ERROR_PACKAGE_IDENTITY_CORRUPT;
+    if (!len) return ERROR_INVALID_PARAMETER;
+    if (!add_package_size( &required, package.name.chars ) ||
+        !add_package_size( &required, package.publisher.chars ) ||
+        !add_package_size( &required, package.resource_id.chars ) ||
+        !add_package_size( &required, package.publisher_id.chars ))
+        return ERROR_ARITHMETIC_OVERFLOW;
+
+    capacity = *len;
+    *len = required;
+    if (!buffer || capacity < required) return ERROR_INSUFFICIENT_BUFFER;
+    id = (PACKAGE_ID *)buffer;
+    strings = (WCHAR *)(buffer + sizeof(*id));
+    fill_package_id( id, &strings, &graph, &package );
+    return ERROR_SUCCESS;
+}
+
+static LONG get_static_package_path_type_status( PackagePathType path_type )
+{
+    switch (path_type)
+    {
+    case PackagePathType_Install:
+    case PackagePathType_Effective:
+        return ERROR_SUCCESS;
+    case PackagePathType_Mutable:
+    case PackagePathType_MachineExternal:
+    case PackagePathType_UserExternal:
+    case PackagePathType_EffectiveExternal:
+        return ERROR_NOT_FOUND;
+    default:
+        return ERROR_INVALID_PARAMETER;
+    }
+}
+
+static LONG get_current_package_info( const UINT32 flags,
+                                      PackagePathType path_type,
+                                      UINT32 *buffer_size, BYTE *buffer,
+                                      UINT32 *count )
+{
+    struct current_package packages[WINE_APPX_GRAPH_MAX_PACKAGES];
+    struct current_package_graph graph;
+    BYTE selected[WINE_APPX_GRAPH_MAX_PACKAGES];
+    struct package_info_native *info;
+    UINT32 capacity, required, selected_count = 0, type_filters, i;
+    BOOL include_static;
+    WCHAR *strings;
+    LONG ret;
+
+    if ((ret = get_graph_or_error( &graph ))) return ret;
+    if (flags & ~PACKAGE_FILTER_KNOWN) return ERROR_INVALID_PARAMETER;
+    if (!buffer_size) return ERROR_INVALID_PARAMETER;
+    if ((ret = get_static_package_path_type_status( path_type ))) return ret;
+
+    /*
+     * GetCurrentPackageInfo is static-only unless DYNAMIC is explicitly
+     * requested.  Unlike the zero-valued ALL_LOADED compatibility filter,
+     * an explicit STATIC category with no type filter selects the complete
+     * static graph.
+     */
+    include_static = !(flags & PACKAGE_FILTER_DYNAMIC) ||
+                     (flags & PACKAGE_FILTER_STATIC);
+    type_filters = flags & (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT |
+                            PACKAGE_FILTER_RESOURCE | PACKAGE_FILTER_BUNDLE |
+                            PACKAGE_FILTER_OPTIONAL |
+                            PACKAGE_FILTER_IS_IN_RELATED_SET |
+                            PACKAGE_FILTER_HOSTRUNTIME);
+    if (!flags) type_filters = PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT;
+
+    /*
+     * Graph v1 does not encode direct versus transitive dependencies.  Never
+     * broaden a DIRECT query to all dependencies; fail closed until v2.
+     */
+    if (include_static && graph.version == 1 &&
+        (type_filters & PACKAGE_FILTER_DIRECT))
+        return ERROR_NOT_SUPPORTED;
+
+    for (i = 0; i < graph.package_count; i++)
+    {
+        BOOL include = include_static;
+
+        if (!get_current_package( &graph, i, &packages[i] ))
+            return APPMODEL_ERROR_PACKAGE_IDENTITY_CORRUPT;
+        if (include && type_filters)
+        {
+            include = (!i && (type_filters & PACKAGE_FILTER_HEAD)) ||
+                      (i && (type_filters & PACKAGE_FILTER_DIRECT) &&
+                       (packages[i].flags & GRAPH_PACKAGE_DIRECT)) ||
+                      ((type_filters & PACKAGE_FILTER_RESOURCE) &&
+                       (packages[i].flags & GRAPH_PACKAGE_RESOURCE));
+        }
+        if (include) selected[selected_count++] = i;
+    }
+
+    required = selected_count * sizeof(*info);
+    for (i = 0; i < selected_count; i++)
+    {
+        const struct current_package *package = &packages[selected[i]];
+
+        if (!add_package_size( &required, package->root.chars ) ||
+            !add_package_size( &required, package->full_name.chars ) ||
+            !add_package_size( &required, package->family_name.chars ) ||
+            !add_package_size( &required, package->name.chars ) ||
+            !add_package_size( &required, package->publisher.chars ) ||
+            !add_package_size( &required, package->resource_id.chars ) ||
+            !add_package_size( &required, package->publisher_id.chars ))
+            return ERROR_ARITHMETIC_OVERFLOW;
+    }
+
+    capacity = *buffer_size;
+    *buffer_size = required;
+    if (count) *count = selected_count;
+    if (!required) return ERROR_SUCCESS;
+    if (!buffer || capacity < required) return ERROR_INSUFFICIENT_BUFFER;
+
+    info = (struct package_info_native *)buffer;
+    strings = (WCHAR *)(buffer + selected_count * sizeof(*info));
+    memset( info, 0, selected_count * sizeof(*info) );
+    for (i = 0; i < selected_count; i++)
+    {
+        const struct current_package *package = &packages[selected[i]];
+
+        if (package->flags & GRAPH_PACKAGE_FRAMEWORK)
+            info[i].flags |= PACKAGE_PROPERTY_FRAMEWORK;
+        if (package->flags & GRAPH_PACKAGE_RESOURCE)
+            info[i].flags |= PACKAGE_PROPERTY_RESOURCE;
+        if (selected[i]) info[i].flags |= PACKAGE_PROPERTY_STATIC;
+        info[i].path = strings;
+        strings = copy_package_string( strings, &graph, package->root );
+        info[i].package_full_name = strings;
+        strings = copy_package_string( strings, &graph, package->full_name );
+        info[i].package_family_name = strings;
+        strings = copy_package_string( strings, &graph, package->family_name );
+        fill_package_id( &info[i].package_id, &strings, &graph, package );
+    }
+    return ERROR_SUCCESS;
 }
 
 /***********************************************************************
  *         GetCurrentPackageInfo   (kernelbase.@)
  */
-LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
+LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size,
+                                   BYTE *buffer, UINT32 *count )
 {
-    FIXME( "(%#x %p %p %p): stub\n", flags, buffer_size, buffer, count );
-    return APPMODEL_ERROR_NO_PACKAGE;
+    return get_current_package_info( flags, PackagePathType_Install,
+                                     buffer_size, buffer, count );
+}
+
+/***********************************************************************
+ *         GetCurrentPackageInfo2   (kernelbase.@)
+ */
+LONG WINAPI GetCurrentPackageInfo2( const UINT32 flags,
+                                    PackagePathType path_type,
+                                    UINT32 *buffer_size, BYTE *buffer,
+                                    UINT32 *count )
+{
+    return get_current_package_info( flags, path_type, buffer_size,
+                                     buffer, count );
+}
+
+static LONG get_current_package_path( PackagePathType path_type,
+                                      UINT32 *length, WCHAR *path )
+{
+    struct current_package_graph graph;
+    struct current_package package;
+    LONG ret;
+
+    if ((ret = get_graph_or_error( &graph ))) return ret;
+    if (!get_current_package( &graph, 0, &package ))
+        return APPMODEL_ERROR_PACKAGE_IDENTITY_CORRUPT;
+    if ((ret = get_static_package_path_type_status( path_type ))) return ret;
+    return copy_graph_string( &graph, package.root, length, path );
 }
 
 /***********************************************************************
  *         GetCurrentPackagePath   (kernelbase.@)
  */
-LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackagePath( UINT32 *length, WCHAR *path )
+LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackagePath(
+    UINT32 *length, WCHAR *path )
 {
-    FIXME( "(%p %p): stub\n", length, path );
-    return APPMODEL_ERROR_NO_PACKAGE;
+    return get_current_package_path(
+        PackagePathType_Install, length, path );
+}
+
+/***********************************************************************
+ *         GetCurrentPackagePath2   (kernelbase.@)
+ */
+LONG WINAPI GetCurrentPackagePath2( PackagePathType path_type,
+                                    UINT32 *length, WCHAR *path )
+{
+    return get_current_package_path( path_type, length, path );
 }
 
 
@@ -1608,8 +2146,38 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackagePath( UINT32 *length, WCHAR
  */
 LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFullName( HANDLE process, UINT32 *length, WCHAR *name )
 {
-    FIXME( "(%p %p %p): stub\n", process, length, name );
-    return APPMODEL_ERROR_NO_PACKAGE;
+    struct current_package_graph graph;
+    struct current_package package;
+    enum current_graph_status graph_status;
+    SIZE_T free_size = 0;
+    void *snapshot = NULL, *free_base;
+    ULONG snapshot_size;
+    NTSTATUS status, free_status;
+    LONG ret;
+
+    if (process == GetCurrentProcess())
+        return GetCurrentPackageFullName( length, name );
+    status = __wine_get_process_package_graph(
+        process, &snapshot, &snapshot_size );
+    if (status == STATUS_NOT_FOUND) return APPMODEL_ERROR_NO_PACKAGE;
+    if (status) return RtlNtStatusToDosError( status );
+    graph_status = validate_package_graph_data( snapshot, &graph );
+    if (graph_status != CURRENT_GRAPH_VALID)
+        ret = APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT;
+    else if (!get_current_package( &graph, 0, &package ))
+        ret = APPMODEL_ERROR_PACKAGE_IDENTITY_CORRUPT;
+    else
+        ret = copy_graph_string( &graph, package.full_name, length, name );
+    free_base = snapshot;
+    free_status = NtFreeVirtualMemory(
+        GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
+    if (!ret && free_status)
+    {
+        WARN( "failed to release remote package graph snapshot, status %#lx.\n",
+              free_status );
+        ret = RtlNtStatusToDosError( free_status );
+    }
+    return ret;
 }
 
 
@@ -1618,37 +2186,38 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFullName( HANDLE process, UINT32 *
  */
 LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFamilyName( HANDLE process, UINT32 *length, WCHAR *name )
 {
-    FIXME( "(%p %p %p): stub\n", process, length, name );
-    return APPMODEL_ERROR_NO_PACKAGE;
-}
+    struct current_package_graph graph;
+    struct current_package package;
+    enum current_graph_status graph_status;
+    SIZE_T free_size = 0;
+    void *snapshot = NULL, *free_base;
+    ULONG snapshot_size;
+    NTSTATUS status, free_status;
+    LONG ret;
 
-/***********************************************************************
- *         GetPackagesByPackageFamily   (kernelbase.@)
- */
-LONG WINAPI DECLSPEC_HOTPATCH GetPackagesByPackageFamily(const WCHAR *family_name, UINT32 *count,
-                                                         WCHAR *full_names, UINT32 *buffer_len, WCHAR *buffer)
-{
-    FIXME( "(%s %p %p %p %p): stub\n", debugstr_w(family_name), count, full_names, buffer_len, buffer );
-
-    if (!count || !buffer_len)
-        return ERROR_INVALID_PARAMETER;
-
-    *count = 0;
-    *buffer_len = 0;
-    return ERROR_SUCCESS;
-}
-
-/***********************************************************************
- *         GetPackagePathByFullName   (kernelbase.@)
- */
-LONG WINAPI GetPackagePathByFullName(const WCHAR *name, UINT32 *len, WCHAR *path)
-{
-    if (!len || !name)
-        return ERROR_INVALID_PARAMETER;
-
-    FIXME( "(%s %p %p): stub\n", debugstr_w(name), len, path );
-
-    return APPMODEL_ERROR_NO_PACKAGE;
+    if (process == GetCurrentProcess())
+        return GetCurrentPackageFamilyName( length, name );
+    status = __wine_get_process_package_graph(
+        process, &snapshot, &snapshot_size );
+    if (status == STATUS_NOT_FOUND) return APPMODEL_ERROR_NO_PACKAGE;
+    if (status) return RtlNtStatusToDosError( status );
+    graph_status = validate_package_graph_data( snapshot, &graph );
+    if (graph_status != CURRENT_GRAPH_VALID)
+        ret = APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT;
+    else if (!get_current_package( &graph, 0, &package ))
+        ret = APPMODEL_ERROR_PACKAGE_IDENTITY_CORRUPT;
+    else
+        ret = copy_graph_string( &graph, package.family_name, length, name );
+    free_base = snapshot;
+    free_status = NtFreeVirtualMemory(
+        GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
+    if (!ret && free_status)
+    {
+        WARN( "failed to release remote package graph snapshot, status %#lx.\n",
+              free_status );
+        ret = RtlNtStatusToDosError( free_status );
+    }
+    return ret;
 }
 
 static const struct
@@ -1663,104 +2232,910 @@ arch_names[] =
     {PROCESSOR_ARCHITECTURE_AMD64,         L"x64"},
     {PROCESSOR_ARCHITECTURE_NEUTRAL,       L"neutral"},
     {PROCESSOR_ARCHITECTURE_ARM64,         L"arm64"},
-    {PROCESSOR_ARCHITECTURE_UNKNOWN,       L"unknown"},
+    {PROCESSOR_ARCHITECTURE_IA32_ON_ARM64, L"x86a64"},
 };
 
-static UINT32 processor_arch_from_string(const WCHAR *str, unsigned int len)
+struct parsed_package_full_name
 {
-    unsigned int i;
+    const WCHAR *name;
+    const WCHAR *resource_id;
+    const WCHAR *publisher_id;
+    UINT32 name_length;
+    UINT32 resource_id_length;
+    UINT32 publisher_id_length;
+    UINT32 processor_architecture;
+    PACKAGE_VERSION version;
+};
 
-    for (i = 0; i < ARRAY_SIZE(arch_names); ++i)
-        if (lstrlenW(arch_names[i].name) == len && !wcsnicmp(str, arch_names[i].name, len))
+struct parsed_package_family_name
+{
+    const WCHAR *name;
+    const WCHAR *publisher_id;
+    UINT32 name_length;
+    UINT32 publisher_id_length;
+};
+
+struct sha256_context
+{
+    UINT32 state[8];
+    UINT64 bytes;
+    BYTE block[64];
+    UINT32 block_length;
+};
+
+struct appx_query_api
+{
+    HMODULE module;
+    LONG (WINAPI *get_path)( const WCHAR *, UINT32 *, WCHAR * );
+    LONG (WINAPI *get_family_packages)(
+        const WCHAR *, UINT32 *, WCHAR **, UINT32 *, WCHAR * );
+    LONG (WINAPI *get_publisher)( const WCHAR *, UINT32 *, WCHAR * );
+};
+
+static INIT_ONCE appx_query_init_once = INIT_ONCE_STATIC_INIT;
+static struct appx_query_api appx_query_api;
+static LONG appx_query_init_error = ERROR_GEN_FAILURE;
+
+static WCHAR ascii_lower( WCHAR ch )
+{
+    return ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch;
+}
+
+static BOOL ascii_equal_slice( const WCHAR *value, UINT32 length,
+                               const WCHAR *expected )
+{
+    UINT32 i;
+
+    if (lstrlenW( expected ) != length) return FALSE;
+    for (i = 0; i < length; i++)
+        if (ascii_lower( value[i] ) != ascii_lower( expected[i] ))
+            return FALSE;
+    return TRUE;
+}
+
+static BOOL get_bounded_identity_length( const WCHAR *value, UINT32 minimum,
+                                         UINT32 maximum, UINT32 *length )
+{
+    UINT32 i;
+
+    if (!value) return FALSE;
+    for (i = 0; i <= maximum; i++)
+        if (!value[i])
+        {
+            if (i < minimum) return FALSE;
+            *length = i;
+            return TRUE;
+        }
+    return FALSE;
+}
+
+static BOOL is_identity_character( WCHAR ch )
+{
+    return (ch >= 'a' && ch <= 'z') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
+}
+
+static BOOL is_reserved_identity_name( const WCHAR *value, UINT32 length )
+{
+    UINT32 base_length = 0;
+
+    while (base_length < length && value[base_length] != '.')
+        base_length++;
+    if (ascii_equal_slice( value, base_length, L"con" ) ||
+        ascii_equal_slice( value, base_length, L"prn" ) ||
+        ascii_equal_slice( value, base_length, L"aux" ) ||
+        ascii_equal_slice( value, base_length, L"nul" ))
+        return TRUE;
+    if (base_length == 4 &&
+        (ascii_equal_slice( value, 3, L"com" ) ||
+         ascii_equal_slice( value, 3, L"lpt" )) &&
+        value[3] >= '1' && value[3] <= '9')
+        return TRUE;
+    return FALSE;
+}
+
+static BOOL is_valid_identity_name( const WCHAR *value, UINT32 length,
+                                    UINT32 minimum, UINT32 maximum,
+                                    BOOL allow_empty )
+{
+    UINT32 i;
+
+    if (!length) return allow_empty;
+    if (!value || length < minimum || length > maximum ||
+        value[length - 1] == '.' ||
+        is_reserved_identity_name( value, length ))
+        return FALSE;
+    for (i = 0; i < length; i++)
+    {
+        if (!is_identity_character( value[i] )) return FALSE;
+        if ((i == 0 || value[i - 1] == '.') && i + 4 <= length &&
+            ascii_equal_slice( value + i, 4, L"xn--" ))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL is_valid_publisher_id( const WCHAR *value, UINT32 length )
+{
+    UINT32 i;
+
+    if (!value || length != PACKAGE_PUBLISHERID_MAX_LENGTH) return FALSE;
+    for (i = 0; i < length; i++)
+    {
+        WCHAR ch = ascii_lower( value[i] );
+
+        if ((ch >= '0' && ch <= '9') ||
+            (ch >= 'a' && ch <= 'h') || ch == 'j' || ch == 'k' ||
+            ch == 'm' || ch == 'n' || (ch >= 'p' && ch <= 't') ||
+            (ch >= 'v' && ch <= 'z'))
+            continue;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static UINT32 processor_arch_from_string( const WCHAR *value, UINT32 length )
+{
+    UINT32 i;
+
+    for (i = 0; i < ARRAY_SIZE(arch_names); i++)
+        if (ascii_equal_slice( value, length, arch_names[i].name ))
             return arch_names[i].code;
     return ~0u;
+}
+
+static const WCHAR *processor_arch_to_string( UINT32 architecture )
+{
+    UINT32 i;
+
+    for (i = 0; i < ARRAY_SIZE(arch_names); i++)
+        if (arch_names[i].code == architecture) return arch_names[i].name;
+    return NULL;
+}
+
+static BOOL parse_package_version( const WCHAR *value, UINT32 length,
+                                   PACKAGE_VERSION *version )
+{
+    USHORT parts[4];
+    UINT32 part, offset = 0;
+
+    memset( parts, 0, sizeof(parts) );
+    for (part = 0; part < ARRAY_SIZE(parts); part++)
+    {
+        UINT32 digits = 0, number = 0;
+
+        while (offset < length && value[offset] >= '0' &&
+               value[offset] <= '9')
+        {
+            number = number * 10 + value[offset++] - '0';
+            if (++digits > 5 || number > 0xffff) return FALSE;
+        }
+        if (!digits ||
+            (part + 1 < ARRAY_SIZE(parts) ?
+             offset >= length || value[offset++] != '.' :
+             offset != length))
+            return FALSE;
+        parts[part] = number;
+    }
+    version->Major = parts[0];
+    version->Minor = parts[1];
+    version->Build = parts[2];
+    version->Revision = parts[3];
+    return TRUE;
+}
+
+static BOOL parse_package_full_name( const WCHAR *full_name,
+                                     struct parsed_package_full_name *parsed )
+{
+    UINT32 separators[4], separator_count = 0, length, i;
+    UINT32 version_start, architecture_start, resource_start, publisher_start;
+
+    memset( parsed, 0, sizeof(*parsed) );
+    if (!get_bounded_identity_length(
+            full_name, PACKAGE_FULL_NAME_MIN_LENGTH,
+            PACKAGE_FULL_NAME_MAX_LENGTH, &length ))
+        return FALSE;
+    for (i = 0; i < length; i++)
+        if (full_name[i] == '_')
+        {
+            if (separator_count == ARRAY_SIZE(separators)) return FALSE;
+            separators[separator_count++] = i;
+        }
+    if (separator_count != ARRAY_SIZE(separators)) return FALSE;
+
+    parsed->name = full_name;
+    parsed->name_length = separators[0];
+    version_start = separators[0] + 1;
+    architecture_start = separators[1] + 1;
+    resource_start = separators[2] + 1;
+    publisher_start = separators[3] + 1;
+    parsed->resource_id = full_name + resource_start;
+    parsed->resource_id_length = separators[3] - resource_start;
+    parsed->publisher_id = full_name + publisher_start;
+    parsed->publisher_id_length = length - publisher_start;
+
+    if (!is_valid_identity_name(
+            parsed->name, parsed->name_length, PACKAGE_NAME_MIN_LENGTH,
+            PACKAGE_NAME_MAX_LENGTH, FALSE ) ||
+        !parse_package_version(
+            full_name + version_start, separators[1] - version_start,
+            &parsed->version ) ||
+        (parsed->processor_architecture = processor_arch_from_string(
+             full_name + architecture_start,
+             separators[2] - architecture_start )) == ~0u ||
+        !is_valid_identity_name(
+            parsed->resource_id, parsed->resource_id_length, 1,
+            PACKAGE_RESOURCEID_MAX_LENGTH, TRUE ) ||
+        !is_valid_publisher_id(
+            parsed->publisher_id, parsed->publisher_id_length ))
+        return FALSE;
+    return TRUE;
+}
+
+static BOOL parse_package_family_name(
+    const WCHAR *family_name, struct parsed_package_family_name *parsed )
+{
+    UINT32 length, separator, i;
+
+    memset( parsed, 0, sizeof(*parsed) );
+    if (!get_bounded_identity_length(
+            family_name, PACKAGE_FAMILY_NAME_MIN_LENGTH,
+            PACKAGE_FAMILY_NAME_MAX_LENGTH, &length ))
+        return FALSE;
+    separator = length;
+    for (i = 0; i < length; i++)
+        if (family_name[i] == '_')
+        {
+            if (separator != length) return FALSE;
+            separator = i;
+        }
+    if (separator == length) return FALSE;
+    parsed->name = family_name;
+    parsed->name_length = separator;
+    parsed->publisher_id = family_name + separator + 1;
+    parsed->publisher_id_length = length - separator - 1;
+    return is_valid_identity_name(
+               parsed->name, parsed->name_length, PACKAGE_NAME_MIN_LENGTH,
+               PACKAGE_NAME_MAX_LENGTH, FALSE ) &&
+           is_valid_publisher_id(
+               parsed->publisher_id, parsed->publisher_id_length );
+}
+
+static UINT32 rotate_right( UINT32 value, UINT32 shift )
+{
+    return (value >> shift) | (value << (32 - shift));
+}
+
+static void sha256_transform( struct sha256_context *context,
+                              const BYTE block[64] )
+{
+    static const UINT32 constants[64] =
+    {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    };
+    UINT32 words[64], a, b, c, d, e, f, g, h, i;
+
+    for (i = 0; i < 16; i++)
+        words[i] = ((UINT32)block[i * 4] << 24) |
+                   ((UINT32)block[i * 4 + 1] << 16) |
+                   ((UINT32)block[i * 4 + 2] << 8) |
+                   block[i * 4 + 3];
+    for (; i < ARRAY_SIZE(words); i++)
+    {
+        UINT32 s0 = rotate_right( words[i - 15], 7 ) ^
+                    rotate_right( words[i - 15], 18 ) ^
+                    (words[i - 15] >> 3);
+        UINT32 s1 = rotate_right( words[i - 2], 17 ) ^
+                    rotate_right( words[i - 2], 19 ) ^
+                    (words[i - 2] >> 10);
+        words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+    }
+
+    a = context->state[0];
+    b = context->state[1];
+    c = context->state[2];
+    d = context->state[3];
+    e = context->state[4];
+    f = context->state[5];
+    g = context->state[6];
+    h = context->state[7];
+    for (i = 0; i < ARRAY_SIZE(words); i++)
+    {
+        UINT32 sum1 = rotate_right( e, 6 ) ^ rotate_right( e, 11 ) ^
+                      rotate_right( e, 25 );
+        UINT32 choose = (e & f) ^ (~e & g);
+        UINT32 temporary1 = h + sum1 + choose + constants[i] + words[i];
+        UINT32 sum0 = rotate_right( a, 2 ) ^ rotate_right( a, 13 ) ^
+                      rotate_right( a, 22 );
+        UINT32 majority = (a & b) ^ (a & c) ^ (b & c);
+        UINT32 temporary2 = sum0 + majority;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + temporary1;
+        d = c;
+        c = b;
+        b = a;
+        a = temporary1 + temporary2;
+    }
+    context->state[0] += a;
+    context->state[1] += b;
+    context->state[2] += c;
+    context->state[3] += d;
+    context->state[4] += e;
+    context->state[5] += f;
+    context->state[6] += g;
+    context->state[7] += h;
+}
+
+static void sha256_init( struct sha256_context *context )
+{
+    static const UINT32 initial_state[8] =
+    {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    };
+
+    memset( context, 0, sizeof(*context) );
+    memcpy( context->state, initial_state, sizeof(initial_state) );
+}
+
+static void sha256_update( struct sha256_context *context, const BYTE *data,
+                           UINT32 length )
+{
+    UINT32 copy;
+
+    context->bytes += length;
+    while (length)
+    {
+        copy = min( length, 64 - context->block_length );
+        memcpy( context->block + context->block_length, data, copy );
+        context->block_length += copy;
+        data += copy;
+        length -= copy;
+        if (context->block_length == 64)
+        {
+            sha256_transform( context, context->block );
+            context->block_length = 0;
+        }
+    }
+}
+
+static void sha256_finish( struct sha256_context *context, BYTE digest[32] )
+{
+    BYTE padding[72] = {0x80};
+    BYTE length_bytes[8];
+    UINT64 bits = context->bytes * 8;
+    UINT32 padding_length, i;
+
+    for (i = 0; i < ARRAY_SIZE(length_bytes); i++)
+        length_bytes[ARRAY_SIZE(length_bytes) - 1 - i] = bits >> (i * 8);
+    padding_length = context->block_length < 56 ?
+                     56 - context->block_length :
+                     120 - context->block_length;
+    sha256_update( context, padding, padding_length );
+    sha256_update( context, length_bytes, sizeof(length_bytes) );
+    for (i = 0; i < ARRAY_SIZE(context->state); i++)
+    {
+        digest[i * 4] = context->state[i] >> 24;
+        digest[i * 4 + 1] = context->state[i] >> 16;
+        digest[i * 4 + 2] = context->state[i] >> 8;
+        digest[i * 4 + 3] = context->state[i];
+    }
+}
+
+static void derive_publisher_id( const WCHAR *publisher, UINT32 length,
+                                 WCHAR publisher_id[14] )
+{
+    static const WCHAR alphabet[] = L"0123456789abcdefghjkmnpqrstvwxyz";
+    struct sha256_context hash;
+    BYTE digest[32], encoded[2];
+    UINT32 i, j;
+
+    sha256_init( &hash );
+    for (i = 0; i < length; i++)
+    {
+        encoded[0] = publisher[i];
+        encoded[1] = publisher[i] >> 8;
+        sha256_update( &hash, encoded, sizeof(encoded) );
+    }
+    sha256_finish( &hash, digest );
+    for (i = 0; i < 13; i++)
+    {
+        UINT32 value = 0;
+
+        for (j = 0; j < 5; j++)
+        {
+            UINT32 bit = i * 5 + j;
+
+            value <<= 1;
+            if (bit < 64)
+                value |= (digest[bit / 8] >> (7 - bit % 8)) & 1;
+        }
+        publisher_id[i] = alphabet[value];
+    }
+    publisher_id[13] = 0;
+}
+
+static BOOL publisher_ids_equal( const WCHAR *left, const WCHAR *right )
+{
+    UINT32 i;
+
+    for (i = 0; i < PACKAGE_PUBLISHERID_MAX_LENGTH; i++)
+        if (ascii_lower( left[i] ) != ascii_lower( right[i] ))
+            return FALSE;
+    return TRUE;
+}
+
+static LONG get_package_id_publisher_id( const PACKAGE_ID *id,
+                                         WCHAR publisher_id[14] )
+{
+    WCHAR derived[14];
+    UINT32 publisher_length = 0, publisher_id_length = 0;
+    BOOL has_publisher, has_publisher_id;
+
+    has_publisher = id->publisher &&
+        get_bounded_identity_length(
+            id->publisher, PACKAGE_PUBLISHER_MIN_LENGTH,
+            PACKAGE_PUBLISHER_MAX_LENGTH, &publisher_length );
+    has_publisher_id = id->publisherId &&
+        get_bounded_identity_length(
+            id->publisherId, PACKAGE_PUBLISHERID_MIN_LENGTH,
+            PACKAGE_PUBLISHERID_MAX_LENGTH, &publisher_id_length ) &&
+        is_valid_publisher_id( id->publisherId, publisher_id_length );
+    if ((id->publisher && !has_publisher) ||
+        (id->publisherId && !has_publisher_id) ||
+        (!has_publisher && !has_publisher_id))
+        return ERROR_INVALID_PARAMETER;
+    if (has_publisher)
+    {
+        derive_publisher_id( id->publisher, publisher_length, derived );
+        if (has_publisher_id &&
+            !publisher_ids_equal( derived, id->publisherId ))
+            return ERROR_INVALID_PARAMETER;
+        memcpy( publisher_id, derived, sizeof(derived) );
+    }
+    else
+    {
+        memcpy( publisher_id, id->publisherId,
+                PACKAGE_PUBLISHERID_MAX_LENGTH * sizeof(*publisher_id) );
+        publisher_id[PACKAGE_PUBLISHERID_MAX_LENGTH] = 0;
+    }
+    return ERROR_SUCCESS;
+}
+
+static WCHAR *append_identity_slice( WCHAR *cursor, const WCHAR *value,
+                                     UINT32 length )
+{
+    memcpy( cursor, value, length * sizeof(*cursor) );
+    return cursor + length;
+}
+
+static WCHAR *append_identity_uint16( WCHAR *cursor, USHORT value )
+{
+    WCHAR digits[5];
+    UINT32 count = 0;
+
+    do
+    {
+        digits[count++] = '0' + value % 10;
+        value /= 10;
+    } while (value);
+    while (count) *cursor++ = digits[--count];
+    return cursor;
+}
+
+static LONG copy_identity_string( const WCHAR *value, UINT32 required,
+                                  UINT32 *length, WCHAR *buffer )
+{
+    UINT32 capacity;
+
+    if (!length) return ERROR_INVALID_PARAMETER;
+    capacity = *length;
+    *length = required;
+    if (!buffer || capacity < required) return ERROR_INSUFFICIENT_BUFFER;
+    memcpy( buffer, value, required * sizeof(*buffer) );
+    return ERROR_SUCCESS;
+}
+
+static LONG load_appx_query_proc( HMODULE module, const char *name,
+                                  void **function )
+{
+    ANSI_STRING name_string;
+    NTSTATUS status;
+
+    RtlInitAnsiString( &name_string, name );
+    if ((status = LdrGetProcedureAddress(
+            module, &name_string, 0, function )))
+        return RtlNtStatusToDosError( status );
+    return ERROR_SUCCESS;
+}
+
+static BOOL CALLBACK init_appx_query_api( INIT_ONCE *once, void *parameter,
+                                          void **context )
+{
+    UNICODE_STRING module_name;
+    ULONG flags = 0;
+    NTSTATUS status;
+    LONG error;
+
+    RtlInitUnicodeString( &module_name, L"appxsvc.dll" );
+    if ((status = LdrLoadDll(
+            (void *)((ULONG_PTR)LOAD_LIBRARY_SEARCH_SYSTEM32 | 1),
+            &flags, &module_name, &appx_query_api.module )))
+    {
+        appx_query_init_error = RtlNtStatusToDosError( status );
+        return TRUE;
+    }
+    if ((error = load_appx_query_proc(
+            appx_query_api.module,
+            "wine_appx_get_package_path_by_full_name",
+            (void **)&appx_query_api.get_path )) ||
+        (error = load_appx_query_proc(
+            appx_query_api.module, "wine_appx_get_packages_by_family",
+            (void **)&appx_query_api.get_family_packages )) ||
+        (error = load_appx_query_proc(
+            appx_query_api.module,
+            "wine_appx_get_package_publisher_by_full_name",
+            (void **)&appx_query_api.get_publisher )))
+    {
+        appx_query_init_error = error;
+        return TRUE;
+    }
+    appx_query_init_error = ERROR_SUCCESS;
+    return TRUE;
+}
+
+static LONG get_appx_query_api( const struct appx_query_api **api )
+{
+    if (!InitOnceExecuteOnce(
+            &appx_query_init_once, init_appx_query_api, NULL, NULL ))
+        return GetLastError();
+    if (appx_query_init_error) return appx_query_init_error;
+    *api = &appx_query_api;
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
+ *         GetPackagesByPackageFamily   (kernelbase.@)
+ */
+LONG WINAPI DECLSPEC_HOTPATCH GetPackagesByPackageFamily(
+    const WCHAR *family_name, UINT32 *count, WCHAR **full_names,
+    UINT32 *buffer_len, WCHAR *buffer )
+{
+    struct parsed_package_family_name parsed;
+    const struct appx_query_api *api;
+    LONG ret;
+
+    TRACE( "family_name %s, count %p, full_names %p, buffer_len %p, "
+           "buffer %p.\n", debugstr_w(family_name), count, full_names,
+           buffer_len, buffer );
+
+    if (!count || !buffer_len ||
+        !parse_package_family_name( family_name, &parsed ))
+        return ERROR_INVALID_PARAMETER;
+    if ((ret = get_appx_query_api( &api ))) return ret;
+    return api->get_family_packages(
+        family_name, count, full_names, buffer_len, buffer );
+}
+
+/***********************************************************************
+ *         GetPackagePathByFullName   (kernelbase.@)
+ */
+LONG WINAPI GetPackagePathByFullName(
+    const WCHAR *name, UINT32 *len, WCHAR *path )
+{
+    struct parsed_package_full_name parsed;
+    const struct appx_query_api *api;
+    LONG ret;
+
+    TRACE( "name %s, len %p, path %p.\n",
+           debugstr_w(name), len, path );
+
+    if (!len || !parse_package_full_name( name, &parsed ))
+        return ERROR_INVALID_PARAMETER;
+    if ((ret = get_appx_query_api( &api ))) return ret;
+    return api->get_path( name, len, path );
+}
+
+/***********************************************************************
+ *         GetPackagePathByFullName2   (kernelbase.@)
+ */
+LONG WINAPI GetPackagePathByFullName2(
+    const WCHAR *name, PackagePathType path_type, UINT32 *len, WCHAR *path )
+{
+    struct parsed_package_full_name parsed;
+    const struct appx_query_api *api;
+    UINT32 probe_length = 0;
+    LONG path_type_status, ret;
+
+    TRACE( "name %s, path_type %u, len %p, path %p.\n",
+           debugstr_w(name), path_type, len, path );
+
+    if (!len || !parse_package_full_name( name, &parsed ))
+        return ERROR_INVALID_PARAMETER;
+    if ((path_type_status =
+            get_static_package_path_type_status( path_type )) ==
+        ERROR_INVALID_PARAMETER)
+        return path_type_status;
+    if ((ret = get_appx_query_api( &api ))) return ret;
+    if (!path_type_status) return api->get_path( name, len, path );
+
+    ret = api->get_path( name, &probe_length, NULL );
+    return ret == ERROR_INSUFFICIENT_BUFFER ? path_type_status : ret;
+}
+
+/***********************************************************************
+ *         PackageFamilyNameFromFullName   (kernelbase.@)
+ */
+LONG WINAPI PackageFamilyNameFromFullName(
+    const WCHAR *full_name, UINT32 *family_name_length, WCHAR *family_name )
+{
+    struct parsed_package_full_name parsed;
+    WCHAR result[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1], *cursor = result;
+
+    TRACE( "full_name %s, family_name_length %p, family_name %p.\n",
+           debugstr_w(full_name), family_name_length, family_name );
+
+    if (!family_name_length ||
+        !parse_package_full_name( full_name, &parsed ))
+        return ERROR_INVALID_PARAMETER;
+    cursor = append_identity_slice(
+        cursor, parsed.name, parsed.name_length );
+    *cursor++ = '_';
+    cursor = append_identity_slice(
+        cursor, parsed.publisher_id, parsed.publisher_id_length );
+    *cursor++ = 0;
+    return copy_identity_string(
+        result, cursor - result, family_name_length, family_name );
+}
+
+/***********************************************************************
+ *         PackageFamilyNameFromId   (kernelbase.@)
+ */
+LONG WINAPI PackageFamilyNameFromId(
+    const PACKAGE_ID *id, UINT32 *family_name_length, WCHAR *family_name )
+{
+    WCHAR publisher_id[14];
+    WCHAR result[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1], *cursor = result;
+    UINT32 name_length, resource_length;
+    LONG ret;
+
+    TRACE( "id %p, family_name_length %p, family_name %p.\n",
+           id, family_name_length, family_name );
+
+    if (!id || !family_name_length || id->reserved ||
+        !get_bounded_identity_length(
+            id->name, PACKAGE_NAME_MIN_LENGTH, PACKAGE_NAME_MAX_LENGTH,
+            &name_length ) ||
+        !is_valid_identity_name(
+            id->name, name_length, PACKAGE_NAME_MIN_LENGTH,
+            PACKAGE_NAME_MAX_LENGTH, FALSE ) ||
+        !processor_arch_to_string( id->processorArchitecture ) ||
+        (id->resourceId &&
+         (!get_bounded_identity_length(
+              id->resourceId, PACKAGE_RESOURCEID_MIN_LENGTH,
+              PACKAGE_RESOURCEID_MAX_LENGTH, &resource_length ) ||
+          !is_valid_identity_name(
+              id->resourceId, resource_length, 1,
+              PACKAGE_RESOURCEID_MAX_LENGTH, TRUE ))))
+        return ERROR_INVALID_PARAMETER;
+    if ((ret = get_package_id_publisher_id( id, publisher_id ))) return ret;
+    cursor = append_identity_slice( cursor, id->name, name_length );
+    *cursor++ = '_';
+    cursor = append_identity_slice(
+        cursor, publisher_id, PACKAGE_PUBLISHERID_MAX_LENGTH );
+    *cursor++ = 0;
+    return copy_identity_string(
+        result, cursor - result, family_name_length, family_name );
+}
+
+/***********************************************************************
+ *         PackageFullNameFromId   (kernelbase.@)
+ */
+LONG WINAPI PackageFullNameFromId(
+    const PACKAGE_ID *id, UINT32 *full_name_length, WCHAR *full_name )
+{
+    WCHAR publisher_id[14];
+    WCHAR result[PACKAGE_FULL_NAME_MAX_LENGTH + 1], *cursor = result;
+    const WCHAR *architecture;
+    UINT32 name_length, resource_length = 0;
+    LONG ret;
+
+    TRACE( "id %p, full_name_length %p, full_name %p.\n",
+           id, full_name_length, full_name );
+
+    if (!id || !full_name_length || id->reserved ||
+        !get_bounded_identity_length(
+            id->name, PACKAGE_NAME_MIN_LENGTH, PACKAGE_NAME_MAX_LENGTH,
+            &name_length ) ||
+        !is_valid_identity_name(
+            id->name, name_length, PACKAGE_NAME_MIN_LENGTH,
+            PACKAGE_NAME_MAX_LENGTH, FALSE ) ||
+        (id->resourceId &&
+         (!get_bounded_identity_length(
+              id->resourceId, PACKAGE_RESOURCEID_MIN_LENGTH,
+              PACKAGE_RESOURCEID_MAX_LENGTH, &resource_length ) ||
+          !is_valid_identity_name(
+              id->resourceId, resource_length, 1,
+              PACKAGE_RESOURCEID_MAX_LENGTH, TRUE ))) ||
+        !(architecture = processor_arch_to_string(
+              id->processorArchitecture )))
+        return ERROR_INVALID_PARAMETER;
+    if ((ret = get_package_id_publisher_id( id, publisher_id ))) return ret;
+
+    cursor = append_identity_slice( cursor, id->name, name_length );
+    *cursor++ = '_';
+    cursor = append_identity_uint16( cursor, id->version.Major );
+    *cursor++ = '.';
+    cursor = append_identity_uint16( cursor, id->version.Minor );
+    *cursor++ = '.';
+    cursor = append_identity_uint16( cursor, id->version.Build );
+    *cursor++ = '.';
+    cursor = append_identity_uint16( cursor, id->version.Revision );
+    *cursor++ = '_';
+    cursor = append_identity_slice(
+        cursor, architecture, lstrlenW(architecture) );
+    *cursor++ = '_';
+    if (resource_length)
+        cursor = append_identity_slice(
+            cursor, id->resourceId, resource_length );
+    *cursor++ = '_';
+    cursor = append_identity_slice(
+        cursor, publisher_id, PACKAGE_PUBLISHERID_MAX_LENGTH );
+    *cursor++ = 0;
+    if (cursor - result > ARRAY_SIZE(result))
+        return ERROR_INVALID_PARAMETER;
+    return copy_identity_string(
+        result, cursor - result, full_name_length, full_name );
+}
+
+/***********************************************************************
+ *         PackageNameAndPublisherIdFromFamilyName   (kernelbase.@)
+ */
+LONG WINAPI PackageNameAndPublisherIdFromFamilyName(
+    const WCHAR *family_name, UINT32 *name_length, WCHAR *name,
+    UINT32 *publisher_id_length, WCHAR *publisher_id )
+{
+    struct parsed_package_family_name parsed;
+    UINT32 name_capacity, publisher_capacity;
+    UINT32 required_name, required_publisher;
+
+    TRACE( "family_name %s, name_length %p, name %p, publisher_id_length "
+           "%p, publisher_id %p.\n", debugstr_w(family_name), name_length,
+           name, publisher_id_length, publisher_id );
+
+    if (!name_length || !publisher_id_length ||
+        !parse_package_family_name( family_name, &parsed ))
+        return ERROR_INVALID_PARAMETER;
+    name_capacity = *name_length;
+    publisher_capacity = *publisher_id_length;
+    required_name = parsed.name_length + 1;
+    required_publisher = parsed.publisher_id_length + 1;
+    *name_length = required_name;
+    *publisher_id_length = required_publisher;
+    if (!name || !publisher_id || name_capacity < required_name ||
+        publisher_capacity < required_publisher)
+        return ERROR_INSUFFICIENT_BUFFER;
+    memcpy( name, parsed.name, parsed.name_length * sizeof(*name) );
+    name[parsed.name_length] = 0;
+    memcpy( publisher_id, parsed.publisher_id,
+            parsed.publisher_id_length * sizeof(*publisher_id) );
+    publisher_id[parsed.publisher_id_length] = 0;
+    return ERROR_SUCCESS;
 }
 
 /***********************************************************************
  *         PackageIdFromFullName   (kernelbase.@)
  */
-LONG WINAPI PackageIdFromFullName(const WCHAR *full_name, UINT32 flags, UINT32 *buffer_length, BYTE *buffer)
+LONG WINAPI PackageIdFromFullName(
+    const WCHAR *full_name, UINT32 flags, UINT32 *buffer_length, BYTE *buffer )
 {
-    const WCHAR *name, *version_str, *arch_str, *resource_id, *publisher_id, *s;
-    PACKAGE_ID *id = (PACKAGE_ID *)buffer;
-    UINT32 size, buffer_size, len;
+    struct parsed_package_full_name parsed;
+    const struct appx_query_api *api;
+    WCHAR derived_publisher_id[14];
+    WCHAR *publisher = NULL, *strings;
+    UINT32 publisher_length = 0, capacity, size;
+    PACKAGE_ID id;
+    LONG ret;
 
-    TRACE("full_name %s, flags %#x, buffer_length %p, buffer %p.\n",
-            debugstr_w(full_name), flags, buffer_length, buffer);
+    TRACE( "full_name %s, flags %#x, buffer_length %p, buffer %p.\n",
+           debugstr_w(full_name), flags, buffer_length, buffer );
 
-    if (flags)
-        FIXME("Flags %#x are not supported.\n", flags);
-
-    if (!full_name || !buffer_length)
+    if (!buffer_length ||
+        (flags != PACKAGE_INFORMATION_BASIC &&
+         flags != PACKAGE_INFORMATION_FULL) ||
+        !parse_package_full_name( full_name, &parsed ))
         return ERROR_INVALID_PARAMETER;
+    if (!buffer && *buffer_length) return ERROR_INVALID_PARAMETER;
 
-    if (!buffer && *buffer_length)
-        return ERROR_INVALID_PARAMETER;
-
-    name = full_name;
-    if (!(version_str = wcschr(name, L'_')))
-        return ERROR_INVALID_PARAMETER;
-    ++version_str;
-
-    if (!(arch_str = wcschr(version_str, L'_')))
-        return ERROR_INVALID_PARAMETER;
-    ++arch_str;
-
-    if (!(resource_id = wcschr(arch_str, L'_')))
-        return ERROR_INVALID_PARAMETER;
-    ++resource_id;
-
-    if (!(publisher_id = wcschr(resource_id, L'_')))
-        return ERROR_INVALID_PARAMETER;
-    ++publisher_id;
-
-    /* Publisher id length should be 13. */
-    size = sizeof(*id) + sizeof(WCHAR) * ((version_str - name) + (publisher_id - resource_id) + 13 + 1);
-    buffer_size = *buffer_length;
-    *buffer_length = size;
-    if (buffer_size < size)
-        return ERROR_INSUFFICIENT_BUFFER;
-
-    memset(id, 0, sizeof(*id));
-    if ((id->processorArchitecture = processor_arch_from_string(arch_str, resource_id - arch_str - 1)) == ~0u)
+    if (flags == PACKAGE_INFORMATION_FULL)
     {
-        FIXME("Unrecognized arch %s.\n", debugstr_w(arch_str));
-        return ERROR_INVALID_PARAMETER;
+        if ((ret = get_appx_query_api( &api ))) return ret;
+        publisher_length = PACKAGE_PUBLISHER_MAX_LENGTH + 1;
+        if (!(publisher = HeapAlloc(
+                GetProcessHeap(), 0,
+                publisher_length * sizeof(*publisher) )))
+            return ERROR_NOT_ENOUGH_MEMORY;
+        ret = api->get_publisher(
+            full_name, &publisher_length, publisher );
+        if (ret)
+        {
+            HeapFree( GetProcessHeap(), 0, publisher );
+            return ret;
+        }
+        if (!get_bounded_identity_length(
+                publisher, PACKAGE_PUBLISHER_MIN_LENGTH,
+                PACKAGE_PUBLISHER_MAX_LENGTH, &publisher_length ))
+        {
+            HeapFree( GetProcessHeap(), 0, publisher );
+            return ERROR_BAD_FORMAT;
+        }
+        derive_publisher_id(
+            publisher, publisher_length, derived_publisher_id );
+        if (!publisher_ids_equal(
+                derived_publisher_id, parsed.publisher_id ))
+        {
+            HeapFree( GetProcessHeap(), 0, publisher );
+            return ERROR_BAD_FORMAT;
+        }
+        publisher_length++;
     }
-    buffer += sizeof(*id);
 
-    id->version.Major = wcstol(version_str, NULL, 10);
-    if (!(s = wcschr(version_str, L'.')))
-        return ERROR_INVALID_PARAMETER;
-    ++s;
-    id->version.Minor = wcstol(s, NULL, 10);
-    if (!(s = wcschr(s, L'.')))
-        return ERROR_INVALID_PARAMETER;
-    ++s;
-    id->version.Build = wcstol(s, NULL, 10);
-    if (!(s = wcschr(s, L'.')))
-        return ERROR_INVALID_PARAMETER;
-    ++s;
-    id->version.Revision = wcstol(s, NULL, 10);
+    size = sizeof(id) +
+           (parsed.name_length + 1 +
+            parsed.resource_id_length + 1 +
+            parsed.publisher_id_length + 1 +
+            publisher_length) * sizeof(WCHAR);
+    capacity = *buffer_length;
+    *buffer_length = size;
+    if (!buffer || capacity < size)
+    {
+        HeapFree( GetProcessHeap(), 0, publisher );
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
 
-    id->name = (WCHAR *)buffer;
-    len = version_str - name - 1;
-    memcpy(id->name, name, sizeof(*id->name) * len);
-    id->name[len] = 0;
-    buffer += sizeof(*id->name) * (len + 1);
-
-    id->resourceId = (WCHAR *)buffer;
-    len = publisher_id - resource_id - 1;
-    memcpy(id->resourceId, resource_id, sizeof(*id->resourceId) * len);
-    id->resourceId[len] = 0;
-    buffer += sizeof(*id->resourceId) * (len + 1);
-
-    id->publisherId = (WCHAR *)buffer;
-    len = lstrlenW(publisher_id);
-    if (len != 13)
-        return ERROR_INVALID_PARAMETER;
-    memcpy(id->publisherId, publisher_id, sizeof(*id->publisherId) * len);
-    id->publisherId[len] = 0;
-
+    memset( &id, 0, sizeof(id) );
+    id.processorArchitecture = parsed.processor_architecture;
+    id.version = parsed.version;
+    strings = (WCHAR *)(buffer + sizeof(id));
+    id.name = strings;
+    strings = append_identity_slice(
+        strings, parsed.name, parsed.name_length );
+    *strings++ = 0;
+    if (publisher)
+    {
+        id.publisher = strings;
+        strings = append_identity_slice(
+            strings, publisher, publisher_length - 1 );
+        *strings++ = 0;
+    }
+    id.resourceId = strings;
+    strings = append_identity_slice(
+        strings, parsed.resource_id, parsed.resource_id_length );
+    *strings++ = 0;
+    id.publisherId = strings;
+    strings = append_identity_slice(
+        strings, parsed.publisher_id, parsed.publisher_id_length );
+    *strings = 0;
+    memcpy( buffer, &id, sizeof(id) );
+    HeapFree( GetProcessHeap(), 0, publisher );
     return ERROR_SUCCESS;
 }

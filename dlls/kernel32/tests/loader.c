@@ -26,9 +26,11 @@
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
+#include "winioctl.h"
 #include "winternl.h"
 #include "winnls.h"
 #include "wine/test.h"
+#include "wine/appx_package_graph.h"
 #include "delayloadhandler.h"
 
 /* PROCESS_ALL_ACCESS in Vista+ PSDKs is incompatible with older Windows versions */
@@ -4919,9 +4921,268 @@ static void test_dll_file( const char *name )
 #undef OK_FIELD
 }
 
+#define PACKAGED_GRAPH_HEADER_SIZE              WINE_APPX_GRAPH_BLOB_HEADER_SIZE
+#define PACKAGED_GRAPH_PACKAGE_SIZE             WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE
+#define PACKAGED_GRAPH_LOADER_SIZE              WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE
+
+struct packaged_graph_builder
+{
+    BYTE *data;
+    UINT32 size;
+    UINT32 capacity;
+};
+
+static void packaged_graph_write_u16(BYTE *data, UINT16 value)
+{
+    data[0] = value;
+    data[1] = value >> 8;
+}
+
+static void packaged_graph_write_u32(BYTE *data, UINT32 value)
+{
+    packaged_graph_write_u16(data, value);
+    packaged_graph_write_u16(data + 2, value >> 16);
+}
+
+static void packaged_graph_write_u64(BYTE *data, UINT64 value)
+{
+    packaged_graph_write_u32(data, value);
+    packaged_graph_write_u32(data + 4, value >> 32);
+}
+
+static void packaged_graph_write_file_identity(BYTE *record,
+        const WCHAR *root, const WCHAR *relative_path, UINT32 fallback)
+{
+    BY_HANDLE_FILE_INFORMATION info;
+    FILE_OBJECTID_BUFFER object_id;
+    FILE_STANDARD_INFORMATION standard;
+    FILE_BASIC_INFORMATION basic;
+    IO_STATUS_BLOCK io;
+    WCHAR path[MAX_PATH];
+    HANDLE file;
+    BOOL metadata = FALSE;
+    UINT32 i;
+
+    memset(&info, 0, sizeof(info));
+    memset(&object_id, 0, sizeof(object_id));
+    memset(&basic, 0, sizeof(basic));
+    memset(&standard, 0, sizeof(standard));
+    if (swprintf(path, ARRAY_SIZE(path), L"%s\\%s", root, relative_path) > 0)
+    {
+        file = CreateFileW(path, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            metadata = GetFileInformationByHandle(file, &info) &&
+                    !NtFsControlFile(file, 0, NULL, NULL, &io,
+                            FSCTL_GET_OBJECT_ID, NULL, 0, &object_id,
+                            sizeof(object_id)) &&
+                    !NtQueryInformationFile(file, &io, &basic, sizeof(basic),
+                            FileBasicInformation) &&
+                    !NtQueryInformationFile(file, &io, &standard,
+                            sizeof(standard), FileStandardInformation) &&
+                    basic.ChangeTime.QuadPart > 0 &&
+                    standard.EndOfFile.QuadPart > 0;
+            CloseHandle(file);
+        }
+    }
+    if (metadata)
+    {
+        for (i = 0; i < WINE_APPX_GRAPH_OBJECT_ID_SIZE; i++)
+            if (object_id.ObjectId[i]) break;
+        if (i == WINE_APPX_GRAPH_OBJECT_ID_SIZE) metadata = FALSE;
+    }
+    if (!metadata || (!info.nFileIndexHigh && !info.nFileIndexLow))
+    {
+        info.dwVolumeSerialNumber = 0x10203040 + fallback;
+        info.nFileIndexHigh = 0x50607080 + fallback;
+        info.nFileIndexLow = 0x90a0b0c0 + fallback;
+        basic.ChangeTime.QuadPart = 0x01d0000000000000ULL + fallback;
+        standard.EndOfFile.QuadPart = 4096 + fallback;
+        for (i = 0; i < WINE_APPX_GRAPH_OBJECT_ID_SIZE; i++)
+            object_id.ObjectId[i] = 0xa0 + fallback + i;
+    }
+    packaged_graph_write_u32(record + 24, info.dwVolumeSerialNumber);
+    packaged_graph_write_u32(record + 28, info.nFileIndexHigh);
+    packaged_graph_write_u32(record + 32, info.nFileIndexLow);
+    packaged_graph_write_u64(
+            record + WINE_APPX_GRAPH_LOADER_CHANGE_TIME_OFFSET,
+            basic.ChangeTime.QuadPart);
+    packaged_graph_write_u64(
+            record + WINE_APPX_GRAPH_LOADER_FILE_SIZE_OFFSET,
+            standard.EndOfFile.QuadPart);
+    memcpy(record + WINE_APPX_GRAPH_LOADER_OBJECT_ID_OFFSET,
+            object_id.ObjectId, WINE_APPX_GRAPH_OBJECT_ID_SIZE);
+}
+
+static BOOL packaged_graph_append_string(struct packaged_graph_builder *builder,
+        UINT32 ref_offset, const WCHAR *string)
+{
+    UINT32 chars = lstrlenW(string) + 1, bytes = chars * sizeof(WCHAR);
+
+    if (builder->size > builder->capacity - bytes) return FALSE;
+    packaged_graph_write_u32(builder->data + ref_offset, builder->size);
+    packaged_graph_write_u32(builder->data + ref_offset + 4, chars);
+    memcpy(builder->data + builder->size, string, bytes);
+    builder->size += bytes;
+    return TRUE;
+}
+
+static BYTE *build_loader_package_graph(const WCHAR *root0, const WCHAR *basename0,
+        const WCHAR *path0, UINT32 package0, const WCHAR *root1,
+        const WCHAR *basename1, const WCHAR *path1, UINT32 package1,
+        UINT32 loader_count, UINT32 *graph_size)
+{
+    static const WCHAR * const package0_prefix[] =
+    {
+        L"LoaderPackage", L"CN=Loader Publisher", L"", L"0abcdefghjkme",
+        L"LoaderPackage_1.0.0.0_neutral__0abcdefghjkme",
+        L"LoaderPackage_0abcdefghjkme",
+    };
+    static const WCHAR * const package1_prefix[] =
+    {
+        L"LoaderFramework", L"CN=Loader Publisher", L"", L"0abcdefghjkme",
+        L"LoaderFramework_1.0.0.0_neutral__0abcdefghjkme",
+        L"LoaderFramework_0abcdefghjkme",
+    };
+    static const UINT32 package_ref_offsets[] = {56, 64, 72, 80, 88, 96};
+    struct packaged_graph_builder builder;
+    BYTE *record0, *record1, *loader0, *loader1;
+    UINT32 fixed_size, i;
+
+    builder.capacity = 8192;
+    if (!(builder.data = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, builder.capacity)))
+        return NULL;
+    fixed_size = PACKAGED_GRAPH_HEADER_SIZE + 2 * PACKAGED_GRAPH_PACKAGE_SIZE +
+            loader_count * PACKAGED_GRAPH_LOADER_SIZE;
+    builder.size = fixed_size;
+    record0 = builder.data + PACKAGED_GRAPH_HEADER_SIZE;
+    record1 = record0 + PACKAGED_GRAPH_PACKAGE_SIZE;
+    loader0 = record1 + PACKAGED_GRAPH_PACKAGE_SIZE;
+    loader1 = loader0 + PACKAGED_GRAPH_LOADER_SIZE;
+
+    if (!packaged_graph_append_string(&builder, 72, L"App") ||
+        !packaged_graph_append_string(&builder, 80, L"LoaderPackage_0abcdefghjkme!App") ||
+        !packaged_graph_append_string(&builder, 88, L"loader.exe") ||
+        !packaged_graph_append_string(&builder, 96, L""))
+        goto failed;
+    for (i = 0; i < ARRAY_SIZE(package_ref_offsets); i++)
+        if (!packaged_graph_append_string(&builder, PACKAGED_GRAPH_HEADER_SIZE +
+                package_ref_offsets[i], package0_prefix[i]))
+            goto failed;
+    if (!packaged_graph_append_string(&builder, PACKAGED_GRAPH_HEADER_SIZE + 104, root0))
+        goto failed;
+    for (i = 0; i < ARRAY_SIZE(package_ref_offsets); i++)
+        if (!packaged_graph_append_string(&builder, PACKAGED_GRAPH_HEADER_SIZE +
+                PACKAGED_GRAPH_PACKAGE_SIZE + package_ref_offsets[i], package1_prefix[i]))
+            goto failed;
+    if (!packaged_graph_append_string(&builder, PACKAGED_GRAPH_HEADER_SIZE +
+            PACKAGED_GRAPH_PACKAGE_SIZE + 104, root1))
+        goto failed;
+    if (loader_count &&
+        (!packaged_graph_append_string(&builder, loader0 - builder.data + 8, basename0) ||
+         !packaged_graph_append_string(&builder, loader0 - builder.data + 16, path0)))
+        goto failed;
+    if (loader_count > 1 &&
+        (!packaged_graph_append_string(&builder, loader1 - builder.data + 8, basename1) ||
+         !packaged_graph_append_string(&builder, loader1 - builder.data + 16, path1)))
+        goto failed;
+
+    memcpy(builder.data, "SWXGRAPH", 8);
+    packaged_graph_write_u32(builder.data + 8, WINE_APPX_GRAPH_BLOB_VERSION);
+    packaged_graph_write_u32(builder.data + 12, PACKAGED_GRAPH_HEADER_SIZE);
+    packaged_graph_write_u32(builder.data + 16, builder.size);
+    packaged_graph_write_u32(builder.data + 40,
+            WINE_APPX_GRAPH_CURRENT_ARCHITECTURE);
+    packaged_graph_write_u32(builder.data + 44, 2);
+    packaged_graph_write_u32(builder.data + 48, PACKAGED_GRAPH_HEADER_SIZE);
+    packaged_graph_write_u32(builder.data + 52, loader_count);
+    packaged_graph_write_u32(builder.data + 56,
+            PACKAGED_GRAPH_HEADER_SIZE + 2 * PACKAGED_GRAPH_PACKAGE_SIZE);
+    packaged_graph_write_u32(builder.data + 104, 0);
+    packaged_graph_write_u32(builder.data + 108, fixed_size);
+    packaged_graph_write_u32(builder.data + 112, 0x10203040);
+    packaged_graph_write_u32(builder.data + 116, 0x50607080);
+    packaged_graph_write_u32(builder.data + 120, 0x90a0b0c0);
+    for (i = 0; i < WINE_APPX_GRAPH_OBJECT_ID_SIZE; i++)
+        builder.data[WINE_APPX_GRAPH_HEADER_OBJECT_ID_OFFSET + i] = 0x40 + i;
+    packaged_graph_write_u32(builder.data + 60, fixed_size);
+    packaged_graph_write_u32(builder.data + 64, builder.size - fixed_size);
+    packaged_graph_write_u32(builder.data + 68, 1);
+
+    packaged_graph_write_u64(record0, 1);
+    packaged_graph_write_u32(record0 + 8, 0);
+    packaged_graph_write_u32(record0 + 12, 0x09);
+    packaged_graph_write_u32(record0 + 16, 0);
+    packaged_graph_write_u64(record1, 1);
+    packaged_graph_write_u32(record1 + 8, 0);
+    packaged_graph_write_u32(record1 + 12,
+            0x0b | (WINE_APPX_GRAPH_BLOB_VERSION > 1 ? 0x10 : 0));
+    packaged_graph_write_u32(record1 + 16, 1);
+    if (loader_count)
+    {
+        packaged_graph_write_u32(loader0, package0);
+        packaged_graph_write_file_identity(loader0, root0, path0, 0);
+    }
+    if (loader_count > 1)
+    {
+        packaged_graph_write_u32(loader1, package1);
+        packaged_graph_write_file_identity(loader1, root1, path1, 1);
+    }
+
+    if (!wine_appx_graph_validate_blob(builder.data, builder.size))
+    {
+        ok(0, "constructed package loader graph is invalid.\n");
+        goto failed;
+    }
+    *graph_size = builder.size;
+    return builder.data;
+
+failed:
+    HeapFree(GetProcessHeap(), 0, builder.data);
+    return NULL;
+}
+
+struct packaged_graph_mutator
+{
+    RTL_USER_PROCESS_PARAMETERS *params;
+    void *valid;
+    void *invalid;
+    LONG stop;
+};
+
+static DWORD WINAPI packaged_graph_mutator_thread(void *parameter)
+{
+    struct packaged_graph_mutator *mutator = parameter;
+
+    while (!InterlockedCompareExchange(&mutator->stop, 0, 0))
+    {
+        InterlockedExchangePointer(&mutator->params->PackageDependencyData, mutator->valid);
+        InterlockedExchangePointer(&mutator->params->PackageDependencyData, mutator->invalid);
+    }
+    return 0;
+}
+
 static void test_LoadPackagedLibrary(void)
 {
-    HMODULE h;
+    RTL_USER_PROCESS_PARAMETERS *params = NtCurrentTeb()->Peb->ProcessParameters;
+    void *original_graph = params->PackageDependencyData;
+    struct packaged_graph_mutator mutator;
+    BYTE *graph = NULL, *known_name_graph = NULL, *outside_graph = NULL;
+    BYTE *unsorted_graph = NULL;
+    BYTE *duplicate_graph = NULL, *case_mismatch_graph = NULL;
+    BYTE *bad_path_graph = NULL, *forbidden_graph = NULL;
+    WCHAR *long_name = NULL;
+    WCHAR windows_dir[MAX_PATH], temp_path[MAX_PATH], temp_root[MAX_PATH];
+    WCHAR source_path[MAX_PATH], copied_known[MAX_PATH], loaded_path[MAX_PATH];
+    UINT32 graph_size;
+    void *noaccess = NULL;
+    HANDLE thread = NULL;
+    DWORD wait, length;
+    unsigned int i;
+    HMODULE h, source_module;
+    BOOL ret, source_ready;
 
     if (!pLoadPackagedLibrary)
     {
@@ -4929,10 +5190,269 @@ static void test_LoadPackagedLibrary(void)
         return;
     }
 
+    params->PackageDependencyData = NULL;
     SetLastError( 0xdeadbeef );
     h = pLoadPackagedLibrary(L"kernel32.dll", 0);
     ok(!h && GetLastError() == APPMODEL_ERROR_NO_PACKAGE, "Got unexpected handle %p, GetLastError() %lu.\n",
             h, GetLastError());
+    h = pLoadPackagedLibrary((WCHAR *)1, 1);
+    ok(!h && GetLastError() == APPMODEL_ERROR_NO_PACKAGE,
+            "Unpackaged poison call returned %p, error %lu.\n", h, GetLastError());
+
+    if (strcmp(winetest_platform, "wine"))
+    {
+        params->PackageDependencyData = original_graph;
+        skip("Wine package graph wire-format tests are not applicable on Windows.\n");
+        return;
+    }
+    GetWindowsDirectoryW(windows_dir, ARRAY_SIZE(windows_dir));
+    graph = build_loader_package_graph(windows_dir, L"kernel32.dll",
+            L"system32\\kernel32.dll", 0, L"C:\\MissingPackage",
+            L"kernel32.dll", L"kernel32.dll", 1, 2, &graph_size);
+    ok(!!graph, "Failed to build loader graph.\n");
+    if (!graph) goto done;
+    params->PackageDependencyData = graph;
+
+    SetLastError(0xdeadbeef);
+    h = pLoadPackagedLibrary(NULL, 0);
+    ok(!h && GetLastError() == ERROR_INVALID_PARAMETER,
+            "NULL name returned %p, error %lu.\n", h, GetLastError());
+    h = pLoadPackagedLibrary(L"kernel32.dll", 1);
+    ok(!h && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Reserved parameter returned %p, error %lu.\n", h, GetLastError());
+    h = pLoadPackagedLibrary(L"..\\kernel32.dll", 0);
+    ok(!h && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Traversal returned %p, error %lu.\n", h, GetLastError());
+    h = pLoadPackagedLibrary(L"C:\\windows\\system32\\kernel32.dll", 0);
+    ok(!h && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Absolute path returned %p, error %lu.\n", h, GetLastError());
+    h = pLoadPackagedLibrary(L"system32/kernel32.dll", 0);
+    ok(!h && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Forward-slash path returned %p, error %lu.\n", h, GetLastError());
+    h = pLoadPackagedLibrary(L"bad?.dll", 0);
+    ok(!h && GetLastError() == ERROR_INVALID_PARAMETER,
+            "Forbidden-character path returned %p, error %lu.\n", h, GetLastError());
+    long_name = HeapAlloc(GetProcessHeap(), 0, 32767 * sizeof(*long_name));
+    ok(!!long_name, "Failed to allocate the long module name.\n");
+    if (long_name)
+    {
+        unsigned int j;
+
+        for (j = 0; j < 32767; j++) long_name[j] = 'a';
+        h = pLoadPackagedLibrary(long_name, 0);
+        ok(!h && GetLastError() == ERROR_FILENAME_EXCED_RANGE,
+                "Overlong name returned %p, error %lu.\n", h, GetLastError());
+    }
+
+    h = pLoadPackagedLibrary(L"kernel32", 0);
+    ok(!!h, "Implicit extension load failed, error %lu.\n", GetLastError());
+    if (h) FreeLibrary(h);
+    h = pLoadPackagedLibrary(L"KERNEL32.DLL", 0);
+    ok(!!h, "Case-insensitive load failed, error %lu.\n", GetLastError());
+    if (h) FreeLibrary(h);
+    h = pLoadPackagedLibrary(L"system32\\kernel32", 0);
+    ok(!!h, "Relative-path load failed, error %lu.\n", GetLastError());
+    if (h) FreeLibrary(h);
+    h = pLoadPackagedLibrary(L"kernel32.", 0);
+    ok(!h && GetLastError() == ERROR_MOD_NOT_FOUND,
+            "Trailing-dot suppression returned %p, error %lu.\n", h, GetLastError());
+    h = pLoadPackagedLibrary(L"missing.dll", 0);
+    ok(!h && GetLastError() == ERROR_MOD_NOT_FOUND,
+            "Missing module returned %p, error %lu.\n", h, GetLastError());
+
+    /*
+     * LoadPackagedLibrary selects its target from the graph even when the
+     * selected basename is also a KnownDLL.  KnownDLL precedence still
+     * applies to the selected module's ordinary basename-only dependencies.
+     */
+    source_module = LoadLibraryW(L"version.dll");
+    ok(!!source_module, "Could not load the package fixture, error %lu.\n",
+            GetLastError());
+    source_path[0] = temp_root[0] = copied_known[0] = 0;
+    if (source_module)
+    {
+        length = GetModuleFileNameW(source_module, source_path,
+                ARRAY_SIZE(source_path));
+        source_ready = length && length < ARRAY_SIZE(source_path);
+        ok(source_ready,
+                "Could not locate the package fixture, error %lu.\n",
+                GetLastError());
+        length = GetTempPathW(ARRAY_SIZE(temp_path), temp_path);
+        ok(length && length < ARRAY_SIZE(temp_path),
+                "Could not get the temporary path, error %lu.\n",
+                GetLastError());
+        if (source_ready && length && length < ARRAY_SIZE(temp_path) &&
+            GetTempFileNameW(temp_path, L"lpk", 0, temp_root))
+        {
+            ret = DeleteFileW(temp_root) && CreateDirectoryW(temp_root, NULL);
+            ok(ret, "Could not create the package fixture root, error %lu.\n",
+                    GetLastError());
+            if (ret && swprintf(copied_known, ARRAY_SIZE(copied_known),
+                    L"%s\\kernel32.dll", temp_root) > 0)
+            {
+                ret = CopyFileW(source_path, copied_known, FALSE);
+                ok(ret, "Could not copy the KnownDLL-name fixture, error %lu.\n",
+                        GetLastError());
+                if (ret)
+                {
+                    known_name_graph = build_loader_package_graph(temp_root,
+                            L"kernel32.dll", L"kernel32.dll", 0,
+                            L"C:\\MissingPackage", L"", L"", 1, 1,
+                            &graph_size);
+                    ok(!!known_name_graph,
+                            "Failed to build the KnownDLL-name graph.\n");
+                    if (known_name_graph)
+                    {
+                        params->PackageDependencyData = known_name_graph;
+                        h = pLoadPackagedLibrary(L"kernel32.dll", 0);
+                        ok(!!h, "KnownDLL-name graph load failed, error %lu.\n",
+                                GetLastError());
+                        if (h)
+                        {
+                            length = GetModuleFileNameW(h, loaded_path,
+                                    ARRAY_SIZE(loaded_path));
+                            ok(length && !wcsicmp(loaded_path, copied_known),
+                                    "KnownDLL-name graph loaded %s instead of %s.\n",
+                                    wine_dbgstr_w(loaded_path),
+                                    wine_dbgstr_w(copied_known));
+                            FreeLibrary(h);
+                        }
+                    }
+                }
+            }
+        }
+        else
+            ok(0, "Could not reserve the package fixture root, error %lu.\n",
+                    GetLastError());
+        FreeLibrary(source_module);
+    }
+    params->PackageDependencyData = graph;
+
+    outside_graph = build_loader_package_graph(L"C:\\MissingPackage",
+            L"kernel32.dll", L"kernel32.dll", 0, L"C:\\MissingFramework",
+            L"", L"", 1, 1, &graph_size);
+    ok(!!outside_graph, "Failed to build outside-provenance graph.\n");
+    if (outside_graph)
+    {
+        params->PackageDependencyData = outside_graph;
+        h = pLoadPackagedLibrary(L"kernel32.dll", 0);
+        ok(!h && (GetLastError() == ERROR_MOD_NOT_FOUND ||
+                   GetLastError() == ERROR_INVALID_DATA),
+                "Outside-provenance module returned %p, error %lu.\n", h, GetLastError());
+    }
+
+    unsorted_graph = build_loader_package_graph(windows_dir, L"z.dll",
+            L"system32\\z.dll", 0, L"C:\\MissingPackage",
+            L"a.dll", L"a.dll", 1, 2, &graph_size);
+    ok(!!unsorted_graph, "Failed to build unsorted graph.\n");
+    if (unsorted_graph)
+    {
+        params->PackageDependencyData = unsorted_graph;
+        h = pLoadPackagedLibrary(L"a.dll", 0);
+        ok(!h && GetLastError() == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                "Unsorted graph returned %p, error %lu.\n", h, GetLastError());
+    }
+
+    duplicate_graph = build_loader_package_graph(windows_dir, L"kernel32.dll",
+            L"system32\\kernel32.dll", 0, windows_dir,
+            L"kernel32.dll", L"other\\kernel32.dll", 0, 2, &graph_size);
+    ok(!!duplicate_graph, "Failed to build duplicate graph.\n");
+    if (duplicate_graph)
+    {
+        params->PackageDependencyData = duplicate_graph;
+        h = pLoadPackagedLibrary(L"kernel32.dll", 0);
+        ok(!h && GetLastError() == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                "Duplicate graph returned %p, error %lu.\n", h, GetLastError());
+    }
+
+    case_mismatch_graph = build_loader_package_graph(windows_dir, L"KERNEL32.DLL",
+            L"system32\\kernel32.dll", 0, L"C:\\MissingPackage",
+            L"", L"", 1, 1, &graph_size);
+    ok(!!case_mismatch_graph, "Failed to build case-mismatch graph.\n");
+    if (case_mismatch_graph)
+    {
+        params->PackageDependencyData = case_mismatch_graph;
+        h = pLoadPackagedLibrary(L"kernel32.dll", 0);
+        ok(!h && GetLastError() == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                "Case-mismatch graph returned %p, error %lu.\n", h, GetLastError());
+    }
+
+    bad_path_graph = build_loader_package_graph(windows_dir, L"kernel32.dll",
+            L"..\\kernel32.dll", 0, L"C:\\MissingPackage",
+            L"", L"", 1, 1, &graph_size);
+    ok(!!bad_path_graph, "Failed to build bad-path graph.\n");
+    if (bad_path_graph)
+    {
+        params->PackageDependencyData = bad_path_graph;
+        h = pLoadPackagedLibrary(L"kernel32.dll", 0);
+        ok(!h && GetLastError() == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                "Bad path graph returned %p, error %lu.\n", h, GetLastError());
+    }
+
+    forbidden_graph = build_loader_package_graph(windows_dir, L"kernel32.dll",
+            L"bad?\\kernel32.dll", 0, L"C:\\MissingPackage",
+            L"", L"", 1, 1, &graph_size);
+    ok(!!forbidden_graph, "Failed to build forbidden-path graph.\n");
+    if (forbidden_graph)
+    {
+        params->PackageDependencyData = forbidden_graph;
+        h = pLoadPackagedLibrary(L"kernel32.dll", 0);
+        ok(!h && GetLastError() == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                "Forbidden-path graph returned %p, error %lu.\n", h, GetLastError());
+    }
+
+    noaccess = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+    ok(!!noaccess, "VirtualAlloc failed, error %lu.\n", GetLastError());
+    if (noaccess)
+    {
+        params->PackageDependencyData = noaccess;
+        h = pLoadPackagedLibrary(L"kernel32.dll", 0);
+        ok(!h && GetLastError() == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                "Inaccessible graph returned %p, error %lu.\n", h, GetLastError());
+
+        mutator.params = params;
+        mutator.valid = graph;
+        mutator.invalid = noaccess;
+        mutator.stop = 0;
+        thread = CreateThread(NULL, 0, packaged_graph_mutator_thread, &mutator, 0, NULL);
+        ok(!!thread, "CreateThread failed, error %lu.\n", GetLastError());
+        if (thread)
+        {
+            for (i = 0; i < 200; i++)
+            {
+                h = pLoadPackagedLibrary(L"kernel32.dll", 0);
+                if (h) FreeLibrary(h);
+                else ok(GetLastError() == APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT,
+                        "Graph mutation returned error %lu.\n", GetLastError());
+            }
+            InterlockedExchange(&mutator.stop, 1);
+            wait = WaitForSingleObject(thread, 5000);
+            ok(wait == WAIT_OBJECT_0, "Mutator thread wait returned %#lx.\n", wait);
+            CloseHandle(thread);
+            thread = NULL;
+        }
+    }
+
+done:
+    if (thread)
+    {
+        InterlockedExchange(&mutator.stop, 1);
+        WaitForSingleObject(thread, 5000);
+        CloseHandle(thread);
+    }
+    params->PackageDependencyData = original_graph;
+    if (noaccess) VirtualFree(noaccess, 0, MEM_RELEASE);
+    HeapFree(GetProcessHeap(), 0, long_name);
+    HeapFree(GetProcessHeap(), 0, forbidden_graph);
+    HeapFree(GetProcessHeap(), 0, bad_path_graph);
+    HeapFree(GetProcessHeap(), 0, case_mismatch_graph);
+    HeapFree(GetProcessHeap(), 0, duplicate_graph);
+    HeapFree(GetProcessHeap(), 0, unsorted_graph);
+    HeapFree(GetProcessHeap(), 0, outside_graph);
+    HeapFree(GetProcessHeap(), 0, known_name_graph);
+    HeapFree(GetProcessHeap(), 0, graph);
+    if (copied_known[0]) DeleteFileW(copied_known);
+    if (temp_root[0]) RemoveDirectoryW(temp_root);
 }
 
 static void test_Wow64Transition(void)
