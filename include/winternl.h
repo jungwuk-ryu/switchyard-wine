@@ -5594,6 +5594,11 @@ static inline PLIST_ENTRY RemoveTailList(PLIST_ENTRY le)
 
 NTSYSAPI NTSTATUS WINAPI __wine_get_unix_env( const char *name, char *value, unsigned int value_size );
 NTSYSAPI NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait );
+/*
+ * Returns a validated PAGE_READONLY package-graph snapshot owned by the
+ * caller.  Release *graph with NtFreeVirtualMemory(MEM_RELEASE) and size zero.
+ */
+NTSYSAPI NTSTATUS WINAPI __wine_get_process_package_graph( HANDLE process, void **graph, ULONG *size );
 
 /* The thread information for 16-bit threads */
 /* NtCurrentTeb()->SubSystemTib points to this */

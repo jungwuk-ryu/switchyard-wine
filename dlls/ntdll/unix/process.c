@@ -34,6 +34,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #ifdef HAVE_SYS_TIMES_H
 # include <sys/times.h>
@@ -72,16 +73,366 @@
 #include "ddk/ntddk.h"
 #include "unix_private.h"
 #include "wine/condrv.h"
+#include "wine/appx_package_graph.h"
 #include "wine/server.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(process);
+
+C_ASSERT( offsetof(struct wine_appx_graph_attach, blob) == 16 );
+C_ASSERT( offsetof(struct wine_appx_graph_attach, leases) == 24 );
+C_ASSERT( offsetof(struct wine_appx_graph_attach, lease_count) == 32 );
+C_ASSERT( sizeof(struct wine_appx_graph_attach) == 40 );
+C_ASSERT( sizeof(struct wine_appx_graph_process_binding) == 8 );
+C_ASSERT( offsetof(struct wine_get_process_package_graph_params, process) == 0 );
+C_ASSERT( offsetof(struct wine_get_process_package_graph_params, graph) == 8 );
+C_ASSERT( offsetof(struct wine_get_process_package_graph_params, size) == 16 );
+C_ASSERT( offsetof(struct wine_get_process_package_graph_params, flags) == 20 );
+C_ASSERT( sizeof(struct wine_get_process_package_graph_params) == 24 );
 
 
 static ULONG execute_flags = MEM_EXECUTE_OPTION_DISABLE;
 
 static UINT process_error_mode;
 ULONG process_cookie = 0xdeadbeef;
+
+#define PACKAGE_GRAPH_FILE_RETRIES 32
+#define PACKAGE_GRAPH_COPY_CHUNK  65536
+
+static LONG package_graph_file_counter;
+
+NTSTATUS unixcall_get_process_package_graph( void *args )
+{
+    struct wine_get_process_package_graph_params *params = args;
+    data_size_t size = 0;
+    obj_handle_t token = 0, received_token = 0;
+    sigset_t sigset;
+    void *graph = NULL;
+    int fd = -1;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    params->graph = 0;
+    params->size = 0;
+    if (params->flags & ~WINE_PROCESS_PACKAGE_GRAPH_LIMIT_2G)
+        return STATUS_INVALID_PARAMETER;
+    if (params->process > ~(obj_handle_t)0)
+        return STATUS_INVALID_HANDLE;
+
+    /*
+     * The fd channel is shared by all threads in a process.  Serialize the
+     * request and receive so a concurrent fd-producing server call cannot
+     * consume this snapshot's descriptor.
+     */
+    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+    SERVER_START_REQ( get_process_package_graph )
+    {
+        req->process = params->process;
+        status = wine_server_call( req );
+        if (!status)
+        {
+            size = reply->graph_size;
+            token = reply->graph_fd;
+            if (!size || size > WINE_APPX_GRAPH_MAX_BLOB_SIZE || !token)
+                status = STATUS_INVALID_IMAGE_FORMAT;
+            else
+            {
+                fd = wine_server_receive_fd( &received_token );
+                if (fd == -1 || received_token != token)
+                    status = STATUS_INVALID_HANDLE;
+            }
+        }
+    }
+    SERVER_END_REQ;
+    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+    if (!status)
+        status = load_package_graph_snapshot(
+            fd, size,
+            !!(params->flags & WINE_PROCESS_PACKAGE_GRAPH_LIMIT_2G),
+            &graph );
+    if (fd != -1) close( fd );
+    if (status) return status;
+
+    if ((params->flags & WINE_PROCESS_PACKAGE_GRAPH_LIMIT_2G) &&
+        (ULONG_PTR)graph >= limit_2g)
+    {
+        SIZE_T free_size = 0;
+
+        NtFreeVirtualMemory( NtCurrentProcess(), &graph, &free_size,
+                             MEM_RELEASE );
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+    params->graph = (ULONG_PTR)graph;
+    params->size = size;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS get_explicit_package_graph(
+    const RTL_USER_PROCESS_PARAMETERS *params, const void **blob,
+    data_size_t *size, obj_handle_t **leases, data_size_t *leases_size )
+{
+    const struct wine_appx_graph_attach *attach;
+    struct wine_appx_graph_attach descriptor;
+    unsigned long long *lease_values = NULL;
+    obj_handle_t *lease_handles = NULL;
+    unsigned int package_count, i;
+    void *snapshot;
+    NTSTATUS status = STATUS_INVALID_PARAMETER;
+
+    *blob = NULL;
+    *size = 0;
+    *leases = NULL;
+    *leases_size = 0;
+    if (!params->PackageDependencyData) return STATUS_SUCCESS;
+
+    attach = params->PackageDependencyData;
+    /*
+     * NtCreateUserProcess runs on a Unix-side stack where taking a Windows
+     * exception from virtual_check_buffer_for_read() cannot be unwound.  Copy
+     * through the virtual-memory lock and never access the user pointer again.
+     */
+    if (virtual_uninterrupted_read_memory( attach, &descriptor,
+                                           sizeof(descriptor) ) != sizeof(descriptor))
+        return STATUS_ACCESS_VIOLATION;
+    if (descriptor.tag != WINE_APPX_GRAPH_ATTACH_TAG) return STATUS_SUCCESS;
+    if (descriptor.version != WINE_APPX_GRAPH_ATTACH_VERSION ||
+        descriptor.reserved || descriptor.lease_reserved || !descriptor.blob ||
+        descriptor.blob != (ULONG_PTR)descriptor.blob ||
+        !descriptor.leases ||
+        descriptor.leases != (ULONG_PTR)descriptor.leases ||
+        !descriptor.lease_count ||
+        descriptor.lease_count > WINE_APPX_GRAPH_MAX_PACKAGES ||
+        !descriptor.size || descriptor.size > WINE_APPX_GRAPH_MAX_BLOB_SIZE)
+        return STATUS_INVALID_PARAMETER;
+    if (!(snapshot = malloc( descriptor.size ))) return STATUS_NO_MEMORY;
+    if (virtual_uninterrupted_read_memory( (const void *)(ULONG_PTR)descriptor.blob,
+                                           snapshot,
+                                           descriptor.size ) != descriptor.size)
+    {
+        free( snapshot );
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (!wine_appx_graph_validate_blob( snapshot, descriptor.size ))
+    {
+        goto failed;
+    }
+    package_count = wine_appx_graph_read_u32(
+        (const unsigned char *)snapshot +
+        WINE_APPX_GRAPH_HEADER_PACKAGE_COUNT_OFFSET );
+    if (descriptor.lease_count != package_count) goto failed;
+
+    if (!(lease_values = malloc(
+              descriptor.lease_count * sizeof(*lease_values) )) ||
+        !(lease_handles = malloc(
+              descriptor.lease_count * sizeof(*lease_handles) )))
+    {
+        status = STATUS_NO_MEMORY;
+        goto failed;
+    }
+    if (virtual_uninterrupted_read_memory(
+            (const void *)(ULONG_PTR)descriptor.leases, lease_values,
+            descriptor.lease_count * sizeof(*lease_values) ) !=
+        descriptor.lease_count * sizeof(*lease_values))
+    {
+        status = STATUS_ACCESS_VIOLATION;
+        goto failed;
+    }
+    for (i = 0; i < descriptor.lease_count; i++)
+    {
+        if (!lease_values[i] ||
+            lease_values[i] != (ULONG_PTR)lease_values[i])
+            goto failed;
+        lease_handles[i] =
+            wine_server_obj_handle( (HANDLE)(ULONG_PTR)lease_values[i] );
+        if (!lease_handles[i]) goto failed;
+    }
+    *blob = snapshot;
+    *size = descriptor.size;
+    *leases = lease_handles;
+    *leases_size = descriptor.lease_count * sizeof(*lease_handles);
+    free( lease_values );
+    return STATUS_SUCCESS;
+
+failed:
+    free( lease_handles );
+    free( lease_values );
+    free( snapshot );
+    return status;
+}
+
+static int create_package_graph_file( char **name )
+{
+    unsigned int i;
+    int fd;
+
+    *name = NULL;
+    for (i = 0; i < PACKAGE_GRAPH_FILE_RETRIES; i++)
+    {
+        unsigned int sequence = InterlockedIncrement( &package_graph_file_counter );
+
+        free( *name );
+        if (asprintf( name, "%s/.wine-appx-source-%lx-%x-%x",
+                      config_dir, (unsigned long)getpid(), sequence, i ) == -1)
+        {
+            *name = NULL;
+            errno = ENOMEM;
+            break;
+        }
+        fd = open( *name, O_RDWR | O_CREAT | O_EXCL |
+                   O_NOFOLLOW | O_CLOEXEC, 0600 );
+        if (fd != -1) return fd;
+        if (errno != EEXIST) break;
+    }
+    return -1;
+}
+
+static int package_graph_source_file_is_safe( const struct stat *st,
+                                              off_t size, nlink_t links )
+{
+    return S_ISREG( st->st_mode ) && st->st_uid == getuid() &&
+           st->st_size == size && st->st_nlink == links &&
+           (st->st_mode & 07777) == 0600;
+}
+
+static NTSTATUS get_package_image_volume_serial( HANDLE image,
+                                                  unsigned int *serial )
+{
+    FILE_FS_VOLUME_INFORMATION info;
+    IO_STATUS_BLOCK io;
+    NTSTATUS status;
+
+    *serial = 0;
+    status = NtQueryVolumeInformationFile(
+        image, &io, &info, sizeof(info), FileFsVolumeInformation );
+    if (status == STATUS_BUFFER_OVERFLOW) status = STATUS_SUCCESS;
+    if (!status) *serial = info.VolumeSerialNumber;
+    /*
+     * GetFileInformationByHandle exposes zero when mountmgr cannot provide a
+     * Windows volume serial.  Preserve that fallback for packaged startup;
+     * the graph's native object token and file-index comparisons still bind
+     * the exact image and a nonzero serial mismatch remains fail-closed.
+     */
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS create_package_graph_fd( const void *blob, data_size_t size,
+                                         int *result )
+{
+    const unsigned char *data = blob;
+    struct stat created, written, opened, unlinked;
+    char *name = NULL;
+    data_size_t offset = 0;
+    NTSTATUS status = STATUS_SUCCESS;
+    int writer = -1, reader = -1, flags, saved_errno, linked = 0;
+
+    *result = -1;
+    if ((writer = create_package_graph_file( &name )) == -1)
+    {
+        status = errno_to_status( errno );
+        goto done;
+    }
+    linked = 1;
+    if (fstat( writer, &created ) == -1 ||
+        (flags = fcntl( writer, F_GETFL )) == -1)
+    {
+        status = errno_to_status( errno );
+        goto done;
+    }
+    if (!package_graph_source_file_is_safe( &created, 0, 1 ) ||
+        (flags & O_ACCMODE) != O_RDWR)
+    {
+        status = STATUS_ACCESS_DENIED;
+        goto done;
+    }
+    if (ftruncate( writer, size ) == -1)
+    {
+        status = errno_to_status( errno );
+        goto done;
+    }
+    while (offset < size)
+    {
+        size_t count = min( (data_size_t)PACKAGE_GRAPH_COPY_CHUNK, size - offset );
+        size_t written = 0;
+
+        while (written < count)
+        {
+            ssize_t ret;
+
+            do ret = pwrite( writer, data + offset + written,
+                             count - written, offset + written );
+            while (ret == -1 && errno == EINTR);
+            if (ret <= 0)
+            {
+                status = ret ? errno_to_status( errno ) : STATUS_DISK_FULL;
+                goto done;
+            }
+            written += ret;
+        }
+        offset += count;
+    }
+
+    if (fstat( writer, &written ) == -1)
+    {
+        status = errno_to_status( errno );
+        goto done;
+    }
+    if (!package_graph_source_file_is_safe( &written, size, 1 ) ||
+        written.st_dev != created.st_dev || written.st_ino != created.st_ino)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+
+    reader = open( name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC );
+    if (reader == -1)
+    {
+        status = errno_to_status( errno );
+        goto done;
+    }
+    if (fstat( reader, &opened ) == -1 ||
+        (flags = fcntl( reader, F_GETFL )) == -1)
+    {
+        status = errno_to_status( errno );
+        goto done;
+    }
+    if (!package_graph_source_file_is_safe( &opened, size, 1 ) ||
+        opened.st_dev != written.st_dev || opened.st_ino != written.st_ino ||
+        (flags & O_ACCMODE) != O_RDONLY)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (unlink( name ) == -1)
+    {
+        status = errno_to_status( errno );
+        goto done;
+    }
+    linked = 0;
+    if (fstat( reader, &unlinked ) == -1)
+    {
+        status = errno_to_status( errno );
+        goto done;
+    }
+    if (!package_graph_source_file_is_safe( &unlinked, size, 0 ) ||
+        unlinked.st_dev != written.st_dev || unlinked.st_ino != written.st_ino)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    close( writer );
+    writer = -1;
+    *result = reader;
+    reader = -1;
+
+done:
+    saved_errno = errno;
+    if (linked) unlink( name );
+    if (reader != -1) close( reader );
+    if (writer != -1) close( writer );
+    free( name );
+    errno = saved_errno;
+    return status;
+}
 
 static BOOL get_process_cycle_time( int unix_pid, PROCESS_CYCLE_TIME_INFORMATION *cycles )
 {
@@ -717,24 +1068,29 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 {
     unsigned int status;
     BOOL success = FALSE;
-    HANDLE file_handle, process_info = 0, process_handle = 0, thread_handle = 0;
-    struct object_attributes *objattr;
-    data_size_t attr_len;
+    HANDLE file_handle = 0, process_info = 0, process_handle = 0, thread_handle = 0;
+    struct object_attributes *process_objattr = NULL, *thread_objattr = NULL;
+    data_size_t process_attr_len, thread_attr_len;
     char *winedebug = NULL;
     char *unix_name = NULL;
     struct startup_info_data *startup_info = NULL;
     ULONG startup_info_size, env_size;
-    int unixdir, socketfd[2] = { -1, -1 };
+    const void *package_graph = NULL;
+    data_size_t package_graph_size = 0;
+    obj_handle_t *package_leases = NULL;
+    struct wine_appx_graph_process_binding package_binding = {0};
+    data_size_t package_leases_size = 0;
+    int unixdir = -1, package_graph_fd = -1, socketfd[2] = { -1, -1 };
     struct pe_image_info pe_info;
     ULONG process_id, thread_id;
     USHORT machine = 0;
     HANDLE parent = 0, debug = 0, token = 0;
-    UNICODE_STRING nt_name, path = {0};
+    UNICODE_STRING nt_name = {0}, path = {0};
     OBJECT_ATTRIBUTES attr, empty_attr = { sizeof(empty_attr) };
     SIZE_T i, attr_count = (ps_attr->TotalLength - sizeof(ps_attr->TotalLength)) / sizeof(PS_ATTRIBUTE);
     const PS_ATTRIBUTE *handles_attr = NULL, *jobs_attr = NULL;
     data_size_t handles_size, jobs_size;
-    obj_handle_t *handles, *jobs;
+    obj_handle_t *handles = NULL, *jobs = NULL;
 
     if (thread_flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER)
     {
@@ -781,6 +1137,11 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
     if (!process_attr) process_attr = &empty_attr;
 
+    if ((status = get_explicit_package_graph(
+            params, &package_graph, &package_graph_size,
+            &package_leases, &package_leases_size )))
+        goto done;
+
     TRACE( "%s image %s cmdline %s parent %p machine %x\n", debugstr_us( &path ),
            debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ), parent, machine );
 
@@ -793,6 +1154,8 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         {
             *process_handle_ptr = *thread_handle_ptr = 0;
             memset( info, 0, sizeof(*info) );
+            free( package_leases );
+            free( (void *)package_graph );
             free( unix_name );
             free( nt_name.Buffer );
             return STATUS_SUCCESS;
@@ -809,29 +1172,26 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         goto done;
     env_size = get_env_size( params, &winedebug );
 
-    if ((status = alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
+    if (package_graph &&
+        (status = get_package_image_volume_serial(
+            file_handle, &package_binding.volume_serial )))
+        goto done;
+
+    if ((status = alloc_object_attributes(
+            process_attr, &process_objattr, &process_attr_len )))
+        goto done;
 
     if ((status = alloc_handle_list( handles_attr, &handles, &handles_size )))
-    {
-        free( objattr );
         goto done;
-    }
 
     if ((status = alloc_handle_list( jobs_attr, &jobs, &jobs_size )))
-    {
-        free( objattr );
-        free( handles );
         goto done;
-    }
 
     /* create the socket for the new process */
 
     if (socketpair( PF_UNIX, SOCK_STREAM, 0, socketfd ) == -1)
     {
         status = STATUS_TOO_MANY_OPENED_FILES;
-        free( objattr );
-        free( handles );
-        free( jobs );
         goto done;
     }
 #ifdef SO_PASSCRED
@@ -842,7 +1202,15 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
 #endif
 
+    if (package_graph &&
+        (status = create_package_graph_fd( package_graph, package_graph_size,
+                                           &package_graph_fd )))
+        goto done;
+    if (package_graph)
+        package_binding.image_handle = wine_server_obj_handle( file_handle );
+
     wine_server_send_fd( socketfd[1] );
+    if (package_graph_fd != -1) wine_server_send_fd( package_graph_fd );
 
     /* create the process on the server side */
 
@@ -858,9 +1226,16 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         req->info_size      = startup_info_size;
         req->handles_size   = handles_size;
         req->jobs_size      = jobs_size;
-        wine_server_add_data( req, objattr, attr_len );
+        req->leases_size    = package_graph ?
+                              package_leases_size + sizeof(package_binding) : 0;
+        req->graph_fd       = package_graph_fd;
+        req->graph_size     = package_graph_size;
+        wine_server_add_data( req, process_objattr, process_attr_len );
         wine_server_add_data( req, handles, handles_size );
         wine_server_add_data( req, jobs, jobs_size );
+        wine_server_add_data( req, &package_binding,
+                              package_graph ? sizeof(package_binding) : 0 );
+        wine_server_add_data( req, package_leases, package_leases_size );
         wine_server_add_data( req, startup_info, startup_info_size );
         wine_server_add_data( req, params->Environment, env_size );
         if (!(status = wine_server_call( req )))
@@ -872,10 +1247,12 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
     SERVER_END_REQ;
     close( socketfd[1] );
-    free( objattr );
-    free( handles );
-    free( jobs );
-
+    socketfd[1] = -1;
+    if (package_graph_fd != -1)
+    {
+        close( package_graph_fd );
+        package_graph_fd = -1;
+    }
     if (status)
     {
         switch (status)
@@ -891,7 +1268,9 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         goto done;
     }
 
-    if ((status = alloc_object_attributes( thread_attr, &objattr, &attr_len ))) goto done;
+    if ((status = alloc_object_attributes(
+            thread_attr, &thread_objattr, &thread_attr_len )))
+        goto done;
 
     SERVER_START_REQ( new_thread )
     {
@@ -899,7 +1278,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         req->access     = thread_access;
         req->flags      = thread_flags;
         req->request_fd = -1;
-        wine_server_add_data( req, objattr, attr_len );
+        wine_server_add_data( req, thread_objattr, thread_attr_len );
         if (!(status = wine_server_call( req )))
         {
             thread_handle = wine_server_ptr_handle( reply->handle );
@@ -907,7 +1286,6 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
     }
     SERVER_END_REQ;
-    free( objattr );
     if (status) goto done;
 
     /* create the child process */
@@ -979,8 +1357,16 @@ done:
     if (process_handle) NtClose( process_handle );
     if (thread_handle) NtClose( thread_handle );
     if (socketfd[0] != -1) close( socketfd[0] );
+    if (socketfd[1] != -1) close( socketfd[1] );
+    if (package_graph_fd != -1) close( package_graph_fd );
     if (unixdir != -1) close( unixdir );
+    free( thread_objattr );
+    free( process_objattr );
+    free( handles );
+    free( jobs );
     free( startup_info );
+    free( package_leases );
+    free( (void *)package_graph );
     free( winedebug );
     free( unix_name );
     free( nt_name.Buffer );

@@ -26,6 +26,8 @@
 struct atom_table;
 struct handle_table;
 struct startup_info;
+struct package_graph;
+struct package_lease_set;
 struct job;
 
 /* process startup state */
@@ -79,6 +81,8 @@ struct process
     struct console      *console;         /* console input */
     enum startup_state   startup_state;   /* startup state */
     struct startup_info *startup_info;    /* startup info while init is in progress */
+    struct package_graph *package_graph;  /* immutable AppX dependency graph */
+    struct package_lease_set *package_leases; /* generation leases held until process exit */
     struct event        *idle_event;      /* event for input idle */
     obj_handle_t         winstation;      /* main handle to process window station */
     obj_handle_t         desktop;         /* handle to desktop to use for new threads */

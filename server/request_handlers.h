@@ -11,6 +11,7 @@ DECL_HANDLER(new_process);
 DECL_HANDLER(get_new_process_info);
 DECL_HANDLER(new_thread);
 DECL_HANDLER(get_startup_info);
+DECL_HANDLER(get_process_package_graph);
 DECL_HANDLER(init_process_done);
 DECL_HANDLER(init_first_thread);
 DECL_HANDLER(init_thread);
@@ -335,6 +336,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_new_process_info,
     (req_handler)req_new_thread,
     (req_handler)req_get_startup_info,
+    (req_handler)req_get_process_package_graph,
     (req_handler)req_init_process_done,
     (req_handler)req_init_first_thread,
     (req_handler)req_init_thread,
@@ -717,7 +719,10 @@ C_ASSERT( offsetof(struct new_process_request, machine) == 36 );
 C_ASSERT( offsetof(struct new_process_request, info_size) == 40 );
 C_ASSERT( offsetof(struct new_process_request, handles_size) == 44 );
 C_ASSERT( offsetof(struct new_process_request, jobs_size) == 48 );
-C_ASSERT( sizeof(struct new_process_request) == 56 );
+C_ASSERT( offsetof(struct new_process_request, leases_size) == 52 );
+C_ASSERT( offsetof(struct new_process_request, graph_fd) == 56 );
+C_ASSERT( offsetof(struct new_process_request, graph_size) == 60 );
+C_ASSERT( sizeof(struct new_process_request) == 64 );
 C_ASSERT( offsetof(struct new_process_reply, info) == 8 );
 C_ASSERT( offsetof(struct new_process_reply, pid) == 12 );
 C_ASSERT( offsetof(struct new_process_reply, handle) == 16 );
@@ -740,7 +745,14 @@ C_ASSERT( sizeof(struct get_startup_info_request) == 16 );
 C_ASSERT( offsetof(struct get_startup_info_reply, info_size) == 8 );
 C_ASSERT( offsetof(struct get_startup_info_reply, debugged) == 12 );
 C_ASSERT( offsetof(struct get_startup_info_reply, machine) == 16 );
-C_ASSERT( sizeof(struct get_startup_info_reply) == 24 );
+C_ASSERT( offsetof(struct get_startup_info_reply, graph_size) == 20 );
+C_ASSERT( offsetof(struct get_startup_info_reply, graph_fd) == 24 );
+C_ASSERT( sizeof(struct get_startup_info_reply) == 32 );
+C_ASSERT( offsetof(struct get_process_package_graph_request, process) == 12 );
+C_ASSERT( sizeof(struct get_process_package_graph_request) == 16 );
+C_ASSERT( offsetof(struct get_process_package_graph_reply, graph_size) == 8 );
+C_ASSERT( offsetof(struct get_process_package_graph_reply, graph_fd) == 12 );
+C_ASSERT( sizeof(struct get_process_package_graph_reply) == 16 );
 C_ASSERT( offsetof(struct init_process_done_request, teb) == 16 );
 C_ASSERT( offsetof(struct init_process_done_request, peb) == 24 );
 C_ASSERT( sizeof(struct init_process_done_request) == 32 );

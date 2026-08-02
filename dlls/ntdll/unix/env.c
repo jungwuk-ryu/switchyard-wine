@@ -55,6 +55,7 @@
 #include "winternl.h"
 #include "winbase.h"
 #include "winnls.h"
+#include "wine/appx_package_graph.h"
 #include "wine/condrv.h"
 #include "wine/debug.h"
 #include "unix_private.h"
@@ -1765,6 +1766,127 @@ static void load_global_options( const UNICODE_STRING *image, BOOL debugged )
     }
 }
 
+static int package_graph_fd_is_unchanged( const struct stat *before,
+                                          const struct stat *after )
+{
+    if (!S_ISREG( after->st_mode ) || after->st_size != before->st_size ||
+        after->st_dev != before->st_dev || after->st_ino != before->st_ino ||
+        after->st_mode != before->st_mode || after->st_uid != before->st_uid ||
+        after->st_gid != before->st_gid || after->st_nlink != before->st_nlink ||
+        after->st_mtime != before->st_mtime || after->st_ctime != before->st_ctime)
+        return 0;
+#ifdef HAVE_STRUCT_STAT_ST_MTIM
+    if (after->st_mtim.tv_nsec != before->st_mtim.tv_nsec) return 0;
+#elif defined(HAVE_STRUCT_STAT_ST_MTIMESPEC)
+    if (after->st_mtimespec.tv_nsec != before->st_mtimespec.tv_nsec) return 0;
+#endif
+#ifdef HAVE_STRUCT_STAT_ST_CTIM
+    if (after->st_ctim.tv_nsec != before->st_ctim.tv_nsec) return 0;
+#elif defined(HAVE_STRUCT_STAT_ST_CTIMESPEC)
+    if (after->st_ctimespec.tv_nsec != before->st_ctimespec.tv_nsec) return 0;
+#endif
+    return 1;
+}
+
+NTSTATUS load_package_graph_snapshot( int fd, data_size_t size,
+                                      BOOL low_address, void **result )
+{
+    struct stat before, after;
+    SIZE_T allocation_size, free_size = 0, protect_size;
+    data_size_t offset = 0;
+    void *graph = NULL, *protect_base;
+    ULONG old_protection;
+    NTSTATUS status;
+    int flags;
+
+    *result = NULL;
+    if (!size || size > WINE_APPX_GRAPH_MAX_BLOB_SIZE)
+        return STATUS_INVALID_IMAGE_FORMAT;
+
+    if (fstat( fd, &before ) == -1) return errno_to_status( errno );
+    if ((flags = fcntl( fd, F_GETFL )) == -1) return errno_to_status( errno );
+    if (!S_ISREG( before.st_mode ) || before.st_size != size ||
+        before.st_uid != getuid() || before.st_nlink ||
+        (before.st_mode & 07777) != 0600 ||
+        (flags & O_ACCMODE) != O_RDONLY)
+        return STATUS_INVALID_IMAGE_FORMAT;
+
+    allocation_size = size;
+    if ((status = NtAllocateVirtualMemory(
+              NtCurrentProcess(), &graph, low_address ? limit_2g - 1 : 0,
+              &allocation_size, MEM_COMMIT, PAGE_READWRITE )))
+        return status;
+    while (offset < size)
+    {
+        ssize_t ret;
+
+        do ret = pread( fd, (char *)graph + offset, size - offset, offset );
+        while (ret == -1 && errno == EINTR);
+        if (ret <= 0)
+        {
+            status = ret ? errno_to_status( errno ) : STATUS_INVALID_IMAGE_FORMAT;
+            goto failed;
+        }
+        offset += ret;
+    }
+    if (fstat( fd, &after ) == -1)
+    {
+        status = errno_to_status( errno );
+        goto failed;
+    }
+    if ((flags = fcntl( fd, F_GETFL )) == -1)
+    {
+        status = errno_to_status( errno );
+        goto failed;
+    }
+    if (!package_graph_fd_is_unchanged( &before, &after ) ||
+        (flags & O_ACCMODE) != O_RDONLY ||
+        !wine_appx_graph_validate_blob( graph, size ))
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto failed;
+    }
+
+    protect_base = graph;
+    protect_size = allocation_size;
+    if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_base,
+                                          &protect_size, PAGE_READONLY,
+                                          &old_protection )))
+        goto failed;
+    *result = graph;
+    return STATUS_SUCCESS;
+
+failed:
+    NtFreeVirtualMemory( NtCurrentProcess(), &graph, &free_size, MEM_RELEASE );
+    return status;
+}
+
+static void *clone_package_graph( const void *source )
+{
+    SIZE_T size, protect_size;
+    void *copy = NULL, *protect_base;
+    ULONG old_protection;
+    NTSTATUS status;
+
+    if (!source) return NULL;
+    size = wine_appx_graph_read_u32(
+        (const unsigned char *)source + WINE_APPX_GRAPH_HEADER_TOTAL_SIZE_OFFSET );
+    assert( wine_appx_graph_validate_blob( source, size ));
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &copy, limit_2g - 1,
+                                      &size, MEM_COMMIT, PAGE_READWRITE );
+    assert( !status );
+    memcpy( copy, source, wine_appx_graph_read_u32(
+            (const unsigned char *)source +
+            WINE_APPX_GRAPH_HEADER_TOTAL_SIZE_OFFSET ) );
+    protect_base = copy;
+    protect_size = size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_base,
+                                     &protect_size, PAGE_READONLY,
+                                     &old_protection );
+    assert( !status );
+    return copy;
+}
+
 
 /*************************************************************************
  *		build_wow64_parameters
@@ -1812,6 +1934,16 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
     wow64_params->dwFlags         = params->dwFlags;
     wow64_params->wShowWindow     = params->wShowWindow;
     wow64_params->ProcessGroupId  = params->ProcessGroupId;
+    if (params->PackageDependencyData)
+    {
+        void *package_graph = clone_package_graph( params->PackageDependencyData );
+
+#ifdef _WIN64
+        wow64_params->PackageDependencyData = PtrToUlong( package_graph );
+#else
+        wow64_params->PackageDependencyData = (ULONG64)(ULONG_PTR)package_graph;
+#endif
+    }
 
     dst = (WCHAR *)(wow64_params + 1);
     dup_unicode_string( &params->CurrentDirectory.DosPath, &dst, &wow64_params->CurrentDirectory.DosPath );
@@ -2012,12 +2144,15 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
 void init_startup_info(void)
 {
     WCHAR *src, *dst, *env;
-    void *module = NULL;
+    void *module = NULL, *package_graph = NULL;
     unsigned int status;
     SIZE_T size, info_size, env_size, env_pos;
+    data_size_t package_graph_size = 0;
     RTL_USER_PROCESS_PARAMETERS *params = NULL;
     struct startup_info_data *info;
     UNICODE_STRING nt_name;
+    obj_handle_t package_graph_token = 0, received_token = 0;
+    int package_graph_fd = -1;
     USHORT machine;
     BOOL debugged;
 
@@ -2037,10 +2172,31 @@ void init_startup_info(void)
         machine = reply->machine;
         debugged = reply->debugged;
         info_size = reply->info_size;
+        package_graph_size = reply->graph_size;
+        package_graph_token = reply->graph_fd;
         env_size = (wine_server_reply_size( reply ) - info_size) / sizeof(WCHAR);
+        if (!status && package_graph_token)
+        {
+            package_graph_fd = wine_server_receive_fd( &received_token );
+            if (package_graph_fd == -1 || received_token != package_graph_token)
+                status = STATUS_INVALID_HANDLE;
+        }
     }
     SERVER_END_REQ;
-    assert( !status );
+    if (!status)
+    {
+        if (!!package_graph_size != !!package_graph_token)
+            status = STATUS_INVALID_IMAGE_FORMAT;
+        else if (package_graph_size)
+            status = load_package_graph_snapshot(
+                package_graph_fd, package_graph_size, FALSE, &package_graph );
+    }
+    if (package_graph_fd != -1) close( package_graph_fd );
+    if (status)
+    {
+        MESSAGE( "wine: rejected malformed package dependency data: %x\n", status );
+        NtTerminateProcess( GetCurrentProcess(), status );
+    }
 
     env = malloc( env_size * sizeof(WCHAR) );
     memcpy( env, (char *)info + info_size, env_size * sizeof(WCHAR) );
@@ -2083,6 +2239,7 @@ void init_startup_info(void)
     params->dwFlags         = info->flags;
     params->wShowWindow     = info->show;
     params->ProcessGroupId  = info->process_group_id;
+    params->PackageDependencyData = package_graph;
 
     src = (WCHAR *)(info + 1);
     dst = (WCHAR *)(params + 1);

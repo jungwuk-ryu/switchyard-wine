@@ -1116,12 +1116,15 @@ struct new_process_request
     data_size_t  info_size;
     data_size_t  handles_size;
     data_size_t  jobs_size;
+    data_size_t  leases_size;
+    int          graph_fd;
+    data_size_t  graph_size;
     /* VARARG(objattr,object_attributes); */
     /* VARARG(handles,uints,handles_size); */
     /* VARARG(jobs,uints,jobs_size); */
+    /* VARARG(leases,uints,leases_size); */
     /* VARARG(info,startup_info,info_size); */
     /* VARARG(env,unicode_str); */
-    char __pad_52[4];
 };
 struct new_process_reply
 {
@@ -1178,9 +1181,26 @@ struct get_startup_info_reply
     data_size_t  info_size;
     int          debugged;
     unsigned short machine;
+    char __pad_18[2];
+    data_size_t  graph_size;
+    obj_handle_t graph_fd;
     /* VARARG(info,startup_info,info_size); */
     /* VARARG(env,unicode_str); */
-    char __pad_18[6];
+    char __pad_28[4];
+};
+
+
+
+struct get_process_package_graph_request
+{
+    struct request_header __header;
+    obj_handle_t process;
+};
+struct get_process_package_graph_reply
+{
+    struct reply_header __header;
+    data_size_t  graph_size;
+    obj_handle_t graph_fd;
 };
 
 
@@ -6431,6 +6451,7 @@ enum request
     REQ_get_new_process_info,
     REQ_new_thread,
     REQ_get_startup_info,
+    REQ_get_process_package_graph,
     REQ_init_process_done,
     REQ_init_first_thread,
     REQ_init_thread,
@@ -6758,6 +6779,7 @@ union generic_request
     struct get_new_process_info_request get_new_process_info_request;
     struct new_thread_request new_thread_request;
     struct get_startup_info_request get_startup_info_request;
+    struct get_process_package_graph_request get_process_package_graph_request;
     struct init_process_done_request init_process_done_request;
     struct init_first_thread_request init_first_thread_request;
     struct init_thread_request init_thread_request;
@@ -7083,6 +7105,7 @@ union generic_reply
     struct get_new_process_info_reply get_new_process_info_reply;
     struct new_thread_reply new_thread_reply;
     struct get_startup_info_reply get_startup_info_reply;
+    struct get_process_package_graph_reply get_process_package_graph_reply;
     struct init_process_done_reply init_process_done_reply;
     struct init_first_thread_reply init_first_thread_reply;
     struct init_thread_reply init_thread_reply;
@@ -7401,6 +7424,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 960
+#define SERVER_PROTOCOL_VERSION 961
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

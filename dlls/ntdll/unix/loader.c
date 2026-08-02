@@ -1251,6 +1251,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     system_time_precise,
     unixcall_native_callback_args,
     unixcall_wine_get_unix_env,
+    unixcall_get_process_package_graph,
 };
 
 
@@ -1277,6 +1278,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     system_time_precise,
     wow64_native_callback_args,
     wow64_wine_get_unix_env,
+    unixcall_get_process_package_graph,
 };
 
 #endif  /* _WIN64 */

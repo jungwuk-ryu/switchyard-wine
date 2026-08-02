@@ -29,6 +29,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/socket.h>
@@ -59,6 +61,7 @@
 #include "ntstatus.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
+#include "wine/appx_package_graph.h"
 
 #include "file.h"
 #include "handle.h"
@@ -149,6 +152,699 @@ struct startup_info
     data_size_t                 data_size;      /* size of whole startup data */
     struct startup_info_data   *data;           /* data for startup info */
 };
+
+/*
+ * Package graphs are internal server objects rather than handle-table
+ * objects.  The backing descriptor is read-only and unlinked before the
+ * object becomes visible, so sharing this object between related processes
+ * cannot expose a mutable graph.
+ */
+struct package_graph
+{
+    unsigned int refs;
+    unsigned int package_count;
+    unsigned int image_pending;
+    data_size_t size;
+    int fd;
+    struct stat image_stat;
+};
+
+/*
+ * A package lease is a server reference to a caller-opened generation marker.
+ * Keeping the file objects here, rather than duplicating handles into the
+ * client, prevents packaged code from dropping its own GC protection.  The
+ * set is released when the process's last thread exits; retaining a process
+ * handle for post-mortem queries does not retain installed payloads.
+ */
+struct package_lease_set
+{
+    unsigned int refs;
+    unsigned int count;
+    struct
+    {
+        struct file *file;
+        dev_t device;
+        ino_t inode;
+    } entries[1];
+};
+
+#define PACKAGE_GRAPH_MAX_SERVER_BYTES (256ULL * 1024 * 1024)
+#define PACKAGE_GRAPH_COPY_BUFFER_SIZE  16384
+#define PACKAGE_GRAPH_FILE_RETRIES      32
+#define PACKAGE_GRAPH_HEADER_PACKAGES_OFFSET 48
+#define PACKAGE_GRAPH_PACKAGE_CONTENT_ID_OFFSET 24
+#define PACKAGE_GRAPH_PACKAGE_FULL_NAME_REF_OFFSET 88
+#define PACKAGE_GRAPH_MARKER_HEADER_SIZE 40
+#define PACKAGE_GRAPH_MARKER_VERSION     1
+
+C_ASSERT( PACKAGE_GRAPH_MAX_SERVER_BYTES >=
+          2ULL * WINE_APPX_GRAPH_MAX_BLOB_SIZE );
+
+static unsigned __int64 package_graph_server_bytes;
+static obj_handle_t package_graph_fd_token;
+
+static struct package_graph *grab_package_graph( struct package_graph *graph )
+{
+    if (graph) graph->refs++;
+    return graph;
+}
+
+static void release_package_graph( struct package_graph *graph )
+{
+    if (!graph || --graph->refs) return;
+    assert( package_graph_server_bytes >= graph->size );
+    package_graph_server_bytes -= graph->size;
+    close( graph->fd );
+    free( graph );
+}
+
+static struct package_lease_set *grab_package_lease_set(
+    struct package_lease_set *leases )
+{
+    if (leases) leases->refs++;
+    return leases;
+}
+
+static void release_package_lease_set( struct package_lease_set *leases )
+{
+    unsigned int i;
+
+    if (!leases || --leases->refs) return;
+    for (i = 0; i < leases->count; i++)
+        release_object( leases->entries[i].file );
+    free( leases );
+}
+
+static int package_graph_source_is_unchanged( const struct stat *before,
+                                              const struct stat *after );
+
+static int package_graph_marker_matches( int fd, const unsigned char *graph,
+                                         const unsigned char *record )
+{
+    static const unsigned char magic[4] = {'S','W','L','M'};
+    struct wine_appx_graph_string_ref full_name =
+        wine_appx_graph_get_ref(
+            record, PACKAGE_GRAPH_PACKAGE_FULL_NAME_REF_OFFSET );
+    unsigned char header[PACKAGE_GRAPH_MARKER_HEADER_SIZE];
+    unsigned char buffer[1024];
+    struct stat before, after;
+    unsigned int offset = 0, bytes, i;
+
+    if (full_name.chars > ~0u / sizeof(WCHAR))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return 0;
+    }
+    bytes = full_name.chars * sizeof(WCHAR);
+    if (fstat( fd, &before ) == -1)
+    {
+        file_set_error();
+        return 0;
+    }
+    if (!S_ISREG( before.st_mode ) || before.st_uid != getuid() ||
+        before.st_nlink != 1 ||
+        before.st_size != PACKAGE_GRAPH_MARKER_HEADER_SIZE + bytes)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return 0;
+    }
+    for (;;)
+    {
+        ssize_t ret = pread( fd, header, sizeof(header), 0 );
+
+        if (ret == -1 && errno == EINTR) continue;
+        if (ret == sizeof(header)) break;
+        if (ret == -1) file_set_error();
+        else set_error( STATUS_INVALID_PARAMETER );
+        return 0;
+    }
+    for (i = 0; i < 32; i++)
+        if (record[PACKAGE_GRAPH_PACKAGE_CONTENT_ID_OFFSET + i]) break;
+    if (i == 32 || memcmp( header, magic, sizeof(magic) ) ||
+        wine_appx_graph_read_u32( header + 4 ) !=
+            PACKAGE_GRAPH_MARKER_VERSION ||
+        memcmp( header + 8,
+                record + PACKAGE_GRAPH_PACKAGE_CONTENT_ID_OFFSET, 32 ))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return 0;
+    }
+    while (offset < bytes)
+    {
+        unsigned int count = min( (unsigned int)sizeof(buffer), bytes - offset );
+        ssize_t ret;
+
+        do ret = pread( fd, buffer, count,
+                        PACKAGE_GRAPH_MARKER_HEADER_SIZE + offset );
+        while (ret == -1 && errno == EINTR);
+        if (ret != count)
+        {
+            if (ret == -1) file_set_error();
+            else set_error( STATUS_INVALID_PARAMETER );
+            return 0;
+        }
+        if (memcmp( buffer, graph + full_name.offset + offset, count ))
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return 0;
+        }
+        offset += count;
+    }
+    if (fstat( fd, &after ) == -1)
+    {
+        file_set_error();
+        return 0;
+    }
+    if (!package_graph_source_is_unchanged( &before, &after ))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return 0;
+    }
+    return 1;
+}
+
+static struct package_lease_set *create_package_lease_set(
+    const obj_handle_t *handles, unsigned int count,
+    const struct package_graph *graph )
+{
+    struct package_lease_set *leases;
+    const unsigned char *mapping = MAP_FAILED;
+    size_t size;
+    unsigned int i, j, packages_offset;
+
+    if (!graph || count != graph->package_count ||
+        !count || count > WINE_APPX_GRAPH_MAX_PACKAGES)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return NULL;
+    }
+    mapping = mmap( NULL, graph->size, PROT_READ, MAP_PRIVATE, graph->fd, 0 );
+    if (mapping == MAP_FAILED)
+    {
+        file_set_error();
+        return NULL;
+    }
+    packages_offset = wine_appx_graph_read_u32(
+        mapping + PACKAGE_GRAPH_HEADER_PACKAGES_OFFSET );
+    size = offsetof( struct package_lease_set, entries ) +
+           count * sizeof(*leases->entries);
+    if (!(leases = mem_alloc( size )))
+    {
+        munmap( (void *)mapping, graph->size );
+        return NULL;
+    }
+    leases->refs = 1;
+    leases->count = 0;
+
+    for (i = 0; i < count; i++)
+    {
+        struct fd *object_fd;
+        struct stat st;
+        unsigned int sharing;
+        int fd, flags;
+
+        if (!(leases->entries[i].file = get_file_obj(
+                current->process, handles[i], FILE_READ_DATA )))
+            goto failed;
+        leases->count++;
+        object_fd = get_obj_fd( (struct object *)leases->entries[i].file );
+        sharing = get_fd_sharing( object_fd );
+        release_object( object_fd );
+        fd = get_file_unix_fd( leases->entries[i].file );
+        if (fd == -1 || fstat( fd, &st ) == -1 ||
+            (flags = fcntl( fd, F_GETFL )) == -1)
+        {
+            if (fd != -1) file_set_error();
+            else set_error( STATUS_INVALID_HANDLE );
+            goto failed;
+        }
+        if (!S_ISREG( st.st_mode ) || st.st_uid != getuid() ||
+            st.st_nlink != 1 || (flags & O_ACCMODE) != O_RDONLY ||
+            (sharing & (FILE_SHARE_WRITE | FILE_SHARE_DELETE)))
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            goto failed;
+        }
+        leases->entries[i].device = st.st_dev;
+        leases->entries[i].inode = st.st_ino;
+        for (j = 0; j < i; j++)
+        {
+            if (leases->entries[j].device == st.st_dev &&
+                leases->entries[j].inode == st.st_ino)
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+                goto failed;
+            }
+        }
+        if (!package_graph_marker_matches(
+                fd, mapping, mapping + packages_offset +
+                    i * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE ))
+            goto failed;
+    }
+    munmap( (void *)mapping, graph->size );
+    return leases;
+
+failed:
+    munmap( (void *)mapping, graph->size );
+    release_package_lease_set( leases );
+    return NULL;
+}
+
+static obj_handle_t next_package_graph_fd_token(void)
+{
+    if (!++package_graph_fd_token) ++package_graph_fd_token;
+    return package_graph_fd_token;
+}
+
+static int get_package_graph_random( unsigned long long random[2] )
+{
+    unsigned char *buffer = (unsigned char *)random;
+    size_t offset = 0;
+    int fd, saved_errno;
+
+    if ((fd = open( "/dev/urandom", O_RDONLY | O_CLOEXEC )) == -1) return 0;
+    while (offset < sizeof(*random) * 2)
+    {
+        ssize_t ret;
+
+        do ret = read( fd, buffer + offset, sizeof(*random) * 2 - offset );
+        while (ret == -1 && errno == EINTR);
+        if (ret <= 0)
+        {
+            saved_errno = ret ? errno : EIO;
+            close( fd );
+            errno = saved_errno;
+            return 0;
+        }
+        offset += ret;
+    }
+    close( fd );
+    return 1;
+}
+
+static int package_graph_file_is_safe( const struct stat *st,
+                                       const struct stat *directory,
+                                       off_t size, nlink_t links )
+{
+    return S_ISREG( st->st_mode ) && st->st_dev == directory->st_dev &&
+           st->st_uid == getuid() && st->st_size == size &&
+           st->st_nlink == links && (st->st_mode & 07777) == 0600;
+}
+
+static int package_graph_source_is_unchanged( const struct stat *before,
+                                              const struct stat *after )
+{
+    if (!S_ISREG( after->st_mode ) || after->st_size != before->st_size ||
+        after->st_dev != before->st_dev || after->st_ino != before->st_ino ||
+        after->st_mode != before->st_mode || after->st_uid != before->st_uid ||
+        after->st_gid != before->st_gid || after->st_nlink != before->st_nlink ||
+        after->st_mtime != before->st_mtime || after->st_ctime != before->st_ctime)
+        return 0;
+#ifdef HAVE_STRUCT_STAT_ST_MTIM
+    if (after->st_mtim.tv_nsec != before->st_mtim.tv_nsec) return 0;
+#elif defined(HAVE_STRUCT_STAT_ST_MTIMESPEC)
+    if (after->st_mtimespec.tv_nsec != before->st_mtimespec.tv_nsec) return 0;
+#endif
+#ifdef HAVE_STRUCT_STAT_ST_CTIM
+    if (after->st_ctim.tv_nsec != before->st_ctim.tv_nsec) return 0;
+#elif defined(HAVE_STRUCT_STAT_ST_CTIMESPEC)
+    if (after->st_ctimespec.tv_nsec != before->st_ctimespec.tv_nsec) return 0;
+#endif
+    return 1;
+}
+
+static int create_package_graph_file( char name[64],
+                                      const struct stat *directory,
+                                      struct stat *created )
+{
+    unsigned int i;
+    int fd, flags, saved_errno;
+
+    for (i = 0; i < PACKAGE_GRAPH_FILE_RETRIES; i++)
+    {
+        unsigned long long random[2];
+
+        if (!get_package_graph_random( random )) return -1;
+        snprintf( name, 64, ".wine-appx-graph-%016llx%016llx",
+                  random[0], random[1] );
+        fd = openat( server_dir_fd, name, O_RDWR | O_CREAT | O_EXCL |
+                     O_NOFOLLOW | O_CLOEXEC, 0600 );
+        if (fd != -1)
+        {
+            if (fstat( fd, created ) == -1 ||
+                (flags = fcntl( fd, F_GETFL )) == -1)
+                saved_errno = errno;
+            else if (package_graph_file_is_safe( created, directory, 0, 1 ) &&
+                     (flags & O_ACCMODE) == O_RDWR)
+                return fd;
+            else saved_errno = EACCES;
+            close( fd );
+            unlinkat( server_dir_fd, name, 0 );
+            errno = saved_errno;
+            name[0] = 0;
+            return -1;
+        }
+        saved_errno = errno;
+        name[0] = 0;
+        errno = saved_errno;
+        if (saved_errno != EEXIST) break;
+    }
+    return -1;
+}
+
+static int copy_package_graph( int source, int destination, data_size_t size )
+{
+    unsigned char buffer[PACKAGE_GRAPH_COPY_BUFFER_SIZE];
+    data_size_t offset = 0;
+
+    while (offset < size)
+    {
+        size_t count = min( (data_size_t)sizeof(buffer), size - offset );
+        size_t written = 0;
+        ssize_t ret;
+
+        do ret = pread( source, buffer, count, offset );
+        while (ret == -1 && errno == EINTR);
+        if (ret != count)
+        {
+            if (ret >= 0) set_error( STATUS_INVALID_PARAMETER );
+            else file_set_error();
+            return 0;
+        }
+        while (written < count)
+        {
+            do ret = pwrite( destination, buffer + written, count - written,
+                             offset + written );
+            while (ret == -1 && errno == EINTR);
+            if (ret <= 0)
+            {
+                if (!ret) set_error( STATUS_DISK_FULL );
+                else file_set_error();
+                return 0;
+            }
+            written += ret;
+        }
+        offset += count;
+    }
+    return 1;
+}
+
+static struct package_graph *create_package_graph( int source_fd, data_size_t size )
+{
+    struct stat directory, before, after, created, destination, unlinked;
+    struct package_graph *graph = NULL;
+    void *mapping = MAP_FAILED;
+    char name[64] = {0};
+    int writer = -1, reader = -1, source_flags, reader_flags;
+    int saved_errno, charged = 0;
+    unsigned int package_count = 0;
+
+    if (!size || size > WINE_APPX_GRAPH_MAX_BLOB_SIZE)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return NULL;
+    }
+    if (fstat( server_dir_fd, &directory ) == -1)
+    {
+        file_set_error();
+        return NULL;
+    }
+    if (!S_ISDIR( directory.st_mode ) || directory.st_uid != getuid() ||
+        (directory.st_mode & 07777) != 0700)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return NULL;
+    }
+    if (fstat( source_fd, &before ) == -1)
+    {
+        file_set_error();
+        return NULL;
+    }
+    if ((source_flags = fcntl( source_fd, F_GETFL )) == -1)
+    {
+        file_set_error();
+        return NULL;
+    }
+    if (!S_ISREG( before.st_mode ) || before.st_size != size ||
+        (source_flags & O_ACCMODE) != O_RDONLY)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return NULL;
+    }
+
+    if (package_graph_server_bytes > PACKAGE_GRAPH_MAX_SERVER_BYTES - size)
+    {
+        set_error( STATUS_NO_MEMORY );
+        return NULL;
+    }
+    package_graph_server_bytes += size;
+    charged = 1;
+
+    if ((writer = create_package_graph_file( name, &directory, &created )) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    if (ftruncate( writer, size ) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    if (!copy_package_graph( source_fd, writer, size )) goto done;
+    if (fstat( source_fd, &after ) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    if ((source_flags = fcntl( source_fd, F_GETFL )) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    if (!package_graph_source_is_unchanged( &before, &after ) ||
+        (source_flags & O_ACCMODE) != O_RDONLY)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+
+    if (fstat( writer, &destination ) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    if (!package_graph_file_is_safe( &destination, &directory, size, 1 ) ||
+        destination.st_dev != created.st_dev ||
+        destination.st_ino != created.st_ino)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+
+    reader = openat( server_dir_fd, name,
+                     O_RDONLY | O_NOFOLLOW | O_CLOEXEC );
+    if (reader == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    if ((reader_flags = fcntl( reader, F_GETFL )) == -1 ||
+        fstat( reader, &unlinked ) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    if (!package_graph_file_is_safe( &unlinked, &directory, size, 1 ) ||
+        unlinked.st_dev != destination.st_dev ||
+        unlinked.st_ino != destination.st_ino ||
+        (reader_flags & O_ACCMODE) != O_RDONLY)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+    if (unlinkat( server_dir_fd, name, 0 ) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    name[0] = 0;
+    if (fstat( reader, &unlinked ) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    if (!package_graph_file_is_safe( &unlinked, &directory, size, 0 ) ||
+        unlinked.st_dev != destination.st_dev ||
+        unlinked.st_ino != destination.st_ino)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+
+    close( writer );
+    writer = -1;
+
+    /*
+     * The server is the trust boundary for direct protocol clients.  Validate
+     * the closed, immutable destination rather than trusting the source bytes
+     * that ntdll inspected before transport.
+     */
+    mapping = mmap( NULL, size, PROT_READ, MAP_PRIVATE, reader, 0 );
+    if (mapping == MAP_FAILED)
+    {
+        file_set_error();
+        goto done;
+    }
+    if (!wine_appx_graph_validate_blob( mapping, size ))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+    package_count = wine_appx_graph_read_u32(
+        (const unsigned char *)mapping +
+        WINE_APPX_GRAPH_HEADER_PACKAGE_COUNT_OFFSET );
+    if (munmap( mapping, size ) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    mapping = MAP_FAILED;
+
+    if (!(graph = mem_alloc( sizeof(*graph) ))) goto done;
+    graph->refs = 1;
+    graph->package_count = package_count;
+    graph->image_pending = 0;
+    graph->size = size;
+    graph->fd = reader;
+    memset( &graph->image_stat, 0, sizeof(graph->image_stat) );
+    reader = -1;
+    charged = 0;
+
+done:
+    saved_errno = errno;
+    if (mapping != MAP_FAILED) munmap( mapping, size );
+    if (name[0]) unlinkat( server_dir_fd, name, 0 );
+    if (reader != -1) close( reader );
+    if (writer != -1) close( writer );
+    if (charged)
+    {
+        assert( package_graph_server_bytes >= size );
+        package_graph_server_bytes -= size;
+    }
+    errno = saved_errno;
+    return graph;
+}
+
+static int bind_package_graph_image( struct package_graph *graph,
+                                     struct file *image,
+                                     unsigned int volume_serial )
+{
+    struct fd *object_fd;
+    unsigned char identity[WINE_APPX_GRAPH_HEADER_RESERVED_OFFSET -
+                           WINE_APPX_GRAPH_HEADER_VOLUME_SERIAL_OFFSET];
+    unsigned char object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE] = {0};
+    unsigned long long expected;
+    struct stat st;
+    unsigned int sharing;
+    int fd, flags;
+
+    if (!graph || !image)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return 0;
+    }
+    object_fd = get_obj_fd( (struct object *)image );
+    sharing = get_fd_sharing( object_fd );
+    release_object( object_fd );
+    fd = get_file_unix_fd( image );
+    if (fd == -1 || fstat( fd, &st ) == -1 ||
+        (flags = fcntl( fd, F_GETFL )) == -1)
+    {
+        if (fd == -1) set_error( STATUS_INVALID_HANDLE );
+        else file_set_error();
+        return 0;
+    }
+    if (!S_ISREG( st.st_mode ) || st.st_uid != getuid() || st.st_nlink != 1 ||
+        (flags & O_ACCMODE) != O_RDONLY ||
+        (sharing & FILE_SHARE_WRITE))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return 0;
+    }
+    for (;;)
+    {
+        ssize_t ret = pread(
+            graph->fd, identity, sizeof(identity),
+            WINE_APPX_GRAPH_HEADER_VOLUME_SERIAL_OFFSET );
+
+        if (ret == -1 && errno == EINTR) continue;
+        if (ret == sizeof(identity)) break;
+        if (ret == -1) file_set_error();
+        else set_error( STATUS_INVALID_PARAMETER );
+        return 0;
+    }
+    expected = ((unsigned long long)wine_appx_graph_read_u32(
+                    identity + sizeof(unsigned int) ) << 32) |
+               wine_appx_graph_read_u32(
+                   identity + 2 * sizeof(unsigned int) );
+    memcpy( object_id, &st.st_dev, sizeof(st.st_dev) );
+    memcpy( object_id + 8, &st.st_ino, sizeof(st.st_ino) );
+    /*
+     * Wine's Windows volume serial is assigned by mountmgr and is not the
+     * Unix st_dev value.  The creator queries it through the same image
+     * handle and carries it next to that handle.  Reconstruct FSCTL_GET_OBJECT_ID's
+     * opaque st_dev/st_ino token from the exact server-side image handle; keep
+     * the full stat below as the authoritative mapped-image recheck.
+     */
+    if (wine_appx_graph_read_u32( identity ) != volume_serial ||
+        expected != (unsigned long long)st.st_ino ||
+        memcmp( identity +
+                    WINE_APPX_GRAPH_HEADER_OBJECT_ID_OFFSET -
+                    WINE_APPX_GRAPH_HEADER_VOLUME_SERIAL_OFFSET,
+                object_id, sizeof(object_id) ))
+    {
+        set_error( STATUS_INVALID_IMAGE_HASH );
+        return 0;
+    }
+    graph->image_stat = st;
+    graph->image_pending = 1;
+    return 1;
+}
+
+static int verify_package_graph_image( struct process *process )
+{
+    struct package_graph *graph = process->package_graph;
+    struct memory_view *view;
+    struct file *image;
+    struct stat st;
+    int fd, valid;
+
+    if (!graph || !graph->image_pending) return 1;
+    if (!list_head( &process->views ))
+    {
+        set_error( STATUS_INVALID_IMAGE_HASH );
+        return 0;
+    }
+    view = get_exe_view( process );
+    if (!(image = get_view_file(
+              view, FILE_READ_ATTRIBUTES,
+              FILE_SHARE_READ | FILE_SHARE_DELETE )))
+    {
+        set_error( STATUS_INVALID_IMAGE_HASH );
+        return 0;
+    }
+    fd = get_file_unix_fd( image );
+    valid = fd != -1 && fstat( fd, &st ) != -1 &&
+            package_graph_source_is_unchanged( &graph->image_stat, &st );
+    release_object( image );
+    if (!valid)
+    {
+        set_error( STATUS_INVALID_IMAGE_HASH );
+        return 0;
+    }
+    graph->image_pending = 0;
+    return 1;
+}
 
 static void startup_info_dump( struct object *obj, int verbose );
 static struct object *startup_info_get_sync( struct object *obj );
@@ -698,6 +1394,8 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->console         = NULL;
     process->startup_state   = STARTUP_IN_PROGRESS;
     process->startup_info    = NULL;
+    process->package_graph   = NULL;
+    process->package_leases  = NULL;
     process->idle_event      = NULL;
     process->peb             = 0;
     process->dir_cache       = NULL;
@@ -759,6 +1457,9 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
          * to use the current impersonation token for the new process */
         process->token = token_duplicate( token ? token : parent->token, TRUE, 0, NULL, NULL, 0, NULL, 0 );
         process->affinity = parent->affinity;
+        process->package_graph = grab_package_graph( parent->package_graph );
+        process->package_leases =
+            grab_package_lease_set( parent->package_leases );
     }
     if (!process->handles || !process->token) goto error;
     process->session_id = token_get_session_id( process->token );
@@ -803,6 +1504,8 @@ static void process_destroy( struct object *obj )
         release_object( process->job );
     }
     if (process->console) release_object( process->console );
+    release_package_graph( process->package_graph );
+    release_package_lease_set( process->package_leases );
     if (process->msg_fd) release_object( process->msg_fd );
     if (process->idle_event) release_object( process->idle_event );
     if (process->id) free_ptid( process->id );
@@ -1007,6 +1710,8 @@ static void process_killed( struct process *process )
     process->desktop = 0;
     cancel_terminating_process_asyncs( process );
     close_process_handles( process );
+    release_package_lease_set( process->package_leases );
+    process->package_leases = NULL;
     if (process->idle_event) release_object( process->idle_event );
     process->idle_event = NULL;
     assert( !process->console );
@@ -1177,36 +1882,61 @@ DECL_HANDLER(new_process)
     const struct security_descriptor *sd;
     const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, NULL );
     struct process *process = NULL;
+    struct package_graph *explicit_graph = NULL;
+    struct package_lease_set *explicit_leases = NULL;
+    struct file *image = NULL;
     struct token *token = NULL;
     struct debug_obj *debug_obj = NULL;
     struct process *parent;
     struct thread *parent_thread = current;
     int socket_fd = thread_get_inflight_fd( current, req->socket_fd );
+    int graph_fd = req->graph_fd == -1 ? -1 :
+                   thread_get_inflight_fd( current, req->graph_fd );
     const obj_handle_t *handles = NULL;
     const obj_handle_t *job_handles = NULL;
+    const struct wine_appx_graph_process_binding *graph_binding = NULL;
+    const obj_handle_t *lease_handles = NULL;
     unsigned int i, job_handle_count;
     struct job *job;
 
     if (socket_fd == -1)
     {
         set_error( STATUS_INVALID_PARAMETER );
+        if (graph_fd != -1) close( graph_fd );
+        return;
+    }
+    if ((req->graph_size && graph_fd == -1) ||
+        (!req->graph_size && req->graph_fd != -1) ||
+        (!!req->graph_size != !!req->leases_size) ||
+        (req->leases_size & (sizeof(obj_handle_t) - 1)) ||
+        req->leases_size >
+            sizeof(*graph_binding) +
+                WINE_APPX_GRAPH_MAX_PACKAGES * sizeof(*lease_handles) ||
+        req->graph_size > WINE_APPX_GRAPH_MAX_BLOB_SIZE)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        if (graph_fd != -1) close( graph_fd );
+        close( socket_fd );
         return;
     }
     if (!objattr)
     {
         set_error( STATUS_INVALID_PARAMETER );
+        if (graph_fd != -1) close( graph_fd );
         close( socket_fd );
         return;
     }
     if (fcntl( socket_fd, F_SETFL, O_NONBLOCK ) == -1)
     {
         set_error( STATUS_INVALID_HANDLE );
+        if (graph_fd != -1) close( graph_fd );
         close( socket_fd );
         return;
     }
     if (shutdown_stage)
     {
         set_error( STATUS_SHUTDOWN_IN_PROGRESS );
+        if (graph_fd != -1) close( graph_fd );
         close( socket_fd );
         return;
     }
@@ -1215,12 +1945,44 @@ DECL_HANDLER(new_process)
     {
         if (!(parent = get_process_from_handle( req->parent_process, PROCESS_CREATE_PROCESS)))
         {
+            if (graph_fd != -1) close( graph_fd );
             close( socket_fd );
             return;
         }
         parent_thread = NULL;
     }
     else parent = (struct process *)grab_object( current->process );
+    /*
+     * A caller may select another process as the nominal parent, but that
+     * must not turn PROCESS_CREATE_PROCESS into a package-identity borrowing
+     * primitive.  Inheritance is allowed only when the creator already owns
+     * the exact same server graph object.
+     */
+    if (!req->graph_size && parent->package_graph &&
+        parent->package_graph != current->process->package_graph)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        if (graph_fd != -1) close( graph_fd );
+        close( socket_fd );
+        release_object( parent );
+        return;
+    }
+    /*
+     * A dead packaged parent has already released its generation leases, so
+     * inheriting that graph would create an unprotected payload reference.
+     * An independently supplied graph carries its own complete lease set and
+     * therefore remains a valid explicit override.
+     */
+    if (parent->package_graph &&
+        (!parent->package_leases || parent->package_graph->image_pending) &&
+        !req->graph_size)
+    {
+        set_error( STATUS_PROCESS_IS_TERMINATING );
+        if (graph_fd != -1) close( graph_fd );
+        close( socket_fd );
+        release_object( parent );
+        return;
+    }
 
     /* If a job further in the job chain does not permit breakaway process creation
      * succeeds and the process which is trying to breakaway is assigned to that job. */
@@ -1228,6 +1990,7 @@ DECL_HANDLER(new_process)
         !(parent->job->limit_flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)))
     {
         set_error( STATUS_ACCESS_DENIED );
+        if (graph_fd != -1) close( graph_fd );
         close( socket_fd );
         release_object( parent );
         return;
@@ -1236,6 +1999,7 @@ DECL_HANDLER(new_process)
     /* build the startup info for a new process */
     if (!(info = alloc_object( &startup_info_ops )))
     {
+        if (graph_fd != -1) close( graph_fd );
         close( socket_fd );
         release_object( parent );
         return;
@@ -1276,6 +2040,20 @@ DECL_HANDLER(new_process)
         job_handles = info_ptr;
         info_ptr = (const char *)info_ptr + req->jobs_size;
         info->data_size -= req->jobs_size;
+    }
+
+    if (req->leases_size > info->data_size)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        close( socket_fd );
+        goto done;
+    }
+    if (req->leases_size)
+    {
+        graph_binding = info_ptr;
+        lease_handles = (const obj_handle_t *)(graph_binding + 1);
+        info_ptr = (const char *)info_ptr + req->leases_size;
+        info->data_size -= req->leases_size;
     }
 
     job_handle_count = req->jobs_size / sizeof(*handles);
@@ -1342,10 +2120,50 @@ DECL_HANDLER(new_process)
         goto done;
     }
 
+    if (graph_fd != -1)
+    {
+        if (req->leases_size < sizeof(*graph_binding) ||
+            !(image = get_file_obj(
+                  current->process, graph_binding->image_handle,
+                  FILE_READ_DATA )))
+        {
+            close( socket_fd );
+            goto done;
+        }
+        if (!(explicit_graph = create_package_graph( graph_fd, req->graph_size )))
+        {
+            close( socket_fd );
+            goto done;
+        }
+        close( graph_fd );
+        graph_fd = -1;
+        if (!bind_package_graph_image(
+                explicit_graph, image, graph_binding->volume_serial ) ||
+            req->leases_size !=
+                sizeof(*graph_binding) +
+                    explicit_graph->package_count * sizeof(*lease_handles) ||
+            !(explicit_leases = create_package_lease_set(
+                lease_handles, explicit_graph->package_count,
+                explicit_graph )))
+        {
+            close( socket_fd );
+            goto done;
+        }
+    }
+
     if (!(process = create_process( socket_fd, parent, req->flags, info->data, sd,
                                     handles, req->handles_size / sizeof(*handles), token )))
         goto done;
 
+    if (explicit_graph)
+    {
+        release_package_graph( process->package_graph );
+        release_package_lease_set( process->package_leases );
+        process->package_graph = explicit_graph;
+        process->package_leases = explicit_leases;
+        explicit_graph = NULL;
+        explicit_leases = NULL;
+    }
     process->machine = req->machine;
     process->startup_info = (struct startup_info *)grab_object( info );
 
@@ -1419,6 +2237,10 @@ DECL_HANDLER(new_process)
     reply->handle = alloc_handle_no_access_check( current->process, process, req->access, objattr->attributes );
 
  done:
+    if (graph_fd != -1) close( graph_fd );
+    release_package_graph( explicit_graph );
+    release_package_lease_set( explicit_leases );
+    if (image) release_object( image );
     if (process) release_object( process );
     if (debug_obj) release_object( debug_obj );
     if (token) release_object( token );
@@ -1487,11 +2309,84 @@ DECL_HANDLER(get_startup_info)
     reply->debugged = !!process->debug_obj;
     reply->machine = process->machine;
     reply->info_size = info->info_size;
+    reply->graph_size = 0;
+    reply->graph_fd = 0;
+    if (process->package_graph)
+    {
+        obj_handle_t token = process->id;
+        int flags = fcntl( process->package_graph->fd, F_GETFL );
+
+        if (flags == -1 || (flags & O_ACCMODE) != O_RDONLY)
+        {
+            set_error( STATUS_INVALID_HANDLE );
+            return;
+        }
+        if (send_client_fd( process, process->package_graph->fd, token ) == -1)
+        {
+            set_error( STATUS_UNSUCCESSFUL );
+            return;
+        }
+        reply->graph_size = process->package_graph->size;
+        reply->graph_fd = token;
+    }
     size = info->data_size;
     if (size > get_reply_max_size()) size = get_reply_max_size();
     set_reply_data_ptr( info->data, size );
     info->data = NULL;
     info->data_size = 0;
+}
+
+/* Snapshot a process package graph without consulting the client PEB. */
+DECL_HANDLER(get_process_package_graph)
+{
+    struct package_graph *graph;
+    struct process *process;
+    struct stat st;
+    obj_handle_t token;
+    int flags;
+
+    reply->graph_size = 0;
+    reply->graph_fd = 0;
+    if (!(process = get_process_from_handle(
+              req->process, PROCESS_QUERY_LIMITED_INFORMATION )))
+        return;
+
+    /*
+     * Take the reference while the process is still pinned.  This makes the
+     * fd/size pair one immutable snapshot even if a future graph-replacement
+     * path swaps process->package_graph after this handler releases process.
+     */
+    graph = grab_package_graph( process->package_graph );
+    release_object( process );
+    if (!graph)
+    {
+        set_error( STATUS_NOT_FOUND );
+        return;
+    }
+
+    if (graph->size > WINE_APPX_GRAPH_MAX_BLOB_SIZE ||
+        fstat( graph->fd, &st ) == -1 ||
+        (flags = fcntl( graph->fd, F_GETFL )) == -1 ||
+        !S_ISREG( st.st_mode ) || st.st_size != graph->size ||
+        st.st_uid != getuid() || st.st_nlink ||
+        (st.st_mode & 07777) != 0600 ||
+        (flags & O_ACCMODE) != O_RDONLY)
+    {
+        set_error( STATUS_INVALID_IMAGE_FORMAT );
+        release_package_graph( graph );
+        return;
+    }
+
+    token = next_package_graph_fd_token();
+    if (send_client_fd( current->process, graph->fd, token ) == -1)
+    {
+        set_error( STATUS_UNSUCCESSFUL );
+        release_package_graph( graph );
+        return;
+    }
+    reply->graph_size = graph->size;
+    reply->graph_fd = token;
+    release_package_graph( graph );
 }
 
 /* signal the end of the process initialization */
@@ -1504,6 +2399,7 @@ DECL_HANDLER(init_process_done)
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
+    if (!verify_package_graph_image( process )) return;
 
     current->teb = req->teb;
     process->peb = req->peb;

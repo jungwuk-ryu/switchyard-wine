@@ -116,6 +116,20 @@ struct wine_get_unix_env_params
     unsigned int  value_size;
 };
 
+#define WINE_PROCESS_PACKAGE_GRAPH_LIMIT_2G 0x00000001u
+
+/*
+ * Keep this argument block pointer-free so the native and WOW64 Unix-call
+ * tables use exactly the same layout.  graph and size are outputs.
+ */
+struct wine_get_process_package_graph_params
+{
+    unsigned long long process;
+    unsigned long long graph;
+    unsigned int size;
+    unsigned int flags;
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -134,6 +148,7 @@ enum ntdll_unix_funcs
     unix_system_time_precise,
     unix_call_native_callback_args,
     unix_get_unix_env,
+    unix_get_process_package_graph,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

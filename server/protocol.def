@@ -1129,9 +1129,13 @@ typedef volatile struct
     data_size_t  info_size;      /* size of startup info */
     data_size_t  handles_size;   /* length of explicit handles list */
     data_size_t  jobs_size;      /* length of jobs list */
+    data_size_t  leases_size;    /* graph binding followed by generation leases */
+    int          graph_fd;       /* fd containing an explicit package graph */
+    data_size_t  graph_size;     /* exact package graph size */
     VARARG(objattr,object_attributes);   /* object attributes */
     VARARG(handles,uints,handles_size);  /* handles list */
     VARARG(jobs,uints,jobs_size);        /* jobs list */
+    VARARG(leases,uints,leases_size);    /* image then package generation leases */
     VARARG(info,startup_info,info_size); /* startup information */
     VARARG(env,unicode_str);     /* environment for new process */
 @REPLY
@@ -1170,8 +1174,19 @@ typedef volatile struct
     data_size_t  info_size;    /* size of startup info */
     int          debugged;     /* being debugged? */
     unsigned short machine;    /* architecture for the new process */
+    data_size_t  graph_size;   /* exact package graph size */
+    obj_handle_t graph_fd;     /* token for the read-only graph fd */
     VARARG(info,startup_info,info_size); /* startup information */
     VARARG(env,unicode_str);   /* environment */
+@END
+
+
+/* Snapshot the immutable package graph owned by a process */
+@REQ(get_process_package_graph)
+    obj_handle_t process;      /* process handle with query-limited access */
+@REPLY
+    data_size_t  graph_size;   /* exact package graph size */
+    obj_handle_t graph_fd;     /* token for the read-only graph fd */
 @END
 
 

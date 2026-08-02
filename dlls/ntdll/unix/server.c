@@ -1772,7 +1772,7 @@ void server_init_process_done(void)
     }
     SERVER_END_REQ;
 
-    assert( !status );
+    if (status) abort_process( status );
     signal_start_thread( main_image_info.TransferAddress, peb, data->teb );
 }
 

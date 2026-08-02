@@ -716,6 +716,7 @@ void init_user_process_params(void)
     new_params->dwFlags         = params->dwFlags;
     new_params->wShowWindow     = params->wShowWindow;
     new_params->ProcessGroupId  = params->ProcessGroupId;
+    new_params->PackageDependencyData = params->PackageDependencyData;
 
     NtCurrentTeb()->Peb->ProcessParameters = new_params;
     NtFreeVirtualMemory( GetCurrentProcess(), (void **)&params, &size, MEM_RELEASE );

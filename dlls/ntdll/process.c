@@ -33,7 +33,14 @@
 #include "windef.h"
 #include "winternl.h"
 #include "ntdll_misc.h"
+#include "unixlib.h"
 #include "wine/exception.h"
+
+C_ASSERT( offsetof(struct wine_get_process_package_graph_params, process) == 0 );
+C_ASSERT( offsetof(struct wine_get_process_package_graph_params, graph) == 8 );
+C_ASSERT( offsetof(struct wine_get_process_package_graph_params, size) == 16 );
+C_ASSERT( offsetof(struct wine_get_process_package_graph_params, flags) == 20 );
+C_ASSERT( sizeof(struct wine_get_process_package_graph_params) == 24 );
 
 
 /******************************************************************************
@@ -52,6 +59,36 @@ PEB * WINAPI RtlGetCurrentPeb(void)
 BOOLEAN WINAPI RtlIsCurrentProcess( HANDLE handle )
 {
     return handle == NtCurrentProcess() || !NtCompareObjects( handle, NtCurrentProcess() );
+}
+
+/**********************************************************************
+ *           __wine_get_process_package_graph
+ *
+ * Return a validated, caller-owned PAGE_READONLY snapshot.  The caller must
+ * release it with NtFreeVirtualMemory(MEM_RELEASE), passing a zero size.
+ */
+NTSTATUS WINAPI __wine_get_process_package_graph(
+    HANDLE process, void **graph, ULONG *size )
+{
+    struct wine_get_process_package_graph_params params = {0};
+    INT_PTR process_value = (INT_PTR)process;
+    NTSTATUS status;
+
+    if (!graph || !size) return STATUS_INVALID_PARAMETER;
+    *graph = NULL;
+    *size = 0;
+    params.process = (int)process_value == process_value ?
+                     (unsigned int)process_value : 0xfffffff0;
+    params.flags = sizeof(void *) == 4 ?
+                   WINE_PROCESS_PACKAGE_GRAPH_LIMIT_2G : 0;
+    if (!(status = WINE_UNIX_CALL(
+              unix_get_process_package_graph, &params )))
+    {
+        if (params.graph > ~(ULONG_PTR)0) return STATUS_INVALID_IMAGE_FORMAT;
+        *graph = (void *)(ULONG_PTR)params.graph;
+        *size = params.size;
+    }
+    return status;
 }
 
 

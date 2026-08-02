@@ -71,9 +71,13 @@ static void dump_new_process_request( const struct new_process_request *req )
     fprintf( stderr, ", info_size=%u", req->info_size );
     fprintf( stderr, ", handles_size=%u", req->handles_size );
     fprintf( stderr, ", jobs_size=%u", req->jobs_size );
+    fprintf( stderr, ", leases_size=%u", req->leases_size );
+    fprintf( stderr, ", graph_fd=%d", req->graph_fd );
+    fprintf( stderr, ", graph_size=%u", req->graph_size );
     dump_varargs_object_attributes( ", objattr=", cur_size );
     dump_varargs_uints( ", handles=", min( cur_size, req->handles_size ));
     dump_varargs_uints( ", jobs=", min( cur_size, req->jobs_size ));
+    dump_varargs_uints( ", leases=", min( cur_size, req->leases_size ));
     dump_varargs_startup_info( ", info=", min( cur_size, req->info_size ));
     dump_varargs_unicode_str( ", env=", cur_size );
 }
@@ -121,8 +125,21 @@ static void dump_get_startup_info_reply( const struct get_startup_info_reply *re
     fprintf( stderr, " info_size=%u", req->info_size );
     fprintf( stderr, ", debugged=%d", req->debugged );
     fprintf( stderr, ", machine=%04x", req->machine );
+    fprintf( stderr, ", graph_size=%u", req->graph_size );
+    fprintf( stderr, ", graph_fd=%04x", req->graph_fd );
     dump_varargs_startup_info( ", info=", min( cur_size, req->info_size ));
     dump_varargs_unicode_str( ", env=", cur_size );
+}
+
+static void dump_get_process_package_graph_request( const struct get_process_package_graph_request *req )
+{
+    fprintf( stderr, " process=%04x", req->process );
+}
+
+static void dump_get_process_package_graph_reply( const struct get_process_package_graph_reply *req )
+{
+    fprintf( stderr, " graph_size=%u", req->graph_size );
+    fprintf( stderr, ", graph_fd=%04x", req->graph_fd );
 }
 
 static void dump_init_process_done_request( const struct init_process_done_request *req )
@@ -3667,6 +3684,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_new_process_info_request,
     (dump_func)dump_new_thread_request,
     (dump_func)dump_get_startup_info_request,
+    (dump_func)dump_get_process_package_graph_request,
     (dump_func)dump_init_process_done_request,
     (dump_func)dump_init_first_thread_request,
     (dump_func)dump_init_thread_request,
@@ -3991,6 +4009,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_new_process_info_reply,
     (dump_func)dump_new_thread_reply,
     (dump_func)dump_get_startup_info_reply,
+    (dump_func)dump_get_process_package_graph_reply,
     (dump_func)dump_init_process_done_reply,
     (dump_func)dump_init_first_thread_reply,
     (dump_func)dump_init_thread_reply,
@@ -4315,6 +4334,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_new_process_info",
     "new_thread",
     "get_startup_info",
+    "get_process_package_graph",
     "init_process_done",
     "init_first_thread",
     "init_thread",
@@ -4698,6 +4718,7 @@ static const struct
     { "INVALID_FILE_FOR_SECTION",    STATUS_INVALID_FILE_FOR_SECTION },
     { "INVALID_HANDLE",              STATUS_INVALID_HANDLE },
     { "INVALID_IMAGE_FORMAT",        STATUS_INVALID_IMAGE_FORMAT },
+    { "INVALID_IMAGE_HASH",          STATUS_INVALID_IMAGE_HASH },
     { "INVALID_IMAGE_NE_FORMAT",     STATUS_INVALID_IMAGE_NE_FORMAT },
     { "INVALID_IMAGE_NOT_MZ",        STATUS_INVALID_IMAGE_NOT_MZ },
     { "INVALID_IMAGE_PROTECT",       STATUS_INVALID_IMAGE_PROTECT },

@@ -32,6 +32,7 @@
 #include "delayloadhandler.h"
 
 #include "wine/exception.h"
+#include "wine/appx_package_graph.h"
 #include "wine/debug.h"
 #include "wine/list.h"
 #include "ntdll_misc.h"
@@ -139,8 +140,60 @@ static const char * const reason_names[] =
 
 struct file_id
 {
-    BYTE ObjectId[16];
+    BYTE        object_id[16];
+    FILE_ID_128 file_id;
+    ULONGLONG   volume_serial;
+    LONGLONG    change_time;
+    ULONGLONG   file_size;
+    BOOL        object_id_valid;
+    BOOL        stable_id_valid;
+    BOOL        stamp_valid;
 };
+
+enum appx_loader_wire_offset
+{
+    APPX_HEADER_PACKAGE_COUNT_OFFSET = 44,
+    APPX_HEADER_PACKAGES_OFFSET      = 48,
+    APPX_HEADER_LOADER_COUNT_OFFSET  = 52,
+    APPX_HEADER_LOADERS_OFFSET       = 56,
+
+    APPX_PACKAGE_ROOT_REF_OFFSET     = 104,
+
+    APPX_LOADER_PACKAGE_INDEX_OFFSET = 0,
+    APPX_LOADER_BASENAME_REF_OFFSET  = 8,
+    APPX_LOADER_PATH_REF_OFFSET      = 16,
+};
+
+struct appx_loader_graph
+{
+    const BYTE *data;
+    UINT32 size;
+    UINT32 package_count;
+    UINT32 packages_offset;
+    UINT32 loader_count;
+    UINT32 loaders_offset;
+};
+
+struct appx_loader_identity
+{
+    BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
+    UINT32 volume_serial;
+    UINT32 file_index_high;
+    UINT32 file_index_low;
+    LONGLONG change_time;
+    ULONGLONG file_size;
+};
+
+struct appx_loader_graph_cache
+{
+    const BYTE *data;
+    BOOL initialized;
+    BOOL roots_valid;
+    BOOL valid;
+    struct appx_loader_graph graph;
+};
+
+static struct appx_loader_graph_cache appx_loader_graph_cache;
 
 #define HASH_MAP_SIZE 32
 static LIST_ENTRY hash_table[HASH_MAP_SIZE];
@@ -152,6 +205,7 @@ typedef struct _wine_modref
     struct file_id        id;
     ULONG                 CheckSum;
     BOOL                  system;
+    BOOL                  appx_stamp_verified;
 } WINE_MODREF;
 
 static UINT tls_module_count = 32;     /* number of modules with TLS directory */
@@ -673,7 +727,11 @@ static WINE_MODREF *find_fileid_module( const struct file_id *id )
 {
     LIST_ENTRY *mark, *entry;
 
-    if (cached_modref && !memcmp( &cached_modref->id, id, sizeof(*id) )) return cached_modref;
+    if (!id->object_id_valid) return NULL;
+    if (cached_modref && cached_modref->id.object_id_valid &&
+        !memcmp( cached_modref->id.object_id, id->object_id,
+                 sizeof(id->object_id) ))
+        return cached_modref;
 
     mark = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
@@ -681,7 +739,9 @@ static WINE_MODREF *find_fileid_module( const struct file_id *id )
         LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
         WINE_MODREF *wm = CONTAINING_RECORD( mod, WINE_MODREF, ldr );
 
-        if (!memcmp( &wm->id, id, sizeof(*id) ))
+        if (wm->id.object_id_valid &&
+            !memcmp( wm->id.object_id, id->object_id,
+                     sizeof(id->object_id) ))
         {
             cached_modref = wm;
             return wm;
@@ -2559,7 +2619,8 @@ done:
  */
 static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, void **module,
                               const SECTION_IMAGE_INFORMATION *image_info, const struct file_id *id,
-                              DWORD flags, BOOL system, BOOL redirected, WINE_MODREF **pwm )
+                              DWORD flags, BOOL system, BOOL redirected,
+                              BOOL appx_stamp_verified, WINE_MODREF **pwm )
 {
     static const char builtin_signature[] = "Wine builtin DLL";
     char *signature = (char *)((IMAGE_DOS_HEADER *)*module + 1);
@@ -2582,6 +2643,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     if (!(wm = alloc_module( *module, nt_name, is_builtin ))) return STATUS_NO_MEMORY;
 
     if (id) wm->id = *id;
+    wm->appx_stamp_verified = appx_stamp_verified;
     if (image_info->LoaderFlags) wm->ldr.Flags |= LDR_COR_IMAGE;
     if (image_info->ComPlusILOnly) wm->ldr.Flags |= LDR_COR_ILONLY;
     if (redirected) wm->ldr.Flags |= LDR_REDIRECTED;
@@ -2980,29 +3042,451 @@ static NTSTATUS get_dll_load_path_search_flags( LPCWSTR module, DWORD flags, WCH
     return STATUS_SUCCESS;
 }
 
+static WCHAR appx_graph_char( const struct appx_loader_graph *graph,
+                              struct wine_appx_graph_string_ref ref,
+                              UINT32 index )
+{
+    return wine_appx_graph_read_u16( graph->data + ref.offset +
+                                     index * sizeof(WCHAR) );
+}
+
+static BOOL appx_path_component_is_reserved(
+    const struct appx_loader_graph *graph,
+    struct wine_appx_graph_string_ref ref, UINT32 start, UINT32 end )
+{
+    WCHAR name[5] = {0};
+    UINT32 base_end = start, i;
+
+    while (base_end < end && appx_graph_char( graph, ref, base_end ) != '.')
+        base_end++;
+    if (base_end - start < 3 || base_end - start > 4) return FALSE;
+    for (i = start; i < base_end; i++)
+    {
+        WCHAR ch = appx_graph_char( graph, ref, i );
+
+        if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
+        name[i - start] = ch;
+    }
+    if (base_end - start == 3)
+        return (!memcmp( name, L"CON", 3 * sizeof(WCHAR) ) ||
+                !memcmp( name, L"PRN", 3 * sizeof(WCHAR) ) ||
+                !memcmp( name, L"AUX", 3 * sizeof(WCHAR) ) ||
+                !memcmp( name, L"NUL", 3 * sizeof(WCHAR) ));
+    return ((!memcmp( name, L"COM", 3 * sizeof(WCHAR) ) ||
+             !memcmp( name, L"LPT", 3 * sizeof(WCHAR) )) &&
+            name[3] >= '1' && name[3] <= '9');
+}
+
+static BOOL appx_validate_path_components(
+    const struct appx_loader_graph *graph,
+    struct wine_appx_graph_string_ref ref, UINT32 start, UINT32 length,
+    BOOL basename_only )
+{
+    UINT32 component = start, i;
+
+    for (i = start; i <= length; i++)
+    {
+        WCHAR ch = i == length ? '\\' : appx_graph_char( graph, ref, i );
+
+        if (ch == '/' || ch == ':' || ch == '"' || ch == '<' || ch == '>' ||
+            ch == '|' || ch == '?' || ch == '*' || ch < 0x20)
+            return FALSE;
+        if (ch != '\\') continue;
+        if ((basename_only && i != length) || i == component ||
+            (i - component == 1 &&
+             appx_graph_char( graph, ref, component ) == '.') ||
+            (i - component == 2 &&
+             appx_graph_char( graph, ref, component ) == '.' &&
+             appx_graph_char( graph, ref, component + 1 ) == '.') ||
+            appx_graph_char( graph, ref, i - 1 ) == ' ' ||
+            appx_graph_char( graph, ref, i - 1 ) == '.' ||
+            i - component > 255 ||
+            appx_path_component_is_reserved( graph, ref, component, i ))
+            return FALSE;
+        component = i + 1;
+    }
+    return TRUE;
+}
+
+static BOOL appx_validate_package_root(
+    const struct appx_loader_graph *graph,
+    struct wine_appx_graph_string_ref root )
+{
+    UINT32 length;
+    WCHAR drive;
+
+    if (root.chars < 4 || root.chars > UNICODE_STRING_MAX_CHARS) return FALSE;
+    length = root.chars - 1;
+    drive = appx_graph_char( graph, root, 0 );
+    if (!((drive >= 'A' && drive <= 'Z') ||
+          (drive >= 'a' && drive <= 'z')) ||
+        appx_graph_char( graph, root, 1 ) != ':' ||
+        appx_graph_char( graph, root, 2 ) != '\\' ||
+        (length > 3 && appx_graph_char( graph, root, length - 1 ) == '\\'))
+        return FALSE;
+    if (length == 3) return TRUE;
+    return appx_validate_path_components( graph, root, 3, length, FALSE );
+}
+
+static BOOL appx_validate_relative_path(
+    const struct appx_loader_graph *graph,
+    struct wine_appx_graph_string_ref path, BOOL basename_only )
+{
+    WCHAR first;
+
+    if (path.chars < 2 || path.chars > UNICODE_STRING_MAX_CHARS) return FALSE;
+    first = appx_graph_char( graph, path, 0 );
+    if (first == '\\' || first == '/') return FALSE;
+    return appx_validate_path_components( graph, path, 0, path.chars - 1,
+                                          basename_only );
+}
+
+static INT appx_compare_graph_refs_ci(
+    const struct appx_loader_graph *graph,
+    struct wine_appx_graph_string_ref left,
+    struct wine_appx_graph_string_ref right )
+{
+    UINT32 left_length = left.chars - 1, right_length = right.chars - 1;
+    const WCHAR *left_string = (const WCHAR *)(graph->data + left.offset);
+    const WCHAR *right_string = (const WCHAR *)(graph->data + right.offset);
+
+    /*
+     * Package policy is consulted while kernel32's imports are still loading,
+     * before locale_init() publishes the Unicode case table.
+     * RtlCompareUnicodeStrings() has an ASCII fallback for that phase;
+     * RtlUpcaseUnicodeChar() does not and would dereference the absent table.
+     */
+    return RtlCompareUnicodeStrings(
+        left_string, left_length, right_string, right_length, TRUE );
+}
+
+static INT appx_compare_name_ref_ci(
+    const WCHAR *name, UINT32 name_length,
+    const struct appx_loader_graph *graph,
+    struct wine_appx_graph_string_ref ref )
+{
+    UINT32 ref_length = ref.chars - 1;
+    const WCHAR *ref_string = (const WCHAR *)(graph->data + ref.offset);
+
+    return RtlCompareUnicodeStrings(
+        name, name_length, ref_string, ref_length, TRUE );
+}
+
+static BOOL appx_basename_matches_path(
+    const struct appx_loader_graph *graph,
+    struct wine_appx_graph_string_ref basename,
+    struct wine_appx_graph_string_ref path )
+{
+    UINT32 path_length = path.chars - 1, basename_length = basename.chars - 1;
+    UINT32 start = 0, i;
+
+    for (i = 0; i < path_length; i++)
+        if (appx_graph_char( graph, path, i ) == '\\') start = i + 1;
+    if (path_length - start != basename_length) return FALSE;
+    for (i = 0; i < basename_length; i++)
+        if (appx_graph_char( graph, basename, i ) !=
+            appx_graph_char( graph, path, start + i ))
+            return FALSE;
+    return TRUE;
+}
+
+static BOOL appx_validate_package_graph_roots(
+    const struct appx_loader_graph *graph )
+{
+    UINT32 i;
+
+    for (i = 0; i < graph->package_count; i++)
+    {
+        const BYTE *record = graph->data + graph->packages_offset +
+                             i * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+        struct wine_appx_graph_string_ref root =
+            wine_appx_graph_get_ref( record, APPX_PACKAGE_ROOT_REF_OFFSET );
+
+        if (!appx_validate_package_root( graph, root )) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL appx_validate_loader_graph_domain(
+    const struct appx_loader_graph *graph )
+{
+    struct wine_appx_graph_string_ref previous_basename = {0};
+    struct wine_appx_graph_string_ref previous_path = {0};
+    UINT32 previous_package = 0, previous_rank = 0, i;
+
+    for (i = 0; i < graph->loader_count; i++)
+    {
+        const BYTE *record = graph->data + graph->loaders_offset +
+                             i * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        struct wine_appx_graph_string_ref basename =
+            wine_appx_graph_get_ref( record, APPX_LOADER_BASENAME_REF_OFFSET );
+        struct wine_appx_graph_string_ref path =
+            wine_appx_graph_get_ref( record, APPX_LOADER_PATH_REF_OFFSET );
+        UINT32 package_index = wine_appx_graph_read_u32(
+            record + APPX_LOADER_PACKAGE_INDEX_OFFSET );
+        UINT32 search_rank = wine_appx_graph_read_u32(
+            record + WINE_APPX_GRAPH_LOADER_SEARCH_RANK_OFFSET );
+        INT comparison;
+
+        if (package_index >= graph->package_count ||
+            (search_rank >= WINE_APPX_GRAPH_MAX_LOADER_SEARCH_PATHS &&
+             search_rank != WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY) ||
+            !appx_validate_relative_path( graph, basename, TRUE ) ||
+            !appx_validate_relative_path( graph, path, FALSE ) ||
+            !appx_basename_matches_path( graph, basename, path ))
+            return FALSE;
+        if (i)
+        {
+            comparison = appx_compare_graph_refs_ci(
+                graph, previous_basename, basename );
+            if (comparison > 0 ||
+                (!comparison && previous_package > package_index) ||
+                (!comparison && previous_package == package_index &&
+                 previous_rank > search_rank) ||
+                (!comparison && previous_package == package_index &&
+                 previous_rank == search_rank &&
+                 appx_compare_graph_refs_ci(
+                     graph, previous_path, path ) >= 0))
+                return FALSE;
+        }
+        previous_basename = basename;
+        previous_path = path;
+        previous_package = package_index;
+        previous_rank = search_rank;
+    }
+    return TRUE;
+}
+
+static NTSTATUS get_appx_loader_graph( const BYTE *data,
+                                       struct appx_loader_graph *graph )
+{
+    struct appx_loader_graph candidate = {0};
+    BOOL roots_valid = FALSE;
+    BOOL valid = FALSE;
+    UINT32 size;
+
+    /*
+     * Normal process startup publishes PackageDependencyData as a private,
+     * PAGE_READONLY snapshot.  The cache deliberately relies on that
+     * immutability: repeatedly validating the live graph would add O(size)
+     * work to every lookup without closing a same-process reprotection TOCTOU.
+     * A caller that replaces or makes this snapshot writable already controls
+     * the process and is outside the loader's trust boundary.
+     */
+    if (appx_loader_graph_cache.initialized &&
+        appx_loader_graph_cache.data == data)
+    {
+        if (!appx_loader_graph_cache.valid) return STATUS_FILE_CORRUPT_ERROR;
+        *graph = appx_loader_graph_cache.graph;
+        return STATUS_SUCCESS;
+    }
+
+    __TRY
+    {
+        size = wine_appx_graph_read_u32(
+            data + WINE_APPX_GRAPH_HEADER_TOTAL_SIZE_OFFSET );
+        if (wine_appx_graph_validate_blob( data, size ))
+        {
+            candidate.data = data;
+            candidate.size = size;
+            candidate.package_count = wine_appx_graph_read_u32(
+                data + APPX_HEADER_PACKAGE_COUNT_OFFSET );
+            candidate.packages_offset = wine_appx_graph_read_u32(
+                data + APPX_HEADER_PACKAGES_OFFSET );
+            candidate.loader_count = wine_appx_graph_read_u32(
+                data + APPX_HEADER_LOADER_COUNT_OFFSET );
+            candidate.loaders_offset = wine_appx_graph_read_u32(
+                data + APPX_HEADER_LOADERS_OFFSET );
+            roots_valid = appx_validate_package_graph_roots( &candidate );
+            valid = roots_valid &&
+                    appx_validate_loader_graph_domain( &candidate );
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        valid = FALSE;
+    }
+    __ENDTRY
+
+    appx_loader_graph_cache.data = data;
+    appx_loader_graph_cache.initialized = TRUE;
+    appx_loader_graph_cache.roots_valid = roots_valid;
+    appx_loader_graph_cache.valid = valid;
+    appx_loader_graph_cache.graph = candidate;
+    if (!valid) return STATUS_FILE_CORRUPT_ERROR;
+    *graph = candidate;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS get_appx_loader_graph_roots(
+    const BYTE *data, struct appx_loader_graph *graph, BOOL *domain_valid )
+{
+    NTSTATUS status = get_appx_loader_graph( data, graph );
+
+    if (!status)
+    {
+        *domain_valid = TRUE;
+        return STATUS_SUCCESS;
+    }
+    if (appx_loader_graph_cache.initialized &&
+        appx_loader_graph_cache.data == data &&
+        appx_loader_graph_cache.roots_valid)
+    {
+        *graph = appx_loader_graph_cache.graph;
+        *domain_valid = FALSE;
+        return STATUS_SUCCESS;
+    }
+    return status;
+}
+
+static const BYTE *appx_find_loader_record(
+    const struct appx_loader_graph *graph, const WCHAR *basename,
+    UINT32 basename_length, BOOL searchable_only, UINT32 *record_index )
+{
+    struct wine_appx_graph_string_ref ref;
+    const BYTE *record;
+    UINT32 low = 0, high = graph->loader_count, middle;
+    INT comparison;
+
+    while (low < high)
+    {
+        middle = low + (high - low) / 2;
+        record = graph->data + graph->loaders_offset +
+                 middle * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        ref = wine_appx_graph_get_ref( record,
+                                       APPX_LOADER_BASENAME_REF_OFFSET );
+        comparison = appx_compare_name_ref_ci(
+            basename, basename_length, graph, ref );
+        if (comparison > 0) low = middle + 1;
+        else high = middle;
+    }
+    while (low < graph->loader_count)
+    {
+        record = graph->data + graph->loaders_offset +
+                 low * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        ref = wine_appx_graph_get_ref( record,
+                                       APPX_LOADER_BASENAME_REF_OFFSET );
+        if (appx_compare_name_ref_ci(
+                basename, basename_length, graph, ref ))
+            break;
+        if (!searchable_only ||
+            wine_appx_graph_read_u32(
+                record + WINE_APPX_GRAPH_LOADER_SEARCH_RANK_OFFSET ) !=
+                WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY)
+        {
+            if (record_index) *record_index = low;
+            return record;
+        }
+        low++;
+    }
+    return NULL;
+}
+
 
 /***********************************************************************
  *	open_dll_file
  *
  * Open a file for a new dll. Helper for find_dll_file.
  */
-static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDLE *mapping,
-                               SECTION_IMAGE_INFORMATION *image_info, struct file_id *id )
+static void query_dll_file_id( HANDLE handle, struct file_id *id )
+{
+    FILE_ID_INFORMATION stable_id;
+    FILE_OBJECTID_BUFFER object_id;
+    IO_STATUS_BLOCK io;
+
+    memset( id, 0, sizeof(*id) );
+    if (!NtFsControlFile( handle, 0, NULL, NULL, &io, FSCTL_GET_OBJECT_ID,
+                          NULL, 0, &object_id, sizeof(object_id) ))
+    {
+        memcpy( id->object_id, object_id.ObjectId, sizeof(id->object_id) );
+        id->object_id_valid = TRUE;
+    }
+    if (!NtQueryInformationFile( handle, &io, &stable_id, sizeof(stable_id),
+                                 FileIdInformation ))
+    {
+        id->volume_serial = stable_id.VolumeSerialNumber;
+        id->file_id = stable_id.FileId;
+        id->stable_id_valid = TRUE;
+    }
+}
+
+static NTSTATUS query_appx_dll_file( HANDLE handle, struct file_id *id )
+{
+    FILE_STANDARD_INFORMATION standard;
+    FILE_BASIC_INFORMATION basic;
+    IO_STATUS_BLOCK io;
+    NTSTATUS status;
+
+    query_dll_file_id( handle, id );
+    if (!id->stable_id_valid) return STATUS_INVALID_IMAGE_HASH;
+    if ((status = NtQueryInformationFile(
+             handle, &io, &basic, sizeof(basic), FileBasicInformation )))
+        return status;
+    if ((status = NtQueryInformationFile(
+             handle, &io, &standard, sizeof(standard),
+             FileStandardInformation )))
+        return status;
+    if (basic.ChangeTime.QuadPart <= 0 ||
+        standard.EndOfFile.QuadPart <= 0)
+        return STATUS_INVALID_IMAGE_HASH;
+    id->change_time = basic.ChangeTime.QuadPart;
+    id->file_size = standard.EndOfFile.QuadPart;
+    id->stamp_valid = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static BOOL appx_file_stamp_matches(
+    const struct file_id *id,
+    const struct appx_loader_identity *expected )
+{
+    ULONGLONG index;
+    UINT32 i;
+
+    if (!id->object_id_valid ||
+        memcmp( id->object_id, expected->object_id,
+                sizeof(expected->object_id) ) ||
+        !id->stable_id_valid ||
+        !id->stamp_valid ||
+        (UINT32)id->volume_serial != expected->volume_serial ||
+        id->change_time != expected->change_time ||
+        id->file_size != expected->file_size)
+        return FALSE;
+    for (i = sizeof(index); i < sizeof(id->file_id.Identifier); i++)
+        if (id->file_id.Identifier[i]) return FALSE;
+    memcpy( &index, id->file_id.Identifier, sizeof(index) );
+    return (UINT32)(index >> 32) == expected->file_index_high &&
+           (UINT32)index == expected->file_index_low;
+}
+
+static NTSTATUS open_dll_file_internal(
+    UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDLE *mapping,
+    SECTION_IMAGE_INFORMATION *image_info, struct file_id *id,
+    const struct appx_loader_identity *expected )
 {
     FILE_BASIC_INFORMATION info;
     OBJECT_ATTRIBUTES attr;
     IO_STATUS_BLOCK io;
     LARGE_INTEGER size;
-    FILE_OBJECTID_BUFFER fid;
     NTSTATUS status;
     HANDLE handle;
+    ULONG options = FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE;
 
-    if ((*pwm = find_fullname_module( nt_name ))) return STATUS_SUCCESS;
+    if ((*pwm = find_fullname_module( nt_name )))
+    {
+        if (!expected ||
+            ((*pwm)->appx_stamp_verified &&
+             appx_file_stamp_matches( &(*pwm)->id, expected )))
+            return STATUS_SUCCESS;
+        *pwm = NULL;
+        return STATUS_INVALID_IMAGE_HASH;
+    }
 
     InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+    if (expected) options |= FILE_OPEN_REPARSE_POINT;
     if ((status = NtOpenFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io,
-                              FILE_SHARE_READ | FILE_SHARE_DELETE,
-                              FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE )))
+                              expected ? FILE_SHARE_READ :
+                                         FILE_SHARE_READ | FILE_SHARE_DELETE,
+                              options )))
     {
         if (status != STATUS_OBJECT_PATH_NOT_FOUND &&
             status != STATUS_OBJECT_NAME_NOT_FOUND &&
@@ -3015,9 +3499,25 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
         return STATUS_DLL_NOT_FOUND;
     }
 
-    if (!NtFsControlFile( handle, 0, NULL, NULL, &io, FSCTL_GET_OBJECT_ID, NULL, 0, &fid, sizeof(fid) ))
+    if (expected)
     {
-        memcpy( id, fid.ObjectId, sizeof(*id) );
+        if (query_appx_dll_file( handle, id ) ||
+            !appx_file_stamp_matches( id, expected ))
+        {
+            NtClose( handle );
+            return STATUS_INVALID_IMAGE_HASH;
+        }
+    }
+    else query_dll_file_id( handle, id );
+    /*
+     * Identity-bound package loads require both the selected inventory path
+     * and its stable file identity.  Generic object-id deduplication could
+     * otherwise reuse a module that was preloaded through a differently
+     * named hard link, losing the path-provenance half of that invariant.
+     * An exact-path module was already handled by find_fullname_module().
+     */
+    if (!expected && id->object_id_valid)
+    {
         if ((*pwm = find_fileid_module( id )))
         {
             TRACE( "%s is the same file as existing module %p %s\n", debugstr_w( nt_name->Buffer ),
@@ -3033,6 +3533,19 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
                               NULL, &size, PAGE_EXECUTE_READ, SEC_IMAGE, handle );
     if (!status)
     {
+        struct file_id after;
+
+        if (expected &&
+            (query_appx_dll_file( handle, &after ) ||
+             !appx_file_stamp_matches( &after, expected )))
+        {
+            status = STATUS_INVALID_IMAGE_HASH;
+            NtClose( *mapping );
+            *mapping = NULL;
+        }
+    }
+    if (!status)
+    {
         NtQuerySection( *mapping, SectionImageInformation, image_info, sizeof(*image_info), NULL );
         if (!is_valid_binary( handle, image_info ))
         {
@@ -3044,6 +3557,26 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
     }
     NtClose( handle );
     return status;
+}
+
+static NTSTATUS open_appx_dll_candidate(
+    const BYTE *data, UNICODE_STRING *nt_name, WINE_MODREF **pwm,
+    HANDLE *mapping, SECTION_IMAGE_INFORMATION *image_info,
+    struct file_id *id, BOOL *identity_bound );
+
+static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm,
+                               HANDLE *mapping,
+                               SECTION_IMAGE_INFORMATION *image_info,
+                               struct file_id *id, BOOL *identity_bound )
+{
+    const BYTE *data = NtCurrentTeb()->Peb->ProcessParameters->
+                       PackageDependencyData;
+
+    if (data)
+        return open_appx_dll_candidate(
+            data, nt_name, pwm, mapping, image_info, id, identity_bound );
+    return open_dll_file_internal( nt_name, pwm, mapping, image_info, id,
+                                   NULL );
 }
 
 
@@ -3072,6 +3605,391 @@ static NTSTATUS open_known_dll( const WCHAR *libname, UNICODE_STRING *nt_name, W
     NtQuerySection( *mapping, SectionImageInformation, image_info, sizeof(*image_info), NULL );
     memset( id, 0, sizeof(*id) );
     TRACE( "loaded %s from known dlls\n", debugstr_us(nt_name) );
+    return STATUS_SUCCESS;
+}
+
+static struct appx_loader_identity appx_get_loader_identity(
+    const BYTE *record )
+{
+    struct appx_loader_identity identity;
+
+    memcpy( identity.object_id,
+            record + WINE_APPX_GRAPH_LOADER_OBJECT_ID_OFFSET,
+            sizeof(identity.object_id) );
+    identity.volume_serial = wine_appx_graph_read_u32(
+        record + WINE_APPX_GRAPH_LOADER_VOLUME_SERIAL_OFFSET );
+    identity.file_index_high = wine_appx_graph_read_u32(
+        record + WINE_APPX_GRAPH_LOADER_FILE_INDEX_HIGH_OFFSET );
+    identity.file_index_low = wine_appx_graph_read_u32(
+        record + WINE_APPX_GRAPH_LOADER_FILE_INDEX_LOW_OFFSET );
+    identity.change_time = wine_appx_graph_read_u64(
+        record + WINE_APPX_GRAPH_LOADER_CHANGE_TIME_OFFSET );
+    identity.file_size = wine_appx_graph_read_u64(
+        record + WINE_APPX_GRAPH_LOADER_FILE_SIZE_OFFSET );
+    return identity;
+}
+
+static BOOL appx_path_relative_to_root(
+    const struct appx_loader_graph *graph,
+    struct wine_appx_graph_string_ref root, const WCHAR *path,
+    UINT32 path_length, UINT32 *relative_start )
+{
+    const WCHAR *root_string = (const WCHAR *)(graph->data + root.offset);
+    UINT32 root_length = root.chars - 1;
+
+    if (path_length < root_length ||
+        RtlCompareUnicodeStrings(
+            path, root_length, root_string, root_length, TRUE ))
+        return FALSE;
+    if (path_length == root_length)
+    {
+        *relative_start = path_length;
+        return TRUE;
+    }
+    if (root_string[root_length - 1] == '\\')
+    {
+        *relative_start = root_length;
+        return TRUE;
+    }
+    if (path[root_length] != '\\') return FALSE;
+    *relative_start = root_length + 1;
+    return TRUE;
+}
+
+static const BYTE *appx_find_loader_path_record(
+    const struct appx_loader_graph *graph, const WCHAR *path,
+    UINT32 path_length, BOOL inspect_loaders, BOOL *inside_root )
+{
+    const BYTE *package_record, *loader_record;
+    struct wine_appx_graph_string_ref root, basename, relative;
+    BYTE matching_packages[(WINE_APPX_GRAPH_MAX_PACKAGES + 7) / 8] = {0};
+    UINT32 package_index, basename_start = 0, relative_start, i;
+
+    *inside_root = FALSE;
+    for (i = 0; i < graph->package_count; i++)
+    {
+        package_record = graph->data + graph->packages_offset +
+                         i * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+        root = wine_appx_graph_get_ref(
+            package_record, APPX_PACKAGE_ROOT_REF_OFFSET );
+        if (appx_path_relative_to_root(
+                graph, root, path, path_length, &relative_start ))
+        {
+            *inside_root = TRUE;
+            if (!inspect_loaders) return NULL;
+            matching_packages[i / 8] |= 1u << (i % 8);
+        }
+    }
+    if (!*inside_root) return NULL;
+
+    for (i = path_length; i; i--)
+        if (path[i - 1] == '\\')
+        {
+            basename_start = i;
+            break;
+        }
+    if (!(loader_record = appx_find_loader_record(
+            graph, path + basename_start, path_length - basename_start,
+            FALSE, &i )))
+        return NULL;
+
+    /*
+     * Loader records are validated as basename-sorted.  Restrict the exact
+     * path lookup to that basename run instead of walking the entire
+     * inventory; the package bitmap retains all matches if roots overlap.
+     */
+    for (; i < graph->loader_count; i++,
+           loader_record += WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE)
+    {
+        basename = wine_appx_graph_get_ref(
+            loader_record, APPX_LOADER_BASENAME_REF_OFFSET );
+        if (appx_compare_name_ref_ci(
+                path + basename_start, path_length - basename_start,
+                graph, basename ))
+            break;
+        package_index = wine_appx_graph_read_u32(
+            loader_record + APPX_LOADER_PACKAGE_INDEX_OFFSET );
+        if (!(matching_packages[package_index / 8] &
+              (1u << (package_index % 8))))
+            continue;
+        package_record = graph->data + graph->packages_offset +
+                         package_index *
+                         WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+        root = wine_appx_graph_get_ref(
+            package_record, APPX_PACKAGE_ROOT_REF_OFFSET );
+        if (!appx_path_relative_to_root(
+                graph, root, path, path_length, &relative_start ))
+            continue;
+        relative = wine_appx_graph_get_ref(
+            loader_record, APPX_LOADER_PATH_REF_OFFSET );
+        if (path_length - relative_start != relative.chars - 1)
+            continue;
+        if (!RtlCompareUnicodeStrings(
+                path + relative_start, path_length - relative_start,
+                (const WCHAR *)(graph->data + relative.offset),
+                relative.chars - 1, TRUE ))
+            return loader_record;
+    }
+    return NULL;
+}
+
+static NTSTATUS open_appx_dll_candidate(
+    const BYTE *data, UNICODE_STRING *nt_name, WINE_MODREF **pwm,
+    HANDLE *mapping, SECTION_IMAGE_INFORMATION *image_info,
+    struct file_id *id, BOOL *identity_bound )
+{
+    struct appx_loader_identity expected;
+    struct appx_loader_graph graph;
+    FILE_BASIC_INFORMATION info;
+    OBJECT_ATTRIBUTES attr;
+    const BYTE *record;
+    const WCHAR *path;
+    UINT32 path_length;
+    NTSTATUS status;
+    BOOL domain_valid, inside_root;
+
+    status = get_appx_loader_graph_roots( data, &graph, &domain_valid );
+    if (status) return status;
+
+    if (nt_name->Length < 4 * sizeof(WCHAR) ||
+        memcmp( nt_name->Buffer, L"\\??\\", 4 * sizeof(WCHAR) ))
+        return open_dll_file_internal(
+            nt_name, pwm, mapping, image_info, id, NULL );
+    path = nt_name->Buffer + 4;
+    path_length = nt_name->Length / sizeof(WCHAR) - 4;
+    record = appx_find_loader_path_record(
+        &graph, path, path_length, domain_valid, &inside_root );
+    if (!inside_root)
+        return open_dll_file_internal(
+            nt_name, pwm, mapping, image_info, id, NULL );
+    if (!domain_valid) return STATUS_FILE_CORRUPT_ERROR;
+
+    if (record)
+    {
+        expected = appx_get_loader_identity( record );
+        status = open_dll_file_internal(
+            nt_name, pwm, mapping, image_info, id, &expected );
+        if (!status && identity_bound) *identity_bound = TRUE;
+        return status;
+    }
+
+    /*
+     * A root-internal path that is not inventory-backed may be probed only
+     * for existence.  Never create an image section for it: an existing file
+     * is an integrity violation, while an absent candidate must remain a
+     * normal search miss so a system directory can still satisfy the name.
+     */
+    InitializeObjectAttributes(
+        &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+    status = NtQueryAttributesFile( &attr, &info );
+    if (status == STATUS_OBJECT_PATH_NOT_FOUND ||
+        status == STATUS_OBJECT_NAME_NOT_FOUND)
+        return STATUS_DLL_NOT_FOUND;
+    return STATUS_INVALID_IMAGE_HASH;
+}
+
+static BOOL appx_loaded_module_path_matches(
+    const struct appx_loader_graph *graph, const BYTE *loader_record,
+    const WINE_MODREF *module )
+{
+    struct wine_appx_graph_string_ref root, path;
+    const BYTE *package_record;
+    UINT32 package_index, root_length, path_length, separator, expected_length;
+    const WCHAR *root_string, *path_string;
+
+    package_index = wine_appx_graph_read_u32(
+        loader_record + APPX_LOADER_PACKAGE_INDEX_OFFSET );
+    if (package_index >= graph->package_count) return FALSE;
+    package_record = graph->data + graph->packages_offset +
+                     package_index * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+    root = wine_appx_graph_get_ref( package_record,
+                                    APPX_PACKAGE_ROOT_REF_OFFSET );
+    path = wine_appx_graph_get_ref( loader_record,
+                                    APPX_LOADER_PATH_REF_OFFSET );
+    root_length = root.chars - 1;
+    path_length = path.chars - 1;
+    separator = appx_graph_char( graph, root, root_length - 1 ) != '\\';
+    if (root_length > ~0u - separator ||
+        root_length + separator > ~0u - path_length)
+        return FALSE;
+    expected_length = root_length + separator + path_length;
+    if (module->ldr.FullDllName.Length / sizeof(WCHAR) != expected_length)
+        return FALSE;
+    root_string = (const WCHAR *)(graph->data + root.offset);
+    path_string = (const WCHAR *)(graph->data + path.offset);
+    if (RtlCompareUnicodeStrings(
+            module->ldr.FullDllName.Buffer, root_length,
+            root_string, root_length, TRUE ))
+        return FALSE;
+    if (separator &&
+        module->ldr.FullDllName.Buffer[root_length] != '\\')
+        return FALSE;
+    return !RtlCompareUnicodeStrings(
+        module->ldr.FullDllName.Buffer + root_length + separator,
+        path_length, path_string, path_length, TRUE );
+}
+
+static NTSTATUS appx_build_loader_nt_name(
+    const struct appx_loader_graph *graph, const BYTE *loader_record,
+    UNICODE_STRING *nt_name )
+{
+    struct wine_appx_graph_string_ref root, path;
+    const BYTE *package_record;
+    UINT32 package_index, root_length, path_length, separator, total, i;
+    WCHAR *buffer, *cursor;
+
+    package_index = wine_appx_graph_read_u32(
+        loader_record + APPX_LOADER_PACKAGE_INDEX_OFFSET );
+    if (package_index >= graph->package_count) return STATUS_FILE_CORRUPT_ERROR;
+    package_record = graph->data + graph->packages_offset +
+                     package_index * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+    root = wine_appx_graph_get_ref( package_record,
+                                    APPX_PACKAGE_ROOT_REF_OFFSET );
+    path = wine_appx_graph_get_ref( loader_record,
+                                    APPX_LOADER_PATH_REF_OFFSET );
+    if (!appx_validate_package_root( graph, root ) ||
+        !appx_validate_relative_path( graph, path, FALSE ))
+        return STATUS_FILE_CORRUPT_ERROR;
+
+    root_length = root.chars - 1;
+    path_length = path.chars - 1;
+    separator = appx_graph_char( graph, root, root_length - 1 ) != '\\';
+    if (root_length > UNICODE_STRING_MAX_CHARS - 4 ||
+        path_length > UNICODE_STRING_MAX_CHARS - 4 - root_length ||
+        separator > UNICODE_STRING_MAX_CHARS - 4 - root_length - path_length)
+        return STATUS_NAME_TOO_LONG;
+    total = 4 + root_length + separator + path_length;
+    if (total >= UNICODE_STRING_MAX_CHARS) return STATUS_NAME_TOO_LONG;
+    if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0,
+                                    (total + 1) * sizeof(*buffer) )))
+        return STATUS_NO_MEMORY;
+
+    memcpy( buffer, L"\\??\\", 4 * sizeof(*buffer) );
+    cursor = buffer + 4;
+    for (i = 0; i < root_length; i++)
+        *cursor++ = appx_graph_char( graph, root, i );
+    if (separator) *cursor++ = '\\';
+    for (i = 0; i < path_length; i++)
+        *cursor++ = appx_graph_char( graph, path, i );
+    *cursor = 0;
+    nt_name->Buffer = buffer;
+    nt_name->Length = total * sizeof(WCHAR);
+    nt_name->MaximumLength = (total + 1) * sizeof(WCHAR);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS open_appx_loader_record(
+    const struct appx_loader_graph *graph, const BYTE *record,
+    UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDLE *mapping,
+    SECTION_IMAGE_INFORMATION *image_info, struct file_id *id )
+{
+    struct appx_loader_identity expected = appx_get_loader_identity( record );
+    NTSTATUS status;
+
+    if ((status = appx_build_loader_nt_name( graph, record, nt_name )))
+        return status;
+    status = open_dll_file_internal( nt_name, pwm, mapping, image_info, id,
+                                     &expected );
+    if (status == STATUS_NOT_SUPPORTED) status = STATUS_INVALID_IMAGE_FORMAT;
+    if (!status)
+        TRACE( "resolved package graph module %s\n", debugstr_us(nt_name) );
+    else
+        WARN( "package graph module %s failed identity-bound open, status %lx\n",
+              debugstr_us(nt_name), status );
+    return status;
+}
+
+static const WCHAR *appx_module_basename( const WCHAR *name )
+{
+    const WCHAR *basename = name, *cursor;
+
+    if ((cursor = wcsrchr( basename, '\\' ))) basename = cursor + 1;
+    if ((cursor = wcsrchr( basename, '/' ))) basename = cursor + 1;
+    return basename;
+}
+
+/*
+ * Absolute paths do not normally participate in package graph search.
+ * LoadPackagedLibrary resolves an inventory record to its absolute path before
+ * entering ntdll, though, so recognize only an exact root + relative-path
+ * match here.  Unrelated explicit paths retain the ordinary loader behavior.
+ */
+static NTSTATUS find_exact_appx_graph_dll(
+    const BYTE *data, const WCHAR *libname, UNICODE_STRING *nt_name,
+    WINE_MODREF **pwm, HANDLE *mapping,
+    SECTION_IMAGE_INFORMATION *image_info, struct file_id *id, BOOL *handled )
+{
+    struct appx_loader_graph graph;
+    struct wine_appx_graph_string_ref ref;
+    UNICODE_STRING input_name = {0}, candidate = {0};
+    const WCHAR *basename = appx_module_basename( libname );
+    const BYTE *record;
+    UINT32 index, basename_length = wcslen( basename );
+    NTSTATUS status;
+
+    *handled = FALSE;
+    /*
+     * A corrupt graph must fail closed for common-name graph search.  It is
+     * not authority over an unrelated caller-supplied absolute path, however.
+     */
+    if (get_appx_loader_graph( data, &graph )) return STATUS_SUCCESS;
+    if (!(record = appx_find_loader_record(
+            &graph, basename, basename_length, FALSE, &index )))
+        return STATUS_SUCCESS;
+    if (RtlDosPathNameToNtPathName_U_WithStatus(
+            libname, &input_name, NULL, NULL ))
+        return STATUS_SUCCESS;
+
+    for (; index < graph.loader_count; index++,
+           record += WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE)
+    {
+        ref = wine_appx_graph_get_ref( record,
+                                       APPX_LOADER_BASENAME_REF_OFFSET );
+        if (appx_compare_name_ref_ci( basename, basename_length,
+                                      &graph, ref ))
+            break;
+        if ((status = appx_build_loader_nt_name(
+                &graph, record, &candidate )))
+        {
+            RtlFreeUnicodeString( &input_name );
+            *handled = TRUE;
+            return status;
+        }
+        if (!RtlEqualUnicodeString( &input_name, &candidate, TRUE ))
+        {
+            RtlFreeUnicodeString( &candidate );
+            candidate.Buffer = NULL;
+            continue;
+        }
+
+        *handled = TRUE;
+        /*
+         * kernelbase reaches this path only after selecting a package graph
+         * record for LoadPackagedLibrary.  The function's target must come
+         * from that graph; KnownDLL precedence remains in the ordinary
+         * basename search used for imports and LoadLibrary.
+         */
+        RtlFreeUnicodeString( &input_name );
+        *nt_name = candidate;
+        {
+            struct appx_loader_identity expected =
+                appx_get_loader_identity( record );
+
+            status = open_dll_file_internal(
+                nt_name, pwm, mapping, image_info, id, &expected );
+        }
+        if (status == STATUS_NOT_SUPPORTED)
+            status = STATUS_INVALID_IMAGE_FORMAT;
+        if (!status)
+            TRACE( "resolved exact package graph module %s\n",
+                   debugstr_us(nt_name) );
+        else
+            WARN( "exact package graph module %s failed identity-bound open, status %lx\n",
+                  debugstr_us(nt_name), status );
+        return status;
+    }
+    RtlFreeUnicodeString( &candidate );
+    RtlFreeUnicodeString( &input_name );
     return STATUS_SUCCESS;
 }
 
@@ -3109,7 +4027,8 @@ static WINE_MODREF *find_existing_module( HMODULE module )
  */
 static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_name, HANDLE mapping,
                                  const SECTION_IMAGE_INFORMATION *image_info, const struct file_id *id,
-                                 DWORD flags, BOOL system, BOOL redirected, WINE_MODREF** pwm )
+                                 DWORD flags, BOOL system, BOOL redirected,
+                                 BOOL identity_bound, WINE_MODREF** pwm )
 {
     void *module = NULL;
     SIZE_T len = 0;
@@ -3118,7 +4037,13 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
 
     if (!NT_SUCCESS(status)) return status;
 
-    if ((*pwm = find_existing_module( module )))  /* already loaded */
+    /*
+     * An identity-bound graph open has already checked the exact inventory
+     * path and stable file ID.  Do not collapse that mapping onto a module
+     * preloaded through another hard-link path.
+     */
+    if (!identity_bound &&
+        (*pwm = find_existing_module( module )))  /* already loaded */
     {
         if ((*pwm)->ldr.LoadCount != -1) (*pwm)->ldr.LoadCount++;
         TRACE( "found %s for %s at %p, count=%d\n",
@@ -3131,8 +4056,9 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
     if (status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH && !convert_to_pe64( module, image_info ))
         status = STATUS_INVALID_IMAGE_FORMAT;
 #endif
-    if (NT_SUCCESS(status)) status = build_module( load_path, nt_name, &module, image_info, id,
-                                                   flags, system, redirected, pwm );
+    if (NT_SUCCESS(status))
+        status = build_module( load_path, nt_name, &module, image_info, id,
+                               flags, system, redirected, identity_bound, pwm );
     if (status && module) NtUnmapViewOfSection( NtCurrentProcess(), module );
     return status;
 }
@@ -3167,8 +4093,9 @@ static NTSTATUS load_so_dll( LPCWSTR load_path, const UNICODE_STRING *nt_name,
     {
         SECTION_IMAGE_INFORMATION image_info = { 0 };
 
-        if ((status = build_module( load_path, &params.nt_name, &module, &image_info, NULL, flags,
-                                    FALSE, FALSE, &wm )))
+        if ((status = build_module(
+                 load_path, &params.nt_name, &module, &image_info, NULL,
+                 flags, FALSE, FALSE, FALSE, &wm )))
         {
             if (module) NtUnmapViewOfSection( NtCurrentProcess(), module );
             return status;
@@ -3208,8 +4135,8 @@ static WINE_MODREF *build_main_module(void)
 #endif
     status = RtlDosPathNameToNtPathName_U_WithStatus( params->ImagePathName.Buffer, &nt_name, NULL, NULL );
     if (status) goto failed;
-    status = build_module( NULL, &nt_name, &module, &info, NULL, LDR_DONT_RESOLVE_REFS, FALSE,
-                           FALSE, &wm );
+    status = build_module( NULL, &nt_name, &module, &info, NULL,
+                           LDR_DONT_RESOLVE_REFS, FALSE, FALSE, FALSE, &wm );
     if (status) goto failed;
     RtlFreeUnicodeString( &nt_name );
     wm->ldr.LoadCount = -1;
@@ -3491,7 +4418,8 @@ static NTSTATUS switchyard_find_mesa_opengl_dll(
     RtlFreeUnicodeString( &mesa_path );
     if (status) return status;
 
-    status = open_dll_file( nt_name, pwm, mapping, image_info, id );
+    status = open_dll_file(
+        nt_name, pwm, mapping, image_info, id, NULL );
     if (status)
     {
         RtlFreeUnicodeString( nt_name );
@@ -3522,7 +4450,8 @@ static NTSTATUS switchyard_find_gptk_d3dmetal_dll(
 
     RtlAppendUnicodeToString( &gptk_path, pe_dir );
     RtlAppendUnicodeToString( &gptk_path, L"\\d3d12.dll" );
-    status = open_dll_file( &gptk_path, pwm, mapping, image_info, id );
+    status = open_dll_file(
+        &gptk_path, pwm, mapping, image_info, id, NULL );
     if (status)
     {
         RtlFreeUnicodeString( &gptk_path );
@@ -3570,7 +4499,8 @@ static NTSTATUS find_builtin_without_file( const WCHAR *name, UNICODE_STRING *ne
         RtlAppendUnicodeToString( new_name, pe_dir );
         RtlAppendUnicodeToString( new_name, L"\\" );
         RtlAppendUnicodeToString( new_name, name );
-        status = open_dll_file( new_name, pwm, mapping, image_info, id );
+        status = open_dll_file(
+            new_name, pwm, mapping, image_info, id, NULL );
         if (status != STATUS_DLL_NOT_FOUND) goto done;
 
         new_name->Length = len;
@@ -3579,7 +4509,8 @@ static NTSTATUS find_builtin_without_file( const WCHAR *name, UNICODE_STRING *ne
         RtlAppendUnicodeToString( new_name, pe_dir );
         RtlAppendUnicodeToString( new_name, L"\\" );
         RtlAppendUnicodeToString( new_name, name );
-        status = open_dll_file( new_name, pwm, mapping, image_info, id );
+        status = open_dll_file(
+            new_name, pwm, mapping, image_info, id, NULL );
         if (status != STATUS_DLL_NOT_FOUND) goto done;
         RtlFreeUnicodeString( new_name );
     }
@@ -3592,12 +4523,14 @@ static NTSTATUS find_builtin_without_file( const WCHAR *name, UNICODE_STRING *ne
         RtlAppendUnicodeToString( new_name, pe_dir );
         RtlAppendUnicodeToString( new_name, L"\\" );
         RtlAppendUnicodeToString( new_name, name );
-        status = open_dll_file( new_name, pwm, mapping, image_info, id );
+        status = open_dll_file(
+            new_name, pwm, mapping, image_info, id, NULL );
         if (status != STATUS_DLL_NOT_FOUND) goto done;
         new_name->Length = len;
         RtlAppendUnicodeToString( new_name, L"\\" );
         RtlAppendUnicodeToString( new_name, name );
-        status = open_dll_file( new_name, pwm, mapping, image_info, id );
+        status = open_dll_file(
+            new_name, pwm, mapping, image_info, id, NULL );
         if (status == STATUS_NOT_SUPPORTED) found_image = TRUE;
         else if (status != STATUS_DLL_NOT_FOUND) goto done;
         RtlFreeUnicodeString( new_name );
@@ -3618,7 +4551,7 @@ done:
  */
 static NTSTATUS search_dll_file( LPCWSTR paths, LPCWSTR search, UNICODE_STRING *nt_name,
                                  WINE_MODREF **pwm, HANDLE *mapping, SECTION_IMAGE_INFORMATION *image_info,
-                                 struct file_id *id )
+                                 struct file_id *id, BOOL *identity_bound )
 {
     WCHAR *name;
     BOOL found_image = FALSE;
@@ -3648,7 +4581,8 @@ static NTSTATUS search_dll_file( LPCWSTR paths, LPCWSTR search, UNICODE_STRING *
         nt_name->Buffer = NULL;
         if ((status = RtlDosPathNameToNtPathName_U_WithStatus( name, nt_name, NULL, NULL ))) goto done;
 
-        status = open_dll_file( nt_name, pwm, mapping, image_info, id );
+        status = open_dll_file(
+            nt_name, pwm, mapping, image_info, id, identity_bound );
         if (status == STATUS_NOT_SUPPORTED) found_image = TRUE;
         else if (status != STATUS_DLL_NOT_FOUND) goto done;
         RtlFreeUnicodeString( nt_name );
@@ -3669,27 +4603,43 @@ done:
  */
 static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNICODE_STRING *nt_name,
                                WINE_MODREF **pwm, HANDLE *mapping, SECTION_IMAGE_INFORMATION *image_info,
-                               struct file_id *id, BOOL *redirected, BOOL find_loaded )
+                               struct file_id *id, BOOL *redirected,
+                               BOOL *identity_bound, BOOL find_loaded )
 {
+    const BYTE *appx_data = NtCurrentTeb()->Peb->ProcessParameters->
+                            PackageDependencyData;
     WCHAR *fullname = NULL;
     NTSTATUS status;
     ULONG wow64_old_value = 0;
+    BOOL redirected_name = FALSE;
+    BOOL original_has_path = contains_path( libname );
 
     *pwm = NULL;
     *redirected = FALSE;
+    *identity_bound = FALSE;
     nt_name->Buffer = NULL;
 
-    if (!contains_path( libname ))
+    if (!original_has_path)
     {
-        status = switchyard_find_mesa_opengl_dll( libname, nt_name, pwm, mapping,
-                                                  image_info, id );
-        if (!status) return status;
-        if (status != STATUS_DLL_NOT_FOUND) return status;
+        /*
+         * Preserve the existing fast path for unpackaged processes.  A
+         * packaged process must first apply activation-context, loaded-module,
+         * KnownDLL, and package-inventory policy below; otherwise an ambient
+         * Switchyard backend with the same basename could bypass the immutable
+         * package graph.
+         */
+        if (!appx_data)
+        {
+            status = switchyard_find_mesa_opengl_dll(
+                libname, nt_name, pwm, mapping, image_info, id );
+            if (!status) return status;
+            if (status != STATUS_DLL_NOT_FOUND) return status;
 
-        status = switchyard_find_gptk_d3dmetal_dll( libname, nt_name, pwm, mapping,
-                                                    image_info, id );
-        if (!status) return status;
-        if (status != STATUS_DLL_NOT_FOUND) return status;
+            status = switchyard_find_gptk_d3dmetal_dll(
+                libname, nt_name, pwm, mapping, image_info, id );
+            if (!status) return status;
+            if (status != STATUS_DLL_NOT_FOUND) return status;
+        }
 
         status = find_apiset_dll( libname, &fullname );
         if (status == STATUS_DLL_NOT_FOUND) return status;
@@ -3704,17 +4654,152 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
         {
             TRACE ("found %s for %s\n", debugstr_w(fullname), debugstr_w(libname) );
             libname = fullname;
+            redirected_name = TRUE;
         }
         else
         {
+            struct appx_loader_graph graph;
+            const BYTE *record = NULL;
+            WINE_MODREF *loaded;
+            UINT32 basename_length = wcslen( libname );
+
             if (status != STATUS_SXS_KEY_NOT_FOUND) return status;
-            if ((*pwm = find_basename_module( libname ))) return STATUS_SUCCESS;
-            if (find_loaded)
+            loaded = find_basename_module( libname );
+            if (!appx_data)
             {
-                TRACE( "Skipping file search for %s.\n", debugstr_w(libname) );
-                return STATUS_DLL_NOT_FOUND;
+                if ((*pwm = loaded)) return STATUS_SUCCESS;
+                if (find_loaded)
+                {
+                    TRACE( "Skipping file search for %s.\n",
+                           debugstr_w(libname) );
+                    return STATUS_DLL_NOT_FOUND;
+                }
+                if (!open_known_dll( libname, nt_name, pwm, mapping,
+                                     image_info, id ))
+                    return STATUS_SUCCESS;
             }
-            if (!open_known_dll( libname, nt_name, pwm, mapping, image_info, id )) return STATUS_SUCCESS;
+            else
+            {
+                /*
+                 * GetModuleHandle-style queries for the two core loader
+                 * nodes must remain usable even if a same-process graph
+                 * pointer is corrupt.  They are established before package
+                 * policy and are never package-selected; all package-only
+                 * loads below still fail closed on graph validation.
+                 */
+                if (find_loaded && loaded &&
+                    (loaded->ldr.DdagNode == node_ntdll ||
+                     loaded->ldr.DdagNode == node_kernel32))
+                {
+                    *pwm = loaded;
+                    return STATUS_SUCCESS;
+                }
+                status = get_appx_loader_graph( appx_data, &graph );
+                if (!status)
+                    record = appx_find_loader_record(
+                        &graph, libname, basename_length, TRUE, NULL );
+
+                /*
+                 * A loaded module may satisfy a package lookup only when it
+                 * is outside the inventory or has the stable identity named
+                 * by the selected record.  This prevents an ambient preload
+                 * with the same basename from hijacking packaged imports.
+                 */
+                if (!status && loaded)
+                {
+                    if (!record)
+                    {
+                        BOOL inside_root;
+
+                        appx_find_loader_path_record(
+                            &graph, loaded->ldr.FullDllName.Buffer,
+                            loaded->ldr.FullDllName.Length / sizeof(WCHAR),
+                            TRUE, &inside_root );
+                        if (inside_root)
+                        {
+                            WARN( "rejecting unregistered package-root module %s\n",
+                                  debugstr_w(loaded->ldr.FullDllName.Buffer) );
+                            return STATUS_INVALID_IMAGE_HASH;
+                        }
+                        *pwm = loaded;
+                        return STATUS_SUCCESS;
+                    }
+                    else
+                    {
+                        struct appx_loader_identity expected =
+                            appx_get_loader_identity( record );
+
+                        if (loaded->appx_stamp_verified &&
+                            appx_loaded_module_path_matches(
+                                &graph, record, loaded ) &&
+                            appx_file_stamp_matches(
+                                &loaded->id, &expected ))
+                        {
+                            *pwm = loaded;
+                            return STATUS_SUCCESS;
+                        }
+                    }
+                }
+                if (find_loaded)
+                {
+                    TRACE( "Skipping file search for %s.\n",
+                           debugstr_w(libname) );
+                    return status ? status : STATUS_DLL_NOT_FOUND;
+                }
+
+                /*
+                 * KnownDLL remains authoritative even if the graph is
+                 * malformed or an ambient module with that basename was
+                 * loaded first.
+                 */
+                *pwm = NULL;
+                if (!open_known_dll( libname, nt_name, pwm, mapping,
+                                     image_info, id ))
+                    return STATUS_SUCCESS;
+                if (status) return status;
+                if (record)
+                {
+                    if (loaded)
+                    {
+                        WARN( "rejecting ambient module %s for package graph identity\n",
+                              debugstr_w(loaded->ldr.FullDllName.Buffer) );
+                        return STATUS_INVALID_IMAGE_HASH;
+                    }
+                    *identity_bound = TRUE;
+                    return open_appx_loader_record(
+                        &graph, record, nt_name, pwm, mapping, image_info, id );
+                }
+
+                /*
+                 * The graph is valid and contains no record for this
+                 * basename.  Only now may a runtime-selected backend
+                 * participate, ahead of the ordinary ambient path search.
+                 */
+                status = switchyard_find_mesa_opengl_dll(
+                    libname, nt_name, pwm, mapping, image_info, id );
+                if (!status) return status;
+                if (status != STATUS_DLL_NOT_FOUND) return status;
+
+                status = switchyard_find_gptk_d3dmetal_dll(
+                    libname, nt_name, pwm, mapping, image_info, id );
+                if (!status) return status;
+                if (status != STATUS_DLL_NOT_FOUND) return status;
+            }
+        }
+    }
+
+    if (original_has_path && !redirected_name &&
+        appx_data)
+    {
+        BOOL handled;
+
+        status = find_exact_appx_graph_dll(
+            appx_data, libname, nt_name, pwm, mapping, image_info, id,
+            &handled );
+        if (handled)
+        {
+            *identity_bound = TRUE;
+            return status;
         }
     }
 
@@ -3723,12 +4808,15 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
 
     if (RtlDetermineDosPathNameType_U( libname ) == RtlPathTypeRelative)
     {
-        status = search_dll_file( load_path, libname, nt_name, pwm, mapping, image_info, id );
+        status = search_dll_file(
+            load_path, libname, nt_name, pwm, mapping, image_info, id,
+            identity_bound );
         if (status == STATUS_DLL_NOT_FOUND)
             status = find_builtin_without_file( libname, nt_name, pwm, mapping, image_info, id );
     }
     else if (!(status = RtlDosPathNameToNtPathName_U_WithStatus( libname, nt_name, NULL, NULL )))
-        status = open_dll_file( nt_name, pwm, mapping, image_info, id );
+        status = open_dll_file(
+            nt_name, pwm, mapping, image_info, id, identity_bound );
 
     if (status == STATUS_NOT_SUPPORTED) status = STATUS_INVALID_IMAGE_FORMAT;
 
@@ -3751,18 +4839,20 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
     HANDLE mapping = 0;
     SECTION_IMAGE_INFORMATION image_info;
     NTSTATUS nts = STATUS_DLL_NOT_FOUND;
-    BOOL redirected;
+    BOOL identity_bound = FALSE, redirected = FALSE;
     void *prev;
 
     TRACE( "looking for %s in %s\n", debugstr_w(libname), debugstr_w(load_path) );
 
     if (system && system_dll_path.Buffer)
-        nts = search_dll_file( system_dll_path.Buffer, libname, &nt_name, pwm, &mapping, &image_info, &id );
+        nts = search_dll_file(
+            system_dll_path.Buffer, libname, &nt_name, pwm, &mapping,
+            &image_info, &id, &identity_bound );
 
     if (nts)
     {
         nts = find_dll_file( load_path, libname, &nt_name, pwm, &mapping, &image_info, &id,
-                             &redirected, FALSE );
+                             &redirected, &identity_bound, FALSE );
         system = FALSE;
     }
 
@@ -3790,7 +4880,7 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
 
     case STATUS_SUCCESS:  /* valid PE file */
         nts = load_native_dll( load_path, &nt_name, mapping, &image_info, &id, flags, system,
-                               redirected, pwm );
+                               redirected, identity_bound, pwm );
         break;
     }
 
@@ -6519,7 +7609,7 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     void *base = NULL;
     void **copy = NULL;
     SIZE_T size;
-    BOOL assigned;
+    BOOL assigned = FALSE;
 
     if (!object || !vtable || !entries) return NULL;
 
@@ -6560,7 +7650,6 @@ static void **switchyard_clone_com_vtable_for_wrapping( void *object, void **vta
     RtlLeaveCriticalSection( &loader_section );
     if (copy)
     {
-        assigned = FALSE;
         __TRY
         {
             *(void ***)object = copy;
@@ -9798,7 +10887,7 @@ NTSTATUS WINAPI LdrGetDllHandleEx( ULONG flags, LPCWSTR load_path, ULONG *dll_ch
     SECTION_IMAGE_INFORMATION image_info;
     UNICODE_STRING nt_name;
     struct file_id id;
-    BOOL redirected;
+    BOOL identity_bound, redirected;
     NTSTATUS status;
     WINE_MODREF *wm;
     WCHAR *dllname;
@@ -9821,7 +10910,8 @@ NTSTATUS WINAPI LdrGetDllHandleEx( ULONG flags, LPCWSTR load_path, ULONG *dll_ch
     RtlEnterCriticalSection( &loader_section );
 
     status = find_dll_file( load_path, dllname ? dllname : name->Buffer,
-                            &nt_name, &wm, &mapping, &image_info, &id, &redirected, TRUE );
+                            &nt_name, &wm, &mapping, &image_info, &id,
+                            &redirected, &identity_bound, TRUE );
 
     if (wm) *base = wm->ldr.DllBase;
     else
@@ -10768,6 +11858,12 @@ void loader_init( CONTEXT *context, void **entry )
 
         actctx_init();
         locale_init();
+        /*
+         * Early core-DLL imports use the pre-locale ASCII fallback in
+         * RtlCompareUnicodeStrings().  Revalidate before resolving the main
+         * image's imports so the immutable cache uses the full Unicode table.
+         */
+        appx_loader_graph_cache.initialized = FALSE;
         if (needs_elevation())
             elevate_token();
         get_env_var( L"WINESYSTEMDLLPATH", 0, &system_dll_path );

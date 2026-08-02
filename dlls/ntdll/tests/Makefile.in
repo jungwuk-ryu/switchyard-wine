@@ -1,6 +1,8 @@
 TESTDLL   = ntdll.dll
 IMPORTS   = user32 advapi32
 
+package_importer_IMPORTS = version
+
 SOURCES = \
 	alpc.c \
 	atom.c \
@@ -17,6 +19,12 @@ SOURCES = \
 	libcef.spec \
 	loader.c \
 	om.c \
+	package_forwarder.c \
+	package_forwarder.spec \
+	package_importer.c \
+	package_importer.spec \
+	package_target.c \
+	package_target.spec \
 	path.c \
 	pipe.c \
 	port.c \

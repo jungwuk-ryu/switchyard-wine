@@ -2772,6 +2772,12 @@ unsigned int get_fd_options( struct fd *fd )
     return fd->options;
 }
 
+/* retrieve the sharing mode for the fd */
+unsigned int get_fd_sharing( struct fd *fd )
+{
+    return fd->sharing;
+}
+
 /* retrieve the completion flags for the fd */
 unsigned int get_fd_comp_flags( struct fd *fd )
 {
