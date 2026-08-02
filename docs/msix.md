@@ -1,9 +1,109 @@
 # MSIX and Packaged Desktop Support
 
-This document describes the MSIX behavior that is implemented in Switchyard
-Wine. It is not a promise of complete Windows package compatibility. An
-application is compatible only after its exact package and runtime revision
-have been tested and recorded in `docs/compatibility.md`.
+Switchyard Wine implements a signed, per-prefix deployment path for full-trust
+desktop MSIX/AppX packages. It can inspect and unpack packages, maintain a
+transactional package store, provide package identity and static dependencies
+to a process, and launch declared Win32 or WinUI 3 applications.
+
+This is not a Microsoft Store client, a UWP/AppContainer implementation, or a
+promise of complete Windows package compatibility. `wineappx` and its store
+format are Switchyard-specific interfaces; they are not WineHQ or Microsoft
+deployment interfaces. Use `wineappx`, `appxsvc.dll`, and the rest of the Wine
+runtime from the same Switchyard build.
+
+An application is compatible only after its exact package and runtime revision
+have been tested and recorded in [`docs/compatibility.md`](compatibility.md).
+
+## Before you start
+
+- Use the same `WINEPREFIX` for package deployment and application launch. A
+  package installed in one prefix is not visible in another prefix.
+- Obtain the package independently and lawfully. Switchyard Wine does not
+  purchase, download, license, decrypt, or update applications through the
+  Microsoft Store.
+- The input must be a signed, unencrypted MSIX/AppX package or a supported
+  app-only bundle. The signer chain must validate through the certificate
+  stores visible to the Wine prefix; there is no unsigned-package bypass.
+- Ensure that the selected package architecture is runnable by the current
+  Wine runtime. `--arch` selects a bundle payload but does not emulate a CPU.
+- Install required standalone framework packages before launching the main
+  package. Static dependencies are resolved from the selected store; the CLI
+  does not accept a dependency-package list on an application install.
+- Reserve enough free space for the archive, expanded payload, staging data,
+  and the configured free-space floor. The default floor is 2 GiB.
+- Do not edit the deployment store, payload directories, catalog, records, or
+  lease files by hand. Use `wineappx remove`, `recover`, and `gc`.
+
+Run `wine wineappx --help` for the command summary or `man wineappx` when the
+manual page is installed. All options must appear before the command. See
+[`docs/building.md`](building.md) when producing the runtime from source.
+
+## Quick start
+
+The examples below use a POSIX shell and a Wine runtime on `PATH`. Switchyard's
+application normally supplies `WINEPREFIX`; direct command-line users should
+set it explicitly. `winepath` converts host paths into paths visible to Wine.
+
+```sh
+export WINEPREFIX="/path/to/prefix"
+package="$(winepath -w "/path/to/Publisher.App.msix")"
+
+wine wineappx inspect "$package"
+wine wineappx initialize
+wine wineappx install "$package"
+wine wineappx list
+```
+
+`inspect`, `install`, and `list` print stable `key=value` records. Copy the
+exact `package_full_name` and application `id` from that output when launching:
+
+```sh
+wine wineappx --wait launch \
+  'Publisher.App_1.2.3.4_x64__publisherid' \
+  'App'
+```
+
+`--wait` makes `wineappx` wait for the application and return the application's
+exit status. Without it, a successful launch returns after process creation.
+
+Inspect and then update with a newer package from the same family:
+
+```sh
+update_package="$(winepath -w "/path/to/Publisher.App-2.0.msix")"
+wine wineappx inspect "$update_package"
+wine wineappx update "$update_package"
+wine wineappx list
+```
+
+A lower-version update is rejected by default. When a deliberate rollback is
+required, put the option before the command:
+
+```sh
+wine wineappx --allow-downgrade update "$package"
+```
+
+Remove the exact active package full name shown by `list`, then collect any
+unreferenced generations that are no longer leased by running processes:
+
+```sh
+wine wineappx remove 'Publisher.App_2.0.0.0_x64__publisherid'
+wine wineappx gc
+```
+
+To verify and extract without installing, choose a destination that does not
+already exist:
+
+```sh
+destination="$(winepath -w "/path/to/new-unpack-directory")"
+wine wineappx unpack "$package" "$destination"
+```
+
+After an interrupted deployment, run recovery before retrying the operation:
+
+```sh
+wine wineappx recover
+wine wineappx gc
+```
 
 ## Current scope
 
@@ -85,7 +185,22 @@ C:\Program Files\WindowsApps\.wine-msix-store
 ```
 
 `wineappx --store` can select another drive-absolute store path. The public
-`PackageManager` projection always uses the default path.
+`PackageManager` projection always uses the default path. A custom store is
+visible only to `wineappx` commands that repeat the same `--store` option; it
+does not change the public projection's store. The Windows path is resolved
+inside the active Wine prefix, not in the host's `/Program Files` directory.
+
+Treat a store as opaque state owned by one prefix. Do not share one store
+between prefixes, replace `catalog.bin`, copy payload generations into it, or
+remove lease files manually. For a consistent offline backup or restore, stop
+every Wine process using the prefix and copy the complete prefix or complete
+custom store. A live file-by-file copy is not a supported snapshot mechanism.
+
+Keep the strict durability default for normal use. If the host filesystem
+cannot flush directory metadata, deployment fails unless
+`--accept-weak-durability` is supplied. Weak durability preserves atomic
+visibility during normal operation but may lose the latest committed mutation
+after sudden power loss or a host crash.
 
 The implemented store contains:
 
@@ -253,31 +368,78 @@ dependencies.
 
 ## Command-line contract
 
-`wineappx` currently provides:
+`wineappx` currently provides the following commands:
 
-```text
-inspect PACKAGE
-unpack PACKAGE DESTINATION
-initialize
-install PACKAGE
-update PACKAGE
-remove PACKAGE_FULL_NAME
-query PACKAGE_FULL_NAME
-list
-launch PACKAGE_FULL_NAME APP_ID
-recover
-gc
-```
+| Command | Result |
+| --- | --- |
+| `inspect PACKAGE` | Verify and describe a package or supported bundle. |
+| `unpack PACKAGE DESTINATION` | Verify and extract into a new directory. |
+| `initialize` | Create or validate the selected deployment store. |
+| `install PACKAGE` | Install a new package-family generation. |
+| `update PACKAGE` | Replace an installed family with a valid update. |
+| `remove PACKAGE_FULL_NAME` | Remove one exact active package. |
+| `query PACKAGE_FULL_NAME` | Query one exact installed package. |
+| `list` | List installed packages and declared applications. |
+| `launch PACKAGE_FULL_NAME APP_ID` | Launch one declared full-trust app. |
+| `recover` | Reconcile interrupted store transactions. |
+| `gc` | Reclaim a bounded set of unpublished generations. |
+
+The most important options are:
+
+| Option | Scope and behavior |
+| --- | --- |
+| `--store PATH` | Use a drive-absolute custom store for this command. |
+| `--arch ARCH` | Select `neutral`, `x86`, `x64`, `arm`, `arm64`, or `x86a64`. |
+| `--allow-downgrade` | Permit a lower-version `update`; rejected elsewhere. |
+| `--wait` | Wait for `launch` and return the child status; rejected elsewhere. |
+| `--accept-weak-durability` | Accept atomic visibility without a guaranteed directory flush. |
+| `--max-archive BYTES` | Set the archive cap; default 32 GiB, maximum 128 GiB. |
+| `--max-expanded BYTES` | Set the expanded cap; default 16 GiB, maximum 64 GiB. |
+| `--free-space-floor BYTES` | Preserve free space; default 2 GiB. |
+
+Byte limits accept a positive decimal value with an optional binary `K`, `M`,
+`G`, or `T` suffix; `KiB`, `MiB`, `GiB`, and `TiB` forms are also accepted.
+Options must precede the command. Use `--` to end option processing when a
+package path begins with a hyphen.
 
 Successful standard output is stable escaped `key=value` data. Diagnostics are
-written to standard error. There is no JSON output mode, JSON registration
-format, or loose-registration command.
+written to standard error. Split a record at the first `=` and unescape the
+value; repeated records use zero-based keys such as
+`package[0].application[1].id`. Backslash, tab, carriage return, line feed, and
+other control code units are escaped. There is no JSON output mode, JSON
+registration format, or loose-registration command.
 
-The helper also exposes store, target-architecture, downgrade, weak-durability,
-archive-size, expanded-size, free-space-floor, and launch-wait options. These
-are private helper controls, not additional public Windows deployment APIs.
+Exit status `0` means success, `1` means verification or operation failure,
+`2` means invalid command usage, and `3` means the private `appxsvc` API does
+not match the `wineappx` executable. `launch --wait` instead returns the child
+process's exit status and prints it as `process_exit_code`.
 
-## Security boundary
+These commands and options are private helper controls, not additional public
+Windows deployment APIs or a compatibility layer for PowerShell's Appx
+cmdlets.
+
+## Troubleshooting and support data
+
+- If inspection or deployment exits with status `1`, read standard error and
+  run `inspect` separately. A package may be well-formed but unsupported, have
+  an untrusted signer chain, fail a signed digest or block-map check, select no
+  compatible bundle payload, or exceed a configured limit.
+- If an operation was interrupted, run `recover`, then `gc`, before retrying.
+  Do not delete transaction, staging, quarantine, or pending-catalog files.
+- If launch cannot find a package or application, use `list` or `query` and
+  pass the exact active package full name and case-sensitive application ID.
+- Exit status `3` normally means components from different Switchyard builds
+  were mixed. Replace the entire runtime instead of copying one DLL or EXE.
+- Reproduce a suspected package-runtime defect in a fresh prefix when
+  practical. Existing prefix policy or catalog state may be material.
+
+A useful issue report includes the Switchyard Wine commit, host and runtime
+architectures, whether the prefix was fresh, the exact command, exit status,
+standard error, and the non-sensitive `inspect` output. Do not publish package
+files, private signing material, license data, or proprietary payloads unless
+you are authorized to do so.
+
+## Trust and isolation boundary
 
 The implementation assumes one trusted Unix user owns and operates a Wine
 prefix. The private deployment code runs with that user's normal host
@@ -317,5 +479,5 @@ executable must still be runnable by the current Wine prefix and host runtime.
 
 Unit and conformance tests establish API and trust-boundary behavior, not
 application compatibility. Record an application result in
-`docs/compatibility.md` only after testing the exact package, Switchyard Wine
-revision, host environment, and launch path.
+[`docs/compatibility.md`](compatibility.md) only after testing the exact
+package, Switchyard Wine revision, host environment, and launch path.
