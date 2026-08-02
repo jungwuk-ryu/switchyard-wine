@@ -17,6 +17,7 @@
  */
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #define COBJMACROS
 #include "initguid.h"
@@ -1688,104 +1689,1280 @@ static void test_feature_level_reporting(void)
     ID3D12Device_Release(device);
 }
 
-static void test_shader_cache_session(void)
+static void init_shader_cache_desc(D3D12_SHADER_CACHE_SESSION_DESC *desc,
+        unsigned int identifier, D3D12_SHADER_CACHE_MODE mode, UINT64 version)
 {
-    static const GUID cache_identifier =
+    static const GUID base_identifier =
             {0x8b1a56f2, 0xe984, 0x49d7, {0x82, 0xe7, 0x59, 0xd7, 0xe9, 0xda, 0x31, 0x41}};
-    static const char key[] = "shader";
-    static const UINT expected = 0x12345678;
-    D3D12_SHADER_CACHE_SESSION_DESC desc;
-    ID3D12ShaderCacheSession *session2;
-    ID3D12ShaderCacheSession *session;
-    ID3D12Device9 *device9;
-    ID3D12Device *device;
-    UINT value, value_size;
-    ULONG refcount;
+
+    memset(desc, 0, sizeof(*desc));
+    desc->Identifier = base_identifier;
+    desc->Identifier.Data1 += identifier;
+    desc->Mode = mode;
+    desc->Version = version;
+    if (mode == D3D12_SHADER_CACHE_MODE_DISK)
+        desc->Flags = D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR;
+}
+
+static BOOL get_shader_cache_device(ID3D12Device **device, ID3D12Device9 **device9)
+{
     HRESULT hr;
 
-    if (!(device = create_device()))
+    *device9 = NULL;
+    if (!(*device = create_device()))
     {
         skip("Failed to create device.\n");
-        return;
+        return FALSE;
     }
 
-    hr = ID3D12Device_QueryInterface(device, &IID_ID3D12Device9, (void **)&device9);
+    hr = ID3D12Device_QueryInterface(*device, &IID_ID3D12Device9, (void **)device9);
     if (hr == E_NOINTERFACE)
     {
         win_skip("ID3D12Device9 is not supported.\n");
-        ID3D12Device_Release(device);
-        return;
+        ID3D12Device_Release(*device);
+        *device = NULL;
+        return FALSE;
     }
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
     if (FAILED(hr))
     {
-        ID3D12Device_Release(device);
+        ID3D12Device_Release(*device);
+        *device = NULL;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static HRESULT create_shader_cache_session_(unsigned int line, ID3D12Device9 *device,
+        const D3D12_SHADER_CACHE_SESSION_DESC *desc, ID3D12ShaderCacheSession **session)
+{
+    HRESULT hr;
+
+    *session = NULL;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, desc,
+            &IID_ID3D12ShaderCacheSession, (void **)session);
+    ok_(__FILE__, line)(hr == S_OK, "Failed to create shader cache session, hr %#lx.\n", hr);
+    return hr;
+}
+#define create_shader_cache_session(a, b, c) create_shader_cache_session_(__LINE__, a, b, c)
+
+static void check_shader_cache_defaults(ID3D12ShaderCacheSession *session,
+        const D3D12_SHADER_CACHE_SESSION_DESC *desc)
+{
+    D3D12_SHADER_CACHE_SESSION_DESC actual;
+
+    actual = ID3D12ShaderCacheSession_GetDesc(session);
+    ok(IsEqualGUID(&actual.Identifier, &desc->Identifier), "Got unexpected identifier.\n");
+    ok(actual.Mode == desc->Mode, "Got unexpected mode %#x.\n", actual.Mode);
+    ok(actual.Flags == desc->Flags, "Got unexpected flags %#x.\n", actual.Flags);
+    ok(actual.MaximumInMemoryCacheSizeBytes == 1024,
+            "Got unexpected memory size %u.\n", actual.MaximumInMemoryCacheSizeBytes);
+    ok(actual.MaximumInMemoryCacheEntries == 128,
+            "Got unexpected memory entry count %u.\n", actual.MaximumInMemoryCacheEntries);
+    ok(actual.MaximumValueFileSizeBytes == 128 * 1024 * 1024,
+            "Got unexpected maximum value file size %u.\n", actual.MaximumValueFileSizeBytes);
+    ok(actual.Version == desc->Version, "Got unexpected version %#I64x.\n", actual.Version);
+}
+
+static void check_shader_cache_value_(unsigned int line, ID3D12ShaderCacheSession *session,
+        const char *key, UINT key_size, UINT expected)
+{
+    UINT value, value_size;
+    HRESULT hr;
+
+    value_size = 0;
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, key_size, NULL, &value_size);
+    ok_(__FILE__, line)(hr == S_OK, "Failed to query shader cache value size, hr %#lx.\n", hr);
+    ok_(__FILE__, line)(value_size == sizeof(value), "Got value size %u.\n", value_size);
+
+    value = 0;
+    value_size = sizeof(value);
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, key_size, &value, &value_size);
+    ok_(__FILE__, line)(hr == S_OK, "Failed to find shader cache value, hr %#lx.\n", hr);
+    ok_(__FILE__, line)(value_size == sizeof(value), "Got value size %u.\n", value_size);
+    ok_(__FILE__, line)(value == expected, "Got value %#x, expected %#x.\n", value, expected);
+}
+#define check_shader_cache_value(a, b, c, d) check_shader_cache_value_(__LINE__, a, b, c, d)
+
+static void check_shader_cache_find_small_buffer(ID3D12ShaderCacheSession *session,
+        const char *key, UINT key_size)
+{
+    UINT value, value_size;
+    HRESULT hr;
+
+    value = 0xdeadbeef;
+    value_size = sizeof(value) - 1;
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, key_size, &value, &value_size);
+    todo_wine_if(hr != DXGI_ERROR_MORE_DATA)
+    ok(hr == DXGI_ERROR_MORE_DATA, "Got unexpected hr %#lx.\n", hr);
+    ok(value_size == sizeof(value), "Got value size %u.\n", value_size);
+}
+
+struct shader_cache_working_dir
+{
+    char path[MAX_PATH];
+    char old_path[MAX_PATH];
+    BOOL active;
+};
+
+static void remove_directory_tree(const char *path)
+{
+    WIN32_FIND_DATAA data;
+    char search[MAX_PATH];
+    char child[MAX_PATH];
+    HANDLE find;
+
+    if (strlen(path) + 3 >= ARRAY_SIZE(search))
+        return;
+    strcpy(search, path);
+    strcat(search, "\\*");
+
+    find = FindFirstFileA(search, &data);
+    if (find != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (!strcmp(data.cFileName, ".") || !strcmp(data.cFileName, ".."))
+                continue;
+            if (strlen(path) + strlen(data.cFileName) + 2 >= ARRAY_SIZE(child))
+                continue;
+            strcpy(child, path);
+            strcat(child, "\\");
+            strcat(child, data.cFileName);
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            {
+                if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    RemoveDirectoryA(child);
+                else
+                    DeleteFileA(child);
+            }
+            else if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                SetFileAttributesA(child, FILE_ATTRIBUTE_NORMAL);
+                remove_directory_tree(child);
+                RemoveDirectoryA(child);
+            }
+            else
+            {
+                SetFileAttributesA(child, FILE_ATTRIBUTE_NORMAL);
+                DeleteFileA(child);
+            }
+        } while (FindNextFileA(find, &data));
+        FindClose(find);
+    }
+
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+    RemoveDirectoryA(path);
+}
+
+static BOOL shader_cache_working_dir_init(struct shader_cache_working_dir *dir)
+{
+    char temp_path[MAX_PATH];
+    DWORD len;
+
+    dir->active = FALSE;
+    len = GetCurrentDirectoryA(ARRAY_SIZE(dir->old_path), dir->old_path);
+    ok(len && len < ARRAY_SIZE(dir->old_path), "Failed to get current directory, error %lu.\n", GetLastError());
+    if (!len || len >= ARRAY_SIZE(dir->old_path))
+        return FALSE;
+
+    len = GetTempPathA(ARRAY_SIZE(temp_path), temp_path);
+    ok(len && len < ARRAY_SIZE(temp_path), "Failed to get temporary directory, error %lu.\n", GetLastError());
+    if (!len || len >= ARRAY_SIZE(temp_path))
+        return FALSE;
+
+    if (!GetTempFileNameA(temp_path, "d3d", 0, dir->path))
+    {
+        ok(FALSE, "Failed to get temporary filename, error %lu.\n", GetLastError());
+        return FALSE;
+    }
+    DeleteFileA(dir->path);
+    if (!CreateDirectoryA(dir->path, NULL))
+    {
+        ok(FALSE, "Failed to create temporary directory, error %lu.\n", GetLastError());
+        return FALSE;
+    }
+    if (!SetCurrentDirectoryA(dir->path))
+    {
+        ok(FALSE, "Failed to change current directory, error %lu.\n", GetLastError());
+        remove_directory_tree(dir->path);
+        return FALSE;
+    }
+
+    dir->active = TRUE;
+    return TRUE;
+}
+
+static void shader_cache_working_dir_cleanup(struct shader_cache_working_dir *dir);
+
+static void check_shader_cache_reparse_root(ID3D12Device9 *device, unsigned int identifier)
+{
+    struct shader_cache_working_dir dir;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    char outside[MAX_PATH], temp_path[MAX_PATH], sentinel[MAX_PATH];
+    HANDLE file;
+    HRESULT hr;
+
+    if (!shader_cache_working_dir_init(&dir))
+        return;
+    if (!GetTempPathA(ARRAY_SIZE(temp_path), temp_path)
+            || !GetTempFileNameA(temp_path, "d3o", 0, outside))
+    {
+        shader_cache_working_dir_cleanup(&dir);
+        return;
+    }
+    DeleteFileA(outside);
+    if (!CreateDirectoryA(outside, NULL))
+    {
+        shader_cache_working_dir_cleanup(&dir);
+        return;
+    }
+    sprintf(sentinel, "%s\\sentinel", outside);
+    file = CreateFileA(sentinel, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    ok(file != INVALID_HANDLE_VALUE, "Failed to create sentinel, error %lu.\n", GetLastError());
+    if (file != INVALID_HANDLE_VALUE)
+        CloseHandle(file);
+
+    if (!CreateSymbolicLinkA("vkd3d-cache", outside, SYMBOLIC_LINK_FLAG_DIRECTORY))
+    {
+        win_skip("Cannot create directory symlink, error %lu.\n", GetLastError());
+        shader_cache_working_dir_cleanup(&dir);
+        DeleteFileA(sentinel);
+        RemoveDirectoryA(outside);
         return;
     }
 
-    memset(&desc, 0, sizeof(desc));
-    desc.Identifier = cache_identifier;
-    desc.Mode = D3D12_SHADER_CACHE_MODE_MEMORY;
-    desc.MaximumInMemoryCacheSizeBytes = 1024;
-    desc.MaximumInMemoryCacheEntries = 8;
-    desc.Version = 1;
-
-    session = NULL;
-    hr = ID3D12Device9_CreateShaderCacheSession(device9, &desc,
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_DISK, 1);
+    session = (ID3D12ShaderCacheSession *)0xdeadbeef;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
             &IID_ID3D12ShaderCacheSession, (void **)&session);
-    ok(hr == S_OK, "Failed to create shader cache session, hr %#lx.\n", hr);
+    ok(FAILED(hr), "Unsafe reparse cache root opened, hr %#lx.\n", hr);
+    ok(!session, "Got unexpected session %p.\n", session);
+    ok(GetFileAttributesA(sentinel) != INVALID_FILE_ATTRIBUTES,
+            "Cache root escape modified the sentinel, error %lu.\n", GetLastError());
+
+    shader_cache_working_dir_cleanup(&dir);
+    DeleteFileA(sentinel);
+    RemoveDirectoryA(outside);
+}
+
+static void shader_cache_working_dir_cleanup(struct shader_cache_working_dir *dir)
+{
+    if (!dir->active)
+        return;
+    ok(SetCurrentDirectoryA(dir->old_path), "Failed to restore current directory, error %lu.\n", GetLastError());
+    remove_directory_tree(dir->path);
+    dir->active = FALSE;
+}
+
+struct shader_cache_thread_data
+{
+    ID3D12Device9 *device;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    HANDLE start_event;
+    HRESULT create_hr;
+    HRESULT store_hr;
+    char key[32];
+    UINT value;
+};
+
+static DWORD WINAPI shader_cache_store_thread(void *arg)
+{
+    struct shader_cache_thread_data *data = arg;
+    ID3D12ShaderCacheSession *session;
+
+    WaitForSingleObject(data->start_event, INFINITE);
+    data->create_hr = ID3D12Device9_CreateShaderCacheSession(data->device, &data->desc,
+            &IID_ID3D12ShaderCacheSession, (void **)&session);
+    if (SUCCEEDED(data->create_hr))
+    {
+        data->store_hr = ID3D12ShaderCacheSession_StoreValue(session, data->key,
+                strlen(data->key) + 1, &data->value, sizeof(data->value));
+        ID3D12ShaderCacheSession_Release(session);
+    }
+    return 0;
+}
+
+static void check_shader_cache_thread_race(ID3D12Device9 *device, D3D12_SHADER_CACHE_MODE mode,
+        unsigned int identifier, BOOL duplicate_keys)
+{
+    static const unsigned int thread_count = 8;
+    struct shader_cache_thread_data data[8];
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    unsigned int i, success_count;
+    HANDLE threads[8], start_event;
+    BOOL all_threads_created;
+    DWORD wait;
+    UINT value, value_size;
+    HRESULT hr;
+
+    ok(thread_count == ARRAY_SIZE(data), "Unexpected thread count.\n");
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
     if (FAILED(hr))
-        goto done;
+        return;
 
-    hr = ID3D12ShaderCacheSession_StoreValue(session,
-            key, sizeof(key), &expected, sizeof(expected));
-    ok(hr == S_OK, "Failed to store shader cache value, hr %#lx.\n", hr);
-    hr = ID3D12ShaderCacheSession_StoreValue(session,
-            key, sizeof(key), &expected, sizeof(expected));
-    ok(hr == DXGI_ERROR_ALREADY_EXISTS, "Got unexpected hr %#lx.\n", hr);
+    start_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    ok(!!start_event, "Failed to create event, error %lu.\n", GetLastError());
+    if (!start_event)
+    {
+        ID3D12ShaderCacheSession_Release(session);
+        return;
+    }
 
-    value_size = 0;
-    hr = ID3D12ShaderCacheSession_FindValue(session,
-            key, sizeof(key), NULL, &value_size);
-    ok(hr == S_OK, "Failed to query shader cache value size, hr %#lx.\n", hr);
-    ok(value_size == sizeof(value), "Got value size %u.\n", value_size);
-    value = 0;
-    hr = ID3D12ShaderCacheSession_FindValue(session,
-            key, sizeof(key), &value, &value_size);
-    ok(hr == S_OK, "Failed to find shader cache value, hr %#lx.\n", hr);
-    ok(value == expected, "Got value %#x, expected %#x.\n", value, expected);
+    all_threads_created = TRUE;
+    for (i = 0; i < thread_count; ++i)
+    {
+        memset(&data[i], 0, sizeof(data[i]));
+        data[i].device = device;
+        data[i].start_event = start_event;
+        data[i].desc = desc;
+        if (duplicate_keys)
+            strcpy(data[i].key, "thread-duplicate");
+        else
+            sprintf(data[i].key, "thread-%u", i);
+        data[i].value = 0x1000 + i;
+        data[i].create_hr = E_FAIL;
+        data[i].store_hr = E_FAIL;
+        threads[i] = CreateThread(NULL, 0, shader_cache_store_thread, &data[i], 0, NULL);
+        ok(!!threads[i], "Failed to create thread %u, error %lu.\n", i, GetLastError());
+        if (!threads[i])
+            all_threads_created = FALSE;
+    }
 
-    session2 = NULL;
-    hr = ID3D12Device9_CreateShaderCacheSession(device9, &desc,
-            &IID_ID3D12ShaderCacheSession, (void **)&session2);
-    ok(hr == S_OK, "Failed to open shared shader cache session, hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
+    if (!all_threads_created)
+    {
+        SetEvent(start_event);
+        for (i = 0; i < thread_count; ++i)
+        {
+            if (threads[i])
+            {
+                wait = WaitForSingleObject(threads[i], 10000);
+                ok(wait == WAIT_OBJECT_0, "%u: Got unexpected wait result %#lx.\n", i, wait);
+                CloseHandle(threads[i]);
+            }
+        }
+        CloseHandle(start_event);
+        ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+        ID3D12ShaderCacheSession_Release(session);
+        return;
+    }
+
+    SetEvent(start_event);
+    wait = WaitForMultipleObjects(thread_count, threads, TRUE, 10000);
+    ok(wait == WAIT_OBJECT_0, "Got unexpected wait result %#lx.\n", wait);
+    if (wait != WAIT_OBJECT_0)
+    {
+        /* The thread arguments are stack-backed. Do not force termination and
+         * allow a worker to outlive them after a transiently slow run. */
+        WaitForMultipleObjects(thread_count, threads, TRUE, INFINITE);
+        for (i = 0; i < thread_count; ++i)
+            CloseHandle(threads[i]);
+        CloseHandle(start_event);
+        ID3D12ShaderCacheSession_Release(session);
+        return;
+    }
+
+    for (i = 0; i < thread_count; ++i)
+    {
+        if (threads[i])
+            CloseHandle(threads[i]);
+    }
+    CloseHandle(start_event);
+
+    success_count = 0;
+    for (i = 0; i < thread_count; ++i)
+    {
+        ok(data[i].create_hr == S_OK, "%u: Got unexpected create hr %#lx.\n", i, data[i].create_hr);
+        if (duplicate_keys)
+        {
+            ok(data[i].store_hr == S_OK || data[i].store_hr == DXGI_ERROR_ALREADY_EXISTS,
+                    "%u: Got unexpected store hr %#lx.\n", i, data[i].store_hr);
+            if (data[i].store_hr == S_OK)
+                ++success_count;
+        }
+        else
+        {
+            ok(data[i].store_hr == S_OK, "%u: Got unexpected store hr %#lx.\n", i, data[i].store_hr);
+        }
+    }
+    if (duplicate_keys)
+        ok(success_count == 1, "Got %u successful duplicate stores.\n", success_count);
+
+    if (duplicate_keys)
     {
         value = 0;
         value_size = sizeof(value);
-        hr = ID3D12ShaderCacheSession_FindValue(session2,
-                key, sizeof(key), &value, &value_size);
-        ok(hr == S_OK, "Failed to find shared shader cache value, hr %#lx.\n", hr);
-        ok(value == expected, "Got value %#x, expected %#x.\n", value, expected);
-        ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
-        ID3D12ShaderCacheSession_Release(session2);
+        hr = ID3D12ShaderCacheSession_FindValue(session, data[0].key, strlen(data[0].key) + 1, &value, &value_size);
+        ok(hr == S_OK, "Failed to find duplicate race value, hr %#lx.\n", hr);
+        ok(value >= 0x1000 && value < 0x1000 + thread_count, "Got unexpected value %#x.\n", value);
     }
-    ID3D12ShaderCacheSession_Release(session);
+    else
+    {
+        for (i = 0; i < thread_count; ++i)
+            check_shader_cache_value(session, data[i].key, strlen(data[i].key) + 1, data[i].value);
+    }
 
-    session = NULL;
-    hr = ID3D12Device9_CreateShaderCacheSession(device9, &desc,
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_common_contract(ID3D12Device9 *device,
+        D3D12_SHADER_CACHE_MODE mode, unsigned int identifier)
+{
+    static const char key[] = "shader";
+    static const char missing_key[] = "missing";
+    static const UINT expected = 0x12345678;
+    static const UINT replacement = 0x87654321;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    HRESULT hr;
+    UINT value_size;
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+
+    value_size = 0;
+    hr = ID3D12ShaderCacheSession_FindValue(session, missing_key, sizeof(missing_key), NULL, &value_size);
+    ok(hr == DXGI_ERROR_NOT_FOUND, "Got unexpected hr %#lx.\n", hr);
+
+    hr = ID3D12ShaderCacheSession_StoreValue(session, key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store shader cache value, hr %#lx.\n", hr);
+    hr = ID3D12ShaderCacheSession_StoreValue(session, key, sizeof(key), &replacement, sizeof(replacement));
+    ok(hr == DXGI_ERROR_ALREADY_EXISTS, "Got unexpected hr %#lx.\n", hr);
+
+    check_shader_cache_value(session, key, sizeof(key), expected);
+    check_shader_cache_find_small_buffer(session, key, sizeof(key));
+
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_process_identity(ID3D12Device9 *device, unsigned int identifier)
+{
+    static const char key[] = "shared-identifier";
+    static const UINT expected = 0x9abcdef0;
+    D3D12_SHADER_CACHE_SESSION_DESC desc, desc2, actual;
+    ID3D12ShaderCacheSession *session, *session2;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_MEMORY, 7);
+    desc.MaximumInMemoryCacheSizeBytes = 4096;
+    desc.MaximumInMemoryCacheEntries = 16;
+    desc.MaximumValueFileSizeBytes = 64;
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+
+    desc2 = desc;
+    desc2.Mode = D3D12_SHADER_CACHE_MODE_DISK;
+    desc2.Flags = D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED
+            | D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR;
+    desc2.MaximumInMemoryCacheSizeBytes = 8192;
+    desc2.MaximumInMemoryCacheEntries = 32;
+    desc2.MaximumValueFileSizeBytes = 128;
+    hr = create_shader_cache_session(device, &desc2, &session2);
+    if (FAILED(hr))
+    {
+        ID3D12ShaderCacheSession_Release(session);
+        return;
+    }
+
+    actual = ID3D12ShaderCacheSession_GetDesc(session2);
+    ok(actual.Mode == desc.Mode, "Got unexpected shared mode %#x.\n", actual.Mode);
+    ok(actual.Flags == desc.Flags, "Got unexpected shared flags %#x.\n", actual.Flags);
+    ok(actual.MaximumInMemoryCacheSizeBytes == desc.MaximumInMemoryCacheSizeBytes,
+            "Got unexpected shared memory size %u.\n", actual.MaximumInMemoryCacheSizeBytes);
+    ok(actual.MaximumInMemoryCacheEntries == desc.MaximumInMemoryCacheEntries,
+            "Got unexpected shared entry count %u.\n", actual.MaximumInMemoryCacheEntries);
+    ok(actual.MaximumValueFileSizeBytes == desc.MaximumValueFileSizeBytes,
+            "Got unexpected shared file size %u.\n", actual.MaximumValueFileSizeBytes);
+
+    hr = ID3D12ShaderCacheSession_StoreValue(session,
+            key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store shared value, hr %#lx.\n", hr);
+    check_shader_cache_value(session2, key, sizeof(key), expected);
+
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session2);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_invalid_arguments(ID3D12Device9 *device, unsigned int identifier)
+{
+    static const GUID guid_null;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    UINT value = 0x12345678, value_size;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+
+    session = (ID3D12ShaderCacheSession *)0xdeadbeef;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, NULL,
             &IID_ID3D12ShaderCacheSession, (void **)&session);
-    ok(hr == S_OK, "Failed to recreate shader cache session, hr %#lx.\n", hr);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    desc.Identifier = guid_null;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12ShaderCacheSession, (void **)&session);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+    desc.Mode = 0x7fffffff;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12ShaderCacheSession, (void **)&session);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+    desc.Flags = 0x80000000;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12ShaderCacheSession, (void **)&session);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+    desc.MaximumValueFileSizeBytes = 1024 * 1024 * 1024u + 1;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12ShaderCacheSession, (void **)&session);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12ShaderCacheSession, NULL);
+    ok(hr == S_FALSE, "Got unexpected hr %#lx.\n", hr);
+
+    init_shader_cache_desc(&desc, identifier + 1, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+    desc.MaximumValueFileSizeBytes = 1024 * 1024 * 1024u;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12ShaderCacheSession, (void **)&session);
+    ok(hr == S_OK, "Maximum valid file size failed, hr %#lx.\n", hr);
     if (SUCCEEDED(hr))
+        ID3D12ShaderCacheSession_Release(session);
+
+    init_shader_cache_desc(&desc, identifier + 2, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+    session = (ID3D12ShaderCacheSession *)0xdeadbeef;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12Device, (void **)&session);
+    ok(hr == E_NOINTERFACE, "Got unexpected interface hr %#lx.\n", hr);
+    ok(!session, "Got unexpected session %p.\n", session);
+
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+
+    value_size = sizeof(value);
+    hr = ID3D12ShaderCacheSession_FindValue(session, NULL, 1, &value, &value_size);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12ShaderCacheSession_FindValue(session, &value, 0, &value, &value_size);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12ShaderCacheSession_FindValue(session, &value, sizeof(value), &value, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12ShaderCacheSession_StoreValue(session, NULL, 1, &value, sizeof(value));
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12ShaderCacheSession_StoreValue(session, &value, 0, &value, sizeof(value));
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12ShaderCacheSession_StoreValue(session, &value, sizeof(value), NULL, sizeof(value));
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12ShaderCacheSession_StoreValue(session, &value, sizeof(value), &value, 0);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_control(ID3D12Device9 *device, unsigned int identifier)
+{
+    static const char key[] = "control";
+    static const UINT expected = 0x12345678;
+    D3D12_FEATURE_DATA_SHADER_CACHE support;
+    D3D12_SHADER_CACHE_SESSION_DESC desc, other_desc;
+    ID3D12ShaderCacheSession *other_session = NULL, *session, *session2;
+    ID3D12Device9 *other_device9 = NULL;
+    ID3D12Device *other_device = NULL;
+    UINT value_size;
+    HRESULT hr;
+
+    if (strcmp(winetest_platform, "wine"))
+    {
+        skip("ShaderCacheControl requires Windows developer mode.\n");
+        return;
+    }
+
+    support.SupportFlags = 0xdeadbeef;
+    hr = ID3D12Device9_CheckFeatureSupport(device,
+            D3D12_FEATURE_SHADER_CACHE, &support, sizeof(support));
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok((support.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_SHADER_CONTROL_CLEAR),
+            "Shader cache clear support was not reported.\n");
+    ok((support.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_SHADER_SESSION_DELETE),
+            "Shader session deletion support was not reported.\n");
+    ok(!(support.SupportFlags & (D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE
+            | D3D12_SHADER_CACHE_SUPPORT_DRIVER_MANAGED_CACHE)),
+            "Unexpected provider cache support %#x.\n", support.SupportFlags);
+
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED, 0);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12Device9_ShaderCacheControl(device, 0, D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+            D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE | D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED
+                    | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED,
+            D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE);
+    ok(hr == S_OK, "Mixed cache kinds failed, hr %#lx.\n", hr);
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED,
+            D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR);
+    ok(hr == E_NOTIMPL, "Got unexpected unsupported-kind hr %#lx.\n", hr);
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    hr = ID3D12ShaderCacheSession_StoreValue(session,
+            key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store value, hr %#lx.\n", hr);
+
+    if (get_shader_cache_device(&other_device, &other_device9))
+    {
+        init_shader_cache_desc(&other_desc, identifier + 10,
+                D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+        hr = create_shader_cache_session(other_device9, &other_desc, &other_session);
+        ok(hr == S_OK, "Failed to create second-device session, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            hr = ID3D12ShaderCacheSession_StoreValue(other_session,
+                    key, sizeof(key), &expected, sizeof(expected));
+            ok(hr == S_OK, "Failed to store second-device value, hr %#lx.\n", hr);
+        }
+    }
+
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+            D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE);
+    ok(hr == S_OK, "Failed to disable shader caches, hr %#lx.\n", hr);
+    value_size = 0;
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, sizeof(key), NULL, &value_size);
+    ok(hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D12ShaderCacheSession_StoreValue(session,
+            "disabled", sizeof("disabled"), &expected, sizeof(expected));
+    ok(hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, "Got unexpected hr %#lx.\n", hr);
+    if (other_session)
     {
         value_size = 0;
-        hr = ID3D12ShaderCacheSession_FindValue(session,
+        hr = ID3D12ShaderCacheSession_FindValue(other_session,
                 key, sizeof(key), NULL, &value_size);
+        ok(hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE,
+                "Second-device cache was not disabled, hr %#lx.\n", hr);
+    }
+    session2 = (ID3D12ShaderCacheSession *)0xdeadbeef;
+    desc.Identifier.Data1++;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12ShaderCacheSession, (void **)&session2);
+    ok(hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, "Got unexpected hr %#lx.\n", hr);
+    ok(!session2, "Got unexpected session %p.\n", session2);
+
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+            D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE);
+    ok(hr == S_OK, "Failed to enable shader caches, hr %#lx.\n", hr);
+    check_shader_cache_value(session, key, sizeof(key), expected);
+    if (other_session)
+        check_shader_cache_value(other_session, key, sizeof(key), expected);
+
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+            D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR);
+    ok(hr == S_OK, "Failed to clear shader caches, hr %#lx.\n", hr);
+    value_size = 0;
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, sizeof(key), NULL, &value_size);
+    ok(hr == DXGI_ERROR_NOT_FOUND, "Got unexpected hr %#lx.\n", hr);
+    if (other_session)
+    {
+        value_size = 0;
+        hr = ID3D12ShaderCacheSession_FindValue(other_session,
+                key, sizeof(key), NULL, &value_size);
+        ok(hr == DXGI_ERROR_NOT_FOUND,
+                "Second-device active cache was not cleared, hr %#lx.\n", hr);
+    }
+
+    ID3D12ShaderCacheSession_Release(session);
+    if (other_session)
+        ID3D12ShaderCacheSession_Release(other_session);
+    if (other_device9)
+        ID3D12Device9_Release(other_device9);
+    if (other_device)
+        ID3D12Device_Release(other_device);
+}
+
+static void check_shader_cache_eviction(ID3D12Device9 *device,
+        D3D12_SHADER_CACHE_MODE mode, unsigned int identifier)
+{
+    static const char keys[][4] = {"one", "two", "tri"};
+    static const BYTE values[3][16] = {{1}, {2}, {3}};
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    BYTE value[16];
+    UINT value_size;
+    HRESULT hr;
+    unsigned int i, first_expected;
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    if (mode == D3D12_SHADER_CACHE_MODE_MEMORY)
+    {
+        desc.MaximumInMemoryCacheSizeBytes = 40;
+        desc.MaximumInMemoryCacheEntries = 2;
+    }
+    else
+    {
+        desc.MaximumValueFileSizeBytes = sizeof(values[0]);
+    }
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(keys); ++i)
+    {
+        hr = ID3D12ShaderCacheSession_StoreValue(session,
+                keys[i], sizeof(keys[i]), values[i], sizeof(values[i]));
+        ok(hr == S_OK, "%u: Failed to store value, hr %#lx.\n", i, hr);
+    }
+
+    first_expected = mode == D3D12_SHADER_CACHE_MODE_MEMORY ? 1 : 0;
+    if (first_expected)
+    {
+        value_size = sizeof(value);
+        hr = ID3D12ShaderCacheSession_FindValue(session,
+                keys[0], sizeof(keys[0]), value, &value_size);
         ok(hr == DXGI_ERROR_NOT_FOUND, "Got unexpected hr %#lx.\n", hr);
+    }
+    for (i = first_expected; i < ARRAY_SIZE(keys); ++i)
+    {
+        memset(value, 0, sizeof(value));
+        value_size = sizeof(value);
+        hr = ID3D12ShaderCacheSession_FindValue(session,
+                keys[i], sizeof(keys[i]), value, &value_size);
+        ok(hr == S_OK, "%u: Failed to find value, hr %#lx.\n", i, hr);
+        ok(!memcmp(value, values[i], sizeof(value)), "%u: Got unexpected value.\n", i);
+    }
+
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_fuzz_inputs(ID3D12Device9 *device,
+        D3D12_SHADER_CACHE_MODE mode, unsigned int identifier, unsigned int count)
+{
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    BYTE key[68], value[68], result[68];
+    UINT key_size, value_size, result_size;
+    unsigned int i, j;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    desc.MaximumInMemoryCacheSizeBytes = 2 * 1024 * 1024;
+    desc.MaximumInMemoryCacheEntries = count;
+    desc.MaximumValueFileSizeBytes = 2 * 1024 * 1024;
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+
+    for (i = 0; i < count; ++i)
+    {
+        key_size = 5 + i % 64;
+        value_size = 1 + (i * 29) % 68;
+        memset(key, i, key_size);
+        memcpy(key, &i, sizeof(i));
+        for (j = 0; j < value_size; ++j)
+            value[j] = (BYTE)(i * 17 + j);
+        hr = ID3D12ShaderCacheSession_StoreValue(session, key, key_size, value, value_size);
+        ok(hr == S_OK, "%u: Failed to store fuzz value, hr %#lx.\n", i, hr);
+    }
+
+    for (i = 0; i < count; ++i)
+    {
+        key_size = 5 + i % 64;
+        value_size = 1 + (i * 29) % 68;
+        memset(key, i, key_size);
+        memcpy(key, &i, sizeof(i));
+        for (j = 0; j < value_size; ++j)
+            value[j] = (BYTE)(i * 17 + j);
+        memset(result, 0, sizeof(result));
+        result_size = sizeof(result);
+        hr = ID3D12ShaderCacheSession_FindValue(session, key, key_size, result, &result_size);
+        ok(hr == S_OK, "%u: Failed to find fuzz value, hr %#lx.\n", i, hr);
+        ok(result_size == value_size, "%u: Got size %u, expected %u.\n", i, result_size, value_size);
+        ok(!memcmp(result, value, value_size), "%u: Got unexpected fuzz value.\n", i);
+    }
+
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_live_version_conflict(ID3D12Device9 *device,
+        D3D12_SHADER_CACHE_MODE mode, unsigned int identifier)
+{
+    D3D12_SHADER_CACHE_SESSION_DESC desc, desc2;
+    ID3D12ShaderCacheSession *session, *session2;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+
+    init_shader_cache_desc(&desc2, identifier, mode, 2);
+    session2 = (ID3D12ShaderCacheSession *)0xdeadbeef;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc2,
+            &IID_ID3D12ShaderCacheSession, (void **)&session2);
+    ok(hr == DXGI_ERROR_ALREADY_EXISTS, "Got unexpected hr %#lx.\n", hr);
+    ok(!session2, "Got unexpected session %p.\n", session2);
+
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_version_clear(ID3D12Device9 *device,
+        D3D12_SHADER_CACHE_MODE mode, unsigned int identifier)
+{
+    static const char key[] = "versioned";
+    static const UINT expected = 0x12345678;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    UINT value_size;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    hr = ID3D12ShaderCacheSession_StoreValue(session, key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store shader cache value, hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_Release(session);
+
+    init_shader_cache_desc(&desc, identifier, mode, 2);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    value_size = 0;
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, sizeof(key), NULL, &value_size);
+    ok(hr == DXGI_ERROR_NOT_FOUND, "Got unexpected hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    value_size = 0;
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, sizeof(key), NULL, &value_size);
+    ok(hr == DXGI_ERROR_NOT_FOUND, "Got unexpected hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_delete_lifetime(ID3D12Device9 *device,
+        D3D12_SHADER_CACHE_MODE mode, unsigned int identifier)
+{
+    static const char key[] = "delete";
+    static const UINT expected = 0x12345678;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session, *session2;
+    UINT value_size;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    hr = ID3D12ShaderCacheSession_StoreValue(session, key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store shader cache value, hr %#lx.\n", hr);
+
+    hr = create_shader_cache_session(device, &desc, &session2);
+    if (FAILED(hr))
+    {
+        ID3D12ShaderCacheSession_Release(session);
+        return;
+    }
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+
+    check_shader_cache_value(session2, key, sizeof(key), expected);
+    ID3D12ShaderCacheSession_Release(session2);
+
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    value_size = 0;
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, sizeof(key), NULL, &value_size);
+    ok(hr == DXGI_ERROR_NOT_FOUND, "Got unexpected hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_quota_too_small(ID3D12Device9 *device,
+        D3D12_SHADER_CACHE_MODE mode, unsigned int identifier)
+{
+    static const char key[] = "oversized";
+    static const UINT expected = 0x12345678;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    if (mode == D3D12_SHADER_CACHE_MODE_MEMORY)
+    {
+        desc.MaximumInMemoryCacheSizeBytes = 1;
+        desc.MaximumInMemoryCacheEntries = 8;
+    }
+    else
+    {
+        desc.MaximumValueFileSizeBytes = 1;
+    }
+
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+
+    hr = ID3D12ShaderCacheSession_StoreValue(session, key, sizeof(key), &expected, sizeof(expected));
+    todo_wine_if(hr != DXGI_ERROR_CACHE_FULL)
+    ok(hr == DXGI_ERROR_CACHE_FULL, "Got unexpected hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_value_file_limit(ID3D12Device9 *device,
+        D3D12_SHADER_CACHE_MODE mode, unsigned int identifier)
+{
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    char key[32];
+    UINT value, value_size;
+    unsigned int i;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, mode, 1);
+    desc.MaximumInMemoryCacheSizeBytes = 64 * 1024;
+    desc.MaximumInMemoryCacheEntries = 256;
+    desc.MaximumValueFileSizeBytes = mode == D3D12_SHADER_CACHE_MODE_DISK ? sizeof(value) : 1;
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+
+    /* MaximumValueFileSizeBytes is per disk value, not an aggregate cache
+     * quota, and is ignored for memory-mode storage. */
+    for (i = 0; i < 128; ++i)
+    {
+        sprintf(key, "value-limit-%u", i);
+        value = 0x5000 + i;
+        hr = ID3D12ShaderCacheSession_StoreValue(session,
+                key, strlen(key) + 1, &value, sizeof(value));
+        ok(hr == S_OK, "%u: Failed to store value, hr %#lx.\n", i, hr);
+    }
+    for (i = 0; i < 128; ++i)
+    {
+        sprintf(key, "value-limit-%u", i);
+        value = 0;
+        value_size = sizeof(value);
+        hr = ID3D12ShaderCacheSession_FindValue(session,
+                key, strlen(key) + 1, &value, &value_size);
+        ok(hr == S_OK, "%u: Failed to find value, hr %#lx.\n", i, hr);
+        ok(value == 0x5000 + i, "%u: Got unexpected value %#x.\n", i, value);
+    }
+
+    if (mode == D3D12_SHADER_CACHE_MODE_DISK)
+    {
+        UINT64 oversized = 0;
+
+        hr = ID3D12ShaderCacheSession_StoreValue(session,
+                "too-large", sizeof("too-large"), &oversized, sizeof(oversized));
+        ok(hr == DXGI_ERROR_CACHE_FULL, "Got unexpected oversized store hr %#lx.\n", hr);
+    }
+
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void test_shader_cache_memory_session(ID3D12Device9 *device)
+{
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, 1, D3D12_SHADER_CACHE_MODE_MEMORY, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    check_shader_cache_defaults(session, &desc);
+    ID3D12ShaderCacheSession_Release(session);
+
+    check_shader_cache_common_contract(device, D3D12_SHADER_CACHE_MODE_MEMORY, 2);
+    check_shader_cache_process_identity(device, 14);
+    check_shader_cache_live_version_conflict(device, D3D12_SHADER_CACHE_MODE_MEMORY, 3);
+    check_shader_cache_version_clear(device, D3D12_SHADER_CACHE_MODE_MEMORY, 4);
+    check_shader_cache_delete_lifetime(device, D3D12_SHADER_CACHE_MODE_MEMORY, 5);
+    check_shader_cache_quota_too_small(device, D3D12_SHADER_CACHE_MODE_MEMORY, 6);
+    check_shader_cache_value_file_limit(device, D3D12_SHADER_CACHE_MODE_MEMORY, 15);
+    check_shader_cache_thread_race(device, D3D12_SHADER_CACHE_MODE_MEMORY, 7, FALSE);
+    check_shader_cache_thread_race(device, D3D12_SHADER_CACHE_MODE_MEMORY, 8, TRUE);
+    check_shader_cache_invalid_arguments(device, 9);
+    check_shader_cache_eviction(device, D3D12_SHADER_CACHE_MODE_MEMORY, 10);
+    check_shader_cache_fuzz_inputs(device, D3D12_SHADER_CACHE_MODE_MEMORY, 11, 256);
+    check_shader_cache_control(device, 13);
+    if (winetest_interactive)
+        check_shader_cache_fuzz_inputs(device, D3D12_SHADER_CACHE_MODE_MEMORY, 12, 10000);
+}
+
+static void check_shader_cache_disk_persistence(ID3D12Device9 *device, unsigned int identifier)
+{
+    static const char key[] = "persistent";
+    static const UINT expected = 0x12345678;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_DISK, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    hr = ID3D12ShaderCacheSession_StoreValue(session, key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store shader cache value, hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_Release(session);
+
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    check_shader_cache_value(session, key, sizeof(key), expected);
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void check_shader_cache_driver_versioned(ID3D12Device9 *device, unsigned int identifier)
+{
+    static const char key[] = "driver-versioned";
+    static const UINT expected = 0x76543210;
+    D3D12_SHADER_CACHE_SESSION_DESC desc, actual;
+    ID3D12ShaderCacheSession *session;
+    HRESULT hr;
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_DISK, 1);
+    desc.Flags |= D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED;
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    actual = ID3D12ShaderCacheSession_GetDesc(session);
+    ok(actual.Flags == desc.Flags, "Got unexpected driver-versioned flags %#x.\n", actual.Flags);
+    hr = ID3D12ShaderCacheSession_StoreValue(session,
+            key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store driver-versioned value, hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_Release(session);
+
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    check_shader_cache_value(session, key, sizeof(key), expected);
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static BOOL is_shader_cache_hex_name(const char *name)
+{
+    unsigned int i;
+
+    if (strlen(name) != 64)
+        return FALSE;
+    for (i = 0; i < 64; ++i)
+    {
+        if (!((name[i] >= '0' && name[i] <= '9')
+                || (name[i] >= 'a' && name[i] <= 'f')))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static void check_shader_cache_root_namespace_quota(ID3D12Device9 *device,
+        unsigned int identifier)
+{
+    static const char active_key[] = "active-root-namespace";
+    static const UINT active_value = 0x2468ace0;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *active, *session;
+    WIN32_FIND_DATAA data;
+    char key[32];
+    HANDLE find;
+    HRESULT hr;
+    unsigned int i, namespace_count = 0;
+    UINT value;
+
+    if (strcmp(winetest_platform, "wine"))
+        return;
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_DISK, 1);
+    hr = create_shader_cache_session(device, &desc, &active);
+    if (FAILED(hr))
+        return;
+    hr = ID3D12ShaderCacheSession_StoreValue(active, active_key,
+            sizeof(active_key), &active_value, sizeof(active_value));
+    ok(hr == S_OK, "Failed to store active namespace value, hr %#lx.\n", hr);
+
+    for (i = 0; i < 136; ++i)
+    {
+        init_shader_cache_desc(&desc, identifier + 1 + i, D3D12_SHADER_CACHE_MODE_DISK, 1);
+        hr = create_shader_cache_session(device, &desc, &session);
+        ok(hr == S_OK, "%u: Failed to create quota namespace, hr %#lx.\n", i, hr);
+        if (FAILED(hr))
+            continue;
+        sprintf(key, "root-quota-%u", i);
+        value = i;
+        hr = ID3D12ShaderCacheSession_StoreValue(session,
+                key, strlen(key) + 1, &value, sizeof(value));
+        ok(hr == S_OK, "%u: Failed to store quota value, hr %#lx.\n", i, hr);
         ID3D12ShaderCacheSession_Release(session);
     }
 
-done:
+    find = FindFirstFileA("vkd3d-cache\\*", &data);
+    ok(find != INVALID_HANDLE_VALUE, "Failed to enumerate cache root, error %lu.\n", GetLastError());
+    if (find != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    && !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                    && is_shader_cache_hex_name(data.cFileName))
+                ++namespace_count;
+        } while (FindNextFileA(find, &data));
+        FindClose(find);
+    }
+    ok(namespace_count <= 128, "Root retained %u namespaces.\n", namespace_count);
+    check_shader_cache_value(active, active_key, sizeof(active_key), active_value);
+
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(active);
+    ID3D12ShaderCacheSession_Release(active);
+}
+
+static void check_shader_cache_disk_control_scope(ID3D12Device9 *device, unsigned int identifier)
+{
+    static const char key[] = "clear-scope";
+    static const UINT expected = 0x12345678;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    UINT value_size;
+    HRESULT hr;
+
+    if (strcmp(winetest_platform, "wine"))
+        return;
+
+    init_shader_cache_desc(&desc, identifier, D3D12_SHADER_CACHE_MODE_DISK, 1);
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    hr = ID3D12ShaderCacheSession_StoreValue(session,
+            key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store working-directory value, hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_Release(session);
+
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+            D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR);
+    ok(hr == S_OK, "Failed to clear shader caches, hr %#lx.\n", hr);
+
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    check_shader_cache_value(session, key, sizeof(key), expected);
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+
+    init_shader_cache_desc(&desc, identifier + 1, D3D12_SHADER_CACHE_MODE_DISK, 1);
+    desc.Flags = D3D12_SHADER_CACHE_FLAG_NONE;
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    hr = ID3D12ShaderCacheSession_StoreValue(session,
+            key, sizeof(key), &expected, sizeof(expected));
+    ok(hr == S_OK, "Failed to store default disk value, hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_Release(session);
+
+    hr = ID3D12Device9_ShaderCacheControl(device,
+            D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+            D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR);
+    ok(hr == S_OK, "Failed to clear default shader caches, hr %#lx.\n", hr);
+
+    hr = create_shader_cache_session(device, &desc, &session);
+    if (FAILED(hr))
+        return;
+    value_size = 0;
+    hr = ID3D12ShaderCacheSession_FindValue(session, key, sizeof(key), NULL, &value_size);
+    ok(hr == DXGI_ERROR_NOT_FOUND, "Got unexpected hr %#lx.\n", hr);
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+}
+
+static void test_shader_cache_disk_session(ID3D12Device9 *device)
+{
+    struct shader_cache_working_dir working_dir;
+    D3D12_SHADER_CACHE_SESSION_DESC desc;
+    ID3D12ShaderCacheSession *session;
+    HRESULT hr;
+
+    if (!shader_cache_working_dir_init(&working_dir))
+        return;
+
+    init_shader_cache_desc(&desc, 100, D3D12_SHADER_CACHE_MODE_DISK, 1);
+    session = NULL;
+    hr = ID3D12Device9_CreateShaderCacheSession(device, &desc,
+            &IID_ID3D12ShaderCacheSession, (void **)&session);
+    todo_wine_if(hr == DXGI_ERROR_UNSUPPORTED)
+    ok(hr == S_OK, "Failed to create disk shader cache session, hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        shader_cache_working_dir_cleanup(&working_dir);
+        return;
+    }
+    check_shader_cache_defaults(session, &desc);
+    ID3D12ShaderCacheSession_SetDeleteOnDestroy(session);
+    ID3D12ShaderCacheSession_Release(session);
+
+    check_shader_cache_common_contract(device, D3D12_SHADER_CACHE_MODE_DISK, 101);
+    check_shader_cache_disk_persistence(device, 102);
+    check_shader_cache_driver_versioned(device, 115);
+    check_shader_cache_root_namespace_quota(device, 120);
+    check_shader_cache_live_version_conflict(device, D3D12_SHADER_CACHE_MODE_DISK, 103);
+    check_shader_cache_version_clear(device, D3D12_SHADER_CACHE_MODE_DISK, 104);
+    check_shader_cache_delete_lifetime(device, D3D12_SHADER_CACHE_MODE_DISK, 105);
+    check_shader_cache_quota_too_small(device, D3D12_SHADER_CACHE_MODE_DISK, 106);
+    check_shader_cache_value_file_limit(device, D3D12_SHADER_CACHE_MODE_DISK, 113);
+    check_shader_cache_thread_race(device, D3D12_SHADER_CACHE_MODE_DISK, 107, FALSE);
+    check_shader_cache_thread_race(device, D3D12_SHADER_CACHE_MODE_DISK, 108, TRUE);
+    check_shader_cache_eviction(device, D3D12_SHADER_CACHE_MODE_DISK, 109);
+    check_shader_cache_fuzz_inputs(device, D3D12_SHADER_CACHE_MODE_DISK, 110, 256);
+    check_shader_cache_disk_control_scope(device, 112);
+    if (winetest_interactive)
+        check_shader_cache_fuzz_inputs(device, D3D12_SHADER_CACHE_MODE_DISK, 111, 10000);
+
+    shader_cache_working_dir_cleanup(&working_dir);
+    check_shader_cache_reparse_root(device, 114);
+}
+
+static void test_shader_cache_session(void)
+{
+    ID3D12Device9 *device9;
+    ID3D12Device *device;
+    ULONG refcount;
+
+    if (!get_shader_cache_device(&device, &device9))
+        return;
+
+    test_shader_cache_memory_session(device9);
+    test_shader_cache_disk_session(device9);
+
     ID3D12Device9_Release(device9);
     refcount = ID3D12Device_Release(device);
     ok(!refcount, "Device has %u references left.\n", (unsigned int)refcount);
