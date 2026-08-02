@@ -1,0 +1,8 @@
+TESTDLL = appxdeploymentclient.dll
+IMPORTS = advapi32 combase kernelbase shlwapi uuid
+
+SOURCES = \
+	async.c \
+	main.c \
+	package.c \
+	projection.c

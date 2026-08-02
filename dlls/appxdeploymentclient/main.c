@@ -27,18 +27,29 @@ WINE_DEFAULT_DEBUG_CHANNEL(appx);
 HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
 {
     FIXME( "clsid %s, riid %s, out %p stub!\n", debugstr_guid(clsid), debugstr_guid(riid), out );
+    if (out) *out = NULL;
     return CLASS_E_CLASSNOTAVAILABLE;
 }
 
 HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **factory )
 {
-    const WCHAR *buffer = WindowsGetStringRawBuffer( classid, NULL );
+    const WCHAR *buffer;
+    const WCHAR *package_manager_name =
+        RuntimeClass_Windows_Management_Deployment_PackageManager;
+    UINT32 classid_length, package_manager_name_length;
 
     TRACE( "class %s, factory %p.\n", debugstr_hstring(classid), factory );
 
+    if (!factory) return E_POINTER;
     *factory = NULL;
+    if (!classid) return CLASS_E_CLASSNOTAVAILABLE;
+    buffer = WindowsGetStringRawBuffer( classid, &classid_length );
+    package_manager_name_length = wcslen( package_manager_name );
 
-    if (!wcscmp( buffer, RuntimeClass_Windows_Management_Deployment_PackageManager ))
+    if (classid_length == package_manager_name_length &&
+        CompareStringOrdinal(
+            buffer, classid_length, package_manager_name,
+            package_manager_name_length, FALSE ) == CSTR_EQUAL)
         IActivationFactory_QueryInterface( package_manager_factory, &IID_IActivationFactory, (void **)factory );
 
     if (*factory) return S_OK;

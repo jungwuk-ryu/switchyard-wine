@@ -1,7 +1,10 @@
 MODULE  = appxdeploymentclient.dll
-IMPORTS = combase
+IMPORTS = advapi32 combase kernelbase
 
 SOURCES = \
+	async.c \
+	backend.c \
 	classes.idl \
 	main.c \
-	package.c
+	package.c \
+	projection.c
