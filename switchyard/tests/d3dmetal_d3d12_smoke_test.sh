@@ -51,17 +51,21 @@ trap cleanup EXIT
 x86_64-w64-mingw32-gcc -o "$work/d3dmetal-d3d12-smoke.exe" \
   "$ROOT_DIR/switchyard/tests/d3dmetal_d3d12_smoke.c" -ld3d12 -ldxgi -luuid
 
+x86_64-w64-mingw32-gcc -Wall -Werror -o "$work/d3dmetal-d3d12-present-smoke.exe" \
+  "$ROOT_DIR/switchyard/tests/frame_scheduler_d3d12_present_smoke.c" -ld3d12 -ldxgi -luuid
+
 run_smoke() {
   local description="$1"
-  shift
+  local executable="$2"
+  shift 2
   if [ -n "$GPTK_PATH" ]; then
     env -u WINE_OPENGL_DRIVER "${gptk_env[@]}" \
       WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winedbg.exe=d" \
-      "$RUNTIME/bin/switchyard-wine" "$work/d3dmetal-d3d12-smoke.exe" "$@" &
+      "$RUNTIME/bin/switchyard-wine" "$executable" "$@" &
   else
     env -u WINE_OPENGL_DRIVER \
       WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winedbg.exe=d" \
-      "$RUNTIME/bin/switchyard-wine" "$work/d3dmetal-d3d12-smoke.exe" "$@" &
+      "$RUNTIME/bin/switchyard-wine" "$executable" "$@" &
   fi
   wine_pid=$!
   (
@@ -79,10 +83,16 @@ run_smoke() {
   return "$status"
 }
 
-run_smoke "D3DMetal D3D12 callback smoke test"
+run_smoke "D3DMetal D3D12 callback smoke test" \
+  "$work/d3dmetal-d3d12-smoke.exe"
 run_smoke "D3DMetal D3D12 descriptor-churn stress test" \
+  "$work/d3dmetal-d3d12-smoke.exe" \
   --switchyard-d3d12-descriptor-stress
 run_smoke "Chromium GPU D3D12 fallback probe" \
+  "$work/d3dmetal-d3d12-smoke.exe" \
   --switchyard-chromium-gpu-probe \
   --type=gpu-process \
   --user-agent-product=SwitchyardTest
+
+run_smoke "D3D12 frame latency swapchain present smoke" \
+  "$work/d3dmetal-d3d12-present-smoke.exe"

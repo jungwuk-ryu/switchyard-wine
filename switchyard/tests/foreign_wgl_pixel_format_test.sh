@@ -12,6 +12,7 @@ command -v x86_64-w64-mingw32-gcc >/dev/null || {
 
 work="$(/usr/bin/mktemp -d /tmp/switchyard-foreign-wgl.XXXXXX)"
 prefix="$work/prefix"
+time_output="$work/time.txt"
 # shellcheck disable=SC2329 # Invoked through the EXIT trap.
 cleanup() {
   WINEPREFIX="$prefix" "$RUNTIME/bin/wineserver" -k >/dev/null 2>&1 || true
@@ -24,8 +25,11 @@ x86_64-w64-mingw32-gcc -municode -Wall -Wextra -Werror \
   -o "$work/foreign-wgl-pixel-format.exe" \
   "$ROOT_DIR/switchyard/tests/foreign_wgl_pixel_format.c" \
   -lopengl32 -lgdi32 -luser32
+echo "foreign_wgl_test_runtime=$(basename "$RUNTIME")"
+"$ROOT_DIR/switchyard/build_runtime.sh" --source-info | sed 's/^/foreign_wgl_source_/'
 WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winedbg.exe=d" \
-  "$RUNTIME/bin/switchyard-wine" "$work/foreign-wgl-pixel-format.exe" &
+  /usr/bin/time -lp "$RUNTIME/bin/switchyard-wine" \
+  "$work/foreign-wgl-pixel-format.exe" 2>"$time_output" &
 wine_pid=$!
 (
   sleep 60
@@ -39,4 +43,12 @@ status=0
 wait "$wine_pid" || status=$?
 kill "$watchdog_pid" 2>/dev/null || true
 wait "$watchdog_pid" 2>/dev/null || true
+cat "$time_output"
+real_seconds="$(awk '$1 == "real" { value=$2 } $2 == "real" { value=$1 } END { print value }' "$time_output")"
+voluntary="$(awk '$2 == "voluntary" && $3 == "context" { value=$1 } END { print value }' "$time_output")"
+involuntary="$(awk '$2 == "involuntary" && $3 == "context" { value=$1 } END { print value }' "$time_output")"
+if [ -n "$real_seconds" ] && [ -n "$voluntary" ] && [ -n "$involuntary" ]; then
+  awk -v real="$real_seconds" -v voluntary="$voluntary" -v involuntary="$involuntary" \
+    'BEGIN { printf "foreign_wgl_wakeup_proxy real_s=%.3f voluntary_context_switches=%d involuntary_context_switches=%d context_switches_per_s=%.3f\n", real, voluntary, involuntary, (voluntary + involuntary) / real }'
+fi
 exit "$status"
