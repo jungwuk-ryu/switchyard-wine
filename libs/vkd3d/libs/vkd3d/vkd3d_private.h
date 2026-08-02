@@ -1862,14 +1862,29 @@ static inline void vkd3d_prepend_struct(void *header, void *structure)
 
 struct vkd3d_shader_cache;
 
-int vkd3d_shader_open_cache(struct vkd3d_shader_cache **cache,
-        uint64_t maximum_memory_size, uint32_t maximum_entry_count);
+struct vkd3d_shader_cache_desc
+{
+    GUID identifier;
+    D3D12_SHADER_CACHE_MODE mode;
+    D3D12_SHADER_CACHE_FLAGS flags;
+    uint64_t version;
+    uint64_t maximum_value_file_size;
+    uint64_t maximum_memory_size;
+    uint32_t maximum_memory_entry_count;
+    const void *driver_identity;
+    size_t driver_identity_size;
+};
+
+HRESULT vkd3d_shader_open_cache(struct vkd3d_shader_cache **cache,
+        const struct vkd3d_shader_cache_desc *desc);
 unsigned int vkd3d_shader_cache_incref(struct vkd3d_shader_cache *cache);
 unsigned int vkd3d_shader_cache_decref(struct vkd3d_shader_cache *cache);
-void vkd3d_shader_cache_clear(struct vkd3d_shader_cache *cache);
-int vkd3d_shader_cache_put(struct vkd3d_shader_cache *cache,
+HRESULT vkd3d_shader_cache_clear(struct vkd3d_shader_cache *cache);
+HRESULT vkd3d_shader_cache_put(struct vkd3d_shader_cache *cache,
         const void *key, size_t key_size, const void *value, size_t value_size);
-int vkd3d_shader_cache_get(struct vkd3d_shader_cache *cache,
+HRESULT vkd3d_shader_cache_get(struct vkd3d_shader_cache *cache,
         const void *key, size_t key_size, void *value, size_t *value_size);
+HRESULT vkd3d_shader_cache_set_delete_on_destroy(struct vkd3d_shader_cache *cache);
+HRESULT vkd3d_shader_cache_clear_application_disk_caches(void);
 
 #endif  /* __VKD3D_PRIVATE_H */

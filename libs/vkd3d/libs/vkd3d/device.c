@@ -2779,6 +2779,15 @@ static void vkd3d_desc_object_cache_cleanup(struct vkd3d_desc_object_cache *cach
 }
 
 /* ID3D12ShaderCacheSession */
+struct d3d12_cache_driver_identity
+{
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint32_t driver_version;
+    uint32_t api_version;
+    uint8_t pipeline_cache_uuid[VK_UUID_SIZE];
+};
+
 struct d3d12_cache_session
 {
     ID3D12ShaderCacheSession ID3D12ShaderCacheSession_iface;
@@ -2790,10 +2799,60 @@ struct d3d12_cache_session
     struct vkd3d_private_store private_store;
     D3D12_SHADER_CACHE_SESSION_DESC desc;
     struct vkd3d_shader_cache *cache;
+
+    struct d3d12_cache_driver_identity driver_identity;
+    size_t driver_identity_size;
 };
 
 static struct vkd3d_mutex cache_list_mutex = VKD3D_MUTEX_INITIALIZER;
 static struct list cache_list = LIST_INIT(cache_list);
+static uint32_t shader_cache_disabled;
+
+static bool d3d12_shader_cache_is_disabled(void)
+{
+    return !vkd3d_atomic_compare_exchange_u32(&shader_cache_disabled, 0, 0);
+}
+
+static void d3d12_cache_session_get_driver_identity(struct d3d12_cache_session *session,
+        struct d3d12_device *device)
+{
+    const struct vkd3d_vk_instance_procs *vk_procs = &device->vkd3d_instance->vk_procs;
+    struct d3d12_cache_driver_identity identity;
+    VkPhysicalDeviceProperties properties;
+
+    session->driver_identity_size = 0;
+    if (!(session->desc.Flags & D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED))
+        return;
+
+    memset(&identity, 0, sizeof(identity));
+    vk_procs->vkGetPhysicalDeviceProperties(device->vk_physical_device, &properties);
+    identity.vendor_id = properties.vendorID;
+    identity.device_id = properties.deviceID;
+    identity.driver_version = properties.driverVersion;
+    identity.api_version = properties.apiVersion;
+    memcpy(identity.pipeline_cache_uuid, properties.pipelineCacheUUID,
+            sizeof(identity.pipeline_cache_uuid));
+    session->driver_identity = identity;
+    session->driver_identity_size = sizeof(identity);
+}
+
+static bool d3d12_cache_session_same_identity(const struct d3d12_cache_session *a,
+        const struct d3d12_cache_session *b)
+{
+    if (memcmp(&a->desc.Identifier, &b->desc.Identifier, sizeof(a->desc.Identifier)))
+        return false;
+
+    /* The first resolved description controls later sessions with the same
+     * identifier. DRIVER_VERSIONED is the one documented exception: two
+     * driver-versioned sessions on different adapters are side-by-side even
+     * within one process. */
+    if ((a->desc.Flags & D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED)
+            && (b->desc.Flags & D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED))
+        return a->driver_identity_size == b->driver_identity_size
+                && !memcmp(&a->driver_identity, &b->driver_identity,
+                        a->driver_identity_size);
+    return true;
+}
 
 static inline struct d3d12_cache_session *impl_from_ID3D12ShaderCacheSession(ID3D12ShaderCacheSession *iface)
 {
@@ -2921,8 +2980,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_cache_session_FindValue(ID3D12ShaderCache
         const void *key, UINT key_size, void *value, UINT *value_size)
 {
     struct d3d12_cache_session *session = impl_from_ID3D12ShaderCacheSession(iface);
-    enum vkd3d_result ret;
     size_t size;
+    HRESULT hr;
 
     TRACE("iface %p, key %p, key_size %#x, value %p, value_size %p.\n",
             iface, key, key_size, value, value_size);
@@ -2933,18 +2992,20 @@ static HRESULT STDMETHODCALLTYPE d3d12_cache_session_FindValue(ID3D12ShaderCache
         return E_INVALIDARG;
     }
 
+    if (d3d12_shader_cache_is_disabled())
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+
     size = *value_size;
-    ret = vkd3d_shader_cache_get(session->cache, key, key_size, value, &size);
+    hr = vkd3d_shader_cache_get(session->cache, key, key_size, value, &size);
     *value_size = size;
 
-    return hresult_from_vkd3d_result(ret);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_cache_session_StoreValue(ID3D12ShaderCacheSession *iface,
         const void *key, UINT key_size, const void *value, UINT value_size)
 {
     struct d3d12_cache_session *session = impl_from_ID3D12ShaderCacheSession(iface);
-    enum vkd3d_result ret;
 
     TRACE("iface %p, key %p, key_size %#x, value %p, value_size %u.\n",
             iface, key, key_size, value, value_size);
@@ -2955,18 +3016,20 @@ static HRESULT STDMETHODCALLTYPE d3d12_cache_session_StoreValue(ID3D12ShaderCach
         return E_INVALIDARG;
     }
 
-    ret = vkd3d_shader_cache_put(session->cache, key, key_size, value, value_size);
-    return hresult_from_vkd3d_result(ret);
+    if (d3d12_shader_cache_is_disabled())
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+
+    return vkd3d_shader_cache_put(session->cache, key, key_size, value, value_size);
 }
 
 static void STDMETHODCALLTYPE d3d12_cache_session_SetDeleteOnDestroy(ID3D12ShaderCacheSession *iface)
 {
     struct d3d12_cache_session *session = impl_from_ID3D12ShaderCacheSession(iface);
+    HRESULT hr;
 
     TRACE("iface %p.\n", iface);
-    /* Memory caches have no persistent backing and are unconditionally
-     * cleared when the final session reference is destroyed. */
-    (void)session;
+    if (FAILED(hr = vkd3d_shader_cache_set_delete_on_destroy(session->cache)))
+        WARN("Failed to mark shader cache for deletion, hr %s.\n", debugstr_hresult(hr));
 }
 
 static D3D12_SHADER_CACHE_SESSION_DESC * STDMETHODCALLTYPE d3d12_cache_session_GetDesc(
@@ -3003,7 +3066,7 @@ static HRESULT d3d12_cache_session_init(struct d3d12_cache_session *session,
         struct d3d12_device *device, const D3D12_SHADER_CACHE_SESSION_DESC *desc)
 {
     struct d3d12_cache_session *i;
-    enum vkd3d_result ret;
+    struct vkd3d_shader_cache_desc cache_desc;
     HRESULT hr;
 
     session->ID3D12ShaderCacheSession_iface.lpVtbl = &d3d12_cache_session_vtbl;
@@ -3018,16 +3081,23 @@ static HRESULT d3d12_cache_session_init(struct d3d12_cache_session *session,
     if (!session->desc.MaximumInMemoryCacheEntries)
         session->desc.MaximumInMemoryCacheEntries = 128;
 
+    d3d12_cache_session_get_driver_identity(session, device);
+
     if (FAILED(hr = vkd3d_private_store_init(&session->private_store)))
         return hr;
 
     vkd3d_mutex_lock(&cache_list_mutex);
 
+    if (d3d12_shader_cache_is_disabled())
+    {
+        hr = DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        goto error;
+    }
+
     /* We expect the number of open caches to be small. */
     LIST_FOR_EACH_ENTRY(i, &cache_list, struct d3d12_cache_session, cache_list_entry)
     {
-        if (i->device == device
-                && !memcmp(&i->desc.Identifier, &desc->Identifier, sizeof(desc->Identifier)))
+        if (d3d12_cache_session_same_identity(i, session))
         {
             TRACE("Found an existing cache %p from session %p.\n", i->cache, i);
             if (desc->Version == i->desc.Version)
@@ -3048,13 +3118,20 @@ static HRESULT d3d12_cache_session_init(struct d3d12_cache_session *session,
 
     if (!session->cache)
     {
-        ret = vkd3d_shader_open_cache(&session->cache,
-                session->desc.MaximumInMemoryCacheSizeBytes,
-                session->desc.MaximumInMemoryCacheEntries);
-        if (ret)
+        memset(&cache_desc, 0, sizeof(cache_desc));
+        cache_desc.identifier = session->desc.Identifier;
+        cache_desc.mode = session->desc.Mode;
+        cache_desc.flags = session->desc.Flags;
+        cache_desc.version = session->desc.Version;
+        cache_desc.maximum_value_file_size = session->desc.MaximumValueFileSizeBytes;
+        cache_desc.maximum_memory_size = session->desc.MaximumInMemoryCacheSizeBytes;
+        cache_desc.maximum_memory_entry_count = session->desc.MaximumInMemoryCacheEntries;
+        cache_desc.driver_identity = &session->driver_identity;
+        cache_desc.driver_identity_size = session->driver_identity_size;
+
+        if (FAILED(hr = vkd3d_shader_open_cache(&session->cache, &cache_desc)))
         {
-            WARN("Failed to open shader cache.\n");
-            hr = hresult_from_vkd3d_result(ret);
+            WARN("Failed to open shader cache, hr %s.\n", debugstr_hresult(hr));
             goto error;
         }
     }
@@ -3792,11 +3869,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(ID3D12Device9 
                 return E_INVALIDARG;
             }
 
-            /* FIXME: The d3d12 documentation states that
-             * D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO is always supported, but
-             * the CachedPSO field of D3D12_GRAPHICS_PIPELINE_STATE_DESC is
-             * ignored and GetCachedBlob() is a stub. */
-            data->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_NONE;
+            /* CachedPSO and pipeline libraries remain unsupported, but the
+             * application-managed session control and deletion paths are
+             * implemented independently of provider PSO caching. */
+            data->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_SHADER_CONTROL_CLEAR
+                    | D3D12_SHADER_CACHE_SUPPORT_SHADER_SESSION_DELETE;
 
             TRACE("Shader cache support %#x.\n", data->SupportFlags);
             return S_OK;
@@ -5551,11 +5628,6 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateShaderCacheSession(ID3D12Dev
         WARN("Invalid mode %#x, returning E_INVALIDARG.\n", desc->Mode);
         return E_INVALIDARG;
     }
-    if (desc->Mode == D3D12_SHADER_CACHE_MODE_DISK)
-    {
-        WARN("Disk shader cache sessions are not supported.\n");
-        return DXGI_ERROR_UNSUPPORTED;
-    }
     if (!session)
     {
         WARN("No output pointer, returning S_FALSE.\n");
@@ -5581,26 +5653,68 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateShaderCacheSession(ID3D12Dev
 static HRESULT STDMETHODCALLTYPE d3d12_device_ShaderCacheControl(ID3D12Device9 *iface,
         D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS control)
 {
-    struct d3d12_device *device = impl_from_ID3D12Device9(iface);
-    struct d3d12_cache_session *session;
+    struct d3d12_cache_session *i, *session;
+    HRESULT hr = S_OK, tmp_hr;
+
+    static const UINT valid_kinds = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER
+            | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS
+            | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED
+            | D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED;
+    static const UINT valid_control = D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE
+            | D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE
+            | D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR;
 
     TRACE("iface %p, kinds %#x, control %#x.\n", iface, kinds, control);
 
-    if (kinds != D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED
-            || control != D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)
+    if (!kinds || (kinds & ~valid_kinds) || !control || (control & ~valid_control)
+            || (control & D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE
+            && control & D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE))
     {
-        WARN("Unsupported shader cache control request.\n");
+        WARN("Invalid shader cache control request.\n");
+        return E_INVALIDARG;
+    }
+
+    if (!(kinds & D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED))
+    {
+        WARN("Shader cache kinds %#x are not supported.\n", kinds);
         return E_NOTIMPL;
     }
 
     vkd3d_mutex_lock(&cache_list_mutex);
-    LIST_FOR_EACH_ENTRY(session, &cache_list, struct d3d12_cache_session, cache_list_entry)
+
+    if (control & D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
+        vkd3d_atomic_exchange_u32(&shader_cache_disabled, 1);
+    else if (control & D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE)
+        vkd3d_atomic_exchange_u32(&shader_cache_disabled, 0);
+
+    if (control & D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)
     {
-        if (session->device == device)
-            vkd3d_shader_cache_clear(session->cache);
+        LIST_FOR_EACH_ENTRY(session, &cache_list, struct d3d12_cache_session, cache_list_entry)
+        {
+            bool already_cleared = false;
+
+            LIST_FOR_EACH_ENTRY(i, &cache_list, struct d3d12_cache_session, cache_list_entry)
+            {
+                if (i == session)
+                    break;
+                if (i->cache == session->cache)
+                {
+                    already_cleared = true;
+                    break;
+                }
+            }
+            if (!already_cleared
+                    && FAILED(tmp_hr = vkd3d_shader_cache_clear(session->cache)) && SUCCEEDED(hr))
+                hr = tmp_hr;
+        }
     }
     vkd3d_mutex_unlock(&cache_list_mutex);
-    return S_OK;
+
+    if ((control & D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)
+            && FAILED(tmp_hr = vkd3d_shader_cache_clear_application_disk_caches()) && SUCCEEDED(hr))
+        hr = tmp_hr;
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandQueue1(ID3D12Device9 *iface,
@@ -5761,7 +5875,6 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     device->ID3D12Device9_iface.lpVtbl = &d3d12_device_vtbl;
     device->refcount = 1;
-
     vkd3d_instance_incref(device->vkd3d_instance = instance);
     device->vk_info = instance->vk_info;
     device->signal_event = instance->signal_event;
