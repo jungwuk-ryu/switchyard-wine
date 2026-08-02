@@ -1546,7 +1546,7 @@ static void test_invalid_command_queue_types(void)
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
-static void test_options14_to_options18_invalid_sizes(void)
+static void test_options5_to_options18_invalid_sizes(void)
 {
     static const struct
     {
@@ -1555,6 +1555,15 @@ static void test_options14_to_options18_invalid_sizes(void)
     }
     tests[] =
     {
+        {D3D12_FEATURE_D3D12_OPTIONS5, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)},
+        {D3D12_FEATURE_D3D12_OPTIONS6, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6)},
+        {D3D12_FEATURE_D3D12_OPTIONS7, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7)},
+        {D3D12_FEATURE_D3D12_OPTIONS8, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS8)},
+        {D3D12_FEATURE_D3D12_OPTIONS9, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)},
+        {D3D12_FEATURE_D3D12_OPTIONS10, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS10)},
+        {D3D12_FEATURE_D3D12_OPTIONS11, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11)},
+        {D3D12_FEATURE_D3D12_OPTIONS12, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12)},
+        {D3D12_FEATURE_D3D12_OPTIONS13, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13)},
         {D3D12_FEATURE_D3D12_OPTIONS14, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS14)},
         {D3D12_FEATURE_D3D12_OPTIONS15, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS15)},
         {D3D12_FEATURE_D3D12_OPTIONS16, sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16)},
@@ -1563,12 +1572,21 @@ static void test_options14_to_options18_invalid_sizes(void)
     };
     union
     {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS10 options10;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS11 options11;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS13 options13;
         D3D12_FEATURE_DATA_D3D12_OPTIONS14 options14;
         D3D12_FEATURE_DATA_D3D12_OPTIONS15 options15;
         D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16;
         D3D12_FEATURE_DATA_D3D12_OPTIONS17 options17;
         D3D12_FEATURE_DATA_D3D12_OPTIONS18 options18;
-        BYTE bytes[32];
+        BYTE bytes[64];
     } data, expected;
     ID3D12Device *device;
     unsigned int i, j;
@@ -1596,6 +1614,106 @@ static void test_options14_to_options18_invalid_sizes(void)
                     "Test %u, size offset %d: Feature data was modified.\n", i, size_offsets[j]);
         }
     }
+
+    ID3D12Device_Release(device);
+}
+
+static BOOL get_feature_options(ID3D12Device *device, D3D12_FEATURE feature,
+        void *data, UINT data_size)
+{
+    HRESULT hr;
+
+    memset(data, 0, data_size);
+    hr = ID3D12Device_CheckFeatureSupport(device, feature, data, data_size);
+    if (hr == E_INVALIDARG)
+    {
+        win_skip("Feature %#x is not understood by this D3D12 provider.\n", feature);
+        return FALSE;
+    }
+    ok(hr == S_OK, "Feature %#x returned unexpected hr %#lx.\n", feature, hr);
+    return hr == S_OK;
+}
+
+static void test_advanced_feature_capability_invariants(void)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS10 options10;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS11 options11;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS13 options13;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS14 options14;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS15 options15;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS17 options17;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS18 options18;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9;
+    ID3D12Device *device;
+    BOOL have_options5, have_options6, have_options7, have_options9;
+    BOOL have_options10, have_options18;
+
+    if (!(device = create_device()))
+    {
+        skip("Failed to create Direct3D 12 device.\n");
+        return;
+    }
+
+    have_options5 = get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS5,
+            &options5, sizeof(options5));
+    have_options6 = get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS6,
+            &options6, sizeof(options6));
+    have_options7 = get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS7,
+            &options7, sizeof(options7));
+    get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS8, &options8, sizeof(options8));
+    have_options9 = get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS9,
+            &options9, sizeof(options9));
+    have_options10 = get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS10,
+            &options10, sizeof(options10));
+    get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS11, &options11, sizeof(options11));
+    get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS12, &options12, sizeof(options12));
+    get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS13, &options13, sizeof(options13));
+    get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS14, &options14, sizeof(options14));
+    get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS15, &options15, sizeof(options15));
+    get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS16, &options16, sizeof(options16));
+    get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS17, &options17, sizeof(options17));
+    have_options18 = get_feature_options(device, D3D12_FEATURE_D3D12_OPTIONS18,
+            &options18, sizeof(options18));
+
+    if (have_options6 && options6.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED)
+    {
+        ok(!options6.AdditionalShadingRatesSupported,
+                "Additional shading rates are advertised without VRS support.\n");
+        ok(!options6.PerPrimitiveShadingRateSupportedWithViewportIndexing,
+                "Per-primitive shading rate is advertised without VRS support.\n");
+        ok(!options6.ShadingRateImageTileSize,
+                "Got shading-rate tile size %u without VRS support.\n", options6.ShadingRateImageTileSize);
+        if (have_options10)
+            ok(!options10.VariableRateShadingSumCombinerSupported,
+                    "The VRS sum combiner is advertised without VRS support.\n");
+    }
+
+    if (have_options7 && options7.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED)
+    {
+        if (have_options9)
+        {
+            ok(!options9.MeshShaderPipelineStatsSupported,
+                    "Mesh pipeline statistics are advertised without mesh shaders.\n");
+            ok(!options9.MeshShaderSupportsFullRangeRenderTargetArrayIndex,
+                    "Mesh RT array indexing is advertised without mesh shaders.\n");
+            ok(!options9.DerivativesInMeshAndAmplificationShadersSupported,
+                    "Mesh derivatives are advertised without mesh shaders.\n");
+        }
+        if (have_options10)
+            ok(!options10.MeshShaderPerPrimitiveShadingRateSupported,
+                    "Mesh shading rates are advertised without mesh shaders.\n");
+    }
+
+    if (have_options5 && have_options18
+            && options5.RenderPassesTier == D3D12_RENDER_PASS_TIER_0)
+        ok(!options18.RenderPassesValid,
+                "Render passes are reported valid while render-pass tier 0 is exposed.\n");
 
     ID3D12Device_Release(device);
 }
@@ -3474,6 +3592,8 @@ done:
 static void test_execute_indirect(void)
 {
     static const float white[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    static const UINT count_data[] = {1, 2};
+    static const DWORD expected[] = {0xff00ff00, 0xffffffff, 0xff00ff00};
     enum { argument_offset = sizeof(UINT), argument_stride = 32, command_count = 2 };
     BYTE argument_data[argument_offset + argument_stride * command_count];
     D3D12_COMMAND_SIGNATURE_DESC signature_desc;
@@ -3481,9 +3601,12 @@ static void test_execute_indirect(void)
     D3D12_DRAW_ARGUMENTS draw_arguments;
     ID3D12CommandSignature *signature = NULL;
     ID3D12Resource *argument_buffer = NULL;
+    ID3D12Resource *count_buffer = NULL;
     struct test_context context;
     D3D12_RANGE range;
+    unsigned int i;
     void *mapped_data;
+    BOOL counted_indirect_supported = TRUE;
     HRESULT hr;
 
     if (!init_test_context(&context, NULL))
@@ -3497,6 +3620,32 @@ static void test_execute_indirect(void)
     signature_desc.ByteStride = argument_stride;
     signature_desc.NumArgumentDescs = 1;
     signature_desc.pArgumentDescs = &argument_desc;
+
+    signature_desc.NumArgumentDescs = 0;
+    signature_desc.pArgumentDescs = NULL;
+    signature = (ID3D12CommandSignature *)0xdeadbeef;
+    hr = ID3D12Device_CreateCommandSignature(context.device, &signature_desc, NULL,
+            &IID_ID3D12CommandSignature, (void **)&signature);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr) && signature)
+        ID3D12CommandSignature_Release(signature);
+
+    signature_desc.NumArgumentDescs = 1;
+    signature_desc.pArgumentDescs = &argument_desc;
+    signature_desc.ByteStride = sizeof(D3D12_DRAW_ARGUMENTS) - sizeof(UINT);
+    signature = (ID3D12CommandSignature *)0xdeadbeef;
+    hr = ID3D12Device_CreateCommandSignature(context.device, &signature_desc, NULL,
+            &IID_ID3D12CommandSignature, (void **)&signature);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr) && signature)
+        ID3D12CommandSignature_Release(signature);
+
+    signature_desc.ByteStride = argument_stride;
+    hr = ID3D12Device_CreateCommandSignature(context.device, &signature_desc, NULL,
+            &IID_ID3D12CommandSignature, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for a NULL output.\n", hr);
+
+    signature = NULL;
     hr = ID3D12Device_CreateCommandSignature(context.device, &signature_desc, NULL,
             &IID_ID3D12CommandSignature, (void **)&signature);
     ok(hr == S_OK, "Failed to create command signature, hr %#lx.\n", hr);
@@ -3529,24 +3678,242 @@ static void test_execute_indirect(void)
     range.End = sizeof(argument_data);
     ID3D12Resource_Unmap(argument_buffer, 0, &range);
 
-    ID3D12GraphicsCommandList_ClearRenderTargetView(context.list[0], context.rtv[0], white, 0, NULL);
-    ID3D12GraphicsCommandList_OMSetRenderTargets(context.list[0], 1, &context.rtv[0], FALSE, NULL);
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list[0], context.root_signature);
-    ID3D12GraphicsCommandList_SetPipelineState(context.list[0], context.pipeline_state);
-    ID3D12GraphicsCommandList_IASetPrimitiveTopology(context.list[0], D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D12GraphicsCommandList_RSSetViewports(context.list[0], 1, &context.viewport);
-    ID3D12GraphicsCommandList_RSSetScissorRects(context.list[0], 1, &context.scissor_rect);
+    count_buffer = create_buffer(context.device, D3D12_HEAP_TYPE_UPLOAD,
+            sizeof(count_data), D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!count_buffer)
+        goto done;
+
+    range.Begin = 0;
+    range.End = 0;
+    hr = ID3D12Resource_Map(count_buffer, 0, &range, &mapped_data);
+    ok(hr == S_OK, "Failed to map indirect count buffer, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+    memcpy(mapped_data, count_data, sizeof(count_data));
+    range.End = sizeof(count_data);
+    ID3D12Resource_Unmap(count_buffer, 0, &range);
+
+    /* Count buffers are a core D3D12 operation, but the Vulkan provider can
+     * only implement them when indirect-count commands are present.  Probe the
+     * recording boundary explicitly so a provider which rejects the operation
+     * is covered without trying to submit an invalid command list. */
     ID3D12GraphicsCommandList_ExecuteIndirect(context.list[0], signature, command_count,
-            argument_buffer, argument_offset, NULL, 0);
-    transition_sub_resource_state(context.list[0], context.render_target[0], 0,
-            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    check_sub_resource_uint(context.render_target[0], 0,
-            context.queue, context.list[0], 0xff00ff00, 0);
+            argument_buffer, argument_offset, count_buffer, 0);
+    hr = ID3D12GraphicsCommandList_Close(context.list[0]);
+    if (hr == E_INVALIDARG)
+    {
+        skip("The provider does not support counted indirect draws.\n");
+        counted_indirect_supported = FALSE;
+    }
+    else
+        ok(hr == S_OK, "Failed to close counted indirect probe, hr %#lx.\n", hr);
+    reset_command_list(&context, 0);
+
+    for (i = 0; i < ARRAY_SIZE(expected); ++i)
+    {
+        if (i && !counted_indirect_supported)
+            break;
+        if (i)
+        {
+            reset_command_list(&context, 0);
+            transition_sub_resource_state(context.list[0], context.render_target[0], 0,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+
+        ID3D12GraphicsCommandList_ClearRenderTargetView(context.list[0], context.rtv[0], white, 0, NULL);
+        ID3D12GraphicsCommandList_OMSetRenderTargets(context.list[0], 1, &context.rtv[0], FALSE, NULL);
+        ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list[0], context.root_signature);
+        ID3D12GraphicsCommandList_SetPipelineState(context.list[0], context.pipeline_state);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(context.list[0], D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D12GraphicsCommandList_RSSetViewports(context.list[0], 1, &context.viewport);
+        ID3D12GraphicsCommandList_RSSetScissorRects(context.list[0], 1, &context.scissor_rect);
+        ID3D12GraphicsCommandList_ExecuteIndirect(context.list[0], signature, command_count,
+                argument_buffer, argument_offset, i ? count_buffer : NULL,
+                i ? (i - 1) * sizeof(UINT) : 0);
+        transition_sub_resource_state(context.list[0], context.render_target[0], 0,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        check_sub_resource_uint(context.render_target[0], 0,
+                context.queue, context.list[0], expected[i], 0);
+    }
 
 done:
+    if (count_buffer)
+        ID3D12Resource_Release(count_buffer);
     if (argument_buffer)
         ID3D12Resource_Release(argument_buffer);
     ID3D12CommandSignature_Release(signature);
+    destroy_test_context(&context);
+}
+
+static void test_timestamp_query_fence_synchronization(void)
+{
+    static const float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
+    static const UINT64 sentinel[] = {0xdeadbeefdeadbeefull, 0xfeedfacefeedfaceull};
+    D3D12_QUERY_HEAP_DESC query_heap_desc;
+    struct test_context_desc context_desc;
+    ID3D12QueryHeap *query_heap = NULL;
+    ID3D12Resource *readback = NULL;
+    ID3D12Fence *fence = NULL;
+    ID3D12Fence1 *fence1 = NULL;
+    struct test_context context;
+    D3D12_RANGE range;
+    UINT64 frequency, *timestamps;
+    HRESULT hr;
+
+    memset(&context_desc, 0, sizeof(context_desc));
+    context_desc.no_pipeline = TRUE;
+    if (!init_test_context(&context, &context_desc))
+        return;
+
+    fence = (ID3D12Fence *)0xdeadbeef;
+    hr = ID3D12Device_CreateFence(context.device, 0, D3D12_FENCE_FLAG_NONE,
+            &IID_ID3D12Fence, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for a NULL fence output.\n", hr);
+
+    fence = (ID3D12Fence *)0xdeadbeef;
+    hr = ID3D12Device_CreateFence(context.device, 0, (D3D12_FENCE_FLAGS)0x80000000,
+            &IID_ID3D12Fence, (void **)&fence);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr) && fence)
+        ID3D12Fence_Release(fence);
+    fence = NULL;
+
+    hr = ID3D12Device_CreateFence(context.device, 0, D3D12_FENCE_FLAG_SHARED,
+            &IID_ID3D12Fence, (void **)&fence);
+    ok(hr == S_OK || hr == E_NOTIMPL, "Got unexpected shared-fence hr %#lx.\n", hr);
+    if (hr == E_NOTIMPL)
+        ok(!fence, "Got fence %p for an unsupported shared fence.\n", fence);
+    if (SUCCEEDED(hr) && fence)
+        ID3D12Fence_Release(fence);
+    fence = NULL;
+
+    hr = ID3D12Device_CreateFence(context.device, 0, D3D12_FENCE_FLAG_NON_MONITORED,
+            &IID_ID3D12Fence1, (void **)&fence1);
+    ok(hr == S_OK, "Failed to create a non-monitored fence, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        ok(ID3D12Fence1_GetCreationFlags(fence1) == D3D12_FENCE_FLAG_NON_MONITORED,
+                "Got creation flags %#x.\n", ID3D12Fence1_GetCreationFlags(fence1));
+        ID3D12Fence1_Release(fence1);
+    }
+    fence1 = NULL;
+
+    hr = ID3D12CommandQueue_GetTimestampFrequency(context.queue, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for a NULL timestamp-frequency output.\n", hr);
+    hr = ID3D12CommandQueue_GetClockCalibration(context.queue, NULL, &frequency);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for a NULL GPU timestamp output.\n", hr);
+    hr = ID3D12CommandQueue_GetClockCalibration(context.queue, &frequency, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for a NULL CPU timestamp output.\n", hr);
+
+    hr = ID3D12CommandQueue_GetTimestampFrequency(context.queue, &frequency);
+    if (hr == E_FAIL)
+    {
+        skip("The direct command queue does not support timestamp queries.\n");
+        destroy_test_context(&context);
+        return;
+    }
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        destroy_test_context(&context);
+        return;
+    }
+    ok(!!frequency, "Got zero timestamp frequency.\n");
+
+    memset(&query_heap_desc, 0, sizeof(query_heap_desc));
+    query_heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_heap_desc.Count = 0;
+    hr = ID3D12Device_CreateQueryHeap(context.device, &query_heap_desc,
+            &IID_ID3D12QueryHeap, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for a NULL query-heap output.\n", hr);
+
+    query_heap = (ID3D12QueryHeap *)0xdeadbeef;
+    hr = ID3D12Device_CreateQueryHeap(context.device, &query_heap_desc,
+            &IID_ID3D12QueryHeap, (void **)&query_heap);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr) && query_heap)
+        ID3D12QueryHeap_Release(query_heap);
+
+    query_heap_desc.Count = 2;
+    query_heap = NULL;
+    hr = ID3D12Device_CreateQueryHeap(context.device, &query_heap_desc,
+            &IID_ID3D12QueryHeap, (void **)&query_heap);
+    ok(hr == S_OK, "Failed to create timestamp query heap, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    readback = create_readback_buffer(context.device, 2 * sizeof(*timestamps));
+    if (!readback)
+        goto done;
+    create_render_target(&context);
+
+    range.Begin = 0;
+    range.End = 0;
+    hr = ID3D12Resource_Map(readback, 0, &range, (void **)&timestamps);
+    ok(hr == S_OK, "Failed to map query readback buffer, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+    memcpy(timestamps, sentinel, sizeof(sentinel));
+    range.End = sizeof(sentinel);
+    ID3D12Resource_Unmap(readback, 0, &range);
+
+    hr = ID3D12Device_CreateFence(context.device, 5, D3D12_FENCE_FLAG_NONE,
+            &IID_ID3D12Fence, (void **)&fence);
+    ok(hr == S_OK, "Failed to create fence, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+    ok(ID3D12Fence_GetCompletedValue(fence) == 5,
+            "Got unexpected initial fence value %#I64x.\n", ID3D12Fence_GetCompletedValue(fence));
+
+    ID3D12GraphicsCommandList_EndQuery(context.list[0], query_heap,
+            D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    ID3D12GraphicsCommandList_ClearRenderTargetView(context.list[0],
+            context.rtv[0], green, 0, NULL);
+    ID3D12GraphicsCommandList_EndQuery(context.list[0], query_heap,
+            D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    ID3D12GraphicsCommandList_ResolveQueryData(context.list[0], query_heap,
+            D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback, 0);
+
+    hr = ID3D12GraphicsCommandList_Close(context.list[0]);
+    ok(hr == S_OK, "Failed to close command list, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+    exec_command_list(context.queue, context.list[0]);
+
+    hr = ID3D12CommandQueue_Signal(context.queue, fence, 7);
+    ok(hr == S_OK, "Failed to signal fence, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+    hr = wait_for_fence(fence, 7);
+    ok(hr == S_OK, "Failed to wait for fence, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+    ok(ID3D12Fence_GetCompletedValue(fence) >= 7,
+            "Got incomplete fence value %#I64x.\n", ID3D12Fence_GetCompletedValue(fence));
+
+    range.Begin = 0;
+    range.End = 2 * sizeof(*timestamps);
+    hr = ID3D12Resource_Map(readback, 0, &range, (void **)&timestamps);
+    ok(hr == S_OK, "Failed to map query results, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        ok(timestamps[0] != sentinel[0] && timestamps[1] != sentinel[1],
+                "Timestamp resolve did not replace both sentinels, %#I64x, %#I64x.\n",
+                timestamps[0], timestamps[1]);
+        ok(timestamps[1] >= timestamps[0],
+                "Timestamps are out of order, %#I64x then %#I64x.\n", timestamps[0], timestamps[1]);
+        range.Begin = 0;
+        range.End = 0;
+        ID3D12Resource_Unmap(readback, 0, &range);
+    }
+
+done:
+    if (fence)
+        ID3D12Fence_Release(fence);
+    if (readback)
+        ID3D12Resource_Release(readback);
+    if (query_heap)
+        ID3D12QueryHeap_Release(query_heap);
     destroy_test_context(&context);
 }
 
@@ -3941,7 +4308,8 @@ START_TEST(d3d12)
     test_swapchain_backbuffer_index();
     test_desktop_window();
     test_invalid_command_queue_types();
-    test_options14_to_options18_invalid_sizes();
+    test_options5_to_options18_invalid_sizes();
+    test_advanced_feature_capability_invariants();
     test_create_command_queue1();
     test_feature_level_reporting();
     test_shader_cache_session();
@@ -3950,6 +4318,7 @@ START_TEST(d3d12)
     test_resource_aliasing_barriers();
     test_texture_aliasing_barrier();
     test_execute_indirect();
+    test_timestamp_query_fence_synchronization();
     test_write_buffer_immediate();
     test_copy_texture_region_between_buffers();
     test_resolve_subresource_region();

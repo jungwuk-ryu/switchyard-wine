@@ -9152,7 +9152,7 @@ static HRESULT d3d12_sync_object_create_release(struct d3d12_sync_object *syncob
 
     if (!relobj->fence)
     {
-        hr = ID3D12Device_CreateFence(syncobj->device, 0, D3D12_FENCE_FLAG_SHARED, &IID_ID3D12Fence, (void **) &relobj->fence);
+        hr = ID3D12Device_CreateFence(syncobj->device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **) &relobj->fence);
         if (FAILED(hr))
             return hr;
     }
@@ -9303,7 +9303,7 @@ HRESULT WINAPI MFCreateD3D12SynchronizationObject(ID3D12Device *device, REFIID r
     if (!syncobj)
         return E_OUTOFMEMORY;
 
-    hr = ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_SHARED, &IID_ID3D12Fence, (void **) &syncobj->ready_fence);
+    hr = ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **) &syncobj->ready_fence);
     if (FAILED(hr))
     {
         free(syncobj);

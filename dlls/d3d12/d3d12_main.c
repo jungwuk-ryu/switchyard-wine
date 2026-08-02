@@ -442,6 +442,7 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_fe
     const struct d3d12_metal_backend *backend;
     IUnknown *probe_device = NULL;
     struct vkd3d_optional_instance_extensions_info optional_extensions_info;
+    struct vkd3d_optional_device_extensions_info optional_device_extensions_info;
     struct vkd3d_instance_create_info instance_create_info;
     PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr;
     struct vkd3d_device_create_info device_create_info;
@@ -457,12 +458,17 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_fe
     };
     static const char * const optional_instance_extensions[] =
     {
+        VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
         VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
     };
     static const char * const device_extensions[] =
     {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    };
+    static const char * const optional_device_extensions[] =
+    {
+        VK_EXT_HDR_METADATA_EXTENSION_NAME,
     };
     static const struct vkd3d_application_info application_info =
     {
@@ -523,8 +529,13 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_fe
         goto done;
     }
 
+    optional_device_extensions_info.type = VKD3D_STRUCTURE_TYPE_OPTIONAL_DEVICE_EXTENSIONS_INFO;
+    optional_device_extensions_info.next = NULL;
+    optional_device_extensions_info.extensions = optional_device_extensions;
+    optional_device_extensions_info.extension_count = ARRAY_SIZE(optional_device_extensions);
+
     device_create_info.type = VKD3D_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    device_create_info.next = NULL;
+    device_create_info.next = &optional_device_extensions_info;
     device_create_info.minimum_feature_level = minimum_feature_level;
     device_create_info.instance = instance;
     device_create_info.instance_create_info = NULL;

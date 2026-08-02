@@ -1276,8 +1276,7 @@ static HRESULT d3d12_fence_init(struct d3d12_fence *fence, struct d3d12_device *
 
     vkd3d_mutex_init(&fence->mutex);
 
-    if ((fence->flags = flags))
-        FIXME("Ignoring flags %#x.\n", flags);
+    fence->flags = flags;
 
     fence->events = NULL;
     fence->events_size = 0;
@@ -1317,11 +1316,33 @@ HRESULT d3d12_fence_create(struct d3d12_device *device,
         uint64_t initial_value, D3D12_FENCE_FLAGS flags, struct d3d12_fence **fence)
 {
     struct d3d12_fence *object;
+    HRESULT hr;
+
+    if (!fence)
+        return E_INVALIDARG;
+    *fence = NULL;
+
+    if (flags & ~(D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER
+            | D3D12_FENCE_FLAG_NON_MONITORED))
+        return E_INVALIDARG;
+
+    /* Sharing is not exposed until CreateSharedHandle() and OpenSharedHandle()
+     * have a provider implementation. Returning a local-only fence with shared
+     * creation flags makes GetCreationFlags() lie and fails much later. */
+    if (flags & (D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER))
+    {
+        WARN("Shared fence flags %#x are not supported.\n", flags);
+        return E_NOTIMPL;
+    }
 
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    d3d12_fence_init(object, device, initial_value, flags);
+    if (FAILED(hr = d3d12_fence_init(object, device, initial_value, flags)))
+    {
+        vkd3d_free(object);
+        return hr;
+    }
 
     TRACE("Created fence %p.\n", object);
 
@@ -9972,6 +9993,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_GetTimestampFrequency(ID3D1
 
     TRACE("iface %p, frequency %p.\n", iface, frequency);
 
+    if (!frequency)
+        return E_INVALIDARG;
+
     if (!command_queue->vkd3d_queue->timestamp_bits)
     {
         WARN("Timestamp queries not supported.\n");
@@ -9999,14 +10023,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_GetClockCalibration(ID3D12C
     TRACE("iface %p, gpu_timestamp %p, cpu_timestamp %p.\n",
             iface, gpu_timestamp, cpu_timestamp);
 
+    if (!gpu_timestamp || !cpu_timestamp)
+        return E_INVALIDARG;
+
     if (!command_queue->vkd3d_queue->timestamp_bits)
     {
         WARN("Timestamp queries not supported.\n");
         return E_FAIL;
     }
-
-    if (!gpu_timestamp || !cpu_timestamp)
-        return E_INVALIDARG;
 
     if (!device->vk_info.EXT_calibrated_timestamps || device->vk_host_time_domain == -1)
     {

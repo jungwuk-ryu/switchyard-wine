@@ -118,6 +118,7 @@ struct vkd3d_vulkan_info
 {
     /* KHR instance extensions */
     bool KHR_get_physical_device_properties2;
+    bool KHR_portability_enumeration;
     /* EXT instance extensions */
     bool EXT_debug_report;
     bool EXT_debug_utils;

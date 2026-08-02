@@ -66,6 +66,7 @@ static const struct vkd3d_optional_extension_info optional_instance_extensions[]
 {
     /* KHR extensions */
     VK_EXTENSION(KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2, KHR_get_physical_device_properties2),
+    VK_EXTENSION(KHR_PORTABILITY_ENUMERATION, KHR_portability_enumeration),
     /* EXT extensions */
     VK_DEBUG_EXTENSION(EXT_DEBUG_REPORT, EXT_debug_report),
     VK_EXTENSION(EXT_DEBUG_UTILS, EXT_debug_utils),
@@ -702,7 +703,8 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
 
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pNext = NULL;
-    instance_info.flags = 0;
+    instance_info.flags = instance->vk_info.KHR_portability_enumeration
+            ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0;
     instance_info.pApplicationInfo = &application_info;
     instance_info.enabledLayerCount = 0;
     instance_info.ppEnabledLayerNames = NULL;
@@ -4897,6 +4899,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateFence(ID3D12Device9 *iface,
     TRACE("iface %p, initial_value %#"PRIx64", flags %#x, riid %s, fence %p.\n",
             iface, initial_value, flags, debugstr_guid(riid), fence);
 
+    if (!fence)
+        return E_INVALIDARG;
+    *fence = NULL;
+
     if (FAILED(hr = d3d12_fence_create(device, initial_value, flags, &object)))
         return hr;
 
@@ -5029,6 +5035,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateQueryHeap(ID3D12Device9 *ifa
     TRACE("iface %p, desc %p, iid %s, heap %p.\n",
             iface, desc, debugstr_guid(iid), heap);
 
+    if (!heap)
+        return E_INVALIDARG;
+    *heap = NULL;
+
     if (FAILED(hr = d3d12_query_heap_create(device, desc, &object)))
         return hr;
 
@@ -5052,6 +5062,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandSignature(ID3D12Devic
 
     TRACE("iface %p, desc %p, root_signature %p, iid %s, command_signature %p.\n",
             iface, desc, root_signature, debugstr_guid(iid), command_signature);
+
+    if (!command_signature)
+        return E_INVALIDARG;
+    *command_signature = NULL;
 
     if (FAILED(hr = d3d12_command_signature_create(device, desc, &object)))
         return hr;
