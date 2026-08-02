@@ -30,8 +30,59 @@
 #include "combase_private.h"
 
 #include "wine/debug.h"
+#include "wine/exception.h"
+#include "wine/appx_package_graph.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(combase);
+
+enum appx_graph_offsets
+{
+    APPX_HEADER_PACKAGE_COUNT_OFFSET = 44,
+    APPX_HEADER_PACKAGES_OFFSET      = 48,
+    APPX_HEADER_LOADER_COUNT_OFFSET  = 52,
+    APPX_HEADER_LOADERS_OFFSET       = 56,
+    APPX_HEADER_CLASS_COUNT_OFFSET   = 104,
+    APPX_HEADER_CLASSES_OFFSET       = 108,
+
+    APPX_PACKAGE_ROOT_REF_OFFSET     = 104,
+
+    APPX_LOADER_PACKAGE_INDEX_OFFSET = 0,
+    APPX_LOADER_BASENAME_REF_OFFSET = 8,
+    APPX_LOADER_PATH_REF_OFFSET      = 16,
+
+    APPX_CLASS_PACKAGE_INDEX_OFFSET  = 0,
+    APPX_CLASS_THREADING_OFFSET      = 4,
+    APPX_CLASS_ID_REF_OFFSET         = 8,
+    APPX_CLASS_PATH_REF_OFFSET       = 16,
+};
+
+enum appx_threading_model
+{
+    APPX_THREADING_BOTH,
+    APPX_THREADING_STA,
+    APPX_THREADING_MTA,
+};
+
+struct appx_class_graph
+{
+    const BYTE *data;
+    UINT32 package_count;
+    UINT32 packages_offset;
+    UINT32 loader_count;
+    UINT32 loaders_offset;
+    UINT32 class_count;
+    UINT32 classes_offset;
+};
+
+struct appx_class_graph_cache
+{
+    BOOL present;
+    BOOL valid;
+    struct appx_class_graph graph;
+};
+
+static INIT_ONCE appx_class_graph_once = INIT_ONCE_STATIC_INIT;
+static struct appx_class_graph_cache appx_class_graph_cache;
 
 struct activatable_class_data
 {
@@ -58,6 +109,605 @@ static BOOL actctx_section_contains_pointer(const ACTCTX_SECTION_KEYED_DATA *dat
 static BOOL actctx_section_contains_data(const ACTCTX_SECTION_KEYED_DATA *data, SIZE_T size)
 {
     return data->ulLength >= size && actctx_section_contains_pointer(data, data->lpData, size);
+}
+
+static WCHAR appx_graph_char(const struct appx_class_graph *graph,
+                             struct wine_appx_graph_string_ref ref, UINT32 index)
+{
+    return wine_appx_graph_read_u16(graph->data + ref.offset + index * sizeof(WCHAR));
+}
+
+static BOOL appx_path_component_is_reserved(const struct appx_class_graph *graph,
+                                            struct wine_appx_graph_string_ref ref,
+                                            UINT32 start, UINT32 length)
+{
+    WCHAR name[5];
+    UINT32 i, base_length = 0;
+
+    while (base_length < length && appx_graph_char(graph, ref, start + base_length) != '.')
+        base_length++;
+    if (!base_length || base_length > 4) return FALSE;
+    for (i = 0; i < base_length; i++)
+        name[i] = RtlUpcaseUnicodeChar(appx_graph_char(graph, ref, start + i));
+    name[base_length] = 0;
+    if ((base_length == 3 && (!wcscmp(name, L"CON") ||
+                              !wcscmp(name, L"PRN") ||
+                              !wcscmp(name, L"AUX") ||
+                              !wcscmp(name, L"NUL"))) ||
+        (base_length == 4 && (!wcsncmp(name, L"COM", 3) ||
+                              !wcsncmp(name, L"LPT", 3)) &&
+         name[3] >= '1' && name[3] <= '9'))
+        return TRUE;
+    return FALSE;
+}
+
+static BOOL appx_validate_path_components(const struct appx_class_graph *graph,
+                                          struct wine_appx_graph_string_ref ref,
+                                          UINT32 start, UINT32 length)
+{
+    UINT32 component = start, i;
+
+    if (start == length) return TRUE;
+    for (i = start; i <= length; i++)
+    {
+        WCHAR ch = i == length ? '\\' : appx_graph_char(graph, ref, i);
+
+        if (ch == '/' || ch == ':' || ch == '"' || ch == '<' || ch == '>' ||
+            ch == '|' || ch == '?' || ch == '*' || ch < 0x20)
+            return FALSE;
+        if (ch != '\\') continue;
+        if (i == component ||
+            (i - component == 1 && appx_graph_char(graph, ref, component) == '.') ||
+            (i - component == 2 && appx_graph_char(graph, ref, component) == '.' &&
+             appx_graph_char(graph, ref, component + 1) == '.') ||
+            appx_graph_char(graph, ref, i - 1) == ' ' ||
+            appx_graph_char(graph, ref, i - 1) == '.' ||
+            i - component > 255 ||
+            appx_path_component_is_reserved(graph, ref, component, i - component))
+            return FALSE;
+        component = i + 1;
+    }
+    return TRUE;
+}
+
+static BOOL appx_validate_package_root(const struct appx_class_graph *graph,
+                                       struct wine_appx_graph_string_ref ref)
+{
+    UINT32 length;
+    WCHAR drive;
+
+    if (ref.chars < 4 || ref.chars > WINE_APPX_GRAPH_MAX_STRING_CHARS + 1)
+        return FALSE;
+    length = ref.chars - 1;
+    drive = appx_graph_char(graph, ref, 0);
+    if (!((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z')) ||
+        appx_graph_char(graph, ref, 1) != ':' ||
+        appx_graph_char(graph, ref, 2) != '\\')
+        return FALSE;
+    if (length > 3 && appx_graph_char(graph, ref, length - 1) == '\\')
+        return FALSE;
+    return appx_validate_path_components(graph, ref, 3, length);
+}
+
+static BOOL appx_validate_relative_path(const struct appx_class_graph *graph,
+                                        struct wine_appx_graph_string_ref ref,
+                                        BOOL basename_only)
+{
+    UINT32 i;
+
+    if (ref.chars < 2 || ref.chars > WINE_APPX_GRAPH_MAX_STRING_CHARS + 1 ||
+        appx_graph_char(graph, ref, 0) == '\\')
+        return FALSE;
+    if (!appx_validate_path_components(graph, ref, 0, ref.chars - 1))
+        return FALSE;
+    if (basename_only)
+        for (i = 0; i + 1 < ref.chars; i++)
+            if (appx_graph_char(graph, ref, i) == '\\') return FALSE;
+    return TRUE;
+}
+
+static INT appx_compare_ref_ranges_ci(const struct appx_class_graph *graph,
+                                      struct wine_appx_graph_string_ref left,
+                                      UINT32 left_start, UINT32 left_length,
+                                      struct wine_appx_graph_string_ref right,
+                                      UINT32 right_start, UINT32 right_length)
+{
+    UINT32 length = min(left_length, right_length), i;
+
+    for (i = 0; i < length; i++)
+    {
+        WCHAR left_ch = RtlUpcaseUnicodeChar(appx_graph_char(graph, left, left_start + i));
+        WCHAR right_ch = RtlUpcaseUnicodeChar(appx_graph_char(graph, right, right_start + i));
+
+        if (left_ch != right_ch) return left_ch < right_ch ? -1 : 1;
+    }
+    if (left_length == right_length) return 0;
+    return left_length < right_length ? -1 : 1;
+}
+
+static INT appx_compare_refs_ci(const struct appx_class_graph *graph,
+                                struct wine_appx_graph_string_ref left,
+                                struct wine_appx_graph_string_ref right)
+{
+    return appx_compare_ref_ranges_ci(graph, left, 0, left.chars - 1,
+                                      right, 0, right.chars - 1);
+}
+
+static BOOL appx_refs_equal(const struct appx_class_graph *graph,
+                            struct wine_appx_graph_string_ref left,
+                            UINT32 left_start,
+                            struct wine_appx_graph_string_ref right,
+                            UINT32 right_start, UINT32 length)
+{
+    UINT32 i;
+
+    for (i = 0; i < length; i++)
+        if (appx_graph_char(graph, left, left_start + i) !=
+            appx_graph_char(graph, right, right_start + i))
+            return FALSE;
+    return TRUE;
+}
+
+static BOOL appx_basename_matches_path(const struct appx_class_graph *graph,
+                                       struct wine_appx_graph_string_ref basename,
+                                       struct wine_appx_graph_string_ref path)
+{
+    UINT32 start = path.chars - 1;
+
+    while (start && appx_graph_char(graph, path, start - 1) != '\\') start--;
+    return basename.chars - 1 == path.chars - 1 - start &&
+           appx_refs_equal(graph, basename, 0, path, start,
+                           basename.chars - 1);
+}
+
+static const BYTE *appx_find_loader_for_class(const struct appx_class_graph *graph,
+                                              const BYTE *class_record)
+{
+    struct wine_appx_graph_string_ref class_path =
+        wine_appx_graph_get_ref(class_record, APPX_CLASS_PATH_REF_OFFSET);
+    struct wine_appx_graph_string_ref loader_path;
+    UINT32 package_index = wine_appx_graph_read_u32(
+        class_record + APPX_CLASS_PACKAGE_INDEX_OFFSET);
+    UINT32 loader_index = wine_appx_graph_read_u32(
+        class_record + WINE_APPX_GRAPH_CLASS_LOADER_INDEX_OFFSET);
+    const BYTE *loader;
+
+    if (loader_index >= graph->loader_count) return NULL;
+    loader = graph->data + graph->loaders_offset +
+             loader_index * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+    loader_path = wine_appx_graph_get_ref(
+        loader, APPX_LOADER_PATH_REF_OFFSET);
+    if (wine_appx_graph_read_u32(
+            loader + APPX_LOADER_PACKAGE_INDEX_OFFSET) != package_index ||
+        class_path.chars != loader_path.chars ||
+        !appx_refs_equal(graph, class_path, 0, loader_path, 0,
+                         class_path.chars) ||
+        wine_appx_graph_read_u32(
+            loader + WINE_APPX_GRAPH_LOADER_VOLUME_SERIAL_OFFSET) !=
+            wine_appx_graph_read_u32(
+                class_record + WINE_APPX_GRAPH_CLASS_VOLUME_SERIAL_OFFSET) ||
+        wine_appx_graph_read_u32(
+            loader + WINE_APPX_GRAPH_LOADER_FILE_INDEX_HIGH_OFFSET) !=
+            wine_appx_graph_read_u32(
+                class_record +
+                WINE_APPX_GRAPH_CLASS_FILE_INDEX_HIGH_OFFSET) ||
+        wine_appx_graph_read_u32(
+            loader + WINE_APPX_GRAPH_LOADER_FILE_INDEX_LOW_OFFSET) !=
+            wine_appx_graph_read_u32(
+                class_record +
+                WINE_APPX_GRAPH_CLASS_FILE_INDEX_LOW_OFFSET) ||
+        wine_appx_graph_read_u64(
+            loader + WINE_APPX_GRAPH_LOADER_CHANGE_TIME_OFFSET) !=
+            wine_appx_graph_read_u64(
+                class_record + WINE_APPX_GRAPH_CLASS_CHANGE_TIME_OFFSET) ||
+        wine_appx_graph_read_u64(
+            loader + WINE_APPX_GRAPH_LOADER_FILE_SIZE_OFFSET) !=
+            wine_appx_graph_read_u64(
+                class_record + WINE_APPX_GRAPH_CLASS_FILE_SIZE_OFFSET))
+        return NULL;
+    return loader;
+}
+
+static BOOL appx_validate_class_graph_domain(const struct appx_class_graph *graph)
+{
+    struct wine_appx_graph_string_ref previous_basename = {0};
+    struct wine_appx_graph_string_ref previous_path = {0};
+    UINT32 previous_package = 0, previous_rank = 0, i;
+
+    for (i = 0; i < graph->package_count; i++)
+    {
+        const BYTE *record = graph->data + graph->packages_offset +
+                             i * WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+
+        if (!appx_validate_package_root(
+                graph, wine_appx_graph_get_ref(record, APPX_PACKAGE_ROOT_REF_OFFSET)))
+            return FALSE;
+    }
+
+    for (i = 0; i < graph->loader_count; i++)
+    {
+        const BYTE *record = graph->data + graph->loaders_offset +
+                             i * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        struct wine_appx_graph_string_ref basename =
+            wine_appx_graph_get_ref(record, APPX_LOADER_BASENAME_REF_OFFSET);
+        struct wine_appx_graph_string_ref path =
+            wine_appx_graph_get_ref(record, APPX_LOADER_PATH_REF_OFFSET);
+        UINT32 package_index = wine_appx_graph_read_u32(
+            record + APPX_LOADER_PACKAGE_INDEX_OFFSET);
+        UINT32 search_rank = wine_appx_graph_read_u32(
+            record + WINE_APPX_GRAPH_LOADER_SEARCH_RANK_OFFSET);
+        UINT64 change_time = wine_appx_graph_read_u64(
+            record + WINE_APPX_GRAPH_LOADER_CHANGE_TIME_OFFSET);
+        UINT64 file_size = wine_appx_graph_read_u64(
+            record + WINE_APPX_GRAPH_LOADER_FILE_SIZE_OFFSET);
+        INT comparison;
+
+        if (package_index >= graph->package_count ||
+            (search_rank >= WINE_APPX_GRAPH_MAX_LOADER_SEARCH_PATHS &&
+             search_rank != WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY) ||
+            !change_time || (change_time >> 63) ||
+            !file_size || (file_size >> 63) ||
+            !appx_validate_relative_path(graph, basename, TRUE) ||
+            !appx_validate_relative_path(graph, path, FALSE) ||
+            !appx_basename_matches_path(graph, basename, path))
+            return FALSE;
+        if (i)
+        {
+            comparison = appx_compare_refs_ci(graph, previous_basename, basename);
+            if (comparison > 0 ||
+                (!comparison && previous_package > package_index) ||
+                (!comparison && previous_package == package_index &&
+                 previous_rank > search_rank) ||
+                (!comparison && previous_package == package_index &&
+                 previous_rank == search_rank &&
+                 appx_compare_refs_ci(graph, previous_path, path) >= 0))
+                return FALSE;
+        }
+        previous_basename = basename;
+        previous_path = path;
+        previous_package = package_index;
+        previous_rank = search_rank;
+    }
+
+    for (i = 0; i < graph->class_count; i++)
+    {
+        const BYTE *record = graph->data + graph->classes_offset +
+                             i * WINE_APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+        struct wine_appx_graph_string_ref path =
+            wine_appx_graph_get_ref(record, APPX_CLASS_PATH_REF_OFFSET);
+
+        if (!appx_validate_relative_path(graph, path, FALSE) ||
+            !appx_find_loader_for_class(graph, record))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL WINAPI initialize_appx_class_graph(INIT_ONCE *once, void *param, void **context)
+{
+    const BYTE *data = NtCurrentTeb()->Peb->ProcessParameters->PackageDependencyData;
+    struct appx_class_graph graph = {0};
+    UINT32 size;
+
+    if (!data)
+    {
+        appx_class_graph_cache.valid = TRUE;
+        return TRUE;
+    }
+
+    appx_class_graph_cache.present = TRUE;
+    __TRY
+    {
+        size = wine_appx_graph_read_u32(
+            data + WINE_APPX_GRAPH_HEADER_TOTAL_SIZE_OFFSET);
+        if (wine_appx_graph_validate_blob(data, size))
+        {
+            graph.data = data;
+            graph.package_count = wine_appx_graph_read_u32(
+                data + APPX_HEADER_PACKAGE_COUNT_OFFSET);
+            graph.packages_offset = wine_appx_graph_read_u32(
+                data + APPX_HEADER_PACKAGES_OFFSET);
+            graph.loader_count = wine_appx_graph_read_u32(
+                data + APPX_HEADER_LOADER_COUNT_OFFSET);
+            graph.loaders_offset = wine_appx_graph_read_u32(
+                data + APPX_HEADER_LOADERS_OFFSET);
+            graph.class_count = wine_appx_graph_read_u32(
+                data + APPX_HEADER_CLASS_COUNT_OFFSET);
+            graph.classes_offset = wine_appx_graph_read_u32(
+                data + APPX_HEADER_CLASSES_OFFSET);
+            if (appx_validate_class_graph_domain(&graph))
+            {
+                appx_class_graph_cache.graph = graph;
+                appx_class_graph_cache.valid = TRUE;
+            }
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        appx_class_graph_cache.valid = FALSE;
+    }
+    __ENDTRY
+    return TRUE;
+}
+
+static INT appx_compare_class_id(const WCHAR *classid, UINT32 length,
+                                 const struct appx_class_graph *graph,
+                                 struct wine_appx_graph_string_ref ref)
+{
+    UINT32 ref_length = ref.chars - 1, count = min(length, ref_length), i;
+
+    for (i = 0; i < count; i++)
+    {
+        WCHAR left = classid[i];
+        WCHAR right = appx_graph_char(graph, ref, i);
+
+        if (left >= 'A' && left <= 'Z') left += 'a' - 'A';
+        if (right >= 'A' && right <= 'Z') right += 'a' - 'A';
+        if (left != right) return left < right ? -1 : 1;
+    }
+    if (length == ref_length) return 0;
+    return length < ref_length ? -1 : 1;
+}
+
+static HRESULT get_appx_library_for_classid(const WCHAR *classid, UINT32 length,
+                                            WCHAR **out, UINT32 *threading_model)
+{
+    const struct appx_class_graph *graph;
+    struct wine_appx_graph_string_ref ref;
+    const BYTE *record;
+    UINT32 low = 0, high, middle, i;
+
+    if (!InitOnceExecuteOnce(&appx_class_graph_once, initialize_appx_class_graph,
+                             NULL, NULL))
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (!appx_class_graph_cache.valid)
+        return HRESULT_FROM_WIN32(APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT);
+    if (!appx_class_graph_cache.present) return S_FALSE;
+
+    if (!length || length > WINE_APPX_GRAPH_MAX_STRING_CHARS)
+        return E_INVALIDARG;
+
+    graph = &appx_class_graph_cache.graph;
+    high = graph->class_count;
+    while (low < high)
+    {
+        middle = low + (high - low) / 2;
+        record = graph->data + graph->classes_offset +
+                 middle * WINE_APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+        ref = wine_appx_graph_get_ref(record, APPX_CLASS_ID_REF_OFFSET);
+        if (appx_compare_class_id(classid, length, graph, ref) > 0)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    if (low >= graph->class_count) return S_FALSE;
+    record = graph->data + graph->classes_offset +
+             low * WINE_APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+    ref = wine_appx_graph_get_ref(record, APPX_CLASS_ID_REF_OFFSET);
+    if (appx_compare_class_id(classid, length, graph, ref)) return S_FALSE;
+
+    ref = wine_appx_graph_get_ref(record, APPX_CLASS_PATH_REF_OFFSET);
+    if (!(*out = malloc(ref.chars * sizeof(WCHAR)))) return E_OUTOFMEMORY;
+    for (i = 0; i < ref.chars; i++) (*out)[i] = appx_graph_char(graph, ref, i);
+    *threading_model = wine_appx_graph_read_u32(
+        record + APPX_CLASS_THREADING_OFFSET);
+    return S_OK;
+}
+
+static HRESULT activate_factory_in_current_apartment(
+    const WCHAR *library, BOOL packaged, HSTRING classid, REFIID iid,
+    void **class_factory)
+{
+    PFNGETACTIVATIONFACTORY get_activation_factory;
+    IActivationFactory *factory;
+    HMODULE module;
+    HRESULT hr = S_OK;
+
+    *class_factory = NULL;
+    if (!(module = packaged ? LoadPackagedLibrary(library, 0) :
+                              LoadLibraryW(library)))
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (!(get_activation_factory =
+          (void *)GetProcAddress(module, "DllGetActivationFactory")))
+    {
+        hr = E_FAIL;
+        goto done;
+    }
+    if (SUCCEEDED(hr = get_activation_factory(classid, &factory)))
+    {
+        hr = IActivationFactory_QueryInterface(factory, iid, class_factory);
+        IActivationFactory_Release(factory);
+        if (SUCCEEDED(hr))
+        {
+            /*
+             * The returned interface executes code from this module.  Keep
+             * the loader reference for the process lifetime, as the existing
+             * WinRT activation path has always done.
+             */
+            module = NULL;
+        }
+    }
+
+done:
+    if (module) FreeLibrary(module);
+    return hr;
+}
+
+struct appx_activation_request
+{
+    const WCHAR *library;
+    HSTRING classid;
+    const IID *iid;
+    IStream *stream;
+    HRESULT hr;
+};
+
+struct appx_activation_host
+{
+    INIT_ONCE once;
+    RO_INIT_TYPE init_type;
+    CRITICAL_SECTION critical_section;
+    HANDLE request_event;
+    HANDLE completion_event;
+    HANDLE ready_event;
+    HANDLE thread;
+    struct appx_activation_request *request;
+    HRESULT hr;
+};
+
+static struct appx_activation_host appx_sta_host =
+    { INIT_ONCE_STATIC_INIT, RO_INIT_SINGLETHREADED };
+static struct appx_activation_host appx_mta_host =
+    { INIT_ONCE_STATIC_INIT, RO_INIT_MULTITHREADED };
+
+static DWORD WINAPI appx_activation_host_thread(void *parameter)
+{
+    struct appx_activation_host *host = parameter;
+    struct appx_activation_request *request;
+    IUnknown *object;
+    DWORD wait;
+    MSG msg;
+
+    host->hr = RoInitialize(host->init_type);
+    if (SUCCEEDED(host->hr) &&
+        host->init_type == RO_INIT_SINGLETHREADED)
+        PeekMessageW(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+    SetEvent(host->ready_event);
+    if (FAILED(host->hr)) return 0;
+
+    for (;;)
+    {
+        wait = MsgWaitForMultipleObjects(1, &host->request_event, FALSE,
+                                         INFINITE, QS_ALLINPUT);
+        if (wait == WAIT_OBJECT_0)
+        {
+            request = host->request;
+            object = NULL;
+            request->stream = NULL;
+            request->hr = activate_factory_in_current_apartment(
+                request->library, TRUE, request->classid, request->iid,
+                (void **)&object);
+            if (SUCCEEDED(request->hr))
+            {
+                request->hr = CoMarshalInterThreadInterfaceInStream(
+                    request->iid, object, &request->stream);
+                IUnknown_Release(object);
+            }
+            SetEvent(host->completion_event);
+        }
+        else if (wait == WAIT_OBJECT_0 + 1)
+        {
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        else
+            break;
+    }
+    RoUninitialize();
+    return 0;
+}
+
+static BOOL CALLBACK initialize_appx_activation_host(
+    INIT_ONCE *once, void *parameter, void **context)
+{
+    struct appx_activation_host *host = parameter;
+    DWORD wait;
+
+    InitializeCriticalSection(&host->critical_section);
+    host->hr = E_OUTOFMEMORY;
+    host->request_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    host->completion_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    host->ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!host->request_event || !host->completion_event || !host->ready_event)
+    {
+        host->hr = HRESULT_FROM_WIN32(GetLastError());
+        return TRUE;
+    }
+    if (!(host->thread = CreateThread(NULL, 0, appx_activation_host_thread,
+                                      host, 0, NULL)))
+    {
+        host->hr = HRESULT_FROM_WIN32(GetLastError());
+        return TRUE;
+    }
+    wait = WaitForSingleObject(host->ready_event, 10000);
+    if (wait != WAIT_OBJECT_0)
+        host->hr = wait == WAIT_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) :
+                                         HRESULT_FROM_WIN32(GetLastError());
+    return TRUE;
+}
+
+static HRESULT activate_factory_in_host(
+    UINT32 threading_model, const WCHAR *library, HSTRING classid, REFIID iid,
+    void **class_factory)
+{
+    struct appx_activation_host *host =
+        threading_model == APPX_THREADING_STA ? &appx_sta_host : &appx_mta_host;
+    struct appx_activation_request request;
+    DWORD index;
+    HRESULT hr;
+
+    *class_factory = NULL;
+    if (!InitOnceExecuteOnce(&host->once, initialize_appx_activation_host,
+                             host, NULL))
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (FAILED(host->hr)) return host->hr;
+
+    EnterCriticalSection(&host->critical_section);
+    request.library = library;
+    request.classid = classid;
+    request.iid = iid;
+    request.stream = NULL;
+    request.hr = E_UNEXPECTED;
+    host->request = &request;
+    ResetEvent(host->completion_event);
+    if (!SetEvent(host->request_event))
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    else
+    {
+        hr = CoWaitForMultipleHandles(COWAIT_DEFAULT, INFINITE, 1,
+                                      &host->completion_event, &index);
+        if (FAILED(hr))
+        {
+            WaitForSingleObject(host->completion_event, INFINITE);
+            hr = request.hr;
+        }
+        else
+            hr = request.hr;
+        if (SUCCEEDED(hr))
+        {
+            hr = CoGetInterfaceAndReleaseStream(request.stream, iid,
+                                                class_factory);
+            request.stream = NULL;
+        }
+    }
+    if (request.stream) IStream_Release(request.stream);
+    host->request = NULL;
+    LeaveCriticalSection(&host->critical_section);
+    return hr;
+}
+
+static HRESULT activate_packaged_factory(
+    UINT32 threading_model, const WCHAR *library, HSTRING classid, REFIID iid,
+    void **class_factory)
+{
+    APTTYPEQUALIFIER qualifier;
+    APTTYPE type;
+    HRESULT hr;
+
+    if (threading_model == APPX_THREADING_BOTH)
+        return activate_factory_in_current_apartment(
+            library, TRUE, classid, iid, class_factory);
+    if (FAILED(hr = CoGetApartmentType(&type, &qualifier))) return hr;
+    if ((threading_model == APPX_THREADING_STA &&
+         (type == APTTYPE_STA || type == APTTYPE_MAINSTA)) ||
+        (threading_model == APPX_THREADING_MTA && type == APTTYPE_MTA))
+        return activate_factory_in_current_apartment(
+            library, TRUE, classid, iid, class_factory);
+    return activate_factory_in_host(threading_model, library, classid, iid,
+                                    class_factory);
 }
 
 static HRESULT get_builtin_library_for_classid(const WCHAR *classid, WCHAR **out)
@@ -90,7 +740,9 @@ static HRESULT get_builtin_library_for_classid(const WCHAR *classid, WCHAR **out
     return REGDB_E_CLASSNOTREG;
 }
 
-static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
+static HRESULT get_library_for_classid(const WCHAR *classid, UINT32 length,
+                                       WCHAR **out, BOOL *packaged,
+                                       UINT32 *threading_model)
 {
     ACTCTX_SECTION_KEYED_DATA data = { sizeof(data) };
     HKEY hkey_root, hkey_class;
@@ -99,6 +751,8 @@ static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
     WCHAR *buf = NULL;
 
     *out = NULL;
+    *packaged = FALSE;
+    *threading_model = APPX_THREADING_BOTH;
 
     /* search activation context first */
     if (FindActCtxSectionStringW(FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX, NULL,
@@ -123,6 +777,13 @@ static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
 
         WARN("Ignoring invalid activation context data for class %s\n", debugstr_w(classid));
         if (data.hActCtx) ReleaseActCtx(data.hActCtx);
+    }
+
+    hr = get_appx_library_for_classid(classid, length, out, threading_model);
+    if (hr != S_FALSE)
+    {
+        if (SUCCEEDED(hr)) *packaged = TRUE;
+        return hr;
     }
 
     if (SUCCEEDED(hr = get_builtin_library_for_classid(classid, out)))
@@ -213,62 +874,49 @@ void WINAPI RoUninitialize(void)
  */
 HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID iid, void **class_factory)
 {
-    PFNGETACTIVATIONFACTORY pDllGetActivationFactory;
-    IActivationFactory *factory;
+    const WCHAR *classid_buffer;
+    UINT32 classid_length, threading_model;
+    BOOL embedded_null, packaged;
     WCHAR *library;
-    HMODULE module;
     HRESULT hr;
 
     TRACE("(%s, %s, %p)\n", debugstr_hstring(classid), debugstr_guid(iid), class_factory);
 
     if (!iid || !class_factory)
         return E_INVALIDARG;
+    *class_factory = NULL;
+
+    if (FAILED(hr = WindowsStringHasEmbeddedNull(classid, &embedded_null)))
+        return hr;
+    classid_buffer = WindowsGetStringRawBuffer(classid, &classid_length);
+    if (embedded_null || !classid_length ||
+        classid_length > WINE_APPX_GRAPH_MAX_STRING_CHARS)
+        return E_INVALIDARG;
 
     if (FAILED(hr = ensure_mta()))
         return hr;
 
-    hr = get_library_for_classid(WindowsGetStringRawBuffer(classid, NULL), &library);
+    hr = get_library_for_classid(classid_buffer, classid_length, &library,
+                                 &packaged, &threading_model);
     if (FAILED(hr))
     {
         ERR("Failed to find library for %s\n", debugstr_hstring(classid));
         return hr;
     }
 
-    if (!(module = LoadLibraryW(library)))
-    {
-        ERR("Failed to load module %s\n", debugstr_w(library));
-        hr = HRESULT_FROM_WIN32(GetLastError());
-        goto done;
-    }
-
-    if (!(pDllGetActivationFactory = (void *)GetProcAddress(module, "DllGetActivationFactory")))
-    {
-        ERR("Module %s does not implement DllGetActivationFactory\n", debugstr_w(library));
-        hr = E_FAIL;
-        goto done;
-    }
-
     TRACE("Found library %s for class %s\n", debugstr_w(library), debugstr_hstring(classid));
-
-    hr = pDllGetActivationFactory(classid, &factory);
-    if (SUCCEEDED(hr))
-    {
-        hr = IActivationFactory_QueryInterface(factory, iid, class_factory);
-        if (SUCCEEDED(hr))
-        {
-            TRACE("Created interface %p\n", *class_factory);
-            module = NULL;
-        }
-        IActivationFactory_Release(factory);
-    }
+    if (packaged)
+        hr = activate_packaged_factory(threading_model, library, classid, iid,
+                                       class_factory);
     else
-    {
+        hr = activate_factory_in_current_apartment(
+            library, FALSE, classid, iid, class_factory);
+    if (SUCCEEDED(hr))
+        TRACE("Created interface %p\n", *class_factory);
+    else
         ERR("Class %s not found in %s, hr %#lx.\n", wine_dbgstr_hstring(classid), debugstr_w(library), hr);
-    }
 
-done:
     free(library);
-    if (module) FreeLibrary(module);
     return hr;
 }
 

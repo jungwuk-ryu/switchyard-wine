@@ -7,4 +7,5 @@ SOURCES = \
 	application.c \
 	application.spec \
 	model.c \
+	package.c \
 	resource.rc

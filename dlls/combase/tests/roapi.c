@@ -21,6 +21,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winerror.h"
+#include "winioctl.h"
 #include "winstring.h"
 #include "winternl.h"
 
@@ -28,6 +29,7 @@
 #include "roapi.h"
 #include "roerrorapi.h"
 
+#include "wine/appx_package_graph.h"
 #include "wine/test.h"
 
 #define EXPECT_REF(obj,ref) _expect_ref((IUnknown*)obj, ref, __LINE__)
@@ -58,7 +60,7 @@ static void flush_events(void)
 
 static void load_resource(const WCHAR *filename)
 {
-    DWORD written;
+    DWORD written = 0;
     HANDLE file;
     HRSRC res;
     void *ptr;
@@ -72,6 +74,486 @@ static void load_resource(const WCHAR *filename)
     WriteFile(file, ptr, SizeofResource(GetModuleHandleW(NULL), res), &written, NULL);
     ok(written == SizeofResource(GetModuleHandleW(NULL), res), "couldn't write resource\n");
     CloseHandle(file);
+}
+
+static void graph_write_u16(BYTE *data, UINT32 value)
+{
+    data[0] = value;
+    data[1] = value >> 8;
+}
+
+static void graph_write_u32(BYTE *data, UINT32 value)
+{
+    graph_write_u16(data, value);
+    graph_write_u16(data + 2, value >> 16);
+}
+
+static void graph_write_u64(BYTE *data, UINT64 value)
+{
+    graph_write_u32(data, value);
+    graph_write_u32(data + 4, value >> 32);
+}
+
+static const WCHAR test_package_full_name[] =
+    L"Wine.Package_1.0.0.0_neutral__pub";
+
+static BOOL write_package_marker(const WCHAR *path)
+{
+    BYTE marker[40 + sizeof(test_package_full_name)];
+    DWORD written;
+    HANDLE file;
+    UINT32 i;
+    BOOL ret;
+
+    memcpy(marker, "SWLM", 4);
+    graph_write_u32(marker + 4, 1);
+    for (i = 0; i < 32; i++) marker[8 + i] = i + 1;
+    for (i = 0; i < ARRAY_SIZE(test_package_full_name); i++)
+        graph_write_u16(marker + 40 + i * sizeof(WCHAR),
+                        test_package_full_name[i]);
+
+    file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    ret = WriteFile(file, marker, sizeof(marker), &written, NULL);
+    if (ret && written != sizeof(marker))
+    {
+        SetLastError(ERROR_WRITE_FAULT);
+        ret = FALSE;
+    }
+    if (ret) ret = FlushFileBuffers(file);
+    CloseHandle(file);
+    return ret;
+}
+
+static BOOL graph_append_string(BYTE *graph, UINT32 capacity, UINT32 *position,
+                                UINT32 ref_offset, const WCHAR *string)
+{
+    UINT32 chars = lstrlenW(string) + 1, i;
+
+    if (*position > capacity ||
+        chars > WINE_APPX_GRAPH_MAX_STRING_CHARS + 1 ||
+        chars > (capacity - *position) / sizeof(WCHAR))
+        return FALSE;
+    graph_write_u32(graph + ref_offset, *position);
+    graph_write_u32(graph + ref_offset + 4, chars);
+    for (i = 0; i < chars; i++)
+        graph_write_u16(graph + *position + i * sizeof(WCHAR), string[i]);
+    *position += chars * sizeof(WCHAR);
+    return TRUE;
+}
+
+static BOOL get_file_identity(const WCHAR *path, DWORD *volume_serial,
+                              DWORD *file_index_high, DWORD *file_index_low,
+                              BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE],
+                              UINT64 *change_time, UINT64 *file_size)
+{
+    BY_HANDLE_FILE_INFORMATION info;
+    FILE_OBJECTID_BUFFER native_id;
+    FILE_STANDARD_INFORMATION standard;
+    FILE_BASIC_INFORMATION basic;
+    IO_STATUS_BLOCK io;
+    HANDLE file;
+    BOOL ret;
+    UINT32 i;
+
+    file = CreateFileW(path, FILE_READ_ATTRIBUTES,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    ret = GetFileInformationByHandle(file, &info);
+    if (ret && object_id &&
+        NtFsControlFile(file, 0, NULL, NULL, &io, FSCTL_GET_OBJECT_ID,
+                        NULL, 0, &native_id, sizeof(native_id)))
+        ret = FALSE;
+    if (ret && change_time &&
+        NtQueryInformationFile(file, &io, &basic, sizeof(basic),
+                               FileBasicInformation))
+        ret = FALSE;
+    if (ret && file_size &&
+        NtQueryInformationFile(file, &io, &standard, sizeof(standard),
+                               FileStandardInformation))
+        ret = FALSE;
+    if (ret && object_id)
+    {
+        for (i = 0; i < WINE_APPX_GRAPH_OBJECT_ID_SIZE; i++)
+            if (native_id.ObjectId[i]) break;
+        if (i == WINE_APPX_GRAPH_OBJECT_ID_SIZE) ret = FALSE;
+    }
+    CloseHandle(file);
+    if (!ret || (!info.nFileIndexHigh && !info.nFileIndexLow) ||
+        (change_time && basic.ChangeTime.QuadPart <= 0) ||
+        (file_size && standard.EndOfFile.QuadPart <= 0))
+        return FALSE;
+    *volume_serial = info.dwVolumeSerialNumber;
+    *file_index_high = info.nFileIndexHigh;
+    *file_index_low = info.nFileIndexLow;
+    if (object_id) memcpy(object_id, native_id.ObjectId, WINE_APPX_GRAPH_OBJECT_ID_SIZE);
+    if (change_time) *change_time = basic.ChangeTime.QuadPart;
+    if (file_size) *file_size = standard.EndOfFile.QuadPart;
+    return TRUE;
+}
+
+static BYTE *build_package_activation_graph(UINT32 threading_model,
+                                            BOOL mismatched_identity,
+                                            BOOL invalid_class_path,
+                                            HANDLE lease, UINT32 *graph_size)
+{
+    static const UINT32 capacity = 64 * 1024;
+    static const WCHAR package_dll[] = L"wine.combase.test.dll";
+    static const WCHAR shadow_dll[] =
+        L"zzshadow\\wine.combase.test.dll";
+    static const WCHAR explicit_dll[] =
+        L"shadow\\wine.combase.test.dll";
+    static const WCHAR invalid_path[] = L"..\\wine.combase.test.dll";
+    const UINT32 package_offset = WINE_APPX_GRAPH_BLOB_HEADER_SIZE;
+    const UINT32 loader_offset = package_offset +
+        WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+    const UINT32 class_offset = loader_offset +
+        3 * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+    const UINT32 strings_offset = class_offset +
+        WINE_APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+    BY_HANDLE_FILE_INFORMATION lease_info;
+    DWORD app_volume, app_high, app_low;
+    DWORD dll_volume, dll_high, dll_low;
+    BYTE app_object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
+    BYTE dll_object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
+    UINT64 dll_change_time, dll_file_size;
+    DWORD class_low;
+    WCHAR module[MAX_PATH], root[MAX_PATH];
+    UINT32 position = strings_offset, i;
+    BYTE *graph;
+
+    if (!GetModuleFileNameW(NULL, module, ARRAY_SIZE(module)) ||
+        !GetCurrentDirectoryW(ARRAY_SIZE(root), root) ||
+        !get_file_identity(module, &app_volume, &app_high, &app_low,
+                           app_object_id, NULL, NULL) ||
+        !get_file_identity(package_dll, &dll_volume, &dll_high, &dll_low,
+                           dll_object_id, &dll_change_time, &dll_file_size) ||
+        !GetFileInformationByHandle(lease, &lease_info))
+        return NULL;
+    i = lstrlenW(root);
+    if (i > 3 && root[i - 1] == '\\') root[i - 1] = 0;
+
+    graph = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, capacity);
+    if (!graph) return NULL;
+    memcpy(graph, "SWXGRAPH", 8);
+    graph_write_u32(graph + 8, WINE_APPX_GRAPH_BLOB_VERSION);
+    graph_write_u32(graph + 12, WINE_APPX_GRAPH_BLOB_HEADER_SIZE);
+    graph_write_u64(graph + 24, 1);
+    graph_write_u64(graph + 32, 1);
+    graph_write_u32(graph + 40, 0);
+    graph_write_u32(graph + 44, 1);
+    graph_write_u32(graph + 48, package_offset);
+    graph_write_u32(graph + 52, 3);
+    graph_write_u32(graph + 56, loader_offset);
+    graph_write_u32(graph + 60, strings_offset);
+    graph_write_u32(graph + 68, 1);
+    graph_write_u32(graph + WINE_APPX_GRAPH_HEADER_CLASS_COUNT_OFFSET, 1);
+    graph_write_u32(graph + WINE_APPX_GRAPH_HEADER_CLASSES_OFFSET, class_offset);
+    graph_write_u32(graph + WINE_APPX_GRAPH_HEADER_VOLUME_SERIAL_OFFSET, app_volume);
+    graph_write_u32(graph + WINE_APPX_GRAPH_HEADER_FILE_INDEX_HIGH_OFFSET, app_high);
+    graph_write_u32(graph + WINE_APPX_GRAPH_HEADER_FILE_INDEX_LOW_OFFSET, app_low);
+    memcpy(graph + WINE_APPX_GRAPH_HEADER_OBJECT_ID_OFFSET, app_object_id,
+           sizeof(app_object_id));
+
+    graph_write_u64(graph + package_offset, 1);
+    graph_write_u32(graph + package_offset + 8, 0);
+    graph_write_u32(graph + package_offset + 12,
+                    WINE_APPX_GRAPH_PACKAGE_ACTIVE |
+                    WINE_APPX_GRAPH_PACKAGE_SIGNED);
+    graph_write_u32(graph + package_offset + 16, 0);
+    for (i = 0; i < 32; i++) graph[package_offset + 24 + i] = i + 1;
+
+    for (i = 0; i < 3; i++)
+    {
+        BYTE *loader = graph + loader_offset +
+                       i * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+
+        graph_write_u32(loader, 0);
+        graph_write_u32(
+            loader + WINE_APPX_GRAPH_LOADER_SEARCH_RANK_OFFSET,
+            i < 2 ? 1 : WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY);
+        graph_write_u32(
+            loader + WINE_APPX_GRAPH_LOADER_VOLUME_SERIAL_OFFSET,
+            dll_volume);
+        graph_write_u32(
+            loader + WINE_APPX_GRAPH_LOADER_FILE_INDEX_HIGH_OFFSET,
+            dll_high);
+        graph_write_u32(
+            loader + WINE_APPX_GRAPH_LOADER_FILE_INDEX_LOW_OFFSET,
+            dll_low);
+        graph_write_u64(
+            loader + WINE_APPX_GRAPH_LOADER_CHANGE_TIME_OFFSET,
+            dll_change_time);
+        graph_write_u64(
+            loader + WINE_APPX_GRAPH_LOADER_FILE_SIZE_OFFSET,
+            dll_file_size);
+        memcpy(loader + WINE_APPX_GRAPH_LOADER_OBJECT_ID_OFFSET,
+               dll_object_id, sizeof(dll_object_id));
+    }
+
+    graph_write_u32(graph + class_offset, 0);
+    graph_write_u32(graph + class_offset + 4, threading_model);
+    graph_write_u32(graph + class_offset +
+                    WINE_APPX_GRAPH_CLASS_VOLUME_SERIAL_OFFSET, dll_volume);
+    graph_write_u32(graph + class_offset +
+                    WINE_APPX_GRAPH_CLASS_FILE_INDEX_HIGH_OFFSET, dll_high);
+    class_low = dll_low;
+    if (mismatched_identity)
+    {
+        class_low ^= 1;
+        if (!class_low && !dll_high) class_low = 2;
+    }
+    graph_write_u32(graph + class_offset +
+                    WINE_APPX_GRAPH_CLASS_FILE_INDEX_LOW_OFFSET,
+                    class_low);
+    graph_write_u32(graph + class_offset +
+                    WINE_APPX_GRAPH_CLASS_LOADER_INDEX_OFFSET, 0);
+    graph_write_u64(graph + class_offset +
+                    WINE_APPX_GRAPH_CLASS_CHANGE_TIME_OFFSET,
+                    dll_change_time);
+    graph_write_u64(graph + class_offset +
+                    WINE_APPX_GRAPH_CLASS_FILE_SIZE_OFFSET,
+                    dll_file_size);
+
+    if (!graph_append_string(graph, capacity, &position, 72, L"App") ||
+        !graph_append_string(graph, capacity, &position, 80,
+                             L"Wine.Package_pub!App") ||
+        !graph_append_string(graph, capacity, &position, 88, module) ||
+        !graph_append_string(graph, capacity, &position, 96, L"") ||
+        !graph_append_string(graph, capacity, &position, package_offset + 56,
+                             L"Wine.Package") ||
+        !graph_append_string(graph, capacity, &position, package_offset + 64,
+                             L"CN=Wine") ||
+        !graph_append_string(graph, capacity, &position, package_offset + 72, L"") ||
+        !graph_append_string(graph, capacity, &position, package_offset + 80,
+                             L"pub") ||
+        !graph_append_string(graph, capacity, &position, package_offset + 88,
+                             test_package_full_name) ||
+        !graph_append_string(graph, capacity, &position, package_offset + 96,
+                             L"Wine.Package_pub") ||
+        !graph_append_string(graph, capacity, &position, package_offset + 104,
+                             root) ||
+        !graph_append_string(graph, capacity, &position, loader_offset + 8,
+                             package_dll) ||
+        !graph_append_string(graph, capacity, &position, loader_offset + 16,
+                             package_dll) ||
+        !graph_append_string(
+            graph, capacity, &position,
+            loader_offset + WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE + 8,
+            package_dll) ||
+        !graph_append_string(
+            graph, capacity, &position,
+            loader_offset + WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE + 16,
+            shadow_dll) ||
+        !graph_append_string(
+            graph, capacity, &position,
+            loader_offset + 2 * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE + 8,
+            package_dll) ||
+        !graph_append_string(
+            graph, capacity, &position,
+            loader_offset + 2 * WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE + 16,
+            explicit_dll) ||
+        !graph_append_string(graph, capacity, &position, class_offset + 8,
+                             L"Wine.Package.Test") ||
+        !graph_append_string(graph, capacity, &position, class_offset + 16,
+                             invalid_class_path ? invalid_path : package_dll))
+        goto invalid;
+
+    graph_write_u32(graph + 16, position);
+    graph_write_u32(graph + 64, position - strings_offset);
+    if (!wine_appx_graph_validate_blob(graph, position)) goto invalid;
+    *graph_size = position;
+    return graph;
+
+invalid:
+    HeapFree(GetProcessHeap(), 0, graph);
+    return NULL;
+}
+
+static DWORD package_activation_child(const char *mode)
+{
+    static const WCHAR embedded_classid[] = L"Wine.Package.Test\0suffix";
+    IActivationFactory *factory = NULL;
+    RO_INIT_TYPE init_type = RO_INIT_MULTITHREADED;
+    const WCHAR *expected_apartment = NULL;
+    HRESULT expected = S_OK, hr;
+    HSTRING classid;
+
+    if (!strcmp(mode, "sta") || !strcmp(mode, "wrong-mta"))
+        init_type = RO_INIT_SINGLETHREADED;
+    if (!strcmp(mode, "sta") || !strcmp(mode, "wrong-sta"))
+        expected_apartment = L"sta";
+    else if (!strcmp(mode, "mta") || !strcmp(mode, "wrong-mta"))
+        expected_apartment = L"mta";
+    if (!strcmp(mode, "embedded-null"))
+        expected = E_INVALIDARG;
+    else if (!strcmp(mode, "bad-identity") || !strcmp(mode, "bad-path"))
+        expected = HRESULT_FROM_WIN32(APPMODEL_ERROR_PACKAGE_RUNTIME_CORRUPT);
+
+    hr = RoInitialize(init_type);
+    if (FAILED(hr)) return 0x10000 | (hr & 0xffff);
+    if (!strcmp(mode, "embedded-null"))
+        hr = WindowsCreateString(embedded_classid,
+                                 ARRAY_SIZE(embedded_classid) - 1, &classid);
+    else
+        hr = WindowsCreateString(L"Wine.Package.Test",
+                                 ARRAY_SIZE(L"Wine.Package.Test") - 1,
+                                 &classid);
+    if (FAILED(hr))
+    {
+        RoUninitialize();
+        return 0x20000 | (hr & 0xffff);
+    }
+    if (expected_apartment &&
+        !SetEnvironmentVariableW(L"WINE_COMBASE_TEST_APARTMENT",
+                                 expected_apartment))
+    {
+        WindowsDeleteString(classid);
+        RoUninitialize();
+        return 0x21000 | (GetLastError() & 0xfff);
+    }
+    hr = RoGetActivationFactory(classid, &IID_IActivationFactory,
+                                (void **)&factory);
+    SetEnvironmentVariableW(L"WINE_COMBASE_TEST_APARTMENT", NULL);
+    if (factory) IActivationFactory_Release(factory);
+    WindowsDeleteString(classid);
+    RoUninitialize();
+    if (hr != expected) return 0x30000 | (hr & 0xffff);
+    if (SUCCEEDED(expected) && !factory) return 0x40000;
+    if (FAILED(expected) && factory) return 0x50000;
+    return 0;
+}
+
+static DWORD run_package_activation_child(const char *mode, UINT32 threading_model,
+                                          BOOL mismatched_identity,
+                                          BOOL invalid_class_path)
+{
+    STARTUPINFOEXW startup = {{sizeof(startup)}};
+    struct wine_appx_graph_attach attach = {0};
+    PROCESS_INFORMATION process_info;
+    unsigned long long lease_value;
+    WCHAR temp_path[MAX_PATH], lease_path[MAX_PATH];
+    WCHAR module[MAX_PATH], command[MAX_PATH + 80];
+    BYTE *graph = NULL;
+    UINT32 graph_size;
+    SIZE_T attr_size = 0;
+    HANDLE lease = INVALID_HANDLE_VALUE;
+    DWORD exit_code = ~0u, wait;
+    BOOL ret;
+
+    if (!GetTempPathW(ARRAY_SIZE(temp_path), temp_path) ||
+        !GetTempFileNameW(temp_path, L"cba", 0, lease_path))
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (!write_package_marker(lease_path))
+    {
+        exit_code = HRESULT_FROM_WIN32(GetLastError());
+        DeleteFileW(lease_path);
+        return exit_code;
+    }
+    lease = CreateFileW(lease_path, GENERIC_READ | DELETE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (lease == INVALID_HANDLE_VALUE)
+    {
+        DeleteFileW(lease_path);
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    graph = build_package_activation_graph(threading_model, mismatched_identity,
+                                           invalid_class_path, lease, &graph_size);
+    if (!graph)
+    {
+        exit_code = ERROR_INVALID_DATA;
+        goto done;
+    }
+
+    lease_value = (ULONG_PTR)lease;
+    attach.tag = WINE_APPX_GRAPH_ATTACH_TAG;
+    attach.version = WINE_APPX_GRAPH_ATTACH_VERSION;
+    attach.size = graph_size;
+    attach.blob = (ULONG_PTR)graph;
+    attach.leases = (ULONG_PTR)&lease_value;
+    attach.lease_count = 1;
+
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    if (!(startup.lpAttributeList = HeapAlloc(GetProcessHeap(), 0, attr_size)))
+    {
+        exit_code = ERROR_NOT_ENOUGH_MEMORY;
+        goto done;
+    }
+    if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0,
+                                           &attr_size) ||
+        !UpdateProcThreadAttribute(startup.lpAttributeList, 0,
+                                   WINE_PROC_THREAD_ATTRIBUTE_PACKAGE_GRAPH,
+                                   &attach, sizeof(attach), NULL, NULL))
+    {
+        exit_code = HRESULT_FROM_WIN32(GetLastError());
+        goto done;
+    }
+    if (!GetModuleFileNameW(NULL, module, ARRAY_SIZE(module)) ||
+        swprintf(command, ARRAY_SIZE(command), L"\"%s\" roapi package-child %hs",
+                 module, mode) < 0)
+    {
+        exit_code = ERROR_FILENAME_EXCED_RANGE;
+        goto done;
+    }
+
+    memset(&process_info, 0, sizeof(process_info));
+    ret = CreateProcessW(module, command, NULL, NULL, FALSE,
+                         EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+                         &startup.StartupInfo, &process_info);
+    if (!ret)
+    {
+        exit_code = HRESULT_FROM_WIN32(GetLastError());
+        goto done;
+    }
+    wait = WaitForSingleObject(process_info.hProcess, 10000);
+    if (wait != WAIT_OBJECT_0)
+    {
+        TerminateProcess(process_info.hProcess, STATUS_TIMEOUT);
+        WaitForSingleObject(process_info.hProcess, 5000);
+        exit_code = STATUS_TIMEOUT;
+    }
+    else if (!GetExitCodeProcess(process_info.hProcess, &exit_code))
+        exit_code = HRESULT_FROM_WIN32(GetLastError());
+    CloseHandle(process_info.hThread);
+    CloseHandle(process_info.hProcess);
+
+done:
+    if (startup.lpAttributeList)
+    {
+        DeleteProcThreadAttributeList(startup.lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, startup.lpAttributeList);
+    }
+    HeapFree(GetProcessHeap(), 0, graph);
+    if (lease != INVALID_HANDLE_VALUE) CloseHandle(lease);
+    DeleteFileW(lease_path);
+    return exit_code;
+}
+
+static void test_package_activation(void)
+{
+    DWORD result;
+
+    result = run_package_activation_child("both", 0, FALSE, FALSE);
+    ok(!result, "Both-threaded package activation child failed %#lx.\n", result);
+    result = run_package_activation_child("sta", 1, FALSE, FALSE);
+    ok(!result, "STA package activation child failed %#lx.\n", result);
+    result = run_package_activation_child("mta", 2, FALSE, FALSE);
+    ok(!result, "MTA package activation child failed %#lx.\n", result);
+    result = run_package_activation_child("embedded-null", 0, FALSE, FALSE);
+    ok(!result, "Embedded-NUL package activation child failed %#lx.\n", result);
+    result = run_package_activation_child("wrong-sta", 1, FALSE, FALSE);
+    ok(!result, "Wrong-apartment STA child failed %#lx.\n", result);
+    result = run_package_activation_child("wrong-mta", 2, FALSE, FALSE);
+    ok(!result, "Wrong-apartment MTA child failed %#lx.\n", result);
+    result = run_package_activation_child("bad-identity", 0, TRUE, FALSE);
+    ok(result == ERROR_INVALID_DATA,
+       "Class/loader identity mismatch returned %#lx.\n", result);
+    result = run_package_activation_child("bad-path", 0, FALSE, TRUE);
+    ok(result == ERROR_INVALID_DATA,
+       "Invalid class path returned %#lx.\n", result);
 }
 
 static void test_ActivationFactories(void)
@@ -868,10 +1350,16 @@ static void test_RoGetErrorReportingFlags(void)
 
 START_TEST(roapi)
 {
+    char **argv;
+    int argc = winetest_get_mainargs(&argv);
     BOOL ret;
+
+    if (argc >= 4 && !strcmp(argv[2], "package-child"))
+        ExitProcess(package_activation_child(argv[3]));
 
     load_resource(L"wine.combase.test.dll");
 
+    test_package_activation();
     test_implicit_mta();
     test_ActivationFactories();
     test_RoGetAgileReference();

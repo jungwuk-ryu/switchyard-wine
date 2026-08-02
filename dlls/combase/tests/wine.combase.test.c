@@ -130,6 +130,23 @@ static const struct IActivationFactoryVtbl factory_vtbl =
 static struct factory class_factory = {{&factory_vtbl}, 0};
 static struct factory trusted_factory = {{&factory_vtbl}, 0, TRUE};
 
+static BOOL package_apartment_matches(void)
+{
+    APTTYPEQUALIFIER qualifier;
+    WCHAR expected[4];
+    APTTYPE type;
+
+    if (!GetEnvironmentVariableW(L"WINE_COMBASE_TEST_APARTMENT", expected,
+                                 ARRAY_SIZE(expected)))
+        return TRUE;
+    if (FAILED(CoGetApartmentType(&type, &qualifier))) return FALSE;
+    if (!wcscmp(expected, L"sta"))
+        return type == APTTYPE_STA || type == APTTYPE_MAINSTA;
+    if (!wcscmp(expected, L"mta"))
+        return type == APTTYPE_MTA;
+    return FALSE;
+}
+
 HRESULT WINAPI DllCanUnloadNow(void)
 {
     return S_OK;
@@ -143,6 +160,12 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
 
     if (!wcscmp(buffer, L"Wine.Test.Class"))
     {
+        IActivationFactory_AddRef((*factory = &class_factory.IActivationFactory_iface));
+        return S_OK;
+    }
+    if (!wcscmp(buffer, L"Wine.Package.Test"))
+    {
+        if (!package_apartment_matches()) return RPC_E_WRONG_THREAD;
         IActivationFactory_AddRef((*factory = &class_factory.IActivationFactory_iface));
         return S_OK;
     }
