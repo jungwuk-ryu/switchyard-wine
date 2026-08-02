@@ -271,27 +271,25 @@ With `SWITCHYARD_SPATIAL_AUDIO_PROFILE=1 WINEDEBUG=+mmdevapi,+coreaudio`, the sa
 focused test produced:
 
 ```text
-static spatial mixer: native 0, dynamic objects 0, samples 23,
-  p50 50291 ns, p95 62542 ns, p99 98125 ns,
-  underruns 1, overruns 0, reentrant rejects 0, callback allocations 0
+static spatial mixer: native 0, dynamic objects 0, samples 22,
+  p50 55500 ns, p95 93875 ns, p99 98708 ns,
+  underruns 0, overruns 0, reentrant rejects 0, callback allocations 0
 backend invalidation fault: native 0, dynamic objects 1, samples 10,
-  p50 542 ns, p95 1375 ns, p99 1375 ns,
+  p50 667 ns, p95 1042 ns, p99 1042 ns,
   underruns 0, overruns 0, reentrant rejects 0, callback allocations 0
 maximum dynamic: native 0, dynamic objects 31, samples 65,
-  p50 221959 ns, p95 406417 ns, p99 596875 ns,
+  p50 209666 ns, p95 374625 ns, p99 458584 ns,
   underruns 0, overruns 0, reentrant rejects 0, callback allocations 0
 ```
 
-The single static-path underrun occurred in the test's empty start-up window;
-the backend fault and sustained 64-quantum maximum-object workload recorded no
-underrun. No path recorded an overrun, reentrant rejection, or callback-side
-allocation.
+The static path, backend fault, and sustained 64-quantum maximum-object workload
+recorded no underrun, overrun, reentrant rejection, or callback-side allocation.
 
 The selected 512-frame period was `106667` 100-ns units (10.6667 ms).
 `IAudioClient::GetStreamLatency` normally returned `279584` 100-ns units
 (27.9584 ms); one activation measured 27.2917 ms. `/usr/bin/time -l` on this
-profiled run reported 2.40 s real time, 0.25 s user CPU, 0.15 s system CPU,
-89,374,720-byte maximum resident set size, and an 81,922,256-byte peak memory
+profiled run reported 2.56 s real time, 0.26 s user CPU, 0.16 s system CPU,
+92,893,184-byte maximum resident set size, and an 85,629,400-byte peak memory
 footprint.
 
 The final unprofiled soak ran the complete focused test 1,753 times in 3,601
