@@ -12,6 +12,8 @@ below.
   and how a generated runtime identifies itself.
 - [`building.md`](building.md) covers the Apple Silicon build, verified external
   inputs, runtime promotion, signing, notarization, and regression checks.
+- [`hdr-edr.md`](hdr-edr.md) defines display-colour semantics, HDR/EDR provider
+  capability policy, lifecycle rules, and the graphics validation procedure.
 - [`msix.md`](msix.md) documents signed full-trust desktop MSIX/AppX deployment,
   `wineappx`, packaged process identity, recovery, and the unsupported UWP and
   Microsoft Store surfaces.
