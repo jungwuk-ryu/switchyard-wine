@@ -26,6 +26,7 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <math.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -64,6 +65,7 @@ static const char devpropkey_monitor_gpu_luidA[] = "Properties\\{CA085853-16CE-4
 static const char devpropkey_monitor_output_idA[] = "Properties\\{CA085853-16CE-48AA-B114-DE9C72334223}\\0002";
 static const char wine_devpropkey_monitor_rcworkA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0004";
 static const char wine_devpropkey_monitor_hdr_enabledA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0006";
+static const char wine_devpropkey_monitor_color_infoA[] = "Properties\\{233a9ef3-afc4-4abd-b564-c32f21f1535b}\\0007";
 
 static const WCHAR linkedW[] = {'L','i','n','k','e','d',0};
 static const WCHAR symbolic_link_valueW[] =
@@ -156,6 +158,7 @@ struct monitor
     BOOL is_clone;
     struct edid_monitor_info edid_info;
     BOOL hdr_enabled;
+    struct wine_monitor_color_info color_info;
 };
 
 static struct list gpus = LIST_INIT(gpus);
@@ -721,6 +724,93 @@ static BOOL read_source_from_registry( unsigned int index, struct source *source
     return TRUE;
 }
 
+static BOOL valid_chromaticity( float x, float y )
+{
+    return isfinite( x ) && isfinite( y ) && x >= 0.0f && y >= 0.0f
+            && x <= 1.0f && y <= 1.0f && x + y > 0.0f && x + y <= 1.0f;
+}
+
+static void sanitize_monitor_color_info( struct wine_monitor_color_info *dst,
+        const struct wine_monitor_color_info *src )
+{
+    UINT valid = src->valid_fields;
+
+    memset( dst, 0, sizeof(*dst) );
+    dst->capabilities = src->capabilities & (WINE_MONITOR_COLOR_CAPABILITY_WIDE_GAMUT
+            | WINE_MONITOR_COLOR_CAPABILITY_PQ | WINE_MONITOR_COLOR_CAPABILITY_HLG);
+
+    if ((valid & WINE_MONITOR_COLOR_VALID_BITS_PER_COLOR)
+            && src->bits_per_color && src->bits_per_color <= 32)
+    {
+        dst->bits_per_color = src->bits_per_color;
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_BITS_PER_COLOR;
+    }
+
+    if ((valid & WINE_MONITOR_COLOR_VALID_COLOR_SPACE)
+            && src->color_space > WINE_MONITOR_COLOR_SPACE_UNKNOWN
+            && src->color_space <= WINE_MONITOR_COLOR_SPACE_BT2100_HLG)
+    {
+        dst->color_space = src->color_space;
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_COLOR_SPACE;
+    }
+
+    if ((valid & WINE_MONITOR_COLOR_VALID_PRIMARIES)
+            && valid_chromaticity( src->red_x, src->red_y )
+            && valid_chromaticity( src->green_x, src->green_y )
+            && valid_chromaticity( src->blue_x, src->blue_y ))
+    {
+        dst->red_x = src->red_x;
+        dst->red_y = src->red_y;
+        dst->green_x = src->green_x;
+        dst->green_y = src->green_y;
+        dst->blue_x = src->blue_x;
+        dst->blue_y = src->blue_y;
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_PRIMARIES;
+    }
+
+    if ((valid & WINE_MONITOR_COLOR_VALID_WHITE_POINT)
+            && valid_chromaticity( src->white_x, src->white_y ))
+    {
+        dst->white_x = src->white_x;
+        dst->white_y = src->white_y;
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_WHITE_POINT;
+    }
+
+#define COPY_NONNEGATIVE(field, flag) \
+    if ((valid & (flag)) && isfinite( src->field ) && src->field >= 0.0f) \
+    { \
+        dst->field = src->field; \
+        dst->valid_fields |= (flag); \
+    }
+    COPY_NONNEGATIVE( min_luminance, WINE_MONITOR_COLOR_VALID_MIN_LUMINANCE );
+    COPY_NONNEGATIVE( max_luminance, WINE_MONITOR_COLOR_VALID_MAX_LUMINANCE );
+    COPY_NONNEGATIVE( max_full_frame_luminance, WINE_MONITOR_COLOR_VALID_MAX_FULL_FRAME_LUMINANCE );
+#undef COPY_NONNEGATIVE
+
+    if ((dst->valid_fields & (WINE_MONITOR_COLOR_VALID_MIN_LUMINANCE
+            | WINE_MONITOR_COLOR_VALID_MAX_LUMINANCE))
+            == (WINE_MONITOR_COLOR_VALID_MIN_LUMINANCE | WINE_MONITOR_COLOR_VALID_MAX_LUMINANCE)
+            && dst->min_luminance > dst->max_luminance)
+        dst->valid_fields &= ~WINE_MONITOR_COLOR_VALID_MIN_LUMINANCE;
+    if ((dst->valid_fields & (WINE_MONITOR_COLOR_VALID_MAX_LUMINANCE
+            | WINE_MONITOR_COLOR_VALID_MAX_FULL_FRAME_LUMINANCE))
+            == (WINE_MONITOR_COLOR_VALID_MAX_LUMINANCE
+            | WINE_MONITOR_COLOR_VALID_MAX_FULL_FRAME_LUMINANCE)
+            && dst->max_full_frame_luminance > dst->max_luminance)
+        dst->valid_fields &= ~WINE_MONITOR_COLOR_VALID_MAX_FULL_FRAME_LUMINANCE;
+
+#define COPY_HEADROOM(field, flag) \
+    if ((valid & (flag)) && isfinite( src->field ) && src->field >= 1.0f) \
+    { \
+        dst->field = src->field; \
+        dst->valid_fields |= (flag); \
+    }
+    COPY_HEADROOM( current_edr_headroom, WINE_MONITOR_COLOR_VALID_CURRENT_EDR_HEADROOM );
+    COPY_HEADROOM( potential_edr_headroom, WINE_MONITOR_COLOR_VALID_POTENTIAL_EDR_HEADROOM );
+    COPY_HEADROOM( reference_edr_headroom, WINE_MONITOR_COLOR_VALID_REFERENCE_EDR_HEADROOM );
+#undef COPY_HEADROOM
+}
+
 static BOOL read_monitor_from_registry( struct monitor *monitor )
 {
     char buffer[4096];
@@ -767,6 +857,14 @@ static BOOL read_monitor_from_registry( struct monitor *monitor )
         return FALSE;
     }
     monitor->hdr_enabled = *(const BOOL *)value->Data;
+
+    /* This property did not exist in older monitor records.  Treat absence as
+     * unknown and sanitize present registry data before exposing it. */
+    size = query_reg_subkey_value( hkey, wine_devpropkey_monitor_color_infoA,
+                                   value, sizeof(buffer) );
+    if (size == sizeof(struct wine_monitor_color_info))
+        sanitize_monitor_color_info( &monitor->color_info,
+                                     (const struct wine_monitor_color_info *)value->Data );
 
     NtClose( hkey );
     return TRUE;
@@ -1968,6 +2066,14 @@ static BOOL write_monitor_to_registry( struct monitor *monitor, const BYTE *edid
         NtClose( subkey );
     }
 
+    /* Wine host display colour information (all fields carry validity bits). */
+    if ((subkey = reg_create_ascii_key( hkey, wine_devpropkey_monitor_color_infoA, 0, NULL )))
+    {
+        set_reg_value( subkey, NULL, 0xffff0000 | DEVPROP_TYPE_BINARY,
+                       &monitor->color_info, sizeof(monitor->color_info) );
+        NtClose( subkey );
+    }
+
     NtClose( hkey );
 
 
@@ -1998,6 +2104,7 @@ static void add_monitor( const struct gdi_monitor *gdi_monitor, void *param )
     monitor->output_id = ctx->monitor_count;
     monitor->rc_work = gdi_monitor->rc_work;
     monitor->hdr_enabled = gdi_monitor->hdr_enabled;
+    sanitize_monitor_color_info( &monitor->color_info, &gdi_monitor->color_info );
 
     TRACE( "%u %s %s\n", monitor->id, wine_dbgstr_rect(&gdi_monitor->rc_monitor), wine_dbgstr_rect(&gdi_monitor->rc_work) );
 
@@ -4689,6 +4796,22 @@ static BOOL get_monitor_info( HMONITOR handle, MONITORINFO *info, UINT dpi )
 
     unlock_display_devices();
     WARN( "invalid handle %p\n", handle );
+    RtlSetLastWin32Error( ERROR_INVALID_MONITOR_HANDLE );
+    return FALSE;
+}
+
+static BOOL get_monitor_color_info( HMONITOR handle, struct wine_monitor_color_info *info )
+{
+    struct monitor *monitor;
+
+    if (!info) return FALSE;
+    memset( info, 0, sizeof(*info) );
+
+    if (!lock_display_devices( FALSE )) return FALSE;
+    if ((monitor = get_monitor_from_handle( handle ))) *info = monitor->color_info;
+    unlock_display_devices();
+
+    if (monitor) return TRUE;
     RtlSetLastWin32Error( ERROR_INVALID_MONITOR_HANDLE );
     return FALSE;
 }
@@ -7613,6 +7736,9 @@ ULONG_PTR WINAPI NtUserCallTwoParam( ULONG_PTR arg1, ULONG_PTR arg2, ULONG code 
     case NtUserCallTwoParam_GetMonitorInfo:
         return get_monitor_info( UlongToHandle(arg1), (MONITORINFO *)arg2, get_thread_dpi() );
 
+    case NtUserCallTwoParam_GetMonitorColorInfo:
+        return get_monitor_color_info( UlongToHandle(arg1), (struct wine_monitor_color_info *)arg2 );
+
     case NtUserCallTwoParam_GetSystemMetricsForDpi:
         return get_system_metrics_for_dpi( arg1, arg2 );
 
@@ -7846,7 +7972,7 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO *color_info = (DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO *)packet;
         struct monitor *monitor;
 
-        FIXME( "DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO semi-stub.\n" );
+        TRACE( "DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO.\n" );
 
         if (packet->size < sizeof(*color_info))
             return STATUS_INVALID_PARAMETER;
@@ -7860,18 +7986,25 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
                         sizeof(monitor->source->gpu->luid) ))
                 continue;
 
-            if (monitor->hdr_enabled)
-            {
-                color_info->advancedColorSupported = 1;
-                color_info->advancedColorEnabled = 1;
-                color_info->bitsPerColorChannel = 10;
-            }
-            else
-            {
-                color_info->advancedColorSupported = 0;
-                color_info->advancedColorEnabled = 0;
-                color_info->bitsPerColorChannel = 8;
-            }
+            color_info->advancedColorSupported = monitor->hdr_enabled
+                    || ((monitor->color_info.valid_fields
+                    & WINE_MONITOR_COLOR_VALID_POTENTIAL_EDR_HEADROOM)
+                    && monitor->color_info.potential_edr_headroom > 1.0f)
+                    || (monitor->color_info.capabilities
+                    & (WINE_MONITOR_COLOR_CAPABILITY_PQ | WINE_MONITOR_COLOR_CAPABILITY_HLG));
+            /* AppKit does not expose a separate system HDR switch.  Current EDR
+             * headroom normally remains 1.0 until a layer requests EDR, so using
+             * it alone would make capability discovery circular. */
+            color_info->advancedColorEnabled = monitor->hdr_enabled
+                    || ((monitor->color_info.valid_fields
+                    & WINE_MONITOR_COLOR_VALID_CURRENT_EDR_HEADROOM)
+                    && monitor->color_info.current_edr_headroom > 1.0f)
+                    || ((monitor->color_info.valid_fields & WINE_MONITOR_COLOR_VALID_COLOR_SPACE)
+                    && (monitor->color_info.color_space == WINE_MONITOR_COLOR_SPACE_BT2100_PQ
+                    || monitor->color_info.color_space == WINE_MONITOR_COLOR_SPACE_BT2100_HLG));
+            color_info->bitsPerColorChannel =
+                    monitor->color_info.valid_fields & WINE_MONITOR_COLOR_VALID_BITS_PER_COLOR
+                    ? monitor->color_info.bits_per_color : 0;
             color_info->wideColorEnforced = 0;
             color_info->advancedColorForceDisabled = 0;
             color_info->colorEncoding = DISPLAYCONFIG_COLOR_ENCODING_RGB;
@@ -7901,10 +8034,10 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
                 continue;
 
             /* DISPLAYCONFIG_SDR_WHITE_LEVEL is expressed as a multiplier of
-             * the 80 nit reference white, scaled by 1000.  Wine currently
-             * presents SDR content at that reference level. */
-            white_level->SDRWhiteLevel = 1000;
-            ret = STATUS_SUCCESS;
+             * the 80 nit reference white, scaled by 1000.  macOS public APIs
+             * expose EDR headroom ratios but not the absolute SDR white level
+             * for a display, so do not synthesize a Windows value here. */
+            ret = STATUS_NOT_SUPPORTED;
             break;
         }
 

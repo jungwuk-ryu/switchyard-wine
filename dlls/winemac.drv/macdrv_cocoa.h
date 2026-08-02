@@ -65,8 +65,10 @@
 
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "macdrv_res.h"
+#include "display_color.h"
 
 
 /* Must match the values of Cocoa's NSDragOperation enum. */
@@ -117,6 +119,36 @@ typedef struct macdrv_opaque_iosurface_layer* macdrv_iosurface_layer;
 typedef struct macdrv_opaque_status_item* macdrv_status_item;
 struct macdrv_event;
 struct macdrv_query;
+
+enum macdrv_metal_color_space
+{
+    MACDRV_METAL_COLOR_SPACE_SRGB,
+    MACDRV_METAL_COLOR_SPACE_EXTENDED_LINEAR_SRGB,
+    MACDRV_METAL_COLOR_SPACE_HDR10_PQ_BT2020,
+};
+
+enum macdrv_metal_pixel_format
+{
+    /* The Vulkan provider owns the CAMetalLayer format for the SDR path. */
+    MACDRV_METAL_PIXEL_FORMAT_PROVIDER,
+    MACDRV_METAL_PIXEL_FORMAT_RGBA16_FLOAT,
+    MACDRV_METAL_PIXEL_FORMAT_RGB10A2_UNORM,
+};
+
+struct macdrv_metal_color_config
+{
+    enum macdrv_metal_color_space color_space;
+    enum macdrv_metal_pixel_format pixel_format;
+    bool has_hdr10_metadata;
+    struct macdrv_hdr10_metadata hdr10_metadata;
+};
+
+enum macdrv_metal_color_result
+{
+    MACDRV_METAL_COLOR_SUCCESS,
+    MACDRV_METAL_COLOR_UNSUPPORTED,
+    MACDRV_METAL_COLOR_INVALID,
+};
 
 
 /* main */
@@ -264,6 +296,7 @@ struct macdrv_monitor
     unsigned char *edid;
     uint32_t edid_len;
     bool hdr_enabled;
+    struct macdrv_display_color_info color_info;
 };
 
 extern int macdrv_set_display_mode(CGDirectDisplayID id, CGDisplayModeRef display_mode);
@@ -565,6 +598,14 @@ extern void macdrv_view_release_metal_view(macdrv_metal_view v);
 extern macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v);
 extern macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* source_hwnd, CGRect bounds);
 extern macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain);
+extern enum macdrv_metal_color_result macdrv_swapchain_supports_color_config(
+        macdrv_metal_swapchain swapchain, const struct macdrv_metal_color_config *config);
+extern enum macdrv_metal_color_result macdrv_swapchain_set_color_config(
+        macdrv_metal_swapchain swapchain, const struct macdrv_metal_color_config *config);
+extern enum macdrv_metal_color_result macdrv_swapchain_validate_color_config(
+        macdrv_metal_swapchain swapchain, const struct macdrv_metal_color_config *config);
+extern enum macdrv_metal_color_result macdrv_swapchain_set_hdr10_metadata(
+        macdrv_metal_swapchain swapchain, const struct macdrv_hdr10_metadata *metadata);
 extern void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain);
 extern void macdrv_window_apply_compositor_node(macdrv_window w, uint64_t node_id,
                                                  uint64_t revision, unsigned int context_id,

@@ -2051,7 +2051,8 @@ static void test_QueryDisplayConfig_result(UINT32 flags,
         white_level.header.id = pi[i].targetInfo.id;
         white_level.SDRWhiteLevel = 0;
         ret = pDisplayConfigGetDeviceInfo(&white_level.header);
-        ok(!ret || broken(ret == ERROR_INVALID_PARAMETER) /* older Windows versions */,
+        ok(!ret || ret == ERROR_NOT_SUPPORTED
+                || broken(ret == ERROR_INVALID_PARAMETER) /* older Windows versions */,
                 "Expected 0, got %ld\n", ret);
         if (!ret) ok(white_level.SDRWhiteLevel, "Expected a nonzero SDR white level.\n");
 

@@ -1042,6 +1042,78 @@ void macdrv_displays_changed(const macdrv_event *event)
         NtUserCallNoParam(NtUserCallNoParam_DisplayModeChanged);
 }
 
+static void display_color_info_to_gdi(const struct macdrv_display_color_info *src,
+        struct wine_monitor_color_info *dst)
+{
+    memset(dst, 0, sizeof(*dst));
+
+    if (src->valid & MACDRV_DISPLAY_COLOR_BITS_PER_COLOR)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_BITS_PER_COLOR;
+    if (src->valid & MACDRV_DISPLAY_COLOR_PRIMARIES)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_PRIMARIES;
+    if (src->valid & MACDRV_DISPLAY_COLOR_WHITE_POINT)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_WHITE_POINT;
+    if (src->valid & MACDRV_DISPLAY_COLOR_MIN_LUMINANCE)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_MIN_LUMINANCE;
+    if (src->valid & MACDRV_DISPLAY_COLOR_MAX_LUMINANCE)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_MAX_LUMINANCE;
+    if (src->valid & MACDRV_DISPLAY_COLOR_MAX_FULL_FRAME_LUMINANCE)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_MAX_FULL_FRAME_LUMINANCE;
+    if (src->valid & MACDRV_DISPLAY_COLOR_CURRENT_EDR_HEADROOM)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_CURRENT_EDR_HEADROOM;
+    if (src->valid & MACDRV_DISPLAY_COLOR_POTENTIAL_EDR_HEADROOM)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_POTENTIAL_EDR_HEADROOM;
+    if (src->valid & MACDRV_DISPLAY_COLOR_REFERENCE_EDR_HEADROOM)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_REFERENCE_EDR_HEADROOM;
+
+    if (src->capabilities & MACDRV_DISPLAY_COLOR_WIDE_GAMUT)
+        dst->capabilities |= WINE_MONITOR_COLOR_CAPABILITY_WIDE_GAMUT;
+    if (src->capabilities & MACDRV_DISPLAY_COLOR_PQ)
+        dst->capabilities |= WINE_MONITOR_COLOR_CAPABILITY_PQ;
+    if (src->capabilities & MACDRV_DISPLAY_COLOR_HLG)
+        dst->capabilities |= WINE_MONITOR_COLOR_CAPABILITY_HLG;
+
+    switch (src->color_space)
+    {
+        case MACDRV_DISPLAY_COLOR_SPACE_SRGB:
+            dst->color_space = WINE_MONITOR_COLOR_SPACE_SRGB;
+            break;
+        case MACDRV_DISPLAY_COLOR_SPACE_BT709:
+            dst->color_space = WINE_MONITOR_COLOR_SPACE_BT709;
+            break;
+        case MACDRV_DISPLAY_COLOR_SPACE_EXTENDED_LINEAR_SRGB:
+            dst->color_space = WINE_MONITOR_COLOR_SPACE_EXTENDED_LINEAR_SRGB;
+            break;
+        case MACDRV_DISPLAY_COLOR_SPACE_BT2020:
+            dst->color_space = WINE_MONITOR_COLOR_SPACE_BT2020;
+            break;
+        case MACDRV_DISPLAY_COLOR_SPACE_BT2100_PQ:
+            dst->color_space = WINE_MONITOR_COLOR_SPACE_BT2100_PQ;
+            break;
+        case MACDRV_DISPLAY_COLOR_SPACE_BT2100_HLG:
+            dst->color_space = WINE_MONITOR_COLOR_SPACE_BT2100_HLG;
+            break;
+        default:
+            dst->color_space = WINE_MONITOR_COLOR_SPACE_UNKNOWN;
+            break;
+    }
+    if ((src->valid & MACDRV_DISPLAY_COLOR_COLOR_SPACE) &&
+            dst->color_space != WINE_MONITOR_COLOR_SPACE_UNKNOWN)
+        dst->valid_fields |= WINE_MONITOR_COLOR_VALID_COLOR_SPACE;
+
+    dst->bits_per_color = src->bits_per_color;
+    dst->red_x = src->red_x; dst->red_y = src->red_y;
+    dst->green_x = src->green_x; dst->green_y = src->green_y;
+    dst->blue_x = src->blue_x; dst->blue_y = src->blue_y;
+    dst->white_x = src->white_x; dst->white_y = src->white_y;
+    dst->min_luminance = src->min_luminance;
+    dst->max_luminance = src->max_luminance;
+    dst->max_full_frame_luminance = src->max_full_frame_luminance;
+    dst->current_edr_headroom = src->current_edr_headroom;
+    dst->potential_edr_headroom = src->potential_edr_headroom;
+    dst->reference_edr_headroom = src->reference_edr_headroom;
+}
+
 UINT macdrv_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param)
 {
     struct macdrv_adapter *adapters, *adapter;
@@ -1096,6 +1168,7 @@ UINT macdrv_UpdateDisplayDevices(const struct gdi_device_manager *device_manager
                     .edid = monitor->edid,
                     .hdr_enabled = monitor->hdr_enabled,
                 };
+                display_color_info_to_gdi(&monitor->color_info, &gdi_monitor.color_info);
                 device_manager->add_monitor( &gdi_monitor, param );
 
                 /* Get the current mode */

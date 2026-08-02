@@ -340,6 +340,7 @@ struct gdi_monitor
     unsigned char *edid;  /* Extended Device Identification Data */
     UINT edid_len;
     BOOL hdr_enabled;
+    struct wine_monitor_color_info color_info;
 };
 
 struct gdi_device_manager

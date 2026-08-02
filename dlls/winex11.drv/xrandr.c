@@ -1149,6 +1149,7 @@ static BOOL xrandr14_get_monitors( ULONG_PTR adapter_id, struct gdi_monitor **ne
                     enum_crtc_info->width == crtc_info->width &&
                     enum_crtc_info->height == crtc_info->height)
                 {
+                    memset( &monitors[monitor_count], 0, sizeof(monitors[monitor_count]) );
                     SetRect( &monitors[monitor_count].rc_monitor, crtc_info->x, crtc_info->y,
                              crtc_info->x + crtc_info->width, crtc_info->y + crtc_info->height );
                     monitors[monitor_count].rc_work = get_work_area( &monitors[monitor_count].rc_monitor );

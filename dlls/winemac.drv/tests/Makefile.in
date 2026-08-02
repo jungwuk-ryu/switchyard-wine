@@ -1,0 +1,5 @@
+PROGRAMS = display_color
+EXTRADEFS = -DMACDRV_NATIVE_TEST
+
+SOURCES = \
+	display_color.c

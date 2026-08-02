@@ -1291,6 +1291,7 @@ enum
     NtUserCallTwoParam_GetDialogProc,
     NtUserCallTwoParam_GetMenuInfo,
     NtUserCallTwoParam_GetMonitorInfo,
+    NtUserCallTwoParam_GetMonitorColorInfo,
     NtUserCallTwoParam_GetSystemMetricsForDpi,
     NtUserCallTwoParam_MonitorFromRect,
     NtUserCallTwoParam_SetIconParam,
@@ -1316,6 +1317,58 @@ static inline BOOL NtUserGetMonitorInfo( HMONITOR monitor, MONITORINFO *info )
 {
     return NtUserCallTwoParam( HandleToUlong(monitor), (ULONG_PTR)info,
                                NtUserCallTwoParam_GetMonitorInfo );
+}
+
+/* Host display colour information.  Every value is optional; callers must
+ * consult valid_fields instead of treating zero as an available measurement. */
+#define WINE_MONITOR_COLOR_VALID_BITS_PER_COLOR            0x00000001
+#define WINE_MONITOR_COLOR_VALID_PRIMARIES                  0x00000002
+#define WINE_MONITOR_COLOR_VALID_WHITE_POINT                0x00000004
+#define WINE_MONITOR_COLOR_VALID_MIN_LUMINANCE              0x00000008
+#define WINE_MONITOR_COLOR_VALID_MAX_LUMINANCE              0x00000010
+#define WINE_MONITOR_COLOR_VALID_MAX_FULL_FRAME_LUMINANCE   0x00000020
+#define WINE_MONITOR_COLOR_VALID_CURRENT_EDR_HEADROOM       0x00000040
+#define WINE_MONITOR_COLOR_VALID_POTENTIAL_EDR_HEADROOM     0x00000080
+#define WINE_MONITOR_COLOR_VALID_REFERENCE_EDR_HEADROOM     0x00000100
+#define WINE_MONITOR_COLOR_VALID_COLOR_SPACE                0x00000200
+
+#define WINE_MONITOR_COLOR_CAPABILITY_WIDE_GAMUT            0x00000001
+#define WINE_MONITOR_COLOR_CAPABILITY_PQ                    0x00000002
+#define WINE_MONITOR_COLOR_CAPABILITY_HLG                   0x00000004
+
+enum wine_monitor_color_space
+{
+    WINE_MONITOR_COLOR_SPACE_UNKNOWN,
+    WINE_MONITOR_COLOR_SPACE_SRGB,
+    WINE_MONITOR_COLOR_SPACE_BT709,
+    WINE_MONITOR_COLOR_SPACE_EXTENDED_LINEAR_SRGB,
+    WINE_MONITOR_COLOR_SPACE_BT2020,
+    WINE_MONITOR_COLOR_SPACE_BT2100_PQ,
+    WINE_MONITOR_COLOR_SPACE_BT2100_HLG,
+};
+
+struct wine_monitor_color_info
+{
+    UINT valid_fields;
+    UINT capabilities;
+    UINT bits_per_color;
+    enum wine_monitor_color_space color_space;
+    float red_x, red_y;
+    float green_x, green_y;
+    float blue_x, blue_y;
+    float white_x, white_y;
+    float min_luminance;             /* cd/m^2 */
+    float max_luminance;             /* cd/m^2 */
+    float max_full_frame_luminance;  /* cd/m^2 */
+    float current_edr_headroom;      /* ratio to SDR reference white */
+    float potential_edr_headroom;    /* ratio to SDR reference white */
+    float reference_edr_headroom;    /* ratio to SDR reference white */
+};
+
+static inline BOOL NtUserGetMonitorColorInfo( HMONITOR monitor, struct wine_monitor_color_info *info )
+{
+    return NtUserCallTwoParam( HandleToUlong(monitor), (ULONG_PTR)info,
+                               NtUserCallTwoParam_GetMonitorColorInfo );
 }
 
 static inline INT NtUserGetSystemMetricsForDpi( INT index, UINT dpi )

@@ -23102,6 +23102,7 @@ wine_fn_config_makefile dlls/winedmo enable_winedmo
 wine_fn_config_makefile dlls/winegstreamer enable_winegstreamer
 wine_fn_config_makefile dlls/winehid.sys enable_winehid_sys
 wine_fn_config_makefile dlls/winemac.drv enable_winemac_drv
+wine_fn_config_makefile dlls/winemac.drv/tests enable_tests
 wine_fn_config_makefile dlls/winemapi enable_winemapi
 wine_fn_config_makefile dlls/wineoss.drv enable_wineoss_drv
 wine_fn_config_makefile dlls/wineps.drv enable_wineps_drv

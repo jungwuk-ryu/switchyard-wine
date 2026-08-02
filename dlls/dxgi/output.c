@@ -17,6 +17,7 @@
  */
 
 #include "dxgi_private.h"
+#include "ntuser.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dxgi);
 
@@ -600,12 +601,13 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_GetDesc1(IDXGIOutput6 *iface,
         DXGI_OUTPUT_DESC1 *desc)
 {
     struct dxgi_output *output = impl_from_IDXGIOutput6(iface);
+    struct wine_monitor_color_info color_info = {0};
     struct wined3d_output_desc wined3d_desc;
     enum wined3d_display_rotation rotation;
     struct wined3d_display_mode mode;
     HRESULT hr;
 
-    FIXME("iface %p, desc %p semi-stub!\n", iface, desc);
+    TRACE("iface %p, desc %p.\n", iface, desc);
 
     if (!desc)
         return E_INVALIDARG;
@@ -640,20 +642,61 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_GetDesc1(IDXGIOutput6 *iface,
     desc->Rotation = dxgi_mode_rotation_from_wined3d(rotation);
     desc->Monitor = wined3d_desc.monitor;
 
-    /* FIXME: fill this from monitor EDID */
     desc->BitsPerColor = 0;
-    desc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-    desc->RedPrimary[0] = 0.f;
-    desc->RedPrimary[1] = 0.f;
-    desc->GreenPrimary[0] = 0.f;
-    desc->GreenPrimary[1] = 0.f;
-    desc->BluePrimary[0] = 0.f;
-    desc->BluePrimary[1] = 0.f;
-    desc->WhitePoint[0] = 0.f;
-    desc->WhitePoint[1] = 0.f;
-    desc->MinLuminance = 0.f;
-    desc->MaxLuminance = 0.f;
-    desc->MaxFullFrameLuminance = 0.f;
+    desc->ColorSpace = DXGI_COLOR_SPACE_CUSTOM;
+    memset(desc->RedPrimary, 0, sizeof(desc->RedPrimary));
+    memset(desc->GreenPrimary, 0, sizeof(desc->GreenPrimary));
+    memset(desc->BluePrimary, 0, sizeof(desc->BluePrimary));
+    memset(desc->WhitePoint, 0, sizeof(desc->WhitePoint));
+    desc->MinLuminance = 0.0f;
+    desc->MaxLuminance = 0.0f;
+    desc->MaxFullFrameLuminance = 0.0f;
+
+    if (!NtUserGetMonitorColorInfo(desc->Monitor, &color_info))
+    {
+        WARN("No host colour information is available for monitor %p.\n", desc->Monitor);
+        return S_OK;
+    }
+
+    if (color_info.valid_fields & WINE_MONITOR_COLOR_VALID_BITS_PER_COLOR)
+        desc->BitsPerColor = color_info.bits_per_color;
+    if (color_info.valid_fields & WINE_MONITOR_COLOR_VALID_COLOR_SPACE)
+    {
+        switch (color_info.color_space)
+        {
+            case WINE_MONITOR_COLOR_SPACE_SRGB:
+            case WINE_MONITOR_COLOR_SPACE_BT709:
+                desc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+                break;
+            case WINE_MONITOR_COLOR_SPACE_BT2100_PQ:
+                desc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                break;
+            default:
+                /* DXGI has no exact RGB output encoding for the remaining
+                 * host spaces.  CUSTOM is more accurate than inventing one. */
+                break;
+        }
+    }
+    if (color_info.valid_fields & WINE_MONITOR_COLOR_VALID_PRIMARIES)
+    {
+        desc->RedPrimary[0] = color_info.red_x;
+        desc->RedPrimary[1] = color_info.red_y;
+        desc->GreenPrimary[0] = color_info.green_x;
+        desc->GreenPrimary[1] = color_info.green_y;
+        desc->BluePrimary[0] = color_info.blue_x;
+        desc->BluePrimary[1] = color_info.blue_y;
+    }
+    if (color_info.valid_fields & WINE_MONITOR_COLOR_VALID_WHITE_POINT)
+    {
+        desc->WhitePoint[0] = color_info.white_x;
+        desc->WhitePoint[1] = color_info.white_y;
+    }
+    if (color_info.valid_fields & WINE_MONITOR_COLOR_VALID_MIN_LUMINANCE)
+        desc->MinLuminance = color_info.min_luminance;
+    if (color_info.valid_fields & WINE_MONITOR_COLOR_VALID_MAX_LUMINANCE)
+        desc->MaxLuminance = color_info.max_luminance;
+    if (color_info.valid_fields & WINE_MONITOR_COLOR_VALID_MAX_FULL_FRAME_LUMINANCE)
+        desc->MaxFullFrameLuminance = color_info.max_full_frame_luminance;
 
     return S_OK;
 }

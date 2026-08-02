@@ -21,17 +21,38 @@
 #include "config.h"
 
 #import <AppKit/AppKit.h>
+#import <ColorSync/ColorSync.h>
 #import <IOKit/graphics/IOGraphicsLib.h>
 #ifdef HAVE_MTLDEVICE_REGISTRYID
 #import <Metal/Metal.h>
 #endif
 #include <dlfcn.h>
+#include <math.h>
 #include "macdrv_cocoa.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
 static uint64_t dedicated_gpu_id;
 static uint64_t integrated_gpu_id;
+
+#define MACDRV_MAX_EDID_SIZE (256 * 128)
+#define MACDRV_MAX_ICC_SIZE (16 * 1024 * 1024)
+#define MACDRV_MAX_DISPLAYS 1024
+
+static uint16_t read_edid_be16(const unsigned char *data)
+{
+    return ((uint16_t)data[0] << 8) | data[1];
+}
+
+static uint16_t read_edid_le16(const unsigned char *data)
+{
+    return data[0] | ((uint16_t)data[1] << 8);
+}
+
+static uint32_t read_edid_le32(const unsigned char *data)
+{
+    return data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
 
 /***********************************************************************
  *              convert_display_rect
@@ -44,6 +65,176 @@ static inline CGRect convert_display_rect(NSRect in_rect, NSRect primary_frame)
     CGRect out_rect = NSRectToCGRect(in_rect);
     out_rect.origin.y = NSMaxY(primary_frame) - NSMaxY(in_rect);
     return out_rect;
+}
+
+static void classify_display_color_space(CGColorSpaceRef color_space,
+        struct macdrv_display_color_info *info)
+{
+    CFStringRef name;
+
+    if (!color_space || !(name = CGColorSpaceCopyName(color_space))) return;
+    if (CFEqual(name, kCGColorSpaceSRGB))
+    {
+        info->color_space = MACDRV_DISPLAY_COLOR_SPACE_SRGB;
+        goto found;
+    }
+#if defined(MAC_OS_X_VERSION_10_11) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_11
+    if (@available(macOS 10.11, *))
+    {
+        if (CFEqual(name, kCGColorSpaceITUR_709))
+        {
+            info->color_space = MACDRV_DISPLAY_COLOR_SPACE_BT709;
+            goto found;
+        }
+        if (CFEqual(name, kCGColorSpaceITUR_2020))
+        {
+            info->color_space = MACDRV_DISPLAY_COLOR_SPACE_BT2020;
+            goto found;
+        }
+    }
+#endif
+#if defined(MAC_OS_X_VERSION_10_12) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_12
+    if (@available(macOS 10.12, *))
+    {
+        if (CFEqual(name, kCGColorSpaceExtendedLinearSRGB))
+        {
+            info->color_space = MACDRV_DISPLAY_COLOR_SPACE_EXTENDED_LINEAR_SRGB;
+            goto found;
+        }
+    }
+#endif
+#if defined(MAC_OS_X_VERSION_11_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_11_0
+    if (@available(macOS 11.0, *))
+    {
+        if (CFEqual(name, kCGColorSpaceITUR_2100_PQ))
+        {
+            info->color_space = MACDRV_DISPLAY_COLOR_SPACE_BT2100_PQ;
+            info->capabilities |= MACDRV_DISPLAY_COLOR_PQ;
+            goto found;
+        }
+        else if (CFEqual(name, kCGColorSpaceITUR_2100_HLG))
+        {
+            info->color_space = MACDRV_DISPLAY_COLOR_SPACE_BT2100_HLG;
+            info->capabilities |= MACDRV_DISPLAY_COLOR_HLG;
+            goto found;
+        }
+    }
+#endif
+    CFRelease(name);
+    return;
+
+found:
+    info->valid |= MACDRV_DISPLAY_COLOR_COLOR_SPACE;
+    CFRelease(name);
+}
+
+static unsigned int display_bits_per_color(NSScreen *screen)
+{
+    NSNumber *bits = screen.deviceDescription[NSDeviceBitsPerSample];
+    unsigned int value;
+
+    if ([bits isKindOfClass:[NSNumber class]] && (value = bits.unsignedIntValue) && value <= 32)
+        return value;
+    return 0;
+}
+
+static void get_display_color_info(NSScreen *screen, CGDirectDisplayID display_id,
+        struct macdrv_display_color_info *info)
+{
+    struct macdrv_display_color_info profile_info = {0};
+    ColorSyncProfileRef profile;
+    CGColorSpaceRef color_space;
+    CFDataRef profile_data;
+    CFIndex length;
+    CGFloat value;
+    unsigned int bits;
+
+    if ((bits = display_bits_per_color(screen)))
+    {
+        info->bits_per_color = bits;
+        info->valid |= MACDRV_DISPLAY_COLOR_BITS_PER_COLOR;
+    }
+
+    color_space = CGDisplayCopyColorSpace(display_id);
+    if (color_space)
+        classify_display_color_space(color_space, info);
+
+    profile = ColorSyncProfileCreateWithDisplayID(display_id);
+    if (profile)
+    {
+        if (ColorSyncProfileIsWideGamut(profile))
+            info->capabilities |= MACDRV_DISPLAY_COLOR_WIDE_GAMUT;
+#if defined(MAC_OS_X_VERSION_11_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_11_0
+        if (@available(macOS 11.0, *))
+        {
+            if (ColorSyncProfileIsPQBased(profile)) info->capabilities |= MACDRV_DISPLAY_COLOR_PQ;
+            if (ColorSyncProfileIsHLGBased(profile)) info->capabilities |= MACDRV_DISPLAY_COLOR_HLG;
+        }
+#endif
+        if ((profile_data = ColorSyncProfileCopyData(profile, NULL)))
+        {
+            length = CFDataGetLength(profile_data);
+            if (length > 0 && length <= MACDRV_MAX_ICC_SIZE)
+            {
+                macdrv_parse_icc_color_info(CFDataGetBytePtr(profile_data), length, &profile_info);
+                macdrv_merge_display_color_info(info, &profile_info);
+            }
+            CFRelease(profile_data);
+        }
+        CFRelease(profile);
+    }
+
+    /* CG can still expose a usable public ICC profile when ColorSync has no registered display profile. */
+    if (color_space)
+    {
+#if defined(MAC_OS_X_VERSION_10_12) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_12
+        if (@available(macOS 10.12, *))
+        {
+            if (CGColorSpaceIsWideGamutRGB(color_space))
+                info->capabilities |= MACDRV_DISPLAY_COLOR_WIDE_GAMUT;
+            if ((profile_data = CGColorSpaceCopyICCData(color_space)))
+            {
+                length = CFDataGetLength(profile_data);
+                if (length > 0 && length <= MACDRV_MAX_ICC_SIZE)
+                {
+                    macdrv_parse_icc_color_info(CFDataGetBytePtr(profile_data), length, &profile_info);
+                    macdrv_merge_display_color_info(info, &profile_info);
+                }
+                CFRelease(profile_data);
+            }
+        }
+#endif
+        CGColorSpaceRelease(color_space);
+    }
+
+#if defined(MAC_OS_X_VERSION_10_11) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_11
+    if (@available(macOS 10.11, *))
+    {
+        value = screen.maximumExtendedDynamicRangeColorComponentValue;
+        if (isfinite(value) && value > 0.0)
+        {
+            info->current_edr_headroom = value;
+            info->valid |= MACDRV_DISPLAY_COLOR_CURRENT_EDR_HEADROOM;
+        }
+    }
+#endif
+#if defined(MAC_OS_X_VERSION_10_15) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_15
+    if (@available(macOS 10.15, *))
+    {
+        value = screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+        if (isfinite(value) && value > 0.0)
+        {
+            info->potential_edr_headroom = value;
+            info->valid |= MACDRV_DISPLAY_COLOR_POTENTIAL_EDR_HEADROOM;
+        }
+        value = screen.maximumReferenceExtendedDynamicRangeColorComponentValue;
+        if (isfinite(value) && value > 0.0)
+        {
+            info->reference_edr_headroom = value;
+            info->valid |= MACDRV_DISPLAY_COLOR_REFERENCE_EDR_HEADROOM;
+        }
+    }
+#endif
 }
 
 
@@ -624,7 +815,7 @@ static CFDataRef get_edid_from_dcpav_service_proxy(uint32_t vendor_number, uint3
 
         edid_result = pIOAVServiceCopyEDID(avservice, &edid);
         CFRelease(avservice);
-        if (edid_result != kIOReturnSuccess || !edid || CFDataGetLength(edid) < 13)
+        if (edid_result != kIOReturnSuccess || !edid || CFDataGetLength(edid) < 16)
         {
             if (edid)
             {
@@ -635,9 +826,9 @@ static CFDataRef get_edid_from_dcpav_service_proxy(uint32_t vendor_number, uint3
         }
 
         edid_ptr = CFDataGetBytePtr(edid);
-        vendor_number_edid = (uint16_t)(edid_ptr[9] | (edid_ptr[8] << 8));
-        model_number_edid = *((uint16_t *)&edid_ptr[10]);
-        serial_number_edid = *((uint32_t *)&edid_ptr[12]);
+        vendor_number_edid = read_edid_be16(edid_ptr + 8);
+        model_number_edid = read_edid_le16(edid_ptr + 10);
+        serial_number_edid = read_edid_le32(edid_ptr + 12);
         if (vendor_number == vendor_number_edid &&
                 model_number == model_number_edid &&
                 serial_number == serial_number_edid)
@@ -673,12 +864,12 @@ static CFDataRef get_edid_from_io_display_edid(uint32_t vendor_number, uint32_t 
         if (display_dict)
         {
             edid = CFDictionaryGetValue(display_dict, CFSTR(kIODisplayEDIDKey));
-            if (edid && (CFDataGetLength(edid) >= 13))
+            if (edid && (CFDataGetLength(edid) >= 16))
             {
                 edid_ptr = CFDataGetBytePtr(edid);
-                vendor_number_edid = (uint16_t)(edid_ptr[9] | (edid_ptr[8] << 8));
-                model_number_edid = *((uint16_t *)&edid_ptr[10]);
-                serial_number_edid = *((uint32_t *)&edid_ptr[12]);
+                vendor_number_edid = read_edid_be16(edid_ptr + 8);
+                model_number_edid = read_edid_le16(edid_ptr + 10);
+                serial_number_edid = read_edid_le32(edid_ptr + 12);
                 if (vendor_number == vendor_number_edid &&
                         model_number == model_number_edid &&
                         /* CGDisplaySerialNumber() isn't reliable on Intel machines; it returns 0 sometimes. */
@@ -904,8 +1095,8 @@ int macdrv_get_monitors(CGDirectDisplayID adapter_id, struct macdrv_monitor** ne
 {
     struct macdrv_monitor* monitors = NULL;
     struct macdrv_monitor* realloc_monitors;
-    CGDirectDisplayID display_ids[16];
-    uint32_t display_id_count, vendor_number, model_number, serial_number;
+    CGDirectDisplayID *display_ids = NULL;
+    uint32_t display_id_capacity, display_id_count, vendor_number, model_number, serial_number;
     NSArray<NSScreen *> *screens = [NSScreen screens];
     NSRect primary_frame;
     int primary_index = 0;
@@ -920,8 +1111,13 @@ int macdrv_get_monitors(CGDirectDisplayID adapter_id, struct macdrv_monitor** ne
     if (!monitors)
         return -1;
 
-    if (CGGetOnlineDisplayList(sizeof(display_ids) / sizeof(display_ids[0]), display_ids, &display_id_count)
-        != kCGErrorSuccess)
+    if (CGGetOnlineDisplayList(0, NULL, &display_id_capacity) != kCGErrorSuccess ||
+            !display_id_capacity || display_id_capacity > MACDRV_MAX_DISPLAYS)
+        goto done;
+    if (!(display_ids = malloc(sizeof(*display_ids) * display_id_capacity)))
+        goto done;
+    if (CGGetOnlineDisplayList(display_id_capacity, display_ids, &display_id_count) != kCGErrorSuccess ||
+            display_id_count > display_id_capacity)
         goto done;
 
     screens = [NSScreen screens];
@@ -943,6 +1139,7 @@ int macdrv_get_monitors(CGDirectDisplayID adapter_id, struct macdrv_monitor** ne
             NSScreen* screen = screens[j];
             CGDirectDisplayID screen_displayID = [[screen deviceDescription][@"NSScreenNumber"] unsignedIntValue];
             CFDataRef edid_data;
+            bool edid_color_is_public = false;
             size_t length;
 
             if (screen_displayID == display_ids[i]
@@ -951,12 +1148,17 @@ int macdrv_get_monitors(CGDirectDisplayID adapter_id, struct macdrv_monitor** ne
                 /* Allocate more space if needed */
                 if (monitor_count >= capacity)
                 {
+                    int old_capacity = capacity;
+
                     capacity *= 2;
                     realloc_monitors = realloc(monitors, sizeof(*monitors) * capacity);
                     if (!realloc_monitors)
                         goto done;
                     monitors = realloc_monitors;
+                    memset(monitors + old_capacity, 0, sizeof(*monitors) * (capacity - old_capacity));
                 }
+
+                memset(&monitors[monitor_count], 0, sizeof(monitors[monitor_count]));
 
                 if (j == 0)
                     primary_index = monitor_count;
@@ -969,28 +1171,45 @@ int macdrv_get_monitors(CGDirectDisplayID adapter_id, struct macdrv_monitor** ne
                 model_number = CGDisplayModelNumber(monitors[monitor_count].id);
                 serial_number = CGDisplaySerialNumber(monitors[monitor_count].id);
 
-                edid_data = get_edid_from_dcpav_service_proxy(vendor_number, model_number, serial_number);
-                if (!edid_data)
-                    edid_data = get_edid_from_io_display_edid(vendor_number, model_number, serial_number);
+                edid_data = get_edid_from_io_display_edid(vendor_number, model_number, serial_number);
+                if (edid_data)
+                    edid_color_is_public = true;
+                else
+                {
+                    /* Preserve the legacy EDID fallback, but do not derive colour capabilities from its private API. */
+                    edid_data = get_edid_from_dcpav_service_proxy(vendor_number, model_number, serial_number);
+                }
                 if (!edid_data)
                     edid_data = generate_edid(monitors[monitor_count].id, vendor_number, model_number, serial_number);
-                if (edid_data && (length = CFDataGetLength(edid_data)))
+                if (edid_data)
                 {
-                    const unsigned char *edid_ptr = CFDataGetBytePtr(edid_data);
+                    CFIndex cf_length = CFDataGetLength(edid_data);
 
-                    if ((monitors[monitor_count].edid = malloc(length)))
+                    if (cf_length > 0 && cf_length <= MACDRV_MAX_EDID_SIZE)
                     {
-                        monitors[monitor_count].edid_len = length;
-                        memcpy(monitors[monitor_count].edid, edid_ptr, length);
+                        const unsigned char *edid_ptr = CFDataGetBytePtr(edid_data);
+                        struct macdrv_display_color_info edid_info;
+
+                        length = cf_length;
+                        if (edid_color_is_public)
+                        {
+                            macdrv_parse_edid_color_info(edid_ptr, length, &edid_info);
+                            macdrv_merge_display_color_info(&monitors[monitor_count].color_info, &edid_info);
+                        }
+                        if ((monitors[monitor_count].edid = malloc(length)))
+                        {
+                            monitors[monitor_count].edid_len = length;
+                            memcpy(monitors[monitor_count].edid, edid_ptr, length);
+                        }
                     }
                     CFRelease(edid_data);
                 }
 
-                monitors[monitor_count].hdr_enabled = false;
-#if defined(MAC_OS_X_VERSION_10_15) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_15
-                if (@available(macOS 10.15, *))
-                    monitors[monitor_count].hdr_enabled = (screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0) ? true : false;
-#endif
+                get_display_color_info(screen, monitors[monitor_count].id,
+                        &monitors[monitor_count].color_info);
+                monitors[monitor_count].hdr_enabled =
+                        (monitors[monitor_count].color_info.valid & MACDRV_DISPLAY_COLOR_POTENTIAL_EDR_HEADROOM) &&
+                        monitors[monitor_count].color_info.potential_edr_headroom > 1.0;
                 monitor_count++;
                 break;
             }
@@ -1010,6 +1229,7 @@ int macdrv_get_monitors(CGDirectDisplayID adapter_id, struct macdrv_monitor** ne
     *count = monitor_count;
     ret = 0;
 done:
+    free(display_ids);
     if (ret)
         macdrv_free_monitors(monitors, capacity);
     return ret;
