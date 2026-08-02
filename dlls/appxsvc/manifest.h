@@ -28,6 +28,7 @@
 #define APPX_MANIFEST_MAX_DEPENDENCIES         128
 #define APPX_MANIFEST_MAX_TARGET_FAMILIES      32
 #define APPX_MANIFEST_MAX_INPROC_CLASSES       1024
+#define APPX_MANIFEST_MAX_LOADER_SEARCH_PATHS  5
 
 typedef struct appx_manifest APPX_MANIFEST;
 
@@ -107,6 +108,9 @@ struct appx_manifest_application
     const WCHAR *trust_level;
     const WCHAR *parameters;
     const WCHAR *current_directory_path;
+    const WCHAR *loader_search_paths[APPX_MANIFEST_MAX_LOADER_SEARCH_PATHS];
+    UINT32 loader_search_path_count;
+    BOOL has_loader_search_path_override;
     enum appx_manifest_activation_kind activation_kind;
 };
 
@@ -144,6 +148,12 @@ BOOL WINAPI appx_manifest_is_supported( const APPX_MANIFEST *manifest );
 BOOL WINAPI appx_manifest_is_framework( const APPX_MANIFEST *manifest );
 BOOL WINAPI appx_manifest_is_resource_package( const APPX_MANIFEST *manifest );
 BOOL WINAPI appx_manifest_has_run_full_trust( const APPX_MANIFEST *manifest );
+BOOL WINAPI appx_manifest_has_loader_search_path_override(
+    const APPX_MANIFEST *manifest );
+UINT32 WINAPI appx_manifest_get_loader_search_path_count(
+    const APPX_MANIFEST *manifest );
+const WCHAR * WINAPI appx_manifest_get_loader_search_path(
+    const APPX_MANIFEST *manifest, UINT32 index );
 
 UINT32 WINAPI appx_manifest_get_application_count( const APPX_MANIFEST *manifest );
 const struct appx_manifest_application * WINAPI appx_manifest_get_application(

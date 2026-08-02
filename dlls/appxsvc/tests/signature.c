@@ -49,11 +49,23 @@ static HRESULT (WINAPI *p_appx_signature_decode_digest_set)(
     const BYTE *, SIZE_T, struct appx_signature_digest_set * );
 static HRESULT (WINAPI *p_appx_signature_decode_indirect_data)(
     const BYTE *, SIZE_T, struct appx_signature_digest_set * );
+static HRESULT (WINAPI *p_appx_signature_decode_indirect_data_ex)(
+    const BYTE *, SIZE_T, UINT32, struct appx_signature_digest_set * );
 static HRESULT (WINAPI *p_appx_signature_compare_digest_sets)(
     const struct appx_signature_digest_set *,
     const struct appx_signature_digest_set * );
 static HRESULT (WINAPI *p_appx_signature_verify_digest_set)(
     const APPX_SIGNATURE *, const struct appx_signature_digest_set * );
+static HRESULT (WINAPI *p_appx_signature_validate_leaf_extensions)(
+    const CERT_EXTENSION *, UINT32, BOOL );
+static HRESULT (WINAPI *p_appx_signature_select_ess_attribute)(
+    UINT32, UINT32, UINT32 * );
+static HRESULT (WINAPI *p_appx_signature_validate_ess_certificate)(
+    const BYTE *, UINT32, UINT32, const BYTE *, UINT32 );
+static HRESULT (WINAPI *p_appx_signature_get_chain_policy)(
+    UINT32, BOOL, DWORD, DWORD *, DWORD * );
+static HRESULT (WINAPI *p_appx_signature_evaluate_chain_status)(
+    UINT32, BOOL, HRESULT, DWORD );
 
 /*
  * AppxSignature.p7x from microsoft/msix-packaging
@@ -352,6 +364,12 @@ static void test_digest_sets( void )
 
 static void test_indirect_data( void )
 {
+    static const BYTE package_sip_guid[] =
+        {0x4b,0xdf,0xc5,0x0a,0x07,0xce,0xe2,0x4d,
+         0xb7,0x6e,0x23,0xc8,0x39,0xa0,0x9f,0xd1};
+    static const BYTE bundle_sip_guid[] =
+        {0xb3,0x58,0x5f,0x0f,0xde,0xaa,0x9a,0x4b,
+         0xa4,0x34,0x95,0x74,0x2d,0x92,0xec,0xeb};
     struct appx_signature_digest_set set;
     struct indirect_fixture fixture;
     HRESULT hr;
@@ -361,6 +379,32 @@ static void test_indirect_data( void )
     hr = p_appx_signature_decode_indirect_data( fixture.data, fixture.size, &set );
     ok( hr == S_OK, "base indirect data returned %#lx.\n", hr );
     ok( set.flags == APPX_SIGNATURE_DIGEST_REQUIRED, "got flags %#x.\n", set.flags );
+    hr = p_appx_signature_decode_indirect_data_ex(
+        fixture.data, fixture.size, 0, &set );
+    ok( hr == S_OK, "typed package indirect data returned %#lx.\n", hr );
+
+    memcpy( fixture.data + fixture.guid, bundle_sip_guid,
+            sizeof(bundle_sip_guid) );
+    hr = p_appx_signature_decode_indirect_data(
+        fixture.data, fixture.size, &set );
+    ok( hr == APPX_E_INVALID_SIP_CLIENT_DATA,
+        "package decoder accepted bundle SIP GUID, got %#lx.\n", hr );
+    hr = p_appx_signature_decode_indirect_data_ex(
+        fixture.data, fixture.size, APPX_SIGNATURE_VERIFY_BUNDLE, &set );
+    ok( hr == S_OK, "typed bundle indirect data returned %#lx.\n", hr );
+    hr = p_appx_signature_decode_indirect_data_ex(
+        fixture.data, fixture.size, 0, &set );
+    ok( hr == APPX_E_INVALID_SIP_CLIENT_DATA,
+        "typed package decoder accepted bundle SIP GUID, got %#lx.\n", hr );
+    hr = p_appx_signature_decode_indirect_data_ex(
+        fixture.data, fixture.size, 0x80000000, &set );
+    ok( hr == E_INVALIDARG, "unknown SIP type flag returned %#lx.\n", hr );
+    memcpy( fixture.data + fixture.guid, package_sip_guid,
+            sizeof(package_sip_guid) );
+    hr = p_appx_signature_decode_indirect_data_ex(
+        fixture.data, fixture.size, APPX_SIGNATURE_VERIFY_BUNDLE, &set );
+    ok( hr == APPX_E_INVALID_SIP_CLIENT_DATA,
+        "bundle decoder accepted package SIP GUID, got %#lx.\n", hr );
 
     make_indirect_fixture( &fixture, TRUE );
     ok( fixture.size == 264, "AXCI indirect data has size %Iu.\n", fixture.size );
@@ -397,6 +441,296 @@ static void test_indirect_data( void )
         "accepted NULL indirect data.\n" );
     ok( p_appx_signature_decode_indirect_data( fixture.data, fixture.size, NULL ) == E_INVALIDARG,
         "accepted NULL indirect output.\n" );
+}
+
+static void set_extension( CERT_EXTENSION *extension, const char *oid,
+                           BOOL critical, BYTE *value, DWORD size )
+{
+    memset( extension, 0, sizeof(*extension) );
+    extension->pszObjId = (char *)oid;
+    extension->fCritical = critical;
+    extension->Value.pbData = value;
+    extension->Value.cbData = size;
+}
+
+static void test_leaf_extensions( void )
+{
+    static BYTE digital_signature[] = {0x03,0x02,0x07,0x80};
+    static BYTE non_repudiation[] = {0x03,0x02,0x06,0x40};
+    static BYTE key_encipherment[] = {0x03,0x02,0x05,0x20};
+    static BYTE malformed_unused_bits[] = {0x03,0x02,0x07,0x81};
+    static BYTE noncanonical_named_bits[] = {0x03,0x03,0x07,0x80,0x00};
+    static BYTE timestamp_eku[] =
+        {0x30,0x0a,0x06,0x08,0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x08};
+    static BYTE code_signing_eku[] =
+        {0x30,0x0a,0x06,0x08,0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x03};
+    static BYTE multiple_eku[] =
+    {
+        0x30,0x14,
+          0x06,0x08,0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x08,
+          0x06,0x08,0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x03
+    };
+    static BYTE malformed_eku[] = {0x30,0x03,0x06,0x01,0x80};
+    CERT_EXTENSION extensions[2];
+    HRESULT hr;
+
+    hr = p_appx_signature_validate_leaf_extensions( NULL, 0, FALSE );
+    ok( hr == S_OK, "absent package extensions returned %#lx.\n", hr );
+    hr = p_appx_signature_validate_leaf_extensions( NULL, 0, TRUE );
+    ok( hr == CERT_E_WRONG_USAGE,
+        "absent timestamp EKU returned %#lx.\n", hr );
+
+    set_extension( extensions, szOID_KEY_USAGE, FALSE,
+                   digital_signature, sizeof(digital_signature) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, FALSE );
+    ok( hr == S_OK, "digitalSignature KeyUsage returned %#lx.\n", hr );
+    set_extension( extensions, szOID_KEY_USAGE, FALSE,
+                   non_repudiation, sizeof(non_repudiation) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, FALSE );
+    ok( hr == S_OK, "nonRepudiation KeyUsage returned %#lx.\n", hr );
+    set_extension( extensions, szOID_KEY_USAGE, FALSE,
+                   key_encipherment, sizeof(key_encipherment) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, FALSE );
+    ok( hr == CERT_E_WRONG_USAGE,
+        "encipherment-only KeyUsage returned %#lx.\n", hr );
+    set_extension( extensions, szOID_KEY_USAGE, FALSE,
+                   malformed_unused_bits, sizeof(malformed_unused_bits) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, FALSE );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE,
+        "malformed KeyUsage returned %#lx.\n", hr );
+    set_extension( extensions, szOID_KEY_USAGE, FALSE,
+                   noncanonical_named_bits,
+                   sizeof(noncanonical_named_bits) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, FALSE );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE,
+        "noncanonical KeyUsage returned %#lx.\n", hr );
+
+    set_extension( extensions, szOID_KEY_USAGE, FALSE,
+                   digital_signature, sizeof(digital_signature) );
+    extensions[1] = extensions[0];
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 2, FALSE );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE,
+        "duplicate KeyUsage returned %#lx.\n", hr );
+
+    set_extension( extensions, szOID_ENHANCED_KEY_USAGE, TRUE,
+                   timestamp_eku, sizeof(timestamp_eku) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, TRUE );
+    ok( hr == S_OK, "strict timestamp EKU returned %#lx.\n", hr );
+    set_extension( extensions, szOID_KEY_USAGE, FALSE,
+                   digital_signature, sizeof(digital_signature) );
+    set_extension( extensions + 1, szOID_ENHANCED_KEY_USAGE, TRUE,
+                   timestamp_eku, sizeof(timestamp_eku) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 2, TRUE );
+    ok( hr == S_OK, "timestamp signing KeyUsage returned %#lx.\n", hr );
+    set_extension( extensions, szOID_KEY_USAGE, FALSE,
+                   key_encipherment, sizeof(key_encipherment) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 2, TRUE );
+    ok( hr == CERT_E_WRONG_USAGE,
+        "timestamp encipherment-only KeyUsage returned %#lx.\n", hr );
+
+    set_extension( extensions, szOID_ENHANCED_KEY_USAGE, TRUE,
+                   timestamp_eku, sizeof(timestamp_eku) );
+    extensions[0].fCritical = FALSE;
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, TRUE );
+    ok( hr == CERT_E_WRONG_USAGE,
+        "noncritical timestamp EKU returned %#lx.\n", hr );
+    set_extension( extensions, szOID_ENHANCED_KEY_USAGE, TRUE,
+                   code_signing_eku, sizeof(code_signing_eku) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, TRUE );
+    ok( hr == CERT_E_WRONG_USAGE,
+        "wrong timestamp EKU returned %#lx.\n", hr );
+    set_extension( extensions, szOID_ENHANCED_KEY_USAGE, TRUE,
+                   multiple_eku, sizeof(multiple_eku) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, TRUE );
+    ok( hr == CERT_E_WRONG_USAGE,
+        "multi-purpose timestamp EKU returned %#lx.\n", hr );
+    set_extension( extensions, szOID_ENHANCED_KEY_USAGE, TRUE,
+                   malformed_eku, sizeof(malformed_eku) );
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 1, TRUE );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE,
+        "malformed timestamp EKU returned %#lx.\n", hr );
+    set_extension( extensions, szOID_ENHANCED_KEY_USAGE, TRUE,
+                   timestamp_eku, sizeof(timestamp_eku) );
+    extensions[1] = extensions[0];
+    hr = p_appx_signature_validate_leaf_extensions( extensions, 2, TRUE );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE,
+        "duplicate timestamp EKU returned %#lx.\n", hr );
+}
+
+static void test_ess_certificate_binding( void )
+{
+    static const BYTE certificate[] = {'a','b','c'};
+    static const BYTE sha1[] =
+        {0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,
+         0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d};
+    static const BYTE sha256[] =
+        {0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,
+         0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+         0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,
+         0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};
+    BYTE version1[28] = {0x30,0x1a,0x30,0x18,0x30,0x16,0x04,0x14};
+    BYTE version2_default[40] =
+        {0x30,0x26,0x30,0x24,0x30,0x22,0x04,0x20};
+    BYTE version2_explicit[53] =
+    {
+        0x30,0x33,0x30,0x31,0x30,0x2f,
+          0x30,0x0b,0x06,0x09,
+            0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,
+          0x04,0x20
+    };
+    BYTE version2_explicit_null[55] =
+    {
+        0x30,0x35,0x30,0x33,0x30,0x31,
+          0x30,0x0d,0x06,0x09,
+            0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,
+            0x05,0x00,
+          0x04,0x20
+    };
+    UINT32 version;
+    HRESULT hr;
+
+    memcpy( version1 + 8, sha1, sizeof(sha1) );
+    memcpy( version2_default + 8, sha256, sizeof(sha256) );
+    memcpy( version2_explicit + 21, sha256, sizeof(sha256) );
+    memcpy( version2_explicit_null + 23, sha256, sizeof(sha256) );
+
+    version = 0xdeadbeef;
+    hr = p_appx_signature_select_ess_attribute( 1, 0, &version );
+    ok( hr == S_OK && version == APPX_SIGNATURE_ESS_CERT_ID_V1,
+        "ESSCertID selection returned %#lx, version %u.\n", hr, version );
+    hr = p_appx_signature_select_ess_attribute( 0, 1, &version );
+    ok( hr == S_OK && version == APPX_SIGNATURE_ESS_CERT_ID_V2,
+        "ESSCertIDv2 selection returned %#lx, version %u.\n", hr, version );
+    hr = p_appx_signature_select_ess_attribute( 0, 0, &version );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE && !version,
+        "missing ESS attribute returned %#lx, version %u.\n", hr, version );
+    hr = p_appx_signature_select_ess_attribute( 2, 0, &version );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE && !version,
+        "duplicate ESSCertID returned %#lx, version %u.\n", hr, version );
+    hr = p_appx_signature_select_ess_attribute( 1, 1, &version );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE && !version,
+        "mixed ESS attributes returned %#lx, version %u.\n", hr, version );
+
+    hr = p_appx_signature_validate_ess_certificate(
+        version1, sizeof(version1), APPX_SIGNATURE_ESS_CERT_ID_V1,
+        certificate, sizeof(certificate) );
+    ok( hr == S_OK, "ESSCertID binding returned %#lx.\n", hr );
+    hr = p_appx_signature_validate_ess_certificate(
+        version2_default, sizeof(version2_default),
+        APPX_SIGNATURE_ESS_CERT_ID_V2, certificate, sizeof(certificate) );
+    ok( hr == S_OK, "default ESSCertIDv2 binding returned %#lx.\n", hr );
+    hr = p_appx_signature_validate_ess_certificate(
+        version2_explicit, sizeof(version2_explicit),
+        APPX_SIGNATURE_ESS_CERT_ID_V2, certificate, sizeof(certificate) );
+    ok( hr == S_OK, "explicit SHA-256 ESSCertIDv2 returned %#lx.\n", hr );
+    hr = p_appx_signature_validate_ess_certificate(
+        version2_explicit_null, sizeof(version2_explicit_null),
+        APPX_SIGNATURE_ESS_CERT_ID_V2, certificate, sizeof(certificate) );
+    ok( hr == S_OK,
+        "explicit SHA-256 NULL ESSCertIDv2 returned %#lx.\n", hr );
+
+    version1[8] ^= 1;
+    hr = p_appx_signature_validate_ess_certificate(
+        version1, sizeof(version1), APPX_SIGNATURE_ESS_CERT_ID_V1,
+        certificate, sizeof(certificate) );
+    ok( hr == TRUST_E_SUBJECT_NOT_TRUSTED,
+        "mismatched ESSCertID returned %#lx.\n", hr );
+    version1[8] ^= 1;
+    hr = p_appx_signature_validate_ess_certificate(
+        version1, sizeof(version1) - 1, APPX_SIGNATURE_ESS_CERT_ID_V1,
+        certificate, sizeof(certificate) );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE,
+        "truncated ESSCertID returned %#lx.\n", hr );
+
+    version2_explicit[18] ^= 1;
+    hr = p_appx_signature_validate_ess_certificate(
+        version2_explicit, sizeof(version2_explicit),
+        APPX_SIGNATURE_ESS_CERT_ID_V2, certificate, sizeof(certificate) );
+    ok( hr == TRUST_E_MALFORMED_SIGNATURE,
+        "unsupported ESSCertIDv2 algorithm returned %#lx.\n", hr );
+    version2_explicit[18] ^= 1;
+    hr = p_appx_signature_validate_ess_certificate(
+        version2_default, sizeof(version2_default), 0,
+        certificate, sizeof(certificate) );
+    ok( hr == E_INVALIDARG, "invalid ESS version returned %#lx.\n", hr );
+}
+
+static void test_chain_policy( void )
+{
+    DWORD flags = 0xdeadbeef, timeout = 0xdeadbeef;
+    HRESULT hr;
+
+    hr = p_appx_signature_get_chain_policy( 0, FALSE, 0,
+                                            &flags, &timeout );
+    ok( hr == S_OK, "offline chain policy returned %#lx.\n", hr );
+    ok( flags == (CERT_CHAIN_CACHE_END_CERT |
+                  CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE |
+                  CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL),
+        "offline chain flags are %#lx.\n", flags );
+    ok( !timeout, "offline chain timeout is %lu.\n", timeout );
+
+    hr = p_appx_signature_get_chain_policy(
+        0, TRUE, CERT_CHAIN_TIMESTAMP_TIME, &flags, &timeout );
+    ok( hr == S_OK, "online chain policy returned %#lx.\n", hr );
+    ok( flags == (CERT_CHAIN_CACHE_END_CERT |
+                  CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE |
+                  CERT_CHAIN_TIMESTAMP_TIME |
+                  CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
+                  CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT),
+        "online chain flags are %#lx.\n", flags );
+    ok( timeout == 10000, "online chain timeout is %lu.\n", timeout );
+
+    flags = timeout = 0xdeadbeef;
+    hr = p_appx_signature_get_chain_policy(
+        APPX_SIGNATURE_VERIFY_ALLOW_UNTRUSTED_CHAIN, TRUE, 0,
+        &flags, &timeout );
+    ok( hr == S_FALSE, "developer online policy returned %#lx.\n", hr );
+    ok( !flags && !timeout,
+        "developer online policy returned flags %#lx, timeout %lu.\n",
+        flags, timeout );
+
+    hr = p_appx_signature_evaluate_chain_status(
+        0, FALSE, CERT_E_UNTRUSTEDROOT,
+        CERT_TRUST_IS_UNTRUSTED_ROOT );
+    ok( hr == CERT_E_UNTRUSTEDROOT,
+        "normal untrusted gate returned %#lx.\n", hr );
+    hr = p_appx_signature_evaluate_chain_status(
+        APPX_SIGNATURE_VERIFY_ALLOW_UNTRUSTED_CHAIN, FALSE,
+        CERT_E_UNTRUSTEDROOT,
+        CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_PARTIAL_CHAIN );
+    ok( hr == S_OK, "developer untrusted chain returned %#lx.\n", hr );
+    hr = p_appx_signature_evaluate_chain_status(
+        APPX_SIGNATURE_VERIFY_ALLOW_UNTRUSTED_CHAIN, FALSE, 0,
+        CERT_TRUST_IS_UNTRUSTED_ROOT |
+        CERT_TRUST_IS_NOT_VALID_FOR_USAGE );
+    ok( hr == CERT_E_WRONG_USAGE,
+        "developer wrong-usage chain returned %#lx.\n", hr );
+    hr = p_appx_signature_evaluate_chain_status(
+        APPX_SIGNATURE_VERIFY_ALLOW_UNTRUSTED_CHAIN, FALSE, 0,
+        CERT_TRUST_IS_UNTRUSTED_ROOT |
+        CERT_TRUST_HAS_NOT_SUPPORTED_CRITICAL_EXT );
+    ok( hr == CERT_E_CRITICAL,
+        "developer critical-extension chain returned %#lx.\n", hr );
+    hr = p_appx_signature_evaluate_chain_status(
+        APPX_SIGNATURE_VERIFY_ALLOW_UNTRUSTED_CHAIN, TRUE, 0, 0 );
+    ok( hr == E_INVALIDARG,
+        "developer online chain status returned %#lx.\n", hr );
+
+    hr = p_appx_signature_evaluate_chain_status(
+        0, TRUE, CRYPT_E_REVOKED, 0 );
+    ok( hr == CERT_E_REVOKED, "revoked policy returned %#lx.\n", hr );
+    hr = p_appx_signature_evaluate_chain_status(
+        0, TRUE, 0, CERT_TRUST_IS_REVOKED );
+    ok( hr == CERT_E_REVOKED, "revoked status returned %#lx.\n", hr );
+    hr = p_appx_signature_evaluate_chain_status(
+        0, TRUE, 0, CERT_TRUST_REVOCATION_STATUS_UNKNOWN );
+    ok( hr == CRYPT_E_REVOCATION_OFFLINE,
+        "unknown revocation status returned %#lx.\n", hr );
+    hr = p_appx_signature_evaluate_chain_status(
+        0, TRUE, CERT_E_REVOCATION_FAILURE,
+        CERT_TRUST_IS_OFFLINE_REVOCATION );
+    ok( hr == CRYPT_E_REVOCATION_OFFLINE,
+        "offline revocation policy returned %#lx.\n", hr );
 }
 
 /*
@@ -678,10 +1012,22 @@ START_TEST( signature )
         (void *)GetProcAddress( module, "appx_signature_decode_digest_set" );
     p_appx_signature_decode_indirect_data =
         (void *)GetProcAddress( module, "appx_signature_decode_indirect_data" );
+    p_appx_signature_decode_indirect_data_ex =
+        (void *)GetProcAddress( module, "appx_signature_decode_indirect_data_ex" );
     p_appx_signature_compare_digest_sets =
         (void *)GetProcAddress( module, "appx_signature_compare_digest_sets" );
     p_appx_signature_verify_digest_set =
         (void *)GetProcAddress( module, "appx_signature_verify_digest_set" );
+    p_appx_signature_validate_leaf_extensions = (void *)GetProcAddress(
+        module, "appx_signature_validate_leaf_extensions" );
+    p_appx_signature_select_ess_attribute = (void *)GetProcAddress(
+        module, "appx_signature_select_ess_attribute" );
+    p_appx_signature_validate_ess_certificate = (void *)GetProcAddress(
+        module, "appx_signature_validate_ess_certificate" );
+    p_appx_signature_get_chain_policy = (void *)GetProcAddress(
+        module, "appx_signature_get_chain_policy" );
+    p_appx_signature_evaluate_chain_status = (void *)GetProcAddress(
+        module, "appx_signature_evaluate_chain_status" );
     if (!p_appx_signature_parse_and_verify || !p_appx_signature_free ||
         !p_appx_signature_get_digest_set ||
         !p_appx_signature_get_signer_subject ||
@@ -689,8 +1035,14 @@ START_TEST( signature )
         !p_appx_signature_check_publisher ||
         !p_appx_signature_decode_digest_set ||
         !p_appx_signature_decode_indirect_data ||
+        !p_appx_signature_decode_indirect_data_ex ||
         !p_appx_signature_compare_digest_sets ||
-        !p_appx_signature_verify_digest_set)
+        !p_appx_signature_verify_digest_set ||
+        !p_appx_signature_validate_leaf_extensions ||
+        !p_appx_signature_select_ess_attribute ||
+        !p_appx_signature_validate_ess_certificate ||
+        !p_appx_signature_get_chain_policy ||
+        !p_appx_signature_evaluate_chain_status)
     {
         ok( 0, "AppX signature exports are unavailable.\n" );
         FreeLibrary( module );
@@ -699,6 +1051,9 @@ START_TEST( signature )
 
     test_digest_sets();
     test_indirect_data();
+    test_leaf_extensions();
+    test_ess_certificate_binding();
+    test_chain_policy();
     test_cms_boundaries();
     test_real_signature();
 

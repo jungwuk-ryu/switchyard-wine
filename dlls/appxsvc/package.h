@@ -54,11 +54,17 @@ typedef struct
  * until this call returns.  The archive layer reopens and byte-range-locks the
  * file.  A successful inspection retains that pinned archive until
  * appx_package_inspection_free().
+ * The _ex form accepts an optional cancellation event that must remain valid
+ * until the call returns.  The legacy form behaves as if that event were NULL.
  */
 HRESULT WINAPI appx_package_inspect( HANDLE file,
                                      const WINE_APPX_ARCHIVE_LIMITS *limits,
                                      UINT32 flags,
                                      APPX_PACKAGE_INSPECTION **result );
+HRESULT WINAPI appx_package_inspect_ex( HANDLE file,
+                                        const WINE_APPX_ARCHIVE_LIMITS *limits,
+                                        UINT32 flags, HANDLE cancel_event,
+                                        APPX_PACKAGE_INSPECTION **result );
 void WINAPI appx_package_inspection_free( APPX_PACKAGE_INSPECTION *inspection );
 
 const APPX_MANIFEST *WINAPI appx_package_inspection_get_manifest(
@@ -68,6 +74,8 @@ UINT32 WINAPI appx_package_inspection_get_file_count(
 const APPX_PACKAGE_FILE *WINAPI appx_package_inspection_get_file(
     const APPX_PACKAGE_INSPECTION *inspection, UINT32 index );
 UINT64 WINAPI appx_package_inspection_get_expanded_size(
+    const APPX_PACKAGE_INSPECTION *inspection );
+UINT64 WINAPI appx_package_inspection_get_archive_expanded_size(
     const APPX_PACKAGE_INSPECTION *inspection );
 HRESULT WINAPI appx_package_inspection_get_content_id(
     const APPX_PACKAGE_INSPECTION *inspection, BYTE *content_id, UINT32 size );

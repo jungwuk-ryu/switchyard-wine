@@ -32,6 +32,9 @@
 
 static HRESULT (WINAPI *p_appx_package_inspect)(
     HANDLE, const WINE_APPX_ARCHIVE_LIMITS *, UINT32, APPX_PACKAGE_INSPECTION ** );
+static HRESULT (WINAPI *p_appx_package_inspect_ex)(
+    HANDLE, const WINE_APPX_ARCHIVE_LIMITS *, UINT32, HANDLE,
+    APPX_PACKAGE_INSPECTION ** );
 static void (WINAPI *p_appx_package_inspection_free)( APPX_PACKAGE_INSPECTION * );
 static const APPX_MANIFEST *(WINAPI *p_appx_package_inspection_get_manifest)(
     const APPX_PACKAGE_INSPECTION * );
@@ -42,6 +45,8 @@ static UINT32 (WINAPI *p_appx_package_inspection_get_file_count)(
 static const APPX_PACKAGE_FILE *(WINAPI *p_appx_package_inspection_get_file)(
     const APPX_PACKAGE_INSPECTION *, UINT32 );
 static UINT64 (WINAPI *p_appx_package_inspection_get_expanded_size)(
+    const APPX_PACKAGE_INSPECTION * );
+static UINT64 (WINAPI *p_appx_package_inspection_get_archive_expanded_size)(
     const APPX_PACKAGE_INSPECTION * );
 static HRESULT (WINAPI *p_appx_package_inspection_get_content_id)(
     const APPX_PACKAGE_INSPECTION *, BYTE *, UINT32 );
@@ -279,12 +284,60 @@ static void test_signed_package( void )
     UINT64 streamed;
     UINT32 count, i;
     DWORD transferred;
-    HANDLE file;
+    HANDLE cancel, file;
     HRESULT hr;
     BOOL found_manifest = FALSE;
 
     ok( create_fixture( path, &file ), "failed to create signed fixture.\n" );
     if (file == INVALID_HANDLE_VALUE) return;
+
+    cancel = CreateEventW( NULL, TRUE, TRUE, NULL );
+    ok( !!cancel, "failed to create manual cancellation event, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        inspection = (void *)0xdeadbeef;
+        hr = p_appx_package_inspect_ex(
+            file, NULL, APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN,
+            cancel, &inspection );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_CANCELLED),
+            "pre-cancelled inspection returned %#lx.\n", hr );
+        ok( !inspection, "pre-cancelled inspection returned %p.\n",
+            inspection );
+        CloseHandle( cancel );
+    }
+
+    cancel = CreateEventW( NULL, FALSE, TRUE, NULL );
+    ok( !!cancel, "failed to create auto-reset cancellation event, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        inspection = (void *)0xdeadbeef;
+        hr = p_appx_package_inspect_ex(
+            file, NULL, APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN,
+            cancel, &inspection );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_CANCELLED),
+            "auto-reset cancelled inspection returned %#lx.\n", hr );
+        ok( !inspection, "auto-reset cancelled inspection returned %p.\n",
+            inspection );
+        CloseHandle( cancel );
+    }
+
+    cancel = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!cancel, "failed to create invalid cancellation event, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        CloseHandle( cancel );
+        inspection = (void *)0xdeadbeef;
+        hr = p_appx_package_inspect_ex(
+            file, NULL, APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN,
+            cancel, &inspection );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE),
+            "invalid cancellation event returned %#lx.\n", hr );
+        ok( !inspection, "invalid cancellation event returned %p.\n",
+            inspection );
+    }
 
     hr = p_appx_package_inspect( file, NULL, 0, &inspection );
     ok( FAILED(hr), "untrusted package returned %#lx.\n", hr );
@@ -308,6 +361,9 @@ static void test_signed_package( void )
     ok( count == 5, "got %u block-mapped files.\n", count );
     ok( p_appx_package_inspection_get_expanded_size( inspection ) != 0,
         "got zero expanded size.\n" );
+    ok( p_appx_package_inspection_get_archive_expanded_size( inspection ) >=
+        p_appx_package_inspection_get_expanded_size( inspection ),
+        "archive expansion is smaller than its block-mapped payload.\n" );
     memset( content_id, 0, sizeof(content_id) );
     hr = p_appx_package_inspection_get_content_id(
         inspection, content_id, sizeof(content_id) );
@@ -400,11 +456,13 @@ START_TEST(package)
 } while (0)
 
     LOAD(appx_package_inspect);
+    LOAD(appx_package_inspect_ex);
     LOAD(appx_package_inspection_free);
     LOAD(appx_package_inspection_get_manifest);
     LOAD(appx_package_inspection_get_file_count);
     LOAD(appx_package_inspection_get_file);
     LOAD(appx_package_inspection_get_expanded_size);
+    LOAD(appx_package_inspection_get_archive_expanded_size);
     LOAD(appx_package_inspection_get_content_id);
     LOAD(appx_package_inspection_get_signer_id);
     LOAD(appx_package_inspection_open_stream);

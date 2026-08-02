@@ -71,6 +71,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 #define DEFAULT_COMPRESSION_RATIO_SLACK           (1024 * 1024)
 
 #define HASH_IO_BUFFER_SIZE                       (64 * 1024)
+#define CANCEL_IO_CHUNK_SIZE                      (1024 * 1024)
 
 struct archive_entry
 {
@@ -103,6 +104,7 @@ struct wine_appx_archive
     UINT64 central_directory_size;
     UINT64 zip64_extensible_offset;
     UINT64 zip64_extensible_size;
+    UINT64 total_uncompressed_size;
     UINT32 count;
     UINT16 zip64_version_made;
     UINT16 zip64_version_needed;
@@ -170,35 +172,91 @@ static BOOL multiply_uint64( UINT64 left, UINT64 right, UINT64 *result )
     return TRUE;
 }
 
-static HRESULT read_at( HANDLE file, UINT64 offset, void *buffer, SIZE_T size )
+static HRESULT check_cancel_event( HANDLE cancel_event )
+{
+    DWORD wait;
+
+    if (!cancel_event) return S_OK;
+    wait = WaitForSingleObject( cancel_event, 0 );
+    if (wait == WAIT_OBJECT_0)
+        return HRESULT_FROM_WIN32( ERROR_CANCELLED );
+    if (wait == WAIT_FAILED)
+        return HRESULT_FROM_WIN32( GetLastError() );
+    return wait == WAIT_TIMEOUT ? S_OK : E_FAIL;
+}
+
+static HRESULT wait_overlapped( HANDLE file, OVERLAPPED *overlapped,
+                                HANDLE cancel_event, DWORD *transferred )
+{
+    HANDLE handles[2] = {overlapped->hEvent, cancel_event};
+    DWORD error, wait;
+
+    if (!cancel_event)
+    {
+        if (!GetOverlappedResult( file, overlapped, transferred, TRUE ))
+            return HRESULT_FROM_WIN32( GetLastError() );
+        return S_OK;
+    }
+
+    wait = WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
+    if (wait == WAIT_OBJECT_0)
+    {
+        if (!GetOverlappedResult( file, overlapped, transferred, FALSE ))
+            return HRESULT_FROM_WIN32( GetLastError() );
+        return check_cancel_event( cancel_event );
+    }
+
+    error = wait == WAIT_OBJECT_0 + 1 ? ERROR_CANCELLED :
+            wait == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
+    CancelIoEx( file, overlapped );
+    /* The OVERLAPPED storage cannot be released until the request is drained. */
+    GetOverlappedResult( file, overlapped, transferred, TRUE );
+    return HRESULT_FROM_WIN32( error );
+}
+
+static HRESULT read_at( HANDLE file, UINT64 offset, void *buffer, SIZE_T size,
+                        HANDLE cancel_event )
 {
     OVERLAPPED overlapped = {0};
     BYTE *cursor = buffer;
-    HRESULT hr = S_OK;
+    HRESULT hr;
 
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (!(overlapped.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL )))
         return HRESULT_FROM_WIN32( GetLastError() );
+    hr = S_OK;
 
     while (size)
     {
-        DWORD chunk = size > MAXDWORD ? MAXDWORD : size;
+        DWORD chunk = size > CANCEL_IO_CHUNK_SIZE ? CANCEL_IO_CHUNK_SIZE : size;
         DWORD error, read = 0;
 
+        if (FAILED(hr = check_cancel_event( cancel_event ))) break;
         overlapped.Offset = offset;
         overlapped.OffsetHigh = offset >> 32;
-        ResetEvent( overlapped.hEvent );
+        if (!ResetEvent( overlapped.hEvent ))
+        {
+            hr = HRESULT_FROM_WIN32( GetLastError() );
+            break;
+        }
         if (!ReadFile( file, cursor, chunk, &read, &overlapped ))
         {
             error = GetLastError();
-            if (error != ERROR_IO_PENDING ||
-                !GetOverlappedResult( file, &overlapped, &read, TRUE ))
+            if (error == ERROR_IO_PENDING)
             {
-                error = GetLastError();
+                hr = wait_overlapped( file, &overlapped, cancel_event, &read );
+                if (hr == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
+                    hr = APPX_E_INVALID_PACKAGING_LAYOUT;
+            }
+            else
                 hr = error == ERROR_HANDLE_EOF ? APPX_E_INVALID_PACKAGING_LAYOUT :
                                                  HRESULT_FROM_WIN32( error );
+            if (FAILED(hr))
+            {
                 break;
             }
         }
+        if (FAILED(hr = check_cancel_event( cancel_event ))) break;
         if (read != chunk)
         {
             hr = APPX_E_INVALID_PACKAGING_LAYOUT;
@@ -263,12 +321,14 @@ static HRESULT sha256_finish( struct sha256_context *context,
 }
 
 static HRESULT hash_file_range( HANDLE file, UINT64 offset, UINT64 size,
-                                struct sha256_context *hash )
+                                struct sha256_context *hash,
+                                HANDLE cancel_event )
 {
     OVERLAPPED overlapped = {0};
     BYTE *buffer;
     HRESULT hr;
 
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (!(buffer = HeapAlloc( GetProcessHeap(), 0, HASH_IO_BUFFER_SIZE )))
         return E_OUTOFMEMORY;
     if (!(overlapped.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL )))
@@ -284,6 +344,7 @@ static HRESULT hash_file_range( HANDLE file, UINT64 offset, UINT64 size,
         DWORD error, read = 0;
         UINT64 next_offset;
 
+        if (FAILED(hr = check_cancel_event( cancel_event ))) break;
         if (!add_uint64( offset, chunk, &next_offset ))
         {
             hr = APPX_E_INVALID_PACKAGING_LAYOUT;
@@ -292,19 +353,29 @@ static HRESULT hash_file_range( HANDLE file, UINT64 offset, UINT64 size,
 
         overlapped.Offset = offset;
         overlapped.OffsetHigh = offset >> 32;
-        ResetEvent( overlapped.hEvent );
+        if (!ResetEvent( overlapped.hEvent ))
+        {
+            hr = HRESULT_FROM_WIN32( GetLastError() );
+            break;
+        }
         if (!ReadFile( file, buffer, chunk, &read, &overlapped ))
         {
             error = GetLastError();
-            if (error != ERROR_IO_PENDING ||
-                !GetOverlappedResult( file, &overlapped, &read, TRUE ))
+            if (error == ERROR_IO_PENDING)
             {
-                error = GetLastError();
+                hr = wait_overlapped( file, &overlapped, cancel_event, &read );
+                if (hr == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
+                    hr = APPX_E_INVALID_PACKAGING_LAYOUT;
+            }
+            else
                 hr = error == ERROR_HANDLE_EOF ? APPX_E_INVALID_PACKAGING_LAYOUT :
                                                  HRESULT_FROM_WIN32( error );
+            if (FAILED(hr))
+            {
                 break;
             }
         }
+        if (FAILED(hr = check_cancel_event( cancel_event ))) break;
         if (read != chunk)
         {
             hr = APPX_E_INVALID_PACKAGING_LAYOUT;
@@ -353,7 +424,9 @@ static HRESULT validate_limits( const WINE_APPX_ARCHIVE_LIMITS *input,
     return S_OK;
 }
 
-static HRESULT find_directory( HANDLE file, UINT64 file_size, struct directory_info *directory )
+static HRESULT find_directory( HANDLE file, UINT64 file_size,
+                               struct directory_info *directory,
+                               HANDLE cancel_event )
 {
     BYTE locator[ZIP64_END_DIRECTORY_LOCATOR_SIZE], zip64[ZIP64_END_DIRECTORY_MIN_SIZE];
     UINT64 eocd_offset, zip64_offset, zip64_size, search_offset;
@@ -364,13 +437,15 @@ static HRESULT find_directory( HANDLE file, UINT64 file_size, struct directory_i
     HRESULT hr;
     BOOL need_zip64, has_locator = FALSE;
 
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (file_size < ZIP_END_DIRECTORY_SIZE) return APPX_E_INVALID_PACKAGING_LAYOUT;
     search_size = file_size > ZIP_END_DIRECTORY_MAX_SEARCH ? ZIP_END_DIRECTORY_MAX_SEARCH : file_size;
     search_offset = file_size - search_size;
 
     if (!(tail = HeapAlloc( GetProcessHeap(), 0, search_size )))
         return E_OUTOFMEMORY;
-    if (FAILED(hr = read_at( file, search_offset, tail, search_size )))
+    if (FAILED(hr = read_at( file, search_offset, tail, search_size,
+                             cancel_event )))
     {
         HeapFree( GetProcessHeap(), 0, tail );
         return hr;
@@ -381,6 +456,11 @@ static HRESULT find_directory( HANDLE file, UINT64 file_size, struct directory_i
         if (read_uint32( tail + i ) != ZIP_END_DIRECTORY_SIGNATURE) continue;
         comment_length = read_uint16( tail + i + 20 );
         if ((UINT64)i + ZIP_END_DIRECTORY_SIZE + comment_length == search_size) break;
+    }
+    if (FAILED(hr = check_cancel_event( cancel_event )))
+    {
+        HeapFree( GetProcessHeap(), 0, tail );
+        return hr;
     }
     if (i < 0)
     {
@@ -410,8 +490,9 @@ static HRESULT find_directory( HANDLE file, UINT64 file_size, struct directory_i
     {
         if (i >= ZIP64_END_DIRECTORY_LOCATOR_SIZE)
             memcpy( locator, tail + i - ZIP64_END_DIRECTORY_LOCATOR_SIZE, sizeof(locator) );
-        else if (FAILED(hr = read_at( file, eocd_offset - ZIP64_END_DIRECTORY_LOCATOR_SIZE,
-                                     locator, sizeof(locator) )))
+        else if (FAILED(hr = read_at(
+            file, eocd_offset - ZIP64_END_DIRECTORY_LOCATOR_SIZE,
+            locator, sizeof(locator), cancel_event )))
         {
             HeapFree( GetProcessHeap(), 0, tail );
             return hr;
@@ -447,7 +528,9 @@ static HRESULT find_directory( HANDLE file, UINT64 file_size, struct directory_i
         zip64_offset = read_uint64( locator + 8 );
         if (zip64_offset >= eocd_offset - ZIP64_END_DIRECTORY_LOCATOR_SIZE)
             return APPX_E_INVALID_PACKAGING_LAYOUT;
-        if (FAILED(hr = read_at( file, zip64_offset, zip64, sizeof(zip64) ))) return hr;
+        if (FAILED(hr = read_at( file, zip64_offset, zip64, sizeof(zip64),
+                                 cancel_event )))
+            return hr;
         if (read_uint32( zip64 ) != ZIP64_END_DIRECTORY_SIGNATURE)
             return APPX_E_INVALID_PACKAGING_LAYOUT;
 
@@ -487,7 +570,7 @@ static HRESULT find_directory( HANDLE file, UINT64 file_size, struct directory_i
     if (!add_uint64( directory->offset, directory->size, &search_offset ) ||
         search_offset != directory->boundary)
         return APPX_E_INVALID_PACKAGING_LAYOUT;
-    return S_OK;
+    return check_cancel_event( cancel_event );
 }
 
 static HRESULT read_zip64_extra( const BYTE *extra, UINT16 extra_length,
@@ -771,7 +854,8 @@ static HRESULT find_file_entry( WINE_APPX_ARCHIVE *archive, const WCHAR *path,
     return S_OK;
 }
 
-static HRESULT validate_paths( struct archive_entry *entries, UINT32 count, UINT32 flags )
+static HRESULT validate_paths( struct archive_entry *entries, UINT32 count, UINT32 flags,
+                               HANDLE cancel_event )
 {
     static const WCHAR *package_files[] =
     {
@@ -790,15 +874,21 @@ static HRESULT validate_paths( struct archive_entry *entries, UINT32 count, UINT
     const WCHAR **required = flags & WINE_APPX_ARCHIVE_OPEN_BUNDLE ? bundle_files : package_files;
     UINT32 i, j;
 
+    HRESULT hr;
+
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     qsort( entries, count, sizeof(*entries), compare_path );
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     for (i = 1; i < count; i++)
     {
+        if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
         if (!compare_path( entries + i - 1, entries + i ))
             return APPX_E_INVALID_PACKAGING_LAYOUT;
     }
 
     for (i = 0; i < count; i++)
     {
+        if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
         for (j = 0; j + 1 < entries[i].path_length; j++)
         {
             struct archive_entry *ancestor;
@@ -817,11 +907,12 @@ static HRESULT validate_paths( struct archive_entry *entries, UINT32 count, UINT
             UINT32 length = lstrlenW( required[i] );
             struct archive_entry *entry = find_path( entries, count, required[i], length );
 
+            if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
             if (!entry || (entry->flags & WINE_APPX_ENTRY_DIRECTORY))
                 return APPX_E_INVALID_PACKAGING_LAYOUT;
         }
     }
-    return S_OK;
+    return check_cancel_event( cancel_event );
 }
 
 static BOOL data_descriptor_matches( const BYTE *descriptor, UINT32 cursor,
@@ -846,7 +937,8 @@ static BOOL data_descriptor_matches( const BYTE *descriptor, UINT32 cursor,
 
 static HRESULT validate_data_descriptor( HANDLE file, struct archive_entry *entry,
                                          UINT64 data_end, UINT64 record_limit,
-                                         UINT64 *record_end )
+                                         UINT64 *record_end,
+                                         HANDLE cancel_event )
 {
     BYTE descriptor[24];
     UINT64 remaining;
@@ -890,7 +982,9 @@ static HRESULT validate_data_descriptor( HANDLE file, struct archive_entry *entr
      * Version 4.5 is still required so consumers know to read eight-byte sizes. */
     if (zip64 && entry->version_needed < 45)
         return APPX_E_INVALID_PACKAGING_LAYOUT;
-    if (FAILED(hr = read_at( file, data_end, descriptor, descriptor_size ))) return hr;
+    if (FAILED(hr = read_at( file, data_end, descriptor, descriptor_size,
+                             cancel_event )))
+        return hr;
     if (cursor && read_uint32( descriptor ) != ZIP_DATA_DESCRIPTOR_SIGNATURE)
         return APPX_E_INVALID_PACKAGING_LAYOUT;
     if (!data_descriptor_matches( descriptor, cursor, entry, zip64 ))
@@ -900,7 +994,8 @@ static HRESULT validate_data_descriptor( HANDLE file, struct archive_entry *entr
 }
 
 static HRESULT validate_local_entry( HANDLE file, UINT64 directory_offset,
-                                     UINT64 record_limit, struct archive_entry *entry )
+                                     UINT64 record_limit, struct archive_entry *entry,
+                                     HANDLE cancel_event )
 {
     BYTE header[ZIP_LOCAL_FILE_HEADER_SIZE], *variable = NULL;
     UINT32 crc32, compressed32, uncompressed32, variable_length;
@@ -910,11 +1005,14 @@ static HRESULT validate_local_entry( HANDLE file, UINT64 directory_offset,
     BOOL used_sizes;
     HRESULT hr;
 
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (record_limit > directory_offset ||
         entry->local_header_offset >= record_limit ||
         record_limit - entry->local_header_offset < sizeof(header))
         return APPX_E_INVALID_PACKAGING_LAYOUT;
-    if (FAILED(hr = read_at( file, entry->local_header_offset, header, sizeof(header) ))) return hr;
+    if (FAILED(hr = read_at( file, entry->local_header_offset, header,
+                             sizeof(header), cancel_event )))
+        return hr;
     if (read_uint32( header ) != ZIP_LOCAL_FILE_HEADER_SIGNATURE)
         return APPX_E_INVALID_PACKAGING_LAYOUT;
 
@@ -941,7 +1039,7 @@ static HRESULT validate_local_entry( HANDLE file, UINT64 directory_offset,
     if (!(variable = HeapAlloc( GetProcessHeap(), 0, variable_length ? variable_length : 1 )))
         return E_OUTOFMEMORY;
     if (FAILED(hr = read_at( file, entry->local_header_offset + sizeof(header),
-                            variable, variable_length )))
+                             variable, variable_length, cancel_event )))
         goto done;
     if (memcmp( variable, entry->name, name_length ))
     {
@@ -985,7 +1083,7 @@ static HRESULT validate_local_entry( HANDLE file, UINT64 directory_offset,
     }
     if (flags & ZIP_FLAG_DATA_DESCRIPTOR)
         hr = validate_data_descriptor( file, entry, data_end, record_limit,
-                                       &entry->record_end );
+                                       &entry->record_end, cancel_event );
     else
     {
         entry->record_end = data_end;
@@ -993,22 +1091,30 @@ static HRESULT validate_local_entry( HANDLE file, UINT64 directory_offset,
     }
 
 done:
+    if (SUCCEEDED(hr)) hr = check_cancel_event( cancel_event );
     HeapFree( GetProcessHeap(), 0, variable );
     return hr;
 }
 
 static HRESULT validate_local_layout( HANDLE file, UINT64 directory_offset,
-                                      struct archive_entry *entries, UINT32 count )
+                                      struct archive_entry *entries, UINT32 count,
+                                      HANDLE cancel_event )
 {
     struct archive_entry **ordered;
     HRESULT hr = S_OK;
     UINT32 i;
 
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (!(ordered = HeapAlloc( GetProcessHeap(), 0, count * sizeof(*ordered) )))
         return E_OUTOFMEMORY;
-    for (i = 0; i < count; i++) ordered[i] = entries + i;
+    for (i = 0; i < count; i++)
+    {
+        if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
+        ordered[i] = entries + i;
+    }
 
     qsort( ordered, count, sizeof(*ordered), compare_offset );
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
     if (ordered[0]->local_header_offset)
     {
         hr = APPX_E_INVALID_PACKAGING_LAYOUT;
@@ -1019,9 +1125,10 @@ static HRESULT validate_local_layout( HANDLE file, UINT64 directory_offset,
         UINT64 record_limit = i + 1 < count ? ordered[i + 1]->local_header_offset :
                                              directory_offset;
 
+        if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
         if (record_limit <= ordered[i]->local_header_offset ||
             FAILED(hr = validate_local_entry( file, directory_offset, record_limit,
-                                              ordered[i] )) ||
+                                              ordered[i], cancel_event )) ||
             ordered[i]->record_end != record_limit)
         {
             if (SUCCEEDED(hr)) hr = APPX_E_INVALID_PACKAGING_LAYOUT;
@@ -1030,6 +1137,7 @@ static HRESULT validate_local_layout( HANDLE file, UINT64 directory_offset,
     }
 
 done:
+    if (SUCCEEDED(hr)) hr = check_cancel_event( cancel_event );
     HeapFree( GetProcessHeap(), 0, ordered );
     return hr;
 }
@@ -1047,8 +1155,9 @@ static void free_entries( struct archive_entry *entries, UINT32 count )
     HeapFree( GetProcessHeap(), 0, entries );
 }
 
-HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMITS *input_limits,
-                                      UINT32 flags, WINE_APPX_ARCHIVE **archive )
+HRESULT WINAPI wine_appx_archive_open_ex(
+    HANDLE file, const WINE_APPX_ARCHIVE_LIMITS *input_limits, UINT32 flags,
+    HANDLE cancel_event, WINE_APPX_ARCHIVE **archive )
 {
     WINE_APPX_ARCHIVE_LIMITS limits;
     struct directory_info directory;
@@ -1062,15 +1171,18 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
     HRESULT hr;
     UINT32 i;
 
-    TRACE( "file %p, limits %p, flags %#x, archive %p.\n", file, input_limits, flags, archive );
+    TRACE( "file %p, limits %p, flags %#x, cancel_event %p, archive %p.\n",
+           file, input_limits, flags, cancel_event, archive );
 
     if (!archive || !file || file == INVALID_HANDLE_VALUE ||
         (flags & ~(WINE_APPX_ARCHIVE_OPEN_PACKAGE | WINE_APPX_ARCHIVE_OPEN_BUNDLE)) ||
         (flags & WINE_APPX_ARCHIVE_OPEN_PACKAGE && flags & WINE_APPX_ARCHIVE_OPEN_BUNDLE))
         return E_INVALIDARG;
     *archive = NULL;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (FAILED(hr = validate_limits( input_limits, &limits ))) return hr;
     if (GetFileType( file ) != FILE_TYPE_DISK) return E_INVALIDARG;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     /*
      * DuplicateHandle() shares the underlying file position.  Reopen an
      * overlapped read-only file object so every archive read is positional
@@ -1081,6 +1193,7 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
                             FILE_FLAG_OVERLAPPED );
     if (duplicate == INVALID_HANDLE_VALUE)
         return HRESULT_FROM_WIN32( GetLastError() );
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
     if (!(lock.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL )))
     {
         hr = HRESULT_FROM_WIN32( GetLastError() );
@@ -1090,13 +1203,16 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
     {
         DWORD error = GetLastError(), transferred;
 
-        if (error != ERROR_IO_PENDING ||
-            !GetOverlappedResult( duplicate, &lock, &transferred, TRUE ))
+        if (error == ERROR_IO_PENDING)
+            hr = wait_overlapped( duplicate, &lock, cancel_event, &transferred );
+        else
+            hr = HRESULT_FROM_WIN32( error );
+        if (FAILED(hr))
         {
-            hr = HRESULT_FROM_WIN32( error == ERROR_IO_PENDING ? GetLastError() : error );
             goto done;
         }
     }
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
     CloseHandle( lock.hEvent );
     lock.hEvent = NULL;
     if (!GetFileSizeEx( duplicate, &size ))
@@ -1109,7 +1225,10 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
         hr = APPX_E_INVALID_PACKAGING_LAYOUT;
         goto done;
     }
-    if (FAILED(hr = find_directory( duplicate, size.QuadPart, &directory ))) goto done;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
+    if (FAILED(hr = find_directory( duplicate, size.QuadPart, &directory,
+                                     cancel_event )))
+        goto done;
     if (!directory.entries || directory.entries > limits.max_entries ||
         directory.entries > MAXDWORD ||
         directory.size > limits.max_central_directory_size ||
@@ -1129,7 +1248,8 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
         hr = E_OUTOFMEMORY;
         goto done;
     }
-    if (FAILED(hr = read_at( duplicate, directory.offset, central, (SIZE_T)directory.size )))
+    if (FAILED(hr = read_at( duplicate, directory.offset, central,
+                             (SIZE_T)directory.size, cancel_event )))
         goto done;
     if (!(entries = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY,
                                (SIZE_T)directory.entries * sizeof(*entries) )))
@@ -1140,6 +1260,7 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
 
     for (i = 0; i < directory.entries; i++)
     {
+        if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
         consumed = 0;
         if (FAILED(hr = parse_central_entry( central + cursor, directory.size - cursor, &limits,
                                              entries + i, &consumed, &total_uncompressed )))
@@ -1148,15 +1269,19 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
         entries[i].central_header_size = consumed;
         cursor += consumed;
     }
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
     if (cursor != directory.size)
     {
         hr = APPX_E_INVALID_PACKAGING_LAYOUT;
         goto done;
     }
-    if (FAILED(hr = validate_paths( entries, directory.entries, flags ))) goto done;
-    if (FAILED(hr = validate_local_layout( duplicate, directory.offset, entries,
-                                           directory.entries )))
+    if (FAILED(hr = validate_paths( entries, directory.entries, flags,
+                                     cancel_event )))
         goto done;
+    if (FAILED(hr = validate_local_layout( duplicate, directory.offset, entries,
+                                           directory.entries, cancel_event )))
+        goto done;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
     if (!GetFileSizeEx( duplicate, &current_size ))
     {
         hr = HRESULT_FROM_WIN32( GetLastError() );
@@ -1178,22 +1303,32 @@ HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMI
     object->central_directory_size = directory.size;
     object->zip64_extensible_offset = directory.zip64_extensible_offset;
     object->zip64_extensible_size = directory.zip64_extensible_size;
+    object->total_uncompressed_size = total_uncompressed;
     object->count = directory.entries;
     object->zip64_version_made = directory.zip64_version_made;
     object->zip64_version_needed = directory.zip64_version_needed;
     object->zip64_directory = directory.zip64;
     object->entries = entries;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
     entries = NULL;
     duplicate = INVALID_HANDLE_VALUE;
     *archive = object;
     hr = S_OK;
 
 done:
+    if (object && !*archive) HeapFree( GetProcessHeap(), 0, object );
     if (lock.hEvent) CloseHandle( lock.hEvent );
     if (duplicate != INVALID_HANDLE_VALUE) CloseHandle( duplicate );
     free_entries( entries, entries ? directory.entries : 0 );
     HeapFree( GetProcessHeap(), 0, central );
     return hr;
+}
+
+HRESULT WINAPI wine_appx_archive_open(
+    HANDLE file, const WINE_APPX_ARCHIVE_LIMITS *input_limits, UINT32 flags,
+    WINE_APPX_ARCHIVE **archive )
+{
+    return wine_appx_archive_open_ex( file, input_limits, flags, NULL, archive );
 }
 
 void WINAPI wine_appx_archive_close( WINE_APPX_ARCHIVE *archive )
@@ -1208,6 +1343,14 @@ HRESULT WINAPI wine_appx_archive_get_count( WINE_APPX_ARCHIVE *archive, UINT32 *
 {
     if (!archive || !count) return E_INVALIDARG;
     *count = archive->count;
+    return S_OK;
+}
+
+HRESULT WINAPI wine_appx_archive_get_total_uncompressed_size(
+    WINE_APPX_ARCHIVE *archive, UINT64 *size )
+{
+    if (!archive || !size) return E_INVALIDARG;
+    *size = archive->total_uncompressed_size;
     return S_OK;
 }
 
@@ -1343,9 +1486,126 @@ static void write_appx_zip64_presignature_eocd( BYTE *buffer )
     write_uint16( buffer + 20, 0 );
 }
 
+struct stream_cancel_monitor
+{
+    WINE_APPX_ARCHIVE_STREAM *stream;
+    HANDLE cancel_event;
+    HANDLE done_event;
+    HANDLE thread;
+    LONG cancelled;
+    LONG status;
+};
+
+static void stream_cancel_monitor_record( struct stream_cancel_monitor *monitor,
+                                          HRESULT hr )
+{
+    InterlockedCompareExchange( &monitor->status, hr, S_OK );
+}
+
+static DWORD WINAPI stream_cancel_monitor_proc( void *parameter )
+{
+    struct stream_cancel_monitor *monitor = parameter;
+    HANDLE handles[2] = {monitor->cancel_event, monitor->done_event};
+    DWORD wait = WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
+
+    if (wait == WAIT_OBJECT_0)
+    {
+        InterlockedExchange( &monitor->cancelled, 1 );
+        wine_appx_archive_stream_cancel( monitor->stream );
+    }
+    else if (wait == WAIT_FAILED)
+    {
+        stream_cancel_monitor_record(
+            monitor, HRESULT_FROM_WIN32(GetLastError()) );
+        wine_appx_archive_stream_cancel( monitor->stream );
+    }
+    else if (wait != WAIT_OBJECT_0 + 1)
+    {
+        stream_cancel_monitor_record( monitor, E_FAIL );
+        wine_appx_archive_stream_cancel( monitor->stream );
+    }
+    return 0;
+}
+
+static HRESULT stream_cancel_monitor_start(
+    struct stream_cancel_monitor *monitor, WINE_APPX_ARCHIVE_STREAM *stream,
+    HANDLE cancel_event )
+{
+    HRESULT hr;
+
+    memset( monitor, 0, sizeof(*monitor) );
+    monitor->stream = stream;
+    monitor->cancel_event = cancel_event;
+    monitor->status = S_OK;
+    if (!cancel_event) return S_OK;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
+    if (!(monitor->done_event = CreateEventW( NULL, TRUE, FALSE, NULL )))
+        return HRESULT_FROM_WIN32( GetLastError() );
+    if (!(monitor->thread = CreateThread( NULL, 0, stream_cancel_monitor_proc,
+                                          monitor, 0, NULL )))
+    {
+        hr = HRESULT_FROM_WIN32( GetLastError() );
+        CloseHandle( monitor->done_event );
+        monitor->done_event = NULL;
+        return hr;
+    }
+    return S_OK;
+}
+
+static HRESULT stream_cancel_monitor_check(
+    struct stream_cancel_monitor *monitor )
+{
+    HRESULT hr;
+
+    if (!monitor->cancel_event) return S_OK;
+    if (InterlockedCompareExchange( &monitor->cancelled, 0, 0 ))
+        return HRESULT_FROM_WIN32( ERROR_CANCELLED );
+    hr = InterlockedCompareExchange( &monitor->status, S_OK, S_OK );
+    if (FAILED(hr)) return hr;
+    hr = check_cancel_event( monitor->cancel_event );
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED))
+    {
+        InterlockedExchange( &monitor->cancelled, 1 );
+        wine_appx_archive_stream_cancel( monitor->stream );
+    }
+    else if (FAILED(hr))
+    {
+        stream_cancel_monitor_record( monitor, hr );
+        wine_appx_archive_stream_cancel( monitor->stream );
+    }
+    return hr;
+}
+
+static HRESULT stream_cancel_monitor_finish(
+    struct stream_cancel_monitor *monitor, HRESULT hr )
+{
+    HRESULT status;
+    DWORD wait;
+
+    if (!monitor->thread) return hr;
+    if (!SetEvent( monitor->done_event ))
+        stream_cancel_monitor_record(
+            monitor, HRESULT_FROM_WIN32(GetLastError()) );
+    wait = WaitForSingleObject( monitor->thread, INFINITE );
+    if (wait == WAIT_FAILED)
+        stream_cancel_monitor_record(
+            monitor, HRESULT_FROM_WIN32(GetLastError()) );
+    else if (wait != WAIT_OBJECT_0)
+        stream_cancel_monitor_record( monitor, E_FAIL );
+    CloseHandle( monitor->thread );
+    CloseHandle( monitor->done_event );
+    monitor->thread = NULL;
+    monitor->done_event = NULL;
+
+    if (InterlockedCompareExchange( &monitor->cancelled, 0, 0 ))
+        return HRESULT_FROM_WIN32( ERROR_CANCELLED );
+    status = InterlockedCompareExchange( &monitor->status, S_OK, S_OK );
+    return FAILED(status) ? status : hr;
+}
+
 static HRESULT calculate_presignature_central_digest(
     WINE_APPX_ARCHIVE *archive, const struct archive_entry *signature,
-    BYTE digest[APPX_SIGNATURE_SHA256_SIZE] )
+    BYTE digest[APPX_SIGNATURE_SHA256_SIZE], HANDLE cancel_event )
 {
     BYTE zip64_header[ZIP64_END_DIRECTORY_MIN_SIZE];
     BYTE locator[ZIP64_END_DIRECTORY_LOCATOR_SIZE];
@@ -1356,6 +1616,7 @@ static HRESULT calculate_presignature_central_digest(
     UINT32 entries;
     HRESULT hr;
 
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (archive->count < 2 ||
         signature->record_end != archive->central_directory_offset ||
         !add_uint64( archive->central_directory_offset,
@@ -1373,8 +1634,9 @@ static HRESULT calculate_presignature_central_digest(
         return APPX_E_INVALID_PACKAGING_LAYOUT;
 
     if (FAILED(hr = sha256_init( &hash ))) return hr;
-    if (FAILED(hr = hash_file_range( archive->file, archive->central_directory_offset,
-                                     directory_size, &hash )))
+    if (FAILED(hr = hash_file_range(
+        archive->file, archive->central_directory_offset, directory_size, &hash,
+        cancel_event )))
         goto done;
 
     if (!archive->zip64_directory)
@@ -1407,9 +1669,9 @@ static HRESULT calculate_presignature_central_digest(
         write_appx_zip64_presignature_eocd( eocd );
 
         if (FAILED(hr = sha256_update( &hash, zip64_header, sizeof(zip64_header) )) ||
-            FAILED(hr = hash_file_range( archive->file,
-                                         archive->zip64_extensible_offset,
-                                         archive->zip64_extensible_size, &hash )) ||
+            FAILED(hr = hash_file_range(
+                archive->file, archive->zip64_extensible_offset,
+                archive->zip64_extensible_size, &hash, cancel_event )) ||
             FAILED(hr = sha256_update( &hash, locator, sizeof(locator) )) ||
             FAILED(hr = sha256_update( &hash, eocd, sizeof(eocd) )))
             goto done;
@@ -1418,41 +1680,60 @@ static HRESULT calculate_presignature_central_digest(
     }
 
 done:
+    if (SUCCEEDED(hr)) hr = check_cancel_event( cancel_event );
     sha256_destroy( &hash );
     return hr;
 }
 
 static HRESULT calculate_raw_range_digest( WINE_APPX_ARCHIVE *archive, UINT64 offset,
                                            UINT64 size,
-                                           BYTE digest[APPX_SIGNATURE_SHA256_SIZE] )
+                                           BYTE digest[APPX_SIGNATURE_SHA256_SIZE],
+                                           HANDLE cancel_event )
 {
     struct sha256_context hash;
     HRESULT hr;
 
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (FAILED(hr = sha256_init( &hash ))) return hr;
-    if (SUCCEEDED(hr = hash_file_range( archive->file, offset, size, &hash )))
+    if (SUCCEEDED(hr = hash_file_range( archive->file, offset, size, &hash,
+                                        cancel_event )))
         hr = sha256_finish( &hash, digest );
+    if (SUCCEEDED(hr)) hr = check_cancel_event( cancel_event );
     sha256_destroy( &hash );
     return hr;
 }
 
 static HRESULT calculate_entry_digest( WINE_APPX_ARCHIVE *archive, UINT32 index,
-                                       BYTE digest[APPX_SIGNATURE_SHA256_SIZE] )
+                                       BYTE digest[APPX_SIGNATURE_SHA256_SIZE],
+                                       HANDLE cancel_event )
 {
     BYTE buffer[HASH_IO_BUFFER_SIZE];
     struct sha256_context hash;
+    struct stream_cancel_monitor monitor;
     WINE_APPX_ARCHIVE_STREAM *stream = NULL;
     HRESULT hr;
 
+    memset( &monitor, 0, sizeof(monitor) );
+    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (FAILED(hr = sha256_init( &hash ))) return hr;
     if (FAILED(hr = wine_appx_archive_stream_open( archive, index, &stream )))
+        goto done;
+    if (FAILED(hr = stream_cancel_monitor_start( &monitor, stream,
+                                                  cancel_event )))
         goto done;
 
     for (;;)
     {
         UINT32 read = 0;
+        HRESULT cancel_hr;
 
+        if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) break;
         hr = wine_appx_archive_stream_read( stream, buffer, sizeof(buffer), &read );
+        if (FAILED(cancel_hr = stream_cancel_monitor_check( &monitor )))
+        {
+            hr = cancel_hr;
+            break;
+        }
         if (hr == S_FALSE)
         {
             hr = sha256_finish( &hash, digest );
@@ -1468,13 +1749,15 @@ static HRESULT calculate_entry_digest( WINE_APPX_ARCHIVE *archive, UINT32 index,
     }
 
 done:
+    hr = stream_cancel_monitor_finish( &monitor, hr );
     if (stream) wine_appx_archive_stream_close( stream );
     sha256_destroy( &hash );
     return hr;
 }
 
-HRESULT WINAPI appx_archive_calculate_digest_set(
-    WINE_APPX_ARCHIVE *archive, struct appx_signature_digest_set *set )
+HRESULT WINAPI appx_archive_calculate_digest_set_ex(
+    WINE_APPX_ARCHIVE *archive, HANDLE cancel_event,
+    struct appx_signature_digest_set *set )
 {
     static const WCHAR signature_path[] =
         {'A','p','p','x','S','i','g','n','a','t','u','r','e','.','p','7','x',0};
@@ -1492,41 +1775,56 @@ HRESULT WINAPI appx_archive_calculate_digest_set(
     if (!set) return E_INVALIDARG;
     memset( set, 0, sizeof(*set) );
     if (!archive) return E_INVALIDARG;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto failed;
 
     if (FAILED(hr = find_file_entry( archive, signature_path, &signature, NULL )))
         goto failed;
     /* Validate the signature position before hashing a potentially huge AXPC range. */
     if (FAILED(hr = calculate_presignature_central_digest(
-            archive, signature, set->central_directory )))
+            archive, signature, set->central_directory, cancel_event )))
         goto failed;
     set->flags |= APPX_SIGNATURE_DIGEST_CENTRAL_DIRECTORY;
 
     if (FAILED(hr = calculate_raw_range_digest( archive, 0,
                                                 signature->local_header_offset,
-                                                set->package_contents )))
+                                                set->package_contents,
+                                                cancel_event )))
         goto failed;
     set->flags |= APPX_SIGNATURE_DIGEST_PACKAGE_CONTENTS;
 
     if (FAILED(hr = find_file_entry( archive, content_types_path, &entry, &index )) ||
-        FAILED(hr = calculate_entry_digest( archive, index, set->content_types )))
+        FAILED(hr = calculate_entry_digest( archive, index, set->content_types,
+                                             cancel_event )))
         goto failed;
     set->flags |= APPX_SIGNATURE_DIGEST_CONTENT_TYPES;
 
     if (FAILED(hr = find_file_entry( archive, block_map_path, &entry, &index )) ||
-        FAILED(hr = calculate_entry_digest( archive, index, set->block_map )))
+        FAILED(hr = calculate_entry_digest( archive, index, set->block_map,
+                                             cancel_event )))
         goto failed;
     set->flags |= APPX_SIGNATURE_DIGEST_BLOCK_MAP;
 
     hr = find_file_entry( archive, code_integrity_path, &entry, &index );
     if (hr == HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ))
+    {
+        if (FAILED(hr = check_cancel_event( cancel_event ))) goto failed;
         return S_OK;
+    }
     if (FAILED(hr) || FAILED(hr = calculate_entry_digest( archive, index,
-                                                          set->code_integrity )))
+                                                          set->code_integrity,
+                                                          cancel_event )))
         goto failed;
     set->flags |= APPX_SIGNATURE_DIGEST_CODE_INTEGRITY;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto failed;
     return S_OK;
 
 failed:
     memset( set, 0, sizeof(*set) );
     return hr;
+}
+
+HRESULT WINAPI appx_archive_calculate_digest_set(
+    WINE_APPX_ARCHIVE *archive, struct appx_signature_digest_set *set )
+{
+    return appx_archive_calculate_digest_set_ex( archive, NULL, set );
 }

@@ -30,8 +30,11 @@
 #include <libxml/xmlreader.h>
 
 #include "wine/appxsvc.h"
+#include "wine/debug.h"
 
 #include "bundle_manifest.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 
 #define XML_MAX_DEPTH                    32
 #define XML_MAX_NODES                    131072
@@ -44,6 +47,8 @@
 #define XML_MAX_NAMESPACE_BYTES          1024
 #define XML_MAX_VALUE_BYTES              65536
 #define MAX_RESOURCES_PER_PACKAGE        200
+#define MAX_DEPENDENCIES_PER_PACKAGE     128
+#define MAX_BUNDLE_FILE_NAME_CHARS       256
 
 static const xmlChar bundle_namespace[] =
     "http://schemas.microsoft.com/appx/2013/bundle";
@@ -82,6 +87,7 @@ struct parser
     UINT32 node_count;
     UINT32 attribute_count;
     UINT32 namespace_count;
+    UINT16 schema_major;
     HRESULT hr;
 };
 
@@ -124,7 +130,13 @@ static BOOL node_is( struct parser *parser, const xmlChar *uri, const char *loca
 
 static HRESULT parser_fail( struct parser *parser, HRESULT hr )
 {
-    if (SUCCEEDED(parser->hr)) parser->hr = hr;
+    if (SUCCEEDED(parser->hr))
+    {
+        TRACE( "rejecting bundle manifest at node %u, attribute %u, "
+               "namespace %u, hr %#lx.\n", parser->node_count,
+               parser->attribute_count, parser->namespace_count, hr );
+        parser->hr = hr;
+    }
     return parser->hr;
 }
 
@@ -392,27 +404,6 @@ static struct xml_attribute *take_attribute( struct xml_attributes *attributes,
 static BOOL uri_is_ignorable( const struct parser *parser,
                               const xmlChar *uri );
 
-static struct xml_attribute *take_ignorable_attribute(
-    const struct parser *parser, struct xml_attributes *attributes,
-    const char *local )
-{
-    UINT32 i;
-
-    for (i = 0; i < attributes->count; i++)
-    {
-        struct xml_attribute *attribute = attributes->item + i;
-
-        if (!attribute->used &&
-            xml_equal( attribute->local, BAD_CAST local ) &&
-            uri_is_ignorable( parser, attribute->uri ))
-        {
-            attribute->used = TRUE;
-            return attribute;
-        }
-    }
-    return NULL;
-}
-
 static HRESULT require_attribute( struct parser *parser,
                                   struct xml_attributes *attributes,
                                   const char *local,
@@ -631,19 +622,6 @@ static HRESULT parse_uint64( struct parser *parser, const xmlChar *value,
     return S_OK;
 }
 
-static HRESULT parse_uint32( struct parser *parser, const xmlChar *value,
-                             UINT32 minimum, UINT32 maximum, UINT32 *result )
-{
-    UINT64 number;
-    HRESULT hr;
-
-    if (FAILED(hr = parse_uint64( parser, value, &number ))) return hr;
-    if (number < minimum || number > maximum)
-        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
-    *result = number;
-    return S_OK;
-}
-
 static HRESULT parse_boolean( struct parser *parser, const xmlChar *value,
                               BOOL *result )
 {
@@ -729,17 +707,88 @@ static BOOL validate_simple_ascii_token( const WCHAR *token, UINT32 maximum )
     return TRUE;
 }
 
+static BOOL validate_ascii_identifier( const WCHAR *token, UINT32 maximum )
+{
+    UINT32 i, length;
+
+    if (!token || !(length = lstrlenW( token )) || length > maximum)
+        return FALSE;
+    for (i = 0; i < length; i++)
+        if (!((token[i] >= 'A' && token[i] <= 'Z') ||
+              (token[i] >= 'a' && token[i] <= 'z') ||
+              (token[i] >= '0' && token[i] <= '9') ||
+              token[i] == '.' || token[i] == '-'))
+            return FALSE;
+    return TRUE;
+}
+
+static BOOL validate_ascii_identifier_xml( const xmlChar *token )
+{
+    const xmlChar *cursor = token;
+
+    if (!cursor || !*cursor) return FALSE;
+    while (*cursor)
+    {
+        if (!((*cursor >= 'A' && *cursor <= 'Z') ||
+              (*cursor >= 'a' && *cursor <= 'z') ||
+              (*cursor >= '0' && *cursor <= '9') ||
+              *cursor == '.' || *cursor == '-'))
+            return FALSE;
+        cursor++;
+    }
+    return TRUE;
+}
+
+static HRESULT parse_scale( struct parser *parser, const xmlChar *value,
+                            UINT32 *scale )
+{
+    static const struct
+    {
+        const char *name;
+        UINT32 value;
+        UINT16 minimum_schema;
+    } scales[] =
+    {
+        {"100", 100, 0}, {"120", 120, 0}, {"125", 125, 2},
+        {"140", 140, 0}, {"150", 150, 0}, {"160", 160, 0},
+        {"180", 180, 0}, {"200", 200, 2}, {"220", 220, 2},
+        {"225", 225, 0}, {"240", 240, 2}, {"250", 250, 2},
+        {"300", 300, 2}, {"400", 400, 2}, {"500", 500, 2}
+    };
+    UINT32 i;
+
+    for (i = 0; i < ARRAY_SIZE(scales); i++)
+        if (xml_equal( value, BAD_CAST scales[i].name ) &&
+            parser->schema_major >= scales[i].minimum_schema)
+        {
+            *scale = scales[i].value;
+            return S_OK;
+        }
+    return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+}
+
+static BOOL validate_dx_feature_level( const xmlChar *value )
+{
+    return xml_equal( value, BAD_CAST "dx9" ) ||
+           xml_equal( value, BAD_CAST "dx10" ) ||
+           xml_equal( value, BAD_CAST "dx11" );
+}
+
 static HRESULT parse_file_name( struct parser *parser, const xmlChar *value,
                                 WCHAR **file_name )
 {
     UINT32 capacity, length = 0;
     HRESULT hr;
     WCHAR *path;
-    int bytes;
+    int bytes, characters;
 
     *file_name = NULL;
     if (!value || (bytes = xmlStrlen( value )) <= 0 ||
         bytes > WINE_APPX_MAX_ENTRY_NAME_BYTES)
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    characters = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS,
+                                      (const char *)value, bytes, NULL, 0 );
+    if (characters <= 0 || characters > MAX_BUNDLE_FILE_NAME_CHARS)
         return parser_fail( parser, APPX_E_INVALID_MANIFEST );
 
     hr = wine_appx_validate_archive_path( value, bytes, 0, &length, NULL );
@@ -766,12 +815,8 @@ static enum appx_bundle_package_type parse_package_type( const WCHAR *name )
 {
     if (!lstrcmpW( name, L"application" ))
         return APPX_BUNDLE_PACKAGE_APPLICATION;
-    if (!lstrcmpW( name, L"framework" ))
-        return APPX_BUNDLE_PACKAGE_FRAMEWORK;
     if (!lstrcmpW( name, L"resource" ))
         return APPX_BUNDLE_PACKAGE_RESOURCE;
-    if (!lstrcmpW( name, L"optional" ))
-        return APPX_BUNDLE_PACKAGE_OPTIONAL;
     return APPX_BUNDLE_PACKAGE_UNSUPPORTED;
 }
 
@@ -887,12 +932,13 @@ static HRESULT parse_resource( struct parser *parser,
     if (SUCCEEDED(parser->hr) && scale)
     {
         resource.has_scale = TRUE;
-        parse_uint32( parser, scale->value, 1, 1000, &resource.scale );
+        parse_scale( parser, scale->value, &resource.scale );
     }
     if (SUCCEEDED(parser->hr) && dx &&
-        (FAILED(xml_to_wstring( parser, dx->value, 1, 32,
+        (!validate_dx_feature_level( dx->value ) ||
+         FAILED(xml_to_wstring( parser, dx->value, 1, 4,
                                 (WCHAR **)&resource.dx_feature_level )) ||
-         !validate_simple_ascii_token( resource.dx_feature_level, 32 )))
+         !validate_simple_ascii_token( resource.dx_feature_level, 4 )))
         parser_fail( parser, APPX_E_INVALID_MANIFEST );
     if (dx)
         package->public.flags |= APPX_BUNDLE_PACKAGE_UNSUPPORTED_QUALIFIER;
@@ -967,6 +1013,117 @@ static HRESULT parse_resources( struct parser *parser,
     return parser->hr;
 }
 
+static HRESULT parse_target_device_family( struct parser *parser,
+                                           struct bundle_package *package,
+                                           xmlChar **names, UINT32 *count )
+{
+    struct appx_bundle_version min_version, max_version;
+    struct xml_attribute *name, *min, *max;
+    struct xml_attributes attributes;
+    xmlChar *name_copy = NULL;
+    UINT32 i;
+    int depth, result;
+
+    if (*count >= MAX_DEPENDENCIES_PER_PACKAGE)
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    if (FAILED(get_attributes( parser, &attributes ))) return parser->hr;
+    require_attribute( parser, &attributes, "Name", &name );
+    require_attribute( parser, &attributes, "MinVersion", &min );
+    require_attribute( parser, &attributes, "MaxVersionTested", &max );
+    if (SUCCEEDED(parser->hr) &&
+        !validate_ascii_identifier_xml( name->value ))
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    if (SUCCEEDED(parser->hr))
+        parse_version( parser, min->value, &min_version );
+    if (SUCCEEDED(parser->hr))
+        parse_version( parser, max->value, &max_version );
+    if (SUCCEEDED(parser->hr))
+        finish_attributes( parser, &attributes, &package->public.flags );
+    if (SUCCEEDED(parser->hr))
+    {
+        for (i = 0; i < *count; i++)
+            if (xml_equal( names[i], name->value ))
+            {
+                parser_fail( parser, APPX_E_INVALID_MANIFEST );
+                break;
+            }
+    }
+    if (SUCCEEDED(parser->hr) && !(name_copy = xmlStrdup( name->value )))
+        parser_fail( parser, E_OUTOFMEMORY );
+    free_attributes( &attributes );
+    if (FAILED(parser->hr)) goto done;
+
+    if (!xmlTextReaderIsEmptyElement( parser->reader ))
+    {
+        depth = xmlTextReaderDepth( parser->reader );
+        while ((result = read_node( parser )) > 0)
+        {
+            int type = xmlTextReaderNodeType( parser->reader );
+
+            if (type == XML_READER_TYPE_END_ELEMENT &&
+                xmlTextReaderDepth( parser->reader ) == depth)
+                break;
+            if (type == XML_READER_TYPE_ELEMENT)
+                skip_ignorable_element( parser, &package->public.flags );
+            else if (!current_node_is_ignorable_text( parser ))
+                parser_fail( parser, APPX_E_INVALID_MANIFEST );
+            if (FAILED(parser->hr)) break;
+        }
+        if (result <= 0) parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    }
+    if (SUCCEEDED(parser->hr))
+    {
+        names[(*count)++] = name_copy;
+        name_copy = NULL;
+    }
+
+done:
+    xmlFree( name_copy );
+    return parser->hr;
+}
+
+static HRESULT parse_dependencies( struct parser *parser,
+                                   struct bundle_package *package )
+{
+    xmlChar *names[MAX_DEPENDENCIES_PER_PACKAGE] = {0};
+    struct xml_attributes attributes;
+    UINT32 count = 0, i;
+    int depth, result;
+
+    if (FAILED(get_attributes( parser, &attributes ))) return parser->hr;
+    finish_attributes( parser, &attributes, &package->public.flags );
+    free_attributes( &attributes );
+    if (FAILED(parser->hr)) return parser->hr;
+    if (xmlTextReaderIsEmptyElement( parser->reader ))
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+
+    depth = xmlTextReaderDepth( parser->reader );
+    while ((result = read_node( parser )) > 0)
+    {
+        int type = xmlTextReaderNodeType( parser->reader );
+
+        if (type == XML_READER_TYPE_END_ELEMENT &&
+            xmlTextReaderDepth( parser->reader ) == depth)
+            break;
+        if (type == XML_READER_TYPE_ELEMENT)
+        {
+            if (node_is( parser, bundle_namespace, "TargetDeviceFamily" ))
+                parse_target_device_family( parser, package, names, &count );
+            else
+                skip_ignorable_element( parser, &package->public.flags );
+        }
+        else if (!current_node_is_ignorable_text( parser ))
+            parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        if (FAILED(parser->hr)) break;
+    }
+    if (result <= 0 || !count)
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    if (SUCCEEDED(parser->hr))
+        package->public.flags |= APPX_BUNDLE_PACKAGE_HAS_DEPENDENCIES;
+    for (i = 0; i < count; i++) xmlFree( names[i] );
+    return parser->hr;
+}
+
 static HRESULT append_package( struct parser *parser,
                                struct bundle_package *package )
 {
@@ -1002,10 +1159,10 @@ static HRESULT parse_package( struct parser *parser )
     struct xml_attribute *type = NULL, *version = NULL;
     struct xml_attribute *architecture, *resource_id;
     struct xml_attribute *file_name = NULL, *offset = NULL, *size = NULL;
-    struct xml_attribute *encrypted, *extension_encrypted;
+    struct xml_attribute *is_stub;
     struct bundle_package package;
     struct xml_attributes attributes;
-    BOOL resources_seen = FALSE;
+    BOOL dependencies_seen = FALSE, resources_seen = FALSE;
     int depth, result;
 
     memset( &package, 0, sizeof(package) );
@@ -1015,17 +1172,16 @@ static HRESULT parse_package( struct parser *parser )
     require_attribute( parser, &attributes, "FileName", &file_name );
     architecture = take_attribute( &attributes, "Architecture" );
     resource_id = take_attribute( &attributes, "ResourceId" );
-    require_attribute( parser, &attributes, "Offset", &offset );
-    require_attribute( parser, &attributes, "Size", &size );
-    encrypted = take_attribute( &attributes, "Encrypted" );
-    if (!encrypted)
-        encrypted = take_attribute( &attributes, "IsEncrypted" );
-    extension_encrypted = take_ignorable_attribute( parser, &attributes,
-                                                     "Encrypted" );
-    if (!extension_encrypted)
-        extension_encrypted = take_ignorable_attribute( parser, &attributes,
-                                                        "IsEncrypted" );
-    if (encrypted && extension_encrypted)
+    offset = take_attribute( &attributes, "Offset" );
+    size = take_attribute( &attributes, "Size" );
+    is_stub = take_attribute( &attributes, "IsStub" );
+    /*
+     * Flat bundles reference external package files and omit both range
+     * attributes.  Preserve that distinction for the deployment layer so it
+     * can fail with ERROR_NOT_SUPPORTED instead of misclassifying a valid flat
+     * manifest as corrupt.  A half-specified range is never valid.
+     */
+    if (!!offset != !!size)
         parser_fail( parser, APPX_E_INVALID_MANIFEST );
     if (SUCCEEDED(parser->hr) && type)
     {
@@ -1041,8 +1197,9 @@ static HRESULT parse_package( struct parser *parser )
     {
         package.public.type = parse_package_type( package.public.type_name );
         if (package.public.type == APPX_BUNDLE_PACKAGE_UNSUPPORTED)
-            package.public.flags |= APPX_BUNDLE_PACKAGE_UNSUPPORTED_TYPE;
-        parse_version( parser, version->value, &package.public.version );
+            parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        else
+            parse_version( parser, version->value, &package.public.version );
     }
     if (SUCCEEDED(parser->hr) && architecture)
         xml_to_wstring( parser, architecture->value, 1, 32,
@@ -1058,13 +1215,13 @@ static HRESULT parse_package( struct parser *parser )
     {
         package.public.architecture =
             parse_architecture_name( package.public.architecture_name );
-        if (package.public.architecture == APPX_BUNDLE_ARCHITECTURE_X86A64 ||
-            package.public.architecture == APPX_BUNDLE_ARCHITECTURE_UNSUPPORTED)
+        if (package.public.architecture ==
+            APPX_BUNDLE_ARCHITECTURE_UNSUPPORTED)
             package.public.flags |=
                 APPX_BUNDLE_PACKAGE_UNSUPPORTED_ARCHITECTURE;
     }
     if (SUCCEEDED(parser->hr) && resource_id)
-        xml_to_wstring( parser, resource_id->value, 0, 30,
+        xml_to_wstring( parser, resource_id->value, 1, 30,
                         (WCHAR **)&package.public.resource_id );
     else if (SUCCEEDED(parser->hr) &&
              !(package.public.resource_id = duplicate_wstring( L"" )))
@@ -1072,12 +1229,12 @@ static HRESULT parse_package( struct parser *parser )
     if (SUCCEEDED(parser->hr) &&
         (!validate_normalized_string( package.public.resource_id, TRUE ) ||
          (*package.public.resource_id &&
-          !validate_simple_ascii_token( package.public.resource_id, 30 ))))
+          !validate_ascii_identifier( package.public.resource_id, 30 ))))
         parser_fail( parser, APPX_E_INVALID_MANIFEST );
     if (SUCCEEDED(parser->hr))
         parse_file_name( parser, file_name->value,
                          (WCHAR **)&package.public.file_name );
-    if (SUCCEEDED(parser->hr))
+    if (SUCCEEDED(parser->hr) && offset)
     {
         parse_uint64( parser, offset->value, &package.public.offset );
         parse_uint64( parser, size->value, &package.public.size );
@@ -1088,23 +1245,13 @@ static HRESULT parse_package( struct parser *parser )
             parser_fail( parser, APPX_E_INVALID_MANIFEST );
         package.public.flags |= APPX_BUNDLE_PACKAGE_HAS_RANGE;
     }
-    if (SUCCEEDED(parser->hr) && encrypted)
+    if (SUCCEEDED(parser->hr) && is_stub)
     {
         BOOL value;
 
-        if (SUCCEEDED(parse_boolean( parser, encrypted->value, &value )) &&
+        if (SUCCEEDED(parse_boolean( parser, is_stub->value, &value )) &&
             value)
-            package.public.flags |= APPX_BUNDLE_PACKAGE_ENCRYPTED;
-    }
-    if (SUCCEEDED(parser->hr) && extension_encrypted)
-    {
-        BOOL value;
-
-        package.public.flags |= APPX_BUNDLE_PACKAGE_UNSUPPORTED_EXTENSION;
-        parser->manifest->unsupported_extensions = TRUE;
-        if (SUCCEEDED(parse_boolean( parser, extension_encrypted->value,
-                                     &value )) && value)
-            package.public.flags |= APPX_BUNDLE_PACKAGE_ENCRYPTED;
+            package.public.flags |= APPX_BUNDLE_PACKAGE_STUB;
     }
     if (SUCCEEDED(parser->hr))
         finish_attributes( parser, &attributes, &package.public.flags );
@@ -1133,6 +1280,16 @@ static HRESULT parse_package( struct parser *parser )
                         parse_resources( parser, &package );
                     }
                 }
+                else if (node_is( parser, bundle_namespace, "Dependencies" ))
+                {
+                    if (dependencies_seen)
+                        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+                    else
+                    {
+                        dependencies_seen = TRUE;
+                        parse_dependencies( parser, &package );
+                    }
+                }
                 else
                     skip_ignorable_element( parser, &package.public.flags );
             }
@@ -1145,8 +1302,7 @@ static HRESULT parse_package( struct parser *parser )
     if (SUCCEEDED(parser->hr) && !resources_seen)
         parser_fail( parser, APPX_E_INVALID_MANIFEST );
     if (SUCCEEDED(parser->hr) &&
-        (package.public.type == APPX_BUNDLE_PACKAGE_APPLICATION ||
-         package.public.type == APPX_BUNDLE_PACKAGE_FRAMEWORK) &&
+        package.public.type == APPX_BUNDLE_PACKAGE_APPLICATION &&
         *package.public.resource_id)
         parser_fail( parser, APPX_E_INVALID_MANIFEST );
     if (SUCCEEDED(parser->hr))
@@ -1233,7 +1389,7 @@ static HRESULT parse_schema_version( struct parser *parser,
 {
     const xmlChar *cursor = value;
     int length;
-    UINT32 parts = 0;
+    UINT32 first = 0, parts = 0;
 
     /* Three unsigned 16-bit decimal components require at most 17 bytes. */
     if (!value || !*value || (length = xmlStrlen( value )) <= 0 ||
@@ -1253,6 +1409,7 @@ static HRESULT parse_schema_version( struct parser *parser,
             if (++digits > 5 || number > 0xffff)
                 return parser_fail( parser, APPX_E_INVALID_MANIFEST );
         }
+        if (parts == 1) first = number;
         if (!digits || (*cursor && *cursor != '.'))
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
         if (*cursor)
@@ -1264,6 +1421,7 @@ static HRESULT parse_schema_version( struct parser *parser,
     }
     if (parts < 2)
         return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    parser->schema_major = first;
     return S_OK;
 }
 
@@ -1628,14 +1786,64 @@ static BOOL valid_host_architecture( enum appx_bundle_architecture architecture 
     return architecture == APPX_BUNDLE_ARCHITECTURE_X86 ||
            architecture == APPX_BUNDLE_ARCHITECTURE_X64 ||
            architecture == APPX_BUNDLE_ARCHITECTURE_ARM ||
-           architecture == APPX_BUNDLE_ARCHITECTURE_ARM64;
+           architecture == APPX_BUNDLE_ARCHITECTURE_ARM64 ||
+           architecture == APPX_BUNDLE_ARCHITECTURE_X86A64;
 }
 
-static UINT32 architecture_rank( enum appx_bundle_architecture package,
-                                 enum appx_bundle_architecture host )
+HRESULT appx_bundle_selection_policy_validate_architecture(
+    const struct appx_bundle_selection_policy *policy )
 {
-    if (package == host) return 2;
-    if (package == APPX_BUNDLE_ARCHITECTURE_NEUTRAL) return 1;
+    UINT32 version, supported;
+
+    if (!appx_bundle_selection_policy_size_valid( policy ) ||
+        !valid_host_architecture( policy->host_architecture ))
+        return E_INVALIDARG;
+    if (policy->size == APPX_BUNDLE_SELECTION_POLICY_LEGACY_SIZE)
+        return S_OK;
+
+    version = policy->architecture_policy.value.version;
+    supported = policy->architecture_policy.value.supported_architectures;
+    if (!version) return supported ? E_INVALIDARG : S_OK;
+    if (version != APPX_BUNDLE_ARCHITECTURE_POLICY_VERSION ||
+        !supported ||
+        (supported & ~APPX_BUNDLE_ARCHITECTURE_CONCRETE_MASK) ||
+        !(supported &
+          APPX_BUNDLE_ARCHITECTURE_MASK(policy->host_architecture)))
+        return E_INVALIDARG;
+    return S_OK;
+}
+
+static UINT32 architecture_rank(
+    enum appx_bundle_architecture package,
+    const struct appx_bundle_selection_policy *policy )
+{
+    /*
+     * Windows on Arm selects a native ARM32 package over x86 when those are
+     * the only submitted variants.  Keep ARM ahead of both x86 package forms;
+     * X64 remains the first Windows 11 emulation guest.
+     */
+    static const enum appx_bundle_architecture guest_order[] =
+    {
+        APPX_BUNDLE_ARCHITECTURE_X64,
+        APPX_BUNDLE_ARCHITECTURE_ARM,
+        APPX_BUNDLE_ARCHITECTURE_X86A64,
+        APPX_BUNDLE_ARCHITECTURE_X86,
+        APPX_BUNDLE_ARCHITECTURE_ARM64,
+    };
+    UINT32 supported, i;
+
+    if (package == policy->host_architecture) return 8;
+    if (package == APPX_BUNDLE_ARCHITECTURE_NEUTRAL) return 7;
+    if (policy->size == APPX_BUNDLE_SELECTION_POLICY_LEGACY_SIZE ||
+        !policy->architecture_policy.value.version)
+        return 0;
+
+    supported = policy->architecture_policy.value.supported_architectures;
+    if (package >= APPX_BUNDLE_ARCHITECTURE_UNSUPPORTED ||
+        !(supported & APPX_BUNDLE_ARCHITECTURE_MASK(package)))
+        return 0;
+    for (i = 0; i < ARRAY_SIZE(guest_order); i++)
+        if (package == guest_order[i]) return 6 - i;
     return 0;
 }
 
@@ -1664,7 +1872,7 @@ static BOOL resource_package_matches(
 {
     UINT32 i;
 
-    if (!architecture_rank( package->architecture, policy->host_architecture ))
+    if (!architecture_rank( package->architecture, policy ))
         return FALSE;
     if (!package->resource_count) return TRUE;
     for (i = 0; i < package->resource_count; i++)
@@ -1681,14 +1889,14 @@ HRESULT WINAPI appx_bundle_manifest_select(
     const struct appx_bundle_package *best = NULL;
     UINT32 best_index = 0, best_rank = 0, i;
     BOOL ambiguous = FALSE, payload_seen = FALSE;
+    BOOL unsupported_semantics = FALSE;
 
     if (!selection || selection->size != sizeof(*selection))
         return E_INVALIDARG;
     memset( selection, 0, sizeof(*selection) );
     selection->size = sizeof(*selection);
-    if (!manifest || !policy ||
-        policy->size != sizeof(*policy) ||
-        !valid_host_architecture( policy->host_architecture ))
+    if (!manifest ||
+        FAILED(appx_bundle_selection_policy_validate_architecture( policy )))
         return E_INVALIDARG;
     if ((!policy->language_neutral_only &&
          (!policy->language || !validate_language( policy->language ))) ||
@@ -1716,6 +1924,16 @@ HRESULT WINAPI appx_bundle_manifest_select(
             selection->issues |= APPX_BUNDLE_SELECTION_UNSUPPORTED_EXTENSION;
         if (package->flags & APPX_BUNDLE_PACKAGE_UNSUPPORTED_QUALIFIER)
             selection->issues |= APPX_BUNDLE_SELECTION_UNSUPPORTED_QUALIFIER;
+        if (package->flags & APPX_BUNDLE_PACKAGE_STUB)
+        {
+            selection->issues |= APPX_BUNDLE_SELECTION_STUB_PAYLOAD;
+            unsupported_semantics = TRUE;
+        }
+        if (package->flags & APPX_BUNDLE_PACKAGE_HAS_DEPENDENCIES)
+        {
+            selection->issues |= APPX_BUNDLE_SELECTION_DEPENDENCY_PAYLOAD;
+            unsupported_semantics = TRUE;
+        }
 
         if (package->type == APPX_BUNDLE_PACKAGE_RESOURCE)
         {
@@ -1733,12 +1951,10 @@ HRESULT WINAPI appx_bundle_manifest_select(
             selection->issues |= APPX_BUNDLE_SELECTION_OPTIONAL_PAYLOAD;
             continue;
         }
-        if (package->type != APPX_BUNDLE_PACKAGE_APPLICATION &&
-            package->type != APPX_BUNDLE_PACKAGE_FRAMEWORK)
+        if (package->type != APPX_BUNDLE_PACKAGE_APPLICATION)
             continue;
         payload_seen = TRUE;
-        rank = architecture_rank( package->architecture,
-                                  policy->host_architecture );
+        rank = architecture_rank( package->architecture, policy );
         if (!rank)
         {
             selection->issues |=
@@ -1748,7 +1964,9 @@ HRESULT WINAPI appx_bundle_manifest_select(
         if ((package->flags & (APPX_BUNDLE_PACKAGE_ENCRYPTED |
                                APPX_BUNDLE_PACKAGE_UNSUPPORTED_ARCHITECTURE |
                                APPX_BUNDLE_PACKAGE_UNSUPPORTED_EXTENSION |
-                               APPX_BUNDLE_PACKAGE_UNSUPPORTED_QUALIFIER)) ||
+                               APPX_BUNDLE_PACKAGE_UNSUPPORTED_QUALIFIER |
+                               APPX_BUNDLE_PACKAGE_STUB |
+                               APPX_BUNDLE_PACKAGE_HAS_DEPENDENCIES)) ||
             manifest->unsupported_extensions)
             continue;
         if (!best || rank > best_rank ||
@@ -1772,6 +1990,11 @@ HRESULT WINAPI appx_bundle_manifest_select(
         selection->issues |= APPX_BUNDLE_SELECTION_AMBIGUOUS_PAYLOAD |
                              APPX_BUNDLE_SELECTION_NO_PAYLOAD;
         return HRESULT_FROM_WIN32( ERROR_DUP_NAME );
+    }
+    if (unsupported_semantics)
+    {
+        selection->issues |= APPX_BUNDLE_SELECTION_NO_PAYLOAD;
+        return HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );
     }
     if (!best)
     {

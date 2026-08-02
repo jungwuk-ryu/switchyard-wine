@@ -49,11 +49,13 @@ WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 #define CATALOG_PACKAGE_STRING_REFS_OFFSET          76
 #define CATALOG_PACKAGE_FIXED_SIZE                  132
 
-#define CATALOG_APPLICATION_RECORD_SIZE             28
+#define CATALOG_APPLICATION_RECORD_SIZE             44
 #define CATALOG_APPLICATION_KIND_OFFSET             0
 #define CATALOG_APPLICATION_ID_REF_OFFSET           4
 #define CATALOG_APPLICATION_EXECUTABLE_REF_OFFSET   12
 #define CATALOG_APPLICATION_ENTRY_POINT_REF_OFFSET  20
+#define CATALOG_APPLICATION_PARAMETERS_REF_OFFSET   28
+#define CATALOG_APPLICATION_CURRENT_DIR_REF_OFFSET  36
 
 #define CATALOG_DEPENDENCY_RECORD_SIZE              24
 #define CATALOG_DEPENDENCY_VERSION_OFFSET           0
@@ -71,6 +73,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 #define CATALOG_HEADER_RESERVED_SIZE                16
 
 #define CATALOG_DIGEST_SIZE                         32
+#define CATALOG_LOCK_POLL_MS                        20
 
 static const BYTE catalog_magic[8] = {'S','W','X','C','A','T','L','G'};
 
@@ -88,7 +91,7 @@ enum package_string_index
 
 struct catalog_application_storage
 {
-    WCHAR *strings[3];
+    WCHAR *strings[5];
 };
 
 struct catalog_dependency_storage
@@ -296,6 +299,17 @@ static HRESULT copy_catalog_string( const WCHAR *source, BOOL allow_empty,
     return S_OK;
 }
 
+static HRESULT validate_catalog_string_max( const WCHAR *string,
+                                            BOOL allow_empty, UINT32 maximum )
+{
+    UINT32 chars;
+    HRESULT hr;
+
+    if (FAILED(hr = bounded_string_length( string, allow_empty, &chars )))
+        return hr;
+    return chars <= maximum + 1 ? S_OK : malformed_catalog();
+}
+
 static HRESULT validate_payload_path( const WCHAR *path )
 {
     BYTE *utf8 = NULL, *escaped = NULL;
@@ -372,6 +386,16 @@ done:
     return hr;
 }
 
+static HRESULT validate_optional_payload_path( const WCHAR *path,
+                                               UINT32 maximum )
+{
+    HRESULT hr;
+
+    if (FAILED(hr = validate_catalog_string_max( path, TRUE, maximum )))
+        return hr;
+    return path[0] ? validate_payload_path( path ) : S_OK;
+}
+
 static void free_catalog_package( struct catalog_package *package )
 {
     UINT32 i;
@@ -385,6 +409,8 @@ static void free_catalog_package( struct catalog_package *package )
             HeapFree( GetProcessHeap(), 0, package->application_storage[i].strings[0] );
             HeapFree( GetProcessHeap(), 0, package->application_storage[i].strings[1] );
             HeapFree( GetProcessHeap(), 0, package->application_storage[i].strings[2] );
+            HeapFree( GetProcessHeap(), 0, package->application_storage[i].strings[3] );
+            HeapFree( GetProcessHeap(), 0, package->application_storage[i].strings[4] );
         }
     }
     if (package->dependency_storage)
@@ -493,10 +519,22 @@ static HRESULT copy_catalog_package( struct catalog_package *destination,
                 FAILED(hr = copy_catalog_string( application->executable, FALSE,
                     &destination->application_storage[i].strings[1] )) ||
                 FAILED(hr = copy_catalog_string( application->entry_point, TRUE,
-                    &destination->application_storage[i].strings[2] )))
+                    &destination->application_storage[i].strings[2] )) ||
+                FAILED(hr = copy_catalog_string(
+                    application->parameters ? application->parameters : L"",
+                    TRUE, &destination->application_storage[i].strings[3] )) ||
+                FAILED(hr = copy_catalog_string(
+                    application->current_directory_path ?
+                    application->current_directory_path : L"", TRUE,
+                    &destination->application_storage[i].strings[4] )))
                 goto failed;
             if (FAILED(hr = validate_payload_path(
-                    destination->application_storage[i].strings[1] )))
+                    destination->application_storage[i].strings[1] )) ||
+                FAILED(hr = validate_catalog_string_max(
+                    destination->application_storage[i].strings[3],
+                    TRUE, 1024 )) ||
+                FAILED(hr = validate_optional_payload_path(
+                    destination->application_storage[i].strings[4], 256 )))
                 goto failed;
             destination->applications[i].id =
                 destination->application_storage[i].strings[0];
@@ -504,6 +542,10 @@ static HRESULT copy_catalog_package( struct catalog_package *destination,
                 destination->application_storage[i].strings[1];
             destination->applications[i].entry_point =
                 destination->application_storage[i].strings[2];
+            destination->applications[i].parameters =
+                destination->application_storage[i].strings[3];
+            destination->applications[i].current_directory_path =
+                destination->application_storage[i].strings[4];
         }
     }
 
@@ -831,6 +873,20 @@ static HRESULT serialize_package( const struct catalog_package *package,
             goto done;
         write_string_ref( record.data + application_offset +
                           CATALOG_APPLICATION_ENTRY_POINT_REF_OFFSET,
+                          offset, chars );
+        if (FAILED(hr = append_catalog_string( &record,
+                                               package->applications[i].parameters,
+                                               &offset, &chars )))
+            goto done;
+        write_string_ref( record.data + application_offset +
+                          CATALOG_APPLICATION_PARAMETERS_REF_OFFSET,
+                          offset, chars );
+        if (FAILED(hr = append_catalog_string( &record,
+                                               package->applications[i].current_directory_path,
+                                               &offset, &chars )))
+            goto done;
+        write_string_ref( record.data + application_offset +
+                          CATALOG_APPLICATION_CURRENT_DIR_REF_OFFSET,
                           offset, chars );
     }
 
@@ -1177,13 +1233,31 @@ static HRESULT parse_catalog_package( const BYTE *record, UINT32 record_size,
                 strings_offset, strings_size,
                 apps_offset + i * CATALOG_APPLICATION_RECORD_SIZE +
                 CATALOG_APPLICATION_ENTRY_POINT_REF_OFFSET, TRUE, &expected_offset,
-                &package->application_storage[i].strings[2] )))
+                &package->application_storage[i].strings[2] )) ||
+            FAILED(hr = read_next_catalog_string( record, record_size,
+                strings_offset, strings_size,
+                apps_offset + i * CATALOG_APPLICATION_RECORD_SIZE +
+                CATALOG_APPLICATION_PARAMETERS_REF_OFFSET, TRUE, &expected_offset,
+                &package->application_storage[i].strings[3] )) ||
+            FAILED(hr = read_next_catalog_string( record, record_size,
+                strings_offset, strings_size,
+                apps_offset + i * CATALOG_APPLICATION_RECORD_SIZE +
+                CATALOG_APPLICATION_CURRENT_DIR_REF_OFFSET, TRUE, &expected_offset,
+                &package->application_storage[i].strings[4] )))
             goto failed;
         package->applications[i].id = package->application_storage[i].strings[0];
         package->applications[i].executable = package->application_storage[i].strings[1];
         package->applications[i].entry_point =
             package->application_storage[i].strings[2];
-        if (FAILED(hr = validate_payload_path( package->applications[i].executable )))
+        package->applications[i].parameters =
+            package->application_storage[i].strings[3];
+        package->applications[i].current_directory_path =
+            package->application_storage[i].strings[4];
+        if (FAILED(hr = validate_payload_path( package->applications[i].executable )) ||
+            FAILED(hr = validate_catalog_string_max(
+                package->applications[i].parameters, TRUE, 1024 )) ||
+            FAILED(hr = validate_optional_payload_path(
+                package->applications[i].current_directory_path, 256 )))
             goto failed;
     }
 
@@ -1411,8 +1485,10 @@ static HRESULT open_store_child( const struct catalog_store *store,
 }
 
 static HRESULT acquire_catalog_lock( const struct catalog_store *store,
+                                     DWORD timeout_ms, HANDLE cancel_event,
                                      struct catalog_lock *lock )
 {
+    ULONGLONG start = GetTickCount64();
     HRESULT hr;
 
     memset( lock, 0, sizeof(*lock) );
@@ -1422,12 +1498,66 @@ static HRESULT acquire_catalog_lock( const struct catalog_store *store,
                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
                                       FILE_OPEN_IF, 0, &lock->handle )))
         goto failed;
-    if (!LockFileEx( lock->handle, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0,
-                     &lock->overlapped ))
+    for (;;)
     {
-        hr = win32_error( GetLastError() );
-        TRACE( "Locking the catalog store failed, hr %#lx.\n", hr );
-        goto failed;
+        DWORD wait;
+
+        if (cancel_event)
+        {
+            wait = WaitForSingleObject( cancel_event, 0 );
+            if (wait == WAIT_OBJECT_0)
+            {
+                hr = HRESULT_FROM_WIN32( ERROR_CANCELLED );
+                goto failed;
+            }
+            if (wait != WAIT_TIMEOUT)
+            {
+                hr = win32_error( GetLastError() );
+                goto failed;
+            }
+        }
+        if (LockFileEx(
+                lock->handle,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0, 1, 0, &lock->overlapped ))
+            break;
+        if (GetLastError() != ERROR_LOCK_VIOLATION)
+        {
+            hr = win32_error( GetLastError() );
+            TRACE( "Locking the catalog store failed, hr %#lx.\n", hr );
+            goto failed;
+        }
+        if (timeout_ms != INFINITE)
+        {
+            ULONGLONG elapsed = GetTickCount64() - start;
+
+            if (elapsed >= timeout_ms)
+            {
+                hr = HRESULT_FROM_WIN32( ERROR_TIMEOUT );
+                TRACE( "Timed out locking the catalog store.\n" );
+                goto failed;
+            }
+            wait = timeout_ms - elapsed;
+            if (wait > CATALOG_LOCK_POLL_MS) wait = CATALOG_LOCK_POLL_MS;
+        }
+        else
+            wait = CATALOG_LOCK_POLL_MS;
+        if (cancel_event)
+        {
+            wait = WaitForSingleObject( cancel_event, wait );
+            if (wait == WAIT_OBJECT_0)
+            {
+                hr = HRESULT_FROM_WIN32( ERROR_CANCELLED );
+                goto failed;
+            }
+            if (wait != WAIT_TIMEOUT)
+            {
+                hr = win32_error( GetLastError() );
+                goto failed;
+            }
+        }
+        else
+            Sleep( wait );
     }
     lock->locked = TRUE;
     return S_OK;
@@ -1541,6 +1671,14 @@ done:
 HRESULT WINAPI appx_catalog_load( const WCHAR *store_root,
                                   APPX_CATALOG_SNAPSHOT **snapshot )
 {
+    return appx_catalog_load_bounded( store_root, INFINITE, NULL, snapshot );
+}
+
+HRESULT WINAPI appx_catalog_load_bounded( const WCHAR *store_root,
+                                          DWORD timeout_ms,
+                                          HANDLE cancel_event,
+                                          APPX_CATALOG_SNAPSHOT **snapshot )
+{
     struct catalog_store store;
     struct catalog_lock lock;
     HRESULT hr;
@@ -1550,7 +1688,8 @@ HRESULT WINAPI appx_catalog_load( const WCHAR *store_root,
     if (!snapshot) return E_INVALIDARG;
     *snapshot = NULL;
     if (FAILED(hr = open_catalog_store( store_root, &store ))) return hr;
-    if (FAILED(hr = acquire_catalog_lock( &store, &lock )))
+    if (FAILED(hr = acquire_catalog_lock(
+            &store, timeout_ms, cancel_event, &lock )))
     {
         close_catalog_store( &store );
         return hr;
@@ -1653,8 +1792,18 @@ static HRESULT replace_catalog_with_pending( const struct catalog_store *store,
     return hr;
 }
 
-HRESULT WINAPI appx_catalog_publish( const WCHAR *store_root, UINT64 expected_epoch,
+HRESULT WINAPI appx_catalog_publish( const WCHAR *store_root,
+                                     UINT64 expected_epoch,
                                      const APPX_CATALOG_SNAPSHOT *replacement )
+{
+    return appx_catalog_publish_bounded(
+        store_root, expected_epoch, replacement, INFINITE, NULL );
+}
+
+HRESULT WINAPI appx_catalog_publish_bounded(
+    const WCHAR *store_root, UINT64 expected_epoch,
+    const APPX_CATALOG_SNAPSHOT *replacement,
+    DWORD timeout_ms, HANDLE cancel_event )
 {
     APPX_CATALOG_SNAPSHOT *current = NULL;
     struct catalog_buffer serialized = {0};
@@ -1670,7 +1819,8 @@ HRESULT WINAPI appx_catalog_publish( const WCHAR *store_root, UINT64 expected_ep
         replacement->epoch != expected_epoch + 1)
         return E_INVALIDARG;
     if (FAILED(hr = open_catalog_store( store_root, &store ))) return hr;
-    if (FAILED(hr = acquire_catalog_lock( &store, &lock )))
+    if (FAILED(hr = acquire_catalog_lock(
+            &store, timeout_ms, cancel_event, &lock )))
     {
         close_catalog_store( &store );
         return hr;

@@ -43,8 +43,13 @@
 
 static HRESULT (WINAPI *p_wine_appx_archive_open)( HANDLE, const WINE_APPX_ARCHIVE_LIMITS *,
                                                    UINT32, WINE_APPX_ARCHIVE ** );
+static HRESULT (WINAPI *p_wine_appx_archive_open_ex)(
+    HANDLE, const WINE_APPX_ARCHIVE_LIMITS *, UINT32, HANDLE,
+    WINE_APPX_ARCHIVE ** );
 static void (WINAPI *p_wine_appx_archive_close)( WINE_APPX_ARCHIVE * );
 static HRESULT (WINAPI *p_wine_appx_archive_get_count)( WINE_APPX_ARCHIVE *, UINT32 * );
+static HRESULT (WINAPI *p_wine_appx_archive_get_total_uncompressed_size)(
+    WINE_APPX_ARCHIVE *, UINT64 * );
 static HRESULT (WINAPI *p_wine_appx_archive_find_entry)( WINE_APPX_ARCHIVE *, const WCHAR *,
                                                          UINT32 * );
 static HRESULT (WINAPI *p_wine_appx_archive_get_entry)( WINE_APPX_ARCHIVE *, UINT32,
@@ -52,6 +57,8 @@ static HRESULT (WINAPI *p_wine_appx_archive_get_entry)( WINE_APPX_ARCHIVE *, UIN
                                                         UINT32 *, WCHAR * );
 static HRESULT (WINAPI *p_appx_archive_calculate_digest_set)(
     WINE_APPX_ARCHIVE *, struct appx_signature_digest_set * );
+static HRESULT (WINAPI *p_appx_archive_calculate_digest_set_ex)(
+    WINE_APPX_ARCHIVE *, HANDLE, struct appx_signature_digest_set * );
 
 static NTSTATUS (WINAPI *p_BCryptOpenAlgorithmProvider)(
     BCRYPT_ALG_HANDLE *, const WCHAR *, const WCHAR *, ULONG );
@@ -544,6 +551,7 @@ static void test_valid_archive( BOOL zip64_directory, BOOL zip64_entry )
     WINE_APPX_ARCHIVE *archive;
     WCHAR path[64];
     UINT32 count, index, length, i;
+    UINT64 total_uncompressed;
     HRESULT hr;
     BOOL found = FALSE;
 
@@ -559,6 +567,7 @@ static void test_valid_archive( BOOL zip64_directory, BOOL zip64_entry )
         hr = p_wine_appx_archive_get_count( archive, &count );
         ok( hr == S_OK, "got hr %#lx.\n", hr );
         ok( count == 5, "got count %u.\n", count );
+        total_uncompressed = 0;
 
         for (i = 0; i < count; i++)
         {
@@ -573,6 +582,7 @@ static void test_valid_archive( BOOL zip64_directory, BOOL zip64_entry )
             entry.size = sizeof(entry);
             hr = p_wine_appx_archive_get_entry( archive, i, &entry, &length, path );
             ok( hr == S_OK, "got hr %#lx.\n", hr );
+            total_uncompressed += entry.uncompressed_size;
             if (!lstrcmpW( path, L"VFS\\ProgramFilesX64\\App\\app.exe" ))
             {
                 found = TRUE;
@@ -587,6 +597,17 @@ static void test_valid_archive( BOOL zip64_directory, BOOL zip64_entry )
             }
         }
         ok( found, "payload entry was not found.\n" );
+        {
+            UINT64 reported = ~(UINT64)0;
+
+            hr = p_wine_appx_archive_get_total_uncompressed_size(
+                archive, &reported );
+            ok( hr == S_OK, "got total-size hr %#lx.\n", hr );
+            ok( reported == total_uncompressed,
+                "got total size %s, expected %s.\n",
+                wine_dbgstr_longlong(reported),
+                wine_dbgstr_longlong(total_uncompressed) );
+        }
 
         index = 0xdeadbeef;
         hr = p_wine_appx_archive_find_entry( archive,
@@ -1398,6 +1419,110 @@ done:
     free_builder( &builder );
 }
 
+static void test_cancellable_inspection( void )
+{
+    struct appx_signature_digest_set set;
+    struct zip_builder builder = {0};
+    WINE_APPX_ARCHIVE *archive = NULL;
+    WCHAR path[64] = {0};
+    HANDLE cancel, file;
+    HRESULT hr;
+
+    add_digest_entries( &builder, TRUE, TRUE );
+    ok( finish_archive( &builder, FALSE ),
+        "failed to finish cancellation fixture.\n" );
+    file = create_archive_file( &builder.buffer, path );
+    ok( file != INVALID_HANDLE_VALUE,
+        "failed to create cancellation fixture, error %lu.\n",
+        GetLastError() );
+    if (file == INVALID_HANDLE_VALUE) goto done;
+
+    cancel = CreateEventW( NULL, TRUE, TRUE, NULL );
+    ok( !!cancel, "failed to create manual cancellation event, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        archive = (WINE_APPX_ARCHIVE *)0xdeadbeef;
+        hr = p_wine_appx_archive_open_ex(
+            file, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, cancel, &archive );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_CANCELLED),
+            "pre-cancelled open returned %#lx.\n", hr );
+        ok( !archive, "pre-cancelled open returned archive %p.\n", archive );
+        CloseHandle( cancel );
+    }
+
+    cancel = CreateEventW( NULL, FALSE, TRUE, NULL );
+    ok( !!cancel, "failed to create auto-reset cancellation event, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        archive = (WINE_APPX_ARCHIVE *)0xdeadbeef;
+        hr = p_wine_appx_archive_open_ex(
+            file, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, cancel, &archive );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_CANCELLED),
+            "auto-reset cancelled open returned %#lx.\n", hr );
+        ok( !archive, "auto-reset cancelled open returned archive %p.\n",
+            archive );
+        CloseHandle( cancel );
+    }
+
+    cancel = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!cancel, "failed to create invalid-handle fixture, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        CloseHandle( cancel );
+        archive = (WINE_APPX_ARCHIVE *)0xdeadbeef;
+        hr = p_wine_appx_archive_open_ex(
+            file, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, cancel, &archive );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE),
+            "invalid cancellation event returned %#lx.\n", hr );
+        ok( !archive, "invalid cancellation event returned archive %p.\n",
+            archive );
+    }
+
+    hr = p_wine_appx_archive_open(
+        file, NULL, WINE_APPX_ARCHIVE_OPEN_PACKAGE, &archive );
+    ok( hr == S_OK, "failed to open digest cancellation fixture, hr %#lx.\n",
+        hr );
+    if (FAILED(hr)) goto close_file;
+
+    cancel = CreateEventW( NULL, FALSE, TRUE, NULL );
+    ok( !!cancel, "failed to create digest cancellation event, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        memset( &set, 0xcc, sizeof(set) );
+        hr = p_appx_archive_calculate_digest_set_ex( archive, cancel, &set );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_CANCELLED),
+            "pre-cancelled digest returned %#lx.\n", hr );
+        ok( digest_set_is_zero( &set ),
+            "pre-cancelled digest left output data.\n" );
+        CloseHandle( cancel );
+    }
+
+    cancel = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!cancel, "failed to create invalid digest event, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        CloseHandle( cancel );
+        memset( &set, 0xcc, sizeof(set) );
+        hr = p_appx_archive_calculate_digest_set_ex( archive, cancel, &set );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE),
+            "invalid digest cancellation event returned %#lx.\n", hr );
+        ok( digest_set_is_zero( &set ),
+            "invalid digest cancellation event left output data.\n" );
+    }
+
+    p_wine_appx_archive_close( archive );
+close_file:
+    CloseHandle( file );
+    DeleteFileW( path );
+done:
+    free_builder( &builder );
+}
+
 static void test_arguments( void )
 {
     WINE_APPX_ARCHIVE_ENTRY entry;
@@ -1444,15 +1569,23 @@ START_TEST(archive)
     }
 
     p_wine_appx_archive_open = (void *)GetProcAddress( module, "wine_appx_archive_open" );
+    p_wine_appx_archive_open_ex =
+        (void *)GetProcAddress( module, "wine_appx_archive_open_ex" );
     p_wine_appx_archive_close = (void *)GetProcAddress( module, "wine_appx_archive_close" );
     p_wine_appx_archive_get_count =
         (void *)GetProcAddress( module, "wine_appx_archive_get_count" );
+    p_wine_appx_archive_get_total_uncompressed_size =
+        (void *)GetProcAddress(
+            module, "wine_appx_archive_get_total_uncompressed_size" );
     p_wine_appx_archive_find_entry =
         (void *)GetProcAddress( module, "wine_appx_archive_find_entry" );
     p_wine_appx_archive_get_entry =
         (void *)GetProcAddress( module, "wine_appx_archive_get_entry" );
     p_appx_archive_calculate_digest_set =
         (void *)GetProcAddress( module, "appx_archive_calculate_digest_set" );
+    p_appx_archive_calculate_digest_set_ex =
+        (void *)GetProcAddress( module,
+                               "appx_archive_calculate_digest_set_ex" );
     p_BCryptOpenAlgorithmProvider =
         (void *)GetProcAddress( bcrypt, "BCryptOpenAlgorithmProvider" );
     p_BCryptCreateHash = (void *)GetProcAddress( bcrypt, "BCryptCreateHash" );
@@ -1461,9 +1594,13 @@ START_TEST(archive)
     p_BCryptDestroyHash = (void *)GetProcAddress( bcrypt, "BCryptDestroyHash" );
     p_BCryptCloseAlgorithmProvider =
         (void *)GetProcAddress( bcrypt, "BCryptCloseAlgorithmProvider" );
-    if (!p_wine_appx_archive_open || !p_wine_appx_archive_close ||
-        !p_wine_appx_archive_get_count || !p_wine_appx_archive_find_entry ||
+    if (!p_wine_appx_archive_open || !p_wine_appx_archive_open_ex ||
+        !p_wine_appx_archive_close ||
+        !p_wine_appx_archive_get_count ||
+        !p_wine_appx_archive_get_total_uncompressed_size ||
+        !p_wine_appx_archive_find_entry ||
         !p_wine_appx_archive_get_entry || !p_appx_archive_calculate_digest_set ||
+        !p_appx_archive_calculate_digest_set_ex ||
         !p_BCryptOpenAlgorithmProvider || !p_BCryptCreateHash ||
         !p_BCryptHashData || !p_BCryptFinishHash || !p_BCryptDestroyHash ||
         !p_BCryptCloseAlgorithmProvider)
@@ -1498,6 +1635,7 @@ START_TEST(archive)
     test_package_digest_ordering();
     test_package_digest_corruption();
     test_package_digest_arguments();
+    test_cancellable_inspection();
     test_arguments();
 
     FreeLibrary( bcrypt );

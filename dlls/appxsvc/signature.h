@@ -22,6 +22,7 @@
 #define __WINE_APPXSVC_SIGNATURE_H
 
 #include "windef.h"
+#include "wincrypt.h"
 #include "winerror.h"
 #include "wine/appxsvc.h"
 
@@ -30,6 +31,10 @@
 #define APPX_SIGNATURE_CERTIFICATE_ID_SIZE          APPX_SIGNATURE_SHA256_SIZE
 
 #define APPX_SIGNATURE_VERIFY_ALLOW_UNTRUSTED_CHAIN 0x00000001
+#define APPX_SIGNATURE_VERIFY_BUNDLE                0x00000002
+
+#define APPX_SIGNATURE_ESS_CERT_ID_V1               1
+#define APPX_SIGNATURE_ESS_CERT_ID_V2               2
 
 #define APPX_SIGNATURE_DIGEST_PACKAGE_CONTENTS     0x00000001
 #define APPX_SIGNATURE_DIGEST_CENTRAL_DIRECTORY    0x00000002
@@ -65,9 +70,19 @@ struct appx_signature_digest_set
 /*
  * Parse AppxSignature.p7x, verify its single CMS signer, bind the
  * authenticated message digest to the embedded SpcIndirectDataContent, and
- * verify the signer's certificate chain.  ALLOW_UNTRUSTED_CHAIN relaxes only
- * untrusted-root/incomplete-chain policy errors; it never bypasses CMS
- * signature or content-digest verification.
+ * verify the signer's certificate chain.  The normal policy first establishes
+ * a complete trusted, time-valid, usage-valid chain without URL retrieval.
+ * Only that trusted chain may enter a second, ten-second-bounded online
+ * revocation pass, which checks every non-root certificate and fails closed
+ * when revocation status is unavailable.
+ *
+ * ALLOW_UNTRUSTED_CHAIN is a developer/test policy, not an installation trust
+ * policy.  It relaxes only untrusted-root/incomplete-chain errors in the first
+ * no-network pass and never starts the online pass.  It does not relax malformed
+ * certificates, unsupported critical extensions, time, usage, KeyUsage, TSA
+ * EKU, CMS signature, timestamp signer binding, or content-digest failures.
+ * Since no revocation network access is permitted in this mode, callers must
+ * not treat its success as a revocation assertion.
  */
 HRESULT WINAPI appx_signature_parse_and_verify( const BYTE *data, SIZE_T size,
                                                 UINT32 flags,
@@ -98,6 +113,32 @@ HRESULT WINAPI appx_signature_decode_digest_set( const BYTE *data, SIZE_T size,
 /* Strictly decode the complete DER SpcIndirectDataContent value. */
 HRESULT WINAPI appx_signature_decode_indirect_data(
     const BYTE *data, SIZE_T size, struct appx_signature_digest_set *set );
+/*
+ * Select the SIP subject type while retaining the same strict DER grammar.
+ * The default form accepts package signatures only; the _ex form accepts
+ * APPX_SIGNATURE_VERIFY_BUNDLE to require the bundle SIP GUID instead.
+ */
+HRESULT WINAPI appx_signature_decode_indirect_data_ex(
+    const BYTE *data, SIZE_T size, UINT32 flags,
+    struct appx_signature_digest_set *set );
+
+/*
+ * Strict leaf and RFC3161 helpers used by the verifier.  They are private DLL
+ * exports so their hostile-input and policy decisions can be tested without a
+ * machine certificate store or network dependency.
+ */
+HRESULT WINAPI appx_signature_validate_leaf_extensions(
+    const CERT_EXTENSION *extensions, UINT32 count, BOOL timestamp_signer );
+HRESULT WINAPI appx_signature_select_ess_attribute(
+    UINT32 version1_count, UINT32 version2_count, UINT32 *version );
+HRESULT WINAPI appx_signature_validate_ess_certificate(
+    const BYTE *attribute, UINT32 attribute_size, UINT32 version,
+    const BYTE *certificate, UINT32 certificate_size );
+HRESULT WINAPI appx_signature_get_chain_policy(
+    UINT32 flags, BOOL online, DWORD time_flags, DWORD *chain_flags,
+    DWORD *url_timeout );
+HRESULT WINAPI appx_signature_evaluate_chain_status(
+    UINT32 flags, BOOL online, HRESULT policy_error, DWORD trust_errors );
 
 /*
  * Compare a caller-recalculated package hash set with the signed set.  The
@@ -115,8 +156,13 @@ HRESULT WINAPI appx_signature_compare_digest_sets(
  * AXPC and AXCD are computed from the raw ZIP file-record and central-directory
  * byte image; AXCT, AXBM, and optional AXCI are computed from the verified
  * uncompressed part streams.
+ * The _ex form accepts an optional cancellation event that must remain valid
+ * until the call returns.  The legacy form behaves as if that event were NULL.
  */
 HRESULT WINAPI appx_archive_calculate_digest_set(
     WINE_APPX_ARCHIVE *archive, struct appx_signature_digest_set *set );
+HRESULT WINAPI appx_archive_calculate_digest_set_ex(
+    WINE_APPX_ARCHIVE *archive, HANDLE cancel_event,
+    struct appx_signature_digest_set *set );
 
 #endif /* __WINE_APPXSVC_SIGNATURE_H */

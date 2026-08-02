@@ -22,6 +22,7 @@
 #define __WINE_APPXSVC_GRAPH_H
 
 #include "catalog.h"
+#include "wine/appx_package_graph.h"
 
 /*
  * The blob format is little-endian and contains offsets rather than pointers.
@@ -29,30 +30,70 @@
  * A receiver must call appx_package_graph_validate_blob() before retaining or
  * interpreting bytes received across a trust boundary.
  */
-#define APPX_GRAPH_BLOB_VERSION                    1
-#define APPX_GRAPH_BLOB_HEADER_SIZE                128
-#define APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE        112
-#define APPX_GRAPH_BLOB_LOADER_RECORD_SIZE         24
-#define APPX_GRAPH_MAX_BLOB_SIZE                   (16u * 1024 * 1024)
-#define APPX_GRAPH_MAX_PACKAGES                    256
-#define APPX_GRAPH_MAX_LOADER_FILES                16384
-#define APPX_GRAPH_MAX_STRING_CHARS                32767
+#define APPX_GRAPH_BLOB_VERSION                    WINE_APPX_GRAPH_BLOB_VERSION
+#define APPX_GRAPH_BLOB_HEADER_SIZE                WINE_APPX_GRAPH_BLOB_HEADER_SIZE
+#define APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE        \
+    WINE_APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE
+#define APPX_GRAPH_BLOB_LOADER_RECORD_SIZE         \
+    WINE_APPX_GRAPH_BLOB_LOADER_RECORD_SIZE
+#define APPX_GRAPH_BLOB_CLASS_RECORD_SIZE          \
+    WINE_APPX_GRAPH_BLOB_CLASS_RECORD_SIZE
+#define APPX_GRAPH_MAX_BLOB_SIZE                   WINE_APPX_GRAPH_MAX_BLOB_SIZE
+#define APPX_GRAPH_MAX_PACKAGES                    WINE_APPX_GRAPH_MAX_PACKAGES
+#define APPX_GRAPH_MAX_LOADER_FILES                \
+    WINE_APPX_GRAPH_MAX_LOADER_FILES
+#define APPX_GRAPH_MAX_CLASSES                     WINE_APPX_GRAPH_MAX_CLASSES
+#define APPX_GRAPH_MAX_STRING_CHARS                \
+    WINE_APPX_GRAPH_MAX_STRING_CHARS
+#define APPX_GRAPH_PACKAGE_DIRECT                  WINE_APPX_GRAPH_PACKAGE_DIRECT
 
 #define APPX_GRAPH_E_RESOLVE_DEPENDENCY_FAILED \
     HRESULT_FROM_WIN32(ERROR_INSTALL_RESOLVE_DEPENDENCY_FAILED)
 
 typedef struct appx_package_graph APPX_PACKAGE_GRAPH;
 
+struct appx_graph_file_identity
+{
+    UINT32 volume_serial;
+    UINT32 file_index_high;
+    UINT32 file_index_low;
+    BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
+};
+
 /*
- * Loader-file inventory is supplied by the already-validated deployment
- * record.  Graph construction never enumerates a directory.  A relative path
- * is indexed by its final component; duplicate basenames within one package
- * are rejected because basename-only loader resolution would be ambiguous.
+ * Loader and class inventories are supplied by the already-validated
+ * deployment record.  Their identities must come from final read handles
+ * opened without following a substitutable path.  Graph construction never
+ * enumerates a directory.  search_rank is the zero-based position of the
+ * relative path's parent directory in the effective loader search override.
+ * WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY keeps the file available to an exact
+ * relative-path LoadPackagedLibrary call without exposing it to basename
+ * search.  Duplicate basenames in distinct paths are valid.
  */
 struct appx_graph_loader_file
 {
     const WCHAR *package_full_name;
     const WCHAR *relative_path;
+    UINT32 volume_serial;
+    UINT32 file_index_high;
+    UINT32 file_index_low;
+    UINT32 search_rank;
+    UINT64 change_time;
+    UINT64 file_size;
+    BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
+};
+
+struct appx_graph_inproc_class
+{
+    const WCHAR *package_full_name;
+    const WCHAR *activatable_class_id;
+    const WCHAR *path;
+    UINT32 threading_model;
+    UINT32 volume_serial;
+    UINT32 file_index_high;
+    UINT32 file_index_low;
+    UINT64 change_time;
+    UINT64 file_size;
 };
 
 struct appx_graph_package
@@ -78,6 +119,10 @@ struct appx_graph_application
     const WCHAR *executable;
     const WCHAR *entry_point;
     enum appx_catalog_activation_kind activation_kind;
+    UINT32 volume_serial;
+    UINT32 file_index_high;
+    UINT32 file_index_low;
+    BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
 };
 
 struct appx_graph_loader_match
@@ -85,6 +130,27 @@ struct appx_graph_loader_match
     UINT32 package_index;
     const WCHAR *package_root;
     const WCHAR *relative_path;
+    UINT32 volume_serial;
+    UINT32 file_index_high;
+    UINT32 file_index_low;
+    UINT64 change_time;
+    UINT64 file_size;
+    BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
+};
+
+struct appx_graph_class_match
+{
+    UINT32 package_index;
+    UINT32 threading_model;
+    const WCHAR *package_root;
+    const WCHAR *activatable_class_id;
+    const WCHAR *path;
+    UINT32 volume_serial;
+    UINT32 file_index_high;
+    UINT32 file_index_low;
+    UINT64 change_time;
+    UINT64 file_size;
+    BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
 };
 
 /*
@@ -92,13 +158,29 @@ struct appx_graph_loader_match
  * store.  Catalog payload paths are store-relative; construction checks and
  * joins both parts so every packed package record is independently usable by
  * the loader without consulting the catalog or filesystem.
+ * application_identity must describe the final main-executable handle.
+ * target_architecture is the concrete dependency domain derived from that
+ * held executable's validated PE machine, not the caller or host preference.
  */
 HRESULT WINAPI appx_package_graph_create(
     const APPX_CATALOG_SNAPSHOT *snapshot, const WCHAR *store_root,
     const WCHAR *package_full_name, const WCHAR *application_id,
     enum appx_catalog_architecture target_architecture, UINT64 revision,
+    const struct appx_graph_file_identity *application_identity,
     const struct appx_graph_loader_file *loader_files, UINT32 loader_file_count,
     APPX_PACKAGE_GRAPH **graph );
+HRESULT WINAPI appx_package_graph_create_with_classes(
+    const APPX_CATALOG_SNAPSHOT *snapshot, const WCHAR *store_root,
+    const WCHAR *package_full_name, const WCHAR *application_id,
+    enum appx_catalog_architecture target_architecture, UINT64 revision,
+    const struct appx_graph_file_identity *application_identity,
+    const struct appx_graph_loader_file *loader_files, UINT32 loader_file_count,
+    const struct appx_graph_inproc_class *classes, UINT32 class_count,
+    APPX_PACKAGE_GRAPH **graph );
+HRESULT WINAPI appx_package_graph_resolve_direct_dependencies(
+    const APPX_CATALOG_SNAPSHOT *snapshot, const WCHAR *package_full_name,
+    enum appx_catalog_architecture target_architecture, UINT32 capacity,
+    UINT32 *package_indices, UINT32 *count );
 HRESULT WINAPI appx_package_graph_from_blob(
     const void *data, SIZE_T size, APPX_PACKAGE_GRAPH **graph );
 HRESULT WINAPI appx_package_graph_clone(
@@ -121,5 +203,13 @@ HRESULT WINAPI appx_package_graph_get_application(
 HRESULT WINAPI appx_package_graph_lookup_basename(
     const APPX_PACKAGE_GRAPH *graph, const WCHAR *basename,
     struct appx_graph_loader_match *match );
+UINT32 WINAPI appx_package_graph_get_inproc_class_count(
+    const APPX_PACKAGE_GRAPH *graph );
+HRESULT WINAPI appx_package_graph_get_inproc_class(
+    const APPX_PACKAGE_GRAPH *graph, UINT32 index,
+    struct appx_graph_class_match *match );
+HRESULT WINAPI appx_package_graph_lookup_inproc_class(
+    const APPX_PACKAGE_GRAPH *graph, const WCHAR *activatable_class_id,
+    struct appx_graph_class_match *match );
 
 #endif /* __WINE_APPXSVC_GRAPH_H */

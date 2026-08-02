@@ -69,7 +69,9 @@ enum appx_bundle_package_flags
     APPX_BUNDLE_PACKAGE_UNSUPPORTED_TYPE         = 0x00000004,
     APPX_BUNDLE_PACKAGE_UNSUPPORTED_ARCHITECTURE = 0x00000008,
     APPX_BUNDLE_PACKAGE_UNSUPPORTED_EXTENSION    = 0x00000010,
-    APPX_BUNDLE_PACKAGE_UNSUPPORTED_QUALIFIER    = 0x00000020
+    APPX_BUNDLE_PACKAGE_UNSUPPORTED_QUALIFIER    = 0x00000020,
+    APPX_BUNDLE_PACKAGE_STUB                     = 0x00000040,
+    APPX_BUNDLE_PACKAGE_HAS_DEPENDENCIES         = 0x00000080
 };
 
 enum appx_bundle_selection_issues
@@ -84,7 +86,9 @@ enum appx_bundle_selection_issues
     APPX_BUNDLE_SELECTION_INCOMPATIBLE_ARCHITECTURE = 0x00000080,
     APPX_BUNDLE_SELECTION_NO_PAYLOAD                = 0x00000100,
     APPX_BUNDLE_SELECTION_AMBIGUOUS_PAYLOAD         = 0x00000200,
-    APPX_BUNDLE_SELECTION_UNSUPPORTED_QUALIFIER     = 0x00000400
+    APPX_BUNDLE_SELECTION_UNSUPPORTED_QUALIFIER     = 0x00000400,
+    APPX_BUNDLE_SELECTION_STUB_PAYLOAD              = 0x00000800,
+    APPX_BUNDLE_SELECTION_DEPENDENCY_PAYLOAD        = 0x00001000
 };
 
 struct appx_bundle_identity
@@ -124,13 +128,24 @@ struct appx_bundle_package
  * Language must then be a nonempty BCP-47-style tag, and scale must be in
  * the range 1..1000.  Neutral resource declarations remain applicable.
  *
- * Payload selection deliberately does not emulate another processor
- * architecture.  It considers only a package matching host_architecture,
- * then a neutral package.  Within one architecture rank it chooses the
- * highest version and reports an equal-version tie as ambiguous.  The caller
- * may make a separately audited emulation decision before choosing the host
- * architecture passed here.
+ * The legacy policy ends after scale_neutral_only and selects an exact
+ * host-architecture payload, then a neutral payload.  The versioned
+ * architecture extension lets a caller provide its separately audited
+ * UserEnabled capability mask.  Selection then prefers host_architecture,
+ * neutral, and finally supported guest architectures in a deterministic
+ * order.  An all-zero extension retains the legacy behavior for source
+ * compatibility with callers which initialize the current structure to zero.
  */
+#define APPX_BUNDLE_ARCHITECTURE_POLICY_VERSION 1
+#define APPX_BUNDLE_ARCHITECTURE_MASK(architecture) \
+    (1u << (architecture))
+#define APPX_BUNDLE_ARCHITECTURE_CONCRETE_MASK \
+    (APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X86) | \
+     APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X64) | \
+     APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_ARM) | \
+     APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_ARM64) | \
+     APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X86A64))
+
 struct appx_bundle_selection_policy
 {
     UINT32 size;
@@ -139,7 +154,30 @@ struct appx_bundle_selection_policy
     UINT32 scale;
     BOOL language_neutral_only;
     BOOL scale_neutral_only;
+    union
+    {
+        UINT64 alignment;
+        struct
+        {
+            UINT32 version;
+            UINT32 supported_architectures;
+        } value;
+    } architecture_policy;
 };
+
+#define APPX_BUNDLE_SELECTION_POLICY_LEGACY_SIZE \
+    FIELD_OFFSET(struct appx_bundle_selection_policy, architecture_policy)
+
+static inline BOOL appx_bundle_selection_policy_size_valid(
+    const struct appx_bundle_selection_policy *policy )
+{
+    return policy &&
+           (policy->size == APPX_BUNDLE_SELECTION_POLICY_LEGACY_SIZE ||
+            policy->size == sizeof(*policy));
+}
+
+HRESULT appx_bundle_selection_policy_validate_architecture(
+    const struct appx_bundle_selection_policy *policy );
 
 struct appx_bundle_selection
 {

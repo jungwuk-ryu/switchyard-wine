@@ -27,6 +27,7 @@
 #include "winerror.h"
 #include "winternl.h"
 
+#include "architecture.h"
 #include "graph.h"
 #include "wine/debug.h"
 
@@ -51,7 +52,13 @@ WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 #define GRAPH_HEADER_AUMID_REF_OFFSET              80
 #define GRAPH_HEADER_EXECUTABLE_REF_OFFSET         88
 #define GRAPH_HEADER_ENTRY_POINT_REF_OFFSET        96
-#define GRAPH_HEADER_RESERVED_OFFSET               104
+#define GRAPH_HEADER_CLASS_COUNT_OFFSET            104
+#define GRAPH_HEADER_CLASSES_OFFSET                108
+#define GRAPH_HEADER_VOLUME_SERIAL_OFFSET          112
+#define GRAPH_HEADER_FILE_INDEX_HIGH_OFFSET        116
+#define GRAPH_HEADER_FILE_INDEX_LOW_OFFSET         120
+#define GRAPH_HEADER_OBJECT_ID_OFFSET              124
+#define GRAPH_HEADER_RESERVED_OFFSET               140
 
 #define GRAPH_PACKAGE_VERSION_OFFSET               0
 #define GRAPH_PACKAGE_ARCHITECTURE_OFFSET          8
@@ -68,9 +75,27 @@ WINE_DEFAULT_DEBUG_CHANNEL(appxsvc);
 #define GRAPH_PACKAGE_ROOT_REF_OFFSET              104
 
 #define GRAPH_LOADER_PACKAGE_INDEX_OFFSET          0
-#define GRAPH_LOADER_RESERVED_OFFSET               4
+#define GRAPH_LOADER_SEARCH_RANK_OFFSET            4
 #define GRAPH_LOADER_BASENAME_REF_OFFSET           8
 #define GRAPH_LOADER_PATH_REF_OFFSET               16
+#define GRAPH_LOADER_VOLUME_SERIAL_OFFSET          24
+#define GRAPH_LOADER_FILE_INDEX_HIGH_OFFSET        28
+#define GRAPH_LOADER_FILE_INDEX_LOW_OFFSET         32
+#define GRAPH_LOADER_RESERVED_OFFSET               36
+#define GRAPH_LOADER_CHANGE_TIME_OFFSET            40
+#define GRAPH_LOADER_FILE_SIZE_OFFSET              48
+#define GRAPH_LOADER_OBJECT_ID_OFFSET              56
+
+#define GRAPH_CLASS_PACKAGE_INDEX_OFFSET           0
+#define GRAPH_CLASS_THREADING_MODEL_OFFSET         4
+#define GRAPH_CLASS_ID_REF_OFFSET                  8
+#define GRAPH_CLASS_PATH_REF_OFFSET                16
+#define GRAPH_CLASS_VOLUME_SERIAL_OFFSET           24
+#define GRAPH_CLASS_FILE_INDEX_HIGH_OFFSET         28
+#define GRAPH_CLASS_FILE_INDEX_LOW_OFFSET          32
+#define GRAPH_CLASS_LOADER_INDEX_OFFSET            36
+#define GRAPH_CLASS_CHANGE_TIME_OFFSET             40
+#define GRAPH_CLASS_FILE_SIZE_OFFSET               48
 
 #define GRAPH_STRING_REF_SIZE                      8
 #define GRAPH_HEADER_RESERVED_SIZE                 \
@@ -96,6 +121,7 @@ struct graph_buffer
 struct candidate
 {
     const struct appx_catalog_package *package;
+    UINT32 catalog_index;
 };
 
 struct selected_package
@@ -103,6 +129,7 @@ struct selected_package
     const struct appx_catalog_package *package;
     UINT32 edge_start;
     UINT32 edge_count;
+    BOOL direct;
 };
 
 struct graph_edge
@@ -116,6 +143,21 @@ struct loader_build
     const WCHAR *relative_path;
     const WCHAR *basename;
     UINT32 package_index;
+    UINT32 search_rank;
+    UINT32 volume_serial;
+    UINT32 file_index_high;
+    UINT32 file_index_low;
+    UINT64 change_time;
+    UINT64 file_size;
+    BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE];
+};
+
+struct class_build
+{
+    const struct appx_graph_inproc_class *class;
+    const WCHAR *path;
+    UINT32 package_index;
+    UINT32 loader_index;
 };
 
 struct dependency_build
@@ -181,27 +223,32 @@ static BOOL multiply_uint32( UINT32 left, UINT32 right, UINT32 *result )
     return TRUE;
 }
 
+static BOOL file_identity_is_valid( UINT32 volume_serial,
+                                    UINT32 file_index_high,
+                                    UINT32 file_index_low )
+{
+    /*
+     * Zero is a valid Windows volume serial and is also Wine's documented
+     * fallback when mountmgr cannot answer.  It remains part of every equality
+     * check; only an all-zero file index means that no file identity exists.
+     */
+    (void)volume_serial;
+    return file_index_high || file_index_low;
+}
+
+static BOOL object_id_is_valid(
+    const BYTE object_id[WINE_APPX_GRAPH_OBJECT_ID_SIZE] )
+{
+    UINT32 i;
+
+    for (i = 0; i < WINE_APPX_GRAPH_OBJECT_ID_SIZE; i++)
+        if (object_id[i]) return TRUE;
+    return FALSE;
+}
+
 static HRESULT malformed_graph( void )
 {
     return APPX_E_INVALID_PACKAGING_LAYOUT;
-}
-
-static BOOL is_valid_architecture( enum appx_catalog_architecture architecture )
-{
-    return architecture == APPX_CATALOG_ARCHITECTURE_NEUTRAL ||
-           architecture == APPX_CATALOG_ARCHITECTURE_X86 ||
-           architecture == APPX_CATALOG_ARCHITECTURE_X64 ||
-           architecture == APPX_CATALOG_ARCHITECTURE_ARM ||
-           architecture == APPX_CATALOG_ARCHITECTURE_ARM64 ||
-           architecture == APPX_CATALOG_ARCHITECTURE_X86A64;
-}
-
-static BOOL architecture_is_compatible(
-    enum appx_catalog_architecture package_architecture,
-    enum appx_catalog_architecture target_architecture )
-{
-    return package_architecture == APPX_CATALOG_ARCHITECTURE_NEUTRAL ||
-           package_architecture == target_architecture;
 }
 
 static BOOL is_valid_activation_kind( enum appx_catalog_activation_kind kind )
@@ -265,6 +312,19 @@ static INT compare_string_exact( const WCHAR *left, const WCHAR *right )
     if (result == CSTR_LESS_THAN) return -1;
     if (result == CSTR_GREATER_THAN) return 1;
     return 0;
+}
+
+static INT compare_string_ascii_ci( const WCHAR *left, const WCHAR *right )
+{
+    for (;; left++, right++)
+    {
+        WCHAR left_ch = *left, right_ch = *right;
+
+        if (left_ch >= 'A' && left_ch <= 'Z') left_ch += 'a' - 'A';
+        if (right_ch >= 'A' && right_ch <= 'Z') right_ch += 'a' - 'A';
+        if (left_ch != right_ch) return left_ch < right_ch ? -1 : 1;
+        if (!left_ch) return 0;
+    }
 }
 
 static INT compare_string_canonical( const WCHAR *left, const WCHAR *right )
@@ -450,7 +510,7 @@ static HRESULT validate_catalog_package_shape(
     HRESULT hr;
 
     if (!package || (package->flags & ~APPX_CATALOG_PACKAGE_KNOWN_FLAGS) ||
-        !is_valid_architecture( package->architecture ) ||
+        !appx_architecture_is_valid( package->architecture ) ||
         package->application_count > APPX_CATALOG_MAX_APPLICATIONS_PER_PACKAGE ||
         package->dependency_count > APPX_CATALOG_MAX_DEPENDENCIES_PER_PACKAGE ||
         (package->application_count && !package->applications) ||
@@ -521,12 +581,12 @@ static HRESULT resolve_dependency( const struct candidate *candidates,
                                    UINT32 candidate_count,
                                    const struct appx_catalog_dependency *dependency,
                                    enum appx_catalog_architecture target_architecture,
-                                   const struct appx_catalog_package **package )
+                                   const struct candidate **selected )
 {
-    const struct appx_catalog_package *best = NULL;
+    const struct candidate *best = NULL;
     UINT32 low = 0, high = candidate_count, i;
 
-    *package = NULL;
+    *selected = NULL;
     while (low < high)
     {
         UINT32 middle = low + (high - low) / 2;
@@ -540,32 +600,39 @@ static HRESULT resolve_dependency( const struct candidate *candidates,
 
     for (i = low; i < candidate_count; i++)
     {
-        const struct appx_catalog_package *candidate = candidates[i].package;
+        const struct candidate *candidate = candidates + i;
         INT version_result;
 
-        if (compare_candidate_key( candidate, dependency->name,
+        if (compare_candidate_key( candidate->package, dependency->name,
                                    dependency->publisher ))
             break;
-        if (!(candidate->flags & APPX_CATALOG_PACKAGE_ACTIVE) ||
-            !architecture_is_compatible( candidate->architecture,
-                                         target_architecture ) ||
-            compare_version( &candidate->version,
+        if (!(candidate->package->flags & APPX_CATALOG_PACKAGE_ACTIVE) ||
+            !appx_architecture_is_compatible( candidate->package->architecture,
+                                              target_architecture ) ||
+            compare_version( &candidate->package->version,
                              &dependency->min_version ) < 0)
             continue;
-        version_result = best ? compare_version( &candidate->version,
-                                                 &best->version ) : 1;
+        version_result = best ? compare_version( &candidate->package->version,
+                                                 &best->package->version ) : 1;
         if (version_result > 0)
             best = candidate;
         else if (!version_result &&
-                 compare_string_ci( candidate->full_name, best->full_name ))
+                 compare_string_ci( candidate->package->full_name,
+                                    best->package->full_name ))
             return APPX_GRAPH_E_RESOLVE_DEPENDENCY_FAILED;
     }
     if (!best) return APPX_GRAPH_E_RESOLVE_DEPENDENCY_FAILED;
-    if (!(best->flags & APPX_CATALOG_PACKAGE_FRAMEWORK) ||
-        !(best->flags & APPX_CATALOG_PACKAGE_SIGNED) ||
-        (best->flags & APPX_CATALOG_PACKAGE_RESOURCE))
+    /*
+     * The first full-trust graph revision deliberately closes over framework
+     * dependencies only.  Resource and ordinary packages require different
+     * lifetime and resource-selection semantics and are rejected here instead
+     * of being silently treated as loader-search packages.
+     */
+    if (!(best->package->flags & APPX_CATALOG_PACKAGE_FRAMEWORK) ||
+        !(best->package->flags & APPX_CATALOG_PACKAGE_SIGNED) ||
+        (best->package->flags & APPX_CATALOG_PACKAGE_RESOURCE))
         return APPX_GRAPH_E_RESOLVE_DEPENDENCY_FAILED;
-    *package = best;
+    *selected = best;
     return S_OK;
 }
 
@@ -694,6 +761,7 @@ static HRESULT build_selection(
 
         if (FAILED(hr = validate_catalog_package_shape( package ))) goto done;
         candidates[i].package = package;
+        candidates[i].catalog_index = i;
         if (i && compare_string_canonical( candidates[i - 1].package->full_name,
                                            package->full_name ) >= 0)
         {
@@ -723,8 +791,8 @@ static HRESULT build_selection(
         hr = HRESULT_FROM_WIN32( ERROR_INSTALL_PACKAGE_NOT_FOUND );
         goto done;
     }
-    if (!architecture_is_compatible( main_package->architecture,
-                                     target_architecture ))
+    if (!appx_architecture_is_compatible( main_package->architecture,
+                                          target_architecture ))
     {
         hr = HRESULT_FROM_WIN32( ERROR_INSTALL_WRONG_PROCESSOR_ARCHITECTURE );
         goto done;
@@ -790,15 +858,17 @@ static HRESULT build_selection(
             }
         for (i = 0; i < package->dependency_count; i++)
         {
-            const struct appx_catalog_package *resolved;
+            const struct appx_catalog_dependency *dependency =
+                package->dependencies + i;
+            const struct candidate *resolved;
             INT selected_index;
 
             if (FAILED(hr = resolve_dependency(
-                    candidates, candidate_count, package->dependencies + i,
+                    candidates, candidate_count, dependency,
                     target_architecture, &resolved )))
                 goto done;
             selected_index = find_selected_package( selected, *selected_count,
-                                                    resolved );
+                                                    resolved->package );
             if (selected_index < 0)
             {
                 if (*selected_count >= APPX_GRAPH_MAX_PACKAGES)
@@ -807,8 +877,9 @@ static HRESULT build_selection(
                     goto done;
                 }
                 selected_index = (*selected_count)++;
-                selected[selected_index].package = resolved;
+                selected[selected_index].package = resolved->package;
             }
+            if (!cursor) selected[selected_index].direct = TRUE;
             if (FAILED(hr = append_edge( edges, edge_count, &edge_capacity,
                                          cursor, selected_index )))
                 goto done;
@@ -832,6 +903,123 @@ done:
     return hr;
 }
 
+HRESULT WINAPI appx_package_graph_resolve_direct_dependencies(
+    const APPX_CATALOG_SNAPSHOT *snapshot, const WCHAR *package_full_name,
+    enum appx_catalog_architecture target_architecture, UINT32 capacity,
+    UINT32 *package_indices, UINT32 *count )
+{
+    const struct appx_catalog_package *main_package = NULL;
+    struct dependency_build dependency_index[
+        APPX_CATALOG_MAX_DEPENDENCIES_PER_PACKAGE];
+    UINT32 resolved_indices[APPX_CATALOG_MAX_DEPENDENCIES_PER_PACKAGE];
+    struct candidate *candidates = NULL;
+    UINT32 candidate_count, chars, i;
+    HRESULT hr = S_OK;
+
+    if (!count) return E_INVALIDARG;
+    *count = 0;
+    if (!snapshot || !package_full_name ||
+        !appx_architecture_is_concrete( target_architecture ) ||
+        (capacity && !package_indices) ||
+        FAILED(bounded_string_length( package_full_name, FALSE, &chars )))
+        return E_INVALIDARG;
+
+    candidate_count = appx_catalog_snapshot_get_package_count( snapshot );
+    if (candidate_count > APPX_CATALOG_MAX_PACKAGES)
+        return malformed_graph();
+    if (candidate_count &&
+        !(candidates = HeapAlloc(
+              GetProcessHeap(), 0,
+              candidate_count * sizeof(*candidates) )))
+        return E_OUTOFMEMORY;
+
+    for (i = 0; i < candidate_count; i++)
+    {
+        const struct appx_catalog_package *package =
+            appx_catalog_snapshot_get_package( snapshot, i );
+
+        if (FAILED(hr = validate_catalog_package_shape( package ))) goto done;
+        candidates[i].package = package;
+        candidates[i].catalog_index = i;
+        if (i && compare_string_canonical(
+                candidates[i - 1].package->full_name,
+                package->full_name ) >= 0)
+        {
+            hr = malformed_graph();
+            goto done;
+        }
+        if (!compare_string_ci( package->full_name, package_full_name ))
+        {
+            if (main_package)
+            {
+                hr = malformed_graph();
+                goto done;
+            }
+            main_package = package;
+        }
+    }
+    if (!main_package)
+    {
+        hr = HRESULT_FROM_WIN32( ERROR_INSTALL_PACKAGE_NOT_FOUND );
+        goto done;
+    }
+    if (!(main_package->flags & APPX_CATALOG_PACKAGE_ACTIVE) ||
+        !(main_package->flags & APPX_CATALOG_PACKAGE_SIGNED))
+    {
+        hr = HRESULT_FROM_WIN32( ERROR_INSTALL_PACKAGE_NOT_FOUND );
+        goto done;
+    }
+    if (!appx_architecture_is_compatible(
+            main_package->architecture, target_architecture ))
+    {
+        hr = HRESULT_FROM_WIN32(
+            ERROR_INSTALL_WRONG_PROCESSOR_ARCHITECTURE );
+        goto done;
+    }
+
+    for (i = 0; i < main_package->dependency_count; i++)
+        dependency_index[i].dependency = main_package->dependencies + i;
+    qsort( dependency_index, main_package->dependency_count,
+           sizeof(*dependency_index), compare_dependency_build );
+    for (i = 1; i < main_package->dependency_count; i++)
+        if (dependency_keys_equal(
+                dependency_index[i - 1].dependency,
+                dependency_index[i].dependency ))
+        {
+            hr = malformed_graph();
+            goto done;
+        }
+
+    qsort( candidates, candidate_count, sizeof(*candidates),
+           compare_candidate );
+    for (i = 0; i < main_package->dependency_count; i++)
+    {
+        const struct candidate *resolved;
+
+        if (FAILED(hr = resolve_dependency(
+                candidates, candidate_count,
+                main_package->dependencies + i, target_architecture,
+                &resolved )))
+            goto done;
+        resolved_indices[i] = resolved->catalog_index;
+    }
+    *count = main_package->dependency_count;
+    if (capacity < *count)
+    {
+        hr = HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+        goto done;
+    }
+    if (*count)
+        memcpy( package_indices, resolved_indices,
+                *count * sizeof(*package_indices) );
+
+done:
+    HeapFree( GetProcessHeap(), 0, candidates );
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER))
+        *count = 0;
+    return hr;
+}
+
 static INT __cdecl compare_loader_build( const void *left_ptr,
                                          const void *right_ptr )
 {
@@ -842,10 +1030,85 @@ static INT __cdecl compare_loader_build( const void *left_ptr,
         return result;
     if (left->package_index != right->package_index)
         return left->package_index < right->package_index ? -1 : 1;
+    if (left->search_rank != right->search_rank)
+        return left->search_rank < right->search_rank ? -1 : 1;
+    if ((result = compare_string_ci( left->relative_path,
+                                     right->relative_path )))
+        return result;
     if ((result = compare_string_exact( left->basename, right->basename )))
         return result;
     return compare_string_canonical( left->relative_path,
                                      right->relative_path );
+}
+
+static INT __cdecl compare_loader_path_build( const void *left_ptr,
+                                              const void *right_ptr )
+{
+    const struct loader_build *left = left_ptr, *right = right_ptr;
+    INT result;
+
+    if (left->package_index != right->package_index)
+        return left->package_index < right->package_index ? -1 : 1;
+    if ((result = compare_string_ci( left->relative_path,
+                                     right->relative_path )))
+        return result;
+    return compare_string_canonical( left->relative_path,
+                                     right->relative_path );
+}
+
+static const struct loader_build *find_loader_build(
+    const struct loader_build *loaders, UINT32 loader_count,
+    const WCHAR *basename, const WCHAR *path, UINT32 package_index )
+{
+    static const UINT32 ranks[] = {0, 1, 2, 3, 4,
+                                   WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY};
+    UINT32 rank_index;
+
+    /*
+     * There are at most five override directories plus the explicit-only
+     * bucket.  Probe each complete sort key so class validation remains
+     * O(log n) even when every file shares a basename.
+     */
+    for (rank_index = 0; rank_index < ARRAY_SIZE(ranks); rank_index++)
+    {
+        UINT32 low = 0, high = loader_count;
+
+        while (low < high)
+        {
+            UINT32 middle = low + (high - low) / 2;
+            INT result = compare_string_ci( loaders[middle].basename,
+                                            basename );
+
+            if (!result)
+            {
+                if (loaders[middle].package_index < package_index)
+                    result = -1;
+                else if (loaders[middle].package_index > package_index)
+                    result = 1;
+            }
+            if (!result)
+            {
+                if (loaders[middle].search_rank < ranks[rank_index])
+                    result = -1;
+                else if (loaders[middle].search_rank > ranks[rank_index])
+                    result = 1;
+            }
+            if (!result)
+                result = compare_string_ci( loaders[middle].relative_path,
+                                            path );
+            if (result < 0)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        if (low < loader_count &&
+            !compare_string_ci( loaders[low].basename, basename ) &&
+            loaders[low].package_index == package_index &&
+            loaders[low].search_rank == ranks[rank_index] &&
+            !compare_string_ci( loaders[low].relative_path, path ))
+            return loaders + low;
+    }
+    return NULL;
 }
 
 static HRESULT build_loader_index(
@@ -874,8 +1137,24 @@ static HRESULT build_loader_index(
         if (FAILED(hr = bounded_string_length(
                 loader_files[i].package_full_name, FALSE, &chars )) ||
             FAILED(hr = validate_relative_path(
-                loader_files[i].relative_path, FALSE )))
+                loader_files[i].relative_path, FALSE )) ||
+            (loader_files[i].search_rank >=
+                 WINE_APPX_GRAPH_MAX_LOADER_SEARCH_PATHS &&
+             loader_files[i].search_rank !=
+                 WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY) ||
+            !file_identity_is_valid(
+                loader_files[i].volume_serial,
+                loader_files[i].file_index_high,
+                loader_files[i].file_index_low ) ||
+            !object_id_is_valid( loader_files[i].object_id ) ||
+            !loader_files[i].change_time ||
+            (loader_files[i].change_time >> 63) ||
+            !loader_files[i].file_size ||
+            (loader_files[i].file_size >> 63))
+        {
+            if (SUCCEEDED(hr)) hr = E_INVALIDARG;
             goto failed;
+        }
         for (j = 0; j < selected_count; j++)
             if (!compare_string_ci( selected[j].package->full_name,
                                     loader_files[i].package_full_name ))
@@ -895,16 +1174,144 @@ static HRESULT build_loader_index(
         result[i].package_index = package_index;
         result[i].relative_path = loader_files[i].relative_path;
         result[i].basename = path_basename( loader_files[i].relative_path );
+        result[i].search_rank = loader_files[i].search_rank;
+        result[i].volume_serial = loader_files[i].volume_serial;
+        result[i].file_index_high = loader_files[i].file_index_high;
+        result[i].file_index_low = loader_files[i].file_index_low;
+        result[i].change_time = loader_files[i].change_time;
+        result[i].file_size = loader_files[i].file_size;
+        memcpy( result[i].object_id, loader_files[i].object_id,
+                sizeof(result[i].object_id) );
     }
-    qsort( result, loader_file_count, sizeof(*result), compare_loader_build );
+    qsort( result, loader_file_count, sizeof(*result),
+           compare_loader_path_build );
     for (i = 1; i < loader_file_count; i++)
         if (result[i - 1].package_index == result[i].package_index &&
-            !compare_string_ci( result[i - 1].basename, result[i].basename ))
+            !compare_string_ci( result[i - 1].relative_path,
+                                result[i].relative_path ))
         {
             hr = malformed_graph();
             goto failed;
         }
+    qsort( result, loader_file_count, sizeof(*result), compare_loader_build );
     *loaders = result;
+    return S_OK;
+
+failed:
+    HeapFree( GetProcessHeap(), 0, result );
+    return hr;
+}
+
+static INT __cdecl compare_class_build( const void *left_ptr,
+                                        const void *right_ptr )
+{
+    const struct class_build *left = left_ptr, *right = right_ptr;
+    INT result;
+
+    if ((result = compare_string_ascii_ci(
+            left->class->activatable_class_id,
+            right->class->activatable_class_id )))
+        return result;
+    if (left->package_index != right->package_index)
+        return left->package_index < right->package_index ? -1 : 1;
+    return compare_string_canonical( left->path, right->path );
+}
+
+static HRESULT build_class_index(
+    const struct selected_package *selected, UINT32 selected_count,
+    const struct loader_build *loaders, UINT32 loader_count,
+    const struct appx_graph_inproc_class *classes, UINT32 class_count,
+    struct class_build **class_index )
+{
+    struct class_build *result = NULL;
+    UINT32 i, j;
+    HRESULT hr;
+
+    *class_index = NULL;
+    if (class_count > APPX_GRAPH_MAX_CLASSES || (class_count && !classes))
+        return E_INVALIDARG;
+    if (class_count &&
+        !(result = HeapAlloc( GetProcessHeap(), 0,
+                              class_count * sizeof(*result) )))
+        return E_OUTOFMEMORY;
+
+    for (i = 0; i < class_count; i++)
+    {
+        const struct loader_build *loader = NULL;
+        const WCHAR *basename;
+        UINT32 chars;
+        INT package_index = -1;
+
+        if (classes[i].threading_model > 2 ||
+            !file_identity_is_valid(
+                classes[i].volume_serial, classes[i].file_index_high,
+                classes[i].file_index_low ) ||
+            !classes[i].change_time || (classes[i].change_time >> 63) ||
+            !classes[i].file_size || (classes[i].file_size >> 63))
+        {
+            hr = E_INVALIDARG;
+            goto failed;
+        }
+        if (FAILED(hr = bounded_string_length(
+                classes[i].package_full_name, FALSE, &chars )) ||
+            FAILED(hr = bounded_string_length(
+                classes[i].activatable_class_id, FALSE, &chars )) ||
+            FAILED(hr = validate_relative_path( classes[i].path, FALSE )))
+            goto failed;
+        for (j = 0; j < selected_count; j++)
+            if (!compare_string_ci( selected[j].package->full_name,
+                                    classes[i].package_full_name ))
+            {
+                if (package_index >= 0)
+                {
+                    hr = malformed_graph();
+                    goto failed;
+                }
+                package_index = j;
+            }
+        if (package_index < 0)
+        {
+            hr = E_INVALIDARG;
+            goto failed;
+        }
+
+        /*
+         * Manifest paths and block-map paths are package paths and therefore
+         * resolve case-insensitively.  Persist the verified loader inventory
+         * spelling so every graph consumer sees one canonical path while the
+         * stable file identity still proves that the class and loader refer
+         * to the same extracted object.
+         */
+        basename = path_basename( classes[i].path );
+        loader = find_loader_build( loaders, loader_count, basename,
+                                    classes[i].path,
+                                    package_index );
+        if (!loader ||
+            compare_string_ci( loader->relative_path, classes[i].path ) ||
+            loader->volume_serial != classes[i].volume_serial ||
+            loader->file_index_high != classes[i].file_index_high ||
+            loader->file_index_low != classes[i].file_index_low ||
+            loader->change_time != classes[i].change_time ||
+            loader->file_size != classes[i].file_size)
+        {
+            hr = malformed_graph();
+            goto failed;
+        }
+        result[i].class = classes + i;
+        result[i].path = loader->relative_path;
+        result[i].package_index = package_index;
+        result[i].loader_index = loader - loaders;
+    }
+    qsort( result, class_count, sizeof(*result), compare_class_build );
+    for (i = 1; i < class_count; i++)
+        if (!compare_string_ascii_ci(
+                result[i - 1].class->activatable_class_id,
+                result[i].class->activatable_class_id ))
+        {
+            hr = malformed_graph();
+            goto failed;
+        }
+    *class_index = result;
     return S_OK;
 
 failed:
@@ -1006,12 +1413,15 @@ static HRESULT serialize_graph(
     const struct selected_package *selected, UINT32 selected_count,
     const struct appx_catalog_application *application,
     enum appx_catalog_architecture target_architecture, UINT64 revision,
+    const struct appx_graph_file_identity *application_identity,
     const struct loader_build *loaders, UINT32 loader_count,
+    const struct class_build *classes, UINT32 class_count,
     BYTE **blob, UINT32 *blob_size )
 {
     struct graph_buffer buffer = {0};
     WCHAR *aumid = NULL;
-    UINT32 package_bytes, loader_bytes, fixed_size, i, record_offset;
+    UINT32 package_bytes, loader_bytes, class_bytes, fixed_size;
+    UINT32 classes_offset, i, record_offset;
     HRESULT hr;
 
     *blob = NULL;
@@ -1022,8 +1432,12 @@ static HRESULT serialize_graph(
         !multiply_uint32( loader_count,
                           APPX_GRAPH_BLOB_LOADER_RECORD_SIZE,
                           &loader_bytes ) ||
+        !multiply_uint32( class_count,
+                          APPX_GRAPH_BLOB_CLASS_RECORD_SIZE,
+                          &class_bytes ) ||
         !add_uint32( APPX_GRAPH_BLOB_HEADER_SIZE, package_bytes, &fixed_size ) ||
-        !add_uint32( fixed_size, loader_bytes, &fixed_size ))
+        !add_uint32( fixed_size, loader_bytes, &classes_offset ) ||
+        !add_uint32( classes_offset, class_bytes, &fixed_size ))
         return malformed_graph();
     if (FAILED(hr = buffer_append_zero( &buffer, fixed_size, NULL ))) goto done;
     if (FAILED(hr = create_aumid( selected[0].package->family_name,
@@ -1056,7 +1470,9 @@ static HRESULT serialize_graph(
                       pack_version( &package->version ) );
         write_uint32( record + GRAPH_PACKAGE_ARCHITECTURE_OFFSET,
                       package->architecture );
-        write_uint32( record + GRAPH_PACKAGE_FLAGS_OFFSET, package->flags );
+        write_uint32( record + GRAPH_PACKAGE_FLAGS_OFFSET,
+                      package->flags |
+                      (selected[i].direct ? APPX_GRAPH_PACKAGE_DIRECT : 0) );
         write_uint32( record + GRAPH_PACKAGE_RANK_OFFSET, i );
         memcpy( record + GRAPH_PACKAGE_CONTENT_ID_OFFSET, package->content_id,
                 APPX_CATALOG_CONTENT_ID_SIZE );
@@ -1099,12 +1515,70 @@ static HRESULT serialize_graph(
         write_uint32( buffer.data + loader_offset +
                       GRAPH_LOADER_PACKAGE_INDEX_OFFSET,
                       loaders[i].package_index );
+        write_uint32( buffer.data + loader_offset +
+                      GRAPH_LOADER_SEARCH_RANK_OFFSET,
+                      loaders[i].search_rank );
+        write_uint32( buffer.data + loader_offset +
+                      GRAPH_LOADER_VOLUME_SERIAL_OFFSET,
+                      loaders[i].volume_serial );
+        write_uint32( buffer.data + loader_offset +
+                      GRAPH_LOADER_FILE_INDEX_HIGH_OFFSET,
+                      loaders[i].file_index_high );
+        write_uint32( buffer.data + loader_offset +
+                      GRAPH_LOADER_FILE_INDEX_LOW_OFFSET,
+                      loaders[i].file_index_low );
+        write_uint64( buffer.data + loader_offset +
+                      GRAPH_LOADER_CHANGE_TIME_OFFSET,
+                      loaders[i].change_time );
+        write_uint64( buffer.data + loader_offset +
+                      GRAPH_LOADER_FILE_SIZE_OFFSET,
+                      loaders[i].file_size );
+        memcpy( buffer.data + loader_offset + GRAPH_LOADER_OBJECT_ID_OFFSET,
+                loaders[i].object_id, sizeof(loaders[i].object_id) );
         if (FAILED(hr = buffer_append_string(
                 &buffer, loaders[i].basename, FALSE,
                 loader_offset + GRAPH_LOADER_BASENAME_REF_OFFSET )) ||
             FAILED(hr = buffer_append_string(
                 &buffer, loaders[i].relative_path, FALSE,
                 loader_offset + GRAPH_LOADER_PATH_REF_OFFSET )))
+            goto done;
+    }
+
+    for (i = 0; i < class_count; i++)
+    {
+        UINT32 class_offset = classes_offset +
+                              i * APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+
+        write_uint32( buffer.data + class_offset +
+                      GRAPH_CLASS_PACKAGE_INDEX_OFFSET,
+                      classes[i].package_index );
+        write_uint32( buffer.data + class_offset +
+                      GRAPH_CLASS_THREADING_MODEL_OFFSET,
+                      classes[i].class->threading_model );
+        write_uint32( buffer.data + class_offset +
+                      GRAPH_CLASS_VOLUME_SERIAL_OFFSET,
+                      classes[i].class->volume_serial );
+        write_uint32( buffer.data + class_offset +
+                      GRAPH_CLASS_FILE_INDEX_HIGH_OFFSET,
+                      classes[i].class->file_index_high );
+        write_uint32( buffer.data + class_offset +
+                      GRAPH_CLASS_FILE_INDEX_LOW_OFFSET,
+                      classes[i].class->file_index_low );
+        write_uint32( buffer.data + class_offset +
+                      GRAPH_CLASS_LOADER_INDEX_OFFSET,
+                      classes[i].loader_index );
+        write_uint64( buffer.data + class_offset +
+                      GRAPH_CLASS_CHANGE_TIME_OFFSET,
+                      classes[i].class->change_time );
+        write_uint64( buffer.data + class_offset +
+                      GRAPH_CLASS_FILE_SIZE_OFFSET,
+                      classes[i].class->file_size );
+        if (FAILED(hr = buffer_append_string(
+                &buffer, classes[i].class->activatable_class_id, FALSE,
+                class_offset + GRAPH_CLASS_ID_REF_OFFSET )) ||
+            FAILED(hr = buffer_append_string(
+                &buffer, classes[i].path, FALSE,
+                class_offset + GRAPH_CLASS_PATH_REF_OFFSET )))
             goto done;
     }
 
@@ -1127,6 +1601,17 @@ static HRESULT serialize_graph(
     write_uint32( buffer.data + GRAPH_HEADER_LOADER_COUNT_OFFSET, loader_count );
     write_uint32( buffer.data + GRAPH_HEADER_LOADERS_OFFSET,
                   APPX_GRAPH_BLOB_HEADER_SIZE + package_bytes );
+    write_uint32( buffer.data + GRAPH_HEADER_CLASS_COUNT_OFFSET, class_count );
+    write_uint32( buffer.data + GRAPH_HEADER_CLASSES_OFFSET, classes_offset );
+    write_uint32( buffer.data + GRAPH_HEADER_VOLUME_SERIAL_OFFSET,
+                  application_identity->volume_serial );
+    write_uint32( buffer.data + GRAPH_HEADER_FILE_INDEX_HIGH_OFFSET,
+                  application_identity->file_index_high );
+    write_uint32( buffer.data + GRAPH_HEADER_FILE_INDEX_LOW_OFFSET,
+                  application_identity->file_index_low );
+    memcpy( buffer.data + GRAPH_HEADER_OBJECT_ID_OFFSET,
+            application_identity->object_id,
+            sizeof(application_identity->object_id) );
     write_uint32( buffer.data + GRAPH_HEADER_STRINGS_OFFSET, fixed_size );
     write_uint32( buffer.data + GRAPH_HEADER_STRINGS_SIZE_OFFSET,
                   buffer.size - fixed_size );
@@ -1216,6 +1701,28 @@ static INT compare_blob_strings( const BYTE *data,
             left_ch = RtlUpcaseUnicodeChar( left_ch );
             right_ch = RtlUpcaseUnicodeChar( right_ch );
         }
+        if (left_ch != right_ch) return left_ch < right_ch ? -1 : 1;
+    }
+    if (left_length == right_length) return 0;
+    return left_length < right_length ? -1 : 1;
+}
+
+static INT compare_blob_class_ids( const BYTE *data,
+                                   struct blob_string_ref left,
+                                   struct blob_string_ref right )
+{
+    UINT32 left_length = left.chars - 1, right_length = right.chars - 1;
+    UINT32 length = left_length < right_length ? left_length : right_length, i;
+
+    for (i = 0; i < length; i++)
+    {
+        WCHAR left_ch = read_uint16(
+            data + left.offset + i * sizeof(WCHAR) );
+        WCHAR right_ch = read_uint16(
+            data + right.offset + i * sizeof(WCHAR) );
+
+        if (left_ch >= 'A' && left_ch <= 'Z') left_ch += 'a' - 'A';
+        if (right_ch >= 'A' && right_ch <= 'Z') right_ch += 'a' - 'A';
         if (left_ch != right_ch) return left_ch < right_ch ? -1 : 1;
     }
     if (left_length == right_length) return 0;
@@ -1330,10 +1837,13 @@ HRESULT WINAPI appx_package_graph_validate_blob( const void *blob, SIZE_T size )
     const BYTE *data = blob;
     struct blob_string_ref application_id, aumid, executable, entry_point;
     struct blob_string_ref previous_basename = {0};
+    struct blob_string_ref previous_loader_path = {0};
+    struct blob_string_ref previous_class_id = {0};
     struct blob_string_ref package_full_names[APPX_GRAPH_MAX_PACKAGES];
     struct blob_string_ref package_sort_scratch[APPX_GRAPH_MAX_PACKAGES];
     UINT32 package_count, package_offset, package_end;
     UINT32 loader_count, loader_offset, loader_end;
+    UINT32 class_count, class_offset, class_end;
     UINT32 strings_offset, strings_size, strings_end;
     UINT32 expected_string, activation_kind, target_architecture;
     UINT32 i, j;
@@ -1353,6 +1863,12 @@ HRESULT WINAPI appx_package_graph_validate_blob( const void *blob, SIZE_T size )
         return malformed_graph();
     for (i = 0; i < GRAPH_HEADER_RESERVED_SIZE; i++)
         if (data[GRAPH_HEADER_RESERVED_OFFSET + i]) return malformed_graph();
+    if (!file_identity_is_valid(
+            read_uint32( data + GRAPH_HEADER_VOLUME_SERIAL_OFFSET ),
+            read_uint32( data + GRAPH_HEADER_FILE_INDEX_HIGH_OFFSET ),
+            read_uint32( data + GRAPH_HEADER_FILE_INDEX_LOW_OFFSET )) ||
+        !object_id_is_valid( data + GRAPH_HEADER_OBJECT_ID_OFFSET ))
+        return malformed_graph();
 
     target_architecture =
         read_uint32( data + GRAPH_HEADER_TARGET_ARCHITECTURE_OFFSET );
@@ -1361,10 +1877,12 @@ HRESULT WINAPI appx_package_graph_validate_blob( const void *blob, SIZE_T size )
     package_offset = read_uint32( data + GRAPH_HEADER_PACKAGES_OFFSET );
     loader_count = read_uint32( data + GRAPH_HEADER_LOADER_COUNT_OFFSET );
     loader_offset = read_uint32( data + GRAPH_HEADER_LOADERS_OFFSET );
+    class_count = read_uint32( data + GRAPH_HEADER_CLASS_COUNT_OFFSET );
+    class_offset = read_uint32( data + GRAPH_HEADER_CLASSES_OFFSET );
     strings_offset = read_uint32( data + GRAPH_HEADER_STRINGS_OFFSET );
     strings_size = read_uint32( data + GRAPH_HEADER_STRINGS_SIZE_OFFSET );
 
-    if (!is_valid_architecture( target_architecture ) ||
+    if (!appx_architecture_is_concrete( target_architecture ) ||
         !is_launchable_activation_kind( activation_kind ) ||
         !package_count || package_count > APPX_GRAPH_MAX_PACKAGES ||
         loader_count > APPX_GRAPH_MAX_LOADER_FILES ||
@@ -1376,7 +1894,12 @@ HRESULT WINAPI appx_package_graph_validate_blob( const void *blob, SIZE_T size )
         !range_inside( loader_offset, loader_count,
                        APPX_GRAPH_BLOB_LOADER_RECORD_SIZE,
                        size, &loader_end ) ||
-        strings_offset != loader_end ||
+        class_count > APPX_GRAPH_MAX_CLASSES ||
+        class_offset != loader_end ||
+        !range_inside( class_offset, class_count,
+                       APPX_GRAPH_BLOB_CLASS_RECORD_SIZE,
+                       size, &class_end ) ||
+        strings_offset != class_end ||
         !add_uint32( strings_offset, strings_size, &strings_end ) ||
         strings_end != size)
         return malformed_graph();
@@ -1420,13 +1943,21 @@ HRESULT WINAPI appx_package_graph_validate_blob( const void *blob, SIZE_T size )
         refs[6] = get_blob_string_ref( record, GRAPH_PACKAGE_ROOT_REF_OFFSET );
         if (read_uint32( record + GRAPH_PACKAGE_RESERVED_OFFSET ) ||
             read_uint32( record + GRAPH_PACKAGE_RANK_OFFSET ) != i ||
-            (flags & ~APPX_CATALOG_PACKAGE_KNOWN_FLAGS) ||
+            (flags & ~(APPX_CATALOG_PACKAGE_KNOWN_FLAGS |
+                       APPX_GRAPH_PACKAGE_DIRECT)) ||
             !(flags & APPX_CATALOG_PACKAGE_ACTIVE) ||
             !(flags & APPX_CATALOG_PACKAGE_SIGNED) ||
-            !is_valid_architecture( architecture ) ||
-            !architecture_is_compatible( architecture, target_architecture ) ||
+            !appx_architecture_is_valid( architecture ) ||
+            !appx_architecture_is_compatible(
+                architecture, target_architecture ) ||
             (i == 0 && (flags & (APPX_CATALOG_PACKAGE_FRAMEWORK |
-                                 APPX_CATALOG_PACKAGE_RESOURCE))) ||
+                                 APPX_CATALOG_PACKAGE_RESOURCE |
+                                 APPX_GRAPH_PACKAGE_DIRECT))) ||
+            /*
+             * Full-trust activation currently serializes only framework
+             * dependencies.  Resource and ordinary dependencies are not part
+             * of this graph's activation or loader search boundary.
+             */
             (i != 0 && (!(flags & APPX_CATALOG_PACKAGE_FRAMEWORK) ||
                         (flags & APPX_CATALOG_PACKAGE_RESOURCE))))
             return malformed_graph();
@@ -1463,9 +1994,28 @@ HRESULT WINAPI appx_package_graph_validate_blob( const void *blob, SIZE_T size )
             record, GRAPH_LOADER_PATH_REF_OFFSET );
         UINT32 package_index =
             read_uint32( record + GRAPH_LOADER_PACKAGE_INDEX_OFFSET );
+        UINT32 search_rank =
+            read_uint32( record + GRAPH_LOADER_SEARCH_RANK_OFFSET );
+        UINT64 change_time =
+            read_uint64( record + GRAPH_LOADER_CHANGE_TIME_OFFSET );
+        UINT64 file_size =
+            read_uint64( record + GRAPH_LOADER_FILE_SIZE_OFFSET );
 
         if (package_index >= package_count ||
-            read_uint32( record + GRAPH_LOADER_RESERVED_OFFSET ))
+            (search_rank >= WINE_APPX_GRAPH_MAX_LOADER_SEARCH_PATHS &&
+             search_rank != WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY) ||
+            read_uint32( record + GRAPH_LOADER_RESERVED_OFFSET ) ||
+            !file_identity_is_valid(
+                read_uint32(
+                    record + GRAPH_LOADER_VOLUME_SERIAL_OFFSET ),
+                read_uint32(
+                    record + GRAPH_LOADER_FILE_INDEX_HIGH_OFFSET ),
+                read_uint32(
+                    record + GRAPH_LOADER_FILE_INDEX_LOW_OFFSET )) ||
+            !object_id_is_valid(
+                record + GRAPH_LOADER_OBJECT_ID_OFFSET ) ||
+            !change_time || (change_time >> 63) ||
+            !file_size || (file_size >> 63))
             return malformed_graph();
         if (FAILED(hr = validate_blob_string( data, size, strings_offset,
                                               basename, FALSE,
@@ -1484,15 +2034,94 @@ HRESULT WINAPI appx_package_graph_validate_blob( const void *blob, SIZE_T size )
                 (i - 1) * APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
             UINT32 previous_package = read_uint32(
                 previous + GRAPH_LOADER_PACKAGE_INDEX_OFFSET );
+            UINT32 previous_rank = read_uint32(
+                previous + GRAPH_LOADER_SEARCH_RANK_OFFSET );
             INT result = compare_blob_strings( data, previous_basename,
                                                basename, TRUE );
 
             if (result > 0 ||
                 (!result && previous_package > package_index) ||
-                (!result && previous_package == package_index))
+                (!result && previous_package == package_index &&
+                 previous_rank > search_rank) ||
+                (!result && previous_package == package_index &&
+                 previous_rank == search_rank &&
+                 compare_blob_strings( data, previous_loader_path,
+                                       path, TRUE ) >= 0))
                 return malformed_graph();
         }
         previous_basename = basename;
+        previous_loader_path = path;
+    }
+
+    for (i = 0; i < class_count; i++)
+    {
+        const BYTE *record = data + class_offset +
+                             i * APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+        struct blob_string_ref class_id = get_blob_string_ref(
+            record, GRAPH_CLASS_ID_REF_OFFSET );
+        struct blob_string_ref path = get_blob_string_ref(
+            record, GRAPH_CLASS_PATH_REF_OFFSET );
+        UINT32 package_index = read_uint32(
+            record + GRAPH_CLASS_PACKAGE_INDEX_OFFSET );
+        UINT32 threading_model = read_uint32(
+            record + GRAPH_CLASS_THREADING_MODEL_OFFSET );
+        UINT32 loader_index = read_uint32(
+            record + GRAPH_CLASS_LOADER_INDEX_OFFSET );
+        const BYTE *loader_record;
+        UINT64 change_time =
+            read_uint64( record + GRAPH_CLASS_CHANGE_TIME_OFFSET );
+        UINT64 file_size =
+            read_uint64( record + GRAPH_CLASS_FILE_SIZE_OFFSET );
+
+        if (package_index >= package_count || threading_model > 2 ||
+            loader_index >= loader_count ||
+            !file_identity_is_valid(
+                read_uint32(
+                    record + GRAPH_CLASS_VOLUME_SERIAL_OFFSET ),
+                read_uint32(
+                    record + GRAPH_CLASS_FILE_INDEX_HIGH_OFFSET ),
+                read_uint32(
+                    record + GRAPH_CLASS_FILE_INDEX_LOW_OFFSET )) ||
+            !change_time || (change_time >> 63) ||
+            !file_size || (file_size >> 63))
+            return malformed_graph();
+        if (FAILED(hr = validate_blob_string( data, size, strings_offset,
+                                              class_id, FALSE,
+                                              &expected_string )) ||
+            FAILED(hr = validate_blob_string( data, size, strings_offset,
+                                              path, FALSE,
+                                              &expected_string )) ||
+            FAILED(hr = validate_blob_path( data, path, FALSE )))
+            return hr;
+        loader_record = data + loader_offset +
+            loader_index * APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        if (read_uint32( loader_record +
+                         GRAPH_LOADER_PACKAGE_INDEX_OFFSET ) != package_index ||
+            compare_blob_strings(
+                data, get_blob_string_ref(
+                    loader_record, GRAPH_LOADER_PATH_REF_OFFSET ),
+                path, FALSE ) ||
+            read_uint32( loader_record +
+                         GRAPH_LOADER_VOLUME_SERIAL_OFFSET ) !=
+                read_uint32( record +
+                             GRAPH_CLASS_VOLUME_SERIAL_OFFSET ) ||
+            read_uint32( loader_record +
+                         GRAPH_LOADER_FILE_INDEX_HIGH_OFFSET ) !=
+                read_uint32( record +
+                             GRAPH_CLASS_FILE_INDEX_HIGH_OFFSET ) ||
+            read_uint32( loader_record +
+                         GRAPH_LOADER_FILE_INDEX_LOW_OFFSET ) !=
+                read_uint32( record +
+                             GRAPH_CLASS_FILE_INDEX_LOW_OFFSET ) ||
+            read_uint64( loader_record +
+                         GRAPH_LOADER_CHANGE_TIME_OFFSET ) != change_time ||
+            read_uint64( loader_record +
+                         GRAPH_LOADER_FILE_SIZE_OFFSET ) != file_size)
+            return malformed_graph();
+        if (i && compare_blob_class_ids( data, previous_class_id,
+                                         class_id ) >= 0)
+            return malformed_graph();
+        previous_class_id = class_id;
     }
     if (expected_string != size) return malformed_graph();
     return S_OK;
@@ -1533,15 +2162,18 @@ HRESULT WINAPI appx_package_graph_clone(
     return appx_package_graph_from_blob( source->data, source->size, graph );
 }
 
-HRESULT WINAPI appx_package_graph_create(
+HRESULT WINAPI appx_package_graph_create_with_classes(
     const APPX_CATALOG_SNAPSHOT *snapshot, const WCHAR *store_root,
     const WCHAR *package_full_name, const WCHAR *application_id,
     enum appx_catalog_architecture target_architecture, UINT64 revision,
+    const struct appx_graph_file_identity *application_identity,
     const struct appx_graph_loader_file *loader_files, UINT32 loader_file_count,
+    const struct appx_graph_inproc_class *classes, UINT32 class_count,
     APPX_PACKAGE_GRAPH **graph )
 {
     struct selected_package selected[APPX_GRAPH_MAX_PACKAGES];
     const struct appx_catalog_application *application;
+    struct class_build *class_index = NULL;
     struct loader_build *loaders = NULL;
     struct graph_edge *edges = NULL;
     BYTE *blob = NULL;
@@ -1549,17 +2181,27 @@ HRESULT WINAPI appx_package_graph_create(
     HRESULT hr;
 
     TRACE( "snapshot %p, store root %s, package %s, application %s, "
-           "architecture %u, revision %s, loader_files %p, count %u, graph %p.\n",
+           "architecture %u, revision %s, loader_files %p, count %u, "
+           "classes %p, count %u, graph %p.\n",
            snapshot, debugstr_w(store_root), debugstr_w(package_full_name),
            debugstr_w(application_id), target_architecture,
-           wine_dbgstr_longlong(revision), loader_files, loader_file_count, graph );
+           wine_dbgstr_longlong(revision), loader_files, loader_file_count,
+           classes, class_count, graph );
 
     if (!graph) return E_INVALIDARG;
     *graph = NULL;
     if (!snapshot || !store_root || !package_full_name || !application_id ||
-        !is_valid_architecture( target_architecture ) ||
+        !application_identity ||
+        !file_identity_is_valid(
+            application_identity->volume_serial,
+            application_identity->file_index_high,
+            application_identity->file_index_low ) ||
+        !object_id_is_valid( application_identity->object_id ) ||
+        !appx_architecture_is_concrete( target_architecture ) ||
         loader_file_count > APPX_GRAPH_MAX_LOADER_FILES ||
-        (loader_file_count && !loader_files))
+        (loader_file_count && !loader_files) ||
+        class_count > APPX_GRAPH_MAX_CLASSES ||
+        (class_count && !classes))
         return E_INVALIDARG;
     if (FAILED(hr = validate_absolute_store_root( store_root )) ||
         FAILED(hr = bounded_string_length( package_full_name, FALSE, &chars )) ||
@@ -1574,9 +2216,15 @@ HRESULT WINAPI appx_package_graph_create(
             selected, selected_count, loader_files, loader_file_count,
             &loaders )))
         goto done;
+    if (FAILED(hr = build_class_index(
+            selected, selected_count, loaders, loader_file_count,
+            classes, class_count, &class_index )))
+        goto done;
     if (FAILED(hr = serialize_graph(
             snapshot, store_root, selected, selected_count, application,
-            target_architecture, revision, loaders, loader_file_count,
+            target_architecture, revision, application_identity,
+            loaders, loader_file_count,
+            class_index, class_count,
             &blob, &blob_size )))
         goto done;
     if (FAILED(hr = appx_package_graph_validate_blob( blob, blob_size )))
@@ -1585,9 +2233,25 @@ HRESULT WINAPI appx_package_graph_create(
 
 done:
     HeapFree( GetProcessHeap(), 0, blob );
+    HeapFree( GetProcessHeap(), 0, class_index );
     HeapFree( GetProcessHeap(), 0, loaders );
     HeapFree( GetProcessHeap(), 0, edges );
     return hr;
+}
+
+HRESULT WINAPI appx_package_graph_create(
+    const APPX_CATALOG_SNAPSHOT *snapshot, const WCHAR *store_root,
+    const WCHAR *package_full_name, const WCHAR *application_id,
+    enum appx_catalog_architecture target_architecture, UINT64 revision,
+    const struct appx_graph_file_identity *application_identity,
+    const struct appx_graph_loader_file *loader_files, UINT32 loader_file_count,
+    APPX_PACKAGE_GRAPH **graph )
+{
+    return appx_package_graph_create_with_classes(
+        snapshot, store_root, package_full_name, application_id,
+        target_architecture, revision, application_identity,
+        loader_files, loader_file_count,
+        NULL, 0, graph );
 }
 
 void WINAPI appx_package_graph_free( APPX_PACKAGE_GRAPH *graph )
@@ -1687,6 +2351,15 @@ HRESULT WINAPI appx_package_graph_get_application(
         graph->data, GRAPH_HEADER_ENTRY_POINT_REF_OFFSET, graph->data );
     application->activation_kind = read_uint32(
         graph->data + GRAPH_HEADER_ACTIVATION_KIND_OFFSET );
+    application->volume_serial = read_uint32(
+        graph->data + GRAPH_HEADER_VOLUME_SERIAL_OFFSET );
+    application->file_index_high = read_uint32(
+        graph->data + GRAPH_HEADER_FILE_INDEX_HIGH_OFFSET );
+    application->file_index_low = read_uint32(
+        graph->data + GRAPH_HEADER_FILE_INDEX_LOW_OFFSET );
+    memcpy( application->object_id,
+            graph->data + GRAPH_HEADER_OBJECT_ID_OFFSET,
+            sizeof(application->object_id) );
     return S_OK;
 }
 
@@ -1737,13 +2410,21 @@ HRESULT WINAPI appx_package_graph_lookup_basename(
         else
             high = middle;
     }
-    if (low >= loader_count)
-        return HRESULT_FROM_WIN32( ERROR_MOD_NOT_FOUND );
-    record = data + loader_offset + low * APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
-    ref = get_blob_string_ref( record, GRAPH_LOADER_BASENAME_REF_OFFSET );
-    if (compare_input_blob_string_ci( basename, data, ref ))
-        return HRESULT_FROM_WIN32( ERROR_MOD_NOT_FOUND );
+    while (low < loader_count)
+    {
+        record = data + loader_offset +
+                 low * APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+        ref = get_blob_string_ref( record, GRAPH_LOADER_BASENAME_REF_OFFSET );
+        if (compare_input_blob_string_ci( basename, data, ref ))
+            break;
+        if (read_uint32( record + GRAPH_LOADER_SEARCH_RANK_OFFSET ) !=
+            WINE_APPX_GRAPH_LOADER_EXPLICIT_ONLY)
+            goto found;
+        low++;
+    }
+    return HRESULT_FROM_WIN32( ERROR_MOD_NOT_FOUND );
 
+found:
     package_index = read_uint32(
         record + GRAPH_LOADER_PACKAGE_INDEX_OFFSET );
     package_offset = read_uint32( data + GRAPH_HEADER_PACKAGES_OFFSET );
@@ -1754,5 +2435,141 @@ HRESULT WINAPI appx_package_graph_lookup_basename(
         package_record, GRAPH_PACKAGE_ROOT_REF_OFFSET, data );
     match->relative_path = graph_string(
         record, GRAPH_LOADER_PATH_REF_OFFSET, data );
+    match->volume_serial = read_uint32(
+        record + GRAPH_LOADER_VOLUME_SERIAL_OFFSET );
+    match->file_index_high = read_uint32(
+        record + GRAPH_LOADER_FILE_INDEX_HIGH_OFFSET );
+    match->file_index_low = read_uint32(
+        record + GRAPH_LOADER_FILE_INDEX_LOW_OFFSET );
+    match->change_time = read_uint64(
+        record + GRAPH_LOADER_CHANGE_TIME_OFFSET );
+    match->file_size = read_uint64(
+        record + GRAPH_LOADER_FILE_SIZE_OFFSET );
+    memcpy( match->object_id, record + GRAPH_LOADER_OBJECT_ID_OFFSET,
+            sizeof(match->object_id) );
+    return S_OK;
+}
+
+UINT32 WINAPI appx_package_graph_get_inproc_class_count(
+    const APPX_PACKAGE_GRAPH *graph )
+{
+    if (!graph) return 0;
+    return read_uint32( graph->data + GRAPH_HEADER_CLASS_COUNT_OFFSET );
+}
+
+static void fill_class_match( const APPX_PACKAGE_GRAPH *graph,
+                              const BYTE *record,
+                              struct appx_graph_class_match *match )
+{
+    const BYTE *data = graph->data;
+    UINT32 loader_index = read_uint32(
+        record + GRAPH_CLASS_LOADER_INDEX_OFFSET );
+    UINT32 loader_offset = read_uint32(
+        data + GRAPH_HEADER_LOADERS_OFFSET );
+    const BYTE *loader_record = data + loader_offset +
+        loader_index * APPX_GRAPH_BLOB_LOADER_RECORD_SIZE;
+    UINT32 package_index = read_uint32(
+        record + GRAPH_CLASS_PACKAGE_INDEX_OFFSET );
+    UINT32 package_offset = read_uint32(
+        data + GRAPH_HEADER_PACKAGES_OFFSET );
+    const BYTE *package_record = data + package_offset +
+        package_index * APPX_GRAPH_BLOB_PACKAGE_RECORD_SIZE;
+
+    match->package_index = package_index;
+    match->threading_model = read_uint32(
+        record + GRAPH_CLASS_THREADING_MODEL_OFFSET );
+    match->package_root = graph_string(
+        package_record, GRAPH_PACKAGE_ROOT_REF_OFFSET, data );
+    match->activatable_class_id = graph_string(
+        record, GRAPH_CLASS_ID_REF_OFFSET, data );
+    match->path = graph_string( record, GRAPH_CLASS_PATH_REF_OFFSET, data );
+    match->volume_serial = read_uint32(
+        record + GRAPH_CLASS_VOLUME_SERIAL_OFFSET );
+    match->file_index_high = read_uint32(
+        record + GRAPH_CLASS_FILE_INDEX_HIGH_OFFSET );
+    match->file_index_low = read_uint32(
+        record + GRAPH_CLASS_FILE_INDEX_LOW_OFFSET );
+    match->change_time = read_uint64(
+        record + GRAPH_CLASS_CHANGE_TIME_OFFSET );
+    match->file_size = read_uint64(
+        record + GRAPH_CLASS_FILE_SIZE_OFFSET );
+    memcpy( match->object_id,
+            loader_record + GRAPH_LOADER_OBJECT_ID_OFFSET,
+            sizeof(match->object_id) );
+}
+
+HRESULT WINAPI appx_package_graph_get_inproc_class(
+    const APPX_PACKAGE_GRAPH *graph, UINT32 index,
+    struct appx_graph_class_match *match )
+{
+    const BYTE *record;
+    UINT32 count, offset;
+
+    if (!graph || !match) return E_INVALIDARG;
+    count = read_uint32( graph->data + GRAPH_HEADER_CLASS_COUNT_OFFSET );
+    if (index >= count) return E_INVALIDARG;
+    offset = read_uint32( graph->data + GRAPH_HEADER_CLASSES_OFFSET );
+    record = graph->data + offset +
+             index * APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+    fill_class_match( graph, record, match );
+    return S_OK;
+}
+
+static INT compare_input_blob_class_id( const WCHAR *input, const BYTE *data,
+                                        struct blob_string_ref ref )
+{
+    UINT32 i, input_length = lstrlenW( input ), ref_length = ref.chars - 1;
+    UINT32 length = input_length < ref_length ? input_length : ref_length;
+
+    for (i = 0; i < length; i++)
+    {
+        WCHAR left = input[i];
+        WCHAR right = read_uint16(
+            data + ref.offset + i * sizeof(WCHAR) );
+
+        if (left >= 'A' && left <= 'Z') left += 'a' - 'A';
+        if (right >= 'A' && right <= 'Z') right += 'a' - 'A';
+        if (left != right) return left < right ? -1 : 1;
+    }
+    if (input_length == ref_length) return 0;
+    return input_length < ref_length ? -1 : 1;
+}
+
+HRESULT WINAPI appx_package_graph_lookup_inproc_class(
+    const APPX_PACKAGE_GRAPH *graph, const WCHAR *activatable_class_id,
+    struct appx_graph_class_match *match )
+{
+    const BYTE *data, *record;
+    struct blob_string_ref ref;
+    UINT32 count, offset, low = 0, high, middle, chars;
+    HRESULT hr;
+
+    if (!graph || !activatable_class_id || !match) return E_INVALIDARG;
+    if (FAILED(hr = bounded_string_length(
+            activatable_class_id, FALSE, &chars )))
+        return E_INVALIDARG;
+    data = graph->data;
+    count = read_uint32( data + GRAPH_HEADER_CLASS_COUNT_OFFSET );
+    offset = read_uint32( data + GRAPH_HEADER_CLASSES_OFFSET );
+    high = count;
+    while (low < high)
+    {
+        middle = low + (high - low) / 2;
+        record = data + offset +
+                 middle * APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+        ref = get_blob_string_ref( record, GRAPH_CLASS_ID_REF_OFFSET );
+        if (compare_input_blob_class_id(
+                activatable_class_id, data, ref ) > 0)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    if (low >= count)
+        return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
+    record = data + offset + low * APPX_GRAPH_BLOB_CLASS_RECORD_SIZE;
+    ref = get_blob_string_ref( record, GRAPH_CLASS_ID_REF_OFFSET );
+    if (compare_input_blob_class_id( activatable_class_id, data, ref ))
+        return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
+    fill_class_match( graph, record, match );
     return S_OK;
 }

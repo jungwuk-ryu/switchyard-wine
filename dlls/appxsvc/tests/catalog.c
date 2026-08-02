@@ -288,7 +288,8 @@ static void init_package( struct appx_catalog_package *package, const WCHAR *nam
     static const struct appx_catalog_application applications[] =
     {
         {L"App", L"VFS\\ProgramFilesX64\\App\\app.exe",
-         L"Windows.FullTrustApplication", APPX_CATALOG_ACTIVATION_FULL_TRUST},
+         L"Windows.FullTrustApplication", L"", L"",
+         APPX_CATALOG_ACTIVATION_FULL_TRUST},
     };
     static const struct appx_catalog_dependency dependencies[] =
     {
@@ -624,7 +625,7 @@ static void test_canonical_and_binary_boundaries( void )
         free_catalog_bytes( &mutated );
     }
 
-    expect_mutated_catalog( &bytes_b, CATALOG_HEADER_VERSION_OFFSET, 2,
+    expect_mutated_catalog( &bytes_b, CATALOG_HEADER_VERSION_OFFSET, 3,
                             HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) );
 
     free_catalog_bytes( &bytes_a );

@@ -133,13 +133,13 @@ static void test_valid_manifest(void)
         BUNDLE_OPEN BUNDLE_IDENTITY
         "<Packages>"
         "<Package Type=\"application\" Version=\"1.2.3.4\""
-        " Architecture=\"x64\" ResourceId=\"\""
+        " Architecture=\"x64\""
         " FileName=\"payload/app.msix\" Offset=\"0\" Size=\"4096\">"
         "<Resources><Resource Language=\"en-US\"/></Resources></Package>"
         "<Package Type=\"resource\" Version=\"1.2.3.4\""
         " Architecture=\"neutral\" ResourceId=\"resources.en-us\""
         " FileName=\"payload/resources.msix\" Offset=\"4096\" Size=\"1024\">"
-        "<Resources><Resource Language=\"en-US\" Scale=\"200\"/></Resources>"
+        "<Resources><Resource Language=\"en-US\" Scale=\"225\"/></Resources>"
         "</Package>"
         "</Packages>" BUNDLE_CLOSE;
     const struct appx_bundle_identity *identity;
@@ -193,12 +193,12 @@ static void test_valid_manifest(void)
         "got language %s.\n",
         wine_dbgstr_w(package->resources[0].language) );
     ok( package->resources[0].has_scale &&
-        package->resources[0].scale == 200, "got scale %u.\n",
+        package->resources[0].scale == 225, "got scale %u.\n",
         package->resources[0].scale );
     ok( !p_appx_bundle_manifest_get_package( manifest, 2 ),
         "got out-of-range package.\n" );
 
-    policy = exact_policy( APPX_BUNDLE_ARCHITECTURE_X64, L"en-us", 200 );
+    policy = exact_policy( APPX_BUNDLE_ARCHITECTURE_X64, L"en-us", 225 );
     init_selection( &selection );
     hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
     ok( hr == S_OK, "got hr %#lx.\n", hr );
@@ -241,7 +241,7 @@ static void test_schema_defaults_and_uniqueness(void)
         "<Packages><Package Type=\"resource\" Version=\"1.0.0.0\""
         " FileName=\"language.msix\" Offset=\"0\" Size=\"1\"><Resources>"
         "<Resource Language=\"en-US\" Scale=\"100\"/>"
-        "<Resource Language=\"en-US\" Scale=\"200\"/>"
+        "<Resource Language=\"en-US\" Scale=\"225\"/>"
         "</Resources></Package></Packages>" BUNDLE_CLOSE,
         BUNDLE_OPEN BUNDLE_IDENTITY
         "<Packages><Package Type=\"resource\" Version=\"1.0.0.0\""
@@ -254,7 +254,7 @@ static void test_schema_defaults_and_uniqueness(void)
         " FileName=\"dx.msix\" Offset=\"0\" Size=\"1\"><Resources>"
         "<Resource Language=\"en-US\" Scale=\"100\""
         " DXFeatureLevel=\"dx11\"/>"
-        "<Resource Language=\"de-DE\" Scale=\"200\""
+        "<Resource Language=\"de-DE\" Scale=\"225\""
         " DXFeatureLevel=\"dx11\"/>"
         "</Resources></Package></Packages>" BUNDLE_CLOSE
     };
@@ -302,6 +302,390 @@ static void test_schema_defaults_and_uniqueness(void)
         hr = parse_text( duplicates[i], &manifest );
         ok( hr == APPX_E_INVALID_MANIFEST,
             "duplicate test %u got hr %#lx and manifest %p.\n",
+            i, hr, manifest );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+}
+
+static void test_package_schema_values(void)
+{
+    static const char resource_format[] =
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"resource\" Version=\"1.0.0.0\""
+        " ResourceId=\"r\" FileName=\"r.msix\" Offset=\"0\" Size=\"1\">"
+        "<Resources><Resource %s=\"%s\"/></Resources>"
+        "</Package></Packages>" BUNDLE_CLOSE;
+    static const char resource_v2_format[] =
+        "<Bundle xmlns=\"http://schemas.microsoft.com/appx/2013/bundle\""
+        " SchemaVersion=\"2.0\">" BUNDLE_IDENTITY
+        "<Packages><Package Type=\"resource\" Version=\"1.0.0.0\""
+        " ResourceId=\"r\" FileName=\"r.msix\" Offset=\"0\" Size=\"1\">"
+        "<Resources><Resource %s=\"%s\"/></Resources>"
+        "</Package></Packages>" BUNDLE_CLOSE;
+    static const char file_name_format[] =
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"%s\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "</Package></Packages>" BUNDLE_CLOSE;
+    static const char *valid_scales_2013[] =
+    {
+        "100", "120", "140", "150", "160", "180", "225"
+    };
+    static const char *valid_scales_v2[] =
+    {
+        "100", "120", "125", "140", "150", "160", "180", "200",
+        "220", "225", "240", "250", "300", "400", "500"
+    };
+    static const char *v2_only_scales[] =
+    {
+        "125", "200", "220", "240", "250", "300", "400", "500"
+    };
+    static const char *invalid_scales[] =
+    {
+        "0", "99", "130", "175", "226", "450", "1000", "0100", " 100"
+    };
+    static const char *valid_dx[] = {"dx9", "dx10", "dx11"};
+    static const char *invalid_dx[] = {"", "DX9", "dx8", "dx12", "dx_9"};
+    static const char *invalid_packages[] =
+    {
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"framework\" Version=\"1.0.0.0\""
+        " FileName=\"f.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"optional\" Version=\"1.0.0.0\""
+        " FileName=\"o.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"future\" Version=\"1.0.0.0\""
+        " FileName=\"f.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " ResourceId=\"\" FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"resource\" Version=\"1.0.0.0\""
+        " ResourceId=\"bad_id\" FileName=\"r.msix\""
+        " Offset=\"0\" Size=\"1\">" NEUTRAL_RESOURCES
+        "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"resource\" Version=\"1.0.0.0\""
+        " ResourceId=\"bad/id\" FileName=\"r.msix\""
+        " Offset=\"0\" Size=\"1\">" NEUTRAL_RESOURCES
+        "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\" Encrypted=\"true\">"
+        NEUTRAL_RESOURCES "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\""
+        " xmlns:b=\"http://schemas.microsoft.com/appx/2013/bundle\""
+        " b:Unknown=\"x\">" NEUTRAL_RESOURCES
+        "</Package></Packages>" BUNDLE_CLOSE
+    };
+    APPX_BUNDLE_MANIFEST *manifest;
+    char file_name[258], text[2048];
+    HRESULT hr;
+    UINT32 i;
+
+    for (i = 0; i < ARRAY_SIZE(valid_scales_2013); i++)
+    {
+        sprintf( text, resource_format, "Scale", valid_scales_2013[i] );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == S_OK, "valid Scale %s got hr %#lx.\n",
+            valid_scales_2013[i], hr );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+    for (i = 0; i < ARRAY_SIZE(v2_only_scales); i++)
+    {
+        sprintf( text, resource_format, "Scale", v2_only_scales[i] );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == APPX_E_INVALID_MANIFEST,
+            "v1-only invalid Scale %s got hr %#lx and manifest %p.\n",
+            v2_only_scales[i], hr, manifest );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+    for (i = 0; i < ARRAY_SIZE(valid_scales_v2); i++)
+    {
+        sprintf( text, resource_v2_format, "Scale", valid_scales_v2[i] );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == S_OK, "valid v2 Scale %s got hr %#lx.\n",
+            valid_scales_v2[i], hr );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+    for (i = 0; i < ARRAY_SIZE(invalid_scales); i++)
+    {
+        sprintf( text, resource_format, "Scale", invalid_scales[i] );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == APPX_E_INVALID_MANIFEST,
+            "invalid Scale %s got hr %#lx and manifest %p.\n",
+            invalid_scales[i], hr, manifest );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+    for (i = 0; i < ARRAY_SIZE(valid_dx); i++)
+    {
+        sprintf( text, resource_format, "DXFeatureLevel", valid_dx[i] );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == S_OK, "valid DXFeatureLevel %s got hr %#lx.\n",
+            valid_dx[i], hr );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+    for (i = 0; i < ARRAY_SIZE(invalid_dx); i++)
+    {
+        sprintf( text, resource_format, "DXFeatureLevel", invalid_dx[i] );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == APPX_E_INVALID_MANIFEST,
+            "invalid DXFeatureLevel %s got hr %#lx and manifest %p.\n",
+            invalid_dx[i], hr, manifest );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+    for (i = 0; i < ARRAY_SIZE(invalid_packages); i++)
+    {
+        manifest = NULL;
+        hr = parse_text( invalid_packages[i], &manifest );
+        ok( hr == APPX_E_INVALID_MANIFEST,
+            "invalid package test %u got hr %#lx and manifest %p.\n",
+            i, hr, manifest );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+
+    memset( file_name, 'a', 249 );
+    strcpy( file_name + 249, "/a.msix" );
+    ok( strlen(file_name) == 256, "got FileName length %u.\n",
+        (UINT32)strlen(file_name) );
+    sprintf( text, file_name_format, file_name );
+    manifest = NULL;
+    hr = parse_text( text, &manifest );
+    ok( hr == S_OK, "256-character FileName got hr %#lx.\n", hr );
+    if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+
+    memset( file_name, 'a', 250 );
+    strcpy( file_name + 250, "/a.msix" );
+    ok( strlen(file_name) == 257, "got FileName length %u.\n",
+        (UINT32)strlen(file_name) );
+    sprintf( text, file_name_format, file_name );
+    manifest = NULL;
+    hr = parse_text( text, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "257-character FileName got hr %#lx and manifest %p.\n",
+        hr, manifest );
+    if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+}
+
+static void test_stub_and_dependencies(void)
+{
+    static const char stub_format[] =
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " Architecture=\"x64\" FileName=\"a.msix\" Offset=\"0\" Size=\"1\""
+        " IsStub=\"%s\">" NEUTRAL_RESOURCES
+        "</Package></Packages>" BUNDLE_CLOSE;
+    static const char dependencies[] =
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " Architecture=\"x64\" FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        "<Dependencies>"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.19041.0\" MaxVersionTested=\"10.0.26100.0\"/>"
+        "<TargetDeviceFamily Name=\"Windows.Universal\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.26100.0\"/>"
+        "</Dependencies>" NEUTRAL_RESOURCES
+        "</Package></Packages>" BUNDLE_CLOSE;
+    static const char *invalid_booleans[] =
+    {
+        "", "TRUE", "False", "yes", "-1", "2"
+    };
+    static const char *invalid_dependencies[] =
+    {
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies/>"
+        "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies Unknown=\"x\">"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies><Other/></Dependencies>"
+        "</Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies>text"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies>"
+        "<TargetDeviceFamily MinVersion=\"10.0.0.0\""
+        " MaxVersionTested=\"10.0.0.0\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies>"
+        "<TargetDeviceFamily Name=\"Windows_Desktop\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies>"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0\" MaxVersionTested=\"10.0.0.0\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies>"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0.0\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies>"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\""
+        " Unknown=\"x\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies>"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\">"
+        "<Other/></TargetDeviceFamily>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES "<Dependencies>"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\"/>"
+        "<TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE,
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+        " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+        NEUTRAL_RESOURCES
+        "<Dependencies><TargetDeviceFamily Name=\"Windows.Desktop\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\"/>"
+        "</Dependencies>"
+        "<Dependencies><TargetDeviceFamily Name=\"Windows.Universal\""
+        " MinVersion=\"10.0.0.0\" MaxVersionTested=\"10.0.0.0\"/>"
+        "</Dependencies></Package></Packages>" BUNDLE_CLOSE
+    };
+    const struct appx_bundle_package *package;
+    struct appx_bundle_selection_policy policy;
+    struct appx_bundle_selection selection;
+    APPX_BUNDLE_MANIFEST *manifest;
+    char text[2048];
+    HRESULT hr;
+    UINT32 i;
+
+    policy = neutral_policy( APPX_BUNDLE_ARCHITECTURE_X64 );
+    for (i = 0; i < 2; i++)
+    {
+        sprintf( text, stub_format, i ? "0" : "false" );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == S_OK, "IsStub=%s got hr %#lx.\n",
+            i ? "0" : "false", hr );
+        if (SUCCEEDED(hr))
+        {
+            package = p_appx_bundle_manifest_get_package( manifest, 0 );
+            ok( !(package->flags & APPX_BUNDLE_PACKAGE_STUB),
+                "IsStub=%s got flags %#x.\n", i ? "0" : "false",
+                package->flags );
+            init_selection( &selection );
+            hr = p_appx_bundle_manifest_select( manifest, &policy,
+                                                &selection );
+            ok( hr == S_OK, "IsStub=%s select got hr %#lx.\n",
+                i ? "0" : "false", hr );
+            p_appx_bundle_manifest_free( manifest );
+        }
+    }
+    for (i = 0; i < 2; i++)
+    {
+        sprintf( text, stub_format, i ? "1" : "true" );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == S_OK, "IsStub=%s got hr %#lx.\n",
+            i ? "1" : "true", hr );
+        if (SUCCEEDED(hr))
+        {
+            package = p_appx_bundle_manifest_get_package( manifest, 0 );
+            ok( package->flags & APPX_BUNDLE_PACKAGE_STUB,
+                "IsStub=%s got flags %#x.\n", i ? "1" : "true",
+                package->flags );
+            init_selection( &selection );
+            hr = p_appx_bundle_manifest_select( manifest, &policy,
+                                                &selection );
+            ok( hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED),
+                "IsStub=%s select got hr %#lx.\n",
+                i ? "1" : "true", hr );
+            ok( !selection.payload &&
+                (selection.issues & APPX_BUNDLE_SELECTION_STUB_PAYLOAD),
+                "IsStub=%s got payload %p and issues %#x.\n",
+                i ? "1" : "true", selection.payload, selection.issues );
+            p_appx_bundle_manifest_free( manifest );
+        }
+    }
+    for (i = 0; i < ARRAY_SIZE(invalid_booleans); i++)
+    {
+        sprintf( text, stub_format, invalid_booleans[i] );
+        manifest = NULL;
+        hr = parse_text( text, &manifest );
+        ok( hr == APPX_E_INVALID_MANIFEST,
+            "invalid IsStub=%s got hr %#lx and manifest %p.\n",
+            invalid_booleans[i], hr, manifest );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+    }
+
+    manifest = NULL;
+    hr = parse_text( dependencies, &manifest );
+    ok( hr == S_OK, "Dependencies got hr %#lx.\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        package = p_appx_bundle_manifest_get_package( manifest, 0 );
+        ok( package->flags & APPX_BUNDLE_PACKAGE_HAS_DEPENDENCIES,
+            "Dependencies got flags %#x.\n", package->flags );
+        init_selection( &selection );
+        hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+        ok( hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED),
+            "Dependencies select got hr %#lx.\n", hr );
+        ok( !selection.payload &&
+            (selection.issues &
+             APPX_BUNDLE_SELECTION_DEPENDENCY_PAYLOAD),
+            "Dependencies got payload %p and issues %#x.\n",
+            selection.payload, selection.issues );
+        p_appx_bundle_manifest_free( manifest );
+    }
+
+    for (i = 0; i < ARRAY_SIZE(invalid_dependencies); i++)
+    {
+        manifest = NULL;
+        hr = parse_text( invalid_dependencies[i], &manifest );
+        ok( hr == APPX_E_INVALID_MANIFEST,
+            "invalid Dependencies test %u got hr %#lx and manifest %p.\n",
             i, hr, manifest );
         if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
     }
@@ -725,6 +1109,52 @@ static void test_limits(void)
         if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
         HeapFree( GetProcessHeap(), 0, buffer );
     }
+
+    buffer = HeapAlloc( GetProcessHeap(), 0, 65536 );
+    ok( !!buffer, "failed to allocate dependency buffer.\n" );
+    if (buffer)
+    {
+        cursor = buffer;
+        cursor += sprintf( cursor, BUNDLE_OPEN BUNDLE_IDENTITY
+            "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+            " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+            NEUTRAL_RESOURCES "<Dependencies>" );
+        for (i = 0; i < 128; i++)
+            cursor += sprintf( cursor,
+                "<TargetDeviceFamily Name=\"Windows.Family%u\""
+                " MinVersion=\"10.0.0.0\""
+                " MaxVersionTested=\"10.0.26100.0\"/>", i );
+        cursor += sprintf( cursor,
+            "</Dependencies></Package></Packages>" BUNDLE_CLOSE );
+        ok( cursor - buffer < 65536, "dependency buffer overflowed.\n" );
+        manifest = NULL;
+        hr = p_appx_bundle_manifest_parse( (BYTE *)buffer, cursor - buffer,
+                                           &manifest );
+        ok( hr == S_OK, "128 dependencies got hr %#lx.\n", hr );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+
+        cursor = buffer;
+        cursor += sprintf( cursor, BUNDLE_OPEN BUNDLE_IDENTITY
+            "<Packages><Package Type=\"application\" Version=\"1.0.0.0\""
+            " FileName=\"a.msix\" Offset=\"0\" Size=\"1\">"
+            NEUTRAL_RESOURCES "<Dependencies>" );
+        for (i = 0; i < 129; i++)
+            cursor += sprintf( cursor,
+                "<TargetDeviceFamily Name=\"Windows.Family%u\""
+                " MinVersion=\"10.0.0.0\""
+                " MaxVersionTested=\"10.0.26100.0\"/>", i );
+        cursor += sprintf( cursor,
+            "</Dependencies></Package></Packages>" BUNDLE_CLOSE );
+        ok( cursor - buffer < 65536, "dependency buffer overflowed.\n" );
+        manifest = NULL;
+        hr = p_appx_bundle_manifest_parse( (BYTE *)buffer, cursor - buffer,
+                                           &manifest );
+        ok( hr == APPX_E_INVALID_MANIFEST,
+            "129 dependencies got hr %#lx and manifest %p.\n",
+            hr, manifest );
+        if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
+        HeapFree( GetProcessHeap(), 0, buffer );
+    }
 }
 
 static void test_unsupported_payloads(void)
@@ -740,14 +1170,9 @@ static void test_unsupported_payloads(void)
         " Offset=\"1\" Size=\"1\">"
         "<Resources><Resource DXFeatureLevel=\"dx11\"/></Resources>"
         "</Package>"
-        "<Package Type=\"optional\" Version=\"1.0.0.0\""
-        " Architecture=\"neutral\" FileName=\"optional.msix\""
-        " Offset=\"2\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
-        "<Package Type=\"future\" Version=\"1.0.0.0\""
+        "<Package Type=\"application\" Version=\"2.0.0.0\""
         " Architecture=\"riscv64\" FileName=\"future.msix\""
-        " Offset=\"3\" Size=\"1\" Encrypted=\"true\">"
-        NEUTRAL_RESOURCES
-        "</Package>"
+        " Offset=\"2\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
         "</Packages>" BUNDLE_CLOSE;
     const struct appx_bundle_package *package;
     struct appx_bundle_selection_policy policy;
@@ -761,18 +1186,12 @@ static void test_unsupported_payloads(void)
     package = p_appx_bundle_manifest_get_package( manifest, 1 );
     ok( package->flags & APPX_BUNDLE_PACKAGE_UNSUPPORTED_QUALIFIER,
         "got flags %#x.\n", package->flags );
-    package = p_appx_bundle_manifest_get_package( manifest, 3 );
-    ok( package->type == APPX_BUNDLE_PACKAGE_UNSUPPORTED,
+    package = p_appx_bundle_manifest_get_package( manifest, 2 );
+    ok( package->type == APPX_BUNDLE_PACKAGE_APPLICATION,
         "got type %u.\n", package->type );
     ok( package->architecture == APPX_BUNDLE_ARCHITECTURE_UNSUPPORTED,
         "got architecture %u.\n", package->architecture );
-    ok( (package->flags &
-         (APPX_BUNDLE_PACKAGE_ENCRYPTED |
-          APPX_BUNDLE_PACKAGE_UNSUPPORTED_TYPE |
-          APPX_BUNDLE_PACKAGE_UNSUPPORTED_ARCHITECTURE)) ==
-        (APPX_BUNDLE_PACKAGE_ENCRYPTED |
-         APPX_BUNDLE_PACKAGE_UNSUPPORTED_TYPE |
-         APPX_BUNDLE_PACKAGE_UNSUPPORTED_ARCHITECTURE),
+    ok( package->flags & APPX_BUNDLE_PACKAGE_UNSUPPORTED_ARCHITECTURE,
         "got flags %#x.\n", package->flags );
 
     policy = neutral_policy( APPX_BUNDLE_ARCHITECTURE_X64 );
@@ -784,15 +1203,9 @@ static void test_unsupported_payloads(void)
         "got payload %p.\n", selection.payload );
     ok( (selection.issues &
          (APPX_BUNDLE_SELECTION_RESOURCE_PAYLOAD |
-          APPX_BUNDLE_SELECTION_OPTIONAL_PAYLOAD |
-          APPX_BUNDLE_SELECTION_ENCRYPTED_PAYLOAD |
-          APPX_BUNDLE_SELECTION_UNSUPPORTED_TYPE |
           APPX_BUNDLE_SELECTION_UNSUPPORTED_ARCHITECTURE |
           APPX_BUNDLE_SELECTION_UNSUPPORTED_QUALIFIER)) ==
         (APPX_BUNDLE_SELECTION_RESOURCE_PAYLOAD |
-         APPX_BUNDLE_SELECTION_OPTIONAL_PAYLOAD |
-         APPX_BUNDLE_SELECTION_ENCRYPTED_PAYLOAD |
-         APPX_BUNDLE_SELECTION_UNSUPPORTED_TYPE |
          APPX_BUNDLE_SELECTION_UNSUPPORTED_ARCHITECTURE |
          APPX_BUNDLE_SELECTION_UNSUPPORTED_QUALIFIER),
         "got issues %#x.\n", selection.issues );
@@ -817,7 +1230,7 @@ static void test_selection(void)
         " Architecture=\"arm64\" FileName=\"arm.msix\""
         " Offset=\"3\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
         "</Packages>" BUNDLE_CLOSE;
-    static const char ambiguous[] =
+    static const char invalid_framework[] =
         BUNDLE_OPEN BUNDLE_IDENTITY
         "<Packages>"
         "<Package Type=\"application\" Version=\"2.0.0.0\""
@@ -863,23 +1276,11 @@ static void test_selection(void)
         p_appx_bundle_manifest_free( manifest );
     }
 
-    hr = parse_text( ambiguous, &manifest );
-    ok( hr == S_OK, "ambiguous parse got hr %#lx.\n", hr );
-    if (SUCCEEDED(hr))
-    {
-        init_selection( &selection );
-        hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
-        ok( hr == HRESULT_FROM_WIN32( ERROR_DUP_NAME ),
-            "ambiguous select got hr %#lx.\n", hr );
-        ok( !selection.payload, "got payload %p.\n", selection.payload );
-        ok( (selection.issues &
-             (APPX_BUNDLE_SELECTION_AMBIGUOUS_PAYLOAD |
-              APPX_BUNDLE_SELECTION_NO_PAYLOAD)) ==
-            (APPX_BUNDLE_SELECTION_AMBIGUOUS_PAYLOAD |
-             APPX_BUNDLE_SELECTION_NO_PAYLOAD),
-            "got issues %#x.\n", selection.issues );
-        p_appx_bundle_manifest_free( manifest );
-    }
+    manifest = NULL;
+    hr = parse_text( invalid_framework, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "framework parse got hr %#lx and manifest %p.\n", hr, manifest );
+    if (SUCCEEDED(hr)) p_appx_bundle_manifest_free( manifest );
 
     hr = parse_text( incompatible, &manifest );
     ok( hr == S_OK, "incompatible parse got hr %#lx.\n", hr );
@@ -919,6 +1320,165 @@ static void test_selection(void)
     ok( hr == E_INVALIDARG, "invalid scale got hr %#lx.\n", hr );
 }
 
+static void test_architecture_capability_policy(void)
+{
+    static const char ranked[] =
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages>"
+        "<Package Type=\"application\" Version=\"1.0.0.0\""
+        " Architecture=\"arm64\" FileName=\"native.msix\""
+        " Offset=\"0\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "<Package Type=\"application\" Version=\"9.0.0.0\""
+        " Architecture=\"neutral\" FileName=\"neutral.msix\""
+        " Offset=\"1\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "<Package Type=\"application\" Version=\"8.0.0.0\""
+        " Architecture=\"x64\" FileName=\"x64.msix\""
+        " Offset=\"2\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "<Package Type=\"application\" Version=\"8.0.0.0\""
+        " Architecture=\"x86a64\" FileName=\"x86a64.msix\""
+        " Offset=\"3\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "<Package Type=\"application\" Version=\"8.0.0.0\""
+        " Architecture=\"x86\" FileName=\"x86.msix\""
+        " Offset=\"4\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "</Packages>" BUNDLE_CLOSE;
+    static const char guests[] =
+        BUNDLE_OPEN BUNDLE_IDENTITY
+        "<Packages>"
+        "<Package Type=\"application\" Version=\"1.0.0.0\""
+        " Architecture=\"x86\" FileName=\"x86.msix\""
+        " Offset=\"0\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "<Package Type=\"application\" Version=\"99.0.0.0\""
+        " Architecture=\"x86a64\" FileName=\"x86a64.msix\""
+        " Offset=\"1\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "<Package Type=\"application\" Version=\"1.0.0.0\""
+        " Architecture=\"x64\" FileName=\"x64.msix\""
+        " Offset=\"2\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "<Package Type=\"application\" Version=\"99.0.0.0\""
+        " Architecture=\"arm\" FileName=\"arm.msix\""
+        " Offset=\"3\" Size=\"1\">" NEUTRAL_RESOURCES "</Package>"
+        "</Packages>" BUNDLE_CLOSE;
+    const struct appx_bundle_package *package;
+    struct appx_bundle_selection_policy policy;
+    struct appx_bundle_selection selection;
+    APPX_BUNDLE_MANIFEST *manifest = NULL;
+    HRESULT hr;
+
+    hr = parse_text( ranked, &manifest );
+    ok( hr == S_OK, "ranked parse got hr %#lx.\n", hr );
+    if (FAILED(hr)) return;
+
+    package = p_appx_bundle_manifest_get_package( manifest, 3 );
+    ok( package->architecture == APPX_BUNDLE_ARCHITECTURE_X86A64,
+        "x86a64 parsed as %u.\n", package->architecture );
+    ok( !(package->flags & APPX_BUNDLE_PACKAGE_UNSUPPORTED_ARCHITECTURE),
+        "x86a64 got flags %#x.\n", package->flags );
+
+    policy = neutral_policy( APPX_BUNDLE_ARCHITECTURE_ARM64 );
+    policy.architecture_policy.value.version =
+        APPX_BUNDLE_ARCHITECTURE_POLICY_VERSION;
+    policy.architecture_policy.value.supported_architectures =
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_ARM64) |
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X64) |
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_ARM) |
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X86A64) |
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X86);
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == S_OK, "capability select got hr %#lx.\n", hr );
+    ok( selection.package_index == 0,
+        "native preference selected index %u.\n", selection.package_index );
+
+    policy.host_architecture = APPX_BUNDLE_ARCHITECTURE_X64;
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == S_OK, "x64 preference select got hr %#lx.\n", hr );
+    ok( selection.package_index == 2,
+        "x64 preference selected index %u.\n", selection.package_index );
+
+    p_appx_bundle_manifest_free( manifest );
+    manifest = NULL;
+
+    hr = parse_text( guests, &manifest );
+    ok( hr == S_OK, "guest parse got hr %#lx.\n", hr );
+    if (FAILED(hr)) return;
+    policy = neutral_policy( APPX_BUNDLE_ARCHITECTURE_ARM64 );
+    policy.architecture_policy.value.version =
+        APPX_BUNDLE_ARCHITECTURE_POLICY_VERSION;
+    policy.architecture_policy.value.supported_architectures =
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_ARM64) |
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X64) |
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_ARM) |
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X86A64) |
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X86);
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == S_OK, "guest select got hr %#lx.\n", hr );
+    ok( selection.package_index == 2,
+        "deterministic guest preference selected index %u.\n",
+        selection.package_index );
+
+    policy.architecture_policy.value.supported_architectures &=
+        ~APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X64);
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == S_OK, "native ARM guest select got hr %#lx.\n", hr );
+    ok( selection.package_index == 3,
+        "ARM versus x86 guest preference selected index %u.\n",
+        selection.package_index );
+
+    memset( &policy.architecture_policy, 0xcc,
+            sizeof(policy.architecture_policy) );
+    policy.size = APPX_BUNDLE_SELECTION_POLICY_LEGACY_SIZE;
+    policy.host_architecture = APPX_BUNDLE_ARCHITECTURE_X64;
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == S_OK && selection.package_index == 2,
+        "legacy policy returned %#lx, index %u.\n",
+        hr, selection.package_index );
+
+    policy.size = APPX_BUNDLE_SELECTION_POLICY_LEGACY_SIZE - 1;
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == E_INVALIDARG, "truncated policy returned %#lx.\n", hr );
+    policy.size = APPX_BUNDLE_SELECTION_POLICY_LEGACY_SIZE + 1;
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == E_INVALIDARG, "intermediate policy returned %#lx.\n", hr );
+    policy.size = sizeof(policy) + 1;
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == E_INVALIDARG, "oversized policy returned %#lx.\n", hr );
+
+    policy = neutral_policy( APPX_BUNDLE_ARCHITECTURE_X64 );
+    policy.architecture_policy.value.version =
+        APPX_BUNDLE_ARCHITECTURE_POLICY_VERSION + 1;
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == E_INVALIDARG, "unknown policy version returned %#lx.\n", hr );
+    policy.architecture_policy.value.version =
+        APPX_BUNDLE_ARCHITECTURE_POLICY_VERSION;
+    policy.architecture_policy.value.supported_architectures =
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X64) |
+        0x80000000u;
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == E_INVALIDARG, "unknown capability flag returned %#lx.\n", hr );
+    policy.architecture_policy.value.supported_architectures =
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X86);
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == E_INVALIDARG, "missing preferred capability returned %#lx.\n",
+        hr );
+    policy.architecture_policy.value.version = 0;
+    policy.architecture_policy.value.supported_architectures =
+        APPX_BUNDLE_ARCHITECTURE_MASK(APPX_BUNDLE_ARCHITECTURE_X64);
+    init_selection( &selection );
+    hr = p_appx_bundle_manifest_select( manifest, &policy, &selection );
+    ok( hr == E_INVALIDARG, "reserved extension returned %#lx.\n", hr );
+
+    p_appx_bundle_manifest_free( manifest );
+}
+
 static BOOL load_functions(void)
 {
     HMODULE module = LoadLibraryA( "appxsvc.dll" );
@@ -952,6 +1512,8 @@ START_TEST(bundle_manifest)
     test_arguments();
     test_valid_manifest();
     test_schema_defaults_and_uniqueness();
+    test_package_schema_values();
+    test_stub_and_dependencies();
     test_schema_versions();
     test_required_grammar();
     test_versions_ranges_and_duplicates();
@@ -959,4 +1521,5 @@ START_TEST(bundle_manifest)
     test_limits();
     test_unsupported_payloads();
     test_selection();
+    test_architecture_capability_policy();
 }

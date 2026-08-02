@@ -1,15 +1,21 @@
 TESTDLL = appxsvc.dll
+IMPORTS = appxsvc bcrypt advapi32
 
 SOURCES = \
 	archive.c \
+	architecture.c \
 	blockmap.c \
+	bundle.c \
 	bundle_manifest.c \
 	catalog.c \
 	content_types.c \
+	deployment.c \
+	deployment_test_backend.c \
 	extract.c \
 	graph.c \
 	manifest.c \
 	package.c \
 	path.c \
+	query.c \
 	signature.c \
 	stream.c

@@ -28,7 +28,7 @@
 #define APPX_CATALOG_PENDING_FILE_NAME            L"catalog.bin.pending"
 #define APPX_CATALOG_LOCK_FILE_NAME               L"store.lock"
 
-#define APPX_CATALOG_VERSION                      1
+#define APPX_CATALOG_VERSION                      2
 #define APPX_CATALOG_HEADER_SIZE                  96
 #define APPX_CATALOG_MAX_FILE_SIZE                (16u * 1024 * 1024)
 #define APPX_CATALOG_MAX_PACKAGES                 4096
@@ -94,6 +94,8 @@ struct appx_catalog_application
     const WCHAR *id;
     const WCHAR *executable;
     const WCHAR *entry_point;
+    const WCHAR *parameters;
+    const WCHAR *current_directory_path;
     enum appx_catalog_activation_kind activation_kind;
 };
 
@@ -139,5 +141,13 @@ HRESULT WINAPI appx_catalog_load( const WCHAR *store_root,
                                   APPX_CATALOG_SNAPSHOT **snapshot );
 HRESULT WINAPI appx_catalog_publish( const WCHAR *store_root, UINT64 expected_epoch,
                                      const APPX_CATALOG_SNAPSHOT *replacement );
+HRESULT WINAPI appx_catalog_load_bounded( const WCHAR *store_root,
+                                          DWORD timeout_ms, HANDLE cancel_event,
+                                          APPX_CATALOG_SNAPSHOT **snapshot );
+HRESULT WINAPI appx_catalog_publish_bounded( const WCHAR *store_root,
+                                             UINT64 expected_epoch,
+                                             const APPX_CATALOG_SNAPSHOT *replacement,
+                                             DWORD timeout_ms,
+                                             HANDLE cancel_event );
 
 #endif /* __WINE_APPXSVC_CATALOG_H */

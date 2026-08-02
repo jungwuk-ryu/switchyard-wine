@@ -37,6 +37,12 @@ static BOOL (WINAPI *p_appx_manifest_is_supported)( const APPX_MANIFEST * );
 static BOOL (WINAPI *p_appx_manifest_is_framework)( const APPX_MANIFEST * );
 static BOOL (WINAPI *p_appx_manifest_is_resource_package)( const APPX_MANIFEST * );
 static BOOL (WINAPI *p_appx_manifest_has_run_full_trust)( const APPX_MANIFEST * );
+static BOOL (WINAPI *p_appx_manifest_has_loader_search_path_override)(
+    const APPX_MANIFEST * );
+static UINT32 (WINAPI *p_appx_manifest_get_loader_search_path_count)(
+    const APPX_MANIFEST * );
+static const WCHAR *(WINAPI *p_appx_manifest_get_loader_search_path)(
+    const APPX_MANIFEST *, UINT32 );
 static UINT32 (WINAPI *p_appx_manifest_get_application_count)(
     const APPX_MANIFEST * );
 static const struct appx_manifest_application *
@@ -785,6 +791,16 @@ static void test_activation(void)
         REQUIRED_STRUCTURE
         "<Applications><Application Id=\"App\" Executable=\"..\\app.exe\""
         " EntryPoint=\"windows.fullTrustApplication\"/></Applications></Package>";
+    static const char invalid_current_directory[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\""
+        " xmlns:uap11=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/11\""
+        " IgnorableNamespaces=\"uap11\">"
+        "<Identity Name=\"Wine.CurrentDirectory\" Publisher=\"CN=Wine\""
+        " Version=\"1.0.0.0\" ProcessorArchitecture=\"x64\"/>"
+        REQUIRED_STRUCTURE
+        "<Applications><Application Id=\"App\" Executable=\"app.exe\""
+        " EntryPoint=\"windows.fullTrustApplication\""
+        " uap11:CurrentDirectoryPath=\"..\\data\"/></Applications></Package>";
     const struct appx_manifest_application *application;
     const struct appx_manifest_identity *identity;
     APPX_MANIFEST *manifest = NULL;
@@ -879,15 +895,17 @@ static void test_activation(void)
         ok( !lstrcmpW( application->current_directory_path, L"data" ),
             "got current directory %s.\n",
             wine_dbgstr_w(application->current_directory_path) );
-        ok( has_reason( manifest,
-                        APPX_MANIFEST_UNSUPPORTED_APPLICATION_PARAMETERS ),
-            "parameters reason is missing.\n" );
-        ok( has_reason( manifest, APPX_MANIFEST_UNSUPPORTED_CURRENT_DIRECTORY ),
-            "current-directory reason is missing.\n" );
+        ok( !has_reason( manifest,
+                         APPX_MANIFEST_UNSUPPORTED_APPLICATION_PARAMETERS ),
+            "parameters reason was recorded.\n" );
+        ok( !has_reason( manifest, APPX_MANIFEST_UNSUPPORTED_CURRENT_DIRECTORY ),
+            "current-directory reason was recorded.\n" );
         p_appx_manifest_free( manifest );
     }
 
     hr = parse_text( traversal, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST, "got hr %#lx.\n", hr );
+    hr = parse_text( invalid_current_directory, &manifest );
     ok( hr == APPX_E_INVALID_MANIFEST, "got hr %#lx.\n", hr );
 }
 
@@ -1083,6 +1101,120 @@ static void test_dependencies_and_classes(void)
             "out-of-process reason is missing.\n" );
         p_appx_manifest_free( manifest );
     }
+}
+
+static void test_loader_search_path_override(void)
+{
+    static const char valid[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\""
+        " xmlns:uap6=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/6\""
+        " xmlns:rescap=\"http://schemas.microsoft.com/appx/manifest/"
+        "foundation/windows10/restrictedcapabilities\""
+        " IgnorableNamespaces=\"uap6\">"
+        "<Identity Name=\"Wine.Loader\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"x64\"/>"
+        REQUIRED_STRUCTURE
+        "<Applications><Application Id=\"App\" Executable=\"bin\\app.exe\""
+        " EntryPoint=\"windows.fullTrustApplication\">"
+        "<Extensions><uap6:Extension Category=\"windows.loaderSearchPathOverride\">"
+        "<uap6:LoaderSearchPathOverride>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"bin\"/>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"plugins/sub\"/>"
+        "</uap6:LoaderSearchPathOverride></uap6:Extension></Extensions>"
+        "</Application></Applications>"
+        "<Capabilities><rescap:Capability Name=\"runFullTrust\"/></Capabilities>"
+        "<Extensions><uap6:Extension Category=\"windows.loaderSearchPathOverride\">"
+        "<uap6:LoaderSearchPathOverride>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"runtime\"/>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"\"/>"
+        "</uap6:LoaderSearchPathOverride></uap6:Extension></Extensions>"
+        "</Package>";
+    static const char empty[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\""
+        " xmlns:uap6=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/6\">"
+        "<Identity Name=\"Wine.EmptyLoader\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "<Extensions><uap6:Extension Category=\"windows.loaderSearchPathOverride\">"
+        "<uap6:LoaderSearchPathOverride/>"
+        "</uap6:Extension></Extensions></Package>";
+    static const char duplicate[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\""
+        " xmlns:uap6=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/6\">"
+        "<Identity Name=\"Wine.DuplicateLoader\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "<Extensions><uap6:Extension Category=\"windows.loaderSearchPathOverride\">"
+        "<uap6:LoaderSearchPathOverride>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"runtime\"/>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"RUNTIME\"/>"
+        "</uap6:LoaderSearchPathOverride></uap6:Extension></Extensions></Package>";
+    static const char too_many[] =
+        "<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\""
+        " xmlns:uap6=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/6\">"
+        "<Identity Name=\"Wine.ManyLoader\" Publisher=\"CN=Wine\" Version=\"1.0.0.0\""
+        " ProcessorArchitecture=\"neutral\"/>"
+        FRAMEWORK_PROPERTIES REQUIRED_RESOURCES REQUIRED_DEPENDENCIES
+        "<Extensions><uap6:Extension Category=\"windows.loaderSearchPathOverride\">"
+        "<uap6:LoaderSearchPathOverride>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"one\"/>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"two\"/>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"three\"/>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"four\"/>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"five\"/>"
+        "<uap6:LoaderSearchPathEntry FolderPath=\"six\"/>"
+        "</uap6:LoaderSearchPathOverride></uap6:Extension></Extensions></Package>";
+    const struct appx_manifest_application *application;
+    APPX_MANIFEST *manifest = NULL;
+    HRESULT hr;
+
+    hr = parse_text( valid, &manifest );
+    ok( hr == S_OK, "valid loader override returned %#lx.\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        ok( p_appx_manifest_is_supported(manifest),
+            "recognized loader override marked manifest unsupported.\n" );
+        ok( p_appx_manifest_has_loader_search_path_override(manifest),
+            "package loader override is missing.\n" );
+        ok( p_appx_manifest_get_loader_search_path_count(manifest) == 2,
+            "got %u package loader paths.\n",
+            p_appx_manifest_get_loader_search_path_count(manifest) );
+        ok( !lstrcmpW( p_appx_manifest_get_loader_search_path(manifest, 0),
+                       L"runtime" ),
+            "got package loader path %s.\n",
+            wine_dbgstr_w(p_appx_manifest_get_loader_search_path(manifest, 0)) );
+        ok( !lstrcmpW( p_appx_manifest_get_loader_search_path(manifest, 1),
+                       L"" ),
+            "root search entry is missing.\n" );
+        application = p_appx_manifest_get_application( manifest, 0 );
+        ok( application && application->has_loader_search_path_override,
+            "application loader override is missing.\n" );
+        ok( application && application->loader_search_path_count == 2,
+            "got %u application loader paths.\n",
+            application ? application->loader_search_path_count : 0 );
+        ok( application && !lstrcmpW(
+                application->loader_search_paths[0], L"bin" ) &&
+            !lstrcmpW( application->loader_search_paths[1],
+                       L"plugins\\sub" ),
+            "application loader path order is wrong.\n" );
+        p_appx_manifest_free( manifest );
+    }
+
+    hr = parse_text( empty, &manifest );
+    ok( hr == S_OK, "empty loader override returned %#lx.\n", hr );
+    if (SUCCEEDED(hr))
+    {
+        ok( p_appx_manifest_has_loader_search_path_override(manifest) &&
+            !p_appx_manifest_get_loader_search_path_count(manifest),
+            "empty loader override was not preserved.\n" );
+        p_appx_manifest_free( manifest );
+    }
+    hr = parse_text( duplicate, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "duplicate loader path returned %#lx.\n", hr );
+    hr = parse_text( too_many, &manifest );
+    ok( hr == APPX_E_INVALID_MANIFEST,
+        "too many loader paths returned %#lx.\n", hr );
 }
 
 static void test_security_and_limits(void)
@@ -1314,6 +1446,9 @@ static BOOL load_functions(void)
     LOAD(appx_manifest_is_framework);
     LOAD(appx_manifest_is_resource_package);
     LOAD(appx_manifest_has_run_full_trust);
+    LOAD(appx_manifest_has_loader_search_path_override);
+    LOAD(appx_manifest_get_loader_search_path_count);
+    LOAD(appx_manifest_get_loader_search_path);
     LOAD(appx_manifest_get_application_count);
     LOAD(appx_manifest_get_application);
     LOAD(appx_manifest_get_dependency_count);
@@ -1342,6 +1477,7 @@ START_TEST(manifest)
     test_required_structure();
     test_activation();
     test_dependencies_and_classes();
+    test_loader_search_path_override();
     test_security_and_limits();
     test_embedded_nul_and_predefined_entity();
 }

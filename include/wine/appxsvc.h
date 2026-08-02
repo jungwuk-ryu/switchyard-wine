@@ -69,11 +69,19 @@ HRESULT WINAPI wine_appx_validate_archive_path( const BYTE *utf8, UINT32 utf8_le
  * The archive handle must grant read access and permit a second read open.
  * The service owns that sharing contract; reopening keeps archive I/O from
  * changing or racing the caller's file position.
+ * The _ex form accepts an optional cancellation event that must remain valid
+ * until the call returns.  The legacy form behaves as if that event were NULL.
  */
 HRESULT WINAPI wine_appx_archive_open( HANDLE file, const WINE_APPX_ARCHIVE_LIMITS *limits,
                                       UINT32 flags, WINE_APPX_ARCHIVE **archive );
+HRESULT WINAPI wine_appx_archive_open_ex( HANDLE file,
+                                         const WINE_APPX_ARCHIVE_LIMITS *limits,
+                                         UINT32 flags, HANDLE cancel_event,
+                                         WINE_APPX_ARCHIVE **archive );
 void WINAPI wine_appx_archive_close( WINE_APPX_ARCHIVE *archive );
 HRESULT WINAPI wine_appx_archive_get_count( WINE_APPX_ARCHIVE *archive, UINT32 *count );
+HRESULT WINAPI wine_appx_archive_get_total_uncompressed_size(
+    WINE_APPX_ARCHIVE *archive, UINT64 *size );
 HRESULT WINAPI wine_appx_archive_find_entry( WINE_APPX_ARCHIVE *archive, const WCHAR *path,
                                              UINT32 *index );
 HRESULT WINAPI wine_appx_archive_get_entry( WINE_APPX_ARCHIVE *archive, UINT32 index,

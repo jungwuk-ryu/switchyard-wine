@@ -82,6 +82,9 @@ struct appx_manifest
     BOOL framework;
     BOOL resource_package;
     BOOL run_full_trust;
+    const WCHAR *loader_search_paths[APPX_MANIFEST_MAX_LOADER_SEARCH_PATHS];
+    UINT32 loader_search_path_count;
+    BOOL has_loader_search_path_override;
 };
 
 struct ignorable_namespace
@@ -724,6 +727,12 @@ static BOOL validate_package_relative_path( const WCHAR *path, UINT32 maximum,
             return FALSE;
     }
     return TRUE;
+}
+
+static BOOL validate_loader_search_folder( const WCHAR *path )
+{
+    return path && (!*path ||
+           validate_package_relative_path( path, 256, NULL ));
 }
 
 static const WCHAR *architecture_name( enum appx_manifest_architecture architecture )
@@ -2135,13 +2144,178 @@ done:
     return FAILED(parser->hr) ? parser->hr : hr;
 }
 
-static HRESULT parse_extensions_element( struct parser *parser, BOOL package_level )
+static HRESULT finish_leaf_element( struct parser *parser )
+{
+    int depth = xmlTextReaderDepth( parser->reader ), result, type;
+
+    if (xmlTextReaderIsEmptyElement( parser->reader )) return S_OK;
+    while ((result = read_node( parser )) == 1)
+    {
+        type = xmlTextReaderNodeType( parser->reader );
+        if (type == XML_READER_TYPE_END_ELEMENT &&
+            xmlTextReaderDepth( parser->reader ) == depth)
+            return S_OK;
+        if (type == XML_READER_TYPE_COMMENT || current_text_is_whitespace( parser ))
+            continue;
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    }
+    return FAILED(parser->hr) ? parser->hr :
+           parser_fail( parser, APPX_E_INVALID_MANIFEST );
+}
+
+static HRESULT parse_loader_search_path_entry(
+    struct parser *parser, const WCHAR **paths, UINT32 *count )
+{
+    struct xml_attributes attributes;
+    struct xml_attribute *folder_path = NULL;
+    WCHAR *path = NULL;
+    UINT32 i;
+    HRESULT hr;
+
+    if (*count == APPX_MANIFEST_MAX_LOADER_SEARCH_PATHS)
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+    if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
+    if (FAILED(require_attribute( parser, &attributes, BAD_CAST "",
+                                  "FolderPath", &folder_path )) ||
+        FAILED(finish_attributes( parser, &attributes, TRUE )) ||
+        FAILED(xml_to_wstring( parser, folder_path->value, 0, 256, &path )))
+    {
+        goto done;
+    }
+    /*
+     * The manifest schema accepts either path separator and Microsoft
+     * documents LoaderSearchPathEntry with forward-slash examples.  Package
+     * inventory paths are canonical Windows paths, so normalize before
+     * duplicate detection and persistence.
+     */
+    for (i = 0; path[i]; i++)
+        if (path[i] == '/') path[i] = '\\';
+    if (!validate_loader_search_folder( path ))
+    {
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        goto done;
+    }
+    for (i = 0; i < *count; i++)
+        if (!lstrcmpiW( paths[i], path ))
+        {
+            parser_fail( parser, APPX_E_INVALID_MANIFEST );
+            goto done;
+        }
+    if (FAILED(hr = finish_leaf_element( parser ))) goto done;
+    paths[(*count)++] = path;
+    path = NULL;
+
+done:
+    HeapFree( GetProcessHeap(), 0, path );
+    free_attributes( &attributes );
+    return parser->hr;
+}
+
+static HRESULT parse_loader_search_path_override(
+    struct parser *parser, const WCHAR **paths, UINT32 *count )
 {
     struct xml_attributes attributes;
     int depth = xmlTextReaderDepth( parser->reader ), result, type;
     HRESULT hr;
 
-    if (package_level)
+    if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
+    if (FAILED(finish_attributes( parser, &attributes, TRUE ))) goto done;
+    free_attributes( &attributes );
+    if (xmlTextReaderIsEmptyElement( parser->reader )) return S_OK;
+
+    while ((result = read_node( parser )) == 1)
+    {
+        type = xmlTextReaderNodeType( parser->reader );
+        if (type == XML_READER_TYPE_END_ELEMENT &&
+            xmlTextReaderDepth( parser->reader ) == depth)
+            return S_OK;
+        if (type == XML_READER_TYPE_COMMENT || current_text_is_whitespace( parser ))
+            continue;
+        if (type != XML_READER_TYPE_ELEMENT ||
+            xmlTextReaderDepth( parser->reader ) != depth + 1 ||
+            !node_is( parser, uap6_namespace, "LoaderSearchPathEntry" ))
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        if (FAILED(parse_loader_search_path_entry( parser, paths, count )))
+            return parser->hr;
+    }
+    return FAILED(parser->hr) ? parser->hr :
+           parser_fail( parser, APPX_E_INVALID_MANIFEST );
+
+done:
+    hr = parser->hr;
+    free_attributes( &attributes );
+    return hr;
+}
+
+static HRESULT parse_loader_search_path_extension(
+    struct parser *parser, BOOL *present, const WCHAR **paths, UINT32 *count )
+{
+    struct xml_attributes attributes;
+    struct xml_attribute *category = NULL;
+    int depth = xmlTextReaderDepth( parser->reader ), result, type;
+    BOOL override_seen = FALSE;
+    HRESULT hr;
+
+    if (FAILED(hr = get_attributes( parser, &attributes ))) return hr;
+    if (FAILED(require_attribute( parser, &attributes, BAD_CAST "",
+                                  "Category", &category )))
+        goto done;
+    if (!xml_equal( category->value,
+                    BAD_CAST "windows.loaderSearchPathOverride" ))
+    {
+        if (FAILED(finish_attributes( parser, &attributes, TRUE )) ||
+            FAILED(add_unsupported_reason(
+                parser, APPX_MANIFEST_UNSUPPORTED_EXTENSION )))
+            goto done;
+        free_attributes( &attributes );
+        return skip_current_element( parser );
+    }
+    if (*present)
+    {
+        parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        goto done;
+    }
+    *present = TRUE;
+    if (FAILED(finish_attributes( parser, &attributes, TRUE ))) goto done;
+    free_attributes( &attributes );
+    if (xmlTextReaderIsEmptyElement( parser->reader ))
+        return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+
+    while ((result = read_node( parser )) == 1)
+    {
+        type = xmlTextReaderNodeType( parser->reader );
+        if (type == XML_READER_TYPE_END_ELEMENT &&
+            xmlTextReaderDepth( parser->reader ) == depth)
+            return override_seen ? S_OK :
+                   parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        if (type == XML_READER_TYPE_COMMENT || current_text_is_whitespace( parser ))
+            continue;
+        if (type != XML_READER_TYPE_ELEMENT ||
+            xmlTextReaderDepth( parser->reader ) != depth + 1 ||
+            !node_is( parser, uap6_namespace, "LoaderSearchPathOverride" ) ||
+            override_seen)
+            return parser_fail( parser, APPX_E_INVALID_MANIFEST );
+        override_seen = TRUE;
+        if (FAILED(parse_loader_search_path_override( parser, paths, count )))
+            return parser->hr;
+    }
+    return FAILED(parser->hr) ? parser->hr :
+           parser_fail( parser, APPX_E_INVALID_MANIFEST );
+
+done:
+    hr = parser->hr;
+    free_attributes( &attributes );
+    return hr;
+}
+
+static HRESULT parse_extensions_element(
+    struct parser *parser, struct appx_manifest_application *application )
+{
+    struct xml_attributes attributes;
+    int depth = xmlTextReaderDepth( parser->reader ), result, type;
+    HRESULT hr;
+
+    if (!application)
     {
         if (parser->extensions_seen)
             return parser_fail( parser, APPX_E_INVALID_MANIFEST );
@@ -2166,6 +2340,22 @@ static HRESULT parse_extensions_element( struct parser *parser, BOOL package_lev
         if (foundation_node_is( parser, "Extension" ))
         {
             if (FAILED(parse_extension_element( parser ))) return parser->hr;
+        }
+        else if (node_is( parser, uap6_namespace, "Extension" ))
+        {
+            BOOL *present = application ?
+                &application->has_loader_search_path_override :
+                &parser->manifest->has_loader_search_path_override;
+            UINT32 *count = application ?
+                &application->loader_search_path_count :
+                &parser->manifest->loader_search_path_count;
+            const WCHAR **paths = application ?
+                application->loader_search_paths :
+                parser->manifest->loader_search_paths;
+
+            if (FAILED(parse_loader_search_path_extension(
+                    parser, present, paths, count )))
+                return parser->hr;
         }
         else if (FAILED(handle_unknown_element( parser, TRUE )))
             return parser->hr;
@@ -2435,18 +2625,21 @@ static HRESULT parse_application_element( struct parser *parser )
     if (parameters)
     {
         if (FAILED(xml_to_wstring( parser, parameters->value, 0, 1024,
-                                   (WCHAR **)&application->parameters )) ||
-            FAILED(add_unsupported_reason(
-                parser, APPX_MANIFEST_UNSUPPORTED_APPLICATION_PARAMETERS )))
+                                   (WCHAR **)&application->parameters )))
             goto done;
     }
     if (current_directory)
     {
         if (FAILED(xml_to_wstring( parser, current_directory->value, 0, 256,
-                                   (WCHAR **)&application->current_directory_path )) ||
-            FAILED(add_unsupported_reason(
-                parser, APPX_MANIFEST_UNSUPPORTED_CURRENT_DIRECTORY )))
+                                   (WCHAR **)&application->current_directory_path )))
             goto done;
+        if (application->current_directory_path[0] &&
+            !validate_package_relative_path(
+                application->current_directory_path, 256, NULL ))
+        {
+            parser_fail( parser, APPX_E_INVALID_MANIFEST );
+            goto done;
+        }
     }
     if (application_id_is_duplicate( parser->manifest, application ))
     {
@@ -2489,7 +2682,7 @@ static HRESULT parse_application_element( struct parser *parser )
                 goto done_no_attrs;
             }
             extensions_seen = TRUE;
-            if (FAILED(parse_extensions_element( parser, FALSE )))
+            if (FAILED(parse_extensions_element( parser, application )))
                 goto done_no_attrs;
         }
         else if ((!parser->windows8_schema &&
@@ -2646,7 +2839,7 @@ static HRESULT parse_package_element( struct parser *parser )
         }
         else if (foundation_node_is( parser, "Extensions" ))
         {
-            if (FAILED(parse_extensions_element( parser, TRUE ))) return parser->hr;
+            if (FAILED(parse_extensions_element( parser, NULL ))) return parser->hr;
         }
         else if (FAILED(handle_unknown_element( parser, TRUE )))
             return parser->hr;
@@ -2794,7 +2987,7 @@ static BOOL contains_doctype_declaration( const BYTE *data, SIZE_T size )
 
 void WINAPI appx_manifest_free( APPX_MANIFEST *manifest )
 {
-    UINT32 i;
+    UINT32 i, j;
 
     if (!manifest) return;
     HeapFree( GetProcessHeap(), 0, (void *)manifest->identity.name );
@@ -2814,7 +3007,13 @@ void WINAPI appx_manifest_free( APPX_MANIFEST *manifest )
         HeapFree( GetProcessHeap(), 0, (void *)application->trust_level );
         HeapFree( GetProcessHeap(), 0, (void *)application->parameters );
         HeapFree( GetProcessHeap(), 0, (void *)application->current_directory_path );
+        for (j = 0; j < application->loader_search_path_count; j++)
+            HeapFree( GetProcessHeap(), 0,
+                      (void *)application->loader_search_paths[j] );
     }
+    for (i = 0; i < manifest->loader_search_path_count; i++)
+        HeapFree( GetProcessHeap(), 0,
+                  (void *)manifest->loader_search_paths[i] );
     for (i = 0; i < manifest->dependency_count; i++)
     {
         HeapFree( GetProcessHeap(), 0, (void *)manifest->dependencies[i].name );
@@ -2955,6 +3154,25 @@ BOOL WINAPI appx_manifest_is_resource_package( const APPX_MANIFEST *manifest )
 BOOL WINAPI appx_manifest_has_run_full_trust( const APPX_MANIFEST *manifest )
 {
     return manifest && manifest->run_full_trust;
+}
+
+BOOL WINAPI appx_manifest_has_loader_search_path_override(
+    const APPX_MANIFEST *manifest )
+{
+    return manifest && manifest->has_loader_search_path_override;
+}
+
+UINT32 WINAPI appx_manifest_get_loader_search_path_count(
+    const APPX_MANIFEST *manifest )
+{
+    return manifest ? manifest->loader_search_path_count : 0;
+}
+
+const WCHAR * WINAPI appx_manifest_get_loader_search_path(
+    const APPX_MANIFEST *manifest, UINT32 index )
+{
+    if (!manifest || index >= manifest->loader_search_path_count) return NULL;
+    return manifest->loader_search_paths[index];
 }
 
 UINT32 WINAPI appx_manifest_get_application_count( const APPX_MANIFEST *manifest )

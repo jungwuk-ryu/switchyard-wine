@@ -1,19 +1,23 @@
 MODULE    = appxsvc.dll
 IMPORTLIB = appxsvc
-IMPORTS   = $(XML2_PE_LIBS) $(ZLIB_PE_LIBS) bcrypt crypt32 kernelbase
+IMPORTS   = $(XML2_PE_LIBS) $(ZLIB_PE_LIBS) advapi32 bcrypt crypt32 kernelbase
 EXTRAINCL = $(XML2_PE_CFLAGS) $(ZLIB_PE_CFLAGS)
 
 SOURCES = \
 	archive.c \
+	architecture.c \
 	blockmap.c \
+	bundle.c \
 	bundle_manifest.c \
 	catalog.c \
 	content_types.c \
+	deployment.c \
 	extract.c \
 	graph.c \
 	main.c \
 	manifest.c \
 	package.c \
 	path.c \
+	query.c \
 	signature.c \
 	stream.c
