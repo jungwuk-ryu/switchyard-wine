@@ -113,6 +113,7 @@ static void CopyKeyboardLayoutDataForInputSource(TISInputSourceRef inputSourceLa
 @property (retain, nonatomic) WineWindow* mouseCaptureWindow;
 
     - (void) setupObservations;
+    - (void) displayColorStateDidChange:(NSNotification *)notification;
     - (void) applicationDidBecomeActive:(NSNotification *)notification;
     - (NSImage*) currentApplicationIcon;
     - (void) applyApplicationIcon;
@@ -292,6 +293,8 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
 
     - (void) dealloc
     {
+        [[NSNotificationCenter defaultCenter] removeObserver:self];
+        [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
         [windowsBeingDragged release];
         [applicationMenuName release];
         [cursor release];
@@ -2162,6 +2165,19 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
                      name:NSWorkspaceActiveSpaceDidChangeNotification
                    object:nil];
 
+        /* Screen-parameter notifications cover display topology and EDR
+         * headroom changes.  A profile-only change and wake can update colour
+         * capabilities without changing the geometry, so invalidate the
+         * global monitor cache for those events as well. */
+        [nc addObserver:self
+               selector:@selector(displayColorStateDidChange:)
+                   name:NSScreenColorSpaceDidChangeNotification
+                 object:nil];
+        [wsnc addObserver:self
+                 selector:@selector(displayColorStateDidChange:)
+                     name:NSWorkspaceDidWakeNotification
+                   object:nil];
+
         [nc addObserver:self
                selector:@selector(releaseMouseCapture)
                    name:NSMenuDidBeginTrackingNotification
@@ -2507,6 +2523,24 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
         // Accumulated mouse movement deltas are invalidated.  Make sure the next
         // mouse move event starts over from an absolute baseline.
         forceNextMouseMoveAbsolute = TRUE;
+    }
+
+    - (void) displayColorStateDidChange:(NSNotification *)notification
+    {
+        if (![NSThread isMainThread])
+        {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self displayColorStateDidChange:notification]; });
+            return;
+        }
+        if (displayColorRefreshPending) return;
+
+        /* Coalesce the profile, wake, and screen-parameter notification burst,
+         * and enumerate after AppKit has committed its updated NSScreen state. */
+        displayColorRefreshPending = TRUE;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->displayColorRefreshPending = FALSE;
+            [self sendDisplaysChanged:FALSE];
+        });
     }
 
     - (void)applicationDidResignActive:(NSNotification *)notification

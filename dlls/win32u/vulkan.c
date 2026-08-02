@@ -24,7 +24,9 @@
 
 #include "config.h"
 
+#include <assert.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -47,6 +49,9 @@ WINE_DECLARE_DEBUG_CHANNEL(fps);
 static const struct vulkan_driver_funcs *driver_funcs;
 
 #define SWITCHYARD_VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME "VK_KHR_portability_subset"
+/* Provider count queries are untrusted at this boundary.  Surface format
+ * lists are normally tiny; cap them before allocating or iterating. */
+#define MAX_SURFACE_FORMAT_COUNT 4096
 
 static const UINT EXTERNAL_MEMORY_WIN32_BITS = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
@@ -139,11 +144,20 @@ static inline struct device_memory *device_memory_from_handle( VkDeviceMemory ha
     return CONTAINING_RECORD( obj, struct device_memory, obj );
 }
 
+struct swapchain;
+
 struct surface
 {
     struct vulkan_surface obj;
     struct client_surface *client;
     HWND hwnd;
+    pthread_mutex_t mutex;
+    struct swapchain *configured_swapchain;
+    unsigned int operation_count;
+    unsigned int swapchain_count;
+    BOOL color_operation_in_progress;
+    BOOL destroy_pending;
+    BOOL destroying;
 };
 
 static struct surface *surface_from_handle( VkSurfaceKHR handle )
@@ -157,7 +171,103 @@ struct swapchain
     struct vulkan_swapchain obj;
     struct surface *surface;
     VkExtent2D extents;
+    VkSurfaceFormatKHR surface_format;
+    VkHdrMetadataEXT hdr_metadata;
+    BOOL has_hdr_metadata;
+    BOOL needs_color_validation;
+    BOOL destroy_pending;
+    BOOL destroying;
 };
+
+static void surface_destroy_now( struct surface *surface );
+void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
+                                   const VkAllocationCallbacks *allocator );
+
+/* Provider colour hooks may synchronously marshal to the AppKit main thread.
+ * OnMainThread() services Wine query events while it waits, so no win32u lock
+ * may be held across one of those hooks.  Reserve provider access with a
+ * fail-fast flag and an active-operation pin, then drop the state lock before
+ * calling the provider.  Destruction first enters a terminal state and removes
+ * registry visibility, and is deferred until every pin and swapchain drains. */
+static BOOL surface_begin_color_operation( struct surface *surface,
+                                           struct swapchain **configured_swapchain )
+{
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &surface->mutex );
+    if (!surface->destroy_pending && !surface->destroying &&
+        !surface->color_operation_in_progress)
+    {
+        surface->color_operation_in_progress = TRUE;
+        ++surface->operation_count;
+        if (configured_swapchain) *configured_swapchain = surface->configured_swapchain;
+        ret = TRUE;
+    }
+    pthread_mutex_unlock( &surface->mutex );
+    return ret;
+}
+
+static BOOL surface_begin_read_operation( struct surface *surface )
+{
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &surface->mutex );
+    if (!surface->destroy_pending && !surface->destroying &&
+        !surface->color_operation_in_progress)
+    {
+        ++surface->operation_count;
+        ret = TRUE;
+    }
+    pthread_mutex_unlock( &surface->mutex );
+    return ret;
+}
+
+static BOOL surface_begin_destroy_operation( struct surface *surface )
+{
+    BOOL ret = FALSE;
+
+    pthread_mutex_lock( &surface->mutex );
+    if (!surface->destroying && !surface->color_operation_in_progress)
+    {
+        surface->color_operation_in_progress = TRUE;
+        ++surface->operation_count;
+        ret = TRUE;
+    }
+    pthread_mutex_unlock( &surface->mutex );
+    return ret;
+}
+
+static void surface_end_operation( struct surface *surface, BOOL color_operation )
+{
+    BOOL destroy = FALSE;
+
+    pthread_mutex_lock( &surface->mutex );
+    assert( surface->operation_count );
+    if (color_operation)
+    {
+        assert( surface->color_operation_in_progress );
+        surface->color_operation_in_progress = FALSE;
+    }
+    --surface->operation_count;
+    if (surface->destroy_pending && !surface->operation_count && !surface->swapchain_count &&
+        !surface->destroying)
+    {
+        surface->destroying = TRUE;
+        destroy = TRUE;
+    }
+    pthread_mutex_unlock( &surface->mutex );
+    if (destroy) surface_destroy_now( surface );
+}
+
+static void surface_end_color_operation( struct surface *surface )
+{
+    surface_end_operation( surface, TRUE );
+}
+
+static void surface_end_read_operation( struct surface *surface )
+{
+    surface_end_operation( surface, FALSE );
+}
 
 static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
@@ -1536,6 +1646,11 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
 
     if (!(surface = calloc( 1, sizeof(*surface) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (pthread_mutex_init( &surface->mutex, NULL ))
+    {
+        free( surface );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
     /* Windows allows surfaces to be created with no HWND, they return VK_ERROR_SURFACE_LOST_KHR later */
     if (!(surface->hwnd = create_info->hwnd))
@@ -1554,6 +1669,7 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
     {
         if (surface->client) client_surface_release( surface->client );
         if (dummy) NtUserDestroyWindow( dummy );
+        pthread_mutex_destroy( &surface->mutex );
         free( surface );
         return res;
     }
@@ -1570,23 +1686,50 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
     return VK_SUCCESS;
 }
 
+static void surface_destroy_now( struct surface *surface )
+{
+    struct vulkan_instance *instance = surface->obj.instance;
+
+    assert( surface->destroy_pending );
+    assert( surface->destroying );
+    assert( !surface->operation_count );
+    assert( !surface->color_operation_in_progress );
+    assert( !surface->swapchain_count );
+
+    /* Make reentrant handle conversion fail before either provider callback. */
+    instance->p_remove_object( instance, &surface->obj.obj );
+    instance->p_vkDestroySurfaceKHR( instance->host.instance, surface->obj.host.surface, NULL );
+    client_surface_release( surface->client );
+    pthread_mutex_destroy( &surface->mutex );
+    free( surface );
+}
+
 static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR client_surface,
                                         const VkAllocationCallbacks *allocator )
 {
-    struct vulkan_instance *instance = vulkan_instance_from_handle( client_instance );
     struct surface *surface = surface_from_handle( client_surface );
+    BOOL destroy = FALSE;
+    unsigned int operation_count, swapchain_count;
 
     if (!surface) return;
 
-    TRACE( "instance %p, handle 0x%s, allocator %p\n", instance, wine_dbgstr_longlong( client_surface ), allocator );
+    TRACE( "instance %p, handle 0x%s, allocator %p\n", client_instance,
+           wine_dbgstr_longlong( client_surface ), allocator );
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
 
-    instance->p_vkDestroySurfaceKHR( instance->host.instance, surface->obj.host.surface, NULL /* allocator */ );
-    client_surface_release( surface->client );
-
-    instance->p_remove_object( instance, &surface->obj.obj );
-
-    free( surface );
+    pthread_mutex_lock( &surface->mutex );
+    surface->destroy_pending = TRUE;
+    if (!surface->operation_count && !surface->swapchain_count && !surface->destroying)
+    {
+        surface->destroying = TRUE;
+        destroy = TRUE;
+    }
+    operation_count = surface->operation_count;
+    swapchain_count = surface->swapchain_count;
+    pthread_mutex_unlock( &surface->mutex );
+    if (destroy) surface_destroy_now( surface );
+    else WARN( "Deferring destruction of surface %p until %u operations and %u swapchains drain.\n",
+               surface, operation_count, swapchain_count );
 }
 
 static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
@@ -1778,9 +1921,67 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice cl
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
     struct surface *surface = surface_from_handle( client_surface );
     struct vulkan_instance *instance = physical_device->instance;
+    VkSurfaceFormatKHR *host_formats = NULL;
+    uint32_t host_count, host_capacity, capacity, supported_count = 0, i;
+    VkResult res;
 
-    return instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
-                                                                surface->obj.host.surface, format_count, formats );
+    if (!format_count) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!surface || !surface_begin_read_operation( surface )) return VK_ERROR_SURFACE_LOST_KHR;
+    capacity = formats ? *format_count : 0;
+
+    if ((res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+            surface->obj.host.surface, &host_count, NULL ))) goto done;
+    if (!host_count)
+    {
+        *format_count = 0;
+        res = VK_SUCCESS;
+        goto done;
+    }
+    if (host_count > MAX_SURFACE_FORMAT_COUNT)
+    {
+        WARN( "Provider returned an excessive surface format count %u.\n", host_count );
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto done;
+    }
+    host_capacity = host_count;
+    if (!(host_formats = calloc( host_count, sizeof(*host_formats) )))
+    {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto done;
+    }
+
+    res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+            surface->obj.host.surface, &host_count, host_formats );
+    if (res < VK_SUCCESS)
+        goto done;
+    if (host_count > host_capacity)
+    {
+        WARN( "Provider grew the surface format count from %u to %u.\n",
+              host_capacity, host_count );
+        res = VK_ERROR_INITIALIZATION_FAILED;
+        goto done;
+    }
+
+    for (i = 0; i < host_count; ++i)
+    {
+        if (driver_funcs->p_surface_supports_format
+                && !driver_funcs->p_surface_supports_format( surface->client,
+                host_formats[i].format, host_formats[i].colorSpace ))
+            continue;
+        if (formats && supported_count < capacity) formats[supported_count] = host_formats[i];
+        ++supported_count;
+    }
+    if (!formats) *format_count = supported_count;
+    else
+    {
+        *format_count = min( capacity, supported_count );
+        if (supported_count > capacity) res = VK_INCOMPLETE;
+    }
+
+done:
+    free( host_formats );
+    surface_end_read_operation( surface );
+    return res;
 }
 
 static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice client_physical_device, const VkPhysicalDeviceSurfaceInfo2KHR *surface_info,
@@ -1790,31 +1991,127 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
     struct surface *surface = surface_from_handle( surface_info->surface );
     VkPhysicalDeviceSurfaceInfo2KHR surface_info_host = *surface_info;
     struct vulkan_instance *instance = physical_device->instance;
+    VkSurfaceFormat2KHR *host_formats = NULL;
+    uint32_t host_count, host_capacity, capacity, supported_count, i;
     VkResult res;
+
+    if (!format_count) return VK_ERROR_INITIALIZATION_FAILED;
 
     if (!instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR)
     {
         VkSurfaceFormatKHR *surface_formats;
-        UINT i;
+        uint32_t available, returned;
 
         /* Until the loader version exporting this function is common, emulate it using the older non-2 version. */
         if (surface_info->pNext) FIXME( "Emulating vkGetPhysicalDeviceSurfaceFormats2KHR, ignoring pNext.\n" );
-        if (!formats) return win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( client_physical_device, surface_info->surface, format_count, NULL );
+        if ((res = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( client_physical_device,
+                surface_info->surface, &available, NULL ))) return res;
+        if (!formats)
+        {
+            *format_count = available;
+            return VK_SUCCESS;
+        }
+        if (!available)
+        {
+            *format_count = 0;
+            return VK_SUCCESS;
+        }
+        capacity = *format_count;
+        if (!capacity)
+        {
+            *format_count = 0;
+            return available ? VK_INCOMPLETE : VK_SUCCESS;
+        }
 
-        surface_formats = calloc( *format_count, sizeof(*surface_formats) );
+        surface_formats = calloc( available, sizeof(*surface_formats) );
         if (!surface_formats) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-        res = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( client_physical_device, surface_info->surface, format_count, surface_formats );
-        if (!res || res == VK_INCOMPLETE) for (i = 0; i < *format_count; i++) formats[i].surfaceFormat = surface_formats[i];
+        returned = available;
+        res = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( client_physical_device,
+                surface_info->surface, &returned, surface_formats );
+        if (!res || res == VK_INCOMPLETE)
+        {
+            returned = min( returned, capacity );
+            for (i = 0; i < returned; ++i) formats[i].surfaceFormat = surface_formats[i];
+            *format_count = returned;
+            if (available > capacity) res = VK_INCOMPLETE;
+        }
 
         free( surface_formats );
         return res;
     }
 
+    if (!surface || !surface_begin_read_operation( surface )) return VK_ERROR_SURFACE_LOST_KHR;
     surface_info_host.surface = surface->obj.host.surface;
+    if (!driver_funcs->p_surface_supports_format)
+    {
+        res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR(
+                physical_device->host.physical_device, &surface_info_host, format_count, formats );
+        goto done;
+    }
 
-    return instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
-                                                                 &surface_info_host, format_count, formats );
+    capacity = formats ? *format_count : 0;
+    if ((res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR(
+            physical_device->host.physical_device, &surface_info_host, &host_count, NULL )))
+        goto done;
+    if (!host_count)
+    {
+        *format_count = 0;
+        res = VK_SUCCESS;
+        goto done;
+    }
+    if (host_count > MAX_SURFACE_FORMAT_COUNT)
+    {
+        WARN( "Provider returned an excessive surface format count %u.\n", host_count );
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto done;
+    }
+    host_capacity = host_count;
+    if (!(host_formats = calloc( host_count, sizeof(*host_formats) )))
+    {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto done;
+    }
+    for (i = 0; i < host_count; ++i)
+        host_formats[i].sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+
+    res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR(
+            physical_device->host.physical_device, &surface_info_host, &host_count, host_formats );
+    if (res < VK_SUCCESS)
+        goto done;
+    if (host_count > host_capacity)
+    {
+        WARN( "Provider grew the surface format count from %u to %u.\n",
+              host_capacity, host_count );
+        res = VK_ERROR_INITIALIZATION_FAILED;
+        goto done;
+    }
+
+    supported_count = 0;
+    for (i = 0; i < host_count; ++i)
+    {
+        if (!driver_funcs->p_surface_supports_format( surface->client,
+                host_formats[i].surfaceFormat.format, host_formats[i].surfaceFormat.colorSpace ))
+            continue;
+        if (formats && supported_count < capacity)
+        {
+            /* VkSurfaceFormat2KHR currently has no output extension structs;
+             * preserve the caller-owned sType/pNext and copy only the value. */
+            formats[supported_count].surfaceFormat = host_formats[i].surfaceFormat;
+        }
+        ++supported_count;
+    }
+    if (!formats) *format_count = supported_count;
+    else
+    {
+        *format_count = min( capacity, supported_count );
+        if (supported_count > capacity) res = VK_INCOMPLETE;
+    }
+
+done:
+    free( host_formats );
+    surface_end_read_operation( surface );
+    return res;
 }
 
 static VkBool32 win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR( VkPhysicalDevice client_physical_device, uint32_t queue )
@@ -1832,20 +2129,34 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
 {
     VkSwapchainPresentScalingCreateInfoEXT scaling = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT};
-    struct swapchain *swapchain, *old_swapchain = swapchain_from_handle( create_info->oldSwapchain );
+    struct swapchain *swapchain, *previous_swapchain, *old_swapchain = swapchain_from_handle( create_info->oldSwapchain );
     struct surface *surface = surface_from_handle( create_info->surface );
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct vulkan_physical_device *physical_device = device->physical_device;
     struct vulkan_instance *instance = physical_device->instance;
     VkSwapchainCreateInfoKHR create_info_host = *create_info;
     VkSurfaceCapabilitiesKHR capabilities;
+    VkSurfaceFormatKHR previous_format;
+    VkHdrMetadataEXT previous_metadata;
     VkSwapchainKHR host_swapchain;
+    BOOL previous_configured = FALSE, previous_has_metadata = FALSE;
+    BOOL previous_destroy_pending, surface_destroy_pending;
     RECT client_rect;
     VkResult res;
+
+    if (!surface) return VK_ERROR_SURFACE_LOST_KHR;
+    if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!surface_begin_color_operation( surface, &previous_swapchain ))
+    {
+        free( swapchain );
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
 
     if (!NtUserIsWindow( surface->hwnd ))
     {
         ERR( "surface %p, hwnd %p is invalid!\n", surface, surface->hwnd );
+        surface_end_color_operation( surface );
+        free( swapchain );
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
@@ -1854,7 +2165,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     /* Windows allows client rect to be empty, but host Vulkan often doesn't, adjust extents back to the host capabilities */
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface->obj.host.surface, &capabilities );
-    if (res) return res;
+    if (res)
+    {
+        surface_end_color_operation( surface );
+        free( swapchain );
+        return res;
+    }
 
     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
@@ -1872,18 +2188,114 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         create_info_host.pNext = &scaling;
     }
 
-    if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    swapchain->surface_format.format = create_info->imageFormat;
+    swapchain->surface_format.colorSpace = create_info->imageColorSpace;
+    swapchain->needs_color_validation = create_info->imageColorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    pthread_mutex_lock( &surface->mutex );
+    surface_destroy_pending = surface->destroy_pending;
+    if (previous_swapchain)
+    {
+        previous_configured = TRUE;
+        previous_format = previous_swapchain->surface_format;
+        previous_metadata = previous_swapchain->hdr_metadata;
+        previous_has_metadata = previous_swapchain->has_hdr_metadata;
+    }
+    pthread_mutex_unlock( &surface->mutex );
+    if (surface_destroy_pending)
+    {
+        pthread_mutex_lock( &surface->mutex );
+        previous_destroy_pending = previous_swapchain && previous_swapchain->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+        surface_end_color_operation( surface );
+        if (previous_destroy_pending)
+            win32u_vkDestroySwapchainKHR( client_device, previous_swapchain->obj.client.swapchain, NULL );
+        free( swapchain );
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    if (driver_funcs->p_surface_configure
+            && (res = driver_funcs->p_surface_configure( surface->client, &swapchain->surface_format )))
+    {
+        pthread_mutex_lock( &surface->mutex );
+        previous_destroy_pending = previous_swapchain && previous_swapchain->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+        surface_end_color_operation( surface );
+        if (previous_destroy_pending)
+            win32u_vkDestroySwapchainKHR( client_device, previous_swapchain->obj.client.swapchain, NULL );
+        free( swapchain );
+        return res;
+    }
+
+    pthread_mutex_lock( &surface->mutex );
+    surface_destroy_pending = surface->destroy_pending;
+    pthread_mutex_unlock( &surface->mutex );
+    if (surface_destroy_pending)
+    {
+        if (driver_funcs->p_surface_configure)
+            driver_funcs->p_surface_configure( surface->client, NULL );
+        pthread_mutex_lock( &surface->mutex );
+        previous_destroy_pending = previous_swapchain && previous_swapchain->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+        surface_end_color_operation( surface );
+        if (previous_destroy_pending)
+            win32u_vkDestroySwapchainKHR( client_device, previous_swapchain->obj.client.swapchain, NULL );
+        free( swapchain );
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
     {
+        if (driver_funcs->p_surface_configure)
+        {
+            const VkSurfaceFormatKHR *format = previous_configured ? &previous_format : NULL;
+            VkResult restore_res = driver_funcs->p_surface_configure( surface->client, format );
+            if (restore_res) WARN( "Failed to restore surface colour configuration, result %d.\n", restore_res );
+            else if (previous_configured && driver_funcs->p_surface_set_hdr_metadata)
+            {
+                const VkHdrMetadataEXT *metadata = previous_has_metadata ? &previous_metadata : NULL;
+                restore_res = driver_funcs->p_surface_set_hdr_metadata( surface->client, metadata );
+                if (restore_res) WARN( "Failed to restore surface HDR metadata, result %d.\n", restore_res );
+            }
+        }
+        pthread_mutex_lock( &surface->mutex );
+        previous_destroy_pending = previous_swapchain && previous_swapchain->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+        surface_end_color_operation( surface );
+        if (previous_destroy_pending)
+            win32u_vkDestroySwapchainKHR( client_device, previous_swapchain->obj.client.swapchain, NULL );
         free( swapchain );
         return res;
+    }
+
+    pthread_mutex_lock( &surface->mutex );
+    surface_destroy_pending = surface->destroy_pending;
+    pthread_mutex_unlock( &surface->mutex );
+    if (surface_destroy_pending)
+    {
+        device->p_vkDestroySwapchainKHR( device->host.device, host_swapchain, NULL );
+        if (driver_funcs->p_surface_configure)
+            driver_funcs->p_surface_configure( surface->client, NULL );
+        pthread_mutex_lock( &surface->mutex );
+        previous_destroy_pending = previous_swapchain && previous_swapchain->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+        surface_end_color_operation( surface );
+        if (previous_destroy_pending)
+            win32u_vkDestroySwapchainKHR( client_device, previous_swapchain->obj.client.swapchain, NULL );
+        free( swapchain );
+        return VK_ERROR_SURFACE_LOST_KHR;
     }
 
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
     swapchain->extents = create_info->imageExtent;
+    pthread_mutex_lock( &surface->mutex );
+    ++surface->swapchain_count;
+    surface->configured_swapchain = swapchain;
+    previous_destroy_pending = previous_swapchain && previous_swapchain->destroy_pending;
+    pthread_mutex_unlock( &surface->mutex );
     instance->p_insert_object( instance, &swapchain->obj.obj );
+    surface_end_color_operation( surface );
+    if (previous_destroy_pending)
+        win32u_vkDestroySwapchainKHR( client_device, previous_swapchain->obj.client.swapchain, NULL );
 
     *ret = swapchain->obj.client.swapchain;
     return VK_SUCCESS;
@@ -1895,14 +2307,186 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct vulkan_instance *instance = device->physical_device->instance;
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
+    struct surface *surface;
+    BOOL configured;
 
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
+    surface = swapchain->surface;
 
-    device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
+    if (!surface_begin_destroy_operation( surface ))
+    {
+        pthread_mutex_lock( &surface->mutex );
+        if (!swapchain->destroying) swapchain->destroy_pending = TRUE;
+        pthread_mutex_unlock( &surface->mutex );
+        WARN( "Deferring destruction of swapchain %p during a reentrant colour operation.\n", swapchain );
+        return;
+    }
+
+    pthread_mutex_lock( &surface->mutex );
+    if (swapchain->destroying)
+    {
+        pthread_mutex_unlock( &surface->mutex );
+        surface_end_color_operation( surface );
+        return;
+    }
+    swapchain->destroy_pending = TRUE;
+    swapchain->destroying = TRUE;
+    configured = surface->configured_swapchain == swapchain;
+    pthread_mutex_unlock( &surface->mutex );
+
+    /* Provider teardown can reenter through AppKit.  Hide the handle before
+     * either callback so a nested destroy cannot resolve this object. */
     instance->p_remove_object( instance, &swapchain->obj.obj );
+    device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
+    if (configured && driver_funcs->p_surface_configure)
+    {
+        VkResult res = driver_funcs->p_surface_configure( surface->client, NULL );
+        if (res) WARN( "Failed to reset surface colour configuration, result %d.\n", res );
+    }
+
+    pthread_mutex_lock( &surface->mutex );
+    if (surface->configured_swapchain == swapchain) surface->configured_swapchain = NULL;
+    assert( surface->swapchain_count );
+    --surface->swapchain_count;
+    pthread_mutex_unlock( &surface->mutex );
+    surface_end_color_operation( surface );
 
     free( swapchain );
+}
+
+static BOOL hdr_metadata_xy_valid( const VkXYColorEXT *value )
+{
+    return isfinite( value->x ) && isfinite( value->y ) && value->x >= 0.0f
+            && value->y >= 0.0f && value->x <= 1.0f && value->y <= 1.0f
+            && value->x + value->y <= 1.0f;
+}
+
+static BOOL hdr_metadata_valid( const VkHdrMetadataEXT *value )
+{
+    const VkHdrVividDynamicMetadataHUAWEI *vivid = value->pNext;
+
+    return value->sType == VK_STRUCTURE_TYPE_HDR_METADATA_EXT
+            && (!vivid || (vivid->sType == VK_STRUCTURE_TYPE_HDR_VIVID_DYNAMIC_METADATA_HUAWEI
+            && !vivid->pNext && vivid->dynamicMetadataSize && vivid->pDynamicMetadata))
+            && hdr_metadata_xy_valid( &value->displayPrimaryRed )
+            && hdr_metadata_xy_valid( &value->displayPrimaryGreen )
+            && hdr_metadata_xy_valid( &value->displayPrimaryBlue )
+            && hdr_metadata_xy_valid( &value->whitePoint )
+            && isfinite( value->maxLuminance ) && value->maxLuminance >= 0.0f
+            && value->maxLuminance <= 10000.0f
+            && isfinite( value->minLuminance ) && value->minLuminance >= 0.0f
+            && (!value->maxLuminance || value->minLuminance <= value->maxLuminance)
+            && isfinite( value->maxContentLightLevel )
+            && value->maxContentLightLevel >= 0.0f && value->maxContentLightLevel <= 10000.0f
+            && isfinite( value->maxFrameAverageLightLevel )
+            && value->maxFrameAverageLightLevel >= 0.0f
+            && value->maxFrameAverageLightLevel <= 10000.0f
+            && (!value->maxContentLightLevel || value->maxFrameAverageLightLevel
+                    <= value->maxContentLightLevel);
+}
+
+static void win32u_vkSetHdrMetadataEXT( VkDevice client_device, uint32_t swapchain_count,
+                                        const VkSwapchainKHR *client_swapchains,
+                                        const VkHdrMetadataEXT *metadata )
+{
+    struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    uint32_t i;
+
+    if (!swapchain_count) return;
+    if (swapchain_count > 4096)
+    {
+        ERR( "Refusing %u HDR metadata swapchains.\n", swapchain_count );
+        return;
+    }
+    if (!client_swapchains || !metadata)
+    {
+        ERR( "Invalid HDR metadata arguments, count %u, swapchains %p, metadata %p.\n",
+             swapchain_count, client_swapchains, metadata );
+        return;
+    }
+    for (i = 0; i < swapchain_count; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+        const VkHdrMetadataEXT *value = &metadata[i];
+
+        if (!swapchain)
+        {
+            ERR( "Invalid swapchain %s at index %u.\n", wine_dbgstr_longlong(client_swapchains[i]), i );
+            return;
+        }
+        if (!hdr_metadata_valid( value ))
+        {
+            ERR( "Invalid HDR metadata at index %u.\n", i );
+            return;
+        }
+    }
+
+    for (i = 0; i < swapchain_count; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+        struct surface *surface;
+        VkResult res = VK_SUCCESS;
+        BOOL configured, destroy_pending, surface_destroy_pending;
+
+        /* A previous entry can synchronously trigger teardown of a later
+         * duplicate handle.  Resolve each object again before pinning it. */
+        if (!swapchain)
+        {
+            WARN( "Swapchain %s disappeared while applying HDR metadata.\n",
+                  wine_dbgstr_longlong(client_swapchains[i]) );
+            continue;
+        }
+        surface = swapchain->surface;
+
+        if (!surface_begin_color_operation( surface, NULL ))
+        {
+            WARN( "Surface colour operation already in progress for swapchain %p.\n", swapchain );
+            continue;
+        }
+
+        pthread_mutex_lock( &surface->mutex );
+        configured = surface->configured_swapchain == swapchain;
+        destroy_pending = swapchain->destroy_pending;
+        surface_destroy_pending = surface->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+
+        if (!destroy_pending && !surface_destroy_pending && device->p_vkSetHdrMetadataEXT)
+            device->p_vkSetHdrMetadataEXT( device->host.device, 1,
+                    &swapchain->obj.host.swapchain, &metadata[i] );
+
+        pthread_mutex_lock( &surface->mutex );
+        destroy_pending = swapchain->destroy_pending;
+        surface_destroy_pending = surface->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+        if (!destroy_pending && !surface_destroy_pending && configured &&
+            swapchain->surface_format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+            driver_funcs->p_surface_set_hdr_metadata)
+        {
+            res = driver_funcs->p_surface_set_hdr_metadata( surface->client, &metadata[i] );
+            if (!res)
+            {
+                pthread_mutex_lock( &surface->mutex );
+                swapchain->hdr_metadata = metadata[i];
+                /* Dynamic HDR Vivid data is forwarded synchronously to the
+                 * host provider but is application-owned and may not outlive
+                 * this call. Cache only the base static HDR metadata. */
+                swapchain->hdr_metadata.pNext = NULL;
+                swapchain->has_hdr_metadata = TRUE;
+                pthread_mutex_unlock( &surface->mutex );
+            }
+        }
+        else if (driver_funcs->p_surface_set_hdr_metadata)
+            res = VK_ERROR_OUT_OF_DATE_KHR;
+
+        pthread_mutex_lock( &surface->mutex );
+        destroy_pending = swapchain->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+        surface_end_color_operation( surface );
+        if (res) WARN( "Failed to apply HDR metadata for swapchain %p, result %d.\n", swapchain, res );
+        if (destroy_pending)
+            win32u_vkDestroySwapchainKHR( client_device, client_swapchains[i], NULL );
+    }
 }
 
 static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkAcquireNextImageInfoKHR *acquire_info,
@@ -1964,15 +2548,49 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
     struct vulkan_queue *queue = vulkan_queue_from_handle( client_queue );
     VkSwapchainKHR swapchains_buffer[16], *swapchains = swapchains_buffer;
+    struct swapchain *objects_buffer[16], **objects = objects_buffer;
+    BOOL destroy_buffer[16], *destroy_pending = destroy_buffer;
     struct vulkan_device *device = queue->device;
     const VkSwapchainKHR *client_swapchains;
+    BOOL invalid_surface = FALSE;
     VkResult res;
+    uint32_t pinned_count = 0;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
 
-    if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer) &&
-        !(swapchains = malloc( present_info->swapchainCount * sizeof(*swapchains) )))
+    if (present_info->swapchainCount > 4096)
+    {
+        ERR( "Refusing %u present swapchains.\n", present_info->swapchainCount );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer))
+    {
+        if (!(swapchains = malloc( present_info->swapchainCount * sizeof(*swapchains) )) ||
+            !(objects = malloc( present_info->swapchainCount * sizeof(*objects) )) ||
+            !(destroy_pending = malloc( present_info->swapchainCount * sizeof(*destroy_pending) )))
+        {
+            if (swapchains != swapchains_buffer) free( swapchains );
+            if (objects != objects_buffer) free( objects );
+            if (destroy_pending != destroy_buffer) free( destroy_pending );
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    client_swapchains = present_info->pSwapchains;
+    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+
+        if (!swapchain || !surface_begin_color_operation( swapchain->surface, NULL ))
+        {
+            res = VK_ERROR_OUT_OF_DATE_KHR;
+            goto done;
+        }
+        objects[i] = swapchain;
+        swapchains[i] = swapchain->obj.host.swapchain;
+        destroy_pending[i] = FALSE;
+        ++pinned_count;
+    }
 
     for (uint32_t i = 0; i < present_info->waitSemaphoreCount; i++)
     {
@@ -1981,34 +2599,66 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         semaphores[i] = semaphore->host.semaphore;
     }
 
-    for (uint32_t i = 0; i < present_info->swapchainCount; i++)
-    {
-        struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
-        swapchains[i] = swapchain->obj.host.swapchain;
-    }
-
-    client_swapchains = present_info->pSwapchains;
     present_info->pSwapchains = swapchains;
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
-        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+        struct swapchain *swapchain = objects[i];
         struct surface *surface = swapchain->surface;
+        VkResult validate_res = VK_SUCCESS;
+
         client_surface_update( surface->client );
+        pthread_mutex_lock( &surface->mutex );
+        if (surface->configured_swapchain != swapchain || surface->destroy_pending ||
+            swapchain->destroy_pending)
+            validate_res = VK_ERROR_OUT_OF_DATE_KHR;
+        pthread_mutex_unlock( &surface->mutex );
+        if (!validate_res && swapchain->needs_color_validation && driver_funcs->p_surface_validate)
+        {
+            validate_res = driver_funcs->p_surface_validate(
+                    surface->client, &swapchain->surface_format );
+        }
+        if (validate_res)
+        {
+            WARN( "Surface colour configuration is no longer valid, result %d.\n", validate_res );
+            invalid_surface = TRUE;
+        }
     }
 
-    res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    if (invalid_surface)
+    {
+        res = VK_ERROR_OUT_OF_DATE_KHR;
+        if (present_info->pResults)
+            for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+                present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    else
+    {
+        res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    }
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
-        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+        struct swapchain *swapchain = objects[i];
         VkResult swapchain_res = present_info->pResults ? present_info->pResults[i] : res;
         struct surface *surface = swapchain->surface;
         RECT client_rect;
 
-        client_surface_present( surface->client );
+        pthread_mutex_lock( &surface->mutex );
+        destroy_pending[i] = swapchain->destroy_pending;
+        if (surface->destroy_pending || swapchain->destroy_pending)
+            swapchain_res = VK_ERROR_OUT_OF_DATE_KHR;
+        pthread_mutex_unlock( &surface->mutex );
 
-        if (swapchain_res < VK_SUCCESS) continue;
+        if (!invalid_surface && swapchain_res >= VK_SUCCESS)
+            client_surface_present( surface->client );
+
+        if (swapchain_res < VK_SUCCESS)
+        {
+            if (present_info->pResults) present_info->pResults[i] = swapchain_res;
+            if (res >= VK_SUCCESS) res = swapchain_res;
+            continue;
+        }
         if (!get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))
         {
             WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
@@ -2026,7 +2676,23 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
     }
 
+done:
+    for (uint32_t i = 0; i < pinned_count; ++i)
+    {
+        struct surface *surface = objects[i]->surface;
+
+        pthread_mutex_lock( &surface->mutex );
+        destroy_pending[i] = objects[i]->destroy_pending;
+        pthread_mutex_unlock( &surface->mutex );
+        surface_end_color_operation( surface );
+    }
+    for (uint32_t i = 0; i < pinned_count; ++i)
+        if (destroy_pending[i])
+            win32u_vkDestroySwapchainKHR( device->client.device, client_swapchains[i], NULL );
+
     if (swapchains != swapchains_buffer) free( swapchains );
+    if (objects != objects_buffer) free( objects );
+    if (destroy_pending != destroy_buffer) free( destroy_pending );
 
     if (TRACE_ON( fps ))
     {
@@ -2976,6 +3642,7 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkQueueSubmit = win32u_vkQueueSubmit,
     .p_vkQueueSubmit2 = win32u_vkQueueSubmit2,
     .p_vkQueueSubmit2KHR = win32u_vkQueueSubmit2KHR,
+    .p_vkSetHdrMetadataEXT = win32u_vkSetHdrMetadataEXT,
     .p_vkUnmapMemory = win32u_vkUnmapMemory,
     .p_vkUnmapMemory2KHR = win32u_vkUnmapMemory2KHR,
 };

@@ -17,6 +17,7 @@
  */
 
 #include <assert.h>
+#include <math.h>
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #define COBJMACROS
@@ -5885,6 +5886,7 @@ static void test_output_desc(void)
 
         for (j = 0; ; ++j)
         {
+            IDXGIOutput6 *output6;
             MONITORINFOEXW monitor_info;
             BOOL ret;
 
@@ -5920,6 +5922,58 @@ static void test_output_desc(void)
                     "Got unexpected desktop coordinates %s, expected %s.\n",
                     wine_dbgstr_rect(&desc.DesktopCoordinates),
                     wine_dbgstr_rect(&monitor_info.rcMonitor));
+
+            if (SUCCEEDED(IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput6, (void **)&output6)))
+            {
+                DXGI_OUTPUT_DESC1 desc1;
+                BOOL primaries_zero, white_zero;
+
+                hr = IDXGIOutput6_GetDesc1(output6, NULL);
+                ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for a NULL output description.\n", hr);
+                memset(&desc1, 0xcc, sizeof(desc1));
+                hr = IDXGIOutput6_GetDesc1(output6, &desc1);
+                ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+                ok(!desc1.BitsPerColor || desc1.BitsPerColor <= 32,
+                        "Got invalid bits per colour %u.\n", desc1.BitsPerColor);
+                primaries_zero = !desc1.RedPrimary[0] && !desc1.RedPrimary[1]
+                        && !desc1.GreenPrimary[0] && !desc1.GreenPrimary[1]
+                        && !desc1.BluePrimary[0] && !desc1.BluePrimary[1];
+                ok(primaries_zero || (desc1.RedPrimary[0] >= 0.0f && desc1.RedPrimary[1] >= 0.0f
+                        && desc1.RedPrimary[0] + desc1.RedPrimary[1] <= 1.0f
+                        && desc1.GreenPrimary[0] >= 0.0f && desc1.GreenPrimary[1] >= 0.0f
+                        && desc1.GreenPrimary[0] + desc1.GreenPrimary[1] <= 1.0f
+                        && desc1.BluePrimary[0] >= 0.0f && desc1.BluePrimary[1] >= 0.0f
+                        && desc1.BluePrimary[0] + desc1.BluePrimary[1] <= 1.0f),
+                        "Got invalid output primaries.\n");
+                white_zero = !desc1.WhitePoint[0] && !desc1.WhitePoint[1];
+                ok(white_zero || (desc1.WhitePoint[0] >= 0.0f && desc1.WhitePoint[1] >= 0.0f
+                        && desc1.WhitePoint[0] + desc1.WhitePoint[1] <= 1.0f),
+                        "Got invalid white point %.8f, %.8f.\n",
+                        desc1.WhitePoint[0], desc1.WhitePoint[1]);
+                ok(isfinite(desc1.MinLuminance) && isfinite(desc1.MaxLuminance)
+                        && isfinite(desc1.MaxFullFrameLuminance)
+                        && desc1.MinLuminance >= 0.0f && desc1.MaxLuminance >= 0.0f
+                        && desc1.MaxFullFrameLuminance >= 0.0f,
+                        "Got invalid luminance range %.8f, %.8f, %.8f.\n",
+                        desc1.MinLuminance, desc1.MaxLuminance, desc1.MaxFullFrameLuminance);
+                if (desc1.MinLuminance && desc1.MaxLuminance)
+                    ok(desc1.MinLuminance <= desc1.MaxLuminance,
+                            "Minimum luminance %.8f exceeds maximum %.8f.\n",
+                            desc1.MinLuminance, desc1.MaxLuminance);
+                if (desc1.MaxLuminance && desc1.MaxFullFrameLuminance)
+                    ok(desc1.MaxFullFrameLuminance <= desc1.MaxLuminance,
+                            "Full-frame luminance %.8f exceeds maximum %.8f.\n",
+                            desc1.MaxFullFrameLuminance, desc1.MaxLuminance);
+                trace("Output %u: bpc %u, color space %#x, primaries %.5f %.5f / %.5f %.5f / %.5f %.5f, "
+                        "white %.5f %.5f, luminance %.5f %.5f %.5f.\n", j, desc1.BitsPerColor,
+                        desc1.ColorSpace, desc1.RedPrimary[0], desc1.RedPrimary[1],
+                        desc1.GreenPrimary[0], desc1.GreenPrimary[1], desc1.BluePrimary[0],
+                        desc1.BluePrimary[1], desc1.WhitePoint[0], desc1.WhitePoint[1],
+                        desc1.MinLuminance, desc1.MaxLuminance, desc1.MaxFullFrameLuminance);
+                IDXGIOutput6_Release(output6);
+            }
+            else
+                win_skip("IDXGIOutput6 is not available.\n");
 
             IDXGIOutput_Release(output);
             refcount = get_refcount(adapter);
@@ -8034,6 +8088,128 @@ static void test_restrict_to_output(IUnknown *device, BOOL is_d3d12)
     ok(refcount == !is_d3d12, "Factory has %lu references left.\n", refcount);
 }
 
+static void test_d3d12_hdr_swapchain_formats(IDXGIFactory2 *factory, IUnknown *device, HWND window)
+{
+    static const struct
+    {
+        DXGI_FORMAT format;
+        DXGI_COLOR_SPACE_TYPE colour_space;
+    }
+    tests[] =
+    {
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709},
+        {DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020},
+    };
+    DXGI_SWAP_CHAIN_DESC1 desc;
+    DXGI_HDR_METADATA_HDR10 metadata;
+    IDXGISwapChain3 *swapchain3;
+    IDXGISwapChain4 *swapchain4;
+    IDXGISwapChain1 *swapchain1;
+    unsigned int i, j;
+    UINT support;
+    HRESULT hr;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.Width = 320;
+    desc.Height = 180;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+
+    memset(&metadata, 0, sizeof(metadata));
+    metadata.RedPrimary[0] = 34000;
+    metadata.RedPrimary[1] = 16000;
+    metadata.GreenPrimary[0] = 13250;
+    metadata.GreenPrimary[1] = 34500;
+    metadata.BluePrimary[0] = 7500;
+    metadata.BluePrimary[1] = 3000;
+    metadata.WhitePoint[0] = 15635;
+    metadata.WhitePoint[1] = 16450;
+    metadata.MaxMasteringLuminance = 1000;
+    metadata.MinMasteringLuminance = 50;
+    metadata.MaxContentLightLevel = 1000;
+    metadata.MaxFrameAverageLightLevel = 400;
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        swapchain4 = NULL;
+        desc.Format = tests[i].format;
+        hr = IDXGIFactory2_CreateSwapChainForHwnd(factory, device, window,
+                &desc, NULL, NULL, &swapchain1);
+        ok(hr == S_OK, "Test %u: Failed to create swapchain, hr %#lx.\n", i, hr);
+        if (FAILED(hr)) continue;
+
+        hr = IDXGISwapChain1_QueryInterface(swapchain1,
+                &IID_IDXGISwapChain3, (void **)&swapchain3);
+        ok(hr == S_OK, "Test %u: IDXGISwapChain3 unavailable, hr %#lx.\n", i, hr);
+        if (FAILED(hr))
+        {
+            IDXGISwapChain1_Release(swapchain1);
+            continue;
+        }
+        hr = IDXGISwapChain1_QueryInterface(swapchain1,
+                &IID_IDXGISwapChain4, (void **)&swapchain4);
+        ok(hr == S_OK, "Test %u: IDXGISwapChain4 unavailable, hr %#lx.\n", i, hr);
+
+        support = 0xdeadbeef;
+        hr = IDXGISwapChain3_CheckColorSpaceSupport(swapchain3,
+                tests[i].colour_space, &support);
+        ok(hr == S_OK, "Test %u: CheckColorSpaceSupport returned %#lx.\n", i, hr);
+        ok(!(support & ~DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT),
+                "Test %u: Got unexpected support flags %#x.\n", i, support);
+        hr = IDXGISwapChain3_SetColorSpace1(swapchain3, tests[i].colour_space);
+        ok(hr == ((support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)
+                ? S_OK : E_INVALIDARG),
+                "Test %u: SetColorSpace1 returned %#lx for support %#x.\n", i, hr, support);
+
+        if (SUCCEEDED(hr))
+        {
+            /* Recreate repeatedly to cover resize and colour-transition state,
+             * including the exact non-SDR provider path when it is present. */
+            for (j = 0; j < 4; ++j)
+            {
+                hr = IDXGISwapChain3_ResizeBuffers(swapchain3, 2,
+                        320 + j, 180 + j, tests[i].format, 0);
+                ok(hr == S_OK, "Test %u/%u: ResizeBuffers returned %#lx.\n", i, j, hr);
+                if (FAILED(hr)) break;
+            }
+        }
+
+        if (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)
+        {
+            hr = IDXGISwapChain3_SetColorSpace1(swapchain3,
+                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            ok(hr == S_OK, "Test %u: Failed to restore SDR colour space, hr %#lx.\n", i, hr);
+            hr = IDXGISwapChain3_SetColorSpace1(swapchain3, tests[i].colour_space);
+            ok(hr == S_OK, "Test %u: Failed to restore non-SDR colour space, hr %#lx.\n", i, hr);
+        }
+
+        if (swapchain4)
+        {
+            hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                    DXGI_HDR_METADATA_TYPE_HDR10, sizeof(metadata), &metadata);
+            if (tests[i].colour_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                    && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
+                ok(hr == S_OK || hr == DXGI_ERROR_INVALID_CALL,
+                        "Test %u: HDR10 metadata returned %#lx.\n", i, hr);
+            else
+                ok(hr == DXGI_ERROR_INVALID_CALL,
+                        "Test %u: Metadata on a non-PQ path returned %#lx.\n", i, hr);
+
+            hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                    DXGI_HDR_METADATA_TYPE_NONE, 0, NULL);
+            ok(hr == S_OK, "Test %u: Clearing HDR metadata returned %#lx.\n", i, hr);
+            IDXGISwapChain4_Release(swapchain4);
+        }
+
+        IDXGISwapChain3_Release(swapchain3);
+        IDXGISwapChain1_Release(swapchain1);
+    }
+}
+
 static void test_colour_space_support(IUnknown *device, BOOL is_d3d12)
 {
     DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
@@ -8112,6 +8288,10 @@ static void test_colour_space_support(IUnknown *device, BOOL is_d3d12)
         return;
     }
 
+    hr = IDXGISwapChain3_CheckColorSpaceSupport(swapchain3,
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, NULL);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for a NULL support pointer.\n", hr);
+
     for (i = 0; i < ARRAY_SIZE(colour_spaces); ++i)
     {
         support = 0xdeadbeef;
@@ -8154,11 +8334,52 @@ static void test_colour_space_support(IUnknown *device, BOOL is_d3d12)
         hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
                 DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr10), NULL);
         ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                (DXGI_HDR_METADATA_TYPE)0xdeadbeef, 0, NULL);
+        ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+        /* Zero denotes unknown HDR10 fields; it is structurally valid metadata,
+         * even though an SDR swapchain/provider may reject applying it. */
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr10), &hdr10);
+        ok(hr == DXGI_ERROR_INVALID_CALL || (!winetest_platform_is_wine && hr == S_OK),
+                "Got unexpected hr %#lx for unknown HDR10 metadata.\n", hr);
+
+        hdr10.RedPrimary[0] = 50000;
+        hdr10.RedPrimary[1] = 1;
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr10), &hdr10);
+        ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for an invalid chromaticity.\n", hr);
+        memset(&hdr10, 0, sizeof(hdr10));
+
+        hdr10.RedPrimary[0] = 34000;
+        hdr10.RedPrimary[1] = 16000;
+        hdr10.GreenPrimary[0] = 13250;
+        hdr10.GreenPrimary[1] = 34500;
+        hdr10.BluePrimary[0] = 7500;
+        hdr10.BluePrimary[1] = 3000;
+        hdr10.WhitePoint[0] = 15635;
+        hdr10.WhitePoint[1] = 16450;
+        hdr10.MaxMasteringLuminance = 1000;
+        hdr10.MinMasteringLuminance = 50;
+        hdr10.MaxContentLightLevel = 1000;
+        hdr10.MaxFrameAverageLightLevel = 400;
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr10), &hdr10);
+        ok(hr == DXGI_ERROR_INVALID_CALL || (!winetest_platform_is_wine && hr == S_OK),
+                "Got unexpected hr %#lx for valid HDR10 metadata.\n", hr);
+
+        hdr10.MaxFrameAverageLightLevel = hdr10.MaxContentLightLevel + 1;
+        hr = IDXGISwapChain4_SetHDRMetaData(swapchain4,
+                DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr10), &hdr10);
+        ok(hr == E_INVALIDARG, "Got unexpected hr %#lx for inverted light levels.\n", hr);
         IDXGISwapChain4_Release(swapchain4);
     }
 
     ref_count = IDXGISwapChain3_Release(swapchain3);
     ok(!ref_count, "Swap chain has %lu references left.\n", ref_count);
+    if (is_d3d12)
+        test_d3d12_hdr_swapchain_formats(factory2, device, window);
     DestroyWindow(window);
     ref_count = IDXGIFactory2_Release(factory2);
     ok(ref_count == !is_d3d12, "Factory has %lu references left.\n", ref_count);

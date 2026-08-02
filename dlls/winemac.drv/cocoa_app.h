@@ -60,6 +60,7 @@ enum {
 
     CGFloat primaryScreenHeight;
     BOOL primaryScreenHeightValid;
+    BOOL displayColorRefreshPending;
     NSMutableData* screenFrameCGRects;
 
     WineWindow* lastTargetWindow;

@@ -1532,6 +1532,35 @@ BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface 
     return surface->metal_swapchain != NULL;
 }
 
+enum macdrv_metal_color_result macdrv_client_surface_supports_color_config(
+        struct macdrv_client_surface *surface, const struct macdrv_metal_color_config *config)
+{
+    if (!surface || !config) return MACDRV_METAL_COLOR_INVALID;
+    if (!macdrv_client_surface_acquire_metal_swapchain(surface)) return MACDRV_METAL_COLOR_UNSUPPORTED;
+    return macdrv_swapchain_supports_color_config(surface->metal_swapchain, config);
+}
+
+enum macdrv_metal_color_result macdrv_client_surface_set_color_config(
+        struct macdrv_client_surface *surface, const struct macdrv_metal_color_config *config)
+{
+    if (!surface || !config || !surface->metal_swapchain) return MACDRV_METAL_COLOR_INVALID;
+    return macdrv_swapchain_set_color_config(surface->metal_swapchain, config);
+}
+
+enum macdrv_metal_color_result macdrv_client_surface_validate_color_config(
+        struct macdrv_client_surface *surface, const struct macdrv_metal_color_config *config)
+{
+    if (!surface || !config || !surface->metal_swapchain) return MACDRV_METAL_COLOR_INVALID;
+    return macdrv_swapchain_validate_color_config(surface->metal_swapchain, config);
+}
+
+enum macdrv_metal_color_result macdrv_client_surface_set_hdr10_metadata(
+        struct macdrv_client_surface *surface, const struct macdrv_hdr10_metadata *metadata)
+{
+    if (!surface || !surface->metal_swapchain) return MACDRV_METAL_COLOR_INVALID;
+    return macdrv_swapchain_set_hdr10_metadata(surface->metal_swapchain, metadata);
+}
+
 /**********************************************************************
  *              SetDesktopWindow   (MACDRV.@)
  */

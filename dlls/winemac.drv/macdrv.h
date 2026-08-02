@@ -217,6 +217,14 @@ struct macdrv_client_surface
 
 extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
 extern BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
+extern enum macdrv_metal_color_result macdrv_client_surface_supports_color_config(
+        struct macdrv_client_surface *surface, const struct macdrv_metal_color_config *config);
+extern enum macdrv_metal_color_result macdrv_client_surface_set_color_config(
+        struct macdrv_client_surface *surface, const struct macdrv_metal_color_config *config);
+extern enum macdrv_metal_color_result macdrv_client_surface_validate_color_config(
+        struct macdrv_client_surface *surface, const struct macdrv_metal_color_config *config);
+extern enum macdrv_metal_color_result macdrv_client_surface_set_hdr10_metadata(
+        struct macdrv_client_surface *surface, const struct macdrv_hdr10_metadata *metadata);
 extern void macdrv_begin_window_move_surface_hold(HWND hwnd);
 extern void macdrv_end_window_move_surface_hold(void);
 

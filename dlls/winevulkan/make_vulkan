@@ -238,6 +238,7 @@ USER_DRIVER_FUNCS = {
     "vkQueueSubmit",
     "vkQueueSubmit2",
     "vkQueueSubmit2KHR",
+    "vkSetHdrMetadataEXT",
     "vkUnmapMemory",
     "vkUnmapMemory2KHR",
 }
@@ -746,6 +747,79 @@ class Function(Type):
         return f"{self.type} wine_{self.name}({self.gen_params()});\n"
 
     def body(self, conv, conversions, params_prefix=""):
+        if self.name == "vkSetHdrMetadataEXT" and conv:
+            body = "\n"
+            body += "    struct VkHdrMetadataEXT32\n"
+            body += "    {\n"
+            body += "        VkStructureType sType;\n"
+            body += "        PTR32 pNext;\n"
+            body += "        VkXYColorEXT displayPrimaryRed;\n"
+            body += "        VkXYColorEXT displayPrimaryGreen;\n"
+            body += "        VkXYColorEXT displayPrimaryBlue;\n"
+            body += "        VkXYColorEXT whitePoint;\n"
+            body += "        float maxLuminance;\n"
+            body += "        float minLuminance;\n"
+            body += "        float maxContentLightLevel;\n"
+            body += "        float maxFrameAverageLightLevel;\n"
+            body += "    };\n"
+            body += "    struct VkHdrVividDynamicMetadataHUAWEI32\n"
+            body += "    {\n"
+            body += "        VkStructureType sType;\n"
+            body += "        PTR32 pNext;\n"
+            body += "        uint32_t dynamicMetadataSize;\n"
+            body += "        PTR32 pDynamicMetadata;\n"
+            body += "    };\n"
+            body += "    const VkSwapchainKHR *swapchains = (const VkSwapchainKHR *)UlongToPtr(params->pSwapchains);\n"
+            body += "    const struct VkHdrMetadataEXT32 *metadata = (const struct VkHdrMetadataEXT32 *)UlongToPtr(params->pMetadata);\n"
+            body += "    uint32_t offset = 0;\n\n"
+            body += "    TRACE(\"%#x, %u, %#x, %#x\\n\", params->device, params->swapchainCount, params->pSwapchains, params->pMetadata);\n\n"
+            body += "    if (params->swapchainCount > 4096 || (params->swapchainCount && (!swapchains || !metadata)))\n"
+            body += "    {\n"
+            body += "        ERR(\"Invalid HDR metadata list before conversion, count %u.\\n\", params->swapchainCount);\n"
+            body += "        return STATUS_SUCCESS;\n"
+            body += "    }\n\n"
+            body += "    while (offset < params->swapchainCount)\n"
+            body += "    {\n"
+            body += "        VkHdrMetadataEXT converted[32];\n"
+            body += "        VkHdrVividDynamicMetadataHUAWEI converted_vivid[32];\n"
+            body += "        uint32_t count = min(ARRAY_SIZE(converted), params->swapchainCount - offset);\n"
+            body += "        uint32_t i;\n\n"
+            body += "        for (i = 0; i < count; ++i)\n"
+            body += "        {\n"
+            body += "            const struct VkHdrVividDynamicMetadataHUAWEI32 *vivid =\n"
+            body += "                    (const struct VkHdrVividDynamicMetadataHUAWEI32 *)UlongToPtr(metadata[offset + i].pNext);\n\n"
+            body += "            if (metadata[offset + i].sType != VK_STRUCTURE_TYPE_HDR_METADATA_EXT ||\n"
+            body += "                (vivid && (vivid->sType != VK_STRUCTURE_TYPE_HDR_VIVID_DYNAMIC_METADATA_HUAWEI ||\n"
+            body += "                vivid->pNext || !vivid->dynamicMetadataSize || !vivid->pDynamicMetadata)))\n"
+            body += "            {\n"
+            body += "                ERR(\"Invalid HDR metadata structure before conversion.\\n\");\n"
+            body += "                return STATUS_SUCCESS;\n"
+            body += "            }\n"
+            body += "            converted[i].sType = metadata[offset + i].sType;\n"
+            body += "            if (vivid)\n"
+            body += "            {\n"
+            body += "                converted_vivid[i].sType = vivid->sType;\n"
+            body += "                converted_vivid[i].pNext = NULL;\n"
+            body += "                converted_vivid[i].dynamicMetadataSize = vivid->dynamicMetadataSize;\n"
+            body += "                converted_vivid[i].pDynamicMetadata = UlongToPtr(vivid->pDynamicMetadata);\n"
+            body += "                converted[i].pNext = &converted_vivid[i];\n"
+            body += "            }\n"
+            body += "            else converted[i].pNext = NULL;\n"
+            body += "            converted[i].displayPrimaryRed = metadata[offset + i].displayPrimaryRed;\n"
+            body += "            converted[i].displayPrimaryGreen = metadata[offset + i].displayPrimaryGreen;\n"
+            body += "            converted[i].displayPrimaryBlue = metadata[offset + i].displayPrimaryBlue;\n"
+            body += "            converted[i].whitePoint = metadata[offset + i].whitePoint;\n"
+            body += "            converted[i].maxLuminance = metadata[offset + i].maxLuminance;\n"
+            body += "            converted[i].minLuminance = metadata[offset + i].minLuminance;\n"
+            body += "            converted[i].maxContentLightLevel = metadata[offset + i].maxContentLightLevel;\n"
+            body += "            converted[i].maxFrameAverageLightLevel = metadata[offset + i].maxFrameAverageLightLevel;\n"
+            body += "        }\n"
+            body += "        vk_funcs->p_vkSetHdrMetadataEXT((VkDevice)UlongToPtr(params->device), count, swapchains + offset, converted);\n"
+            body += "        offset += count;\n"
+            body += "    }\n"
+            body += "    return STATUS_SUCCESS;\n"
+            return body
+
         body = ""
         needs_alloc = False
         deferred_op = None
@@ -776,6 +850,33 @@ class Function(Type):
 
         if not self.is_perf_critical():
             body += "    {0}\n".format(self.trace(params_prefix=params_prefix, conv=conv))
+
+        # vkSetHdrMetadataEXT is routed through the user driver, but the
+        # 32-bit thunk must convert its metadata array before win32u sees the
+        # call. The WOW64 thunk above converts fixed chunks; validate the
+        # native-width path before it reaches the user driver.
+        if self.name == "vkSetHdrMetadataEXT":
+            body += f"    if ({params_prefix}swapchainCount > 4096)\n"
+            body += "    {\n"
+            body += f"        ERR(\"Refusing %u HDR metadata swapchains before conversion.\\n\", {params_prefix}swapchainCount);\n"
+            body += "        return STATUS_SUCCESS;\n"
+            body += "    }\n\n"
+            body += f"    if ({params_prefix}swapchainCount && (!{params_prefix}pSwapchains || !{params_prefix}pMetadata))\n"
+            body += "    {\n"
+            body += "        ERR(\"Invalid HDR metadata pointer arguments before conversion.\\n\");\n"
+            body += "        return STATUS_SUCCESS;\n"
+            body += "    }\n\n"
+            body += f"    for (uint32_t i = 0; i < {params_prefix}swapchainCount; ++i)\n"
+            body += "    {\n"
+            body += f"        const VkHdrVividDynamicMetadataHUAWEI *vivid = {params_prefix}pMetadata[i].pNext;\n\n"
+            body += f"        if ({params_prefix}pMetadata[i].sType != VK_STRUCTURE_TYPE_HDR_METADATA_EXT ||\n"
+            body += "            (vivid && (vivid->sType != VK_STRUCTURE_TYPE_HDR_VIVID_DYNAMIC_METADATA_HUAWEI ||\n"
+            body += "            vivid->pNext || !vivid->dynamicMetadataSize || !vivid->pDynamicMetadata)))\n"
+            body += "        {\n"
+            body += "            ERR(\"Invalid HDR metadata structure before dispatch.\\n\");\n"
+            body += "            return STATUS_SUCCESS;\n"
+            body += "        }\n"
+            body += "    }\n\n"
 
         if self.params[0].optional and self.params[0].is_handle():
             if self.type != "void":

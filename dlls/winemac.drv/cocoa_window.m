@@ -28,6 +28,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <math.h>
+#include <stdatomic.h>
 
 #import "cocoa_window.h"
 
@@ -662,9 +663,21 @@ static void WineCompositorDetachView(WineContentView* view);
 @interface WineMetalView : WineBaseView
 {
     id<MTLDevice> _device;
+    struct macdrv_metal_color_config _colorConfig;
+    BOOL _hasColorConfig;
+    BOOL _hdrLayerConfigured;
+    BOOL _applyingColorConfig;
+    CGColorSpaceRef _sdrColorSpace;
+    atomic_uint _activeColorConfigKey;
+    atomic_bool _activeDisplaySupported;
 }
 
     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+    - (enum macdrv_metal_color_result) supportsColorConfig:(const struct macdrv_metal_color_config*)config;
+    - (enum macdrv_metal_color_result) setColorConfig:(const struct macdrv_metal_color_config*)config;
+    - (enum macdrv_metal_color_result) validateColorConfig:(const struct macdrv_metal_color_config*)config;
+    - (enum macdrv_metal_color_result) setHDR10Metadata:(const struct macdrv_hdr10_metadata*)metadata;
+    - (void) screenConfigurationChanged;
 
 @end
 
@@ -700,6 +713,7 @@ static void WineCompositorDetachView(WineContentView* view);
     - (void) wine_setBackingSize:(const int*)newBackingSize;
 
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
+    - (void) windowScreenConfigurationChanged;
     - (CALayer*) compositorLayer;
     - (void) removeAllCALayerHostViews;
 
@@ -1326,6 +1340,11 @@ static void WineCompositorDetachView(WineContentView* view)
         return _metalView;
     }
 
+    - (void) windowScreenConfigurationChanged
+    {
+        [_metalView screenConfigurationChanged];
+    }
+
     - (CALayer*) compositorLayer
     {
         return compositorRootLayer;
@@ -1655,6 +1674,79 @@ static void WineCompositorDetachView(WineContentView* view)
 @end
 
 
+static enum macdrv_metal_color_result macdrv_validate_metal_color_config(
+        const struct macdrv_metal_color_config *config)
+{
+    if (!config) return MACDRV_METAL_COLOR_INVALID;
+
+    switch (config->color_space)
+    {
+        case MACDRV_METAL_COLOR_SPACE_SRGB:
+            if (config->pixel_format != MACDRV_METAL_PIXEL_FORMAT_PROVIDER || config->has_hdr10_metadata)
+                return MACDRV_METAL_COLOR_INVALID;
+            break;
+
+        case MACDRV_METAL_COLOR_SPACE_EXTENDED_LINEAR_SRGB:
+            if (config->pixel_format != MACDRV_METAL_PIXEL_FORMAT_RGBA16_FLOAT || config->has_hdr10_metadata)
+                return MACDRV_METAL_COLOR_INVALID;
+            break;
+
+        case MACDRV_METAL_COLOR_SPACE_HDR10_PQ_BT2020:
+            if (config->pixel_format != MACDRV_METAL_PIXEL_FORMAT_RGB10A2_UNORM ||
+                (config->has_hdr10_metadata && !macdrv_hdr10_metadata_is_valid(&config->hdr10_metadata)))
+                return MACDRV_METAL_COLOR_INVALID;
+            break;
+
+        default:
+            return MACDRV_METAL_COLOR_INVALID;
+    }
+
+    return MACDRV_METAL_COLOR_SUCCESS;
+}
+
+static unsigned int macdrv_metal_color_config_key(const struct macdrv_metal_color_config *config)
+{
+    return 1 + ((unsigned int)config->color_space << 8) + config->pixel_format;
+}
+
+static BOOL macdrv_screen_supports_edr(NSScreen *screen)
+{
+    if (!screen) return FALSE;
+
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101500
+    if (@available(macOS 10.15, *))
+        return screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0;
+#endif
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101100
+    if (@available(macOS 10.11, *))
+        return screen.maximumExtendedDynamicRangeColorComponentValue > 1.0;
+#endif
+    return FALSE;
+}
+
+static CGColorSpaceRef macdrv_create_layer_color_space(enum macdrv_metal_color_space color_space)
+{
+    switch (color_space)
+    {
+        case MACDRV_METAL_COLOR_SPACE_EXTENDED_LINEAR_SRGB:
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101200
+            if (@available(macOS 10.12, *))
+                return CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+#endif
+            return NULL;
+
+        case MACDRV_METAL_COLOR_SPACE_HDR10_PQ_BT2020:
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 110000
+            if (@available(macOS 11.0, *))
+                return CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+#endif
+            return NULL;
+
+        default:
+            return NULL;
+    }
+}
+
 @implementation WineMetalView
 
     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device
@@ -1663,22 +1755,260 @@ static void WineCompositorDetachView(WineContentView* view)
         if (self)
         {
             _device = [device retain];
+            atomic_init(&_activeColorConfigKey, 0);
+            atomic_init(&_activeDisplaySupported, false);
             self.wantsLayer = YES;
             self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
+            [[NSNotificationCenter defaultCenter] addObserver:self
+                                                     selector:@selector(screenParametersDidChange:)
+                                                         name:NSApplicationDidChangeScreenParametersNotification
+                                                       object:nil];
+            [[NSNotificationCenter defaultCenter] addObserver:self
+                                                     selector:@selector(screenParametersDidChange:)
+                                                         name:NSScreenColorSpaceDidChangeNotification
+                                                       object:nil];
+            [[[NSWorkspace sharedWorkspace] notificationCenter] addObserver:self
+                                                                    selector:@selector(screenParametersDidChange:)
+                                                                        name:NSWorkspaceDidWakeNotification
+                                                                      object:nil];
         }
         return self;
     }
 
     - (void) dealloc
     {
+        [[NSNotificationCenter defaultCenter] removeObserver:self];
+        [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
+        if (_sdrColorSpace) CGColorSpaceRelease(_sdrColorSpace);
         [_device release];
         [super dealloc];
+    }
+
+    - (enum macdrv_metal_color_result) applyColorConfig:(const struct macdrv_metal_color_config*)config
+    {
+        CAMetalLayer *layer = (CAMetalLayer*)self.layer;
+        CGColorSpaceRef color_space;
+        id edr_metadata = nil;
+        BOOL enable_edr;
+        enum macdrv_metal_color_result result;
+
+        if ((result = macdrv_validate_metal_color_config(config)) != MACDRV_METAL_COLOR_SUCCESS)
+            return result;
+        if (![layer isKindOfClass:[CAMetalLayer class]]) return MACDRV_METAL_COLOR_UNSUPPORTED;
+
+        if (config->color_space == MACDRV_METAL_COLOR_SPACE_SRGB)
+        {
+            if (config->pixel_format != MACDRV_METAL_PIXEL_FORMAT_PROVIDER || config->has_hdr10_metadata)
+                return MACDRV_METAL_COLOR_INVALID;
+
+            /* A never-HDR SDR swapchain retains the existing provider configuration. */
+            if (!_hdrLayerConfigured)
+            {
+                _colorConfig = *config;
+                _hasColorConfig = YES;
+                atomic_store_explicit(&_activeColorConfigKey, macdrv_metal_color_config_key(config),
+                                      memory_order_release);
+                atomic_store_explicit(&_activeDisplaySupported, true, memory_order_release);
+                return MACDRV_METAL_COLOR_SUCCESS;
+            }
+
+            atomic_store_explicit(&_activeDisplaySupported, false, memory_order_release);
+            _applyingColorConfig = YES;
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101500
+            if (@available(macOS 10.15, *)) layer.EDRMetadata = nil;
+#endif
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101100
+            if (@available(macOS 10.11, *)) layer.wantsExtendedDynamicRangeContent = NO;
+#endif
+            layer.colorspace = _sdrColorSpace;
+            [CATransaction commit];
+            _applyingColorConfig = NO;
+
+            if (_sdrColorSpace)
+            {
+                CGColorSpaceRelease(_sdrColorSpace);
+                _sdrColorSpace = NULL;
+            }
+            _hdrLayerConfigured = NO;
+            _colorConfig = *config;
+            _hasColorConfig = YES;
+            atomic_store_explicit(&_activeColorConfigKey, macdrv_metal_color_config_key(config),
+                                  memory_order_release);
+            atomic_store_explicit(&_activeDisplaySupported, true, memory_order_release);
+            return MACDRV_METAL_COLOR_SUCCESS;
+        }
+
+#if MAC_OS_X_VERSION_MAX_ALLOWED < 101100
+        return MACDRV_METAL_COLOR_UNSUPPORTED;
+#else
+        /* The current headroom is normally 1.0 until a layer requests EDR.
+         * Potential headroom is the non-circular public capability probe. */
+        enable_edr = macdrv_screen_supports_edr(self.window.screen);
+        if (!enable_edr) return MACDRV_METAL_COLOR_UNSUPPORTED;
+        if (!(color_space = macdrv_create_layer_color_space(config->color_space)))
+            return MACDRV_METAL_COLOR_UNSUPPORTED;
+
+        if (config->has_hdr10_metadata)
+        {
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101500
+            if (@available(macOS 10.15, *))
+            {
+                unsigned char display_bytes[24], content_bytes[4];
+                NSData *display_info, *content_info;
+
+                macdrv_serialize_hdr10_metadata(&config->hdr10_metadata, display_bytes, content_bytes);
+                display_info = [NSData dataWithBytes:display_bytes length:sizeof(display_bytes)];
+                content_info = [NSData dataWithBytes:content_bytes length:sizeof(content_bytes)];
+                edr_metadata = [CAEDRMetadata HDR10MetadataWithDisplayInfo:display_info
+                                                               contentInfo:content_info
+                                                        /* HDR10 uses a normalized 10-bit pixel format.  Apple's
+                                                         * public CAEDRMetadata contract requires 10,000 nits for
+                                                         * normalized content; 100 is the reference-white scale for
+                                                         * display-linear floating-point buffers. */
+                                                        opticalOutputScale:10000.0f];
+            }
+            else
+#endif
+            {
+                CGColorSpaceRelease(color_space);
+                return MACDRV_METAL_COLOR_UNSUPPORTED;
+            }
+            if (!edr_metadata)
+            {
+                CGColorSpaceRelease(color_space);
+                return MACDRV_METAL_COLOR_UNSUPPORTED;
+            }
+        }
+
+        atomic_store_explicit(&_activeDisplaySupported, false, memory_order_release);
+        if (!_hdrLayerConfigured)
+        {
+            if (layer.colorspace) _sdrColorSpace = CGColorSpaceRetain(layer.colorspace);
+        }
+
+        _applyingColorConfig = YES;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        /* MoltenVK owns pixelFormat and sets it from the selected VkFormat. */
+        layer.colorspace = color_space;
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101500
+        if (@available(macOS 10.15, *)) layer.EDRMetadata = edr_metadata;
+#endif
+        if (@available(macOS 10.11, *)) layer.wantsExtendedDynamicRangeContent = enable_edr;
+        [CATransaction commit];
+        _applyingColorConfig = NO;
+        CGColorSpaceRelease(color_space);
+
+        _hdrLayerConfigured = YES;
+        _colorConfig = *config;
+        _hasColorConfig = YES;
+        atomic_store_explicit(&_activeColorConfigKey, macdrv_metal_color_config_key(config),
+                              memory_order_release);
+        atomic_store_explicit(&_activeDisplaySupported, enable_edr, memory_order_release);
+        return MACDRV_METAL_COLOR_SUCCESS;
+#endif
+    }
+
+    - (enum macdrv_metal_color_result) supportsColorConfig:(const struct macdrv_metal_color_config*)config
+    {
+        CGColorSpaceRef color_space;
+        enum macdrv_metal_color_result result;
+
+        if ((result = macdrv_validate_metal_color_config(config)) != MACDRV_METAL_COLOR_SUCCESS)
+            return result;
+        if (config->color_space == MACDRV_METAL_COLOR_SPACE_SRGB)
+            return MACDRV_METAL_COLOR_SUCCESS;
+        if (!macdrv_screen_supports_edr(self.window.screen))
+            return MACDRV_METAL_COLOR_UNSUPPORTED;
+        if (!(color_space = macdrv_create_layer_color_space(config->color_space)))
+            return MACDRV_METAL_COLOR_UNSUPPORTED;
+        CGColorSpaceRelease(color_space);
+
+        if (config->has_hdr10_metadata)
+        {
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101500
+            if (@available(macOS 10.15, *)) return MACDRV_METAL_COLOR_SUCCESS;
+#endif
+            return MACDRV_METAL_COLOR_UNSUPPORTED;
+        }
+        return MACDRV_METAL_COLOR_SUCCESS;
+    }
+
+    - (enum macdrv_metal_color_result) setColorConfig:(const struct macdrv_metal_color_config*)config
+    {
+        if (!config) return MACDRV_METAL_COLOR_INVALID;
+        return [self applyColorConfig:config];
+    }
+
+    - (enum macdrv_metal_color_result) validateColorConfig:(const struct macdrv_metal_color_config*)config
+    {
+        enum macdrv_metal_color_result result;
+
+        if ((result = macdrv_validate_metal_color_config(config)) != MACDRV_METAL_COLOR_SUCCESS)
+            return result;
+        if (atomic_load_explicit(&_activeColorConfigKey, memory_order_acquire) !=
+                macdrv_metal_color_config_key(config) ||
+            !atomic_load_explicit(&_activeDisplaySupported, memory_order_acquire))
+            return MACDRV_METAL_COLOR_UNSUPPORTED;
+        return MACDRV_METAL_COLOR_SUCCESS;
+    }
+
+    - (enum macdrv_metal_color_result) setHDR10Metadata:(const struct macdrv_hdr10_metadata*)metadata
+    {
+        struct macdrv_metal_color_config config;
+
+        if (!_hasColorConfig || _colorConfig.color_space != MACDRV_METAL_COLOR_SPACE_HDR10_PQ_BT2020)
+            return MACDRV_METAL_COLOR_UNSUPPORTED;
+        if (metadata && !macdrv_hdr10_metadata_is_valid(metadata))
+            return MACDRV_METAL_COLOR_INVALID;
+
+        config = _colorConfig;
+        config.has_hdr10_metadata = !!metadata;
+        if (metadata) config.hdr10_metadata = *metadata;
+        else memset(&config.hdr10_metadata, 0, sizeof(config.hdr10_metadata));
+        return [self applyColorConfig:&config];
+    }
+
+    - (void) screenConfigurationChanged
+    {
+        if (_applyingColorConfig) return;
+        if (_hasColorConfig && _colorConfig.color_space != MACDRV_METAL_COLOR_SPACE_SRGB)
+        {
+            BOOL supported = macdrv_screen_supports_edr(self.window.screen);
+
+            if (supported == atomic_load_explicit(&_activeDisplaySupported, memory_order_acquire))
+                return;
+            if ([self applyColorConfig:&_colorConfig] != MACDRV_METAL_COLOR_SUCCESS)
+                atomic_store_explicit(&_activeDisplaySupported, false, memory_order_release);
+        }
+    }
+
+    - (void) screenParametersDidChange:(NSNotification*)notification
+    {
+        if ([NSThread isMainThread])
+            [self screenConfigurationChanged];
+        else
+            OnMainThreadAsync(^{ [self screenConfigurationChanged]; });
     }
 
     - (void) setRetinaMode:(BOOL)mode
     {
         self.layer.contentsScale = mode ? 2.0 : 1.0;
         [super setRetinaMode:mode];
+    }
+
+    - (void) viewDidMoveToWindow
+    {
+        [super viewDidMoveToWindow];
+        [self screenConfigurationChanged];
+    }
+
+    - (void) viewDidChangeBackingProperties
+    {
+        [super viewDidChangeBackingProperties];
+        [self screenConfigurationChanged];
     }
 
     - (CALayer*) makeBackingLayer
@@ -3886,6 +4216,7 @@ static void WineCompositorDetachView(WineContentView* view)
 
     - (void) windowDidChangeScreen:(NSNotification*)notification
     {
+        [(WineContentView*)self.contentView windowScreenConfigurationChanged];
         [self checkWineDisplayLink];
     }
 
@@ -4968,6 +5299,10 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 @protocol WineMetalSwapChain <NSObject>
 
 - (CAMetalLayer*) layer;
+- (enum macdrv_metal_color_result) supportsColorConfig:(const struct macdrv_metal_color_config*)config;
+- (enum macdrv_metal_color_result) setColorConfig:(const struct macdrv_metal_color_config*)config;
+- (enum macdrv_metal_color_result) validateColorConfig:(const struct macdrv_metal_color_config*)config;
+- (enum macdrv_metal_color_result) setHDR10Metadata:(const struct macdrv_hdr10_metadata*)metadata;
 
 @end
 
@@ -5006,6 +5341,44 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 - (CAMetalLayer*) layer
 {
     return (CAMetalLayer*)macdrv_view_get_metal_layer(metal_view);
+}
+
+- (enum macdrv_metal_color_result) setColorConfig:(const struct macdrv_metal_color_config*)config
+{
+    __block enum macdrv_metal_color_result result;
+
+    if ([NSThread isMainThread])
+        result = [(WineMetalView*)metal_view setColorConfig:config];
+    else
+        OnMainThread(^{ result = [(WineMetalView*)metal_view setColorConfig:config]; });
+    return result;
+}
+
+- (enum macdrv_metal_color_result) supportsColorConfig:(const struct macdrv_metal_color_config*)config
+{
+    __block enum macdrv_metal_color_result result;
+
+    if ([NSThread isMainThread])
+        result = [(WineMetalView*)metal_view supportsColorConfig:config];
+    else
+        OnMainThread(^{ result = [(WineMetalView*)metal_view supportsColorConfig:config]; });
+    return result;
+}
+
+- (enum macdrv_metal_color_result) validateColorConfig:(const struct macdrv_metal_color_config*)config
+{
+    return [(WineMetalView*)metal_view validateColorConfig:config];
+}
+
+- (enum macdrv_metal_color_result) setHDR10Metadata:(const struct macdrv_hdr10_metadata*)metadata
+{
+    __block enum macdrv_metal_color_result result;
+
+    if ([NSThread isMainThread])
+        result = [(WineMetalView*)metal_view setHDR10Metadata:metadata];
+    else
+        OnMainThread(^{ result = [(WineMetalView*)metal_view setHDR10Metadata:metadata]; });
+    return result;
 }
 
 - (void) dealloc
@@ -5645,6 +6018,31 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     return offscreen_layer;
 }
 
+- (enum macdrv_metal_color_result) setColorConfig:(const struct macdrv_metal_color_config*)config
+{
+    enum macdrv_metal_color_result result = macdrv_validate_metal_color_config(config);
+
+    if (result != MACDRV_METAL_COLOR_SUCCESS) return result;
+    return config->color_space == MACDRV_METAL_COLOR_SPACE_SRGB ?
+            MACDRV_METAL_COLOR_SUCCESS : MACDRV_METAL_COLOR_UNSUPPORTED;
+}
+
+- (enum macdrv_metal_color_result) supportsColorConfig:(const struct macdrv_metal_color_config*)config
+{
+    return [self setColorConfig:config];
+}
+
+- (enum macdrv_metal_color_result) validateColorConfig:(const struct macdrv_metal_color_config*)config
+{
+    return [self setColorConfig:config];
+}
+
+- (enum macdrv_metal_color_result) setHDR10Metadata:(const struct macdrv_hdr10_metadata*)metadata
+{
+    return metadata && !macdrv_hdr10_metadata_is_valid(metadata) ?
+            MACDRV_METAL_COLOR_INVALID : MACDRV_METAL_COLOR_UNSUPPORTED;
+}
+
 - (void) ensureRemoteLayerRegistered
 {
     BOOL attach = NO, attached, release_attached = NO;
@@ -5727,6 +6125,34 @@ macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* source_hwnd, CGRe
 macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain)
 {
     return (macdrv_metal_layer)[(id<WineMetalSwapChain>)swapchain layer];
+}
+
+enum macdrv_metal_color_result macdrv_swapchain_supports_color_config(
+        macdrv_metal_swapchain swapchain, const struct macdrv_metal_color_config *config)
+{
+    if (!swapchain || !config) return MACDRV_METAL_COLOR_INVALID;
+    return [(id<WineMetalSwapChain>)swapchain supportsColorConfig:config];
+}
+
+enum macdrv_metal_color_result macdrv_swapchain_set_color_config(
+        macdrv_metal_swapchain swapchain, const struct macdrv_metal_color_config *config)
+{
+    if (!swapchain || !config) return MACDRV_METAL_COLOR_INVALID;
+    return [(id<WineMetalSwapChain>)swapchain setColorConfig:config];
+}
+
+enum macdrv_metal_color_result macdrv_swapchain_validate_color_config(
+        macdrv_metal_swapchain swapchain, const struct macdrv_metal_color_config *config)
+{
+    if (!swapchain || !config) return MACDRV_METAL_COLOR_INVALID;
+    return [(id<WineMetalSwapChain>)swapchain validateColorConfig:config];
+}
+
+enum macdrv_metal_color_result macdrv_swapchain_set_hdr10_metadata(
+        macdrv_metal_swapchain swapchain, const struct macdrv_hdr10_metadata *metadata)
+{
+    if (!swapchain) return MACDRV_METAL_COLOR_INVALID;
+    return [(id<WineMetalSwapChain>)swapchain setHDR10Metadata:metadata];
 }
 
 

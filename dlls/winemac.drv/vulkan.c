@@ -28,6 +28,7 @@
 #include "config.h"
 
 #include <dlfcn.h>
+#include <math.h>
 
 #include "ntstatus.h"
 #include "macdrv.h"
@@ -39,6 +40,138 @@
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs;
+
+static BOOL macdrv_color_config_from_vk(VkFormat format, VkColorSpaceKHR color_space,
+        struct macdrv_metal_color_config *config)
+{
+    memset(config, 0, sizeof(*config));
+
+    switch (color_space)
+    {
+        case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+            config->color_space = MACDRV_METAL_COLOR_SPACE_SRGB;
+            config->pixel_format = MACDRV_METAL_PIXEL_FORMAT_PROVIDER;
+            return TRUE;
+
+        case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+            if (format != VK_FORMAT_R16G16B16A16_SFLOAT) return FALSE;
+            config->color_space = MACDRV_METAL_COLOR_SPACE_EXTENDED_LINEAR_SRGB;
+            config->pixel_format = MACDRV_METAL_PIXEL_FORMAT_RGBA16_FLOAT;
+            return TRUE;
+
+        case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+            if (format != VK_FORMAT_A2B10G10R10_UNORM_PACK32) return FALSE;
+            config->color_space = MACDRV_METAL_COLOR_SPACE_HDR10_PQ_BT2020;
+            config->pixel_format = MACDRV_METAL_PIXEL_FORMAT_RGB10A2_UNORM;
+            return TRUE;
+
+        default:
+            return FALSE;
+    }
+}
+
+static VkResult macdrv_color_result_to_vk(enum macdrv_metal_color_result result, BOOL validation)
+{
+    switch (result)
+    {
+        case MACDRV_METAL_COLOR_SUCCESS:
+            return VK_SUCCESS;
+        case MACDRV_METAL_COLOR_UNSUPPORTED:
+            return validation ? VK_ERROR_OUT_OF_DATE_KHR : VK_ERROR_INITIALIZATION_FAILED;
+        default:
+            return VK_ERROR_INITIALIZATION_FAILED;
+    }
+}
+
+static VkBool32 macdrv_surface_supports_format(struct client_surface *client, VkFormat format,
+        VkColorSpaceKHR color_space)
+{
+    struct macdrv_metal_color_config config;
+
+    if (!macdrv_color_config_from_vk(format, color_space, &config)) return VK_FALSE;
+    return macdrv_client_surface_supports_color_config(impl_from_client_surface(client), &config)
+            == MACDRV_METAL_COLOR_SUCCESS;
+}
+
+static VkResult macdrv_surface_configure(struct client_surface *client, const VkSurfaceFormatKHR *format)
+{
+    struct macdrv_metal_color_config config;
+
+    if (!format)
+    {
+        memset(&config, 0, sizeof(config));
+        config.color_space = MACDRV_METAL_COLOR_SPACE_SRGB;
+        config.pixel_format = MACDRV_METAL_PIXEL_FORMAT_PROVIDER;
+    }
+    else if (!macdrv_color_config_from_vk(format->format, format->colorSpace, &config))
+    {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    return macdrv_color_result_to_vk(macdrv_client_surface_set_color_config(
+            impl_from_client_surface(client), &config), FALSE);
+}
+
+static VkResult macdrv_surface_validate(struct client_surface *client, const VkSurfaceFormatKHR *format)
+{
+    struct macdrv_metal_color_config config;
+
+    if (!format || !macdrv_color_config_from_vk(format->format, format->colorSpace, &config))
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    return macdrv_color_result_to_vk(macdrv_client_surface_validate_color_config(
+            impl_from_client_surface(client), &config), TRUE);
+}
+
+static BOOL macdrv_vk_chromaticity_to_uint16(const VkXYColorEXT *value, uint16_t result[2])
+{
+    double x, y;
+
+    if (!isfinite(value->x) || !isfinite(value->y) || value->x < 0.0f || value->y < 0.0f
+            || value->x > 1.0f || value->y > 1.0f || value->x + value->y > 1.0f)
+        return FALSE;
+    x = value->x * 50000.0;
+    y = value->y * 50000.0;
+    if (x > UINT16_MAX || y > UINT16_MAX) return FALSE;
+    result[0] = lround(x);
+    result[1] = lround(y);
+    return TRUE;
+}
+
+static VkResult macdrv_surface_set_hdr_metadata(struct client_surface *client,
+        const VkHdrMetadataEXT *metadata)
+{
+    struct macdrv_hdr10_metadata hdr10;
+
+    if (!metadata)
+        return macdrv_color_result_to_vk(macdrv_client_surface_set_hdr10_metadata(
+                impl_from_client_surface(client), NULL), FALSE);
+
+    memset(&hdr10, 0, sizeof(hdr10));
+    if (metadata->sType != VK_STRUCTURE_TYPE_HDR_METADATA_EXT
+            || !macdrv_vk_chromaticity_to_uint16(&metadata->displayPrimaryRed, hdr10.red_primary)
+            || !macdrv_vk_chromaticity_to_uint16(&metadata->displayPrimaryGreen, hdr10.green_primary)
+            || !macdrv_vk_chromaticity_to_uint16(&metadata->displayPrimaryBlue, hdr10.blue_primary)
+            || !macdrv_vk_chromaticity_to_uint16(&metadata->whitePoint, hdr10.white_point)
+            || !isfinite(metadata->maxLuminance) || metadata->maxLuminance < 0.0f
+            || metadata->maxLuminance > 10000.0f
+            || !isfinite(metadata->minLuminance) || metadata->minLuminance < 0.0f
+            || (metadata->maxLuminance && metadata->minLuminance > metadata->maxLuminance)
+            || !isfinite(metadata->maxContentLightLevel) || metadata->maxContentLightLevel < 0.0f
+            || metadata->maxContentLightLevel > 10000.0f
+            || !isfinite(metadata->maxFrameAverageLightLevel)
+            || metadata->maxFrameAverageLightLevel < 0.0f
+            || metadata->maxFrameAverageLightLevel > 10000.0f
+            || (metadata->maxContentLightLevel && metadata->maxFrameAverageLightLevel >
+                    metadata->maxContentLightLevel))
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    hdr10.max_mastering_luminance = lround(metadata->maxLuminance * 10000.0);
+    hdr10.min_mastering_luminance = lround(metadata->minLuminance * 10000.0);
+    hdr10.max_content_light_level = lround(metadata->maxContentLightLevel);
+    hdr10.max_frame_average_light_level = lround(metadata->maxFrameAverageLightLevel);
+    return macdrv_color_result_to_vk(macdrv_client_surface_set_hdr10_metadata(
+            impl_from_client_surface(client), &hdr10), FALSE);
+}
 
 static VkResult macdrv_vulkan_surface_create(struct client_surface *client, const struct vulkan_instance *instance, VkSurfaceKHR *handle)
 {
@@ -105,6 +238,10 @@ static void macdrv_map_device_extensions(struct vulkan_device_extensions *extens
 static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = macdrv_vulkan_surface_create,
+    .p_surface_supports_format = macdrv_surface_supports_format,
+    .p_surface_configure = macdrv_surface_configure,
+    .p_surface_validate = macdrv_surface_validate,
+    .p_surface_set_hdr_metadata = macdrv_surface_set_hdr_metadata,
     .p_get_physical_device_presentation_support = macdrv_get_physical_device_presentation_support,
     .p_map_instance_extensions = macdrv_map_instance_extensions,
     .p_map_device_extensions = macdrv_map_device_extensions,

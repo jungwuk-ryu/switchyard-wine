@@ -89,7 +89,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 48
+#define WINE_VULKAN_DRIVER_VERSION 49
 
 struct vulkan_object
 {
@@ -351,6 +351,7 @@ struct vulkan_funcs
     PFN_vkQueueSubmit p_vkQueueSubmit;
     PFN_vkQueueSubmit2 p_vkQueueSubmit2;
     PFN_vkQueueSubmit2KHR p_vkQueueSubmit2KHR;
+    PFN_vkSetHdrMetadataEXT p_vkSetHdrMetadataEXT;
     PFN_vkUnmapMemory p_vkUnmapMemory;
     PFN_vkUnmapMemory2KHR p_vkUnmapMemory2KHR;
 };
@@ -360,6 +361,10 @@ struct client_surface;
 struct vulkan_driver_funcs
 {
     VkResult (*p_vulkan_surface_create)(struct client_surface *, const struct vulkan_instance *, VkSurfaceKHR *);
+    VkBool32 (*p_surface_supports_format)(struct client_surface *, VkFormat, VkColorSpaceKHR);
+    VkResult (*p_surface_configure)(struct client_surface *, const VkSurfaceFormatKHR *);
+    VkResult (*p_surface_validate)(struct client_surface *, const VkSurfaceFormatKHR *);
+    VkResult (*p_surface_set_hdr_metadata)(struct client_surface *, const VkHdrMetadataEXT *);
     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);
     void (*p_map_instance_extensions)( struct vulkan_instance_extensions *extensions );
     void (*p_map_device_extensions)( struct vulkan_device_extensions *extensions );

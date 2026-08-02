@@ -4075,28 +4075,6 @@ typedef struct VkGraphicsPipelineShaderGroupsCreateInfoNV32
     PTR32 pPipelines;
 } VkGraphicsPipelineShaderGroupsCreateInfoNV32;
 
-typedef struct VkHdrMetadataEXT32
-{
-    VkStructureType sType;
-    PTR32 pNext;
-    VkXYColorEXT displayPrimaryRed;
-    VkXYColorEXT displayPrimaryGreen;
-    VkXYColorEXT displayPrimaryBlue;
-    VkXYColorEXT whitePoint;
-    float maxLuminance;
-    float minLuminance;
-    float maxContentLightLevel;
-    float maxFrameAverageLightLevel;
-} VkHdrMetadataEXT32;
-
-typedef struct VkHdrVividDynamicMetadataHUAWEI32
-{
-    VkStructureType sType;
-    PTR32 pNext;
-    PTR32 dynamicMetadataSize;
-    PTR32 pDynamicMetadata;
-} VkHdrVividDynamicMetadataHUAWEI32;
-
 typedef struct VkHostAddressRangeEXT32
 {
     PTR32 address;
@@ -49538,97 +49516,6 @@ static void convert_VkGpaDeviceClockModeInfoAMD_host_to_win32(const VkGpaDeviceC
     out->engineClockRatioToPeak = in->engineClockRatioToPeak;
 }
 
-#ifdef _WIN64
-static const VkSwapchainKHR *convert_VkSwapchainKHR_array_win64_to_host(struct conversion_context *ctx, const VkSwapchainKHR *in, uint32_t count)
-{
-    VkSwapchainKHR *out;
-    unsigned int i;
-
-    if (!in || !count) return NULL;
-
-    out = conversion_context_alloc(ctx, count * sizeof(*out));
-    for (i = 0; i < count; i++)
-    {
-        out[i] = vulkan_swapchain_from_handle(in[i])->host.swapchain;
-    }
-
-    return out;
-}
-#endif /* _WIN64 */
-
-static const VkSwapchainKHR *convert_VkSwapchainKHR_array_win32_to_host(struct conversion_context *ctx, const VkSwapchainKHR *in, uint32_t count)
-{
-    VkSwapchainKHR *out;
-    unsigned int i;
-
-    if (!in || !count) return NULL;
-
-    out = conversion_context_alloc(ctx, count * sizeof(*out));
-    for (i = 0; i < count; i++)
-    {
-        out[i] = vulkan_swapchain_from_handle(in[i])->host.swapchain;
-    }
-
-    return out;
-}
-
-static void convert_VkHdrMetadataEXT_win32_to_host(struct conversion_context *ctx, const VkHdrMetadataEXT32 *in, VkHdrMetadataEXT *out)
-{
-    const VkBaseInStructure32 *in_header;
-    VkBaseOutStructure *out_header = (void *)out;
-
-    if (!in) return;
-
-    out->sType = in->sType;
-    out->pNext = NULL;
-    out->displayPrimaryRed = in->displayPrimaryRed;
-    out->displayPrimaryGreen = in->displayPrimaryGreen;
-    out->displayPrimaryBlue = in->displayPrimaryBlue;
-    out->whitePoint = in->whitePoint;
-    out->maxLuminance = in->maxLuminance;
-    out->minLuminance = in->minLuminance;
-    out->maxContentLightLevel = in->maxContentLightLevel;
-    out->maxFrameAverageLightLevel = in->maxFrameAverageLightLevel;
-
-    for (in_header = UlongToPtr(in->pNext); in_header; in_header = UlongToPtr(in_header->pNext))
-    {
-        switch (in_header->sType)
-        {
-        case VK_STRUCTURE_TYPE_HDR_VIVID_DYNAMIC_METADATA_HUAWEI:
-        {
-            VkHdrVividDynamicMetadataHUAWEI *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
-            const VkHdrVividDynamicMetadataHUAWEI32 *in_ext = (const VkHdrVividDynamicMetadataHUAWEI32 *)in_header;
-            out_ext->sType = VK_STRUCTURE_TYPE_HDR_VIVID_DYNAMIC_METADATA_HUAWEI;
-            out_ext->pNext = NULL;
-            out_ext->dynamicMetadataSize = in_ext->dynamicMetadataSize;
-            out_ext->pDynamicMetadata = UlongToPtr(in_ext->pDynamicMetadata);
-            out_header->pNext = (void *)out_ext;
-            out_header = (void *)out_ext;
-            break;
-        }
-        default:
-            FIXME("Unhandled sType %u.\n", in_header->sType);
-            break;
-        }
-    }
-}
-
-static const VkHdrMetadataEXT *convert_VkHdrMetadataEXT_array_win32_to_host(struct conversion_context *ctx, const VkHdrMetadataEXT32 *in, uint32_t count)
-{
-    VkHdrMetadataEXT *out;
-    unsigned int i;
-
-    if (!in || !count) return NULL;
-
-    out = conversion_context_alloc(ctx, count * sizeof(*out));
-    for (i = 0; i < count; i++)
-    {
-        convert_VkHdrMetadataEXT_win32_to_host(ctx, &in[i], &out[i]);
-    }
-
-    return out;
-}
-
 static void convert_VkSetLatencyMarkerInfoNV_win32_to_host(const VkSetLatencyMarkerInfoNV32 *in, VkSetLatencyMarkerInfoNV *out)
 {
     if (!in) return;
@@ -70277,16 +70164,35 @@ static NTSTATUS thunk32_vkSetGpaDeviceClockModeAMD(void *args)
 static NTSTATUS thunk64_vkSetHdrMetadataEXT(void *args)
 {
     struct vkSetHdrMetadataEXT_params *params = args;
-    const VkSwapchainKHR *pSwapchains_host;
-    struct conversion_context local_ctx;
-    struct conversion_context *ctx = &local_ctx;
 
     TRACE("%p, %u, %p, %p\n", params->device, params->swapchainCount, params->pSwapchains, params->pMetadata);
 
-    init_conversion_context(ctx);
-    pSwapchains_host = convert_VkSwapchainKHR_array_win64_to_host(ctx, params->pSwapchains, params->swapchainCount);
-    vulkan_device_from_handle(params->device)->p_vkSetHdrMetadataEXT(vulkan_device_from_handle(params->device)->host.device, params->swapchainCount, pSwapchains_host, params->pMetadata);
-    free_conversion_context(ctx);
+    if (params->swapchainCount > 4096)
+    {
+        ERR("Refusing %u HDR metadata swapchains before conversion.\n", params->swapchainCount);
+        return STATUS_SUCCESS;
+    }
+
+    if (params->swapchainCount && (!params->pSwapchains || !params->pMetadata))
+    {
+        ERR("Invalid HDR metadata pointer arguments before conversion.\n");
+        return STATUS_SUCCESS;
+    }
+
+    for (uint32_t i = 0; i < params->swapchainCount; ++i)
+    {
+        const VkHdrVividDynamicMetadataHUAWEI *vivid = params->pMetadata[i].pNext;
+
+        if (params->pMetadata[i].sType != VK_STRUCTURE_TYPE_HDR_METADATA_EXT ||
+            (vivid && (vivid->sType != VK_STRUCTURE_TYPE_HDR_VIVID_DYNAMIC_METADATA_HUAWEI ||
+            vivid->pNext || !vivid->dynamicMetadataSize || !vivid->pDynamicMetadata)))
+        {
+            ERR("Invalid HDR metadata structure before dispatch.\n");
+            return STATUS_SUCCESS;
+        }
+    }
+
+    vk_funcs->p_vkSetHdrMetadataEXT(params->device, params->swapchainCount, params->pSwapchains, params->pMetadata);
     return STATUS_SUCCESS;
 }
 #endif /* _WIN64 */
@@ -70300,18 +70206,80 @@ static NTSTATUS thunk32_vkSetHdrMetadataEXT(void *args)
         PTR32 pSwapchains;
         PTR32 pMetadata;
     } *params = args;
-    const VkSwapchainKHR *pSwapchains_host;
-    const VkHdrMetadataEXT *pMetadata_host;
-    struct conversion_context local_ctx;
-    struct conversion_context *ctx = &local_ctx;
+
+    struct VkHdrMetadataEXT32
+    {
+        VkStructureType sType;
+        PTR32 pNext;
+        VkXYColorEXT displayPrimaryRed;
+        VkXYColorEXT displayPrimaryGreen;
+        VkXYColorEXT displayPrimaryBlue;
+        VkXYColorEXT whitePoint;
+        float maxLuminance;
+        float minLuminance;
+        float maxContentLightLevel;
+        float maxFrameAverageLightLevel;
+    };
+    struct VkHdrVividDynamicMetadataHUAWEI32
+    {
+        VkStructureType sType;
+        PTR32 pNext;
+        uint32_t dynamicMetadataSize;
+        PTR32 pDynamicMetadata;
+    };
+    const VkSwapchainKHR *swapchains = (const VkSwapchainKHR *)UlongToPtr(params->pSwapchains);
+    const struct VkHdrMetadataEXT32 *metadata = (const struct VkHdrMetadataEXT32 *)UlongToPtr(params->pMetadata);
+    uint32_t offset = 0;
 
     TRACE("%#x, %u, %#x, %#x\n", params->device, params->swapchainCount, params->pSwapchains, params->pMetadata);
 
-    init_conversion_context(ctx);
-    pSwapchains_host = convert_VkSwapchainKHR_array_win32_to_host(ctx, (const VkSwapchainKHR *)UlongToPtr(params->pSwapchains), params->swapchainCount);
-    pMetadata_host = convert_VkHdrMetadataEXT_array_win32_to_host(ctx, (const VkHdrMetadataEXT32 *)UlongToPtr(params->pMetadata), params->swapchainCount);
-    vulkan_device_from_handle((VkDevice)UlongToPtr(params->device))->p_vkSetHdrMetadataEXT(vulkan_device_from_handle((VkDevice)UlongToPtr(params->device))->host.device, params->swapchainCount, pSwapchains_host, pMetadata_host);
-    free_conversion_context(ctx);
+    if (params->swapchainCount > 4096 || (params->swapchainCount && (!swapchains || !metadata)))
+    {
+        ERR("Invalid HDR metadata list before conversion, count %u.\n", params->swapchainCount);
+        return STATUS_SUCCESS;
+    }
+
+    while (offset < params->swapchainCount)
+    {
+        VkHdrMetadataEXT converted[32];
+        VkHdrVividDynamicMetadataHUAWEI converted_vivid[32];
+        uint32_t count = min(ARRAY_SIZE(converted), params->swapchainCount - offset);
+        uint32_t i;
+
+        for (i = 0; i < count; ++i)
+        {
+            const struct VkHdrVividDynamicMetadataHUAWEI32 *vivid =
+                    (const struct VkHdrVividDynamicMetadataHUAWEI32 *)UlongToPtr(metadata[offset + i].pNext);
+
+            if (metadata[offset + i].sType != VK_STRUCTURE_TYPE_HDR_METADATA_EXT ||
+                (vivid && (vivid->sType != VK_STRUCTURE_TYPE_HDR_VIVID_DYNAMIC_METADATA_HUAWEI ||
+                vivid->pNext || !vivid->dynamicMetadataSize || !vivid->pDynamicMetadata)))
+            {
+                ERR("Invalid HDR metadata structure before conversion.\n");
+                return STATUS_SUCCESS;
+            }
+            converted[i].sType = metadata[offset + i].sType;
+            if (vivid)
+            {
+                converted_vivid[i].sType = vivid->sType;
+                converted_vivid[i].pNext = NULL;
+                converted_vivid[i].dynamicMetadataSize = vivid->dynamicMetadataSize;
+                converted_vivid[i].pDynamicMetadata = UlongToPtr(vivid->pDynamicMetadata);
+                converted[i].pNext = &converted_vivid[i];
+            }
+            else converted[i].pNext = NULL;
+            converted[i].displayPrimaryRed = metadata[offset + i].displayPrimaryRed;
+            converted[i].displayPrimaryGreen = metadata[offset + i].displayPrimaryGreen;
+            converted[i].displayPrimaryBlue = metadata[offset + i].displayPrimaryBlue;
+            converted[i].whitePoint = metadata[offset + i].whitePoint;
+            converted[i].maxLuminance = metadata[offset + i].maxLuminance;
+            converted[i].minLuminance = metadata[offset + i].minLuminance;
+            converted[i].maxContentLightLevel = metadata[offset + i].maxContentLightLevel;
+            converted[i].maxFrameAverageLightLevel = metadata[offset + i].maxFrameAverageLightLevel;
+        }
+        vk_funcs->p_vkSetHdrMetadataEXT((VkDevice)UlongToPtr(params->device), count, swapchains + offset, converted);
+        offset += count;
+    }
     return STATUS_SUCCESS;
 }
 
