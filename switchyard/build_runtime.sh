@@ -264,6 +264,7 @@ content_tree_is_verified() {
 
 SWITCHYARD_MANAGED_RUNTIME_ROOT="${HOME}/.switchyard/runtimes"
 source "$ROOT_DIR/switchyard/lib/directory_safety.sh"
+source "$ROOT_DIR/switchyard/lib/source_state.sh"
 
 source_tree_digest() {
   {
@@ -273,6 +274,24 @@ source_tree_digest() {
       sha256_file "$WINE_DIR/$path"
     done
   } | short_sha256_stream
+}
+
+assert_source_state_unchanged() {
+  local phase="$1"
+  local current_fingerprint
+  local current_revision
+
+  if ! current_revision="$(git -C "$WINE_DIR" rev-parse HEAD)" ||
+     ! current_fingerprint="$(switchyard_source_state_fingerprint "$WINE_DIR")"; then
+    echo "failed to verify the Wine source state after $phase" >&2
+    return 1
+  fi
+  if [ "$current_revision" != "$wine_revision" ] ||
+     [ "$current_fingerprint" != "$build_source_fingerprint" ]; then
+    echo "Wine source changed after runtime build metadata was captured ($phase)." >&2
+    echo "Refusing to publish a runtime assembled from multiple source states." >&2
+    return 1
+  fi
 }
 
 json_string() {
@@ -1723,6 +1742,7 @@ if ! git -C "$WINE_DIR" merge-base --is-ancestor "$upstream_wine_revision" HEAD;
 fi
 
 wine_revision="$(git -C "$WINE_DIR" rev-parse HEAD)"
+build_source_fingerprint="$(switchyard_source_state_fingerprint "$WINE_DIR")"
 source_status="$(git -C "$WINE_DIR" status --porcelain --untracked-files=normal)"
 if [ -n "$source_status" ]; then
   source_dirty=true
@@ -1737,6 +1757,7 @@ patchset_id="switchyard-wine-${wine_revision:0:12}"
 if [ -z "$USER_SET_WINE_BUILD_DIR" ]; then
   WINE_BUILD_DIR="${HOME}/Library/Caches/Switchyard/Wine/build-wow64-x86_64-${source_identity}"
 fi
+assert_source_state_unchanged "source metadata capture"
 if [ "$MODE" = "--source-info" ]; then
   echo "sourceRepository=$SOURCE_REPOSITORY"
   echo "sourceRevision=$wine_revision"
@@ -2068,8 +2089,10 @@ if [ "$configured" -eq 0 ]; then
   fi
 fi
 
+assert_source_state_unchanged "dependency preparation"
 echo "building Switchyard Wine with $JOBS jobs"
 make -C "$WINE_BUILD_DIR" -j"$JOBS"
+assert_source_state_unchanged "compilation"
 
 runtime_parent="$(dirname "$FINAL_WINE_INSTALL_PREFIX")"
 runtime_name="$(basename "$FINAL_WINE_INSTALL_PREFIX")"
@@ -2413,6 +2436,8 @@ wine_executable="$FINAL_WINE_INSTALL_PREFIX/bin/switchyard-wine"
 wine_unix_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-unix/wine")"
 i386_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/i386-windows/ntdll.dll")"
 x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows/ntdll.dll")"
+
+assert_source_state_unchanged "runtime assembly"
 
 {
   printf '{\n'

@@ -32,4 +32,6 @@ jobs:
       - name: Verify downstream history and source policy
         run: ./switchyard/verify_source.sh
       - name: Check runtime tooling syntax
-        run: bash -n switchyard/build_runtime.sh switchyard/release_runtime.sh switchyard/verify_tls_packages.sh switchyard/lib/gpu_capability_policy.sh switchyard/lib/directory_safety.sh switchyard/tests/amd_umd_loader_policy_test.sh switchyard/tests/assertion_logging_test.sh switchyard/tests/atiadl_provider_policy_test.sh switchyard/tests/gpu_capability_policy_test.sh switchyard/tests/graphics_adapter_identity_test.sh switchyard/tests/directory_safety_test.sh switchyard/tests/runtime_tls_smoke_test.sh switchyard/tests/wow64_large_address_aware_test.sh
+        run: bash -n switchyard/build_runtime.sh switchyard/release_runtime.sh switchyard/verify_tls_packages.sh switchyard/lib/gpu_capability_policy.sh switchyard/lib/directory_safety.sh switchyard/lib/source_state.sh switchyard/tests/amd_umd_loader_policy_test.sh switchyard/tests/assertion_logging_test.sh switchyard/tests/atiadl_provider_policy_test.sh switchyard/tests/gpu_capability_policy_test.sh switchyard/tests/graphics_adapter_identity_test.sh switchyard/tests/directory_safety_test.sh switchyard/tests/source_state_test.sh switchyard/tests/runtime_tls_smoke_test.sh switchyard/tests/wow64_large_address_aware_test.sh
+      - name: Verify runtime source-state guard
+        run: ./switchyard/tests/source_state_test.sh

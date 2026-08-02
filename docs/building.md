@@ -125,6 +125,13 @@ The destructive-promotion guard has a local macOS regression test:
 ./switchyard/tests/directory_safety_test.sh
 ```
 
+The runtime builder also rejects a checkout that changes after it captures the
+source revision. Exercise that source-state fingerprint independently with:
+
+```sh
+./switchyard/tests/source_state_test.sh
+```
+
 After building, exercise the runtime-local GnuTLS closure through Wine's WinHTTP
 implementation with:
 
