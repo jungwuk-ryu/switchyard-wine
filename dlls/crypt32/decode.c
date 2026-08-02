@@ -6381,7 +6381,7 @@ static BOOL CRYPT_AsnDecodeCertStatus(const BYTE *pbEncoded,
  DWORD *pcbDecoded)
 {
     BOOL ret = TRUE;
-    BYTE tag = pbEncoded[0] & ~3, status = pbEncoded[0] & 3;
+    BYTE tag, status;
     DWORD bytesNeeded = FIELD_OFFSET(OCSP_BASIC_RESPONSE_ENTRY, ThisUpdate) -
                         FIELD_OFFSET(OCSP_BASIC_RESPONSE_ENTRY, dwCertStatus);
 
@@ -6390,6 +6390,8 @@ static BOOL CRYPT_AsnDecodeCertStatus(const BYTE *pbEncoded,
         SetLastError(CRYPT_E_ASN1_EOD);
         return FALSE;
     }
+    tag = pbEncoded[0] & ~3;
+    status = pbEncoded[0] & 3;
 
     switch (status)
     {
@@ -6437,38 +6439,84 @@ static BOOL CRYPT_AsnDecodeCertStatus(const BYTE *pbEncoded,
         if ((ret = CRYPT_GetLen(pbEncoded, cbEncoded, &dataLen)))
         {
             BYTE lenBytes = GET_LEN_BYTES(pbEncoded[1]);
-            DWORD bytesDecoded, size;
+            DWORD bytesDecoded, reasonDecoded, reasonLen, size;
+            const BYTE *reasonEncoded;
             FILETIME date;
+            DWORD reason = CRL_REASON_UNSPECIFIED;
 
-            if (dataLen)
+            if (!dataLen)
             {
-                size = sizeof(date);
-                ret = CRYPT_AsnDecodeGeneralizedTime(pbEncoded + 1 + lenBytes, cbEncoded - 1 - lenBytes,
-                 dwFlags, &date, &size, &bytesDecoded);
-                if (ret)
-                {
-                    OCSP_BASIC_REVOKED_INFO *info;
+                SetLastError(CRYPT_E_ASN1_CORRUPT);
+                return FALSE;
+            }
+            size = sizeof(date);
+            ret = CRYPT_AsnDecodeGeneralizedTime(pbEncoded + 1 + lenBytes,
+                    dataLen, dwFlags, &date, &size, &bytesDecoded);
+            if (ret && bytesDecoded > dataLen)
+            {
+                SetLastError(CRYPT_E_ASN1_CORRUPT);
+                ret = FALSE;
+            }
+            if (ret && bytesDecoded < dataLen)
+            {
+                BYTE reasonLenBytes;
+                DWORD reasonSize = sizeof(reason);
 
-                    bytesNeeded += sizeof(*info);
-                    if (!pvStructInfo)
-                        *pcbStructInfo = bytesNeeded;
-                    else if (*pcbStructInfo < bytesNeeded)
-                    {
-                        *pcbStructInfo = bytesNeeded;
-                        SetLastError(ERROR_MORE_DATA);
-                        return FALSE;
-                    }
-                    if (pvStructInfo)
-                    {
-                        *(DWORD *)pvStructInfo = 1;
-                        info = *(OCSP_BASIC_REVOKED_INFO **)((char *)pvStructInfo
-                            + FIELD_OFFSET(OCSP_BASIC_RESPONSE_ENTRY, pRevokedInfo)
-                            - FIELD_OFFSET(OCSP_BASIC_RESPONSE_ENTRY, dwCertStatus));
-                        info->RevocationDate = date;
-                    }
-                    *pcbStructInfo = bytesNeeded;
-                    *pcbDecoded = 1 + lenBytes + bytesDecoded;
+                reasonEncoded = pbEncoded + 1 + lenBytes + bytesDecoded;
+                if (reasonEncoded[0] != (ASN_CONTEXT | ASN_CONSTRUCTOR))
+                {
+                    SetLastError(CRYPT_E_ASN1_BADTAG);
+                    ret = FALSE;
                 }
+                else if (!CRYPT_GetLen(reasonEncoded,
+                        dataLen - bytesDecoded, &reasonLen))
+                    ret = FALSE;
+                else
+                {
+                    reasonLenBytes = GET_LEN_BYTES(reasonEncoded[1]);
+                    if (1 + reasonLenBytes + reasonLen !=
+                            dataLen - bytesDecoded || !reasonLen)
+                    {
+                        SetLastError(CRYPT_E_ASN1_CORRUPT);
+                        ret = FALSE;
+                    }
+                    else
+                    {
+                        ret = CRYPT_AsnDecodeOCSPResponseStatus(reasonEncoded +
+                                1 + reasonLenBytes, reasonLen, dwFlags,
+                                &reason, &reasonSize, &reasonDecoded);
+                        if (ret && reasonDecoded != reasonLen)
+                        {
+                            SetLastError(CRYPT_E_ASN1_CORRUPT);
+                            ret = FALSE;
+                        }
+                    }
+                }
+            }
+            if (ret)
+            {
+                OCSP_BASIC_REVOKED_INFO *info;
+
+                bytesNeeded += sizeof(*info);
+                if (!pvStructInfo)
+                    *pcbStructInfo = bytesNeeded;
+                else if (*pcbStructInfo < bytesNeeded)
+                {
+                    *pcbStructInfo = bytesNeeded;
+                    SetLastError(ERROR_MORE_DATA);
+                    return FALSE;
+                }
+                if (pvStructInfo)
+                {
+                    *(DWORD *)pvStructInfo = 1;
+                    info = *(OCSP_BASIC_REVOKED_INFO **)((char *)pvStructInfo
+                        + FIELD_OFFSET(OCSP_BASIC_RESPONSE_ENTRY, pRevokedInfo)
+                        - FIELD_OFFSET(OCSP_BASIC_RESPONSE_ENTRY, dwCertStatus));
+                    info->RevocationDate = date;
+                    info->dwCrlReasonCode = reason;
+                }
+                *pcbStructInfo = bytesNeeded;
+                *pcbDecoded = 1 + lenBytes + dataLen;
             }
         }
         break;

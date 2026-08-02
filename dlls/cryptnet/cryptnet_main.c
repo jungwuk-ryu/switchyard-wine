@@ -41,6 +41,17 @@ WINE_DEFAULT_DEBUG_CHANNEL(cryptnet);
 
 #define IS_INTOID(x)    (((ULONG_PTR)(x) >> 16) == 0)
 
+#define MAX_CRL_ENCODED_SIZE    (32u * 1024 * 1024)
+#define MAX_OCSP_RESPONSE_SIZE  (1u * 1024 * 1024)
+#define OCSP_CLOCK_SKEW_SECONDS 300
+#define OCSP_NO_NEXT_UPDATE_MAX_AGE_SECONDS 86400
+#define MAX_OCSP_EMBEDDED_CERTIFICATES 16
+#define MAX_OCSP_RESPONSE_ENTRIES 4096
+#define MAX_REVOCATION_URLS 64
+
+#define szOID_PKIX_KP_OCSP_SIGNING_LOCAL "1.3.6.1.5.5.7.3.9"
+#define szOID_PKIX_OCSP_NOCHECK_LOCAL    "1.3.6.1.5.5.7.48.1.5"
+
 
 /***********************************************************************
  *    DllRegisterServer (CRYPTNET.@)
@@ -441,17 +452,52 @@ static void WINAPI CRYPT_FreeBlob(LPCSTR pszObjectOid,
     CryptMemFree(pObject->rgBlob);
 }
 
-static BOOL CRYPT_GetObjectFromFile(HANDLE hFile, PCRYPT_BLOB_ARRAY pObject)
+static DWORD CRYPT_GetEncodedObjectLimit(LPCSTR oid,
+        const CRYPT_RETRIEVE_AUX_INFO *aux_info)
+{
+    DWORD limit = ~0u;
+
+    if (IS_INTOID(oid) && LOWORD(oid) == LOWORD(CONTEXT_OID_CRL))
+        limit = MAX_CRL_ENCODED_SIZE;
+    if (aux_info && aux_info->cbSize >= RTL_SIZEOF_THROUGH_FIELD(
+            CRYPT_RETRIEVE_AUX_INFO, dwMaxUrlRetrievalByteCount) &&
+            aux_info->dwMaxUrlRetrievalByteCount &&
+            aux_info->dwMaxUrlRetrievalByteCount < limit)
+        limit = aux_info->dwMaxUrlRetrievalByteCount;
+    return limit;
+}
+
+static BOOL CRYPT_CheckEncodedObjectSize(const CRYPT_BLOB_ARRAY *object, DWORD limit)
+{
+    ULONGLONG total = 0;
+    DWORD i;
+
+    if (limit == ~0u)
+        return TRUE;
+
+    for (i = 0; i < object->cBlob; ++i)
+    {
+        total += object->rgBlob[i].cbData;
+        if (total > limit)
+        {
+            SetLastError(ERROR_FILE_TOO_LARGE);
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL CRYPT_GetObjectFromFile(HANDLE hFile, DWORD limit, PCRYPT_BLOB_ARRAY pObject)
 {
     BOOL ret;
     LARGE_INTEGER size;
 
     if ((ret = GetFileSizeEx(hFile, &size)))
     {
-        if (size.HighPart)
+        if (size.HighPart || size.LowPart > limit)
         {
             WARN("file too big\n");
-            SetLastError(ERROR_INVALID_DATA);
+            SetLastError(ERROR_FILE_TOO_LARGE);
             ret = FALSE;
         }
         else
@@ -490,8 +536,8 @@ static BOOL CRYPT_GetObjectFromFile(HANDLE hFile, PCRYPT_BLOB_ARRAY pObject)
     return ret;
 }
 
-static BOOL CRYPT_GetObjectFromCache(LPCWSTR pszURL, PCRYPT_BLOB_ARRAY pObject,
- PCRYPT_RETRIEVE_AUX_INFO pAuxInfo)
+static BOOL CRYPT_GetObjectFromCache(LPCWSTR pszURL, DWORD limit,
+ PCRYPT_BLOB_ARRAY pObject, PCRYPT_RETRIEVE_AUX_INFO pAuxInfo)
 {
     BOOL ret = FALSE;
     INTERNET_CACHE_ENTRY_INFOW *pCacheInfo = NULL;
@@ -522,7 +568,7 @@ static BOOL CRYPT_GetObjectFromCache(LPCWSTR pszURL, PCRYPT_BLOB_ARRAY pObject,
 
             if (hFile != INVALID_HANDLE_VALUE)
             {
-                if ((ret = CRYPT_GetObjectFromFile(hFile, pObject)))
+                if ((ret = CRYPT_GetObjectFromFile(hFile, limit, pObject)))
                 {
                     if (pAuxInfo && pAuxInfo->cbSize >= RTL_SIZEOF_THROUGH_FIELD(CRYPT_RETRIEVE_AUX_INFO, pLastSyncTime)
                             && pAuxInfo->pLastSyncTime)
@@ -593,9 +639,20 @@ static BOOL CRYPT_CrackUrl(LPCWSTR pszURL, URL_COMPONENTSW *components)
             if (!components->nPort)
                 components->nPort = INTERNET_DEFAULT_HTTP_PORT;
             break;
+        case INTERNET_SCHEME_HTTPS:
+            if (!components->nPort)
+                components->nPort = INTERNET_DEFAULT_HTTPS_PORT;
+            break;
         default:
             ; /* do nothing */
         }
+    }
+    else
+    {
+        CryptMemFree(components->lpszUrlPath);
+        CryptMemFree(components->lpszHostName);
+        components->lpszUrlPath = NULL;
+        components->lpszHostName = NULL;
     }
     TRACE("returning %d\n", ret);
     return ret;
@@ -603,89 +660,155 @@ static BOOL CRYPT_CrackUrl(LPCWSTR pszURL, URL_COMPONENTSW *components)
 
 struct InetContext
 {
-    HANDLE event;
-    DWORD  timeout;
-    DWORD  error;
+    ULONGLONG deadline;
 };
 
-static struct InetContext *CRYPT_MakeInetContext(DWORD dwTimeout)
+static ULONGLONG CRYPT_MakeDeadline(DWORD timeout)
 {
-    struct InetContext *context = CryptMemAlloc(sizeof(struct InetContext));
+    return timeout ? GetTickCount64() + timeout : 0;
+}
 
-    if (context)
+static BOOL CRYPT_GetRemainingTimeout(ULONGLONG deadline, DWORD *timeout)
+{
+    ULONGLONG now, remaining;
+
+    if (!deadline)
     {
-        context->event = CreateEventW(NULL, FALSE, FALSE, NULL);
-        if (!context->event)
-        {
-            CryptMemFree(context);
-            context = NULL;
-        }
-        else
-        {
-            context->timeout = dwTimeout;
-            context->error = ERROR_SUCCESS;
-        }
+        *timeout = 0;
+        return TRUE;
     }
-    return context;
+
+    now = GetTickCount64();
+    if (now >= deadline)
+    {
+        SetLastError(ERROR_TIMEOUT);
+        return FALSE;
+    }
+
+    remaining = deadline - now;
+    *timeout = remaining > ~0u ? ~0u : remaining;
+    return TRUE;
+}
+
+static BOOL CRYPT_CompleteInetOperation(struct InetContext *context,
+        BOOL result)
+{
+    DWORD error = result ? ERROR_SUCCESS : GetLastError(), remaining;
+
+    if (!context) return result;
+    if (!CRYPT_GetRemainingTimeout(context->deadline, &remaining))
+        return FALSE;
+    if (!result) SetLastError(error);
+    return result;
+}
+
+static BOOL CRYPT_SetInetTimeouts(HINTERNET handle, struct InetContext *context,
+        BOOL connect)
+{
+    DWORD timeout;
+
+    if (!context)
+        return TRUE;
+    if (!CRYPT_GetRemainingTimeout(context->deadline, &timeout))
+        return FALSE;
+    if (connect && !InternetSetOptionW(handle, INTERNET_OPTION_CONNECT_TIMEOUT,
+            &timeout, sizeof(timeout)))
+        return FALSE;
+    if (!InternetSetOptionW(handle, INTERNET_OPTION_SEND_TIMEOUT, &timeout,
+            sizeof(timeout)))
+        return FALSE;
+    if (!InternetSetOptionW(handle, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout,
+            sizeof(timeout)))
+        return FALSE;
+    return TRUE;
 }
 
 static BOOL CRYPT_DownloadObject(DWORD dwRetrievalFlags, HINTERNET hHttp,
- struct InetContext *context, PCRYPT_BLOB_ARRAY pObject,
+ struct InetContext *context, DWORD limit, PCRYPT_BLOB_ARRAY pObject,
  PCRYPT_RETRIEVE_AUX_INFO pAuxInfo)
 {
     CRYPT_DATA_BLOB object = { 0, NULL };
-    DWORD bytesAvailable;
-    BOOL ret;
+    DWORD content_length = 0, capacity, count, size;
+    BOOL have_content_length, ret = FALSE;
 
-    do {
-        if ((ret = InternetQueryDataAvailable(hHttp, &bytesAvailable, 0, 0)))
+    size = sizeof(content_length);
+    have_content_length = HttpQueryInfoW(hHttp,
+            HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER,
+            &content_length, &size, NULL);
+    if (!limit || (have_content_length &&
+            (!content_length || content_length > limit)))
+    {
+        SetLastError(content_length ? ERROR_FILE_TOO_LARGE : ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    capacity = have_content_length ? content_length : min(limit, 16384u);
+    if (!(object.pbData = CryptMemAlloc(capacity)))
+    {
+        SetLastError(ERROR_OUTOFMEMORY);
+        return FALSE;
+    }
+
+    for (;;)
+    {
+        if (object.cbData == capacity)
         {
-            if (bytesAvailable)
+            if (have_content_length || capacity == limit)
             {
-                if (object.pbData)
-                    object.pbData = CryptMemRealloc(object.pbData,
-                     object.cbData + bytesAvailable);
-                else
-                    object.pbData = CryptMemAlloc(bytesAvailable);
-                if (object.pbData)
-                {
-                    INTERNET_BUFFERSA buffer = { sizeof(buffer), 0 };
+                BYTE extra;
 
-                    buffer.dwBufferLength = bytesAvailable;
-                    buffer.lpvBuffer = object.pbData + object.cbData;
-                    if (!(ret = InternetReadFileExA(hHttp, &buffer, IRF_NO_WAIT,
-                     (DWORD_PTR)context)))
-                    {
-                        if (GetLastError() == ERROR_IO_PENDING)
-                        {
-                            if (WaitForSingleObject(context->event,
-                             context->timeout) == WAIT_TIMEOUT)
-                                SetLastError(ERROR_TIMEOUT);
-                            else if (context->error)
-                                SetLastError(context->error);
-                            else
-                                ret = TRUE;
-                        }
-                    }
-                    if (ret)
-                        object.cbData += buffer.dwBufferLength;
-                }
-                else
+                if (!CRYPT_SetInetTimeouts(hHttp, context, FALSE))
+                    break;
+                ret = InternetReadFile(hHttp, &extra, sizeof(extra), &count);
+                if (!CRYPT_CompleteInetOperation(context, ret))
+                    break;
+                if (count)
                 {
-                    SetLastError(ERROR_OUTOFMEMORY);
+                    SetLastError(have_content_length ? ERROR_INVALID_DATA :
+                            ERROR_FILE_TOO_LARGE);
                     ret = FALSE;
                 }
+                else
+                    ret = TRUE;
+                break;
             }
+
+            size = capacity > limit / 2 ? limit : capacity * 2;
+            {
+                BYTE *new_data = CryptMemRealloc(object.pbData, size);
+
+                if (!new_data)
+                {
+                    SetLastError(ERROR_OUTOFMEMORY);
+                    break;
+                }
+                object.pbData = new_data;
+            }
+            capacity = size;
         }
-        else if (GetLastError() == ERROR_IO_PENDING)
+
+        if (!CRYPT_SetInetTimeouts(hHttp, context, FALSE))
+            break;
+        ret = InternetReadFile(hHttp, object.pbData + object.cbData,
+                capacity - object.cbData, &count);
+        if (!CRYPT_CompleteInetOperation(context, ret))
+            break;
+        if (!count)
         {
-            if (WaitForSingleObject(context->event, context->timeout) ==
-             WAIT_TIMEOUT)
-                SetLastError(ERROR_TIMEOUT);
+            if (!object.cbData || (have_content_length &&
+                    object.cbData != content_length))
+                SetLastError(ERROR_INVALID_DATA);
             else
                 ret = TRUE;
+            break;
         }
-    } while (ret && bytesAvailable);
+        if (count > capacity - object.cbData)
+        {
+            SetLastError(ERROR_INVALID_DATA);
+            break;
+        }
+        object.cbData += count;
+    }
     if (ret)
     {
         pObject->rgBlob = CryptMemAlloc(sizeof(CRYPT_DATA_BLOB));
@@ -702,6 +825,8 @@ static BOOL CRYPT_DownloadObject(DWORD dwRetrievalFlags, HINTERNET hHttp,
             pObject->cBlob = 1;
         }
     }
+    else
+        CryptMemFree(object.pbData);
     TRACE("returning %d\n", ret);
     return ret;
 }
@@ -773,21 +898,6 @@ static void CRYPT_CacheURL(LPCWSTR pszURL, const CRYPT_BLOB_ARRAY *pObject,
             NULL, 0, NULL, NULL);
 }
 
-static void CALLBACK CRYPT_InetStatusCallback(HINTERNET hInt,
- DWORD_PTR dwContext, DWORD status, void *statusInfo, DWORD statusInfoLen)
-{
-    struct InetContext *context = (struct InetContext *)dwContext;
-    LPINTERNET_ASYNC_RESULT result;
-
-    switch (status)
-    {
-    case INTERNET_STATUS_REQUEST_COMPLETE:
-        result = statusInfo;
-        context->error = result->dwError;
-        SetEvent(context->event);
-    }
-}
-
 static BOOL CRYPT_Connect(const URL_COMPONENTSW *components,
  struct InetContext *context, PCRYPT_CREDENTIALS pCredentials,
  HINTERNET *phInt, HINTERNET *phHost)
@@ -798,20 +908,24 @@ static BOOL CRYPT_Connect(const URL_COMPONENTSW *components,
      components->nPort, context, pCredentials, phInt, phInt);
 
     *phHost = NULL;
-    *phInt = InternetOpenW(NULL, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL,
-     context ? INTERNET_FLAG_ASYNC : 0);
+    *phInt = InternetOpenW(NULL, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (*phInt)
     {
         DWORD service;
 
-        if (context)
-            InternetSetStatusCallbackW(*phInt, CRYPT_InetStatusCallback);
+        if (!CRYPT_SetInetTimeouts(*phInt, context, TRUE))
+        {
+            InternetCloseHandle(*phInt);
+            *phInt = NULL;
+            return FALSE;
+        }
         switch (components->nScheme)
         {
         case INTERNET_SCHEME_FTP:
             service = INTERNET_SERVICE_FTP;
             break;
         case INTERNET_SCHEME_HTTP:
+        case INTERNET_SCHEME_HTTPS:
             service = INTERNET_SERVICE_HTTP;
             break;
         default:
@@ -819,7 +933,12 @@ static BOOL CRYPT_Connect(const URL_COMPONENTSW *components,
         }
         /* FIXME: use pCredentials for username/password */
         *phHost = InternetConnectW(*phInt, components->lpszHostName,
-         components->nPort, NULL, NULL, service, 0, (DWORD_PTR)context);
+         components->nPort, NULL, NULL, service, 0, 0);
+        if (!CRYPT_CompleteInetOperation(context, !!*phHost) && *phHost)
+        {
+            InternetCloseHandle(*phHost);
+            *phHost = NULL;
+        }
         if (!*phHost)
         {
             InternetCloseHandle(*phInt);
@@ -859,6 +978,8 @@ static BOOL WINAPI HTTP_RetrieveEncodedObjectW(LPCWSTR pszURL,
  PCRYPT_CREDENTIALS pCredentials, PCRYPT_RETRIEVE_AUX_INFO pAuxInfo)
 {
     BOOL ret = FALSE;
+    DWORD error = ERROR_SUCCESS;
+    DWORD limit = CRYPT_GetEncodedObjectLimit(pszObjectOid, pAuxInfo);
 
     TRACE("(%s, %s, %08lx, %ld, %p, %p, %p, %p, %p, %p)\n", debugstr_w(pszURL),
      debugstr_a(pszObjectOid), dwRetrievalFlags, dwTimeout, pObject,
@@ -870,7 +991,7 @@ static BOOL WINAPI HTTP_RetrieveEncodedObjectW(LPCWSTR pszURL,
     *ppvFreeContext = NULL;
 
     if (!(dwRetrievalFlags & CRYPT_WIRE_ONLY_RETRIEVAL))
-        ret = CRYPT_GetObjectFromCache(pszURL, pObject, pAuxInfo);
+        ret = CRYPT_GetObjectFromCache(pszURL, limit, pObject, pAuxInfo);
     if (!ret && (!(dwRetrievalFlags & CRYPT_CACHE_ONLY_RETRIEVAL) ||
      (dwRetrievalFlags & CRYPT_WIRE_ONLY_RETRIEVAL)))
     {
@@ -878,13 +999,25 @@ static BOOL WINAPI HTTP_RetrieveEncodedObjectW(LPCWSTR pszURL,
 
         if ((ret = CRYPT_CrackUrl(pszURL, &components)))
         {
-            HINTERNET hInt, hHost;
-            struct InetContext *context = NULL;
+            HINTERNET hInt = NULL, hHost = NULL;
+            struct InetContext inet_context, *context = NULL;
+            DWORD request_flags = INTERNET_FLAG_NO_COOKIES |
+                    INTERNET_FLAG_NO_UI;
 
             if (dwTimeout)
-                context = CRYPT_MakeInetContext(dwTimeout);
+            {
+                inet_context.deadline = CRYPT_MakeDeadline(dwTimeout);
+                context = &inet_context;
+            }
+            if (dwRetrievalFlags & CRYPT_DONT_CACHE_RESULT)
+                request_flags |= INTERNET_FLAG_NO_CACHE_WRITE;
+            if (dwRetrievalFlags & CRYPT_WIRE_ONLY_RETRIEVAL)
+                request_flags |= INTERNET_FLAG_RELOAD;
+            if (components.nScheme == INTERNET_SCHEME_HTTPS)
+                request_flags |= INTERNET_FLAG_SECURE;
+
             ret = CRYPT_Connect(&components, context, pCredentials, &hInt,
-             &hHost);
+                    &hHost);
             if (ret)
             {
                 static LPCWSTR types[] =
@@ -897,42 +1030,30 @@ static BOOL WINAPI HTTP_RetrieveEncodedObjectW(LPCWSTR pszURL,
                 };
                 HINTERNET hHttp = HttpOpenRequestW(hHost, NULL,
                  components.lpszUrlPath, NULL, NULL, types,
-                 INTERNET_FLAG_NO_COOKIES | INTERNET_FLAG_NO_UI,
-                 (DWORD_PTR)context);
+                 request_flags, 0);
 
                 if (hHttp)
                 {
-                    if (dwTimeout)
+                    ret = CRYPT_SetInetTimeouts(hHttp, context, FALSE);
+                    if (ret)
+                        ret = HttpSendRequestW(hHttp, NULL, 0, NULL, 0);
+                    ret = CRYPT_CompleteInetOperation(context, ret);
+                    if (ret)
                     {
-                        InternetSetOptionW(hHttp,
-                         INTERNET_OPTION_RECEIVE_TIMEOUT, &dwTimeout,
-                         sizeof(dwTimeout));
-                        InternetSetOptionW(hHttp, INTERNET_OPTION_SEND_TIMEOUT,
-                         &dwTimeout, sizeof(dwTimeout));
-                    }
-                    ret = HttpSendRequestExW(hHttp, NULL, NULL, 0,
-                     (DWORD_PTR)context);
-                    if (!ret && GetLastError() == ERROR_IO_PENDING)
-                    {
-                        if (WaitForSingleObject(context->event,
-                         context->timeout) == WAIT_TIMEOUT)
-                            SetLastError(ERROR_TIMEOUT);
-                        else
-                            ret = TRUE;
-                    }
-                    if (ret &&
-                     !(ret = HttpEndRequestW(hHttp, NULL, 0, (DWORD_PTR)context)) &&
-                     GetLastError() == ERROR_IO_PENDING)
-                    {
-                        if (WaitForSingleObject(context->event,
-                         context->timeout) == WAIT_TIMEOUT)
-                            SetLastError(ERROR_TIMEOUT);
-                        else
-                            ret = TRUE;
+                        DWORD status = 0, size = sizeof(status);
+
+                        if (!HttpQueryInfoW(hHttp, HTTP_QUERY_STATUS_CODE |
+                                HTTP_QUERY_FLAG_NUMBER, &status, &size, NULL))
+                            ret = FALSE;
+                        else if (status != HTTP_STATUS_OK)
+                        {
+                            SetLastError(ERROR_HTTP_INVALID_SERVER_RESPONSE);
+                            ret = FALSE;
+                        }
                     }
                     if (ret)
                         ret = CRYPT_DownloadObject(dwRetrievalFlags, hHttp,
-                         context, pObject, pAuxInfo);
+                                context, limit, pObject, pAuxInfo);
                     if (ret && !(dwRetrievalFlags & CRYPT_DONT_CACHE_RESULT))
                     {
                         SYSTEMTIME st;
@@ -943,18 +1064,24 @@ static BOOL WINAPI HTTP_RetrieveEncodedObjectW(LPCWSTR pszURL,
                                     &st, &len, NULL) && SystemTimeToFileTime(&st, &ft))
                             CRYPT_CacheURL(pszURL, pObject, dwRetrievalFlags, ft);
                     }
+                    if (!ret)
+                        error = GetLastError();
                     InternetCloseHandle(hHttp);
+                }
+                else
+                {
+                    ret = FALSE;
+                    error = GetLastError();
                 }
                 InternetCloseHandle(hHost);
                 InternetCloseHandle(hInt);
             }
-            if (context)
-            {
-                CloseHandle(context->event);
-                CryptMemFree(context);
-            }
+            else
+                error = GetLastError();
             CryptMemFree(components.lpszUrlPath);
             CryptMemFree(components.lpszHostName);
+            if (!ret && error)
+                SetLastError(error);
         }
     }
     TRACE("returning %d\n", ret);
@@ -1029,7 +1156,9 @@ static BOOL WINAPI File_RetrieveEncodedObjectW(LPCWSTR pszURL,
             }
             if (hFile != INVALID_HANDLE_VALUE)
             {
-                if ((ret = CRYPT_GetObjectFromFile(hFile, pObject)))
+                if ((ret = CRYPT_GetObjectFromFile(hFile,
+                        CRYPT_GetEncodedObjectLimit(pszObjectOid, pAuxInfo),
+                        pObject)))
                 {
                     if (pAuxInfo && pAuxInfo->cbSize >= RTL_SIZEOF_THROUGH_FIELD(CRYPT_RETRIEVE_AUX_INFO, pLastSyncTime)
                             && pAuxInfo->pLastSyncTime)
@@ -1500,12 +1629,18 @@ BOOL WINAPI CryptRetrieveObjectByUrlW(LPCWSTR pszURL, LPCSTR pszObjectOid,
          pAuxInfo);
         if (ret)
         {
-            ret = create(pszObjectOid, dwRetrievalFlags, &object, ppvObject);
-            if (ret && !(dwRetrievalFlags & CRYPT_DONT_CACHE_RESULT) &&
-                CRYPT_GetExpiration(*ppvObject, pszObjectOid, &expires))
+            if (CRYPT_CheckEncodedObjectSize(&object,
+                    CRYPT_GetEncodedObjectLimit(pszObjectOid, pAuxInfo)))
             {
-                CRYPT_CacheURL(pszURL, &object, dwRetrievalFlags, expires);
+                ret = create(pszObjectOid, dwRetrievalFlags, &object, ppvObject);
+                if (ret && !(dwRetrievalFlags & CRYPT_DONT_CACHE_RESULT) &&
+                    CRYPT_GetExpiration(*ppvObject, pszObjectOid, &expires))
+                {
+                    CRYPT_CacheURL(pszURL, &object, dwRetrievalFlags, expires);
+                }
             }
+            else
+                ret = FALSE;
             freeObject(pszObjectOid, &object, freeContext);
         }
     }
@@ -1534,7 +1669,18 @@ BOOL WINAPI CryptRetrieveObjectByUrlW(LPCWSTR pszURL, LPCSTR pszObjectOid,
  * contents do not.
  */
 
-static const char revocation_cache_signature[] = "Wine cached revocation";
+static const char revocation_cache_signature[] = "Wine cached revocation v2";
+
+struct revocation_cache_record
+{
+    FILETIME this_update;
+    FILETIME next_update;
+    FILETIME revocation_time;
+    DWORD error;
+    DWORD reason;
+};
+
+static BOOL filetime_is_zero(const FILETIME *time);
 
 #define CACHED_CERT_HASH_SIZE 20
 
@@ -1545,8 +1691,8 @@ static FILE *open_cached_revocation_file(const CERT_CONTEXT *cert, const CERT_RE
     WCHAR path[MAX_PATH];
     WCHAR *appdata_path;
     DWORD len, i, size;
-    HCRYPTPROV prov;
-    HCRYPTHASH hash;
+    HCRYPTPROV prov = 0;
+    HCRYPTHASH hash = 0;
     HRESULT hr;
 
     if (FAILED(hr = SHGetKnownFolderPath(&FOLDERID_LocalAppDataLow, 0, NULL, &appdata_path)))
@@ -1564,21 +1710,29 @@ static FILE *open_cached_revocation_file(const CERT_CONTEXT *cert, const CERT_RE
         return NULL;
     }
 
-    CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT);
-    CryptCreateHash(prov, CALG_SHA1, 0, 0, &hash);
-    CryptHashData(hash, cert->pbCertEncoded, cert->cbCertEncoded, 0);
+    if (!CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL,
+            CRYPT_VERIFYCONTEXT) ||
+            !CryptCreateHash(prov, CALG_SHA1, 0, 0, &hash) ||
+            !CryptHashData(hash, cert->pbCertEncoded, cert->cbCertEncoded, 0))
+        goto crypto_failed;
     if (params && params->pIssuerCert)
     {
-        CryptHashData(hash, (BYTE *)&params->pIssuerCert->cbCertEncoded, sizeof(params->pIssuerCert->cbCertEncoded), 0);
-        CryptHashData(hash, params->pIssuerCert->pbCertEncoded, params->pIssuerCert->cbCertEncoded, 0);
+        if (!CryptHashData(hash, (BYTE *)&params->pIssuerCert->cbCertEncoded,
+                sizeof(params->pIssuerCert->cbCertEncoded), 0) ||
+                !CryptHashData(hash, params->pIssuerCert->pbCertEncoded,
+                    params->pIssuerCert->cbCertEncoded, 0))
+            goto crypto_failed;
     }
     else
     {
         size = 0;
-        CryptHashData(hash, (BYTE *)&size, sizeof(size), 0);
+        if (!CryptHashData(hash, (BYTE *)&size, sizeof(size), 0))
+            goto crypto_failed;
     }
     size = sizeof(hash_data);
-    CryptGetHashParam(hash, HP_HASHVAL, hash_data, &size, 0);
+    if (!CryptGetHashParam(hash, HP_HASHVAL, hash_data, &size, 0) ||
+            size != sizeof(hash_data))
+        goto crypto_failed;
     CryptDestroyHash(hash);
     CryptReleaseContext(prov, 0);
 
@@ -1591,14 +1745,20 @@ static FILE *open_cached_revocation_file(const CERT_CONTEXT *cert, const CERT_RE
     }
 
     return _wfsopen(path, mode, sharing);
+
+crypto_failed:
+    if (hash) CryptDestroyHash(hash);
+    if (prov) CryptReleaseContext(prov, 0);
+    return NULL;
 }
 
 static BOOL find_cached_revocation_status(const CERT_CONTEXT *cert, const CERT_REVOCATION_PARA *params,
         const FILETIME *time, CERT_REVOCATION_STATUS *status)
 {
     char buffer[sizeof(revocation_cache_signature)];
-    FILETIME update_time;
+    struct revocation_cache_record record;
     FILE *file;
+    int extra;
     int len;
 
     if (!(file = open_cached_revocation_file(cert, params, L"rb", _SH_DENYWR)))
@@ -1612,32 +1772,41 @@ static BOOL find_cached_revocation_status(const CERT_CONTEXT *cert, const CERT_R
         return FALSE;
     }
 
-    if (fread(&update_time, sizeof(update_time), 1, file) != 1)
+    if (fread(&record, sizeof(record), 1, file) != 1 ||
+            (extra = fgetc(file)) != EOF)
     {
-        ERR("Failed to read update time.\n");
+        ERR("Invalid cached revocation record.\n");
         fclose(file);
         return FALSE;
     }
 
-    if (CompareFileTime(time, &update_time) > 0)
+    if (filetime_is_zero(&record.this_update) ||
+            filetime_is_zero(&record.next_update) ||
+            CompareFileTime(&record.this_update, &record.next_update) >= 0 ||
+            CompareFileTime(time, &record.this_update) < 0 ||
+            CompareFileTime(time, &record.next_update) >= 0 ||
+            (record.error != ERROR_SUCCESS &&
+                record.error != CRYPT_E_REVOKED))
     {
         TRACE("Cached revocation status is potentially out of date.\n");
         fclose(file);
         return FALSE;
     }
 
-    if (fread(&status->dwError, sizeof(status->dwError), 1, file) != 1)
+    status->dwError = record.error;
+    status->dwReason = record.reason;
+    if (status->dwError == CRYPT_E_REVOKED)
     {
-        ERR("Failed to read error code.\n");
-        fclose(file);
-        return FALSE;
-    }
-
-    if (status->dwError == CERT_E_REVOKED && fread(&status->dwReason, sizeof(status->dwReason), 1, file) != 1)
-    {
-        ERR("Failed to read revocation reason.\n");
-        fclose(file);
-        return FALSE;
+        if (filetime_is_zero(&record.revocation_time))
+        {
+            fclose(file);
+            return FALSE;
+        }
+        if (CompareFileTime(time, &record.revocation_time) < 0)
+        {
+            status->dwError = ERROR_SUCCESS;
+            status->dwReason = 0;
+        }
     }
 
     TRACE("Using cached status %#lx, reason %#lx.\n", status->dwError, status->dwReason);
@@ -1645,75 +1814,265 @@ static BOOL find_cached_revocation_status(const CERT_CONTEXT *cert, const CERT_R
     return TRUE;
 }
 
-static void cache_revocation_status(const CERT_CONTEXT *cert, const CERT_REVOCATION_PARA *params,
-        const FILETIME *time, const CERT_REVOCATION_STATUS *status)
+static void cache_revocation_status(const CERT_CONTEXT *cert,
+        const CERT_REVOCATION_PARA *params, const FILETIME *this_update,
+        const FILETIME *next_update, const FILETIME *revocation_time,
+        const CERT_REVOCATION_STATUS *status)
 {
+    struct revocation_cache_record record;
     FILE *file;
 
     if (!(file = open_cached_revocation_file(cert, params, L"wb", _SH_DENYRW)))
         return;
+    memset(&record, 0, sizeof(record));
+    record.this_update = *this_update;
+    record.next_update = *next_update;
+    record.revocation_time = *revocation_time;
+    record.error = status->dwError;
+    record.reason = status->dwReason;
     fwrite(revocation_cache_signature, 1, sizeof(revocation_cache_signature), file);
-    fwrite(time, sizeof(*time), 1, file);
-    fwrite(&status->dwError, sizeof(status->dwError), 1, file);
-    if (status->dwError == CERT_E_REVOKED)
-        fwrite(&status->dwReason, sizeof(status->dwReason), 1, file);
+    fwrite(&record, sizeof(record), 1, file);
     fclose(file);
 }
 
-static DWORD verify_cert_revocation_with_crl_online(const CERT_CONTEXT *cert,
-        const CRL_CONTEXT *crl, FILETIME *pTime, CERT_REVOCATION_STATUS *pRevStatus)
+static BOOL filetime_is_zero(const FILETIME *time)
 {
+    return !time->dwLowDateTime && !time->dwHighDateTime;
+}
+
+static BOOL extensions_are_unique(DWORD count,
+        const CERT_EXTENSION *extensions)
+{
+    DWORD i, j;
+
+    if (count && !extensions) return FALSE;
+    for (i = 0; i < count; ++i)
+    {
+        if (!extensions[i].pszObjId || !extensions[i].pszObjId[0] ||
+                (extensions[i].Value.cbData &&
+                    !extensions[i].Value.pbData))
+            return FALSE;
+        for (j = 0; j < i; ++j)
+            if (!strcmp(extensions[i].pszObjId, extensions[j].pszObjId))
+            {
+                WARN("duplicate extension %s\n",
+                        debugstr_a(extensions[i].pszObjId));
+                return FALSE;
+            }
+    }
+    return TRUE;
+}
+
+static BOOL certificate_is_ca(const CERT_CONTEXT *cert, BOOL *is_ca)
+{
+    CERT_BASIC_CONSTRAINTS2_INFO constraints;
+    PCERT_EXTENSION extension;
+    DWORD size = sizeof(constraints);
+
+    *is_ca = FALSE;
+    if (!extensions_are_unique(cert->pCertInfo->cExtension,
+            cert->pCertInfo->rgExtension))
+        return FALSE;
+    extension = CertFindExtension(szOID_BASIC_CONSTRAINTS2,
+            cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension);
+    if (!extension)
+        return TRUE;
+    if (!CryptDecodeObjectEx(cert->dwCertEncodingType, X509_BASIC_CONSTRAINTS2,
+            extension->Value.pbData, extension->Value.cbData,
+            CRYPT_DECODE_NOCOPY_FLAG, NULL, &constraints, &size))
+        return FALSE;
+    *is_ca = constraints.fCA;
+    return TRUE;
+}
+
+static BOOL crl_scope_is_complete_for_certificate(const CERT_CONTEXT *cert,
+        const CRL_CONTEXT *crl)
+{
+    PCERT_EXTENSION delta, issuing;
+    CRL_ISSUING_DIST_POINT *point = NULL;
+    BOOL is_ca, valid = FALSE;
+    DWORD size, i;
+
+    if (!extensions_are_unique(crl->pCrlInfo->cExtension,
+            crl->pCrlInfo->rgExtension))
+        return FALSE;
+    for (i = 0; i < crl->pCrlInfo->cExtension; ++i)
+    {
+        const CERT_EXTENSION *extension = crl->pCrlInfo->rgExtension + i;
+
+        if (!extension->fCritical) continue;
+        if (!strcmp(extension->pszObjId, szOID_ISSUING_DIST_POINT) ||
+                !strcmp(extension->pszObjId,
+                    szOID_DELTA_CRL_INDICATOR))
+            continue;
+        WARN("unsupported critical CRL extension %s\n",
+                debugstr_a(extension->pszObjId));
+        return FALSE;
+    }
+
+    delta = CertFindExtension(szOID_DELTA_CRL_INDICATOR,
+            crl->pCrlInfo->cExtension, crl->pCrlInfo->rgExtension);
+    if (delta)
+    {
+        WARN("A delta CRL cannot prove status without its base CRL\n");
+        return FALSE;
+    }
+    if (!CertIsValidCRLForCertificate(cert, crl, 0, NULL))
+    {
+        WARN("CRL issuing distribution point does not cover the certificate\n");
+        return FALSE;
+    }
+
+    issuing = CertFindExtension(szOID_ISSUING_DIST_POINT,
+            crl->pCrlInfo->cExtension, crl->pCrlInfo->rgExtension);
+    if (!issuing)
+        return TRUE;
+    if (!CryptDecodeObjectEx(crl->dwCertEncodingType, X509_ISSUING_DIST_POINT,
+            issuing->Value.pbData, issuing->Value.cbData,
+            CRYPT_DECODE_ALLOC_FLAG, NULL, &point, &size))
+        return FALSE;
+    if (point->fIndirectCRL || point->OnlySomeReasonFlags.cbData)
+    {
+        WARN("Indirect or reason-partitioned CRLs are unsupported\n");
+        goto done;
+    }
+    if (point->fOnlyContainsUserCerts && point->fOnlyContainsCACerts)
+        goto done;
+    if (!certificate_is_ca(cert, &is_ca))
+        goto done;
+    if ((point->fOnlyContainsUserCerts && is_ca) ||
+            (point->fOnlyContainsCACerts && !is_ca))
+        goto done;
+    valid = TRUE;
+
+done:
+    LocalFree(point);
+    return valid;
+}
+
+static BOOL crl_entry_reason(const CRL_ENTRY *entry, DWORD *reason)
+{
+    PCERT_EXTENSION extension;
+    DWORD i, size = sizeof(*reason);
+
+    *reason = CRL_REASON_UNSPECIFIED;
+    if (!extensions_are_unique(entry->cExtension, entry->rgExtension))
+        return FALSE;
+    for (i = 0; i < entry->cExtension; ++i)
+    {
+        extension = entry->rgExtension + i;
+        if (!extension->fCritical) continue;
+        if (!strcmp(extension->pszObjId, szOID_CRL_REASON_CODE) ||
+                !strcmp(extension->pszObjId, "2.5.29.24"))
+            continue;
+        WARN("unsupported critical CRL entry extension %s\n",
+                debugstr_a(extension->pszObjId));
+        return FALSE;
+    }
+
+    extension = CertFindExtension(szOID_CRL_REASON_CODE, entry->cExtension,
+            entry->rgExtension);
+    if (extension && !CryptDecodeObjectEx(X509_ASN_ENCODING,
+            X509_CRL_REASON_CODE, extension->Value.pbData,
+            extension->Value.cbData, 0, NULL, reason, &size))
+        return FALSE;
+    if (*reason == 7 || *reason == CRL_REASON_REMOVE_FROM_CRL || *reason > 10)
+        return FALSE;
+    return TRUE;
+}
+
+static DWORD verify_cert_revocation_with_crl_online(const CERT_CONTEXT *cert,
+        const CERT_CONTEXT *issuer, const CRL_CONTEXT *crl, FILETIME *time,
+        CERT_REVOCATION_STATUS *status, FILETIME *this_update,
+        FILETIME *next_update, FILETIME *revocation_time)
+{
+    CRYPT_BIT_BLOB usage;
+    PCERT_EXTENSION extension;
     PCRL_ENTRY entry = NULL;
+    DWORD size;
+
+    if (!CertCompareCertificateName(issuer->dwCertEncodingType,
+            &issuer->pCertInfo->Subject, &crl->pCrlInfo->Issuer))
+    {
+        WARN("CRL issuer does not match the certificate issuer\n");
+        return CRYPT_E_NO_REVOCATION_CHECK;
+    }
+
+    if (!extensions_are_unique(issuer->pCertInfo->cExtension,
+            issuer->pCertInfo->rgExtension))
+        return CRYPT_E_NO_REVOCATION_CHECK;
+    extension = CertFindExtension(szOID_KEY_USAGE,
+            issuer->pCertInfo->cExtension, issuer->pCertInfo->rgExtension);
+    if (extension)
+    {
+        size = sizeof(usage);
+        if (!CryptDecodeObjectEx(issuer->dwCertEncodingType, X509_BITS,
+                extension->Value.pbData, extension->Value.cbData,
+                CRYPT_DECODE_NOCOPY_FLAG, NULL, &usage, &size) ||
+                !usage.cbData || usage.cbData > 2 ||
+                !(usage.pbData[0] & CERT_CRL_SIGN_KEY_USAGE))
+        {
+            WARN("certificate issuer is not allowed to sign CRLs\n");
+            return CRYPT_E_NO_REVOCATION_CHECK;
+        }
+    }
+
+    if (!CryptVerifyCertificateSignatureEx(0, crl->dwCertEncodingType,
+            CRYPT_VERIFY_CERT_SIGN_SUBJECT_CRL, (void *)crl,
+            CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT, (void *)issuer, 0, NULL))
+    {
+        WARN("CRL signature verification failed, error %#lx\n", GetLastError());
+        return CRYPT_E_NO_REVOCATION_CHECK;
+    }
+    if (filetime_is_zero(&crl->pCrlInfo->ThisUpdate) ||
+            filetime_is_zero(&crl->pCrlInfo->NextUpdate) ||
+            CertVerifyCRLTimeValidity(time, crl->pCrlInfo))
+    {
+        WARN("CRL is not valid at the verification time\n");
+        return CRYPT_E_REVOCATION_OFFLINE;
+    }
+    if (!crl_scope_is_complete_for_certificate(cert, crl))
+        return CRYPT_E_NO_REVOCATION_CHECK;
+
+    *this_update = crl->pCrlInfo->ThisUpdate;
+    *next_update = crl->pCrlInfo->NextUpdate;
+    memset(revocation_time, 0, sizeof(*revocation_time));
 
     CertFindCertificateInCRL(cert, crl, 0, NULL, &entry);
     if (entry)
+    {
+        DWORD reason;
+
+        if (!crl_entry_reason(entry, &reason))
+            return CRYPT_E_NO_REVOCATION_CHECK;
+        *revocation_time = entry->RevocationDate;
+        if (CompareFileTime(time, &entry->RevocationDate) < 0)
+            return ERROR_SUCCESS;
+        status->dwReason = reason;
         return CRYPT_E_REVOKED;
+    }
 
     /* Since the CRL was retrieved for the cert being checked, then it's
      * guaranteed to be fresh, and the cert is not revoked. */
     return ERROR_SUCCESS;
 }
 
-/* Try to retrieve a CRL from any one of the specified distribution points. */
-static const CRL_CONTEXT *retrieve_crl_from_dist_points(const CRYPT_URL_ARRAY *array,
-        DWORD verify_flags, DWORD timeout)
+static DWORD get_revocation_url_timeout(const CERT_REVOCATION_PARA *params)
 {
-    DWORD retrieve_flags = 0;
-    const CRL_CONTEXT *crl;
-    DWORD i;
-
-    if (verify_flags & CERT_VERIFY_CACHE_ONLY_BASED_REVOCATION)
-        retrieve_flags |= CRYPT_CACHE_ONLY_RETRIEVAL;
-
-    /* Yes, this is a weird algorithm, but the documentation for
-     * CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT specifies this, and
-     * tests seem to bear it out for CertVerifyRevocation() as well. */
-    if (verify_flags & CERT_VERIFY_REV_ACCUMULATIVE_TIMEOUT_FLAG)
-        timeout /= 2;
-
-    for (i = 0; i < array->cUrl; ++i)
-    {
-        if (CryptRetrieveObjectByUrlW(array->rgwszUrl[i], CONTEXT_OID_CRL, retrieve_flags,
-                timeout, (void **)&crl, NULL, NULL, NULL, NULL))
-            return crl;
-
-        /* We don't check the current time here. This may result in less
-         * accurate timeouts, but this too seems to be true of Windows. */
-        if ((verify_flags & CERT_VERIFY_REV_ACCUMULATIVE_TIMEOUT_FLAG) && GetLastError() == ERROR_TIMEOUT)
-            timeout /= 2;
-    }
-
-    return NULL;
+    if (params && params->cbSize >=
+            RTL_SIZEOF_THROUGH_FIELD(CERT_REVOCATION_PARA, dwUrlRetrievalTimeout))
+        return params->dwUrlRetrievalTimeout;
+    return 0;
 }
 
 static DWORD verify_cert_revocation_from_dist_points_ext(const CRYPT_DATA_BLOB *value, const CERT_CONTEXT *cert,
         FILETIME *time, DWORD flags, const CERT_REVOCATION_PARA *params, CERT_REVOCATION_STATUS *status,
-        FILETIME *next_update)
+        FILETIME *this_update, FILETIME *next_update,
+        FILETIME *revocation_time, ULONGLONG deadline)
 {
-    DWORD url_array_size, error;
+    DWORD url_array_size, error = CRYPT_E_REVOCATION_OFFLINE;
     CRYPT_URL_ARRAY *url_array;
-    const CRL_CONTEXT *crl;
-    DWORD timeout = 0;
+    DWORD timeout = 0, i;
 
     if (!params || !params->pIssuerCert)
     {
@@ -1732,37 +2091,107 @@ static DWORD verify_cert_revocation_from_dist_points_ext(const CRYPT_DATA_BLOB *
         CryptMemFree(url_array);
         return GetLastError();
     }
-
-    if (params && params->cbSize >= RTL_SIZEOF_THROUGH_FIELD(CERT_REVOCATION_PARA, dwUrlRetrievalTimeout))
-        timeout = params->dwUrlRetrievalTimeout;
-
-    if (!(crl = retrieve_crl_from_dist_points(url_array, flags, timeout)))
+    if (!url_array->cUrl || url_array->cUrl > MAX_REVOCATION_URLS ||
+            !url_array->rgwszUrl)
     {
         CryptMemFree(url_array);
-        return CRYPT_E_REVOCATION_OFFLINE;
+        return CRYPT_E_NO_REVOCATION_CHECK;
     }
 
-    error = verify_cert_revocation_with_crl_online(cert, crl, time, status);
+    timeout = get_revocation_url_timeout(params);
+    if ((flags & CERT_VERIFY_REV_ACCUMULATIVE_TIMEOUT_FLAG) && timeout && !deadline)
+        deadline = CRYPT_MakeDeadline(timeout);
 
-    *next_update = crl->pCrlInfo->NextUpdate;
+    for (i = 0; i < url_array->cUrl; ++i)
+    {
+        const CRL_CONTEXT *crl = NULL;
+        DWORD retrieve_flags = CRYPT_DONT_CACHE_RESULT |
+                CRYPT_CACHE_ONLY_RETRIEVAL;
+        DWORD url_timeout = timeout;
+        unsigned int attempt, attempts =
+                (flags & CERT_VERIFY_CACHE_ONLY_BASED_REVOCATION) ? 1 : 2;
 
-    CertFreeCRLContext(crl);
+        if (!url_array->rgwszUrl[i] || !url_array->rgwszUrl[i][0])
+        {
+            error = CRYPT_E_NO_REVOCATION_CHECK;
+            continue;
+        }
+
+        for (attempt = 0; attempt < attempts; ++attempt)
+        {
+            CRYPT_DATA_BLOB blob;
+            CRYPT_BLOB_ARRAY object;
+
+            if (attempt)
+            {
+                retrieve_flags &= ~CRYPT_CACHE_ONLY_RETRIEVAL;
+                retrieve_flags |= CRYPT_WIRE_ONLY_RETRIEVAL;
+                url_timeout = timeout;
+                if ((flags & CERT_VERIFY_REV_ACCUMULATIVE_TIMEOUT_FLAG) &&
+                        deadline && !CRYPT_GetRemainingTimeout(deadline,
+                            &url_timeout))
+                {
+                    error = GetLastError();
+                    goto done;
+                }
+            }
+
+            if (!CryptRetrieveObjectByUrlW(url_array->rgwszUrl[i],
+                    CONTEXT_OID_CRL, retrieve_flags, url_timeout,
+                    (void **)&crl, NULL, NULL, NULL, NULL))
+            {
+                error = GetLastError();
+                if (!attempt && attempts > 1)
+                    continue;
+                break;
+            }
+
+            error = verify_cert_revocation_with_crl_online(cert,
+                    params->pIssuerCert, crl, time, status, this_update,
+                    next_update, revocation_time);
+            if (error == ERROR_SUCCESS || error == CRYPT_E_REVOKED)
+            {
+                if (attempt)
+                {
+                    blob.cbData = crl->cbCrlEncoded;
+                    blob.pbData = crl->pbCrlEncoded;
+                    object.cBlob = 1;
+                    object.rgBlob = &blob;
+                    CRYPT_CacheURL(url_array->rgwszUrl[i], &object, 0,
+                            *next_update);
+                }
+                CertFreeCRLContext(crl);
+                goto done;
+            }
+            CertFreeCRLContext(crl);
+            crl = NULL;
+            if (!attempt)
+                DeleteUrlCacheEntryW(url_array->rgwszUrl[i]);
+        }
+    }
+
+done:
     CryptMemFree(url_array);
     return error;
 }
 
-static void sha1_hash(const BYTE *data, DWORD datalen, BYTE *buf, DWORD *buflen)
+static BOOL sha1_hash(const BYTE *data, DWORD datalen, BYTE *buf, DWORD *buflen)
 {
-    HCRYPTPROV prov;
-    HCRYPTHASH hash;
+    HCRYPTPROV prov = 0;
+    HCRYPTHASH hash = 0;
+    BOOL ret = FALSE;
 
-    CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT);
-    CryptCreateHash(prov, CALG_SHA1, 0, 0, &hash);
-    CryptHashData(hash, data, datalen, 0);
-    CryptGetHashParam(hash, HP_HASHVAL, buf, buflen, 0);
+    if (!CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL,
+            CRYPT_VERIFYCONTEXT) || !CryptCreateHash(prov, CALG_SHA1, 0, 0,
+            &hash) || !CryptHashData(hash, data, datalen, 0) ||
+            !CryptGetHashParam(hash, HP_HASHVAL, buf, buflen, 0))
+        goto done;
+    ret = TRUE;
 
-    CryptDestroyHash(hash);
-    CryptReleaseContext(prov, 0);
+done:
+    if (hash) CryptDestroyHash(hash);
+    if (prov) CryptReleaseContext(prov, 0);
+    return ret;
 }
 
 static BYTE *build_ocsp_request(const CERT_CONTEXT *cert, const CERT_CONTEXT *issuer_cert, DWORD *ret_size)
@@ -1777,12 +2206,17 @@ static BYTE *build_ocsp_request(const CERT_CONTEXT *cert, const CERT_CONTEXT *is
     memset(&entry, 0, sizeof(entry));
     entry.CertId.HashAlgorithm.pszObjId = (char *)szOID_OIWSEC_sha1;
 
-    sha1_hash(issuer->Subject.pbData, issuer->Subject.cbData, issuer_name_hash, &hash_len);
+    if (!sha1_hash(issuer->Subject.pbData, issuer->Subject.cbData,
+            issuer_name_hash, &hash_len))
+        return NULL;
     entry.CertId.IssuerNameHash.cbData = sizeof(issuer_name_hash);
     entry.CertId.IssuerNameHash.pbData = issuer_name_hash;
 
-    sha1_hash(issuer->SubjectPublicKeyInfo.PublicKey.pbData, issuer->SubjectPublicKeyInfo.PublicKey.cbData,
-              issuer_key_hash, &hash_len);
+    hash_len = sizeof(issuer_key_hash);
+    if (!sha1_hash(issuer->SubjectPublicKeyInfo.PublicKey.pbData,
+            issuer->SubjectPublicKeyInfo.PublicKey.cbData, issuer_key_hash,
+            &hash_len))
+        return NULL;
     entry.CertId.IssuerKeyHash.cbData = sizeof(issuer_key_hash);
     entry.CertId.IssuerKeyHash.pbData = issuer_key_hash;
 
@@ -1883,36 +2317,34 @@ static WCHAR *build_request_url(const WCHAR *base_url, const BYTE *data, DWORD d
     return ret;
 }
 
-static DWORD map_ocsp_status(DWORD status)
-{
-    switch (status)
-    {
-    case OCSP_BASIC_GOOD_CERT_STATUS: return ERROR_SUCCESS;
-    case OCSP_BASIC_REVOKED_CERT_STATUS: return CRYPT_E_REVOKED;
-    case OCSP_BASIC_UNKNOWN_CERT_STATUS: return CRYPT_E_REVOCATION_OFFLINE;
-    default:
-        FIXME("unhandled status %lu\n", status);
-        return CRYPT_E_REVOCATION_OFFLINE;
-    }
-}
-
 static BOOL match_cert_id(const OCSP_CERT_ID *id, const CERT_INFO *cert, const CERT_INFO *issuer)
 {
     BYTE hash[20];
     DWORD hash_len = sizeof(hash);
 
-    if (!id->HashAlgorithm.pszObjId || strcmp(id->HashAlgorithm.pszObjId, szOID_OIWSEC_sha1))
+    if (!id || !cert || !issuer || !id->HashAlgorithm.pszObjId ||
+            strcmp(id->HashAlgorithm.pszObjId, szOID_OIWSEC_sha1) ||
+            id->IssuerNameHash.cbData != sizeof(hash) ||
+            !id->IssuerNameHash.pbData ||
+            id->IssuerKeyHash.cbData != sizeof(hash) ||
+            !id->IssuerKeyHash.pbData || !id->SerialNumber.cbData ||
+            !id->SerialNumber.pbData || !cert->SerialNumber.cbData ||
+            !cert->SerialNumber.pbData)
     {
-        FIXME("hash algorithm %s not supported\n", debugstr_a(id->HashAlgorithm.pszObjId));
+        WARN("unsupported or malformed OCSP certificate identifier\n");
         return FALSE;
     }
 
-    sha1_hash(issuer->Subject.pbData, issuer->Subject.cbData, hash, &hash_len);
+    if (!sha1_hash(issuer->Subject.pbData, issuer->Subject.cbData, hash,
+            &hash_len))
+        return FALSE;
     if (id->IssuerNameHash.cbData != hash_len) return FALSE;
     if (memcmp(id->IssuerNameHash.pbData, hash, hash_len)) return FALSE;
 
-    sha1_hash(issuer->SubjectPublicKeyInfo.PublicKey.pbData,
-              issuer->SubjectPublicKeyInfo.PublicKey.cbData, hash, &hash_len);
+    hash_len = sizeof(hash);
+    if (!sha1_hash(issuer->SubjectPublicKeyInfo.PublicKey.pbData,
+            issuer->SubjectPublicKeyInfo.PublicKey.cbData, hash, &hash_len))
+        return FALSE;
     if (id->IssuerKeyHash.cbData != hash_len) return FALSE;
     if (memcmp(id->IssuerKeyHash.pbData, hash, hash_len)) return FALSE;
 
@@ -1920,85 +2352,406 @@ static BOOL match_cert_id(const OCSP_CERT_ID *id, const CERT_INFO *cert, const C
     return !memcmp(cert->SerialNumber.pbData, id->SerialNumber.pbData, id->SerialNumber.cbData);
 }
 
-static DWORD check_ocsp_response_info(const CERT_INFO *cert, const CERT_INFO *issuer,
-                                      const CRYPT_OBJID_BLOB *blob, DWORD *status, FILETIME *next_update)
+static BOOL ocsp_responder_matches_certificate(
+        const OCSP_BASIC_RESPONSE_INFO *info, const CERT_INFO *certificate)
+{
+    BYTE hash[20];
+    DWORD hash_len = sizeof(hash);
+
+    switch (info->dwResponderIdChoice)
+    {
+    case OCSP_BASIC_BY_NAME_RESPONDER_ID:
+        return CertCompareCertificateName(X509_ASN_ENCODING,
+                (CERT_NAME_BLOB *)&info->ByNameResponderId,
+                (CERT_NAME_BLOB *)&certificate->Subject);
+
+    case OCSP_BASIC_BY_KEY_RESPONDER_ID:
+        if (!sha1_hash(certificate->SubjectPublicKeyInfo.PublicKey.pbData,
+                certificate->SubjectPublicKeyInfo.PublicKey.cbData, hash,
+                &hash_len))
+            return FALSE;
+        return info->ByKeyResponderId.cbData == hash_len &&
+                !memcmp(info->ByKeyResponderId.pbData, hash, hash_len);
+
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL add_filetime_seconds(const FILETIME *input, DWORD seconds,
+        FILETIME *output)
+{
+    ULARGE_INTEGER value;
+    ULONGLONG addition = (ULONGLONG)seconds * 10000000;
+
+    value.LowPart = input->dwLowDateTime;
+    value.HighPart = input->dwHighDateTime;
+    if (value.QuadPart > ~(ULONGLONG)0 - addition)
+        return FALSE;
+    value.QuadPart += addition;
+    output->dwLowDateTime = value.LowPart;
+    output->dwHighDateTime = value.HighPart;
+    return TRUE;
+}
+
+static BOOL ocsp_response_time_is_valid(const OCSP_BASIC_RESPONSE_INFO *info,
+        const OCSP_BASIC_RESPONSE_ENTRY *entry, const FILETIME *verification_time,
+        FILETIME *effective_next_update)
+{
+    FILETIME latest;
+
+    if (filetime_is_zero(&info->ProducedAt) ||
+            filetime_is_zero(&entry->ThisUpdate) ||
+            !add_filetime_seconds(verification_time, OCSP_CLOCK_SKEW_SECONDS,
+                &latest))
+        return FALSE;
+    if (CompareFileTime(&info->ProducedAt, &latest) > 0 ||
+            CompareFileTime(&entry->ThisUpdate, &latest) > 0 ||
+            CompareFileTime(&info->ProducedAt, &entry->ThisUpdate) < 0)
+        return FALSE;
+
+    if (!filetime_is_zero(&entry->NextUpdate))
+    {
+        if (CompareFileTime(&entry->ThisUpdate, &entry->NextUpdate) >= 0 ||
+                CompareFileTime(verification_time, &entry->NextUpdate) >= 0 ||
+                CompareFileTime(&info->ProducedAt, &entry->NextUpdate) >= 0)
+            return FALSE;
+        *effective_next_update = entry->NextUpdate;
+    }
+    else
+    {
+        if (!add_filetime_seconds(&entry->ThisUpdate,
+                OCSP_NO_NEXT_UPDATE_MAX_AGE_SECONDS, effective_next_update) ||
+                CompareFileTime(verification_time, effective_next_update) >= 0)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL ocsp_extensions_are_supported(DWORD count,
+        const CERT_EXTENSION *extensions)
+{
+    DWORD i;
+
+    if (!extensions_are_unique(count, extensions)) return FALSE;
+    for (i = 0; i < count; ++i)
+        if (extensions[i].fCritical)
+        {
+            WARN("unsupported critical OCSP extension %s\n",
+                    debugstr_a(extensions[i].pszObjId));
+            return FALSE;
+        }
+    return TRUE;
+}
+
+static BOOL certificate_has_ocsp_signing_eku(const CERT_CONTEXT *certificate)
+{
+    CERT_ENHKEY_USAGE *usage;
+    PCERT_EXTENSION extension;
+    DWORD size, i;
+    BOOL found = FALSE;
+
+    if (!extensions_are_unique(certificate->pCertInfo->cExtension,
+            certificate->pCertInfo->rgExtension))
+        return FALSE;
+    extension = CertFindExtension(szOID_ENHANCED_KEY_USAGE,
+            certificate->pCertInfo->cExtension,
+            certificate->pCertInfo->rgExtension);
+    if (!extension || !CryptDecodeObjectEx(certificate->dwCertEncodingType,
+            X509_ENHANCED_KEY_USAGE, extension->Value.pbData,
+            extension->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &usage,
+            &size))
+        return FALSE;
+    for (i = 0; i < usage->cUsageIdentifier; ++i)
+        if (usage->rgpszUsageIdentifier[i] &&
+                !strcmp(usage->rgpszUsageIdentifier[i],
+                szOID_PKIX_KP_OCSP_SIGNING_LOCAL))
+        {
+            found = TRUE;
+            break;
+        }
+    LocalFree(usage);
+    return found;
+}
+
+static BOOL ocsp_delegate_has_supported_critical_extensions(
+        const CERT_CONTEXT *certificate)
+{
+    DWORD i;
+
+    if (!extensions_are_unique(certificate->pCertInfo->cExtension,
+            certificate->pCertInfo->rgExtension))
+        return FALSE;
+    for (i = 0; i < certificate->pCertInfo->cExtension; ++i)
+    {
+        const CERT_EXTENSION *extension =
+                certificate->pCertInfo->rgExtension + i;
+
+        if (!extension->fCritical) continue;
+        if (!extension->pszObjId) return FALSE;
+        if (!strcmp(extension->pszObjId, szOID_ENHANCED_KEY_USAGE) ||
+                !strcmp(extension->pszObjId, szOID_KEY_USAGE) ||
+                !strcmp(extension->pszObjId, szOID_BASIC_CONSTRAINTS2) ||
+                !strcmp(extension->pszObjId, szOID_SUBJECT_KEY_IDENTIFIER) ||
+                !strcmp(extension->pszObjId,
+                    szOID_AUTHORITY_KEY_IDENTIFIER2) ||
+                !strcmp(extension->pszObjId,
+                    szOID_PKIX_OCSP_NOCHECK_LOCAL))
+            continue;
+        WARN("unsupported critical OCSP responder extension %s\n",
+                debugstr_a(extension->pszObjId));
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL ocsp_delegate_is_authorized(const CERT_CONTEXT *certificate,
+        const CERT_CONTEXT *issuer, const FILETIME *verification_time)
+{
+    CRYPT_BIT_BLOB usage;
+    PCERT_EXTENSION extension;
+    FILETIME time = *verification_time;
+    BOOL is_ca;
+    DWORD size;
+
+    if (!CertCompareCertificateName(certificate->dwCertEncodingType,
+            &certificate->pCertInfo->Issuer, &issuer->pCertInfo->Subject) ||
+            CertVerifyTimeValidity(&time, certificate->pCertInfo) ||
+            !CryptVerifyCertificateSignatureEx(0,
+                certificate->dwCertEncodingType,
+                CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT, (void *)certificate,
+                CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT, (void *)issuer, 0, NULL) ||
+            !certificate_is_ca(certificate, &is_ca) || is_ca ||
+            !certificate_has_ocsp_signing_eku(certificate) ||
+            !ocsp_delegate_has_supported_critical_extensions(certificate))
+        return FALSE;
+
+    if (!extensions_are_unique(certificate->pCertInfo->cExtension,
+            certificate->pCertInfo->rgExtension))
+        return FALSE;
+    extension = CertFindExtension(szOID_KEY_USAGE,
+            certificate->pCertInfo->cExtension,
+            certificate->pCertInfo->rgExtension);
+    if (!extension) return TRUE;
+    size = sizeof(usage);
+    return CryptDecodeObjectEx(certificate->dwCertEncodingType, X509_BITS,
+            extension->Value.pbData, extension->Value.cbData,
+            CRYPT_DECODE_NOCOPY_FLAG, NULL, &usage, &size) && usage.cbData &&
+            usage.cbData <= 2 &&
+            (usage.pbData[0] & CERT_DIGITAL_SIGNATURE_KEY_USAGE);
+}
+
+static const CERT_CONTEXT *find_ocsp_signer(
+        const CRYPT_OBJID_BLOB *response_info,
+        const OCSP_SIGNATURE_INFO *signature, const CERT_CONTEXT *issuer,
+        const FILETIME *verification_time)
 {
     OCSP_BASIC_RESPONSE_INFO *info;
-    DWORD size, i;
+    const CERT_CONTEXT *signer = NULL;
+    DWORD size, i, matches = 0;
 
+    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, OCSP_BASIC_RESPONSE,
+            response_info->pbData, response_info->cbData,
+            CRYPT_DECODE_ALLOC_FLAG, NULL, &info, &size))
+        return NULL;
+    if (info->dwVersion != OCSP_BASIC_RESPONSE_V1 ||
+            signature->cCertEncoded > MAX_OCSP_EMBEDDED_CERTIFICATES ||
+            (signature->cCertEncoded && !signature->rgCertEncoded))
+        goto done;
+
+    if (ocsp_responder_matches_certificate(info, issuer->pCertInfo))
+    {
+        signer = CertDuplicateCertificateContext(issuer);
+        goto done;
+    }
+
+    for (i = 0; i < signature->cCertEncoded; ++i)
+    {
+        const CERT_BLOB *blob = signature->rgCertEncoded + i;
+        const CERT_CONTEXT *candidate;
+
+        if (!blob->cbData || !blob->pbData) continue;
+        candidate = CertCreateCertificateContext(X509_ASN_ENCODING,
+                blob->pbData, blob->cbData);
+
+        if (!candidate) continue;
+        if (ocsp_responder_matches_certificate(info,
+                candidate->pCertInfo))
+        {
+            ++matches;
+            if (matches == 1 && ocsp_delegate_is_authorized(candidate,
+                    issuer, verification_time))
+                signer = CertDuplicateCertificateContext(candidate);
+        }
+        CertFreeCertificateContext(candidate);
+    }
+    if (matches != 1)
+    {
+        CertFreeCertificateContext(signer);
+        signer = NULL;
+    }
+
+done:
+    LocalFree(info);
+    return signer;
+}
+
+static DWORD check_ocsp_response_info(const CERT_CONTEXT *cert,
+        const CERT_CONTEXT *issuer, const CRYPT_OBJID_BLOB *blob,
+        const FILETIME *verification_time, CERT_REVOCATION_STATUS *rev_status,
+        FILETIME *this_update, FILETIME *next_update,
+        FILETIME *revocation_time)
+{
+    OCSP_BASIC_RESPONSE_INFO *info;
+    DWORD size, i, matches = 0, result = CRYPT_E_NO_REVOCATION_CHECK;
+
+    memset(this_update, 0, sizeof(*this_update));
     memset(next_update, 0, sizeof(*next_update));
-    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, OCSP_BASIC_RESPONSE, blob->pbData, blob->cbData,
-                             CRYPT_DECODE_ALLOC_FLAG, NULL, &info, &size)) return GetLastError();
+    memset(revocation_time, 0, sizeof(*revocation_time));
+    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, OCSP_BASIC_RESPONSE,
+            blob->pbData, blob->cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &info,
+            &size))
+        return GetLastError();
+    if (info->dwVersion != OCSP_BASIC_RESPONSE_V1 ||
+            !info->cResponseEntry ||
+            info->cResponseEntry > MAX_OCSP_RESPONSE_ENTRIES ||
+            !info->rgResponseEntry ||
+            !ocsp_extensions_are_supported(info->cExtension,
+                info->rgExtension))
+        goto done;
 
-    FIXME("check responder id\n");
     for (i = 0; i < info->cResponseEntry; i++)
     {
         OCSP_BASIC_RESPONSE_ENTRY *entry = &info->rgResponseEntry[i];
-        if (match_cert_id(&entry->CertId, cert, issuer))
+        if (match_cert_id(&entry->CertId, cert->pCertInfo,
+                issuer->pCertInfo))
         {
-            *status = map_ocsp_status(entry->dwCertStatus);
-            *next_update = entry->NextUpdate;
+            if (++matches != 1)
+            {
+                memset(this_update, 0, sizeof(*this_update));
+                memset(next_update, 0, sizeof(*next_update));
+                memset(revocation_time, 0, sizeof(*revocation_time));
+                result = CRYPT_E_NO_REVOCATION_CHECK;
+                goto done;
+            }
+            if (!ocsp_extensions_are_supported(entry->cExtension,
+                    entry->rgExtension))
+            {
+                result = CRYPT_E_NO_REVOCATION_CHECK;
+                goto done;
+            }
+            if (!ocsp_response_time_is_valid(info, entry,
+                    verification_time, next_update))
+            {
+                result = CRYPT_E_REVOCATION_OFFLINE;
+                goto done;
+            }
+            *this_update = entry->ThisUpdate;
+            switch (entry->dwCertStatus)
+            {
+            case OCSP_BASIC_GOOD_CERT_STATUS:
+                result = ERROR_SUCCESS;
+                break;
+            case OCSP_BASIC_REVOKED_CERT_STATUS:
+                if (!entry->pRevokedInfo ||
+                        filetime_is_zero(&entry->pRevokedInfo->RevocationDate))
+                {
+                    result = CRYPT_E_NO_REVOCATION_CHECK;
+                    goto done;
+                }
+                *revocation_time = entry->pRevokedInfo->RevocationDate;
+                if (CompareFileTime(verification_time,
+                        revocation_time) < 0)
+                    result = ERROR_SUCCESS;
+                else
+                {
+                    rev_status->dwReason =
+                            entry->pRevokedInfo->dwCrlReasonCode;
+                    result = CRYPT_E_REVOKED;
+                }
+                break;
+            case OCSP_BASIC_UNKNOWN_CERT_STATUS:
+                result = CRYPT_E_REVOCATION_OFFLINE;
+                break;
+            default:
+                result = CRYPT_E_NO_REVOCATION_CHECK;
+                break;
+            }
         }
     }
 
+done:
     LocalFree(info);
-    return ERROR_SUCCESS;
+    return result;
 }
 
-static DWORD verify_signed_ocsp_response_info(const CERT_INFO *cert, const CERT_INFO *issuer,
-                                              const CRYPT_OBJID_BLOB *blob, FILETIME *next_update)
+static DWORD verify_signed_ocsp_response_info(const CERT_CONTEXT *cert,
+        const CERT_CONTEXT *issuer, const CRYPT_OBJID_BLOB *blob,
+        const FILETIME *verification_time, CERT_REVOCATION_STATUS *rev_status,
+        FILETIME *this_update, FILETIME *next_update,
+        FILETIME *revocation_time)
 {
     OCSP_BASIC_SIGNED_RESPONSE_INFO *info;
-    DWORD size, error, status = CRYPT_E_REVOCATION_OFFLINE;
-    CRYPT_ALGORITHM_IDENTIFIER *alg;
+    CERT_SIGNED_CONTENT_INFO signed_content;
+    const CERT_CONTEXT *signer = NULL;
+    BYTE *encoded_signed = NULL;
+    DWORD size, encoded_size, error;
     CRYPT_BIT_BLOB *sig;
-    HCRYPTPROV prov = 0;
-    HCRYPTHASH hash = 0;
-    HCRYPTKEY key = 0;
-    DWORD algid;
 
     if (!CryptDecodeObjectEx(X509_ASN_ENCODING, OCSP_BASIC_SIGNED_RESPONSE, blob->pbData, blob->cbData,
                              CRYPT_DECODE_ALLOC_FLAG, NULL, &info, &size)) return GetLastError();
 
-    if ((error = check_ocsp_response_info(cert, issuer, &info->ToBeSigned, &status, next_update))) goto done;
-
-    alg = &info->SignatureInfo.SignatureAlgorithm;
-    if (!alg->pszObjId || !(algid = CertOIDToAlgId(alg->pszObjId)))
+    if (!(signer = find_ocsp_signer(&info->ToBeSigned,
+            &info->SignatureInfo, issuer, verification_time)))
     {
-        FIXME("unhandled signature algorithm %s\n", debugstr_a(alg->pszObjId));
         error = CRYPT_E_NO_REVOCATION_CHECK;
         goto done;
     }
 
-    if (!CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) goto done;
-    if (!CryptCreateHash(prov, algid, 0, 0, &hash)) goto done;
-    if (!CryptHashData(hash, info->ToBeSigned.pbData, info->ToBeSigned.cbData, 0)) goto done;
-
     sig = &info->SignatureInfo.Signature;
-    if (!CryptImportPublicKeyInfoEx(prov, X509_ASN_ENCODING, (CERT_PUBLIC_KEY_INFO *)&issuer->SubjectPublicKeyInfo,
-                                    0, 0, NULL, &key))
+    if (!sig->cbData || sig->cUnusedBits)
+    {
+        error = CRYPT_E_NO_REVOCATION_CHECK;
+        goto done;
+    }
+    signed_content.ToBeSigned = info->ToBeSigned;
+    signed_content.SignatureAlgorithm =
+            info->SignatureInfo.SignatureAlgorithm;
+    signed_content.Signature = *sig;
+    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, X509_CERT, &signed_content,
+            CRYPT_ENCODE_ALLOC_FLAG |
+            CRYPT_ENCODE_NO_SIGNATURE_BYTE_REVERSAL_FLAG, NULL,
+            &encoded_signed, &encoded_size))
     {
         error = GetLastError();
-        TRACE("failed to import public key %#lx\n", error);
+        goto done;
     }
-    else if (!CryptVerifySignatureW(hash, sig->pbData, sig->cbData, key, NULL, 0))
+    SetLastError(ERROR_SUCCESS);
+    if (!CryptVerifyCertificateSignature(0, X509_ASN_ENCODING,
+            encoded_signed, encoded_size,
+            &signer->pCertInfo->SubjectPublicKeyInfo))
     {
         error = GetLastError();
-        TRACE("failed to verify signature %#lx\n", error);
+        if (!error) error = NTE_BAD_SIGNATURE;
+        TRACE("failed to verify OCSP signature %#lx\n", error);
+        goto done;
     }
-    else error = ERROR_SUCCESS;
+    error = check_ocsp_response_info(cert, issuer, &info->ToBeSigned,
+            verification_time, rev_status, this_update, next_update,
+            revocation_time);
 
 done:
-    CryptDestroyKey(key);
-    CryptDestroyHash(hash);
-    CryptReleaseContext(prov, 0);
+    if (signer) CertFreeCertificateContext(signer);
+    LocalFree(encoded_signed);
     LocalFree(info);
-    if (error) return error;
-    return status;
+    return error;
 }
 
-static DWORD handle_ocsp_response(const CERT_INFO *cert, const CERT_INFO *issuer, const BYTE *encoded,
-                                  DWORD encoded_size, FILETIME *next_update)
+static DWORD handle_ocsp_response(const CERT_CONTEXT *cert,
+        const CERT_CONTEXT *issuer, const BYTE *encoded, DWORD encoded_size,
+        const FILETIME *verification_time, CERT_REVOCATION_STATUS *rev_status,
+        FILETIME *this_update, FILETIME *next_update,
+        FILETIME *revocation_time)
 {
     OCSP_RESPONSE_INFO *info;
     DWORD size, error = CRYPT_E_NO_REVOCATION_CHECK;
@@ -2014,7 +2767,9 @@ static DWORD handle_ocsp_response(const CERT_INFO *cert, const CERT_INFO *issuer
             FIXME("unhandled response type %s\n", debugstr_a(info->pszObjId));
             break;
         }
-        error = verify_signed_ocsp_response_info(cert, issuer, &info->Value, next_update);
+        error = verify_signed_ocsp_response_info(cert, issuer, &info->Value,
+                verification_time, rev_status, this_update, next_update,
+                revocation_time);
         break;
 
     default:
@@ -2026,15 +2781,144 @@ static DWORD handle_ocsp_response(const CERT_INFO *cert, const CERT_INFO *issuer
     return error;
 }
 
-static DWORD verify_cert_revocation_with_ocsp(const CERT_CONTEXT *cert, const WCHAR *base_url,
-                                              const CERT_REVOCATION_PARA *revpara, FILETIME *next_update)
+static BOOL set_http_deadline_options(HINTERNET handle, ULONGLONG deadline, BOOL connect)
+{
+    DWORD timeout;
+
+    if (!deadline)
+        return TRUE;
+    if (!CRYPT_GetRemainingTimeout(deadline, &timeout))
+        return FALSE;
+    if (connect && !InternetSetOptionW(handle, INTERNET_OPTION_CONNECT_TIMEOUT,
+            &timeout, sizeof(timeout)))
+        return FALSE;
+    if (!InternetSetOptionW(handle, INTERNET_OPTION_SEND_TIMEOUT, &timeout,
+            sizeof(timeout)))
+        return FALSE;
+    if (!InternetSetOptionW(handle, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout,
+            sizeof(timeout)))
+        return FALSE;
+    return TRUE;
+}
+
+static BOOL query_http_status(HINTERNET request, DWORD *status)
+{
+    DWORD size = sizeof(*status);
+
+    *status = 0;
+    return HttpQueryInfoW(request, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+            status, &size, NULL);
+}
+
+static BOOL http_deadline_is_valid(ULONGLONG deadline)
+{
+    DWORD remaining;
+
+    return !deadline || CRYPT_GetRemainingTimeout(deadline, &remaining);
+}
+
+static BOOL read_http_response(HINTERNET request, DWORD limit, ULONGLONG deadline,
+        BYTE **data, DWORD *data_size)
+{
+    BYTE *buffer = NULL, *new_buffer;
+    DWORD content_length = 0, size = sizeof(content_length), capacity, count;
+    BOOL have_content_length, ret = FALSE;
+
+    *data = NULL;
+    *data_size = 0;
+    have_content_length = HttpQueryInfoW(request,
+            HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER,
+            &content_length, &size, NULL);
+    if (have_content_length && (!content_length || content_length > limit))
+    {
+        SetLastError(content_length ? ERROR_FILE_TOO_LARGE : ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    capacity = have_content_length ? content_length : min(limit, 4096u);
+    if (!(buffer = malloc(capacity)))
+    {
+        SetLastError(ERROR_OUTOFMEMORY);
+        return FALSE;
+    }
+
+    for (;;)
+    {
+        if (*data_size == capacity)
+        {
+            if (have_content_length || capacity == limit)
+            {
+                BYTE extra;
+
+                if (!set_http_deadline_options(request, deadline, FALSE) ||
+                        !InternetReadFile(request, &extra, sizeof(extra),
+                            &count) || !http_deadline_is_valid(deadline))
+                    break;
+                if (count)
+                    SetLastError(have_content_length ? ERROR_INVALID_DATA :
+                            ERROR_FILE_TOO_LARGE);
+                else
+                    ret = TRUE;
+                break;
+            }
+
+            size = capacity > limit / 2 ? limit : capacity * 2;
+            if (!(new_buffer = realloc(buffer, size)))
+            {
+                SetLastError(ERROR_OUTOFMEMORY);
+                break;
+            }
+            buffer = new_buffer;
+            capacity = size;
+        }
+
+        if (!set_http_deadline_options(request, deadline, FALSE) ||
+                !InternetReadFile(request, buffer + *data_size,
+                    capacity - *data_size, &count) ||
+                !http_deadline_is_valid(deadline))
+            break;
+        if (!count)
+        {
+            if (have_content_length && *data_size != content_length)
+                SetLastError(ERROR_INVALID_DATA);
+            else if (!*data_size)
+                SetLastError(ERROR_INVALID_DATA);
+            else
+                ret = TRUE;
+            break;
+        }
+        if (count > capacity - *data_size)
+        {
+            SetLastError(ERROR_INVALID_DATA);
+            break;
+        }
+        *data_size += count;
+    }
+
+    if (ret)
+        *data = buffer;
+    else
+    {
+        free(buffer);
+        *data_size = 0;
+    }
+    return ret;
+}
+
+static DWORD verify_cert_revocation_with_ocsp(const CERT_CONTEXT *cert,
+        const WCHAR *base_url, const CERT_REVOCATION_PARA *revpara,
+        const FILETIME *verification_time, CERT_REVOCATION_STATUS *rev_status,
+        FILETIME *this_update, FILETIME *next_update,
+        FILETIME *revocation_time, ULONGLONG deadline)
 {
     HINTERNET ses = NULL, con = NULL, req = NULL;
+    BOOL response_received = FALSE;
     BYTE *request_data = NULL, *response_data = NULL;
-    DWORD size, status, request_len, response_len, count, ret = CRYPT_E_REVOCATION_OFFLINE;
-    DWORD flags = INTERNET_FLAG_KEEP_CONNECTION;
+    DWORD status = 0, request_len, response_len, ret = CRYPT_E_REVOCATION_OFFLINE;
+    DWORD flags = INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_RELOAD |
+            INTERNET_FLAG_NO_CACHE_WRITE;
     URL_COMPONENTSW comp;
-    WCHAR *url = NULL;
+    WCHAR *url = NULL, *host = NULL;
 
     if (!revpara || !revpara->pIssuerCert)
     {
@@ -2043,6 +2927,8 @@ static DWORD verify_cert_revocation_with_ocsp(const CERT_CONTEXT *cert, const WC
     }
     if (!(request_data = build_ocsp_request(cert, revpara->pIssuerCert, &request_len)))
         return CRYPT_E_REVOCATION_OFFLINE;
+    if (!deadline)
+        deadline = CRYPT_MakeDeadline(get_revocation_url_timeout(revpara));
 
     url = build_request_url(base_url, request_data, request_len);
     if (!url)
@@ -2079,32 +2965,59 @@ static DWORD verify_cert_revocation_with_ocsp(const CERT_CONTEXT *cert, const WC
         ret = GetLastError();
         goto done;
     }
-    comp.lpszHostName[comp.dwHostNameLength] = 0;
-    if (!(con = InternetConnectW(ses, comp.lpszHostName, comp.nPort, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0)))
+    if (!set_http_deadline_options(ses, deadline, TRUE))
     {
         ret = GetLastError();
         goto done;
     }
-    comp.lpszHostName[comp.dwHostNameLength] = '/';
-    if (!(req = HttpOpenRequestW(con, NULL, comp.lpszUrlPath, NULL, NULL, NULL, flags, 0)) ||
-        !HttpSendRequestW(req, NULL, 0, NULL, 0)) goto done;
-
-    size = sizeof(status);
-    if (!HttpQueryInfoW(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &size, NULL)) goto done;
-    if (status == HTTP_STATUS_OK)
+    if (!(host = malloc((comp.dwHostNameLength + 1) * sizeof(*host))))
     {
-        size = sizeof(response_len);
-        if (!HttpQueryInfoW(req, HTTP_QUERY_FLAG_NUMBER | HTTP_QUERY_CONTENT_LENGTH, &response_len, &size, 0) ||
-            !response_len || !(response_data = malloc(response_len)) ||
-            !InternetReadFile(req, response_data, response_len, &count) || count != response_len) goto done;
-
-        ret = handle_ocsp_response(cert->pCertInfo, revpara->pIssuerCert->pCertInfo, response_data, response_len,
-                                   next_update);
+        ret = ERROR_OUTOFMEMORY;
+        goto done;
+    }
+    memcpy(host, comp.lpszHostName, comp.dwHostNameLength * sizeof(*host));
+    host[comp.dwHostNameLength] = 0;
+    if (!(con = InternetConnectW(ses, host, comp.nPort, NULL, NULL,
+            INTERNET_SERVICE_HTTP, 0, 0)))
+    {
+        ret = GetLastError();
+        goto done;
+    }
+    if (!http_deadline_is_valid(deadline))
+    {
+        ret = GetLastError();
+        goto done;
+    }
+    if (!(req = HttpOpenRequestW(con, NULL, comp.lpszUrlPath, NULL, NULL, NULL,
+            flags, 0)))
+        ret = GetLastError();
+    else if (!set_http_deadline_options(req, deadline, FALSE) ||
+            !HttpSendRequestW(req, NULL, 0, NULL, 0) ||
+            !http_deadline_is_valid(deadline))
+        ret = GetLastError();
+    else if (!query_http_status(req, &status) ||
+            !http_deadline_is_valid(deadline))
+        ret = GetLastError();
+    else if (status == HTTP_STATUS_OK)
+    {
+        if (read_http_response(req, MAX_OCSP_RESPONSE_SIZE, deadline,
+                &response_data, &response_len))
+        {
+            response_received = TRUE;
+            ret = handle_ocsp_response(cert, revpara->pIssuerCert,
+                    response_data, response_len, verification_time,
+                    rev_status, this_update, next_update, revocation_time);
+        }
+        else
+            ret = GetLastError();
     }
     if (ret == ERROR_SUCCESS || ret == CRYPT_E_REVOKED) goto done;
+    if (response_received || ret == ERROR_FILE_TOO_LARGE || ret == ERROR_TIMEOUT ||
+            ret == ERROR_INTERNET_TIMEOUT)
+        goto done;
 
     WARN("GET OCSP request failed, status %lu, ret %#lx, retrying with POST.\n", status, ret);
-    InternetCloseHandle(req);
+    if (req) InternetCloseHandle(req);
     req = NULL;
     free(response_data);
     response_data = NULL;
@@ -2118,49 +3031,84 @@ static DWORD verify_cert_revocation_with_ocsp(const CERT_CONTEXT *cert, const WC
         goto done;
     }
     flags &= ~INTERNET_FLAG_KEEP_CONNECTION;
-    if (!(req = HttpOpenRequestW(con, L"POST", comp.lpszUrlPath, NULL, NULL, NULL, flags, 0)) ||
-        !HttpSendRequestW(req, L"Content-Type: application/ocsp-request\0", -1, request_data, request_len)) goto done;
-    if (status != HTTP_STATUS_OK)
-     {
-        WARN("request status %lu.\n", status);
+    if (!(req = HttpOpenRequestW(con, L"POST", comp.lpszUrlPath, NULL, NULL,
+            NULL, flags, 0)) || !set_http_deadline_options(req, deadline, FALSE) ||
+            !HttpSendRequestW(req, L"Content-Type: application/ocsp-request\r\n",
+                -1, request_data, request_len) ||
+            !http_deadline_is_valid(deadline))
+    {
+        ret = GetLastError();
         goto done;
     }
-    if (!HttpQueryInfoW(req, HTTP_QUERY_FLAG_NUMBER | HTTP_QUERY_CONTENT_LENGTH, &response_len, &size, 0) ||
-        !response_len || !(response_data = malloc(response_len)) ||
-        !InternetReadFile(req, response_data, response_len, &count) || count != response_len) goto done;
+    if (!query_http_status(req, &status) ||
+            !http_deadline_is_valid(deadline))
+    {
+        ret = GetLastError();
+        goto done;
+    }
+    if (status != HTTP_STATUS_OK)
+    {
+        WARN("request status %lu.\n", status);
+        ret = CRYPT_E_REVOCATION_OFFLINE;
+        goto done;
+    }
+    if (!read_http_response(req, MAX_OCSP_RESPONSE_SIZE, deadline,
+            &response_data, &response_len))
+    {
+        ret = GetLastError();
+        goto done;
+    }
 
-    ret = handle_ocsp_response(cert->pCertInfo, revpara->pIssuerCert->pCertInfo, response_data, response_len,
-                               next_update);
+    ret = handle_ocsp_response(cert, revpara->pIssuerCert, response_data,
+            response_len, verification_time, rev_status, this_update,
+            next_update, revocation_time);
 
 done:
     LocalFree(request_data);
     free(url);
+    free(host);
     free(response_data);
-    InternetCloseHandle(req);
-    InternetCloseHandle(con);
-    InternetCloseHandle(ses);
+    if (req) InternetCloseHandle(req);
+    if (con) InternetCloseHandle(con);
+    if (ses) InternetCloseHandle(ses);
     return ret;
 }
 
 static DWORD verify_cert_revocation_from_aia_ext(const CRYPT_DATA_BLOB *value, const CERT_CONTEXT *cert,
         FILETIME *pTime, DWORD dwFlags, CERT_REVOCATION_PARA *pRevPara, CERT_REVOCATION_STATUS *pRevStatus,
-        FILETIME *next_update)
+        FILETIME *this_update, FILETIME *next_update,
+        FILETIME *revocation_time, ULONGLONG deadline)
 {
-    BOOL ret;
+    BOOL ret, found = FALSE;
     DWORD size, i, error = CRYPT_E_NO_REVOCATION_CHECK;
     CERT_AUTHORITY_INFO_ACCESS *aia;
 
     ret = CryptDecodeObjectEx(X509_ASN_ENCODING, X509_AUTHORITY_INFO_ACCESS, value->pbData, value->cbData,
                               CRYPT_DECODE_ALLOC_FLAG, NULL, &aia, &size);
     if (!ret) return GetLastError();
+    if (aia->cAccDescr > MAX_REVOCATION_URLS ||
+            (aia->cAccDescr && !aia->rgAccDescr))
+    {
+        LocalFree(aia);
+        return CRYPT_E_NO_REVOCATION_CHECK;
+    }
 
     for (i = 0; i < aia->cAccDescr; i++)
     {
-        if (!strcmp(aia->rgAccDescr[i].pszAccessMethod, szOID_PKIX_OCSP))
+        if (aia->rgAccDescr[i].pszAccessMethod &&
+                !strcmp(aia->rgAccDescr[i].pszAccessMethod,
+                    szOID_PKIX_OCSP))
         {
+            found = TRUE;
             if (aia->rgAccDescr[i].AccessLocation.dwAltNameChoice == CERT_ALT_NAME_URL)
             {
                 const WCHAR *url = aia->rgAccDescr[i].AccessLocation.pwszURL;
+
+                if (!url || !url[0])
+                {
+                    error = CRYPT_E_NO_REVOCATION_CHECK;
+                    continue;
+                }
                 TRACE("OCSP URL = %s\n", debugstr_w(url));
                 if (dwFlags & CERT_VERIFY_CACHE_ONLY_BASED_REVOCATION)
                 {
@@ -2169,7 +3117,9 @@ static DWORD verify_cert_revocation_from_aia_ext(const CRYPT_DATA_BLOB *value, c
                 }
                 else
                 {
-                    error = verify_cert_revocation_with_ocsp(cert, url, pRevPara, next_update);
+                    error = verify_cert_revocation_with_ocsp(cert, url,
+                            pRevPara, pTime, pRevStatus, this_update,
+                            next_update, revocation_time, deadline);
                 }
             }
             else
@@ -2177,47 +3127,81 @@ static DWORD verify_cert_revocation_from_aia_ext(const CRYPT_DATA_BLOB *value, c
                 FIXME("unsupported AccessLocation type %lu\n", aia->rgAccDescr[i].AccessLocation.dwAltNameChoice);
                 error = ERROR_NOT_SUPPORTED;
             }
-            break;
+            if (error == ERROR_SUCCESS || error == CRYPT_E_REVOKED)
+                break;
         }
     }
 
     LocalFree(aia);
-    return error;
+    return found ? error : CRYPT_E_NO_REVOCATION_CHECK;
 }
 
 static DWORD verify_cert_revocation_with_crl_offline(PCCERT_CONTEXT cert,
-        const CRL_CONTEXT *crl, FILETIME *pTime, CERT_REVOCATION_STATUS *pRevStatus)
+        const CERT_CONTEXT *issuer, const CRL_CONTEXT *crl, FILETIME *pTime,
+        CERT_REVOCATION_STATUS *pRevStatus)
 {
+    CRYPT_BIT_BLOB usage;
+    PCERT_EXTENSION extension;
     PCRL_ENTRY entry = NULL;
-    LONG valid;
+    DWORD reason, size;
 
-    valid = CompareFileTime(pTime, &crl->pCrlInfo->ThisUpdate);
-    if (valid <= 0)
+    if (!CertCompareCertificateName(issuer->dwCertEncodingType,
+            &issuer->pCertInfo->Subject, &crl->pCrlInfo->Issuer) ||
+            !extensions_are_unique(issuer->pCertInfo->cExtension,
+                issuer->pCertInfo->rgExtension))
+        return CRYPT_E_NO_REVOCATION_CHECK;
+    extension = CertFindExtension(szOID_KEY_USAGE,
+            issuer->pCertInfo->cExtension, issuer->pCertInfo->rgExtension);
+    if (extension)
     {
-        /* If this CRL is not older than the time being verified, there's no
-         * way to know whether the certificate was revoked.
-         */
+        size = sizeof(usage);
+        if (!CryptDecodeObjectEx(issuer->dwCertEncodingType, X509_BITS,
+                extension->Value.pbData, extension->Value.cbData,
+                CRYPT_DECODE_NOCOPY_FLAG, NULL, &usage, &size) ||
+                !usage.cbData || usage.cbData > 2 ||
+                !(usage.pbData[0] & CERT_CRL_SIGN_KEY_USAGE))
+            return CRYPT_E_NO_REVOCATION_CHECK;
+    }
+    if (!CryptVerifyCertificateSignatureEx(0, crl->dwCertEncodingType,
+            CRYPT_VERIFY_CERT_SIGN_SUBJECT_CRL, (void *)crl,
+            CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT, (void *)issuer, 0, NULL) ||
+            !crl_scope_is_complete_for_certificate(cert, crl))
+        return CRYPT_E_NO_REVOCATION_CHECK;
+
+    if (CompareFileTime(pTime, &crl->pCrlInfo->ThisUpdate) <= 0)
+    {
         TRACE("CRL not old enough\n");
         return CRYPT_E_REVOCATION_OFFLINE;
     }
-
     CertFindCertificateInCRL(cert, crl, 0, NULL, &entry);
     if (entry)
+    {
+        if (!crl_entry_reason(entry, &reason))
+            return CRYPT_E_NO_REVOCATION_CHECK;
+        if (CompareFileTime(pTime, &entry->RevocationDate) < 0)
+            return CRYPT_E_REVOCATION_OFFLINE;
+        pRevStatus->dwReason = reason;
         return CRYPT_E_REVOKED;
+    }
 
-    /* Since the CRL was not retrieved for the cert being checked, there's no
-     * guarantee it's fresh, so the cert *might* be okay, but it's safer not to
-     * guess. */
     TRACE("certificate not found\n");
     return CRYPT_E_REVOCATION_OFFLINE;
 }
 
 static DWORD verify_cert_revocation(const CERT_CONTEXT *cert, FILETIME *pTime,
-        DWORD dwFlags, CERT_REVOCATION_PARA *pRevPara, CERT_REVOCATION_STATUS *pRevStatus)
+        DWORD dwFlags, CERT_REVOCATION_PARA *pRevPara,
+        CERT_REVOCATION_STATUS *pRevStatus, ULONGLONG deadline)
 {
     DWORD error = ERROR_SUCCESS;
+    FILETIME this_update = {0};
     FILETIME next_update = {0};
+    FILETIME revocation_time = {0};
     PCERT_EXTENSION ext;
+    BOOL has_online_source = FALSE;
+
+    if (!extensions_are_unique(cert->pCertInfo->cExtension,
+            cert->pCertInfo->rgExtension))
+        return CRYPT_E_NO_REVOCATION_CHECK;
 
     if (find_cached_revocation_status(cert, pRevPara, pTime, pRevStatus))
     {
@@ -2230,19 +3214,23 @@ static DWORD verify_cert_revocation(const CERT_CONTEXT *cert, FILETIME *pTime,
 
     if ((ext = CertFindExtension(szOID_AUTHORITY_INFO_ACCESS, cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension)))
     {
-        error = verify_cert_revocation_from_aia_ext(&ext->Value, cert, pTime, dwFlags, pRevPara, pRevStatus,
-                                                    &next_update);
+        has_online_source = TRUE;
+        error = verify_cert_revocation_from_aia_ext(&ext->Value, cert, pTime,
+                dwFlags, pRevPara, pRevStatus, &this_update, &next_update,
+                &revocation_time, deadline);
         TRACE("verify_cert_revocation_from_aia_ext() returned %08lx\n", error);
         if (error == ERROR_SUCCESS || error == CRYPT_E_REVOKED) goto done;
     }
     if ((ext = CertFindExtension(szOID_CRL_DIST_POINTS, cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension)))
     {
-        error = verify_cert_revocation_from_dist_points_ext(&ext->Value, cert, pTime, dwFlags, pRevPara, pRevStatus,
-                                                            &next_update);
+        has_online_source = TRUE;
+        error = verify_cert_revocation_from_dist_points_ext(&ext->Value, cert,
+                pTime, dwFlags, pRevPara, pRevStatus, &this_update,
+                &next_update, &revocation_time, deadline);
         TRACE("verify_cert_revocation_from_dist_points_ext() returned %08lx\n", error);
         if (error == ERROR_SUCCESS || error == CRYPT_E_REVOKED) goto done;
     }
-    if (!ext)
+    if (!has_online_source)
     {
         if (pRevPara && pRevPara->hCrlStore && pRevPara->pIssuerCert)
         {
@@ -2252,7 +3240,11 @@ static DWORD verify_cert_revocation(const CERT_CONTEXT *cert, FILETIME *pTime,
             /* If the caller told us about the issuer, make sure the issuer
              * can sign CRLs before looking for one.
              */
-            if ((ext = CertFindExtension(szOID_KEY_USAGE,
+            if (!extensions_are_unique(
+                    pRevPara->pIssuerCert->pCertInfo->cExtension,
+                    pRevPara->pIssuerCert->pCertInfo->rgExtension))
+                canSignCRLs = FALSE;
+            else if ((ext = CertFindExtension(szOID_KEY_USAGE,
              pRevPara->pIssuerCert->pCertInfo->cExtension,
              pRevPara->pIssuerCert->pCertInfo->rgExtension)))
             {
@@ -2263,7 +3255,7 @@ static DWORD verify_cert_revocation(const CERT_CONTEXT *cert, FILETIME *pTime,
                  ext->Value.pbData, ext->Value.cbData,
                  CRYPT_DECODE_NOCOPY_FLAG, NULL, &usage, &size))
                     canSignCRLs = FALSE;
-                else if (usage.cbData > 2)
+                else if (!usage.cbData || usage.cbData > 2)
                 {
                     /* The key usage extension only defines 9 bits => no more
                      * than 2 bytes are needed to encode all known usages.
@@ -2272,9 +3264,8 @@ static DWORD verify_cert_revocation(const CERT_CONTEXT *cert, FILETIME *pTime,
                 }
                 else
                 {
-                    BYTE usageBits = usage.pbData[usage.cbData - 1];
-
-                    canSignCRLs = usageBits & CERT_CRL_SIGN_KEY_USAGE;
+                    canSignCRLs = usage.pbData[0] &
+                            CERT_CRL_SIGN_KEY_USAGE;
                 }
             }
             else
@@ -2292,7 +3283,8 @@ static DWORD verify_cert_revocation(const CERT_CONTEXT *cert, FILETIME *pTime,
             }
             if (crl)
             {
-                error = verify_cert_revocation_with_crl_offline(cert, crl, pTime, pRevStatus);
+                error = verify_cert_revocation_with_crl_offline(cert,
+                        pRevPara->pIssuerCert, crl, pTime, pRevStatus);
                 CertFreeCRLContext(crl);
             }
             else
@@ -2313,15 +3305,18 @@ static DWORD verify_cert_revocation(const CERT_CONTEXT *cert, FILETIME *pTime,
         }
     }
 done:
-    if ((next_update.dwLowDateTime || next_update.dwHighDateTime)
+    if (!filetime_is_zero(&this_update) && !filetime_is_zero(&next_update)
         && (error == ERROR_SUCCESS || error == CRYPT_E_REVOKED))
     {
         CERT_REVOCATION_STATUS rev_status;
 
         memset(&rev_status, 0, sizeof(rev_status));
         rev_status.cbSize = sizeof(rev_status);
-        rev_status.dwError = error;
-        cache_revocation_status(cert, pRevPara, &next_update, &rev_status);
+        rev_status.dwError = filetime_is_zero(&revocation_time) ? error :
+                CRYPT_E_REVOKED;
+        rev_status.dwReason = pRevStatus->dwReason;
+        cache_revocation_status(cert, pRevPara, &this_update, &next_update,
+                &revocation_time, &rev_status);
     }
     return error;
 }
@@ -2350,6 +3345,7 @@ BOOL WINAPI CertDllVerifyRevocation(DWORD dwEncodingType, DWORD dwRevType,
  PCERT_REVOCATION_PARA pRevPara, PCERT_REVOCATION_STATUS pRevStatus)
 {
     DWORD error = 0, i;
+    ULONGLONG deadline = 0;
     FILETIME now;
     LPFILETIME pTime = NULL;
 
@@ -2376,13 +3372,16 @@ BOOL WINAPI CertDllVerifyRevocation(DWORD dwEncodingType, DWORD dwRevType,
         pTime = &now;
     }
     memset(&pRevStatus->dwIndex, 0, pRevStatus->cbSize - sizeof(DWORD));
+    if (dwFlags & CERT_VERIFY_REV_ACCUMULATIVE_TIMEOUT_FLAG)
+        deadline = CRYPT_MakeDeadline(get_revocation_url_timeout(pRevPara));
     if (dwRevType != CERT_CONTEXT_REVOCATION_TYPE)
         error = CRYPT_E_NO_REVOCATION_CHECK;
     else
     {
         for (i = 0; i < cContext; i++)
         {
-            if ((error = verify_cert_revocation(rgpvContext[i], pTime, dwFlags, pRevPara, pRevStatus)))
+            if ((error = verify_cert_revocation(rgpvContext[i], pTime, dwFlags,
+                    pRevPara, pRevStatus, deadline)))
             {
                 pRevStatus->dwIndex = i;
                 break;
