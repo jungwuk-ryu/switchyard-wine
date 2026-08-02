@@ -68,6 +68,13 @@ only after signature, block-map, manifest, path, and resource-limit validation.
 The complete implementation and verification contract is documented in
 [`docs/msix.md`](msix.md).
 
+## Spatial audio
+
+CoreAudio dynamic PointSources, the private bed/dialogue/object transport,
+real-time callback rules, endpoint invalidation, capability policy, and the
+hardware validation boundary are documented in
+[`docs/spatial-audio.md`](spatial-audio.md).
+
 ## Release model
 
 The `main` branch is a linear downstream branch rooted at the revision in `switchyard/upstream-base.txt`. That revision is a compatibility baseline, not a promise to follow WineHQ's release cadence. Upstream fixes may be cherry-picked or adapted individually, and the base advances only after established Switchyard launcher and game workflows have been checked for regressions. Preserving known-working behavior takes priority over adopting a newer Wine version.
