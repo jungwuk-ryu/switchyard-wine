@@ -1155,7 +1155,7 @@ static LRESULT move_window(HWND hwnd, WPARAM wparam)
     HMONITOR mon = 0;
     MONITORINFO info;
 
-    if ((style & (WS_MINIMIZE | WS_MAXIMIZE)) || !IsWindowVisible(hwnd)) return -1;
+    if ((style & (WS_MINIMIZE | WS_MAXIMIZE)) || !NtUserIsWindowVisible(hwnd)) return -1;
     if (hittest && hittest != HTCAPTION) return -1;
 
     capturePoint.x = (short)LOWORD(dwPoint);

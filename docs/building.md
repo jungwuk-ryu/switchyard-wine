@@ -148,6 +148,14 @@ implementation with:
 ./switchyard/tests/runtime_tls_smoke_test.sh ~/.switchyard/runtimes/<runtime-id>
 ```
 
+Verify that the Mac driver does not bind Win32 window visibility checks to the
+similarly named Carbon API with:
+
+```sh
+./switchyard/tests/winemac_visibility_symbol_test.sh \
+  ~/.switchyard/runtimes/<runtime-id>
+```
+
 Verify Wine's runtime-relative GStreamer linkage and its media plugins, with an
 optional ASF/WMV3 asset for full video-stream decoding, with:
 

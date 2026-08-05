@@ -118,6 +118,8 @@ static void CopyKeyboardLayoutDataForInputSource(TISInputSourceRef inputSourceLa
     - (NSImage*) currentApplicationIcon;
     - (void) applyApplicationIcon;
     - (BOOL) windowCanRepresentApplicationIcon:(WineWindow*)window;
+    - (BOOL) updateApplicationIconWindowForWindow:(WineWindow*)window;
+    - (void) windowApplicationIconDidChange:(WineWindow*)window;
     - (void) forgetApplicationIconForWindow:(WineWindow*)window;
     - (NSString*) currentApplicationMenuName;
     - (void) setApplicationMenuName:(NSString*)name;
@@ -425,11 +427,13 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
                ([window isVisible] || [window isMiniaturized]);
     }
 
-    - (void) updateApplicationIconForWindow:(WineWindow*)window
+    - (BOOL) updateApplicationIconWindowForWindow:(WineWindow*)window
     {
+        WineWindow* previousWindow = applicationIconWindow;
+
         if (applicationIconWindow && applicationIconWindow != window &&
             [self windowCanRepresentApplicationIcon:applicationIconWindow])
-            return;
+            return FALSE;
 
         if ([self windowCanRepresentApplicationIcon:window])
             applicationIconWindow = window;
@@ -447,7 +451,21 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
             }
         }
 
-        [self applyApplicationIcon];
+        return applicationIconWindow != previousWindow;
+    }
+
+    - (void) updateApplicationIconForWindow:(WineWindow*)window
+    {
+        if ([self updateApplicationIconWindowForWindow:window])
+            [self applyApplicationIcon];
+    }
+
+    - (void) windowApplicationIconDidChange:(WineWindow*)window
+    {
+        BOOL selectionChanged = [self updateApplicationIconWindowForWindow:window];
+
+        if (selectionChanged || applicationIconWindow == window)
+            [self applyApplicationIcon];
     }
 
     - (void) forgetApplicationIconForWindow:(WineWindow*)window
@@ -635,8 +653,11 @@ static NSImage* image_by_merging_application_and_window_icons(NSImage* applicati
 
         if ([self windowCanRepresentApplicationIcon:window])
         {
-            applicationIconWindow = window;
-            [self applyApplicationIcon];
+            if (applicationIconWindow != window)
+            {
+                applicationIconWindow = window;
+                [self applyApplicationIcon];
+            }
         }
         else
             [self updateApplicationIconForWindow:window];
@@ -2961,7 +2982,7 @@ void macdrv_set_cocoa_window_icon(macdrv_window w, CFArrayRef images)
         WineApplicationController* controller = [WineApplicationController sharedController];
 
         window.applicationIcon = image_from_cgimage_array(imageArray);
-        [controller updateApplicationIconForWindow:window];
+        [controller windowApplicationIconDidChange:window];
     });
 }
 
