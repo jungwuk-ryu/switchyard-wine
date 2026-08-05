@@ -686,7 +686,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
             gl_info->gl_ops.gl.p_glFinish();
         }
 
-        /* call wglSwapBuffers through the gl table to avoid confusing the Steam overlay */
+        /* Use the private OpenGL swap entry point when available to avoid confusing the Steam overlay. */
         gl_info->gl_ops.wgl.p_wglSwapBuffers(context_gl->dc);
     }
 
