@@ -787,27 +787,53 @@ void wined3d_buffer_acquire_bo_for_write(struct wined3d_buffer *buffer, struct w
     wined3d_context_copy_bo_address(context, &dst, &src, 1, &range, WINED3D_MAP_WRITE | WINED3D_MAP_DISCARD);
 }
 
-void wined3d_buffer_copy_bo_address(struct wined3d_buffer *dst_buffer, struct wined3d_context *context,
-        unsigned int dst_offset, const struct wined3d_const_bo_address *src_addr, unsigned int size)
+static void wined3d_buffer_copy_bo_address_flags(struct wined3d_buffer *dst_buffer, struct wined3d_context *context,
+        unsigned int dst_offset, const struct wined3d_const_bo_address *src_addr, unsigned int size,
+        uint32_t map_flags)
 {
-    uint32_t map_flags = WINED3D_MAP_WRITE;
     struct wined3d_bo_address dst_addr;
     struct wined3d_range range;
     DWORD dst_location;
+    bool cow;
 
-    if (!dst_offset && size == dst_buffer->resource.size)
+    map_flags |= WINED3D_MAP_WRITE;
+    if (!dst_offset && size == dst_buffer->resource.size && !(map_flags & WINED3D_MAP_NOOVERWRITE))
         map_flags |= WINED3D_MAP_DISCARD;
 
-    if (map_flags & WINED3D_MAP_DISCARD)
+    cow = (map_flags & WINED3D_MAP_NOOVERWRITE)
+            && dst_buffer->buffer_object && dst_buffer->buffer_object->refcount > 1;
+    if (map_flags & (WINED3D_MAP_DISCARD | WINED3D_MAP_NOOVERWRITE))
         wined3d_buffer_acquire_bo_for_write(dst_buffer, context);
+    if (cow)
+        map_flags &= ~WINED3D_MAP_NOOVERWRITE;
 
     dst_location = wined3d_buffer_get_memory(dst_buffer, context, &dst_addr);
     dst_addr.addr += dst_offset;
 
     range.offset = 0;
     range.size = size;
-    wined3d_context_copy_bo_address(context, &dst_addr, (const struct wined3d_bo_address *)src_addr, 1, &range, map_flags);
+    if (!wined3d_context_copy_bo_address(context, &dst_addr,
+            (const struct wined3d_bo_address *)src_addr, 1, &range, map_flags))
+    {
+        ERR("Failed to update buffer %p location %s.\n",
+                dst_buffer, wined3d_debug_location(dst_location));
+
+        /* glUnmapBuffer() returning GL_FALSE makes the complete data store
+         * undefined. Do not keep treating that BO as an up-to-date location. */
+        if (!(dst_buffer->locations & ~dst_location))
+            wined3d_buffer_validate_location(dst_buffer, WINED3D_LOCATION_DISCARDED);
+        wined3d_buffer_invalidate_location(dst_buffer, dst_location);
+        if (dst_location & WINED3D_LOCATION_BUFFER)
+            wined3d_buffer_unload_location(dst_buffer, context, WINED3D_LOCATION_BUFFER);
+        return;
+    }
     wined3d_buffer_invalidate_range(dst_buffer, ~dst_location, dst_offset, size);
+}
+
+void wined3d_buffer_copy_bo_address(struct wined3d_buffer *dst_buffer, struct wined3d_context *context,
+        unsigned int dst_offset, const struct wined3d_const_bo_address *src_addr, unsigned int size)
+{
+    wined3d_buffer_copy_bo_address_flags(dst_buffer, context, dst_offset, src_addr, size, 0);
 }
 
 void wined3d_buffer_copy(struct wined3d_buffer *dst_buffer, unsigned int dst_offset,
@@ -878,7 +904,12 @@ void wined3d_buffer_update_sub_resource(struct wined3d_buffer *buffer, struct wi
     }
     else
     {
-        wined3d_buffer_copy_bo_address(buffer, context, offset, &upload_bo->addr, size);
+        uint32_t map_flags = 0;
+
+        if ((upload_bo->flags & UPLOAD_BO_NOOVERWRITE) && (offset || size < buffer->resource.size))
+            map_flags |= WINED3D_MAP_NOOVERWRITE;
+
+        wined3d_buffer_copy_bo_address_flags(buffer, context, offset, &upload_bo->addr, size, map_flags);
     }
 }
 

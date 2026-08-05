@@ -3020,7 +3020,63 @@ void wined3d_context_gl_flush_bo_address(struct wined3d_context_gl *context_gl,
     flush_bo_ranges(context_gl, data, 1, &range);
 }
 
-void wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
+enum wined3d_nooverwrite_upload_result
+{
+    WINED3D_NOOVERWRITE_UPLOAD_NOT_ATTEMPTED,
+    WINED3D_NOOVERWRITE_UPLOAD_COMPLETE,
+    WINED3D_NOOVERWRITE_UPLOAD_CORRUPTED,
+};
+
+static enum wined3d_nooverwrite_upload_result wined3d_context_gl_upload_bo_nooverwrite(
+        struct wined3d_context_gl *context_gl,
+        struct wined3d_bo_gl *dst_bo, const struct wined3d_bo_address *dst,
+        const struct wined3d_bo_address *src, const struct wined3d_range *range)
+{
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    const GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT;
+    size_t bo_size = dst_bo->size, offset = (uintptr_t)dst->addr;
+    BYTE *dst_ptr;
+
+    if (!range->size || offset > bo_size || range->offset > bo_size - offset
+            || range->size > bo_size - offset - range->offset)
+        return WINED3D_NOOVERWRITE_UPLOAD_NOT_ATTEMPTED;
+    if (dst_bo->b.buffer_offset > (size_t)INTPTR_MAX - offset)
+        return WINED3D_NOOVERWRITE_UPLOAD_NOT_ATTEMPTED;
+    offset += dst_bo->b.buffer_offset;
+    if (range->offset > (size_t)INTPTR_MAX - offset)
+        return WINED3D_NOOVERWRITE_UPLOAD_NOT_ATTEMPTED;
+#if UINT_MAX > INTPTR_MAX
+    if (range->size > (size_t)INTPTR_MAX)
+        return WINED3D_NOOVERWRITE_UPLOAD_NOT_ATTEMPTED;
+#endif
+    offset += range->offset;
+
+    wined3d_context_gl_bind_bo(context_gl, dst_bo->binding, dst_bo->id);
+    if (!(dst_ptr = GL_EXTCALL(glMapBufferRange(dst_bo->binding,
+            (GLintptr)offset, range->size, flags))))
+    {
+        wined3d_context_gl_bind_bo(context_gl, dst_bo->binding, 0);
+        checkGLcall("map NOOVERWRITE buffer upload");
+        return WINED3D_NOOVERWRITE_UPLOAD_NOT_ATTEMPTED;
+    }
+
+    memcpy(dst_ptr, src->addr + range->offset, range->size);
+    if (!GL_EXTCALL(glUnmapBuffer(dst_bo->binding)))
+    {
+        WARN_(d3d_perf)("A NOOVERWRITE buffer upload was corrupted while unmapping.\n");
+        wined3d_context_gl_bind_bo(context_gl, dst_bo->binding, 0);
+        checkGLcall("unmap NOOVERWRITE buffer upload");
+        wined3d_context_gl_reference_bo(context_gl, dst_bo);
+        return WINED3D_NOOVERWRITE_UPLOAD_CORRUPTED;
+    }
+    wined3d_context_gl_bind_bo(context_gl, dst_bo->binding, 0);
+    checkGLcall("NOOVERWRITE buffer upload");
+
+    wined3d_context_gl_reference_bo(context_gl, dst_bo);
+    return WINED3D_NOOVERWRITE_UPLOAD_COMPLETE;
+}
+
+bool wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
         const struct wined3d_bo_address *dst, const struct wined3d_bo_address *src,
         unsigned int range_count, const struct wined3d_range *ranges, uint32_t map_flags)
 {
@@ -3084,6 +3140,20 @@ void wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
         }
         else
         {
+            enum wined3d_nooverwrite_upload_result nooverwrite_result;
+
+            if ((map_flags & WINED3D_MAP_NOOVERWRITE) && range_count == 1
+                    && gl_info->supported[ARB_MAP_BUFFER_RANGE] && (dst_bo->flags & GL_MAP_WRITE_BIT)
+                    && !dst_bo->b.map_ptr)
+            {
+                nooverwrite_result = wined3d_context_gl_upload_bo_nooverwrite(
+                        context_gl, dst_bo, dst, src, ranges);
+                if (nooverwrite_result == WINED3D_NOOVERWRITE_UPLOAD_COMPLETE)
+                    return true;
+                if (nooverwrite_result == WINED3D_NOOVERWRITE_UPLOAD_CORRUPTED)
+                    return false;
+            }
+
             wined3d_context_gl_bind_bo(context_gl, dst_bo->binding, dst_bo->id);
             for (i = 0; i < range_count; ++i)
                 GL_EXTCALL(glBufferSubData(dst_bo->binding,
@@ -3099,6 +3169,8 @@ void wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
         for (i = 0; i < range_count; ++i)
             memcpy(dst->addr + ranges[i].offset, src->addr + ranges[i].offset, ranges[i].size);
     }
+
+    return true;
 }
 
 void wined3d_context_gl_destroy_bo(struct wined3d_context_gl *context_gl, struct wined3d_bo_gl *bo)

@@ -785,7 +785,7 @@ static inline bool wined3d_context_gl_bind_sampler(
 }
 void wined3d_context_gl_bind_texture(struct wined3d_context_gl *context_gl, GLenum target, GLuint name);
 void wined3d_context_gl_check_fbo_status(const struct wined3d_context_gl *context_gl, GLenum target);
-void wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
+bool wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
         const struct wined3d_bo_address *dst, const struct wined3d_bo_address *src,
         unsigned int range_count, const struct wined3d_range *ranges, uint32_t map_flags);
 void wined3d_context_gl_destroy(struct wined3d_context_gl *context_gl);

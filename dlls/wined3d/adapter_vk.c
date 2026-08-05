@@ -1037,7 +1037,7 @@ static void adapter_vk_unmap_bo_address(struct wined3d_context *context,
     wined3d_bo_vk_unmap(bo, context_vk);
 }
 
-void adapter_vk_copy_bo_address(struct wined3d_context *context,
+bool adapter_vk_copy_bo_address(struct wined3d_context *context,
         const struct wined3d_bo_address *dst, const struct wined3d_bo_address *src,
         unsigned int range_count, const struct wined3d_range *ranges, uint32_t map_flags)
 {
@@ -1062,7 +1062,7 @@ void adapter_vk_copy_bo_address(struct wined3d_context *context,
         if (!(vk_command_buffer = wined3d_context_vk_get_command_buffer(context_vk)))
         {
             ERR("Failed to get command buffer.\n");
-            return;
+            return false;
         }
 
         wined3d_context_vk_end_current_render_pass(context_vk);
@@ -1120,7 +1120,7 @@ void adapter_vk_copy_bo_address(struct wined3d_context *context,
         wined3d_context_vk_reference_bo(context_vk, src_bo);
         wined3d_context_vk_reference_bo(context_vk, dst_bo);
 
-        return;
+        return true;
     }
 
     for (i = 0; i < range_count; ++i)
@@ -1132,17 +1132,22 @@ void adapter_vk_copy_bo_address(struct wined3d_context *context,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &staging_bo)))
         {
             ERR("Failed to create staging bo.\n");
-            return;
+            return false;
         }
 
         staging.buffer_object = &staging_bo.b;
         staging.addr = NULL;
-        adapter_vk_copy_bo_address(context, &staging, src, range_count, ranges, WINED3D_MAP_WRITE);
-        adapter_vk_copy_bo_address(context, dst, &staging, range_count, ranges, WINED3D_MAP_WRITE);
+        if (!adapter_vk_copy_bo_address(context, &staging, src, range_count, ranges, WINED3D_MAP_WRITE)
+                || !adapter_vk_copy_bo_address(context, dst, &staging,
+                range_count, ranges, WINED3D_MAP_WRITE))
+        {
+            wined3d_context_vk_destroy_bo(context_vk, &staging_bo);
+            return false;
+        }
 
         wined3d_context_vk_destroy_bo(context_vk, &staging_bo);
 
-        return;
+        return true;
     }
 
     if (dst_bo && (!(dst_bo->memory_type & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || (!(map_flags & WINED3D_MAP_DISCARD)
@@ -1152,17 +1157,22 @@ void adapter_vk_copy_bo_address(struct wined3d_context *context,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &staging_bo)))
         {
             ERR("Failed to create staging bo.\n");
-            return;
+            return false;
         }
 
         staging.buffer_object = &staging_bo.b;
         staging.addr = NULL;
-        adapter_vk_copy_bo_address(context, &staging, src, range_count, ranges, WINED3D_MAP_WRITE);
-        adapter_vk_copy_bo_address(context, dst, &staging, range_count, ranges, WINED3D_MAP_WRITE);
+        if (!adapter_vk_copy_bo_address(context, &staging, src, range_count, ranges, WINED3D_MAP_WRITE)
+                || !adapter_vk_copy_bo_address(context, dst, &staging,
+                range_count, ranges, WINED3D_MAP_WRITE))
+        {
+            wined3d_context_vk_destroy_bo(context_vk, &staging_bo);
+            return false;
+        }
 
         wined3d_context_vk_destroy_bo(context_vk, &staging_bo);
 
-        return;
+        return true;
     }
 
     src_ptr = adapter_vk_map_bo_address(context, src, size, WINED3D_MAP_READ);
@@ -1173,6 +1183,8 @@ void adapter_vk_copy_bo_address(struct wined3d_context *context,
 
     adapter_vk_unmap_bo_address(context, dst, range_count, ranges);
     adapter_vk_unmap_bo_address(context, src, 0, NULL);
+
+    return true;
 }
 
 static void adapter_vk_flush_bo_address(struct wined3d_context *context,

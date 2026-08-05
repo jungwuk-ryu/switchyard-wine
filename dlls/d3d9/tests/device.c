@@ -14330,6 +14330,240 @@ static void test_vertex_buffer_read_write(void)
     DestroyWindow(window);
 }
 
+static DWORD get_render_target_pixel(IDirect3DDevice9 *device, IDirect3DSurface9 *readback,
+        UINT x, UINT y)
+{
+    IDirect3DSurface9 *backbuffer;
+    D3DLOCKED_RECT locked_rect;
+    DWORD color;
+    HRESULT hr;
+
+    hr = IDirect3DDevice9_GetRenderTarget(device, 0, &backbuffer);
+    ok(hr == S_OK, "Failed to get backbuffer, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        return 0;
+
+    hr = IDirect3DDevice9_GetRenderTargetData(device, backbuffer, readback);
+    ok(hr == S_OK, "Failed to copy backbuffer, hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        IDirect3DSurface9_Release(backbuffer);
+        return 0;
+    }
+
+    hr = IDirect3DSurface9_LockRect(readback, &locked_rect, NULL, D3DLOCK_READONLY);
+    ok(hr == S_OK, "Failed to lock readback, hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        IDirect3DSurface9_Release(backbuffer);
+        return 0;
+    }
+    color = ((DWORD *)locked_rect.pBits)[y * (locked_rect.Pitch / sizeof(*((DWORD *)locked_rect.pBits))) + x];
+    hr = IDirect3DSurface9_UnlockRect(readback);
+    ok(hr == S_OK, "Failed to unlock readback, hr %#lx.\n", hr);
+
+    IDirect3DSurface9_Release(backbuffer);
+    return color;
+}
+
+struct dynamic_vb_test_vertex
+{
+    struct vec3 position;
+    DWORD diffuse;
+};
+
+static void fill_dynamic_vb_test_quad(struct dynamic_vb_test_vertex *quad, float x0, float x1, DWORD color)
+{
+    memset(quad, 0, 4 * sizeof(*quad));
+    quad[0].position = (struct vec3){x0, -0.5f, 0.0f};
+    quad[1].position = (struct vec3){x0, 0.5f, 0.0f};
+    quad[2].position = (struct vec3){x1, -0.5f, 0.0f};
+    quad[3].position = (struct vec3){x1, 0.5f, 0.0f};
+
+    quad[0].diffuse = color;
+    quad[1].diffuse = color;
+    quad[2].diffuse = color;
+    quad[3].diffuse = color;
+}
+
+static void test_dynamic_buffer_nooverwrite(void)
+{
+    IDirect3DVertexBuffer9 *buffer = NULL;
+    IDirect3DDevice9 *device;
+    IDirect3D9 *d3d;
+    IDirect3DQuery9 *event_query = NULL;
+    IDirect3DSurface9 *readback = NULL;
+    unsigned int color;
+    ULONG refcount;
+    HWND window;
+    HRESULT hr;
+    struct dynamic_vb_test_vertex *data;
+
+    window = create_window();
+    d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    ok(!!d3d, "Failed to create a D3D object.\n");
+    if (!d3d)
+    {
+        DestroyWindow(window);
+        return;
+    }
+    if (!(device = create_device(d3d, window, NULL)))
+    {
+        skip("Failed to create a D3D device, skipping tests.\n");
+        IDirect3D9_Release(d3d);
+        DestroyWindow(window);
+        return;
+    }
+
+    hr = IDirect3DDevice9_CreateQuery(device, D3DQUERYTYPE_EVENT, &event_query);
+    ok(hr == D3D_OK || hr == D3DERR_NOTAVAILABLE, "Got unexpected hr %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        if (hr == D3DERR_NOTAVAILABLE)
+            skip("Event queries are not supported, skipping test.\n");
+        goto done;
+    }
+
+    hr = IDirect3DDevice9_CreateOffscreenPlainSurface(device, 640, 480, D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM, &readback, NULL);
+    ok(hr == D3D_OK, "Failed to create readback surface, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    hr = IDirect3DDevice9_CreateVertexBuffer(device, 3 * 4 * sizeof(*data),
+            D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFVF_XYZ | D3DFVF_DIFFUSE, D3DPOOL_DEFAULT, &buffer, NULL);
+    ok(hr == D3D_OK, "Failed to create vertex buffer, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    /* Some applications start streaming with NOOVERWRITE, without a preceding DISCARD. */
+    hr = IDirect3DVertexBuffer9_Lock(buffer, 0, 4 * sizeof(*data),
+            (void **)&data, D3DLOCK_NOOVERWRITE);
+    ok(hr == D3D_OK, "Failed to lock vertex buffer, hr %#lx.\n", hr);
+    fill_dynamic_vb_test_quad(data, -0.75f, -0.25f, 0xff00ff00);
+    hr = IDirect3DVertexBuffer9_Unlock(buffer);
+    ok(hr == D3D_OK, "Failed to unlock vertex buffer, hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_SetStreamSource(device, 0, buffer, 0, sizeof(*data));
+    ok(hr == D3D_OK, "Failed to set stream source, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetFVF(device, D3DFVF_XYZ | D3DFVF_DIFFUSE);
+    ok(hr == D3D_OK, "Failed to set FVF, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetRenderState(device, D3DRS_LIGHTING, FALSE);
+    ok(hr == D3D_OK, "Failed to set render state, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetRenderState(device, D3DRS_ZENABLE, FALSE);
+    ok(hr == D3D_OK, "Failed to set render state, hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff0000ff, 0.0f, 0);
+    ok(hr == D3D_OK, "Failed to clear, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(hr == D3D_OK, "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitive(device, D3DPT_TRIANGLESTRIP, 0, 2);
+    ok(hr == D3D_OK, "Failed to draw quad, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(hr == D3D_OK, "Failed to end scene, hr %#lx.\n", hr);
+    hr = IDirect3DQuery9_Issue(event_query, D3DISSUE_END);
+    ok(hr == D3D_OK, "Failed to issue event query, hr %#lx.\n", hr);
+    wait_query(event_query);
+
+    color = get_render_target_pixel(device, readback, 160, 240);
+    ok(color == 0xff00ff00, "Got unexpected initial quad color 0x%08x.\n", color);
+
+    /* Vertex buffers allow nested locks. Keep an active exact upload alive while
+     * a second, disjoint NOOVERWRITE lock uses the synchronous fallback. */
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff0000ff, 0.0f, 0);
+    ok(hr == D3D_OK, "Failed to clear, hr %#lx.\n", hr);
+    hr = IDirect3DVertexBuffer9_Lock(buffer, 0, 4 * sizeof(*data),
+            (void **)&data, D3DLOCK_NOOVERWRITE);
+    ok(hr == D3D_OK, "Failed to lock first vertex buffer range, hr %#lx.\n", hr);
+    fill_dynamic_vb_test_quad(data, -0.75f, -0.25f, 0xff00ff00);
+
+    hr = IDirect3DVertexBuffer9_Lock(buffer, 4 * sizeof(*data), 4 * sizeof(*data),
+            (void **)&data, D3DLOCK_NOOVERWRITE);
+    ok(hr == D3D_OK, "Failed to lock second vertex buffer range, hr %#lx.\n", hr);
+    fill_dynamic_vb_test_quad(data, 0.25f, 0.75f, 0xffff0000);
+
+    hr = IDirect3DVertexBuffer9_Unlock(buffer);
+    ok(hr == D3D_OK, "Failed to unlock vertex buffer, hr %#lx.\n", hr);
+
+    /* Force queued work to complete between the two unlocks. The exact upload
+     * must remain pending until the synchronous nested map has been unmapped. */
+    hr = IDirect3DQuery9_Issue(event_query, D3DISSUE_END);
+    ok(hr == D3D_OK, "Failed to issue event query, hr %#lx.\n", hr);
+    wait_query(event_query);
+
+    hr = IDirect3DVertexBuffer9_Unlock(buffer);
+    ok(hr == D3D_OK, "Failed to unlock vertex buffer, hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(hr == D3D_OK, "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitive(device, D3DPT_TRIANGLESTRIP, 0, 2);
+    ok(hr == D3D_OK, "Failed to draw first quad, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitive(device, D3DPT_TRIANGLESTRIP, 4, 2);
+    ok(hr == D3D_OK, "Failed to draw second quad, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(hr == D3D_OK, "Failed to end scene, hr %#lx.\n", hr);
+    hr = IDirect3DQuery9_Issue(event_query, D3DISSUE_END);
+    ok(hr == D3D_OK, "Failed to issue event query, hr %#lx.\n", hr);
+    wait_query(event_query);
+
+    color = get_render_target_pixel(device, readback, 160, 240);
+    ok(color == 0xff00ff00, "Got unexpected nested first quad color 0x%08x.\n", color);
+    color = get_render_target_pixel(device, readback, 480, 240);
+    ok(color == 0xffff0000, "Got unexpected nested second quad color 0x%08x.\n", color);
+
+    hr = IDirect3DVertexBuffer9_Lock(buffer, 0, 0, (void **)&data, D3DLOCK_DISCARD);
+    ok(hr == D3D_OK, "Failed to initialize vertex buffer, hr %#lx.\n", hr);
+    memset(data, 0, 3 * 4 * sizeof(*data));
+    hr = IDirect3DVertexBuffer9_Unlock(buffer);
+    ok(hr == D3D_OK, "Failed to unlock vertex buffer, hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff0000ff, 0.0f, 0);
+    ok(hr == D3D_OK, "Failed to clear, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(hr == D3D_OK, "Failed to begin scene, hr %#lx.\n", hr);
+
+    hr = IDirect3DVertexBuffer9_Lock(buffer, 4 * sizeof(*data), 2 * 4 * sizeof(*data),
+            (void **)&data, D3DLOCK_NOOVERWRITE);
+    ok(hr == D3D_OK, "Failed to lock vertex buffer, hr %#lx.\n", hr);
+
+    fill_dynamic_vb_test_quad(data + 0, -0.75f, -0.25f, 0xff00ff00);
+    hr = IDirect3DDevice9_DrawPrimitive(device, D3DPT_TRIANGLESTRIP, 4, 2);
+    ok(hr == D3D_OK, "Failed to draw first quad, hr %#lx.\n", hr);
+    hr = IDirect3DQuery9_Issue(event_query, D3DISSUE_END);
+    ok(hr == D3D_OK, "Failed to issue event query, hr %#lx.\n", hr);
+    wait_query(event_query);
+
+    fill_dynamic_vb_test_quad(data + 4, 0.25f, 0.75f, 0xffff0000);
+    hr = IDirect3DDevice9_DrawPrimitive(device, D3DPT_TRIANGLESTRIP, 8, 2);
+    ok(hr == D3D_OK, "Failed to draw second quad, hr %#lx.\n", hr);
+    hr = IDirect3DVertexBuffer9_Unlock(buffer);
+    ok(hr == D3D_OK, "Failed to unlock vertex buffer, hr %#lx.\n", hr);
+
+    hr = IDirect3DQuery9_Issue(event_query, D3DISSUE_END);
+    ok(hr == D3D_OK, "Failed to issue event query, hr %#lx.\n", hr);
+    wait_query(event_query);
+
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(hr == D3D_OK, "Failed to end scene, hr %#lx.\n", hr);
+
+    color = get_render_target_pixel(device, readback, 160, 240);
+    ok(color == 0xff00ff00, "Got unexpected first quad color 0x%08x.\n", color);
+    color = get_render_target_pixel(device, readback, 480, 240);
+    ok(color == 0xffff0000, "Got unexpected second quad color 0x%08x.\n", color);
+
+done:
+    if (event_query)
+        IDirect3DQuery9_Release(event_query);
+    if (readback)
+        IDirect3DSurface9_Release(readback);
+    if (buffer)
+        IDirect3DVertexBuffer9_Release(buffer);
+    refcount = IDirect3DDevice9_Release(device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+    IDirect3D9_Release(d3d);
+    DestroyWindow(window);
+}
+
 static void test_get_display_mode(void)
 {
     static const DWORD creation_flags[] = {0, CREATE_DEVICE_FULLSCREEN};
@@ -15501,6 +15735,7 @@ START_TEST(device)
     test_resource_access();
     test_multiply_transform();
     test_vertex_buffer_read_write();
+    test_dynamic_buffer_nooverwrite();
     test_get_display_mode();
     test_multi_adapter();
     test_shader_validator();

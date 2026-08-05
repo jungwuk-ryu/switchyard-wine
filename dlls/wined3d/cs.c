@@ -3148,6 +3148,49 @@ static void get_map_pitch(const struct wined3d_format *format, const struct wine
     }
 }
 
+static bool wined3d_cs_buffer_nooverwrite_eligible(const struct wined3d_resource *resource,
+        const struct wined3d_box *box, uint32_t flags)
+{
+    return !resource->device->adapter->d3d_info.persistent_map && resource->type == WINED3D_RTYPE_BUFFER
+            && box->left < box->right && box->right <= resource->size
+            && !box->top && box->bottom == 1 && !box->front && box->back == 1
+            && (flags & WINED3D_MAP_WRITE) && !(flags & WINED3D_MAP_READ)
+            && !(resource->access & WINED3D_RESOURCE_ACCESS_MAP_R)
+            && (resource->usage & WINED3DUSAGE_DYNAMIC)
+            && (resource->bind_flags == WINED3D_BIND_VERTEX_BUFFER
+            || resource->bind_flags == WINED3D_BIND_INDEX_BUFFER);
+}
+
+static bool wined3d_cs_map_buffer_nooverwrite(struct wined3d_resource *resource,
+        struct wined3d_map_desc *map_desc, const struct wined3d_box *box, uint32_t flags)
+{
+    struct wined3d_client_resource *client = &resource->client;
+    size_t size;
+    void *data;
+
+    if (!(flags & WINED3D_MAP_NOOVERWRITE) || flags & WINED3D_MAP_DISCARD
+            || !wined3d_cs_buffer_nooverwrite_eligible(resource, box, flags))
+        return false;
+
+    size = box->right - box->left;
+    if (!(data = malloc(size)))
+    {
+        WARN_(d3d_perf)("Failed to allocate a dynamic buffer upload.\n");
+        return false;
+    }
+
+    client->mapped_upload.addr.buffer_object = NULL;
+    client->mapped_upload.addr.addr = data;
+    client->mapped_upload.flags = UPLOAD_BO_UPLOAD_ON_UNMAP
+            | UPLOAD_BO_FREE_ON_UNMAP | UPLOAD_BO_NOOVERWRITE;
+    client->mapped_box = *box;
+
+    wined3d_resource_get_sub_resource_map_pitch(resource, 0, &map_desc->row_pitch, &map_desc->slice_pitch);
+    map_desc->data = data;
+    TRACE_(d3d_perf)("Using an exact client upload for a dynamic buffer map.\n");
+    return true;
+}
+
 static bool wined3d_cs_map_upload_bo(struct wined3d_device_context *context, struct wined3d_resource *resource,
         unsigned int sub_resource_idx, struct wined3d_map_desc *map_desc, const struct wined3d_box *box, uint32_t flags)
 {
@@ -3155,12 +3198,21 @@ static bool wined3d_cs_map_upload_bo(struct wined3d_device_context *context, str
     const struct wined3d_format *format = resource->format;
     size_t size;
 
+    if (client->mapped_upload.addr.buffer_object || client->mapped_upload.addr.addr)
+    {
+        TRACE_(d3d_perf)("Using a synchronous map while another client map is active.\n");
+        return false;
+    }
+
     if (flags & (WINED3D_MAP_DISCARD | WINED3D_MAP_NOOVERWRITE))
     {
         struct wined3d_device *device = context->device;
         struct wined3d_bo_address addr;
         struct wined3d_bo *bo;
         uint8_t *map_ptr;
+
+        if (wined3d_cs_map_buffer_nooverwrite(resource, map_desc, box, flags))
+            return true;
 
         if (resource->pin_sysmem)
         {
@@ -3269,6 +3321,11 @@ static bool wined3d_cs_unmap_upload_bo(struct wined3d_device_context *context, s
     struct wined3d_client_resource *client = &resource->client;
     struct wined3d_device *device = context->device;
     struct wined3d_bo *bo;
+
+    /* A nested map may have fallen back to the synchronous resource path while
+     * this client upload was active. Unmap that BO before queuing the upload. */
+    if (resource->map_count)
+        return false;
 
     if (wined3d_bo_address_is_null(&client->mapped_upload.addr))
         return false;
@@ -3617,6 +3674,8 @@ void CDECL wined3d_device_context_flush_mapped_buffer(struct wined3d_device_cont
         struct wined3d_buffer *buffer)
 {
     struct wined3d_client_resource *client = &buffer->resource.client;
+    struct upload_bo upload_bo;
+    bool sync_upload;
 
     /* d3d9 applications can draw from a mapped dynamic buffer.
      * Castlevania 2 depends on this behaviour.
@@ -3629,8 +3688,39 @@ void CDECL wined3d_device_context_flush_mapped_buffer(struct wined3d_device_cont
         return;
 
     if (client->mapped_upload.flags & UPLOAD_BO_UPLOAD_ON_UNMAP)
+    {
+        upload_bo = client->mapped_upload;
+        sync_upload = false;
+        if ((upload_bo.flags & UPLOAD_BO_FREE_ON_UNMAP) && !upload_bo.addr.buffer_object)
+        {
+            size_t size = client->mapped_box.right - client->mapped_box.left;
+            void *data;
+
+            if ((data = malloc(size)))
+            {
+                memcpy(data, (const void *)upload_bo.addr.addr, size);
+                upload_bo.addr.addr = data;
+                upload_bo.flags |= UPLOAD_BO_FREE_ON_UNMAP;
+            }
+            else
+            {
+                WARN_(d3d_perf)("Failed to allocate a mapped buffer upload snapshot.\n");
+                upload_bo.flags &= ~UPLOAD_BO_FREE_ON_UNMAP;
+                sync_upload = true;
+            }
+        }
         wined3d_device_context_upload_bo(context, &buffer->resource, 0,
-                &client->mapped_box, &client->mapped_upload, buffer->resource.size, buffer->resource.size);
+                &client->mapped_box, &upload_bo, buffer->resource.size, buffer->resource.size);
+
+        /* Once a draw references the mapped range, a later unsynchronised upload
+         * of the same range is no longer covered by the NOOVERWRITE promise. */
+        client->mapped_upload.flags &= ~UPLOAD_BO_NOOVERWRITE;
+
+        /* The application may keep writing to the mapped buffer after the draw.
+         * Ensure that an allocation failure cannot expose those writes to this upload. */
+        if (sync_upload)
+            wined3d_device_context_finish(context, WINED3D_CS_QUEUE_DEFAULT);
+    }
 
     if (client->mapped_upload.flags & UPLOAD_BO_RENAME_ON_UNMAP)
     {

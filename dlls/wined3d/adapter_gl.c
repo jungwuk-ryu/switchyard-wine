@@ -4362,11 +4362,12 @@ static void adapter_gl_unmap_bo_address(struct wined3d_context *context,
     wined3d_context_gl_unmap_bo_address(wined3d_context_gl(context), data, range_count, ranges);
 }
 
-static void adapter_gl_copy_bo_address(struct wined3d_context *context,
+static bool adapter_gl_copy_bo_address(struct wined3d_context *context,
         const struct wined3d_bo_address *dst, const struct wined3d_bo_address *src,
         unsigned int range_count, const struct wined3d_range *ranges, uint32_t map_flags)
 {
-    wined3d_context_gl_copy_bo_address(wined3d_context_gl(context), dst, src, range_count, ranges, map_flags);
+    return wined3d_context_gl_copy_bo_address(
+            wined3d_context_gl(context), dst, src, range_count, ranges, map_flags);
 }
 
 static void adapter_gl_flush_bo_address(struct wined3d_context *context,

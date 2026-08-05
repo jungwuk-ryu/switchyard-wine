@@ -823,7 +823,7 @@ static inline const struct wined3d_adapter_vk *wined3d_adapter_vk_const(const st
     return CONTAINING_RECORD(adapter, struct wined3d_adapter_vk, a);
 }
 
-void adapter_vk_copy_bo_address(struct wined3d_context *context, const struct wined3d_bo_address *dst,
+bool adapter_vk_copy_bo_address(struct wined3d_context *context, const struct wined3d_bo_address *dst,
         const struct wined3d_bo_address *src,
         unsigned int range_count, const struct wined3d_range *ranges, uint32_t map_flags);
 unsigned int wined3d_adapter_vk_get_memory_type_index(const struct wined3d_adapter_vk *adapter_vk,
