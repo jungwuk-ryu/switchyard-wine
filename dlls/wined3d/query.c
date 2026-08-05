@@ -460,7 +460,7 @@ void wined3d_query_signal_retrieved(struct wined3d_query *query)
 
 void CDECL wined3d_query_wait_for_retrieval(struct wined3d_query *query)
 {
-    static const LARGE_INTEGER timeout = {.QuadPart = -1000};
+    static const LARGE_INTEGER timeout = {.QuadPart = -100};
     struct wined3d_cs *cs = query->device->cs;
     LONG main = query->counter_main;
     LONG retrieved = query->counter_retrieved;
