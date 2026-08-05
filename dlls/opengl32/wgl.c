@@ -1879,10 +1879,7 @@ INT WINAPI wglGetPixelFormat(HDC hdc)
     return args.ret;
 }
 
-/***********************************************************************
- *              wglSwapBuffers (OPENGL32.@)
- */
-BOOL WINAPI DECLSPEC_HOTPATCH wglSwapBuffers( HDC hdc )
+static BOOL WINAPI wgl_swap_buffers( HDC hdc )
 {
     struct wglSwapBuffers_params args = { .teb = NtCurrentTeb(), .hdc = hdc };
     NTSTATUS status;
@@ -1908,6 +1905,19 @@ BOOL WINAPI DECLSPEC_HOTPATCH wglSwapBuffers( HDC hdc )
     }
 
     return args.ret;
+}
+
+/***********************************************************************
+ *              wglSwapBuffers (OPENGL32.@)
+ */
+BOOL WINAPI DECLSPEC_HOTPATCH wglSwapBuffers( HDC hdc )
+{
+    return wgl_swap_buffers( hdc );
+}
+
+BOOL WINAPI __wine_wglSwapBuffers( HDC hdc )
+{
+    return wgl_swap_buffers( hdc );
 }
 
 /***********************************************************************

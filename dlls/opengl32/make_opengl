@@ -1777,6 +1777,7 @@ foreach (sort keys %wgl_functions)
 {
     printf SPEC "%s\n", generate_spec_entry( $_, $wgl_functions{$_} );
 }
+print SPEC "\@ stdcall -private __wine_wglSwapBuffers(long)\n";
 
 close(SPEC);
 

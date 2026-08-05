@@ -43,6 +43,35 @@ static int verify_hotpatch_target( const struct hotpatch_target *target )
     return 1;
 }
 
+static int verify_private_swap_entry(void)
+{
+    FARPROC public_swap, private_swap;
+    HMODULE module;
+
+    if (!(module = LoadLibraryA( "opengl32.dll" )))
+    {
+        fprintf( stderr, "Could not load opengl32.dll: %lu\n", GetLastError() );
+        return 0;
+    }
+    public_swap = GetProcAddress( module, "wglSwapBuffers" );
+    private_swap = GetProcAddress( module, "__wine_wglSwapBuffers" );
+    if (!public_swap || !private_swap)
+    {
+        fprintf( stderr, "Could not resolve the public and private OpenGL swap entry points\n" );
+        FreeLibrary( module );
+        return 0;
+    }
+    if (public_swap == private_swap)
+    {
+        fprintf( stderr, "The public and private OpenGL swap entry points are identical\n" );
+        FreeLibrary( module );
+        return 0;
+    }
+
+    FreeLibrary( module );
+    return 1;
+}
+
 int main(void)
 {
     static const struct hotpatch_target targets[] =
@@ -54,6 +83,7 @@ int main(void)
         {"hid.dll", "HidP_GetUsageValue"},
         {"hid.dll", "HidP_GetValueCaps"},
         {"hid.dll", "HidP_MaxDataListLength"},
+        {"opengl32.dll", "wglSwapBuffers"},
         {"setupapi.dll", "SetupDiEnumDriverInfoA"},
     };
     unsigned int i;
@@ -67,6 +97,7 @@ int main(void)
 
     for (i = 0; i < ARRAYSIZE(targets); ++i)
         success &= verify_hotpatch_target( &targets[i] );
+    success &= verify_private_swap_entry();
 
     if (!success) return 1;
     printf( "Steam overlay hotpatch entry points passed\n" );

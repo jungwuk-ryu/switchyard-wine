@@ -359,3 +359,4 @@
 @ stdcall wglUseFontBitmapsW(long long long long)
 @ stdcall wglUseFontOutlinesA(long long long long float float long ptr)
 @ stdcall wglUseFontOutlinesW(long long long long float float long ptr)
+@ stdcall -private __wine_wglSwapBuffers(long)
