@@ -12540,6 +12540,126 @@ done:
     DestroyWindow(window);
 }
 
+static void test_indexed_draw_instance_count(void)
+{
+    struct vertex
+    {
+        float x, y, z, rhw;
+        DWORD diffuse;
+    };
+    static const struct vertex vertices[] =
+    {
+        {-0.5f,   -0.5f, 0.5f, 1.0f, 0xff400000},
+        {-0.5f,  479.5f, 0.5f, 1.0f, 0xff400000},
+        {639.5f,  -0.5f, 0.5f, 1.0f, 0xff400000},
+        {639.5f, 479.5f, 0.5f, 1.0f, 0xff400000},
+    };
+    static const WORD indices[] = {0, 1, 2, 2, 1, 3};
+    IDirect3DVertexBuffer9 *vb = NULL;
+    IDirect3DIndexBuffer9 *ib = NULL;
+    IDirect3DDevice9 *device;
+    IDirect3D9 *d3d;
+    unsigned int color;
+    ULONG refcount;
+    HWND window;
+    HRESULT hr;
+    void *data;
+
+    window = create_window();
+    d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    ok(!!d3d, "Failed to create a D3D object.\n");
+    if (!(device = create_device(d3d, window, window, TRUE)))
+    {
+        skip("Failed to create a D3D device, skipping tests.\n");
+        goto done;
+    }
+
+    hr = IDirect3DDevice9_CreateVertexBuffer(device, sizeof(vertices), 0,
+            D3DFVF_XYZRHW | D3DFVF_DIFFUSE, D3DPOOL_DEFAULT, &vb, NULL);
+    ok(hr == D3D_OK, "Failed to create vertex buffer, hr %#lx.\n", hr);
+    if (!vb)
+        goto out;
+
+    hr = IDirect3DVertexBuffer9_Lock(vb, 0, 0, &data, 0);
+    ok(hr == D3D_OK, "Failed to lock vertex buffer, hr %#lx.\n", hr);
+    memcpy(data, vertices, sizeof(vertices));
+    hr = IDirect3DVertexBuffer9_Unlock(vb);
+    ok(hr == D3D_OK, "Failed to unlock vertex buffer, hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_CreateIndexBuffer(device, sizeof(indices), 0,
+            D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, NULL);
+    ok(hr == D3D_OK, "Failed to create index buffer, hr %#lx.\n", hr);
+    if (!ib)
+        goto out;
+
+    hr = IDirect3DIndexBuffer9_Lock(ib, 0, 0, &data, 0);
+    ok(hr == D3D_OK, "Failed to lock index buffer, hr %#lx.\n", hr);
+    memcpy(data, indices, sizeof(indices));
+    hr = IDirect3DIndexBuffer9_Unlock(ib);
+    ok(hr == D3D_OK, "Failed to unlock index buffer, hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_SetFVF(device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    ok(hr == D3D_OK, "Failed to set FVF, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetRenderState(device, D3DRS_ZENABLE, FALSE);
+    ok(hr == D3D_OK, "Failed to disable depth testing, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetRenderState(device, D3DRS_LIGHTING, FALSE);
+    ok(hr == D3D_OK, "Failed to disable lighting, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE);
+    ok(hr == D3D_OK, "Failed to disable culling, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+    ok(hr == D3D_OK, "Failed to enable blending, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_ONE);
+    ok(hr == D3D_OK, "Failed to set source blend, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_ONE);
+    ok(hr == D3D_OK, "Failed to set destination blend, hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_SetStreamSourceFreq(device, 0, 2);
+    ok(hr == D3D_OK, "Failed to set plain stream frequency, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetStreamSource(device, 0, vb, 0, sizeof(vertices[0]));
+    ok(hr == D3D_OK, "Failed to set stream source, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetIndices(device, ib);
+    ok(hr == D3D_OK, "Failed to set indices, hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0, 1.0f, 0);
+    ok(hr == D3D_OK, "Failed to clear, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(hr == D3D_OK, "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawIndexedPrimitive(device, D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+    ok(hr == D3D_OK, "Failed to draw, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(hr == D3D_OK, "Failed to end scene, hr %#lx.\n", hr);
+
+    color = getPixelColor(device, 320, 240);
+    ok(color_match(color, 0x00400000, 1), "Got color %#08x, expected 0x00400000.\n", color);
+
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0, 1.0f, 0);
+    ok(hr == D3D_OK, "Failed to clear, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(hr == D3D_OK, "Failed to begin scene, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawIndexedPrimitiveUP(device, D3DPT_TRIANGLELIST,
+            0, ARRAY_SIZE(vertices), 2, indices, D3DFMT_INDEX16, vertices, sizeof(vertices[0]));
+    ok(hr == D3D_OK, "Failed to draw, hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(hr == D3D_OK, "Failed to end scene, hr %#lx.\n", hr);
+
+    color = getPixelColor(device, 320, 240);
+    ok(color_match(color, 0x00400000, 1), "Got color %#08x, expected 0x00400000.\n", color);
+
+    hr = IDirect3DDevice9_SetStreamSourceFreq(device, 0, 1);
+    ok(hr == D3D_OK, "Failed to reset stream frequency, hr %#lx.\n", hr);
+
+out:
+    if (ib)
+        IDirect3DIndexBuffer9_Release(ib);
+    if (vb)
+        IDirect3DVertexBuffer9_Release(vb);
+    refcount = IDirect3DDevice9_Release(device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+done:
+    IDirect3D9_Release(d3d);
+    DestroyWindow(window);
+}
+
 static void np2_stretch_rect_test(void)
 {
     IDirect3DSurface9 *src = NULL, *dst = NULL, *backbuffer = NULL;
@@ -29570,6 +29690,7 @@ START_TEST(visual)
 
     IDirect3D9_Release(d3d);
 
+    test_indexed_draw_instance_count();
     test_sanity();
     depth_clamp_test();
     stretchrect_test();

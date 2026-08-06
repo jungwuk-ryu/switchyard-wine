@@ -3233,6 +3233,14 @@ static void d3d9_device_upload_managed_textures(struct d3d9_device *device)
     }
 }
 
+static inline unsigned int d3d9_device_get_indexed_instance_count(const struct d3d9_device *device)
+{
+    const struct wined3d_stream_state *stream = &device->stateblock_state->streams[0];
+
+    /* The default frequency is 1, but doesn't enable instancing without INDEXEDDATA. */
+    return stream->flags & WINED3DSTREAMSOURCE_INDEXEDDATA ? stream->frequency : 0;
+}
+
 static HRESULT WINAPI d3d9_device_DrawPrimitive(IDirect3DDevice9Ex *iface,
         D3DPRIMITIVETYPE primitive_type, UINT start_vertex, UINT primitive_count)
 {
@@ -3303,7 +3311,7 @@ static HRESULT WINAPI d3d9_device_DrawIndexedPrimitive(IDirect3DDevice9Ex *iface
     d3d9_device_upload_sysmem_index_buffer(device, &start_idx, index_count);
     wined3d_device_context_flush_mapped_buffer(device->immediate_context, device->stateblock_state->index_buffer);
     wined3d_device_context_draw_indexed(device->immediate_context, base_vertex_idx, start_idx, index_count, 0,
-            device->stateblock_state->streams[0].frequency);
+            d3d9_device_get_indexed_instance_count(device));
     d3d9_rts_flag_auto_gen_mipmap(device);
     wined3d_mutex_unlock();
 
@@ -3426,7 +3434,7 @@ static HRESULT WINAPI d3d9_device_DrawIndexedPrimitiveUP(IDirect3DDevice9Ex *ifa
             wined3d_primitive_type_from_d3d(primitive_type), 0);
     wined3d_device_context_draw_indexed(device->immediate_context,
             vb_pos / vertex_stride - min_vertex_idx, ib_pos / idx_fmt_size, idx_count, 0,
-            device->stateblock_state->streams[0].frequency);
+            d3d9_device_get_indexed_instance_count(device));
 
     wined3d_stateblock_set_stream_source(device->state, 0, NULL, 0, 0);
     wined3d_stateblock_set_index_buffer(device->state, NULL, WINED3DFMT_UNKNOWN);
