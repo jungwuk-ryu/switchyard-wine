@@ -3303,7 +3303,7 @@ static const struct wined3d_device_context_ops wined3d_cs_st_ops =
 static BOOL wined3d_cs_queue_is_empty(const struct wined3d_cs *cs, const struct wined3d_cs_queue *queue)
 {
     wined3d_from_cs(cs);
-    return *(volatile ULONG *)&queue->head == queue->tail;
+    return wined3d_cs_queue_load_head(queue) == queue->tail;
 }
 
 static void wined3d_cs_queue_submit(struct wined3d_cs_queue *queue, struct wined3d_cs *cs)
@@ -3314,7 +3314,7 @@ static void wined3d_cs_queue_submit(struct wined3d_cs_queue *queue, struct wined
     packet = (struct wined3d_cs_packet *)&queue->data[queue->head & WINED3D_CS_QUEUE_MASK];
     TRACE("Queuing %s.\n", debug_cs_packet(packet));
     packet_size = FIELD_OFFSET(struct wined3d_cs_packet, data[packet->size]);
-    InterlockedExchange((LONG *)&queue->head, queue->head + packet_size);
+    wined3d_cs_queue_store_head(queue, queue->head + packet_size);
 
     if (InterlockedCompareExchange(&cs->waiting_for_event, FALSE, TRUE))
     {
@@ -3371,7 +3371,7 @@ static void *wined3d_cs_queue_require_space(struct wined3d_cs_queue *queue, size
 
     for (;;)
     {
-        ULONG tail = (*(volatile ULONG *)&queue->tail) & WINED3D_CS_QUEUE_MASK;
+        ULONG tail = wined3d_cs_queue_load_tail(queue) & WINED3D_CS_QUEUE_MASK;
         ULONG new_pos;
 
         /* Empty. */
@@ -3418,7 +3418,7 @@ static void wined3d_cs_mt_finish(struct wined3d_device_context *context, enum wi
         return wined3d_cs_st_finish(context, queue_id);
 
     TRACE_(d3d_perf)("Waiting for queue %u to be empty.\n", queue_id);
-    while (queue->head != (tail = *(volatile ULONG *)&queue->tail))
+    while (queue->head != (tail = wined3d_cs_queue_load_tail(queue)))
         wined3d_cs_queue_wait_tail(queue, tail, &spin_count);
     TRACE_(d3d_perf)("Queue is now empty.\n");
 }
@@ -3518,7 +3518,7 @@ static inline bool wined3d_cs_execute_next(struct wined3d_cs *cs, struct wined3d
         TRACE("%s executed.\n", debug_cs_packet(packet));
     }
 
-    InterlockedExchange((LONG *)&queue->tail, tail);
+    wined3d_cs_queue_store_tail(queue, tail);
     if (InterlockedCompareExchange(&queue->waiters, 0, 0))
         RtlWakeAddressAll(&queue->tail);
     return true;
@@ -3603,10 +3603,10 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
         run = wined3d_cs_execute_next(cs, queue);
     }
 
-    InterlockedExchange((LONG *)&cs->queue[WINED3D_CS_QUEUE_MAP].tail,
-            cs->queue[WINED3D_CS_QUEUE_MAP].head);
-    InterlockedExchange((LONG *)&cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail,
-            cs->queue[WINED3D_CS_QUEUE_DEFAULT].head);
+    wined3d_cs_queue_store_tail(&cs->queue[WINED3D_CS_QUEUE_MAP],
+            wined3d_cs_queue_load_head(&cs->queue[WINED3D_CS_QUEUE_MAP]));
+    wined3d_cs_queue_store_tail(&cs->queue[WINED3D_CS_QUEUE_DEFAULT],
+            wined3d_cs_queue_load_head(&cs->queue[WINED3D_CS_QUEUE_DEFAULT]));
     RtlWakeAddressAll(&cs->queue[WINED3D_CS_QUEUE_MAP].tail);
     RtlWakeAddressAll(&cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail);
     TRACE("Stopped.\n");

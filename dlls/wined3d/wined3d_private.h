@@ -3665,6 +3665,26 @@ struct wined3d_cs_queue
     BYTE data[WINED3D_CS_QUEUE_SIZE];
 };
 
+static inline ULONG wined3d_cs_queue_load_head(const struct wined3d_cs_queue *queue)
+{
+    return ReadAcquire((const volatile LONG *)&queue->head);
+}
+
+static inline ULONG wined3d_cs_queue_load_tail(const struct wined3d_cs_queue *queue)
+{
+    return ReadAcquire((const volatile LONG *)&queue->tail);
+}
+
+static inline void wined3d_cs_queue_store_head(struct wined3d_cs_queue *queue, ULONG head)
+{
+    WriteRelease((volatile LONG *)&queue->head, head);
+}
+
+static inline void wined3d_cs_queue_store_tail(struct wined3d_cs_queue *queue, ULONG tail)
+{
+    WriteRelease((volatile LONG *)&queue->tail, tail);
+}
+
 struct wined3d_device_context_ops
 {
     void *(*require_space)(struct wined3d_device_context *context, size_t size, enum wined3d_cs_queue_id queue_id);
@@ -3842,7 +3862,7 @@ void wined3d_device_context_push_constants(struct wined3d_device_context *contex
 static inline void wined3d_resource_reference(struct wined3d_resource *resource)
 {
     const struct wined3d_cs *cs = resource->device->cs;
-    resource->access_time = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
+    resource->access_time = wined3d_cs_queue_load_head(&cs->queue[WINED3D_CS_QUEUE_DEFAULT]);
 }
 
 #define WINED3D_PAUSE_SPIN_COUNT 200u
@@ -3874,7 +3894,7 @@ static inline void wined3d_resource_wait_idle(const struct wined3d_resource *res
         return;
 
     access_time = resource->access_time;
-    head = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
+    head = wined3d_cs_queue_load_head(&cs->queue[WINED3D_CS_QUEUE_DEFAULT]);
 
     /* The basic idea is that a resource is busy if tail < access_time <= head.
      * But we have to be careful about wrap-around of the head and tail. The
@@ -3900,7 +3920,7 @@ static inline void wined3d_resource_wait_idle(const struct wined3d_resource *res
 
     for (;;)
     {
-        tail = *(volatile ULONG *)&cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail;
+        tail = wined3d_cs_queue_load_tail(&cs->queue[WINED3D_CS_QUEUE_DEFAULT]);
         if (head == tail) /* Queue empty. */
             break;
 
