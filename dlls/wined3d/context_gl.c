@@ -3427,6 +3427,8 @@ void context_state_fb(struct wined3d_context *context, const struct wined3d_stat
         wined3d_context_gl_apply_draw_buffers(context_gl, rt_mask);
         *cur_mask = rt_mask;
     }
+
+    wined3d_context_gl_check_fbo_status(context_gl, GL_FRAMEBUFFER);
 }
 
 static void wined3d_context_gl_map_stage(struct wined3d_context_gl *context_gl, unsigned int stage, unsigned int unit)
@@ -3692,6 +3694,7 @@ void context_state_drawbuf(struct wined3d_context *context, const struct wined3d
     {
         wined3d_context_gl_apply_draw_buffers(context_gl, rt_mask);
         *cur_mask = rt_mask;
+        wined3d_context_gl_check_fbo_status(context_gl, GL_FRAMEBUFFER);
     }
 }
 
@@ -4114,8 +4117,6 @@ static BOOL context_apply_draw_state(struct wined3d_context *context,
         context->update_unordered_access_view_bindings = 0;
         context->update_compute_unordered_access_view_bindings = 1;
     }
-
-    wined3d_context_gl_check_fbo_status(context_gl, GL_FRAMEBUFFER);
 
     device->shader_backend->shader_apply_draw_state(device->shader_priv, context, state);
     context->shader_update_mask &= 1u << WINED3D_SHADER_TYPE_COMPUTE;
