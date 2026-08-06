@@ -4830,8 +4830,11 @@ static void wined3d_context_gl_unload_numbered_array(struct wined3d_context_gl *
 
     GL_EXTCALL(glDisableVertexAttribArray(i));
     checkGLcall("glDisableVertexAttribArray");
-    if (gl_info->supported[ARB_INSTANCED_ARRAYS])
+    if (gl_info->supported[ARB_INSTANCED_ARRAYS] && context_gl->vertex_attrib_divisor[i])
+    {
         GL_EXTCALL(glVertexAttribDivisor(i, 0));
+        context_gl->vertex_attrib_divisor[i] = 0;
+    }
 
     context_gl->c.numbered_array_mask &= ~(1u << i);
 }
@@ -4887,15 +4890,7 @@ static void wined3d_context_gl_load_numbered_arrays(struct wined3d_context_gl *c
         format_gl = wined3d_format_gl(element->format);
         stream = &state->streams[element->stream_idx];
 
-        if (gl_info->supported[ARB_INSTANCED_ARRAYS])
-        {
-            unsigned int divisor = 0;
-
-            if (element->instanced)
-                divisor = element->divisor ? element->divisor : UINT_MAX;
-            GL_EXTCALL(glVertexAttribDivisor(i, divisor));
-        }
-        else if (element->divisor)
+        if (!gl_info->supported[ARB_INSTANCED_ARRAYS] && element->divisor)
         {
             /* Unload instanced arrays, they will be loaded using immediate
              * mode instead. */
@@ -4911,6 +4906,19 @@ static void wined3d_context_gl_load_numbered_arrays(struct wined3d_context_gl *c
         {
             const void *offset = get_vertex_attrib_pointer(element, state);
             unsigned int format_attrs = format_gl->f.attrs;
+
+            if (gl_info->supported[ARB_INSTANCED_ARRAYS])
+            {
+                unsigned int divisor = 0;
+
+                if (element->instanced)
+                    divisor = element->divisor ? element->divisor : UINT_MAX;
+                if (context_gl->vertex_attrib_divisor[i] != divisor)
+                {
+                    GL_EXTCALL(glVertexAttribDivisor(i, divisor));
+                    context_gl->vertex_attrib_divisor[i] = divisor;
+                }
+            }
 
             bo = wined3d_bo_gl_id(element->data.buffer_object);
             if (current_bo != bo)

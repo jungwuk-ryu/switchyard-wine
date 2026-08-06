@@ -646,6 +646,7 @@ struct wined3d_context_gl
     uint32_t padding : 25;
 
     uint32_t default_attrib_value_set;
+    GLuint vertex_attrib_divisor[MAX_ATTRIBS];
 
     GLenum tracking_parm; /* Which source is tracking current colour. */
     GLenum untracked_materials[2];

@@ -12502,13 +12502,13 @@ static void stream_test(void)
         ok(SUCCEEDED(hr), "Failed to set stream source frequency, hr %#lx.\n", hr);
         hr = IDirect3DDevice9_SetStreamSource(device, act.strVertex, NULL, 0, 0);
         ok(SUCCEEDED(hr), "Failed to set stream source, hr %#lx.\n", hr);
-        hr = IDirect3DDevice9_SetStreamSourceFreq(device, act.idxColor, 1);
+        hr = IDirect3DDevice9_SetStreamSourceFreq(device, act.strColor, 1);
         ok(SUCCEEDED(hr), "Failed to set stream source frequency, hr %#lx.\n", hr);
-        hr = IDirect3DDevice9_SetStreamSource(device, act.idxColor, NULL, 0, 0);
+        hr = IDirect3DDevice9_SetStreamSource(device, act.strColor, NULL, 0, 0);
         ok(SUCCEEDED(hr), "Failed to set stream source, hr %#lx.\n", hr);
-        hr = IDirect3DDevice9_SetStreamSourceFreq(device, act.idxInstance, 1);
+        hr = IDirect3DDevice9_SetStreamSourceFreq(device, act.strInstance, 1);
         ok(SUCCEEDED(hr), "Failed to set stream source frequency, hr %#lx.\n", hr);
-        hr = IDirect3DDevice9_SetStreamSource(device, act.idxInstance, NULL, 0, 0);
+        hr = IDirect3DDevice9_SetStreamSource(device, act.strInstance, NULL, 0, 0);
         ok(SUCCEEDED(hr), "Failed to set stream source, hr %#lx.\n", hr);
 
         hr = IDirect3DVertexDeclaration9_Release(pDecl);
@@ -12526,6 +12526,55 @@ static void stream_test(void)
         hr = IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
         ok(hr == S_OK, "Got hr %#lx.\n", hr);
     }
+
+    decl[0].Stream = 0;
+    decl[1].Stream = 1;
+    decl[2].Stream = 2;
+    hr = IDirect3DDevice9_CreateVertexDeclaration(device, decl, &pDecl);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetVertexDeclaration(device, pDecl);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetStreamSource(device, 0, vb, 0, sizeof(quad[0]));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetStreamSource(device, 1, vb2, 0, sizeof(vertcolor[0]));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetStreamSource(device, 2, vb3, 0, sizeof(instancepos[0]));
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetStreamSourceFreq(device, 0, D3DSTREAMSOURCE_INDEXEDDATA | 1);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetStreamSourceFreq(device, 1, 1);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetStreamSourceFreq(device, 2, D3DSTREAMSOURCE_INSTANCEDATA | 1);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawIndexedPrimitive(device, D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    hr = IDirect3DDevice9_SetStreamSourceFreq(device, 0, 1);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_SetStreamSourceFreq(device, 2, 1);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+            0xffffffff, 1.0f, 0);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_BeginScene(device);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_DrawPrimitive(device, D3DPT_TRIANGLELIST, 0, 1);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    hr = IDirect3DDevice9_EndScene(device);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+
+    color = getPixelColor(device, 384, 252);
+    ok(color_match(color, 0x00ff0000, 1),
+            "Per-vertex draw after instancing has color 0x%08x, expected 0x00ff0000.\n", color);
+
+    hr = IDirect3DVertexDeclaration9_Release(pDecl);
+    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+    pDecl = NULL;
 
 out:
     if(vb) IDirect3DVertexBuffer9_Release(vb);
