@@ -1736,7 +1736,7 @@ static int context_choose_pixel_format(const struct wined3d_device *device, HDC 
 }
 
 /* Context activation is done by the caller. */
-void wined3d_context_gl_bind_dummy_textures(const struct wined3d_context_gl *context_gl)
+void wined3d_context_gl_bind_dummy_textures(struct wined3d_context_gl *context_gl)
 {
     const struct wined3d_dummy_textures *textures = &wined3d_device_gl(context_gl->c.device)->dummy_textures;
     const struct wined3d_gl_info *gl_info = context_gl->gl_info;
@@ -1744,7 +1744,7 @@ void wined3d_context_gl_bind_dummy_textures(const struct wined3d_context_gl *con
 
     for (i = 0; i < gl_info->limits.combined_samplers; ++i)
     {
-        GL_EXTCALL(glActiveTexture(GL_TEXTURE0 + i));
+        wined3d_context_gl_active_texture(context_gl, gl_info, i);
 
         gl_info->gl_ops.gl.p_glBindTexture(GL_TEXTURE_1D, textures->tex_1d);
         gl_info->gl_ops.gl.p_glBindTexture(GL_TEXTURE_2D, textures->tex_2d);
@@ -2445,6 +2445,9 @@ static void wined3d_context_gl_apply_draw_buffers(struct wined3d_context_gl *con
 void wined3d_context_gl_active_texture(struct wined3d_context_gl *context_gl,
         const struct wined3d_gl_info *gl_info, unsigned int unit)
 {
+    if (context_gl->active_texture == unit)
+        return;
+
     GL_EXTCALL(glActiveTexture(GL_TEXTURE0 + unit));
     checkGLcall("glActiveTexture");
     context_gl->active_texture = unit;

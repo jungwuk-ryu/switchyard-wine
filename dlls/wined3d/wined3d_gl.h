@@ -759,7 +759,7 @@ void wined3d_context_gl_apply_fbo_state_explicit(struct wined3d_context_gl *cont
         struct wined3d_resource *rt, unsigned int rt_sub_resource_idx,
         struct wined3d_resource *ds, unsigned int ds_sub_resource_idx, uint32_t location);
 void wined3d_context_gl_bind_bo(struct wined3d_context_gl *context_gl, GLenum binding, GLuint name);
-void wined3d_context_gl_bind_dummy_textures(const struct wined3d_context_gl *context_gl);
+void wined3d_context_gl_bind_dummy_textures(struct wined3d_context_gl *context_gl);
 void wined3d_context_gl_bind_texture(struct wined3d_context_gl *context_gl, GLenum target, GLuint name);
 void wined3d_context_gl_check_fbo_status(const struct wined3d_context_gl *context_gl, GLenum target);
 void wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
