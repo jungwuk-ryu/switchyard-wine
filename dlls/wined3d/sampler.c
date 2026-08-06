@@ -357,14 +357,14 @@ static void texture_gl_apply_base_level(struct wined3d_texture_gl *texture_gl,
 
 /* This function relies on the correct texture being bound and loaded. */
 void wined3d_sampler_gl_bind(struct wined3d_sampler_gl *sampler_gl, unsigned int unit,
-        struct wined3d_texture_gl *texture_gl, const struct wined3d_context_gl *context_gl)
+        struct wined3d_texture_gl *texture_gl, struct wined3d_context_gl *context_gl)
 {
     const struct wined3d_gl_info *gl_info = context_gl->gl_info;
 
     if (gl_info->supported[ARB_SAMPLER_OBJECTS])
     {
-        GL_EXTCALL(glBindSampler(unit, sampler_gl->name));
-        checkGLcall("bind sampler");
+        if (wined3d_context_gl_bind_sampler(context_gl, unit, sampler_gl->name))
+            checkGLcall("bind sampler");
     }
     else if (texture_gl)
     {

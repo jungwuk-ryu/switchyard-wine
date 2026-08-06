@@ -4802,6 +4802,7 @@ static void wined3d_sampler_gl_destroy_object(void *object)
     {
         context = context_acquire(sampler_gl->s.device, NULL, 0);
         gl_info = wined3d_context_gl(context)->gl_info;
+        wined3d_context_gl_invalidate_sampler_binding(sampler_gl->s.device, sampler_gl->name);
         GL_EXTCALL(glDeleteSamplers(1, &sampler_gl->name));
         context_release(context);
     }

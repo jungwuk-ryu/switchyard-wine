@@ -628,6 +628,12 @@ struct fbo_entry
     } key;
 };
 
+struct wined3d_gl_sampler_binding
+{
+    GLuint name;
+    bool valid;
+};
+
 struct wined3d_context_gl
 {
     struct wined3d_context c;
@@ -654,6 +660,7 @@ struct wined3d_context_gl
     unsigned int active_texture;
 
     GLenum *texture_type;
+    struct wined3d_gl_sampler_binding *sampler_bindings;
 
     /* The WGL context. */
     unsigned int level;
@@ -761,6 +768,21 @@ void wined3d_context_gl_apply_fbo_state_explicit(struct wined3d_context_gl *cont
         struct wined3d_resource *ds, unsigned int ds_sub_resource_idx, uint32_t location);
 void wined3d_context_gl_bind_bo(struct wined3d_context_gl *context_gl, GLenum binding, GLuint name);
 void wined3d_context_gl_bind_dummy_textures(struct wined3d_context_gl *context_gl);
+bool wined3d_context_gl_bind_sampler_slow(struct wined3d_context_gl *context_gl, unsigned int unit, GLuint name);
+static inline bool wined3d_context_gl_bind_sampler(
+        struct wined3d_context_gl *context_gl, unsigned int unit, GLuint name)
+{
+    struct wined3d_gl_sampler_binding *binding;
+
+    if (unit < context_gl->gl_info->limits.combined_samplers)
+    {
+        binding = &context_gl->sampler_bindings[unit];
+        if (binding->valid && binding->name == name)
+            return false;
+    }
+
+    return wined3d_context_gl_bind_sampler_slow(context_gl, unit, name);
+}
 void wined3d_context_gl_bind_texture(struct wined3d_context_gl *context_gl, GLenum target, GLuint name);
 void wined3d_context_gl_check_fbo_status(const struct wined3d_context_gl *context_gl, GLenum target);
 void wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
@@ -768,6 +790,7 @@ void wined3d_context_gl_copy_bo_address(struct wined3d_context_gl *context_gl,
         unsigned int range_count, const struct wined3d_range *ranges, uint32_t map_flags);
 void wined3d_context_gl_destroy(struct wined3d_context_gl *context_gl);
 void wined3d_context_gl_destroy_bo(struct wined3d_context_gl *context_gl, struct wined3d_bo_gl *bo);
+void wined3d_context_gl_invalidate_sampler_binding(struct wined3d_device *device, GLuint name);
 void wined3d_context_gl_draw_shaded_quad(struct wined3d_context_gl *context_gl, struct wined3d_texture_gl *texture_gl,
         unsigned int sub_resource_idx, const RECT *src_rect, const RECT *dst_rect,
         enum wined3d_texture_filter_type filter);
@@ -1068,7 +1091,7 @@ static inline struct wined3d_sampler_gl *wined3d_sampler_gl(struct wined3d_sampl
 }
 
 void wined3d_sampler_gl_bind(struct wined3d_sampler_gl *sampler_gl, unsigned int unit,
-        struct wined3d_texture_gl *texture_gl, const struct wined3d_context_gl *context_gl);
+        struct wined3d_texture_gl *texture_gl, struct wined3d_context_gl *context_gl);
 void wined3d_sampler_gl_init(struct wined3d_sampler_gl *sampler_gl, struct wined3d_device *device,
         const struct wined3d_sampler_desc *desc, void *parent, const struct wined3d_parent_ops *parent_ops);
 

@@ -1140,6 +1140,26 @@ void context_gl_resource_released(struct wined3d_device *device, GLuint name, BO
             wined3d_context_gl_queue_fbo_entry_destruction);
 }
 
+void wined3d_context_gl_invalidate_sampler_binding(struct wined3d_device *device, GLuint name)
+{
+    unsigned int i, j;
+
+    wined3d_from_cs(device->cs);
+
+    for (i = 0; i < device->context_count; ++i)
+    {
+        struct wined3d_context_gl *context_gl = wined3d_context_gl(device->contexts[i]);
+
+        for (j = 0; j < context_gl->gl_info->limits.combined_samplers; ++j)
+        {
+            struct wined3d_gl_sampler_binding *binding = &context_gl->sampler_bindings[j];
+
+            if (binding->valid && binding->name == name)
+                binding->valid = false;
+        }
+    }
+}
+
 void wined3d_context_gl_texture_update(struct wined3d_context_gl *context_gl,
         const struct wined3d_texture_gl *texture_gl)
 {
@@ -1488,6 +1508,7 @@ static void wined3d_context_gl_cleanup(struct wined3d_context_gl *context_gl)
         wined3d_context_gl_destroy_fbo_entry(context_gl, entry);
     }
 
+    free(context_gl->sampler_bindings);
     free(context_gl->texture_type);
 
     if (restore_ctx)
@@ -2061,6 +2082,11 @@ HRESULT wined3d_context_gl_init(struct wined3d_context_gl *context_gl, struct wi
     if (!(context_gl->texture_type = calloc(gl_info->limits.combined_samplers,
             sizeof(*context_gl->texture_type))))
         goto fail;
+    if (!(context_gl->sampler_bindings = calloc(gl_info->limits.combined_samplers,
+            sizeof(*context_gl->sampler_bindings))))
+        goto fail;
+    for (i = 0; i < gl_info->limits.combined_samplers; ++i)
+        context_gl->sampler_bindings[i].valid = true;
 
     if (!wined3d_context_gl_create_wgl_ctx(context_gl, swapchain_gl, &new_drawable))
         goto fail;
@@ -2248,6 +2274,7 @@ HRESULT wined3d_context_gl_init(struct wined3d_context_gl *context_gl, struct wi
     return WINED3D_OK;
 
 fail:
+    free(context_gl->sampler_bindings);
     free(context_gl->texture_type);
     return E_FAIL;
 }
@@ -2522,6 +2549,23 @@ void wined3d_context_gl_bind_texture(struct wined3d_context_gl *context_gl, GLen
     }
 
     checkGLcall("bind texture");
+}
+
+bool wined3d_context_gl_bind_sampler_slow(struct wined3d_context_gl *context_gl, unsigned int unit, GLuint name)
+{
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    struct wined3d_gl_sampler_binding *binding;
+
+    GL_EXTCALL(glBindSampler(unit, name));
+
+    if (unit < gl_info->limits.combined_samplers)
+    {
+        binding = &context_gl->sampler_bindings[unit];
+        binding->name = name;
+        binding->valid = true;
+    }
+
+    return true;
 }
 
 static void wined3d_context_gl_poll_fences(struct wined3d_context_gl *context_gl)
@@ -3146,7 +3190,7 @@ void wined3d_context_gl_apply_blit_state(struct wined3d_context_gl *context_gl, 
     context->last_was_blit = TRUE;
 
     if (gl_info->supported[ARB_SAMPLER_OBJECTS])
-        GL_EXTCALL(glBindSampler(0, 0));
+        wined3d_context_gl_bind_sampler(context_gl, 0, 0);
     wined3d_context_gl_active_texture(context_gl, gl_info, 0);
 
     context_invalidate_compute_state(context, STATE_COMPUTE_SHADER_RESOURCE_BINDING);
@@ -3738,7 +3782,7 @@ static void wined3d_context_gl_bind_shader_resources(struct wined3d_context_gl *
                     wined3d_context_gl_active_texture(context_gl, gl_info, bind_idx);
                     wined3d_context_gl_bind_texture(context_gl, GL_NONE, 0);
                     if (gl_info->supported[ARB_SAMPLER_OBJECTS])
-                        GL_EXTCALL(glBindSampler(bind_idx, 0));
+                        wined3d_context_gl_bind_sampler(context_gl, bind_idx, 0);
                 }
             }
         }
@@ -3777,7 +3821,7 @@ static void wined3d_context_gl_bind_shader_resources(struct wined3d_context_gl *
             wined3d_context_gl_active_texture(context_gl, gl_info, bind_idx);
             wined3d_context_gl_bind_texture(context_gl, GL_NONE, 0);
             if (gl_info->supported[ARB_SAMPLER_OBJECTS])
-                GL_EXTCALL(glBindSampler(bind_idx, 0));
+                wined3d_context_gl_bind_sampler(context_gl, bind_idx, 0);
         }
     }
 }

@@ -5795,6 +5795,13 @@ static void test_mipmap_autogen(void)
          0.5f, -0.5f, 0.1f, 1.0f, 0.0f,
          0.5f,  0.5f, 0.1f, 1.0f, 1.0f,
     };
+    static const float border_quad[] =
+    {
+        -0.5f, -0.5f, 0.1f, -1.0f, -1.0f,
+        -0.5f,  0.5f, 0.1f, -1.0f, -1.0f,
+         0.5f, -0.5f, 0.1f, -1.0f, -1.0f,
+         0.5f,  0.5f, 0.1f, -1.0f, -1.0f,
+    };
 
     window = create_window();
     d3d = Direct3DCreate9(D3D_SDK_VERSION);
@@ -6030,6 +6037,66 @@ static void test_mipmap_autogen(void)
 
     color = getPixelColor(device, 200, 200);
     ok(color == 0x0000ffff, "Unexpected color 0x%08x.\n", color);
+
+    if (caps.TextureAddressCaps & D3DPTADDRESSCAPS_BORDER)
+    {
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+        ok(SUCCEEDED(hr), "Failed to set texture addressing, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+        ok(SUCCEEDED(hr), "Failed to set texture addressing, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_BORDERCOLOR, 0xff0000ff);
+        ok(SUCCEEDED(hr), "Failed to set border color, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        ok(SUCCEEDED(hr), "Failed to set minification filter, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        ok(SUCCEEDED(hr), "Failed to set magnification filter, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        ok(SUCCEEDED(hr), "Failed to set mip filter, hr %#lx.\n", hr);
+
+        hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xffffff00, 1.0f, 0);
+        ok(SUCCEEDED(hr), "Failed to clear, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_BeginScene(device);
+        ok(SUCCEEDED(hr), "Failed to begin scene, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_DrawPrimitiveUP(device,
+                D3DPT_TRIANGLESTRIP, 2, border_quad, 5 * sizeof(float));
+        ok(SUCCEEDED(hr), "Failed to draw, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_EndScene(device);
+        ok(SUCCEEDED(hr), "Failed to end scene, hr %#lx.\n", hr);
+        color = getPixelColor(device, 320, 240);
+        ok(color == 0x000000ff, "Unexpected color 0x%08x.\n", color);
+
+        /* Generating mipmaps unbinds the sampler object internally. Verify that the next draw
+         * restores it even though the D3D sampler state did not change. */
+        IDirect3DTexture9_GenerateMipSubLevels(texture3);
+        hr = IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xffffff00, 1.0f, 0);
+        ok(SUCCEEDED(hr), "Failed to clear, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_BeginScene(device);
+        ok(SUCCEEDED(hr), "Failed to begin scene, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_DrawPrimitiveUP(device,
+                D3DPT_TRIANGLESTRIP, 2, border_quad, 5 * sizeof(float));
+        ok(SUCCEEDED(hr), "Failed to draw, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_EndScene(device);
+        ok(SUCCEEDED(hr), "Failed to end scene, hr %#lx.\n", hr);
+        color = getPixelColor(device, 320, 240);
+        ok(color == 0x000000ff, "Unexpected color 0x%08x.\n", color);
+
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        ok(SUCCEEDED(hr), "Failed to restore texture addressing, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        ok(SUCCEEDED(hr), "Failed to restore texture addressing, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_BORDERCOLOR, 0);
+        ok(SUCCEEDED(hr), "Failed to restore border color, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        ok(SUCCEEDED(hr), "Failed to restore minification filter, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        ok(SUCCEEDED(hr), "Failed to restore magnification filter, hr %#lx.\n", hr);
+        hr = IDirect3DDevice9_SetSamplerState(device, 0, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
+        ok(SUCCEEDED(hr), "Failed to restore mip filter, hr %#lx.\n", hr);
+    }
+    else
+    {
+        skip("Border texture addressing is not supported.\n");
+    }
 
     IDirect3DSurface9_Release(surface3);
     IDirect3DSurface9_Release(surface2);
