@@ -662,6 +662,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
     TRACE("Presenting DC %p.\n", context_gl->dc);
 
+    gl_info = context_gl->gl_info;
     pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format - 1];
     if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
             || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
@@ -672,8 +673,6 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     }
     else
     {
-        gl_info = context_gl->gl_info;
-
         swapchain_gl_set_swap_interval(swapchain, context_gl, swap_interval);
 
         wined3d_texture_load_location(back_buffer, 0, context, back_buffer->resource.draw_binding);
@@ -699,6 +698,8 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
     wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_DRAWABLE);
     wined3d_texture_invalidate_location(swapchain->front_buffer, 0, ~WINED3D_LOCATION_DRAWABLE);
+
+    checkGLcall_frame("frame boundary");
 
     context_release(context);
 }

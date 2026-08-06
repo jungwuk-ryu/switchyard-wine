@@ -421,15 +421,25 @@ static inline bool wined3d_fence_supported(const struct wined3d_gl_info *gl_info
 /* Checking of API calls */
 /* --------------------- */
 #ifndef WINE_NO_DEBUG_MSGS
+/* Synchronous per-call error polling is too expensive for default logging, especially through WoW64. */
 #define checkGLcall(A)                                              \
     do                                                              \
     {                                                               \
+        if (__WINE_IS_DEBUG_ON(_TRACE, &__wine_dbch_d3d)            \
+                && !gl_info->supported[ARB_DEBUG_OUTPUT])           \
+            wined3d_check_gl_call(gl_info, __FILE__, __LINE__, A);  \
+    } while(0)
+#define checkGLcall_frame(A)                                        \
+    do                                                              \
+    {                                                               \
         if (__WINE_IS_DEBUG_ON(_ERR, &__wine_dbch_d3d)              \
+                && !__WINE_IS_DEBUG_ON(_TRACE, &__wine_dbch_d3d)    \
                 && !gl_info->supported[ARB_DEBUG_OUTPUT])           \
             wined3d_check_gl_call(gl_info, __FILE__, __LINE__, A);  \
     } while(0)
 #else
 #define checkGLcall(A) do {} while(0)
+#define checkGLcall_frame(A) do {} while(0)
 #endif
 
 struct wined3d_bo_gl

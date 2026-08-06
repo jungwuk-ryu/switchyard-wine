@@ -2528,6 +2528,9 @@ static void check_fbo_compat(struct wined3d_caps_gl_ctx *ctx, struct wined3d_for
                 checkGLcall("RB attachment");
             }
 
+            /* The following error is used for capability detection, so don't rely on
+             * debug logging to clear stale errors. */
+            while (gl_info->gl_ops.gl.p_glGetError());
             gl_info->gl_ops.gl.p_glEnable(GL_BLEND);
             gl_info->gl_ops.gl.p_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             gl_info->gl_ops.gl.p_glClear(GL_COLOR_BUFFER_BIT);
