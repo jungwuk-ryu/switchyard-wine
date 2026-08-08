@@ -10,6 +10,7 @@
 
 #include "windef.h"
 #include "winbase.h"
+#include "winternl.h"
 #include "wine/debug.h"
 
 #include "wine/vulkan.h"
@@ -392,49 +393,94 @@ static BOOL get_ags_version_from_resource(const WCHAR *filename, enum amd_ags_ve
     return TRUE;
 }
 
-static enum amd_ags_version guess_version_from_exports(HMODULE hnative, int *ags_version)
+static BOOL image_exports_name(HMODULE module, const char *name)
 {
+    IMAGE_EXPORT_DIRECTORY *exports;
+    DWORD i, size, *names;
+
+    if (!(exports = RtlImageDirectoryEntryToData(module, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size)))
+        return FALSE;
+    if (!(names = RtlImageRvaToVa(RtlImageNtHeader(module), module, exports->AddressOfNames, NULL)))
+        return FALSE;
+
+    for (i = 0; i < exports->NumberOfNames; i++)
+    {
+        const char *export_name = RtlImageRvaToVa(RtlImageNtHeader(module), module, names[i], NULL);
+        if (export_name && !strcmp(export_name, name))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static enum amd_ags_version guess_version_from_exports(const WCHAR *filename, int *ags_version)
+{
+    HANDLE file = INVALID_HANDLE_VALUE, mapping = NULL;
+    enum amd_ags_version ret = AMD_AGS_VERSION_5_4_1;
+    HMODULE module = NULL;
+
     /* Known DLL versions without version info:
      *  - An update to AGS 5.4.1 included an amd_ags_x64.dll with no file version info;
      *  - CoD: Modern Warfare Remastered (2017) ships dll without version info which is version 5.0.1
      *    (not tagged in AGSSDK history), compatible with 5.0.5.
+     *
+     * Map the image as data instead of using LoadLibraryW(), since loading the app-provided
+     * native DLL would execute its DllMain even when Wine selected the builtin AGS module.
      */
-    if (GetProcAddress(hnative, "agsGetDriverVersionInfo"))
+    file = CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        goto done;
+    if (!(mapping = CreateFileMappingW(file, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL)))
+        goto done;
+    if (!(module = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)))
+        goto done;
+
+    if (image_exports_name(module, "agsGetDriverVersionInfo"))
     {
         /* agsGetDriverVersionInfo existed somewhere before 3.1.1, there is no SDK history in github before 3.1.1. */
         TRACE("agsGetDriverVersionInfo found.\n");
         *ags_version = AGS_MAKE_VERSION(3, 0, 0);
-        return AMD_AGS_VERSION_4_0_3;
+        ret = AMD_AGS_VERSION_4_0_3;
+        goto done;
     }
 
-    if (GetProcAddress(hnative, "agsDriverExtensions_SetCrossfireMode"))
+    if (image_exports_name(module, "agsDriverExtensions_SetCrossfireMode"))
     {
         /* agsDriverExtensions_SetCrossfireMode was deprecated in 3.2.0 */
         TRACE("agsDriverExtensions_SetCrossfireMode found.\n");
         *ags_version = AGS_MAKE_VERSION(3, 1, 1);
-        return AMD_AGS_VERSION_4_0_3;
+        ret = AMD_AGS_VERSION_4_0_3;
+        goto done;
     }
-    if (GetProcAddress(hnative, "agsDriverExtensions_Init"))
+    if (image_exports_name(module, "agsDriverExtensions_Init"))
     {
         /* agsGetEyefinityConfigInfo was deprecated in 4.0.0 */
         TRACE("agsDriverExtensions_Init found.\n");
         *ags_version = AGS_MAKE_VERSION(3, 2, 2);
-        return AMD_AGS_VERSION_4_0_3;
+        ret = AMD_AGS_VERSION_4_0_3;
+        goto done;
     }
-    if (GetProcAddress(hnative, "agsGetEyefinityConfigInfo"))
+    if (image_exports_name(module, "agsGetEyefinityConfigInfo"))
     {
         /* agsGetEyefinityConfigInfo was deprecated in 5.0.0 */
         TRACE("agsGetEyefinityConfigInfo found.\n");
-        return AMD_AGS_VERSION_4_0_3;
+        ret = AMD_AGS_VERSION_4_0_3;
+        goto done;
     }
-    if (GetProcAddress(hnative, "agsDriverExtensionsDX11_Init"))
+    if (image_exports_name(module, "agsDriverExtensionsDX11_Init"))
     {
         /* agsDriverExtensionsDX11_Init was deprecated in 5.3.0 */
         TRACE("agsDriverExtensionsDX11_Init found.\n");
-        return AMD_AGS_VERSION_5_0_5;
+        ret = AMD_AGS_VERSION_5_0_5;
+        goto done;
     }
     TRACE("Returning 5.4.1.\n");
-    return AMD_AGS_VERSION_5_4_1;
+
+done:
+    if (module) UnmapViewOfFile(module);
+    if (mapping) CloseHandle(mapping);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    return ret;
 }
 
 static BOOL is_wine_builtin_file(const WCHAR *filename)
@@ -466,8 +512,6 @@ static enum amd_ags_version determine_ags_version(int *ags_version)
      */
     enum amd_ags_version ret = AMD_AGS_VERSION_5_4_1;
     WCHAR dllname[MAX_PATH], temp_path[MAX_PATH], temp_name[MAX_PATH];
-    int (WINAPI *pagsGetVersionNumber)(void);
-    HMODULE hnative = NULL;
     HMODULE module;
     DWORD size;
     static __thread int recursive_version_detection;
@@ -516,30 +560,11 @@ static enum amd_ags_version determine_ags_version(int *ags_version)
     if (get_ags_version_from_resource(temp_name, &ret, ags_version))
         goto done;
 
-    if (!(hnative = LoadLibraryW(temp_name)))
-    {
-        ERR("LoadLibraryW failed for %s.\n", debugstr_w(temp_name));
-        goto done;
-    }
-
-    if ((pagsGetVersionNumber = (void *)GetProcAddress(hnative, "agsGetVersionNumber")))
-    {
-        recursive_version_detection++;
-        *ags_version = pagsGetVersionNumber();
-        recursive_version_detection--;
-        ret = get_version_number(*ags_version);
-        TRACE("Got version %s (%d) from agsGetVersionNumber.\n", debugstr_agsversion(*ags_version), ret);
-        goto done;
-    }
-
-    ret = guess_version_from_exports(hnative, ags_version);
+    ret = guess_version_from_exports(temp_name, ags_version);
 
 done:
     if (!*ags_version)
         *ags_version = amd_ags_info[ret].ags_max_public_version;
-
-    if (hnative)
-        FreeLibrary(hnative);
 
     if (*temp_name)
         DeleteFileW(temp_name);
