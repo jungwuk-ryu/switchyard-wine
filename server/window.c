@@ -2472,9 +2472,9 @@ DECL_HANDLER(set_window_info)
             else shared->info.user_data = MAKELONG(req->new_info, shared->info.user_data >> 16);
             break;
         default:
-            if (req->size > sizeof(req->new_info) || req->offset < 0 ||
-                req->offset > shared->extra_size - (int)req->size ||
-                (!req->internal && req->offset < shared->private_size))
+            if (req->size > sizeof(req->new_info) ||
+                !is_valid_user_extra_range( req->offset, req->size, shared->extra_size ) ||
+                (!req->internal && (data_size_t)req->offset < shared->private_size))
             {
                 set_win32_error( ERROR_INVALID_INDEX );
                 break;

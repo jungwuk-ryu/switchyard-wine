@@ -331,7 +331,7 @@ DECL_HANDLER(set_class_info)
             if (req->new_info > 4096)
             {
                 set_error( STATUS_INVALID_PARAMETER );
-                return;
+                break;
             }
             reply->old_info = shared->info.win_extra;
             shared->info.win_extra = req->new_info;
@@ -369,11 +369,11 @@ DECL_HANDLER(set_class_info)
             shared->info.menu_name = req->new_info;
             break;
         default:
-            if (req->size > sizeof(req->new_info) || req->offset < 0 ||
-                req->offset > class->shared->info.cls_extra - (int)req->size)
+            if (req->size > sizeof(req->new_info) ||
+                !is_valid_user_extra_range( req->offset, req->size, shared->info.cls_extra ))
             {
                 set_win32_error( ERROR_INVALID_INDEX );
-                return;
+                break;
             }
             memcpy( &reply->old_info, (char *)shared->extra + req->offset, req->size );
             memcpy( (char *)shared->extra + req->offset, &req->new_info, req->size );
