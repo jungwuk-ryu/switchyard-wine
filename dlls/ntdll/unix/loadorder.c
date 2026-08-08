@@ -150,31 +150,39 @@ static WCHAR *get_basename( WCHAR *name )
     return name;
 }
 
-/***************************************************************************
- *	wcs_contains_ascii
- *
- * Return whether a WCHAR string contains an ASCII substring, ignoring case.
- */
-static BOOL wcs_contains_ascii( const WCHAR *str, const char *ascii )
+static BOOL wcs_equal_ascii_len( const WCHAR *str, const char *ascii, size_t len )
 {
-    size_t len = strlen( ascii );
+    size_t i;
 
-    if (!len) return TRUE;
-    while (*str)
+    for (i = 0; i < len; i++)
     {
-        size_t i;
+        WCHAR ch = str[i];
+        unsigned char expected = ascii[i];
 
-        for (i = 0; i < len && str[i]; i++)
-        {
-            WCHAR ch = str[i];
-            unsigned char expected = ascii[i];
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+        if (expected >= 'A' && expected <= 'Z') expected += 'a' - 'A';
+        if (ch != expected) return FALSE;
+    }
+    return TRUE;
+}
 
-            if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
-            if (expected >= 'A' && expected <= 'Z') expected += 'a' - 'A';
-            if (ch != expected) break;
-        }
-        if (i == len) return TRUE;
-        str++;
+static BOOL switchyard_is_mesa_opengl_path( const WCHAR *module, const WCHAR *basename )
+{
+    static const char x86_64_mesa_path[] = "\\lib\\switchyard-mesa\\x86_64-windows\\";
+    static const char i386_mesa_path[] = "\\lib\\switchyard-mesa\\i386-windows\\";
+    const WCHAR *dir = basename - 1;
+    const char *path;
+    size_t len;
+
+    if (dir < module || *dir != '\\') return FALSE;
+
+    for (path = x86_64_mesa_path;; path = i386_mesa_path)
+    {
+        len = strlen( path );
+        if (dir - module + 1 >= len &&
+            wcs_equal_ascii_len( dir - len + 1, path, len ))
+            return TRUE;
+        if (path == i386_mesa_path) break;
     }
     return FALSE;
 }
@@ -586,9 +594,7 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
     module[len + 1] = 0;
     remove_dll_ext( module + 1 );
     basename = get_basename( module + 1 );
-    switchyard_mesa =
-        wcs_contains_ascii( module + 1, "\\lib\\switchyard-mesa\\x86_64-windows\\" ) ||
-        wcs_contains_ascii( module + 1, "\\lib\\switchyard-mesa\\i386-windows\\" );
+    switchyard_mesa = switchyard_is_mesa_opengl_path( module + 1, basename );
 
     /* first explicit module name */
     if ((ret = get_load_order_value( std_key, app_key, is_system_dir ? basename : module+1 )) != LO_INVALID)

@@ -4384,7 +4384,13 @@ static NTSTATUS get_env_var( const WCHAR *name, SIZE_T extra, UNICODE_STRING *re
 static void switchyard_init_mesa_opengl(void)
 {
     UNICODE_STRING mesa_path;
+    UNICODE_STRING opengl_driver;
 
+    if (get_env_var( L"WINE_OPENGL_DRIVER", 0, &opengl_driver )) return;
+    switchyard_mesa_opengl = opengl_driver.Length &&
+        !wcsicmp( opengl_driver.Buffer, L"llvmpipe" );
+    RtlFreeUnicodeString( &opengl_driver );
+    if (!switchyard_mesa_opengl) return;
     if (get_env_var( L"SWITCHYARD_OPENGL_DLL_PATH", 0, &mesa_path )) return;
     switchyard_mesa_opengl = !!mesa_path.Length;
     RtlFreeUnicodeString( &mesa_path );
