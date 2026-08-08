@@ -3871,7 +3871,8 @@ static HRESULT sltg_get_typelib_ref(const sltg_ref_lookup_t *table, DWORD typein
     return E_FAIL;
 }
 
-static WORD *SLTG_DoType(WORD *pType, char *pBlk, TYPEDESC *pTD, const sltg_ref_lookup_t *ref_lookup)
+static WORD *SLTG_DoType(WORD *pType, char *pBlk, SIZE_T block_size, TYPEDESC *pTD,
+        const sltg_ref_lookup_t *ref_lookup)
 {
     BOOL done = FALSE;
 
@@ -3901,19 +3902,46 @@ static WORD *SLTG_DoType(WORD *pType, char *pBlk, TYPEDESC *pTD, const sltg_ref_
 
 	    struct SLTG_SAFEARRAY
 	    {
-	        short cDims;
-	        short fFetures;
+	        WORD cDims;
+	        WORD fFeatures;
 	        int cbElements;
 	        int cLocks;
 	        int pvData;
 	        SAFEARRAYBOUND rgsabound[1];
-	    } *pSA = (struct SLTG_SAFEARRAY *)(pBlk + *(++pType));
+	    } array;
+	    WORD offset = *(++pType);
+	    SIZE_T size;
+
+	    if (offset > block_size || offsetof(struct SLTG_SAFEARRAY, rgsabound) > block_size - offset)
+	    {
+	        WARN("invalid SLTG SAFEARRAY offset %#x\n", offset);
+	        pTD->vt = VT_EMPTY;
+	        done = TRUE;
+	        break;
+	    }
+	    memcpy(&array, pBlk + offset, offsetof(struct SLTG_SAFEARRAY, rgsabound));
+	    if (!array.cDims || array.cDims >
+	        (block_size - offset - offsetof(struct SLTG_SAFEARRAY, rgsabound)) /
+	        sizeof(SAFEARRAYBOUND))
+	    {
+	        WARN("invalid SLTG SAFEARRAY dimension count %u\n", array.cDims);
+	        pTD->vt = VT_EMPTY;
+	        done = TRUE;
+	        break;
+	    }
 
 	    pTD->vt = VT_CARRAY;
-	    pTD->lpadesc = calloc(1, sizeof(ARRAYDESC) + (pSA->cDims - 1) * sizeof(SAFEARRAYBOUND));
-	    pTD->lpadesc->cDims = pSA->cDims;
-	    memcpy(pTD->lpadesc->rgbounds, pSA->rgsabound,
-		   pSA->cDims * sizeof(SAFEARRAYBOUND));
+	    size = FIELD_OFFSET(ARRAYDESC, rgbounds[array.cDims]);
+	    if (!(pTD->lpadesc = calloc(1, size)))
+	    {
+	        pTD->vt = VT_EMPTY;
+	        done = TRUE;
+	        break;
+	    }
+	    pTD->lpadesc->cDims = array.cDims;
+	    memcpy(pTD->lpadesc->rgbounds,
+	            pBlk + offset + offsetof(struct SLTG_SAFEARRAY, rgsabound),
+	            array.cDims * sizeof(SAFEARRAYBOUND));
 
 	    pTD = &pTD->lpadesc->tdescElem;
 	    break;
@@ -3940,7 +3968,7 @@ static WORD *SLTG_DoType(WORD *pType, char *pBlk, TYPEDESC *pTD, const sltg_ref_
     return pType;
 }
 
-static WORD *SLTG_DoElem(WORD *pType, char *pBlk,
+static WORD *SLTG_DoElem(WORD *pType, char *pBlk, SIZE_T block_size,
 			 ELEMDESC *pElem, const sltg_ref_lookup_t *ref_lookup)
 {
     /* Handle [in/out] first */
@@ -3959,7 +3987,7 @@ static WORD *SLTG_DoElem(WORD *pType, char *pBlk,
     if(*pType & 0x80)
         pElem->paramdesc.wParamFlags |= PARAMFLAG_FRETVAL;
 
-    return SLTG_DoType(pType, pBlk, &pElem->tdesc, ref_lookup);
+    return SLTG_DoType(pType, pBlk, block_size, &pElem->tdesc, ref_lookup);
 }
 
 
@@ -4087,7 +4115,7 @@ static char *SLTG_DoImpls(char *pBlk, ITypeInfoImpl *pTI,
     return (char*)info;
 }
 
-static void SLTG_DoVars(char *pBlk, char *pFirstItem, ITypeInfoImpl *pTI, unsigned short cVars,
+static void SLTG_DoVars(char *pBlk, SIZE_T block_size, char *pFirstItem, ITypeInfoImpl *pTI, unsigned short cVars,
 			const char *pNameTable, const sltg_ref_lookup_t *ref_lookup, const BYTE *hlp_strings)
 {
   TLBVarDesc *pVarDesc;
@@ -4132,7 +4160,7 @@ static void SLTG_DoVars(char *pBlk, char *pFirstItem, ITypeInfoImpl *pTI, unsign
       if (pItem->flags & ~0xda)
         FIXME_(typelib)("unhandled flags = %02x\n", pItem->flags & ~0xda);
 
-      SLTG_DoElem(pType, pBlk,
+      SLTG_DoElem(pType, pBlk, block_size,
 		  &pVarDesc->vardesc.elemdescVar, ref_lookup);
 
       if (TRACE_ON(typelib)) {
@@ -4204,7 +4232,7 @@ static void SLTG_DoVars(char *pBlk, char *pFirstItem, ITypeInfoImpl *pTI, unsign
   pTI->typeattr.cVars = cVars;
 }
 
-static void SLTG_DoFuncs(char *pBlk, char *pFirstItem, ITypeInfoImpl *pTI,
+static void SLTG_DoFuncs(char *pBlk, SIZE_T block_size, char *pFirstItem, ITypeInfoImpl *pTI,
 			 unsigned short cFuncs, char *pNameTable, const sltg_ref_lookup_t *ref_lookup,
 			 const BYTE *hlp_strings)
 {
@@ -4258,7 +4286,7 @@ static void SLTG_DoFuncs(char *pBlk, char *pFirstItem, ITypeInfoImpl *pTI,
 	else
 	    pType = (WORD*)(pBlk + pFunc->rettype);
 
-	SLTG_DoElem(pType, pBlk, &pFuncDesc->funcdesc.elemdescFunc, ref_lookup);
+	SLTG_DoElem(pType, pBlk, block_size, &pFuncDesc->funcdesc.elemdescFunc, ref_lookup);
 
 	pFuncDesc->funcdesc.lprgelemdescParam =
 	  calloc(pFuncDesc->funcdesc.cParams, sizeof(ELEMDESC));
@@ -4277,11 +4305,11 @@ static void SLTG_DoFuncs(char *pBlk, char *pFirstItem, ITypeInfoImpl *pTI,
 
 	    if(HaveOffs) { /* the next word is an offset to type */
 	        pType = (WORD*)(pBlk + *pArg);
-		SLTG_DoElem(pType, pBlk,
+		SLTG_DoElem(pType, pBlk, block_size,
 			    &pFuncDesc->funcdesc.lprgelemdescParam[param], ref_lookup);
 		pArg++;
 	    } else {
-		pArg = SLTG_DoElem(pArg, pBlk,
+		pArg = SLTG_DoElem(pArg, pBlk, block_size,
                                    &pFuncDesc->funcdesc.lprgelemdescParam[param], ref_lookup);
 	    }
 
@@ -4322,7 +4350,7 @@ static void SLTG_ProcessCoClass(char *pBlk, ITypeInfoImpl *pTI,
 }
 
 
-static void SLTG_ProcessInterface(char *pBlk, ITypeInfoImpl *pTI,
+static void SLTG_ProcessInterface(char *pBlk, SIZE_T block_size, ITypeInfoImpl *pTI,
 				  char *pNameTable, SLTG_TypeInfoHeader *pTIHeader,
 				  const SLTG_TypeInfoTail *pTITail, const BYTE *hlp_strings)
 {
@@ -4341,7 +4369,8 @@ static void SLTG_ProcessInterface(char *pBlk, ITypeInfoImpl *pTI,
     }
 
     if (pTITail->funcs_off != 0xffff)
-        SLTG_DoFuncs(pBlk, pBlk + pTITail->funcs_off, pTI, pTITail->cFuncs, pNameTable, ref_lookup, hlp_strings);
+        SLTG_DoFuncs(pBlk, block_size, pBlk + pTITail->funcs_off, pTI, pTITail->cFuncs,
+                pNameTable, ref_lookup, hlp_strings);
 
     free(ref_lookup);
 
@@ -4349,7 +4378,7 @@ static void SLTG_ProcessInterface(char *pBlk, ITypeInfoImpl *pTI,
         dump_TLBFuncDesc(pTI->funcdescs, pTI->typeattr.cFuncs);
 }
 
-static void SLTG_ProcessRecord(char *pBlk, ITypeInfoImpl *pTI,
+static void SLTG_ProcessRecord(char *pBlk, SIZE_T block_size, ITypeInfoImpl *pTI,
 			       const char *pNameTable, SLTG_TypeInfoHeader *pTIHeader,
 			       const SLTG_TypeInfoTail *pTITail, const BYTE *hlp_strings)
 {
@@ -4360,13 +4389,13 @@ static void SLTG_ProcessRecord(char *pBlk, ITypeInfoImpl *pTI,
                                pTI->pTypeLib, (char *)pNameTable);
 
   if (pTITail->vars_off != 0xffff)
-    SLTG_DoVars(pBlk, pBlk + pTITail->vars_off, pTI, pTITail->cVars,
+    SLTG_DoVars(pBlk, block_size, pBlk + pTITail->vars_off, pTI, pTITail->cVars,
                 pNameTable, ref_lookup, hlp_strings);
 
   free(ref_lookup);
 }
 
-static void SLTG_ProcessUnion(char *pBlk, ITypeInfoImpl *pTI,
+static void SLTG_ProcessUnion(char *pBlk, SIZE_T block_size, ITypeInfoImpl *pTI,
 			       const char *pNameTable, SLTG_TypeInfoHeader *pTIHeader,
 			       const SLTG_TypeInfoTail *pTITail, const BYTE *hlp_strings)
 {
@@ -4377,13 +4406,13 @@ static void SLTG_ProcessUnion(char *pBlk, ITypeInfoImpl *pTI,
                                pTI->pTypeLib, (char *)pNameTable);
 
   if (pTITail->vars_off != 0xffff)
-    SLTG_DoVars(pBlk, pBlk + pTITail->vars_off, pTI, pTITail->cVars,
+    SLTG_DoVars(pBlk, block_size, pBlk + pTITail->vars_off, pTI, pTITail->cVars,
                 pNameTable, ref_lookup, hlp_strings);
 
   free(ref_lookup);
 }
 
-static void SLTG_ProcessAlias(char *pBlk, ITypeInfoImpl *pTI,
+static void SLTG_ProcessAlias(char *pBlk, SIZE_T block_size, ITypeInfoImpl *pTI,
 			      char *pNameTable, SLTG_TypeInfoHeader *pTIHeader,
 			      const SLTG_TypeInfoTail *pTITail)
 {
@@ -4406,12 +4435,12 @@ static void SLTG_ProcessAlias(char *pBlk, ITypeInfoImpl *pTI,
   pType = (WORD *)(pBlk + pTITail->tdescalias_vt);
 
   pTI->tdescAlias = malloc(sizeof(TYPEDESC));
-  SLTG_DoType(pType, pBlk, pTI->tdescAlias, ref_lookup);
+  SLTG_DoType(pType, pBlk, block_size, pTI->tdescAlias, ref_lookup);
 
   free(ref_lookup);
 }
 
-static void SLTG_ProcessDispatch(char *pBlk, ITypeInfoImpl *pTI,
+static void SLTG_ProcessDispatch(char *pBlk, SIZE_T block_size, ITypeInfoImpl *pTI,
 				 char *pNameTable, SLTG_TypeInfoHeader *pTIHeader,
 				 const SLTG_TypeInfoTail *pTITail, const BYTE *hlp_strings)
 {
@@ -4421,10 +4450,12 @@ static void SLTG_ProcessDispatch(char *pBlk, ITypeInfoImpl *pTI,
                                   pNameTable);
 
   if (pTITail->vars_off != 0xffff)
-    SLTG_DoVars(pBlk, pBlk + pTITail->vars_off, pTI, pTITail->cVars, pNameTable, ref_lookup, hlp_strings);
+    SLTG_DoVars(pBlk, block_size, pBlk + pTITail->vars_off, pTI, pTITail->cVars,
+            pNameTable, ref_lookup, hlp_strings);
 
   if (pTITail->funcs_off != 0xffff)
-    SLTG_DoFuncs(pBlk, pBlk + pTITail->funcs_off, pTI, pTITail->cFuncs, pNameTable, ref_lookup, hlp_strings);
+    SLTG_DoFuncs(pBlk, block_size, pBlk + pTITail->funcs_off, pTI, pTITail->cFuncs,
+            pNameTable, ref_lookup, hlp_strings);
 
   if (pTITail->impls_off != 0xffff)
     SLTG_DoImpls(pBlk + pTITail->impls_off, pTI, FALSE, ref_lookup);
@@ -4439,14 +4470,15 @@ static void SLTG_ProcessDispatch(char *pBlk, ITypeInfoImpl *pTI,
       dump_TLBFuncDesc(pTI->funcdescs, pTI->typeattr.cFuncs);
 }
 
-static void SLTG_ProcessEnum(char *pBlk, ITypeInfoImpl *pTI,
+static void SLTG_ProcessEnum(char *pBlk, SIZE_T block_size, ITypeInfoImpl *pTI,
 			     const char *pNameTable, SLTG_TypeInfoHeader *pTIHeader,
 			     const SLTG_TypeInfoTail *pTITail, const BYTE *hlp_strings)
 {
-  SLTG_DoVars(pBlk, pBlk + pTITail->vars_off, pTI, pTITail->cVars, pNameTable, NULL, hlp_strings);
+  SLTG_DoVars(pBlk, block_size, pBlk + pTITail->vars_off, pTI, pTITail->cVars,
+          pNameTable, NULL, hlp_strings);
 }
 
-static void SLTG_ProcessModule(char *pBlk, ITypeInfoImpl *pTI,
+static void SLTG_ProcessModule(char *pBlk, SIZE_T block_size, ITypeInfoImpl *pTI,
 			       char *pNameTable, SLTG_TypeInfoHeader *pTIHeader,
 			       const SLTG_TypeInfoTail *pTITail, const BYTE *hlp_strings)
 {
@@ -4456,10 +4488,12 @@ static void SLTG_ProcessModule(char *pBlk, ITypeInfoImpl *pTI,
                                   pNameTable);
 
   if (pTITail->vars_off != 0xffff)
-    SLTG_DoVars(pBlk, pBlk + pTITail->vars_off, pTI, pTITail->cVars, pNameTable, ref_lookup, hlp_strings);
+    SLTG_DoVars(pBlk, block_size, pBlk + pTITail->vars_off, pTI, pTITail->cVars,
+            pNameTable, ref_lookup, hlp_strings);
 
   if (pTITail->funcs_off != 0xffff)
-    SLTG_DoFuncs(pBlk, pBlk + pTITail->funcs_off, pTI, pTITail->cFuncs, pNameTable, ref_lookup, hlp_strings);
+    SLTG_DoFuncs(pBlk, block_size, pBlk + pTITail->funcs_off, pTI, pTITail->cFuncs,
+            pNameTable, ref_lookup, hlp_strings);
   free(ref_lookup);
   if (TRACE_ON(typelib))
     dump_TypeInfo(pTI);
@@ -4481,6 +4515,20 @@ typedef struct {
   WORD typekind;
 } SLTG_InternalOtherTypeInfo;
 
+static void free_sltg_other_typeinfos(SLTG_InternalOtherTypeInfo *infos, UINT count)
+{
+    UINT i;
+
+    if (!infos) return;
+    for (i = 0; i < count; ++i)
+    {
+        free(infos[i].index_name);
+        free(infos[i].other_name);
+        free(infos[i].extra);
+    }
+    free(infos);
+}
+
 /****************************************************************************
  *	ITypeLib2_Constructor_SLTG
  *
@@ -4496,19 +4544,20 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
     SLTG_Pad9 *pPad9;
     LPVOID pBlk, pFirstBlk;
     SLTG_LibBlk *pLibBlk;
-    SLTG_InternalOtherTypeInfo *pOtherTypeInfoBlks;
+    SLTG_InternalOtherTypeInfo *pOtherTypeInfoBlks = NULL;
     char *pNameTable, *ptr;
     const BYTE *hlp_strings;
     int i;
     DWORD len, order;
+    SIZE_T directory_size, file_offset;
+    UINT block_count, typeinfo_block_count;
     ITypeInfoImpl **ppTypeInfoImpl;
 
     TRACE_(typelib)("%p, TLB length = %ld\n", pLib, dwTLBLength);
 
 
-    pTypeLibImpl = TypeLibImpl_Constructor();
-    if (!pTypeLibImpl) return NULL;
-
+    if (dwTLBLength < sizeof(*pHeader))
+        return NULL;
     pHeader = pLib;
 
     TRACE_(typelib)("header:\n");
@@ -4518,6 +4567,19 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
     {
         FIXME_(typelib)("Header type magic %#lx not supported.\n", pHeader->SLTG_magic);
 	return NULL;
+    }
+    if (pHeader->nrOfFileBlks < 2)
+    {
+        WARN("invalid SLTG block count %u\n", pHeader->nrOfFileBlks);
+        return NULL;
+    }
+    block_count = pHeader->nrOfFileBlks - 1;
+    directory_size = sizeof(*pHeader) + block_count * sizeof(*pBlkEntry) + sizeof(*pMagic)
+            + (block_count - 1) * sizeof(*pIndex) + sizeof(*pPad9);
+    if (directory_size > dwTLBLength)
+    {
+        WARN("invalid SLTG block directory size %Iu\n", directory_size);
+        return NULL;
     }
 
     /* This points to pHeader->nrOfFileBlks - 1 of SLTG_BlkEntry */
@@ -4545,13 +4607,35 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
     pFirstBlk = pPad9 + 1;
 
     /* We'll set up a ptr to the main library block, which is the last one. */
-
-    for(pBlk = pFirstBlk, order = pHeader->first_blk - 1;
-	  pBlkEntry[order].next != 0;
-	  order = pBlkEntry[order].next - 1) {
-       pBlk = (char*)pBlk + pBlkEntry[order].len;
+    if (!pHeader->first_blk || pHeader->first_blk > block_count)
+    {
+        WARN("invalid first SLTG block %u\n", pHeader->first_blk);
+        return NULL;
     }
-    pLibBlk = pBlk;
+    file_offset = directory_size;
+    order = pHeader->first_blk - 1;
+    for (i = 0; ; ++i)
+    {
+        if (i >= block_count || order >= block_count || pBlkEntry[order].len > dwTLBLength - file_offset)
+        {
+            WARN("invalid SLTG block chain\n");
+            return NULL;
+        }
+        if (!pBlkEntry[order].next)
+            break;
+        file_offset += pBlkEntry[order].len;
+        order = pBlkEntry[order].next - 1;
+    }
+    if (pBlkEntry[order].len < sizeof(*pLibBlk))
+    {
+        WARN("invalid SLTG library block size %#lx\n", pBlkEntry[order].len);
+        return NULL;
+    }
+    typeinfo_block_count = i;
+    pLibBlk = (SLTG_LibBlk *)((char *)pLib + file_offset);
+
+    pTypeLibImpl = TypeLibImpl_Constructor();
+    if (!pTypeLibImpl) return NULL;
 
     len = SLTG_ReadLibBlk(pLibBlk, pTypeLibImpl);
 
@@ -4563,8 +4647,20 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
     /* And now TypeInfoCount of SLTG_OtherTypeInfo */
     pTypeLibImpl->TypeInfoCount = *(WORD *)((char *)pLibBlk + len);
     len += sizeof(WORD);
+    if (pTypeLibImpl->TypeInfoCount != typeinfo_block_count)
+    {
+        WARN("SLTG type info count %d does not match the block chain count %u\n",
+                pTypeLibImpl->TypeInfoCount, typeinfo_block_count);
+        ITypeLib2_Release(&pTypeLibImpl->ITypeLib2_iface);
+        return NULL;
+    }
 
     pOtherTypeInfoBlks = calloc(pTypeLibImpl->TypeInfoCount, sizeof(*pOtherTypeInfoBlks));
+    if (pTypeLibImpl->TypeInfoCount && !pOtherTypeInfoBlks)
+    {
+        ITypeLib2_Release(&pTypeLibImpl->ITypeLib2_iface);
+        return NULL;
+    }
 
     ptr = (char*)pLibBlk + len;
 
@@ -4644,6 +4740,8 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
        them in the order in which they are in the file */
 
     pTypeLibImpl->typeinfos = calloc(pTypeLibImpl->TypeInfoCount, sizeof(ITypeInfoImpl*));
+    if (pTypeLibImpl->TypeInfoCount && !pTypeLibImpl->typeinfos)
+        goto failed;
     ppTypeInfoImpl = pTypeLibImpl->typeinfos;
 
     for(pBlk = pFirstBlk, order = pHeader->first_blk - 1, i = 0;
@@ -4653,24 +4751,30 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
       SLTG_TypeInfoHeader *pTIHeader;
       SLTG_TypeInfoTail *pTITail;
       SLTG_MemberHeader *pMemHeader;
+      SIZE_T member_offset, member_size;
+      char *member_block;
 
       if(strcmp(pBlkEntry[order].index_string + (char*)pMagic, pOtherTypeInfoBlks[i].index_name)) {
         FIXME_(typelib)("Index strings don't match\n");
-        free(pOtherTypeInfoBlks);
-        return NULL;
+	goto failed;
       }
 
+      if (pBlkEntry[order].len < sizeof(*pTIHeader))
+      {
+	WARN("invalid SLTG type info block size %#lx\n", pBlkEntry[order].len);
+	goto failed;
+      }
       pTIHeader = pBlk;
       if(pTIHeader->magic != SLTG_TIHEADER_MAGIC) {
 	FIXME_(typelib)("TypeInfoHeader magic = %04x\n", pTIHeader->magic);
-       free(pOtherTypeInfoBlks);
-	return NULL;
+	goto failed;
       }
       TRACE_(typelib)("pTIHeader->res06 = %lx, pTIHeader->res0e = %lx, "
         "pTIHeader->res16 = %lx, pTIHeader->res1e = %lx\n",
         pTIHeader->res06, pTIHeader->res0e, pTIHeader->res16, pTIHeader->res1e);
 
-      *ppTypeInfoImpl = ITypeInfoImpl_Constructor();
+      if (!(*ppTypeInfoImpl = ITypeInfoImpl_Constructor()))
+          goto failed;
       (*ppTypeInfoImpl)->pTypeLib = pTypeLibImpl;
       (*ppTypeInfoImpl)->index = i;
       (*ppTypeInfoImpl)->Name = SLTG_ReadName(pNameTable, pOtherTypeInfoBlks[i].name_offs, pTypeLibImpl);
@@ -4697,9 +4801,23 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
 	    debugstr_guid(TLB_get_guidref((*ppTypeInfoImpl)->guid)),
 	    (*ppTypeInfoImpl)->typeattr.wTypeFlags);
 
+      if (pTIHeader->elem_table > pBlkEntry[order].len
+              || sizeof(*pMemHeader) > pBlkEntry[order].len - pTIHeader->elem_table)
+      {
+	WARN("invalid SLTG member block size %#lx\n", pBlkEntry[order].len);
+	goto failed;
+      }
       pMemHeader = (SLTG_MemberHeader*)((char *)pBlk + pTIHeader->elem_table);
-
-      pTITail = (SLTG_TypeInfoTail*)((char *)(pMemHeader + 1) + pMemHeader->cbExtra);
+      member_offset = pTIHeader->elem_table + sizeof(*pMemHeader);
+      if (pMemHeader->cbExtra > pBlkEntry[order].len - member_offset
+              || sizeof(*pTITail) > pBlkEntry[order].len - member_offset - pMemHeader->cbExtra)
+      {
+	WARN("invalid SLTG member data size %#lx\n", pMemHeader->cbExtra);
+	goto failed;
+      }
+      member_block = (char *)(pMemHeader + 1);
+      member_size = pMemHeader->cbExtra;
+      pTITail = (SLTG_TypeInfoTail *)(member_block + member_size);
 
       (*ppTypeInfoImpl)->typeattr.cbAlignment = pTITail->cbAlignment;
       (*ppTypeInfoImpl)->typeattr.cbSizeInstance = pTITail->cbSizeInstance;
@@ -4707,17 +4825,17 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
 
       switch(pTIHeader->typekind) {
       case TKIND_ENUM:
-	SLTG_ProcessEnum((char *)(pMemHeader + 1), *ppTypeInfoImpl, pNameTable,
+	SLTG_ProcessEnum(member_block, member_size, *ppTypeInfoImpl, pNameTable,
                          pTIHeader, pTITail, hlp_strings);
 	break;
 
       case TKIND_RECORD:
-	SLTG_ProcessRecord((char *)(pMemHeader + 1), *ppTypeInfoImpl, pNameTable,
+	SLTG_ProcessRecord(member_block, member_size, *ppTypeInfoImpl, pNameTable,
                            pTIHeader, pTITail, hlp_strings);
 	break;
 
       case TKIND_INTERFACE:
-	SLTG_ProcessInterface((char *)(pMemHeader + 1), *ppTypeInfoImpl, pNameTable,
+	SLTG_ProcessInterface(member_block, member_size, *ppTypeInfoImpl, pNameTable,
                               pTIHeader, pTITail, hlp_strings);
 	break;
 
@@ -4727,22 +4845,22 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
 	break;
 
       case TKIND_ALIAS:
-	SLTG_ProcessAlias((char *)(pMemHeader + 1), *ppTypeInfoImpl, pNameTable,
+	SLTG_ProcessAlias(member_block, member_size, *ppTypeInfoImpl, pNameTable,
                           pTIHeader, pTITail);
 	break;
 
       case TKIND_DISPATCH:
-	SLTG_ProcessDispatch((char *)(pMemHeader + 1), *ppTypeInfoImpl, pNameTable,
+	SLTG_ProcessDispatch(member_block, member_size, *ppTypeInfoImpl, pNameTable,
                              pTIHeader, pTITail, hlp_strings);
 	break;
 
       case TKIND_MODULE:
-	SLTG_ProcessModule((char *)(pMemHeader + 1), *ppTypeInfoImpl, pNameTable,
+	SLTG_ProcessModule(member_block, member_size, *ppTypeInfoImpl, pNameTable,
                            pTIHeader, pTITail, hlp_strings);
 	break;
 
       case TKIND_UNION:
-	SLTG_ProcessUnion((char *)(pMemHeader + 1), *ppTypeInfoImpl, pNameTable,
+	SLTG_ProcessUnion(member_block, member_size, *ppTypeInfoImpl, pNameTable,
                            pTIHeader, pTITail, hlp_strings);
 	break;
 
@@ -4775,12 +4893,16 @@ static ITypeLib2* ITypeLib2_Constructor_SLTG(LPVOID pLib, DWORD dwTLBLength)
 
     if(i != pTypeLibImpl->TypeInfoCount) {
       FIXME("Somehow processed %d TypeInfos\n", i);
-      free(pOtherTypeInfoBlks);
-      return NULL;
+      goto failed;
     }
 
-    free(pOtherTypeInfoBlks);
+    free_sltg_other_typeinfos(pOtherTypeInfoBlks, pTypeLibImpl->TypeInfoCount);
     return &pTypeLibImpl->ITypeLib2_iface;
+
+failed:
+    free_sltg_other_typeinfos(pOtherTypeInfoBlks, pTypeLibImpl->TypeInfoCount);
+    ITypeLib2_Release(&pTypeLibImpl->ITypeLib2_iface);
+    return NULL;
 }
 
 static HRESULT WINAPI ITypeLib2_fnQueryInterface(ITypeLib2 *iface, REFIID riid, void **ppv)
@@ -4891,6 +5013,7 @@ static ULONG WINAPI ITypeLib2_fnRelease( ITypeLib2 *iface)
       }
 
       for (i = 0; i < This->TypeInfoCount; ++i){
+          if (!This->typeinfos || !This->typeinfos[i]) continue;
           free(This->typeinfos[i]->tdescAlias);
           ITypeInfoImpl_Destroy(This->typeinfos[i]);
       }

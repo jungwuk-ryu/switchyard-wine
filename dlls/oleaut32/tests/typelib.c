@@ -843,6 +843,207 @@ static void write_typelib(int res_no, const WCHAR *filename)
     CloseHandle( file );
 }
 
+static WORD read_sltg_word(const BYTE *ptr)
+{
+    WORD value;
+
+    memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+static DWORD read_sltg_dword(const BYTE *ptr)
+{
+    DWORD value;
+
+    memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+static void write_sltg_word(BYTE *ptr, WORD value)
+{
+    memcpy(ptr, &value, sizeof(value));
+}
+
+static BOOL find_sltg_array(BYTE *data, DWORD size, BYTE **type_desc, BYTE **safearray)
+{
+    enum
+    {
+        header_size = 0x24,
+        block_entry_size = 8,
+        magic_size = 13,
+        index_size = 11,
+        pad_size = 9,
+        member_header_size = 9,
+        typeinfo_elem_table_offset = 0x0a,
+        member_extra_size_offset = 5,
+        tail_vars_offset = 0x0a,
+        variable_type_offset = 8,
+    };
+    SIZE_T block_count, directory_size, elem_table, member_offset, member_size;
+    BYTE *block, *member, *tail, *variable;
+    DWORD block_size;
+    WORD file_blocks, first_block, type_offset, array_offset, vars_offset;
+
+    if (size < header_size || read_sltg_dword(data) != 0x47544c53)
+        return FALSE;
+    file_blocks = read_sltg_word(data + 4);
+    if (file_blocks < 2)
+        return FALSE;
+    block_count = file_blocks - 1;
+    first_block = read_sltg_word(data + 0x0a);
+    if (first_block != 1)
+        return FALSE;
+    directory_size = header_size + block_count * block_entry_size + magic_size
+            + (block_count - 1) * index_size + pad_size;
+    if (directory_size > size)
+        return FALSE;
+    block_size = read_sltg_dword(data + header_size + (first_block - 1) * block_entry_size);
+    if (block_size > size - directory_size)
+        return FALSE;
+    block = data + directory_size;
+    if (block_size < typeinfo_elem_table_offset + sizeof(DWORD))
+        return FALSE;
+
+    elem_table = read_sltg_dword(block + typeinfo_elem_table_offset);
+    if (elem_table > block_size || member_header_size > block_size - elem_table)
+        return FALSE;
+    member = block + elem_table + member_header_size;
+    member_offset = elem_table + member_header_size;
+    member_size = read_sltg_dword(member - member_header_size + member_extra_size_offset);
+    if (member_size > block_size - member_offset || 0x0c > block_size - member_offset - member_size)
+        return FALSE;
+    tail = member + member_size;
+    vars_offset = read_sltg_word(tail + tail_vars_offset);
+    if (vars_offset > member_size || variable_type_offset + sizeof(WORD) > member_size - vars_offset)
+        return FALSE;
+    variable = member + vars_offset;
+    type_offset = read_sltg_word(variable + variable_type_offset);
+    if (type_offset > member_size || 2 * sizeof(WORD) > member_size - type_offset)
+        return FALSE;
+    *type_desc = member + type_offset;
+    if (read_sltg_word(*type_desc) != VT_CARRAY)
+        return FALSE;
+    array_offset = read_sltg_word(*type_desc + sizeof(WORD));
+    if (array_offset > member_size || 16 + sizeof(SAFEARRAYBOUND) > member_size - array_offset)
+        return FALSE;
+    *safearray = member + array_offset;
+    return TRUE;
+}
+
+static HRESULT load_sltg_data(const BYTE *data, DWORD size, WCHAR *filename, ITypeLib **typelib)
+{
+    DWORD written;
+    HANDLE file;
+    HRESULT hr;
+
+    filename[0] = 0;
+    if (!GetTempFileNameW(L".", L"tlb", 0, filename))
+        return HRESULT_FROM_WIN32(GetLastError());
+    file = CreateFileW(filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (!WriteFile(file, data, size, &written, NULL) || written != size)
+    {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        if (hr == S_OK) hr = E_FAIL;
+        CloseHandle(file);
+        DeleteFileW(filename);
+        return hr;
+    }
+    CloseHandle(file);
+    return LoadTypeLibEx(filename, REGKIND_NONE, typelib);
+}
+
+static void check_sltg_array(const BYTE *data, DWORD size, VARTYPE expected_type, BOOL malformed)
+{
+    WCHAR filename[MAX_PATH];
+    ITypeInfo *typeinfo;
+    ITypeLib *typelib;
+    VARDESC *desc;
+    HRESULT hr;
+
+    hr = load_sltg_data(data, size, filename, &typelib);
+    ok(hr == S_OK || (malformed && broken(FAILED(hr))), "LoadTypeLibEx returned %#lx.\n", hr);
+    if (FAILED(hr))
+    {
+        if (filename[0]) DeleteFileW(filename);
+        return;
+    }
+
+    hr = ITypeLib_GetTypeInfo(typelib, 0, &typeinfo);
+    ok(hr == S_OK || (malformed && broken(FAILED(hr))), "GetTypeInfo returned %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        hr = ITypeInfo_GetVarDesc(typeinfo, 0, &desc);
+        ok(hr == S_OK || (malformed && broken(FAILED(hr))), "GetVarDesc returned %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            ok(desc->elemdescVar.tdesc.vt == expected_type
+                    || (malformed && broken(desc->elemdescVar.tdesc.vt != VT_CARRAY)),
+                    "Got type %#x, expected %#x.\n", desc->elemdescVar.tdesc.vt, expected_type);
+            if (expected_type == VT_CARRAY)
+            {
+                ok(desc->elemdescVar.tdesc.lpadesc != NULL, "Got a NULL array description.\n");
+                if (desc->elemdescVar.tdesc.lpadesc)
+                {
+                    ok(desc->elemdescVar.tdesc.lpadesc->cDims == 1, "Got %u dimensions.\n",
+                            desc->elemdescVar.tdesc.lpadesc->cDims);
+                    ok(desc->elemdescVar.tdesc.lpadesc->rgbounds[0].cElements == 4,
+                            "Got %lu elements.\n", desc->elemdescVar.tdesc.lpadesc->rgbounds[0].cElements);
+                    ok(desc->elemdescVar.tdesc.lpadesc->rgbounds[0].lLbound == 0,
+                            "Got lower bound %ld.\n", desc->elemdescVar.tdesc.lpadesc->rgbounds[0].lLbound);
+                    ok(desc->elemdescVar.tdesc.lpadesc->tdescElem.vt == VT_INT,
+                            "Got element type %#x.\n", desc->elemdescVar.tdesc.lpadesc->tdescElem.vt);
+                }
+            }
+            ITypeInfo_ReleaseVarDesc(typeinfo, desc);
+        }
+        ITypeInfo_Release(typeinfo);
+    }
+    ITypeLib_Release(typelib);
+    DeleteFileW(filename);
+}
+
+static void test_sltg_safearray(void)
+{
+    BYTE *data, *type_desc, *safearray;
+    const BYTE *resource_data;
+    DWORD size;
+    HGLOBAL handle;
+    HRSRC resource;
+
+    resource = FindResourceW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(5), L"TYPELIB");
+    ok(resource != NULL, "Failed to find SLTG test typelib.\n");
+    if (!resource) return;
+    size = SizeofResource(GetModuleHandleW(NULL), resource);
+    handle = LoadResource(GetModuleHandleW(NULL), resource);
+    resource_data = LockResource(handle);
+    ok(resource_data != NULL && size != 0, "Failed to load SLTG test typelib.\n");
+    if (!resource_data || !size) return;
+    data = malloc(size);
+    ok(data != NULL, "Failed to allocate %lu bytes.\n", size);
+    if (!data) return;
+    memcpy(data, resource_data, size);
+
+    if (!find_sltg_array(data, size, &type_desc, &safearray))
+    {
+        ok(0, "Failed to locate the SLTG array.\n");
+        free(data);
+        return;
+    }
+
+    check_sltg_array(data, size, VT_CARRAY, FALSE);
+
+    write_sltg_word(safearray, 0x8000);
+    check_sltg_array(data, size, VT_EMPTY, TRUE);
+    write_sltg_word(safearray, 1);
+
+    write_sltg_word(type_desc + sizeof(WORD), 0xfff0);
+    check_sltg_array(data, size, VT_EMPTY, TRUE);
+
+    free(data);
+}
+
 static void test_invoke_func(ITypeInfo *typeinfo)
 {
     DISPID named_args[3] = { DISPID_THIS };
@@ -8800,6 +9001,7 @@ START_TEST(typelib)
     test_register_typelib_64();
     test_create_typelibs();
     test_LoadTypeLib();
+    test_sltg_safearray();
     test_TypeInfo2_GetContainingTypeLib();
     test_LoadRegTypeLib();
     test_GetLibAttr();
