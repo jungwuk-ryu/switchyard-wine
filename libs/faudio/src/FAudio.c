@@ -2853,8 +2853,16 @@ uint32_t FAudioSourceVoice_SubmitSourceBuffer(
 	FAudio_PlatformLockMutex(voice->src.bufferLock);
 	LOG_MUTEX_LOCK(voice->audio, voice->src.bufferLock)
 
-	array_reserve(voice->audio, (void **)&voice->src.queued_buffers, &voice->src.queued_buffers_capacity,
-		voice->src.queued_buffer_count + 1, sizeof(*voice->src.queued_buffers));
+	if (voice->src.queued_buffer_count == ~(size_t) 0 ||
+		!array_reserve(voice->audio, (void **)&voice->src.queued_buffers,
+			&voice->src.queued_buffers_capacity, voice->src.queued_buffer_count + 1,
+			sizeof(*voice->src.queued_buffers)))
+	{
+		FAudio_PlatformUnlockMutex(voice->src.bufferLock);
+		LOG_MUTEX_UNLOCK(voice->audio, voice->src.bufferLock)
+		LOG_API_EXIT(voice->audio)
+		return FAUDIO_E_OUT_OF_MEMORY;
+	}
 
 	entry = &voice->src.queued_buffers[voice->src.queued_buffer_count++];
 	FAudio_memset(entry, 0, sizeof(*entry));
@@ -2924,16 +2932,26 @@ uint32_t FAudioSourceVoice_FlushSourceBuffers(
 	FAudio_PlatformLockMutex(voice->src.bufferLock);
 	LOG_MUTEX_LOCK(voice->audio, voice->src.bufferLock)
 
-	array_reserve(voice->audio, (void **)&voice->src.flush_buffers, &voice->src.flush_buffers_capacity,
-		voice->src.flush_buffer_count + voice->src.queued_buffer_count, sizeof(*voice->src.flush_buffers));
-
 	/* If the source is playing, don't flush the active buffer */
 	if (voice->src.active == 1 && voice->src.queued_buffer_count > 0
 		&& voice->src.queued_buffers[0].sent_OnStartBuffer)
 	{
 		offset = 1;
 	}
-	else
+
+	if (voice->src.queued_buffer_count - offset > ~(size_t) 0 - voice->src.flush_buffer_count ||
+		!array_reserve(voice->audio, (void **)&voice->src.flush_buffers,
+			&voice->src.flush_buffers_capacity,
+			voice->src.flush_buffer_count + voice->src.queued_buffer_count - offset,
+			sizeof(*voice->src.flush_buffers)))
+	{
+		FAudio_PlatformUnlockMutex(voice->src.bufferLock);
+		LOG_MUTEX_UNLOCK(voice->audio, voice->src.bufferLock)
+		LOG_API_EXIT(voice->audio)
+		return FAUDIO_E_OUT_OF_MEMORY;
+	}
+
+	if (!offset)
 	{
 		voice->src.curBufferOffset = 0;
 	}

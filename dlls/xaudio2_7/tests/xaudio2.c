@@ -559,6 +559,273 @@ static const IXAudio2VoiceCallbackVtbl loop_buf_vtbl = {
 
 static IXAudio2VoiceCallback loop_buf = { &loop_buf_vtbl };
 
+struct reentrant_submit_data
+{
+    IXAudio2VoiceCallback callback;
+    IXAudio2SourceVoice *source;
+    XAUDIO2_BUFFER buffer;
+    HANDLE event;
+    HRESULT submit_hr;
+    LONG submitted;
+    LONG end_count;
+    LONG expected_end_count;
+    LONG replacement_context;
+    LONG replacement_start_count;
+    LONG replacement_end_count;
+    LONG order_failures;
+    UINT32 submit_count;
+    UINT64 expected_samples;
+    BOOL submit_on_start;
+    BOOL submit_on_end;
+    BOOL replace_on_start;
+};
+
+static struct reentrant_submit_data *reentrant_submit_data_from_callback(IXAudio2VoiceCallback *iface)
+{
+    return CONTAINING_RECORD(iface, struct reentrant_submit_data, callback);
+}
+
+static void reentrant_submit_buffers(struct reentrant_submit_data *data)
+{
+    HRESULT hr;
+    UINT32 i;
+
+    for (i = 0; i < data->submit_count; ++i)
+    {
+        hr = IXAudio2SourceVoice_SubmitSourceBuffer(data->source, &data->buffer, NULL);
+        if (FAILED(hr))
+        {
+            data->submit_hr = hr;
+            break;
+        }
+    }
+}
+
+static void WINAPI reentrant_submit_OnVoiceProcessingPassStart(IXAudio2VoiceCallback *iface,
+        UINT32 bytes_required)
+{
+}
+
+static void WINAPI reentrant_submit_OnVoiceProcessingPassEnd(IXAudio2VoiceCallback *iface)
+{
+    struct reentrant_submit_data *data = reentrant_submit_data_from_callback(iface);
+
+    if (FAILED(data->submit_hr) || data->end_count == data->expected_end_count)
+        SetEvent(data->event);
+}
+
+static void WINAPI reentrant_submit_OnStreamEnd(IXAudio2VoiceCallback *iface)
+{
+}
+
+static void WINAPI reentrant_submit_OnBufferStart(IXAudio2VoiceCallback *iface, void *context)
+{
+    struct reentrant_submit_data *data = reentrant_submit_data_from_callback(iface);
+    HRESULT hr;
+
+    if (context == &data->replacement_context)
+        InterlockedIncrement(&data->replacement_start_count);
+    else
+        ok(context == data, "Got unexpected buffer context %p.\n", context);
+
+    if (data->submit_on_start && !InterlockedCompareExchange(&data->submitted, 1, 0))
+        reentrant_submit_buffers(data);
+    if (data->replace_on_start && !InterlockedCompareExchange(&data->submitted, 1, 0))
+    {
+        hr = IXAudio2SourceVoice_Stop(data->source, 0, XAUDIO2_COMMIT_NOW);
+        if (SUCCEEDED(hr))
+            hr = IXAudio2SourceVoice_FlushSourceBuffers(data->source);
+        data->buffer.pContext = &data->replacement_context;
+        if (SUCCEEDED(hr))
+            reentrant_submit_buffers(data);
+        if (SUCCEEDED(hr) && SUCCEEDED(data->submit_hr))
+            hr = IXAudio2SourceVoice_Start(data->source, 0, XAUDIO2_COMMIT_NOW);
+        if (FAILED(hr))
+            data->submit_hr = hr;
+    }
+}
+
+static void WINAPI reentrant_submit_OnBufferEnd(IXAudio2VoiceCallback *iface, void *context)
+{
+    struct reentrant_submit_data *data = reentrant_submit_data_from_callback(iface);
+    LONG replacement_end_count;
+
+    if (context == &data->replacement_context)
+    {
+        replacement_end_count = InterlockedIncrement(&data->replacement_end_count);
+        if (replacement_end_count > data->replacement_start_count)
+            InterlockedIncrement(&data->order_failures);
+    }
+    else
+        ok(context == data, "Got unexpected buffer context %p.\n", context);
+    if (data->submit_on_end && !InterlockedCompareExchange(&data->submitted, 1, 0))
+        reentrant_submit_buffers(data);
+
+    InterlockedIncrement(&data->end_count);
+}
+
+static void WINAPI reentrant_submit_OnLoopEnd(IXAudio2VoiceCallback *iface, void *context)
+{
+    ok(0, "Unexpected OnLoopEnd.\n");
+}
+
+static void WINAPI reentrant_submit_OnVoiceError(IXAudio2VoiceCallback *iface, void *context, HRESULT error)
+{
+    ok(0, "Unexpected OnVoiceError %#lx.\n", error);
+}
+
+static const IXAudio2VoiceCallbackVtbl reentrant_submit_vtbl =
+{
+    reentrant_submit_OnVoiceProcessingPassStart,
+    reentrant_submit_OnVoiceProcessingPassEnd,
+    reentrant_submit_OnStreamEnd,
+    reentrant_submit_OnBufferStart,
+    reentrant_submit_OnBufferEnd,
+    reentrant_submit_OnLoopEnd,
+    reentrant_submit_OnVoiceError,
+};
+
+static void init_reentrant_submit_data(struct reentrant_submit_data *data)
+{
+    memset(data, 0, sizeof(*data));
+    data->callback.lpVtbl = &reentrant_submit_vtbl;
+    data->event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ok(!!data->event, "Failed to create event, error %lu.\n", GetLastError());
+    data->submit_hr = S_OK;
+    data->buffer.pContext = data;
+}
+
+static void wait_for_reentrant_buffers(struct reentrant_submit_data *data)
+{
+    XAUDIO2_VOICE_STATE state;
+    DWORD ret;
+
+    ret = WaitForSingleObject(data->event, 5000);
+    ok(ret == WAIT_OBJECT_0, "Wait returned %#lx.\n", ret);
+    ok(data->submit_hr == S_OK, "SubmitSourceBuffer failed: %#lx.\n", data->submit_hr);
+    ok(data->end_count == data->expected_end_count, "Got %ld buffer ends, expected %ld.\n",
+            data->end_count, data->expected_end_count);
+    ok(!data->order_failures, "Got %ld replacement buffer ends before their starts.\n", data->order_failures);
+    if (data->expected_samples)
+    {
+        get_voice_state(data->source, &state);
+        ok(state.SamplesPlayed == data->expected_samples, "Got %s samples played, expected %s.\n",
+                wine_dbgstr_longlong(state.SamplesPlayed), wine_dbgstr_longlong(data->expected_samples));
+    }
+}
+
+static void test_reentrant_queue_growth(IXAudio2 *xa)
+{
+    struct reentrant_submit_data data;
+    IXAudio2MasteringVoice *master;
+    IXAudio2SourceVoice *source;
+    BYTE unaligned_samples[16] = {0};
+    float samples[64] = {0};
+    WAVEFORMATEX format;
+    HRESULT hr;
+    UINT32 i;
+
+    IXAudio2_StopEngine(xa);
+    hr = create_mastering_voice(xa, 2, &master);
+    ok(hr == S_OK, "CreateMasteringVoice failed: %#lx.\n", hr);
+
+    /* SubmitSourceBuffer takes effect immediately from a voice callback. Grow
+     * the queue through several capacities while DecodeBuffers is returning
+     * from OnBufferStart. */
+    memset(&format, 0, sizeof(format));
+    format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+    format.nChannels = 1;
+    format.nSamplesPerSec = 44100;
+    format.wBitsPerSample = 32;
+    format.nBlockAlign = sizeof(float);
+    format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+
+    init_reentrant_submit_data(&data);
+    data.submit_on_start = TRUE;
+    data.submit_count = XAUDIO2_MAX_QUEUED_BUFFERS - 1;
+    data.expected_end_count = XAUDIO2_MAX_QUEUED_BUFFERS;
+    data.buffer.AudioBytes = sizeof(samples);
+    data.buffer.pAudioData = (BYTE *)samples;
+
+    hr = IXAudio2_CreateSourceVoice(xa, &source, &format, 0, 1.0f, &data.callback, NULL, NULL);
+    ok(hr == S_OK, "CreateSourceVoice failed: %#lx.\n", hr);
+    data.source = source;
+    hr = IXAudio2SourceVoice_SubmitSourceBuffer(source, &data.buffer, NULL);
+    ok(hr == S_OK, "SubmitSourceBuffer failed: %#lx.\n", hr);
+    hr = IXAudio2SourceVoice_Start(source, 0, XAUDIO2_COMMIT_NOW);
+    ok(hr == S_OK, "Start failed: %#lx.\n", hr);
+    hr = IXAudio2_StartEngine(xa);
+    ok(hr == S_OK, "StartEngine failed: %#lx.\n", hr);
+    wait_for_reentrant_buffers(&data);
+    IXAudio2_StopEngine(xa);
+    IXAudio2SourceVoice_DestroyVoice(source);
+    CloseHandle(data.event);
+
+    /* A callback may stop and flush its active buffer, then replace the queue.
+     * The decoder must restart with the replacement head after the callback. */
+    init_reentrant_submit_data(&data);
+    data.replace_on_start = TRUE;
+    data.submit_count = 5;
+    data.expected_end_count = data.submit_count + 1;
+    data.buffer.AudioBytes = sizeof(samples);
+    data.buffer.pAudioData = (BYTE *)samples;
+
+    hr = IXAudio2_CreateSourceVoice(xa, &source, &format, 0, 1.0f, &data.callback, NULL, NULL);
+    ok(hr == S_OK, "CreateSourceVoice failed: %#lx.\n", hr);
+    data.source = source;
+    hr = IXAudio2SourceVoice_SubmitSourceBuffer(source, &data.buffer, NULL);
+    ok(hr == S_OK, "SubmitSourceBuffer failed: %#lx.\n", hr);
+    hr = IXAudio2SourceVoice_Start(source, 0, XAUDIO2_COMMIT_NOW);
+    ok(hr == S_OK, "Start failed: %#lx.\n", hr);
+    hr = IXAudio2_StartEngine(xa);
+    ok(hr == S_OK, "StartEngine failed: %#lx.\n", hr);
+    wait_for_reentrant_buffers(&data);
+    IXAudio2_StopEngine(xa);
+    IXAudio2SourceVoice_DestroyVoice(source);
+    CloseHandle(data.event);
+
+    /* Fill the initial four-entry capacity, then append one buffer from the
+     * first OnBufferEnd. The following unaligned-data collection must grow
+     * and relocate the queue before decoding its new internal head. */
+    memset(&format, 0, sizeof(format));
+    format.wFormatTag = WAVE_FORMAT_PCM;
+    format.nChannels = 8;
+    format.nSamplesPerSec = 44100;
+    format.wBitsPerSample = 16;
+    format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
+    format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+
+    init_reentrant_submit_data(&data);
+    data.submit_on_end = TRUE;
+    data.submit_count = 1;
+    data.expected_end_count = 5;
+    data.expected_samples = 4;
+    data.buffer.AudioBytes = sizeof(unaligned_samples) - 1;
+    data.buffer.pAudioData = unaligned_samples;
+
+    hr = IXAudio2_CreateSourceVoice(xa, &source, &format, 0, 1.0f, &data.callback, NULL, NULL);
+    ok(hr == S_OK, "CreateSourceVoice failed: %#lx.\n", hr);
+    data.source = source;
+    hr = IXAudio2SourceVoice_SubmitSourceBuffer(source, &data.buffer, NULL);
+    ok(hr == S_OK, "SubmitSourceBuffer failed: %#lx.\n", hr);
+    data.buffer.AudioBytes = sizeof(unaligned_samples);
+    for (i = 0; i < 3; ++i)
+    {
+        hr = IXAudio2SourceVoice_SubmitSourceBuffer(source, &data.buffer, NULL);
+        ok(hr == S_OK, "SubmitSourceBuffer failed: %#lx.\n", hr);
+    }
+    hr = IXAudio2SourceVoice_Start(source, 0, XAUDIO2_COMMIT_NOW);
+    ok(hr == S_OK, "Start failed: %#lx.\n", hr);
+    hr = IXAudio2_StartEngine(xa);
+    ok(hr == S_OK, "StartEngine failed: %#lx.\n", hr);
+    wait_for_reentrant_buffers(&data);
+    IXAudio2_StopEngine(xa);
+    IXAudio2SourceVoice_DestroyVoice(source);
+    CloseHandle(data.event);
+
+    IXAudio2MasteringVoice_DestroyVoice(master);
+}
+
 static void test_buffer_callbacks(IXAudio2 *xa)
 {
     HRESULT hr;
@@ -1529,6 +1796,7 @@ START_TEST(xaudio2)
         test_DeviceDetails(audio);
         test_simple_streaming(audio);
         test_buffer_callbacks(audio);
+        test_reentrant_queue_growth(audio);
         test_looping(audio);
         test_submix(audio);
         test_flush(audio);
