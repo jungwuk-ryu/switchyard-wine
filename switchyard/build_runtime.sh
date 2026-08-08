@@ -252,6 +252,28 @@ write_content_tree_digest() {
   content_tree_digest "$root" > "$root/.switchyard-content-sha256"
 }
 
+runtime_content_tree_digest() {
+  local root="$1"
+
+  (
+    cd "$root"
+    find . \( -type f -o -type l \) ! -path './.switchyard-content-sha256' -print |
+      LC_ALL=C sort |
+      while IFS= read -r path; do
+        if [ -L "$path" ]; then
+          printf 'link %s %s\n' "$path" "$(readlink "$path")"
+        else
+          printf 'file %s %s\n' "$path" "$(sha256_file "$path")"
+        fi
+      done
+  ) | shasum -a 256 | awk '{print $1}'
+}
+
+write_runtime_content_tree_digest() {
+  local root="$1"
+  runtime_content_tree_digest "$root" > "$root/.switchyard-content-sha256"
+}
+
 content_tree_is_verified() {
   local root="$1"
   local marker="$root/.switchyard-content-sha256"
@@ -2609,6 +2631,7 @@ assert_source_state_unchanged "runtime assembly"
   printf '  }\n'
   printf '}\n'
 } >"$WINE_INSTALL_PREFIX/switchyard-runtime.json"
+write_runtime_content_tree_digest "$WINE_INSTALL_PREFIX"
 
 if ! runtime_is_complete_at "$WINE_INSTALL_PREFIX"; then
   echo "Refusing to publish an incomplete or internally inconsistent Wine runtime." >&2

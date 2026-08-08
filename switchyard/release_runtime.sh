@@ -74,6 +74,16 @@ content_tree_digest() {
   ) | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
 }
 
+content_tree_is_verified() {
+  local root="$1"
+  local marker="$root/.switchyard-content-sha256"
+  local expected
+
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  expected="$(/usr/bin/tr -d '[:space:]' < "$marker")"
+  [ -n "$expected" ] && [ "$(content_tree_digest "$root")" = "$expected" ]
+}
+
 manifest="$RUNTIME/switchyard-runtime.json"
 runtime_id="$(manifest_value id "$manifest")"
 source_revision="$(manifest_value sourceRevision "$manifest")"
@@ -90,6 +100,10 @@ current_revision="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 [ "$source_dirty" = "false" ] || { echo "release runtime was built from a dirty source tree" >&2; exit 1; }
 [ -z "$gptk_path" ] || { echo "release runtime records a user-provided GPTK path" >&2; exit 1; }
 [ "$gptk_digest" = "no-gptk" ] || { echo "release runtime contains a GPTK overlay" >&2; exit 1; }
+content_tree_is_verified "$RUNTIME" || {
+  echo "release runtime content digest is missing or does not match the runtime tree" >&2
+  exit 1
+}
 
 for required_notice in \
   share/doc/switchyard-wine/LICENSE \
