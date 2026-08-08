@@ -15,6 +15,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stddef.h>
 
@@ -63,7 +64,6 @@ static enum AVSampleFormat sample_format_from_wave_format_tag(UINT tag, UINT dep
         break;
     }
 
-    FIXME("Format tag %#x depth %#x implemented\n", tag, depth);
     return AV_SAMPLE_FMT_NONE;
 }
 
@@ -71,9 +71,8 @@ static void audio_frame_init_from_format(AVFrame *frame, const WAVEFORMATEXTENSI
 {
     if (format->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE)
     {
-        WAVEFORMATEXTENSIBLE *extensible = CONTAINING_RECORD(format, WAVEFORMATEXTENSIBLE, Format);
-        frame->format = sample_format_from_wave_format_tag(extensible->SubFormat.Data1, extensible->Format.wBitsPerSample);
-        av_channel_layout_from_mask(&frame->ch_layout, extensible->dwChannelMask);
+        frame->format = sample_format_from_wave_format_tag(format->SubFormat.Data1, format->Format.wBitsPerSample);
+        av_channel_layout_from_mask(&frame->ch_layout, format->dwChannelMask);
     }
     else
     {
@@ -117,49 +116,34 @@ static AVBufferRef *buffer_from_media_buffer(IMediaBuffer *media_buffer, int fla
 
 static int audio_frame_wrap_buffer(AVFrame *frame, const WAVEFORMATEXTENSIBLE *format, AVBufferRef *buffer)
 {
+    size_t sample_count = buffer->size / format->Format.nBlockAlign;
     int size;
 
     TRACE("frame %p, type %p, buffer %p\n", frame, format, buffer);
 
+    if (sample_count > INT_MAX)
+    {
+        av_frame_unref(frame);
+        return AVERROR(EINVAL);
+    }
     audio_frame_init_from_format(frame, format);
-    frame->nb_samples = buffer->size / format->Format.nBlockAlign;
+    frame->nb_samples = sample_count;
 
     size = av_samples_fill_arrays(frame->data, frame->linesize, buffer->data,
             frame->ch_layout.nb_channels, frame->nb_samples, frame->format, 1);
-    if (size > buffer->size)
-        return -1;
+    if (size < 0 || size > buffer->size)
+    {
+        av_frame_unref(frame);
+        return size < 0 ? size : AVERROR(EINVAL);
+    }
 
+    if (!(frame->buf[0] = av_buffer_ref(buffer)))
+    {
+        av_frame_unref(frame);
+        return AVERROR(ENOMEM);
+    }
     frame->opaque = (void *)-1; /* avoid reusing frame */
-    frame->buf[0] = av_buffer_ref(buffer);
     frame->extended_data = frame->data;
-    return size;
-}
-
-static int audio_frame_copy_from_buffer(AVFrame *frame, const WAVEFORMATEXTENSIBLE *format, AVBufferRef *buffer)
-{
-    UINT8 *input_planes[4];
-    int size;
-
-    ERR("frame %p, buffer %p\n", frame, buffer);
-
-    size = av_samples_fill_arrays(input_planes, NULL, buffer->data, frame->ch_layout.nb_channels,
-            frame->nb_samples, frame->format, 1);
-    av_samples_copy(frame->data, input_planes, 0, 0, buffer->size / format->Format.nBlockAlign,
-            frame->ch_layout.nb_channels, frame->format);
-    return size;
-}
-
-static int audio_frame_copy_to_buffer(AVFrame *frame, const WAVEFORMATEXTENSIBLE *format, AVBufferRef *buffer)
-{
-    UINT8 *output_planes[4];
-    int size;
-
-    ERR("frame %p, buffer %p\n", frame, buffer);
-
-    size = av_samples_fill_arrays(output_planes, NULL, buffer->data, frame->ch_layout.nb_channels,
-            frame->nb_samples, frame->format, 1);
-    av_samples_copy(output_planes, frame->data, 0, 0, frame->nb_samples,
-            frame->ch_layout.nb_channels, frame->format);
     return size;
 }
 
@@ -232,7 +216,12 @@ static HRESULT resampler_process_frame(struct resampler *impl, AVFrame *input_fr
     if (!(buffer = buffer_from_media_buffer(output->pBuffer, 0)))
         return E_OUTOFMEMORY;
     if ((ret = audio_frame_wrap_buffer(&output_frame, &impl->output_format, buffer)) < 0)
-        av_frame_move_ref(&output_frame, &impl->output_frame);
+    {
+        av_buffer_unref(&buffer);
+        output->dwStatus = 0;
+        IMediaBuffer_SetLength(output->pBuffer, 0);
+        return ret == AVERROR(ENOMEM) ? E_OUTOFMEMORY : E_FAIL;
+    }
 
     pts = swr_next_pts(impl->context, input_frame->pts);
     if ((ret = swr_convert(impl->context, output_frame.data, buffer->size / impl->output_format.Format.nBlockAlign,
@@ -240,17 +229,11 @@ static HRESULT resampler_process_frame(struct resampler *impl, AVFrame *input_fr
         ERR("error ret %d (%s)\n", -ret, av_err2str(ret));
     else if ((output_frame.nb_samples = ret))
     {
-        if (!output_frame.opaque)
-            ret = audio_frame_copy_to_buffer(&output_frame, &impl->output_format, buffer);
-        else
-            ret = output_frame.nb_samples * impl->output_format.Format.nBlockAlign;
+        ret = output_frame.nb_samples * impl->output_format.Format.nBlockAlign;
         duration = av_rescale(output_frame.nb_samples, 10000000, output_frame.sample_rate);
     }
 
-    if (!output_frame.opaque)
-        av_frame_move_ref(&impl->output_frame, &output_frame);
-    else
-        av_frame_unref(&output_frame);
+    av_frame_unref(&output_frame);
     av_buffer_unref(&buffer);
 
     output->dwStatus = 0;
@@ -302,12 +285,20 @@ static HRESULT resampler_process_input(struct resampler *impl, const DMO_OUTPUT_
 
     if (!(buffer = buffer_from_media_buffer(input->pBuffer, AV_BUFFER_FLAG_READONLY)))
         return E_OUTOFMEMORY;
-    if ((ret = audio_frame_wrap_buffer(&impl->current_frame, &impl->input_format, buffer)) < 0)
+    if (!buffer->size)
     {
-        ret = audio_frame_copy_from_buffer(&impl->input_frame, &impl->input_format, buffer);
-        av_frame_move_ref(&impl->current_frame, &impl->input_frame);
+        av_buffer_unref(&buffer);
+        return S_OK;
     }
+    if (buffer->size % impl->input_format.Format.nBlockAlign)
+    {
+        av_buffer_unref(&buffer);
+        return E_INVALIDARG;
+    }
+    ret = audio_frame_wrap_buffer(&impl->current_frame, &impl->input_format, buffer);
     av_buffer_unref(&buffer);
+    if (ret < 0)
+        return ret == AVERROR(ENOMEM) ? E_OUTOFMEMORY : E_FAIL;
 
     if (SUCCEEDED(hr = IMediaBuffer_QueryInterface(input->pBuffer, &IID_IMFSample, (void **)&sample)))
     {
@@ -895,12 +886,17 @@ static HRESULT WINAPI media_object_GetOutputType(IMediaObject *iface, DWORD inde
 
 static HRESULT check_dmo_media_type(const DMO_MEDIA_TYPE *type, UINT *block_alignment)
 {
-    WAVEFORMATEX *wfx;
+    const WAVEFORMATEXTENSIBLE *extensible;
+    const WAVEFORMATEX *wfx;
+    UINT64 expected_block_alignment, expected_bytes_per_sec;
+    DWORD channel_mask;
+    UINT channel_count = 0, format_tag;
     ULONG i;
 
     if (!IsEqualGUID(&type->majortype, &MEDIATYPE_Audio))
         return DMO_E_INVALIDTYPE;
-    if (!IsEqualGUID(&type->formattype, &FORMAT_WaveFormatEx) || type->cbFormat < sizeof(*wfx))
+    if (!IsEqualGUID(&type->formattype, &FORMAT_WaveFormatEx) || !type->pbFormat
+            || type->cbFormat < sizeof(*wfx))
         return DMO_E_INVALIDTYPE;
 
     for (i = 0; i < ARRAY_SIZE(audio_formats); ++i)
@@ -909,8 +905,41 @@ static HRESULT check_dmo_media_type(const DMO_MEDIA_TYPE *type, UINT *block_alig
     if (i == ARRAY_SIZE(audio_formats))
         return DMO_E_INVALIDTYPE;
 
-    wfx = (WAVEFORMATEX *)type->pbFormat;
+    wfx = (const WAVEFORMATEX *)type->pbFormat;
     if (!wfx->wBitsPerSample || !wfx->nAvgBytesPerSec || !wfx->nChannels || !wfx->nSamplesPerSec || !wfx->nBlockAlign)
+        return DMO_E_INVALIDTYPE;
+    if (wfx->cbSize > type->cbFormat - sizeof(*wfx) || wfx->nSamplesPerSec > INT_MAX)
+        return DMO_E_INVALIDTYPE;
+
+    if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+    {
+        if (wfx->cbSize < sizeof(*extensible) - sizeof(*wfx) || type->cbFormat < sizeof(*extensible))
+            return DMO_E_INVALIDTYPE;
+        extensible = (const WAVEFORMATEXTENSIBLE *)wfx;
+        if (!IsEqualGUID(&extensible->SubFormat, &type->subtype)
+                || extensible->Samples.wValidBitsPerSample > wfx->wBitsPerSample)
+            return DMO_E_INVALIDTYPE;
+        for (channel_mask = extensible->dwChannelMask; channel_mask; channel_mask &= channel_mask - 1)
+            ++channel_count;
+        if (channel_count != wfx->nChannels)
+            return DMO_E_INVALIDTYPE;
+        format_tag = extensible->SubFormat.Data1;
+    }
+    else
+    {
+        if (wfx->wFormatTag != type->subtype.Data1)
+            return DMO_E_INVALIDTYPE;
+        format_tag = wfx->wFormatTag;
+    }
+
+    if (sample_format_from_wave_format_tag(format_tag, wfx->wBitsPerSample) == AV_SAMPLE_FMT_NONE)
+        return DMO_E_INVALIDTYPE;
+
+    expected_block_alignment = (UINT64)wfx->nChannels * wfx->wBitsPerSample;
+    if (expected_block_alignment % 8 || expected_block_alignment / 8 != wfx->nBlockAlign)
+        return DMO_E_INVALIDTYPE;
+    expected_bytes_per_sec = (UINT64)wfx->nSamplesPerSec * wfx->nBlockAlign;
+    if (expected_bytes_per_sec != wfx->nAvgBytesPerSec)
         return DMO_E_INVALIDTYPE;
 
     *block_alignment = wfx->nBlockAlign;

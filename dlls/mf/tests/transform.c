@@ -6176,6 +6176,108 @@ failed:
     CoUninitialize();
 }
 
+static void check_resampler_dmo_input_type_(int line, IMediaObject *dmo, const DMO_MEDIA_TYPE *type, HRESULT expect)
+{
+    HRESULT hr = IMediaObject_SetInputType(dmo, 0, type, DMO_SET_TYPEF_TEST_ONLY);
+
+    ok_(__FILE__, line)(hr == expect || broken(expect == DMO_E_INVALIDTYPE && hr == DMO_E_TYPE_NOT_ACCEPTED),
+            "SetInputType returned %#lx, expected %#lx.\n", hr, expect);
+}
+
+#define check_resampler_dmo_input_type(a, b, c) check_resampler_dmo_input_type_(__LINE__, a, b, c)
+
+static void test_resampler_dmo_media_types(IMediaObject *dmo)
+{
+    WAVEFORMATEXTENSIBLE format = {0};
+    DMO_MEDIA_TYPE type = {0};
+
+    type.majortype = MEDIATYPE_Audio;
+    type.subtype = MEDIASUBTYPE_PCM;
+    type.formattype = FORMAT_WaveFormatEx;
+    type.pbFormat = (BYTE *)&format;
+    type.cbFormat = sizeof(format.Format);
+
+    format.Format.wFormatTag = WAVE_FORMAT_PCM;
+    format.Format.nChannels = 2;
+    format.Format.nSamplesPerSec = 48000;
+    format.Format.nAvgBytesPerSec = 192000;
+    format.Format.nBlockAlign = 4;
+    format.Format.wBitsPerSample = 16;
+    check_resampler_dmo_input_type(dmo, &type, S_OK);
+
+    type.pbFormat = NULL;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    type.pbFormat = (BYTE *)&format;
+
+    type.cbFormat--;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    type.cbFormat++;
+
+    format.Format.cbSize = 1;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    format.Format.cbSize = 0;
+
+    format.Format.nBlockAlign++;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    format.Format.nBlockAlign--;
+
+    format.Format.nAvgBytesPerSec++;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    format.Format.nAvgBytesPerSec--;
+
+    format.Format.wBitsPerSample = 24;
+    format.Format.nBlockAlign = 6;
+    format.Format.nAvgBytesPerSec = 288000;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+
+    format.Format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+    format.Format.wBitsPerSample = 32;
+    format.Format.nBlockAlign = 8;
+    format.Format.nAvgBytesPerSec = 384000;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+
+    format.Format.wFormatTag = WAVE_FORMAT_PCM;
+    format.Format.nChannels = 1;
+    format.Format.nSamplesPerSec = 0x80000000;
+    format.Format.nAvgBytesPerSec = 0x80000000;
+    format.Format.nBlockAlign = 1;
+    format.Format.wBitsPerSample = 8;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+
+    memset(&format, 0, sizeof(format));
+    type.cbFormat = sizeof(format);
+    format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    format.Format.nChannels = 2;
+    format.Format.nSamplesPerSec = 48000;
+    format.Format.nAvgBytesPerSec = 192000;
+    format.Format.nBlockAlign = 4;
+    format.Format.wBitsPerSample = 16;
+    format.Format.cbSize = sizeof(format) - sizeof(format.Format);
+    format.Samples.wValidBitsPerSample = 16;
+    format.dwChannelMask = KSAUDIO_SPEAKER_STEREO;
+    format.SubFormat = MEDIASUBTYPE_PCM;
+    check_resampler_dmo_input_type(dmo, &type, S_OK);
+
+    type.cbFormat--;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    type.cbFormat++;
+
+    format.Format.cbSize--;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    format.Format.cbSize++;
+
+    format.SubFormat = MEDIASUBTYPE_IEEE_FLOAT;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    format.SubFormat = MEDIASUBTYPE_PCM;
+
+    format.dwChannelMask = KSAUDIO_SPEAKER_MONO;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+    format.dwChannelMask = KSAUDIO_SPEAKER_STEREO;
+
+    format.Samples.wValidBitsPerSample++;
+    check_resampler_dmo_input_type(dmo, &type, DMO_E_INVALIDTYPE);
+}
+
 static void test_audio_convert(void)
 {
     const GUID *const class_id = &CLSID_CResamplerMediaObject;
@@ -6427,6 +6529,8 @@ static void test_audio_convert(void)
     hr = IMFTransform_QueryInterface(transform, &IID_IMediaObject, (void **)&dmo);
     ok(hr == S_OK, "QueryInterface returned %#lx\n", hr);
 
+    test_resampler_dmo_media_types(dmo);
+
     memset(&dmo_mt, 0, sizeof(dmo_mt));
     hr = IMediaObject_GetInputCurrentType(dmo, 0, &dmo_mt);
     ok(hr == S_OK, "GetInputCurrentType returned %#lx\n", hr);
@@ -6500,6 +6604,12 @@ static void test_audio_convert(void)
 
     load_resource(L"audiodata.bin", &audio_data, &audio_data_len);
     ok(audio_data_len == 179928, "got length %lu\n", audio_data_len);
+
+    input_sample = create_sample(audio_data, input_info.cbSize - 1);
+    hr = IMFTransform_ProcessInput(transform, 0, input_sample, 0);
+    ok(FAILED(hr), "ProcessInput returned %#lx for a partial audio block.\n", hr);
+    ret = IMFSample_Release(input_sample);
+    ok(ret == 0, "Release returned %lu\n", ret);
 
     input_sample = create_sample(audio_data, audio_data_len);
     hr = IMFSample_SetSampleTime(input_sample, 0);
