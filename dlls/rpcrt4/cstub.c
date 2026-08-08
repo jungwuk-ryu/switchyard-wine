@@ -108,7 +108,7 @@ BOOL fill_delegated_proxy_table(IUnknownVtbl *vtbl, DWORD num)
     const void **entry = (const void **)(vtbl + 1);
     DWORD i;
 
-    if (num > NB_THUNK_ENTRIES)
+    if (num < 3 || num > NB_THUNK_ENTRIES)
     {
         FIXME( "%lu methods not supported\n", num );
         return FALSE;

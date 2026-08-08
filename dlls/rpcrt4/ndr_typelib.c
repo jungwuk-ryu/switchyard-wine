@@ -1470,7 +1470,7 @@ static HRESULT get_iface_info(ITypeInfo *typeinfo, WORD *funcs, WORD *parentfunc
     ITypeInfo_ReleaseTypeAttr(*real_typeinfo, typeattr);
 
     /* No parent typeinfo is needed when the interface only inherits IUnknown. */
-    if (*parentfuncs <= 3)
+    if (*parentfuncs == 3)
     {
         *parentiid = IID_IUnknown;
         return S_OK;
