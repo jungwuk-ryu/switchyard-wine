@@ -253,7 +253,8 @@ static int video_frame_copy_from_buffer(AVFrame *frame, const MFVIDEOFORMAT *for
 
     ERR("frame %s, format %p, buffer %p\n", debugstr_avframe(frame), format, buffer);
 
-    size = fill_arrays_with_format(input_planes, input_strides, buffer, format, pitch);
+    if ((size = fill_arrays_with_format(input_planes, input_strides, buffer, format, pitch)) < 0)
+        return size;
     av_image_copy(frame->data, frame->linesize, (const UINT8 **)input_planes, input_strides,
             frame->format, format->videoInfo.dwWidth, format->videoInfo.dwHeight);
     return size;
@@ -267,7 +268,8 @@ static int video_frame_copy_to_buffer(AVFrame *frame, const MFVIDEOFORMAT *forma
 
     ERR("frame %s, format %p, buffer %p\n", debugstr_avframe(frame), format, buffer);
 
-    size = fill_arrays_with_format(output_planes, output_strides, buffer, format, pitch);
+    if ((size = fill_arrays_with_format(output_planes, output_strides, buffer, format, pitch)) < 0)
+        return size;
     av_image_copy(output_planes, output_strides, (const UINT8 **)frame->data, frame->linesize,
             frame->format, format->videoInfo.dwWidth, format->videoInfo.dwHeight);
     return size;
