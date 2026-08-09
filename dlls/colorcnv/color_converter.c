@@ -15,6 +15,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stddef.h>
 
@@ -163,29 +164,48 @@ static int fill_arrays_with_format(uint8_t *planes[4], int strides[4], AVBufferR
 {
     enum AVPixelFormat pix_fmt = pixel_format_from_video_subtype(&format->guidFormat);
     UINT width = format->videoInfo.dwWidth, height = format->videoInfo.dwHeight;
-    int size;
+    int new_strides[4] = {0};
+    const int *layout_strides = strides;
+    INT64 scaled_stride;
+    UINT abs_pitch;
+    int layout_size, ret, size, i;
 
-    size = av_image_fill_arrays(planes, strides, buffer->data, pix_fmt, width, height, 1);
+    if (width > INT_MAX || height > INT_MAX)
+        return AVERROR(EINVAL);
+    if ((size = av_image_fill_arrays(planes, strides, NULL, pix_fmt, width, height, 1)) < 0)
+        return size;
+    layout_size = size;
+
+    abs_pitch = pitch < 0 ? -(UINT)pitch : (UINT)pitch;
+    if (pitch && (abs_pitch > INT_MAX || strides[0] <= 0 || abs_pitch < (UINT)strides[0]))
+        return AVERROR(EINVAL);
+    if (pitch && abs_pitch != (UINT)strides[0])
+    {
+        for (i = 0; i < ARRAY_SIZE(new_strides); ++i)
+        {
+            scaled_stride = (INT64)abs_pitch * strides[i] / strides[0];
+            if (scaled_stride < 0 || scaled_stride > INT_MAX)
+                return AVERROR(EINVAL);
+            new_strides[i] = scaled_stride;
+        }
+        if ((layout_size = av_image_fill_pointers(planes, pix_fmt, height, NULL, new_strides)) < 0)
+            return layout_size;
+        layout_strides = new_strides;
+    }
+
+    if ((size_t)layout_size > buffer->size)
+    {
+        ERR("stride %ld linesize %d,%d,%d,%d size %#x buffer %#Ix\n", pitch, layout_strides[0],
+                layout_strides[1], layout_strides[2], layout_strides[3], layout_size, buffer->size);
+        return AVERROR(EINVAL);
+    }
+    if ((ret = av_image_fill_pointers(planes, pix_fmt, height, buffer->data, layout_strides)) < 0)
+        return ret;
+    if (layout_strides != strides)
+        memcpy(strides, new_strides, sizeof(new_strides));
+
     TRACE("buffer %p / %#Ix size %d pitch %ld, planes %p,%p,%p strides %d,%d,%d\n", buffer->data, buffer->size,
             size, pitch, planes[0], planes[1], planes[2], strides[0], strides[1], strides[2]);
-    if (size > buffer->size)
-    {
-        ERR("stride %lu linesize %u,%u,%u,%u size %#x buffer %#Ix\n", pitch, strides[0], strides[1],
-                strides[2], strides[3], size, buffer->size);
-        return -1;
-    }
-
-    if (pitch && abs(pitch) != strides[0])
-    {
-        int new_strides[4] = {0};
-        for (int i = 0; i < 4; i++) new_strides[i] = (abs(pitch) * strides[i]) / strides[0];
-        for (int i = 1; i < 4 && planes[i]; i++)
-        {
-            size_t height = (planes[i] - planes[i - 1]) / strides[i - 1];
-            planes[i] = planes[i - 1] + height * new_strides[i - 1];
-        }
-        memcpy(strides, new_strides, sizeof(new_strides));
-    }
 
     /* unlike the video processor, color converter doesn't care about 2D buffer pitch */
     if (format->videoInfo.VideoFlags & MFVideoFlag_BottomUpLinearRep)
@@ -222,16 +242,24 @@ static BOOL video_frame_wrap_buffer(AVFrame *frame, const MFVIDEOFORMAT *format,
     video_frame_init_aperture(frame, format);
 
     if ((size = fill_arrays_with_format(frame->data, frame->linesize, buffer, format, pitch)) < 0)
+    {
+        av_frame_unref(frame);
         return size;
+    }
     /* swscale requires 16byte alignment for data pointers when SSE2 optimizations are used. */
     if (!check_arrays_alignment(frame->data, frame->linesize, size, 16))
     {
         ERR("frame %s isn't aligned to 16 bytes\n", debugstr_avframe(frame));
+        av_frame_unref(frame);
         return -1;
     }
 
+    if (!(frame->buf[0] = av_buffer_ref(buffer)))
+    {
+        av_frame_unref(frame);
+        return AVERROR(ENOMEM);
+    }
     frame->opaque = (void *)-1;
-    frame->buf[0] = av_buffer_ref(buffer);
     frame->extended_data = frame->data;
     return size;
 }
@@ -244,7 +272,8 @@ static int video_frame_copy_from_buffer(AVFrame *frame, const MFVIDEOFORMAT *for
 
     ERR("frame %s, format %p, buffer %p\n", debugstr_avframe(frame), format, buffer);
 
-    size = fill_arrays_with_format(input_planes, input_strides, buffer, format, pitch);
+    if ((size = fill_arrays_with_format(input_planes, input_strides, buffer, format, pitch)) < 0)
+        return size;
     av_image_copy(frame->data, frame->linesize, (const UINT8 **)input_planes, input_strides,
             frame->format, format->videoInfo.dwWidth, format->videoInfo.dwHeight);
     return size;
@@ -258,7 +287,8 @@ static int video_frame_copy_to_buffer(AVFrame *frame, const MFVIDEOFORMAT *forma
 
     ERR("frame %s, format %p, buffer %p\n", debugstr_avframe(frame), format, buffer);
 
-    size = fill_arrays_with_format(output_planes, output_strides, buffer, format, pitch);
+    if ((size = fill_arrays_with_format(output_planes, output_strides, buffer, format, pitch)) < 0)
+        return size;
     av_image_copy(output_planes, output_strides, (const UINT8 **)frame->data, frame->linesize,
             frame->format, format->videoInfo.dwWidth, format->videoInfo.dwHeight);
     return size;
@@ -410,7 +440,11 @@ static HRESULT color_convert_process_input(struct color_convert *impl, const DMO
         return E_OUTOFMEMORY;
     if ((ret = video_frame_wrap_buffer(&impl->current_frame, &impl->input_format, buffer, pitch)) < 0)
     {
-        ret = video_frame_copy_from_buffer(&impl->input_frame, &impl->input_format, buffer, pitch);
+        if ((ret = video_frame_copy_from_buffer(&impl->input_frame, &impl->input_format, buffer, pitch)) < 0)
+        {
+            av_buffer_unref(&buffer);
+            return E_FAIL;
+        }
         av_frame_move_ref(&impl->current_frame, &impl->input_frame);
     }
     av_buffer_unref(&buffer);
