@@ -221,6 +221,7 @@ require_command unzip
 require_command zstd
 require_command install_name_tool
 require_command pkgutil
+require_command python3
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
@@ -252,26 +253,19 @@ write_content_tree_digest() {
   content_tree_digest "$root" > "$root/.switchyard-content-sha256"
 }
 
-runtime_content_tree_digest() {
-  local root="$1"
-
-  (
-    cd "$root"
-    find . \( -type f -o -type l \) ! -path './.switchyard-content-sha256' -print |
-      LC_ALL=C sort |
-      while IFS= read -r path; do
-        if [ -L "$path" ]; then
-          printf 'link %s %s\n' "$path" "$(readlink "$path")"
-        else
-          printf 'file %s %s\n' "$path" "$(sha256_file "$path")"
-        fi
-      done
-  ) | shasum -a 256 | awk '{print $1}'
-}
-
 write_runtime_content_tree_digest() {
   local root="$1"
-  runtime_content_tree_digest "$root" > "$root/.switchyard-content-sha256"
+  python3 "$ROOT_DIR/switchyard/runtime_content_digest.py" write "$root"
+}
+
+runtime_content_tree_digest() {
+  local root="$1"
+  python3 "$ROOT_DIR/switchyard/runtime_content_digest.py" digest "$root"
+}
+
+runtime_content_tree_is_verified() {
+  local root="$1"
+  python3 "$ROOT_DIR/switchyard/runtime_content_digest.py" verify "$root"
 }
 
 content_tree_is_verified() {
@@ -1885,6 +1879,7 @@ runtime_is_complete_at() {
   local plugin
 
   [ -f "$manifest" ] || return 1
+  runtime_content_tree_is_verified "$prefix" || return 1
   manifest_id="$(/usr/bin/plutil -extract id raw -o - "$manifest" 2>/dev/null || true)"
   [ "$manifest_id" = "$runtime_id" ] || return 1
   manifest_install_prefix="$(/usr/bin/plutil -extract installPrefix raw -o - "$manifest" 2>/dev/null || true)"
@@ -2631,7 +2626,7 @@ assert_source_state_unchanged "runtime assembly"
   printf '  }\n'
   printf '}\n'
 } >"$WINE_INSTALL_PREFIX/switchyard-runtime.json"
-write_runtime_content_tree_digest "$WINE_INSTALL_PREFIX"
+runtime_content_sha256="$(write_runtime_content_tree_digest "$WINE_INSTALL_PREFIX")"
 
 if ! runtime_is_complete_at "$WINE_INSTALL_PREFIX"; then
   echo "Refusing to publish an incomplete or internally inconsistent Wine runtime." >&2
@@ -2650,3 +2645,4 @@ if [ "$MODE" = "--ensure" ]; then
 else
   echo "built Switchyard Wine runtime at $FINAL_WINE_INSTALL_PREFIX"
 fi
+echo "runtime content sha256: $runtime_content_sha256"
