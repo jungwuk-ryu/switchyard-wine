@@ -160,11 +160,12 @@ case "$DISABLE_GPTK_OVERLAY" in
     ;;
 esac
 TLS_DLOPEN_NAME="@loader_path/../../switchyard-tls/lib/libgnutls.dylib"
-MAX_JOBS=13
-JOBS="${JOBS:-$MAX_JOBS}"
-if [ "$JOBS" -gt "$MAX_JOBS" ]; then
-  JOBS="$MAX_JOBS"
-elif [ "$JOBS" -lt 1 ]; then
+DEFAULT_JOBS="$(($(sysctl -n hw.ncpu) - 1))"
+if [ "$DEFAULT_JOBS" -lt 1 ]; then
+  DEFAULT_JOBS=1
+fi
+JOBS="${JOBS:-$DEFAULT_JOBS}"
+if [ "$JOBS" -lt 1 ]; then
   JOBS=1
 fi
 RECONFIGURE="${RECONFIGURE:-0}"
