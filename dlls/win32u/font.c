@@ -1659,7 +1659,8 @@ static const struct font_links_defaults_list
     "NotoSansCanadianAboriginal-Regular.ttf,Noto Sans Canadian Aboriginal\0" \
     "NotoSansMongolian-Regular.ttf,Noto Sans Mongolian\0" \
     "NotoSansSymbols-Regular.ttf,Noto Sans Symbols\0" \
-    "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols 2\0"
+    "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols 2\0" \
+    "NotoEmoji-Static.ttf,Noto Emoji\0"
 
 static const char system_link_tahoma_sc[] =
     "SIMSUN.TTC,SimSun\0"

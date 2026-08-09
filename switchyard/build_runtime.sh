@@ -76,11 +76,13 @@ FONT_DEPS_LAYER_SHA256=(
   "2cc112cce103be3beb13cc8ba67f521d4e972c4082fd69868d34920d63120c09"
   "fbb3a7908a19f306823dbd51b417705c73f710a9a1fb1e34ba7aa67a3c966094"
 )
-FONT_ASSET_SET_VERSION="noto-monthly-release-2026.07.01-cjk-2.004-aliases-1"
+FONT_ASSET_SET_VERSION="noto-monthly-release-2026.07.01-cjk-2.004-emoji-static-3.002-aliases-1"
 FONT_ASSET_MANIFEST="$ROOT_DIR/switchyard/font-assets.tsv"
 FONT_ASSET_DOWNLOAD_CACHE_DIR="${FONT_ASSET_DOWNLOAD_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Fonts/assets/noto-monthly-release-2026.07.01}"
 FONT_ASSET_PREFIX="${FONT_ASSET_PREFIX:-${HOME}/.switchyard/deps/fonts/assets-${FONT_ASSET_SET_VERSION}}"
 FONT_ALIAS_SCRIPT="$ROOT_DIR/switchyard/make_font_alias.py"
+FONT_EMOJI_STATIC_SCRIPT="$ROOT_DIR/switchyard/make_static_font.py"
+FONTCONFIG_ASSET_FRAGMENT="$ROOT_DIR/switchyard/fontconfig/50-switchyard-font-assets.conf"
 PE_MODULE_RENAME_SCRIPT="$ROOT_DIR/switchyard/rename_pe_module.py"
 FONT_ALIAS_SOURCE="NotoSansCJK-Regular.ttc"
 FONT_ALIAS_FILE="ArialUnicodeMS.otf"
@@ -88,6 +90,10 @@ FONT_ALIAS_FAMILY="Arial Unicode MS"
 FONT_ALIAS_POSTSCRIPT="ArialUnicodeMS"
 FONT_ALIAS_FACE_INDEX=1
 FONT_ALIAS_SHA256="ccdd3bd646d95b31513e10ad9c975d878c0ef8b25ff2d92f2e635b50218b128e"
+FONT_EMOJI_SOURCE="NotoEmoji-VariableFont_wght.ttf"
+FONT_EMOJI_FILE="NotoEmoji-Static.ttf"
+FONT_EMOJI_FAMILY="Noto Emoji"
+FONT_EMOJI_SHA256="65d8794d403b609345baaf7a656608990a836b27af5650f6cc921088b0b026d6"
 TLS_PACKAGE_MANIFEST="$ROOT_DIR/switchyard/tls-deps.tsv"
 TLS_SOURCE_MANIFEST="$ROOT_DIR/switchyard/tls-source-deps.tsv"
 TLS_PACKAGE_BASE_URL="https://conda.anaconda.org/conda-forge/osx-64"
@@ -383,6 +389,7 @@ stage_font_assets() {
   local url
   local extra
   local asset
+  local emoji_source_asset=""
   local font_count=0
   local license_count=0
 
@@ -394,6 +401,9 @@ stage_font_assets() {
   if content_tree_is_verified "$FONT_ASSET_PREFIX" &&
      cmp -s "$FONT_ASSET_MANIFEST" \
        "$FONT_ASSET_PREFIX/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv" &&
+     [ -f "$FONT_ASSET_PREFIX/lib/switchyard-fonts/share/doc/switchyard-font-assets/generated-fonts.tsv" ] &&
+     [ -f "$FONT_ASSET_PREFIX/share/wine/fonts/$FONT_EMOJI_FILE" ] &&
+     [ "$(sha256_file "$FONT_ASSET_PREFIX/share/wine/fonts/$FONT_EMOJI_FILE")" = "$FONT_EMOJI_SHA256" ] &&
      [ -f "$FONT_ASSET_PREFIX/share/wine/fonts/$FONT_ALIAS_FILE" ] &&
      [ "$(sha256_file "$FONT_ASSET_PREFIX/share/wine/fonts/$FONT_ALIAS_FILE")" = "$FONT_ALIAS_SHA256" ]; then
     printf '%s\n' "$FONT_ASSET_PREFIX"
@@ -408,7 +418,7 @@ stage_font_assets() {
   while IFS=$'\t' read -r kind name expected_hash url extra; do
     case "$kind" in
       ''|'#'*) continue ;;
-      font|license) ;;
+      font|font-source|license) ;;
       *)
         echo "unsupported font asset type '$kind' in $FONT_ASSET_MANIFEST" >&2
         exit 1
@@ -437,7 +447,7 @@ stage_font_assets() {
     esac
 
     asset="$(download_font_asset "$name" "$expected_hash" "$url")"
-    if [ "$kind" = "font" ]; then
+    if [ "$kind" = "font" ] || [ "$kind" = "font-source" ]; then
       case "$name" in
         *.ttf|*.ttc|*.otf) ;;
         *)
@@ -445,8 +455,15 @@ stage_font_assets() {
           exit 1
           ;;
       esac
-      install -m 0644 "$asset" "$temporary_prefix/share/wine/fonts/$name"
-      font_count=$((font_count + 1))
+      if [ "$kind" = "font" ]; then
+        install -m 0644 "$asset" "$temporary_prefix/share/wine/fonts/$name"
+        font_count=$((font_count + 1))
+      elif [ "$name" = "$FONT_EMOJI_SOURCE" ]; then
+        emoji_source_asset="$asset"
+      else
+        echo "unsupported generated font source: $name" >&2
+        exit 1
+      fi
     else
       install -m 0644 "$asset" \
         "$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/$name"
@@ -454,19 +471,27 @@ stage_font_assets() {
     fi
   done < "$FONT_ASSET_MANIFEST"
 
-  if [ "$font_count" -lt 1 ] || [ "$license_count" -lt 1 ]; then
-    echo "font asset manifest did not provide both fonts and license notices" >&2
+  if [ "$font_count" -lt 1 ] || [ "$license_count" -lt 1 ] || [ -z "$emoji_source_asset" ]; then
+    echo "font asset manifest did not provide fonts, the emoji source, and license notices" >&2
     exit 1
   fi
 
   if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 is required to generate the bundled font compatibility alias" >&2
+    echo "python3 is required to generate bundled font derivatives" >&2
     exit 1
   fi
-  if [ ! -f "$FONT_ALIAS_SCRIPT" ]; then
-    echo "missing font compatibility alias generator: $FONT_ALIAS_SCRIPT" >&2
+  if [ ! -f "$FONT_ALIAS_SCRIPT" ] || [ ! -f "$FONT_EMOJI_STATIC_SCRIPT" ]; then
+    echo "missing bundled font generator" >&2
     exit 1
   fi
+  python3 "$FONT_EMOJI_STATIC_SCRIPT" \
+    "$emoji_source_asset" \
+    "$temporary_prefix/share/wine/fonts/$FONT_EMOJI_FILE"
+  if [ "$(sha256_file "$temporary_prefix/share/wine/fonts/$FONT_EMOJI_FILE")" != "$FONT_EMOJI_SHA256" ]; then
+    echo "generated static emoji font has an unexpected sha256" >&2
+    exit 1
+  fi
+  font_count=$((font_count + 1))
   python3 "$FONT_ALIAS_SCRIPT" \
     "$temporary_prefix/share/wine/fonts/$FONT_ALIAS_SOURCE" \
     "$temporary_prefix/share/wine/fonts/$FONT_ALIAS_FILE" \
@@ -481,14 +506,20 @@ stage_font_assets() {
 
   install -m 0644 "$FONT_ASSET_MANIFEST" \
     "$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv"
+  printf 'file\tfamily\tsource\tsha256\n%s\t%s\t%s\t%s\n' \
+    "$FONT_EMOJI_FILE" "$FONT_EMOJI_FAMILY" "$FONT_EMOJI_SOURCE" "$FONT_EMOJI_SHA256" \
+    >"$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/generated-fonts.tsv"
   cat >"$temporary_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/README.txt" <<EOF
 Switchyard Wine redistributable font set $FONT_ASSET_SET_VERSION
 
 The Noto font binaries are installed under share/wine/fonts so every Wine
-prefix has deterministic multilingual text fallback. ArialUnicodeMS.otf is an
-OFL-licensed compatibility alias generated from the Korean face of
-NotoSansCJK-Regular.ttc; it is not a Microsoft font. Preserve the included
-license notices and manifest when distributing the runtime.
+prefix has deterministic multilingual and emoji fallback. $FONT_EMOJI_FILE is
+a default-instance static outline derivative of $FONT_EMOJI_SOURCE: only its
+variable-font tables are removed. It retains the upstream Noto Emoji family
+name and is licensed under the OFL. ArialUnicodeMS.otf is an OFL-licensed
+compatibility alias generated from the Korean face of NotoSansCJK-Regular.ttc;
+it is not a Microsoft font. Preserve the included license notices, manifest,
+and generated-font metadata when distributing the runtime.
 EOF
 
   write_content_tree_digest "$temporary_prefix"
@@ -1835,7 +1866,7 @@ font_deps_prefix="$(stage_font_deps)"
 font_deps_digest="$(content_tree_digest "$font_deps_prefix")"
 font_assets_prefix="$(stage_font_assets)"
 font_assets_digest="$(content_tree_digest "$font_assets_prefix")"
-font_asset_count="$(awk -F '\t' '$1 == "font" { count++ } END { print count + 1 }' "$FONT_ASSET_MANIFEST")"
+font_asset_count="$(awk -F '\t' '$1 == "font" { count++ } END { print count + 2 }' "$FONT_ASSET_MANIFEST")"
 tls_deps_prefix="$(stage_tls_deps)"
 if [ -n "$tls_deps_prefix" ]; then
   tls_deps_digest="$(content_tree_digest "$tls_deps_prefix")"
@@ -1935,10 +1966,15 @@ runtime_is_complete_at() {
   [ "$manifest_font_assets_digest" = "$font_assets_digest" ] || return 1
   cmp -s "$FONT_ASSET_MANIFEST" \
     "$prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv" || return 1
+  [ -f "$FONTCONFIG_ASSET_FRAGMENT" ] || return 1
+  cmp -s "$FONTCONFIG_ASSET_FRAGMENT" \
+    "$prefix/lib/switchyard-fonts/etc/fonts/conf.d/50-switchyard-font-assets.conf" || return 1
+  [ -f "$prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/generated-fonts.tsv" ] || return 1
   while IFS=$'\t' read -r kind name expected_hash url extra; do
     case "$kind" in
       ''|'#'*) continue ;;
       font) asset_path="$prefix/share/wine/fonts/$name" ;;
+      font-source) continue ;;
       license) asset_path="$prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets/$name" ;;
       *) return 1 ;;
     esac
@@ -1946,6 +1982,8 @@ runtime_is_complete_at() {
     [ -f "$asset_path" ] || return 1
     [ "$(sha256_file "$asset_path")" = "$expected_hash" ] || return 1
   done < "$FONT_ASSET_MANIFEST"
+  [ -f "$prefix/share/wine/fonts/$FONT_EMOJI_FILE" ] || return 1
+  [ "$(sha256_file "$prefix/share/wine/fonts/$FONT_EMOJI_FILE")" = "$FONT_EMOJI_SHA256" ] || return 1
   [ -f "$prefix/share/wine/fonts/$FONT_ALIAS_FILE" ] || return 1
   [ "$(sha256_file "$prefix/share/wine/fonts/$FONT_ALIAS_FILE")" = "$FONT_ALIAS_SHA256" ] || return 1
 }
@@ -2231,6 +2269,13 @@ if [ -f "$runtime_font_root/etc/fonts/fonts.conf" ]; then
   perl -0pi -e "s#\\n\\s*<cachedir>\\Q${font_deps_prefix}/var/cache/fontconfig\\E</cachedir>##g" \
     "$runtime_font_root/etc/fonts/fonts.conf"
 fi
+if [ ! -f "$FONTCONFIG_ASSET_FRAGMENT" ]; then
+  echo "missing Fontconfig asset fragment: $FONTCONFIG_ASSET_FRAGMENT" >&2
+  exit 1
+fi
+mkdir -p "$runtime_font_root/etc/fonts/conf.d"
+install -m 0644 "$FONTCONFIG_ASSET_FRAGMENT" \
+  "$runtime_font_root/etc/fonts/conf.d/50-switchyard-font-assets.conf"
 
 echo "installing $font_asset_count redistributable font files"
 mkdir -p "$WINE_INSTALL_PREFIX/share/wine/fonts" \
@@ -2583,6 +2628,9 @@ assert_source_state_unchanged "runtime assembly"
   printf '    "compatibilityAlias": {"file": %s, "family": %s, "source": %s, "faceIndex": %s, "sha256": %s},\n' \
     "$(json_string "$FONT_ALIAS_FILE")" "$(json_string "$FONT_ALIAS_FAMILY")" \
     "$(json_string "$FONT_ALIAS_SOURCE")" "$FONT_ALIAS_FACE_INDEX" "$(json_string "$FONT_ALIAS_SHA256")"
+  printf '    "emojiFallback": {"file": %s, "family": %s, "source": %s, "sha256": %s},\n' \
+    "$(json_string "$FONT_EMOJI_FILE")" "$(json_string "$FONT_EMOJI_FAMILY")" \
+    "$(json_string "$FONT_EMOJI_SOURCE")" "$(json_string "$FONT_EMOJI_SHA256")"
   printf '    "manifest": "lib/switchyard-fonts/share/doc/switchyard-font-assets/manifest.tsv"\n'
   printf '  },\n'
   if [ -n "$tls_deps_prefix" ]; then

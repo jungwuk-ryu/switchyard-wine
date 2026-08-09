@@ -1,4 +1,6 @@
 # Switchyard Wine redistributable font assets. Fields: type, file, sha256, url
+# NotoEmoji-VariableFont_wght.ttf is reduced reproducibly to NotoEmoji-Static.ttf.
+font-source	NotoEmoji-VariableFont_wght.ttf	de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551	https://raw.githubusercontent.com/google/fonts/2d85e20401920891efb7cd6272d6339685df2820/ofl/notoemoji/NotoEmoji%5Bwght%5D.ttf
 font	NotoSans-Bold.ttf	1df075a380fc7cb898acf64c1f7b3b4dd780de3caa860178bf929de35817a913	https://raw.githubusercontent.com/notofonts/notofonts.github.io/noto-monthly-release-2026.07.01/fonts/NotoSans/hinted/ttf/NotoSans-Bold.ttf
 font	NotoSans-Regular.ttf	478c558ea716033cd60c03438f628dfa75694dcf6b5f6d505a2f05fd2b4f3823	https://raw.githubusercontent.com/notofonts/notofonts.github.io/noto-monthly-release-2026.07.01/fonts/NotoSans/hinted/ttf/NotoSans-Regular.ttf
 font	NotoSansArabic-Regular.ttf	bdff3e5659d67e67def05b33f749683b9376ae819d65d3dd62ac4640b3aaef48	https://raw.githubusercontent.com/notofonts/notofonts.github.io/noto-monthly-release-2026.07.01/fonts/NotoSansArabic/hinted/ttf/NotoSansArabic-Regular.ttf
@@ -68,4 +70,5 @@ font	NotoSerifTibetan-Regular.ttf	ee97bf3dc56e813651db734c9f35f8f1d41e7e31acf5f7
 font	NotoSansCJK-Bold.ttc	faa5f3656a78b2e2d450d27fe8382c778bc2b6bb5ea29c986664a6a435056ceb	https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/OTC/NotoSansCJK-Bold.ttc
 font	NotoSansCJK-Regular.ttc	b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a	https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/OTC/NotoSansCJK-Regular.ttc
 license	Noto-CJK-OFL.txt	6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2	https://raw.githubusercontent.com/notofonts/noto-cjk/a99a4354c68964f6bfac488d01010b1fb6d9178a/Sans/LICENSE
+license	Noto-Emoji-OFL.txt	6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2	https://raw.githubusercontent.com/google/fonts/2d85e20401920891efb7cd6272d6339685df2820/ofl/notoemoji/OFL.txt
 license	Noto-OFL.txt	f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8	https://raw.githubusercontent.com/notofonts/notofonts.github.io/noto-monthly-release-2026.07.01/fonts/LICENSE
