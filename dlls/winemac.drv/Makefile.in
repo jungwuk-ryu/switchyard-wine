@@ -36,6 +36,7 @@ SOURCES = \
 	frame_scheduler.c \
 	gdi.c \
 	image.c \
+	iosurface_properties.c \
 	keyboard.c \
 	macdrv_main.c \
 	mouse.c \

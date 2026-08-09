@@ -1,5 +1,10 @@
-PROGRAMS = display_color
+PROGRAMS = display_color iosurface_privacy
 EXTRADEFS = -DMACDRV_NATIVE_TEST
+UNIX_LIBS = -framework CoreFoundation -framework IOSurface
 
 SOURCES = \
-	display_color.c
+	display_color.c \
+	iosurface_privacy.c
+
+display_color_OBJS = display_color.o
+iosurface_privacy_OBJS = iosurface_privacy.o

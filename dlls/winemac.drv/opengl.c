@@ -27,6 +27,7 @@
 
 #include "macdrv.h"
 #include "frame_scheduler.h"
+#include "iosurface_properties.h"
 
 #include "winuser.h"
 #include "winternl.h"
@@ -1608,18 +1609,6 @@ static void foreign_surface_target_release(struct foreign_surface_target *target
     free(target);
 }
 
-static void foreign_surface_set_number(CFMutableDictionaryRef properties, CFStringRef key,
-                                       SInt64 value)
-{
-    CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt64Type, &value);
-
-    if (number)
-    {
-        CFDictionarySetValue(properties, key, number);
-        CFRelease(number);
-    }
-}
-
 static BOOL foreign_surface_initialize_iosurface(IOSurfaceRef surface)
 {
     void *base;
@@ -1657,13 +1646,9 @@ static struct foreign_surface_backing *foreign_surface_backing_create(int format
     backing->height = height;
     backing->color_count = (pf->double_buffer ? 2 : 1) * (pf->stereo ? 2 : 1);
 
-    properties = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
-                                           &kCFTypeDictionaryValueCallBacks);
+    properties = macdrv_create_private_iosurface_properties(width, height, 4,
+                                                             0x42475241 /* BGRA */);
     if (!properties) goto failed;
-    foreign_surface_set_number(properties, kIOSurfaceWidth, width);
-    foreign_surface_set_number(properties, kIOSurfaceHeight, height);
-    foreign_surface_set_number(properties, kIOSurfaceBytesPerElement, 4);
-    foreign_surface_set_number(properties, kIOSurfacePixelFormat, 0x42475241 /* BGRA */);
     for (i = 0; i < backing->color_count; i++)
     {
         backing->color_surfaces[i] = IOSurfaceCreate(properties);
@@ -1671,13 +1656,8 @@ static struct foreign_surface_backing *foreign_surface_backing_create(int format
     }
     if (i == backing->color_count)
     {
-        /* The HWND host can belong to a different process than its WGL
-           renderer. Keep render targets private, but allow the final triple-
-           buffered presentation surfaces to be resolved by the host. */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        CFDictionarySetValue(properties, kIOSurfaceIsGlobal, kCFBooleanTrue);
-#pragma clang diagnostic pop
+        /* CAContext exports the final layer tree to its registered host. Keep
+           both render and presentation surfaces private to this process. */
         for (i = 0; i < ARRAY_SIZE(backing->present_surfaces); i++)
         {
             backing->present_surfaces[i] = IOSurfaceCreate(properties);

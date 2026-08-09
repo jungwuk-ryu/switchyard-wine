@@ -70,8 +70,6 @@ struct macdrv_remote_layer
     BOOL endpoint_dirty;
     BOOL present_pending;
     UINT64 present_serial;
-    unsigned int surface_id;
-    BOOL surface_opaque;
 };
 
 static pthread_mutex_t remote_layer_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2495,8 +2493,6 @@ static BOOL remote_layer_attach(HWND source, unsigned int context_id,
     {
         entry->present_pending = FALSE;
         entry->present_serial = 0;
-        entry->surface_id = 0;
-        entry->surface_opaque = FALSE;
     }
     entry->context_id = context_id;
     entry->endpoint_size = endpoint_size;
@@ -2548,12 +2544,10 @@ static BOOL remote_layer_release(HWND source, unsigned int context_id,
 }
 
 static BOOL remote_layer_present(HWND source, unsigned int context_id,
-                                 enum macdrv_compositor_plane plane, LPARAM surface_info)
+                                 enum macdrv_compositor_plane plane)
 {
     struct macdrv_remote_layer *entry;
     UINT64 node_id = 0, present_serial = 0;
-    unsigned int surface_id = 0;
-    BOOL surface_opaque = FALSE;
     BOOL handled = FALSE;
 
     pthread_mutex_lock(&remote_layer_mutex);
@@ -2563,15 +2557,11 @@ static BOOL remote_layer_present(HWND source, unsigned int context_id,
         handled = TRUE;
         if (entry->context_id == context_id && entry->host && entry->displayed)
         {
-            entry->surface_id = (UINT32)(UINT_PTR)surface_info;
-            entry->surface_opaque = (UINT64)(UINT_PTR)surface_info >> 32;
             present_serial = ++entry->present_serial;
             if (!entry->present_pending)
             {
                 entry->present_pending = TRUE;
                 node_id = entry->node_id;
-                surface_id = entry->surface_id;
-                surface_opaque = entry->surface_opaque;
             }
         }
         break;
@@ -2579,8 +2569,7 @@ static BOOL remote_layer_present(HWND source, unsigned int context_id,
     pthread_mutex_unlock(&remote_layer_mutex);
 
     if (node_id)
-        macdrv_window_present_compositor_node(node_id, context_id, present_serial,
-                                               surface_id, surface_opaque);
+        macdrv_window_present_compositor_node(node_id, context_id, present_serial);
     return handled;
 }
 
@@ -2589,27 +2578,20 @@ void macdrv_remote_layer_present_complete(uint64_t node_id, unsigned int context
 {
     struct macdrv_remote_layer *entry;
     UINT64 next_serial = 0;
-    unsigned int surface_id = 0;
-    BOOL surface_opaque = FALSE;
 
     pthread_mutex_lock(&remote_layer_mutex);
     if ((entry = remote_layer_find_node_locked(node_id)) &&
         entry->context_id == context_id && entry->present_pending)
     {
         if (entry->present_serial > present_serial)
-        {
             next_serial = entry->present_serial;
-            surface_id = entry->surface_id;
-            surface_opaque = entry->surface_opaque;
-        }
         else
             entry->present_pending = FALSE;
     }
     pthread_mutex_unlock(&remote_layer_mutex);
 
     if (next_serial)
-        macdrv_window_present_compositor_node(node_id, context_id, next_serial,
-                                               surface_id, surface_opaque);
+        macdrv_window_present_compositor_node(node_id, context_id, next_serial);
 }
 
 
@@ -2659,7 +2641,7 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         enum macdrv_compositor_plane plane = msg == WM_MACDRV_PRESENT_REMOTE_GPU_LAYER ?
                                              MACDRV_COMPOSITOR_GPU : MACDRV_COMPOSITOR_DIB;
-        return remote_layer_present(hwnd, (unsigned int)wp, plane, lp);
+        return remote_layer_present(hwnd, (unsigned int)wp, plane);
     }
     }
 
@@ -2708,16 +2690,14 @@ bool macdrv_release_remote_layer(void* source_ptr, unsigned int context_id, bool
                                      context_id, size);
 }
 
-bool macdrv_present_remote_layer(void* source_ptr, unsigned int context_id, bool gpu,
-                                 unsigned int surface_id, bool surface_opaque)
+bool macdrv_present_remote_layer(void* source_ptr, unsigned int context_id, bool gpu)
 {
     HWND source = (HWND)source_ptr;
-    LPARAM surface_info = (UINT64)surface_id | ((UINT64)surface_opaque << 32);
 
     if (!source || !context_id || !NtUserGetWindowThread(source, NULL)) return false;
     return NtUserPostMessage(source, gpu ? WM_MACDRV_PRESENT_REMOTE_GPU_LAYER :
                                           WM_MACDRV_PRESENT_REMOTE_DIB_LAYER,
-                             context_id, surface_info);
+                             context_id, 0);
 }
 
 
