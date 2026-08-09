@@ -165,7 +165,7 @@ void FAudio_INTERNAL_debug_fmt(
 
 bool array_reserve(FAudio *audio, void **elements, size_t *capacity, size_t count, size_t size)
 {
-    unsigned int new_capacity, max_capacity;
+    size_t new_capacity, max_capacity;
     void *new_elements;
 
     if (count <= *capacity)
@@ -408,7 +408,7 @@ static uint32_t buffer_get_end(FAudioSourceVoice *voice, const struct queued_buf
 /* If there is any leftover unaligned data at the end of this buffer, stash it
  * stash it in the voice.
  * We will later combine it with the beginning of the next buffer. */
-static void save_unaligned_end_data(FAudioSourceVoice *voice, const struct queued_buffer *buffer)
+static bool save_unaligned_end_data(FAudioSourceVoice *voice, const struct queued_buffer *buffer)
 {
 	const uint32_t samples_per_block = voice->src.samples_per_block;
 	const uint32_t block_size = voice->src.format->nBlockAlign;
@@ -416,7 +416,7 @@ static void save_unaligned_end_data(FAudioSourceVoice *voice, const struct queue
 
 #ifdef HAVE_WMADEC
 	if (voice->src.wmadec)
-		return;
+		return true;
 #endif
 
 	byte_pos = buffer->first_block_offset;
@@ -434,7 +434,7 @@ static void save_unaligned_end_data(FAudioSourceVoice *voice, const struct queue
 	}
 
 	if (byte_pos == end_pos)
-		return;
+		return true;
 
 	/* If the last buffer was also unaligned, and this one
 	 * wasn't big enough to complete the block, then we'll
@@ -445,20 +445,27 @@ static void save_unaligned_end_data(FAudioSourceVoice *voice, const struct queue
 
 	if (!voice->src.unaligned_data)
 		voice->src.unaligned_data = voice->audio->pMalloc(block_size);
+	if (!voice->src.unaligned_data)
+		return false;
 	FAudio_memcpy(voice->src.unaligned_data + voice->src.unaligned_size,
 		buffer->buffer.pAudioData + byte_pos, end_pos - byte_pos);
 	voice->src.unaligned_size += (end_pos - byte_pos);
+
+	return true;
 }
 
-static void start_buffer(FAudioSourceVoice *voice, struct queued_buffer *buffer)
+static bool start_buffer(FAudioSourceVoice *voice, struct queued_buffer *buffer)
 {
 	if (!buffer->sent_OnStartBuffer)
 	{
+		FAudioVoiceCallback *callback = voice->src.callback;
+		void *context = buffer->buffer.pContext;
+
 		buffer->sent_OnStartBuffer = true;
 
 		if (	!buffer->internal &&
-			voice->src.callback != NULL &&
-			voice->src.callback->OnBufferStart != NULL	)
+			callback != NULL &&
+			callback->OnBufferStart != NULL	)
 		{
 			FAudio_PlatformUnlockMutex(voice->src.bufferLock);
 			LOG_MUTEX_UNLOCK(voice->audio, voice->src.bufferLock)
@@ -469,9 +476,9 @@ static void start_buffer(FAudioSourceVoice *voice, struct queued_buffer *buffer)
 			FAudio_PlatformUnlockMutex(voice->audio->sourceLock);
 			LOG_MUTEX_UNLOCK(voice->audio, voice->audio->sourceLock)
 
-			voice->src.callback->OnBufferStart(
-				voice->src.callback,
-				buffer->buffer.pContext
+			callback->OnBufferStart(
+				callback,
+				context
 			);
 
 			FAudio_PlatformLockMutex(voice->audio->sourceLock);
@@ -482,11 +489,15 @@ static void start_buffer(FAudioSourceVoice *voice, struct queued_buffer *buffer)
 
 			FAudio_PlatformLockMutex(voice->src.bufferLock);
 			LOG_MUTEX_LOCK(voice->audio, voice->src.bufferLock)
+
+			return true;
 		}
 	}
+
+	return false;
 }
 
-static void end_buffer(FAudioSourceVoice *voice)
+static bool end_buffer(FAudioSourceVoice *voice)
 {
 	struct queued_buffer *buffer = &voice->src.queued_buffers[0];
 	bool eos = buffer->buffer.Flags & FAUDIO_END_OF_STREAM;
@@ -494,7 +505,8 @@ static void end_buffer(FAudioSourceVoice *voice)
 	void *context = buffer->buffer.pContext;
 	bool internal = buffer->internal;
 
-	save_unaligned_end_data(voice, buffer);
+	if (!save_unaligned_end_data(voice, buffer))
+		return false;
 
 	if (buffer->buffer.LoopCount > 0)
 	{
@@ -525,8 +537,12 @@ static void end_buffer(FAudioSourceVoice *voice)
 			LOG_MUTEX_LOCK(voice->audio, voice->src.bufferLock)
 		}
 
-		buffer->first_block_offset = 0;
-		return;
+		if (voice->src.queued_buffer_count &&
+			voice->src.queued_buffers[0].sent_OnStartBuffer)
+		{
+			voice->src.queued_buffers[0].first_block_offset = 0;
+		}
+		return true;
 	}
 
 #ifdef HAVE_WMADEC
@@ -578,12 +594,14 @@ static void end_buffer(FAudioSourceVoice *voice)
 		FAudio_PlatformLockMutex(voice->src.bufferLock);
 		LOG_MUTEX_LOCK(voice->audio, voice->src.bufferLock)
 	}
+
+	return true;
 }
 
 /* If we have saved unaligned data, and the next buffer has enough data to
  * complete the block, then turn it into an internal queued buffer entry
  * and offset the next buffer's byte position accordingly. */
-static void try_collect_unaligned_data(FAudioSourceVoice *voice)
+static bool try_collect_unaligned_data(FAudioSourceVoice *voice)
 {
 	const uint32_t samples_per_block = voice->src.samples_per_block;
 	const uint32_t block_size = voice->src.format->nBlockAlign;
@@ -591,34 +609,40 @@ static void try_collect_unaligned_data(FAudioSourceVoice *voice)
 	uint32_t begin_bytes;
 
 	if (!voice->src.queued_buffer_count)
-		return;
+		return true;
 	buffer = &voice->src.queued_buffers[0];
 	if (!voice->src.unaligned_size)
-		return;
+		return true;
 
 	if (buffer->buffer.LoopCount)
 	{
 		/* If there's not enough data to complete the block, the buffer
 		 * will be immediately ended in end_buffer(), and its data
 		 * appended to the unaligned data we already have. */
-		if (voice->src.unaligned_size + buffer->loop_bytes < block_size)
-			return;
+		if (buffer->loop_bytes < block_size - voice->src.unaligned_size)
+			return true;
 		begin_bytes = buffer->buffer.LoopBegin / samples_per_block * block_size;
 	}
 	else
 	{
-		if (voice->src.unaligned_size + buffer->play_bytes < block_size)
-			return;
+		if (buffer->play_bytes < block_size - voice->src.unaligned_size)
+			return true;
 		begin_bytes = buffer->buffer.PlayBegin / samples_per_block * block_size;
 	}
 
+	/* Put this data into a new internal buffer. */
+	if (voice->src.queued_buffer_count == ~(size_t) 0 ||
+		!array_reserve(voice->audio, (void **)&voice->src.queued_buffers,
+		&voice->src.queued_buffers_capacity, voice->src.queued_buffer_count + 1,
+		sizeof(*voice->src.queued_buffers)))
+	{
+		return false;
+	}
+
+	buffer = &voice->src.queued_buffers[0];
 	buffer->first_block_offset = block_size - voice->src.unaligned_size;
 	FAudio_memcpy(voice->src.unaligned_data + voice->src.unaligned_size,
 		buffer->buffer.pAudioData + begin_bytes, buffer->first_block_offset);
-
-	/* Put this data into a new internal buffer. */
-	array_reserve(voice->audio, (void **)&voice->src.queued_buffers, &voice->src.queued_buffers_capacity,
-		voice->src.queued_buffer_count + 1, sizeof(*voice->src.queued_buffers));
 	FAudio_memmove(&voice->src.queued_buffers[1], &voice->src.queued_buffers[0],
 		voice->src.queued_buffer_count * sizeof(*voice->src.queued_buffers));
 	++voice->src.queued_buffer_count;
@@ -634,6 +658,8 @@ static void try_collect_unaligned_data(FAudioSourceVoice *voice)
 	/* Reset the unaligned size for next time. */
 	voice->src.unaligned_data = NULL;
 	voice->src.unaligned_size = 0;
+
+	return true;
 }
 
 static void FAudio_INTERNAL_DecodeBuffers(
@@ -652,13 +678,30 @@ static void FAudio_INTERNAL_DecodeBuffers(
 	while (decoded < *toDecode && voice->src.queued_buffer_count)
 	{
 		float *dst = voice->audio->decodeCache + (decoded * voice->src.format->nChannels);
-		struct queued_buffer *buffer = &voice->src.queued_buffers[0];
+		struct queued_buffer *buffer;
 		uint32_t decode_count;
 
-		try_collect_unaligned_data(voice);
+		if (!try_collect_unaligned_data(voice))
+		{
+			FAudio_zero(
+				voice->audio->decodeCache + (decoded * voice->src.format->nChannels),
+				sizeof(float) * ((*toDecode - decoded + EXTRA_DECODE_PADDING) *
+					voice->src.format->nChannels)
+			);
+			LOG_FUNC_EXIT(voice->audio)
+			return;
+		}
+		buffer = &voice->src.queued_buffers[0];
 
 		/* Start-of-buffer behavior */
-		start_buffer(voice, buffer);
+		if (start_buffer(voice, buffer))
+		{
+			if (!voice->src.queued_buffer_count)
+				continue;
+			buffer = &voice->src.queued_buffers[0];
+			if (!buffer->sent_OnStartBuffer)
+				continue;
+		}
 
 		/* Number of samples we are decoding in one call. */
 		decode_count = FAudio_min(*toDecode - decoded,
@@ -695,8 +738,16 @@ static void FAudio_INTERNAL_DecodeBuffers(
 		voice->src.totalSamples += decode_count;
 
 		/* End-of-buffer behavior */
-		if (decoded < *toDecode)
-			end_buffer(voice);
+		if (decoded < *toDecode && !end_buffer(voice))
+		{
+			FAudio_zero(
+				voice->audio->decodeCache + (decoded * voice->src.format->nChannels),
+				sizeof(float) * ((*toDecode - decoded + EXTRA_DECODE_PADDING) *
+					voice->src.format->nChannels)
+			);
+			LOG_FUNC_EXIT(voice->audio)
+			return;
+		}
 	}
 
 	/* ... FIXME: I keep going past the buffer so fuck it */
