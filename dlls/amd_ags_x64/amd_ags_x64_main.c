@@ -10,7 +10,6 @@
 
 #include "windef.h"
 #include "winbase.h"
-#include "winternl.h"
 #include "wine/debug.h"
 
 #include "wine/vulkan.h"
@@ -393,30 +392,195 @@ static BOOL get_ags_version_from_resource(const WCHAR *filename, enum amd_ags_ve
     return TRUE;
 }
 
-static BOOL image_exports_name(HMODULE module, const char *name)
+struct mapped_pe_image
 {
-    IMAGE_EXPORT_DIRECTORY *exports;
-    DWORD i, size, *names;
+    const BYTE *data;
+    SIZE_T size;
+    SIZE_T sections_offset;
+    WORD section_count;
+    DWORD size_of_headers;
+    IMAGE_DATA_DIRECTORY exports;
+};
 
-    if (!(exports = RtlImageDirectoryEntryToData(module, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size)))
+static const void *mapped_file_range(const struct mapped_pe_image *image, SIZE_T offset, SIZE_T size)
+{
+    if (offset > image->size || size > image->size - offset)
+        return NULL;
+    return image->data + offset;
+}
+
+static BOOL mapped_file_read(const struct mapped_pe_image *image, SIZE_T offset, void *buffer, SIZE_T size)
+{
+    const void *ptr = mapped_file_range(image, offset, size);
+
+    if (!ptr)
         return FALSE;
-    if (!(names = RtlImageRvaToVa(RtlImageNtHeader(module), module, exports->AddressOfNames, NULL)))
+    memcpy(buffer, ptr, size);
+    return TRUE;
+}
+
+static BOOL mapped_pe_image_init(struct mapped_pe_image *image, const void *data, SIZE_T size)
+{
+    IMAGE_OPTIONAL_HEADER32 optional32;
+    IMAGE_OPTIONAL_HEADER64 optional64;
+    IMAGE_FILE_HEADER file_header;
+    IMAGE_DOS_HEADER dos;
+    const void *optional;
+    SIZE_T optional_offset, sections_size;
+    DWORD signature;
+    WORD magic;
+
+    memset(image, 0, sizeof(*image));
+    image->data = data;
+    image->size = size;
+
+    if (!mapped_file_read(image, 0, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        return FALSE;
+    if (!mapped_file_read(image, dos.e_lfanew, &signature, sizeof(signature)) || signature != IMAGE_NT_SIGNATURE)
+        return FALSE;
+    if ((SIZE_T)dos.e_lfanew > image->size - sizeof(signature)
+            || !mapped_file_read(image, dos.e_lfanew + sizeof(signature), &file_header, sizeof(file_header)))
         return FALSE;
 
-    for (i = 0; i < exports->NumberOfNames; i++)
+    optional_offset = dos.e_lfanew + sizeof(signature) + sizeof(file_header);
+    if (!(optional = mapped_file_range(image, optional_offset, file_header.SizeOfOptionalHeader))
+            || file_header.SizeOfOptionalHeader < sizeof(magic))
+        return FALSE;
+    memcpy(&magic, optional, sizeof(magic));
+
+    if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
     {
-        const char *export_name = RtlImageRvaToVa(RtlImageNtHeader(module), module, names[i], NULL);
-        if (export_name && !strcmp(export_name, name))
-            return TRUE;
+        if (file_header.SizeOfOptionalHeader < offsetof(IMAGE_OPTIONAL_HEADER32, DataDirectory[1]))
+            return FALSE;
+        memset(&optional32, 0, sizeof(optional32));
+        memcpy(&optional32, optional, min(sizeof(optional32), file_header.SizeOfOptionalHeader));
+        if (optional32.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT)
+            return FALSE;
+        image->size_of_headers = optional32.SizeOfHeaders;
+        image->exports = optional32.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     }
-    return FALSE;
+    else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        if (file_header.SizeOfOptionalHeader < offsetof(IMAGE_OPTIONAL_HEADER64, DataDirectory[1]))
+            return FALSE;
+        memset(&optional64, 0, sizeof(optional64));
+        memcpy(&optional64, optional, min(sizeof(optional64), file_header.SizeOfOptionalHeader));
+        if (optional64.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT)
+            return FALSE;
+        image->size_of_headers = optional64.SizeOfHeaders;
+        image->exports = optional64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    }
+    else
+        return FALSE;
+
+    /* The Windows loader supports at most 96 sections in an image. */
+    if (!file_header.NumberOfSections || file_header.NumberOfSections > 96)
+        return FALSE;
+    image->sections_offset = optional_offset + file_header.SizeOfOptionalHeader;
+    sections_size = (SIZE_T)file_header.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
+    if (!mapped_file_range(image, image->sections_offset, sections_size))
+        return FALSE;
+    image->section_count = file_header.NumberOfSections;
+    return TRUE;
+}
+
+static const void *mapped_pe_image_rva(const struct mapped_pe_image *image, DWORD rva, SIZE_T size)
+{
+    IMAGE_SECTION_HEADER section;
+    SIZE_T delta, offset;
+    unsigned int i;
+
+    if (rva < image->size_of_headers)
+    {
+        if (size > image->size_of_headers - rva)
+            return NULL;
+        return mapped_file_range(image, rva, size);
+    }
+
+    for (i = 0; i < image->section_count; ++i)
+    {
+        if (!mapped_file_read(image, image->sections_offset + i * sizeof(section), &section, sizeof(section)))
+            return NULL;
+        if (rva < section.VirtualAddress)
+            continue;
+        delta = rva - section.VirtualAddress;
+        if (delta > section.SizeOfRawData || size > section.SizeOfRawData - delta)
+            continue;
+        if ((SIZE_T)section.PointerToRawData > ~(SIZE_T)0 - delta)
+            return NULL;
+        offset = section.PointerToRawData + delta;
+        return mapped_file_range(image, offset, size);
+    }
+    return NULL;
+}
+
+enum known_ags_export
+{
+    AGS_EXPORT_GET_DRIVER_VERSION_INFO = 1u << 0,
+    AGS_EXPORT_SET_CROSSFIRE_MODE      = 1u << 1,
+    AGS_EXPORT_DRIVER_EXTENSIONS_INIT  = 1u << 2,
+    AGS_EXPORT_GET_EYEFINITY_INFO      = 1u << 3,
+    AGS_EXPORT_DX11_INIT               = 1u << 4,
+};
+
+static unsigned int image_get_known_ags_exports(const void *data, SIZE_T size)
+{
+    static const struct
+    {
+        const char *name;
+        SIZE_T size;
+        unsigned int flag;
+    }
+    known_exports[] =
+    {
+        {"agsGetDriverVersionInfo", sizeof("agsGetDriverVersionInfo"), AGS_EXPORT_GET_DRIVER_VERSION_INFO},
+        {"agsDriverExtensions_SetCrossfireMode", sizeof("agsDriverExtensions_SetCrossfireMode"),
+                AGS_EXPORT_SET_CROSSFIRE_MODE},
+        {"agsDriverExtensions_Init", sizeof("agsDriverExtensions_Init"), AGS_EXPORT_DRIVER_EXTENSIONS_INIT},
+        {"agsGetEyefinityConfigInfo", sizeof("agsGetEyefinityConfigInfo"), AGS_EXPORT_GET_EYEFINITY_INFO},
+        {"agsDriverExtensionsDX11_Init", sizeof("agsDriverExtensionsDX11_Init"), AGS_EXPORT_DX11_INIT},
+    };
+    IMAGE_EXPORT_DIRECTORY exports;
+    struct mapped_pe_image image;
+    const BYTE *names;
+    unsigned int flags = 0, i, j;
+    SIZE_T names_size;
+    DWORD name_rva;
+
+    if (!mapped_pe_image_init(&image, data, size) || image.exports.Size < sizeof(exports)
+            || !(data = mapped_pe_image_rva(&image, image.exports.VirtualAddress, sizeof(exports))))
+        return 0;
+    memcpy(&exports, data, sizeof(exports));
+
+    if (exports.NumberOfNames > image.size / sizeof(DWORD))
+        return 0;
+    names_size = (SIZE_T)exports.NumberOfNames * sizeof(DWORD);
+    if (!(names = mapped_pe_image_rva(&image, exports.AddressOfNames, names_size)))
+        return 0;
+
+    for (i = 0; i < exports.NumberOfNames; ++i)
+    {
+        memcpy(&name_rva, names + i * sizeof(name_rva), sizeof(name_rva));
+        for (j = 0; j < ARRAY_SIZE(known_exports); ++j)
+        {
+            const char *name = mapped_pe_image_rva(&image, name_rva, known_exports[j].size);
+            if (name && !memcmp(name, known_exports[j].name, known_exports[j].size))
+            {
+                flags |= known_exports[j].flag;
+                break;
+            }
+        }
+    }
+    return flags;
 }
 
 static enum amd_ags_version guess_version_from_exports(const WCHAR *filename, int *ags_version)
 {
     HANDLE file = INVALID_HANDLE_VALUE, mapping = NULL;
     enum amd_ags_version ret = AMD_AGS_VERSION_5_4_1;
-    HMODULE module = NULL;
+    const void *module = NULL;
+    LARGE_INTEGER file_size;
+    unsigned int exports;
 
     /* Known DLL versions without version info:
      *  - An update to AGS 5.4.1 included an amd_ags_x64.dll with no file version info;
@@ -430,12 +594,16 @@ static enum amd_ags_version guess_version_from_exports(const WCHAR *filename, in
             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE)
         goto done;
-    if (!(mapping = CreateFileMappingW(file, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL)))
+    if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0
+            || (ULONGLONG)file_size.QuadPart > (ULONGLONG)~(SIZE_T)0)
+        goto done;
+    if (!(mapping = CreateFileMappingW(file, NULL, PAGE_READONLY, 0, 0, NULL)))
         goto done;
     if (!(module = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)))
         goto done;
+    exports = image_get_known_ags_exports(module, file_size.QuadPart);
 
-    if (image_exports_name(module, "agsGetDriverVersionInfo"))
+    if (exports & AGS_EXPORT_GET_DRIVER_VERSION_INFO)
     {
         /* agsGetDriverVersionInfo existed somewhere before 3.1.1, there is no SDK history in github before 3.1.1. */
         TRACE("agsGetDriverVersionInfo found.\n");
@@ -444,7 +612,7 @@ static enum amd_ags_version guess_version_from_exports(const WCHAR *filename, in
         goto done;
     }
 
-    if (image_exports_name(module, "agsDriverExtensions_SetCrossfireMode"))
+    if (exports & AGS_EXPORT_SET_CROSSFIRE_MODE)
     {
         /* agsDriverExtensions_SetCrossfireMode was deprecated in 3.2.0 */
         TRACE("agsDriverExtensions_SetCrossfireMode found.\n");
@@ -452,7 +620,7 @@ static enum amd_ags_version guess_version_from_exports(const WCHAR *filename, in
         ret = AMD_AGS_VERSION_4_0_3;
         goto done;
     }
-    if (image_exports_name(module, "agsDriverExtensions_Init"))
+    if (exports & AGS_EXPORT_DRIVER_EXTENSIONS_INIT)
     {
         /* agsGetEyefinityConfigInfo was deprecated in 4.0.0 */
         TRACE("agsDriverExtensions_Init found.\n");
@@ -460,14 +628,14 @@ static enum amd_ags_version guess_version_from_exports(const WCHAR *filename, in
         ret = AMD_AGS_VERSION_4_0_3;
         goto done;
     }
-    if (image_exports_name(module, "agsGetEyefinityConfigInfo"))
+    if (exports & AGS_EXPORT_GET_EYEFINITY_INFO)
     {
         /* agsGetEyefinityConfigInfo was deprecated in 5.0.0 */
         TRACE("agsGetEyefinityConfigInfo found.\n");
         ret = AMD_AGS_VERSION_4_0_3;
         goto done;
     }
-    if (image_exports_name(module, "agsDriverExtensionsDX11_Init"))
+    if (exports & AGS_EXPORT_DX11_INIT)
     {
         /* agsDriverExtensionsDX11_Init was deprecated in 5.3.0 */
         TRACE("agsDriverExtensionsDX11_Init found.\n");
@@ -514,18 +682,11 @@ static enum amd_ags_version determine_ags_version(int *ags_version)
     WCHAR dllname[MAX_PATH], temp_path[MAX_PATH], temp_name[MAX_PATH];
     HMODULE module;
     DWORD size;
-    static __thread int recursive_version_detection;
 
     TRACE("*ags_version %#x.\n", *ags_version);
 
     if (*ags_version)
         return get_version_number(*ags_version);
-
-    if (recursive_version_detection)
-    {
-        TRACE("Recursive AGS version detection, using the compatibility default.\n");
-        goto done;
-    }
 
     *temp_name = 0;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
