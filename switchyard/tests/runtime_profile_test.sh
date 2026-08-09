@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/switchyard/build_runtime.sh"
 RELEASE_SCRIPT="$ROOT_DIR/switchyard/release_runtime.sh"
 PROFILE_LIBRARY="$ROOT_DIR/switchyard/lib/runtime_profile.sh"
+STABLE_ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime.entitlements"
+NATIVE_ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime-native-arm64.entitlements"
 TEST_ROOT="$(mktemp -d)"
 failure_index=0
 
@@ -98,6 +100,32 @@ EOF
 # shellcheck disable=SC1090 # The test resolves the worktree root at runtime.
 source "$PROFILE_LIBRARY"
 
+if ! /usr/bin/python3 - "$STABLE_ENTITLEMENTS" "$NATIVE_ENTITLEMENTS" <<'PY'
+import plistlib
+import sys
+
+expected = (
+    {
+        "com.apple.security.cs.allow-dyld-environment-variables": True,
+        "com.apple.security.cs.allow-unsigned-executable-memory": True,
+    },
+    {
+        "com.apple.security.cs.allow-dyld-environment-variables": True,
+        "com.apple.security.cs.allow-jit": True,
+        "com.apple.security.cs.allow-unsigned-executable-memory": True,
+        "com.apple.security.custom-x18-abi-toggle": True,
+    },
+)
+for path, wanted in zip(sys.argv[1:], expected):
+    with open(path, "rb") as stream:
+        actual = plistlib.load(stream)
+    if actual != wanted:
+        raise SystemExit(f"unexpected entitlements in {path}: {actual!r}")
+PY
+then
+  fail "runtime signing entitlement plists do not contain the exact profile policy"
+fi
+
 [ "$(grep -c 'signed_runtime/bin/wineserver' "$RELEASE_SCRIPT")" -eq 2 ] ||
   fail "release cleanup and smoke teardown do not use the installed wineserver path"
 if grep -F 'signed_runtime/bin/switchyard-wineserver' "$RELEASE_SCRIPT" >/dev/null; then
@@ -117,6 +145,8 @@ switchyard_load_runtime_profile stable-x86_64-rosetta
 [ "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" = "14.0" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH" = "x86_64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_RELEASE_SUFFIX" = "macos-x86_64" ]
+[ "$SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME" = "wine-runtime.entitlements" ]
+[ "$(switchyard_runtime_profile_entitlements_path "$ROOT_DIR")" = "$STABLE_ENTITLEMENTS" ]
 
 switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_RUNTIME_PROFILE_ENABLED" = "0" ]
@@ -131,7 +161,20 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" = "26.5" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH" = "arm64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_RELEASE_SUFFIX" = "macos-arm64" ]
+[ "$SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME" = "wine-runtime-native-arm64.entitlements" ]
+[ "$(switchyard_runtime_profile_entitlements_path "$ROOT_DIR")" = "$NATIVE_ENTITLEMENTS" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH" != "$SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH" ]
+
+preview_entitlements_basename="$SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME"
+SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME="wine-runtime.entitlements"
+expect_failure "cross-profile entitlements path" 2 \
+  "Runtime profile signing entitlements are not allowlisted." \
+  switchyard_runtime_profile_entitlements_path "$ROOT_DIR"
+SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME="../../untrusted.entitlements"
+expect_failure "unallowlisted entitlements path" 2 \
+  "Runtime profile signing entitlements are not allowlisted." \
+  switchyard_runtime_profile_entitlements_path "$ROOT_DIR"
+SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME="$preview_entitlements_basename"
 
 default_source_info="$(SWITCHYARD_DISABLE_GPTK_OVERLAY=1 "$BUILD_SCRIPT" --source-info)"
 stable_source_info="$(SWITCHYARD_DISABLE_GPTK_OVERLAY=1 \

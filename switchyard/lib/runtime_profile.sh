@@ -38,6 +38,7 @@ switchyard_load_runtime_profile() {
       SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_ARCHITECTURE_DESCRIPTION="universal (x86_64 used by Wine under Rosetta)"
       SWITCHYARD_RUNTIME_PROFILE_BUILD_CACHE_BASENAME="build-wow64-x86_64"
       SWITCHYARD_RUNTIME_PROFILE_RELEASE_SUFFIX="macos-x86_64"
+      SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME="wine-runtime.entitlements"
       ;;
     preview-native-arm64-fex)
       SWITCHYARD_RUNTIME_PROFILE="$profile"
@@ -57,9 +58,26 @@ switchyard_load_runtime_profile() {
       SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_ARCHITECTURE_DESCRIPTION="universal (arm64 used by native Wine)"
       SWITCHYARD_RUNTIME_PROFILE_BUILD_CACHE_BASENAME="build-native-arm64-fex"
       SWITCHYARD_RUNTIME_PROFILE_RELEASE_SUFFIX="macos-arm64"
+      SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME="wine-runtime-native-arm64.entitlements"
       ;;
     *)
       echo "Unknown runtime profile. Expected stable-x86_64-rosetta or preview-native-arm64-fex." >&2
+      return 2
+      ;;
+  esac
+}
+
+switchyard_runtime_profile_entitlements_path() {
+  local root="$1"
+
+  case "${SWITCHYARD_RUNTIME_PROFILE:-}:${SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME:-}" in
+    stable-x86_64-rosetta:wine-runtime.entitlements|\
+    preview-native-arm64-fex:wine-runtime-native-arm64.entitlements)
+      /usr/bin/printf '%s/switchyard/%s\n' \
+        "$root" "$SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME"
+      ;;
+    *)
+      echo "Runtime profile signing entitlements are not allowlisted." >&2
       return 2
       ;;
   esac

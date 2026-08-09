@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/switchyard/lib/runtime_profile.sh"
-ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime.entitlements"
+ENTITLEMENTS=""
 EXPECTED_TEAM_ID="${SWITCHYARD_DEVELOPER_TEAM_ID:-M3CULMDKU3}"
 RUNTIME=""
 OUTPUT_DIR=""
@@ -78,8 +78,6 @@ done
 [ ! -L "$RUNTIME" ] || { echo "runtime path must not be a symbolic link" >&2; exit 1; }
 [ -f "$RUNTIME/switchyard-runtime.json" ] || { echo "runtime manifest is missing" >&2; exit 1; }
 [ ! -L "$RUNTIME/switchyard-runtime.json" ] || { echo "runtime manifest must not be a symbolic link" >&2; exit 1; }
-[ -f "$ENTITLEMENTS" ] || { echo "runtime signing entitlements are missing" >&2; exit 1; }
-
 manifest_value() {
   /usr/bin/plutil -extract "$1" raw -o - "$2" 2>/dev/null || true
 }
@@ -113,6 +111,11 @@ switchyard_runtime_profile_is_known "$runtime_profile" || {
   exit 1
 }
 switchyard_load_runtime_profile "$runtime_profile" || exit $?
+ENTITLEMENTS="$(switchyard_runtime_profile_entitlements_path "$ROOT_DIR")" || exit $?
+[ -f "$ENTITLEMENTS" ] && [ ! -L "$ENTITLEMENTS" ] || {
+  echo "runtime signing entitlements are missing or invalid" >&2
+  exit 1
+}
 switchyard_require_runtime_profile_enabled || exit $?
 switchyard_validate_runtime_manifest_profile "$manifest_snapshot" "$runtime_profile" || exit 1
 runtime_id="$(manifest_value id "$manifest_snapshot")"
