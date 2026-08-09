@@ -53,6 +53,12 @@ x86_64-w64-mingw32-gcc -O2 -Wall -Wextra \
 i686-w64-mingw32-gcc -O2 -Wall -Wextra \
   "$ROOT_DIR/switchyard/tests/mesa_opengl_backend.c" \
   -o "$work/opengl-probe-i386.exe" -lopengl32 -lgdi32 -luser32
+x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -Werror \
+  "$ROOT_DIR/switchyard/tests/mesa_opengl_loader_probe.c" \
+  -o "$work/loader-probe-x86_64.exe"
+i686-w64-mingw32-gcc -O2 -Wall -Wextra -Werror \
+  "$ROOT_DIR/switchyard/tests/mesa_opengl_loader_probe.c" \
+  -o "$work/loader-probe-i386.exe"
 
 invalid_status=0
 WINEPREFIX="$prefix" WINE_OPENGL_DRIVER=invalid \
@@ -103,6 +109,23 @@ for mesa_output in "$mesa_x86_64_output" "$mesa_i386_output"; do
     printf '%s\n' "$mesa_output" >&2
     exit 1
   }
+done
+
+runtime_real="$(cd "$RUNTIME" && pwd -P)"
+mesa_windows_root="Z:${runtime_real//\//\\}\\lib\\switchyard-mesa"
+real_wine="$RUNTIME/bin/wine.switchyard-real"
+if [ ! -x "$real_wine" ]; then
+  real_wine="$RUNTIME/bin/wine64.switchyard-real"
+fi
+[ -x "$real_wine" ] || { echo "preserved Wine executable is missing" >&2; exit 1; }
+for initial_path in 'Z:\switchyard-attacker' "$mesa_windows_root"; do
+  for loader_probe in "$work/loader-probe-x86_64.exe" "$work/loader-probe-i386.exe"; do
+    WINEPREFIX="$prefix" WINEDEBUG=-all WINE_OPENGL_DRIVER=llvmpipe \
+      SWITCHYARD_OPENGL_DLL_PATH="$initial_path" \
+      SWITCHYARD_MESA_DLL_NT_PATH="$initial_path" \
+      SWITCHYARD_EXPECTED_MESA_DLL_PATH="$mesa_windows_root" \
+      "$real_wine" "$loader_probe"
+  done
 done
 
 printf '%s\n' "$default_output"

@@ -81,6 +81,7 @@ static LCID user_lcid, system_lcid;
 static LANGID user_ui_language;
 static WCHAR *nt_build_dir;
 static WCHAR *nt_data_dir;
+WCHAR *switchyard_mesa_dll_nt_path;
 
 static char system_locale[LOCALE_NAME_MAX_LENGTH];
 static char user_locale[LOCALE_NAME_MAX_LENGTH];
@@ -992,6 +993,22 @@ static void add_path_var( WCHAR **env, SIZE_T *pos, SIZE_T *size, const char *na
     free( nt_name );
 }
 
+static void add_switchyard_mesa_path_var( WCHAR **env, SIZE_T *pos, SIZE_T *size )
+{
+    free( switchyard_mesa_dll_nt_path );
+    switchyard_mesa_dll_nt_path = NULL;
+    if (switchyard_mesa_dll_path &&
+        unix_to_nt_file_name( switchyard_mesa_dll_path,
+                              &switchyard_mesa_dll_nt_path, FILE_OPEN ))
+    {
+        free( switchyard_mesa_dll_nt_path );
+        switchyard_mesa_dll_nt_path = NULL;
+    }
+    append_envW( env, pos, size, "SWITCHYARD_MESA_DLL_NT_PATH",
+                 switchyard_mesa_dll_nt_path );
+    append_envW( env, pos, size, "SWITCHYARD_OPENGL_DLL_PATH", NULL );
+}
+
 
 static void add_system_dll_path_var( WCHAR **env, SIZE_T *pos, SIZE_T *size )
 {
@@ -1042,6 +1059,7 @@ static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     add_path_var( env, pos, size, "WINELOADER", wineloader );
     add_path_var( env, pos, size, "SWITCHYARD_GPTK_DLL_NT_PATH",
                   switchyard_gptk_dll_path );
+    add_switchyard_mesa_path_var( env, pos, size );
     for (i = 0; dll_paths[i]; i++)
     {
         snprintf( str, sizeof(str), "WINEDLLDIR%u", i );

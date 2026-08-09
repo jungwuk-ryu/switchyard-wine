@@ -2391,9 +2391,10 @@ if [ -n "${VK_ICD_FILENAMES:-}" ]; then
   export SWITCHYARD_HOST_VK_ICD_FILENAMES="$VK_ICD_FILENAMES"
 fi
 export VK_ICD_FILENAMES="$vulkan_icd"
+unset SWITCHYARD_OPENGL_DLL_PATH SWITCHYARD_MESA_DLL_NT_PATH
 case "${WINE_OPENGL_DRIVER:-wine}" in
   ''|wine)
-    unset SWITCHYARD_OPENGL_DLL_PATH
+    :
     ;;
   llvmpipe)
     if [ ! -f "$mesa_gl_root/x86_64-windows/opengl32.dll" ] ||
@@ -2403,8 +2404,6 @@ case "${WINE_OPENGL_DRIVER:-wine}" in
       echo "Switchyard runtime is missing the Mesa OpenGL backend under $mesa_gl_root." >&2
       exit 127
     fi
-    mesa_windows_root="Z:${mesa_gl_root//\//\\}"
-    export SWITCHYARD_OPENGL_DLL_PATH="$mesa_windows_root"
     export GALLIUM_DRIVER="llvmpipe"
     export MESA_LOADER_DRIVER_OVERRIDE="llvmpipe"
     export LIBGL_ALWAYS_SOFTWARE="1"
