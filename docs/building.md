@@ -105,17 +105,26 @@ For a release build, first build a clean Wine-only runtime and then create a
 Developer ID signed, optionally notarized archive:
 
 ```sh
-SWITCHYARD_DISABLE_GPTK_OVERLAY=1 ./switchyard/build_runtime.sh
+set -o pipefail
+runtime_digest="$(
+  SWITCHYARD_DISABLE_GPTK_OVERLAY=1 ./switchyard/build_runtime.sh |
+    tee /dev/stderr |
+    sed -n 's/^runtime content sha256: //p'
+)"
 ./switchyard/release_runtime.sh \
   --runtime ~/.switchyard/runtimes/<runtime-id> \
+  --runtime-content-sha256 "$runtime_digest" \
   --output ~/Desktop/switchyard-runtime-release \
   --identity "Developer ID Application: ..." \
   --notary-profile switchyard-notary
 ```
 
 The release script refuses dirty source builds, GPTK overlays, missing license
-or corresponding-source notices, unexpected signing teams, and runtimes that
-cannot start a fresh Wine prefix. The ZIP itself cannot carry a stapled ticket;
+or corresponding-source notices, unexpected signing teams, runtimes that do not
+match the digest captured directly from the build, and runtimes that cannot start
+a fresh Wine prefix. The digest argument is intentionally separate from the
+runtime tree; reading the marker from a potentially modified runtime would not
+provide an independent trust anchor. The ZIP itself cannot carry a stapled ticket;
 the generated release manifest records the accepted notarization submission and
 the app verifies the archive digest plus the Developer ID signed Mach-O files.
 

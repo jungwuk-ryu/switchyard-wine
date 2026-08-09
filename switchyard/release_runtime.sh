@@ -8,10 +8,11 @@ RUNTIME=""
 OUTPUT_DIR=""
 IDENTITY="${SWITCHYARD_CODESIGN_IDENTITY:-}"
 NOTARY_PROFILE="${SWITCHYARD_NOTARY_PROFILE:-}"
+EXPECTED_RUNTIME_DIGEST="${SWITCHYARD_RUNTIME_CONTENT_SHA256:-}"
 
 usage() {
   cat >&2 <<EOF
-usage: $0 --runtime PATH --output DIR --identity IDENTITY [--notary-profile PROFILE]
+usage: $0 --runtime PATH --runtime-content-sha256 SHA256 --output DIR --identity IDENTITY [--notary-profile PROFILE]
 EOF
   exit 2
 }
@@ -21,6 +22,11 @@ while [ "$#" -gt 0 ]; do
     --runtime)
       [ "$#" -ge 2 ] || usage
       RUNTIME="$2"
+      shift 2
+      ;;
+    --runtime-content-sha256)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_RUNTIME_DIGEST="$2"
       shift 2
       ;;
     --output)
@@ -45,6 +51,10 @@ done
 [ -n "$RUNTIME" ] || usage
 [ -n "$OUTPUT_DIR" ] || usage
 [ -n "$IDENTITY" ] || usage
+[[ "$EXPECTED_RUNTIME_DIGEST" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "runtime content SHA-256 must contain exactly 64 lowercase hexadecimal characters" >&2
+  exit 2
+}
 [ -d "$RUNTIME" ] || { echo "runtime does not exist: $RUNTIME" >&2; exit 1; }
 [ ! -L "$RUNTIME" ] || { echo "runtime path must not be a symbolic link" >&2; exit 1; }
 [ -f "$RUNTIME/switchyard-runtime.json" ] || { echo "runtime manifest is missing" >&2; exit 1; }
@@ -58,20 +68,19 @@ sha256_file() {
   /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
 }
 
-content_tree_digest() {
+runtime_content_tree_is_verified() {
   local root="$1"
-  (
-    cd "$root"
-    /usr/bin/find . \( -type f -o -type l \) ! -path './.switchyard-content-sha256' -print |
-      LC_ALL=C /usr/bin/sort |
-      while IFS= read -r item; do
-        if [ -L "$item" ]; then
-          /usr/bin/printf 'link %s %s\n' "$item" "$(/usr/bin/readlink "$item")"
-        else
-          /usr/bin/printf 'file %s %s\n' "$item" "$(sha256_file "$item")"
-        fi
-      done
-  ) | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+  /usr/bin/python3 "$ROOT_DIR/switchyard/runtime_content_digest.py" verify "$root"
+}
+
+runtime_content_tree_digest() {
+  local root="$1"
+  /usr/bin/python3 "$ROOT_DIR/switchyard/runtime_content_digest.py" digest "$root"
+}
+
+write_runtime_content_tree_digest() {
+  local root="$1"
+  /usr/bin/python3 "$ROOT_DIR/switchyard/runtime_content_digest.py" write "$root" >/dev/null
 }
 
 manifest="$RUNTIME/switchyard-runtime.json"
@@ -90,6 +99,14 @@ current_revision="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 [ "$source_dirty" = "false" ] || { echo "release runtime was built from a dirty source tree" >&2; exit 1; }
 [ -z "$gptk_path" ] || { echo "release runtime records a user-provided GPTK path" >&2; exit 1; }
 [ "$gptk_digest" = "no-gptk" ] || { echo "release runtime contains a GPTK overlay" >&2; exit 1; }
+runtime_content_tree_is_verified "$RUNTIME" || {
+  echo "release runtime content digest is missing or does not match the runtime tree" >&2
+  exit 1
+}
+[ "$(runtime_content_tree_digest "$RUNTIME")" = "$EXPECTED_RUNTIME_DIGEST" ] || {
+  echo "release runtime content does not match the separately recorded build digest" >&2
+  exit 1
+}
 
 for required_notice in \
   share/doc/switchyard-wine/LICENSE \
@@ -148,6 +165,14 @@ done
 
 echo "cloning runtime into release staging"
 /bin/cp -cR "$RUNTIME" "$signed_runtime"
+runtime_content_tree_is_verified "$signed_runtime" || {
+  echo "release staging content does not match the build-time runtime digest" >&2
+  exit 1
+}
+[ "$(runtime_content_tree_digest "$signed_runtime")" = "$EXPECTED_RUNTIME_DIGEST" ] || {
+  echo "release staging content does not match the separately recorded build digest" >&2
+  exit 1
+}
 portable_manifest="$signed_runtime/switchyard-runtime.json"
 /usr/bin/plutil -replace installPrefix -string "." "$portable_manifest"
 /usr/bin/plutil -replace executable -string "bin/switchyard-wine" "$portable_manifest"
@@ -222,7 +247,7 @@ WINEPREFIX="$prefix" "$signed_runtime/bin/switchyard-wineserver" -k >/dev/null 2
 /bin/rm -rf "$prefix"
 prefix=""
 
-content_tree_digest "$signed_runtime" > "$signed_runtime/.switchyard-content-sha256"
+write_runtime_content_tree_digest "$signed_runtime"
 echo "creating $archive_name"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$signed_runtime" "$archive"
 archive_sha256="$(sha256_file "$archive")"
