@@ -55,8 +55,8 @@ extern void ObjectStublessClient4(void);
 
 BOOL fill_stubless_table( IUnknownVtbl *vtbl, DWORD num )
 {
-    size_t entry_size = (char *)ObjectStublessClient4 - (char *)ObjectStublessClient3;
-    const void **entry = (const void **)(vtbl + 1);
+    size_t entry_size;
+    const void **entry;
     DWORD i;
 
     if (num < 3 || num >= NB_THUNK_ENTRIES)
@@ -64,6 +64,8 @@ BOOL fill_stubless_table( IUnknownVtbl *vtbl, DWORD num )
         FIXME( "%lu methods not supported\n", num );
         return FALSE;
     }
+    entry_size = (char *)ObjectStublessClient4 - (char *)ObjectStublessClient3;
+    entry = (const void **)(vtbl + 1);
     for (i = 0; i < num - 3; i++, entry++)
         if (*entry == (void *)-1) *entry = (char *)ObjectStublessClient3 + i * entry_size;
 
@@ -89,7 +91,15 @@ HRESULT StdProxy_Construct(REFIID riid,
     ULONG count = ProxyInfo->pStubVtblList[Index]->header.DispatchTableCount;
     vtbl = (CInterfaceProxyVtbl *)((const void **)vtbl + 1);
     TRACE("stubless vtbl %p: count=%ld\n", vtbl->Vtbl, count );
-    fill_stubless_table( (IUnknownVtbl *)vtbl->Vtbl, count );
+    if (!fill_stubless_table( (IUnknownVtbl *)vtbl->Vtbl, count ))
+      return RPC_E_UNEXPECTED;
+  }
+
+  if (ProxyInfo->pDelegatedIIDs && ProxyInfo->pDelegatedIIDs[Index]) {
+    ULONG count = ProxyInfo->pStubVtblList[Index]->header.DispatchTableCount;
+
+    if (count < 3 || count > NB_THUNK_ENTRIES)
+      return RPC_E_UNEXPECTED;
   }
 
   if (!IsEqualGUID(vtbl->header.piid, riid)) {

@@ -1543,6 +1543,210 @@ static void test_ChannelBufferRefCount(IPSFactoryBuffer *ppsf)
     ok(!stubMessage.pRpcChannelBuffer, "dangling pRpcChannelBuffer = %p\n", stubMessage.pRpcChannelBuffer);
 }
 
+struct malformed_typelib
+{
+    ITypeLib ITypeLib_iface;
+    LONG refcount;
+    TLIBATTR attr;
+};
+
+struct malformed_typeinfo
+{
+    ITypeInfo ITypeInfo_iface;
+    LONG refcount;
+    TYPEATTR attr;
+    ITypeLib *typelib;
+};
+
+static struct malformed_typelib *malformed_typelib_from_iface(ITypeLib *iface)
+{
+    return CONTAINING_RECORD(iface, struct malformed_typelib, ITypeLib_iface);
+}
+
+static struct malformed_typeinfo *malformed_typeinfo_from_iface(ITypeInfo *iface)
+{
+    return CONTAINING_RECORD(iface, struct malformed_typeinfo, ITypeInfo_iface);
+}
+
+static HRESULT WINAPI malformed_typelib_QueryInterface(ITypeLib *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_ITypeLib))
+    {
+        *out = iface;
+        ITypeLib_AddRef(iface);
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI malformed_typelib_AddRef(ITypeLib *iface)
+{
+    struct malformed_typelib *typelib = malformed_typelib_from_iface(iface);
+    return InterlockedIncrement(&typelib->refcount);
+}
+
+static ULONG WINAPI malformed_typelib_Release(ITypeLib *iface)
+{
+    struct malformed_typelib *typelib = malformed_typelib_from_iface(iface);
+    return InterlockedDecrement(&typelib->refcount);
+}
+
+static HRESULT WINAPI malformed_typelib_GetLibAttr(ITypeLib *iface, TLIBATTR **attr)
+{
+    struct malformed_typelib *typelib = malformed_typelib_from_iface(iface);
+    *attr = &typelib->attr;
+    return S_OK;
+}
+
+static void WINAPI malformed_typelib_ReleaseTLibAttr(ITypeLib *iface, TLIBATTR *attr)
+{
+}
+
+static const ITypeLibVtbl malformed_typelib_vtbl =
+{
+    .QueryInterface = malformed_typelib_QueryInterface,
+    .AddRef = malformed_typelib_AddRef,
+    .Release = malformed_typelib_Release,
+    .GetLibAttr = malformed_typelib_GetLibAttr,
+    .ReleaseTLibAttr = malformed_typelib_ReleaseTLibAttr,
+};
+
+static HRESULT WINAPI malformed_typeinfo_QueryInterface(ITypeInfo *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_ITypeInfo))
+    {
+        *out = iface;
+        ITypeInfo_AddRef(iface);
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI malformed_typeinfo_AddRef(ITypeInfo *iface)
+{
+    struct malformed_typeinfo *typeinfo = malformed_typeinfo_from_iface(iface);
+    return InterlockedIncrement(&typeinfo->refcount);
+}
+
+static ULONG WINAPI malformed_typeinfo_Release(ITypeInfo *iface)
+{
+    struct malformed_typeinfo *typeinfo = malformed_typeinfo_from_iface(iface);
+    return InterlockedDecrement(&typeinfo->refcount);
+}
+
+static HRESULT WINAPI malformed_typeinfo_GetTypeAttr(ITypeInfo *iface, TYPEATTR **attr)
+{
+    struct malformed_typeinfo *typeinfo = malformed_typeinfo_from_iface(iface);
+    *attr = &typeinfo->attr;
+    return S_OK;
+}
+
+static HRESULT WINAPI malformed_typeinfo_GetContainingTypeLib(ITypeInfo *iface,
+        ITypeLib **typelib, UINT *index)
+{
+    struct malformed_typeinfo *typeinfo = malformed_typeinfo_from_iface(iface);
+    *typelib = typeinfo->typelib;
+    ITypeLib_AddRef(*typelib);
+    if (index) *index = 0;
+    return S_OK;
+}
+
+static void WINAPI malformed_typeinfo_ReleaseTypeAttr(ITypeInfo *iface, TYPEATTR *attr)
+{
+}
+
+static const ITypeInfoVtbl malformed_typeinfo_vtbl =
+{
+    .QueryInterface = malformed_typeinfo_QueryInterface,
+    .AddRef = malformed_typeinfo_AddRef,
+    .Release = malformed_typeinfo_Release,
+    .GetTypeAttr = malformed_typeinfo_GetTypeAttr,
+    .GetContainingTypeLib = malformed_typeinfo_GetContainingTypeLib,
+    .ReleaseTypeAttr = malformed_typeinfo_ReleaseTypeAttr,
+};
+
+static void test_malformed_typelib_vtable(void)
+{
+    static const struct
+    {
+        const char *name;
+        SYSKIND syskind;
+        WORD funcs;
+        WORD size;
+    }
+    tests[] =
+    {
+        {"no inherited methods", SYS_WIN32, 0, 0},
+        {"one inherited method", SYS_WIN32, 0, 4},
+        {"two inherited methods", SYS_WIN32, 2, 16},
+        {"more functions than slots", SYS_WIN32, 4, 12},
+        {"misaligned vtable size", SYS_WIN32, 0, 13},
+        {"unsupported vtable size", SYS_WIN32, 0, 4096},
+        {"64-bit two inherited methods", SYS_WIN64, 2, 32},
+        {"64-bit misaligned vtable size", SYS_WIN64, 0, 25},
+    };
+    struct malformed_typelib typelib;
+    struct malformed_typeinfo typeinfo;
+    IRpcProxyBuffer *proxy;
+    IRpcStubBuffer *stub;
+    HRESULT (WINAPI *pCreateProxyFromTypeInfo)(ITypeInfo *, IUnknown *, REFIID,
+            IRpcProxyBuffer **, void **);
+    HRESULT (WINAPI *pCreateStubFromTypeInfo)(ITypeInfo *, REFIID, IUnknown *,
+            IRpcStubBuffer **);
+    HMODULE rpcrt4;
+    unsigned int i;
+    HRESULT hr;
+    void *obj;
+
+    if (!winetest_platform_is_wine)
+    {
+        skip("Wine-specific malformed typelib hardening tests.\n");
+        return;
+    }
+
+    rpcrt4 = GetModuleHandleA("rpcrt4.dll");
+    pCreateProxyFromTypeInfo = (void *)GetProcAddress(rpcrt4, "CreateProxyFromTypeInfo");
+    pCreateStubFromTypeInfo = (void *)GetProcAddress(rpcrt4, "CreateStubFromTypeInfo");
+    ok(!!pCreateProxyFromTypeInfo, "CreateProxyFromTypeInfo is unavailable.\n");
+    ok(!!pCreateStubFromTypeInfo, "CreateStubFromTypeInfo is unavailable.\n");
+    if (!pCreateProxyFromTypeInfo || !pCreateStubFromTypeInfo) return;
+
+    memset(&typelib, 0, sizeof(typelib));
+    typelib.ITypeLib_iface.lpVtbl = &malformed_typelib_vtbl;
+    typelib.refcount = 1;
+
+    memset(&typeinfo, 0, sizeof(typeinfo));
+    typeinfo.ITypeInfo_iface.lpVtbl = &malformed_typeinfo_vtbl;
+    typeinfo.refcount = 1;
+    typeinfo.attr.typekind = TKIND_INTERFACE;
+    typeinfo.typelib = &typelib.ITypeLib_iface;
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        typelib.attr.syskind = tests[i].syskind;
+        typeinfo.attr.cFuncs = tests[i].funcs;
+        typeinfo.attr.cbSizeVft = tests[i].size;
+
+        proxy = NULL;
+        obj = NULL;
+        hr = pCreateProxyFromTypeInfo(&typeinfo.ITypeInfo_iface, NULL, &IID_IUnknown, &proxy, &obj);
+        ok(hr == E_INVALIDARG, "%s: CreateProxyFromTypeInfo returned %#lx.\n", tests[i].name, hr);
+        ok(!proxy, "%s: unexpected proxy %p.\n", tests[i].name, proxy);
+        ok(!obj, "%s: unexpected object %p.\n", tests[i].name, obj);
+
+        stub = NULL;
+        hr = pCreateStubFromTypeInfo(&typeinfo.ITypeInfo_iface, &IID_IUnknown, NULL, &stub);
+        ok(hr == E_INVALIDARG, "%s: CreateStubFromTypeInfo returned %#lx.\n", tests[i].name, hr);
+        ok(!stub, "%s: unexpected stub %p.\n", tests[i].name, stub);
+        ok(typeinfo.refcount == 1, "%s: typeinfo refcount is %ld.\n",
+                tests[i].name, typeinfo.refcount);
+        ok(typelib.refcount == 1, "%s: typelib refcount is %ld.\n",
+                tests[i].name, typelib.refcount);
+    }
+}
+
 START_TEST( cstub )
 {
     IPSFactoryBuffer *ppsf;
@@ -1569,6 +1773,7 @@ START_TEST( cstub )
     test_NdrDllRegisterProxy();
     test_delegated_methods();
     test_ChannelBufferRefCount(ppsf);
+    test_malformed_typelib_vtable();
 
     OleUninitialize();
 }
