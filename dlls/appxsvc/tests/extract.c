@@ -52,6 +52,7 @@ struct fake_file
 {
     APPX_PACKAGE_FILE view;
     const BYTE *data;
+    const BYTE *expected_data;
     UINT64 data_size;
     UINT32 chunk_size;
     HRESULT terminal_hr;
@@ -68,6 +69,8 @@ struct appx_package_inspection
     LONG streams_opened;
     LONG streams_closed;
     LONG streams_cancelled;
+    LONG validations_opened;
+    LONG validations_closed;
 };
 
 struct wine_appx_archive_stream
@@ -76,6 +79,14 @@ struct wine_appx_archive_stream
     struct fake_file *file;
     UINT64 offset;
     LONG cancelled;
+};
+
+struct fake_validation
+{
+    struct appx_package_inspection *inspection;
+    struct fake_file *file;
+    UINT64 offset;
+    BOOL active;
 };
 
 struct test_directory
@@ -237,6 +248,77 @@ static void WINAPI fake_source_close_stream( void *opaque )
     HeapFree( GetProcessHeap(), 0, stream );
 }
 
+static HRESULT WINAPI fake_source_open_validation(
+    const void *source, void **result )
+{
+    struct appx_package_inspection *inspection =
+        (struct appx_package_inspection *)source;
+    struct fake_validation *validation;
+
+    if (!inspection || !result) return E_INVALIDARG;
+    *result = NULL;
+    if (!(validation = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                  sizeof(*validation) )))
+        return E_OUTOFMEMORY;
+    validation->inspection = inspection;
+    InterlockedIncrement( &inspection->validations_opened );
+    *result = validation;
+    return S_OK;
+}
+
+static HRESULT WINAPI fake_source_begin_file(
+    void *opaque, UINT32 file_index )
+{
+    struct fake_validation *validation = opaque;
+
+    if (!validation || validation->active ||
+        file_index >= validation->inspection->count)
+        return E_INVALIDARG;
+    validation->file = &validation->inspection->files[file_index];
+    validation->offset = 0;
+    validation->active = TRUE;
+    return S_OK;
+}
+
+static HRESULT WINAPI fake_source_validate_data(
+    void *opaque, const void *data, UINT32 size )
+{
+    struct fake_validation *validation = opaque;
+
+    if (!validation || !validation->active || (!data && size))
+        return E_INVALIDARG;
+    if (validation->offset > validation->file->data_size ||
+        size > validation->file->data_size - validation->offset)
+        return APPX_E_CORRUPT_CONTENT;
+    if (size && (!validation->file->expected_data ||
+        memcmp( data, validation->file->expected_data + validation->offset,
+                size )))
+        return APPX_E_BLOCK_HASH_INVALID;
+    validation->offset += size;
+    return S_OK;
+}
+
+static HRESULT WINAPI fake_source_finish_file( void *opaque )
+{
+    struct fake_validation *validation = opaque;
+
+    if (!validation || !validation->active) return E_INVALIDARG;
+    if (validation->offset != validation->file->data_size)
+        return APPX_E_CORRUPT_CONTENT;
+    validation->file = NULL;
+    validation->active = FALSE;
+    return S_OK;
+}
+
+static void WINAPI fake_source_close_validation( void *opaque )
+{
+    struct fake_validation *validation = opaque;
+
+    if (!validation) return;
+    InterlockedIncrement( &validation->inspection->validations_closed );
+    HeapFree( GetProcessHeap(), 0, validation );
+}
+
 static const APPX_EXTRACT_TEST_SOURCE fake_source_ops =
 {
     sizeof(fake_source_ops),
@@ -246,7 +328,12 @@ static const APPX_EXTRACT_TEST_SOURCE fake_source_ops =
     fake_source_open_stream,
     fake_source_read_stream,
     fake_source_cancel_stream,
-    fake_source_close_stream
+    fake_source_close_stream,
+    fake_source_open_validation,
+    fake_source_begin_file,
+    fake_source_validate_data,
+    fake_source_finish_file,
+    fake_source_close_validation
 };
 
 static HRESULT extract_fake( const struct appx_package_inspection *inspection,
@@ -300,6 +387,7 @@ static void add_fake_file( struct appx_package_inspection *inspection,
     file->view.compressed_size = declared_size;
     file->view.uncompressed_size = declared_size;
     file->data = data;
+    file->expected_data = data;
     file->data_size = data_size;
     file->chunk_size = chunk_size;
     file->terminal_hr = S_FALSE;
@@ -619,6 +707,10 @@ static void test_basic_streaming_and_attributes( void )
         "opened %ld streams.\n", inspection.streams_opened );
     ok( inspection.streams_closed == 3,
         "closed %ld streams.\n", inspection.streams_closed );
+    ok( inspection.validations_opened == 1,
+        "opened %ld validation contexts.\n", inspection.validations_opened );
+    ok( inspection.validations_closed == 1,
+        "closed %ld validation contexts.\n", inspection.validations_closed );
     ok( write_calls > 3, "only %ld writes were issued.\n", write_calls );
     ok( flush_file_calls == 3, "got %ld file flushes.\n",
         flush_file_calls );
@@ -649,6 +741,40 @@ static void test_basic_streaming_and_attributes( void )
     append_path( path, L"Assets\\empty.dat" );
     ok( read_file_data( path, buffer, sizeof(buffer), &size ) && !size,
         "empty file size is %lu, error %lu.\n", size, GetLastError() );
+    close_directory( &staging );
+}
+
+static void test_stream_validation_failure( void )
+{
+    static const BYTE data[] = "abcdef";
+    static const BYTE expected[] = "abcxef";
+    struct appx_package_inspection inspection;
+    struct test_directory staging;
+    APPX_EXTRACT_TEST_IO io = default_test_io();
+    HRESULT hr;
+
+    reset_hooks();
+    init_inspection( &inspection );
+    add_fake_file( &inspection, L"payload.bin", data,
+                   sizeof(data) - 1, sizeof(data) - 1, 3 );
+    inspection.files[0].expected_data = expected;
+    ok( create_unique_directory( &staging ),
+        "failed to create validation staging directory.\n" );
+    if (staging.handle == INVALID_HANDLE_VALUE) return;
+
+    hr = extract_fake( &inspection, staging.handle, NULL, &io );
+    ok( hr == APPX_E_BLOCK_HASH_INVALID,
+        "mismatched streamed validation returned %#lx.\n", hr );
+    ok( directory_is_empty( staging.path ),
+        "mismatched streamed validation left staging entries.\n" );
+    ok( inspection.streams_opened == 1 &&
+        inspection.streams_closed == 1,
+        "validation stream leak: opened %ld, closed %ld.\n",
+        inspection.streams_opened, inspection.streams_closed );
+    ok( inspection.validations_opened == 1 &&
+        inspection.validations_closed == 1,
+        "validation context leak: opened %ld, closed %ld.\n",
+        inspection.validations_opened, inspection.validations_closed );
     close_directory( &staging );
 }
 
@@ -1330,6 +1456,12 @@ static void test_options_and_durability( void )
     hr = p_appx_package_extract_with_test_source(
         &inspection, &source_ops, staging.handle, NULL, NULL );
     ok( hr == E_INVALIDARG, "missing source callback returned %#lx.\n", hr );
+    source_ops = fake_source_ops;
+    source_ops.validate_data = NULL;
+    hr = p_appx_package_extract_with_test_source(
+        &inspection, &source_ops, staging.handle, NULL, NULL );
+    ok( hr == E_INVALIDARG,
+        "missing validation callback returned %#lx.\n", hr );
     inspection.count = 65537;
     hr = p_appx_package_extract_with_test_source(
         &inspection, &fake_source_ops, staging.handle, NULL, NULL );
@@ -1409,6 +1541,7 @@ START_TEST(extract)
     ok( p_appx_package_extract( NULL, NULL, NULL ) == E_INVALIDARG,
         "NULL inspection was accepted.\n" );
     test_basic_streaming_and_attributes();
+    test_stream_validation_failure();
     test_terminal_verification_and_failures();
     test_plan_validation();
     test_quota_and_free_space();

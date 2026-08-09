@@ -51,12 +51,14 @@ struct appx_package_inspection
 {
     WINE_APPX_ARCHIVE *archive;
     APPX_MANIFEST *manifest;
+    APPX_BLOCK_MAP *block_map;
     APPX_PACKAGE_FILE *files;
     UINT32 file_count;
     UINT64 expanded_size;
     UINT64 archive_expanded_size;
     BYTE content_id[APPX_PACKAGE_CONTENT_ID_SIZE];
     BYTE signer_id[APPX_PACKAGE_SIGNER_ID_SIZE];
+    BOOL payload_validated;
 };
 
 static HRESULT check_cancel_event( HANDLE cancel_event )
@@ -74,18 +76,29 @@ static HRESULT check_cancel_event( HANDLE cancel_event )
 
 struct stream_cancel_monitor
 {
+    CRITICAL_SECTION cs;
     WINE_APPX_ARCHIVE_STREAM *stream;
     HANDLE cancel_event;
     HANDLE done_event;
     HANDLE thread;
     LONG cancelled;
     LONG status;
+    BOOL initialized;
 };
 
 static void stream_cancel_monitor_record( struct stream_cancel_monitor *monitor,
                                           HRESULT hr )
 {
     InterlockedCompareExchange( &monitor->status, hr, S_OK );
+}
+
+static void stream_cancel_monitor_cancel_stream(
+    struct stream_cancel_monitor *monitor )
+{
+    EnterCriticalSection( &monitor->cs );
+    if (monitor->stream)
+        wine_appx_archive_stream_cancel( monitor->stream );
+    LeaveCriticalSection( &monitor->cs );
 }
 
 static DWORD WINAPI stream_cancel_monitor_proc( void *parameter )
@@ -97,45 +110,84 @@ static DWORD WINAPI stream_cancel_monitor_proc( void *parameter )
     if (wait == WAIT_OBJECT_0)
     {
         InterlockedExchange( &monitor->cancelled, 1 );
-        wine_appx_archive_stream_cancel( monitor->stream );
+        stream_cancel_monitor_cancel_stream( monitor );
     }
     else if (wait == WAIT_FAILED)
     {
         stream_cancel_monitor_record(
             monitor, HRESULT_FROM_WIN32(GetLastError()) );
-        wine_appx_archive_stream_cancel( monitor->stream );
+        stream_cancel_monitor_cancel_stream( monitor );
     }
     else if (wait != WAIT_OBJECT_0 + 1)
     {
         stream_cancel_monitor_record( monitor, E_FAIL );
-        wine_appx_archive_stream_cancel( monitor->stream );
+        stream_cancel_monitor_cancel_stream( monitor );
     }
     return 0;
 }
 
 static HRESULT stream_cancel_monitor_start(
-    struct stream_cancel_monitor *monitor, WINE_APPX_ARCHIVE_STREAM *stream,
-    HANDLE cancel_event )
+    struct stream_cancel_monitor *monitor, HANDLE cancel_event )
 {
     HRESULT hr;
 
     memset( monitor, 0, sizeof(*monitor) );
-    monitor->stream = stream;
+    InitializeCriticalSection( &monitor->cs );
+    monitor->initialized = TRUE;
     monitor->cancel_event = cancel_event;
     monitor->status = S_OK;
     if (!cancel_event) return S_OK;
-    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
+    if (FAILED(hr = check_cancel_event( cancel_event ))) goto failed;
     if (!(monitor->done_event = CreateEventW( NULL, TRUE, FALSE, NULL )))
-        return HRESULT_FROM_WIN32( GetLastError() );
+    {
+        hr = HRESULT_FROM_WIN32( GetLastError() );
+        goto failed;
+    }
     if (!(monitor->thread = CreateThread( NULL, 0, stream_cancel_monitor_proc,
                                           monitor, 0, NULL )))
     {
         hr = HRESULT_FROM_WIN32( GetLastError() );
-        CloseHandle( monitor->done_event );
-        monitor->done_event = NULL;
-        return hr;
+        goto failed;
     }
     return S_OK;
+
+failed:
+    if (monitor->done_event) CloseHandle( monitor->done_event );
+    DeleteCriticalSection( &monitor->cs );
+    memset( monitor, 0, sizeof(*monitor) );
+    return hr;
+}
+
+static HRESULT stream_cancel_monitor_set_stream(
+    struct stream_cancel_monitor *monitor, WINE_APPX_ARCHIVE_STREAM *stream )
+{
+    HRESULT hr;
+
+    if (!monitor->initialized || !stream) return E_INVALIDARG;
+    EnterCriticalSection( &monitor->cs );
+    if (monitor->stream)
+    {
+        LeaveCriticalSection( &monitor->cs );
+        return E_UNEXPECTED;
+    }
+    monitor->stream = stream;
+    if (InterlockedCompareExchange( &monitor->cancelled, 0, 0 ) ||
+        FAILED(InterlockedCompareExchange( &monitor->status, S_OK, S_OK )))
+        wine_appx_archive_stream_cancel( stream );
+    LeaveCriticalSection( &monitor->cs );
+    hr = InterlockedCompareExchange( &monitor->status, S_OK, S_OK );
+    if (FAILED(hr)) return hr;
+    return InterlockedCompareExchange( &monitor->cancelled, 0, 0 ) ?
+           HRESULT_FROM_WIN32( ERROR_CANCELLED ) : S_OK;
+}
+
+static void stream_cancel_monitor_clear_stream(
+    struct stream_cancel_monitor *monitor, WINE_APPX_ARCHIVE_STREAM *stream )
+{
+    if (!monitor->initialized) return;
+    EnterCriticalSection( &monitor->cs );
+    if (monitor->stream == stream) monitor->stream = NULL;
+    LeaveCriticalSection( &monitor->cs );
 }
 
 static HRESULT stream_cancel_monitor_check(
@@ -152,12 +204,12 @@ static HRESULT stream_cancel_monitor_check(
     if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED))
     {
         InterlockedExchange( &monitor->cancelled, 1 );
-        wine_appx_archive_stream_cancel( monitor->stream );
+        stream_cancel_monitor_cancel_stream( monitor );
     }
     else if (FAILED(hr))
     {
         stream_cancel_monitor_record( monitor, hr );
-        wine_appx_archive_stream_cancel( monitor->stream );
+        stream_cancel_monitor_cancel_stream( monitor );
     }
     return hr;
 }
@@ -168,25 +220,32 @@ static HRESULT stream_cancel_monitor_finish(
     HRESULT status;
     DWORD wait;
 
-    if (!monitor->thread) return hr;
-    if (!SetEvent( monitor->done_event ))
-        stream_cancel_monitor_record(
-            monitor, HRESULT_FROM_WIN32(GetLastError()) );
-    wait = WaitForSingleObject( monitor->thread, INFINITE );
-    if (wait == WAIT_FAILED)
-        stream_cancel_monitor_record(
-            monitor, HRESULT_FROM_WIN32(GetLastError()) );
-    else if (wait != WAIT_OBJECT_0)
-        stream_cancel_monitor_record( monitor, E_FAIL );
-    CloseHandle( monitor->thread );
-    CloseHandle( monitor->done_event );
-    monitor->thread = NULL;
-    monitor->done_event = NULL;
+    if (!monitor->initialized) return hr;
+    if (monitor->thread)
+    {
+        if (!SetEvent( monitor->done_event ))
+            stream_cancel_monitor_record(
+                monitor, HRESULT_FROM_WIN32(GetLastError()) );
+        wait = WaitForSingleObject( monitor->thread, INFINITE );
+        if (wait == WAIT_FAILED)
+            stream_cancel_monitor_record(
+                monitor, HRESULT_FROM_WIN32(GetLastError()) );
+        else if (wait != WAIT_OBJECT_0)
+            stream_cancel_monitor_record( monitor, E_FAIL );
+        CloseHandle( monitor->thread );
+        CloseHandle( monitor->done_event );
+    }
 
     if (InterlockedCompareExchange( &monitor->cancelled, 0, 0 ))
-        return HRESULT_FROM_WIN32( ERROR_CANCELLED );
-    status = InterlockedCompareExchange( &monitor->status, S_OK, S_OK );
-    return FAILED(status) ? status : hr;
+        hr = HRESULT_FROM_WIN32( ERROR_CANCELLED );
+    else
+    {
+        status = InterlockedCompareExchange( &monitor->status, S_OK, S_OK );
+        if (FAILED(status)) hr = status;
+    }
+    DeleteCriticalSection( &monitor->cs );
+    memset( monitor, 0, sizeof(*monitor) );
+    return hr;
 }
 
 struct hash_engine
@@ -194,6 +253,18 @@ struct hash_engine
     BCRYPT_ALG_HANDLE algorithm;
     BCRYPT_HASH_HANDLE block;
     BCRYPT_HASH_HANDLE file;
+};
+
+struct appx_package_validation
+{
+    const APPX_PACKAGE_INSPECTION *inspection;
+    struct hash_engine engine;
+    const APPX_BLOCK_MAP_FILE *file;
+    UINT64 total;
+    UINT32 file_index;
+    UINT32 block_index;
+    UINT32 block_offset;
+    BOOL active;
 };
 
 static BOOL equal_path( const WCHAR *left, const WCHAR *right )
@@ -320,8 +391,8 @@ static HRESULT read_entry( WINE_APPX_ARCHIVE *archive, const WCHAR *path,
         return E_OUTOFMEMORY;
     if (FAILED(hr = wine_appx_archive_stream_open( archive, index, &stream )))
         goto done;
-    if (FAILED(hr = stream_cancel_monitor_start( &monitor, stream,
-                                                  cancel_event )))
+    if (FAILED(hr = stream_cancel_monitor_start( &monitor, cancel_event )) ||
+        FAILED(hr = stream_cancel_monitor_set_stream( &monitor, stream )))
         goto done;
 
     while (offset < entry.uncompressed_size)
@@ -367,6 +438,8 @@ static HRESULT read_entry( WINE_APPX_ARCHIVE *archive, const WCHAR *path,
     hr = S_OK;
 
 done:
+    stream_cancel_monitor_clear_stream( &monitor, stream );
+    if (stream) wine_appx_archive_stream_close( stream );
     hr = stream_cancel_monitor_finish( &monitor, hr );
     if (SUCCEEDED(hr))
     {
@@ -374,7 +447,6 @@ done:
         *size = (UINT32)entry.uncompressed_size;
         buffer = NULL;
     }
-    if (stream) wine_appx_archive_stream_close( stream );
     HeapFree( GetProcessHeap(), 0, buffer );
     return hr;
 }
@@ -425,16 +497,159 @@ static HRESULT finish_hash( BCRYPT_HASH_HANDLE hash,
     return status ? HRESULT_FROM_NT( status ) : S_OK;
 }
 
+static HRESULT validation_finish_complete_blocks(
+    APPX_PACKAGE_VALIDATION *validation )
+{
+    BYTE digest[APPX_BLOCK_MAP_HASH_SIZE];
+    const APPX_BLOCK_MAP_BLOCK *block;
+    HRESULT hr;
+
+    while (validation->block_index < validation->file->block_count)
+    {
+        block = appx_block_map_get_block(
+            validation->inspection->block_map, validation->file_index,
+            validation->block_index );
+        if (!block) return APPX_E_INVALID_BLOCKMAP;
+        if (validation->block_offset != block->logical_size) return S_OK;
+        if (FAILED(hr = finish_hash( validation->engine.block, digest )))
+            return hr;
+        if (!constant_equal( digest, block->hash, sizeof(digest) ))
+            return APPX_E_BLOCK_HASH_INVALID;
+        validation->block_index++;
+        validation->block_offset = 0;
+    }
+    return S_OK;
+}
+
+HRESULT WINAPI appx_package_inspection_open_validation(
+    const APPX_PACKAGE_INSPECTION *inspection,
+    APPX_PACKAGE_VALIDATION **result )
+{
+    APPX_PACKAGE_VALIDATION *validation;
+    HRESULT hr;
+
+    if (!result) return E_INVALIDARG;
+    *result = NULL;
+    if (!inspection || !inspection->block_map) return E_INVALIDARG;
+    if (!(validation = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                  sizeof(*validation) )))
+        return E_OUTOFMEMORY;
+    validation->inspection = inspection;
+    if (FAILED(hr = hash_engine_open( &validation->engine )))
+    {
+        HeapFree( GetProcessHeap(), 0, validation );
+        return hr;
+    }
+    *result = validation;
+    return S_OK;
+}
+
+HRESULT WINAPI appx_package_validation_begin_file(
+    APPX_PACKAGE_VALIDATION *validation, UINT32 file_index )
+{
+    const APPX_PACKAGE_FILE *file;
+
+    if (!validation || validation->active ||
+        file_index >= validation->inspection->file_count)
+        return E_INVALIDARG;
+    file = validation->inspection->files + file_index;
+    validation->file = appx_block_map_get_file(
+        validation->inspection->block_map, file_index );
+    if (!validation->file ||
+        !exact_path( validation->file->name, file->path ) ||
+        validation->file->size != file->uncompressed_size)
+        return E_INVALIDARG;
+    validation->total = 0;
+    validation->file_index = file_index;
+    validation->block_index = 0;
+    validation->block_offset = 0;
+    validation->active = TRUE;
+    return validation_finish_complete_blocks( validation );
+}
+
+HRESULT WINAPI appx_package_validation_update(
+    APPX_PACKAGE_VALIDATION *validation, const void *data, UINT32 size )
+{
+    const BYTE *cursor = data;
+    HRESULT hr;
+
+    if (!validation || !validation->active || (!data && size))
+        return E_INVALIDARG;
+    if (validation->total > validation->file->size ||
+        size > validation->file->size - validation->total)
+        return APPX_E_CORRUPT_CONTENT;
+    while (size)
+    {
+        const APPX_BLOCK_MAP_BLOCK *block;
+        UINT32 count, remaining;
+
+        if (FAILED(hr = validation_finish_complete_blocks( validation )))
+            return hr;
+        if (validation->block_index >= validation->file->block_count ||
+            !(block = appx_block_map_get_block(
+                validation->inspection->block_map, validation->file_index,
+                validation->block_index )) ||
+            validation->block_offset >= block->logical_size)
+            return APPX_E_INVALID_BLOCKMAP;
+        remaining = block->logical_size - validation->block_offset;
+        count = size < remaining ? size : remaining;
+        if (FAILED(hr = hash_data( validation->engine.block,
+                                    cursor, count )) ||
+            (validation->file->has_file_hash &&
+             FAILED(hr = hash_data( validation->engine.file,
+                                     cursor, count ))))
+            return hr;
+        validation->total += count;
+        validation->block_offset += count;
+        cursor += count;
+        size -= count;
+    }
+    return validation_finish_complete_blocks( validation );
+}
+
+HRESULT WINAPI appx_package_validation_finish_file(
+    APPX_PACKAGE_VALIDATION *validation )
+{
+    BYTE digest[APPX_BLOCK_MAP_HASH_SIZE];
+    HRESULT hr;
+
+    if (!validation || !validation->active) return E_INVALIDARG;
+    if (FAILED(hr = validation_finish_complete_blocks( validation )))
+        return hr;
+    if (validation->block_index != validation->file->block_count ||
+        validation->total != validation->file->size)
+        return APPX_E_CORRUPT_CONTENT;
+    if (validation->file->has_file_hash)
+    {
+        if (FAILED(hr = finish_hash( validation->engine.file, digest )))
+            return hr;
+        if (!constant_equal( digest, validation->file->file_hash,
+                              sizeof(digest) ))
+            return APPX_E_BLOCK_HASH_INVALID;
+    }
+    validation->active = FALSE;
+    validation->file = NULL;
+    return S_OK;
+}
+
+void WINAPI appx_package_validation_close(
+    APPX_PACKAGE_VALIDATION *validation )
+{
+    if (!validation) return;
+    hash_engine_close( &validation->engine );
+    HeapFree( GetProcessHeap(), 0, validation );
+}
+
 static HRESULT reconcile_entry( const APPX_BLOCK_MAP *map, UINT32 file_index,
                                 const APPX_BLOCK_MAP_FILE *file,
                                 const WINE_APPX_ARCHIVE_ENTRY *entry,
-                                HANDLE cancel_event )
+                                struct stream_cancel_monitor *monitor )
 {
     UINT64 local_header_size, compressed_blocks = 0;
     UINT32 i;
     HRESULT hr;
 
-    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
+    if (FAILED(hr = stream_cancel_monitor_check( monitor ))) return hr;
     if (entry->flags & WINE_APPX_ENTRY_DIRECTORY)
         return APPX_E_INVALID_PACKAGING_LAYOUT;
     if (entry->uncompressed_size != file->size ||
@@ -453,7 +668,7 @@ static HRESULT reconcile_entry( const APPX_BLOCK_MAP *map, UINT32 file_index,
             const APPX_BLOCK_MAP_BLOCK *block =
                 appx_block_map_get_block( map, file_index, i );
 
-            if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
+            if (FAILED(hr = stream_cancel_monitor_check( monitor ))) return hr;
             if (!block || block->has_compressed_size)
                 return APPX_E_FILE_COMPRESSION_MISMATCH;
         }
@@ -467,7 +682,7 @@ static HRESULT reconcile_entry( const APPX_BLOCK_MAP *map, UINT32 file_index,
         const APPX_BLOCK_MAP_BLOCK *block =
             appx_block_map_get_block( map, file_index, i );
 
-        if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
+        if (FAILED(hr = stream_cancel_monitor_check( monitor ))) return hr;
         if (!block || !block->has_compressed_size ||
             compressed_blocks > ~(UINT64)0 - block->compressed_size)
             return APPX_E_FILE_COMPRESSION_MISMATCH;
@@ -485,20 +700,17 @@ static HRESULT verify_file_stream( WINE_APPX_ARCHIVE *archive,
                                    UINT32 file_index, UINT32 archive_index,
                                    const APPX_BLOCK_MAP_FILE *file,
                                    struct hash_engine *engine,
-                                   HANDLE cancel_event )
+                                   struct stream_cancel_monitor *monitor )
 {
     WINE_APPX_ARCHIVE_STREAM *stream = NULL;
-    struct stream_cancel_monitor monitor;
     BYTE buffer[APPX_BLOCK_MAP_BLOCK_SIZE], digest[APPX_BLOCK_MAP_HASH_SIZE];
     UINT32 i;
     HRESULT hr;
 
-    memset( &monitor, 0, sizeof(monitor) );
-    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
+    if (FAILED(hr = stream_cancel_monitor_check( monitor ))) return hr;
     if (FAILED(hr = wine_appx_archive_stream_open( archive, archive_index, &stream )))
         return hr;
-    if (FAILED(hr = stream_cancel_monitor_start( &monitor, stream,
-                                                  cancel_event )))
+    if (FAILED(hr = stream_cancel_monitor_set_stream( monitor, stream )))
         goto done;
 
     for (i = 0; i < file->block_count; i++)
@@ -507,7 +719,7 @@ static HRESULT verify_file_stream( WINE_APPX_ARCHIVE *archive,
             appx_block_map_get_block( map, file_index, i );
         UINT32 offset = 0;
 
-        if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) goto done;
+        if (FAILED(hr = stream_cancel_monitor_check( monitor ))) goto done;
         if (!block)
         {
             hr = APPX_E_INVALID_BLOCKMAP;
@@ -518,10 +730,10 @@ static HRESULT verify_file_stream( WINE_APPX_ARCHIVE *archive,
             UINT32 read = 0, remaining = block->logical_size - offset;
             HRESULT cancel_hr;
 
-            if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) goto done;
+            if (FAILED(hr = stream_cancel_monitor_check( monitor ))) goto done;
             hr = wine_appx_archive_stream_read( stream, buffer + offset,
                                                 remaining, &read );
-            if (FAILED(cancel_hr = stream_cancel_monitor_check( &monitor )))
+            if (FAILED(cancel_hr = stream_cancel_monitor_check( monitor )))
             {
                 hr = cancel_hr;
                 goto done;
@@ -538,7 +750,7 @@ static HRESULT verify_file_stream( WINE_APPX_ARCHIVE *archive,
                 goto done;
             offset += read;
         }
-        if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) goto done;
+        if (FAILED(hr = stream_cancel_monitor_check( monitor ))) goto done;
         if (FAILED(hr = finish_hash( engine->block, digest ))) goto done;
         if (!constant_equal( digest, block->hash, sizeof(digest) ))
         {
@@ -550,9 +762,9 @@ static HRESULT verify_file_stream( WINE_APPX_ARCHIVE *archive,
         UINT32 read = 0;
         HRESULT cancel_hr;
 
-        if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) goto done;
+        if (FAILED(hr = stream_cancel_monitor_check( monitor ))) goto done;
         hr = wine_appx_archive_stream_read( stream, buffer, 1, &read );
-        if (FAILED(cancel_hr = stream_cancel_monitor_check( &monitor )))
+        if (FAILED(cancel_hr = stream_cancel_monitor_check( monitor )))
         {
             hr = cancel_hr;
             goto done;
@@ -565,7 +777,7 @@ static HRESULT verify_file_stream( WINE_APPX_ARCHIVE *archive,
     }
     if (file->has_file_hash)
     {
-        if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) goto done;
+        if (FAILED(hr = stream_cancel_monitor_check( monitor ))) goto done;
         if (FAILED(hr = finish_hash( engine->file, digest ))) goto done;
         if (!constant_equal( digest, file->file_hash, sizeof(digest) ))
         {
@@ -576,7 +788,7 @@ static HRESULT verify_file_stream( WINE_APPX_ARCHIVE *archive,
     hr = S_OK;
 
 done:
-    hr = stream_cancel_monitor_finish( &monitor, hr );
+    stream_cancel_monitor_clear_stream( monitor, stream );
     wine_appx_archive_stream_close( stream );
     return hr;
 }
@@ -611,21 +823,21 @@ static HRESULT validate_content_type_coverage( WINE_APPX_ARCHIVE *archive,
                                                const APPX_CONTENT_TYPES *types,
                                                APPX_PACKAGE_FILE *const *mapped,
                                                UINT32 mapped_count,
-                                               HANDLE cancel_event )
+                                               struct stream_cancel_monitor *monitor )
 {
     WINE_APPX_ARCHIVE_ENTRY entry;
     WCHAR *path = NULL, *part = NULL;
     UINT32 count, i, j, length;
     HRESULT hr;
 
-    if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
+    if (FAILED(hr = stream_cancel_monitor_check( monitor ))) return hr;
     if (FAILED(hr = wine_appx_archive_get_count( archive, &count ))) return hr;
     for (i = 0; i < count; i++)
     {
         const WCHAR *content_type;
         BOOL should_be_mapped;
 
-        if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
+        if (FAILED(hr = stream_cancel_monitor_check( monitor ))) goto done;
         if (FAILED(hr = get_entry_path( archive, i, &entry, &path ))) goto done;
         if (entry.flags & WINE_APPX_ENTRY_DIRECTORY)
         {
@@ -676,7 +888,7 @@ static HRESULT validate_content_type_coverage( WINE_APPX_ARCHIVE *archive,
         part = NULL;
         path = NULL;
     }
-    hr = check_cancel_event( cancel_event );
+    hr = stream_cancel_monitor_check( monitor );
 
 done:
     HeapFree( GetProcessHeap(), 0, part );
@@ -699,9 +911,10 @@ static HRESULT validate_block_map( WINE_APPX_ARCHIVE *archive,
                                    const APPX_CONTENT_TYPES *types,
                                    APPX_PACKAGE_FILE **result_files,
                                    UINT32 *result_count, UINT64 *expanded_size,
-                                   HANDLE cancel_event )
+                                   HANDLE cancel_event, BOOL validate_payload )
 {
     APPX_PACKAGE_FILE **ordered = NULL, *files = NULL;
+    struct stream_cancel_monitor monitor;
     struct hash_engine engine;
     UINT32 count, i;
     UINT64 total = 0;
@@ -710,6 +923,7 @@ static HRESULT validate_block_map( WINE_APPX_ARCHIVE *archive,
     *result_files = NULL;
     *result_count = 0;
     *expanded_size = 0;
+    memset( &monitor, 0, sizeof(monitor) );
     if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     count = appx_block_map_get_file_count( map );
     if (!count || count > APPX_BLOCK_MAP_MAX_FILES ||
@@ -724,6 +938,8 @@ static HRESULT validate_block_map( WINE_APPX_ARCHIVE *archive,
         return E_OUTOFMEMORY;
     }
     if (FAILED(hr = hash_engine_open( &engine ))) goto done;
+    if (FAILED(hr = stream_cancel_monitor_start( &monitor, cancel_event )))
+        goto close_engine;
 
     for (i = 0; i < count; i++)
     {
@@ -732,7 +948,8 @@ static HRESULT validate_block_map( WINE_APPX_ARCHIVE *archive,
         WCHAR *path = NULL;
         UINT32 archive_index;
 
-        if (FAILED(hr = check_cancel_event( cancel_event ))) goto close_engine;
+        if (FAILED(hr = stream_cancel_monitor_check( &monitor )))
+            goto close_engine;
         if (!file || is_block_map_footprint( file->name ) ||
             FAILED(hr = wine_appx_archive_find_entry( archive, file->name,
                                                        &archive_index )) ||
@@ -750,10 +967,10 @@ static HRESULT validate_block_map( WINE_APPX_ARCHIVE *archive,
             hr = APPX_E_INVALID_BLOCKMAP;
             goto close_engine;
         }
-        if (FAILED(hr = reconcile_entry( map, i, file, &entry,
-                                          cancel_event )) ||
-            FAILED(hr = verify_file_stream( archive, map, i, archive_index,
-                                             file, &engine, cancel_event )))
+        if (FAILED(hr = reconcile_entry( map, i, file, &entry, &monitor )) ||
+            ((validate_payload || exact_path( file->name, manifest_path )) &&
+             FAILED(hr = verify_file_stream( archive, map, i, archive_index,
+                                              file, &engine, &monitor ))))
         {
             HeapFree( GetProcessHeap(), 0, path );
             goto close_engine;
@@ -773,12 +990,13 @@ static HRESULT validate_block_map( WINE_APPX_ARCHIVE *archive,
         ordered[i] = files + i;
         total += entry.uncompressed_size;
     }
-    if (FAILED(hr = check_cancel_event( cancel_event ))) goto close_engine;
+    if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) goto close_engine;
     qsort( ordered, count, sizeof(*ordered), compare_package_files );
-    if (FAILED(hr = check_cancel_event( cancel_event ))) goto close_engine;
+    if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) goto close_engine;
     for (i = 1; i < count; i++)
     {
-        if (FAILED(hr = check_cancel_event( cancel_event ))) goto close_engine;
+        if (FAILED(hr = stream_cancel_monitor_check( &monitor )))
+            goto close_engine;
         if (!compare_package_files( ordered + i - 1, ordered + i ))
         {
             hr = APPX_E_INVALID_BLOCKMAP;
@@ -787,10 +1005,10 @@ static HRESULT validate_block_map( WINE_APPX_ARCHIVE *archive,
     }
     if (FAILED(hr = validate_content_type_coverage( archive, types,
                                                     ordered, count,
-                                                    cancel_event )))
+                                                    &monitor )))
         goto close_engine;
 
-    if (FAILED(hr = check_cancel_event( cancel_event ))) goto close_engine;
+    if (FAILED(hr = stream_cancel_monitor_check( &monitor ))) goto close_engine;
     *result_files = files;
     *result_count = count;
     *expanded_size = total;
@@ -798,6 +1016,7 @@ static HRESULT validate_block_map( WINE_APPX_ARCHIVE *archive,
     hr = S_OK;
 
 close_engine:
+    hr = stream_cancel_monitor_finish( &monitor, hr );
     hash_engine_close( &engine );
 done:
     HeapFree( GetProcessHeap(), 0, ordered );
@@ -827,7 +1046,8 @@ HRESULT WINAPI appx_package_inspect_ex(
     if (!result) return E_INVALIDARG;
     *result = NULL;
     if (!file || file == INVALID_HANDLE_VALUE ||
-        (flags & ~APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN))
+        (flags & ~(APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN |
+                   APPX_PACKAGE_INSPECT_DEFER_PAYLOAD_VALIDATION)))
         return E_INVALIDARG;
     if (FAILED(hr = check_cancel_event( cancel_event ))) return hr;
     if (FAILED(hr = wine_appx_archive_open_ex(
@@ -990,11 +1210,10 @@ HRESULT WINAPI appx_package_inspect_ex(
     if (FAILED(hr = appx_signature_get_signer_certificate_id(
         signature, inspection->signer_id, sizeof(inspection->signer_id) )))
         goto done;
-    if (FAILED(hr = validate_block_map( archive, block_map, types,
-                                        &inspection->files,
-                                        &inspection->file_count,
-                                        &inspection->expanded_size,
-                                        cancel_event )))
+    if (FAILED(hr = validate_block_map(
+            archive, block_map, types, &inspection->files,
+            &inspection->file_count, &inspection->expanded_size, cancel_event,
+            !(flags & APPX_PACKAGE_INSPECT_DEFER_PAYLOAD_VALIDATION) )))
     {
         TRACE( "block-map reconciliation failed, hr %#lx.\n", hr );
         goto done;
@@ -1006,8 +1225,12 @@ HRESULT WINAPI appx_package_inspect_ex(
 
     inspection->archive = archive;
     inspection->manifest = manifest;
+    inspection->block_map = block_map;
+    inspection->payload_validated =
+        !(flags & APPX_PACKAGE_INSPECT_DEFER_PAYLOAD_VALIDATION);
     archive = NULL;
     manifest = NULL;
+    block_map = NULL;
     if (FAILED(hr = check_cancel_event( cancel_event ))) goto done;
     *result = inspection;
     inspection = NULL;
@@ -1035,6 +1258,7 @@ void WINAPI appx_package_inspection_free( APPX_PACKAGE_INSPECTION *inspection )
 {
     if (!inspection) return;
     free_files( inspection->files, inspection->file_count );
+    appx_block_map_free( inspection->block_map );
     appx_manifest_free( inspection->manifest );
     wine_appx_archive_close( inspection->archive );
     HeapFree( GetProcessHeap(), 0, inspection );
@@ -1090,6 +1314,19 @@ HRESULT WINAPI appx_package_inspection_get_signer_id(
 }
 
 HRESULT WINAPI appx_package_inspection_open_stream(
+    const APPX_PACKAGE_INSPECTION *inspection, UINT32 file_index,
+    WINE_APPX_ARCHIVE_STREAM **stream )
+{
+    if (!stream) return E_INVALIDARG;
+    *stream = NULL;
+    if (!inspection) return E_INVALIDARG;
+    if (file_index >= inspection->file_count) return E_BOUNDS;
+    if (!inspection->payload_validated) return E_ACCESSDENIED;
+    return wine_appx_archive_stream_open(
+        inspection->archive, inspection->files[file_index].archive_index, stream );
+}
+
+HRESULT WINAPI appx_package_inspection_open_validation_stream(
     const APPX_PACKAGE_INSPECTION *inspection, UINT32 file_index,
     WINE_APPX_ARCHIVE_STREAM **stream )
 {

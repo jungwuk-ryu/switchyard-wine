@@ -101,6 +101,7 @@ struct extract_context
     APPX_EXTRACT_TEST_SOURCE source_ops;
     APPX_EXTRACT_OPTIONS options;
     APPX_EXTRACT_TEST_IO io;
+    void *validation;
     struct extract_cancel_monitor cancel;
     struct extract_plan plan;
     HANDLE root;
@@ -488,7 +489,8 @@ static HRESULT WINAPI package_source_open_stream(
 
     if (!result) return E_INVALIDARG;
     *result = NULL;
-    hr = appx_package_inspection_open_stream( source, index, &stream );
+    hr = appx_package_inspection_open_validation_stream(
+        source, index, &stream );
     if (SUCCEEDED(hr)) *result = stream;
     return hr;
 }
@@ -509,6 +511,41 @@ static void WINAPI package_source_close_stream( void *stream )
     wine_appx_archive_stream_close( stream );
 }
 
+static HRESULT WINAPI package_source_open_validation(
+    const void *source, void **result )
+{
+    APPX_PACKAGE_VALIDATION *validation = NULL;
+    HRESULT hr;
+
+    if (!result) return E_INVALIDARG;
+    *result = NULL;
+    hr = appx_package_inspection_open_validation( source, &validation );
+    if (SUCCEEDED(hr)) *result = validation;
+    return hr;
+}
+
+static HRESULT WINAPI package_source_begin_file(
+    void *validation, UINT32 file_index )
+{
+    return appx_package_validation_begin_file( validation, file_index );
+}
+
+static HRESULT WINAPI package_source_validate_data(
+    void *validation, const void *data, UINT32 size )
+{
+    return appx_package_validation_update( validation, data, size );
+}
+
+static HRESULT WINAPI package_source_finish_file( void *validation )
+{
+    return appx_package_validation_finish_file( validation );
+}
+
+static void WINAPI package_source_close_validation( void *validation )
+{
+    appx_package_validation_close( validation );
+}
+
 static const APPX_EXTRACT_TEST_SOURCE package_source_ops =
 {
     sizeof(package_source_ops),
@@ -518,7 +555,12 @@ static const APPX_EXTRACT_TEST_SOURCE package_source_ops =
     package_source_open_stream,
     package_source_read_stream,
     package_source_cancel_stream,
-    package_source_close_stream
+    package_source_close_stream,
+    package_source_open_validation,
+    package_source_begin_file,
+    package_source_validate_data,
+    package_source_finish_file,
+    package_source_close_validation
 };
 
 static HRESULT validate_canonical_path( const WCHAR *path )
@@ -1170,6 +1212,9 @@ static HRESULT extract_file( struct extract_context *context,
     if (!(file_info = context->source_ops.get_file(
           context->source, node->file_index )))
         return malformed_package();
+    if (FAILED(hr = context->source_ops.begin_file(
+          context->validation, node->file_index )))
+        return hr;
     parent = node->parent ? node->parent->handle : context->root;
     if (FAILED(hr = create_child( parent, node->name, FALSE, &file )))
         return hr;
@@ -1207,7 +1252,8 @@ static HRESULT extract_file( struct extract_context *context,
             if (read || total != file_info->uncompressed_size)
                 hr = APPX_E_CORRUPT_CONTENT;
             else
-                hr = S_OK;
+                hr = context->source_ops.finish_file(
+                    context->validation );
             break;
         }
         if (FAILED(hr)) break;
@@ -1218,6 +1264,9 @@ static HRESULT extract_file( struct extract_context *context,
             hr = APPX_E_CORRUPT_CONTENT;
             break;
         }
+        if (FAILED(hr = context->source_ops.validate_data(
+              context->validation, context->buffer, read )))
+            break;
         if (FAILED(hr = write_file_all( context, file, total,
                                         context->buffer, read )))
             break;
@@ -1454,7 +1503,9 @@ static HRESULT validate_source_ops(
         !source_ops->get_count || !source_ops->get_file ||
         !source_ops->get_expanded_size || !source_ops->open_stream ||
         !source_ops->read_stream || !source_ops->cancel_stream ||
-        !source_ops->close_stream)
+        !source_ops->close_stream || !source_ops->open_validation ||
+        !source_ops->begin_file || !source_ops->validate_data ||
+        !source_ops->finish_file || !source_ops->close_validation)
         return E_INVALIDARG;
     *copy = *source_ops;
     return S_OK;
@@ -1493,6 +1544,14 @@ HRESULT WINAPI appx_package_extract_with_test_source(
         goto done;
     if (FAILED(hr = build_extract_plan( &context )))
         goto done;
+    if (FAILED(hr = context.source_ops.open_validation(
+          context.source, &context.validation )))
+        goto done;
+    if (!context.validation)
+    {
+        hr = malformed_package();
+        goto done;
+    }
     if (FAILED(hr = duplicate_staging_root( staging_root, &context.root )))
         goto done;
     if (FAILED(hr = check_initial_space( &context )))
@@ -1526,6 +1585,8 @@ done:
      */
     cancel_monitor_destroy( &context.cancel );
     close_plan_handles( &context, discard );
+    if (context.validation)
+        context.source_ops.close_validation( context.validation );
     if (context.write_event) CloseHandle( context.write_event );
     HeapFree( GetProcessHeap(), 0, context.buffer );
     if (context.root != INVALID_HANDLE_VALUE) CloseHandle( context.root );

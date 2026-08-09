@@ -2314,7 +2314,8 @@ static HRESULT prepare_production_package(
     if (container == APPX_CONTAINER_PACKAGE)
     {
         if (FAILED(hr = appx_package_inspect_ex(
-                package_file, options->archive_limits, 0,
+                package_file, options->archive_limits,
+                APPX_PACKAGE_INSPECT_DEFER_PAYLOAD_VALIDATION,
                 options->cancel_event, &prepared->package_inspection )))
             return hr;
         prepared->inspection = prepared->package_inspection;
@@ -2332,7 +2333,9 @@ static HRESULT prepare_production_package(
         bundle_policy.architecture_policy.value.supported_architectures =
             map_bundle_supported_architectures( &architecture_policy );
         hr = appx_bundle_inspect_ex(
-            package_file, options->archive_limits, 0, &bundle_policy,
+            package_file, options->archive_limits,
+            APPX_BUNDLE_INSPECT_DEFER_SELECTED_PAYLOAD_VALIDATION,
+            &bundle_policy,
             &bundle_options,
             &prepared->bundle_inspection );
         if (FAILED(hr)) return hr;

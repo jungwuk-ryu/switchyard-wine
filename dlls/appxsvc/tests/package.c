@@ -27,6 +27,7 @@
 
 #include "wine/test.h"
 
+#include "../extract.h"
 #include "../manifest.h"
 #include "../package.h"
 
@@ -35,6 +36,8 @@ static HRESULT (WINAPI *p_appx_package_inspect)(
 static HRESULT (WINAPI *p_appx_package_inspect_ex)(
     HANDLE, const WINE_APPX_ARCHIVE_LIMITS *, UINT32, HANDLE,
     APPX_PACKAGE_INSPECTION ** );
+static HRESULT (WINAPI *p_appx_package_extract)(
+    const APPX_PACKAGE_INSPECTION *, HANDLE, const APPX_EXTRACT_OPTIONS * );
 static void (WINAPI *p_appx_package_inspection_free)( APPX_PACKAGE_INSPECTION * );
 static const APPX_MANIFEST *(WINAPI *p_appx_package_inspection_get_manifest)(
     const APPX_PACKAGE_INSPECTION * );
@@ -269,6 +272,60 @@ done:
     return success;
 }
 
+static BOOL append_path( WCHAR path[MAX_PATH], const WCHAR *name )
+{
+    UINT32 length = lstrlenW( path ), name_length = lstrlenW( name );
+
+    if (length + 1 + name_length >= MAX_PATH) return FALSE;
+    if (length && path[length - 1] != '\\') path[length++] = '\\';
+    memcpy( path + length, name, (name_length + 1) * sizeof(WCHAR) );
+    return TRUE;
+}
+
+static BOOL create_staging_directory( WCHAR path[MAX_PATH], HANDLE *directory )
+{
+    WCHAR temp[MAX_PATH];
+
+    *directory = INVALID_HANDLE_VALUE;
+    if (!GetTempPathW( ARRAY_SIZE(temp), temp ) ||
+        !GetTempFileNameW( temp, L"apx", 0, path ))
+        return FALSE;
+    DeleteFileW( path );
+    if (!CreateDirectoryW( path, NULL )) return FALSE;
+    *directory = CreateFileW(
+        path, GENERIC_READ | GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL );
+    if (*directory == INVALID_HANDLE_VALUE)
+    {
+        RemoveDirectoryW( path );
+        path[0] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void remove_extracted_fixture( const WCHAR *root )
+{
+    static const WCHAR *files[] =
+    {
+        L"2.txt", L"a\\3.txt", L"Empty.txt", L"Tile.png",
+        L"AppxManifest.xml"
+    };
+    WCHAR path[MAX_PATH];
+    UINT32 i;
+
+    for (i = 0; i < ARRAY_SIZE(files); i++)
+    {
+        lstrcpynW( path, root, ARRAY_SIZE(path) );
+        if (append_path( path, files[i] )) DeleteFileW( path );
+    }
+    lstrcpynW( path, root, ARRAY_SIZE(path) );
+    if (append_path( path, L"a" )) RemoveDirectoryW( path );
+    RemoveDirectoryW( root );
+}
+
 static void test_signed_package( void )
 {
     static const WCHAR expected_name[] = L"AppxPackaging.Signing.UnitTests.Data";
@@ -277,14 +334,14 @@ static void test_signed_package( void )
     const APPX_PACKAGE_FILE *file_info;
     const APPX_MANIFEST *manifest;
     WINE_APPX_ARCHIVE_STREAM *stream;
-    WCHAR path[MAX_PATH] = {0};
+    WCHAR extracted[MAX_PATH], path[MAX_PATH] = {0};
     BYTE buffer[4096], content_id[APPX_PACKAGE_CONTENT_ID_SIZE];
     BYTE signer_id[APPX_PACKAGE_SIGNER_ID_SIZE], byte;
     LARGE_INTEGER offset;
     UINT64 streamed;
     UINT32 count, i;
     DWORD transferred;
-    HANDLE cancel, file;
+    HANDLE cancel, directory, file;
     HRESULT hr;
     BOOL found_manifest = FALSE;
 
@@ -339,9 +396,56 @@ static void test_signed_package( void )
             inspection );
     }
 
+    cancel = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!cancel, "failed to create validation cancellation event, error %lu.\n",
+        GetLastError() );
+    if (cancel)
+    {
+        inspection = (void *)0xdeadbeef;
+        hr = p_appx_package_inspect_ex(
+            file, NULL, APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN,
+            cancel, &inspection );
+        ok( hr == S_OK,
+            "cancellable full inspection returned %#lx.\n", hr );
+        ok( !!inspection,
+            "cancellable full inspection returned no result.\n" );
+        p_appx_package_inspection_free( inspection );
+        inspection = NULL;
+        CloseHandle( cancel );
+    }
+
     hr = p_appx_package_inspect( file, NULL, 0, &inspection );
     ok( FAILED(hr), "untrusted package returned %#lx.\n", hr );
     ok( !inspection, "untrusted package returned inspection %p.\n", inspection );
+
+    hr = p_appx_package_inspect_ex(
+        file, NULL,
+        APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN |
+        APPX_PACKAGE_INSPECT_DEFER_PAYLOAD_VALIDATION,
+        NULL, &inspection );
+    ok( hr == S_OK, "deferred package inspection returned %#lx.\n", hr );
+    ok( !!inspection, "deferred package inspection returned no result.\n" );
+    if (inspection)
+    {
+        stream = NULL;
+        hr = p_appx_package_inspection_open_stream(
+            inspection, 0, &stream );
+        ok( hr == E_ACCESSDENIED,
+            "deferred inspection opened an unvalidated stream, hr %#lx.\n",
+            hr );
+        ok( !stream, "deferred inspection returned stream %p.\n", stream );
+        ok( create_staging_directory( extracted, &directory ),
+            "failed to create extraction staging directory.\n" );
+        if (directory != INVALID_HANDLE_VALUE)
+        {
+            hr = p_appx_package_extract( inspection, directory, NULL );
+            ok( hr == S_OK, "deferred extraction returned %#lx.\n", hr );
+            CloseHandle( directory );
+            remove_extracted_fixture( extracted );
+        }
+        p_appx_package_inspection_free( inspection );
+        inspection = NULL;
+    }
 
     hr = p_appx_package_inspect(
         file, NULL, APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN, &inspection );
@@ -457,6 +561,7 @@ START_TEST(package)
 
     LOAD(appx_package_inspect);
     LOAD(appx_package_inspect_ex);
+    LOAD(appx_package_extract);
     LOAD(appx_package_inspection_free);
     LOAD(appx_package_inspection_get_manifest);
     LOAD(appx_package_inspection_get_file_count);

@@ -27,17 +27,20 @@
 #include "manifest.h"
 
 /*
- * Production deployment must pass zero.  The untrusted-chain flag exists for
- * conformance fixtures and explicitly configured development installs; it
- * never relaxes the CMS signature, signed digest, publisher, block-map, CRC,
- * or package-layout checks.
+ * The untrusted-chain flag exists for conformance fixtures and explicitly
+ * configured development installs; production deployment never passes it.
+ * Production may defer bulk payload hashes until extraction, but that never
+ * relaxes the CMS signature, signed digest, publisher, block-map structure,
+ * CRC, or package-layout checks.
  */
 #define APPX_PACKAGE_INSPECT_ALLOW_UNTRUSTED_CHAIN 0x00000001
+#define APPX_PACKAGE_INSPECT_DEFER_PAYLOAD_VALIDATION 0x00000002
 #define APPX_PACKAGE_MAX_CODE_INTEGRITY_SIZE       (256u * 1024 * 1024)
 #define APPX_PACKAGE_CONTENT_ID_SIZE               32
 #define APPX_PACKAGE_SIGNER_ID_SIZE                32
 
 typedef struct appx_package_inspection APPX_PACKAGE_INSPECTION;
+typedef struct appx_package_validation APPX_PACKAGE_VALIDATION;
 
 typedef struct
 {
@@ -83,11 +86,38 @@ HRESULT WINAPI appx_package_inspection_get_signer_id(
     const APPX_PACKAGE_INSPECTION *inspection, BYTE *signer_id, UINT32 size );
 
 /*
- * Streams are available only for files in the fully reconciled block map.
- * They own an independent archive handle and therefore remain valid if the
- * inspection object is freed after this call returns.
+ * Ordinary streams are available only after inspection has validated every
+ * payload hash.  They own an independent archive handle and therefore remain
+ * valid if the inspection object is freed after this call returns.
  */
 HRESULT WINAPI appx_package_inspection_open_stream(
+    const APPX_PACKAGE_INSPECTION *inspection, UINT32 file_index,
+    WINE_APPX_ARCHIVE_STREAM **stream );
+
+/*
+ * Deployment may defer bulk payload block-hash validation so extraction can
+ * hash the same bytes it writes instead of inflating every file twice.  The
+ * signed block map, content types, package byte image, and manifest are still
+ * authenticated before a deferred inspection is returned.  Such an inspection
+ * must be consumed only by appx_package_extract(); ordinary stream access is
+ * rejected until validation has already completed during inspection.
+ *
+ * These helpers are the private bridge used by the extractor.  A validation
+ * object owns one reusable SHA-256 engine for the whole extraction and accepts
+ * one file at a time.
+ */
+HRESULT WINAPI appx_package_inspection_open_validation(
+    const APPX_PACKAGE_INSPECTION *inspection,
+    APPX_PACKAGE_VALIDATION **validation );
+HRESULT WINAPI appx_package_validation_begin_file(
+    APPX_PACKAGE_VALIDATION *validation, UINT32 file_index );
+HRESULT WINAPI appx_package_validation_update(
+    APPX_PACKAGE_VALIDATION *validation, const void *data, UINT32 size );
+HRESULT WINAPI appx_package_validation_finish_file(
+    APPX_PACKAGE_VALIDATION *validation );
+void WINAPI appx_package_validation_close(
+    APPX_PACKAGE_VALIDATION *validation );
+HRESULT WINAPI appx_package_inspection_open_validation_stream(
     const APPX_PACKAGE_INSPECTION *inspection, UINT32 file_index,
     WINE_APPX_ARCHIVE_STREAM **stream );
 

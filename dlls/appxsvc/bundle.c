@@ -93,6 +93,7 @@ struct archive_source
     APPX_PACKAGE_INSPECTION *current;
     struct materialized_package retained;
     UINT32 retained_index;
+    BOOL defer_retained_payload_validation;
 };
 
 static BOOL exact_path( const WCHAR *left, const WCHAR *right )
@@ -1627,6 +1628,7 @@ struct archive_stream_context
     WINE_APPX_ARCHIVE_STREAM *stream;
     struct archive_source *source;
     APPX_PACKAGE_INSPECTION *inspection;
+    UINT32 package_flags;
 };
 
 static HRESULT WINAPI archive_stream_read_callback(
@@ -1652,7 +1654,7 @@ static HRESULT WINAPI archive_package_inspect_callback(
     struct archive_stream_context *stream = context;
 
     return appx_package_inspect_ex(
-        file, stream->source->limits, stream->source->package_flags,
+        file, stream->source->limits, stream->package_flags,
         stream->source->options.cancel_event, &stream->inspection );
 }
 
@@ -1665,7 +1667,7 @@ static void free_materialized_package( struct materialized_package *package )
 
 static HRESULT materialize_archive_package(
     struct archive_source *source, UINT32 archive_index, UINT64 expected_size,
-    struct materialized_package *package )
+    UINT32 package_flags, struct materialized_package *package )
 {
     struct archive_stream_context context;
     HRESULT hr;
@@ -1673,6 +1675,7 @@ static HRESULT materialize_archive_package(
     memset( package, 0, sizeof(*package) );
     memset( &context, 0, sizeof(context) );
     context.source = source;
+    context.package_flags = package_flags;
     if (FAILED(hr = wine_appx_archive_stream_open( source->archive,
                                                    archive_index,
                                                    &context.stream )))
@@ -1701,6 +1704,7 @@ static HRESULT WINAPI archive_inspect_package_callback(
     APPX_PACKAGE_INSPECTION *current_inspection;
     struct materialized_package materialized;
     WINE_APPX_ARCHIVE_LIMITS limited;
+    UINT32 package_flags = source->package_flags;
     HRESULT hr;
 
     appx_package_inspection_free( source->current );
@@ -1733,10 +1737,13 @@ static HRESULT WINAPI archive_inspect_package_callback(
         limited.max_total_uncompressed_size =
             remaining_expanded_size;
     source->limits = &limited;
+    if (source->defer_retained_payload_validation &&
+        manifest_index == source->retained_index)
+        package_flags |= APPX_PACKAGE_INSPECT_DEFER_PAYLOAD_VALIDATION;
     if (FAILED(hr = materialize_archive_package(
         source, archive_index,
         stable->entries[archive_index].entry.uncompressed_size,
-        &materialized )))
+        package_flags, &materialized )))
     {
         source->limits = original_limits;
         return hr;
@@ -1909,7 +1916,8 @@ HRESULT WINAPI appx_bundle_inspect_ex(
     *result = NULL;
     if (!file || file == INVALID_HANDLE_VALUE ||
         FAILED(appx_bundle_selection_policy_validate_architecture( policy )) ||
-        (flags & ~APPX_BUNDLE_INSPECT_ALLOW_UNTRUSTED_CHAIN))
+        (flags & ~(APPX_BUNDLE_INSPECT_ALLOW_UNTRUSTED_CHAIN |
+                   APPX_BUNDLE_INSPECT_DEFER_SELECTED_PAYLOAD_VALIDATION)))
         return E_INVALIDARG;
     if (FAILED(hr = normalize_inspect_options(
             input_options, &options )) ||
@@ -2071,6 +2079,8 @@ HRESULT WINAPI appx_bundle_inspect_ex(
         TRACE( "inner archive preparation failed, hr %#lx.\n", hr );
         goto done;
     }
+    stable.production.defer_retained_payload_validation =
+        !!(flags & APPX_BUNDLE_INSPECT_DEFER_SELECTED_PAYLOAD_VALIDATION);
     stable.manifest = manifest;
     if (FAILED(hr = validate_outer_content_types( types, &stable )))
     {
@@ -2102,8 +2112,11 @@ HRESULT WINAPI appx_bundle_inspect_ex(
                 retention_hint.package_index;
     }
     /*
-     * Every inner package is materialized and fully inspected by the shared
-     * validator.  Selection occurs only after the last successful callback.
+     * Every inner package is materialized and inspected by the shared
+     * validator.  Deployment may defer only the retention-hint package's bulk
+     * payload hashes; selection must resolve to that same package, whose
+     * extraction performs the hashes before publication.  Every other inner
+     * package remains fully validated here.
      */
     {
         struct appx_bundle_selection selection = {sizeof(selection)};

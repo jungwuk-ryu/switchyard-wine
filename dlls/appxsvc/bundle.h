@@ -29,6 +29,8 @@
 #include "package.h"
 
 #define APPX_BUNDLE_INSPECT_ALLOW_UNTRUSTED_CHAIN 0x00000001
+/* Deployment validates the selected inner package while extracting it. */
+#define APPX_BUNDLE_INSPECT_DEFER_SELECTED_PAYLOAD_VALIDATION 0x00000002
 #define APPX_BUNDLE_SIGNER_ID_SIZE                APPX_PACKAGE_SIGNER_ID_SIZE
 #define APPX_BUNDLE_MAX_CODE_INTEGRITY_SIZE       APPX_PACKAGE_MAX_CODE_INTEGRITY_SIZE
 #define APPX_BUNDLE_MATERIALIZE_BUFFER_SIZE       (1024 * 1024)
@@ -60,9 +62,11 @@ typedef struct
 
 /*
  * Inspecting a bundle validates the signed outer container and every embedded
- * package before applying the selection policy.  The returned selected package
- * is backed by a delete-pending private temporary file and remains immutable
- * until appx_bundle_inspection_free().
+ * package before applying the selection policy.  Deployment may defer the
+ * selected package's bulk payload hashes until extraction; all other inner
+ * packages are fully validated during inspection.  The returned selected
+ * package is backed by a delete-pending private temporary file and remains
+ * immutable until appx_bundle_inspection_free().
  */
 HRESULT WINAPI appx_bundle_inspect(
     HANDLE file, const WINE_APPX_ARCHIVE_LIMITS *limits, UINT32 flags,

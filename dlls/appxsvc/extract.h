@@ -144,6 +144,16 @@ typedef void (WINAPI *APPX_EXTRACT_SOURCE_CANCEL_STREAM_CALLBACK)(
     void *stream );
 typedef void (WINAPI *APPX_EXTRACT_SOURCE_CLOSE_STREAM_CALLBACK)(
     void *stream );
+typedef HRESULT (WINAPI *APPX_EXTRACT_SOURCE_OPEN_VALIDATION_CALLBACK)(
+    const void *source, void **validation );
+typedef HRESULT (WINAPI *APPX_EXTRACT_SOURCE_BEGIN_FILE_CALLBACK)(
+    void *validation, UINT32 file_index );
+typedef HRESULT (WINAPI *APPX_EXTRACT_SOURCE_VALIDATE_DATA_CALLBACK)(
+    void *validation, const void *data, UINT32 size );
+typedef HRESULT (WINAPI *APPX_EXTRACT_SOURCE_FINISH_FILE_CALLBACK)(
+    void *validation );
+typedef void (WINAPI *APPX_EXTRACT_SOURCE_CLOSE_VALIDATION_CALLBACK)(
+    void *validation );
 
 typedef struct
 {
@@ -155,6 +165,11 @@ typedef struct
     APPX_EXTRACT_SOURCE_READ_STREAM_CALLBACK read_stream;
     APPX_EXTRACT_SOURCE_CANCEL_STREAM_CALLBACK cancel_stream;
     APPX_EXTRACT_SOURCE_CLOSE_STREAM_CALLBACK close_stream;
+    APPX_EXTRACT_SOURCE_OPEN_VALIDATION_CALLBACK open_validation;
+    APPX_EXTRACT_SOURCE_BEGIN_FILE_CALLBACK begin_file;
+    APPX_EXTRACT_SOURCE_VALIDATE_DATA_CALLBACK validate_data;
+    APPX_EXTRACT_SOURCE_FINISH_FILE_CALLBACK finish_file;
+    APPX_EXTRACT_SOURCE_CLOSE_VALIDATION_CALLBACK close_validation;
 } APPX_EXTRACT_TEST_SOURCE;
 
 HRESULT WINAPI appx_package_extract_with_test_source(
