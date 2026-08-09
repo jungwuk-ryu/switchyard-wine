@@ -199,6 +199,11 @@ extern unsigned int get_class_fnid( struct window_class *class, data_size_t *ext
 extern client_ptr_t get_class_wndproc( struct window_class *class, bool *ansi );
 extern client_ptr_t get_class_client_ptr( struct window_class *class );
 
+static inline int is_valid_user_extra_range( int offset, data_size_t size, data_size_t total )
+{
+    return offset >= 0 && size <= total && (data_size_t)offset <= total - size;
+}
+
 /* windows station functions */
 
 extern struct winstation *get_visible_winstation(void);

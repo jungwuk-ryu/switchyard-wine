@@ -7392,6 +7392,22 @@ static void test_set_window_word_size(void)
     DestroyWindow(hwnd);
 }
 
+static void test_extra_data_bounds(void)
+{
+    LONG_PTR retval;
+
+    /* MainWindowClass reserves no extra class or window data. */
+    SetLastError(0xdeadbeef);
+    retval = SetWindowLongPtrA(hwndMain, 0, 0x12345678);
+    ok(!retval, "SetWindowLongPtrA returned %#Ix.\n", retval);
+    ok(check_error(GetLastError(), ERROR_INVALID_INDEX), "Got error %lu.\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    retval = SetClassLongPtrA(hwndMain, 0, 0x12345678);
+    ok(!retval, "SetClassLongPtrA returned %#Ix.\n", retval);
+    ok(check_error(GetLastError(), ERROR_INVALID_INDEX), "Got error %lu.\n", GetLastError());
+}
+
 static void test_SetWindowLong(void)
 {
     LONG_PTR retval;
@@ -14622,6 +14638,7 @@ START_TEST(win)
     test_cascade_windows();
     test_tile_windows();
     test_GW_ENABLEDPOPUP();
+    test_extra_data_bounds();
 
     /* add the tests above this line */
     if (hhook) UnhookWindowsHookEx(hhook);
