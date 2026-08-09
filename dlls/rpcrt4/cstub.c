@@ -105,14 +105,15 @@ HRESULT CStdStubBuffer_Construct(REFIID riid,
 
 BOOL fill_delegated_proxy_table(IUnknownVtbl *vtbl, DWORD num)
 {
-    const void **entry = (const void **)(vtbl + 1);
+    const void **entry;
     DWORD i;
 
-    if (num > NB_THUNK_ENTRIES)
+    if (num < 3 || num > NB_THUNK_ENTRIES)
     {
         FIXME( "%lu methods not supported\n", num );
         return FALSE;
     }
+    entry = (const void **)(vtbl + 1);
     vtbl->QueryInterface = IUnknown_QueryInterface_Proxy;
     vtbl->AddRef = IUnknown_AddRef_Proxy;
     vtbl->Release = IUnknown_Release_Proxy;
@@ -123,7 +124,7 @@ BOOL fill_delegated_proxy_table(IUnknownVtbl *vtbl, DWORD num)
 
 const IUnknownVtbl *get_delegating_vtbl(DWORD num)
 {
-    if (num > NB_THUNK_ENTRIES)
+    if (num < 3 || num > NB_THUNK_ENTRIES)
     {
         FIXME( "%lu methods not supported\n", num );
         return NULL;
@@ -163,7 +164,12 @@ HRESULT CStdStubBuffer_Delegating_Construct(REFIID riid,
         return E_OUTOFMEMORY;
     }
 
-    This->base_obj.lpVtbl = get_delegating_vtbl( vtbl->header.DispatchTableCount );
+    if (!(This->base_obj.lpVtbl = get_delegating_vtbl( vtbl->header.DispatchTableCount )))
+    {
+        free(This);
+        IUnknown_Release(pvServer);
+        return RPC_E_UNEXPECTED;
+    }
     r = create_stub(delegating_iid, &This->base_obj, &This->base_stub);
     if(FAILED(r))
     {
