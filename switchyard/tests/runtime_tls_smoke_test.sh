@@ -13,8 +13,8 @@ command -v x86_64-w64-mingw32-gcc >/dev/null || {
 work="$(/usr/bin/mktemp -d /tmp/switchyard-runtime-tls.XXXXXX)"
 prefix="$work/prefix"
 cleanup() {
-  WINEPREFIX="$prefix" "$RUNTIME/bin/switchyard-wineserver" -k >/dev/null 2>&1 || true
-  WINEPREFIX="$prefix" "$RUNTIME/bin/switchyard-wineserver" -w >/dev/null 2>&1 || true
+  WINEPREFIX="$prefix" "$RUNTIME/bin/wineserver" -k >/dev/null 2>&1 || true
+  WINEPREFIX="$prefix" "$RUNTIME/bin/wineserver" -w >/dev/null 2>&1 || true
   /bin/rm -rf "$work"
 }
 trap cleanup EXIT
