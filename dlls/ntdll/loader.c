@@ -108,10 +108,12 @@ static WCHAR *default_load_path;    /* default dll search path */
 static HANDLE known_dlls_ntdir;  /* NT directory containing known dlls sections */
 static BOOL switchyard_mesa_opengl;  /* use the runtime-selected Mesa OpenGL backend */
 static UNICODE_STRING switchyard_mesa_opengl_path;
-#ifdef _WIN64
+#if defined(__x86_64__)
 static const WCHAR switchyard_mesa_pe_dir[] = L"x86_64-windows\\";
-#else
+#elif defined(__i386__)
 static const WCHAR switchyard_mesa_pe_dir[] = L"i386-windows\\";
+#else
+static const WCHAR switchyard_mesa_pe_dir[] = L"";
 #endif
 
 struct dll_dir_entry
@@ -4386,6 +4388,7 @@ static void switchyard_init_mesa_opengl(void)
 {
     UNICODE_STRING opengl_driver;
 
+    if (!switchyard_mesa_pe_dir[0]) return;
     if (get_env_var( L"WINE_OPENGL_DRIVER", 0, &opengl_driver )) return;
     switchyard_mesa_opengl = opengl_driver.Length &&
         !wcsicmp( opengl_driver.Buffer, L"llvmpipe" );
@@ -4956,7 +4959,7 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 #define SWITCHYARD_GPTK_WIN32_CALLBACK_LEGACY_ENTRIES 41
 #define SWITCHYARD_GPTK_WIN32_CALLBACK_V4_ENTRIES 68
 
-#ifdef _WIN64
+#if defined(__x86_64__) && !defined(__arm64ec__)
 
 static BYTE *native_callback_thunk_ptr;
 static BYTE *native_callback_thunk_end;
@@ -10739,7 +10742,7 @@ NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, vo
     void *pe_callback_storage[SWITCHYARD_GPTK_WIN32_DISPATCH_V4_ENTRIES];
     void *dispatch_args;
     NTSTATUS status;
-#ifdef _WIN64
+#if defined(__x86_64__) && !defined(__arm64ec__)
     struct switchyard_native_callback_scope scope;
 #endif
 
@@ -10747,7 +10750,7 @@ NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, vo
 
     dispatch_args = prepare_pe_callback_table( code, args, pe_callback_storage,
                                                ARRAY_SIZE(pe_callback_storage) );
-#ifdef _WIN64
+#if defined(__x86_64__) && !defined(__arm64ec__)
 
     if (switchyard_enter_native_callback_scope( &scope ))
     {
@@ -10772,7 +10775,7 @@ NTSTATUS WINAPI __wine_unix_call( unixlib_handle_t handle, unsigned int code, vo
  */
 NTSTATUS WINAPI __wine_call_native_thread_func( void *func, void *arg )
 {
-#ifdef _WIN64
+#if defined(__x86_64__) && !defined(__arm64ec__)
     typedef void (WINAPI *native_thread_func)(void *);
     struct switchyard_native_callback_scope scope;
 
@@ -12103,14 +12106,14 @@ PVOID WINAPI RtlPcToFileHeader( PVOID pc, PVOID *address )
 {
     LDR_DATA_TABLE_ENTRY *module;
     PVOID ret = NULL;
-#ifdef _WIN64
+#if defined(__x86_64__) && !defined(__arm64ec__)
     WINE_MODREF *wm;
     ULONG flags;
 #endif
 
     RtlEnterCriticalSection( &loader_section );
     if (!LdrFindEntryForAddress( pc, &module )) ret = module->DllBase;
-#ifdef _WIN64
+#if defined(__x86_64__) && !defined(__arm64ec__)
     else if (switchyard_is_native_callback_thunk_address( pc ) &&
              switchyard_get_native_callback_thunk_info( pc, NULL, NULL, &flags ) &&
              (flags & SWITCHYARD_NATIVE_CALLBACK_MODULE_DXGI) &&
