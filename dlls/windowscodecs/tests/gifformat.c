@@ -505,6 +505,36 @@ static const char gif_without_trailer_2[] = {
 /* image data */0x02,0x02,0x44,0xde,0xad,0xbe,0xef,0xde,0xad,0xbe,0xef
 };
 
+static const char gif_invalid_record[] = {
+/* LSD */'G','I','F','8','9','a',0x01,0x00,0x01,0x00,0x00,0x00,0x00,
+/* invalid record */0x00
+};
+
+static void test_invalid_gif(void)
+{
+    IWICBitmapDecoder *decoder;
+    IStream *stream;
+    HRESULT hr;
+    ULONG ref;
+
+    stream = create_stream(gif_invalid_record, sizeof(gif_invalid_record));
+    if (!stream) return;
+
+    hr = CoCreateInstance(&CLSID_WICGifDecoder, NULL, CLSCTX_INPROC_SERVER,
+            &IID_IWICBitmapDecoder, (void **)&decoder);
+    ok(hr == S_OK, "CoCreateInstance failed, hr=%#lx\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        hr = IWICBitmapDecoder_Initialize(decoder, stream, WICDecodeMetadataCacheOnDemand);
+        ok(FAILED(hr), "Initialize succeeded\n");
+        ref = IWICBitmapDecoder_Release(decoder);
+        ok(!ref, "decoder refcount %lu\n", ref);
+    }
+
+    ref = IStream_Release(stream);
+    ok(!ref, "stream refcount %lu\n", ref);
+}
+
 static void test_truncated_gif(void)
 {
     HRESULT hr;
@@ -1100,6 +1130,7 @@ START_TEST(gifformat)
     test_gif_frame_sizes();
     test_gif_full_table();
     test_gif_notrailer();
+    test_invalid_gif();
 
     IWICImagingFactory_Release(factory);
     CoUninitialize();
