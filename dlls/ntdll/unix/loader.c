@@ -123,6 +123,7 @@ const char *build_dir = NULL;
 const char *config_dir = NULL;
 const char *wineloader = NULL;
 const char *switchyard_gptk_dll_path = NULL;
+const char *switchyard_mesa_dll_path = NULL;
 const char **dll_paths = NULL;
 const char **system_dll_paths = NULL;
 const char *user_name = NULL;
@@ -308,6 +309,15 @@ static void set_dll_path(void)
             switchyard_gptk_dll_path = realpath( candidate, NULL );
             free( candidate );
         }
+    }
+
+    if (!build_dir)
+    {
+        char *candidate = build_relative_path( dll_dir, LIBDIR "/wine",
+                                                LIBDIR "/switchyard-mesa" );
+
+        switchyard_mesa_dll_path = realpath( candidate, NULL );
+        free( candidate );
     }
 
     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;

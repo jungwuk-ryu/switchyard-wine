@@ -150,31 +150,35 @@ static WCHAR *get_basename( WCHAR *name )
     return name;
 }
 
-/***************************************************************************
- *	wcs_contains_ascii
- *
- * Return whether a WCHAR string contains an ASCII substring, ignoring case.
- */
-static BOOL wcs_contains_ascii( const WCHAR *str, const char *ascii )
+static BOOL switchyard_is_mesa_opengl_path( const WCHAR *module, const WCHAR *basename )
 {
-    size_t len = strlen( ascii );
-
-    if (!len) return TRUE;
-    while (*str)
+    static const WCHAR prefixW[] = {'\\','?','?','\\'};
+    static const WCHAR x86_64_dirW[] = {'\\','x','8','6','_','6','4','-','w','i','n','d','o','w','s',0};
+    static const WCHAR i386_dirW[] = {'\\','i','3','8','6','-','w','i','n','d','o','w','s',0};
+    static const WCHAR * const arch_dirs[] =
     {
-        size_t i;
+        x86_64_dirW, i386_dirW
+    };
+    const WCHAR *trusted = switchyard_mesa_dll_nt_path;
+    const WCHAR *dir = basename - 1;
+    size_t arch_len, dir_len, trusted_len;
+    unsigned int i;
 
-        for (i = 0; i < len && str[i]; i++)
-        {
-            WCHAR ch = str[i];
-            unsigned char expected = ascii[i];
+    if (!trusted || dir < module || *dir != '\\') return FALSE;
+    if (!wcsncmp( trusted, prefixW, ARRAY_SIZE(prefixW) )) trusted += ARRAY_SIZE(prefixW);
+    trusted_len = wcslen( trusted );
+    while (trusted_len && (trusted[trusted_len - 1] == '\\' || trusted[trusted_len - 1] == '/'))
+        trusted_len--;
+    if (!trusted_len) return FALSE;
+    dir_len = dir - module;
 
-            if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
-            if (expected >= 'A' && expected <= 'Z') expected += 'a' - 'A';
-            if (ch != expected) break;
-        }
-        if (i == len) return TRUE;
-        str++;
+    for (i = 0; i < ARRAY_SIZE(arch_dirs); i++)
+    {
+        arch_len = wcslen( arch_dirs[i] );
+        if (dir_len == trusted_len + arch_len &&
+            !wcsnicmp( module, trusted, trusted_len ) &&
+            !wcsnicmp( module + trusted_len, arch_dirs[i], arch_len ))
+            return TRUE;
     }
     return FALSE;
 }
@@ -571,7 +575,7 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
     const WCHAR *path = nt_name->Buffer;
     unsigned int len = nt_name->Length / sizeof(WCHAR);
     WCHAR *module, *basename;
-    BOOL switchyard_mesa;
+    BOOL switchyard_mesa = FALSE;
 
     if (!init_done) init_load_order();
 
@@ -586,9 +590,8 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
     module[len + 1] = 0;
     remove_dll_ext( module + 1 );
     basename = get_basename( module + 1 );
-    switchyard_mesa =
-        wcs_contains_ascii( module + 1, "\\lib\\switchyard-mesa\\x86_64-windows\\" ) ||
-        wcs_contains_ascii( module + 1, "\\lib\\switchyard-mesa\\i386-windows\\" );
+    if (!wcsicmp( basename, opengl32W ) || !wcsicmp( basename, libgalliumW ))
+        switchyard_mesa = switchyard_is_mesa_opengl_path( module + 1, basename );
 
     /* first explicit module name */
     if ((ret = get_load_order_value( std_key, app_key, is_system_dir ? basename : module+1 )) != LO_INVALID)
@@ -632,8 +635,7 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
             goto done;
         }
 
-        if (switchyard_mesa &&
-            (!wcsicmp( basename, opengl32W ) || !wcsicmp( basename, libgalliumW )))
+        if (switchyard_mesa)
         {
             ret = LO_NATIVE;
             TRACE( "using runtime-selected Switchyard Mesa OpenGL backend %s for %s\n",

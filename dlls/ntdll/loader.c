@@ -107,6 +107,7 @@ static DWORD default_search_flags;  /* default flags set by LdrSetDefaultDllDire
 static WCHAR *default_load_path;    /* default dll search path */
 static HANDLE known_dlls_ntdir;  /* NT directory containing known dlls sections */
 static BOOL switchyard_mesa_opengl;  /* use the runtime-selected Mesa OpenGL backend */
+static UNICODE_STRING switchyard_mesa_opengl_path;
 #ifdef _WIN64
 static const WCHAR switchyard_mesa_pe_dir[] = L"x86_64-windows\\";
 #else
@@ -4383,11 +4384,26 @@ static NTSTATUS get_env_var( const WCHAR *name, SIZE_T extra, UNICODE_STRING *re
 
 static void switchyard_init_mesa_opengl(void)
 {
-    UNICODE_STRING mesa_path;
+    UNICODE_STRING opengl_driver;
 
-    if (get_env_var( L"SWITCHYARD_OPENGL_DLL_PATH", 0, &mesa_path )) return;
-    switchyard_mesa_opengl = !!mesa_path.Length;
-    RtlFreeUnicodeString( &mesa_path );
+    if (get_env_var( L"WINE_OPENGL_DRIVER", 0, &opengl_driver )) return;
+    switchyard_mesa_opengl = opengl_driver.Length &&
+        !wcsicmp( opengl_driver.Buffer, L"llvmpipe" );
+    RtlFreeUnicodeString( &opengl_driver );
+    if (!switchyard_mesa_opengl) return;
+    switchyard_mesa_opengl = FALSE;
+    if (get_env_var( L"SWITCHYARD_MESA_DLL_NT_PATH",
+                     wcslen(switchyard_mesa_pe_dir) +
+                     ARRAY_SIZE(L"libgallium_wgl.dll") + 2,
+                     &switchyard_mesa_opengl_path ))
+        return;
+    if (!switchyard_mesa_opengl_path.Length)
+    {
+        RtlFreeUnicodeString( &switchyard_mesa_opengl_path );
+        switchyard_mesa_opengl_path.Buffer = NULL;
+        return;
+    }
+    switchyard_mesa_opengl = TRUE;
     if (switchyard_mesa_opengl)
         TRACE( "enabled the runtime-selected Switchyard Mesa OpenGL backend\n" );
 }
@@ -4402,40 +4418,37 @@ static NTSTATUS switchyard_find_mesa_opengl_dll(
     const WCHAR *libname, UNICODE_STRING *nt_name, WINE_MODREF **pwm,
     HANDLE *mapping, SECTION_IMAGE_INFORMATION *image_info, struct file_id *id )
 {
-    UNICODE_STRING mesa_path;
     NTSTATUS status;
     WCHAR last;
 
     if (!switchyard_mesa_opengl || contains_path( libname ) ||
         !switchyard_is_mesa_opengl_dll( libname ))
         return STATUS_DLL_NOT_FOUND;
-    if (get_env_var( L"SWITCHYARD_OPENGL_DLL_PATH",
-                     wcslen(switchyard_mesa_pe_dir) + wcslen(libname) + 2, &mesa_path ))
-        return STATUS_DLL_NOT_FOUND;
-    if (!mesa_path.Length)
-    {
-        RtlFreeUnicodeString( &mesa_path );
-        return STATUS_DLL_NOT_FOUND;
-    }
+    if (!(nt_name->Buffer = RtlAllocateHeap( GetProcessHeap(), 0,
+                                             switchyard_mesa_opengl_path.MaximumLength )))
+        return STATUS_NO_MEMORY;
+    nt_name->Length = switchyard_mesa_opengl_path.Length;
+    nt_name->MaximumLength = switchyard_mesa_opengl_path.MaximumLength;
+    memcpy( nt_name->Buffer, switchyard_mesa_opengl_path.Buffer,
+            switchyard_mesa_opengl_path.Length + sizeof(WCHAR) );
 
-    last = mesa_path.Buffer[mesa_path.Length / sizeof(WCHAR) - 1];
-    if (last != '\\' && last != '/') RtlAppendUnicodeToString( &mesa_path, L"\\" );
-    RtlAppendUnicodeToString( &mesa_path, switchyard_mesa_pe_dir );
-    RtlAppendUnicodeToString( &mesa_path, libname );
-    status = RtlDosPathNameToNtPathName_U_WithStatus( mesa_path.Buffer, nt_name, NULL, NULL );
-    RtlFreeUnicodeString( &mesa_path );
-    if (status) return status;
+    status = STATUS_SUCCESS;
+    last = nt_name->Buffer[nt_name->Length / sizeof(WCHAR) - 1];
+    if (last != '\\' && last != '/') status = RtlAppendUnicodeToString( nt_name, L"\\" );
+    if (!status) status = RtlAppendUnicodeToString( nt_name, switchyard_mesa_pe_dir );
+    if (!status) status = RtlAppendUnicodeToString( nt_name, libname );
+    if (status) goto failed;
 
     status = open_dll_file(
         nt_name, pwm, mapping, image_info, id, NULL );
-    if (status)
-    {
-        RtlFreeUnicodeString( nt_name );
-        nt_name->Buffer = NULL;
-        return status;
-    }
+    if (status) goto failed;
     TRACE( "redirected %s to %s\n", debugstr_w(libname), debugstr_us(nt_name) );
     return STATUS_SUCCESS;
+
+failed:
+    RtlFreeUnicodeString( nt_name );
+    nt_name->Buffer = NULL;
+    return status;
 }
 
 static NTSTATUS switchyard_find_gptk_d3dmetal_dll(
