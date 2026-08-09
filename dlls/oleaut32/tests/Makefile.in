@@ -1,6 +1,8 @@
 TESTDLL   = oleaut32.dll
 IMPORTS   = oleaut32 ole32 rpcrt4 user32 gdi32 advapi32
 
+test_sltg_EXTRAIDLFLAGS = --oldtlb --win32
+
 SOURCES = \
 	dispatch.c \
 	olefont.c \
@@ -8,6 +10,7 @@ SOURCES = \
 	safearray.c \
 	test_reg.idl \
 	test_simple.idl \
+	test_sltg.idl \
 	test_tlb.idl \
 	tmarshal.c \
 	tmarshal.idl \
