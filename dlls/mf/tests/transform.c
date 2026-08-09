@@ -2317,6 +2317,89 @@ static IMFSample *create_sample_(const BYTE *data, ULONG size, const struct attr
     return sample;
 }
 
+static void test_undersized_video_buffers(REFCLSID class_id)
+{
+    static const BYTE input_data[16 * 16 * 3 / 2];
+    const struct attribute_desc input_type_desc[] =
+    {
+        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video, .required = TRUE),
+        ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_NV12, .required = TRUE),
+        ATTR_RATIO(MF_MT_FRAME_SIZE, 16, 16, .required = TRUE),
+        {0},
+    };
+    const struct attribute_desc output_type_desc[] =
+    {
+        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video, .required = TRUE),
+        ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32, .required = TRUE),
+        ATTR_RATIO(MF_MT_FRAME_SIZE, 16, 16, .required = TRUE),
+        {0},
+    };
+    const char *name = IsEqualGUID(class_id, &CLSID_CColorConvertDMO) ? "color converter" : "video processor";
+    IMFMediaBuffer *output_buffer;
+    IMFSample *input_sample, *output_sample;
+    IMFTransform *transform = NULL;
+    DWORD length, max_length, status;
+    BYTE *data;
+    HRESULT hr;
+    ULONG i, ref;
+
+    if (!winetest_platform_is_wine)
+    {
+        skip("Wine-specific undersized buffer hardening test.\n");
+        return;
+    }
+
+    winetest_push_context("%s undersized buffers", name);
+    hr = CoInitialize(NULL);
+    ok(hr == S_OK, "CoInitialize returned %#lx.\n", hr);
+
+    hr = CoCreateInstance(class_id, NULL, CLSCTX_INPROC_SERVER, &IID_IMFTransform, (void **)&transform);
+    ok(hr == S_OK, "CoCreateInstance returned %#lx.\n", hr);
+    if (FAILED(hr)) goto done;
+
+    check_mft_set_input_type(transform, input_type_desc, S_OK);
+    check_mft_set_output_type(transform, output_type_desc, S_OK);
+
+    input_sample = create_sample(input_data, sizeof(input_data) - 1);
+    hr = IMFTransform_ProcessInput(transform, 0, input_sample, 0);
+    ok(hr == E_FAIL, "ProcessInput returned %#lx.\n", hr);
+    ref = IMFSample_Release(input_sample);
+    ok(!ref, "Release returned %lu.\n", ref);
+
+    input_sample = create_sample(input_data, sizeof(input_data));
+    hr = IMFTransform_ProcessInput(transform, 0, input_sample, 0);
+    ok(hr == S_OK, "ProcessInput returned %#lx.\n", hr);
+
+    output_sample = create_sample(NULL, 16 * 16 * 4 - 1);
+    hr = check_mft_process_output(transform, output_sample, &status);
+    ok(hr == E_FAIL, "ProcessOutput returned %#lx.\n", hr);
+    ok(!status, "Got output status %#lx.\n", status);
+
+    hr = IMFSample_GetBufferByIndex(output_sample, 0, &output_buffer);
+    ok(hr == S_OK, "GetBufferByIndex returned %#lx.\n", hr);
+    hr = IMFMediaBuffer_GetMaxLength(output_buffer, &max_length);
+    ok(hr == S_OK, "GetMaxLength returned %#lx.\n", hr);
+    ok(max_length == 16 * 16 * 4 - 1, "Got maximum length %lu.\n", max_length);
+    hr = IMFMediaBuffer_Lock(output_buffer, &data, NULL, &length);
+    ok(hr == S_OK, "Lock returned %#lx.\n", hr);
+    ok(!length, "Got current length %lu.\n", length);
+    for (i = 0; i < max_length && data[i] == 0xcd; ++i);
+    ok(i == max_length, "Output buffer changed at offset %lu.\n", i);
+    hr = IMFMediaBuffer_Unlock(output_buffer);
+    ok(hr == S_OK, "Unlock returned %#lx.\n", hr);
+    IMFMediaBuffer_Release(output_buffer);
+
+    ref = IMFSample_Release(output_sample);
+    ok(!ref, "Release returned %lu.\n", ref);
+    ref = IMFSample_Release(input_sample);
+    ok(!ref, "Release returned %lu.\n", ref);
+
+done:
+    if (transform) IMFTransform_Release(transform);
+    CoUninitialize();
+    winetest_pop_context();
+}
+
 static void test_aac_encoder(void)
 {
     const GUID *const class_id = &CLSID_AACMFTEncoder;
@@ -11798,6 +11881,8 @@ START_TEST(transform)
     test_wmv_decoder_dmo_get_size_info();
     test_wmv_decoder_media_object();
     test_audio_convert();
+    test_undersized_video_buffers(&CLSID_CColorConvertDMO);
+    test_undersized_video_buffers(&CLSID_VideoProcessorMFT);
     test_color_convert(FALSE);
     test_color_convert(TRUE);
     test_video_processor(FALSE);
