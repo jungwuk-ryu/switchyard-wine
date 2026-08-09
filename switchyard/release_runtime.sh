@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/switchyard/lib/runtime_profile.sh"
 ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime.entitlements"
 EXPECTED_TEAM_ID="${SWITCHYARD_DEVELOPER_TEAM_ID:-M3CULMDKU3}"
 RUNTIME=""
@@ -9,6 +10,24 @@ OUTPUT_DIR=""
 IDENTITY="${SWITCHYARD_CODESIGN_IDENTITY:-}"
 NOTARY_PROFILE="${SWITCHYARD_NOTARY_PROFILE:-}"
 EXPECTED_RUNTIME_DIGEST="${SWITCHYARD_RUNTIME_CONTENT_SHA256:-}"
+manifest_snapshot=""
+mach_o_list=""
+verification_log=""
+prefix=""
+signed_runtime=""
+
+cleanup() {
+  if [ -n "$prefix" ]; then
+    if [ -n "$signed_runtime" ]; then
+      WINEPREFIX="$prefix" "$signed_runtime/bin/wineserver" -k >/dev/null 2>&1 || true
+    fi
+    /bin/rm -rf "$prefix"
+  fi
+  [ -z "$manifest_snapshot" ] || /bin/rm -f "$manifest_snapshot"
+  [ -z "$mach_o_list" ] || /bin/rm -f "$mach_o_list"
+  [ -z "$verification_log" ] || /bin/rm -f "$verification_log"
+}
+trap cleanup EXIT
 
 usage() {
   cat >&2 <<EOF
@@ -58,6 +77,7 @@ done
 [ -d "$RUNTIME" ] || { echo "runtime does not exist: $RUNTIME" >&2; exit 1; }
 [ ! -L "$RUNTIME" ] || { echo "runtime path must not be a symbolic link" >&2; exit 1; }
 [ -f "$RUNTIME/switchyard-runtime.json" ] || { echo "runtime manifest is missing" >&2; exit 1; }
+[ ! -L "$RUNTIME/switchyard-runtime.json" ] || { echo "runtime manifest must not be a symbolic link" >&2; exit 1; }
 [ -f "$ENTITLEMENTS" ] || { echo "runtime signing entitlements are missing" >&2; exit 1; }
 
 manifest_value() {
@@ -84,11 +104,22 @@ write_runtime_content_tree_digest() {
 }
 
 manifest="$RUNTIME/switchyard-runtime.json"
-runtime_id="$(manifest_value id "$manifest")"
-source_revision="$(manifest_value sourceRevision "$manifest")"
-source_dirty="$(manifest_value sourceDirty "$manifest")"
-gptk_path="$(manifest_value gptkPath "$manifest")"
-gptk_digest="$(manifest_value gptkRedistDigest "$manifest")"
+manifest_snapshot="$(/usr/bin/mktemp)"
+/bin/cp "$manifest" "$manifest_snapshot"
+manifest_snapshot_sha256="$(sha256_file "$manifest_snapshot")"
+runtime_profile="$(manifest_value runtimeFamily "$manifest_snapshot")"
+switchyard_runtime_profile_is_known "$runtime_profile" || {
+  echo "runtime manifest has an unknown runtime profile" >&2
+  exit 1
+}
+switchyard_load_runtime_profile "$runtime_profile" || exit $?
+switchyard_require_runtime_profile_enabled || exit $?
+switchyard_validate_runtime_manifest_profile "$manifest_snapshot" "$runtime_profile" || exit 1
+runtime_id="$(manifest_value id "$manifest_snapshot")"
+source_revision="$(manifest_value sourceRevision "$manifest_snapshot")"
+source_dirty="$(manifest_value sourceDirty "$manifest_snapshot")"
+gptk_path="$(manifest_value gptkPath "$manifest_snapshot")"
+gptk_digest="$(manifest_value gptkRedistDigest "$manifest_snapshot")"
 current_revision="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 
 [ -n "$runtime_id" ] || { echo "runtime manifest has no id" >&2; exit 1; }
@@ -105,6 +136,14 @@ runtime_content_tree_is_verified "$RUNTIME" || {
 }
 [ "$(runtime_content_tree_digest "$RUNTIME")" = "$EXPECTED_RUNTIME_DIGEST" ] || {
   echo "release runtime content does not match the separately recorded build digest" >&2
+  exit 1
+}
+[ -f "$manifest" ] && [ ! -L "$manifest" ] || {
+  echo "runtime manifest changed type during release validation" >&2
+  exit 1
+}
+[ "$(sha256_file "$manifest")" = "$manifest_snapshot_sha256" ] || {
+  echo "runtime manifest changed during release validation" >&2
   exit 1
 }
 
@@ -149,7 +188,7 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 release_short_revision="${source_revision:0:12}"
-release_root_name="Switchyard-Wine-Runtime-${release_short_revision}-macos-x86_64"
+release_root_name="Switchyard-Wine-Runtime-${release_short_revision}-${SWITCHYARD_RUNTIME_PROFILE_RELEASE_SUFFIX}"
 signed_runtime="$OUTPUT_DIR/$release_root_name"
 archive_name="${release_root_name}.zip"
 archive="$OUTPUT_DIR/$archive_name"
@@ -176,18 +215,10 @@ runtime_content_tree_is_verified "$signed_runtime" || {
 portable_manifest="$signed_runtime/switchyard-runtime.json"
 /usr/bin/plutil -replace installPrefix -string "." "$portable_manifest"
 /usr/bin/plutil -replace executable -string "bin/switchyard-wine" "$portable_manifest"
+wine_unix_executable="$signed_runtime/lib/wine/${SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH}-unix/wine"
 
 mach_o_list="$(/usr/bin/mktemp)"
 verification_log="$(/usr/bin/mktemp)"
-prefix=""
-cleanup() {
-  if [ -n "$prefix" ]; then
-    WINEPREFIX="$prefix" "$signed_runtime/bin/switchyard-wineserver" -k >/dev/null 2>&1 || true
-    /bin/rm -rf "$prefix"
-  fi
-  /bin/rm -f "$mach_o_list" "$verification_log"
-}
-trap cleanup EXIT
 
 /usr/bin/find "$signed_runtime" -type f -print0 |
 while IFS= read -r -d '' item; do
@@ -209,14 +240,14 @@ while IFS= read -r -d '' item; do
 done < "$mach_o_list"
 
 for launcher in \
-  "$signed_runtime/lib/wine/x86_64-unix/wine" \
+  "$wine_unix_executable" \
   "$signed_runtime/bin/wine.switchyard-real"; do
   [ -f "$launcher" ] || { echo "release runtime is missing launcher $launcher" >&2; exit 1; }
   /usr/bin/codesign --force --sign "$IDENTITY" --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" "$launcher"
 done
 
-wine_sha256="$(sha256_file "$signed_runtime/lib/wine/x86_64-unix/wine")"
+wine_sha256="$(sha256_file "$wine_unix_executable")"
 /usr/bin/plutil -replace integrity.wineUnixSha256 -string "$wine_sha256" "$portable_manifest"
 
 while IFS= read -r -d '' item; do
@@ -226,7 +257,7 @@ while IFS= read -r -d '' item; do
   fi
 done < "$mach_o_list"
 
-signing_details="$(/usr/bin/codesign -d --verbose=4 "$signed_runtime/lib/wine/x86_64-unix/wine" 2>&1)"
+signing_details="$(/usr/bin/codesign -d --verbose=4 "$wine_unix_executable" 2>&1)"
 /usr/bin/printf '%s\n' "$signing_details" | /usr/bin/grep -F "TeamIdentifier=$EXPECTED_TEAM_ID" >/dev/null || {
   echo "signed runtime has an unexpected Developer Team ID" >&2
   exit 1
@@ -242,7 +273,7 @@ smoke_output="$(WINEPREFIX="$prefix" WINEDEBUG=-all "$signed_runtime/bin/switchy
   echo "signed runtime failed the fresh-prefix smoke test" >&2
   exit 1
 }
-WINEPREFIX="$prefix" "$signed_runtime/bin/switchyard-wineserver" -k >/dev/null 2>&1 || true
+WINEPREFIX="$prefix" "$signed_runtime/bin/wineserver" -k >/dev/null 2>&1 || true
 /bin/sleep 1
 /bin/rm -rf "$prefix"
 prefix=""
@@ -269,17 +300,37 @@ if [ -n "$NOTARY_PROFILE" ]; then
   }
 fi
 
+release_pe_architectures=""
+for pe_architecture in "${SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS[@]}"; do
+  [ -z "$release_pe_architectures" ] || release_pe_architectures+=", "
+  release_pe_architectures+="\"$pe_architecture\""
+done
+release_architecture_command=""
+for command_part in "${SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND[@]}"; do
+  [ -z "$release_architecture_command" ] || release_architecture_command+=", "
+  release_architecture_command+="\"$command_part\""
+done
+
 cat > "$release_manifest" <<EOF
 {
   "schemaVersion": 1,
+  "runtimeManifestVersion": $SWITCHYARD_RUNTIME_MANIFEST_VERSION,
   "runtimeID": "$runtime_id",
+  "runtimeProfile": "$SWITCHYARD_RUNTIME_PROFILE",
   "sourceRevision": "$source_revision",
   "archive": "$archive_name",
   "archiveSha256": "$archive_sha256",
   "archiveSize": $archive_size,
   "platform": "macos",
-  "hostArchitecture": "x86_64",
-  "peArchitectures": ["i386", "x86_64"],
+  "hostArchitecture": "$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH",
+  "wineUnixArchitecture": "$SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH",
+  "buildTriplet": "$SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET",
+  "hostTriplet": "$SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET",
+  "architectureCommand": [$release_architecture_command],
+  "requiresRosetta": $SWITCHYARD_RUNTIME_PROFILE_REQUIRES_ROSETTA,
+  "minimumMacOS": "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS",
+  "gstreamerRegistryArchitecture": "$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH",
+  "peArchitectures": [$release_pe_architectures],
   "developerTeamID": "$EXPECTED_TEAM_ID",
   "notarizationStatus": "$notary_status",
   "notarizationID": "$notary_id"

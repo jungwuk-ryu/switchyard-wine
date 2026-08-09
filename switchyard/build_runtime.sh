@@ -5,18 +5,55 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WINE_DIR="$ROOT_DIR"
 SOURCE_REPOSITORY="${SWITCHYARD_WINE_SOURCE_REPOSITORY:-https://github.com/jungwuk-ryu/switchyard-wine}"
 UPSTREAM_BASE_FILE="$ROOT_DIR/switchyard/upstream-base.txt"
-MODE="${1:-build}"
+source "$ROOT_DIR/switchyard/lib/runtime_profile.sh"
 
-case "$MODE" in
-  build|--ensure|--source-info|--verify-media|--verify-mesa|--verify-tls) ;;
-  *)
-    echo "usage: $0 [--ensure|--source-info|--verify-media|--verify-mesa|--verify-tls]" >&2
-    exit 2
-    ;;
-esac
+runtime_build_usage() {
+  echo "usage: $0 [--runtime-profile PROFILE] [build|--ensure|--source-info|--verify-media|--verify-mesa|--verify-tls]" >&2
+  exit 2
+}
 
-BUILD_PROFILE="switchyard-wow64-pe"
-PE_ARCHS=("i386" "x86_64")
+MODE="build"
+mode_was_set=0
+requested_runtime_profile="$SWITCHYARD_DEFAULT_RUNTIME_PROFILE"
+runtime_profile_was_set=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --runtime-profile)
+      [ "$runtime_profile_was_set" -eq 0 ] || {
+        echo "--runtime-profile may be specified only once." >&2
+        runtime_build_usage
+      }
+      [ "$#" -ge 2 ] && [[ "$2" != --* ]] || {
+        echo "--runtime-profile requires a profile name." >&2
+        runtime_build_usage
+      }
+      requested_runtime_profile="$2"
+      runtime_profile_was_set=1
+      shift 2
+      ;;
+    build|--ensure|--source-info|--verify-media|--verify-mesa|--verify-tls)
+      [ "$mode_was_set" -eq 0 ] || {
+        echo "A build mode may be specified only once." >&2
+        runtime_build_usage
+      }
+      MODE="$1"
+      mode_was_set=1
+      shift
+      ;;
+    *) runtime_build_usage ;;
+  esac
+done
+
+switchyard_load_runtime_profile "$requested_runtime_profile" || exit $?
+switchyard_require_runtime_profile_enabled || exit $?
+
+BUILD_PROFILE="$SWITCHYARD_RUNTIME_PROFILE_BUILD_PROFILE"
+PE_ARCHS=("${SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS[@]}")
+WINE_UNIX_ARCH="$SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH"
+HOST_MACHO_ARCH="$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH"
+WINE_BUILD_TRIPLET="$SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET"
+WINE_HOST_TRIPLET="$SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET"
+PROFILE_ARCH_COMMAND=("${SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND[@]}")
 WINE_GRAPHICS_FALLBACK_MODULES=("d3d10" "d3d11" "d3d12" "d3d12core" "dcomp" "dwmapi" "dxgi" "wined3d")
 WINE_MONO_VERSION="11.2.0"
 WINE_MONO_ARCH="x86"
@@ -189,7 +226,8 @@ macos_no_huge_supported() {
   cat >"$temporary_dir/conftest.c" <<'EOF'
 int main(void) { return 0; }
 EOF
-  if arch -x86_64 clang -arch x86_64 "$temporary_dir/conftest.c" -o "$temporary_dir/conftest" -Wl,-no_huge >/dev/null 2>&1; then
+  if "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
+      "$temporary_dir/conftest.c" -o "$temporary_dir/conftest" -Wl,-no_huge >/dev/null 2>&1; then
     rm -rf "$temporary_dir"
     return 0
   fi
@@ -1012,7 +1050,7 @@ EOF
 #include FT_FREETYPE_H
 int main(void) { FT_Library lib; return FT_Init_FreeType(&lib); }
 EOF
-  arch -x86_64 clang -arch x86_64 \
+  "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
     -I"$temporary_prefix/include/freetype2" \
     -L"$temporary_prefix/lib" \
     -Wl,-rpath,"$temporary_prefix/lib" \
@@ -1026,7 +1064,7 @@ EOF
 #include <fontconfig/fontconfig.h>
 int main(void) { return FcInit() ? 0 : 1; }
 EOF
-  arch -x86_64 clang -arch x86_64 \
+  "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
     -I"$temporary_prefix/include" \
     -I"$temporary_prefix/include/freetype2" \
     -L"$temporary_prefix/lib" \
@@ -1475,7 +1513,7 @@ EOF
 #include <gnutls/gnutls.h>
 int main(void) { return gnutls_check_version("3.0") ? 0 : 1; }
 EOF
-  arch -x86_64 clang -arch x86_64 \
+  "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
     -I"$temporary_prefix/include" \
     -L"$temporary_prefix/lib" \
     -Wl,-rpath,"$temporary_prefix/lib" \
@@ -1541,7 +1579,7 @@ verify_gstreamer_runtime() {
   local feature
 
   registry_dir="$(mktemp -d)"
-  registry_path="$registry_dir/registry-x86_64.bin"
+  registry_path="$registry_dir/registry-${SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH}.bin"
   for feature in \
     asfdemux avdec_wmv3 avdec_wmapro audioconvert audioresample \
     decodebin deinterlace videoconvert videoflip; do
@@ -1554,7 +1592,7 @@ verify_gstreamer_runtime() {
       GST_PLUGIN_SCANNER_1_0="$prefix/libexec/gstreamer-1.0/gst-plugin-scanner" \
       GST_REGISTRY_1_0="$registry_path" \
       GST_REGISTRY_FORK=no \
-      arch -x86_64 "$prefix/bin/gst-inspect-1.0" "$feature" >/dev/null
+      "${PROFILE_ARCH_COMMAND[@]}" "$prefix/bin/gst-inspect-1.0" "$feature" >/dev/null
   done
 
   if [ -n "$smoke_asset" ]; then
@@ -1573,7 +1611,7 @@ verify_gstreamer_runtime() {
       GST_PLUGIN_SCANNER_1_0="$prefix/libexec/gstreamer-1.0/gst-plugin-scanner" \
       GST_REGISTRY_1_0="$registry_path" \
       GST_REGISTRY_FORK=no \
-      arch -x86_64 "$prefix/bin/gst-launch-1.0" -q \
+      "${PROFILE_ARCH_COMMAND[@]}" "$prefix/bin/gst-launch-1.0" -q \
         filesrc location="$smoke_asset" ! asfdemux name=demux \
         demux.video_0 ! queue ! avdec_wmv3 ! videoconvert ! fakesink sync=false
   fi
@@ -1763,7 +1801,8 @@ relocate_winegstreamer_for_runtime() {
   fi
 }
 
-if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+if [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_ROSETTA" = "true" ] &&
+   ! "${PROFILE_ARCH_COMMAND[@]}" /usr/bin/true >/dev/null 2>&1; then
   echo "Rosetta is required to build and run the x86_64 Switchyard Wine runtime." >&2
   echo "Install it with: softwareupdate --install-rosetta --agree-to-license" >&2
   exit 1
@@ -1803,7 +1842,7 @@ else
 fi
 patchset_id="switchyard-wine-${wine_revision:0:12}"
 if [ -z "$USER_SET_WINE_BUILD_DIR" ]; then
-  WINE_BUILD_DIR="${HOME}/Library/Caches/Switchyard/Wine/build-wow64-x86_64-${source_identity}"
+  WINE_BUILD_DIR="${HOME}/Library/Caches/Switchyard/Wine/${SWITCHYARD_RUNTIME_PROFILE_BUILD_CACHE_BASENAME}-${source_identity}"
 fi
 assert_source_state_unchanged "source metadata capture"
 if [ "$MODE" = "--source-info" ]; then
@@ -1814,6 +1853,15 @@ if [ "$MODE" = "--source-info" ]; then
   echo "sourceTreeDigest=$source_digest"
   echo "patchsetID=$patchset_id"
   echo "gptkOverlayDisabled=$DISABLE_GPTK_OVERLAY"
+  echo "runtimeProfile=$SWITCHYARD_RUNTIME_PROFILE"
+  echo "hostMachOArchitecture=$HOST_MACHO_ARCH"
+  echo "wineUnixArchitecture=$WINE_UNIX_ARCH"
+  echo "peArchitectures=$SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV"
+  echo "wineBuildTriplet=$WINE_BUILD_TRIPLET"
+  echo "wineHostTriplet=$WINE_HOST_TRIPLET"
+  echo "requiresRosetta=$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_ROSETTA"
+  echo "minimumMacOS=$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
+  echo "gstreamerRegistryArchitecture=$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH"
   exit 0
 fi
 
@@ -1877,7 +1925,7 @@ else
   tls_dlopen_digest="none"
 fi
 
-runtime_id="switchyard-local-wow64-x86_64-${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${gstreamer_deps_digest}-${vulkan_deps_digest}-${mesa_windows_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
+runtime_id="${SWITCHYARD_RUNTIME_PROFILE_ID_PREFIX}${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${gstreamer_deps_digest}-${vulkan_deps_digest}-${mesa_windows_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
 if [ -z "$USER_SET_WINE_INSTALL_PREFIX" ]; then
   WINE_INSTALL_PREFIX="${HOME}/.switchyard/runtimes/$runtime_id"
 fi
@@ -1912,6 +1960,8 @@ runtime_is_complete_at() {
 
   [ -f "$manifest" ] || return 1
   runtime_content_tree_is_verified "$prefix" || return 1
+  switchyard_validate_runtime_manifest_profile "$manifest" "$SWITCHYARD_RUNTIME_PROFILE" \
+    >/dev/null 2>&1 || return 1
   manifest_id="$(/usr/bin/plutil -extract id raw -o - "$manifest" 2>/dev/null || true)"
   [ "$manifest_id" = "$runtime_id" ] || return 1
   manifest_install_prefix="$(/usr/bin/plutil -extract installPrefix raw -o - "$manifest" 2>/dev/null || true)"
@@ -1923,14 +1973,14 @@ runtime_is_complete_at() {
   [ -f "$prefix/share/switchyard/metal_hud_safety.sh" ] || return 1
   [ -f "$prefix/share/switchyard/gpu_capability_policy.sh" ] || return 1
   [ -x "$prefix/libexec/switchyard-host-gpu-info" ] || return 1
-  [ -x "$prefix/lib/wine/x86_64-unix/wine" ] || return 1
+  [ -x "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/wine" ] || return 1
   [ -f "$prefix/lib/wine/i386-windows/ntdll.dll" ] || return 1
   [ -f "$prefix/lib/wine/x86_64-windows/ntdll.dll" ] || return 1
   expected_wine_sha="$(/usr/bin/plutil -extract integrity.wineUnixSha256 raw -o - "$manifest" 2>/dev/null || true)"
   expected_i386_ntdll_sha="$(/usr/bin/plutil -extract integrity.i386NtdllSha256 raw -o - "$manifest" 2>/dev/null || true)"
   expected_x86_64_ntdll_sha="$(/usr/bin/plutil -extract integrity.x86_64NtdllSha256 raw -o - "$manifest" 2>/dev/null || true)"
   [ -n "$expected_wine_sha" ] &&
-    [ "$(sha256_file "$prefix/lib/wine/x86_64-unix/wine")" = "$expected_wine_sha" ] || return 1
+    [ "$(sha256_file "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/wine")" = "$expected_wine_sha" ] || return 1
   [ -n "$expected_i386_ntdll_sha" ] &&
     [ "$(sha256_file "$prefix/lib/wine/i386-windows/ntdll.dll")" = "$expected_i386_ntdll_sha" ] || return 1
   [ -n "$expected_x86_64_ntdll_sha" ] &&
@@ -1943,10 +1993,10 @@ runtime_is_complete_at() {
   for plugin in "${GSTREAMER_PLUGIN_FILES[@]}"; do
     [ -f "$prefix/lib/switchyard-gstreamer/lib/gstreamer-1.0/$plugin" ] || return 1
   done
-  [ -f "$prefix/lib/wine/x86_64-unix/winegstreamer.so" ] || return 1
-  otool -L "$prefix/lib/wine/x86_64-unix/winegstreamer.so" |
+  [ -f "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/winegstreamer.so" ] || return 1
+  otool -L "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/winegstreamer.so" |
     grep -F '@rpath/libgstreamer-1.0.0.dylib' >/dev/null || return 1
-  otool -l "$prefix/lib/wine/x86_64-unix/winegstreamer.so" |
+  otool -l "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/winegstreamer.so" |
     grep -F '@loader_path/../../switchyard-gstreamer/lib' >/dev/null || return 1
   manifest_mesa_digest="$(/usr/bin/plutil -extract mesaOpenGL.digest raw -o - "$manifest" 2>/dev/null || true)"
   [ "$manifest_mesa_digest" = "$mesa_windows_digest" ] || return 1
@@ -2076,13 +2126,13 @@ if [ "$configured" -eq 0 ]; then
     CPPFLAGS="${configure_cppflags} ${CPPFLAGS:-}" \
     LDFLAGS="${configure_ldflags} ${LDFLAGS:-}" \
     PKG_CONFIG_PATH="${configure_pkg_config_path}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" \
-    arch -x86_64 "$WINE_DIR/configure" \
-      --build=x86_64-apple-darwin \
-      --host=x86_64-apple-darwin \
-      CC="clang -arch x86_64" \
-      CXX="clang++ -arch x86_64" \
-      OBJC="clang -arch x86_64" \
-      --enable-archs=i386,x86_64 \
+    "${PROFILE_ARCH_COMMAND[@]}" "$WINE_DIR/configure" \
+      --build="$WINE_BUILD_TRIPLET" \
+      --host="$WINE_HOST_TRIPLET" \
+      CC="clang -arch $HOST_MACHO_ARCH" \
+      CXX="clang++ -arch $HOST_MACHO_ARCH" \
+      OBJC="clang -arch $HOST_MACHO_ARCH" \
+      --enable-archs="$SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV" \
       --disable-tests \
       --without-alsa \
       --without-capi \
@@ -2307,7 +2357,7 @@ install -m 0644 "$ROOT_DIR/switchyard/lib/gpu_capability_policy.sh" \
   "$WINE_INSTALL_PREFIX/share/switchyard/gpu_capability_policy.sh"
 mkdir -p "$WINE_INSTALL_PREFIX/libexec"
 echo "building the D3DMetal host GPU identity helper"
-arch -x86_64 clang -arch x86_64 -fobjc-arc -Wall -Wextra -Werror \
+"${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" -fobjc-arc -Wall -Wextra -Werror \
   -mmacosx-version-min="$TLS_MIN_MACOS_VERSION" \
   "$ROOT_DIR/switchyard/host_gpu_info.m" \
   -framework Foundation -framework IOKit -framework Metal \
@@ -2407,7 +2457,7 @@ export GST_PLUGIN_PATH=
 export GST_PLUGIN_PATH_1_0=
 export GST_PLUGIN_SCANNER="$gstreamer_scanner"
 export GST_PLUGIN_SCANNER_1_0="$gstreamer_scanner"
-export GST_REGISTRY="$gstreamer_registry_dir/registry-x86_64.bin"
+export GST_REGISTRY="$gstreamer_registry_dir/registry-__SWITCHYARD_GSTREAMER_REGISTRY_ARCH__.bin"
 export GST_REGISTRY_1_0="$GST_REGISTRY"
 # Forked plugin discovery can stall when both sides are translated by Rosetta.
 # The curated plugin set is small enough to register safely in the Wine process.
@@ -2468,9 +2518,9 @@ if [ "$invoked_name" = "switchyard-wine" ]; then
   invoked_path="$bin_dir/wine"
 fi
 
-real_executable="$runtime_dir/lib/wine/x86_64-unix/wine"
+real_executable="$runtime_dir/lib/wine/__SWITCHYARD_WINE_UNIX_ARCH__-unix/wine"
 if [ "$invoked_name" = "wine64" ]; then
-  real_executable="$runtime_dir/lib/wine/x86_64-unix/wine"
+  real_executable="$runtime_dir/lib/wine/__SWITCHYARD_WINE_UNIX_ARCH__-unix/wine"
 fi
 
 if [ ! -x "$real_executable" ]; then
@@ -2486,6 +2536,12 @@ fi
 
 exec -a "$invoked_path" "$real_executable" "$@"
 EOF
+SWITCHYARD_WRAPPER_GSTREAMER_REGISTRY_ARCH="$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH" \
+SWITCHYARD_WRAPPER_WINE_UNIX_ARCH="$WINE_UNIX_ARCH" \
+  perl -0pi -e '
+    s/__SWITCHYARD_GSTREAMER_REGISTRY_ARCH__/$ENV{SWITCHYARD_WRAPPER_GSTREAMER_REGISTRY_ARCH}/g;
+    s/__SWITCHYARD_WINE_UNIX_ARCH__/$ENV{SWITCHYARD_WRAPPER_WINE_UNIX_ARCH}/g;
+  ' "$WINE_INSTALL_PREFIX/bin/wine"
 chmod 0755 "$WINE_INSTALL_PREFIX/bin/wine"
 if [ -x "$WINE_INSTALL_PREFIX/bin/wine64.switchyard-real" ]; then
   cp "$WINE_INSTALL_PREFIX/bin/wine" "$WINE_INSTALL_PREFIX/bin/wine64"
@@ -2495,7 +2551,7 @@ fi
 staged_wine_executable="$WINE_INSTALL_PREFIX/bin/switchyard-wine"
 ln -sf wine "$staged_wine_executable"
 wine_executable="$FINAL_WINE_INSTALL_PREFIX/bin/switchyard-wine"
-wine_unix_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-unix/wine")"
+wine_unix_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/$WINE_UNIX_ARCH-unix/wine")"
 i386_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/i386-windows/ntdll.dll")"
 x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows/ntdll.dll")"
 
@@ -2503,8 +2559,30 @@ assert_source_state_unchanged "runtime assembly"
 
 {
   printf '{\n'
+  printf '  "manifestVersion": %s,\n' "$SWITCHYARD_RUNTIME_MANIFEST_VERSION"
   printf '  "id": %s,\n' "$(json_string "$runtime_id")"
+  printf '  "runtimeFamily": %s,\n' "$(json_string "$SWITCHYARD_RUNTIME_PROFILE")"
   printf '  "buildProfile": %s,\n' "$(json_string "$BUILD_PROFILE")"
+  printf '  "host": {\n'
+  printf '    "platform": "macos",\n'
+  printf '    "architecture": %s,\n' "$(json_string "$HOST_MACHO_ARCH")"
+  printf '    "wineUnixArchitecture": %s,\n' "$(json_string "$WINE_UNIX_ARCH")"
+  printf '    "buildTriplet": %s,\n' "$(json_string "$WINE_BUILD_TRIPLET")"
+  printf '    "hostTriplet": %s,\n' "$(json_string "$WINE_HOST_TRIPLET")"
+  printf '    "architectureCommand": [\n'
+  for index in "${!PROFILE_ARCH_COMMAND[@]}"; do
+    if [ "$index" -lt "$((${#PROFILE_ARCH_COMMAND[@]} - 1))" ]; then
+      printf '      %s,\n' "$(json_string "${PROFILE_ARCH_COMMAND[$index]}")"
+    else
+      printf '      %s\n' "$(json_string "${PROFILE_ARCH_COMMAND[$index]}")"
+    fi
+  done
+  printf '    ],\n'
+  printf '    "requiresRosetta": %s,\n' "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_ROSETTA"
+  printf '    "minimumMacOS": %s,\n' "$(json_string "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS")"
+  printf '    "gstreamerRegistryArchitecture": %s\n' \
+    "$(json_string "$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH")"
+  printf '  },\n'
   printf '  "peArchitectures": [\n'
   for index in "${!PE_ARCHS[@]}"; do
     if [ "$index" -lt "$((${#PE_ARCHS[@]} - 1))" ]; then
@@ -2554,7 +2632,8 @@ assert_source_state_unchanged "runtime assembly"
   printf '    "root": "lib/switchyard-gstreamer",\n'
   printf '    "digest": %s,\n' "$(json_string "$gstreamer_deps_digest")"
   printf '    "version": %s,\n' "$(json_string "$GSTREAMER_VERSION")"
-  printf '    "architecture": "universal (x86_64 used by Wine under Rosetta)",\n'
+  printf '    "architecture": %s,\n' \
+    "$(json_string "$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_ARCHITECTURE_DESCRIPTION")"
   printf '    "runtimePackage": %s,\n' "$(json_string "$GSTREAMER_RUNTIME_PACKAGE")"
   printf '    "runtimePackageUrl": %s,\n' \
     "$(json_string "$GSTREAMER_PACKAGE_BASE_URL/$GSTREAMER_RUNTIME_PACKAGE")"
@@ -2599,7 +2678,7 @@ assert_source_state_unchanged "runtime assembly"
   printf '  "fontRuntime": {\n'
   printf '    "root": "lib/switchyard-fonts",\n'
   printf '    "digest": %s,\n' "$(json_string "$font_deps_digest")"
-  printf '    "architecture": "x86_64",\n'
+  printf '    "architecture": %s,\n' "$(json_string "$HOST_MACHO_ARCH")"
   printf '    "freetypeDlopenName": %s,\n' "$(json_string "$FONT_DLOPEN_FREETYPE")"
   printf '    "fontconfigDlopenName": %s,\n' "$(json_string "$FONT_DLOPEN_FONTCONFIG")"
   printf '    "license": "FreeType License/GPL dual-license, MIT-style fontconfig, libpng License, LGPL/GPL gettext components; preserve upstream notices when distributing",\n'
@@ -2638,7 +2717,7 @@ assert_source_state_unchanged "runtime assembly"
     printf '  "tlsRuntime": {\n'
     printf '    "root": "lib/switchyard-tls",\n'
     printf '    "digest": %s,\n' "$(json_string "$tls_deps_digest")"
-    printf '    "architecture": "x86_64",\n'
+    printf '    "architecture": %s,\n' "$(json_string "$HOST_MACHO_ARCH")"
     printf '    "dlopenName": %s,\n' "$(json_string "$TLS_DLOPEN_NAME")"
     printf '    "license": "redistributable conda-forge and source-built GnuTLS dependency closure with notices",\n'
     printf '    "packageManifest": "lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv",\n'
@@ -2650,7 +2729,7 @@ assert_source_state_unchanged "runtime assembly"
   printf '  "vulkanRuntime": {\n'
   printf '    "root": "lib/switchyard-vulkan",\n'
   printf '    "digest": %s,\n' "$(json_string "$vulkan_deps_digest")"
-  printf '    "architecture": "x86_64",\n'
+  printf '    "architecture": %s,\n' "$(json_string "$HOST_MACHO_ARCH")"
   printf '    "license": "Apache-2.0",\n'
   printf '    "icdFile": "lib/switchyard-vulkan/etc/vulkan/icd.d/MoltenVK_icd.json",\n'
   printf '    "vulkanLoader": {\n'
@@ -2674,6 +2753,11 @@ assert_source_state_unchanged "runtime assembly"
   printf '  }\n'
   printf '}\n'
 } >"$WINE_INSTALL_PREFIX/switchyard-runtime.json"
+if ! switchyard_validate_runtime_manifest_profile \
+     "$WINE_INSTALL_PREFIX/switchyard-runtime.json" "$SWITCHYARD_RUNTIME_PROFILE"; then
+  echo "Refusing to publish a runtime with inconsistent profile metadata." >&2
+  exit 1
+fi
 runtime_content_sha256="$(write_runtime_content_tree_digest "$WINE_INSTALL_PREFIX")"
 
 if ! runtime_is_complete_at "$WINE_INSTALL_PREFIX"; then
