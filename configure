@@ -12364,11 +12364,15 @@ case $host_os in
     SYSTEMCONFIGURATION_LIBS="-framework SystemConfiguration"
 
 
-    WINELOADER_LDFLAGS="-Wl,-segalign,0x1000,-pagezero_size,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
+    WINELOADER_LDFLAGS="-Wl,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
 
     case $HOST_ARCH in
-      i386) wine_use_preloader=yes ;;
+      i386)
+        WINELOADER_LDFLAGS="-Wl,-segalign,0x1000,-pagezero_size,0x1000 $WINELOADER_LDFLAGS"
+        wine_use_preloader=yes
+        ;;
       x86_64)
+        WINELOADER_LDFLAGS="-Wl,-segalign,0x1000,-pagezero_size,0x1000 $WINELOADER_LDFLAGS"
                 { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether the compiler supports -Wl,-no_huge" >&5
 printf %s "checking whether the compiler supports -Wl,-no_huge... " >&6; }
 if test ${ac_cv_cflags__Wl__no_huge+y}
