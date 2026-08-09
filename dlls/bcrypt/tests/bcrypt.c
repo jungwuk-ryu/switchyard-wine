@@ -2298,6 +2298,12 @@ static void test_ECDSA(void)
     ok(status == STATUS_INVALID_PARAMETER, "Expected STATUS_INVALID_PARAMETER, got %#lx\n", status);
 
     ecckey->dwMagic = BCRYPT_ECDSA_PUBLIC_P256_MAGIC;
+    memset(ecckey + 1, 0, sizeof(eccPubkey));
+    status = BCryptImportKeyPair(alg, NULL, BCRYPT_ECCPUBLIC_BLOB, &key, buffer, size, 0);
+    ok(status == STATUS_INVALID_PARAMETER, "Expected STATUS_INVALID_PARAMETER, got %#lx\n", status);
+    if (!status) BCryptDestroyKey(key);
+
+    memcpy(ecckey + 1, eccPubkey, sizeof(eccPubkey));
     ecckey->cbKey = 32;
     status = BCryptImportKeyPair(alg, NULL, BCRYPT_PUBLIC_KEY_BLOB, &key, buffer, size, 0);
     ok(!status, "BCryptImportKeyPair failed: %#lx\n", status);
@@ -3334,7 +3340,7 @@ static void test_ECDH_alg(const struct ecdh_test *t)
     BYTE *buf;
     BCRYPT_ECCKEY_BLOB *ecckey;
     BCRYPT_ALG_HANDLE alg;
-    BCRYPT_KEY_HANDLE key, privkey, pubkey;
+    BCRYPT_KEY_HANDLE key, privkey, pubkey, invalid_key;
     BCRYPT_SECRET_HANDLE secret;
     NTSTATUS status;
     ULONG size;
@@ -3369,6 +3375,12 @@ static void test_ECDH_alg(const struct ecdh_test *t)
 
     status = BCryptImportKeyPair(alg, NULL, BCRYPT_ECCPUBLIC_BLOB, &pubkey, buf, size, 0);
     ok(status == STATUS_SUCCESS, "got %#lx\n", status);
+
+    memset(ecckey + 1, 0, ecckey->cbKey * 2);
+    invalid_key = NULL;
+    status = BCryptImportKeyPair(alg, NULL, BCRYPT_ECCPUBLIC_BLOB, &invalid_key, buf, size, 0);
+    ok(status == STATUS_INVALID_PARAMETER, "got %#lx\n", status);
+    if (!status) BCryptDestroyKey(invalid_key);
     free(buf);
 
     size = 0;
@@ -3674,6 +3686,16 @@ static void test_ECDH(void)
     blob = (BCRYPT_ECCKEY_BLOB *)buf;
     ok(blob->dwMagic == BCRYPT_ECDH_PRIVATE_GENERIC_MAGIC, "got %08lx\n", blob->dwMagic);
     ok(blob->cbKey == 32, "got %lu\n", blob->cbKey);
+
+    blob->dwMagic = BCRYPT_ECDH_PUBLIC_GENERIC_MAGIC;
+    blob->cbKey--;
+    key2 = NULL;
+    status = BCryptImportKeyPair(alg, NULL, BCRYPT_ECCPUBLIC_BLOB, &key2, buf,
+                                 sizeof(*blob) + blob->cbKey * 2, 0);
+    ok(status == STATUS_INVALID_PARAMETER, "got %#lx\n", status);
+    if (!status) BCryptDestroyKey(key2);
+    blob->dwMagic = BCRYPT_ECDH_PRIVATE_GENERIC_MAGIC;
+    blob->cbKey++;
 
     status = BCryptImportKeyPair(alg, NULL, BCRYPT_ECCPUBLIC_BLOB, &key2, buf, size, 0);
     ok(status == STATUS_SUCCESS, "got %#lx\n", status);
