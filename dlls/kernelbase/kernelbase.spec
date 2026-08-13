@@ -930,6 +930,7 @@
 @ stdcall IsValidSecurityDescriptor(ptr)
 @ stdcall IsValidSid(ptr)
 @ stdcall IsWellKnownSid(ptr long)
+@ stdcall IsWow64GuestMachineSupported(long ptr)
 @ stdcall IsWow64Process(ptr ptr)
 @ stdcall IsWow64Process2(ptr ptr ptr)
 @ stdcall K32EmptyWorkingSet(long) EmptyWorkingSet

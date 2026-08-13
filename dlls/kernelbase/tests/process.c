@@ -29,9 +29,11 @@
 #include <winternl.h>
 #include <appmodel.h>
 
+#include "wine/exception.h"
 #include "wine/test.h"
 
 static NTSTATUS (WINAPI *pNtQueryObject)(HANDLE,OBJECT_INFORMATION_CLASS,PVOID,ULONG,PULONG);
+static NTSTATUS (WINAPI *pNtQuerySystemInformationEx)(SYSTEM_INFORMATION_CLASS,void*,ULONG,void*,ULONG,ULONG*);
 
 static BOOL (WINAPI *pCompareObjectHandles)(HANDLE, HANDLE);
 static LPVOID (WINAPI *pMapViewOfFile3)(HANDLE, HANDLE, PVOID, ULONG64 offset, SIZE_T size,
@@ -45,6 +47,8 @@ static HANDLE (WINAPI *pCreateFileMappingFromApp)(HANDLE, PSECURITY_ATTRIBUTES, 
 static LPVOID (WINAPI *pMapViewOfFileFromApp)(HANDLE, ULONG, ULONG64, SIZE_T);
 static BOOL (WINAPI *pUnmapViewOfFile2)(HANDLE, void *, ULONG);
 static HRESULT (WINAPI *pGetMachineTypeAttributes)(USHORT, MACHINE_ATTRIBUTES *);
+static HRESULT (WINAPI *pIsWow64GuestMachineSupported)(USHORT, BOOL *);
+static HRESULT (WINAPI *pKernel32IsWow64GuestMachineSupported)(USHORT, BOOL *);
 static BOOL (WINAPI *pIsWow64Process2)(HANDLE, USHORT *, USHORT *);
 static BOOL (WINAPI *pGetProcessInformation)(HANDLE, PROCESS_INFORMATION_CLASS, void *, DWORD);
 static BOOL (WINAPI *pSetProcessInformation)(HANDLE, PROCESS_INFORMATION_CLASS, void *, DWORD);
@@ -790,6 +794,106 @@ static void test_GetMachineTypeAttributes(void)
     }
 }
 
+static BOOL is_guest_machine( const SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION *machines,
+                              USHORT machine )
+{
+    for (unsigned int i = 0; machines[i].Machine; i++)
+        if (machines[i].Machine == machine && machines[i].UserMode && !machines[i].Native)
+            return TRUE;
+    return FALSE;
+}
+
+static void test_IsWow64GuestMachineSupported(void)
+{
+    static const USHORT test_machines[] =
+    {
+        IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_TARGET_HOST, IMAGE_FILE_MACHINE_I386,
+        IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, 0xffff
+    };
+    SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION machines[8];
+    HRESULT (WINAPI *functions[])(USHORT, BOOL *) =
+    {
+        pIsWow64GuestMachineSupported, pKernel32IsWow64GuestMachineSupported
+    };
+    static const char * const function_names[] = { "kernelbase", "kernel32" };
+    HANDLE process = NULL;
+    NTSTATUS status;
+    HRESULT hr;
+    DWORD exception;
+    BOOL supported, expected, arm64_native = FALSE;
+
+    if (!pIsWow64GuestMachineSupported)
+    {
+        win_skip("IsWow64GuestMachineSupported() is not supported.\n");
+        return;
+    }
+
+    if (!pNtQuerySystemInformationEx)
+    {
+        win_skip("NtQuerySystemInformationEx() is not supported.\n");
+        return;
+    }
+
+    status = pNtQuerySystemInformationEx( SystemSupportedProcessorArchitectures2, &process, sizeof(process),
+                                          machines, sizeof(machines), NULL );
+    if (status)
+    {
+        win_skip("SystemSupportedProcessorArchitectures2 failed, status %#lx.\n", status);
+        return;
+    }
+    for (unsigned int i = 0; machines[i].Machine; i++)
+        if (machines[i].Machine == IMAGE_FILE_MACHINE_ARM64 && machines[i].Native)
+            arm64_native = TRUE;
+
+    for (unsigned int i = 0; i < ARRAY_SIZE(functions); i++)
+    {
+        if (!functions[i])
+        {
+            ok( 0, "%s IsWow64GuestMachineSupported() export is missing.\n", function_names[i] );
+            continue;
+        }
+
+        for (unsigned int j = 0; j < ARRAY_SIZE(test_machines); j++)
+        {
+            expected = is_guest_machine( machines, test_machines[j] );
+            supported = 0xdeadbeef;
+            hr = functions[i]( test_machines[j], &supported );
+            ok( hr == S_OK, "%s machine %#x returned %#lx.\n",
+                function_names[i], test_machines[j], hr );
+            ok( supported == expected, "%s machine %#x returned %d, expected %d.\n",
+                function_names[i], test_machines[j], supported, expected );
+        }
+
+        if (sizeof(void *) == 4 && arm64_native)
+        {
+            skip("%s NULL output cannot be tested by the i386 provider on ARM64.\n",
+                 function_names[i]);
+            continue;
+        }
+
+        exception = 0;
+        __TRY
+        {
+            functions[i]( IMAGE_FILE_MACHINE_I386, NULL );
+        }
+        __EXCEPT_ALL
+        {
+            exception = GetExceptionCode();
+        }
+        __ENDTRY
+        ok( exception == STATUS_ACCESS_VIOLATION, "%s NULL output raised %#lx.\n",
+            function_names[i], exception );
+    }
+
+    if (arm64_native)
+    {
+        supported = FALSE;
+        hr = pIsWow64GuestMachineSupported( IMAGE_FILE_MACHINE_AMD64, &supported );
+        ok( hr == S_OK, "AMD64 on ARM64 returned %#lx.\n", hr );
+        ok( supported, "AMD64 guest support was not reported on ARM64.\n" );
+    }
+}
+
 static void init_funcs(void)
 {
     HMODULE hmod = GetModuleHandleA("kernelbase.dll");
@@ -801,6 +905,7 @@ static void init_funcs(void)
     X(CreateFileMappingFromApp);
     X(GetMachineTypeAttributes);
     X(GetProcessInformation);
+    X(IsWow64GuestMachineSupported);
     X(IsWow64Process2);
     X(MapViewOfFile3);
     X(MapViewOfFileFromApp);
@@ -812,9 +917,13 @@ static void init_funcs(void)
     X(VirtualProtectFromApp);
     X(UnmapViewOfFile2);
 
+    hmod = GetModuleHandleA("kernel32.dll");
+    pKernel32IsWow64GuestMachineSupported = (void *)GetProcAddress(hmod, "IsWow64GuestMachineSupported");
+
     hmod = GetModuleHandleA("ntdll.dll");
 
     X(NtQueryObject);
+    X(NtQuerySystemInformationEx);
 #undef X
 }
 
@@ -836,4 +945,5 @@ START_TEST(process)
     test_ProcessShutdownParameters();
     test_ProcessPowerThrottling();
     test_GetMachineTypeAttributes();
+    test_IsWow64GuestMachineSupported();
 }

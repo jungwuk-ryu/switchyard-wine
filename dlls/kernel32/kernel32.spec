@@ -1032,6 +1032,7 @@
 @ stdcall -import IsValidLocaleName(wstr)
 @ stdcall -import IsValidNLSVersion(long wstr ptr)
 # @ stub IsValidUILanguage
+@ stdcall -import IsWow64GuestMachineSupported(long ptr)
 @ stdcall -import IsWow64Process(ptr ptr)
 @ stdcall -import IsWow64Process2(ptr ptr ptr)
 @ stdcall -import K32EmptyWorkingSet(long)

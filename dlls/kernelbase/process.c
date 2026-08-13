@@ -1188,6 +1188,34 @@ BOOL WINAPI DECLSPEC_HOTPATCH IsWow64Process2( HANDLE process, USHORT *machine, 
 
 
 /**********************************************************************
+ *           IsWow64GuestMachineSupported   (kernelbase.@)
+ */
+HRESULT WINAPI IsWow64GuestMachineSupported( USHORT machine, BOOL *supported )
+{
+    SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION machines[8];
+    HANDLE process = NULL;
+    NTSTATUS status;
+    BOOL result = FALSE;
+
+    status = NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures2, &process, sizeof(process),
+                                         machines, sizeof(machines), NULL );
+    if (status) return HRESULT_FROM_NT(status);
+
+    for (unsigned int i = 0; machines[i].Machine; i++)
+    {
+        if (machines[i].Machine == machine && machines[i].UserMode && !machines[i].Native)
+        {
+            result = TRUE;
+            break;
+        }
+    }
+
+    *supported = result;
+    return S_OK;
+}
+
+
+/**********************************************************************
  *           IsWow64Process   (kernelbase.@)
  */
 BOOL WINAPI DECLSPEC_HOTPATCH IsWow64Process( HANDLE process, PBOOL wow64 )
