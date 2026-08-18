@@ -791,6 +791,7 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
     NTSTATUS status;
     ssize_t ret;
 
+    *size = 0;
     memset( &hdr, 0, sizeof(hdr) );
     if (async->addr || async->icmp_over_dgram)
     {

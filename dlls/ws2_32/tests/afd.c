@@ -1545,6 +1545,68 @@ static void test_recv(void)
     ok(io.Information == 5, "got %#Ix\n", io.Information);
     ok(!strcmp(buffer, "da\xccta"), "got %s\n", debugstr_an(buffer, io.Information));
 
+    /* Test that a receive warning without transferred data reports zero through
+     * both the IOSB and completion port. */
+    {
+        LARGE_INTEGER zero = {{0}};
+        IO_STATUS_BLOCK completion_io;
+        ULONG_PTR key, value;
+        HANDLE port;
+
+        port = CreateIoCompletionPort((HANDLE)client, NULL, 0, 0);
+        ok(!!port, "got error %lu\n", GetLastError());
+
+        ret = send(server, "xy", 2, 0);
+        ok(ret == 2, "got %d\n", ret);
+
+        /* wait for the data to be available */
+        check_poll_mask(client, event, AFD_POLL_READ, AFD_POLL_READ);
+
+        wsabufs[0].len = 1;
+        params.count = 1;
+        memset(&io, 0xcc, sizeof(io));
+        ret = NtDeviceIoControlFile((HANDLE)client, event, NULL, NULL, &io,
+                IOCTL_AFD_RECV, &params, sizeof(params), NULL, 0);
+        ok(!ret, "got %#x\n", ret);
+        ok(!io.Status, "got %#lx\n", io.Status);
+        ok(io.Information == 1, "got %#Ix\n", io.Information);
+        ok(buffer[0] == 'x', "got %#x\n", buffer[0]);
+
+        params.count = 0;
+        memset(&io, 0xcc, sizeof(io));
+        ret = NtDeviceIoControlFile((HANDLE)client, event, NULL, (void *)0xdeadbeef, &io,
+                IOCTL_AFD_RECV, &params, sizeof(params), NULL, 0);
+        ok(ret == STATUS_INVALID_PARAMETER || ret == STATUS_BUFFER_OVERFLOW || !ret,
+                "got %#x\n", ret);
+        if (ret != STATUS_INVALID_PARAMETER)
+        {
+            ok(io.Status == ret, "got status %#lx\n", io.Status);
+            ok(!io.Information, "got information %#Ix\n", io.Information);
+
+            key = value = 0xcccccccc;
+            memset(&completion_io, 0xcc, sizeof(completion_io));
+            ret = NtRemoveIoCompletion(port, &key, &value, &completion_io, &zero);
+            ok(!ret, "got %#x\n", ret);
+            ok(!key, "got key %#Ix\n", key);
+            ok(value == 0xdeadbeef, "got value %#Ix\n", value);
+            ok(completion_io.Status == io.Status, "got status %#lx\n", completion_io.Status);
+            ok(!completion_io.Information, "got information %#Ix\n", completion_io.Information);
+        }
+
+        params.count = 1;
+        memset(&io, 0xcc, sizeof(io));
+        ret = NtDeviceIoControlFile((HANDLE)client, event, NULL, NULL, &io,
+                IOCTL_AFD_RECV, &params, sizeof(params), NULL, 0);
+        ok(!ret, "got %#x\n", ret);
+        ok(!io.Status, "got %#lx\n", io.Status);
+        ok(io.Information == 1, "got %#Ix\n", io.Information);
+        ok(buffer[0] == 'y', "got %#x\n", buffer[0]);
+
+        CloseHandle(port);
+        wsabufs[0].len = 2;
+        params.count = 2;
+    }
+
     /* Test nonblocking mode. */
 
     set_blocking(client, FALSE);
