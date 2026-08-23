@@ -9072,28 +9072,57 @@ static BOOL is_inside_thread_stack( struct thread_data *data, void *ptr, struct 
  *           grow_thread_stack
  */
 static NTSTATUS grow_thread_stack( struct thread_data *data, char *page,
-                                   struct thread_stack_info *stack_info,
-                                   BOOL *protect_failed )
+                                   struct thread_stack_info *stack_info )
 {
-    NTSTATUS ret = 0;
-    BOOL failed = FALSE;
+    BYTE old_vprot[VPROT_STACK_SNAPSHOT_PAGES];
     SIZE_T stack_page_size = stack_info->is_wow ? page_size : host_page_size;
     SIZE_T guaranteed = ROUND_SIZE( 0, stack_info->guaranteed, stack_page_size - 1 );
+    char *lower_page;
+    size_t i, snapshot_size, snapshot_pages;
+    BOOL overflow = FALSE;
 
-    set_page_vprot_bits( page, stack_page_size, VPROT_COMMITTED, VPROT_GUARD );
-    if (mprotect_range( page, stack_page_size, 0, 0 )) failed = TRUE;
     if (page >= stack_info->start + stack_page_size + guaranteed)
     {
-        set_page_vprot_bits( page - stack_page_size, stack_page_size,
+        lower_page = page - stack_page_size;
+        snapshot_size = 2 * stack_page_size;
+        snapshot_pages = snapshot_size >> page_shift;
+        if (snapshot_pages > ARRAY_SIZE(old_vprot)) return STATUS_ACCESS_DENIED;
+        for (i = 0; i < snapshot_pages; i++)
+            old_vprot[i] = get_page_vprot( lower_page + i * page_size );
+
+        /* Establish the new guard physically before publishing it.  This is
+         * particularly important for two 4K WoW lanes sharing one 16K host
+         * page: the second projection must see the staged lower-lane guard. */
+        if (mprotect_range( lower_page, stack_page_size,
+                            VPROT_COMMITTED | VPROT_GUARD, 0 ))
+        {
+            restore_vprot_or_abort( lower_page, snapshot_size, old_vprot );
+            return STATUS_ACCESS_DENIED;
+        }
+        set_page_vprot_bits( lower_page, stack_page_size,
                              VPROT_COMMITTED | VPROT_GUARD, 0 );
-        if (mprotect_range( page - stack_page_size, stack_page_size, 0, 0 )) failed = TRUE;
+
+        if (mprotect_range( page, stack_page_size,
+                            VPROT_COMMITTED, VPROT_GUARD ))
+        {
+            restore_vprot_or_abort( lower_page, snapshot_size, old_vprot );
+            return STATUS_ACCESS_DENIED;
+        }
+        set_page_vprot_bits( page, stack_page_size, VPROT_COMMITTED, VPROT_GUARD );
     }
     else  /* inside guaranteed space -> overflow exception */
     {
+        overflow = TRUE;
         page = stack_info->start + stack_page_size;
+        if (mprotect_range( page, guaranteed, VPROT_COMMITTED, VPROT_GUARD ))
+        {
+            /* The failed domain walk may already have changed earlier host
+             * pages.  Logical metadata is still exact, so re-project it. */
+            if (mprotect_range( page, guaranteed, 0, 0 ))
+                abort_process( STATUS_ACCESS_DENIED );
+            return STATUS_ACCESS_DENIED;
+        }
         set_page_vprot_bits( page, guaranteed, VPROT_COMMITTED, VPROT_GUARD );
-        if (mprotect_range( page, guaranteed, 0, 0 )) failed = TRUE;
-        ret = STATUS_STACK_OVERFLOW;
     }
     if (stack_info->is_wow)
     {
@@ -9101,8 +9130,7 @@ static NTSTATUS grow_thread_stack( struct thread_data *data, char *page,
         wow_teb->Tib.StackLimit = wow64_native_to_guest_addr( page );
     }
     else data->teb->Tib.StackLimit = page;
-    if (protect_failed) *protect_failed = failed;
-    return ret;
+    return overflow ? STATUS_STACK_OVERFLOW : STATUS_SUCCESS;
 }
 
 
@@ -9193,7 +9221,6 @@ int32_t __wine_resolve_wow64_memory_fault_v1(
             ULONG_PTR page_start = (ULONG_PTR)logical_page;
             ULONG_PTR capture_start, capture_end;
             SIZE_T guaranteed_size;
-            BOOL protect_failed;
 
             if (view->size > ~(ULONG_PTR)0 - view_start)
             {
@@ -9232,21 +9259,26 @@ int32_t __wine_resolve_wow64_memory_fault_v1(
                 if (capture_end < page_start + page_size)
                     capture_end = page_start + page_size;
             }
-            status = grow_thread_stack( data, logical_page, &stack_info, &protect_failed );
-            if (protect_failed) bridge_status = STATUS_ACCESS_DENIED;
-            if (status)
+            status = grow_thread_stack( data, logical_page, &stack_info );
+            if (status == STATUS_STACK_OVERFLOW)
             {
                 result->status = status;
                 result->parameter_count = 0;
                 memset( result->information, 0, sizeof(result->information) );
             }
-            else
+            else if (status == STATUS_SUCCESS)
             {
                 result->action = WINE_WOW64_MEMORY_FAULT_RETRY;
                 result->status = STATUS_SUCCESS;
                 result->parameter_count = 0;
                 memset( result->information, 0, sizeof(result->information) );
             }
+            else if (status == STATUS_ACCESS_DENIED)
+            {
+                result->status = STATUS_ACCESS_DENIED;
+                bridge_status = STATUS_ACCESS_DENIED;
+            }
+            else bridge_status = status;
             wow64_memory_capture_transaction( &transaction, status,
                                                (void *)capture_start,
                                                capture_end - capture_start,
@@ -9374,7 +9406,7 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
                 ret = STATUS_GUARD_PAGE_VIOLATION;
             }
         }
-        else ret = grow_thread_stack( data, page, &stack_info, NULL );
+        else ret = grow_thread_stack( data, page, &stack_info );
     }
     else if (err == EXCEPTION_WRITE_FAULT)
     {
@@ -9802,12 +9834,19 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
         mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
         if ((stack_info.is_wow ? get_page_vprot( page ) : get_host_page_vprot( page )) & VPROT_GUARD)
         {
-            NTSTATUS status = grow_thread_stack( data, page, &stack_info, NULL );
+            NTSTATUS status = grow_thread_stack( data, page, &stack_info );
 
-            if (status)
+            if (status == STATUS_STACK_OVERFLOW)
             {
                 rec->ExceptionCode = STATUS_STACK_OVERFLOW;
                 rec->NumberParameters = 0;
+            }
+            else if (status)
+            {
+                mutex_unlock( &virtual_mutex );
+                if (status == STATUS_ACCESS_DENIED)
+                    ERR( "failed to update stack protection, status %08x\n", status );
+                abort_thread(1);
             }
         }
         mutex_unlock( &virtual_mutex );

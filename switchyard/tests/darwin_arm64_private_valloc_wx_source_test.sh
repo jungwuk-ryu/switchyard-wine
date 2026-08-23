@@ -180,11 +180,29 @@ validate_memory_access_source, _, _ = extract_function("validate_mprotect_memory
 memory_access_source, _, _ = extract_function("mprotect_memory_access_range")
 native_fault_source, _, _ = extract_function("virtual_handle_fault")
 wow64_fault_source, _, _ = extract_function("__wine_resolve_wow64_memory_fault_v1")
+grow_stack_source, _, _ = extract_function("grow_thread_stack")
+setup_exception_source, _, _ = extract_function("virtual_setup_exception")
 allocate_source, _, _ = extract_function("allocate_virtual_memory")
 map_view_source, _, _ = extract_function("map_view")
 snapshot_source, _, _ = extract_function("snapshot_vprot")
 restore_source, _, _ = extract_function("restore_vprot_or_abort")
 restore_uniform_source, _, _ = extract_function("restore_uniform_vprot_or_abort")
+
+grow_stack_clean = strip_comments_and_literals(grow_stack_source)
+wow64_fault_clean = strip_comments_and_literals(wow64_fault_source)
+setup_exception_clean = strip_comments_and_literals(setup_exception_source)
+if re.search(r"\b(?:malloc|calloc|realloc|free|snapshot_vprot)\s*\(", grow_stack_clean):
+    fail("stack-fault growth allocates memory on the fault path")
+if re.search(r"\bprotect_failed\b", grow_stack_clean + wow64_fault_clean):
+    fail("stack-fault protection failure is published out-of-band")
+if (not re.search(r"\bSTATUS_ACCESS_DENIED\b", grow_stack_clean) or
+        not re.search(r"\brestore_vprot_or_abort\s*\(", grow_stack_clean)):
+    fail("stack-fault growth does not fail closed with exact vprot rollback")
+if not re.search(r"\bSTATUS_ACCESS_DENIED\b", wow64_fault_clean):
+    fail("the WoW64 fault bridge does not reject failed stack reprotection")
+if (not re.search(r"\bSTATUS_ACCESS_DENIED\b", setup_exception_clean) or
+        not re.search(r"\babort_thread\s*\(", setup_exception_clean)):
+    fail("exception-stack setup can continue after failed stack reprotection")
 
 if not has_apple_arm64_guard(can_retry_start):
     fail("the private-valloc eligibility helper is not gated to Apple ARM64")
@@ -1235,10 +1253,340 @@ int main(void)
 '''
 
 
+stack_growth_model = r'''
+#include <setjmp.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef unsigned char BYTE;
+typedef int BOOL;
+typedef uint32_t NTSTATUS;
+typedef uintptr_t ULONG_PTR;
+typedef size_t SIZE_T;
+
+#define FALSE 0
+#define TRUE 1
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+#define ROUND_SIZE(addr, size, mask) \
+    (((SIZE_T)(size) + ((ULONG_PTR)(addr) & (mask)) + (mask)) & ~(ULONG_PTR)(mask))
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000)
+#define STATUS_ACCESS_DENIED ((NTSTATUS)0xc0000022)
+#define STATUS_STACK_OVERFLOW ((NTSTATUS)0xc00000fd)
+#define VPROT_COMMITTED 0x01
+#define VPROT_GUARD 0x02
+#define VPROT_READ 0x04
+#define VPROT_WRITE 0x08
+#define VPROT_EXEC 0x10
+#define VPROT_WRITEWATCH 0x20
+#define VPROT_STACK_SNAPSHOT_PAGES 64
+#define ERR(...) ((void)0)
+
+static const SIZE_T page_size = 4096;
+static const unsigned int page_shift = 12;
+static const SIZE_T host_page_size = 16384;
+
+struct model_tib
+{
+    void *StackLimit;
+};
+
+struct model_tib32
+{
+    ULONG_PTR StackLimit;
+};
+
+typedef struct
+{
+    struct model_tib Tib;
+} TEB;
+
+typedef struct
+{
+    struct model_tib32 Tib;
+} WOW_TEB;
+
+struct thread_data
+{
+    TEB *teb;
+};
+
+struct thread_stack_info
+{
+    char *start;
+    char *limit;
+    char *end;
+    SIZE_T guaranteed;
+    BOOL is_wow;
+};
+
+struct protect_call
+{
+    void *base;
+    SIZE_T size;
+    BYTE set;
+    BYTE clear;
+    BYTE observed[16];
+};
+
+_Alignas(16384) static unsigned char probe_memory[16 * 4096];
+static BYTE page_vprot[16];
+static struct protect_call protect_calls[8];
+static unsigned int protect_call_count;
+static unsigned int fail_mask;
+static unsigned int abort_count;
+static NTSTATUS abort_status;
+static jmp_buf abort_environment;
+static TEB native_teb;
+static WOW_TEB wow_teb;
+static struct thread_data thread_data = {&native_teb};
+
+static size_t page_index(const void *address)
+{
+    const unsigned char *page = address;
+
+    if (page < probe_memory || page >= probe_memory + sizeof(probe_memory) ||
+        (size_t)(page - probe_memory) % page_size)
+    {
+        fprintf(stderr, "invalid model page %p\n", address);
+        return ARRAY_SIZE(page_vprot);
+    }
+    return (size_t)(page - probe_memory) / page_size;
+}
+
+static BYTE get_page_vprot(const void *address)
+{
+    size_t index = page_index(address);
+
+    return index < ARRAY_SIZE(page_vprot) ? page_vprot[index] : 0;
+}
+
+static void set_page_vprot(const void *base, SIZE_T size, BYTE vprot)
+{
+    size_t index = page_index(base);
+    size_t count = size / page_size;
+    size_t i;
+
+    if (index > ARRAY_SIZE(page_vprot) || count > ARRAY_SIZE(page_vprot) - index) return;
+    for (i = 0; i < count; i++) page_vprot[index + i] = vprot;
+}
+
+static void set_page_vprot_bits(const void *base, SIZE_T size, BYTE set, BYTE clear)
+{
+    size_t index = page_index(base);
+    size_t count = size / page_size;
+    size_t i;
+
+    if (index > ARRAY_SIZE(page_vprot) || count > ARRAY_SIZE(page_vprot) - index) return;
+    for (i = 0; i < count; i++)
+        page_vprot[index + i] = (page_vprot[index + i] & ~clear) | set;
+}
+
+static int mprotect_range(void *base, SIZE_T size, BYTE set, BYTE clear)
+{
+    struct protect_call *call;
+
+    if (protect_call_count >= ARRAY_SIZE(protect_calls)) return -1;
+    call = &protect_calls[protect_call_count++];
+    call->base = base;
+    call->size = size;
+    call->set = set;
+    call->clear = clear;
+    memcpy(call->observed, page_vprot, sizeof(call->observed));
+    return !!(fail_mask & (1u << protect_call_count)) ? -1 : 0;
+}
+
+static void abort_process(NTSTATUS status)
+{
+    abort_count++;
+    abort_status = status;
+    longjmp(abort_environment, 1);
+}
+
+static WOW_TEB *get_wow_teb(TEB *teb)
+{
+    (void)teb;
+    return &wow_teb;
+}
+
+static ULONG_PTR wow64_native_to_guest_addr(const void *address)
+{
+    return (ULONG_PTR)address;
+}
+''' + restore_source + grow_stack_source + r'''
+
+#define CHECK(expression) do { \
+    if (!(expression)) { \
+        fprintf(stderr, "stack growth check failed at line %d: %s\n", \
+                __LINE__, #expression); \
+        return 1; \
+    } \
+} while (0)
+
+static void reset_stack_model(struct thread_stack_info *info)
+{
+    memset(page_vprot, 0, sizeof(page_vprot));
+    memset(protect_calls, 0, sizeof(protect_calls));
+    protect_call_count = 0;
+    fail_mask = 0;
+    abort_count = 0;
+    abort_status = 0;
+    native_teb.Tib.StackLimit = probe_memory + 14 * page_size;
+    wow_teb.Tib.StackLimit = (ULONG_PTR)(probe_memory + 13 * page_size);
+    info->start = (char *)probe_memory;
+    info->limit = (char *)(probe_memory + 4 * page_size);
+    info->end = (char *)(probe_memory + 12 * page_size);
+    info->guaranteed = page_size;
+    info->is_wow = TRUE;
+}
+
+static void set_normal_pages(struct thread_stack_info *info, BYTE *before)
+{
+    reset_stack_model(info);
+    page_vprot[0] = VPROT_READ;
+    page_vprot[1] = VPROT_READ | VPROT_WRITE;
+    page_vprot[2] = VPROT_READ | VPROT_WRITEWATCH;
+    page_vprot[3] = VPROT_COMMITTED | VPROT_GUARD | VPROT_READ |
+                    VPROT_WRITE | VPROT_EXEC;
+    page_vprot[4] = VPROT_COMMITTED | VPROT_READ;
+    memcpy(before, page_vprot, sizeof(page_vprot));
+}
+
+static int check_normal_success(void)
+{
+    struct thread_stack_info info;
+    BYTE before[ARRAY_SIZE(page_vprot)];
+    BYTE expected[ARRAY_SIZE(page_vprot)];
+    NTSTATUS status;
+
+    set_normal_pages(&info, before);
+    memcpy(expected, before, sizeof(expected));
+    expected[2] |= VPROT_COMMITTED | VPROT_GUARD;
+    expected[3] = (expected[3] & ~VPROT_GUARD) | VPROT_COMMITTED;
+    status = grow_thread_stack(&thread_data, (char *)(probe_memory + 3 * page_size), &info);
+    CHECK(status == STATUS_SUCCESS);
+    CHECK(protect_call_count == 2);
+    CHECK(protect_calls[0].base == probe_memory + 2 * page_size);
+    CHECK(protect_calls[0].size == page_size);
+    CHECK(protect_calls[0].set == (VPROT_COMMITTED | VPROT_GUARD));
+    CHECK(!protect_calls[0].clear);
+    CHECK(!(protect_calls[0].observed[2] & VPROT_GUARD));
+    CHECK(protect_calls[0].observed[3] & VPROT_GUARD);
+    CHECK(protect_calls[1].base == probe_memory + 3 * page_size);
+    CHECK(protect_calls[1].size == page_size);
+    CHECK(protect_calls[1].set == VPROT_COMMITTED);
+    CHECK(protect_calls[1].clear == VPROT_GUARD);
+    CHECK(protect_calls[1].observed[2] & VPROT_GUARD);
+    CHECK(protect_calls[1].observed[3] & VPROT_GUARD);
+    CHECK(!memcmp(page_vprot, expected, sizeof(expected)));
+    CHECK(wow_teb.Tib.StackLimit == (ULONG_PTR)(probe_memory + 3 * page_size));
+    CHECK(native_teb.Tib.StackLimit == probe_memory + 14 * page_size);
+    CHECK(!abort_count);
+    return 0;
+}
+
+static int check_normal_failure(unsigned int failed_call, unsigned int expected_calls)
+{
+    struct thread_stack_info info;
+    BYTE before[ARRAY_SIZE(page_vprot)];
+    ULONG_PTR old_limit;
+    NTSTATUS status;
+
+    set_normal_pages(&info, before);
+    old_limit = wow_teb.Tib.StackLimit;
+    fail_mask = 1u << failed_call;
+    status = grow_thread_stack(&thread_data, (char *)(probe_memory + 3 * page_size), &info);
+    CHECK(status == STATUS_ACCESS_DENIED);
+    CHECK(protect_call_count == expected_calls);
+    CHECK(!memcmp(page_vprot, before, sizeof(before)));
+    CHECK(wow_teb.Tib.StackLimit == old_limit);
+    CHECK(!abort_count);
+    if (failed_call == 2)
+        CHECK(protect_calls[1].observed[2] & VPROT_GUARD);
+    CHECK(protect_calls[expected_calls - 1].set == 0);
+    CHECK(protect_calls[expected_calls - 1].clear == 0);
+    return 0;
+}
+
+static int check_overflow(BOOL fail_protect)
+{
+    struct thread_stack_info info;
+    BYTE before[ARRAY_SIZE(page_vprot)];
+    ULONG_PTR old_limit;
+    NTSTATUS status;
+
+    reset_stack_model(&info);
+    page_vprot[0] = VPROT_READ;
+    page_vprot[1] = VPROT_COMMITTED | VPROT_GUARD | VPROT_READ | VPROT_WRITE;
+    page_vprot[2] = VPROT_COMMITTED | VPROT_READ;
+    memcpy(before, page_vprot, sizeof(before));
+    old_limit = wow_teb.Tib.StackLimit;
+    if (fail_protect) fail_mask = 1u << 1;
+    status = grow_thread_stack(&thread_data, (char *)(probe_memory + page_size), &info);
+    CHECK(protect_calls[0].base == probe_memory + page_size);
+    CHECK(protect_calls[0].size == page_size);
+    CHECK(protect_calls[0].set == VPROT_COMMITTED);
+    CHECK(protect_calls[0].clear == VPROT_GUARD);
+    CHECK(protect_calls[0].observed[1] & VPROT_GUARD);
+    if (fail_protect)
+    {
+        CHECK(status == STATUS_ACCESS_DENIED);
+        CHECK(protect_call_count == 2);
+        CHECK(!memcmp(page_vprot, before, sizeof(before)));
+        CHECK(wow_teb.Tib.StackLimit == old_limit);
+        CHECK(!protect_calls[1].set && !protect_calls[1].clear);
+    }
+    else
+    {
+        CHECK(status == STATUS_STACK_OVERFLOW);
+        CHECK(protect_call_count == 1);
+        CHECK(page_vprot[1] == ((before[1] & ~VPROT_GUARD) | VPROT_COMMITTED));
+        CHECK(wow_teb.Tib.StackLimit == (ULONG_PTR)(probe_memory + page_size));
+    }
+    CHECK(!abort_count);
+    return 0;
+}
+
+static int check_rollback_abort(void)
+{
+    struct thread_stack_info info;
+    BYTE before[ARRAY_SIZE(page_vprot)];
+    ULONG_PTR old_limit;
+
+    set_normal_pages(&info, before);
+    old_limit = wow_teb.Tib.StackLimit;
+    fail_mask = (1u << 1) | (1u << 2);
+    if (!setjmp(abort_environment))
+    {
+        grow_thread_stack(&thread_data, (char *)(probe_memory + 3 * page_size), &info);
+        CHECK(0);
+    }
+    CHECK(abort_count == 1 && abort_status == STATUS_ACCESS_DENIED);
+    CHECK(protect_call_count == 2);
+    CHECK(!memcmp(page_vprot, before, sizeof(before)));
+    CHECK(wow_teb.Tib.StackLimit == old_limit);
+    return 0;
+}
+
+int main(void)
+{
+    if (check_normal_success()) return 1;
+    if (check_normal_failure(1, 2)) return 1;
+    if (check_normal_failure(2, 3)) return 1;
+    if (check_overflow(FALSE)) return 1;
+    if (check_overflow(TRUE)) return 1;
+    if (check_rollback_abort()) return 1;
+    return 0;
+}
+'''
+
+
 compile_and_run("private-valloc-eligibility-model", eligibility_model)
 compile_and_run("writable-exec-retry-model", retry_model)
 compile_and_run("physical-ownership-domain-model", domain_model)
 compile_and_run("uniform-protection-rollback-model", uniform_rollback_model)
+compile_and_run("stack-growth-atomicity-model", stack_growth_model)
 PY
 
 echo "Darwin ARM64 private-valloc W^X source contract verified"
