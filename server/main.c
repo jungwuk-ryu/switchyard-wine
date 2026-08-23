@@ -99,8 +99,7 @@ static void option_callback( int optc, char *optarg )
         fprintf( stderr, "%s\n", PACKAGE_STRING );
         exit(0);
     case 'w':
-        wait_for_lock();
-        exit(0);
+        exit( wait_for_lock() != 0 );
     }
 }
 
