@@ -2947,6 +2947,8 @@ enum d3dkmt_lifecycle_race_op
     D3DKMT_LIFECYCLE_RACE_CLOSE,
     D3DKMT_LIFECYCLE_RACE_CREATE,
     D3DKMT_LIFECYCLE_RACE_DESTROY,
+    D3DKMT_LIFECYCLE_RACE_DESTROY_SYNC,
+    D3DKMT_LIFECYCLE_RACE_QUERY_ADAPTER,
     D3DKMT_LIFECYCLE_RACE_SET_OWNER,
 };
 
@@ -2989,6 +2991,27 @@ static DWORD WINAPI d3dkmt_lifecycle_race_thread( void *arg )
         race->status = D3DKMTDestroyDevice( &desc );
         break;
     }
+    case D3DKMT_LIFECYCLE_RACE_DESTROY_SYNC:
+    {
+        D3DKMT_DESTROYSYNCHRONIZATIONOBJECT desc = { .hSyncObject = race->handle };
+
+        race->status = D3DKMTDestroySynchronizationObject( &desc );
+        break;
+    }
+    case D3DKMT_LIFECYCLE_RACE_QUERY_ADAPTER:
+    {
+        D3DKMT_WDDM_2_7_CAPS caps = {0};
+        D3DKMT_QUERYADAPTERINFO desc =
+        {
+            .hAdapter = race->handle,
+            .Type = KMTQAITYPE_WDDM_2_7_CAPS,
+            .pPrivateDriverData = &caps,
+            .PrivateDriverDataSize = sizeof(caps),
+        };
+
+        race->status = D3DKMTQueryAdapterInfo( &desc );
+        break;
+    }
     case D3DKMT_LIFECYCLE_RACE_SET_OWNER:
     {
         D3DKMT_VIDPNSOURCEOWNER_TYPE type = D3DKMT_VIDPNSOURCEOWNER_EXCLUSIVE;
@@ -3007,6 +3030,52 @@ static DWORD WINAPI d3dkmt_lifecycle_race_thread( void *arg )
     return 0;
 }
 
+static BOOL run_d3dkmt_destroy_race( enum d3dkmt_lifecycle_race_op op,
+                                     D3DKMT_HANDLE handle )
+{
+    enum { thread_count = 8 };
+    struct d3dkmt_lifecycle_race races[thread_count];
+    HANDLE threads[thread_count] = {0}, start;
+    UINT created, i, successes = 0;
+    DWORD wait;
+
+    start = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok_ptr( start, !=, NULL );
+    if (!start) return FALSE;
+
+    for (i = 0; i < thread_count; i++)
+    {
+        races[i].start = start;
+        races[i].op = op;
+        races[i].handle = handle;
+        races[i].output = 0;
+        races[i].status = STATUS_UNSUCCESSFUL;
+        threads[i] = CreateThread( NULL, 0, d3dkmt_lifecycle_race_thread,
+                                   &races[i], 0, NULL );
+        ok_ptr( threads[i], !=, NULL );
+        if (!threads[i]) break;
+    }
+    created = i;
+    SetEvent( start );
+    if (created)
+    {
+        wait = WaitForMultipleObjects( created, threads, TRUE, 30000 );
+        ok_u4( wait, ==, WAIT_OBJECT_0 );
+        if (wait != WAIT_OBJECT_0)
+            WaitForMultipleObjects( created, threads, TRUE, INFINITE );
+        for (i = 0; i < created; i++)
+        {
+            if (races[i].status == STATUS_SUCCESS) successes++;
+            else ok_nt( STATUS_INVALID_PARAMETER, races[i].status );
+        }
+        ok_u4( successes, ==, 1 );
+    }
+
+    for (i = 0; i < created; i++) CloseHandle( threads[i] );
+    CloseHandle( start );
+    return !!created;
+}
+
 static BOOL open_test_adapter_from_luid( const LUID *luid,
                                          D3DKMT_HANDLE *adapter )
 {
@@ -3019,7 +3088,7 @@ static BOOL open_test_adapter_from_luid( const LUID *luid,
     return TRUE;
 }
 
-static void test_d3dkmt_adapter_device_concurrency(void)
+static void test_d3dkmt_object_concurrency(void)
 {
     enum { thread_count = 8, create_close_iterations = 32 };
     D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open_gdi = {0};
@@ -3032,7 +3101,7 @@ static void test_d3dkmt_adapter_device_concurrency(void)
 
     if (!winetest_platform_is_wine)
     {
-        win_skip( "adapter/device object-table race test is Wine-specific\n" );
+        win_skip( "D3DKMT object-table race test is Wine-specific\n" );
         return;
     }
 
@@ -3111,6 +3180,22 @@ static void test_d3dkmt_adapter_device_concurrency(void)
             return;
         }
         device = create.hDevice;
+    }
+
+    {
+        D3DKMT_CREATESYNCHRONIZATIONOBJECT2 create_sync = { .hDevice = device };
+        D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy_sync;
+
+        create_sync.Info.Type = D3DDDI_SYNCHRONIZATION_MUTEX;
+        status = D3DKMTCreateSynchronizationObject2( &create_sync );
+        ok_nt( STATUS_SUCCESS, status );
+        if (!status && !run_d3dkmt_destroy_race( D3DKMT_LIFECYCLE_RACE_DESTROY_SYNC,
+                                                  create_sync.hSyncObject ))
+        {
+            destroy_sync.hSyncObject = create_sync.hSyncObject;
+            status = D3DKMTDestroySynchronizationObject( &destroy_sync );
+            ok_nt( STATUS_SUCCESS, status );
+        }
     }
 
     start = CreateEventW( NULL, TRUE, FALSE, NULL );
@@ -3193,7 +3278,8 @@ static void test_d3dkmt_adapter_device_concurrency(void)
         }
 
         create_race.start = close_race.start = start;
-        create_race.op = D3DKMT_LIFECYCLE_RACE_CREATE;
+        create_race.op = (i & 1) ? D3DKMT_LIFECYCLE_RACE_QUERY_ADAPTER :
+                                   D3DKMT_LIFECYCLE_RACE_CREATE;
         close_race.op = D3DKMT_LIFECYCLE_RACE_CLOSE;
         create_race.handle = close_race.handle = adapter;
         create_race.output = close_race.output = 0;
@@ -3214,8 +3300,10 @@ static void test_d3dkmt_adapter_device_concurrency(void)
             ok_nt( STATUS_SUCCESS, close_race.status );
             ok( create_race.status == STATUS_SUCCESS ||
                 create_race.status == STATUS_INVALID_PARAMETER,
-                "iteration %u create returned %#lx\n", i, create_race.status );
-            if (create_race.status == STATUS_SUCCESS)
+                "iteration %u operation %u returned %#lx\n", i,
+                create_race.op, create_race.status );
+            if (create_race.op == D3DKMT_LIFECYCLE_RACE_CREATE &&
+                create_race.status == STATUS_SUCCESS)
             {
                 D3DKMT_DESTROYDEVICE destroy = { .hDevice = create_race.output };
 
@@ -3244,7 +3332,8 @@ static void test_d3dkmt_adapter_device_concurrency(void)
                 D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
                 D3DKMTCloseAdapter( &close );
             }
-            if (pair[0] && create_race.status == STATUS_SUCCESS)
+            if (pair[0] && create_race.op == D3DKMT_LIFECYCLE_RACE_CREATE &&
+                create_race.status == STATUS_SUCCESS)
             {
                 D3DKMT_DESTROYDEVICE destroy = { .hDevice = create_race.output };
                 D3DKMTDestroyDevice( &destroy );
@@ -8506,7 +8595,7 @@ START_TEST( d3dkmt )
     test_D3DKMTCreateDevice();
     test_D3DKMTDestroyDevice();
     test_wow64_protected_adapter_device_lifecycle();
-    test_d3dkmt_adapter_device_concurrency();
+    test_d3dkmt_object_concurrency();
     test_D3DKMTCheckVidPnExclusiveOwnership();
     test_D3DKMTSetVidPnSourceOwner();
     test_D3DKMTCheckOcclusion();
