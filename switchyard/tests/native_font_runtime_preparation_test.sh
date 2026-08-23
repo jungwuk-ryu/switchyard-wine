@@ -33,6 +33,21 @@ fail()
     exit 1
 }
 
+snapshot_prepared_font_roots()
+{
+    /usr/bin/python3 -I - <<'PY'
+import os
+import re
+import stat
+
+pattern = re.compile(r"switchyard-font-runtime[.][A-Za-z0-9]{6}\Z")
+for entry in sorted(os.scandir("/private/tmp"), key=lambda item: item.name):
+    if pattern.fullmatch(entry.name):
+        info = entry.stat(follow_symlinks=False)
+        print(entry.name, info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
+PY
+}
+
 if [ "$(/usr/bin/uname -s)" != Darwin ] ||
    [ "$(/usr/bin/uname -m)" != arm64 ]; then
     echo "Native font runtime preparation test skipped outside native macOS ARM64"
@@ -93,6 +108,21 @@ for name in names:
     fragment = source[match.start():end].rstrip()
     if not fragment.endswith("}"):
         raise SystemExit(f"extracted {name} definition is incomplete")
+    if name == "prepare_font_runtime_for_install":
+        allocation = fragment.find(
+            "/usr/bin/mktemp -d /private/tmp/switchyard-font-runtime.XXXXXX"
+        )
+        validations = (
+            fragment.find('validate_extracted_tree_links "$source_prefix"'),
+            fragment.find('validate_extracted_tree_links "$font_assets_prefix"'),
+        )
+        if (
+            allocation < 0
+            or any(position < 0 or position > allocation for position in validations)
+        ):
+            raise SystemExit(
+                "font input link validation must precede prepared-root allocation"
+            )
     fragments.append(fragment)
 output_path.write_text("\n\n".join(fragments) + "\n", encoding="utf-8")
 PY
@@ -178,6 +208,32 @@ content_tree_is_verified "$SOURCE_PREFIX" ||
     fail "source fixture content marker is invalid"
 source_digest="$(/usr/bin/tr -d '[:space:]' < \
     "$SOURCE_PREFIX/.switchyard-content-sha256")"
+
+UNSAFE_SOURCE_PREFIX="$TEST_ROOT/unsafe-source-font-prefix"
+OUTSIDE_SOURCE_ROOT="$TEST_ROOT/outside-source-root"
+/bin/mkdir "$UNSAFE_SOURCE_PREFIX" "$OUTSIDE_SOURCE_ROOT"
+/usr/bin/printf '%s\n' 'must not be copied' >"$OUTSIDE_SOURCE_ROOT/sentinel"
+/bin/ln -s "$OUTSIDE_SOURCE_ROOT" "$UNSAFE_SOURCE_PREFIX/escaping-link"
+if validate_extracted_tree_links "$UNSAFE_SOURCE_PREFIX" >/dev/null 2>&1; then
+    fail "production tree validator accepted an escaping input symlink"
+fi
+prepared_roots_before="$(snapshot_prepared_font_roots)"
+unsafe_stdout="$TEST_ROOT/unsafe-preparation.stdout"
+unsafe_stderr="$TEST_ROOT/unsafe-preparation.stderr"
+if prepare_font_runtime_for_install \
+        "$UNSAFE_SOURCE_PREFIX" "$ASSET_PREFIX" \
+        >"$unsafe_stdout" 2>"$unsafe_stderr"; then
+    fail "production font preparation accepted an escaping input symlink"
+fi
+[ ! -s "$unsafe_stdout" ] ||
+    fail "rejected font preparation returned a prepared runtime path"
+[ -s "$unsafe_stderr" ] ||
+    fail "rejected font preparation did not explain the unsafe input"
+prepared_roots_after="$(snapshot_prepared_font_roots)"
+[ "$prepared_roots_after" = "$prepared_roots_before" ] ||
+    fail "rejected unsafe input allocated or leaked a prepared font root"
+[ -f "$OUTSIDE_SOURCE_ROOT/sentinel" ] ||
+    fail "unsafe input validation followed the escaping symlink"
 
 PREPARED_ROOT="$(prepare_font_runtime_for_install \
     "$SOURCE_PREFIX" "$ASSET_PREFIX")" ||
