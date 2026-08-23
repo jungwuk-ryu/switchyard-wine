@@ -1977,6 +1977,27 @@ relocate_font_deps_for_runtime() {
 }
 
 prepare_font_runtime_for_install() {
+  (
+  local prepared_root_cleanup_target=""
+  local prepared_root_status
+
+  # This function normally runs inside a command substitution, whose Bash 3.2
+  # subshell does not inherit the caller's traps.  Own an additional isolated
+  # subshell so a signal or any nonzero return before publication removes the
+  # private tree even before the parent can record its path.
+  trap '
+    prepared_root_status=$?
+    trap - EXIT
+    if [ "$prepared_root_status" -ne 0 ] &&
+       [ -n "$prepared_root_cleanup_target" ]; then
+      remove_prepared_font_runtime "$prepared_root_cleanup_target" || true
+    fi
+    exit "$prepared_root_status"
+  ' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
   [ "$#" -eq 2 ] || {
     echo "prepare_font_runtime_for_install requires dependency and asset roots" >&2
     return 2
@@ -2011,14 +2032,10 @@ prepare_font_runtime_for_install() {
   created_root="$(
     /usr/bin/mktemp -d /private/tmp/switchyard-font-runtime.XXXXXX
   )" || return 1
-  runtime_font_root="$(cd "$created_root" && /bin/pwd -P)" || {
-    remove_prepared_font_runtime "$created_root" || true
-    return 1
-  }
-  chmod 0700 "$runtime_font_root" || {
-    remove_prepared_font_runtime "$runtime_font_root" || true
-    return 1
-  }
+  prepared_root_cleanup_target="$created_root"
+  runtime_font_root="$(cd "$created_root" && /bin/pwd -P)" || return 1
+  prepared_root_cleanup_target="$runtime_font_root"
+  chmod 0700 "$runtime_font_root" || return 1
 
   if ! (
     set -e
@@ -2050,11 +2067,11 @@ prepare_font_runtime_for_install() {
     write_content_tree_digest "$runtime_font_root"
     content_tree_is_verified "$runtime_font_root"
   ); then
-    remove_prepared_font_runtime "$runtime_font_root" || true
     return 1
   fi
 
   printf '%s\n' "$runtime_font_root"
+  )
 }
 
 download_tls_package() {

@@ -245,6 +245,29 @@ prepared_roots_after="$(snapshot_prepared_font_roots)"
 [ -f "$OUTSIDE_SOURCE_ROOT/sentinel" ] ||
     fail "unsafe input validation followed the escaping symlink"
 
+prepared_roots_before="$(snapshot_prepared_font_roots)"
+set +e
+(
+    ditto()
+    {
+        /bin/sh -c '/bin/kill -TERM "$PPID"'
+        return 99
+    }
+    prepare_font_runtime_for_install "$SOURCE_PREFIX" "$ASSET_PREFIX"
+) >"$TEST_ROOT/interrupted-preparation.stdout" \
+  2>"$TEST_ROOT/interrupted-preparation.stderr"
+interrupted_status=$?
+set -e
+if [ "$interrupted_status" -eq 0 ]; then
+    /bin/cat "$TEST_ROOT/interrupted-preparation.stderr" >&2 || true
+    fail "interrupted preparation reported success"
+fi
+[ ! -s "$TEST_ROOT/interrupted-preparation.stdout" ] ||
+    fail "interrupted preparation returned a prepared runtime path"
+prepared_roots_after="$(snapshot_prepared_font_roots)"
+[ "$prepared_roots_after" = "$prepared_roots_before" ] ||
+    fail "signal inside preparation leaked its unpublished private runtime"
+
 PREPARED_ROOT="$(prepare_font_runtime_for_install \
     "$SOURCE_PREFIX" "$ASSET_PREFIX")" ||
     fail "production font runtime preparation failed"
