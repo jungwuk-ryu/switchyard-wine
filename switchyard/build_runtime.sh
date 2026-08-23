@@ -772,13 +772,19 @@ PY
 verify_runtime_relative_macho_tree() {
   local root="$1"
   local label="$2"
-  local candidate description dependency rpath
+  local candidate description dependencies dependency rpaths rpath
 
   [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 0
   while IFS= read -r -d '' candidate; do
     description="$(file -b "$candidate")" || return 1
     case "$description" in *Mach-O*) ;; *) continue ;; esac
+    # This verifier runs inside dependency-staging command substitutions.
+    # macOS Bash 3.2 retains nested process-substitution descriptors until the
+    # function returns, so snapshot each bounded tool result before iterating.
+    dependencies="$(otool -L "$candidate" |
+      /usr/bin/awk '$0 ~ /^\t/ { print $1 }')" || return 1
     while IFS= read -r dependency; do
+      [ -n "$dependency" ] || continue
       case "$dependency" in
         *'/../'*|*'/./'*|*/..|*/.)
           echo "$label contains a traversing Mach-O dependency: $candidate -> $dependency" >&2
@@ -792,8 +798,12 @@ verify_runtime_relative_macho_tree() {
           return 1
           ;;
       esac
-    done < <(otool -L "$candidate" | /usr/bin/awk '$0 ~ /^\t/ { print $1 }')
+    done <<<"$dependencies"
+    rpaths="$(otool -l "$candidate" |
+      /usr/bin/awk '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')" ||
+      return 1
     while IFS= read -r rpath; do
+      [ -n "$rpath" ] || continue
       case "$rpath" in
         @loader_path|@loader_path/*|@executable_path|@executable_path/*) ;;
         *)
@@ -801,9 +811,9 @@ verify_runtime_relative_macho_tree() {
           return 1
           ;;
       esac
-    done < <(otool -l "$candidate" |
-      /usr/bin/awk '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')
+    done <<<"$rpaths"
   done < <(find "$root" -type f -print0)
+  return 0
 }
 
 vulkan_deps_match_profile_architecture() {
