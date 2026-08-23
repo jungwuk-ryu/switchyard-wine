@@ -184,6 +184,7 @@ switchyard_load_runtime_profile stable-x86_64-rosetta
 [ "$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH" = "x86_64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH" = "x86_64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV" = "i386,x86_64" ]
+[ "${SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS[*]}" = "i386 x86_64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET" = "x86_64-apple-darwin" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET" = "x86_64-apple-darwin" ]
 [ "${SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND[*]}" = "arch -x86_64" ]
@@ -211,6 +212,7 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH" = "arm64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH" = "aarch64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV" = "aarch64,arm64ec,x86_64,i386" ]
+[ "${SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS[*]}" = "aarch64 x86_64 i386" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET" = "aarch64-apple-darwin" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET" = "aarch64-apple-darwin" ]
 [ "${SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND[*]}" = "arch -arm64" ]
@@ -755,6 +757,11 @@ if grep -E '^kuserSharedDataModel=' <<<"$default_source_info" >/dev/null; then
 fi
 grep -F -- '      --with-unicorn' "$BUILD_SCRIPT" >/dev/null ||
   fail "native profile does not pass --with-unicorn to Wine configure"
+grep -F 'INSTALLED_PE_ARCHS=("${SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS[@]}")' \
+  "$BUILD_SCRIPT" >/dev/null ||
+  fail "runtime build does not separate configure PE targets from installed PE layout"
+[ "$(grep -F -c 'for pe_arch in "${INSTALLED_PE_ARCHS[@]}"; do' "$BUILD_SCRIPT")" -eq 2 ] ||
+  fail "runtime install validation still iterates configure-only PE targets"
 grep -F "UNICORN_RUNTIME_RPATH='@loader_path/../../switchyard-unicorn/lib'" \
   "$BUILD_SCRIPT" >/dev/null ||
   fail "native providers do not use the runtime-relative Unicorn rpath"

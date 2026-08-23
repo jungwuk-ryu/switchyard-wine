@@ -49,6 +49,7 @@ switchyard_require_runtime_profile_enabled || exit $?
 
 BUILD_PROFILE="$SWITCHYARD_RUNTIME_PROFILE_BUILD_PROFILE"
 PE_ARCHS=("${SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS[@]}")
+INSTALLED_PE_ARCHS=("${SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS[@]}")
 WINE_UNIX_ARCH="$SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH"
 HOST_MACHO_ARCH="$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH"
 WINE_BUILD_TRIPLET="$SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET"
@@ -4039,7 +4040,7 @@ if ! grep -F "#define HAVE_WINE_PRELOADER 1" "$WINE_BUILD_DIR/include/config.h" 
   find "$WINE_INSTALL_PREFIX" \( -type f -o -type l \) \( -name wine-preloader -o -name wine64-preloader \) -exec rm -f {} +
 fi
 
-for pe_arch in "${PE_ARCHS[@]}"; do
+for pe_arch in "${INSTALLED_PE_ARCHS[@]}"; do
   pe_ntdll="$WINE_INSTALL_PREFIX/lib/wine/$pe_arch-windows/ntdll.dll"
   if [ ! -f "$pe_ntdll" ]; then
     echo "Wine install is missing $pe_arch PE ntdll.dll at $pe_ntdll." >&2
@@ -4051,7 +4052,7 @@ done
 wine_graphics_fallback_root="$WINE_INSTALL_PREFIX/lib/switchyard-wine-graphics"
 echo "preserving Wine graphics modules under $wine_graphics_fallback_root"
 rm -rf "$wine_graphics_fallback_root"
-for pe_arch in "${PE_ARCHS[@]}"; do
+for pe_arch in "${INSTALLED_PE_ARCHS[@]}"; do
   mkdir -p "$wine_graphics_fallback_root/$pe_arch-windows"
   mkdir -p "$wine_graphics_fallback_root/$pe_arch-unix"
   for module in "${WINE_GRAPHICS_FALLBACK_MODULES[@]}"; do

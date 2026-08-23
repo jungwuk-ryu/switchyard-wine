@@ -2,9 +2,10 @@
 # shellcheck disable=SC2034 # Profile globals are consumed by sourcing scripts.
 
 # Runtime profiles are a closed set of trusted build and release policy values.
-# Keep host Mach-O, Wine Unix, and PE architecture names separate: they belong
-# to different ABIs and are not interchangeable even when they target the same
-# physical CPU family.
+# Keep host Mach-O, Wine Unix, PE ABI, and installed PE layout names separate:
+# they are not interchangeable even when they target the same physical CPU
+# family.  Wine links ARM64EC objects into the installed aarch64 ARM64X image,
+# so arm64ec is a configure/manifest ABI without a standalone install directory.
 
 SWITCHYARD_DEFAULT_RUNTIME_PROFILE="stable-x86_64-rosetta"
 SWITCHYARD_RUNTIME_MANIFEST_VERSION="2"
@@ -661,6 +662,7 @@ switchyard_load_runtime_profile() {
       SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH="x86_64"
       SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS=("i386" "x86_64")
       SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV="i386,x86_64"
+      SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS=("i386" "x86_64")
       SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET="x86_64-apple-darwin"
       SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET="x86_64-apple-darwin"
       SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND=("arch" "-x86_64")
@@ -692,6 +694,7 @@ switchyard_load_runtime_profile() {
       SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH="aarch64"
       SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS=("aarch64" "arm64ec" "x86_64" "i386")
       SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV="aarch64,arm64ec,x86_64,i386"
+      SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS=("aarch64" "x86_64" "i386")
       SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET="aarch64-apple-darwin"
       SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET="aarch64-apple-darwin"
       SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND=("arch" "-arm64")
