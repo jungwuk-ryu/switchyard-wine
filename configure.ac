@@ -988,6 +988,7 @@ AC_SUBST(TOP_INSTALL_LIB,"")
 AC_SUBST(TOP_INSTALL_DEV,"")
 AC_SUBST(WINELOADER_LDFLAGS,"")
 AC_SUBST(WINEPRELOADER_LDFLAGS,"")
+AC_SUBST(WINEMETAL_WOW64_UNIXLIB,"")
 AC_SUBST(NTDLL_X18_TEST_UNIXLIB,"")
 XTAJIT64_UNIXLIB=
 XTAJIT64_PE_CFLAGS=
@@ -1012,6 +1013,7 @@ case $host_os in
     DLLFLAGS="$DLLFLAGS -fPIC"
     LDDLLFLAGS="-fPIC"
     enable_winemac_drv=${enable_winemac_drv:-yes}
+    test "$HOST_ARCH" != aarch64 || WINEMETAL_WOW64_UNIXLIB=winemetal-wow64.so
     test "$HOST_ARCH" != aarch64 || test "x$wine_cv_have_os_custom_x18_abi" != xyes ||
         NTDLL_X18_TEST_UNIXLIB=ntdll-x18-test.so
     with_fontconfig=${with_fontconfig:-no}
@@ -3479,6 +3481,7 @@ WINE_CONFIG_MAKEFILE(dlls/winehid.sys)
 WINE_CONFIG_MAKEFILE(dlls/winemac.drv)
 WINE_CONFIG_MAKEFILE(dlls/winemac.drv/tests)
 WINE_CONFIG_MAKEFILE(dlls/winemapi)
+WINE_CONFIG_MAKEFILE(dlls/winemetal-wow64)
 WINE_CONFIG_MAKEFILE(dlls/wineoss.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineps.drv)
 WINE_CONFIG_MAKEFILE(dlls/wineps16.drv16)

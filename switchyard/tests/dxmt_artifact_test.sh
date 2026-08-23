@@ -59,6 +59,77 @@ test_root="$(cd "$test_root" && pwd -P)"
 runtime="$test_root/runtime"
 manifest="$runtime/switchyard-runtime.json"
 failure_log="$test_root/failure.log"
+fixture_companion="$test_root/winemetal-wow64.so"
+fixture_companion_extra="$test_root/winemetal-wow64-extra.so"
+
+/bin/cat >"$test_root/winemetal-wow64.c" <<'EOF'
+#include <stdint.h>
+typedef int32_t (*unixlib_entry_t)(void *);
+struct dispatch_entry_v2 { uint32_t args_size; uint32_t flags; };
+struct dispatch_source_v2
+{
+    uint32_t version, size, entry_count, entry_size;
+    const unixlib_entry_t *funcs;
+    const struct dispatch_entry_v2 *entries;
+    uint32_t flags, reserved;
+};
+static int32_t fixture_call(void *args) { return args ? 0 : 0; }
+__attribute__((visibility("default"))) const unixlib_entry_t
+    __wine_unix_call_wow64_funcs[] = {fixture_call};
+static const struct dispatch_entry_v2 entries[] = {{4, 1}};
+__attribute__((visibility("default"))) const struct dispatch_source_v2
+    __wine_unix_call_wow64_dispatch_v2 =
+        {2, sizeof(struct dispatch_source_v2), 1, sizeof(struct dispatch_entry_v2),
+         __wine_unix_call_wow64_funcs, entries, 0, 0};
+struct companion_descriptor_v4
+{
+    uint32_t version, size, entry_count, flags;
+    unsigned char abi_sha256[32];
+    const void *bind;
+};
+__attribute__((visibility("default"))) const struct companion_descriptor_v4
+    __wine_unix_call_wow64_companion_v4 = {
+        4, sizeof(struct companion_descriptor_v4), 138, 0,
+        {0x79, 0x38, 0xd5, 0x69, 0x16, 0x07, 0x4f, 0x61,
+         0xdc, 0xe9, 0x6b, 0x43, 0xe3, 0xf6, 0x3b, 0x47,
+         0xfe, 0x52, 0x56, 0x5c, 0x6a, 0x4c, 0x60, 0x96,
+         0xc8, 0x76, 0x84, 0x7f, 0x19, 0x20, 0xd9, 0xd3},
+        __wine_unix_call_wow64_funcs,
+    };
+#ifdef EXTRA_COMPANION_EXPORT
+__attribute__((visibility("default"))) const uint32_t
+    __wine_unix_call_wow64_unexpected_v2 = 2;
+#endif
+extern int ntdll_fixture(void);
+extern void *NSClassFromString(void *);
+extern void *MTLCreateSystemDefaultDevice(void);
+extern void *objc_getClass(const char *);
+__attribute__((constructor)) static void companion_dependencies(void)
+{
+    volatile const void *dependencies[] = {
+        (const void *)(uintptr_t)ntdll_fixture,
+        (const void *)(uintptr_t)NSClassFromString,
+        (const void *)(uintptr_t)MTLCreateSystemDefaultDevice,
+        (const void *)(uintptr_t)objc_getClass,
+    };
+    (void)dependencies;
+}
+EOF
+/bin/cat >"$test_root/ntdll.c" <<'EOF'
+int ntdll_fixture(void) { return 7; }
+EOF
+/usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -O2 -Wall -Wextra -Werror \
+  -mmacosx-version-min=26.5 -Wl,-install_name,@rpath/ntdll.so \
+  "$test_root/ntdll.c" -o "$test_root/ntdll.so"
+/usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -nostdlib -O2 -Wall -Wextra -Werror \
+  -mmacosx-version-min=26.5 -Wl,-install_name,@rpath/winemetal-wow64.so \
+  -Wl,-rpath,@loader_path/ "$test_root/winemetal-wow64.c" "$test_root/ntdll.so" \
+  -framework Foundation -framework Metal -lSystem -lobjc -o "$fixture_companion"
+/usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -nostdlib -O2 -Wall -Wextra -Werror \
+  -DEXTRA_COMPANION_EXPORT=1 -mmacosx-version-min=26.5 \
+  -Wl,-install_name,@rpath/winemetal-wow64.so -Wl,-rpath,@loader_path/ \
+  "$test_root/winemetal-wow64.c" "$test_root/ntdll.so" \
+  -framework Foundation -framework Metal -lSystem -lobjc -o "$fixture_companion_extra"
 
 cleanup() {
   local status=$?
@@ -154,9 +225,38 @@ for path, source_digest, file_format, architecture in module_sources:
     modules.append(item)
 
 files_manifest = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/files.sha256"
+companion_path = "lib/wine/aarch64-unix/winemetal-wow64.so"
+schema_path = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+companion = {
+    "path": companion_path,
+    "sha256": digest(companion_path),
+    "format": "mach-o-dylib",
+    "architecture": "arm64",
+    "minimumMacOS": "26.5",
+    "sdk": "26.5",
+    "installName": "@rpath/winemetal-wow64.so",
+    "rpaths": ["@loader_path/"],
+    "loadCommands": [
+        {"command": "LC_LOAD_DYLIB", "path": "@rpath/ntdll.so"},
+        {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"},
+        {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Metal.framework/Versions/A/Metal"},
+        {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libSystem.B.dylib"},
+        {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libobjc.A.dylib"},
+    ],
+    "originalUnixLibrary": module_sources[0][0],
+    "originalSha256": modules[0]["sha256"],
+    "abiSchema": schema_path,
+    "abiSchemaSha256": digest(schema_path),
+    "entryCount": 138,
+    "dispatchSourceVersion": 2,
+    "bindingVersion": 4,
+    "codeSignature": "strict",
+}
 with open(os.path.join(runtime, files_manifest), "w", encoding="ascii", newline="\n") as stream:
     for item in modules:
         stream.write(f"{item['sha256']}  {item['path']}\n")
+    stream.write(f"{companion['sha256']}  {companion_path}\n")
+    stream.write(f"{companion['abiSchemaSha256']}  {schema_path}\n")
 
 corresponding_source = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/CORRESPONDING-SOURCE.txt"
 with open(os.path.join(runtime, corresponding_source), "w", encoding="utf-8", newline="\n") as stream:
@@ -183,6 +283,7 @@ document_paths = [
     "lib/switchyard-dxmt/share/doc/switchyard-dxmt/LICENSE",
     "lib/switchyard-dxmt/share/doc/switchyard-dxmt/COPYING.LIB",
     corresponding_source,
+    schema_path,
 ]
 documents = [{"path": path, "sha256": digest(path)} for path in document_paths]
 value = {
@@ -219,6 +320,7 @@ value = {
         },
         "license": "LGPL-2.1-or-later",
         "modules": modules,
+        "wow64Companion": companion,
         "documents": documents,
     },
 }
@@ -236,6 +338,10 @@ reset_runtime() {
   /bin/rm -rf -- "$runtime"
   /bin/mkdir -p "$runtime"
   /bin/cp -R "$STAGED_FIXTURE/." "$runtime/"
+  /usr/bin/install -m 0755 "$fixture_companion" \
+    "$runtime/lib/wine/aarch64-unix/winemetal-wow64.so"
+  /usr/bin/install -m 0644 "$ROOT_DIR/dlls/winemetal-wow64/abi-schema-v4.txt" \
+    "$runtime/lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
   write_manifest
 }
 
@@ -301,6 +407,32 @@ PY
 reset_runtime
 validate_runtime
 
+reset_runtime
+/usr/bin/install -m 0755 "$fixture_companion_extra" \
+  "$runtime/lib/wine/aarch64-unix/winemetal-wow64.so"
+write_manifest
+expect_failure "extra DXMT WoW64 companion export" "companion export set is not exact"
+
+/bin/rm "$runtime/lib/wine/aarch64-unix/winemetal-wow64.so"
+expect_failure "missing DXMT WoW64 companion" "failed safely"
+
+reset_runtime
+/usr/bin/printf 'tampered\n' >>"$runtime/lib/wine/aarch64-unix/winemetal-wow64.so"
+expect_failure "tampered DXMT WoW64 companion" "companion digest mismatch"
+
+reset_runtime
+/bin/mv "$runtime/lib/wine/aarch64-unix/winemetal-wow64.so" \
+  "$test_root/winemetal-wow64.target"
+/bin/ln -s "$test_root/winemetal-wow64.target" \
+  "$runtime/lib/wine/aarch64-unix/winemetal-wow64.so"
+expect_failure "symbolic-link DXMT WoW64 companion" "failed safely"
+
+reset_runtime
+/usr/bin/printf 'tampered\n' >> \
+  "$runtime/lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+expect_failure "tampered DXMT WoW64 schema" "document digest mismatch"
+
+reset_runtime
 mutate_manifest 'value["dxmt"]["unexpected"] = True'
 expect_failure "unknown DXMT key" "unexpected field set"
 
@@ -523,7 +655,8 @@ set -e
   echo "DXMT validation accepted a replaced live runtime root." >&2
   exit 1
 }
-/usr/bin/grep -F "runtime root changed during validation" \
+/usr/bin/grep -E \
+  'runtime root changed during validation|DXMT WoW64 companion changed while it was inspected' \
   "$root_aba_log" >/dev/null || {
   /bin/cat "$root_aba_log" >&2
   echo "DXMT root-replacement regression failed at the wrong validation gate." >&2

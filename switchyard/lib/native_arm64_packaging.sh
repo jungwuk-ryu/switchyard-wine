@@ -24,25 +24,38 @@ switchyard_native_arm64_require_packaging_contract() {
     [ "${SWITCHYARD_DXMT_COPYING_SHA256:-}" = \
       "e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c" ] &&
     [ "${SWITCHYARD_DXMT_CORRESPONDING_SOURCE_SHA256:-}" = \
-      "40bbbbecb9c48cfd67f5862b0b93878ae80dc3de083790d3ec9dadd98618c89a" ] || {
+      "40bbbbecb9c48cfd67f5862b0b93878ae80dc3de083790d3ec9dadd98618c89a" ] &&
+    [ "${SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256:-}" = \
+      "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0" ] &&
+    [ "${SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256:-}" = \
+      "7938d56916074f61dce96b43e3f63b47fe52565c6a4c6096c876847f1920d9d3" ] || {
     echo "Native ARM64 DXMT packaging constants do not match the closed policy." >&2
     return 1
   }
 }
 
 switchyard_stage_native_arm64_dxmt_artifact() {
-  local archive source_root runtime_root
+  local archive source_root wine_source_root runtime_root schema_sha256
 
-  [ "$#" -eq 3 ] || {
-    echo "usage: switchyard_stage_native_arm64_dxmt_artifact ARCHIVE SOURCE RUNTIME" >&2
+  [ "$#" -eq 4 ] || {
+    echo "usage: switchyard_stage_native_arm64_dxmt_artifact ARCHIVE DXMT_SOURCE WINE_SOURCE RUNTIME" >&2
     return 2
   }
   archive="$1"
   source_root="$2"
-  runtime_root="$3"
+  wine_source_root="$3"
+  runtime_root="$4"
   switchyard_native_arm64_require_packaging_contract || return 1
+  declare -F switchyard_validate_dxmt_wow64_companion_source >/dev/null || {
+    echo "DXMT WoW64 companion source validator is unavailable." >&2
+    return 1
+  }
+  schema_sha256="$(
+    switchyard_validate_dxmt_wow64_companion_source "$wine_source_root"
+  )" || return 1
+  [ "$schema_sha256" = "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" ] || return 1
 
-  /usr/bin/python3 -I - "$archive" "$source_root" "$runtime_root" \
+  /usr/bin/python3 -I - "$archive" "$source_root" "$wine_source_root" "$runtime_root" \
     "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" \
     "$SWITCHYARD_DXMT_SOURCE_REVISION" \
     "$SWITCHYARD_DXMT_ARTIFACT_NAME" \
@@ -52,7 +65,8 @@ switchyard_stage_native_arm64_dxmt_artifact() {
     "$SWITCHYARD_DXMT_PACKAGE_BUILD" \
     "$SWITCHYARD_DXMT_LICENSE_SHA256" \
     "$SWITCHYARD_DXMT_COPYING_SHA256" \
-    "$SWITCHYARD_DXMT_CORRESPONDING_SOURCE_SHA256" <<'PY'
+    "$SWITCHYARD_DXMT_CORRESPONDING_SOURCE_SHA256" \
+    "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" <<'PY'
 import hashlib
 import os
 import stat
@@ -63,6 +77,7 @@ import tarfile
 (
     archive_name,
     source_name,
+    wine_source_name,
     runtime_name,
     repository,
     revision,
@@ -74,7 +89,12 @@ import tarfile
     license_sha256,
     copying_sha256,
     corresponding_source_sha256,
+    companion_schema_sha256,
 ) = sys.argv[1:]
+
+COMPANION_PATH = "lib/wine/aarch64-unix/winemetal-wow64.so"
+COMPANION_SCHEMA_SOURCE = "dlls/winemetal-wow64/abi-schema-v4.txt"
+COMPANION_SCHEMA_PATH = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
 
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_MEMBER = 40 * 1024 * 1024
@@ -208,6 +228,43 @@ class RuntimeTree:
         finally:
             os.close(descriptor)
 
+    def read_file(self, relative, maximum):
+        parent, name = relative.rsplit("/", 1)
+        descriptor = self.open_directory(parent)
+        source = -1
+        try:
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            source = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            opened = os.fstat(source)
+            identity = lambda value: (
+                value.st_dev, value.st_ino, value.st_mode, value.st_size,
+                value.st_mtime_ns, value.st_ctime_ns,
+            )
+            if (
+                identity(metadata) != identity(opened)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_size <= 0
+                or opened.st_size > maximum
+                or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or not opened.st_mode & 0o111
+            ):
+                fail("runtime input is unsafe: " + relative)
+            data = bytearray()
+            while block := os.read(source, min(1024 * 1024, opened.st_size + 1 - len(data))):
+                data.extend(block)
+            after = os.fstat(source)
+            if len(data) != opened.st_size or identity(opened) != identity(after):
+                fail("runtime input changed while reading: " + relative)
+            return bytes(data)
+        finally:
+            if source >= 0:
+                os.close(source)
+            os.close(descriptor)
+
     def write_file(self, relative, data, mode, replace):
         parent, name = relative.rsplit("/", 1)
         descriptor = self.open_directory(parent, create=True)
@@ -270,6 +327,26 @@ def git(*arguments):
 
 source_fd, _source_metadata = validate_absolute(source_name, "source root", directory=True)
 os.close(source_fd)
+wine_source_fd, _wine_source_metadata = validate_absolute(
+    wine_source_name, "Wine source root", directory=True
+)
+os.close(wine_source_fd)
+schema_name = os.path.join(wine_source_name, COMPANION_SCHEMA_SOURCE)
+schema_fd, schema_metadata = validate_absolute(schema_name, "companion ABI schema")
+if schema_metadata.st_size <= 0 or schema_metadata.st_size > 1024 * 1024:
+    os.close(schema_fd)
+    fail("companion ABI schema is outside its size bound")
+with os.fdopen(schema_fd, "rb") as schema_stream:
+    schema_data = schema_stream.read(schema_metadata.st_size + 1)
+if (
+    len(schema_data) != schema_metadata.st_size
+    or sha256(schema_data) != companion_schema_sha256
+    or not schema_data.endswith(b"\n")
+    or b"\r" in schema_data
+    or b"\0" in schema_data
+    or any(byte > 0x7f for byte in schema_data)
+):
+    fail("companion ABI schema is not the exact pinned ASCII/LF file")
 if git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii").strip() != revision:
     fail("source checkout is not at the pinned revision")
 remotes = git("remote", "get-url", "--all", "origin").decode("utf-8").splitlines()
@@ -347,6 +424,7 @@ try:
     os.close(wine_directory)
     if tree.exists("lib/switchyard-dxmt"):
         fail("runtime already contains a DXMT documentation root")
+    companion_data = tree.read_file(COMPANION_PATH, 64 * 1024 * 1024)
     for relative in STAGED:
         destination = "lib/wine/" + relative
         mode = 0o755 if relative.endswith(".so") else 0o644
@@ -376,6 +454,10 @@ LGPL-2.1-or-later; LICENSE and COPYING.LIB are retained in this directory.
         (sha256(data_by_name[item]) + "  lib/wine/" + item + "\n").encode("ascii")
         for item in STAGED
     )
+    files_manifest += (
+        sha256(companion_data) + "  " + COMPANION_PATH + "\n"
+        + companion_schema_sha256 + "  " + COMPANION_SCHEMA_PATH + "\n"
+    ).encode("ascii")
     tree.write_file(documentation + "/files.sha256", files_manifest, 0o644, replace=False)
     tree.write_file(documentation + "/LICENSE", license_data, 0o644, replace=False)
     tree.write_file(documentation + "/COPYING.LIB", copying_data, 0o644, replace=False)
@@ -385,6 +467,7 @@ LGPL-2.1-or-later; LICENSE and COPYING.LIB are retained in this directory.
         0o644,
         replace=False,
     )
+    tree.write_file(COMPANION_SCHEMA_PATH, schema_data, 0o644, replace=False)
 finally:
     tree.close()
 PY
@@ -408,7 +491,9 @@ switchyard_finalize_native_arm64_runtime_manifest() {
     "$SWITCHYARD_DXMT_ARTIFACT_SHA256" \
     "$SWITCHYARD_DXMT_PACKAGE_WORKFLOW" \
     "$SWITCHYARD_DXMT_PACKAGE_WORKFLOW_SHA256" \
-    "$SWITCHYARD_DXMT_PACKAGE_BUILD" <<'PY'
+    "$SWITCHYARD_DXMT_PACKAGE_BUILD" \
+    "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" \
+    "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" <<'PY'
 import hashlib
 import json
 import os
@@ -426,7 +511,12 @@ import sys
     workflow,
     workflow_sha256,
     package_build,
+    original_winemetal_sha256,
+    companion_schema_sha256,
 ) = sys.argv[1:]
+
+COMPANION_PATH = "lib/wine/aarch64-unix/winemetal-wow64.so"
+COMPANION_SCHEMA_PATH = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
 
 MODULE_SOURCES = [
     ("lib/wine/aarch64-unix/winemetal.so", "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0", "mach-o-dylib", "arm64"),
@@ -472,6 +562,7 @@ DOCUMENT_PATHS = [
     "lib/switchyard-dxmt/share/doc/switchyard-dxmt/LICENSE",
     "lib/switchyard-dxmt/share/doc/switchyard-dxmt/COPYING.LIB",
     "lib/switchyard-dxmt/share/doc/switchyard-dxmt/CORRESPONDING-SOURCE.txt",
+    COMPANION_SCHEMA_PATH,
 ]
 AUDITED = [
     ("crypt32", "lib/wine/aarch64-unix/crypt32.so"),
@@ -484,6 +575,10 @@ AUDITED = [
 
 def fail(message):
     raise SystemExit("native ARM64 manifest production failed: " + message)
+
+
+if original_winemetal_sha256 != MODULE_SOURCES[0][1]:
+    fail("DXMT original winemetal source identity is not exact")
 
 
 def no_duplicates(pairs):
@@ -601,6 +696,9 @@ try:
         data, _metadata = tree.read(relative)
         return hashlib.sha256(data).hexdigest()
 
+    if digest(COMPANION_SCHEMA_PATH) != companion_schema_sha256:
+        fail("staged companion ABI schema differs from the pinned source contract")
+
     value["graphicsBackend"] = "dxmt-metal"
     value["wow64UnixlibPolicy"] = {
         "contractVersion": 2,
@@ -648,6 +746,31 @@ try:
         },
         "license": "LGPL-2.1-or-later",
         "modules": modules,
+        "wow64Companion": {
+            "path": COMPANION_PATH,
+            "sha256": digest(COMPANION_PATH),
+            "format": "mach-o-dylib",
+            "architecture": "arm64",
+            "minimumMacOS": "26.5",
+            "sdk": "26.5",
+            "installName": "@rpath/winemetal-wow64.so",
+            "rpaths": ["@loader_path/"],
+            "loadCommands": [
+                {"command": "LC_LOAD_DYLIB", "path": "@rpath/ntdll.so"},
+                {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"},
+                {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Metal.framework/Versions/A/Metal"},
+                {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libSystem.B.dylib"},
+                {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libobjc.A.dylib"},
+            ],
+            "originalUnixLibrary": MODULE_SOURCES[0][0],
+            "originalSha256": digest(MODULE_SOURCES[0][0]),
+            "abiSchema": COMPANION_SCHEMA_PATH,
+            "abiSchemaSha256": companion_schema_sha256,
+            "entryCount": 138,
+            "dispatchSourceVersion": 2,
+            "bindingVersion": 4,
+            "codeSignature": "strict",
+        },
         "documents": [
             {"path": relative, "sha256": digest(relative)} for relative in DOCUMENT_PATHS
         ],
@@ -1660,13 +1783,54 @@ try:
         item["sha256"] = digest(item["path"])
         if item.get("format") == "pe-dll" and item["sha256"] != item.get("sourceSha256"):
             fail("DXMT PE module differs from its pinned artifact bytes")
+    companion = dxmt.get("wow64Companion")
+    companion_fields = {
+        "path", "sha256", "format", "architecture", "minimumMacOS", "sdk",
+        "installName", "rpaths", "loadCommands", "originalUnixLibrary",
+        "originalSha256", "abiSchema", "abiSchemaSha256", "entryCount",
+        "dispatchSourceVersion", "bindingVersion", "codeSignature",
+    }
+    if (
+        type(companion) is not dict
+        or set(companion) != companion_fields
+        or companion.get("path") != "lib/wine/aarch64-unix/winemetal-wow64.so"
+        or companion.get("format") != "mach-o-dylib"
+        or companion.get("architecture") != "arm64"
+        or companion.get("minimumMacOS") != "26.5"
+        or companion.get("sdk") != "26.5"
+        or companion.get("installName") != "@rpath/winemetal-wow64.so"
+        or companion.get("rpaths") != ["@loader_path/"]
+        or companion.get("loadCommands") != [
+            {"command": "LC_LOAD_DYLIB", "path": "@rpath/ntdll.so"},
+            {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"},
+            {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Metal.framework/Versions/A/Metal"},
+            {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libSystem.B.dylib"},
+            {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libobjc.A.dylib"},
+        ]
+        or companion.get("originalUnixLibrary") != modules[0].get("path")
+        or companion.get("abiSchema")
+        != "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+        or companion.get("entryCount") != 138
+        or companion.get("dispatchSourceVersion") != 2
+        or companion.get("bindingVersion") != 4
+        or companion.get("codeSignature") != "strict"
+    ):
+        fail("DXMT WoW64 companion schema is not exact")
+    companion["sha256"] = digest(companion["path"])
+    companion["originalSha256"] = modules[0]["sha256"]
+    schema_digest = digest(companion["abiSchema"])
+    if companion.get("abiSchemaSha256") != schema_digest:
+        fail("DXMT WoW64 companion ABI schema differs from its manifest binding")
     files_relative = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/files.sha256"
-    new_files_data = "".join(
+    new_files_text = "".join(
         f"{item['sha256']}  {item['path']}\n" for item in modules
-    ).encode("ascii")
+    )
+    new_files_text += f"{companion['sha256']}  {companion['path']}\n"
+    new_files_text += f"{schema_digest}  {companion['abiSchema']}\n"
+    new_files_data = new_files_text.encode("ascii")
     _old_files_data, files_info = read_file(files_relative, MAX_MANIFEST)
     documents = dxmt.get("documents")
-    if type(documents) is not list or len(documents) != 4:
+    if type(documents) is not list or len(documents) != 5:
         fail("DXMT document schema is not exact")
     for item in documents:
         if type(item) is not dict or set(item) != {"path", "sha256"}:
@@ -2044,6 +2208,7 @@ switchyard_validate_native_arm64_runtime_packaging() {
       switchyard_validate_native_arm64_signed_dependency_trees \
       switchyard_validate_native_cpu_provider_files \
       switchyard_validate_wow64_unixlib_policy_manifest \
+      switchyard_validate_dxmt_wow64_companion_source \
       switchyard_validate_dxmt_runtime_manifest; do
     declare -F "$validator" >/dev/null || {
       echo "Native ARM64 packaging validator is unavailable: $validator" >&2
@@ -2057,5 +2222,6 @@ switchyard_validate_native_arm64_runtime_packaging() {
   switchyard_validate_native_cpu_provider_files "$manifest" "$runtime_root" || return 1
   switchyard_validate_wow64_unixlib_policy_manifest \
     "$runtime_root" "$manifest" "$source_root" || return 1
+  switchyard_validate_dxmt_wow64_companion_source "$source_root" >/dev/null || return 1
   switchyard_validate_dxmt_runtime_manifest "$runtime_root" "$manifest"
 }

@@ -163,6 +163,15 @@ if [ -e "$RUNTIME/lib/wine/x86_64-unix/winemetal.so" ]; then
   echo "Native DXMT runtime unexpectedly stages the Rosetta x86_64 Unix library." >&2
   exit 1
 fi
+dxmt_companion="$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so"
+[ -f "$dxmt_companion" ] && [ ! -L "$dxmt_companion" ] && [ -x "$dxmt_companion" ] || {
+  echo "Native DXMT runtime is missing its regular executable WoW64 companion." >&2
+  exit 1
+}
+[ "$(/usr/bin/lipo -archs "$dxmt_companion" 2>/dev/null)" = arm64 ] || {
+  echo "Native DXMT WoW64 companion is not arm64-only." >&2
+  exit 1
+}
 
 validate_runtime_executable() {
   local candidate="$1"
@@ -376,6 +385,7 @@ run_guest() {
   local architecture_log="$work/$guest.architecture"
   local architecture_error="$work/$guest.architecture.err"
   local process_identity wine_executable provider_relative provider_unix
+  local -a expected_images
   local ready_nonce ready_marker start_seconds
   local pid status=0 ready=0 probe_status=0 count sample
 
@@ -469,10 +479,16 @@ run_guest() {
     return 1
   }
   provider_unix="$RUNTIME/$provider_relative"
+  expected_images=(
+    "$wine_executable"
+    "$RUNTIME/lib/wine/aarch64-unix/winemetal.so"
+    "$provider_unix"
+  )
+  if [ "$guest" = i386 ]; then
+    expected_images+=("$dxmt_companion")
+  fi
   "$work/loaded-image-probe" --loaded-images "$pid" "$process_identity" \
-    "$wine_executable" \
-    "$RUNTIME/lib/wine/aarch64-unix/winemetal.so" \
-    "$provider_unix" \
+    "${expected_images[@]}" \
     >"$probe_log" 2>"$probe_error" &
   ACTIVE_PROBE_PID=$!
   for ((count = 0; count < 200; ++count)); do

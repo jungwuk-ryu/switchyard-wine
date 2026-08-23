@@ -304,6 +304,8 @@ for module in crypt32 dwrite secur32 winemac ws2_32; do
     -mmacosx-version-min=26.5 -Wl,-install_name,"@rpath/$module.so" \
     "$TEST_ROOT/policy.c" -o "$RUNTIME/lib/wine/aarch64-unix/$module.so"
 done
+/bin/cp "$RUNTIME/lib/wine/aarch64-unix/crypt32.so" \
+  "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so"
 
 XTAJIT_UNIX_SHA="$(sha256_file "$RUNTIME/$SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY")"
 XTAJIT_PE_SHA="$(sha256_file "$RUNTIME/$SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY")"
@@ -448,6 +450,11 @@ value = {
                 "sha256": ws2_32_digest,
             },
         ],
+    },
+    "dxmt": {
+        "wow64Companion": {
+            "path": "lib/wine/aarch64-unix/winemetal-wow64.so",
+        },
     },
 }
 with open(output, "x", encoding="utf-8", newline="\n") as stream:
@@ -826,7 +833,8 @@ for relative in \
     dlls/dwrite/freetype.c \
     dlls/secur32/schannel_gnutls.c \
     dlls/winemac.drv/macdrv_main.c \
-    dlls/ws2_32/unixlib.c; do
+    dlls/ws2_32/unixlib.c \
+    dlls/winemetal-wow64/unixlib.c; do
   /bin/mkdir -p "$SOURCE_FIXTURE/$(dirname "$relative")"
   /bin/cp "$ROOT_DIR/$relative" "$SOURCE_FIXTURE/$relative"
 done
@@ -848,9 +856,10 @@ expect_failure "inconsistent generation-tagged source constants" \
 switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
 switchyard_validate_wow64_unixlib_policy_manifest "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
 
-if /usr/bin/grep -E 'owned[-_ ]backing|winemetal-wow64|abi-schema-v3' \
-    "$PROVIDER_LIBRARY" >/dev/null; then
-  fail "retired external policy schema leaked into the provider validator"
+/usr/bin/grep -F 'winemetal-wow64.so' "$PROVIDER_LIBRARY" >/dev/null ||
+  fail "DXMT companion is absent from the exact v2 export inventory"
+if /usr/bin/grep -E 'abi-schema-v3|companion_v3' "$PROVIDER_LIBRARY" >/dev/null; then
+  fail "retired companion schema leaked into the provider validator"
 fi
 
 echo "native CPU-provider and generation-tagged v2 policy fixtures passed"

@@ -294,6 +294,8 @@ __attribute__((visibility("default"))) const struct dispatch_source_v2
          __wine_unix_call_wow64_funcs, entries, 0, 0};
 EOF
 done
+/bin/cp "$RUNTIME/lib/wine/aarch64-unix/crypt32.so" \
+    "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so"
 
 /usr/bin/xcrun --sdk macosx clang -arch arm64 -std=c17 -O2 \
     -mmacosx-version-min=26.5 -Wall -Wextra -Werror \
@@ -452,6 +454,11 @@ value = {
                 "sha256": ws2_32_digest,
             },
         ],
+    },
+    "dxmt": {
+        "wow64Companion": {
+            "path": "lib/wine/aarch64-unix/winemetal-wow64.so",
+        },
     },
 }
 with open(output, "x", encoding="utf-8", newline="\n") as stream:
@@ -612,9 +619,9 @@ expect_driver_failure test_log_limit \
 /usr/bin/grep -F \
     'switchyard_validate_runtime_manifest_profile "$MANIFEST" preview-native-arm64-fex' \
     "$DRIVER" >/dev/null || fail "driver is not bound to the current native profile"
-if /usr/bin/grep -E 'winemetal-wow64|owned-backing|abi-schema-v3' \
+if /usr/bin/grep -E 'abi-schema-v3|companion_v3' \
         "$DRIVER" >/dev/null; then
-    fail "retired owned-backing policy leaked into the current UI harness"
+    fail "retired DXMT companion schema leaked into the current UI harness"
 fi
 
 echo "Native i386 UI acceptance fixture-only driver coverage passed; no production runtime was qualified."

@@ -9,7 +9,7 @@
 
 SWITCHYARD_DEFAULT_RUNTIME_PROFILE="stable-x86_64-rosetta"
 SWITCHYARD_RUNTIME_MANIFEST_VERSION="2"
-SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION="1"
+SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION="2"
 SWITCHYARD_NATIVE_LLVM_VERSION="22.1.8"
 SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG="--no-default-config"
 SWITCHYARD_RUNTIME_BOOTSTRAP_MAX_PATH="260"
@@ -457,8 +457,8 @@ switchyard_native_configured_host_target_policy_is_exact() {
 }
 
 switchyard_native_runtime_closure_digest() {
-  [ "$#" -eq 17 ] || {
-    echo "Native runtime closure requires the exact 17-input contract." >&2
+  [ "$#" -eq 19 ] || {
+    echo "Native runtime closure requires the exact 19-input contract." >&2
     return 2
   }
 
@@ -484,6 +484,8 @@ labels = (
     "tlsDlopenDigest",
     "unicornRuntimeDigest",
     "dxmtArtifactSha256",
+    "dxmtOriginalWinemetalSha256",
+    "dxmtCompanionAbiSchemaSha256",
     "nativeCompilerIdentity",
 )
 values = sys.argv[1:]
@@ -494,7 +496,7 @@ if values[2] not in ("true", "false"):
 if values[4] != "no-gptk":
     raise SystemExit("native runtime closure must not bind a GPTK overlay")
 hex64 = set("0123456789abcdef")
-for index in (5, 6, 7, 8, 9, 10, 14, 15, 16):
+for index in (5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18):
     if len(values[index]) != 64 or set(values[index]) - hex64:
         raise SystemExit("native runtime closure input is not a full SHA-256: " + labels[index])
 for index in (11,):
@@ -510,7 +512,7 @@ if len(values[3]) != 64 or set(values[3]) - hex64:
     raise SystemExit("native runtime closure source state digest is invalid")
 
 digest = hashlib.sha256()
-digest.update(b"switchyard-preview-native-arm64-fex-runtime-closure-v1\0")
+digest.update(b"switchyard-preview-native-arm64-fex-runtime-closure-v2\0")
 for label, value in zip(labels, values):
     key = label.encode("utf-8", "strict")
     payload = value.encode("utf-8", "strict")
@@ -635,6 +637,8 @@ SWITCHYARD_DXMT_SOURCE_REPOSITORY="https://github.com/3Shain/dxmt.git"
 SWITCHYARD_DXMT_SOURCE_REVISION="856d9f35789679ef00c1ba01a6353438df84b66f"
 SWITCHYARD_DXMT_ARTIFACT_NAME="dxmt-${SWITCHYARD_DXMT_SOURCE_REVISION}.tar.gz"
 SWITCHYARD_DXMT_ARTIFACT_SHA256="8840df7038d7cbffed3652712c86ec4d6d495612aa39306e9a184bd213514acf"
+SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256="1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0"
+SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256="7938d56916074f61dce96b43e3f63b47fe52565c6a4c6096c876847f1920d9d3"
 SWITCHYARD_DXMT_PACKAGE_WORKFLOW=".github/workflows/ci.yml"
 SWITCHYARD_DXMT_PACKAGE_WORKFLOW_SHA256="fe5a3656b9f59e81e650e60077bcdd840a5205ff0d960f00f6cb4c8fbacbe851"
 SWITCHYARD_DXMT_PACKAGE_BUILD="gcc-release-x86_64-windows-cross+gcc-release-x86-windows-cross+clang-release-arm64ec-windows-cross"

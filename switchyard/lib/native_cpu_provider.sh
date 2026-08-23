@@ -1015,6 +1015,7 @@ expected_modules = [
     ("winemac", "lib/wine/aarch64-unix/winemac.so"),
     ("ws2_32", "lib/wine/aarch64-unix/ws2_32.so"),
 ]
+companion_relative = "lib/wine/aarch64-unix/winemetal-wow64.so"
 MAX_UNIX_IMAGES = 4096
 MAX_UNIX_SNAPSHOT_BYTES = 4 * 1024 * 1024 * 1024
 sha256_pattern = re.compile(r"[0-9a-f]{64}")
@@ -1105,6 +1106,7 @@ if (
     fail("runtime manifest changed while parsing")
 
 policy = value.get("wow64UnixlibPolicy") if type(value) is dict else None
+dxmt = value.get("dxmt") if type(value) is dict else None
 expected_keys = {
     "contractVersion",
     "handleEncoding",
@@ -1128,6 +1130,9 @@ if (
     fail("manifest policy does not require source v2 externally")
 if policy["requiredEntryFlag"] != required_flag or type(policy["requiredEntryFlag"]) is not str:
     fail("manifest policy does not require REVIEWED entry metadata")
+companion = dxmt.get("wow64Companion") if type(dxmt) is dict else None
+if type(companion) is not dict or companion.get("path") != companion_relative:
+    fail("manifest does not bind the exact DXMT WoW64 companion")
 
 snapshot_workspace = tempfile.TemporaryDirectory(
     prefix="switchyard-wow64-policy.", dir="/private/tmp"
@@ -1427,13 +1432,15 @@ if v1_images:
     paths = sorted(os.path.relpath(path, root) for path in v1_images)
     fail(f"external Unix library exports the ntdll-only v1 source: {paths}")
 expected_v2_images = {os.path.join(root, relative) for _, relative in expected_modules}
+expected_v2_images.add(os.path.join(root, companion_relative))
 if v2_images != expected_v2_images:
     missing = sorted(os.path.relpath(path, root) for path in expected_v2_images - v2_images)
     extra = sorted(os.path.relpath(path, root) for path in v2_images - expected_v2_images)
     fail(f"external v2 dispatch module set is not exact; missing={missing}, extra={extra}")
 
-expected_paths = {relative.casefold() for _, relative in expected_modules}
+expected_paths = {relative.casefold() for _, relative in expected_modules} | {companion_relative.casefold()}
 reserved = {os.path.basename(relative).casefold() for _, relative in expected_modules}
+reserved.add(os.path.basename(companion_relative).casefold())
 for directory, directories, files in os.walk(root, followlinks=False):
     for name in directories:
         path = os.path.join(directory, name)
@@ -1682,6 +1689,7 @@ source_files = {
     ),
     "winemac": ("dlls/winemac.drv/macdrv_main.c", None, None),
     "ws2_32": ("dlls/ws2_32/unixlib.c", None, None),
+    "winemetal-wow64": ("dlls/winemetal-wow64/unixlib.c", 138, None),
 }
 for module, (relative, expected_count, expected_digest) in source_files.items():
     raw_source = read_source(relative, 32 * 1024 * 1024)

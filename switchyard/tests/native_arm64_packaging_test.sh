@@ -120,6 +120,65 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ -d "$DXMT_SOURCE" ] && [ ! -L "$DXMT_SOURCE" ] ||
   fail "pinned DXMT source fixture is missing or unsafe"
 
+COMPANION_SOURCE_FIXTURE="$TEST_ROOT/companion-source"
+for relative in \
+    configure.ac configure \
+    include/wine/unixlib.h \
+    dlls/winemetal-wow64/Makefile.in \
+    dlls/winemetal-wow64/adapter.c \
+    dlls/winemetal-wow64/buffer.h \
+    dlls/winemetal-wow64/buffer.m \
+    dlls/winemetal-wow64/commands.c \
+    dlls/winemetal-wow64/unixlib.c \
+    dlls/winemetal-wow64/winemetal_private.h \
+    dlls/winemetal-wow64/abi-schema-v4.txt; do
+  /bin/mkdir -p "$COMPANION_SOURCE_FIXTURE/$(dirname "$relative")"
+  /bin/cp "$ROOT_DIR/$relative" "$COMPANION_SOURCE_FIXTURE/$relative"
+done
+[ "$(switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE")" = \
+  "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" ] ||
+  fail "exact DXMT WoW64 companion source preflight did not return its schema identity"
+/bin/cp "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt" \
+  "$TEST_ROOT/abi-schema-v4.good"
+/usr/bin/printf 'tampered\n' >> \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
+expect_failure "tampered companion ABI schema source" \
+  switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
+/bin/cp "$TEST_ROOT/abi-schema-v4.good" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
+/bin/mv "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt" \
+  "$TEST_ROOT/abi-schema-v4.target"
+/bin/ln -s "$TEST_ROOT/abi-schema-v4.target" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
+expect_failure "symbolic-link companion ABI schema source" \
+  switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
+/bin/rm "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
+/bin/mv "$TEST_ROOT/abi-schema-v4.target" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
+/bin/mv "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/buffer.m" \
+  "$TEST_ROOT/buffer.m.target"
+/bin/ln -s "$TEST_ROOT/buffer.m.target" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/buffer.m"
+expect_failure "symbolic-link companion implementation source" \
+  switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
+/bin/rm "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/buffer.m"
+/bin/mv "$TEST_ROOT/buffer.m.target" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/buffer.m"
+/bin/cp "$COMPANION_SOURCE_FIXTURE/include/wine/unixlib.h" \
+  "$TEST_ROOT/unixlib.h.good"
+/usr/bin/sed -i '' 's/{ 0x79,/{ 0x78,/' \
+  "$COMPANION_SOURCE_FIXTURE/include/wine/unixlib.h"
+expect_failure "mismatched companion ABI digest header" \
+  switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
+/bin/cp "$TEST_ROOT/unixlib.h.good" \
+  "$COMPANION_SOURCE_FIXTURE/include/wine/unixlib.h"
+/bin/mv "$COMPANION_SOURCE_FIXTURE/include/wine/unixlib.h" \
+  "$TEST_ROOT/unixlib.h.missing"
+expect_failure "missing companion ABI digest header" \
+  switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
+/bin/mv "$TEST_ROOT/unixlib.h.missing" \
+  "$COMPANION_SOURCE_FIXTURE/include/wine/unixlib.h"
+
 UNICORN_CACHE="${SWITCHYARD_UNICORN_FIXTURE_CACHE:-${HOME}/.switchyard/deps/cpu-provider/unicorn-${SWITCHYARD_UNICORN_VERSION}-${SWITCHYARD_UNICORN_SOURCE_REVISION:0:12}-build${SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION}-arm64-macos-${SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS}}"
 [ -d "$UNICORN_CACHE" ] && [ ! -L "$UNICORN_CACHE" ] ||
   fail "pinned Unicorn fixture cache is missing: $UNICORN_CACHE"
@@ -270,11 +329,12 @@ struct dispatch_source_v2
     const struct dispatch_entry_v2 *entries;
     uint32_t flags, reserved;
 };
+#define FIXTURE_IMMUTABLE_EXPORT __attribute__((visibility("default"), section("__DATA_CONST,__const")))
 static int32_t fixture_call(void *args) { return args ? 0 : 0; }
-__attribute__((visibility("default"))) const unixlib_entry_t
+FIXTURE_IMMUTABLE_EXPORT const unixlib_entry_t
     __wine_unix_call_wow64_funcs[] = {fixture_call};
 static const struct dispatch_entry_v2 entries[] = {{4, 1}};
-__attribute__((visibility("default"))) const struct dispatch_source_v2
+FIXTURE_IMMUTABLE_EXPORT const struct dispatch_source_v2
     __wine_unix_call_wow64_dispatch_v2 =
         {2, sizeof(struct dispatch_source_v2), 1, sizeof(struct dispatch_entry_v2),
          __wine_unix_call_wow64_funcs, entries, 0, 0};
@@ -284,6 +344,44 @@ for module in crypt32 dwrite secur32 winemac ws2_32; do
     -mmacosx-version-min=26.5 -Wl,-install_name,"@rpath/$module.so" \
     "$TEST_ROOT/policy.c" -o "$RUNTIME/lib/wine/aarch64-unix/$module.so"
 done
+/bin/cat >"$TEST_ROOT/companion.c" <<'EOF'
+#include "policy.c"
+extern int ntdll_fixture(void);
+extern void *NSClassFromString(void *);
+extern void *MTLCreateSystemDefaultDevice(void);
+extern void *objc_getClass(const char *);
+__attribute__((constructor)) static void companion_dependencies(void)
+{
+    volatile const void *dependencies[] = {
+        (const void *)(uintptr_t)ntdll_fixture,
+        (const void *)(uintptr_t)NSClassFromString,
+        (const void *)(uintptr_t)MTLCreateSystemDefaultDevice,
+        (const void *)(uintptr_t)objc_getClass,
+    };
+    (void)dependencies;
+}
+struct companion_descriptor_v4
+{
+    uint32_t version, size, entry_count, flags;
+    unsigned char abi_sha256[32];
+    const void *bind;
+};
+FIXTURE_IMMUTABLE_EXPORT const struct companion_descriptor_v4
+    __wine_unix_call_wow64_companion_v4 = {
+        4, sizeof(struct companion_descriptor_v4), 138, 0,
+        {0x79, 0x38, 0xd5, 0x69, 0x16, 0x07, 0x4f, 0x61,
+         0xdc, 0xe9, 0x6b, 0x43, 0xe3, 0xf6, 0x3b, 0x47,
+         0xfe, 0x52, 0x56, 0x5c, 0x6a, 0x4c, 0x60, 0x96,
+         0xc8, 0x76, 0x84, 0x7f, 0x19, 0x20, 0xd9, 0xd3},
+        __wine_unix_call_wow64_funcs,
+    };
+EOF
+/usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -nostdlib -O2 -Wall -Wextra -Werror \
+  -mmacosx-version-min=26.5 -Wl,-install_name,@rpath/winemetal-wow64.so \
+  -Wl,-rpath,@loader_path/ -I"$TEST_ROOT" "$TEST_ROOT/companion.c" \
+  "$RUNTIME/lib/wine/aarch64-unix/ntdll.so" \
+  -framework Foundation -framework Metal -lSystem -lobjc \
+  -o "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so"
 
 DEPENDENCY_FIELDS=(gstreamerRuntime vulkanRuntime fontRuntime tlsRuntime)
 DEPENDENCY_ROOTS=(
@@ -485,7 +583,8 @@ with open(output, "x", encoding="utf-8", newline="\n") as stream:
 PY
 /bin/chmod 0644 "$MANIFEST"
 
-switchyard_stage_native_arm64_dxmt_artifact "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$RUNTIME"
+switchyard_stage_native_arm64_dxmt_artifact \
+  "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$ROOT_DIR" "$RUNTIME"
 switchyard_finalize_native_arm64_runtime_manifest "$RUNTIME" "$MANIFEST"
 switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
 
@@ -501,8 +600,17 @@ if [item["module"] for item in value["wow64UnixlibPolicy"]["auditedModules"]] !=
     "crypt32", "dwrite", "secur32", "winemac", "ws2_32"
 ]:
     raise SystemExit("producer did not emit the exact sorted audited-module list")
-if len(value["dxmt"]["modules"]) != 17 or len(value["dxmt"]["documents"]) != 4:
+if len(value["dxmt"]["modules"]) != 17 or len(value["dxmt"]["documents"]) != 5:
     raise SystemExit("producer did not emit the exact DXMT closure")
+companion = value["dxmt"]["wow64Companion"]
+if (companion["path"] != "lib/wine/aarch64-unix/winemetal-wow64.so"
+        or companion["format"] != "mach-o-dylib"
+        or companion["minimumMacOS"] != "26.5"
+        or companion["sdk"] != "26.5"
+        or companion["installName"] != "@rpath/winemetal-wow64.so"
+        or companion["rpaths"] != ["@loader_path/"]
+        or companion["codeSignature"] != "strict"):
+    raise SystemExit("producer did not emit the exact signed companion identity")
 PY
 
 RUNTIME_ID_BEFORE="$(/usr/bin/plutil -extract id raw -o - "$MANIFEST")"
@@ -683,7 +791,17 @@ for item in value["dxmt"]["modules"]:
         raise SystemExit("refreshed DXMT module digest is stale")
 files = "".join(
     f"{item['sha256']}  {item['path']}\n" for item in value["dxmt"]["modules"]
-).encode("ascii")
+)
+companion = value["dxmt"]["wow64Companion"]
+if companion["sha256"] != digest(companion["path"]):
+    raise SystemExit("refreshed DXMT companion digest is stale")
+if companion["originalSha256"] != value["dxmt"]["modules"][0]["sha256"]:
+    raise SystemExit("refreshed DXMT companion lost its original-library binding")
+if companion["abiSchemaSha256"] != digest(companion["abiSchema"]):
+    raise SystemExit("refreshed DXMT companion schema digest is stale")
+files += f"{companion['sha256']}  {companion['path']}\n"
+files += f"{companion['abiSchemaSha256']}  {companion['abiSchema']}\n"
+files = files.encode("ascii")
 files_path = value["dxmt"]["documents"][0]["path"]
 with open(os.path.join(root, files_path), "rb") as stream:
     if stream.read() != files:
@@ -1009,9 +1127,26 @@ expect_failure "tampered DXMT module" \
   switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
 /bin/cp "$TEST_ROOT/d3d11.good" "$RUNTIME/lib/wine/x86_64-windows/d3d11.dll"
 
+companion="$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so"
+/bin/cp "$companion" "$TEST_ROOT/winemetal-wow64.good"
+/usr/bin/printf 'tampered\n' >>"$companion"
+expect_failure "tampered DXMT WoW64 companion" \
+  switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
+/bin/cp "$TEST_ROOT/winemetal-wow64.good" "$companion"
+/bin/rm "$companion"
+expect_failure "missing DXMT WoW64 companion" \
+  switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
+/bin/cp "$TEST_ROOT/winemetal-wow64.good" "$companion"
+/bin/mv "$companion" "$TEST_ROOT/winemetal-wow64.target"
+/bin/ln -s "$TEST_ROOT/winemetal-wow64.target" "$companion"
+expect_failure "symbolic-link DXMT WoW64 companion" \
+  switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
+/bin/rm "$companion"
+/bin/mv "$TEST_ROOT/winemetal-wow64.target" "$companion"
+
 expect_failure "missing artifact input" \
   switchyard_stage_native_arm64_dxmt_artifact \
-    "$TEST_ROOT/missing.tar.gz" "$DXMT_SOURCE" "$RUNTIME"
+    "$TEST_ROOT/missing.tar.gz" "$DXMT_SOURCE" "$ROOT_DIR" "$RUNTIME"
 
 tampered_archive="$TEST_ROOT/tampered.tar.gz"
 /bin/cp "$DXMT_ARCHIVE" "$tampered_archive"
@@ -1021,7 +1156,7 @@ empty_runtime="$TEST_ROOT/tampered-runtime"
 /bin/chmod 0700 "$empty_runtime"
 expect_failure "tampered artifact archive" \
   switchyard_stage_native_arm64_dxmt_artifact \
-    "$tampered_archive" "$DXMT_SOURCE" "$empty_runtime"
+    "$tampered_archive" "$DXMT_SOURCE" "$ROOT_DIR" "$empty_runtime"
 
 outside="$TEST_ROOT/outside"
 unsafe_runtime="$TEST_ROOT/unsafe-runtime"
@@ -1030,7 +1165,7 @@ unsafe_runtime="$TEST_ROOT/unsafe-runtime"
 /bin/ln -s "$outside" "$unsafe_runtime/lib/wine/aarch64-windows"
 expect_failure "symbolic-link architecture directory" \
   switchyard_stage_native_arm64_dxmt_artifact \
-    "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$unsafe_runtime"
+    "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$ROOT_DIR" "$unsafe_runtime"
 [ -z "$(/usr/bin/find "$outside" -mindepth 1 -print -quit)" ] ||
   fail "staging wrote outside the runtime through a symbolic link"
 
@@ -1040,7 +1175,7 @@ real_parent="$TEST_ROOT/real-parent"
 /bin/ln -s "$real_parent" "$TEST_ROOT/linked-parent"
 expect_failure "symbolic-link runtime parent" \
   switchyard_stage_native_arm64_dxmt_artifact \
-    "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$TEST_ROOT/linked-parent/runtime"
+    "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$ROOT_DIR" "$TEST_ROOT/linked-parent/runtime"
 
 /bin/cp "$TEST_ROOT/manifest.good" "$TEST_ROOT/already-native.json"
 expect_failure "manifest native-field overwrite" \

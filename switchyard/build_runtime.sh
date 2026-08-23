@@ -213,6 +213,7 @@ if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
 fi
 DXMT_ARCHIVE=""
 DXMT_SOURCE_DIR=""
+DXMT_WOW64_COMPANION_ABI_SCHEMA_SHA256=""
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
   DXMT_ARCHIVE="${SWITCHYARD_DXMT_ARCHIVE:-${HOME}/Library/Caches/Switchyard/DXMT/${SWITCHYARD_DXMT_ARTIFACT_NAME}}"
   DXMT_SOURCE_DIR="${SWITCHYARD_DXMT_SOURCE_DIR:-${HOME}/.switchyard/deps/dxmt/${SWITCHYARD_DXMT_SOURCE_REVISION}/source}"
@@ -3320,6 +3321,12 @@ if [ "$MODE" = "--source-info" ]; then
   exit 0
 fi
 
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  DXMT_WOW64_COMPANION_ABI_SCHEMA_SHA256="$(
+    switchyard_validate_dxmt_wow64_companion_source "$ROOT_DIR"
+  )" || exit $?
+fi
+
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] &&
    [ -n "$USER_SET_WINE_INSTALL_PREFIX" ]; then
   WINE_INSTALL_PREFIX="$(
@@ -3445,7 +3452,8 @@ if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
       "$vulkan_closure_digest" "$mesa_closure_digest" "$font_closure_digest" \
       "$font_assets_closure_digest" "$tls_closure_digest" "$TLS_DLOPEN_NAME" \
       "$tls_dlopen_closure_digest" "$unicorn_runtime_digest" \
-      "$SWITCHYARD_DXMT_ARTIFACT_SHA256" "$NATIVE_COMPILER_POLICY_IDENTITY"
+      "$SWITCHYARD_DXMT_ARTIFACT_SHA256" "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" \
+      "$DXMT_WOW64_COMPANION_ABI_SCHEMA_SHA256" "$NATIVE_COMPILER_POLICY_IDENTITY"
   )" || exit $?
   runtime_id="$(
     switchyard_native_runtime_id_from_closure_digest \
@@ -3836,8 +3844,10 @@ if [ "$configured" -eq 1 ]; then
        ! grep -F "XTAJIT_UNIXLIB = xtajit.so" \
          "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
        ! grep -F "XTAJIT_PE_CFLAGS = -DHAVE_UNICORN" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "WINEMETAL_WOW64_UNIXLIB = winemetal-wow64.so" \
          "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
-      echo "existing native Wine build does not use the exact pinned Unicorn provider; reconfiguring"
+      echo "existing native Wine build does not use the exact native provider and DXMT companion; reconfiguring"
       RECONFIGURE=1
     fi
   fi
@@ -3994,8 +4004,10 @@ if [ "$configured" -eq 0 ]; then
        ! grep -F "XTAJIT_UNIXLIB = xtajit.so" \
          "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
        ! grep -F "XTAJIT_PE_CFLAGS = -DHAVE_UNICORN" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "WINEMETAL_WOW64_UNIXLIB = winemetal-wow64.so" \
          "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
-      echo "Wine configure did not enable both native Unicorn provider Unix libraries." >&2
+      echo "Wine configure did not enable the native providers and DXMT WoW64 companion." >&2
       exit 1
     fi
     native_configured_compiler_policy_is_exact "$WINE_BUILD_DIR/Makefile" || {
@@ -4037,6 +4049,13 @@ make -C "$WINE_BUILD_DIR" install DESTDIR="$INSTALL_STAGE_ROOT"
 if [ ! -d "$staged_wine_install_prefix" ]; then
   echo "Wine install did not create the expected staged prefix at $staged_wine_install_prefix." >&2
   exit 1
+fi
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  companion="$staged_wine_install_prefix/lib/wine/aarch64-unix/winemetal-wow64.so"
+  if [ ! -f "$companion" ] || [ -L "$companion" ] || [ ! -x "$companion" ]; then
+    echo "Wine install did not produce the required native ARM64 DXMT WoW64 companion: $companion" >&2
+    exit 1
+  fi
 fi
 WINE_INSTALL_PREFIX="$staged_wine_install_prefix"
 
@@ -4119,7 +4138,7 @@ fi
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
   echo "staging the pinned native ARM64 DXMT artifact closure"
   switchyard_stage_native_arm64_dxmt_artifact \
-    "$DXMT_ARCHIVE" "$DXMT_SOURCE_DIR" "$WINE_INSTALL_PREFIX"
+    "$DXMT_ARCHIVE" "$DXMT_SOURCE_DIR" "$ROOT_DIR" "$WINE_INSTALL_PREFIX"
 fi
 
 echo "installing Wine Mono addon $WINE_MONO_FILE"

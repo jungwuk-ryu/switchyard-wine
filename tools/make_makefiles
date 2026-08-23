@@ -30,6 +30,8 @@ my %deleted_files;
 # live in the ordinary per-DLL tests directory without obscuring its ownership.
 my %nonstandard_test_makefiles =
 (
+    # This is an arm64-only Unix sibling for the pinned DXMT host library.
+    "dlls/winemetal-wow64/Makefile.in" => 1,
     "dlls/xtajit64/provider_tests/Makefile.in" => 1,
 );
 

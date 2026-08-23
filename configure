@@ -685,6 +685,7 @@ PCSCLITE_CFLAGS
 PCAP_LIBS
 PCAP_CFLAGS
 NTDLL_X18_TEST_UNIXLIB
+WINEMETAL_WOW64_UNIXLIB
 UNICORN_LIBS
 UNICORN_CFLAGS
 OPENCL_CFLAGS
@@ -1585,6 +1586,7 @@ enable_winegstreamer
 enable_winehid_sys
 enable_winemac_drv
 enable_winemapi
+enable_winemetal_wow64
 enable_wineoss_drv
 enable_wineps_drv
 enable_winepulse_drv
@@ -12125,6 +12127,7 @@ WINELOADER_LDFLAGS=""
 WINEPRELOADER_LDFLAGS=""
 
 NTDLL_X18_TEST_UNIXLIB=""
+WINEMETAL_WOW64_UNIXLIB=""
 
 XTAJIT64_UNIXLIB=
 XTAJIT64_PE_CFLAGS=
@@ -12435,6 +12438,7 @@ case $host_os in
     DLLFLAGS="$DLLFLAGS -fPIC"
     LDDLLFLAGS="-fPIC"
     enable_winemac_drv=${enable_winemac_drv:-yes}
+    test "$HOST_ARCH" != aarch64 || WINEMETAL_WOW64_UNIXLIB=winemetal-wow64.so
     test "$HOST_ARCH" != aarch64 || test "x$wine_cv_have_os_custom_x18_abi" != xyes ||
         NTDLL_X18_TEST_UNIXLIB=ntdll-x18-test.so
     with_fontconfig=${with_fontconfig:-no}
@@ -23311,6 +23315,7 @@ wine_fn_config_makefile dlls/winehid.sys enable_winehid_sys
 wine_fn_config_makefile dlls/winemac.drv enable_winemac_drv
 wine_fn_config_makefile dlls/winemac.drv/tests enable_tests
 wine_fn_config_makefile dlls/winemapi enable_winemapi
+wine_fn_config_makefile dlls/winemetal-wow64 enable_winemetal_wow64
 wine_fn_config_makefile dlls/wineoss.drv enable_wineoss_drv
 wine_fn_config_makefile dlls/wineps.drv enable_wineps_drv
 wine_fn_config_makefile dlls/wineps16.drv16 enable_win16
@@ -24529,6 +24534,7 @@ TOP_INSTALL_LIB = $TOP_INSTALL_LIB
 TOP_INSTALL_DEV = $TOP_INSTALL_DEV
 WINELOADER_LDFLAGS = $WINELOADER_LDFLAGS
 WINEPRELOADER_LDFLAGS = $WINEPRELOADER_LDFLAGS
+WINEMETAL_WOW64_UNIXLIB = $WINEMETAL_WOW64_UNIXLIB
 NTDLL_X18_TEST_UNIXLIB = $NTDLL_X18_TEST_UNIXLIB
 XTAJIT64_UNIXLIB = $XTAJIT64_UNIXLIB
 XTAJIT64_PE_CFLAGS = $XTAJIT64_PE_CFLAGS
