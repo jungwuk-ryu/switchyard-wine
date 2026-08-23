@@ -598,8 +598,8 @@ sub generate_unix_thunk($$$$)
         if (($name eq "glBindFramebuffer" || $name eq "glBindFramebufferEXT") &&
             $arg eq "framebuffer")
         {
-            $ret .= "    if (!$arg && bind_separate_default_fbos( $teb, params->target, " .
-                    "(void (*)(GLenum, GLuint))funcs->p_$name )) goto bound_default_fbos;\n";
+            $ret .= "    if (!$arg && bind_separate_default_fbos( $teb, params->target,\n" .
+                    "            (void (*)(GLenum, GLuint))funcs->p_$name )) goto bound_default_fbos;\n";
         }
         $ret .= "    if (!$arg) $arg = get_default_fbo( $teb, $target );\n";
     }
