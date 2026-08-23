@@ -1965,6 +1965,75 @@ relocate_font_deps_for_runtime() {
   fi
 }
 
+prepare_font_runtime_for_install() {
+  [ "$#" -eq 2 ] || {
+    echo "prepare_font_runtime_for_install requires dependency and asset roots" >&2
+    return 2
+  }
+
+  local source_prefix="$1"
+  local font_assets_prefix="$2"
+  local created_root
+  local runtime_font_root
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || {
+    echo "Prepared font runtime closure is restricted to the native profile." >&2
+    return 1
+  }
+  [ -d "$source_prefix" ] && [ ! -L "$source_prefix" ] || {
+    echo "Font dependency root is missing or unsafe: $source_prefix" >&2
+    return 1
+  }
+  [ -d "$font_assets_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets" ] &&
+    [ ! -L "$font_assets_prefix" ] || {
+    echo "Font asset documentation root is missing or unsafe: $font_assets_prefix" >&2
+    return 1
+  }
+  created_root="$(
+    /usr/bin/mktemp -d /private/tmp/switchyard-font-runtime.XXXXXX
+  )" || return 1
+  runtime_font_root="$(cd "$created_root" && /bin/pwd -P)" || {
+    remove_prepared_font_runtime "$created_root" || true
+    return 1
+  }
+  chmod 0700 "$runtime_font_root"
+
+  if ! (
+    set -e
+    ditto "$source_prefix" "$runtime_font_root"
+    relocate_font_deps_for_runtime "$runtime_font_root" "$source_prefix"
+    if [ -f "$runtime_font_root/etc/fonts/fonts.conf" ]; then
+      SWITCHYARD_FONT_SOURCE_PREFIX="$source_prefix" \
+        perl -0pi -e '
+          s#\n\s*<cachedir>\Q$ENV{SWITCHYARD_FONT_SOURCE_PREFIX}\E/var/cache/fontconfig</cachedir>##g
+        ' "$runtime_font_root/etc/fonts/fonts.conf"
+    fi
+    [ -f "$FONTCONFIG_ASSET_FRAGMENT" ] && [ ! -L "$FONTCONFIG_ASSET_FRAGMENT" ] || {
+      echo "missing or unsafe Fontconfig asset fragment: $FONTCONFIG_ASSET_FRAGMENT" >&2
+      exit 1
+    }
+    mkdir -p "$runtime_font_root/etc/fonts/conf.d" \
+      "$runtime_font_root/share/doc/switchyard-font-assets"
+    install -m 0644 "$FONTCONFIG_ASSET_FRAGMENT" \
+      "$runtime_font_root/etc/fonts/conf.d/50-switchyard-font-assets.conf"
+    ditto "$font_assets_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets" \
+      "$runtime_font_root/share/doc/switchyard-font-assets"
+    chmod 0755 "$runtime_font_root"
+    font_deps_match_profile_architecture "$runtime_font_root"
+    verify_runtime_relative_macho_tree "$runtime_font_root" \
+      "prepared font runtime"
+    verify_host_macho_tree_signatures "$runtime_font_root" \
+      "prepared font runtime"
+    write_content_tree_digest "$runtime_font_root"
+    content_tree_is_verified "$runtime_font_root"
+  ); then
+    remove_prepared_font_runtime "$runtime_font_root" || true
+    return 1
+  fi
+
+  printf '%s\n' "$runtime_font_root"
+}
+
 download_tls_package() {
   local package_name="$1"
   local filename="$2"
@@ -3273,9 +3342,16 @@ vulkan_deps_digest="$(content_tree_digest "$vulkan_deps_prefix")"
 capture_required_output mesa_windows_prefix stage_mesa_windows_opengl || exit $?
 mesa_windows_digest="$(content_tree_digest "$mesa_windows_prefix")"
 capture_required_output font_deps_prefix stage_font_deps || exit $?
-font_deps_digest="$(content_tree_digest "$font_deps_prefix")"
 capture_required_output font_assets_prefix stage_font_assets || exit $?
 font_assets_digest="$(content_tree_digest "$font_assets_prefix")"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  capture_required_output FONT_RUNTIME_PREPARED_ROOT \
+    prepare_font_runtime_for_install \
+    "$font_deps_prefix" "$font_assets_prefix" || exit $?
+  font_deps_digest="$(content_tree_digest "$FONT_RUNTIME_PREPARED_ROOT")"
+else
+  font_deps_digest="$(content_tree_digest "$font_deps_prefix")"
+fi
 font_asset_count="$(awk -F '\t' '$1 == "font" { count++ } END { print count + 2 }' "$FONT_ASSET_MANIFEST")"
 capture_required_output tls_deps_prefix stage_tls_deps || exit $?
 if [ -n "$tls_deps_prefix" ]; then
@@ -3313,7 +3389,7 @@ if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
   gstreamer_closure_digest="$(runtime_content_tree_digest "$gstreamer_deps_prefix")"
   vulkan_closure_digest="$(runtime_content_tree_digest "$vulkan_deps_prefix")"
   mesa_closure_digest="$(runtime_content_tree_digest "$mesa_windows_prefix")"
-  font_closure_digest="$(runtime_content_tree_digest "$font_deps_prefix")"
+  font_closure_digest="$(runtime_content_tree_digest "$FONT_RUNTIME_PREPARED_ROOT")"
   font_assets_closure_digest="$(runtime_content_tree_digest "$font_assets_prefix")"
   if [ -n "$tls_deps_prefix" ]; then
     tls_closure_digest="$(runtime_content_tree_digest "$tls_deps_prefix")"
@@ -3432,6 +3508,10 @@ runtime_is_complete_at() {
       "$prefix/lib/switchyard-vulkan" || return 1
     font_deps_match_profile_architecture \
       "$prefix/lib/switchyard-fonts" || return 1
+    content_tree_is_verified \
+      "$prefix/lib/switchyard-fonts" || return 1
+    [ "$(content_tree_digest "$prefix/lib/switchyard-fonts")" = \
+      "$font_deps_digest" ] || return 1
     tls_deps_match_profile_architecture \
       "$prefix/lib/switchyard-tls" || return 1
     gstreamer_deps_match_profile_architecture \
@@ -4038,33 +4118,43 @@ echo "installing $HOST_DEPENDENCY_ARCH FreeType and fontconfig runtime libraries
 runtime_font_root="$WINE_INSTALL_PREFIX/lib/switchyard-fonts"
 rm -rf "$runtime_font_root"
 mkdir -p "$runtime_font_root"
-ditto "$font_deps_prefix" "$runtime_font_root"
-relocate_font_deps_for_runtime "$runtime_font_root" "$font_deps_prefix"
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  ditto "$FONT_RUNTIME_PREPARED_ROOT" "$runtime_font_root"
+else
+  ditto "$font_deps_prefix" "$runtime_font_root"
+  relocate_font_deps_for_runtime "$runtime_font_root" "$font_deps_prefix"
+  if [ -f "$runtime_font_root/etc/fonts/fonts.conf" ]; then
+    perl -0pi -e "s#\\n\\s*<cachedir>\\Q${font_deps_prefix}/var/cache/fontconfig\\E</cachedir>##g" \
+      "$runtime_font_root/etc/fonts/fonts.conf"
+  fi
+  if [ ! -f "$FONTCONFIG_ASSET_FRAGMENT" ]; then
+    echo "missing Fontconfig asset fragment: $FONTCONFIG_ASSET_FRAGMENT" >&2
+    exit 1
+  fi
+  mkdir -p "$runtime_font_root/etc/fonts/conf.d" \
+    "$runtime_font_root/share/doc/switchyard-font-assets"
+  install -m 0644 "$FONTCONFIG_ASSET_FRAGMENT" \
+    "$runtime_font_root/etc/fonts/conf.d/50-switchyard-font-assets.conf"
+  ditto "$font_assets_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets" \
+    "$runtime_font_root/share/doc/switchyard-font-assets"
+fi
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  content_tree_is_verified "$runtime_font_root"
+  [ "$(content_tree_digest "$runtime_font_root")" = "$font_deps_digest" ]
   verify_host_macho_tree_arches "$runtime_font_root" \
     "staged font runtime" "$HOST_DEPENDENCY_ARCH"
   verify_native_macho_tree_macos_compatibility "$runtime_font_root" \
     "staged font runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
   verify_runtime_relative_macho_tree "$runtime_font_root" "staged font runtime"
+  verify_host_macho_tree_signatures "$runtime_font_root" "staged font runtime"
+  remove_prepared_font_runtime "$FONT_RUNTIME_PREPARED_ROOT"
+  FONT_RUNTIME_PREPARED_ROOT=""
 fi
-if [ -f "$runtime_font_root/etc/fonts/fonts.conf" ]; then
-  perl -0pi -e "s#\\n\\s*<cachedir>\\Q${font_deps_prefix}/var/cache/fontconfig\\E</cachedir>##g" \
-    "$runtime_font_root/etc/fonts/fonts.conf"
-fi
-if [ ! -f "$FONTCONFIG_ASSET_FRAGMENT" ]; then
-  echo "missing Fontconfig asset fragment: $FONTCONFIG_ASSET_FRAGMENT" >&2
-  exit 1
-fi
-mkdir -p "$runtime_font_root/etc/fonts/conf.d"
-install -m 0644 "$FONTCONFIG_ASSET_FRAGMENT" \
-  "$runtime_font_root/etc/fonts/conf.d/50-switchyard-font-assets.conf"
 
 echo "installing $font_asset_count redistributable font files"
 mkdir -p "$WINE_INSTALL_PREFIX/share/wine/fonts" \
   "$runtime_font_root/share/doc/switchyard-font-assets"
 ditto "$font_assets_prefix/share/wine/fonts" "$WINE_INSTALL_PREFIX/share/wine/fonts"
-ditto "$font_assets_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets" \
-  "$runtime_font_root/share/doc/switchyard-font-assets"
 
 if [ -n "$tls_deps_prefix" ]; then
   echo "installing $HOST_DEPENDENCY_ARCH GnuTLS runtime libraries"
