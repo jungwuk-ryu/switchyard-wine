@@ -3170,13 +3170,14 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
                                      IMAGE_NT_HEADERS *nt, SIZE_T len )
 {
     char *base;
-    IMAGE_BASE_RELOCATION *rel, *end;
+    IMAGE_BASE_RELOCATION *rel;
     const IMAGE_DATA_DIRECTORY *relocs;
     struct module_write_protect image_protect = {0};
     INT_PTR delta;
     ULONG *protect_old = NULL, protect_count = 0;
     NTSTATUS status = STATUS_SUCCESS;
     BOOL image_write_protected = FALSE;
+    SIZE_T remaining;
 
     base = (char *)nt->OptionalHeader.ImageBase;
     if (client_base == base) return STATUS_SUCCESS;  /* nothing to do */
@@ -3229,11 +3230,18 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
            module, (char *)module + len );
 
     rel = get_rva( module, relocs->VirtualAddress );
-    end = get_rva( module, relocs->VirtualAddress + relocs->Size );
+    remaining = relocs->Size;
     delta = (char *)client_base - base;
 
-    while (rel < end - 1 && rel->SizeOfBlock)
+    while (remaining >= sizeof(*rel) && rel->SizeOfBlock)
     {
+        ULONG block_size = rel->SizeOfBlock;
+
+        if (block_size < sizeof(*rel) || block_size > remaining)
+        {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            goto done;
+        }
         if (rel->VirtualAddress >= len)
         {
             WARN( "invalid address %p in relocation %p\n", get_rva( module, rel->VirtualAddress ), rel );
@@ -3248,6 +3256,7 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
             status = STATUS_INVALID_IMAGE_FORMAT;
             goto done;
         }
+        remaining -= block_size;
     }
 
 done:
