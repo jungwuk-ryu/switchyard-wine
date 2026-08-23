@@ -153,7 +153,8 @@ declare -F switchyard_validate_native_cpu_provider_files >/dev/null || {
   echo "Native CPU-provider validator does not expose its file-closure gate." >&2
   exit 1
 }
-switchyard_validate_runtime_manifest_profile "$manifest" preview-native-arm64-fex
+switchyard_validate_runtime_manifest_profile \
+  "$manifest" preview-native-arm64-fex "$RUNTIME"
 switchyard_validate_dxmt_runtime_manifest "$RUNTIME" "$manifest"
 switchyard_validate_native_cpu_provider_files "$manifest" "$RUNTIME"
 switchyard_validate_wow64_unixlib_policy_manifest \
@@ -572,7 +573,8 @@ build_loaded_image_probe "$work/loaded-image-probe"
 for guest in "${guests[@]}"; do
   run_guest "$guest"
 done
-switchyard_validate_runtime_manifest_profile "$manifest" preview-native-arm64-fex
+switchyard_validate_runtime_manifest_profile \
+  "$manifest" preview-native-arm64-fex "$RUNTIME"
 switchyard_validate_dxmt_runtime_manifest "$RUNTIME" "$manifest"
 switchyard_validate_native_cpu_provider_files "$manifest" "$RUNTIME"
 switchyard_validate_wow64_unixlib_policy_manifest \

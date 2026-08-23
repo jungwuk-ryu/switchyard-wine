@@ -5,6 +5,7 @@ umask 077
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PROFILE_LIBRARY="$ROOT_DIR/switchyard/lib/runtime_profile.sh"
 PROVIDER_LIBRARY="$ROOT_DIR/switchyard/lib/native_cpu_provider.sh"
+DXMT_ACCEPTANCE_TEST="$ROOT_DIR/switchyard/tests/dxmt_d3d11_acceptance_test.sh"
 DIGEST_HELPER="$ROOT_DIR/switchyard/runtime_content_digest.py"
 TEST_ROOT="$(/usr/bin/mktemp -d /private/tmp/switchyard-native-provider.XXXXXX)"
 TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
@@ -133,7 +134,8 @@ PY
 }
 [ "$(/usr/bin/uname -s)" = Darwin ] || fail "fixtures require macOS"
 [ "$(/usr/bin/uname -m)" = arm64 ] || fail "fixtures require a native arm64 shell"
-for source_file in "$PROFILE_LIBRARY" "$PROVIDER_LIBRARY" "$DIGEST_HELPER"; do
+for source_file in \
+    "$PROFILE_LIBRARY" "$PROVIDER_LIBRARY" "$DXMT_ACCEPTANCE_TEST" "$DIGEST_HELPER"; do
   [ -f "$source_file" ] && [ ! -L "$source_file" ] ||
     fail "required policy source is missing or unsafe: $source_file"
 done
@@ -142,6 +144,11 @@ source "$PROFILE_LIBRARY"
 # shellcheck disable=SC1090
 source "$PROVIDER_LIBRARY"
 switchyard_load_runtime_profile preview-native-arm64-fex
+
+[ "$(/usr/bin/grep -Fxc \
+  "  \"\$manifest\" preview-native-arm64-fex \"\$RUNTIME\"" \
+  "$DXMT_ACCEPTANCE_TEST")" -eq 2 ] ||
+  fail "DXMT acceptance does not bind both profile checks to its runtime root"
 REPO_SOURCE_PATCH="$ROOT_DIR/switchyard/patches/$(basename "$SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH")"
 [ -f "$REPO_SOURCE_PATCH" ] && [ ! -L "$REPO_SOURCE_PATCH" ] ||
   fail "pinned Unicorn source patch is missing or unsafe: $REPO_SOURCE_PATCH"
@@ -449,6 +456,28 @@ with open(output, "x", encoding="utf-8", newline="\n") as stream:
 PY
 /bin/chmod 0644 "$MANIFEST"
 /bin/cp "$MANIFEST" "$TEST_ROOT/manifest.good"
+
+PROFILE_BINDING_LOG="$TEST_ROOT/profile-binding.log"
+SIGNED_BINDING_MANIFEST="$TEST_ROOT/signed-binding-runtime.json"
+switchyard_validate_runtime_manifest_profile() {
+  /usr/bin/printf '%s\t%s\n' "$#" "${3:-}" >>"$PROFILE_BINDING_LOG"
+}
+switchyard_native_cpu_provider_validate_runtime_profile "$MANIFEST" "$RUNTIME"
+/bin/cp "$MANIFEST" "$SIGNED_BINDING_MANIFEST"
+/usr/bin/plutil -insert runtimeSigning -json '{"mode":"engineering-adhoc"}' \
+  "$SIGNED_BINDING_MANIFEST"
+switchyard_native_cpu_provider_validate_runtime_profile \
+  "$SIGNED_BINDING_MANIFEST" "$RUNTIME"
+[ "$(/usr/bin/sed -n '1p' "$PROFILE_BINDING_LOG")" = $'2\t' ] ||
+  fail "unsigned provider metadata validation unexpectedly bound a runtime root"
+[ "$(/usr/bin/sed -n '2p' "$PROFILE_BINDING_LOG")" = $'3\t'"$RUNTIME" ] ||
+  fail "signed provider validation did not bind its exact runtime root"
+[ "$(/usr/bin/wc -l <"$PROFILE_BINDING_LOG" | /usr/bin/tr -d ' ')" -eq 2 ] ||
+  fail "provider profile-binding fixture observed unexpected validation calls"
+# Restore the production profile validator for the complete unsigned fixture;
+# runtime_profile_test.sh separately owns signed process-entry validation.
+# shellcheck disable=SC1090
+source "$PROFILE_LIBRARY"
 
 switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
 switchyard_validate_wow64_unixlib_policy_manifest "$RUNTIME" "$MANIFEST" "$ROOT_DIR"

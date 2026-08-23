@@ -88,6 +88,21 @@ switchyard_native_cpu_provider_validate_executable_path() {
   }
 }
 
+switchyard_native_cpu_provider_validate_runtime_profile() {
+  local manifest runtime_root
+
+  [ "$#" -eq 2 ] || return 2
+  manifest="$1"
+  runtime_root="$2"
+  if [ -n "$(switchyard_runtime_manifest_value runtimeSigning.mode "$manifest")" ]; then
+    switchyard_validate_runtime_manifest_profile \
+      "$manifest" preview-native-arm64-fex "$runtime_root"
+  else
+    switchyard_validate_runtime_manifest_profile \
+      "$manifest" preview-native-arm64-fex
+  fi
+}
+
 switchyard_validate_native_cpu_provider_files() {
   local manifest runtime_root digest_helper lipo_tool otool_tool vtool_tool
 
@@ -98,7 +113,8 @@ switchyard_validate_native_cpu_provider_files() {
   manifest="$1"
   runtime_root="$2"
   switchyard_native_cpu_provider_load_profile_contract || return 1
-  switchyard_validate_runtime_manifest_profile "$manifest" preview-native-arm64-fex || return 1
+  switchyard_native_cpu_provider_validate_runtime_profile \
+    "$manifest" "$runtime_root" || return 1
   digest_helper="$(switchyard_native_cpu_provider_content_digest_helper)" || return 1
   lipo_tool="$(switchyard_native_cpu_provider_inspection_tool lipo)" || return 1
   otool_tool="$(switchyard_native_cpu_provider_inspection_tool otool)" || return 1
@@ -953,7 +969,8 @@ switchyard_validate_wow64_unixlib_policy_manifest() {
   manifest="$2"
   source_root="$3"
   switchyard_native_cpu_provider_load_profile_contract || return 1
-  switchyard_validate_runtime_manifest_profile "$manifest" preview-native-arm64-fex || return 1
+  switchyard_native_cpu_provider_validate_runtime_profile \
+    "$manifest" "$runtime_root" || return 1
   codesign_tool="$(switchyard_native_cpu_provider_inspection_tool codesign)" || return 1
   lipo_tool="$(switchyard_native_cpu_provider_inspection_tool lipo)" || return 1
   nm_tool="$(switchyard_native_cpu_provider_inspection_tool nm)" || return 1
