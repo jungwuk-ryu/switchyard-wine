@@ -54,6 +54,35 @@ HOST_MACHO_ARCH="$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH"
 WINE_BUILD_TRIPLET="$SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET"
 WINE_HOST_TRIPLET="$SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET"
 PROFILE_ARCH_COMMAND=("${SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND[@]}")
+HOST_DEPENDENCY_ARCH="$SWITCHYARD_RUNTIME_PROFILE_HOST_DEPENDENCY_ARCH"
+GSTREAMER_MACHO_ARCHS=("${SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_MACHO_ARCHS[@]}")
+NATIVE_CPU_PROVIDER_ENABLED=0
+if [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_UNICORN" = "true" ]; then
+  NATIVE_CPU_PROVIDER_ENABLED=1
+fi
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  for native_packaging_library in \
+      "$ROOT_DIR/switchyard/lib/native_arm64_packaging.sh" \
+      "$ROOT_DIR/switchyard/lib/native_cpu_provider.sh" \
+      "$ROOT_DIR/switchyard/lib/dxmt_artifact.sh" \
+      "$ROOT_DIR/switchyard/lib/macho_signing.sh"; do
+    [ -f "$native_packaging_library" ] && [ ! -L "$native_packaging_library" ] || {
+      echo "Native ARM64 packaging policy is missing or unsafe: $native_packaging_library" >&2
+      exit 1
+    }
+    # shellcheck disable=SC1090 # Paths are fixed repository policy libraries.
+    source "$native_packaging_library"
+  done
+fi
+NATIVE_ARM64_HOST_PROBE=""
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  NATIVE_ARM64_HOST_PROBE="$ROOT_DIR/switchyard/native_arm64_host_probe.sh"
+  [ -f "$NATIVE_ARM64_HOST_PROBE" ] && [ ! -L "$NATIVE_ARM64_HOST_PROBE" ] &&
+    [ -x "$NATIVE_ARM64_HOST_PROBE" ] || {
+    echo "Native ARM64 strict host probe is missing or unsafe: $NATIVE_ARM64_HOST_PROBE" >&2
+    exit 1
+  }
+fi
 WINE_GRAPHICS_FALLBACK_MODULES=("d3d10" "d3d11" "d3d12" "d3d12core" "dcomp" "dwmapi" "dxgi" "wined3d")
 WINE_MONO_VERSION="11.2.0"
 WINE_MONO_ARCH="x86"
@@ -62,22 +91,38 @@ WINE_MONO_FILE="wine-mono-${WINE_MONO_VERSION}-${WINE_MONO_ARCH}.msi"
 WINE_MONO_URL="https://dl.winehq.org/wine/wine-mono/${WINE_MONO_VERSION}/${WINE_MONO_FILE}"
 WINE_MONO_CACHE_DIR="${WINE_MONO_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Wine/addons/mono}"
 VULKAN_LOADER_VERSION="1.4.350.1"
-VULKAN_LOADER_BOTTLE="vulkan-loader--${VULKAN_LOADER_VERSION}.tahoe.bottle.tar.gz"
 VULKAN_LOADER_REPOSITORY="homebrew/core/vulkan-loader"
-VULKAN_LOADER_LAYER_SHA256="03185dd14f4a4501875b38cac7b69f11a2dd6921df4deaf7436aed74d62186e0"
-VULKAN_LOADER_MANIFEST_DIGEST="sha256:ecfcd7a2cb9fd52f60b200e9feaa7448057435de86ed504bfa44ac22a7d38149"
 VULKAN_HEADERS_VERSION="1.4.350.1"
-VULKAN_HEADERS_BOTTLE="vulkan-headers--${VULKAN_HEADERS_VERSION}.tahoe.bottle.tar.gz"
 VULKAN_HEADERS_REPOSITORY="homebrew/core/vulkan-headers"
-VULKAN_HEADERS_LAYER_SHA256="b482fc6a2e4831ae1b572370791cffb91f44ba08908885ee579d44fdfe1f43d0"
-VULKAN_HEADERS_MANIFEST_DIGEST="sha256:c7f375dee3dc83d989457e74db0636eef966d79deb57ed98dafe8b44e07bc56b"
 MOLTENVK_VERSION="1.4.1"
-MOLTENVK_BOTTLE="molten-vk--${MOLTENVK_VERSION}.sonoma.bottle.tar.gz"
 MOLTENVK_REPOSITORY="homebrew/core/molten-vk"
-MOLTENVK_LAYER_SHA256="9bb2d88ee0ed7cd035f982a59a2e9c5878237c9f4df88117172ccdbc5127f6d9"
-MOLTENVK_MANIFEST_DIGEST="sha256:6facac52c2f0f948cf185cf97f5f941c4d2f55a75e5e19d7e259e807597afd94"
+case "$SWITCHYARD_RUNTIME_PROFILE" in
+  stable-x86_64-rosetta)
+    VULKAN_LOADER_LAYER_SHA256="03185dd14f4a4501875b38cac7b69f11a2dd6921df4deaf7436aed74d62186e0"
+    VULKAN_LOADER_MANIFEST_DIGEST="sha256:ecfcd7a2cb9fd52f60b200e9feaa7448057435de86ed504bfa44ac22a7d38149"
+    VULKAN_HEADERS_LAYER_SHA256="b482fc6a2e4831ae1b572370791cffb91f44ba08908885ee579d44fdfe1f43d0"
+    VULKAN_HEADERS_MANIFEST_DIGEST="sha256:c7f375dee3dc83d989457e74db0636eef966d79deb57ed98dafe8b44e07bc56b"
+    MOLTENVK_LAYER_SHA256="9bb2d88ee0ed7cd035f982a59a2e9c5878237c9f4df88117172ccdbc5127f6d9"
+    MOLTENVK_MANIFEST_DIGEST="sha256:6facac52c2f0f948cf185cf97f5f941c4d2f55a75e5e19d7e259e807597afd94"
+    ;;
+  preview-native-arm64-fex)
+    VULKAN_LOADER_LAYER_SHA256="29759c4cff4f88360ee973d63bd99ca70131b03cac1256e0642ebb9756c8950f"
+    VULKAN_LOADER_MANIFEST_DIGEST="sha256:0ca71aa91842d6f8e621c9999d56f9f95c7dccf132d92805b108c0f918a24e1c"
+    VULKAN_HEADERS_LAYER_SHA256="b94439ee3fade8cb511fe296e5d2b75c0ed2a5b9943feb4c94fcd5aac6c07a8b"
+    VULKAN_HEADERS_MANIFEST_DIGEST="sha256:482d23c4186ded585cd30ebd518357000fb27d1f621e44a4630f90d6c4e3a540"
+    MOLTENVK_LAYER_SHA256="c0b1bda916255edc08d5a884eec4826e2649a890283b03e6f62e4aa9984cc9b8"
+    MOLTENVK_MANIFEST_DIGEST="sha256:a1fe928a3d7f92c9cca9795ce24c02a76b92c7bd86fe6c7dacd3e56738a1f11b"
+    ;;
+  *)
+    echo "No closed Vulkan dependency policy exists for $SWITCHYARD_RUNTIME_PROFILE." >&2
+    exit 2
+    ;;
+esac
+VULKAN_LOADER_BOTTLE="vulkan-loader--${VULKAN_LOADER_VERSION}.${SWITCHYARD_RUNTIME_PROFILE_VULKAN_LOADER_BOTTLE_TAG}.bottle.tar.gz"
+VULKAN_HEADERS_BOTTLE="vulkan-headers--${VULKAN_HEADERS_VERSION}.${SWITCHYARD_RUNTIME_PROFILE_VULKAN_HEADERS_BOTTLE_TAG}.bottle.tar.gz"
+MOLTENVK_BOTTLE="molten-vk--${MOLTENVK_VERSION}.${SWITCHYARD_RUNTIME_PROFILE_MOLTENVK_BOTTLE_TAG}.bottle.tar.gz"
 VULKAN_CACHE_DIR="${VULKAN_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Vulkan}"
-VULKAN_DEPS_PREFIX="${VULKAN_DEPS_PREFIX:-${HOME}/.switchyard/deps/vulkan/x86_64-loader-${VULKAN_LOADER_VERSION}-moltenvk-${MOLTENVK_VERSION}}"
+VULKAN_DEPS_PREFIX="${VULKAN_DEPS_PREFIX:-${HOME}/.switchyard/deps/vulkan/${HOST_DEPENDENCY_ARCH}-loader-${VULKAN_LOADER_VERSION}-moltenvk-${MOLTENVK_VERSION}}"
 MESA_WINDOWS_VERSION="26.1.1"
 MESA_WINDOWS_LLVM_VERSION="22.1.6"
 MESA_WINDOWS_ARCHIVE="mesa3d-${MESA_WINDOWS_VERSION}-release-msvc.7z"
@@ -100,19 +145,32 @@ MESA_LLVM_LICENSE_SHA256="8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc
 MESA_WINDOWS_CACHE_DIR="${MESA_WINDOWS_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Mesa/windows-${MESA_WINDOWS_VERSION}}"
 MESA_WINDOWS_DEPS_PREFIX="${MESA_WINDOWS_DEPS_PREFIX:-${HOME}/.switchyard/deps/mesa/windows-wow64-${MESA_WINDOWS_VERSION}}"
 FONT_DEPS_CACHE_DIR="${FONT_DEPS_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Fonts/deps}"
-FONT_DEPS_PREFIX="${FONT_DEPS_PREFIX:-${HOME}/.switchyard/deps/fonts/x86_64-freetype-2.14.3-fontconfig-2.18.1}"
+FONT_DEPS_PREFIX="${FONT_DEPS_PREFIX:-${HOME}/.switchyard/deps/fonts/${HOST_DEPENDENCY_ARCH}-freetype-2.14.3-fontconfig-2.18.1}"
 FONT_DLOPEN_FREETYPE="@loader_path/../../switchyard-fonts/lib/libfreetype.6.dylib"
 FONT_DLOPEN_FONTCONFIG="@loader_path/../../switchyard-fonts/lib/libfontconfig.1.dylib"
 FONT_DEPS_NAMES=("freetype" "fontconfig" "libpng" "gettext" "libunistring")
 FONT_DEPS_VERSIONS=("2.14.3" "2.18.1" "1.6.58" "1.0" "1.4.2")
 FONT_DEPS_REPOSITORIES=("homebrew/core/freetype" "homebrew/core/fontconfig" "homebrew/core/libpng" "homebrew/core/gettext" "homebrew/core/libunistring")
-FONT_DEPS_LAYER_SHA256=(
-  "c266877a4676016b189131c87355f3e9be0d5e0edbe3a464b5b6ef039945f199"
-  "9550776a54e32d8340966173a5d30d337a9f9984030bbdf7233eed792ad5d69c"
-  "c74a40635359b753e614fb0a69a32149179a27f79d3338d5c5b685f66e223967"
-  "2cc112cce103be3beb13cc8ba67f521d4e972c4082fd69868d34920d63120c09"
-  "fbb3a7908a19f306823dbd51b417705c73f710a9a1fb1e34ba7aa67a3c966094"
-)
+case "$SWITCHYARD_RUNTIME_PROFILE" in
+  stable-x86_64-rosetta)
+    FONT_DEPS_LAYER_SHA256=(
+      "c266877a4676016b189131c87355f3e9be0d5e0edbe3a464b5b6ef039945f199"
+      "9550776a54e32d8340966173a5d30d337a9f9984030bbdf7233eed792ad5d69c"
+      "c74a40635359b753e614fb0a69a32149179a27f79d3338d5c5b685f66e223967"
+      "2cc112cce103be3beb13cc8ba67f521d4e972c4082fd69868d34920d63120c09"
+      "fbb3a7908a19f306823dbd51b417705c73f710a9a1fb1e34ba7aa67a3c966094"
+    )
+    ;;
+  preview-native-arm64-fex)
+    FONT_DEPS_LAYER_SHA256=(
+      "4aeceab2c37d3685dd0de24b737f07c33a1098eaf757eb24d8d8bbe6ed68d02d"
+      "f4854307ce84898d35564e9a7027cd200973736c74bc9b783a8b34cc1fffd821"
+      "fd6cbd5d7a231b83e359fd96231bb3dd668124ab5c2009697dee906ace98fadd"
+      "f9ea4eed738746ea4150a4f83e8dd11ca21ca3de5bb113995c25eec409bb5749"
+      "dc4d4b4406a2c7032dd838ae362ecaeba114d8ac9d9daaa18f760d1d71ba3577"
+    )
+    ;;
+esac
 FONT_ASSET_SET_VERSION="noto-monthly-release-2026.07.01-cjk-2.004-emoji-static-3.002-aliases-1"
 FONT_ASSET_MANIFEST="$ROOT_DIR/switchyard/font-assets.tsv"
 FONT_ASSET_DOWNLOAD_CACHE_DIR="${FONT_ASSET_DOWNLOAD_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Fonts/assets/noto-monthly-release-2026.07.01}"
@@ -131,9 +189,10 @@ FONT_EMOJI_SOURCE="NotoEmoji-VariableFont_wght.ttf"
 FONT_EMOJI_FILE="NotoEmoji-Static.ttf"
 FONT_EMOJI_FAMILY="Noto Emoji"
 FONT_EMOJI_SHA256="65d8794d403b609345baaf7a656608990a836b27af5650f6cc921088b0b026d6"
-TLS_PACKAGE_MANIFEST="$ROOT_DIR/switchyard/tls-deps.tsv"
+TLS_PACKAGE_MANIFEST="$ROOT_DIR/switchyard/$SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_MANIFEST_BASENAME"
 TLS_SOURCE_MANIFEST="$ROOT_DIR/switchyard/tls-source-deps.tsv"
-TLS_PACKAGE_BASE_URL="https://conda.anaconda.org/conda-forge/osx-64"
+TLS_PACKAGE_SUBDIR="$SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_SUBDIR"
+TLS_PACKAGE_BASE_URL="https://conda.anaconda.org/conda-forge/$TLS_PACKAGE_SUBDIR"
 TLS_RUNTIME_LAYOUT_VERSION="5"
 TLS_MIN_MACOS_VERSION="14.0"
 TLS_PACKAGE_CACHE_DIR="${TLS_PACKAGE_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/TLS/packages}"
@@ -147,6 +206,29 @@ GSTREAMER_DEVEL_PACKAGE="gstreamer-1.0-devel-${GSTREAMER_VERSION}-universal.pkg"
 GSTREAMER_DEVEL_PACKAGE_SHA256="6f7b55e8fb86dcc615c9cae46b79b7785851e5c77f79a938648a81dfa2603729"
 GSTREAMER_PACKAGE_CACHE_DIR="${GSTREAMER_PACKAGE_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Media/GStreamer}"
 GSTREAMER_DEPS_PREFIX="${GSTREAMER_DEPS_PREFIX:-${HOME}/.switchyard/deps/media/gstreamer-${GSTREAMER_VERSION}-universal-curated-v${GSTREAMER_RUNTIME_LAYOUT_VERSION}}"
+UNICORN_RUNTIME_PREFIX=""
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  UNICORN_RUNTIME_PREFIX="${SWITCHYARD_UNICORN_RUNTIME_PREFIX:-${HOME}/.switchyard/deps/cpu-provider/unicorn-${SWITCHYARD_UNICORN_VERSION}-${SWITCHYARD_UNICORN_SOURCE_REVISION:0:12}-build${SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION}-arm64-macos-${SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS}}"
+fi
+DXMT_ARCHIVE=""
+DXMT_SOURCE_DIR=""
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  DXMT_ARCHIVE="${SWITCHYARD_DXMT_ARCHIVE:-${HOME}/Library/Caches/Switchyard/DXMT/${SWITCHYARD_DXMT_ARTIFACT_NAME}}"
+  DXMT_SOURCE_DIR="${SWITCHYARD_DXMT_SOURCE_DIR:-${HOME}/.switchyard/deps/dxmt/${SWITCHYARD_DXMT_SOURCE_REVISION}/source}"
+fi
+UNICORN_PACKAGE_ROOT_RELATIVE="lib/switchyard-unicorn"
+UNICORN_DYLIB_RELATIVE="$UNICORN_PACKAGE_ROOT_RELATIVE/lib/libunicorn.2.dylib"
+UNICORN_SOURCE_PATCH_RELATIVE="$UNICORN_PACKAGE_ROOT_RELATIVE/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME"
+UNICORN_RUNTIME_RPATH='@loader_path/../../switchyard-unicorn/lib'
+UNICORN_PROVIDER_UNIXLIBS=(
+  "lib/wine/aarch64-unix/xtajit.so"
+  "lib/wine/aarch64-unix/xtajit64.so"
+)
+UNICORN_PROVIDER_PE_LIBS=(
+  "lib/wine/aarch64-windows/xtajit.dll"
+  "lib/wine/aarch64-windows/xtajit64.dll"
+)
+UNICORN_PROVIDER_GUEST_ARCHS=("i386" "x86_64")
 GSTREAMER_RUNTIME_COMPONENTS=(
   "base-system-1.0-${GSTREAMER_VERSION}-universal.pkg"
   "base-crypto-${GSTREAMER_VERSION}-universal.pkg"
@@ -187,6 +269,11 @@ GSTREAMER_PLUGIN_FILES=(
 USER_SET_WINE_BUILD_DIR="${WINE_BUILD_DIR+x}"
 WINE_BUILD_DIR="${WINE_BUILD_DIR:-}"
 USER_SET_WINE_INSTALL_PREFIX="${WINE_INSTALL_PREFIX+x}"
+NATIVE_LLVM_BIN=""
+NATIVE_MINGW_CLANG=""
+NATIVE_HOST_CLANG=""
+NATIVE_HOST_CLANGXX=""
+NATIVE_COMPILER_POLICY_IDENTITY=""
 DISABLE_GPTK_OVERLAY="${SWITCHYARD_DISABLE_GPTK_OVERLAY:-0}"
 case "$DISABLE_GPTK_OVERLAY" in
   0) GPTK_PATH="${GPTK_PATH:-$(defaults read dev.switchyard.Switchyard gptkPath 2>/dev/null || true)}" ;;
@@ -196,8 +283,14 @@ case "$DISABLE_GPTK_OVERLAY" in
     exit 2
     ;;
 esac
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  # The x86_64 GPTK host overlay is a Rosetta runtime dependency.  A native
+  # profile must never inherit it from preferences or the caller's environment.
+  DISABLE_GPTK_OVERLAY=1
+  GPTK_PATH=""
+fi
 TLS_DLOPEN_NAME="@loader_path/../../switchyard-tls/lib/libgnutls.dylib"
-DEFAULT_JOBS="$(($(sysctl -n hw.ncpu) - 1))"
+DEFAULT_JOBS="$(( $(/usr/sbin/sysctl -n hw.ncpu) - 1 ))"
 if [ "$DEFAULT_JOBS" -lt 1 ]; then
   DEFAULT_JOBS=1
 fi
@@ -208,8 +301,14 @@ fi
 RECONFIGURE="${RECONFIGURE:-0}"
 INSTALL_STAGE_ROOT=""
 SWAP_HELPER_DIR=""
+NATIVE_ENTITLEMENTS_SNAPSHOT_FD=""
 
 cleanup_temporary_paths() {
+  if [ -n "$NATIVE_ENTITLEMENTS_SNAPSHOT_FD" ] &&
+     [ -e "/dev/fd/$NATIVE_ENTITLEMENTS_SNAPSHOT_FD" ]; then
+    close_validated_entitlements_snapshot "$NATIVE_ENTITLEMENTS_SNAPSHOT_FD" || true
+  fi
+  NATIVE_ENTITLEMENTS_SNAPSHOT_FD=""
   if [ -n "$INSTALL_STAGE_ROOT" ]; then
     rm -rf "$INSTALL_STAGE_ROOT"
   fi
@@ -220,23 +319,36 @@ cleanup_temporary_paths() {
 trap cleanup_temporary_paths EXIT
 
 macos_no_huge_supported() {
+  local compiler="clang"
   local temporary_dir
 
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    compiler="$NATIVE_HOST_CLANG"
+  fi
   temporary_dir="$(mktemp -d)"
   cat >"$temporary_dir/conftest.c" <<'EOF'
 int main(void) { return 0; }
 EOF
-  if "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
-      "$temporary_dir/conftest.c" -o "$temporary_dir/conftest" -Wl,-no_huge >/dev/null 2>&1; then
-    rm -rf "$temporary_dir"
-    return 0
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    if "${PROFILE_ARCH_COMMAND[@]}" "$compiler" "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" \
+        -arch "$HOST_MACHO_ARCH" \
+        "$temporary_dir/conftest.c" -o "$temporary_dir/conftest" -Wl,-no_huge >/dev/null 2>&1; then
+      rm -rf "$temporary_dir"
+      return 0
+    fi
+  else
+    if "${PROFILE_ARCH_COMMAND[@]}" "$compiler" -arch "$HOST_MACHO_ARCH" \
+        "$temporary_dir/conftest.c" -o "$temporary_dir/conftest" -Wl,-no_huge >/dev/null 2>&1; then
+      rm -rf "$temporary_dir"
+      return 0
+    fi
   fi
   rm -rf "$temporary_dir"
   return 1
 }
 
 MACOS_NO_HUGE_SUPPORTED=0
-if macos_no_huge_supported; then
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 0 ] && macos_no_huge_supported; then
   MACOS_NO_HUGE_SUPPORTED=1
 fi
 
@@ -247,10 +359,127 @@ require_command() {
   fi
 }
 
-require_command brew
+native_configured_compiler_policy_is_exact() {
+  switchyard_native_configured_compiler_policy_is_exact \
+    "$1" "$NATIVE_HOST_CLANG" "$NATIVE_HOST_CLANGXX" \
+    "$HOST_MACHO_ARCH" "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG"
+}
 
-BREW_PREFIX="$(brew --prefix)"
+reject_ambient_native_compiler_policy() {
+  local variable
+  local value
+
+  for variable in CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS CPPFLAGS LDFLAGS \
+      MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET \
+      TVOS_DEPLOYMENT_TARGET WATCHOS_DEPLOYMENT_TARGET \
+      DRIVERKIT_DEPLOYMENT_TARGET BRIDGEOS_DEPLOYMENT_TARGET \
+      XROS_DEPLOYMENT_TARGET SDKROOT DEVELOPER_DIR TOOLCHAINS \
+      CCC_OVERRIDE_OPTIONS ARCHFLAGS RC_ARCHS CLANG_CONFIG_PATH \
+      CLANG_CONFIG_FILE CLANG_CONFIG_FILE_SYSTEM_DIR \
+      CLANG_CONFIG_FILE_USER_DIR MAKEFLAGS MAKEFILES MFLAGS GNUMAKEFLAGS \
+      MAKEOVERRIDES; do
+    value="${!variable-}"
+    if [ -n "$value" ]; then
+      echo "Native Wine build rejects ambient $variable; the profile owns its compiler policy." >&2
+      return 1
+    fi
+    unset "$variable"
+  done
+
+  # Autoconf also consults historical lowercase compiler variables.  They are
+  # intentionally ignored rather than becoming part of native build policy.
+  unset cc cxx cpp objc objcxx
+}
+
+switchyard_require_native_arm64_ensure_host() {
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] && [ "$MODE" = "--ensure" ] || return 0
+  /bin/bash "$NATIVE_ARM64_HOST_PROBE" --strict \
+    --minimum-macos "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+    --kuser-model "$SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL"
+}
+
+switchyard_sign_preview_native_runtime_entries() {
+  local entitlements entry result=0
+  local entries=(
+    "lib/wine/aarch64-unix/wine"
+    "bin/wine.switchyard-real"
+  )
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 0
+  [ "$SWITCHYARD_RUNTIME_PROFILE" = preview-native-arm64-fex ] || {
+    echo "Native engineering signing is restricted to preview-native-arm64-fex." >&2
+    return 1
+  }
+  [ -n "$INSTALL_STAGE_ROOT" ] && [ -d "$INSTALL_STAGE_ROOT" ] &&
+    [ ! -L "$INSTALL_STAGE_ROOT" ] || {
+    echo "Native engineering signing requires the private runtime staging root." >&2
+    return 1
+  }
+  entitlements="$(switchyard_runtime_profile_entitlements_path "$ROOT_DIR")" || return 1
+  create_validated_entitlements_snapshot \
+    "$SWITCHYARD_RUNTIME_PROFILE" "$entitlements" "$INSTALL_STAGE_ROOT" \
+    NATIVE_ENTITLEMENTS_SNAPSHOT_FD || return 1
+
+  for entry in "${entries[@]}"; do
+    entry="$WINE_INSTALL_PREFIX/$entry"
+    if [ ! -f "$entry" ] || [ -L "$entry" ] || [ ! -x "$entry" ]; then
+      echo "Native runtime process entry is missing or unsafe: $entry" >&2
+      result=1
+      break
+    fi
+    if ! sign_engineering_macho_atomically \
+        /usr/bin/codesign "$SWITCHYARD_RUNTIME_PROFILE" "$entry" \
+        "$NATIVE_ENTITLEMENTS_SNAPSHOT_FD"; then
+      result=1
+      break
+    fi
+  done
+
+  if ! close_validated_entitlements_snapshot "$NATIVE_ENTITLEMENTS_SNAPSHOT_FD"; then
+    result=1
+  fi
+  NATIVE_ENTITLEMENTS_SNAPSHOT_FD=""
+  [ "$result" -eq 0 ]
+}
+
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  reject_ambient_native_compiler_policy || exit $?
+fi
+
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  native_homebrew="/opt/homebrew/bin/brew"
+  [ -f "$native_homebrew" ] && [ ! -L "$native_homebrew" ] &&
+    [ -x "$native_homebrew" ] || {
+    echo "Native ARM64 runtime requires physical Apple Silicon Homebrew." >&2
+    exit 1
+  }
+  BREW_PREFIX="$("$native_homebrew" --prefix)"
+else
+  require_command brew
+  BREW_PREFIX="$(brew --prefix)"
+fi
 export PATH="${BREW_PREFIX}/opt/bison/bin:${BREW_PREFIX}/opt/flex/bin:${BREW_PREFIX}/opt/pkgconf/bin:${BREW_PREFIX}/bin:${PATH}"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  native_llvm_prefix="$("$native_homebrew" --prefix llvm)"
+  [ -d "$native_llvm_prefix/bin" ] || {
+    echo "Native ARM64 runtime requires the Homebrew LLVM formula." >&2
+    exit 1
+  }
+  NATIVE_LLVM_BIN="$(cd "$native_llvm_prefix/bin" && /bin/pwd -P)"
+  [ "$NATIVE_LLVM_BIN" = \
+    "/opt/homebrew/Cellar/llvm/$SWITCHYARD_NATIVE_LLVM_VERSION/bin" ] || {
+    echo "Native ARM64 runtime requires the physical pinned Homebrew LLVM Cellar bin." >&2
+    exit 1
+  }
+  switchyard_qualify_native_llvm_compilers "$NATIVE_LLVM_BIN" || exit $?
+  NATIVE_MINGW_CLANG="$SWITCHYARD_QUALIFIED_NATIVE_CLANG"
+  NATIVE_HOST_CLANG="$SWITCHYARD_QUALIFIED_NATIVE_CLANG"
+  NATIVE_HOST_CLANGXX="$SWITCHYARD_QUALIFIED_NATIVE_CLANGXX"
+  NATIVE_COMPILER_POLICY_IDENTITY="$SWITCHYARD_QUALIFIED_NATIVE_COMPILER_IDENTITY"
+  if macos_no_huge_supported; then
+    MACOS_NO_HUGE_SUPPORTED=1
+  fi
+fi
 
 require_command bison
 require_command flex
@@ -267,6 +496,13 @@ require_command zstd
 require_command install_name_tool
 require_command pkgutil
 require_command python3
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  require_command file
+  require_command lipo
+  require_command otool
+  require_command vtool
+  require_command xar
+fi
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
@@ -321,6 +557,316 @@ content_tree_is_verified() {
   [ -f "$marker" ] || return 1
   expected="$(tr -d '[:space:]' < "$marker")"
   [ -n "$expected" ] && [ "$(content_tree_digest "$root")" = "$expected" ]
+}
+
+validate_archive_members() {
+  local archive="$1"
+  local kind="$2"
+
+  /usr/bin/python3 - "$archive" "$kind" <<'PY'
+import pathlib
+import stat
+import sys
+import tarfile
+import zipfile
+
+archive, kind = sys.argv[1:]
+
+def validate_name(name):
+    path = pathlib.PurePosixPath(name)
+    if (not name or path.is_absolute() or "\\" in name or
+            any(part in ("", ".", "..") for part in path.parts)):
+        raise ValueError("unsafe archive path: " + name)
+    return path
+
+def validate_link(path, target, symbolic):
+    target_path = pathlib.PurePosixPath(target)
+    if not target or target_path.is_absolute() or "\\" in target:
+        raise ValueError("unsafe archive link: " + str(path))
+    combined = path.parent.joinpath(target_path) if symbolic else target_path
+    depth = 0
+    for part in combined.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            depth -= 1
+        else:
+            depth += 1
+        if depth < 0:
+            raise ValueError("archive link escapes its root: " + str(path))
+
+count = 0
+total = 0
+if kind == "tar":
+    with tarfile.open(archive, "r:*") as stream:
+        for member in stream:
+            count += 1
+            total += member.size
+            if member.size < 0:
+                raise ValueError("archive contains a negative entry size")
+            if count > 300000 or total > 4 * 1024 * 1024 * 1024:
+                raise ValueError("archive exceeds its extraction resource bounds")
+            path = validate_name(member.name)
+            if member.issym() or member.islnk():
+                validate_link(path, member.linkname, member.issym())
+            elif not (member.isfile() or member.isdir()):
+                raise ValueError("unsupported archive entry: " + member.name)
+elif kind == "zip":
+    with zipfile.ZipFile(archive) as stream:
+        for member in stream.infolist():
+            count += 1
+            total += member.file_size
+            if count > 300000 or total > 4 * 1024 * 1024 * 1024:
+                raise ValueError("archive exceeds its extraction resource bounds")
+            validate_name(member.filename)
+            mode = member.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                raise ValueError("symbolic links are not accepted in zip inputs")
+else:
+    raise ValueError("unknown archive kind")
+PY
+}
+
+validate_xar_members() {
+  local archive="$1"
+
+  /usr/bin/xar -tf "$archive" | /usr/bin/python3 -c '
+import pathlib
+import sys
+
+count = 0
+for raw in sys.stdin:
+    name = raw.rstrip("\n")
+    count += 1
+    path = pathlib.PurePosixPath(name)
+    if (not name or path.is_absolute() or "\\" in name or
+            any(part in ("", ".", "..") for part in path.parts)):
+        raise SystemExit("unsafe xar member: " + name)
+if count == 0 or count > 300000:
+    raise SystemExit("xar member count is outside its bound")
+'
+}
+
+validate_extracted_tree_links() {
+  local root="$1"
+
+  /usr/bin/python3 - "$root" <<'PY'
+import os
+import stat
+import sys
+
+root = os.path.realpath(sys.argv[1])
+info = os.lstat(root)
+if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+    raise SystemExit("extracted root is not a real directory")
+for directory, directories, files in os.walk(root, followlinks=False):
+    for name in directories + files:
+        path = os.path.join(directory, name)
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            resolved = os.path.realpath(path)
+            if os.path.commonpath((root, resolved)) != root:
+                raise SystemExit("extracted link escapes its root: " + path)
+        elif not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise SystemExit("extracted tree contains an unsupported entry: " + path)
+PY
+}
+
+verify_host_macho_tree_arches() {
+  local root="$1"
+  local label="$2"
+  local candidate description actual_arches actual_count expected_arch
+  local expected_count macho_count=0
+  shift 2
+
+  [ -d "$root" ] && [ ! -L "$root" ] || {
+    echo "$label root is missing or unsafe: $root" >&2
+    return 1
+  }
+  expected_count="$#"
+  [ "$expected_count" -gt 0 ] || return 1
+  while IFS= read -r -d '' candidate; do
+    description="$(file -b "$candidate")" || return 1
+    case "$candidate:$description" in
+      *.dylib:*Mach-O*|*.so:*Mach-O*|*.bundle:*Mach-O*|*.a:*archive*|*:*Mach-O*) ;;
+      *.dylib:*|*.so:*|*.bundle:*|*.a:*)
+        echo "$label contains a non-Mach-O library: $candidate ($description)" >&2
+        return 1
+        ;;
+      *) continue ;;
+    esac
+    actual_arches="$(lipo "$candidate" -archs)" || return 1
+    lipo "$candidate" -verify_arch "$@" >/dev/null 2>&1 || {
+      echo "$label file lacks required architecture(s) $*: $candidate ($actual_arches)" >&2
+      return 1
+    }
+    actual_count="$(/usr/bin/awk '{ print NF }' <<<"$actual_arches")"
+    [ "$actual_count" -eq "$expected_count" ] || {
+      echo "$label file has unexpected architecture(s): $candidate ($actual_arches; expected $*)" >&2
+      return 1
+    }
+    for expected_arch in "$@"; do
+      case " $actual_arches " in
+        *" $expected_arch "*) ;;
+        *) return 1 ;;
+      esac
+    done
+    macho_count=$((macho_count + 1))
+  done < <(find "$root" -type f -print0)
+  [ "$macho_count" -gt 0 ] || {
+    echo "$label does not contain a Mach-O file." >&2
+    return 1
+  }
+}
+
+verify_native_macho_tree_macos_compatibility() {
+  local root="$1"
+  local label="$2"
+  local maximum="$3"
+  local candidate description metadata
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 0
+  while IFS= read -r -d '' candidate; do
+    description="$(file -b "$candidate")" || return 1
+    case "$description" in *Mach-O*) ;; *) continue ;; esac
+    metadata="$(vtool -arch arm64 -show-build "$candidate" 2>/dev/null)" || {
+      echo "$label has unreadable macOS metadata: $candidate" >&2
+      return 1
+    }
+    SWITCHYARD_MACHO_BUILD_METADATA="$metadata" /usr/bin/python3 -I - \
+        "$maximum" "$candidate" <<'PY' || return 1
+import os
+import re
+import sys
+
+maximum, path = sys.argv[1:]
+lines = os.environ["SWITCHYARD_MACHO_BUILD_METADATA"].splitlines()
+if sum(line.split()[:2] == ["cmd", "LC_BUILD_VERSION"] for line in lines) != 1:
+    raise SystemExit(path + ": expected one LC_BUILD_VERSION")
+if any(line.split()[:2] == ["cmd", "LC_VERSION_MIN_MACOSX"] for line in lines):
+    raise SystemExit(path + ": legacy macOS deployment command is not accepted")
+
+fields = {}
+for line in lines:
+    parts = line.split()
+    if len(parts) == 2 and parts[0] in ("platform", "minos", "sdk"):
+        if parts[0] in fields:
+            raise SystemExit(path + ": duplicate build metadata field " + parts[0])
+        fields[parts[0]] = parts[1]
+if fields.get("platform") != "MACOS":
+    raise SystemExit(path + ": Mach-O platform is not macOS")
+
+def version(value):
+    if re.fullmatch(r"[0-9]+(?:[.][0-9]+){0,2}", value or "") is None:
+        raise SystemExit(path + ": malformed macOS version")
+    parts = [int(item) for item in value.split(".")]
+    return tuple((parts + [0, 0])[:3])
+
+if version(fields.get("minos")) > version(maximum):
+    raise SystemExit(path + ": minimum macOS exceeds the runtime profile")
+version(fields.get("sdk"))
+PY
+  done < <(find "$root" -type f -print0)
+}
+
+verify_runtime_relative_macho_tree() {
+  local root="$1"
+  local label="$2"
+  local candidate description dependency rpath
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 0
+  while IFS= read -r -d '' candidate; do
+    description="$(file -b "$candidate")" || return 1
+    case "$description" in *Mach-O*) ;; *) continue ;; esac
+    while IFS= read -r dependency; do
+      case "$dependency" in
+        *'/../'*|*'/./'*|*/..|*/.)
+          echo "$label contains a traversing Mach-O dependency: $candidate -> $dependency" >&2
+          return 1
+          ;;
+      esac
+      case "$dependency" in
+        @rpath/*|@loader_path/*|@executable_path/*|/usr/lib/*|/System/Library/*) ;;
+        *)
+          echo "$label retains a non-runtime dependency: $candidate -> $dependency" >&2
+          return 1
+          ;;
+      esac
+    done < <(otool -L "$candidate" | /usr/bin/awk '$0 ~ /^\t/ { print $1 }')
+    while IFS= read -r rpath; do
+      case "$rpath" in
+        @loader_path|@loader_path/*|@executable_path|@executable_path/*) ;;
+        *)
+          echo "$label retains a non-runtime rpath: $candidate -> $rpath" >&2
+          return 1
+          ;;
+      esac
+    done < <(otool -l "$candidate" |
+      /usr/bin/awk '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')
+  done < <(find "$root" -type f -print0)
+}
+
+vulkan_deps_match_profile_architecture() {
+  local prefix="$1"
+
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    verify_host_macho_tree_arches "$prefix" \
+      "Vulkan runtime" "$HOST_DEPENDENCY_ARCH" >/dev/null 2>&1 &&
+      verify_native_macho_tree_macos_compatibility "$prefix" \
+        "Vulkan runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+        >/dev/null 2>&1
+  else
+    file "$prefix/lib/libvulkan.1.4.350.dylib" | grep -q "x86_64" &&
+      file "$prefix/lib/libMoltenVK.dylib" | grep -q "x86_64"
+  fi
+}
+
+font_deps_match_profile_architecture() {
+  local prefix="$1"
+
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    verify_host_macho_tree_arches "$prefix" \
+      "font runtime" "$HOST_DEPENDENCY_ARCH" >/dev/null 2>&1 &&
+      verify_native_macho_tree_macos_compatibility "$prefix" \
+        "font runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+        >/dev/null 2>&1
+  else
+    file "$prefix/lib/libfreetype.6.dylib" | grep -q "x86_64" &&
+      file "$prefix/lib/libfontconfig.1.dylib" | grep -q "x86_64"
+  fi
+}
+
+tls_deps_match_profile_architecture() {
+  local prefix="$1"
+
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    verify_host_macho_tree_arches "$prefix" \
+      "TLS runtime" "$HOST_DEPENDENCY_ARCH" >/dev/null 2>&1 &&
+      verify_native_macho_tree_macos_compatibility "$prefix" \
+        "TLS runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+        >/dev/null 2>&1
+  else
+    file "$prefix/lib/libgnutls.30.dylib" | grep -q "x86_64"
+  fi
+}
+
+gstreamer_deps_match_profile_architecture() {
+  local prefix="$1"
+  local plugin
+
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    verify_host_macho_tree_arches "$prefix" \
+      "GStreamer runtime" "${GSTREAMER_MACHO_ARCHS[@]}" >/dev/null 2>&1 &&
+      verify_native_macho_tree_macos_compatibility "$prefix" \
+        "GStreamer runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+        >/dev/null 2>&1
+    return
+  fi
+
+  file "$prefix/lib/libgstreamer-1.0.0.dylib" | grep "x86_64" >/dev/null || return 1
+  for plugin in "${GSTREAMER_PLUGIN_FILES[@]}"; do
+    file "$prefix/lib/gstreamer-1.0/$plugin" | grep "x86_64" >/dev/null || return 1
+  done
 }
 
 SWITCHYARD_MANAGED_RUNTIME_ROOT="${HOME}/.switchyard/runtimes"
@@ -813,8 +1359,7 @@ stage_vulkan_deps() {
      [ -f "$lib_dir/libvulkan.1.4.350.dylib" ] &&
      [ -f "$lib_dir/libMoltenVK.dylib" ] &&
      [ -f "$icd_file" ] &&
-     file "$lib_dir/libvulkan.1.4.350.dylib" | grep -q "x86_64" &&
-     file "$lib_dir/libMoltenVK.dylib" | grep -q "x86_64"; then
+     vulkan_deps_match_profile_architecture "$VULKAN_DEPS_PREFIX"; then
     printf '%s\n' "$VULKAN_DEPS_PREFIX"
     return 0
   fi
@@ -822,6 +1367,11 @@ stage_vulkan_deps() {
   loader_archive="$(download_homebrew_oci_blob "$VULKAN_LOADER_REPOSITORY" "sha256:$VULKAN_LOADER_LAYER_SHA256" "$VULKAN_LOADER_BOTTLE")"
   headers_archive="$(download_homebrew_oci_blob "$VULKAN_HEADERS_REPOSITORY" "sha256:$VULKAN_HEADERS_LAYER_SHA256" "$VULKAN_HEADERS_BOTTLE")"
   moltenvk_archive="$(download_homebrew_oci_blob "$MOLTENVK_REPOSITORY" "sha256:$MOLTENVK_LAYER_SHA256" "$MOLTENVK_BOTTLE")"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    validate_archive_members "$loader_archive" tar
+    validate_archive_members "$headers_archive" tar
+    validate_archive_members "$moltenvk_archive" tar
+  fi
 
   staging_dir="$(mktemp -d)"
   temporary_prefix="${VULKAN_DEPS_PREFIX}.tmp.$$"
@@ -840,6 +1390,9 @@ stage_vulkan_deps() {
     "molten-vk/${MOLTENVK_VERSION}/etc/vulkan/icd.d/MoltenVK_icd.json" \
     "molten-vk/${MOLTENVK_VERSION}/LICENSE" \
     "molten-vk/${MOLTENVK_VERSION}/README.md"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    validate_extracted_tree_links "$staging_dir"
+  fi
 
   ditto "$staging_dir/vulkan-headers/${VULKAN_HEADERS_VERSION}/include" "$temporary_prefix/include"
   install -m 0644 "$staging_dir/vulkan-loader/${VULKAN_LOADER_VERSION}/lib/libvulkan.1.4.350.dylib" \
@@ -861,6 +1414,10 @@ stage_vulkan_deps() {
 
   install_name_tool -id "@rpath/libvulkan.1.dylib" "$temporary_prefix/lib/libvulkan.1.4.350.dylib"
   install_name_tool -id "@rpath/libMoltenVK.dylib" "$temporary_prefix/lib/libMoltenVK.dylib"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    vulkan_deps_match_profile_architecture "$temporary_prefix"
+    verify_runtime_relative_macho_tree "$temporary_prefix" "Vulkan runtime"
+  fi
 
   {
     printf 'prefix=%s\n' "$VULKAN_DEPS_PREFIX"
@@ -868,7 +1425,7 @@ stage_vulkan_deps() {
     printf 'libdir=${exec_prefix}/lib\n'
     printf 'includedir=${prefix}/include\n\n'
     printf 'Name: Vulkan-Loader\n'
-    printf 'Description: Switchyard staged x86_64 Vulkan loader\n'
+    printf 'Description: Switchyard staged %s Vulkan loader\n' "$HOST_DEPENDENCY_ARCH"
     printf 'Version: 1.4.350\n'
     printf 'Libs: -L${libdir} -lvulkan\n'
     printf 'Cflags: -I${includedir}\n'
@@ -876,7 +1433,7 @@ stage_vulkan_deps() {
 
   {
     printf '{\n'
-    printf '  "architecture": "x86_64",\n'
+    printf '  "architecture": %s,\n' "$(json_string "$HOST_DEPENDENCY_ARCH")"
     printf '  "license": "Apache-2.0",\n'
     printf '  "vulkanLoader": {\n'
     printf '    "version": %s,\n' "$(json_string "$VULKAN_LOADER_VERSION")"
@@ -931,8 +1488,7 @@ stage_font_deps() {
      [ -f "$FONT_DEPS_PREFIX/lib/pkgconfig/freetype2.pc" ] &&
      [ -f "$FONT_DEPS_PREFIX/lib/pkgconfig/fontconfig.pc" ] &&
      [ -f "$FONT_DEPS_PREFIX/etc/fonts/fonts.conf" ] &&
-     file "$lib_dir/libfreetype.6.dylib" | grep -q "x86_64" &&
-     file "$lib_dir/libfontconfig.1.dylib" | grep -q "x86_64"; then
+     font_deps_match_profile_architecture "$FONT_DEPS_PREFIX"; then
     printf '%s\n' "$FONT_DEPS_PREFIX"
     return 0
   fi
@@ -948,10 +1504,16 @@ stage_font_deps() {
     version="${FONT_DEPS_VERSIONS[$index]}"
     repository="${FONT_DEPS_REPOSITORIES[$index]}"
     sha="${FONT_DEPS_LAYER_SHA256[$index]}"
-    bottle="${name}--${version}.sonoma.bottle.tar.gz"
+    bottle="${name}--${version}.${SWITCHYARD_RUNTIME_PROFILE_FONT_BOTTLE_TAG}.bottle.tar.gz"
     archive="$(download_homebrew_oci_blob "$repository" "sha256:$sha" "$bottle" "$FONT_DEPS_CACHE_DIR")"
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      validate_archive_members "$archive" tar
+    fi
 
     tar -xzf "$archive" -C "$staging_dir"
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      validate_extracted_tree_links "$staging_dir"
+    fi
     formula_root="$staging_dir/$name/$version"
     if [ ! -d "$formula_root" ]; then
       echo "Homebrew bottle $bottle did not contain expected root $name/$version." >&2
@@ -1007,7 +1569,7 @@ libdir=\${prefix}/lib
 includedir=\${prefix}/include
 
 Name: FreeType 2
-Description: Switchyard staged x86_64 FreeType
+Description: Switchyard staged $HOST_DEPENDENCY_ARCH FreeType
 Version: ${FONT_DEPS_VERSIONS[0]}
 Libs: -L\${libdir} -lfreetype
 Cflags: -I\${includedir}/freetype2
@@ -1020,7 +1582,7 @@ libdir=\${prefix}/lib
 includedir=\${prefix}/include
 
 Name: Fontconfig
-Description: Switchyard staged x86_64 fontconfig
+Description: Switchyard staged $HOST_DEPENDENCY_ARCH fontconfig
 Version: ${FONT_DEPS_VERSIONS[1]}
 Requires: freetype2
 Libs: -L\${libdir} -lfontconfig
@@ -1033,7 +1595,19 @@ EOF
       "$temporary_prefix/etc/fonts/fonts.conf"
   fi
 
-  cat >"$temporary_prefix/share/doc/switchyard-font-deps/README.txt" <<EOF
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    cat >"$temporary_prefix/share/doc/switchyard-font-deps/README.txt" <<EOF
+This directory contains user-local $HOST_DEPENDENCY_ARCH FreeType/fontconfig
+runtime dependencies staged from pinned Homebrew
+$SWITCHYARD_RUNTIME_PROFILE_FONT_BOTTLE_TAG bottles for the Switchyard Wine build.
+
+The staged files keep Wine's GDI font backend independent of a mutable host
+Homebrew prefix. Do not commit these binaries to the Switchyard repository.
+Preserve upstream license notices when distributing a runtime built with these
+libraries.
+EOF
+  else
+    cat >"$temporary_prefix/share/doc/switchyard-font-deps/README.txt" <<'EOF'
 This directory contains user-local x86_64 FreeType/fontconfig runtime
 dependencies staged from Homebrew sonoma bottles for the Switchyard Wine build.
 
@@ -1042,6 +1616,7 @@ against the host arm64 Homebrew prefix. Do not commit these binaries to the
 Switchyard repository. Preserve upstream license notices when distributing a
 runtime built with these libraries.
 EOF
+  fi
 
   test_source="$temporary_prefix/freetype-link-test.c"
   test_binary="$temporary_prefix/freetype-link-test"
@@ -1050,11 +1625,23 @@ EOF
 #include FT_FREETYPE_H
 int main(void) { FT_Library lib; return FT_Init_FreeType(&lib); }
 EOF
-  "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
-    -I"$temporary_prefix/include/freetype2" \
-    -L"$temporary_prefix/lib" \
-    -Wl,-rpath,"$temporary_prefix/lib" \
-    "$test_source" -lfreetype -o "$test_binary"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    switchyard_validate_qualified_native_llvm_compilers || return 1
+    "${PROFILE_ARCH_COMMAND[@]}" "$NATIVE_HOST_CLANG" \
+      "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" -arch "$HOST_MACHO_ARCH" \
+      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      -I"$temporary_prefix/include/freetype2" \
+      -L"$temporary_prefix/lib" \
+      -Wl,-rpath,"$temporary_prefix/lib" \
+      "$test_source" -lfreetype -o "$test_binary"
+  else
+    "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
+      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      -I"$temporary_prefix/include/freetype2" \
+      -L"$temporary_prefix/lib" \
+      -Wl,-rpath,"$temporary_prefix/lib" \
+      "$test_source" -lfreetype -o "$test_binary"
+  fi
   env DYLD_LIBRARY_PATH="$temporary_prefix/lib" "$test_binary"
   rm -f "$test_source" "$test_binary"
 
@@ -1064,18 +1651,35 @@ EOF
 #include <fontconfig/fontconfig.h>
 int main(void) { return FcInit() ? 0 : 1; }
 EOF
-  "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
-    -I"$temporary_prefix/include" \
-    -I"$temporary_prefix/include/freetype2" \
-    -L"$temporary_prefix/lib" \
-    -Wl,-rpath,"$temporary_prefix/lib" \
-    "$test_source" -lfontconfig -lfreetype -lintl -lunistring -lpng16 \
-    -o "$test_binary"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    switchyard_validate_qualified_native_llvm_compilers || return 1
+    "${PROFILE_ARCH_COMMAND[@]}" "$NATIVE_HOST_CLANG" \
+      "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" -arch "$HOST_MACHO_ARCH" \
+      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      -I"$temporary_prefix/include" \
+      -I"$temporary_prefix/include/freetype2" \
+      -L"$temporary_prefix/lib" \
+      -Wl,-rpath,"$temporary_prefix/lib" \
+      "$test_source" -lfontconfig -lfreetype -lintl -lunistring -lpng16 \
+      -o "$test_binary"
+  else
+    "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
+      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      -I"$temporary_prefix/include" \
+      -I"$temporary_prefix/include/freetype2" \
+      -L"$temporary_prefix/lib" \
+      -Wl,-rpath,"$temporary_prefix/lib" \
+      "$test_source" -lfontconfig -lfreetype -lintl -lunistring -lpng16 \
+      -o "$test_binary"
+  fi
   env DYLD_LIBRARY_PATH="$temporary_prefix/lib" \
     FONTCONFIG_FILE="$temporary_prefix/etc/fonts/fonts.conf" \
     FONTCONFIG_PATH="$temporary_prefix/etc/fonts" \
     "$test_binary"
   rm -f "$test_source" "$test_binary"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    font_deps_match_profile_architecture "$temporary_prefix"
+  fi
   write_content_tree_digest "$temporary_prefix"
   atomic_replace_directory "$temporary_prefix" "$FONT_DEPS_PREFIX" cache
   rm -rf "$staging_dir"
@@ -1188,19 +1792,50 @@ extract_tls_package() {
   local destination="$2"
   local container
   local payload
+  local uncompressed
+  local uncompressed_size
 
   mkdir -p "$destination"
   case "$archive" in
     *.conda)
       container="$(mktemp -d)"
+      if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+        validate_archive_members "$archive" zip
+      fi
       unzip -q "$archive" -d "$container"
+      if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+        validate_extracted_tree_links "$container"
+      fi
       for payload in "$container"/pkg-*.tar.zst "$container"/info-*.tar.zst; do
         [ -f "$payload" ] || continue
-        zstd -dc "$payload" | tar -xf - -C "$destination"
+        if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+          uncompressed_size="$(zstd -lv "$payload" 2>&1 | /usr/bin/sed -nE \
+            's/^Decompressed Size:.*\(([0-9]+) B\).*/\1/p')"
+          case "$uncompressed_size" in
+            ''|*[!0-9]*)
+              echo "TLS package payload has no bounded Zstandard content size: $payload" >&2
+              exit 1
+              ;;
+          esac
+          [ "$uncompressed_size" -le $((2 * 1024 * 1024 * 1024)) ] || {
+            echo "TLS package payload exceeds its extraction size bound: $payload" >&2
+            exit 1
+          }
+          uncompressed="$container/$(basename "${payload%.zst}").validated"
+          zstd -dc "$payload" >"$uncompressed"
+          validate_archive_members "$uncompressed" tar
+          tar -xf "$uncompressed" -C "$destination"
+          rm -f "$uncompressed"
+        else
+          zstd -dc "$payload" | tar -xf - -C "$destination"
+        fi
       done
       rm -rf "$container"
       ;;
     *.tar.bz2)
+      if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+        validate_archive_members "$archive" tar
+      fi
       tar -xjf "$archive" -C "$destination"
       ;;
     *)
@@ -1208,6 +1843,9 @@ extract_tls_package() {
       exit 1
       ;;
   esac
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    validate_extracted_tree_links "$destination"
+  fi
 }
 
 stage_tls_deps() {
@@ -1243,6 +1881,8 @@ stage_tls_deps() {
   local dependency_name
   local test_source
   local test_binary
+  local source_build_triplet="arm-apple-darwin"
+  local source_host_triplet="x86_64-apple-darwin"
 
   if [ ! -f "$TLS_PACKAGE_MANIFEST" ]; then
     echo "missing pinned TLS package manifest at $TLS_PACKAGE_MANIFEST" >&2
@@ -1253,11 +1893,14 @@ stage_tls_deps() {
     exit 1
   fi
   manifest_digest="$({ /bin/cat "$TLS_PACKAGE_MANIFEST" "$TLS_SOURCE_MANIFEST"; /usr/bin/printf '%s\n' "$TLS_RUNTIME_LAYOUT_VERSION"; } | short_sha256_stream)"
-  tls_deps_prefix="$TLS_DEPS_CACHE_DIR/x86_64-gnutls-${manifest_digest}"
+  if [ "$HOST_DEPENDENCY_ARCH" = "arm64" ]; then
+    source_host_triplet="arm-apple-darwin"
+  fi
+  tls_deps_prefix="$TLS_DEPS_CACHE_DIR/${HOST_DEPENDENCY_ARCH}-gnutls-${manifest_digest}"
   if content_tree_is_verified "$tls_deps_prefix" &&
      [ -f "$tls_deps_prefix/lib/libgnutls.30.dylib" ] &&
      [ -f "$tls_deps_prefix/lib/pkgconfig/gnutls.pc" ] &&
-     file "$tls_deps_prefix/lib/libgnutls.30.dylib" | grep -q "x86_64"; then
+     tls_deps_match_profile_architecture "$tls_deps_prefix"; then
     printf '%s\n' "$tls_deps_prefix"
     return 0
   fi
@@ -1328,6 +1971,9 @@ stage_tls_deps() {
 
     source_archive="$(download_tls_source \
       "$source_name" "$source_filename" "$source_url" "$source_hash")"
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      validate_archive_members "$source_archive" tar
+    fi
     source_work="${temporary_prefix}.${source_name}-source"
     source_root="$source_work/$source_name-$source_version"
     source_build="$source_work/build"
@@ -1336,24 +1982,34 @@ stage_tls_deps() {
     rm -rf "$source_work"
     mkdir -p "$source_work" "$source_build" "$source_prefix"
     tar -xzf "$source_archive" -C "$source_work"
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      validate_extracted_tree_links "$source_work"
+    fi
     [ -x "$source_root/configure" ] || {
       echo "$source_name source archive has no configure script" >&2
       exit 1
     }
 
-    echo "building source-pinned x86_64 $source_name $source_version" >&2
+    tls_source_cc="clang -arch $HOST_DEPENDENCY_ARCH"
+    tls_source_cxx="clang++ -arch $HOST_DEPENDENCY_ARCH"
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      switchyard_validate_qualified_native_llvm_compilers || return 1
+      tls_source_cc="$NATIVE_HOST_CLANG $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_DEPENDENCY_ARCH"
+      tls_source_cxx="$NATIVE_HOST_CLANGXX $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_DEPENDENCY_ARCH"
+    fi
+    echo "building source-pinned $HOST_DEPENDENCY_ARCH $source_name $source_version" >&2
     if ! (
       cd "$source_build"
       env \
-        CC='clang -arch x86_64' \
-        CXX='clang++ -arch x86_64' \
+        CC="$tls_source_cc" \
+        CXX="$tls_source_cxx" \
         CFLAGS="-O2 -mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
         CXXFLAGS="-O2 -mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
         LDFLAGS="-mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
         MACOSX_DEPLOYMENT_TARGET="$TLS_MIN_MACOS_VERSION" \
         "$source_root/configure" \
-          --build=arm-apple-darwin \
-          --host=x86_64-apple-darwin \
+          --build="$source_build_triplet" \
+          --host="$source_host_triplet" \
           --prefix="$source_prefix" \
           --disable-static \
           --enable-shared
@@ -1364,8 +2020,12 @@ stage_tls_deps() {
       exit 1
     fi
     if [ ! -f "$source_prefix/lib/libunistring.2.dylib" ] ||
-       ! file "$source_prefix/lib/libunistring.2.dylib" | grep -q 'x86_64'; then
-      echo "$source_name source build did not produce the expected x86_64 library" >&2
+       { [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] &&
+         ! verify_host_macho_tree_arches "$source_prefix" \
+           "$source_name source build" "$HOST_DEPENDENCY_ARCH" >/dev/null 2>&1; } ||
+       { [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 0 ] &&
+         ! file "$source_prefix/lib/libunistring.2.dylib" | grep -q 'x86_64'; }; then
+      echo "$source_name source build did not produce the expected $HOST_DEPENDENCY_ARCH library" >&2
       exit 1
     fi
     install -m 0644 "$source_prefix/lib/libunistring.2.dylib" \
@@ -1384,7 +2044,7 @@ Name: $source_name
 Version: $source_version
 Source: $source_url
 SHA-256: $source_hash
-Build: x86_64 macOS, minimum version $TLS_MIN_MACOS_VERSION
+Build: $HOST_DEPENDENCY_ARCH macOS, minimum version $TLS_MIN_MACOS_VERSION
 EOF
     printf '%s\t%s\t%s\t%s\t%s\n' \
       "$source_name" "$source_version" "source-xcode" "$source_filename" "$source_hash" \
@@ -1452,10 +2112,6 @@ EOF
   for library in "$temporary_prefix"/lib/*.dylib; do
     [ -e "$library" ] || continue
     [ -L "$library" ] && continue
-    if ! file "$library" | grep -q "x86_64"; then
-      echo "TLS runtime library is not x86_64: $library" >&2
-      exit 1
-    fi
     install_name_tool -id "@loader_path/$(basename "$library")" "$library"
     while IFS= read -r dependency; do
       case "$dependency" in
@@ -1488,13 +2144,23 @@ libdir=\${prefix}/lib
 includedir=\${prefix}/include
 
 Name: GnuTLS
-Description: Pinned redistributable x86_64 GnuTLS runtime for Switchyard Wine
+Description: Pinned redistributable $HOST_DEPENDENCY_ARCH GnuTLS runtime for Switchyard Wine
 Version: 3.8.13
 Libs: -L\${libdir} -lgnutls
 Cflags: -I\${includedir}
 EOF
 
-  cat >"$temporary_prefix/share/doc/switchyard-tls/README.txt" <<EOF
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    cat >"$temporary_prefix/share/doc/switchyard-tls/README.txt" <<EOF
+This directory contains the pinned $HOST_DEPENDENCY_ARCH macOS GnuTLS dependency closure used
+by Switchyard Wine for schannel support. Binary packages are downloaded from
+the conda-forge $TLS_PACKAGE_SUBDIR channel, while the legacy libunistring ABI
+is rebuilt from its pinned GNU source for modern macOS compatibility.
+Every input is hash-verified before staging. Package metadata, source identity,
+and license notices are preserved for redistribution and source tracing.
+EOF
+  else
+    cat >"$temporary_prefix/share/doc/switchyard-tls/README.txt" <<'EOF'
 This directory contains the pinned x86_64 macOS GnuTLS dependency closure used
 by Switchyard Wine for schannel support. Binary packages are downloaded from
 the conda-forge osx-64 channel, while the legacy libunistring ABI is rebuilt
@@ -1502,6 +2168,7 @@ from its pinned GNU source for modern macOS signing and Rosetta compatibility.
 Every input is hash-verified before staging. Package metadata, source identity,
 and license notices are preserved for redistribution and source tracing.
 EOF
+  fi
   install -m 0644 "$TLS_PACKAGE_MANIFEST" \
     "$temporary_prefix/share/doc/switchyard-tls/packages.tsv"
   install -m 0644 "$TLS_SOURCE_MANIFEST" \
@@ -1513,13 +2180,30 @@ EOF
 #include <gnutls/gnutls.h>
 int main(void) { return gnutls_check_version("3.0") ? 0 : 1; }
 EOF
-  "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
-    -I"$temporary_prefix/include" \
-    -L"$temporary_prefix/lib" \
-    -Wl,-rpath,"$temporary_prefix/lib" \
-    "$test_source" -lgnutls -o "$test_binary"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    switchyard_validate_qualified_native_llvm_compilers || return 1
+    "${PROFILE_ARCH_COMMAND[@]}" "$NATIVE_HOST_CLANG" \
+      "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" -arch "$HOST_MACHO_ARCH" \
+      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      -I"$temporary_prefix/include" \
+      -L"$temporary_prefix/lib" \
+      -Wl,-rpath,"$temporary_prefix/lib" \
+      "$test_source" -lgnutls -o "$test_binary"
+  else
+    "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" \
+      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      -I"$temporary_prefix/include" \
+      -L"$temporary_prefix/lib" \
+      -Wl,-rpath,"$temporary_prefix/lib" \
+      "$test_source" -lgnutls -o "$test_binary"
+  fi
   env DYLD_LIBRARY_PATH="$temporary_prefix/lib" "$test_binary"
   rm -f "$test_source" "$test_binary"
+
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    tls_deps_match_profile_architecture "$temporary_prefix"
+    verify_runtime_relative_macho_tree "$temporary_prefix" "TLS runtime"
+  fi
 
   write_content_tree_digest "$temporary_prefix"
   atomic_replace_directory "$temporary_prefix" "$tls_deps_prefix" cache
@@ -1639,10 +2323,9 @@ gstreamer_deps_are_complete() {
   [ -f "$prefix/share/doc/switchyard-gstreamer/INSTALLER-LICENSE.txt" ] || return 1
   [ -f "$prefix/share/doc/switchyard-gstreamer/packages.tsv" ] || return 1
   [ "$(tr -d '[:space:]' < "$prefix/share/doc/switchyard-gstreamer/VERSION")" = "$GSTREAMER_VERSION" ] || return 1
-  file "$prefix/lib/libgstreamer-1.0.0.dylib" | grep "x86_64" >/dev/null || return 1
+  gstreamer_deps_match_profile_architecture "$prefix" || return 1
   for plugin in "${GSTREAMER_PLUGIN_FILES[@]}"; do
     [ -f "$prefix/lib/gstreamer-1.0/$plugin" ] || return 1
-    file "$prefix/lib/gstreamer-1.0/$plugin" | grep "x86_64" >/dev/null || return 1
   done
 }
 
@@ -1669,12 +2352,20 @@ stage_gstreamer_deps() {
     "$GSTREAMER_RUNTIME_PACKAGE" "$GSTREAMER_RUNTIME_PACKAGE_SHA256")"
   devel_package="$(download_gstreamer_package \
     "$GSTREAMER_DEVEL_PACKAGE" "$GSTREAMER_DEVEL_PACKAGE_SHA256")"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    validate_xar_members "$runtime_package"
+    validate_xar_members "$devel_package"
+  fi
   extraction_root="$(mktemp -d)"
   runtime_expanded="$extraction_root/runtime"
   devel_expanded="$extraction_root/devel"
   echo "extracting pinned GStreamer runtime and development packages" >&2
   pkgutil --expand-full "$runtime_package" "$runtime_expanded"
   pkgutil --expand-full "$devel_package" "$devel_expanded"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    validate_extracted_tree_links "$runtime_expanded"
+    validate_extracted_tree_links "$devel_expanded"
+  fi
 
   mkdir -p "$(dirname "$GSTREAMER_DEPS_PREFIX")"
   temporary_prefix="${GSTREAMER_DEPS_PREFIX}.tmp.$$"
@@ -1747,7 +2438,11 @@ stage_gstreamer_deps() {
   {
     printf 'Switchyard GStreamer media runtime\n\n'
     printf 'Version: %s\n' "$GSTREAMER_VERSION"
-    printf 'Architecture: universal package; Wine consumes the x86_64 slices under Rosetta\n'
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      printf 'Architecture: universal x86_64/arm64 package; native Wine consumes the arm64 slices\n'
+    else
+      printf 'Architecture: universal package; Wine consumes the x86_64 slices under Rosetta\n'
+    fi
     printf 'Selected plugins:\n'
     printf '  %s\n' "${GSTREAMER_PLUGIN_FILES[@]}"
     printf '\nThe runtime is restricted to the plugins needed by Wine Media Foundation.\n'
@@ -1757,6 +2452,11 @@ stage_gstreamer_deps() {
   } > "$temporary_prefix/share/doc/switchyard-gstreamer/README.txt"
 
   chmod -R u+rwX "$temporary_prefix"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    validate_extracted_tree_links "$temporary_prefix"
+    gstreamer_deps_match_profile_architecture "$temporary_prefix"
+    verify_runtime_relative_macho_tree "$temporary_prefix" "GStreamer runtime"
+  fi
   verify_gstreamer_runtime "$temporary_prefix"
   write_content_tree_digest "$temporary_prefix"
   atomic_replace_directory "$temporary_prefix" "$GSTREAMER_DEPS_PREFIX" cache
@@ -1799,6 +2499,378 @@ relocate_winegstreamer_for_runtime() {
     echo "Wine was built without its Unix GStreamer backend." >&2
     return 1
   fi
+}
+
+verify_exact_arm64_macos_metadata() {
+  local candidate="$1"
+  local label="$2"
+  local expected_version="$3"
+  local metadata
+
+  metadata="$(vtool -arch arm64 -show-build "$candidate" 2>/dev/null)" || {
+    echo "$label has unreadable macOS build metadata: $candidate" >&2
+    return 1
+  }
+  SWITCHYARD_MACHO_BUILD_METADATA="$metadata" /usr/bin/python3 -I - \
+      "$expected_version" "$candidate" <<'PY'
+import os
+import re
+import sys
+
+expected, path = sys.argv[1:]
+lines = os.environ["SWITCHYARD_MACHO_BUILD_METADATA"].splitlines()
+if sum(line.split()[:2] == ["cmd", "LC_BUILD_VERSION"] for line in lines) != 1:
+    raise SystemExit(path + ": expected one LC_BUILD_VERSION")
+if any(line.split()[:2] == ["cmd", "LC_VERSION_MIN_MACOSX"] for line in lines):
+    raise SystemExit(path + ": legacy deployment metadata is not accepted")
+fields = {}
+for line in lines:
+    parts = line.split()
+    if len(parts) == 2 and parts[0] in ("platform", "minos", "sdk"):
+        if parts[0] in fields:
+            raise SystemExit(path + ": duplicate build metadata field " + parts[0])
+        fields[parts[0]] = parts[1]
+
+def version(value):
+    if re.fullmatch(r"[0-9]+(?:[.][0-9]+){0,2}", value or "") is None:
+        raise SystemExit(path + ": malformed macOS version")
+    pieces = [int(piece) for piece in value.split(".")]
+    return tuple((pieces + [0, 0])[:3])
+
+if fields.get("platform") != "MACOS":
+    raise SystemExit(path + ": Mach-O platform is not macOS")
+if version(fields.get("minos")) != version(expected):
+    raise SystemExit(path + ": minimum macOS does not match " + expected)
+if version(fields.get("sdk")) != version(expected):
+    raise SystemExit(path + ": SDK does not match " + expected)
+PY
+}
+
+validate_staged_unicorn_runtime() {
+  local runtime_root="$1"
+  local package_root="$runtime_root/$UNICORN_PACKAGE_ROOT_RELATIVE"
+  local metadata="$package_root/switchyard-unicorn-runtime.json"
+  local dylib="$runtime_root/$UNICORN_DYLIB_RELATIVE"
+  local dylib_link="$package_root/lib/libunicorn.dylib"
+  local source_archive="$package_root/share/src/switchyard-unicorn/unicorn-${SWITCHYARD_UNICORN_SOURCE_REVISION}.tar.gz"
+  local source_patch="$runtime_root/$UNICORN_SOURCE_PATCH_RELATIVE"
+  local notice_root="$package_root/share/doc/switchyard-unicorn"
+  local actual dependency notice
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
+  [ -d "$package_root" ] && [ ! -L "$package_root" ] || return 1
+  validate_extracted_tree_links "$package_root" || return 1
+  runtime_content_tree_is_verified "$package_root" || return 1
+  [ "$(runtime_content_tree_digest "$package_root")" = \
+    "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" ] || return 1
+  [ -f "$metadata" ] && [ ! -L "$metadata" ] || return 1
+  [ -f "$dylib" ] && [ ! -L "$dylib" ] || return 1
+  [ -L "$dylib_link" ] && [ "$(readlink "$dylib_link")" = "libunicorn.2.dylib" ] || return 1
+  [ -f "$source_archive" ] && [ ! -L "$source_archive" ] || return 1
+  [ -f "$source_patch" ] && [ ! -L "$source_patch" ] || return 1
+  [ -z "$(find "$package_root" -type f \( -name '*.a' -o -name '*.o' \) -print -quit)" ] || return 1
+  [ ! -e "$package_root/include" ] && [ ! -L "$package_root/include" ] || return 1
+  [ ! -e "$package_root/lib/pkgconfig" ] && [ ! -L "$package_root/lib/pkgconfig" ] || return 1
+  /usr/bin/python3 -I - "$package_root" "$SWITCHYARD_UNICORN_SOURCE_REVISION" \
+      "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" <<'PY' || return 1
+import os
+import stat
+import sys
+
+root, revision, patch_basename = sys.argv[1:]
+allowed = {
+    ".switchyard-content-sha256",
+    "lib/libunicorn.2.dylib",
+    "lib/libunicorn.dylib",
+    "share/doc/switchyard-unicorn/README.txt",
+    "share/doc/switchyard-unicorn/CORRESPONDING-SOURCE.txt",
+    "share/doc/switchyard-unicorn/COPYING",
+    "share/doc/switchyard-unicorn/COPYING.LGPL2",
+    "share/doc/switchyard-unicorn/COPYING_GLIB",
+    "share/doc/switchyard-unicorn/QEMU-COPYING",
+    "share/doc/switchyard-unicorn/QEMU-COPYING.LIB",
+    "share/doc/switchyard-unicorn/QEMU-LICENSE",
+    "share/src/switchyard-unicorn/unicorn-" + revision + ".tar.gz",
+    "share/src/switchyard-unicorn/" + patch_basename,
+    "switchyard-unicorn-runtime.json",
+}
+seen = set()
+for directory, directories, files in os.walk(root, followlinks=False):
+    for name in files + [name for name in directories if os.path.islink(os.path.join(directory, name))]:
+        path = os.path.join(directory, name)
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        info = os.lstat(path)
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+            raise SystemExit("unsupported Unicorn payload entry: " + relative)
+        if relative not in allowed:
+            raise SystemExit("unexpected Unicorn payload entry: " + relative)
+        seen.add(relative)
+if seen != allowed:
+    raise SystemExit("Unicorn payload file set is incomplete")
+PY
+  /usr/bin/python3 -I - "$metadata" "$SWITCHYARD_UNICORN_VERSION" \
+      "$SWITCHYARD_UNICORN_SOURCE_REPOSITORY" "$SWITCHYARD_UNICORN_SOURCE_REVISION" \
+      "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" \
+      "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" \
+      "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" \
+      "$SWITCHYARD_UNICORN_LIBRARY_SHA256" \
+      "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" \
+      "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" <<'PY' || return 1
+import json
+import os
+import sys
+
+(
+    metadata,
+    version,
+    repository,
+    revision,
+    archive_sha,
+    patch_basename,
+    patch_sha,
+    library_sha,
+    contract,
+    minimum,
+) = sys.argv[1:]
+
+def no_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate Unicorn manifest field")
+        value[key] = item
+    return value
+
+if os.path.getsize(metadata) > 1024 * 1024:
+    raise ValueError("Unicorn manifest exceeds its size bound")
+with open(metadata, "r", encoding="utf-8") as stream:
+    value = json.load(stream, object_pairs_hook=no_duplicates)
+expected = {
+    "version": version,
+    "sourceRepository": repository,
+    "sourceRevision": revision,
+    "buildContractVersion": int(contract),
+    "enabledArchitectures": ["x86"],
+    "hostArchitecture": "arm64",
+    "minimumMacOS": minimum,
+    "library": "lib/libunicorn.2.dylib",
+    "sourceArchive": "share/src/switchyard-unicorn/unicorn-" + revision + ".tar.gz",
+    "sourceArchiveSha256": archive_sha,
+    "sourcePatch": {
+        "path": "share/src/switchyard-unicorn/" + patch_basename,
+        "sha256": patch_sha,
+    },
+    "license": "GPL-2.0-only with separately licensed GLib/QEMU components; preserve all included notices and corresponding source",
+}
+if type(value) is not dict or set(value) != set(expected) | {"librarySha256"}:
+    raise ValueError("Unicorn manifest has an unexpected field set")
+for key, wanted in expected.items():
+    if type(value.get(key)) is not type(wanted) or value.get(key) != wanted:
+        raise ValueError("Unicorn manifest field is invalid: " + key)
+if value.get("librarySha256") != library_sha:
+    raise ValueError("Unicorn library digest is invalid")
+PY
+  actual="$(/usr/bin/plutil -extract librarySha256 raw -o - "$metadata" 2>/dev/null || true)"
+  [ "$actual" = "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ] || return 1
+  [ "$(sha256_file "$dylib")" = "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ] || return 1
+  [ "$(sha256_file "$source_archive")" = "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" ] || return 1
+  [ "$(sha256_file "$source_patch")" = "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" ] || return 1
+  /usr/bin/cmp -s "$source_patch" \
+    "$ROOT_DIR/switchyard/patches/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" || return 1
+  validate_archive_members "$source_archive" tar || return 1
+  [ "$(/usr/bin/gzip -dc "$source_archive" | git get-tar-commit-id 2>/dev/null || true)" = \
+    "$SWITCHYARD_UNICORN_SOURCE_REVISION" ] || return 1
+  [ "$(lipo -archs "$dylib")" = "arm64" ] || return 1
+  [ "$(otool -D "$dylib" | /usr/bin/tail -n 1)" = "@rpath/libunicorn.2.dylib" ] || return 1
+  verify_exact_arm64_macos_metadata "$dylib" "Unicorn runtime" \
+    "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" || return 1
+  while IFS= read -r dependency; do
+    case "$dependency" in
+      @rpath/libunicorn.2.dylib|/usr/lib/*|/System/Library/*) ;;
+      *) return 1 ;;
+    esac
+  done < <(otool -L "$dylib" | /usr/bin/awk 'NR > 1 { print $1 }')
+  [ -z "$(otool -l "$dylib" | /usr/bin/awk \
+    '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')" ] || return 1
+  for notice in README.txt CORRESPONDING-SOURCE.txt COPYING COPYING.LGPL2 COPYING_GLIB \
+      QEMU-COPYING QEMU-COPYING.LIB QEMU-LICENSE; do
+    [ -s "$notice_root/$notice" ] && [ ! -L "$notice_root/$notice" ] || return 1
+  done
+}
+
+validate_staged_unicorn_providers() {
+  local runtime_root="$1"
+  local index relative unix_library pe_library pe_description dependency rpath
+  local unicorn_dependency_count ntdll_dependency_count
+  local loader_rpath_count runtime_rpath_count
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
+  [ "${#UNICORN_PROVIDER_UNIXLIBS[@]}" -eq "${#UNICORN_PROVIDER_PE_LIBS[@]}" ] &&
+    [ "${#UNICORN_PROVIDER_UNIXLIBS[@]}" -eq "${#UNICORN_PROVIDER_GUEST_ARCHS[@]}" ] || return 1
+  for index in "${!UNICORN_PROVIDER_UNIXLIBS[@]}"; do
+    relative="${UNICORN_PROVIDER_UNIXLIBS[$index]}"
+    unix_library="$runtime_root/$relative"
+    pe_library="$runtime_root/${UNICORN_PROVIDER_PE_LIBS[$index]}"
+    [ -f "$unix_library" ] && [ ! -L "$unix_library" ] || return 1
+    [ -f "$pe_library" ] && [ ! -L "$pe_library" ] || return 1
+    pe_description="$(file -b "$pe_library")" || return 1
+    case "${UNICORN_PROVIDER_GUEST_ARCHS[$index]}:$pe_description" in
+      i386:*PE32+*Aarch64*|x86_64:*PE32+*x86-64*) ;;
+      *) return 1 ;;
+    esac
+    [ "$(lipo -archs "$unix_library")" = "arm64" ] || return 1
+    verify_exact_arm64_macos_metadata "$unix_library" \
+      "native Unicorn provider" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" || return 1
+    [ "$(otool -D "$unix_library" | /usr/bin/tail -n 1)" = \
+      "@rpath/$(basename "$unix_library")" ] || return 1
+    unicorn_dependency_count=0
+    ntdll_dependency_count=0
+    while IFS= read -r dependency; do
+      case "$dependency" in
+        @rpath/libunicorn.2.dylib)
+          unicorn_dependency_count=$((unicorn_dependency_count + 1))
+          ;;
+        @rpath/ntdll.so)
+          ntdll_dependency_count=$((ntdll_dependency_count + 1))
+          ;;
+        "@rpath/$(basename "$unix_library")"|/usr/lib/*|/System/Library/*)
+          ;;
+        *) return 1 ;;
+      esac
+    done < <(otool -L "$unix_library" | /usr/bin/awk 'NR > 1 { print $1 }')
+    [ "$unicorn_dependency_count" -eq 1 ] || return 1
+    [ "$ntdll_dependency_count" -eq 1 ] || return 1
+    loader_rpath_count=0
+    runtime_rpath_count=0
+    while IFS= read -r rpath; do
+      case "$rpath" in
+        "$UNICORN_RUNTIME_RPATH")
+          runtime_rpath_count=$((runtime_rpath_count + 1))
+          ;;
+        @loader_path/)
+          loader_rpath_count=$((loader_rpath_count + 1))
+          ;;
+        *) return 1 ;;
+      esac
+    done < <(otool -l "$unix_library" | /usr/bin/awk \
+      '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')
+    [ "$loader_rpath_count" -eq 1 ] || return 1
+    [ "$runtime_rpath_count" -eq 1 ] || return 1
+  done
+}
+
+stage_unicorn_runtime() {
+  local runtime_root="$1"
+  local provider_prefix="$2"
+  local package_root="$runtime_root/$UNICORN_PACKAGE_ROOT_RELATIVE"
+  local source_notice_root="$provider_prefix/share/doc/switchyard-unicorn"
+  local source_archive="$provider_prefix/share/src/switchyard-unicorn/unicorn-${SWITCHYARD_UNICORN_SOURCE_REVISION}.tar.gz"
+  local source_patch="$provider_prefix/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME"
+  local destination_notice_root="$package_root/share/doc/switchyard-unicorn"
+  local destination_source_root="$package_root/share/src/switchyard-unicorn"
+  local relative unix_library dependency rpath
+  local unicorn_dependency_count loader_rpath_count runtime_rpath_count notice
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
+  runtime_content_tree_is_verified "$provider_prefix" || {
+    echo "Pinned Unicorn development cache failed content verification." >&2
+    return 1
+  }
+  [ ! -e "$package_root" ] && [ ! -L "$package_root" ] || {
+    echo "Wine install unexpectedly contains the Unicorn runtime path." >&2
+    return 1
+  }
+  [ -f "$provider_prefix/lib/libunicorn.2.dylib" ] && \
+    [ ! -L "$provider_prefix/lib/libunicorn.2.dylib" ] || return 1
+  [ -f "$provider_prefix/switchyard-unicorn-runtime.json" ] && \
+    [ ! -L "$provider_prefix/switchyard-unicorn-runtime.json" ] || return 1
+  [ -f "$source_archive" ] && [ ! -L "$source_archive" ] || return 1
+  [ -f "$source_patch" ] && [ ! -L "$source_patch" ] || return 1
+  [ "$(sha256_file "$source_patch")" = "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" ] || return 1
+
+  mkdir -p "$package_root/lib" "$destination_notice_root" "$destination_source_root"
+  chmod 0755 "$package_root" "$package_root/lib" "$package_root/share" \
+    "$package_root/share/doc" "$destination_notice_root" "$package_root/share/src" \
+    "$destination_source_root"
+  install -m 0755 "$provider_prefix/lib/libunicorn.2.dylib" \
+    "$runtime_root/$UNICORN_DYLIB_RELATIVE"
+  ln -s libunicorn.2.dylib "$package_root/lib/libunicorn.dylib"
+  install -m 0644 "$provider_prefix/switchyard-unicorn-runtime.json" \
+    "$package_root/switchyard-unicorn-runtime.json"
+  for notice in README.txt CORRESPONDING-SOURCE.txt COPYING COPYING.LGPL2 COPYING_GLIB \
+      QEMU-COPYING QEMU-COPYING.LIB QEMU-LICENSE; do
+    [ -f "$source_notice_root/$notice" ] && [ ! -L "$source_notice_root/$notice" ] || {
+      echo "Pinned Unicorn development cache is missing $notice." >&2
+      return 1
+    }
+    install -m 0644 "$source_notice_root/$notice" "$destination_notice_root/$notice"
+  done
+  install -m 0644 "$source_archive" "$destination_source_root/$(basename "$source_archive")"
+  install -m 0644 "$source_patch" "$destination_source_root/$(basename "$source_patch")"
+  write_runtime_content_tree_digest "$package_root" >/dev/null
+
+  for relative in "${UNICORN_PROVIDER_UNIXLIBS[@]}"; do
+    unix_library="$runtime_root/$relative"
+    [ -f "$unix_library" ] && [ ! -L "$unix_library" ] || {
+      echo "Wine install is missing native Unicorn provider $relative." >&2
+      return 1
+    }
+    unicorn_dependency_count=0
+    while IFS= read -r dependency; do
+      case "$dependency" in
+        */libunicorn.2.dylib|*/libunicorn.dylib)
+          unicorn_dependency_count=$((unicorn_dependency_count + 1))
+          if [ "$dependency" != "@rpath/libunicorn.2.dylib" ]; then
+            install_name_tool -change "$dependency" "@rpath/libunicorn.2.dylib" "$unix_library"
+          fi
+          ;;
+      esac
+    done < <(otool -L "$unix_library" | /usr/bin/awk 'NR > 1 { print $1 }')
+    [ "$unicorn_dependency_count" -eq 1 ] || {
+      echo "Native provider has an ambiguous Unicorn dependency: $relative" >&2
+      return 1
+    }
+    loader_rpath_count=0
+    runtime_rpath_count=0
+    while IFS= read -r rpath; do
+      case "$rpath" in
+        "$UNICORN_RUNTIME_RPATH")
+          runtime_rpath_count=$((runtime_rpath_count + 1))
+          ;;
+        @loader_path/)
+          loader_rpath_count=$((loader_rpath_count + 1))
+          ;;
+        @loader_path)
+          install_name_tool -delete_rpath "$rpath" "$unix_library"
+          ;;
+        *)
+          install_name_tool -delete_rpath "$rpath" "$unix_library"
+          ;;
+      esac
+    done < <(otool -l "$unix_library" | /usr/bin/awk \
+      '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')
+    if [ "$loader_rpath_count" -eq 0 ]; then
+      install_name_tool -add_rpath '@loader_path/' "$unix_library"
+    elif [ "$loader_rpath_count" -ne 1 ]; then
+      echo "Native provider has duplicate ntdll loader rpaths: $relative" >&2
+      return 1
+    fi
+    if [ "$runtime_rpath_count" -eq 0 ]; then
+      install_name_tool -add_rpath "$UNICORN_RUNTIME_RPATH" "$unix_library"
+    elif [ "$runtime_rpath_count" -ne 1 ]; then
+      echo "Native provider has duplicate Unicorn runtime rpaths: $relative" >&2
+      return 1
+    fi
+  done
+
+  validate_staged_unicorn_runtime "$runtime_root" || {
+    echo "Staged Unicorn runtime payload failed validation." >&2
+    return 1
+  }
+  validate_staged_unicorn_providers "$runtime_root" || {
+    echo "Staged native Unicorn providers failed validation." >&2
+    return 1
+  }
 }
 
 if [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_ROSETTA" = "true" ] &&
@@ -1862,7 +2934,19 @@ if [ "$MODE" = "--source-info" ]; then
   echo "requiresRosetta=$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_ROSETTA"
   echo "minimumMacOS=$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
   echo "gstreamerRegistryArchitecture=$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    echo "kuserSharedDataModel=$SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL"
+  fi
   exit 0
+fi
+
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] &&
+   [ -n "$USER_SET_WINE_INSTALL_PREFIX" ]; then
+  WINE_INSTALL_PREFIX="$(
+    switchyard_canonical_runtime_install_prefix "$WINE_INSTALL_PREFIX"
+  )" || exit $?
+  switchyard_validate_native_runtime_prefix_bootstrap_budget \
+    "$WINE_INSTALL_PREFIX" || exit $?
 fi
 
 gptk_redist_digest="no-gptk"
@@ -1920,12 +3004,62 @@ tls_deps_prefix="$(stage_tls_deps)"
 if [ -n "$tls_deps_prefix" ]; then
   tls_deps_digest="$(content_tree_digest "$tls_deps_prefix")"
   tls_dlopen_digest="$(printf '%s' "$TLS_DLOPEN_NAME" | short_sha256_stream)"
+  tls_dlopen_closure_digest="$(
+    printf '%s' "$TLS_DLOPEN_NAME" | shasum -a 256 | awk '{print $1}'
+  )"
 else
   tls_deps_digest="none"
   tls_dlopen_digest="none"
+  tls_dlopen_closure_digest="none"
 fi
 
-runtime_id="${SWITCHYARD_RUNTIME_PROFILE_ID_PREFIX}${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${gstreamer_deps_digest}-${vulkan_deps_digest}-${mesa_windows_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
+unicorn_runtime_prefix=""
+unicorn_runtime_digest=""
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  echo "building or validating pinned Unicorn $SWITCHYARD_UNICORN_VERSION for native ARM64"
+  "$ROOT_DIR/switchyard/build_unicorn_runtime.sh" \
+    --output "$UNICORN_RUNTIME_PREFIX" \
+    --minimum-macos "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" >/dev/null
+  unicorn_runtime_prefix="$UNICORN_RUNTIME_PREFIX"
+  runtime_content_tree_is_verified "$unicorn_runtime_prefix" || {
+    echo "Pinned Unicorn development cache failed content verification." >&2
+    exit 1
+  }
+  unicorn_runtime_digest="$(runtime_content_tree_digest "$unicorn_runtime_prefix")"
+  [ "$unicorn_runtime_digest" = "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" ] || {
+    echo "Pinned Unicorn development cache has an unexpected closed-policy digest." >&2
+    exit 1
+  }
+fi
+
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  gstreamer_closure_digest="$(runtime_content_tree_digest "$gstreamer_deps_prefix")"
+  vulkan_closure_digest="$(runtime_content_tree_digest "$vulkan_deps_prefix")"
+  mesa_closure_digest="$(runtime_content_tree_digest "$mesa_windows_prefix")"
+  font_closure_digest="$(runtime_content_tree_digest "$font_deps_prefix")"
+  font_assets_closure_digest="$(runtime_content_tree_digest "$font_assets_prefix")"
+  if [ -n "$tls_deps_prefix" ]; then
+    tls_closure_digest="$(runtime_content_tree_digest "$tls_deps_prefix")"
+  else
+    tls_closure_digest="none"
+  fi
+  runtime_closure_digest="$(
+    switchyard_native_runtime_closure_digest \
+      "$source_identity" "$wine_revision" "$source_dirty" "$build_source_fingerprint" \
+      "$gptk_redist_digest" "$wine_mono_digest" "$gstreamer_closure_digest" \
+      "$vulkan_closure_digest" "$mesa_closure_digest" "$font_closure_digest" \
+      "$font_assets_closure_digest" "$tls_closure_digest" "$TLS_DLOPEN_NAME" \
+      "$tls_dlopen_closure_digest" "$unicorn_runtime_digest" \
+      "$SWITCHYARD_DXMT_ARTIFACT_SHA256" "$NATIVE_COMPILER_POLICY_IDENTITY"
+  )" || exit $?
+  runtime_id="$(
+    switchyard_native_runtime_id_from_closure_digest \
+      "$SWITCHYARD_RUNTIME_PROFILE_ID_PREFIX" "$wine_revision" "$source_dirty" \
+      "$runtime_closure_digest"
+  )" || exit $?
+else
+  runtime_id="${SWITCHYARD_RUNTIME_PROFILE_ID_PREFIX}${source_identity}-${gptk_redist_digest}-${wine_mono_digest:0:12}-${gstreamer_deps_digest}-${vulkan_deps_digest}-${mesa_windows_digest}-${font_deps_digest}-${font_assets_digest}-${tls_deps_digest}-${tls_dlopen_digest}"
+fi
 if [ -z "$USER_SET_WINE_INSTALL_PREFIX" ]; then
   WINE_INSTALL_PREFIX="${HOME}/.switchyard/runtimes/$runtime_id"
 fi
@@ -1936,6 +3070,13 @@ case "$WINE_INSTALL_PREFIX" in
     exit 1
     ;;
 esac
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  WINE_INSTALL_PREFIX="$(
+    switchyard_canonical_runtime_install_prefix "$WINE_INSTALL_PREFIX"
+  )" || exit $?
+  switchyard_validate_native_runtime_prefix_bootstrap_budget \
+    "$WINE_INSTALL_PREFIX" || exit $?
+fi
 FINAL_WINE_INSTALL_PREFIX="$WINE_INSTALL_PREFIX"
 
 runtime_is_complete_at() {
@@ -1950,6 +3091,12 @@ runtime_is_complete_at() {
   local manifest_font_assets_digest
   local manifest_gstreamer_digest
   local manifest_mesa_digest
+  local manifest_unicorn_digest
+  local manifest_unicorn_payload_digest
+  local manifest_unicorn_library_sha
+  local manifest_provider_sha
+  local manifest_native_value
+  local index
   local kind
   local name
   local expected_hash
@@ -1960,8 +3107,13 @@ runtime_is_complete_at() {
 
   [ -f "$manifest" ] || return 1
   runtime_content_tree_is_verified "$prefix" || return 1
-  switchyard_validate_runtime_manifest_profile "$manifest" "$SWITCHYARD_RUNTIME_PROFILE" \
-    >/dev/null 2>&1 || return 1
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    switchyard_validate_runtime_manifest_profile \
+      "$manifest" "$SWITCHYARD_RUNTIME_PROFILE" "$prefix" >/dev/null 2>&1 || return 1
+  else
+    switchyard_validate_runtime_manifest_profile \
+      "$manifest" "$SWITCHYARD_RUNTIME_PROFILE" >/dev/null 2>&1 || return 1
+  fi
   manifest_id="$(/usr/bin/plutil -extract id raw -o - "$manifest" 2>/dev/null || true)"
   [ "$manifest_id" = "$runtime_id" ] || return 1
   manifest_install_prefix="$(/usr/bin/plutil -extract installPrefix raw -o - "$manifest" 2>/dev/null || true)"
@@ -1998,6 +3150,124 @@ runtime_is_complete_at() {
     grep -F '@rpath/libgstreamer-1.0.0.dylib' >/dev/null || return 1
   otool -l "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/winegstreamer.so" |
     grep -F '@loader_path/../../switchyard-gstreamer/lib' >/dev/null || return 1
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    vulkan_deps_match_profile_architecture \
+      "$prefix/lib/switchyard-vulkan" || return 1
+    font_deps_match_profile_architecture \
+      "$prefix/lib/switchyard-fonts" || return 1
+    tls_deps_match_profile_architecture \
+      "$prefix/lib/switchyard-tls" || return 1
+    gstreamer_deps_match_profile_architecture \
+      "$prefix/lib/switchyard-gstreamer" || return 1
+    verify_runtime_relative_macho_tree \
+      "$prefix/lib/switchyard-vulkan" "Vulkan runtime" >/dev/null 2>&1 || return 1
+    verify_runtime_relative_macho_tree \
+      "$prefix/lib/switchyard-fonts" "font runtime" >/dev/null 2>&1 || return 1
+    verify_runtime_relative_macho_tree \
+      "$prefix/lib/switchyard-tls" "TLS runtime" >/dev/null 2>&1 || return 1
+    verify_runtime_relative_macho_tree \
+      "$prefix/lib/switchyard-gstreamer" "GStreamer runtime" >/dev/null 2>&1 || return 1
+
+    manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.architecture raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = \
+      "$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_ARCHITECTURE_DESCRIPTION" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.digest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$gstreamer_deps_digest" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.runtimePackage raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$GSTREAMER_RUNTIME_PACKAGE" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.runtimePackageUrl raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = \
+      "$GSTREAMER_PACKAGE_BASE_URL/$GSTREAMER_RUNTIME_PACKAGE" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.runtimePackageSha256 raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$GSTREAMER_RUNTIME_PACKAGE_SHA256" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.developmentPackage raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$GSTREAMER_DEVEL_PACKAGE" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.developmentPackageUrl raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = \
+      "$GSTREAMER_PACKAGE_BASE_URL/$GSTREAMER_DEVEL_PACKAGE" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.developmentPackageSha256 raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$GSTREAMER_DEVEL_PACKAGE_SHA256" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract fontRuntime.architecture raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$HOST_MACHO_ARCH" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract fontRuntime.digest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$font_deps_digest" ] || return 1
+    for index in "${!FONT_DEPS_NAMES[@]}"; do
+      manifest_native_value="$(/usr/bin/plutil -extract "fontRuntime.formulae.$index.name" raw -o - "$manifest" 2>/dev/null || true)"
+      [ "$manifest_native_value" = "${FONT_DEPS_NAMES[$index]}" ] || return 1
+      manifest_native_value="$(/usr/bin/plutil -extract "fontRuntime.formulae.$index.version" raw -o - "$manifest" 2>/dev/null || true)"
+      [ "$manifest_native_value" = "${FONT_DEPS_VERSIONS[$index]}" ] || return 1
+      manifest_native_value="$(/usr/bin/plutil -extract "fontRuntime.formulae.$index.repository" raw -o - "$manifest" 2>/dev/null || true)"
+      [ "$manifest_native_value" = "${FONT_DEPS_REPOSITORIES[$index]}" ] || return 1
+      manifest_native_value="$(/usr/bin/plutil -extract "fontRuntime.formulae.$index.bottleTag" raw -o - "$manifest" 2>/dev/null || true)"
+      [ "$manifest_native_value" = \
+        "$SWITCHYARD_RUNTIME_PROFILE_FONT_BOTTLE_TAG" ] || return 1
+      manifest_native_value="$(/usr/bin/plutil -extract "fontRuntime.formulae.$index.layerSha256" raw -o - "$manifest" 2>/dev/null || true)"
+      [ "$manifest_native_value" = "${FONT_DEPS_LAYER_SHA256[$index]}" ] || return 1
+    done
+    manifest_native_value="$(/usr/bin/plutil -extract tlsRuntime.architecture raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$HOST_MACHO_ARCH" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract tlsRuntime.digest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$tls_deps_digest" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract tlsRuntime.packageSubdir raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$TLS_PACKAGE_SUBDIR" ] || return 1
+    cmp -s "$TLS_PACKAGE_MANIFEST" \
+      "$prefix/lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv" || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.architecture raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$HOST_MACHO_ARCH" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.digest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$vulkan_deps_digest" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanLoader.version raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_LOADER_VERSION" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanLoader.repository raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_LOADER_REPOSITORY" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanLoader.bottle raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_LOADER_BOTTLE" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanLoader.manifestDigest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_LOADER_MANIFEST_DIGEST" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanLoader.layerSha256 raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_LOADER_LAYER_SHA256" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanHeaders.version raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_HEADERS_VERSION" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanHeaders.repository raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_HEADERS_REPOSITORY" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanHeaders.bottle raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_HEADERS_BOTTLE" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanHeaders.manifestDigest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_HEADERS_MANIFEST_DIGEST" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.vulkanHeaders.layerSha256 raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$VULKAN_HEADERS_LAYER_SHA256" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.moltenVK.version raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$MOLTENVK_VERSION" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.moltenVK.repository raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$MOLTENVK_REPOSITORY" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.moltenVK.bottle raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$MOLTENVK_BOTTLE" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.moltenVK.manifestDigest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$MOLTENVK_MANIFEST_DIGEST" ] || return 1
+    manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.moltenVK.layerSha256 raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_native_value" = "$MOLTENVK_LAYER_SHA256" ] || return 1
+
+    validate_staged_unicorn_runtime "$prefix" >/dev/null 2>&1 || return 1
+    validate_staged_unicorn_providers "$prefix" >/dev/null 2>&1 || return 1
+    manifest_unicorn_digest="$(/usr/bin/plutil -extract cpuProvider.developmentCacheDigest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_unicorn_digest" = "$unicorn_runtime_digest" ] || return 1
+    manifest_unicorn_payload_digest="$(/usr/bin/plutil -extract cpuProvider.runtimePayloadDigest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_unicorn_payload_digest" = \
+      "$(runtime_content_tree_digest "$prefix/$UNICORN_PACKAGE_ROOT_RELATIVE")" ] || return 1
+    manifest_unicorn_library_sha="$(/usr/bin/plutil -extract cpuProvider.librarySha256 raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_unicorn_library_sha" = \
+      "$(sha256_file "$prefix/$UNICORN_DYLIB_RELATIVE")" ] || return 1
+    for index in "${!UNICORN_PROVIDER_UNIXLIBS[@]}"; do
+      manifest_provider_sha="$(/usr/bin/plutil -extract "cpuProvider.components.$index.unixLibrarySha256" raw -o - "$manifest" 2>/dev/null || true)"
+      [ "$manifest_provider_sha" = \
+        "$(sha256_file "$prefix/${UNICORN_PROVIDER_UNIXLIBS[$index]}")" ] || return 1
+      manifest_provider_sha="$(/usr/bin/plutil -extract "cpuProvider.components.$index.peLibrarySha256" raw -o - "$manifest" 2>/dev/null || true)"
+      [ "$manifest_provider_sha" = \
+        "$(sha256_file "$prefix/${UNICORN_PROVIDER_PE_LIBS[$index]}")" ] || return 1
+    done
+    switchyard_validate_native_arm64_runtime_packaging \
+      "$prefix" "$manifest" "$ROOT_DIR" >/dev/null 2>&1 || return 1
+  fi
   manifest_mesa_digest="$(/usr/bin/plutil -extract mesaOpenGL.digest raw -o - "$manifest" 2>/dev/null || true)"
   [ "$manifest_mesa_digest" = "$mesa_windows_digest" ] || return 1
   content_tree_is_verified "$prefix/lib/switchyard-mesa" || return 1
@@ -2044,6 +3314,7 @@ runtime_is_complete() {
 }
 
 if [ "$MODE" = "--ensure" ] && runtime_is_complete; then
+  switchyard_require_native_arm64_ensure_host
   wine_executable="$FINAL_WINE_INSTALL_PREFIX/bin/switchyard-wine"
   defaults write dev.switchyard.Switchyard winePath "$wine_executable"
   defaults write dev.switchyard.Switchyard 'activeRuntimeSourceRevision.v1' "$wine_revision"
@@ -2056,8 +3327,28 @@ if [ "$MODE" = "--ensure" ]; then
 fi
 
 mkdir -p "$WINE_BUILD_DIR" "$(dirname "$FINAL_WINE_INSTALL_PREFIX")"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  current_native_runtime_prefix="$(
+    switchyard_canonical_runtime_install_prefix "$FINAL_WINE_INSTALL_PREFIX"
+  )" || exit $?
+  [ "$current_native_runtime_prefix" = "$FINAL_WINE_INSTALL_PREFIX" ] || {
+    echo "Native runtime install prefix changed while preparing the build." >&2
+    exit 1
+  }
+  switchyard_validate_native_runtime_prefix_bootstrap_budget \
+    "$FINAL_WINE_INSTALL_PREFIX" || exit $?
+fi
 
 configured=0
+native_compiler_config_identity=""
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  native_compiler_config_identity="$(
+    /usr/bin/printf '%s\0%s\0%s\0%s\0' \
+      "$NATIVE_COMPILER_POLICY_IDENTITY" "$NATIVE_HOST_CLANG" \
+      "$NATIVE_HOST_CLANGXX" "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" |
+      /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+  )"
+fi
 if [ -f "$WINE_BUILD_DIR/config.status" ]; then
   configured=1
 fi
@@ -2100,6 +3391,44 @@ if [ "$configured" -eq 1 ]; then
     echo "existing Wine build does not reference TLS prefix $tls_deps_prefix; reconfiguring"
     RECONFIGURE=1
   fi
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    if [ ! -f "$WINE_BUILD_DIR/.switchyard-native-compiler-policy" ] ||
+       [ -L "$WINE_BUILD_DIR/.switchyard-native-compiler-policy" ] ||
+       [ "$(<"$WINE_BUILD_DIR/.switchyard-native-compiler-policy")" != \
+         "$native_compiler_config_identity" ]; then
+      echo "existing native Wine build does not use the qualified compiler identity; reconfiguring"
+      RECONFIGURE=1
+    fi
+    if ! native_configured_compiler_policy_is_exact "$WINE_BUILD_DIR/Makefile"; then
+      echo "existing native Wine build has ambiguous compiler assignments; reconfiguring"
+      RECONFIGURE=1
+    fi
+    if ! grep -F -- "--with-mingw=$NATIVE_MINGW_CLANG" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F -- "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F -- "--with-unicorn" "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "UNICORN_CFLAGS = -I${unicorn_runtime_prefix}/lib/pkgconfig/../../include" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "UNICORN_LIBS = -L${unicorn_runtime_prefix}/lib/pkgconfig/.. -lunicorn" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "XTAJIT64_UNIXLIB = xtajit64.so" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "XTAJIT64_PE_CFLAGS = -DHAVE_UNICORN" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "XTAJIT_UNIXLIB = xtajit.so" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "XTAJIT_PE_CFLAGS = -DHAVE_UNICORN" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
+      echo "existing native Wine build does not use the exact pinned Unicorn provider; reconfiguring"
+      RECONFIGURE=1
+    fi
+  fi
+  if ! grep -F -- "-mmacosx-version-min=$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
+    echo "existing Wine build does not target macOS $SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS; reconfiguring"
+    RECONFIGURE=1
+  fi
 fi
 
 if [ "$RECONFIGURE" = "1" ] && [ "$configured" -eq 1 ]; then
@@ -2108,13 +3437,45 @@ fi
 
 if [ "$configured" -eq 0 ]; then
   echo "configuring Switchyard Wine in $WINE_BUILD_DIR"
+  profile_configure_options=()
   configure_cppflags="-I${font_deps_prefix}/include -I${font_deps_prefix}/include/freetype2 -I${vulkan_deps_prefix}/include"
   configure_ldflags="-L${font_deps_prefix}/lib -Wl,-rpath,${font_deps_prefix}/lib -L${vulkan_deps_prefix}/lib -Wl,-rpath,${vulkan_deps_prefix}/lib"
   configure_pkg_config_path="${gstreamer_deps_prefix}/lib/pkgconfig:${font_deps_prefix}/lib/pkgconfig:${vulkan_deps_prefix}/lib/pkgconfig"
+  configure_deployment_flag="-mmacosx-version-min=$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
   if [ -n "$tls_deps_prefix" ]; then
     configure_cppflags="-I${tls_deps_prefix}/include ${configure_cppflags}"
     configure_ldflags="-L${tls_deps_prefix}/lib -Wl,-rpath,${tls_deps_prefix}/lib ${configure_ldflags}"
     configure_pkg_config_path="${tls_deps_prefix}/lib/pkgconfig:${configure_pkg_config_path}"
+  fi
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    configure_cppflags="-I${unicorn_runtime_prefix}/include ${configure_cppflags}"
+    configure_ldflags="-L${unicorn_runtime_prefix}/lib -Wl,-rpath,${unicorn_runtime_prefix}/lib ${configure_ldflags}"
+    configure_pkg_config_path="${unicorn_runtime_prefix}/lib/pkgconfig:${configure_pkg_config_path}"
+    profile_configure_options+=(
+      "--with-mingw=$NATIVE_MINGW_CLANG"
+      --with-unicorn
+    )
+  fi
+  configure_cc="clang -arch $HOST_MACHO_ARCH"
+  configure_cxx="clang++ -arch $HOST_MACHO_ARCH"
+  configure_objc="clang -arch $HOST_MACHO_ARCH"
+  configure_cflags="${configure_deployment_flag} ${CFLAGS:-}"
+  configure_cxxflags="${configure_deployment_flag} ${CXXFLAGS:-}"
+  configure_objcflags="${configure_deployment_flag} ${OBJCFLAGS:-}"
+  configure_cppflags_environment="${configure_cppflags} ${CPPFLAGS:-}"
+  configure_ldflags_environment="${configure_deployment_flag} ${configure_ldflags} ${LDFLAGS:-}"
+  configure_pkg_config_path_environment="${configure_pkg_config_path}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    switchyard_validate_qualified_native_llvm_compilers || exit $?
+    configure_cc="$NATIVE_HOST_CLANG $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_MACHO_ARCH"
+    configure_cxx="$NATIVE_HOST_CLANGXX $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_MACHO_ARCH"
+    configure_objc="$NATIVE_HOST_CLANG $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_MACHO_ARCH"
+    configure_cflags="-g -O2 $configure_deployment_flag"
+    configure_cxxflags="-g -O2 $configure_deployment_flag"
+    configure_objcflags="-g -O2 $configure_deployment_flag"
+    configure_cppflags_environment="$configure_cppflags"
+    configure_ldflags_environment="${configure_deployment_flag} ${configure_ldflags}"
+    configure_pkg_config_path_environment="$configure_pkg_config_path"
   fi
   (
     cd "$WINE_BUILD_DIR"
@@ -2123,16 +3484,24 @@ if [ "$configured" -eq 0 ]; then
     if [ -n "$tls_deps_prefix" ]; then
       export ac_cv_lib_soname_gnutls="$TLS_DLOPEN_NAME"
     fi
-    CPPFLAGS="${configure_cppflags} ${CPPFLAGS:-}" \
-    LDFLAGS="${configure_ldflags} ${LDFLAGS:-}" \
-    PKG_CONFIG_PATH="${configure_pkg_config_path}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" \
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      unset cc cxx cpp objc objcxx
+    fi
+    MACOSX_DEPLOYMENT_TARGET="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+    CFLAGS="$configure_cflags" \
+    CXXFLAGS="$configure_cxxflags" \
+    OBJCFLAGS="$configure_objcflags" \
+    CPPFLAGS="$configure_cppflags_environment" \
+    LDFLAGS="$configure_ldflags_environment" \
+    PKG_CONFIG_PATH="$configure_pkg_config_path_environment" \
     "${PROFILE_ARCH_COMMAND[@]}" "$WINE_DIR/configure" \
       --build="$WINE_BUILD_TRIPLET" \
       --host="$WINE_HOST_TRIPLET" \
-      CC="clang -arch $HOST_MACHO_ARCH" \
-      CXX="clang++ -arch $HOST_MACHO_ARCH" \
-      OBJC="clang -arch $HOST_MACHO_ARCH" \
+      CC="$configure_cc" \
+      CXX="$configure_cxx" \
+      OBJC="$configure_objc" \
       --enable-archs="$SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV" \
+      "${profile_configure_options[@]}" \
       --disable-tests \
       --without-alsa \
       --without-capi \
@@ -2193,13 +3562,50 @@ if [ "$configured" -eq 0 ]; then
     echo "Refusing to build a Wine runtime without its Media Foundation backend." >&2
     exit 1
   fi
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    if ! grep -F "UNICORN_CFLAGS = -I${unicorn_runtime_prefix}/lib/pkgconfig/../../include" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "UNICORN_LIBS = -L${unicorn_runtime_prefix}/lib/pkgconfig/.. -lunicorn" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "XTAJIT64_UNIXLIB = xtajit64.so" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "XTAJIT64_PE_CFLAGS = -DHAVE_UNICORN" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "XTAJIT_UNIXLIB = xtajit.so" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
+       ! grep -F "XTAJIT_PE_CFLAGS = -DHAVE_UNICORN" \
+         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
+      echo "Wine configure did not enable both native Unicorn provider Unix libraries." >&2
+      exit 1
+    fi
+    native_configured_compiler_policy_is_exact "$WINE_BUILD_DIR/Makefile" || {
+      echo "Wine configure did not preserve the exact qualified native compilers." >&2
+      exit 1
+    }
+    /usr/bin/printf '%s\n' "$native_compiler_config_identity" > \
+      "$WINE_BUILD_DIR/.switchyard-native-compiler-policy"
+  fi
 fi
 
 assert_source_state_unchanged "dependency preparation"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  switchyard_validate_qualified_native_llvm_compilers || exit $?
+fi
 echo "building Switchyard Wine with $JOBS jobs"
 make -C "$WINE_BUILD_DIR" -j"$JOBS"
 assert_source_state_unchanged "compilation"
 
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  current_native_runtime_prefix="$(
+    switchyard_canonical_runtime_install_prefix "$FINAL_WINE_INSTALL_PREFIX"
+  )" || exit $?
+  [ "$current_native_runtime_prefix" = "$FINAL_WINE_INSTALL_PREFIX" ] || {
+    echo "Native runtime install prefix changed before runtime staging." >&2
+    exit 1
+  }
+  switchyard_validate_native_runtime_prefix_bootstrap_budget \
+    "$FINAL_WINE_INSTALL_PREFIX" || exit $?
+fi
 runtime_parent="$(dirname "$FINAL_WINE_INSTALL_PREFIX")"
 runtime_name="$(basename "$FINAL_WINE_INSTALL_PREFIX")"
 INSTALL_STAGE_ROOT="$(mktemp -d "$runtime_parent/.${runtime_name}.staging.XXXXXX")"
@@ -2290,6 +3696,12 @@ else
   echo "GPTK redist was not found; leaving Wine runtime without GPTK overlay." >&2
 fi
 
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  echo "staging the pinned native ARM64 DXMT artifact closure"
+  switchyard_stage_native_arm64_dxmt_artifact \
+    "$DXMT_ARCHIVE" "$DXMT_SOURCE_DIR" "$WINE_INSTALL_PREFIX"
+fi
+
 echo "installing Wine Mono addon $WINE_MONO_FILE"
 mkdir -p "$WINE_INSTALL_PREFIX/share/wine/mono"
 install -m 0644 "$wine_mono_path" "$WINE_INSTALL_PREFIX/share/wine/mono/$WINE_MONO_FILE"
@@ -2299,23 +3711,48 @@ rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer"
 mkdir -p "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer"
 ditto "$gstreamer_deps_prefix" "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer"
 relocate_winegstreamer_for_runtime "$WINE_INSTALL_PREFIX" "$gstreamer_deps_prefix"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  verify_host_macho_tree_arches "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer" \
+    "staged GStreamer runtime" "${GSTREAMER_MACHO_ARCHS[@]}"
+  verify_native_macho_tree_macos_compatibility \
+    "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer" \
+    "staged GStreamer runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
+  verify_runtime_relative_macho_tree "$WINE_INSTALL_PREFIX/lib/switchyard-gstreamer" \
+    "staged GStreamer runtime"
+fi
 
-echo "installing x86_64 Vulkan loader and MoltenVK runtime"
+echo "installing $HOST_DEPENDENCY_ARCH Vulkan loader and MoltenVK runtime"
 rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan"
 mkdir -p "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan"
 ditto "$vulkan_deps_prefix" "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  verify_host_macho_tree_arches "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan" \
+    "staged Vulkan runtime" "$HOST_DEPENDENCY_ARCH"
+  verify_native_macho_tree_macos_compatibility \
+    "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan" \
+    "staged Vulkan runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
+  verify_runtime_relative_macho_tree "$WINE_INSTALL_PREFIX/lib/switchyard-vulkan" \
+    "staged Vulkan runtime"
+fi
 
 echo "installing i386/x86_64 Mesa Windows OpenGL fallback"
 rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-mesa"
 mkdir -p "$WINE_INSTALL_PREFIX/lib/switchyard-mesa"
 ditto "$mesa_windows_prefix" "$WINE_INSTALL_PREFIX/lib/switchyard-mesa"
 
-echo "installing x86_64 FreeType and fontconfig runtime libraries"
+echo "installing $HOST_DEPENDENCY_ARCH FreeType and fontconfig runtime libraries"
 runtime_font_root="$WINE_INSTALL_PREFIX/lib/switchyard-fonts"
 rm -rf "$runtime_font_root"
 mkdir -p "$runtime_font_root"
 ditto "$font_deps_prefix" "$runtime_font_root"
 relocate_font_deps_for_runtime "$runtime_font_root" "$font_deps_prefix"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  verify_host_macho_tree_arches "$runtime_font_root" \
+    "staged font runtime" "$HOST_DEPENDENCY_ARCH"
+  verify_native_macho_tree_macos_compatibility "$runtime_font_root" \
+    "staged font runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
+  verify_runtime_relative_macho_tree "$runtime_font_root" "staged font runtime"
+fi
 if [ -f "$runtime_font_root/etc/fonts/fonts.conf" ]; then
   perl -0pi -e "s#\\n\\s*<cachedir>\\Q${font_deps_prefix}/var/cache/fontconfig\\E</cachedir>##g" \
     "$runtime_font_root/etc/fonts/fonts.conf"
@@ -2336,10 +3773,30 @@ ditto "$font_assets_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets
   "$runtime_font_root/share/doc/switchyard-font-assets"
 
 if [ -n "$tls_deps_prefix" ]; then
-  echo "installing x86_64 GnuTLS runtime libraries"
+  echo "installing $HOST_DEPENDENCY_ARCH GnuTLS runtime libraries"
   rm -rf "$WINE_INSTALL_PREFIX/lib/switchyard-tls"
   mkdir -p "$WINE_INSTALL_PREFIX/lib/switchyard-tls"
   ditto "$tls_deps_prefix" "$WINE_INSTALL_PREFIX/lib/switchyard-tls"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    verify_host_macho_tree_arches "$WINE_INSTALL_PREFIX/lib/switchyard-tls" \
+      "staged TLS runtime" "$HOST_DEPENDENCY_ARCH"
+    verify_native_macho_tree_macos_compatibility \
+      "$WINE_INSTALL_PREFIX/lib/switchyard-tls" \
+      "staged TLS runtime" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
+    verify_runtime_relative_macho_tree "$WINE_INSTALL_PREFIX/lib/switchyard-tls" \
+      "staged TLS runtime"
+  fi
+fi
+
+unicorn_payload_digest=""
+unicorn_library_sha256=""
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  echo "installing the pinned Unicorn native CPU-provider runtime closure"
+  stage_unicorn_runtime "$WINE_INSTALL_PREFIX" "$unicorn_runtime_prefix"
+  unicorn_payload_digest="$(
+    runtime_content_tree_digest "$WINE_INSTALL_PREFIX/$UNICORN_PACKAGE_ROOT_RELATIVE"
+  )"
+  unicorn_library_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/$UNICORN_DYLIB_RELATIVE")"
 fi
 
 echo "installing Wine license, source, and replacement notices"
@@ -2357,11 +3814,22 @@ install -m 0644 "$ROOT_DIR/switchyard/lib/gpu_capability_policy.sh" \
   "$WINE_INSTALL_PREFIX/share/switchyard/gpu_capability_policy.sh"
 mkdir -p "$WINE_INSTALL_PREFIX/libexec"
 echo "building the D3DMetal host GPU identity helper"
-"${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" -fobjc-arc -Wall -Wextra -Werror \
-  -mmacosx-version-min="$TLS_MIN_MACOS_VERSION" \
-  "$ROOT_DIR/switchyard/host_gpu_info.m" \
-  -framework Foundation -framework IOKit -framework Metal \
-  -o "$WINE_INSTALL_PREFIX/libexec/switchyard-host-gpu-info"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  switchyard_validate_qualified_native_llvm_compilers || exit $?
+  "${PROFILE_ARCH_COMMAND[@]}" "$NATIVE_HOST_CLANG" \
+    "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" \
+    -arch "$HOST_MACHO_ARCH" -fobjc-arc -Wall -Wextra -Werror \
+    -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+    "$ROOT_DIR/switchyard/host_gpu_info.m" \
+    -framework Foundation -framework IOKit -framework Metal \
+    -o "$WINE_INSTALL_PREFIX/libexec/switchyard-host-gpu-info"
+else
+  "${PROFILE_ARCH_COMMAND[@]}" clang -arch "$HOST_MACHO_ARCH" -fobjc-arc -Wall -Wextra -Werror \
+    -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+    "$ROOT_DIR/switchyard/host_gpu_info.m" \
+    -framework Foundation -framework IOKit -framework Metal \
+    -o "$WINE_INSTALL_PREFIX/libexec/switchyard-host-gpu-info"
+fi
 cat >"$wine_notice_root/CORRESPONDING-SOURCE.txt" <<EOF
 Switchyard Wine runtime corresponding source
 
@@ -2551,7 +4019,15 @@ fi
 staged_wine_executable="$WINE_INSTALL_PREFIX/bin/switchyard-wine"
 ln -sf wine "$staged_wine_executable"
 wine_executable="$FINAL_WINE_INSTALL_PREFIX/bin/switchyard-wine"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  echo "ad-hoc signing the native ARM64 runtime process entries"
+  switchyard_sign_preview_native_runtime_entries
+fi
 wine_unix_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/$WINE_UNIX_ARCH-unix/wine")"
+wine_real_sha256=""
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  wine_real_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/bin/wine.switchyard-real")"
+fi
 i386_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/i386-windows/ntdll.dll")"
 x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows/ntdll.dll")"
 
@@ -2607,6 +4083,80 @@ assert_source_state_unchanged "runtime assembly"
   printf '    "i386NtdllSha256": %s,\n' "$(json_string "$i386_ntdll_sha256")"
   printf '    "x86_64NtdllSha256": %s\n' "$(json_string "$x86_64_ntdll_sha256")"
   printf '  },\n'
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    printf '  "runtimeSigning": {\n'
+    printf '    "mode": "engineering-adhoc",\n'
+    printf '    "processEntryMachOs": [\n'
+    printf '      {"path": "lib/wine/aarch64-unix/wine", "sha256": %s},\n' \
+      "$(json_string "$wine_unix_sha256")"
+    printf '      {"path": "bin/wine.switchyard-real", "sha256": %s}\n' \
+      "$(json_string "$wine_real_sha256")"
+    printf '    ]\n'
+    printf '  },\n'
+    printf '  "cpuProvider": {\n'
+    printf '    "implementation": "unicorn",\n'
+    printf '    "version": %s,\n' "$(json_string "$SWITCHYARD_UNICORN_VERSION")"
+    printf '    "sourceRepository": %s,\n' \
+      "$(json_string "$SWITCHYARD_UNICORN_SOURCE_REPOSITORY")"
+    printf '    "sourceRevision": %s,\n' \
+      "$(json_string "$SWITCHYARD_UNICORN_SOURCE_REVISION")"
+    printf '    "sourceArchive": %s,\n' \
+      "$(json_string "$UNICORN_PACKAGE_ROOT_RELATIVE/share/src/switchyard-unicorn/unicorn-${SWITCHYARD_UNICORN_SOURCE_REVISION}.tar.gz")"
+    printf '    "sourceArchiveSha256": %s,\n' \
+      "$(json_string "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256")"
+    printf '    "sourcePatch": {\n'
+    printf '      "path": %s,\n' "$(json_string "$UNICORN_SOURCE_PATCH_RELATIVE")"
+    printf '      "sha256": %s\n' \
+      "$(json_string "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256")"
+    printf '    },\n'
+    printf '    "buildContractVersion": %s,\n' \
+      "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION"
+    printf '    "hostArchitecture": "arm64",\n'
+    printf '    "kuserSharedDataModel": %s,\n' \
+      "$(json_string "$SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL")"
+    printf '    "emulatedArchitectures": ["i386", "x86_64"],\n'
+    printf '    "developmentCacheDigest": %s,\n' \
+      "$(json_string "$unicorn_runtime_digest")"
+    printf '    "runtimeRoot": %s,\n' \
+      "$(json_string "$UNICORN_PACKAGE_ROOT_RELATIVE")"
+    printf '    "runtimePayloadDigest": %s,\n' \
+      "$(json_string "$unicorn_payload_digest")"
+    printf '    "library": %s,\n' "$(json_string "$UNICORN_DYLIB_RELATIVE")"
+    printf '    "librarySha256": %s,\n' "$(json_string "$unicorn_library_sha256")"
+    printf '    "providerUnixLibraries": [\n'
+    for index in "${!UNICORN_PROVIDER_UNIXLIBS[@]}"; do
+      if [ "$index" -lt "$((${#UNICORN_PROVIDER_UNIXLIBS[@]} - 1))" ]; then
+        printf '      %s,\n' "$(json_string "${UNICORN_PROVIDER_UNIXLIBS[$index]}")"
+      else
+        printf '      %s\n' "$(json_string "${UNICORN_PROVIDER_UNIXLIBS[$index]}")"
+      fi
+    done
+    printf '    ],\n'
+    printf '    "components": [\n'
+    for index in "${!UNICORN_PROVIDER_UNIXLIBS[@]}"; do
+      printf '      {\n'
+      printf '        "guestArchitecture": %s,\n' \
+        "$(json_string "${UNICORN_PROVIDER_GUEST_ARCHS[$index]}")"
+      printf '        "unixLibrary": %s,\n' \
+        "$(json_string "${UNICORN_PROVIDER_UNIXLIBS[$index]}")"
+      printf '        "unixLibrarySha256": %s,\n' \
+        "$(json_string "$(sha256_file "$WINE_INSTALL_PREFIX/${UNICORN_PROVIDER_UNIXLIBS[$index]}")")"
+      printf '        "peLibrary": %s,\n' \
+        "$(json_string "${UNICORN_PROVIDER_PE_LIBS[$index]}")"
+      printf '        "peLibrarySha256": %s\n' \
+        "$(json_string "$(sha256_file "$WINE_INSTALL_PREFIX/${UNICORN_PROVIDER_PE_LIBS[$index]}")")"
+      if [ "$index" -lt "$((${#UNICORN_PROVIDER_UNIXLIBS[@]} - 1))" ]; then
+        printf '      },\n'
+      else
+        printf '      }\n'
+      fi
+    done
+    printf '    ],\n'
+    printf '    "runtimeRpath": %s,\n' "$(json_string "$UNICORN_RUNTIME_RPATH")"
+    printf '    "manifest": %s\n' \
+      "$(json_string "$UNICORN_PACKAGE_ROOT_RELATIVE/switchyard-unicorn-runtime.json")"
+    printf '  },\n'
+  fi
   printf '  "gptkPath": %s,\n' "$(json_string "$GPTK_PATH")"
   printf '  "gptkRedistDigest": %s,\n' "$(json_string "$gptk_redist_digest")"
   printf '  "wineGraphicsFallback": {\n'
@@ -2689,6 +4239,10 @@ assert_source_state_unchanged "runtime assembly"
     printf '        "name": %s,\n' "$(json_string "${FONT_DEPS_NAMES[$index]}")"
     printf '        "version": %s,\n' "$(json_string "${FONT_DEPS_VERSIONS[$index]}")"
     printf '        "repository": %s,\n' "$(json_string "${FONT_DEPS_REPOSITORIES[$index]}")"
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      printf '        "bottleTag": %s,\n' \
+        "$(json_string "$SWITCHYARD_RUNTIME_PROFILE_FONT_BOTTLE_TAG")"
+    fi
     printf '        "layerSha256": %s\n' "$(json_string "${FONT_DEPS_LAYER_SHA256[$index]}")"
     if [ "$index" -lt "$((${#FONT_DEPS_NAMES[@]} - 1))" ]; then
       printf '      },\n'
@@ -2718,6 +4272,9 @@ assert_source_state_unchanged "runtime assembly"
     printf '    "root": "lib/switchyard-tls",\n'
     printf '    "digest": %s,\n' "$(json_string "$tls_deps_digest")"
     printf '    "architecture": %s,\n' "$(json_string "$HOST_MACHO_ARCH")"
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      printf '    "packageSubdir": %s,\n' "$(json_string "$TLS_PACKAGE_SUBDIR")"
+    fi
     printf '    "dlopenName": %s,\n' "$(json_string "$TLS_DLOPEN_NAME")"
     printf '    "license": "redistributable conda-forge and source-built GnuTLS dependency closure with notices",\n'
     printf '    "packageManifest": "lib/switchyard-tls/share/doc/switchyard-tls/packages.tsv",\n'
@@ -2735,27 +4292,54 @@ assert_source_state_unchanged "runtime assembly"
   printf '    "vulkanLoader": {\n'
   printf '      "version": %s,\n' "$(json_string "$VULKAN_LOADER_VERSION")"
   printf '      "repository": %s,\n' "$(json_string "$VULKAN_LOADER_REPOSITORY")"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    printf '      "bottle": %s,\n' "$(json_string "$VULKAN_LOADER_BOTTLE")"
+  fi
   printf '      "manifestDigest": %s,\n' "$(json_string "$VULKAN_LOADER_MANIFEST_DIGEST")"
   printf '      "layerSha256": %s\n' "$(json_string "$VULKAN_LOADER_LAYER_SHA256")"
   printf '    },\n'
   printf '    "vulkanHeaders": {\n'
   printf '      "version": %s,\n' "$(json_string "$VULKAN_HEADERS_VERSION")"
   printf '      "repository": %s,\n' "$(json_string "$VULKAN_HEADERS_REPOSITORY")"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    printf '      "bottle": %s,\n' "$(json_string "$VULKAN_HEADERS_BOTTLE")"
+  fi
   printf '      "manifestDigest": %s,\n' "$(json_string "$VULKAN_HEADERS_MANIFEST_DIGEST")"
   printf '      "layerSha256": %s\n' "$(json_string "$VULKAN_HEADERS_LAYER_SHA256")"
   printf '    },\n'
   printf '    "moltenVK": {\n'
   printf '      "version": %s,\n' "$(json_string "$MOLTENVK_VERSION")"
   printf '      "repository": %s,\n' "$(json_string "$MOLTENVK_REPOSITORY")"
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    printf '      "bottle": %s,\n' "$(json_string "$MOLTENVK_BOTTLE")"
+  fi
   printf '      "manifestDigest": %s,\n' "$(json_string "$MOLTENVK_MANIFEST_DIGEST")"
   printf '      "layerSha256": %s\n' "$(json_string "$MOLTENVK_LAYER_SHA256")"
   printf '    }\n'
   printf '  }\n'
   printf '}\n'
 } >"$WINE_INSTALL_PREFIX/switchyard-runtime.json"
-if ! switchyard_validate_runtime_manifest_profile \
-     "$WINE_INSTALL_PREFIX/switchyard-runtime.json" "$SWITCHYARD_RUNTIME_PROFILE"; then
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  switchyard_finalize_native_arm64_runtime_manifest \
+    "$WINE_INSTALL_PREFIX" "$WINE_INSTALL_PREFIX/switchyard-runtime.json"
+  switchyard_refresh_native_arm64_signed_runtime_manifest \
+    "$WINE_INSTALL_PREFIX" "$WINE_INSTALL_PREFIX/switchyard-runtime.json"
+fi
+profile_validation_arguments=(
+  "$WINE_INSTALL_PREFIX/switchyard-runtime.json"
+  "$SWITCHYARD_RUNTIME_PROFILE"
+)
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  profile_validation_arguments+=("$WINE_INSTALL_PREFIX")
+fi
+if ! switchyard_validate_runtime_manifest_profile "${profile_validation_arguments[@]}"; then
   echo "Refusing to publish a runtime with inconsistent profile metadata." >&2
+  exit 1
+fi
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] &&
+   ! switchyard_validate_native_arm64_runtime_packaging \
+     "$WINE_INSTALL_PREFIX" "$WINE_INSTALL_PREFIX/switchyard-runtime.json" "$ROOT_DIR"; then
+  echo "Refusing to publish a native runtime with an invalid packaging closure." >&2
   exit 1
 fi
 runtime_content_sha256="$(write_runtime_content_tree_digest "$WINE_INSTALL_PREFIX")"
@@ -2765,7 +4349,20 @@ if ! runtime_is_complete_at "$WINE_INSTALL_PREFIX"; then
   exit 1
 fi
 
-atomic_replace_directory "$WINE_INSTALL_PREFIX" "$FINAL_WINE_INSTALL_PREFIX" runtime
+switchyard_require_native_arm64_ensure_host
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  current_native_runtime_prefix="$(
+    switchyard_canonical_runtime_install_prefix "$FINAL_WINE_INSTALL_PREFIX"
+  )" || exit $?
+  [ "$current_native_runtime_prefix" = "$FINAL_WINE_INSTALL_PREFIX" ] || {
+    echo "Native runtime install prefix changed before publication." >&2
+    exit 1
+  }
+  switchyard_validate_native_runtime_prefix_bootstrap_budget \
+    "$FINAL_WINE_INSTALL_PREFIX" || exit $?
+fi
+atomic_replace_directory "$WINE_INSTALL_PREFIX" "$FINAL_WINE_INSTALL_PREFIX" runtime \
+  "$SWITCHYARD_RUNTIME_PROFILE"
 WINE_INSTALL_PREFIX="$FINAL_WINE_INSTALL_PREFIX"
 rm -rf "$INSTALL_STAGE_ROOT"
 INSTALL_STAGE_ROOT=""

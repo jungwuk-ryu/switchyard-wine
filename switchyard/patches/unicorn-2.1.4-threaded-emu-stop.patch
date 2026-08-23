@@ -1,0 +1,612 @@
+diff --git a/include/uc_priv.h b/include/uc_priv.h
+index c3132dc..f316da1 100644
+--- a/include/uc_priv.h
++++ b/include/uc_priv.h
+@@ -9,6 +9,7 @@
+ #include <stdio.h>
+ 
+ #include "qemu.h"
++#include "qemu/atomic.h"
+ #include "qemu/xxhash.h"
+ #include "unicorn/unicorn.h"
+ #include "list.h"
+@@ -521,6 +522,16 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
+                                 length);
+ }
+ 
++static inline bool uc_stop_requested(const uc_engine *uc)
++{
++    return atomic_read(&uc->stop_request);
++}
++
++static inline void uc_set_stop_request(uc_engine *uc, bool value)
++{
++    atomic_set(&uc->stop_request, value);
++}
++
+ /*
+  break translation loop:
+  This is done in two cases:
+@@ -530,11 +541,10 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
+ */
+ static inline uc_err break_translation_loop(uc_engine *uc)
+ {
+-    if (uc->emulation_done) {
++    if (atomic_read(&uc->emulation_done)) {
+         return UC_ERR_OK;
+     }
+ 
+-    // TODO: make this atomic somehow?
+     if (uc->cpu) {
+         // exit the current TB
+         cpu_exit(uc->cpu);
+@@ -545,10 +555,10 @@ static inline uc_err break_translation_loop(uc_engine *uc)
+ 
+ static inline void revert_uc_emu_stop(uc_engine *uc)
+ {
+-    uc->stop_request = 0;
+-    uc->cpu->exit_request = 0;
+-    uc->cpu->tcg_exit_req = 0;
+-    uc->cpu->icount_decr_ptr->u16.high = 0;
++    uc_set_stop_request(uc, false);
++    atomic_set(&uc->cpu->exit_request, false);
++    atomic_set(&uc->cpu->tcg_exit_req, 0);
++    atomic_set(&uc->cpu->icount_decr_ptr->u16.high, 0);
+ }
+ 
+ #ifdef UNICORN_TRACER
+diff --git a/qemu/accel/tcg/cpu-exec.c b/qemu/accel/tcg/cpu-exec.c
+index 77168f3..80038b2 100644
+--- a/qemu/accel/tcg/cpu-exec.c
++++ b/qemu/accel/tcg/cpu-exec.c
+@@ -101,7 +101,7 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+             }
+         }
+ 
+-        cpu->tcg_exit_req = 0;
++        atomic_set(&cpu->tcg_exit_req, 0);
+     }
+     return ret;
+ }
+@@ -438,9 +438,9 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
+     /* Clear the interrupt flag now since we're processing
+      * cpu->interrupt_request and cpu->exit_request.
+      * Ensure zeroing happens before reading cpu->exit_request or
+-     * cpu->interrupt_request (see also smp_wmb in cpu_exit())
++     * cpu->interrupt_request (see also the paired exchanges in cpu_exit()).
+      */
+-    cpu_neg(cpu)->icount_decr.u16.high = 0;
++    atomic_xchg(&cpu_neg(cpu)->icount_decr.u16.high, 0);
+ 
+     if (unlikely(cpu->interrupt_request)) {
+         int interrupt_request;
+@@ -494,8 +494,8 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
+     }
+ 
+     /* Finally, check if we need to exit to the main loop.  */
+-    if (unlikely(cpu->exit_request)) {
+-        cpu->exit_request = 0;
++    if (unlikely(atomic_read(&cpu->exit_request)) &&
++        atomic_xchg(&cpu->exit_request, false)) {
+         if (cpu->exception_index == -1) {
+             cpu->exception_index = EXCP_INTERRUPT;
+         }
+@@ -522,8 +522,7 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+     }
+ 
+     *last_tb = NULL;
+-    insns_left = cpu_neg(cpu)->icount_decr.u32;
+-    if (insns_left < 0) {
++    if (cpu_loop_exit_requested(cpu)) {
+         /* Something asked us to stop executing chained TBs; just
+          * continue round the main loop. Whatever requested the exit
+          * will also have set something else (eg exit_request or
+@@ -611,7 +610,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
+             }
+ 
+             tb = tb_find(cpu, last_tb, tb_exit, cflags);
+-            if (unlikely(cpu->exit_request)) {
++            if (unlikely(atomic_read(&cpu->exit_request))) {
+                 continue;
+             }
+             cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
+@@ -622,7 +621,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
+     }
+ 
+     // Unicorn: Clear any TCG exit flag that might have been left set by exit requests
+-    uc->cpu->tcg_exit_req = 0;
++    atomic_set(&uc->cpu->tcg_exit_req, 0);
+ 
+     cc->cpu_exec_exit(cpu);
+     // rcu_read_unlock();
+diff --git a/qemu/accel/tcg/cputlb.c b/qemu/accel/tcg/cputlb.c
+index 3d0bebd..ff90b58 100644
+--- a/qemu/accel/tcg/cputlb.c
++++ b/qemu/accel/tcg/cputlb.c
+@@ -1578,7 +1578,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                         break;
+ 
+                     // the last callback may already asked to stop emulation
+-                    if (uc->stop_request)
++                    if (uc_stop_requested(uc))
+                         break;
+                 }
+             } else {
+@@ -1599,7 +1599,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                         break;
+ 
+                     // the last callback may already asked to stop emulation
+-                    if (uc->stop_request)
++                    if (uc_stop_requested(uc))
+                         break;
+                 }
+             }
+@@ -1663,7 +1663,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+             }
+             JIT_CALLBACK_GUARD(((uc_cb_hookmem_t)hook->callback)(env->uc, UC_MEM_READ, paddr, size, 0, hook->user_data));
+             // the last callback may already asked to stop emulation
+-            if (uc->stop_request)
++            if (uc_stop_requested(uc))
+                 break;
+         }
+ 
+@@ -1699,7 +1699,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                     break;
+ 
+                 // the last callback may already asked to stop emulation
+-                if (uc->stop_request)
++                if (uc_stop_requested(uc))
+                     break;
+             }
+ 
+@@ -1749,7 +1749,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                     break;
+ 
+                 // the last callback may already asked to stop emulation
+-                if (uc->stop_request)
++                if (uc_stop_requested(uc))
+                     break;
+             }
+ 
+@@ -1859,7 +1859,7 @@ _out:
+                 }
+                 JIT_CALLBACK_GUARD(((uc_cb_hookmem_t)hook->callback)(env->uc, UC_MEM_READ_AFTER, paddr, size, res, hook->user_data));
+                 // the last callback may already asked to stop emulation
+-                if (uc->stop_request)
++                if (uc_stop_requested(uc))
+                     break;
+             }
+         }
+@@ -2207,7 +2207,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
+             }
+             JIT_CALLBACK_GUARD(((uc_cb_hookmem_t)hook->callback)(uc, UC_MEM_WRITE, paddr, size, val, hook->user_data));
+             // the last callback may already asked to stop emulation
+-            if (uc->stop_request)
++            if (uc_stop_requested(uc))
+                 break;
+         }
+     }
+@@ -2230,7 +2230,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
+                 break;
+ 
+             // the last callback may already asked to stop emulation
+-            if (uc->stop_request)
++            if (uc_stop_requested(uc))
+                 break;
+         }
+ 
+@@ -2283,7 +2283,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
+                 break;
+ 
+             // the last callback may already asked to stop emulation
+-            if (uc->stop_request)
++            if (uc_stop_requested(uc))
+                 break;
+         }
+ 
+diff --git a/qemu/accel/tcg/tcg-runtime.c b/qemu/accel/tcg/tcg-runtime.c
+index 777287a..d02e8c4 100644
+--- a/qemu/accel/tcg/tcg-runtime.c
++++ b/qemu/accel/tcg/tcg-runtime.c
+@@ -176,7 +176,7 @@ void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
+             // Only unlock (allow writing to JIT area) if we are the outmost uc_emu_start
+             tb_exec_unlock(uc);
+         }
+-        uc->cpu->tcg_exit_req = 0;
++        atomic_set(&uc->cpu->tcg_exit_req, 0);
+ 
+         if (uc->skip_sync_pc_on_exit) {
+             uc->skip_sync_pc_on_exit = false;
+@@ -185,4 +185,4 @@ void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
+             cpu_loop_exit_restore(uc->cpu, GETPC());
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/qemu/hw/core/cpu.c b/qemu/hw/core/cpu.c
+index 0bd16dc..e3f99f2 100644
+--- a/qemu/hw/core/cpu.c
++++ b/qemu/hw/core/cpu.c
+@@ -57,9 +57,11 @@ void cpu_reset_interrupt(CPUState *cpu, int mask)
+ 
+ void cpu_exit(CPUState *cpu)
+ {
+-    cpu->exit_request = 1;
+-    cpu->tcg_exit_req = 1;
+-    cpu->icount_decr_ptr->u16.high = -1;
++    /* Paired with the full exchange that clears high in
++     * cpu_handle_interrupt(), so neither wakeup can be lost. */
++    atomic_xchg(&cpu->exit_request, true);
++    atomic_set(&cpu->tcg_exit_req, 1);
++    atomic_xchg(&cpu->icount_decr_ptr->u16.high, (uint16_t)-1);
+ }
+ 
+ static void cpu_common_noop(CPUState *cpu)
+diff --git a/qemu/include/exec/exec-all.h b/qemu/include/exec/exec-all.h
+index 68c6567..a84e812 100644
+--- a/qemu/include/exec/exec-all.h
++++ b/qemu/include/exec/exec-all.h
+@@ -80,7 +80,7 @@ void QEMU_NORETURN cpu_loop_exit_atomic(CPUState *cpu, uintptr_t pc);
+  */
+ static inline bool cpu_loop_exit_requested(CPUState *cpu)
+ {
+-    return (int32_t)cpu_neg(cpu)->icount_decr.u32 < 0;
++    return (int16_t)atomic_read(&cpu_neg(cpu)->icount_decr.u16.high) < 0;
+ }
+ 
+ void cpu_reloading_memory_map(void);
+diff --git a/qemu/softmmu/cpus.c b/qemu/softmmu/cpus.c
+index afb8bbe..9e49021 100644
+--- a/qemu/softmmu/cpus.c
++++ b/qemu/softmmu/cpus.c
+@@ -97,16 +97,16 @@ static int tcg_cpu_exec(struct uc_struct *uc)
+             r = cpu_exec(uc, cpu);
+ 
+             // quit current TB but continue emulating?
+-            if (uc->quit_request && !uc->stop_request) {
++            if (uc->quit_request && !uc_stop_requested(uc)) {
+                 // reset stop_request
+-                uc->stop_request = false;
++                uc_set_stop_request(uc, false);
+ 
+                 // resume cpu
+                 cpu->halted = 0;
+-                cpu->exit_request = 0;
++                atomic_set(&cpu->exit_request, false);
+                 cpu->exception_index = -1;
+                 cpu_resume(cpu);
+-            } else if (uc->stop_request) {
++            } else if (uc_stop_requested(uc)) {
+                 //printf(">>> got STOP request!!!\n");
+                 finish = true;
+                 break;
+@@ -135,9 +135,9 @@ static int tcg_cpu_exec(struct uc_struct *uc)
+         }
+     }
+     uc->exit_request = 0;
+-    uc->cpu->exit_request = 0;
+-    uc->cpu->icount_decr_ptr->u16.high = 0;
+-    uc->cpu->tcg_exit_req = 0;
++    atomic_set(&uc->cpu->exit_request, false);
++    atomic_set(&uc->cpu->icount_decr_ptr->u16.high, 0);
++    atomic_set(&uc->cpu->tcg_exit_req, 0);
+ 
+     return finish;
+ }
+@@ -207,7 +207,7 @@ void resume_all_vcpus(struct uc_struct* uc)
+ {
+     CPUState *cpu = uc->cpu;
+     cpu->halted = 0;
+-    cpu->exit_request = 0;
++    atomic_set(&cpu->exit_request, false);
+     cpu->exception_index = -1;
+     cpu_resume(cpu);
+     /* static void qemu_tcg_cpu_loop(struct uc_struct *uc) */
+diff --git a/qemu/target/i386/misc_helper.c b/qemu/target/i386/misc_helper.c
+index ccc12c8..fc11d8d 100644
+--- a/qemu/target/i386/misc_helper.c
++++ b/qemu/target/i386/misc_helper.c
+@@ -132,7 +132,7 @@ void helper_cpuid(CPUX86State *env)
+         }
+ 
+         // the last callback may already asked to stop emulation
+-        if (env->uc->stop_request)
++        if (uc_stop_requested(env->uc))
+             break;
+     }
+ 
+@@ -244,7 +244,7 @@ void helper_rdtsc(CPUX86State *env)
+         }
+ 
+         // the last callback may already asked to stop emulation
+-        if (env->uc->stop_request)
++        if (uc_stop_requested(env->uc))
+             break;
+     }
+ 
+@@ -288,7 +288,7 @@ void helper_rdtscp(CPUX86State *env)
+         }
+ 
+         // the last callback may already asked to stop emulation
+-        if (env->uc->stop_request)
++        if (uc_stop_requested(env->uc))
+             break;
+     }
+ 
+diff --git a/qemu/target/i386/seg_helper.c b/qemu/target/i386/seg_helper.c
+index 97447fe..e39a85b 100644
+--- a/qemu/target/i386/seg_helper.c
++++ b/qemu/target/i386/seg_helper.c
+@@ -992,7 +992,7 @@ void helper_syscall(CPUX86State *env, int next_eip_addend)
+         }
+ 
+         // the last callback may already asked to stop emulation
+-        if (env->uc->stop_request)
++        if (uc_stop_requested(env->uc))
+             break;
+     }
+ 
+@@ -2376,7 +2376,7 @@ void helper_sysenter(CPUX86State *env, int next_eip_addend)
+         }
+ 
+         // the last callback may already asked to stop emulation
+-        if (env->uc->stop_request)
++        if (uc_stop_requested(env->uc))
+             break;
+     }
+ 
+diff --git a/uc.c b/uc.c
+index 75b89a0..e66a152 100644
+--- a/uc.c
++++ b/uc.c
+@@ -1018,13 +1018,13 @@ static void *_timeout_fn(void *arg)
+     do {
+         usleep(TIMEOUT_STEP);
+         // perhaps emulation is even done before timeout?
+-        if (uc->emulation_done) {
++        if (atomic_read(&uc->emulation_done)) {
+             break;
+         }
+     } while ((uint64_t)(get_clock() - current_time) < uc->timeout);
+ 
+     // timeout before emulation is done?
+-    if (!uc->emulation_done) {
++    if (!atomic_read(&uc->emulation_done)) {
+         uc->timed_out = true;
+         // force emulation to stop
+         uc_emu_stop(uc);
+@@ -1081,7 +1081,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+     // reset the counter
+     uc->emu_counter = 0;
+     uc->invalid_error = UC_ERR_OK;
+-    uc->emulation_done = false;
++    atomic_set(&uc->emulation_done, false);
+     uc->size_recur_mem = 0;
+     uc->timed_out = false;
+     uc->first_tb = true;
+@@ -1187,7 +1187,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+ #endif
+     }
+     uc->skip_sync_pc_on_exit = false;
+-    uc->stop_request = false;
++    uc_set_stop_request(uc, false);
+ 
+     uc->emu_count = count;
+     // remove count hook if counting isn't necessary
+@@ -1232,7 +1232,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+     // emulation is done if and only if we exit the outer uc_emu_start
+     // or we may lost uc_emu_stop
+     if (uc->nested_level == 0) {
+-        uc->emulation_done = true;
++        atomic_set(&uc->emulation_done, true);
+ 
+         // remove hooks to delete
+         // make sure we delete all hooks at the first level.
+@@ -1256,11 +1256,8 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+ UNICORN_EXPORT
+ uc_err uc_emu_stop(uc_engine *uc)
+ {
+-    UC_INIT(uc);
+-    uc->stop_request = true;
+-    uc_err err = break_translation_loop(uc);
+-    restore_jit_state(uc);
+-    return err;
++    uc_set_stop_request(uc, true);
++    return break_translation_loop(uc);
+ }
+ 
+ // return target index where a memory region at the address exists, or could be
+@@ -2071,7 +2068,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
+ {
+     struct uc_struct *uc = handle;
+ 
+-    if (unlikely(uc->stop_request)) {
++    if (unlikely(uc_stop_requested(uc))) {
+         return;
+     }
+ 
+@@ -2089,7 +2086,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
+     JIT_CALLBACK_GUARD(((uc_hook_tcg_op_2)hook->callback)(
+         uc, address, arg1, arg2, size, hook->user_data));
+ 
+-    if (unlikely(uc->stop_request)) {
++    if (unlikely(uc_stop_requested(uc))) {
+         return;
+     }
+ }
+@@ -2121,9 +2118,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
+     // }
+ 
+     // the last callback may already asked to stop emulation
+-    if (uc->stop_request && !not_allow_stop) {
++    if (uc_stop_requested(uc) && !not_allow_stop) {
+         return;
+-    } else if (not_allow_stop && uc->stop_request) {
++    } else if (not_allow_stop && uc_stop_requested(uc)) {
+         revert_uc_emu_stop(uc);
+     }
+ 
+@@ -2156,9 +2153,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
+         //   normally. No check_exit_request is generated and the hooks are
+         //   triggered normally. In other words, the whole IT block is treated
+         //   as a single instruction.
+-        if (not_allow_stop && uc->stop_request) {
++        if (not_allow_stop && uc_stop_requested(uc)) {
+             revert_uc_emu_stop(uc);
+-        } else if (!not_allow_stop && uc->stop_request) {
++        } else if (!not_allow_stop && uc_stop_requested(uc)) {
+             break;
+         }
+     }
+diff --git a/tests/regress/threaded_emu_stop.c b/tests/regress/threaded_emu_stop.c
+new file mode 100644
+index 0000000..e4cc03f
+--- /dev/null
++++ b/tests/regress/threaded_emu_stop.c
+@@ -0,0 +1,145 @@
++/* Test cross-thread uc_emu_stop() without racing the emulation thread state. */
++
++#define _POSIX_C_SOURCE 200809L
++
++#include <pthread.h>
++#include <sched.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <unicorn/unicorn.h>
++
++#define ADDRESS 0x100000
++#define ITERATIONS 100
++#define TIMEOUT_SECONDS 5
++
++struct test_state
++{
++    uc_engine *uc;
++    atomic_uint entered;
++    atomic_uint released;
++    atomic_uint finished;
++    uc_err result;
++};
++
++static bool wait_for_value(atomic_uint *value, unsigned int expected)
++{
++    struct timespec start, now;
++
++    clock_gettime(CLOCK_MONOTONIC, &start);
++    do
++    {
++        /* Keep this coordination relaxed: an acquire/release pair would hide
++         * unrelated engine-state races from ThreadSanitizer. */
++        if (atomic_load_explicit(value, memory_order_relaxed) >= expected)
++            return true;
++        sched_yield();
++        clock_gettime(CLOCK_MONOTONIC, &now);
++    } while (now.tv_sec - start.tv_sec < TIMEOUT_SECONDS);
++    return false;
++}
++
++static void code_hook(uc_engine *uc, uint64_t address, uint32_t size,
++                      void *user_data)
++{
++    struct test_state *state = user_data;
++    unsigned int generation;
++
++    (void)uc;
++    (void)address;
++    (void)size;
++
++    generation = atomic_fetch_add_explicit(&state->entered, 1,
++                                           memory_order_relaxed) + 1;
++    while (atomic_load_explicit(&state->released, memory_order_relaxed) <
++           generation)
++        sched_yield();
++}
++
++static void *emulation_thread(void *arg)
++{
++    struct test_state *state = arg;
++
++    state->result = uc_emu_start(state->uc, ADDRESS, UINT64_MAX, 0, 0);
++    atomic_fetch_add_explicit(&state->finished, 1, memory_order_relaxed);
++    return NULL;
++}
++
++int main(void)
++{
++    static const unsigned char code[] = {0xeb, 0xfe}; /* jmp $ */
++    struct test_state state = {0};
++    pthread_t thread;
++    uc_hook hook;
++    uc_err err;
++    unsigned int i;
++    int ret;
++
++    alarm(TIMEOUT_SECONDS * 3);
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_32, &state.uc)))
++    {
++        fprintf(stderr, "open failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++
++    /* Stopping must not initialize an otherwise idle engine. */
++    if ((err = uc_emu_stop(state.uc)) ||
++        (err = uc_mem_map(state.uc, ADDRESS, 0x1000, UC_PROT_ALL)) ||
++        (err = uc_mem_write(state.uc, ADDRESS, code, sizeof(code))) ||
++        (err = uc_hook_add(state.uc, &hook, UC_HOOK_CODE, code_hook, &state,
++                           ADDRESS, ADDRESS + sizeof(code) - 1)))
++    {
++        fprintf(stderr, "setup failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++
++    /* A stop made after initialization must not prevent the next start. */
++    if ((err = uc_emu_stop(state.uc)))
++    {
++        fprintf(stderr, "idle stop failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++
++    for (i = 1; i <= ITERATIONS; i++)
++    {
++        if ((ret = pthread_create(&thread, NULL, emulation_thread, &state)))
++        {
++            fprintf(stderr, "pthread_create failed: %d\n", ret);
++            return 1;
++        }
++        if (!wait_for_value(&state.entered, i))
++        {
++            fputs("emulation did not enter\n", stderr);
++            return 1;
++        }
++
++        /* The emulation owner is inside the hook while this runs. */
++        if ((err = uc_emu_stop(state.uc)))
++        {
++            fprintf(stderr, "cross-thread stop failed: %s\n", uc_strerror(err));
++            return 1;
++        }
++
++        atomic_store_explicit(&state.released, i, memory_order_relaxed);
++        if (!wait_for_value(&state.finished, i))
++        {
++            fputs("emulation did not stop\n", stderr);
++            return 1;
++        }
++        pthread_join(thread, NULL);
++        if (state.result != UC_ERR_OK)
++        {
++            fprintf(stderr, "emulation failed: %s\n", uc_strerror(state.result));
++            return 1;
++        }
++    }
++
++    uc_close(state.uc);
++    alarm(0);
++    puts("cross-thread stop passed");
++    return 0;
++}

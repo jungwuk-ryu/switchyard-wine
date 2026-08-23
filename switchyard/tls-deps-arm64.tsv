@@ -1,0 +1,12 @@
+# Redistributable arm64 macOS TLS runtime packages from conda-forge.
+# Channel: https://conda.anaconda.org/conda-forge/osx-arm64
+# Fields: name, version, build, filename, sha256
+gmp	6.3.0	h7bae524_2	gmp-6.3.0-h7bae524_2.conda	76e222e072d61c840f64a44e0580c2503562b009090f55aa45053bf1ccb385dd
+gnutls	3.8.13	hfe86254_0	gnutls-3.8.13-hfe86254_0.conda	d36222db9e35788af78b6f41f66dc702d20b18375a9059c81ee074ea4c63d72a
+libffi	3.5.2	hcf2aa1b_0	libffi-3.5.2-hcf2aa1b_0.conda	6686a26466a527585e6a75cc2a242bf4a3d97d6d6c86424a441677917f28bec7
+libiconv	1.18	h23cfdf5_2	libiconv-1.18-h23cfdf5_2.conda	de0336e800b2af9a40bdd694b03870ac4a848161b35c8a2325704f123f185f03
+libidn2	2.3.8	ha90df94_1	libidn2-2.3.8-ha90df94_1.conda	6d9d2db2c8a645f63073553e9497ea266507c940de42800f2f0faddbf00149cd
+libintl	0.25.1	h493aca8_0	libintl-0.25.1-h493aca8_0.conda	99d2cebcd8f84961b86784451b010f5f0a795ed1c08f1e7c76fbb3c22abf021a
+libtasn1	4.21.0	h84a0fba_0	libtasn1-4.21.0-h84a0fba_0.conda	0593a03d869f3452ced058ca428ceeeff089f8556bb8609226c505362b72369b
+nettle	3.10.1	h2435c67_0	nettle-3.10.1-h2435c67_0.conda	83079cfea1512921327cdc8d7950ffaa6e6b7ca1d48bcacd5a5537852da088bb
+p11-kit	0.26.4	h4613bd8_0	p11-kit-0.26.4-h4613bd8_0.conda	927ba155350e9668e6661c196bd5076c699d787900b5751d52a753919f2ccbd0
