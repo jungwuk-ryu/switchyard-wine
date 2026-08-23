@@ -114,29 +114,19 @@ static NTSTATUS init_unixlib(void)
     return __wine_init_unix_call();
 }
 
-static BOOLEAN set_syscall_callback_state( BOOLEAN state )
-{
-    CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
-    BOOLEAN old = FALSE;
-
-    if (!cpu) return FALSE;
-    old = cpu->InSyscallCallback;
-    cpu->InSyscallCallback = state;
-    return old;
-}
+static NTSTATUS synchronize_transition_state_mapping( struct xtajit64_thread_state *state,
+                                                       BOOL *provider_touched );
+static NTSTATUS unregister_transition_state_mapping( struct xtajit64_thread_state *state );
 
 static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
 {
     struct xtajit64_thread_state *state;
-    BOOLEAN old_callback_state;
     SIZE_T size = XTAJIT64_CONTROL_STACK_SIZE;
     void *allocation = NULL;
     NTSTATUS status;
 
-    old_callback_state = set_syscall_callback_state( FALSE );
     status = NtAllocateVirtualMemory( GetCurrentProcess(), &allocation, 0, &size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
-    set_syscall_callback_state( old_callback_state );
     if (status) return status;
     if (size < sizeof(*state) + 0x10000 ||
         (ULONG_PTR)allocation > ~(ULONG_PTR)0 - size)
@@ -144,9 +134,7 @@ static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
         void *free_base = allocation;
         SIZE_T free_size = 0;
 
-        old_callback_state = set_syscall_callback_state( FALSE );
         NtFreeVirtualMemory( GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
-        set_syscall_callback_state( old_callback_state );
         return STATUS_NO_MEMORY;
     }
 
@@ -159,15 +147,12 @@ static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
     return STATUS_SUCCESS;
 }
 
-static void free_transition_state( struct xtajit64_thread_state *state )
+static NTSTATUS free_transition_state( struct xtajit64_thread_state *state )
 {
-    BOOLEAN old_callback_state;
     void *free_base = state;
     SIZE_T free_size = 0;
 
-    old_callback_state = set_syscall_callback_state( FALSE );
-    NtFreeVirtualMemory( GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
-    set_syscall_callback_state( old_callback_state );
+    return NtFreeVirtualMemory( GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
 }
 
 static void *resolve_arm64ec_export( HMODULE module, const char *name )
@@ -334,12 +319,49 @@ static NTSTATUS describe_host_mapping( ULONG_PTR host, SIZE_T size,
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS synchronize_transition_state_mapping( struct xtajit64_thread_state *state,
+                                                       BOOL *provider_touched )
+{
+    struct xtajit64_memory_params params;
+    ULONG_PTR allocation_base;
+    NTSTATUS status;
+
+    if (!provider_touched) return STATUS_INVALID_PARAMETER;
+    *provider_touched = FALSE;
+    if (!state || !state->allocation_size ||
+        (ULONG_PTR)state > ~(ULONG_PTR)0 - state->allocation_size)
+        return STATUS_INVALID_ADDRESS;
+    if ((status = get_allocation_base( state, &allocation_base ))) return status;
+    if ((status = describe_host_mapping( (ULONG_PTR)state, state->allocation_size,
+                                          allocation_base, PAGE_READWRITE, &params )))
+        return status;
+    *provider_touched = TRUE;
+    return XTAJIT64_CALL( memory_map, &params );
+}
+
+static NTSTATUS unregister_transition_state_mapping( struct xtajit64_thread_state *state )
+{
+    struct xtajit64_memory_params params;
+
+    if (!state || !state->allocation_size ||
+        (ULONG_PTR)state > ~(ULONG_PTR)0 - state->allocation_size)
+        return STATUS_INVALID_ADDRESS;
+    memset( &params, 0, sizeof(params) );
+    params.guest = (ULONG_PTR)state;
+    params.host = (ULONG_PTR)state;
+    params.size = state->allocation_size;
+    return XTAJIT64_CALL( memory_unmap, &params );
+}
+
 struct mapping_snapshot
 {
     struct xtajit64_memory_params *ranges;
     ULONG count;
     ULONG capacity;
 };
+
+static RTL_SRWLOCK resync_snapshot_lock = RTL_SRWLOCK_INIT;
+static struct mapping_snapshot resync_snapshot;
 
 static void free_mapping_snapshot( struct mapping_snapshot *snapshot )
 {
@@ -455,7 +477,7 @@ static NTSTATUS resync_existing_mappings(void)
 {
     struct xtajit64_memory_resync_params params = {0};
     struct xtajit64_memory_resync_begin_params begin;
-    struct mapping_snapshot snapshot = {0};
+    struct mapping_snapshot *snapshot = &resync_snapshot;
     SYSTEM_BASIC_INFORMATION info;
     NTSTATUS status;
     ULONG attempt;
@@ -466,6 +488,11 @@ static NTSTATUS resync_existing_mappings(void)
         info.PageSize > XTAJIT64_MAX_HOST_PAGE_SIZE ||
         (info.PageSize & (info.PageSize - 1)))
         return STATUS_INVALID_PARAMETER;
+    /* Keep the bounded snapshot allocation for reuse.  Allocating and freeing
+     * it inside every authoritative pass changes the very address space being
+     * scanned and can prevent the outer generation retry from converging. */
+    RtlAcquireSRWLockExclusive( &resync_snapshot_lock );
+    snapshot->count = 0;
     for (attempt = 0; attempt < XTAJIT64_MAX_RESYNC_ATTEMPTS; ++attempt)
     {
         /* A concurrent map/protect/unmap after this token makes the commit
@@ -473,22 +500,23 @@ static NTSTATUS resync_existing_mappings(void)
         if ((status = XTAJIT64_CALL( memory_resync_begin, &begin ))) break;
         status = collect_existing_mappings( (ULONG_PTR)info.LowestUserAddress,
                                             (ULONG_PTR)info.HighestUserAddress,
-                                            info.PageSize, &snapshot );
+                                            info.PageSize, snapshot );
         if (status) break;
-        params.ranges = (ULONG_PTR)snapshot.ranges;
+        params.ranges = (ULONG_PTR)snapshot->ranges;
         params.generation = begin.generation;
-        params.count = snapshot.count;
+        params.count = snapshot->count;
         status = XTAJIT64_CALL( memory_resync, &params );
         if (!status)
         {
             TRACE( "resynchronized %lu committed x64/native mapping runs through %p\n",
-                   snapshot.count, info.HighestUserAddress );
+                   snapshot->count, info.HighestUserAddress );
             break;
         }
-        snapshot.count = 0;
+        snapshot->count = 0;
         if (status != STATUS_RETRY) break;
     }
-    free_mapping_snapshot( &snapshot );
+    snapshot->count = 0;
+    RtlReleaseSRWLockExclusive( &resync_snapshot_lock );
     return status;
 }
 
@@ -1542,7 +1570,8 @@ NTSTATUS WINAPI ThreadInit(void)
 #ifdef HAVE_UNICORN
     CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
     struct xtajit64_thread_state *state;
-    NTSTATUS status;
+    NTSTATUS cleanup_status, status;
+    BOOL provider_touched;
 
     if (!cpu || !cpu->ContextAmd64) return STATUS_INVALID_PARAMETER;
     if ((state = cpu->EmulatorData[0]))
@@ -1553,15 +1582,21 @@ NTSTATUS WINAPI ThreadInit(void)
         poison_provider( "thread mapping synchronization", status );
         return status;
     }
-    /* This private control stack is created while ntdll is calling us from an
-     * ARM64EC syscall callback.  Publish it through the ordinary VM
-     * notification path before opening the per-thread engine; otherwise the
-     * nested allocation is deferred as a process-wide authoritative resync and
-     * every worker thread pays an O(process mappings) startup cost. */
     if ((status = allocate_transition_state( &state ))) return status;
+    /* Publish this known uniform allocation directly while ntdll defers its
+     * nested VM notification.  Ntdll acknowledges the exact single mutation;
+     * any additional or concurrent mutation retains the full-resync fallback. */
+    if ((status = synchronize_transition_state_mapping( state, &provider_touched )))
+    {
+        if (!provider_touched) free_transition_state( state );
+        else poison_provider( "transition-state synchronization", status );
+        return status;
+    }
     if ((status = XTAJIT64_CALL( thread_init, NULL )))
     {
-        free_transition_state( state );
+        cleanup_status = unregister_transition_state_mapping( state );
+        if (!cleanup_status) cleanup_status = free_transition_state( state );
+        if (cleanup_status) poison_provider( "transition-state cleanup", cleanup_status );
         return status;
     }
 
@@ -1584,6 +1619,7 @@ void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
     ULONG_PTR native_stack_allocation = 0, emulator_stack_allocation = 0;
     ULONG_PTR teb_limit = 0, teb_base = 0;
     UINT64 teb_allocation = 0;
+    NTSTATUS status;
 #endif
 
     TRACE( "%p %lx\n", handle, exit_code );
@@ -1603,16 +1639,29 @@ void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
     if (emulator_stack_allocation != native_stack_allocation)
         unregister_thread_stack_allocation( emulator_stack_allocation );
     if (!cpu || !(state = get_thread_state())) return;
-    cpu->EmulatorData[0] = NULL;
-    state->magic = 0;
-    if ((ULONG_PTR)&state >= (ULONG_PTR)state &&
+    if ((status = unregister_transition_state_mapping( state )))
+    {
+        poison_provider( "transition-state unregister", status );
+        return;
+    }
+    if (state->allocation_size <= ~(ULONG_PTR)0 - (ULONG_PTR)state &&
+        (ULONG_PTR)&state >= (ULONG_PTR)state &&
         (ULONG_PTR)&state < (ULONG_PTR)state + state->allocation_size)
     {
+        cpu->EmulatorData[0] = NULL;
+        state->magic = 0;
         ERR( "cannot release x64 transition state while running on its control stack\n" );
     }
     else
     {
-        free_transition_state( state );
+        cpu->EmulatorData[0] = NULL;
+        state->magic = 0;
+        if ((status = free_transition_state( state )))
+        {
+            state->magic = XTAJIT64_THREAD_STATE_MAGIC;
+            cpu->EmulatorData[0] = state;
+            poison_provider( "transition-state release", status );
+        }
     }
 #endif
 }

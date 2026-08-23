@@ -3765,13 +3765,90 @@ static void test_translated_view_information(void)
 }
 
 #ifdef __arm64ec__
+enum resync_hook_mode
+{
+    RESYNC_HOOK_RETURN,
+    RESYNC_HOOK_BLOCK_FIRST,
+    RESYNC_HOOK_MUTATE,
+    RESYNC_HOOK_MUTATE_ALWAYS,
+};
+
+static LONG resync_hook_calls;
+static LONG resync_hook_callback_state;
+static volatile LONG resync_hook_mode;
+static volatile NTSTATUS resync_hook_status;
+static volatile NTSTATUS resync_hook_mutation_status;
+static HANDLE resync_hook_entered_event;
+static HANDLE resync_hook_release_event;
+static void *resync_hook_mutation_addr;
+
+static NTSTATUS WINAPI resync_test_hook(void)
+{
+    CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    LONG call = InterlockedIncrement( &resync_hook_calls );
+
+    if (cpu && cpu->InSyscallCallback)
+        InterlockedIncrement( &resync_hook_callback_state );
+    if (resync_hook_mode == RESYNC_HOOK_BLOCK_FIRST && call == 1)
+    {
+        SetEvent( resync_hook_entered_event );
+        if (WaitForSingleObject( resync_hook_release_event, 10000 ))
+            resync_hook_mutation_status = STATUS_TIMEOUT;
+    }
+    else if ((resync_hook_mode == RESYNC_HOOK_MUTATE && call == 1) ||
+             resync_hook_mode == RESYNC_HOOK_MUTATE_ALWAYS)
+    {
+        SIZE_T size = 0x1000;
+        void *addr = NULL;
+        NTSTATUS status;
+
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+        if (!status && resync_hook_mode == RESYNC_HOOK_MUTATE) resync_hook_mutation_addr = addr;
+        else if (!status)
+        {
+            size = 0;
+            status = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+        }
+        if (status) resync_hook_mutation_status = status;
+    }
+    return resync_hook_status;
+}
+
+struct resync_gate_thread_params
+{
+    NTSTATUS (WINAPI *prepare)(void);
+    HANDLE ready_event;
+    HANDLE start_event;
+};
+
+static DWORD CALLBACK resync_gate_thread( void *arg )
+{
+    struct resync_gate_thread_params *params = arg;
+
+    SetEvent( params->ready_event );
+    if (WaitForSingleObject( params->start_event, 10000 )) return STATUS_TIMEOUT;
+    return params->prepare();
+}
+
 static void test_x64_execution_gate(void)
 {
     NTSTATUS (WINAPI *prepare_x64_execution)(void);
     NTSTATUS (WINAPI *get_x64_syscall_dispatcher)(ULONG_PTR *, ULONG *);
+    struct resync_gate_thread_params thread_params;
+    void *hook, *failure_addr, *reset_addr;
+    void *addr = NULL, *addr_ex = NULL, *map = NULL, *map_ex = NULL;
+    HANDLE thread = NULL, section = NULL;
     HMODULE ntdll = GetModuleHandleA( "ntdll.dll" );
+    HMODULE module = GetModuleHandleA( "xtajit64.dll" );
+    LARGE_INTEGER section_size, offset;
+    DWORD wait, exit_code;
+    BOOL ret;
+    SIZE_T size;
+    ULONG old_protect;
     ULONG_PTR dispatcher = 0;
     ULONG count = 0;
+    NTSTATUS failure_status[8];
     NTSTATUS status;
 
     prepare_x64_execution = pRtlFindExportedRoutineByName(
@@ -3786,6 +3863,465 @@ static void test_x64_execution_gate(void)
     ok( !status, "identity x64 execution preparation returned %#lx\n", status );
     status = prepare_x64_execution();
     ok( !status, "repeated identity x64 execution preparation returned %#lx\n", status );
+
+    *(void **)&hook_code[2] = resync_test_hook;
+    if (module && (hook = hook_notification_function( module,
+                       "ResyncIdentityMemoryMappingsStatus",
+                       "ResyncIdentityMemoryMappingsStatus" )))
+    {
+        resync_hook_mode = RESYNC_HOOK_RETURN;
+        resync_hook_status = STATUS_SUCCESS;
+        resync_hook_mutation_status = STATUS_SUCCESS;
+        resync_hook_calls = resync_hook_callback_state = 0;
+
+        size = 0x1000;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+        if (!status)
+            status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                             PAGE_READONLY, &old_protect );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "coalesced nested allocation/protection failed %#lx\n", status );
+        status = prepare_x64_execution();
+        ok( !status, "coalesced nested mutation resync failed %#lx\n", status );
+        ok( resync_hook_calls == 1, "coalesced nested mutations caused %ld resyncs\n",
+            resync_hook_calls );
+        status = prepare_x64_execution();
+        ok( !status, "clean execution gate failed %#lx\n", status );
+        ok( resync_hook_calls == 1, "clean execution gate caused %ld resyncs\n", resync_hook_calls );
+
+        size = 0x1000;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                         PAGE_READWRITE, &old_protect );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "nested protection failed %#lx\n", status );
+        status = prepare_x64_execution();
+        ok( !status, "nested protection resync failed %#lx\n", status );
+        ok( resync_hook_calls == 2, "nested protection caused %ld total resyncs\n",
+            resync_hook_calls );
+
+        size = 0x1000;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &addr_ex, &size,
+                                            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
+                                            NULL, 0 );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "nested extended allocation failed %#lx\n", status );
+        status = prepare_x64_execution();
+        ok( !status, "nested extended allocation resync failed %#lx\n", status );
+        ok( resync_hook_calls == 3, "nested extended allocation caused %ld total resyncs\n",
+            resync_hook_calls );
+
+        section_size.QuadPart = 0x10000;
+        status = NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &section_size,
+                                  PAGE_READWRITE, SEC_COMMIT, 0 );
+        ok( !status, "NtCreateSection failed %#lx\n", status );
+        if (!status)
+        {
+            size = 0;
+            offset.QuadPart = 0;
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+            status = NtMapViewOfSection( section, NtCurrentProcess(), &map, 0, 0,
+                                         &offset, &size, ViewShare, 0, PAGE_READWRITE );
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+            ok( !status, "nested map failed %#lx\n", status );
+            status = prepare_x64_execution();
+            ok( !status, "nested map resync failed %#lx\n", status );
+            ok( resync_hook_calls == 4, "nested map caused %ld total resyncs\n",
+                resync_hook_calls );
+
+            size = 0;
+            offset.QuadPart = 0;
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+            status = NtMapViewOfSectionEx( section, NtCurrentProcess(), &map_ex, &offset,
+                                           &size, 0, PAGE_READWRITE, NULL, 0 );
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+            ok( !status, "nested extended map failed %#lx\n", status );
+            status = prepare_x64_execution();
+            ok( !status, "nested extended map resync failed %#lx\n", status );
+            ok( resync_hook_calls == 5, "nested extended map caused %ld total resyncs\n",
+                resync_hook_calls );
+
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+            status = NtUnmapViewOfSection( NtCurrentProcess(), map );
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+            ok( !status, "nested unmap failed %#lx\n", status );
+            if (!status) map = NULL;
+            status = prepare_x64_execution();
+            ok( !status, "nested unmap resync failed %#lx\n", status );
+            ok( resync_hook_calls == 6, "nested unmap caused %ld total resyncs\n",
+                resync_hook_calls );
+
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+            status = NtUnmapViewOfSectionEx( NtCurrentProcess(), map_ex, 0 );
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+            ok( !status, "nested extended unmap failed %#lx\n", status );
+            if (!status) map_ex = NULL;
+            status = prepare_x64_execution();
+            ok( !status, "nested extended unmap resync failed %#lx\n", status );
+            ok( resync_hook_calls == 7, "nested extended unmap caused %ld total resyncs\n",
+                resync_hook_calls );
+        }
+
+        size = 0;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &addr_ex, &size, MEM_RELEASE );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "nested extended allocation free failed %#lx\n", status );
+        if (!status) addr_ex = NULL;
+        status = prepare_x64_execution();
+        ok( !status, "nested extended allocation free resync failed %#lx\n", status );
+        ok( resync_hook_calls == 8, "nested extended allocation free caused %ld total resyncs\n",
+            resync_hook_calls );
+
+        resync_hook_status = STATUS_NO_MEMORY;
+        size = 0x1000;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                         PAGE_READWRITE, &old_protect );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "nested failure-propagation protection failed %#lx\n", status );
+        status = prepare_x64_execution();
+        ok( status == STATUS_NO_MEMORY, "failed resync returned %#lx\n", status );
+        ok( resync_hook_calls == 9, "failed resync caused %ld total calls\n", resync_hook_calls );
+        resync_hook_status = STATUS_SUCCESS;
+        status = prepare_x64_execution();
+        ok( !status, "pending resync retry failed %#lx\n", status );
+        ok( resync_hook_calls == 10, "pending resync retry caused %ld total calls\n",
+            resync_hook_calls );
+
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+
+        failure_addr = NULL;
+        size = 0;
+        failure_status[0] = NtAllocateVirtualMemory( NtCurrentProcess(), &failure_addr,
+                                                     0, &size, MEM_RESERVE, PAGE_READWRITE );
+
+        failure_addr = NULL;
+        size = 0;
+        failure_status[1] = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &failure_addr,
+                                                       &size, MEM_RESERVE, PAGE_READWRITE,
+                                                       NULL, 0 );
+
+        failure_addr = (void *)0x1234;
+        size = 0;
+        failure_status[2] = NtFreeVirtualMemory( NtCurrentProcess(), &failure_addr,
+                                                 &size, MEM_RELEASE );
+
+        failure_addr = (void *)0x1234;
+        size = 0x1000;
+        failure_status[3] = NtProtectVirtualMemory( NtCurrentProcess(), &failure_addr,
+                                                    &size, PAGE_READONLY, &old_protect );
+
+        failure_addr = NULL;
+        size = 0;
+        offset.QuadPart = 0;
+        failure_status[4] = NtMapViewOfSection( (HANDLE)0xdead, NtCurrentProcess(),
+                                                &failure_addr, 0, 0, &offset, &size,
+                                                ViewShare, 0, PAGE_READWRITE );
+
+        failure_addr = NULL;
+        size = 0;
+        offset.QuadPart = 0;
+        failure_status[5] = NtMapViewOfSectionEx( (HANDLE)0xdead, NtCurrentProcess(),
+                                                  &failure_addr, &offset, &size, 0,
+                                                  PAGE_READWRITE, NULL, 0 );
+
+        failure_status[6] = NtUnmapViewOfSection( NtCurrentProcess(), (void *)0x1234 );
+        failure_status[7] = NtUnmapViewOfSectionEx( NtCurrentProcess(), (void *)0x1234, 0 );
+
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !NT_SUCCESS(failure_status[0]), "zero-size allocation returned %#lx\n",
+            failure_status[0] );
+        ok( !NT_SUCCESS(failure_status[1]), "zero-size extended allocation returned %#lx\n",
+            failure_status[1] );
+        ok( !NT_SUCCESS(failure_status[2]), "invalid free returned %#lx\n", failure_status[2] );
+        ok( !NT_SUCCESS(failure_status[3]), "invalid protection returned %#lx\n",
+            failure_status[3] );
+        ok( !NT_SUCCESS(failure_status[4]), "invalid map returned %#lx\n", failure_status[4] );
+        ok( !NT_SUCCESS(failure_status[5]), "invalid extended map returned %#lx\n",
+            failure_status[5] );
+        ok( !NT_SUCCESS(failure_status[6]), "invalid unmap returned %#lx\n",
+            failure_status[6] );
+        ok( !NT_SUCCESS(failure_status[7]), "invalid extended unmap returned %#lx\n",
+            failure_status[7] );
+        status = prepare_x64_execution();
+        ok( !status, "gate after failed mutations returned %#lx\n", status );
+        ok( resync_hook_calls == 10, "failed mutations caused %ld total resyncs\n",
+            resync_hook_calls );
+
+        resync_hook_mode = RESYNC_HOOK_MUTATE_ALWAYS;
+        resync_hook_calls = resync_hook_callback_state = 0;
+        resync_hook_mutation_status = STATUS_SUCCESS;
+        size = 0x1000;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                         PAGE_READONLY, &old_protect );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "bounded-retry protection failed %#lx\n", status );
+        status = prepare_x64_execution();
+        ok( status == STATUS_RETRY, "bounded resync exhaustion returned %#lx\n", status );
+        ok( resync_hook_calls == 8, "bounded resync exhaustion made %ld calls\n",
+            resync_hook_calls );
+        ok( !resync_hook_mutation_status, "bounded resync mutation failed %#lx\n",
+            resync_hook_mutation_status );
+        resync_hook_mode = RESYNC_HOOK_RETURN;
+        status = prepare_x64_execution();
+        ok( !status, "bounded resync retry failed %#lx\n", status );
+        ok( resync_hook_calls == 9, "bounded resync retry made %ld calls\n",
+            resync_hook_calls );
+
+        resync_hook_mode = RESYNC_HOOK_MUTATE;
+        resync_hook_calls = resync_hook_callback_state = 0;
+        resync_hook_mutation_status = STATUS_SUCCESS;
+        resync_hook_mutation_addr = NULL;
+        size = 0x1000;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                         PAGE_READONLY, &old_protect );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "nested reentrant-resync protection failed %#lx\n", status );
+        status = prepare_x64_execution();
+        ok( !status, "self-mutating resync returned %#lx\n", status );
+        ok( resync_hook_calls == 2, "self-mutating resync made %ld calls\n", resync_hook_calls );
+        ok( resync_hook_callback_state == resync_hook_calls,
+            "%ld/%ld resync hooks observed callback state\n",
+            resync_hook_callback_state, resync_hook_calls );
+        ok( !resync_hook_mutation_status, "hook mutation failed %#lx\n",
+            resync_hook_mutation_status );
+        ok( !!resync_hook_mutation_addr, "hook mutation did not retain allocation %p\n",
+            resync_hook_mutation_addr );
+        resync_hook_mode = RESYNC_HOOK_RETURN;
+        if (resync_hook_mutation_addr)
+        {
+            failure_addr = resync_hook_mutation_addr;
+            size = 0;
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+            status = NtFreeVirtualMemory( NtCurrentProcess(), &failure_addr, &size,
+                                          MEM_RELEASE );
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+            ok( !status, "nested hook allocation cleanup failed %#lx\n", status );
+            if (!status) resync_hook_mutation_addr = NULL;
+            status = prepare_x64_execution();
+            ok( !status, "hook allocation cleanup resync failed %#lx\n", status );
+            ok( resync_hook_calls == 3, "hook allocation cleanup made %ld resync calls\n",
+                resync_hook_calls );
+        }
+
+        resync_hook_entered_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+        resync_hook_release_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+        thread_params.ready_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+        thread_params.start_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+        thread_params.prepare = prepare_x64_execution;
+        ok( !!resync_hook_entered_event && !!resync_hook_release_event &&
+            !!thread_params.ready_event && !!thread_params.start_event,
+            "failed to create resync gate events, error %lu\n", GetLastError() );
+        if (resync_hook_entered_event && resync_hook_release_event &&
+            thread_params.ready_event && thread_params.start_event)
+            thread = CreateThread( NULL, 0, resync_gate_thread, &thread_params, 0, NULL );
+        ok( !!thread, "CreateThread failed %lu\n", GetLastError() );
+        if (thread)
+        {
+            wait = WaitForSingleObject( thread_params.ready_event, 10000 );
+            ok( !wait, "gate thread did not become ready, wait %lu\n", wait );
+            status = prepare_x64_execution();
+            ok( !status, "gate thread setup resync failed %#lx\n", status );
+            resync_hook_calls = resync_hook_callback_state = 0;
+            resync_hook_mutation_status = STATUS_SUCCESS;
+            resync_hook_mode = RESYNC_HOOK_BLOCK_FIRST;
+            ResetEvent( resync_hook_entered_event );
+            ResetEvent( resync_hook_release_event );
+            size = 0x1000;
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+            status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                             PAGE_READWRITE, &old_protect );
+            NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+            ok( !status, "nested concurrent protection failed %#lx\n", status );
+            SetEvent( thread_params.start_event );
+            wait = WaitForSingleObject( resync_hook_entered_event, 10000 );
+            ok( !wait, "resync hook did not block, wait %lu\n", wait );
+            if (!wait)
+            {
+                size = 0x1000;
+                NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+                status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                                 PAGE_READONLY, &old_protect );
+                NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+                ok( !status, "mutation during resync failed %#lx\n", status );
+            }
+            SetEvent( resync_hook_release_event );
+            wait = WaitForSingleObject( thread, 10000 );
+            ok( !wait, "gate thread wait returned %lu\n", wait );
+            GetExitCodeThread( thread, &exit_code );
+            ok( !exit_code, "gate thread returned %#lx\n", exit_code );
+            ok( resync_hook_calls == 2, "concurrent mutation caused %ld resync calls\n",
+                resync_hook_calls );
+            ok( resync_hook_callback_state == resync_hook_calls,
+                "%ld/%ld concurrent hooks observed callback state\n",
+                resync_hook_callback_state, resync_hook_calls );
+            ok( !resync_hook_mutation_status, "blocking resync hook failed %#lx\n",
+                resync_hook_mutation_status );
+        }
+        resync_hook_mode = RESYNC_HOOK_RETURN;
+
+        if (addr)
+        {
+            resync_hook_calls = resync_hook_callback_state = 0;
+            reset_addr = addr;
+            size = 0x1000;
+            status = NtAllocateVirtualMemory( NtCurrentProcess(), &reset_addr, 0, &size,
+                                              MEM_RESET, PAGE_READONLY );
+            ok( !status, "ordinary MEM_RESET failed %#lx\n", status );
+            ok( resync_hook_calls == 1, "ordinary MEM_RESET caused %ld resyncs\n",
+                resync_hook_calls );
+            status = prepare_x64_execution();
+            ok( !status, "clean gate after MEM_RESET failed %#lx\n", status );
+            ok( resync_hook_calls == 1, "clean gate after MEM_RESET caused %ld resyncs\n",
+                resync_hook_calls );
+        }
+
+        if (section)
+        {
+            resync_hook_calls = resync_hook_callback_state = 0;
+            size = 0;
+            offset.QuadPart = 0;
+            status = NtMapViewOfSection( section, NtCurrentProcess(), &map, 0, 0,
+                                         &offset, &size, ViewShare, 0, PAGE_READWRITE );
+            ok( !status, "ordinary map failed %#lx\n", status );
+            ok( resync_hook_calls == 1, "ordinary map caused %ld resyncs\n",
+                resync_hook_calls );
+            status = prepare_x64_execution();
+            ok( !status, "clean gate after ordinary map failed %#lx\n", status );
+            ok( resync_hook_calls == 1, "clean gate after ordinary map caused %ld resyncs\n",
+                resync_hook_calls );
+            if (map)
+            {
+                NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+                status = NtUnmapViewOfSection( NtCurrentProcess(), map );
+                NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+                ok( !status, "ordinary map cleanup failed %#lx\n", status );
+                if (!status) map = NULL;
+                status = prepare_x64_execution();
+                ok( !status, "ordinary map cleanup resync failed %#lx\n", status );
+            }
+
+            resync_hook_calls = resync_hook_callback_state = 0;
+            size = 0;
+            offset.QuadPart = 0;
+            status = NtMapViewOfSectionEx( section, NtCurrentProcess(), &map_ex, &offset,
+                                           &size, 0, PAGE_READWRITE, NULL, 0 );
+            ok( !status, "ordinary extended map failed %#lx\n", status );
+            ok( resync_hook_calls == 1, "ordinary extended map caused %ld resyncs\n",
+                resync_hook_calls );
+            status = prepare_x64_execution();
+            ok( !status, "clean gate after ordinary extended map failed %#lx\n", status );
+            ok( resync_hook_calls == 1,
+                "clean gate after ordinary extended map caused %ld resyncs\n",
+                resync_hook_calls );
+            if (map_ex)
+            {
+                NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+                status = NtUnmapViewOfSectionEx( NtCurrentProcess(), map_ex, 0 );
+                NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+                ok( !status, "ordinary extended map cleanup failed %#lx\n", status );
+                if (!status) map_ex = NULL;
+                status = prepare_x64_execution();
+                ok( !status, "ordinary extended map cleanup resync failed %#lx\n", status );
+            }
+        }
+
+        size = 0;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "nested allocation cleanup failed %#lx\n", status );
+        if (!status) addr = NULL;
+        status = prepare_x64_execution();
+        ok( !status, "cleanup resync failed %#lx\n", status );
+
+        ret = WriteProcessMemory( GetCurrentProcess(), hook, old_code, sizeof(old_code), NULL );
+        ok( ret, "restoring resync hook failed, error %lu\n", GetLastError() );
+        size = 0x1000;
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+        if (!status)
+        {
+            size = 0;
+            status = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+        }
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "authoritative resync trigger failed %#lx\n", status );
+        status = prepare_x64_execution();
+        ok( !status, "authoritative provider resync failed %#lx\n", status );
+
+        if (thread) CloseHandle( thread );
+        if (thread_params.ready_event) CloseHandle( thread_params.ready_event );
+        if (thread_params.start_event) CloseHandle( thread_params.start_event );
+        if (resync_hook_entered_event) CloseHandle( resync_hook_entered_event );
+        if (resync_hook_release_event) CloseHandle( resync_hook_release_event );
+        if (map) NtUnmapViewOfSection( NtCurrentProcess(), map );
+        if (map_ex) NtUnmapViewOfSection( NtCurrentProcess(), map_ex );
+        if (addr_ex)
+        {
+            size = 0;
+            NtFreeVirtualMemory( NtCurrentProcess(), &addr_ex, &size, MEM_RELEASE );
+        }
+        if (addr)
+        {
+            size = 0;
+            NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+        }
+        if (resync_hook_mutation_addr)
+        {
+            size = 0;
+            NtFreeVirtualMemory( NtCurrentProcess(), &resync_hook_mutation_addr,
+                                 &size, MEM_RELEASE );
+        }
+        if (section) NtClose( section );
+    }
+
+    *(void **)&hook_code[2] = resync_test_hook;
+    if (module && (hook = hook_notification_function( module,
+                       "ResyncIdentityMemoryMappingsStatus",
+                       "ResyncIdentityMemoryMappingsStatus" )))
+    {
+        resync_hook_mode = RESYNC_HOOK_RETURN;
+        resync_hook_status = STATUS_SUCCESS;
+        resync_hook_calls = resync_hook_callback_state = 0;
+
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtFlushInstructionCache( NtCurrentProcess(), hook, 0x10 );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !status, "nested instruction-cache flush failed %#lx\n", status );
+
+        status = prepare_x64_execution();
+        ok( !status, "deferred cache flush failed %#lx\n", status );
+        ok( resync_hook_calls == 1, "deferred cache flush made %ld resync calls\n",
+            resync_hook_calls );
+        ok( resync_hook_callback_state == resync_hook_calls,
+            "%ld/%ld cache resync hooks observed callback state\n",
+            resync_hook_callback_state, resync_hook_calls );
+
+        status = prepare_x64_execution();
+        ok( !status, "clean cache gate failed %#lx\n", status );
+        ok( resync_hook_calls == 1, "clean cache gate made %ld resync calls\n",
+            resync_hook_calls );
+
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback++;
+        status = NtFlushInstructionCache( NtCurrentProcess(), (void *)1, 1 );
+        NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback--;
+        ok( !NT_SUCCESS(status), "invalid nested cache flush returned %#lx\n", status );
+        status = prepare_x64_execution();
+        ok( !status, "gate after failed cache flush returned %#lx\n", status );
+        ok( resync_hook_calls == 1, "failed cache flush made %ld resync calls\n",
+            resync_hook_calls );
+
+        ret = WriteProcessMemory( NtCurrentProcess(), hook, old_code, sizeof(old_code), NULL );
+        ok( ret, "restoring cache resync hook failed, error %lu\n", GetLastError() );
+    }
 
     status = get_x64_syscall_dispatcher( NULL, &count );
     ok( status == STATUS_INVALID_PARAMETER, "NULL dispatcher returned %#lx\n", status );
