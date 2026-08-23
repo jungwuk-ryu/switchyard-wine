@@ -174,17 +174,20 @@ static BOOL send_cross_process_notification( HANDLE process, UINT id, const void
 
 static void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METADATA *metadata )
 {
-    const IMAGE_ARM64EC_REDIRECTION_ENTRY *map = get_rva( module, metadata->RedirectionMetadata );
-    int min = 0, max = metadata->RedirectionMetadataCount - 1;
+    const char *map = get_rva( module, metadata->RedirectionMetadata );
+    ULONG min = 0, max = metadata->RedirectionMetadataCount;
     ULONG_PTR rva = (ULONG_PTR)ptr - (ULONG_PTR)module;
 
     if (!ptr) return NULL;
-    while (min <= max)
+    while (min < max)
     {
-        int pos = (min + max) / 2;
-        if (map[pos].Source == rva) return get_rva( module, map[pos].Destination );
-        if (map[pos].Source < rva) min = pos + 1;
-        else max = pos - 1;
+        IMAGE_ARM64EC_REDIRECTION_ENTRY entry;
+        ULONG pos = min + (max - min) / 2;
+
+        memcpy( &entry, map + pos * sizeof(entry), sizeof(entry) );
+        if (entry.Source == rva) return get_rva( module, entry.Destination );
+        if (entry.Source < rva) min = pos + 1;
+        else max = pos;
     }
     return ptr;
 }
@@ -266,28 +269,38 @@ NTSTATUS arm64ec_thread_init(void)
  */
 IMAGE_ARM64EC_METADATA *arm64ec_get_module_metadata( HMODULE module )
 {
-    IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
-    ULONG size;
+    char *cfg;
+    ULONGLONG metadata;
+    ULONG declared_size, size;
 
     if (!(cfg = RtlImageDirectoryEntryToData( module, TRUE,
                                               IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &size )))
         return NULL;
 
-    size = min( size, cfg->Size );
-    if (size <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer )) return NULL;
-    return (IMAGE_ARM64EC_METADATA *)cfg->CHPEMetadataPointer;
+    if (size < sizeof(declared_size)) return NULL;
+    memcpy( &declared_size, cfg, sizeof(declared_size) );
+    size = min( size, declared_size );
+    if (size < offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) +
+               sizeof(metadata)) return NULL;
+    memcpy( &metadata, cfg + offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ),
+            sizeof(metadata) );
+    return (IMAGE_ARM64EC_METADATA *)(ULONG_PTR)metadata;
 }
 
 
 static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec, UINT rva, void *ptr )
 {
+    SIZE_T offset;
+
     if (!rva) return;
 
-    if (rva < sec->VirtualAddress || rva >= sec->VirtualAddress + sec->Misc.VirtualSize)
+    if (rva < sec->VirtualAddress ||
+        (offset = rva - sec->VirtualAddress) > sec->Misc.VirtualSize ||
+        sizeof(void *) > sec->Misc.VirtualSize - offset)
         ERR( "rva %x outside of section %s (%lx-%lx)\n", rva,
              sec->Name, sec->VirtualAddress, sec->VirtualAddress + sec->Misc.VirtualSize );
     else
-        *(void **)get_rva( module, rva ) = ptr;
+        memcpy( get_rva( module, rva ), &ptr, sizeof(ptr) );
 }
 
 /*******************************************************************
@@ -296,6 +309,7 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
 void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
                                      const IMAGE_ARM64EC_METADATA *metadata )
 {
+    NTSTATUS status;
     DWORD i, protect_old;
     const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
 
@@ -303,13 +317,19 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
 
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
     {
-        if ((sec->VirtualAddress <= metadata->__os_arm64x_dispatch_call) &&
-            (sec->VirtualAddress + sec->Misc.VirtualSize > metadata->__os_arm64x_dispatch_call))
+        if (metadata->__os_arm64x_dispatch_call >= sec->VirtualAddress &&
+            metadata->__os_arm64x_dispatch_call - sec->VirtualAddress < sec->Misc.VirtualSize)
         {
             void *base = get_rva( module, sec->VirtualAddress );
             SIZE_T size = sec->Misc.VirtualSize;
 
-            NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, PAGE_READWRITE, &protect_old );
+            status = NtProtectVirtualMemory( NtCurrentProcess(), &base, &size,
+                                             PAGE_READWRITE, &protect_old );
+            if (status)
+            {
+                ERR( "failed to make hybrid metadata writable, status %08lx\n", status );
+                return;
+            }
 
 #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
             SET_FUNC( __os_arm64x_dispatch_call, arm64x_check_call );
@@ -328,7 +348,10 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
             SET_FUNC( SetX64InformationFunctionPointer, __os_arm64x_set_x64_information );
 #undef SET_FUNC
 
-            NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, protect_old, &protect_old );
+            status = NtProtectVirtualMemory( NtCurrentProcess(), &base, &size,
+                                             protect_old, &protect_old );
+            if (status)
+                ERR( "failed to restore hybrid metadata protection, status %08lx\n", status );
             return;
         }
     }

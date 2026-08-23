@@ -4804,6 +4804,128 @@ static void *get_host_addr_space_limit(void)
 
 #endif /* _WIN64 */
 
+#if defined(__aarch64__) || defined(__APPLE__)
+
+#define IMPORT_STRING_CACHE_MIN_LENGTH 64
+
+struct import_string_interval
+{
+    struct rb_entry entry;
+    SIZE_T start;
+    SIZE_T end;
+};
+
+struct import_string_cache
+{
+    struct rb_tree tree;
+};
+
+
+static int compare_import_string_interval( const void *key, const struct rb_entry *entry )
+{
+    const struct import_string_interval *interval =
+        RB_ENTRY_VALUE( entry, struct import_string_interval, entry );
+    SIZE_T start = *(const SIZE_T *)key;
+
+    if (start < interval->start) return -1;
+    if (start > interval->start) return 1;
+    return 0;
+}
+
+
+static struct import_string_interval *find_import_string_interval(
+    const struct import_string_cache *cache, SIZE_T start,
+    struct import_string_interval **next )
+{
+    struct rb_entry *entry = cache->tree.root;
+
+    *next = NULL;
+    while (entry)
+    {
+        struct import_string_interval *interval =
+            RB_ENTRY_VALUE( entry, struct import_string_interval, entry );
+
+        if (start < interval->start)
+        {
+            *next = interval;
+            entry = entry->left;
+        }
+        else if (start >= interval->end) entry = entry->right;
+        else return interval;
+    }
+    return NULL;
+}
+
+
+static NTSTATUS add_import_string_interval( struct import_string_cache *cache,
+                                            SIZE_T start, SIZE_T end )
+{
+    struct import_string_interval *interval, *next, *previous = NULL;
+    struct rb_entry *entry;
+
+    /* Bound interval-node memory by caching only strings whose rescans could be expensive. */
+    if (end <= start || end - start < IMPORT_STRING_CACHE_MIN_LENGTH) return STATUS_SUCCESS;
+    if (find_import_string_interval( cache, start, &next )) return STATUS_SUCCESS;
+    if (next) entry = rb_prev( &next->entry );
+    else entry = rb_tail( cache->tree.root );
+    if (entry) previous = RB_ENTRY_VALUE( entry, struct import_string_interval, entry );
+
+    if (previous && previous->end >= start)
+    {
+        interval = previous;
+        if (interval->end < end) interval->end = end;
+    }
+    else
+    {
+        if (!(interval = malloc( sizeof(*interval) ))) return STATUS_NO_MEMORY;
+        interval->start = start;
+        interval->end = end;
+        if (rb_put( &cache->tree, &interval->start, &interval->entry ) < 0)
+        {
+            free( interval );
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+    }
+
+    entry = rb_next( &interval->entry );
+    while (entry)
+    {
+        struct rb_entry *following = rb_next( entry );
+        struct import_string_interval *following_interval =
+            RB_ENTRY_VALUE( entry, struct import_string_interval, entry );
+
+        if (following_interval->start > interval->end) break;
+        if (interval->end < following_interval->end)
+            interval->end = following_interval->end;
+        rb_remove( &cache->tree, entry );
+        free( following_interval );
+        entry = following;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static void free_import_string_interval( struct rb_entry *entry, void *context )
+{
+    (void)context;
+    free( RB_ENTRY_VALUE( entry, struct import_string_interval, entry ) );
+}
+
+
+static void init_import_string_cache( struct import_string_cache *cache )
+{
+    rb_init( &cache->tree, compare_import_string_interval );
+}
+
+
+static void free_import_string_cache( struct import_string_cache *cache )
+{
+    rb_destroy( &cache->tree, free_import_string_interval, NULL );
+}
+
+#endif
+
+
 #ifdef __aarch64__
 
 /***********************************************************************
@@ -4828,69 +4950,1512 @@ static void alloc_arm64ec_map(void)
 /***********************************************************************
  *           update_arm64ec_ranges
  */
-static void update_arm64ec_ranges( struct file_view *view, IMAGE_NT_HEADERS *nt,
-                                   const IMAGE_DATA_DIRECTORY *dir, UINT *entry_point )
+#define IMAGE_RVA_RANGE_FITS(rva, size) \
+    (!(size) || (SIZE_T)(size) - 1 <= ~(ULONG)0 - (ULONG)(rva))
+
+C_ASSERT( IMAGE_RVA_RANGE_FITS( 0xfffffffc, 4 ) );
+C_ASSERT( !IMAGE_RVA_RANGE_FITS( 0xfffffffc, 8 ) );
+
+static BOOL image_rva_range_valid( SIZE_T total_size, ULONG rva, SIZE_T size )
 {
-    const IMAGE_ARM64EC_METADATA *metadata;
-    const IMAGE_CHPE_RANGE_ENTRY *map;
-    char *base = view->base;
-    const IMAGE_LOAD_CONFIG_DIRECTORY *cfg = (void *)(base + dir->VirtualAddress);
-    ULONG i, size = min( dir->Size, cfg->Size );
+    if (rva > total_size || size > total_size - rva) return FALSE;
+    /* Every byte address must remain representable by the 32-bit PE RVA type. */
+    return IMAGE_RVA_RANGE_FITS( rva, size );
+}
+#undef IMAGE_RVA_RANGE_FITS
 
-    if (size <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer )) return;
-    if (!cfg->CHPEMetadataPointer) return;
-    if (!arm64ec_view) alloc_arm64ec_map();
-    commit_arm64ec_map( view );
-    metadata = (void *)(base + (cfg->CHPEMetadataPointer - nt->OptionalHeader.ImageBase));
-    *entry_point = redirect_arm64ec_rva( base, nt->OptionalHeader.AddressOfEntryPoint, metadata );
-    if (!metadata->CodeMap) return;
-    map = (void *)(base + metadata->CodeMap);
 
-    for (i = 0; i < metadata->CodeMapCount; i++)
+static BOOL image_rva_array_valid( SIZE_T total_size, ULONG rva, ULONG count,
+                                   SIZE_T element_size )
+{
+    if (!count) return TRUE;
+    if (!rva || !element_size || rva > total_size) return FALSE;
+    if (count > (total_size - rva) / element_size) return FALSE;
+    return (SIZE_T)(count - 1) <= (~(ULONG)0 - rva) / element_size;
+}
+
+
+static BOOL image_rva_offset_valid( SIZE_T total_size, ULONG rva, SIZE_T offset,
+                                    SIZE_T size, ULONG *result )
+{
+    if (offset > ~(ULONG)0 - rva) return FALSE;
+    *result = rva + (ULONG)offset;
+    return image_rva_range_valid( total_size, *result, size );
+}
+
+
+struct arm64x_patch_chunk
+{
+    ULONG rva;
+    BYTE value[8];
+    BYTE mask;
+};
+
+struct arm64x_fixup_transaction
+{
+    struct arm64x_patch_chunk *chunks;
+    SIZE_T count;
+};
+
+struct arm64x_shared_range
+{
+    SIZE_T start;
+    SIZE_T end;
+};
+
+struct arm64ec_mapping
+{
+    IMAGE_ARM64EC_METADATA metadata;
+    UINT entry_point;
+    BOOL present;
+};
+
+
+static struct arm64x_patch_chunk *find_arm64x_chunk(
+    const struct arm64x_fixup_transaction *transaction, ULONG rva )
+{
+    SIZE_T low = 0, high = transaction->count;
+
+    rva &= ~7u;
+    while (low < high)
     {
-        if ((map[i].StartOffset & 0x3) != 1 /* arm64ec */) continue;
-        set_arm64ec_range( base + (map[i].StartOffset & ~3), map[i].Length );
+        SIZE_T pos = low + (high - low) / 2;
+
+        if (transaction->chunks[pos].rva == rva) return transaction->chunks + pos;
+        if (transaction->chunks[pos].rva < rva) low = pos + 1;
+        else high = pos;
+    }
+    return NULL;
+}
+
+
+static void read_arm64x_image( const char *base, const struct arm64x_fixup_transaction *transaction,
+                               ULONG rva, void *buffer, SIZE_T size )
+{
+    BYTE *dst = buffer;
+    SIZE_T end = rva + size, current, byte;
+
+    memcpy( dst, base + rva, size );
+    if (!transaction || !transaction->count) return;
+
+    for (current = rva & ~7u; current < end; current += 8)
+    {
+        const struct arm64x_patch_chunk *chunk = find_arm64x_chunk( transaction, current );
+
+        if (!chunk) continue;
+        for (byte = 0; byte < 8; byte++)
+        {
+            SIZE_T address = chunk->rva + byte;
+
+            if (!(chunk->mask & (1u << byte)) || address < rva || address >= end) continue;
+            dst[address - rva] = chunk->value[byte];
+        }
     }
 }
 
 
-/***********************************************************************
- *           apply_arm64x_relocations
- */
-static void apply_arm64x_relocations( char *base, const IMAGE_BASE_RELOCATION *reloc, size_t size )
+static NTSTATUS write_arm64x_image( struct arm64x_fixup_transaction *transaction, ULONG rva,
+                                    const void *buffer, SIZE_T size )
 {
-    const IMAGE_BASE_RELOCATION *reloc_end = (const IMAGE_BASE_RELOCATION *)((const char *)reloc + size);
+    const BYTE *src = buffer;
+    SIZE_T i;
 
-    while (reloc < reloc_end - 1 && reloc->SizeOfBlock)
+    for (i = 0; i < size; i++)
     {
-        const USHORT *rel = (const USHORT *)(reloc + 1);
-        const USHORT *rel_end = (const USHORT *)reloc + reloc->SizeOfBlock / sizeof(USHORT);
-        char *page = base + reloc->VirtualAddress;
+        struct arm64x_patch_chunk *chunk = find_arm64x_chunk( transaction, rva + i );
+        BYTE bit = 1u << ((rva + i) & 7);
 
-        while (rel < rel_end && *rel)
+        if (!chunk) return STATUS_INVALID_IMAGE_FORMAT;
+        chunk->mask |= bit;
+        chunk->value[(rva + i) & 7] = src[i];
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static void apply_arm64x_transaction( char *base, struct arm64x_fixup_transaction *transaction )
+{
+    SIZE_T i, byte;
+
+    for (i = 0; i < transaction->count; i++)
+    {
+        const struct arm64x_patch_chunk *chunk = transaction->chunks + i;
+
+        for (byte = 0; byte < 8; byte++)
+            if (chunk->mask & (1u << byte)) base[chunk->rva + byte] = chunk->value[byte];
+    }
+}
+
+
+static void free_arm64x_transaction( struct arm64x_fixup_transaction *transaction )
+{
+    free( transaction->chunks );
+    transaction->chunks = NULL;
+    transaction->count = 0;
+}
+
+
+static NTSTATUS get_transformed_nt_headers( const char *base, const IMAGE_NT_HEADERS *nt,
+                                            SIZE_T total_size,
+                                            const struct arm64x_fixup_transaction *transaction,
+                                            IMAGE_NT_HEADERS *transformed )
+{
+    SIZE_T rva = (const char *)nt - base;
+
+    if (rva > ~(ULONG)0 || !image_rva_range_valid( total_size, rva, sizeof(*transformed) ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    read_arm64x_image( base, transaction, rva, transformed, sizeof(*transformed) );
+
+    if (transformed->Signature != nt->Signature ||
+        transformed->FileHeader.NumberOfSections != nt->FileHeader.NumberOfSections ||
+        transformed->FileHeader.SizeOfOptionalHeader != nt->FileHeader.SizeOfOptionalHeader ||
+        transformed->OptionalHeader.Magic != nt->OptionalHeader.Magic ||
+        transformed->OptionalHeader.SizeOfImage != nt->OptionalHeader.SizeOfImage ||
+        transformed->OptionalHeader.SizeOfHeaders != nt->OptionalHeader.SizeOfHeaders ||
+        transformed->OptionalHeader.SectionAlignment != nt->OptionalHeader.SectionAlignment ||
+        transformed->OptionalHeader.FileAlignment != nt->OptionalHeader.FileAlignment ||
+        transformed->OptionalHeader.ImageBase != nt->OptionalHeader.ImageBase)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if (transformed->OptionalHeader.AddressOfEntryPoint &&
+        !image_rva_range_valid( total_size,
+                                transformed->OptionalHeader.AddressOfEntryPoint, 1 ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS get_transformed_data_dir( const IMAGE_NT_HEADERS *nt, SIZE_T total_size,
+                                          ULONG index, IMAGE_DATA_DIRECTORY *dir, BOOL *present )
+{
+    *present = FALSE;
+    if (index >= nt->OptionalHeader.NumberOfRvaAndSizes) return STATUS_SUCCESS;
+    *dir = nt->OptionalHeader.DataDirectory[index];
+    if (!dir->Size || !dir->VirtualAddress) return STATUS_SUCCESS;
+    if (!image_rva_range_valid( total_size, dir->VirtualAddress, dir->Size ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    *present = TRUE;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS validate_transformed_sections( const char *base, const IMAGE_NT_HEADERS *nt,
+                                               const IMAGE_SECTION_HEADER *sections,
+                                               SIZE_T total_size,
+                                               const struct arm64x_fixup_transaction *transaction )
+{
+    const IMAGE_SECTION_HEADER *image_sections = IMAGE_FIRST_SECTION( nt );
+    IMAGE_SECTION_HEADER transformed;
+    SIZE_T rva = (const char *)image_sections - base;
+    ULONG i;
+
+    if (rva > total_size ||
+        nt->FileHeader.NumberOfSections > (total_size - rva) / sizeof(transformed))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        read_arm64x_image( base, transaction, rva + i * sizeof(transformed),
+                           &transformed, sizeof(transformed) );
+        if (memcmp( &transformed, sections + i, sizeof(transformed) ))
+            return STATUS_INVALID_IMAGE_FORMAT;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static BOOL get_arm64x_shared_section_range( const IMAGE_SECTION_HEADER *section,
+                                             SIZE_T align_mask, SIZE_T *start, SIZE_T *end )
+{
+    SIZE_T map_size;
+
+    if ((section->Characteristics & (IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE)) !=
+        (IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE))
+        return FALSE;
+    if (section->Misc.VirtualSize)
+        map_size = ROUND_SIZE( 0, section->Misc.VirtualSize, align_mask );
+    else
+        map_size = ROUND_SIZE( 0, section->SizeOfRawData, align_mask );
+    if (!map_size) return FALSE;
+    *start = section->VirtualAddress & ~host_page_mask;
+    *end = (section->VirtualAddress + map_size + host_page_mask) & ~host_page_mask;
+    return TRUE;
+}
+
+
+static int compare_arm64x_shared_ranges( const void *left, const void *right )
+{
+    const struct arm64x_shared_range *a = left, *b = right;
+
+    if (a->start < b->start) return -1;
+    if (a->start > b->start) return 1;
+    if (a->end < b->end) return -1;
+    if (a->end > b->end) return 1;
+    return 0;
+}
+
+
+static NTSTATUS get_arm64x_shared_ranges( const IMAGE_SECTION_HEADER *sections,
+                                          ULONG section_count, SIZE_T align_mask,
+                                          struct arm64x_shared_range **ranges,
+                                          SIZE_T *range_count )
+{
+    SIZE_T count = 0, i;
+
+    *ranges = NULL;
+    *range_count = 0;
+    if (!section_count) return STATUS_SUCCESS;
+    if (!(*ranges = malloc( section_count * sizeof(**ranges) ))) return STATUS_NO_MEMORY;
+
+    for (i = 0; i < section_count; i++)
+    {
+        SIZE_T start, end;
+
+        if (!get_arm64x_shared_section_range( sections + i, align_mask, &start, &end ))
+            continue;
+        (*ranges)[count].start = start;
+        (*ranges)[count++].end = end;
+    }
+    qsort( *ranges, count, sizeof(**ranges), compare_arm64x_shared_ranges );
+    for (i = 1; i < count; i++)
+    {
+        if ((*ranges)[*range_count].end >= (*ranges)[i].start)
         {
-            USHORT offset = *rel & 0xfff;
-            USHORT type = (*rel >> 12) & 3;
-            USHORT arg = *rel >> 14;
-            int val;
-            rel++;
+            if ((*ranges)[*range_count].end < (*ranges)[i].end)
+                (*ranges)[*range_count].end = (*ranges)[i].end;
+        }
+        else (*ranges)[++*range_count] = (*ranges)[i];
+    }
+    if (count) ++*range_count;
+    return STATUS_SUCCESS;
+}
+
+
+static BOOL arm64x_page_overlaps_shared_range( SIZE_T page,
+                                               const struct arm64x_shared_range *ranges,
+                                               SIZE_T range_count )
+{
+    SIZE_T low = 0, high = range_count;
+
+    while (low < high)
+    {
+        SIZE_T pos = low + (high - low) / 2;
+
+        if (page < ranges[pos].start) high = pos;
+        else if (page >= ranges[pos].end) low = pos + 1;
+        else return TRUE;
+    }
+    return FALSE;
+}
+
+
+static BOOL arm64x_transaction_contains_page(
+    const struct arm64x_fixup_transaction *transaction, SIZE_T page )
+{
+    SIZE_T low = 0, high = transaction->count;
+
+    while (low < high)
+    {
+        SIZE_T pos = low + (high - low) / 2;
+
+        if (transaction->chunks[pos].rva < page) low = pos + 1;
+        else high = pos;
+    }
+    while (low < transaction->count &&
+           (transaction->chunks[low].rva & ~host_page_mask) == page)
+    {
+        if (transaction->chunks[low].mask) return TRUE;
+        low++;
+    }
+    return FALSE;
+}
+
+
+static NTSTATUS append_arm64x_range( struct arm64x_shared_range **ranges,
+                                     SIZE_T *count, SIZE_T *capacity,
+                                     SIZE_T start, SIZE_T end )
+{
+    struct arm64x_shared_range *new_ranges;
+    SIZE_T new_capacity;
+
+    if (start == end) return STATUS_SUCCESS;
+    if (*count == *capacity)
+    {
+        new_capacity = *capacity ? *capacity * 2 : 8;
+        if (new_capacity < *capacity ||
+            new_capacity > ~(SIZE_T)0 / sizeof(**ranges))
+            return STATUS_NO_MEMORY;
+        if (!(new_ranges = realloc( *ranges, new_capacity * sizeof(**ranges) )))
+            return STATUS_NO_MEMORY;
+        *ranges = new_ranges;
+        *capacity = new_capacity;
+    }
+    (*ranges)[*count].start = start;
+    (*ranges)[(*count)++].end = end;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS privatize_arm64x_image_range(
+    struct file_view *view, SIZE_T start, SIZE_T size,
+    const struct arm64x_shared_range *ranges, SIZE_T range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot );
+static NTSTATUS privatize_arm64x_c_string(
+    struct file_view *view, const struct arm64x_fixup_transaction *transaction,
+    struct import_string_cache *cache, ULONG rva, SIZE_T prefix_size,
+    const struct arm64x_shared_range *ranges, SIZE_T range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot );
+
+
+static NTSTATUS get_arm64x_import_ranges(
+    struct file_view *view, const struct arm64x_fixup_transaction *transaction,
+    SIZE_T total_size, const IMAGE_DATA_DIRECTORY *imports, SIZE_T thunk_size,
+    const struct arm64x_shared_range *shared_ranges, SIZE_T shared_range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot,
+    struct import_string_cache *string_cache,
+    struct arm64x_shared_range **ranges, SIZE_T *range_count )
+{
+    IMAGE_IMPORT_DESCRIPTOR descriptor;
+    SIZE_T capacity = 0, count = 0, offset = 0;
+    NTSTATUS status = STATUS_INVALID_IMAGE_FORMAT;
+    BOOL terminated = FALSE;
+    char *base = view->base;
+
+    while (imports->Size - offset >= sizeof(descriptor))
+    {
+        ULONG lookup_rva, thunk_rva;
+        SIZE_T thunk_offset = 0;
+        ULONGLONG thunk;
+
+        if ((status = privatize_arm64x_image_range(
+                 view, imports->VirtualAddress + offset, sizeof(descriptor), shared_ranges,
+                 shared_range_count, private_pages, private_page_count, snapshot )))
+            goto done;
+        read_arm64x_image( base, transaction, imports->VirtualAddress + offset,
+                           &descriptor, sizeof(descriptor) );
+        offset += sizeof(descriptor);
+        if (!descriptor.Name || !descriptor.FirstThunk)
+        {
+            terminated = TRUE;
+            break;
+        }
+        if ((status = privatize_arm64x_c_string(
+                 view, transaction, string_cache, descriptor.Name, 0, shared_ranges,
+                 shared_range_count, private_pages, private_page_count, snapshot )))
+            goto done;
+
+        lookup_rva = descriptor.OriginalFirstThunk ?
+                     descriptor.OriginalFirstThunk : descriptor.FirstThunk;
+        for (;;)
+        {
+            if (!image_rva_offset_valid( total_size, lookup_rva, thunk_offset,
+                                         thunk_size, &thunk_rva ))
+            {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                goto done;
+            }
+            if ((status = privatize_arm64x_image_range(
+                     view, thunk_rva, thunk_size, shared_ranges, shared_range_count,
+                     private_pages, private_page_count, snapshot )))
+                goto done;
+            thunk = 0;
+            read_arm64x_image( base, transaction, thunk_rva, &thunk, thunk_size );
+            if (!thunk) break;
+            if (!(thunk & (thunk_size == sizeof(IMAGE_THUNK_DATA32) ?
+                           IMAGE_ORDINAL_FLAG32 : IMAGE_ORDINAL_FLAG64)))
+            {
+                if (thunk > ~(ULONG)0)
+                {
+                    status = STATUS_INVALID_IMAGE_FORMAT;
+                    goto done;
+                }
+                if ((status = privatize_arm64x_c_string(
+                         view, transaction, string_cache, thunk,
+                         offsetof(IMAGE_IMPORT_BY_NAME, Name), shared_ranges,
+                         shared_range_count, private_pages, private_page_count, snapshot )))
+                    goto done;
+            }
+            if (!image_rva_offset_valid( total_size, descriptor.FirstThunk, thunk_offset,
+                                         thunk_size, &thunk_rva ))
+            {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                goto done;
+            }
+            if ((status = privatize_arm64x_image_range(
+                     view, thunk_rva, thunk_size, shared_ranges, shared_range_count,
+                     private_pages, private_page_count, snapshot )))
+                goto done;
+            thunk_offset += thunk_size;
+        }
+        if (thunk_offset)
+        {
+            SIZE_T start = descriptor.FirstThunk & ~host_page_mask;
+            SIZE_T end = (descriptor.FirstThunk + thunk_offset + host_page_mask) &
+                         ~host_page_mask;
+
+            if ((status = append_arm64x_range( ranges, &count, &capacity, start, end )))
+                goto done;
+        }
+    }
+    if (!terminated)
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+    if ((status = append_arm64x_range(
+             ranges, &count, &capacity,
+             imports->VirtualAddress & ~host_page_mask,
+             (imports->VirtualAddress + offset + host_page_mask) & ~host_page_mask )))
+        goto done;
+
+    qsort( *ranges, count, sizeof(**ranges), compare_arm64x_shared_ranges );
+    *range_count = 0;
+    for (offset = 1; offset < count; offset++)
+    {
+        if ((*ranges)[*range_count].end >= (*ranges)[offset].start)
+        {
+            if ((*ranges)[*range_count].end < (*ranges)[offset].end)
+                (*ranges)[*range_count].end = (*ranges)[offset].end;
+        }
+        else (*ranges)[++*range_count] = (*ranges)[offset];
+    }
+    if (count) ++*range_count;
+    return STATUS_SUCCESS;
+
+done:
+    free( *ranges );
+    *ranges = NULL;
+    *range_count = 0;
+    return status;
+}
+
+
+static NTSTATUS privatize_arm64x_page( struct file_view *view, SIZE_T page,
+                                       const struct arm64x_shared_range *ranges,
+                                       SIZE_T range_count, void **snapshot )
+{
+    char *base = view->base;
+
+    if (!arm64x_page_overlaps_shared_range( page, ranges, range_count ))
+        return STATUS_SUCCESS;
+    if (!*snapshot && !(*snapshot = malloc( host_page_size )))
+        return STATUS_NO_MEMORY;
+    memcpy( *snapshot, base + page, host_page_size );
+    if (anon_mmap_fixed( base + page, host_page_size,
+                         PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+        return STATUS_NO_MEMORY;
+    memcpy( base + page, *snapshot, host_page_size );
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS privatize_arm64x_page_once(
+    struct file_view *view, SIZE_T page,
+    const struct arm64x_shared_range *ranges, SIZE_T range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot )
+{
+    SIZE_T page_index = page / host_page_size;
+    NTSTATUS status;
+
+    if (!arm64x_page_overlaps_shared_range( page, ranges, range_count ))
+        return STATUS_SUCCESS;
+    if (page_index >= private_page_count) return STATUS_INVALID_IMAGE_FORMAT;
+    if (private_pages[page_index / 8] & (1u << (page_index % 8)))
+        return STATUS_SUCCESS;
+    if ((status = privatize_arm64x_page( view, page, ranges, range_count, snapshot )))
+        return status;
+    private_pages[page_index / 8] |= 1u << (page_index % 8);
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS privatize_arm64x_image_range(
+    struct file_view *view, SIZE_T start, SIZE_T size,
+    const struct arm64x_shared_range *ranges, SIZE_T range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot )
+{
+    SIZE_T page, end;
+    NTSTATUS status;
+
+    if (start > view->size || size > view->size - start)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if (!size || !range_count) return STATUS_SUCCESS;
+    end = start + size;
+    for (page = start & ~host_page_mask; page < end; page += host_page_size)
+        if ((status = privatize_arm64x_page_once(
+                 view, page, ranges, range_count, private_pages,
+                 private_page_count, snapshot )))
+            return status;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS privatize_arm64x_c_string(
+    struct file_view *view, const struct arm64x_fixup_transaction *transaction,
+    struct import_string_cache *cache, ULONG rva, SIZE_T prefix_size,
+    const struct arm64x_shared_range *ranges, SIZE_T range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot )
+{
+    struct import_string_interval *interval, *next;
+    SIZE_T string_start, current, page_end, scan_size;
+    NTSTATUS status;
+    BYTE *terminator;
+
+    if (rva > view->size || prefix_size >= view->size - rva)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if ((status = privatize_arm64x_image_range(
+             view, rva, prefix_size + 1, ranges, range_count,
+             private_pages, private_page_count, snapshot )))
+        return status;
+    string_start = current = rva + prefix_size;
+    if ((interval = find_import_string_interval( cache, current, &next )))
+        return STATUS_SUCCESS;
+    while (current < view->size)
+    {
+        if (next && current >= next->start)
+            return add_import_string_interval( cache, string_start, next->end );
+        page_end = (current + host_page_size) & ~host_page_mask;
+        if (page_end > view->size || page_end < current) page_end = view->size;
+        if (next && next->start < page_end) page_end = next->start;
+        if ((status = privatize_arm64x_image_range(
+                 view, current, page_end - current, ranges, range_count,
+                 private_pages, private_page_count, snapshot )))
+            return status;
+        scan_size = page_end - current;
+        if (!*snapshot && !(*snapshot = malloc( host_page_size )))
+            return STATUS_NO_MEMORY;
+        read_arm64x_image( view->base, transaction, current, *snapshot, scan_size );
+        if ((terminator = memchr( *snapshot, 0, scan_size )))
+            return add_import_string_interval(
+                cache, string_start, current + (terminator - (BYTE *)*snapshot) + 1 );
+        current = page_end;
+    }
+    return STATUS_INVALID_IMAGE_FORMAT;
+}
+
+
+static NTSTATUS privatize_arm64x_pages( struct file_view *view,
+                                        const struct arm64x_fixup_transaction *transaction,
+                                        const IMAGE_SECTION_HEADER *sections, ULONG section_count,
+                                        SIZE_T align_mask,
+                                        const IMAGE_DATA_DIRECTORY *effective_import,
+                                        SIZE_T import_thunk_size,
+                                        const struct arm64ec_mapping *arm64ec_mapping )
+{
+    struct arm64x_shared_range *ranges, *import_ranges = NULL;
+    struct import_string_cache string_cache;
+    void *snapshot = NULL;
+    BYTE *private_pages = NULL;
+    SIZE_T slot_pages[28], slot_page_count = 0;
+    SIZE_T i, j, range_count, import_range_count = 0, last_page = ~(SIZE_T)0;
+    SIZE_T private_page_count;
+    NTSTATUS status;
+
+    init_import_string_cache( &string_cache );
+
+    for (i = 0; i < section_count; i++)
+        if ((sections[i].Characteristics & (IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE)) ==
+            (IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE))
+            break;
+    if (i == section_count) return STATUS_SUCCESS;
+    if ((status = get_arm64x_shared_ranges( sections, section_count, align_mask,
+                                             &ranges, &range_count )))
+        return status;
+    if (!range_count)
+    {
+        free( ranges );
+        return STATUS_SUCCESS;
+    }
+    if (view->size > ~(SIZE_T)0 - host_page_mask)
+    {
+        free( ranges );
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+    private_page_count = ROUND_SIZE( 0, view->size, host_page_mask ) / host_page_size;
+    if (!(private_pages = calloc( (private_page_count + 7) / 8, 1 )))
+    {
+        free( ranges );
+        return STATUS_NO_MEMORY;
+    }
+    if (effective_import)
+    {
+        if ((status = get_arm64x_import_ranges(
+                 view, transaction, view->size, effective_import, import_thunk_size,
+                 ranges, range_count, private_pages, private_page_count, &snapshot,
+                 &string_cache,
+                 &import_ranges, &import_range_count )))
+            goto done;
+    }
+    if (arm64ec_mapping && arm64ec_mapping->present)
+    {
+        const ULONG slots[] =
+        {
+            arm64ec_mapping->metadata.__os_arm64x_dispatch_call_no_redirect,
+            arm64ec_mapping->metadata.__os_arm64x_dispatch_ret,
+            arm64ec_mapping->metadata.__os_arm64x_dispatch_call,
+            arm64ec_mapping->metadata.__os_arm64x_dispatch_icall,
+            arm64ec_mapping->metadata.__os_arm64x_dispatch_icall_cfg,
+            arm64ec_mapping->metadata.GetX64InformationFunctionPointer,
+            arm64ec_mapping->metadata.SetX64InformationFunctionPointer,
+            arm64ec_mapping->metadata.__os_arm64x_dispatch_fptr,
+            arm64ec_mapping->metadata.__os_arm64x_helper3,
+            arm64ec_mapping->metadata.__os_arm64x_helper4,
+            arm64ec_mapping->metadata.__os_arm64x_helper5,
+            arm64ec_mapping->metadata.__os_arm64x_helper6,
+            arm64ec_mapping->metadata.__os_arm64x_helper7,
+            arm64ec_mapping->metadata.__os_arm64x_helper8,
+        };
+
+        for (i = 0; i < ARRAY_SIZE(slots); i++)
+        {
+            SIZE_T page, end;
+
+            if (!slots[i]) continue;
+            page = slots[i] & ~host_page_mask;
+            end = (slots[i] + sizeof(void *) + host_page_mask) & ~host_page_mask;
+            for (; page < end; page += host_page_size)
+            {
+                for (j = 0; j < slot_page_count; j++)
+                    if (slot_pages[j] == page) break;
+                if (j == slot_page_count) slot_pages[slot_page_count++] = page;
+            }
+        }
+    }
+    if (!transaction->count && !slot_page_count && !import_range_count)
+    {
+        status = STATUS_SUCCESS;
+        goto done;
+    }
+
+    for (i = 0; i < transaction->count; i++)
+    {
+        const struct arm64x_patch_chunk *chunk = transaction->chunks + i;
+        SIZE_T page, end;
+
+        if (!chunk->mask) continue;
+        page = chunk->rva & ~host_page_mask;
+        end = (chunk->rva + 8 + host_page_mask) & ~host_page_mask;
+
+        for (; page < end; page += host_page_size)
+        {
+            if (page == last_page) continue;
+            last_page = page;
+            if ((status = privatize_arm64x_page_once(
+                     view, page, ranges, range_count, private_pages,
+                     private_page_count, &snapshot )))
+                goto done;
+        }
+    }
+
+    for (i = 0; i < import_range_count; i++)
+    {
+        SIZE_T page;
+
+        for (page = import_ranges[i].start; page < import_ranges[i].end;
+             page += host_page_size)
+        {
+            if (arm64x_transaction_contains_page( transaction, page )) continue;
+            if ((status = privatize_arm64x_page_once(
+                     view, page, ranges, range_count, private_pages,
+                     private_page_count, &snapshot )))
+                goto done;
+        }
+    }
+
+    for (i = 0; i < slot_page_count; i++)
+    {
+        SIZE_T page = slot_pages[i];
+
+        if ((status = privatize_arm64x_page_once(
+                 view, page, ranges, range_count, private_pages,
+                 private_page_count, &snapshot )))
+            goto done;
+    }
+    status = STATUS_SUCCESS;
+
+done:
+    free_import_string_cache( &string_cache );
+    free( snapshot );
+    free( private_pages );
+    free( ranges );
+    free( import_ranges );
+    return status;
+}
+
+
+static NTSTATUS get_load_config_size( const char *base,
+                                      const struct arm64x_fixup_transaction *transaction,
+                                      const IMAGE_DATA_DIRECTORY *dir,
+                                      ULONG *declared_size )
+{
+    if (dir->Size < sizeof(*declared_size)) return STATUS_INVALID_IMAGE_FORMAT;
+    read_arm64x_image( base, transaction, dir->VirtualAddress, declared_size,
+                       sizeof(*declared_size) );
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS read_load_config_field( const char *base,
+                                        const struct arm64x_fixup_transaction *transaction,
+                                        const IMAGE_DATA_DIRECTORY *dir,
+                                        ULONG declared_size, SIZE_T offset, SIZE_T size,
+                                        void *value, BOOL *present )
+{
+    *present = FALSE;
+    if (declared_size <= offset) return STATUS_SUCCESS;
+    if (size > ~(SIZE_T)0 - offset || declared_size < offset + size || dir->Size < offset + size)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    read_arm64x_image( base, transaction, dir->VirtualAddress + offset, value, size );
+    *present = TRUE;
+    return STATUS_SUCCESS;
+}
+
+
+static BOOL arm64ec_optional_range_valid( SIZE_T total_size, ULONG rva, SIZE_T size )
+{
+    return !rva || image_rva_range_valid( total_size, rva, size );
+}
+
+
+struct arm64_unwind_info_ext
+{
+    WORD epilog_count;
+    BYTE code_words;
+    BYTE reserved;
+};
+
+
+static BOOL arm64ec_metadata_extents_valid( SIZE_T total_size,
+                                             const IMAGE_ARM64EC_METADATA *metadata )
+{
+    return image_rva_array_valid( total_size, metadata->CodeMap,
+                                  metadata->CodeMapCount,
+                                  sizeof(IMAGE_CHPE_RANGE_ENTRY) ) &&
+           image_rva_array_valid( total_size, metadata->CodeRangesToEntryPoints,
+                                  metadata->CodeRangesToEntryPointsCount,
+                                  sizeof(IMAGE_ARM64EC_CODE_RANGE_ENTRY_POINT) ) &&
+           image_rva_array_valid( total_size, metadata->RedirectionMetadata,
+                                  metadata->RedirectionMetadataCount,
+                                  sizeof(IMAGE_ARM64EC_REDIRECTION_ENTRY) ) &&
+           (!metadata->ExtraRFETableSize ||
+            (!(metadata->ExtraRFETable &
+               (TYPE_ALIGNMENT(ARM64_RUNTIME_FUNCTION) - 1)) &&
+             !(metadata->ExtraRFETableSize % sizeof(ARM64_RUNTIME_FUNCTION)) &&
+             image_rva_array_valid(
+                 total_size, metadata->ExtraRFETable,
+                 metadata->ExtraRFETableSize / sizeof(ARM64_RUNTIME_FUNCTION),
+                 sizeof(ARM64_RUNTIME_FUNCTION) )));
+}
+
+
+static NTSTATUS privatize_arm64ec_unwind_info(
+    struct file_view *view, const struct arm64x_fixup_transaction *transaction,
+    SIZE_T total_size, ULONG unwind_rva,
+    const struct arm64x_shared_range *ranges, SIZE_T range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot )
+{
+    IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY_XDATA xdata;
+    struct arm64_unwind_info_ext extended;
+    ULONG code_words, epilog_count, field_rva;
+    SIZE_T extent;
+    NTSTATUS status;
+
+    if (!image_rva_range_valid( total_size, unwind_rva, sizeof(xdata) ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if ((status = privatize_arm64x_image_range(
+             view, unwind_rva, sizeof(xdata), ranges, range_count,
+             private_pages, private_page_count, snapshot )))
+        return status;
+    read_arm64x_image( view->base, transaction, unwind_rva, &xdata, sizeof(xdata) );
+
+    extent = sizeof(xdata);
+    code_words = xdata.CodeWords;
+    epilog_count = xdata.EpilogCount;
+    if (!code_words && !epilog_count)
+    {
+        if (!image_rva_offset_valid( total_size, unwind_rva, extent,
+                                     sizeof(extended), &field_rva ))
+            return STATUS_INVALID_IMAGE_FORMAT;
+        if ((status = privatize_arm64x_image_range(
+                 view, field_rva, sizeof(extended), ranges, range_count,
+                 private_pages, private_page_count, snapshot )))
+            return status;
+        read_arm64x_image( view->base, transaction, field_rva, &extended,
+                           sizeof(extended) );
+        extent += sizeof(extended);
+        code_words = extended.code_words;
+        epilog_count = extended.epilog_count;
+    }
+    if (!xdata.EpilogInHeader) extent += (SIZE_T)epilog_count * sizeof(DWORD);
+    extent += (SIZE_T)code_words * sizeof(DWORD);
+    if (xdata.ExceptionDataPresent) extent += sizeof(ULONG);
+    if (!image_rva_range_valid( total_size, unwind_rva, extent ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    return privatize_arm64x_image_range( view, unwind_rva, extent, ranges, range_count,
+                                         private_pages, private_page_count, snapshot );
+}
+
+
+static NTSTATUS validate_arm64_unwind_info( const char *base,
+                                             const struct arm64x_fixup_transaction *transaction,
+                                             SIZE_T total_size, ULONG begin_rva, ULONG unwind_rva )
+{
+    IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY_XDATA xdata;
+    struct arm64_unwind_info_ext extended;
+    ULONG code_words, epilog_count, field_rva, handler_rva;
+    SIZE_T extent;
+
+    if (!image_rva_range_valid( total_size, unwind_rva, sizeof(xdata) ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    read_arm64x_image( base, transaction, unwind_rva, &xdata, sizeof(xdata) );
+    if (!image_rva_range_valid( total_size, begin_rva, (SIZE_T)xdata.FunctionLength * 4 ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+
+    extent = sizeof(xdata);
+    code_words = xdata.CodeWords;
+    epilog_count = xdata.EpilogCount;
+    if (!code_words && !epilog_count)
+    {
+        if (!image_rva_offset_valid( total_size, unwind_rva, extent,
+                                     sizeof(extended), &field_rva ))
+            return STATUS_INVALID_IMAGE_FORMAT;
+        read_arm64x_image( base, transaction, field_rva, &extended, sizeof(extended) );
+        extent += sizeof(extended);
+        code_words = extended.code_words;
+        epilog_count = extended.epilog_count;
+    }
+    if (!xdata.EpilogInHeader) extent += (SIZE_T)epilog_count * sizeof(DWORD);
+    extent += (SIZE_T)code_words * sizeof(DWORD);
+    if (!image_rva_range_valid( total_size, unwind_rva, extent ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if (xdata.ExceptionDataPresent)
+    {
+        if (!image_rva_offset_valid( total_size, unwind_rva, extent,
+                                     sizeof(handler_rva), &field_rva ))
+            return STATUS_INVALID_IMAGE_FORMAT;
+        read_arm64x_image( base, transaction, field_rva, &handler_rva, sizeof(handler_rva) );
+        if (!image_rva_range_valid( total_size, handler_rva, sizeof(ULONG) ))
+            return STATUS_INVALID_IMAGE_FORMAT;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS validate_arm64ec_metadata( const char *base,
+                                           const struct arm64x_fixup_transaction *transaction,
+                                           SIZE_T total_size, ULONG metadata_rva,
+                                           IMAGE_ARM64EC_METADATA *metadata )
+{
+    ARM64_RUNTIME_FUNCTION function, previous_function;
+    IMAGE_ARM64EC_CODE_RANGE_ENTRY_POINT code_range;
+    IMAGE_ARM64EC_REDIRECTION_ENTRY redirection, previous;
+    IMAGE_CHPE_RANGE_ENTRY code;
+    ULONG extra_rfe_count, i, start;
+    SIZE_T code_map_end = 0;
+
+    if (!metadata_rva || metadata_rva & (TYPE_ALIGNMENT(IMAGE_ARM64EC_METADATA) - 1) ||
+        !image_rva_range_valid( total_size, metadata_rva, sizeof(*metadata) ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    read_arm64x_image( base, transaction, metadata_rva, metadata, sizeof(*metadata) );
+
+    if (!arm64ec_metadata_extents_valid( total_size, metadata ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+
+    for (i = 0; i < metadata->CodeMapCount; i++)
+    {
+        read_arm64x_image( base, transaction, metadata->CodeMap + i * sizeof(code),
+                           &code, sizeof(code) );
+        start = code.StartOffset & ~3u;
+        if (!code.Length || !image_rva_range_valid( total_size, start, code.Length ) ||
+            (i && start < code_map_end))
+            return STATUS_INVALID_IMAGE_FORMAT;
+        code_map_end = start + (SIZE_T)code.Length;
+    }
+
+    for (i = 0; i < metadata->CodeRangesToEntryPointsCount; i++)
+    {
+        read_arm64x_image( base, transaction,
+                           metadata->CodeRangesToEntryPoints + i * sizeof(code_range),
+                           &code_range, sizeof(code_range) );
+        if (code_range.StartRva >= code_range.EndRva || code_range.EndRva > total_size ||
+            code_range.EntryPoint >= total_size)
+            return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    for (i = 0; i < metadata->RedirectionMetadataCount; i++)
+    {
+        read_arm64x_image( base, transaction,
+                           metadata->RedirectionMetadata + i * sizeof(redirection),
+                           &redirection, sizeof(redirection) );
+        if (redirection.Source >= total_size || redirection.Destination >= total_size ||
+            (i && previous.Source >= redirection.Source))
+            return STATUS_INVALID_IMAGE_FORMAT;
+        previous = redirection;
+    }
+
+    extra_rfe_count = metadata->ExtraRFETableSize / sizeof(function);
+    for (i = 0; i < extra_rfe_count; i++)
+    {
+        read_arm64x_image( base, transaction,
+                           metadata->ExtraRFETable + i * sizeof(function),
+                           &function, sizeof(function) );
+        if (function.BeginAddress >= total_size ||
+            (i && previous_function.BeginAddress >= function.BeginAddress))
+            return STATUS_INVALID_IMAGE_FORMAT;
+        if (!function.Flag)
+        {
+            if (validate_arm64_unwind_info( base, transaction, total_size,
+                                             function.BeginAddress, function.UnwindData ))
+                return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        else if (!image_rva_range_valid( total_size, function.BeginAddress,
+                                          (SIZE_T)function.FunctionLength * 4 ))
+            return STATUS_INVALID_IMAGE_FORMAT;
+        previous_function = function;
+    }
+
+#define VALIDATE_ARM64EC_SLOT(field) \
+    if (!arm64ec_optional_range_valid( total_size, metadata->field, sizeof(void *) )) \
+        return STATUS_INVALID_IMAGE_FORMAT
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_dispatch_call_no_redirect );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_dispatch_ret );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_dispatch_call );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_dispatch_icall );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_dispatch_icall_cfg );
+    VALIDATE_ARM64EC_SLOT( GetX64InformationFunctionPointer );
+    VALIDATE_ARM64EC_SLOT( SetX64InformationFunctionPointer );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_dispatch_fptr );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_helper3 );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_helper4 );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_helper5 );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_helper6 );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_helper7 );
+    VALIDATE_ARM64EC_SLOT( __os_arm64x_helper8 );
+#undef VALIDATE_ARM64EC_SLOT
+    return STATUS_SUCCESS;
+}
+
+
+static ULONG redirect_validated_arm64ec_rva( const char *base,
+                                              const struct arm64x_fixup_transaction *transaction,
+                                              ULONG rva,
+                                              const IMAGE_ARM64EC_METADATA *metadata )
+{
+    IMAGE_ARM64EC_REDIRECTION_ENTRY entry;
+    ULONG low = 0, high = metadata->RedirectionMetadataCount;
+
+    while (low < high)
+    {
+        ULONG pos = low + (high - low) / 2;
+
+        read_arm64x_image( base, transaction,
+                           metadata->RedirectionMetadata + pos * sizeof(entry),
+                           &entry, sizeof(entry) );
+        if (entry.Source == rva) return entry.Destination;
+        if (entry.Source < rva) low = pos + 1;
+        else high = pos;
+    }
+    return rva;
+}
+
+
+static NTSTATUS update_arm64ec_ranges( struct file_view *view, IMAGE_NT_HEADERS *nt,
+                                       const struct arm64x_fixup_transaction *transaction,
+                                       const IMAGE_DATA_DIRECTORY *dir,
+                                       const IMAGE_SECTION_HEADER *sections,
+                                       ULONG section_count, SIZE_T align_mask,
+                                       SIZE_T total_size,
+                                       struct arm64ec_mapping *mapping )
+{
+    struct arm64x_shared_range *ranges = NULL;
+    const SIZE_T metadata_offset = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY,
+                                             CHPEMetadataPointer );
+    ARM64_RUNTIME_FUNCTION function;
+    IMAGE_ARM64EC_METADATA metadata;
+    ULONGLONG metadata_va, security_cookie_va, image_base, delta;
+    void *snapshot = NULL;
+    BYTE *private_pages = NULL;
+    char *base = view->base;
+    ULONG declared_size, metadata_rva, security_cookie_rva, i;
+    SIZE_T range_count = 0, private_page_count = 0, load_config_size;
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOL present, security_cookie_present;
+
+    memset( mapping, 0, sizeof(*mapping) );
+    for (i = 0; i < section_count; i++)
+    {
+        SIZE_T start, end;
+
+        if (get_arm64x_shared_section_range( sections + i, align_mask, &start, &end ))
+            break;
+    }
+    if (i < section_count &&
+        (status = get_arm64x_shared_ranges( sections, section_count, align_mask,
+                                             &ranges, &range_count )))
+        goto done;
+    if (range_count)
+    {
+        if (view->size > ~(SIZE_T)0 - host_page_mask)
+        {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            goto done;
+        }
+        private_page_count = ROUND_SIZE( 0, view->size, host_page_mask ) / host_page_size;
+        if (!(private_pages = calloc( (private_page_count + 7) / 8, 1 )))
+        {
+            status = STATUS_NO_MEMORY;
+            goto done;
+        }
+    }
+
+    if (!image_rva_range_valid( total_size, dir->VirtualAddress,
+                                sizeof(declared_size) ))
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+    if ((status = privatize_arm64x_image_range(
+             view, dir->VirtualAddress, sizeof(declared_size), ranges, range_count,
+             private_pages, private_page_count, &snapshot )))
+        goto done;
+    if ((status = get_load_config_size( base, transaction, dir, &declared_size ))) goto done;
+    load_config_size = min( (SIZE_T)declared_size, (SIZE_T)dir->Size );
+    load_config_size = min( load_config_size, sizeof(IMAGE_LOAD_CONFIG_DIRECTORY) );
+    if ((status = privatize_arm64x_image_range(
+             view, dir->VirtualAddress, load_config_size, ranges, range_count,
+             private_pages, private_page_count, &snapshot )))
+        goto done;
+    if ((status = get_load_config_size( base, transaction, dir, &declared_size ))) goto done;
+    image_base = nt->OptionalHeader.ImageBase;
+    if ((status = read_load_config_field(
+             base, transaction, dir, declared_size,
+             offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, SecurityCookie ),
+             sizeof(security_cookie_va), &security_cookie_va,
+             &security_cookie_present )))
+        goto done;
+    if (security_cookie_present && security_cookie_va)
+    {
+        if (security_cookie_va < image_base ||
+            (delta = security_cookie_va - image_base) > ~(ULONG)0)
+        {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            goto done;
+        }
+        security_cookie_rva = delta;
+        if (!image_rva_range_valid( total_size, security_cookie_rva,
+                                    sizeof(ULONG_PTR) ))
+        {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            goto done;
+        }
+        if ((status = privatize_arm64x_image_range(
+                 view, security_cookie_rva, sizeof(ULONG_PTR), ranges, range_count,
+                 private_pages, private_page_count, &snapshot )))
+            goto done;
+    }
+    if (declared_size <= metadata_offset) goto done;
+    if (declared_size < metadata_offset + sizeof(metadata_va) ||
+        dir->Size < metadata_offset + sizeof(metadata_va))
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+    if ((status = read_load_config_field( base, transaction, dir, declared_size,
+                                          metadata_offset,
+                                          sizeof(metadata_va), &metadata_va, &present )))
+        goto done;
+    if (!present || !metadata_va) goto done;
+
+    if (metadata_va < image_base || (delta = metadata_va - image_base) > ~(ULONG)0)
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+    metadata_rva = delta;
+    if (!metadata_rva || metadata_rva & (TYPE_ALIGNMENT(IMAGE_ARM64EC_METADATA) - 1) ||
+        !image_rva_range_valid( total_size, metadata_rva, sizeof(metadata) ))
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+    if ((status = privatize_arm64x_image_range(
+             view, metadata_rva, sizeof(metadata), ranges, range_count,
+             private_pages, private_page_count, &snapshot )))
+        goto done;
+    read_arm64x_image( base, transaction, metadata_rva, &metadata, sizeof(metadata) );
+    if (!arm64ec_metadata_extents_valid( total_size, &metadata ))
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+
+#define PRIVATIZE_ARM64EC_ARRAY(field, count, type) \
+    if (metadata.count && \
+        (status = privatize_arm64x_image_range( \
+            view, metadata.field, (SIZE_T)metadata.count * sizeof(type), ranges, \
+            range_count, private_pages, private_page_count, &snapshot ))) \
+        goto done
+    PRIVATIZE_ARM64EC_ARRAY( CodeMap, CodeMapCount, IMAGE_CHPE_RANGE_ENTRY );
+    PRIVATIZE_ARM64EC_ARRAY( CodeRangesToEntryPoints, CodeRangesToEntryPointsCount,
+                             IMAGE_ARM64EC_CODE_RANGE_ENTRY_POINT );
+    PRIVATIZE_ARM64EC_ARRAY( RedirectionMetadata, RedirectionMetadataCount,
+                             IMAGE_ARM64EC_REDIRECTION_ENTRY );
+#undef PRIVATIZE_ARM64EC_ARRAY
+    if (metadata.ExtraRFETableSize &&
+        (status = privatize_arm64x_image_range(
+            view, metadata.ExtraRFETable, metadata.ExtraRFETableSize, ranges,
+            range_count, private_pages, private_page_count, &snapshot )))
+        goto done;
+
+    for (i = 0; i < metadata.ExtraRFETableSize / sizeof(function); i++)
+    {
+        read_arm64x_image( base, transaction,
+                           metadata.ExtraRFETable + i * sizeof(function),
+                           &function, sizeof(function) );
+        if (!function.Flag &&
+            (status = privatize_arm64ec_unwind_info(
+                view, transaction, total_size, function.UnwindData, ranges, range_count,
+                private_pages, private_page_count, &snapshot )))
+            goto done;
+    }
+
+    {
+        const ULONG slots[] =
+        {
+            metadata.__os_arm64x_dispatch_call_no_redirect,
+            metadata.__os_arm64x_dispatch_ret,
+            metadata.__os_arm64x_dispatch_call,
+            metadata.__os_arm64x_dispatch_icall,
+            metadata.__os_arm64x_dispatch_icall_cfg,
+            metadata.GetX64InformationFunctionPointer,
+            metadata.SetX64InformationFunctionPointer,
+            metadata.__os_arm64x_dispatch_fptr,
+            metadata.__os_arm64x_helper3,
+            metadata.__os_arm64x_helper4,
+            metadata.__os_arm64x_helper5,
+            metadata.__os_arm64x_helper6,
+            metadata.__os_arm64x_helper7,
+            metadata.__os_arm64x_helper8,
+        };
+
+        for (i = 0; i < ARRAY_SIZE(slots); i++)
+        {
+            if (!arm64ec_optional_range_valid( total_size, slots[i], sizeof(void *) ))
+            {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                goto done;
+            }
+            if (slots[i] &&
+                (status = privatize_arm64x_image_range(
+                    view, slots[i], sizeof(void *), ranges, range_count,
+                    private_pages, private_page_count, &snapshot )))
+                goto done;
+        }
+    }
+
+    if ((status = validate_arm64ec_metadata( base, transaction, total_size, metadata_rva,
+                                             &mapping->metadata )))
+        goto done;
+
+    mapping->entry_point = redirect_validated_arm64ec_rva(
+        base, transaction, nt->OptionalHeader.AddressOfEntryPoint, &mapping->metadata );
+    mapping->present = TRUE;
+
+done:
+    free( snapshot );
+    free( private_pages );
+    free( ranges );
+    return status;
+}
+
+
+static void commit_arm64ec_mapping( struct file_view *view,
+                                    const struct arm64x_fixup_transaction *transaction,
+                                    const struct arm64ec_mapping *mapping )
+{
+    IMAGE_CHPE_RANGE_ENTRY code;
+    char *base = view->base;
+    ULONG i;
+
+    if (!mapping->present) return;
+    if (!arm64ec_view) alloc_arm64ec_map();
+    commit_arm64ec_map( view );
+
+    for (i = 0; i < mapping->metadata.CodeMapCount; i++)
+    {
+        read_arm64x_image( base, transaction, mapping->metadata.CodeMap + i * sizeof(code),
+                           &code, sizeof(code) );
+        if ((code.StartOffset & 0x3) != 1 /* arm64ec */) continue;
+        set_arm64ec_range( base + (code.StartOffset & ~3u), code.Length );
+    }
+}
+
+
+static BOOL memory_is_zero( const BYTE *ptr, SIZE_T size )
+{
+    while (size--) if (*ptr++) return FALSE;
+    return TRUE;
+}
+
+
+enum arm64x_parse_mode
+{
+    ARM64X_VALIDATE_FIXUPS,
+    ARM64X_COLLECT_CHUNKS,
+    ARM64X_BUILD_OVERLAY
+};
+
+
+static NTSTATUS parse_arm64x_relocations( const char *base, const BYTE *fixups, SIZE_T size,
+                                          SIZE_T total_size,
+                                          struct arm64x_fixup_transaction *transaction,
+                                          enum arm64x_parse_mode mode, SIZE_T *operation_count,
+                                          SIZE_T *chunk_count )
+{
+    IMAGE_BASE_RELOCATION block;
+    SIZE_T chunks = 0, count = 0, pos = 0;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    while (pos < size)
+    {
+        SIZE_T block_end, record_pos;
+
+        if (size - pos < sizeof(block))
+        {
+            if (!memory_is_zero( fixups + pos, size - pos )) status = STATUS_INVALID_IMAGE_FORMAT;
+            break;
+        }
+        memcpy( &block, fixups + pos, sizeof(block) );
+        if (!block.SizeOfBlock)
+        {
+            if (!memory_is_zero( fixups + pos, size - pos )) status = STATUS_INVALID_IMAGE_FORMAT;
+            break;
+        }
+        if (block.SizeOfBlock < sizeof(block) || block.SizeOfBlock > size - pos ||
+            (block.SizeOfBlock - sizeof(block)) % sizeof(USHORT))
+        {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            break;
+        }
+
+        block_end = pos + block.SizeOfBlock;
+        record_pos = pos + sizeof(block);
+        while (record_pos < block_end)
+        {
+            USHORT record, type, arg, operand;
+            SIZE_T width;
+            ULONG target;
+            BYTE value[8];
+
+            memcpy( &record, fixups + record_pos, sizeof(record) );
+            record_pos += sizeof(record);
+            if (!record)
+            {
+                if (!memory_is_zero( fixups + record_pos, block_end - record_pos ))
+                    status = STATUS_INVALID_IMAGE_FORMAT;
+                break;
+            }
+
+            type = (record >> 12) & 3;
+            arg = record >> 14;
+            if (block.VirtualAddress > ~(ULONG)0 - (record & 0xfff))
+            {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                break;
+            }
+            target = block.VirtualAddress + (record & 0xfff);
+
             switch (type)
             {
             case IMAGE_DVRT_ARM64X_FIXUP_TYPE_ZEROFILL:
-                memset( page + offset, 0, 1 << arg );
+                if (!arg) return STATUS_INVALID_IMAGE_FORMAT;
+                width = (SIZE_T)1 << arg;
                 break;
             case IMAGE_DVRT_ARM64X_FIXUP_TYPE_VALUE:
-                memcpy( page + offset, rel, 1 << arg );
-                rel += (1 << arg) / sizeof(USHORT);
+                if (!arg)
+                {
+                    status = STATUS_INVALID_IMAGE_FORMAT;
+                    break;
+                }
+                width = (SIZE_T)1 << arg;
+                if (width > block_end - record_pos)
+                {
+                    status = STATUS_INVALID_IMAGE_FORMAT;
+                    break;
+                }
+                record_pos += width;
                 break;
             case IMAGE_DVRT_ARM64X_FIXUP_TYPE_DELTA:
-                val = (unsigned int)*rel++ * ((arg & 2) ? 8 : 4);
-                if (arg & 1) val = -val;
-                *(int *)(page + offset) += val;
+                width = sizeof(ULONG);
+                if (block_end - record_pos < sizeof(operand))
+                {
+                    status = STATUS_INVALID_IMAGE_FORMAT;
+                    break;
+                }
+                record_pos += sizeof(operand);
+                break;
+            default:
+                status = STATUS_INVALID_IMAGE_FORMAT;
                 break;
             }
+            if (status) break;
+            if (!image_rva_range_valid( total_size, target, width ))
+            {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                break;
+            }
+
+            if (mode == ARM64X_COLLECT_CHUNKS)
+            {
+                ULONG first = target & ~7u;
+                ULONG last = (target + width - 1) & ~7u;
+
+                transaction->chunks[chunks++].rva = first;
+                if (last != first) transaction->chunks[chunks++].rva = last;
+            }
+            else if (mode == ARM64X_BUILD_OVERLAY)
+            {
+                read_arm64x_image( base, transaction, target, value, width );
+                switch (type)
+                {
+                case IMAGE_DVRT_ARM64X_FIXUP_TYPE_ZEROFILL:
+                    memset( value, 0, width );
+                    break;
+                case IMAGE_DVRT_ARM64X_FIXUP_TYPE_VALUE:
+                    memcpy( value, fixups + record_pos - width, width );
+                    break;
+                case IMAGE_DVRT_ARM64X_FIXUP_TYPE_DELTA:
+                {
+                    ULONG current, delta;
+
+                    memcpy( &operand, fixups + record_pos - sizeof(operand), sizeof(operand) );
+                    memcpy( &current, value, sizeof(current) );
+                    delta = (ULONG)operand * ((arg & 2) ? 8 : 4);
+                    if (arg & 1) delta = 0u - delta;
+                    current += delta;
+                    memcpy( value, &current, sizeof(current) );
+                    break;
+                }
+                }
+                if ((status = write_arm64x_image( transaction, target, value, width )))
+                    break;
+            }
+            count++;
         }
-        reloc = (const IMAGE_BASE_RELOCATION *)rel_end;
+        if (status) break;
+        pos = block_end;
+    }
+    *operation_count = count;
+    if (chunk_count) *chunk_count = chunks;
+    return status;
+}
+
+
+static int compare_arm64x_chunks( const void *left, const void *right )
+{
+    const struct arm64x_patch_chunk *a = left, *b = right;
+
+    if (a->rva < b->rva) return -1;
+    if (a->rva > b->rva) return 1;
+    return 0;
+}
+
+
+static NTSTATUS build_arm64x_transaction( const char *base, const BYTE *fixups, SIZE_T size,
+                                          SIZE_T total_size,
+                                          struct arm64x_fixup_transaction *transaction )
+{
+    SIZE_T count, parsed_count, chunk_count, max_chunks, unique, i;
+    NTSTATUS status;
+
+    if ((status = parse_arm64x_relocations( base, fixups, size, total_size, NULL,
+                                            ARM64X_VALIDATE_FIXUPS, &count, NULL )))
+        return status;
+    if (!count) return STATUS_SUCCESS;
+    if (count > ~(SIZE_T)0 / 2) return STATUS_NO_MEMORY;
+    max_chunks = count * 2;
+    if (max_chunks > ~(SIZE_T)0 / sizeof(*transaction->chunks)) return STATUS_NO_MEMORY;
+    if (!(transaction->chunks = calloc( max_chunks, sizeof(*transaction->chunks) )))
+        return STATUS_NO_MEMORY;
+
+    status = parse_arm64x_relocations( base, fixups, size, total_size, transaction,
+                                       ARM64X_COLLECT_CHUNKS, &parsed_count, &chunk_count );
+    if (status || parsed_count != count)
+    {
+        free_arm64x_transaction( transaction );
+        return status ? status : STATUS_INVALID_IMAGE_FORMAT;
+    }
+    assert( chunk_count <= max_chunks );
+    qsort( transaction->chunks, chunk_count, sizeof(*transaction->chunks), compare_arm64x_chunks );
+
+    for (i = unique = 0; i < chunk_count; i++)
+    {
+        if (unique && transaction->chunks[unique - 1].rva == transaction->chunks[i].rva) continue;
+        transaction->chunks[unique++].rva = transaction->chunks[i].rva;
+    }
+    transaction->count = unique;
+    status = parse_arm64x_relocations( base, fixups, size, total_size, transaction,
+                                       ARM64X_BUILD_OVERLAY, &parsed_count, NULL );
+    if (status || parsed_count != count)
+    {
+        free_arm64x_transaction( transaction );
+        return status ? status : STATUS_INVALID_IMAGE_FORMAT;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS find_arm64x_fixups( const BYTE *entries, SIZE_T size, ULONG version,
+                                    const BYTE **fixups, SIZE_T *fixup_size )
+{
+    SIZE_T pos = 0;
+
+    *fixups = NULL;
+    *fixup_size = 0;
+    switch (version)
+    {
+    case 1:
+        while (pos < size)
+        {
+            IMAGE_DYNAMIC_RELOCATION64 dyn;
+            SIZE_T step;
+
+            if (size - pos < sizeof(dyn)) return STATUS_INVALID_IMAGE_FORMAT;
+            memcpy( &dyn, entries + pos, sizeof(dyn) );
+            if (dyn.BaseRelocSize > size - pos - sizeof(dyn))
+                return STATUS_INVALID_IMAGE_FORMAT;
+            step = sizeof(dyn) + dyn.BaseRelocSize;
+            if (dyn.Symbol == IMAGE_DYNAMIC_RELOCATION_ARM64X && !*fixups)
+            {
+                *fixups = entries + pos + sizeof(dyn);
+                *fixup_size = dyn.BaseRelocSize;
+            }
+            pos += step;
+        }
+        return STATUS_SUCCESS;
+
+    case 2:
+        while (pos < size)
+        {
+            IMAGE_DYNAMIC_RELOCATION64_V2 dyn;
+            SIZE_T step;
+
+            if (size - pos < sizeof(dyn)) return STATUS_INVALID_IMAGE_FORMAT;
+            memcpy( &dyn, entries + pos, sizeof(dyn) );
+            if (dyn.HeaderSize < sizeof(dyn) || dyn.HeaderSize > size - pos ||
+                dyn.FixupInfoSize > size - pos - dyn.HeaderSize)
+                return STATUS_INVALID_IMAGE_FORMAT;
+            step = dyn.HeaderSize + dyn.FixupInfoSize;
+            if (dyn.Symbol == IMAGE_DYNAMIC_RELOCATION_ARM64X && !*fixups)
+            {
+                *fixups = entries + pos + dyn.HeaderSize;
+                *fixup_size = dyn.FixupInfoSize;
+            }
+            pos += step;
+        }
+        return STATUS_SUCCESS;
+
+    default:
+        FIXME( "unsupported version %u\n", version );
+        return STATUS_SUCCESS;
     }
 }
 
@@ -4898,55 +6463,64 @@ static void apply_arm64x_relocations( char *base, const IMAGE_BASE_RELOCATION *r
 /***********************************************************************
  *           update_arm64x_mapping
  */
-static void update_arm64x_mapping( struct file_view *view, IMAGE_NT_HEADERS *nt,
-                                   const IMAGE_DATA_DIRECTORY *dir, IMAGE_SECTION_HEADER *sections )
+static NTSTATUS update_arm64x_mapping( struct file_view *view, IMAGE_NT_HEADERS *nt,
+                                       const IMAGE_DATA_DIRECTORY *dir,
+                                       IMAGE_SECTION_HEADER *sections, SIZE_T total_size,
+                                       struct arm64x_fixup_transaction *transaction )
 {
-    const IMAGE_DYNAMIC_RELOCATION_TABLE *table;
-    const char *ptr, *end;
+    IMAGE_DYNAMIC_RELOCATION_TABLE table;
+    const BYTE *entries, *fixups;
+    IMAGE_SECTION_HEADER section;
+    BYTE *snapshot = NULL;
     char *base = view->base;
-    const IMAGE_LOAD_CONFIG_DIRECTORY *cfg = (void *)(base + dir->VirtualAddress);
-    ULONG sec, offset, size = min( dir->Size, cfg->Size );
+    ULONG declared_size, offset, table_rva;
+    SIZE_T section_size, section_remaining, fixup_size;
+    USHORT section_index;
+    NTSTATUS status;
+    BOOL present;
 
-    if (size <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, DynamicValueRelocTableSection )) return;
-    offset = cfg->DynamicValueRelocTableOffset;
-    sec = cfg->DynamicValueRelocTableSection;
-    if (!sec || sec > nt->FileHeader.NumberOfSections) return;
-    if (offset >= sections[sec - 1].Misc.VirtualSize) return;
-    table = (const IMAGE_DYNAMIC_RELOCATION_TABLE *)(base + sections[sec - 1].VirtualAddress + offset);
-    ptr = (const char *)(table + 1);
-    end = ptr + table->Size;
-    switch (table->Version)
+    if ((status = get_load_config_size( base, NULL, dir, &declared_size ))) return status;
+    if ((status = read_load_config_field( base, NULL, dir, declared_size,
+                                          offsetof( IMAGE_LOAD_CONFIG_DIRECTORY,
+                                                    DynamicValueRelocTableOffset ),
+                                          sizeof(offset), &offset, &present )))
+        return status;
+    if (!present) return STATUS_SUCCESS;
+    if ((status = read_load_config_field( base, NULL, dir, declared_size,
+                                          offsetof( IMAGE_LOAD_CONFIG_DIRECTORY,
+                                                    DynamicValueRelocTableSection ),
+                                          sizeof(section_index), &section_index, &present )))
+        return status;
+    if (!present) return STATUS_INVALID_IMAGE_FORMAT;
+    if (!section_index) return STATUS_SUCCESS;
+    if (section_index > nt->FileHeader.NumberOfSections) return STATUS_INVALID_IMAGE_FORMAT;
+
+    memcpy( &section, sections + section_index - 1, sizeof(section) );
+    section_size = section.Misc.VirtualSize ? section.Misc.VirtualSize : section.SizeOfRawData;
+    if (!image_rva_range_valid( total_size, section.VirtualAddress, section_size ) ||
+        offset > section_size || section_size - offset < sizeof(table) ||
+        section.VirtualAddress > ~(ULONG)0 - offset)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    section_remaining = section_size - offset;
+    table_rva = section.VirtualAddress + offset;
+    memcpy( &table, base + table_rva, sizeof(table) );
+    if (table.Size > section_remaining - sizeof(table) ||
+        !image_rva_range_valid( total_size, table_rva + sizeof(table), table.Size ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+
+    entries = (const BYTE *)base + table_rva + sizeof(table);
+    if ((status = find_arm64x_fixups( entries, table.Size, table.Version,
+                                      &fixups, &fixup_size )))
+        return status;
+    if (!fixups) return STATUS_SUCCESS;
+    if (fixup_size)
     {
-    case 1:
-        while (ptr < end)
-        {
-            const IMAGE_DYNAMIC_RELOCATION64 *dyn = (const IMAGE_DYNAMIC_RELOCATION64 *)ptr;
-            if (dyn->Symbol == IMAGE_DYNAMIC_RELOCATION_ARM64X)
-            {
-                apply_arm64x_relocations( base, (const IMAGE_BASE_RELOCATION *)(dyn + 1),
-                                          dyn->BaseRelocSize );
-                break;
-            }
-            ptr += sizeof(*dyn) + dyn->BaseRelocSize;
-        }
-        break;
-    case 2:
-        while (ptr < end)
-        {
-            const IMAGE_DYNAMIC_RELOCATION64_V2 *dyn = (const IMAGE_DYNAMIC_RELOCATION64_V2 *)ptr;
-            if (dyn->Symbol == IMAGE_DYNAMIC_RELOCATION_ARM64X)
-            {
-                apply_arm64x_relocations( base, (const IMAGE_BASE_RELOCATION *)(dyn + 1),
-                                          dyn->FixupInfoSize );
-                break;
-            }
-            ptr += dyn->HeaderSize + dyn->FixupInfoSize;
-        }
-        break;
-    default:
-        FIXME( "unsupported version %u\n", table->Version );
-        break;
+        if (!(snapshot = malloc( fixup_size ))) return STATUS_NO_MEMORY;
+        memcpy( snapshot, fixups, fixup_size );
     }
+    status = build_arm64x_transaction( base, snapshot, fixup_size, total_size, transaction );
+    free( snapshot );
+    return status;
 }
 
 #endif  /* __aarch64__ */
@@ -4977,6 +6551,377 @@ static IMAGE_DATA_DIRECTORY *get_data_dir( IMAGE_NT_HEADERS *nt, SIZE_T total_si
     if (data->Size > total_size - data->VirtualAddress) return NULL;
     return data;
 }
+
+
+#if defined(__APPLE__) && !defined(__aarch64__)
+
+struct apple_import_range
+{
+    SIZE_T start;
+    SIZE_T end;
+};
+
+
+static BOOL apple_image_rva_offset_valid( SIZE_T total_size, ULONG rva,
+                                           SIZE_T offset, SIZE_T size, ULONG *result )
+{
+    if (offset > ~(ULONG)0 - rva) return FALSE;
+    *result = rva + (ULONG)offset;
+    if (*result > total_size || size > total_size - *result) return FALSE;
+    return !size || size - 1 <= ~(ULONG)0 - *result;
+}
+
+
+static NTSTATUS append_apple_import_range( struct apple_import_range **ranges,
+                                           SIZE_T *count, SIZE_T *capacity,
+                                           SIZE_T start, SIZE_T end )
+{
+    struct apple_import_range *new_ranges;
+    SIZE_T new_capacity;
+
+    if (start == end) return STATUS_SUCCESS;
+    if (*count == *capacity)
+    {
+        new_capacity = *capacity ? *capacity * 2 : 8;
+        if (new_capacity < *capacity ||
+            new_capacity > ~(SIZE_T)0 / sizeof(**ranges))
+            return STATUS_NO_MEMORY;
+        if (!(new_ranges = realloc( *ranges, new_capacity * sizeof(**ranges) )))
+            return STATUS_NO_MEMORY;
+        *ranges = new_ranges;
+        *capacity = new_capacity;
+    }
+    (*ranges)[*count].start = start;
+    (*ranges)[(*count)++].end = end;
+    return STATUS_SUCCESS;
+}
+
+
+static int compare_apple_import_ranges( const void *left, const void *right )
+{
+    const struct apple_import_range *a = left, *b = right;
+
+    if (a->start < b->start) return -1;
+    if (a->start > b->start) return 1;
+    if (a->end < b->end) return -1;
+    if (a->end > b->end) return 1;
+    return 0;
+}
+
+
+static NTSTATUS get_apple_shared_ranges( const IMAGE_SECTION_HEADER *sections,
+                                         ULONG section_count, SIZE_T align_mask,
+                                         struct apple_import_range **ranges,
+                                         SIZE_T *range_count )
+{
+    SIZE_T count = 0, i, offset;
+
+    *ranges = NULL;
+    *range_count = 0;
+    if (!section_count) return STATUS_SUCCESS;
+    if (!(*ranges = malloc( section_count * sizeof(**ranges) ))) return STATUS_NO_MEMORY;
+    for (i = 0; i < section_count; i++)
+    {
+        SIZE_T map_size, start, end;
+
+        if ((sections[i].Characteristics & (IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE)) !=
+            (IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE))
+            continue;
+        map_size = ROUND_SIZE( 0, sections[i].Misc.VirtualSize ?
+                              sections[i].Misc.VirtualSize : sections[i].SizeOfRawData,
+                              align_mask );
+        if (!map_size) continue;
+        start = sections[i].VirtualAddress & ~host_page_mask;
+        end = (sections[i].VirtualAddress + map_size + host_page_mask) & ~host_page_mask;
+        (*ranges)[count].start = start;
+        (*ranges)[count++].end = end;
+    }
+    qsort( *ranges, count, sizeof(**ranges), compare_apple_import_ranges );
+    for (i = 1, offset = 0; i < count; i++)
+    {
+        if ((*ranges)[offset].end >= (*ranges)[i].start)
+        {
+            if ((*ranges)[offset].end < (*ranges)[i].end)
+                (*ranges)[offset].end = (*ranges)[i].end;
+        }
+        else (*ranges)[++offset] = (*ranges)[i];
+    }
+    if (count) *range_count = offset + 1;
+    return STATUS_SUCCESS;
+}
+
+
+static BOOL apple_page_overlaps_ranges( SIZE_T page,
+                                         const struct apple_import_range *ranges,
+                                         SIZE_T range_count )
+{
+    SIZE_T low = 0, high = range_count;
+
+    while (low < high)
+    {
+        SIZE_T pos = low + (high - low) / 2;
+
+        if (page < ranges[pos].start) high = pos;
+        else if (page >= ranges[pos].end) low = pos + 1;
+        else return TRUE;
+    }
+    return FALSE;
+}
+
+
+static NTSTATUS privatize_apple_page( struct file_view *view, SIZE_T page,
+                                      const struct apple_import_range *shared_ranges,
+                                      SIZE_T shared_range_count, BYTE *private_pages,
+                                      SIZE_T private_page_count, void **snapshot )
+{
+    SIZE_T page_index = page / host_page_size;
+    char *base = view->base;
+
+    if (!apple_page_overlaps_ranges( page, shared_ranges, shared_range_count ))
+        return STATUS_SUCCESS;
+    if (page_index >= private_page_count) return STATUS_INVALID_IMAGE_FORMAT;
+    if (private_pages[page_index / 8] & (1u << (page_index % 8)))
+        return STATUS_SUCCESS;
+    if (!*snapshot && !(*snapshot = malloc( host_page_size )))
+        return STATUS_NO_MEMORY;
+    memcpy( *snapshot, base + page, host_page_size );
+    if (anon_mmap_fixed( base + page, host_page_size,
+                         PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+        return STATUS_NO_MEMORY;
+    memcpy( base + page, *snapshot, host_page_size );
+    private_pages[page_index / 8] |= 1u << (page_index % 8);
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS privatize_apple_image_range(
+    struct file_view *view, SIZE_T start, SIZE_T size,
+    const struct apple_import_range *shared_ranges, SIZE_T shared_range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot )
+{
+    SIZE_T page, end;
+    NTSTATUS status;
+
+    if (start > view->size || size > view->size - start)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if (!size || !shared_range_count) return STATUS_SUCCESS;
+    end = start + size;
+    for (page = start & ~host_page_mask; page < end; page += host_page_size)
+        if ((status = privatize_apple_page(
+                 view, page, shared_ranges, shared_range_count,
+                 private_pages, private_page_count, snapshot )))
+            return status;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS privatize_apple_c_string(
+    struct file_view *view, struct import_string_cache *cache,
+    ULONG rva, SIZE_T prefix_size,
+    const struct apple_import_range *shared_ranges, SIZE_T shared_range_count,
+    BYTE *private_pages, SIZE_T private_page_count, void **snapshot )
+{
+    struct import_string_interval *interval, *next;
+    SIZE_T string_start, current, page_end;
+    NTSTATUS status;
+    const char *terminator;
+
+    if (rva > view->size || prefix_size >= view->size - rva)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if ((status = privatize_apple_image_range(
+             view, rva, prefix_size + 1, shared_ranges, shared_range_count,
+             private_pages, private_page_count, snapshot )))
+        return status;
+    string_start = current = rva + prefix_size;
+    if ((interval = find_import_string_interval( cache, current, &next )))
+        return STATUS_SUCCESS;
+    while (current < view->size)
+    {
+        if (next && current >= next->start)
+            return add_import_string_interval( cache, string_start, next->end );
+        page_end = (current + host_page_size) & ~host_page_mask;
+        if (page_end > view->size || page_end < current) page_end = view->size;
+        if (next && next->start < page_end) page_end = next->start;
+        if ((status = privatize_apple_image_range(
+                 view, current, page_end - current, shared_ranges, shared_range_count,
+                 private_pages, private_page_count, snapshot )))
+            return status;
+        if ((terminator = memchr( (char *)view->base + current, 0,
+                                  page_end - current )))
+            return add_import_string_interval(
+                cache, string_start, terminator - (char *)view->base + 1 );
+        current = page_end;
+    }
+    return STATUS_INVALID_IMAGE_FORMAT;
+}
+
+
+static NTSTATUS privatize_apple_import_pages( struct file_view *view,
+                                              const IMAGE_DATA_DIRECTORY *imports,
+                                              SIZE_T thunk_size,
+                                              const IMAGE_SECTION_HEADER *sections,
+                                              ULONG section_count, SIZE_T align_mask )
+{
+    struct apple_import_range *ranges = NULL, *shared_ranges = NULL;
+    struct import_string_cache string_cache;
+    IMAGE_IMPORT_DESCRIPTOR descriptor;
+    SIZE_T capacity = 0, count = 0, shared_range_count = 0, offset = 0, i;
+    void *snapshot = NULL;
+    BYTE *private_pages = NULL;
+    SIZE_T private_page_count;
+    NTSTATUS status = STATUS_INVALID_IMAGE_FORMAT;
+    BOOL terminated = FALSE;
+    char *base = view->base;
+
+    init_import_string_cache( &string_cache );
+
+    for (i = 0; i < section_count; i++)
+        if ((sections[i].Characteristics & (IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE)) ==
+            (IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE))
+            break;
+    if (i == section_count) return STATUS_SUCCESS;
+    if ((status = get_apple_shared_ranges( sections, section_count, align_mask,
+                                            &shared_ranges, &shared_range_count )))
+        goto done;
+    if (!shared_range_count)
+    {
+        status = STATUS_SUCCESS;
+        goto done;
+    }
+    if (view->size > ~(SIZE_T)0 - host_page_mask)
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+    private_page_count = ROUND_SIZE( 0, view->size, host_page_mask ) / host_page_size;
+    if (!(private_pages = calloc( (private_page_count + 7) / 8, 1 )))
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+    while (imports->Size - offset >= sizeof(descriptor))
+    {
+        ULONG lookup_rva, thunk_rva;
+        SIZE_T thunk_offset = 0;
+        ULONGLONG thunk;
+
+        if ((status = privatize_apple_image_range(
+                 view, imports->VirtualAddress + offset, sizeof(descriptor),
+                 shared_ranges, shared_range_count, private_pages,
+                 private_page_count, &snapshot )))
+            goto done;
+        memcpy( &descriptor, base + imports->VirtualAddress + offset, sizeof(descriptor) );
+        offset += sizeof(descriptor);
+        if (!descriptor.Name || !descriptor.FirstThunk)
+        {
+            terminated = TRUE;
+            break;
+        }
+        if ((status = privatize_apple_c_string(
+                 view, &string_cache, descriptor.Name, 0,
+                 shared_ranges, shared_range_count,
+                 private_pages, private_page_count, &snapshot )))
+            goto done;
+        lookup_rva = descriptor.OriginalFirstThunk ?
+                     descriptor.OriginalFirstThunk : descriptor.FirstThunk;
+        for (;;)
+        {
+            if (!apple_image_rva_offset_valid( view->size, lookup_rva, thunk_offset,
+                                               thunk_size, &thunk_rva ))
+            {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                goto done;
+            }
+            if ((status = privatize_apple_image_range(
+                     view, thunk_rva, thunk_size, shared_ranges, shared_range_count,
+                     private_pages, private_page_count, &snapshot )))
+                goto done;
+            thunk = 0;
+            memcpy( &thunk, base + thunk_rva, thunk_size );
+            if (!thunk) break;
+            if (!(thunk & (thunk_size == sizeof(IMAGE_THUNK_DATA32) ?
+                           IMAGE_ORDINAL_FLAG32 : IMAGE_ORDINAL_FLAG64)))
+            {
+                if (thunk > ~(ULONG)0)
+                {
+                    status = STATUS_INVALID_IMAGE_FORMAT;
+                    goto done;
+                }
+                if ((status = privatize_apple_c_string(
+                         view, &string_cache, thunk,
+                         offsetof(IMAGE_IMPORT_BY_NAME, Name),
+                         shared_ranges, shared_range_count, private_pages,
+                         private_page_count, &snapshot )))
+                    goto done;
+            }
+            if (!apple_image_rva_offset_valid( view->size, descriptor.FirstThunk,
+                                               thunk_offset, thunk_size, &thunk_rva ))
+            {
+                status = STATUS_INVALID_IMAGE_FORMAT;
+                goto done;
+            }
+            if ((status = privatize_apple_image_range(
+                     view, thunk_rva, thunk_size, shared_ranges, shared_range_count,
+                     private_pages, private_page_count, &snapshot )))
+                goto done;
+            thunk_offset += thunk_size;
+        }
+        if (thunk_offset)
+        {
+            SIZE_T start = descriptor.FirstThunk & ~host_page_mask;
+            SIZE_T end = (descriptor.FirstThunk + thunk_offset + host_page_mask) &
+                         ~host_page_mask;
+
+            if ((status = append_apple_import_range( &ranges, &count, &capacity,
+                                                       start, end )))
+                goto done;
+        }
+    }
+    if (!terminated)
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+    if ((status = append_apple_import_range(
+             &ranges, &count, &capacity,
+             imports->VirtualAddress & ~host_page_mask,
+             (imports->VirtualAddress + offset + host_page_mask) & ~host_page_mask )))
+        goto done;
+
+    qsort( ranges, count, sizeof(*ranges), compare_apple_import_ranges );
+    for (i = 1, offset = 0; i < count; i++)
+    {
+        if (ranges[offset].end >= ranges[i].start)
+        {
+            if (ranges[offset].end < ranges[i].end) ranges[offset].end = ranges[i].end;
+        }
+        else ranges[++offset] = ranges[i];
+    }
+    if (count) count = offset + 1;
+    for (i = 0; i < count; i++)
+    {
+        SIZE_T page;
+
+        for (page = ranges[i].start; page < ranges[i].end; page += host_page_size)
+        {
+            if ((status = privatize_apple_page(
+                     view, page, shared_ranges, shared_range_count,
+                     private_pages, private_page_count, &snapshot )))
+                goto done;
+        }
+    }
+    status = STATUS_SUCCESS;
+
+done:
+    free_import_string_cache( &string_cache );
+    free( snapshot );
+    free( private_pages );
+    free( shared_ranges );
+    free( ranges );
+    return status;
+}
+
+#endif  /* __APPLE__ && !__aarch64__ */
 
 
 /***********************************************************************
@@ -5058,6 +7003,17 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     SIZE_T header_size, header_map_size, total_size = view->size;
     SIZE_T align_mask = max( image_info->alignment - 1, page_mask );
     INT_PTR delta;
+#ifdef __aarch64__
+    USHORT mapped_machine = image_info->machine;
+    UINT mapped_entry_point = image_info->entry_point;
+    struct arm64x_fixup_transaction arm64x_transaction = {0};
+    struct arm64ec_mapping arm64ec_mapping = {0};
+    IMAGE_NT_HEADERS transformed_nt;
+    IMAGE_DATA_DIRECTORY transformed_load_config, transformed_import, effective_import;
+    SIZE_T effective_import_thunk_size = 0;
+    BOOL transformed_load_config_present, transformed_import_present;
+    BOOL hybrid_metadata_processed = FALSE, effective_import_present = FALSE;
+#endif
 
     TRACE_(module)( "mapping PE file %s at %p-%p\n", debugstr_us(nt_name), ptr, ptr + total_size );
 
@@ -5160,6 +7116,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
                 goto done;
             }
 
+#ifndef __APPLE__
             /* check if the import directory falls inside this section */
             if (imports && imports->VirtualAddress >= sec[i].VirtualAddress &&
                 imports->VirtualAddress < sec[i].VirtualAddress + map_size)
@@ -5172,6 +7129,11 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
                                         pos + (base - sec[i].VirtualAddress),
                                         VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY, FALSE );
             }
+#else
+            /* Apple SEC_IMAGE falls back to pread() here, which would write through
+             * the MAP_SHARED backing.  Privatize validated descriptor and IAT pages
+             * explicitly after all sections have been mapped instead. */
+#endif
             pos += map_size;
             continue;
         }
@@ -5211,25 +7173,105 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     }
 
 #ifdef __aarch64__
-    if ((dir = get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG )))
+#ifdef __APPLE__
+    if (imports)
     {
-        if (image_info->machine == IMAGE_FILE_MACHINE_ARM64 &&
-            (machine == IMAGE_FILE_MACHINE_AMD64 ||
-             (!machine && main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64)))
-        {
-            update_arm64x_mapping( view, nt, dir, sec );
-            /* reload changed machine from NT header */
-            image_info->machine = nt->FileHeader.Machine;
-        }
-        if (image_info->machine == IMAGE_FILE_MACHINE_AMD64)
-            update_arm64ec_ranges( view, nt, dir, &image_info->entry_point );
+        effective_import = *imports;
+        effective_import_present = TRUE;
+        effective_import_thunk_size = nt->OptionalHeader.Magic ==
+                                      IMAGE_NT_OPTIONAL_HDR32_MAGIC ?
+                                      sizeof(IMAGE_THUNK_DATA32) : sizeof(IMAGE_THUNK_DATA64);
     }
 #endif
+    if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+        (mapped_machine == IMAGE_FILE_MACHINE_AMD64 ||
+         (mapped_machine == IMAGE_FILE_MACHINE_ARM64 &&
+          (machine == IMAGE_FILE_MACHINE_AMD64 ||
+           (!machine && main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64)))))
+    {
+        hybrid_metadata_processed = TRUE;
+        if ((dir = get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG )) &&
+            mapped_machine == IMAGE_FILE_MACHINE_ARM64)
+        {
+            status = update_arm64x_mapping( view, nt, dir, sec, total_size,
+                                             &arm64x_transaction );
+            if (status) goto done;
+        }
+        if ((status = get_transformed_nt_headers( ptr, nt, total_size, &arm64x_transaction,
+                                                   &transformed_nt )))
+            goto done;
+        if ((status = validate_transformed_sections( ptr, nt, sec, total_size,
+                                                      &arm64x_transaction )))
+            goto done;
+        mapped_machine = transformed_nt.FileHeader.Machine;
+        if (mapped_machine != IMAGE_FILE_MACHINE_AMD64)
+        {
+            status = STATUS_INVALID_IMAGE_FORMAT;
+            goto done;
+        }
+        mapped_entry_point = transformed_nt.OptionalHeader.AddressOfEntryPoint;
+        if ((status = get_transformed_data_dir( &transformed_nt, total_size,
+                                                 IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG,
+                                                 &transformed_load_config,
+                                                 &transformed_load_config_present )))
+            goto done;
+        if (mapped_machine == IMAGE_FILE_MACHINE_AMD64 && transformed_load_config_present)
+        {
+            status = update_arm64ec_ranges( view, &transformed_nt, &arm64x_transaction,
+                                            &transformed_load_config, sec,
+                                            nt->FileHeader.NumberOfSections, align_mask,
+                                            total_size,
+                                            &arm64ec_mapping );
+            if (status) goto done;
+        }
+        if ((status = get_transformed_data_dir( &transformed_nt, total_size,
+                                                 IMAGE_DIRECTORY_ENTRY_IMPORT,
+                                                 &transformed_import,
+                                                 &transformed_import_present )))
+            goto done;
+#ifdef __APPLE__
+        effective_import_present = transformed_import_present;
+#else
+        effective_import_present = transformed_import_present &&
+            (!imports || imports->VirtualAddress != transformed_import.VirtualAddress ||
+             imports->Size != transformed_import.Size);
+#endif
+        if (effective_import_present)
+        {
+            effective_import = transformed_import;
+            effective_import_thunk_size = sizeof(IMAGE_THUNK_DATA64);
+        }
+    }
+    if (machine && machine != (hybrid_metadata_processed ? mapped_machine : nt->FileHeader.Machine))
+    {
+        status = STATUS_NOT_SUPPORTED;
+        goto done;
+    }
+    if ((status = privatize_arm64x_pages( view, &arm64x_transaction, sec,
+                                          nt->FileHeader.NumberOfSections, align_mask,
+                                          effective_import_present ? &effective_import : NULL,
+                                          effective_import_thunk_size,
+                                          &arm64ec_mapping )))
+        goto done;
+    apply_arm64x_transaction( ptr, &arm64x_transaction );
+    commit_arm64ec_mapping( view, NULL, &arm64ec_mapping );
+    if (arm64ec_mapping.present) mapped_entry_point = arm64ec_mapping.entry_point;
+#else
     if (machine && machine != nt->FileHeader.Machine)
     {
         status = STATUS_NOT_SUPPORTED;
         goto done;
     }
+#ifdef __APPLE__
+    if (imports &&
+        (status = privatize_apple_import_pages(
+             view, imports,
+             nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC ?
+                 sizeof(IMAGE_THUNK_DATA32) : sizeof(IMAGE_THUNK_DATA64),
+             sec, nt->FileHeader.NumberOfSections, align_mask )))
+        goto done;
+#endif
+#endif
 
     /* relocate to dynamic base */
 
@@ -5289,9 +7331,16 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 #ifdef VALGRIND_LOAD_PDB_DEBUGINFO
     VALGRIND_LOAD_PDB_DEBUGINFO(fd, ptr, total_size, ptr - (char *)wine_server_get_ptr( image_info->base ));
 #endif
+#ifdef __aarch64__
+    image_info->machine = mapped_machine;
+    image_info->entry_point = mapped_entry_point;
+#endif
     status = STATUS_SUCCESS;
 
 done:
+#ifdef __aarch64__
+    free_arm64x_transaction( &arm64x_transaction );
+#endif
     free( sections );
     return status;
 }

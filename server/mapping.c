@@ -742,7 +742,7 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
 static int load_data_dir( void *dir, size_t dir_size, size_t va, size_t size, size_t align_mask,
                           int unix_fd, IMAGE_SECTION_HEADER *sec, unsigned int nb_sec )
 {
-    size_t map_size, file_size;
+    size_t map_size, file_size, offset, read_size;
     off_t file_start;
     unsigned int i;
 
@@ -751,13 +751,14 @@ static int load_data_dir( void *dir, size_t dir_size, size_t va, size_t size, si
     for (i = 0; i < nb_sec; i++)
     {
         if (va < sec[i].VirtualAddress) continue;
-        if (sec[i].Misc.VirtualSize && va - sec[i].VirtualAddress >= sec[i].Misc.VirtualSize) continue;
+        offset = va - sec[i].VirtualAddress;
+        if (sec[i].Misc.VirtualSize && offset >= sec[i].Misc.VirtualSize) continue;
         get_section_sizes( &sec[i], align_mask, &map_size, &file_start, &file_size );
-        if (size >= map_size) continue;
-        if (va - sec[i].VirtualAddress >= map_size - size) continue;
-        if (size > dir_size) size = dir_size;
-        if (size > file_size) size = file_size;
-        return pread( unix_fd, dir, size, file_start + va - sec[i].VirtualAddress );
+        if (offset > map_size || size > map_size - offset) continue;
+        if (offset >= file_size) return 0;
+        read_size = min( size, dir_size );
+        if (read_size > file_size - offset) read_size = file_size - offset;
+        return pread( unix_fd, dir, read_size, file_start + offset );
     }
     return 0;
 }
@@ -870,18 +871,60 @@ static int load_clr_header( IMAGE_COR20_HEADER *hdr, IMAGE_DATA_DIRECTORY *data,
 }
 
 /* load the LOAD_CONFIG header from its section */
-static int load_cfg_header( IMAGE_LOAD_CONFIG_DIRECTORY64 *cfg, IMAGE_DATA_DIRECTORY *data, size_t align_mask,
-                            int unix_fd, IMAGE_SECTION_HEADER *sec, unsigned int nb_sec )
+static int load_cfg_header( void *cfg, size_t capacity, IMAGE_DATA_DIRECTORY *data, size_t align_mask,
+                            int unix_fd, IMAGE_SECTION_HEADER *sec, unsigned int nb_sec,
+                            size_t *loaded_size, unsigned int *config_size )
 {
-    unsigned int cfg_size;
-    int ret = load_data_dir( cfg, sizeof(*cfg), data->VirtualAddress, data->Size,
+    size_t required_size;
+    int ret = load_data_dir( cfg, capacity, data->VirtualAddress, data->Size,
                              align_mask, unix_fd, sec, nb_sec );
 
-    if (ret <= 0) return 0;
-    cfg_size = ret;
-    if (cfg_size < offsetof( IMAGE_LOAD_CONFIG_DIRECTORY64, Size ) + sizeof(cfg_size)) return 0;
-    if (cfg_size > cfg->Size) cfg_size = cfg->Size;
-    if (cfg_size < sizeof(*cfg)) memset( (char *)cfg + cfg_size, 0, sizeof(*cfg) - cfg_size );
+    if (ret < (int)sizeof(*config_size)) return 0;
+    memcpy( config_size, cfg, sizeof(*config_size) );
+    if (*config_size && *config_size < sizeof(*config_size)) return 0;
+    required_size = min( (size_t)*config_size, capacity );
+    if ((size_t)ret < required_size) return 0;
+    if ((size_t)ret < capacity) memset( (char *)cfg + ret, 0, capacity - ret );
+    *loaded_size = ret;
+    return 1;
+}
+
+/* return -1 for malformed metadata, 0 for a non-hybrid image, and 1 for a hybrid image */
+static int classify_hybrid_image( const void *cfg, size_t loaded_size, unsigned int config_size,
+                                  int is_pe32, client_ptr_t image_base, mem_size_t image_size )
+{
+    client_ptr_t metadata_va, metadata_rva;
+    size_t field_offset, field_size, field_end, metadata_size;
+
+    if (is_pe32)
+    {
+        field_offset = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY32, CHPEMetadataPointer );
+        field_size = sizeof(((IMAGE_LOAD_CONFIG_DIRECTORY32 *)0)->CHPEMetadataPointer);
+        metadata_size = sizeof(IMAGE_CHPE_METADATA_X86);
+    }
+    else
+    {
+        field_offset = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY64, CHPEMetadataPointer );
+        field_size = sizeof(((IMAGE_LOAD_CONFIG_DIRECTORY64 *)0)->CHPEMetadataPointer);
+        metadata_size = sizeof(IMAGE_ARM64EC_METADATA);
+    }
+    field_end = field_offset + field_size;
+
+    if (config_size <= field_offset) return 0;  /* older load config */
+    if (config_size < field_end || loaded_size < field_end) return -1;
+
+    if (is_pe32)
+        metadata_va = ((const IMAGE_LOAD_CONFIG_DIRECTORY32 *)cfg)->CHPEMetadataPointer;
+    else
+        metadata_va = ((const IMAGE_LOAD_CONFIG_DIRECTORY64 *)cfg)->CHPEMetadataPointer;
+    if (!metadata_va) return 0;
+
+    if (image_size > ~(client_ptr_t)0 - image_base) return -1;
+    if (metadata_va < image_base || metadata_va > ~(client_ptr_t)0 - metadata_size)
+        return -1;
+    metadata_rva = metadata_va - image_base;
+    if (metadata_rva > image_size || metadata_size > image_size - metadata_rva)
+        return -1;
     return 1;
 }
 
@@ -914,9 +957,10 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
         IMAGE_LOAD_CONFIG_DIRECTORY64 cfg64;
     } cfg;
     off_t pos;
-    int size, has_relocs;
+    int size, has_relocs, hybrid;
     IMAGE_DATA_DIRECTORY *data_dirs, *exp_dir, *res_dir, *cfg_dir, *clr_dir;
-    size_t mz_size, align_mask;
+    size_t mz_size, align_mask, header_map_boundary, cfg_loaded_size;
+    unsigned int cfg_size;
     unsigned int i, ret, nb_data_dirs;
 
     /* load the headers */
@@ -1066,9 +1110,14 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
     ret = STATUS_INVALID_FILE_FOR_SECTION;
     if (pread( unix_fd, sec, size, pos ) != size) goto done;
 
+    header_map_boundary = round_size( mapping->image.header_size, align_mask );
     mapping->image.header_map_size = mapping->image.map_size;
     for (i = 0; i < nt.FileHeader.NumberOfSections; i++)
     {
+        if (!(mapping->image.image_flags & IMAGE_FLAGS_ImageMappedFlat) &&
+            (sec[i].Misc.VirtualSize || sec[i].SizeOfRawData) &&
+            sec[i].VirtualAddress < header_map_boundary)
+            goto done;
         mapping->image.header_map_size = min( mapping->image.header_map_size, sec[i].VirtualAddress );
         if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) mapping->image.contains_code = 1;
     }
@@ -1096,13 +1145,18 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
         }
     }
 
-    if (cfg_dir && load_cfg_header( &cfg.cfg64, cfg_dir, align_mask,
-                                    unix_fd, sec, nt.FileHeader.NumberOfSections ))
+    if (cfg_dir)
     {
-        if (nt.opt.hdr32.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
-            mapping->image.is_hybrid = !!cfg.cfg32.CHPEMetadataPointer;
-        else
-            mapping->image.is_hybrid = !!cfg.cfg64.CHPEMetadataPointer;
+        int is_pe32 = nt.opt.hdr32.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+        size_t cfg_capacity = is_pe32 ? sizeof(cfg.cfg32) : sizeof(cfg.cfg64);
+
+        if (!load_cfg_header( &cfg, cfg_capacity, cfg_dir, align_mask, unix_fd, sec,
+                              nt.FileHeader.NumberOfSections, &cfg_loaded_size, &cfg_size ))
+            goto done;
+        hybrid = classify_hybrid_image( &cfg, cfg_loaded_size, cfg_size, is_pe32,
+                                        mapping->image.base, mapping->image.map_size );
+        if (hybrid < 0) goto done;
+        mapping->image.is_hybrid = hybrid;
     }
 
     if (build_shared_mapping( mapping, align_mask, unix_fd, sec, nt.FileHeader.NumberOfSections ))

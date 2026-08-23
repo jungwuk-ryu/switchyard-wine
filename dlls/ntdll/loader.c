@@ -2733,9 +2733,12 @@ static void update_load_config( void *module, void *client_base )
                                             IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &size );
     if (!cfg) return;
     size = min( size, cfg->Size );
-    if (size > offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, SecurityCookie ) &&
+    if (size >= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, SecurityCookie ) +
+                sizeof(cfg->SecurityCookie) &&
+        nt->OptionalHeader.SizeOfImage >= sizeof(ULONG_PTR) &&
         cfg->SecurityCookie > (ULONG_PTR)client_base &&
-        cfg->SecurityCookie < (ULONG_PTR)client_base + nt->OptionalHeader.SizeOfImage)
+        cfg->SecurityCookie - (ULONG_PTR)client_base <=
+            nt->OptionalHeader.SizeOfImage - sizeof(ULONG_PTR))
     {
         ULONG_PTR *cookie = (ULONG_PTR *)((char *)module +
             (cfg->SecurityCookie - (ULONG_PTR)client_base));
@@ -2743,9 +2746,12 @@ static void update_load_config( void *module, void *client_base )
         set_security_cookie( cookie );
     }
 #ifdef __arm64ec__
-    if (size > offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) &&
+    if (size >= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) +
+                sizeof(cfg->CHPEMetadataPointer) &&
+        nt->OptionalHeader.SizeOfImage >= sizeof(IMAGE_ARM64EC_METADATA) &&
         cfg->CHPEMetadataPointer > (ULONG_PTR)client_base &&
-        cfg->CHPEMetadataPointer < (ULONG_PTR)client_base + nt->OptionalHeader.SizeOfImage)
+        cfg->CHPEMetadataPointer - (ULONG_PTR)client_base <=
+            nt->OptionalHeader.SizeOfImage - sizeof(IMAGE_ARM64EC_METADATA))
     {
         const IMAGE_ARM64EC_METADATA *metadata = (void *)((char *)module +
             (cfg->CHPEMetadataPointer - (ULONG_PTR)client_base));

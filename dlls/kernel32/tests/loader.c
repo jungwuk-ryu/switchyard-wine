@@ -50,7 +50,10 @@ static NTSTATUS (WINAPI *pNtCreateSection)(HANDLE *, ACCESS_MASK, const OBJECT_A
                                            const LARGE_INTEGER *, ULONG, ULONG, HANDLE );
 static NTSTATUS (WINAPI *pNtQuerySection)(HANDLE, SECTION_INFORMATION_CLASS, void *, SIZE_T, SIZE_T *);
 static NTSTATUS (WINAPI *pNtMapViewOfSection)(HANDLE, HANDLE, PVOID *, ULONG_PTR, SIZE_T, const LARGE_INTEGER *, SIZE_T *, ULONG, ULONG, ULONG);
+static NTSTATUS (WINAPI *pNtMapViewOfSectionEx)(HANDLE, HANDLE, PVOID *, const LARGE_INTEGER *, SIZE_T *,
+                                                ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG);
 static NTSTATUS (WINAPI *pNtUnmapViewOfSection)(HANDLE, PVOID);
+static NTSTATUS (WINAPI *pRtlGetNativeSystemInformation)(SYSTEM_INFORMATION_CLASS, void *, ULONG, ULONG *);
 static NTSTATUS (WINAPI *pNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 static NTSTATUS (WINAPI *pNtSetInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG);
 static NTSTATUS (WINAPI *pNtTerminateProcess)(HANDLE, DWORD);
@@ -797,6 +800,1324 @@ static void test_image_header_size_bounds(void)
     ok( status == STATUS_INVALID_FILE_FOR_SECTION, "NtCreateSection error %08lx\n", status );
 }
 
+#ifdef __aarch64__
+
+enum
+{
+    HYBRID_SECTION_RVA = 0x10000,
+    HYBRID_SECTION_SIZE = 0x10000,
+    HYBRID_FILE_OFFSET = 0x1000,
+    HYBRID_IMAGE_SIZE = 0x20000,
+    HYBRID_CONFIG_OFFSET = 0,
+    HYBRID_METADATA_OFFSET = 0x200,
+    HYBRID_ARRAY_OFFSET = 0x300,
+    HYBRID_TABLE_OFFSET = 0x800,
+    HYBRID_MARKER_OFFSET = 0xc00,
+    HYBRID_IMPORT_OFFSET = 0x4000,
+    HYBRID_SLOT_OFFSET = 0x5000,
+    HYBRID_IAT_OFFSET = 0x8000,
+    HYBRID_NAME_OFFSET = 0xc000,
+};
+
+enum hybrid_chpe_case
+{
+    HYBRID_CHPE_OLD_CONFIG_BOUNDARY,
+    HYBRID_CHPE_CONFIG_PARTIAL,
+    HYBRID_CHPE_DIRECTORY_PARTIAL,
+    HYBRID_CHPE_CONFIG_EXACT,
+    HYBRID_CHPE_POINTER_UNDERFLOW,
+    HYBRID_CHPE_METADATA_CROSSING,
+    HYBRID_CHPE_CODE_MAP_CROSSING,
+    HYBRID_CHPE_CODE_RANGE_CROSSING,
+    HYBRID_CHPE_REDIRECTION_CROSSING,
+    HYBRID_CHPE_REDIRECTION_COUNT_OVERFLOW,
+    HYBRID_CHPE_POINTER_SLOT_CROSSING,
+    HYBRID_CHPE_VALID_BOUNDARY,
+};
+
+enum hybrid_pe32_chpe_case
+{
+    HYBRID_PE32_CHPE_OLD_CONFIG_BOUNDARY,
+    HYBRID_PE32_CHPE_CONFIG_PARTIAL,
+    HYBRID_PE32_CHPE_METADATA_EXACT_FIT,
+};
+
+enum hybrid_arm64x_case
+{
+    HYBRID_ARM64X_VALID_V2_EXTENDED_HEADER,
+    HYBRID_ARM64X_VALID_V1,
+    HYBRID_ARM64X_CONFIG_PARTIAL,
+    HYBRID_ARM64X_SECTION_INVALID,
+    HYBRID_ARM64X_OFFSET_INVALID,
+    HYBRID_ARM64X_TABLE_HEADER_CROSSING,
+    HYBRID_ARM64X_TABLE_SIZE_CROSSING,
+    HYBRID_ARM64X_V1_ENTRY_CROSSING,
+    HYBRID_ARM64X_V1_FIXUPS_CROSSING,
+    HYBRID_ARM64X_V2_ENTRY_CROSSING,
+    HYBRID_ARM64X_V2_HEADER_TOO_SMALL,
+    HYBRID_ARM64X_V2_PAYLOAD_CROSSING,
+    HYBRID_ARM64X_RELOC_HEADER_CROSSING,
+    HYBRID_ARM64X_RELOC_BLOCK_CROSSING,
+    HYBRID_ARM64X_RELOC_OPERAND_CROSSING,
+    HYBRID_ARM64X_RELOC_UNKNOWN_TYPE,
+    HYBRID_ARM64X_RELOC_TARGET_CROSSING,
+    HYBRID_ARM64X_TRANSFORMED_IMPORT_FIRST_THUNK_TERMINATOR,
+    HYBRID_ARM64X_SHARED_IAT_ISOLATION,
+    HYBRID_ARM64X_IMPORT_LOOKUP_UNTERMINATED,
+    HYBRID_ARM64X_SHARED_SLOT_ISOLATION,
+    HYBRID_ARM64EC_SHARED_METADATA_ISOLATION,
+    HYBRID_ARM64EC_SECURITY_COOKIE_CROSSING,
+    HYBRID_ARM64X_UNEXPECTED_TRANSFORMED_MACHINE,
+    HYBRID_ARM64X_VALIDATE_BEFORE_APPLY,
+    HYBRID_ARM64X_TRANSFORMED_CHPE_ATOMICITY,
+};
+
+static BYTE *hybrid_section_ptr( BYTE *data, DWORD rva )
+{
+    assert( rva >= HYBRID_SECTION_RVA );
+    assert( rva - HYBRID_SECTION_RVA < HYBRID_SECTION_SIZE );
+    return data + rva - HYBRID_SECTION_RVA;
+}
+
+static void init_hybrid_image( IMAGE_NT_HEADERS *nt, IMAGE_SECTION_HEADER *image_section,
+                               BYTE *data, WORD machine )
+{
+    memset( data, 0, HYBRID_SECTION_SIZE );
+    *nt = nt_header_template;
+    memset( image_section, 0, sizeof(*image_section) );
+
+    nt->FileHeader.Machine = machine;
+    nt->FileHeader.NumberOfSections = 1;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(nt->OptionalHeader);
+    nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL;
+    nt->OptionalHeader.ImageBase = 0x180000000;
+    nt->OptionalHeader.SectionAlignment = HYBRID_SECTION_RVA;
+    nt->OptionalHeader.FileAlignment = HYBRID_FILE_OFFSET;
+    nt->OptionalHeader.SizeOfInitializedData = HYBRID_SECTION_SIZE;
+    nt->OptionalHeader.SizeOfHeaders = HYBRID_FILE_OFFSET;
+    nt->OptionalHeader.SizeOfImage = HYBRID_IMAGE_SIZE;
+    nt->OptionalHeader.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE |
+                                            IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+
+    memcpy( image_section->Name, ".hybrid", sizeof(".hybrid") );
+    image_section->Misc.VirtualSize = HYBRID_SECTION_SIZE;
+    image_section->VirtualAddress = HYBRID_SECTION_RVA;
+    image_section->SizeOfRawData = HYBRID_SECTION_SIZE;
+    image_section->PointerToRawData = HYBRID_FILE_OFFSET;
+    image_section->Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+                                     IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_SHARED;
+}
+
+static void init_hybrid_image32( IMAGE_NT_HEADERS32 *nt, IMAGE_SECTION_HEADER *image_section,
+                                 BYTE *data )
+{
+    memset( data, 0, HYBRID_SECTION_SIZE );
+    memset( nt, 0, sizeof(*nt) );
+    memset( image_section, 0, sizeof(*image_section) );
+
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_I386;
+    nt->FileHeader.NumberOfSections = 1;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(nt->OptionalHeader);
+    nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL;
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+    nt->OptionalHeader.MajorLinkerVersion = 1;
+    nt->OptionalHeader.SizeOfInitializedData = HYBRID_SECTION_SIZE;
+    nt->OptionalHeader.ImageBase = 0x10000000;
+    nt->OptionalHeader.SectionAlignment = HYBRID_SECTION_RVA;
+    nt->OptionalHeader.FileAlignment = HYBRID_FILE_OFFSET;
+    nt->OptionalHeader.MajorOperatingSystemVersion = 4;
+    nt->OptionalHeader.MajorImageVersion = 1;
+    nt->OptionalHeader.MajorSubsystemVersion = 4;
+    nt->OptionalHeader.SizeOfHeaders = HYBRID_FILE_OFFSET;
+    nt->OptionalHeader.SizeOfImage = HYBRID_IMAGE_SIZE;
+    nt->OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    nt->OptionalHeader.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE |
+                                            IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
+    nt->OptionalHeader.SizeOfStackReserve = 0x100000;
+    nt->OptionalHeader.SizeOfStackCommit = 0x1000;
+    nt->OptionalHeader.SizeOfHeapReserve = 0x100000;
+    nt->OptionalHeader.SizeOfHeapCommit = 0x1000;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+
+    memcpy( image_section->Name, ".hybrid", sizeof(".hybrid") );
+    image_section->Misc.VirtualSize = HYBRID_SECTION_SIZE;
+    image_section->VirtualAddress = HYBRID_SECTION_RVA;
+    image_section->SizeOfRawData = HYBRID_SECTION_SIZE;
+    image_section->PointerToRawData = HYBRID_FILE_OFFSET;
+    image_section->Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+                                     IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_SHARED;
+}
+
+static HANDLE create_hybrid_image_section( const IMAGE_NT_HEADERS *nt,
+                                           const IMAGE_SECTION_HEADER *image_section,
+                                           const BYTE *data, char filename[MAX_PATH],
+                                           NTSTATUS *create_status, BOOL truncate_tail )
+{
+    const DWORD expected_size = HYBRID_FILE_OFFSET + HYBRID_SECTION_SIZE;
+    LARGE_INTEGER end;
+    HANDLE file, mapping = NULL;
+    DWORD file_size;
+
+    filename[0] = 0;
+    *create_status = STATUS_UNSUCCESSFUL;
+    file_size = create_test_dll_sections( &dos_header, nt, image_section, data, filename );
+    ok( file_size == expected_size, "test image size %#lx, expected %#lx\n",
+        file_size, expected_size );
+    if (file_size != expected_size) goto failed;
+
+    file = CreateFileA( filename, GENERIC_READ | (truncate_tail ? GENERIC_WRITE : 0),
+                        FILE_SHARE_READ | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, 0, 0 );
+    ok( file != INVALID_HANDLE_VALUE, "CreateFileA(%s) failed, error %lu\n",
+        wine_dbgstr_a(filename), GetLastError() );
+    if (file == INVALID_HANDLE_VALUE) goto failed;
+
+    if (truncate_tail)
+    {
+        end.QuadPart = expected_size - 1;
+        if (!SetFilePointerEx( file, end, NULL, FILE_BEGIN ) || !SetEndOfFile( file ))
+        {
+            ok( 0, "failed to truncate test image, error %lu\n", GetLastError() );
+            CloseHandle( file );
+            goto failed;
+        }
+    }
+
+    *create_status = pNtCreateSection( &mapping,
+                                       STANDARD_RIGHTS_REQUIRED | SECTION_MAP_READ | SECTION_QUERY,
+                                       NULL, NULL, PAGE_READONLY, SEC_IMAGE, file );
+    CloseHandle( file );
+    if (*create_status == STATUS_SUCCESS) return mapping;
+
+failed:
+    if (mapping) CloseHandle( mapping );
+    if (filename[0])
+    {
+        BOOL ret = DeleteFileA( filename );
+
+        ok( ret, "DeleteFileA(%s) failed, error %lu\n", wine_dbgstr_a(filename), GetLastError() );
+    }
+    filename[0] = 0;
+    return NULL;
+}
+
+static void close_hybrid_image_section( HANDLE mapping, char filename[MAX_PATH] )
+{
+    BOOL ret;
+
+    if (mapping) CloseHandle( mapping );
+    if (!filename[0]) return;
+    ret = DeleteFileA( filename );
+    ok( ret, "DeleteFileA(%s) failed, error %lu\n", wine_dbgstr_a(filename), GetLastError() );
+    filename[0] = 0;
+}
+
+static NTSTATUS map_hybrid_image_section( HANDLE mapping, WORD machine, void **base )
+{
+    MEM_EXTENDED_PARAMETER ext = {0};
+    LARGE_INTEGER offset;
+    SIZE_T size = 0;
+
+    offset.QuadPart = 0;
+    *base = NULL;
+    ext.Type = MemExtendedParameterImageMachine;
+    ext.ULong = machine;
+    return pNtMapViewOfSectionEx( mapping, GetCurrentProcess(), base, &offset, &size,
+                                  0, PAGE_READONLY, &ext, 1 );
+}
+
+static void unmap_hybrid_image( void *base )
+{
+    NTSTATUS status;
+
+    if (!base) return;
+    status = pNtUnmapViewOfSection( GetCurrentProcess(), base );
+    ok( status == STATUS_SUCCESS, "NtUnmapViewOfSection returned %#lx\n", status );
+}
+
+static BOOL hybrid_status_matches( NTSTATUS status, NTSTATUS expected )
+{
+    return expected == STATUS_SUCCESS ? NT_SUCCESS(status) : status == expected;
+}
+
+static BOOL probe_hybrid_image_mapping(void)
+{
+    IMAGE_NT_HEADERS nt;
+    IMAGE_SECTION_HEADER image_section;
+    char filename[MAX_PATH] = {0};
+    BYTE *data;
+    HANDLE mapping;
+    NTSTATUS create_status, status;
+    void *base;
+
+    data = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, HYBRID_SECTION_SIZE );
+    ok( !!data, "failed to allocate hybrid image data\n" );
+    if (!data) return FALSE;
+    init_hybrid_image( &nt, &image_section, data, IMAGE_FILE_MACHINE_ARM64 );
+    mapping = create_hybrid_image_section( &nt, &image_section, data, filename,
+                                           &create_status, FALSE );
+    ok( create_status == STATUS_SUCCESS, "ARM64 control NtCreateSection returned %#lx\n",
+        create_status );
+    if (!mapping)
+    {
+        HeapFree( GetProcessHeap(), 0, data );
+        return FALSE;
+    }
+
+    status = map_hybrid_image_section( mapping, IMAGE_FILE_MACHINE_ARM64, &base );
+    if (status == STATUS_INVALID_PARAMETER || status == STATUS_NOT_IMPLEMENTED ||
+        status == STATUS_NOT_SUPPORTED)
+    {
+        win_skip( "MemExtendedParameterImageMachine is unsupported, status %#lx\n", status );
+        unmap_hybrid_image( base );
+        close_hybrid_image_section( mapping, filename );
+        HeapFree( GetProcessHeap(), 0, data );
+        return FALSE;
+    }
+    ok( NT_SUCCESS(status), "ARM64 control mapping returned %#lx\n", status );
+    unmap_hybrid_image( base );
+    close_hybrid_image_section( mapping, filename );
+    HeapFree( GetProcessHeap(), 0, data );
+    return NT_SUCCESS(status);
+}
+
+static void build_chpe_image( enum hybrid_chpe_case test, IMAGE_NT_HEADERS *nt,
+                              IMAGE_SECTION_HEADER *image_section, BYTE *data )
+{
+    const DWORD cfg_field_end = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) +
+                                sizeof(((IMAGE_LOAD_CONFIG_DIRECTORY *)0)->CHPEMetadataPointer);
+    const DWORD metadata_rva = HYBRID_SECTION_RVA + HYBRID_METADATA_OFFSET;
+    const DWORD array_rva = HYBRID_SECTION_RVA + HYBRID_ARRAY_OFFSET;
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
+    IMAGE_ARM64EC_METADATA *metadata;
+    IMAGE_CHPE_RANGE_ENTRY range = {0};
+    DWORD boundary_rva, old_size = sizeof(DWORD);
+
+    init_hybrid_image( nt, image_section, data, IMAGE_FILE_MACHINE_AMD64 );
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    dir->VirtualAddress = HYBRID_SECTION_RVA + HYBRID_CONFIG_OFFSET;
+    dir->Size = cfg_field_end;
+    cfg = (IMAGE_LOAD_CONFIG_DIRECTORY *)hybrid_section_ptr( data, dir->VirtualAddress );
+    cfg->Size = cfg_field_end;
+    cfg->CHPEMetadataPointer = nt->OptionalHeader.ImageBase + metadata_rva;
+    metadata = (IMAGE_ARM64EC_METADATA *)hybrid_section_ptr( data, metadata_rva );
+    metadata->Version = 2;
+
+    switch (test)
+    {
+    case HYBRID_CHPE_OLD_CONFIG_BOUNDARY:
+        dir->VirtualAddress = HYBRID_IMAGE_SIZE - sizeof(old_size);
+        dir->Size = sizeof(old_size);
+        memcpy( hybrid_section_ptr( data, dir->VirtualAddress ), &old_size, sizeof(old_size) );
+        break;
+    case HYBRID_CHPE_CONFIG_PARTIAL:
+        cfg->Size = cfg_field_end - 1;
+        break;
+    case HYBRID_CHPE_DIRECTORY_PARTIAL:
+        dir->Size = cfg_field_end - 1;
+        break;
+    case HYBRID_CHPE_CONFIG_EXACT:
+        break;
+    case HYBRID_CHPE_POINTER_UNDERFLOW:
+        cfg->CHPEMetadataPointer = nt->OptionalHeader.ImageBase - 1;
+        break;
+    case HYBRID_CHPE_METADATA_CROSSING:
+        cfg->CHPEMetadataPointer = nt->OptionalHeader.ImageBase + HYBRID_IMAGE_SIZE -
+                                   sizeof(*metadata) + 1;
+        break;
+    case HYBRID_CHPE_CODE_MAP_CROSSING:
+        metadata->CodeMap = HYBRID_IMAGE_SIZE - sizeof(IMAGE_CHPE_RANGE_ENTRY) + 1;
+        metadata->CodeMapCount = 1;
+        break;
+    case HYBRID_CHPE_CODE_RANGE_CROSSING:
+        metadata->CodeMap = array_rva;
+        metadata->CodeMapCount = 1;
+        range.StartOffset = HYBRID_IMAGE_SIZE | 1;
+        range.Length = 1;
+        memcpy( hybrid_section_ptr( data, array_rva ), &range, sizeof(range) );
+        break;
+    case HYBRID_CHPE_REDIRECTION_CROSSING:
+        metadata->RedirectionMetadata = HYBRID_IMAGE_SIZE -
+                                        sizeof(IMAGE_ARM64EC_REDIRECTION_ENTRY) + 1;
+        metadata->RedirectionMetadataCount = 1;
+        break;
+    case HYBRID_CHPE_REDIRECTION_COUNT_OVERFLOW:
+        metadata->RedirectionMetadata = array_rva;
+        metadata->RedirectionMetadataCount = 0x80000000;
+        break;
+    case HYBRID_CHPE_POINTER_SLOT_CROSSING:
+        metadata->__os_arm64x_helper3 = HYBRID_IMAGE_SIZE - 1;
+        break;
+    case HYBRID_CHPE_VALID_BOUNDARY:
+        boundary_rva = HYBRID_IMAGE_SIZE - sizeof(IMAGE_CHPE_RANGE_ENTRY);
+        metadata->CodeMap = boundary_rva;
+        metadata->CodeMapCount = 1;
+        metadata->RedirectionMetadata = boundary_rva;
+        metadata->RedirectionMetadataCount = 1;
+        range.StartOffset = HYBRID_SECTION_RVA | 1;
+        range.Length = 1;
+        memcpy( hybrid_section_ptr( data, boundary_rva ), &range, sizeof(range) );
+        break;
+    }
+}
+
+static void build_pe32_chpe_image( enum hybrid_pe32_chpe_case test, IMAGE_NT_HEADERS32 *nt,
+                                   IMAGE_SECTION_HEADER *image_section, BYTE *data )
+{
+    const DWORD field_end = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY32, CHPEMetadataPointer ) +
+                            sizeof(((IMAGE_LOAD_CONFIG_DIRECTORY32 *)0)->CHPEMetadataPointer);
+    const DWORD metadata_rva = HYBRID_IMAGE_SIZE - sizeof(IMAGE_CHPE_METADATA_X86);
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_LOAD_CONFIG_DIRECTORY32 *cfg;
+    IMAGE_CHPE_METADATA_X86 *metadata;
+    DWORD old_size = sizeof(DWORD);
+
+    init_hybrid_image32( nt, image_section, data );
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    dir->VirtualAddress = HYBRID_SECTION_RVA + HYBRID_CONFIG_OFFSET;
+    dir->Size = field_end;
+    cfg = (IMAGE_LOAD_CONFIG_DIRECTORY32 *)hybrid_section_ptr( data, dir->VirtualAddress );
+    cfg->Size = field_end;
+    cfg->CHPEMetadataPointer = nt->OptionalHeader.ImageBase + metadata_rva;
+    metadata = (IMAGE_CHPE_METADATA_X86 *)hybrid_section_ptr( data, metadata_rva );
+    metadata->Version = 1;
+
+    switch (test)
+    {
+    case HYBRID_PE32_CHPE_OLD_CONFIG_BOUNDARY:
+        dir->VirtualAddress = HYBRID_IMAGE_SIZE - sizeof(old_size);
+        dir->Size = sizeof(old_size);
+        memcpy( hybrid_section_ptr( data, dir->VirtualAddress ), &old_size, sizeof(old_size) );
+        break;
+    case HYBRID_PE32_CHPE_CONFIG_PARTIAL:
+        cfg->Size = field_end - 1;
+        break;
+    case HYBRID_PE32_CHPE_METADATA_EXACT_FIT:
+        break;
+    }
+}
+
+static void test_pe32_chpe_classification(void)
+{
+    static const struct
+    {
+        const char *name;
+        enum hybrid_pe32_chpe_case test;
+        NTSTATUS status;
+    } tests[] =
+    {
+        { "PE32 old load config ending at section boundary",
+          HYBRID_PE32_CHPE_OLD_CONFIG_BOUNDARY, STATUS_SUCCESS },
+        { "PE32 load-config CHPE field partially declared",
+          HYBRID_PE32_CHPE_CONFIG_PARTIAL, STATUS_INVALID_FILE_FOR_SECTION },
+        { "PE32 CHPE metadata ending at image boundary",
+          HYBRID_PE32_CHPE_METADATA_EXACT_FIT, STATUS_SUCCESS },
+    };
+    IMAGE_NT_HEADERS32 nt;
+    IMAGE_SECTION_HEADER image_section;
+    char filename[MAX_PATH] = {0};
+    NTSTATUS create_status;
+    HANDLE mapping;
+    BYTE *data;
+    unsigned int i;
+
+    data = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, HYBRID_SECTION_SIZE );
+    ok( !!data, "failed to allocate PE32 hybrid image data\n" );
+    if (!data) return;
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        winetest_push_context( "%s", tests[i].name );
+        build_pe32_chpe_image( tests[i].test, &nt, &image_section, data );
+        mapping = create_hybrid_image_section( (const IMAGE_NT_HEADERS *)&nt, &image_section,
+                                               data, filename, &create_status, FALSE );
+        ok( create_status == tests[i].status, "NtCreateSection returned %#lx, expected %#lx\n",
+            create_status, tests[i].status );
+        close_hybrid_image_section( mapping, filename );
+        winetest_pop_context();
+    }
+
+    HeapFree( GetProcessHeap(), 0, data );
+}
+
+static void setup_arm64x_config( IMAGE_NT_HEADERS *nt, BYTE *data )
+{
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
+
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    dir->VirtualAddress = HYBRID_SECTION_RVA + HYBRID_CONFIG_OFFSET;
+    dir->Size = sizeof(*cfg);
+    cfg = (IMAGE_LOAD_CONFIG_DIRECTORY *)hybrid_section_ptr( data, dir->VirtualAddress );
+    cfg->Size = sizeof(*cfg);
+    cfg->DynamicValueRelocTableOffset = HYBRID_TABLE_OFFSET;
+    cfg->DynamicValueRelocTableSection = 1;
+}
+
+static DWORD append_arm64x_value_block( BYTE *ptr, DWORD target_rva, unsigned int size_code,
+                                        const void *value )
+{
+    IMAGE_BASE_RELOCATION reloc;
+    const DWORD value_size = 1u << size_code;
+    DWORD block_size;
+    USHORT record, zero = 0;
+
+    block_size = ALIGN_SIZE( sizeof(reloc) + sizeof(record) + value_size + sizeof(zero),
+                             sizeof(DWORD) );
+    memset( ptr, 0, block_size );
+    reloc.VirtualAddress = target_rva & ~0xfff;
+    reloc.SizeOfBlock = block_size;
+    record = (target_rva & 0xfff) | (IMAGE_DVRT_ARM64X_FIXUP_TYPE_VALUE << 12) |
+             (size_code << 14);
+    memcpy( ptr, &reloc, sizeof(reloc) );
+    memcpy( ptr + sizeof(reloc), &record, sizeof(record) );
+    memcpy( ptr + sizeof(reloc) + sizeof(record), value, value_size );
+    memcpy( ptr + sizeof(reloc) + sizeof(record) + value_size, &zero, sizeof(zero) );
+    return block_size;
+}
+
+static DWORD append_arm64x_unknown_block( BYTE *ptr, DWORD target_rva )
+{
+    IMAGE_BASE_RELOCATION reloc;
+    USHORT records[2];
+
+    reloc.VirtualAddress = target_rva & ~0xfff;
+    reloc.SizeOfBlock = sizeof(reloc) + sizeof(records);
+    records[0] = (target_rva & 0xfff) | (3 << 12);
+    records[1] = 0;
+    memcpy( ptr, &reloc, sizeof(reloc) );
+    memcpy( ptr + sizeof(reloc), records, sizeof(records) );
+    return reloc.SizeOfBlock;
+}
+
+static void set_arm64x_v1_table( BYTE *data, const BYTE *fixups, DWORD fixup_size )
+{
+    IMAGE_DYNAMIC_RELOCATION_TABLE *table;
+    IMAGE_DYNAMIC_RELOCATION64 dyn = {0};
+
+    table = (IMAGE_DYNAMIC_RELOCATION_TABLE *)(data + HYBRID_TABLE_OFFSET);
+    table->Version = 1;
+    table->Size = sizeof(dyn) + fixup_size;
+    dyn.Symbol = IMAGE_DYNAMIC_RELOCATION_ARM64X;
+    dyn.BaseRelocSize = fixup_size;
+    memcpy( table + 1, &dyn, sizeof(dyn) );
+    memcpy( (BYTE *)(table + 1) + sizeof(dyn), fixups, fixup_size );
+}
+
+static void set_arm64x_v2_table( BYTE *data, DWORD extra_header_size )
+{
+    const DWORD machine_rva = sizeof(IMAGE_DOS_HEADER) +
+                              offsetof( IMAGE_NT_HEADERS, FileHeader.Machine );
+    IMAGE_DYNAMIC_RELOCATION_TABLE *table;
+    IMAGE_DYNAMIC_RELOCATION64_V2 dyn = {0};
+    BYTE fixups[32] = {0};
+    DWORD fixup_size;
+    WORD machine = IMAGE_FILE_MACHINE_AMD64;
+
+    fixup_size = append_arm64x_value_block( fixups, machine_rva,
+                                            IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &machine );
+    table = (IMAGE_DYNAMIC_RELOCATION_TABLE *)(data + HYBRID_TABLE_OFFSET);
+    table->Version = 2;
+    dyn.HeaderSize = sizeof(dyn) + extra_header_size;
+    dyn.FixupInfoSize = fixup_size;
+    dyn.Symbol = IMAGE_DYNAMIC_RELOCATION_ARM64X;
+    table->Size = dyn.HeaderSize + dyn.FixupInfoSize;
+    memcpy( table + 1, &dyn, sizeof(dyn) );
+    memcpy( (BYTE *)(table + 1) + dyn.HeaderSize, fixups, fixup_size );
+}
+
+static void build_arm64x_image( enum hybrid_arm64x_case test, IMAGE_NT_HEADERS *nt,
+                                IMAGE_SECTION_HEADER *image_section, BYTE *data )
+{
+    const DWORD machine_rva = sizeof(IMAGE_DOS_HEADER) +
+                              offsetof( IMAGE_NT_HEADERS, FileHeader.Machine );
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
+    IMAGE_DYNAMIC_RELOCATION_TABLE *table;
+    IMAGE_DYNAMIC_RELOCATION64 dyn1 = {0};
+    IMAGE_DYNAMIC_RELOCATION64_V2 dyn2 = {0};
+    IMAGE_BASE_RELOCATION reloc = {0};
+    BYTE fixups[128] = {0};
+    DWORD fixup_size = 0;
+    USHORT record, marker = 0x1357, changed = 0x2468;
+    WORD machine = IMAGE_FILE_MACHINE_AMD64;
+    ULONGLONG value64 = 0x123456789abcdef0;
+
+    init_hybrid_image( nt, image_section, data, IMAGE_FILE_MACHINE_ARM64 );
+    setup_arm64x_config( nt, data );
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    cfg = (IMAGE_LOAD_CONFIG_DIRECTORY *)hybrid_section_ptr( data, dir->VirtualAddress );
+    table = (IMAGE_DYNAMIC_RELOCATION_TABLE *)(data + HYBRID_TABLE_OFFSET);
+
+    switch (test)
+    {
+    case HYBRID_ARM64X_VALID_V2_EXTENDED_HEADER:
+        set_arm64x_v2_table( data, 8 );
+        break;
+    case HYBRID_ARM64X_VALID_V1:
+        fixup_size = append_arm64x_value_block( fixups, machine_rva,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &machine );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    case HYBRID_ARM64X_CONFIG_PARTIAL:
+        set_arm64x_v2_table( data, 0 );
+        cfg->Size = dir->Size = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY,
+                                          DynamicValueRelocTableSection ) + 1;
+        break;
+    case HYBRID_ARM64X_SECTION_INVALID:
+        cfg->DynamicValueRelocTableSection = 2;
+        break;
+    case HYBRID_ARM64X_OFFSET_INVALID:
+        cfg->DynamicValueRelocTableOffset = HYBRID_SECTION_SIZE;
+        break;
+    case HYBRID_ARM64X_TABLE_HEADER_CROSSING:
+        cfg->DynamicValueRelocTableOffset = HYBRID_SECTION_SIZE - sizeof(*table) + 1;
+        break;
+    case HYBRID_ARM64X_TABLE_SIZE_CROSSING:
+        set_arm64x_v2_table( data, 0 );
+        table->Size = HYBRID_SECTION_SIZE;
+        break;
+    case HYBRID_ARM64X_V1_ENTRY_CROSSING:
+        table->Version = 1;
+        table->Size = sizeof(dyn1) - 1;
+        dyn1.Symbol = IMAGE_DYNAMIC_RELOCATION_ARM64X;
+        memcpy( table + 1, &dyn1, sizeof(dyn1) );
+        break;
+    case HYBRID_ARM64X_V1_FIXUPS_CROSSING:
+        table->Version = 1;
+        table->Size = sizeof(dyn1);
+        dyn1.Symbol = IMAGE_DYNAMIC_RELOCATION_ARM64X;
+        dyn1.BaseRelocSize = 1;
+        memcpy( table + 1, &dyn1, sizeof(dyn1) );
+        break;
+    case HYBRID_ARM64X_V2_ENTRY_CROSSING:
+        table->Version = 2;
+        table->Size = sizeof(dyn2) - 1;
+        dyn2.HeaderSize = sizeof(dyn2);
+        dyn2.Symbol = IMAGE_DYNAMIC_RELOCATION_ARM64X;
+        memcpy( table + 1, &dyn2, sizeof(dyn2) );
+        break;
+    case HYBRID_ARM64X_V2_HEADER_TOO_SMALL:
+        table->Version = 2;
+        table->Size = sizeof(dyn2);
+        dyn2.HeaderSize = sizeof(dyn2) - 1;
+        dyn2.Symbol = IMAGE_DYNAMIC_RELOCATION_ARM64X;
+        memcpy( table + 1, &dyn2, sizeof(dyn2) );
+        break;
+    case HYBRID_ARM64X_V2_PAYLOAD_CROSSING:
+        set_arm64x_v2_table( data, 8 );
+        table->Size--;
+        break;
+    case HYBRID_ARM64X_RELOC_HEADER_CROSSING:
+        fixups[0] = 1;
+        set_arm64x_v1_table( data, fixups, sizeof(reloc) - 1 );
+        break;
+    case HYBRID_ARM64X_RELOC_BLOCK_CROSSING:
+        reloc.SizeOfBlock = sizeof(reloc) + 4;
+        memcpy( fixups, &reloc, sizeof(reloc) );
+        set_arm64x_v1_table( data, fixups, sizeof(reloc) + sizeof(record) );
+        break;
+    case HYBRID_ARM64X_RELOC_OPERAND_CROSSING:
+        reloc.SizeOfBlock = sizeof(reloc) + 2 * sizeof(record);
+        record = (machine_rva & 0xfff) | (IMAGE_DVRT_ARM64X_FIXUP_TYPE_VALUE << 12) |
+                 (IMAGE_DVRT_ARM64X_FIXUP_SIZE_8BYTES << 14);
+        memcpy( fixups, &reloc, sizeof(reloc) );
+        memcpy( fixups + sizeof(reloc), &record, sizeof(record) );
+        set_arm64x_v1_table( data, fixups, reloc.SizeOfBlock );
+        break;
+    case HYBRID_ARM64X_RELOC_UNKNOWN_TYPE:
+        fixup_size = append_arm64x_unknown_block( fixups, machine_rva );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    case HYBRID_ARM64X_RELOC_TARGET_CROSSING:
+        fixup_size = append_arm64x_value_block( fixups, HYBRID_IMAGE_SIZE - 4,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_8BYTES, &value64 );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    case HYBRID_ARM64X_TRANSFORMED_IMPORT_FIRST_THUNK_TERMINATOR:
+    {
+        const DWORD import_rva = HYBRID_SECTION_RVA + HYBRID_IMPORT_OFFSET;
+        const DWORD import_size = sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        const DWORD import_rva_field = sizeof(IMAGE_DOS_HEADER) +
+            offsetof( IMAGE_NT_HEADERS, OptionalHeader.DataDirectory[
+                      IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress );
+        const DWORD import_size_field = sizeof(IMAGE_DOS_HEADER) +
+            offsetof( IMAGE_NT_HEADERS, OptionalHeader.DataDirectory[
+                      IMAGE_DIRECTORY_ENTRY_IMPORT].Size );
+        IMAGE_IMPORT_DESCRIPTOR *descriptor;
+
+        descriptor = (IMAGE_IMPORT_DESCRIPTOR *)hybrid_section_ptr( data, import_rva );
+        descriptor->Name = HYBRID_IMAGE_SIZE - 1;
+        descriptor->FirstThunk = 0;
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, machine_rva,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &machine );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, import_rva_field,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_4BYTES, &import_rva );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, import_size_field,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_4BYTES, &import_size );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    }
+    case HYBRID_ARM64X_SHARED_IAT_ISOLATION:
+    case HYBRID_ARM64X_IMPORT_LOOKUP_UNTERMINATED:
+    {
+        const DWORD import_rva = HYBRID_SECTION_RVA + HYBRID_IMPORT_OFFSET;
+        const DWORD lookup_rva = test == HYBRID_ARM64X_IMPORT_LOOKUP_UNTERMINATED ?
+                                 HYBRID_IMAGE_SIZE - sizeof(IMAGE_THUNK_DATA64) : import_rva + 0x100;
+        const DWORD name_rva = HYBRID_SECTION_RVA + HYBRID_NAME_OFFSET;
+        const DWORD module_rva = name_rva + 0x100;
+        const DWORD iat_rva = HYBRID_SECTION_RVA + HYBRID_IAT_OFFSET;
+        const DWORD import_size = 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        const DWORD import_rva_field = sizeof(IMAGE_DOS_HEADER) +
+            offsetof( IMAGE_NT_HEADERS, OptionalHeader.DataDirectory[
+                      IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress );
+        const DWORD import_size_field = sizeof(IMAGE_DOS_HEADER) +
+            offsetof( IMAGE_NT_HEADERS, OptionalHeader.DataDirectory[
+                      IMAGE_DIRECTORY_ENTRY_IMPORT].Size );
+        IMAGE_IMPORT_DESCRIPTOR *descriptor;
+        IMAGE_THUNK_DATA64 *lookup, *iat;
+        IMAGE_IMPORT_BY_NAME *import_name;
+
+        memcpy( data + HYBRID_MARKER_OFFSET, &marker, sizeof(marker) );
+        descriptor = (IMAGE_IMPORT_DESCRIPTOR *)hybrid_section_ptr( data, import_rva );
+        descriptor[0].OriginalFirstThunk = lookup_rva;
+        descriptor[0].Name = module_rva;
+        descriptor[0].FirstThunk = iat_rva;
+        lookup = (IMAGE_THUNK_DATA64 *)hybrid_section_ptr( data, lookup_rva );
+        lookup[0].u1.AddressOfData = name_rva;
+        if (test == HYBRID_ARM64X_SHARED_IAT_ISOLATION) lookup[1].u1.AddressOfData = 0;
+        iat = (IMAGE_THUNK_DATA64 *)hybrid_section_ptr( data, iat_rva );
+        iat[0].u1.AddressOfData = name_rva;
+        iat[1].u1.AddressOfData = 0;
+        import_name = (IMAGE_IMPORT_BY_NAME *)hybrid_section_ptr( data, name_rva );
+        import_name->Hint = 0;
+        memcpy( import_name->Name, "x", sizeof("x") );
+        memcpy( hybrid_section_ptr( data, module_rva ), "x.dll", sizeof("x.dll") );
+
+        if (test == HYBRID_ARM64X_IMPORT_LOOKUP_UNTERMINATED)
+            fixup_size += append_arm64x_value_block(
+                fixups + fixup_size, HYBRID_SECTION_RVA + HYBRID_MARKER_OFFSET,
+                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &changed );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, machine_rva,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &machine );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, import_rva_field,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_4BYTES, &import_rva );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, import_size_field,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_4BYTES, &import_size );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    }
+    case HYBRID_ARM64X_SHARED_SLOT_ISOLATION:
+    {
+        const DWORD metadata_rva = HYBRID_SECTION_RVA + HYBRID_METADATA_OFFSET;
+        const DWORD slot_rva = HYBRID_SECTION_RVA + HYBRID_SLOT_OFFSET;
+        IMAGE_ARM64EC_METADATA *metadata;
+        ULONGLONG metadata_va = nt->OptionalHeader.ImageBase + metadata_rva;
+
+        memcpy( data + HYBRID_MARKER_OFFSET, &marker, sizeof(marker) );
+        metadata = (IMAGE_ARM64EC_METADATA *)hybrid_section_ptr( data, metadata_rva );
+        metadata->Version = 2;
+        metadata->__os_arm64x_dispatch_call = slot_rva;
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, machine_rva,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &machine );
+        fixup_size += append_arm64x_value_block(
+            fixups + fixup_size, HYBRID_SECTION_RVA + HYBRID_CONFIG_OFFSET +
+            offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ),
+            IMAGE_DVRT_ARM64X_FIXUP_SIZE_8BYTES, &metadata_va );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    }
+    case HYBRID_ARM64EC_SHARED_METADATA_ISOLATION:
+    {
+        const DWORD cookie_rva = HYBRID_SECTION_RVA;
+        const DWORD config_rva = HYBRID_SECTION_RVA + 0x4000;
+        const DWORD metadata_rva = HYBRID_SECTION_RVA + 0x8000;
+        const DWORD code_map_rva = HYBRID_SECTION_RVA + 0xc000;
+        IMAGE_ARM64EC_METADATA *metadata;
+        IMAGE_CHPE_RANGE_ENTRY *code;
+
+        init_hybrid_image( nt, image_section, data, IMAGE_FILE_MACHINE_AMD64 );
+        dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+        dir->VirtualAddress = config_rva;
+        dir->Size = sizeof(*cfg);
+        cfg = (IMAGE_LOAD_CONFIG_DIRECTORY *)hybrid_section_ptr( data, config_rva );
+        cfg->Size = sizeof(*cfg);
+        cfg->SecurityCookie = nt->OptionalHeader.ImageBase + cookie_rva;
+        cfg->CHPEMetadataPointer = nt->OptionalHeader.ImageBase + metadata_rva;
+        value64 = 0x123456789abcdef0;
+        memcpy( hybrid_section_ptr( data, cookie_rva ), &value64, sizeof(value64) );
+        metadata = (IMAGE_ARM64EC_METADATA *)hybrid_section_ptr( data, metadata_rva );
+        metadata->Version = 2;
+        metadata->CodeMap = code_map_rva;
+        metadata->CodeMapCount = 1;
+        code = (IMAGE_CHPE_RANGE_ENTRY *)hybrid_section_ptr( data, code_map_rva );
+        code->StartOffset = HYBRID_SECTION_RVA | 1;
+        code->Length = 1;
+        break;
+    }
+    case HYBRID_ARM64EC_SECURITY_COOKIE_CROSSING:
+    {
+        const DWORD config_rva = HYBRID_SECTION_RVA + 0x4000;
+
+        init_hybrid_image( nt, image_section, data, IMAGE_FILE_MACHINE_AMD64 );
+        dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+        dir->VirtualAddress = config_rva;
+        dir->Size = sizeof(*cfg);
+        cfg = (IMAGE_LOAD_CONFIG_DIRECTORY *)hybrid_section_ptr( data, config_rva );
+        cfg->Size = sizeof(*cfg);
+        cfg->SecurityCookie = nt->OptionalHeader.ImageBase + HYBRID_IMAGE_SIZE - 4;
+        break;
+    }
+    case HYBRID_ARM64X_UNEXPECTED_TRANSFORMED_MACHINE:
+    {
+        WORD unexpected_machine = IMAGE_FILE_MACHINE_I386;
+
+        memcpy( data + HYBRID_MARKER_OFFSET, &marker, sizeof(marker) );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size,
+                                                HYBRID_SECTION_RVA + HYBRID_MARKER_OFFSET,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &changed );
+        fixup_size += append_arm64x_value_block(
+            fixups + fixup_size, machine_rva, IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES,
+            &unexpected_machine );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    }
+    case HYBRID_ARM64X_VALIDATE_BEFORE_APPLY:
+        memcpy( data + HYBRID_MARKER_OFFSET, &marker, sizeof(marker) );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size,
+                                                HYBRID_SECTION_RVA + HYBRID_MARKER_OFFSET,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &changed );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, machine_rva,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &machine );
+        fixup_size += append_arm64x_unknown_block( fixups + fixup_size, machine_rva );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    case HYBRID_ARM64X_TRANSFORMED_CHPE_ATOMICITY:
+    {
+        const DWORD metadata_rva = HYBRID_SECTION_RVA + HYBRID_METADATA_OFFSET;
+        IMAGE_ARM64EC_METADATA *metadata;
+        ULONGLONG metadata_va = nt->OptionalHeader.ImageBase + metadata_rva;
+        DWORD bad_code_map = HYBRID_IMAGE_SIZE - sizeof(IMAGE_CHPE_RANGE_ENTRY) + 1;
+        DWORD count = 1;
+
+        memcpy( data + HYBRID_MARKER_OFFSET, &marker, sizeof(marker) );
+        metadata = (IMAGE_ARM64EC_METADATA *)hybrid_section_ptr( data, metadata_rva );
+        metadata->Version = 2;
+        fixup_size += append_arm64x_value_block( fixups + fixup_size,
+                                                HYBRID_SECTION_RVA + HYBRID_MARKER_OFFSET,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &changed );
+        fixup_size += append_arm64x_value_block( fixups + fixup_size, machine_rva,
+                                                IMAGE_DVRT_ARM64X_FIXUP_SIZE_2BYTES, &machine );
+        fixup_size += append_arm64x_value_block(
+            fixups + fixup_size, HYBRID_SECTION_RVA + HYBRID_CONFIG_OFFSET +
+            offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ),
+            IMAGE_DVRT_ARM64X_FIXUP_SIZE_8BYTES, &metadata_va );
+        fixup_size += append_arm64x_value_block(
+            fixups + fixup_size, metadata_rva + offsetof( IMAGE_ARM64EC_METADATA, CodeMap ),
+            IMAGE_DVRT_ARM64X_FIXUP_SIZE_4BYTES, &bad_code_map );
+        fixup_size += append_arm64x_value_block(
+            fixups + fixup_size, metadata_rva + offsetof( IMAGE_ARM64EC_METADATA, CodeMapCount ),
+            IMAGE_DVRT_ARM64X_FIXUP_SIZE_4BYTES, &count );
+        set_arm64x_v1_table( data, fixups, fixup_size );
+        break;
+    }
+    }
+}
+
+static void test_arm64ec_metadata_bounds(void)
+{
+    static const struct
+    {
+        const char *name;
+        enum hybrid_chpe_case test;
+        NTSTATUS create_status;
+        NTSTATUS map_status;
+        BOOL truncate_tail;
+    } chpe_tests[] =
+    {
+        { "old load config ending at section boundary", HYBRID_CHPE_OLD_CONFIG_BOUNDARY,
+          STATUS_SUCCESS, STATUS_SUCCESS, FALSE },
+        { "old load config with one-byte raw tail missing", HYBRID_CHPE_OLD_CONFIG_BOUNDARY,
+          STATUS_INVALID_FILE_FOR_SECTION, STATUS_UNSUCCESSFUL, TRUE },
+        { "load-config CHPE field partially declared", HYBRID_CHPE_CONFIG_PARTIAL,
+          STATUS_INVALID_FILE_FOR_SECTION, STATUS_UNSUCCESSFUL, FALSE },
+        { "load-config CHPE field partially present", HYBRID_CHPE_DIRECTORY_PARTIAL,
+          STATUS_INVALID_FILE_FOR_SECTION, STATUS_UNSUCCESSFUL, FALSE },
+        { "load-config CHPE field exact", HYBRID_CHPE_CONFIG_EXACT,
+          STATUS_SUCCESS, STATUS_SUCCESS, FALSE },
+        { "CHPE VA underflow", HYBRID_CHPE_POINTER_UNDERFLOW,
+          STATUS_INVALID_FILE_FOR_SECTION, STATUS_UNSUCCESSFUL, FALSE },
+        { "CHPE metadata crossing image", HYBRID_CHPE_METADATA_CROSSING,
+          STATUS_INVALID_FILE_FOR_SECTION, STATUS_UNSUCCESSFUL, FALSE },
+        { "CHPE CodeMap array crossing image", HYBRID_CHPE_CODE_MAP_CROSSING,
+          STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "CHPE CodeMap range crossing image", HYBRID_CHPE_CODE_RANGE_CROSSING,
+          STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "CHPE redirection array crossing image", HYBRID_CHPE_REDIRECTION_CROSSING,
+          STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "CHPE redirection count overflow", HYBRID_CHPE_REDIRECTION_COUNT_OVERFLOW,
+          STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "CHPE pointer slot crossing image", HYBRID_CHPE_POINTER_SLOT_CROSSING,
+          STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "CHPE arrays ending at image boundary", HYBRID_CHPE_VALID_BOUNDARY,
+          STATUS_SUCCESS, STATUS_SUCCESS, FALSE },
+    };
+    static const struct
+    {
+        const char *name;
+        enum hybrid_arm64x_case test;
+        NTSTATUS map_status;
+        BOOL check_atomicity;
+    } arm64x_tests[] =
+    {
+        { "ARM64X V2 extended HeaderSize", HYBRID_ARM64X_VALID_V2_EXTENDED_HEADER,
+          STATUS_SUCCESS, FALSE },
+        { "ARM64X V1 exact entry stride", HYBRID_ARM64X_VALID_V1, STATUS_SUCCESS, FALSE },
+        { "ARM64X load-config field partial", HYBRID_ARM64X_CONFIG_PARTIAL,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X table section", HYBRID_ARM64X_SECTION_INVALID,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X table offset", HYBRID_ARM64X_OFFSET_INVALID,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X table header crossing section", HYBRID_ARM64X_TABLE_HEADER_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X table size crossing section", HYBRID_ARM64X_TABLE_SIZE_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X V1 entry crossing table", HYBRID_ARM64X_V1_ENTRY_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X V1 fixups crossing table", HYBRID_ARM64X_V1_FIXUPS_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X V2 entry crossing table", HYBRID_ARM64X_V2_ENTRY_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X V2 HeaderSize too small", HYBRID_ARM64X_V2_HEADER_TOO_SMALL,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X V2 payload crossing table", HYBRID_ARM64X_V2_PAYLOAD_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X relocation header crossing", HYBRID_ARM64X_RELOC_HEADER_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X relocation block crossing", HYBRID_ARM64X_RELOC_BLOCK_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X relocation operand crossing", HYBRID_ARM64X_RELOC_OPERAND_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X relocation unknown type", HYBRID_ARM64X_RELOC_UNKNOWN_TYPE,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X relocation target crossing image", HYBRID_ARM64X_RELOC_TARGET_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X transformed import FirstThunk terminator",
+          HYBRID_ARM64X_TRANSFORMED_IMPORT_FIRST_THUNK_TERMINATOR, STATUS_SUCCESS, FALSE },
+        { "ARM64X shared IAT isolation", HYBRID_ARM64X_SHARED_IAT_ISOLATION,
+          STATUS_SUCCESS, FALSE },
+        { "ARM64X unterminated import lookup", HYBRID_ARM64X_IMPORT_LOOKUP_UNTERMINATED,
+          STATUS_INVALID_IMAGE_FORMAT, TRUE },
+        { "ARM64X shared hybrid slot isolation", HYBRID_ARM64X_SHARED_SLOT_ISOLATION,
+          STATUS_SUCCESS, FALSE },
+        { "ARM64EC shared metadata isolation", HYBRID_ARM64EC_SHARED_METADATA_ISOLATION,
+          STATUS_SUCCESS, FALSE },
+        { "ARM64EC security cookie crossing image",
+          HYBRID_ARM64EC_SECURITY_COOKIE_CROSSING, STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "ARM64X unexpected transformed machine", HYBRID_ARM64X_UNEXPECTED_TRANSFORMED_MACHINE,
+          STATUS_INVALID_IMAGE_FORMAT, TRUE },
+        { "ARM64X validate before apply", HYBRID_ARM64X_VALIDATE_BEFORE_APPLY,
+          STATUS_INVALID_IMAGE_FORMAT, TRUE },
+        { "ARM64X transformed CHPE validate before apply",
+          HYBRID_ARM64X_TRANSFORMED_CHPE_ATOMICITY, STATUS_INVALID_IMAGE_FORMAT, TRUE },
+    };
+    SYSTEM_CPU_INFORMATION cpu_info;
+    ULONG return_length = 0;
+    IMAGE_NT_HEADERS nt;
+    IMAGE_SECTION_HEADER image_section;
+    char filename[MAX_PATH] = {0};
+    NTSTATUS create_status, status;
+    HANDLE mapping;
+    BYTE *data;
+    void *base, *source_base;
+    unsigned int i;
+
+    if (strcmp( winetest_platform, "wine" ))
+    {
+        skip( "ARM64EC/ARM64X metadata mapping is Wine-specific.\n" );
+        return;
+    }
+    if (!pNtMapViewOfSectionEx || !pRtlGetNativeSystemInformation)
+    {
+        win_skip( "ARM64 hybrid image mapping exports are unavailable.\n" );
+        return;
+    }
+    status = pRtlGetNativeSystemInformation( SystemCpuInformation, &cpu_info,
+                                             sizeof(cpu_info), &return_length );
+    if (status || cpu_info.ProcessorArchitecture != PROCESSOR_ARCHITECTURE_ARM64)
+    {
+        win_skip( "hybrid metadata tests require a native ARM64 host, status %#lx architecture %u\n",
+                  status, status ? ~0u : cpu_info.ProcessorArchitecture );
+        return;
+    }
+    test_pe32_chpe_classification();
+    if (!probe_hybrid_image_mapping()) return;
+
+    data = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, HYBRID_SECTION_SIZE );
+    ok( !!data, "failed to allocate hybrid image data\n" );
+    if (!data) return;
+
+    for (i = 0; i < ARRAY_SIZE(chpe_tests); i++)
+    {
+        base = NULL;
+        winetest_push_context( "%s", chpe_tests[i].name );
+        build_chpe_image( chpe_tests[i].test, &nt, &image_section, data );
+        mapping = create_hybrid_image_section( &nt, &image_section, data, filename,
+                                               &create_status, chpe_tests[i].truncate_tail );
+        ok( create_status == chpe_tests[i].create_status,
+            "NtCreateSection returned %#lx, expected %#lx\n",
+            create_status, chpe_tests[i].create_status );
+        if (mapping)
+        {
+            status = map_hybrid_image_section( mapping, IMAGE_FILE_MACHINE_AMD64, &base );
+            ok( hybrid_status_matches( status, chpe_tests[i].map_status ),
+                "NtMapViewOfSectionEx returned %#lx, expected %#lx\n",
+                status, chpe_tests[i].map_status );
+            unmap_hybrid_image( base );
+        }
+        close_hybrid_image_section( mapping, filename );
+        winetest_pop_context();
+    }
+
+    for (i = 0; i < ARRAY_SIZE(arm64x_tests); i++)
+    {
+        base = NULL;
+        source_base = NULL;
+        winetest_push_context( "%s", arm64x_tests[i].name );
+        build_arm64x_image( arm64x_tests[i].test, &nt, &image_section, data );
+        mapping = create_hybrid_image_section( &nt, &image_section, data, filename,
+                                               &create_status, FALSE );
+        ok( create_status == STATUS_SUCCESS, "NtCreateSection returned %#lx\n", create_status );
+        if (mapping)
+        {
+            if (arm64x_tests[i].test == HYBRID_ARM64X_SHARED_IAT_ISOLATION)
+            {
+                status = map_hybrid_image_section( mapping, IMAGE_FILE_MACHINE_ARM64,
+                                                   &source_base );
+                ok( NT_SUCCESS(status), "native ARM64 source mapping returned %#lx\n", status );
+            }
+            status = map_hybrid_image_section( mapping, IMAGE_FILE_MACHINE_AMD64, &base );
+            if (arm64x_tests[i].map_status == STATUS_SUCCESS)
+            {
+                ok( NT_SUCCESS(status), "NtMapViewOfSectionEx returned %#lx\n", status );
+                if (NT_SUCCESS(status))
+                {
+                    ok( ((IMAGE_NT_HEADERS *)((char *)base + ((IMAGE_DOS_HEADER *)base)->e_lfanew))->
+                        FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64,
+                        "ARM64X mapping did not rewrite the machine field\n" );
+                    if (arm64x_tests[i].test ==
+                        HYBRID_ARM64X_TRANSFORMED_IMPORT_FIRST_THUNK_TERMINATOR)
+                    {
+                        IMAGE_IMPORT_DESCRIPTOR descriptor;
+
+                        memcpy( &descriptor, (BYTE *)base + HYBRID_SECTION_RVA +
+                                HYBRID_IMPORT_OFFSET, sizeof(descriptor) );
+                        ok( descriptor.Name && !descriptor.FirstThunk,
+                            "transformed import descriptor has Name %#lx FirstThunk %#lx\n",
+                            descriptor.Name, descriptor.FirstThunk );
+                    }
+                    if (arm64x_tests[i].test == HYBRID_ARM64X_SHARED_SLOT_ISOLATION)
+                    {
+                        ULONGLONG slot = 0, changed = 0x123456789abcdef0;
+
+                        memcpy( &slot, (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_SLOT_OFFSET,
+                                sizeof(slot) );
+                        ok( !slot, "hybrid slot initially %#I64x, expected zero\n", slot );
+                        memcpy( (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_SLOT_OFFSET,
+                                &changed, sizeof(changed) );
+                        memcpy( &slot, (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_SLOT_OFFSET,
+                                sizeof(slot) );
+                        ok( slot == changed, "hybrid slot %#I64x, expected %#I64x\n",
+                            slot, changed );
+                    }
+                    if (arm64x_tests[i].test == HYBRID_ARM64EC_SHARED_METADATA_ISOLATION)
+                    {
+                        const DWORD cookie_rva = HYBRID_SECTION_RVA;
+                        const DWORD config_rva = HYBRID_SECTION_RVA + 0x4000;
+                        const DWORD metadata_rva = HYBRID_SECTION_RVA + 0x8000;
+                        const DWORD code_map_rva = HYBRID_SECTION_RVA + 0xc000;
+                        const ULONGLONG metadata_va = nt.OptionalHeader.ImageBase + metadata_rva;
+                        const ULONGLONG initial_cookie = 0x123456789abcdef0;
+                        const ULONGLONG changed_cookie = 0xfedcba9876543210;
+                        IMAGE_LOAD_CONFIG_DIRECTORY *mapped_cfg, *second_cfg;
+                        IMAGE_ARM64EC_METADATA *mapped_metadata, *second_metadata;
+                        IMAGE_CHPE_RANGE_ENTRY *mapped_code, *second_code;
+                        NTSTATUS second_status;
+                        ULONGLONG cookie;
+                        void *second_base = NULL;
+
+                        mapped_cfg = (IMAGE_LOAD_CONFIG_DIRECTORY *)((BYTE *)base + config_rva);
+                        mapped_metadata = (IMAGE_ARM64EC_METADATA *)((BYTE *)base + metadata_rva);
+                        mapped_code = (IMAGE_CHPE_RANGE_ENTRY *)((BYTE *)base + code_map_rva);
+                        memcpy( &cookie, (BYTE *)base + cookie_rva, sizeof(cookie) );
+                        ok( cookie == initial_cookie, "security cookie %#I64x\n", cookie );
+                        ok( mapped_cfg->CHPEMetadataPointer == metadata_va,
+                            "metadata pointer %#I64x, expected %#I64x\n",
+                            mapped_cfg->CHPEMetadataPointer, metadata_va );
+                        ok( mapped_metadata->CodeMap == code_map_rva &&
+                            mapped_metadata->CodeMapCount == 1,
+                            "CodeMap %#lx count %#lx\n", mapped_metadata->CodeMap,
+                            mapped_metadata->CodeMapCount );
+                        ok( mapped_code->StartOffset == (HYBRID_SECTION_RVA | 1) &&
+                            mapped_code->Length == 1,
+                            "CodeMap entry start %#lx length %#lx\n",
+                            mapped_code->StartOffset, mapped_code->Length );
+
+                        memcpy( (BYTE *)base + cookie_rva, &changed_cookie,
+                                sizeof(changed_cookie) );
+                        mapped_cfg->CHPEMetadataPointer = 0;
+                        mapped_metadata->CodeMap = 0;
+                        mapped_code->Length = 0;
+                        second_status = map_hybrid_image_section(
+                            mapping, IMAGE_FILE_MACHINE_AMD64, &second_base );
+                        ok( NT_SUCCESS(second_status),
+                            "second AMD64 mapping returned %#lx\n", second_status );
+                        if (NT_SUCCESS(second_status))
+                        {
+                            second_cfg = (IMAGE_LOAD_CONFIG_DIRECTORY *)
+                                ((BYTE *)second_base + config_rva);
+                            second_metadata = (IMAGE_ARM64EC_METADATA *)
+                                ((BYTE *)second_base + metadata_rva);
+                            second_code = (IMAGE_CHPE_RANGE_ENTRY *)
+                                ((BYTE *)second_base + code_map_rva);
+                            memcpy( &cookie, (BYTE *)second_base + cookie_rva,
+                                    sizeof(cookie) );
+                            ok( cookie == initial_cookie,
+                                "second security cookie %#I64x, expected %#I64x\n",
+                                cookie, initial_cookie );
+                            ok( second_cfg->CHPEMetadataPointer == metadata_va,
+                                "second metadata pointer %#I64x, expected %#I64x\n",
+                                second_cfg->CHPEMetadataPointer, metadata_va );
+                            ok( second_metadata->CodeMap == code_map_rva &&
+                                second_metadata->CodeMapCount == 1,
+                                "second CodeMap %#lx count %#lx\n",
+                                second_metadata->CodeMap,
+                                second_metadata->CodeMapCount );
+                            ok( second_code->StartOffset == (HYBRID_SECTION_RVA | 1) &&
+                                second_code->Length == 1,
+                                "second CodeMap entry start %#lx length %#lx\n",
+                                second_code->StartOffset, second_code->Length );
+                        }
+                        unmap_hybrid_image( second_base );
+                    }
+                    if (arm64x_tests[i].test == HYBRID_ARM64X_SHARED_IAT_ISOLATION)
+                    {
+                        IMAGE_IMPORT_DESCRIPTOR descriptor, source_descriptor;
+                        IMAGE_THUNK_DATA64 thunk, source_lookup, source_iat;
+                        BYTE name[sizeof(WORD) + sizeof("x")];
+                        BYTE source_name[sizeof(name)] = {0, 0, 'x', 0};
+                        char module_name[sizeof("x.dll")];
+                        char source_module_name[sizeof(module_name)] = "x.dll";
+                        const BYTE changed_source_name[] = {0, 0, 'y', 0};
+                        const BYTE changed_private_name[] = {0, 0, 'z', 0};
+                        const char changed_source_module[] = "y.dll";
+                        const char changed_private_module[] = "z.dll";
+                        ULONGLONG changed = 0xfeedfacecafebeef;
+                        ULONGLONG source_changed = 0x0123456789abcdef;
+
+                        if (source_base)
+                        {
+                            memcpy( &source_descriptor, (BYTE *)source_base +
+                                    HYBRID_SECTION_RVA + HYBRID_IMPORT_OFFSET,
+                                    sizeof(source_descriptor) );
+                            memcpy( &source_lookup, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IMPORT_OFFSET + 0x100, sizeof(source_lookup) );
+                            memcpy( &source_iat, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IAT_OFFSET, sizeof(source_iat) );
+                            memcpy( source_name, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_NAME_OFFSET, sizeof(source_name) );
+                            memcpy( source_module_name, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_NAME_OFFSET + 0x100, sizeof(source_module_name) );
+                            descriptor = source_descriptor;
+                            descriptor.OriginalFirstThunk = HYBRID_SECTION_RVA +
+                                                            HYBRID_IMPORT_OFFSET + 0x300;
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IMPORT_OFFSET, &descriptor, sizeof(descriptor) );
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IMPORT_OFFSET + 0x100, &source_changed,
+                                    sizeof(source_changed) );
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA + HYBRID_IAT_OFFSET,
+                                    &source_changed, sizeof(source_changed) );
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA + HYBRID_NAME_OFFSET,
+                                    changed_source_name, sizeof(changed_source_name) );
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_NAME_OFFSET + 0x100, changed_source_module,
+                                    sizeof(changed_source_module) );
+                        }
+
+                        memcpy( &descriptor, (BYTE *)base + HYBRID_SECTION_RVA +
+                                HYBRID_IMPORT_OFFSET, sizeof(descriptor) );
+                        ok( descriptor.OriginalFirstThunk == HYBRID_SECTION_RVA +
+                            HYBRID_IMPORT_OFFSET + 0x100,
+                            "import lookup RVA initially %#lx\n",
+                            descriptor.OriginalFirstThunk );
+                        memcpy( &thunk, (BYTE *)base + HYBRID_SECTION_RVA +
+                                HYBRID_IMPORT_OFFSET + 0x100, sizeof(thunk) );
+                        ok( thunk.u1.AddressOfData == HYBRID_SECTION_RVA +
+                            HYBRID_NAME_OFFSET,
+                            "import lookup initially %#I64x\n", thunk.u1.AddressOfData );
+                        memcpy( &thunk, (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_IAT_OFFSET,
+                                sizeof(thunk) );
+                        ok( thunk.u1.AddressOfData == HYBRID_SECTION_RVA +
+                            HYBRID_NAME_OFFSET,
+                            "IAT initially %#I64x\n", thunk.u1.AddressOfData );
+                        memcpy( name, (BYTE *)base + HYBRID_SECTION_RVA +
+                                HYBRID_NAME_OFFSET, sizeof(name) );
+                        ok( !memcmp( name, source_name, sizeof(name) ),
+                            "private import name changed with source mapping\n" );
+                        memcpy( module_name, (BYTE *)base + HYBRID_SECTION_RVA +
+                                HYBRID_NAME_OFFSET + 0x100, sizeof(module_name) );
+                        ok( !memcmp( module_name, source_module_name, sizeof(module_name) ),
+                            "private module name changed with source mapping\n" );
+                        memcpy( (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_IAT_OFFSET,
+                                &changed, sizeof(changed) );
+                        memcpy( (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_IMPORT_OFFSET + 0x100,
+                                &changed, sizeof(changed) );
+                        descriptor.OriginalFirstThunk = HYBRID_SECTION_RVA +
+                                                        HYBRID_IMPORT_OFFSET + 0x300;
+                        memcpy( (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_IMPORT_OFFSET,
+                                &descriptor, sizeof(descriptor) );
+                        memcpy( (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_NAME_OFFSET,
+                                changed_private_name, sizeof(changed_private_name) );
+                        memcpy( (BYTE *)base + HYBRID_SECTION_RVA +
+                                HYBRID_NAME_OFFSET + 0x100, changed_private_module,
+                                sizeof(changed_private_module) );
+                        memcpy( &thunk, (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_IAT_OFFSET,
+                                sizeof(thunk) );
+                        ok( thunk.u1.Function == changed, "IAT %#I64x, expected %#I64x\n",
+                            thunk.u1.Function, changed );
+                        if (source_base)
+                        {
+                            memcpy( &descriptor, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IMPORT_OFFSET, sizeof(descriptor) );
+                            ok( descriptor.OriginalFirstThunk == HYBRID_SECTION_RVA +
+                                HYBRID_IMPORT_OFFSET + 0x300,
+                                "source import lookup RVA changed to %#lx\n",
+                                descriptor.OriginalFirstThunk );
+                            memcpy( &thunk, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IMPORT_OFFSET + 0x100, sizeof(thunk) );
+                            ok( thunk.u1.Function == source_changed,
+                                "source import lookup %#I64x, expected %#I64x\n",
+                                thunk.u1.Function, source_changed );
+                            memcpy( &thunk, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IAT_OFFSET, sizeof(thunk) );
+                            ok( thunk.u1.Function == source_changed,
+                                "source IAT %#I64x, expected %#I64x\n",
+                                thunk.u1.Function, source_changed );
+                            memcpy( name, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_NAME_OFFSET, sizeof(name) );
+                            ok( !memcmp( name, changed_source_name, sizeof(name) ),
+                                "source import name changed with private mapping\n" );
+                            memcpy( module_name, (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_NAME_OFFSET + 0x100, sizeof(module_name) );
+                            ok( !memcmp( module_name, changed_source_module,
+                                        sizeof(module_name) ),
+                                "source module name changed with private mapping\n" );
+
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IMPORT_OFFSET, &source_descriptor,
+                                    sizeof(source_descriptor) );
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IMPORT_OFFSET + 0x100, &source_lookup,
+                                    sizeof(source_lookup) );
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_IAT_OFFSET, &source_iat, sizeof(source_iat) );
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_NAME_OFFSET, source_name, sizeof(source_name) );
+                            memcpy( (BYTE *)source_base + HYBRID_SECTION_RVA +
+                                    HYBRID_NAME_OFFSET + 0x100, source_module_name,
+                                    sizeof(source_module_name) );
+                        }
+                    }
+                }
+            }
+            else
+                ok( status == arm64x_tests[i].map_status,
+                    "NtMapViewOfSectionEx returned %#lx, expected %#lx\n",
+                    status, arm64x_tests[i].map_status );
+            unmap_hybrid_image( base );
+
+            if (arm64x_tests[i].check_atomicity ||
+                arm64x_tests[i].test == HYBRID_ARM64X_SHARED_SLOT_ISOLATION ||
+                arm64x_tests[i].test == HYBRID_ARM64X_SHARED_IAT_ISOLATION)
+            {
+                USHORT marker = 0;
+
+                status = map_hybrid_image_section( mapping, IMAGE_FILE_MACHINE_ARM64, &base );
+                ok( NT_SUCCESS(status), "native ARM64 control mapping returned %#lx\n", status );
+                if (NT_SUCCESS(status))
+                {
+                    memcpy( &marker, (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_MARKER_OFFSET,
+                            sizeof(marker) );
+                    ok( marker == 0x1357, "shared marker %#x, expected 0x1357\n", marker );
+                    if (arm64x_tests[i].test == HYBRID_ARM64X_TRANSFORMED_CHPE_ATOMICITY)
+                    {
+                        IMAGE_LOAD_CONFIG_DIRECTORY *mapped_cfg;
+                        IMAGE_ARM64EC_METADATA *mapped_metadata;
+
+                        mapped_cfg = (IMAGE_LOAD_CONFIG_DIRECTORY *)((BYTE *)base +
+                                     HYBRID_SECTION_RVA + HYBRID_CONFIG_OFFSET);
+                        mapped_metadata = (IMAGE_ARM64EC_METADATA *)((BYTE *)base +
+                                          HYBRID_SECTION_RVA + HYBRID_METADATA_OFFSET);
+                        ok( !mapped_cfg->CHPEMetadataPointer,
+                            "shared CHPE metadata pointer %#I64x, expected zero\n",
+                            mapped_cfg->CHPEMetadataPointer );
+                        ok( !mapped_metadata->CodeMap && !mapped_metadata->CodeMapCount,
+                            "shared CodeMap %#lx count %#lx, expected zero\n",
+                            mapped_metadata->CodeMap, mapped_metadata->CodeMapCount );
+                    }
+                    else if (arm64x_tests[i].test == HYBRID_ARM64X_SHARED_SLOT_ISOLATION)
+                    {
+                        ULONGLONG slot;
+
+                        memcpy( &slot, (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_SLOT_OFFSET,
+                                sizeof(slot) );
+                        ok( !slot, "native control mapping saw hybrid slot %#I64x\n", slot );
+                    }
+                    else if (arm64x_tests[i].test == HYBRID_ARM64X_SHARED_IAT_ISOLATION)
+                    {
+                        IMAGE_IMPORT_DESCRIPTOR descriptor;
+                        IMAGE_THUNK_DATA64 thunk;
+
+                        memcpy( &descriptor, (BYTE *)base + HYBRID_SECTION_RVA +
+                                HYBRID_IMPORT_OFFSET, sizeof(descriptor) );
+                        ok( descriptor.OriginalFirstThunk == HYBRID_SECTION_RVA +
+                            HYBRID_IMPORT_OFFSET + 0x100,
+                            "native control mapping saw import lookup RVA %#lx\n",
+                            descriptor.OriginalFirstThunk );
+                        memcpy( &thunk, (BYTE *)base + HYBRID_SECTION_RVA +
+                                HYBRID_IMPORT_OFFSET + 0x100, sizeof(thunk) );
+                        ok( thunk.u1.AddressOfData == HYBRID_SECTION_RVA +
+                            HYBRID_NAME_OFFSET,
+                            "native control mapping saw import lookup %#I64x\n",
+                            thunk.u1.AddressOfData );
+                        memcpy( &thunk, (BYTE *)base + HYBRID_SECTION_RVA + HYBRID_IAT_OFFSET,
+                                sizeof(thunk) );
+                        ok( thunk.u1.AddressOfData == HYBRID_SECTION_RVA +
+                            HYBRID_NAME_OFFSET,
+                            "native control mapping saw IAT %#I64x\n", thunk.u1.AddressOfData );
+                    }
+                }
+                unmap_hybrid_image( base );
+            }
+            unmap_hybrid_image( source_base );
+        }
+        close_hybrid_image_section( mapping, filename );
+        winetest_pop_context();
+    }
+
+    HeapFree( GetProcessHeap(), 0, data );
+}
+#else
+static void test_arm64ec_metadata_bounds(void)
+{
+    skip( "ARM64EC/ARM64X metadata mapping needs an ARM64 process.\n" );
+}
+#endif
 
 static void test_Loader(void)
 {
@@ -2196,7 +3517,10 @@ static void test_shared_image_section(void)
     static const BYTE shared_data[0x200] = "shared section data";
     IMAGE_SECTION_HEADER shared_section = {0};
     IMAGE_NT_HEADERS nt_header = nt_header_template;
+    LARGE_INTEGER size;
     char dll_name[MAX_PATH];
+    NTSTATUS status;
+    HANDLE file, map;
     HMODULE module;
 
     nt_header.FileHeader.NumberOfSections = 1;
@@ -2215,6 +3539,18 @@ static void test_shared_image_section(void)
                                     IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_SHARED;
 
     create_test_dll_sections( &dos_header, &nt_header, &shared_section, shared_data, dll_name );
+    file = CreateFileA( dll_name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, 0 );
+    ok( file != INVALID_HANDLE_VALUE, "CreateFileA failed, error %lu.\n", GetLastError() );
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        size.QuadPart = GetFileSize( file, NULL );
+        map = NULL;
+        status = pNtCreateSection( &map, STANDARD_RIGHTS_REQUIRED | SECTION_MAP_READ | SECTION_QUERY,
+                                   NULL, &size, PAGE_READONLY, SEC_IMAGE, file );
+        ok( status == STATUS_SUCCESS, "NtCreateSection returned %#lx.\n", status );
+        if (map) CloseHandle( map );
+        CloseHandle( file );
+    }
 
     SetLastError( 0xdeadbeef );
     module = LoadLibraryExA( dll_name, NULL, DONT_RESOLVE_DLL_REFERENCES );
@@ -2226,6 +3562,23 @@ static void test_shared_image_section(void)
         FreeLibrary( module );
     }
 
+    DeleteFileA( dll_name );
+
+    shared_section.VirtualAddress = 0;
+    create_test_dll_sections( &dos_header, &nt_header, &shared_section, shared_data, dll_name );
+    file = CreateFileA( dll_name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, 0 );
+    ok( file != INVALID_HANDLE_VALUE, "CreateFileA failed, error %lu.\n", GetLastError() );
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        size.QuadPart = GetFileSize( file, NULL );
+        map = NULL;
+        status = pNtCreateSection( &map, STANDARD_RIGHTS_REQUIRED | SECTION_MAP_READ | SECTION_QUERY,
+                                   NULL, &size, PAGE_READONLY, SEC_IMAGE, file );
+        ok( status == STATUS_INVALID_FILE_FOR_SECTION,
+            "NtCreateSection returned %#lx.\n", status );
+        if (map) CloseHandle( map );
+        CloseHandle( file );
+    }
     DeleteFileA( dll_name );
 }
 
@@ -5548,6 +6901,7 @@ START_TEST(loader)
     pNtCreateSection = (void *)GetProcAddress(ntdll, "NtCreateSection");
     pNtQuerySection = (void *)GetProcAddress(ntdll, "NtQuerySection");
     pNtMapViewOfSection = (void *)GetProcAddress(ntdll, "NtMapViewOfSection");
+    pNtMapViewOfSectionEx = (void *)GetProcAddress(ntdll, "NtMapViewOfSectionEx");
     pNtUnmapViewOfSection = (void *)GetProcAddress(ntdll, "NtUnmapViewOfSection");
     pNtTerminateProcess = (void *)GetProcAddress(ntdll, "NtTerminateProcess");
     pNtQueryInformationProcess = (void *)GetProcAddress(ntdll, "NtQueryInformationProcess");
@@ -5559,6 +6913,7 @@ START_TEST(loader)
     pLdrUnloadDll = (void *)GetProcAddress(ntdll, "LdrUnloadDll");
     pRtlInitUnicodeString = (void *)GetProcAddress(ntdll, "RtlInitUnicodeString");
     pRtlAcquirePebLock = (void *)GetProcAddress(ntdll, "RtlAcquirePebLock");
+    pRtlGetNativeSystemInformation = (void *)GetProcAddress(ntdll, "RtlGetNativeSystemInformation");
     pRtlImageDirectoryEntryToData = (void *)GetProcAddress(ntdll, "RtlImageDirectoryEntryToData");
     pRtlImageNtHeader = (void *)GetProcAddress(ntdll, "RtlImageNtHeader");
     pLdrRegisterDllNotification = (void *)GetProcAddress(ntdll, "LdrRegisterDllNotification");
@@ -5631,6 +6986,7 @@ START_TEST(loader)
     test_dll_file( "user32.dll" );
     test_Wow64Transition();
     test_image_header_size_bounds();
+    test_arm64ec_metadata_bounds();
     /* loader test must be last, it can corrupt the internal loader state on Windows */
     test_Loader();
 }

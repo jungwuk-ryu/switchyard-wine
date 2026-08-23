@@ -2814,15 +2814,18 @@ static void load_ntdll_wow64_functions( HMODULE module )
  */
 ULONG_PTR redirect_arm64ec_rva( void *base, ULONG_PTR rva, const IMAGE_ARM64EC_METADATA *metadata )
 {
-    const IMAGE_ARM64EC_REDIRECTION_ENTRY *map = get_rva( base, metadata->RedirectionMetadata );
-    int min = 0, max = metadata->RedirectionMetadataCount - 1;
+    const char *map = get_rva( base, metadata->RedirectionMetadata );
+    ULONG min = 0, max = metadata->RedirectionMetadataCount;
 
-    while (min <= max)
+    while (min < max)
     {
-        int pos = (min + max) / 2;
-        if (map[pos].Source == rva) return map[pos].Destination;
-        if (map[pos].Source < rva) min = pos + 1;
-        else max = pos - 1;
+        IMAGE_ARM64EC_REDIRECTION_ENTRY entry;
+        ULONG pos = min + (max - min) / 2;
+
+        memcpy( &entry, map + pos * sizeof(entry), sizeof(entry) );
+        if (entry.Source == rva) return entry.Destination;
+        if (entry.Source < rva) min = pos + 1;
+        else max = pos;
     }
     return rva;
 }
