@@ -190,6 +190,90 @@ event_line() {
   /usr/bin/awk -v wanted="$event" '$0 == wanted { print NR; exit }' "$log"
 }
 
+assert_native_release_source_contract() {
+  /usr/bin/python3 -I - "$RELEASE_SCRIPT" <<'PY'
+import re
+import sys
+
+
+source_name = sys.argv[1]
+with open(source_name, encoding="utf-8") as stream:
+    source = stream.read()
+
+definition = re.compile(
+    r"(?m)^([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([ \t]*\)[ \t]*\{[^\n]*$"
+)
+definitions = list(definition.finditer(source))
+
+
+def function_body(name):
+    for index, match in enumerate(definitions):
+        if match.group(1) != name:
+            continue
+        end = definitions[index + 1].start() if index + 1 < len(definitions) else len(source)
+        return source[match.end():end]
+    raise SystemExit(f"native release source contract lost function {name}")
+
+
+def call_offsets(body, name):
+    return [
+        match.start()
+        for match in re.finditer(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", body)
+    ]
+
+
+release = function_body("switchyard_release_preview_native")
+operations = {
+    "sign": call_offsets(release, "switchyard_sign_native_release_runtime"),
+    "refresh": call_offsets(
+        release, "switchyard_refresh_native_arm64_signed_runtime_manifest"
+    ),
+    "validate": call_offsets(release, "switchyard_validate_native_release_runtime"),
+    "smoke": call_offsets(release, "switchyard_run_native_release_smoke"),
+    "outer": call_offsets(release, "switchyard_publish_native_outer_digest"),
+    "tree_verify": call_offsets(release, "runtime_content_tree_is_verified"),
+    "archive": call_offsets(release, "switchyard_create_native_release_archive"),
+}
+expected_counts = {
+    "sign": 1,
+    "refresh": 1,
+    "validate": 2,
+    "smoke": 1,
+    "outer": 1,
+    "tree_verify": 2,
+    "archive": 1,
+}
+for operation, expected in expected_counts.items():
+    actual = len(operations[operation])
+    if actual != expected:
+        raise SystemExit(
+            f"native release source contract has {actual} {operation} calls, expected {expected}"
+        )
+
+ordered = [
+    operations["sign"][0],
+    operations["refresh"][0],
+    operations["validate"][0],
+    operations["smoke"][0],
+    operations["validate"][1],
+    operations["outer"][0],
+    operations["tree_verify"][1],
+    operations["archive"][0],
+]
+if ordered != sorted(ordered) or len(set(ordered)) != len(ordered):
+    raise SystemExit(
+        "native release source contract is not sign, refresh, validate, smoke, "
+        "validate, outer digest, archive"
+    )
+
+outer_publisher = function_body("switchyard_publish_native_outer_digest")
+if len(call_offsets(outer_publisher, "write_runtime_content_tree_digest")) != 1:
+    raise SystemExit("native outer-digest publisher is not the sole one-shot marker writer")
+if call_offsets(release, "write_runtime_content_tree_digest"):
+    raise SystemExit("native release flow writes the outer marker outside its publisher")
+PY
+}
+
 run_case() {
   local label="$1"
   local failure_mode="$2"
@@ -263,6 +347,15 @@ run_case() {
         return 1
       fi
     }
+    switchyard_validate_native_release_runtime() {
+      native_validation_call_count=$((native_validation_call_count + 1))
+      /usr/bin/printf 'validate:%s\n' "$native_validation_call_count" \
+        >>"$SWITCHYARD_TEST_ORDER_LOG"
+      switchyard_validate_runtime_manifest_profile \
+        "$2" preview-native-arm64-fex "$1" &&
+        switchyard_validate_native_arm64_runtime_packaging \
+          "$1" "$2" "$ROOT_DIR"
+    }
     switchyard_refresh_native_arm64_signed_runtime_manifest() {
       /usr/bin/printf 'refresh\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
       if [ "$failure_mode" = refresh-unknown ]; then
@@ -286,6 +379,10 @@ run_case() {
     switchyard_publish_native_outer_digest() {
       /usr/bin/printf 'outer-digest\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
       /usr/bin/python3 -I "$DIGEST_HELPER" write "$1" >/dev/null
+      if [ "$failure_mode" = post-outer-dependency-mutation ]; then
+        /usr/bin/printf 'stale dependency marker\n' \
+          >"$1/lib/switchyard-gstreamer/.switchyard-content-sha256"
+      fi
     }
     switchyard_create_native_release_archive() {
       /usr/bin/printf 'archive\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
@@ -294,6 +391,7 @@ run_case() {
 
     profile_call_count=0
     packaging_call_count=0
+    native_validation_call_count=0
     publish_call_count=0
     release_arguments=(
       --runtime "$runtime" \
@@ -327,6 +425,7 @@ run_case() {
   "$RELEASE_SCRIPT" >/dev/null || fail "stable fresh-prefix smoke changed"
 /usr/bin/grep -F '/usr/bin/codesign --force --sign "$IDENTITY" --options runtime --timestamp' \
   "$RELEASE_SCRIPT" >/dev/null || fail "stable Developer-ID/Hardened signing changed"
+assert_native_release_source_contract || fail "native release source ordering contract changed"
 
 run_case success none 0
 success_output="$TEST_ROOT/success-output"
@@ -363,14 +462,16 @@ PY
   fail "native release did not attach entitlements to exactly two entries"
 last_sign="$(/usr/bin/awk '/^sign:/ { line=NR } END { print line }' "$success_log")"
 refresh_line="$(event_line refresh "$success_log")"
+first_validation_line="$(event_line validate:1 "$success_log")"
 smoke_line="$(event_line smoke "$success_log")"
+second_validation_line="$(event_line validate:2 "$success_log")"
 digest_line="$(event_line outer-digest "$success_log")"
 archive_line="$(event_line archive "$success_log")"
 [ "$last_sign" -lt "$refresh_line" ] &&
-  [ "$(event_line profile:2 "$success_log")" -gt "$refresh_line" ] &&
-  [ "$(event_line packaging:2 "$success_log")" -lt "$smoke_line" ] &&
-  [ "$(event_line packaging:3 "$success_log")" -gt "$smoke_line" ] &&
-  [ "$digest_line" -gt "$(event_line packaging:3 "$success_log")" ] &&
+  [ "$refresh_line" -lt "$first_validation_line" ] &&
+  [ "$first_validation_line" -lt "$smoke_line" ] &&
+  [ "$smoke_line" -lt "$second_validation_line" ] &&
+  [ "$second_validation_line" -lt "$digest_line" ] &&
   [ "$archive_line" -gt "$digest_line" ] ||
   fail "native release ordering contract changed"
 
@@ -379,6 +480,14 @@ run_case missing-entry missing-entry 1
 run_case refresh-unknown-field refresh-unknown 1
 run_case smoke-failure smoke 73
 run_case validator-failure post-smoke-validator 1
+run_case post-outer-dependency-mutation post-outer-dependency-mutation 1
+if /usr/bin/grep -Fqx archive \
+    "$TEST_ROOT/post-outer-dependency-mutation-case/order.log"; then
+  fail "native release archived a runtime changed after its outer marker"
+fi
+/usr/bin/grep -F 'native release outer content digest did not verify' \
+  "$TEST_ROOT/post-outer-dependency-mutation-case/stderr" >/dev/null ||
+  fail "post-outer dependency mutation did not reach the final digest gate"
 run_case source-unknown-field unknown-source 1
 run_case partial-publication partial-publication 1
 run_case malformed-notary malformed-notary 1
