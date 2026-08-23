@@ -1626,8 +1626,16 @@ try:
         fail("cannot parse nested Unicorn manifest: " + str(error))
     if type(nested) is not dict or set(nested) != NESTED_UNICORN_FIELDS:
         fail("nested Unicorn manifest schema is not exact")
-    nested["librarySha256"] = unicorn_digest
-    new_nested_data = json_bytes(nested)
+    if nested.get("librarySha256") == unicorn_digest:
+        # Keep the pinned package manifest byte-for-byte when signing did not
+        # change the Unicorn dylib.  Re-serializing an otherwise unchanged
+        # manifest would alter its compact array formatting, needlessly change
+        # the package content identity, and turn an engineering refresh into a
+        # signed-package mutation.
+        new_nested_data = nested_data
+    else:
+        nested["librarySha256"] = unicorn_digest
+        new_nested_data = json_bytes(nested)
     if len(new_nested_data) > MAX_MANIFEST:
         fail("nested Unicorn manifest exceeds its size bound")
 

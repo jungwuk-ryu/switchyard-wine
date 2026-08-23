@@ -148,6 +148,7 @@ UNICORN_CACHE="${SWITCHYARD_UNICORN_FIXTURE_CACHE:-${HOME}/.switchyard/deps/cpu-
   "$RUNTIME/lib/switchyard-unicorn/share/src/switchyard-unicorn"
 
 UNICORN_PACKAGE="$RUNTIME/lib/switchyard-unicorn"
+UNICORN_MANIFEST="$UNICORN_PACKAGE/switchyard-unicorn-runtime.json"
 /usr/bin/install -m 0755 "$UNICORN_CACHE/lib/libunicorn.2.dylib" \
   "$UNICORN_PACKAGE/lib/libunicorn.2.dylib"
 /bin/ln -s libunicorn.2.dylib "$UNICORN_PACKAGE/lib/libunicorn.dylib"
@@ -525,6 +526,25 @@ for dependency_root in "${DEPENDENCY_ROOTS[@]}"; do
     /usr/bin/stat -f '%Lp' "$dependency_root/.switchyard-content-sha256"
   )")
 done
+
+# An identity refresh must not rewrite the pinned Unicorn package merely to
+# normalize JSON formatting when its Mach-O library bytes did not change.
+UNICORN_MANIFEST_SHA_BEFORE="$(sha256_file "$UNICORN_MANIFEST")"
+UNICORN_MARKER_SHA_BEFORE="$(
+  sha256_file "$UNICORN_PACKAGE/.switchyard-content-sha256"
+)"
+switchyard_refresh_native_arm64_signed_runtime_manifest "$RUNTIME" "$MANIFEST"
+[ "$(sha256_file "$UNICORN_MANIFEST")" = "$UNICORN_MANIFEST_SHA_BEFORE" ] ||
+  fail "no-op signed refresh rewrote the pinned Unicorn manifest"
+[ "$(sha256_file "$UNICORN_PACKAGE/.switchyard-content-sha256")" = \
+    "$UNICORN_MARKER_SHA_BEFORE" ] ||
+  fail "no-op signed refresh changed the pinned Unicorn content marker"
+[ "$(/usr/bin/plutil -extract cpuProvider.runtimePayloadDigest raw -o - \
+    "$MANIFEST")" = "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" ] ||
+  fail "no-op signed refresh changed the pinned Unicorn payload identity"
+switchyard_validate_runtime_manifest_profile \
+  "$MANIFEST" preview-native-arm64-fex "$RUNTIME"
+switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
 
 SIGNING_MUTATION_TARGETS=(
   "$UNICORN_PACKAGE/lib/libunicorn.2.dylib"
