@@ -30,6 +30,10 @@
 #include "wine/asm.h"
 #include "win32syscalls.h"
 
+struct wine_d3dkmt_create_allocation32;
+struct wine_d3dkmt_lifecycle32;
+struct wine_d3dkmt_open_resource32;
+
 void *__wine_syscall_dispatcher = NULL;
 
 /*******************************************************************
@@ -245,6 +249,18 @@ NTSTATUS SYSCALL_API NtGdiDdDDICreateAllocation2( D3DKMT_CREATEALLOCATION *desc 
     SYSCALL_FUNC( NtGdiDdDDICreateAllocation2 );
 }
 
+NTSTATUS SYSCALL_API __wine_win32u_d3dkmt_create_allocation(
+    struct wine_d3dkmt_create_allocation32 *params )
+{
+    SYSCALL_FUNC( __wine_win32u_d3dkmt_create_allocation );
+}
+
+NTSTATUS SYSCALL_API __wine_win32u_d3dkmt_lifecycle(
+    struct wine_d3dkmt_lifecycle32 *params )
+{
+    SYSCALL_FUNC( __wine_win32u_d3dkmt_lifecycle );
+}
+
 NTSTATUS SYSCALL_API NtGdiDdDDICreateDCFromMemory( D3DKMT_CREATEDCFROMMEMORY *desc )
 {
     SYSCALL_FUNC( NtGdiDdDDICreateDCFromMemory );
@@ -368,6 +384,12 @@ NTSTATUS SYSCALL_API NtGdiDdDDIOpenResource2( D3DKMT_OPENRESOURCE *desc )
 NTSTATUS SYSCALL_API NtGdiDdDDIOpenResourceFromNtHandle( D3DKMT_OPENRESOURCEFROMNTHANDLE *desc )
 {
     SYSCALL_FUNC( NtGdiDdDDIOpenResourceFromNtHandle );
+}
+
+NTSTATUS SYSCALL_API __wine_win32u_d3dkmt_open_resource(
+    struct wine_d3dkmt_open_resource32 *params )
+{
+    SYSCALL_FUNC( __wine_win32u_d3dkmt_open_resource );
 }
 
 NTSTATUS SYSCALL_API NtGdiDdDDIOpenSyncObjectFromNtHandle( D3DKMT_OPENSYNCOBJECTFROMNTHANDLE *desc )

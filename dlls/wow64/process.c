@@ -33,6 +33,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(wow);
 
+#define WOW64_MAX_SERVER_HANDLE_ENTRIES 0x00ffffffu
+
 
 static BOOL is_process_wow64( HANDLE handle )
 {
@@ -60,78 +62,191 @@ static BOOL is_process_id_wow64( const CLIENT_ID *id )
 }
 
 
-static RTL_USER_PROCESS_PARAMETERS *process_params_32to64( RTL_USER_PROCESS_PARAMETERS **params,
-                                                           RTL_USER_PROCESS_PARAMETERS32 *params32 )
+static void *alloc_temp( SIZE_T size )
 {
-    UNICODE_STRING image, dllpath, curdir, cmdline, title, desktop, shell, runtime;
-    RTL_USER_PROCESS_PARAMETERS *ret;
+    void *ret;
 
-    *params = NULL;
-    if (RtlCreateProcessParametersEx( &ret, unicode_str_32to64( &image, &params32->ImagePathName ),
-                                      unicode_str_32to64( &dllpath, &params32->DllPath ),
-                                      unicode_str_32to64( &curdir, &params32->CurrentDirectory.DosPath ),
-                                      unicode_str_32to64( &cmdline, &params32->CommandLine ),
-                                      ULongToPtr( params32->Environment ),
-                                      unicode_str_32to64( &title, &params32->WindowTitle ),
-                                      unicode_str_32to64( &desktop, &params32->Desktop ),
-                                      unicode_str_32to64( &shell, &params32->ShellInfo ),
-                                      unicode_str_32to64( &runtime, &params32->RuntimeInfo ),
-                                      PROCESS_PARAMS_FLAG_NORMALIZED ))
-        return NULL;
-
-    ret->DebugFlags            = params32->DebugFlags;
-    ret->ConsoleHandle         = LongToHandle( params32->ConsoleHandle );
-    ret->ConsoleFlags          = params32->ConsoleFlags;
-    ret->hStdInput             = LongToHandle( params32->hStdInput );
-    ret->hStdOutput            = LongToHandle( params32->hStdOutput );
-    ret->hStdError             = LongToHandle( params32->hStdError );
-    ret->dwX                   = params32->dwX;
-    ret->dwY                   = params32->dwY;
-    ret->dwXSize               = params32->dwXSize;
-    ret->dwYSize               = params32->dwYSize;
-    ret->dwXCountChars         = params32->dwXCountChars;
-    ret->dwYCountChars         = params32->dwYCountChars;
-    ret->dwFillAttribute       = params32->dwFillAttribute;
-    ret->dwFlags               = params32->dwFlags;
-    ret->wShowWindow           = params32->wShowWindow;
-    ret->EnvironmentVersion    = params32->EnvironmentVersion;
-    ret->PackageDependencyData = ULongToPtr( params32->PackageDependencyData );
-    ret->ProcessGroupId        = params32->ProcessGroupId;
-    ret->LoaderThreads         = params32->LoaderThreads;
-    *params = ret;
+    if (!size) return NULL;
+    if (!(ret = Wow64AllocateTemp( size ))) RtlRaiseStatus( STATUS_NO_MEMORY );
     return ret;
 }
 
 
-static void put_ps_create_info( PS_CREATE_INFO32 *info32, const PS_CREATE_INFO *info )
+static BOOL multiply_size( SIZE_T left, SIZE_T right, SIZE_T *result )
 {
-    info32->State = info->State;
+    if (right && left > ~(SIZE_T)0 / right) return FALSE;
+    *result = left * right;
+    return TRUE;
+}
+
+
+static NTSTATUS snapshot_environment( WCHAR **result, ULONG address, ULONG size )
+{
+    WCHAR chunk[2048];
+    SIZE_T offset = 0, actual_size = 0, i, count;
+    BOOL previous_zero = FALSE;
+    WCHAR *environment;
+
+    *result = NULL;
+    if (!address) return STATUS_SUCCESS;
+    if (!size || (size & (sizeof(WCHAR) - 1)) ||
+        (ULONGLONG)address + size > 0x100000000ull)
+        return STATUS_INVALID_PARAMETER;
+
+    while (offset < size && !actual_size)
+    {
+        SIZE_T bytes = min( (SIZE_T)size - offset, sizeof(chunk) );
+
+        wow64_read_user( chunk, wow64_guest_memory_ptr( address + (ULONG)offset ), bytes );
+        count = bytes / sizeof(*chunk);
+        for (i = 0; i < count; i++)
+        {
+            if (!chunk[i] && ((!offset && !i) || previous_zero))
+            {
+                actual_size = offset + (i + 1) * sizeof(*chunk);
+                break;
+            }
+            previous_zero = !chunk[i];
+        }
+        offset += bytes;
+    }
+    if (!actual_size) return STATUS_INVALID_PARAMETER;
+
+    environment = alloc_temp( actual_size );
+    wow64_read_user( environment, wow64_guest_memory_ptr( address ), actual_size );
+    *result = environment;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS snapshot_unicode_string( UNICODE_STRING *str, const UNICODE_STRING32 *str32 )
+{
+    void *buffer = NULL;
+
+    if (str32->Length > str32->MaximumLength || (str32->Length & (sizeof(WCHAR) - 1)))
+        return STATUS_INVALID_PARAMETER;
+    if (str32->Length)
+    {
+        if (!str32->Buffer) return STATUS_ACCESS_VIOLATION;
+        buffer = alloc_temp( str32->Length );
+        wow64_read_user( buffer, wow64_guest_memory_ptr( str32->Buffer ), str32->Length );
+    }
+    str->Length = str32->Length;
+    str->MaximumLength = str32->MaximumLength;
+    str->Buffer = buffer;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS process_params_32to64( RTL_USER_PROCESS_PARAMETERS **params,
+                                       const RTL_USER_PROCESS_PARAMETERS32 *params32 )
+{
+    RTL_USER_PROCESS_PARAMETERS32 local;
+    UNICODE_STRING image, dllpath, curdir, cmdline, title, desktop, shell, runtime;
+    WCHAR *environment = NULL;
+    RTL_USER_PROCESS_PARAMETERS *ret;
+    NTSTATUS status;
+
+    *params = NULL;
+    wow64_read_user( &local, params32, sizeof(local) );
+    if ((status = snapshot_unicode_string( &image, &local.ImagePathName )) ||
+        (status = snapshot_unicode_string( &dllpath, &local.DllPath )) ||
+        (status = snapshot_unicode_string( &curdir, &local.CurrentDirectory.DosPath )) ||
+        (status = snapshot_unicode_string( &cmdline, &local.CommandLine )) ||
+        (status = snapshot_unicode_string( &title, &local.WindowTitle )) ||
+        (status = snapshot_unicode_string( &desktop, &local.Desktop )) ||
+        (status = snapshot_unicode_string( &shell, &local.ShellInfo )) ||
+        (status = snapshot_unicode_string( &runtime, &local.RuntimeInfo )))
+        return status;
+
+    if (local.Environment)
+    {
+        if ((status = snapshot_environment( &environment, local.Environment,
+                                             local.EnvironmentSize )))
+            return status;
+    }
+
+    if ((status = RtlCreateProcessParametersEx( &ret, &image, &dllpath, &curdir, &cmdline,
+                                                environment, &title, &desktop, &shell, &runtime,
+                                                PROCESS_PARAMS_FLAG_NORMALIZED )))
+        return status;
+
+    ret->DebugFlags            = local.DebugFlags;
+    ret->ConsoleHandle         = LongToHandle( local.ConsoleHandle );
+    ret->ConsoleFlags          = local.ConsoleFlags;
+    ret->hStdInput             = LongToHandle( local.hStdInput );
+    ret->hStdOutput            = LongToHandle( local.hStdOutput );
+    ret->hStdError             = LongToHandle( local.hStdError );
+    ret->dwX                   = local.dwX;
+    ret->dwY                   = local.dwY;
+    ret->dwXSize               = local.dwXSize;
+    ret->dwYSize               = local.dwYSize;
+    ret->dwXCountChars         = local.dwXCountChars;
+    ret->dwYCountChars         = local.dwYCountChars;
+    ret->dwFillAttribute       = local.dwFillAttribute;
+    ret->dwFlags               = local.dwFlags;
+    ret->wShowWindow           = local.wShowWindow;
+    ret->EnvironmentVersion    = local.EnvironmentVersion;
+    ret->PackageDependencyData = wow64_guest_memory_ptr( local.PackageDependencyData );
+    ret->ProcessGroupId        = local.ProcessGroupId;
+    ret->LoaderThreads         = local.LoaderThreads;
+    *params = ret;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS ps_create_info_32to64( PS_CREATE_INFO *info, PS_CREATE_INFO32 *snapshot,
+                                       const PS_CREATE_INFO32 *info32 )
+{
+    wow64_read_user( snapshot, info32, sizeof(*snapshot) );
+    if (snapshot->Size != sizeof(*snapshot) || snapshot->State >= PsCreateMaximumStates)
+        return STATUS_INVALID_PARAMETER;
+
+    memset( info, 0, sizeof(*info) );
+    info->Size = sizeof(*info);
+    info->State = snapshot->State;
+    if (snapshot->State == PsCreateInitialState)
+    {
+        info->InitState.InitFlags = snapshot->InitState.InitFlags;
+        info->InitState.AdditionalFileAccess = snapshot->InitState.AdditionalFileAccess;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static void ps_create_info_64to32( PS_CREATE_INFO32 *local,
+                                   const PS_CREATE_INFO32 *snapshot,
+                                   const PS_CREATE_INFO *info )
+{
+    *local = *snapshot;
+
+    local->State = info->State;
     switch (info->State)
     {
     case PsCreateInitialState:
-        info32->InitState.InitFlags            = info->InitState.InitFlags;
-        info32->InitState.AdditionalFileAccess = info->InitState.AdditionalFileAccess;
+        local->InitState.InitFlags            = info->InitState.InitFlags;
+        local->InitState.AdditionalFileAccess = info->InitState.AdditionalFileAccess;
         break;
     case PsCreateFailOnSectionCreate:
-        info32->FailSection.FileHandle = HandleToLong( info->FailSection.FileHandle );
+        local->FailSection.FileHandle = HandleToLong( info->FailSection.FileHandle );
         break;
     case PsCreateFailExeFormat:
-        info32->ExeFormat.DllCharacteristics = info->ExeFormat.DllCharacteristics;
+        local->ExeFormat.DllCharacteristics = info->ExeFormat.DllCharacteristics;
         break;
     case PsCreateFailExeName:
-        info32->ExeName.IFEOKey = HandleToLong( info->ExeName.IFEOKey );
+        local->ExeName.IFEOKey = HandleToLong( info->ExeName.IFEOKey );
         break;
     case PsCreateSuccess:
-        info32->SuccessState.OutputFlags                 = info->SuccessState.OutputFlags;
-        info32->SuccessState.FileHandle                  = HandleToLong( info->SuccessState.FileHandle );
-        info32->SuccessState.SectionHandle               = HandleToLong( info->SuccessState.SectionHandle );
-        info32->SuccessState.UserProcessParametersNative = info->SuccessState.UserProcessParametersNative;
-        info32->SuccessState.UserProcessParametersWow64  = info->SuccessState.UserProcessParametersWow64;
-        info32->SuccessState.CurrentParameterFlags       = info->SuccessState.CurrentParameterFlags;
-        info32->SuccessState.PebAddressNative            = info->SuccessState.PebAddressNative;
-        info32->SuccessState.PebAddressWow64             = info->SuccessState.PebAddressWow64;
-        info32->SuccessState.ManifestAddress             = info->SuccessState.ManifestAddress;
-        info32->SuccessState.ManifestSize                = info->SuccessState.ManifestSize;
+        local->SuccessState.OutputFlags                 = info->SuccessState.OutputFlags;
+        local->SuccessState.FileHandle                  = HandleToLong( info->SuccessState.FileHandle );
+        local->SuccessState.SectionHandle               = HandleToLong( info->SuccessState.SectionHandle );
+        local->SuccessState.UserProcessParametersNative = info->SuccessState.UserProcessParametersNative;
+        local->SuccessState.UserProcessParametersWow64  = info->SuccessState.UserProcessParametersWow64;
+        local->SuccessState.CurrentParameterFlags       = info->SuccessState.CurrentParameterFlags;
+        local->SuccessState.PebAddressNative            = info->SuccessState.PebAddressNative;
+        local->SuccessState.PebAddressWow64             = info->SuccessState.PebAddressWow64;
+        local->SuccessState.ManifestAddress             = info->SuccessState.ManifestAddress;
+        local->SuccessState.ManifestSize                = info->SuccessState.ManifestSize;
         break;
     default:
         break;
@@ -139,95 +254,170 @@ static void put_ps_create_info( PS_CREATE_INFO32 *info32, const PS_CREATE_INFO *
 }
 
 
-static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const PS_ATTRIBUTE_LIST32 *attr32 )
+static NTSTATUS put_ps_create_info( PS_CREATE_INFO32 *info32, const PS_CREATE_INFO32 *snapshot,
+                                    const PS_CREATE_INFO *info )
 {
-    PS_ATTRIBUTE_LIST *ret;
-    ULONG i, count;
+    PS_CREATE_INFO32 local;
 
-    if (!attr32) return NULL;
-    count = (attr32->TotalLength - sizeof(attr32->TotalLength)) / sizeof(PS_ATTRIBUTE32);
-    ret = Wow64AllocateTemp( offsetof(PS_ATTRIBUTE_LIST, Attributes[count]) );
-    ret->TotalLength = offsetof( PS_ATTRIBUTE_LIST, Attributes[count] );
+    ps_create_info_64to32( &local, snapshot, info );
+    return wow64_try_write_user( info32, &local, sizeof(local) );
+}
+
+
+static NTSTATUS ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, PS_ATTRIBUTE_LIST32 **snapshot,
+                                      ULONG *attr_count, const PS_ATTRIBUTE_LIST32 *attr32 )
+{
+    const SIZE_T header32 = offsetof( PS_ATTRIBUTE_LIST32, Attributes );
+    const SIZE_T header = offsetof( PS_ATTRIBUTE_LIST, Attributes );
+    PS_ATTRIBUTE_LIST32 *local;
+    PS_ATTRIBUTE_LIST *ret;
+    SIZE_T native_size;
+    ULONG total, i, count;
+
+    *attr = NULL;
+    *snapshot = NULL;
+    *attr_count = 0;
+    if (!attr32) return STATUS_SUCCESS;
+
+    wow64_read_user( &total, attr32, sizeof(total) );
+    if (total < header32 || (total - header32) % sizeof(PS_ATTRIBUTE32))
+        return STATUS_INVALID_PARAMETER;
+    count = (total - header32) / sizeof(PS_ATTRIBUTE32);
+    if (count > PsAttributeMax) return STATUS_INVALID_PARAMETER;
+    if (!multiply_size( count, sizeof(PS_ATTRIBUTE), &native_size ) ||
+        native_size > ~(SIZE_T)0 - header)
+        return STATUS_INVALID_PARAMETER;
+    native_size += header;
+    local = alloc_temp( total );
+    wow64_read_user( local, attr32, total );
+    if (local->TotalLength != total) return STATUS_INVALID_PARAMETER;
+    ret = alloc_temp( native_size );
+    memset( ret, 0, native_size );
+    ret->TotalLength = native_size;
     for (i = 0; i < count; i++)
     {
-        ret->Attributes[i].Attribute    = attr32->Attributes[i].Attribute;
-        ret->Attributes[i].Size         = attr32->Attributes[i].Size;
-        ret->Attributes[i].Value        = attr32->Attributes[i].Value;
+        const PS_ATTRIBUTE32 *in = &local->Attributes[i];
+
+        ret->Attributes[i].Attribute    = in->Attribute;
+        ret->Attributes[i].Size         = in->Size;
+        ret->Attributes[i].Value        = in->Value;
         ret->Attributes[i].ReturnLength = NULL;
         switch (ret->Attributes[i].Attribute)
         {
         case PS_ATTRIBUTE_IMAGE_NAME:
             {
-                OBJECT_ATTRIBUTES attr;
+                OBJECT_ATTRIBUTES objattr;
                 UNICODE_STRING path;
+                void *buffer = NULL;
 
-                path.Length = ret->Attributes[i].Size;
-                path.Buffer = ret->Attributes[i].ValuePtr;
-                InitializeObjectAttributes( &attr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
-                if (get_file_redirect( &attr ))
+                if (in->Size > (USHORT)~0 || (in->Size & (sizeof(WCHAR) - 1)))
+                    return STATUS_INVALID_PARAMETER;
+                if (in->Size)
                 {
-                    ret->Attributes[i].Size = attr.ObjectName->Length;
-                    ret->Attributes[i].ValuePtr = attr.ObjectName->Buffer;
+                    if (!in->Value) return STATUS_ACCESS_VIOLATION;
+                    buffer = alloc_temp( in->Size );
+                    wow64_read_user( buffer, wow64_guest_memory_ptr( in->Value ), in->Size );
+                }
+                path.Length = path.MaximumLength = in->Size;
+                path.Buffer = buffer;
+                ret->Attributes[i].ValuePtr = path.Buffer;
+                InitializeObjectAttributes( &objattr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
+                if (get_file_redirect( &objattr ))
+                {
+                    ret->Attributes[i].Size = objattr.ObjectName->Length;
+                    ret->Attributes[i].ValuePtr = objattr.ObjectName->Buffer;
                 }
             }
             break;
         case PS_ATTRIBUTE_HANDLE_LIST:
         case PS_ATTRIBUTE_JOB_LIST:
             {
-                ULONG j, handles_count = attr32->Attributes[i].Size / sizeof(ULONG);
+                LONG *handles32;
+                ULONG j, handles_count;
 
-                ret->Attributes[i].Size     = handles_count * sizeof(HANDLE);
-                ret->Attributes[i].ValuePtr = Wow64AllocateTemp( ret->Attributes[i].Size );
+                if (in->Size % sizeof(ULONG)) return STATUS_INVALID_PARAMETER;
+                handles_count = in->Size / sizeof(ULONG);
+                /* The server handle table cannot contain more entries than this.  Reject an
+                 * attacker-controlled widened allocation that could never be consumed. */
+                if (handles_count > WOW64_MAX_SERVER_HANDLE_ENTRIES)
+                    return STATUS_INVALID_PARAMETER;
+                if (in->Size && !in->Value) return STATUS_ACCESS_VIOLATION;
+                if (!multiply_size( handles_count, sizeof(HANDLE), &ret->Attributes[i].Size ))
+                    return STATUS_INVALID_PARAMETER;
+                ret->Attributes[i].ValuePtr = alloc_temp( ret->Attributes[i].Size );
+                handles32 = alloc_temp( in->Size );
+                if (in->Size) wow64_read_user( handles32, wow64_guest_memory_ptr( in->Value ), in->Size );
                 for (j = 0; j < handles_count; j++)
-                    ((HANDLE *)ret->Attributes[i].ValuePtr)[j] =
-                        LongToHandle( ((LONG *)ULongToPtr(attr32->Attributes[i].Value))[j] );
+                    ((HANDLE *)ret->Attributes[i].ValuePtr)[j] = LongToHandle( handles32[j] );
             }
             break;
         case PS_ATTRIBUTE_PARENT_PROCESS:
         case PS_ATTRIBUTE_DEBUG_PORT:
         case PS_ATTRIBUTE_TOKEN:
             ret->Attributes[i].Size     = sizeof(HANDLE);
-            ret->Attributes[i].ValuePtr = LongToHandle( attr32->Attributes[i].Value );
+            ret->Attributes[i].ValuePtr = LongToHandle( in->Value );
             break;
         case PS_ATTRIBUTE_CLIENT_ID:
             ret->Attributes[i].Size     = sizeof(CLIENT_ID);
-            ret->Attributes[i].ValuePtr = Wow64AllocateTemp( ret->Attributes[i].Size );
+            ret->Attributes[i].ValuePtr = alloc_temp( ret->Attributes[i].Size );
+            memset( ret->Attributes[i].ValuePtr, 0, ret->Attributes[i].Size );
+            wow64_probe_user_write( wow64_guest_memory_ptr( in->Value ),
+                                    min( in->Size, sizeof(CLIENT_ID32) ));
+            if (in->ReturnLength)
+                wow64_probe_user_write( wow64_guest_memory_ptr( in->ReturnLength ), sizeof(ULONG) );
             break;
         case PS_ATTRIBUTE_IMAGE_INFO:
             ret->Attributes[i].Size     = sizeof(SECTION_IMAGE_INFORMATION);
-            ret->Attributes[i].ValuePtr = Wow64AllocateTemp( ret->Attributes[i].Size );
+            ret->Attributes[i].ValuePtr = alloc_temp( ret->Attributes[i].Size );
+            memset( ret->Attributes[i].ValuePtr, 0, ret->Attributes[i].Size );
+            wow64_probe_user_write( wow64_guest_memory_ptr( in->Value ),
+                                    min( in->Size, sizeof(SECTION_IMAGE_INFORMATION32) ));
+            if (in->ReturnLength)
+                wow64_probe_user_write( wow64_guest_memory_ptr( in->ReturnLength ), sizeof(ULONG) );
             break;
         case PS_ATTRIBUTE_TEB_ADDRESS:
             ret->Attributes[i].Size     = sizeof(TEB *);
-            ret->Attributes[i].ValuePtr = Wow64AllocateTemp( ret->Attributes[i].Size );
+            ret->Attributes[i].ValuePtr = alloc_temp( ret->Attributes[i].Size );
+            memset( ret->Attributes[i].ValuePtr, 0, ret->Attributes[i].Size );
+            wow64_probe_user_write( wow64_guest_memory_ptr( in->Value ),
+                                    min( in->Size, sizeof(ULONG) ));
+            if (in->ReturnLength)
+                wow64_probe_user_write( wow64_guest_memory_ptr( in->ReturnLength ), sizeof(ULONG) );
             break;
         case PS_ATTRIBUTE_GROUP_AFFINITY:
             {
-                GROUP_AFFINITY32 *aff32 = ret->Attributes[i].ValuePtr;
+                GROUP_AFFINITY32 aff32;
                 GROUP_AFFINITY *aff64;
+
+                if (in->Size < sizeof(aff32)) return STATUS_INVALID_PARAMETER;
+                wow64_read_user( &aff32, wow64_guest_memory_ptr( in->Value ), sizeof(aff32) );
                 ret->Attributes[i].Size     = sizeof(GROUP_AFFINITY);
-                ret->Attributes[i].ValuePtr = Wow64AllocateTemp( ret->Attributes[i].Size );
+                ret->Attributes[i].ValuePtr = alloc_temp( ret->Attributes[i].Size );
                 aff64 = ret->Attributes[i].ValuePtr;
-                aff64->Mask = aff32->Mask;
-                aff64->Group = aff32->Group;
-                aff64->Reserved[0] = aff32->Reserved[0];
-                aff64->Reserved[1] = aff32->Reserved[1];
-                aff64->Reserved[2] = aff32->Reserved[2];
+                aff64->Mask = aff32.Mask;
+                aff64->Group = aff32.Group;
+                aff64->Reserved[0] = aff32.Reserved[0];
+                aff64->Reserved[1] = aff32.Reserved[1];
+                aff64->Reserved[2] = aff32.Reserved[2];
             }
             break;
         }
     }
     *attr = ret;
-    return ret;
+    *snapshot = local;
+    *attr_count = count;
+    return STATUS_SUCCESS;
 }
 
 
-static void put_ps_attributes( PS_ATTRIBUTE_LIST32 *attr32, const PS_ATTRIBUTE_LIST *attr )
+static NTSTATUS put_ps_attributes( const PS_ATTRIBUTE_LIST32 *attr32, ULONG count,
+                                  const PS_ATTRIBUTE_LIST *attr )
 {
+    NTSTATUS status;
     ULONG i;
 
-    if (!attr32) return;
-    for (i = 0; i < (attr32->TotalLength - sizeof(attr32->TotalLength)) / sizeof(PS_ATTRIBUTE32); i++)
+    if (!attr32) return STATUS_SUCCESS;
+    for (i = 0; i < count; i++)
     {
         switch (attr->Attributes[i].Attribute)
         {
@@ -235,10 +425,22 @@ static void put_ps_attributes( PS_ATTRIBUTE_LIST32 *attr32, const PS_ATTRIBUTE_L
         {
             CLIENT_ID32 id32;
             ULONG size = min( attr32->Attributes[i].Size, sizeof(id32) );
-            put_client_id( &id32, attr->Attributes[i].ValuePtr );
-            memcpy( ULongToPtr( attr32->Attributes[i].Value ), &id32, size );
+            const CLIENT_ID *id = attr->Attributes[i].ValuePtr;
+
+            id32.UniqueProcess = HandleToLong( id->UniqueProcess );
+            id32.UniqueThread = HandleToLong( id->UniqueThread );
+            status = wow64_try_write_user( wow64_guest_memory_ptr( attr32->Attributes[i].Value ),
+                                           &id32, size );
+            if (status) return status;
             if (attr32->Attributes[i].ReturnLength)
-                *(ULONG *)ULongToPtr(attr32->Attributes[i].ReturnLength) = size;
+            {
+                ULONG length = size;
+
+                status = wow64_try_write_user( wow64_guest_memory_ptr(
+                                               attr32->Attributes[i].ReturnLength ),
+                                               &length, sizeof(length) );
+                if (status) return status;
+            }
             break;
         }
         case PS_ATTRIBUTE_IMAGE_INFO:
@@ -246,23 +448,42 @@ static void put_ps_attributes( PS_ATTRIBUTE_LIST32 *attr32, const PS_ATTRIBUTE_L
             SECTION_IMAGE_INFORMATION32 info32;
             ULONG size = min( attr32->Attributes[i].Size, sizeof(info32) );
             put_section_image_info( &info32, attr->Attributes[i].ValuePtr );
-            memcpy( ULongToPtr( attr32->Attributes[i].Value ), &info32, size );
+            status = wow64_try_write_user( wow64_guest_memory_ptr( attr32->Attributes[i].Value ),
+                                           &info32, size );
+            if (status) return status;
             if (attr32->Attributes[i].ReturnLength)
-                *(ULONG *)ULongToPtr(attr32->Attributes[i].ReturnLength) = size;
+            {
+                ULONG length = size;
+
+                status = wow64_try_write_user( wow64_guest_memory_ptr(
+                                               attr32->Attributes[i].ReturnLength ),
+                                               &length, sizeof(length) );
+                if (status) return status;
+            }
             break;
         }
         case PS_ATTRIBUTE_TEB_ADDRESS:
         {
             TEB **teb = attr->Attributes[i].ValuePtr;
-            ULONG teb32 = PtrToUlong( *teb ) + 0x2000;
-            ULONG size = min( attr->Attributes[i].Size, sizeof(teb32) );
-            memcpy( ULongToPtr( attr32->Attributes[i].Value ), &teb32, size );
+            ULONG teb32 = wow64_guest_memory_addr( *teb ) + 0x2000;
+            ULONG size = min( attr32->Attributes[i].Size, sizeof(teb32) );
+            status = wow64_try_write_user( wow64_guest_memory_ptr( attr32->Attributes[i].Value ),
+                                           &teb32, size );
+            if (status) return status;
             if (attr32->Attributes[i].ReturnLength)
-                *(ULONG *)ULongToPtr(attr32->Attributes[i].ReturnLength) = size;
+            {
+                ULONG length = size;
+
+                status = wow64_try_write_user( wow64_guest_memory_ptr(
+                                               attr32->Attributes[i].ReturnLength ),
+                                               &length, sizeof(length) );
+                if (status) return status;
+            }
             break;
         }
         }
     }
+    return STATUS_SUCCESS;
 }
 
 void put_vm_counters( VM_COUNTERS_EX32 *info32, const VM_COUNTERS_EX *info, ULONG size )
@@ -282,6 +503,235 @@ void put_vm_counters( VM_COUNTERS_EX32 *info32, const VM_COUNTERS_EX *info, ULON
 }
 
 
+static NTSTATUS query_process_buffer( HANDLE handle, PROCESSINFOCLASS class, void *ptr,
+                                      ULONG len, ULONG *retlen )
+{
+    const ULONG untouched = 0xdeadbeef;
+    ULONG result = untouched;
+    SIZE_T capacity;
+    void *buffer = NULL;
+    ULONG copy_size = 0;
+    BOOL oversized_output = FALSE;
+    NTSTATUS status;
+
+    switch (class)
+    {
+    case ProcessIoCounters:              capacity = sizeof(IO_COUNTERS); break;
+    case ProcessTimes:                   capacity = sizeof(KERNEL_USER_TIMES); break;
+    case ProcessDefaultHardErrorMode:    capacity = sizeof(ULONG); break;
+    case ProcessPriorityClass:           capacity = sizeof(PROCESS_PRIORITY_CLASS); break;
+    case ProcessPriorityBoost:           capacity = sizeof(ULONG); break;
+    case ProcessHandleCount:             capacity = sizeof(ULONG); break;
+    case ProcessSessionInformation:      capacity = sizeof(ULONG); break;
+    case ProcessDebugFlags:              capacity = sizeof(ULONG); break;
+    case ProcessExecuteFlags:            capacity = sizeof(ULONG); break;
+    case ProcessCookie:                  capacity = sizeof(ULONG); break;
+    case ProcessCycleTime:               capacity = sizeof(PROCESS_CYCLE_TIME_INFORMATION); break;
+    case ProcessPowerThrottlingState:    capacity = sizeof(PROCESS_POWER_THROTTLING_STATE); break;
+    default:                             return STATUS_INVALID_INFO_CLASS;
+    }
+
+    if (!ptr)
+    {
+        status = NtQueryInformationProcess( handle, class, NULL, len, &result );
+        if (retlen && result != untouched) put_size( retlen, result );
+        return status;
+    }
+
+    oversized_output = class == ProcessIoCounters || class == ProcessTimes ||
+                       class == ProcessHandleCount;
+    if (len < capacity || (!oversized_output && len != capacity))
+    {
+        status = NtQueryInformationProcess( handle, class, NULL, len, &result );
+        if (retlen && result != untouched) put_size( retlen, result );
+        return status;
+    }
+
+    buffer = alloc_temp( capacity );
+    if (buffer) memset( buffer, 0, capacity );
+    status = NtQueryInformationProcess( handle, class, buffer, capacity, &result );
+    if (oversized_output && len > capacity) status = STATUS_INFO_LENGTH_MISMATCH;
+    if (!status) copy_size = result == untouched ? capacity : min( (ULONG)capacity, result );
+    else if (status == STATUS_INFO_LENGTH_MISMATCH && result != untouched)
+    {
+        if (oversized_output && result <= capacity) copy_size = result;
+    }
+    else if (result != untouched && (class == ProcessPriorityBoost || class == ProcessDebugFlags))
+        copy_size = min( (ULONG)capacity, result );
+    if (copy_size)
+    {
+        if (ptr) wow64_write_user( ptr, buffer, copy_size );
+        else status = STATUS_ACCESS_VIOLATION;
+    }
+    if (retlen && result != untouched) put_size( retlen, result );
+    return status;
+}
+
+
+static NTSTATUS query_process_handle_table( HANDLE handle, void *ptr, ULONG len,
+                                            ULONG *retlen )
+{
+    const ULONG untouched = 0xdeadbeef;
+    ULONG result = untouched, required;
+    void *buffer;
+    NTSTATUS status;
+
+    if (!ptr && len)
+    {
+        status = NtQueryInformationProcess( handle, ProcessHandleTable, NULL, len, &result );
+        if (retlen && result != untouched) put_size( retlen, result );
+        return status;
+    }
+
+    status = NtQueryInformationProcess( handle, ProcessHandleTable, NULL, 0, &result );
+    if (result == untouched)
+    {
+        return status;
+    }
+    if (status && status != STATUS_INFO_LENGTH_MISMATCH)
+    {
+        if (retlen) put_size( retlen, result );
+        return status;
+    }
+    if (result % sizeof(ULONG) || result / sizeof(ULONG) > WOW64_MAX_SERVER_HANDLE_ENTRIES)
+    {
+        if (retlen) put_size( retlen, result );
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (len < result)
+    {
+        if (retlen) put_size( retlen, result );
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (!result)
+    {
+        if (retlen) put_size( retlen, 0 );
+        return STATUS_SUCCESS;
+    }
+
+    buffer = alloc_temp( result );
+    memset( buffer, 0, result );
+    required = untouched;
+    status = NtQueryInformationProcess( handle, ProcessHandleTable, buffer, result, &required );
+    if (!status)
+    {
+        if (required > result || required % sizeof(ULONG))
+            return STATUS_INFO_LENGTH_MISMATCH;
+        if (required) wow64_write_user( ptr, buffer, required );
+    }
+    if (retlen && required != untouched) put_size( retlen, required );
+    return status;
+}
+
+
+static NTSTATUS query_thread_buffer( HANDLE handle, THREADINFOCLASS class, void *ptr,
+                                     ULONG len, ULONG *retlen )
+{
+    const ULONG untouched = 0xdeadbeef;
+    ULONG result = untouched;
+    SIZE_T capacity;
+    void *buffer;
+    ULONG copy_size = 0;
+    NTSTATUS status;
+
+    switch (class)
+    {
+    case ThreadTimes:                       capacity = sizeof(KERNEL_USER_TIMES); break;
+    case ThreadEnableAlignmentFaultFixup:   capacity = sizeof(BOOLEAN); break;
+    case ThreadAmILastThread:               capacity = sizeof(ULONG); break;
+    case ThreadIsIoPending:                 capacity = sizeof(ULONG); break;
+    case ThreadIsTerminated:                capacity = sizeof(ULONG); break;
+    case ThreadHideFromDebugger:            capacity = sizeof(BOOLEAN); break;
+    case ThreadSuspendCount:                capacity = sizeof(ULONG); break;
+    case ThreadPriorityBoost:               capacity = sizeof(ULONG); break;
+    case ThreadIdealProcessorEx:            capacity = sizeof(PROCESSOR_NUMBER); break;
+    case ThreadCycleTime:                   capacity = sizeof(PROCESS_CYCLE_TIME_INFORMATION); break;
+    case ThreadPagePriority:                capacity = sizeof(MEMORY_PRIORITY_INFORMATION); break;
+    case ThreadPowerThrottlingState:        capacity = sizeof(THREAD_POWER_THROTTLING_STATE); break;
+    default:                                return STATUS_INVALID_INFO_CLASS;
+    }
+    if (class == ThreadHideFromDebugger && retlen)
+        wow64_probe_user_write( retlen, sizeof(*retlen) );
+    if (!ptr)
+    {
+        status = NtQueryInformationThread( handle, class, NULL, len, &result );
+        if (retlen && result != untouched) put_size( retlen, result );
+        return status;
+    }
+    if (class == ThreadTimes) capacity = min( capacity, len );
+    else if (len != capacity)
+    {
+        status = NtQueryInformationThread( handle, class, NULL, len, &result );
+        if (retlen && result != untouched) put_size( retlen, result );
+        return status;
+    }
+    buffer = alloc_temp( capacity );
+    if (buffer) memset( buffer, 0, capacity );
+    status = NtQueryInformationThread( handle, class, buffer, capacity, &result );
+    if (!status) copy_size = result == untouched ? capacity : min( (ULONG)capacity, result );
+    if (copy_size)
+    {
+        if (ptr) wow64_write_user( ptr, buffer, copy_size );
+        else status = STATUS_ACCESS_VIOLATION;
+    }
+    if (retlen && result != untouched) put_size( retlen, result );
+    return status;
+}
+
+
+static NTSTATUS publish_handle_result( ULONG *handle_ptr, HANDLE handle, NTSTATUS status )
+{
+    NTSTATUS publish_status = try_put_handle( handle_ptr, handle );
+
+    if (!publish_status) return status;
+    if (handle) NtClose( handle );
+    return publish_status;
+}
+
+
+struct create_user_thread_cleanup
+{
+    struct process_address_codec codec;
+    HANDLE handle;
+    HANDLE transaction;
+    NTSTATUS status;
+};
+
+
+static void cleanup_create_user_thread( BOOL normal, void *arg )
+{
+    struct create_user_thread_cleanup *cleanup = arg;
+
+    if (cleanup->transaction)
+        __wine_wow64_complete_user_thread( cleanup->transaction, FALSE, cleanup->status );
+    if (cleanup->handle) NtClose( cleanup->handle );
+    close_process_address_codec( normal, &cleanup->codec );
+}
+
+
+struct create_user_process_cleanup
+{
+    HANDLE process;
+    HANDLE thread;
+    HANDLE transaction;
+    RTL_USER_PROCESS_PARAMETERS *params;
+    NTSTATUS status;
+};
+
+
+static void cleanup_create_user_process( BOOL normal, void *arg )
+{
+    struct create_user_process_cleanup *cleanup = arg;
+
+    (void)normal;
+    if (cleanup->transaction)
+        __wine_wow64_complete_user_process( cleanup->transaction, FALSE, cleanup->status );
+    if (cleanup->thread) NtClose( cleanup->thread );
+    if (cleanup->process) NtClose( cleanup->process );
+    if (cleanup->params) RtlDestroyProcessParameters( cleanup->params );
+}
+
+
 /**********************************************************************
  *           wow64_NtAlertMultipleThreadByThreadId
  */
@@ -289,14 +739,29 @@ NTSTATUS WINAPI wow64_NtAlertMultipleThreadByThreadId( UINT *args )
 {
     LONG *handles_ptr = get_ptr( &args );
     ULONG count = get_ulong( &args );
-    void *unk1 = get_ptr( &args );
-    void *unk2 = get_ptr( &args );
+    void *unk1 = get_raw_ptr( &args );
+    void *unk2 = get_raw_ptr( &args );
+    LONG handles32_buf[256], *handles32;
     HANDLE handles_buf[256], *handles;
+    SIZE_T guest_size, native_size;
     unsigned int i;
 
-    if (count <= ARRAY_SIZE(handles_buf)) handles = handles_buf;
-    else                                  handles = Wow64AllocateTemp( count * sizeof(*handles) );
-    for (i = 0; i < count; ++i) handles[i] = (HANDLE)(ULONG_PTR)handles_ptr[i];
+    if (!multiply_size( count, sizeof(*handles32), &guest_size ) ||
+        !multiply_size( count, sizeof(*handles), &native_size ))
+        return STATUS_INVALID_PARAMETER;
+    if (guest_size) wow64_probe_user_read( handles_ptr, guest_size );
+    if (count <= ARRAY_SIZE(handles_buf))
+    {
+        handles32 = handles32_buf;
+        handles = handles_buf;
+    }
+    else
+    {
+        handles32 = alloc_temp( guest_size );
+        handles = alloc_temp( native_size );
+    }
+    if (guest_size) wow64_read_user( handles32, handles_ptr, guest_size );
+    for (i = 0; i < count; ++i) handles[i] = LongToHandle( handles32[i] );
 
     return NtAlertMultipleThreadByThreadId( handles, count, unk1, unk2 );
 }
@@ -310,7 +775,13 @@ NTSTATUS WINAPI wow64_NtAlertResumeThread( UINT *args )
     HANDLE handle = get_handle( &args );
     ULONG *count = get_ptr( &args );
 
-    return NtAlertResumeThread( handle, count );
+    ULONG local;
+    NTSTATUS status;
+
+    if (count) wow64_probe_user_write( count, sizeof(*count) );
+    status = NtAlertResumeThread( handle, count ? &local : NULL );
+    if (!status && count) wow64_write_user( count, &local, sizeof(local) );
+    return status;
 }
 
 
@@ -377,8 +848,8 @@ NTSTATUS WINAPI wow64_NtCreateThreadEx( UINT *args )
     ACCESS_MASK access = get_ulong( &args );
     OBJECT_ATTRIBUTES32 *attr32 = get_ptr( &args );
     HANDLE process = get_handle( &args );
-    PRTL_THREAD_START_ROUTINE start = get_ptr( &args );
-    void *param = get_ptr( &args );
+    ULONG start = get_ulong( &args );
+    ULONG param = get_ulong( &args );
     ULONG flags = get_ulong( &args );
     ULONG_PTR zero_bits = get_ulong( &args );
     SIZE_T stack_commit = get_ulong( &args );
@@ -386,22 +857,74 @@ NTSTATUS WINAPI wow64_NtCreateThreadEx( UINT *args )
     PS_ATTRIBUTE_LIST32 *attr_list32 = get_ptr( &args );
 
     struct object_attr64 attr;
+    PS_ATTRIBUTE_LIST32 *attr_snapshot;
     PS_ATTRIBUTE_LIST *attr_list;
-    HANDLE handle = 0;
-    NTSTATUS status;
-
-    *handle_ptr = 0;
-    if (is_process_wow64( process ))
+    ULONG attr_count;
+    struct wine_wow64_create_user_thread_params create =
     {
-        status = NtCreateThreadEx( &handle, access, objattr_32to64( &attr, attr32 ), process,
-                                   start, param, flags, get_zero_bits( zero_bits ),
-                                   stack_commit, stack_reserve,
-                                   ps_attributes_32to64( &attr_list, attr_list32 ));
-        put_ps_attributes( attr_list32, attr_list );
-    }
-    else status = STATUS_ACCESS_DENIED;
+        .version = WINE_WOW64_CREATE_USER_THREAD_VERSION,
+        .size = sizeof(create),
+    };
+    struct create_user_thread_cleanup cleanup = {0};
+    NTSTATUS status, publish_status = STATUS_SUCCESS, complete_status;
 
-    put_handle( handle_ptr, handle );
+    put_handle( handle_ptr, 0 );
+    if ((status = init_process_address_codec( process, &cleanup.codec ))) return status;
+
+    __TRY
+    {
+        do
+        {
+            if ((status = ps_attributes_32to64( &attr_list, &attr_snapshot, &attr_count,
+                                                attr_list32 ))) break;
+
+            create.process = (ULONG_PTR)cleanup.codec.process;
+            create.object_attributes = (ULONG_PTR)objattr_32to64( &attr, attr32 );
+            create.attribute_list = (ULONG_PTR)attr_list;
+            create.start = (ULONG_PTR)decode_process_address( &cleanup.codec, start );
+            create.param = (ULONG_PTR)decode_process_address( &cleanup.codec, param );
+            create.zero_bits = get_zero_bits( zero_bits );
+            create.stack_commit = stack_commit;
+            create.stack_reserve = stack_reserve;
+            create.access = access;
+            create.flags = flags;
+
+            status = __wine_wow64_create_user_thread( &create );
+            cleanup.handle = (HANDLE)(ULONG_PTR)create.handle;
+            cleanup.transaction = (HANDLE)(ULONG_PTR)create.transaction;
+            cleanup.status = status;
+            if ((!status && (!cleanup.handle || !cleanup.transaction)) ||
+                (status && (cleanup.handle || cleanup.transaction)))
+                RtlExitUserProcess( STATUS_INVALID_PARAMETER );
+
+            publish_status = put_ps_attributes( attr_snapshot, attr_count, attr_list );
+            if (!publish_status)
+                publish_status = try_put_handle( handle_ptr, cleanup.handle );
+            if (publish_status)
+            {
+                cleanup.status = publish_status;
+                status = publish_status;
+                break;
+            }
+
+            if (!cleanup.transaction)
+            {
+                cleanup.handle = 0;
+                break;
+            }
+
+            /* The final handle publication transfers ownership to the guest.
+             * Commit only releases the private transaction suspension; failure
+             * after publication cannot be returned with a stale visible handle. */
+            cleanup.handle = 0;
+            complete_status = __wine_wow64_complete_user_thread(
+                cleanup.transaction, TRUE, STATUS_SUCCESS );
+            cleanup.transaction = 0;
+            if (complete_status) RtlExitUserProcess( complete_status );
+        } while (0);
+    }
+    __FINALLY_CTX( cleanup_create_user_thread, &cleanup )
+
     return status;
 }
 
@@ -424,25 +947,109 @@ NTSTATUS WINAPI wow64_NtCreateUserProcess( UINT *args )
     PS_ATTRIBUTE_LIST32 *attr32 = get_ptr( &args );
 
     struct object_attr64 process_attr, thread_attr;
+    OBJECT_ATTRIBUTES *process_attr_ptr, *thread_attr_ptr;
     RTL_USER_PROCESS_PARAMETERS *params;
-    PS_CREATE_INFO info;
+    PS_CREATE_INFO info, non_mz_native_info = {0};
+    PS_CREATE_INFO32 info_snapshot, non_mz_info;
+    PS_ATTRIBUTE_LIST32 *attr_snapshot;
     PS_ATTRIBUTE_LIST *attr;
-    HANDLE process_handle = 0, thread_handle = 0;
+    ULONG attr_count;
+    struct wine_wow64_create_user_process_params create =
+    {
+        .version = WINE_WOW64_CREATE_USER_PROCESS_VERSION,
+        .size = sizeof(create),
+    };
+    struct create_user_process_cleanup cleanup = {0};
+    NTSTATUS status, publish_status = STATUS_SUCCESS, complete_status;
 
-    NTSTATUS status;
+    if ((status = try_put_handle_pair( process_handle_ptr, 0, thread_handle_ptr, 0 )))
+        return status;
+    if ((status = process_params_32to64( &params, params32 ))) return status;
+    cleanup.params = params;
 
-    *process_handle_ptr = *thread_handle_ptr = 0;
-    status = NtCreateUserProcess( &process_handle, &thread_handle, process_access, thread_access,
-                                  objattr_32to64( &process_attr, process_attr32 ),
-                                  objattr_32to64( &thread_attr, thread_attr32 ),
-                                  process_flags, thread_flags,
-                                  process_params_32to64( &params, params32),
-                                  &info, ps_attributes_32to64( &attr, attr32 ));
-    put_handle( process_handle_ptr, process_handle );
-    put_handle( thread_handle_ptr, thread_handle );
-    put_ps_create_info( info32, &info );
-    put_ps_attributes( attr32, attr );
-    RtlDestroyProcessParameters( params );
+    __TRY
+    {
+        do
+        {
+            if ((status = ps_create_info_32to64( &info, &info_snapshot, info32 ))) break;
+            wow64_probe_user_write( info32, sizeof(*info32) );
+            if ((status = ps_attributes_32to64( &attr, &attr_snapshot, &attr_count,
+                                                attr32 ))) break;
+
+            process_attr_ptr = objattr_32to64( &process_attr, process_attr32 );
+            thread_attr_ptr = objattr_32to64( &thread_attr, thread_attr32 );
+            ps_create_info_64to32( &non_mz_info, &info_snapshot, &non_mz_native_info );
+            create.process_attributes = (ULONG_PTR)process_attr_ptr;
+            create.thread_attributes = (ULONG_PTR)thread_attr_ptr;
+            create.process_parameters = (ULONG_PTR)params;
+            create.create_info = (ULONG_PTR)&info;
+            create.attribute_list = (ULONG_PTR)attr;
+            create.guest_process_handle = (ULONG_PTR)process_handle_ptr;
+            create.guest_thread_handle = (ULONG_PTR)thread_handle_ptr;
+            create.guest_create_info = (ULONG_PTR)info32;
+            create.non_mz_create_info = (ULONG_PTR)&non_mz_info;
+            create.process_access = process_access;
+            create.thread_access = thread_access;
+            create.process_flags = process_flags;
+            create.thread_flags = thread_flags;
+            create.non_mz_create_info_size = sizeof(non_mz_info);
+
+            status = __wine_wow64_create_user_process( &create );
+            cleanup.process = (HANDLE)(ULONG_PTR)create.process_handle;
+            cleanup.thread = (HANDLE)(ULONG_PTR)create.thread_handle;
+            cleanup.transaction = (HANDLE)(ULONG_PTR)create.transaction;
+            cleanup.status = status;
+
+            if (create.result == WINE_WOW64_CREATE_USER_PROCESS_NON_MZ_COMMITTED)
+            {
+                if (status || cleanup.process || cleanup.thread || cleanup.transaction)
+                    RtlExitUserProcess( STATUS_INVALID_PARAMETER );
+            }
+            else
+            {
+                if (create.result == WINE_WOW64_CREATE_USER_PROCESS_PE_TRANSACTION)
+                {
+                    if (status || !cleanup.transaction || !cleanup.process || !cleanup.thread)
+                        publish_status = STATUS_INVALID_PARAMETER;
+                }
+                else if (create.result != WINE_WOW64_CREATE_USER_PROCESS_NONE || !status ||
+                         cleanup.transaction || cleanup.process || cleanup.thread)
+                    publish_status = STATUS_INVALID_PARAMETER;
+
+                if (!publish_status)
+                    publish_status = put_ps_create_info( info32, &info_snapshot, &info );
+                if (!publish_status)
+                    publish_status = put_ps_attributes( attr_snapshot, attr_count, attr );
+                if (!publish_status)
+                    publish_status = try_put_handle_pair( process_handle_ptr, cleanup.process,
+                                                          thread_handle_ptr, cleanup.thread );
+                if (!publish_status && cleanup.transaction)
+                {
+                    /* The atomic pair publication transfers handle ownership to the guest.
+                     * A commit failure after that point cannot be returned without exposing
+                     * handles to a process which the token close would cancel. */
+                    cleanup.process = cleanup.thread = 0;
+                    complete_status = __wine_wow64_complete_user_process(
+                        cleanup.transaction, TRUE, STATUS_SUCCESS );
+                    cleanup.transaction = 0;
+                    if (complete_status) RtlExitUserProcess( complete_status );
+                }
+                if (publish_status)
+                {
+                    cleanup.status = publish_status;
+                    status = publish_status;
+                }
+                else if (!cleanup.transaction)
+                {
+                    /* No transaction means either a failure result with zero handles or a
+                     * successfully committed pair whose ownership has already transferred. */
+                    cleanup.process = cleanup.thread = 0;
+                }
+            }
+        } while (0);
+    }
+    __FINALLY_CTX( cleanup_create_user_process, &cleanup )
+
     return status;
 }
 
@@ -482,10 +1089,9 @@ NTSTATUS WINAPI wow64_NtGetNextProcess( UINT *args )
     HANDLE handle = 0;
     NTSTATUS status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtGetNextProcess( process, access, attributes, flags, &handle );
-    put_handle( handle_ptr, handle );
-    return status;
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -504,10 +1110,9 @@ NTSTATUS WINAPI wow64_NtGetNextThread( UINT *args )
     HANDLE handle = 0;
     NTSTATUS status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtGetNextThread( process, thread, access, attributes, flags, &handle );
-    put_handle( handle_ptr, handle );
-    return status;
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -538,10 +1143,9 @@ NTSTATUS WINAPI wow64_NtOpenProcess( UINT *args )
     CLIENT_ID id;
     NTSTATUS status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtOpenProcess( &handle, access, objattr_32to64( &attr, attr32 ), client_id_32to64( &id, id32 ));
-    put_handle( handle_ptr, handle );
-    return status;
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -560,10 +1164,9 @@ NTSTATUS WINAPI wow64_NtOpenThread( UINT *args )
     CLIENT_ID id;
     NTSTATUS status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtOpenThread( &handle, access, objattr_32to64( &attr, attr32 ), client_id_32to64( &id, id32 ));
-    put_handle( handle_ptr, handle );
-    return status;
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -586,24 +1189,25 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
         if (len == sizeof(PROCESS_BASIC_INFORMATION32))
         {
             PROCESS_BASIC_INFORMATION info;
-            PROCESS_BASIC_INFORMATION32 *info32 = ptr;
+            PROCESS_BASIC_INFORMATION32 info32;
 
             if (!(status = NtQueryInformationProcess( handle, class, &info, sizeof(info), NULL )))
             {
                 if (is_process_wow64( handle ))
-                    info32->PebBaseAddress = PtrToUlong( info.PebBaseAddress ) + 0x1000;
+                    info32.PebBaseAddress = wow64_guest_memory_addr( info.PebBaseAddress ) + 0x1000;
                 else
-                    info32->PebBaseAddress = 0;
-                info32->ExitStatus = info.ExitStatus;
-                info32->AffinityMask = info.AffinityMask;
-                info32->BasePriority = info.BasePriority;
-                info32->UniqueProcessId = info.UniqueProcessId;
-                info32->InheritedFromUniqueProcessId = info.InheritedFromUniqueProcessId;
-                if (retlen) *retlen = sizeof(*info32);
+                    info32.PebBaseAddress = 0;
+                info32.ExitStatus = info.ExitStatus;
+                info32.AffinityMask = info.AffinityMask;
+                info32.BasePriority = info.BasePriority;
+                info32.UniqueProcessId = info.UniqueProcessId;
+                info32.InheritedFromUniqueProcessId = info.InheritedFromUniqueProcessId;
+                wow64_write_user( ptr, &info32, sizeof(info32) );
+                put_size( retlen, sizeof(info32) );
             }
             return status;
         }
-        if (retlen) *retlen = sizeof(PROCESS_BASIC_INFORMATION32);
+        put_size( retlen, sizeof(PROCESS_BASIC_INFORMATION32) );
         return STATUS_INFO_LENGTH_MISMATCH;
 
     case ProcessIoCounters:  /* IO_COUNTERS */
@@ -617,66 +1221,85 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
     case ProcessExecuteFlags:  /* ULONG */
     case ProcessCookie:  /* ULONG */
     case ProcessCycleTime:  /* PROCESS_CYCLE_TIME_INFORMATION */
-    case ProcessHandleTable:  /* ULONG[] */
     case ProcessPowerThrottlingState:  /* PROCESS_POWER_THROTTLING_STATE */
-        /* FIXME: check buffer alignment */
-        return NtQueryInformationProcess( handle, class, ptr, len, retlen );
+        return query_process_buffer( handle, class, ptr, len, retlen );
+
+    case ProcessHandleTable:  /* ULONG[] */
+        return query_process_handle_table( handle, ptr, len, retlen );
 
     case ProcessQuotaLimits:  /* QUOTA_LIMITS */
         if (len == sizeof(QUOTA_LIMITS32))
         {
             QUOTA_LIMITS info;
-            QUOTA_LIMITS32 *info32 = ptr;
+            QUOTA_LIMITS32 info32 = {0};
 
             if (!(status = NtQueryInformationProcess( handle, class, &info, sizeof(info), NULL )))
             {
-                info32->PagedPoolLimit        = info.PagedPoolLimit;
-                info32->NonPagedPoolLimit     = info.NonPagedPoolLimit;
-                info32->MinimumWorkingSetSize = info.MinimumWorkingSetSize;
-                info32->MaximumWorkingSetSize = info.MaximumWorkingSetSize;
-                info32->PagefileLimit         = info.PagefileLimit;
-                info32->TimeLimit             = info.TimeLimit;
-                if (retlen) *retlen = len;
+                info32.PagedPoolLimit        = info.PagedPoolLimit;
+                info32.NonPagedPoolLimit     = info.NonPagedPoolLimit;
+                info32.MinimumWorkingSetSize = info.MinimumWorkingSetSize;
+                info32.MaximumWorkingSetSize = info.MaximumWorkingSetSize;
+                info32.PagefileLimit         = info.PagefileLimit;
+                info32.TimeLimit             = info.TimeLimit;
+                wow64_write_user( ptr, &info32, sizeof(info32) );
+                put_size( retlen, len );
             }
             return status;
         }
-        if (retlen) *retlen = sizeof(QUOTA_LIMITS32);
+        put_size( retlen, sizeof(QUOTA_LIMITS32) );
         return STATUS_INFO_LENGTH_MISMATCH;
 
     case ProcessVmCounters:  /* VM_COUNTERS_EX */
         if (len == sizeof(VM_COUNTERS32) || len == sizeof(VM_COUNTERS_EX32))
         {
             VM_COUNTERS_EX info;
-            VM_COUNTERS_EX32 *info32 = ptr;
+            VM_COUNTERS_EX32 info32;
 
             if (!(status = NtQueryInformationProcess( handle, class, &info, sizeof(info), NULL )))
             {
-                put_vm_counters( info32, &info, len );
-                if (retlen) *retlen = len;
+                put_vm_counters( &info32, &info, len );
+                wow64_write_user( ptr, &info32, len );
+                put_size( retlen, len );
             }
             return status;
         }
-        if (retlen) *retlen = sizeof(VM_COUNTERS_EX32);
+        put_size( retlen, sizeof(VM_COUNTERS_EX32) );
         return STATUS_INFO_LENGTH_MISMATCH;
 
     case ProcessDebugPort:  /* ULONG_PTR */
     case ProcessAffinityMask:  /* ULONG_PTR */
-    case ProcessWow64Information:  /* ULONG_PTR */
     case ProcessDebugObjectHandle:  /* HANDLE */
-        if (retlen) *(volatile ULONG *)retlen |= 0;
+        if (class == ProcessDebugObjectHandle && retlen)
+            wow64_probe_user_write( retlen, sizeof(*retlen) );
         if (len == sizeof(ULONG))
         {
             ULONG_PTR data;
 
             if (!(status = NtQueryInformationProcess( handle, class, &data, sizeof(data), NULL )))
             {
-                *(ULONG *)ptr = data;
-                if (retlen) *retlen = sizeof(ULONG);
+                ULONG data32 = data;
+                wow64_write_user( ptr, &data32, sizeof(data32) );
+                put_size( retlen, sizeof(data32) );
             }
             else if (status == STATUS_PORT_NOT_SET)
             {
                 if (!ptr) return STATUS_ACCESS_VIOLATION;
-                if (retlen) *retlen = sizeof(ULONG);
+                put_size( retlen, sizeof(ULONG) );
+            }
+            return status;
+        }
+        return STATUS_INFO_LENGTH_MISMATCH;
+
+    case ProcessWow64Information:  /* ULONG_PTR containing a guest PEB address */
+        if (len == sizeof(ULONG))
+        {
+            ULONG_PTR data;
+
+            if (!(status = NtQueryInformationProcess( handle, class, &data, sizeof(data), NULL )))
+            {
+                ULONG data32 = wow64_guest_memory_addr( (void *)data );
+                wow64_write_user( ptr, &data32, sizeof(data32) );
+                put_size( retlen, sizeof(data32) );
             }
             return status;
         }
@@ -685,18 +1308,51 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
     case ProcessImageFileName:
     case ProcessImageFileNameWin32:  /* UNICODE_STRING + string */
         {
-            ULONG retsize, size = len + sizeof(UNICODE_STRING) - sizeof(UNICODE_STRING32);
-            UNICODE_STRING *str = Wow64AllocateTemp( size );
-            UNICODE_STRING32 *str32 = ptr;
+            const ULONG delta = sizeof(UNICODE_STRING) - sizeof(UNICODE_STRING32);
+            const ULONG untouched = 0xdeadbeef;
+            ULONG required = untouched, retsize = untouched, size, out_size;
+            UNICODE_STRING32 str32;
+            UNICODE_STRING *str;
 
-            if (!(status = NtQueryInformationProcess( handle, class, str, size, &retsize )))
+            if (len > ~(ULONG)0 - delta) return STATUS_INFO_LENGTH_MISMATCH;
+            size = len + delta;
+
+            status = NtQueryInformationProcess( handle, class, NULL, 0, &required );
+            if (status != STATUS_INFO_LENGTH_MISMATCH || required == untouched || required > size)
             {
-                str32->Length = str->Length;
-                str32->MaximumLength = str->MaximumLength;
-                str32->Buffer = PtrToUlong( str32 + 1 );
-                memcpy( str32 + 1, str->Buffer, str->MaximumLength );
+                if (retlen && required != untouched)
+                {
+                    out_size = required >= delta ? required - delta : required;
+                    put_size( retlen, out_size );
+                }
+                return status;
             }
-            if (retlen) *retlen = retsize + sizeof(UNICODE_STRING32) - sizeof(UNICODE_STRING);
+            if (required < sizeof(*str) + sizeof(WCHAR)) return STATUS_INFO_LENGTH_MISMATCH;
+            str = alloc_temp( required );
+            memset( str, 0, required );
+
+            status = NtQueryInformationProcess( handle, class, str, required, &retsize );
+            if (!status)
+            {
+                ULONG string_size;
+
+                if (len < sizeof(str32) || retsize > required ||
+                    str->Length > str->MaximumLength || str->Buffer != (WCHAR *)(str + 1) ||
+                    str->MaximumLength > required - sizeof(*str))
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                str32.Length = str->Length;
+                str32.MaximumLength = str->MaximumLength;
+                str32.Buffer = wow64_guest_memory_addr( (char *)ptr + sizeof(str32) );
+                string_size = min( len - sizeof(str32), str->MaximumLength );
+                wow64_write_user( ptr, &str32, sizeof(str32) );
+                if (string_size)
+                    wow64_write_user( (char *)ptr + sizeof(str32), str->Buffer, string_size );
+            }
+            if (retlen && retsize != untouched)
+            {
+                out_size = retsize >= delta ? retsize - delta : retsize;
+                put_size( retlen, out_size );
+            }
             return status;
         }
 
@@ -704,16 +1360,17 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
         if (len == sizeof(SECTION_IMAGE_INFORMATION32))
         {
             SECTION_IMAGE_INFORMATION info;
-            SECTION_IMAGE_INFORMATION32 *info32 = ptr;
+            SECTION_IMAGE_INFORMATION32 info32;
 
             if (!(status = NtQueryInformationProcess( handle, class, &info, sizeof(info), NULL )))
             {
-                put_section_image_info( info32, &info );
-                if (retlen) *retlen = sizeof(*info32);
+                put_section_image_info( &info32, &info );
+                wow64_write_user( ptr, &info32, sizeof(info32) );
+                put_size( retlen, sizeof(info32) );
             }
             return status;
         }
-        if (retlen) *retlen = sizeof(SECTION_IMAGE_INFORMATION32);
+        put_size( retlen, sizeof(SECTION_IMAGE_INFORMATION32) );
         return STATUS_INFO_LENGTH_MISMATCH;
 
     default:
@@ -746,16 +1403,18 @@ NTSTATUS WINAPI wow64_NtQueryInformationThread( UINT *args )
         status = NtQueryInformationThread( handle, class, &info, sizeof(info), NULL );
         if (!status)
         {
+            ULONG size = min( len, sizeof(info32) );
+
             info32.ExitStatus = info.ExitStatus;
             info32.TebBaseAddress = is_process_id_wow64( &info.ClientId ) && info.TebBaseAddress ?
-                                    PtrToUlong(info.TebBaseAddress) + 0x2000 : 0;
+                                    wow64_guest_memory_addr(info.TebBaseAddress) + 0x2000 : 0;
             info32.ClientId.UniqueProcess = HandleToULong( info.ClientId.UniqueProcess );
             info32.ClientId.UniqueThread = HandleToULong( info.ClientId.UniqueThread );
             info32.AffinityMask = info.AffinityMask;
             info32.Priority = info.Priority;
             info32.BasePriority = info.BasePriority;
-            memcpy( ptr, &info32, min( len, sizeof(info32) ));
-            if (retlen) *retlen = min( len, sizeof(info32) );
+            wow64_write_user( ptr, &info32, size );
+            put_size( retlen, size );
         }
         return status;
     }
@@ -772,8 +1431,7 @@ NTSTATUS WINAPI wow64_NtQueryInformationThread( UINT *args )
     case ThreadCycleTime:  /* PROCESS_CYCLE_TIME_INFORMATION */
     case ThreadPagePriority:  /* MEMORY_PRIORITY_INFORMATION */
     case ThreadPowerThrottlingState:  /* THREAD_POWER_THROTTLING_STATE */
-        /* FIXME: check buffer alignment */
-        return NtQueryInformationThread( handle, class, ptr, len, retlen );
+        return query_thread_buffer( handle, class, ptr, len, retlen );
 
     case ThreadAffinityMask:  /* ULONG_PTR */
     case ThreadQuerySetWin32StartAddress:  /* PRTL_THREAD_START_ROUTINE */
@@ -783,14 +1441,28 @@ NTSTATUS WINAPI wow64_NtQueryInformationThread( UINT *args )
         status = NtQueryInformationThread( handle, class, &data, sizeof(data), NULL );
         if (!status)
         {
-            memcpy( ptr, &data, min( len, sizeof(ULONG) ));
-            if (retlen) *retlen = min( len, sizeof(ULONG) );
+            ULONG data32 = data;
+            ULONG size = min( len, sizeof(data32) );
+
+            wow64_write_user( ptr, &data32, size );
+            put_size( retlen, size );
         }
         return status;
     }
 
     case ThreadDescriptorTableEntry:  /* THREAD_DESCRIPTOR_INFORMATION */
-        return RtlWow64GetThreadSelectorEntry( handle, ptr, len, retlen );
+    {
+        const ULONG untouched = 0xdeadbeef;
+        THREAD_DESCRIPTOR_INFORMATION buffer;
+        ULONG result = untouched;
+
+        if (len == sizeof(buffer)) wow64_read_user( &buffer, ptr, sizeof(buffer) );
+        status = RtlWow64GetThreadSelectorEntry( handle, len == sizeof(buffer) ? &buffer : NULL,
+                                                 len, retlen ? &result : NULL );
+        if (!status) wow64_write_user( ptr, &buffer, sizeof(buffer) );
+        if (retlen && result != untouched) put_size( retlen, result );
+        return status;
+    }
 
     case ThreadWow64Context:  /* WOW64_CONTEXT* */
         return STATUS_INVALID_INFO_CLASS;
@@ -803,8 +1475,10 @@ NTSTATUS WINAPI wow64_NtQueryInformationThread( UINT *args )
         if (!status)
         {
             GROUP_AFFINITY32 info32 = { info.Mask, info.Group };
-            memcpy( ptr, &info32, min( len, sizeof(info32) ));
-            if (retlen) *retlen = min( len, sizeof(info32) );
+            ULONG size = min( len, sizeof(info32) );
+
+            wow64_write_user( ptr, &info32, size );
+            put_size( retlen, size );
         }
         return status;
     }
@@ -812,26 +1486,49 @@ NTSTATUS WINAPI wow64_NtQueryInformationThread( UINT *args )
     case ThreadNameInformation:  /* THREAD_NAME_INFORMATION */
     {
         THREAD_NAME_INFORMATION *info;
-        THREAD_NAME_INFORMATION32 *info32 = ptr;
-        ULONG size, ret_size;
+        THREAD_NAME_INFORMATION32 info32;
+        const ULONG delta = sizeof(*info) - sizeof(info32);
+        ULONG capacity, size, ret_size = 0, out_size;
 
-        if (len >= sizeof(*info32))
+        if (len >= sizeof(info32))
         {
-            size = sizeof(*info) + len - sizeof(*info32);
-            info = Wow64AllocateTemp( size );
-            status = NtQueryInformationThread( handle, class, info, size, &ret_size );
+            if (len > MAXDWORD - delta) return STATUS_INFO_LENGTH_MISMATCH;
+            size = len + delta;
+            status = NtQueryInformationThread( handle, class, NULL, 0, &ret_size );
+            capacity = min( size, max( ret_size, (ULONG)sizeof(*info) ) );
+            info = alloc_temp( capacity );
+            status = NtQueryInformationThread( handle, class, info, capacity, &ret_size );
+            if (status == STATUS_BUFFER_TOO_SMALL && ret_size > capacity && ret_size <= size)
+            {
+                capacity = ret_size;
+                info = alloc_temp( capacity );
+                status = NtQueryInformationThread( handle, class, info, capacity, &ret_size );
+            }
             if (!status)
             {
-                info32->ThreadName.Length = info->ThreadName.Length;
-                info32->ThreadName.MaximumLength = info->ThreadName.MaximumLength;
-                info32->ThreadName.Buffer = PtrToUlong( info32 + 1 );
-                memcpy( info32 + 1, info + 1, min( len, info->ThreadName.MaximumLength ));
+                ULONG string_size;
+
+                if (ret_size > capacity || info->ThreadName.Length > info->ThreadName.MaximumLength ||
+                    info->ThreadName.Buffer != (WCHAR *)(info + 1) ||
+                    info->ThreadName.MaximumLength > capacity - sizeof(*info))
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                info32.ThreadName.Length = info->ThreadName.Length;
+                info32.ThreadName.MaximumLength = info->ThreadName.MaximumLength;
+                info32.ThreadName.Buffer = wow64_guest_memory_addr( (char *)ptr + sizeof(info32) );
+                string_size = min( len - sizeof(info32), info->ThreadName.MaximumLength );
+                wow64_write_user( ptr, &info32, sizeof(info32) );
+                if (string_size)
+                    wow64_write_user( (char *)ptr + sizeof(info32), info + 1, string_size );
             }
         }
         else status = NtQueryInformationThread( handle, class, NULL, 0, &ret_size );
 
         if (retlen && (status == STATUS_SUCCESS || status == STATUS_BUFFER_TOO_SMALL))
-            *retlen = sizeof(*info32) + ret_size - sizeof(*info);
+        {
+            out_size = ret_size >= sizeof(*info) ?
+                       sizeof(THREAD_NAME_INFORMATION32) + ret_size - sizeof(*info) : ret_size;
+            put_size( retlen, out_size );
+        }
         return status;
     }
 
@@ -923,8 +1620,13 @@ NTSTATUS WINAPI wow64_NtResumeThread( UINT *args )
 {
     HANDLE handle = get_handle( &args );
     ULONG *count = get_ptr( &args );
+    ULONG local;
+    NTSTATUS status;
 
-    return NtResumeThread( handle, count );
+    if (count) wow64_probe_user_write( count, sizeof(*count) );
+    status = NtResumeThread( handle, count ? &local : NULL );
+    if (!status && count) wow64_write_user( count, &local, sizeof(local) );
+    return status;
 }
 
 
@@ -943,29 +1645,63 @@ NTSTATUS WINAPI wow64_NtSetInformationProcess( UINT *args )
     switch (class)
     {
     case ProcessDefaultHardErrorMode:   /* ULONG */
-    case ProcessPriorityClass:   /* PROCESS_PRIORITY_CLASS */
     case ProcessBasePriority:   /* ULONG */
     case ProcessPriorityBoost:  /* ULONG */
-    case ProcessPagePriority:   /* MEMORY_PRIORITY_INFORMATION */
+    {
+        ULONG value;
+
+        if (len != sizeof(value)) return NtSetInformationProcess( handle, class, NULL, len );
+        wow64_read_user( &value, ptr, sizeof(value) );
+        return NtSetInformationProcess( handle, class, &value, sizeof(value) );
+    }
+
+    case ProcessPriorityClass:   /* PROCESS_PRIORITY_CLASS */
+    {
+        PROCESS_PRIORITY_CLASS priority;
+
+        if (len != sizeof(priority)) return NtSetInformationProcess( handle, class, NULL, len );
+        wow64_read_user( &priority, ptr, sizeof(priority) );
+        return NtSetInformationProcess( handle, class, &priority, sizeof(priority) );
+    }
+
     case ProcessPowerThrottlingState:   /* PROCESS_POWER_THROTTLING_STATE */
+    {
+        PROCESS_POWER_THROTTLING_STATE state;
+
+        if (len != sizeof(state)) return NtSetInformationProcess( handle, class, NULL, len );
+        wow64_read_user( &state, ptr, sizeof(state) );
+        return NtSetInformationProcess( handle, class, &state, sizeof(state) );
+    }
+
+    case ProcessPagePriority:   /* MEMORY_PRIORITY_INFORMATION */
     case ProcessLeapSecondInformation:   /* PROCESS_LEAP_SECOND_INFO */
+        /* These classes are currently rejected without inspecting their buffer. */
+        return NtSetInformationProcess( handle, class, NULL, len );
+
     case ProcessWineGrantAdminToken:   /* NULL */
-        return NtSetInformationProcess( handle, class, ptr, len );
+        return NtSetInformationProcess( handle, class, NULL, len );
 
     case ProcessExecuteFlags:   /* ULONG */
-        status = NtSetInformationProcess( handle, class, ptr, len );
+    {
+        ULONG flags;
+
+        if (len != sizeof(flags)) return NtSetInformationProcess( handle, class, NULL, len );
+        wow64_read_user( &flags, ptr, sizeof(flags) );
+        status = NtSetInformationProcess( handle, class, &flags, sizeof(flags) );
         if (!status && pBTCpuNotifyProcessExecuteFlagsChange)
-            pBTCpuNotifyProcessExecuteFlagsChange(*(ULONG *)ptr);
+            pBTCpuNotifyProcessExecuteFlagsChange( flags );
         return status;
+    }
 
     case ProcessAccessToken: /* PROCESS_ACCESS_TOKEN */
         if (len == sizeof(PROCESS_ACCESS_TOKEN32))
         {
-            PROCESS_ACCESS_TOKEN32 *stack = ptr;
+            PROCESS_ACCESS_TOKEN32 stack;
             PROCESS_ACCESS_TOKEN info;
 
-            info.Thread = ULongToHandle( stack->Thread );
-            info.Token = ULongToHandle( stack->Token );
+            wow64_read_user( &stack, ptr, sizeof(stack) );
+            info.Thread = ULongToHandle( stack.Thread );
+            info.Token = ULongToHandle( stack.Token );
             return NtSetInformationProcess( handle, class, &info, sizeof(info) );
         }
         else return STATUS_INFO_LENGTH_MISMATCH;
@@ -973,7 +1709,11 @@ NTSTATUS WINAPI wow64_NtSetInformationProcess( UINT *args )
     case ProcessAffinityMask:   /* ULONG_PTR */
         if (len == sizeof(ULONG))
         {
-            ULONG_PTR mask = *(ULONG *)ptr;
+            ULONG mask32;
+            ULONG_PTR mask;
+
+            wow64_read_user( &mask32, ptr, sizeof(mask32) );
+            mask = mask32;
             return NtSetInformationProcess( handle, class, &mask, sizeof(mask) );
         }
         else return STATUS_INVALID_PARAMETER;
@@ -989,28 +1729,62 @@ NTSTATUS WINAPI wow64_NtSetInformationProcess( UINT *args )
     case ProcessThreadStackAllocation:   /* PROCESS_STACK_ALLOCATION_INFORMATION(_EX) */
         if (len == sizeof(PROCESS_STACK_ALLOCATION_INFORMATION_EX32))
         {
-            PROCESS_STACK_ALLOCATION_INFORMATION_EX32 *stack = ptr;
+            PROCESS_STACK_ALLOCATION_INFORMATION_EX32 stack;
             PROCESS_STACK_ALLOCATION_INFORMATION_EX info;
 
-            info.PreferredNode = stack->PreferredNode;
-            info.Reserved0 = stack->Reserved0;
-            info.Reserved1 = stack->Reserved1;
-            info.Reserved2 = stack->Reserved2;
-            info.AllocInfo.ReserveSize = stack->AllocInfo.ReserveSize;
-            info.AllocInfo.ZeroBits = get_zero_bits( stack->AllocInfo.ZeroBits );
+            wow64_read_user( &stack, ptr, sizeof(stack) );
+            wow64_probe_user_write( (char *)ptr + offsetof(PROCESS_STACK_ALLOCATION_INFORMATION_EX32,
+                                                            AllocInfo.StackBase), sizeof(ULONG) );
+            info.PreferredNode = stack.PreferredNode;
+            info.Reserved0 = stack.Reserved0;
+            info.Reserved1 = stack.Reserved1;
+            info.Reserved2 = stack.Reserved2;
+            info.AllocInfo.ReserveSize = stack.AllocInfo.ReserveSize;
+            info.AllocInfo.ZeroBits = get_zero_bits( stack.AllocInfo.ZeroBits );
             if (!(status = NtSetInformationProcess( handle, class, &info, sizeof(info) )))
-                stack->AllocInfo.StackBase = PtrToUlong( info.AllocInfo.StackBase );
+            {
+                ULONG base = wow64_guest_memory_addr( info.AllocInfo.StackBase );
+                NTSTATUS publish_status = wow64_try_write_user(
+                    (char *)ptr + offsetof(PROCESS_STACK_ALLOCATION_INFORMATION_EX32,
+                                           AllocInfo.StackBase), &base, sizeof(base) );
+
+                if (publish_status)
+                {
+                    SIZE_T free_size = 0;
+                    void *free_base = info.AllocInfo.StackBase;
+
+                    NtFreeVirtualMemory( NtCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
+                    return publish_status;
+                }
+            }
             return status;
         }
         else if (len == sizeof(PROCESS_STACK_ALLOCATION_INFORMATION32))
         {
-            PROCESS_STACK_ALLOCATION_INFORMATION32 *stack = ptr;
+            PROCESS_STACK_ALLOCATION_INFORMATION32 stack;
             PROCESS_STACK_ALLOCATION_INFORMATION info;
 
-            info.ReserveSize = stack->ReserveSize;
-            info.ZeroBits = get_zero_bits( stack->ZeroBits );
+            wow64_read_user( &stack, ptr, sizeof(stack) );
+            wow64_probe_user_write( (char *)ptr + offsetof(PROCESS_STACK_ALLOCATION_INFORMATION32,
+                                                            StackBase), sizeof(ULONG) );
+            info.ReserveSize = stack.ReserveSize;
+            info.ZeroBits = get_zero_bits( stack.ZeroBits );
             if (!(status = NtSetInformationProcess( handle, class, &info, sizeof(info) )))
-                stack->StackBase = PtrToUlong( info.StackBase );
+            {
+                ULONG base = wow64_guest_memory_addr( info.StackBase );
+                NTSTATUS publish_status = wow64_try_write_user(
+                    (char *)ptr + offsetof(PROCESS_STACK_ALLOCATION_INFORMATION32, StackBase),
+                    &base, sizeof(base) );
+
+                if (publish_status)
+                {
+                    SIZE_T free_size = 0;
+                    void *free_base = info.StackBase;
+
+                    NtFreeVirtualMemory( NtCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
+                    return publish_status;
+                }
+            }
             return status;
         }
         else return STATUS_INFO_LENGTH_MISMATCH;
@@ -1022,9 +1796,10 @@ NTSTATUS WINAPI wow64_NtSetInformationProcess( UINT *args )
         if (len == sizeof(ULONG))
         {
             HANDLE event = 0;
+
+            wow64_probe_user_write( ptr, sizeof(ULONG) );
             status = NtSetInformationProcess( handle, class, &event, sizeof(HANDLE *) );
-            put_handle( ptr, event );
-            return status;
+            return publish_handle_result( ptr, event, status );
         }
         else return STATUS_INFO_LENGTH_MISMATCH;
 
@@ -1047,21 +1822,66 @@ NTSTATUS WINAPI wow64_NtSetInformationThread( UINT *args )
 
     switch (class)
     {
-    case ThreadZeroTlsCell:   /* ULONG */
     case ThreadPriority:   /* ULONG */
     case ThreadBasePriority:   /* ULONG */
-    case ThreadHideFromDebugger:   /* void */
-    case ThreadEnableAlignmentFaultFixup:   /* BOOLEAN */
-    case ThreadPagePriority:  /* MEMORY_PRIORITY_INFORMATION */
-    case ThreadPowerThrottlingState:  /* THREAD_POWER_THROTTLING_STATE */
     case ThreadIdealProcessor:   /* ULONG */
     case ThreadPriorityBoost:   /* ULONG */
-        return NtSetInformationThread( handle, class, ptr, len );
+    {
+        ULONG value;
+
+        if (len != sizeof(value)) return NtSetInformationThread( handle, class, NULL, len );
+        wow64_read_user( &value, ptr, sizeof(value) );
+        return NtSetInformationThread( handle, class, &value, sizeof(value) );
+    }
+
+    case ThreadZeroTlsCell:   /* ULONG */
+    {
+        ULONG value;
+
+        if (handle != GetCurrentThread()) return NtSetInformationThread( handle, class, NULL, len );
+        if (len != sizeof(value)) return NtSetInformationThread( handle, class, NULL, len );
+        wow64_read_user( &value, ptr, sizeof(value) );
+        return NtSetInformationThread( handle, class, &value, sizeof(value) );
+    }
+
+    case ThreadHideFromDebugger:   /* void */
+        return NtSetInformationThread( handle, class, NULL, len );
+
+    case ThreadEnableAlignmentFaultFixup:   /* BOOLEAN */
+    {
+        BOOLEAN enable;
+
+        if (len != sizeof(enable)) return NtSetInformationThread( handle, class, NULL, len );
+        wow64_read_user( &enable, ptr, sizeof(enable) );
+        return NtSetInformationThread( handle, class, &enable, sizeof(enable) );
+    }
+
+    case ThreadPagePriority:  /* MEMORY_PRIORITY_INFORMATION */
+    {
+        MEMORY_PRIORITY_INFORMATION info;
+
+        if (len != sizeof(info)) return NtSetInformationThread( handle, class, NULL, len );
+        wow64_read_user( &info, ptr, sizeof(info) );
+        return NtSetInformationThread( handle, class, &info, sizeof(info) );
+    }
+
+    case ThreadPowerThrottlingState:  /* THREAD_POWER_THROTTLING_STATE */
+    {
+        THREAD_POWER_THROTTLING_STATE info;
+
+        if (len != sizeof(info)) return NtSetInformationThread( handle, class, NULL, len );
+        wow64_read_user( &info, ptr, sizeof(info) );
+        return NtSetInformationThread( handle, class, &info, sizeof(info) );
+    }
 
     case ThreadImpersonationToken:   /* HANDLE */
         if (len == sizeof(ULONG))
         {
-            HANDLE token = LongToHandle( *(ULONG *)ptr );
+            ULONG token32;
+            HANDLE token;
+
+            wow64_read_user( &token32, ptr, sizeof(token32) );
+            token = LongToHandle( token32 );
             return NtSetInformationThread( handle, class, &token, sizeof(token) );
         }
         else return STATUS_INVALID_PARAMETER;
@@ -1070,7 +1890,11 @@ NTSTATUS WINAPI wow64_NtSetInformationThread( UINT *args )
     case ThreadQuerySetWin32StartAddress:   /* PRTL_THREAD_START_ROUTINE */
         if (len == sizeof(ULONG))
         {
-            ULONG_PTR mask = *(ULONG *)ptr;
+            ULONG value32;
+            ULONG_PTR mask;
+
+            wow64_read_user( &value32, ptr, sizeof(value32) );
+            mask = value32;
             return NtSetInformationThread( handle, class, &mask, sizeof(mask) );
         }
         else return STATUS_INVALID_PARAMETER;
@@ -1082,8 +1906,13 @@ NTSTATUS WINAPI wow64_NtSetInformationThread( UINT *args )
     case ThreadGroupInformation:   /* GROUP_AFFINITY */
         if (len == sizeof(GROUP_AFFINITY32))
         {
-            GROUP_AFFINITY32 *info32 = ptr;
-            GROUP_AFFINITY info = { info32->Mask, info32->Group };
+            GROUP_AFFINITY32 info32;
+            GROUP_AFFINITY info;
+
+            wow64_read_user( &info32, ptr, sizeof(info32) );
+            memset( &info, 0, sizeof(info) );
+            info.Mask = info32.Mask;
+            info.Group = info32.Group;
 
             return NtSetInformationThread( handle, class, &info, sizeof(info) );
         }
@@ -1093,11 +1922,13 @@ NTSTATUS WINAPI wow64_NtSetInformationThread( UINT *args )
     case ThreadWineNativeThreadName:
         if (len == sizeof(THREAD_NAME_INFORMATION32))
         {
-            THREAD_NAME_INFORMATION32 *info32 = ptr;
+            THREAD_NAME_INFORMATION32 info32;
             THREAD_NAME_INFORMATION info;
+            NTSTATUS status;
 
-            if (!unicode_str_32to64( &info.ThreadName, &info32->ThreadName ))
-                return STATUS_ACCESS_VIOLATION;
+            wow64_read_user( &info32, ptr, sizeof(info32) );
+            if ((status = snapshot_unicode_string( &info.ThreadName, &info32.ThreadName )))
+                return status;
             return NtSetInformationThread( handle, class, &info, sizeof(info) );
         }
         else return STATUS_INFO_LENGTH_MISMATCH;
@@ -1117,7 +1948,13 @@ NTSTATUS WINAPI wow64_NtSetThreadExecutionState( UINT *args )
     EXECUTION_STATE new_state = get_ulong( &args );
     EXECUTION_STATE *old_state = get_ptr( &args );
 
-    return NtSetThreadExecutionState( new_state, old_state );
+    EXECUTION_STATE local;
+    NTSTATUS status;
+
+    if (old_state) wow64_probe_user_write( old_state, sizeof(*old_state) );
+    status = NtSetThreadExecutionState( new_state, old_state ? &local : NULL );
+    if (!status && old_state) wow64_write_user( old_state, &local, sizeof(local) );
+    return status;
 }
 
 
@@ -1140,7 +1977,13 @@ NTSTATUS WINAPI wow64_NtSuspendThread( UINT *args )
     HANDLE handle = get_handle( &args );
     ULONG *count = get_ptr( &args );
 
-    return NtSuspendThread( handle, count );
+    ULONG local;
+    NTSTATUS status;
+
+    if (count) wow64_probe_user_write( count, sizeof(*count) );
+    status = NtSuspendThread( handle, count ? &local : NULL );
+    if (!status && count) wow64_write_user( count, &local, sizeof(local) );
+    return status;
 }
 
 
@@ -1196,11 +2039,26 @@ NTSTATUS WINAPI wow64_NtWow64QueryInformationProcess64( UINT *args )
     void *info = get_ptr( &args );
     ULONG size = get_ulong( &args );
     ULONG *ret_len = get_ptr( &args );
+    PROCESS_BASIC_INFORMATION native_info;
+    ULONG result = 0;
+    NTSTATUS status;
 
     switch (class)
     {
     case ProcessBasicInformation:
-        return NtQueryInformationProcess( handle, class, info, size, ret_len );
+        if (size < sizeof(native_info))
+        {
+            status = NtQueryInformationProcess( handle, class, NULL, size, &result );
+        }
+        else
+        {
+            status = NtQueryInformationProcess( handle, class, &native_info,
+                                                sizeof(native_info), &result );
+            if (!status) wow64_write_user( info, &native_info, sizeof(native_info) );
+            if (size > sizeof(native_info)) status = STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if (ret_len) put_size( ret_len, result );
+        return status;
     default:
         return STATUS_NOT_IMPLEMENTED;
     }

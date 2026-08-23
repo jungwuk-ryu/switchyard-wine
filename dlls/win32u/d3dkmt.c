@@ -30,6 +30,7 @@
 #include "win32u_private.h"
 #include "ntuser_private.h"
 #include "d3dkmdt.h"
+#include "d3dkmt_private.h"
 
 #include <d3d9types.h>
 #include <dxgi.h>
@@ -149,6 +150,8 @@ struct d3dkmt_object
     D3DKMT_HANDLE       global;         /* object global handle */
     BOOL                shared;         /* object is shared using nt handles */
     HANDLE              handle;         /* internal handle of the server object */
+    unsigned int        pin_count;      /* transient native operation references */
+    BOOL                delete_pending; /* local handle removed while pinned */
 };
 
 struct d3dkmt_mutex
@@ -255,18 +258,6 @@ done:
     return object->local ? STATUS_SUCCESS : STATUS_NO_MEMORY;
 }
 
-/* free a d3dkmt local object handle */
-static void free_object_handle( struct d3dkmt_object *object )
-{
-    unsigned int index = handle_to_index( object->local );
-
-    pthread_mutex_lock( &d3dkmt_lock );
-    assert( objects + index < objects_end && objects[index] == object );
-    objects[index] = NULL;
-    object->local = 0;
-    pthread_mutex_unlock( &d3dkmt_lock );
-}
-
 /* return a pointer to a d3dkmt object from its local handle */
 static void *get_d3dkmt_object( D3DKMT_HANDLE local, enum d3dkmt_type type )
 {
@@ -274,12 +265,70 @@ static void *get_d3dkmt_object( D3DKMT_HANDLE local, enum d3dkmt_type type )
     struct d3dkmt_object *object;
 
     pthread_mutex_lock( &d3dkmt_lock );
-    if (objects + index >= objects_end) object = NULL;
+    if (!objects || index >= objects_end - objects) object = NULL;
     else object = objects[index];
     pthread_mutex_unlock( &d3dkmt_lock );
 
     if (!object || object->local != local || (type != -1 && object->type != type)) return NULL;
     return object;
+}
+
+/* Pin a handle-table object across validation and the operation that consumes it. */
+static void *pin_d3dkmt_object( D3DKMT_HANDLE local, enum d3dkmt_type type )
+{
+    unsigned int index = handle_to_index( local );
+    struct d3dkmt_object *object;
+
+    pthread_mutex_lock( &d3dkmt_lock );
+    if (!objects || index >= objects_end - objects) object = NULL;
+    else object = objects[index];
+    if (!object || object->local != local || object->delete_pending ||
+        object->pin_count == ~0u || (type != -1 && object->type != type)) object = NULL;
+    else object->pin_count++;
+    pthread_mutex_unlock( &d3dkmt_lock );
+    return object;
+}
+
+/* Validate a handle without borrowing the object.  The caller must hold
+ * d3dkmt_lock, so a consuming close cannot race the metadata check. */
+static BOOL validate_d3dkmt_object_handle_locked( D3DKMT_HANDLE local,
+                                                   enum d3dkmt_type type )
+{
+    unsigned int index = handle_to_index( local );
+    struct d3dkmt_object *object;
+
+    if (!objects || index >= objects_end - objects) object = NULL;
+    else object = objects[index];
+    return object && object->local == local && !object->delete_pending &&
+           (type == -1 || object->type == type);
+}
+
+static BOOL validate_d3dkmt_object_handle( D3DKMT_HANDLE local,
+                                            enum d3dkmt_type type )
+{
+    BOOL valid;
+
+    pthread_mutex_lock( &d3dkmt_lock );
+    valid = validate_d3dkmt_object_handle_locked( local, type );
+    pthread_mutex_unlock( &d3dkmt_lock );
+    return valid;
+}
+
+static void destroy_d3dkmt_object( struct d3dkmt_object *object )
+{
+    if (object->handle) NtClose( object->handle );
+    free( object );
+}
+
+static void unpin_d3dkmt_object( struct d3dkmt_object *object )
+{
+    BOOL destroy = FALSE;
+
+    pthread_mutex_lock( &d3dkmt_lock );
+    assert( object->pin_count );
+    if (!--object->pin_count && object->delete_pending) destroy = TRUE;
+    pthread_mutex_unlock( &d3dkmt_lock );
+    if (destroy) destroy_d3dkmt_object( object );
 }
 
 static NTSTATUS d3dkmt_object_alloc( UINT size, enum d3dkmt_type type, void **obj )
@@ -386,10 +435,74 @@ static NTSTATUS d3dkmt_object_query( enum d3dkmt_type type, D3DKMT_HANDLE global
 
 static void d3dkmt_object_free( struct d3dkmt_object *object )
 {
+    BOOL destroy = FALSE;
+
     TRACE( "object %p/%#x, global %#x\n", object, object->local, object->global );
-    if (object->local) free_object_handle( object );
-    if (object->handle) NtClose( object->handle );
-    free( object );
+    pthread_mutex_lock( &d3dkmt_lock );
+    if (object->local)
+    {
+        unsigned int index = handle_to_index( object->local );
+
+        assert( objects + index < objects_end && objects[index] == object );
+        objects[index] = NULL;
+        object->local = 0;
+    }
+    if (object->pin_count) object->delete_pending = TRUE;
+    else destroy = TRUE;
+    pthread_mutex_unlock( &d3dkmt_lock );
+    if (destroy) destroy_d3dkmt_object( object );
+}
+
+static void remove_vidpn_source_owners_locked( D3DKMT_HANDLE device )
+{
+    struct d3dkmt_vidpn_source *source, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( source, next, &d3dkmt_vidpn_sources,
+                              struct d3dkmt_vidpn_source, entry )
+    {
+        if (source->device != device) continue;
+        list_remove( &source->entry );
+        free( source );
+    }
+}
+
+/* Remove a caller-owned handle and acquire the destruction responsibility in
+ * one locked step.  This is the consuming counterpart to pin_d3dkmt_object():
+ * exactly one concurrent close wins, while an already-pinned operation keeps
+ * the detached object alive until its final unpin. */
+static NTSTATUS release_d3dkmt_object_handle( D3DKMT_HANDLE local,
+                                               enum d3dkmt_type type )
+{
+    unsigned int index = handle_to_index( local );
+    struct d3dkmt_object *object = NULL;
+    D3DKMT_HANDLE global = 0;
+    BOOL destroy = FALSE;
+
+    if (!local) return STATUS_INVALID_PARAMETER;
+
+    pthread_mutex_lock( &d3dkmt_lock );
+    if (objects && index < objects_end - objects)
+        object = objects[index];
+    if (!object || object->local != local || object->delete_pending ||
+        object->type != type)
+        object = NULL;
+    else
+    {
+        if (type == D3DKMT_DEVICE)
+            remove_vidpn_source_owners_locked( local );
+        objects[index] = NULL;
+        global = object->global;
+        object->local = 0;
+        if (object->pin_count) object->delete_pending = TRUE;
+        else destroy = TRUE;
+    }
+    pthread_mutex_unlock( &d3dkmt_lock );
+
+    if (!object) return STATUS_INVALID_PARAMETER;
+    TRACE( "released handle %#x for object %p, global %#x\n", local, object,
+           global );
+    if (destroy) destroy_d3dkmt_object( object );
+    return STATUS_SUCCESS;
 }
 
 /* create a struct security_descriptor and contained information in one contiguous piece of memory */
@@ -575,14 +688,80 @@ NTSTATUS WINAPI NtGdiDdDDIEscape( const D3DKMT_ESCAPE *desc )
  */
 NTSTATUS WINAPI NtGdiDdDDICloseAdapter( const D3DKMT_CLOSEADAPTER *desc )
 {
-    struct d3dkmt_object *adapter;
-
     TRACE( "(%p)\n", desc );
 
     if (!desc || !desc->hAdapter) return STATUS_INVALID_PARAMETER;
-    if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
+    return release_d3dkmt_object_handle( desc->hAdapter, D3DKMT_ADAPTER );
+}
 
-    d3dkmt_object_free( adapter );
+struct d3dkmt_open_adapter_luid_desc32
+{
+    uint32_t luid_low;
+    int32_t luid_high;
+    uint32_t adapter;
+};
+
+struct d3dkmt_create_device_desc32
+{
+    uint32_t adapter;
+    uint32_t flags;
+    uint32_t device;
+    uint32_t command_buffer;
+    uint32_t command_buffer_size;
+    uint32_t allocation_list;
+    uint32_t allocation_list_size;
+    uint32_t patch_location_list;
+    uint32_t patch_location_list_size;
+};
+
+C_ASSERT( sizeof(struct d3dkmt_open_adapter_luid_desc32) == 12 );
+C_ASSERT( offsetof(struct d3dkmt_open_adapter_luid_desc32, adapter) == 8 );
+C_ASSERT( sizeof(struct d3dkmt_create_device_desc32) == 36 );
+C_ASSERT( offsetof(struct d3dkmt_create_device_desc32, device) == 8 );
+
+struct d3dkmt_lifecycle_wow64
+{
+    struct wine_d3dkmt_lifecycle32 *packet;
+    struct ntdll_wow64_user_write_range output_range;
+    D3DKMT_HANDLE output;
+};
+
+static NTSTATUS d3dkmt_lifecycle_fault( struct d3dkmt_lifecycle_wow64 *wow64,
+                                         NTSTATUS status )
+{
+    wow64->packet->fault_status = status;
+    return status;
+}
+
+static NTSTATUS d3dkmt_lifecycle_prepare_output(
+    struct d3dkmt_lifecycle_wow64 *wow64, SIZE_T offset )
+{
+    uint64_t address = (uint64_t)wow64->packet->guest_desc + offset;
+    NTSTATUS status;
+    void *output;
+
+    if (address + sizeof(wow64->output) > 0x100000000ull)
+        return d3dkmt_lifecycle_fault( wow64, STATUS_ACCESS_VIOLATION );
+    if ((status = ntdll_wow64_guest32_to_host( address, &output )))
+        return d3dkmt_lifecycle_fault( wow64, status );
+
+    wow64->output_range.dst = output;
+    wow64->output_range.src = &wow64->output;
+    wow64->output_range.size = sizeof(wow64->output);
+    if ((status = ntdll_wow64_probe_user_writev( &wow64->output_range, 1 )))
+        return d3dkmt_lifecycle_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_lifecycle_publish(
+    struct d3dkmt_lifecycle_wow64 *wow64, D3DKMT_HANDLE handle )
+{
+    NTSTATUS status;
+
+    wow64->output = handle;
+    if ((status = ntdll_wow64_atomic_writev( &wow64->output_range, 1 )))
+        return d3dkmt_lifecycle_fault( wow64, status );
+    wow64->packet->output_handle = handle;
     return STATUS_SUCCESS;
 }
 
@@ -612,12 +791,16 @@ static struct vulkan_physical_device *get_vulkan_physical_device( struct vulkan_
 /******************************************************************************
  *           NtGdiDdDDIOpenAdapterFromLuid    (win32u.@)
  */
-NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc )
+static NTSTATUS d3dkmt_open_adapter_from_luid(
+    D3DKMT_OPENADAPTERFROMLUID *desc, struct d3dkmt_lifecycle_wow64 *wow64 )
 {
     struct vulkan_instance *instance;
     struct d3dkmt_adapter *adapter;
     NTSTATUS status;
 
+    if (wow64 && (status = d3dkmt_lifecycle_prepare_output(
+        wow64, offsetof(struct d3dkmt_open_adapter_luid_desc32, adapter) )))
+        return status;
     if ((status = d3dkmt_object_alloc( sizeof(*adapter), D3DKMT_ADAPTER, (void **)&adapter ))) return status;
     if ((status = alloc_object_handle( &adapter->obj ))) goto failed;
 
@@ -625,7 +808,12 @@ NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc 
     else adapter->physical_device = get_vulkan_physical_device( instance, &desc->AdapterLuid );
     if (!adapter->physical_device) WARN( "Failed to find Vulkan physical device\n" );
 
-    desc->hAdapter = adapter->obj.local;
+    if (wow64)
+    {
+        if ((status = d3dkmt_lifecycle_publish( wow64, adapter->obj.local )))
+            goto failed;
+    }
+    else desc->hAdapter = adapter->obj.local;
     return STATUS_SUCCESS;
 
 failed:
@@ -633,30 +821,59 @@ failed:
     return status;
 }
 
+NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc )
+{
+    return d3dkmt_open_adapter_from_luid( desc, NULL );
+}
+
 /******************************************************************************
  *           NtGdiDdDDICreateDevice    (win32u.@)
  */
-NTSTATUS WINAPI NtGdiDdDDICreateDevice( D3DKMT_CREATEDEVICE *desc )
+static NTSTATUS d3dkmt_create_device( D3DKMT_CREATEDEVICE *desc,
+                                      struct d3dkmt_lifecycle_wow64 *wow64 )
 {
     struct d3dkmt_adapter *adapter;
-    struct d3dkmt_device *device;
-    NTSTATUS status;
+    struct d3dkmt_device *device = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
 
     TRACE( "(%p)\n", desc );
 
     if (!desc) return STATUS_INVALID_PARAMETER;
     if (desc->Flags.LegacyMode || desc->Flags.RequestVSync || desc->Flags.DisableGpuTimeout) FIXME( "Flags unsupported.\n" );
 
-    if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
-    if ((status = d3dkmt_object_alloc( sizeof(*device), D3DKMT_DEVICE, (void **)&device ))) return status;
-    if ((status = alloc_object_handle( &device->obj ))) goto failed;
+    if (wow64)
+    {
+        if (!(adapter = pin_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER )))
+            return STATUS_INVALID_PARAMETER;
+    }
+    else if (!validate_d3dkmt_object_handle( desc->hAdapter, D3DKMT_ADAPTER ))
+        return STATUS_INVALID_PARAMETER;
 
-    desc->hDevice = device->obj.local;
-    return STATUS_SUCCESS;
+    if (wow64 && (status = d3dkmt_lifecycle_prepare_output(
+        wow64, offsetof(struct d3dkmt_create_device_desc32, device) )))
+        goto done;
+    if ((status = d3dkmt_object_alloc( sizeof(*device), D3DKMT_DEVICE,
+                                       (void **)&device )))
+        goto done;
+    if ((status = alloc_object_handle( &device->obj ))) goto done;
 
-failed:
-    d3dkmt_object_free( &device->obj );
+    if (wow64)
+    {
+        if ((status = d3dkmt_lifecycle_publish( wow64, device->obj.local )))
+            goto done;
+    }
+    else desc->hDevice = device->obj.local;
+    device = NULL;
+
+done:
+    if (device) d3dkmt_object_free( &device->obj );
+    if (wow64) unpin_d3dkmt_object( &adapter->obj );
     return status;
+}
+
+NTSTATUS WINAPI NtGdiDdDDICreateDevice( D3DKMT_CREATEDEVICE *desc )
+{
+    return d3dkmt_create_device( desc, NULL );
 }
 
 /******************************************************************************
@@ -664,19 +881,56 @@ failed:
  */
 NTSTATUS WINAPI NtGdiDdDDIDestroyDevice( const D3DKMT_DESTROYDEVICE *desc )
 {
-    D3DKMT_SETVIDPNSOURCEOWNER set_owner_desc = {0};
-    struct d3dkmt_object *device;
-
     TRACE( "(%p)\n", desc );
 
     if (!desc || !desc->hDevice) return STATUS_INVALID_PARAMETER;
-    if (!(device = get_d3dkmt_object( desc->hDevice, D3DKMT_DEVICE ))) return STATUS_INVALID_PARAMETER;
+    return release_d3dkmt_object_handle( desc->hDevice, D3DKMT_DEVICE );
+}
 
-    set_owner_desc.hDevice = desc->hDevice;
-    NtGdiDdDDISetVidPnSourceOwner( &set_owner_desc );
+NTSTATUS WINAPI __wine_win32u_d3dkmt_lifecycle(
+    struct wine_d3dkmt_lifecycle32 *packet )
+{
+    struct d3dkmt_lifecycle_wow64 wow64 = { .packet = packet };
 
-    d3dkmt_object_free( device );
-    return STATUS_SUCCESS;
+    if (!packet || packet->version != WINE_D3DKMT_LIFECYCLE32_VERSION ||
+        packet->size != sizeof(*packet) || !packet->guest_desc ||
+        packet->output_handle || packet->fault_status ||
+        packet->reserved[0] || packet->reserved[1])
+        return STATUS_INVALID_PARAMETER;
+    packet->fault_status = 0;
+
+    switch (packet->variant)
+    {
+    case WINE_D3DKMT_LIFECYCLE32_OPEN_ADAPTER_FROM_LUID:
+    {
+        D3DKMT_OPENADAPTERFROMLUID desc = {0};
+
+        desc.AdapterLuid.LowPart = packet->luid_low;
+        desc.AdapterLuid.HighPart = packet->luid_high;
+        return d3dkmt_open_adapter_from_luid( &desc, &wow64 );
+    }
+    case WINE_D3DKMT_LIFECYCLE32_CLOSE_ADAPTER:
+    {
+        D3DKMT_CLOSEADAPTER desc = { .hAdapter = packet->input_handle };
+
+        return NtGdiDdDDICloseAdapter( &desc );
+    }
+    case WINE_D3DKMT_LIFECYCLE32_CREATE_DEVICE:
+    {
+        D3DKMT_CREATEDEVICE desc = { .hAdapter = packet->input_handle };
+
+        memcpy( &desc.Flags, &packet->flags, sizeof(desc.Flags) );
+        return d3dkmt_create_device( &desc, &wow64 );
+    }
+    case WINE_D3DKMT_LIFECYCLE32_DESTROY_DEVICE:
+    {
+        D3DKMT_DESTROYDEVICE desc = { .hDevice = packet->input_handle };
+
+        return NtGdiDdDDIDestroyDevice( &desc );
+    }
+    default:
+        return STATUS_INVALID_PARAMETER;
+    }
 }
 
 /******************************************************************************
@@ -858,6 +1112,13 @@ NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER 
         return STATUS_INVALID_PARAMETER;
 
     pthread_mutex_lock( &d3dkmt_lock );
+
+    /* Keep validation and owner-list mutation atomic with DestroyDevice. */
+    if (!validate_d3dkmt_object_handle_locked( desc->hDevice, D3DKMT_DEVICE ))
+    {
+        pthread_mutex_unlock( &d3dkmt_lock );
+        return STATUS_INVALID_PARAMETER;
+    }
 
     /* Check parameters */
     for (i = 0; i < desc->VidPnSourceCount; ++i)
@@ -1117,40 +1378,317 @@ failed:
     return STATUS_INVALID_PARAMETER;
 }
 
-/******************************************************************************
- *           NtGdiDdDDICreateAllocation2    (win32u.@)
- */
-NTSTATUS WINAPI NtGdiDdDDICreateAllocation2( D3DKMT_CREATEALLOCATION *params )
+struct d3dkmt_create_standard_allocation32
+{
+    UINT type;
+    UINT size;
+    UINT flags;
+};
+
+struct d3dddi_allocation_info32
+{
+    D3DKMT_HANDLE allocation;
+    ULONG system_memory;
+    ULONG private_driver_data;
+    UINT private_driver_data_size;
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID source_id;
+    UINT flags;
+};
+
+struct d3dddi_allocation_info2_32
+{
+    D3DKMT_HANDLE allocation;
+    union
+    {
+        ULONG section;
+        ULONG system_memory;
+    };
+    ULONG private_driver_data;
+    UINT private_driver_data_size;
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID source_id;
+    UINT flags;
+    D3DGPU_VIRTUAL_ADDRESS gpu_address;
+    ULONG priority;
+    ULONG reserved[5];
+};
+
+struct d3dkmt_create_allocation_desc32
+{
+    D3DKMT_HANDLE device;
+    D3DKMT_HANDLE resource;
+    D3DKMT_HANDLE global_share;
+    ULONG private_runtime_data;
+    UINT private_runtime_data_size;
+    ULONG standard_or_private;
+    UINT private_driver_data_size;
+    UINT allocation_count;
+    ULONG allocation_info;
+    UINT flags;
+    ULONG private_runtime_resource_handle;
+};
+
+C_ASSERT( sizeof(struct d3dkmt_create_standard_allocation32) == 12 );
+C_ASSERT( sizeof(struct d3dddi_allocation_info32) == 24 );
+C_ASSERT( sizeof(struct d3dddi_allocation_info2_32) == 56 );
+C_ASSERT( sizeof(struct d3dkmt_create_allocation_desc32) == 44 );
+C_ASSERT( offsetof(struct d3dkmt_create_allocation_desc32, global_share) ==
+          offsetof(struct d3dkmt_create_allocation_desc32, resource) + sizeof(D3DKMT_HANDLE) );
+C_ASSERT( offsetof(struct d3dddi_allocation_info32, allocation) == 0 );
+C_ASSERT( offsetof(struct d3dddi_allocation_info2_32, allocation) == 0 );
+C_ASSERT( offsetof(struct d3dddi_allocation_info2_32, gpu_address) == 24 );
+
+struct d3dkmt_create_allocation_wow64
+{
+    struct wine_d3dkmt_create_allocation32 *packet;
+    struct d3dkmt_create_allocation_desc32 desc32;
+    struct d3dkmt_create_standard_allocation32 standard32;
+    D3DKMT_CREATESTANDARDALLOCATION standard;
+    union
+    {
+        struct d3dddi_allocation_info32 info;
+        struct d3dddi_allocation_info2_32 info2;
+    } allocation32;
+    union
+    {
+        D3DDDI_ALLOCATIONINFO info;
+        D3DDDI_ALLOCATIONINFO2 info2;
+    } allocation;
+    void *desc_user;
+    void *allocation_user;
+    struct ntdll_wow64_user_write_range outputs[3];
+    ULONG output_count;
+};
+
+static NTSTATUS d3dkmt_create_allocation_fault(
+    struct d3dkmt_create_allocation_wow64 *wow64, NTSTATUS status )
+{
+    wow64->packet->fault_status = status;
+    return status;
+}
+
+static NTSTATUS d3dkmt_create_allocation_guest_ptr( ULONG address, void **host )
+{
+    NTSTATUS status = ntdll_wow64_guest32_to_host( address, host );
+
+    if (status) *host = NULL;
+    return status;
+}
+
+static NTSTATUS d3dkmt_create_allocation_capture_standard(
+    D3DKMT_CREATEALLOCATION *params, struct d3dkmt_create_allocation_wow64 *wow64 )
+{
+    void *standard_user;
+    NTSTATUS status;
+
+    if ((status = d3dkmt_create_allocation_guest_ptr(
+                     wow64->packet->guest_standard_or_private, &standard_user )))
+        return status;
+    if ((status = ntdll_wow64_copy_from_user( &wow64->standard32, standard_user,
+                                               sizeof(wow64->standard32) )))
+        return d3dkmt_create_allocation_fault( wow64, status );
+    wow64->standard.Type = wow64->standard32.type;
+    wow64->standard.ExistingHeapData.Size = wow64->standard32.size;
+    wow64->standard.Flags.Value = wow64->standard32.flags;
+    params->pStandardAllocation = &wow64->standard;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_create_allocation_capture_allocation(
+    D3DKMT_CREATEALLOCATION *params, BOOL version2,
+    struct d3dkmt_create_allocation_wow64 *wow64 )
+{
+    void *system_memory, *private_driver_data, *runtime;
+    NTSTATUS status;
+
+    if ((status = d3dkmt_create_allocation_guest_ptr(
+                     wow64->packet->guest_allocation, &wow64->allocation_user )))
+        return status;
+    if ((status = d3dkmt_create_allocation_guest_ptr(
+                     wow64->packet->guest_runtime, &runtime )))
+        return status;
+
+    if (version2)
+    {
+        struct d3dddi_allocation_info2_32 *in = &wow64->allocation32.info2;
+        D3DDDI_ALLOCATIONINFO2 *out = &wow64->allocation.info2;
+
+        if ((status = ntdll_wow64_copy_from_user( in, wow64->allocation_user, sizeof(*in) )))
+            return d3dkmt_create_allocation_fault( wow64, status );
+        if (params->Flags.ExistingSection)
+            out->hSection = UlongToHandle( in->section );
+        else
+        {
+            if ((status = d3dkmt_create_allocation_guest_ptr( in->system_memory,
+                                                               &system_memory )))
+                return status;
+            out->pSystemMem = system_memory;
+        }
+        if ((status = d3dkmt_create_allocation_guest_ptr( in->private_driver_data,
+                                                           &private_driver_data )))
+            return status;
+        out->hAllocation = in->allocation;
+        out->pPrivateDriverData = private_driver_data;
+        out->PrivateDriverDataSize = in->private_driver_data_size;
+        out->VidPnSourceId = in->source_id;
+        out->Flags.Value = in->flags;
+        out->GpuVirtualAddress = in->gpu_address;
+        out->Priority = in->priority;
+        params->pAllocationInfo2 = out;
+    }
+    else
+    {
+        struct d3dddi_allocation_info32 *in = &wow64->allocation32.info;
+        D3DDDI_ALLOCATIONINFO *out = &wow64->allocation.info;
+
+        if ((status = ntdll_wow64_copy_from_user( in, wow64->allocation_user, sizeof(*in) )))
+            return d3dkmt_create_allocation_fault( wow64, status );
+        if ((status = d3dkmt_create_allocation_guest_ptr( in->system_memory,
+                                                           &system_memory )))
+            return status;
+        if ((status = d3dkmt_create_allocation_guest_ptr( in->private_driver_data,
+                                                           &private_driver_data )))
+            return status;
+        out->hAllocation = in->allocation;
+        out->pSystemMem = system_memory;
+        out->pPrivateDriverData = private_driver_data;
+        out->PrivateDriverDataSize = in->private_driver_data_size;
+        out->VidPnSourceId = in->source_id;
+        out->Flags.Value = in->flags;
+        params->pAllocationInfo = out;
+    }
+    params->pPrivateRuntimeData = runtime;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_create_allocation_prepare_outputs(
+    BOOL version2, struct d3dkmt_create_allocation_wow64 *wow64 )
+{
+    NTSTATUS status;
+
+    if ((status = d3dkmt_create_allocation_guest_ptr( wow64->packet->guest_desc,
+                                                       &wow64->desc_user )))
+        return status;
+    wow64->outputs[0].dst = (char *)wow64->desc_user +
+                            offsetof(struct d3dkmt_create_allocation_desc32, resource);
+    wow64->outputs[0].src = &wow64->desc32.resource;
+    wow64->outputs[0].size = 2 * sizeof(D3DKMT_HANDLE);
+    wow64->outputs[1].dst = wow64->allocation_user;
+    wow64->outputs[1].src = &wow64->allocation32.info.allocation;
+    wow64->outputs[1].size = sizeof(D3DKMT_HANDLE);
+    wow64->output_count = 2;
+    if (version2)
+    {
+        wow64->outputs[2].dst = (char *)wow64->allocation_user +
+                                offsetof(struct d3dddi_allocation_info2_32, gpu_address);
+        wow64->outputs[2].src = &wow64->allocation32.info2.gpu_address;
+        wow64->outputs[2].size = sizeof(D3DGPU_VIRTUAL_ADDRESS);
+        wow64->output_count++;
+    }
+    if ((status = ntdll_wow64_probe_user_writev( wow64->outputs, wow64->output_count )))
+        return d3dkmt_create_allocation_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_create_allocation_publish(
+    D3DKMT_CREATEALLOCATION *params, BOOL version2,
+    struct d3dkmt_create_allocation_wow64 *wow64 )
+{
+    NTSTATUS status;
+
+    wow64->desc32.resource = params->hResource;
+    wow64->desc32.global_share = params->hGlobalShare;
+    if (version2)
+    {
+        wow64->allocation32.info2.allocation = params->pAllocationInfo2->hAllocation;
+        wow64->allocation32.info2.gpu_address = params->pAllocationInfo2->GpuVirtualAddress;
+    }
+    else
+        wow64->allocation32.info.allocation = params->pAllocationInfo->hAllocation;
+
+    /* Preserve the original thunk's scalar publication order.  Atomic writev
+     * defines later overlapping ranges to win. */
+    if ((status = ntdll_wow64_atomic_writev( wow64->outputs, wow64->output_count )))
+        return d3dkmt_create_allocation_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_create_allocation( D3DKMT_CREATEALLOCATION *params, BOOL version2,
+                                          struct d3dkmt_create_allocation_wow64 *wow64 )
 {
     D3DKMT_CREATESTANDARDALLOCATION *standard;
-    struct d3dkmt_resource *resource = NULL;
+    struct d3dkmt_resource *resource = NULL, *existing_resource = NULL;
     D3DDDI_ALLOCATIONINFO *alloc_info;
-    struct d3dkmt_object *allocation;
+    struct d3dkmt_object *allocation = NULL;
     struct d3dkmt_device *device;
-    NTSTATUS status;
+    NTSTATUS status = STATUS_SUCCESS;
 
     FIXME( "params %p semi-stub!\n", params );
 
     if (!params) return STATUS_INVALID_PARAMETER;
-    if (!(device = get_d3dkmt_object( params->hDevice, D3DKMT_DEVICE ))) return STATUS_INVALID_PARAMETER;
+    device = pin_d3dkmt_object( params->hDevice, D3DKMT_DEVICE );
+    if (!device) return STATUS_INVALID_PARAMETER;
 
-    if (!params->Flags.StandardAllocation) return STATUS_INVALID_PARAMETER;
-    if (params->PrivateDriverDataSize) return STATUS_INVALID_PARAMETER;
+    if (!params->Flags.StandardAllocation || params->PrivateDriverDataSize)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
 
-    if (params->NumAllocations != 1) return STATUS_INVALID_PARAMETER;
-    if (!(alloc_info = params->pAllocationInfo)) return STATUS_INVALID_PARAMETER;
+    if (params->NumAllocations != 1 ||
+        (wow64 ? (!wow64->packet->guest_allocation ||
+                  !wow64->packet->guest_standard_or_private) :
+                 (!params->pAllocationInfo || !params->pStandardAllocation)))
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
 
-    if (!(standard = params->pStandardAllocation)) return STATUS_INVALID_PARAMETER;
-    if (standard->Type != D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP) return STATUS_INVALID_PARAMETER;
-    if (standard->ExistingHeapData.Size & 0xfff) return STATUS_INVALID_PARAMETER;
-    if (!params->Flags.ExistingSysMem) return STATUS_INVALID_PARAMETER;
-    if (!alloc_info->pSystemMem) return STATUS_INVALID_PARAMETER;
+    if (wow64 &&
+        (status = d3dkmt_create_allocation_capture_standard( params, wow64 )))
+        goto done;
+
+    standard = params->pStandardAllocation;
+    if (standard->Type != D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP ||
+        (standard->ExistingHeapData.Size & 0xfff) || !params->Flags.ExistingSysMem)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+
+    if (wow64 &&
+        (status = d3dkmt_create_allocation_capture_allocation( params, version2, wow64 )))
+        goto done;
+    alloc_info = params->pAllocationInfo;
+    if (!alloc_info->pSystemMem)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
 
     if (params->Flags.CreateResource)
     {
-        if (params->hResource && !(resource = get_d3dkmt_object( params->hResource, D3DKMT_RESOURCE )))
-            return STATUS_INVALID_HANDLE;
-        if ((status = d3dkmt_object_alloc( sizeof(*resource), D3DKMT_RESOURCE, (void **)&resource ))) return status;
+        if (params->hResource)
+        {
+            existing_resource = pin_d3dkmt_object( params->hResource, D3DKMT_RESOURCE );
+            if (!existing_resource)
+            {
+                status = STATUS_INVALID_HANDLE;
+                goto done;
+            }
+        }
+        if (wow64 && params->Flags.CreateShared && params->PrivateRuntimeDataSize &&
+            (status = ntdll_wow64_probe_user_read( params->pPrivateRuntimeData,
+                                                    params->PrivateRuntimeDataSize )))
+        {
+            status = d3dkmt_create_allocation_fault( wow64, status );
+            goto done;
+        }
+        if (wow64 &&
+            (status = d3dkmt_create_allocation_prepare_outputs( version2, wow64 )))
+            goto done;
+        if ((status = d3dkmt_object_alloc( sizeof(*resource), D3DKMT_RESOURCE,
+                                           (void **)&resource )))
+            goto done;
         if ((status = d3dkmt_object_alloc( sizeof(*allocation), D3DKMT_ALLOCATION, (void **)&allocation ))) goto failed;
 
         if (!params->Flags.CreateShared) status = alloc_object_handle( &resource->obj );
@@ -1163,24 +1701,52 @@ NTSTATUS WINAPI NtGdiDdDDICreateAllocation2( D3DKMT_CREATEALLOCATION *params )
     }
     else
     {
-        if (params->Flags.CreateShared) return STATUS_INVALID_PARAMETER;
+        if (params->Flags.CreateShared)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            goto done;
+        }
         if (params->hResource)
         {
-            resource = get_d3dkmt_object( params->hResource, D3DKMT_RESOURCE );
-            return resource ? STATUS_INVALID_PARAMETER : STATUS_INVALID_HANDLE;
+            existing_resource = pin_d3dkmt_object( params->hResource, D3DKMT_RESOURCE );
+            status = existing_resource ? STATUS_INVALID_PARAMETER : STATUS_INVALID_HANDLE;
+            goto done;
         }
-        if ((status = d3dkmt_object_alloc( sizeof(*allocation), D3DKMT_ALLOCATION, (void **)&allocation ))) return status;
+        if (wow64 &&
+            (status = d3dkmt_create_allocation_prepare_outputs( version2, wow64 )))
+            goto done;
+        if ((status = d3dkmt_object_alloc( sizeof(*allocation), D3DKMT_ALLOCATION,
+                                           (void **)&allocation )))
+            goto done;
         params->hGlobalShare = 0;
     }
 
     if ((status = alloc_object_handle( allocation ))) goto failed;
     if (resource) resource->allocation = allocation->local;
     alloc_info->hAllocation = allocation->local;
-    return STATUS_SUCCESS;
+    if (wow64 && (status = d3dkmt_create_allocation_publish( params, version2, wow64 )))
+        goto failed;
+    allocation = NULL;
+    resource = NULL;
+    goto done;
 
 failed:
+    if (allocation) d3dkmt_object_free( allocation );
     if (resource) d3dkmt_object_free( &resource->obj );
+done:
+    if (wow64 && status == STATUS_ACCESS_VIOLATION && !wow64->packet->fault_status)
+        wow64->packet->fault_status = status;
+    if (existing_resource) unpin_d3dkmt_object( &existing_resource->obj );
+    unpin_d3dkmt_object( &device->obj );
     return status;
+}
+
+/******************************************************************************
+ *           NtGdiDdDDICreateAllocation2    (win32u.@)
+ */
+NTSTATUS WINAPI NtGdiDdDDICreateAllocation2( D3DKMT_CREATEALLOCATION *params )
+{
+    return d3dkmt_create_allocation( params, TRUE, NULL );
 }
 
 /******************************************************************************
@@ -1188,7 +1754,44 @@ failed:
  */
 NTSTATUS WINAPI NtGdiDdDDICreateAllocation( D3DKMT_CREATEALLOCATION *params )
 {
-    return NtGdiDdDDICreateAllocation2( params );
+    return d3dkmt_create_allocation( params, FALSE, NULL );
+}
+
+NTSTATUS WINAPI __wine_win32u_d3dkmt_create_allocation(
+    struct wine_d3dkmt_create_allocation32 *packet )
+{
+    struct d3dkmt_create_allocation_wow64 wow64 = { .packet = packet };
+    D3DKMT_CREATEALLOCATION params = {0};
+    BOOL version2;
+
+    if (!packet || packet->version != WINE_D3DKMT_CREATE_ALLOCATION32_VERSION ||
+        packet->size != sizeof(*packet) || packet->fault_status ||
+        packet->reserved[0] || packet->reserved[1])
+        return STATUS_INVALID_PARAMETER;
+    packet->fault_status = 0;
+    if (packet->variant == WINE_D3DKMT_CREATE_ALLOCATION32_V1) version2 = FALSE;
+    else if (packet->variant == WINE_D3DKMT_CREATE_ALLOCATION32_V2) version2 = TRUE;
+    else return STATUS_INVALID_PARAMETER;
+    if (!packet->guest_desc) return STATUS_INVALID_PARAMETER;
+
+    wow64.desc32.device = params.hDevice = packet->hDevice;
+    wow64.desc32.resource = params.hResource = packet->hResource;
+    wow64.desc32.global_share = params.hGlobalShare = packet->hGlobalShare;
+    wow64.desc32.private_runtime_data = packet->guest_runtime;
+    wow64.desc32.private_runtime_data_size = params.PrivateRuntimeDataSize =
+        packet->private_runtime_data_size;
+    wow64.desc32.standard_or_private = packet->guest_standard_or_private;
+    wow64.desc32.private_driver_data_size = params.PrivateDriverDataSize =
+        packet->private_driver_data_size;
+    wow64.desc32.allocation_count = params.NumAllocations = packet->num_allocations;
+    wow64.desc32.allocation_info = packet->guest_allocation;
+    wow64.desc32.flags = packet->flags;
+    memcpy( &params.Flags, &packet->flags, sizeof(params.Flags) );
+    wow64.desc32.private_runtime_resource_handle = packet->private_runtime_resource_handle;
+    params.hPrivateRuntimeResourceHandle = UlongToHandle(
+        packet->private_runtime_resource_handle );
+
+    return d3dkmt_create_allocation( &params, version2, &wow64 );
 }
 
 /******************************************************************************
@@ -1247,34 +1850,260 @@ NTSTATUS WINAPI NtGdiDdDDIDestroyAllocation( const D3DKMT_DESTROYALLOCATION *par
     return NtGdiDdDDIDestroyAllocation2( &params2 );
 }
 
-/******************************************************************************
- *           NtGdiDdDDIOpenResource    (win32u.@)
- */
-NTSTATUS WINAPI NtGdiDdDDIOpenResource( D3DKMT_OPENRESOURCE *params )
+struct d3dkmt_open_resource_wow64
 {
-    struct d3dkmt_object *device, *allocation;
-    D3DDDI_OPENALLOCATIONINFO *alloc_info;
-    struct d3dkmt_resource *resource;
-    UINT runtime_size;
+    struct wine_d3dkmt_open_resource32 *packet;
+    union
+    {
+        struct wine_d3dddi_openallocationinfo32 info;
+        struct wine_d3dddi_openallocationinfo2_32 info2;
+    } allocation32;
+    union
+    {
+        D3DDDI_OPENALLOCATIONINFO info;
+        D3DDDI_OPENALLOCATIONINFO2 info2;
+    } allocation;
+    void *desc_user;
+    void *allocation_user;
+    struct ntdll_wow64_user_write_range outputs[8];
+    ULONG output_count;
+};
+
+static NTSTATUS d3dkmt_open_resource_fault( struct d3dkmt_open_resource_wow64 *wow64,
+                                             NTSTATUS status )
+{
+    wow64->packet->fault_status = status;
+    return status;
+}
+
+static NTSTATUS d3dkmt_open_resource_guest_ptr( ULONG address, void **host )
+{
+    NTSTATUS status = ntdll_wow64_guest32_to_host( address, host );
+
+    if (status) *host = NULL;
+    return status;
+}
+
+static NTSTATUS d3dkmt_open_resource_array_size( UINT count, SIZE_T element_size,
+                                                 SIZE_T *size )
+{
+    if (element_size && count > ~(SIZE_T)0 / element_size) return STATUS_INVALID_PARAMETER;
+    *size = (SIZE_T)count * element_size;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_open_resource_capture_allocation(
+    D3DKMT_OPENRESOURCE *params, BOOL version2,
+    struct d3dkmt_open_resource_wow64 *wow64 )
+{
+    void *private_driver_data;
+    SIZE_T native_size, wire_size;
     NTSTATUS status;
+
+    if (version2)
+    {
+        struct wine_d3dddi_openallocationinfo2_32 *in = &wow64->allocation32.info2;
+        D3DDDI_OPENALLOCATIONINFO2 *out = &wow64->allocation.info2;
+
+        if ((status = d3dkmt_open_resource_array_size( params->NumAllocations,
+                                                       sizeof(*in), &wire_size )) ||
+            (status = d3dkmt_open_resource_array_size( params->NumAllocations,
+                                                       sizeof(*out), &native_size )))
+            return status;
+        if (wire_size > sizeof(wow64->allocation32) ||
+            native_size > sizeof(wow64->allocation))
+            return STATUS_INVALID_PARAMETER;
+        if ((status = d3dkmt_open_resource_guest_ptr(
+                         wow64->packet->guest_allocations, &wow64->allocation_user )))
+            return status;
+        if ((status = ntdll_wow64_copy_from_user( in, wow64->allocation_user, wire_size )))
+            return d3dkmt_open_resource_fault( wow64, status );
+        if ((status = d3dkmt_open_resource_guest_ptr( in->private_driver_data,
+                                                       &private_driver_data )))
+            return status;
+        out->hAllocation = in->allocation;
+        out->pPrivateDriverData = private_driver_data;
+        out->PrivateDriverDataSize = in->private_driver_data_size;
+        out->GpuVirtualAddress = in->gpu_address;
+        params->pOpenAllocationInfo2 = out;
+    }
+    else
+    {
+        struct wine_d3dddi_openallocationinfo32 *in = &wow64->allocation32.info;
+        D3DDDI_OPENALLOCATIONINFO *out = &wow64->allocation.info;
+
+        if ((status = d3dkmt_open_resource_array_size( params->NumAllocations,
+                                                       sizeof(*in), &wire_size )) ||
+            (status = d3dkmt_open_resource_array_size( params->NumAllocations,
+                                                       sizeof(*out), &native_size )))
+            return status;
+        if (wire_size > sizeof(wow64->allocation32) ||
+            native_size > sizeof(wow64->allocation))
+            return STATUS_INVALID_PARAMETER;
+        if ((status = d3dkmt_open_resource_guest_ptr(
+                         wow64->packet->guest_allocations, &wow64->allocation_user )))
+            return status;
+        if ((status = ntdll_wow64_copy_from_user( in, wow64->allocation_user, wire_size )))
+            return d3dkmt_open_resource_fault( wow64, status );
+        if ((status = d3dkmt_open_resource_guest_ptr( in->private_driver_data,
+                                                       &private_driver_data )))
+            return status;
+        out->hAllocation = in->allocation;
+        out->pPrivateDriverData = private_driver_data;
+        out->PrivateDriverDataSize = in->private_driver_data_size;
+        params->pOpenAllocationInfo = out;
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_open_resource_capture_buffers(
+    D3DKMT_OPENRESOURCE *params, struct d3dkmt_open_resource_wow64 *wow64 )
+{
+    NTSTATUS status;
+
+    if ((status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_private_runtime,
+                                                   &params->pPrivateRuntimeData )) ||
+        (status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_resource_private,
+                                                   &params->pResourcePrivateDriverData )) ||
+        (status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_total_private,
+                                                   &params->pTotalPrivateDriverDataBuffer )))
+        return status;
+    if (params->PrivateRuntimeDataSize &&
+        (status = ntdll_wow64_probe_user_write( params->pPrivateRuntimeData,
+                                                params->PrivateRuntimeDataSize )))
+        return d3dkmt_open_resource_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_open_resource_prepare_outputs(
+    BOOL version2, struct d3dkmt_open_resource_wow64 *wow64 )
+{
+    NTSTATUS status;
+
+    if ((status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_desc,
+                                                   &wow64->desc_user )))
+        return status;
+    wow64->outputs[0].dst = (char *)wow64->desc_user +
+        offsetof(struct wine_d3dkmt_open_resource32_desc, total_private_driver_data_size);
+    wow64->outputs[0].src = &wow64->packet->total_private_driver_data_size;
+    wow64->outputs[0].size = sizeof(uint32_t);
+    wow64->outputs[1].dst = (char *)wow64->desc_user +
+        offsetof(struct wine_d3dkmt_open_resource32_desc, resource);
+    wow64->outputs[1].src = &wow64->packet->resource;
+    wow64->outputs[1].size = sizeof(uint32_t);
+    wow64->outputs[2].dst = wow64->allocation_user;
+    wow64->outputs[2].src = &wow64->allocation32.info.allocation;
+    wow64->outputs[2].size = sizeof(uint32_t);
+    wow64->outputs[3].dst = (char *)wow64->allocation_user +
+        offsetof(struct wine_d3dddi_openallocationinfo32, private_driver_data_size);
+    wow64->outputs[3].src = &wow64->allocation32.info.private_driver_data_size;
+    wow64->outputs[3].size = sizeof(uint32_t);
+    wow64->output_count = 4;
+    if (version2)
+    {
+        wow64->outputs[4].dst = (char *)wow64->allocation_user +
+            offsetof(struct wine_d3dddi_openallocationinfo2_32, gpu_address);
+        wow64->outputs[4].src = &wow64->allocation32.info2.gpu_address;
+        wow64->outputs[4].size = sizeof(uint64_t);
+        wow64->output_count++;
+    }
+    if ((status = ntdll_wow64_probe_user_writev( wow64->outputs,
+                                                  wow64->output_count )))
+        return d3dkmt_open_resource_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_open_resource_publish(
+    D3DKMT_OPENRESOURCE *params, BOOL version2,
+    struct d3dkmt_open_resource_wow64 *wow64 )
+{
+    NTSTATUS status;
+
+    wow64->packet->total_private_driver_data_size =
+        params->TotalPrivateDriverDataBufferSize;
+    wow64->packet->resource = params->hResource;
+    if (version2)
+    {
+        wow64->allocation32.info2.allocation = params->pOpenAllocationInfo2->hAllocation;
+        wow64->allocation32.info2.private_driver_data_size =
+            params->pOpenAllocationInfo2->PrivateDriverDataSize;
+        wow64->allocation32.info2.gpu_address =
+            params->pOpenAllocationInfo2->GpuVirtualAddress;
+    }
+    else
+    {
+        wow64->allocation32.info.allocation = params->pOpenAllocationInfo->hAllocation;
+        wow64->allocation32.info.private_driver_data_size =
+            params->pOpenAllocationInfo->PrivateDriverDataSize;
+    }
+    if ((status = ntdll_wow64_atomic_writev( wow64->outputs,
+                                              wow64->output_count )))
+        return d3dkmt_open_resource_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_open_resource_params(
+    D3DKMT_OPENRESOURCE *params, BOOL version2,
+    struct d3dkmt_open_resource_wow64 *wow64 )
+{
+    struct d3dkmt_object *allocation = NULL;
+    struct d3dkmt_resource *resource = NULL;
+    struct d3dkmt_device *device;
+    D3DDDI_OPENALLOCATIONINFO *alloc_info;
+    UINT query_runtime_size, runtime_size;
+    NTSTATUS status = STATUS_SUCCESS;
 
     TRACE( "params %p\n", params );
 
     if (!params) return STATUS_INVALID_PARAMETER;
-    if (!(device = get_d3dkmt_object( params->hDevice, D3DKMT_DEVICE ))) return STATUS_INVALID_PARAMETER;
-    if (!is_d3dkmt_global( params->hGlobalShare )) return STATUS_INVALID_PARAMETER;
-    if (params->ResourcePrivateDriverDataSize) return STATUS_INVALID_PARAMETER;
+    if (!(device = pin_d3dkmt_object( params->hDevice, D3DKMT_DEVICE )))
+        return STATUS_INVALID_PARAMETER;
+    if (!is_d3dkmt_global( params->hGlobalShare ))
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if ((status = d3dkmt_object_query( D3DKMT_RESOURCE, params->hGlobalShare,
+                                       NULL, &query_runtime_size )))
+        goto done;
+    if (params->ResourcePrivateDriverDataSize)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (params->NumAllocations != 1 ||
+        (wow64 ? !wow64->packet->guest_allocations :
+                 (version2 ? !params->pOpenAllocationInfo2 :
+                             !params->pOpenAllocationInfo)))
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (params->PrivateRuntimeDataSize &&
+        params->PrivateRuntimeDataSize != query_runtime_size)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (wow64 &&
+        ((status = d3dkmt_open_resource_capture_allocation( params, version2, wow64 )) ||
+         (status = d3dkmt_open_resource_capture_buffers( params, wow64 )) ||
+         (status = d3dkmt_open_resource_prepare_outputs( version2, wow64 ))))
+        goto done;
 
-    if (!params->NumAllocations) return STATUS_INVALID_PARAMETER;
-    if (!(alloc_info = params->pOpenAllocationInfo)) return STATUS_INVALID_PARAMETER;
-
-    if ((status = d3dkmt_object_alloc( sizeof(*resource), D3DKMT_RESOURCE, (void **)&resource ))) return status;
-    if ((status = d3dkmt_object_alloc( sizeof(*allocation), D3DKMT_ALLOCATION, (void **)&allocation ))) goto failed;
+    alloc_info = params->pOpenAllocationInfo;
+    if ((status = d3dkmt_object_alloc( sizeof(*resource), D3DKMT_RESOURCE,
+                                       (void **)&resource )))
+        goto done;
+    if ((status = d3dkmt_object_alloc( sizeof(*allocation), D3DKMT_ALLOCATION,
+                                       (void **)&allocation )))
+        goto done;
 
     runtime_size = params->PrivateRuntimeDataSize;
-    if ((status = d3dkmt_object_open( &resource->obj, params->hGlobalShare, NULL, params->pPrivateRuntimeData, &runtime_size ))) goto failed;
-
-    if ((status = alloc_object_handle( allocation ))) goto failed;
+    if ((status = d3dkmt_object_open( &resource->obj, params->hGlobalShare, NULL,
+                                      params->pPrivateRuntimeData, &runtime_size )))
+        goto done;
+    if ((status = alloc_object_handle( allocation ))) goto done;
     resource->allocation = allocation->local;
     alloc_info->hAllocation = allocation->local;
     alloc_info->PrivateDriverDataSize = 0;
@@ -1283,11 +2112,24 @@ NTSTATUS WINAPI NtGdiDdDDIOpenResource( D3DKMT_OPENRESOURCE *params )
     params->PrivateRuntimeDataSize = runtime_size;
     params->TotalPrivateDriverDataBufferSize = 0;
     params->ResourcePrivateDriverDataSize = 0;
-    return STATUS_SUCCESS;
+    if (wow64 && (status = d3dkmt_open_resource_publish( params, version2, wow64 )))
+        goto done;
+    allocation = NULL;
+    resource = NULL;
 
-failed:
-    d3dkmt_object_free( &resource->obj );
+done:
+    if (allocation) d3dkmt_object_free( allocation );
+    if (resource) d3dkmt_object_free( &resource->obj );
+    unpin_d3dkmt_object( &device->obj );
     return status;
+}
+
+/******************************************************************************
+ *           NtGdiDdDDIOpenResource    (win32u.@)
+ */
+NTSTATUS WINAPI NtGdiDdDDIOpenResource( D3DKMT_OPENRESOURCE *params )
+{
+    return d3dkmt_open_resource_params( params, FALSE, NULL );
 }
 
 /******************************************************************************
@@ -1295,77 +2137,199 @@ failed:
  */
 NTSTATUS WINAPI NtGdiDdDDIOpenResource2( D3DKMT_OPENRESOURCE *params )
 {
-    struct d3dkmt_object *device, *allocation;
-    D3DDDI_OPENALLOCATIONINFO2 *alloc_info;
-    struct d3dkmt_resource *resource;
-    UINT runtime_size;
-    NTSTATUS status;
-
-    TRACE( "params %p\n", params );
-
-    if (!params) return STATUS_INVALID_PARAMETER;
-    if (!(device = get_d3dkmt_object( params->hDevice, D3DKMT_DEVICE ))) return STATUS_INVALID_PARAMETER;
-    if (!is_d3dkmt_global( params->hGlobalShare )) return STATUS_INVALID_PARAMETER;
-    if (params->ResourcePrivateDriverDataSize) return STATUS_INVALID_PARAMETER;
-
-    if (!params->NumAllocations) return STATUS_INVALID_PARAMETER;
-    if (!(alloc_info = params->pOpenAllocationInfo2)) return STATUS_INVALID_PARAMETER;
-
-    if ((status = d3dkmt_object_alloc( sizeof(*resource), D3DKMT_RESOURCE, (void **)&resource ))) return status;
-    if ((status = d3dkmt_object_alloc( sizeof(*allocation), D3DKMT_ALLOCATION, (void **)&allocation ))) goto failed;
-
-    runtime_size = params->PrivateRuntimeDataSize;
-    if ((status = d3dkmt_object_open( &resource->obj, params->hGlobalShare, NULL, params->pPrivateRuntimeData, &runtime_size ))) goto failed;
-
-    if ((status = alloc_object_handle( allocation ))) goto failed;
-    resource->allocation = allocation->local;
-    alloc_info->hAllocation = allocation->local;
-    alloc_info->PrivateDriverDataSize = 0;
-
-    params->hResource = resource->obj.local;
-    params->PrivateRuntimeDataSize = runtime_size;
-    params->TotalPrivateDriverDataBufferSize = 0;
-    params->ResourcePrivateDriverDataSize = 0;
-    return STATUS_SUCCESS;
-
-failed:
-    d3dkmt_object_free( &resource->obj );
-    return status;
+    return d3dkmt_open_resource_params( params, TRUE, NULL );
 }
 
-/******************************************************************************
- *           NtGdiDdDDIOpenResourceFromNtHandle    (win32u.@)
- */
-NTSTATUS WINAPI NtGdiDdDDIOpenResourceFromNtHandle( D3DKMT_OPENRESOURCEFROMNTHANDLE *params )
+static NTSTATUS d3dkmt_open_resource_nt_capture(
+    D3DKMT_OPENRESOURCEFROMNTHANDLE *params,
+    struct d3dkmt_open_resource_wow64 *wow64 )
+{
+    struct wine_d3dddi_openallocationinfo2_32 *in = &wow64->allocation32.info2;
+    void *private_driver_data;
+    SIZE_T native_size, wire_size;
+    NTSTATUS status;
+
+    if ((status = d3dkmt_open_resource_array_size( params->NumAllocations,
+                                                   sizeof(*in), &wire_size )) ||
+        (status = d3dkmt_open_resource_array_size( params->NumAllocations,
+                                                   sizeof(wow64->allocation.info2),
+                                                   &native_size )))
+        return status;
+    if (wire_size > sizeof(wow64->allocation32) ||
+        native_size > sizeof(wow64->allocation))
+        return STATUS_INVALID_PARAMETER;
+    if ((status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_allocations,
+                                                   &wow64->allocation_user )))
+        return status;
+    if ((status = ntdll_wow64_copy_from_user( in, wow64->allocation_user, wire_size )))
+        return d3dkmt_open_resource_fault( wow64, status );
+    if ((status = d3dkmt_open_resource_guest_ptr( in->private_driver_data,
+                                                   &private_driver_data )) ||
+        (status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_private_runtime,
+                                                   &params->pPrivateRuntimeData )) ||
+        (status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_resource_private,
+                                                   &params->pResourcePrivateDriverData )) ||
+        (status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_total_private,
+                                                   &params->pTotalPrivateDriverDataBuffer )) ||
+        (status = d3dkmt_open_resource_guest_ptr(
+                       wow64->packet->guest_keyed_mutex_runtime,
+                       &params->pKeyedMutexPrivateRuntimeData )))
+        return status;
+    wow64->allocation.info2.hAllocation = in->allocation;
+    wow64->allocation.info2.pPrivateDriverData = private_driver_data;
+    wow64->allocation.info2.PrivateDriverDataSize = in->private_driver_data_size;
+    wow64->allocation.info2.GpuVirtualAddress = in->gpu_address;
+    params->pOpenAllocationInfo2 = &wow64->allocation.info2;
+    if (params->PrivateRuntimeDataSize &&
+        (status = ntdll_wow64_probe_user_write( params->pPrivateRuntimeData,
+                                                params->PrivateRuntimeDataSize )))
+        return d3dkmt_open_resource_fault( wow64, status );
+    if (params->KeyedMutexPrivateRuntimeDataSize &&
+        (status = ntdll_wow64_probe_user_write(
+                       params->pKeyedMutexPrivateRuntimeData,
+                       params->KeyedMutexPrivateRuntimeDataSize )))
+        return d3dkmt_open_resource_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_open_resource_nt_prepare_outputs(
+    struct d3dkmt_open_resource_wow64 *wow64 )
+{
+    NTSTATUS status;
+
+    if ((status = d3dkmt_open_resource_guest_ptr( wow64->packet->guest_desc,
+                                                   &wow64->desc_user )))
+        return status;
+    wow64->outputs[0].dst = (char *)wow64->desc_user +
+        offsetof(struct wine_d3dkmt_open_resource_nt32_desc, private_runtime_data_size);
+    wow64->outputs[0].src = &wow64->packet->private_runtime_data_size;
+    wow64->outputs[0].size = sizeof(uint32_t);
+    wow64->outputs[1].dst = (char *)wow64->desc_user +
+        offsetof(struct wine_d3dkmt_open_resource_nt32_desc,
+                 resource_private_driver_data_size);
+    wow64->outputs[1].src = &wow64->packet->resource_private_driver_data_size;
+    wow64->outputs[1].size = sizeof(uint32_t);
+    wow64->outputs[2].dst = (char *)wow64->desc_user +
+        offsetof(struct wine_d3dkmt_open_resource_nt32_desc,
+                 total_private_driver_data_size);
+    wow64->outputs[2].src = &wow64->packet->total_private_driver_data_size;
+    wow64->outputs[2].size = sizeof(uint32_t);
+    wow64->outputs[3].dst = (char *)wow64->desc_user +
+        offsetof(struct wine_d3dkmt_open_resource_nt32_desc, resource);
+    wow64->outputs[3].src = &wow64->packet->resource;
+    wow64->outputs[3].size = 2 * sizeof(uint32_t);
+    wow64->outputs[4].dst = (char *)wow64->desc_user +
+        offsetof(struct wine_d3dkmt_open_resource_nt32_desc, sync_object);
+    wow64->outputs[4].src = &wow64->packet->sync_object;
+    wow64->outputs[4].size = sizeof(uint32_t);
+    wow64->outputs[5].dst = wow64->allocation_user;
+    wow64->outputs[5].src = &wow64->allocation32.info2.allocation;
+    wow64->outputs[5].size = sizeof(uint32_t);
+    wow64->outputs[6].dst = (char *)wow64->allocation_user +
+        offsetof(struct wine_d3dddi_openallocationinfo2_32, private_driver_data_size);
+    wow64->outputs[6].src = &wow64->allocation32.info2.private_driver_data_size;
+    wow64->outputs[6].size = sizeof(uint32_t);
+    wow64->outputs[7].dst = (char *)wow64->allocation_user +
+        offsetof(struct wine_d3dddi_openallocationinfo2_32, gpu_address);
+    wow64->outputs[7].src = &wow64->allocation32.info2.gpu_address;
+    wow64->outputs[7].size = sizeof(uint64_t);
+    wow64->output_count = 8;
+    if ((status = ntdll_wow64_probe_user_writev( wow64->outputs,
+                                                  wow64->output_count )))
+        return d3dkmt_open_resource_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_open_resource_nt_publish(
+    D3DKMT_OPENRESOURCEFROMNTHANDLE *params,
+    struct d3dkmt_open_resource_wow64 *wow64 )
+{
+    NTSTATUS status;
+
+    wow64->packet->private_runtime_data_size = params->PrivateRuntimeDataSize;
+    wow64->packet->resource_private_driver_data_size =
+        params->ResourcePrivateDriverDataSize;
+    wow64->packet->total_private_driver_data_size =
+        params->TotalPrivateDriverDataBufferSize;
+    wow64->packet->resource = params->hResource;
+    wow64->packet->keyed_mutex = params->hKeyedMutex;
+    wow64->packet->sync_object = params->hSyncObject;
+    wow64->allocation32.info2.allocation = params->pOpenAllocationInfo2->hAllocation;
+    wow64->allocation32.info2.private_driver_data_size =
+        params->pOpenAllocationInfo2->PrivateDriverDataSize;
+    wow64->allocation32.info2.gpu_address =
+        params->pOpenAllocationInfo2->GpuVirtualAddress;
+    if ((status = ntdll_wow64_atomic_writev( wow64->outputs,
+                                              wow64->output_count )))
+        return d3dkmt_open_resource_fault( wow64, status );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS d3dkmt_open_resource_nt( D3DKMT_OPENRESOURCEFROMNTHANDLE *params,
+                                         struct d3dkmt_open_resource_wow64 *wow64 )
 {
     struct d3dkmt_object *sync = NULL;
     struct d3dkmt_mutex *mutex = NULL;
     struct d3dkmt_resource *resource = NULL;
-    NTSTATUS status;
-    UINT dummy = 0;
+    struct d3dkmt_device *device;
+    UINT dummy = 0, query_runtime_size;
+    NTSTATUS status = STATUS_SUCCESS;
 
     FIXME( "params %p semi-stub!\n", params );
 
     if (!params) return STATUS_INVALID_PARAMETER;
-    if (!params->pPrivateRuntimeData) return STATUS_INVALID_PARAMETER;
-    if (!params->pTotalPrivateDriverDataBuffer) return STATUS_INVALID_PARAMETER;
-    if (!params->pOpenAllocationInfo2) return STATUS_INVALID_PARAMETER;
-    if (!params->NumAllocations) return STATUS_INVALID_PARAMETER;
+    if (!(device = pin_d3dkmt_object( params->hDevice, D3DKMT_DEVICE )))
+        return STATUS_INVALID_PARAMETER;
+    if ((status = d3dkmt_object_query( D3DKMT_RESOURCE, 0, params->hNtHandle,
+                                       &query_runtime_size )))
+        goto done;
+    if (wow64 ? (!wow64->packet->guest_private_runtime ||
+                 !wow64->packet->guest_total_private ||
+                 !wow64->packet->guest_allocations) :
+                (!params->pPrivateRuntimeData ||
+                 !params->pTotalPrivateDriverDataBuffer ||
+                 !params->pOpenAllocationInfo2))
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (params->NumAllocations != 1)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (params->PrivateRuntimeDataSize &&
+        params->PrivateRuntimeDataSize != query_runtime_size)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (wow64 &&
+        ((status = d3dkmt_open_resource_nt_capture( params, wow64 )) ||
+         (status = d3dkmt_open_resource_nt_prepare_outputs( wow64 ))))
+        goto done;
 
-    if ((status = d3dkmt_object_alloc( sizeof(*resource), D3DKMT_RESOURCE, (void **)&resource ))) return status;
-    if ((status = d3dkmt_object_alloc( sizeof(*mutex), D3DKMT_MUTEX, (void **)&mutex ))) goto failed;
-    if ((status = d3dkmt_object_alloc( sizeof(*sync), D3DKMT_SYNC, (void **)&sync ))) goto failed;
+    if ((status = d3dkmt_object_alloc( sizeof(*resource), D3DKMT_RESOURCE,
+                                       (void **)&resource )))
+        goto done;
+    if ((status = d3dkmt_object_alloc( sizeof(*mutex), D3DKMT_MUTEX,
+                                       (void **)&mutex )))
+        goto done;
+    if ((status = d3dkmt_object_alloc( sizeof(*sync), D3DKMT_SYNC,
+                                       (void **)&sync )))
+        goto done;
 
-    if ((status = d3dkmt_object_open( &resource->obj, 0, params->hNtHandle, params->pPrivateRuntimeData,
+    if ((status = d3dkmt_object_open( &resource->obj, 0, params->hNtHandle,
+                                      params->pPrivateRuntimeData,
                                       &params->PrivateRuntimeDataSize )))
-        goto failed;
-
-    if (d3dkmt_object_open( &mutex->obj, 0, params->hNtHandle, params->pKeyedMutexPrivateRuntimeData, &params->KeyedMutexPrivateRuntimeDataSize ))
+        goto done;
+    if (d3dkmt_object_open( &mutex->obj, 0, params->hNtHandle,
+                            params->pKeyedMutexPrivateRuntimeData,
+                            &params->KeyedMutexPrivateRuntimeDataSize ))
     {
         d3dkmt_object_free( &mutex->obj );
         mutex = NULL;
     }
-
     if (d3dkmt_object_open( sync, 0, params->hNtHandle, NULL, &dummy ))
     {
         d3dkmt_object_free( sync );
@@ -1377,13 +2341,76 @@ NTSTATUS WINAPI NtGdiDdDDIOpenResourceFromNtHandle( D3DKMT_OPENRESOURCEFROMNTHAN
     params->hSyncObject = sync ? sync->local : 0;
     params->TotalPrivateDriverDataBufferSize = 0;
     params->ResourcePrivateDriverDataSize = 0;
-    return STATUS_SUCCESS;
+    if (wow64 && (status = d3dkmt_open_resource_nt_publish( params, wow64 )))
+        goto done;
+    resource = NULL;
+    mutex = NULL;
+    sync = NULL;
 
-failed:
+done:
     if (sync) d3dkmt_object_free( sync );
     if (mutex) d3dkmt_object_free( &mutex->obj );
     if (resource) d3dkmt_object_free( &resource->obj );
+    unpin_d3dkmt_object( &device->obj );
     return status;
+}
+
+/******************************************************************************
+ *           NtGdiDdDDIOpenResourceFromNtHandle    (win32u.@)
+ */
+NTSTATUS WINAPI NtGdiDdDDIOpenResourceFromNtHandle( D3DKMT_OPENRESOURCEFROMNTHANDLE *params )
+{
+    return d3dkmt_open_resource_nt( params, NULL );
+}
+
+NTSTATUS WINAPI __wine_win32u_d3dkmt_open_resource(
+    struct wine_d3dkmt_open_resource32 *packet )
+{
+    struct d3dkmt_open_resource_wow64 wow64 = { .packet = packet };
+
+    if (!packet || packet->version != WINE_D3DKMT_OPEN_RESOURCE32_VERSION ||
+        packet->size != sizeof(*packet) || packet->fault_status ||
+        packet->reserved[0] || packet->reserved[1])
+        return STATUS_INVALID_PARAMETER;
+    packet->fault_status = 0;
+    if (packet->variant == WINE_D3DKMT_OPEN_RESOURCE32_NT_HANDLE)
+    {
+        D3DKMT_OPENRESOURCEFROMNTHANDLE params = {0};
+
+        params.hDevice = packet->device;
+        params.hNtHandle = UlongToHandle( packet->shared_handle );
+        params.NumAllocations = packet->allocation_count;
+        params.PrivateRuntimeDataSize = packet->private_runtime_data_size;
+        params.ResourcePrivateDriverDataSize =
+            packet->resource_private_driver_data_size;
+        params.TotalPrivateDriverDataBufferSize =
+            packet->total_private_driver_data_size;
+        params.KeyedMutexPrivateRuntimeDataSize =
+            packet->keyed_mutex_private_runtime_data_size;
+        params.hResource = packet->resource;
+        params.hKeyedMutex = packet->keyed_mutex;
+        params.hSyncObject = packet->sync_object;
+        return d3dkmt_open_resource_nt( &params, &wow64 );
+    }
+    else
+    {
+        D3DKMT_OPENRESOURCE params = {0};
+        BOOL version2;
+
+        if (packet->variant == WINE_D3DKMT_OPEN_RESOURCE32_V1) version2 = FALSE;
+        else if (packet->variant == WINE_D3DKMT_OPEN_RESOURCE32_V2) version2 = TRUE;
+        else return STATUS_INVALID_PARAMETER;
+        params.hDevice = packet->device;
+        params.hGlobalShare = packet->shared_handle;
+        params.NumAllocations = packet->allocation_count;
+        params.PrivateRuntimeDataSize = packet->private_runtime_data_size;
+        params.ResourcePrivateDriverDataSize =
+            packet->resource_private_driver_data_size;
+        params.TotalPrivateDriverDataBufferSize =
+            packet->total_private_driver_data_size;
+        params.hResource = packet->resource;
+        return d3dkmt_open_resource_params( &params, version2, &wow64 );
+    }
 }
 
 

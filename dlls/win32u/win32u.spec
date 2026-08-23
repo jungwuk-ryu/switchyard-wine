@@ -1540,3 +1540,6 @@
 @ stub -syscall NtValidateCompositionSurfaceHandle
 @ stub -syscall NtVisualCaptureBits
 # extern gDispatchTableValues
+@ stdcall -syscall=0x1604 -arch=win64 __wine_win32u_d3dkmt_create_allocation(ptr)
+@ stdcall -syscall=0x1605 -arch=win64 __wine_win32u_d3dkmt_open_resource(ptr)
+@ stdcall -syscall=0x1606 -arch=win64 __wine_win32u_d3dkmt_lifecycle(ptr)

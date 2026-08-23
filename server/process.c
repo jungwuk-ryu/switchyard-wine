@@ -103,6 +103,7 @@ static void process_poll_event( struct fd *fd, int event );
 static struct list *process_get_kernel_obj_list( struct object *obj );
 static void process_destroy( struct object *obj );
 static void terminate_process( struct process *process, struct thread *skip, int exit_code );
+static void cleanup_terminated_process( struct process *process );
 
 static const struct object_ops process_ops =
 {
@@ -151,6 +152,15 @@ struct startup_info
     data_size_t                 info_size;      /* size of startup info */
     data_size_t                 data_size;      /* size of whole startup data */
     struct startup_info_data   *data;           /* data for startup info */
+    unsigned int                transaction;    /* private creation transaction state */
+};
+
+enum startup_transaction_state
+{
+    STARTUP_TRANSACTION_NONE,
+    STARTUP_TRANSACTION_ACTIVE,
+    STARTUP_TRANSACTION_COMMITTED,
+    STARTUP_TRANSACTION_CANCELLED,
 };
 
 /*
@@ -848,6 +858,9 @@ static int verify_package_graph_image( struct process *process )
 
 static void startup_info_dump( struct object *obj, int verbose );
 static struct object *startup_info_get_sync( struct object *obj );
+static void cancel_startup_transaction( struct startup_info *info, int status );
+static int startup_info_close_handle( struct object *obj, struct process *process,
+                                      obj_handle_t handle );
 static void startup_info_destroy( struct object *obj );
 
 static const struct object_ops startup_info_ops =
@@ -871,7 +884,7 @@ static const struct object_ops startup_info_ops =
     NULL,                          /* unlink_name */
     no_open_file,                  /* open_file */
     no_kernel_obj_list,            /* get_kernel_obj_list */
-    no_close_handle,               /* close_handle */
+    startup_info_close_handle,     /* close_handle */
     startup_info_destroy           /* destroy */
 };
 
@@ -1373,6 +1386,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->sigkill_timeout = NULL;
     process->sigkill_delay   = TICKS_PER_SEC / 64;
     process->machine         = native_machine;
+    process->vm_flags        = 0;
     process->page_size       = get_page_size();
     process->unix_pid        = -1;
     process->exit_code       = STILL_ACTIVE;
@@ -1388,6 +1402,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->is_system       = 0;
     process->debug_children  = 1;
     process->is_terminating  = 0;
+    process->vm_flags_valid  = 0;
     process->imagelen        = 0;
     process->image           = NULL;
     process->job             = NULL;
@@ -1601,9 +1616,46 @@ static void startup_info_destroy( struct object *obj )
 {
     struct startup_info *info = (struct startup_info *)obj;
     assert( obj->ops == &startup_info_ops );
+    cancel_startup_transaction( info, STATUS_UNSUCCESSFUL );
     free( info->data );
     if (info->process) release_object( info->process );
     if (info->sync) release_object( info->sync );
+}
+
+static void cancel_startup_transaction( struct startup_info *info, int status )
+{
+    struct process *process;
+    int exit_code;
+
+    if (info->transaction != STARTUP_TRANSACTION_ACTIVE) return;
+    info->transaction = STARTUP_TRANSACTION_CANCELLED;
+    if (!(process = info->process)) return;
+
+    exit_code = status ? status : STATUS_UNSUCCESSFUL;
+    terminate_process( process, NULL, exit_code );
+    if (!process->running_threads && process->startup_state == STARTUP_IN_PROGRESS)
+    {
+        /* A transaction may be cancelled before the initial thread exists.
+         * Such a process was never added to the running-process counters, so
+         * abort its startup directly instead of routing it through process_died(). */
+        process->exit_code = exit_code;
+        process->end_time = current_time;
+        cleanup_terminated_process( process );
+        signal_sync( process->sync );
+    }
+}
+
+static int startup_info_close_handle( struct object *obj, struct process *process,
+                                      obj_handle_t handle )
+{
+    struct startup_info *info = (struct startup_info *)obj;
+
+    (void)process;
+    (void)handle;
+    assert( obj->ops == &startup_info_ops );
+    if (obj->handle_count == 1)
+        cancel_startup_transaction( info, STATUS_UNSUCCESSFUL );
+    return 1;
 }
 
 static void startup_info_dump( struct object *obj, int verbose )
@@ -1692,19 +1744,10 @@ void kill_console_processes( struct thread *renderer, int exit_code )
     }
 }
 
-/* a process has been killed (i.e. its last thread died) */
-static void process_killed( struct process *process )
+/* Release state that cannot remain live once a process has terminated. */
+static void cleanup_terminated_process( struct process *process )
 {
-#ifdef __APPLE__
-    struct rusage_info_v4 usage;
-
-    if (process->unix_pid != -1 &&
-        !proc_pid_rusage( process->unix_pid, RUSAGE_INFO_V4, (rusage_info_t *)&usage ))
-        process->cycle_time = usage.ri_cycles;
-#endif
-
     assert( list_empty( &process->thread_list ));
-    process->end_time = current_time;
     close_process_desktop( process );
     process->winstation = 0;
     process->desktop = 0;
@@ -1723,6 +1766,21 @@ static void process_killed( struct process *process )
     set_process_startup_state( process, STARTUP_ABORTED );
     finish_process_tracing( process );
     release_job_process( process );
+}
+
+/* a process has been killed (i.e. its last thread died) */
+static void process_killed( struct process *process )
+{
+#ifdef __APPLE__
+    struct rusage_info_v4 usage;
+
+    if (process->unix_pid != -1 &&
+        !proc_pid_rusage( process->unix_pid, RUSAGE_INFO_V4, (rusage_info_t *)&usage ))
+        process->cycle_time = usage.ri_cycles;
+#endif
+
+    process->end_time = current_time;
+    cleanup_terminated_process( process );
     start_sigkill_timer( process );
     signal_sync( process->sync );
 }
@@ -1896,9 +1954,16 @@ DECL_HANDLER(new_process)
     const obj_handle_t *job_handles = NULL;
     const struct wine_appx_graph_process_binding *graph_binding = NULL;
     const obj_handle_t *lease_handles = NULL;
-    unsigned int i, job_handle_count;
+    unsigned int i, job_handle_count, error;
     struct job *job;
 
+    if (req->wine_flags & ~1)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        if (graph_fd != -1) close( graph_fd );
+        if (socket_fd != -1) close( socket_fd );
+        return;
+    }
     if (socket_fd == -1)
     {
         set_error( STATUS_INVALID_PARAMETER );
@@ -2007,6 +2072,8 @@ DECL_HANDLER(new_process)
     info->sync     = NULL;
     info->process  = NULL;
     info->data     = NULL;
+    info->transaction = (req->wine_flags & 1) ? STARTUP_TRANSACTION_ACTIVE :
+                                               STARTUP_TRANSACTION_NONE;
 
     if (!(info->sync = create_internal_sync( 1, 0 )))
     {
@@ -2165,7 +2232,6 @@ DECL_HANDLER(new_process)
         explicit_leases = NULL;
     }
     process->machine = req->machine;
-    process->startup_info = (struct startup_info *)grab_object( info );
 
     job = parent->job;
     while (job)
@@ -2188,8 +2254,7 @@ DECL_HANDLER(new_process)
         release_object( job );
         if (get_error())
         {
-            release_job_process( process );
-            goto done;
+            goto failed_process;
         }
     }
 
@@ -2231,10 +2296,28 @@ DECL_HANDLER(new_process)
     else
         info->data->process_group_id = process->group_id;
 
+    if (get_error()) goto failed_process;
+    if (!(reply->info = alloc_handle( current->process, info, SYNCHRONIZE, 0 )))
+        goto failed_process;
+    if (!(reply->handle = alloc_handle_no_access_check( current->process, process,
+                                                        req->access, objattr->attributes )))
+    {
+        error = get_error();
+        close_handle( current->process, reply->info );
+        reply->info = 0;
+        set_error( error );
+        goto failed_process;
+    }
+
+    process->startup_info = (struct startup_info *)grab_object( info );
     info->process = (struct process *)grab_object( process );
-    reply->info = alloc_handle( current->process, info, SYNCHRONIZE, 0 );
     reply->pid = get_process_id( process );
-    reply->handle = alloc_handle_no_access_check( current->process, process, req->access, objattr->attributes );
+    goto done;
+
+ failed_process:
+    error = get_error();
+    release_job_process( process );
+    set_error( error );
 
  done:
     if (graph_fd != -1) close( graph_fd );
@@ -2245,6 +2328,41 @@ DECL_HANDLER(new_process)
     if (debug_obj) release_object( debug_obj );
     if (token) release_object( token );
     release_object( parent );
+    release_object( info );
+}
+
+/* Commit or cancel a transactionally created process.  The startup-info
+ * handle is intentionally resolved with access 0: it is an unforgeable,
+ * private ownership token and does not widen the requested process handle. */
+DECL_HANDLER(complete_new_process)
+{
+    struct startup_info *info;
+
+    if (req->commit != 0 && req->commit != 1)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+
+    if (!(info = (struct startup_info *)get_handle_obj( current->process,
+                                                        req->info, 0,
+                                                        &startup_info_ops )))
+        return;
+
+    if (req->commit)
+    {
+        if (info->transaction == STARTUP_TRANSACTION_ACTIVE)
+            info->transaction = STARTUP_TRANSACTION_COMMITTED;
+        else if (info->transaction != STARTUP_TRANSACTION_COMMITTED)
+            set_error( STATUS_INVALID_PARAMETER );
+    }
+    else
+    {
+        if (info->transaction == STARTUP_TRANSACTION_ACTIVE)
+            cancel_startup_transaction( info, req->status );
+        else if (info->transaction != STARTUP_TRANSACTION_CANCELLED)
+            set_error( STATUS_INVALID_PARAMETER );
+    }
     release_object( info );
 }
 
@@ -2471,6 +2589,24 @@ DECL_HANDLER(get_process_info)
         }
         release_object( process );
     }
+}
+
+/* Fetch the address model for an already valid process handle.  This private
+ * query does not grant access to target memory; the following operation still
+ * performs its own access check. */
+DECL_HANDLER(get_process_vm_machine)
+{
+    struct process *process;
+
+    if (!(process = get_process_from_handle( req->handle, 0 ))) return;
+    if (!process->vm_flags_valid)
+        set_error( STATUS_DEVICE_NOT_READY );
+    else
+    {
+        reply->machine = process->machine;
+        reply->flags = process->vm_flags;
+    }
+    release_object( process );
 }
 
 DECL_HANDLER(get_process_cpu_sets)

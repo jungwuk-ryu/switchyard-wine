@@ -3745,7 +3745,7 @@ static void test_PFXExportCertStoreEx(void)
     HCERTSTORE store, store2;
     CRYPT_DATA_BLOB pfx, exported;
     const CERT_CONTEXT *cert, *cert2;
-    DWORD count, size;
+    DWORD count, i, size;
     BOOL ret;
 
     /* Test NULL parameters. */
@@ -3790,16 +3790,20 @@ static void test_PFXExportCertStoreEx(void)
     exported.pbData = HeapAlloc( GetProcessHeap(), 0, exported.cbData );
     ok( exported.pbData != NULL, "HeapAlloc failed\n" );
     size = exported.cbData;
-    exported.cbData = 1;
+    ok( size > 1, "expected export size larger than 1\n" );
+    memset( exported.pbData, 0xcc, size );
+    exported.cbData = size - 1;
     SetLastError( 0xdeadbeef );
     ret = PFXExportCertStoreEx( store, &exported, L"test", NULL, 0 );
     ok( !ret, "PFXExportCertStoreEx failed %lx\n", GetLastError() );
     ok( GetLastError() == ERROR_SUCCESS, "got %lx\n", GetLastError() );
+    ok( exported.cbData == size, "got size %lu, expected %lu\n", exported.cbData, size );
+    for (i = 0; i < size; i++)
+        if (exported.pbData[i] != 0xcc) break;
+    ok( i == size, "byte %lu was written on undersized export\n", i );
     exported.cbData = size;
 
     /* Actual export. */
-    exported.pbData = HeapAlloc( GetProcessHeap(), 0, exported.cbData );
-    ok( exported.pbData != NULL, "HeapAlloc failed\n" );
     ret = PFXExportCertStoreEx( store, &exported, L"test", NULL, 0 );
     ok( ret, "PFXExportCertStoreEx failed %lx\n", GetLastError() );
 

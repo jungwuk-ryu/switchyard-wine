@@ -3886,6 +3886,147 @@ static void test_NtAllocateReserveObject(void)
     }
 }
 
+static void test_wow64_logical_page_marshalling(void)
+{
+    static const WCHAR name_fmt[] = L"\\BaseNamedObjects\\wine_wow64_page_%08lx_%u";
+    SECURITY_QUALITY_OF_SERVICE qos;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    HANDLE *handle, valid;
+    WCHAR name_buffer[128];
+    void *write_pages[16];
+    ULONG_PTR page_count;
+    DWORD granularity;
+    DWORD old_protect;
+    NTSTATUS status;
+    BYTE *memory, *write_watch;
+    unsigned int id = 0;
+
+    if (sizeof(void *) != 4) return;
+    memory = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!memory, "VirtualAlloc failed %lu\n", GetLastError() );
+    if (!memory) return;
+    handle = (HANDLE *)(memory + 0x1000);
+
+    swprintf( name_buffer, ARRAY_SIZE(name_buffer), name_fmt, GetCurrentProcessId(), id++ );
+    pRtlInitUnicodeString( &name, name_buffer );
+    InitializeObjectAttributes( &attr, &name, 0, 0, NULL );
+    ok( VirtualProtect( handle, 0x1000, PAGE_READONLY, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( handle, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_ACCESS_VIOLATION, "read-only output returned %#lx\n", status );
+    ok( VirtualProtect( handle, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( handle, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_SUCCESS, "valid follow-up returned %#lx\n", status );
+    if (!status)
+    {
+        valid = *handle;
+        ok( VirtualProtect( handle, 0x1000, PAGE_READONLY, &old_protect ),
+            "VirtualProtect failed %lu\n", GetLastError() );
+        status = pNtOpenEvent( handle, EVENT_ALL_ACCESS, &attr );
+        ok( status == STATUS_ACCESS_VIOLATION, "read-only open output returned %#lx\n", status );
+        ok( VirtualProtect( handle, 0x1000, PAGE_READWRITE, &old_protect ),
+            "VirtualProtect failed %lu\n", GetLastError() );
+        status = pNtOpenEvent( handle, EVENT_ALL_ACCESS, &attr );
+        ok( status == STATUS_SUCCESS, "valid open follow-up returned %#lx\n", status );
+        if (!status) pNtClose( *handle );
+        pNtClose( valid );
+    }
+
+    swprintf( name_buffer, ARRAY_SIZE(name_buffer), name_fmt, GetCurrentProcessId(), id++ );
+    pRtlInitUnicodeString( &name, name_buffer );
+    ok( VirtualProtect( handle, 0x1000, PAGE_NOACCESS, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( handle, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_ACCESS_VIOLATION, "no-access output returned %#lx\n", status );
+    ok( VirtualProtect( handle, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( handle, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_SUCCESS, "valid follow-up returned %#lx\n", status );
+    if (!status) pNtClose( *handle );
+
+    swprintf( name_buffer, ARRAY_SIZE(name_buffer), name_fmt, GetCurrentProcessId(), id++ );
+    pRtlInitUnicodeString( &name, name_buffer );
+    ok( VirtualProtect( handle, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( handle, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_GUARD_PAGE_VIOLATION, "guard output returned %#lx\n", status );
+    ok( VirtualProtect( handle, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( handle, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_SUCCESS, "valid follow-up returned %#lx\n", status );
+    if (!status) pNtClose( *handle );
+
+    swprintf( name_buffer, ARRAY_SIZE(name_buffer), name_fmt, GetCurrentProcessId(), id++ );
+    pRtlInitUnicodeString( &name, name_buffer );
+    memcpy( memory + 0x2000, name_buffer, name.Length );
+    name.Buffer = (WCHAR *)(memory + 0x2000);
+    ok( VirtualProtect( memory + 0x2000, 0x1000, PAGE_NOACCESS, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( &valid, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_ACCESS_VIOLATION, "protected name returned %#lx\n", status );
+    ok( VirtualProtect( memory + 0x2000, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( &valid, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_SUCCESS, "valid name follow-up returned %#lx\n", status );
+    if (!status) pNtClose( valid );
+
+    swprintf( name_buffer, ARRAY_SIZE(name_buffer), name_fmt, GetCurrentProcessId(), id++ );
+    pRtlInitUnicodeString( &name, name_buffer );
+    qos.Length = sizeof(qos);
+    qos.ImpersonationLevel = SecurityIdentification;
+    qos.ContextTrackingMode = SECURITY_STATIC_TRACKING;
+    qos.EffectiveOnly = FALSE;
+    memcpy( memory + 0x3000, &qos, sizeof(qos) );
+    attr.SecurityQualityOfService = memory + 0x3000;
+    ok( VirtualProtect( memory + 0x3000, 0x1000, PAGE_NOACCESS, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( &valid, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_ACCESS_VIOLATION, "protected QoS returned %#lx\n", status );
+    ok( VirtualProtect( memory + 0x3000, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtCreateEvent( &valid, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+    ok( status == STATUS_SUCCESS, "valid QoS follow-up returned %#lx\n", status );
+    if (!status) pNtClose( valid );
+
+    write_watch = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                                PAGE_READWRITE );
+    if (!write_watch)
+        win_skip( "MEM_WRITE_WATCH allocation failed %lu\n", GetLastError() );
+    else
+    {
+        BOOL found = FALSE;
+        ULONG_PTR i;
+        UINT watch_ret;
+
+        handle = (HANDLE *)(write_watch + 0x2000);
+        swprintf( name_buffer, ARRAY_SIZE(name_buffer), name_fmt, GetCurrentProcessId(), id++ );
+        pRtlInitUnicodeString( &name, name_buffer );
+        InitializeObjectAttributes( &attr, &name, 0, 0, NULL );
+        ok( !ResetWriteWatch( write_watch, 0x10000 ), "ResetWriteWatch failed %lu\n", GetLastError() );
+        status = pNtCreateEvent( handle, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
+        ok( status == STATUS_SUCCESS, "write-watch create returned %#lx\n", status );
+        page_count = ARRAY_SIZE(write_pages);
+        watch_ret = GetWriteWatch( WRITE_WATCH_FLAG_RESET, write_watch, 0x10000, write_pages,
+                                   &page_count, &granularity );
+        ok( !watch_ret, "GetWriteWatch failed %u\n", watch_ret );
+        if (!watch_ret)
+        {
+            for (i = 0; i < page_count; i++)
+                if ((BYTE *)handle >= (BYTE *)write_pages[i] &&
+                    (BYTE *)handle < (BYTE *)write_pages[i] + granularity)
+                    found = TRUE;
+            ok( found, "handle output page was not reported (%Iu pages, granularity %lu)\n",
+                page_count, granularity );
+        }
+        if (!status) pNtClose( *handle );
+        VirtualFree( write_watch, 0, MEM_RELEASE );
+    }
+
+    VirtualFree( memory, 0, MEM_RELEASE );
+}
+
 START_TEST(om)
 {
     HMODULE hntdll = GetModuleHandleA("ntdll.dll");
@@ -3956,4 +4097,5 @@ START_TEST(om)
     test_object_permanence();
     test_zero_access();
     test_NtAllocateReserveObject();
+    test_wow64_logical_page_marshalling();
 }

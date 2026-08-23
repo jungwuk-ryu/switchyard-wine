@@ -39,8 +39,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
-static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
-
 /* check if current version is NT or Win95 */
 static inline BOOL is_version_nt(void)
 {
@@ -180,6 +178,8 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetSystemTimes( FILETIME *idle, FILETIME *kernel, 
  */
 ULONG WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
 {
+    const struct _KUSER_SHARED_DATA *user_shared_data = RtlGetCurrentPeb()->SharedData;
+
     /* note: we ignore TickCountMultiplier */
     return user_shared_data->TickCount.LowPart;
 }
@@ -190,6 +190,7 @@ ULONG WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
  */
 ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
 {
+    const struct _KUSER_SHARED_DATA *user_shared_data = RtlGetCurrentPeb()->SharedData;
     ULONG high, low;
 
     do
@@ -208,6 +209,7 @@ ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
  */
 void WINAPI DECLSPEC_HOTPATCH QueryInterruptTime( ULONGLONG *time )
 {
+    const struct _KUSER_SHARED_DATA *user_shared_data = RtlGetCurrentPeb()->SharedData;
     ULONG high, low;
 
     do
@@ -237,6 +239,7 @@ void WINAPI DECLSPEC_HOTPATCH QueryInterruptTimePrecise( ULONGLONG *time )
  */
 void WINAPI DECLSPEC_HOTPATCH QueryUnbiasedInterruptTimePrecise( ULONGLONG *time )
 {
+    const struct _KUSER_SHARED_DATA *user_shared_data = RtlGetCurrentPeb()->SharedData;
     ULONGLONG bias, bias2;
     LARGE_INTEGER counter;
 

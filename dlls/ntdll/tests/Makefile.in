@@ -1,10 +1,13 @@
 TESTDLL   = ntdll.dll
 IMPORTS   = user32 advapi32
+UNIXLIB   = $(NTDLL_X18_TEST_UNIXLIB)
+INSTALL_TEST = $(NTDLL_X18_TEST_UNIXLIB)
 
 package_importer_IMPORTS = version
 
 SOURCES = \
 	alpc.c \
+	arm64ec_ec_code.c \
 	atom.c \
 	change.c \
 	directory.c \
@@ -41,4 +44,5 @@ SOURCES = \
 	time.c \
 	unwind.c \
 	virtual.c \
-	wow64.c
+	wow64.c \
+	x18_dispatch_unix.m

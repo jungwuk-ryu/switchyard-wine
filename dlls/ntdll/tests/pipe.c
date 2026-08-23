@@ -1098,6 +1098,87 @@ static BOOL create_pipe_pair( HANDLE *read, HANDLE *write, ULONG flags, ULONG ty
     return TRUE;
 }
 
+static BOOL is_translated_wow64_memory(void)
+{
+    ULONG translated = 0;
+    NTSTATUS status;
+
+    status = NtQueryVirtualMemory( GetCurrentProcess(), NtCurrentTeb(),
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    return !status && translated;
+}
+
+static void test_translated_wow64_async_read_protection(void)
+{
+    static const DWORD protections[] = {PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD, 0};
+    IO_STATUS_BLOCK iosb;
+    MEMORY_BASIC_INFORMATION info;
+    HANDLE event, read, write;
+    DWORD old_protect, written;
+    char *base, *page;
+    NTSTATUS status;
+    unsigned int i;
+    BOOL ret;
+
+    if (!is_translated_wow64_memory()) return;
+    base = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!base, "VirtualAlloc failed %lu\n", GetLastError() );
+    if (!base) return;
+    page = base + 0x1000;
+    event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!event, "CreateEvent failed %lu\n", GetLastError() );
+    if (!event)
+    {
+        VirtualFree( base, 0, MEM_RELEASE );
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(protections); i++)
+    {
+        if (!create_pipe_pair( &read, &write, FILE_FLAG_OVERLAPPED | PIPE_ACCESS_INBOUND,
+                               PIPE_TYPE_BYTE, 4096 ))
+            break;
+        ResetEvent( event );
+        iosb.Status = 0xdeadbeef;
+        iosb.Information = 0xdeadbeef;
+        status = NtReadFile( read, event, NULL, NULL, &iosb, page, 1, NULL, NULL );
+        ok( status == STATUS_PENDING, "iteration %u returned %#lx\n", i, status );
+
+        if (protections[i])
+            ret = VirtualProtect( page, 0x1000, protections[i], &old_protect );
+        else
+            ret = VirtualFree( page, 0x1000, MEM_DECOMMIT );
+        ok( ret, "iteration %u transition failed %lu\n", i, GetLastError() );
+
+        ret = WriteFile( write, "x", 1, &written, NULL );
+        ok( ret && written == 1, "iteration %u WriteFile failed %lu\n", i, GetLastError() );
+        ok( WaitForSingleObject( event, 5000 ) == WAIT_OBJECT_0,
+            "iteration %u completion timed out\n", i );
+        ok( iosb.Status == STATUS_ACCESS_VIOLATION,
+            "iteration %u completed with %#lx\n", i, iosb.Status );
+        ok( !iosb.Information, "iteration %u transferred %Iu bytes\n", i, iosb.Information );
+
+        if (protections[i] == (PAGE_READWRITE | PAGE_GUARD))
+        {
+            ret = VirtualQuery( page, &info, sizeof(info) ) == sizeof(info);
+            ok( ret, "iteration %u VirtualQuery failed %lu\n", i, GetLastError() );
+            if (ret) ok( info.Protect & PAGE_GUARD, "guard was consumed (%#lx)\n", info.Protect );
+        }
+
+        if (protections[i])
+            ret = VirtualProtect( page, 0x1000, PAGE_READWRITE, &old_protect );
+        else
+            ret = VirtualAlloc( page, 0x1000, MEM_COMMIT, PAGE_READWRITE ) != NULL;
+        ok( ret, "iteration %u restore failed %lu\n", i, GetLastError() );
+        CloseHandle( write );
+        CloseHandle( read );
+    }
+
+    CloseHandle( event );
+    VirtualFree( base, 0, MEM_RELEASE );
+}
+
 static void read_pipe_test(ULONG pipe_flags, ULONG pipe_type)
 {
     IO_STATUS_BLOCK iosb, iosb2;
@@ -3170,6 +3251,7 @@ START_TEST(pipe)
 
     trace("starting overlapped tests\n");
     test_overlapped();
+    test_translated_wow64_async_read_protection();
 
     trace("starting completion tests\n");
     test_completion();

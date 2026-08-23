@@ -24,6 +24,8 @@
 
 #include "config.h"
 
+#include <limits.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <dlfcn.h>
 
@@ -47,6 +49,11 @@
 #ifdef SONAME_LIBFREETYPE
 
 WINE_DEFAULT_DEBUG_CHANNEL(dwrite);
+
+#ifdef _WIN64
+static void wow64_font_registry_attach(void);
+static void wow64_font_registry_cleanup(void);
+#endif
 
 static void *ft_handle = NULL;
 static FT_Library library = 0;
@@ -166,6 +173,9 @@ static NTSTATUS process_attach(void *args)
     }
     pFT_Library_Version(library, &FT_Version.major, &FT_Version.minor, &FT_Version.patch);
 
+#ifdef _WIN64
+    wow64_font_registry_attach();
+#endif
     TRACE("FreeType version is %d.%d.%d\n", FT_Version.major, FT_Version.minor, FT_Version.patch);
     return STATUS_SUCCESS;
 
@@ -178,6 +188,9 @@ sym_not_found:
 
 static NTSTATUS process_detach(void *args)
 {
+#ifdef _WIN64
+    wow64_font_registry_cleanup();
+#endif
     pFT_Done_FreeType(library);
     return STATUS_SUCCESS;
 }
@@ -858,45 +871,80 @@ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
 
 typedef ULONG PTR32;
 
-static NTSTATUS wow64_create_font_object(void *args)
+struct wow64_create_font_object_params
 {
-    struct
-    {
-        PTR32 data;
-        UINT64 size;
-        ULONG index;
-        PTR32 axis_values;
-        ULONG axis_values_count;
-        ULONG axis_values_are_default;
-        PTR32 object;
-    } const *params32 = args;
-    struct create_font_object_params params =
-    {
-        ULongToPtr(params32->data),
-        params32->size,
-        params32->index,
-        ULongToPtr(params32->axis_values),
-        params32->axis_values_count,
-        params32->axis_values_are_default,
-        ULongToPtr(params32->object),
-    };
+    PTR32 data;
+    UINT64 size;
+    ULONG index;
+    PTR32 axis_values;
+    ULONG axis_values_count;
+    ULONG axis_values_are_default;
+    PTR32 object;
+};
 
-    return create_font_object(&params);
-}
-
-static NTSTATUS wow64_release_font_object(void *args)
+struct wow64_release_font_object_params
 {
-    struct
-    {
-        UINT64 object;
-    } const *params32 = args;
-    struct release_font_object_params params =
-    {
-        params32->object
-    };
+    UINT64 object;
+};
 
-    return release_font_object(&params);
-}
+struct wow64_get_glyph_outline_params
+{
+    UINT64 object;
+    ULONG simulations;
+    ULONG glyph;
+    float emsize;
+    PTR32 outline;
+};
+
+struct wow64_get_glyph_count_params
+{
+    UINT64 object;
+    PTR32 count;
+};
+
+struct wow64_get_glyph_advance_params
+{
+    UINT64 object;
+    ULONG glyph;
+    ULONG mode;
+    float emsize;
+    PTR32 advance;
+    PTR32 has_contours;
+};
+
+struct wow64_get_glyph_bbox_params
+{
+    UINT64 object;
+    ULONG simulations;
+    ULONG glyph;
+    float emsize;
+    MATRIX_2X2 m;
+    PTR32 bbox;
+};
+
+struct wow64_get_glyph_bitmap_params
+{
+    UINT64 object;
+    ULONG simulations;
+    ULONG glyph;
+    ULONG mode;
+    float emsize;
+    MATRIX_2X2 m;
+    RECT bbox;
+    int pitch;
+    PTR32 bitmap;
+    PTR32 is_1bpp;
+};
+
+struct wow64_get_design_glyph_metrics_params
+{
+    UINT64 object;
+    ULONG simulations;
+    ULONG glyph;
+    ULONG upem;
+    ULONG ascent;
+    PTR32 metrics;
+};
 
 struct dwrite_outline32
 {
@@ -915,161 +963,830 @@ struct dwrite_outline32
     } points;
 };
 
-static NTSTATUS wow64_get_glyph_outline(void *args)
-{
-    struct
-    {
-        UINT64 object;
-        ULONG simulations;
-        ULONG glyph;
-        float emsize;
-        PTR32 outline;
-    } const *params32 = args;
-    struct dwrite_outline32 *outline32 = ULongToPtr(params32->outline);
-    struct dwrite_outline outline =
-    {
-        .tags.values = ULongToPtr(outline32->tags.values),
-        .tags.count = outline32->tags.count,
-        .tags.size = outline32->tags.size,
-        .points.values = ULongToPtr(outline32->points.values),
-        .points.count = outline32->points.count,
-        .points.size = outline32->points.size,
-    };
+C_ASSERT(sizeof(struct wow64_create_font_object_params) == 40);
+C_ASSERT(sizeof(struct wow64_release_font_object_params) == 8);
+C_ASSERT(sizeof(struct wow64_get_glyph_outline_params) == 24);
+C_ASSERT(sizeof(struct wow64_get_glyph_count_params) == 16);
+C_ASSERT(sizeof(struct wow64_get_glyph_advance_params) == 32);
+C_ASSERT(sizeof(struct wow64_get_glyph_bbox_params) == 40);
+C_ASSERT(sizeof(struct wow64_get_glyph_bitmap_params) == 72);
+C_ASSERT(sizeof(struct wow64_get_design_glyph_metrics_params) == 32);
+C_ASSERT(sizeof(struct dwrite_outline32) == 24);
+C_ASSERT(sizeof(SIZE_T) >= sizeof(UINT64));
 
-    struct get_glyph_outline_params params =
-    {
-        params32->object,
-        params32->simulations,
-        params32->glyph,
-        params32->emsize,
-        &outline,
-    };
+static NTSTATUS wow64_guest_pointer(PTR32 address, SIZE_T offset, void **ptr)
+{
+    if ((!address && offset) || offset > MAXDWORD - address)
+        return STATUS_ACCESS_VIOLATION;
+    return ntdll_wow64_guest32_to_host(address + offset, ptr);
+}
+
+#ifdef SONAME_LIBFREETYPE
+static NTSTATUS wow64_copy_from_guest(void *dst, PTR32 src, SIZE_T size)
+{
+    void *ptr;
     NTSTATUS status;
 
-    status = get_glyph_outline(&params);
-    outline32->points.count = outline.points.count;
-    outline32->tags.count = outline.tags.count;
+    if (size && (!src || size > 0x100000000ULL - src)) return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_guest_pointer(src, 0, &ptr))) return status;
+    return ntdll_wow64_copy_from_user(dst, ptr, size);
+}
+
+static NTSTATUS wow64_probe_read_guest(PTR32 src, SIZE_T size)
+{
+    void *ptr;
+    NTSTATUS status;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!src || size > 0x100000000ULL - src) return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_guest_pointer(src, 0, &ptr))) return status;
+    return ntdll_wow64_probe_user_read(ptr, size);
+}
+#endif
+
+static NTSTATUS wow64_write_guest(PTR32 dst, const void *src, SIZE_T size)
+{
+    void *ptr;
+    NTSTATUS status;
+
+    if (size && (!dst || size > 0x100000000ULL - dst)) return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_guest_pointer(dst, 0, &ptr))) return status;
+    return ntdll_wow64_faulting_copy_to_user(ptr, src, size);
+}
+
+static NTSTATUS wow64_atomic_write_guest(PTR32 dst, const void *src, SIZE_T size)
+{
+    void *ptr;
+    NTSTATUS status;
+
+    if (size && (!dst || size > 0x100000000ULL - dst)) return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_guest_pointer(dst, 0, &ptr))) return status;
+    return ntdll_wow64_atomic_write_user(ptr, src, size);
+}
+
+static NTSTATUS wow64_probe_write_guest(PTR32 dst, SIZE_T size)
+{
+    void *ptr;
+    NTSTATUS status;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!dst || size > 0x100000000ULL - dst) return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_guest_pointer(dst, 0, &ptr))) return status;
+    return ntdll_wow64_probe_user_write(ptr, size);
+}
+
+static NTSTATUS wow64_probe_write_pair(PTR32 dst1, SIZE_T size1, PTR32 dst2, SIZE_T size2)
+{
+    struct ntdll_wow64_user_write_range ranges[2];
+    NTSTATUS status;
+    void *ptr;
+
+    if (size1 && (!dst1 || size1 > 0x100000000ULL - dst1)) return STATUS_ACCESS_VIOLATION;
+    if (size1 && (status = wow64_guest_pointer(dst1, 0, &ptr))) return status;
+    if (!size1) ptr = NULL;
+    ranges[0] = (struct ntdll_wow64_user_write_range){ ptr, NULL, size1 };
+    if (size2 && (!dst2 || size2 > 0x100000000ULL - dst2)) return STATUS_ACCESS_VIOLATION;
+    if (size2 && (status = wow64_guest_pointer(dst2, 0, &ptr))) return status;
+    if (!size2) ptr = NULL;
+    ranges[1] = (struct ntdll_wow64_user_write_range){ ptr, NULL, size2 };
+    return ntdll_wow64_probe_user_writev(ranges, ARRAY_SIZE(ranges));
+}
+
+static NTSTATUS wow64_atomic_write_pair(PTR32 dst1, const void *src1, SIZE_T size1,
+                                        PTR32 dst2, const void *src2, SIZE_T size2)
+{
+    struct ntdll_wow64_user_write_range ranges[2];
+    NTSTATUS status;
+    void *ptr;
+
+    if (size1 && (!dst1 || size1 > 0x100000000ULL - dst1)) return STATUS_ACCESS_VIOLATION;
+    if (size1 && (status = wow64_guest_pointer(dst1, 0, &ptr))) return status;
+    if (!size1) ptr = NULL;
+    ranges[0] = (struct ntdll_wow64_user_write_range){ ptr, src1, size1 };
+    if (size2 && (!dst2 || size2 > 0x100000000ULL - dst2)) return STATUS_ACCESS_VIOLATION;
+    if (size2 && (status = wow64_guest_pointer(dst2, 0, &ptr))) return status;
+    if (!size2) ptr = NULL;
+    ranges[1] = (struct ntdll_wow64_user_write_range){ ptr, src2, size2 };
+    return ntdll_wow64_atomic_writev(ranges, ARRAY_SIZE(ranges));
+}
+
+#ifdef SONAME_LIBFREETYPE
+
+#define WOW64_FONT_AXIS_MAX_COUNT 0xffff
+#define WOW64_FONT_OBJECT_BUCKETS 64
+#define WOW64_FONT_TOKEN_PREFIX 0x4457000000000000ULL
+#define WOW64_FONT_TOKEN_MASK   0x0000ffffffffffffULL
+
+struct wow64_font_object
+{
+    struct wow64_font_object *next;
+    UINT64 token;
+    unsigned int refs;
+    pthread_mutex_t mutex;
+    FT_Face face;
+    void *data;
+};
+
+static pthread_mutex_t wow64_font_objects_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t wow64_font_objects_cond = PTHREAD_COND_INITIALIZER;
+static struct wow64_font_object *wow64_font_objects[WOW64_FONT_OBJECT_BUCKETS];
+static UINT64 wow64_font_next_token = 1;
+static unsigned int wow64_font_object_count;
+static BOOL wow64_font_registry_detaching;
+
+static unsigned int wow64_font_object_hash(UINT64 token)
+{
+    return (token ^ (token >> 32)) % WOW64_FONT_OBJECT_BUCKETS;
+}
+
+static struct wow64_font_object *wow64_find_font_object_locked(UINT64 token)
+{
+    struct wow64_font_object *object;
+
+    for (object = wow64_font_objects[wow64_font_object_hash(token)]; object; object = object->next)
+        if (object->token == token) return object;
+    return NULL;
+}
+
+static void wow64_destroy_font_object(struct wow64_font_object *object)
+{
+    pFT_Done_Face(object->face);
+    free(object->data);
+    pthread_mutex_destroy(&object->mutex);
+    free(object);
+
+    pthread_mutex_lock(&wow64_font_objects_mutex);
+    --wow64_font_object_count;
+    pthread_cond_broadcast(&wow64_font_objects_cond);
+    pthread_mutex_unlock(&wow64_font_objects_mutex);
+}
+
+static void wow64_font_registry_attach(void)
+{
+    pthread_mutex_lock(&wow64_font_objects_mutex);
+    wow64_font_registry_detaching = FALSE;
+    pthread_mutex_unlock(&wow64_font_objects_mutex);
+}
+
+static void wow64_font_registry_cleanup(void)
+{
+    struct wow64_font_object *destroy_list = NULL, *object, *next;
+    unsigned int bucket;
+
+    pthread_mutex_lock(&wow64_font_objects_mutex);
+    wow64_font_registry_detaching = TRUE;
+    for (bucket = 0; bucket < ARRAY_SIZE(wow64_font_objects); ++bucket)
+    {
+        for (object = wow64_font_objects[bucket]; object; object = next)
+        {
+            next = object->next;
+            object->next = NULL;
+            if (!--object->refs)
+            {
+                object->next = destroy_list;
+                destroy_list = object;
+            }
+        }
+        wow64_font_objects[bucket] = NULL;
+    }
+    pthread_mutex_unlock(&wow64_font_objects_mutex);
+
+    while ((object = destroy_list))
+    {
+        destroy_list = object->next;
+        wow64_destroy_font_object(object);
+    }
+
+    pthread_mutex_lock(&wow64_font_objects_mutex);
+    while (wow64_font_object_count)
+        pthread_cond_wait(&wow64_font_objects_cond, &wow64_font_objects_mutex);
+    pthread_mutex_unlock(&wow64_font_objects_mutex);
+}
+
+static NTSTATUS wow64_register_font_object(struct wow64_font_object *object, UINT64 *token)
+{
+    unsigned int bucket;
+
+    if (pthread_mutex_init(&object->mutex, NULL)) return STATUS_NO_MEMORY;
+    object->refs = 1; /* registry reference */
+
+    pthread_mutex_lock(&wow64_font_objects_mutex);
+    if (wow64_font_registry_detaching)
+    {
+        pthread_mutex_unlock(&wow64_font_objects_mutex);
+        pthread_mutex_destroy(&object->mutex);
+        return STATUS_UNSUCCESSFUL;
+    }
+    do
+    {
+        object->token = WOW64_FONT_TOKEN_PREFIX | (wow64_font_next_token++ & WOW64_FONT_TOKEN_MASK);
+        if (!(wow64_font_next_token & WOW64_FONT_TOKEN_MASK)) wow64_font_next_token = 1;
+    } while (!object->token || wow64_find_font_object_locked(object->token));
+    bucket = wow64_font_object_hash(object->token);
+    object->next = wow64_font_objects[bucket];
+    wow64_font_objects[bucket] = object;
+    ++wow64_font_object_count;
+    pthread_mutex_unlock(&wow64_font_objects_mutex);
+
+    *token = object->token;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS wow64_acquire_font_object(UINT64 token, struct wow64_font_object **ret)
+{
+    struct wow64_font_object *object;
+    BOOL destroy;
+
+    *ret = NULL;
+    if (!token) return STATUS_INVALID_HANDLE;
+
+    pthread_mutex_lock(&wow64_font_objects_mutex);
+    if (!(object = wow64_find_font_object_locked(token)) || object->refs == UINT_MAX)
+    {
+        pthread_mutex_unlock(&wow64_font_objects_mutex);
+        return STATUS_INVALID_HANDLE;
+    }
+    ++object->refs;
+    pthread_mutex_unlock(&wow64_font_objects_mutex);
+
+    if (pthread_mutex_lock(&object->mutex))
+    {
+        pthread_mutex_lock(&wow64_font_objects_mutex);
+        destroy = !--object->refs;
+        pthread_mutex_unlock(&wow64_font_objects_mutex);
+        if (destroy) wow64_destroy_font_object(object);
+        return STATUS_UNSUCCESSFUL;
+    }
+    *ret = object;
+    return STATUS_SUCCESS;
+}
+
+static void wow64_release_font_object_ref(struct wow64_font_object *object)
+{
+    BOOL destroy;
+
+    pthread_mutex_unlock(&object->mutex);
+    pthread_mutex_lock(&wow64_font_objects_mutex);
+    destroy = !--object->refs;
+    pthread_mutex_unlock(&wow64_font_objects_mutex);
+    if (destroy) wow64_destroy_font_object(object);
+}
+
+static NTSTATUS wow64_unregister_font_object(UINT64 token)
+{
+    struct wow64_font_object **cursor, *object;
+    unsigned int bucket;
+    BOOL destroy;
+
+    if (!token) return STATUS_INVALID_HANDLE;
+    bucket = wow64_font_object_hash(token);
+    pthread_mutex_lock(&wow64_font_objects_mutex);
+    for (cursor = &wow64_font_objects[bucket]; (object = *cursor); cursor = &object->next)
+    {
+        if (object->token != token) continue;
+        *cursor = object->next;
+        destroy = !--object->refs;
+        pthread_mutex_unlock(&wow64_font_objects_mutex);
+        if (destroy) wow64_destroy_font_object(object);
+        return STATUS_SUCCESS;
+    }
+    pthread_mutex_unlock(&wow64_font_objects_mutex);
+
+    return STATUS_INVALID_HANDLE;
+}
+
+#endif
+
+static NTSTATUS wow64_create_font_object(void *args)
+{
+    const struct wow64_create_font_object_params *params32 = args;
+    UINT64 value = 0;
+    NTSTATUS status;
+#ifdef SONAME_LIBFREETYPE
+    DWRITE_FONT_AXIS_VALUE *axis_values = NULL;
+    struct wow64_font_object *object = NULL;
+    FT_Fixed *coordinates = NULL;
+    FT_Face face = NULL;
+    FT_Error fterror;
+    void *data = NULL;
+    SIZE_T axis_size, size;
+    unsigned int i;
+#endif
+
+    if ((status = wow64_write_guest(params32->object, &value, sizeof(value)))) return status;
+
+#ifdef SONAME_LIBFREETYPE
+    if (params32->size > (UINT64)LONG_MAX)
+        return STATUS_INVALID_PARAMETER;
+    size = params32->size;
+    if (size)
+    {
+        if (!params32->data || size > 0x100000000ULL - params32->data)
+            return STATUS_ACCESS_VIOLATION;
+        if ((status = wow64_probe_read_guest(params32->data, size))) return status;
+        if (!(data = malloc(size))) return STATUS_NO_MEMORY;
+        if ((status = wow64_copy_from_guest(data, params32->data, size)))
+        {
+            free(data);
+            return status;
+        }
+    }
+
+    fterror = pFT_New_Memory_Face(library, data, params32->size, params32->index, &face);
+    if (fterror != FT_Err_Ok)
+    {
+        WARN("Failed to create a face object, error %d.\n", fterror);
+        free(data);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (params32->axis_values_count)
+    {
+        if (!pFT_Set_Var_Design_Coordinates)
+        {
+            if (!params32->axis_values_are_default)
+            {
+                WARN("FreeType does not support variable font coordinates.\n");
+                status = STATUS_NOT_SUPPORTED;
+                goto failed;
+            }
+        }
+        else
+        {
+            if (params32->axis_values_count > WOW64_FONT_AXIS_MAX_COUNT)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                goto failed;
+            }
+            axis_size = (SIZE_T)params32->axis_values_count * sizeof(*axis_values);
+            if (!params32->axis_values || axis_size > 0x100000000ULL - params32->axis_values)
+            {
+                status = STATUS_ACCESS_VIOLATION;
+                goto failed;
+            }
+            if ((status = wow64_probe_read_guest(params32->axis_values, axis_size))) goto failed;
+            if (!(coordinates = calloc(params32->axis_values_count, sizeof(*coordinates))) ||
+                !(axis_values = malloc(axis_size)))
+            {
+                status = STATUS_NO_MEMORY;
+                goto failed;
+            }
+            if ((status = wow64_copy_from_guest(axis_values, params32->axis_values, axis_size)))
+                goto failed;
+
+            for (i = 0; i < params32->axis_values_count; ++i)
+                coordinates[i] = axis_values[i].value * 65536.0f;
+
+            fterror = pFT_Set_Var_Design_Coordinates(face, params32->axis_values_count, coordinates);
+            if (fterror != FT_Err_Ok && !params32->axis_values_are_default)
+            {
+                WARN("Failed to set variable font coordinates, error %d.\n", fterror);
+                status = STATUS_UNSUCCESSFUL;
+                goto failed;
+            }
+        }
+    }
+
+    if (!(object = malloc(sizeof(*object))))
+    {
+        status = STATUS_NO_MEMORY;
+        goto failed;
+    }
+    object->face = face;
+    object->data = data;
+    if ((status = wow64_register_font_object(object, &value)))
+    {
+        free(object);
+        goto failed;
+    }
+    object = NULL;
+    face = NULL;
+    data = NULL;
+    if ((status = wow64_atomic_write_guest(params32->object, &value, sizeof(value))))
+    {
+        wow64_unregister_font_object(value);
+        free(axis_values);
+        free(coordinates);
+        return status;
+    }
+
+    free(axis_values);
+    free(coordinates);
+    return STATUS_SUCCESS;
+
+failed:
+    free(axis_values);
+    free(coordinates);
+    pFT_Done_Face(face);
+    free(data);
     return status;
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+static NTSTATUS wow64_release_font_object(void *args)
+{
+    const struct wow64_release_font_object_params *params32 = args;
+
+#ifdef SONAME_LIBFREETYPE
+    return wow64_unregister_font_object(params32->object);
+#else
+    return release_font_object((void *)params32);
+#endif
+}
+
+#ifdef SONAME_LIBFREETYPE
+static NTSTATUS wow64_publish_outline(PTR32 outline_address, const struct dwrite_outline32 *outline32,
+                                      const BYTE *tags, ULONG tags_count,
+                                      const D2D1_POINT_2F *points, ULONG points_count,
+                                      ULONG result_tags_count, ULONG result_points_count)
+{
+    struct ntdll_wow64_user_write_range ranges[4];
+    SIZE_T bytes, offset;
+    ULONG count = 0;
+    void *ptr;
+    NTSTATUS status;
+
+    if (tags_count)
+    {
+        offset = (SIZE_T)outline32->tags.count * sizeof(*tags);
+        bytes = (SIZE_T)tags_count * sizeof(*tags);
+        if (!outline32->tags.values || offset > 0x100000000ULL - outline32->tags.values ||
+            bytes > 0x100000000ULL - outline32->tags.values - offset ||
+            (status = wow64_guest_pointer(outline32->tags.values, offset, &ptr)))
+            return STATUS_ACCESS_VIOLATION;
+        ranges[count++] = (struct ntdll_wow64_user_write_range)
+                          { ptr, tags, bytes };
+    }
+    if (points_count)
+    {
+        offset = (SIZE_T)outline32->points.count * sizeof(*points);
+        bytes = (SIZE_T)points_count * sizeof(*points);
+        if (!outline32->points.values || offset > 0x100000000ULL - outline32->points.values ||
+            bytes > 0x100000000ULL - outline32->points.values - offset ||
+            (status = wow64_guest_pointer(outline32->points.values, offset, &ptr)))
+            return STATUS_ACCESS_VIOLATION;
+        ranges[count++] = (struct ntdll_wow64_user_write_range)
+                          { ptr, points, bytes };
+    }
+    offset = offsetof(struct dwrite_outline32, points.count);
+    if (!outline_address || offset > 0x100000000ULL - outline_address ||
+        sizeof(result_points_count) > 0x100000000ULL - outline_address - offset)
+        return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_guest_pointer(outline_address,
+                                      offset, &ptr)))
+        return status;
+    ranges[count++] = (struct ntdll_wow64_user_write_range)
+                      { ptr, &result_points_count, sizeof(result_points_count) };
+    offset = offsetof(struct dwrite_outline32, tags.count);
+    if (offset > 0x100000000ULL - outline_address ||
+        sizeof(result_tags_count) > 0x100000000ULL - outline_address - offset)
+        return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_guest_pointer(outline_address,
+                                      offset, &ptr)))
+        return status;
+    ranges[count++] = (struct ntdll_wow64_user_write_range)
+                      { ptr, &result_tags_count, sizeof(result_tags_count) };
+    return ntdll_wow64_atomic_writev(ranges, count);
+}
+#endif
+
+static NTSTATUS wow64_get_glyph_outline(void *args)
+{
+#ifdef SONAME_LIBFREETYPE
+    const struct wow64_get_glyph_outline_params *params32 = args;
+    struct dwrite_outline32 outline32;
+    ULONG result_tags_count, result_points_count;
+    ULONG tags_count = 0, points_count = 0;
+    D2D1_POINT_2F *points = NULL;
+    BYTE *tags = NULL;
+    NTSTATUS status;
+
+    if ((status = wow64_copy_from_guest(&outline32, params32->outline, sizeof(outline32))))
+        return status;
+    result_tags_count = outline32.tags.count;
+    result_points_count = outline32.points.count;
+
+    {
+        struct wow64_font_object *object;
+        FT_Face face;
+        FT_Size size;
+
+        if ((status = wow64_acquire_font_object(params32->object, &object))) return status;
+        face = object->face;
+        if (!(size = freetype_set_face_size(face, params32->emsize)))
+            status = STATUS_UNSUCCESSFUL;
+        else
+        {
+            status = STATUS_SUCCESS;
+            if (!pFT_Load_Glyph(face, params32->glyph, FT_LOAD_NO_BITMAP))
+            {
+                FT_Outline *ft_outline = &face->glyph->outline;
+
+                if (outline32.points.values)
+                {
+                    struct dwrite_outline outline = {0};
+                    ULONG tags_capacity = 0, points_capacity = 0;
+                    ULONG max_tags = 0, max_points = 0;
+
+                    if (ft_outline->n_points > 0)
+                    {
+                        max_points = (ULONG)ft_outline->n_points * 3;
+                        max_tags = ft_outline->n_points;
+                    }
+                    if (ft_outline->n_contours > 0)
+                        max_tags += (ULONG)ft_outline->n_contours * 2;
+                    if (outline32.tags.size >= outline32.tags.count)
+                        tags_capacity = min(outline32.tags.size - outline32.tags.count, max_tags);
+                    if (outline32.points.size >= outline32.points.count)
+                        points_capacity = min(outline32.points.size - outline32.points.count, max_points);
+
+                    if ((tags_capacity && !(tags = malloc(tags_capacity * sizeof(*tags)))) ||
+                        (points_capacity && !(points = malloc(points_capacity * sizeof(*points)))))
+                        status = STATUS_NO_MEMORY;
+                    else
+                    {
+                        FT_Matrix m;
+
+                        outline.tags.values = tags;
+                        outline.tags.size = tags_capacity;
+                        outline.points.values = points;
+                        outline.points.size = points_capacity;
+                        if (params32->simulations & DWRITE_FONT_SIMULATIONS_BOLD)
+                            embolden_glyph_outline(ft_outline, params32->emsize);
+
+                        m.xx = 1 << 16;
+                        m.xy = params32->simulations & DWRITE_FONT_SIMULATIONS_OBLIQUE ? (1 << 16) / 3 : 0;
+                        m.yx = 0;
+                        m.yy = -(1 << 16);
+                        pFT_Outline_Transform(ft_outline, &m);
+                        decompose_outline(ft_outline, &outline);
+                        tags_count = outline.tags.count;
+                        points_count = outline.points.count;
+                        result_tags_count += tags_count;
+                        result_points_count += points_count;
+                    }
+                }
+                else
+                {
+                    result_points_count = ft_outline->n_points * 3;
+                    result_tags_count = ft_outline->n_points + ft_outline->n_contours * 2;
+                }
+            }
+            pFT_Done_Size(size);
+        }
+        wow64_release_font_object_ref(object);
+    }
+    {
+        NTSTATUS publish_status = wow64_publish_outline(params32->outline, &outline32, tags, tags_count,
+                                                        points, points_count, result_tags_count,
+                                                        result_points_count);
+        free(tags);
+        free(points);
+        return publish_status ? publish_status : status;
+    }
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
 }
 
 static NTSTATUS wow64_get_glyph_count(void *args)
 {
-    struct
-    {
-        UINT64 object;
-        PTR32 count;
-    } const *params32 = args;
-    struct get_glyph_count_params params =
-    {
-        params32->object,
-        ULongToPtr(params32->count),
-    };
+    const struct wow64_get_glyph_count_params *params32 = args;
+#ifdef SONAME_LIBFREETYPE
+    struct wow64_font_object *object;
+    unsigned int count;
+    struct get_glyph_count_params params;
+    NTSTATUS status, publish_status;
 
-    return get_glyph_count(&params);
+    if ((status = wow64_acquire_font_object(params32->object, &object))) return status;
+    params.object = (ULONG_PTR)object->face;
+    params.count = &count;
+    status = get_glyph_count(&params);
+    wow64_release_font_object_ref(object);
+    publish_status = wow64_atomic_write_guest(params32->count, &count, sizeof(count));
+    return publish_status ? publish_status : status;
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
 }
 
 static NTSTATUS wow64_get_glyph_advance(void *args)
 {
-    struct
-    {
-        UINT64 object;
-        ULONG glyph;
-        ULONG mode;
-        float emsize;
-        PTR32 advance;
-        PTR32 has_contours;
-    } const *params32 = args;
-    struct get_glyph_advance_params params =
-    {
-        params32->object,
-        params32->glyph,
-        params32->mode,
-        params32->emsize,
-        ULongToPtr(params32->advance),
-        ULongToPtr(params32->has_contours),
-    };
+    const struct wow64_get_glyph_advance_params *params32 = args;
+    int advance = 0;
+    unsigned int has_contours = 0;
+    struct get_glyph_advance_params params;
+    NTSTATUS status, publish_status;
+#ifdef SONAME_LIBFREETYPE
+    struct wow64_font_object *object;
+#endif
 
-    return get_glyph_advance(&params);
+    if ((status = wow64_probe_write_pair(params32->advance, sizeof(advance),
+                                         params32->has_contours, sizeof(has_contours)))) return status;
+#ifdef SONAME_LIBFREETYPE
+    if ((status = wow64_acquire_font_object(params32->object, &object))) return status;
+    params.object = (ULONG_PTR)object->face;
+#else
+    params.object = params32->object;
+#endif
+    params.glyph = params32->glyph;
+    params.mode = params32->mode;
+    params.emsize = params32->emsize;
+    params.advance = &advance;
+    params.has_contours = &has_contours;
+    status = get_glyph_advance(&params);
+#ifdef SONAME_LIBFREETYPE
+    wow64_release_font_object_ref(object);
+#endif
+    publish_status = wow64_atomic_write_pair(params32->advance, &advance, sizeof(advance),
+                                             params32->has_contours, &has_contours,
+                                             sizeof(has_contours));
+    return publish_status ? publish_status : status;
 }
 
 static NTSTATUS wow64_get_glyph_bbox(void *args)
 {
-    struct
-    {
-        UINT64 object;
-        ULONG simulations;
-        ULONG glyph;
-        float emsize;
-        MATRIX_2X2 m;
-        PTR32 bbox;
-    } const *params32 = args;
-    struct get_glyph_bbox_params params =
-    {
-        params32->object,
-        params32->simulations,
-        params32->glyph,
-        params32->emsize,
-        params32->m,
-        ULongToPtr(params32->bbox),
-    };
+    const struct wow64_get_glyph_bbox_params *params32 = args;
+    RECT bbox = {0};
+    struct get_glyph_bbox_params params;
+    NTSTATUS status, publish_status;
+#ifdef SONAME_LIBFREETYPE
+    struct wow64_font_object *object;
+#endif
 
-    return get_glyph_bbox(&params);
+    if ((status = wow64_probe_write_guest(params32->bbox, sizeof(bbox)))) return status;
+#ifdef SONAME_LIBFREETYPE
+    if ((status = wow64_acquire_font_object(params32->object, &object))) return status;
+    params.object = (ULONG_PTR)object->face;
+#else
+    params.object = params32->object;
+#endif
+    params.simulations = params32->simulations;
+    params.glyph = params32->glyph;
+    params.emsize = params32->emsize;
+    params.m = params32->m;
+    params.bbox = &bbox;
+    status = get_glyph_bbox(&params);
+#ifdef SONAME_LIBFREETYPE
+    wow64_release_font_object_ref(object);
+#endif
+    publish_status = wow64_atomic_write_guest(params32->bbox, &bbox, sizeof(bbox));
+    return publish_status ? publish_status : status;
 }
 
 static NTSTATUS wow64_get_glyph_bitmap(void *args)
 {
-    struct
-    {
-        UINT64 object;
-        ULONG simulations;
-        ULONG glyph;
-        ULONG mode;
-        float emsize;
-        MATRIX_2X2 m;
-        RECT bbox;
-        int pitch;
-        PTR32 bitmap;
-        PTR32 is_1bpp;
-    } const *params32 = args;
-    struct get_glyph_bitmap_params params =
-    {
-        params32->object,
-        params32->simulations,
-        params32->glyph,
-        params32->mode,
-        params32->emsize,
-        params32->m,
-        params32->bbox,
-        params32->pitch,
-        ULongToPtr(params32->bitmap),
-        ULongToPtr(params32->is_1bpp),
-    };
+    const struct wow64_get_glyph_bitmap_params *params32 = args;
+    unsigned int is_1bpp = 0;
+    NTSTATUS status;
 
-    return get_glyph_bitmap(&params);
+#ifdef SONAME_LIBFREETYPE
+    struct wow64_font_object *object;
+    LONGLONG width = (LONGLONG)params32->bbox.right - params32->bbox.left;
+    LONGLONG height = (LONGLONG)params32->bbox.bottom - params32->bbox.top;
+    SIZE_T min_pitch, bitmap_size;
+
+    if ((status = wow64_probe_write_guest(params32->is_1bpp, sizeof(is_1bpp)))) return status;
+    if (width < 0 || width > MAXLONG || height < 0 || height > MAXLONG || params32->pitch < 0)
+    {
+        status = wow64_atomic_write_guest(params32->is_1bpp, &is_1bpp, sizeof(is_1bpp));
+        return status ? status : STATUS_INVALID_PARAMETER;
+    }
+    if (params32->mode == DWRITE_RENDERING_MODE1_ALIASED)
+        min_pitch = (((SIZE_T)width + 31) >> 5) << 2;
+    else
+        min_pitch = (((SIZE_T)width + 3) / 4) * 4;
+    if ((SIZE_T)params32->pitch < min_pitch ||
+        (ULONGLONG)height > ~(SIZE_T)0 / (unsigned int)max(params32->pitch, 1))
+    {
+        status = wow64_atomic_write_guest(params32->is_1bpp, &is_1bpp, sizeof(is_1bpp));
+        return status ? status : STATUS_INVALID_PARAMETER;
+    }
+    bitmap_size = (SIZE_T)height * params32->pitch;
+    if ((status = wow64_probe_write_guest(params32->bitmap, bitmap_size))) return status;
+    if ((status = wow64_acquire_font_object(params32->object, &object))) return status;
+    {
+        FT_Face face = object->face;
+        BOOL needs_transform;
+        NTSTATUS ret = STATUS_SUCCESS;
+        FT_Glyph glyph;
+        FT_Size size;
+        FT_Matrix m;
+
+        if (!(size = freetype_set_face_size(face, params32->emsize)))
+        {
+            wow64_release_font_object_ref(object);
+            status = wow64_atomic_write_guest(params32->is_1bpp, &is_1bpp, sizeof(is_1bpp));
+            return status ? status : STATUS_UNSUCCESSFUL;
+        }
+
+        needs_transform = FT_IS_SCALABLE(face) && get_glyph_transform(params32->simulations, &params32->m, &m);
+        if (!pFT_Load_Glyph(face, params32->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0))
+        {
+            BYTE *bitmap;
+            struct get_glyph_bitmap_params params;
+
+            if (!(bitmap = calloc(1, max(bitmap_size, (SIZE_T)1))))
+            {
+                pFT_Done_Size(size);
+                wow64_release_font_object_ref(object);
+                status = wow64_atomic_write_guest(params32->is_1bpp, &is_1bpp, sizeof(is_1bpp));
+                return status ? status : STATUS_NO_MEMORY;
+            }
+
+            if (pFT_Get_Glyph(face->glyph, &glyph))
+            {
+                free(bitmap);
+                pFT_Done_Size(size);
+                wow64_release_font_object_ref(object);
+                status = wow64_atomic_write_guest(params32->is_1bpp, &is_1bpp, sizeof(is_1bpp));
+                return status ? status : STATUS_UNSUCCESSFUL;
+            }
+            if (needs_transform)
+            {
+                if (params32->simulations & DWRITE_FONT_SIMULATIONS_BOLD)
+                    embolden_glyph(glyph, params32->emsize);
+                pFT_Glyph_Transform(glyph, &m, NULL);
+            }
+
+            params.object = (ULONG_PTR)face;
+            params.simulations = params32->simulations;
+            params.glyph = params32->glyph;
+            params.mode = params32->mode;
+            params.emsize = params32->emsize;
+            params.m = params32->m;
+            params.bbox = params32->bbox;
+            params.pitch = params32->pitch;
+            params.bitmap = bitmap;
+            params.is_1bpp = &is_1bpp;
+            if (params32->mode == DWRITE_RENDERING_MODE1_ALIASED)
+                ret = freetype_get_aliased_glyph_bitmap(&params, glyph);
+            else
+                ret = freetype_get_aa_glyph_bitmap(&params, glyph);
+            pFT_Done_Glyph(glyph);
+
+            if (!ret)
+            {
+                ret = wow64_atomic_write_pair(params32->is_1bpp, &is_1bpp, sizeof(is_1bpp),
+                                               params32->bitmap, bitmap, bitmap_size);
+            }
+            free(bitmap);
+        }
+        else ret = wow64_atomic_write_guest(params32->is_1bpp, &is_1bpp, sizeof(is_1bpp));
+        pFT_Done_Size(size);
+        wow64_release_font_object_ref(object);
+        return ret;
+    }
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
 }
 
 static NTSTATUS wow64_get_design_glyph_metrics(void *args)
 {
-    struct
-    {
-        UINT64 object;
-        ULONG simulations;
-        ULONG glyph;
-        ULONG upem;
-        ULONG ascent;
-        PTR32 metrics;
-    } const *params32 = args;
-    struct get_design_glyph_metrics_params params =
-    {
-        params32->object,
-        params32->simulations,
-        params32->glyph,
-        params32->upem,
-        params32->ascent,
-        ULongToPtr(params32->metrics),
-    };
+    const struct wow64_get_design_glyph_metrics_params *params32 = args;
 
-    return get_design_glyph_metrics(&params);
+#ifdef SONAME_LIBFREETYPE
+    DWRITE_GLYPH_METRICS metrics;
+    struct wow64_font_object *object;
+    FT_Face face;
+    FT_Size size;
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOL loaded = FALSE;
+
+    if ((status = wow64_acquire_font_object(params32->object, &object))) return status;
+    face = object->face;
+    if (!(size = freetype_set_face_size(face, params32->upem)))
+    {
+        wow64_release_font_object_ref(object);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (!pFT_Load_Glyph(face, params32->glyph, FT_LOAD_NO_SCALE))
+    {
+        FT_Glyph_Metrics *ft_metrics = &face->glyph->metrics;
+
+        metrics.leftSideBearing = ft_metrics->horiBearingX;
+        metrics.advanceWidth = ft_metrics->horiAdvance;
+        metrics.rightSideBearing = ft_metrics->horiAdvance - ft_metrics->horiBearingX - ft_metrics->width;
+        metrics.advanceHeight = ft_metrics->vertAdvance;
+        metrics.verticalOriginY = params32->ascent;
+        metrics.topSideBearing = params32->ascent - ft_metrics->horiBearingY;
+        metrics.bottomSideBearing = ft_metrics->vertAdvance - ft_metrics->height - metrics.topSideBearing;
+        if (params32->simulations & DWRITE_FONT_SIMULATIONS_BOLD && freetype_glyph_has_contours(face) &&
+            metrics.advanceWidth)
+            metrics.advanceWidth += (params32->upem + 49) / 50;
+        loaded = TRUE;
+    }
+    pFT_Done_Size(size);
+    wow64_release_font_object_ref(object);
+    if (loaded) status = wow64_atomic_write_guest(params32->metrics, &metrics, sizeof(metrics));
+    return status;
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
 };
 
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
@@ -1085,6 +1802,36 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_get_glyph_bitmap,
     wow64_get_design_glyph_metrics,
 };
+
+static const struct wine_unixlib_dispatch_entry_v2 wow64_dispatch_entries[] =
+{
+    { 0, WINE_UNIXLIB_DISPATCH_ENTRY_REVIEWED },
+    { 0, WINE_UNIXLIB_DISPATCH_ENTRY_REVIEWED },
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_create_font_object_params,
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_release_font_object_params, 0),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_get_glyph_outline_params,
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_get_glyph_count_params,
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_get_glyph_advance_params,
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_get_glyph_bbox_params,
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_get_glyph_bitmap_params,
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_get_design_glyph_metrics_params,
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT),
+};
+
+WINE_UNIXLIB_DISPATCH_SOURCE_V2(__wine_unix_call_wow64_funcs, wow64_dispatch_entries);
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
 

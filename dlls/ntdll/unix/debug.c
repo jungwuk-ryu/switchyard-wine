@@ -328,9 +328,30 @@ NTSTATUS wow64_wine_dbg_write( void *args )
     {
         ULONG        str;
         unsigned int len;
-    } const *params32 = args;
+    } params32;
+    char buffer[1024];
+    SIZE_T offset = 0;
 
-    return write( 2, ULongToPtr(params32->str), params32->len );
+    if (virtual_copy_from_user( &params32, args, sizeof(params32) )) return -1;
+    if (params32.len && (!params32.str ||
+        params32.len > 0x100000000ull - params32.str)) return -1;
+
+    while (offset < params32.len)
+    {
+        SIZE_T count = min( sizeof(buffer), params32.len - offset );
+        ssize_t ret;
+
+        if (virtual_copy_from_user( buffer,
+                                    (char *)wow64_guest_to_native_ptr( params32.str ) + offset,
+                                    count ))
+            return offset ? (NTSTATUS)offset : -1;
+        ret = write( 2, buffer, count );
+        if (ret <= 0) return offset ? (NTSTATUS)offset : ret;
+        offset += ret;
+        if (ret < count) break;
+    }
+
+    return offset;
 }
 
 /***********************************************************************
@@ -341,12 +362,13 @@ NTSTATUS wow64_get_current_teb( void *args )
     struct
     {
         ULONG teb;
-    } *params32 = args;
+    } params32;
     struct thread_data *data = get_thread_data();
     void *teb = data ? get_wow_teb( data->teb ) : NULL;
 
-    params32->teb = PtrToUlong( teb );
-    return teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    params32.teb = wow64_native_to_guest_addr( teb );
+    if (!teb) return STATUS_UNSUCCESSFUL;
+    return virtual_faulting_copy_to_user( args, &params32, sizeof(params32) );
 }
 
 /***********************************************************************

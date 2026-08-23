@@ -2439,8 +2439,40 @@ typedef enum _MEMORY_INFORMATION_CLASS {
     MemoryWineLoadUnixLibByName,
     MemoryWineLoadUnixLibByNameWow64,
     MemoryWineUnloadUnixLib,
+    MemoryWineWow64TranslatedInformation,
+    MemoryWineProcessVmMachineInformation,
+    MemoryWineTranslatedViewInformation,
 #endif
 } MEMORY_INFORMATION_CLASS;
+
+#ifdef __WINESRC__
+#define WINE_PROCESS_VM_INFORMATION_VERSION 1
+#define WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED 0x0001
+
+typedef struct _WINE_PROCESS_VM_INFORMATION
+{
+    ULONG Version;
+    ULONG Size;
+    USHORT Machine;
+    USHORT Flags;
+    ULONG Reserved;
+} WINE_PROCESS_VM_INFORMATION;
+
+#define WINE_TRANSLATED_VIEW_INFORMATION_VERSION 1
+#define WINE_TRANSLATED_VIEW_AMD64_LOW 0x00000001
+
+typedef struct _WINE_TRANSLATED_VIEW_INFORMATION
+{
+    ULONG Version;
+    ULONG Flags;
+    PVOID GuestBase;
+    PVOID HostBase;
+    PVOID AllocationBase;
+    SIZE_T RegionSize;
+    ULONG Protect;
+    ULONG Reserved;
+} WINE_TRANSLATED_VIEW_INFORMATION;
+#endif
 
 typedef struct _MEMORY_SECTION_NAME
 {

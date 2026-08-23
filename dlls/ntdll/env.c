@@ -70,13 +70,14 @@ static void set_wow64_environment( WCHAR **env )
     UNICODE_STRING arch6432_strW = RTL_CONSTANT_STRING( L"PROCESSOR_ARCHITEW6432" );
     UNICODE_STRING valW = { 0, sizeof(buf), buf };
     UNICODE_STRING nameW;
-    USHORT machine = RtlImageNtHeader( NtCurrentTeb()->Peb->ImageBaseAddress )->FileHeader.Machine;
+    USHORT machine;
 
     /* set the PROCESSOR_ARCHITECTURE variable */
 
     RtlSetEnvironmentVariable( env, &arch_strW, get_machine_name( current_machine, &nameW ));
     if (!is_win64 && NtCurrentTeb()->WowTebOffset)
     {
+        machine = RtlImageNtHeader( NtCurrentTeb()->Peb->ImageBaseAddress )->FileHeader.Machine;
         RtlWow64GetProcessMachines( GetCurrentProcess(), NULL, &machine );
         RtlSetEnvironmentVariable( env, &arch6432_strW, get_machine_name( machine, &nameW ));
     }

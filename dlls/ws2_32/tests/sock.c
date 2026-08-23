@@ -40,6 +40,7 @@
 #include <bthdef.h>
 #include <ws2bth.h>
 #include <stdio.h>
+#include "wine/afd.h"
 #include "wine/test.h"
 
 #define MAX_CLIENTS 4      /* Max number of clients */
@@ -8215,6 +8216,658 @@ static DWORD CALLBACK write_watch_thread( void *arg )
     return 0;
 }
 
+static BOOL is_translated_wow64_memory(void)
+{
+    ULONG translated = 0;
+    NTSTATUS status;
+
+    status = NtQueryVirtualMemory( GetCurrentProcess(), NtCurrentTeb(),
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    return !status && translated;
+}
+
+static void test_translated_wow64_recv_protection(void)
+{
+    static const DWORD protections[] = {PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD, 0};
+    SOCKET src, dest;
+    WSAOVERLAPPED ov;
+    WSABUF buf;
+    MEMORY_BASIC_INFORMATION info;
+    DWORD bytes, flags, old_protect, wait_result;
+    fd_set read_set;
+    struct timeval timeout;
+    HANDLE event;
+    char *base, *page;
+    int i, ret;
+
+    if (!is_translated_wow64_memory()) return;
+    tcp_socketpair( &src, &dest );
+    base = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!base, "VirtualAlloc failed %lu\n", GetLastError() );
+    if (!base) goto done;
+    page = base + 0x1000;
+
+    event = CreateEventA( NULL, TRUE, FALSE, NULL );
+    ok( !!event, "CreateEvent failed %lu\n", GetLastError() );
+    if (!event) goto free;
+
+    for (i = 0; i < ARRAY_SIZE(protections); i++)
+    {
+        memset( &ov, 0, sizeof(ov) );
+        ov.hEvent = event;
+        ResetEvent( event );
+        flags = 0;
+        buf.buf = page;
+        buf.len = 1;
+        ret = WSARecv( dest, &buf, 1, NULL, &flags, &ov, NULL );
+        ok( ret == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING,
+            "WSARecv returned %d, error %d\n", ret, WSAGetLastError() );
+
+        if (protections[i])
+            ret = VirtualProtect( page, 0x1000, protections[i], &old_protect );
+        else
+            ret = VirtualFree( page, 0x1000, MEM_DECOMMIT );
+        ok( ret, "memory transition %d failed %lu\n", i, GetLastError() );
+
+        ret = send( src, "x", 1, 0 );
+        ok( ret == 1, "send returned %d, error %d\n", ret, WSAGetLastError() );
+        wait_result = WaitForSingleObject( event, 5000 );
+        ok( wait_result == WAIT_OBJECT_0, "completion wait returned %lu\n", wait_result );
+        bytes = 0xdeadbeef;
+        flags = 0;
+        ret = WSAGetOverlappedResult( dest, &ov, &bytes, FALSE, &flags );
+        ok( !ret && WSAGetLastError() == WSAEFAULT,
+            "WSAGetOverlappedResult returned %d, error %d\n", ret, WSAGetLastError() );
+        ok( !ov.InternalHigh, "iteration %d transferred %Iu bytes\n", i, ov.InternalHigh );
+
+        if (protections[i] == (PAGE_READWRITE | PAGE_GUARD))
+        {
+            ret = VirtualQuery( page, &info, sizeof(info) );
+            ok( ret == sizeof(info), "VirtualQuery returned %d\n", ret );
+            if (ret == sizeof(info))
+                ok( info.Protect & PAGE_GUARD, "guard was consumed, protect %#lx\n", info.Protect );
+        }
+
+        if (protections[i])
+            ret = VirtualProtect( page, 0x1000, PAGE_READWRITE, &old_protect );
+        else
+            ret = !!VirtualAlloc( page, 0x1000, MEM_COMMIT, PAGE_READWRITE );
+        ok( ret, "memory restore %d failed %lu\n", i, GetLastError() );
+        if (wait_result != WAIT_OBJECT_0) break;
+        page[0] = 0;
+        FD_ZERO( &read_set );
+        FD_SET( dest, &read_set );
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        ret = select( 0, &read_set, NULL, NULL, &timeout );
+        ok( ret == 1, "retry select returned %d, error %d\n", ret, WSAGetLastError() );
+        if (ret == 1)
+        {
+            ret = recv( dest, page, 1, 0 );
+            ok( ret == 1 && page[0] == 'x',
+                "retry recv returned %d, byte %#x\n", ret, page[0] );
+        }
+    }
+
+    CloseHandle( event );
+free:
+    VirtualFree( base, 0, MEM_RELEASE );
+done:
+    closesocket( dest );
+    closesocket( src );
+}
+
+static void test_translated_wow64_recv_write_watch(void)
+{
+    UINT (WINAPI *pGetWriteWatch)(DWORD,LPVOID,SIZE_T,LPVOID*,ULONG_PTR*,ULONG*);
+    WSAOVERLAPPED ov = {0};
+    void *results[8];
+    SOCKET src, dest;
+    WSABUF bufs[3];
+    ULONG_PTR count;
+    ULONG granularity;
+    DWORD bytes, flags, wait_result;
+    HANDLE event;
+    char *base = NULL;
+    int ret;
+
+    if (!is_translated_wow64_memory()) return;
+    pGetWriteWatch = (void *)GetProcAddress( GetModuleHandleA("kernel32.dll"), "GetWriteWatch" );
+    if (!pGetWriteWatch)
+    {
+        win_skip( "GetWriteWatch is unavailable\n" );
+        return;
+    }
+
+    tcp_socketpair( &src, &dest );
+    base = VirtualAlloc( NULL, 0x30000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                         PAGE_READWRITE );
+    ok( !!base, "VirtualAlloc failed %lu\n", GetLastError() );
+    if (!base) goto done;
+    memset( base, 0xcc, 0x30000 );
+    count = ARRAY_SIZE(results);
+    ret = pGetWriteWatch( WRITE_WATCH_FLAG_RESET, base, 0x30000,
+                          results, &count, &granularity );
+    ok( !ret, "GetWriteWatch failed %lu\n", GetLastError() );
+
+    bufs[0].buf = base;
+    bufs[1].buf = base + 0x10000;
+    bufs[2].buf = base + 0x20000;
+    bufs[0].len = bufs[1].len = bufs[2].len = 4;
+    event = CreateEventA( NULL, TRUE, FALSE, NULL );
+    ok( !!event, "CreateEvent failed %lu\n", GetLastError() );
+    if (!event) goto free;
+    ov.hEvent = event;
+    flags = 0;
+    ret = WSARecv( dest, bufs, ARRAY_SIZE(bufs), NULL, &flags, &ov, NULL );
+    ok( ret == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING,
+        "WSARecv returned %d, error %d\n", ret, WSAGetLastError() );
+
+    count = ARRAY_SIZE(results);
+    ret = pGetWriteWatch( WRITE_WATCH_FLAG_RESET, base, 0x30000,
+                          results, &count, &granularity );
+    ok( !ret, "GetWriteWatch reset failed %lu\n", GetLastError() );
+    ret = send( src, "abcdef", 6, 0 );
+    ok( ret == 6, "send returned %d, error %d\n", ret, WSAGetLastError() );
+    wait_result = WaitForSingleObject( event, 5000 );
+    ok( wait_result == WAIT_OBJECT_0, "completion wait returned %lu\n", wait_result );
+    bytes = 0;
+    flags = 0;
+    ret = WSAGetOverlappedResult( dest, &ov, &bytes, FALSE, &flags );
+    ok( ret, "WSAGetOverlappedResult failed %d\n", WSAGetLastError() );
+    ok( bytes == 6, "transferred %lu bytes\n", bytes );
+    ok( !memcmp( base, "abcd", 4 ), "first buffer mismatch\n" );
+    ok( !memcmp( base + 0x10000, "ef", 2 ) && base[0x10002] == (char)0xcc &&
+        base[0x10003] == (char)0xcc, "second buffer mismatch\n" );
+    ok( base[0x20000] == (char)0xcc, "third buffer was modified\n" );
+
+    count = ARRAY_SIZE(results);
+    ret = pGetWriteWatch( 0, base, 0x30000, results, &count, &granularity );
+    ok( !ret, "GetWriteWatch failed %lu\n", GetLastError() );
+    ok( count == 2, "reported %Iu dirty pages\n", count );
+    if (count >= 2)
+    {
+        ok( results[0] == base, "first dirty page %p\n", results[0] );
+        ok( results[1] == base + 0x10000, "second dirty page %p\n", results[1] );
+    }
+
+    CloseHandle( event );
+free:
+    VirtualFree( base, 0, MEM_RELEASE );
+done:
+    closesocket( dest );
+    closesocket( src );
+}
+
+static void test_translated_wow64_send_protection(void)
+{
+    static const char noaccess_message[] = "x";
+    SOCKET sender = INVALID_SOCKET;
+    SOCKET receiver = INVALID_SOCKET;
+    char *base = NULL, *lane;
+    WSABUF buf;
+    struct sockaddr_in addr;
+    char recv_buffer[16];
+    DWORD err, bytes_sent, old_protect;
+    int addr_len, ret;
+
+    if (!is_translated_wow64_memory()) return;
+
+    sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ok(sender != INVALID_SOCKET, "failed to create sender socket, error %d\n", WSAGetLastError());
+    receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ok(receiver != INVALID_SOCKET, "failed to create receiver socket, error %d\n", WSAGetLastError());
+    if (sender == INVALID_SOCKET || receiver == INVALID_SOCKET)
+        goto done;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr_len = sizeof(addr);
+    ret = bind(receiver, (struct sockaddr *)&addr, sizeof(addr));
+    ok(!ret, "bind() failed, error %d\n", WSAGetLastError());
+    ret = getsockname(receiver, (struct sockaddr *)&addr, &addr_len);
+    ok(!ret, "getsockname() failed, error %d\n", WSAGetLastError());
+    ret = connect(sender, (struct sockaddr *)&addr, addr_len);
+    ok(!ret, "connect() failed, error %d\n", WSAGetLastError());
+
+    ret = set_blocking(receiver, FALSE);
+    ok(!ret, "set_blocking() failed, error %d\n", WSAGetLastError());
+
+    base = VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(!!base, "VirtualAlloc failed %d\n", WSAGetLastError());
+    if (!base)
+        goto done;
+
+    memset(base, 'A', 0x2000);
+    lane = base + 0x1000;
+
+    ret = send(sender, base, sizeof(noaccess_message), 0);
+    ok(ret == sizeof(noaccess_message), "baseline send() failed %d, error %d\n", ret, WSAGetLastError());
+    ret = recv(receiver, recv_buffer, sizeof(recv_buffer), 0);
+    ok(ret == sizeof(noaccess_message),
+       "baseline receive failed, error %d\n", WSAGetLastError());
+    ret = recv(receiver, recv_buffer, sizeof(recv_buffer), 0);
+    ok(ret == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK,
+       "extra datagram should not be present (%d, %d)\n", ret, WSAGetLastError());
+
+    ret = VirtualProtect(lane, 0x1000, PAGE_NOACCESS, &old_protect);
+    ok(ret, "VirtualProtect failed to set no-access lane %d\n", WSAGetLastError());
+
+    WSASetLastError(0xdeadbeef);
+    ret = send(sender, lane, sizeof(noaccess_message), 0);
+    err = WSAGetLastError();
+    ok(ret == SOCKET_ERROR && err == WSAEFAULT,
+       "send() in no-access lane failed with %d/%lu\n", ret, err);
+
+    WSASetLastError(0xdeadbeef);
+    ret = recv(receiver, recv_buffer, sizeof(recv_buffer), 0);
+    ok(ret == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK,
+       "send() from no-access lane leaked datagram (%d, %d)\n", ret, WSAGetLastError());
+
+    buf.buf = lane;
+    buf.len = sizeof(noaccess_message);
+    WSASetLastError(0xdeadbeef);
+    bytes_sent = 0xdeadbeef;
+    ret = WSASend(sender, &buf, 1, &bytes_sent, 0, NULL, NULL);
+    err = WSAGetLastError();
+    ok(ret == SOCKET_ERROR && err == WSAEFAULT,
+       "WSASend() in no-access lane failed with %d/%lu\n", ret, err);
+
+    ret = VirtualProtect(lane, 0x1000, PAGE_READWRITE, &old_protect);
+    ok(ret, "VirtualProtect restore failed %d\n", WSAGetLastError());
+
+    ret = VirtualFree(lane, 0x1000, MEM_DECOMMIT);
+    ok(ret, "VirtualFree failed %d\n", WSAGetLastError());
+
+    WSASetLastError(0xdeadbeef);
+    ret = send(sender, lane, sizeof(noaccess_message), 0);
+    err = WSAGetLastError();
+    ok(ret == SOCKET_ERROR && err == WSAEFAULT,
+       "send() in decommitted lane failed with %d/%lu\n", ret, err);
+
+    WSASetLastError(0xdeadbeef);
+    ret = recv(receiver, recv_buffer, sizeof(recv_buffer), 0);
+    ok(ret == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK,
+       "send() from decommitted lane leaked datagram (%d, %d)\n", ret, WSAGetLastError());
+
+    WSASetLastError(0xdeadbeef);
+    bytes_sent = 0xdeadbeef;
+    ret = WSASend(sender, &buf, 1, &bytes_sent, 0, NULL, NULL);
+    err = WSAGetLastError();
+    ok(ret == SOCKET_ERROR && err == WSAEFAULT,
+       "WSASend() in decommitted lane failed with %d/%lu\n", ret, err);
+
+    WSASetLastError(0xdeadbeef);
+    ret = recv(receiver, recv_buffer, sizeof(recv_buffer), 0);
+    ok(ret == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK,
+       "WSASend() from decommitted lane leaked datagram (%d, %d)\n", ret, WSAGetLastError());
+
+done:
+    if (base)
+        VirtualFree(base, 0, MEM_RELEASE);
+    if (receiver != INVALID_SOCKET)
+        closesocket(receiver);
+    if (sender != INVALID_SOCKET)
+        closesocket(sender);
+}
+
+static void test_translated_wow64_wsarecvmsg_protection(void)
+{
+    UINT (WINAPI *pGetWriteWatch)(DWORD,LPVOID,SIZE_T,LPVOID*,ULONG_PTR*,ULONG*);
+    LPFN_WSARECVMSG pWSARecvMsg = NULL;
+    static const char *const fault_names[] = {"control", "name", "flags"};
+    SOCKET sender = INVALID_SOCKET;
+    SOCKET receiver = INVALID_SOCKET;
+    char recvmsg_data[] = "recv";
+    struct afd_recvmsg_params params;
+    struct sockaddr_in addr;
+    WSAOVERLAPPED ov = {0};
+    IO_STATUS_BLOCK iosb;
+    WSAMSG local_hdr, *hdr;
+    WSABUF buf;
+    void *results[8];
+    DWORD err, old_protect, bytes, completion_flags, on = 1, wait_result;
+    ULONG_PTR count;
+    ULONG granularity;
+    ULONG ws_flags;
+    NTSTATUS status;
+    int *output_addr_len;
+    int addr_len, i, ret;
+    char *base = NULL;
+
+    if (!is_translated_wow64_memory()) return;
+
+    sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ok(sender != INVALID_SOCKET, "failed to create sender socket, error %d\n", WSAGetLastError());
+    receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ok(receiver != INVALID_SOCKET, "failed to create receiver socket, error %d\n", WSAGetLastError());
+    if (sender == INVALID_SOCKET || receiver == INVALID_SOCKET)
+        goto done;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr_len = sizeof(addr);
+    ret = bind(receiver, (struct sockaddr *)&addr, sizeof(addr));
+    ok(!ret, "bind() failed, error %d\n", WSAGetLastError());
+    ret = getsockname(receiver, (struct sockaddr *)&addr, &addr_len);
+    ok(!ret, "getsockname() failed, error %d\n", WSAGetLastError());
+    ret = connect(sender, (struct sockaddr *)&addr, addr_len);
+    ok(!ret, "connect() failed, error %d\n", WSAGetLastError());
+    ret = setsockopt(receiver, IPPROTO_IP, IP_PKTINFO, (const char *)&on, sizeof(on));
+    ok(!ret, "failed to enable IP_PKTINFO, error %d\n", WSAGetLastError());
+
+    pGetWriteWatch = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetWriteWatch");
+    if (!pGetWriteWatch)
+    {
+        win_skip("GetWriteWatch is unavailable\n");
+        base = VirtualAlloc(NULL, 0x7000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        ok(!!base, "VirtualAlloc failed %lu\n", GetLastError());
+    }
+    else
+    {
+        base = VirtualAlloc(NULL, 0x7000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+        ok(!!base, "VirtualAlloc failed %lu\n", GetLastError());
+    }
+    if (!base)
+        goto done;
+
+    memset(base, 0x55, 0x7000);
+
+    buf.buf = base;
+    buf.len = sizeof(recvmsg_data);
+
+    if (pGetWriteWatch)
+    {
+        count = ARRAY_SIZE(results);
+        ret = pGetWriteWatch(WRITE_WATCH_FLAG_RESET, base, 0x1000, results, &count, &granularity);
+        ok(!ret, "GetWriteWatch failed %lu\n", GetLastError());
+        count = ARRAY_SIZE(results);
+        ret = pGetWriteWatch(WRITE_WATCH_FLAG_RESET, base + 0x6000, 0x1000, results, &count, &granularity);
+        ok(!ret, "GetWriteWatch failed %lu\n", GetLastError());
+    }
+
+    ret = WSAIoctl(receiver, SIO_GET_EXTENSION_FUNCTION_POINTER, &WSARecvMsg_GUID, sizeof(WSARecvMsg_GUID),
+                   &pWSARecvMsg, sizeof(pWSARecvMsg), &bytes, NULL, NULL);
+    ok(!ret, "failed to get WSARecvMsg, error %d\n", WSAGetLastError());
+    if (ret)
+        goto done;
+
+    ov.hEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+    ok(ov.hEvent != NULL, "CreateEventA failed %lu\n", GetLastError());
+    if (!ov.hEvent)
+        goto done;
+
+    for (i = 0; i < ARRAY_SIZE(fault_names); ++i)
+    {
+        memset(&ov, 0, offsetof(WSAOVERLAPPED, hEvent));
+        ResetEvent(ov.hEvent);
+        if (i == 2)
+            hdr = (WSAMSG *)(base + 0x5000 - offsetof(WSAMSG, dwFlags));
+        else
+            hdr = &local_hdr;
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->lpBuffers = &buf;
+        hdr->dwBufferCount = 1;
+        hdr->dwFlags = 0x55aa55aa;
+        if (!i)
+        {
+            hdr->Control.buf = base + 0x1000;
+            hdr->Control.len = 0x40;
+        }
+        else if (i == 1)
+        {
+            hdr->name = (struct sockaddr *)(base + 0x2000);
+            hdr->namelen = sizeof(struct sockaddr_in);
+        }
+
+        WSASetLastError(0xdeadbeef);
+        ret = pWSARecvMsg(receiver, hdr, NULL, &ov, NULL);
+        err = WSAGetLastError();
+        ok(ret != 0 && err == WSA_IO_PENDING,
+           "%s WSARecvMsg() returned %d with error %lu\n", fault_names[i], ret, err);
+        if (!ret || err != WSA_IO_PENDING) break;
+
+        ret = VirtualProtect(base + (i == 2 ? 0x5000 : (i + 1) * 0x1000),
+                             0x1000, PAGE_NOACCESS, &old_protect);
+        ok(ret, "failed to make %s output inaccessible %lu\n", fault_names[i], GetLastError());
+
+        ret = send(sender, recvmsg_data, sizeof(recvmsg_data), 0);
+        ok(ret == sizeof(recvmsg_data), "send() failed %d, error %d\n", ret, WSAGetLastError());
+        wait_result = WaitForSingleObject(ov.hEvent, 5000);
+        ok(wait_result == WAIT_OBJECT_0, "%s completion wait returned %lu\n",
+           fault_names[i], wait_result);
+
+        bytes = 0xdeadbeef;
+        completion_flags = 0xdeadc0de;
+        ret = WSAGetOverlappedResult(receiver, &ov, &bytes, FALSE, &completion_flags);
+        err = WSAGetLastError();
+        ok(!ret && err == WSAEFAULT,
+           "%s WSAGetOverlappedResult returned %d, error %lu\n", fault_names[i], ret, err);
+        ok(!bytes, "%s completion transferred %lu bytes\n", fault_names[i], bytes);
+        ok(!completion_flags, "%s completion flags are %#lx\n", fault_names[i], completion_flags);
+
+        ret = VirtualProtect(base + (i == 2 ? 0x5000 : (i + 1) * 0x1000),
+                             0x1000, PAGE_READWRITE, &old_protect);
+        ok(ret, "failed to restore %s output %lu\n", fault_names[i], GetLastError());
+        if (wait_result != WAIT_OBJECT_0) break;
+        ok(hdr->dwFlags == 0x55aa55aa, "%s flags changed to %#lx\n",
+           fault_names[i], hdr->dwFlags);
+        if (!i)
+            ok(hdr->Control.len == 0x40 && base[0x1000] == 0x55,
+               "control metadata was partially written\n");
+        else if (i == 1)
+            ok(hdr->namelen == sizeof(struct sockaddr_in) && base[0x2000] == 0x55,
+               "name metadata was partially written\n");
+    }
+
+    /* WSARecvMsg keeps namelen as a nested output pointer.  Exercise the
+     * lower AFD contract directly so the always-present Control descriptor
+     * in WSAMSG cannot mask an inaccessible namelen field. */
+    memset(&params, 0, sizeof(params));
+    memset(&iosb, 0, sizeof(iosb));
+    ws_flags = 0;
+    output_addr_len = (int *)(base + 0x3000);
+    *output_addr_len = sizeof(struct sockaddr_in);
+    params.addr_ptr = PtrToUlong(base + 0x2000);
+    params.addr_len_ptr = PtrToUlong(output_addr_len);
+    params.ws_flags_ptr = PtrToUlong(&ws_flags);
+    params.force_async = TRUE;
+    params.count = 1;
+    params.buffers_ptr = PtrToUlong(&buf);
+    ResetEvent(ov.hEvent);
+    iosb.Status = STATUS_PENDING;
+    status = NtDeviceIoControlFile((HANDLE)receiver, ov.hEvent, NULL, NULL, &iosb,
+                                   IOCTL_AFD_WINE_RECVMSG, &params, sizeof(params), NULL, 0);
+    ok(status == STATUS_PENDING, "namelen receive returned %#lx\n", status);
+    if (status == STATUS_PENDING)
+    {
+        ret = VirtualProtect(output_addr_len, 0x1000, PAGE_NOACCESS, &old_protect);
+        ok(ret, "failed to make namelen inaccessible %lu\n", GetLastError());
+        ret = send(sender, recvmsg_data, sizeof(recvmsg_data), 0);
+        ok(ret == sizeof(recvmsg_data), "send() failed %d, error %d\n", ret, WSAGetLastError());
+        ret = WaitForSingleObject(ov.hEvent, 5000);
+        ok(ret == WAIT_OBJECT_0, "namelen completion wait returned %d\n", ret);
+        ret = VirtualProtect(output_addr_len, 0x1000, PAGE_READWRITE, &old_protect);
+        ok(ret, "failed to restore namelen %lu\n", GetLastError());
+        ok(iosb.Status == STATUS_ACCESS_VIOLATION && !iosb.Information,
+           "namelen completion returned %#lx/%Iu\n", iosb.Status, iosb.Information);
+        ok(*output_addr_len == sizeof(struct sockaddr_in) && base[0x2000] == 0x55,
+           "name length metadata was partially written\n");
+    }
+
+    if (pGetWriteWatch)
+    {
+        count = ARRAY_SIZE(results);
+        ret = pGetWriteWatch(0, base, 0x1000, results, &count, &granularity);
+        ok(!ret, "GetWriteWatch failed %lu\n", GetLastError());
+        ok(count == 1, "data lane reported %Iu dirty pages\n", count);
+        if (count) ok(results[0] == base, "dirty page is %p, expected %p\n", results[0], base);
+
+        count = ARRAY_SIZE(results);
+        ret = pGetWriteWatch(0, base + 0x6000, 0x1000, results, &count, &granularity);
+        ok(!ret, "GetWriteWatch failed %lu\n", GetLastError());
+        ok(!count, "adjacent lane was written (%Iu pages)\n", count);
+    }
+
+done:
+    if (ov.hEvent)
+        CloseHandle(ov.hEvent);
+    if (base)
+        VirtualFree(base, 0, MEM_RELEASE);
+    if (sender != INVALID_SOCKET)
+        closesocket(sender);
+    if (receiver != INVALID_SOCKET)
+        closesocket(receiver);
+}
+
+static void test_translated_wow64_transmitfile_protection(void)
+{
+    DWORD num_bytes, err;
+    GUID transmitFileGuid = WSAID_TRANSMITFILE;
+    LPFN_TRANSMITFILE pTransmitFile = NULL;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    char head_msg[] = "hello world";
+    char tail_msg[] = "goodbye!!!";
+    char temp_path[MAX_PATH], temp_file[MAX_PATH] = {0};
+    struct sockaddr_in bindAddress;
+    TRANSMIT_FILE_BUFFERS buffers;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET server = INVALID_SOCKET;
+    SOCKET dest = INVALID_SOCKET;
+    char recv_buffer[128];
+    DWORD old_protect;
+    int iret;
+    int len;
+    BOOL bret;
+    char *base = NULL;
+
+    if (!is_translated_wow64_memory()) return;
+
+    client = socket(AF_INET, SOCK_STREAM, 0);
+    ok(client != INVALID_SOCKET, "failed to create client socket, error %d\n", WSAGetLastError());
+    server = socket(AF_INET, SOCK_STREAM, 0);
+    ok(server != INVALID_SOCKET, "failed to create server socket, error %d\n", WSAGetLastError());
+    if (client == INVALID_SOCKET || server == INVALID_SOCKET)
+        goto done;
+
+    iret = WSAIoctl(client, SIO_GET_EXTENSION_FUNCTION_POINTER, &transmitFileGuid, sizeof(transmitFileGuid),
+                    &pTransmitFile, sizeof(pTransmitFile), &num_bytes, NULL, NULL);
+    ok(!iret, "failed to get TransmitFile, error %d\n", WSAGetLastError());
+    if (!pTransmitFile)
+        goto done;
+
+    iret = GetTempPathA( ARRAY_SIZE(temp_path), temp_path );
+    ok( iret && iret < ARRAY_SIZE(temp_path), "GetTempPathA failed %lu\n", GetLastError() );
+    if (!iret || iret >= ARRAY_SIZE(temp_path)) goto done;
+    iret = GetTempFileNameA( temp_path, "wne", 0, temp_file );
+    ok( iret, "GetTempFileNameA failed %lu\n", GetLastError() );
+    if (!iret) goto done;
+    file = CreateFileA( temp_file, GENERIC_READ, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL );
+    ok(file != INVALID_HANDLE_VALUE, "failed to open file, error %lu\n", GetLastError());
+    if (file == INVALID_HANDLE_VALUE)
+        goto done;
+
+    memset(&bindAddress, 0, sizeof(bindAddress));
+    bindAddress.sin_family = AF_INET;
+    bindAddress.sin_port = 0;
+    bindAddress.sin_addr.s_addr = inet_addr("127.0.0.1");
+    iret = bind(server, (struct sockaddr *)&bindAddress, sizeof(bindAddress));
+    ok(!iret, "failed to bind socket, error %d\n", WSAGetLastError());
+    if (iret) goto done;
+    iret = listen(server, 1);
+    ok(!iret, "failed to listen, error %d\n", WSAGetLastError());
+    if (iret) goto done;
+    len = sizeof(bindAddress);
+    iret = getsockname(server, (struct sockaddr *)&bindAddress, &len);
+    ok(!iret, "failed to query server address, error %d\n", WSAGetLastError());
+    if (iret) goto done;
+    iret = connect(client, (struct sockaddr *)&bindAddress, sizeof(bindAddress));
+    ok(!iret, "failed to connect, error %d\n", WSAGetLastError());
+    if (iret) goto done;
+    len = sizeof(bindAddress);
+    dest = accept(server, (struct sockaddr *)&bindAddress, &len);
+    ok(dest != INVALID_SOCKET, "failed to accept, error %d\n", WSAGetLastError());
+    iret = set_blocking(dest, FALSE);
+    ok(!iret, "failed to make destination socket non-blocking, error %d\n", WSAGetLastError());
+
+    base = VirtualAlloc(NULL, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(!!base, "VirtualAlloc failed %lu\n", GetLastError());
+    if (!base)
+        goto close;
+
+    memcpy(base, head_msg, sizeof(head_msg));
+    memcpy(base + 0x2000, tail_msg, sizeof(tail_msg));
+    buffers.Head = base;
+    buffers.HeadLength = sizeof(head_msg);
+    buffers.Tail = base + 0x2000;
+    buffers.TailLength = sizeof(tail_msg);
+
+    iret = VirtualProtect(base, 0x1000, PAGE_NOACCESS, &old_protect);
+    ok(iret, "failed to make head lane no-access %lu\n", GetLastError());
+    WSASetLastError(0xdeadbeef);
+    bret = pTransmitFile(client, file, 0, 0, NULL, &buffers, 0);
+    err = WSAGetLastError();
+    ok(!bret, "TransmitFile succeeded unexpectedly\n");
+    ok(err == WSAEFAULT, "head no-access failed with unexpected error %lu\n", err);
+    WSASetLastError(0xdeadbeef);
+    iret = recv(dest, recv_buffer, sizeof(recv_buffer), 0);
+    ok(iret == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK,
+       "head no-access still delivered data (%d, %d)\n", iret, WSAGetLastError());
+
+    iret = VirtualProtect(base, 0x1000, PAGE_READWRITE, &old_protect);
+    ok(iret, "failed to restore head lane %lu\n", GetLastError());
+    iret = VirtualFree(base, 0x1000, MEM_DECOMMIT);
+    ok(iret, "failed to decommit head lane %lu\n", GetLastError());
+    WSASetLastError(0xdeadbeef);
+    bret = pTransmitFile(client, file, 0, 0, NULL, &buffers, 0);
+    err = WSAGetLastError();
+    ok(!bret, "TransmitFile succeeded unexpectedly\n");
+    ok(err == WSAEFAULT, "decommitted head failed with unexpected error %lu\n", err);
+    WSASetLastError(0xdeadbeef);
+    iret = recv(dest, recv_buffer, sizeof(recv_buffer), 0);
+    ok(iret == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK,
+       "decommitted head still delivered data (%d, %d)\n", iret, WSAGetLastError());
+
+    iret = VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    ok(iret, "failed to restore head lane %lu\n", GetLastError());
+
+    iret = VirtualProtect(base + 0x2000, 0x1000, PAGE_NOACCESS, &old_protect);
+    ok(iret, "failed to make tail lane no-access %lu\n", GetLastError());
+    buffers.TailLength = sizeof(tail_msg);
+    WSASetLastError(0xdeadbeef);
+    bret = pTransmitFile(client, file, 0, 0, NULL, &buffers, 0);
+    err = WSAGetLastError();
+    ok(!bret, "TransmitFile succeeded unexpectedly\n");
+    ok(err == WSAEFAULT, "tail no-access failed with unexpected error %lu\n", err);
+    WSASetLastError(0xdeadbeef);
+    iret = recv(dest, recv_buffer, sizeof(recv_buffer), 0);
+    ok(iret == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK,
+       "tail no-access still delivered data (%d, %d)\n", iret, WSAGetLastError());
+
+    iret = VirtualProtect(base + 0x2000, 0x1000, PAGE_READWRITE, &old_protect);
+    ok(iret, "failed to restore tail lane %lu\n", GetLastError());
+
+close:
+    if (base)
+        VirtualFree(base, 0, MEM_RELEASE);
+
+done:
+    if (dest != INVALID_SOCKET)
+        closesocket(dest);
+    if (server != INVALID_SOCKET)
+        closesocket(server);
+    if (client != INVALID_SOCKET)
+        closesocket(client);
+    if (file != INVALID_HANDLE_VALUE)
+        CloseHandle(file);
+    else if (temp_file[0])
+        DeleteFileA(temp_file);
+}
+
 static void test_write_watch(void)
 {
     SOCKET src, dest;
@@ -15136,6 +15789,504 @@ static void test_afunix(void)
     test_afunix_path( path );
 }
 
+struct wow64_dns_getaddrinfo_params
+{
+    ULONG node;
+    ULONG service;
+    ULONG hints;
+    ULONG info;
+    ULONG size;
+};
+
+struct wow64_dns_gethostbyaddr_params
+{
+    ULONG addr;
+    int len;
+    int family;
+    ULONG host;
+    ULONG size;
+};
+
+struct wow64_dns_gethostbyname_params
+{
+    ULONG name;
+    ULONG host;
+    ULONG size;
+};
+
+struct wow64_dns_gethostname_params
+{
+    ULONG name;
+    unsigned int size;
+};
+
+struct wow64_dns_getnameinfo_params
+{
+    ULONG addr;
+    int addr_len;
+    ULONG host;
+    DWORD host_len;
+    ULONG serv;
+    DWORD serv_len;
+    unsigned int flags;
+};
+
+struct wow64_dns_addrinfo32
+{
+    int ai_flags;
+    int ai_family;
+    int ai_socktype;
+    int ai_protocol;
+    ULONG ai_addrlen;
+    ULONG ai_canonname;
+    ULONG ai_addr;
+    ULONG ai_next;
+};
+
+struct wow64_dns_hostent32
+{
+    ULONG h_name;
+    ULONG h_aliases;
+    short h_addrtype;
+    short h_length;
+    ULONG h_addr_list;
+};
+
+C_ASSERT(sizeof(struct wow64_dns_getaddrinfo_params) == 20);
+C_ASSERT(sizeof(struct wow64_dns_gethostbyaddr_params) == 20);
+C_ASSERT(sizeof(struct wow64_dns_gethostbyname_params) == 12);
+C_ASSERT(sizeof(struct wow64_dns_gethostname_params) == 8);
+C_ASSERT(sizeof(struct wow64_dns_getnameinfo_params) == 28);
+C_ASSERT(sizeof(struct wow64_dns_addrinfo32) == 32);
+C_ASSERT(sizeof(struct wow64_dns_hostent32) == 16);
+
+static BOOL wow64_dns_buffer_is_filled(const void *buffer, SIZE_T size, BYTE value)
+{
+    const BYTE *bytes = buffer;
+    SIZE_T i;
+
+    for (i = 0; i < size; ++i)
+        if (bytes[i] != value) return FALSE;
+    return TRUE;
+}
+
+static unsigned int wow64_dns_check_addrinfo_chain(const BYTE *buffer, ULONG size)
+{
+    ULONG base = PtrToUlong(buffer), offset = 0;
+    unsigned int count = 0;
+
+    for (;;)
+    {
+        struct wow64_dns_addrinfo32 entry;
+        const BYTE *nul;
+        ULONG next;
+        USHORT family;
+
+        ok(offset <= size && size - offset >= sizeof(entry),
+           "addrinfo record %u at %#lx exceeds packed size %#lx\n", count, offset, size);
+        if (offset > size || size - offset < sizeof(entry)) return 0;
+        memcpy(&entry, buffer + offset, sizeof(entry));
+        next = offset + sizeof(entry);
+
+        ok(entry.ai_family == AF_INET || entry.ai_family == AF_INET6,
+           "addrinfo record %u has unexpected family %d\n", count, entry.ai_family);
+        if (entry.ai_family != AF_INET && entry.ai_family != AF_INET6) return 0;
+
+        if (entry.ai_canonname)
+        {
+            ok(entry.ai_canonname == base + next,
+               "addrinfo record %u canonname %#lx, expected %#lx\n",
+               count, entry.ai_canonname, base + next);
+            if (entry.ai_canonname != base + next) return 0;
+            nul = memchr(buffer + next, 0, size - next);
+            ok(!!nul, "addrinfo record %u canonname is unterminated\n", count);
+            if (!nul) return 0;
+            next = nul - buffer + 1;
+        }
+
+        ok(entry.ai_addr == base + next,
+           "addrinfo record %u address %#lx, expected %#lx\n",
+           count, entry.ai_addr, base + next);
+        if (entry.ai_addr != base + next) return 0;
+        ok(entry.ai_addrlen <= size - next,
+           "addrinfo record %u address length %#lx exceeds packed size %#lx\n",
+           count, entry.ai_addrlen, size);
+        if (entry.ai_addrlen > size - next) return 0;
+        ok((entry.ai_family == AF_INET && entry.ai_addrlen == sizeof(struct sockaddr_in)) ||
+           (entry.ai_family == AF_INET6 && entry.ai_addrlen == sizeof(struct sockaddr_in6)),
+           "addrinfo record %u family %d has address length %#lx\n",
+           count, entry.ai_family, entry.ai_addrlen);
+        if (entry.ai_addrlen < sizeof(family)) return 0;
+        memcpy(&family, buffer + next, sizeof(family));
+        ok(family == entry.ai_family,
+           "addrinfo record %u family %d has sockaddr family %u\n",
+           count, entry.ai_family, family);
+        next += entry.ai_addrlen;
+        ++count;
+
+        if (!entry.ai_next)
+        {
+            ok(next == size, "addrinfo packed extent %#lx, expected %#lx\n", next, size);
+            return next == size ? count : 0;
+        }
+        ok(entry.ai_next == base + next,
+           "addrinfo record %u next %#lx, expected %#lx\n", count - 1, entry.ai_next, base + next);
+        if (entry.ai_next != base + next || count > size / sizeof(entry)) return 0;
+        offset = next;
+    }
+}
+
+static void test_translated_wow64_dns_marshalling(void)
+{
+    enum
+    {
+        unix_getaddrinfo,
+        unix_gethostbyaddr,
+        unix_gethostbyname,
+        unix_gethostname,
+        unix_getnameinfo,
+    };
+    NTSTATUS (WINAPI **dispatcher_ptr)(UINT64, unsigned int, void *);
+    NTSTATUS (WINAPI *dispatcher)(UINT64, unsigned int, void *);
+    struct wow64_dns_getnameinfo_params *cross_nameinfo;
+    struct wow64_dns_getnameinfo_params nameinfo_params;
+    struct wow64_dns_gethostbyaddr_params hostbyaddr_params;
+    struct wow64_dns_gethostbyname_params hostbyname_params;
+    struct wow64_dns_getaddrinfo_params addrinfo_params;
+    struct wow64_dns_gethostname_params hostname_params;
+    struct wow64_dns_addrinfo32 *addrinfo, *hints;
+    struct wow64_dns_hostent32 *hostent;
+    struct sockaddr_in *sockaddr;
+    ULONG translated = 0, old_protect, addrinfo_needed, host_needed, *result_size;
+    BYTE *memory, *node, *address, *info, *host;
+    char *service, *hostname, *nameinfo_host, *nameinfo_service;
+    UINT64 handle;
+    HMODULE ntdll, ws2;
+    NTSTATUS status;
+    SIZE_T size;
+
+    if (sizeof(void *) != 4)
+    {
+        skip("WoW64 DNS marshalling requires a 32-bit test process\n");
+        return;
+    }
+    status = NtQueryVirtualMemory(GetCurrentProcess(), NtCurrentTeb(),
+                                  MemoryWineWow64TranslatedInformation,
+                                  &translated, sizeof(translated), NULL);
+    if (status || !translated)
+    {
+        skip("WoW64 translated memory is unavailable\n");
+        return;
+    }
+
+    ntdll = GetModuleHandleA("ntdll.dll");
+    ws2 = GetModuleHandleA("ws2_32.dll");
+    dispatcher_ptr = (void *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher");
+    if (!dispatcher_ptr || !(dispatcher = *dispatcher_ptr))
+    {
+        skip("Unix-call dispatcher is unavailable\n");
+        return;
+    }
+    status = NtQueryVirtualMemory(GetCurrentProcess(), ws2, MemoryWineLoadUnixLibWow64,
+                                  &handle, sizeof(handle), NULL);
+    if (status)
+    {
+        skip("ws2_32 WoW64 Unixlib is unavailable, status %#lx\n", status);
+        return;
+    }
+    ok(!!(handle & 0x8000000000000000ULL),
+       "expected tagged ws2_32 Unixlib handle, got %s\n", wine_dbgstr_longlong(handle));
+
+    size = 0x14000;
+    memory = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    if (!memory) memory = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(!!memory, "failed to allocate DNS test memory, error %lu\n", GetLastError());
+    if (!memory) return;
+    memset(memory, 0, size);
+
+    node = memory + 0x1ff8;
+    service = (char *)memory + 0x3000;
+    info = memory + 0x4000;
+    result_size = (ULONG *)(memory + 0x5000);
+    hints = (struct wow64_dns_addrinfo32 *)(memory + 0x6ff0);
+    address = memory + 0x8ffe;
+    host = memory + 0xa000;
+    hostname = (char *)memory + 0xb000;
+    sockaddr = (struct sockaddr_in *)(memory + 0xcff8);
+    nameinfo_host = (char *)memory + 0xe000;
+    nameinfo_service = (char *)memory + 0xf000;
+    cross_nameinfo = (struct wow64_dns_getnameinfo_params *)(memory + 0x10ff0);
+
+    strcpy((char *)node, "127.0.0.1");
+    strcpy(service, "80");
+    memset(hints, 0, sizeof(*hints));
+    hints->ai_flags = AI_NUMERICHOST;
+    hints->ai_family = AF_INET;
+    hints->ai_socktype = SOCK_STREAM;
+    hints->ai_protocol = IPPROTO_TCP;
+    hints->ai_addr = 0xdeadbeef;
+    hints->ai_next = 0xcafebabe;
+
+    memset(&addrinfo_params, 0, sizeof(addrinfo_params));
+    addrinfo_params.node = PtrToUlong(node);
+    addrinfo_params.service = PtrToUlong(service);
+    addrinfo_params.hints = PtrToUlong(hints);
+    addrinfo_params.info = PtrToUlong(info);
+    addrinfo_params.size = PtrToUlong(result_size);
+
+    *result_size = 0x1000;
+    memset(info, 0xcc, 0x1000);
+    ok(VirtualProtect(memory + 0x2000, 0x1000, PAGE_NOACCESS, &old_protect),
+       "failed to protect node tail, error %lu\n", GetLastError());
+    ok(VirtualProtect(memory + 0x7000, 0x1000, PAGE_NOACCESS, &old_protect),
+       "failed to protect ignored hints tail, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+    ok(status == WSAEFAULT, "protected getaddrinfo node returned %#lx\n", status);
+    ok(*result_size == 0x1000 && wow64_dns_buffer_is_filled(info, 0x1000, 0xcc),
+       "failed getaddrinfo changed output or size %lu\n", *result_size);
+
+    node = memory + 0x1ff0;
+    strcpy((char *)node, "127.0.0.1");
+    addrinfo_params.node = PtrToUlong(node);
+    *result_size = 1;
+    status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+    ok(status == ERROR_INSUFFICIENT_BUFFER &&
+       *result_size == sizeof(struct wow64_dns_addrinfo32) + sizeof(struct sockaddr_in),
+       "page-bounded getaddrinfo returned %#lx, guest32 size %lu\n", status, *result_size);
+    ok(wow64_dns_buffer_is_filled(info, 0x1000, 0xcc),
+       "short page-bounded getaddrinfo changed output\n");
+
+    ok(VirtualProtect(memory + 0x2000, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore node tail, error %lu\n", GetLastError());
+
+    node = memory + 0x1ff8;
+    strcpy((char *)node, "127.0.0.1");
+    addrinfo_params.node = PtrToUlong(node);
+    *result_size = sizeof(struct wow64_dns_addrinfo32) + sizeof(struct sockaddr_in);
+    memset(info, 0, 0x1000);
+    status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+    addrinfo = (struct wow64_dns_addrinfo32 *)info;
+    ok(!status && addrinfo->ai_family == AF_INET,
+       "exact guest32 getaddrinfo returned %#lx, family %d\n", status, addrinfo->ai_family);
+
+    *result_size = 0x1000;
+    memset(info, 0xcc, 0x1000);
+    ok(VirtualProtect(info, 0x1000, PAGE_READONLY, &old_protect),
+       "failed to protect addrinfo output, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+    ok(status == WSAEFAULT, "readonly getaddrinfo output returned %#lx\n", status);
+    ok(wow64_dns_buffer_is_filled(info, 0x1000, 0xcc),
+       "readonly getaddrinfo changed output\n");
+    ok(VirtualProtect(info, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore addrinfo output, error %lu\n", GetLastError());
+    memset(info, 0, 0x1000);
+    status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+    addrinfo = (struct wow64_dns_addrinfo32 *)info;
+    ok(!status && addrinfo->ai_family == AF_INET,
+       "valid getaddrinfo returned %#lx, family %d\n", status, addrinfo->ai_family);
+    ok(addrinfo->ai_addr >= PtrToUlong(info) && addrinfo->ai_addr < PtrToUlong(info + 0x1000),
+       "getaddrinfo serialized native address %#lx\n", addrinfo->ai_addr);
+    ok(!addrinfo->ai_next ||
+       (addrinfo->ai_next >= PtrToUlong(info) && addrinfo->ai_next < PtrToUlong(info + 0x1000)),
+       "getaddrinfo serialized native next %#lx\n", addrinfo->ai_next);
+    ok(VirtualProtect(memory + 0x7000, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore hints tail, error %lu\n", GetLastError());
+
+    strcpy((char *)node, "localhost");
+    hints->ai_flags = AI_CANONNAME;
+    hints->ai_family = AF_UNSPEC;
+    *result_size = 1;
+    memset(info, 0xcc, 0x1000);
+    status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+    addrinfo_needed = *result_size;
+    ok(status == ERROR_INSUFFICIENT_BUFFER && addrinfo_needed > sizeof(*addrinfo) &&
+       addrinfo_needed <= 0x1000 - 16,
+       "short localhost getaddrinfo returned %#lx, guest32 size %lu\n",
+       status, addrinfo_needed);
+    ok(wow64_dns_buffer_is_filled(info, 0x1000, 0xcc),
+       "short localhost getaddrinfo changed output\n");
+    if (status == ERROR_INSUFFICIENT_BUFFER && addrinfo_needed > sizeof(*addrinfo) &&
+        addrinfo_needed <= 0x1000 - 16)
+    {
+        *result_size = addrinfo_needed - 1;
+        status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+        ok(status == ERROR_INSUFFICIENT_BUFFER && *result_size == addrinfo_needed,
+           "required-1 localhost getaddrinfo returned %#lx, size %lu\n", status, *result_size);
+        ok(wow64_dns_buffer_is_filled(info, 0x1000, 0xcc),
+           "required-1 localhost getaddrinfo changed output\n");
+
+        *result_size = addrinfo_needed;
+        status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+        ok(!status && *result_size == addrinfo_needed,
+           "exact localhost getaddrinfo returned %#lx, size %lu\n", status, *result_size);
+        ok(wow64_dns_check_addrinfo_chain(info, addrinfo_needed) != 0,
+           "exact localhost getaddrinfo returned an invalid packed chain\n");
+        ok(wow64_dns_buffer_is_filled(info + addrinfo_needed, 16, 0xcc),
+           "exact localhost getaddrinfo overwrote the trailing sentinel\n");
+
+        *result_size = addrinfo_needed + 16;
+        memset(info, 0xcc, 0x1000);
+        status = dispatcher(handle, unix_getaddrinfo, &addrinfo_params);
+        ok(!status && *result_size == addrinfo_needed + 16,
+           "extended localhost getaddrinfo returned %#lx, size %lu\n", status, *result_size);
+        ok(wow64_dns_check_addrinfo_chain(info, addrinfo_needed) != 0,
+           "extended localhost getaddrinfo returned an invalid packed chain\n");
+        ok(wow64_dns_buffer_is_filled(info + addrinfo_needed, 16, 0xcc),
+           "extended localhost getaddrinfo overwrote the trailing sentinel\n");
+    }
+
+    address[0] = 127;
+    address[1] = 0;
+    address[2] = 0;
+    address[3] = 1;
+    memset(&hostbyaddr_params, 0, sizeof(hostbyaddr_params));
+    hostbyaddr_params.addr = PtrToUlong(address);
+    hostbyaddr_params.len = 4;
+    hostbyaddr_params.family = AF_INET;
+    hostbyaddr_params.host = PtrToUlong(host);
+    hostbyaddr_params.size = PtrToUlong(result_size);
+    *result_size = 0x1000;
+    memset(host, 0xcc, 0x1000);
+    ok(VirtualProtect(memory + 0x9000, 0x1000, PAGE_NOACCESS, &old_protect),
+       "failed to protect address tail, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_gethostbyaddr, &hostbyaddr_params);
+    ok(status == WSAEFAULT, "protected gethostbyaddr returned %#lx\n", status);
+    ok(wow64_dns_buffer_is_filled(host, 0x1000, 0xcc),
+       "failed gethostbyaddr changed output\n");
+    ok(VirtualProtect(memory + 0x9000, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore address tail, error %lu\n", GetLastError());
+
+    *result_size = 1;
+    status = dispatcher(handle, unix_gethostbyaddr, &hostbyaddr_params);
+    host_needed = *result_size;
+    ok(status == ERROR_INSUFFICIENT_BUFFER && host_needed > sizeof(*hostent),
+       "short gethostbyaddr returned %#lx, guest32 size %lu\n", status, host_needed);
+    ok(wow64_dns_buffer_is_filled(host, 0x1000, 0xcc),
+       "short gethostbyaddr changed output\n");
+    *result_size = host_needed;
+    memset(host, 0, 0x1000);
+    status = dispatcher(handle, unix_gethostbyaddr, &hostbyaddr_params);
+    hostent = (struct wow64_dns_hostent32 *)host;
+    ok(!status && hostent->h_addrtype == AF_INET,
+       "exact guest32 gethostbyaddr returned %#lx, family %d\n", status, hostent->h_addrtype);
+
+    *result_size = 0x1000;
+    memset(host, 0xcc, 0x1000);
+    ok(VirtualProtect(host, 0x1000, PAGE_READONLY, &old_protect),
+       "failed to protect hostent output, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_gethostbyaddr, &hostbyaddr_params);
+    ok(status == WSAEFAULT, "readonly gethostbyaddr output returned %#lx\n", status);
+    ok(wow64_dns_buffer_is_filled(host, 0x1000, 0xcc),
+       "readonly gethostbyaddr changed output\n");
+    ok(VirtualProtect(host, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore hostent output, error %lu\n", GetLastError());
+    memset(host, 0, 0x1000);
+    status = dispatcher(handle, unix_gethostbyaddr, &hostbyaddr_params);
+    hostent = (struct wow64_dns_hostent32 *)host;
+    ok(!status && hostent->h_addrtype == AF_INET,
+       "valid gethostbyaddr returned %#lx, family %d\n", status, hostent->h_addrtype);
+    ok(hostent->h_name >= PtrToUlong(host) && hostent->h_name < PtrToUlong(host + 0x1000) &&
+       hostent->h_addr_list >= PtrToUlong(host) && hostent->h_addr_list < PtrToUlong(host + 0x1000),
+       "gethostbyaddr serialized native pointers %#lx, %#lx\n",
+       hostent->h_name, hostent->h_addr_list);
+
+    strcpy((char *)node, "localhost");
+    memset(&hostbyname_params, 0, sizeof(hostbyname_params));
+    hostbyname_params.name = PtrToUlong(node);
+    hostbyname_params.host = PtrToUlong(host);
+    hostbyname_params.size = PtrToUlong(result_size);
+    *result_size = 0x1000;
+    memset(host, 0xcc, 0x1000);
+    ok(VirtualProtect(memory + 0x2000, 0x1000, PAGE_NOACCESS, &old_protect),
+       "failed to protect hostname tail, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_gethostbyname, &hostbyname_params);
+    ok(status == WSAEFAULT, "protected gethostbyname returned %#lx\n", status);
+    ok(wow64_dns_buffer_is_filled(host, 0x1000, 0xcc),
+       "failed gethostbyname changed output\n");
+    ok(VirtualProtect(memory + 0x2000, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore hostname tail, error %lu\n", GetLastError());
+    memset(host, 0, 0x1000);
+    status = dispatcher(handle, unix_gethostbyname, &hostbyname_params);
+    hostent = (struct wow64_dns_hostent32 *)host;
+    ok(!status && hostent->h_name >= PtrToUlong(host) &&
+       hostent->h_name < PtrToUlong(host + 0x1000),
+       "valid gethostbyname returned %#lx, name %#lx\n", status, hostent->h_name);
+
+    memset(&hostname_params, 0, sizeof(hostname_params));
+    hostname_params.name = PtrToUlong(hostname);
+    hostname_params.size = 256;
+    memset(hostname, 0xcc, 256);
+    ok(VirtualProtect(hostname, 0x1000, PAGE_READONLY, &old_protect),
+       "failed to protect gethostname output, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_gethostname, &hostname_params);
+    ok(status == WSAEFAULT, "readonly gethostname output returned %#lx\n", status);
+    ok(wow64_dns_buffer_is_filled(hostname, 256, 0xcc),
+       "readonly gethostname changed output\n");
+    ok(VirtualProtect(hostname, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore gethostname output, error %lu\n", GetLastError());
+    memset(hostname, 0, 256);
+    status = dispatcher(handle, unix_gethostname, &hostname_params);
+    ok(!status && hostname[0], "valid gethostname returned %#lx, name %s\n",
+       status, debugstr_a(hostname));
+
+    memset(sockaddr, 0, sizeof(*sockaddr));
+    sockaddr->sin_family = AF_INET;
+    sockaddr->sin_port = htons(80);
+    sockaddr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    memset(&nameinfo_params, 0, sizeof(nameinfo_params));
+    nameinfo_params.addr = PtrToUlong(sockaddr);
+    nameinfo_params.addr_len = sizeof(*sockaddr);
+    nameinfo_params.host = PtrToUlong(nameinfo_host);
+    nameinfo_params.host_len = 64;
+    nameinfo_params.serv = PtrToUlong(nameinfo_service);
+    nameinfo_params.serv_len = 32;
+    nameinfo_params.flags = NI_NUMERICHOST | NI_NUMERICSERV;
+    memset(nameinfo_host, 0xcc, 64);
+    memset(nameinfo_service, 0xcc, 32);
+    ok(VirtualProtect(memory + 0xd000, 0x1000, PAGE_NOACCESS, &old_protect),
+       "failed to protect sockaddr tail, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_getnameinfo, &nameinfo_params);
+    ok(status == WSAEFAULT, "protected getnameinfo address returned %#lx\n", status);
+    ok(wow64_dns_buffer_is_filled(nameinfo_host, 64, 0xcc) &&
+       wow64_dns_buffer_is_filled(nameinfo_service, 32, 0xcc),
+       "failed getnameinfo changed output\n");
+    ok(VirtualProtect(memory + 0xd000, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore sockaddr tail, error %lu\n", GetLastError());
+
+    ok(VirtualProtect(nameinfo_service, 0x1000, PAGE_READONLY, &old_protect),
+       "failed to protect service output, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_getnameinfo, &nameinfo_params);
+    ok(status == WSAEFAULT, "partially readonly getnameinfo returned %#lx\n", status);
+    ok(wow64_dns_buffer_is_filled(nameinfo_host, 64, 0xcc) &&
+       wow64_dns_buffer_is_filled(nameinfo_service, 32, 0xcc),
+       "failed atomic getnameinfo partially changed output\n");
+    ok(VirtualProtect(nameinfo_service, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore service output, error %lu\n", GetLastError());
+    memset(nameinfo_host, 0, 64);
+    memset(nameinfo_service, 0, 32);
+    status = dispatcher(handle, unix_getnameinfo, &nameinfo_params);
+    ok(!status && !strcmp(nameinfo_host, "127.0.0.1") && !strcmp(nameinfo_service, "80"),
+       "valid getnameinfo returned %#lx, %s, %s\n", status,
+       debugstr_a(nameinfo_host), debugstr_a(nameinfo_service));
+
+    memcpy(cross_nameinfo, &nameinfo_params, sizeof(nameinfo_params));
+    ok(VirtualProtect(memory + 0x11000, 0x1000, PAGE_NOACCESS, &old_protect),
+       "failed to protect outer nameinfo tail, error %lu\n", GetLastError());
+    status = dispatcher(handle, unix_getnameinfo, cross_nameinfo);
+    ok(status == STATUS_ACCESS_VIOLATION,
+       "protected outer getnameinfo returned %#lx\n", status);
+    ok(VirtualProtect(memory + 0x11000, 0x1000, PAGE_READWRITE, &old_protect),
+       "failed to restore outer nameinfo tail, error %lu\n", GetLastError());
+    memset(nameinfo_host, 0, 64);
+    memset(nameinfo_service, 0, 32);
+    status = dispatcher(handle, unix_getnameinfo, cross_nameinfo);
+    ok(!status && !strcmp(nameinfo_host, "127.0.0.1") && !strcmp(nameinfo_service, "80"),
+       "valid outer follow-up returned %#lx, %s, %s\n", status,
+       debugstr_a(nameinfo_host), debugstr_a(nameinfo_service));
+
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 START_TEST( sock )
 {
     int i;
@@ -15194,12 +16345,18 @@ START_TEST( sock )
     test_WSARecv();
     test_WSAPoll();
     test_write_watch();
+    test_translated_wow64_send_protection();
+    test_translated_wow64_wsarecvmsg_protection();
+    test_translated_wow64_recv_protection();
+    test_translated_wow64_recv_write_watch();
+    test_translated_wow64_dns_marshalling();
 
     test_events();
     test_select_after_WSAEventSelect();
 
     test_ipv6only();
     test_TransmitFile();
+    test_translated_wow64_transmitfile_protection();
     test_AcceptEx();
     test_connect();
     test_shutdown();

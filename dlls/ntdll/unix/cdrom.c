@@ -1616,6 +1616,8 @@ static NTSTATUS CDROM_RawRead(int fd, const RAW_READ_INFO* raw, void* buffer, DW
  */
 static NTSTATUS CDROM_ScsiPassThroughDirect(int fd, const SCSI_PASS_THROUGH_DIRECT *in_pkt, SCSI_PASS_THROUGH_DIRECT *out_pkt)
 {
+    const void *read_buffer = NULL;
+    void *write_buffer = NULL;
     int ret = STATUS_NOT_SUPPORTED;
 #ifdef HAVE_SG_IO_HDR_T_INTERFACE_ID
     sg_io_hdr_t cmd;
@@ -1655,9 +1657,11 @@ static NTSTATUS CDROM_ScsiPassThroughDirect(int fd, const SCSI_PASS_THROUGH_DIRE
     {
     case SCSI_IOCTL_DATA_IN:
         cmd.dxfer_direction = SG_DXFER_FROM_DEV;
+        write_buffer = in_pkt->DataBuffer;
         break;
     case SCSI_IOCTL_DATA_OUT:
         cmd.dxfer_direction = SG_DXFER_TO_DEV;
+        read_buffer = in_pkt->DataBuffer;
         break;
     case SCSI_IOCTL_DATA_UNSPECIFIED:
         cmd.dxfer_direction = SG_DXFER_NONE;
@@ -1666,7 +1670,10 @@ static NTSTATUS CDROM_ScsiPassThroughDirect(int fd, const SCSI_PASS_THROUGH_DIRE
        return STATUS_INVALID_PARAMETER;
     }
 
-    io = ioctl(fd, SG_IO, &cmd);
+    io = virtual_locked_ioctl( fd, SG_IO, &cmd, read_buffer,
+                               read_buffer ? in_pkt->DataTransferLength : 0,
+                               write_buffer,
+                               write_buffer ? in_pkt->DataTransferLength : 0 );
 
     out_pkt->ScsiStatus         = cmd.status;
     out_pkt->DataTransferLength = in_pkt->DataTransferLength - cmd.resid;
@@ -1690,9 +1697,11 @@ static NTSTATUS CDROM_ScsiPassThroughDirect(int fd, const SCSI_PASS_THROUGH_DIRE
     {
     case SCSI_IOCTL_DATA_OUT:
         cmd.direction = kSCSIDataTransfer_FromInitiatorToTarget;
+        read_buffer = in_pkt->DataBuffer;
 	break;
     case SCSI_IOCTL_DATA_IN:
         cmd.direction = kSCSIDataTransfer_FromTargetToInitiator;
+	write_buffer = in_pkt->DataBuffer;
 	break;
     case SCSI_IOCTL_DATA_UNSPECIFIED:
         cmd.direction = kSCSIDataTransfer_NoDataTransfer;
@@ -1701,7 +1710,10 @@ static NTSTATUS CDROM_ScsiPassThroughDirect(int fd, const SCSI_PASS_THROUGH_DIRE
        return STATUS_INVALID_PARAMETER;
     }
 
-    io = ioctl(fd, DKIOCSCSICOMMAND, &cmd);
+    io = virtual_locked_ioctl( fd, DKIOCSCSICOMMAND, &cmd, read_buffer,
+                               read_buffer ? in_pkt->DataTransferLength : 0,
+                               write_buffer,
+                               write_buffer ? in_pkt->DataTransferLength : 0 );
 
     if (cmd.response == kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE)
     {
@@ -1747,66 +1759,80 @@ static NTSTATUS CDROM_ScsiPassThroughDirect(int fd, const SCSI_PASS_THROUGH_DIRE
 
 static NTSTATUS CDROM_ScsiPassThroughDirect32(int fd, const SCSI_PASS_THROUGH_DIRECT32 *in_pkt32, SCSI_PASS_THROUGH_DIRECT32 *out_pkt32)
 {
+    SCSI_PASS_THROUGH_DIRECT32 input, output;
+    const SCSI_PASS_THROUGH_DIRECT32 *in_pkt = &input;
     SCSI_PASS_THROUGH_DIRECT *pkt;
     ULONG_PTR ptr;
     NTSTATUS ret;
 
-    if (in_pkt32->Length < sizeof(SCSI_PASS_THROUGH_DIRECT32))
+    if ((ret = virtual_copy_from_user( &input, in_pkt32, sizeof(input) ))) return ret;
+    if (in_pkt->Length < sizeof(SCSI_PASS_THROUGH_DIRECT32))
         return STATUS_BUFFER_TOO_SMALL;
 
-    if (in_pkt32->CdbLength > 16)
+    if (in_pkt->CdbLength > 16)
         return STATUS_INVALID_PARAMETER;
 
 #ifdef SENSEBUFLEN
-    if (in_pkt32->SenseInfoLength > SENSEBUFLEN)
+    if (in_pkt->SenseInfoLength > SENSEBUFLEN)
         return STATUS_INVALID_PARAMETER;
 #endif
 
-    if (in_pkt32->SenseInfoLength > 0)
+    if (in_pkt->SenseInfoLength > 0)
     {
-        if (in_pkt32->SenseInfoOffset < sizeof(SCSI_PASS_THROUGH_DIRECT32))
+        if (in_pkt->SenseInfoOffset < sizeof(SCSI_PASS_THROUGH_DIRECT32))
             return STATUS_INVALID_PARAMETER;
-        ptr = (ULONG_PTR)in_pkt32 + in_pkt32->SenseInfoOffset;
+        ptr = (ULONG_PTR)in_pkt32 + in_pkt->SenseInfoOffset;
         if (ptr < (ULONG_PTR)in_pkt32)
             return STATUS_INVALID_PARAMETER;
-        if ((ptr + in_pkt32->SenseInfoLength) < ptr)
+        if ((ptr + in_pkt->SenseInfoLength) < ptr)
             return STATUS_INVALID_PARAMETER;
     }
 
-    pkt = calloc(1, sizeof(SCSI_PASS_THROUGH_DIRECT) + in_pkt32->SenseInfoLength);
+    if (in_pkt->DataTransferLength)
+    {
+        if (!in_pkt->DataBuffer ||
+            in_pkt->DataTransferLength > 0x100000000ull - in_pkt->DataBuffer)
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    pkt = calloc(1, sizeof(SCSI_PASS_THROUGH_DIRECT) + in_pkt->SenseInfoLength);
     if (!pkt) return STATUS_NO_MEMORY;
 
     pkt->Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
-    pkt->CdbLength = in_pkt32->CdbLength;
-    pkt->SenseInfoLength = in_pkt32->SenseInfoLength;
-    pkt->DataIn = in_pkt32->DataIn;
-    pkt->DataTransferLength = in_pkt32->DataTransferLength;
-    pkt->TimeOutValue = in_pkt32->TimeOutValue;
-    pkt->DataBuffer = ULongToPtr(in_pkt32->DataBuffer);
+    pkt->CdbLength = in_pkt->CdbLength;
+    pkt->SenseInfoLength = in_pkt->SenseInfoLength;
+    pkt->DataIn = in_pkt->DataIn;
+    pkt->DataTransferLength = in_pkt->DataTransferLength;
+    pkt->TimeOutValue = in_pkt->TimeOutValue;
+    pkt->DataBuffer = wow64_guest_to_native_ptr( in_pkt->DataBuffer );
     pkt->SenseInfoOffset = sizeof(SCSI_PASS_THROUGH_DIRECT);
-    memcpy(pkt->Cdb, in_pkt32->Cdb, sizeof(pkt->Cdb));
+    memcpy(pkt->Cdb, in_pkt->Cdb, sizeof(pkt->Cdb));
 
     ret = CDROM_ScsiPassThroughDirect(fd, pkt, pkt);
-    if (NT_ERROR(ret)) goto done;
+    if (NT_ERROR(ret)) goto free_packet;
 
-    out_pkt32->Length = sizeof(SCSI_PASS_THROUGH_DIRECT32);
-    out_pkt32->ScsiStatus = pkt->ScsiStatus;
-    out_pkt32->PathId = pkt->PathId;
-    out_pkt32->TargetId = pkt->TargetId;
-    out_pkt32->Lun = pkt->Lun;
-    out_pkt32->CdbLength = pkt->CdbLength;
-    out_pkt32->SenseInfoLength = pkt->SenseInfoLength;
-    out_pkt32->DataIn = pkt->DataIn;
-    out_pkt32->DataTransferLength = pkt->DataTransferLength;
-    out_pkt32->TimeOutValue = pkt->TimeOutValue;
-    out_pkt32->DataBuffer = in_pkt32->DataBuffer;
-    out_pkt32->SenseInfoOffset = in_pkt32->SenseInfoOffset;
-    memcpy(out_pkt32->Cdb, pkt->Cdb, sizeof(out_pkt32->Cdb));
-    memcpy((char*)out_pkt32 + out_pkt32->SenseInfoOffset,
-            (const char*)pkt + pkt->SenseInfoOffset,
-            pkt->SenseInfoLength);
+    memset( &output, 0, sizeof(output) );
+    output.Length = sizeof(output);
+    output.ScsiStatus = pkt->ScsiStatus;
+    output.PathId = pkt->PathId;
+    output.TargetId = pkt->TargetId;
+    output.Lun = pkt->Lun;
+    output.CdbLength = pkt->CdbLength;
+    output.SenseInfoLength = pkt->SenseInfoLength;
+    output.DataIn = pkt->DataIn;
+    output.DataTransferLength = pkt->DataTransferLength;
+    output.TimeOutValue = pkt->TimeOutValue;
+    output.DataBuffer = in_pkt->DataBuffer;
+    output.SenseInfoOffset = in_pkt->SenseInfoOffset;
+    memcpy( output.Cdb, pkt->Cdb, sizeof(output.Cdb) );
+    if ((ret = virtual_faulting_copy_to_user( out_pkt32, &output, sizeof(output) )))
+        goto free_packet;
+    if (pkt->SenseInfoLength &&
+        (ret = virtual_faulting_copy_to_user( (char *)out_pkt32 + output.SenseInfoOffset,
+                  (const char *)pkt + pkt->SenseInfoOffset, pkt->SenseInfoLength )))
+        goto free_packet;
 
-done:
+free_packet:
     free(pkt);
     return ret;
 }

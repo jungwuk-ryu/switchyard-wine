@@ -94,6 +94,17 @@ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
 
 #define u64_to_user_ptr(u) ((void *)(uintptr_t)(u))
 
+static NTSTATUS decode_client_ptr64( ULONGLONG value, void **ret )
+{
+    if (in_wow64_call())
+    {
+        if (value >> 32) return STATUS_INVALID_PARAMETER;
+        *ret = wow64_guest_to_native_ptr( (ULONG)value );
+    }
+    else *ret = u64_to_user_ptr( value );
+    return STATUS_SUCCESS;
+}
+
 union unix_sockaddr
 {
     struct sockaddr addr;
@@ -111,9 +122,13 @@ struct async_recv_ioctl
 {
     struct async_fileio io;
     void *control;
+    void *control_buffer;
+    ULONG control_len;
     struct WS_sockaddr *addr;
     int *addr_len;
+    int addr_len_value;
     unsigned int *ret_flags;
+    unsigned int ret_flags_value;
     int unix_flags;
     unsigned int count;
     BOOL icmp_over_dgram;
@@ -130,6 +145,10 @@ struct async_send_ioctl
     unsigned int count;
     unsigned int iov_cursor;
     int fd;
+    BOOL icmp_over_dgram;
+    BOOL icmp_header_valid;
+    unsigned short icmp_id;
+    unsigned short icmp_seq;
     struct iovec iov[1];
 };
 
@@ -526,10 +545,10 @@ static size_t cmsg_align_32( size_t len )
 
 /* we assume that cmsg_data does not require translation, which is currently
  * true for all messages */
-static int wow64_translate_control( const WSABUF *control64, struct afd_wsabuf_32 *control32 )
+static int wow64_translate_control( const WSABUF *control64, void *buffer, ULONG *length )
 {
-    char *const buf32 = ULongToPtr(control32->buf);
-    const ULONG max_len = control32->len;
+    char *const buf32 = buffer;
+    const ULONG max_len = *length;
     const char *ptr64 = control64->buf;
     char *ptr32 = buf32;
 
@@ -540,7 +559,7 @@ static int wow64_translate_control( const WSABUF *control64, struct afd_wsabuf_3
 
         if (ptr32 + sizeof(*cmsg32) + cmsg_align_32( cmsg64->cmsg_len ) > buf32 + max_len)
         {
-            control32->len = 0;
+            *length = 0;
             return 0;
         }
 
@@ -553,8 +572,8 @@ static int wow64_translate_control( const WSABUF *control64, struct afd_wsabuf_3
         ptr32 += cmsg_align_32( cmsg32->cmsg_len );
     }
 
-    control32->len = ptr32 - buf32;
-    FIXME("-> %d\n", control32->len);
+    *length = ptr32 - buf32;
+    FIXME("-> %u\n", *length);
     return 1;
 }
 
@@ -650,15 +669,32 @@ static void set_ipv6_addr_from_pktinfo( struct msghdr *hdr, struct in6_addr *add
 #endif
 }
 
-static ssize_t fixup_icmpv6_over_dgram( struct msghdr *hdr, void *buf, union unix_sockaddr *unix_addr,
-                                      HANDLE handle, ssize_t recv_len )
+static ssize_t fixup_icmpv6_over_dgram( struct msghdr *hdr, void *buf, size_t buf_len,
+                                        union unix_sockaddr *unix_addr, HANDLE handle,
+                                        ssize_t recv_len, NTSTATUS *status )
 {
     struct ipv6_pseudo_header ip_h;
-    struct icmp_hdr *icmp_h = buf;
+    struct icmp_hdr *icmp_h;
     unsigned int fixup_status;
+    size_t packet_len;
     unsigned int sum;
+    void *packet;
 
     if (recv_len < sizeof(*icmp_h)) return recv_len;
+    packet_len = min( (size_t)recv_len, buf_len );
+    if (packet_len < sizeof(*icmp_h)) return recv_len;
+    if (!(packet = malloc( packet_len )))
+    {
+        *status = STATUS_NO_MEMORY;
+        return 0;
+    }
+    if (virtual_copy_from_user( packet, buf, packet_len ))
+    {
+        free( packet );
+        *status = STATUS_ACCESS_VIOLATION;
+        return 0;
+    }
+    icmp_h = packet;
 
     SERVER_START_REQ( socket_get_icmp_id )
     {
@@ -672,17 +708,26 @@ static ssize_t fixup_icmpv6_over_dgram( struct msghdr *hdr, void *buf, union uni
     if (fixup_status)
     {
         WARN( "socket_get_icmp_id returned %#x.\n", fixup_status );
+        free( packet );
         return recv_len;
     }
 
     memset( &ip_h, 0, sizeof(ip_h) );
     ip_h.src = unix_addr->in6.sin6_addr;
     set_ipv6_addr_from_pktinfo( hdr, &ip_h.dst );
-    ip_h.next_len = htonl( recv_len );
+    ip_h.next_len = htonl( packet_len );
     ip_h.next_header = IPPROTO_ICMPV6;
     sum = chksum_add( (BYTE *)&ip_h, sizeof(ip_h), 0 );
     icmp_h->checksum = 0;
-    icmp_h->checksum = chksum( (BYTE *)icmp_h, recv_len, sum );
+    icmp_h->checksum = chksum( (BYTE *)icmp_h, packet_len, sum );
+
+    if (virtual_uninterrupted_write_memory( buf, packet, packet_len ))
+    {
+        free( packet );
+        *status = STATUS_ACCESS_VIOLATION;
+        return 0;
+    }
+    free( packet );
 
     return recv_len;
 }
@@ -695,8 +740,8 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
     unsigned int fixup_status;
     struct cmsghdr *cmsg;
     struct ip_hdr ip_h;
-    size_t buf_len;
-    char *buf;
+    size_t buf_len, payload_len, output_len;
+    char *buf, *output;
 
     if (hdr->msg_iovlen != 1)
     {
@@ -708,23 +753,27 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
     buf_len = hdr->msg_iov[0].iov_len;
 
     if (unix_addr->addr.sa_family == AF_INET6)
-        return fixup_icmpv6_over_dgram( hdr, buf, unix_addr, handle, recv_len );
+        return fixup_icmpv6_over_dgram( hdr, buf, buf_len, unix_addr, handle,
+                                        recv_len, status );
 
     if (recv_len + sizeof(ip_h) > buf_len)
         *status = STATUS_BUFFER_OVERFLOW;
 
-    if (buf_len < sizeof(ip_h))
+    payload_len = buf_len < sizeof(ip_h) ? 0 : min( (size_t)recv_len, buf_len - sizeof(ip_h) );
+    output_len = min( buf_len, sizeof(ip_h) + payload_len );
+    if (!(output = malloc( output_len ? output_len : 1 )))
     {
-        recv_len = buf_len;
+        *status = STATUS_NO_MEMORY;
+        return 0;
     }
-    else
+    if (payload_len && virtual_copy_from_user( output + sizeof(ip_h), buf, payload_len ))
     {
-        recv_len = min( recv_len, buf_len - sizeof(ip_h) );
-        memmove( buf + sizeof(ip_h), buf, recv_len );
-        if (recv_len >= sizeof(struct icmp_hdr))
-            icmp_h = (struct icmp_hdr *)(buf + sizeof(ip_h));
-        recv_len += sizeof(ip_h);
+        free( output );
+        *status = STATUS_ACCESS_VIOLATION;
+        return 0;
     }
+    if (payload_len >= sizeof(struct icmp_hdr))
+        icmp_h = (struct icmp_hdr *)(output + sizeof(ip_h));
     memset( &ip_h, 0, sizeof(ip_h) );
     ip_h.v_hl = (4 << 4) | (sizeof(ip_h) >> 2);
     ip_h.tot_len = htons( tot_len );
@@ -774,20 +823,32 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
         if (!fixup_status)
         {
             icmp_h->checksum = 0;
-            icmp_h->checksum = chksum( (BYTE *)icmp_h, recv_len - sizeof(ip_h), 0 );
+            icmp_h->checksum = chksum( (BYTE *)icmp_h, payload_len, 0 );
         }
     }
     ip_h.checksum = chksum( (BYTE *)&ip_h, sizeof(ip_h), 0 );
-    memcpy( buf, &ip_h, min( sizeof(ip_h), buf_len ));
+    memcpy( output, &ip_h, min( sizeof(ip_h), output_len ) );
+    if (output_len && virtual_uninterrupted_write_memory( buf, output, output_len ))
+    {
+        free( output );
+        *status = STATUS_ACCESS_VIOLATION;
+        return 0;
+    }
+    free( output );
 
-    return recv_len;
+    return output_len;
 }
 
 static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
 {
     char control_buffer[512];
+    char control_output[512];
+    char addr_buffer[sizeof(union unix_sockaddr)];
     union unix_sockaddr unix_addr;
     struct msghdr hdr;
+    ULONG control_len = 0;
+    int addr_len = 0;
+    BOOL write_addr = FALSE;
     NTSTATUS status;
     ssize_t ret;
 
@@ -822,6 +883,8 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
 
     if (async->control)
     {
+        control_len = min( async->control_len, (ULONG)sizeof(control_output) );
+
         if (async->icmp_over_dgram)
             FIXME( "May return extra control headers.\n" );
 
@@ -834,29 +897,34 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
             wsabuf.buf = control_buffer64;
             if (convert_control_headers( &hdr, &wsabuf ))
             {
-                if (!wow64_translate_control( &wsabuf, async->control ))
+                if (!wow64_translate_control( &wsabuf, control_output, &control_len ))
                 {
                     WARN( "Application passed insufficient room for control headers.\n" );
-                    *async->ret_flags |= WS_MSG_CTRUNC;
+                    async->ret_flags_value |= WS_MSG_CTRUNC;
                     status = STATUS_BUFFER_OVERFLOW;
                 }
             }
             else
             {
                 FIXME( "control buffer is too small\n" );
-                *async->ret_flags |= WS_MSG_CTRUNC;
+                async->ret_flags_value |= WS_MSG_CTRUNC;
+                control_len = 0;
                 status = STATUS_BUFFER_OVERFLOW;
             }
         }
         else
         {
-            if (!convert_control_headers( &hdr, async->control ))
+            WSABUF wsabuf = {control_len, control_output};
+
+            if (!convert_control_headers( &hdr, &wsabuf ))
             {
                 WARN( "Application passed insufficient room for control headers.\n" );
-                *async->ret_flags |= WS_MSG_CTRUNC;
+                async->ret_flags_value |= WS_MSG_CTRUNC;
                 status = STATUS_BUFFER_OVERFLOW;
             }
+            control_len = wsabuf.len;
         }
+
     }
 
     /* If this socket is connected, Linux doesn't give us msg_name and
@@ -866,10 +934,49 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
      * don't try to translate it.
      */
     if (async->addr && hdr.msg_namelen)
-        *async->addr_len = sockaddr_from_unix( &unix_addr, async->addr, *async->addr_len );
+    {
+        addr_len = sockaddr_from_unix( &unix_addr, (struct WS_sockaddr *)addr_buffer,
+                                       async->addr_len_value );
+        write_addr = TRUE;
+    }
+
+    /* Validate every completion output before publishing any metadata.  The
+     * final writes repeat the check under virtual_mutex to remain safe if the
+     * application changes a mapping after this preflight. */
+    if ((async->control &&
+         ((control_len && !virtual_check_buffer_for_write_no_touch( async->control_buffer, control_len )) ||
+          !virtual_check_buffer_for_write_no_touch( async->control, sizeof(control_len) ))) ||
+        (write_addr &&
+         ((addr_len > 0 && !virtual_check_buffer_for_write_no_touch( async->addr, addr_len )) ||
+          !virtual_check_buffer_for_write_no_touch( async->addr_len, sizeof(addr_len) ))) ||
+        (async->ret_flags && !virtual_check_buffer_for_write_no_touch( async->ret_flags,
+                                                                       sizeof(async->ret_flags_value) )))
+    {
+        *size = 0;
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (async->control &&
+        ((control_len && virtual_uninterrupted_write_memory( async->control_buffer,
+                                                              control_output, control_len )) ||
+         virtual_uninterrupted_write_memory( async->control, &control_len,
+                                             sizeof(control_len))))
+        goto metadata_fault;
+    if (write_addr &&
+        ((addr_len > 0 && virtual_uninterrupted_write_memory( async->addr, addr_buffer,
+                                                              addr_len )) ||
+         virtual_uninterrupted_write_memory( async->addr_len, &addr_len, sizeof(addr_len))))
+        goto metadata_fault;
+    if (async->ret_flags && virtual_uninterrupted_write_memory( async->ret_flags,
+                                                                &async->ret_flags_value,
+                                                                sizeof(async->ret_flags_value) ))
+        goto metadata_fault;
 
     *size = ret;
     return status;
+
+metadata_fault:
+    *size = 0;
+    return STATUS_ACCESS_VIOLATION;
 }
 
 static BOOL async_recv_proc( void *user, ULONG_PTR *info, unsigned int *status )
@@ -967,6 +1074,8 @@ static NTSTATUS sock_ioctl_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
                                  struct WS_sockaddr *addr, int *addr_len, unsigned int *ret_flags, int unix_flags, int force_async )
 {
     struct async_recv_ioctl *async;
+    struct afd_wsabuf_32 control32;
+    WSABUF control64;
     DWORD async_size;
     unsigned int i;
 
@@ -978,7 +1087,10 @@ static NTSTATUS sock_ioctl_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
             return STATUS_INVALID_PARAMETER;
     }
 
-    async_size = offsetof( struct async_recv_ioctl, iov[count] );
+    if (count > (MAXDWORD - offsetof( struct async_recv_ioctl, iov )) /
+                sizeof(async->iov[0]))
+        return STATUS_INVALID_PARAMETER;
+    async_size = offsetof( struct async_recv_ioctl, iov ) + count * sizeof(async->iov[0]);
 
     if (!(async = (struct async_recv_ioctl *)alloc_fileio( async_size, async_recv_proc, handle )))
         return STATUS_NO_MEMORY;
@@ -990,8 +1102,15 @@ static NTSTATUS sock_ioctl_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
 
         for (i = 0; i < count; ++i)
         {
-            async->iov[i].iov_base = ULongToPtr( buffers[i].buf );
-            async->iov[i].iov_len = buffers[i].len;
+            struct afd_wsabuf_32 buffer;
+
+            if (virtual_copy_from_user( &buffer, buffers + i, sizeof(buffer) ))
+            {
+                release_fileio( &async->io );
+                return STATUS_ACCESS_VIOLATION;
+            }
+            async->iov[i].iov_base = wow64_guest_to_native_ptr( buffer.buf );
+            async->iov[i].iov_len = buffer.len;
         }
     }
     else
@@ -1006,12 +1125,44 @@ static NTSTATUS sock_ioctl_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
     }
     async->unix_flags = unix_flags;
     async->control = control;
+    async->control_buffer = NULL;
+    async->control_len = 0;
+    if (control)
+    {
+        if (in_wow64_call())
+        {
+            if (virtual_copy_from_user( &control32, control, sizeof(control32) ))
+                goto access_violation;
+            async->control_buffer = wow64_guest_to_native_ptr( control32.buf );
+            async->control_len = control32.len;
+        }
+        else
+        {
+            if (virtual_copy_from_user( &control64, control, sizeof(control64) ))
+                goto access_violation;
+            async->control_buffer = control64.buf;
+            async->control_len = control64.len;
+        }
+        if (async->control_len && !async->control_buffer) goto access_violation;
+    }
     async->addr = addr;
     async->addr_len = addr_len;
+    async->addr_len_value = 0;
+    if (addr && (!addr_len || virtual_copy_from_user( &async->addr_len_value, addr_len,
+                                                       sizeof(async->addr_len_value) )))
+        goto access_violation;
     async->ret_flags = ret_flags;
+    async->ret_flags_value = 0;
+    if (ret_flags && virtual_copy_from_user( &async->ret_flags_value, ret_flags,
+                                              sizeof(async->ret_flags_value) ))
+        goto access_violation;
     async->icmp_over_dgram = is_icmp_over_dgram( fd );
 
     return sock_recv( handle, event, apc, apc_user, io, fd, async, force_async );
+
+access_violation:
+    release_fileio( &async->io );
+    return STATUS_ACCESS_VIOLATION;
 }
 
 
@@ -1029,9 +1180,13 @@ NTSTATUS sock_read( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE apc,
     async->iov[0].iov_len = length;
     async->unix_flags = 0;
     async->control = NULL;
+    async->control_buffer = NULL;
+    async->control_len = 0;
     async->addr = NULL;
     async->addr_len = NULL;
+    async->addr_len_value = 0;
     async->ret_flags = NULL;
+    async->ret_flags_value = 0;
     async->icmp_over_dgram = is_icmp_over_dgram( fd );
 
     return sock_recv( handle, event, apc, apc_user, io, fd, async, 1 );
@@ -1089,7 +1244,7 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
     hdr.msg_iov = async->iov + async->iov_cursor;
     hdr.msg_iovlen = async->count - async->iov_cursor;
 
-    while ((ret = sendmsg( fd, &hdr, async->unix_flags )) == -1)
+    while ((ret = virtual_locked_sendmsg( fd, &hdr, async->unix_flags )) == -1)
     {
         if (errno == EISCONN)
         {
@@ -1154,25 +1309,35 @@ static BOOL async_send_proc( void *user, ULONG_PTR *info, unsigned int *status )
     return TRUE;
 }
 
-static void sock_save_icmp_id( struct async_send_ioctl *async )
+static NTSTATUS snapshot_icmp_id( int fd, struct async_send_ioctl *async )
 {
-    unsigned short id, seq;
-    struct icmp_hdr *h;
+    struct icmp_hdr h;
 
-    if (async->count != 1 || async->iov[0].iov_len < sizeof(*h))
+    async->icmp_over_dgram = is_icmp_over_dgram( fd );
+    async->icmp_header_valid = FALSE;
+    if (!async->icmp_over_dgram) return STATUS_SUCCESS;
+    if (async->count != 1 || async->iov[0].iov_len < sizeof(h))
     {
         FIXME( "ICMP over DGRAM fixup is not supported for count %u, len %zu.\n", async->count, async->iov[0].iov_len );
-        return;
+        return STATUS_SUCCESS;
     }
 
-    h = async->iov[0].iov_base;
-    id = h->un.echo.id;
-    seq = h->un.echo.sequence;
+    if (virtual_copy_from_user( &h, async->iov[0].iov_base, sizeof(h) ))
+        return STATUS_ACCESS_VIOLATION;
+    async->icmp_id = h.un.echo.id;
+    async->icmp_seq = h.un.echo.sequence;
+    async->icmp_header_valid = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static void sock_save_icmp_id( struct async_send_ioctl *async )
+{
+    if (!async->icmp_header_valid) return;
     SERVER_START_REQ( socket_send_icmp_id )
     {
         req->handle = wine_server_obj_handle( async->io.handle );
-        req->icmp_id = id;
-        req->icmp_seq = seq;
+        req->icmp_id = async->icmp_id;
+        req->icmp_seq = async->icmp_seq;
         if (wine_server_call( req ))
             WARN( "socket_fixup_send_data failed.\n" );
     }
@@ -1186,6 +1351,13 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
     BOOL nonblocking;
     unsigned int status;
     ULONG options;
+
+    if ((status = snapshot_icmp_id( fd, async )))
+    {
+        if (async->fd != -1) close( async->fd );
+        release_fileio( &async->io );
+        return status;
+    }
 
     SERVER_START_REQ( send_socket )
     {
@@ -1201,7 +1373,7 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
     /* the server currently will never succeed immediately */
     assert(status == STATUS_ALERTED || status == STATUS_PENDING || NT_ERROR(status));
 
-    if (!NT_ERROR(status) && is_icmp_over_dgram( fd ))
+    if (!NT_ERROR(status) && async->icmp_over_dgram)
         sock_save_icmp_id( async );
 
     if (status == STATUS_ALERTED)
@@ -1222,20 +1394,34 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
             struct async_send_ioctl *rem_async;
             unsigned int i, iov_count;
             IO_STATUS_BLOCK *rem_io;
+            NTSTATUS queue_status = STATUS_SUCCESS;
             char *p;
 
             TRACE( "Short write, queueing remaining data.\n" );
             data_size = 0;
             iov_count = async->count - async->iov_cursor;
             for (i = 0; i < iov_count; ++i)
-                data_size += iov[i].iov_len;
-
-            addr_size = max( 0, async->addr_len );
-            async_size = offsetof( struct async_send_ioctl, iov[1] ) + data_size + addr_size
-                         + sizeof(IO_STATUS_BLOCK) + sizeof(IO_STATUS_BLOCK32);
-            if (!(rem_async = (struct async_send_ioctl *)alloc_fileio( async_size, async_send_proc, handle )))
             {
-                status = STATUS_NO_MEMORY;
+                if (iov[i].iov_len > MAXDWORD - data_size)
+                {
+                    queue_status = STATUS_NO_MEMORY;
+                    break;
+                }
+                data_size += iov[i].iov_len;
+            }
+
+            addr_size = async->addr ? max( 0, async->addr_len ) : 0;
+            async_size = offsetof( struct async_send_ioctl, iov[1] );
+            if (!queue_status && (data_size > MAXDWORD - async_size ||
+                                  addr_size > MAXDWORD - async_size - data_size ||
+                                  sizeof(IO_STATUS_BLOCK) + sizeof(IO_STATUS_BLOCK32) >
+                                  MAXDWORD - async_size - data_size - addr_size))
+                queue_status = STATUS_NO_MEMORY;
+            async_size += data_size + addr_size + sizeof(IO_STATUS_BLOCK) + sizeof(IO_STATUS_BLOCK32);
+            if (queue_status || !(rem_async = (struct async_send_ioctl *)alloc_fileio( async_size,
+                                                                                      async_send_proc, handle )))
+            {
+                status = queue_status ? queue_status : STATUS_NO_MEMORY;
             }
             else
             {
@@ -1247,12 +1433,16 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
                 rem_async->iov[0].iov_len = data_size;
                 for (i = 0; i < iov_count; ++i)
                 {
-                    memcpy( p, iov[i].iov_base, iov[i].iov_len );
+                    if (virtual_copy_from_user( p, iov[i].iov_base, iov[i].iov_len ))
+                    {
+                        queue_status = STATUS_ACCESS_VIOLATION;
+                        break;
+                    }
                     p += iov[i].iov_len;
                 }
                 rem_async->unix_flags = async->unix_flags;
-                memcpy( p, async->addr, addr_size );
-                rem_async->addr = (const struct WS_sockaddr *)p;
+                if (!queue_status && addr_size) memcpy( p, async->addr, addr_size );
+                rem_async->addr = async->addr ? (const struct WS_sockaddr *)p : NULL;
                 p += addr_size;
                 rem_async->addr_len = async->addr_len;
                 rem_async->iov_cursor = 0;
@@ -1261,8 +1451,15 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
                 p += sizeof(IO_STATUS_BLOCK);
                 rem_io->Pointer = p;
                 p += sizeof(IO_STATUS_BLOCK32);
-                status = sock_send( handle, NULL, NULL, NULL, rem_io, fd, rem_async,
-                                    SERVER_SOCKET_IO_FORCE_ASYNC | SERVER_SOCKET_IO_SYSTEM );
+                if (!queue_status)
+                    queue_status = sock_send( handle, NULL, NULL, NULL, rem_io, fd, rem_async,
+                                              SERVER_SOCKET_IO_FORCE_ASYNC | SERVER_SOCKET_IO_SYSTEM );
+                else
+                {
+                    if (rem_async->fd != -1) close( rem_async->fd );
+                    release_fileio( &rem_async->io );
+                }
+                status = queue_status;
                 if (status == STATUS_PENDING) status = STATUS_SUCCESS;
                 if (!status)
                 {
@@ -1291,12 +1488,17 @@ static NTSTATUS sock_ioctl_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
                                  const struct WS_sockaddr *addr, unsigned int addr_len, int unix_flags, int force_async )
 {
     struct async_send_ioctl *async;
-    DWORD async_size;
+    SIZE_T async_size, addr_size = addr ? addr_len : 0;
     unsigned int i;
 
-    async_size = offsetof( struct async_send_ioctl, iov[count] );
+    if (count > (MAXDWORD - offsetof( struct async_send_ioctl, iov )) /
+                sizeof(async->iov[0]))
+        return STATUS_INVALID_PARAMETER;
+    async_size = offsetof( struct async_send_ioctl, iov ) + count * sizeof(async->iov[0]);
+    if (addr_size > MAXDWORD - async_size) return STATUS_INVALID_PARAMETER;
 
-    if (!(async = (struct async_send_ioctl *)alloc_fileio( async_size, async_send_proc, handle )))
+    if (!(async = (struct async_send_ioctl *)alloc_fileio( async_size + addr_size,
+                                                           async_send_proc, handle )))
         return STATUS_NO_MEMORY;
 
     async->count = count;
@@ -1306,8 +1508,21 @@ static NTSTATUS sock_ioctl_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
 
         for (i = 0; i < count; ++i)
         {
-            async->iov[i].iov_base = ULongToPtr( buffers[i].buf );
-            async->iov[i].iov_len = buffers[i].len;
+            struct afd_wsabuf_32 buffer;
+
+            if (virtual_copy_from_user( &buffer, buffers + i, sizeof(buffer) ))
+            {
+                release_fileio( &async->io );
+                return STATUS_ACCESS_VIOLATION;
+            }
+            async->iov[i].iov_base = wow64_guest_to_native_ptr( buffer.buf );
+            async->iov[i].iov_len = buffer.len;
+            if (!virtual_check_buffer_for_read( async->iov[i].iov_base,
+                                                async->iov[i].iov_len ))
+            {
+                release_fileio( &async->io );
+                return STATUS_ACCESS_VIOLATION;
+            }
         }
     }
     else
@@ -1322,7 +1537,16 @@ static NTSTATUS sock_ioctl_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
     }
     async->fd = -1;
     async->unix_flags = unix_flags;
-    async->addr = addr;
+    async->addr = NULL;
+    if (addr)
+    {
+        async->addr = (void *)((char *)async + async_size);
+        if (addr_size && virtual_copy_from_user( (void *)async->addr, addr, addr_size ))
+        {
+            release_fileio( &async->io );
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
     async->addr_len = addr_len;
     async->iov_cursor = 0;
     async->sent_len = 0;
@@ -1341,6 +1565,8 @@ NTSTATUS sock_write( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE apc,
         return STATUS_NO_MEMORY;
 
     async->fd = -1;
+    async->icmp_over_dgram = FALSE;
+    async->icmp_header_valid = FALSE;
     async->count = 1;
     async->iov[0].iov_base = (void *)buffer;
     async->iov[0].iov_len = length;
@@ -1357,7 +1583,7 @@ NTSTATUS sock_write( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE apc,
 static ssize_t do_send( int fd, const void *buffer, size_t len, int flags )
 {
     ssize_t ret;
-    while ((ret = send( fd, buffer, len, flags )) < 0 && errno == EINTR);
+    while ((ret = virtual_locked_send( fd, buffer, len, flags )) < 0 && errno == EINTR);
     if (ret < 0 && errno != EWOULDBLOCK) WARN( "send: %s\n", strerror( errno ) );
     return ret;
 }
@@ -1467,6 +1693,7 @@ static NTSTATUS sock_transmit( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc,
     struct async_transmit_ioctl *async;
     enum server_fd_type file_type;
     union unix_sockaddr addr;
+    void *head, *tail;
     socklen_t addr_len;
     HANDLE wait_handle;
     unsigned int status;
@@ -1489,6 +1716,12 @@ static NTSTATUS sock_transmit( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc,
         }
     }
 
+    if ((status = decode_client_ptr64( params->head_ptr, &head ))) return status;
+    if ((status = decode_client_ptr64( params->tail_ptr, &tail ))) return status;
+    if ((params->head_len && !virtual_check_buffer_for_read( head, params->head_len )) ||
+        (params->tail_len && !virtual_check_buffer_for_read( tail, params->tail_len )))
+        return STATUS_ACCESS_VIOLATION;
+
     if (!(async = (struct async_transmit_ioctl *)alloc_fileio( sizeof(*async), async_transmit_proc, handle )))
         return STATUS_NO_MEMORY;
 
@@ -1506,9 +1739,9 @@ static NTSTATUS sock_transmit( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc,
     async->tail_cursor = 0;
     async->file_len = params->file_len;
     async->flags = params->flags;
-    async->head = u64_to_user_ptr(params->head_ptr);
+    async->head = head;
     async->head_len = params->head_len;
-    async->tail = u64_to_user_ptr(params->tail_ptr);
+    async->tail = tail;
     async->tail_len = params->tail_len;
     async->offset = params->offset;
 
@@ -1707,18 +1940,21 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 
             if (in_wow64_call())
             {
-                const struct afd_recv_params_32 *params32 = in_buffer;
+                struct afd_recv_params_32 params32;
 
                 if (in_size < sizeof(struct afd_recv_params_32))
                 {
                     status = STATUS_INVALID_PARAMETER;
                     break;
                 }
+                if ((status = virtual_copy_from_user( &params32, in_buffer,
+                                                       sizeof(params32) )))
+                    break;
 
-                params.recv_flags = params32->recv_flags;
-                params.msg_flags = params32->msg_flags;
-                params.buffers = ULongToPtr( params32->buffers );
-                params.count = params32->count;
+                params.recv_flags = params32.recv_flags;
+                params.msg_flags = params32.msg_flags;
+                params.buffers = wow64_guest_to_native_ptr( params32.buffers );
+                params.count = params32.count;
             }
             else
             {
@@ -1757,28 +1993,46 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 
         case IOCTL_AFD_WINE_RECVMSG:
         {
-            struct afd_recvmsg_params *params = in_buffer;
-            unsigned int *ws_flags = u64_to_user_ptr(params->ws_flags_ptr);
+            struct afd_recvmsg_params params_buffer, *params = &params_buffer;
+            void *ws_flags_ptr, *buffers_ptr, *control_ptr, *addr_ptr, *addr_len_ptr;
+            unsigned int ws_flags_value, *ws_flags;
             int unix_flags = 0;
 
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
                 return status;
-
             if (in_size < sizeof(*params))
             {
                 status = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
-
-            if (*ws_flags & WS_MSG_OOB)
+            if ((status = virtual_copy_from_user( params, in_buffer, sizeof(*params) )))
+                break;
+            if ((status = decode_client_ptr64( params->ws_flags_ptr, &ws_flags_ptr )) ||
+                (status = decode_client_ptr64( params->buffers_ptr, &buffers_ptr )) ||
+                (status = decode_client_ptr64( params->control_ptr, &control_ptr )) ||
+                (status = decode_client_ptr64( params->addr_ptr, &addr_ptr )) ||
+                (status = decode_client_ptr64( params->addr_len_ptr, &addr_len_ptr )))
+                break;
+            ws_flags = ws_flags_ptr;
+            if (!ws_flags || (params->count && !buffers_ptr) || (addr_ptr && !addr_len_ptr))
+            {
+                status = STATUS_ACCESS_VIOLATION;
+                break;
+            }
+            if (virtual_copy_from_user( &ws_flags_value, ws_flags,
+                                        sizeof(ws_flags_value) ))
+            {
+                status = STATUS_ACCESS_VIOLATION;
+                break;
+            }
+            if (ws_flags_value & WS_MSG_OOB)
                 unix_flags |= MSG_OOB;
-            if (*ws_flags & WS_MSG_PEEK)
+            if (ws_flags_value & WS_MSG_PEEK)
                 unix_flags |= MSG_PEEK;
-            if (*ws_flags & WS_MSG_WAITALL)
+            if (ws_flags_value & WS_MSG_WAITALL)
                 FIXME( "MSG_WAITALL is not supported\n" );
-            status = sock_ioctl_recv( handle, event, apc, apc_user, io, fd, u64_to_user_ptr(params->buffers_ptr),
-                                      params->count, u64_to_user_ptr(params->control_ptr),
-                                      u64_to_user_ptr(params->addr_ptr), u64_to_user_ptr(params->addr_len_ptr),
+            status = sock_ioctl_recv( handle, event, apc, apc_user, io, fd, buffers_ptr,
+                                      params->count, control_ptr, addr_ptr, addr_len_ptr,
                                       ws_flags, unix_flags, params->force_async );
             if (needs_close) close( fd );
             return status;
@@ -1786,26 +2040,37 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 
         case IOCTL_AFD_WINE_SENDMSG:
         {
-            const struct afd_sendmsg_params *params = in_buffer;
+            struct afd_sendmsg_params params_buffer;
+            const struct afd_sendmsg_params *params = &params_buffer;
+            void *buffers_ptr, *addr_ptr;
             int unix_flags = 0;
 
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
                 return status;
-
             if (in_size < sizeof(*params))
             {
                 status = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
-
+            if ((status = virtual_copy_from_user( &params_buffer, in_buffer,
+                                                   sizeof(params_buffer) )))
+                break;
+            if ((status = decode_client_ptr64( params->buffers_ptr, &buffers_ptr )) ||
+                (status = decode_client_ptr64( params->addr_ptr, &addr_ptr )))
+                break;
+            if (params->count && !buffers_ptr)
+            {
+                status = STATUS_ACCESS_VIOLATION;
+                break;
+            }
             if (params->ws_flags & WS_MSG_OOB)
                 unix_flags |= MSG_OOB;
             if (params->ws_flags & WS_MSG_PARTIAL)
                 WARN( "ignoring MSG_PARTIAL\n" );
             if (params->ws_flags & ~(WS_MSG_OOB | WS_MSG_PARTIAL))
                 FIXME( "unknown flags %#x\n", params->ws_flags );
-            status = sock_ioctl_send( handle, event, apc, apc_user, io, fd, u64_to_user_ptr( params->buffers_ptr ),
-                                      params->count, u64_to_user_ptr( params->addr_ptr ), params->addr_len,
+            status = sock_ioctl_send( handle, event, apc, apc_user, io, fd, buffers_ptr,
+                                      params->count, addr_ptr, params->addr_len,
                                       unix_flags, params->force_async );
             if (needs_close) close( fd );
             return status;
@@ -1813,16 +2078,19 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 
         case IOCTL_AFD_WINE_TRANSMIT:
         {
-            const struct afd_transmit_params *params = in_buffer;
+            struct afd_transmit_params params_buffer;
+            const struct afd_transmit_params *params = &params_buffer;
 
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
                 return status;
-
             if (in_size < sizeof(*params))
             {
                 status = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
+            if ((status = virtual_copy_from_user( &params_buffer, in_buffer,
+                                                   sizeof(params_buffer) )))
+                break;
             status = sock_transmit( handle, event, apc, apc_user, io, fd, params );
             if (needs_close) close( fd );
             return status;

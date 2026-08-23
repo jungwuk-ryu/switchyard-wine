@@ -1,6 +1,11 @@
 TESTDLL   = win32u.dll
 IMPORTS   = imm32 user32 gdi32 dwmapi setupapi opengl32 d3d9 dxgi d3d10 d3d11 d3d12 win32u
 
+kuser_test_EXTRADLLFLAGS = -mconsole
+kuser_test_IMPORTS = win32u
+
 SOURCES = \
 	d3dkmt.c \
+	gdi.c \
+	kuser_test.c \
 	win32u.c

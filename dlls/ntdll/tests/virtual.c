@@ -24,6 +24,7 @@
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
+#include "wine/low_va.h"
 #include "wine/test.h"
 #include "ddk/wdm.h"
 
@@ -41,6 +42,8 @@ static NTSTATUS (WINAPI *pNtAllocateVirtualMemoryEx)(HANDLE, PVOID *, SIZE_T *, 
                                                      MEM_EXTENDED_PARAMETER *, ULONG);
 static NTSTATUS (WINAPI *pNtMapViewOfSectionEx)(HANDLE, HANDLE, PVOID *, const LARGE_INTEGER *, SIZE_T *,
         ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG);
+static NTSTATUS (WINAPI *pNtCreateSectionEx)(HANDLE *, ACCESS_MASK, const OBJECT_ATTRIBUTES *,
+        const LARGE_INTEGER *, ULONG, ULONG, HANDLE, MEM_EXTENDED_PARAMETER *, ULONG);
 static NTSTATUS (WINAPI *pNtSetInformationVirtualMemory)(HANDLE, VIRTUAL_MEMORY_INFORMATION_CLASS,
                                                          ULONG_PTR, PMEMORY_RANGE_ENTRY,
                                                          PVOID, ULONG);
@@ -57,6 +60,1388 @@ static const BOOL is_win64 = sizeof(void*) != sizeof(int);
 static BOOL is_wow64;
 
 static SYSTEM_BASIC_INFORMATION sbi;
+
+static HANDLE create_target_process(const char *arg);
+
+#ifndef _WIN64
+static LONG wow64_guard_exception_count;
+static ULONG_PTR wow64_guard_exception_access;
+static ULONG_PTR wow64_guard_exception_address;
+
+static LONG WINAPI wow64_guard_exception_handler( EXCEPTION_POINTERS *ptrs )
+{
+    EXCEPTION_RECORD *record = ptrs->ExceptionRecord;
+
+    if (record->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement( &wow64_guard_exception_count );
+    if (record->NumberParameters >= 2)
+    {
+        wow64_guard_exception_access = record->ExceptionInformation[0];
+        wow64_guard_exception_address = record->ExceptionInformation[1];
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void test_wow64_translated_guard_resolution(void)
+{
+    MEMORY_BASIC_INFORMATION info;
+    ULONG old_protect;
+    volatile BYTE *page;
+    void *address;
+    void *base;
+    void *protect_page;
+    void *handler;
+    SIZE_T size;
+    NTSTATUS status;
+    BYTE value;
+
+    if (!is_wow64) return;
+
+    address = NULL;
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &address, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "WoW64 guard allocation failed %#lx\n", status );
+    if (status) return;
+    base = address;
+
+    page = (BYTE *)address + page_size;
+    *page = 0x6d;
+    protect_page = (void *)page;
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &size,
+                                     PAGE_READWRITE | PAGE_GUARD, &old_protect );
+    ok( !status, "WoW64 guard protect failed %#lx\n", status );
+    ok( !status && old_protect == PAGE_READWRITE,
+        "WoW64 guard old protection was %#lx\n", old_protect );
+    if (status) goto done;
+    page = protect_page;
+
+    wow64_guard_exception_count = 0;
+    wow64_guard_exception_access = ~(ULONG_PTR)0;
+    wow64_guard_exception_address = 0;
+    handler = RtlAddVectoredExceptionHandler( TRUE, wow64_guard_exception_handler );
+    ok( !!handler, "RtlAddVectoredExceptionHandler failed\n" );
+    if (!handler) goto done;
+    value = *page;
+    RtlRemoveVectoredExceptionHandler( handler );
+
+    ok( value == 0x6d, "guarded read returned %#x\n", value );
+    ok( wow64_guard_exception_count == 1, "got %ld guard exceptions\n",
+        wow64_guard_exception_count );
+    ok( wow64_guard_exception_access == EXCEPTION_READ_FAULT,
+        "got guard access %Ix\n", wow64_guard_exception_access );
+    ok( wow64_guard_exception_address == (ULONG_PTR)page,
+        "got guard address %p, expected %p\n",
+        (void *)wow64_guard_exception_address, (void *)page );
+
+    status = NtQueryVirtualMemory( NtCurrentProcess(), (void *)page,
+                                   MemoryBasicInformation, &info, sizeof(info), NULL );
+    ok( !status, "guard query failed %#lx\n", status );
+    ok( !(info.Protect & PAGE_GUARD), "guard remained set in protection %#lx\n",
+        info.Protect );
+    value = *page;
+    ok( value == 0x6d && wow64_guard_exception_count == 1,
+        "second read returned %#x after %ld guard exceptions\n",
+        value, wow64_guard_exception_count );
+
+done:
+    address = base;
+    size = 0;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
+    ok( !status, "WoW64 guard release failed %#lx\n", status );
+}
+
+static DWORD run_wow64_translated_writewatch_child(void)
+{
+    void *addresses[1] = {NULL};
+    volatile BYTE *memory;
+    DWORD old_protect;
+    ULONG granularity;
+    ULONG_PTR count;
+
+    memory = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                           PAGE_READWRITE );
+    if (!memory) return 1;
+
+    /* The first fault makes this logical page writable.  On a 16K translated
+     * host page it also dirties its three siblings. */
+    memory[0] = 0x11;
+
+    /* PAGE_EXECUTE remains readable on Windows.  The translated fault bridge
+     * must use the effective Unix access instead of requiring VPROT_READ. */
+    memory[0x2000] = 0x33;
+    if (!VirtualProtect( (BYTE *)memory + 0x2000, 0x1000, PAGE_EXECUTE, &old_protect ))
+    {
+        VirtualFree( (void *)memory, 0, MEM_RELEASE );
+        return 2;
+    }
+    if (memory[0x2000] != 0x33)
+    {
+        VirtualFree( (void *)memory, 0, MEM_RELEASE );
+        return 3;
+    }
+
+    /* Make the watched sibling executable.  Its executable-write policy must
+     * not be inherited by the ordinary writable faulting lane. */
+    if (!VirtualProtect( (BYTE *)memory + 0x1000, 0x1000,
+                         PAGE_EXECUTE_READWRITE, &old_protect ))
+    {
+        VirtualFree( (void *)memory, 0, MEM_RELEASE );
+        return 4;
+    }
+
+    /* Re-arm only the sibling.  The target page is now logically writable but
+     * shares a physically read-only host page with a watched 4K lane. */
+    count = ARRAY_SIZE(addresses);
+    if (GetWriteWatch( WRITE_WATCH_FLAG_RESET, (BYTE *)memory + 0x1000, 0x1000,
+                       addresses, &count, &granularity ))
+    {
+        VirtualFree( (void *)memory, 0, MEM_RELEASE );
+        return 5;
+    }
+
+    memory[1] = 0x22;
+    if (memory[1] != 0x22)
+    {
+        VirtualFree( (void *)memory, 0, MEM_RELEASE );
+        return 6;
+    }
+    VirtualFree( (void *)memory, 0, MEM_RELEASE );
+    return 0;
+}
+
+static void test_wow64_translated_writewatch_resolution(void)
+{
+    DWORD exit_code = ~0u, wait;
+    HANDLE process;
+
+    if (!is_wow64) return;
+    process = create_target_process( "wow64_writewatch" );
+    if (!process) return;
+    wait = WaitForSingleObject( process, 5000 );
+    ok( wait == WAIT_OBJECT_0, "WoW64 mixed write-watch child wait returned %#lx\n", wait );
+    if (wait != WAIT_OBJECT_0) TerminateProcess( process, 0xdead );
+    else
+    {
+        ok( GetExitCodeProcess( process, &exit_code ),
+            "GetExitCodeProcess failed, error %lu\n", GetLastError() );
+        ok( exit_code == 0, "WoW64 mixed write-watch child exited %#lx\n", exit_code );
+    }
+    CloseHandle( process );
+}
+
+static void test_wow64_translated_copy_protection(void)
+{
+    MEMORY_BASIC_INFORMATION info;
+    volatile BYTE *memory;
+    void *address, *page;
+    SIZE_T size, transferred;
+    ULONG old_protect, translated = 0;
+    BYTE value, write_value;
+    NTSTATUS status;
+
+    if (!is_wow64) return;
+
+    address = NULL;
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &address, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "WoW64 copy-protection allocation failed %#lx\n", status );
+    if (status) return;
+    memory = address;
+
+    status = NtQueryVirtualMemory( NtCurrentProcess(), address,
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    if (status || !translated)
+    {
+        win_skip( "not running with translated WoW64 memory\n" );
+        goto done;
+    }
+
+    memory[0] = 0x11;
+    memory[page_size] = 0x22;
+    memory[2 * page_size] = 0x33;
+
+    page = (void *)(memory + page_size);
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &size,
+                                     PAGE_NOACCESS, &old_protect );
+    ok( !status && old_protect == PAGE_READWRITE,
+        "WoW64 no-access protect returned %#lx, old protection %#lx\n",
+        status, old_protect );
+    if (status) goto done;
+
+    page = (void *)(memory + 2 * page_size);
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &size,
+                                     PAGE_READWRITE | PAGE_GUARD, &old_protect );
+    ok( !status && old_protect == PAGE_READWRITE,
+        "WoW64 guard protect returned %#lx, old protection %#lx\n",
+        status, old_protect );
+    if (status) goto restore_noaccess;
+
+    value = 0;
+    transferred = ~(SIZE_T)0;
+    status = NtReadVirtualMemory( NtCurrentProcess(), (const void *)memory,
+                                  &value, sizeof(value), &transferred );
+    ok( !status && transferred == sizeof(value) && value == 0x11,
+        "adjacent readable page returned %#lx, size %Iu, value %#x\n",
+        status, transferred, value );
+
+    value = 0xcc;
+    transferred = ~(SIZE_T)0;
+    status = NtReadVirtualMemory( NtCurrentProcess(), (const void *)(memory + page_size),
+                                  &value, sizeof(value), &transferred );
+    ok( status == STATUS_PARTIAL_COPY && !transferred && value == 0xcc,
+        "no-access read returned %#lx, size %Iu, value %#x\n",
+        status, transferred, value );
+
+    value = 0xcc;
+    transferred = ~(SIZE_T)0;
+    status = NtReadVirtualMemory( NtCurrentProcess(), (const void *)(memory + 2 * page_size),
+                                  &value, sizeof(value), &transferred );
+    ok( status == STATUS_PARTIAL_COPY && !transferred && value == 0xcc,
+        "guard read returned %#lx, size %Iu, value %#x\n",
+        status, transferred, value );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), (const void *)(memory + 2 * page_size),
+                                   MemoryBasicInformation, &info, sizeof(info), NULL );
+    ok( !status && (info.Protect & PAGE_GUARD),
+        "guard query returned %#lx, protection %#lx\n", status, info.Protect );
+
+    write_value = 0x44;
+    transferred = ~(SIZE_T)0;
+    status = NtWriteVirtualMemory( NtCurrentProcess(), (void *)memory,
+                                   &write_value, sizeof(write_value), &transferred );
+    ok( !status && transferred == sizeof(write_value) && memory[0] == write_value,
+        "adjacent writable page returned %#lx, size %Iu, value %#x\n",
+        status, transferred, memory[0] );
+
+    transferred = ~(SIZE_T)0;
+    status = NtWriteVirtualMemory( NtCurrentProcess(), (void *)(memory + page_size),
+                                   &write_value, sizeof(write_value), &transferred );
+    ok( status == STATUS_PARTIAL_COPY && !transferred,
+        "no-access write returned %#lx, size %Iu\n", status, transferred );
+
+    transferred = ~(SIZE_T)0;
+    status = NtWriteVirtualMemory( NtCurrentProcess(), (void *)(memory + 2 * page_size),
+                                   &write_value, sizeof(write_value), &transferred );
+    ok( status == STATUS_PARTIAL_COPY && !transferred,
+        "guard write returned %#lx, size %Iu\n", status, transferred );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), (const void *)(memory + 2 * page_size),
+                                   MemoryBasicInformation, &info, sizeof(info), NULL );
+    ok( !status && (info.Protect & PAGE_GUARD),
+        "guard query after write returned %#lx, protection %#lx\n", status, info.Protect );
+
+    page = (void *)(memory + 2 * page_size);
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &size,
+                                     PAGE_READWRITE, &old_protect );
+    ok( !status, "WoW64 guard restore failed %#lx\n", status );
+    if (!status)
+        ok( memory[2 * page_size] == 0x33,
+            "failed guard write changed value to %#x\n", memory[2 * page_size] );
+
+restore_noaccess:
+    page = (void *)(memory + page_size);
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &size,
+                                     PAGE_READWRITE, &old_protect );
+    ok( !status, "WoW64 no-access restore failed %#lx\n", status );
+    if (!status)
+        ok( memory[page_size] == 0x22,
+            "failed no-access write changed value to %#x\n", memory[page_size] );
+
+done:
+    address = (void *)memory;
+    size = 0;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
+    ok( !status, "WoW64 copy-protection release failed %#lx\n", status );
+}
+
+static void test_wow64_unowned_shadow_access(void)
+{
+    LARGE_INTEGER section_size;
+    volatile BYTE *reference = NULL;
+    void *short_view = NULL;
+    SIZE_T reference_size = 0, short_size, transferred;
+    BYTE value, write_value = 0x44;
+    HANDLE section;
+    NTSTATUS status;
+
+    if (!is_wow64) return;
+
+    section_size.QuadPart = 0x10000;
+    status = NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &section_size,
+                              PAGE_READWRITE, SEC_COMMIT, NULL );
+    ok( !status, "unowned-shadow section creation failed %#lx\n", status );
+    if (status) return;
+
+    status = NtMapViewOfSection( section, NtCurrentProcess(), (void **)&reference, 0, 0,
+                                 NULL, &reference_size, ViewShare, 0, PAGE_READWRITE );
+    ok( !status, "reference section map failed %#lx\n", status );
+    if (status) goto done;
+    reference[page_size] = 0x22;
+
+    short_size = page_size;
+    status = NtMapViewOfSection( section, NtCurrentProcess(), &short_view, 0, 0,
+                                 NULL, &short_size, ViewShare, 0, PAGE_READWRITE );
+    ok( !status && short_size == page_size,
+        "short section map returned %#lx, size %Iu\n", status, short_size );
+    if (status) goto done;
+
+    /* Darwin maps the containing 16K host page, but the adjacent 4K lane is
+     * outside the tagged view and must remain logically inaccessible. */
+    value = 0xcc;
+    transferred = ~(SIZE_T)0;
+    status = NtReadVirtualMemory( NtCurrentProcess(), (BYTE *)short_view + page_size,
+                                  &value, sizeof(value), &transferred );
+    ok( status == STATUS_PARTIAL_COPY && !transferred && value == 0xcc,
+        "unowned shadow read returned %#lx, size %Iu, value %#x\n",
+        status, transferred, value );
+
+    transferred = ~(SIZE_T)0;
+    status = NtWriteVirtualMemory( NtCurrentProcess(), (BYTE *)short_view + page_size,
+                                   &write_value, sizeof(write_value), &transferred );
+    ok( status == STATUS_PARTIAL_COPY && !transferred,
+        "unowned shadow write returned %#lx, size %Iu\n", status, transferred );
+    ok( reference[page_size] == 0x22,
+        "failed unowned shadow write changed backing to %#x\n", reference[page_size] );
+
+done:
+    if (short_view)
+    {
+        status = NtUnmapViewOfSection( NtCurrentProcess(), short_view );
+        ok( !status, "short section unmap failed %#lx\n", status );
+    }
+    if (reference)
+    {
+        status = NtUnmapViewOfSection( NtCurrentProcess(), (void *)reference );
+        ok( !status, "reference section unmap failed %#lx\n", status );
+    }
+    NtClose( section );
+}
+
+static void test_wow64_virtual_guest_marshalling(void)
+{
+    MEM_ADDRESS_REQUIREMENTS *requirements;
+    MEM_EXTENDED_PARAMETER *parameter;
+    MEMORY_WORKING_SET_EX_INFORMATION *working_set;
+    MEMORY_RANGE_ENTRY *ranges;
+    MEMORY_BASIC_INFORMATION *query_info;
+    WINE_PROCESS_VM_INFORMATION *machine_info;
+    LARGE_INTEGER section_size;
+    void **address_cell, **watch_addresses;
+    SIZE_T *size_cell, size;
+    ULONG *old_protect_cell;
+    ULONG old_protect, translated = 0, granularity, prefetch_flags = 0;
+    ULONG_PTR watch_count;
+    BYTE *cells, *watch_memory;
+    void *target = NULL, *page, *candidate, *view;
+    HANDLE section = NULL, restricted = NULL, query_handle = NULL;
+    NTSTATUS status;
+    DWORD handles_before = 0, handles_after = 0;
+    BOOL have_handle_count;
+    unsigned int i;
+
+    if (!is_wow64 || !winetest_platform_is_wine || page_size != 0x1000) return;
+
+    cells = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!cells, "guest-marshalling cell allocation failed %lu\n", GetLastError() );
+    if (!cells) return;
+    status = NtQueryVirtualMemory( NtCurrentProcess(), cells,
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    if (status || !translated)
+    {
+        win_skip( "not running with translated WoW64 memory\n" );
+        VirtualFree( cells, 0, MEM_RELEASE );
+        return;
+    }
+
+    address_cell = (void **)(cells + 0x100);
+    size_cell = (SIZE_T *)(cells + 0x1100);
+    old_protect_cell = (ULONG *)(cells + 0x2100);
+
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &target, 0, &size,
+                                      MEM_RESERVE, PAGE_READWRITE );
+    ok( !status, "target reserve failed %#lx\n", status );
+    if (status) goto done;
+
+    *address_cell = (BYTE *)target + page_size;
+    *size_cell = page_size;
+    ok( VirtualProtect( cells + 0x1000, page_size, PAGE_READONLY, &old_protect ),
+        "size-cell read-only protect failed %lu\n", GetLastError() );
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), address_cell, 0, size_cell,
+                                      MEM_COMMIT, PAGE_READWRITE );
+    ok( status == STATUS_ACCESS_VIOLATION,
+        "protected commit output returned %#lx\n", status );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), (BYTE *)target + page_size,
+                                   MemoryBasicInformation, &size, sizeof(size), NULL );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH,
+        "short reserve-state query returned %#lx\n", status );
+    {
+        MEMORY_BASIC_INFORMATION info;
+
+        status = NtQueryVirtualMemory( NtCurrentProcess(), (BYTE *)target + page_size,
+                                       MemoryBasicInformation, &info, sizeof(info), NULL );
+        ok( !status && info.State == MEM_RESERVE,
+            "failed commit changed state, status %#lx state %#lx\n", status, info.State );
+    }
+    ok( VirtualProtect( cells + 0x1000, page_size, PAGE_READWRITE, &old_protect ),
+        "size-cell restore failed %lu\n", GetLastError() );
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), address_cell, 0, size_cell,
+                                      MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "valid commit follow-up returned %#lx\n", status );
+
+    *address_cell = (BYTE *)target + page_size;
+    *size_cell = page_size;
+    *old_protect_cell = 0xdeadbeef;
+    ok( VirtualProtect( cells + 0x2000, page_size, PAGE_READWRITE | PAGE_GUARD,
+                        &old_protect ), "old-protection guard failed %lu\n", GetLastError() );
+    status = NtProtectVirtualMemory( NtCurrentProcess(), address_cell, size_cell,
+                                     PAGE_READONLY, old_protect_cell );
+    ok( status == STATUS_GUARD_PAGE_VIOLATION,
+        "guarded old-protection output returned %#lx\n", status );
+    {
+        MEMORY_BASIC_INFORMATION info;
+
+        status = NtQueryVirtualMemory( NtCurrentProcess(), (BYTE *)target + page_size,
+                                       MemoryBasicInformation, &info, sizeof(info), NULL );
+        ok( !status && info.Protect == PAGE_READWRITE,
+            "failed protect changed target, status %#lx protection %#lx\n",
+            status, info.Protect );
+        status = NtQueryVirtualMemory( NtCurrentProcess(), cells + 0x2000,
+                                       MemoryBasicInformation, &info, sizeof(info), NULL );
+        ok( !status && (info.Protect & PAGE_GUARD),
+            "output probe consumed guard, status %#lx protection %#lx\n",
+            status, info.Protect );
+    }
+    ok( VirtualProtect( cells + 0x2000, page_size, PAGE_READWRITE, &old_protect ),
+        "old-protection guard restore failed %lu\n", GetLastError() );
+    status = NtProtectVirtualMemory( NtCurrentProcess(), address_cell, size_cell,
+                                     PAGE_READONLY, old_protect_cell );
+    ok( !status && *old_protect_cell == PAGE_READWRITE,
+        "valid protect follow-up returned %#lx old %#lx\n", status, *old_protect_cell );
+    status = NtProtectVirtualMemory( NtCurrentProcess(), address_cell, size_cell,
+                                     PAGE_READWRITE, old_protect_cell );
+    ok( !status, "target protection restore returned %#lx\n", status );
+
+    *address_cell = (BYTE *)target + page_size;
+    *size_cell = page_size;
+    ok( VirtualProtect( cells + 0x1000, page_size, PAGE_READONLY, &old_protect ),
+        "free size-cell protect failed %lu\n", GetLastError() );
+    status = NtFreeVirtualMemory( NtCurrentProcess(), address_cell, size_cell, MEM_DECOMMIT );
+    ok( status == STATUS_ACCESS_VIOLATION,
+        "protected decommit output returned %#lx\n", status );
+    {
+        MEMORY_BASIC_INFORMATION info;
+
+        status = NtQueryVirtualMemory( NtCurrentProcess(), (BYTE *)target + page_size,
+                                       MemoryBasicInformation, &info, sizeof(info), NULL );
+        ok( !status && info.State == MEM_COMMIT,
+            "failed decommit changed state, status %#lx state %#lx\n", status, info.State );
+    }
+    ok( VirtualProtect( cells + 0x1000, page_size, PAGE_READWRITE, &old_protect ),
+        "free size-cell restore failed %lu\n", GetLastError() );
+
+    query_info = (MEMORY_BASIC_INFORMATION *)(cells + 0x4000 - sizeof(*query_info) / 2);
+    memset( query_info, 0xcc, sizeof(*query_info) );
+    ok( VirtualProtect( cells + 0x4000, page_size, PAGE_NOACCESS, &old_protect ),
+        "query output no-access protect failed %lu\n", GetLastError() );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), target, MemoryBasicInformation,
+                                   query_info, sizeof(*query_info), NULL );
+    ok( status == STATUS_ACCESS_VIOLATION,
+        "cross-page query output returned %#lx\n", status );
+    ok( *(BYTE *)query_info == 0xcc, "failed query partially changed output\n" );
+    ok( VirtualProtect( cells + 0x4000, page_size, PAGE_READWRITE, &old_protect ),
+        "query output restore failed %lu\n", GetLastError() );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), target, MemoryBasicInformation,
+                                   query_info, sizeof(*query_info), NULL );
+    ok( !status && query_info->State == MEM_RESERVE,
+        "valid query follow-up returned %#lx state %#lx\n", status, query_info->State );
+
+    working_set = (MEMORY_WORKING_SET_EX_INFORMATION *)(
+        cells + 0x5000 - sizeof(*working_set) );
+    working_set[0].VirtualAddress = target;
+    working_set[1].VirtualAddress = (BYTE *)target + page_size;
+    ok( VirtualProtect( cells + 0x5000, page_size, PAGE_NOACCESS, &old_protect ),
+        "working-set lane protect failed %lu\n", GetLastError() );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), NULL,
+                                   MemoryWorkingSetExInformation, working_set,
+                                   2 * sizeof(*working_set), NULL );
+    ok( status == STATUS_ACCESS_VIOLATION,
+        "cross-page WorkingSetEx input returned %#lx\n", status );
+    ok( VirtualProtect( cells + 0x5000, page_size, PAGE_READWRITE, &old_protect ),
+        "working-set lane restore failed %lu\n", GetLastError() );
+    status = NtDuplicateObject( NtCurrentProcess(), NtCurrentProcess(), NtCurrentProcess(),
+                                &restricted, SYNCHRONIZE, 0, 0 );
+    ok( !status, "restricted self duplicate failed %#lx\n", status );
+    if (!status)
+    {
+        status = NtQueryVirtualMemory( restricted, NULL, MemoryWorkingSetExInformation,
+                                       working_set, sizeof(*working_set), NULL );
+        ok( status == STATUS_ACCESS_DENIED,
+            "restricted WorkingSetEx query returned %#lx\n", status );
+        NtClose( restricted );
+        restricted = NULL;
+    }
+    status = NtDuplicateObject( NtCurrentProcess(), NtCurrentProcess(), NtCurrentProcess(),
+                                &query_handle, PROCESS_QUERY_INFORMATION, 0, 0 );
+    ok( !status, "query self duplicate failed %#lx\n", status );
+    if (!status)
+    {
+        status = NtQueryVirtualMemory( query_handle, NULL, MemoryWorkingSetExInformation,
+                                       working_set, sizeof(*working_set), NULL );
+        ok( !status, "valid WorkingSetEx follow-up returned %#lx\n", status );
+        status = NtQueryVirtualMemory( query_handle, target,
+                                       MemoryWineWow64TranslatedInformation,
+                                       &translated, sizeof(translated), NULL );
+        ok( status == STATUS_INVALID_HANDLE,
+            "duplicated-self translated-info query returned %#lx\n", status );
+        NtClose( query_handle );
+        query_handle = NULL;
+    }
+
+    watch_memory = VirtualAlloc( NULL, 0x10000,
+                                 MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                                 PAGE_READWRITE );
+    ok( !!watch_memory, "write-watch allocation failed %lu\n", GetLastError() );
+    if (watch_memory)
+    {
+        BOOL found = FALSE;
+
+        watch_memory[0] = 0x5a;
+        watch_memory[page_size] = 0xa5;
+        watch_addresses = (void **)(cells + 0x6000 - sizeof(*watch_addresses));
+        watch_count = 2;
+        ok( VirtualProtect( cells + 0x6000, page_size, PAGE_NOACCESS, &old_protect ),
+            "write-watch output lane protect failed %lu\n", GetLastError() );
+        status = NtGetWriteWatch( NtCurrentProcess(), WRITE_WATCH_FLAG_RESET,
+                                  watch_memory, 2 * page_size, watch_addresses,
+                                  &watch_count, &granularity );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "protected write-watch reset returned %#lx\n", status );
+        ok( VirtualProtect( cells + 0x6000, page_size, PAGE_READWRITE, &old_protect ),
+            "write-watch output lane restore failed %lu\n", GetLastError() );
+        watch_count = 2;
+        status = NtGetWriteWatch( NtCurrentProcess(), 0, watch_memory, page_size,
+                                  watch_addresses, &watch_count, &granularity );
+        ok( !status, "post-failure write-watch query returned %#lx\n", status );
+        for (i = 0; !status && i < watch_count; i++)
+            if (watch_addresses[i] == watch_memory) found = TRUE;
+        ok( found, "failed reset discarded the write watch\n" );
+        watch_count = 2;
+        status = NtGetWriteWatch( NtCurrentProcess(), WRITE_WATCH_FLAG_RESET,
+                                  watch_memory, 2 * page_size, watch_addresses,
+                                  &watch_count, &granularity );
+        ok( !status, "valid write-watch reset returned %#lx\n", status );
+        VirtualFree( watch_memory, 0, MEM_RELEASE );
+    }
+
+    machine_info = (WINE_PROCESS_VM_INFORMATION *)(cells + 0x7000);
+    ok( VirtualProtect( cells + 0x7000, page_size, PAGE_READONLY, &old_protect ),
+        "machine-info output protect failed %lu\n", GetLastError() );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), NULL,
+                                   MemoryWineProcessVmMachineInformation,
+                                   machine_info, sizeof(*machine_info), NULL );
+    ok( status == STATUS_ACCESS_VIOLATION,
+        "protected VM-machine output returned %#lx\n", status );
+    ok( VirtualProtect( cells + 0x7000, page_size, PAGE_READWRITE, &old_protect ),
+        "machine-info output restore failed %lu\n", GetLastError() );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), NULL,
+                                   MemoryWineProcessVmMachineInformation,
+                                   machine_info, sizeof(*machine_info), NULL );
+    ok( !status && machine_info->Machine == IMAGE_FILE_MACHINE_I386,
+        "valid VM-machine follow-up returned %#lx machine %#x\n",
+        status, machine_info->Machine );
+
+    {
+        static const WCHAR missing_unixlib[] = L"__wine_missing_marshalling_test";
+        UNICODE_STRING *unix_name = (UNICODE_STRING *)(
+            cells + 0xc000 - sizeof(*unix_name) / 2 );
+        UINT64 unix_result[2] = {0};
+        SIZE_T unix_retlen = ~(SIZE_T)0;
+
+        memcpy( cells + 0xd000, missing_unixlib, sizeof(missing_unixlib) );
+        unix_name->Length = sizeof(missing_unixlib) - sizeof(WCHAR);
+        unix_name->MaximumLength = sizeof(missing_unixlib);
+        unix_name->Buffer = (WCHAR *)(cells + 0xd000);
+        ok( VirtualProtect( cells + 0xc000, page_size, PAGE_NOACCESS, &old_protect ),
+            "Unix-name header lane protect failed %lu\n", GetLastError() );
+        status = NtQueryVirtualMemory( NtCurrentProcess(), unix_name,
+                                       MemoryWineLoadUnixLibByName, unix_result,
+                                       sizeof(unix_result), &unix_retlen );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "cross-page Unix-name header returned %#lx\n", status );
+        ok( VirtualProtect( cells + 0xc000, page_size, PAGE_READWRITE, &old_protect ),
+            "Unix-name header lane restore failed %lu\n", GetLastError() );
+        ok( VirtualProtect( cells + 0xd000, page_size, PAGE_NOACCESS, &old_protect ),
+            "Unix-name buffer lane protect failed %lu\n", GetLastError() );
+        status = NtQueryVirtualMemory( NtCurrentProcess(), unix_name,
+                                       MemoryWineLoadUnixLibByName, unix_result,
+                                       sizeof(unix_result), &unix_retlen );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "protected Unix-name buffer returned %#lx\n", status );
+        ok( VirtualProtect( cells + 0xd000, page_size, PAGE_READWRITE, &old_protect ),
+            "Unix-name buffer lane restore failed %lu\n", GetLastError() );
+        status = NtQueryVirtualMemory( NtCurrentProcess(), unix_name,
+                                       MemoryWineLoadUnixLibByName, unix_result,
+                                       sizeof(unix_result), &unix_retlen );
+        ok( status == STATUS_DLL_NOT_FOUND,
+            "valid missing Unix-name follow-up returned %#lx\n", status );
+    }
+
+    if (pNtSetInformationVirtualMemory)
+    {
+        ranges = (MEMORY_RANGE_ENTRY *)(cells + 0x8000 - sizeof(*ranges));
+        ranges[0].VirtualAddress = target;
+        ranges[0].NumberOfBytes = page_size;
+        ranges[1].VirtualAddress = (BYTE *)target + page_size;
+        ranges[1].NumberOfBytes = page_size;
+        ok( VirtualProtect( cells + 0x8000, page_size, PAGE_NOACCESS, &old_protect ),
+            "range input lane protect failed %lu\n", GetLastError() );
+        status = pNtSetInformationVirtualMemory( NtCurrentProcess(), VmPrefetchInformation,
+                                                 2, ranges, &prefetch_flags,
+                                                 sizeof(prefetch_flags) );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "cross-page range input returned %#lx\n", status );
+        ok( VirtualProtect( cells + 0x8000, page_size, PAGE_READWRITE, &old_protect ),
+            "range input lane restore failed %lu\n", GetLastError() );
+        status = pNtSetInformationVirtualMemory( NtCurrentProcess(), VmPrefetchInformation,
+                                                 2, ranges, &prefetch_flags,
+                                                 sizeof(prefetch_flags) );
+        ok( !status, "valid range follow-up returned %#lx\n", status );
+        status = pNtSetInformationVirtualMemory( NtCurrentProcess(), VmPrefetchInformation,
+                                                 ~(ULONG_PTR)0, ranges, &prefetch_flags,
+                                                 sizeof(prefetch_flags) );
+        ok( status == STATUS_INTEGER_OVERFLOW,
+            "range-count overflow returned %#lx\n", status );
+    }
+
+    if (pNtAllocateVirtualMemoryEx)
+    {
+        parameter = (MEM_EXTENDED_PARAMETER *)(cells + 0x9000);
+        requirements = (MEM_ADDRESS_REQUIREMENTS *)(cells + 0xa000);
+        memset( parameter, 0, sizeof(*parameter) );
+        memset( requirements, 0, sizeof(*requirements) );
+        parameter->Type = MemExtendedParameterAddressRequirements;
+        parameter->Pointer = requirements;
+        *address_cell = NULL;
+        *size_cell = 0x10000;
+        ok( VirtualProtect( cells + 0xa000, page_size, PAGE_NOACCESS, &old_protect ),
+            "nested requirements lane protect failed %lu\n", GetLastError() );
+        status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), address_cell, size_cell,
+                                             MEM_RESERVE, PAGE_READWRITE, parameter, 1 );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "protected address requirements returned %#lx\n", status );
+        ok( !*address_cell, "failed extended allocation changed address to %p\n",
+            *address_cell );
+        ok( VirtualProtect( cells + 0xa000, page_size, PAGE_READWRITE, &old_protect ),
+            "nested requirements lane restore failed %lu\n", GetLastError() );
+        status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), address_cell, size_cell,
+                                             MEM_RESERVE, PAGE_READWRITE, parameter, 1 );
+        ok( !status, "valid extended allocation follow-up returned %#lx\n", status );
+        if (!status)
+        {
+            page = *address_cell;
+            size = 0;
+            NtFreeVirtualMemory( NtCurrentProcess(), &page, &size, MEM_RELEASE );
+        }
+        *address_cell = NULL;
+        *size_cell = 0x10000;
+        status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), address_cell, size_cell,
+                                             MEM_RESERVE, PAGE_READWRITE, parameter, ~0u );
+        ok( status == STATUS_INVALID_PARAMETER,
+            "extended-parameter count overflow returned %#lx\n", status );
+    }
+
+    if (pNtCreateSectionEx)
+    {
+        HANDLE *handle_cell = (HANDLE *)address_cell;
+
+        section_size.QuadPart = page_size;
+        status = NtQueryInformationProcess( NtCurrentProcess(), ProcessHandleCount,
+                                            &handles_before, sizeof(handles_before), NULL );
+        have_handle_count = !status;
+        ok( VirtualProtect( cells, page_size, PAGE_READONLY, &old_protect ),
+            "section handle output protect failed %lu\n", GetLastError() );
+        status = pNtCreateSectionEx( handle_cell, SECTION_ALL_ACCESS, NULL, &section_size,
+                                     PAGE_READWRITE, SEC_COMMIT, NULL, NULL, 0 );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "protected section handle output returned %#lx\n", status );
+        ok( VirtualProtect( cells, page_size, PAGE_READWRITE, &old_protect ),
+            "section handle output restore failed %lu\n", GetLastError() );
+        if (have_handle_count)
+        {
+            status = NtQueryInformationProcess( NtCurrentProcess(), ProcessHandleCount,
+                                                &handles_after, sizeof(handles_after), NULL );
+            ok( !status, "post-failure handle-count query returned %#lx\n", status );
+            if (!status)
+                ok( handles_after == handles_before,
+                    "failed section publish leaked handles (%lu -> %lu)\n",
+                    handles_before, handles_after );
+        }
+        status = pNtCreateSectionEx( handle_cell, SECTION_ALL_ACCESS, NULL, &section_size,
+                                     PAGE_READWRITE, SEC_COMMIT, NULL, NULL, 0 );
+        ok( !status, "valid section create follow-up returned %#lx\n", status );
+        if (!status) NtClose( *handle_cell );
+    }
+
+    section_size.QuadPart = page_size;
+    status = NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &section_size,
+                              PAGE_READWRITE, SEC_COMMIT, NULL );
+    ok( !status, "map test section creation failed %#lx\n", status );
+    if (!status)
+    {
+        candidate = NULL;
+        size = 0x10000;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &candidate, 0, &size,
+                                          MEM_RESERVE, PAGE_NOACCESS );
+        ok( !status, "map candidate reserve failed %#lx\n", status );
+        if (!status)
+        {
+            view = candidate;
+            size = 0;
+            status = NtFreeVirtualMemory( NtCurrentProcess(), &view, &size, MEM_RELEASE );
+            ok( !status, "map candidate release failed %#lx\n", status );
+            *address_cell = candidate;
+            *size_cell = page_size;
+            ok( VirtualProtect( cells + 0x1000, page_size, PAGE_READONLY, &old_protect ),
+                "map size-cell protect failed %lu\n", GetLastError() );
+            status = NtMapViewOfSection( section, NtCurrentProcess(), address_cell, 0, 0,
+                                         NULL, size_cell, ViewShare, 0, PAGE_READWRITE );
+            ok( status == STATUS_ACCESS_VIOLATION,
+                "protected map output returned %#lx\n", status );
+            ok( VirtualProtect( cells + 0x1000, page_size, PAGE_READWRITE, &old_protect ),
+                "map size-cell restore failed %lu\n", GetLastError() );
+            *address_cell = candidate;
+            *size_cell = page_size;
+            status = NtMapViewOfSection( section, NtCurrentProcess(), address_cell, 0, 0,
+                                         NULL, size_cell, ViewShare, 0, PAGE_READWRITE );
+            ok( !status, "valid map follow-up returned %#lx\n", status );
+            if (!status) NtUnmapViewOfSection( NtCurrentProcess(), *address_cell );
+        }
+        NtClose( section );
+        section = NULL;
+    }
+
+done:
+    if (restricted) NtClose( restricted );
+    if (query_handle) NtClose( query_handle );
+    if (section) NtClose( section );
+    if (target)
+    {
+        page = target;
+        size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &page, &size, MEM_RELEASE );
+    }
+    for (i = 0; i < 0xe; i++)
+        VirtualProtect( cells + i * page_size, page_size, PAGE_READWRITE, &old_protect );
+    VirtualFree( cells, 0, MEM_RELEASE );
+}
+#else
+static void test_wow64_translated_guard_resolution(void)
+{
+}
+
+static void test_wow64_translated_writewatch_resolution(void)
+{
+}
+
+static void test_wow64_translated_copy_protection(void)
+{
+}
+
+static void test_wow64_unowned_shadow_access(void)
+{
+}
+
+static void test_wow64_virtual_guest_marshalling(void)
+{
+}
+#endif
+
+static void test_wow64_process_vm_machine_information(void)
+{
+#ifndef _WIN64
+    static const ACCESS_MASK allowed_access[] =
+    {
+        PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
+        PROCESS_VM_OPERATION,
+        PROCESS_QUERY_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        SYNCHRONIZE,
+    };
+    HANDLE process;
+    WINE_PROCESS_VM_INFORMATION info;
+    SIZE_T ret_len;
+    NTSTATUS status;
+    unsigned int i;
+
+    if (!is_wow64 || !winetest_platform_is_wine) return;
+
+    for (i = 0; i < ARRAY_SIZE(allowed_access); i++)
+    {
+        process = NULL;
+        status = NtDuplicateObject( NtCurrentProcess(), NtCurrentProcess(), NtCurrentProcess(),
+                                    &process, allowed_access[i], 0, 0 );
+        ok( !status, "NtDuplicateObject(%#lx) failed %#lx\n", allowed_access[i], status );
+        if (status) continue;
+
+        memset( &info, 0, sizeof(info) );
+        ret_len = ~(SIZE_T)0;
+        status = NtQueryVirtualMemory( process, NULL, MemoryWineProcessVmMachineInformation,
+                                       &info, sizeof(info), &ret_len );
+        ok( !status, "VM machine query (%#lx) failed %#lx\n", allowed_access[i], status );
+        ok( info.Version == WINE_PROCESS_VM_INFORMATION_VERSION, "got version %lu\n", info.Version );
+        ok( info.Size == sizeof(info), "got structure size %lu\n", info.Size );
+        ok( info.Machine != 0, "got machine %#x\n", info.Machine );
+        ok( !(info.Flags & ~WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED), "got flags %#x\n", info.Flags );
+        ok( !info.Reserved, "got reserved %#lx\n", info.Reserved );
+        ok( ret_len == sizeof(info), "got size %Iu\n", ret_len );
+        NtClose( process );
+    }
+
+    memset( &info, 0, sizeof(info) );
+    ret_len = ~(SIZE_T)0;
+    status = NtQueryVirtualMemory( NtCurrentProcess(), (void *)(ULONG_PTR)~(ULONG)0,
+                                   MemoryWineProcessVmMachineInformation,
+                                   &info, sizeof(info), &ret_len );
+    ok( !status, "maximum-address query failed %#lx\n", status );
+    ok( info.Version == WINE_PROCESS_VM_INFORMATION_VERSION, "got version %lu\n", info.Version );
+    ok( info.Size == sizeof(info), "got structure size %lu\n", info.Size );
+    ok( info.Machine != 0, "got machine %#x\n", info.Machine );
+    ok( !(info.Flags & ~WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED), "got flags %#x\n", info.Flags );
+    ok( !info.Reserved, "got reserved %#lx\n", info.Reserved );
+    ok( ret_len == sizeof(info), "got size %Iu\n", ret_len );
+
+    memset( &info, 0xdd, sizeof(info) );
+    ret_len = 0xdeadbeef;
+    status = NtQueryVirtualMemory( NtCurrentProcess(), NULL,
+                                   MemoryWineProcessVmMachineInformation,
+                                   &info, sizeof(info) - 1, &ret_len );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH, "short query returned %#lx\n", status );
+    ok( info.Version == 0xdddddddd, "short query changed output to %#lx\n", info.Version );
+    ok( ret_len == 0xdeadbeef, "short query changed size to %Iu\n", ret_len );
+
+    status = NtQueryVirtualMemory( NtCurrentProcess(), NULL,
+                                   MemoryWineProcessVmMachineInformation,
+                                   &info, sizeof(info) + 1, &ret_len );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH, "long query returned %#lx\n", status );
+    ok( info.Version == 0xdddddddd, "long query changed output to %#lx\n", info.Version );
+    ok( ret_len == 0xdeadbeef, "long query changed size to %Iu\n", ret_len );
+
+    status = NtQueryVirtualMemory( NtCurrentProcess(), NULL,
+                                   MemoryWineProcessVmMachineInformation,
+                                   NULL, sizeof(info), &ret_len );
+    ok( status == STATUS_ACCESS_VIOLATION, "null-buffer query returned %#lx\n", status );
+    ok( ret_len == 0xdeadbeef, "null-buffer query changed size to %Iu\n", ret_len );
+
+    status = NtQueryVirtualMemory( (HANDLE)(ULONG_PTR)0xdeadbeef, NULL,
+                                   MemoryWineProcessVmMachineInformation,
+                                   &info, sizeof(info), &ret_len );
+    ok( status == STATUS_INVALID_HANDLE, "invalid-handle query returned %#lx\n", status );
+    status = NtQueryVirtualMemory( (HANDLE)(ULONG_PTR)0xdeadbeef, NULL,
+                                   MemoryWineProcessVmMachineInformation,
+                                   &info, sizeof(info) - 1, &ret_len );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH,
+        "short invalid-handle query returned %#lx\n", status );
+#endif
+}
+
+static void test_wow64_translated_view_contract(void)
+{
+#ifdef _WIN64
+    static const ACCESS_MASK vm_access[] =
+    {
+        PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
+        PROCESS_VM_OPERATION,
+    };
+    const ULONG_PTR shadow_start = WINE_LOW_VA_SHADOW_BASE;
+    const ULONG_PTR shadow_end = WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE;
+    const ULONG_PTR test_margin = 0x1000000;
+    MEM_EXTENDED_PARAMETER translated_params[2] = {0};
+    MEM_EXTENDED_PARAMETER ext = {0};
+    MEM_ADDRESS_REQUIREMENTS requirements = {0};
+    MEMORY_BASIC_INFORMATION info;
+    ULONG translated = 2;
+    ULONG_PTR shared_data = (ULONG_PTR)NtCurrentTeb()->Peb->SharedData;
+    LARGE_INTEGER section_size;
+    HANDLE process;
+    HANDLE section;
+    void *address, *page, *ordinary, *translated_view;
+    SIZE_T size, ret_len = 0;
+    NTSTATUS status;
+    ULONG old_protect;
+    WINE_PROCESS_VM_INFORMATION vm_info;
+    unsigned int i;
+    BOOL ordinary_reserved, translated_reserved;
+
+    if (!is_wow64) return;
+    if (shared_data < WINE_LOW_VA_SHADOW_BASE ||
+        shared_data - WINE_LOW_VA_SHADOW_BASE >= WINE_LOW_VA_SHADOW_SIZE)
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(vm_access); i++)
+    {
+        process = NULL;
+        status = NtDuplicateObject( NtCurrentProcess(), NtCurrentProcess(), NtCurrentProcess(),
+                                    &process, vm_access[i], 0, 0 );
+        ok( !status, "NtDuplicateObject(%#lx) failed %#lx\n", vm_access[i], status );
+        if (!status)
+        {
+            memset( &vm_info, 0, sizeof(vm_info) );
+            ret_len = 0;
+            status = NtQueryVirtualMemory( process, NULL, MemoryWineProcessVmMachineInformation,
+                                           &vm_info, sizeof(vm_info), &ret_len );
+            ok( !status, "VM machine query (%#lx) failed %#lx\n", vm_access[i], status );
+            ok( vm_info.Version == WINE_PROCESS_VM_INFORMATION_VERSION,
+                "got version %lu\n", vm_info.Version );
+            ok( vm_info.Size == sizeof(vm_info), "got structure size %lu\n", vm_info.Size );
+            ok( vm_info.Machine == IMAGE_FILE_MACHINE_I386, "got machine %#x\n", vm_info.Machine );
+            ok( vm_info.Flags == WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED,
+                "got flags %#x\n", vm_info.Flags );
+            ok( !vm_info.Reserved, "got reserved %#lx\n", vm_info.Reserved );
+            ok( ret_len == sizeof(vm_info), "got size %Iu\n", ret_len );
+            NtClose( process );
+        }
+    }
+
+    process = NULL;
+    status = NtDuplicateObject( NtCurrentProcess(), NtCurrentProcess(), NtCurrentProcess(),
+                                &process, SYNCHRONIZE, 0, 0 );
+    ok( !status, "NtDuplicateObject(SYNCHRONIZE) failed %#lx\n", status );
+    if (!status)
+    {
+        status = NtQueryVirtualMemory( process, NULL, MemoryWineProcessVmMachineInformation,
+                                       &vm_info, sizeof(vm_info), NULL );
+        ok( status == STATUS_ACCESS_DENIED, "no-VM-rights query returned %#lx\n", status );
+        NtClose( process );
+    }
+    status = NtQueryVirtualMemory( (HANDLE)(ULONG_PTR)0xdeadbeef, NULL,
+                                   MemoryWineProcessVmMachineInformation,
+                                   &vm_info, sizeof(vm_info), NULL );
+    ok( status == STATUS_INVALID_HANDLE, "invalid-handle query returned %#lx\n", status );
+
+    status = NtQueryVirtualMemory( NtCurrentProcess(), (void *)shared_data,
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated) - 1, NULL );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH, "got %#lx\n", status );
+    status = NtQueryVirtualMemory( 0, (void *)shared_data,
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    ok( status == STATUS_INVALID_HANDLE, "got %#lx\n", status );
+
+    translated = 0;
+    status = NtQueryVirtualMemory( NtCurrentProcess(), (void *)shared_data,
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), &ret_len );
+    ok( !status, "got %#lx\n", status );
+    ok( translated == 1, "got %lu\n", translated );
+    ok( ret_len == sizeof(translated), "got %Iu\n", ret_len );
+
+    translated = 1;
+    status = NtQueryVirtualMemory( NtCurrentProcess(), test_wow64_translated_view_contract,
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    ok( !status, "got %#lx\n", status );
+    ok( translated == 0, "got %lu\n", translated );
+
+    address = (void *)(WINE_LOW_VA_SHADOW_BASE + 0x50000000);
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &address, 0, &size,
+                                      MEM_RESERVE, PAGE_READWRITE );
+    ok( status == STATUS_CONFLICTING_ADDRESSES, "got %#lx, address %p\n", status, address );
+
+    address = NULL;
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &address, 0, &size,
+                                      MEM_RESERVE, PAGE_READWRITE );
+    ok( !status, "got %#lx\n", status );
+    ok( (ULONG_PTR)address < WINE_LOW_VA_SHADOW_BASE ||
+        (ULONG_PTR)address - WINE_LOW_VA_SHADOW_BASE >= WINE_LOW_VA_SHADOW_SIZE,
+        "ordinary allocation entered the translated shadow at %p\n", address );
+    if (!status)
+    {
+        size = 0;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
+        ok( !status, "got %#lx\n", status );
+    }
+
+    if (!pNtAllocateVirtualMemoryEx)
+    {
+        win_skip( "NtAllocateVirtualMemoryEx() is missing\n" );
+        return;
+    }
+
+    ext.Type = MemExtendedParameterAddressRequirements;
+    ext.Pointer = &requirements;
+    requirements.LowestStartingAddress = (void *)(shadow_start - test_margin);
+    requirements.HighestEndingAddress = (void *)(shadow_end + test_margin - 1);
+
+    address = NULL;
+    size = 0x10000;
+    status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), &address, &size, MEM_RESERVE,
+                                         PAGE_READWRITE, &ext, 1 );
+    ok( !status, "bottom-up allocation failed, status %#lx\n", status );
+    if (!status)
+    {
+        ok( (ULONG_PTR)address >= shadow_start - test_margin &&
+            (ULONG_PTR)address + size <= shadow_start,
+            "bottom-up allocation did not use the range below the shadow: %p size %Iu\n",
+            address, size );
+        size = 0;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
+        ok( !status, "got %#lx\n", status );
+    }
+
+    address = NULL;
+    size = 0x10000;
+    status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), &address, &size,
+                                         MEM_RESERVE | MEM_TOP_DOWN,
+                                         PAGE_READWRITE, &ext, 1 );
+    ok( !status, "top-down allocation failed, status %#lx\n", status );
+    if (!status)
+    {
+        ok( (ULONG_PTR)address >= shadow_end &&
+            (ULONG_PTR)address + size - 1 <= shadow_end + test_margin - 1,
+            "top-down allocation did not use the range above the shadow: %p size %Iu\n",
+            address, size );
+        size = 0;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
+        ok( !status, "got %#lx\n", status );
+    }
+
+    /* Placeholder coalescing must not erase the type-31 ownership boundary,
+     * regardless of which side of the requested range is translated. */
+    ordinary_reserved = translated_reserved = FALSE;
+    ordinary = (void *)(shadow_start - 0x10000);
+    size = 0x10000;
+    status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), &ordinary, &size,
+                                         MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                         PAGE_NOACCESS, NULL, 0 );
+    ok( !status, "lower ordinary placeholder reserve failed %#lx\n", status );
+    if (!status) ordinary_reserved = TRUE;
+    translated_view = (void *)shadow_start;
+    requirements.LowestStartingAddress = translated_view;
+    requirements.HighestEndingAddress = (BYTE *)translated_view + 0xffff;
+    translated_params[0].Type = MemExtendedParameterAddressRequirements;
+    translated_params[0].Pointer = &requirements;
+    translated_params[1].Type = WINE_MEM_EXTENDED_PARAMETER_WOW64_TRANSLATED;
+    size = 0x10000;
+    if (!status)
+    {
+        status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), &translated_view, &size,
+                                             MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                             PAGE_NOACCESS, translated_params,
+                                             ARRAY_SIZE(translated_params) );
+        ok( !status, "lower translated placeholder reserve failed %#lx\n", status );
+        if (!status) translated_reserved = TRUE;
+    }
+    if (!status)
+    {
+        address = ordinary;
+        size = 0x20000;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &address, &size,
+                                      MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS );
+        ok( status == STATUS_CONFLICTING_ADDRESSES,
+            "ordinary-to-translated coalesce returned %#lx\n", status );
+        translated = 0;
+        status = NtQueryVirtualMemory( NtCurrentProcess(), translated_view,
+                                       MemoryWineWow64TranslatedInformation,
+                                       &translated, sizeof(translated), NULL );
+        ok( !status && translated == 1,
+            "lower translated placeholder changed, status %#lx translated %lu\n",
+            status, translated );
+    }
+    if (translated_reserved)
+    {
+        size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &translated_view, &size, MEM_RELEASE );
+    }
+    if (ordinary_reserved)
+    {
+        size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &ordinary, &size, MEM_RELEASE );
+    }
+
+    ordinary_reserved = translated_reserved = FALSE;
+    translated_view = (void *)(shadow_end - 0x10000);
+    requirements.LowestStartingAddress = translated_view;
+    requirements.HighestEndingAddress = (BYTE *)translated_view + 0xffff;
+    size = 0x10000;
+    status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), &translated_view, &size,
+                                         MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                         PAGE_NOACCESS, translated_params,
+                                         ARRAY_SIZE(translated_params) );
+    ok( !status, "upper translated placeholder reserve failed %#lx\n", status );
+    if (!status) translated_reserved = TRUE;
+    ordinary = (void *)shadow_end;
+    size = 0x10000;
+    if (!status)
+    {
+        status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), &ordinary, &size,
+                                             MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                             PAGE_NOACCESS, NULL, 0 );
+        ok( !status, "upper ordinary placeholder reserve failed %#lx\n", status );
+        if (!status) ordinary_reserved = TRUE;
+    }
+    if (!status)
+    {
+        address = translated_view;
+        size = 0x20000;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), &address, &size,
+                                      MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS );
+        ok( status == STATUS_CONFLICTING_ADDRESSES,
+            "translated-to-ordinary coalesce returned %#lx\n", status );
+        translated = 0;
+        status = NtQueryVirtualMemory( NtCurrentProcess(), translated_view,
+                                       MemoryWineWow64TranslatedInformation,
+                                       &translated, sizeof(translated), NULL );
+        ok( !status && translated == 1,
+            "upper translated placeholder changed, status %#lx translated %lu\n",
+            status, translated );
+    }
+    if (ordinary_reserved)
+    {
+        size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &ordinary, &size, MEM_RELEASE );
+    }
+    if (translated_reserved)
+    {
+        size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &translated_view, &size, MEM_RELEASE );
+    }
+
+    /* Exercise every translated mutation through the registered provider.  The
+     * observer is intentionally not replaceable by a late test double: these
+     * state checks cover the real producer/consumer path and the provider's
+     * native harness validates the exact event snapshots. */
+    requirements.LowestStartingAddress = (void *)(shadow_start + 0x60000000);
+    requirements.HighestEndingAddress = (void *)(shadow_start + 0x6fffffff);
+    translated_params[0].Type = MemExtendedParameterAddressRequirements;
+    translated_params[0].Pointer = &requirements;
+    translated_params[1].Type = WINE_MEM_EXTENDED_PARAMETER_WOW64_TRANSLATED;
+
+    address = NULL;
+    size = 0x10000;
+    status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), &address, &size, MEM_RESERVE,
+                                         PAGE_READWRITE, translated_params,
+                                         ARRAY_SIZE(translated_params) );
+    ok( !status, "translated reserve failed %#lx\n", status );
+    if (status) return;
+
+    translated = 0;
+    status = NtQueryVirtualMemory( NtCurrentProcess(), address,
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    ok( !status && translated == 1, "translated query returned %#lx, %lu\n",
+        status, translated );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), address, MemoryBasicInformation,
+                                   &info, sizeof(info), NULL );
+    ok( !status && info.State == MEM_RESERVE,
+        "reserve query returned %#lx, state %#lx\n", status, info.State );
+
+    page = (char *)address + 0x4000;
+    size = 3 * page_size;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &page, 0, &size,
+                                      MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "translated commit failed %#lx\n", status );
+    if (!status)
+    {
+        memset( page, 0x5a, size );
+        ok( *(BYTE *)page == 0x5a && *((BYTE *)page + size - 1) == 0x5a,
+            "translated committed memory is not writable\n" );
+    }
+
+    page = (char *)address + 0x5000;
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &size,
+                                     PAGE_READONLY, &old_protect );
+    ok( !status && old_protect == PAGE_READWRITE,
+        "translated protect returned %#lx, old protection %#lx\n", status, old_protect );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), page, MemoryBasicInformation,
+                                   &info, sizeof(info), NULL );
+    ok( !status && info.State == MEM_COMMIT && info.Protect == PAGE_READONLY,
+        "protect query returned %#lx, state %#lx protection %#lx\n",
+        status, info.State, info.Protect );
+
+    page = (char *)address + 0x6000;
+    size = page_size;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), &page, &size, MEM_DECOMMIT );
+    ok( !status, "translated decommit failed %#lx\n", status );
+    status = NtQueryVirtualMemory( NtCurrentProcess(), page, MemoryBasicInformation,
+                                   &info, sizeof(info), NULL );
+    ok( !status && info.State == MEM_RESERVE,
+        "decommit query returned %#lx, state %#lx\n", status, info.State );
+
+    page = (char *)address + 0x6000;
+    size = page_size;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &page, 0, &size,
+                                      MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "translated recommit failed %#lx\n", status );
+    if (!status)
+    {
+        *(BYTE *)page = 0xa5;
+        ok( *(BYTE *)page == 0xa5, "translated recommitted memory is not writable\n" );
+    }
+
+    /* A failed mutation must complete and release the provider gate before the
+     * immediately following successful mutation. */
+    page = (char *)address + 0x7000;
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &size,
+                                     PAGE_READONLY, &old_protect );
+    ok( status == STATUS_NOT_COMMITTED, "reserved-page protect returned %#lx\n", status );
+    page = (char *)address + 0x4000;
+    size = page_size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &size,
+                                     PAGE_READONLY, &old_protect );
+    ok( !status, "post-failure translated protect failed %#lx\n", status );
+
+    page = address;
+    size = 0;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), &page, &size, MEM_RELEASE );
+    ok( !status, "translated release failed %#lx\n", status );
+    translated = 1;
+    status = NtQueryVirtualMemory( NtCurrentProcess(), address,
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    ok( status == STATUS_NOT_MAPPED_VIEW,
+        "released translated query returned %#lx, %lu\n", status, translated );
+
+    if (!pNtMapViewOfSectionEx)
+    {
+        win_skip( "NtMapViewOfSectionEx() is missing\n" );
+        return;
+    }
+    section_size.QuadPart = 0x10000;
+    status = NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &section_size,
+                              PAGE_READWRITE, SEC_COMMIT, NULL );
+    ok( !status, "NtCreateSection failed %#lx\n", status );
+    if (status) return;
+    address = NULL;
+    size = 0;
+    status = pNtMapViewOfSectionEx( section, NtCurrentProcess(), &address, NULL, &size,
+                                    0, PAGE_READWRITE, translated_params,
+                                    ARRAY_SIZE(translated_params) );
+    ok( !status, "translated section map failed %#lx\n", status );
+    if (!status)
+    {
+        translated = 0;
+        status = NtQueryVirtualMemory( NtCurrentProcess(), address,
+                                       MemoryWineWow64TranslatedInformation,
+                                       &translated, sizeof(translated), NULL );
+        ok( !status && translated == 1, "mapped translated query returned %#lx, %lu\n",
+            status, translated );
+        *(BYTE *)address = 0x3c;
+        ok( *(BYTE *)address == 0x3c, "translated section memory is not writable\n" );
+        status = NtUnmapViewOfSection( NtCurrentProcess(), address );
+        ok( !status, "translated section unmap failed %#lx\n", status );
+        translated = 1;
+        status = NtQueryVirtualMemory( NtCurrentProcess(), address,
+                                       MemoryWineWow64TranslatedInformation,
+                                       &translated, sizeof(translated), NULL );
+        ok( status == STATUS_NOT_MAPPED_VIEW,
+            "unmapped translated query returned %#lx, %lu\n", status, translated );
+    }
+
+    /* A legacy section replacement inherits ownership from a type-31
+     * placeholder.  First force a size mismatch: its transaction must still
+     * complete and leave the placeholder intact before the successful retry. */
+    address = NULL;
+    size = 0x10000;
+    status = pNtAllocateVirtualMemoryEx( NtCurrentProcess(), &address, &size,
+                                         MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                         PAGE_NOACCESS, translated_params,
+                                         ARRAY_SIZE(translated_params) );
+    ok( !status, "translated placeholder reserve failed %#lx\n", status );
+    if (!status)
+    {
+        page = address;
+        size = page_size;
+        status = pNtMapViewOfSectionEx( section, NtCurrentProcess(), &page, NULL, &size,
+                                        MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0 );
+        ok( status == STATUS_CONFLICTING_ADDRESSES,
+            "mismatched placeholder replacement returned %#lx\n", status );
+
+        page = address;
+        size = 0x10000;
+        status = pNtMapViewOfSectionEx( section, NtCurrentProcess(), &page, NULL, &size,
+                                        MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0 );
+        ok( !status, "legacy placeholder replacement failed %#lx\n", status );
+        if (!status)
+        {
+            translated = 0;
+            status = NtQueryVirtualMemory( NtCurrentProcess(), page,
+                                           MemoryWineWow64TranslatedInformation,
+                                           &translated, sizeof(translated), NULL );
+            ok( !status && translated == 1,
+                "replacement translated query returned %#lx, %lu\n", status, translated );
+            *(BYTE *)page = 0x7b;
+            ok( *(BYTE *)page == 0x7b, "replacement mapping is not writable\n" );
+            status = NtUnmapViewOfSection( NtCurrentProcess(), page );
+            ok( !status, "replacement section unmap failed %#lx\n", status );
+        }
+        else
+        {
+            page = address;
+            size = 0;
+            status = NtFreeVirtualMemory( NtCurrentProcess(), &page, &size, MEM_RELEASE );
+            ok( !status, "translated placeholder release failed %#lx\n", status );
+        }
+    }
+    NtClose( section );
+
+    /* Remote calls execute these mutations in the APC target process; using
+     * the translated reserve followed by legacy commit/protect/free exercises
+     * both the private transport flag and tag-derived ownership in the target. */
+    process = create_target_process( "sleep" );
+    ok( !!process, "failed to create remote translated-memory target\n" );
+    if (!process) return;
+    address = NULL;
+    size = 0x10000;
+    status = pNtAllocateVirtualMemoryEx( process, &address, &size, MEM_RESERVE,
+                                         PAGE_READWRITE, translated_params,
+                                         ARRAY_SIZE(translated_params) );
+    ok( !status, "remote translated reserve failed %#lx\n", status );
+    if (!status)
+    {
+        ok( (ULONG_PTR)address >= shadow_start && (ULONG_PTR)address + size <= shadow_end,
+            "remote translated reserve escaped shadow: %p size %Iu\n", address, size );
+        page = (char *)address + 0x4000;
+        size = page_size;
+        status = NtAllocateVirtualMemory( process, &page, 0, &size,
+                                          MEM_COMMIT, PAGE_READWRITE );
+        ok( !status, "remote translated commit failed %#lx\n", status );
+        status = NtQueryVirtualMemory( process, page, MemoryBasicInformation,
+                                       &info, sizeof(info), NULL );
+        ok( !status && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
+            "remote commit query returned %#lx, state %#lx protection %#lx\n",
+            status, info.State, info.Protect );
+        size = page_size;
+        status = NtProtectVirtualMemory( process, &page, &size,
+                                         PAGE_READONLY, &old_protect );
+        ok( !status, "remote translated protect failed %#lx\n", status );
+        size = page_size;
+        status = NtFreeVirtualMemory( process, &page, &size, MEM_DECOMMIT );
+        ok( !status, "remote translated decommit failed %#lx\n", status );
+        page = address;
+        size = 0;
+        status = NtFreeVirtualMemory( process, &page, &size, MEM_RELEASE );
+        ok( !status, "remote translated release failed %#lx\n", status );
+    }
+    NtTerminateProcess( process, 0 );
+    NtWaitForSingleObject( process, FALSE, NULL );
+    NtClose( process );
+#endif
+}
 
 static inline void *get_rva( HMODULE module, DWORD va )
 {
@@ -690,6 +2075,16 @@ static void test_NtAllocateVirtualMemoryEx(void)
         pRtlGetNativeSystemInformation( SystemCpuInformation, &cpu_info, sizeof(cpu_info), NULL );
         if (cpu_info.ProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64)
         {
+            if (pRtlIsEcCode)
+            {
+                const void *ptr = (const void *)~(ULONG_PTR)0;
+
+                ok( !pRtlIsEcCode( ptr ), "EC code %p\n", ptr );
+                ptr = (const void *)(ULONG_PTR)0x0000800000000000ULL;
+                ok( !pRtlIsEcCode( ptr ), "EC code %p\n", ptr );
+                ptr = (const void *)(ULONG_PTR)0xffff800000000000ULL;
+                ok( !pRtlIsEcCode( ptr ), "EC code %p\n", ptr );
+            }
             ok(status == STATUS_SUCCESS, "Unexpected status %08lx.\n", status);
             if (pRtlIsEcCode) ok( pRtlIsEcCode( addr1 ), "not EC code %p\n", addr1 );
             size = 0;
@@ -1439,6 +2834,140 @@ static void test_RtlCreateUserStack(void)
     }
 }
 
+static void check_section_commit_size( HANDLE process )
+{
+    const SIZE_T commit_size = page_size + 1;
+    const SIZE_T rounded_commit = 2 * page_size;
+    MEMORY_BASIC_INFORMATION mbi;
+    LARGE_INTEGER offset, section_size;
+    HANDLE mapping = NULL;
+    SIZE_T size, ret_size;
+    void *ptr;
+    NTSTATUS status;
+
+    section_size.QuadPart = 0x10000;
+    status = NtCreateSection( &mapping, SECTION_ALL_ACCESS, NULL, &section_size,
+                              PAGE_READWRITE, SEC_RESERVE, NULL );
+    ok( status == STATUS_SUCCESS, "NtCreateSection returned %08lx\n", status );
+    if (status) return;
+
+    ptr = NULL;
+    size = 0;
+    offset.QuadPart = 0;
+    status = NtMapViewOfSection( mapping, process, &ptr, 0, commit_size, &offset, &size,
+                                 ViewUnmap, 0, PAGE_READWRITE );
+    ok( status == STATUS_SUCCESS, "NtMapViewOfSection returned %08lx\n", status );
+    if (status)
+    {
+        NtClose( mapping );
+        return;
+    }
+
+    status = NtQueryVirtualMemory( process, ptr, MemoryBasicInformation, &mbi, sizeof(mbi),
+                                   &ret_size );
+    ok( status == STATUS_SUCCESS, "NtQueryVirtualMemory returned %08lx\n", status );
+    if (!status)
+    {
+        ok( mbi.BaseAddress == ptr, "got base %p, expected %p\n", mbi.BaseAddress, ptr );
+        ok( mbi.State == MEM_COMMIT, "got state %#lx\n", mbi.State );
+        ok( mbi.RegionSize == rounded_commit, "got region size %Iu, expected %Iu\n",
+            mbi.RegionSize, rounded_commit );
+    }
+
+    status = NtQueryVirtualMemory( process, (char *)ptr + rounded_commit,
+                                   MemoryBasicInformation, &mbi, sizeof(mbi), &ret_size );
+    ok( status == STATUS_SUCCESS, "NtQueryVirtualMemory returned %08lx\n", status );
+    if (!status)
+    {
+        ok( mbi.BaseAddress == (char *)ptr + rounded_commit,
+            "got base %p, expected %p\n", mbi.BaseAddress, (char *)ptr + rounded_commit );
+        ok( mbi.State == MEM_RESERVE, "got state %#lx\n", mbi.State );
+    }
+
+    status = NtUnmapViewOfSection( process, ptr );
+    ok( status == STATUS_SUCCESS, "NtUnmapViewOfSection returned %08lx\n", status );
+    NtClose( mapping );
+}
+
+static void test_wow64_section_commit_size( HANDLE process )
+{
+    if (!is_wow64) return;
+
+    check_section_commit_size( NtCurrentProcess() );
+    check_section_commit_size( process );
+}
+
+static void test_wow64_sec_reserve_alias_commit(void)
+{
+#ifndef _WIN64
+    LARGE_INTEGER section_size;
+    SIZE_T size, transferred;
+    HANDLE mapping = NULL;
+    void *first = NULL, *second = NULL, *commit;
+    BYTE input, output;
+    NTSTATUS status;
+
+    if (!is_wow64) return;
+
+    section_size.QuadPart = 0x10000;
+    status = NtCreateSection( &mapping, SECTION_ALL_ACCESS, NULL, &section_size,
+                              PAGE_READWRITE, SEC_RESERVE, NULL );
+    ok( !status, "NtCreateSection returned %#lx\n", status );
+    if (status) return;
+
+    size = 0;
+    status = NtMapViewOfSection( mapping, NtCurrentProcess(), &first, 0, 0, NULL, &size,
+                                 ViewUnmap, 0, PAGE_READWRITE );
+    ok( !status, "first SEC_RESERVE map returned %#lx\n", status );
+    size = 0;
+    if (!status)
+    {
+        status = NtMapViewOfSection( mapping, NtCurrentProcess(), &second, 0, 0, NULL, &size,
+                                     ViewUnmap, 0, PAGE_READWRITE );
+        ok( !status, "second SEC_RESERVE map returned %#lx\n", status );
+    }
+    if (!first || !second) goto done;
+
+    commit = first;
+    size = page_size;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &commit, 0, &size,
+                                      MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "SEC_RESERVE alias commit returned %#lx\n", status );
+    if (status) goto done;
+
+    input = 0x4d;
+    transferred = 0xdeadbeef;
+    status = NtWriteVirtualMemory( NtCurrentProcess(), first, &input, sizeof(input),
+                                   &transferred );
+    ok( !status && transferred == sizeof(input),
+        "first alias write returned %#lx, %Iu\n", status, transferred );
+    output = 0;
+    transferred = 0xdeadbeef;
+    status = NtReadVirtualMemory( NtCurrentProcess(), second, &output, sizeof(output),
+                                  &transferred );
+    ok( !status && transferred == sizeof(output) && output == input,
+        "unfaulted alias read returned %#lx, %Iu, %#x\n", status, transferred, output );
+
+    input = 0xa6;
+    transferred = 0xdeadbeef;
+    status = NtWriteVirtualMemory( NtCurrentProcess(), second, &input, sizeof(input),
+                                   &transferred );
+    ok( !status && transferred == sizeof(input),
+        "unfaulted alias write returned %#lx, %Iu\n", status, transferred );
+    output = 0;
+    transferred = 0xdeadbeef;
+    status = NtReadVirtualMemory( NtCurrentProcess(), first, &output, sizeof(output),
+                                  &transferred );
+    ok( !status && transferred == sizeof(output) && output == input,
+        "first alias read returned %#lx, %Iu, %#x\n", status, transferred, output );
+
+done:
+    if (second) NtUnmapViewOfSection( NtCurrentProcess(), second );
+    if (first) NtUnmapViewOfSection( NtCurrentProcess(), first );
+    NtClose( mapping );
+#endif
+}
+
 static void test_NtMapViewOfSection(void)
 {
     static const char testfile[] = "testfile.xxx";
@@ -1468,6 +2997,9 @@ static void test_NtMapViewOfSection(void)
 
     process = create_target_process("sleep");
     ok(process != NULL, "Can't start process\n");
+
+    test_wow64_section_commit_size( process );
+    test_wow64_sec_reserve_alias_commit();
 
     ptr = NULL;
     size = 0;
@@ -2200,13 +3732,15 @@ static void perform_relocations( void *module, INT_PTR delta )
 static void test_syscalls(void)
 {
     HMODULE module = GetModuleHandleW( L"ntdll.dll" );
-    HANDLE handle;
+    HANDLE handle, self;
     NTSTATUS status;
     NTSTATUS (WINAPI *pNtClose)(HANDLE);
     WCHAR path[MAX_PATH];
     HANDLE file, mapping;
+    SIZE_T protect_size;
+    ULONG old_protect;
     INT_PTR delta;
-    void *ptr;
+    void *ptr, *protect_ptr;
 
     /* initial image */
     pNtClose = (void *)GetProcAddress( module, "NtClose" );
@@ -2217,10 +3751,32 @@ static void test_syscalls(void)
     status = pNtClose( handle );
     ok( status == STATUS_INVALID_HANDLE, "NtClose failed %lx\n", status );
 
+    status = NtFlushInstructionCache( GetCurrentProcess(), NULL, 0x1234 );
+    ok( !status, "NtFlushInstructionCache(NULL) failed %lx\n", status );
+    status = NtFlushInstructionCache( GetCurrentProcess(), pNtClose, 0 );
+    ok( !status, "zero-size NtFlushInstructionCache failed %lx\n", status );
+
     /* syscall thunk copy */
     ptr = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE );
     ok( ptr != NULL, "VirtualAlloc failed\n" );
     memcpy( ptr, pNtClose, 32 );
+    protect_ptr = ptr;
+    protect_size = 0x1000;
+    status = NtProtectVirtualMemory( GetCurrentProcess(), &protect_ptr, &protect_size,
+                                     PAGE_EXECUTE_READ, &old_protect );
+    ok( !status, "NtProtectVirtualMemory failed %lx\n", status );
+    ok( old_protect == PAGE_EXECUTE_READWRITE, "old protection is %#lx\n", old_protect );
+    status = NtFlushInstructionCache( GetCurrentProcess(), ptr, 32 );
+    ok( !status, "NtFlushInstructionCache failed %lx\n", status );
+    self = OpenProcess( PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE,
+                        GetCurrentProcessId() );
+    ok( !!self, "OpenProcess failed %lu\n", GetLastError() );
+    if (self)
+    {
+        status = NtFlushInstructionCache( self, ptr, 32 );
+        ok( !status, "real-self NtFlushInstructionCache failed %lx\n", status );
+        NtClose( self );
+    }
     pNtClose = ptr;
     handle = CreateEventW( NULL, FALSE, FALSE, NULL );
     ok( handle != 0, "CreateEventWfailed %lu\n", GetLastError() );
@@ -3571,6 +5127,10 @@ START_TEST(virtual)
             Sleep(5000); /* spawned process runs for at most 5 seconds */
             return;
         }
+#ifndef _WIN64
+        if (!strcmp(argv[2], "wow64_writewatch"))
+            ExitProcess( run_wow64_translated_writewatch_child() );
+#endif
         return;
     }
 
@@ -3585,6 +5145,7 @@ START_TEST(virtual)
     pRtlGetEnabledExtendedFeatures = (void *)GetProcAddress(mod, "RtlGetEnabledExtendedFeatures");
     pNtAllocateVirtualMemoryEx = (void *)GetProcAddress(mod, "NtAllocateVirtualMemoryEx");
     pNtMapViewOfSectionEx = (void *)GetProcAddress(mod, "NtMapViewOfSectionEx");
+    pNtCreateSectionEx = (void *)GetProcAddress(mod, "NtCreateSectionEx");
     pNtSetInformationVirtualMemory = (void *)GetProcAddress(mod, "NtSetInformationVirtualMemory");
 
 #ifndef __aarch64__
@@ -3609,6 +5170,13 @@ START_TEST(virtual)
     test_NtMapViewOfSectionEx();
     test_prefetch();
     test_user_shared_data();
+    test_wow64_translated_guard_resolution();
+    test_wow64_translated_writewatch_resolution();
+    test_wow64_translated_copy_protection();
+    test_wow64_unowned_shadow_access();
+    test_wow64_virtual_guest_marshalling();
+    test_wow64_process_vm_machine_information();
+    test_wow64_translated_view_contract();
     test_syscalls();
     test_invalid_syscalls();
     test_syscall_numbers();

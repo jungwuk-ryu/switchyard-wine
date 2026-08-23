@@ -5314,7 +5314,10 @@ void actctx_init(void)
     ctx.cbSize   = sizeof(ctx);
     ctx.lpSource = NULL;
     ctx.dwFlags  = ACTCTX_FLAG_RESOURCE_NAME_VALID | ACTCTX_FLAG_HMODULE_VALID;
-    ctx.hModule  = NtCurrentTeb()->Peb->ImageBaseAddress;
+    /* Native activation-context parsing needs the mapped host backing when the
+     * Windows-visible main image uses a translated fixed-low address. */
+    ctx.hModule  = __wine_main_image_native_base ? __wine_main_image_native_base
+                                                  : NtCurrentTeb()->Peb->ImageBaseAddress;
     ctx.lpResourceName = (LPCWSTR)CREATEPROCESS_MANIFEST_RESOURCE_ID;
 
     if (!RtlCreateActivationContext( &actctx, &ctx )) process_actctx = check_actctx( actctx );

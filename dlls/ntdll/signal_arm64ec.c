@@ -30,6 +30,7 @@
 #include "ddk/wdm.h"
 #include "wine/exception.h"
 #include "wine/list.h"
+#include "wine/low_va.h"
 #include "ntdll_misc.h"
 #include "unwind.h"
 #include "wine/debug.h"
@@ -93,6 +94,14 @@ static inline void leave_syscall_callback(void)
         RtlCaptureContext( &ctx );
         if (*cpu_area->SuspendDoorbell) NtContinue( &ctx, FALSE );
     }
+}
+
+NTSTATUS WINAPI __wine_arm64ec_prepare_x64_execution(void)
+{
+    /* Phase A has no deferred remote-mapping queue.  Keep this as the
+     * mandatory execution barrier so a later provider capability can add the
+     * drain without changing the PE/provider contract. */
+    return STATUS_SUCCESS;
 }
 
 /**********************************************************************
@@ -337,6 +346,15 @@ ALL_SYSCALLS
 #undef SYSCALL_ENTRY
     __nb_syscalls
 };
+
+NTSTATUS WINAPI __wine_arm64ec_get_x64_syscall_dispatcher( ULONG_PTR *dispatcher,
+                                                            ULONG *count )
+{
+    if (!dispatcher || !count) return STATUS_INVALID_PARAMETER;
+    *dispatcher = (ULONG_PTR)invoke_arm64ec_syscall;
+    *count = __nb_syscalls;
+    return STATUS_SUCCESS;
+}
 
 #define DEFINE_SYSCALL_(ret,name,args) \
     ret __attribute__((naked, hybrid_patchable)) name args { __ASM_SYSCALL_FUNC( __id_##name, name ); }
@@ -1392,7 +1410,10 @@ __ASM_GLOBAL_FUNC( "#KiUserCallbackDispatcher",
 BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 {
     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
-    ULONG_PTR page = ptr / page_size;
+    ULONG_PTR page;
+
+    if (!map || !wine_arm64ec_code_pointer_in_range( ptr )) return FALSE;
+    page = ptr / page_size;
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
@@ -1886,6 +1907,9 @@ static void __attribute__((naked)) arm64x_check_icall_early(void)
     asm( "ret" );
 }
 
+#define ARM64EC_STRINGIFY_(value) #value
+#define ARM64EC_STRINGIFY(value) ARM64EC_STRINGIFY_(value)
+
 /**************************************************************************
  *		arm64x_check_call
  *
@@ -1896,13 +1920,21 @@ static void __attribute__((naked)) arm64x_check_call(void)
     asm( ".seh_proc \"#arm64x_check_call\"\n\t"
          ".seh_endprologue\n\t"
          /* check for EC code */
+         "lsr x16, x11, #" ARM64EC_STRINGIFY(WINE_ARM64EC_CODE_POINTER_BITS) "\n\t"
+         "cbnz x16, .Lexit\n\t"
          "ldr x16, [x18, #0x60]\n\t"        /* peb */
          "lsr x17, x11, #18\n\t"            /* dest / page_size / 64 */
          "ldr x16, [x16, #0x368]\n\t"       /* peb->EcCodeBitMap */
+         "cbz x16, .Lexit\n\t"
          "lsr x9, x11, #12\n\t"             /* dest / page_size */
          "ldr x16, [x16, x17, lsl #3]\n\t"
          "lsr x16, x16, x9\n\t"
          "tbnz x16, #0, .Ldone\n\t"
+         /* A low target not marked as EC code belongs to the translated x64
+          * address domain.  Its bytes may live only in the native shadow, so
+          * let the emulator fetch (or fault) through the guest mapping. */
+         "lsr x16, x11, #32\n\t"
+         "cbz x16, .Lexit\n\t"
          /* check if dest is aligned */
          "tst x11, #15\n\t"                 /* dest & 15 */
          "b.ne .Ljmp\n\t"
@@ -2024,6 +2056,9 @@ LONG __attribute__((naked)) __C_ExecuteExceptionFilter( EXCEPTION_POINTERS *ptrs
          "ret\n\t"
          ".seh_endproc" );
 }
+
+#undef ARM64EC_STRINGIFY
+#undef ARM64EC_STRINGIFY_
 
 
 /***********************************************************************

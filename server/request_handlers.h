@@ -328,6 +328,9 @@ DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(dcomp_create_shared_visual);
 DECL_HANDLER(dcomp_set_shared_visual_info);
 DECL_HANDLER(dcomp_get_shared_visual_info);
+DECL_HANDLER(get_process_vm_machine);
+DECL_HANDLER(complete_new_process);
+DECL_HANDLER(complete_new_thread);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -653,6 +656,9 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_dcomp_create_shared_visual,
     (req_handler)req_dcomp_set_shared_visual_info,
     (req_handler)req_dcomp_get_shared_visual_info,
+    (req_handler)req_get_process_vm_machine,
+    (req_handler)req_complete_new_process,
+    (req_handler)req_complete_new_thread,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -716,6 +722,7 @@ C_ASSERT( offsetof(struct new_process_request, flags) == 24 );
 C_ASSERT( offsetof(struct new_process_request, socket_fd) == 28 );
 C_ASSERT( offsetof(struct new_process_request, access) == 32 );
 C_ASSERT( offsetof(struct new_process_request, machine) == 36 );
+C_ASSERT( offsetof(struct new_process_request, wine_flags) == 38 );
 C_ASSERT( offsetof(struct new_process_request, info_size) == 40 );
 C_ASSERT( offsetof(struct new_process_request, handles_size) == 44 );
 C_ASSERT( offsetof(struct new_process_request, jobs_size) == 48 );
@@ -735,12 +742,14 @@ C_ASSERT( sizeof(struct get_new_process_info_reply) == 16 );
 C_ASSERT( offsetof(struct new_thread_request, process) == 12 );
 C_ASSERT( offsetof(struct new_thread_request, access) == 16 );
 C_ASSERT( offsetof(struct new_thread_request, flags) == 20 );
-C_ASSERT( offsetof(struct new_thread_request, request_fd) == 24 );
-C_ASSERT( offsetof(struct new_thread_request, is_system) == 28 );
-C_ASSERT( sizeof(struct new_thread_request) == 32 );
+C_ASSERT( offsetof(struct new_thread_request, wine_flags) == 24 );
+C_ASSERT( offsetof(struct new_thread_request, request_fd) == 28 );
+C_ASSERT( offsetof(struct new_thread_request, is_system) == 32 );
+C_ASSERT( sizeof(struct new_thread_request) == 40 );
 C_ASSERT( offsetof(struct new_thread_reply, tid) == 8 );
 C_ASSERT( offsetof(struct new_thread_reply, handle) == 12 );
-C_ASSERT( sizeof(struct new_thread_reply) == 16 );
+C_ASSERT( offsetof(struct new_thread_reply, info) == 16 );
+C_ASSERT( sizeof(struct new_thread_reply) == 24 );
 C_ASSERT( sizeof(struct get_startup_info_request) == 16 );
 C_ASSERT( offsetof(struct get_startup_info_reply, info_size) == 8 );
 C_ASSERT( offsetof(struct get_startup_info_reply, debugged) == 12 );
@@ -1193,15 +1202,18 @@ C_ASSERT( offsetof(struct map_view_request, mapping) == 12 );
 C_ASSERT( offsetof(struct map_view_request, access) == 16 );
 C_ASSERT( offsetof(struct map_view_request, base) == 24 );
 C_ASSERT( offsetof(struct map_view_request, size) == 32 );
-C_ASSERT( offsetof(struct map_view_request, start) == 40 );
-C_ASSERT( sizeof(struct map_view_request) == 48 );
+C_ASSERT( offsetof(struct map_view_request, commit_size) == 40 );
+C_ASSERT( offsetof(struct map_view_request, start) == 48 );
+C_ASSERT( sizeof(struct map_view_request) == 56 );
 C_ASSERT( offsetof(struct map_image_view_request, mapping) == 12 );
 C_ASSERT( offsetof(struct map_image_view_request, base) == 16 );
-C_ASSERT( offsetof(struct map_image_view_request, size) == 24 );
-C_ASSERT( offsetof(struct map_image_view_request, offset) == 32 );
-C_ASSERT( offsetof(struct map_image_view_request, entry) == 40 );
-C_ASSERT( offsetof(struct map_image_view_request, machine) == 44 );
-C_ASSERT( sizeof(struct map_image_view_request) == 48 );
+C_ASSERT( offsetof(struct map_image_view_request, guest_base) == 24 );
+C_ASSERT( offsetof(struct map_image_view_request, size) == 32 );
+C_ASSERT( offsetof(struct map_image_view_request, offset) == 40 );
+C_ASSERT( offsetof(struct map_image_view_request, entry) == 48 );
+C_ASSERT( offsetof(struct map_image_view_request, machine) == 52 );
+C_ASSERT( offsetof(struct map_image_view_request, flags) == 54 );
+C_ASSERT( sizeof(struct map_image_view_request) == 56 );
 C_ASSERT( sizeof(struct map_builtin_view_request) == 16 );
 C_ASSERT( offsetof(struct get_image_view_info_request, process) == 12 );
 C_ASSERT( offsetof(struct get_image_view_info_request, addr) == 16 );
@@ -2485,3 +2497,16 @@ C_ASSERT( offsetof(struct dcomp_get_shared_visual_info_request, handle) == 12 );
 C_ASSERT( sizeof(struct dcomp_get_shared_visual_info_request) == 16 );
 C_ASSERT( offsetof(struct dcomp_get_shared_visual_info_reply, target_root) == 8 );
 C_ASSERT( sizeof(struct dcomp_get_shared_visual_info_reply) == 16 );
+C_ASSERT( offsetof(struct get_process_vm_machine_request, handle) == 12 );
+C_ASSERT( sizeof(struct get_process_vm_machine_request) == 16 );
+C_ASSERT( offsetof(struct get_process_vm_machine_reply, machine) == 8 );
+C_ASSERT( offsetof(struct get_process_vm_machine_reply, flags) == 10 );
+C_ASSERT( sizeof(struct get_process_vm_machine_reply) == 16 );
+C_ASSERT( offsetof(struct complete_new_process_request, info) == 12 );
+C_ASSERT( offsetof(struct complete_new_process_request, status) == 16 );
+C_ASSERT( offsetof(struct complete_new_process_request, commit) == 20 );
+C_ASSERT( sizeof(struct complete_new_process_request) == 24 );
+C_ASSERT( offsetof(struct complete_new_thread_request, info) == 12 );
+C_ASSERT( offsetof(struct complete_new_thread_request, status) == 16 );
+C_ASSERT( offsetof(struct complete_new_thread_request, commit) == 20 );
+C_ASSERT( sizeof(struct complete_new_thread_request) == 24 );

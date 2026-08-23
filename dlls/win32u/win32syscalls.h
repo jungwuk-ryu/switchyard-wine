@@ -3082,7 +3082,10 @@
     SYSCALL_ENTRY( 0x1600, NtUserYieldTask, 0 ) \
     SYSCALL_ENTRY( 0x1601, NtUserZapActiveAndFocus, 0 ) \
     SYSCALL_ENTRY( 0x1602, NtValidateCompositionSurfaceHandle, 0 ) \
-    SYSCALL_ENTRY( 0x1603, NtVisualCaptureBits, 0 )
+    SYSCALL_ENTRY( 0x1603, NtVisualCaptureBits, 0 ) \
+    SYSCALL_ENTRY( 0x1604, __wine_win32u_d3dkmt_create_allocation, 8 ) \
+    SYSCALL_ENTRY( 0x1605, __wine_win32u_d3dkmt_open_resource, 8 ) \
+    SYSCALL_ENTRY( 0x1606, __wine_win32u_d3dkmt_lifecycle, 8 )
 #else
 #define ALL_SYSCALLS ALL_SYSCALLS32
 #endif

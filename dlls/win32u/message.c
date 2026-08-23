@@ -45,8 +45,6 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 #define QS_HARDWARE     0x40000000
 #define QS_INTERNAL     (QS_DRIVER | QS_HARDWARE)
 
-static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
-
 static LONG atomic_load_long( const volatile LONG *ptr )
 {
 #if defined(__i386__) || defined(__x86_64__)
@@ -67,8 +65,13 @@ static ULONG atomic_load_ulong( const volatile ULONG *ptr )
 
 static UINT64 get_tick_count(void)
 {
+    const struct _KUSER_SHARED_DATA *user_shared_data = RtlGetCurrentPeb()->SharedData;
     ULONG high, low;
 
+    /* Native arm64 Darwin keeps the authoritative KUSER_SHARED_DATA backing
+     * outside the reserved low 4-GiB range.  ntdll publishes the authoritative
+     * process-wide address through PEB.SharedData; ordinary hosts still
+     * publish the canonical 0x7ffe0000 mapping there. */
     do
     {
         high = atomic_load_long( &user_shared_data->TickCount.High1Time );

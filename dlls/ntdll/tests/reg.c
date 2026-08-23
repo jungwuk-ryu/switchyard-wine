@@ -562,6 +562,360 @@ static void test_NtCreateKey(void)
     pNtClose(key);
 }
 
+static void test_wow64_registry_user_buffers(void)
+{
+    static const WCHAR nested_subkeyW[] = L"wow64_nested_user_buffer_test";
+    static const WCHAR subkeyW[] = L"wow64_user_buffer_test";
+    static const WCHAR valueW[] = L"wow64_user_buffer_value";
+    union
+    {
+        KEY_VALUE_PARTIAL_INFORMATION info;
+        BYTE buffer[64];
+    } value_info;
+    KEY_NAME_INFORMATION *info;
+    MEMORY_BASIC_INFORMATION mbi;
+    void *write_pages[8], *base;
+    OBJECT_ATTRIBUTES attr, nested_attr;
+    UNICODE_STRING name, nested_name, value_name, *guest_name;
+    WCHAR *guest_buffer;
+    HANDLE created = 0, nested = 0, parent, stale, *key;
+    ULONG *disposition, *result_len;
+    ULONG_PTR write_count;
+    ULONG page_size, query_len, value_data = 0x12345678, value_len, i;
+    SYSTEM_INFO si;
+    NTSTATUS status;
+    SIZE_T queried;
+    DWORD old_prot;
+    UINT ret;
+
+    if (sizeof(void *) != 4) return;
+
+    GetSystemInfo( &si );
+    page_size = si.dwPageSize;
+    if (page_size != 0x1000)
+    {
+        skip( "expected 4K WoW64 pages, got %#lx\n", page_size );
+        return;
+    }
+
+    InitializeObjectAttributes( &attr, &winetestpath, OBJ_CASE_INSENSITIVE, 0, NULL );
+    status = pNtOpenKey( &parent, KEY_ALL_ACCESS, &attr );
+    ok( status == STATUS_SUCCESS, "NtOpenKey failed: %#lx\n", status );
+    if (status) return;
+
+    pRtlInitUnicodeString( &name, subkeyW );
+    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, parent, NULL );
+    status = pNtOpenKey( &stale, KEY_ALL_ACCESS, &attr );
+    if (!status)
+    {
+        pNtDeleteKey( stale );
+        pNtClose( stale );
+    }
+    pRtlInitUnicodeString( &nested_name, nested_subkeyW );
+    InitializeObjectAttributes( &nested_attr, &nested_name, OBJ_CASE_INSENSITIVE, parent, NULL );
+    status = pNtOpenKey( &stale, KEY_ALL_ACCESS, &nested_attr );
+    if (!status)
+    {
+        pNtDeleteKey( stale );
+        pNtClose( stale );
+    }
+
+    base = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                         PAGE_READWRITE );
+    if (!base)
+    {
+        win_skip( "MEM_WRITE_WATCH not supported\n" );
+        pNtClose( parent );
+        return;
+    }
+
+    key = (HANDLE *)((char *)base + page_size);
+    disposition = (ULONG *)((char *)base + 2 * page_size);
+    result_len = (ULONG *)((char *)base + 3 * page_size);
+    info = (KEY_NAME_INFORMATION *)((char *)base + 5 * page_size -
+                                    offsetof(KEY_NAME_INFORMATION, Name));
+    guest_name = (UNICODE_STRING *)((char *)base + 6 * page_size);
+    guest_buffer = (WCHAR *)((char *)base + 7 * page_size);
+
+    memcpy( guest_buffer, nested_subkeyW, sizeof(nested_subkeyW) );
+    guest_name->Buffer = guest_buffer;
+    guest_name->Length = sizeof(nested_subkeyW) - sizeof(WCHAR);
+    guest_name->MaximumLength = sizeof(nested_subkeyW);
+    InitializeObjectAttributes( &nested_attr, guest_name, OBJ_CASE_INSENSITIVE, parent, NULL );
+
+    ret = VirtualProtect( guest_buffer, page_size, PAGE_NOACCESS, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtCreateKey( &nested, KEY_ALL_ACCESS, &nested_attr, 0, NULL, 0, NULL );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+    InitializeObjectAttributes( &nested_attr, &nested_name, OBJ_CASE_INSENSITIVE, parent, NULL );
+    status = pNtOpenKey( &stale, KEY_READ, &nested_attr );
+    ok( status == STATUS_OBJECT_NAME_NOT_FOUND, "protected nested name created a key: %#lx\n", status );
+    if (!status)
+    {
+        pNtDeleteKey( stale );
+        pNtClose( stale );
+    }
+
+    ret = VirtualProtect( guest_buffer, page_size, PAGE_READWRITE | PAGE_GUARD, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    InitializeObjectAttributes( &nested_attr, guest_name, OBJ_CASE_INSENSITIVE, parent, NULL );
+    status = pNtCreateKey( &nested, KEY_ALL_ACCESS, &nested_attr, 0, NULL, 0, NULL );
+    ok( status == STATUS_GUARD_PAGE_VIOLATION,
+        "expected STATUS_GUARD_PAGE_VIOLATION, got %#lx\n", status );
+    queried = VirtualQuery( guest_buffer, &mbi, sizeof(mbi) );
+    ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+    ok( !(mbi.Protect & PAGE_GUARD), "nested name guard was not cleared, protection %#lx\n", mbi.Protect );
+    InitializeObjectAttributes( &nested_attr, &nested_name, OBJ_CASE_INSENSITIVE, parent, NULL );
+    status = pNtOpenKey( &stale, KEY_READ, &nested_attr );
+    ok( status == STATUS_OBJECT_NAME_NOT_FOUND, "guarded nested name created a key: %#lx\n", status );
+    if (!status)
+    {
+        pNtDeleteKey( stale );
+        pNtClose( stale );
+    }
+
+    ret = VirtualProtect( guest_buffer, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    InitializeObjectAttributes( &nested_attr, guest_name, OBJ_CASE_INSENSITIVE, parent, NULL );
+    status = pNtCreateKey( &nested, KEY_ALL_ACCESS, &nested_attr, 0, NULL, 0, NULL );
+    ok( status == STATUS_SUCCESS, "NtCreateKey with nested guest name failed: %#lx\n", status );
+    if (!status)
+    {
+        status = pNtDeleteKey( nested );
+        ok( status == STATUS_SUCCESS, "NtDeleteKey failed: %#lx\n", status );
+        pNtClose( nested );
+        nested = 0;
+    }
+
+    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, parent, NULL );
+
+    ret = VirtualProtect( key, page_size, PAGE_READONLY, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtCreateKey( key, KEY_ALL_ACCESS, &attr, 0, NULL, 0, disposition );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+    status = pNtOpenKey( &stale, KEY_READ, &attr );
+    ok( status == STATUS_OBJECT_NAME_NOT_FOUND, "protected handle created a key: %#lx\n", status );
+    if (!status)
+    {
+        pNtDeleteKey( stale );
+        pNtClose( stale );
+    }
+
+    ret = VirtualProtect( key, page_size, PAGE_READWRITE | PAGE_GUARD, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtCreateKey( key, KEY_ALL_ACCESS, &attr, 0, NULL, 0, disposition );
+    ok( status == STATUS_GUARD_PAGE_VIOLATION,
+        "expected STATUS_GUARD_PAGE_VIOLATION, got %#lx\n", status );
+    queried = VirtualQuery( key, &mbi, sizeof(mbi) );
+    ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+    ok( !(mbi.Protect & PAGE_GUARD), "handle guard was not cleared, protection %#lx\n", mbi.Protect );
+    status = pNtOpenKey( &stale, KEY_READ, &attr );
+    ok( status == STATUS_OBJECT_NAME_NOT_FOUND, "guarded handle created a key: %#lx\n", status );
+    if (!status)
+    {
+        pNtDeleteKey( stale );
+        pNtClose( stale );
+    }
+
+    ret = VirtualProtect( key, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+
+    ret = VirtualProtect( disposition, page_size, PAGE_READONLY, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtCreateKey( key, KEY_ALL_ACCESS, &attr, 0, NULL, 0, disposition );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+    status = pNtOpenKey( &stale, KEY_READ, &attr );
+    ok( status == STATUS_OBJECT_NAME_NOT_FOUND, "protected disposition created a key: %#lx\n", status );
+    if (!status)
+    {
+        pNtDeleteKey( stale );
+        pNtClose( stale );
+    }
+
+    ret = VirtualProtect( disposition, page_size, PAGE_READWRITE | PAGE_GUARD, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtCreateKey( key, KEY_ALL_ACCESS, &attr, 0, NULL, 0, disposition );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+    queried = VirtualQuery( disposition, &mbi, sizeof(mbi) );
+    ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+    ok( mbi.Protect & PAGE_GUARD, "disposition probe cleared guard, protection %#lx\n", mbi.Protect );
+    status = pNtOpenKey( &stale, KEY_READ, &attr );
+    ok( status == STATUS_OBJECT_NAME_NOT_FOUND, "guarded disposition created a key: %#lx\n", status );
+    if (!status)
+    {
+        pNtDeleteKey( stale );
+        pNtClose( stale );
+    }
+
+    ret = VirtualProtect( disposition, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    *key = (HANDLE)(ULONG_PTR)0xdeadbeef;
+    *disposition = 0xdeadbeef;
+    ret = ResetWriteWatch( base, 0x10000 );
+    ok( !ret, "ResetWriteWatch failed: %u\n", ret );
+
+    status = pNtCreateKey( key, KEY_ALL_ACCESS, &attr, 0, NULL, 0, disposition );
+    ok( status == STATUS_SUCCESS, "NtCreateKey failed: %#lx\n", status );
+    ok( *key && *key != INVALID_HANDLE_VALUE, "got invalid key %p\n", *key );
+    ok( *disposition == REG_CREATED_NEW_KEY, "got disposition %lu\n", *disposition );
+    if (status) goto done;
+    created = *key;
+
+    write_count = ARRAY_SIZE(write_pages);
+    ret = GetWriteWatch( 0, base, 0x10000, write_pages, &write_count, &page_size );
+    ok( !ret, "GetWriteWatch failed: %u\n", ret );
+    ok( write_count == 2, "expected 2 written pages, got %Iu\n", write_count );
+    for (i = 0; i < min( write_count, 2 ); i++)
+        ok( write_pages[i] == (char *)base + (i + 1) * page_size,
+            "write page %lu is %p\n", i, write_pages[i] );
+
+    pRtlInitUnicodeString( &value_name, valueW );
+    status = pNtSetValueKey( created, &value_name, 0, REG_DWORD, &value_data, sizeof(value_data) );
+    ok( status == STATUS_SUCCESS, "NtSetValueKey failed: %#lx\n", status );
+    memcpy( guest_buffer, valueW, sizeof(valueW) );
+    guest_name->Buffer = guest_buffer;
+    guest_name->Length = sizeof(valueW) - sizeof(WCHAR);
+    guest_name->MaximumLength = sizeof(valueW);
+
+    value_len = 0xdeadbeef;
+    ret = VirtualProtect( guest_buffer, page_size, PAGE_NOACCESS, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryValueKey( created, guest_name, 0xdeadbeef, &value_info,
+                               sizeof(value_info), &value_len );
+    ok( status == STATUS_INVALID_PARAMETER, "expected STATUS_INVALID_PARAMETER, got %#lx\n", status );
+    ok( value_len == 0xdeadbeef, "invalid class published result length %#lx\n", value_len );
+    status = pNtQueryValueKey( created, guest_name, KeyValuePartialInformation, &value_info,
+                               sizeof(value_info), &value_len );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+
+    ret = VirtualProtect( guest_buffer, page_size, PAGE_READWRITE | PAGE_GUARD, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryValueKey( created, guest_name, KeyValuePartialInformation, &value_info,
+                               sizeof(value_info), &value_len );
+    ok( status == STATUS_GUARD_PAGE_VIOLATION,
+        "expected STATUS_GUARD_PAGE_VIOLATION, got %#lx\n", status );
+    queried = VirtualQuery( guest_buffer, &mbi, sizeof(mbi) );
+    ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+    ok( !(mbi.Protect & PAGE_GUARD), "value name guard was not cleared, protection %#lx\n", mbi.Protect );
+
+    ret = VirtualProtect( guest_buffer, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryValueKey( created, guest_name, KeyValuePartialInformation, &value_info,
+                               sizeof(value_info), &value_len );
+    ok( status == STATUS_SUCCESS, "NtQueryValueKey failed: %#lx\n", status );
+    ok( value_info.info.Type == REG_DWORD, "got type %lu\n", value_info.info.Type );
+    ok( value_info.info.DataLength == sizeof(value_data), "got data length %lu\n",
+        value_info.info.DataLength );
+    ok( !memcmp( value_info.info.Data, &value_data, sizeof(value_data) ), "got wrong value data\n" );
+
+    ret = VirtualProtect( result_len, page_size, PAGE_READONLY, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryKey( created, KeyNameInformation, NULL, 0, result_len );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+
+    ret = VirtualProtect( result_len, page_size, PAGE_READWRITE | PAGE_GUARD, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryKey( created, KeyNameInformation, NULL, 0, result_len );
+    ok( status == STATUS_GUARD_PAGE_VIOLATION,
+        "expected STATUS_GUARD_PAGE_VIOLATION, got %#lx\n", status );
+    queried = VirtualQuery( result_len, &mbi, sizeof(mbi) );
+    ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+    ok( !(mbi.Protect & PAGE_GUARD), "result length guard was not cleared, protection %#lx\n", mbi.Protect );
+
+    ret = VirtualProtect( result_len, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    ret = ResetWriteWatch( base, 0x10000 );
+    ok( !ret, "ResetWriteWatch failed: %u\n", ret );
+    status = pNtQueryKey( created, KeyNameInformation, NULL, 0, result_len );
+    ok( status == STATUS_BUFFER_TOO_SMALL, "expected STATUS_BUFFER_TOO_SMALL, got %#lx\n", status );
+    ok( *result_len >= offsetof(KEY_NAME_INFORMATION, Name), "got length %lu\n", *result_len );
+
+    write_count = ARRAY_SIZE(write_pages);
+    ret = GetWriteWatch( 0, base, 0x10000, write_pages, &write_count, &page_size );
+    ok( !ret, "GetWriteWatch failed: %u\n", ret );
+    ok( write_count == 1, "expected 1 written page, got %Iu\n", write_count );
+    if (write_count)
+        ok( write_pages[0] == result_len, "write page is %p\n", write_pages[0] );
+
+    info->NameLength = 0xdeadbeef;
+    query_len = 0xdeadbeef;
+    ret = VirtualProtect( (char *)base + 5 * page_size, page_size, PAGE_READONLY, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryKey( created, KeyNameInformation, info, page_size, &query_len );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+    ok( info->NameLength == 0xdeadbeef, "fixed header was partially published: %#lx\n", info->NameLength );
+    ok( query_len == 0xdeadbeef, "result length was partially published: %#lx\n", query_len );
+
+    ret = VirtualProtect( (char *)base + 5 * page_size, page_size,
+                          PAGE_READWRITE | PAGE_GUARD, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryKey( created, KeyNameInformation, info, page_size, &query_len );
+    ok( status == STATUS_GUARD_PAGE_VIOLATION,
+        "expected STATUS_GUARD_PAGE_VIOLATION, got %#lx\n", status );
+    ok( info->NameLength == 0xdeadbeef, "fixed header was partially published: %#lx\n", info->NameLength );
+    ok( query_len == 0xdeadbeef, "result length was partially published: %#lx\n", query_len );
+    queried = VirtualQuery( (char *)base + 5 * page_size, &mbi, sizeof(mbi) );
+    ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+    ok( !(mbi.Protect & PAGE_GUARD), "query output guard was not cleared, protection %#lx\n", mbi.Protect );
+
+    ret = VirtualProtect( (char *)base + 5 * page_size, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+
+    info->NameLength = 0xdeadbeef;
+    info->Name[0] = 0xffff;
+    query_len = 0xdeadbeef;
+    ret = VirtualProtect( (char *)base + 4 * page_size, page_size, PAGE_READONLY, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryKey( created, KeyNameInformation, info, page_size, &query_len );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+    ok( info->NameLength == 0xdeadbeef, "protected fixed header was published: %#lx\n", info->NameLength );
+    ok( info->Name[0] != 0xffff, "variable output was not published before the fixed-header fault\n" );
+    ok( query_len == 0xdeadbeef, "result length was partially published: %#lx\n", query_len );
+
+    ret = VirtualProtect( (char *)base + 4 * page_size, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    info->NameLength = 0xdeadbeef;
+    info->Name[0] = 0xffff;
+    ret = VirtualProtect( (char *)base + 4 * page_size, page_size,
+                          PAGE_READWRITE | PAGE_GUARD, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtQueryKey( created, KeyNameInformation, info, page_size, &query_len );
+    ok( status == STATUS_GUARD_PAGE_VIOLATION,
+        "expected STATUS_GUARD_PAGE_VIOLATION, got %#lx\n", status );
+    ok( info->NameLength == 0xdeadbeef, "guarded fixed header was published: %#lx\n", info->NameLength );
+    ok( info->Name[0] != 0xffff, "variable output was not published before the fixed-header fault\n" );
+    ok( query_len == 0xdeadbeef, "result length was partially published: %#lx\n", query_len );
+    queried = VirtualQuery( (char *)base + 4 * page_size, &mbi, sizeof(mbi) );
+    ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+    ok( !(mbi.Protect & PAGE_GUARD), "fixed output guard was not cleared, protection %#lx\n", mbi.Protect );
+
+    ret = VirtualProtect( (char *)base + 4 * page_size, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    ret = ResetWriteWatch( base, 0x10000 );
+    ok( !ret, "ResetWriteWatch failed: %u\n", ret );
+    status = pNtQueryKey( created, KeyNameInformation, info, page_size, &query_len );
+    ok( status == STATUS_SUCCESS, "NtQueryKey failed: %#lx\n", status );
+    ok( query_len == offsetof(KEY_NAME_INFORMATION, Name) + info->NameLength,
+        "length %lu does not match name length %lu\n", query_len, info->NameLength );
+
+    write_count = ARRAY_SIZE(write_pages);
+    ret = GetWriteWatch( 0, base, 0x10000, write_pages, &write_count, &page_size );
+    ok( !ret, "GetWriteWatch failed: %u\n", ret );
+    ok( write_count == 2, "expected 2 written pages, got %Iu\n", write_count );
+    for (i = 0; i < min( write_count, 2 ); i++)
+        ok( write_pages[i] == (char *)base + (i + 4) * page_size,
+            "write page %lu is %p\n", i, write_pages[i] );
+
+done:
+    if (created) status = pNtDeleteKey( created );
+    else status = STATUS_SUCCESS;
+    ok( status == STATUS_SUCCESS, "NtDeleteKey failed: %#lx\n", status );
+    if (created) pNtClose( created );
+    if (nested) pNtClose( nested );
+    VirtualFree( base, 0, MEM_RELEASE );
+    pNtClose( parent );
+}
+
 static void test_NtSetValueKey(void)
 {
     HANDLE key;
@@ -3167,6 +3521,7 @@ START_TEST(reg)
     pRtlAppendUnicodeToString(&winetestpath, L"\\WineTest");
 
     test_NtCreateKey();
+    test_wow64_registry_user_buffers();
     test_NtOpenKey();
     test_NtSetValueKey();
     test_RtlCheckRegistryKey();

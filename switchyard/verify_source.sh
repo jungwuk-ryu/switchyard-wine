@@ -43,5 +43,26 @@ fi
 
 "$ROOT_DIR/switchyard/verify_font_assets.sh"
 "$ROOT_DIR/switchyard/verify_tls_packages.sh"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_low_guest_dispatch.py" \
+  "$ROOT_DIR/dlls/ntdll/signal_arm64ec.c" \
+  "$ROOT_DIR/include/wine/low_va.h"
+"$ROOT_DIR/dlls/ntdll/tests/run_arm64ec_low_guest_decode.sh"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_low_guest_access.py" \
+  "$ROOT_DIR/dlls/ntdll/unix/signal_arm64.c" \
+  "$ROOT_DIR/dlls/ntdll/unix/virtual.c"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_low_instruction_cache.py" \
+  "$ROOT_DIR/dlls/ntdll/unix/virtual.c"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_low_memory_v1.py" \
+  "$ROOT_DIR/include/wine/low_va.h" \
+  "$ROOT_DIR/dlls/ntdll/unix/virtual.c" \
+  "$ROOT_DIR/server/mapping.c"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/dlls/ntdll/tests/check_creation_transactions.py" \
+  "$ROOT_DIR/server/process.c" \
+  "$ROOT_DIR/server/thread.c"
 
 echo "source history verified from $upstream_base through $(git -C "$ROOT_DIR" rev-parse HEAD)"

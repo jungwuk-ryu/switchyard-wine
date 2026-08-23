@@ -106,6 +106,7 @@ NTSTATUS unixcall_get_process_package_graph( void *args )
     struct wine_get_process_package_graph_params *params = args;
     data_size_t size = 0;
     obj_handle_t token = 0, received_token = 0;
+    ULONG_PTR graph_address;
     sigset_t sigset;
     void *graph = NULL;
     int fd = -1;
@@ -153,16 +154,22 @@ NTSTATUS unixcall_get_process_package_graph( void *args )
     if (fd != -1) close( fd );
     if (status) return status;
 
-    if ((params->flags & WINE_PROCESS_PACKAGE_GRAPH_LIMIT_2G) &&
-        (ULONG_PTR)graph >= limit_2g)
+    graph_address = (ULONG_PTR)graph;
+    if (params->flags & WINE_PROCESS_PACKAGE_GRAPH_LIMIT_2G)
     {
-        SIZE_T free_size = 0;
+        ULONG guest_address = wow64_native_to_guest_addr( graph );
 
-        NtFreeVirtualMemory( NtCurrentProcess(), &graph, &free_size,
-                             MEM_RELEASE );
-        return STATUS_INVALID_IMAGE_FORMAT;
+        if (guest_address >= limit_2g || wow64_guest_to_native_ptr( guest_address ) != graph)
+        {
+            SIZE_T free_size = 0;
+
+            NtFreeVirtualMemory( NtCurrentProcess(), &graph, &free_size,
+                                 MEM_RELEASE );
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        graph_address = guest_address;
     }
-    params->graph = (ULONG_PTR)graph;
+    params->graph = graph_address;
     params->size = size;
     return STATUS_SUCCESS;
 }
@@ -173,8 +180,10 @@ static NTSTATUS get_explicit_package_graph(
 {
     const struct wine_appx_graph_attach *attach;
     struct wine_appx_graph_attach descriptor;
+    const void *blob_ptr, *leases_ptr;
     unsigned long long *lease_values = NULL;
     obj_handle_t *lease_handles = NULL;
+    BOOL wow64_descriptor;
     unsigned int package_count, i;
     void *snapshot;
     NTSTATUS status = STATUS_INVALID_PARAMETER;
@@ -191,23 +200,35 @@ static NTSTATUS get_explicit_package_graph(
      * exception from virtual_check_buffer_for_read() cannot be unwound.  Copy
      * through the virtual-memory lock and never access the user pointer again.
      */
-    if (virtual_uninterrupted_read_memory( attach, &descriptor,
-                                           sizeof(descriptor) ) != sizeof(descriptor))
+    if (virtual_copy_from_user( &descriptor, attach, sizeof(descriptor) ))
         return STATUS_ACCESS_VIOLATION;
     if (descriptor.tag != WINE_APPX_GRAPH_ATTACH_TAG) return STATUS_SUCCESS;
+    wow64_descriptor = is_wow64() &&
+        wow64_guest_to_native_ptr( wow64_native_to_guest_addr( attach ) ) == attach;
     if (descriptor.version != WINE_APPX_GRAPH_ATTACH_VERSION ||
         descriptor.reserved || descriptor.lease_reserved || !descriptor.blob ||
-        descriptor.blob != (ULONG_PTR)descriptor.blob ||
         !descriptor.leases ||
-        descriptor.leases != (ULONG_PTR)descriptor.leases ||
         !descriptor.lease_count ||
         descriptor.lease_count > WINE_APPX_GRAPH_MAX_PACKAGES ||
         !descriptor.size || descriptor.size > WINE_APPX_GRAPH_MAX_BLOB_SIZE)
         return STATUS_INVALID_PARAMETER;
+    if (wow64_descriptor)
+    {
+        if (descriptor.blob >> 32 || descriptor.leases >> 32)
+            return STATUS_INVALID_PARAMETER;
+        blob_ptr = wow64_guest_to_native_ptr( (ULONG)descriptor.blob );
+        leases_ptr = wow64_guest_to_native_ptr( (ULONG)descriptor.leases );
+    }
+    else
+    {
+        if (descriptor.blob != (ULONG_PTR)descriptor.blob ||
+            descriptor.leases != (ULONG_PTR)descriptor.leases)
+            return STATUS_INVALID_PARAMETER;
+        blob_ptr = (const void *)(ULONG_PTR)descriptor.blob;
+        leases_ptr = (const void *)(ULONG_PTR)descriptor.leases;
+    }
     if (!(snapshot = malloc( descriptor.size ))) return STATUS_NO_MEMORY;
-    if (virtual_uninterrupted_read_memory( (const void *)(ULONG_PTR)descriptor.blob,
-                                           snapshot,
-                                           descriptor.size ) != descriptor.size)
+    if (virtual_copy_from_user( snapshot, blob_ptr, descriptor.size ))
     {
         free( snapshot );
         return STATUS_ACCESS_VIOLATION;
@@ -229,10 +250,8 @@ static NTSTATUS get_explicit_package_graph(
         status = STATUS_NO_MEMORY;
         goto failed;
     }
-    if (virtual_uninterrupted_read_memory(
-            (const void *)(ULONG_PTR)descriptor.leases, lease_values,
-            descriptor.lease_count * sizeof(*lease_values) ) !=
-        descriptor.lease_count * sizeof(*lease_values))
+    if (virtual_copy_from_user( lease_values, leases_ptr,
+            descriptor.lease_count * sizeof(*lease_values) ))
     {
         status = STATUS_ACCESS_VIOLATION;
         goto failed;
@@ -918,19 +937,80 @@ NTSTATUS wow64_wine_spawnvp( void *args )
     {
         ULONG argv;
         int   wait;
-    } const *params32 = args;
-
-    ULONG *argv32 = ULongToPtr( params32->argv );
-    unsigned int i, count = 0;
-    char **argv;
+    } params32;
+    ULONG *entries = NULL;
+    SIZE_T count = 0, capacity = 0, string_bytes = 0, max_bytes;
+    char **argv = NULL;
+    long arg_max;
     NTSTATUS ret;
 
-    while (argv32[count]) count++;
-    argv = malloc( (count + 1) * sizeof(*argv) );
-    for (i = 0; i < count; i++) argv[i] = ULongToPtr( argv32[i] );
-    argv[count] = NULL;
-    ret = __wine_unix_spawnvp( argv, params32->wait );
+    if ((ret = virtual_copy_from_user( &params32, args, sizeof(params32) ))) return ret;
+    if (!params32.argv) return STATUS_ACCESS_VIOLATION;
+    arg_max = sysconf( _SC_ARG_MAX );
+    max_bytes = arg_max > 0 ? min( (SIZE_T)arg_max, (SIZE_T)0x1000000 ) : 0x100000;
+    max_bytes = max( max_bytes, (SIZE_T)0x1000 );
+
+    for (;;)
+    {
+        ULONG entry;
+
+        if (count >= max_bytes / sizeof(*entries) ||
+            count >= (0x100000000ull - params32.argv) / sizeof(*entries))
+        {
+            ret = STATUS_BUFFER_OVERFLOW;
+            goto done;
+        }
+        if ((ret = virtual_copy_from_user( &entry,
+                (ULONG *)wow64_guest_to_native_ptr( params32.argv ) + count,
+                sizeof(entry) )))
+            goto done;
+        if (!entry) break;
+        if (count == capacity)
+        {
+            SIZE_T new_capacity = min( max_bytes / sizeof(*entries),
+                                        capacity ? 2 * capacity : 16 );
+            ULONG *new_entries;
+
+            if (new_capacity <= capacity ||
+                !(new_entries = realloc( entries, new_capacity * sizeof(*entries) )))
+            {
+                ret = STATUS_NO_MEMORY;
+                goto done;
+            }
+            entries = new_entries;
+            capacity = new_capacity;
+        }
+        entries[count++] = entry;
+    }
+
+    if (!(argv = calloc( count + 1, sizeof(*argv) )))
+    {
+        ret = STATUS_NO_MEMORY;
+        goto done;
+    }
+    for (SIZE_T i = 0; i < count; i++)
+    {
+        SIZE_T remaining = max_bytes - string_bytes;
+
+        if (!remaining)
+        {
+            ret = STATUS_BUFFER_OVERFLOW;
+            goto done;
+        }
+        if ((ret = virtual_copy_string_from_user( &argv[i],
+                wow64_guest_to_native_ptr( entries[i] ), remaining )))
+            goto done;
+        string_bytes += strlen( argv[i] ) + 1;
+    }
+    ret = __wine_unix_spawnvp( argv, params32.wait );
+
+done:
+    if (argv)
+    {
+        for (SIZE_T i = 0; i < count; i++) free( argv[i] );
+    }
     free( argv );
+    free( entries );
     return ret;
 }
 #endif
@@ -1033,6 +1113,21 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     return status;
 }
 
+struct fork_and_exec_context
+{
+    OBJECT_ATTRIBUTES *attr;
+    const char *unix_name;
+    int unixdir;
+    const RTL_USER_PROCESS_PARAMETERS *params;
+};
+
+static NTSTATUS fork_and_exec_callback( void *context )
+{
+    struct fork_and_exec_context *args = context;
+
+    return fork_and_exec( args->attr, args->unix_name, args->unixdir, args->params );
+}
+
 static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_t **handles, data_size_t *handles_len )
 {
     SIZE_T count, i;
@@ -1059,12 +1154,13 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
 /**********************************************************************
  *           NtCreateUserProcess  (NTDLL.@)
  */
-NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr,
+static NTSTATUS create_user_process( HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr,
                                      ACCESS_MASK process_access, ACCESS_MASK thread_access,
                                      OBJECT_ATTRIBUTES *process_attr, OBJECT_ATTRIBUTES *thread_attr,
                                      ULONG process_flags, ULONG thread_flags,
                                      RTL_USER_PROCESS_PARAMETERS *params, PS_CREATE_INFO *info,
-                                     PS_ATTRIBUTE_LIST *ps_attr )
+                                     PS_ATTRIBUTE_LIST *ps_attr,
+                                     struct wine_wow64_create_user_process_params *transaction )
 {
     unsigned int status;
     BOOL success = FALSE;
@@ -1150,15 +1246,28 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     InitializeObjectAttributes( &attr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
     if ((status = get_pe_file_info( &attr, &nt_name, &unix_name, &file_handle, &pe_info )))
     {
-        if (status == STATUS_INVALID_IMAGE_NOT_MZ && !fork_and_exec( &attr, unix_name, unixdir, params ))
+        if (status == STATUS_INVALID_IMAGE_NOT_MZ && transaction)
+        {
+            struct fork_and_exec_context context = { &attr, unix_name, unixdir, params };
+
+            status = virtual_run_wow64_non_mz_create_process( transaction,
+                                                               fork_and_exec_callback,
+                                                               &context );
+            if (!status)
+            {
+                *process_handle_ptr = *thread_handle_ptr = 0;
+                memset( info, 0, sizeof(*info) );
+                transaction->result = WINE_WOW64_CREATE_USER_PROCESS_NON_MZ_COMMITTED;
+                goto done;
+            }
+        }
+        else if (status == STATUS_INVALID_IMAGE_NOT_MZ &&
+                 !fork_and_exec( &attr, unix_name, unixdir, params ))
         {
             *process_handle_ptr = *thread_handle_ptr = 0;
             memset( info, 0, sizeof(*info) );
-            free( package_leases );
-            free( (void *)package_graph );
-            free( unix_name );
-            free( nt_name.Buffer );
-            return STATUS_SUCCESS;
+            status = STATUS_SUCCESS;
+            goto done;
         }
         goto done;
     }
@@ -1223,6 +1332,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         req->socket_fd      = socketfd[1];
         req->access         = process_access;
         req->machine        = machine;
+        req->wine_flags     = !!transaction;
         req->info_size      = startup_info_size;
         req->handles_size   = handles_size;
         req->jobs_size      = jobs_size;
@@ -1277,6 +1387,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         req->process    = wine_server_obj_handle( process_handle );
         req->access     = thread_access;
         req->flags      = thread_flags;
+        req->wine_flags = 0;
         req->request_fd = -1;
         wine_server_add_data( req, thread_objattr, thread_attr_len );
         if (!(status = wine_server_call( req )))
@@ -1349,6 +1460,12 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     *process_handle_ptr = process_handle;
     *thread_handle_ptr = thread_handle;
     process_handle = thread_handle = 0;
+    if (transaction)
+    {
+        transaction->transaction = (ULONG_PTR)process_info;
+        transaction->result = WINE_WOW64_CREATE_USER_PROCESS_PE_TRANSACTION;
+        process_info = 0;
+    }
     status = STATUS_SUCCESS;
 
 done:
@@ -1370,6 +1487,170 @@ done:
     free( winedebug );
     free( unix_name );
     free( nt_name.Buffer );
+    return status;
+}
+
+
+/**********************************************************************
+ *           NtCreateUserProcess  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr,
+                                     ACCESS_MASK process_access, ACCESS_MASK thread_access,
+                                     OBJECT_ATTRIBUTES *process_attr, OBJECT_ATTRIBUTES *thread_attr,
+                                     ULONG process_flags, ULONG thread_flags,
+                                     RTL_USER_PROCESS_PARAMETERS *params, PS_CREATE_INFO *info,
+                                     PS_ATTRIBUTE_LIST *ps_attr )
+{
+    return create_user_process( process_handle_ptr, thread_handle_ptr,
+                                process_access, thread_access,
+                                process_attr, thread_attr, process_flags,
+                                thread_flags, params, info, ps_attr, NULL );
+}
+
+static BOOL is_wow64_native_staging_range( UINT64 value, SIZE_T size, BOOL optional )
+{
+    UINT64 end;
+
+    if (!value) return optional;
+    if ((UINT64)(ULONG_PTR)value != value || value <= MAXDWORD ||
+        size > ~(UINT64)0 - value)
+        return FALSE;
+    end = value + size;
+    if (value < WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE &&
+        end > WINE_LOW_VA_SHADOW_BASE)
+        return FALSE;
+    return TRUE;
+}
+
+static BOOL get_wow64_guest_address_model( BOOL *shadow )
+{
+#ifdef _WIN64
+    WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
+    ULONG_PTR address = (ULONG_PTR)wow_teb;
+
+    if (!wow_teb) return FALSE;
+    *shadow = address >= WINE_LOW_VA_SHADOW_BASE &&
+              address - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE;
+    return TRUE;
+#else
+    return FALSE;
+#endif
+}
+
+static BOOL is_wow64_guest_output_range( UINT64 value, SIZE_T size, BOOL shadow )
+{
+    if (!value || size > 0x100000000ull) return FALSE;
+    if (!shadow)
+        return value <= MAXDWORD && size <= 0x100000000ull - value;
+    return value >= WINE_LOW_VA_SHADOW_BASE &&
+           value - WINE_LOW_VA_SHADOW_BASE <= WINE_LOW_VA_SHADOW_SIZE - size;
+}
+
+static NTSTATUS complete_wow64_process_transaction( HANDLE transaction,
+                                                     BOOL commit, NTSTATUS status )
+{
+    NTSTATUS ret;
+
+    SERVER_START_REQ( complete_new_process )
+    {
+        req->info = wine_server_obj_handle( transaction );
+        req->status = status;
+        req->commit = commit;
+        ret = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    NtClose( transaction );
+    return ret;
+}
+
+C_ASSERT( sizeof(struct wine_wow64_create_user_process_params) == 144 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_process_params, version) == 0 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_process_params, process_handle) == 8 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_process_params, transaction) == 96 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_process_params, process_access) == 104 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_process_params, result) == 124 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_process_params, reserved) == 128 );
+
+NTSTATUS unixcall_wow64_create_user_process( void *args )
+{
+    struct wine_wow64_create_user_process_params params;
+    HANDLE process_handle = 0, thread_handle = 0;
+    BOOL shadow;
+    NTSTATUS status, publish;
+
+    if (!is_wow64_native_staging_range( (ULONG_PTR)args, sizeof(params), FALSE ))
+        return STATUS_INVALID_PARAMETER;
+    if ((status = virtual_copy_from_user( &params, args, sizeof(params) ))) return status;
+    if (!get_wow64_guest_address_model( &shadow ) ||
+        params.version != WINE_WOW64_CREATE_USER_PROCESS_VERSION ||
+        params.size != sizeof(params) || params.process_handle ||
+        params.thread_handle || params.transaction || params.result ||
+        params.reserved[0] || params.reserved[1] ||
+        !params.non_mz_create_info_size || params.non_mz_create_info_size > 256 ||
+        !is_wow64_native_staging_range( params.process_attributes,
+                                        sizeof(OBJECT_ATTRIBUTES), TRUE ) ||
+        !is_wow64_native_staging_range( params.thread_attributes,
+                                        sizeof(OBJECT_ATTRIBUTES), TRUE ) ||
+        !is_wow64_native_staging_range( params.process_parameters,
+                                        sizeof(RTL_USER_PROCESS_PARAMETERS), FALSE ) ||
+        !is_wow64_native_staging_range( params.create_info,
+                                        sizeof(PS_CREATE_INFO), FALSE ) ||
+        !is_wow64_native_staging_range( params.attribute_list,
+                                        sizeof(SIZE_T), FALSE ) ||
+        !is_wow64_native_staging_range( params.non_mz_create_info,
+                                        params.non_mz_create_info_size, FALSE ) ||
+        !is_wow64_guest_output_range( params.guest_process_handle,
+                                       sizeof(ULONG), shadow ) ||
+        !is_wow64_guest_output_range( params.guest_thread_handle,
+                                       sizeof(ULONG), shadow ) ||
+        !is_wow64_guest_output_range( params.guest_create_info,
+                                       params.non_mz_create_info_size, shadow ))
+        return STATUS_INVALID_PARAMETER;
+    if ((status = wow64_probe_user_write( args, sizeof(params) ))) return status;
+
+    status = create_user_process( &process_handle, &thread_handle,
+                                  params.process_access, params.thread_access,
+                                  (void *)(ULONG_PTR)params.process_attributes,
+                                  (void *)(ULONG_PTR)params.thread_attributes,
+                                  params.process_flags, params.thread_flags,
+                                  (void *)(ULONG_PTR)params.process_parameters,
+                                  (void *)(ULONG_PTR)params.create_info,
+                                  (void *)(ULONG_PTR)params.attribute_list,
+                                  &params );
+    params.process_handle = (ULONG_PTR)process_handle;
+    params.thread_handle = (ULONG_PTR)thread_handle;
+    if ((publish = virtual_copy_to_user( args, &params, sizeof(params) )))
+    {
+        if (params.transaction)
+            complete_wow64_process_transaction( (HANDLE)(ULONG_PTR)params.transaction,
+                                                 FALSE, publish );
+        if (thread_handle) NtClose( thread_handle );
+        if (process_handle) NtClose( process_handle );
+        return publish;
+    }
+    return status;
+}
+
+C_ASSERT( sizeof(struct wine_wow64_complete_user_process_params) == 24 );
+C_ASSERT( offsetof(struct wine_wow64_complete_user_process_params, transaction) == 0 );
+C_ASSERT( offsetof(struct wine_wow64_complete_user_process_params, status) == 8 );
+C_ASSERT( offsetof(struct wine_wow64_complete_user_process_params, commit) == 12 );
+C_ASSERT( offsetof(struct wine_wow64_complete_user_process_params, reserved) == 16 );
+
+NTSTATUS unixcall_wow64_complete_user_process( void *args )
+{
+    struct wine_wow64_complete_user_process_params params;
+    NTSTATUS status;
+
+    if ((status = virtual_copy_from_user( &params, args, sizeof(params) ))) return status;
+    if (!params.transaction || params.commit > 1 || params.reserved)
+        return STATUS_INVALID_PARAMETER;
+    status = complete_wow64_process_transaction(
+        (HANDLE)(ULONG_PTR)params.transaction, params.commit, params.status );
+    /* Once the guest handle cells have been published, returning a commit
+     * failure would leave live-looking but cancelled handles behind.  A server
+     * or token invariant failure at that point is not recoverable. */
+    if (params.commit && status) abort_process( status );
     return status;
 }
 

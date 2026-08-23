@@ -541,6 +541,7 @@ union apc_call
         mem_size_t       align;
         unsigned int     prot;
         unsigned int     attributes;
+        unsigned int     wine_flags;
     } virtual_alloc_ex;
     struct
     {
@@ -591,6 +592,7 @@ union apc_call
         mem_size_t       size;
         file_pos_t       offset;
         mem_size_t       zero_bits;
+        mem_size_t       commit_size;
         unsigned int     alloc_type;
         unsigned int     prot;
     } map_view;
@@ -606,7 +608,8 @@ union apc_call
         unsigned int     alloc_type;
         unsigned int     prot;
         unsigned short   machine;
-        unsigned short   __pad[3];
+        unsigned short   wine_flags;
+        unsigned int     attributes;
     } map_view_ex;
     struct
     {
@@ -618,6 +621,8 @@ union apc_call
     {
         enum apc_type    type;
         unsigned int     flags;
+        unsigned int     access;
+        unsigned int     wine_flags;
         client_ptr_t     func;
         client_ptr_t     arg;
         mem_size_t       zero_bits;
@@ -733,6 +738,7 @@ union apc_result
         thread_id_t      tid;
         client_ptr_t     teb;
         obj_handle_t     handle;
+        obj_handle_t     info;
     } create_thread;
     struct
     {
@@ -1112,7 +1118,7 @@ struct new_process_request
     int          socket_fd;
     unsigned int access;
     unsigned short machine;
-    char __pad_38[2];
+    unsigned short wine_flags;
     data_size_t  info_size;
     data_size_t  handles_size;
     data_size_t  jobs_size;
@@ -1157,15 +1163,19 @@ struct new_thread_request
     obj_handle_t process;
     unsigned int access;
     unsigned int flags;
+    unsigned int wine_flags;
     int          request_fd;
     int          is_system;
     /* VARARG(objattr,object_attributes); */
+    char __pad_36[4];
 };
 struct new_thread_reply
 {
     struct reply_header __header;
     thread_id_t  tid;
     obj_handle_t handle;
+    obj_handle_t info;
+    char __pad_20[4];
 };
 
 
@@ -2438,6 +2448,7 @@ struct map_view_request
     char __pad_20[4];
     client_ptr_t base;
     mem_size_t   size;
+    mem_size_t   commit_size;
     file_pos_t   start;
 };
 struct map_view_reply
@@ -2447,16 +2458,20 @@ struct map_view_reply
 
 
 
+#define IMAGE_VIEW_TRANSLATED_WOW64 0x0001
+#define IMAGE_VIEW_TRANSLATED_AMD64_LOW 0x0002
+
 struct map_image_view_request
 {
     struct request_header __header;
     obj_handle_t mapping;
     client_ptr_t base;
+    client_ptr_t guest_base;
     mem_size_t   size;
     mem_size_t   offset;
     unsigned int entry;
     unsigned short machine;
-    char __pad_46[2];
+    unsigned short flags;
 };
 struct map_image_view_reply
 {
@@ -6445,6 +6460,52 @@ struct dcomp_get_shared_visual_info_reply
 };
 
 
+/* Retrieve process machine metadata for a virtual-memory operation.
+ * Keep Wine-private requests appended so existing request numbers remain stable. */
+struct get_process_vm_machine_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_process_vm_machine_reply
+{
+    struct reply_header __header;
+    unsigned short machine;
+    unsigned short flags;
+    char __pad_12[4];
+};
+
+
+/* Commit or cancel a transactionally created process without requiring a
+ * PROCESS_TERMINATE handle. */
+struct complete_new_process_request
+{
+    struct request_header __header;
+    obj_handle_t info;
+    int          status;
+    int          commit;
+};
+struct complete_new_process_reply
+{
+    struct reply_header __header;
+};
+
+
+/* Commit or cancel a private WoW64 thread-creation transaction.  The token
+ * owns a server reference and does not depend on the requested thread access. */
+struct complete_new_thread_request
+{
+    struct request_header __header;
+    obj_handle_t info;
+    int          status;
+    int          commit;
+};
+struct complete_new_thread_reply
+{
+    struct reply_header __header;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6768,6 +6829,9 @@ enum request
     REQ_dcomp_create_shared_visual,
     REQ_dcomp_set_shared_visual_info,
     REQ_dcomp_get_shared_visual_info,
+    REQ_get_process_vm_machine,
+    REQ_complete_new_process,
+    REQ_complete_new_thread,
     REQ_NB_REQUESTS
 };
 
@@ -7096,6 +7160,9 @@ union generic_request
     struct dcomp_create_shared_visual_request dcomp_create_shared_visual_request;
     struct dcomp_set_shared_visual_info_request dcomp_set_shared_visual_info_request;
     struct dcomp_get_shared_visual_info_request dcomp_get_shared_visual_info_request;
+    struct get_process_vm_machine_request get_process_vm_machine_request;
+    struct complete_new_process_request complete_new_process_request;
+    struct complete_new_thread_request complete_new_thread_request;
 };
 union generic_reply
 {
@@ -7422,8 +7489,11 @@ union generic_reply
     struct dcomp_create_shared_visual_reply dcomp_create_shared_visual_reply;
     struct dcomp_set_shared_visual_info_reply dcomp_set_shared_visual_info_reply;
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
+    struct get_process_vm_machine_reply get_process_vm_machine_reply;
+    struct complete_new_process_reply complete_new_process_reply;
+    struct complete_new_thread_reply complete_new_thread_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 961
+#define SERVER_PROTOCOL_VERSION 967
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

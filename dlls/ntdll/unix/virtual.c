@@ -87,6 +87,7 @@
 #include "winternl.h"
 #include "ddk/wdm.h"
 #include "wine/list.h"
+#include "wine/low_va.h"
 #include "wine/rbtree.h"
 #include "unix_private.h"
 #include "wine/debug.h"
@@ -118,6 +119,7 @@ struct builtin_module
     void        *module;
     char        *unix_path;
     void        *unix_handle;
+    unixlib_handle_t wow64_dispatch;
 };
 
 static struct list builtin_modules = LIST_INIT( builtin_modules );
@@ -144,6 +146,14 @@ struct file_view
 #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
 #define VPROT_PLACEHOLDER      0x0400
 #define VPROT_FREE_PLACEHOLDER 0x0800
+#define VPROT_WOW64_TRANSLATED 0x1000  /* view contains i386 guest memory in the Darwin shadow */
+#define VPROT_AMD64_LOW_TRANSLATED 0x2000 /* fixed-low AMD64 image in the Darwin shadow */
+#define VPROT_SHADOW_TRANSLATED (VPROT_WOW64_TRANSLATED | VPROT_AMD64_LOW_TRANSLATED)
+
+static inline BOOL is_shadow_translated_vprot( unsigned int vprot )
+{
+    return !!(vprot & VPROT_SHADOW_TRANSLATED);
+}
 
 /* Conversion from VPROT_* to Win32 flags */
 static const BYTE VIRTUAL_Win32Flags[16] =
@@ -769,6 +779,363 @@ static ULONG_PTR get_wow_user_space_limit(void)
     return (ULONG_PTR)user_space_limit;
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+#define WOW64_MEMORY_INLINE_RANGES 8
+#define ARM64EC_LOW_MEMORY_INLINE_RANGES 8
+
+C_ASSERT( sizeof(struct wine_wow64_memory_range_v1) == 40 );
+C_ASSERT( sizeof(struct wine_wow64_memory_event_v1) == 72 );
+C_ASSERT( sizeof(struct wine_wow64_memory_observer_v1) == 40 );
+C_ASSERT( sizeof(struct wine_arm64ec_low_memory_range_v1) == 40 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_range_v1, host_address) == 0 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_range_v1, size) == 8 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_range_v1, host_allocation_base) == 16 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_range_v1, state) == 24 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_range_v1, protect) == 28 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_range_v1, flags) == 32 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_range_v1, reserved) == 36 );
+C_ASSERT( sizeof(struct wine_arm64ec_low_memory_event_v1) == 72 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, version) == 0 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, size) == 4 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, operation) == 8 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, flags) == 12 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, status) == 16 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, snapshot_status) == 20 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, reserved) == 24 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, host_address) == 32 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, size_covered) == 40 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, host_allocation_base) == 48 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, ranges) == 56 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_event_v1, range_count) == 64 );
+C_ASSERT( sizeof(struct wine_arm64ec_low_memory_observer_v1) == 40 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_observer_v1, version) == 0 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_observer_v1, size) == 4 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_observer_v1, context) == 8 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_observer_v1, begin) == 16 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_observer_v1, complete) == 24 );
+C_ASSERT( offsetof(struct wine_arm64ec_low_memory_observer_v1, capabilities) == 32 );
+C_ASSERT( sizeof(struct wine_wow64_memory_fault_result_v1) == 48 );
+
+struct wow64_memory_transaction
+{
+    struct wine_wow64_memory_event_v1 event;
+    struct wine_wow64_memory_range_v1 *ranges;
+    struct wine_wow64_memory_range_v1 inline_ranges[WOW64_MEMORY_INLINE_RANGES];
+    SIZE_T range_capacity;
+    const struct wine_wow64_memory_observer_v1 *observer;
+    void *observer_transaction;
+    BOOL gate_locked;
+    BOOL observer_begun;
+    BOOL nested;
+};
+
+static pthread_mutex_t wow64_memory_observer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct wine_wow64_memory_observer_v1 wow64_memory_observer;
+static BOOL wow64_memory_observer_registered;
+static BOOL wow64_memory_observer_required;
+static BOOL wow64_memory_logical_write_fault_delegated;
+static __thread struct wow64_memory_transaction *wow64_memory_current_transaction;
+static __thread BOOL wow64_memory_observer_callback_active;
+
+struct arm64ec_low_memory_transaction
+{
+    struct wine_arm64ec_low_memory_event_v1 event;
+    struct wine_arm64ec_low_memory_range_v1 *ranges;
+    struct wine_arm64ec_low_memory_range_v1 inline_ranges[ARM64EC_LOW_MEMORY_INLINE_RANGES];
+    SIZE_T range_capacity;
+    const struct wine_arm64ec_low_memory_observer_v1 *observer;
+    void *observer_transaction;
+    BOOL gate_locked;
+    BOOL observer_begun;
+    BOOL nested;
+};
+
+static pthread_mutex_t arm64ec_low_memory_observer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct wine_arm64ec_low_memory_observer_v1 arm64ec_low_memory_observer;
+static BOOL arm64ec_low_memory_observer_registered;
+static BOOL arm64ec_low_memory_observer_required;
+static __thread struct arm64ec_low_memory_transaction *arm64ec_low_memory_current_transaction;
+static __thread BOOL arm64ec_low_memory_observer_callback_active;
+
+static inline BOOL is_wow64_shadow_address( const void *address )
+{
+    ULONG_PTR value = (ULONG_PTR)address;
+
+    return value >= WINE_LOW_VA_SHADOW_BASE &&
+           value - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE;
+}
+
+static inline BOOL is_inside_wow64_shadow( const void *address, SIZE_T size )
+{
+    ULONG_PTR value = (ULONG_PTR)address;
+
+    return is_wow64_shadow_address( address ) &&
+           size <= WINE_LOW_VA_SHADOW_SIZE - (value - WINE_LOW_VA_SHADOW_BASE);
+}
+
+static inline BOOL overlaps_wow64_shadow( const void *address, SIZE_T size )
+{
+    ULONG_PTR value = (ULONG_PTR)address;
+
+    if (!size || value >= WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) return FALSE;
+    if (value >= WINE_LOW_VA_SHADOW_BASE) return TRUE;
+    return size > WINE_LOW_VA_SHADOW_BASE - value;
+}
+
+static inline BOOL limits_are_inside_wow64_shadow( ULONG_PTR limit_low, ULONG_PTR limit_high )
+{
+    return limit_low >= WINE_LOW_VA_SHADOW_BASE &&
+           limit_high >= limit_low &&
+           limit_high - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE;
+}
+
+/* Normalize an address supplied by an ARM64EC/x64 VM operation to the host
+ * window observed by the AMD64-low provider.  Numeric membership only selects
+ * the serialization gate; the VPROT tag remains the ownership authority. */
+static BOOL get_arm64ec_low_candidate_range( const void *address, SIZE_T size,
+                                              void **host_address )
+{
+    ULONG_PTR value = (ULONG_PTR)address;
+
+    if (!is_arm64ec() || !address) return FALSE;
+    if (value < WINE_LOW_VA_SHADOW_SIZE)
+    {
+        if (size > WINE_LOW_VA_SHADOW_SIZE - value) return FALSE;
+        *host_address = (void *)(WINE_LOW_VA_SHADOW_BASE + value);
+        return TRUE;
+    }
+    if (!is_inside_wow64_shadow( address, size )) return FALSE;
+    *host_address = (void *)address;
+    return TRUE;
+}
+
+static NTSTATUS allocate_wow64_shadow_memory( void **address, SIZE_T *size,
+                                              ULONG type, ULONG protect );
+static NTSTATUS wow64_memory_set_logical_write_fault_delegation( BOOL enable );
+
+static inline BOOL wow64_memory_observer_is_required(void)
+{
+    return __atomic_load_n( &wow64_memory_observer_required, __ATOMIC_ACQUIRE );
+}
+
+static inline BOOL wow64_memory_logical_write_fault_is_delegated(void)
+{
+    return __atomic_load_n( &wow64_memory_logical_write_fault_delegated,
+                            __ATOMIC_ACQUIRE );
+}
+
+static inline void wow64_memory_assert_transaction(void)
+{
+    assert( !wow64_memory_observer_is_required() || wow64_memory_current_transaction );
+}
+
+static NTSTATUS wow64_memory_begin_transaction( struct wow64_memory_transaction *transaction,
+                                                 BOOL candidate, ULONG operation,
+                                                 const void *address, SIZE_T size,
+                                                 const void *allocation_base )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    memset( transaction, 0, sizeof(*transaction) );
+    transaction->ranges = transaction->inline_ranges;
+    transaction->range_capacity = ARRAY_SIZE(transaction->inline_ranges);
+    if (!candidate) return STATUS_SUCCESS;
+    if (wow64_memory_observer_callback_active)
+    {
+        ERR( "translated memory mutation from observer callback\n" );
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (wow64_memory_current_transaction)
+    {
+        transaction->nested = TRUE;
+        return STATUS_SUCCESS;
+    }
+
+    mutex_lock( &wow64_memory_observer_mutex );
+    transaction->gate_locked = TRUE;
+    transaction->event.version = WINE_WOW64_MEMORY_OBSERVER_VERSION;
+    transaction->event.size = sizeof(transaction->event);
+    transaction->event.operation = operation;
+    transaction->event.address = (ULONG_PTR)address;
+    transaction->event.size_covered = size;
+    transaction->event.allocation_base = (ULONG_PTR)allocation_base;
+
+    if (wow64_memory_observer_registered)
+    {
+        transaction->observer = &wow64_memory_observer;
+        wow64_memory_observer_callback_active = TRUE;
+        status = transaction->observer->begin( transaction->observer->context, operation,
+                                               (ULONG_PTR)address, size,
+                                               (ULONG_PTR)allocation_base,
+                                               &transaction->observer_transaction );
+        wow64_memory_observer_callback_active = FALSE;
+        if (status)
+        {
+            transaction->gate_locked = FALSE;
+            mutex_unlock( &wow64_memory_observer_mutex );
+            return status;
+        }
+        transaction->observer_begun = TRUE;
+    }
+    wow64_memory_current_transaction = transaction;
+    return STATUS_SUCCESS;
+}
+
+static void wow64_memory_complete_transaction( struct wow64_memory_transaction *transaction )
+{
+    if (transaction->nested || !transaction->gate_locked) return;
+
+    assert( wow64_memory_current_transaction == transaction );
+    wow64_memory_current_transaction = NULL;
+    if (transaction->observer_begun)
+    {
+        transaction->event.ranges = transaction->ranges;
+        wow64_memory_observer_callback_active = TRUE;
+        transaction->observer->complete( transaction->observer->context,
+                                         transaction->observer_transaction,
+                                         &transaction->event );
+        wow64_memory_observer_callback_active = FALSE;
+    }
+    if (transaction->ranges != transaction->inline_ranges) free( transaction->ranges );
+    transaction->gate_locked = FALSE;
+    mutex_unlock( &wow64_memory_observer_mutex );
+}
+
+static inline BOOL arm64ec_low_memory_observer_is_required(void)
+{
+    return __atomic_load_n( &arm64ec_low_memory_observer_required, __ATOMIC_ACQUIRE );
+}
+
+static inline void arm64ec_low_memory_assert_transaction(void)
+{
+    assert( !arm64ec_low_memory_observer_is_required() ||
+            arm64ec_low_memory_current_transaction );
+}
+
+/* The observer begin callback runs before virtual_mutex, so an unmap or
+ * MEM_RELEASE request cannot resolve its containing view yet.  Give the
+ * provider a conservative, nonempty logical-page interval to quiesce; the
+ * completion event is replaced with the exact resolved view interval while
+ * virtual_mutex is held. */
+static NTSTATUS arm64ec_low_memory_normalize_begin_interval(
+    const void *address, SIZE_T size, void **base, SIZE_T *covered )
+{
+    const ULONG_PTR shadow_start = WINE_LOW_VA_SHADOW_BASE;
+    const ULONG_PTR shadow_end = WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE;
+    ULONG_PTR start = (ULONG_PTR)address, end;
+
+    if (start < shadow_start || start >= shadow_end) return STATUS_INVALID_ADDRESS;
+    if (!size) size = 1;
+    if (size > shadow_end - start) return STATUS_INVALID_ADDRESS;
+    end = start + size;
+    start &= ~page_mask;
+    end = (end + page_mask) & ~page_mask;
+    if (end <= start || end > shadow_end) return STATUS_INVALID_ADDRESS;
+    *base = (void *)start;
+    *covered = end - start;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS arm64ec_low_memory_begin_transaction(
+    struct arm64ec_low_memory_transaction *transaction, BOOL candidate, ULONG operation,
+    const void *address, SIZE_T size, const void *allocation_base )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    void *begin_address;
+    SIZE_T begin_size;
+
+    memset( transaction, 0, sizeof(*transaction) );
+    transaction->ranges = transaction->inline_ranges;
+    transaction->range_capacity = ARRAY_SIZE(transaction->inline_ranges);
+    if (!candidate) return STATUS_SUCCESS;
+    if ((status = arm64ec_low_memory_normalize_begin_interval(
+             address, size, &begin_address, &begin_size )))
+        return status;
+    if (arm64ec_low_memory_observer_callback_active)
+    {
+        ERR( "AMD64-low memory mutation from observer callback\n" );
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (arm64ec_low_memory_current_transaction)
+    {
+        transaction->nested = TRUE;
+        arm64ec_low_memory_current_transaction->event.flags |=
+            WINE_ARM64EC_LOW_MEMORY_EVENT_FULL_SNAPSHOT;
+        return STATUS_SUCCESS;
+    }
+
+    mutex_lock( &arm64ec_low_memory_observer_mutex );
+    transaction->gate_locked = TRUE;
+    transaction->event.version = WINE_ARM64EC_LOW_MEMORY_OBSERVER_VERSION;
+    transaction->event.size = sizeof(transaction->event);
+    transaction->event.operation = operation;
+    transaction->event.host_address = (ULONG_PTR)begin_address;
+    transaction->event.size_covered = begin_size;
+    transaction->event.host_allocation_base = (ULONG_PTR)allocation_base;
+
+    if (arm64ec_low_memory_observer_registered)
+    {
+        transaction->observer = &arm64ec_low_memory_observer;
+        arm64ec_low_memory_observer_callback_active = TRUE;
+        status = transaction->observer->begin(
+            transaction->observer->context, operation, (ULONG_PTR)begin_address, begin_size,
+            (ULONG_PTR)allocation_base, &transaction->observer_transaction );
+        arm64ec_low_memory_observer_callback_active = FALSE;
+        if (status)
+        {
+            transaction->gate_locked = FALSE;
+            mutex_unlock( &arm64ec_low_memory_observer_mutex );
+            return status;
+        }
+        transaction->observer_begun = TRUE;
+    }
+    arm64ec_low_memory_current_transaction = transaction;
+    return STATUS_SUCCESS;
+}
+
+static void arm64ec_low_memory_complete_transaction(
+    struct arm64ec_low_memory_transaction *transaction )
+{
+    if (transaction->nested || !transaction->gate_locked) return;
+
+    assert( arm64ec_low_memory_current_transaction == transaction );
+    arm64ec_low_memory_current_transaction = NULL;
+    if (transaction->observer_begun)
+    {
+        transaction->event.ranges = transaction->ranges;
+        arm64ec_low_memory_observer_callback_active = TRUE;
+        transaction->observer->complete( transaction->observer->context,
+                                         transaction->observer_transaction,
+                                         &transaction->event );
+        arm64ec_low_memory_observer_callback_active = FALSE;
+    }
+    if (transaction->ranges != transaction->inline_ranges) free( transaction->ranges );
+    transaction->gate_locked = FALSE;
+    mutex_unlock( &arm64ec_low_memory_observer_mutex );
+}
+#endif
+
+#if !defined(__APPLE__) || !defined(__aarch64__)
+static inline BOOL wow64_memory_logical_write_fault_is_delegated(void)
+{
+    return FALSE;
+}
+
+static inline BOOL is_inside_wow64_shadow( const void *address, SIZE_T size )
+{
+    (void)address;
+    (void)size;
+    return FALSE;
+}
+
+static inline BOOL overlaps_wow64_shadow( const void *address, SIZE_T size )
+{
+    (void)address;
+    (void)size;
+    return FALSE;
+}
+#endif
+
 
 /***********************************************************************
  *           add_builtin_module
@@ -783,6 +1150,7 @@ static void add_builtin_module( void *module, void *handle )
     builtin->refcount    = 1;
     builtin->unix_path   = NULL;
     builtin->unix_handle = NULL;
+    builtin->wow64_dispatch = 0;
     list_add_tail( &builtin_modules, &builtin->entry );
 }
 
@@ -811,6 +1179,8 @@ static void release_builtin_module( void *module )
     if (!builtin) return;
     if (--builtin->refcount) return;
     list_remove( &builtin->entry );
+    if (builtin->wow64_dispatch)
+        unregister_wow64_unixlib_dispatch( builtin->wow64_dispatch );
     if (builtin->handle) dlclose( builtin->handle );
     if (builtin->unix_handle) dlclose( builtin->unix_handle );
     free( builtin->unix_path );
@@ -841,11 +1211,32 @@ void *get_builtin_so_handle( void *module )
 /***********************************************************************
  *           get_unixlib_funcs
  */
-static NTSTATUS get_unixlib_funcs( void *so_handle, BOOL wow, const void **funcs, NTSTATUS (**entry)(void) )
+static NTSTATUS get_unixlib_funcs( void *so_handle, BOOL wow, unixlib_handle_t *dispatch,
+                                   NTSTATUS (**entry)(void), BOOL *dispatch_registered )
 {
-    *funcs = dlsym( so_handle, wow ? "__wine_unix_call_wow64_funcs" : "__wine_unix_call_funcs" );
-    if (!*funcs) *entry = dlsym( so_handle, "__wine_unix_lib_init" );
-    return *funcs || *entry ? STATUS_SUCCESS : STATUS_ENTRYPOINT_NOT_FOUND;
+    const unixlib_entry_t *funcs;
+
+    *dispatch = 0;
+    *dispatch_registered = FALSE;
+    funcs = dlsym( so_handle, wow ? "__wine_unix_call_wow64_funcs" : "__wine_unix_call_funcs" );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (wow)
+    {
+        const struct wine_unixlib_dispatch_source_v2 *source;
+        NTSTATUS status;
+
+        if (!funcs) return STATUS_ENTRYPOINT_NOT_FOUND;
+        source = dlsym( so_handle, "__wine_unix_call_wow64_dispatch_v2" );
+        if (!source) return STATUS_INVALID_IMAGE_FORMAT;
+        if ((status = register_wow64_unixlib_dispatch_v2( source, funcs, dispatch )))
+            return status;
+        *dispatch_registered = TRUE;
+        return STATUS_SUCCESS;
+    }
+#endif
+    if (funcs) *dispatch = (UINT_PTR)funcs;
+    else *entry = dlsym( so_handle, "__wine_unix_lib_init" );
+    return *dispatch || *entry ? STATUS_SUCCESS : STATUS_ENTRYPOINT_NOT_FOUND;
 }
 
 
@@ -950,13 +1341,14 @@ static void register_non_native_code_region( void *so_handle, void *module )
 /***********************************************************************
  *           load_builtin_unixlib
  */
-static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs )
+static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, unixlib_handle_t *dispatch )
 {
     NTSTATUS (*entry)(void) = NULL;
     void *unix_handle = NULL;
     sigset_t sigset;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     struct builtin_module *builtin;
+    BOOL dispatch_registered = FALSE;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if ((builtin = get_builtin_module( module )))
@@ -970,7 +1362,17 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
         if (builtin->unix_handle)
         {
             unix_handle = builtin->unix_handle;
-            status = get_unixlib_funcs( builtin->unix_handle, wow, funcs, &entry );
+            if (wow && builtin->wow64_dispatch)
+            {
+                *dispatch = builtin->wow64_dispatch;
+                status = STATUS_SUCCESS;
+            }
+            else
+            {
+                status = get_unixlib_funcs( builtin->unix_handle, wow, dispatch, &entry,
+                                            &dispatch_registered );
+                if (!status && dispatch_registered) builtin->wow64_dispatch = *dispatch;
+            }
         }
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
@@ -1230,6 +1632,33 @@ static BYTE get_host_page_vprot( const void *addr )
 
 
 /***********************************************************************
+ *           get_translated_host_page_vprot
+ *
+ * Return the physical protection required by translated logical pages.
+ * The CPU provider enforces 4K guard/no-access state; Darwin can only
+ * protect the containing 16K host page, so guarded pages must not suppress
+ * access required by an adjacent committed logical page.
+ */
+static BYTE get_translated_host_page_vprot( const void *addr )
+{
+    const char *base = ROUND_ADDR( addr, host_page_mask );
+    BYTE vprot = 0;
+    size_t i;
+
+    for (i = 0; i < host_page_size; i += page_size)
+    {
+        BYTE page_vprot = get_page_vprot( base + i );
+
+        if (!(page_vprot & VPROT_COMMITTED) || (page_vprot & VPROT_GUARD)) continue;
+        if (wow64_memory_logical_write_fault_is_delegated())
+            page_vprot &= ~VPROT_WRITEWATCH;
+        vprot |= page_vprot;
+    }
+    return vprot;
+}
+
+
+/***********************************************************************
  *           get_vprot_range_size
  *
  * Return the size of the region with equal masked vprot byte.
@@ -1293,6 +1722,9 @@ static void set_page_vprot( const void *addr, size_t size, BYTE vprot )
     size_t idx = (size_t)addr >> page_shift;
     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( addr, size )) wow64_memory_assert_transaction();
+#endif
 #ifdef _WIN64
     while (idx >> pages_vprot_shift != end >> pages_vprot_shift)
     {
@@ -1317,6 +1749,9 @@ static void set_page_vprot_bits( const void *addr, size_t size, BYTE set, BYTE c
     size_t idx = (size_t)addr >> page_shift;
     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( addr, size )) wow64_memory_assert_transaction();
+#endif
 #ifdef _WIN64
     for ( ; idx < end; idx++)
     {
@@ -1340,7 +1775,11 @@ static BOOL set_page_vprot_exec_write_protect( const void *addr, size_t size )
 #ifdef _WIN64 /* only supported on 64-bit so assume 2-level table */
     size_t idx = (size_t)addr >> page_shift;
     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
-
+#endif
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( addr, size )) wow64_memory_assert_transaction();
+#endif
+#ifdef _WIN64 /* only supported on 64-bit so assume 2-level table */
     for ( ; idx < end; idx++)
     {
         BYTE *ptr = pages_vprot[idx >> pages_vprot_shift] + (idx & pages_vprot_mask);
@@ -1571,6 +2010,147 @@ static struct file_view *find_view( const void *addr, size_t size )
     return NULL;
 }
 
+static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max_size,
+                                  BYTE *vprot, BYTE vprot_mask );
+
+#if defined(__APPLE__) && defined(__aarch64__)
+struct memory_access_cache
+{
+    struct file_view *view;
+    const char *start;
+    const char *end;
+    BOOL committed;
+};
+
+/* Return the logical protection for a tagged WoW64 page.  The numeric shadow
+ * range is only a fast lookup bound; the private type-31 view tag remains the
+ * ownership authority.  virtual_mutex must be held by the caller. */
+static BYTE get_memory_access_vprot( const void *addr, SIZE_T *available, BOOL *translated,
+                                     struct memory_access_cache *cache )
+{
+    struct file_view *view;
+
+    *available = host_page_size - ((ULONG_PTR)addr & host_page_mask);
+    if (translated) *translated = FALSE;
+    if (is_wow64_shadow_address( addr ))
+    {
+        *available = page_size - ((ULONG_PTR)addr & page_mask);
+        if ((view = find_view( addr, 0 )) && (view->protect & VPROT_WOW64_TRANSLATED))
+        {
+            BYTE vprot = get_page_vprot( addr );
+
+            if (translated) *translated = TRUE;
+            /* SEC_RESERVE commitment belongs to the shared mapping object in
+             * the server.  An alias may not have faulted since another view
+             * committed the range, so consult that authority before judging
+             * a native copy or I/O buffer.  get_committed_size() preserves
+             * the read-only observer-callback rule when no transaction owns
+             * this lookup. */
+            if ((view->protect & SEC_RESERVE) && !(vprot & VPROT_COMMITTED))
+            {
+                if (cache && cache->view == view && (const char *)addr >= cache->start &&
+                    (const char *)addr < cache->end)
+                {
+                    if (cache->committed) vprot |= VPROT_COMMITTED;
+                }
+                else
+                {
+                    SIZE_T run = get_committed_size( view, (void *)addr,
+                                                     (const char *)view->base + view->size -
+                                                     (const char *)addr,
+                                                     &vprot, VPROT_COMMITTED );
+                    if (cache)
+                    {
+                        cache->view = view;
+                        cache->start = addr;
+                        cache->end = (const char *)addr + max( run, *available );
+                        cache->committed = !!(vprot & VPROT_COMMITTED);
+                    }
+                }
+            }
+            return vprot;
+        }
+        /* Ordinary views are forbidden in the shadow.  A host page may still
+         * be physically accessible because it contains an adjacent tagged 4K
+         * lane, but that does not grant ownership of this logical address. */
+        return 0;
+    }
+    return get_host_page_vprot( addr );
+}
+
+/* Validate only tagged translated pages in a native memory-copy range.
+ * Ordinary views retain their existing host access behavior.  virtual_mutex
+ * must be held by the caller. */
+static BOOL check_wow64_translated_memory_access( const void *base, SIZE_T size, int unix_prot )
+{
+    struct memory_access_cache cache = {0};
+    ULONG_PTR start = (ULONG_PTR)base, end;
+
+    if (!size) return TRUE;
+    if (size > ~(ULONG_PTR)0 - start) return FALSE;
+    end = start + size;
+    if (end <= WINE_LOW_VA_SHADOW_BASE ||
+        start >= WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE)
+        return TRUE;
+
+    start = max( start, (ULONG_PTR)WINE_LOW_VA_SHADOW_BASE );
+    end = min( end, (ULONG_PTR)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) );
+    while (start < end)
+    {
+        SIZE_T available;
+        BOOL translated;
+        BYTE vprot = get_memory_access_vprot( (void *)start, &available, &translated, &cache );
+
+        if (!translated) return FALSE;
+        if (unix_prot & PROT_WRITE) vprot &= ~VPROT_WRITEWATCH;
+        if (!(get_unix_prot( vprot ) & unix_prot)) return FALSE;
+        start += min( available, end - start );
+    }
+    return TRUE;
+}
+
+static BOOL virtual_check_wow64_translated_memory_access( const void *base, SIZE_T size,
+                                                           int unix_prot )
+{
+    BOOL ret;
+    sigset_t sigset;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    ret = check_wow64_translated_memory_access( base, size, unix_prot );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return ret;
+}
+#else
+struct memory_access_cache { int unused; };
+
+static BYTE get_memory_access_vprot( const void *addr, SIZE_T *available, BOOL *translated,
+                                     struct memory_access_cache *cache )
+{
+    (void)cache;
+    *available = host_page_size - ((ULONG_PTR)addr & host_page_mask);
+    if (translated) *translated = FALSE;
+    return get_host_page_vprot( addr );
+}
+
+static inline BOOL check_wow64_translated_memory_access( const void *base, SIZE_T size,
+                                                          int unix_prot )
+{
+    (void)base;
+    (void)size;
+    (void)unix_prot;
+    return TRUE;
+}
+
+static inline BOOL virtual_check_wow64_translated_memory_access( const void *base, SIZE_T size,
+                                                                  int unix_prot )
+{
+    (void)base;
+    (void)size;
+    (void)unix_prot;
+    return TRUE;
+}
+#endif
+
 
 /***********************************************************************
  *           is_write_watch_range
@@ -1602,6 +2182,36 @@ static struct file_view *find_view_range( const void *addr, size_t size )
     }
     return NULL;
 }
+
+
+/***********************************************************************
+ *           find_view_at_or_after
+ *
+ * Find the view containing addr, or the first view starting after it.
+ * virtual_mutex must be held by the caller.
+ */
+#if defined(__APPLE__) && defined(__aarch64__)
+static struct file_view *find_view_at_or_after( const void *addr )
+{
+    struct wine_rb_entry *candidate = NULL, *ptr = views_tree.root;
+    ULONG_PTR address = (ULONG_PTR)addr;
+
+    while (ptr)
+    {
+        struct file_view *view = WINE_RB_ENTRY_VALUE( ptr, struct file_view, entry );
+        ULONG_PTR start = (ULONG_PTR)view->base;
+
+        if (view->size <= ~(ULONG_PTR)0 - start && start + view->size <= address)
+            ptr = ptr->right;
+        else
+        {
+            candidate = ptr;
+            ptr = ptr->left;
+        }
+    }
+    return candidate ? WINE_RB_ENTRY_VALUE( candidate, struct file_view, entry ) : NULL;
+}
+#endif
 
 
 /***********************************************************************
@@ -1905,6 +2515,11 @@ static void unregister_view( struct file_view *view )
  */
 static void delete_view( struct file_view *view ) /* [in] View */
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (view->protect & VPROT_WOW64_TRANSLATED) wow64_memory_assert_transaction();
+    if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
+        arm64ec_low_memory_assert_transaction();
+#endif
     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     set_page_vprot( view->base, view->size, 0 );
     if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( view->base, view->size );
@@ -1935,6 +2550,13 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
 {
     struct file_view *view;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((vprot & VPROT_SHADOW_TRANSLATED) == VPROT_SHADOW_TRANSLATED)
+        return STATUS_INVALID_PARAMETER;
+    if (vprot & VPROT_WOW64_TRANSLATED) wow64_memory_assert_transaction();
+    if (vprot & VPROT_AMD64_LOW_TRANSLATED)
+        arm64ec_low_memory_assert_transaction();
+#endif
     assert( !((UINT_PTR)base & host_page_mask) );
     assert( !(size & page_mask) );
 
@@ -1990,6 +2612,523 @@ static DWORD get_win32_prot( BYTE vprot, unsigned int map_prot )
     if (vprot & VPROT_GUARD) ret |= PAGE_GUARD;
     if (map_prot & SEC_NOCACHE) ret |= PAGE_NOCACHE;
     return ret;
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max_size,
+                                  BYTE *vprot, BYTE vprot_mask );
+
+static NTSTATUS wow64_memory_append_range( struct wow64_memory_transaction *transaction,
+                                           ULONG_PTR address, SIZE_T size,
+                                           ULONG_PTR allocation_base, ULONG state,
+                                           ULONG protect, ULONG flags )
+{
+    struct wine_wow64_memory_range_v1 *range;
+    SIZE_T count = transaction->event.range_count;
+
+    if (!size) return STATUS_SUCCESS;
+    if (count)
+    {
+        range = &transaction->ranges[count - 1];
+        if (range->address + range->size == address &&
+            range->allocation_base == allocation_base && range->state == state &&
+            range->protect == protect && range->flags == flags)
+        {
+            range->size += size;
+            return STATUS_SUCCESS;
+        }
+    }
+    if (count == transaction->range_capacity)
+    {
+        struct wine_wow64_memory_range_v1 *ranges;
+        SIZE_T capacity = transaction->range_capacity ? transaction->range_capacity * 2 : 16;
+
+        if (capacity < transaction->range_capacity ||
+            capacity > ~(SIZE_T)0 / sizeof(*ranges)) return STATUS_NO_MEMORY;
+        if (transaction->ranges == transaction->inline_ranges)
+        {
+            if (!(ranges = malloc( capacity * sizeof(*ranges) ))) return STATUS_NO_MEMORY;
+            memcpy( ranges, transaction->inline_ranges,
+                    count * sizeof(*transaction->inline_ranges) );
+        }
+        else if (!(ranges = realloc( transaction->ranges, capacity * sizeof(*ranges) )))
+            return STATUS_NO_MEMORY;
+        transaction->ranges = ranges;
+        transaction->range_capacity = capacity;
+    }
+    range = &transaction->ranges[count];
+    range->address = address;
+    range->size = size;
+    range->allocation_base = allocation_base;
+    range->state = state;
+    range->protect = protect;
+    range->flags = flags;
+    range->reserved = 0;
+    transaction->event.range_count = count + 1;
+    return STATUS_SUCCESS;
+}
+
+/* Capture a complete, sorted description of a translated-shadow slice.
+ * virtual_mutex must be held by the caller. */
+static NTSTATUS wow64_memory_snapshot_range( struct wow64_memory_transaction *transaction,
+                                             ULONG_PTR address, SIZE_T size )
+{
+    const ULONG_PTR shadow_start = WINE_LOW_VA_SHADOW_BASE;
+    const ULONG_PTR shadow_end = WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE;
+    ULONG_PTR cursor, end;
+    struct file_view *view;
+    NTSTATUS status;
+
+    transaction->event.range_count = 0;
+    if (!size) return STATUS_SUCCESS;
+    if ((address & page_mask) || (size & page_mask) || address < shadow_start ||
+        size > shadow_end - address) return STATUS_INVALID_ADDRESS;
+    end = address + size;
+    cursor = address;
+
+    view = find_view_at_or_after( (void *)address );
+    while (view)
+    {
+        struct wine_rb_entry *next = rb_next( &view->entry );
+        struct file_view *current = view;
+        ULONG_PTR view_start = (ULONG_PTR)current->base;
+        ULONG_PTR view_end;
+
+        view = next ? WINE_RB_ENTRY_VALUE( next, struct file_view, entry ) : NULL;
+
+        if (current->size > ~(ULONG_PTR)0 - view_start) return STATUS_INVALID_ADDRESS;
+        view_end = view_start + current->size;
+        if (view_end <= cursor) continue;
+        if (view_start >= end) break;
+
+        if (view_start > cursor)
+        {
+            SIZE_T gap = min( view_start, end ) - cursor;
+
+            if ((status = wow64_memory_append_range( transaction, cursor, gap, 0,
+                                                      MEM_FREE, PAGE_NOACCESS, 0 )))
+                return status;
+            cursor += gap;
+            if (cursor == end) break;
+        }
+
+        view_start = max( view_start, cursor );
+        view_end = min( view_end, end );
+        if (!(current->protect & VPROT_WOW64_TRANSLATED))
+        {
+            if ((status = wow64_memory_append_range( transaction, view_start,
+                                                      view_end - view_start, 0,
+                                                      MEM_FREE, PAGE_NOACCESS, 0 )))
+                return status;
+        }
+        else
+        {
+            ULONG_PTR page;
+
+            for (page = view_start; page < view_end;)
+            {
+                BYTE vprot;
+                SIZE_T run;
+                ULONG state, protect, flags = WINE_WOW64_MEMORY_RANGE_TRANSLATED;
+
+                if (current->protect & SEC_RESERVE)
+                    run = get_committed_size( current, (void *)page, view_end - page,
+                                              &vprot, 0xff );
+                else
+                    run = get_vprot_range_size( (char *)page, view_end - page,
+                                                0xff, &vprot );
+                state = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
+                protect = state == MEM_COMMIT ? get_win32_prot( vprot, current->protect ) : 0;
+                if (vprot & VPROT_WRITEWATCH)
+                    flags |= WINE_WOW64_MEMORY_RANGE_LOGICAL_WRITE_FAULT;
+
+                if (!run || (run & page_mask) || run > view_end - page)
+                    return STATUS_INVALID_ADDRESS;
+                if ((status = wow64_memory_append_range(
+                         transaction, page, run, (ULONG_PTR)current->base, state, protect,
+                         flags )))
+                    return status;
+                page += run;
+            }
+        }
+        cursor = view_end;
+        if (cursor == end) break;
+    }
+    if (cursor < end)
+        return wow64_memory_append_range( transaction, cursor, end - cursor, 0,
+                                          MEM_FREE, PAGE_NOACCESS, 0 );
+    return STATUS_SUCCESS;
+}
+
+static void wow64_memory_capture_transaction( struct wow64_memory_transaction *transaction,
+                                               NTSTATUS status, const void *address,
+                                               SIZE_T size, const void *allocation_base )
+{
+    if (transaction->nested || !transaction->gate_locked) return;
+
+    transaction->event.status = status;
+    transaction->event.address = (ULONG_PTR)address;
+    transaction->event.size_covered = size;
+    transaction->event.allocation_base = (ULONG_PTR)allocation_base;
+    transaction->event.snapshot_status = STATUS_SUCCESS;
+    if (transaction->observer_begun && size)
+        transaction->event.snapshot_status = wow64_memory_snapshot_range(
+            transaction, (ULONG_PTR)address, size );
+}
+
+static NTSTATUS arm64ec_low_memory_append_range(
+    struct arm64ec_low_memory_transaction *transaction, ULONG_PTR address, SIZE_T size,
+    ULONG_PTR allocation_base, ULONG state, ULONG protect )
+{
+    struct wine_arm64ec_low_memory_range_v1 *range;
+    SIZE_T count = transaction->event.range_count;
+
+    if (!size) return STATUS_SUCCESS;
+    if (count)
+    {
+        range = &transaction->ranges[count - 1];
+        if (range->host_address <= UINT64_MAX - range->size &&
+            range->host_address + range->size == address &&
+            range->host_allocation_base == allocation_base &&
+            range->state == state && range->protect == protect && !range->flags)
+        {
+            if (range->size > UINT64_MAX - size) return STATUS_INTEGER_OVERFLOW;
+            range->size += size;
+            return STATUS_SUCCESS;
+        }
+    }
+    if (count == transaction->range_capacity)
+    {
+        struct wine_arm64ec_low_memory_range_v1 *ranges;
+        SIZE_T capacity = transaction->range_capacity ? transaction->range_capacity * 2 : 16;
+
+        if (capacity < transaction->range_capacity ||
+            capacity > ~(SIZE_T)0 / sizeof(*ranges)) return STATUS_NO_MEMORY;
+        if (transaction->ranges == transaction->inline_ranges)
+        {
+            if (!(ranges = malloc( capacity * sizeof(*ranges) ))) return STATUS_NO_MEMORY;
+            memcpy( ranges, transaction->inline_ranges,
+                    count * sizeof(*transaction->inline_ranges) );
+        }
+        else if (!(ranges = realloc( transaction->ranges, capacity * sizeof(*ranges) )))
+            return STATUS_NO_MEMORY;
+        transaction->ranges = ranges;
+        transaction->range_capacity = capacity;
+    }
+    range = &transaction->ranges[count];
+    range->host_address = address;
+    range->size = size;
+    range->host_allocation_base = allocation_base;
+    range->state = state;
+    range->protect = protect;
+    range->flags = 0;
+    range->reserved = 0;
+    transaction->event.range_count = count + 1;
+    return STATUS_SUCCESS;
+}
+
+/* Capture the authoritative post-state of an AMD64-low shadow slice.
+ * virtual_mutex must be held.  Untagged ranges are intentionally published as
+ * MEM_FREE: numeric location in the shadow never establishes LOW ownership. */
+static NTSTATUS arm64ec_low_memory_snapshot_range(
+    struct arm64ec_low_memory_transaction *transaction, ULONG_PTR address, SIZE_T size )
+{
+    const ULONG_PTR shadow_start = WINE_LOW_VA_SHADOW_BASE;
+    const ULONG_PTR shadow_end = WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE;
+    ULONG_PTR cursor, end;
+    struct file_view *view;
+    NTSTATUS status;
+
+    transaction->event.range_count = 0;
+    if (!size) return STATUS_SUCCESS;
+    if ((address & page_mask) || (size & page_mask) || address < shadow_start ||
+        size > shadow_end - address) return STATUS_INVALID_ADDRESS;
+    end = address + size;
+    cursor = address;
+
+    view = find_view_at_or_after( (void *)address );
+    while (view)
+    {
+        struct wine_rb_entry *next = rb_next( &view->entry );
+        struct file_view *current = view;
+        ULONG_PTR view_start = (ULONG_PTR)current->base;
+        ULONG_PTR view_end;
+
+        view = next ? WINE_RB_ENTRY_VALUE( next, struct file_view, entry ) : NULL;
+        if (current->size > ~(ULONG_PTR)0 - view_start) return STATUS_INVALID_ADDRESS;
+        view_end = view_start + current->size;
+        if (view_end <= cursor) continue;
+        if (view_start >= end) break;
+
+        if (view_start > cursor)
+        {
+            SIZE_T gap = min( view_start, end ) - cursor;
+
+            if ((status = arm64ec_low_memory_append_range(
+                     transaction, cursor, gap, 0, MEM_FREE, PAGE_NOACCESS )))
+                return status;
+            cursor += gap;
+            if (cursor == end) break;
+        }
+
+        view_start = max( view_start, cursor );
+        view_end = min( view_end, end );
+        if (!(current->protect & VPROT_AMD64_LOW_TRANSLATED))
+        {
+            if ((status = arm64ec_low_memory_append_range(
+                     transaction, view_start, view_end - view_start, 0,
+                     MEM_FREE, PAGE_NOACCESS )))
+                return status;
+        }
+        else
+        {
+            ULONG_PTR page;
+
+            if ((ULONG_PTR)current->base < shadow_start ||
+                current->size > shadow_end - (ULONG_PTR)current->base)
+                return STATUS_INVALID_ADDRESS;
+            for (page = view_start; page < view_end;)
+            {
+                BYTE vprot;
+                SIZE_T run;
+                ULONG state, protect;
+
+                if (current->protect & SEC_RESERVE)
+                    run = get_committed_size( current, (void *)page, view_end - page,
+                                              &vprot, 0xff );
+                else
+                    run = get_vprot_range_size( (char *)page, view_end - page,
+                                                0xff, &vprot );
+                if (!run || (run & page_mask) || run > view_end - page)
+                    return STATUS_INVALID_ADDRESS;
+                state = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
+                protect = state == MEM_COMMIT ?
+                    get_win32_prot( vprot, current->protect ) : 0;
+                if ((status = arm64ec_low_memory_append_range(
+                         transaction, page, run, (ULONG_PTR)current->base,
+                         state, protect )))
+                    return status;
+                page += run;
+            }
+        }
+        cursor = view_end;
+        if (cursor == end) break;
+    }
+    if (cursor < end)
+        return arm64ec_low_memory_append_range( transaction, cursor, end - cursor, 0,
+                                                MEM_FREE, PAGE_NOACCESS );
+    return STATUS_SUCCESS;
+}
+
+static void arm64ec_low_memory_capture_transaction(
+    struct arm64ec_low_memory_transaction *transaction, NTSTATUS status,
+    const void *address, SIZE_T size, const void *allocation_base )
+{
+    if (transaction->nested || !transaction->gate_locked) return;
+
+    transaction->event.status = status;
+    transaction->event.snapshot_status = STATUS_SUCCESS;
+    if (transaction->event.flags & WINE_ARM64EC_LOW_MEMORY_EVENT_FULL_SNAPSHOT)
+    {
+        address = (void *)(ULONG_PTR)WINE_LOW_VA_SHADOW_BASE;
+        size = WINE_LOW_VA_SHADOW_SIZE;
+        allocation_base = NULL;
+    }
+    else if (!size)
+    {
+        /* An invalid unmap/release still has to resume a successfully paused
+         * provider with an authoritative post-state.  Retain the conservative
+         * page used by begin() when no containing view was resolved. */
+        address = (void *)(ULONG_PTR)transaction->event.host_address;
+        size = transaction->event.size_covered;
+        allocation_base = NULL;
+    }
+    transaction->event.host_address = (ULONG_PTR)address;
+    transaction->event.size_covered = size;
+    transaction->event.host_allocation_base = (ULONG_PTR)allocation_base;
+    if (transaction->observer_begun && size)
+        transaction->event.snapshot_status = arm64ec_low_memory_snapshot_range(
+            transaction, (ULONG_PTR)address, size );
+}
+
+#endif
+
+int32_t __wine_register_wow64_memory_observer(
+    const struct wine_wow64_memory_observer_v1 *observer )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction = {0};
+    sigset_t sigset;
+    NTSTATUS status;
+
+    if (!observer || observer->version != WINE_WOW64_MEMORY_OBSERVER_VERSION ||
+        observer->size < sizeof(*observer) || !observer->begin || !observer->complete ||
+        !(observer->capabilities & WINE_WOW64_MEMORY_OBSERVER_CAP_LOGICAL_WRITE_FAULT) ||
+        (observer->capabilities & ~WINE_WOW64_MEMORY_OBSERVER_CAP_LOGICAL_WRITE_FAULT))
+        return STATUS_INVALID_PARAMETER;
+    if (wow64_memory_observer_callback_active || wow64_memory_current_transaction)
+        return STATUS_INVALID_PARAMETER;
+
+    mutex_lock( &wow64_memory_observer_mutex );
+    if (wow64_memory_observer_registered)
+    {
+        mutex_unlock( &wow64_memory_observer_mutex );
+        return STATUS_ALREADY_REGISTERED;
+    }
+    if (!is_wow64() || !is_wow64_shadow_address( user_shared_data ))
+    {
+        mutex_unlock( &wow64_memory_observer_mutex );
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    transaction.observer = observer;
+    transaction.gate_locked = TRUE;
+    transaction.event.version = WINE_WOW64_MEMORY_OBSERVER_VERSION;
+    transaction.event.size = sizeof(transaction.event);
+    transaction.event.operation = WINE_WOW64_MEMORY_RESYNC;
+    transaction.event.flags = WINE_WOW64_MEMORY_EVENT_FULL_SNAPSHOT;
+    transaction.event.address = WINE_LOW_VA_SHADOW_BASE;
+    transaction.event.size_covered = WINE_LOW_VA_SHADOW_SIZE;
+    transaction.ranges = transaction.inline_ranges;
+    transaction.range_capacity = ARRAY_SIZE(transaction.inline_ranges);
+
+    wow64_memory_observer_callback_active = TRUE;
+    status = observer->begin( observer->context, WINE_WOW64_MEMORY_RESYNC,
+                              WINE_LOW_VA_SHADOW_BASE, WINE_LOW_VA_SHADOW_SIZE,
+                              0, &transaction.observer_transaction );
+    wow64_memory_observer_callback_active = FALSE;
+    if (status)
+    {
+        __atomic_store_n( &wow64_memory_observer_required, FALSE, __ATOMIC_RELEASE );
+        mutex_unlock( &wow64_memory_observer_mutex );
+        return status;
+    }
+    transaction.observer_begun = TRUE;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    /* Observer begin has stopped every guest engine.  Publish the transaction
+     * requirement only after excluding native writers too; before this point
+     * the physical host-page policy remains authoritative. */
+    __atomic_store_n( &wow64_memory_observer_required, TRUE, __ATOMIC_RELEASE );
+    status = wow64_memory_snapshot_range( &transaction, WINE_LOW_VA_SHADOW_BASE,
+                                          WINE_LOW_VA_SHADOW_SIZE );
+    if (!status) status = wow64_memory_set_logical_write_fault_delegation( TRUE );
+    /* A failed handoff has already restored the physical write-fault policy.
+     * Clear the mutation fence before dropping virtual_mutex so concurrent
+     * native writes cannot observe required==TRUE with delegation disabled
+     * while the provider's failure completion is still running. */
+    if (status)
+        __atomic_store_n( &wow64_memory_observer_required, FALSE, __ATOMIC_RELEASE );
+    else
+    {
+        /* Make the observer visible before native writers can enter
+         * virtual_mutex under delegated enforcement.  They will then block on
+         * the observer gate until this full-snapshot completion returns. */
+        wow64_memory_observer = *observer;
+        wow64_memory_observer_registered = TRUE;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    transaction.event.status = STATUS_SUCCESS;
+    transaction.event.snapshot_status = status;
+    transaction.event.ranges = transaction.ranges;
+    wow64_memory_observer_callback_active = TRUE;
+    observer->complete( observer->context, transaction.observer_transaction,
+                        &transaction.event );
+    wow64_memory_observer_callback_active = FALSE;
+    if (transaction.ranges != transaction.inline_ranges) free( transaction.ranges );
+    mutex_unlock( &wow64_memory_observer_mutex );
+    return status;
+#else
+    (void)observer;
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+int32_t __wine_register_arm64ec_low_memory_observer_v1(
+    const struct wine_arm64ec_low_memory_observer_v1 *observer )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct arm64ec_low_memory_transaction transaction = {0};
+    sigset_t sigset;
+    NTSTATUS status;
+
+    if (!observer || observer->version != WINE_ARM64EC_LOW_MEMORY_OBSERVER_VERSION ||
+        observer->size != sizeof(*observer) || !observer->begin || !observer->complete ||
+        observer->capabilities !=
+            WINE_ARM64EC_LOW_MEMORY_OBSERVER_CAP_EXACT_POST_SNAPSHOT)
+        return STATUS_INVALID_PARAMETER;
+    if (arm64ec_low_memory_observer_callback_active ||
+        arm64ec_low_memory_current_transaction)
+        return STATUS_INVALID_PARAMETER;
+
+    mutex_lock( &arm64ec_low_memory_observer_mutex );
+    if (arm64ec_low_memory_observer_registered)
+    {
+        mutex_unlock( &arm64ec_low_memory_observer_mutex );
+        return STATUS_ALREADY_REGISTERED;
+    }
+    if (!is_arm64ec())
+    {
+        mutex_unlock( &arm64ec_low_memory_observer_mutex );
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    transaction.observer = observer;
+    transaction.gate_locked = TRUE;
+    transaction.event.version = WINE_ARM64EC_LOW_MEMORY_OBSERVER_VERSION;
+    transaction.event.size = sizeof(transaction.event);
+    transaction.event.operation = WINE_WOW64_MEMORY_RESYNC;
+    transaction.event.flags = WINE_ARM64EC_LOW_MEMORY_EVENT_FULL_SNAPSHOT;
+    transaction.event.host_address = WINE_LOW_VA_SHADOW_BASE;
+    transaction.event.size_covered = WINE_LOW_VA_SHADOW_SIZE;
+    transaction.ranges = transaction.inline_ranges;
+    transaction.range_capacity = ARRAY_SIZE(transaction.inline_ranges);
+
+    arm64ec_low_memory_observer_callback_active = TRUE;
+    status = observer->begin( observer->context, WINE_WOW64_MEMORY_RESYNC,
+                              WINE_LOW_VA_SHADOW_BASE, WINE_LOW_VA_SHADOW_SIZE,
+                              0, &transaction.observer_transaction );
+    arm64ec_low_memory_observer_callback_active = FALSE;
+    if (status)
+    {
+        mutex_unlock( &arm64ec_low_memory_observer_mutex );
+        return status;
+    }
+    transaction.observer_begun = TRUE;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    /* begin() has stopped every x64 engine.  Set the mutation fence only
+     * after native writers are excluded; this keeps registration and the
+     * initial exact snapshot atomic without weakening identity mappings. */
+    __atomic_store_n( &arm64ec_low_memory_observer_required, TRUE,
+                      __ATOMIC_RELEASE );
+    status = arm64ec_low_memory_snapshot_range(
+        &transaction, WINE_LOW_VA_SHADOW_BASE, WINE_LOW_VA_SHADOW_SIZE );
+    if (status)
+        __atomic_store_n( &arm64ec_low_memory_observer_required, FALSE,
+                          __ATOMIC_RELEASE );
+    else
+    {
+        arm64ec_low_memory_observer = *observer;
+        arm64ec_low_memory_observer_registered = TRUE;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    transaction.event.status = STATUS_SUCCESS;
+    transaction.event.snapshot_status = status;
+    transaction.event.ranges = transaction.ranges;
+    arm64ec_low_memory_observer_callback_active = TRUE;
+    observer->complete( observer->context, transaction.observer_transaction,
+                        &transaction.event );
+    arm64ec_low_memory_observer_callback_active = FALSE;
+    if (transaction.ranges != transaction.inline_ranges) free( transaction.ranges );
+    mutex_unlock( &arm64ec_low_memory_observer_mutex );
+    return status;
+#else
+    (void)observer;
+    return STATUS_NOT_SUPPORTED;
+#endif
 }
 
 
@@ -2067,9 +3206,16 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image 
  *
  * Wrapper for mprotect, adds PROT_EXEC if forced by force_exec_prot
  */
-static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+static inline int mprotect_exec( void *base, size_t size, int unix_prot, BOOL translated_wow64 )
 {
-    if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Guest code is fetched by the CPU provider and must never become host ARM64 executable code. */
+    if (translated_wow64) unix_prot &= ~PROT_EXEC;
+#else
+    translated_wow64 = FALSE;
+#endif
+
+    if (!translated_wow64 && force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
         if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
@@ -2088,6 +3234,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
  */
 static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
 {
+    struct file_view *view = find_view( base, size );
+    BOOL translated_shadow = view && is_shadow_translated_vprot( view->protect );
     size_t i, count;
     char *addr = ROUND_ADDR( base, host_page_mask );
     int prot, next;
@@ -2095,19 +3243,115 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
 
     size = ROUND_SIZE( base, size, host_page_mask );
 
-    vprot = get_host_page_vprot( addr );
+    vprot = translated_shadow ? get_translated_host_page_vprot( addr )
+                             : get_host_page_vprot( addr );
     prot = get_unix_prot( (vprot & ~clear) | set );
     for (count = i = 1; i < size / host_page_size; i++, count++)
     {
-        vprot = get_host_page_vprot( addr + count * host_page_size );
+        vprot = translated_shadow
+                ? get_translated_host_page_vprot( addr + count * host_page_size )
+                : get_host_page_vprot( addr + count * host_page_size );
         next = get_unix_prot( (vprot & ~clear) | set );
         if (next == prot) continue;
-        if (mprotect_exec( addr, count * host_page_size, prot )) return -1;
+        if (mprotect_exec( addr, count * host_page_size, prot, translated_shadow )) return -1;
         addr += count * host_page_size;
         prot = next;
         count = 0;
     }
-    return mprotect_exec( addr, count * host_page_size, prot );
+    return mprotect_exec( addr, count * host_page_size, prot, translated_shadow );
+}
+
+
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Switch the physical backing between native write-watch enforcement and the
+ * observer's 4K logical enforcement.  The registration caller holds both the
+ * observer gate and virtual_mutex, and begin() has stopped every guest engine,
+ * so no translated instruction can run between the full snapshot and this
+ * reprotection pass. */
+static NTSTATUS wow64_memory_set_logical_write_fault_delegation( BOOL enable )
+{
+    struct file_view *view;
+    BOOL rollback_failed = FALSE;
+    BOOL previous = wow64_memory_logical_write_fault_is_delegated();
+    NTSTATUS status = STATUS_SUCCESS;
+
+    __atomic_store_n( &wow64_memory_logical_write_fault_delegated, enable,
+                      __ATOMIC_RELEASE );
+    view = find_view_at_or_after( (void *)WINE_LOW_VA_SHADOW_BASE );
+    while (view && (ULONG_PTR)view->base < WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE)
+    {
+        struct wine_rb_entry *next = rb_next( &view->entry );
+
+        if ((view->protect & VPROT_WOW64_TRANSLATED) &&
+            mprotect_range( view->base, view->size, 0, 0 ))
+        {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+        view = next ? WINE_RB_ENTRY_VALUE( next, struct file_view, entry ) : NULL;
+    }
+    if (!status) return STATUS_SUCCESS;
+
+    /* Restore the old physical policy before the provider is allowed to
+     * resume.  A rollback mprotect failure means host protection can no longer
+     * represent the logical state, so fail closed rather than publishing a
+     * partially delegated address space. */
+    __atomic_store_n( &wow64_memory_logical_write_fault_delegated, previous,
+                      __ATOMIC_RELEASE );
+    view = find_view_at_or_after( (void *)WINE_LOW_VA_SHADOW_BASE );
+    while (view && (ULONG_PTR)view->base < WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE)
+    {
+        struct wine_rb_entry *next = rb_next( &view->entry );
+
+        if ((view->protect & VPROT_WOW64_TRANSLATED) &&
+            mprotect_range( view->base, view->size, 0, 0 ))
+        {
+            ERR( "failed to restore translated host protection for %p-%p\n",
+                 view->base, (char *)view->base + view->size );
+            rollback_failed = TRUE;
+        }
+        view = next ? WINE_RB_ENTRY_VALUE( next, struct file_view, entry ) : NULL;
+    }
+    if (rollback_failed) abort_process( STATUS_ACCESS_DENIED );
+    return status;
+}
+#endif
+
+
+/* Apply physical protection without widening ownership across a logical view
+ * boundary.  Keep ordinary memory on the existing coalesced fast path.  A
+ * translated shadow range is split only at view boundaries; mprotect_range()
+ * still aggregates all host pages within each tagged view segment. */
+static int mprotect_memory_access_range( void *base, size_t size, BYTE set, BYTE clear )
+{
+    if (!overlaps_wow64_shadow( base, size ))
+        return mprotect_range( base, size, set, clear );
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    while (size)
+    {
+        struct file_view *view;
+        SIZE_T available = size;
+        ULONG_PTR address = (ULONG_PTR)base;
+
+        if (address < WINE_LOW_VA_SHADOW_BASE)
+            available = min( available, WINE_LOW_VA_SHADOW_BASE - address );
+        else if (address < WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE)
+        {
+            if (!(view = find_view( base, 0 )) ||
+                !(view->protect & VPROT_WOW64_TRANSLATED))
+                return -1;
+            available = min( available,
+                             (SIZE_T)((ULONG_PTR)view->base + view->size - address) );
+        }
+        if (mprotect_range( base, available, set, clear )) return -1;
+        base = (char *)base + available;
+        size -= available;
+    }
+    return 0;
+#else
+    return mprotect_range( base, size, set, clear );
+#endif
 }
 
 
@@ -2118,6 +3362,11 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot )
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (view->protect & VPROT_WOW64_TRANSLATED) wow64_memory_assert_transaction();
+    if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
+        arm64ec_low_memory_assert_transaction();
+#endif
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
@@ -2201,12 +3450,53 @@ static void commit_arm64ec_map( struct file_view *view )
  */
 static void update_write_watches( void *base, size_t size, size_t accessed_size )
 {
+    if (!size) return;
     TRACE( "updating watch %p-%p-%p\n", base, (char *)base + accessed_size, (char *)base + size );
     /* clear write watch flag on accessed pages */
     set_page_vprot_bits( base, accessed_size, 0, VPROT_WRITEWATCH );
     /* restore page protections on the entire range */
-    mprotect_range( base, size, 0, 0 );
+    if (mprotect_memory_access_range( base, size, 0, 0 ))
+        abort_process( STATUS_ACCESS_DENIED );
 }
+
+
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Publish native writes after a blocking kernel/server operation.  Until this
+ * short transaction completes, stale provider state is conservative: the
+ * affected guest lane may fault once more, but it cannot gain write access.
+ * The caller must not hold virtual_mutex or the observer gate. */
+static void wow64_memory_publish_native_write_or_abort( void *base, SIZE_T size )
+{
+    struct wow64_memory_transaction transaction;
+    void *capture_base;
+    SIZE_T capture_size;
+    NTSTATUS status, snapshot_status;
+    sigset_t sigset;
+
+    if (!size || !wow64_memory_logical_write_fault_is_delegated() ||
+        !overlaps_wow64_shadow( base, size )) return;
+    capture_base = ROUND_ADDR( base, page_mask );
+    capture_size = ROUND_SIZE( base, size, page_mask );
+    if (!is_inside_wow64_shadow( capture_base, capture_size ))
+        abort_process( STATUS_ACCESS_VIOLATION );
+
+    status = wow64_memory_begin_transaction( &transaction, TRUE,
+                                              WINE_WOW64_MEMORY_PROTECT,
+                                              capture_base, capture_size, NULL );
+    if (status) abort_process( status );
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    set_page_vprot_bits( capture_base, capture_size, 0, VPROT_WRITEWATCH );
+    if (mprotect_memory_access_range( capture_base, capture_size, 0, 0 ))
+        status = STATUS_ACCESS_DENIED;
+    wow64_memory_capture_transaction( &transaction, status, capture_base,
+                                       capture_size, NULL );
+    snapshot_status = transaction.event.snapshot_status;
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    wow64_memory_complete_transaction( &transaction );
+    if (status || snapshot_status) abort_process( status ? status : snapshot_status );
+}
+#endif
 
 
 /***********************************************************************
@@ -2286,6 +3576,43 @@ static void *find_reserved_free_area_outside_preloader( void *start, void *end, 
     return find_reserved_free_area( start, end, size, top_down, align_mask );
 }
 
+static void *find_reserved_free_area_for_view( void *start, void *end, size_t size,
+                                               int top_down, size_t align_mask,
+                                               BOOL translated_wow64 )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    void *shadow_start = (void *)WINE_LOW_VA_SHADOW_BASE;
+    void *shadow_end = (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE);
+    void *ret;
+
+    if (!translated_wow64 && start < shadow_end && end > shadow_start)
+    {
+        if (top_down)
+        {
+            if (end > shadow_end &&
+                (ret = find_reserved_free_area_outside_preloader( max( start, shadow_end ), end,
+                                                                   size, top_down, align_mask )))
+                return ret;
+            if (start < shadow_start)
+                return find_reserved_free_area_outside_preloader( start, min( end, shadow_start ),
+                                                                  size, top_down, align_mask );
+        }
+        else
+        {
+            if (start < shadow_start &&
+                (ret = find_reserved_free_area_outside_preloader( start, min( end, shadow_start ),
+                                                                   size, top_down, align_mask )))
+                return ret;
+            if (end > shadow_end)
+                return find_reserved_free_area_outside_preloader( max( start, shadow_end ), end,
+                                                                  size, top_down, align_mask );
+        }
+        return NULL;
+    }
+#endif
+    return find_reserved_free_area_outside_preloader( start, end, size, top_down, align_mask );
+}
+
 /***********************************************************************
  *           map_reserved_area
  *
@@ -2293,7 +3620,7 @@ static void *find_reserved_free_area_outside_preloader( void *start, void *end, 
  * virtual_mutex must be held by caller.
  */
 static void *map_reserved_area( void *limit_low, void *limit_high, size_t size, int top_down,
-                                int unix_prot, size_t align_mask )
+                                int unix_prot, size_t align_mask, BOOL translated_wow64 )
 {
     void *ptr = NULL;
     struct reserved_area *area;
@@ -2309,7 +3636,8 @@ static void *map_reserved_area( void *limit_low, void *limit_high, size_t size, 
             if (end <= limit_low) return NULL;
             if (start < limit_low) start = (void *)ROUND_SIZE( 0, limit_low, host_page_mask );
             if (end > limit_high) end = ROUND_ADDR( limit_high, host_page_mask );
-            ptr = find_reserved_free_area_outside_preloader( start, end, size, top_down, align_mask );
+            ptr = find_reserved_free_area_for_view( start, end, size, top_down, align_mask,
+                                                    translated_wow64 );
             if (ptr) break;
         }
     }
@@ -2324,7 +3652,8 @@ static void *map_reserved_area( void *limit_low, void *limit_high, size_t size, 
             if (end <= limit_low) continue;
             if (start < limit_low) start = (void *)ROUND_SIZE( 0, limit_low, host_page_mask );
             if (end > limit_high) end = ROUND_ADDR( limit_high, host_page_mask );
-            ptr = find_reserved_free_area_outside_preloader( start, end, size, top_down, align_mask );
+            ptr = find_reserved_free_area_for_view( start, end, size, top_down, align_mask,
+                                                    translated_wow64 );
             if (ptr) break;
         }
     }
@@ -2409,6 +3738,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
     if (alloc_type & MEM_REPLACE_PLACEHOLDER)
     {
         struct file_view *view;
+#if defined(__APPLE__) && defined(__aarch64__)
+        unsigned int requested_owner, view_owner;
+#endif
 
         if (!(view = find_view( base, 0 ))) return STATUS_INVALID_PARAMETER;
         if (view->base != base || view->size != size) return STATUS_CONFLICTING_ADDRESSES;
@@ -2416,6 +3748,21 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
         TRACE( "found view %p, size %p, protect %#x.\n", view->base, (void *)view->size, view->protect );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+        requested_owner = vprot & VPROT_SHADOW_TRANSLATED;
+        view_owner = view->protect & VPROT_SHADOW_TRANSLATED;
+        if (requested_owner == VPROT_SHADOW_TRANSLATED ||
+            view_owner == VPROT_SHADOW_TRANSLATED)
+            return STATUS_CONFLICTING_ADDRESSES;
+        if ((requested_owner || view_owner) &&
+            !is_inside_wow64_shadow( base, size ))
+            return STATUS_CONFLICTING_ADDRESSES;
+        if (requested_owner && view_owner && requested_owner != view_owner)
+            return STATUS_CONFLICTING_ADDRESSES;
+        if (view_owner && (vprot & SEC_IMAGE) && !requested_owner)
+            return STATUS_CONFLICTING_ADDRESSES;
+        vprot |= view_owner;
+#endif
         view->protect = vprot | VPROT_PLACEHOLDER;
         set_vprot( view, base, size, vprot );
         if (vprot & VPROT_WRITEWATCH)
@@ -2426,6 +3773,65 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         *view_ret = view;
         return STATUS_SUCCESS;
     }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((vprot & VPROT_SHADOW_TRANSLATED) == VPROT_SHADOW_TRANSLATED)
+        return STATUS_INVALID_PARAMETER;
+    if (base)
+    {
+        if (is_shadow_translated_vprot( vprot ))
+        {
+            if (!is_inside_wow64_shadow( base, size )) return STATUS_CONFLICTING_ADDRESSES;
+        }
+        else if (overlaps_wow64_shadow( base, size )) return STATUS_CONFLICTING_ADDRESSES;
+    }
+    else
+    {
+        ULONG_PTR range_low = max( limit_low, (ULONG_PTR)address_space_start );
+        ULONG_PTR range_end = (ULONG_PTR)min( user_space_limit, host_addr_space_limit );
+        ULONG_PTR range_high = range_end ? range_end - 1 : ~(ULONG_PTR)0;
+
+        if (limit_high && limit_high < range_high) range_high = limit_high;
+        if (is_shadow_translated_vprot( vprot ))
+        {
+            if (!limits_are_inside_wow64_shadow( range_low, range_high ))
+                return STATUS_CONFLICTING_ADDRESSES;
+        }
+        else if ((limit_low || limit_high || top_down) &&
+                 range_low < WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE &&
+                 range_high >= WINE_LOW_VA_SHADOW_BASE)
+        {
+            NTSTATUS first = STATUS_NO_MEMORY, second = STATUS_NO_MEMORY;
+            ULONG_PTR below_high = WINE_LOW_VA_SHADOW_BASE - 1;
+            ULONG_PTR above_low = WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE;
+
+            /* Keep the shadow unavailable to ordinary native allocations while retaining
+             * the caller's allocation direction on both sides of the excluded window. */
+            if (top_down)
+            {
+                if (above_low < range_high)
+                    first = map_view( view_ret, NULL, size, alloc_type, vprot,
+                                      max( range_low, above_low ), range_high, align_mask );
+                if (!first) return first;
+                if (range_low < below_high)
+                    second = map_view( view_ret, NULL, size, alloc_type, vprot,
+                                       range_low, min( range_high, below_high ), align_mask );
+            }
+            else
+            {
+                if (range_low < below_high)
+                    first = map_view( view_ret, NULL, size, alloc_type, vprot,
+                                      range_low, min( range_high, below_high ), align_mask );
+                if (!first) return first;
+                if (above_low < range_high)
+                    second = map_view( view_ret, NULL, size, alloc_type, vprot,
+                                       max( range_low, above_low ), range_high, align_mask );
+            }
+            if (!second) return second;
+            return first != STATUS_NO_MEMORY ? first : second;
+        }
+    }
+#endif
 
     if (limit_high && limit_low >= limit_high) return STATUS_INVALID_PARAMETER;
 
@@ -2454,7 +3860,8 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
 
-        if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
+        if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask,
+                                      is_shadow_translated_vprot( vprot ) )))
         {
             TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
             goto done;
@@ -2478,6 +3885,21 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 return status;
             }
             TRACE( "got mem with anon mmap %p-%p\n", ptr, (char *)ptr + size );
+#if defined(__APPLE__) && defined(__aarch64__)
+            /* The unconstrained ASLR path cannot be converted to map_free_area()
+             * on Darwin, where arbitrary fixed mappings may be unavailable.
+             * Reject an ordinary OS-selected candidate that touches the shadow
+             * and retry without changing the allocator's placement policy. */
+            if (!is_shadow_translated_vprot( vprot ) &&
+                overlaps_wow64_shadow( ptr, view_size ))
+            {
+                /* Restore reserved areas rather than punching a hole in the
+                 * shadow reservation.  Otherwise mmap() can return the same
+                 * invalid candidate forever. */
+                unmap_area( ptr, view_size );
+                continue;
+            }
+#endif
             /* if we got something beyond the user limit, unmap it and retry */
             if (!is_beyond_limit( ptr, view_size, user_space_limit )) break;
             unmap_size = unmap_area_above_user_limit( ptr, view_size );
@@ -2591,6 +4013,10 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
 static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max_size, BYTE *vprot, BYTE vprot_mask )
 {
     SIZE_T offset, size;
+#if defined(__APPLE__) && defined(__aarch64__)
+    BOOL translated_read_only = FALSE;
+    BOOL server_committed = FALSE;
+#endif
 
     base = ROUND_ADDR( base, page_mask );
     offset = (char *)base - (char *)view->base;
@@ -2611,13 +4037,43 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
                 if (reply->committed)
                 {
                     *vprot |= VPROT_COMMITTED;
-                    set_page_vprot_bits( base, size, VPROT_COMMITTED, 0 );
+#if defined(__APPLE__) && defined(__aarch64__)
+                    server_committed = TRUE;
+                    translated_read_only =
+                        ((view->protect & VPROT_WOW64_TRANSLATED) &&
+                         wow64_memory_observer_is_required() &&
+                         !wow64_memory_current_transaction) ||
+                        ((view->protect & VPROT_AMD64_LOW_TRANSLATED) &&
+                         arm64ec_low_memory_observer_is_required() &&
+                         !arm64ec_low_memory_current_transaction);
+                    if (!translated_read_only)
+#endif
+                        set_page_vprot_bits( base, size, VPROT_COMMITTED, 0 );
                 }
             }
         }
         SERVER_END_REQ;
 
         if (!size || !(vprot_mask & ~VPROT_COMMITTED)) return size;
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (translated_read_only && server_committed)
+        {
+            BYTE local_vprot;
+
+            /* A query may run from complete(), after the observer gate has
+             * been acquired but outside virtual_mutex.  Preserve its read-only
+             * contract: the server response already bounds a uniformly
+             * committed run, so combine it with local non-commit protection
+             * without changing the structural VPROT cache.  A later provider
+             * fault resolves and publishes any newly discovered shared commit
+             * from normal context. */
+            size = get_vprot_range_size( base, size,
+                                         vprot_mask & ~VPROT_COMMITTED,
+                                         &local_vprot );
+            *vprot = local_vprot | VPROT_COMMITTED;
+            return size;
+        }
+#endif
     }
     else size = min( view->size - offset, max_size );
 
@@ -2635,6 +4091,11 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
 {
     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (view->protect & VPROT_WOW64_TRANSLATED) wow64_memory_assert_transaction();
+    if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
+        arm64ec_low_memory_assert_transaction();
+#endif
     if (!size)
     {
         size = view->size;
@@ -2706,7 +4167,13 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
 static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *base, size_t size )
 {
     NTSTATUS status;
+    unsigned int translated_owner = view->protect & VPROT_SHADOW_TRANSLATED;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (translated_owner & VPROT_WOW64_TRANSLATED) wow64_memory_assert_transaction();
+    if (translated_owner & VPROT_AMD64_LOW_TRANSLATED)
+        arm64ec_low_memory_assert_transaction();
+#endif
     if (!size) return STATUS_INVALID_PARAMETER_3;
     if (!(view->protect & VPROT_PLACEHOLDER)) return STATUS_CONFLICTING_ADDRESSES;
     if (view->protect & VPROT_FREE_PLACEHOLDER && size == view->size) return STATUS_CONFLICTING_ADDRESSES;
@@ -2723,11 +4190,12 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
         status = remove_pages_from_view( view, base, size );
         if (status) return status;
 
-        status = create_view( &view, base, size, VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER );
+        status = create_view( &view, base, size, VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER |
+                                                translated_owner );
         if (status) return status;
     }
 
-    view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
+    view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER | translated_owner;
     set_page_vprot( view->base, view->size, 0 );
     anon_mmap_fixed( view->base, ROUND_SIZE( 0, view->size, host_page_mask ), PROT_NONE, 0 );
     return STATUS_SUCCESS;
@@ -2746,6 +4214,11 @@ static NTSTATUS free_pages( struct file_view *view, char *base, size_t size )
     char *host_end = base + size;
     NTSTATUS status;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (view->protect & VPROT_WOW64_TRANSLATED) wow64_memory_assert_transaction();
+    if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
+        arm64ec_low_memory_assert_transaction();
+#endif
     if (size == view->size)
     {
         assert( base == view->base );
@@ -2798,6 +4271,11 @@ static NTSTATUS coalesce_placeholders( struct file_view *view, char *base, size_
 
     if (!size) return STATUS_INVALID_PARAMETER_3;
     if (base != view->base) return STATUS_CONFLICTING_ADDRESSES;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (view->protect & VPROT_WOW64_TRANSLATED) wow64_memory_assert_transaction();
+    if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
+        arm64ec_low_memory_assert_transaction();
+#endif
 
     curr_view = view;
     while (curr_view->protect & VPROT_FREE_PLACEHOLDER)
@@ -2808,6 +4286,8 @@ static NTSTATUS coalesce_placeholders( struct file_view *view, char *base, size_
         if (!(next = rb_next( &curr_view->entry ))) break;
         next_view = RB_ENTRY_VALUE( next, struct file_view, entry );
         if ((char *)curr_view->base + curr_view->size != next_view->base) break;
+        if ((view->protect ^ next_view->protect) & VPROT_SHADOW_TRANSLATED)
+            return STATUS_CONFLICTING_ADDRESSES;
         curr_view = next_view;
     }
 
@@ -3496,7 +4976,8 @@ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigne
  * Map a view for a PE image at an appropriate address.
  */
 static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_info *image_info, SIZE_T size,
-                                ULONG_PTR limit_low, ULONG_PTR limit_high, ULONG alloc_type )
+                                ULONG_PTR limit_low, ULONG_PTR limit_high, ULONG alloc_type,
+                                ULONG_PTR address_bias, unsigned int translated_vprot )
 {
     unsigned int vprot = SEC_IMAGE | SEC_FILE | VPROT_COMMITTED | VPROT_READ | VPROT_EXEC | VPROT_WRITECOPY;
     void *base;
@@ -3505,26 +4986,65 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
     BOOL top_down = (image_info->image_charact & IMAGE_FILE_DLL) &&
                     (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated);
 
-    limit_low = max( limit_low, (ULONG_PTR)address_space_start );  /* make sure the DOS area remains free */
-    if (!limit_high) limit_high = (ULONG_PTR)user_space_limit;
+    if (address_bias)
+    {
+        ULONG_PTR wow_limit = get_wow_user_space_limit();
+        ULONG_PTR guest_limit;
+
+        vprot |= translated_vprot;
+        /* WoW64 thunks pass translated address requirements in native host form.
+         * Convert those limits back to guest form before applying the image bias;
+         * bootstrap mappings made before the provider starts still pass zero limits. */
+        if (limit_low >= address_bias && limit_low - address_bias < WINE_LOW_VA_SHADOW_SIZE)
+            limit_low -= address_bias;
+        if (limit_high >= address_bias && limit_high - address_bias < WINE_LOW_VA_SHADOW_SIZE)
+            limit_high -= address_bias;
+        /* The main image is mapped before virtual_set_large_address_space(). */
+        if (!wow_limit) wow_limit = WINE_LOW_VA_SHADOW_SIZE - (granularity_mask + 1);
+        /* get_wow_user_space_limit() is exclusive; map_view() takes an inclusive high bound. */
+        guest_limit = limit_high ? min( limit_high, wow_limit - 1 ) : wow_limit - 1;
+
+        limit_low = address_bias + max( limit_low, (ULONG_PTR)address_space_start );
+        limit_high = address_bias + guest_limit;
+    }
+    else
+    {
+        /* make sure the DOS area remains free */
+        limit_low = max( limit_low, (ULONG_PTR)address_space_start );
+        if (!limit_high) limit_high = (ULONG_PTR)user_space_limit;
+    }
 
     /* first try the specified base */
 
     if (image_info->map_addr)
     {
-        base = wine_server_get_ptr( image_info->map_addr );
-        if ((ULONG_PTR)base != image_info->map_addr) base = NULL;
+        ULONG_PTR preferred = address_bias + image_info->map_addr;
+
+        base = wine_server_get_ptr( preferred );
+        if ((ULONG_PTR)base != preferred) base = NULL;
     }
     else
     {
-        base = wine_server_get_ptr( image_info->base );
-        if ((ULONG_PTR)base != image_info->base) base = NULL;
+        ULONG_PTR preferred = address_bias + image_info->base;
+
+        base = wine_server_get_ptr( preferred );
+        if ((ULONG_PTR)base != preferred) base = NULL;
     }
     if (base)
     {
         status = map_view( view_ret, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
         if (!status) return status;
     }
+
+    /* A fixed-low AMD64 image cannot be relocated within the guest address
+     * domain. Its authoritative backing must land at the exact biased base. */
+    if (translated_vprot & VPROT_AMD64_LOW_TRANSLATED)
+        return STATUS_CONFLICTING_ADDRESSES;
+
+    /* A translated 32-bit image must never escape its owned shadow window. */
+    if (address_bias)
+        return map_view( view_ret, NULL, size, top_down ? MEM_TOP_DOWN : 0,
+                         vprot, limit_low, limit_high, 0 );
 
     /* then some appropriate address range */
 
@@ -3558,17 +5078,49 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
 static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size_ptr,
                                    ULONG_PTR limit_low, ULONG_PTR limit_high, ULONG alloc_type,
                                    struct pe_mapping_info *pe_mapping, USHORT machine,
+                                   BOOL translated_wow64, BOOL translated_amd64_low,
                                    BOOL is_builtin, off_t offset)
 {
     int unix_fd = -1, needs_close;
     int shared_fd = -1, shared_needs_close = 0;
     SIZE_T size = pe_mapping->image.map_size;
+    ULONG_PTR address_bias = 0;
+    unsigned int translated_vprot = 0;
     struct file_view *view;
     unsigned int status;
     sigset_t sigset;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    struct arm64ec_low_memory_transaction low_transaction;
+    void *capture_base;
+    void *allocation_base = NULL;
+    SIZE_T capture_size;
+#endif
 
     if (offset >= size)
         return STATUS_INVALID_PARAMETER;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (translated_wow64)
+    {
+        if (pe_mapping->image.machine != IMAGE_FILE_MACHINE_I386)
+            return STATUS_INVALID_IMAGE_FORMAT;
+        address_bias = WINE_LOW_VA_SHADOW_BASE;
+        translated_vprot = VPROT_WOW64_TRANSLATED;
+    }
+    else if (translated_amd64_low && !offset &&
+             pe_mapping->image.machine == IMAGE_FILE_MACHINE_AMD64 &&
+             !(pe_mapping->image.image_charact & IMAGE_FILE_DLL) &&
+             (pe_mapping->image.image_charact & IMAGE_FILE_RELOCS_STRIPPED) &&
+             pe_mapping->image.base < limit_4g &&
+             size <= limit_4g - pe_mapping->image.base)
+    {
+        address_bias = WINE_LOW_VA_SHADOW_BASE;
+        translated_vprot = VPROT_AMD64_LOW_TRANSLATED;
+    }
+#else
+    (void)translated_wow64;
+#endif
 
     if ((status = server_get_unix_fd( mapping, 0, &unix_fd, &needs_close, NULL, NULL )))
         return status;
@@ -3580,6 +5132,37 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
         if (needs_close) close( unix_fd );
         return status;
     }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    status = wow64_memory_begin_transaction(
+                                              &transaction,
+                                              !!(translated_vprot & VPROT_WOW64_TRANSLATED),
+                                              WINE_WOW64_MEMORY_MAP,
+                                              *addr_ptr, size, NULL );
+    if (status)
+    {
+        if (needs_close) close( unix_fd );
+        if (shared_needs_close) close( shared_fd );
+        return status;
+    }
+    status = arm64ec_low_memory_begin_transaction(
+        &low_transaction, !!(translated_vprot & VPROT_AMD64_LOW_TRANSLATED),
+        WINE_WOW64_MEMORY_MAP,
+        translated_vprot & VPROT_AMD64_LOW_TRANSLATED ?
+            (void *)(WINE_LOW_VA_SHADOW_BASE + pe_mapping->image.base) : *addr_ptr,
+        size, NULL );
+    if (status)
+    {
+        transaction.event.status = status;
+        wow64_memory_complete_transaction( &transaction );
+        if (needs_close) close( unix_fd );
+        if (shared_needs_close) close( shared_fd );
+        return status;
+    }
+    capture_base = translated_vprot & VPROT_AMD64_LOW_TRANSLATED ?
+                   (void *)(WINE_LOW_VA_SHADOW_BASE + pe_mapping->image.base) : *addr_ptr;
+    capture_size = size;
+#endif
 
     if (!pe_mapping->image.map_addr &&
         (pe_mapping->image.image_charact & IMAGE_FILE_DLL) &&
@@ -3595,8 +5178,13 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    status = map_image_view( &view, &pe_mapping->image, size, limit_low, limit_high, alloc_type );
+    status = map_image_view( &view, &pe_mapping->image, size, limit_low, limit_high,
+                             alloc_type, address_bias, translated_vprot );
     if (status) goto done;
+#if defined(__APPLE__) && defined(__aarch64__)
+    capture_base = view->base;
+    allocation_base = view->base;
+#endif
 
     status = map_image_into_view( view, &pe_mapping->nt_name, unix_fd, &pe_mapping->image,
                                   machine, shared_fd, needs_close );
@@ -3606,16 +5194,27 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
         {
             free_pages( view, view->base, offset );
             size -= offset;
+#if defined(__APPLE__) && defined(__aarch64__)
+            capture_base = view->base;
+            allocation_base = view->base;
+            capture_size = size;
+#endif
         }
 
-        pe_mapping->image.base = wine_server_client_ptr( view->base );
+        pe_mapping->image.base = wine_server_client_ptr(
+            translated_vprot ? (char *)view->base - address_bias : view->base );
         SERVER_START_REQ( map_image_view )
         {
             req->mapping = wine_server_obj_handle( mapping );
-            req->base    = pe_mapping->image.base;
+            req->base    = wine_server_client_ptr( view->base );
+            req->guest_base = pe_mapping->image.base;
             req->size    = size;
             req->entry   = pe_mapping->image.entry_point;
             req->machine = pe_mapping->image.machine;
+            req->flags   = translated_vprot & VPROT_AMD64_LOW_TRANSLATED ?
+                           IMAGE_VIEW_TRANSLATED_AMD64_LOW :
+                           translated_vprot & VPROT_WOW64_TRANSLATED ?
+                           IMAGE_VIEW_TRANSLATED_WOW64 : 0;
             req->offset  = offset;
             status = wine_server_call( req );
         }
@@ -3631,7 +5230,27 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
     else delete_view( view );
 
 done:
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (translated_vprot & VPROT_AMD64_LOW_TRANSLATED)
+    {
+        void *low_base = capture_base;
+        SIZE_T low_size = capture_size;
+
+        arm64ec_low_memory_capture_transaction( &low_transaction, status,
+                                                 low_base, low_size,
+                                                 allocation_base );
+    }
+    if (capture_base && is_inside_wow64_shadow( capture_base, capture_size ))
+        wow64_memory_capture_transaction( &transaction, status, capture_base,
+                                           capture_size, allocation_base );
+    else
+        wow64_memory_capture_transaction( &transaction, status, NULL, 0, NULL );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+    arm64ec_low_memory_complete_transaction( &low_transaction );
+#endif
     if (needs_close) close( unix_fd );
     if (shared_needs_close) close( shared_fd );
     return status;
@@ -3646,7 +5265,8 @@ done:
 static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_PTR limit_low,
                                          ULONG_PTR limit_high, SIZE_T commit_size,
                                          const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr,
-                                         ULONG alloc_type, ULONG protect, USHORT machine )
+                                         ULONG alloc_type, ULONG protect, USHORT machine,
+                                         BOOL translated_wow64 )
 {
     unsigned int res;
     mem_size_t full_size;
@@ -3659,6 +5279,12 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     struct file_view *view;
     LARGE_INTEGER offset;
     sigset_t sigset;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    BOOL transaction_candidate;
+    void *capture_base;
+    void *allocation_base = NULL;
+#endif
 
     switch(protect)
     {
@@ -3697,14 +5323,17 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
         if (teb64)
         {
             prev = teb64->Tib.ArbitraryUserPointer;
-            teb64->Tib.ArbitraryUserPointer = PtrToUlong(data->teb->Tib.ArbitraryUserPointer);
+            teb64->Tib.ArbitraryUserPointer =
+                wow64_native_to_guest_addr( data->teb->Tib.ArbitraryUserPointer );
         }
         /* check if we can replace that mapping with the builtin */
         res = load_builtin( pe_mapping, machine, &info, addr_ptr, size_ptr,
-                            limit_low, limit_high, offset.QuadPart );
+                            limit_low, limit_high, offset.QuadPart,
+                            translated_wow64, FALSE );
         if (res == STATUS_IMAGE_ALREADY_LOADED)
             res = virtual_map_image( handle, addr_ptr, size_ptr, limit_low, limit_high,
-                                     alloc_type, pe_mapping, machine, FALSE, offset.QuadPart );
+                                     alloc_type, pe_mapping, machine, translated_wow64,
+                                     FALSE, FALSE, offset.QuadPart );
         free_pe_mapping_info( pe_mapping );
         if (teb64) teb64->Tib.ArbitraryUserPointer = prev;
         return res;
@@ -3729,31 +5358,65 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     }
     if (!(size = ROUND_SIZE( 0, size, page_mask ))) return STATUS_INVALID_PARAMETER;  /* wrap-around */
 
+    if (!(sec_flags & SEC_RESERVE)) commit_size = 0;
+    else if (commit_size)
+    {
+        commit_size = ROUND_SIZE( 0, commit_size, page_mask );
+        if (!commit_size || commit_size > size) return STATUS_INVALID_PARAMETER;
+    }
+
     get_vprot_flags( protect, &vprot, FALSE );
     vprot |= sec_flags;
     if (!(sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (translated_wow64) vprot |= VPROT_WOW64_TRANSLATED;
+#else
+    (void)translated_wow64;
+#endif
 
     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    transaction_candidate = translated_wow64 ||
+                            ((alloc_type & MEM_REPLACE_PLACEHOLDER) && base &&
+                             is_inside_wow64_shadow( base, size ));
+    res = wow64_memory_begin_transaction( &transaction, transaction_candidate,
+                                           WINE_WOW64_MEMORY_MAP, base, size, NULL );
+    if (res)
+    {
+        if (needs_close) close( unix_handle );
+        return res;
+    }
+    capture_base = base;
+#endif
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
     if (res) goto done;
+#if defined(__APPLE__) && defined(__aarch64__)
+    capture_base = view->base;
+    allocation_base = view->base;
+#endif
 
     TRACE( "handle=%p size=%lx offset=%s\n", handle, size, wine_dbgstr_longlong(offset.QuadPart) );
     res = map_file_into_view( view, unix_handle, 0, size, offset.QuadPart, vprot, needs_close );
     if (res == STATUS_SUCCESS)
     {
+        if (commit_size)
+            set_page_vprot_bits( view->base, commit_size, VPROT_COMMITTED, 0 );
+
         /* file mappings must always be accessible */
         mprotect_range( view->base, view->size, VPROT_COMMITTED, 0 );
 
         SERVER_START_REQ( map_view )
         {
-            req->mapping = wine_server_obj_handle( handle );
-            req->access  = access;
-            req->base    = wine_server_client_ptr( view->base );
-            req->size    = size;
-            req->start   = offset.QuadPart;
+            req->mapping     = wine_server_obj_handle( handle );
+            req->access      = access;
+            req->base        = wine_server_client_ptr( view->base );
+            req->size        = size;
+            req->commit_size = commit_size;
+            req->start       = offset.QuadPart;
             res = wine_server_call( req );
         }
         SERVER_END_REQ;
@@ -3769,7 +5432,17 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     else delete_view( view );
 
 done:
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (capture_base && is_inside_wow64_shadow( capture_base, size ))
+        wow64_memory_capture_transaction( &transaction, res, capture_base, size,
+                                           allocation_base );
+    else
+        wow64_memory_capture_transaction( &transaction, res, NULL, 0, NULL );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+#endif
     if (needs_close) close( unix_handle );
     return res;
 }
@@ -3791,6 +5464,19 @@ static void *alloc_virtual_heap( SIZE_T size )
         if (is_beyond_limit( base, area->size, address_space_limit ))
             address_space_limit = host_addr_space_limit = end;
         if (is_win64 && base < (void *)0x80000000) break;
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (base < (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) &&
+            end > (void *)WINE_LOW_VA_SHADOW_BASE)
+        {
+            if (end > (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) &&
+                (char *)end - (char *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) >= size)
+                base = (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE);
+            else if (base < (void *)WINE_LOW_VA_SHADOW_BASE &&
+                     (char *)WINE_LOW_VA_SHADOW_BASE - (char *)base >= size)
+                end = (void *)WINE_LOW_VA_SHADOW_BASE;
+            else continue;
+        }
+#endif
         if (preload_reserve_end >= end)
         {
             if (preload_reserve_start <= base) continue;  /* no space in that area */
@@ -3861,6 +5547,22 @@ void virtual_init(void)
         }
         unsetenv( "WINEPRELOADRESERVE" );
     }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Own the translated window before any internal anonymous allocation can
+     * consume it.  reserve_area() uses non-overwriting Mach mappings on Darwin
+     * and records only holes that this process successfully acquired. */
+    reserve_area( (void *)WINE_LOW_VA_SHADOW_BASE,
+                  (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) );
+    if (mmap_is_in_reserved_area( (void *)WINE_LOW_VA_SHADOW_BASE,
+                                  WINE_LOW_VA_SHADOW_SIZE ) != 1)
+    {
+        ERR( "failed to reserve the translated low-address window %p-%p\n",
+             (void *)WINE_LOW_VA_SHADOW_BASE,
+             (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) );
+        exit(1);
+    }
+#endif
 
     /* try to find space in a reserved area for the views and pages protection table */
 #ifdef _WIN64
@@ -3997,7 +5699,9 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
  */
 NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size,
                                      SECTION_IMAGE_INFORMATION *info, ULONG_PTR limit_low,
-                                     ULONG_PTR limit_high, WORD machine, BOOL prefer_native, off_t offset )
+                                     ULONG_PTR limit_high, WORD machine, BOOL prefer_native,
+                                     off_t offset, BOOL translated_wow64,
+                                     BOOL translated_amd64_low )
 {
     mem_size_t full_size;
     unsigned int sec_flags;
@@ -4027,8 +5731,11 @@ NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size
     }
     else
     {
+        if (pe_mapping->image.image_flags & IMAGE_FLAGS_ComPlusNativeReady)
+            translated_wow64 = FALSE;
         status = virtual_map_image( mapping, module, size, limit_low, limit_high, 0,
-                                    pe_mapping, machine, TRUE, offset );
+                                    pe_mapping, machine, translated_wow64,
+                                    translated_amd64_low, TRUE, offset );
         virtual_fill_image_information( &pe_mapping->image, info );
     }
 
@@ -4057,11 +5764,40 @@ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTIO
     *size = 0;
 
     /* check if we can replace that mapping with the builtin */
-    status = load_builtin( pe_mapping, machine, info, module, size, limit_low, limit_high, 0 );
+    {
+        BOOL translated_wow64 = FALSE;
+        BOOL translated_amd64_low = FALSE;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+        /* This entry point owns the one pre-PEB main-image bootstrap.  Carry
+         * that provenance through builtin replacement rather than inferring
+         * translation from the PE machine in the generic image mapper. */
+        translated_wow64 = pe_mapping->image.machine == IMAGE_FILE_MACHINE_I386 &&
+                            !(pe_mapping->image.image_flags & IMAGE_FLAGS_ComPlusNativeReady);
+        translated_amd64_low = current_machine == IMAGE_FILE_MACHINE_ARM64 &&
+                               pe_mapping->image.machine == IMAGE_FILE_MACHINE_AMD64;
+#endif
+        status = load_builtin( pe_mapping, machine, info, module, size, limit_low,
+                               limit_high, 0, translated_wow64,
+                               translated_amd64_low );
+    }
     if (status == STATUS_IMAGE_ALREADY_LOADED)
     {
+        BOOL translated_wow64 = FALSE;
+        BOOL translated_amd64_low = FALSE;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+        /* The main i386 image is mapped before wow_peb exists.  This is the
+         * single bootstrap owner; later image mappings require either an
+         * established WoW64 process or the private type-31 parameter. */
+        translated_wow64 = pe_mapping->image.machine == IMAGE_FILE_MACHINE_I386 &&
+                            !(pe_mapping->image.image_flags & IMAGE_FLAGS_ComPlusNativeReady);
+        translated_amd64_low = current_machine == IMAGE_FILE_MACHINE_ARM64 &&
+                               pe_mapping->image.machine == IMAGE_FILE_MACHINE_AMD64;
+#endif
         status = virtual_map_image( mapping, module, size, limit_low, limit_high, 0,
-                                    pe_mapping, machine, FALSE, 0 );
+                                    pe_mapping, machine, translated_wow64,
+                                    translated_amd64_low, FALSE, 0 );
         virtual_fill_image_information( &pe_mapping->image, info );
     }
     free_pe_mapping_info( pe_mapping );
@@ -4200,17 +5936,18 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
 
 #ifdef _WIN64
     teb = (TEB *)teb64;
-    teb32->Peb = PtrToUlong( (char *)peb + page_size );
-    teb32->Tib.Self = PtrToUlong( teb32 );
+    teb32->Peb = wow64_native_to_guest_addr( (char *)peb + page_size );
+    teb32->Tib.Self = wow64_native_to_guest_addr( teb32 );
     teb32->Tib.ExceptionList = ~0u;
     teb32->Tib.FiberData = 0x1e00;
-    teb32->ActivationContextStackPointer = PtrToUlong( &teb32->ActivationContextStack );
+    teb32->ActivationContextStackPointer =
+        wow64_native_to_guest_addr( &teb32->ActivationContextStack );
     teb32->ActivationContextStack.FrameListCache.Flink =
         teb32->ActivationContextStack.FrameListCache.Blink =
-            PtrToUlong( &teb32->ActivationContextStack.FrameListCache );
-    teb32->StaticUnicodeString.Buffer = PtrToUlong( teb32->StaticUnicodeBuffer );
+            wow64_native_to_guest_addr( &teb32->ActivationContextStack.FrameListCache );
+    teb32->StaticUnicodeString.Buffer = wow64_native_to_guest_addr( teb32->StaticUnicodeBuffer );
     teb32->StaticUnicodeString.MaximumLength = sizeof( teb32->StaticUnicodeBuffer );
-    teb32->GdiBatchCount = PtrToUlong( teb64 );
+    teb32->GdiBatchCount = wow64_native_to_guest_addr( teb64 );
     teb32->WowTebOffset  = -teb_offset;
     if (is_wow) teb64->WowTebOffset = teb_offset;
 #else
@@ -4259,22 +5996,54 @@ TEB *virtual_alloc_first_teb(void)
     SIZE_T total = 32 * block_size;
     struct thread_data *thread_data;
 
+    /*
+     * Darwin reserves the low 4 GiB in native arm64 processes.  Keep the
+     * Windows-visible KUSER_SHARED_DATA address in the CPU provider, but map
+     * the native backing wherever the host can represent it.  PEB.SharedData
+     * publishes that backing address to native PE code.
+     */
+#if defined(__APPLE__) && defined(__aarch64__)
+    user_shared_data = (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_USER_SHARED_DATA_ADDRESS);
+#endif
+
     /* reserve space for shared user data */
+#if defined(__APPLE__) && defined(__aarch64__)
+    status = allocate_wow64_shadow_memory( (void **)&user_shared_data, &data_size,
+                                           MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
+#else
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
+#endif
     if (status)
     {
         ERR( "wine: failed to map the shared user data: %08x\n", status );
         exit(1);
     }
 
-    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0, &total,
-                             MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+#if defined(__APPLE__) && defined(__aarch64__)
+    teb_block = (void *)(WINE_LOW_VA_SHADOW_BASE + 0x70000000);
+    status = allocate_wow64_shadow_memory( &teb_block, &total, MEM_RESERVE, PAGE_READWRITE );
+#else
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0,
+                                      &total, MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+#endif
+    if (status)
+    {
+        ERR( "wine: failed to reserve the initial TEB block: %08x\n", status );
+        exit(1);
+    }
     teb_block_pos = 30;
     ptr = (char *)teb_block + 30 * block_size;
     data_size = 2 * block_size;
-    NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &data_size, MEM_COMMIT, PAGE_READWRITE );
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &data_size,
+                                      MEM_COMMIT, PAGE_READWRITE );
+    if (status)
+    {
+        ERR( "wine: failed to commit the initial TEB block: %08x\n", status );
+        exit(1);
+    }
     peb = (PEB *)((char *)teb_block + 31 * block_size + (is_win64 ? 0 : page_size));
+    peb->SharedData = user_shared_data;
     teb = init_teb( ptr, FALSE );
 
     thread_data = virtual_alloc_thread_data();
@@ -4295,6 +6064,17 @@ NTSTATUS virtual_alloc_teb( struct thread_data *data )
     void *ptr = NULL;
     NTSTATUS status = STATUS_SUCCESS;
     SIZE_T block_size = 4 * page_size;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    BOOL new_teb_block = FALSE;
+#endif
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    status = wow64_memory_begin_transaction( &transaction, is_wow64(),
+                                              WINE_WOW64_MEMORY_COMMIT,
+                                              NULL, block_size, NULL );
+    if (status) return status;
+#endif
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (next_free_teb)
@@ -4309,18 +6089,30 @@ NTSTATUS virtual_alloc_teb( struct thread_data *data )
         {
             SIZE_T total = 32 * block_size;
 
-            if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, user_space_wow_limit,
-                                                   &total, MEM_RESERVE, PAGE_READWRITE )))
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (is_wow64())
+                status = allocate_wow64_shadow_memory( &ptr, &total, MEM_RESERVE, PAGE_READWRITE );
+            else
+                status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, 0, &total,
+                                                  MEM_RESERVE, PAGE_READWRITE );
+#else
+            status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, user_space_wow_limit,
+                                              &total, MEM_RESERVE, PAGE_READWRITE );
+#endif
+            if (status)
             {
-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
-                return status;
+                goto done;
             }
             teb_block = ptr;
             teb_block_pos = 32;
+#if defined(__APPLE__) && defined(__aarch64__)
+            new_teb_block = is_inside_wow64_shadow( ptr, total );
+#endif
         }
         ptr = ((char *)teb_block + --teb_block_pos * block_size);
-        NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
-                                 MEM_COMMIT, PAGE_READWRITE );
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
+                                          MEM_COMMIT, PAGE_READWRITE );
+        if (status) goto done;
     }
     data->teb = init_teb( ptr, is_wow64() );
     list_add_head( &teb_list, &data->entry );
@@ -4330,7 +6122,31 @@ NTSTATUS virtual_alloc_teb( struct thread_data *data )
         *(void **)ptr = next_free_teb;
         next_free_teb = ptr;
     }
+done:
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (ptr && is_inside_wow64_shadow( ptr, block_size ))
+    {
+        struct file_view *view = find_view( ptr, block_size );
+
+        /* Reserving a fresh TEB arena is nested under this transaction.  The
+         * committed TEB is only one slice of that mutation, so publish the
+         * complete tagged allocation rather than leaving the remaining arena
+         * falsely described as free. */
+        if (view && (view->protect & VPROT_WOW64_TRANSLATED))
+            wow64_memory_capture_transaction( &transaction, status,
+                                               new_teb_block ? view->base : ptr,
+                                               new_teb_block ? view->size : block_size,
+                                               view->base );
+        else
+            wow64_memory_capture_transaction( &transaction, status, NULL, 0, NULL );
+    }
+    else
+        wow64_memory_capture_transaction( &transaction, status, NULL, 0, NULL );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+#endif
     return status;
 }
 
@@ -4347,7 +6163,13 @@ struct thread_data *virtual_alloc_thread_data(void)
     SIZE_T size = signal_stack_mask + 1 + kernel_stack_size;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
-    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED, limit_4g, 0, 0 );
+#if defined(__APPLE__) && defined(__aarch64__)
+    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+                       WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE, 0, 0 );
+#else
+    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+                       limit_4g, 0, 0 );
+#endif
     if (!status)
     {
         data = view->base;
@@ -4391,7 +6213,8 @@ void virtual_free_thread_data( struct thread_data *data )
         NtFreeVirtualMemory( GetCurrentProcess(), (void **)&teb->ChpeV2CpuAreaInfo, &size, MEM_RELEASE );
     }
 #endif
-    if ((wow_teb = get_wow_teb( teb )) && (ptr = ULongToPtr( wow_teb->DeallocationStack )))
+    if ((wow_teb = get_wow_teb( teb )) &&
+        (ptr = wow64_guest_to_native_ptr( wow_teb->DeallocationStack )))
     {
         size = 0;
         NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
@@ -4587,7 +6410,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
             if (wow_teb)
             {
                 if (wow_teb->TlsExpansionSlots)
-                    ((ULONG *)ULongToPtr( wow_teb->TlsExpansionSlots ))[index] = 0;
+                    ((ULONG *)wow64_guest_to_native_ptr( wow_teb->TlsExpansionSlots ))[index] = 0;
             }
             else
 #endif
@@ -4609,6 +6432,12 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     NTSTATUS status;
     sigset_t sigset;
     SIZE_T size;
+    SIZE_T stack_page_size = host_page_size;
+    unsigned int vprot = VPROT_READ | VPROT_WRITE | VPROT_COMMITTED;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    void *capture_base = NULL;
+#endif
 
     if (!reserve_size) reserve_size = main_image_info.MaximumStackSize;
     if (!commit_size) commit_size = main_image_info.CommittedStackSize;
@@ -4617,11 +6446,24 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
     size = ROUND_SIZE( 0, size, granularity_mask );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (limits_are_inside_wow64_shadow( limit_low, limit_high ))
+    {
+        vprot |= VPROT_WOW64_TRANSLATED;
+        stack_page_size = page_size;
+    }
+    status = wow64_memory_begin_transaction(
+        &transaction, !!(vprot & VPROT_WOW64_TRANSLATED),
+        WINE_WOW64_MEMORY_ALLOCATE, NULL, size, NULL );
+    if (status) return status;
+#endif
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
-                       limit_low, limit_high, 0 );
+    status = map_view( &view, NULL, size, 0, vprot, limit_low, limit_high, 0 );
     if (status != STATUS_SUCCESS) goto done;
+#if defined(__APPLE__) && defined(__aarch64__)
+    capture_base = view->base;
+#endif
 
 #ifdef VALGRIND_STACK_REGISTER
     VALGRIND_STACK_REGISTER( view->base, (char *)view->base + view->size );
@@ -4630,10 +6472,10 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     /* setup no access guard page */
     if (guard_page)
     {
-        set_page_vprot( view->base, host_page_size, 0 );
-        set_page_vprot( (char *)view->base + host_page_size, host_page_size,
+        set_page_vprot( view->base, stack_page_size, 0 );
+        set_page_vprot( (char *)view->base + stack_page_size, stack_page_size,
                         VPROT_READ | VPROT_WRITE | VPROT_COMMITTED | VPROT_GUARD );
-        mprotect_range( view->base, 2 * host_page_size , 0, 0 );
+        mprotect_range( view->base, 2 * stack_page_size, 0, 0 );
     }
     VIRTUAL_DEBUG_DUMP_VIEW( view );
 
@@ -4642,9 +6484,19 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     stack->OldStackLimit = 0;
     stack->DeallocationStack = view->base;
     stack->StackBase = (char *)view->base + view->size;
-    stack->StackLimit = (char *)view->base + (guard_page ? 2 * host_page_size : 0);
+    stack->StackLimit = (char *)view->base + (guard_page ? 2 * stack_page_size : 0);
 done:
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (capture_base)
+        wow64_memory_capture_transaction( &transaction, status, capture_base, size,
+                                           capture_base );
+    else
+        wow64_memory_capture_transaction( &transaction, status, NULL, 0, NULL );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+#endif
     return status;
 }
 
@@ -4747,9 +6599,10 @@ static BOOL is_inside_thread_stack( struct thread_data *data, void *ptr, struct 
 {
     TEB *teb;
     WOW_TEB *wow_teb;
-    size_t min_guaranteed = max( page_size * (is_win64 ? 2 : 1), host_page_size );
+    size_t min_guaranteed;
 
     if (!(teb = data->teb)) return FALSE;
+    min_guaranteed = max( page_size * (is_win64 ? 2 : 1), host_page_size );
     stack->start = teb->DeallocationStack;
     stack->limit = teb->Tib.StackLimit;
     stack->end   = teb->Tib.StackBase;
@@ -4758,9 +6611,12 @@ static BOOL is_inside_thread_stack( struct thread_data *data, void *ptr, struct 
     if ((char *)ptr > stack->start && (char *)ptr <= stack->end) return TRUE;
 
     if (!(wow_teb = get_wow_teb( teb ))) return FALSE;
-    stack->start = ULongToPtr( wow_teb->DeallocationStack );
-    stack->limit = ULongToPtr( wow_teb->Tib.StackLimit );
-    stack->end   = ULongToPtr( wow_teb->Tib.StackBase );
+    stack->start = wow64_guest_to_native_ptr( wow_teb->DeallocationStack );
+    stack->limit = wow64_guest_to_native_ptr( wow_teb->Tib.StackLimit );
+    stack->end   = wow64_guest_to_native_ptr( wow_teb->Tib.StackBase );
+    /* The paired WoW TEB describes an i386 stack even though native ntdll is
+     * 64-bit.  Its Windows minimum guarantee is therefore one guest page. */
+    min_guaranteed = page_size;
     stack->guaranteed = max( wow_teb->GuaranteedStackBytes, min_guaranteed );
     stack->is_wow = TRUE;
     return ((char *)ptr > stack->start && (char *)ptr <= stack->end);
@@ -4770,31 +6626,268 @@ static BOOL is_inside_thread_stack( struct thread_data *data, void *ptr, struct 
 /***********************************************************************
  *           grow_thread_stack
  */
-static NTSTATUS grow_thread_stack( struct thread_data *data, char *page, struct thread_stack_info *stack_info )
+static NTSTATUS grow_thread_stack( struct thread_data *data, char *page,
+                                   struct thread_stack_info *stack_info,
+                                   BOOL *protect_failed )
 {
     NTSTATUS ret = 0;
+    BOOL failed = FALSE;
+    SIZE_T stack_page_size = stack_info->is_wow ? page_size : host_page_size;
+    SIZE_T guaranteed = ROUND_SIZE( 0, stack_info->guaranteed, stack_page_size - 1 );
 
-    set_page_vprot_bits( page, host_page_size, VPROT_COMMITTED, VPROT_GUARD );
-    mprotect_range( page, host_page_size, 0, 0 );
-    if (page >= stack_info->start + host_page_size + stack_info->guaranteed)
+    set_page_vprot_bits( page, stack_page_size, VPROT_COMMITTED, VPROT_GUARD );
+    if (mprotect_range( page, stack_page_size, 0, 0 )) failed = TRUE;
+    if (page >= stack_info->start + stack_page_size + guaranteed)
     {
-        set_page_vprot_bits( page - host_page_size, host_page_size, VPROT_COMMITTED | VPROT_GUARD, 0 );
-        mprotect_range( page - host_page_size, host_page_size, 0, 0 );
+        set_page_vprot_bits( page - stack_page_size, stack_page_size,
+                             VPROT_COMMITTED | VPROT_GUARD, 0 );
+        if (mprotect_range( page - stack_page_size, stack_page_size, 0, 0 )) failed = TRUE;
     }
     else  /* inside guaranteed space -> overflow exception */
     {
-        page = stack_info->start + host_page_size;
-        set_page_vprot_bits( page, stack_info->guaranteed, VPROT_COMMITTED, VPROT_GUARD );
-        mprotect_range( page, stack_info->guaranteed, 0, 0 );
+        page = stack_info->start + stack_page_size;
+        set_page_vprot_bits( page, guaranteed, VPROT_COMMITTED, VPROT_GUARD );
+        if (mprotect_range( page, guaranteed, 0, 0 )) failed = TRUE;
         ret = STATUS_STACK_OVERFLOW;
     }
     if (stack_info->is_wow)
     {
         WOW_TEB *wow_teb = get_wow_teb( data->teb );
-        wow_teb->Tib.StackLimit = PtrToUlong( page );
+        wow_teb->Tib.StackLimit = wow64_native_to_guest_addr( page );
     }
     else data->teb->Tib.StackLimit = page;
+    if (protect_failed) *protect_failed = failed;
     return ret;
+}
+
+
+int32_t __wine_resolve_wow64_memory_fault_v1(
+    uint64_t host_address, uint32_t access_type,
+    struct wine_wow64_memory_fault_result_v1 *result )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    struct thread_stack_info stack_info;
+    struct thread_data *data = get_thread_data();
+    struct file_view *view;
+    char *logical_page, *host_page;
+    void *allocation_base = NULL;
+    NTSTATUS bridge_status = STATUS_SUCCESS;
+    NTSTATUS status, snapshot_status;
+    BYTE vprot, host_vprot;
+    sigset_t sigset;
+
+    if (!result || result->version != WINE_WOW64_MEMORY_FAULT_VERSION ||
+        result->size < sizeof(*result))
+        return STATUS_INVALID_PARAMETER;
+    memset( result, 0, sizeof(*result) );
+    result->version = WINE_WOW64_MEMORY_FAULT_VERSION;
+    result->size = sizeof(*result);
+    result->action = WINE_WOW64_MEMORY_FAULT_RAISE;
+    result->status = STATUS_ACCESS_VIOLATION;
+    result->parameter_count = 2;
+    result->information[0] = access_type;
+    result->information[1] = host_address;
+
+    if (!data || !is_wow64() || !wow64_memory_observer_is_required() ||
+        (access_type != WINE_WOW64_MEMORY_FAULT_READ &&
+         access_type != WINE_WOW64_MEMORY_FAULT_WRITE &&
+         access_type != WINE_WOW64_MEMORY_FAULT_EXECUTE) ||
+        !is_wow64_shadow_address( (void *)(ULONG_PTR)host_address ))
+        return STATUS_INVALID_PARAMETER;
+
+    logical_page = ROUND_ADDR( (void *)(ULONG_PTR)host_address, page_mask );
+    host_page = ROUND_ADDR( logical_page, host_page_mask );
+    status = wow64_memory_begin_transaction( &transaction, TRUE,
+                                              WINE_WOW64_MEMORY_PROTECT,
+                                              logical_page, page_size, NULL );
+    if (status) return status;
+    if (!transaction.observer_begun || transaction.nested)
+    {
+        wow64_memory_complete_transaction( &transaction );
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    view = find_view( logical_page, page_size );
+    if (!view || !(view->protect & VPROT_WOW64_TRANSLATED))
+    {
+        /* The fixed begin coverage must still be reconciled when the fault is
+         * genuinely free or belongs to an untagged view.  The snapshot emits
+         * MEM_FREE without the translated flag; address alone never proves
+         * provider ownership. */
+        wow64_memory_capture_transaction( &transaction, result->status,
+                                           logical_page, page_size, NULL );
+        goto done;
+    }
+    allocation_base = view->base;
+
+    /* A shared SEC_RESERVE view may have been committed through another view
+     * since its local VPROT cache was populated.  This normal-context fault is
+     * the synchronization point: refresh the logical page while a transaction
+     * is active so the observer sees the authoritative committed state. */
+    vprot = get_page_vprot( logical_page );
+    if (view->protect & SEC_RESERVE)
+    {
+        BYTE committed_vprot;
+
+        if (get_committed_size( view, logical_page, page_size,
+                                &committed_vprot, VPROT_COMMITTED ))
+            vprot = get_page_vprot( logical_page );
+    }
+
+    if ((vprot & (VPROT_COMMITTED | VPROT_GUARD)) ==
+        (VPROT_COMMITTED | VPROT_GUARD))
+    {
+        if (is_inside_thread_stack( data, logical_page, &stack_info ) && stack_info.is_wow)
+        {
+            ULONG_PTR view_start = (ULONG_PTR)view->base;
+            ULONG_PTR view_end;
+            ULONG_PTR stack_start = (ULONG_PTR)stack_info.start;
+            ULONG_PTR stack_end = (ULONG_PTR)stack_info.end;
+            ULONG_PTR page_start = (ULONG_PTR)logical_page;
+            ULONG_PTR capture_start, capture_end;
+            SIZE_T guaranteed_size;
+            BOOL protect_failed;
+
+            if (view->size > ~(ULONG_PTR)0 - view_start)
+            {
+                bridge_status = STATUS_INVALID_ADDRESS;
+                wow64_memory_capture_transaction( &transaction, bridge_status,
+                                                   logical_page, page_size,
+                                                   allocation_base );
+                goto done;
+            }
+            view_end = view_start + view->size;
+            guaranteed_size = ROUND_SIZE( 0, stack_info.guaranteed, page_mask );
+            if (!guaranteed_size || stack_start != view_start || stack_end <= stack_start ||
+                stack_end > view_end || stack_end - stack_start < page_size ||
+                page_start < stack_start + page_size ||
+                page_start > stack_end - page_size ||
+                guaranteed_size > stack_end - stack_start - page_size ||
+                (ULONG_PTR)stack_info.limit < stack_start + page_size ||
+                (ULONG_PTR)stack_info.limit > stack_end)
+            {
+                bridge_status = STATUS_INVALID_ADDRESS;
+                wow64_memory_capture_transaction( &transaction, bridge_status,
+                                                   logical_page, page_size,
+                                                   allocation_base );
+                goto done;
+            }
+
+            if (page_start >= stack_start + page_size + guaranteed_size)
+            {
+                capture_start = page_start - page_size;
+                capture_end = page_start + page_size;
+            }
+            else
+            {
+                capture_start = stack_start + page_size;
+                capture_end = capture_start + guaranteed_size;
+                if (capture_end < page_start + page_size)
+                    capture_end = page_start + page_size;
+            }
+            status = grow_thread_stack( data, logical_page, &stack_info, &protect_failed );
+            if (protect_failed) bridge_status = STATUS_ACCESS_DENIED;
+            if (status)
+            {
+                result->status = status;
+                result->parameter_count = 0;
+                memset( result->information, 0, sizeof(result->information) );
+            }
+            else
+            {
+                result->action = WINE_WOW64_MEMORY_FAULT_RETRY;
+                result->status = STATUS_SUCCESS;
+                result->parameter_count = 0;
+                memset( result->information, 0, sizeof(result->information) );
+            }
+            wow64_memory_capture_transaction( &transaction, status,
+                                               (void *)capture_start,
+                                               capture_end - capture_start,
+                                               allocation_base );
+            goto done;
+        }
+
+        set_page_vprot_bits( logical_page, page_size, 0, VPROT_GUARD );
+        if (mprotect_range( logical_page, page_size, 0, 0 ))
+            bridge_status = STATUS_ACCESS_DENIED;
+        result->status = STATUS_GUARD_PAGE_VIOLATION;
+        wow64_memory_capture_transaction( &transaction, result->status,
+                                           logical_page, page_size, allocation_base );
+        goto done;
+    }
+
+    host_vprot = get_translated_host_page_vprot( host_page );
+    if (access_type == WINE_WOW64_MEMORY_FAULT_WRITE &&
+        (vprot & VPROT_COMMITTED) && (vprot & (VPROT_WRITE | VPROT_WRITECOPY)) &&
+        ((wow64_memory_logical_write_fault_is_delegated() && (vprot & VPROT_WRITEWATCH)) ||
+         (!wow64_memory_logical_write_fault_is_delegated() &&
+          (host_vprot & VPROT_WRITEWATCH))))
+    {
+        if (enable_write_exceptions && (vprot & (VPROT_EXEC | VPROT_WRITEWATCH)) ==
+            (VPROT_EXEC | VPROT_WRITEWATCH) && !data->allow_writes)
+        {
+            result->status = STATUS_IN_PAGE_ERROR;
+            result->parameter_count = 3;
+            result->information[2] = STATUS_EXECUTABLE_MEMORY_WRITE;
+        }
+        else
+        {
+            void *clear_base = host_page;
+            SIZE_T clear_size = host_page_size;
+
+            /* A capability-negotiated provider enforces this private bit at
+             * guest 4K granularity, so disarm only the faulting lane.  The
+             * pre-registration fallback retains physical host-page behavior. */
+            if (wow64_memory_logical_write_fault_is_delegated())
+            {
+                clear_base = logical_page;
+                clear_size = page_size;
+            }
+            set_page_vprot_bits( clear_base, clear_size, 0, VPROT_WRITEWATCH );
+            /* Keep the logical address here so mprotect_range() can identify
+             * the translated view even when it ends inside this host page. */
+            if (mprotect_range( logical_page, page_size, 0, 0 ))
+                bridge_status = STATUS_ACCESS_DENIED;
+            result->action = WINE_WOW64_MEMORY_FAULT_RETRY;
+            result->status = STATUS_SUCCESS;
+            result->parameter_count = 0;
+            memset( result->information, 0, sizeof(result->information) );
+
+            wow64_memory_capture_transaction( &transaction, result->status,
+                                               clear_base, clear_size,
+                                               allocation_base );
+            goto done;
+        }
+    }
+    else if ((vprot & VPROT_COMMITTED) &&
+             ((access_type == WINE_WOW64_MEMORY_FAULT_READ &&
+               (get_unix_prot( vprot ) & PROT_READ)) ||
+              (access_type == WINE_WOW64_MEMORY_FAULT_WRITE &&
+               (get_unix_prot( vprot & ~VPROT_WRITEWATCH ) & PROT_WRITE)) ||
+              (access_type == WINE_WOW64_MEMORY_FAULT_EXECUTE && (vprot & VPROT_EXEC))))
+    {
+        result->action = WINE_WOW64_MEMORY_FAULT_RETRY;
+        result->status = STATUS_SUCCESS;
+        result->parameter_count = 0;
+        memset( result->information, 0, sizeof(result->information) );
+    }
+    wow64_memory_capture_transaction( &transaction, result->status,
+                                       logical_page, page_size, allocation_base );
+
+done:
+    snapshot_status = transaction.event.snapshot_status;
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    wow64_memory_complete_transaction( &transaction );
+    if (bridge_status) return bridge_status;
+    return snapshot_status;
+#else
+    (void)host_address;
+    (void)access_type;
+    (void)result;
+    return STATUS_NOT_SUPPORTED;
+#endif
 }
 
 
@@ -4830,7 +6923,7 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
             mprotect_range( page, host_page_size, 0, 0 );
             ret = STATUS_GUARD_PAGE_VIOLATION;
         }
-        else ret = grow_thread_stack( data, page, &stack_info );
+        else ret = grow_thread_stack( data, page, &stack_info, NULL );
     }
     else if (err == EXCEPTION_WRITE_FAULT)
     {
@@ -4862,12 +6955,369 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
 
 
 /***********************************************************************
+ *           arm64ec_scalar_load
+ */
+#if defined(__APPLE__) && defined(__aarch64__)
+static inline void arm64ec_scalar_load( const void *addr, SIZE_T size, ULONG64 *value )
+{
+    ULONG tmp32;
+    USHORT tmp16;
+
+    switch (size)
+    {
+    case sizeof(BYTE):
+        __asm__ volatile( "ldrb %w0, [%1]" : "=r" (tmp32) : "r" (addr) : "memory" );
+        *value = (BYTE)tmp32;
+        break;
+    case sizeof(USHORT):
+        __asm__ volatile( "ldrh %w0, [%1]" : "=r" (tmp32) : "r" (addr) : "memory" );
+        tmp16 = tmp32;
+        *value = tmp16;
+        break;
+    case sizeof(ULONG):
+        __asm__ volatile( "ldr %w0, [%1]" : "=r" (tmp32) : "r" (addr) : "memory" );
+        *value = tmp32;
+        break;
+    case sizeof(ULONG64):
+        __asm__ volatile( "ldr %0, [%1]" : "=r" (*value) : "r" (addr) : "memory" );
+        break;
+    default:
+        assert(0);
+    }
+}
+
+
+/***********************************************************************
+ *           arm64ec_scalar_store
+ */
+static inline void arm64ec_scalar_store( void *addr, SIZE_T size, ULONG64 value )
+{
+    ULONG tmp32;
+
+    switch (size)
+    {
+    case sizeof(BYTE):
+        tmp32 = value;
+        __asm__ volatile( "strb %w0, [%1]" :: "r" (tmp32), "r" (addr) : "memory" );
+        break;
+    case sizeof(USHORT):
+        tmp32 = value;
+        __asm__ volatile( "strh %w0, [%1]" :: "r" (tmp32), "r" (addr) : "memory" );
+        break;
+    case sizeof(ULONG):
+        tmp32 = value;
+        __asm__ volatile( "str %w0, [%1]" :: "r" (tmp32), "r" (addr) : "memory" );
+        break;
+    case sizeof(ULONG64):
+        __asm__ volatile( "str %0, [%1]" :: "r" (value), "r" (addr) : "memory" );
+        break;
+    default:
+        assert(0);
+    }
+}
+
+
+/***********************************************************************
+ *           arm64ec_q_load
+ */
+static inline void arm64ec_q_load( const void *addr,
+                                   struct arm64ec_low_guest_value *value )
+{
+    __asm__ volatile( "ldr q0, [%0]\n\t"
+                      "str q0, [%1]"
+                      :: "r" (addr), "r" (value) : "v0", "memory" );
+}
+
+
+/***********************************************************************
+ *           arm64ec_q_store
+ */
+static inline void arm64ec_q_store( void *addr,
+                                    const struct arm64ec_low_guest_value *value )
+{
+    __asm__ volatile( "ldr q0, [%0]\n\t"
+                      "str q0, [%1]"
+                      :: "r" (value), "r" (addr) : "v0", "memory" );
+}
+
+
+/***********************************************************************
+ *           arm64ec_qpair_load
+ */
+static inline void arm64ec_qpair_load( const void *addr,
+                                       struct arm64ec_low_guest_value *value )
+{
+    __asm__ volatile( "ldp q0, q1, [%0]\n\t"
+                      "stp q0, q1, [%1]"
+                      :: "r" (addr), "r" (value) : "v0", "v1", "memory" );
+}
+
+
+/***********************************************************************
+ *           arm64ec_qpair_store
+ */
+static inline void arm64ec_qpair_store( void *addr,
+                                        const struct arm64ec_low_guest_value *value )
+{
+    __asm__ volatile( "ldp q0, q1, [%0]\n\t"
+                      "stp q0, q1, [%1]"
+                      :: "r" (value), "r" (addr) : "v0", "v1", "memory" );
+}
+
+
+/***********************************************************************
+ *           arm64ec_gpr_pair_load
+ */
+static inline void arm64ec_gpr_pair_load( const void *addr,
+                                          struct arm64ec_low_guest_value *value,
+                                          SIZE_T element_size )
+{
+    if (element_size == sizeof(ULONG))
+    {
+        ULONG first, second;
+
+        __asm__ volatile( "ldp %w0, %w1, [%2]"
+                          : "=&r" (first), "=&r" (second) : "r" (addr) : "memory" );
+        value->word[0] = first;
+        value->word[1] = second;
+    }
+    else
+    {
+        ULONG64 first, second;
+
+        __asm__ volatile( "ldp %x0, %x1, [%2]"
+                          : "=&r" (first), "=&r" (second) : "r" (addr) : "memory" );
+        value->word[0] = first;
+        value->word[1] = second;
+    }
+}
+
+
+/***********************************************************************
+ *           arm64ec_gpr_pair_store
+ */
+static inline void arm64ec_gpr_pair_store( void *addr,
+                                           const struct arm64ec_low_guest_value *value,
+                                           SIZE_T element_size )
+{
+    if (element_size == sizeof(ULONG))
+    {
+        ULONG first = value->word[0], second = value->word[1];
+
+        __asm__ volatile( "stp %w0, %w1, [%2]"
+                          :: "r" (first), "r" (second), "r" (addr) : "memory" );
+    }
+    else
+    {
+        ULONG64 first = value->word[0], second = value->word[1];
+
+        __asm__ volatile( "stp %x0, %x1, [%2]"
+                          :: "r" (first), "r" (second), "r" (addr) : "memory" );
+    }
+}
+#endif
+
+
+/***********************************************************************
+ *           virtual_arm64ec_fetch_low_guest_instr
+ *
+ * Fetch one instruction from Wine-owned ARM64EC code while holding the
+ * virtual memory lock.  This avoids trusting the guest-visible PEB EC bitmap
+ * directly from the signal handler and avoids a validate-then-deref race on PC.
+ */
+BOOL virtual_arm64ec_fetch_low_guest_instr( const void *pc, ULONG *instr )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct file_view *view;
+    ULONG_PTR page;
+    ULONG64 value;
+    UINT64 *map;
+    BOOL ret = FALSE;
+    BYTE vprot;
+
+    if (!instr || ((ULONG_PTR)pc & 3)) return FALSE;
+
+    mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
+    if (!(view = find_view( pc, sizeof(*instr) )) ||
+        !(view->protect & VPROT_ARM64EC) || (view->protect & VPROT_SYSTEM) ||
+        !arm64ec_view)
+        goto done;
+
+    page = (ULONG_PTR)pc >> page_shift;
+    if ((page / 8) >= arm64ec_view->size) goto done;
+    map = arm64ec_view->base;
+    if (!((map[page / 64] >> (page & 63)) & 1)) goto done;
+
+    vprot = get_page_vprot( pc );
+    if ((vprot & (VPROT_COMMITTED | VPROT_EXEC | VPROT_GUARD)) !=
+        (VPROT_COMMITTED | VPROT_EXEC))
+        goto done;
+
+    arm64ec_scalar_load( pc, sizeof(*instr), &value );
+    *instr = value;
+    ret = TRUE;
+
+done:
+    mutex_unlock( &virtual_mutex );
+    return ret;
+#else
+    (void)pc;
+    (void)instr;
+    return FALSE;
+#endif
+}
+
+
+/***********************************************************************
+ *           check_translated_write_access
+ *
+ * Validate the physical Darwin pages backing one already-validated LOW
+ * operand.  This signal path is read-only with respect to virtual-memory
+ * metadata: write-watch disarming belongs to a normal-context V1 transaction.
+ */
+#if defined(__APPLE__) && defined(__aarch64__)
+static NTSTATUS check_translated_write_access( void *base, SIZE_T size,
+                                                BOOL *has_write_watch )
+{
+    ULONG_PTR start = (ULONG_PTR)base, end, page;
+
+    if (!has_write_watch || !size || size > ~(ULONG_PTR)0 - start)
+        return STATUS_INVALID_PARAMETER;
+    *has_write_watch = FALSE;
+    end = start + size;
+    page = start & ~host_page_mask;
+    while (page < end)
+    {
+        BYTE physical_vprot = get_host_page_vprot( (void *)page );
+        BYTE translated_vprot = get_translated_host_page_vprot( (void *)page );
+
+        if (physical_vprot & VPROT_WRITEWATCH)
+        {
+            *has_write_watch = TRUE;
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if (!(get_unix_prot( translated_vprot ) & PROT_WRITE))
+            return STATUS_ACCESS_VIOLATION;
+        if (host_page_size > ~(ULONG_PTR)0 - page) return STATUS_INVALID_PARAMETER;
+        page += host_page_size;
+    }
+    return STATUS_SUCCESS;
+}
+#endif
+
+
+/***********************************************************************
+ *           virtual_arm64ec_low_guest_access
+ *
+ * Validate and perform one bounded native ARM64EC access to an AMD64 fixed-low
+ * guest operand.  The interrupted register remains a guest pointer; only this
+ * operand is redirected to its tagged high-shadow backing while virtual_mutex
+ * prevents remap and reprotection races.
+ */
+NTSTATUS virtual_arm64ec_low_guest_access( struct thread_data *data, ULONG_PTR guest,
+                                           struct arm64ec_low_guest_value *value,
+                                           SIZE_T size, SIZE_T pair_element_size,
+                                           BOOL write, ULONG_PTR *extra_status )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct file_view *view;
+    BOOL has_write_watch = FALSE;
+    ULONG_PTR host, page, end;
+    SIZE_T offset;
+    NTSTATUS status = STATUS_ACCESS_VIOLATION;
+
+    (void)data;
+    if (!value ||
+        ((!pair_element_size && size != sizeof(BYTE) && size != sizeof(USHORT) &&
+          size != sizeof(ULONG) && size != sizeof(ULONG64) && size != 16) ||
+         (pair_element_size &&
+          ((pair_element_size != sizeof(ULONG) &&
+            pair_element_size != sizeof(ULONG64) && pair_element_size != 16) ||
+           size != pair_element_size * 2))) ||
+        guest >= WINE_LOW_VA_SHADOW_SIZE || size > WINE_LOW_VA_SHADOW_SIZE - guest)
+        return STATUS_INVALID_PARAMETER;
+    if (extra_status) *extra_status = 0;
+    host = WINE_LOW_VA_SHADOW_BASE + guest;
+
+    mutex_lock( &virtual_mutex );  /* signal handler already masks nested VM mutation */
+    for (offset = 0; offset < size; )
+    {
+        SIZE_T span = min( size - offset, page_size - ((host + offset) & page_mask) );
+        BYTE vprot = get_page_vprot( (void *)(host + offset) );
+
+        if (!(view = find_view( (void *)(host + offset), span )) ||
+            !(view->protect & VPROT_AMD64_LOW_TRANSLATED) ||
+            (view->protect & VPROT_SYSTEM) ||
+            !(vprot & VPROT_COMMITTED) || (vprot & VPROT_GUARD))
+            goto done;
+        if (write)
+        {
+            /* Executable writes and all write-watch state need observer-visible
+             * normal-context transitions; this first signal bridge stays closed. */
+            if (!(vprot & (VPROT_WRITE | VPROT_WRITECOPY)) ||
+                (vprot & (VPROT_EXEC | VPROT_WRITEWATCH)))
+                goto done;
+        }
+        else if (!(get_unix_prot( vprot ) & PROT_READ)) goto done;
+        offset += span;
+    }
+
+    end = host + size;
+    page = host & ~host_page_mask;
+    if (write)
+    {
+        if ((status = check_translated_write_access( (void *)host, size,
+                                                     &has_write_watch )) ||
+            has_write_watch)
+            goto done;
+        if (!pair_element_size && size == 16) arm64ec_q_store( (void *)host, value );
+        else if (pair_element_size == 16) arm64ec_qpair_store( (void *)host, value );
+        else if (pair_element_size)
+            arm64ec_gpr_pair_store( (void *)host, value, pair_element_size );
+        else arm64ec_scalar_store( (void *)host, size, value->word[0] );
+    }
+    else
+    {
+        while (page < end)
+        {
+            if (!(get_unix_prot( get_translated_host_page_vprot( (void *)page )) &
+                  PROT_READ))
+                goto done;
+            if (host_page_size > ~(ULONG_PTR)0 - page) goto done;
+            page += host_page_size;
+        }
+        if (!pair_element_size && size == 16) arm64ec_q_load( (const void *)host, value );
+        else if (pair_element_size == 16) arm64ec_qpair_load( (const void *)host, value );
+        else if (pair_element_size)
+            arm64ec_gpr_pair_load( (const void *)host, value, pair_element_size );
+        else arm64ec_scalar_load( (const void *)host, size, &value->word[0] );
+    }
+    status = STATUS_SUCCESS;
+
+done:
+    mutex_unlock( &virtual_mutex );
+    return status;
+#else
+    (void)data;
+    (void)guest;
+    (void)value;
+    (void)size;
+    (void)pair_element_size;
+    (void)write;
+    (void)extra_status;
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
+/***********************************************************************
  *           virtual_setup_exception
  */
 void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t size, EXCEPTION_RECORD *rec )
 {
     char *stack = stack_ptr;
     struct thread_stack_info stack_info;
+    SIZE_T stack_page_size;
 
     if (!is_inside_thread_stack( data, stack, &stack_info ))
     {
@@ -4883,23 +7333,29 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
     }
 
     stack -= size;
+    stack_page_size = stack_info.is_wow ? page_size : host_page_size;
 
-    if (stack < stack_info.start + host_page_size)
+    if (stack < stack_info.start + stack_page_size)
     {
         /* stack overflow on last page, unrecoverable */
-        UINT diff = stack_info.start + host_page_size - stack;
+        UINT diff = stack_info.start + stack_page_size - stack;
         ERR( "stack overflow %u bytes addr %p stack %p (%p-%p-%p)\n",
              diff, rec->ExceptionAddress, stack, stack_info.start, stack_info.limit, stack_info.end );
         abort_thread(1);
     }
     else if (stack < stack_info.limit)
     {
-        char *page = ROUND_ADDR( stack, host_page_mask );
+        char *page = ROUND_ADDR( stack, stack_page_size - 1 );
         mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
-        if ((get_host_page_vprot( page ) & VPROT_GUARD) && grow_thread_stack( data, page, &stack_info ))
+        if ((stack_info.is_wow ? get_page_vprot( page ) : get_host_page_vprot( page )) & VPROT_GUARD)
         {
-            rec->ExceptionCode = STATUS_STACK_OVERFLOW;
-            rec->NumberParameters = 0;
+            NTSTATUS status = grow_thread_stack( data, page, &stack_info, NULL );
+
+            if (status)
+            {
+                rec->ExceptionCode = STATUS_STACK_OVERFLOW;
+                rec->NumberParameters = 0;
+            }
         }
         mutex_unlock( &virtual_mutex );
     }
@@ -4917,22 +7373,168 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
  *
  * Check if the memory range is writable, temporarily disabling write watches if necessary.
  */
-static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_watch )
+static NTSTATUS validate_write_access( void *base, size_t size, BOOL *has_write_watch )
 {
-    size_t i;
-    char *addr = ROUND_ADDR( base, host_page_mask );
+    char *addr = base;
+    size_t remaining = size;
+    struct memory_access_cache cache = {0};
 
-    size = ROUND_SIZE( base, size, host_page_mask );
-    for (i = 0; i < size; i += host_page_size)
+    while (remaining)
     {
-        BYTE vprot = get_host_page_vprot( addr + i );
-        if (vprot & VPROT_WRITEWATCH) *has_write_watch = TRUE;
+        SIZE_T available;
+        BOOL translated;
+        BYTE vprot = get_memory_access_vprot( addr, &available, &translated, &cache );
+
+        if ((vprot & VPROT_WRITEWATCH) ||
+            (translated && (get_translated_host_page_vprot( addr ) & VPROT_WRITEWATCH)))
+            *has_write_watch = TRUE;
         if (!(get_unix_prot( vprot & ~VPROT_WRITEWATCH ) & PROT_WRITE))
             return STATUS_INVALID_USER_BUFFER;
+        available = min( available, remaining );
+        addr += available;
+        remaining -= available;
     }
-    if (*has_write_watch)
-        mprotect_range( addr, size, 0, VPROT_WRITEWATCH );  /* temporarily enable write access */
+
     return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_watch )
+{
+    NTSTATUS status;
+
+    if ((status = validate_write_access( base, size, has_write_watch ))) return status;
+
+    /* Keep the logical range intact so mprotect_range() can identify a tagged
+     * view even when it ends inside a 16K host page.  Apply one logical/host
+     * lane at a time so adjacent views retain their own ownership tag. */
+    if (*has_write_watch &&
+#if defined(__APPLE__) && defined(__aarch64__)
+        !wow64_memory_logical_write_fault_is_delegated() &&
+#endif
+        mprotect_memory_access_range( base, size, 0, VPROT_WRITEWATCH ))
+    {
+        if (mprotect_memory_access_range( base, size, 0, 0 ))
+            abort_process( STATUS_ACCESS_DENIED );
+        return STATUS_INVALID_USER_BUFFER;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static unsigned int virtual_server_call( void *req_ptr, BOOL lock_native_reply,
+                                         void *fixed_reply, SIZE_T fixed_reply_size )
+{
+    struct __server_request_info * const req = req_ptr;
+    sigset_t sigset;
+    void *addr = req->reply_data;
+    data_size_t size = req->u.req.request_header.reply_size;
+    data_size_t reply_size = 0;
+    BOOL has_write_watch = FALSE;
+    BOOL fixed_has_write_watch = FALSE;
+    BOOL reply_received = FALSE;
+    BOOL delegated_write_fault = FALSE;
+    unsigned int i, ret = STATUS_SUCCESS;
+    size_t payload_size = 0;
+    BOOL lock_required = (lock_native_reply && !!size) || !!fixed_reply_size;
+
+    if (fixed_reply_size > sizeof(req->u.reply)) return STATUS_INVALID_PARAMETER;
+    if (req->data_count > __SERVER_MAX_DATA) goto malformed;
+    for (i = 0; i < req->data_count; i++)
+    {
+        if (req->data[i].size > ~(data_size_t)0 - payload_size) goto malformed;
+        payload_size += req->data[i].size;
+    }
+    if (payload_size != req->u.req.request_header.request_size ||
+        payload_size > ~(data_size_t)0 - sizeof(req->u.req) ||
+        payload_size > SSIZE_MAX - sizeof(req->u.req))
+        goto malformed;
+
+    for (i = 0; i < req->data_count; i++)
+    {
+        if (req->data[i].size &&
+            (!req->data[i].ptr ||
+             (overlaps_wow64_shadow( req->data[i].ptr, req->data[i].size ) &&
+              !is_inside_wow64_shadow( req->data[i].ptr, req->data[i].size ))))
+        {
+            memset( &req->u.reply, 0, sizeof(req->u.reply) );
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if (overlaps_wow64_shadow( req->data[i].ptr, req->data[i].size ))
+            lock_required = TRUE;
+    }
+    if (size && (!addr || (overlaps_wow64_shadow( addr, size ) &&
+                           !is_inside_wow64_shadow( addr, size ))))
+    {
+        memset( &req->u.reply, 0, sizeof(req->u.reply) );
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (overlaps_wow64_shadow( addr, size )) lock_required = TRUE;
+    if (fixed_reply_size &&
+        (!fixed_reply ||
+         (overlaps_wow64_shadow( fixed_reply, fixed_reply_size ) &&
+          !is_inside_wow64_shadow( fixed_reply, fixed_reply_size ))))
+    {
+        memset( &req->u.reply, 0, sizeof(req->u.reply) );
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (overlaps_wow64_shadow( fixed_reply, fixed_reply_size )) lock_required = TRUE;
+    if (!lock_required) return wine_server_call_unchecked( req_ptr );
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    delegated_write_fault = wow64_memory_logical_write_fault_is_delegated();
+#endif
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    for (i = 0; i < req->data_count; i++)
+    {
+        if (overlaps_wow64_shadow( req->data[i].ptr, req->data[i].size ) &&
+            !check_wow64_translated_memory_access( req->data[i].ptr,
+                                                    req->data[i].size, PROT_READ ))
+        {
+            ret = STATUS_ACCESS_VIOLATION;
+            break;
+        }
+    }
+    if (!ret && size)
+    {
+        if (check_write_access( addr, size, &has_write_watch ))
+            ret = STATUS_ACCESS_VIOLATION;
+    }
+    if (!ret && fixed_reply_size)
+    {
+        if (check_write_access( fixed_reply, fixed_reply_size, &fixed_has_write_watch ))
+            ret = STATUS_ACCESS_VIOLATION;
+    }
+    if (!ret)
+    {
+        ret = server_call_unlocked_with_reply_size( req, &reply_size, &reply_received );
+        if (fixed_reply_size && reply_received)
+            memcpy( fixed_reply, &req->u.reply, fixed_reply_size );
+    }
+    else
+        memset( &req->u.reply, 0, sizeof(req->u.reply) );
+    if (has_write_watch && !delegated_write_fault)
+        update_write_watches( addr, size, min( size, reply_size ));
+    if (fixed_has_write_watch && !delegated_write_fault)
+        update_write_watches( fixed_reply, fixed_reply_size,
+                              reply_received ? fixed_reply_size : 0 );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (has_write_watch && delegated_write_fault && reply_size)
+    {
+        wow64_memory_publish_native_write_or_abort( addr, min( size, reply_size ) );
+    }
+    if (fixed_has_write_watch && reply_received && delegated_write_fault && fixed_reply_size)
+    {
+        wow64_memory_publish_native_write_or_abort( fixed_reply, fixed_reply_size );
+    }
+#endif
+    return ret;
+
+malformed:
+    memset( &req->u.reply, 0, sizeof(req->u.reply) );
+    return STATUS_INVALID_PARAMETER;
 }
 
 
@@ -4941,24 +7543,30 @@ static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_wat
  */
 unsigned int virtual_locked_server_call( void *req_ptr )
 {
-    struct __server_request_info * const req = req_ptr;
-    sigset_t sigset;
-    void *addr = req->reply_data;
-    data_size_t size = req->u.req.request_header.reply_size;
-    BOOL has_write_watch = FALSE;
-    unsigned int ret;
+    return virtual_server_call( req_ptr, TRUE, NULL, 0 );
+}
 
-    if (!size) return wine_server_call( req_ptr );
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
-    if (!(ret = check_write_access( addr, size, &has_write_watch )))
-    {
-        ret = server_call_unlocked( req );
-        if (has_write_watch) update_write_watches( addr, size, wine_server_reply_size( req ));
-    }
-    else memset( &req->u.reply, 0, sizeof(req->u.reply) );
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
-    return ret;
+/***********************************************************************
+ *           virtual_locked_wow64_server_call
+ */
+unsigned int virtual_locked_wow64_server_call( void *req_ptr )
+{
+    return virtual_server_call( req_ptr, FALSE, NULL, 0 );
+}
+
+
+/***********************************************************************
+ *           virtual_locked_wow64_server_call_with_reply
+ *
+ * Validate and publish the fixed WoW64 reply descriptor while the virtual
+ * address space is locked.  This prevents a protection race from turning a
+ * successful server-side operation into an unpublishable reply.
+ */
+unsigned int virtual_locked_wow64_server_call_with_reply( void *req_ptr,
+                                                          void *reply, SIZE_T reply_size )
+{
+    return virtual_server_call( req_ptr, FALSE, reply, reply_size );
 }
 
 
@@ -4969,19 +7577,37 @@ ssize_t virtual_locked_read( int fd, void *addr, size_t size )
 {
     sigset_t sigset;
     BOOL has_write_watch = FALSE;
+    BOOL delegated_write_fault = FALSE;
     int err = EFAULT;
+    ssize_t ret;
 
-    ssize_t ret = read( fd, addr, size );
-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    /* A translated 4K lane can be logically inaccessible while an adjacent
+     * lane keeps the shared 16K host page writable.  Validate the logical
+     * protections before letting the kernel copy into any shadow range. */
+    if (!overlaps_wow64_shadow( addr, size ))
+    {
+        ret = read( fd, addr, size );
+        if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    }
+    else ret = -1;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    delegated_write_fault = wow64_memory_logical_write_fault_is_delegated();
+#endif
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (!check_write_access( addr, size, &has_write_watch ))
     {
         ret = read( fd, addr, size );
         err = errno;
-        if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
+        if (has_write_watch && !delegated_write_fault)
+            update_write_watches( addr, size, max( 0, ret ));
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (has_write_watch && delegated_write_fault && ret > 0)
+        wow64_memory_publish_native_write_or_abort( addr, ret );
+#endif
     errno = err;
     return ret;
 }
@@ -4994,19 +7620,34 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
 {
     sigset_t sigset;
     BOOL has_write_watch = FALSE;
+    BOOL delegated_write_fault = FALSE;
     int err = EFAULT;
+    ssize_t ret;
 
-    ssize_t ret = pread( fd, addr, size, offset );
-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    if (!overlaps_wow64_shadow( addr, size ))
+    {
+        ret = pread( fd, addr, size, offset );
+        if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    }
+    else ret = -1;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    delegated_write_fault = wow64_memory_logical_write_fault_is_delegated();
+#endif
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (!check_write_access( addr, size, &has_write_watch ))
     {
         ret = pread( fd, addr, size, offset );
         err = errno;
-        if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
+        if (has_write_watch && !delegated_write_fault)
+            update_write_watches( addr, size, max( 0, ret ));
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (has_write_watch && delegated_write_fault && ret > 0)
+        wow64_memory_publish_native_write_or_abort( addr, ret );
+#endif
     errno = err;
     return ret;
 }
@@ -5018,12 +7659,29 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
 ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
 {
     sigset_t sigset;
-    size_t i;
+    size_t accessed, i, j, remaining;
     BOOL has_write_watch = FALSE;
+    BOOL delegated_write_fault = FALSE;
+    BOOL shadow = FALSE;
     int err = EFAULT;
+    ssize_t ret;
 
-    ssize_t ret = recvmsg( fd, hdr, flags );
-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    for (i = 0; i < hdr->msg_iovlen; i++)
+        if (overlaps_wow64_shadow( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len ))
+        {
+            shadow = TRUE;
+            break;
+        }
+    if (!shadow)
+    {
+        ret = recvmsg( fd, hdr, flags );
+        if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    }
+    else ret = -1;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    delegated_write_fault = wow64_memory_logical_write_fault_is_delegated();
+#endif
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     for (i = 0; i < hdr->msg_iovlen; i++)
@@ -5034,10 +7692,132 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
         ret = recvmsg( fd, hdr, flags );
         err = errno;
     }
-    if (has_write_watch)
-        while (i--) update_write_watches( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, 0 );
+    if (has_write_watch && !delegated_write_fault)
+    {
+        remaining = ret > 0 ? ret : 0;
+        for (j = 0; j < i; j++)
+        {
+            accessed = min( hdr->msg_iov[j].iov_len, remaining );
+            update_write_watches( hdr->msg_iov[j].iov_base, hdr->msg_iov[j].iov_len, accessed );
+            remaining -= accessed;
+        }
+    }
 
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (has_write_watch && delegated_write_fault && ret > 0)
+    {
+        remaining = ret;
+        for (j = 0; j < i && remaining; j++)
+        {
+            accessed = min( hdr->msg_iov[j].iov_len, remaining );
+            if (accessed)
+                wow64_memory_publish_native_write_or_abort( hdr->msg_iov[j].iov_base,
+                                                             accessed );
+            remaining -= accessed;
+        }
+    }
+#endif
+    errno = err;
+    return ret;
+}
+
+
+/***********************************************************************
+ *           virtual_locked_sendmsg
+ */
+ssize_t virtual_locked_sendmsg( int fd, const struct msghdr *hdr, int flags )
+{
+    sigset_t sigset;
+    BOOL shadow = FALSE;
+    size_t i;
+    int err = EFAULT;
+    ssize_t ret = -1;
+
+    for (i = 0; i < hdr->msg_iovlen; i++)
+        if (overlaps_wow64_shadow( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len ))
+        {
+            shadow = TRUE;
+            break;
+        }
+    if (!shadow) return sendmsg( fd, hdr, flags );
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    for (i = 0; i < hdr->msg_iovlen; i++)
+        if (!check_wow64_translated_memory_access( hdr->msg_iov[i].iov_base,
+                                                   hdr->msg_iov[i].iov_len, PROT_READ ))
+            break;
+    if (i == hdr->msg_iovlen)
+    {
+        ret = sendmsg( fd, hdr, flags );
+        err = errno;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    errno = err;
+    return ret;
+}
+
+
+/***********************************************************************
+ *           virtual_locked_send
+ */
+ssize_t virtual_locked_send( int fd, const void *buffer, size_t size, int flags )
+{
+    struct iovec iov = {(void *)buffer, size};
+    struct msghdr hdr = {0};
+
+    hdr.msg_iov = &iov;
+    hdr.msg_iovlen = 1;
+    return virtual_locked_sendmsg( fd, &hdr, flags );
+}
+
+
+/***********************************************************************
+ *           virtual_locked_ioctl
+ *
+ * Keep a kernel ioctl from observing the physical 16K permission of a
+ * logically inaccessible translated 4K input or output lane.  This avoids
+ * eager bounce allocations for direct-I/O controls while serializing guest
+ * reprotection for the duration of the kernel access.
+ */
+int virtual_locked_ioctl( int fd, unsigned long request, void *arg,
+                          const void *read_buffer, SIZE_T read_size,
+                          void *write_buffer, SIZE_T write_size )
+{
+    BOOL has_write_watch = FALSE, delegated = FALSE;
+#if defined(__APPLE__) && defined(__aarch64__)
+    BOOL accessed = FALSE;
+#endif
+    BOOL shadow_read = overlaps_wow64_shadow( read_buffer, read_size );
+    BOOL shadow_write = overlaps_wow64_shadow( write_buffer, write_size );
+    sigset_t sigset;
+    int err = EFAULT, ret = -1;
+
+    if (!shadow_read && !shadow_write) return ioctl( fd, request, arg );
+#if defined(__APPLE__) && defined(__aarch64__)
+    delegated = wow64_memory_logical_write_fault_is_delegated();
+#endif
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if ((!shadow_read || check_wow64_translated_memory_access( read_buffer, read_size,
+                                                               PROT_READ )) &&
+        (!shadow_write || !check_write_access( write_buffer, write_size,
+                                                &has_write_watch )))
+    {
+#if defined(__APPLE__) && defined(__aarch64__)
+        accessed = TRUE;
+#endif
+        ret = ioctl( fd, request, arg );
+        err = errno;
+        /* An ioctl may publish partial output even when it reports failure.
+         * Conservatively dirty the requested output range. */
+        if (has_write_watch && !delegated)
+            update_write_watches( write_buffer, write_size, write_size );
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (accessed && has_write_watch && delegated)
+        wow64_memory_publish_native_write_or_abort( write_buffer, write_size );
+#endif
     errno = err;
     return ret;
 }
@@ -5069,6 +7849,7 @@ BOOL virtual_check_buffer_for_read( const void *ptr, SIZE_T size )
 {
     if (!size) return TRUE;
     if (!ptr) return FALSE;
+    if (!virtual_check_wow64_translated_memory_access( ptr, size, PROT_READ )) return FALSE;
 
     __TRY
     {
@@ -5103,6 +7884,7 @@ BOOL virtual_check_buffer_for_write( void *ptr, SIZE_T size )
 {
     if (!size) return TRUE;
     if (!ptr) return FALSE;
+    if (!virtual_check_wow64_translated_memory_access( ptr, size, PROT_WRITE )) return FALSE;
 
     __TRY
     {
@@ -5128,6 +7910,28 @@ BOOL virtual_check_buffer_for_write( void *ptr, SIZE_T size )
 
 
 /***********************************************************************
+ *           virtual_check_buffer_for_write_no_touch
+ *
+ * Validate a completion output without changing its contents or consuming
+ * logical guard/write-watch state.
+ */
+BOOL virtual_check_buffer_for_write_no_touch( void *ptr, SIZE_T size )
+{
+    BOOL has_write_watch = FALSE;
+    sigset_t sigset;
+    NTSTATUS status;
+
+    if (!size) return TRUE;
+    if (!ptr) return FALSE;
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    status = check_write_access( ptr, size, &has_write_watch );
+    if (has_write_watch) update_write_watches( ptr, size, 0 );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return !status;
+}
+
+
+/***********************************************************************
  *           virtual_uninterrupted_read_memory
  *
  * Similar to NtReadVirtualMemory, but without wineserver calls. Moreover
@@ -5139,6 +7943,7 @@ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T
     struct file_view *view;
     sigset_t sigset;
     SIZE_T bytes_read = 0;
+    struct memory_access_cache cache = {0};
 
     if (!size) return 0;
 
@@ -5147,9 +7952,13 @@ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T
     {
         if (!(view->protect & VPROT_SYSTEM))
         {
-            while (bytes_read < size && (get_unix_prot( get_host_page_vprot( addr )) & PROT_READ))
+            while (bytes_read < size)
             {
-                SIZE_T block_size = min( size - bytes_read, host_page_size - ((UINT_PTR)addr & host_page_mask) );
+                SIZE_T available;
+                BYTE vprot = get_memory_access_vprot( addr, &available, NULL, &cache );
+                SIZE_T block_size = min( size - bytes_read, available );
+
+                if (!(get_unix_prot( vprot ) & PROT_READ)) break;
                 memcpy( buffer, addr, block_size );
 
                 addr   = (const void *)((const char *)addr + block_size);
@@ -5175,17 +7984,1094 @@ NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZ
     BOOL has_write_watch = FALSE;
     sigset_t sigset;
     NTSTATUS ret;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    void *capture_base;
+    SIZE_T capture_size;
+    NTSTATUS snapshot_status;
+    BOOL delegated_range;
+    BOOL stored;
+#endif
 
     if (!size) return STATUS_SUCCESS;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
-    if (!(ret = check_write_access( addr, size, &has_write_watch )))
+    ret = check_write_access( addr, size, &has_write_watch );
+#if defined(__APPLE__) && defined(__aarch64__)
+    delegated_range = wow64_memory_logical_write_fault_is_delegated() &&
+                      overlaps_wow64_shadow( addr, size );
+    if (!ret && has_write_watch && delegated_range)
+    {
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        capture_base = ROUND_ADDR( addr, page_mask );
+        capture_size = ROUND_SIZE( addr, size, page_mask );
+        if (!is_inside_wow64_shadow( capture_base, capture_size ))
+            return STATUS_ACCESS_VIOLATION;
+        ret = wow64_memory_begin_transaction( &transaction, TRUE,
+                                               WINE_WOW64_MEMORY_PROTECT,
+                                               capture_base, capture_size, NULL );
+        if (ret) return ret;
+
+        has_write_watch = FALSE;
+        stored = FALSE;
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        if (!(ret = check_write_access( addr, size, &has_write_watch )))
+        {
+            memcpy( addr, buffer, size );
+            stored = TRUE;
+            if (has_write_watch)
+            {
+                set_page_vprot_bits( capture_base, capture_size, 0, VPROT_WRITEWATCH );
+                if (mprotect_memory_access_range( capture_base, capture_size, 0, 0 ))
+                    ret = STATUS_ACCESS_DENIED;
+            }
+        }
+        wow64_memory_capture_transaction( &transaction, ret, capture_base,
+                                           capture_size, NULL );
+        snapshot_status = transaction.event.snapshot_status;
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        wow64_memory_complete_transaction( &transaction );
+        if (stored && (ret || snapshot_status))
+            abort_process( ret ? ret : snapshot_status );
+        return ret ? ret : snapshot_status;
+    }
+#endif
+    if (!ret)
     {
         memcpy( addr, buffer, size );
-        if (has_write_watch) update_write_watches( addr, size, size );
+        if (has_write_watch)
+            update_write_watches( addr, size, size );
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     return ret;
+}
+
+
+/***********************************************************************
+ *           virtual_copy_from_user
+ *
+ * Copy from a current-process WoW64 user buffer without letting Darwin's
+ * 16K host protection widen a translated 4K guest page.  Ordinary address
+ * spaces keep the established fault behavior and avoid the virtual lock.
+ */
+NTSTATUS virtual_copy_from_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!dst || !src) return STATUS_ACCESS_VIOLATION;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( src, size ))
+    {
+        struct memory_access_cache cache = {0};
+        const char *addr = src;
+        char *buffer = dst;
+        SIZE_T remaining = size;
+        sigset_t sigset;
+
+        if (!is_inside_wow64_shadow( src, size )) return STATUS_ACCESS_VIOLATION;
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        while (remaining)
+        {
+            SIZE_T available;
+            BYTE vprot = get_memory_access_vprot( addr, &available, NULL, &cache );
+
+            if (vprot & VPROT_GUARD)
+            {
+                struct wine_wow64_memory_fault_result_v1 result =
+                {
+                    .version = WINE_WOW64_MEMORY_FAULT_VERSION,
+                    .size = sizeof(result),
+                };
+
+                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+                status = __wine_resolve_wow64_memory_fault_v1( (ULONG_PTR)addr,
+                            WINE_WOW64_MEMORY_FAULT_READ, &result );
+                if (status) return status;
+                if (result.action != WINE_WOW64_MEMORY_FAULT_RETRY) return result.status;
+                memset( &cache, 0, sizeof(cache) );
+                server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+                continue;
+            }
+            if (!(get_unix_prot( vprot ) & PROT_READ))
+            {
+                status = STATUS_ACCESS_VIOLATION;
+                break;
+            }
+            available = min( available, remaining );
+            memcpy( buffer, addr, available );
+            addr += available;
+            buffer += available;
+            remaining -= available;
+        }
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        return status;
+    }
+#endif
+    __TRY
+    {
+        memcpy( dst, src, size );
+    }
+    __EXCEPT
+    {
+        status = get_thread_data()->jmp_status;
+    }
+    __ENDTRY
+    return status;
+}
+
+
+/***********************************************************************
+ *           virtual_copy_string_from_user
+ *
+ * Snapshot a NUL-terminated current-process user string without reading
+ * beyond the logical page containing its terminator.  The caller supplies
+ * the resource bound and owns the returned allocation.
+ */
+NTSTATUS virtual_copy_string_from_user( char **dst, const char *src, SIZE_T max_size )
+{
+    SIZE_T capacity = 0, length = 0;
+    char *buffer = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!dst) return STATUS_INVALID_PARAMETER;
+    *dst = NULL;
+    if (!src) return STATUS_ACCESS_VIOLATION;
+    if (!max_size) return STATUS_NAME_TOO_LONG;
+
+    while (length < max_size)
+    {
+        ULONG_PTR address = (ULONG_PTR)src + length;
+        SIZE_T chunk, required;
+        char *terminator, *new_buffer;
+
+        if (address < (ULONG_PTR)src) { status = STATUS_ACCESS_VIOLATION; break; }
+        chunk = min( max_size - length, page_size - (address & page_mask) );
+        required = length + chunk;
+        if (required > capacity)
+        {
+            SIZE_T new_capacity = min( max_size, max( required, capacity ? 2 * capacity : 256 ));
+
+            if (new_capacity < required || (capacity && new_capacity < capacity))
+            {
+                status = STATUS_NO_MEMORY;
+                break;
+            }
+            if (!(new_buffer = realloc( buffer, new_capacity )))
+            {
+                status = STATUS_NO_MEMORY;
+                break;
+            }
+            buffer = new_buffer;
+            capacity = new_capacity;
+        }
+        if ((status = virtual_copy_from_user( buffer + length, (const void *)address, chunk )))
+            break;
+        if ((terminator = memchr( buffer + length, 0, chunk )))
+        {
+            *dst = buffer;
+            return STATUS_SUCCESS;
+        }
+        length += chunk;
+    }
+    free( buffer );
+    return status ? status : STATUS_NAME_TOO_LONG;
+}
+
+
+/***********************************************************************
+ *           virtual_copy_to_user
+ */
+NTSTATUS virtual_copy_to_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!dst || !src) return STATUS_ACCESS_VIOLATION;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( dst, size ))
+    {
+        if (!is_inside_wow64_shadow( dst, size )) return STATUS_ACCESS_VIOLATION;
+        status = virtual_uninterrupted_write_memory( dst, src, size );
+        return status ? STATUS_ACCESS_VIOLATION : STATUS_SUCCESS;
+    }
+#endif
+    __TRY
+    {
+        memcpy( dst, src, size );
+    }
+    __EXCEPT
+    {
+        status = get_thread_data()->jmp_status;
+    }
+    __ENDTRY
+    return status;
+}
+
+
+/***********************************************************************
+ *           wow64_probe_user_read
+ */
+NTSTATUS wow64_probe_user_read( const void *ptr, SIZE_T size )
+{
+    BYTE value;
+    SIZE_T offset = 0;
+    NTSTATUS status;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!ptr) return STATUS_ACCESS_VIOLATION;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( ptr, size ))
+    {
+        if (!is_inside_wow64_shadow( ptr, size ) ||
+            !virtual_check_wow64_translated_memory_access( ptr, size, PROT_READ ))
+            return STATUS_ACCESS_VIOLATION;
+        return STATUS_SUCCESS;
+    }
+#endif
+    while (offset < size)
+    {
+        status = virtual_copy_from_user( &value, (const char *)ptr + offset, 1 );
+        if (status) return status;
+        offset += min( host_page_size - (((ULONG_PTR)ptr + offset) & host_page_mask),
+                       size - offset );
+    }
+    return virtual_copy_from_user( &value, (const char *)ptr + size - 1, 1 );
+}
+
+
+/***********************************************************************
+ *           wow64_probe_user_write
+ */
+NTSTATUS wow64_probe_user_write( void *ptr, SIZE_T size )
+{
+    if (!size) return STATUS_SUCCESS;
+    if (!ptr) return STATUS_ACCESS_VIOLATION;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( ptr, size ))
+    {
+        if (!is_inside_wow64_shadow( ptr, size ) ||
+            !virtual_check_buffer_for_write_no_touch( ptr, size ))
+            return STATUS_ACCESS_VIOLATION;
+        return STATUS_SUCCESS;
+    }
+#endif
+    return virtual_check_buffer_for_write( ptr, size ) ? STATUS_SUCCESS : STATUS_ACCESS_VIOLATION;
+}
+
+
+static NTSTATUS wow64_prepare_faulting_write_user( void *dst, SIZE_T size )
+{
+    if (!size) return STATUS_SUCCESS;
+    if (!dst) return STATUS_ACCESS_VIOLATION;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( dst, size ))
+    {
+        ULONG_PTR start = (ULONG_PTR)dst, cursor;
+
+        if (!is_inside_wow64_shadow( dst, size )) return STATUS_ACCESS_VIOLATION;
+        cursor = start + size;
+
+        /* Walk high to low before publishing any byte.  Stack frames extend
+         * down from the old SP, so this reaches and resolves each guard page
+         * in order instead of rejecting a large frame at an uncommitted page
+         * below the current guard. */
+        while (cursor > start)
+        {
+            struct wine_wow64_memory_fault_result_v1 result =
+            {
+                .version = WINE_WOW64_MEMORY_FAULT_VERSION,
+                .size = sizeof(result),
+            };
+            struct memory_access_cache cache = {0};
+            ULONG_PTR page = (cursor - 1) & ~page_mask;
+            SIZE_T available;
+            BYTE vprot;
+            NTSTATUS status;
+            sigset_t sigset;
+
+            server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+            vprot = get_memory_access_vprot( (void *)(cursor - 1), &available, NULL, &cache );
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            /* Resolve guards to preserve direct-store stack growth and guard
+             * exceptions.  Ordinary write-watch state is consumed only by
+             * the final copy; clearing it during preflight would mark an
+             * earlier page dirty even if a later page rejects the frame. */
+            if ((vprot & VPROT_GUARD) ||
+                (enable_write_exceptions && (vprot & VPROT_WRITEWATCH) &&
+                 is_vprot_exec_write( vprot )))
+            {
+                status = __wine_resolve_wow64_memory_fault_v1( cursor - 1,
+                            WINE_WOW64_MEMORY_FAULT_WRITE, &result );
+                if (status) return status;
+                if (result.action != WINE_WOW64_MEMORY_FAULT_RETRY) return result.status;
+                continue;
+            }
+            if (!(get_unix_prot( vprot & ~VPROT_WRITEWATCH ) & PROT_WRITE))
+                return STATUS_ACCESS_VIOLATION;
+            cursor = max( page, start );
+        }
+
+        return STATUS_SUCCESS;
+    }
+#endif
+    {
+        ULONG_PTR start = (ULONG_PTR)dst, cursor = start + size;
+
+        /* Low-identity WoW64 can rely on native host-page faults, but the pair
+         * and ownership-returning publishers still have to resolve guards
+         * before their all-or-nothing validation/store interval.  Touch only
+         * guard pages; ordinary write-watch pages must remain armed until the
+         * final store succeeds. */
+        while (cursor > start)
+        {
+            struct memory_access_cache cache = {0};
+            ULONG_PTR page = (cursor - 1) & ~host_page_mask;
+            NTSTATUS status = STATUS_SUCCESS;
+            SIZE_T available;
+            BYTE vprot;
+            sigset_t sigset;
+
+            server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+            vprot = get_memory_access_vprot( (void *)(cursor - 1), &available, NULL, &cache );
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            if (vprot & VPROT_GUARD)
+            {
+                EXCEPTION_RECORD rec = {0};
+
+                rec.NumberParameters = 2;
+                rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+                rec.ExceptionInformation[1] = cursor - 1;
+                status = virtual_handle_fault( get_thread_data(), &rec,
+                                                __builtin_frame_address(0) );
+                if (status) return status;
+                continue;
+            }
+            if (enable_write_exceptions && (vprot & VPROT_WRITEWATCH) &&
+                is_vprot_exec_write( vprot ) && !get_thread_data()->allow_writes)
+                return STATUS_IN_PAGE_ERROR;
+            if (!(get_unix_prot( vprot & ~VPROT_WRITEWATCH ) & PROT_WRITE))
+                return STATUS_ACCESS_VIOLATION;
+            cursor = max( page, start );
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS wow64_faulting_write_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!dst || !src) return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_prepare_faulting_write_user( dst, size ))) return status;
+
+    /* The checked copy takes virtual_mutex once and only publishes after the
+     * complete frame has passed logical protection validation. */
+    return virtual_copy_to_user( dst, src, size );
+}
+
+
+/***********************************************************************
+ *           virtual_faulting_copy_to_user
+ *
+ * Preserve the fault behavior of a direct current-process user store.
+ * Native I/O preflight paths use virtual_copy_to_user() instead; this
+ * variant is for fixed Unix-call outputs that the old code dereferenced.
+ */
+NTSTATUS virtual_faulting_copy_to_user( void *dst, const void *src, SIZE_T size )
+{
+    return wow64_faulting_write_user( dst, src, size );
+}
+
+
+static NTSTATUS wow64_atomic_write_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!dst || !src) return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_prepare_faulting_write_user( dst, size ))) return status;
+
+    /* Unlike an ordinary direct thunk copy, callers of this operation own a
+     * newly-created handle/object that must be rolled back on failure.  The
+     * uninterrupted helper validates the complete range and stores it under a
+     * single virtual-lock interval on both high-shadow and low-identity paths. */
+    status = virtual_uninterrupted_write_memory( dst, src, size );
+    return status ? STATUS_ACCESS_VIOLATION : STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_guest32_to_host  (ntdll.so)
+ */
+static BOOL get_current_wow64_user_model( BOOL *shadow )
+{
+#ifdef _WIN64
+    WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
+    ULONG_PTR address = (ULONG_PTR)wow_teb;
+
+    if (!wow_teb) return FALSE;
+    *shadow = address >= WINE_LOW_VA_SHADOW_BASE &&
+              address - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE;
+#else
+    *shadow = FALSE;
+#endif
+    return TRUE;
+}
+
+
+static BOOL is_current_wow64_user_range( const void *ptr, SIZE_T size, BOOL shadow )
+{
+    ULONG_PTR address = (ULONG_PTR)ptr;
+
+    if (!size) return TRUE;
+    if (!ptr) return FALSE;
+    if (shadow)
+        return size <= WINE_LOW_VA_SHADOW_SIZE &&
+               address >= WINE_LOW_VA_SHADOW_BASE &&
+               address - WINE_LOW_VA_SHADOW_BASE <= WINE_LOW_VA_SHADOW_SIZE - size;
+    return address <= MAXDWORD && size <= 0x100000000ull - address;
+}
+
+
+NTSTATUS ntdll_wow64_guest32_to_host( ULONG address, void **host )
+{
+    BOOL shadow;
+
+    if (!host) return STATUS_INVALID_PARAMETER;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    *host = !address ? NULL : shadow ?
+            (void *)(ULONG_PTR)(WINE_LOW_VA_SHADOW_BASE + address) :
+            (void *)(ULONG_PTR)address;
+    return STATUS_SUCCESS;
+}
+
+
+/* Convert a current-process WoW64 host pointer back to its canonical 32-bit
+ * address.  The active paired TEB is authoritative: identity callers may not
+ * smuggle shadow pointers and translated callers may not smuggle low host
+ * pointers into a native Unix-library call context. */
+NTSTATUS virtual_wow64_host_to_guest32( const void *host, SIZE_T size, ULONG *guest )
+{
+    ULONG_PTR address = (ULONG_PTR)host;
+    BOOL shadow;
+
+    if (!guest) return STATUS_INVALID_PARAMETER;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    if (!size)
+    {
+        *guest = 0;
+        return STATUS_SUCCESS;
+    }
+    if (!is_current_wow64_user_range( host, size, shadow ))
+        return STATUS_ACCESS_VIOLATION;
+    if (shadow) address -= WINE_LOW_VA_SHADOW_BASE;
+    if (!address) return STATUS_ACCESS_VIOLATION;
+    *guest = address;
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_copy_from_user  (ntdll.so)
+ */
+NTSTATUS ntdll_wow64_copy_from_user( void *dst, const void *src, SIZE_T size )
+{
+    BOOL shadow;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    if (!is_current_wow64_user_range( src, size, shadow ))
+        return STATUS_ACCESS_VIOLATION;
+    return virtual_copy_from_user( dst, src, size );
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_copy_to_user  (ntdll.so)
+ */
+NTSTATUS ntdll_wow64_copy_to_user( void *dst, const void *src, SIZE_T size )
+{
+    BOOL shadow;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    if (!is_current_wow64_user_range( dst, size, shadow ))
+        return STATUS_ACCESS_VIOLATION;
+    return virtual_copy_to_user( dst, src, size );
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_faulting_copy_to_user  (ntdll.so)
+ */
+NTSTATUS ntdll_wow64_faulting_copy_to_user( void *dst, const void *src, SIZE_T size )
+{
+    BOOL shadow;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    if (!is_current_wow64_user_range( dst, size, shadow ))
+        return STATUS_ACCESS_VIOLATION;
+    return wow64_faulting_write_user( dst, src, size );
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_atomic_write_user  (ntdll.so)
+ */
+NTSTATUS ntdll_wow64_atomic_write_user( void *dst, const void *src, SIZE_T size )
+{
+    BOOL shadow;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    if (!is_current_wow64_user_range( dst, size, shadow ))
+        return STATUS_ACCESS_VIOLATION;
+    return wow64_atomic_write_user( dst, src, size );
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_probe_user_writev  (ntdll.so)
+ */
+NTSTATUS ntdll_wow64_probe_user_writev(
+    const struct ntdll_wow64_user_write_range *ranges, ULONG count )
+{
+    struct ntdll_wow64_user_write_range local[NTDLL_WOW64_USER_WRITEV_MAX];
+    BOOL has_write_watch = FALSE;
+    BOOL shadow;
+    sigset_t sigset;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG i;
+
+    if (!count) return STATUS_SUCCESS;
+    if (!ranges || count > ARRAY_SIZE(local)) return STATUS_INVALID_PARAMETER;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    memcpy( local, ranges, count * sizeof(*local) );
+
+    for (i = 0; i < count; i++)
+    {
+        if (!local[i].size) continue;
+        if (!is_current_wow64_user_range( local[i].dst, local[i].size, shadow ))
+            return STATUS_ACCESS_VIOLATION;
+        if ((status = wow64_prepare_faulting_write_user( local[i].dst,
+                                                          local[i].size )))
+            return status;
+    }
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    for (i = 0; i < count && !status; i++)
+    {
+        if (!local[i].size) continue;
+        has_write_watch = FALSE;
+        status = validate_write_access( local[i].dst, local[i].size,
+                                        &has_write_watch );
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return status ? STATUS_ACCESS_VIOLATION : STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_atomic_writev  (ntdll.so)
+ *
+ * Validate every destination before opening write-watch backing or storing a
+ * byte.  All stores then run under one virtual_mutex interval, so a concurrent
+ * protection change cannot split ownership publication.  Later overlapping
+ * ranges win, matching native-order scalar publication.
+ */
+NTSTATUS ntdll_wow64_atomic_writev(
+    const struct ntdll_wow64_user_write_range *ranges, ULONG count )
+{
+    struct ntdll_wow64_user_write_range local[NTDLL_WOW64_USER_WRITEV_MAX];
+    BOOL watches[NTDLL_WOW64_USER_WRITEV_MAX] = {0};
+    BOOL delegated = FALSE;
+    BOOL shadow;
+    sigset_t sigset;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG i;
+
+    if (!count) return STATUS_SUCCESS;
+    if (!ranges || count > ARRAY_SIZE(local)) return STATUS_INVALID_PARAMETER;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    memcpy( local, ranges, count * sizeof(*local) );
+
+    for (i = 0; i < count; i++)
+    {
+        if (!local[i].size) continue;
+        if (!local[i].src ||
+            !is_current_wow64_user_range( local[i].dst, local[i].size, shadow ))
+            return STATUS_ACCESS_VIOLATION;
+        if ((status = wow64_prepare_faulting_write_user( local[i].dst,
+                                                          local[i].size )))
+            return status;
+    }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    delegated = wow64_memory_logical_write_fault_is_delegated();
+#endif
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    for (i = 0; i < count && !status; i++)
+    {
+        if (!local[i].size) continue;
+        status = validate_write_access( local[i].dst, local[i].size,
+                                        &watches[i] );
+    }
+    for (i = 0; i < count && !status; i++)
+    {
+        if (!local[i].size) continue;
+        status = check_write_access( local[i].dst, local[i].size, &watches[i] );
+    }
+    if (!status)
+    {
+        for (i = 0; i < count; i++)
+            if (local[i].size) memcpy( local[i].dst, local[i].src, local[i].size );
+    }
+    if (!delegated)
+    {
+        for (i = 0; i < count; i++)
+            if (watches[i])
+                update_write_watches( local[i].dst, local[i].size,
+                                      status ? 0 : local[i].size );
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (status) return STATUS_ACCESS_VIOLATION;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (delegated)
+    {
+        for (i = 0; i < count; i++)
+            if (watches[i])
+                wow64_memory_publish_native_write_or_abort( local[i].dst,
+                                                             local[i].size );
+    }
+#endif
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_probe_user_read  (ntdll.so)
+ */
+NTSTATUS ntdll_wow64_probe_user_read( const void *src, SIZE_T size )
+{
+    BOOL shadow;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    if (!is_current_wow64_user_range( src, size, shadow ))
+        return STATUS_ACCESS_VIOLATION;
+    return wow64_probe_user_read( src, size );
+}
+
+
+/***********************************************************************
+ *           ntdll_wow64_probe_user_write  (ntdll.so)
+ */
+NTSTATUS ntdll_wow64_probe_user_write( void *dst, SIZE_T size )
+{
+    BOOL shadow;
+
+    if (!size) return STATUS_SUCCESS;
+    if (!get_current_wow64_user_model( &shadow )) return STATUS_INVALID_PARAMETER;
+    if (!is_current_wow64_user_range( dst, size, shadow ))
+        return STATUS_ACCESS_VIOLATION;
+    return wow64_probe_user_write( dst, size );
+}
+
+
+NTSTATUS virtual_publish_wow64_ulong_pair( ULONG *dst1, ULONG value1,
+                                           ULONG *dst2, ULONG value2 )
+{
+    BOOL watch1 = FALSE, watch2 = FALSE;
+    BOOL delegated = FALSE;
+    sigset_t sigset;
+    NTSTATUS status;
+
+    if (!dst1 || !dst2) return STATUS_ACCESS_VIOLATION;
+    if ((status = wow64_prepare_faulting_write_user( dst1, sizeof(*dst1) ))) return status;
+    if ((status = wow64_prepare_faulting_write_user( dst2, sizeof(*dst2) ))) return status;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((overlaps_wow64_shadow( dst1, sizeof(*dst1) ) &&
+         !is_inside_wow64_shadow( dst1, sizeof(*dst1) )) ||
+        (overlaps_wow64_shadow( dst2, sizeof(*dst2) ) &&
+         !is_inside_wow64_shadow( dst2, sizeof(*dst2) )))
+        return STATUS_ACCESS_VIOLATION;
+    delegated = wow64_memory_logical_write_fault_is_delegated();
+#endif
+
+    /* Validate both cells before either store on every host.  This is a cold
+     * ownership-publication path; taking virtual_mutex also prevents a second
+     * thread from reprotecting one cell between validation and publication. */
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    status = check_write_access( dst1, sizeof(*dst1), &watch1 );
+    if (!status) status = check_write_access( dst2, sizeof(*dst2), &watch2 );
+    if (!status)
+    {
+        memcpy( dst1, &value1, sizeof(value1) );
+        memcpy( dst2, &value2, sizeof(value2) );
+    }
+    if (watch1 && !delegated)
+        update_write_watches( dst1, sizeof(*dst1), status ? 0 : sizeof(*dst1) );
+    if (watch2 && !delegated)
+        update_write_watches( dst2, sizeof(*dst2), status ? 0 : sizeof(*dst2) );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (status) return STATUS_ACCESS_VIOLATION;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Provider write-fault state may remain conservatively armed between the
+     * native stores and these short publications; it never widens guest access. */
+    if (watch1 && delegated)
+        wow64_memory_publish_native_write_or_abort( dst1, sizeof(*dst1) );
+    if (watch2 && delegated && dst2 != dst1)
+        wow64_memory_publish_native_write_or_abort( dst2, sizeof(*dst2) );
+#endif
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           virtual_run_wow64_non_mz_create_process
+ *
+ * A successful Unix-image launch cannot be rolled back after the detached
+ * grandchild has exec'd.  Keep the three deterministic WoW64 outputs stable
+ * under virtual_mutex, run the native launch, and publish them only if the
+ * launch succeeds.  This is deliberately a cold, process-creation-only path;
+ * holding the VM lock avoids a preflight/reprotect race without weakening the
+ * ordinary syscall fast paths.
+ */
+NTSTATUS virtual_run_wow64_non_mz_create_process(
+    const struct wine_wow64_create_user_process_params *params,
+    NTSTATUS (*operation)(void *context), void *context )
+{
+    ULONG *process_handle = (void *)(ULONG_PTR)params->guest_process_handle;
+    ULONG *thread_handle = (void *)(ULONG_PTR)params->guest_thread_handle;
+    void *create_info = (void *)(ULONG_PTR)params->guest_create_info;
+    const void *create_info_src = (const void *)(ULONG_PTR)params->non_mz_create_info;
+    SIZE_T create_info_size = params->non_mz_create_info_size;
+    BYTE create_info_copy[256];
+    BOOL process_watch = FALSE, thread_watch = FALSE, info_watch = FALSE;
+    BOOL delegated = FALSE;
+    ULONG zero = 0;
+    sigset_t sigset;
+    NTSTATUS status;
+
+    if (!operation || !process_handle || !thread_handle || !create_info ||
+        !create_info_src || !create_info_size || create_info_size > sizeof(create_info_copy))
+        return STATUS_INVALID_PARAMETER;
+    if ((status = virtual_copy_from_user( create_info_copy, create_info_src,
+                                          create_info_size )))
+        return status;
+    if ((status = wow64_prepare_faulting_write_user( create_info, create_info_size )))
+        return status;
+    if ((status = wow64_prepare_faulting_write_user( process_handle,
+                                                      sizeof(*process_handle) )))
+        return status;
+    if ((status = wow64_prepare_faulting_write_user( thread_handle,
+                                                      sizeof(*thread_handle) )))
+        return status;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((overlaps_wow64_shadow( create_info, create_info_size ) &&
+         !is_inside_wow64_shadow( create_info, create_info_size )) ||
+        (overlaps_wow64_shadow( process_handle, sizeof(*process_handle) ) &&
+         !is_inside_wow64_shadow( process_handle, sizeof(*process_handle) )) ||
+        (overlaps_wow64_shadow( thread_handle, sizeof(*thread_handle) ) &&
+         !is_inside_wow64_shadow( thread_handle, sizeof(*thread_handle) )))
+        return STATUS_ACCESS_VIOLATION;
+    delegated = wow64_memory_logical_write_fault_is_delegated();
+#endif
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    status = validate_write_access( create_info, create_info_size, &info_watch );
+    if (!status)
+        status = validate_write_access( process_handle, sizeof(*process_handle),
+                                        &process_watch );
+    if (!status)
+        status = validate_write_access( thread_handle, sizeof(*thread_handle),
+                                        &thread_watch );
+    if (status)
+    {
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    status = operation( context );
+    if (!status)
+    {
+        /* Protection cannot change while virtual_mutex is held.  A failure to
+         * expose a previously validated write-watch page after the process has
+         * launched is an unrecoverable host/provider invariant violation. */
+        if (check_write_access( create_info, create_info_size, &info_watch ) ||
+            check_write_access( process_handle, sizeof(*process_handle),
+                                &process_watch ) ||
+            check_write_access( thread_handle, sizeof(*thread_handle),
+                                &thread_watch ))
+            abort_process( STATUS_ACCESS_DENIED );
+        memcpy( create_info, create_info_copy, create_info_size );
+        memcpy( process_handle, &zero, sizeof(zero) );
+        memcpy( thread_handle, &zero, sizeof(zero) );
+    }
+    if (info_watch && !delegated)
+        update_write_watches( create_info, create_info_size,
+                              status ? 0 : create_info_size );
+    if (process_watch && !delegated)
+        update_write_watches( process_handle, sizeof(*process_handle),
+                              status ? 0 : sizeof(*process_handle) );
+    if (thread_watch && !delegated)
+        update_write_watches( thread_handle, sizeof(*thread_handle),
+                              status ? 0 : sizeof(*thread_handle) );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (!status && delegated)
+    {
+        if (info_watch)
+            wow64_memory_publish_native_write_or_abort( create_info,
+                                                        create_info_size );
+        if (process_watch)
+            wow64_memory_publish_native_write_or_abort( process_handle,
+                                                        sizeof(*process_handle) );
+        if (thread_watch && thread_handle != process_handle)
+            wow64_memory_publish_native_write_or_abort( thread_handle,
+                                                        sizeof(*thread_handle) );
+    }
+#endif
+    return status;
+}
+
+
+static NTSTATUS wow64_store_release_long( LONG *dst, LONG value )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( dst, sizeof(*dst) ))
+    {
+        struct wow64_memory_transaction transaction;
+        BOOL has_write_watch = FALSE;
+        sigset_t sigset;
+        NTSTATUS status, snapshot_status;
+        void *capture_base;
+        SIZE_T capture_size;
+        BOOL delegated;
+        BOOL stored = FALSE;
+
+        if (!is_inside_wow64_shadow( dst, sizeof(*dst) ) ||
+            ((ULONG_PTR)dst & (__alignof__(*dst) - 1)))
+            return STATUS_ACCESS_VIOLATION;
+        capture_base = ROUND_ADDR( dst, page_mask );
+        capture_size = ROUND_SIZE( dst, sizeof(*dst), page_mask );
+        delegated = wow64_memory_logical_write_fault_is_delegated();
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        status = check_write_access( dst, sizeof(*dst), &has_write_watch );
+        if (status || !has_write_watch || !delegated)
+        {
+            if (!status)
+            {
+                __atomic_store_n( dst, value, __ATOMIC_RELEASE );
+                if (has_write_watch)
+                    update_write_watches( dst, sizeof(*dst), sizeof(*dst) );
+            }
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            return status ? STATUS_ACCESS_VIOLATION : STATUS_SUCCESS;
+        }
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+        status = wow64_memory_begin_transaction( &transaction, TRUE,
+                    WINE_WOW64_MEMORY_PROTECT, capture_base, capture_size, NULL );
+        if (status) return status;
+        has_write_watch = FALSE;
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        status = check_write_access( dst, sizeof(*dst), &has_write_watch );
+        if (!status)
+        {
+            __atomic_store_n( dst, value, __ATOMIC_RELEASE );
+            stored = TRUE;
+        }
+        if (!status && has_write_watch)
+        {
+            set_page_vprot_bits( capture_base, capture_size, 0, VPROT_WRITEWATCH );
+            if (mprotect_memory_access_range( capture_base, capture_size, 0, 0 ))
+                status = STATUS_ACCESS_DENIED;
+        }
+        wow64_memory_capture_transaction( &transaction, status, capture_base,
+                                           capture_size, NULL );
+        snapshot_status = transaction.event.snapshot_status;
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        wow64_memory_complete_transaction( &transaction );
+        if (stored && (status || snapshot_status))
+            abort_process( status ? status : snapshot_status );
+        if (!status) status = snapshot_status;
+        return status ? STATUS_ACCESS_VIOLATION : STATUS_SUCCESS;
+    }
+#endif
+    {
+        NTSTATUS status = STATUS_SUCCESS;
+
+        __TRY
+        {
+            __atomic_store_n( dst, value, __ATOMIC_RELEASE );
+        }
+        __EXCEPT
+        {
+            status = STATUS_ACCESS_VIOLATION;
+        }
+        __ENDTRY
+        return status;
+    }
+}
+
+
+/***********************************************************************
+ *           virtual_publish_wow64_iosb
+ *
+ * Publish Information and then Status with release ordering as one checked
+ * logical write.  This prevents a 16K host mapping from bypassing a protected
+ * 4K translated lane and prevents a protection race between the two fields.
+ */
+NTSTATUS virtual_publish_wow64_iosb( IO_STATUS_BLOCK32 *dst, NTSTATUS status,
+                                     ULONG information )
+{
+    NTSTATUS ret = STATUS_SUCCESS;
+
+    if (!dst) return STATUS_ACCESS_VIOLATION;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (overlaps_wow64_shadow( dst, sizeof(*dst) ))
+    {
+        struct wow64_memory_transaction transaction;
+        BOOL has_write_watch = FALSE;
+        sigset_t sigset;
+        NTSTATUS snapshot_status;
+        void *capture_base;
+        SIZE_T capture_size;
+        BOOL delegated;
+        BOOL stored = FALSE;
+
+        if (!is_inside_wow64_shadow( dst, sizeof(*dst) ) ||
+            ((ULONG_PTR)dst & (__alignof__(*dst) - 1)))
+            return STATUS_ACCESS_VIOLATION;
+        capture_base = ROUND_ADDR( dst, page_mask );
+        capture_size = ROUND_SIZE( dst, sizeof(*dst), page_mask );
+        delegated = wow64_memory_logical_write_fault_is_delegated();
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        ret = check_write_access( dst, sizeof(*dst), &has_write_watch );
+        if (ret || !has_write_watch || !delegated)
+        {
+            if (!ret)
+            {
+                dst->Information = information;
+                __atomic_store_n( &dst->Status, status, __ATOMIC_RELEASE );
+                if (has_write_watch)
+                    update_write_watches( dst, sizeof(*dst), sizeof(*dst) );
+            }
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            return ret ? STATUS_ACCESS_VIOLATION : STATUS_SUCCESS;
+        }
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+        ret = wow64_memory_begin_transaction( &transaction, TRUE,
+                  WINE_WOW64_MEMORY_PROTECT, capture_base, capture_size, NULL );
+        if (ret) return ret;
+        has_write_watch = FALSE;
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        ret = check_write_access( dst, sizeof(*dst), &has_write_watch );
+        if (!ret)
+        {
+            dst->Information = information;
+            __atomic_store_n( &dst->Status, status, __ATOMIC_RELEASE );
+            stored = TRUE;
+        }
+        if (!ret && has_write_watch)
+        {
+            set_page_vprot_bits( capture_base, capture_size, 0, VPROT_WRITEWATCH );
+            if (mprotect_memory_access_range( capture_base, capture_size, 0, 0 ))
+                ret = STATUS_ACCESS_DENIED;
+        }
+        wow64_memory_capture_transaction( &transaction, ret, capture_base,
+                                           capture_size, NULL );
+        snapshot_status = transaction.event.snapshot_status;
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        wow64_memory_complete_transaction( &transaction );
+        if (stored && (ret || snapshot_status))
+            abort_process( ret ? ret : snapshot_status );
+        if (!ret) ret = snapshot_status;
+        return ret ? STATUS_ACCESS_VIOLATION : STATUS_SUCCESS;
+    }
+#endif
+    __TRY
+    {
+        dst->Information = information;
+        __atomic_store_n( &dst->Status, status, __ATOMIC_RELEASE );
+    }
+    __EXCEPT
+    {
+        ret = STATUS_ACCESS_VIOLATION;
+    }
+    __ENDTRY
+    return ret;
+}
+
+
+/***********************************************************************
+ *           unixcall_wow64_user_copy
+ */
+C_ASSERT( sizeof(struct wow64_user_copy_params) == 48 );
+C_ASSERT( offsetof(struct wow64_user_copy_params, dst) == 0 );
+C_ASSERT( offsetof(struct wow64_user_copy_params, src) == 8 );
+C_ASSERT( offsetof(struct wow64_user_copy_params, size) == 16 );
+C_ASSERT( offsetof(struct wow64_user_copy_params, value) == 24 );
+C_ASSERT( offsetof(struct wow64_user_copy_params, operation) == 32 );
+C_ASSERT( offsetof(struct wow64_user_copy_params, status) == 36 );
+C_ASSERT( offsetof(struct wow64_user_copy_params, reserved) == 40 );
+
+NTSTATUS unixcall_wow64_user_copy( void *args )
+{
+    const struct wow64_user_copy_params *params = args;
+    void *dst;
+    const void *src;
+    SIZE_T size;
+
+    if (params->reserved[0] || params->reserved[1]) return STATUS_INVALID_PARAMETER;
+    size = params->size;
+    if ((unsigned long long)size != params->size) return STATUS_INVALID_PARAMETER;
+    dst = (void *)(ULONG_PTR)params->dst;
+    src = (const void *)(ULONG_PTR)params->src;
+
+    switch (params->operation)
+    {
+    case WOW64_USER_COPY_READ:
+        return virtual_copy_from_user( dst, src, size );
+    case WOW64_USER_COPY_WRITE:
+        return virtual_copy_to_user( dst, src, size );
+    case WOW64_USER_COPY_PROBE_READ:
+        if (params->dst) return STATUS_INVALID_PARAMETER;
+        return wow64_probe_user_read( src, size );
+    case WOW64_USER_COPY_PROBE_WRITE:
+        if (params->src) return STATUS_INVALID_PARAMETER;
+        return wow64_probe_user_write( dst, size );
+    case WOW64_USER_COPY_FAULTING_WRITE:
+        return wow64_faulting_write_user( dst, src, size );
+    case WOW64_USER_COPY_STORE_RELEASE_LONG:
+        if (params->size != sizeof(LONG)) return STATUS_INVALID_PARAMETER;
+        return wow64_store_release_long( dst, params->value );
+    case WOW64_USER_COPY_PUBLISH_IOSB:
+        if (params->src || params->size != sizeof(IO_STATUS_BLOCK32) ||
+            params->value > MAXDWORD)
+            return STATUS_INVALID_PARAMETER;
+        return virtual_publish_wow64_iosb( dst, params->status, params->value );
+    case WOW64_USER_COPY_PUBLISH_HANDLE_PAIR:
+        if (params->size != 2 * sizeof(ULONG)) return STATUS_INVALID_PARAMETER;
+        return virtual_publish_wow64_ulong_pair( dst, (ULONG)params->value,
+                                                  (void *)(ULONG_PTR)params->src,
+                                                  (ULONG)(params->value >> 32) );
+    case WOW64_USER_COPY_ATOMIC_WRITE:
+        return wow64_atomic_write_user( dst, src, size );
+    default:
+        return STATUS_INVALID_PARAMETER;
+    }
 }
 
 
@@ -5337,7 +9223,7 @@ void virtual_set_large_address_space(void)
  */
 static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect,
                                          ULONG_PTR limit_low, ULONG_PTR limit_high,
-                                         ULONG_PTR align, ULONG attributes )
+                                         ULONG_PTR align, ULONG attributes, BOOL translated_wow64 )
 {
     void *base;
     unsigned int vprot;
@@ -5346,6 +9232,14 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     sigset_t sigset;
     SIZE_T size = *size_ptr;
     NTSTATUS status = STATUS_SUCCESS;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    struct arm64ec_low_memory_transaction low_transaction;
+    void *allocation_base = NULL;
+    void *low_capture_base = NULL;
+    BOOL low_candidate = FALSE, low_input = FALSE, low_new_reserve = FALSE, low_view = FALSE;
+    ULONG operation;
+#endif
 
     /* Round parameters to a page boundary */
 
@@ -5389,9 +9283,43 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     /* Reserve the memory */
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    operation = (type & MEM_RESERVE) ? WINE_WOW64_MEMORY_ALLOCATE :
+                (type & MEM_COMMIT) ? WINE_WOW64_MEMORY_COMMIT :
+                WINE_WOW64_MEMORY_PROTECT;
+    low_candidate = get_arm64ec_low_candidate_range( base, size, &low_capture_base );
+    low_input = low_candidate && (ULONG_PTR)base < WINE_LOW_VA_SHADOW_SIZE;
+    low_new_reserve = low_input && (type & MEM_RESERVE) &&
+                      !(type & MEM_REPLACE_PLACEHOLDER);
+    status = wow64_memory_begin_transaction( &transaction,
+                                              translated_wow64 ||
+                                              (base && is_wow64_shadow_address( base )),
+                                              operation, base, size, NULL );
+    if (status) return status;
+    status = arm64ec_low_memory_begin_transaction(
+        &low_transaction, low_candidate, operation, low_capture_base, size, NULL );
+    if (status)
+    {
+        transaction.event.status = status;
+        wow64_memory_complete_transaction( &transaction );
+        return status;
+    }
+#endif
+
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    if ((type & MEM_RESERVE) || !base)
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (!status && low_input && (view = find_view( low_capture_base, size )) &&
+        (view->protect & VPROT_AMD64_LOW_TRANSLATED))
+    {
+        low_view = TRUE;
+        allocation_base = view->base;
+        if ((type & MEM_RESERVE) || !base) status = STATUS_CONFLICTING_ADDRESSES;
+        else base = low_capture_base;
+    }
+#endif
+
+    if (!status && ((type & MEM_RESERVE) || !base))
     {
         if (!(status = get_vprot_flags( protect, &vprot, FALSE )))
         {
@@ -5399,39 +9327,119 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             if (type & MEM_WRITE_WATCH) vprot |= VPROT_WRITEWATCH;
             if (type & MEM_RESERVE_PLACEHOLDER) vprot |= VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
             if (protect & PAGE_NOCACHE) vprot |= SEC_NOCACHE;
+            if (translated_wow64) vprot |= VPROT_WOW64_TRANSLATED;
 
             if (vprot & VPROT_WRITECOPY) status = STATUS_INVALID_PAGE_PROTECTION;
+#if defined(__APPLE__) && defined(__aarch64__)
+            /* A fresh canonical-low ARM64EC reservation has no usable native
+             * backing on Darwin.  Only establish it in the high shadow after
+             * a provider has synchronously accepted authoritative LOW
+             * ownership; otherwise fail closed instead of returning an
+             * inaccessible low host mapping. */
+            else if (low_new_reserve && !arm64ec_low_memory_observer_is_required())
+                status = STATUS_NOT_SUPPORTED;
+#endif
             else if (is_dos_memory) status = allocate_dos_memory( &view, vprot );
-            else status = map_view( &view, base, size, type, vprot, limit_low, limit_high,
-                                    align ? align - 1 : granularity_mask );
+            else
+            {
+#if defined(__APPLE__) && defined(__aarch64__)
+                if (low_new_reserve)
+                {
+                    base = low_capture_base;
+                    vprot |= VPROT_AMD64_LOW_TRANSLATED;
+                }
+#endif
+                status = map_view( &view, base, size, type, vprot, limit_low, limit_high,
+                                   align ? align - 1 : granularity_mask );
+            }
 
             if (status == STATUS_SUCCESS)
             {
                 base = view->base;
+#if defined(__APPLE__) && defined(__aarch64__)
+                if (view->protect & VPROT_WOW64_TRANSLATED) allocation_base = view->base;
+                if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
+                {
+                    low_view = TRUE;
+                    allocation_base = view->base;
+                }
+#endif
                 if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
             }
         }
     }
-    else if (type & MEM_RESET)
+    else if (!status && (type & MEM_RESET))
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
-        else madvise( base, size, MADV_DONTNEED );
-    }
-    else  /* commit the pages */
-    {
-        if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
-        else if (view->protect & SEC_FILE) status = STATUS_ALREADY_COMMITTED;
-        else if (view->protect & VPROT_FREE_PLACEHOLDER) status = STATUS_CONFLICTING_ADDRESSES;
-        else if (!(status = set_protection( view, base, size, protect )) && (view->protect & SEC_RESERVE))
+        else
         {
-            SERVER_START_REQ( add_mapping_committed_range )
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
             {
-                req->base   = wine_server_client_ptr( view->base );
-                req->offset = (char *)base - (char *)view->base;
-                req->size   = size;
-                wine_server_call( req );
+                low_view = TRUE;
+                allocation_base = view->base;
             }
-            SERVER_END_REQ;
+            if (view->protect & VPROT_WOW64_TRANSLATED) allocation_base = view->base;
+#endif
+            madvise( base, size, MADV_DONTNEED );
+        }
+    }
+    else if (!status)  /* commit the pages */
+    {
+        if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
+        else
+        {
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
+            {
+                low_view = TRUE;
+                allocation_base = view->base;
+            }
+            if (view->protect & VPROT_WOW64_TRANSLATED) allocation_base = view->base;
+#endif
+            if (view->protect & SEC_FILE) status = STATUS_ALREADY_COMMITTED;
+            else if (view->protect & VPROT_FREE_PLACEHOLDER) status = STATUS_CONFLICTING_ADDRESSES;
+            else if (view->protect & SEC_RESERVE)
+            {
+                SIZE_T page_count = size >> page_shift;
+                BYTE *old_vprot;
+
+                if (!(old_vprot = malloc( page_count ))) status = STATUS_NO_MEMORY;
+                else
+                {
+                    SIZE_T i, run_start;
+                    BYTE run_vprot;
+
+                    for (i = 0; i < page_count; i++)
+                        old_vprot[i] = get_page_vprot( (char *)base + i * page_size );
+                    if (!(status = set_protection( view, base, size, protect )))
+                    {
+                        SERVER_START_REQ( add_mapping_committed_range )
+                        {
+                            req->base   = wine_server_client_ptr( view->base );
+                            req->offset = (char *)base - (char *)view->base;
+                            req->size   = size;
+                            status = wine_server_call( req );
+                        }
+                        SERVER_END_REQ;
+                    }
+                    if (status)
+                    {
+                        for (run_start = 0; run_start < page_count;)
+                        {
+                            run_vprot = old_vprot[run_start];
+                            for (i = run_start + 1;
+                                 i < page_count && old_vprot[i] == run_vprot; i++);
+                            set_page_vprot( (char *)base + run_start * page_size,
+                                            (i - run_start) * page_size, run_vprot );
+                            run_start = i;
+                        }
+                        mprotect_range( base, size, 0, 0 );
+                    }
+                    free( old_vprot );
+                }
+            }
+            else status = set_protection( view, base, size, protect );
         }
     }
 
@@ -5443,11 +9451,33 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (low_candidate)
+        arm64ec_low_memory_capture_transaction(
+            &low_transaction, status, low_capture_base, size,
+            low_view ? allocation_base : NULL );
+    if (!allocation_base && status == STATUS_SUCCESS && translated_wow64 &&
+        operation == WINE_WOW64_MEMORY_ALLOCATE)
+        allocation_base = base;
+    if (base && is_inside_wow64_shadow( base, size ))
+        wow64_memory_capture_transaction( &transaction, status, base, size, allocation_base );
+    else
+        wow64_memory_capture_transaction( &transaction, status, NULL, 0, allocation_base );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+    arm64ec_low_memory_complete_transaction( &low_transaction );
+#endif
 
     if (status == STATUS_SUCCESS)
     {
-        *ret = base;
+        *ret =
+#if defined(__APPLE__) && defined(__aarch64__)
+            low_input && low_view ? (char *)base - WINE_LOW_VA_SHADOW_BASE :
+#endif
+            base;
         *size_ptr = size;
     }
     else if (status == STATUS_NO_MEMORY)
@@ -5455,6 +9485,25 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     return status;
 }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+static NTSTATUS allocate_wow64_shadow_memory( void **address, SIZE_T *size,
+                                              ULONG type, ULONG protect )
+{
+    ULONG_PTR limit_low = 0, limit_high = 0;
+
+    if (!*address)
+    {
+        ULONG_PTR wow_limit = get_wow_user_space_limit();
+
+        if (!wow_limit) wow_limit = limit_2g;
+        limit_low = WINE_LOW_VA_SHADOW_BASE + 0x10000;
+        limit_high = WINE_LOW_VA_SHADOW_BASE + wow_limit - 1;
+    }
+    return allocate_virtual_memory( address, size, type, protect, limit_low, limit_high,
+                                    0, 0, TRUE );
+}
+#endif
 
 
 /***********************************************************************
@@ -5512,13 +9561,14 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
     else
         limit = 0;
 
-    return allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+    return allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0, FALSE );
 }
 
 
 static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, ULONG count,
                                      ULONG_PTR *limit_low, ULONG_PTR *limit_high, ULONG_PTR *align,
-                                     ULONG *attributes, USHORT *machine )
+                                     ULONG *attributes, USHORT *machine, BOOL *translated_wow64,
+                                     SIZE_T *map_commit_size )
 {
     ULONG i, present = 0;
 
@@ -5532,12 +9582,34 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
 
         switch (parameters[i].Type)
         {
+#if defined(__APPLE__) && defined(__aarch64__)
+        case WINE_MEM_EXTENDED_PARAMETER_WOW64_TRANSLATED:
+            if (!is_wow64()) return STATUS_INVALID_PARAMETER;
+            if (parameters[i].ULong64)
+            {
+                if (!map_commit_size || parameters[i].ULong64 > ~(ULONG)0)
+                    return STATUS_INVALID_PARAMETER;
+                *map_commit_size = parameters[i].ULong64;
+            }
+            *translated_wow64 = TRUE;
+            break;
+#endif
+
         case MemExtendedParameterAddressRequirements:
         {
             MEM_ADDRESS_REQUIREMENTS *r = parameters[i].Pointer;
             ULONG_PTR limit;
 
-            if (is_wow64()) limit = get_wow_user_space_limit();
+            if (is_wow64())
+            {
+                limit = get_wow_user_space_limit();
+#if defined(__APPLE__) && defined(__aarch64__)
+                if ((ULONG_PTR)r->LowestStartingAddress >= WINE_LOW_VA_SHADOW_BASE &&
+                    (ULONG_PTR)r->LowestStartingAddress <
+                        WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE)
+                    limit += WINE_LOW_VA_SHADOW_BASE;
+#endif
+            }
             else limit = (ULONG_PTR)user_space_limit;
 
             if (r->Alignment)
@@ -5611,13 +9683,26 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
     ULONG attributes = 0;
     USHORT machine = 0;
     unsigned int status;
+    BOOL translated_wow64 = FALSE;
 
     TRACE( "%p %p %08lx %x %08x %p %u\n",
           process, *ret, *size_ptr, type, protect, parameters, count );
 
     status = get_extended_params( parameters, count, &limit_low, &limit_high,
-                                  &align, &attributes, &machine );
+                                  &align, &attributes, &machine, &translated_wow64, NULL );
     if (status) return status;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (translated_wow64)
+    {
+        if (*ret)
+        {
+            if (!is_wow64_shadow_address( *ret )) return STATUS_INVALID_PARAMETER;
+        }
+        else if (!limits_are_inside_wow64_shadow( limit_low, limit_high ))
+            return STATUS_INVALID_PARAMETER;
+    }
+#endif
 
     if (type & ~type_mask) return STATUS_INVALID_PARAMETER;
     if (*ret && (align || limit_low || limit_high)) return STATUS_INVALID_PARAMETER;
@@ -5639,6 +9724,10 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         call.virtual_alloc_ex.op_type      = type;
         call.virtual_alloc_ex.prot         = protect;
         call.virtual_alloc_ex.attributes   = attributes;
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (translated_wow64)
+            call.virtual_alloc_ex.wine_flags |= WINE_APC_MEMORY_WOW64_TRANSLATED;
+#endif
         status = server_queue_process_apc( process, &call, &result );
         if (status != STATUS_SUCCESS) return status;
 
@@ -5651,7 +9740,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
     }
 
     return allocate_virtual_memory( ret, size_ptr, type, protect,
-                                    limit_low, limit_high, align, attributes );
+                                    limit_low, limit_high, align, attributes, translated_wow64 );
 }
 
 
@@ -5661,12 +9750,22 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
  */
 NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
 {
-    struct file_view *view;
+    struct file_view *view = NULL;
     char *base;
     sigset_t sigset;
     unsigned int status = STATUS_SUCCESS;
     LPVOID addr = *addr_ptr;
     SIZE_T size = *size_ptr;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    struct arm64ec_low_memory_transaction low_transaction;
+    void *allocation_base = NULL;
+    char *capture_base;
+    SIZE_T capture_size;
+    void *low_capture_base = NULL;
+    SIZE_T low_capture_size;
+    BOOL low_candidate, low_input, low_view = FALSE;
+#endif
 
     TRACE("%p %p %08lx %x\n", process, addr, size, type );
 
@@ -5697,6 +9796,45 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     if (size) size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    low_candidate = get_arm64ec_low_candidate_range( base, size, &low_capture_base );
+    low_input = low_candidate && (ULONG_PTR)base < WINE_LOW_VA_SHADOW_SIZE;
+    low_capture_size = size;
+    if ((type & MEM_COALESCE_PLACEHOLDERS) && overlaps_wow64_shadow( base, size ))
+    {
+        ULONG_PTR request_start = (ULONG_PTR)base;
+        ULONG_PTR shadow_end = WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE;
+        ULONG_PTR start = max( request_start, (ULONG_PTR)WINE_LOW_VA_SHADOW_BASE );
+        ULONG_PTR end = size > ~(ULONG_PTR)0 - request_start
+                        ? shadow_end : min( request_start + size, shadow_end );
+
+        capture_base = (char *)start;
+        capture_size = end - start;
+    }
+    else
+    {
+        capture_base = base;
+        capture_size = size;
+    }
+    status = wow64_memory_begin_transaction(
+        &transaction, base && (is_wow64_shadow_address( base ) ||
+                               ((type & MEM_COALESCE_PLACEHOLDERS) &&
+                                overlaps_wow64_shadow( base, size ))),
+        type == MEM_DECOMMIT ? WINE_WOW64_MEMORY_DECOMMIT : WINE_WOW64_MEMORY_RELEASE,
+        capture_base, capture_size, NULL );
+    if (status) return status;
+    status = arm64ec_low_memory_begin_transaction(
+        &low_transaction, low_candidate,
+        type == MEM_DECOMMIT ? WINE_WOW64_MEMORY_DECOMMIT : WINE_WOW64_MEMORY_RELEASE,
+        low_capture_base, low_capture_size, NULL );
+    if (status)
+    {
+        transaction.event.status = status;
+        wow64_memory_complete_transaction( &transaction );
+        return status;
+    }
+#endif
+
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     /* avoid freeing the DOS area when a broken app passes a NULL pointer */
@@ -5709,40 +9847,99 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 #endif
         status = STATUS_INVALID_PARAMETER;
     }
-    else if (!(view = find_view( base, 0 ))) status = STATUS_MEMORY_NOT_ALLOCATED;
-    else if (!is_view_valloc( view )) status = STATUS_INVALID_PARAMETER;
-    else if (!size && base != view->base) status = STATUS_FREE_VM_NOT_AT_BASE;
-    else if ((char *)view->base + view->size - base < size && !(type & MEM_COALESCE_PLACEHOLDERS))
-             status = STATUS_UNABLE_TO_FREE_VM;
-    else switch (type)
+    else
     {
-    case MEM_DECOMMIT:
-        status = decommit_pages( view, base, size );
-        break;
-    case MEM_RELEASE:
-        if (!size) size = view->size;
-        status = free_pages( view, base, size );
-        break;
-    case MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER:
-        status = free_pages_preserve_placeholder( view, base, size );
-        break;
-    case MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS:
-        status = coalesce_placeholders( view, base, size );
-        break;
-    case MEM_COALESCE_PLACEHOLDERS:
-        status = STATUS_INVALID_PARAMETER_4;
-        break;
-    default:
-        status = STATUS_INVALID_PARAMETER;
-        break;
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (low_input && (view = find_view( low_capture_base, 0 )) &&
+            (view->protect & VPROT_AMD64_LOW_TRANSLATED))
+        {
+            base = low_capture_base;
+            low_view = TRUE;
+        }
+        else view = find_view( base, 0 );
+#else
+        view = find_view( base, 0 );
+#endif
+        if (!view) status = STATUS_MEMORY_NOT_ALLOCATED;
+    }
+    if (view)
+    {
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (low_view || (view->protect & VPROT_AMD64_LOW_TRANSLATED))
+        {
+            low_view = TRUE;
+            allocation_base = view->base;
+            if (!low_capture_size)
+            {
+                low_capture_base = view->base;
+                low_capture_size = view->size;
+            }
+        }
+        if (view->protect & VPROT_WOW64_TRANSLATED)
+        {
+            allocation_base = view->base;
+            if (!capture_size)
+            {
+                capture_base = view->base;
+                capture_size = view->size;
+            }
+        }
+#endif
+        if (!is_view_valloc( view )) status = STATUS_INVALID_PARAMETER;
+        else if (!size && base != view->base) status = STATUS_FREE_VM_NOT_AT_BASE;
+        else if ((char *)view->base + view->size - base < size &&
+                 !(type & MEM_COALESCE_PLACEHOLDERS))
+            status = STATUS_UNABLE_TO_FREE_VM;
+        else switch (type)
+        {
+        case MEM_DECOMMIT:
+            status = decommit_pages( view, base, size );
+            break;
+        case MEM_RELEASE:
+            if (!size) size = view->size;
+            status = free_pages( view, base, size );
+            break;
+        case MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER:
+            status = free_pages_preserve_placeholder( view, base, size );
+            break;
+        case MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS:
+            status = coalesce_placeholders( view, base, size );
+            break;
+        case MEM_COALESCE_PLACEHOLDERS:
+            status = STATUS_INVALID_PARAMETER_4;
+            break;
+        default:
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
     }
 
     if (status == STATUS_SUCCESS)
     {
-        *addr_ptr = base;
+        *addr_ptr =
+#if defined(__APPLE__) && defined(__aarch64__)
+            low_input && low_view ? (char *)base - WINE_LOW_VA_SHADOW_BASE :
+#endif
+            base;
         *size_ptr = size;
     }
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (low_candidate)
+        arm64ec_low_memory_capture_transaction(
+            &low_transaction, status, low_capture_base,
+            low_view ? low_capture_size : 0,
+            low_view ? allocation_base : NULL );
+    if (capture_base && capture_size && is_inside_wow64_shadow( capture_base, capture_size ))
+        wow64_memory_capture_transaction( &transaction, status, capture_base,
+                                           capture_size, allocation_base );
+    else
+        wow64_memory_capture_transaction( &transaction, status, NULL, 0, allocation_base );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+    arm64ec_low_memory_complete_transaction( &low_transaction );
+#endif
     return status;
 }
 
@@ -5762,6 +9959,13 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     SIZE_T size = *size_ptr;
     LPVOID addr = *addr_ptr;
     DWORD old;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    struct arm64ec_low_memory_transaction low_transaction;
+    void *allocation_base = NULL;
+    void *low_capture_base = NULL;
+    BOOL low_candidate, low_input, low_view = FALSE;
+#endif
 
     TRACE("%p %p %08lx %08x\n", process, addr, size, new_prot );
 
@@ -5797,10 +10001,55 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    low_candidate = get_arm64ec_low_candidate_range( base, size, &low_capture_base );
+    low_input = low_candidate && (ULONG_PTR)base < WINE_LOW_VA_SHADOW_SIZE;
+    status = wow64_memory_begin_transaction( &transaction,
+                                              base && is_wow64_shadow_address( base ),
+                                              WINE_WOW64_MEMORY_PROTECT,
+                                              base, size, NULL );
+    if (status)
+    {
+        *old_prot = PAGE_NOACCESS;
+        return status;
+    }
+    status = arm64ec_low_memory_begin_transaction(
+        &low_transaction, low_candidate, WINE_WOW64_MEMORY_PROTECT,
+        low_capture_base, size, NULL );
+    if (status)
+    {
+        transaction.event.status = status;
+        wow64_memory_complete_transaction( &transaction );
+        *old_prot = PAGE_NOACCESS;
+        return status;
+    }
+#endif
+
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    if ((view = find_view( base, size )))
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (low_input && (view = find_view( low_capture_base, size )) &&
+        (view->protect & VPROT_AMD64_LOW_TRANSLATED))
     {
+        base = low_capture_base;
+        low_view = TRUE;
+        allocation_base = view->base;
+    }
+    else view = find_view( base, size );
+#else
+    view = find_view( base, size );
+#endif
+    if (view)
+    {
+#if defined(__APPLE__) && defined(__aarch64__)
+        low_view = low_view || !!(view->protect & VPROT_AMD64_LOW_TRANSLATED);
+        if (low_view)
+        {
+            low_capture_base = base;
+            allocation_base = view->base;
+        }
+        if (view->protect & VPROT_WOW64_TRANSLATED) allocation_base = view->base;
+#endif
         /* Make sure all the pages are committed */
         if (get_committed_size( view, base, size, &vprot, VPROT_COMMITTED ) >= size && (vprot & VPROT_COMMITTED))
         {
@@ -5821,11 +10070,30 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (low_candidate)
+        arm64ec_low_memory_capture_transaction( &low_transaction, status,
+                                                 low_capture_base, size,
+                                                 low_view ? allocation_base : NULL );
+    if (base && size && is_inside_wow64_shadow( base, size ))
+        wow64_memory_capture_transaction( &transaction, status, base, size, allocation_base );
+    else
+        wow64_memory_capture_transaction( &transaction, status, NULL, 0, allocation_base );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+    arm64ec_low_memory_complete_transaction( &low_transaction );
+#endif
 
     if (status == STATUS_SUCCESS)
     {
-        *addr_ptr = base;
+        *addr_ptr =
+#if defined(__APPLE__) && defined(__aarch64__)
+            low_input && low_view ? (char *)base - WINE_LOW_VA_SHADOW_BASE :
+#endif
+            base;
         *size_ptr = size;
         *old_prot = old;
     }
@@ -5914,6 +10182,9 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
     char *base, *alloc_base, *alloc_end;
     struct file_view *view;
     BOOL fake_reserved;
+#if defined(__APPLE__) && defined(__aarch64__)
+    BOOL translated_amd64_low = FALSE;
+#endif
     sigset_t sigset;
 
     base = ROUND_ADDR( addr, page_mask );
@@ -5923,6 +10194,19 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
     /* Find the view containing the address */
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((ULONG_PTR)base < WINE_LOW_VA_SHADOW_SIZE)
+    {
+        char *shadow = base + WINE_LOW_VA_SHADOW_BASE;
+        struct file_view *shadow_view = find_view( shadow, 0 );
+
+        if (shadow_view && (shadow_view->protect & VPROT_AMD64_LOW_TRANSLATED))
+        {
+            base = shadow;
+            translated_amd64_low = TRUE;
+        }
+    }
+#endif
     view = get_memory_region_size( base, &alloc_base, &alloc_end, &fake_reserved );
 
     /* Fill the info structure */
@@ -5962,6 +10246,14 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
         else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) info->Type = MEM_MAPPED;
         else info->Type = MEM_PRIVATE;
     }
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (translated_amd64_low)
+    {
+        info->BaseAddress = (char *)info->BaseAddress - WINE_LOW_VA_SHADOW_BASE;
+        if (info->AllocationBase)
+            info->AllocationBase = (char *)info->AllocationBase - WINE_LOW_VA_SHADOW_BASE;
+    }
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 
     return STATUS_SUCCESS;
@@ -6366,6 +10658,85 @@ static unsigned int get_memory_image_info( HANDLE process, LPCVOID addr, MEMORY_
     return status;
 }
 
+/* Return the canonical Windows address for a host mapping.  Numeric shadow
+ * membership is not sufficient; only the explicit AMD64-low ownership tag
+ * changes the address domain. */
+void *virtual_get_guest_address( const void *host )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct file_view *view;
+    void *guest = (void *)host;
+    sigset_t sigset;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if ((view = find_view( host, 0 )) &&
+        (view->protect & VPROT_AMD64_LOW_TRANSLATED))
+        guest = (char *)host - WINE_LOW_VA_SHADOW_BASE;
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return guest;
+#else
+    return (void *)host;
+#endif
+}
+
+static NTSTATUS query_translated_view_information( HANDLE process, LPCVOID addr,
+                                                   WINE_TRANSLATED_VIEW_INFORMATION *info,
+                                                   SIZE_T len, SIZE_T *res_len )
+{
+    WINE_TRANSLATED_VIEW_INFORMATION local =
+    {
+        .Version = WINE_TRANSLATED_VIEW_INFORMATION_VERSION,
+    };
+    struct file_view *view;
+    void *host = (void *)addr, *region;
+    BYTE vprot;
+    sigset_t sigset;
+
+    if (len != sizeof(local)) return STATUS_INFO_LENGTH_MISMATCH;
+    if (!info) return STATUS_ACCESS_VIOLATION;
+    if (process != NtCurrentProcess()) return STATUS_INVALID_HANDLE;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((ULONG_PTR)addr < WINE_LOW_VA_SHADOW_SIZE)
+    {
+        void *shadow = (char *)addr + WINE_LOW_VA_SHADOW_BASE;
+        struct file_view *shadow_view = find_view( shadow, 0 );
+
+        if (shadow_view && (shadow_view->protect & VPROT_AMD64_LOW_TRANSLATED))
+            host = shadow;
+    }
+#endif
+    if (!(view = find_view( host, 0 )))
+    {
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        return STATUS_NOT_MAPPED_VIEW;
+    }
+
+    region = ROUND_ADDR( host, page_mask );
+    local.GuestBase = region;
+    local.HostBase = region;
+    local.AllocationBase = view->base;
+    local.RegionSize = get_committed_size( view, region,
+                                           (char *)view->base + view->size - (char *)region,
+                                           &vprot, ~VPROT_WRITEWATCH );
+    if (vprot & VPROT_COMMITTED)
+        local.Protect = get_win32_prot( vprot, view->protect );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (view->protect & VPROT_AMD64_LOW_TRANSLATED)
+    {
+        local.Flags = WINE_TRANSLATED_VIEW_AMD64_LOW;
+        local.GuestBase = (char *)region - WINE_LOW_VA_SHADOW_BASE;
+        local.AllocationBase = (char *)view->base - WINE_LOW_VA_SHADOW_BASE;
+    }
+#endif
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    *info = local;
+    if (res_len) *res_len = sizeof(local);
+    return STATUS_SUCCESS;
+}
+
 
 /***********************************************************************
  *             NtQueryVirtualMemory   (NTDLL.@)
@@ -6403,10 +10774,10 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
             if (process == GetCurrentProcess())
             {
                 void *module = (void *)addr;
-                const void *funcs = NULL;
+                unixlib_handle_t dispatch;
 
-                status = load_builtin_unixlib( module, info_class == MemoryWineLoadUnixLibWow64, &funcs );
-                if (!status) *(unixlib_handle_t *)buffer = (UINT_PTR)funcs;
+                status = load_builtin_unixlib( module, info_class == MemoryWineLoadUnixLibWow64, &dispatch );
+                if (!status) *(unixlib_handle_t *)buffer = dispatch;
                 return status;
             }
             return STATUS_INVALID_HANDLE;
@@ -6418,19 +10789,33 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
                 UINT64 res[2];
                 const UNICODE_STRING *name = addr;
                 NTSTATUS (*entry)(void) = NULL;
-                const void *funcs;
+                unixlib_handle_t dispatch;
+                unixlib_module_t token;
+                BOOL dispatch_registered = FALSE;
                 void *handle;
 
+                if (len != sizeof(res[0]) && len != sizeof(res))
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                if (!buffer) return STATUS_ACCESS_VIOLATION;
                 if ((status = load_unixlib_by_name( name, &handle ))) return status;
-                res[0] = (UINT_PTR)handle;
                 if (!(status = get_unixlib_funcs( handle, info_class == MemoryWineLoadUnixLibByNameWow64,
-                                                  &funcs, &entry )))
+                                                  &dispatch, &entry, &dispatch_registered )))
                 {
-                    res[1] = (UINT_PTR)funcs;
+                    res[1] = dispatch;
                     if (entry) status = entry();
                 }
-                if (status) dlclose( handle );
-                else memcpy( buffer, res, min( len, sizeof(res) ));
+                if (!status)
+                    status = create_unixlib_module_token( handle, dispatch,
+                                                          dispatch_registered, &token );
+                if (status)
+                {
+                    if (dispatch_registered) unregister_wow64_unixlib_dispatch( dispatch );
+                    dlclose( handle );
+                    return status;
+                }
+                res[0] = token;
+                status = virtual_copy_to_user( buffer, res, len );
+                if (status) unload_unixlib_module_token( token );
                 return status;
             }
             return STATUS_INVALID_HANDLE;
@@ -6438,11 +10823,69 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
         case MemoryWineUnloadUnixLib:
             if (process == GetCurrentProcess())
             {
-                const unixlib_module_t *handle = addr;
+                unixlib_module_t token;
 
-                if (!dlclose( (void *)(UINT_PTR)*handle )) return STATUS_SUCCESS;
+                if ((status = virtual_copy_from_user( &token, addr, sizeof(token) )))
+                    return status;
+                return unload_unixlib_module_token( token );
             }
             return STATUS_INVALID_HANDLE;
+
+        case MemoryWineWow64TranslatedInformation:
+            if (len != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+            if (process == GetCurrentProcess())
+            {
+                struct file_view *view;
+                sigset_t sigset;
+
+                if (!buffer) return STATUS_ACCESS_VIOLATION;
+                server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+                if (!(view = find_view( addr, 0 ))) status = STATUS_NOT_MAPPED_VIEW;
+                else
+                {
+                    *(ULONG *)buffer = !!(view->protect & VPROT_WOW64_TRANSLATED);
+                    if (res_len) *res_len = sizeof(ULONG);
+                    status = STATUS_SUCCESS;
+                }
+                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+                return status;
+            }
+            return STATUS_INVALID_HANDLE;
+
+        case MemoryWineProcessVmMachineInformation:
+            if (len != sizeof(WINE_PROCESS_VM_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
+            if (!buffer) return STATUS_ACCESS_VIOLATION;
+            SERVER_START_REQ( get_process_vm_machine )
+            {
+                req->handle = wine_server_obj_handle( process );
+                status = wine_server_call( req );
+                if (!status)
+                {
+                    WINE_PROCESS_VM_INFORMATION info =
+                    {
+                        WINE_PROCESS_VM_INFORMATION_VERSION,
+                        sizeof(info),
+                        reply->machine,
+                        reply->flags,
+                        0,
+                    };
+
+                    if ((info.Flags & ~WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED) ||
+                        ((info.Flags & WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED) &&
+                         info.Machine != IMAGE_FILE_MACHINE_I386))
+                        status = STATUS_INVALID_PARAMETER;
+                    else
+                    {
+                        *(WINE_PROCESS_VM_INFORMATION *)buffer = info;
+                        if (res_len) *res_len = sizeof(info);
+                    }
+                }
+            }
+            SERVER_END_REQ;
+            return status;
+
+        case MemoryWineTranslatedViewInformation:
+            return query_translated_view_information( process, addr, buffer, len, res_len );
 
         default:
             FIXME("(%p,%p,info_class=%d,%p,%ld,%p) Unknown information class\n",
@@ -6537,6 +10980,7 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
                                     SECTION_INHERIT inherit, ULONG alloc_type, ULONG protect )
 {
     unsigned int res;
+    ULONG_PTR limit_high;
     SIZE_T mask = granularity_mask;
     LARGE_INTEGER offset;
 
@@ -6588,6 +11032,7 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
         call.map_view.size         = *size_ptr;
         call.map_view.offset       = offset.QuadPart;
         call.map_view.zero_bits    = zero_bits;
+        call.map_view.commit_size  = commit_size;
         call.map_view.alloc_type   = alloc_type;
         call.map_view.prot         = protect;
         res = server_queue_process_apc( process, &call, &result );
@@ -6601,8 +11046,9 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
         return result.map_view.status;
     }
 
-    return virtual_map_section( handle, addr_ptr, 0, get_zero_bits_limit( zero_bits ), commit_size,
-                                offset_ptr, size_ptr, alloc_type, protect, 0 );
+    limit_high = get_zero_bits_limit( zero_bits );
+    return virtual_map_section( handle, addr_ptr, 0, limit_high, commit_size,
+                                offset_ptr, size_ptr, alloc_type, protect, 0, FALSE );
 }
 
 /***********************************************************************
@@ -6618,8 +11064,10 @@ NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr
     ULONG attributes = 0;
     USHORT machine = 0;
     unsigned int status;
+    SIZE_T commit_size = 0;
     SIZE_T mask = granularity_mask;
     LARGE_INTEGER offset;
+    BOOL translated_wow64 = FALSE;
 
     offset.QuadPart = offset_ptr ? offset_ptr->QuadPart : 0;
 
@@ -6627,8 +11075,21 @@ NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr
            handle, process, *addr_ptr, wine_dbgstr_longlong(offset.QuadPart), *size_ptr, alloc_type, protect );
 
     status = get_extended_params( parameters, count, &limit_low, &limit_high,
-                                  &align, &attributes, &machine );
+                                  &align, &attributes, &machine, &translated_wow64, &commit_size );
     if (status) return status;
+    if (commit_size && attributes) return STATUS_INVALID_PARAMETER;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (translated_wow64)
+    {
+        if (*addr_ptr)
+        {
+            if (!is_wow64_shadow_address( *addr_ptr )) return STATUS_INVALID_PARAMETER;
+        }
+        else if (!limits_are_inside_wow64_shadow( limit_low, limit_high ))
+            return STATUS_INVALID_PARAMETER;
+    }
+#endif
 
     if (align) return STATUS_INVALID_PARAMETER;
     if (*addr_ptr && (limit_low || limit_high)) return STATUS_INVALID_PARAMETER;
@@ -6666,6 +11127,13 @@ NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr
         call.map_view_ex.alloc_type   = alloc_type;
         call.map_view_ex.prot         = protect;
         call.map_view_ex.machine      = machine;
+        call.map_view_ex.attributes   = commit_size ? (ULONG)commit_size : attributes;
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (translated_wow64)
+            call.map_view_ex.wine_flags |= WINE_APC_MEMORY_WOW64_TRANSLATED;
+        if (commit_size)
+            call.map_view_ex.wine_flags |= WINE_APC_MEMORY_MAP_COMMIT_SIZE;
+#endif
         status = server_queue_process_apc( process, &call, &result );
         if (status != STATUS_SUCCESS) return status;
 
@@ -6677,8 +11145,8 @@ NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr
         return result.map_view_ex.status;
     }
 
-    return virtual_map_section( handle, addr_ptr, limit_low, limit_high, 0,
-                                offset_ptr, size_ptr, alloc_type, protect, machine );
+    return virtual_map_section( handle, addr_ptr, limit_low, limit_high, commit_size,
+                                offset_ptr, size_ptr, alloc_type, protect, machine, translated_wow64 );
 }
 
 
@@ -6692,6 +11160,16 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
     struct file_view *view;
     unsigned int status = STATUS_NOT_MAPPED_VIEW;
     sigset_t sigset;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    struct arm64ec_low_memory_transaction low_transaction;
+    void *capture_base = NULL;
+    void *allocation_base = NULL;
+    void *low_capture_base = NULL;
+    SIZE_T capture_size = 0;
+    SIZE_T low_capture_size = 0;
+    BOOL low_candidate, low_input, low_view = FALSE;
+#endif
 
     if (process != NtCurrentProcess())
     {
@@ -6708,8 +11186,55 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
         return status;
     }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    low_candidate = get_arm64ec_low_candidate_range( addr, 0, &low_capture_base );
+    low_input = low_candidate && (ULONG_PTR)addr < WINE_LOW_VA_SHADOW_SIZE;
+    status = wow64_memory_begin_transaction( &transaction,
+                                              addr && is_wow64_shadow_address( addr ),
+                                              WINE_WOW64_MEMORY_UNMAP,
+                                              addr, 0, NULL );
+    if (status) return status;
+    status = arm64ec_low_memory_begin_transaction(
+        &low_transaction, low_candidate, WINE_WOW64_MEMORY_UNMAP,
+        low_capture_base, 0, NULL );
+    if (status)
+    {
+        transaction.event.status = status;
+        wow64_memory_complete_transaction( &transaction );
+        return status;
+    }
+    status = STATUS_NOT_MAPPED_VIEW;
+#endif
+
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
-    if (!(view = find_view( addr, 0 )) || is_view_valloc( view )) goto done;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (low_input && (view = find_view( low_capture_base, 0 )) &&
+        (view->protect & VPROT_AMD64_LOW_TRANSLATED))
+    {
+        addr = low_capture_base;
+        low_view = TRUE;
+    }
+    else view = find_view( addr, 0 );
+#else
+    view = find_view( addr, 0 );
+#endif
+    if (!view || is_view_valloc( view )) goto done;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (low_view || (view->protect & VPROT_AMD64_LOW_TRANSLATED))
+    {
+        low_view = TRUE;
+        low_capture_base = view->base;
+        low_capture_size = view->size;
+        allocation_base = view->base;
+    }
+    if (view->protect & VPROT_WOW64_TRANSLATED)
+    {
+        capture_base = view->base;
+        capture_size = view->size;
+        allocation_base = view->base;
+    }
+#endif
 
     if (flags & MEM_PRESERVE_PLACEHOLDER && !(view->protect & VPROT_PLACEHOLDER))
     {
@@ -6724,8 +11249,8 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
         {
             TRACE( "not freeing in-use builtin %p\n", view->base );
             builtin->refcount--;
-            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
-            return STATUS_SUCCESS;
+            status = STATUS_SUCCESS;
+            goto done;
         }
     }
 
@@ -6743,7 +11268,23 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
     }
     else FIXME( "failed to unmap %p %x\n", view->base, status );
 done:
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (low_candidate)
+        arm64ec_low_memory_capture_transaction(
+            &low_transaction, status, low_capture_base,
+            low_view ? low_capture_size : 0,
+            low_view ? allocation_base : NULL );
+    if (capture_base && capture_size)
+        wow64_memory_capture_transaction( &transaction, status, capture_base,
+                                           capture_size, allocation_base );
+    else
+        wow64_memory_capture_transaction( &transaction, status, NULL, 0, allocation_base );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+    arm64ec_low_memory_complete_transaction( &low_transaction );
+#endif
     return status;
 }
 
@@ -6923,6 +11464,11 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
 {
     NTSTATUS status = STATUS_SUCCESS;
     sigset_t sigset;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    NTSTATUS snapshot_status = STATUS_SUCCESS;
+    BOOL candidate;
+#endif
 
     size = ROUND_SIZE( base, size, page_mask );
     base = ROUND_ADDR( base, page_mask );
@@ -6935,6 +11481,14 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
 
     TRACE( "%p %x %p-%p %p %lu\n", process, flags, base, (char *)base + size,
            addresses, *count );
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    candidate = (flags & WRITE_WATCH_FLAG_RESET) && overlaps_wow64_shadow( base, size );
+    status = wow64_memory_begin_transaction( &transaction, candidate,
+                                              WINE_WOW64_MEMORY_PROTECT,
+                                              base, size, base );
+    if (status) return status;
+#endif
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
@@ -6968,7 +11522,18 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
     }
     else status = STATUS_INVALID_PARAMETER;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (candidate)
+    {
+        wow64_memory_capture_transaction( &transaction, status, base, size, base );
+        snapshot_status = transaction.event.snapshot_status;
+    }
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+    if (!status) status = snapshot_status;
+#endif
     return status;
 }
 
@@ -6981,6 +11546,11 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
 {
     NTSTATUS status = STATUS_SUCCESS;
     sigset_t sigset;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct wow64_memory_transaction transaction;
+    NTSTATUS snapshot_status = STATUS_SUCCESS;
+    BOOL candidate;
+#endif
 
     size = ROUND_SIZE( base, size, page_mask );
     base = ROUND_ADDR( base, page_mask );
@@ -6989,6 +11559,14 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
 
     if (!size) return STATUS_INVALID_PARAMETER;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    candidate = overlaps_wow64_shadow( base, size );
+    status = wow64_memory_begin_transaction( &transaction, candidate,
+                                              WINE_WOW64_MEMORY_PROTECT,
+                                              base, size, base );
+    if (status) return status;
+#endif
+
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     if (is_write_watch_range( base, size ))
@@ -6996,7 +11574,18 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
     else
         status = STATUS_INVALID_PARAMETER;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (candidate)
+    {
+        wow64_memory_capture_transaction( &transaction, status, base, size, base );
+        snapshot_status = transaction.event.snapshot_status;
+    }
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    wow64_memory_complete_transaction( &transaction );
+    if (!status) status = snapshot_status;
+#endif
     return status;
 }
 
@@ -7013,6 +11602,12 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
     if (!virtual_check_buffer_for_write( buffer, size ))
     {
         status = STATUS_ACCESS_VIOLATION;
+        size = 0;
+    }
+    else if (process == GetCurrentProcess() &&
+             !virtual_check_wow64_translated_memory_access( addr, size, PROT_READ ))
+    {
+        status = STATUS_PARTIAL_COPY;
         size = 0;
     }
     else if (process == GetCurrentProcess())
@@ -7054,7 +11649,18 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
 {
     unsigned int status;
 
-    if (virtual_check_buffer_for_read( buffer, size ))
+    if (!virtual_check_buffer_for_read( buffer, size ))
+    {
+        status = STATUS_PARTIAL_COPY;
+        size = 0;
+    }
+    else if (process == GetCurrentProcess() &&
+             !virtual_check_wow64_translated_memory_access( addr, size, PROT_WRITE ))
+    {
+        status = STATUS_PARTIAL_COPY;
+        size = 0;
+    }
+    else
     {
         SERVER_START_REQ( write_process_memory )
         {
@@ -7065,11 +11671,6 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
             size = reply->written;
         }
         SERVER_END_REQ;
-    }
-    else
-    {
-        status = STATUS_PARTIAL_COPY;
-        size = 0;
     }
     if (bytes_written) *bytes_written = size;
     return status;
@@ -7153,6 +11754,50 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
     sigset_t sigset;
     NTSTATUS ret = STATUS_SUCCESS;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    for (i = 0; i < count; i++)
+    {
+        void *base = ROUND_ADDR( addresses[i].VirtualAddress, page_mask );
+        SIZE_T size = ROUND_SIZE( addresses[i].VirtualAddress,
+                                  addresses[i].NumberOfBytes, page_mask );
+
+        if (overlaps_wow64_shadow( base, size )) break;
+    }
+    if (i < count)
+    {
+        for (i = 0; i < count; i++)
+        {
+            struct wow64_memory_transaction transaction;
+            void *base = ROUND_ADDR( addresses[i].VirtualAddress, page_mask );
+            SIZE_T size = ROUND_SIZE( addresses[i].VirtualAddress,
+                                      addresses[i].NumberOfBytes, page_mask );
+            struct file_view *view;
+            NTSTATUS snapshot_status = STATUS_SUCCESS;
+            BOOL candidate = overlaps_wow64_shadow( base, size );
+
+            ret = wow64_memory_begin_transaction( &transaction, candidate,
+                                                   WINE_WOW64_MEMORY_PROTECT,
+                                                   base, size, base );
+            if (ret) break;
+            server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+            if (!(view = find_view( base, size ))) ret = STATUS_MEMORY_NOT_ALLOCATED;
+            else if (use_kernel_writewatch) reset_write_watches( base, size );
+            else if (set_page_vprot_exec_write_protect( base, size ))
+                mprotect_range( base, size, 0, 0 );
+            if (candidate)
+            {
+                wow64_memory_capture_transaction( &transaction, ret, base, size, base );
+                snapshot_status = transaction.event.snapshot_status;
+            }
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            wow64_memory_complete_transaction( &transaction );
+            if (!ret) ret = snapshot_status;
+            if (ret) break;
+        }
+        return ret;
+    }
+#endif
+
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     for (i = 0; i < count; i++)
     {
@@ -7213,13 +11858,191 @@ NTSTATUS WINAPI NtSetInformationVirtualMemory( HANDLE process,
 /**********************************************************************
  *           NtFlushInstructionCache  (NTDLL.@)
  */
+#if defined(__APPLE__) && defined(__aarch64__) && defined(HAVE___CLEAR_CACHE)
+/* Flush only physically accessible host-page runs.  Darwin's cache primitive
+ * can signal on PROT_NONE even though a Windows page is logically committed.
+ * virtual_mutex must be held by the caller. */
+static void flush_instruction_cache_accessible_runs( ULONG_PTR start, ULONG_PTR end,
+                                                     BOOL translated )
+{
+    ULONG_PTR page = start & ~host_page_mask;
+    ULONG_PTR run_start = 0, run_end = 0;
+
+    while (page < end)
+    {
+        ULONG_PTR segment_start = max( page, start );
+        ULONG_PTR segment_end = min( page + host_page_size, end );
+        BYTE vprot = translated ? get_translated_host_page_vprot( (void *)page )
+                                : get_host_page_vprot( (void *)page );
+
+        if (get_unix_prot( vprot ) != PROT_NONE)
+        {
+            if (!run_start) run_start = segment_start;
+            run_end = segment_end;
+        }
+        else if (run_start)
+        {
+            __clear_cache( (char *)run_start, (char *)run_end );
+            run_start = run_end = 0;
+        }
+        page += host_page_size;
+    }
+    if (run_start) __clear_cache( (char *)run_start, (char *)run_end );
+}
+
+/* Check one logical page, caching the server's uniform SEC_RESERVE run so a
+ * large flush does not issue one mapping query per 4K page.  virtual_mutex
+ * must be held by the caller. */
+static BOOL is_instruction_cache_page_committed( struct file_view *view, ULONG_PTR page,
+                                                 ULONG_PTR end, ULONG_PTR *cached_end,
+                                                 BOOL *cached_committed )
+{
+    BYTE vprot;
+    SIZE_T run;
+
+    if (!(view->protect & SEC_RESERVE))
+        return !!(get_page_vprot( (void *)page ) & VPROT_COMMITTED);
+    if (page >= *cached_end)
+    {
+        run = get_committed_size( view, (void *)page, end - page,
+                                  &vprot, VPROT_COMMITTED );
+        if (run < page_size || (run & page_mask) || run > end - page)
+        {
+            *cached_end = page;
+            *cached_committed = FALSE;
+            return FALSE;
+        }
+        *cached_end = page + run;
+        *cached_committed = !!(vprot & VPROT_COMMITTED);
+    }
+    return *cached_committed;
+}
+
+static NTSTATUS flush_arm64ec_low_instruction_cache( const void *addr, SIZE_T size )
+{
+    ULONG_PTR guest = (ULONG_PTR)addr;
+    ULONG_PTR host, host_end, guest_end, page, last_page;
+    ULONG_PTR committed_end = 0;
+    struct file_view *view = NULL;
+    sigset_t sigset;
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOL any_low = FALSE, other_translated = FALSE;
+    BOOL translated_valid = TRUE, committed = FALSE;
+
+    /* The caller has already excluded the NULL/zero-length forms. */
+    if (guest >= WINE_LOW_VA_SHADOW_SIZE || size > WINE_LOW_VA_SHADOW_SIZE - guest)
+        return STATUS_ACCESS_VIOLATION;
+    host = WINE_LOW_VA_SHADOW_BASE + guest;
+    host_end = host + size;
+    guest_end = guest + size;
+    page = host & ~page_mask;
+    last_page = (host_end - 1) & ~page_mask;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+
+    /* Scan the entire shadow interval before deciding its address model.  If
+     * any page has LOW ownership, partial translated coverage is an error and
+     * must never fall back to an ordinary mapping at the same guest address. */
+    for (;;)
+    {
+        unsigned int translated_owner;
+
+        if ((!view || page < (ULONG_PTR)view->base ||
+             page + page_size > (ULONG_PTR)view->base + view->size) &&
+            !(view = find_view( (void *)page, page_size )))
+            translated_valid = FALSE;
+        else if ((translated_owner = view->protect & VPROT_SHADOW_TRANSLATED) ==
+                 VPROT_AMD64_LOW_TRANSLATED)
+        {
+            ULONG_PTR view_end = (ULONG_PTR)view->base + view->size;
+
+            any_low = TRUE;
+            if (view->protect & VPROT_SYSTEM)
+                translated_valid = FALSE;
+            else if (translated_valid &&
+                !is_instruction_cache_page_committed(
+                    view, page, min( view_end, last_page + page_size ),
+                    &committed_end, &committed ))
+                translated_valid = FALSE;
+        }
+        else
+        {
+            translated_valid = FALSE;
+            if (translated_owner) other_translated = TRUE;
+        }
+        if (page == last_page) break;
+        page += page_size;
+    }
+
+    if (any_low || other_translated)
+    {
+        if (!any_low || other_translated || !translated_valid)
+            status = STATUS_ACCESS_VIOLATION;
+        else flush_instruction_cache_accessible_runs( host, host_end, TRUE );
+    }
+    else
+    {
+        /* With no translated owner, preserve a genuine low identity mapping.
+         * Numeric low addresses alone never authorize cache maintenance. */
+        view = NULL;
+        committed_end = 0;
+        page = guest & ~page_mask;
+        last_page = (guest_end - 1) & ~page_mask;
+        for (;;)
+        {
+            if (((!view || page < (ULONG_PTR)view->base ||
+                  page + page_size > (ULONG_PTR)view->base + view->size) &&
+                 !(view = find_view( (void *)page, page_size ))) ||
+                (view->protect & (VPROT_SHADOW_TRANSLATED | VPROT_SYSTEM)))
+            {
+                status = STATUS_ACCESS_VIOLATION;
+                break;
+            }
+            if (!is_instruction_cache_page_committed(
+                    view, page,
+                    min( (ULONG_PTR)view->base + view->size,
+                         last_page + page_size ),
+                    &committed_end, &committed ))
+            {
+                status = STATUS_ACCESS_VIOLATION;
+                break;
+            }
+            if (page == last_page) break;
+            page += page_size;
+        }
+        if (!status) flush_instruction_cache_accessible_runs( guest, guest_end, FALSE );
+    }
+
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return status;
+}
+#endif
+
 NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T size )
 {
 #if defined(__x86_64__) || defined(__i386__)
     /* no-op */
 #elif defined(HAVE___CLEAR_CACHE)
-    if (handle == GetCurrentProcess())
+    BOOL current_process = handle == NtCurrentProcess();
+
+    /* A duplicated self handle names the same process as the pseudo handle.
+     * Resolve that identity before deciding whether local cache maintenance is
+     * required; comparison failures retain the historical remote no-op path. */
+    if (!current_process)
+        current_process = !NtCompareObjects( handle, NtCurrentProcess() );
+    if (current_process)
     {
+        /* NULL means the whole process cache.  There is no host byte range to
+         * clear; the ARM64EC wrapper performs the provider-wide TB flush after
+         * this successful syscall. */
+        if (!addr) return STATUS_SUCCESS;
+#if defined(__APPLE__) && defined(__aarch64__)
+        /* The ARM64EC syscall receives a canonical AMD64 address.  Translate
+         * only provider-owned fixed-low ranges here; the PE callback still
+         * observes the original guest address after this syscall returns. */
+        if (is_arm64ec() && addr && size && (ULONG_PTR)addr < WINE_LOW_VA_SHADOW_SIZE)
+            return flush_arm64ec_low_instruction_cache( addr, size );
+#endif
         __clear_cache( (char *)addr, (char *)addr + size );
     }
     else

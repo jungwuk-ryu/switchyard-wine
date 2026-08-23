@@ -5376,6 +5376,82 @@ static void test_CreateRestrictedToken(void)
     CloseHandle(process_token);
 }
 
+static void test_wow64_logical_page_marshalling(void)
+{
+    OBJECT_TYPE_LIST *object_list;
+    TOKEN_GROUPS *groups;
+    GENERIC_MAPPING mapping = {0};
+    SECURITY_DESCRIPTOR sd;
+    UNICODE_STRING empty = {0};
+    ACCESS_MASK granted = 0xdeadbeef;
+    NTSTATUS access_status = 0xdeadbeef, status;
+    BOOLEAN onclose = 0xcc;
+    HANDLE process_token = NULL, *output;
+    DWORD old_protect;
+    GUID *guid;
+    BYTE *memory;
+    BOOL ret;
+
+    if (sizeof(void *) != 4 || strcmp( winetest_platform, "wine" )) return;
+
+    memory = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!memory, "VirtualAlloc failed %lu\n", GetLastError() );
+    if (!memory) return;
+    groups = (TOKEN_GROUPS *)(memory + 0x1000);
+    output = (HANDLE *)(memory + 0x2000);
+    object_list = (OBJECT_TYPE_LIST *)(memory + 0x3000);
+    guid = (GUID *)(memory + 0x3ff8);  /* cross a logical 4K boundary */
+
+    ret = OpenProcessToken( GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &process_token );
+    ok( ret, "OpenProcessToken failed %lu\n", GetLastError() );
+    if (!ret) goto done;
+
+    groups->GroupCount = ~0u;
+    *output = (HANDLE)0xdeadbeef;
+    status = NtFilterToken( process_token, 0, groups, NULL, NULL, output );
+    ok( status == STATUS_INTEGER_OVERFLOW, "invalid group count returned %#lx\n", status );
+    ok( !*output, "invalid group count returned handle %p\n", *output );
+
+    ok( VirtualProtect( output, 0x1000, PAGE_READONLY, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = NtFilterToken( process_token, 0, NULL, NULL, NULL, output );
+    ok( status == STATUS_ACCESS_VIOLATION, "read-only token output returned %#lx\n", status );
+    ok( VirtualProtect( output, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = NtFilterToken( process_token, 0, NULL, NULL, NULL, output );
+    ok( status == STATUS_SUCCESS, "valid token follow-up returned %#lx\n", status );
+    if (!status) CloseHandle( *output );
+
+    ret = InitializeSecurityDescriptor( &sd, SECURITY_DESCRIPTOR_REVISION );
+    ok( ret, "InitializeSecurityDescriptor failed %lu\n", GetLastError() );
+    memset( guid, 0x5a, sizeof(*guid) );
+    object_list->Level = 0;
+    object_list->Sbz = 0;
+    object_list->ObjectType = guid;
+
+    status = NtAccessCheckByTypeAndAuditAlarm( &empty, NULL, &empty, &empty, &sd, NULL, 0,
+                                               AuditEventObjectAccess, 0, object_list, ~0u,
+                                               &mapping, FALSE, &granted, &access_status, &onclose );
+    ok( status == STATUS_INTEGER_OVERFLOW, "invalid object-list count returned %#lx\n", status );
+
+    ok( VirtualProtect( memory + 0x4000, 0x1000, PAGE_NOACCESS, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = NtAccessCheckByTypeAndAuditAlarm( &empty, NULL, &empty, &empty, &sd, NULL, 0,
+                                               AuditEventObjectAccess, 0, object_list, 1,
+                                               &mapping, FALSE, &granted, &access_status, &onclose );
+    ok( status == STATUS_ACCESS_VIOLATION, "protected object GUID returned %#lx\n", status );
+    ok( VirtualProtect( memory + 0x4000, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = NtAccessCheckByTypeAndAuditAlarm( &empty, NULL, &empty, &empty, &sd, NULL, 0,
+                                               AuditEventObjectAccess, 0, object_list, 1,
+                                               &mapping, FALSE, &granted, &access_status, &onclose );
+    ok( status == STATUS_NOT_IMPLEMENTED, "valid object-list follow-up returned %#lx\n", status );
+
+done:
+    if (process_token) CloseHandle( process_token );
+    VirtualFree( memory, 0, MEM_RELEASE );
+}
+
 static void validate_default_security_descriptor(SECURITY_DESCRIPTOR *sd)
 {
     BOOL ret, present, defaulted;
@@ -8775,6 +8851,7 @@ START_TEST(security)
     test_GetUserNameA();
     test_GetUserNameW();
     test_CreateRestrictedToken();
+    test_wow64_logical_page_marshalling();
     test_TokenIntegrityLevel();
     test_default_dacl_owner_group_sid();
     test_AdjustTokenPrivileges();

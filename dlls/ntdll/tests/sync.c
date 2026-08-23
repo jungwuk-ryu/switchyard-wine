@@ -27,9 +27,13 @@
 #include "setjmp.h"
 #include "wine/test.h"
 
+static BOOL     (WINAPI *pGetProcessHandleCount)( HANDLE, DWORD * );
 static NTSTATUS (WINAPI *pNtAlertMultipleThreadByThreadId)( HANDLE *, ULONG, void *, void * );
 static NTSTATUS (WINAPI *pNtAlertThreadByThreadId)( HANDLE );
+static HANDLE   (WINAPI *pDbgUiGetThreadDebugObject)( void );
+static void     (WINAPI *pDbgUiSetThreadDebugObject)( HANDLE );
 static NTSTATUS (WINAPI *pNtClose)( HANDLE );
+static NTSTATUS (WINAPI *pNtCreateDebugObject)( HANDLE *, ACCESS_MASK, OBJECT_ATTRIBUTES *, ULONG );
 static NTSTATUS (WINAPI *pNtCreateEvent) ( PHANDLE, ACCESS_MASK, const OBJECT_ATTRIBUTES *, EVENT_TYPE, BOOLEAN);
 static NTSTATUS (WINAPI *pNtCreateKeyedEvent)( HANDLE *, ACCESS_MASK, const OBJECT_ATTRIBUTES *, ULONG );
 static NTSTATUS (WINAPI *pNtCreateMutant)( HANDLE *, ACCESS_MASK, const OBJECT_ATTRIBUTES *, BOOLEAN );
@@ -50,6 +54,10 @@ static NTSTATUS (WINAPI *pNtSetEvent)( HANDLE, LONG * );
 static NTSTATUS (WINAPI *pNtSetEventBoostPriority)( HANDLE );
 static NTSTATUS (WINAPI *pNtWaitForAlertByThreadId)( void *, const LARGE_INTEGER * );
 static NTSTATUS (WINAPI *pNtWaitForKeyedEvent)( HANDLE, const void *, BOOLEAN, const LARGE_INTEGER * );
+static NTSTATUS (WINAPI *pNtWaitForMultipleObjects)( ULONG, const HANDLE *, WAIT_TYPE, BOOLEAN,
+                                                      const LARGE_INTEGER * );
+static NTSTATUS (WINAPI *pNtWaitForDebugEvent)( HANDLE, BOOLEAN, LARGE_INTEGER *,
+                                                 DBGUI_WAIT_STATE_CHANGE * );
 static BOOLEAN  (WINAPI *pRtlAcquireResourceExclusive)( RTL_RWLOCK *, BOOLEAN );
 static BOOLEAN  (WINAPI *pRtlAcquireResourceShared)( RTL_RWLOCK *, BOOLEAN );
 static void     (WINAPI *pRtlDeleteResource)( RTL_RWLOCK * );
@@ -167,6 +175,274 @@ static void test_event(void)
         "NtQueryEventBoostPriority failed, expected 1, got %ld\n", info.EventState );
 
     pNtClose(event);
+}
+
+static void test_wow64_logical_page_marshalling(void)
+{
+    EVENT_BASIC_INFORMATION info;
+    LARGE_INTEGER timeout;
+    HANDLE events[2] = {0}, *handles;
+    DWORD old_protect;
+    NTSTATUS status;
+    LONG *previous;
+    BYTE *memory;
+
+    if (sizeof(void *) != 4) return;
+    memory = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!memory, "VirtualAlloc failed %lu\n", GetLastError() );
+    if (!memory) return;
+    handles = (HANDLE *)(memory + 0x0ffc);
+    previous = (LONG *)(memory + 0x2000);
+    timeout.QuadPart = 0;
+
+    status = pNtCreateEvent( &events[0], EVENT_ALL_ACCESS, NULL, NotificationEvent, FALSE );
+    ok( status == STATUS_SUCCESS, "NtCreateEvent returned %#lx\n", status );
+    if (status) goto done;
+    status = pNtCreateEvent( &events[1], EVENT_ALL_ACCESS, NULL, NotificationEvent, FALSE );
+    ok( status == STATUS_SUCCESS, "NtCreateEvent returned %#lx\n", status );
+    if (status) goto done;
+    handles[0] = events[0];
+    handles[1] = events[1];
+
+    ok( VirtualProtect( memory + 0x1000, 0x1000, PAGE_NOACCESS, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtWaitForMultipleObjects( 2, handles, WaitAny, FALSE, &timeout );
+    ok( status == STATUS_ACCESS_VIOLATION, "protected handle lane returned %#lx\n", status );
+    status = pNtWaitForMultipleObjects( MAXIMUM_WAIT_OBJECTS + 1, handles, WaitAny, FALSE, &timeout );
+    ok( status == STATUS_INVALID_PARAMETER_1, "invalid count returned %#lx\n", status );
+    ok( VirtualProtect( memory + 0x1000, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtWaitForMultipleObjects( 2, handles, WaitAny, FALSE, &timeout );
+    ok( status == STATUS_TIMEOUT, "valid wait returned %#lx\n", status );
+
+    ok( VirtualProtect( previous, 0x1000, PAGE_READONLY, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtSetEvent( events[0], previous );
+    ok( status == STATUS_ACCESS_VIOLATION, "read-only state output returned %#lx\n", status );
+    memset( &info, 0xcc, sizeof(info) );
+    status = pNtQueryEvent( events[0], EventBasicInformation, &info, sizeof(info), NULL );
+    ok( status == STATUS_SUCCESS, "NtQueryEvent returned %#lx\n", status );
+    ok( !info.EventState, "invalid output changed event state to %ld\n", info.EventState );
+    ok( VirtualProtect( previous, 0x1000, PAGE_READWRITE, &old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+    status = pNtSetEvent( events[0], previous );
+    ok( status == STATUS_SUCCESS, "valid state output returned %#lx\n", status );
+    ok( !*previous, "previous state is %ld\n", *previous );
+
+done:
+    if (events[0]) pNtClose( events[0] );
+    if (events[1]) pNtClose( events[1] );
+    VirtualFree( memory, 0, MEM_RELEASE );
+}
+
+static DWORD WINAPI debug_publish_child_thread( void *arg )
+{
+    Sleep( 500 );
+    return 0;
+}
+
+static void debug_publish_child( int argc, char **argv )
+{
+    HANDLE ready, start, done, thread;
+
+    if (argc != 6) return;
+    ready = ULongToHandle( strtoul( argv[3], NULL, 10 ) );
+    start = ULongToHandle( strtoul( argv[4], NULL, 10 ) );
+    done = ULongToHandle( strtoul( argv[5], NULL, 10 ) );
+
+    SetEvent( ready );
+    if (WaitForSingleObject( start, 5000 ) == WAIT_OBJECT_0)
+    {
+        thread = CreateThread( NULL, 0, debug_publish_child_thread, NULL, 0, NULL );
+        if (thread)
+        {
+            SetEvent( done );
+            WaitForSingleObject( thread, 5000 );
+            CloseHandle( thread );
+        }
+    }
+
+    CloseHandle( done );
+    CloseHandle( start );
+    CloseHandle( ready );
+}
+
+static void close_debug_event_handles( DEBUG_EVENT *event )
+{
+    switch (event->dwDebugEventCode)
+    {
+    case CREATE_THREAD_DEBUG_EVENT:
+        if (event->u.CreateThread.hThread) CloseHandle( event->u.CreateThread.hThread );
+        break;
+    case CREATE_PROCESS_DEBUG_EVENT:
+        if (event->u.CreateProcessInfo.hProcess) CloseHandle( event->u.CreateProcessInfo.hProcess );
+        if (event->u.CreateProcessInfo.hThread) CloseHandle( event->u.CreateProcessInfo.hThread );
+        if (event->u.CreateProcessInfo.hFile &&
+            event->u.CreateProcessInfo.hFile != INVALID_HANDLE_VALUE)
+            CloseHandle( event->u.CreateProcessInfo.hFile );
+        break;
+    case LOAD_DLL_DEBUG_EVENT:
+        if (event->u.LoadDll.hFile && event->u.LoadDll.hFile != INVALID_HANDLE_VALUE)
+            CloseHandle( event->u.LoadDll.hFile );
+        break;
+    default:
+        break;
+    }
+}
+
+static BOOL wait_and_continue_debug_event( DEBUG_EVENT *event, DWORD timeout )
+{
+    BOOL ret;
+
+    ret = WaitForDebugEvent( event, timeout );
+    if (!ret) return FALSE;
+    close_debug_event_handles( event );
+    ret = ContinueDebugEvent( event->dwProcessId, event->dwThreadId, DBG_CONTINUE );
+    ok( ret, "ContinueDebugEvent failed %lu\n", GetLastError() );
+    return ret;
+}
+
+struct debug_publish_params
+{
+    void *state;
+    HANDLE arm;
+    HANDLE start;
+    BOOL protect_ret;
+    DWORD protect_error;
+    DWORD old_protect;
+};
+
+static DWORD WINAPI protect_debug_publish_output( void *arg )
+{
+    struct debug_publish_params *params = arg;
+
+    WaitForSingleObject( params->arm, INFINITE );
+    Sleep( 100 );
+    params->protect_ret = VirtualProtect( params->state, 0x1000, PAGE_READONLY,
+                                          &params->old_protect );
+    params->protect_error = GetLastError();
+    if (params->protect_ret) SetEvent( params->start );
+    return 0;
+}
+
+static void test_wow64_debug_event_publish_failure( char **argv )
+{
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    PROCESS_INFORMATION pi = {0};
+    STARTUPINFOA si = {sizeof(si)};
+    struct debug_publish_params params;
+    OBJECT_ATTRIBUTES attr;
+    DBGUI_WAIT_STATE_CHANGE *state;
+    HANDLE old_debug, debug = NULL, ready = NULL, start = NULL, done = NULL;
+    HANDLE arm = NULL, protect_thread = NULL;
+    LARGE_INTEGER timeout;
+    DEBUG_EVENT event;
+    char cmdline[MAX_PATH * 2];
+    BYTE *memory = NULL;
+    DWORD before = 0, after = 0, wait, i;
+    NTSTATUS status;
+    BOOL ret, got_before = FALSE;
+
+    if (sizeof(void *) != 4 || strcmp( winetest_platform, "wine" )) return;
+    if (!pGetProcessHandleCount || !pNtCreateDebugObject || !pNtWaitForDebugEvent ||
+        !pDbgUiGetThreadDebugObject || !pDbgUiSetThreadDebugObject)
+    {
+        win_skip( "native debug entry points are unavailable\n" );
+        return;
+    }
+
+    ready = CreateEventA( &sa, TRUE, FALSE, NULL );
+    start = CreateEventA( &sa, TRUE, FALSE, NULL );
+    done = CreateEventA( &sa, TRUE, FALSE, NULL );
+    arm = CreateEventA( NULL, TRUE, FALSE, NULL );
+    ok( ready && start && done && arm, "event creation failed %lu\n", GetLastError() );
+    if (!ready || !start || !done || !arm) goto done;
+
+    InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
+    status = pNtCreateDebugObject( &debug, DEBUG_ALL_ACCESS, &attr, 0 );
+    ok( !status, "NtCreateDebugObject failed %#lx\n", status );
+    if (status) goto done;
+    old_debug = pDbgUiGetThreadDebugObject();
+    pDbgUiSetThreadDebugObject( debug );
+
+    sprintf( cmdline, "\"%s\" %s debug_publish %lu %lu %lu", argv[0], argv[1],
+             HandleToULong( ready ), HandleToULong( start ), HandleToULong( done ) );
+    ret = CreateProcessA( NULL, cmdline, NULL, NULL, TRUE, DEBUG_ONLY_THIS_PROCESS,
+                          NULL, NULL, &si, &pi );
+    ok( ret, "CreateProcess failed %lu\n", GetLastError() );
+    if (!ret) goto restore_debug;
+
+    for (i = 0; i < 100 && WaitForSingleObject( ready, 0 ) == WAIT_TIMEOUT; i++)
+    {
+        if (!wait_and_continue_debug_event( &event, 100 ))
+            ok( GetLastError() == ERROR_SEM_TIMEOUT,
+                "WaitForDebugEvent failed %lu\n", GetLastError() );
+    }
+    wait = WaitForSingleObject( ready, 0 );
+    ok( wait == WAIT_OBJECT_0, "debug child did not become ready, wait %lu\n", wait );
+    if (wait != WAIT_OBJECT_0) goto terminate_child;
+
+    memory = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!memory, "VirtualAlloc failed %lu\n", GetLastError() );
+    if (!memory) goto terminate_child;
+    state = (DBGUI_WAIT_STATE_CHANGE *)(memory + 0x2000);
+
+    memset( &params, 0, sizeof(params) );
+    params.state = state;
+    params.arm = arm;
+    params.start = start;
+    protect_thread = CreateThread( NULL, 0, protect_debug_publish_output, &params, 0, NULL );
+    ok( !!protect_thread, "CreateThread failed %lu\n", GetLastError() );
+    if (!protect_thread) goto terminate_child;
+    ret = pGetProcessHandleCount( GetCurrentProcess(), &before );
+    ok( ret, "GetProcessHandleCount failed %lu\n", GetLastError() );
+    got_before = ret;
+
+    SetEvent( arm );
+    timeout.QuadPart = -5 * (LONGLONG)10000000;
+    status = pNtWaitForDebugEvent( debug, FALSE, &timeout, state );
+    wait = WaitForSingleObject( protect_thread, 5000 );
+    ok( wait == WAIT_OBJECT_0, "output protection thread wait returned %lu\n", wait );
+    ok( params.protect_ret, "VirtualProtect failed %lu\n", params.protect_error );
+    ok( status == STATUS_ACCESS_VIOLATION, "protected debug output returned %#lx\n", status );
+    wait = WaitForSingleObject( done, 2000 );
+    ok( wait == WAIT_OBJECT_0, "discarded event left debug child stopped, wait %lu\n", wait );
+
+    ret = pGetProcessHandleCount( GetCurrentProcess(), &after );
+    ok( ret, "GetProcessHandleCount failed %lu\n", GetLastError() );
+    if (ret && got_before)
+        ok( after == before, "debug event leaked handles, count %lu -> %lu\n", before, after );
+    ok( VirtualProtect( state, 0x1000, PAGE_READWRITE, &params.old_protect ),
+        "VirtualProtect failed %lu\n", GetLastError() );
+
+terminate_child:
+    for (i = 0; i < 100 && WaitForSingleObject( pi.hProcess, 0 ) == WAIT_TIMEOUT; i++)
+    {
+        if (!wait_and_continue_debug_event( &event, 100 ))
+            ok( GetLastError() == ERROR_SEM_TIMEOUT,
+                "WaitForDebugEvent failed %lu\n", GetLastError() );
+    }
+    if (WaitForSingleObject( pi.hProcess, 0 ) == WAIT_TIMEOUT)
+    {
+        ok( 0, "debug child did not exit\n" );
+        TerminateProcess( pi.hProcess, 1 );
+        for (i = 0; i < 50 && WaitForSingleObject( pi.hProcess, 0 ) == WAIT_TIMEOUT; i++)
+            wait_and_continue_debug_event( &event, 100 );
+    }
+    if (pi.hThread) CloseHandle( pi.hThread );
+    if (pi.hProcess) CloseHandle( pi.hProcess );
+
+restore_debug:
+    pDbgUiSetThreadDebugObject( old_debug );
+    pNtClose( debug );
+
+done:
+    if (protect_thread) CloseHandle( protect_thread );
+    if (memory) VirtualFree( memory, 0, MEM_RELEASE );
+    if (arm) CloseHandle( arm );
+    if (done) CloseHandle( done );
+    if (start) CloseHandle( start );
+    if (ready) CloseHandle( ready );
 }
 
 static const WCHAR keyed_nameW[] = L"\\BaseNamedObjects\\WineTestEvent";
@@ -1430,16 +1706,25 @@ static void test_barrier(void)
 START_TEST(sync)
 {
     HMODULE module = GetModuleHandleA("ntdll.dll");
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
     char **argv;
     int argc;
 
     argc = winetest_get_mainargs( &argv );
 
-    if (argc > 2) return;
+    if (argc > 2)
+    {
+        if (!strcmp( argv[2], "debug_publish" )) debug_publish_child( argc, argv );
+        return;
+    }
 
+    pGetProcessHandleCount            = (void *)GetProcAddress(kernel32, "GetProcessHandleCount");
+    pDbgUiGetThreadDebugObject       = (void *)GetProcAddress(module, "DbgUiGetThreadDebugObject");
+    pDbgUiSetThreadDebugObject       = (void *)GetProcAddress(module, "DbgUiSetThreadDebugObject");
     pNtAlertMultipleThreadByThreadId = (void *)GetProcAddress(module, "NtAlertMultipleThreadByThreadId");
     pNtAlertThreadByThreadId        = (void *)GetProcAddress(module, "NtAlertThreadByThreadId");
     pNtClose                        = (void *)GetProcAddress(module, "NtClose");
+    pNtCreateDebugObject            = (void *)GetProcAddress(module, "NtCreateDebugObject");
     pNtCreateEvent                  = (void *)GetProcAddress(module, "NtCreateEvent");
     pNtCreateKeyedEvent             = (void *)GetProcAddress(module, "NtCreateKeyedEvent");
     pNtCreateMutant                 = (void *)GetProcAddress(module, "NtCreateMutant");
@@ -1460,6 +1745,8 @@ START_TEST(sync)
     pNtSetEventBoostPriority        = (void *)GetProcAddress(module, "NtSetEventBoostPriority");
     pNtWaitForAlertByThreadId       = (void *)GetProcAddress(module, "NtWaitForAlertByThreadId");
     pNtWaitForKeyedEvent            = (void *)GetProcAddress(module, "NtWaitForKeyedEvent");
+    pNtWaitForMultipleObjects       = (void *)GetProcAddress(module, "NtWaitForMultipleObjects");
+    pNtWaitForDebugEvent            = (void *)GetProcAddress(module, "NtWaitForDebugEvent");
     pRtlAcquireResourceExclusive    = (void *)GetProcAddress(module, "RtlAcquireResourceExclusive");
     pRtlAcquireResourceShared       = (void *)GetProcAddress(module, "RtlAcquireResourceShared");
     pRtlDeleteResource              = (void *)GetProcAddress(module, "RtlDeleteResource");
@@ -1475,6 +1762,8 @@ START_TEST(sync)
 
     test_wait_on_address();
     test_event();
+    test_wow64_logical_page_marshalling();
+    test_wow64_debug_event_publish_failure( argv );
     test_mutant();
     test_semaphore();
     test_keyed_events();

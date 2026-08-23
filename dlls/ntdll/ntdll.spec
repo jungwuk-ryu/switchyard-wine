@@ -1762,10 +1762,21 @@
 @ cdecl wine_server_fd_to_handle(long long long ptr)
 @ cdecl wine_server_handle_to_fd(long long ptr ptr)
 
+@ cdecl -norelay __wine_wow64_user_copy(ptr ptr long long)
+@ cdecl -norelay __wine_wow64_store_release_long(ptr long)
+@ cdecl -norelay __wine_wow64_publish_iosb(ptr long long)
+@ cdecl -norelay __wine_wow64_publish_handle_pair(ptr long ptr long)
+@ cdecl -norelay __wine_wow64_create_user_process(ptr)
+@ cdecl -norelay __wine_wow64_complete_user_process(long long long)
+@ cdecl -norelay __wine_wow64_create_user_thread(ptr)
+@ cdecl -norelay __wine_wow64_complete_user_thread(long long long)
+@ stdcall -norelay -arch=arm64ec __wine_arm64ec_prepare_x64_execution()
+@ stdcall -norelay -arch=arm64ec __wine_arm64ec_get_x64_syscall_dispatcher(ptr ptr)
+
 # Unix interface
 @ stdcall -arch=x86_64 __wine_unix_call(long long ptr)
 @ stdcall __wine_unix_spawnvp(long ptr)
-@ stdcall -arch=x86_64 __wine_call_native_thread_func(ptr ptr)
+@ stdcall -arch=x86_64,arm64,arm64ec __wine_call_native_thread_func(ptr ptr)
 @ stdcall __wine_ctrl_routine(ptr)
 @ extern -private __wine_syscall_dispatcher
 @ extern -private __wine_unix_call_dispatcher
@@ -1786,3 +1797,6 @@
 @ cdecl wine_get_version()
 @ cdecl wine_get_build_id()
 @ cdecl wine_get_host_version(ptr ptr)
+
+# Keep new internal extensions append-only to preserve existing ordinals.
+@ extern -private __wine_main_image_native_base

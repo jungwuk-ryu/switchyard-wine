@@ -23,6 +23,7 @@
 
 #include "../win32u/win32syscalls.h"
 #include "ntuser.h"
+#include "wine/wow64_user.h"
 
 #define SYSCALL_ENTRY(id,name,_args) extern NTSTATUS WINAPI wow64_ ## name( UINT *args );
 ALL_SYSCALLS32
@@ -50,6 +51,57 @@ typedef struct
 static inline ULONG get_ulong( UINT **args ) { return *(*args)++; }
 static inline HANDLE get_handle( UINT **args ) { return LongToHandle( *(*args)++ ); }
 static inline void *get_ptr( UINT **args ) { return ULongToPtr( *(*args)++ ); }
+
+/* Keep get_ptr() as the zero-extending client-value facade used by user.c.
+ * GDI wrappers must opt in explicitly when a value denotes guest memory. */
+static inline void *wow64win_guest_memory_ptr( ULONG address )
+{
+    return wine_wow64_guest_memory_ptr( address );
+}
+
+static inline ULONG wow64win_guest_memory_addr( const void *address )
+{
+    return wine_wow64_guest_memory_addr( address );
+}
+
+static inline void *get_memory_ptr( UINT **args )
+{
+    return wow64win_guest_memory_ptr( get_ulong( args ) );
+}
+
+static inline void *get_client_ptr( UINT **args )
+{
+    return ULongToPtr( get_ulong( args ) );
+}
+
+static inline void wow64win_read_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_copy_from_user( dst, src, size );
+    if (status) RtlRaiseStatus( status );
+}
+
+static inline void wow64win_write_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_copy_to_user( dst, src, size );
+    if (status) RtlRaiseStatus( status );
+}
+
+static inline NTSTATUS wow64win_try_write_user( void *dst, const void *src, SIZE_T size )
+{
+    return wine_wow64_try_copy_to_user( dst, src, size );
+}
+
+static inline void wow64win_probe_user_read( const void *src, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_probe_user_read( src, size );
+    if (status) RtlRaiseStatus( status );
+}
+
+static inline void wow64win_probe_user_write( void *dst, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_probe_user_write( dst, size );
+    if (status) RtlRaiseStatus( status );
+}
 
 static inline void **addr_32to64( void **addr, ULONG *addr32 )
 {

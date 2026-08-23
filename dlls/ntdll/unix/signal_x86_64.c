@@ -2170,6 +2170,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
 
     if (data->jmp_buf)
     {
+        data->jmp_status = rec->ExceptionCode;
         TRACE_(seh)( "returning to handler\n" );
         RDI_sig(sigcontext) = (ULONG_PTR)data->jmp_buf;
         RSI_sig(sigcontext) = 1;
@@ -3030,7 +3031,7 @@ static int libc_addr_cb( struct dl_phdr_info *info, size_t size, void *arg )
 /**********************************************************************
  *		signal_init_process
  */
-void signal_init_process( TEB *teb )
+BOOL signal_init_process( TEB *teb )
 {
     struct sigaction sig_act;
     WOW_TEB *wow_teb = get_wow_teb( teb );
@@ -3092,7 +3093,7 @@ void signal_init_process( TEB *teb )
     sig_act.sa_sigaction = sigsys_handler;
     if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
 #endif
-    return;
+    return TRUE;
 
  error:
     perror("sigaction");

@@ -151,6 +151,19 @@ extern void SNOOP_SetupDLL( HMODULE hmod );
 extern const WCHAR windows_dir[];
 
 extern void (FASTCALL *pBaseThreadInitThunk)(DWORD,LPTHREAD_START_ROUTINE,void *);
+extern void *__wine_main_image_native_base;
+
+/* The fixed-low AMD64 main image may have separate Windows-visible and native
+ * backing addresses.  These helpers are private to PE ntdll: public image and
+ * loader APIs must continue to expose the Windows address. */
+extern HMODULE ntdll_get_native_image_base( HMODULE module );
+extern IMAGE_NT_HEADERS *ntdll_get_native_image_headers( HMODULE module );
+extern void *ntdll_get_native_image_directory( HMODULE module, BOOL image,
+                                               WORD dir, ULONG *size );
+extern void *ntdll_image_address_to_native( HMODULE module, const void *address,
+                                            SIZE_T size );
+extern void *ntdll_image_address_to_client( HMODULE module, const void *address,
+                                            SIZE_T size );
 
 extern struct _KUSER_SHARED_DATA *user_shared_data;
 

@@ -240,9 +240,9 @@ static void dump_apc_call( const char *prefix, const union apc_call *call )
         dump_uint64( ",limit_low=", &call->virtual_alloc_ex.limit_low );
         dump_uint64( ",limit_high=", &call->virtual_alloc_ex.limit_high );
         dump_uint64( ",align=", &call->virtual_alloc_ex.align );
-        fprintf( stderr, ",op_type=%x,prot=%x,attributes=%x",
+        fprintf( stderr, ",op_type=%x,prot=%x,attributes=%x,wine_flags=%x",
                  call->virtual_alloc_ex.op_type, call->virtual_alloc_ex.prot,
-                 call->virtual_alloc_ex.attributes );
+                 call->virtual_alloc_ex.attributes, call->virtual_alloc_ex.wine_flags );
         break;
     case APC_VIRTUAL_FREE:
         dump_uint64( "APC_VIRTUAL_FREE,addr=", &call->virtual_free.addr );
@@ -275,6 +275,7 @@ static void dump_apc_call( const char *prefix, const union apc_call *call )
         dump_uint64( ",size=", &call->map_view.size );
         dump_uint64( ",offset=", &call->map_view.offset );
         dump_uint64( ",zero_bits=", &call->map_view.zero_bits );
+        dump_uint64( ",commit_size=", &call->map_view.commit_size );
         fprintf( stderr, ",alloc_type=%x,prot=%x", call->map_view.alloc_type, call->map_view.prot );
         break;
     case APC_MAP_VIEW_EX:
@@ -284,8 +285,9 @@ static void dump_apc_call( const char *prefix, const union apc_call *call )
         dump_uint64( ",offset=", &call->map_view_ex.offset );
         dump_uint64( ",limit_low=", &call->map_view_ex.limit_low );
         dump_uint64( ",limit_high=", &call->map_view_ex.limit_high );
-        fprintf( stderr, ",alloc_type=%x,prot=%x,machine=%04x",
-                 call->map_view_ex.alloc_type, call->map_view_ex.prot, call->map_view_ex.machine );
+        fprintf( stderr, ",alloc_type=%x,prot=%x,machine=%04x,wine_flags=%04x,attributes=%x",
+                 call->map_view_ex.alloc_type, call->map_view_ex.prot, call->map_view_ex.machine,
+                 call->map_view_ex.wine_flags, call->map_view_ex.attributes );
         break;
     case APC_UNMAP_VIEW:
         dump_uint64( "APC_UNMAP_VIEW,addr=", &call->unmap_view.addr );

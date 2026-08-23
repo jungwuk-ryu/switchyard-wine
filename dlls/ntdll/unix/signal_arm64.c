@@ -50,6 +50,9 @@
 #ifdef HAVE_SYS_UCONTEXT_H
 # include <sys/ucontext.h>
 #endif
+#ifdef HAVE_OS_CUSTOM_X18_ABI
+# include <os/arch/arm64.h>
+#endif
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -58,8 +61,87 @@
 #include "wine/asm.h"
 #include "unix_private.h"
 #include "wine/debug.h"
+#ifdef __APPLE__
+# include "arm64ec_low_guest_decode.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
+
+#ifdef __APPLE__
+
+#if defined(HAVE_OS_CUSTOM_X18_ABI) && \
+    defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) && \
+    __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 260400
+# define CUSTOM_X18_ABI_ALWAYS_AVAILABLE
+#endif
+
+#if defined(HAVE_OS_CUSTOM_X18_ABI) && !defined(CUSTOM_X18_ABI_ALWAYS_AVAILABLE)
+static bool (*custom_x18_abi_enabled_func)(void);
+static void (*set_custom_x18_abi_enabled_func)(bool enabled);
+#endif
+
+static void set_custom_x18_abi_enabled( BOOL enabled );
+
+static BOOL custom_x18_abi_enabled(void)
+{
+#ifdef CUSTOM_X18_ABI_ALWAYS_AVAILABLE
+    return os_custom_x18_abi_enabled();
+#elif defined(HAVE_OS_CUSTOM_X18_ABI)
+    return custom_x18_abi_enabled_func && custom_x18_abi_enabled_func();
+#else
+    return FALSE;
+#endif
+}
+
+static BOOL init_custom_x18_abi(void)
+{
+#if defined(HAVE_OS_CUSTOM_X18_ABI) && !defined(CUSTOM_X18_ABI_ALWAYS_AVAILABLE)
+    if (__builtin_available(macOS 26.4, *))
+    {
+        custom_x18_abi_enabled_func = os_custom_x18_abi_enabled;
+        set_custom_x18_abi_enabled_func = os_set_custom_x18_abi_enabled;
+    }
+    if (!custom_x18_abi_enabled_func || !set_custom_x18_abi_enabled_func) return FALSE;
+#elif !defined(CUSTOM_X18_ABI_ALWAYS_AVAILABLE)
+    return FALSE;
+#endif
+
+    /* Symbol availability does not prove that this task carries the required
+     * entitlement. Exercise both states while x18 still belongs to Darwin. */
+    if (!custom_x18_abi_enabled())
+    {
+        set_custom_x18_abi_enabled( TRUE );
+        if (!custom_x18_abi_enabled()) return FALSE;
+    }
+    set_custom_x18_abi_enabled( FALSE );
+    return !custom_x18_abi_enabled();
+}
+
+static void set_custom_x18_abi_enabled( BOOL enabled )
+{
+#ifdef CUSTOM_X18_ABI_ALWAYS_AVAILABLE
+    os_set_custom_x18_abi_enabled( enabled );
+#elif defined(HAVE_OS_CUSTOM_X18_ABI)
+    if (set_custom_x18_abi_enabled_func) set_custom_x18_abi_enabled_func( enabled );
+#else
+    (void)enabled;
+#endif
+}
+
+/* Windows owns x18 as its TEB pointer. Darwin APIs may only run while the
+ * thread is in the system x18 ABI, so every PE/Unix transition switches the
+ * ownership mode before crossing the boundary. */
+static void __attribute__((used,noinline)) enter_system_x18_abi(void)
+{
+    if (custom_x18_abi_enabled()) set_custom_x18_abi_enabled( FALSE );
+}
+
+static void __attribute__((used,noinline)) enter_windows_x18_abi(void)
+{
+    if (!custom_x18_abi_enabled()) set_custom_x18_abi_enabled( TRUE );
+}
+
+#endif
 
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
@@ -189,13 +271,56 @@ struct syscall_frame
     struct syscall_frame *prev_frame;     /* 110 */
     void                 *syscall_cfa;    /* 118 */
     ULONG                 syscall_id;     /* 120 */
-    ULONG                 align;          /* 124 */
+    ULONG                 dispatcher_flags; /* 124 */
     ULONG                 fpcr;           /* 128 */
     ULONG                 fpsr;           /* 12c */
     NEON128               v[32];          /* 130 */
 };
 
 C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
+
+#define DISPATCHER_FLAG_UNIX_CALL         0x01
+#define DISPATCHER_FLAG_RETURN_CUSTOM_X18 0x02
+#define DISPATCHER_FLAG_SYSCALL_TRACE     0x04
+
+#ifdef __APPLE__
+
+struct unix_dispatcher_entry
+{
+    struct syscall_frame *frame;
+    TEB *teb;
+    ULONG_PTR saved_x18;
+    BOOL custom_x18;
+};
+
+C_ASSERT( offsetof( struct unix_dispatcher_entry, frame ) == 0x00 );
+C_ASSERT( offsetof( struct unix_dispatcher_entry, teb ) == 0x08 );
+C_ASSERT( offsetof( struct unix_dispatcher_entry, saved_x18 ) == 0x10 );
+C_ASSERT( offsetof( struct unix_dispatcher_entry, custom_x18 ) == 0x18 );
+C_ASSERT( sizeof( struct unix_dispatcher_entry ) == 0x20 );
+
+/* A nested Darwin callback may enter the Unix dispatcher while x18 is
+ * system-owned. Recover the TEB from pthread state, and preserve an existing
+ * custom-x18 value only as opaque PE register state. */
+static void __attribute__((used,noinline)) prepare_unix_dispatcher_entry(
+    struct unix_dispatcher_entry *entry )
+{
+    struct thread_data *data;
+
+    entry->custom_x18 = custom_x18_abi_enabled();
+    entry->saved_x18 = 0;
+    if (entry->custom_x18)
+    {
+        __asm__ volatile( "mov %0, x18" : "=r" (entry->saved_x18) );
+        set_custom_x18_abi_enabled( FALSE );
+    }
+
+    data = get_thread_data();
+    entry->teb = data ? data->teb : NULL;
+    entry->frame = data ? get_syscall_frame( data ) : NULL;
+}
+
+#endif
 
 
 #define ESR_ELx_EC(esr)                 (((DWORD64)(esr) >> 26) & 0x3f)
@@ -212,10 +337,12 @@ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 #define ESR_ELx_ISS_DFSC(esr)           ((esr) & 0x3f)
 #define ESR_ELx_ISS_DFSC_ALIGN_FAULT    0x21
 
+#ifdef linux
 static DWORD64 make_esr( ULONG ec, ULONG info )
 {
     return ((DWORD64)ec << 26) | (info & 0xffff);
 }
+#endif
 
 /***********************************************************************
  *           context_init_empty_xstate
@@ -487,6 +614,11 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
         context->Fpsr = frame->fpsr;
         memcpy( context->V, frame->v, sizeof(context->V) );
         context->ContextFlags |= CONTEXT_FLOATING_POINT;
+    }
+    if (needed_flags & CONTEXT_ARM64_X18)
+    {
+        context->X[18] = frame->x[18];
+        context->ContextFlags |= CONTEXT_ARM64_X18;
     }
     if (needed_flags & CONTEXT_DEBUG_REGISTERS) FIXME( "debug registers not supported\n" );
     set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
@@ -883,31 +1015,44 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
                    "stp d12, d13, [x29, #0x80]\n\t"
                    "stp d14, d15, [x29, #0x90]\n\t"
                    "stp x1, x2, [x29, #0xa0]\n\t" /* ret_ptr, ret_len */
-                   "mov x18, x4\n\t"              /* teb */
+                   "mov x19, x4\n\t"              /* teb, keep system x18 untouched */
                    "mrs x1, fpcr\n\t"
                    "mrs x2, fpsr\n\t"
                    "bfi x1, x2, #0, #32\n\t"
-                   "ldr x2, [x18]\n\t"            /* teb->Tib.ExceptionList */
+                   "ldr x2, [x19]\n\t"            /* teb->Tib.ExceptionList */
                    "stp x1, x2, [x29, #0xb0]\n\t"
 
-                   "ldr x7, [x18, #0x378]\n\t"    /* thread_data->syscall_frame */
+                   "ldr x7, [x19, #0x378]\n\t"    /* thread_data->syscall_frame */
                    "sub x1, sp, #0x330\n\t"       /* sizeof(struct syscall_frame) */
-                   "str x1, [x18, #0x378]\n\t"    /* thread_data->syscall_frame */
+                   "str x1, [x19, #0x378]\n\t"    /* thread_data->syscall_frame */
                    "add x8, x29, #0xd0\n\t"
                    "stp x7, x8, [x1, #0x110]\n\t" /* frame->prev_frame,syscall_cfa */
-                   "ldr w11, [x18, #0x380]\n\t"   /* thread_data->syscall_trace */
+                   "ldr w11, [x19, #0x380]\n\t"   /* thread_data->syscall_trace */
                    "cbnz x11, 1f\n\t"
                    /* switch to user stack */
+#ifdef __APPLE__
+                   "mov x21, x19\n\t"             /* teb */
+                   "mov x19, x0\n\t"              /* user_sp */
+                   "mov x20, x3\n\t"              /* func */
+                   "bl " __ASM_NAME("enter_windows_x18_abi") "\n\t"
+                   "mov x18, x21\n\t"
+                   "mov sp, x19\n\t"
+                   "br x20\n"
+#else
+                   "mov x18, x19\n\t"             /* teb */
                    "mov sp, x0\n\t"               /* user_sp */
                    "br x3\n"
-                   "1:\tmov x19, x18\n\t"         /* teb */
-                   "mov x20, x0\n\t"              /* user_sp */
+#endif
+                   "1:\tmov x20, x0\n\t"          /* user_sp */
                    "mov x21, x3\n\t"              /* func */
                    "mov sp, x1\n\t"
                    "ldr x1, [x20]\n\t"            /* args */
                    "ldp w2, w0, [x20, #8]\n\t"    /* len, id */
                    "str x0, [x29, #0xc0]\n\t"     /* id */
                    "bl " __ASM_NAME("trace_usercall") "\n\t"
+#ifdef __APPLE__
+                   "bl " __ASM_NAME("enter_windows_x18_abi") "\n\t"
+#endif
                    "mov x18, x19\n\t"             /* teb */
                    "mov sp, x20\n\t"              /* user_sp */
                    "br x21" )
@@ -1080,6 +1225,8 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context,
 
     if (data->jmp_buf)
     {
+        data->jmp_status = rec->ExceptionCode;
+        unwind_wow64_unixlib_call_context( data->jmp_unixlib_context );
         TRACE( "returning to handler\n" );
         REGn_sig(0, context) = (ULONG_PTR)data->jmp_buf;
         REGn_sig(1, context) = 1;
@@ -1089,15 +1236,245 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context,
     }
     if ((frame = get_syscall_frame( data )))
     {
+        /* A fault escaping a tagged Unixlib call bypasses its C epilogue.
+         * Drop the native snapshot context before returning to user mode; a
+         * fault handled by an inner checked-copy jump buffer does not reach
+         * this branch and keeps the enclosing context intact. */
+        reset_wow64_unixlib_call_context();
         TRACE( "returning to user mode ip=%p ret=%08x\n", (void *)frame->pc, rec->ExceptionCode );
         REGn_sig(0, context)  = rec->ExceptionCode;
+#ifndef __APPLE__
         REGn_sig(18, context) = (ULONG_PTR)data->teb;
+#endif
         SP_sig(context)       = (ULONG_PTR)frame;
         PC_sig(context)       = (ULONG_PTR)__wine_syscall_dispatcher_return;
         return TRUE;
     }
     return FALSE;
 }
+
+#if defined(__APPLE__) && defined(__aarch64__)
+
+static BOOL get_arm64_signal_reg( ucontext_t *context, unsigned int reg, ULONG_PTR *value )
+{
+    switch (reg)
+    {
+    case 0 ... 28:
+        *value = REGn_sig( reg, context );
+        return TRUE;
+    case 29:
+        *value = FP_sig( context );
+        return TRUE;
+    case 30:
+        *value = LR_sig( context );
+        return TRUE;
+    case 31:
+        *value = SP_sig( context );
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL set_arm64_signal_reg( ucontext_t *context, unsigned int reg, ULONG_PTR value )
+{
+    switch (reg)
+    {
+    case 0 ... 28:
+        REGn_sig( reg, context ) = value;
+        return TRUE;
+    case 29:
+        FP_sig( context ) = value;
+        return TRUE;
+    case 30:
+        LR_sig( context ) = value;
+        return TRUE;
+    case 31:
+        SP_sig( context ) = value;
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL get_arm64_signal_q( const ucontext_t *context, unsigned int reg, ULONG64 value[2] )
+{
+    __uint128_t q;
+
+    if (reg >= 32) return FALSE;
+    q = context->uc_mcontext->__ns.__v[reg];
+    value[0] = (ULONG64)q;
+    value[1] = (ULONG64)(q >> 64);
+    return TRUE;
+}
+
+static BOOL set_arm64_signal_q( ucontext_t *context, unsigned int reg, const ULONG64 value[2] )
+{
+    __uint128_t q;
+
+    if (reg >= 32) return FALSE;
+    q = (__uint128_t)value[0] | ((__uint128_t)value[1] << 64);
+    context->uc_mcontext->__ns.__v[reg] = q;
+    return TRUE;
+}
+
+static BOOL get_arm64_signal_d( const ucontext_t *context, unsigned int reg, ULONG64 *value )
+{
+    if (!value || reg >= 32) return FALSE;
+    *value = (ULONG64)context->uc_mcontext->__ns.__v[reg];
+    return TRUE;
+}
+
+static BOOL set_arm64_signal_d( ucontext_t *context, unsigned int reg, ULONG64 value )
+{
+    if (reg >= 32) return FALSE;
+    context->uc_mcontext->__ns.__v[reg] = (__uint128_t)value;
+    return TRUE;
+}
+
+static BOOL handle_arm64ec_low_guest_access( struct thread_data *data, ucontext_t *sigcontext,
+                                             siginfo_t *siginfo, DWORD64 esr,
+                                             EXCEPTION_RECORD *rec, BOOL *raise_exception )
+{
+    struct arm64ec_low_guest_access access;
+    struct arm64ec_low_guest_value value = {{0}};
+    ULONG_PTR pc = PC_sig( sigcontext );
+    ULONG_PTR extra_status = 0;
+    NTSTATUS status;
+    ULONG instr;
+    ULONG_PTR base, offset_register = 0;
+    unsigned int rn, rm;
+
+    *raise_exception = FALSE;
+    if (!data || !siginfo || !is_arm64ec() ||
+        is_inside_syscall( data, SP_sig( sigcontext )) ||
+        !arm64ec_low_guest_is_translation_fault( esr ) ||
+        !virtual_arm64ec_fetch_low_guest_instr( (const void *)pc, &instr ))
+        return FALSE;
+
+    rn = arm64ec_low_guest_base_register( instr );
+    if (!get_arm64_signal_reg( sigcontext, rn, &base )) return FALSE;
+    if (arm64ec_low_guest_offset_register( instr, &rm ) && rm != 31 &&
+        !get_arm64_signal_reg( sigcontext, rm, &offset_register ))
+        return FALSE;
+    if (!arm64ec_decode_low_guest_access( instr, base, offset_register,
+                                          (ULONG_PTR)siginfo->si_addr,
+                                          ESR_ELx_ISS_DABT_WNR(esr),
+                                          WINE_LOW_VA_SHADOW_SIZE, &access ))
+        return FALSE;
+
+    if (access.write)
+    {
+        if (access.simd_scalar_size == 16)
+        {
+            if (!get_arm64_signal_q( sigcontext, access.rt, &value.word[0] )) return FALSE;
+        }
+        else if (access.simd_scalar_size == 8)
+        {
+            if (!get_arm64_signal_d( sigcontext, access.rt, &value.word[0] )) return FALSE;
+        }
+        else if (access.pair_element_size == 16)
+        {
+            if (!get_arm64_signal_q( sigcontext, access.rt, &value.word[0] ) ||
+                !get_arm64_signal_q( sigcontext, access.rt2, &value.word[2] ))
+                return FALSE;
+        }
+        else if (access.pair_element_size)
+        {
+            ULONG_PTR reg_value;
+
+            if (access.rt != 31)
+            {
+                if (!get_arm64_signal_reg( sigcontext, access.rt, &reg_value )) return FALSE;
+                value.word[0] = reg_value;
+            }
+            if (access.rt2 != 31)
+            {
+                if (!get_arm64_signal_reg( sigcontext, access.rt2, &reg_value )) return FALSE;
+                value.word[1] = reg_value;
+            }
+        }
+        else if (access.rt != 31)
+        {
+            ULONG_PTR reg_value;
+
+            if (!get_arm64_signal_reg( sigcontext, access.rt, &reg_value )) return FALSE;
+            value.word[0] = reg_value;
+        }
+        status = virtual_arm64ec_low_guest_access( data, access.address, &value,
+                                                   access.size, access.pair_element_size,
+                                                   TRUE, &extra_status );
+    }
+    else
+    {
+        status = virtual_arm64ec_low_guest_access( data, access.address, &value,
+                                                   access.size, access.pair_element_size,
+                                                   FALSE, &extra_status );
+        if (!status && access.simd_scalar_size == 16)
+        {
+            if (!set_arm64_signal_q( sigcontext, access.rt, &value.word[0] )) return FALSE;
+        }
+        else if (!status && access.simd_scalar_size == 8)
+        {
+            if (!set_arm64_signal_d( sigcontext, access.rt, value.word[0] )) return FALSE;
+        }
+        else if (!status && access.pair_element_size == 16)
+        {
+            if (!set_arm64_signal_q( sigcontext, access.rt, &value.word[0] ) ||
+                !set_arm64_signal_q( sigcontext, access.rt2, &value.word[2] ))
+                return FALSE;
+        }
+        else if (!status && access.pair_element_size)
+        {
+            if (access.rt != 31 &&
+                !set_arm64_signal_reg( sigcontext, access.rt, value.word[0] ))
+                return FALSE;
+            if (access.rt2 != 31 &&
+                !set_arm64_signal_reg( sigcontext, access.rt2, value.word[1] ))
+                return FALSE;
+        }
+        else if (!status && access.rt != 31)
+        {
+            if (access.sign_extend_size)
+            {
+                uint64_t extended;
+
+                if (!arm64ec_low_guest_extend_signed_load( value.word[0], access.size,
+                                                            access.sign_extend_size,
+                                                            &extended ))
+                    return FALSE;
+                value.word[0] = extended;
+            }
+            else if (access.load_32) value.word[0] = (ULONG)value.word[0];
+            if (!set_arm64_signal_reg( sigcontext, access.rt, value.word[0] )) return FALSE;
+        }
+    }
+    if (status)
+    {
+        if (status != STATUS_GUARD_PAGE_VIOLATION &&
+            status != STATUS_IN_PAGE_ERROR)
+            return FALSE;
+        rec->ExceptionCode = status;
+        rec->ExceptionInformation[0] = access.write ? EXCEPTION_WRITE_FAULT :
+                                                      EXCEPTION_READ_FAULT;
+        rec->ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+        rec->NumberParameters = 2;
+        if (status == STATUS_IN_PAGE_ERROR && extra_status)
+        {
+            rec->ExceptionInformation[2] = extra_status;
+            rec->NumberParameters = 3;
+        }
+        *raise_exception = TRUE;
+        return TRUE;
+    }
+    if (access.writeback_valid &&
+        !set_arm64_signal_reg( sigcontext, access.rn, access.writeback ))
+        return FALSE;
+    PC_sig( sigcontext ) = pc + 4;
+    return TRUE;
+}
+
+#endif
 
 
 /**********************************************************************
@@ -1134,6 +1511,22 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
             rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
         else
             rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
+#if defined(__APPLE__) && defined(__aarch64__)
+        {
+            BOOL raise_exception;
+
+            if (handle_arm64ec_low_guest_access( data, sigcontext, siginfo, esr,
+                                                 &rec, &raise_exception ))
+            {
+                if (raise_exception)
+                {
+                    save_context( &context, sigcontext );
+                    setup_raise_exception( data, sigcontext, &rec, &context );
+                }
+                return;
+            }
+        }
+#endif
         break;
     default:
         rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
@@ -1176,6 +1569,8 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
             return;
         }
     }
+
+    if (handle_syscall_fault( data, sigcontext, &rec )) return;
 
     save_context( &context, sigcontext );
     setup_raise_exception( data, sigcontext, &rec, &context );
@@ -1443,6 +1838,64 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 #endif
 }
 
+#ifdef __APPLE__
+
+typedef void (*signal_handler_func)( int signal, siginfo_t *siginfo, void *sigcontext );
+
+/* Signal handlers call Darwin APIs, so they must run in the system x18 ABI.
+ * The kernel ucontext remains the authoritative saved Windows x18 value. */
+static void dispatch_signal_with_system_x18( signal_handler_func handler, int signal,
+                                             siginfo_t *siginfo, void *_sigcontext )
+{
+    ucontext_t *sigcontext = _sigcontext;
+    BOOL custom = custom_x18_abi_enabled();
+    BOOL resume_custom = custom;
+
+    if (custom) set_custom_x18_abi_enabled( FALSE );
+    handler( signal, siginfo, sigcontext );
+
+    /* A system-ABI fault may have been redirected to a Windows dispatcher.
+     * The SIGUSR2 slow path likewise resumes the saved Windows frame. */
+    if (!resume_custom)
+    {
+        struct thread_data *data = get_thread_data();
+        struct syscall_frame *frame = data ? get_syscall_frame( data ) : NULL;
+
+        resume_custom = data && REGn_sig( 18, sigcontext ) == (ULONG_PTR)data->teb &&
+                        PC_sig( sigcontext ) == (ULONG_PTR)pKiUserExceptionDispatcher;
+        if (!resume_custom && handler == usr2_handler)
+            resume_custom = frame && SP_sig( sigcontext ) == frame->sp &&
+                            PC_sig( sigcontext ) == frame->pc &&
+                            REGn_sig( 18, sigcontext ) == frame->x[18];
+    }
+
+    if (resume_custom)
+    {
+        ULONG_PTR custom_x18 = REGn_sig( 18, sigcontext );
+
+        set_custom_x18_abi_enabled( TRUE );
+        __asm__ volatile( "mov x18, %0" :: "r" (custom_x18) );
+    }
+}
+
+#define DEFINE_SYSTEM_X18_SIGNAL_WRAPPER(name) \
+    static void name##_system_x18( int signal, siginfo_t *siginfo, void *sigcontext ) \
+    { \
+        dispatch_signal_with_system_x18( name, signal, siginfo, sigcontext ); \
+    }
+
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( int_handler )
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( fpe_handler )
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( abrt_handler )
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( quit_handler )
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( usr1_handler )
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( usr2_handler )
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( trap_handler )
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( segv_handler )
+DEFINE_SYSTEM_X18_SIGNAL_WRAPPER( ill_handler )
+
+#endif
+
 
 /**********************************************************************
  *           get_thread_ldt_entry
@@ -1473,36 +1926,84 @@ void signal_free_thread( TEB *teb )
 /**********************************************************************
  *		signal_init_process
  */
-void signal_init_process( TEB *teb )
+BOOL signal_init_process( TEB *teb )
 {
     struct sigaction sig_act;
 
+#ifdef __APPLE__
+    if (!init_custom_x18_abi()) return FALSE;
+#endif
     alloc_syscall_frame( sizeof(struct syscall_frame) );
     signal_alloc_thread( teb );
 
     sig_act.sa_mask = server_block_set;
     sig_act.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
 
-    sig_act.sa_sigaction = int_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        int_handler_system_x18;
+#else
+        int_handler;
+#endif
     if (sigaction( SIGINT, &sig_act, NULL ) == -1) goto error;
-    sig_act.sa_sigaction = fpe_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        fpe_handler_system_x18;
+#else
+        fpe_handler;
+#endif
     if (sigaction( SIGFPE, &sig_act, NULL ) == -1) goto error;
-    sig_act.sa_sigaction = abrt_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        abrt_handler_system_x18;
+#else
+        abrt_handler;
+#endif
     if (sigaction( SIGABRT, &sig_act, NULL ) == -1) goto error;
-    sig_act.sa_sigaction = quit_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        quit_handler_system_x18;
+#else
+        quit_handler;
+#endif
     if (sigaction( SIGQUIT, &sig_act, NULL ) == -1) goto error;
-    sig_act.sa_sigaction = usr1_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        usr1_handler_system_x18;
+#else
+        usr1_handler;
+#endif
     if (sigaction( SIGUSR1, &sig_act, NULL ) == -1) goto error;
-    sig_act.sa_sigaction = usr2_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        usr2_handler_system_x18;
+#else
+        usr2_handler;
+#endif
     if (sigaction( SIGUSR2, &sig_act, NULL ) == -1) goto error;
-    sig_act.sa_sigaction = trap_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        trap_handler_system_x18;
+#else
+        trap_handler;
+#endif
     if (sigaction( SIGTRAP, &sig_act, NULL ) == -1) goto error;
-    sig_act.sa_sigaction = segv_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        segv_handler_system_x18;
+#else
+        segv_handler;
+#endif
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGSEGV, &sig_act, NULL ) == -1) goto error;
-    sig_act.sa_sigaction = ill_handler;
+    sig_act.sa_sigaction =
+#ifdef __APPLE__
+        ill_handler_system_x18;
+#else
+        ill_handler;
+#endif
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
-    return;
+    return TRUE;
 
  error:
     perror("sigaction");
@@ -1539,8 +2040,8 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
     {
         XMM_SAVE_AREA32 *fpu = (XMM_SAVE_AREA32 *)i386_context->ExtendedRegisters;
         i386_context->ContextFlags = CONTEXT_I386_ALL;
-        i386_context->Eax = (ULONG_PTR)entry;
-        i386_context->Ebx = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
+        i386_context->Eax = wow64_native_to_guest_addr( entry );
+        i386_context->Ebx = wow64_native_to_guest_addr( arg == peb ? wow_peb : arg );
         i386_context->Esp = get_wow_teb( teb )->Tib.StackBase - 16;
         i386_context->Eip = pLdrSystemDllInitBlock->pRtlUserThreadStart;
         i386_context->SegCs = 0x23;
@@ -1572,7 +2073,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
 
     ctx = (CONTEXT *)((ULONG_PTR)context.Sp & ~15) - 1;
     *ctx = context;
-    ctx->ContextFlags = CONTEXT_FULL;
+    ctx->ContextFlags = CONTEXT_FULL | CONTEXT_ARM64_X18;
     signal_set_full_context( ctx );
 
     frame->sp    = (ULONG64)ctx;
@@ -1617,6 +2118,7 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
                    "sub x4, sp, #0x330\n\t"     /* sizeof(struct syscall_frame) */
                    "str x4, [x2, #0x378]\n\t"   /* thread_data->syscall_frame */
                    "1:\tstr wzr, [x4, #0x10c]\n\t" /* frame->restore_flags */
+                   "str wzr, [x4, #0x124]\n\t"   /* frame->dispatcher_flags */
                    "stp xzr, x5, [x4, #0x110]\n\t" /* frame->prev_frame,syscall_cfa */
                    /* switch to kernel stack */
                    "mov sp, x4\n\t"
@@ -1641,6 +2143,15 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "mrs x9, NZCV\n\t"
                    "stp x30, x9, [x10, #0x100]\n\t"
                    "str w8, [x10, #0x120]\n\t"
+#ifdef __APPLE__
+                   "ldr w9, [x18, #0x380]\n\t" /* thread_data->syscall_trace */
+                   "cmp w9, #0\n\t"
+                   "cset w9, ne\n\t"
+                   "lsl w9, w9, #2\n\t"
+                   "str w9, [x10, #0x124]\n\t" /* frame->dispatcher_flags */
+#else
+                   "str wzr, [x10, #0x124]\n\t"
+#endif
                    "mrs x9, FPCR\n\t"
                    "str w9, [x10, #0x128]\n\t"
                    "mrs x9, FPSR\n\t"
@@ -1664,6 +2175,28 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "mov x22, x10\n\t"
                    /* switch to kernel stack */
                    "mov sp, x10\n\t"
+#ifdef __APPLE__
+                   /* The ABI toggle may clobber all caller-saved registers. */
+                   "stp x0,  x1,  [x22, #0x00]\n\t"
+                   "stp x2,  x3,  [x22, #0x10]\n\t"
+                   "stp x4,  x5,  [x22, #0x20]\n\t"
+                   "stp x6,  x7,  [x22, #0x30]\n\t"
+                   "stp x8,  x9,  [x22, #0x40]\n\t"
+                   "stp x10, x11, [x22, #0x50]\n\t"
+                   "stp x12, x13, [x22, #0x60]\n\t"
+                   "stp x14, x15, [x22, #0x70]\n\t"
+                   "stp x16, x17, [x22, #0x80]\n\t"
+                   "bl " __ASM_NAME("enter_system_x18_abi") "\n\t"
+                   "ldp x0,  x1,  [x22, #0x00]\n\t"
+                   "ldp x2,  x3,  [x22, #0x10]\n\t"
+                   "ldp x4,  x5,  [x22, #0x20]\n\t"
+                   "ldp x6,  x7,  [x22, #0x30]\n\t"
+                   "ldp x8,  x9,  [x22, #0x40]\n\t"
+                   "ldp x10, x11, [x22, #0x50]\n\t"
+                   "ldp x12, x13, [x22, #0x60]\n\t"
+                   "ldp x14, x15, [x22, #0x70]\n\t"
+                   "ldp x16, x17, [x22, #0x80]\n\t"
+#endif
                    /* we're now on the kernel stack, stitch unwind info with previous frame */
                    __ASM_CFI_CFA_IS_AT2(x22, 0x98, 0x02) /* frame->syscall_cfa */
                    __ASM_CFI(".cfi_offset 29, -0xc0\n\t")
@@ -1680,7 +2213,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
                    "and x20, x8, #0xfff\n\t"    /* syscall number */
                    "ubfx x21, x8, #12, #2\n\t"  /* syscall table number */
+#ifdef __APPLE__
+                   "ldr x16, [x22, #0x90]\n\t"  /* saved teb */
+                   "ldr x16, [x16, #0x370]\n\t"  /* thread_data->syscall_table */
+#else
                    "ldr x16, [x18, #0x370]\n\t" /* thread_data->syscall_table */
+#endif
                    "add x21, x16, x21, lsl #5\n\t"
                    "ldr x16, [x21, #16]\n\t"    /* table->ServiceLimit */
                    "cmp x20, x16\n\t"
@@ -1698,8 +2236,13 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "cbnz x9, 1b\n"
                    "2:\tldr x16, [x21]\n\t"     /* table->ServiceTable */
                    "ldr x23, [x16, x20, lsl 3]\n\t"
+#ifdef __APPLE__
+                   "ldr w11, [x22, #0x124]\n\t" /* frame->dispatcher_flags */
+                   "tbnz w11, #2, " __ASM_LOCAL_LABEL("trace_syscall") "\n\t"
+#else
                    "ldr w11, [x18, #0x380]\n\t" /* thread_data->syscall_trace */
                    "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall") "\n\t"
+#endif
                    "blr x23\n\t"
                    "mov sp, x22\n"
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
@@ -1710,17 +2253,36 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "ldp x14, x15, [sp, #0xf8]\n\t" /* frame->sp, frame->pc */
                    "cmp x12, x15\n\t"              /* frame->x16 == frame->pc? */
                    "ccmp x13, x14, #0, eq\n\t"     /* frame->x17 == frame->sp? */
-                   "beq 1f\n\t"                    /* take slowpath if unequal */
+                   "beq 2f\n\t"                    /* take slowpath if unequal */
                    "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
-                   "1:\tldp x0, x1, [sp, #0x00]\n\t"
+                   "2:\n\t"
+#ifdef __APPLE__
+                   /* Every successful dispatcher return resumes PE code. */
+                   "mov x20, x0\n\t"
+                   "bl " __ASM_NAME("enter_windows_x18_abi") "\n\t"
+                   "ldr w16, [sp, #0x10c]\n\t"
+#endif
+                   "tbz x16, #1, 3f\n\t"        /* CONTEXT_INTEGER */
+                   "ldp x0, x1, [sp, #0x00]\n\t"
                    "ldp x2, x3, [sp, #0x10]\n\t"
                    "ldp x4, x5, [sp, #0x20]\n\t"
                    "ldp x6, x7, [sp, #0x30]\n\t"
                    "ldp x8, x9, [sp, #0x40]\n\t"
                    "ldp x10, x11, [sp, #0x50]\n\t"
                    "ldp x12, x13, [sp, #0x60]\n\t"
-                   "ldp x14, x15, [sp, #0x70]\n"
-                   "2:\tldp x18, x19, [sp, #0x90]\n\t"
+                   "ldp x14, x15, [sp, #0x70]\n\t"
+                   "b 4f\n"
+                   "3:\n\t"
+#ifdef __APPLE__
+                   "mov x0, x20\n\t"
+#endif
+                   "4:\n\t"
+#ifdef __APPLE__
+                   "ldr x18, [sp, #0x90]\n\t"
+                   "ldr x19, [sp, #0x98]\n\t"
+#else
+                   "ldp x18, x19, [sp, #0x90]\n\t"
+#endif
                    "ldp x20, x21, [sp, #0xa0]\n\t"
                    "ldp x22, x23, [sp, #0xb0]\n\t"
                    "ldp x24, x25, [sp, #0xc0]\n\t"
@@ -1785,8 +2347,13 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
+#ifdef __APPLE__
+                   "ldr w11, [sp, #0x124]\n\t" /* frame->dispatcher_flags */
+                   "tbnz w11, #2, " __ASM_LOCAL_LABEL("trace_syscall_ret") "\n\t"
+#else
                    "ldr w11, [x18, #0x380]\n\t" /* thread_data->syscall_trace */
                    "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall_ret") "\n\t"
+#endif
                    "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
 
@@ -1795,8 +2362,41 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
  */
 __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "hint 34\n\t" /* bti c */
+#ifdef __APPLE__
+                   /* x18 is OS-owned while a nested Darwin callback is active.
+                    * Preserve the arguments and recover the TEB from pthread
+                    * state without interpreting system x18. */
+                   "sub sp, sp, #0x50\n\t"
+                   __ASM_CFI(".cfi_def_cfa_offset 0x50\n\t")
+                   "stp x0, x1, [sp, #0x00]\n\t"
+                   "stp x2, x30, [sp, #0x10]\n\t"
+                   __ASM_CFI(".cfi_offset 30, -0x38\n\t")
+                   "mrs x9, NZCV\n\t"
+                   "str x9, [sp, #0x20]\n\t"
+                   "add x0, sp, #0x28\n\t"
+                   "bl " __ASM_NAME("prepare_unix_dispatcher_entry") "\n\t"
+                   "ldr x10, [sp, #0x28]\n\t" /* entry.frame */
+                   "ldr x9, [sp, #0x30]\n\t"  /* entry.teb */
+                   "ldr x12, [sp, #0x38]\n\t" /* entry.saved_x18 */
+                   "ldr w11, [sp, #0x40]\n\t" /* entry.custom_x18 */
+                   "cbz x10, " __ASM_LOCAL_LABEL("unix_call_no_frame") "\n\t"
+                   "ldp x0, x1, [sp, #0x00]\n\t"
+                   "ldp x2, x30, [sp, #0x10]\n\t"
+                   "ldr x13, [sp, #0x20]\n\t"
+                   "msr NZCV, x13\n\t"
+                   "add sp, sp, #0x50\n\t"
+                   __ASM_CFI(".cfi_restore 30\n\t")
+                   __ASM_CFI(".cfi_def_cfa sp, 0\n\t")
+#else
                    "ldr x10, [x18, #0x378]\n\t" /* thread_data->syscall_frame */
+#endif
+#ifdef __APPLE__
+                   "cmp w11, #0\n\t"
+                   "csel x12, x12, x9, ne\n\t" /* opaque custom x18 or recovered teb */
+                   "stp x12, x19, [x10, #0x90]\n\t"
+#else
                    "stp x18, x19, [x10, #0x90]\n\t"
+#endif
                    "stp x20, x21, [x10, #0xa0]\n\t"
                    "stp x22, x23, [x10, #0xb0]\n\t"
                    "stp x24, x25, [x10, #0xc0]\n\t"
@@ -1811,8 +2411,17 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "mrs x9, NZCV\n\t"
                    "stp x30, x9, [x10, #0x100]\n\t"
                    "mov x19, x10\n\t"
+#ifdef __APPLE__
+                   "mov w11, #3\n\t" /* UNIX_CALL | RETURN_CUSTOM_X18 */
+                   "str w11, [x10, #0x124]\n\t"
+#endif
+                   "str wzr, [x10, #0x10c]\n\t" /* consume prior restore_flags */
                    /* switch to kernel stack */
                    "mov sp, x10\n\t"
+#ifdef __APPLE__
+                   "stp x0, x1, [x19, #0x00]\n\t"
+                   "str x2, [x19, #0x10]\n\t"
+#endif
                    /* we're now on the kernel stack, stitch unwind info with previous frame */
                    __ASM_CFI_CFA_IS_AT2(x19, 0x98, 0x02) /* frame->syscall_cfa */
                    __ASM_CFI(".cfi_offset 29, -0xc0\n\t")
@@ -1827,16 +2436,50 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    __ASM_CFI(".cfi_offset 26, -0x78\n\t")
                    __ASM_CFI(".cfi_offset 27, -0x70\n\t")
                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
+                   "tbnz x0, #63, " __ASM_LOCAL_LABEL("unix_call_tagged") "\n\t"
                    "ldr x16, [x0, x1, lsl 3]\n\t"
                    "mov x0, x2\n\t"             /* args */
                    "blr x16\n\t"
+                   "b " __ASM_LOCAL_LABEL("unix_call_done") "\n"
+                   __ASM_LOCAL_LABEL("unix_call_tagged") ":\n\t"
+                   "bl " __ASM_NAME("__wine_unix_call_dispatcher_tagged") "\n"
+                   __ASM_LOCAL_LABEL("unix_call_done") ":\n\t"
                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
                    "cbnz w16, " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
+#ifdef __APPLE__
+                   /* A successful Unix call always returns to PE code. */
+                   "str x0, [sp, #0x00]\n\t"
+                   "bl " __ASM_NAME("enter_windows_x18_abi") "\n\t"
+                   "ldr x0, [sp, #0x00]\n\t"
+#endif
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
+#ifdef __APPLE__
+                   "ldr x18, [sp, #0x90]\n\t"
+                   "ldr x19, [sp, #0x98]\n\t"
+#else
                    "ldp x18, x19, [sp, #0x90]\n\t"
+#endif
                    "ldp x16, x17, [sp, #0xf8]\n\t"
                    /* switch to user stack */
                    "mov sp, x16\n\t"
-                   "ret x17" )
+                   "ret x17\n"
+#ifdef __APPLE__
+                   __ASM_LOCAL_LABEL("unix_call_no_frame") ":\n\t"
+                   __ASM_CFI(".cfi_def_cfa sp, 0x50\n\t")
+                   __ASM_CFI(".cfi_offset 30, -0x38\n\t")
+                   /* prepare_unix_dispatcher_entry() already left custom mode. */
+                   "cbz w11, " __ASM_LOCAL_LABEL("unix_call_no_frame_system") "\n\t"
+                   "bl " __ASM_NAME("enter_windows_x18_abi") "\n\t"
+                   "ldr x18, [sp, #0x38]\n\t"
+                   __ASM_LOCAL_LABEL("unix_call_no_frame_system") ":\n\t"
+                   "ldr x30, [sp, #0x18]\n\t"
+                   "add sp, sp, #0x50\n\t"
+                   __ASM_CFI(".cfi_restore 30\n\t")
+                   __ASM_CFI(".cfi_def_cfa sp, 0\n\t")
+                   "movz w0, #0x0008\n\t"       /* STATUS_INVALID_HANDLE */
+                   "movk w0, #0xc000, lsl #16\n\t"
+                   "ret"
+#endif
+                   )
 
 #endif  /* __aarch64__ */

@@ -24,6 +24,8 @@
 
 #define COBJMACROS
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windows.h"
 #include "winternl.h"
 #include "dwrite_3.h"
@@ -31,6 +33,7 @@
 #include "d2d1.h"
 
 #include "wine/test.h"
+#include "wine/unixlib.h"
 
 #define MS_CMAP_TAG DWRITE_MAKE_OPENTYPE_TAG('c','m','a','p')
 #define MS_VDMX_TAG DWRITE_MAKE_OPENTYPE_TAG('V','D','M','X')
@@ -11061,6 +11064,632 @@ static void test_font_download_queue(void)
     ok(ref == 0, "factory not released, %lu\n", ref);
 }
 
+struct wow64_test_matrix_2x2
+{
+    float m11, m12, m21, m22;
+};
+
+struct wow64_test_create_font_object_params
+{
+    ULONG data;
+    UINT64 size;
+    ULONG index;
+    ULONG axis_values;
+    ULONG axis_values_count;
+    ULONG axis_values_are_default;
+    ULONG object;
+};
+
+struct wow64_test_release_font_object_params { UINT64 object; };
+struct wow64_test_get_glyph_count_params { UINT64 object; ULONG count; };
+
+struct wow64_test_get_glyph_outline_params
+{
+    UINT64 object;
+    ULONG simulations;
+    ULONG glyph;
+    float emsize;
+    ULONG outline;
+};
+
+struct wow64_test_get_glyph_advance_params
+{
+    UINT64 object;
+    ULONG glyph;
+    ULONG mode;
+    float emsize;
+    ULONG advance;
+    ULONG has_contours;
+};
+
+struct wow64_test_get_glyph_bbox_params
+{
+    UINT64 object;
+    ULONG simulations;
+    ULONG glyph;
+    float emsize;
+    struct wow64_test_matrix_2x2 m;
+    ULONG bbox;
+};
+
+struct wow64_test_get_glyph_bitmap_params
+{
+    UINT64 object;
+    ULONG simulations;
+    ULONG glyph;
+    ULONG mode;
+    float emsize;
+    struct wow64_test_matrix_2x2 m;
+    RECT bbox;
+    int pitch;
+    ULONG bitmap;
+    ULONG is_1bpp;
+};
+
+struct wow64_test_get_design_glyph_metrics_params
+{
+    UINT64 object;
+    ULONG simulations;
+    ULONG glyph;
+    ULONG upem;
+    ULONG ascent;
+    ULONG metrics;
+};
+
+struct wow64_test_outline32
+{
+    struct { ULONG values, count, size; } tags;
+    struct { ULONG values, count, size; } points;
+};
+
+enum wow64_test_unix_func
+{
+    wow64_unix_create_font_object = 2,
+    wow64_unix_release_font_object,
+    wow64_unix_get_glyph_outline,
+    wow64_unix_get_glyph_count,
+    wow64_unix_get_glyph_advance,
+    wow64_unix_get_glyph_bbox,
+    wow64_unix_get_glyph_bitmap,
+    wow64_unix_get_design_glyph_metrics,
+};
+
+struct wow64_font_release_thread_context
+{
+    NTSTATUS (WINAPI *dispatcher)(unixlib_handle_t, unsigned int, void *);
+    unixlib_handle_t handle;
+    UINT64 object;
+    HANDLE started, go;
+    NTSTATUS first_status, unexpected_status;
+    ULONG first_count, unexpected_count;
+    LONG successful_calls, saw_invalid;
+};
+
+static DWORD WINAPI wow64_font_release_thread(void *arg)
+{
+    struct wow64_font_release_thread_context *context = arg;
+    struct wow64_test_get_glyph_count_params params;
+    ULONG count = 0, i;
+    NTSTATUS status;
+
+    params.object = context->object;
+    params.count = PtrToUlong(&count);
+    for (i = 0; i < 100000; ++i)
+    {
+        count = 0xcccccccc;
+        status = context->dispatcher(context->handle, wow64_unix_get_glyph_count, &params);
+        if (!i)
+        {
+            context->first_status = status;
+            context->first_count = count;
+            SetEvent(context->started);
+            WaitForSingleObject(context->go, 5000);
+        }
+        if (status == STATUS_SUCCESS)
+        {
+            if (count != 8)
+            {
+                context->unexpected_status = status;
+                context->unexpected_count = count;
+                break;
+            }
+            InterlockedIncrement(&context->successful_calls);
+        }
+        else if (status == STATUS_INVALID_HANDLE)
+        {
+            InterlockedExchange(&context->saw_invalid, TRUE);
+            break;
+        }
+        else
+        {
+            context->unexpected_status = status;
+            context->unexpected_count = count;
+            break;
+        }
+    }
+    return 0;
+}
+
+C_ASSERT(sizeof(struct wow64_test_create_font_object_params) == 40);
+C_ASSERT(sizeof(struct wow64_test_release_font_object_params) == 8);
+C_ASSERT(sizeof(struct wow64_test_get_glyph_outline_params) == 24);
+C_ASSERT(sizeof(struct wow64_test_get_glyph_count_params) == 16);
+C_ASSERT(sizeof(struct wow64_test_get_glyph_advance_params) == 32);
+C_ASSERT(sizeof(struct wow64_test_get_glyph_bbox_params) == 40);
+C_ASSERT(sizeof(struct wow64_test_get_glyph_bitmap_params) == 72);
+C_ASSERT(sizeof(struct wow64_test_get_design_glyph_metrics_params) == 32);
+C_ASSERT(sizeof(struct wow64_test_outline32) == 24);
+
+static BOOL buffer_is_filled(const void *buffer, SIZE_T size, BYTE value)
+{
+    const BYTE *bytes = buffer;
+    SIZE_T i;
+
+    for (i = 0; i < size; ++i)
+        if (bytes[i] != value) return FALSE;
+    return TRUE;
+}
+
+static void test_wow64_unixlib_marshalling(void)
+{
+    NTSTATUS (WINAPI **dispatcher_ptr)(unixlib_handle_t, unsigned int, void *);
+    NTSTATUS (WINAPI *dispatcher)(unixlib_handle_t, unsigned int, void *);
+    struct wow64_test_get_design_glyph_metrics_params metrics_params;
+    struct wow64_test_get_glyph_bitmap_params bitmap_params;
+    struct wow64_test_get_glyph_advance_params advance_params;
+    struct wow64_test_get_glyph_outline_params outline_params;
+    struct wow64_test_create_font_object_params create_params;
+    struct wow64_test_get_glyph_count_params count_params;
+    struct wow64_test_get_glyph_bbox_params bbox_params;
+    struct wow64_test_release_font_object_params *cross_release;
+    struct wow64_test_release_font_object_params release_params;
+    static struct wow64_font_release_thread_context thread_context;
+    struct wow64_test_outline32 *outline;
+    DWRITE_GLYPH_METRICS *metrics;
+    D2D1_POINT_2F *points;
+    ULONG *count, *has_contours, *is_1bpp;
+    ULONG translated = 0, old_protect;
+    ULONG_PTR watch_count;
+    ULONG granularity;
+    void *watch_pages[4];
+    UINT64 *object = NULL;
+    unsigned int bitmap_size, pitch;
+    BYTE *memory, *font_data, *tags, *bitmap;
+    const BYTE *resource_data;
+    unixlib_handle_t handle;
+    HGLOBAL resource_handle;
+    HMODULE ntdll, dwrite;
+    HANDLE thread = NULL;
+    BOOL write_watch = TRUE;
+    DWORD resource_size, wait;
+    HRSRC resource;
+    NTSTATUS status;
+    UINT64 stale_object;
+    SIZE_T size;
+    RECT *bbox;
+    int *advance;
+    unsigned int i;
+
+    if (sizeof(void *) != 4)
+    {
+        skip("WoW64 Unixlib marshalling requires a 32-bit test process\n");
+        return;
+    }
+    status = NtQueryVirtualMemory(GetCurrentProcess(), NtCurrentTeb(),
+                                  MemoryWineWow64TranslatedInformation,
+                                  &translated, sizeof(translated), NULL);
+    if (status || !translated)
+    {
+        skip("WoW64 translated memory is unavailable\n");
+        return;
+    }
+
+    ntdll = GetModuleHandleA("ntdll.dll");
+    dwrite = GetModuleHandleA("dwrite.dll");
+    dispatcher_ptr = (void *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher");
+    if (!dispatcher_ptr || !(dispatcher = *dispatcher_ptr))
+    {
+        skip("Unix-call dispatcher is unavailable\n");
+        return;
+    }
+    status = NtQueryVirtualMemory(GetCurrentProcess(), dwrite, MemoryWineLoadUnixLibWow64,
+                                  &handle, sizeof(handle), NULL);
+    if (status)
+    {
+        skip("DWrite WoW64 Unixlib is unavailable, status %#lx\n", status);
+        return;
+    }
+    ok(!!(handle & WINE_UNIXLIB_DISPATCH_HANDLE_TAG),
+       "expected tagged DWrite Unixlib handle, got %s\n", wine_dbgstr_longlong(handle));
+
+    resource = FindResourceA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(1), (LPCSTR)RT_RCDATA);
+    ok(!!resource, "failed to find test font resource\n");
+    if (!resource) return;
+    resource_size = SizeofResource(GetModuleHandleA(NULL), resource);
+    resource_handle = LoadResource(GetModuleHandleA(NULL), resource);
+    resource_data = LockResource(resource_handle);
+    ok(!!resource_data && resource_size, "failed to load test font resource\n");
+    if (!resource_data || !resource_size) return;
+
+    size = 0x20000;
+    memory = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    if (!memory)
+    {
+        write_watch = FALSE;
+        memory = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    }
+    ok(!!memory, "failed to allocate test memory, error %lu\n", GetLastError());
+    if (!memory) return;
+    memset(memory, 0, size);
+
+    font_data = memory + 0x3c00;
+    ok(resource_size < 0x1800, "test font is too large, size %lu\n", resource_size);
+    if (resource_size >= 0x1800) goto done;
+    memcpy(font_data, resource_data, resource_size);
+    object = (UINT64 *)(memory + 0x6000);
+    count = (ULONG *)(memory + 0x7000);
+    advance = (int *)(memory + 0x7000);
+    bbox = (RECT *)(memory + 0x7000);
+    metrics = (DWRITE_GLYPH_METRICS *)(memory + 0x7000);
+    has_contours = (ULONG *)(memory + 0x8000);
+    is_1bpp = (ULONG *)(memory + 0x8000);
+    cross_release = (struct wow64_test_release_font_object_params *)(memory + 0x8ffc);
+    outline = (struct wow64_test_outline32 *)(memory + 0xa000);
+    tags = memory + 0xb000;
+    points = (D2D1_POINT_2F *)(memory + 0xc000);
+    bitmap = memory + 0xd000;
+
+    memset(&create_params, 0, sizeof(create_params));
+    create_params.data = PtrToUlong(font_data);
+    create_params.size = resource_size;
+    create_params.object = PtrToUlong(object);
+
+    *object = 0xdeadbeefcafebabeULL;
+    ok(VirtualProtect(memory + 0x4000, 0x1000, PAGE_NOACCESS, &old_protect),
+       "VirtualProtect failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_create_font_object, &create_params);
+    ok(status == STATUS_ACCESS_VIOLATION, "noaccess font returned %#lx\n", status);
+    ok(!*object, "failed create published object %s\n", wine_dbgstr_longlong(*object));
+    ok(VirtualProtect(memory + 0x4000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+
+    *object = 0xdeadbeefcafebabeULL;
+    ok(VirtualProtect(memory + 0x4000, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old_protect),
+       "VirtualProtect guard failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_create_font_object, &create_params);
+    ok(status == STATUS_GUARD_PAGE_VIOLATION, "guarded font returned %#lx\n", status);
+    ok(!*object, "guarded create published object %s\n", wine_dbgstr_longlong(*object));
+    ok(VirtualProtect(memory + 0x4000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+
+    *object = 0xdeadbeefcafebabeULL;
+    ok(VirtualProtect(memory + 0x6000, 0x1000, PAGE_READONLY, &old_protect),
+       "VirtualProtect object failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_create_font_object, &create_params);
+    ok(status == STATUS_ACCESS_VIOLATION, "readonly object returned %#lx\n", status);
+    ok(*object == 0xdeadbeefcafebabeULL, "readonly object changed to %s\n",
+       wine_dbgstr_longlong(*object));
+    ok(VirtualProtect(memory + 0x6000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+
+    *object = 0xdeadbeefcafebabeULL;
+    create_params.data = 0xfffffff0;
+    create_params.size = 0x100;
+    status = dispatcher(handle, wow64_unix_create_font_object, &create_params);
+    ok(status == STATUS_ACCESS_VIOLATION, "wrapped font range returned %#lx\n", status);
+    ok(!*object, "wrapped font range published object %s\n", wine_dbgstr_longlong(*object));
+    create_params.data = PtrToUlong(font_data);
+    create_params.size = resource_size;
+
+    *object = 0xdeadbeefcafebabeULL;
+    create_params.axis_values = 0xfffffff8;
+    create_params.axis_values_count = 2;
+    status = dispatcher(handle, wow64_unix_create_font_object, &create_params);
+    ok(status == STATUS_ACCESS_VIOLATION, "wrapped axes returned %#lx\n", status);
+    ok(!*object, "wrapped axes published object %s\n", wine_dbgstr_longlong(*object));
+    create_params.axis_values = 0;
+    create_params.axis_values_count = 0;
+
+    release_params.object = 0xdeadbeefcafebabeULL;
+    status = dispatcher(handle, wow64_unix_release_font_object, &release_params);
+    ok(status == STATUS_INVALID_HANDLE, "forged release returned %#lx\n", status);
+
+    *object = 0;
+    status = dispatcher(handle, wow64_unix_create_font_object, &create_params);
+    ok(status == STATUS_SUCCESS, "valid create returned %#lx\n", status);
+    ok(!!*object, "valid create returned a null object\n");
+    if (!*object) goto done;
+
+    memset(&count_params, 0, sizeof(count_params));
+    count_params.object = *object;
+    count_params.count = PtrToUlong(count);
+    ok(VirtualProtect(memory + 0x3000, 0x2000, PAGE_NOACCESS, &old_protect),
+       "VirtualProtect retained font failed, error %lu\n", GetLastError());
+    *count = 0xcccccccc;
+    status = dispatcher(handle, wow64_unix_get_glyph_count, &count_params);
+    ok(status == STATUS_SUCCESS && *count == 8,
+       "retained font count returned %#lx, count %lu\n", status, *count);
+    ok(VirtualProtect(memory + 0x3000, 0x2000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect retained font restore failed, error %lu\n", GetLastError());
+
+    count_params.object = 0xdeadbeefcafebabeULL;
+    *count = 0xcccccccc;
+    status = dispatcher(handle, wow64_unix_get_glyph_count, &count_params);
+    ok(status == STATUS_INVALID_HANDLE && *count == 0xcccccccc,
+       "forged count returned %#lx or changed output %lu\n", status, *count);
+    count_params.object = *object;
+
+    *count = 0xcccccccc;
+    ok(VirtualProtect(memory + 0x7000, 0x1000, PAGE_READONLY, &old_protect),
+       "VirtualProtect count failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_glyph_count, &count_params);
+    ok(status == STATUS_ACCESS_VIOLATION, "readonly count returned %#lx\n", status);
+    ok(*count == 0xcccccccc, "readonly count changed to %lu\n", *count);
+    ok(VirtualProtect(memory + 0x7000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+
+    memset(&advance_params, 0, sizeof(advance_params));
+    advance_params.object = *object;
+    advance_params.glyph = 5;
+    advance_params.mode = DWRITE_MEASURING_MODE_NATURAL;
+    advance_params.emsize = 20.0f;
+    advance_params.advance = PtrToUlong(advance);
+    advance_params.has_contours = PtrToUlong(has_contours);
+    *advance = 0x55555555;
+    *has_contours = 0xaaaaaaaa;
+    ok(VirtualProtect(memory + 0x8000, 0x1000, PAGE_READONLY, &old_protect),
+       "VirtualProtect contours failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_glyph_advance, &advance_params);
+    ok(status == STATUS_ACCESS_VIOLATION, "readonly contours returned %#lx\n", status);
+    ok(*advance == 0x55555555 && *has_contours == 0xaaaaaaaa,
+       "failed advance partially published %d, %lu\n", *advance, *has_contours);
+    ok(VirtualProtect(memory + 0x8000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_glyph_advance, &advance_params);
+    ok(status == STATUS_SUCCESS && *has_contours <= 1,
+       "valid advance returned %#lx, contours %lu\n", status, *has_contours);
+
+    memset(&bbox_params, 0, sizeof(bbox_params));
+    bbox_params.object = *object;
+    bbox_params.glyph = 5;
+    bbox_params.emsize = 20.0f;
+    bbox_params.m.m11 = bbox_params.m.m22 = 1.0f;
+    bbox_params.bbox = PtrToUlong(bbox);
+    memset(bbox, 0x5a, sizeof(*bbox));
+    ok(VirtualProtect(memory + 0x7000, 0x1000, PAGE_READONLY, &old_protect),
+       "VirtualProtect bbox failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_glyph_bbox, &bbox_params);
+    ok(status == STATUS_ACCESS_VIOLATION && buffer_is_filled(bbox, sizeof(*bbox), 0x5a),
+       "readonly bbox returned %#lx or changed output\n", status);
+    ok(VirtualProtect(memory + 0x7000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_glyph_bbox, &bbox_params);
+    ok(status == STATUS_SUCCESS && !IsRectEmpty(bbox), "valid bbox returned %#lx or empty\n", status);
+
+    memset(&metrics_params, 0, sizeof(metrics_params));
+    metrics_params.object = *object;
+    metrics_params.glyph = 5;
+    metrics_params.upem = 1000;
+    metrics_params.ascent = 800;
+    metrics_params.metrics = PtrToUlong(metrics);
+    memset(metrics, 0x5a, sizeof(*metrics));
+    ok(VirtualProtect(memory + 0x7000, 0x1000, PAGE_READONLY, &old_protect),
+       "VirtualProtect metrics failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_design_glyph_metrics, &metrics_params);
+    ok(status == STATUS_ACCESS_VIOLATION && buffer_is_filled(metrics, sizeof(*metrics), 0x5a),
+       "readonly metrics returned %#lx or changed output\n", status);
+    ok(VirtualProtect(memory + 0x7000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_design_glyph_metrics, &metrics_params);
+    ok(status == STATUS_SUCCESS && metrics->advanceWidth == 1000,
+       "valid metrics returned %#lx, advance %d\n", status, metrics->advanceWidth);
+
+    metrics_params.object = 0xdeadbeefcafebabeULL;
+    memset(metrics, 0x5a, sizeof(*metrics));
+    status = dispatcher(handle, wow64_unix_get_design_glyph_metrics, &metrics_params);
+    ok(status == STATUS_INVALID_HANDLE && buffer_is_filled(metrics, sizeof(*metrics), 0x5a),
+       "forged metrics returned %#lx or changed output\n", status);
+    metrics_params.object = *object;
+
+    memset(outline, 0, sizeof(*outline));
+    memset(&outline_params, 0, sizeof(outline_params));
+    outline_params.object = *object;
+    outline_params.glyph = 5;
+    outline_params.emsize = 20.0f;
+    outline_params.outline = PtrToUlong(outline);
+    ok(VirtualProtect(memory + 0xa000, 0x1000, PAGE_READONLY, &old_protect),
+       "VirtualProtect outline failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_glyph_outline, &outline_params);
+    ok(status == STATUS_ACCESS_VIOLATION && !outline->tags.count && !outline->points.count,
+       "readonly outline returned %#lx or changed counts\n", status);
+    ok(VirtualProtect(memory + 0xa000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_get_glyph_outline, &outline_params);
+    ok(status == STATUS_SUCCESS && outline->tags.count && outline->points.count,
+       "outline size query returned %#lx, %lu tags, %lu points\n",
+       status, outline->tags.count, outline->points.count);
+    if (outline->tags.count <= 0x1000 && outline->points.count <= 0x1000 / sizeof(*points))
+    {
+        outline->tags.values = PtrToUlong(tags);
+        outline->tags.size = outline->tags.count;
+        outline->tags.count = 0;
+        outline->points.values = PtrToUlong(points);
+        outline->points.size = outline->points.count;
+        outline->points.count = 0;
+        memset(tags, 0xcc, 0x1000);
+        memset(points, 0xcc, 0x1000);
+        ok(VirtualProtect(memory + 0xc000, 0x1000, PAGE_READONLY, &old_protect),
+           "VirtualProtect points failed, error %lu\n", GetLastError());
+        status = dispatcher(handle, wow64_unix_get_glyph_outline, &outline_params);
+        ok(status == STATUS_ACCESS_VIOLATION && !outline->tags.count && !outline->points.count,
+           "readonly points returned %#lx or changed counts\n", status);
+        ok(buffer_is_filled(tags, 0x1000, 0xcc), "failed outline changed tags\n");
+        ok(VirtualProtect(memory + 0xc000, 0x1000, PAGE_READWRITE, &old_protect),
+           "VirtualProtect restore failed, error %lu\n", GetLastError());
+        status = dispatcher(handle, wow64_unix_get_glyph_outline, &outline_params);
+        ok(status == STATUS_SUCCESS && outline->tags.count && outline->points.count,
+           "valid outline returned %#lx or empty\n", status);
+    }
+    else skip("outline staging buffers exceed one logical page\n");
+
+    if (!IsRectEmpty(bbox))
+    {
+        pitch = ((bbox->right - bbox->left + 3) / 4) * 4;
+        bitmap_size = pitch * (bbox->bottom - bbox->top);
+        if (bitmap_size <= 0x1000)
+        {
+            memset(&bitmap_params, 0, sizeof(bitmap_params));
+            bitmap_params.object = *object;
+            bitmap_params.glyph = 5;
+            bitmap_params.mode = DWRITE_RENDERING_MODE1_NATURAL;
+            bitmap_params.emsize = 20.0f;
+            bitmap_params.m.m11 = bitmap_params.m.m22 = 1.0f;
+            bitmap_params.bbox = *bbox;
+            bitmap_params.pitch = pitch;
+            bitmap_params.bitmap = PtrToUlong(bitmap);
+            bitmap_params.is_1bpp = PtrToUlong(is_1bpp);
+            memset(bitmap, 0xcc, bitmap_size);
+            *is_1bpp = 0xaaaaaaaa;
+            if (write_watch && ResetWriteWatch(memory + 0x8000, 0x1000)) write_watch = FALSE;
+            ok(VirtualProtect(memory + 0xd000, 0x1000, PAGE_READONLY, &old_protect),
+               "VirtualProtect bitmap failed, error %lu\n", GetLastError());
+            status = dispatcher(handle, wow64_unix_get_glyph_bitmap, &bitmap_params);
+            ok(status == STATUS_ACCESS_VIOLATION && *is_1bpp == 0xaaaaaaaa,
+               "readonly bitmap returned %#lx or changed flag %lu\n", status, *is_1bpp);
+            ok(buffer_is_filled(bitmap, bitmap_size, 0xcc), "failed bitmap changed pixels\n");
+            if (write_watch)
+            {
+                watch_count = ARRAY_SIZE(watch_pages);
+                if (!GetWriteWatch(0, memory + 0x8000, 0x1000, watch_pages, &watch_count, &granularity))
+                    ok(!watch_count, "failed atomic bitmap dirtied %Iu flag pages\n", watch_count);
+            }
+            ok(VirtualProtect(memory + 0xd000, 0x1000, PAGE_READWRITE, &old_protect),
+               "VirtualProtect restore failed, error %lu\n", GetLastError());
+
+            bitmap_params.bbox.left = 0;
+            bitmap_params.bbox.top = 0;
+            bitmap_params.bbox.right = 4;
+            bitmap_params.bbox.bottom = 64;
+            bitmap_params.pitch = 4;
+            bitmap_params.bitmap = 0xfffffff0;
+            *is_1bpp = 0xaaaaaaaa;
+            status = dispatcher(handle, wow64_unix_get_glyph_bitmap, &bitmap_params);
+            ok(status == STATUS_ACCESS_VIOLATION && *is_1bpp == 0xaaaaaaaa,
+               "wrapped bitmap returned %#lx or changed flag %lu\n", status, *is_1bpp);
+
+            bitmap_params.bbox = *bbox;
+            bitmap_params.pitch = pitch;
+            bitmap_params.bitmap = PtrToUlong(bitmap);
+            memset(bitmap, 0, bitmap_size);
+            status = dispatcher(handle, wow64_unix_get_glyph_bitmap, &bitmap_params);
+            ok(status == STATUS_SUCCESS && *is_1bpp <= 1,
+               "valid bitmap returned %#lx, flag %lu\n", status, *is_1bpp);
+            for (i = 0; i < bitmap_size && !bitmap[i]; ++i) {}
+            ok(i < bitmap_size, "valid bitmap contains no set pixels\n");
+        }
+        else skip("bitmap exceeds one logical page\n");
+    }
+
+    cross_release->object = *object;
+    ok(VirtualProtect(memory + 0x9000, 0x1000, PAGE_NOACCESS, &old_protect),
+       "VirtualProtect release args failed, error %lu\n", GetLastError());
+    status = dispatcher(handle, wow64_unix_release_font_object, cross_release);
+    ok(status == STATUS_ACCESS_VIOLATION, "cross-page release returned %#lx\n", status);
+    ok(VirtualProtect(memory + 0x9000, 0x1000, PAGE_READWRITE, &old_protect),
+       "VirtualProtect restore failed, error %lu\n", GetLastError());
+    if (!status)
+    {
+        *object = 0;
+        goto done;
+    }
+    *count = 0;
+    status = dispatcher(handle, wow64_unix_get_glyph_count, &count_params);
+    ok(status == STATUS_SUCCESS && *count == 8,
+       "failed release consumed object, status %#lx count %lu\n", status, *count);
+
+    memset(&thread_context, 0, sizeof(thread_context));
+    thread_context.dispatcher = dispatcher;
+    thread_context.handle = handle;
+    thread_context.object = *object;
+    thread_context.unexpected_status = STATUS_PENDING;
+    thread_context.started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    thread_context.go = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ok(!!thread_context.started && !!thread_context.go,
+       "failed to create release race events, error %lu\n", GetLastError());
+    if (thread_context.started && thread_context.go)
+        thread = CreateThread(NULL, 0, wow64_font_release_thread, &thread_context, 0, NULL);
+    ok(!!thread, "failed to create release race thread, error %lu\n", GetLastError());
+    if (thread)
+    {
+        wait = WaitForSingleObject(thread_context.started, 5000);
+        ok(wait == WAIT_OBJECT_0, "release race start wait returned %lu\n", wait);
+        ok(thread_context.first_status == STATUS_SUCCESS && thread_context.first_count == 8,
+           "release race first call returned %#lx, count %lu\n",
+           thread_context.first_status, thread_context.first_count);
+    }
+
+    stale_object = *object;
+    release_params.object = stale_object;
+    if (thread) SetEvent(thread_context.go);
+    status = dispatcher(handle, wow64_unix_release_font_object, &release_params);
+    ok(status == STATUS_SUCCESS, "valid release returned %#lx\n", status);
+    if (thread)
+    {
+        wait = WaitForSingleObject(thread, 5000);
+        ok(wait == WAIT_OBJECT_0, "release race thread wait returned %lu\n", wait);
+        if (wait == WAIT_OBJECT_0)
+        {
+            ok(thread_context.successful_calls > 0 && thread_context.saw_invalid,
+               "release race made %ld successful calls, saw invalid %ld\n",
+               thread_context.successful_calls, thread_context.saw_invalid);
+            ok(thread_context.unexpected_status == STATUS_PENDING,
+               "release race returned unexpected %#lx, count %lu\n",
+               thread_context.unexpected_status, thread_context.unexpected_count);
+            CloseHandle(thread);
+            thread = NULL;
+        }
+    }
+    if (!thread)
+    {
+        if (thread_context.started) CloseHandle(thread_context.started);
+        if (thread_context.go) CloseHandle(thread_context.go);
+    }
+
+    status = dispatcher(handle, wow64_unix_release_font_object, &release_params);
+    ok(status == STATUS_INVALID_HANDLE, "double release returned %#lx\n", status);
+
+    count_params.object = stale_object;
+    *count = 0xcccccccc;
+    status = dispatcher(handle, wow64_unix_get_glyph_count, &count_params);
+    ok(status == STATUS_INVALID_HANDLE && *count == 0xcccccccc,
+       "stale count returned %#lx or changed output %lu\n", status, *count);
+
+    metrics_params.object = stale_object;
+    memset(metrics, 0x5a, sizeof(*metrics));
+    status = dispatcher(handle, wow64_unix_get_design_glyph_metrics, &metrics_params);
+    ok(status == STATUS_INVALID_HANDLE && buffer_is_filled(metrics, sizeof(*metrics), 0x5a),
+       "stale metrics returned %#lx or changed output\n", status);
+    *object = 0;
+
+done:
+    if (thread)
+    {
+        SetEvent(thread_context.go);
+        if (WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0)
+        {
+            CloseHandle(thread);
+            if (thread_context.started) CloseHandle(thread_context.started);
+            if (thread_context.go) CloseHandle(thread_context.go);
+        }
+    }
+    if (memory && object && *object)
+    {
+        release_params.object = *object;
+        dispatcher(handle, wow64_unix_release_font_object, &release_params);
+    }
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 START_TEST(font)
 {
     IDWriteFactory *factory;
@@ -11138,6 +11767,7 @@ START_TEST(font)
     test_CreateFontCollectionFromFontSet();
     test_GetMatchingFontsByLOGFONT();
     test_font_download_queue();
+    test_wow64_unixlib_marshalling();
 
     IDWriteFactory_Release(factory);
 }

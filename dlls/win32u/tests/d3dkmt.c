@@ -19,6 +19,7 @@
  */
 
 #include <stdarg.h>
+#include <setjmp.h>
 
 #define COBJMACROS
 #include "ntstatus.h"
@@ -59,6 +60,104 @@ static PFN_vkGetDeviceProcAddr p_vkGetDeviceProcAddr;
 
 static const LUID luid_zero;
 const GUID GUID_NULL = {0};
+
+static jmp_buf create_allocation_jmpbuf;
+static DWORD create_allocation_exception;
+
+static LONG WINAPI create_allocation_exception_handler( EXCEPTION_POINTERS *eptr )
+{
+    create_allocation_exception = eptr->ExceptionRecord->ExceptionCode;
+    longjmp( create_allocation_jmpbuf, 1 );
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static DWORD call_create_allocation_catching_fault( D3DKMT_CREATEALLOCATION *desc,
+                                                     BOOL version2, NTSTATUS *status )
+{
+    void *handler;
+
+    create_allocation_exception = 0;
+    handler = AddVectoredExceptionHandler( TRUE, create_allocation_exception_handler );
+    ok( !!handler, "AddVectoredExceptionHandler failed, error %lu\n", GetLastError() );
+    if (!handler) return 0;
+
+    if (!setjmp( create_allocation_jmpbuf ))
+        *status = version2 ? D3DKMTCreateAllocation2( desc ) :
+                             D3DKMTCreateAllocation( desc );
+    RemoveVectoredExceptionHandler( handler );
+    return create_allocation_exception;
+}
+
+enum open_resource_test_variant
+{
+    OPEN_RESOURCE_TEST_V1,
+    OPEN_RESOURCE_TEST_V2,
+    OPEN_RESOURCE_TEST_NT_HANDLE,
+};
+
+enum d3dkmt_lifecycle_test_call
+{
+    D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER,
+    D3DKMT_LIFECYCLE_TEST_CLOSE_ADAPTER,
+    D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE,
+    D3DKMT_LIFECYCLE_TEST_DESTROY_DEVICE,
+};
+
+static DWORD call_d3dkmt_lifecycle_catching_fault(
+    void *desc, enum d3dkmt_lifecycle_test_call call, NTSTATUS *status )
+{
+    void *handler;
+
+    create_allocation_exception = 0;
+    handler = AddVectoredExceptionHandler( TRUE, create_allocation_exception_handler );
+    ok( !!handler, "AddVectoredExceptionHandler failed, error %lu\n", GetLastError() );
+    if (!handler) return 0;
+
+    if (!setjmp( create_allocation_jmpbuf ))
+    {
+        switch (call)
+        {
+        case D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER:
+            *status = D3DKMTOpenAdapterFromLuid( desc );
+            break;
+        case D3DKMT_LIFECYCLE_TEST_CLOSE_ADAPTER:
+            *status = D3DKMTCloseAdapter( desc );
+            break;
+        case D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE:
+            *status = D3DKMTCreateDevice( desc );
+            break;
+        case D3DKMT_LIFECYCLE_TEST_DESTROY_DEVICE:
+            *status = D3DKMTDestroyDevice( desc );
+            break;
+        }
+    }
+    RemoveVectoredExceptionHandler( handler );
+    return create_allocation_exception;
+}
+
+static DWORD call_open_resource_catching_fault( void *desc,
+                                                enum open_resource_test_variant variant,
+                                                NTSTATUS *status )
+{
+    void *handler;
+
+    create_allocation_exception = 0;
+    handler = AddVectoredExceptionHandler( TRUE, create_allocation_exception_handler );
+    ok( !!handler, "AddVectoredExceptionHandler failed, error %lu\n", GetLastError() );
+    if (!handler) return 0;
+
+    if (!setjmp( create_allocation_jmpbuf ))
+    {
+        if (variant == OPEN_RESOURCE_TEST_V1)
+            *status = D3DKMTOpenResource( desc );
+        else if (variant == OPEN_RESOURCE_TEST_V2)
+            *status = D3DKMTOpenResource2( desc );
+        else
+            *status = D3DKMTOpenResourceFromNtHandle( desc );
+    }
+    RemoveVectoredExceptionHandler( handler );
+    return create_allocation_exception;
+}
 
 static const char *debugstr_luid( const LUID *luid )
 {
@@ -2374,6 +2473,1606 @@ static void test_D3DKMTAcquireKeyedMutex( void )
     ok_nt( STATUS_SUCCESS, status );
 }
 
+union wow64_test_allocation_info
+{
+    D3DDDI_ALLOCATIONINFO info;
+    D3DDDI_ALLOCATIONINFO2 info2;
+};
+
+union wow64_test_open_allocation_info
+{
+    D3DDDI_OPENALLOCATIONINFO info;
+    D3DDDI_OPENALLOCATIONINFO2 info2;
+};
+
+static void init_wow64_test_create_allocation( D3DKMT_CREATEALLOCATION *create,
+                                                D3DKMT_CREATESTANDARDALLOCATION *standard,
+                                                union wow64_test_allocation_info *allocation,
+                                                D3DKMT_HANDLE device, void *system_memory,
+                                                BOOL version2 )
+{
+    memset( create, 0, sizeof(*create) );
+    memset( standard, 0, sizeof(*standard) );
+    memset( allocation, 0, sizeof(*allocation) );
+
+    standard->Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
+    standard->ExistingHeapData.Size = 0x1000;
+    create->hDevice = device;
+    create->hGlobalShare = 0x1eadbeed;
+    create->Flags.ExistingSysMem = 1;
+    create->Flags.StandardAllocation = 1;
+    create->pStandardAllocation = standard;
+    create->NumAllocations = 1;
+    create->hPrivateRuntimeResourceHandle = (HANDLE)(ULONG_PTR)0xdeadbeef;
+    if (version2)
+    {
+        allocation->info2.hAllocation = 0x1eadbeed;
+        allocation->info2.pSystemMem = system_memory;
+        create->pAllocationInfo2 = &allocation->info2;
+    }
+    else
+    {
+        allocation->info.hAllocation = 0x1eadbeed;
+        allocation->info.pSystemMem = system_memory;
+        create->pAllocationInfo = &allocation->info;
+    }
+}
+
+static BOOL set_wow64_test_page_protection( void *page, DWORD protect )
+{
+    DWORD old_protect;
+    BOOL ret = VirtualProtect( page, 0x1000, protect, &old_protect );
+
+    ok( ret, "VirtualProtect(%#lx) failed, error %lu\n", protect, GetLastError() );
+    return ret;
+}
+
+static void test_wow64_protected_adapter_device_lifecycle(void)
+{
+    D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open_gdi = {0};
+    D3DKMT_OPENADAPTERFROMLUID *open, *open_split;
+    D3DKMT_CREATEDEVICE *create, *create_split;
+    D3DKMT_DESTROYDEVICE *destroy;
+    D3DKMT_CLOSEADAPTER *close;
+    D3DKMT_HANDLE next_local;
+    BYTE *lanes, *watch = NULL;
+    BOOL is_wow64 = FALSE;
+    DWORD exception, all_flags = ~0u;
+    NTSTATUS status;
+    UINT ret;
+
+    if (sizeof(void *) != 4 || !IsWow64Process( GetCurrentProcess(), &is_wow64 ) ||
+        !is_wow64 || !winetest_platform_is_wine)
+    {
+        win_skip( "protected adapter/device lifecycle test requires Wine WoW64\n" );
+        return;
+    }
+
+    wcscpy( open_gdi.DeviceName, display1W );
+    status = D3DKMTOpenAdapterFromGdiDisplayName( &open_gdi );
+    ok_nt( STATUS_SUCCESS, status );
+    if (status) return;
+    next_local = open_gdi.hAdapter + 0x40;
+
+    {
+        D3DKMT_CLOSEADAPTER baseline_close = { .hAdapter = open_gdi.hAdapter };
+
+        status = D3DKMTCloseAdapter( &baseline_close );
+        ok_nt( STATUS_SUCCESS, status );
+    }
+
+    lanes = VirtualAlloc( NULL, 0x7000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    if (!lanes)
+    {
+        win_skip( "VirtualAlloc failed, error %lu\n", GetLastError() );
+        return;
+    }
+    open_split = (D3DKMT_OPENADAPTERFROMLUID *)(lanes + 0x1000 -
+                                                 offsetof(D3DKMT_OPENADAPTERFROMLUID,
+                                                          hAdapter) - 2);
+    create_split = (D3DKMT_CREATEDEVICE *)(lanes + 0x3000 -
+                                            offsetof(D3DKMT_CREATEDEVICE, hDevice) - 2);
+    open = (D3DKMT_OPENADAPTERFROMLUID *)(lanes + 0x4000);
+    create = (D3DKMT_CREATEDEVICE *)(lanes + 0x4000);
+    close = (D3DKMT_CLOSEADAPTER *)(lanes + 0x5000);
+    destroy = (D3DKMT_DESTROYDEVICE *)(lanes + 0x5000);
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        NULL, D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "NULL open-adapter exception %#lx, status %#lx\n", exception, status );
+
+    memset( open, 0, sizeof(*open) );
+    open->AdapterLuid = open_gdi.AdapterLuid;
+    open->hAdapter = 0x1eadbeed;
+    if (!set_wow64_test_page_protection( open, PAGE_NOACCESS )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        open, D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "no-access open-adapter exception %#lx, status %#lx\n", exception, status );
+    if (!set_wow64_test_page_protection( open, PAGE_READWRITE )) goto done;
+    ok_x4( open->hAdapter, ==, 0x1eadbeed );
+
+    if (!set_wow64_test_page_protection( open, PAGE_READWRITE | PAGE_GUARD ))
+        goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        open, D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER, &status );
+    ok( exception == STATUS_GUARD_PAGE_VIOLATION,
+        "guarded open-adapter exception %#lx, status %#lx\n", exception, status );
+    if (!set_wow64_test_page_protection( open, PAGE_READWRITE )) goto done;
+    ok_x4( open->hAdapter, ==, 0x1eadbeed );
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        (void *)(ULONG_PTR)0xfffffff8u, D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER,
+        &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "4-GiB-crossing open-adapter exception %#lx, status %#lx\n",
+        exception, status );
+
+    memset( open_split, 0, sizeof(*open_split) );
+    open_split->AdapterLuid = open_gdi.AdapterLuid;
+    open_split->hAdapter = 0x1eadbeed;
+    if (!set_wow64_test_page_protection( lanes + 0x1000, PAGE_NOACCESS ))
+        goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        open_split, D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "cross-page no-access open-adapter exception %#lx, status %#lx\n",
+        exception, status );
+    if (!set_wow64_test_page_protection( lanes + 0x1000, PAGE_READWRITE ))
+        goto done;
+    ok_x4( open_split->hAdapter, ==, 0x1eadbeed );
+
+    if (!set_wow64_test_page_protection( lanes + 0x1000,
+                                          PAGE_READWRITE | PAGE_GUARD ))
+        goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        open_split, D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER, &status );
+    ok( exception == STATUS_GUARD_PAGE_VIOLATION,
+        "cross-page guarded open-adapter exception %#lx, status %#lx\n",
+        exception, status );
+    if (!set_wow64_test_page_protection( lanes + 0x1000, PAGE_READWRITE ))
+        goto done;
+    ok_x4( open_split->hAdapter, ==, 0x1eadbeed );
+
+    if (!set_wow64_test_page_protection( lanes + 0x1000, PAGE_READONLY ))
+        goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        open_split, D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "cross-page read-only open-adapter exception %#lx, status %#lx\n",
+        exception, status );
+    ok_x4( open_split->hAdapter, ==, 0x1eadbeed );
+    if (!set_wow64_test_page_protection( lanes + 0x1000, PAGE_READWRITE ))
+        goto done;
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        open_split, D3DKMT_LIFECYCLE_TEST_OPEN_ADAPTER, &status );
+    ok( !exception, "valid open-adapter follow-up raised %#lx\n", exception );
+    ok_nt( STATUS_SUCCESS, status );
+    if (exception || status) goto done;
+    check_d3dkmt_local( open_split->hAdapter, &next_local );
+
+    memset( create, 0, sizeof(*create) );
+    create->hAdapter = open_split->hAdapter;
+    create->hDevice = 0x1eadbeed;
+    if (!set_wow64_test_page_protection( create, PAGE_NOACCESS )) goto close_adapter;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        create, D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "no-access create-device exception %#lx, status %#lx\n", exception, status );
+    if (!set_wow64_test_page_protection( create, PAGE_READWRITE )) goto close_adapter;
+    ok_x4( create->hDevice, ==, 0x1eadbeed );
+
+    if (!set_wow64_test_page_protection( create, PAGE_READWRITE | PAGE_GUARD ))
+        goto close_adapter;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        create, D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE, &status );
+    ok( exception == STATUS_GUARD_PAGE_VIOLATION,
+        "guarded create-device exception %#lx, status %#lx\n", exception, status );
+    if (!set_wow64_test_page_protection( create, PAGE_READWRITE )) goto close_adapter;
+    ok_x4( create->hDevice, ==, 0x1eadbeed );
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        (void *)(ULONG_PTR)0xfffffff0u, D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE,
+        &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "4-GiB-crossing create-device exception %#lx, status %#lx\n",
+        exception, status );
+
+    memset( create_split, 0, sizeof(*create_split) );
+    create_split->hAdapter = 0x1eadbeed;
+    create_split->hDevice = 0x2eadbeed;
+    create_split->pCommandBuffer = (void *)(ULONG_PTR)0xfffffffcu;
+    create_split->CommandBufferSize = ~0u;
+    create_split->pAllocationList = (void *)(ULONG_PTR)0xfffffffcu;
+    create_split->AllocationListSize = ~0u;
+    create_split->pPatchLocationList = (void *)(ULONG_PTR)0xfffffffcu;
+    create_split->PatchLocationListSize = ~0u;
+    memcpy( &create_split->Flags, &all_flags, sizeof(all_flags) );
+    if (!set_wow64_test_page_protection( lanes + 0x3000, PAGE_NOACCESS ))
+        goto close_adapter;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        create_split, D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "cross-page no-access create-device exception %#lx, status %#lx\n",
+        exception, status );
+    if (!set_wow64_test_page_protection( lanes + 0x3000, PAGE_READWRITE ))
+        goto close_adapter;
+    ok_x4( create_split->hDevice, ==, 0x2eadbeed );
+
+    if (!set_wow64_test_page_protection( lanes + 0x3000,
+                                          PAGE_READWRITE | PAGE_GUARD ))
+        goto close_adapter;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        create_split, D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE, &status );
+    ok( exception == STATUS_GUARD_PAGE_VIOLATION,
+        "cross-page guarded create-device exception %#lx, status %#lx\n",
+        exception, status );
+    if (!set_wow64_test_page_protection( lanes + 0x3000, PAGE_READWRITE ))
+        goto close_adapter;
+    ok_x4( create_split->hDevice, ==, 0x2eadbeed );
+
+    if (!set_wow64_test_page_protection( lanes + 0x3000, PAGE_READONLY ))
+        goto close_adapter;
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        create_split, D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE, &status );
+    ok( !exception, "invalid adapter with read-only output raised %#lx\n",
+        exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    ok_x4( create_split->hDevice, ==, 0x2eadbeed );
+
+    create_split->hAdapter = open_split->hAdapter;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        create_split, D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "valid adapter with read-only output exception %#lx, status %#lx\n",
+        exception, status );
+    ok_x4( create_split->hDevice, ==, 0x2eadbeed );
+    if (!set_wow64_test_page_protection( lanes + 0x3000, PAGE_READWRITE ))
+        goto close_adapter;
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        create_split, D3DKMT_LIFECYCLE_TEST_CREATE_DEVICE, &status );
+    ok( !exception, "valid create-device follow-up raised %#lx\n", exception );
+    ok_nt( STATUS_SUCCESS, status );
+    if (exception || status) goto close_adapter;
+    check_d3dkmt_local( create_split->hDevice, &next_local );
+    ok_ptr( create_split->pCommandBuffer, ==, (void *)(ULONG_PTR)0xfffffffcu );
+    ok_u4( create_split->CommandBufferSize, ==, ~0u );
+    ok_ptr( create_split->pAllocationList, ==, (void *)(ULONG_PTR)0xfffffffcu );
+    ok_u4( create_split->AllocationListSize, ==, ~0u );
+    ok_ptr( create_split->pPatchLocationList, ==,
+            (void *)(ULONG_PTR)0xfffffffcu );
+    ok_u4( create_split->PatchLocationListSize, ==, ~0u );
+
+    destroy->hDevice = create_split->hDevice;
+    if (!set_wow64_test_page_protection( destroy, PAGE_NOACCESS ))
+        goto destroy_device;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        destroy, D3DKMT_LIFECYCLE_TEST_DESTROY_DEVICE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "no-access destroy-device exception %#lx, status %#lx\n", exception,
+        status );
+    if (!set_wow64_test_page_protection( destroy, PAGE_READWRITE ))
+        goto destroy_device;
+
+    if (!set_wow64_test_page_protection( destroy, PAGE_READWRITE | PAGE_GUARD ))
+        goto destroy_device;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        destroy, D3DKMT_LIFECYCLE_TEST_DESTROY_DEVICE, &status );
+    ok( exception == STATUS_GUARD_PAGE_VIOLATION,
+        "guarded destroy-device exception %#lx, status %#lx\n", exception,
+        status );
+    if (!set_wow64_test_page_protection( destroy, PAGE_READWRITE ))
+        goto destroy_device;
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        (void *)(ULONG_PTR)0xfffffffeu, D3DKMT_LIFECYCLE_TEST_DESTROY_DEVICE,
+        &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "4-GiB-crossing destroy-device exception %#lx, status %#lx\n",
+        exception, status );
+
+    destroy->hDevice = 0x1eadbeed;
+    if (!set_wow64_test_page_protection( destroy, PAGE_READONLY ))
+        goto destroy_device;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        destroy, D3DKMT_LIFECYCLE_TEST_DESTROY_DEVICE, &status );
+    ok( !exception, "read-only invalid destroy-device raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    if (!set_wow64_test_page_protection( destroy, PAGE_READWRITE ))
+        goto destroy_device;
+    destroy->hDevice = create_split->hDevice;
+    if (!set_wow64_test_page_protection( destroy, PAGE_READONLY ))
+        goto destroy_device;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        destroy, D3DKMT_LIFECYCLE_TEST_DESTROY_DEVICE, &status );
+    ok( !exception, "read-only destroy-device raised %#lx\n", exception );
+    ok_nt( STATUS_SUCCESS, status );
+    if (!set_wow64_test_page_protection( destroy, PAGE_READWRITE ))
+        goto close_adapter;
+    status = D3DKMTDestroyDevice( destroy );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    goto close_adapter;
+
+destroy_device:
+    if (set_wow64_test_page_protection( destroy, PAGE_READWRITE ))
+    {
+        destroy->hDevice = create_split->hDevice;
+        status = D3DKMTDestroyDevice( destroy );
+        ok_nt( STATUS_SUCCESS, status );
+    }
+
+close_adapter:
+    close->hAdapter = open_split->hAdapter;
+    if (!set_wow64_test_page_protection( close, PAGE_NOACCESS )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        close, D3DKMT_LIFECYCLE_TEST_CLOSE_ADAPTER, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "no-access close-adapter exception %#lx, status %#lx\n", exception,
+        status );
+    if (!set_wow64_test_page_protection( close, PAGE_READWRITE )) goto done;
+
+    if (!set_wow64_test_page_protection( close, PAGE_READWRITE | PAGE_GUARD ))
+        goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        close, D3DKMT_LIFECYCLE_TEST_CLOSE_ADAPTER, &status );
+    ok( exception == STATUS_GUARD_PAGE_VIOLATION,
+        "guarded close-adapter exception %#lx, status %#lx\n", exception,
+        status );
+    if (!set_wow64_test_page_protection( close, PAGE_READWRITE )) goto done;
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        (void *)(ULONG_PTR)0xfffffffeu, D3DKMT_LIFECYCLE_TEST_CLOSE_ADAPTER,
+        &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "4-GiB-crossing close-adapter exception %#lx, status %#lx\n",
+        exception, status );
+
+    close->hAdapter = 0x1eadbeed;
+    if (!set_wow64_test_page_protection( close, PAGE_READONLY )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        close, D3DKMT_LIFECYCLE_TEST_CLOSE_ADAPTER, &status );
+    ok( !exception, "read-only invalid close-adapter raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    if (!set_wow64_test_page_protection( close, PAGE_READWRITE )) goto done;
+    close->hAdapter = open_split->hAdapter;
+    if (!set_wow64_test_page_protection( close, PAGE_READONLY )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_d3dkmt_lifecycle_catching_fault(
+        close, D3DKMT_LIFECYCLE_TEST_CLOSE_ADAPTER, &status );
+    ok( !exception, "read-only close-adapter raised %#lx\n", exception );
+    ok_nt( STATUS_SUCCESS, status );
+    if (!set_wow64_test_page_protection( close, PAGE_READWRITE )) goto done;
+    status = D3DKMTCloseAdapter( close );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+
+    watch = VirtualAlloc( NULL, 0x5000,
+                          MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                          PAGE_READWRITE );
+    if (watch)
+    {
+        D3DKMT_OPENADAPTERFROMLUID *watch_open = (void *)(watch + 0x1000);
+        D3DKMT_CREATEDEVICE *watch_create = (void *)(watch + 0x3000);
+        D3DKMT_DESTROYDEVICE watch_destroy;
+        D3DKMT_CLOSEADAPTER watch_close;
+        ULONG granularity;
+        ULONG_PTR count;
+        void *written[4];
+
+        memset( watch_open, 0, sizeof(*watch_open) );
+        watch_open->AdapterLuid = open_gdi.AdapterLuid;
+        watch_open->hAdapter = 0x1eadbeed;
+        count = ARRAY_SIZE(written);
+        ret = GetWriteWatch( WRITE_WATCH_FLAG_RESET, watch, 0x5000, written,
+                             &count, &granularity );
+        ok( !ret, "GetWriteWatch reset failed %u\n", ret );
+        status = D3DKMTOpenAdapterFromLuid( watch_open );
+        ok_nt( STATUS_SUCCESS, status );
+        count = ARRAY_SIZE(written);
+        ret = GetWriteWatch( 0, watch, 0x5000, written, &count, &granularity );
+        ok( !ret, "GetWriteWatch failed %u\n", ret );
+        ok( count == 1, "open-adapter dirtied %Iu pages\n", count );
+        if (count == 1)
+            ok( written[0] == watch_open, "dirty page %p, expected %p\n",
+                written[0], watch_open );
+
+        if (!status)
+        {
+            memset( watch_create, 0, sizeof(*watch_create) );
+            watch_create->hAdapter = watch_open->hAdapter;
+            watch_create->hDevice = 0x1eadbeed;
+            count = ARRAY_SIZE(written);
+            ret = GetWriteWatch( WRITE_WATCH_FLAG_RESET, watch, 0x5000,
+                                 written, &count, &granularity );
+            ok( !ret, "GetWriteWatch reset failed %u\n", ret );
+            status = D3DKMTCreateDevice( watch_create );
+            ok_nt( STATUS_SUCCESS, status );
+            count = ARRAY_SIZE(written);
+            ret = GetWriteWatch( 0, watch, 0x5000, written, &count,
+                                 &granularity );
+            ok( !ret, "GetWriteWatch failed %u\n", ret );
+            ok( count == 1, "create-device dirtied %Iu pages\n", count );
+            if (count == 1)
+                ok( written[0] == watch_create,
+                    "dirty page %p, expected %p\n", written[0], watch_create );
+
+            if (!status)
+            {
+                watch_destroy.hDevice = watch_create->hDevice;
+                status = D3DKMTDestroyDevice( &watch_destroy );
+                ok_nt( STATUS_SUCCESS, status );
+            }
+            watch_close.hAdapter = watch_open->hAdapter;
+            status = D3DKMTCloseAdapter( &watch_close );
+            ok_nt( STATUS_SUCCESS, status );
+        }
+    }
+    else win_skip( "write-watch allocation failed, error %lu\n", GetLastError() );
+
+done:
+    if (watch) VirtualFree( watch, 0, MEM_RELEASE );
+    VirtualFree( lanes, 0, MEM_RELEASE );
+}
+
+enum d3dkmt_lifecycle_race_op
+{
+    D3DKMT_LIFECYCLE_RACE_CLOSE,
+    D3DKMT_LIFECYCLE_RACE_CREATE,
+    D3DKMT_LIFECYCLE_RACE_DESTROY,
+    D3DKMT_LIFECYCLE_RACE_SET_OWNER,
+};
+
+struct d3dkmt_lifecycle_race
+{
+    HANDLE start;
+    enum d3dkmt_lifecycle_race_op op;
+    D3DKMT_HANDLE handle;
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID source_id;
+    D3DKMT_HANDLE output;
+    NTSTATUS status;
+};
+
+static DWORD WINAPI d3dkmt_lifecycle_race_thread( void *arg )
+{
+    struct d3dkmt_lifecycle_race *race = arg;
+
+    WaitForSingleObject( race->start, INFINITE );
+    switch (race->op)
+    {
+    case D3DKMT_LIFECYCLE_RACE_CLOSE:
+    {
+        D3DKMT_CLOSEADAPTER desc = { .hAdapter = race->handle };
+
+        race->status = D3DKMTCloseAdapter( &desc );
+        break;
+    }
+    case D3DKMT_LIFECYCLE_RACE_CREATE:
+    {
+        D3DKMT_CREATEDEVICE desc = { .hAdapter = race->handle };
+
+        race->status = D3DKMTCreateDevice( &desc );
+        race->output = desc.hDevice;
+        break;
+    }
+    case D3DKMT_LIFECYCLE_RACE_DESTROY:
+    {
+        D3DKMT_DESTROYDEVICE desc = { .hDevice = race->handle };
+
+        race->status = D3DKMTDestroyDevice( &desc );
+        break;
+    }
+    case D3DKMT_LIFECYCLE_RACE_SET_OWNER:
+    {
+        D3DKMT_VIDPNSOURCEOWNER_TYPE type = D3DKMT_VIDPNSOURCEOWNER_EXCLUSIVE;
+        D3DKMT_SETVIDPNSOURCEOWNER desc =
+        {
+            .hDevice = race->handle,
+            .pType = &type,
+            .pVidPnSourceId = &race->source_id,
+            .VidPnSourceCount = 1,
+        };
+
+        race->status = D3DKMTSetVidPnSourceOwner( &desc );
+        break;
+    }
+    }
+    return 0;
+}
+
+static BOOL open_test_adapter_from_luid( const LUID *luid,
+                                         D3DKMT_HANDLE *adapter )
+{
+    D3DKMT_OPENADAPTERFROMLUID open = { .AdapterLuid = *luid };
+    NTSTATUS status = D3DKMTOpenAdapterFromLuid( &open );
+
+    ok_nt( STATUS_SUCCESS, status );
+    if (status) return FALSE;
+    *adapter = open.hAdapter;
+    return TRUE;
+}
+
+static void test_d3dkmt_adapter_device_concurrency(void)
+{
+    enum { thread_count = 8, create_close_iterations = 32 };
+    D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open_gdi = {0};
+    struct d3dkmt_lifecycle_race races[thread_count];
+    HANDLE threads[thread_count], start;
+    D3DKMT_HANDLE adapter, device;
+    NTSTATUS status;
+    DWORD wait;
+    UINT created, i, successes;
+
+    if (!winetest_platform_is_wine)
+    {
+        win_skip( "adapter/device object-table race test is Wine-specific\n" );
+        return;
+    }
+
+    wcscpy( open_gdi.DeviceName, display1W );
+    status = D3DKMTOpenAdapterFromGdiDisplayName( &open_gdi );
+    ok_nt( STATUS_SUCCESS, status );
+    if (status) return;
+    adapter = open_gdi.hAdapter;
+
+    start = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok_ptr( start, !=, NULL );
+    if (!start)
+    {
+        D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+        D3DKMTCloseAdapter( &close );
+        return;
+    }
+    memset( threads, 0, sizeof(threads) );
+    for (i = 0; i < thread_count; i++)
+    {
+        races[i].start = start;
+        races[i].op = D3DKMT_LIFECYCLE_RACE_CLOSE;
+        races[i].handle = adapter;
+        races[i].output = 0;
+        races[i].status = STATUS_UNSUCCESSFUL;
+        threads[i] = CreateThread( NULL, 0, d3dkmt_lifecycle_race_thread,
+                                   &races[i], 0, NULL );
+        ok_ptr( threads[i], !=, NULL );
+        if (!threads[i]) break;
+    }
+    created = i;
+    if (created == thread_count)
+    {
+        SetEvent( start );
+        wait = WaitForMultipleObjects( thread_count, threads, TRUE, 30000 );
+        ok_u4( wait, ==, WAIT_OBJECT_0 );
+        if (wait != WAIT_OBJECT_0)
+            WaitForMultipleObjects( thread_count, threads, TRUE, INFINITE );
+        successes = 0;
+        for (i = 0; i < thread_count; i++)
+        {
+            if (races[i].status == STATUS_SUCCESS) successes++;
+            else ok_nt( STATUS_INVALID_PARAMETER, races[i].status );
+        }
+        ok_u4( successes, ==, 1 );
+    }
+    else
+    {
+        SetEvent( start );
+        if (created)
+        {
+            wait = WaitForMultipleObjects( created, threads, TRUE, 30000 );
+            ok_u4( wait, ==, WAIT_OBJECT_0 );
+            if (wait != WAIT_OBJECT_0)
+                WaitForMultipleObjects( created, threads, TRUE, INFINITE );
+        }
+        else
+        {
+            D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+            D3DKMTCloseAdapter( &close );
+        }
+    }
+    for (i = 0; i < thread_count; i++) if (threads[i]) CloseHandle( threads[i] );
+    CloseHandle( start );
+
+    if (!open_test_adapter_from_luid( &open_gdi.AdapterLuid, &adapter )) return;
+    {
+        D3DKMT_CREATEDEVICE create = { .hAdapter = adapter };
+
+        status = D3DKMTCreateDevice( &create );
+        ok_nt( STATUS_SUCCESS, status );
+        if (status)
+        {
+            D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+            D3DKMTCloseAdapter( &close );
+            return;
+        }
+        device = create.hDevice;
+    }
+
+    start = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok_ptr( start, !=, NULL );
+    if (!start)
+    {
+        D3DKMT_DESTROYDEVICE destroy = { .hDevice = device };
+        D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+        D3DKMTDestroyDevice( &destroy );
+        D3DKMTCloseAdapter( &close );
+        return;
+    }
+    memset( threads, 0, sizeof(threads) );
+    for (i = 0; i < thread_count; i++)
+    {
+        races[i].start = start;
+        races[i].op = D3DKMT_LIFECYCLE_RACE_DESTROY;
+        races[i].handle = device;
+        races[i].output = 0;
+        races[i].status = STATUS_UNSUCCESSFUL;
+        threads[i] = CreateThread( NULL, 0, d3dkmt_lifecycle_race_thread,
+                                   &races[i], 0, NULL );
+        ok_ptr( threads[i], !=, NULL );
+        if (!threads[i]) break;
+    }
+    created = i;
+    if (created == thread_count)
+    {
+        SetEvent( start );
+        wait = WaitForMultipleObjects( thread_count, threads, TRUE, 30000 );
+        ok_u4( wait, ==, WAIT_OBJECT_0 );
+        if (wait != WAIT_OBJECT_0)
+            WaitForMultipleObjects( thread_count, threads, TRUE, INFINITE );
+        successes = 0;
+        for (i = 0; i < thread_count; i++)
+        {
+            if (races[i].status == STATUS_SUCCESS) successes++;
+            else ok_nt( STATUS_INVALID_PARAMETER, races[i].status );
+        }
+        ok_u4( successes, ==, 1 );
+    }
+    else
+    {
+        SetEvent( start );
+        if (created)
+        {
+            wait = WaitForMultipleObjects( created, threads, TRUE, 30000 );
+            ok_u4( wait, ==, WAIT_OBJECT_0 );
+            if (wait != WAIT_OBJECT_0)
+                WaitForMultipleObjects( created, threads, TRUE, INFINITE );
+        }
+        else
+        {
+            D3DKMT_DESTROYDEVICE destroy = { .hDevice = device };
+            D3DKMTDestroyDevice( &destroy );
+        }
+    }
+    for (i = 0; i < thread_count; i++) if (threads[i]) CloseHandle( threads[i] );
+    CloseHandle( start );
+    {
+        D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+        status = D3DKMTCloseAdapter( &close );
+        ok_nt( STATUS_SUCCESS, status );
+    }
+
+    for (i = 0; i < create_close_iterations; i++)
+    {
+        struct d3dkmt_lifecycle_race create_race, close_race;
+        HANDLE pair[2] = {0};
+
+        if (!open_test_adapter_from_luid( &open_gdi.AdapterLuid, &adapter )) break;
+        start = CreateEventW( NULL, TRUE, FALSE, NULL );
+        ok_ptr( start, !=, NULL );
+        if (!start)
+        {
+            D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+
+            D3DKMTCloseAdapter( &close );
+            break;
+        }
+
+        create_race.start = close_race.start = start;
+        create_race.op = D3DKMT_LIFECYCLE_RACE_CREATE;
+        close_race.op = D3DKMT_LIFECYCLE_RACE_CLOSE;
+        create_race.handle = close_race.handle = adapter;
+        create_race.output = close_race.output = 0;
+        create_race.status = close_race.status = STATUS_UNSUCCESSFUL;
+        pair[0] = CreateThread( NULL, 0, d3dkmt_lifecycle_race_thread,
+                                &create_race, 0, NULL );
+        pair[1] = CreateThread( NULL, 0, d3dkmt_lifecycle_race_thread,
+                                &close_race, 0, NULL );
+        ok_ptr( pair[0], !=, NULL );
+        ok_ptr( pair[1], !=, NULL );
+        SetEvent( start );
+        if (pair[0] && pair[1])
+        {
+            wait = WaitForMultipleObjects( 2, pair, TRUE, 30000 );
+            ok_u4( wait, ==, WAIT_OBJECT_0 );
+            if (wait != WAIT_OBJECT_0)
+                WaitForMultipleObjects( 2, pair, TRUE, INFINITE );
+            ok_nt( STATUS_SUCCESS, close_race.status );
+            ok( create_race.status == STATUS_SUCCESS ||
+                create_race.status == STATUS_INVALID_PARAMETER,
+                "iteration %u create returned %#lx\n", i, create_race.status );
+            if (create_race.status == STATUS_SUCCESS)
+            {
+                D3DKMT_DESTROYDEVICE destroy = { .hDevice = create_race.output };
+
+                status = D3DKMTDestroyDevice( &destroy );
+                ok_nt( STATUS_SUCCESS, status );
+            }
+        }
+        else
+        {
+            if (pair[0])
+            {
+                wait = WaitForSingleObject( pair[0], 30000 );
+                ok_u4( wait, ==, WAIT_OBJECT_0 );
+                if (wait != WAIT_OBJECT_0)
+                    WaitForSingleObject( pair[0], INFINITE );
+            }
+            if (pair[1])
+            {
+                wait = WaitForSingleObject( pair[1], 30000 );
+                ok_u4( wait, ==, WAIT_OBJECT_0 );
+                if (wait != WAIT_OBJECT_0)
+                    WaitForSingleObject( pair[1], INFINITE );
+            }
+            if (!pair[1])
+            {
+                D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+                D3DKMTCloseAdapter( &close );
+            }
+            if (pair[0] && create_race.status == STATUS_SUCCESS)
+            {
+                D3DKMT_DESTROYDEVICE destroy = { .hDevice = create_race.output };
+                D3DKMTDestroyDevice( &destroy );
+            }
+        }
+        if (pair[0]) CloseHandle( pair[0] );
+        if (pair[1]) CloseHandle( pair[1] );
+        CloseHandle( start );
+    }
+
+    for (i = 0; i < create_close_iterations; i++)
+    {
+        struct d3dkmt_lifecycle_race destroy_race, owner_race;
+        D3DKMT_CHECKVIDPNEXCLUSIVEOWNERSHIP check;
+        D3DKMT_SETVIDPNSOURCEOWNER stale;
+        D3DKMT_VIDPNSOURCEOWNER_TYPE type;
+        HANDLE pair[2] = {0};
+
+        if (!open_test_adapter_from_luid( &open_gdi.AdapterLuid, &adapter )) break;
+        {
+            D3DKMT_CREATEDEVICE create = { .hAdapter = adapter };
+
+            status = D3DKMTCreateDevice( &create );
+            ok_nt( STATUS_SUCCESS, status );
+            if (status)
+            {
+                D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+
+                D3DKMTCloseAdapter( &close );
+                break;
+            }
+            device = create.hDevice;
+        }
+
+        start = CreateEventW( NULL, TRUE, FALSE, NULL );
+        ok_ptr( start, !=, NULL );
+        if (!start)
+        {
+            D3DKMT_DESTROYDEVICE destroy = { .hDevice = device };
+            D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+
+            D3DKMTDestroyDevice( &destroy );
+            D3DKMTCloseAdapter( &close );
+            break;
+        }
+
+        destroy_race.start = owner_race.start = start;
+        destroy_race.op = D3DKMT_LIFECYCLE_RACE_DESTROY;
+        owner_race.op = D3DKMT_LIFECYCLE_RACE_SET_OWNER;
+        destroy_race.handle = owner_race.handle = device;
+        destroy_race.source_id = owner_race.source_id = open_gdi.VidPnSourceId;
+        destroy_race.output = owner_race.output = 0;
+        destroy_race.status = owner_race.status = STATUS_UNSUCCESSFUL;
+        pair[0] = CreateThread( NULL, 0, d3dkmt_lifecycle_race_thread,
+                                &destroy_race, 0, NULL );
+        pair[1] = CreateThread( NULL, 0, d3dkmt_lifecycle_race_thread,
+                                &owner_race, 0, NULL );
+        ok_ptr( pair[0], !=, NULL );
+        ok_ptr( pair[1], !=, NULL );
+        SetEvent( start );
+        if (pair[0])
+        {
+            wait = WaitForSingleObject( pair[0], 30000 );
+            ok_u4( wait, ==, WAIT_OBJECT_0 );
+            if (wait != WAIT_OBJECT_0)
+                WaitForSingleObject( pair[0], INFINITE );
+            ok_nt( STATUS_SUCCESS, destroy_race.status );
+        }
+        else
+        {
+            D3DKMT_DESTROYDEVICE destroy = { .hDevice = device };
+
+            status = D3DKMTDestroyDevice( &destroy );
+            ok_nt( STATUS_SUCCESS, status );
+        }
+        if (pair[1])
+        {
+            wait = WaitForSingleObject( pair[1], 30000 );
+            ok_u4( wait, ==, WAIT_OBJECT_0 );
+            if (wait != WAIT_OBJECT_0)
+                WaitForSingleObject( pair[1], INFINITE );
+            ok( owner_race.status == STATUS_SUCCESS ||
+                owner_race.status == STATUS_INVALID_PARAMETER,
+                "iteration %u set-owner returned %#lx\n", i, owner_race.status );
+        }
+
+        type = D3DKMT_VIDPNSOURCEOWNER_EXCLUSIVE;
+        stale.hDevice = device;
+        stale.pType = &type;
+        stale.pVidPnSourceId = &open_gdi.VidPnSourceId;
+        stale.VidPnSourceCount = 1;
+        status = D3DKMTSetVidPnSourceOwner( &stale );
+        ok_nt( STATUS_INVALID_PARAMETER, status );
+
+        check.hAdapter = adapter;
+        check.VidPnSourceId = open_gdi.VidPnSourceId;
+        status = D3DKMTCheckVidPnExclusiveOwnership( &check );
+        ok_nt( STATUS_SUCCESS, status );
+
+        if (pair[0]) CloseHandle( pair[0] );
+        if (pair[1]) CloseHandle( pair[1] );
+        CloseHandle( start );
+        {
+            D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+
+            status = D3DKMTCloseAdapter( &close );
+            ok_nt( STATUS_SUCCESS, status );
+        }
+    }
+
+    if (open_test_adapter_from_luid( &open_gdi.AdapterLuid, &adapter ))
+    {
+        D3DKMT_CLOSEADAPTER close = { .hAdapter = adapter };
+        status = D3DKMTCloseAdapter( &close );
+        ok_nt( STATUS_SUCCESS, status );
+    }
+}
+
+static void check_wow64_create_allocation_followup( D3DKMT_CREATEALLOCATION *create,
+                                                     union wow64_test_allocation_info *allocation,
+                                                     BOOL version2,
+                                                     D3DKMT_HANDLE *next_local )
+{
+    D3DKMT_DESTROYALLOCATION destroy = { .hDevice = create->hDevice };
+    D3DKMT_HANDLE handle;
+    DWORD exception;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    exception = call_create_allocation_catching_fault( create, version2, &status );
+    ok( !exception, "valid follow-up raised %#lx\n", exception );
+    if (exception) return;
+    ok_nt( STATUS_SUCCESS, status );
+    if (status) return;
+
+    handle = version2 ? allocation->info2.hAllocation : allocation->info.hAllocation;
+    if (create->Flags.CreateResource)
+    {
+        if (create->Flags.CreateShared) check_d3dkmt_global( create->hGlobalShare );
+        else ok_x4( create->hGlobalShare, ==, 0 );
+        check_d3dkmt_local( create->hResource, next_local );
+        check_d3dkmt_local( handle, next_local );
+        destroy.hResource = create->hResource;
+    }
+    else
+    {
+        check_d3dkmt_local( handle, next_local );
+        destroy.phAllocationList = &handle;
+        destroy.AllocationCount = 1;
+    }
+    status = D3DKMTDestroyAllocation( &destroy );
+    ok_nt( STATUS_SUCCESS, status );
+}
+
+static void test_wow64_protected_create_allocation( D3DKMT_HANDLE device,
+                                                     D3DKMT_HANDLE *next_local )
+{
+    D3DKMT_CREATESTANDARDALLOCATION *standard;
+    union wow64_test_allocation_info *allocation;
+    union wow64_test_allocation_info *split_allocation;
+    D3DKMT_CREATEALLOCATION *create;
+    D3DGPU_VIRTUAL_ADDRESS overlap_gpu;
+    BYTE *lanes, *runtime;
+    DWORD exception;
+    NTSTATUS status;
+    BOOL is_wow64 = FALSE;
+    static const UINT invalid_counts[] = {2, ~0u};
+    UINT i;
+
+    if (sizeof(void *) != 4 || !IsWow64Process( GetCurrentProcess(), &is_wow64 ) || !is_wow64)
+    {
+        win_skip( "protected allocation test requires a 32-bit process under WoW64\n" );
+        return;
+    }
+
+    lanes = VirtualAlloc( NULL, 0x5000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    if (!lanes)
+    {
+        win_skip( "VirtualAlloc failed, error %lu\n", GetLastError() );
+        return;
+    }
+    create = (D3DKMT_CREATEALLOCATION *)(lanes + 0x0000);
+    standard = (D3DKMT_CREATESTANDARDALLOCATION *)(lanes + 0x1000);
+    allocation = (union wow64_test_allocation_info *)(lanes + 0x2000);
+    runtime = lanes + 0x4000;
+    split_allocation = (union wow64_test_allocation_info *)(lanes + 0x2000 -
+        offsetof(D3DDDI_ALLOCATIONINFO2, GpuVirtualAddress));
+
+    init_wow64_test_create_allocation( create, standard, allocation, 0,
+                                        lanes + 0x3000, FALSE );
+    create->pPrivateRuntimeData = lanes + 0x3000;
+    create->PrivateRuntimeDataSize = ~0u;
+    if (!set_wow64_test_page_protection( standard, PAGE_NOACCESS ) ||
+        !set_wow64_test_page_protection( allocation, PAGE_NOACCESS ) ||
+        !set_wow64_test_page_protection( lanes + 0x3000, PAGE_NOACCESS ))
+        goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, FALSE, &status );
+    ok( !exception, "invalid device raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+
+    create->hDevice = device;
+    for (i = 0; i < ARRAY_SIZE(invalid_counts); i++)
+    {
+        create->NumAllocations = invalid_counts[i];
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_create_allocation_catching_fault( create, FALSE, &status );
+        ok( !exception, "count %#x raised %#lx\n", invalid_counts[i], exception );
+        ok_nt( STATUS_INVALID_PARAMETER, status );
+    }
+    if (!set_wow64_test_page_protection( standard, PAGE_READWRITE )) goto done;
+    create->NumAllocations = 1;
+    standard->Type = 0;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, FALSE, &status );
+    ok( !exception, "invalid standard raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+
+    if (!set_wow64_test_page_protection( allocation, PAGE_READWRITE ) ||
+        !set_wow64_test_page_protection( lanes + 0x3000, PAGE_READWRITE ))
+        goto done;
+    standard->Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
+    create->pPrivateRuntimeData = NULL;
+    create->PrivateRuntimeDataSize = 0;
+    check_wow64_create_allocation_followup( create, allocation, FALSE, next_local );
+
+    init_wow64_test_create_allocation( create, standard, allocation, 0,
+                                        lanes + 0x3000, FALSE );
+    create->Flags.CreateResource = 1;
+    create->Flags.CreateShared = 1;
+    create->pPrivateRuntimeData = runtime;
+    create->PrivateRuntimeDataSize = 0x20;
+    memset( runtime, 0x5a, create->PrivateRuntimeDataSize );
+    if (!set_wow64_test_page_protection( runtime, PAGE_NOACCESS )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, FALSE, &status );
+    ok( !exception, "invalid device with protected runtime raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+
+    create->hDevice = device;
+    create->NumAllocations = 2;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, FALSE, &status );
+    ok( !exception, "invalid count with protected runtime raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+
+    create->NumAllocations = 1;
+    create->hResource = 0x1eadbeed;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, FALSE, &status );
+    ok( !exception, "invalid resource with protected runtime raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_HANDLE, status );
+    ok_x4( create->hResource, ==, 0x1eadbeed );
+    ok_x4( create->hGlobalShare, ==, 0x1eadbeed );
+    ok_x4( allocation->info.hAllocation, ==, 0x1eadbeed );
+
+    create->hResource = 0;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, FALSE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "protected runtime exception %#lx, status %#lx\n", exception, status );
+    ok_x4( create->hResource, ==, 0 );
+    ok_x4( create->hGlobalShare, ==, 0x1eadbeed );
+    ok_x4( allocation->info.hAllocation, ==, 0x1eadbeed );
+    if (!set_wow64_test_page_protection( runtime, PAGE_READWRITE )) goto done;
+    check_wow64_create_allocation_followup( create, allocation, FALSE, next_local );
+
+    init_wow64_test_create_allocation( create, standard, allocation, device,
+                                        lanes + 0x3000, FALSE );
+    create->Flags.CreateResource = 1;
+    create->Flags.CreateShared = 1;
+    create->pPrivateRuntimeData = NULL;
+    create->PrivateRuntimeDataSize = 0;
+    check_wow64_create_allocation_followup( create, allocation, FALSE, next_local );
+
+    init_wow64_test_create_allocation( create, standard, allocation, device,
+                                        lanes + 0x3000, TRUE );
+    create->Flags.CreateResource = 1;
+    create->Flags.CreateShared = 1;
+    create->pPrivateRuntimeData = runtime;
+    create->PrivateRuntimeDataSize = 0x20;
+    allocation->info2.GpuVirtualAddress = 0x1122334455667788ull;
+    if (!set_wow64_test_page_protection( runtime, PAGE_READONLY )) goto done;
+    check_wow64_create_allocation_followup( create, allocation, TRUE, next_local );
+    ok_x8( allocation->info2.GpuVirtualAddress, ==, 0x1122334455667788ull );
+    if (!set_wow64_test_page_protection( runtime, PAGE_READWRITE )) goto done;
+
+    if (winetest_platform_is_wine)
+    {
+        init_wow64_test_create_allocation( create, standard, allocation, device,
+                                            lanes + 0x3000, TRUE );
+        create->Flags.CreateResource = 1;
+        create->Flags.CreateShared = 1;
+        create->pPrivateRuntimeData = runtime;
+        create->PrivateRuntimeDataSize = ~PtrToUlong( runtime ) + 2;
+        allocation->info2.GpuVirtualAddress = 0x1122334455667788ull;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_create_allocation_catching_fault( create, TRUE, &status );
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "4-GiB-crossing runtime exception %#lx, status %#lx\n", exception, status );
+        ok_x4( create->hResource, ==, 0 );
+        ok_x4( create->hGlobalShare, ==, 0x1eadbeed );
+        ok_x4( allocation->info2.hAllocation, ==, 0x1eadbeed );
+        ok_x8( allocation->info2.GpuVirtualAddress, ==, 0x1122334455667788ull );
+        create->PrivateRuntimeDataSize = 0x20;
+        check_wow64_create_allocation_followup( create, allocation, TRUE, next_local );
+    }
+
+    init_wow64_test_create_allocation( create, standard, allocation, device,
+                                        lanes + 0x3000, FALSE );
+    if (!set_wow64_test_page_protection( standard, PAGE_NOACCESS )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, FALSE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "protected standard exception %#lx, status %#lx\n", exception, status );
+    ok_x4( create->hGlobalShare, ==, 0x1eadbeed );
+    ok_x4( allocation->info.hAllocation, ==, 0x1eadbeed );
+    if (!set_wow64_test_page_protection( standard, PAGE_READWRITE )) goto done;
+    check_wow64_create_allocation_followup( create, allocation, FALSE, next_local );
+
+    init_wow64_test_create_allocation( create, standard, allocation, device,
+                                        lanes + 0x3000, TRUE );
+    if (!set_wow64_test_page_protection( allocation, PAGE_NOACCESS )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, TRUE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "protected allocation exception %#lx, status %#lx\n", exception, status );
+    ok_x4( create->hGlobalShare, ==, 0x1eadbeed );
+    if (!set_wow64_test_page_protection( allocation, PAGE_READWRITE )) goto done;
+    check_wow64_create_allocation_followup( create, allocation, TRUE, next_local );
+
+    init_wow64_test_create_allocation( create, standard, allocation, device,
+                                        lanes + 0x3000, FALSE );
+    if (!set_wow64_test_page_protection( create, PAGE_READONLY )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, FALSE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "read-only descriptor exception %#lx, status %#lx\n", exception, status );
+    ok_x4( allocation->info.hAllocation, ==, 0x1eadbeed );
+    if (!set_wow64_test_page_protection( create, PAGE_READWRITE )) goto done;
+    ok_x4( create->hGlobalShare, ==, 0x1eadbeed );
+    check_wow64_create_allocation_followup( create, allocation, FALSE, next_local );
+
+    init_wow64_test_create_allocation( create, standard, split_allocation, device,
+                                        lanes + 0x3000, TRUE );
+    split_allocation->info2.GpuVirtualAddress = 0x1122334455667788ull;
+    if (!set_wow64_test_page_protection( &split_allocation->info2.GpuVirtualAddress,
+                                          PAGE_READONLY ))
+        goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, TRUE, &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "read-only GPU address exception %#lx, status %#lx\n", exception, status );
+    ok_x4( create->hGlobalShare, ==, 0x1eadbeed );
+    ok_x4( split_allocation->info2.hAllocation, ==, 0x1eadbeed );
+    ok_x8( split_allocation->info2.GpuVirtualAddress, ==, 0x1122334455667788ull );
+    if (!set_wow64_test_page_protection( &split_allocation->info2.GpuVirtualAddress,
+                                          PAGE_READWRITE ))
+        goto done;
+    check_wow64_create_allocation_followup( create, split_allocation, TRUE, next_local );
+    ok_x8( split_allocation->info2.GpuVirtualAddress, ==, 0x1122334455667788ull );
+
+    /* Exercise all three v2 ranges with the outer output and hAllocation at
+     * the same address.  The later hAllocation range wins, then the GPU range
+     * publishes the captured value. */
+    init_wow64_test_create_allocation( create, standard, allocation, device,
+                                        lanes + 0x3000, TRUE );
+    create->hResource = 0;
+    create->hGlobalShare = PtrToUlong( lanes + 0x3000 );
+    create->pAllocationInfo2 = (D3DDDI_ALLOCATIONINFO2 *)&create->hResource;
+    overlap_gpu = create->pAllocationInfo2->GpuVirtualAddress;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_create_allocation_catching_fault( create, TRUE, &status );
+    ok( !exception, "overlapping outputs raised %#lx\n", exception );
+    ok_nt( STATUS_SUCCESS, status );
+    if (!exception && !status)
+    {
+        D3DKMT_DESTROYALLOCATION destroy = { .hDevice = device };
+        D3DKMT_HANDLE handle = create->hResource;
+
+        check_d3dkmt_local( handle, next_local );
+        ok_x4( create->hGlobalShare, ==, 0 );
+        ok_x8( ((D3DDDI_ALLOCATIONINFO2 *)&create->hResource)->GpuVirtualAddress,
+               ==, overlap_gpu );
+        destroy.phAllocationList = &handle;
+        destroy.AllocationCount = 1;
+        status = D3DKMTDestroyAllocation( &destroy );
+        ok_nt( STATUS_SUCCESS, status );
+    }
+
+done:
+    VirtualFree( lanes, 0, MEM_RELEASE );
+}
+
+static void init_wow64_test_open_resource( D3DKMT_OPENRESOURCE *open,
+                                            union wow64_test_open_allocation_info *allocation,
+                                            D3DKMT_HANDLE device, D3DKMT_HANDLE global,
+                                            void *runtime, UINT runtime_size,
+                                            void *resource_data, UINT resource_size,
+                                            void *total_data, UINT total_size,
+                                            BOOL version2 )
+{
+    memset( open, 0, sizeof(*open) );
+    memset( allocation, 0, sizeof(*allocation) );
+    open->hDevice = device;
+    open->hGlobalShare = global;
+    open->NumAllocations = 1;
+    open->pPrivateRuntimeData = runtime;
+    open->PrivateRuntimeDataSize = runtime_size;
+    open->pResourcePrivateDriverData = resource_data;
+    open->ResourcePrivateDriverDataSize = resource_size;
+    open->pTotalPrivateDriverDataBuffer = total_data;
+    open->TotalPrivateDriverDataBufferSize = total_size;
+    open->hResource = 0x1eadbeed;
+    if (version2)
+    {
+        open->pOpenAllocationInfo2 = &allocation->info2;
+        allocation->info2.hAllocation = 0x1eadbeed;
+        allocation->info2.pPrivateDriverData = resource_data;
+        allocation->info2.PrivateDriverDataSize = 0xdeadbeef;
+        allocation->info2.GpuVirtualAddress = 0x1122334455667788ull;
+    }
+    else
+    {
+        open->pOpenAllocationInfo = &allocation->info;
+        allocation->info.hAllocation = 0x1eadbeed;
+        allocation->info.pPrivateDriverData = resource_data;
+        allocation->info.PrivateDriverDataSize = 0xdeadbeef;
+    }
+}
+
+static void test_wow64_protected_open_resource(
+    D3DKMT_HANDLE device, D3DKMT_HANDLE global, UINT runtime_size,
+    UINT resource_size, UINT total_size, D3DKMT_HANDLE *next_local )
+{
+    static const UINT invalid_counts[] = {0, 2, ~0u};
+    union wow64_test_open_allocation_info *allocation;
+    D3DKMT_DESTROYALLOCATION destroy = {0};
+    D3DKMT_OPENRESOURCE *open;
+    BYTE *lanes, *runtime;
+    DWORD exception;
+    NTSTATUS status;
+    BOOL is_wow64 = FALSE;
+    UINT i, version;
+
+    if (sizeof(void *) != 4 || !IsWow64Process( GetCurrentProcess(), &is_wow64 ) || !is_wow64)
+    {
+        win_skip( "protected open-resource test requires a 32-bit process under WoW64\n" );
+        return;
+    }
+
+    lanes = VirtualAlloc( NULL, 0x6000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    if (!lanes)
+    {
+        win_skip( "VirtualAlloc failed, error %lu\n", GetLastError() );
+        return;
+    }
+    open = (D3DKMT_OPENRESOURCE *)(lanes + 0x0000);
+    allocation = (union wow64_test_open_allocation_info *)(lanes + 0x1000);
+    runtime = lanes + 0x2000;
+
+    for (version = 0; version < 2; version++)
+    {
+        enum open_resource_test_variant variant = version ? OPEN_RESOURCE_TEST_V2 :
+                                                            OPEN_RESOURCE_TEST_V1;
+
+        init_wow64_test_open_resource( open, allocation, device, global, runtime,
+                                        runtime_size, lanes + 0x3000, resource_size,
+                                        lanes + 0x4000, total_size, version );
+        if (!set_wow64_test_page_protection( allocation, PAGE_NOACCESS ) ||
+            !set_wow64_test_page_protection( runtime, PAGE_NOACCESS ))
+            goto done;
+
+        open->hDevice = 0;
+        open->NumAllocations = ~0u;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( !exception, "v%u invalid device raised %#lx\n", version + 1, exception );
+        ok_nt( STATUS_INVALID_PARAMETER, status );
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+
+        open->hDevice = device;
+        open->hGlobalShare = global ^ 0x80000000u;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( !exception, "v%u invalid global raised %#lx\n", version + 1, exception );
+        ok_nt( STATUS_INVALID_PARAMETER, status );
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+
+        open->hGlobalShare = global;
+        for (i = 0; i < ARRAY_SIZE(invalid_counts); i++)
+        {
+            open->NumAllocations = invalid_counts[i];
+            status = STATUS_UNSUCCESSFUL;
+            exception = call_open_resource_catching_fault( open, variant, &status );
+            ok( !exception, "v%u count %#x raised %#lx\n", version + 1,
+                invalid_counts[i], exception );
+            ok_nt( STATUS_INVALID_PARAMETER, status );
+            ok_x4( open->hResource, ==, 0x1eadbeed );
+        }
+
+        open->NumAllocations = 1;
+        open->PrivateRuntimeDataSize = runtime_size + 1;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( !exception, "v%u invalid runtime size raised %#lx\n", version + 1,
+            exception );
+        ok_nt( STATUS_INVALID_PARAMETER, status );
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+        open->PrivateRuntimeDataSize = runtime_size;
+
+        open->NumAllocations = 1;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "v%u protected allocation exception %#lx, status %#lx\n",
+            version + 1, exception, status );
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+
+        if (!set_wow64_test_page_protection( allocation, PAGE_READWRITE )) goto done;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "v%u protected runtime exception %#lx, status %#lx\n",
+            version + 1, exception, status );
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+
+        if (!set_wow64_test_page_protection( runtime, PAGE_READONLY )) goto done;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "v%u read-only runtime exception %#lx, status %#lx\n",
+            version + 1, exception, status );
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+        if (!set_wow64_test_page_protection( runtime, PAGE_READWRITE )) goto done;
+
+        if (winetest_platform_is_wine)
+        {
+            if (version) open->pOpenAllocationInfo2 = (void *)(ULONG_PTR)0xfffffffcu;
+            else open->pOpenAllocationInfo = (void *)(ULONG_PTR)0xfffffffcu;
+            status = STATUS_UNSUCCESSFUL;
+            exception = call_open_resource_catching_fault( open, variant, &status );
+            ok( exception == STATUS_ACCESS_VIOLATION,
+                "v%u 4-GiB-crossing allocation exception %#lx, status %#lx\n",
+                version + 1, exception, status );
+            if (version) open->pOpenAllocationInfo2 = &allocation->info2;
+            else open->pOpenAllocationInfo = &allocation->info;
+
+            if (runtime_size > 1)
+            {
+                open->pPrivateRuntimeData =
+                    (void *)(ULONG_PTR)(0u - runtime_size + 1);
+                status = STATUS_UNSUCCESSFUL;
+                exception = call_open_resource_catching_fault( open, variant, &status );
+                ok( exception == STATUS_ACCESS_VIOLATION,
+                    "v%u 4-GiB-crossing runtime exception %#lx, status %#lx\n",
+                    version + 1, exception, status );
+                open->pPrivateRuntimeData = runtime;
+            }
+        }
+
+        if (!set_wow64_test_page_protection( open, PAGE_READONLY )) goto done;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "v%u read-only descriptor exception %#lx, status %#lx\n",
+            version + 1, exception, status );
+        if (!set_wow64_test_page_protection( open, PAGE_READWRITE )) goto done;
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+
+        if (!set_wow64_test_page_protection( allocation, PAGE_READONLY )) goto done;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "v%u read-only allocation exception %#lx, status %#lx\n",
+            version + 1, exception, status );
+        if (!set_wow64_test_page_protection( allocation, PAGE_READWRITE )) goto done;
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault( open, variant, &status );
+        ok( !exception, "v%u valid follow-up raised %#lx\n", version + 1, exception );
+        ok_nt( STATUS_SUCCESS, status );
+        if (!exception && !status)
+        {
+            D3DKMT_HANDLE allocation_handle = version ? allocation->info2.hAllocation :
+                                                       allocation->info.hAllocation;
+
+            check_d3dkmt_local( open->hResource, next_local );
+            check_d3dkmt_local( allocation_handle, next_local );
+            if (version)
+                ok_x8( allocation->info2.GpuVirtualAddress, ==,
+                       0x1122334455667788ull );
+            destroy.hDevice = device;
+            destroy.hResource = open->hResource;
+            status = D3DKMTDestroyAllocation( &destroy );
+            ok_nt( STATUS_SUCCESS, status );
+        }
+
+        if (version)
+        {
+            D3DDDI_OPENALLOCATIONINFO2 *overlap;
+
+            init_wow64_test_open_resource( open, allocation, device, global, runtime,
+                                            runtime_size, lanes + 0x3000, resource_size,
+                                            lanes + 0x4000, total_size, TRUE );
+            overlap = (D3DDDI_OPENALLOCATIONINFO2 *)
+                &open->TotalPrivateDriverDataBufferSize;
+            open->pOpenAllocationInfo2 = overlap;
+            overlap->hAllocation = 0x1eadbeed;
+            overlap->pPrivateDriverData = lanes + 0x3000;
+            overlap->PrivateDriverDataSize = 0xdeadbeef;
+            overlap->GpuVirtualAddress = 0x1122334455667788ull;
+            status = STATUS_UNSUCCESSFUL;
+            exception = call_open_resource_catching_fault(
+                open, OPEN_RESOURCE_TEST_V2, &status );
+            ok( !exception, "overlapping open-resource outputs raised %#lx\n",
+                exception );
+            ok_nt( STATUS_SUCCESS, status );
+            if (!exception && !status)
+            {
+                check_d3dkmt_local( open->hResource, next_local );
+                check_d3dkmt_local( open->TotalPrivateDriverDataBufferSize,
+                                    next_local );
+                ok_x8( overlap->GpuVirtualAddress, ==, 0x1122334455667788ull );
+                destroy.hDevice = device;
+                destroy.hResource = open->hResource;
+                status = D3DKMTDestroyAllocation( &destroy );
+                ok_nt( STATUS_SUCCESS, status );
+            }
+        }
+    }
+
+done:
+    VirtualFree( lanes, 0, MEM_RELEASE );
+}
+
+static void init_wow64_test_open_resource_nt(
+    D3DKMT_OPENRESOURCEFROMNTHANDLE *open, D3DDDI_OPENALLOCATIONINFO2 *allocation,
+    D3DKMT_HANDLE device, HANDLE handle, void *runtime, UINT runtime_size,
+    void *resource_data, UINT resource_size, void *total_data, UINT total_size,
+    void *keyed_data )
+{
+    memset( open, 0, sizeof(*open) );
+    memset( allocation, 0, sizeof(*allocation) );
+    open->hDevice = device;
+    open->hNtHandle = handle;
+    open->NumAllocations = 1;
+    open->pOpenAllocationInfo2 = allocation;
+    open->PrivateRuntimeDataSize = runtime_size;
+    open->pPrivateRuntimeData = runtime;
+    open->ResourcePrivateDriverDataSize = resource_size;
+    open->pResourcePrivateDriverData = resource_data;
+    open->TotalPrivateDriverDataBufferSize = total_size;
+    open->pTotalPrivateDriverDataBuffer = total_data;
+    open->pKeyedMutexPrivateRuntimeData = keyed_data;
+    open->hResource = open->hKeyedMutex = open->hSyncObject = 0x1eadbeed;
+    allocation->hAllocation = 0x1eadbeed;
+    allocation->pPrivateDriverData = resource_data;
+    allocation->PrivateDriverDataSize = 0xdeadbeef;
+    allocation->GpuVirtualAddress = 0x1122334455667788ull;
+}
+
+static void test_wow64_protected_open_resource_nt(
+    D3DKMT_HANDLE device, HANDLE handle, UINT runtime_size, UINT resource_size,
+    UINT total_size, D3DKMT_HANDLE *next_local )
+{
+    static const UINT invalid_counts[] = {0, 2, ~0u};
+    D3DKMT_OPENRESOURCEFROMNTHANDLE *open;
+    D3DDDI_OPENALLOCATIONINFO2 *allocation;
+    D3DKMT_DESTROYALLOCATION destroy = {0};
+    BYTE *lanes, *runtime;
+    DWORD exception;
+    NTSTATUS status;
+    BOOL is_wow64 = FALSE;
+    UINT i;
+
+    if (sizeof(void *) != 4 || !IsWow64Process( GetCurrentProcess(), &is_wow64 ) || !is_wow64)
+    {
+        win_skip( "protected NT open-resource test requires a 32-bit process under WoW64\n" );
+        return;
+    }
+
+    lanes = VirtualAlloc( NULL, 0x7000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    if (!lanes)
+    {
+        win_skip( "VirtualAlloc failed, error %lu\n", GetLastError() );
+        return;
+    }
+    open = (D3DKMT_OPENRESOURCEFROMNTHANDLE *)(lanes + 0x0000);
+    allocation = (D3DDDI_OPENALLOCATIONINFO2 *)(lanes + 0x1000);
+    runtime = lanes + 0x2000;
+    init_wow64_test_open_resource_nt( open, allocation, device, handle, runtime,
+                                       runtime_size, lanes + 0x3000, resource_size,
+                                       lanes + 0x4000, total_size, lanes + 0x5000 );
+    if (!set_wow64_test_page_protection( allocation, PAGE_NOACCESS ) ||
+        !set_wow64_test_page_protection( runtime, PAGE_NOACCESS ))
+        goto done;
+
+    open->hDevice = 0;
+    open->NumAllocations = ~0u;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( !exception, "invalid NT-open device raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    ok_x4( open->hResource, ==, 0x1eadbeed );
+
+    open->hDevice = device;
+    open->hNtHandle = (HANDLE)(ULONG_PTR)0xdeadbeef;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( !exception, "invalid NT handle raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_HANDLE, status );
+    ok_x4( open->hResource, ==, 0x1eadbeed );
+
+    open->hNtHandle = handle;
+    for (i = 0; i < ARRAY_SIZE(invalid_counts); i++)
+    {
+        open->NumAllocations = invalid_counts[i];
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault(
+            open, OPEN_RESOURCE_TEST_NT_HANDLE, &status );
+        ok( !exception, "NT-open count %#x raised %#lx\n", invalid_counts[i],
+            exception );
+        ok_nt( STATUS_INVALID_PARAMETER, status );
+        ok_x4( open->hResource, ==, 0x1eadbeed );
+    }
+
+    open->NumAllocations = 1;
+    open->PrivateRuntimeDataSize = runtime_size + 1;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( !exception, "invalid NT runtime size raised %#lx\n", exception );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    ok_x4( open->hResource, ==, 0x1eadbeed );
+    open->PrivateRuntimeDataSize = runtime_size;
+
+    open->NumAllocations = 1;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "protected NT allocation exception %#lx, status %#lx\n", exception, status );
+    ok_x4( open->hResource, ==, 0x1eadbeed );
+
+    if (!set_wow64_test_page_protection( allocation, PAGE_READWRITE )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "protected NT runtime exception %#lx, status %#lx\n", exception, status );
+    ok_x4( open->hResource, ==, 0x1eadbeed );
+
+    if (!set_wow64_test_page_protection( runtime, PAGE_READONLY )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "read-only NT runtime exception %#lx, status %#lx\n", exception, status );
+    if (!set_wow64_test_page_protection( runtime, PAGE_READWRITE )) goto done;
+    ok_x4( open->hResource, ==, 0x1eadbeed );
+
+    if (winetest_platform_is_wine)
+    {
+        open->pOpenAllocationInfo2 = (void *)(ULONG_PTR)0xfffffffcu;
+        status = STATUS_UNSUCCESSFUL;
+        exception = call_open_resource_catching_fault(
+            open, OPEN_RESOURCE_TEST_NT_HANDLE, &status );
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "4-GiB-crossing NT allocation exception %#lx, status %#lx\n",
+            exception, status );
+        open->pOpenAllocationInfo2 = allocation;
+
+        if (runtime_size > 1)
+        {
+            open->pPrivateRuntimeData =
+                (void *)(ULONG_PTR)(0u - runtime_size + 1);
+            status = STATUS_UNSUCCESSFUL;
+            exception = call_open_resource_catching_fault(
+                open, OPEN_RESOURCE_TEST_NT_HANDLE, &status );
+            ok( exception == STATUS_ACCESS_VIOLATION,
+                "4-GiB-crossing NT runtime exception %#lx, status %#lx\n",
+                exception, status );
+            open->pPrivateRuntimeData = runtime;
+        }
+    }
+
+    if (!set_wow64_test_page_protection( open, PAGE_READONLY )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "read-only NT descriptor exception %#lx, status %#lx\n", exception, status );
+    if (!set_wow64_test_page_protection( open, PAGE_READWRITE )) goto done;
+    ok_x4( open->hResource, ==, 0x1eadbeed );
+
+    if (!set_wow64_test_page_protection( allocation, PAGE_READONLY )) goto done;
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "read-only NT allocation exception %#lx, status %#lx\n", exception, status );
+    if (!set_wow64_test_page_protection( allocation, PAGE_READWRITE )) goto done;
+    ok_x4( open->hResource, ==, 0x1eadbeed );
+
+    status = STATUS_UNSUCCESSFUL;
+    exception = call_open_resource_catching_fault( open, OPEN_RESOURCE_TEST_NT_HANDLE,
+                                                    &status );
+    ok( !exception, "valid NT follow-up raised %#lx\n", exception );
+    ok_nt( STATUS_SUCCESS, status );
+    if (!exception && !status)
+    {
+        check_d3dkmt_local( open->hResource, next_local );
+        ok_x4( open->hKeyedMutex, ==, 0 );
+        ok_x4( open->hSyncObject, ==, 0 );
+        ok_x8( allocation->GpuVirtualAddress, ==, 0x1122334455667788ull );
+        destroy.hDevice = device;
+        destroy.hResource = open->hResource;
+        status = D3DKMTDestroyAllocation( &destroy );
+        ok_nt( STATUS_SUCCESS, status );
+    }
+
+done:
+    VirtualFree( lanes, 0, MEM_RELEASE );
+}
+
 static void test_D3DKMTCreateAllocation( void )
 {
     OBJECT_ATTRIBUTES attr = {.Length = sizeof(attr)};
@@ -2415,6 +4114,8 @@ static void test_D3DKMTCreateAllocation( void )
     status = D3DKMTCreateDevice( &create_device );
     ok_nt( STATUS_SUCCESS, status );
     check_d3dkmt_local( create_device.hDevice, &next_local );
+
+    test_wow64_protected_create_allocation( create_device.hDevice, &next_local );
 
 
     allocs[0].pSystemMem = allocs2[0].pSystemMem = VirtualAlloc( NULL, 0x10000, MEM_COMMIT, PAGE_READWRITE );
@@ -2695,6 +4396,12 @@ static void test_D3DKMTCreateAllocation( void )
     /* runtime data doesn't get updated ? */
     ok_u1( runtime_data[0], ==, 0xcd );
 
+    test_wow64_protected_open_resource( create_device.hDevice, create.hGlobalShare,
+                                         query.PrivateRuntimeDataSize,
+                                         query.ResourcePrivateDriverDataSize,
+                                         query.TotalPrivateDriverDataSize,
+                                         &next_local );
+
     /* D3DKMTOpenResource works with a global handle */
     memset( runtime_data, 0xcd, sizeof(runtime_data) );
     memset( driver_data, 0xcd, sizeof(driver_data) );
@@ -2735,8 +4442,14 @@ static void test_D3DKMTCreateAllocation( void )
     ok_nt( STATUS_SUCCESS, status );
     open.hResource = 0;
 
-    /* NumAllocations must be set */
+    /* NumAllocations must match the queried allocation count. */
     open.NumAllocations = 0;
+    status = D3DKMTOpenResource( &open );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    open.NumAllocations = 2;
+    status = D3DKMTOpenResource( &open );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    open.NumAllocations = ~0u;
     status = D3DKMTOpenResource( &open );
     ok_nt( STATUS_INVALID_PARAMETER, status );
     open.NumAllocations = 1;
@@ -3158,6 +4871,13 @@ static void test_D3DKMTShareObjects( void )
     CloseHandle( open_resource_name.hNtHandle );
 
 
+    test_wow64_protected_open_resource_nt( create_device.hDevice, handle,
+                                            query_resource.PrivateRuntimeDataSize,
+                                            query_resource.ResourcePrivateDriverDataSize,
+                                            query_resource.TotalPrivateDriverDataSize,
+                                            &next_local );
+
+
     memset( runtime_data, 0xcd, sizeof(runtime_data) );
     memset( driver_data, 0xcd, sizeof(driver_data) );
     open_resource.hDevice = create_device.hDevice;
@@ -3198,6 +4918,12 @@ static void test_D3DKMTShareObjects( void )
     open_resource.pOpenAllocationInfo2 = &open_alloc;
 
     open_resource.NumAllocations = 0;
+    status = D3DKMTOpenResourceFromNtHandle( &open_resource );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    open_resource.NumAllocations = 2;
+    status = D3DKMTOpenResourceFromNtHandle( &open_resource );
+    ok_nt( STATUS_INVALID_PARAMETER, status );
+    open_resource.NumAllocations = ~0u;
     status = D3DKMTOpenResourceFromNtHandle( &open_resource );
     ok_nt( STATUS_INVALID_PARAMETER, status );
     open_resource.NumAllocations = 1;
@@ -6779,6 +8505,8 @@ START_TEST( d3dkmt )
     test_D3DKMTCloseAdapter();
     test_D3DKMTCreateDevice();
     test_D3DKMTDestroyDevice();
+    test_wow64_protected_adapter_device_lifecycle();
+    test_d3dkmt_adapter_device_concurrency();
     test_D3DKMTCheckVidPnExclusiveOwnership();
     test_D3DKMTSetVidPnSourceOwner();
     test_D3DKMTCheckOcclusion();

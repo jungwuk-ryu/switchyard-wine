@@ -22,7 +22,10 @@
 #define __WOW64_PRIVATE_H
 
 #include "../ntdll/ntsyscalls.h"
+#include "../ntdll/unixlib.h"
 #include "struct32.h"
+#include "wine/low_va.h"
+#include "wine/wow64_user.h"
 
 #define SYSCALL_ENTRY(id,name,_args) extern NTSTATUS WINAPI wow64_ ## name( UINT *args );
 ALL_SYSCALLS32
@@ -37,6 +40,7 @@ extern USHORT current_machine;
 extern ULONG_PTR args_alignment;
 extern ULONG_PTR highest_user_address;
 extern ULONG_PTR default_zero_bits;
+extern BOOL wow64_low_va_shadow;
 extern SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock;
 
 extern void     (WINAPI *pBTCpuFlushInstructionCache2)( const void *, SIZE_T );
@@ -58,7 +62,28 @@ struct object_attr64
     OBJECT_ATTRIBUTES   attr;
     UNICODE_STRING      str;
     SECURITY_DESCRIPTOR sd;
+    SECURITY_QUALITY_OF_SERVICE qos;
 };
+
+/* Pin a target process handle with its original access mask while resolving
+ * the authoritative target address model.  Cross-process thunk callers must
+ * perform the native operation through codec.process and keep the codec alive
+ * until every target-address input and output has been converted. */
+struct process_address_codec
+{
+    HANDLE process;
+    BOOL close_process;
+    BOOL is_current;
+    BOOL translated;
+};
+
+extern NTSTATUS init_process_address_codec( HANDLE process,
+                                             struct process_address_codec *codec );
+extern void CALLBACK close_process_address_codec( BOOL normal, void *arg );
+extern void *decode_process_address( const struct process_address_codec *codec,
+                                     ULONG address );
+extern NTSTATUS encode_process_address( const struct process_address_codec *codec,
+                                        const void *address, ULONG *ret );
 
 /* cf. GetSystemWow64Directory2 */
 static inline const WCHAR *get_machine_wow64_dir( USHORT machine )
@@ -77,9 +102,88 @@ static inline TEB32 *NtCurrentTeb32(void)
     return (TEB32 *)((char *)NtCurrentTeb() + NtCurrentTeb()->WowTebOffset);
 }
 
-static inline ULONG get_ulong( UINT **args ) { return *(*args)++; }
-static inline HANDLE get_handle( UINT **args ) { return LongToHandle( *(*args)++ ); }
-static inline void *get_ptr( UINT **args ) { return ULongToPtr( *(*args)++ ); }
+/* Native ARM64 keeps i386 mappings in a fixed high shadow while the guest ABI
+ * retains low 32-bit addresses.  This process-init state is captured before
+ * guest code runs; do not make the translation boundary depend on writable PEB
+ * fields after initialization. */
+static inline BOOL wow64_uses_low_va_shadow(void)
+{
+    return wow64_low_va_shadow;
+}
+
+static inline void *wow64_guest_memory_ptr( ULONG address )
+{
+    return wine_wow64_guest_memory_ptr_for_shadow( wow64_uses_low_va_shadow(), address );
+}
+
+static inline ULONG wow64_guest_memory_addr( const void *address )
+{
+    return wine_wow64_guest_memory_addr_for_shadow( wow64_uses_low_va_shadow(), address );
+}
+
+/* Convert pointer-shaped values that the native call treats as opaque data. */
+static inline void *wow64_raw_ptr32( ULONG value )
+{
+    return ULongToPtr( value );
+}
+
+static inline void wow64_read_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_copy_from_user( dst, src, size );
+    if (status) RtlRaiseStatus( status );
+}
+
+static inline void wow64_write_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_copy_to_user( dst, src, size );
+    if (status) RtlRaiseStatus( status );
+}
+
+/* Use the status-returning form when the native call creates an object or
+ * otherwise acquires ownership that must be rolled back if the guest output
+ * is reprotected after its initial probe. */
+static inline NTSTATUS wow64_try_write_user( void *dst, const void *src, SIZE_T size )
+{
+    return wine_wow64_try_copy_to_user( dst, src, size );
+}
+
+static inline void wow64_probe_user_read( const void *ptr, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_probe_user_read( ptr, size );
+    if (status) RtlRaiseStatus( status );
+}
+
+static inline void wow64_probe_user_write( void *ptr, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_probe_user_write( ptr, size );
+    if (status) RtlRaiseStatus( status );
+}
+
+static inline void wow64_faulting_write_user( void *dst, const void *src, SIZE_T size )
+{
+    NTSTATUS status = wine_wow64_faulting_copy_to_user( dst, src, size );
+    if (status) RtlRaiseStatus( status );
+}
+
+static inline NTSTATUS wow64_store_release_long( LONG *dst, LONG value )
+{
+    return __wine_wow64_store_release_long( dst, value );
+}
+
+static inline NTSTATUS wow64_publish_iosb( IO_STATUS_BLOCK32 *dst, NTSTATUS status,
+                                           ULONG information )
+{
+    return __wine_wow64_publish_iosb( dst, status, information );
+}
+
+static inline ULONG get_ulong( UINT **args )
+{
+    return *(*args)++;
+}
+
+static inline HANDLE get_handle( UINT **args ) { return LongToHandle( get_ulong( args ) ); }
+static inline void *get_ptr( UINT **args ) { return wow64_guest_memory_ptr( get_ulong( args ) ); }
+static inline void *get_raw_ptr( UINT **args ) { return wow64_raw_ptr32( get_ulong( args ) ); }
 
 static inline ULONG64 get_ulong64( UINT **args )
 {
@@ -98,15 +202,21 @@ static inline ULONG_PTR get_zero_bits( ULONG_PTR zero_bits )
 
 static inline void **addr_32to64( void **addr, ULONG *addr32 )
 {
+    ULONG value;
+
     if (!addr32) return NULL;
-    *addr = ULongToPtr( *addr32 );
+    wow64_read_user( &value, addr32, sizeof(value) );
+    *addr = wow64_guest_memory_ptr( value );
     return addr;
 }
 
 static inline SIZE_T *size_32to64( SIZE_T *size, ULONG *size32 )
 {
+    ULONG value;
+
     if (!size32) return NULL;
-    *size = *size32;
+    wow64_read_user( &value, size32, sizeof(value) );
+    *size = value;
     return size;
 }
 
@@ -117,7 +227,7 @@ static inline void *apc_32to64( ULONG func )
 
 static inline void *apc_param_32to64( ULONG func, ULONG context )
 {
-    if (!func) return ULongToPtr( context );
+    if (!func) return wow64_raw_ptr32( context );  /* completion-port value, not an address */
     return (void *)(ULONG_PTR)(((ULONG64)func << 32) | context);
 }
 
@@ -130,59 +240,110 @@ static inline IO_STATUS_BLOCK *iosb_32to64( IO_STATUS_BLOCK *io, IO_STATUS_BLOCK
 
 static inline UNICODE_STRING *unicode_str_32to64( UNICODE_STRING *str, const UNICODE_STRING32 *str32 )
 {
+    UNICODE_STRING32 local;
+
     if (!str32) return NULL;
-    str->Length = str32->Length;
-    str->MaximumLength = str32->MaximumLength;
-    str->Buffer = ULongToPtr( str32->Buffer );
+    wow64_read_user( &local, str32, sizeof(local) );
+    str->Length = local.Length;
+    str->MaximumLength = local.MaximumLength;
+    str->Buffer = wow64_guest_memory_ptr( local.Buffer );
     return str;
+}
+
+/* Materialize a guest string for native helpers that inspect the buffer before
+ * entering ntdll's common object-attribute capture boundary.  The temporary
+ * allocation has syscall lifetime and the terminator is native-only; Windows'
+ * Length and MaximumLength values remain unchanged. */
+static inline UNICODE_STRING *unicode_str_32to64_temp( UNICODE_STRING *str,
+                                                       const UNICODE_STRING32 *str32 )
+{
+    WCHAR *buffer;
+
+    if (!unicode_str_32to64( str, str32 )) return NULL;
+    if (!(buffer = Wow64AllocateTemp( (SIZE_T)str->Length + sizeof(*buffer) )))
+        RtlRaiseStatus( STATUS_NO_MEMORY );
+    if (str->Length) wow64_read_user( buffer, str->Buffer, str->Length );
+    buffer[str->Length / sizeof(*buffer)] = 0;
+    str->Buffer = buffer;
+    return str;
+}
+
+static inline void unicode_str_32to64_materialize( UNICODE_STRING *str )
+{
+    WCHAR *buffer;
+
+    if (!str || !str->Buffer) return;
+    if (!(buffer = Wow64AllocateTemp( (SIZE_T)str->Length + sizeof(*buffer) )))
+        RtlRaiseStatus( STATUS_NO_MEMORY );
+    if (str->Length) wow64_read_user( buffer, str->Buffer, str->Length );
+    buffer[str->Length / sizeof(*buffer)] = 0;
+    str->Buffer = buffer;
 }
 
 static inline CLIENT_ID *client_id_32to64( CLIENT_ID *id, const CLIENT_ID32 *id32 )
 {
+    CLIENT_ID32 local;
+
     if (!id32) return NULL;
-    id->UniqueProcess = LongToHandle( id32->UniqueProcess );
-    id->UniqueThread = LongToHandle( id32->UniqueThread );
+    wow64_read_user( &local, id32, sizeof(local) );
+    id->UniqueProcess = LongToHandle( local.UniqueProcess );
+    id->UniqueThread = LongToHandle( local.UniqueThread );
     return id;
 }
 
 static inline SECURITY_DESCRIPTOR *secdesc_32to64( SECURITY_DESCRIPTOR *out, const SECURITY_DESCRIPTOR *in )
 {
     /* relative descr has the same layout for 32 and 64 */
-    const SECURITY_DESCRIPTOR_RELATIVE *sd = (const SECURITY_DESCRIPTOR_RELATIVE *)in;
+    SECURITY_DESCRIPTOR_RELATIVE sd;
 
     if (!in) return NULL;
-    out->Revision = sd->Revision;
-    out->Sbz1     = sd->Sbz1;
-    out->Control  = sd->Control & ~SE_SELF_RELATIVE;
-    if (sd->Control & SE_SELF_RELATIVE)
+    wow64_read_user( &sd, in, sizeof(sd) );
+    out->Revision = sd.Revision;
+    out->Sbz1     = sd.Sbz1;
+    out->Control  = sd.Control & ~SE_SELF_RELATIVE;
+    if (sd.Control & SE_SELF_RELATIVE)
     {
-        out->Owner = sd->Owner ? (PSID)((BYTE *)sd + sd->Owner) : NULL;
-        out->Group = sd->Group ? (PSID)((BYTE *)sd + sd->Group) : NULL;
-        out->Sacl = ((sd->Control & SE_SACL_PRESENT) && sd->Sacl) ? (PSID)((BYTE *)sd + sd->Sacl) : NULL;
-        out->Dacl = ((sd->Control & SE_DACL_PRESENT) && sd->Dacl) ? (PSID)((BYTE *)sd + sd->Dacl) : NULL;
+        out->Owner = sd.Owner ? (PSID)((BYTE *)in + sd.Owner) : NULL;
+        out->Group = sd.Group ? (PSID)((BYTE *)in + sd.Group) : NULL;
+        out->Sacl = ((sd.Control & SE_SACL_PRESENT) && sd.Sacl) ? (PSID)((BYTE *)in + sd.Sacl) : NULL;
+        out->Dacl = ((sd.Control & SE_DACL_PRESENT) && sd.Dacl) ? (PSID)((BYTE *)in + sd.Dacl) : NULL;
     }
     else
     {
-        out->Owner = ULongToPtr( sd->Owner );
-        out->Group = ULongToPtr( sd->Group );
-        out->Sacl = (sd->Control & SE_SACL_PRESENT) ? ULongToPtr( sd->Sacl ) : NULL;
-        out->Dacl = (sd->Control & SE_DACL_PRESENT) ? ULongToPtr( sd->Dacl ) : NULL;
+        out->Owner = wow64_guest_memory_ptr( sd.Owner );
+        out->Group = wow64_guest_memory_ptr( sd.Group );
+        out->Sacl = (sd.Control & SE_SACL_PRESENT) ? wow64_guest_memory_ptr( sd.Sacl ) : NULL;
+        out->Dacl = (sd.Control & SE_DACL_PRESENT) ? wow64_guest_memory_ptr( sd.Dacl ) : NULL;
     }
     return out;
 }
 
 static inline OBJECT_ATTRIBUTES *objattr_32to64( struct object_attr64 *out, const OBJECT_ATTRIBUTES32 *in )
 {
+    OBJECT_ATTRIBUTES32 local;
+
     memset( out, 0, sizeof(*out) );
     if (!in) return NULL;
-    if (in->Length != sizeof(*in)) return &out->attr;
+    wow64_read_user( &local, in, sizeof(local) );
+    if (local.Length != sizeof(local)) return &out->attr;
 
     out->attr.Length = sizeof(out->attr);
-    out->attr.RootDirectory = LongToHandle( in->RootDirectory );
-    out->attr.Attributes = in->Attributes;
-    out->attr.ObjectName = unicode_str_32to64( &out->str, ULongToPtr( in->ObjectName ));
-    out->attr.SecurityQualityOfService = ULongToPtr( in->SecurityQualityOfService );
-    out->attr.SecurityDescriptor = secdesc_32to64( &out->sd, ULongToPtr( in->SecurityDescriptor ));
+    out->attr.RootDirectory = LongToHandle( local.RootDirectory );
+    out->attr.Attributes = local.Attributes;
+    out->attr.ObjectName = unicode_str_32to64( &out->str, wow64_guest_memory_ptr( local.ObjectName ));
+    if (local.SecurityQualityOfService)
+    {
+        SECURITY_QUALITY_OF_SERVICE32 qos32;
+
+        wow64_read_user( &qos32, wow64_guest_memory_ptr( local.SecurityQualityOfService ), sizeof(qos32) );
+        out->qos.Length = qos32.Length;
+        out->qos.ImpersonationLevel = qos32.ImpersonationLevel;
+        out->qos.ContextTrackingMode = qos32.ContextTrackingMode;
+        out->qos.EffectiveOnly = qos32.EffectiveOnly;
+        out->attr.SecurityQualityOfService = &out->qos;
+    }
+    out->attr.SecurityDescriptor = secdesc_32to64( &out->sd,
+                                                   wow64_guest_memory_ptr( local.SecurityDescriptor ));
     return &out->attr;
 }
 
@@ -191,27 +352,34 @@ static inline OBJECT_ATTRIBUTES *objattr_32to64_redirect( struct object_attr64 *
 {
     OBJECT_ATTRIBUTES *attr = objattr_32to64( out, in );
 
-    if (attr) get_file_redirect( attr );
+    if (attr)
+    {
+        unicode_str_32to64_materialize( attr->ObjectName );
+        get_file_redirect( attr );
+    }
     return attr;
 }
 
 static inline ALPC_PORT_ATTRIBUTES *alpc_port_attributes_32to64( ALPC_PORT_ATTRIBUTES *out,
                                                                  const ALPC_PORT_ATTRIBUTES32 *in )
 {
-    if (!in) return NULL;
+    ALPC_PORT_ATTRIBUTES32 local;
 
-    out->Flags = in->Flags;
-    out->SecurityQos.Length = in->SecurityQos.Length;
-    out->SecurityQos.ImpersonationLevel = in->SecurityQos.ImpersonationLevel;
-    out->SecurityQos.ContextTrackingMode = in->SecurityQos.ContextTrackingMode;
-    out->SecurityQos.EffectiveOnly = in->SecurityQos.EffectiveOnly;
-    out->MaxMessageLength = in->MaxMessageLength + (sizeof(ALPC_PORT_MESSAGE) - sizeof(ALPC_PORT_MESSAGE32));
-    out->MemoryBandwidth = in->MemoryBandwidth;
-    out->MaxPoolUsage = in->MaxPoolUsage;
-    out->MaxSectionSize = in->MaxSectionSize;
-    out->MaxViewSize = in->MaxViewSize;
-    out->MaxTotalSectionSize = in->MaxTotalSectionSize;
-    out->DupObjectTypes = in->DupObjectTypes;
+    if (!in) return NULL;
+    wow64_read_user( &local, in, sizeof(local) );
+
+    out->Flags = local.Flags;
+    out->SecurityQos.Length = local.SecurityQos.Length;
+    out->SecurityQos.ImpersonationLevel = local.SecurityQos.ImpersonationLevel;
+    out->SecurityQos.ContextTrackingMode = local.SecurityQos.ContextTrackingMode;
+    out->SecurityQos.EffectiveOnly = local.SecurityQos.EffectiveOnly;
+    out->MaxMessageLength = local.MaxMessageLength + (sizeof(ALPC_PORT_MESSAGE) - sizeof(ALPC_PORT_MESSAGE32));
+    out->MemoryBandwidth = local.MemoryBandwidth;
+    out->MaxPoolUsage = local.MaxPoolUsage;
+    out->MaxSectionSize = local.MaxSectionSize;
+    out->MaxViewSize = local.MaxViewSize;
+    out->MaxTotalSectionSize = local.MaxTotalSectionSize;
+    out->DupObjectTypes = local.DupObjectTypes;
     out->Reserved = 0;
     return out;
 }
@@ -240,6 +408,17 @@ static inline ALPC_PORT_MESSAGE *alpc_port_message_32to64( ALPC_PORT_MESSAGE **o
 done:
     *out = msg;
     return msg;
+}
+
+static inline ALPC_CONTEXT_ATTR *alpc_context_attr_32to64( ALPC_CONTEXT_ATTR *out,
+                                                           const ALPC_CONTEXT_ATTR32 *in )
+{
+    out->PortContext = wow64_raw_ptr32( in->PortContext );
+    out->MessageContext = wow64_raw_ptr32( in->MessageContext );
+    out->Sequence = in->Sequence;
+    out->MessageId = in->MessageId;
+    out->CallbackId = in->CallbackId;
+    return out;
 }
 
 static inline ALPC_MESSAGE_ATTRIBUTES *alpc_port_message_attributes_32to64( ALPC_MESSAGE_ATTRIBUTES **out,
@@ -276,7 +455,7 @@ static inline ALPC_MESSAGE_ATTRIBUTES *alpc_port_message_attributes_32to64( ALPC
         to_attr->ContextHandle = UlongToHandle( from_attr->ContextHandle );
         if (from_attr->QoSPointer)
         {
-            SECURITY_QUALITY_OF_SERVICE32 *qos32 = (SECURITY_QUALITY_OF_SERVICE32 *)ULongToPtr( from_attr->QoSPointer );
+            SECURITY_QUALITY_OF_SERVICE32 *qos32 = wow64_guest_memory_ptr( from_attr->QoSPointer );
             SECURITY_QUALITY_OF_SERVICE *qos = Wow64AllocateTemp( sizeof(*qos) );
 
             to_attr->QoS = qos;
@@ -300,7 +479,7 @@ static inline ALPC_MESSAGE_ATTRIBUTES *alpc_port_message_attributes_32to64( ALPC
 
         to_attr->Flags = from_attr->Flags;
         to_attr->SectionHandle = UlongToHandle( from_attr->SectionHandle );
-        to_attr->ViewBase = UlongToPtr( from_attr->ViewBase );
+        to_attr->ViewBase = wow64_guest_memory_ptr( from_attr->ViewBase );
         to_attr->ViewSize = from_attr->ViewSize;
     }
     if (in->AllocatedAttributes & ALPC_MESSAGE_VIEW_ATTRIBUTE)
@@ -311,11 +490,7 @@ static inline ALPC_MESSAGE_ATTRIBUTES *alpc_port_message_attributes_32to64( ALPC
         const ALPC_CONTEXT_ATTR32 *from_attr = (const ALPC_CONTEXT_ATTR32 *)current_from_attr;
         ALPC_CONTEXT_ATTR *to_attr = AlpcGetMessageAttribute( attr, ALPC_MESSAGE_CONTEXT_ATTRIBUTE );
 
-        to_attr->PortContext = UlongToPtr( from_attr->PortContext );
-        to_attr->MessageContext = UlongToPtr( from_attr->MessageContext );
-        to_attr->Sequence = from_attr->Sequence;
-        to_attr->MessageId = from_attr->MessageId;
-        to_attr->CallbackId = from_attr->CallbackId;
+        alpc_context_attr_32to64( to_attr, from_attr );
     }
     if (in->AllocatedAttributes & ALPC_MESSAGE_CONTEXT_ATTRIBUTE)
         current_from_attr += sizeof(ALPC_CONTEXT_ATTR32);
@@ -405,7 +580,7 @@ static inline ALPC_MESSAGE_ATTRIBUTES32 *alpc_port_message_attributes_64to32( AL
         to_attr->ContextHandle = HandleToUlong( from_attr->ContextHandle );
         if (to_attr->QoSPointer && from_attr->QoS)
         {
-            SECURITY_QUALITY_OF_SERVICE32 *qos32 = ULongToPtr( to_attr->QoSPointer );
+            SECURITY_QUALITY_OF_SERVICE32 *qos32 = wow64_guest_memory_ptr( to_attr->QoSPointer );
             qos32->ImpersonationLevel = from_attr->QoS->ImpersonationLevel;
             qos32->ContextTrackingMode = from_attr->QoS->ContextTrackingMode;
             qos32->EffectiveOnly = from_attr->QoS->EffectiveOnly;
@@ -421,7 +596,7 @@ static inline ALPC_MESSAGE_ATTRIBUTES32 *alpc_port_message_attributes_64to32( AL
 
         to_attr->Flags = from_attr->Flags;
         to_attr->SectionHandle = HandleToUlong( from_attr->SectionHandle );
-        to_attr->ViewBase = PtrToUlong( from_attr->ViewBase );
+        to_attr->ViewBase = wow64_guest_memory_addr( from_attr->ViewBase );
         to_attr->ViewSize = from_attr->ViewSize;
     }
     if (out->AllocatedAttributes & ALPC_MESSAGE_VIEW_ATTRIBUTE)
@@ -490,49 +665,80 @@ static inline ALPC_MESSAGE_ATTRIBUTES32 *alpc_port_message_attributes_64to32( AL
 
 static inline TOKEN_USER *token_user_32to64( TOKEN_USER *out, const TOKEN_USER32 *in )
 {
-    out->User.Sid = ULongToPtr( in->User.Sid );
-    out->User.Attributes = in->User.Attributes;
+    TOKEN_USER32 local;
+    wow64_read_user( &local, in, sizeof(local) );
+    out->User.Sid = wow64_guest_memory_ptr( local.User.Sid );
+    out->User.Attributes = local.User.Attributes;
     return out;
 }
 
 static inline TOKEN_OWNER *token_owner_32to64( TOKEN_OWNER *out, const TOKEN_OWNER32 *in )
 {
-    out->Owner = ULongToPtr( in->Owner );
+    TOKEN_OWNER32 local;
+    wow64_read_user( &local, in, sizeof(local) );
+    out->Owner = wow64_guest_memory_ptr( local.Owner );
     return out;
 }
 
 static inline TOKEN_PRIMARY_GROUP *token_primary_group_32to64( TOKEN_PRIMARY_GROUP *out, const TOKEN_PRIMARY_GROUP32 *in )
 {
-    out->PrimaryGroup = ULongToPtr( in->PrimaryGroup );
+    TOKEN_PRIMARY_GROUP32 local;
+    wow64_read_user( &local, in, sizeof(local) );
+    out->PrimaryGroup = wow64_guest_memory_ptr( local.PrimaryGroup );
     return out;
 }
 
 static inline TOKEN_DEFAULT_DACL *token_default_dacl_32to64( TOKEN_DEFAULT_DACL *out, const TOKEN_DEFAULT_DACL32 *in )
 {
-    out->DefaultDacl = ULongToPtr( in->DefaultDacl );
+    TOKEN_DEFAULT_DACL32 local;
+    wow64_read_user( &local, in, sizeof(local) );
+    out->DefaultDacl = wow64_guest_memory_ptr( local.DefaultDacl );
     return out;
 }
 
 static inline void put_handle( ULONG *handle32, HANDLE handle )
 {
-    *handle32 = HandleToULong( handle );
+    ULONG value = HandleToULong( handle );
+    wow64_write_user( handle32, &value, sizeof(value) );
+}
+
+static inline NTSTATUS try_put_handle( ULONG *handle32, HANDLE handle )
+{
+    ULONG value = HandleToULong( handle );
+
+    return wow64_try_write_user( handle32, &value, sizeof(value) );
+}
+
+static inline NTSTATUS try_put_handle_pair( ULONG *handle1, HANDLE value1,
+                                             ULONG *handle2, HANDLE value2 )
+{
+    return wine_wow64_publish_handle_pair( handle1, HandleToULong(value1),
+                                            handle2, HandleToULong(value2) );
 }
 
 static inline void put_addr( ULONG *addr32, void *addr )
 {
-    if (addr32) *addr32 = PtrToUlong( addr );
+    ULONG value;
+    if (!addr32) return;
+    value = wow64_guest_memory_addr( addr );
+    wow64_write_user( addr32, &value, sizeof(value) );
 }
 
 static inline void put_size( ULONG *size32, SIZE_T size )
 {
-    if (size32) *size32 = min( size, MAXDWORD );
+    ULONG value;
+    if (!size32) return;
+    value = min( size, MAXDWORD );
+    wow64_write_user( size32, &value, sizeof(value) );
 }
 
 static inline void put_client_id( CLIENT_ID32 *id32, const CLIENT_ID *id )
 {
+    CLIENT_ID32 local;
     if (!id32) return;
-    id32->UniqueProcess = HandleToLong( id->UniqueProcess );
-    id32->UniqueThread = HandleToLong( id->UniqueThread );
+    local.UniqueProcess = HandleToLong( id->UniqueProcess );
+    local.UniqueThread = HandleToLong( id->UniqueThread );
+    wow64_write_user( id32, &local, sizeof(local) );
 }
 
 static inline void put_iosb( IO_STATUS_BLOCK32 *io32, const IO_STATUS_BLOCK *io )
@@ -541,8 +747,10 @@ static inline void put_iosb( IO_STATUS_BLOCK32 *io32, const IO_STATUS_BLOCK *io 
     /* async I/O leaves the 64-bit one untouched and updates the 32-bit one directly later on */
     if (io32 && io->Pointer != io32)
     {
-        io32->Status = io->Status;
-        io32->Information = io->Information;
+        IO_STATUS_BLOCK32 local;
+        local.Status = io->Status;
+        local.Information = io->Information;
+        wow64_write_user( io32, &local, sizeof(local) );
     }
 }
 

@@ -1203,11 +1203,21 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
 
         /* 32-bit stack */
         if (!limit || limit > user_space_wow_limit) limit = user_space_wow_limit;
+#if defined(__APPLE__) && defined(__aarch64__)
+        if ((status = virtual_alloc_thread_stack( &stack, WINE_LOW_VA_SHADOW_BASE + 0x10000,
+                                                  WINE_LOW_VA_SHADOW_BASE + limit,
+                                                  reserve_size, commit_size, TRUE )))
+            return status;
+        wow_teb->Tib.StackBase = wow64_native_to_guest_addr( stack.StackBase );
+        wow_teb->Tib.StackLimit = wow64_native_to_guest_addr( stack.StackLimit );
+        wow_teb->DeallocationStack = wow64_native_to_guest_addr( stack.DeallocationStack );
+#else
         if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
             return status;
         wow_teb->Tib.StackBase = PtrToUlong( stack.StackBase );
         wow_teb->Tib.StackLimit = PtrToUlong( stack.StackLimit );
         wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
+#endif
         return STATUS_SUCCESS;
 #else
         wow_teb->Tib.StackBase = wow_teb->TlsSlots[WOW64_TLS_CPURESERVED] = PtrToUlong( cpu );
@@ -1253,7 +1263,8 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
  */
 static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_ret,
                                       ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
-                                      void *start, void *param, ULONG flags, BOOL is_system )
+                                      void *start, void *param, ULONG flags, BOOL is_system,
+                                      HANDLE *transaction )
 {
     data_size_t len;
     struct object_attributes *objattr;
@@ -1261,6 +1272,8 @@ static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_
     int request_pipe[2];
     DWORD tid = 0;
     NTSTATUS status;
+
+    if (transaction) *transaction = 0;
 
     if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
 
@@ -1276,12 +1289,14 @@ static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_
         req->process    = wine_server_obj_handle( NtCurrentProcess() );
         req->access     = access;
         req->flags      = flags;
+        req->wine_flags = transaction ? WINE_THREAD_CREATE_TRANSACTION : 0;
         req->is_system  = !!is_system;
         req->request_fd = request_pipe[0];
         wine_server_add_data( req, objattr, len );
         if (!(status = wine_server_call( req )))
         {
             *handle = wine_server_ptr_handle( reply->handle );
+            if (transaction) *transaction = wine_server_ptr_handle( reply->info );
             tid = reply->tid;
         }
         close( request_pipe[0] );
@@ -1297,6 +1312,11 @@ static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_
 
     if (!(data = virtual_alloc_thread_data()))
     {
+        if (transaction && *transaction)
+        {
+            NtClose( *transaction );
+            *transaction = 0;
+        }
         NtClose( *handle );
         close( request_pipe[1] );
         return STATUS_NO_MEMORY;
@@ -1371,11 +1391,6 @@ static NTSTATUS update_attr_list( PS_ATTRIBUTE_LIST *attr, HANDLE thread, const 
         }
     }
 
-    if (status)
-    {
-        NtTerminateThread( thread, status );
-        NtClose( thread );
-    }
     return status;
 }
 
@@ -1394,10 +1409,61 @@ NTSTATUS WINAPI NtCreateThread( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRI
 /***********************************************************************
  *              NtCreateThreadEx   (NTDLL.@)
  */
-NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
-                                  HANDLE process, PRTL_THREAD_START_ROUTINE start, void *param,
-                                  ULONG flags, ULONG_PTR zero_bits, SIZE_T stack_commit,
-                                  SIZE_T stack_reserve, PS_ATTRIBUTE_LIST *attr_list )
+NTSTATUS complete_wow64_thread_transaction( HANDLE transaction, BOOL commit,
+                                             NTSTATUS cancel_status )
+{
+    NTSTATUS status;
+
+    SERVER_START_REQ( complete_new_thread )
+    {
+        req->info = wine_server_obj_handle( transaction );
+        req->status = cancel_status;
+        req->commit = commit;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return status;
+}
+
+static void cancel_created_thread( HANDLE *handle, HANDLE *transaction,
+                                   NTSTATUS status )
+{
+    if (*transaction)
+    {
+        complete_wow64_thread_transaction( *transaction, FALSE, status );
+        NtClose( *transaction );
+        *transaction = 0;
+    }
+    if (*handle)
+    {
+        NtClose( *handle );
+        *handle = 0;
+    }
+}
+
+static void cleanup_failed_thread_creation( HANDLE *handle, HANDLE *transaction,
+                                            NTSTATUS status )
+{
+    if (transaction && *transaction)
+    {
+        cancel_created_thread( handle, transaction, status );
+        return;
+    }
+    if (*handle)
+    {
+        /* Preserve the ordinary native path's historical best-effort cleanup.
+         * Transactional WoW64 callers never depend on the requested handle's
+         * THREAD_TERMINATE access and take the branch above instead. */
+        NtTerminateThread( *handle, status );
+        NtClose( *handle );
+    }
+}
+
+NTSTATUS create_thread_ex_internal( HANDLE *handle, HANDLE *transaction, ACCESS_MASK access,
+                                    OBJECT_ATTRIBUTES *attr, HANDLE process,
+                                    PRTL_THREAD_START_ROUTINE start, void *param, ULONG flags,
+                                    ULONG_PTR zero_bits, SIZE_T stack_commit,
+                                    SIZE_T stack_reserve, PS_ATTRIBUTE_LIST *attr_list )
 {
     static const ULONG supported_flags = THREAD_CREATE_FLAGS_CREATE_SUSPENDED | THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH |
                                          THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER | THREAD_CREATE_FLAGS_SKIP_LOADER_INIT |
@@ -1407,6 +1473,8 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     WOW_TEB *wow_teb;
     unsigned int status;
 
+    if (transaction) *transaction = 0;
+
     if (flags & ~supported_flags)
         FIXME( "Unsupported flags %#x.\n", flags );
 
@@ -1414,6 +1482,8 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 #ifndef _WIN64
     if (!is_old_wow64() && zero_bits >= 32) return STATUS_INVALID_PARAMETER_3;
 #endif
+
+    if (!access) access = THREAD_ALL_ACCESS;
 
     if (process != NtCurrentProcess())
     {
@@ -1424,6 +1494,8 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 
         call.create_thread.type      = APC_CREATE_THREAD;
         call.create_thread.flags     = flags;
+        call.create_thread.access    = access;
+        call.create_thread.wine_flags = transaction ? WINE_THREAD_CREATE_TRANSACTION : 0;
         call.create_thread.func      = wine_server_client_ptr( start );
         call.create_thread.arg       = wine_server_client_ptr( param );
         call.create_thread.zero_bits = zero_bits;
@@ -1437,14 +1509,16 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
             CLIENT_ID client_id = make_client_id( result.create_thread.pid, result.create_thread.tid );
             TEB *teb = wine_server_get_ptr( result.create_thread.teb );
             *handle = wine_server_ptr_handle( result.create_thread.handle );
+            if (transaction)
+                *transaction = wine_server_ptr_handle( result.create_thread.info );
             if (attr_list) status = update_attr_list( attr_list, *handle, &client_id, teb );
         }
+        if (status) cleanup_failed_thread_creation( handle, transaction, status );
         return status;
     }
 
-    if (!access) access = THREAD_ALL_ACCESS;
-
-    if ((status = create_server_thread( handle, &data, access, attr, start, param, flags, FALSE )))
+    if ((status = create_server_thread( handle, &data, access, attr, start, param, flags,
+                                        FALSE, transaction )))
         return status;
 
     if ((status = virtual_alloc_teb( data ))) goto done;
@@ -1467,12 +1541,157 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 done:
     if (status)
     {
+        if (transaction && *transaction)
+        {
+            complete_wow64_thread_transaction( *transaction, FALSE, status );
+            NtClose( *transaction );
+            *transaction = 0;
+        }
         NtClose( *handle );
         close( data->request_fd );
         virtual_free_thread_data( data );
         return status;
     }
     if (attr_list) status = update_attr_list( attr_list, *handle, &teb->ClientId, teb );
+    if (status) cleanup_failed_thread_creation( handle, transaction, status );
+    return status;
+}
+
+NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
+                                  HANDLE process, PRTL_THREAD_START_ROUTINE start, void *param,
+                                  ULONG flags, ULONG_PTR zero_bits, SIZE_T stack_commit,
+                                  SIZE_T stack_reserve, PS_ATTRIBUTE_LIST *attr_list )
+{
+    return create_thread_ex_internal( handle, NULL, access, attr, process, start, param, flags,
+                                      zero_bits, stack_commit, stack_reserve, attr_list );
+}
+
+static BOOL is_wow64_thread_staging_range( UINT64 value, SIZE_T size, BOOL optional )
+{
+    UINT64 end;
+
+    if (!value) return optional;
+    if (size > ~(UINT64)0 - value) return FALSE;
+    end = value + size;
+    if (value <= MAXDWORD ||
+        (value >= WINE_LOW_VA_SHADOW_BASE &&
+         value - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE))
+        return FALSE;
+    return end > value;
+}
+
+static NTSTATUS query_wow64_thread_target_model( HANDLE process,
+                                                 WINE_PROCESS_VM_INFORMATION *info )
+{
+    NTSTATUS status;
+
+    memset( info, 0, sizeof(*info) );
+    if ((status = NtQueryVirtualMemory( process, NULL,
+                                       MemoryWineProcessVmMachineInformation,
+                                       info, sizeof(*info), NULL )))
+        return status;
+    if (info->Version != WINE_PROCESS_VM_INFORMATION_VERSION ||
+        info->Size != sizeof(*info) || info->Reserved ||
+        info->Machine != IMAGE_FILE_MACHINE_I386 ||
+        (info->Flags & ~WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED))
+        return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS validate_wow64_thread_target_address(
+    const WINE_PROCESS_VM_INFORMATION *info, UINT64 address )
+{
+    if (!address) return STATUS_SUCCESS;
+    if (info->Flags & WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED)
+    {
+        if (address < WINE_LOW_VA_SHADOW_BASE ||
+            address - WINE_LOW_VA_SHADOW_BASE >= WINE_LOW_VA_SHADOW_SIZE)
+            return STATUS_INVALID_ADDRESS;
+    }
+    else if (address > MAXDWORD) return STATUS_INVALID_ADDRESS;
+    return STATUS_SUCCESS;
+}
+
+C_ASSERT( sizeof(struct wine_wow64_create_user_thread_params) == 112 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_thread_params, handle) == 8 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_thread_params, process) == 24 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_thread_params, start) == 48 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_thread_params, access) == 88 );
+C_ASSERT( offsetof(struct wine_wow64_create_user_thread_params, reserved) == 96 );
+
+NTSTATUS unixcall_wow64_create_user_thread( void *args )
+{
+    struct wine_wow64_create_user_thread_params params;
+    WINE_PROCESS_VM_INFORMATION target_info;
+    HANDLE handle = 0, transaction = 0;
+    NTSTATUS status, publish;
+
+    if (!is_wow64_thread_staging_range( (ULONG_PTR)args, sizeof(params), FALSE ))
+        return STATUS_INVALID_PARAMETER;
+    if ((status = virtual_copy_from_user( &params, args, sizeof(params) ))) return status;
+    if (params.version != WINE_WOW64_CREATE_USER_THREAD_VERSION ||
+        params.size != sizeof(params) || params.handle || params.transaction ||
+        params.reserved[0] || params.reserved[1] ||
+        !is_wow64_thread_staging_range( params.object_attributes,
+                                        sizeof(OBJECT_ATTRIBUTES), TRUE ) ||
+        !is_wow64_thread_staging_range( params.attribute_list,
+                                        sizeof(SIZE_T), TRUE ))
+        return STATUS_INVALID_PARAMETER;
+    if ((status = query_wow64_thread_target_model(
+             (HANDLE)(ULONG_PTR)params.process, &target_info )) ||
+        (status = validate_wow64_thread_target_address( &target_info, params.start )) ||
+        (status = validate_wow64_thread_target_address( &target_info, params.param )))
+        return status;
+    if ((status = wow64_probe_user_write( args, sizeof(params) ))) return status;
+
+    status = create_thread_ex_internal(
+        &handle, &transaction, params.access,
+        (OBJECT_ATTRIBUTES *)(ULONG_PTR)params.object_attributes,
+        (HANDLE)(ULONG_PTR)params.process,
+        (PRTL_THREAD_START_ROUTINE)(ULONG_PTR)params.start,
+        (void *)(ULONG_PTR)params.param, params.flags, params.zero_bits,
+        params.stack_commit, params.stack_reserve,
+        (PS_ATTRIBUTE_LIST *)(ULONG_PTR)params.attribute_list );
+    if (status)
+    {
+        if (transaction)
+        {
+            complete_wow64_thread_transaction( transaction, FALSE, status );
+            NtClose( transaction );
+        }
+        if (handle) NtClose( handle );
+        return status;
+    }
+    if (!handle || !transaction) abort_process( STATUS_INVALID_PARAMETER );
+
+    params.handle = (ULONG_PTR)handle;
+    params.transaction = (ULONG_PTR)transaction;
+    if ((publish = virtual_copy_to_user( args, &params, sizeof(params) )))
+    {
+        complete_wow64_thread_transaction( transaction, FALSE, publish );
+        NtClose( transaction );
+        NtClose( handle );
+        return publish;
+    }
+    return STATUS_SUCCESS;
+}
+
+C_ASSERT( sizeof(struct wine_wow64_complete_user_thread_params) == 24 );
+
+NTSTATUS unixcall_wow64_complete_user_thread( void *args )
+{
+    struct wine_wow64_complete_user_thread_params params;
+    NTSTATUS status;
+
+    if ((status = virtual_copy_from_user( &params, args, sizeof(params) ))) return status;
+    if (!params.transaction || params.commit > 1 || params.reserved)
+        return STATUS_INVALID_PARAMETER;
+    status = complete_wow64_thread_transaction(
+        (HANDLE)(ULONG_PTR)params.transaction, params.commit, params.status );
+    /* Closing an active token is the rights-independent cancellation fallback.
+     * A committed or cancelled token is inert. */
+    NtClose( (HANDLE)(ULONG_PTR)params.transaction );
+    if (params.commit && status) abort_process( status );
     return status;
 }
 
@@ -1487,7 +1706,8 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
     NTSTATUS status;
     ULONG flags = THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE;
 
-    if ((status = create_server_thread( handle, &data, access, attr, start, param, flags, TRUE )))
+    if ((status = create_server_thread( handle, &data, access, attr, start, param, flags,
+                                        TRUE, NULL )))
         return status;
 
     if ((status = spawn_thread( data )))
@@ -1947,7 +2167,10 @@ void ntdll_set_exception_jmp_buf( jmp_buf jmp )
 {
     struct thread_data *data = get_thread_data();
     assert( !jmp || !data->jmp_buf );
+    if (jmp) data->jmp_status = STATUS_ACCESS_VIOLATION;
+    data->jmp_unixlib_context = jmp ? get_wow64_unixlib_call_context_mark() : NULL;
     data->jmp_buf = jmp;
+    if (!jmp) finalize_wow64_unixlib_call_contexts();
 }
 
 

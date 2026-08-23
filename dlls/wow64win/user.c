@@ -428,6 +428,34 @@ static MSG32 *msg_64to32( const MSG *msg64, MSG32 *msg32 )
     return msg32;
 }
 
+static UNICODE_STRING *snapshot_unicode_string32( UNICODE_STRING *str,
+                                                   const UNICODE_STRING32 *str32 )
+{
+    UNICODE_STRING32 source;
+
+    if (!str32) return NULL;
+    wow64win_read_user( &source, str32, sizeof(source) );
+    if (source.Length > source.MaximumLength || (source.Length & (sizeof(WCHAR) - 1)))
+        RtlRaiseStatus( STATUS_INVALID_PARAMETER );
+
+    str->Length = source.Length;
+    str->MaximumLength = source.MaximumLength;
+    str->Buffer = NULL;
+    if (source.Buffer)
+    {
+        WCHAR *buffer;
+
+        if (!(buffer = Wow64AllocateTemp( (SIZE_T)source.Length + sizeof(*buffer) )))
+            RtlRaiseStatus( STATUS_NO_MEMORY );
+        if (source.Length)
+            wow64win_read_user( buffer, wow64win_guest_memory_ptr( source.Buffer ), source.Length );
+        buffer[source.Length / sizeof(*buffer)] = 0;
+        str->Buffer = buffer;
+    }
+    else if (source.Length) RtlRaiseStatus( STATUS_ACCESS_VIOLATION );
+    return str;
+}
+
 static void win_proc_params_64to32( const struct win_proc_params *src, struct win_proc_params32 *dst )
 {
     struct win_proc_params32 params;
@@ -1539,17 +1567,19 @@ NTSTATUS WINAPI wow64_NtUserBeginDeferWindowPos( UINT *args )
 NTSTATUS WINAPI wow64_NtUserBeginPaint( UINT *args )
 {
     HWND hwnd = get_handle( &args );
-    PAINTSTRUCT32 *ps32 = get_ptr( &args );
+    PAINTSTRUCT32 *ps32 = get_memory_ptr( &args );
 
     PAINTSTRUCT ps;
+    PAINTSTRUCT32 out;
     HDC ret;
 
     ret = NtUserBeginPaint( hwnd, ps32 ? & ps : NULL );
     if (ret && ps32)
     {
-        ps32->hdc = HandleToUlong( ps.hdc );
-        ps32->fErase  = ps.fErase;
-        ps32->rcPaint = ps.rcPaint;
+        out.hdc = HandleToUlong( ps.hdc );
+        out.fErase = ps.fErase;
+        out.rcPaint = ps.rcPaint;
+        wow64win_write_user( ps32, &out, offsetof(PAINTSTRUCT32, fRestore) );
     }
     return HandleToUlong( ret );
 }
@@ -1926,9 +1956,9 @@ NTSTATUS WINAPI wow64_NtUserCreatePopupMenu( UINT *args )
 NTSTATUS WINAPI wow64_NtUserCreateWindowEx( UINT *args )
 {
     DWORD ex_style = get_ulong( &args );
-    UNICODE_STRING32 *class_name32 = get_ptr( &args );
-    UNICODE_STRING32 *version32 = get_ptr( &args );
-    UNICODE_STRING32 *window_name32 = get_ptr( &args );
+    UNICODE_STRING32 *class_name32 = get_memory_ptr( &args );
+    UNICODE_STRING32 *version32 = get_memory_ptr( &args );
+    UNICODE_STRING32 *window_name32 = get_memory_ptr( &args );
     DWORD style = get_ulong( &args );
     int x = get_ulong( &args );
     int y = get_ulong( &args );
@@ -1936,20 +1966,20 @@ NTSTATUS WINAPI wow64_NtUserCreateWindowEx( UINT *args )
     int height = get_ulong( &args );
     HWND parent = get_handle( &args );
     HMENU menu = get_handle( &args );
-    HINSTANCE instance = get_ptr( &args );
-    void *params = get_ptr( &args );
+    HINSTANCE instance = get_client_ptr( &args );
+    void *params = get_client_ptr( &args );
     DWORD flags = get_ulong( &args );
-    HINSTANCE client_instance = get_ptr( &args );
-    const WCHAR *class = get_ptr( &args );
+    HINSTANCE client_instance = get_client_ptr( &args );
+    const WCHAR *class = get_client_ptr( &args );
     BOOL ansi = get_ulong( &args );
 
     UNICODE_STRING class_name, version, window_name;
     HWND ret;
 
     ret = NtUserCreateWindowEx( ex_style,
-                                unicode_str_32to64( &class_name, class_name32),
-                                unicode_str_32to64( &version, version32 ),
-                                unicode_str_32to64( &window_name, window_name32 ),
+                                snapshot_unicode_string32( &class_name, class_name32 ),
+                                snapshot_unicode_string32( &version, version32 ),
+                                snapshot_unicode_string32( &window_name, window_name32 ),
                                 style, x, y, width, height, parent, menu,
                                 instance, params, flags, client_instance, class, ansi );
     return HandleToUlong( ret );
@@ -2736,15 +2766,20 @@ NTSTATUS WINAPI wow64_NtUserGetMenuItemRect( UINT *args )
 
 NTSTATUS WINAPI wow64_NtUserGetMessage( UINT *args )
 {
-    MSG32 *msg32 = get_ptr( &args );
+    MSG32 *msg32 = get_memory_ptr( &args );
     HWND hwnd = get_handle( &args );
     UINT first = get_ulong( &args );
     UINT last = get_ulong( &args );
     MSG msg;
+    MSG32 out;
     int ret;
 
     ret = NtUserGetMessage( &msg, hwnd, first, last );
-    if (ret != -1) msg_64to32( &msg, msg32 );
+    if (ret != -1)
+    {
+        msg_64to32( &msg, &out );
+        wow64win_write_user( msg32, &out, sizeof(out) );
+    }
     return ret;
 }
 
@@ -3940,15 +3975,17 @@ NTSTATUS WINAPI wow64_NtUserOpenWindowStation( UINT *args )
 
 NTSTATUS WINAPI wow64_NtUserPeekMessage( UINT *args )
 {
-    MSG32 *msg32 = get_ptr( &args );
+    MSG32 *msg32 = get_memory_ptr( &args );
     HWND hwnd = get_handle( &args );
     UINT first = get_ulong( &args );
     UINT last = get_ulong( &args );
     UINT flags = get_ulong( &args );
     MSG msg;
+    MSG32 out;
 
     if (!NtUserPeekMessage( msg32 ? &msg : NULL, hwnd, first, last, flags )) return FALSE;
-    msg_64to32( &msg, msg32 );
+    msg_64to32( &msg, &out );
+    wow64win_write_user( msg32, &out, sizeof(out) );
     return TRUE;
 }
 

@@ -786,6 +786,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context,
 
     if (data->jmp_buf)
     {
+        data->jmp_status = rec->ExceptionCode;
         TRACE( "returning to handler\n" );
         REGn_sig(0, context) = (DWORD)data->jmp_buf;
         REGn_sig(1, context) = 1;
@@ -1074,7 +1075,7 @@ void signal_free_thread( TEB *teb )
 /**********************************************************************
  *		signal_init_process
  */
-void signal_init_process( TEB *teb )
+BOOL signal_init_process( TEB *teb )
 {
     struct sigaction sig_act;
 
@@ -1100,7 +1101,7 @@ void signal_init_process( TEB *teb )
     if (sigaction( SIGSEGV, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
-    return;
+    return TRUE;
 
  error:
     perror("sigaction");

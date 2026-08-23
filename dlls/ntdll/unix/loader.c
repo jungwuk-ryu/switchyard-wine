@@ -67,6 +67,7 @@
 # undef GetCurrentThread
 # include <pthread.h>
 # include <mach/mach.h>
+# include <mach/mach_vm.h>
 # include <mach/mach_error.h>
 # include <mach-o/getsect.h>
 # include <crt_externs.h>
@@ -92,6 +93,615 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(module);
 
+struct unixlib_module_token
+{
+    struct list entry;
+    unixlib_module_t token;
+    unixlib_handle_t dispatch;
+    void *module;
+};
+
+static pthread_mutex_t unixlib_module_token_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct list unixlib_module_tokens = LIST_INIT( unixlib_module_tokens );
+static UINT64 next_unixlib_module_token = 1;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+struct wow64_unixlib_dispatch_slot
+{
+    struct wine_unixlib_dispatch_v1 dispatch;
+    const struct wine_unixlib_dispatch_entry_v2 *entries;
+    void *module_ref;
+    UINT64 generation;
+    UINT64 state;
+    UINT32 owners;
+};
+
+struct wow64_unixlib_call_context
+{
+    struct ntdll_wow64_unixlib_call_context public;
+    struct wow64_unixlib_call_context *prev;
+    struct wow64_unixlib_dispatch_slot *slot;
+    struct syscall_frame *frame;
+};
+
+#define WOW64_UNIXLIB_SLOT_ACTIVE_MASK 0x00000000ffffffffull
+#define WOW64_UNIXLIB_SLOT_LIVE        0x4000000000000000ull
+#define WOW64_UNIXLIB_SLOT_CLOSING     0x8000000000000000ull
+
+static struct wow64_unixlib_dispatch_slot wow64_unixlib_dispatch_registry[
+    WINE_UNIXLIB_DISPATCH_MAX_SLOTS] __attribute__((aligned(64)));
+static pthread_mutex_t wow64_unixlib_dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local struct wow64_unixlib_call_context *wow64_unixlib_call_context;
+static UINT32 wow64_unixlib_dispatch_finalize_pending;
+
+static BOOL is_guest_controlled_dispatch_address( const void *ptr )
+{
+    UINT64 address = (UINT_PTR)ptr;
+
+    return !ptr || address < 0x100000000ull ||
+           (address >= WINE_LOW_VA_SHADOW_BASE &&
+            address - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE);
+}
+
+static BOOL dispatch_range_has_protection( const void *ptr, SIZE_T size, vm_prot_t required,
+                                           vm_prot_t forbidden )
+{
+    mach_vm_address_t address = (UINT_PTR)ptr;
+    mach_vm_address_t end;
+
+    if (!size || size > ~(mach_vm_address_t)0 - address) return FALSE;
+    end = address + size;
+    while (address < end)
+    {
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        mach_vm_address_t region = address;
+        mach_vm_size_t region_size;
+
+        if (mach_vm_region( mach_task_self(), &region, &region_size,
+                            VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                            &count, &object ) != KERN_SUCCESS)
+            return FALSE;
+        if (object != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), object );
+        if (region > address || !region_size || region_size > ~(mach_vm_address_t)0 - region ||
+            (info.protection & required) != required || (info.protection & forbidden))
+            return FALSE;
+        address = min( end, region + region_size );
+    }
+    return TRUE;
+}
+
+static NTSTATUS pin_wow64_unixlib_dispatch_source( const void *source, void **module_ref )
+{
+    Dl_info source_info;
+
+    *module_ref = NULL;
+    if (!source || is_guest_controlled_dispatch_address( source ) ||
+        !dladdr( source, &source_info ) || !source_info.dli_fname)
+        return STATUS_INVALID_PARAMETER;
+#ifdef RTLD_NOLOAD
+    if (!(*module_ref = dlopen( source_info.dli_fname, RTLD_NOW | RTLD_NOLOAD )))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+static void finalize_wow64_unixlib_dispatch_slot(
+    struct wow64_unixlib_dispatch_slot *slot_entry )
+{
+    struct wine_unixlib_dispatch_v1 *entry = &slot_entry->dispatch;
+    void *module_ref = NULL;
+    UINT64 state;
+
+    pthread_mutex_lock( &wow64_unixlib_dispatch_mutex );
+    state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
+    if (state == (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING) &&
+        !slot_entry->owners)
+    {
+        module_ref = slot_entry->module_ref;
+        slot_entry->module_ref = NULL;
+        slot_entry->entries = NULL;
+        entry->magic = 0;
+        entry->version = 0;
+        entry->entry_count = 0;
+        entry->funcs = NULL;
+        entry->self = 0;
+        __atomic_store_n( &slot_entry->state, 0, __ATOMIC_RELEASE );
+    }
+    pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+    if (module_ref) dlclose( module_ref );
+}
+
+static void finalize_drained_wow64_unixlib_dispatch_slots(void)
+{
+    UINT32 slot;
+
+    if (!__atomic_load_n( &wow64_unixlib_dispatch_finalize_pending, __ATOMIC_ACQUIRE ))
+        return;
+    if (!__atomic_exchange_n( &wow64_unixlib_dispatch_finalize_pending, 0,
+                              __ATOMIC_ACQ_REL ))
+        return;
+    for (slot = 0; slot < WINE_UNIXLIB_DISPATCH_MAX_SLOTS; slot++)
+        if (__atomic_load_n( &wow64_unixlib_dispatch_registry[slot].state,
+                            __ATOMIC_ACQUIRE ) ==
+            (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING))
+            finalize_wow64_unixlib_dispatch_slot( &wow64_unixlib_dispatch_registry[slot] );
+}
+
+static void release_wow64_unixlib_dispatch_slot(
+    struct wow64_unixlib_dispatch_slot *slot_entry, BOOL finalize )
+{
+    UINT64 old_state;
+
+    old_state = __atomic_fetch_sub( &slot_entry->state, 1, __ATOMIC_RELEASE );
+    assert( old_state & WOW64_UNIXLIB_SLOT_ACTIVE_MASK );
+    if (finalize && (old_state & WOW64_UNIXLIB_SLOT_CLOSING) &&
+        (old_state & WOW64_UNIXLIB_SLOT_ACTIVE_MASK) == 1)
+    {
+        __atomic_thread_fence( __ATOMIC_ACQUIRE );
+        finalize_wow64_unixlib_dispatch_slot( slot_entry );
+    }
+    else if (!finalize && (old_state & WOW64_UNIXLIB_SLOT_CLOSING) &&
+             (old_state & WOW64_UNIXLIB_SLOT_ACTIVE_MASK) == 1)
+        __atomic_store_n( &wow64_unixlib_dispatch_finalize_pending, 1, __ATOMIC_RELEASE );
+}
+
+static NTSTATUS acquire_wow64_unixlib_dispatch_slot(
+    unixlib_handle_t handle, struct wow64_unixlib_dispatch_slot **slot_ret )
+{
+    struct wow64_unixlib_dispatch_slot *slot_entry;
+    UINT64 generation, state, active;
+    UINT32 slot;
+
+    if (!wine_unixlib_decode_dispatch_handle( handle, &slot, &generation ))
+        return STATUS_INVALID_PARAMETER;
+    slot_entry = &wow64_unixlib_dispatch_registry[slot];
+    for (;;)
+    {
+        state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
+        if ((state & (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING)) !=
+            WOW64_UNIXLIB_SLOT_LIVE)
+            return STATUS_INVALID_PARAMETER;
+        active = state & WOW64_UNIXLIB_SLOT_ACTIVE_MASK;
+        if (active == WOW64_UNIXLIB_SLOT_ACTIVE_MASK) return STATUS_TOO_MANY_OPENED_FILES;
+        if (__atomic_compare_exchange_n( &slot_entry->state, &state, state + 1, FALSE,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
+            break;
+    }
+    if (slot_entry->generation != generation)
+    {
+        release_wow64_unixlib_dispatch_slot( slot_entry, TRUE );
+        return STATUS_INVALID_PARAMETER;
+    }
+    *slot_ret = slot_entry;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS register_wow64_unixlib_dispatch_source(
+    const void *source, SIZE_T source_size, const unixlib_entry_t *funcs, UINT32 entry_count,
+    const struct wine_unixlib_dispatch_entry_v2 *entries, unixlib_handle_t *handle )
+{
+    struct wow64_unixlib_dispatch_slot *slot_entry, *free_slot = NULL;
+    struct wine_unixlib_dispatch_v1 *entry;
+    Dl_info source_info, table_info, metadata_info, func_info;
+    SIZE_T metadata_size = entry_count * sizeof(*entries);
+    SIZE_T table_size = entry_count * sizeof(*funcs);
+    UINT64 state;
+    UINT32 i, slot;
+    void *module_ref;
+
+    if (!source || !funcs || !handle || is_guest_controlled_dispatch_address( source ) ||
+        is_guest_controlled_dispatch_address( funcs ) || !dladdr( source, &source_info ) ||
+        !source_info.dli_fname)
+        return STATUS_INVALID_PARAMETER;
+#ifdef RTLD_NOLOAD
+    module_ref = dlopen( source_info.dli_fname, RTLD_NOW | RTLD_NOLOAD );
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+    if (!module_ref) return STATUS_INVALID_IMAGE_FORMAT;
+
+    if (!dispatch_range_has_protection( source, source_size, VM_PROT_READ, VM_PROT_WRITE ) ||
+        !dispatch_range_has_protection( funcs, table_size, VM_PROT_READ, VM_PROT_WRITE ) ||
+        !dladdr( funcs, &table_info ) || source_info.dli_fbase != table_info.dli_fbase)
+        goto invalid;
+    if (entries &&
+        (is_guest_controlled_dispatch_address( entries ) ||
+         !dispatch_range_has_protection( entries, metadata_size, VM_PROT_READ, VM_PROT_WRITE ) ||
+         !dladdr( entries, &metadata_info ) ||
+         source_info.dli_fbase != metadata_info.dli_fbase))
+        goto invalid;
+
+    for (i = 0; i < entry_count; i++)
+    {
+        unixlib_entry_t func = funcs[i];
+
+        if (func && (is_guest_controlled_dispatch_address( (const void *)func ) ||
+            !dispatch_range_has_protection( (const void *)func, 1, VM_PROT_EXECUTE, 0 ) ||
+            !dladdr( (const void *)func, &func_info ) ||
+            func_info.dli_fbase != source_info.dli_fbase))
+            goto invalid;
+        if (entries)
+        {
+            UINT32 flags = entries[i].flags;
+
+            if (flags & ~WINE_UNIXLIB_DISPATCH_ENTRY_VALID_FLAGS) goto invalid;
+            if (func)
+            {
+                if (!(flags & WINE_UNIXLIB_DISPATCH_ENTRY_REVIEWED) ||
+                    entries[i].args_size > WINE_UNIXLIB_DISPATCH_MAX_ARGS_SIZE)
+                    goto invalid;
+            }
+            else if (entries[i].args_size || flags) goto invalid;
+        }
+    }
+
+    finalize_drained_wow64_unixlib_dispatch_slots();
+    pthread_mutex_lock( &wow64_unixlib_dispatch_mutex );
+    for (slot = 0; slot < WINE_UNIXLIB_DISPATCH_MAX_SLOTS; slot++)
+    {
+        slot_entry = &wow64_unixlib_dispatch_registry[slot];
+        state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
+        if (!state && !free_slot) free_slot = slot_entry;
+        if ((state & (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING)) !=
+            WOW64_UNIXLIB_SLOT_LIVE)
+            continue;
+        entry = &slot_entry->dispatch;
+        if (entry->entry_count == entry_count && entry->funcs == funcs &&
+            slot_entry->entries == entries)
+        {
+            if (slot_entry->owners == UINT_MAX)
+            {
+                pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+                dlclose( module_ref );
+                return STATUS_TOO_MANY_OPENED_FILES;
+            }
+            slot_entry->owners++;
+            *handle = wine_unixlib_dispatch_handle( slot, slot_entry->generation );
+            pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+            dlclose( module_ref );
+            return STATUS_SUCCESS;
+        }
+    }
+    if (!free_slot)
+    {
+        pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+        dlclose( module_ref );
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+
+    slot = free_slot - wow64_unixlib_dispatch_registry;
+    slot_entry = free_slot;
+    entry = &slot_entry->dispatch;
+    if (!(++slot_entry->generation & WINE_UNIXLIB_DISPATCH_GENERATION_MASK))
+        slot_entry->generation = 1;
+    entry->magic = WINE_UNIXLIB_DISPATCH_MAGIC;
+    entry->version = WINE_UNIXLIB_DISPATCH_VERSION;
+    entry->entry_count = entry_count;
+    entry->funcs = funcs;
+    entry->self = (UINT_PTR)entry;
+    slot_entry->entries = entries;
+    slot_entry->module_ref = module_ref;
+    slot_entry->owners = 1;
+    *handle = wine_unixlib_dispatch_handle( slot, slot_entry->generation );
+    __atomic_store_n( &slot_entry->state, WOW64_UNIXLIB_SLOT_LIVE, __ATOMIC_RELEASE );
+    pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+    return STATUS_SUCCESS;
+
+invalid:
+    dlclose( module_ref );
+    return STATUS_INVALID_PARAMETER;
+}
+
+NTSTATUS register_wow64_unixlib_dispatch(
+    const struct wine_unixlib_dispatch_source_v1 *source, const unixlib_entry_t *funcs,
+    unixlib_handle_t *handle )
+{
+    void *module_ref;
+    NTSTATUS status;
+
+    if ((status = pin_wow64_unixlib_dispatch_source( source, &module_ref ))) return status;
+    if (!dispatch_range_has_protection( source, sizeof(*source), VM_PROT_READ, VM_PROT_WRITE ) ||
+        source->version != WINE_UNIXLIB_DISPATCH_VERSION ||
+        source->size != sizeof(*source) || !source->entry_count ||
+        source->entry_count > WINE_UNIXLIB_DISPATCH_MAX_ENTRIES || source->reserved ||
+        source->funcs != funcs)
+        status = STATUS_INVALID_PARAMETER;
+    else
+        status = register_wow64_unixlib_dispatch_source( source, sizeof(*source), funcs,
+                                                         source->entry_count, NULL, handle );
+    dlclose( module_ref );
+    return status;
+}
+
+NTSTATUS register_wow64_unixlib_dispatch_v2(
+    const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
+    unixlib_handle_t *handle )
+{
+    void *module_ref;
+    NTSTATUS status;
+
+    if ((status = pin_wow64_unixlib_dispatch_source( source, &module_ref ))) return status;
+    if (!dispatch_range_has_protection( source, sizeof(*source), VM_PROT_READ, VM_PROT_WRITE ) ||
+        source->version != WINE_UNIXLIB_DISPATCH_SOURCE_V2_VERSION ||
+        source->size != sizeof(*source) || !source->entry_count ||
+        source->entry_count > WINE_UNIXLIB_DISPATCH_MAX_ENTRIES ||
+        source->entry_size != sizeof(*source->entries) || source->funcs != funcs ||
+        !source->entries || source->flags || source->reserved)
+        status = STATUS_INVALID_PARAMETER;
+    else
+        status = register_wow64_unixlib_dispatch_source( source, sizeof(*source), funcs,
+                                                         source->entry_count, source->entries,
+                                                         handle );
+    dlclose( module_ref );
+    return status;
+}
+
+NTSTATUS unregister_wow64_unixlib_dispatch( unixlib_handle_t handle )
+{
+    struct wow64_unixlib_dispatch_slot *slot_entry;
+    UINT64 generation, old_state;
+    UINT32 slot;
+    BOOL finalize = FALSE;
+
+    if (!wine_unixlib_decode_dispatch_handle( handle, &slot, &generation ))
+        return STATUS_INVALID_HANDLE;
+    finalize_drained_wow64_unixlib_dispatch_slots();
+    pthread_mutex_lock( &wow64_unixlib_dispatch_mutex );
+    slot_entry = &wow64_unixlib_dispatch_registry[slot];
+    old_state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
+    if ((old_state & (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING)) !=
+        WOW64_UNIXLIB_SLOT_LIVE || slot_entry->generation != generation ||
+        !slot_entry->owners)
+    {
+        pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+        return STATUS_INVALID_HANDLE;
+    }
+    if (!--slot_entry->owners)
+    {
+        old_state = __atomic_fetch_or( &slot_entry->state, WOW64_UNIXLIB_SLOT_CLOSING,
+                                       __ATOMIC_ACQ_REL );
+        finalize = !(old_state & WOW64_UNIXLIB_SLOT_ACTIVE_MASK);
+    }
+    pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+    if (finalize) finalize_wow64_unixlib_dispatch_slot( slot_entry );
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS ntdll_wow64_get_unixlib_call_context(
+    struct ntdll_wow64_unixlib_call_context *context )
+{
+    if (!context || !wow64_unixlib_call_context) return STATUS_INVALID_PARAMETER;
+    *context = wow64_unixlib_call_context->public;
+    return STATUS_SUCCESS;
+}
+
+void *get_wow64_unixlib_call_context_mark(void)
+{
+    return wow64_unixlib_call_context;
+}
+
+void unwind_wow64_unixlib_call_context( void *mark )
+{
+    while (wow64_unixlib_call_context && wow64_unixlib_call_context != mark)
+    {
+        struct wow64_unixlib_call_context *context = wow64_unixlib_call_context;
+
+        wow64_unixlib_call_context = context->prev;
+        release_wow64_unixlib_dispatch_slot( context->slot, FALSE );
+    }
+}
+
+void reset_wow64_unixlib_call_context(void)
+{
+    struct thread_data *data = get_thread_data();
+    struct syscall_frame *frame = data ? get_syscall_frame( data ) : NULL;
+
+    while (wow64_unixlib_call_context && wow64_unixlib_call_context->frame == frame)
+    {
+        struct wow64_unixlib_call_context *context = wow64_unixlib_call_context;
+
+        wow64_unixlib_call_context = context->prev;
+        release_wow64_unixlib_dispatch_slot( context->slot, FALSE );
+    }
+}
+
+void finalize_wow64_unixlib_call_contexts(void)
+{
+    finalize_drained_wow64_unixlib_dispatch_slots();
+}
+
+NTSTATUS __wine_unix_call_dispatcher_tagged( unixlib_handle_t handle,
+                                             unsigned int code, void *args )
+{
+    struct wow64_unixlib_dispatch_slot *slot_entry;
+    const struct wine_unixlib_dispatch_v1 *entry;
+    const struct wine_unixlib_dispatch_entry_v2 *metadata;
+    struct wow64_unixlib_call_context context;
+    unixlib_entry_t func;
+    void *snapshot = NULL, *null_host;
+    NTSTATUS status;
+    UINT32 count, guest_args;
+
+    finalize_drained_wow64_unixlib_dispatch_slots();
+    if ((status = acquire_wow64_unixlib_dispatch_slot( handle, &slot_entry ))) return status;
+    entry = &slot_entry->dispatch;
+    count = entry->entry_count;
+    if (!count || entry->magic != WINE_UNIXLIB_DISPATCH_MAGIC ||
+        entry->version != WINE_UNIXLIB_DISPATCH_VERSION ||
+        entry->self != (UINT_PTR)entry || !entry->funcs || code >= count ||
+        is_guest_controlled_dispatch_address( entry->funcs ))
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    func = entry->funcs[code];
+    if (is_guest_controlled_dispatch_address( (const void *)func ))
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (!(metadata = slot_entry->entries))
+    {
+        status = func( args );
+        goto done;
+    }
+
+    metadata += code;
+    if (!(metadata->flags & WINE_UNIXLIB_DISPATCH_ENTRY_REVIEWED) ||
+        metadata->flags & ~WINE_UNIXLIB_DISPATCH_ENTRY_VALID_FLAGS ||
+        metadata->args_size > WINE_UNIXLIB_DISPATCH_MAX_ARGS_SIZE)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if (!metadata->args_size)
+    {
+        if ((status = ntdll_wow64_guest32_to_host( 0, &null_host ))) goto done;
+    }
+    else
+    {
+        if ((status = virtual_wow64_host_to_guest32( args, metadata->args_size,
+                                                     &guest_args )))
+            goto done;
+        snapshot = __builtin_alloca( metadata->args_size );
+        if ((status = ntdll_wow64_copy_from_user( snapshot, args, metadata->args_size )))
+            goto done;
+    }
+
+    context.public.guest_args = metadata->args_size ? ULongToPtr( guest_args ) : NULL;
+    context.public.args_size = metadata->args_size;
+    context.public.flags = metadata->flags;
+    context.prev = wow64_unixlib_call_context;
+    context.slot = slot_entry;
+    context.frame = get_syscall_frame( get_thread_data() );
+    wow64_unixlib_call_context = &context;
+    status = func( snapshot );
+    assert( wow64_unixlib_call_context == &context );
+    wow64_unixlib_call_context = context.prev;
+done:
+    release_wow64_unixlib_dispatch_slot( slot_entry, TRUE );
+    return status;
+}
+#else
+NTSTATUS register_wow64_unixlib_dispatch(
+    const struct wine_unixlib_dispatch_source_v1 *source, const unixlib_entry_t *funcs,
+    unixlib_handle_t *handle )
+{
+    (void)source;
+    (void)funcs;
+    (void)handle;
+    return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS unregister_wow64_unixlib_dispatch( unixlib_handle_t handle )
+{
+    (void)handle;
+    return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS register_wow64_unixlib_dispatch_v2(
+    const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
+    unixlib_handle_t *handle )
+{
+    (void)source;
+    (void)funcs;
+    (void)handle;
+    return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS ntdll_wow64_get_unixlib_call_context(
+    struct ntdll_wow64_unixlib_call_context *context )
+{
+    (void)context;
+    return STATUS_NOT_SUPPORTED;
+}
+
+void reset_wow64_unixlib_call_context(void)
+{
+}
+
+void *get_wow64_unixlib_call_context_mark(void)
+{
+    return NULL;
+}
+
+void unwind_wow64_unixlib_call_context( void *mark )
+{
+    (void)mark;
+}
+
+void finalize_wow64_unixlib_call_contexts(void)
+{
+}
+
+NTSTATUS __wine_unix_call_dispatcher_tagged( unixlib_handle_t handle,
+                                             unsigned int code, void *args )
+{
+    (void)handle;
+    (void)code;
+    (void)args;
+    return STATUS_NOT_SUPPORTED;
+}
+#endif
+
+#define UNIXLIB_MODULE_TOKEN_TAG  0x4000000000000000ull
+#define UNIXLIB_MODULE_TOKEN_MASK 0x3fffffffffffffffull
+
+NTSTATUS create_unixlib_module_token( void *module, unixlib_handle_t dispatch,
+                                      BOOL dispatch_registered, unixlib_module_t *token )
+{
+    struct unixlib_module_token *entry;
+
+    if (!module || !token || (dispatch_registered &&
+        !wine_unixlib_decode_dispatch_handle( dispatch, NULL, NULL )))
+        return STATUS_INVALID_PARAMETER;
+    if (!(entry = malloc( sizeof(*entry) ))) return STATUS_NO_MEMORY;
+    entry->module = module;
+    entry->dispatch = dispatch_registered ? dispatch : 0;
+
+    pthread_mutex_lock( &unixlib_module_token_mutex );
+    if (!next_unixlib_module_token || next_unixlib_module_token > UNIXLIB_MODULE_TOKEN_MASK)
+    {
+        pthread_mutex_unlock( &unixlib_module_token_mutex );
+        free( entry );
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    entry->token = UNIXLIB_MODULE_TOKEN_TAG | next_unixlib_module_token++;
+    list_add_tail( &unixlib_module_tokens, &entry->entry );
+    *token = entry->token;
+    pthread_mutex_unlock( &unixlib_module_token_mutex );
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS unload_unixlib_module_token( unixlib_module_t token )
+{
+    struct unixlib_module_token *entry, *found = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if ((token & ~UNIXLIB_MODULE_TOKEN_MASK) != UNIXLIB_MODULE_TOKEN_TAG)
+        return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &unixlib_module_token_mutex );
+    LIST_FOR_EACH_ENTRY( entry, &unixlib_module_tokens, struct unixlib_module_token, entry )
+    {
+        if (entry->token != token) continue;
+        list_remove( &entry->entry );
+        found = entry;
+        break;
+    }
+    pthread_mutex_unlock( &unixlib_module_token_mutex );
+    if (!found) return STATUS_INVALID_HANDLE;
+
+    if (found->dispatch)
+        status = unregister_wow64_unixlib_dispatch( found->dispatch );
+    dlclose( found->module );
+    free( found );
+    return status;
+}
+
 #if defined __i386__ || (defined __x86_64__ && !defined __APPLE__)
 #define SO_DLLS_SUPPORTED
 #endif
@@ -105,6 +715,7 @@ void *pKiUserEmulationDispatcher = NULL;
 void *pLdrInitializeThunk = NULL;
 void *pRtlUserThreadStart = NULL;
 void *p__wine_ctrl_routine = NULL;
+void *main_image_native_base = NULL;
 SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock = NULL;
 
 #ifdef __GNUC__
@@ -1225,20 +1836,34 @@ static NTSTATUS wow64_register_non_native_code_region( void *args )
 
 static NTSTATUS wow64_wine_get_unix_env( void *args )
 {
-    const struct
+    struct
     {
         ULONG name;
         ULONG value;
         unsigned int value_size;
-    } *params32 = args;
-    struct wine_get_unix_env_params params =
-    {
-        .name = ULongToPtr( params32->name ),
-        .value = ULongToPtr( params32->value ),
-        .value_size = params32->value_size,
-    };
+    } params32;
+    const char *value;
+    char *name;
+    size_t len;
+    NTSTATUS status;
 
-    return unixcall_wine_get_unix_env( &params );
+    if ((status = virtual_copy_from_user( &params32, args, sizeof(params32) ))) return status;
+    if ((status = virtual_copy_string_from_user( &name,
+            wow64_guest_to_native_ptr( params32.name ), 0x10000 )))
+        return status;
+    if (!(value = getenv( name ))) status = STATUS_VARIABLE_NOT_FOUND;
+    else
+    {
+        len = strlen( value ) + 1;
+        if (len > params32.value_size) status = STATUS_BUFFER_TOO_SMALL;
+        else if (!params32.value || len > 0x100000000ull - params32.value)
+            status = STATUS_ACCESS_VIOLATION;
+        else
+            status = virtual_faulting_copy_to_user(
+                wow64_guest_to_native_ptr( params32.value ), value, len );
+    }
+    free( name );
+    return status;
 }
 #endif
 
@@ -1262,6 +1887,11 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_native_callback_args,
     unixcall_wine_get_unix_env,
     unixcall_get_process_package_graph,
+    unixcall_wow64_user_copy,
+    unixcall_wow64_create_user_process,
+    unixcall_wow64_complete_user_process,
+    unixcall_wow64_create_user_thread,
+    unixcall_wow64_complete_user_thread,
 };
 
 
@@ -1289,6 +1919,20 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_native_callback_args,
     wow64_wine_get_unix_env,
     unixcall_get_process_package_graph,
+    unixcall_wow64_user_copy,
+    unixcall_wow64_create_user_process,
+    unixcall_wow64_complete_user_process,
+    unixcall_wow64_create_user_thread,
+    unixcall_wow64_complete_user_thread,
+};
+
+static const struct wine_unixlib_dispatch_source_v1 ntdll_wow64_dispatch_source =
+{
+    WINE_UNIXLIB_DISPATCH_VERSION,
+    sizeof(struct wine_unixlib_dispatch_source_v1),
+    ARRAY_SIZE(unix_call_wow64_funcs),
+    0,
+    unix_call_wow64_funcs,
 };
 
 #endif  /* _WIN64 */
@@ -1354,7 +1998,8 @@ static NTSTATUS open_dll_file( const char *name, OBJECT_ATTRIBUTES *attr, HANDLE
 static NTSTATUS open_builtin_pe_file( const char *name, OBJECT_ATTRIBUTES *attr, void **module,
                                       SIZE_T *size, SECTION_IMAGE_INFORMATION *image_info,
                                       ULONG_PTR limit_low, ULONG_PTR limit_high,
-                                      WORD machine, BOOL prefer_native, off_t offset )
+                                      WORD machine, BOOL prefer_native, off_t offset,
+                                      BOOL translated_wow64, BOOL translated_amd64_low )
 {
     NTSTATUS status;
     HANDLE mapping;
@@ -1364,7 +2009,8 @@ static NTSTATUS open_builtin_pe_file( const char *name, OBJECT_ATTRIBUTES *attr,
     if (!status)
     {
         status = virtual_map_builtin_module( mapping, module, size, image_info,
-                                             limit_low, limit_high, machine, prefer_native, offset );
+                                             limit_low, limit_high, machine, prefer_native, offset,
+                                             translated_wow64, translated_amd64_low );
         NtClose( mapping );
     }
     return status;
@@ -1530,7 +2176,8 @@ static char *switchyard_prepend_graphics_fallback_path( char *ptr, const char *a
 static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name, void **module,
                                   SIZE_T *size_ptr, SECTION_IMAGE_INFORMATION *image_info,
                                   ULONG_PTR limit_low, ULONG_PTR limit_high, USHORT search_machine,
-                                  USHORT load_machine, BOOL prefer_native, off_t offset )
+                                  USHORT load_machine, BOOL prefer_native, off_t offset,
+                                  BOOL translated_wow64, BOOL translated_amd64_low )
 {
     unsigned int i, pos, len, namepos = 0, maxlen = 0;
     char *ptr = NULL, *file, *ext = NULL;
@@ -1599,7 +2246,8 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
         /* try as a dll */
         ptr = prepend_build_dir_path( file + pos, ".dll", pe_dir, "/dlls", pe_build_dir );
         status = open_builtin_pe_file( ptr, &attr, module, size_ptr, image_info,
-                                       limit_low, limit_high, load_machine, prefer_native, offset );
+                                       limit_low, limit_high, load_machine, prefer_native, offset,
+                                       translated_wow64, translated_amd64_low );
         ptr = prepend_build_dir_path( file + pos, ".dll", "", "/dlls", build_dir );
         if (status != STATUS_DLL_NOT_FOUND) goto done;
         status = open_builtin_so_file( ptr, &attr, module, image_info,
@@ -1609,7 +2257,8 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
         /* now as a program */
         ptr = prepend_build_dir_path( file + pos, ".exe", pe_dir, "/programs", pe_build_dir );
         status = open_builtin_pe_file( ptr, &attr, module, size_ptr, image_info,
-                                       limit_low, limit_high, load_machine, prefer_native, offset );
+                                       limit_low, limit_high, load_machine, prefer_native, offset,
+                                       translated_wow64, translated_amd64_low );
         ptr = prepend_build_dir_path( file + pos, ".exe", "", "/programs", build_dir );
         if (status != STATUS_DLL_NOT_FOUND) goto done;
         status = open_builtin_so_file( ptr, &attr, module, image_info,
@@ -1638,7 +2287,8 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
         ptr = prepend( ptr, pe_dir, strlen(pe_dir) );
         ptr = prepend( ptr, switchyard_gptk_dll_path, strlen(switchyard_gptk_dll_path) );
         status = open_builtin_pe_file( ptr, &attr, module, size_ptr, image_info,
-                                       limit_low, limit_high, load_machine, prefer_native, offset );
+                                       limit_low, limit_high, load_machine, prefer_native, offset,
+                                       translated_wow64, translated_amd64_low );
         if (status != STATUS_DLL_NOT_FOUND)
         {
             if (!status)
@@ -1664,7 +2314,8 @@ skip_gptk_module:
 
             fallback_pe_path = switchyard_prepend_graphics_fallback_path( fallback_pe_path, pe_dir, dll_paths[i] );
             status = open_builtin_pe_file( fallback_pe_path, &attr, module, size_ptr, image_info,
-                                           limit_low, limit_high, load_machine, prefer_native, offset );
+                                           limit_low, limit_high, load_machine, prefer_native, offset,
+                                           translated_wow64, translated_amd64_low );
             if (!status)
             {
                 WARN( "Switchyard routing Chromium GPU subprocess %s to Wine graphics fallback %s.\n",
@@ -1682,7 +2333,8 @@ skip_gptk_module:
         ptr = prepend( ptr, pe_dir, strlen(pe_dir) );
         ptr = prepend( ptr, dll_paths[i], strlen(dll_paths[i]) );
         status = open_builtin_pe_file( ptr, &attr, module, size_ptr, image_info, limit_low, limit_high,
-                                       load_machine, prefer_native, offset );
+                                       load_machine, prefer_native, offset, translated_wow64,
+                                       translated_amd64_low );
         /* use so dir for unix lib */
         ptr = file + pos;
         ptr = prepend( ptr, so_dir, strlen(so_dir) );
@@ -1693,7 +2345,8 @@ skip_gptk_module:
         if (status != STATUS_DLL_NOT_FOUND) goto done;
         ptr = prepend( file + pos, dll_paths[i], strlen(dll_paths[i]) );
         status = open_builtin_pe_file( ptr, &attr, module, size_ptr, image_info, limit_low, limit_high,
-                                       load_machine, prefer_native, offset );
+                                       load_machine, prefer_native, offset, translated_wow64,
+                                       translated_amd64_low );
         if (status == STATUS_NOT_SUPPORTED)
         {
             found_image = TRUE;
@@ -1727,7 +2380,8 @@ done:
  */
 NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine,
                        SECTION_IMAGE_INFORMATION *info, void **module, SIZE_T *size,
-                       ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset )
+                       ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset,
+                       BOOL translated_wow64, BOOL translated_amd64_low )
 {
     NTSTATUS status;
     USHORT sysdir_machine, search_machine = pe_mapping->image.machine;
@@ -1758,11 +2412,13 @@ NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine,
         return STATUS_IMAGE_ALREADY_LOADED;
     case LO_BUILTIN:
         return find_builtin_dll( &pe_mapping->nt_name, &pe_mapping->exp_name, module, size, info,
-                                 limit_low, limit_high, search_machine, machine, FALSE, offset );
+                                 limit_low, limit_high, search_machine, machine, FALSE, offset,
+                                 translated_wow64, translated_amd64_low );
     default:
         status = find_builtin_dll( &pe_mapping->nt_name, &pe_mapping->exp_name, module, size, info,
                                    limit_low, limit_high, search_machine, machine,
-                                   (loadorder == LO_DEFAULT), offset );
+                                   (loadorder == LO_DEFAULT), offset, translated_wow64,
+                                   translated_amd64_low );
         if (status == STATUS_DLL_NOT_FOUND || status == STATUS_NOT_SUPPORTED)
             return STATUS_IMAGE_ALREADY_LOADED;
         return status;
@@ -1947,7 +2603,15 @@ NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **mod
     /* if path is in system dir, we can load the builtin even if the file itself doesn't exist */
     if (loadorder != LO_NATIVE && is_prefix_bootstrap && is_system_dir)
         status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0,
-                                   search_machine, load_machine, FALSE, 0 );
+                                   search_machine, load_machine, FALSE, 0,
+#if defined(__APPLE__) && defined(__aarch64__)
+                                   search_machine == IMAGE_FILE_MACHINE_I386,
+                                   current_machine == IMAGE_FILE_MACHINE_ARM64 &&
+                                   search_machine == IMAGE_FILE_MACHINE_AMD64
+#else
+                                   FALSE, FALSE
+#endif
+                                   );
     return status;
 }
 
@@ -1967,7 +2631,14 @@ NTSTATUS load_start_exe( UNICODE_STRING *nt_name, void **module )
     wcscpy( image, get_machine_wow64_dir( current_machine ));
     wcscat( image, startW );
     init_unicode_string( nt_name, image );
-    status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0, current_machine, 0, FALSE, 0 );
+    status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0,
+                               current_machine, 0, FALSE, 0, FALSE,
+#if defined(__APPLE__) && defined(__aarch64__)
+                               is_arm64ec() && current_machine == IMAGE_FILE_MACHINE_AMD64
+#else
+                               FALSE
+#endif
+                               );
     if (!NT_SUCCESS(status))
     {
         MESSAGE( "wine: failed to load start.exe: %x\n", status );
@@ -2032,6 +2703,7 @@ static void load_ntdll_functions( HMODULE module )
     void **p__wine_syscall_dispatcher;
     void **p__wine_unix_call_dispatcher;
     void **p__wine_unix_call_dispatcher_arm64ec = NULL;
+    void **p__wine_main_image_native_base;
     unixlib_handle_t *p__wine_unixlib_handle;
     const IMAGE_EXPORT_DIRECTORY *exports;
 
@@ -2051,6 +2723,7 @@ static void load_ntdll_functions( HMODULE module )
     GET_FUNC( LdrSystemDllInitBlock );
     GET_FUNC( RtlUserThreadStart );
     GET_FUNC( __wine_ctrl_routine );
+    GET_FUNC( __wine_main_image_native_base );
     GET_FUNC( __wine_syscall_dispatcher );
     GET_FUNC( __wine_unix_call_dispatcher );
     GET_FUNC( __wine_unixlib_handle );
@@ -2060,6 +2733,7 @@ static void load_ntdll_functions( HMODULE module )
         GET_FUNC( KiUserEmulationDispatcher );
     }
     *p__wine_syscall_dispatcher = __wine_syscall_dispatcher;
+    *p__wine_main_image_native_base = main_image_native_base;
     *p__wine_unixlib_handle = (UINT_PTR)unix_call_funcs;
     if (p__wine_unix_call_dispatcher_arm64ec)
     {
@@ -2082,9 +2756,11 @@ static void load_ntdll_wow64_functions( HMODULE module )
     exports = get_module_data_dir( module, IMAGE_FILE_EXPORT_DIRECTORY, NULL );
     assert( exports );
 
-    pLdrSystemDllInitBlock->ntdll_handle = (ULONG_PTR)module;
+    pLdrSystemDllInitBlock->ntdll_handle = wow64_native_to_guest_addr( module );
 
-#define GET_FUNC(name) pLdrSystemDllInitBlock->p##name = find_named_export( module, exports, #name )
+#define GET_FUNC(name) \
+    pLdrSystemDllInitBlock->p##name = \
+        wow64_native_to_guest_addr( (void *)find_named_export( module, exports, #name ) )
     GET_FUNC( KiUserApcDispatcher );
     GET_FUNC( KiUserCallbackDispatcher );
     GET_FUNC( KiUserExceptionDispatcher );
@@ -2101,13 +2777,33 @@ static void load_ntdll_wow64_functions( HMODULE module )
     {
         unixlib_handle_t *p__wine_unixlib_handle = (void *)find_named_export( module, exports,
                                                                               "__wine_unixlib_handle" );
-        *p__wine_unixlib_handle = (UINT_PTR)unix_call_wow64_funcs;
+#if defined(__APPLE__) && defined(__aarch64__)
+        unixlib_handle_t handle;
+        NTSTATUS status;
+
+        if ((status = register_wow64_unixlib_dispatch( &ntdll_wow64_dispatch_source,
+                                                       unix_call_wow64_funcs, &handle )))
+            fatal_error( "failed to register the WoW64 ntdll Unix call table, status %#x\n", status );
+#else
+        unixlib_handle_t handle = (UINT_PTR)unix_call_wow64_funcs;
+        NTSTATUS status;
+#endif
+        if ((status = virtual_faulting_copy_to_user( p__wine_unixlib_handle,
+                                                      &handle, sizeof(handle) )))
+            fatal_error( "failed to publish the WoW64 ntdll Unix call table, status %#x\n", status );
     }
 #endif
 
     /* also set the 32-bit LdrSystemDllInitBlock */
-    memcpy( (void *)(ULONG_PTR)pLdrSystemDllInitBlock->pLdrSystemDllInitBlock,
+    {
+        NTSTATUS status = virtual_faulting_copy_to_user(
+            wow64_guest_to_native_ptr( (ULONG)pLdrSystemDllInitBlock->pLdrSystemDllInitBlock ),
             pLdrSystemDllInitBlock, sizeof(*pLdrSystemDllInitBlock) );
+
+        if (status)
+            fatal_error( "failed to publish the WoW64 system DLL initialization block, status %#x\n",
+                         status );
+    }
 }
 
 
@@ -2182,7 +2878,8 @@ static void load_ntdll(void)
     else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
 
     if (is_arm64ec()) machine = main_image_info.Machine;
-    status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0, machine, FALSE, 0 );
+    status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0,
+                                   machine, FALSE, 0, FALSE, FALSE );
     if (status == STATUS_DLL_NOT_FOUND)
     {
         free( name );
@@ -2254,7 +2951,7 @@ static void load_apiset_dll(void)
                 map->Size <= sec->Misc.VirtualSize)
             {
                 peb->ApiSetMap = map;
-                if (wow_peb) wow_peb->ApiSetMap = PtrToUlong(map);
+                if (wow_peb) wow_peb->ApiSetMap = wow64_native_to_guest_addr( map );
                 TRACE( "loaded %s apiset at %p\n", debugstr_w(path), map );
                 return;
             }
@@ -2288,7 +2985,14 @@ static void load_wow64_ntdll( USHORT machine )
     wcscpy( path, wow64_dir );
     wcscat( path, ntdllW );
     init_unicode_string( &nt_name, path );
-    status = find_builtin_dll( &nt_name, NULL, &module, &size, &info, 0, 0, machine, 0, FALSE, 0 );
+    status = find_builtin_dll( &nt_name, NULL, &module, &size, &info, 0, 0,
+                               machine, 0, FALSE, 0,
+#if defined(__APPLE__) && defined(__aarch64__)
+                               is_wow64() && machine == IMAGE_FILE_MACHINE_I386, FALSE
+#else
+                               FALSE, FALSE
+#endif
+                               );
     if (status == STATUS_IMAGE_NOT_AT_BASE) status = virtual_relocate_module( module );
     if (status) fatal_error( "failed to load %s error %x\n", debugstr_w(path), status );
     load_ntdll_wow64_functions( module );

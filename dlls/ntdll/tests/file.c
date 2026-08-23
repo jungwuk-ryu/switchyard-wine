@@ -1121,6 +1121,121 @@ static void test_set_io_completion(void)
     pNtClose( h );
 }
 
+static void test_wow64_completion_user_buffers(void)
+{
+    FILE_IO_COMPLETION_INFORMATION *info;
+    FILE_IO_COMPLETION_INFORMATION sentinel;
+    void *write_pages[8], *base;
+    ULONG_PTR *key, *value;
+    IO_STATUS_BLOCK *iosb;
+    LARGE_INTEGER timeout = {{0}};
+    ULONG *written;
+    ULONG_PTR write_count;
+    ULONG page_size, count, i;
+    SYSTEM_INFO si;
+    HANDLE port;
+    NTSTATUS status;
+    DWORD old_prot;
+    UINT ret;
+
+    if (sizeof(void *) != 4) return;
+
+    GetSystemInfo( &si );
+    page_size = si.dwPageSize;
+    if (page_size != 0x1000)
+    {
+        skip( "expected 4K WoW64 pages, got %#lx\n", page_size );
+        return;
+    }
+
+    base = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                         PAGE_READWRITE );
+    if (!base)
+    {
+        win_skip( "MEM_WRITE_WATCH not supported\n" );
+        return;
+    }
+
+    info = (FILE_IO_COMPLETION_INFORMATION *)((char *)base + page_size - sizeof(*info));
+    written = (ULONG *)((char *)base + 2 * page_size);
+    key = (ULONG_PTR *)((char *)base + 3 * page_size);
+    value = key + 1;
+    iosb = (IO_STATUS_BLOCK *)(key + 2);
+
+    status = pNtCreateIoCompletion( &port, IO_COMPLETION_ALL_ACCESS, NULL, 0 );
+    ok( status == STATUS_SUCCESS, "NtCreateIoCompletion failed: %#lx\n", status );
+    if (status) goto done;
+
+    memset( &sentinel, 0xcc, sizeof(sentinel) );
+    memcpy( info, &sentinel, sizeof(sentinel) );
+    *written = 0xdeadbeef;
+    status = pNtRemoveIoCompletionEx( (HANDLE)(ULONG_PTR)0xdeadbeef, info, 2, written,
+                                      &timeout, FALSE );
+    ok( status == STATUS_INVALID_HANDLE, "expected STATUS_INVALID_HANDLE, got %#lx\n", status );
+    ok( *written == 0xdeadbeef, "invalid handle published count %lu\n", *written );
+    ok( !memcmp( info, &sentinel, sizeof(sentinel) ), "invalid handle modified completion info\n" );
+
+    status = pNtRemoveIoCompletionEx( port, info, 2, written, &timeout, FALSE );
+    ok( status == STATUS_TIMEOUT, "expected STATUS_TIMEOUT, got %#lx\n", status );
+    ok( *written <= 1, "timeout published invalid count %lu\n", *written );
+    ok( !memcmp( info, &sentinel, sizeof(sentinel) ), "timeout modified completion info\n" );
+
+    status = pNtSetIoCompletion( port, 0x11223344, 0x55667788, STATUS_INVALID_DEVICE_REQUEST, 9 );
+    ok( status == STATUS_SUCCESS, "NtSetIoCompletion failed: %#lx\n", status );
+    status = pNtSetIoCompletion( port, 0x99aabbcc, 0xddeeff00, STATUS_BUFFER_OVERFLOW, 17 );
+    ok( status == STATUS_SUCCESS, "NtSetIoCompletion failed: %#lx\n", status );
+
+    ret = VirtualProtect( (char *)base + page_size, page_size, PAGE_READONLY, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtRemoveIoCompletionEx( port, info, 2, written, &timeout, FALSE );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+    count = get_pending_msgs( port );
+    ok( count == 2, "read-only output consumed %lu completions\n", 2 - count );
+
+    ret = VirtualProtect( (char *)base + page_size, page_size,
+                          PAGE_READWRITE | PAGE_GUARD, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    status = pNtRemoveIoCompletionEx( port, info, 2, written, &timeout, FALSE );
+    ok( status == STATUS_ACCESS_VIOLATION, "expected STATUS_ACCESS_VIOLATION, got %#lx\n", status );
+    count = get_pending_msgs( port );
+    ok( count == 2, "guarded output consumed %lu completions\n", 2 - count );
+
+    ret = VirtualProtect( (char *)base + page_size, page_size, PAGE_READWRITE, &old_prot );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    ret = ResetWriteWatch( base, 0x10000 );
+    ok( !ret, "ResetWriteWatch failed: %u\n", ret );
+
+    *written = 0xdeadbeef;
+    status = pNtRemoveIoCompletionEx( port, info, 2, written, &timeout, FALSE );
+    ok( status == STATUS_SUCCESS, "NtRemoveIoCompletionEx failed: %#lx\n", status );
+    ok( *written == 2, "got %lu completions\n", *written );
+    ok( info[0].CompletionKey == 0x11223344, "got key %#Ix\n", info[0].CompletionKey );
+    ok( info[0].CompletionValue == 0x55667788, "got value %#Ix\n", info[0].CompletionValue );
+    ok( info[1].CompletionKey == 0x99aabbcc, "got key %#Ix\n", info[1].CompletionKey );
+    ok( info[1].CompletionValue == 0xddeeff00, "got value %#Ix\n", info[1].CompletionValue );
+
+    write_count = ARRAY_SIZE(write_pages);
+    ret = GetWriteWatch( 0, base, 0x10000, write_pages, &write_count, &page_size );
+    ok( !ret, "GetWriteWatch failed: %u\n", ret );
+    ok( write_count == 3, "expected 3 written pages, got %Iu\n", write_count );
+    for (i = 0; i < min( write_count, 3 ); i++)
+        ok( write_pages[i] == (char *)base + i * page_size,
+            "write page %lu is %p\n", i, write_pages[i] );
+
+    status = pNtSetIoCompletion( port, CKEY_FIRST, CVALUE_FIRST, STATUS_SUCCESS, 23 );
+    ok( status == STATUS_SUCCESS, "NtSetIoCompletion failed: %#lx\n", status );
+    status = pNtRemoveIoCompletion( port, key, value, iosb, &timeout );
+    ok( status == STATUS_SUCCESS, "NtRemoveIoCompletion failed: %#lx\n", status );
+    ok( *key == CKEY_FIRST, "got key %#Ix\n", *key );
+    ok( *value == CVALUE_FIRST, "got value %#Ix\n", *value );
+    ok( iosb->Status == STATUS_SUCCESS, "got status %#lx\n", iosb->Status );
+    ok( iosb->Information == 23, "got information %#Ix\n", iosb->Information );
+
+    pNtClose( port );
+done:
+    VirtualFree( base, 0, MEM_RELEASE );
+}
+
 static void test_file_io_completion(void)
 {
     static const char pipe_name[] = "\\\\.\\pipe\\iocompletiontestnamedpipe";
@@ -7415,6 +7530,7 @@ START_TEST(file)
     append_file_test();
     nt_mailslot_test();
     test_set_io_completion();
+    test_wow64_completion_user_buffers();
     test_set_io_completion_ex();
     test_file_io_completion();
     test_file_basic_information();

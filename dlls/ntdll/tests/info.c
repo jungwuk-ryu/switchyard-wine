@@ -42,7 +42,12 @@ static NTSTATUS (WINAPI * pNtSetThreadExecutionState)(EXECUTION_STATE, EXECUTION
 static NTSTATUS (WINAPI * pNtQueryInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
 static NTSTATUS (WINAPI * pNtSetInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG);
 static NTSTATUS (WINAPI * pNtSetInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG);
+static NTSTATUS (WINAPI * pNtCreateThreadEx)(HANDLE *, ACCESS_MASK, OBJECT_ATTRIBUTES *, HANDLE,
+                                             PRTL_THREAD_START_ROUTINE, void *, ULONG, ULONG_PTR,
+                                             SIZE_T, SIZE_T, PS_ATTRIBUTE_LIST *);
 static NTSTATUS (WINAPI * pNtReadVirtualMemory)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+static NTSTATUS (WINAPI * pNtWriteVirtualMemory)(HANDLE, void*, const void*, SIZE_T, SIZE_T*);
+static NTSTATUS (WINAPI * pNtProtectVirtualMemory)(HANDLE, void**, SIZE_T*, ULONG, ULONG*);
 static NTSTATUS (WINAPI * pNtQueryVirtualMemory)(HANDLE, LPCVOID, MEMORY_INFORMATION_CLASS , PVOID , SIZE_T , SIZE_T *);
 static NTSTATUS (WINAPI * pNtCreateSection)(HANDLE*,ACCESS_MASK,const OBJECT_ATTRIBUTES*,const LARGE_INTEGER*,ULONG,ULONG,HANDLE);
 static NTSTATUS (WINAPI * pNtMapViewOfSection)(HANDLE,HANDLE,PVOID*,ULONG_PTR,SIZE_T,const LARGE_INTEGER*,SIZE_T*,SECTION_INHERIT,ULONG,ULONG);
@@ -103,7 +108,10 @@ static void InitFunctionPtrs(void)
     NTDLL_GET_PROC(NtQueryInformationThread);
     NTDLL_GET_PROC(NtSetInformationProcess);
     NTDLL_GET_PROC(NtSetInformationThread);
+    NTDLL_GET_PROC(NtCreateThreadEx);
     NTDLL_GET_PROC(NtReadVirtualMemory);
+    NTDLL_GET_PROC(NtWriteVirtualMemory);
+    NTDLL_GET_PROC(NtProtectVirtualMemory);
     NTDLL_GET_PROC(NtQueryVirtualMemory);
     NTDLL_GET_PROC(NtClose);
     NTDLL_GET_PROC(NtCreateSection);
@@ -5162,6 +5170,766 @@ static void test_process_parameters_flags( int argc, char **argv )
     RegDeleteKeyA( HKEY_LOCAL_MACHINE, keyname );
 }
 
+static BOOL run_translated_info_child( int argc, char **argv )
+{
+    HANDLE event;
+
+    if (argc < 4 || strcmp( argv[2], "wow64-create-child" )) return FALSE;
+    event = OpenEventA( EVENT_MODIFY_STATE, FALSE, argv[3] );
+    ok( !!event, "failed to open parent event %s, error %lu\n", argv[3], GetLastError() );
+    if (event)
+    {
+        ok( SetEvent( event ), "failed to signal parent event, error %lu\n", GetLastError() );
+        CloseHandle( event );
+    }
+    return TRUE;
+}
+
+#ifndef _WIN64
+
+static void CALLBACK translated_info_thread_proc( void *arg )
+{
+}
+
+static BOOL query_translated_allocation( void *memory )
+{
+    ULONG translated = 0;
+    NTSTATUS status;
+
+    status = pNtQueryVirtualMemory( GetCurrentProcess(), memory,
+                                    MemoryWineWow64TranslatedInformation,
+                                    &translated, sizeof(translated), NULL );
+    return !status && translated;
+}
+
+static BOOL query_current_handle_count( ULONG *count )
+{
+    NTSTATUS status;
+
+    *count = 0;
+    status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleCount,
+                                         count, sizeof(*count), NULL );
+    ok( !status, "ProcessHandleCount failed, status %#lx\n", status );
+    return !status;
+}
+
+static void close_test_thread( HANDLE thread )
+{
+    DWORD wait;
+
+    if (!thread) return;
+    wait = WaitForSingleObject( thread, 2000 );
+    ok( wait == WAIT_OBJECT_0, "test thread wait returned %#lx\n", wait );
+    if (wait != WAIT_OBJECT_0)
+    {
+        TerminateThread( thread, 0xdead );
+        WaitForSingleObject( thread, 2000 );
+    }
+    CloseHandle( thread );
+}
+
+static NTSTATUS create_translated_info_child( int argc, char **argv, const char *event_name,
+                                              HANDLE *process, HANDLE *thread,
+                                              ACCESS_MASK process_access,
+                                              ACCESS_MASK thread_access )
+{
+    WCHAR module[MAX_PATH], image_path[MAX_PATH + 4], command_line[2 * MAX_PATH];
+    WCHAR test_name[64], event_nameW[128];
+    RTL_USER_PROCESS_PARAMETERS *params;
+    PS_CREATE_INFO create_info;
+    PS_ATTRIBUTE_LIST attr;
+    UNICODE_STRING image, command;
+    NTSTATUS status;
+
+    if (argc < 2 || !MultiByteToWideChar( CP_ACP, 0, argv[1], -1, test_name,
+                                          ARRAY_SIZE(test_name) ) ||
+        !MultiByteToWideChar( CP_ACP, 0, event_name, -1, event_nameW,
+                              ARRAY_SIZE(event_nameW) ))
+        return STATUS_INVALID_PARAMETER;
+    if (!GetModuleFileNameW( NULL, module, ARRAY_SIZE(module) ))
+        return STATUS_UNSUCCESSFUL;
+    lstrcpyW( image_path, L"\\??\\" );
+    lstrcatW( image_path, module );
+    swprintf( command_line, ARRAY_SIZE(command_line), L"\"%s\" %s wow64-create-child %s",
+              module, test_name, event_nameW );
+    RtlInitUnicodeString( &image, image_path );
+    RtlInitUnicodeString( &command, command_line );
+    status = RtlCreateProcessParametersEx( &params, &image, NULL, NULL, &command, NULL,
+                                           NULL, NULL, NULL, NULL,
+                                           PROCESS_PARAMS_FLAG_NORMALIZED );
+    if (status) return status;
+
+    memset( &attr, 0, sizeof(attr) );
+    attr.TotalLength = sizeof(attr);
+    attr.Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
+    attr.Attributes[0].Size = image.Length;
+    attr.Attributes[0].ValuePtr = image.Buffer;
+    memset( &create_info, 0, sizeof(create_info) );
+    create_info.Size = sizeof(create_info);
+    status = NtCreateUserProcess( process, thread, process_access, thread_access,
+                                  NULL, NULL, 0, 0, params, &create_info, &attr );
+    RtlDestroyProcessParameters( params );
+    return status;
+}
+
+static void test_wow64_translated_info_marshalling( int argc, char **argv )
+{
+    static const DWORD output_protections[] = { PAGE_READONLY, PAGE_NOACCESS };
+    static const ULONG fixed_query_lengths[] = { sizeof(ULONG) - 1, sizeof(ULONG),
+                                                 sizeof(ULONG) + 1, MAXDWORD };
+    static const ULONG thread_times_lengths[] = { sizeof(KERNEL_USER_TIMES) - 1,
+                                                  sizeof(KERNEL_USER_TIMES),
+                                                  sizeof(KERNEL_USER_TIMES) + 1, MAXDWORD };
+    const SIZE_T allocation_size = 0x10000, logical_page_size = 0x1000;
+    const SIZE_T attr_header = offsetof(PS_ATTRIBUTE_LIST, Attributes);
+    const SIZE_T one_attr_size = offsetof(PS_ATTRIBUTE_LIST, Attributes[1]);
+    PS_ATTRIBUTE_LIST *attr, *edge_attr;
+    CLIENT_ID *attr_client_id;
+    GROUP_AFFINITY *affinity;
+    KERNEL_USER_TIMES *thread_times;
+    OBJECT_ATTRIBUTES objattr;
+    CLIENT_ID client_id;
+    MEMORY_BASIC_INFORMATION mbi;
+    EXECUTION_STATE initial_state, old_state, state, restored;
+    ULONG before, after, old_protect, i, value, *output, *partial, *retptr, *attr_retlen;
+    ULONG_PTR process_mask, system_mask, watch_count;
+    SIZE_T transferred, protect_size;
+    void *watch_addresses[8];
+    void *protect_base;
+    BYTE *memory = NULL, *watch = NULL;
+    DWORD granularity;
+    HANDLE process, restricted, thread;
+    HANDLE child_event;
+    char child_event_name[96];
+    NTSTATUS status;
+    BOOL ret;
+
+    if (!is_wow64 || !pNtCreateThreadEx || !pNtQueryVirtualMemory) return;
+
+    memory = VirtualAlloc( NULL, allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!memory, "translated marshalling allocation failed, error %lu\n", GetLastError() );
+    if (!memory) return;
+    if (!query_translated_allocation( memory ))
+    {
+        win_skip( "not running with translated WoW64 memory\n" );
+        VirtualFree( memory, 0, MEM_RELEASE );
+        return;
+    }
+
+    memory[0] = 0x5a;
+    memory[3 * logical_page_size] = 0xa5;
+    output = (ULONG *)(memory + logical_page_size);
+    InitializeObjectAttributes( &objattr, NULL, 0, NULL, NULL );
+    client_id.UniqueProcess = ULongToHandle( GetCurrentProcessId() );
+    client_id.UniqueThread = NULL;
+
+    for (i = 0; i < ARRAY_SIZE(output_protections); ++i)
+    {
+        *output = 0xcccccccc;
+        ret = VirtualProtect( output, logical_page_size, output_protections[i], &old_protect );
+        ok( ret, "protecting handle output %#lx failed, error %lu\n",
+            output_protections[i], GetLastError() );
+        if (!ret) continue;
+
+        if (!query_current_handle_count( &before )) before = 0;
+        status = NtOpenProcess( (HANDLE *)output, PROCESS_QUERY_LIMITED_INFORMATION,
+                                &objattr, &client_id );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "protected NtOpenProcess output %#lx returned %#lx\n",
+            output_protections[i], status );
+        if (!query_current_handle_count( &after )) after = before;
+        ok( after == before, "protected NtOpenProcess changed handle count %lu -> %lu\n",
+            before, after );
+
+        ret = VirtualProtect( output, logical_page_size, PAGE_READWRITE, &old_protect );
+        ok( ret, "restoring handle output failed, error %lu\n", GetLastError() );
+        if (ret)
+        {
+            process = ULongToHandle( *output );
+            ok( *output == 0xcccccccc, "protected handle output changed to %#lx\n", *output );
+            if (!status && process && *output != 0xcccccccc) CloseHandle( process );
+        }
+    }
+
+    process = NULL;
+    status = NtOpenProcess( &process, PROCESS_QUERY_LIMITED_INFORMATION, &objattr, &client_id );
+    ok( !status && !!process, "valid NtOpenProcess follow-up returned %#lx, handle %p\n",
+        status, process );
+    if (process) CloseHandle( process );
+
+    sprintf( child_event_name, "wine-wow64-create-%08lx-%08lx",
+             GetCurrentProcessId(), GetTickCount() );
+    child_event = CreateEventA( NULL, TRUE, FALSE, child_event_name );
+    ok( !!child_event, "creating child launch event failed, error %lu\n", GetLastError() );
+    if (child_event)
+    {
+        HANDLE child_process = (HANDLE)(ULONG_PTR)0xcccccccc;
+        HANDLE *child_thread = (HANDLE *)output;
+        DWORD wait;
+
+        *child_thread = (HANDLE)(ULONG_PTR)0xcccccccc;
+        ret = VirtualProtect( child_thread, logical_page_size, PAGE_READONLY, &old_protect );
+        ok( ret, "protecting create-process thread output failed, error %lu\n", GetLastError() );
+        if (ret)
+        {
+            status = create_translated_info_child( argc, argv, child_event_name,
+                                                   &child_process, child_thread,
+                                                   SYNCHRONIZE, SYNCHRONIZE );
+            ok( status == STATUS_ACCESS_VIOLATION,
+                "protected NtCreateUserProcess output returned %#lx\n", status );
+            wait = WaitForSingleObject( child_event, 200 );
+            ok( wait == WAIT_TIMEOUT,
+                "protected NtCreateUserProcess launched a child, wait %#lx\n", wait );
+            ret = VirtualProtect( child_thread, logical_page_size, PAGE_READWRITE,
+                                  &old_protect );
+            ok( ret, "restoring create-process output failed, error %lu\n", GetLastError() );
+            if (ret)
+            {
+                ok( child_process == (HANDLE)(ULONG_PTR)0xcccccccc &&
+                    *child_thread == (HANDLE)(ULONG_PTR)0xcccccccc,
+                    "protected process outputs changed to %p/%p\n",
+                    child_process, *child_thread );
+                if (!status)
+                {
+                    if (child_process) CloseHandle( child_process );
+                    if (*child_thread) CloseHandle( *child_thread );
+                }
+            }
+        }
+
+        ResetEvent( child_event );
+        child_process = NULL;
+        *child_thread = NULL;
+        status = create_translated_info_child( argc, argv, child_event_name,
+                                               &child_process, child_thread,
+                                               SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                                               SYNCHRONIZE );
+        ok( !status && !!child_process && !!*child_thread,
+            "valid restricted NtCreateUserProcess returned %#lx, handles %p/%p\n",
+            status, child_process, *child_thread );
+        if (!status)
+        {
+            wait = WaitForSingleObject( child_event, 5000 );
+            ok( wait == WAIT_OBJECT_0, "child launch event wait returned %#lx\n", wait );
+            wait = WaitForSingleObject( child_process, 5000 );
+            ok( wait == WAIT_OBJECT_0, "restricted child process wait returned %#lx\n", wait );
+            if (wait != WAIT_OBJECT_0)
+            {
+                HANDLE terminate = OpenProcess( PROCESS_TERMINATE | SYNCHRONIZE, FALSE,
+                                                GetProcessId( child_process ) );
+
+                ok( !!terminate, "opening timed-out child for cleanup failed, error %lu\n",
+                    GetLastError() );
+                if (terminate)
+                {
+                    TerminateProcess( terminate, 0xdead );
+                    WaitForSingleObject( terminate, 2000 );
+                    CloseHandle( terminate );
+                }
+            }
+        }
+        if (child_process) CloseHandle( child_process );
+        if (*child_thread) CloseHandle( *child_thread );
+        CloseHandle( child_event );
+    }
+
+    if (pNtWriteVirtualMemory && pNtProtectVirtualMemory)
+    {
+        restricted = NULL;
+        ret = DuplicateHandle( GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+                               &restricted, PROCESS_VM_OPERATION, FALSE, 0 );
+        ok( ret, "duplicating operation-only self handle failed, error %lu\n", GetLastError() );
+        if (ret)
+        {
+            value = 0xcccccccc;
+            transferred = 0xdeadbeef;
+            status = pNtReadVirtualMemory( restricted, memory, &value, sizeof(value), &transferred );
+            ok( status == STATUS_ACCESS_DENIED,
+                "operation-only self read returned %#lx\n", status );
+            ok( value == 0xcccccccc, "denied self read changed output to %#lx\n", value );
+
+            partial = (ULONG *)(memory + 0x100);
+            *partial = 0xcccccccc;
+            value = 0x12345678;
+            transferred = 0xdeadbeef;
+            status = pNtWriteVirtualMemory( restricted, partial, &value, sizeof(value),
+                                            &transferred );
+            ok( status == STATUS_ACCESS_DENIED,
+                "operation-only self write returned %#lx\n", status );
+            ok( *partial == 0xcccccccc, "denied self write changed target to %#lx\n", *partial );
+            CloseHandle( restricted );
+        }
+
+        restricted = NULL;
+        ret = DuplicateHandle( GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+                               &restricted, PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, 0 );
+        ok( ret, "duplicating non-operation self handle failed, error %lu\n", GetLastError() );
+        if (ret)
+        {
+            protect_base = memory;
+            protect_size = logical_page_size;
+            old_protect = 0xdeadbeef;
+            status = pNtProtectVirtualMemory( restricted, &protect_base, &protect_size,
+                                              PAGE_READONLY, &old_protect );
+            ok( status == STATUS_ACCESS_DENIED,
+                "non-operation self protect returned %#lx\n", status );
+            ret = VirtualQuery( memory, &mbi, sizeof(mbi) ) == sizeof(mbi);
+            ok( ret, "VirtualQuery after denied protect failed, error %lu\n", GetLastError() );
+            if (ret) ok( mbi.Protect == PAGE_READWRITE,
+                         "denied protect changed protection to %#lx\n", mbi.Protect );
+            CloseHandle( restricted );
+        }
+    }
+
+    *output = 0xcccccccc;
+    ret = VirtualProtect( output, logical_page_size, PAGE_READWRITE | PAGE_GUARD, &old_protect );
+    ok( ret, "protecting guard output failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleCount,
+                                             output, sizeof(*output), NULL );
+        ok( status == STATUS_GUARD_PAGE_VIOLATION,
+            "guarded ProcessHandleCount returned %#lx\n", status );
+        ret = VirtualQuery( output, &mbi, sizeof(mbi) ) == sizeof(mbi);
+        ok( ret, "VirtualQuery for guard output failed, error %lu\n", GetLastError() );
+        if (ret) ok( !(mbi.Protect & PAGE_GUARD), "non-stack guard was not consumed, protect %#lx\n",
+                     mbi.Protect );
+        ret = VirtualProtect( output, logical_page_size, PAGE_READWRITE, &old_protect );
+        ok( ret, "restoring guard output failed, error %lu\n", GetLastError() );
+        if (ret) ok( *output == 0xcccccccc, "guarded output changed to %#lx\n", *output );
+    }
+
+    partial = (ULONG *)(memory + 0x100);
+    retptr = partial + 2;
+    thread_times = (KERNEL_USER_TIMES *)(memory + 0x400);
+    for (i = 0; i < ARRAY_SIZE(fixed_query_lengths); ++i)
+    {
+        ULONG query_len = fixed_query_lengths[i];
+
+        partial[0] = partial[1] = 0xcccccccc;
+        *retptr = 0xdddddddd;
+        status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleCount,
+                                             partial, query_len, retptr );
+        ok( status == (query_len == sizeof(*partial) ? STATUS_SUCCESS :
+                                                       STATUS_INFO_LENGTH_MISMATCH),
+            "ProcessHandleCount length %lu returned %#lx\n", query_len, status );
+        if (query_len >= sizeof(*partial))
+            ok( partial[0] != 0xcccccccc,
+                "ProcessHandleCount length %lu did not publish output\n", query_len );
+        else
+            ok( partial[0] == 0xcccccccc,
+                "short ProcessHandleCount changed output to %#lx\n", partial[0] );
+        ok( partial[1] == 0xcccccccc,
+            "ProcessHandleCount length %lu overwrote its fixed output\n", query_len );
+        ok( *retptr == sizeof(*partial),
+            "ProcessHandleCount length %lu return length is %lu\n", query_len, *retptr );
+
+        partial[0] = partial[1] = 0xcccccccc;
+        *retptr = 0xdddddddd;
+        status = pNtQuerySystemInformation( SystemRecommendedSharedDataAlignment,
+                                            partial, query_len, retptr );
+        ok( status == (query_len < sizeof(*partial) ? STATUS_INFO_LENGTH_MISMATCH :
+                                                           STATUS_SUCCESS),
+            "SystemRecommendedSharedDataAlignment length %lu returned %#lx\n",
+            query_len, status );
+        if (query_len >= sizeof(*partial))
+            ok( partial[0] != 0xcccccccc,
+                "system query length %lu did not publish output\n", query_len );
+        else
+            ok( partial[0] == 0xcccccccc,
+                "short system query changed output to %#lx\n", partial[0] );
+        ok( partial[1] == 0xcccccccc,
+            "system query length %lu overwrote its fixed output\n", query_len );
+        ok( *retptr == sizeof(*partial),
+            "system query length %lu return length is %lu\n", query_len, *retptr );
+    }
+
+    for (i = 0; i < ARRAY_SIZE(thread_times_lengths); ++i)
+    {
+        ULONG query_len = thread_times_lengths[i];
+        ULONG expected = min( query_len, (ULONG)sizeof(*thread_times) );
+
+        memset( thread_times, 0xcc, sizeof(*thread_times) + 1 );
+        *retptr = 0xdddddddd;
+        status = pNtQueryInformationThread( GetCurrentThread(), ThreadTimes,
+                                            thread_times, query_len, retptr );
+        ok( !status, "ThreadTimes length %lu returned %#lx\n", query_len, status );
+        ok( *retptr == expected,
+            "ThreadTimes length %lu return length is %lu\n", query_len, *retptr );
+        ok( ((BYTE *)thread_times)[sizeof(*thread_times)] == 0xcc,
+            "ThreadTimes length %lu overwrote its fixed output\n", query_len );
+    }
+
+    *partial = 0xcccccccc;
+    *retptr = 0xdddddddd;
+    status = pNtQueryInformationProcess( GetCurrentProcess(), 0x7fffffff,
+                                         partial, MAXDWORD, retptr );
+    ok( status == STATUS_INVALID_INFO_CLASS,
+        "unsupported oversized process query returned %#lx\n", status );
+    ok( *partial == 0xcccccccc && *retptr == 0xdddddddd,
+        "unsupported oversized process query changed output %#lx/%#lx\n",
+        *partial, *retptr );
+
+    *partial = 0xcccccccc;
+    *retptr = 0xdddddddd;
+    status = pNtQuerySystemInformation( 0x7fffffff, partial, MAXDWORD, retptr );
+    ok( status == STATUS_INVALID_INFO_CLASS,
+        "unsupported oversized system query returned %#lx\n", status );
+    ok( *partial == 0xcccccccc && *retptr == 0xdddddddd,
+        "unsupported oversized system query changed output %#lx/%#lx\n",
+        *partial, *retptr );
+
+    partial = (ULONG *)(memory + 0x100);
+    retptr = (ULONG *)(memory + logical_page_size);
+    *partial = 0xcccccccc;
+    *retptr = 0xdddddddd;
+    ret = VirtualProtect( retptr, logical_page_size, PAGE_READONLY, &old_protect );
+    ok( ret, "protecting partial-query return length failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleTable,
+                                             partial, sizeof(*partial), retptr );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "protected ProcessHandleTable return length returned %#lx\n", status );
+        ok( *partial == 0xcccccccc, "short ProcessHandleTable output changed to %#lx\n",
+            *partial );
+        ret = VirtualProtect( retptr, logical_page_size, PAGE_READWRITE, &old_protect );
+        ok( ret, "restoring partial-query return length failed, error %lu\n", GetLastError() );
+        if (ret) ok( *retptr == 0xdddddddd, "protected return length changed to %#lx\n", *retptr );
+    }
+    *partial = 0xcccccccc;
+    *retptr = 0;
+    status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleTable,
+                                         partial, sizeof(*partial), retptr );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH,
+        "partial ProcessHandleTable follow-up returned %#lx\n", status );
+    ok( *partial == 0xcccccccc, "short ProcessHandleTable follow-up changed output to %#lx\n",
+        *partial );
+    ok( *retptr > sizeof(*partial) && !(*retptr % sizeof(*partial)),
+        "partial ProcessHandleTable return length is %lu\n", *retptr );
+
+    attr = (PS_ATTRIBUTE_LIST *)(memory + 0x200);
+    memset( attr, 0, one_attr_size );
+    attr->TotalLength = attr_header - 1;
+    thread = (HANDLE)0xcccccccc;
+    status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+    ok( status == STATUS_INVALID_PARAMETER && !thread,
+        "short PS_ATTRIBUTE_LIST returned %#lx, thread %p\n", status, thread );
+
+    attr->TotalLength = attr_header + 1;
+    thread = (HANDLE)0xcccccccc;
+    status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+    ok( status == STATUS_INVALID_PARAMETER && !thread,
+        "non-divisible PS_ATTRIBUTE_LIST returned %#lx, thread %p\n", status, thread );
+
+    attr->TotalLength = offsetof(PS_ATTRIBUTE_LIST, Attributes[PsAttributeMax + 1]);
+    thread = (HANDLE)0xcccccccc;
+    status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+    ok( status == STATUS_INVALID_PARAMETER && !thread,
+        "oversized PS_ATTRIBUTE_LIST count returned %#lx, thread %p\n", status, thread );
+
+    memset( attr, 0, one_attr_size );
+    attr->TotalLength = one_attr_size;
+    attr->Attributes[0].Attribute = PS_ATTRIBUTE_HANDLE_LIST;
+    attr->Attributes[0].Size = MAXDWORD & ~(sizeof(ULONG) - 1);
+    attr->Attributes[0].ValuePtr = memory;
+    thread = (HANDLE)0xcccccccc;
+    status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+    ok( status == STATUS_INVALID_PARAMETER && !thread,
+        "oversized handle attribute returned %#lx, thread %p\n", status, thread );
+
+    edge_attr = (PS_ATTRIBUTE_LIST *)(memory + logical_page_size - attr_header);
+    memset( edge_attr, 0, one_attr_size );
+    edge_attr->TotalLength = one_attr_size;
+    ret = VirtualProtect( memory + logical_page_size, logical_page_size,
+                          PAGE_NOACCESS, &old_protect );
+    ok( ret, "protecting truncated attribute extent failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        thread = (HANDLE)0xcccccccc;
+        status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                    translated_info_thread_proc, NULL, 0, 0, 0, 0, edge_attr );
+        ok( status == STATUS_ACCESS_VIOLATION && !thread,
+            "truncated PS_ATTRIBUTE_LIST returned %#lx, thread %p\n", status, thread );
+        ret = VirtualProtect( memory + logical_page_size, logical_page_size,
+                              PAGE_READWRITE, &old_protect );
+        ok( ret, "restoring truncated attribute lane failed, error %lu\n", GetLastError() );
+    }
+
+    memset( attr, 0, one_attr_size );
+    affinity = (GROUP_AFFINITY *)(memory + logical_page_size);
+    ret = GetProcessAffinityMask( GetCurrentProcess(), &process_mask, &system_mask );
+    ok( ret, "GetProcessAffinityMask failed, error %lu\n", GetLastError() );
+    if (!ret) process_mask = 1;
+    memset( affinity, 0, sizeof(*affinity) );
+    affinity->Mask = process_mask & (~process_mask + 1);
+    attr->TotalLength = one_attr_size;
+    attr->Attributes[0].Attribute = PS_ATTRIBUTE_GROUP_AFFINITY;
+    attr->Attributes[0].Size = sizeof(*affinity);
+    attr->Attributes[0].ValuePtr = affinity;
+    ret = VirtualProtect( affinity, logical_page_size, PAGE_NOACCESS, &old_protect );
+    ok( ret, "protecting nested affinity failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        thread = (HANDLE)0xcccccccc;
+        status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                    translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+        ok( status == STATUS_ACCESS_VIOLATION && !thread,
+            "protected nested affinity returned %#lx, thread %p\n", status, thread );
+        ret = VirtualProtect( affinity, logical_page_size, PAGE_READWRITE, &old_protect );
+        ok( ret, "restoring nested affinity failed, error %lu\n", GetLastError() );
+    }
+
+    memset( attr, 0, one_attr_size );
+    attr->TotalLength = one_attr_size;
+    attr->Attributes[0].Attribute = PS_ATTRIBUTE_CLIENT_ID;
+    attr->Attributes[0].Size = sizeof(CLIENT_ID);
+    attr->Attributes[0].ValuePtr = memory + logical_page_size;
+    ret = VirtualProtect( memory + logical_page_size, logical_page_size,
+                          PAGE_READONLY, &old_protect );
+    ok( ret, "protecting nested client id failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        query_current_handle_count( &before );
+        thread = (HANDLE)0xcccccccc;
+        status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                    translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+        ok( status == STATUS_ACCESS_VIOLATION && !thread,
+            "protected nested client id returned %#lx, thread %p\n", status, thread );
+        query_current_handle_count( &after );
+        ok( after == before, "protected client-id output changed handle count %lu -> %lu\n",
+            before, after );
+        ret = VirtualProtect( memory + logical_page_size, logical_page_size,
+                              PAGE_READWRITE, &old_protect );
+        ok( ret, "restoring nested client id failed, error %lu\n", GetLastError() );
+        close_test_thread( thread );
+    }
+
+    attr_client_id = (CLIENT_ID *)(memory + logical_page_size);
+    attr_retlen = (ULONG *)(memory + 2 * logical_page_size);
+    memset( attr_client_id, 0xcc, sizeof(*attr_client_id) );
+    *attr_retlen = 0xdddddddd;
+    attr->Attributes[0].ValuePtr = attr_client_id;
+    attr->Attributes[0].ReturnLength = attr_retlen;
+    ret = VirtualProtect( attr_retlen, logical_page_size, PAGE_READONLY, &old_protect );
+    ok( ret, "protecting client-id return length failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        query_current_handle_count( &before );
+        thread = (HANDLE)0xcccccccc;
+        status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                    translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+        ok( status == STATUS_ACCESS_VIOLATION && !thread,
+            "protected client-id return length returned %#lx, thread %p\n", status, thread );
+        query_current_handle_count( &after );
+        ok( after == before, "protected client-id length changed handle count %lu -> %lu\n",
+            before, after );
+        ret = VirtualProtect( attr_retlen, logical_page_size, PAGE_READWRITE, &old_protect );
+        ok( ret, "restoring client-id return length failed, error %lu\n", GetLastError() );
+        if (ret) ok( *attr_retlen == 0xdddddddd,
+                     "protected client-id return length changed to %#lx\n", *attr_retlen );
+    }
+
+    attr->Attributes[0].ReturnLength = NULL;
+    ret = VirtualProtect( attr_client_id, logical_page_size,
+                          PAGE_READWRITE | PAGE_GUARD, &old_protect );
+    ok( ret, "protecting guarded client id failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        thread = (HANDLE)0xcccccccc;
+        status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                    translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+        ok( status == STATUS_ACCESS_VIOLATION && !thread,
+            "guarded client id returned %#lx, thread %p\n", status, thread );
+        ret = VirtualQuery( attr_client_id, &mbi, sizeof(mbi) ) == sizeof(mbi);
+        ok( ret, "VirtualQuery for guarded client id failed, error %lu\n", GetLastError() );
+        if (ret) ok( mbi.Protect & PAGE_GUARD,
+                     "client-id preflight consumed guard, protect %#lx\n", mbi.Protect );
+        ret = VirtualProtect( attr_client_id, logical_page_size, PAGE_READWRITE, &old_protect );
+        ok( ret, "restoring guarded client id failed, error %lu\n", GetLastError() );
+    }
+
+    memset( attr_client_id, 0, sizeof(*attr_client_id) );
+    *attr_retlen = 0xdddddddd;
+    attr->Attributes[0].ReturnLength = attr_retlen;
+    thread = NULL;
+    status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                translated_info_thread_proc, NULL, 0, 0, 0, 0, attr );
+    ok( !status && !!thread, "valid client-id attribute returned %#lx, thread %p\n",
+        status, thread );
+    if (!status)
+    {
+        ok( attr_client_id->UniqueProcess == ULongToHandle( GetCurrentProcessId() ),
+            "client-id process is %p\n", attr_client_id->UniqueProcess );
+        ok( !!attr_client_id->UniqueThread, "client-id thread was not published\n" );
+        ok( *attr_retlen == sizeof(*attr_client_id),
+            "client-id return length is %lu\n", *attr_retlen );
+    }
+    close_test_thread( thread );
+
+    restricted = NULL;
+    ret = DuplicateHandle( GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+                           &restricted, PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0 );
+    ok( ret, "duplicating self handle without create-thread access failed, error %lu\n",
+        GetLastError() );
+    if (ret)
+    {
+        thread = (HANDLE)0xcccccccc;
+        status = pNtCreateThreadEx( &thread, SYNCHRONIZE, NULL, restricted,
+                                    translated_info_thread_proc, NULL, 0, 0, 0, 0, NULL );
+        ok( status == STATUS_ACCESS_DENIED && !thread,
+            "restricted self NtCreateThreadEx returned %#lx, thread %p\n", status, thread );
+        close_test_thread( thread );
+        CloseHandle( restricted );
+    }
+
+    restricted = NULL;
+    ret = DuplicateHandle( GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+                           &restricted, PROCESS_CREATE_THREAD, FALSE, 0 );
+    ok( ret, "duplicating create-thread-only self handle failed, error %lu\n", GetLastError() );
+    if (ret)
+    {
+        DWORD wait;
+
+        thread = NULL;
+        status = pNtCreateThreadEx( &thread, SYNCHRONIZE, NULL, restricted,
+                                    translated_info_thread_proc, NULL, 0, 0, 0, 0, NULL );
+        ok( !status && !!thread,
+            "create-thread-only self NtCreateThreadEx returned %#lx, thread %p\n",
+            status, thread );
+        if (thread)
+        {
+            wait = WaitForSingleObject( thread, 2000 );
+            ok( wait == WAIT_OBJECT_0,
+                "create-thread-only self thread wait returned %#lx\n", wait );
+            CloseHandle( thread );
+        }
+        CloseHandle( restricted );
+    }
+
+    {
+        char native_cmd[] = "C:\\windows\\sysnative\\cmd.exe /c exit";
+        STARTUPINFOA startup = { sizeof(startup) };
+        PROCESS_INFORMATION native_process;
+
+        memset( &native_process, 0, sizeof(native_process) );
+        ret = CreateProcessA( NULL, native_cmd, NULL, NULL, FALSE, CREATE_SUSPENDED,
+                              NULL, NULL, &startup, &native_process );
+        if (ret)
+        {
+            WINE_PROCESS_VM_INFORMATION vm_info;
+
+            memset( &vm_info, 0, sizeof(vm_info) );
+            status = pNtQueryVirtualMemory( native_process.hProcess, NULL,
+                                            MemoryWineProcessVmMachineInformation,
+                                            &vm_info, sizeof(vm_info), NULL );
+            if (!status && vm_info.Machine != IMAGE_FILE_MACHINE_I386)
+            {
+                thread = (HANDLE)0xcccccccc;
+                status = pNtCreateThreadEx( &thread, SYNCHRONIZE, NULL,
+                                            native_process.hProcess, NULL, NULL,
+                                            0, 0, 0, 0, NULL );
+                ok( status == STATUS_INVALID_PARAMETER && !thread,
+                    "zero-address non-i386 NtCreateThreadEx returned %#lx, thread %p, machine %#x\n",
+                    status, thread, vm_info.Machine );
+                close_test_thread( thread );
+            }
+            else win_skip( "sysnative target is not a queryable non-i386 process, status %#lx, machine %#x\n",
+                           status, vm_info.Machine );
+            TerminateProcess( native_process.hProcess, 0 );
+            CloseHandle( native_process.hThread );
+            CloseHandle( native_process.hProcess );
+        }
+        else win_skip( "could not start sysnative target, error %lu\n", GetLastError() );
+    }
+
+    thread = NULL;
+    status = pNtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                                translated_info_thread_proc, NULL, 0, 0, 0, 0, NULL );
+    ok( !status && !!thread, "valid NtCreateThreadEx follow-up returned %#lx, thread %p\n",
+        status, thread );
+    close_test_thread( thread );
+
+    if (pNtSetThreadExecutionState && pNtPowerInformation)
+    {
+        status = pNtPowerInformation( SystemExecutionState, NULL, 0,
+                                      &initial_state, sizeof(initial_state) );
+        ok( !status, "initial execution-state query returned %#lx\n", status );
+        old_state = 0xcccccccc;
+        status = pNtSetThreadExecutionState( ES_CONTINUOUS | ES_SYSTEM_REQUIRED, &old_state );
+        ok( !status, "setting execution-state baseline returned %#lx\n", status );
+        status = pNtPowerInformation( SystemExecutionState, NULL, 0, &state, sizeof(state) );
+        ok( !status && (state & ES_SYSTEM_REQUIRED),
+            "execution-state baseline query returned %#lx, state %#lx\n", status, state );
+
+        *output = 0xcccccccc;
+        ret = VirtualProtect( output, logical_page_size, PAGE_NOACCESS, &old_protect );
+        ok( ret, "protecting execution-state output failed, error %lu\n", GetLastError() );
+        if (ret)
+        {
+            status = pNtSetThreadExecutionState( ES_CONTINUOUS, (EXECUTION_STATE *)output );
+            ok( status == STATUS_ACCESS_VIOLATION,
+                "protected NtSetThreadExecutionState returned %#lx\n", status );
+            status = pNtPowerInformation( SystemExecutionState, NULL, 0, &state, sizeof(state) );
+            ok( !status && (state & ES_SYSTEM_REQUIRED),
+                "failed execution-state call changed state, status %#lx, state %#lx\n",
+                status, state );
+            ret = VirtualProtect( output, logical_page_size, PAGE_READWRITE, &old_protect );
+            ok( ret, "restoring execution-state output failed, error %lu\n", GetLastError() );
+        }
+        status = pNtSetThreadExecutionState( old_state, &restored );
+        ok( !status, "restoring execution state returned %#lx\n", status );
+    }
+
+    ok( memory[0] == 0x5a && memory[3 * logical_page_size] == 0xa5,
+        "translated sibling sentinels changed to %#x/%#x\n",
+        memory[0], memory[3 * logical_page_size] );
+
+    watch = VirtualAlloc( NULL, allocation_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                          PAGE_READWRITE );
+    ok( !!watch, "write-watch allocation failed, error %lu\n", GetLastError() );
+    if (watch && query_translated_allocation( watch ))
+    {
+        output = (ULONG *)(watch + logical_page_size);
+        ret = !ResetWriteWatch( watch, 4 * logical_page_size );
+        ok( ret, "ResetWriteWatch failed, error %lu\n", GetLastError() );
+        status = pNtQueryInformationProcess( GetCurrentProcess(), ProcessHandleCount,
+                                             output, sizeof(*output), NULL );
+        ok( !status, "write-watch ProcessHandleCount returned %#lx\n", status );
+        watch_count = ARRAY_SIZE(watch_addresses);
+        granularity = 0;
+        ret = !GetWriteWatch( 0, watch, 4 * logical_page_size, watch_addresses,
+                              &watch_count, &granularity );
+        ok( ret, "GetWriteWatch failed, error %lu\n", GetLastError() );
+        if (ret)
+        {
+            ok( watch_count == 1, "expected one dirty logical page, got %Iu\n", watch_count );
+            if (watch_count)
+                ok( watch_addresses[0] == watch + logical_page_size,
+                    "unexpected dirty page %p, expected %p\n",
+                    watch_addresses[0], watch + logical_page_size );
+            ok( granularity == logical_page_size,
+                "unexpected write-watch granularity %#lx\n", granularity );
+        }
+    }
+    if (watch) VirtualFree( watch, 0, MEM_RELEASE );
+    VirtualFree( memory, 0, MEM_RELEASE );
+}
+
+#else
+
+static void test_wow64_translated_info_marshalling( int argc, char **argv )
+{
+    (void)argc;
+    (void)argv;
+}
+
+#endif
+
 START_TEST(info)
 {
     char **argv;
@@ -5170,6 +5938,7 @@ START_TEST(info)
     InitFunctionPtrs();
 
     argc = winetest_get_mainargs(&argv);
+    if (run_translated_info_child( argc, argv )) return;
     if (argc >= 3)
     {
         if (strcmp(argv[2], "debuggee:dbgport") == 0) test_debuggee_dbgport(argc - 2, argv + 2);
@@ -5254,4 +6023,5 @@ START_TEST(info)
     test_process_id();
     test_processor_idle_cycle_time();
     test_process_parameters_flags(argc, argv);
+    test_wow64_translated_info_marshalling( argc, argv );
 }

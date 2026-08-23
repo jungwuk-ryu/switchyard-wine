@@ -429,13 +429,16 @@ static void load_strings(struct localized_string *str)
     localized_strings = dict;
 }
 
+#ifdef _WIN64
+static NTSTATUS load_wow64_strings(ULONG strings);
+#endif
+
 
 /***********************************************************************
  *              macdrv_init
  */
-static NTSTATUS macdrv_init(void *arg)
+static NTSTATUS macdrv_init_common(struct init_params *params, BOOL wow64, ULONG strings32)
 {
-    struct init_params *params = arg;
     SessionAttributeBits attributes;
     OSStatus status;
 
@@ -450,6 +453,18 @@ static NTSTATUS macdrv_init(void *arg)
 
     init_win_context();
     setup_options();
+#ifdef _WIN64
+    if (wow64)
+    {
+        NTSTATUS init_status = load_wow64_strings(strings32);
+
+        if (init_status) return init_status;
+    }
+    else
+#else
+    (void)wow64;
+    (void)strings32;
+#endif
     load_strings(params->strings);
 
     macdrv_err_on = ERR_ON(macdrv);
@@ -461,6 +476,11 @@ static NTSTATUS macdrv_init(void *arg)
 
     init_user_driver();
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS macdrv_init(void *arg)
+{
+    return macdrv_init_common(arg, FALSE, 0);
 }
 
 
@@ -715,20 +735,119 @@ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
 
 #ifdef _WIN64
 
+#define WOW64_LOCALIZED_STRING_MAX_COUNT 256
+#define WOW64_LOCALIZED_STRING_MAX_TOTAL 0x400000
+
+struct wow64_init_params
+{
+    ULONG strings;
+    UINT64 app_icon_callback;
+    UINT64 app_quit_request_callback;
+};
+
+struct localized_string32
+{
+    UINT id;
+    UINT len;
+    UINT64 str;
+};
+
+C_ASSERT(sizeof(struct wow64_init_params) == 24);
+C_ASSERT(sizeof(struct localized_string32) == 16);
+
+static NTSTATUS load_wow64_strings(ULONG strings)
+{
+    CFMutableDictionaryRef dict;
+    SIZE_T total = 0;
+    unsigned int i;
+    NTSTATUS status;
+
+    dict = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                     &kCFTypeDictionaryValueCallBacks);
+    if (!dict)
+    {
+        ERR("Failed to create localized strings dictionary\n");
+        return STATUS_NO_MEMORY;
+    }
+
+    for (i = 0; i < WOW64_LOCALIZED_STRING_MAX_COUNT; i++)
+    {
+        struct localized_string32 str;
+        void *ptr;
+
+        if (i > (MAXDWORD - strings) / sizeof(str))
+        {
+            status = STATUS_ACCESS_VIOLATION;
+            goto failed;
+        }
+        if ((status = ntdll_wow64_guest32_to_host(strings + i * sizeof(str), &ptr)) ||
+            (status = ntdll_wow64_copy_from_user(&str, ptr, sizeof(str))))
+            goto failed;
+        if (!str.id)
+        {
+            localized_strings = dict;
+            return STATUS_SUCCESS;
+        }
+
+        if (str.str && str.len)
+        {
+            CFNumberRef key;
+            CFStringRef value;
+            UniChar *buffer;
+            SIZE_T size;
+
+            if (str.str > MAXDWORD)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                goto failed;
+            }
+            size = str.len * sizeof(*buffer);
+            if (size > WOW64_LOCALIZED_STRING_MAX_TOTAL - total)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                goto failed;
+            }
+            total += size;
+            if (!(buffer = malloc(size)))
+            {
+                status = STATUS_NO_MEMORY;
+                goto failed;
+            }
+            if ((status = ntdll_wow64_guest32_to_host((ULONG)str.str, &ptr)) ||
+                (status = ntdll_wow64_copy_from_user(buffer, ptr, size)))
+            {
+                free(buffer);
+                goto failed;
+            }
+
+            key = CFNumberCreate(NULL, kCFNumberIntType, &str.id);
+            value = CFStringCreateWithCharacters(NULL, buffer, str.len);
+            if (key && value) CFDictionarySetValue(dict, key, value);
+            else ERR("Failed to add string ID 0x%04x %s\n", str.id,
+                     debugstr_wn(buffer, str.len));
+            if (key) CFRelease(key);
+            if (value) CFRelease(value);
+            free(buffer);
+        }
+        else ERR("Failed to load string ID 0x%04x\n", str.id);
+    }
+
+    status = STATUS_INVALID_PARAMETER;
+
+failed:
+    CFRelease(dict);
+    return status;
+}
+
 static NTSTATUS wow64_init(void *arg)
 {
-    struct
-    {
-        ULONG strings;
-        UINT64 app_icon_callback;
-        UINT64 app_quit_request_callback;
-    } *params32 = arg;
+    const struct wow64_init_params *params32 = arg;
     struct init_params params;
 
-    params.strings = UlongToPtr(params32->strings);
+    params.strings = NULL;
     params.app_icon_callback = params32->app_icon_callback;
     params.app_quit_request_callback = params32->app_quit_request_callback;
-    return macdrv_init(&params);
+    return macdrv_init_common(&params, TRUE, params32->strings);
 }
 
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
@@ -736,6 +855,16 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_init,
     macdrv_quit_result,
 };
+
+static const struct wine_unixlib_dispatch_entry_v2 wow64_dispatch_entries[] =
+{
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct wow64_init_params,
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                  WINE_UNIXLIB_DISPATCH_ENTRY_MAY_CALLBACK),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2(struct quit_result_params, 0),
+};
+
+WINE_UNIXLIB_DISPATCH_SOURCE_V2(__wine_unix_call_wow64_funcs, wow64_dispatch_entries);
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
 

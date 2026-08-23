@@ -52,6 +52,7 @@ struct process
     struct timeout_user *sigkill_timeout; /* timeout for final SIGKILL */
     timeout_t            sigkill_delay;   /* delay before final SIGKILL */
     unsigned short       machine;         /* client machine type */
+    unsigned short       vm_flags;        /* Wine-private virtual-memory flags */
     unsigned int         page_size;       /* client page size */
     int                  unix_pid;        /* Unix pid for final SIGKILL */
     int                  exit_code;       /* process exit code */
@@ -71,6 +72,7 @@ struct process
     unsigned int         is_system:1;     /* is it a system process? */
     unsigned int         debug_children:1;/* also debug all child processes */
     unsigned int         is_terminating:1;/* is process terminating? */
+    unsigned int         vm_flags_valid:1;/* main image established the VM address model */
     data_size_t          imagelen;        /* length of image path in bytes */
     WCHAR               *image;           /* main exe image full path */
     struct job          *job;             /* job object associated with this process */

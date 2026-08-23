@@ -494,7 +494,7 @@ union unix_sockaddr
  * given a short buffer */
 static int sockaddr_from_unix( const union unix_sockaddr *uaddr, struct WS_sockaddr *wsaddr, socklen_t wsaddrlen )
 {
-    memset( wsaddr, 0, wsaddrlen );
+    if (wsaddrlen) memset( wsaddr, 0, wsaddrlen );
 
     switch (uaddr->addr.sa_family)
     {
@@ -693,79 +693,104 @@ static BOOL addrinfo_in_list( const struct WS_addrinfo *list, const struct WS_ad
     return FALSE;
 }
 
-static NTSTATUS unix_getaddrinfo( void *args )
+static BOOL add_size_checked( SIZE_T *size, SIZE_T add )
 {
+    if (add > ~(SIZE_T)0 - *size) return FALSE;
+    *size += add;
+    return TRUE;
+}
+
+static BOOL add_array_size_checked( SIZE_T *size, SIZE_T count, SIZE_T element_size )
+{
+    if (count && element_size > ~(SIZE_T)0 / count) return FALSE;
+    return add_size_checked( size, count * element_size );
+}
+
+static BOOL get_cstring_size( const char *string, SIZE_T *size )
+{
+    SIZE_T len = strnlen( string, UINT_MAX );
+
+    if (len == UINT_MAX) return FALSE;
+    *size = len + 1;
+    return TRUE;
+}
+
+static BOOL add_cstring_size_checked( SIZE_T *size, const char *string )
+{
+    SIZE_T len;
+
+    return get_cstring_size( string, &len ) && add_size_checked( size, len );
+}
+
 #ifdef HAVE_GETADDRINFO
-    struct getaddrinfo_params *params = args;
-    const char *service = params->service;
-    const struct WS_addrinfo *hints = params->hints;
-    struct addrinfo unix_hints = {0};
-    struct addrinfo *unix_info, *src;
-    struct WS_addrinfo *dst, *prev = NULL;
-    unsigned int needed_size = 0;
-    int ret;
+static NTSTATUS prepare_addrinfo_hints( const struct WS_addrinfo *hints, struct addrinfo *unix_hints )
+{
+    if (!hints) return 0;
 
-    /* servname tweak required by OSX and BSD kernels */
-    if (service && !service[0]) service = "0";
+    unix_hints->ai_flags = addrinfo_flags_to_unix( hints->ai_flags );
 
-    if (hints)
+    if (hints->ai_family)
+        unix_hints->ai_family = family_to_unix( hints->ai_family );
+
+    if (hints->ai_socktype)
     {
-        unix_hints.ai_flags = addrinfo_flags_to_unix( hints->ai_flags );
-
-        if (hints->ai_family)
-            unix_hints.ai_family = family_to_unix( hints->ai_family );
-
-        if (hints->ai_socktype)
-        {
-            if ((unix_hints.ai_socktype = socktype_to_unix( hints->ai_socktype )) < 0)
-                return WSAESOCKTNOSUPPORT;
-        }
-
-        if (hints->ai_protocol)
-            unix_hints.ai_protocol = max( protocol_to_unix( hints->ai_protocol ), 0 );
-
-        /* Windows allows some invalid combinations */
-        if (unix_hints.ai_protocol == IPPROTO_TCP
-                && unix_hints.ai_socktype != SOCK_STREAM
-                && unix_hints.ai_socktype != SOCK_SEQPACKET)
-        {
-            WARN( "ignoring invalid type %u for TCP\n", unix_hints.ai_socktype );
-            unix_hints.ai_socktype = 0;
-        }
-        else if (unix_hints.ai_protocol == IPPROTO_UDP && unix_hints.ai_socktype != SOCK_DGRAM)
-        {
-            WARN( "ignoring invalid type %u for UDP\n", unix_hints.ai_socktype );
-            unix_hints.ai_socktype = 0;
-        }
-        else if (unix_hints.ai_protocol >= WS_NSPROTO_IPX && unix_hints.ai_protocol <= WS_NSPROTO_IPX + 255
-                && unix_hints.ai_socktype != SOCK_DGRAM)
-        {
-            WARN( "ignoring invalid type %u for IPX\n", unix_hints.ai_socktype );
-            unix_hints.ai_socktype = 0;
-        }
-        else if (unix_hints.ai_protocol == IPPROTO_IPV6)
-        {
-            WARN( "ignoring protocol IPv6\n" );
-            unix_hints.ai_protocol = 0;
-        }
+        if ((unix_hints->ai_socktype = socktype_to_unix( hints->ai_socktype )) < 0)
+            return WSAESOCKTNOSUPPORT;
     }
 
-    ret = getaddrinfo( params->node, service, hints ? &unix_hints : NULL, &unix_info );
-    if (ret)
-        return addrinfo_err_from_unix( ret );
+    if (hints->ai_protocol)
+        unix_hints->ai_protocol = max( protocol_to_unix( hints->ai_protocol ), 0 );
+
+    /* Windows allows some invalid combinations */
+    if (unix_hints->ai_protocol == IPPROTO_TCP
+            && unix_hints->ai_socktype != SOCK_STREAM
+            && unix_hints->ai_socktype != SOCK_SEQPACKET)
+    {
+        WARN( "ignoring invalid type %u for TCP\n", unix_hints->ai_socktype );
+        unix_hints->ai_socktype = 0;
+    }
+    else if (unix_hints->ai_protocol == IPPROTO_UDP && unix_hints->ai_socktype != SOCK_DGRAM)
+    {
+        WARN( "ignoring invalid type %u for UDP\n", unix_hints->ai_socktype );
+        unix_hints->ai_socktype = 0;
+    }
+    else if (unix_hints->ai_protocol >= WS_NSPROTO_IPX && unix_hints->ai_protocol <= WS_NSPROTO_IPX + 255
+            && unix_hints->ai_socktype != SOCK_DGRAM)
+    {
+        WARN( "ignoring invalid type %u for IPX\n", unix_hints->ai_socktype );
+        unix_hints->ai_socktype = 0;
+    }
+    else if (unix_hints->ai_protocol == IPPROTO_IPV6)
+    {
+        WARN( "ignoring protocol IPv6\n" );
+        unix_hints->ai_protocol = 0;
+    }
+
+    return 0;
+}
+
+static NTSTATUS addrinfo_from_unix( struct getaddrinfo_params *params, const struct addrinfo *unix_info )
+{
+    const struct WS_addrinfo *hints = params->hints;
+    const struct addrinfo *src;
+    struct WS_addrinfo *dst, *prev = NULL;
+    SIZE_T needed_size = 0;
 
     for (src = unix_info; src != NULL; src = src->ai_next)
     {
-        needed_size += sizeof(struct WS_addrinfo);
-        if (src->ai_canonname)
-            needed_size += strlen( src->ai_canonname ) + 1;
-        needed_size += sockaddr_from_unix( (const union unix_sockaddr *)src->ai_addr, NULL, 0 );
+        SIZE_T addr_size = sockaddr_from_unix( (const union unix_sockaddr *)src->ai_addr, NULL, 0 );
+
+        if (!add_size_checked( &needed_size, sizeof(struct WS_addrinfo) ) ||
+            (src->ai_canonname && !add_cstring_size_checked( &needed_size, src->ai_canonname )) ||
+            !add_size_checked( &needed_size, addr_size ) || needed_size > UINT_MAX)
+            return WSAENOBUFS;
     }
+
+    if (!needed_size) return 0;
 
     if (*params->size < needed_size)
     {
-        *params->size = needed_size;
-        freeaddrinfo( unix_info );
+        *params->size = (unsigned int)needed_size;
         return ERROR_INSUFFICIENT_BUFFER;
     }
 
@@ -791,8 +816,9 @@ static NTSTATUS unix_getaddrinfo( void *args )
         }
         if (src->ai_canonname)
         {
-            size_t len = strlen( src->ai_canonname ) + 1;
+            SIZE_T len;
 
+            if (!get_cstring_size( src->ai_canonname, &len )) return WSAENOBUFS;
             dst->ai_canonname = next;
             memcpy( dst->ai_canonname, src->ai_canonname, len );
             next = dst->ai_canonname + len;
@@ -813,33 +839,77 @@ static NTSTATUS unix_getaddrinfo( void *args )
         }
     }
 
-    freeaddrinfo( unix_info );
     return 0;
+}
+
+static NTSTATUS unix_getaddrinfo_result( struct getaddrinfo_params *params, const char *node,
+                                         const char *service, const struct addrinfo *unix_hints )
+{
+    struct addrinfo *unix_info;
+    NTSTATUS status;
+    int ret;
+
+    if ((ret = getaddrinfo( node, service, unix_hints, &unix_info )))
+        return addrinfo_err_from_unix( ret );
+    status = addrinfo_from_unix( params, unix_info );
+    freeaddrinfo( unix_info );
+    return status;
+}
 #else
+static NTSTATUS unix_getaddrinfo_result( struct getaddrinfo_params *params, const char *node,
+                                         const char *service, const void *unix_hints )
+{
     FIXME( "getaddrinfo() not found during build time\n" );
     return WS_EAI_FAIL;
+}
+#endif
+
+static NTSTATUS unix_getaddrinfo( void *args )
+{
+    struct getaddrinfo_params *params = args;
+    const char *service = params->service;
+#ifdef HAVE_GETADDRINFO
+    struct addrinfo unix_hints = {0};
+    NTSTATUS status;
+
+    /* servname tweak required by OSX and BSD kernels */
+    if (service && !service[0]) service = "0";
+    if ((status = prepare_addrinfo_hints( params->hints, &unix_hints ))) return status;
+    return unix_getaddrinfo_result( params, params->node, service,
+                                    params->hints ? &unix_hints : NULL );
+#else
+    return unix_getaddrinfo_result( params, params->node, service, NULL );
 #endif
 }
 
 
 static int hostent_from_unix( const struct hostent *unix_host, struct WS_hostent *host, unsigned int *const size )
 {
-    unsigned int needed_size = sizeof( struct WS_hostent ), alias_count = 0, addr_count = 0, i;
-    char *p;
+    SIZE_T needed_size = sizeof(struct WS_hostent), alias_count = 0, addr_count = 0, i;
+    SIZE_T aliases_offset, addr_list_offset, offset;
+    char *base = (char *)host;
 
-    needed_size += strlen( unix_host->h_name ) + 1;
+    if (!unix_host->h_name || !unix_host->h_aliases || !unix_host->h_addr_list ||
+        unix_host->h_length < 0 || unix_host->h_length > 0x7fff ||
+        !add_cstring_size_checked( &needed_size, unix_host->h_name ))
+        return WSAENOBUFS;
 
     for (alias_count = 0; unix_host->h_aliases[alias_count] != NULL; ++alias_count)
-        needed_size += sizeof(char *) + strlen( unix_host->h_aliases[alias_count] ) + 1;
-    needed_size += sizeof(char *); /* null terminator */
+        if (!add_size_checked( &needed_size, sizeof(char *) ) ||
+            !add_cstring_size_checked( &needed_size, unix_host->h_aliases[alias_count] ))
+            return WSAENOBUFS;
+    if (!add_size_checked( &needed_size, sizeof(char *) )) return WSAENOBUFS; /* null terminator */
 
     for (addr_count = 0; unix_host->h_addr_list[addr_count] != NULL; ++addr_count)
-        needed_size += sizeof(char *) + unix_host->h_length;
-    needed_size += sizeof(char *); /* null terminator */
+        if (!add_size_checked( &needed_size, sizeof(char *) ) ||
+            !add_size_checked( &needed_size, unix_host->h_length ))
+            return WSAENOBUFS;
+    if (!add_size_checked( &needed_size, sizeof(char *) ) || needed_size > UINT_MAX)
+        return WSAENOBUFS; /* null terminator */
 
     if (*size < needed_size)
     {
-        *size = needed_size;
+        *size = (unsigned int)needed_size;
         return ERROR_INSUFFICIENT_BUFFER;
     }
 
@@ -850,60 +920,98 @@ static int hostent_from_unix( const struct hostent *unix_host, struct WS_hostent
     host->h_addrtype = family_from_unix( unix_host->h_addrtype );
     host->h_length = unix_host->h_length;
 
-    p = (char *)(host + 1);
-    host->h_aliases = (char **)p;
-    p += (alias_count + 1) * sizeof(char *);
-    host->h_addr_list = (char **)p;
-    p += (addr_count + 1) * sizeof(char *);
+    aliases_offset = sizeof(*host);
+    addr_list_offset = aliases_offset;
+    if (!add_array_size_checked( &addr_list_offset, alias_count + 1, sizeof(char *) ))
+        return WSAENOBUFS;
+    offset = addr_list_offset;
+    if (!add_array_size_checked( &offset, addr_count + 1, sizeof(char *) ) || offset > needed_size)
+        return WSAENOBUFS;
+    host->h_aliases = (char **)(base + aliases_offset);
+    host->h_addr_list = (char **)(base + addr_list_offset);
 
     for (i = 0; i < addr_count; ++i)
     {
-        host->h_addr_list[i] = p;
+        SIZE_T next = offset;
+
+        if (!add_size_checked( &next, unix_host->h_length ) || next > needed_size)
+            return WSAENOBUFS;
+        host->h_addr_list[i] = base + offset;
         memcpy( host->h_addr_list[i], unix_host->h_addr_list[i], unix_host->h_length );
-        p += unix_host->h_length;
+        offset = next;
     }
 
     for (i = 0; i < alias_count; ++i)
     {
-        size_t len = strlen( unix_host->h_aliases[i] ) + 1;
+        SIZE_T len, next;
 
-        host->h_aliases[i] = p;
+        if (!get_cstring_size( unix_host->h_aliases[i], &len )) return WSAENOBUFS;
+        next = offset;
+        if (!add_size_checked( &next, len ) || next > needed_size) return WSAENOBUFS;
+        host->h_aliases[i] = base + offset;
         memcpy( host->h_aliases[i], unix_host->h_aliases[i], len );
-        p += len;
+        offset = next;
     }
 
-    host->h_name = p;
-    strcpy( host->h_name, unix_host->h_name );
+    host->h_name = base + offset;
+    {
+        SIZE_T len, next;
+
+        if (!get_cstring_size( unix_host->h_name, &len )) return WSAENOBUFS;
+        next = offset;
+        if (!add_size_checked( &next, len ) || next != needed_size) return WSAENOBUFS;
+        memcpy( host->h_name, unix_host->h_name, len );
+    }
 
     return 0;
 }
 
 
-static NTSTATUS unix_gethostbyaddr( void *args )
+typedef NTSTATUS (*hostent_result_func)( const struct hostent *host, void *context );
+
+struct native_hostent_result
 {
-    struct gethostbyaddr_params *params = args;
-    const void *addr = params->addr;
+    struct WS_hostent *host;
+    unsigned int *size;
+};
+
+static NTSTATUS native_hostent_result( const struct hostent *host, void *context )
+{
+    struct native_hostent_result *result = context;
+
+    return hostent_from_unix( host, result->host, result->size );
+}
+
+static NTSTATUS unix_gethostbyaddr_result( const void *address, int len, int family,
+                                           hostent_result_func result_func, void *context )
+{
+    const void *addr = address;
     const struct in_addr loopback = { htonl( INADDR_LOOPBACK ) };
-    int unix_family = family_to_unix( params->family );
+    int unix_family = family_to_unix( family );
     struct hostent *unix_host;
     int ret;
 
-    if (params->family == WS_AF_INET && params->len == 4 && !memcmp( addr, magic_loopback_addr, 4 ))
+    if (family == WS_AF_INET && len == 4 && !memcmp( addr, magic_loopback_addr, 4 ))
         addr = &loopback;
 
 #ifdef HAVE_LINUX_GETHOSTBYNAME_R_6
     {
         char *unix_buffer, *new_buffer;
         struct hostent stack_host;
-        int unix_size = 1024;
+        SIZE_T unix_size = 1024;
         int locerr;
 
         if (!(unix_buffer = malloc( unix_size )))
             return WSAENOBUFS;
 
-        while (gethostbyaddr_r( addr, params->len, unix_family, &stack_host, unix_buffer,
+        while (gethostbyaddr_r( addr, len, unix_family, &stack_host, unix_buffer,
                                 unix_size, &unix_host, &locerr ) == ERANGE)
         {
+            if (unix_size > ~(SIZE_T)0 / 2)
+            {
+                free( unix_buffer );
+                return WSAENOBUFS;
+            }
             unix_size *= 2;
             if (!(new_buffer = realloc( unix_buffer, unix_size )))
             {
@@ -916,7 +1024,7 @@ static NTSTATUS unix_gethostbyaddr( void *args )
         if (!unix_host)
             ret = (locerr < 0 ? errno_from_unix( errno ) : host_errno_from_unix( locerr ));
         else
-            ret = hostent_from_unix( unix_host, params->host, params->size );
+            ret = result_func( unix_host, context );
 
         free( unix_buffer );
         return ret;
@@ -924,31 +1032,39 @@ static NTSTATUS unix_gethostbyaddr( void *args )
 #else
     pthread_mutex_lock( &host_mutex );
 
-    if (!(unix_host = gethostbyaddr( addr, params->len, unix_family )))
+    if (!(unix_host = gethostbyaddr( addr, len, unix_family )))
     {
         ret = (h_errno < 0 ? errno_from_unix( errno ) : host_errno_from_unix( h_errno ));
         pthread_mutex_unlock( &host_mutex );
         return ret;
     }
 
-    ret = hostent_from_unix( unix_host, params->host, params->size );
+    ret = result_func( unix_host, context );
 
     pthread_mutex_unlock( &host_mutex );
     return ret;
 #endif
 }
 
-static int compare_addrs_hashed( const void *a1, const void *a2, int addr_len )
+static NTSTATUS unix_gethostbyaddr( void *args )
+{
+    struct gethostbyaddr_params *params = args;
+    struct native_hostent_result result = {params->host, params->size};
+
+    return unix_gethostbyaddr_result( params->addr, params->len, params->family,
+                                      native_hostent_result, &result );
+}
+
+static int compare_addrs_hashed( const void *a1, const void *a2, unsigned int addr_len )
 {
     char a1_hashed[16], a2_hashed[16];
 
-    assert( addr_len <= sizeof(a1_hashed) );
     hash_random( (BYTE *)a1_hashed, a1, addr_len );
     hash_random( (BYTE *)a2_hashed, a2, addr_len );
     return memcmp( a1_hashed, a2_hashed, addr_len );
 }
 
-static void sort_addrs_hashed( struct hostent *host )
+static NTSTATUS sort_addrs_hashed( struct hostent *host )
 {
     /* On Unix gethostbyname() may return IP addresses in random order on each call. On Windows the order of
      * IP addresses is not determined as well but it is the same on consequent calls (changes after network
@@ -960,6 +1076,8 @@ static void sort_addrs_hashed( struct hostent *host )
      * sort once per process. */
     unsigned int i, j;
     char *tmp;
+
+    if (!host->h_addr_list || host->h_length < 0 || host->h_length > 16) return WSAENOBUFS;
 
     pthread_once( &hash_init_once, init_hash );
 
@@ -975,23 +1093,29 @@ static void sort_addrs_hashed( struct hostent *host )
             }
         }
     }
+    return 0;
 }
 
 #ifdef HAVE_LINUX_GETHOSTBYNAME_R_6
-static NTSTATUS unix_gethostbyname( void *args )
+static NTSTATUS unix_gethostbyname_result( const char *name, hostent_result_func result_func,
+                                           void *context )
 {
-    struct gethostbyname_params *params = args;
     struct hostent stack_host, *unix_host;
     char *unix_buffer, *new_buffer;
-    int unix_size = 1024;
+    SIZE_T unix_size = 1024;
     int locerr;
     int ret;
 
     if (!(unix_buffer = malloc( unix_size )))
         return WSAENOBUFS;
 
-    while (gethostbyname_r( params->name, &stack_host, unix_buffer, unix_size, &unix_host, &locerr ) == ERANGE)
+    while (gethostbyname_r( name, &stack_host, unix_buffer, unix_size, &unix_host, &locerr ) == ERANGE)
     {
+        if (unix_size > ~(SIZE_T)0 / 2)
+        {
+            free( unix_buffer );
+            return WSAENOBUFS;
+        }
         unix_size *= 2;
         if (!(new_buffer = realloc( unix_buffer, unix_size )))
         {
@@ -1007,36 +1131,42 @@ static NTSTATUS unix_gethostbyname( void *args )
     }
     else
     {
-        sort_addrs_hashed( unix_host );
-        ret = hostent_from_unix( unix_host, params->host, params->size );
+        if (!(ret = sort_addrs_hashed( unix_host ))) ret = result_func( unix_host, context );
     }
 
     free( unix_buffer );
     return ret;
 }
 #else
-static NTSTATUS unix_gethostbyname( void *args )
+static NTSTATUS unix_gethostbyname_result( const char *name, hostent_result_func result_func,
+                                           void *context )
 {
-    struct gethostbyname_params *params = args;
     struct hostent *unix_host;
     int ret;
 
     pthread_mutex_lock( &host_mutex );
 
-    if (!(unix_host = gethostbyname( params->name )))
+    if (!(unix_host = gethostbyname( name )))
     {
         ret = (h_errno < 0 ? errno_from_unix( errno ) : host_errno_from_unix( h_errno ));
         pthread_mutex_unlock( &host_mutex );
         return ret;
     }
 
-    sort_addrs_hashed( unix_host );
-    ret = hostent_from_unix( unix_host, params->host, params->size );
+    if (!(ret = sort_addrs_hashed( unix_host ))) ret = result_func( unix_host, context );
 
     pthread_mutex_unlock( &host_mutex );
     return ret;
 }
 #endif
+
+static NTSTATUS unix_gethostbyname( void *args )
+{
+    struct gethostbyname_params *params = args;
+    struct native_hostent_result result = {params->host, params->size};
+
+    return unix_gethostbyname_result( params->name, native_hostent_result, &result );
+}
 
 
 static NTSTATUS unix_gethostname( void *args )
@@ -1078,6 +1208,57 @@ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == ws_unix_funcs_count );
 
 typedef ULONG PTR32;
 
+#define WOW64_RESOLVER_STRING_MAX 0x10000u
+#define WOW64_GUEST_PAGE_SIZE     0x1000u
+
+struct wow64_getaddrinfo_params
+{
+    PTR32 node;
+    PTR32 service;
+    PTR32 hints;
+    PTR32 info;
+    PTR32 size;
+};
+
+struct wow64_gethostbyaddr_params
+{
+    PTR32 addr;
+    int len;
+    int family;
+    PTR32 host;
+    PTR32 size;
+};
+
+struct wow64_gethostbyname_params
+{
+    PTR32 name;
+    PTR32 host;
+    PTR32 size;
+};
+
+struct wow64_gethostname_params
+{
+    PTR32 name;
+    unsigned int size;
+};
+
+struct wow64_getnameinfo_params
+{
+    PTR32 addr;
+    int addr_len;
+    PTR32 host;
+    DWORD host_len;
+    PTR32 serv;
+    DWORD serv_len;
+    unsigned int flags;
+};
+
+C_ASSERT( sizeof(struct wow64_getaddrinfo_params) == 20 );
+C_ASSERT( sizeof(struct wow64_gethostbyaddr_params) == 20 );
+C_ASSERT( sizeof(struct wow64_gethostbyname_params) == 12 );
+C_ASSERT( sizeof(struct wow64_gethostname_params) == 8 );
+C_ASSERT( sizeof(struct wow64_getnameinfo_params) == 28 );
+
 struct WS_addrinfo32
 {
     int   ai_flags;
@@ -1099,248 +1280,645 @@ struct WS_hostent32
     PTR32 h_addr_list;
 };
 
-static NTSTATUS put_addrinfo32( const struct WS_addrinfo *info, struct WS_addrinfo32 *info32,
-                                unsigned int *size )
+struct wow64_publish_range
 {
-    struct WS_addrinfo32 *dst = info32, *prev = NULL;
-    const struct WS_addrinfo *src;
-    unsigned int needed_size = 0;
+    PTR32 address;
+    const void *data;
+    SIZE_T size;
+};
 
-    for (src = info; src != NULL; src = src->ai_next)
-    {
-        needed_size += sizeof(struct WS_addrinfo32);
-        if (src->ai_canonname) needed_size += strlen( src->ai_canonname ) + 1;
-        needed_size += src->ai_addrlen;
-    }
+union wow64_ws_sockaddr
+{
+    struct WS_sockaddr addr;
+    struct WS_sockaddr_in in;
+    struct WS_sockaddr_in6 in6;
+#ifdef HAS_IPX
+    struct WS_sockaddr_ipx ipx;
+#endif
+#ifdef HAS_IRDA
+    SOCKADDR_IRDA irda;
+#endif
+};
 
-    if (*size < needed_size)
-    {
-        *size = needed_size;
-        return ERROR_INSUFFICIENT_BUFFER;
-    }
-
-    memset( info32, 0, needed_size );
-
-    for (src = info; src != NULL; src = src->ai_next)
-    {
-        char *next = (char *)(dst + 1);
-
-        dst->ai_flags = src->ai_flags;
-        dst->ai_family = src->ai_family;
-        dst->ai_socktype = src->ai_socktype;
-        dst->ai_protocol = src->ai_protocol;
-        if (src->ai_canonname)
-        {
-            dst->ai_canonname = PtrToUlong( next );
-            strcpy( next, src->ai_canonname );
-            next += strlen(next) + 1;
-        }
-        dst->ai_addrlen = src->ai_addrlen;
-        dst->ai_addr = PtrToUlong(next);
-        memcpy( next, src->ai_addr, dst->ai_addrlen );
-        next += dst->ai_addrlen;
-        if (prev) prev->ai_next = PtrToUlong(dst);
-        prev = dst;
-        dst = (struct WS_addrinfo32 *)next;
-    }
-    return STATUS_SUCCESS;
+static NTSTATUS wow64_guest_pointer( PTR32 address, void **ptr )
+{
+    return ntdll_wow64_guest32_to_host( address, ptr ) ? WSAEFAULT : 0;
 }
 
-static NTSTATUS put_hostent32( const struct WS_hostent *host, struct WS_hostent32 *host32,
-                               unsigned int *size )
+static BOOL wow64_guest_range_valid( PTR32 address, SIZE_T size )
 {
-    unsigned int needed_size = sizeof( struct WS_hostent32 ), alias_count = 0, addr_count = 0, i;
-    char *p;
-    ULONG *aliases, *addr_list;
+    return !size || size - 1 <= MAXDWORD - address;
+}
 
-    needed_size += strlen( host->h_name ) + 1;
+static NTSTATUS wow64_read_guest( void *dst, PTR32 address, SIZE_T size )
+{
+    void *src;
 
-    for (alias_count = 0; host->h_aliases[alias_count] != NULL; ++alias_count)
-        needed_size += sizeof(ULONG) + strlen( host->h_aliases[alias_count] ) + 1;
-    needed_size += sizeof(ULONG); /* null terminator */
+    if (!size) return 0;
+    if (!wow64_guest_range_valid( address, size ) || wow64_guest_pointer( address, &src ))
+        return WSAEFAULT;
+    return ntdll_wow64_copy_from_user( dst, src, size ) ? WSAEFAULT : 0;
+}
 
-    for (addr_count = 0; host->h_addr_list[addr_count] != NULL; ++addr_count)
-        needed_size += sizeof(ULONG) + host->h_length;
-    needed_size += sizeof(ULONG); /* null terminator */
+static NTSTATUS wow64_publish( const struct wow64_publish_range *publish, unsigned int count )
+{
+    struct ntdll_wow64_user_write_range ranges[2];
+    unsigned int i, range_count = 0;
 
-    if (*size < needed_size)
+    if (count > ARRAY_SIZE(ranges)) return WSAEFAULT;
+    for (i = 0; i < count; ++i)
     {
-        *size = needed_size;
+        void *dst;
+
+        if (!publish[i].size) continue;
+        if (!wow64_guest_range_valid( publish[i].address, publish[i].size ) ||
+            wow64_guest_pointer( publish[i].address, &dst ))
+            return WSAEFAULT;
+        ranges[range_count].dst = dst;
+        ranges[range_count].src = publish[i].data;
+        ranges[range_count].size = publish[i].size;
+        ++range_count;
+    }
+    if (!range_count) return 0;
+    return ntdll_wow64_atomic_writev( ranges, range_count ) ? WSAEFAULT : 0;
+}
+
+static NTSTATUS wow64_publish_one( PTR32 address, const void *data, SIZE_T size )
+{
+    const struct wow64_publish_range publish = {address, data, size};
+
+    return wow64_publish( &publish, 1 );
+}
+
+static BOOL wow64_guest_offset( PTR32 base, SIZE_T offset, PTR32 *address )
+{
+    if (offset > MAXDWORD - base) return FALSE;
+    *address = base + offset;
+    return TRUE;
+}
+
+static NTSTATUS wow64_capture_string_tail( PTR32 address, char first, char **result )
+{
+    SIZE_T capacity = 64, len = 1;
+    char *buffer, *new_buffer, *nul;
+    NTSTATUS status;
+
+    if (!(buffer = malloc( capacity ))) return WSAENOBUFS;
+    buffer[0] = first;
+    if (!first)
+    {
+        *result = buffer;
+        return 0;
+    }
+
+    while (len < WOW64_RESOLVER_STRING_MAX)
+    {
+        SIZE_T chunk, required;
+        PTR32 current;
+
+        if (len > MAXDWORD - address)
+        {
+            free( buffer );
+            return WSAEFAULT;
+        }
+        current = address + len;
+        chunk = min( (SIZE_T)WOW64_RESOLVER_STRING_MAX - len,
+                     (SIZE_T)WOW64_GUEST_PAGE_SIZE - (current & (WOW64_GUEST_PAGE_SIZE - 1)) );
+        required = len + chunk;
+        if (required > capacity)
+        {
+            SIZE_T new_capacity = min( max( capacity * 2, required ),
+                                       (SIZE_T)WOW64_RESOLVER_STRING_MAX );
+
+            if (!(new_buffer = realloc( buffer, new_capacity )))
+            {
+                free( buffer );
+                return WSAENOBUFS;
+            }
+            buffer = new_buffer;
+            capacity = new_capacity;
+        }
+        if ((status = wow64_read_guest( buffer + len, current, chunk )))
+        {
+            free( buffer );
+            return status;
+        }
+        if ((nul = memchr( buffer + len, 0, chunk )))
+        {
+            *result = buffer;
+            return 0;
+        }
+        len = required;
+    }
+
+    free( buffer );
+    return WSAEFAULT;
+}
+
+static NTSTATUS wow64_capture_string( PTR32 address, char **result )
+{
+    char first;
+    NTSTATUS status;
+
+    *result = NULL;
+    if (!address) return 0;
+    if ((status = wow64_read_guest( &first, address, 1 ))) return status;
+    return wow64_capture_string_tail( address, first, result );
+}
+
+static NTSTATUS put_addrinfo32( const struct WS_addrinfo *info, void *buffer, PTR32 guest_base,
+                                unsigned int capacity, unsigned int *needed_size )
+{
+    const struct WS_addrinfo *src;
+    SIZE_T needed = 0, offset, prev_offset = ~(SIZE_T)0;
+    BYTE *dst = buffer;
+
+    for (src = info; src != NULL; src = src->ai_next)
+    {
+        if (!add_size_checked( &needed, sizeof(struct WS_addrinfo32) ) ||
+            (src->ai_canonname && !add_cstring_size_checked( &needed, src->ai_canonname )) ||
+            !add_size_checked( &needed, src->ai_addrlen ) || needed > MAXDWORD)
+            return WSAENOBUFS;
+    }
+
+    *needed_size = (unsigned int)needed;
+    if (capacity < needed)
+    {
         return ERROR_INSUFFICIENT_BUFFER;
     }
 
-    memset( host32, 0, needed_size );
+    memset( buffer, 0, needed );
+    offset = 0;
+
+    for (src = info; src != NULL; src = src->ai_next)
+    {
+        struct WS_addrinfo32 entry = {0};
+        SIZE_T entry_offset = offset;
+        PTR32 address;
+
+        if (!add_size_checked( &offset, sizeof(entry) )) return WSAENOBUFS;
+        entry.ai_flags = src->ai_flags;
+        entry.ai_family = src->ai_family;
+        entry.ai_socktype = src->ai_socktype;
+        entry.ai_protocol = src->ai_protocol;
+        if (src->ai_canonname)
+        {
+            SIZE_T len, next;
+
+            if (!get_cstring_size( src->ai_canonname, &len )) return WSAENOBUFS;
+            if (!wow64_guest_offset( guest_base, offset, &entry.ai_canonname )) return WSAEFAULT;
+            next = offset;
+            if (!add_size_checked( &next, len ) || next > needed) return WSAENOBUFS;
+            memcpy( dst + offset, src->ai_canonname, len );
+            offset = next;
+        }
+        if (src->ai_addrlen > MAXDWORD) return WSAENOBUFS;
+        entry.ai_addrlen = (PTR32)src->ai_addrlen;
+        if (!wow64_guest_offset( guest_base, offset, &entry.ai_addr )) return WSAEFAULT;
+        {
+            SIZE_T next = offset;
+
+            if (!add_size_checked( &next, src->ai_addrlen ) || next > needed) return WSAENOBUFS;
+            memcpy( dst + offset, src->ai_addr, src->ai_addrlen );
+            offset = next;
+        }
+
+        if (prev_offset != ~(SIZE_T)0)
+        {
+            if (!wow64_guest_offset( guest_base, entry_offset, &address )) return WSAEFAULT;
+            memcpy( dst + prev_offset + offsetof(struct WS_addrinfo32, ai_next),
+                    &address, sizeof(address) );
+        }
+        memcpy( dst + entry_offset, &entry, sizeof(entry) );
+        prev_offset = entry_offset;
+    }
+    return 0;
+}
+
+#ifdef HAVE_GETADDRINFO
+static NTSTATUS wow64_addrinfo_from_unix( const struct addrinfo *unix_info,
+                                          const struct WS_addrinfo *hints, PTR32 guest_base,
+                                          unsigned int capacity, void **wire,
+                                          unsigned int *needed_size )
+{
+    struct getaddrinfo_params params = {0};
+    unsigned int native_size = 0;
+    void *native_info = NULL;
+    NTSTATUS status;
+
+    *wire = NULL;
+    *needed_size = 0;
+    params.hints = hints;
+    params.size = &native_size;
+    status = addrinfo_from_unix( &params, unix_info );
+    if (status != ERROR_INSUFFICIENT_BUFFER) return status;
+    if (!(native_info = malloc( max(native_size, 1u) ))) return WSAENOBUFS;
+
+    params.info = native_info;
+    status = addrinfo_from_unix( &params, unix_info );
+    if (status) goto done;
+
+    status = put_addrinfo32( native_info, NULL, guest_base, 0, needed_size );
+    if (status != ERROR_INSUFFICIENT_BUFFER) goto done;
+    if (capacity < *needed_size) goto done;
+    if (!guest_base || !wow64_guest_range_valid( guest_base, *needed_size ))
+    {
+        status = WSAEFAULT;
+        goto done;
+    }
+    if (!(*wire = malloc( max(*needed_size, 1u) )))
+    {
+        status = WSAENOBUFS;
+        goto done;
+    }
+    status = put_addrinfo32( native_info, *wire, guest_base, capacity, needed_size );
+
+done:
+    free( native_info );
+    return status;
+}
+#endif
+
+static NTSTATUS put_hostent32( const struct WS_hostent *host, void *buffer, PTR32 guest_base,
+                               unsigned int capacity, unsigned int *needed_size )
+{
+    SIZE_T alias_count = 0, addr_count = 0, i;
+    SIZE_T needed = sizeof(struct WS_hostent32), aliases_offset, addr_list_offset, offset;
+    struct WS_hostent32 host32 = {0};
+    BYTE *dst = buffer;
+    PTR32 address;
+
+    if (host->h_length < 0 || !add_cstring_size_checked( &needed, host->h_name ))
+        return WSAENOBUFS;
+
+    for (alias_count = 0; host->h_aliases[alias_count] != NULL; ++alias_count)
+        if (!add_size_checked( &needed, sizeof(ULONG) ) ||
+            !add_cstring_size_checked( &needed, host->h_aliases[alias_count] ))
+            return WSAENOBUFS;
+    if (!add_size_checked( &needed, sizeof(ULONG) )) return WSAENOBUFS; /* null terminator */
+
+    for (addr_count = 0; host->h_addr_list[addr_count] != NULL; ++addr_count)
+        if (!add_size_checked( &needed, sizeof(ULONG) ) ||
+            !add_size_checked( &needed, host->h_length )) return WSAENOBUFS;
+    if (!add_size_checked( &needed, sizeof(ULONG) ) || needed > MAXDWORD)
+        return WSAENOBUFS; /* null terminator */
+
+    *needed_size = (unsigned int)needed;
+    if (capacity < needed)
+    {
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
+
+    memset( buffer, 0, needed );
 
     /* arrange the memory in the same order as windows >= XP */
-
-    host32->h_addrtype = host->h_addrtype;
-    host32->h_length = host->h_length;
-
-    aliases = (ULONG *)(host32 + 1);
-    addr_list = aliases + alias_count + 1;
-    p = (char *)(addr_list + addr_count + 1);
-
-    host32->h_aliases = PtrToUlong( aliases );
-    host32->h_addr_list = PtrToUlong( addr_list );
+    host32.h_addrtype = host->h_addrtype;
+    host32.h_length = host->h_length;
+    aliases_offset = sizeof(host32);
+    addr_list_offset = aliases_offset;
+    if (!add_array_size_checked( &addr_list_offset, alias_count + 1, sizeof(ULONG) ))
+        return WSAENOBUFS;
+    offset = addr_list_offset;
+    if (!add_array_size_checked( &offset, addr_count + 1, sizeof(ULONG) ) || offset > needed)
+        return WSAENOBUFS;
+    if (!wow64_guest_offset( guest_base, aliases_offset, &host32.h_aliases ) ||
+        !wow64_guest_offset( guest_base, addr_list_offset, &host32.h_addr_list ))
+        return WSAEFAULT;
 
     for (i = 0; i < addr_count; ++i)
     {
-        addr_list[i] = PtrToUlong( p );
-        memcpy( p, host->h_addr_list[i], host->h_length );
-        p += host->h_length;
+        SIZE_T next = offset;
+
+        if (!wow64_guest_offset( guest_base, offset, &address )) return WSAEFAULT;
+        if (!add_size_checked( &next, host->h_length ) || next > needed) return WSAENOBUFS;
+        memcpy( dst + addr_list_offset + i * sizeof(address), &address, sizeof(address) );
+        memcpy( dst + offset, host->h_addr_list[i], host->h_length );
+        offset = next;
     }
 
     for (i = 0; i < alias_count; ++i)
     {
-        size_t len = strlen( host->h_aliases[i] ) + 1;
+        SIZE_T len, next;
 
-        aliases[i] = PtrToUlong( p );
-        memcpy( p, host->h_aliases[i], len );
-        p += len;
+        if (!get_cstring_size( host->h_aliases[i], &len )) return WSAENOBUFS;
+        if (!wow64_guest_offset( guest_base, offset, &address )) return WSAEFAULT;
+        next = offset;
+        if (!add_size_checked( &next, len ) || next > needed) return WSAENOBUFS;
+        memcpy( dst + aliases_offset + i * sizeof(address), &address, sizeof(address) );
+        memcpy( dst + offset, host->h_aliases[i], len );
+        offset = next;
     }
 
-    host32->h_name = PtrToUlong( p );
-    strcpy( p, host->h_name );
-    return STATUS_SUCCESS;
+    if (!wow64_guest_offset( guest_base, offset, &host32.h_name )) return WSAEFAULT;
+    {
+        SIZE_T len, next;
+
+        if (!get_cstring_size( host->h_name, &len )) return WSAENOBUFS;
+        next = offset;
+        if (!add_size_checked( &next, len ) || next != needed) return WSAENOBUFS;
+        memcpy( dst + offset, host->h_name, len );
+    }
+    memcpy( dst, &host32, sizeof(host32) );
+    return 0;
 }
 
+struct wow64_hostent_result
+{
+    PTR32 guest_base;
+    unsigned int capacity;
+    unsigned int needed_size;
+    void *wire;
+};
+
+static NTSTATUS wow64_hostent_result( const struct hostent *unix_host, void *context )
+{
+    struct wow64_hostent_result *result = context;
+    struct WS_hostent *native_host = NULL;
+    unsigned int native_size = 0;
+    NTSTATUS status;
+
+    status = hostent_from_unix( unix_host, NULL, &native_size );
+    if (status != ERROR_INSUFFICIENT_BUFFER) return status;
+    if (!(native_host = malloc( max(native_size, 1u) ))) return WSAENOBUFS;
+    status = hostent_from_unix( unix_host, native_host, &native_size );
+    if (status) goto done;
+
+    status = put_hostent32( native_host, NULL, result->guest_base, 0, &result->needed_size );
+    if (status != ERROR_INSUFFICIENT_BUFFER) goto done;
+    if (result->capacity < result->needed_size) goto done;
+    if (!result->guest_base || !wow64_guest_range_valid( result->guest_base, result->needed_size ))
+    {
+        status = WSAEFAULT;
+        goto done;
+    }
+    if (!(result->wire = malloc( max(result->needed_size, 1u) )))
+    {
+        status = WSAENOBUFS;
+        goto done;
+    }
+    status = put_hostent32( native_host, result->wire, result->guest_base,
+                            result->capacity, &result->needed_size );
+
+done:
+    free( native_host );
+    return status;
+}
+
+static NTSTATUS wow64_publish_size( PTR32 address, unsigned int size )
+{
+    return wow64_publish_one( address, &size, sizeof(size) );
+}
 
 static NTSTATUS wow64_unix_getaddrinfo( void *args )
 {
-    struct
-    {
-        PTR32 node;
-        PTR32 service;
-        PTR32 hints;
-        PTR32 info;
-        PTR32 size;
-    } const *params32 = args;
-
+    const struct wow64_getaddrinfo_params *params32 = args;
+    struct WS_addrinfo hints = {0};
+    unsigned int capacity, needed = 0;
+    char service_first, *node = NULL, *service_buffer = NULL;
+    const char *service = NULL;
+    void *wire = NULL;
     NTSTATUS status;
-    struct WS_addrinfo hints;
-    struct getaddrinfo_params params =
-    {
-        ULongToPtr( params32->node ),
-        ULongToPtr( params32->service ),
-        NULL,
-        NULL,
-        ULongToPtr(params32->size)
-    };
+#ifdef HAVE_GETADDRINFO
+    struct addrinfo unix_hints = {0}, *unix_info = NULL;
+    int ret;
+#else
+    struct getaddrinfo_params params = {0};
+#endif
 
     if (params32->hints)
     {
-        const struct WS_addrinfo32 *hints32 = ULongToPtr(params32->hints);
-        hints.ai_flags    = hints32->ai_flags;
-        hints.ai_family   = hints32->ai_family;
-        hints.ai_socktype = hints32->ai_socktype;
-        hints.ai_protocol = hints32->ai_protocol;
+        if ((status = wow64_read_guest( &hints, params32->hints,
+                                        offsetof(struct WS_addrinfo, ai_addrlen) )))
+            return status;
+#ifndef HAVE_GETADDRINFO
         params.hints = &hints;
+#endif
     }
+    if ((status = wow64_read_guest( &capacity, params32->size, sizeof(capacity) ))) return status;
 
-    if (!(params.info = malloc( *params.size ))) return WSAENOBUFS;
-    status = unix_getaddrinfo( &params );
-    if (!status) put_addrinfo32( params.info, ULongToPtr(params32->info), ULongToPtr(params32->size) );
-    free( params.info );
+    if (params32->service)
+    {
+        if ((status = wow64_read_guest( &service_first, params32->service, 1 ))) goto done;
+        if (!service_first) service = "0";
+    }
+#ifdef HAVE_GETADDRINFO
+    if ((status = prepare_addrinfo_hints( params32->hints ? &hints : NULL, &unix_hints ))) goto done;
+#endif
+    if (params32->service && service_first)
+    {
+        if ((status = wow64_capture_string_tail( params32->service, service_first,
+                                                  &service_buffer ))) goto done;
+        service = service_buffer;
+    }
+    if ((status = wow64_capture_string( params32->node, &node ))) goto done;
+#ifdef HAVE_GETADDRINFO
+    if ((ret = getaddrinfo( node, service, params32->hints ? &unix_hints : NULL, &unix_info )))
+        status = addrinfo_err_from_unix( ret );
+    else
+        status = wow64_addrinfo_from_unix( unix_info, params32->hints ? &hints : NULL,
+                                           params32->info, capacity, &wire, &needed );
+    if (unix_info) freeaddrinfo( unix_info );
+#else
+    status = unix_getaddrinfo_result( &params, node, service, NULL );
+#endif
+    if (status == ERROR_INSUFFICIENT_BUFFER)
+    {
+        status = wow64_publish_size( params32->size, needed );
+        if (!status) status = ERROR_INSUFFICIENT_BUFFER;
+        goto done;
+    }
+    if (status) goto done;
+    status = wow64_publish_one( params32->info, wire, needed );
+
+done:
+    free( service_buffer );
+    free( node );
+    free( wire );
     return status;
 }
 
 
 static NTSTATUS wow64_unix_gethostbyaddr( void *args )
 {
-    struct
-    {
-        PTR32 addr;
-        int   len;
-        int   family;
-        PTR32 host;
-        PTR32 size;
-    } const *params32 = args;
-
+    const struct wow64_gethostbyaddr_params *params32 = args;
+    struct wow64_hostent_result result = {params32->host};
+    unsigned int capacity;
+    void *addr = NULL;
     NTSTATUS status;
-    struct gethostbyaddr_params params =
-    {
-        ULongToPtr( params32->addr ),
-        params32->len,
-        params32->family,
-        NULL,
-        ULongToPtr(params32->size)
-    };
 
-    if (!(params.host = malloc( *params.size ))) return WSAENOBUFS;
-    status = unix_gethostbyaddr( &params );
-    if (!status)
-        status = put_hostent32( params.host, ULongToPtr(params32->host), ULongToPtr(params32->size) );
-    free( params.host );
+    if ((status = wow64_read_guest( &capacity, params32->size, sizeof(capacity) ))) return status;
+    result.capacity = capacity;
+    family_to_unix( params32->family );
+    if (params32->len < 0 || params32->len > 256)
+    {
+        status = WSAEFAULT;
+        goto done;
+    }
+    if (!(addr = malloc( max(params32->len, 1) )))
+    {
+        status = WSAENOBUFS;
+        goto done;
+    }
+    if ((status = wow64_read_guest( addr, params32->addr, params32->len ))) goto done;
+    status = unix_gethostbyaddr_result( addr, params32->len, params32->family,
+                                        wow64_hostent_result, &result );
+    if (status == ERROR_INSUFFICIENT_BUFFER)
+    {
+        status = wow64_publish_size( params32->size, result.needed_size );
+        if (!status) status = ERROR_INSUFFICIENT_BUFFER;
+        goto done;
+    }
+    if (status) goto done;
+    status = wow64_publish_one( params32->host, result.wire, result.needed_size );
+
+done:
+    free( addr );
+    free( result.wire );
     return status;
 }
 
 
 static NTSTATUS wow64_unix_gethostbyname( void *args )
 {
-    struct
-    {
-        PTR32 name;
-        PTR32 host;
-        PTR32 size;
-    } const *params32 = args;
-
+    const struct wow64_gethostbyname_params *params32 = args;
+    struct wow64_hostent_result result = {params32->host};
+    unsigned int capacity;
+    char *name = NULL;
     NTSTATUS status;
-    struct gethostbyname_params params =
-    {
-        ULongToPtr( params32->name ),
-        NULL,
-        ULongToPtr(params32->size)
-    };
 
-    if (!(params.host = malloc( *params.size ))) return WSAENOBUFS;
-    status = unix_gethostbyname( &params );
-    if (!status)
-        status = put_hostent32( params.host, ULongToPtr(params32->host), ULongToPtr(params32->size) );
-    free( params.host );
+    if ((status = wow64_read_guest( &capacity, params32->size, sizeof(capacity) ))) return status;
+    result.capacity = capacity;
+    if (!params32->name)
+    {
+        status = WSAEFAULT;
+        goto done;
+    }
+    if ((status = wow64_capture_string( params32->name, &name ))) goto done;
+    status = unix_gethostbyname_result( name, wow64_hostent_result, &result );
+    if (status == ERROR_INSUFFICIENT_BUFFER)
+    {
+        status = wow64_publish_size( params32->size, result.needed_size );
+        if (!status) status = ERROR_INSUFFICIENT_BUFFER;
+        goto done;
+    }
+    if (status) goto done;
+    status = wow64_publish_one( params32->host, result.wire, result.needed_size );
+
+done:
+    free( name );
+    free( result.wire );
     return status;
 }
 
 
 static NTSTATUS wow64_unix_gethostname( void *args )
 {
-    struct
+    const struct wow64_gethostname_params *params32 = args;
+    struct gethostname_params params;
+    unsigned int capacity;
+    SIZE_T len;
+    NTSTATUS status;
+
+    capacity = min( params32->size, WOW64_RESOLVER_STRING_MAX );
+    if (!(params.name = malloc( max( capacity, 1u ) ))) return WSAENOBUFS;
+    params.size = capacity;
+    status = unix_gethostname( &params );
+    if (!status)
     {
-        PTR32 name;
-        unsigned int size;
-    } const *params32 = args;
-
-    struct gethostname_params params = { ULongToPtr(params32->name), params32->size };
-
-    if (!unix_gethostname( &params )) return 0;
-    return errno_from_unix( errno );
+        len = strnlen( params.name, capacity );
+        if (len == capacity) status = WSAEFAULT;
+        else status = wow64_publish_one( params32->name, params.name, len + 1 );
+    }
+    free( params.name );
+    return status;
 }
 
 
+static NTSTATUS wow64_capture_sockaddr( PTR32 address, int length, union wow64_ws_sockaddr *addr )
+{
+    USHORT family;
+    SIZE_T size = 0;
+    NTSTATUS status;
+
+    memset( addr, 0, sizeof(*addr) );
+    if ((status = wow64_read_guest( &family, address, sizeof(family) ))) return status;
+    addr->addr.sa_family = family;
+
+    switch (family)
+    {
+    case WS_AF_INET:
+        if (length >= sizeof(addr->in)) size = sizeof(addr->in);
+        break;
+    case WS_AF_INET6:
+        if (length >= sizeof(addr->in6)) size = sizeof(addr->in6);
+        break;
+#ifdef HAS_IPX
+    case WS_AF_IPX:
+        if (length >= sizeof(addr->ipx)) size = sizeof(addr->ipx);
+        break;
+#endif
+#ifdef HAS_IRDA
+    case WS_AF_IRDA:
+        if (length >= sizeof(addr->irda)) size = sizeof(addr->irda);
+        break;
+#endif
+    }
+    if (size) return wow64_read_guest( addr, address, size );
+    return 0;
+}
+
 static NTSTATUS wow64_unix_getnameinfo( void *args )
 {
-    struct
-    {
-        PTR32 addr;
-        int addr_len;
-        PTR32 host;
-        DWORD host_len;
-        PTR32 serv;
-        DWORD serv_len;
-        unsigned int flags;
-    } const *params32 = args;
+    const struct wow64_getnameinfo_params *params32 = args;
+    union wow64_ws_sockaddr addr;
+    struct getnameinfo_params params = {0};
+    struct wow64_publish_range publish[2];
+    unsigned int count = 0;
+    DWORD host_capacity = min( params32->host_len, WOW64_RESOLVER_STRING_MAX );
+    DWORD serv_capacity = min( params32->serv_len, WOW64_RESOLVER_STRING_MAX );
+    NTSTATUS status;
+    SIZE_T len;
 
-    struct getnameinfo_params params =
+    if ((status = wow64_capture_sockaddr( params32->addr, params32->addr_len, &addr ))) return status;
+    params.addr = &addr.addr;
+    params.addr_len = params32->addr_len;
+    params.host_len = params32->host ? host_capacity : params32->host_len;
+    params.serv_len = params32->serv ? serv_capacity : params32->serv_len;
+    params.flags = params32->flags;
+    if (params32->host && !(params.host = malloc( max( host_capacity, 1u ) ))) return WSAENOBUFS;
+    if (params32->serv && !(params.serv = malloc( max( serv_capacity, 1u ) )))
     {
-        ULongToPtr( params32->addr ),
-        params32->addr_len,
-        ULongToPtr( params32->host ),
-        params32->host_len,
-        ULongToPtr( params32->serv ),
-        params32->serv_len,
-        params32->flags
-    };
+        free( params.host );
+        return WSAENOBUFS;
+    }
 
-    return unix_getnameinfo( &params );
+    status = unix_getnameinfo( &params );
+    if (!status && params.host && host_capacity)
+    {
+        len = strnlen( params.host, host_capacity );
+        if (len == host_capacity) status = WSAEFAULT;
+        else
+        {
+            publish[count].address = params32->host;
+            publish[count].data = params.host;
+            publish[count++].size = len + 1;
+        }
+    }
+    if (!status && params.serv && serv_capacity)
+    {
+        len = strnlen( params.serv, serv_capacity );
+        if (len == serv_capacity) status = WSAEFAULT;
+        else
+        {
+            publish[count].address = params32->serv;
+            publish[count].data = params.serv;
+            publish[count++].size = len + 1;
+        }
+    }
+    if (!status) status = wow64_publish( publish, count );
+    free( params.serv );
+    free( params.host );
+    return status;
 }
 
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
@@ -1352,6 +1930,28 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_unix_getnameinfo,
 };
 
+static const struct wine_unixlib_dispatch_entry_v2 wow64_dispatch_metadata[] =
+{
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wow64_getaddrinfo_params,
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wow64_gethostbyaddr_params,
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wow64_gethostbyname_params,
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wow64_gethostname_params,
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wow64_getnameinfo_params,
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
+                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+};
+
+WINE_UNIXLIB_DISPATCH_SOURCE_V2(__wine_unix_call_wow64_funcs, wow64_dispatch_metadata);
+
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == ws_unix_funcs_count );
+C_ASSERT( ARRAYSIZE(wow64_dispatch_metadata) == ws_unix_funcs_count );
 
 #endif  /* _WIN64 */

@@ -27,6 +27,7 @@
 #include "wine/unixlib.h"
 #include "wine/server.h"
 #include "wine/list.h"
+#include "wine/low_va.h"
 #include "wine/debug.h"
 
 struct msghdr;
@@ -86,6 +87,27 @@ static inline BOOL is_wow64(void)
     return !!wow_peb;
 }
 
+static inline void *wow64_guest_to_native_ptr( ULONG address )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (is_wow64() && address)
+        return (void *)(ULONG_PTR)(WINE_LOW_VA_SHADOW_BASE + address);
+#endif
+    return ULongToPtr( address );
+}
+
+static inline ULONG wow64_native_to_guest_addr( const void *address )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    ULONG_PTR value = (ULONG_PTR)address;
+
+    if (value >= WINE_LOW_VA_SHADOW_BASE &&
+        value - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE)
+        return value - WINE_LOW_VA_SHADOW_BASE;
+#endif
+    return PtrToUlong( address );
+}
+
 /* check for old-style Wow64 (using a 32-bit ntdll.so) */
 static inline BOOL is_old_wow64(void)
 {
@@ -112,6 +134,8 @@ struct thread_data
     BOOL         suspend;           /* suspend on startup */
     pthread_t    pthread_id;        /* pthread thread id */
     void        *jmp_buf;           /* setjmp buffer for exception handling */
+    void        *jmp_unixlib_context; /* Unixlib context at jmp installation */
+    NTSTATUS     jmp_status;        /* exception returned through jmp_buf */
     void        *start;             /* thread entry point */
     void        *param;             /* thread entry point parameter */
     struct list  entry;             /* entry in TEB list */
@@ -192,6 +216,7 @@ extern void *pKiUserEmulationDispatcher;
 extern void *pLdrInitializeThunk;
 extern void *pRtlUserThreadStart;
 extern void *p__wine_ctrl_routine;
+extern void *main_image_native_base;
 extern SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock;
 
 struct _FILE_FS_DEVICE_INFORMATION;
@@ -239,7 +264,8 @@ extern char *get_alternate_wineloader( WORD machine );
 extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info );
 extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine,
                               SECTION_IMAGE_INFORMATION *info, void **module, SIZE_T *size,
-                              ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset );
+                              ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset,
+                              BOOL translated_wow64, BOOL translated_amd64_low );
 extern NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret );
 extern BOOL is_system_dir_path( const UNICODE_STRING *path, WORD *machine );
 extern NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **module );
@@ -248,6 +274,9 @@ extern ULONG_PTR redirect_arm64ec_rva( void *module, ULONG_PTR rva, const IMAGE_
 extern void start_server( BOOL debug );
 
 extern unsigned int server_call_unlocked( void *req_ptr );
+extern unsigned int server_call_unlocked_with_reply_size( void *req_ptr, data_size_t *reply_size,
+                                                          BOOL *reply_received );
+extern unsigned int wine_server_call_unchecked( void *req_ptr );
 extern void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
 extern void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
 extern unsigned int server_select( const union select_op *select_op, data_size_t size, UINT flags,
@@ -310,10 +339,13 @@ extern ULONG_PTR get_system_affinity_mask(void);
 extern NTSTATUS cpu_set_ids_to_mask( const ULONG *ids, ULONG count, ULONG_PTR *mask );
 extern ULONG cpu_set_mask_to_ids( ULONG_PTR mask, ULONG *ids, ULONG count );
 extern UINT_PTR get_host_page_size(void);
+extern void *virtual_get_guest_address( const void *host );
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 );
 extern NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size,
                                             SECTION_IMAGE_INFORMATION *info, ULONG_PTR limit_low,
-                                            ULONG_PTR limit_high, WORD machine, BOOL prefer_native, off_t offset );
+                                            ULONG_PTR limit_high, WORD machine, BOOL prefer_native,
+                                            off_t offset, BOOL translated_wow64,
+                                            BOOL translated_amd64_low );
 extern NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size,
                                     SECTION_IMAGE_INFORMATION *info, ULONG_PTR limit_low,
                                     ULONG_PTR limit_high, USHORT machine );
@@ -331,16 +363,56 @@ extern void virtual_map_user_shared_data(void);
 extern void virtual_init_user_shared_data(void);
 extern NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, void *stack );
 extern unsigned int virtual_locked_server_call( void *req_ptr );
+extern unsigned int virtual_locked_wow64_server_call( void *req_ptr );
+extern unsigned int virtual_locked_wow64_server_call_with_reply( void *req_ptr,
+                                                                 void *reply, SIZE_T reply_size );
 extern ssize_t virtual_locked_read( int fd, void *addr, size_t size );
 extern ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset );
 extern ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags );
+extern ssize_t virtual_locked_sendmsg( int fd, const struct msghdr *hdr, int flags );
+extern ssize_t virtual_locked_send( int fd, const void *buffer, size_t size, int flags );
+extern int virtual_locked_ioctl( int fd, unsigned long request, void *arg,
+                                 const void *read_buffer, SIZE_T read_size,
+                                 void *write_buffer, SIZE_T write_size );
 extern BOOL virtual_is_valid_code_address( const void *addr, SIZE_T size );
+extern BOOL virtual_arm64ec_fetch_low_guest_instr( const void *pc, ULONG *instr );
 extern void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t size, EXCEPTION_RECORD *rec );
 extern BOOL virtual_check_buffer_for_read( const void *ptr, SIZE_T size );
 extern BOOL virtual_check_buffer_for_write( void *ptr, SIZE_T size );
+extern BOOL virtual_check_buffer_for_write_no_touch( void *ptr, SIZE_T size );
+
+struct arm64ec_low_guest_value
+{
+    ULONG64 word[4];
+} __attribute__((aligned(16)));
+
+extern NTSTATUS virtual_arm64ec_low_guest_access( struct thread_data *data, ULONG_PTR guest,
+                                                  struct arm64ec_low_guest_value *value,
+                                                  SIZE_T size, SIZE_T pair_element_size,
+                                                  BOOL write, ULONG_PTR *extra_status );
 extern void virtual_register_non_native_code_region( const void *base, SIZE_T size );
 extern SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T size );
 extern NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZE_T size );
+extern NTSTATUS virtual_copy_from_user( void *dst, const void *src, SIZE_T size );
+extern NTSTATUS virtual_copy_to_user( void *dst, const void *src, SIZE_T size );
+extern NTSTATUS virtual_wow64_host_to_guest32( const void *host, SIZE_T size,
+                                               ULONG *guest );
+extern NTSTATUS virtual_faulting_copy_to_user( void *dst, const void *src, SIZE_T size );
+extern NTSTATUS wow64_probe_user_read( const void *ptr, SIZE_T size );
+extern NTSTATUS wow64_probe_user_write( void *ptr, SIZE_T size );
+extern NTSTATUS virtual_copy_string_from_user( char **dst, const char *src, SIZE_T max_size );
+extern NTSTATUS virtual_publish_wow64_ulong_pair( ULONG *dst1, ULONG value1,
+                                                  ULONG *dst2, ULONG value2 );
+extern NTSTATUS virtual_publish_wow64_iosb( IO_STATUS_BLOCK32 *dst, NTSTATUS status,
+                                            ULONG information );
+extern NTSTATUS virtual_run_wow64_non_mz_create_process(
+    const struct wine_wow64_create_user_process_params *params,
+    NTSTATUS (*operation)(void *context), void *context );
+extern NTSTATUS unixcall_wow64_user_copy( void *args );
+extern NTSTATUS unixcall_wow64_create_user_process( void *args );
+extern NTSTATUS unixcall_wow64_complete_user_process( void *args );
+extern NTSTATUS unixcall_wow64_create_user_thread( void *args );
+extern NTSTATUS unixcall_wow64_complete_user_thread( void *args );
 extern void virtual_set_force_exec( BOOL enable );
 extern void virtual_enable_write_exceptions( BOOL enable );
 extern void virtual_set_large_address_space(void);
@@ -357,13 +429,38 @@ extern BOOL get_thread_times( int unix_pid, int unix_tid, LARGE_INTEGER *kernel_
 extern NTSTATUS signal_alloc_thread( TEB *teb );
 extern void signal_free_thread( TEB *teb );
 extern void signal_disable_syscall_dispatch(void);
-extern void signal_init_process( TEB *teb );
+extern BOOL signal_init_process( TEB *teb );
 extern void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg, TEB *teb );
 extern SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4];
 extern void __wine_syscall_dispatcher(void);
 extern void __wine_syscall_dispatcher_return(void);
 extern void __wine_unix_call_dispatcher(void);
+extern NTSTATUS register_wow64_unixlib_dispatch(
+    const struct wine_unixlib_dispatch_source_v1 *source, const unixlib_entry_t *funcs,
+    unixlib_handle_t *handle );
+extern NTSTATUS register_wow64_unixlib_dispatch_v2(
+    const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
+    unixlib_handle_t *handle );
+extern NTSTATUS unregister_wow64_unixlib_dispatch( unixlib_handle_t handle );
+extern NTSTATUS create_unixlib_module_token( void *module, unixlib_handle_t dispatch,
+                                             BOOL dispatch_registered,
+                                             unixlib_module_t *token );
+extern NTSTATUS unload_unixlib_module_token( unixlib_module_t token );
+extern NTSTATUS __wine_unix_call_dispatcher_tagged( unixlib_handle_t handle,
+                                                    unsigned int code, void *args );
+extern void *get_wow64_unixlib_call_context_mark(void);
+extern void unwind_wow64_unixlib_call_context( void *mark );
+extern void finalize_wow64_unixlib_call_contexts(void);
+extern void reset_wow64_unixlib_call_context(void);
 extern NTSTATUS signal_set_full_context( CONTEXT *context );
+extern NTSTATUS create_thread_ex_internal( HANDLE *handle, HANDLE *transaction,
+                                           ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
+                                           HANDLE process, PRTL_THREAD_START_ROUTINE start,
+                                           void *param, ULONG flags, ULONG_PTR zero_bits,
+                                           SIZE_T stack_commit, SIZE_T stack_reserve,
+                                           PS_ATTRIBUTE_LIST *attr_list );
+extern NTSTATUS complete_wow64_thread_transaction( HANDLE transaction, BOOL commit,
+                                                    NTSTATUS cancel_status );
 extern NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size );
 extern NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size );
 extern void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid );
@@ -498,7 +595,10 @@ static inline BOOL is_inside_syscall( struct thread_data *data, ULONG_PTR sp )
 static inline BOOL is_ec_code( ULONG_PTR ptr )
 {
     const UINT64 *map = (const UINT64 *)peb->EcCodeBitMap;
-    ULONG_PTR page = ptr / page_size;
+    ULONG_PTR page;
+
+    if (!map || !wine_arm64ec_code_pointer_in_range( ptr )) return FALSE;
+    page = ptr / page_size;
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
@@ -566,8 +666,11 @@ static inline void set_async_iosb( client_ptr_t iosb, NTSTATUS status, ULONG_PTR
     if (in_wow64_call())
     {
         IO_STATUS_BLOCK32 *io = wine_server_get_ptr( iosb );
-        io->Information = info;
-        WriteRelease( &io->Status, status );
+
+        /* The I/O has already completed and its server/IOCP notification must
+         * still be delivered.  A failed logical copy leaves both IOSB fields
+         * untouched; there is no synchronous caller to receive that failure. */
+        (void)virtual_publish_wow64_iosb( io, status, (ULONG)info );
     }
     else
     {
@@ -653,6 +756,25 @@ static inline NTSTATUS map_section( HANDLE mapping, void **ptr, SIZE_T *size, UL
 {
     *ptr = NULL;
     *size = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (user_space_wow_limit)
+    {
+        MEM_ADDRESS_REQUIREMENTS requirements =
+        {
+            (void *)(WINE_LOW_VA_SHADOW_BASE + 0x10000),
+            (void *)(WINE_LOW_VA_SHADOW_BASE +
+                     (user_space_wow_limit & ~(ULONG_PTR)0xffff) - 1),
+            0
+        };
+        MEM_EXTENDED_PARAMETER parameters[2] = {0};
+
+        parameters[0].Type = MemExtendedParameterAddressRequirements;
+        parameters[0].Pointer = &requirements;
+        parameters[1].Type = WINE_MEM_EXTENDED_PARAMETER_WOW64_TRANSLATED;
+        return NtMapViewOfSectionEx( mapping, NtCurrentProcess(), ptr, NULL, size, 0,
+                                     protect, parameters, ARRAY_SIZE(parameters) );
+    }
+#endif
     return NtMapViewOfSection( mapping, NtCurrentProcess(), ptr, user_space_wow_limit,
                                0, NULL, size, ViewShare, 0, protect );
 }

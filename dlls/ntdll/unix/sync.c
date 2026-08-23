@@ -205,55 +205,131 @@ static inline int futex_wake_one( const LONG *addr )
 unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
                                       data_size_t *ret_len )
 {
-    unsigned int len = sizeof(**ret);
-    SID *owner = NULL, *group = NULL;
-    ACL *dacl = NULL, *sacl = NULL;
-    SECURITY_DESCRIPTOR *sd;
+    OBJECT_ATTRIBUTES attr_local;
+    UNICODE_STRING name_local, *name = NULL;
+    SECURITY_DESCRIPTOR_RELATIVE sd_header;
+    SECURITY_DESCRIPTOR sd_local, *sd = NULL;
+    const void *owner = NULL, *group = NULL, *dacl = NULL, *sacl = NULL;
+    data_size_t owner_len = 0, group_len = 0, dacl_len = 0, sacl_len = 0;
+    data_size_t len = sizeof(**ret);
+    NTSTATUS status;
+
+#define ADD_OBJECT_ATTRIBUTE_SIZE(value) \
+    do { \
+        data_size_t value_size = (value); \
+        if (value_size > ~(data_size_t)0 - len) return STATUS_NO_MEMORY; \
+        len += value_size; \
+    } while (0)
 
     *ret = NULL;
     *ret_len = 0;
 
     if (!attr) return STATUS_SUCCESS;
 
+    if ((status = virtual_copy_from_user( &attr_local, attr, sizeof(attr_local) ))) return status;
+    attr = &attr_local;
+
     if (attr->Length != sizeof(*attr)) return STATUS_INVALID_PARAMETER;
 
-    if ((sd = attr->SecurityDescriptor))
+    if (attr->SecurityDescriptor)
     {
-        len += sizeof(struct security_descriptor);
-	if (sd->Revision != SECURITY_DESCRIPTOR_REVISION) return STATUS_UNKNOWN_REVISION;
-        if (sd->Control & SE_SELF_RELATIVE)
+        const void *sd_source = attr->SecurityDescriptor;
+
+        if ((status = virtual_copy_from_user( &sd_header, sd_source, sizeof(sd_header) )))
+            return status;
+        if (sd_header.Revision != SECURITY_DESCRIPTOR_REVISION) return STATUS_UNKNOWN_REVISION;
+        if (sd_header.Control & SE_SELF_RELATIVE)
         {
-            SECURITY_DESCRIPTOR_RELATIVE *rel = (SECURITY_DESCRIPTOR_RELATIVE *)sd;
-            if (rel->Owner) owner = (PSID)((BYTE *)rel + rel->Owner);
-            if (rel->Group) group = (PSID)((BYTE *)rel + rel->Group);
-            if ((sd->Control & SE_SACL_PRESENT) && rel->Sacl) sacl = (PSID)((BYTE *)rel + rel->Sacl);
-            if ((sd->Control & SE_DACL_PRESENT) && rel->Dacl) dacl = (PSID)((BYTE *)rel + rel->Dacl);
+            ULONG_PTR base = (ULONG_PTR)sd_source;
+
+            memset( &sd_local, 0, sizeof(sd_local) );
+            sd_local.Revision = sd_header.Revision;
+            sd_local.Sbz1 = sd_header.Sbz1;
+            sd_local.Control = sd_header.Control;
+            if (sd_header.Owner)
+            {
+                if (sd_header.Owner > ~(ULONG_PTR)0 - base) return STATUS_ACCESS_VIOLATION;
+                owner = (const void *)(base + sd_header.Owner);
+            }
+            if (sd_header.Group)
+            {
+                if (sd_header.Group > ~(ULONG_PTR)0 - base) return STATUS_ACCESS_VIOLATION;
+                group = (const void *)(base + sd_header.Group);
+            }
+            if ((sd_header.Control & SE_SACL_PRESENT) && sd_header.Sacl)
+            {
+                if (sd_header.Sacl > ~(ULONG_PTR)0 - base) return STATUS_ACCESS_VIOLATION;
+                sacl = (const void *)(base + sd_header.Sacl);
+            }
+            if ((sd_header.Control & SE_DACL_PRESENT) && sd_header.Dacl)
+            {
+                if (sd_header.Dacl > ~(ULONG_PTR)0 - base) return STATUS_ACCESS_VIOLATION;
+                dacl = (const void *)(base + sd_header.Dacl);
+            }
         }
         else
         {
-            owner = sd->Owner;
-            group = sd->Group;
-            if (sd->Control & SE_SACL_PRESENT) sacl = sd->Sacl;
-            if (sd->Control & SE_DACL_PRESENT) dacl = sd->Dacl;
+            if ((status = virtual_copy_from_user( &sd_local, sd_source, sizeof(sd_local) )))
+                return status;
+            owner = sd_local.Owner;
+            group = sd_local.Group;
+            if (sd_local.Control & SE_SACL_PRESENT) sacl = sd_local.Sacl;
+            if (sd_local.Control & SE_DACL_PRESENT) dacl = sd_local.Dacl;
+        }
+        sd = &sd_local;
+
+        if (owner)
+        {
+            SID sid;
+
+            if ((status = virtual_copy_from_user( &sid, owner, offsetof(SID, SubAuthority) )))
+                return status;
+            owner_len = offsetof( SID, SubAuthority[sid.SubAuthorityCount] );
+            ADD_OBJECT_ATTRIBUTE_SIZE( owner_len );
+        }
+        if (group)
+        {
+            SID sid;
+
+            if ((status = virtual_copy_from_user( &sid, group, offsetof(SID, SubAuthority) )))
+                return status;
+            group_len = offsetof( SID, SubAuthority[sid.SubAuthorityCount] );
+            ADD_OBJECT_ATTRIBUTE_SIZE( group_len );
+        }
+        if (sacl)
+        {
+            ACL acl;
+
+            if ((status = virtual_copy_from_user( &acl, sacl, sizeof(acl) ))) return status;
+            sacl_len = acl.AclSize;
+            ADD_OBJECT_ATTRIBUTE_SIZE( sacl_len );
+        }
+        if (dacl)
+        {
+            ACL acl;
+
+            if ((status = virtual_copy_from_user( &acl, dacl, sizeof(acl) ))) return status;
+            dacl_len = acl.AclSize;
+            ADD_OBJECT_ATTRIBUTE_SIZE( dacl_len );
         }
 
-        if (owner) len += offsetof( SID, SubAuthority[owner->SubAuthorityCount] );
-        if (group) len += offsetof( SID, SubAuthority[group->SubAuthorityCount] );
-        if (sacl) len += sacl->AclSize;
-        if (dacl) len += dacl->AclSize;
-
         /* fix alignment for the Unicode name that follows the structure */
+        if (len > ~(data_size_t)0 - (sizeof(WCHAR) - 1)) return STATUS_NO_MEMORY;
         len = (len + sizeof(WCHAR) - 1) & ~(sizeof(WCHAR) - 1);
     }
 
     if (attr->ObjectName)
     {
-        if ((ULONG_PTR)attr->ObjectName->Buffer & (sizeof(WCHAR) - 1)) return STATUS_DATATYPE_MISALIGNMENT;
-        if (attr->ObjectName->Length & (sizeof(WCHAR) - 1)) return STATUS_OBJECT_NAME_INVALID;
-        len += attr->ObjectName->Length;
+        if ((status = virtual_copy_from_user( &name_local, attr->ObjectName,
+                                               sizeof(name_local) ))) return status;
+        name = &name_local;
+        if ((ULONG_PTR)name->Buffer & (sizeof(WCHAR) - 1)) return STATUS_DATATYPE_MISALIGNMENT;
+        if (name->Length & (sizeof(WCHAR) - 1)) return STATUS_OBJECT_NAME_INVALID;
+        ADD_OBJECT_ATTRIBUTE_SIZE( name->Length );
     }
     else if (attr->RootDirectory) return STATUS_OBJECT_NAME_INVALID;
 
+    if (len > ~(data_size_t)0 - 3) return STATUS_NO_MEMORY;
     len = (len + 3) & ~3;  /* DWORD-align the entire structure */
 
     if (!(*ret = calloc( len, 1 ))) return STATUS_NO_MEMORY;
@@ -261,37 +337,44 @@ unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct obje
     (*ret)->rootdir = wine_server_obj_handle( attr->RootDirectory );
     (*ret)->attributes = attr->Attributes;
 
-    if (attr->SecurityDescriptor)
+    if (sd)
     {
         struct security_descriptor *descr = (struct security_descriptor *)(*ret + 1);
         unsigned char *ptr = (unsigned char *)(descr + 1);
 
         descr->control = sd->Control & ~SE_SELF_RELATIVE;
-        if (owner) descr->owner_len = offsetof( SID, SubAuthority[owner->SubAuthorityCount] );
-        if (group) descr->group_len = offsetof( SID, SubAuthority[group->SubAuthorityCount] );
-        if (sacl) descr->sacl_len = sacl->AclSize;
-        if (dacl) descr->dacl_len = dacl->AclSize;
+        descr->owner_len = owner_len;
+        descr->group_len = group_len;
+        descr->sacl_len = sacl_len;
+        descr->dacl_len = dacl_len;
 
-        memcpy( ptr, owner, descr->owner_len );
+        if ((status = virtual_copy_from_user( ptr, owner, descr->owner_len ))) goto failed;
         ptr += descr->owner_len;
-        memcpy( ptr, group, descr->group_len );
+        if ((status = virtual_copy_from_user( ptr, group, descr->group_len ))) goto failed;
         ptr += descr->group_len;
-        memcpy( ptr, sacl, descr->sacl_len );
+        if ((status = virtual_copy_from_user( ptr, sacl, descr->sacl_len ))) goto failed;
         ptr += descr->sacl_len;
-        memcpy( ptr, dacl, descr->dacl_len );
+        if ((status = virtual_copy_from_user( ptr, dacl, descr->dacl_len ))) goto failed;
         (*ret)->sd_len = (sizeof(*descr) + descr->owner_len + descr->group_len + descr->sacl_len +
                           descr->dacl_len + sizeof(WCHAR) - 1) & ~(sizeof(WCHAR) - 1);
     }
 
-    if (attr->ObjectName)
+    if (name)
     {
         unsigned char *ptr = (unsigned char *)(*ret + 1) + (*ret)->sd_len;
-        (*ret)->name_len = attr->ObjectName->Length;
-        memcpy( ptr, attr->ObjectName->Buffer, (*ret)->name_len );
+        (*ret)->name_len = name->Length;
+        if ((status = virtual_copy_from_user( ptr, name->Buffer, (*ret)->name_len ))) goto failed;
     }
 
     *ret_len = len;
+#undef ADD_OBJECT_ATTRIBUTE_SIZE
     return STATUS_SUCCESS;
+
+failed:
+    free( *ret );
+    *ret = NULL;
+#undef ADD_OBJECT_ATTRIBUTE_SIZE
+    return status;
 }
 
 

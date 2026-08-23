@@ -1172,6 +1172,9 @@ static void test_debug_loop_wow64(void)
         switch (ev.dwDebugEventCode)
         {
         case CREATE_PROCESS_DEBUG_EVENT:
+            ok( !((ULONG64)(ULONG_PTR)ev.u.CreateProcessInfo.lpBaseOfImage >> 32),
+                "WoW64 image base is not a 32-bit client address: %p\n",
+                ev.u.CreateProcessInfo.lpBaseOfImage );
             break;
         case LOAD_DLL_DEBUG_EVENT:
             if (!pGetMappedFileNameW( pi.hProcess, ev.u.LoadDll.lpBaseOfDll, buffer, ARRAY_SIZE(buffer) )) buffer[0] = L'\0';

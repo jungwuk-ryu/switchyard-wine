@@ -44,6 +44,7 @@
 #include "process.h"
 #include "request.h"
 #include "security.h"
+#include "wine/low_va.h"
 
 /* list of memory ranges, used to store committed info */
 struct ranges
@@ -134,7 +135,8 @@ struct memory_view
     struct shared_map *shared;       /* temp file for shared PE mapping */
     struct pe_image_info image;      /* image info (for PE image mapping) */
     unsigned int    flags;           /* SEC_* flags */
-    client_ptr_t    base;            /* view base address (in process addr space) */
+    client_ptr_t    base;            /* host view base address (in process addr space) */
+    client_ptr_t    client_base;     /* canonical Windows view base address */
     mem_size_t      size;            /* view size */
     file_pos_t      start;           /* start offset in mapping */
     data_size_t     namelen;
@@ -413,7 +415,7 @@ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base
     struct memory_view *view;
 
     LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
-        if (view->base == base) return view;
+        if (view->base == base || view->client_base == base) return view;
 
     set_error( STATUS_NOT_MAPPED_VIEW );
     return NULL;
@@ -425,7 +427,9 @@ static struct memory_view *find_mapped_addr( struct process *process, client_ptr
     struct memory_view *view;
 
     LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
-        if (addr >= view->base && addr < view->base + view->size) return view;
+        if ((addr >= view->base && addr < view->base + view->size) ||
+            (addr >= view->client_base && addr < view->client_base + view->size))
+            return view;
 
     set_error( STATUS_NOT_MAPPED_VIEW );
     return NULL;
@@ -445,6 +449,21 @@ static int is_valid_view_addr( struct process *process, client_ptr_t addr, mem_s
     {
         if (view->base + view->size <= addr) continue;
         if (view->base >= addr + size) continue;
+        return 0;
+    }
+    return 1;
+}
+
+/* check the canonical Windows address independently from the host mapping */
+static int is_valid_client_view_addr( struct process *process, client_ptr_t addr, mem_size_t size )
+{
+    struct memory_view *view;
+
+    if (!size || (addr & (process->page_size - 1)) || addr + size < addr) return 0;
+    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+    {
+        if (view->client_base + view->size <= addr) continue;
+        if (view->client_base >= addr + size) continue;
         return 0;
     }
     return 1;
@@ -583,7 +602,11 @@ static void add_committed_range( struct memory_view *view, file_pos_t start, fil
     {
         unsigned int new_size = committed->max * 2;
         struct range *new_ptr = realloc( committed->ranges, new_size * sizeof(*new_ptr) );
-        if (!new_ptr) return;
+        if (!new_ptr)
+        {
+            set_error( STATUS_NO_MEMORY );
+            return;
+        }
         committed->max = new_size;
         ranges = committed->ranges = new_ptr;
     }
@@ -1270,7 +1293,7 @@ struct file *get_view_file( const struct memory_view *view, unsigned int access,
 const struct pe_image_info *get_view_image_info( const struct memory_view *view, client_ptr_t *base )
 {
     if (!(view->flags & SEC_IMAGE)) return NULL;
-    *base = view->base;
+    *base = view->client_base;
     return &view->image;
 }
 
@@ -1706,7 +1729,9 @@ DECL_HANDLER(map_view)
     if ((mapping->flags & SEC_IMAGE) ||
         req->start >= mapping->size ||
         req->start + req->size < req->start ||
-        req->start + req->size > round_size( mapping->size, page_mask ))
+        req->start + req->size > round_size( mapping->size, page_mask ) ||
+        (req->commit_size & page_mask) || req->commit_size > req->size ||
+        (req->commit_size && (req->start & page_mask)))
     {
         set_error( STATUS_INVALID_PARAMETER );
         goto done;
@@ -1715,6 +1740,7 @@ DECL_HANDLER(map_view)
     if ((view = mem_alloc( sizeof(*view) )))
     {
         view->base      = req->base;
+        view->client_base = req->base;
         view->size      = req->size;
         view->start     = req->start;
         view->flags     = mapping->flags;
@@ -1722,6 +1748,17 @@ DECL_HANDLER(map_view)
         view->fd        = !is_fd_removable( mapping->fd ) ? (struct fd *)grab_object( mapping->fd ) : NULL;
         view->committed = mapping->committed ? (struct ranges *)grab_object( mapping->committed ) : NULL;
         view->shared    = NULL;
+        if (req->commit_size)
+        {
+            add_committed_range( view, 0, req->commit_size );
+            if (get_error())
+            {
+                if (view->fd) release_object( view->fd );
+                if (view->committed) release_object( view->committed );
+                free( view );
+                goto done;
+            }
+        }
         add_process_view( current, view );
     }
 
@@ -1735,7 +1772,8 @@ DECL_HANDLER(map_image_view)
     struct mapping *mapping;
     struct memory_view *view;
 
-    if (!is_valid_view_addr( current->process, req->base, req->size ))
+    if (!is_valid_view_addr( current->process, req->base, req->size ) ||
+        !is_valid_client_view_addr( current->process, req->guest_base, req->size ))
     {
         set_error( STATUS_INVALID_PARAMETER );
         return;
@@ -1749,9 +1787,66 @@ DECL_HANDLER(map_image_view)
         goto done;
     }
 
+    if (req->flags & ~(IMAGE_VIEW_TRANSLATED_WOW64 | IMAGE_VIEW_TRANSLATED_AMD64_LOW))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (!req->flags)
+    {
+        if (req->guest_base != req->base)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            goto done;
+        }
+    }
+    else if (req->base != WINE_LOW_VA_SHADOW_BASE + req->guest_base ||
+             req->guest_base >= WINE_LOW_VA_SHADOW_SIZE ||
+             req->size > WINE_LOW_VA_SHADOW_SIZE - req->guest_base)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+    else if (req->flags == IMAGE_VIEW_TRANSLATED_WOW64)
+    {
+        if (mapping->image.machine != IMAGE_FILE_MACHINE_I386)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            goto done;
+        }
+    }
+    else if (req->flags == IMAGE_VIEW_TRANSLATED_AMD64_LOW)
+    {
+        if (current->process->vm_flags_valid ||
+            mapping->image.machine != IMAGE_FILE_MACHINE_AMD64 || req->offset ||
+            (mapping->image.image_charact & IMAGE_FILE_DLL) ||
+            !(mapping->image.image_charact & IMAGE_FILE_RELOCS_STRIPPED) ||
+            req->guest_base != mapping->image.base ||
+            req->guest_base >= 0x100000000ULL ||
+            req->size > 0x100000000ULL - req->guest_base)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            goto done;
+        }
+    }
+    else
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+#else
+    if (req->flags || req->guest_base != req->base)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
+#endif
+
     if ((view = mem_alloc( sizeof(*view) )))
     {
         view->base      = req->base;
+        view->client_base = req->guest_base;
         view->size      = req->size;
         view->flags     = mapping->flags;
         view->start     = 0;
@@ -1762,12 +1857,16 @@ DECL_HANDLER(map_image_view)
         view->image     = mapping->image;
         if (add_process_view( current, view ))
         {
-            current->entry_point = view->base + req->entry;
+            current->entry_point = view->client_base + req->entry;
             current->process->machine = (view->image.image_flags & IMAGE_FLAGS_ComPlusNativeReady) ?
                                          native_machine : req->machine;
+            current->process->vm_flags = req->flags == IMAGE_VIEW_TRANSLATED_WOW64 ?
+                                         WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED : 0;
+            current->process->vm_flags_valid = 1;
         }
 
-        if (view->base != (mapping->image.map_addr ? mapping->image.map_addr : mapping->image.base) + req->offset)
+        if (view->client_base !=
+            (mapping->image.map_addr ? mapping->image.map_addr : mapping->image.base) + req->offset)
             set_error( STATUS_IMAGE_NOT_AT_BASE );
         if (req->machine != current->process->machine)
         {
@@ -1800,6 +1899,7 @@ DECL_HANDLER(map_builtin_view)
     {
         memset( view, 0, sizeof(*view) );
         view->base    = image->base;
+        view->client_base = image->base;
         view->size    = image->map_size;
         view->flags   = SEC_IMAGE;
         view->image   = *image;
@@ -1807,8 +1907,10 @@ DECL_HANDLER(map_builtin_view)
         memcpy( view->name, image + 1, namelen );
         if (add_process_view( current, view ))
         {
-            current->entry_point = view->base + image->entry_point;
+            current->entry_point = view->client_base + image->entry_point;
             current->process->machine = image->machine;
+            current->process->vm_flags = 0;
+            current->process->vm_flags_valid = 1;
         }
     }
 }
@@ -1833,7 +1935,7 @@ DECL_HANDLER(get_image_view_info)
 
     if ((view = find_mapped_addr( process, req->addr )) && (view->flags & SEC_IMAGE))
     {
-        reply->base = view->base;
+        reply->base = view->client_base;
         reply->size = view->size;
     }
 

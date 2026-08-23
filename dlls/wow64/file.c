@@ -34,6 +34,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(wow);
 
 static FILE_OBJECTID_BUFFER windir_id, sysdir_id;
 
+static inline void put_ulong_user( ULONG *out, ULONG value )
+{
+    if (out) wow64_write_user( out, &value, sizeof(value) );
+}
+
 static inline NTSTATUS get_file_id( HANDLE handle, FILE_OBJECTID_BUFFER *id )
 {
     IO_STATUS_BLOCK32 io32;
@@ -92,7 +97,7 @@ static BOOL replace_path( OBJECT_ATTRIBUTES *attr, ULONG prefix_len, const WCHAR
                           const WCHAR *replace_dir, const WCHAR *replace_name )
 {
     const WCHAR *name = attr->ObjectName->Buffer;
-    ULONG match_len, replace_len, len = attr->ObjectName->Length / sizeof(WCHAR);
+    ULONG match_len, replace_len, new_len, len = attr->ObjectName->Length / sizeof(WCHAR);
     UNICODE_STRING str;
     WCHAR *p;
 
@@ -101,7 +106,9 @@ static BOOL replace_path( OBJECT_ATTRIBUTES *attr, ULONG prefix_len, const WCHAR
     match_len = wcslen( match );
     replace_len = wcslen( replace_dir );
     if (replace_name) replace_len += wcslen( replace_name );
-    str.Length = (len + replace_len - match_len) * sizeof(WCHAR);
+    new_len = len - match_len + replace_len;
+    if (new_len > ((USHORT)-1 - sizeof(WCHAR)) / sizeof(WCHAR)) return FALSE;
+    str.Length = new_len * sizeof(WCHAR);
     str.MaximumLength = str.Length + sizeof(WCHAR);
     if (!(p = str.Buffer = Wow64AllocateTemp( str.MaximumLength ))) return FALSE;
 
@@ -134,11 +141,16 @@ BOOL get_file_redirect( OBJECT_ATTRIBUTES *attr )
         L"system32\\drivers\\etc", L"system32\\logfiles", L"system32\\spool"
     };
     static const WCHAR windirW[] = L"\\??\\C:\\windows\\";
-    const WCHAR *name = attr->ObjectName->Buffer;
-    unsigned int i, prefix_len = 0, len = attr->ObjectName->Length / sizeof(WCHAR);
+    const WCHAR *name;
+    unsigned int i, prefix_len = 0, len;
     const WCHAR *syswow64dir;
     UNICODE_STRING redir;
 
+    if (!attr || !attr->ObjectName || !attr->ObjectName->Buffer ||
+        attr->ObjectName->Length & (sizeof(WCHAR) - 1))
+        return FALSE;
+    name = attr->ObjectName->Buffer;
+    len = attr->ObjectName->Length / sizeof(WCHAR);
     if (!len) return FALSE;
 
     if (!attr->RootDirectory)
@@ -163,6 +175,9 @@ BOOL get_file_redirect( OBJECT_ATTRIBUTES *attr )
 
             /* redirect everything else */
             syswow64dir = get_machine_wow64_dir( current_machine );
+            if (len > ((USHORT)-1 - sizeof(WCHAR)) / sizeof(WCHAR) -
+                      wcslen(syswow64dir) - 1)
+                return FALSE;
             redir.Length = (wcslen(syswow64dir) + 1 + len) * sizeof(WCHAR);
             redir.MaximumLength = redir.Length + sizeof(WCHAR);
             if (!(redir.Buffer = Wow64AllocateTemp( redir.MaximumLength ))) return FALSE;
@@ -265,13 +280,17 @@ NTSTATUS WINAPI wow64_NtCreateFile( UINT *args )
     struct object_attr64 attr;
     IO_STATUS_BLOCK io;
     HANDLE handle = 0;
-    NTSTATUS status;
+    NTSTATUS status, publish_status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtCreateFile( &handle, access, objattr_32to64_redirect( &attr, attr32 ),
                            iosb_32to64( &io, io32 ), alloc_size, attributes,
                            sharing, disposition, options, ea_buffer, ea_length );
-    put_handle( handle_ptr, handle );
+    if ((publish_status = try_put_handle( handle_ptr, handle )))
+    {
+        if (handle) NtClose( handle );
+        return publish_status;
+    }
     put_iosb( io32, &io );
     return status;
 }
@@ -294,12 +313,16 @@ NTSTATUS WINAPI wow64_NtCreateMailslotFile( UINT *args )
     struct object_attr64 attr;
     IO_STATUS_BLOCK io;
     HANDLE handle = 0;
-    NTSTATUS status;
+    NTSTATUS status, publish_status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtCreateMailslotFile( &handle, access, objattr_32to64( &attr, attr32 ),
                                    iosb_32to64( &io, io32 ), options, quota, msg_size, timeout );
-    put_handle( handle_ptr, handle );
+    if ((publish_status = try_put_handle( handle_ptr, handle )))
+    {
+        if (handle) NtClose( handle );
+        return publish_status;
+    }
     put_iosb( io32, &io );
     return status;
 }
@@ -328,14 +351,18 @@ NTSTATUS WINAPI wow64_NtCreateNamedPipeFile( UINT *args )
     struct object_attr64 attr;
     IO_STATUS_BLOCK io;
     HANDLE handle = 0;
-    NTSTATUS status;
+    NTSTATUS status, publish_status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtCreateNamedPipeFile( &handle, access, objattr_32to64( &attr, attr32 ),
                                     iosb_32to64( &io, io32 ), sharing, dispo, options,
                                     pipe_type, read_mode, completion_mode, max_inst,
                                     inbound_quota, outbound_quota, timeout );
-    put_handle( handle_ptr, handle );
+    if ((publish_status = try_put_handle( handle_ptr, handle )))
+    {
+        if (handle) NtClose( handle );
+        return publish_status;
+    }
     put_iosb( io32, &io );
     return status;
 }
@@ -353,7 +380,7 @@ NTSTATUS WINAPI wow64_NtCreatePagingFile( UINT *args )
 
     UNICODE_STRING str;
 
-    return NtCreatePagingFile( unicode_str_32to64( &str, str32 ), min_size, max_size, actual_size );
+    return NtCreatePagingFile( unicode_str_32to64_temp( &str, str32 ), min_size, max_size, actual_size );
 }
 
 
@@ -526,12 +553,16 @@ NTSTATUS WINAPI wow64_NtOpenFile( UINT *args )
     struct object_attr64 attr;
     IO_STATUS_BLOCK io;
     HANDLE handle = 0;
-    NTSTATUS status;
+    NTSTATUS status, publish_status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtOpenFile( &handle, access, objattr_32to64_redirect( &attr, attr32 ),
                          iosb_32to64( &io, io32 ), sharing, options );
-    put_handle( handle_ptr, handle );
+    if ((publish_status = try_put_handle( handle_ptr, handle )))
+    {
+        if (handle) NtClose( handle );
+        return publish_status;
+    }
     put_iosb( io32, &io );
     return status;
 }
@@ -574,7 +605,7 @@ NTSTATUS WINAPI wow64_NtQueryDirectoryFile( UINT *args )
 
     status = NtQueryDirectoryFile( handle, event, apc_32to64( apc ), apc_param_32to64( apc, apc_param ),
                                    iosb_32to64( &io, io32 ), buffer, len, class, single_entry,
-                                   unicode_str_32to64( &mask, mask32 ), restart_scan );
+                                   unicode_str_32to64_temp( &mask, mask32 ), restart_scan );
     put_iosb( io32, &io );
     return status;
 }
@@ -724,13 +755,19 @@ NTSTATUS WINAPI wow64_NtRemoveIoCompletion( UINT *args )
 
     IO_STATUS_BLOCK io;
     ULONG_PTR key, value;
+    ULONG key32, value32;
     NTSTATUS status;
 
+    wow64_probe_user_write( key_ptr, sizeof(*key_ptr) );
+    wow64_probe_user_write( value_ptr, sizeof(*value_ptr) );
+    wow64_probe_user_write( io32, sizeof(*io32) );
     status = NtRemoveIoCompletion( handle, &key, &value, iosb_32to64( &io, io32 ), timeout );
     if (!status)
     {
-        *key_ptr = key;
-        *value_ptr = value;
+        key32 = key;
+        value32 = value;
+        wow64_write_user( key_ptr, &key32, sizeof(key32) );
+        wow64_write_user( value_ptr, &value32, sizeof(value32) );
     }
     put_iosb( io32, &io );
     return status;
@@ -750,20 +787,39 @@ NTSTATUS WINAPI wow64_NtRemoveIoCompletionEx( UINT *args )
     BOOLEAN alertable = get_ulong( &args );
 
     NTSTATUS status;
-    ULONG i;
+    ULONG i, count32 = 0;
     FILE_IO_COMPLETION_INFORMATION *info;
+    FILE_IO_COMPLETION_INFORMATION32 *local32;
+    SIZE_T size32;
 
     if (!count) return STATUS_INVALID_PARAMETER;
+    if (count > ~(ULONG)0 / sizeof(*local32)) return STATUS_ACCESS_VIOLATION;
+
+    size32 = count * sizeof(*local32);
+    wow64_probe_user_write( info32, size32 );
+    wow64_probe_user_write( written, sizeof(*written) );
 
     info = Wow64AllocateTemp( count * sizeof(*info) );
+    local32 = Wow64AllocateTemp( size32 );
+    if (!info || !local32) return STATUS_NO_MEMORY;
+    memset( info, 0, count * sizeof(*info) );
 
-    status = NtRemoveIoCompletionEx( handle, info, count, written, timeout, alertable );
-    for (i = 0; i < *written; i++)
+    status = NtRemoveIoCompletionEx( handle, info, count, &count32, timeout, alertable );
+    if (status == STATUS_SUCCESS || status == STATUS_TIMEOUT || status == STATUS_USER_APC)
     {
-        info32[i].CompletionKey             = info[i].CompletionKey;
-        info32[i].CompletionValue           = info[i].CompletionValue;
-        info32[i].IoStatusBlock.Status      = info[i].IoStatusBlock.Status;
-        info32[i].IoStatusBlock.Information = info[i].IoStatusBlock.Information;
+        count32 = min( count32, count );
+        if (status == STATUS_SUCCESS)
+        {
+            for (i = 0; i < count32; i++)
+            {
+                local32[i].CompletionKey             = info[i].CompletionKey;
+                local32[i].CompletionValue           = info[i].CompletionValue;
+                local32[i].IoStatusBlock.Status      = info[i].IoStatusBlock.Status;
+                local32[i].IoStatusBlock.Information = info[i].IoStatusBlock.Information;
+            }
+            if (count32) wow64_write_user( info32, local32, count32 * sizeof(*local32) );
+        }
+        put_ulong_user( written, count32 );
     }
     return status;
 }
@@ -825,17 +881,41 @@ NTSTATUS WINAPI wow64_NtSetInformationFile( UINT *args )
         {
             OBJECT_ATTRIBUTES attr;
             UNICODE_STRING name;
-            FILE_RENAME_INFORMATION32 *info32 = ptr;
+            FILE_RENAME_INFORMATION32 info32;
             FILE_RENAME_INFORMATION *info;
-            ULONG size;
+            ULONG size, name_len;
 
-            name.Buffer = info32->FileName;
-            name.Length = info32->FileNameLength;
-            InitializeObjectAttributes( &attr, &name, 0, LongToHandle( info32->RootDirectory ), 0 );
+            wow64_read_user( &info32, ptr, offsetof(FILE_RENAME_INFORMATION32, FileName) );
+            name_len = info32.FileNameLength;
+            if (name_len > len - offsetof(FILE_RENAME_INFORMATION32, FileName) ||
+                name_len > (ULONG)(USHORT)-1 - sizeof(WCHAR) ||
+                name_len & (sizeof(WCHAR) - 1))
+            {
+                status = io.Status = STATUS_INVALID_PARAMETER_3;
+                break;
+            }
+            name.Buffer = Wow64AllocateTemp( name_len + sizeof(WCHAR) );
+            if (!name.Buffer)
+            {
+                status = io.Status = STATUS_NO_MEMORY;
+                break;
+            }
+            wow64_read_user( name.Buffer,
+                             (const char *)ptr + offsetof(FILE_RENAME_INFORMATION32, FileName),
+                             name_len );
+            name.Buffer[name_len / sizeof(WCHAR)] = 0;
+            name.Length = name_len;
+            name.MaximumLength = name_len + sizeof(WCHAR);
+            InitializeObjectAttributes( &attr, &name, 0, LongToHandle( info32.RootDirectory ), 0 );
             get_file_redirect( &attr );
             size = offsetof( FILE_RENAME_INFORMATION, FileName[name.Length/sizeof(WCHAR)] );
             info = Wow64AllocateTemp( size );
-            info->Flags           = info32->Flags;
+            if (!info)
+            {
+                status = io.Status = STATUS_NO_MEMORY;
+                break;
+            }
+            info->Flags           = info32.Flags;
             info->RootDirectory   = attr.RootDirectory;
             info->FileNameLength  = name.Length;
             memcpy( info->FileName, name.Buffer, info->FileNameLength );
@@ -847,11 +927,12 @@ NTSTATUS WINAPI wow64_NtSetInformationFile( UINT *args )
     case FileCompletionInformation:   /* FILE_COMPLETION_INFORMATION */
         if (len >= sizeof(FILE_COMPLETION_INFORMATION32))
         {
-            FILE_COMPLETION_INFORMATION32 *info32 = ptr;
+            FILE_COMPLETION_INFORMATION32 info32;
             FILE_COMPLETION_INFORMATION info;
 
-            info.CompletionPort = LongToHandle( info32->CompletionPort );
-            info.CompletionKey  = info32->CompletionKey;
+            wow64_read_user( &info32, ptr, sizeof(info32) );
+            info.CompletionPort = LongToHandle( info32.CompletionPort );
+            info.CompletionKey  = info32.CompletionKey;  /* opaque completion value */
             status = NtSetInformationFile( handle, iosb_32to64( &io, io32 ), &info, sizeof(info), class );
         }
         else status = io.Status = STATUS_INVALID_PARAMETER_3;

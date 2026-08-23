@@ -5907,6 +5907,18 @@ static void test_ReOpenFile(void)
     CloseHandle(file);
 }
 
+static BOOL is_translated_wow64_memory(void)
+{
+    NTSTATUS (WINAPI *query)(HANDLE, const void *, MEMORY_INFORMATION_CLASS,
+                             void *, SIZE_T, SIZE_T *);
+    ULONG translated = 0;
+
+    query = (void *)GetProcAddress( GetModuleHandleA("ntdll.dll"), "NtQueryVirtualMemory" );
+    return query && !query( GetCurrentProcess(), NtCurrentTeb(),
+                            MemoryWineWow64TranslatedInformation,
+                            &translated, sizeof(translated), NULL ) && translated;
+}
+
 static void test_WriteFileGather(void)
 {
     char temp_path[MAX_PATH], filename[MAX_PATH];
@@ -6054,6 +6066,69 @@ static void test_WriteFileGather(void)
     memset( rbuf1, 0x17, si.dwPageSize );
     ok( memcmp( rbuf2, rbuf1, si.dwPageSize ) == 0,
             "data should not have been read into buffer\n" );
+
+    if (is_translated_wow64_memory())
+    {
+        /* A native 64-bit segment value is invalid for a 32-bit caller, but
+         * it must not be inspected before handle/length validation or after
+         * the preceding segment reaches EOF. */
+        memset( &ovl, 0, sizeof(ovl) );
+        ovl.hEvent = evt;
+        memset( fse, 0, sizeof(fse) );
+        fse[0].Buffer = rbuf1;
+        fse[1].Alignment = 0x100000000ULL;
+        SetLastError( 0xdeadbeef );
+        br = ReadFileScatter( hfile, fse, si.dwPageSize * 2, NULL, &ovl );
+        ok( !br && GetLastError() == ERROR_IO_PENDING,
+            "EOF scatter returned %d, error %lu\n", br, GetLastError() );
+        size = 0xdeadbeef;
+        key = 0xdeadbeef;
+        povl = (OVERLAPPED *)0xdeadbeef;
+        ret = GetQueuedCompletionStatus( hiocp2, &size, &key, &povl, 1000 );
+        ok( ret, "EOF scatter completion failed %lu\n", GetLastError() );
+        ok( size == si.dwPageSize && key == 999 && povl == &ovl,
+            "EOF scatter completion returned %lu/%Iu/%p\n", size, key, povl );
+        tx = 0;
+        br = GetOverlappedResult( hfile, &ovl, &tx, TRUE );
+        ok( br && tx == si.dwPageSize,
+            "EOF scatter returned %d, size %lu, error %lu\n", br, tx, GetLastError() );
+
+        memset( &ovl, 0, sizeof(ovl) );
+        ovl.hEvent = evt;
+        fse[0].Alignment = 0x100000000ULL;
+        SetLastError( 0xdeadbeef );
+        br = ReadFileScatter( INVALID_HANDLE_VALUE, fse, si.dwPageSize, NULL, &ovl );
+        ok( !br && GetLastError() == ERROR_INVALID_HANDLE,
+            "invalid handle scatter returned %d, error %lu\n", br, GetLastError() );
+
+        SetLastError( 0xdeadbeef );
+        br = WriteFileGather( hfile, fse, si.dwPageSize - 1, NULL, &ovl );
+        ok( !br && GetLastError() == ERROR_INVALID_PARAMETER,
+            "misaligned gather returned %d, error %lu\n", br, GetLastError() );
+
+        SetLastError( 0xdeadbeef );
+        br = WriteFileGather( hfile, fse, si.dwPageSize, NULL, &ovl );
+        ok( !br && GetLastError() == ERROR_INVALID_USER_BUFFER,
+            "high segment gather returned %d, error %lu\n", br, GetLastError() );
+
+        SetLastError( 0xdeadbeef );
+        br = ReadFileScatter( hfile, fse, si.dwPageSize, NULL, &ovl );
+        ok( !br && GetLastError() == ERROR_IO_PENDING,
+            "high segment scatter returned %d, error %lu\n", br, GetLastError() );
+        size = 0xdeadbeef;
+        key = 0xdeadbeef;
+        povl = (OVERLAPPED *)0xdeadbeef;
+        SetLastError( 0xdeadbeef );
+        ret = GetQueuedCompletionStatus( hiocp2, &size, &key, &povl, 1000 );
+        ok( !ret && GetLastError() == ERROR_NOACCESS && !size && povl == &ovl,
+            "high segment completion returned %lu/%lu/%p, error %lu\n",
+            ret, size, povl, GetLastError() );
+        tx = 0xdeadbeef;
+        br = GetOverlappedResult( hfile, &ovl, &tx, TRUE );
+        ok( !br && GetLastError() == ERROR_NOACCESS && !tx,
+            "high segment completion returned %d, size %lu, error %lu\n",
+            br, tx, GetLastError() );
+    }
 
     ResetEvent( evt );
 

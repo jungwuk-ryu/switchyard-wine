@@ -30,6 +30,7 @@
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "ntuser.h"
+#include "d3dkmt_private.h"
 #include "wine/asm.h"
 #include "wine/unixlib.h"
 #include "win32syscalls.h"

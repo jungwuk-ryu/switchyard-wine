@@ -557,6 +557,7 @@ union apc_call
         mem_size_t       align;        /* allocation alignment */
         unsigned int     prot;         /* memory protection flags */
         unsigned int     attributes;   /* memory extended attributes */
+        unsigned int     wine_flags;   /* Wine-private memory call flags */
     } virtual_alloc_ex;
     struct
     {
@@ -607,6 +608,7 @@ union apc_call
         mem_size_t       size;         /* allocation size */
         file_pos_t       offset;       /* file offset */
         mem_size_t       zero_bits;    /* number of zero high bits */
+        mem_size_t       commit_size;  /* initially committed size */
         unsigned int     alloc_type;   /* allocation type */
         unsigned int     prot;         /* memory protection flags */
     } map_view;
@@ -622,7 +624,8 @@ union apc_call
         unsigned int     alloc_type;   /* allocation type */
         unsigned int     prot;         /* memory protection flags */
         unsigned short   machine;      /* requested machine for image mappings */
-        unsigned short   __pad[3];
+        unsigned short   wine_flags;   /* Wine-private memory call flags */
+        unsigned int     attributes;   /* attributes, or 32-bit commit size when flagged */
     } map_view_ex;
     struct
     {
@@ -634,6 +637,8 @@ union apc_call
     {
         enum apc_type    type;      /* APC_CREATE_THREAD */
         unsigned int     flags;     /* creation flags */
+        unsigned int     access;    /* requested handle access */
+        unsigned int     wine_flags;/* Wine-private transaction flags */
         client_ptr_t     func;      /* void (__stdcall *func)(void*);  start function */
         client_ptr_t     arg;       /* argument for start function */
         mem_size_t       zero_bits; /* number of zero high bits for thread stack */
@@ -749,6 +754,7 @@ union apc_result
         thread_id_t      tid;       /* thread id */
         client_ptr_t     teb;       /* thread teb (in process address space) */
         obj_handle_t     handle;    /* handle to new thread */
+        obj_handle_t     info;      /* private creation transaction token */
     } create_thread;
     struct
     {
@@ -1126,6 +1132,7 @@ typedef volatile struct
     int          socket_fd;      /* file descriptor for process socket */
     unsigned int access;         /* access rights for process object */
     unsigned short machine;      /* architecture that the new process will use */
+    unsigned short wine_flags;   /* Wine-private creation flags */
     data_size_t  info_size;      /* size of startup info */
     data_size_t  handles_size;   /* length of explicit handles list */
     data_size_t  jobs_size;      /* length of jobs list */
@@ -1159,12 +1166,14 @@ typedef volatile struct
     obj_handle_t process;      /* process in which to create thread */
     unsigned int access;       /* wanted access rights */
     unsigned int flags;        /* thread creation flags */
+    unsigned int wine_flags;   /* Wine-private creation transaction flags */
     int          request_fd;   /* fd for request pipe */
     int          is_system;    /* system thread (kernel mode only) */
     VARARG(objattr,object_attributes); /* object attributes */
 @REPLY
     thread_id_t  tid;          /* thread id */
     obj_handle_t handle;       /* thread handle (in the current process) */
+    obj_handle_t info;         /* private creation transaction token */
 @END
 
 
@@ -1984,18 +1993,24 @@ enum server_fd_type
     unsigned int access;        /* wanted access rights */
     client_ptr_t base;          /* view base address (page-aligned) */
     mem_size_t   size;          /* view size */
+    mem_size_t   commit_size;   /* initially committed size */
     file_pos_t   start;         /* start offset in mapping */
 @END
 
 
 /* Add a memory view for an image mapping in the current process */
+#define IMAGE_VIEW_TRANSLATED_WOW64 0x0001
+#define IMAGE_VIEW_TRANSLATED_AMD64_LOW 0x0002
+
 @REQ(map_image_view)
     obj_handle_t mapping;       /* file mapping handle */
-    client_ptr_t base;          /* view base address (page-aligned) */
+    client_ptr_t base;          /* host view base address (page-aligned) */
+    client_ptr_t guest_base;    /* canonical Windows view base address */
     mem_size_t   size;          /* view size */
     mem_size_t   offset;        /* offset into the image */
     unsigned int entry;         /* entry point in mapped view */
     unsigned short machine;     /* machine in the mapped view */
+    unsigned short flags;       /* IMAGE_VIEW_* translation flags */
 @END
 
 
@@ -2011,7 +2026,7 @@ enum server_fd_type
     obj_handle_t process;       /* process handle */
     client_ptr_t addr;          /* address inside mapped view (in process address space) */
 @REPLY
-    client_ptr_t base;          /* view base address */
+    client_ptr_t base;          /* canonical client view base address */
     mem_size_t   size;          /* view size */
 @END
 
@@ -4458,4 +4473,32 @@ enum inproc_sync_type
     obj_handle_t  handle;                     /* shared visual handle */
 @REPLY
     client_ptr_t  target_root;                /* root IDCompositionVisual pointer for the target created from this shared visual */
+@END
+
+
+/* Retrieve process machine metadata for a virtual-memory operation.
+ * Keep Wine-private requests appended so existing request numbers remain stable. */
+@REQ(get_process_vm_machine)
+    obj_handle_t handle;               /* process handle */
+@REPLY
+    unsigned short machine;            /* process architecture */
+    unsigned short flags;              /* Wine-private virtual-memory flags */
+@END
+
+
+/* Commit or cancel a transactionally created process without requiring a
+ * PROCESS_TERMINATE handle. */
+@REQ(complete_new_process)
+    obj_handle_t info;           /* private startup info handle */
+    int          status;         /* cancellation exit status */
+    int          commit;         /* commit instead of cancel */
+@END
+
+
+/* Commit or cancel a private WoW64 thread-creation transaction.  The token
+ * owns a server reference and does not depend on the requested thread access. */
+@REQ(complete_new_thread)
+    obj_handle_t info;                 /* transaction token returned by new_thread */
+    int          status;               /* cancellation status for diagnostics */
+    int          commit;               /* nonzero to release the private suspend */
 @END

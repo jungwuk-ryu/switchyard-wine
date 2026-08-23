@@ -58,6 +58,7 @@
 #include "wine/appx_package_graph.h"
 #include "wine/condrv.h"
 #include "wine/debug.h"
+#include "wine/low_va.h"
 #include "unix_private.h"
 #include "locale_private.h"
 #include "error.h"
@@ -1698,7 +1699,11 @@ static inline void dup_unicode_string( const UNICODE_STRING *src, WCHAR **dst, U
 #endif
 {
     if (!src->Buffer) return;
+#ifdef _WIN64
+    str->Buffer = wow64_native_to_guest_addr( *dst );
+#else
     str->Buffer = PtrToUlong( *dst );
+#endif
     str->Length = src->Length;
     str->MaximumLength = src->MaximumLength;
     memcpy( *dst, src->Buffer, src->MaximumLength );
@@ -1806,6 +1811,36 @@ static int package_graph_fd_is_unchanged( const struct stat *before,
     return 1;
 }
 
+static NTSTATUS allocate_wow64_memory( void **address, SIZE_T *size, ULONG type, ULONG protect )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    ULONG_PTR wow_limit = user_space_wow_limit & ~(ULONG_PTR)0xffff;
+    MEM_ADDRESS_REQUIREMENTS requirements =
+    {
+        (void *)(WINE_LOW_VA_SHADOW_BASE + 0x10000),
+        NULL,
+        0
+    };
+    MEM_EXTENDED_PARAMETER parameters[2] = {0};
+
+    /* Keep low-address data below both 2 GiB and the active WoW64 user limit.
+     * The address requirement uses an inclusive end, while the effective user
+     * limit is rounded down to the 64-KiB allocation granularity. */
+    if (!wow_limit || wow_limit > limit_2g) wow_limit = limit_2g;
+    requirements.HighestEndingAddress =
+        (void *)(WINE_LOW_VA_SHADOW_BASE + wow_limit - 1);
+
+    parameters[0].Type = MemExtendedParameterAddressRequirements;
+    parameters[0].Pointer = &requirements;
+    parameters[1].Type = WINE_MEM_EXTENDED_PARAMETER_WOW64_TRANSLATED;
+    return NtAllocateVirtualMemoryEx( NtCurrentProcess(), address, size, type, protect,
+                                      parameters, ARRAY_SIZE(parameters) );
+#else
+    return NtAllocateVirtualMemory( NtCurrentProcess(), address, limit_2g - 1, size,
+                                    type, protect );
+#endif
+}
+
 NTSTATUS load_package_graph_snapshot( int fd, data_size_t size,
                                       BOOL low_address, void **result )
 {
@@ -1830,9 +1865,12 @@ NTSTATUS load_package_graph_snapshot( int fd, data_size_t size,
         return STATUS_INVALID_IMAGE_FORMAT;
 
     allocation_size = size;
-    if ((status = NtAllocateVirtualMemory(
-              NtCurrentProcess(), &graph, low_address ? limit_2g - 1 : 0,
-              &allocation_size, MEM_COMMIT, PAGE_READWRITE )))
+    if (low_address)
+        status = allocate_wow64_memory( &graph, &allocation_size, MEM_COMMIT, PAGE_READWRITE );
+    else
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), &graph, 0, &allocation_size,
+                                          MEM_COMMIT, PAGE_READWRITE );
+    if (status)
         return status;
     while (offset < size)
     {
@@ -1890,8 +1928,7 @@ static void *clone_package_graph( const void *source )
     size = wine_appx_graph_read_u32(
         (const unsigned char *)source + WINE_APPX_GRAPH_HEADER_TOTAL_SIZE_OFFSET );
     assert( wine_appx_graph_validate_blob( source, size ));
-    status = NtAllocateVirtualMemory( NtCurrentProcess(), &copy, limit_2g - 1,
-                                      &size, MEM_COMMIT, PAGE_READWRITE );
+    status = allocate_wow64_memory( &copy, &size, MEM_COMMIT, PAGE_READWRITE );
     assert( !status );
     memcpy( copy, source, wine_appx_graph_read_u32(
             (const unsigned char *)source +
@@ -1929,8 +1966,7 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
                    + ((params->RuntimeInfo.MaximumLength + 1) & ~1)
                    + params->EnvironmentSize);
 
-    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&wow64_params, limit_2g - 1, &size,
-                                      MEM_COMMIT, PAGE_READWRITE );
+    status = allocate_wow64_memory( (void **)&wow64_params, &size, MEM_COMMIT, PAGE_READWRITE );
     assert( !status );
 
     wow64_params->AllocationSize  = size;
@@ -1957,7 +1993,7 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
         void *package_graph = clone_package_graph( params->PackageDependencyData );
 
 #ifdef _WIN64
-        wow64_params->PackageDependencyData = PtrToUlong( package_graph );
+        wow64_params->PackageDependencyData = wow64_native_to_guest_addr( package_graph );
 #else
         wow64_params->PackageDependencyData = (ULONG64)(ULONG_PTR)package_graph;
 #endif
@@ -1973,7 +2009,7 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
     dup_unicode_string( &params->ShellInfo, &dst, &wow64_params->ShellInfo );
     dup_unicode_string( &params->RuntimeInfo, &dst, &wow64_params->RuntimeInfo );
 
-    wow64_params->Environment = PtrToUlong( dst );
+    wow64_params->Environment = wow64_native_to_guest_addr( dst );
     wow64_params->EnvironmentSize = params->EnvironmentSize;
     memcpy( dst, params->Environment, params->EnvironmentSize );
     return wow64_params;
@@ -1985,6 +2021,14 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
  */
 static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module, BOOL debugged )
 {
+    if (main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64)
+    {
+        void *guest = virtual_get_guest_address( module );
+
+        main_image_native_base = guest != module ? module : NULL;
+        module = guest;
+    }
+    else main_image_native_base = NULL;
     peb->ImageBaseAddress           = module;
     peb->ProcessParameters          = params;
     peb->OSMajorVersion             = 10;
@@ -2013,8 +2057,10 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module, BOOL de
     {
         void *wow64_params = build_wow64_parameters( params );
 
-        wow_peb->ImageBaseAddress                = PtrToUlong( peb->ImageBaseAddress );
-        wow_peb->ProcessParameters               = PtrToUlong( wow64_params );
+        wow_peb->ImageBaseAddress                = wow64_native_to_guest_addr( peb->ImageBaseAddress );
+        wow_peb->ProcessParameters               = wow64_native_to_guest_addr( wow64_params );
+        /* The translated 32-bit address space keeps the Windows ABI address. */
+        wow_peb->SharedData                      = WINE_USER_SHARED_DATA_ADDRESS;
         wow_peb->NumberOfProcessors              = peb->NumberOfProcessors;
         wow_peb->NtGlobalFlag                    = peb->NtGlobalFlag;
         wow_peb->CriticalSectionTimeout.QuadPart = peb->CriticalSectionTimeout.QuadPart;

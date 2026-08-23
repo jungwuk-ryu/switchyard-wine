@@ -33,7 +33,10 @@
 #include "rtlsupportapi.h"
 #include "ddk/wdm.h"
 #include "excpt.h"
+#include "wine/low_va.h"
 #include "wine/test.h"
+#include "wine/unixlib.h"
+#include "x18_dispatch_test.h"
 #include "intrin.h"
 
 static void *code_mem;
@@ -7881,6 +7884,18 @@ static void test_thread_context(void)
     ok( (char *)context.Pc >= (char *)pNtGetContextThread &&
         (char *)context.Pc <= (char *)pNtGetContextThread + 32,
         "wrong Pc %p/%p\n", (void *)context.Pc, pNtGetContextThread );
+
+    memset( &context, 0xcc, sizeof(context) );
+    memset( &expect, 0xcc, sizeof(expect) );
+    context.ContextFlags = CONTEXT_ARM64_X18;
+
+    status = func_ptr( GetCurrentThread(), &context, &expect, pNtGetContextThread );
+    ok( status == STATUS_SUCCESS, "NtGetContextThread failed %08lx\n", status );
+    ok( context.ContextFlags == CONTEXT_ARM64_X18, "wrong flags %08lx\n",
+        context.ContextFlags );
+    COMPARE( X18 );
+    ok( context.X17 == 0xcccccccccccccccc, "X17 was modified to %p\n", (void *)context.X17 );
+    ok( context.X19 == 0xcccccccccccccccc, "X19 was modified to %p\n", (void *)context.X19 );
 #undef COMPARE
 }
 
@@ -8918,6 +8933,339 @@ static void test_brk(void)
                         PAGE_EXECUTE_READ, UNW_FLAG_EHANDLER,
                         0, 0 );
 }
+
+struct system_abi_signal_state
+{
+    void *unix_funcs[1];
+    ULONG_PTR recovery_sp;
+    ULONG_PTR recovery_lr;
+    void *recovery_pc;
+    TEB *expected_teb;
+    TEB *observed_teb;
+    void *observed_self;
+    void *exception_address;
+    DWORD exception_code;
+    BOOL handler_called;
+};
+
+static struct system_abi_signal_state *system_abi_signal_state;
+
+static DWORD WINAPI system_abi_signal_handler( EXCEPTION_RECORD *rec, void *frame,
+                                               CONTEXT *context, DISPATCHER_CONTEXT *dispatcher )
+{
+    struct system_abi_signal_state *state = system_abi_signal_state;
+    TEB *teb = NtCurrentTeb();
+
+    (void)frame;
+    (void)dispatcher;
+
+    if (!state) return ExceptionContinueSearch;
+
+    state->handler_called = TRUE;
+    state->exception_code = rec->ExceptionCode;
+    state->exception_address = rec->ExceptionAddress;
+    state->observed_teb = teb;
+    if (teb == state->expected_teb) state->observed_self = teb->Tib.Self;
+
+    /* Leave the interrupted Unix dispatcher frame through the saved PE frame. */
+    context->Sp = state->recovery_sp;
+    context->Fp = state->recovery_sp;
+    context->Lr = state->recovery_lr;
+    context->Pc = (ULONG_PTR)state->recovery_pc;
+    context->X18 = (ULONG_PTR)state->expected_teb;
+    return ExceptionContinueExecution;
+}
+
+static void test_system_abi_signal_teb(void)
+{
+    typedef NTSTATUS (WINAPI *unix_call_dispatcher_func)(ULONG64, unsigned int, void *);
+    enum
+    {
+        recovery_offset = 8 * sizeof(DWORD),
+        fault_offset = 10 * sizeof(DWORD),
+    };
+    static const DWORD call_system_abi_fault[] =
+    {
+        0xa9bf7bfd, /* 00: stp x29, x30, [sp, #-16]! */
+        0x910003fd, /* 04: mov x29, sp */
+        0xf900041d, /* 08: str x29, [x0, #8] */
+        0xf900081e, /* 0c: str x30, [x0, #16] */
+        0xaa0103f0, /* 10: mov x16, x1 */
+        0xd2800001, /* 14: mov x1, #0 */
+        0xd2800002, /* 18: mov x2, #0 */
+        0xd63f0200, /* 1c: blr x16 */
+        0xa8c17bfd, /* 20: ldp x29, x30, [sp], #16 */
+        0xd65f03c0, /* 24: ret */
+
+        0xa9bf7bfd, /* 28: stp x29, x30, [sp, #-16]! */
+        0x910003fd, /* 2c: mov x29, sp */
+        0xd43e0000, /* 30: brk #0xf000 */
+        0xd503201f, /* 34: nop */
+        0xa8c17bfd, /* 38: ldp x29, x30, [sp], #16 */
+        0xd65f03c0, /* 3c: ret */
+    };
+    struct system_abi_signal_state state = {0};
+    unix_call_dispatcher_func *dispatcher_export;
+    unix_call_dispatcher_func dispatcher;
+    ULONG_PTR shared_data = (ULONG_PTR)NtCurrentTeb()->Peb->SharedData;
+
+    C_ASSERT( FIELD_OFFSET(struct system_abi_signal_state, recovery_sp) == 8 );
+    C_ASSERT( FIELD_OFFSET(struct system_abi_signal_state, recovery_lr) == 16 );
+
+    /* The translated KUSER backing identifies the native Darwin ARM64 runtime. */
+    if (shared_data < WINE_LOW_VA_SHADOW_BASE ||
+        shared_data - WINE_LOW_VA_SHADOW_BASE >= WINE_LOW_VA_SHADOW_SIZE)
+        return;
+
+    dispatcher_export = (void *)GetProcAddress( hntdll, "__wine_unix_call_dispatcher" );
+    if (!dispatcher_export || !(dispatcher = *dispatcher_export))
+    {
+        win_skip( "the Wine Unix-call dispatcher is unavailable\n" );
+        return;
+    }
+
+    state.unix_funcs[0] = (char *)code_mem + fault_offset;
+    state.recovery_pc = (char *)code_mem + recovery_offset;
+    state.expected_teb = NtCurrentTeb();
+    system_abi_signal_state = &state;
+    run_exception_test( system_abi_signal_handler, NULL, call_system_abi_fault,
+                        sizeof(call_system_abi_fault), fault_offset,
+                        PAGE_EXECUTE_READ, UNW_FLAG_EHANDLER, &state, dispatcher );
+    system_abi_signal_state = NULL;
+
+    ok( state.handler_called, "the system-ABI signal did not reach PE exception handling\n" );
+    ok( state.exception_code == EXCEPTION_BREAKPOINT, "got exception %#lx at %p\n",
+        state.exception_code, state.exception_address );
+    ok( state.observed_teb == state.expected_teb, "wrong TEB %p, expected %p\n",
+        state.observed_teb, state.expected_teb );
+    ok( state.observed_self == &state.expected_teb->Tib, "wrong Tib.Self %p, expected %p\n",
+        state.observed_self, &state.expected_teb->Tib );
+}
+
+static void test_system_abi_illegal_instruction(void)
+{
+    typedef NTSTATUS (WINAPI *unix_call_dispatcher_func)(ULONG64, unsigned int, void *);
+    static const DWORD illegal_unix_func[] =
+    {
+        0x00000000, /* udf #0 */
+        0xd65f03c0, /* ret */
+    };
+    unix_call_dispatcher_func *dispatcher_export;
+    unix_call_dispatcher_func dispatcher;
+    void *unix_funcs[1];
+    ULONG_PTR shared_data = (ULONG_PTR)NtCurrentTeb()->Peb->SharedData;
+    NTSTATUS status;
+
+    /* The translated KUSER backing identifies the native Darwin ARM64 runtime. */
+    if (shared_data < WINE_LOW_VA_SHADOW_BASE ||
+        shared_data - WINE_LOW_VA_SHADOW_BASE >= WINE_LOW_VA_SHADOW_SIZE)
+        return;
+
+    dispatcher_export = (void *)GetProcAddress( hntdll, "__wine_unix_call_dispatcher" );
+    if (!dispatcher_export || !(dispatcher = *dispatcher_export))
+    {
+        win_skip( "the Wine Unix-call dispatcher is unavailable\n" );
+        return;
+    }
+
+    memcpy( code_mem, illegal_unix_func, sizeof(illegal_unix_func) );
+    FlushInstructionCache( GetCurrentProcess(), code_mem, sizeof(illegal_unix_func) );
+    unix_funcs[0] = code_mem;
+    status = dispatcher( (ULONG64)(ULONG_PTR)unix_funcs, 0, NULL );
+    ok( status == STATUS_ILLEGAL_INSTRUCTION, "got status %#lx\n", status );
+}
+
+#if defined(__aarch64__) && !defined(__arm64ec__)
+
+static WCHAR *find_last_path_separator( WCHAR *path )
+{
+    WCHAR *ret = NULL;
+
+    for (; *path; path++) if (*path == '/' || *path == '\\') ret = path;
+    return ret;
+}
+
+static NTSTATUS try_load_x18_dispatch_helper( WCHAR *path, BOOL *found,
+                                               unixlib_module_t *module,
+                                               unixlib_handle_t *handle )
+{
+    UNICODE_STRING name;
+    NTSTATUS status;
+    DWORD attrs;
+
+    if ((attrs = GetFileAttributesW( path )) == INVALID_FILE_ATTRIBUTES ||
+        (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return STATUS_DLL_NOT_FOUND;
+
+    *found = TRUE;
+    if ((status = RtlDosPathNameToNtPathName_U_WithStatus( path, &name, NULL, NULL )))
+        return status;
+    status = __wine_load_unix_lib( &name, module, handle );
+    RtlFreeUnicodeString( &name );
+    return status;
+}
+
+static NTSTATUS load_x18_dispatch_helper( WCHAR *path, SIZE_T count, BOOL *found,
+                                          unixlib_module_t *module,
+                                          unixlib_handle_t *handle )
+{
+    static const WCHAR helper_name[] = L"ntdll-x18-test.so";
+    UNICODE_STRING name;
+    WCHAR *separator, *parent;
+    NTSTATUS status;
+    DWORD len;
+
+    *found = FALSE;
+    if (!(len = GetModuleFileNameW( NULL, path, count )) || len >= count)
+        return STATUS_BUFFER_TOO_SMALL;
+    if (!(separator = find_last_path_separator( path ))) return STATUS_OBJECT_PATH_INVALID;
+    if (separator - path + ARRAY_SIZE(helper_name) >= count) return STATUS_BUFFER_TOO_SMALL;
+
+    separator[1] = 0;
+    lstrcatW( path, helper_name );
+    status = try_load_x18_dispatch_helper( path, found, module, handle );
+    if (*found) return status;
+
+    *separator = 0;
+    if (!(parent = find_last_path_separator( path ))) return STATUS_DLL_NOT_FOUND;
+    if (parent - path + ARRAY_SIZE(helper_name) >= count) return STATUS_BUFFER_TOO_SMALL;
+    parent[1] = 0;
+    lstrcatW( path, helper_name );
+    status = try_load_x18_dispatch_helper( path, found, module, handle );
+    if (*found) return status;
+
+    /* Installed tests place the helper on ntdll's native library path. */
+    RtlInitUnicodeString( &name, helper_name );
+    status = __wine_load_unix_lib( &name, module, handle );
+    if (!status) *found = TRUE;
+    return status;
+}
+
+static void test_system_x18_dispatcher_entry(void)
+{
+    typedef NTSTATUS (WINAPI *unix_call_dispatcher_func)(unixlib_handle_t,
+                                                         unsigned int, void *);
+    typedef NTSTATUS (*direct_bridge_func)(void *);
+    struct x18_dispatch_test_state state;
+    unix_call_dispatcher_func *dispatcher_export, dispatcher;
+    unixlib_handle_t *ntdll_handle_export;
+    unixlib_module_t test_module = 0;
+    unixlib_handle_t test_handle = 0;
+    const ULONG_PTR *test_funcs;
+    direct_bridge_func bridge;
+    ULONG_PTR shared_data = (ULONG_PTR)NtCurrentTeb()->Peb->SharedData;
+    WCHAR helper_path[MAX_PATH];
+    BOOL found;
+    NTSTATUS status;
+    unsigned int i;
+
+    /* The translated KUSER backing identifies the native Darwin ARM64 runtime. */
+    if (shared_data < WINE_LOW_VA_SHADOW_BASE ||
+        shared_data - WINE_LOW_VA_SHADOW_BASE >= WINE_LOW_VA_SHADOW_SIZE)
+        return;
+
+    dispatcher_export = RtlFindExportedRoutineByName( hntdll, "__wine_unix_call_dispatcher" );
+    ntdll_handle_export = RtlFindExportedRoutineByName( hntdll, "__wine_unixlib_handle" );
+    if (!dispatcher_export || !(dispatcher = *dispatcher_export) ||
+        !ntdll_handle_export || !*ntdll_handle_export)
+    {
+        win_skip( "the raw ntdll Unix-call exports are unavailable\n" );
+        return;
+    }
+
+    status = load_x18_dispatch_helper( helper_path, ARRAY_SIZE(helper_path), &found,
+                                       &test_module, &test_handle );
+    if (!found)
+    {
+        win_skip( "the native system-x18 test helper is unavailable\n" );
+        return;
+    }
+    ok( !status, "failed to load %s, status %#lx\n", wine_dbgstr_w(helper_path), status );
+    if (status) return;
+
+    test_funcs = (const ULONG_PTR *)(ULONG_PTR)test_handle;
+    bridge = (direct_bridge_func)test_funcs[x18_dispatch_direct_bridge];
+    ok( !!bridge, "the native system-x18 bridge is missing\n" );
+    if (!bridge)
+    {
+        __wine_unload_unix_lib( test_module );
+        return;
+    }
+
+    for (i = 0; i < 2; i++)
+    {
+        TEB *teb = NtCurrentTeb();
+
+        memset( &state, 0, sizeof(state) );
+        state.dispatcher = (ULONG_PTR)dispatcher;
+        state.test_handle = test_handle;
+        state.ntdll_handle = *ntdll_handle_export;
+        state.expected_teb = (ULONG_PTR)teb;
+        state.opaque_x18 = 1;
+        state.opaque_status = STATUS_UNSUCCESSFUL;
+        state.system_status = STATUS_UNSUCCESSFUL;
+        state.teb_status = STATUS_UNSUCCESSFUL;
+
+        status = bridge( &state );
+        if (status == STATUS_NOT_SUPPORTED)
+        {
+            win_skip( "Darwin custom x18 ABI support is unavailable\n" );
+            break;
+        }
+        ok( !status, "iteration %u bridge returned %#lx\n", i, status );
+        ok( state.entry_custom == TRUE, "iteration %u entered with mode %u\n",
+            i, state.entry_custom );
+        ok( state.after_opaque_custom == TRUE,
+            "iteration %u mode after opaque-x18 call is %u\n", i, state.after_opaque_custom );
+        ok( state.observed_opaque_x18 == state.opaque_x18,
+            "iteration %u restored x18 %#I64x, expected %#I64x\n", i,
+            state.observed_opaque_x18, state.opaque_x18 );
+        ok( state.before_system_custom == FALSE,
+            "iteration %u mode before system entry is %u\n", i, state.before_system_custom );
+        ok( state.system_target_custom == FALSE,
+            "iteration %u system-entry target mode is %u\n", i, state.system_target_custom );
+        ok( state.after_system_custom == TRUE,
+            "iteration %u mode after system-entry call is %u\n", i, state.after_system_custom );
+        ok( state.observed_system_x18 == state.expected_teb,
+            "iteration %u system-entry x18 %p, expected %p\n", i,
+            (void *)(ULONG_PTR)state.observed_system_x18,
+            (void *)(ULONG_PTR)state.expected_teb );
+        ok( state.before_teb_custom == FALSE,
+            "iteration %u mode before TEB call is %u\n", i, state.before_teb_custom );
+        ok( state.after_teb_custom == TRUE,
+            "iteration %u mode after TEB call is %u\n", i, state.after_teb_custom );
+        ok( state.observed_teb_x18 == state.expected_teb,
+            "iteration %u TEB-call x18 %p, expected %p\n", i,
+            (void *)(ULONG_PTR)state.observed_teb_x18,
+            (void *)(ULONG_PTR)state.expected_teb );
+        ok( state.final_custom == TRUE, "iteration %u final mode is %u\n",
+            i, state.final_custom );
+        ok( state.inner_called == 1, "iteration %u inner call count is %u\n",
+            i, state.inner_called );
+        ok( state.opaque_status == STATUS_ILLEGAL_INSTRUCTION,
+            "iteration %u opaque-x18 status is %#lx\n", i, state.opaque_status );
+        ok( state.system_status == STATUS_SUCCESS,
+            "iteration %u system-entry status is %#lx\n", i, state.system_status );
+        ok( state.teb_status == STATUS_SUCCESS,
+            "iteration %u TEB status is %#lx\n", i, state.teb_status );
+        ok( state.observed_teb == state.expected_teb,
+            "iteration %u observed TEB %p, expected %p\n", i,
+            (void *)(ULONG_PTR)state.observed_teb, (void *)(ULONG_PTR)state.expected_teb );
+        ok( NtCurrentTeb() == teb, "iteration %u returned with TEB %p, expected %p\n",
+            i, NtCurrentTeb(), teb );
+    }
+
+    status = __wine_unload_unix_lib( test_module );
+    ok( !status, "failed to unload the native system-x18 helper, status %#lx\n", status );
+}
+
+#else
+
+static void test_system_x18_dispatcher_entry(void)
+{
+}
+
+#endif
 
 static LONG consolidate_dummy_called;
 static LONG pass;
@@ -12986,6 +13334,9 @@ START_TEST(exception)
 
     test_continue();
     test_brk();
+    test_system_abi_signal_teb();
+    test_system_abi_illegal_instruction();
+    test_system_x18_dispatcher_entry();
     test_nested_exception();
     test_collided_unwind();
     test_restore_context();

@@ -30,6 +30,87 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(wow);
 
+static NTSTATUS publish_handle_result( ULONG *handle_ptr, HANDLE handle, NTSTATUS status )
+{
+    NTSTATUS publish_status = try_put_handle( handle_ptr, handle );
+
+    if (!publish_status) return status;
+    if (handle) NtClose( handle );
+    return publish_status;
+}
+
+static inline BOOL registry_query_status( NTSTATUS status )
+{
+    return status == STATUS_SUCCESS || status == STATUS_BUFFER_TOO_SMALL ||
+           status == STATUS_BUFFER_OVERFLOW;
+}
+
+static void *alloc_registry_output( ULONG len )
+{
+    void *ret = Wow64AllocateTemp( len ? len : 1 );
+
+    if (!ret) RtlRaiseStatus( STATUS_NO_MEMORY );
+    return ret;
+}
+
+static ULONG key_info_fixed_size( KEY_INFORMATION_CLASS class )
+{
+    switch (class)
+    {
+    case KeyBasicInformation:  return offsetof(KEY_BASIC_INFORMATION, Name);
+    case KeyFullInformation:   return offsetof(KEY_FULL_INFORMATION, Class);
+    case KeyNodeInformation:   return offsetof(KEY_NODE_INFORMATION, Name);
+    case KeyNameInformation:   return offsetof(KEY_NAME_INFORMATION, Name);
+    case KeyCachedInformation: return sizeof(KEY_CACHED_INFORMATION);
+    default:                    return 0;
+    }
+}
+
+static ULONG key_value_info_fixed_size( KEY_VALUE_INFORMATION_CLASS class )
+{
+    switch (class)
+    {
+    case KeyValueBasicInformation:   return offsetof(KEY_VALUE_BASIC_INFORMATION, Name);
+    case KeyValueFullInformation:    return offsetof(KEY_VALUE_FULL_INFORMATION, Name);
+    case KeyValuePartialInformation: return offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data);
+    default:                         return 0;
+    }
+}
+
+/* Registry query helpers receive the variable server reply before filling the
+ * fixed header.  Publish in the same order so a later guest fault leaves the
+ * same partial result as the native path. */
+static void put_registry_info( void *out, const void *local, ULONG len,
+                               ULONG result_len, ULONG fixed_size )
+{
+    ULONG written = min( len, result_len );
+
+    if (written > fixed_size)
+        wow64_write_user( (char *)out + fixed_size, (const char *)local + fixed_size,
+                          written - fixed_size );
+    if (written)
+        wow64_write_user( out, local, min( written, fixed_size ) );
+}
+
+static void put_registry_value_info( void *out, const void *local, ULONG len,
+                                     ULONG result_len, ULONG min_size, ULONG fixed_size )
+{
+    ULONG written = min( len, result_len );
+
+    /* NtQueryValueKey copies the name before issuing the server request. */
+    if (written > min_size && fixed_size > min_size)
+    {
+        ULONG end = min( written, fixed_size );
+        wow64_write_user( (char *)out + min_size, (const char *)local + min_size,
+                          end - min_size );
+    }
+    if (written > fixed_size)
+        wow64_write_user( (char *)out + fixed_size, (const char *)local + fixed_size,
+                          written - fixed_size );
+    if (written)
+        wow64_write_user( out, local, min( written, min_size ) );
+}
+
 
 /**********************************************************************
  *           wow64_NtCreateKey
@@ -47,13 +128,21 @@ NTSTATUS WINAPI wow64_NtCreateKey( UINT *args )
     struct object_attr64 attr;
     UNICODE_STRING class;
     HANDLE handle = 0;
-    NTSTATUS status;
+    ULONG disposition;
+    NTSTATUS status, publish_status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
+    if (dispos) wow64_probe_user_write( dispos, sizeof(*dispos) );
     status = NtCreateKey( &handle, access, objattr_32to64( &attr, attr32 ), index,
-                          unicode_str_32to64( &class, class32 ), options, dispos );
-    put_handle( handle_ptr, handle );
-    return status;
+                          unicode_str_32to64_temp( &class, class32 ), options,
+                          dispos ? &disposition : NULL );
+    if (!status && dispos &&
+        (publish_status = wow64_try_write_user( dispos, &disposition, sizeof(disposition) )))
+    {
+        if (handle) NtClose( handle );
+        return publish_status;
+    }
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -74,13 +163,21 @@ NTSTATUS WINAPI wow64_NtCreateKeyTransacted( UINT *args )
     struct object_attr64 attr;
     UNICODE_STRING class;
     HANDLE handle = 0;
-    NTSTATUS status;
+    ULONG disposition;
+    NTSTATUS status, publish_status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
+    if (dispos) wow64_probe_user_write( dispos, sizeof(*dispos) );
     status = NtCreateKeyTransacted( &handle, access, objattr_32to64( &attr, attr32 ), index,
-                                    unicode_str_32to64( &class, class32 ), options, transacted, dispos );
-    put_handle( handle_ptr, handle );
-    return status;
+                                    unicode_str_32to64_temp( &class, class32 ), options, transacted,
+                                    dispos ? &disposition : NULL );
+    if (!status && dispos &&
+        (publish_status = wow64_try_write_user( dispos, &disposition, sizeof(disposition) )))
+    {
+        if (handle) NtClose( handle );
+        return publish_status;
+    }
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -104,8 +201,10 @@ NTSTATUS WINAPI wow64_NtDeleteValueKey( UINT *args )
     UNICODE_STRING32 *str32 = get_ptr( &args );
 
     UNICODE_STRING str;
+    UNICODE_STRING *name = unicode_str_32to64( &str, str32 );
 
-    return NtDeleteValueKey( handle, unicode_str_32to64( &str, str32 ));
+    if (name && name->Length <= 16383 * sizeof(WCHAR)) unicode_str_32to64_materialize( name );
+    return NtDeleteValueKey( handle, name );
 }
 
 
@@ -121,7 +220,21 @@ NTSTATUS WINAPI wow64_NtEnumerateKey( UINT *args )
     ULONG len = get_ulong( &args );
     ULONG *retlen = get_ptr( &args );
 
-    return NtEnumerateKey( handle, index, class, ptr, len, retlen );
+    ULONG fixed_size, result_len = 0;
+    void *local;
+    NTSTATUS status;
+
+    if (index == ~(ULONG)0) return NtEnumerateKey( handle, index, class, ptr, len, retlen );
+    if (!(fixed_size = key_info_fixed_size( class )))
+        return NtEnumerateKey( handle, index, class, ptr, len, retlen );
+    local = alloc_registry_output( len );
+    status = NtEnumerateKey( handle, index, class, local, len, &result_len );
+    if (registry_query_status( status ))
+    {
+        put_registry_info( ptr, local, len, result_len, fixed_size );
+        wow64_write_user( retlen, &result_len, sizeof(result_len) );
+    }
+    return status;
 }
 
 
@@ -137,7 +250,20 @@ NTSTATUS WINAPI wow64_NtEnumerateValueKey( UINT *args )
     ULONG len = get_ulong( &args );
     ULONG *retlen = get_ptr( &args );
 
-    return NtEnumerateValueKey( handle, index, class, ptr, len, retlen );
+    ULONG fixed_size, result_len = 0;
+    void *local;
+    NTSTATUS status;
+
+    if (!(fixed_size = key_value_info_fixed_size( class )))
+        return NtEnumerateValueKey( handle, index, class, ptr, len, retlen );
+    local = alloc_registry_output( len );
+    status = NtEnumerateValueKey( handle, index, class, local, len, &result_len );
+    if (registry_query_status( status ))
+    {
+        put_registry_info( ptr, local, len, result_len, fixed_size );
+        wow64_write_user( retlen, &result_len, sizeof(result_len) );
+    }
+    return status;
 }
 
 
@@ -274,10 +400,9 @@ NTSTATUS WINAPI wow64_NtOpenKey( UINT *args )
     HANDLE handle = 0;
     NTSTATUS status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtOpenKey( &handle, access, objattr_32to64( &attr, attr32 ));
-    put_handle( handle_ptr, handle );
-    return status;
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -295,10 +420,9 @@ NTSTATUS WINAPI wow64_NtOpenKeyEx( UINT *args )
     HANDLE handle = 0;
     NTSTATUS status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtOpenKeyEx( &handle, access, objattr_32to64( &attr, attr32 ), options );
-    put_handle( handle_ptr, handle );
-    return status;
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -316,10 +440,9 @@ NTSTATUS WINAPI wow64_NtOpenKeyTransacted( UINT *args )
     HANDLE handle = 0;
     NTSTATUS status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtOpenKeyTransacted( &handle, access, objattr_32to64( &attr, attr32 ), transaction );
-    put_handle( handle_ptr, handle );
-    return status;
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -338,10 +461,9 @@ NTSTATUS WINAPI wow64_NtOpenKeyTransactedEx( UINT *args )
     HANDLE handle = 0;
     NTSTATUS status;
 
-    *handle_ptr = 0;
+    put_handle( handle_ptr, 0 );
     status = NtOpenKeyTransactedEx( &handle, access, objattr_32to64( &attr, attr32 ), options, transaction );
-    put_handle( handle_ptr, handle );
-    return status;
+    return publish_handle_result( handle_ptr, handle, status );
 }
 
 
@@ -356,7 +478,20 @@ NTSTATUS WINAPI wow64_NtQueryKey( UINT *args )
     ULONG len = get_ulong( &args );
     ULONG *retlen = get_ptr( &args );
 
-    return NtQueryKey( handle, class, info, len, retlen );
+    ULONG fixed_size, result_len = 0;
+    void *local;
+    NTSTATUS status;
+
+    if (!(fixed_size = key_info_fixed_size( class )))
+        return NtQueryKey( handle, class, info, len, retlen );
+    local = alloc_registry_output( len );
+    status = NtQueryKey( handle, class, local, len, &result_len );
+    if (registry_query_status( status ))
+    {
+        put_registry_info( info, local, len, result_len, fixed_size );
+        wow64_write_user( retlen, &result_len, sizeof(result_len) );
+    }
+    return status;
 }
 
 
@@ -390,8 +525,49 @@ NTSTATUS WINAPI wow64_NtQueryValueKey( UINT *args )
     ULONG *retlen = get_ptr( &args );
 
     UNICODE_STRING str;
+    ULONG min_size = 0, fixed_size = 0, result_len = 0;
+    UNICODE_STRING *name;
+    void *local;
+    NTSTATUS status;
 
-    return NtQueryValueKey( handle, unicode_str_32to64( &str, str32 ), class, ptr, len, retlen );
+    name = unicode_str_32to64( &str, str32 );
+    if (!name) return NtQueryValueKey( handle, NULL, class, ptr, len, retlen );
+    switch (class)
+    {
+    case KeyValueBasicInformation:
+        min_size = offsetof(KEY_VALUE_BASIC_INFORMATION, Name);
+        fixed_size = min_size + name->Length;
+        break;
+    case KeyValueFullInformation:
+        min_size = offsetof(KEY_VALUE_FULL_INFORMATION, Name);
+        fixed_size = min_size + name->Length;
+        break;
+    case KeyValuePartialInformation:
+        min_size = fixed_size = offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data);
+        break;
+    case KeyValuePartialInformationAlign64:
+        min_size = fixed_size = offsetof(KEY_VALUE_PARTIAL_INFORMATION_ALIGN64, Data);
+        break;
+    default:
+        return NtQueryValueKey( handle, name, class, ptr, len, retlen );
+    }
+    if (name->Length > 16383 * sizeof(WCHAR))
+        return NtQueryValueKey( handle, name, class, ptr, len, retlen );
+    unicode_str_32to64_materialize( name );
+
+    local = alloc_registry_output( len );
+    status = NtQueryValueKey( handle, name, class, local, len, &result_len );
+    if (registry_query_status( status ))
+    {
+        put_registry_value_info( ptr, local, len, result_len, min_size, fixed_size );
+        wow64_write_user( retlen, &result_len, sizeof(result_len) );
+    }
+    else if (name->Length <= 16383 * sizeof(WCHAR) && fixed_size > min_size && len > min_size)
+    {
+        ULONG name_len = min( len - min_size, (ULONG)name->Length );
+        wow64_write_user( (char *)ptr + min_size, (char *)local + min_size, name_len );
+    }
+    return status;
 }
 
 
@@ -404,8 +580,10 @@ NTSTATUS WINAPI wow64_NtRenameKey( UINT *args )
     UNICODE_STRING32 *str32 = get_ptr( &args );
 
     UNICODE_STRING str;
+    UNICODE_STRING *name = unicode_str_32to64( &str, str32 );
 
-    return NtRenameKey( handle, unicode_str_32to64( &str, str32 ));
+    if (name && name->Buffer && name->Length) unicode_str_32to64_materialize( name );
+    return NtRenameKey( handle, name );
 }
 
 
@@ -476,8 +654,10 @@ NTSTATUS WINAPI wow64_NtSetValueKey( UINT *args )
     ULONG count = get_ulong( &args );
 
     UNICODE_STRING str;
+    UNICODE_STRING *name = unicode_str_32to64( &str, str32 );
 
-    return NtSetValueKey( handle, unicode_str_32to64( &str, str32 ), index, type, data, count );
+    if (name && name->Length <= 16383 * sizeof(WCHAR)) unicode_str_32to64_materialize( name );
+    return NtSetValueKey( handle, name, index, type, data, count );
 }
 
 

@@ -24,6 +24,7 @@
 #define WINE_UNIX_CALL_EXPORT
 #include "wine/unixlib.h"
 #undef WINE_UNIX_CALL_EXPORT
+#include "wine/wow64_user.h"
 
 struct _DISPATCHER_CONTEXT;
 
@@ -149,6 +150,11 @@ enum ntdll_unix_funcs
     unix_call_native_callback_args,
     unix_get_unix_env,
     unix_get_process_package_graph,
+    unix_wow64_user_copy,
+    unix_wow64_create_user_process,
+    unix_wow64_complete_user_process,
+    unix_wow64_create_user_thread,
+    unix_wow64_complete_user_thread,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

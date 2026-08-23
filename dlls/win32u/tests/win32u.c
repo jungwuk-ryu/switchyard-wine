@@ -23,6 +23,7 @@
 
 #include "winbase.h"
 #include "ntuser.h"
+#include "wine/exception.h"
 
 #define MAX_ATOM_LEN  255
 
@@ -3054,15 +3055,278 @@ void test_NtUserGetPointerDeviceRects( const char *arg )
         wine_dbgstr_rect( &display ), wine_dbgstr_rect( &screen ) );
 }
 
+static HWND create_unicode_test_window( UNICODE_STRING *class_name, UNICODE_STRING *window_name )
+{
+    return NtUserCreateWindowEx( 0, class_name, NULL, window_name, WS_POPUP,
+                                 0, 0, 16, 16, NULL, NULL, NULL, NULL, 0, NULL, NULL, FALSE );
+}
+
+static void test_wow64_user_buffers(void)
+{
+    static const WCHAR staticW[] = L"static";
+    static const WCHAR titleW[] = L"wow64 user buffer test";
+    void *write_pages[8], *base;
+    UNICODE_STRING *class_name, *window_name;
+    WCHAR *class_buffer, *window_buffer;
+    ULONG_PTR write_count;
+    ULONG page_size;
+    SYSTEM_INFO si;
+    MEMORY_BASIC_INFORMATION mbi;
+    PAINTSTRUCT *paint;
+    DWORD old_protect, exception;
+    UINT peek_msg = WM_APP + 0x431, get_msg = WM_APP + 0x432;
+    MSG *msg, valid_msg;
+    HWND hwnd;
+    HDC hdc;
+    BOOL ret;
+    SIZE_T queried;
+
+    if (sizeof(void *) != 4) return;
+
+    GetSystemInfo( &si );
+    page_size = si.dwPageSize;
+    if (page_size != 0x1000)
+    {
+        skip( "expected 4K WoW64 pages, got %#lx\n", page_size );
+        return;
+    }
+
+    base = VirtualAlloc( NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                         PAGE_READWRITE );
+    if (!base)
+    {
+        win_skip( "MEM_WRITE_WATCH not supported\n" );
+        return;
+    }
+
+    class_name = (UNICODE_STRING *)((char *)base + page_size - sizeof(*class_name) / 2);
+    class_buffer = (WCHAR *)((char *)base + 2 * page_size);
+    window_name = (UNICODE_STRING *)((char *)base + 3 * page_size);
+    window_buffer = (WCHAR *)((char *)base + 4 * page_size);
+    msg = (MSG *)((char *)base + 5 * page_size);
+    paint = (PAINTSTRUCT *)((char *)base + 6 * page_size);
+
+    memcpy( class_buffer, staticW, sizeof(staticW) );
+    class_name->Buffer = class_buffer;
+    class_name->Length = sizeof(staticW) - sizeof(WCHAR);
+    class_name->MaximumLength = sizeof(staticW);
+    memcpy( window_buffer, titleW, sizeof(titleW) );
+    window_name->Buffer = window_buffer;
+    window_name->Length = sizeof(titleW) - sizeof(WCHAR);
+    window_name->MaximumLength = sizeof(titleW);
+
+    ret = VirtualProtect( (char *)base + page_size, page_size, PAGE_NOACCESS, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    exception = 0;
+    hwnd = NULL;
+    __TRY
+    {
+        hwnd = create_unicode_test_window( class_name, window_name );
+    }
+    __EXCEPT_ALL
+    {
+        exception = GetExceptionCode();
+    }
+    __ENDTRY
+    ok( exception == STATUS_ACCESS_VIOLATION,
+        "protected class descriptor raised %#lx\n", exception );
+    if (hwnd) DestroyWindow( hwnd );
+
+    ret = VirtualProtect( (char *)base + page_size, page_size, PAGE_READWRITE, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    ret = VirtualProtect( class_buffer, page_size, PAGE_NOACCESS, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    exception = 0;
+    hwnd = NULL;
+    __TRY
+    {
+        hwnd = create_unicode_test_window( class_name, window_name );
+    }
+    __EXCEPT_ALL
+    {
+        exception = GetExceptionCode();
+    }
+    __ENDTRY
+    ok( exception == STATUS_ACCESS_VIOLATION, "protected class string raised %#lx\n", exception );
+    if (hwnd) DestroyWindow( hwnd );
+
+    ret = VirtualProtect( class_buffer, page_size, PAGE_READWRITE | PAGE_GUARD, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    exception = 0;
+    hwnd = NULL;
+    __TRY
+    {
+        hwnd = create_unicode_test_window( class_name, window_name );
+    }
+    __EXCEPT_ALL
+    {
+        exception = GetExceptionCode();
+    }
+    __ENDTRY
+    ok( exception == STATUS_GUARD_PAGE_VIOLATION,
+        "guarded class string raised %#lx\n", exception );
+    if (hwnd) DestroyWindow( hwnd );
+    queried = VirtualQuery( class_buffer, &mbi, sizeof(mbi) );
+    ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+    ok( !(mbi.Protect & PAGE_GUARD), "class string guard was not cleared, protection %#lx\n",
+        mbi.Protect );
+
+    ret = VirtualProtect( class_buffer, page_size, PAGE_READONLY, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    ret = VirtualProtect( window_buffer, page_size, PAGE_READONLY, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    ret = ResetWriteWatch( base, 0x10000 );
+    ok( !ret, "ResetWriteWatch failed: %u\n", ret );
+    hwnd = create_unicode_test_window( class_name, window_name );
+    ok( !!hwnd, "failed to create window from read-only strings, error %lu\n", GetLastError() );
+    if (hwnd) DestroyWindow( hwnd );
+    write_count = ARRAY_SIZE(write_pages);
+    ret = GetWriteWatch( 0, base, 0x10000, write_pages, &write_count, &page_size );
+    ok( !ret, "GetWriteWatch failed: %u\n", ret );
+    ok( !write_count, "CreateWindow wrote %Iu input pages\n", write_count );
+
+    ret = VirtualProtect( class_buffer, page_size, PAGE_READWRITE, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    ret = VirtualProtect( window_buffer, page_size, PAGE_READWRITE, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+
+    PeekMessageW( &valid_msg, NULL, 0, 0, PM_NOREMOVE );
+    ret = PostThreadMessageW( GetCurrentThreadId(), peek_msg, 0x1234, 0x5678 );
+    ok( ret, "PostThreadMessage failed: %lu\n", GetLastError() );
+    ret = VirtualProtect( msg, page_size, PAGE_READONLY, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    exception = 0;
+    __TRY
+    {
+        NtUserPeekMessage( msg, NULL, peek_msg, peek_msg, PM_REMOVE );
+    }
+    __EXCEPT_ALL
+    {
+        exception = GetExceptionCode();
+    }
+    __ENDTRY
+    ok( exception == STATUS_ACCESS_VIOLATION, "read-only PeekMessage output raised %#lx\n",
+        exception );
+    ret = VirtualProtect( msg, page_size, PAGE_READWRITE, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    ret = NtUserPeekMessage( &valid_msg, NULL, peek_msg, peek_msg, PM_REMOVE );
+    ok( !ret, "failed PeekMessage publication did not consume the message\n" );
+
+    ret = PostThreadMessageW( GetCurrentThreadId(), get_msg, 0x9abc, 0xdef0 );
+    ok( ret, "PostThreadMessage failed: %lu\n", GetLastError() );
+    if (ret)
+    {
+        ret = VirtualProtect( msg, page_size, PAGE_READWRITE | PAGE_GUARD, &old_protect );
+        ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+        exception = 0;
+        __TRY
+        {
+            NtUserGetMessage( msg, NULL, get_msg, get_msg );
+        }
+        __EXCEPT_ALL
+        {
+            exception = GetExceptionCode();
+        }
+        __ENDTRY
+        ok( exception == STATUS_GUARD_PAGE_VIOLATION,
+            "guarded GetMessage output raised %#lx\n", exception );
+        queried = VirtualQuery( msg, &mbi, sizeof(mbi) );
+        ok( queried == sizeof(mbi), "VirtualQuery returned %Iu\n", queried );
+        ok( !(mbi.Protect & PAGE_GUARD), "message guard was not cleared, protection %#lx\n",
+            mbi.Protect );
+        ret = NtUserPeekMessage( &valid_msg, NULL, get_msg, get_msg, PM_REMOVE );
+        ok( !ret, "failed GetMessage publication did not consume the message\n" );
+    }
+
+    ret = VirtualProtect( msg, page_size, PAGE_READWRITE, &old_protect );
+    ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+    memset( msg, 0xcc, sizeof(*msg) );
+    ret = ResetWriteWatch( base, 0x10000 );
+    ok( !ret, "ResetWriteWatch failed: %u\n", ret );
+    ret = PostThreadMessageW( GetCurrentThreadId(), get_msg, 0x1357, 0x2468 );
+    ok( ret, "PostThreadMessage failed: %lu\n", GetLastError() );
+    if (ret)
+    {
+        ret = NtUserGetMessage( msg, NULL, get_msg, get_msg );
+        ok( ret, "NtUserGetMessage failed\n" );
+        ok( msg->message == get_msg && msg->wParam == 0x1357 && msg->lParam == 0x2468,
+            "got message %#x, wparam %#Ix, lparam %#Ix\n",
+            msg->message, msg->wParam, msg->lParam );
+        write_count = ARRAY_SIZE(write_pages);
+        ret = GetWriteWatch( 0, base, 0x10000, write_pages, &write_count, &page_size );
+        ok( !ret, "GetWriteWatch failed: %u\n", ret );
+        ok( write_count == 1, "GetMessage wrote %Iu pages\n", write_count );
+        if (write_count) ok( write_pages[0] == msg, "GetMessage wrote unexpected page %p\n",
+                             write_pages[0] );
+    }
+
+    hwnd = CreateWindowExW( 0, staticW, titleW, WS_POPUP, 0, 0, 16, 16,
+                            NULL, NULL, NULL, NULL );
+    ok( !!hwnd, "CreateWindowExW failed: %lu\n", GetLastError() );
+    if (hwnd)
+    {
+        InvalidateRect( hwnd, NULL, FALSE );
+        ret = VirtualProtect( paint, page_size, PAGE_READONLY, &old_protect );
+        ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+        exception = 0;
+        hdc = NULL;
+        __TRY
+        {
+            hdc = NtUserBeginPaint( hwnd, paint );
+        }
+        __EXCEPT_ALL
+        {
+            exception = GetExceptionCode();
+        }
+        __ENDTRY
+        ok( exception == STATUS_ACCESS_VIOLATION, "read-only BeginPaint output raised %#lx\n",
+            exception );
+        ret = VirtualProtect( paint, page_size, PAGE_READWRITE, &old_protect );
+        ok( ret, "VirtualProtect failed: %lu\n", GetLastError() );
+        if (!exception && hdc) NtUserEndPaint( hwnd, paint );
+        ok( !GetUpdateRect( hwnd, NULL, FALSE ), "failed BeginPaint publication left an update\n" );
+        DestroyWindow( hwnd );
+    }
+
+    hwnd = CreateWindowExW( 0, staticW, titleW, WS_POPUP, 0, 0, 16, 16,
+                            NULL, NULL, NULL, NULL );
+    ok( !!hwnd, "CreateWindowExW failed: %lu\n", GetLastError() );
+    if (hwnd)
+    {
+        InvalidateRect( hwnd, NULL, FALSE );
+        memset( paint, 0xcc, sizeof(*paint) );
+        ret = ResetWriteWatch( base, 0x10000 );
+        ok( !ret, "ResetWriteWatch failed: %u\n", ret );
+        hdc = NtUserBeginPaint( hwnd, paint );
+        ok( !!hdc, "NtUserBeginPaint failed\n" );
+        if (hdc) NtUserEndPaint( hwnd, paint );
+        write_count = ARRAY_SIZE(write_pages);
+        ret = GetWriteWatch( 0, base, 0x10000, write_pages, &write_count, &page_size );
+        ok( !ret, "GetWriteWatch failed: %u\n", ret );
+        ok( write_count == 1, "BeginPaint wrote %Iu pages\n", write_count );
+        if (write_count) ok( write_pages[0] == paint, "BeginPaint wrote unexpected page %p\n",
+                             write_pages[0] );
+        DestroyWindow( hwnd );
+    }
+
+    VirtualFree( base, 0, MEM_RELEASE );
+}
+
 START_TEST(win32u)
 {
     char **argv;
     int argc;
 
-    /* native win32u.dll fails if user32 is not loaded, so make sure it's fully initialized */
+    /* Native win32u.dll needs user32 fully initialized before the remaining tests. */
     GetDesktopWindow();
 
     argc = winetest_get_mainargs( &argv );
+    if (argc > 2 && !strcmp( argv[2], "wow64_user_buffers" ))
+    {
+        test_wow64_user_buffers();
+        return;
+    }
+
     if (argc > 3 && !strcmp( argv[2], "ipcmsg" ))
     {
         test_inter_process_child( LongToHandle( strtol( argv[3], NULL, 16 )));
@@ -3113,6 +3377,7 @@ START_TEST(win32u)
     test_NtUserQueryWindow();
     test_RegisterClipboardFormat();
     test_NtUserRegisterWindowMessage();
+    test_wow64_user_buffers();
 
     run_in_process( argv, "NtUserEnableMouseInPointer 0" );
     run_in_process( argv, "NtUserEnableMouseInPointer 1" );

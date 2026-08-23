@@ -174,6 +174,53 @@ static const struct object_ops context_ops =
     context_destroy,            /* destroy */
 };
 
+#define WINE_THREAD_CREATE_TRANSACTION 0x00000001u
+
+enum thread_startup_transaction_state
+{
+    THREAD_STARTUP_TRANSACTION_NONE,
+    THREAD_STARTUP_TRANSACTION_ACTIVE,
+    THREAD_STARTUP_TRANSACTION_COMMITTED,
+    THREAD_STARTUP_TRANSACTION_CANCELLED,
+};
+
+struct thread_startup_info
+{
+    struct object obj;
+    struct thread *thread;
+    unsigned int transaction;
+};
+
+static void thread_startup_info_dump( struct object *obj, int verbose );
+static int thread_startup_info_close_handle( struct object *obj, struct process *process,
+                                             obj_handle_t handle );
+static void thread_startup_info_destroy( struct object *obj );
+
+static const struct object_ops thread_startup_info_ops =
+{
+    sizeof(struct thread_startup_info), /* size */
+    &no_type,                           /* type */
+    thread_startup_info_dump,           /* dump */
+    NULL,                               /* add_queue */
+    NULL,                               /* remove_queue */
+    NULL,                               /* signaled */
+    NULL,                               /* satisfied */
+    no_signal,                          /* signal */
+    no_get_fd,                          /* get_fd */
+    default_get_sync,                   /* get_sync */
+    default_map_access,                 /* map_access */
+    default_get_sd,                     /* get_sd */
+    default_set_sd,                     /* set_sd */
+    no_get_full_name,                   /* get_full_name */
+    no_lookup_name,                     /* lookup_name */
+    no_link_name,                       /* link_name */
+    NULL,                               /* unlink_name */
+    no_open_file,                       /* open_file */
+    no_kernel_obj_list,                 /* get_kernel_obj_list */
+    thread_startup_info_close_handle,   /* close_handle */
+    thread_startup_info_destroy         /* destroy */
+};
+
 
 /* thread operations */
 
@@ -1879,6 +1926,66 @@ void kill_thread( struct thread *thread, int violent_death )
     release_object( thread );
 }
 
+static void cancel_thread_startup_transaction( struct thread_startup_info *info,
+                                               int status )
+{
+    if (info->transaction != THREAD_STARTUP_TRANSACTION_ACTIVE) return;
+    info->transaction = THREAD_STARTUP_TRANSACTION_CANCELLED;
+    if (info->thread->state != TERMINATED)
+    {
+        info->thread->exit_code = status ? status : STATUS_UNSUCCESSFUL;
+        kill_thread( info->thread, 1 );
+    }
+}
+
+static void thread_startup_info_dump( struct object *obj, int verbose )
+{
+    struct thread_startup_info *info = (struct thread_startup_info *)obj;
+
+    assert( obj->ops == &thread_startup_info_ops );
+    fprintf( stderr, "Thread startup info tid=%04x state=%u\n",
+             info->thread ? get_thread_id( info->thread ) : 0, info->transaction );
+}
+
+static int thread_startup_info_close_handle( struct object *obj, struct process *process,
+                                             obj_handle_t handle )
+{
+    struct thread_startup_info *info = (struct thread_startup_info *)obj;
+
+    (void)process;
+    (void)handle;
+    assert( obj->ops == &thread_startup_info_ops );
+    /* APC completion moves the private token between process handle tables by
+     * duplicating it before closing the source.  Only the last token close is
+     * a cancellation decision. */
+    if (obj->handle_count == 1)
+        cancel_thread_startup_transaction( info, STATUS_UNSUCCESSFUL );
+    return 1;
+}
+
+static void thread_startup_info_destroy( struct object *obj )
+{
+    struct thread_startup_info *info = (struct thread_startup_info *)obj;
+
+    assert( obj->ops == &thread_startup_info_ops );
+    cancel_thread_startup_transaction( info, STATUS_UNSUCCESSFUL );
+    if (info->thread) release_object( info->thread );
+}
+
+static obj_handle_t create_thread_startup_transaction( struct thread *thread )
+{
+    struct thread_startup_info *info;
+    obj_handle_t handle = 0;
+
+    if (!(info = alloc_object( &thread_startup_info_ops ))) return 0;
+    info->thread = (struct thread *)grab_object( thread );
+    info->transaction = THREAD_STARTUP_TRANSACTION_NONE;
+    handle = alloc_handle_no_access_check( current->process, info, 0, 0 );
+    if (handle) info->transaction = THREAD_STARTUP_TRANSACTION_ACTIVE;
+    release_object( info );
+    return handle;
+}
+
 /* copy parts of a context structure */
 static void copy_context( struct context_data *to, const struct context_data *from, unsigned int flags )
 {
@@ -1912,6 +2019,9 @@ DECL_HANDLER(new_thread)
     const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, NULL );
     int request_fd = thread_get_inflight_fd( current, req->request_fd );
 
+    reply->handle = 0;
+    reply->info = 0;
+
     if (!(process = get_process_from_handle( req->process, 0 )))
     {
         if (request_fd != -1) close( request_fd );
@@ -1944,26 +2054,83 @@ DECL_HANDLER(new_thread)
         set_error( STATUS_ACCESS_DENIED );
         goto done;
     }
+    if (req->wine_flags & ~WINE_THREAD_CREATE_TRANSACTION)
+    {
+        if (request_fd != -1) close( request_fd );
+        set_error( STATUS_INVALID_PARAMETER );
+        goto done;
+    }
 
     if ((thread = create_thread( request_fd, process, sd )))
     {
         thread->system_regs = current->system_regs;
         if (req->flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) thread->suspend++;
+        if (req->wine_flags & WINE_THREAD_CREATE_TRANSACTION) thread->suspend++;
         thread->is_system = req->is_system;
         thread->dbg_hidden = !!(req->flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
         thread->bypass_proc_suspend = !!(req->flags & THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE);
         add_process_thread( process, thread );
         reply->tid = get_thread_id( thread );
+        if ((req->wine_flags & WINE_THREAD_CREATE_TRANSACTION) &&
+            !(reply->info = create_thread_startup_transaction( thread )))
+        {
+            unsigned int error = get_error();
+
+            kill_thread( thread, 1 );
+            set_error( error );
+            goto done;
+        }
         if ((reply->handle = alloc_handle_no_access_check( current->process, thread,
                                                            req->access, objattr->attributes )))
         {
             /* thread object will be released when the thread gets killed */
             goto done;
         }
-        kill_thread( thread, 1 );
+        else
+        {
+            unsigned int error = get_error();
+
+            if (reply->info)
+            {
+                close_handle( current->process, reply->info );
+                reply->info = 0;
+            }
+            else kill_thread( thread, 1 );
+            set_error( error );
+        }
     }
 done:
     release_object( process );
+}
+
+DECL_HANDLER(complete_new_thread)
+{
+    struct thread_startup_info *info;
+
+    if (req->commit != 0 && req->commit != 1)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (!(info = (struct thread_startup_info *)get_handle_obj(
+              current->process, req->info, 0, &thread_startup_info_ops )))
+        return;
+
+    if (info->transaction == THREAD_STARTUP_TRANSACTION_ACTIVE)
+    {
+        if (req->commit)
+        {
+            info->transaction = THREAD_STARTUP_TRANSACTION_COMMITTED;
+            if (info->thread->state != TERMINATED) resume_thread( info->thread );
+        }
+        else cancel_thread_startup_transaction( info, req->status );
+    }
+    else if ((req->commit &&
+              info->transaction != THREAD_STARTUP_TRANSACTION_COMMITTED) ||
+             (!req->commit &&
+              info->transaction != THREAD_STARTUP_TRANSACTION_CANCELLED))
+        set_error( STATUS_INVALID_PARAMETER );
+    release_object( info );
 }
 
 static int init_thread( struct thread *thread, int reply_fd, int wait_fd )
@@ -2375,11 +2542,37 @@ DECL_HANDLER(select)
         apc->executed = 1;
         if (apc->result.type == APC_CREATE_THREAD)  /* transfer the handle to the caller process */
         {
-            obj_handle_t handle = duplicate_handle( current->process, apc->result.create_thread.handle,
-                                                    apc->caller->process, 0, 0, DUPLICATE_SAME_ACCESS );
-            close_handle( current->process, apc->result.create_thread.handle );
+            obj_handle_t source_handle = apc->result.create_thread.handle;
+            obj_handle_t source_info = apc->result.create_thread.info;
+            obj_handle_t handle = 0, info = 0;
+            unsigned int status = apc->result.create_thread.status;
+
+            if (!status && source_handle)
+            {
+                handle = duplicate_handle( current->process, source_handle,
+                                           apc->caller->process, 0, 0,
+                                           DUPLICATE_SAME_ACCESS );
+                if (!handle) status = get_error();
+            }
+            if (!status && source_info)
+            {
+                info = duplicate_handle( current->process, source_info,
+                                         apc->caller->process, 0, 0,
+                                         DUPLICATE_SAME_ACCESS );
+                if (!info) status = get_error();
+            }
+            if (source_handle) close_handle( current->process, source_handle );
+            if (source_info) close_handle( current->process, source_info );
+            if (status)
+            {
+                if (handle) close_handle( apc->caller->process, handle );
+                if (info) close_handle( apc->caller->process, info );
+                handle = info = 0;
+            }
+            apc->result.create_thread.status = status;
             apc->result.create_thread.handle = handle;
-            clear_error();  /* ignore errors from the above calls */
+            apc->result.create_thread.info = info;
+            clear_error();  /* transfer errors are carried in the APC result */
         }
         signal_sync( apc->sync );
         close_handle( current->process, req->prev_apc );

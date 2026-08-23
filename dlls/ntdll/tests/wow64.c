@@ -20,6 +20,7 @@
  */
 
 #include <stdarg.h>
+#include <limits.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -28,8 +29,15 @@
 #include "winternl.h"
 #include "winioctl.h"
 #include "winuser.h"
+#include "winreg.h"
 #include "ddk/wdm.h"
+#include "wine/exception.h"
+#include "wine/low_va.h"
+#include "wine/server.h"
 #include "wine/test.h"
+#include "wine/unixlib.h"
+#include "wine/wow64_user.h"
+#include "x18_dispatch_test.h"
 
 static NTSTATUS (WINAPI *pNtQuerySystemInformationEx)(SYSTEM_INFORMATION_CLASS,void*,ULONG,void*,ULONG,ULONG*);
 static NTSTATUS (WINAPI *pRtlGetNativeSystemInformation)(SYSTEM_INFORMATION_CLASS,void*,ULONG,ULONG*);
@@ -70,6 +78,527 @@ static void *code_mem;
 
 static BOOL is_win64 = sizeof(void *) > sizeof(int);
 static BOOL is_wow64;
+
+typedef NTSTATUS (WINAPI *unix_call_dispatcher_func)(unixlib_handle_t,
+                                                      unsigned int, void *);
+
+struct unixlib_dispatch_thread_params
+{
+    unix_call_dispatcher_func dispatcher;
+    unixlib_handle_t handle;
+    unsigned int code;
+    void *args;
+    NTSTATUS status;
+};
+
+static DWORD WINAPI unixlib_dispatch_thread( void *arg )
+{
+    struct unixlib_dispatch_thread_params *params = arg;
+
+    params->status = params->dispatcher( params->handle, params->code, params->args );
+    return 0;
+}
+
+static WCHAR *find_last_unixlib_path_separator( WCHAR *path )
+{
+    WCHAR *ret = NULL;
+
+    for (; *path; path++) if (*path == '/' || *path == '\\') ret = path;
+    return ret;
+}
+
+static NTSTATUS try_load_wow64_unixlib_lifecycle_helper(
+    WCHAR *path, BOOL *found, unixlib_module_t *module, unixlib_handle_t *handle )
+{
+    UNICODE_STRING name;
+    NTSTATUS status;
+    DWORD attrs;
+
+    if ((attrs = GetFileAttributesW( path )) == INVALID_FILE_ATTRIBUTES ||
+        (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return STATUS_DLL_NOT_FOUND;
+
+    *found = TRUE;
+    if ((status = RtlDosPathNameToNtPathName_U_WithStatus( path, &name, NULL, NULL )))
+        return status;
+    status = __wine_load_unix_lib( &name, module, handle );
+    RtlFreeUnicodeString( &name );
+    return status;
+}
+
+static NTSTATUS load_wow64_unixlib_lifecycle_helper(
+    WCHAR *path, SIZE_T count, BOOL *found, unixlib_module_t *module,
+    unixlib_handle_t *handle )
+{
+    static const WCHAR helper_name[] = L"ntdll-x18-test.so";
+    UNICODE_STRING name;
+    WCHAR *separator, *parent;
+    NTSTATUS status;
+    DWORD len;
+
+    *found = FALSE;
+    if (!(len = GetModuleFileNameW( NULL, path, count )) || len >= count)
+        return STATUS_BUFFER_TOO_SMALL;
+    if (!(separator = find_last_unixlib_path_separator( path )))
+        return STATUS_OBJECT_PATH_INVALID;
+    if (separator - path + ARRAY_SIZE(helper_name) >= count)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    separator[1] = 0;
+    lstrcatW( path, helper_name );
+    status = try_load_wow64_unixlib_lifecycle_helper( path, found, module, handle );
+    if (*found) return status;
+
+    *separator = 0;
+    if (!(parent = find_last_unixlib_path_separator( path ))) return STATUS_DLL_NOT_FOUND;
+    if (parent - path + ARRAY_SIZE(helper_name) >= count) return STATUS_BUFFER_TOO_SMALL;
+    parent[1] = 0;
+    lstrcatW( path, helper_name );
+    status = try_load_wow64_unixlib_lifecycle_helper( path, found, module, handle );
+    if (*found) return status;
+
+    RtlInitUnicodeString( &name, helper_name );
+    status = __wine_load_unix_lib( &name, module, handle );
+    if (!status)
+    {
+        lstrcpynW( path, helper_name, count );
+        *found = TRUE;
+    }
+    return status;
+}
+
+static void test_unixlib_dispatch_bounds(void)
+{
+    enum
+    {
+        unix_get_current_teb_test = 3,
+        ntdll_wow64_unix_call_count = 22,
+        dispatch_max_slots = 1025,
+    };
+    NTSTATUS (WINAPI **dispatcher_ptr)(unixlib_handle_t, unsigned int, void *);
+    NTSTATUS (WINAPI *dispatcher)(unixlib_handle_t, unsigned int, void *);
+    struct
+    {
+        void *teb;
+    } params = {0};
+    unixlib_handle_t *handle_ptr, handle;
+    ULONG translated = 0;
+    NTSTATUS status;
+    HMODULE ntdll;
+
+    ntdll = GetModuleHandleA( "ntdll.dll" );
+    handle_ptr = pRtlFindExportedRoutineByName( ntdll, "__wine_unixlib_handle" );
+    dispatcher_ptr = pRtlFindExportedRoutineByName( ntdll, "__wine_unix_call_dispatcher" );
+    if (!handle_ptr || !dispatcher_ptr || !*dispatcher_ptr)
+    {
+        skip( "ntdll Unix-call exports are unavailable\n" );
+        return;
+    }
+
+    status = NtQueryVirtualMemory( GetCurrentProcess(), NtCurrentTeb(),
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    if (status) translated = 0;
+
+    handle = *handle_ptr;
+    dispatcher = *dispatcher_ptr;
+    if (translated)
+    {
+        ok( !!(handle & WINE_UNIXLIB_DISPATCH_HANDLE_TAG),
+            "expected a tagged WoW64 Unix-call handle, got %s\n", wine_dbgstr_longlong(handle) );
+
+        status = dispatcher( handle, unix_get_current_teb_test, &params );
+        ok( status == STATUS_SUCCESS, "valid dispatch returned %#lx\n", status );
+        ok( params.teb == NtCurrentTeb(), "TEB %p, expected %p\n", params.teb, NtCurrentTeb() );
+
+        status = dispatcher( handle, ntdll_wow64_unix_call_count, &params );
+        ok( status == STATUS_INVALID_PARAMETER, "code==count returned %#lx\n", status );
+        status = dispatcher( WINE_UNIXLIB_DISPATCH_HANDLE_TAG, unix_get_current_teb_test, &params );
+        ok( status == STATUS_INVALID_PARAMETER, "zero tagged payload returned %#lx\n", status );
+        status = dispatcher( WINE_UNIXLIB_DISPATCH_HANDLE_TAG | dispatch_max_slots,
+                             unix_get_current_teb_test, &params );
+        ok( status == STATUS_INVALID_PARAMETER, "empty tagged slot returned %#lx\n", status );
+        status = dispatcher( WINE_UNIXLIB_DISPATCH_HANDLE_TAG | (dispatch_max_slots + 1),
+                             unix_get_current_teb_test, &params );
+        ok( status == STATUS_INVALID_PARAMETER, "out-of-range tagged slot returned %#lx\n", status );
+    }
+    else
+    {
+        ok( !(handle & WINE_UNIXLIB_DISPATCH_HANDLE_TAG),
+            "trusted native Unix-call handle is unexpectedly tagged: %s\n",
+            wine_dbgstr_longlong(handle) );
+        status = dispatcher( handle, unix_get_current_teb_test, &params );
+        ok( status == STATUS_SUCCESS, "native raw dispatch returned %#lx\n", status );
+        ok( params.teb != NULL, "native raw dispatch returned no TEB\n" );
+    }
+}
+
+static void test_unixlib_dispatch_lifecycle(void)
+{
+    static const SIZE_T result_lengths[] = {0, 1, 7, 8, 9, 15, 16, 17};
+    unix_call_dispatcher_func *dispatcher_ptr, dispatcher;
+    struct wow64_unixlib_context_params context_params;
+    struct wow64_unixlib_context_result context_result;
+    struct wow64_unixlib_checked_fault_params fault_params;
+    struct wow64_unixlib_checked_fault_result fault_result = {0};
+    struct wow64_unixlib_block_params block_params;
+    struct wow64_unixlib_block_state block_state;
+    struct wow64_unixlib_self_unload_params unload_params;
+    struct unixlib_dispatch_thread_params thread_params;
+    unixlib_handle_t handle, stale_handle;
+    unixlib_module_t module;
+    ULONG translated = 0;
+    WCHAR helper_path[MAX_PATH];
+    HMODULE ntdll;
+    HANDLE thread;
+    NTSTATUS status;
+    void *noaccess;
+    BOOL found;
+    UINT i;
+
+    status = NtQueryVirtualMemory( GetCurrentProcess(), NtCurrentTeb(),
+                                   MemoryWineWow64TranslatedInformation,
+                                   &translated, sizeof(translated), NULL );
+    if (status || !translated) return;
+
+    ntdll = GetModuleHandleA( "ntdll.dll" );
+    dispatcher_ptr = pRtlFindExportedRoutineByName( ntdll, "__wine_unix_call_dispatcher" );
+    if (!dispatcher_ptr || !(dispatcher = *dispatcher_ptr))
+    {
+        skip( "the Wine Unix-call dispatcher is unavailable\n" );
+        return;
+    }
+
+    status = load_wow64_unixlib_lifecycle_helper(
+        helper_path, ARRAY_SIZE(helper_path), &found, &module, &handle );
+    if (!found)
+    {
+        skip( "the WoW64 Unixlib lifecycle helper is unavailable\n" );
+        return;
+    }
+    ok( !status, "failed to load %s, status %#lx\n",
+        wine_dbgstr_w(helper_path), status );
+    if (status) return;
+    ok( wine_unixlib_decode_dispatch_handle( handle, NULL, NULL ),
+        "expected generation-tagged handle, got %s\n", wine_dbgstr_longlong(handle) );
+
+    status = __wine_unload_unix_lib( 0 );
+    ok( status == STATUS_INVALID_HANDLE, "zero token unload returned %#lx\n", status );
+    status = __wine_unload_unix_lib( 0x4000000000001234ull );
+    ok( status == STATUS_INVALID_HANDLE, "unknown token unload returned %#lx\n", status );
+
+    status = dispatcher( handle, wow64_unixlib_lifecycle_zero_args, NULL );
+    ok( !status, "zero-argument dispatch returned %#lx\n", status );
+    status = dispatcher( handle, wow64_unixlib_lifecycle_zero_args, &context_params );
+    ok( !status, "zero-argument non-NULL dispatch returned %#lx\n", status );
+
+    memset( &context_result, 0, sizeof(context_result) );
+    context_params.result = PtrToUlong( &context_result );
+    context_params.value = 0x12345678;
+    status = dispatcher( handle, wow64_unixlib_lifecycle_context, &context_params );
+    ok( !status, "context dispatch returned %#lx\n", status );
+    ok( context_result.guest_args == PtrToUlong(&context_params),
+        "context guest args %#x, expected %#lx\n", context_result.guest_args,
+        PtrToUlong(&context_params) );
+    ok( context_result.args_size == sizeof(context_params),
+        "context args size %u, expected %Iu\n", context_result.args_size,
+        sizeof(context_params) );
+    ok( context_result.flags == (WINE_UNIXLIB_DISPATCH_ENTRY_REVIEWED |
+                                 WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT),
+        "context flags %#x\n", context_result.flags );
+    ok( context_result.value == context_params.value, "context value %#x\n",
+        context_result.value );
+
+    noaccess = VirtualAlloc( NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS );
+    fault_params.noaccess = PtrToUlong( noaccess );
+    fault_params.result = PtrToUlong( &fault_result );
+    ok( !!fault_params.noaccess, "failed to allocate no-access page, error %lu\n",
+        GetLastError() );
+    if (fault_params.noaccess)
+    {
+        memset( &fault_result, 0, sizeof(fault_result) );
+        status = dispatcher( handle, wow64_unixlib_lifecycle_checked_fault,
+                             &fault_params );
+        ok( !status, "checked-fault dispatch returned %#lx\n", status );
+        ok( fault_result.fault_status == STATUS_ACCESS_VIOLATION,
+            "nested checked copy returned %#lx\n", fault_result.fault_status );
+        ok( fault_result.guest_args_before == PtrToUlong(&fault_params) &&
+            fault_result.guest_args_after == PtrToUlong(&fault_params),
+            "nested context args %#x/%#x, expected %#lx\n",
+            fault_result.guest_args_before, fault_result.guest_args_after,
+            PtrToUlong(&fault_params) );
+        ok( fault_result.context_preserved,
+            "nested checked-copy longjmp discarded the outer context\n" );
+        VirtualFree( noaccess, 0, MEM_RELEASE );
+    }
+
+    status = dispatcher( handle, wow64_unixlib_lifecycle_illegal_instruction, NULL );
+    ok( status == STATUS_ILLEGAL_INSTRUCTION,
+        "illegal-instruction dispatch returned %#lx\n", status );
+    memset( &context_result, 0, sizeof(context_result) );
+    status = dispatcher( handle, wow64_unixlib_lifecycle_context, &context_params );
+    ok( !status && context_result.guest_args == PtrToUlong(&context_params),
+        "post-signal context dispatch returned %#lx args %#x\n",
+        status, context_result.guest_args );
+
+    stale_handle = handle;
+    status = __wine_unload_unix_lib( module );
+    ok( !status, "initial unload returned %#lx\n", status );
+    status = __wine_unload_unix_lib( module );
+    ok( status == STATUS_INVALID_HANDLE, "replayed unload returned %#lx\n", status );
+    status = dispatcher( stale_handle, wow64_unixlib_lifecycle_zero_args, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "stale dispatch returned %#lx\n", status );
+
+    status = load_wow64_unixlib_lifecycle_helper(
+        helper_path, ARRAY_SIZE(helper_path), &found, &module, &handle );
+    ok( found && !status, "reload returned %#lx, found %u\n", status, found );
+    if (status || !found) return;
+    ok( handle != stale_handle, "reload reused stale handle %s\n",
+        wine_dbgstr_longlong(handle) );
+
+    memset( &block_state, 0, sizeof(block_state) );
+    block_params.state = PtrToUlong( &block_state );
+    block_params.reserved = 0;
+    thread_params.dispatcher = dispatcher;
+    thread_params.handle = handle;
+    thread_params.code = wow64_unixlib_lifecycle_block;
+    thread_params.args = &block_params;
+    thread_params.status = STATUS_PENDING;
+    thread = CreateThread( NULL, 0, unixlib_dispatch_thread, &thread_params, 0, NULL );
+    ok( !!thread, "failed to create dispatch thread, error %lu\n", GetLastError() );
+    if (thread)
+    {
+        for (i = 0; i < 5000 &&
+             !InterlockedCompareExchange( &block_state.entered, 0, 0 ); i++) Sleep(1);
+        ok( InterlockedCompareExchange( &block_state.entered, 0, 0 ) == 1,
+            "blocking dispatch did not enter\n" );
+        stale_handle = handle;
+        status = __wine_unload_unix_lib( module );
+        ok( !status, "active unload returned %#lx\n", status );
+        InterlockedExchange( &block_state.release, 1 );
+        ok( WaitForSingleObject( thread, 5000 ) == WAIT_OBJECT_0,
+            "blocking dispatch did not complete\n" );
+        ok( !thread_params.status, "blocking dispatch returned %#lx\n",
+            thread_params.status );
+        ok( block_state.exited == 1, "blocking dispatch did not publish exit\n" );
+        CloseHandle( thread );
+        status = dispatcher( stale_handle, wow64_unixlib_lifecycle_zero_args, NULL );
+        ok( status == STATUS_INVALID_PARAMETER,
+            "post-drain stale dispatch returned %#lx\n", status );
+    }
+    else
+    {
+        status = __wine_unload_unix_lib( module );
+        ok( !status, "fallback unload returned %#lx\n", status );
+    }
+
+    status = load_wow64_unixlib_lifecycle_helper(
+        helper_path, ARRAY_SIZE(helper_path), &found, &module, &handle );
+    ok( found && !status, "self-unload reload returned %#lx, found %u\n", status, found );
+    if (!status && found)
+    {
+        unload_params.module = module;
+        stale_handle = handle;
+        status = dispatcher( handle, wow64_unixlib_lifecycle_self_unload, &unload_params );
+        ok( !status, "self-unload dispatch returned %#lx\n", status );
+        status = __wine_unload_unix_lib( module );
+        ok( status == STATUS_INVALID_HANDLE,
+            "post-self-unload replay returned %#lx\n", status );
+        status = dispatcher( stale_handle, wow64_unixlib_lifecycle_zero_args, NULL );
+        ok( status == STATUS_INVALID_PARAMETER,
+            "self-unloaded stale dispatch returned %#lx\n", status );
+    }
+
+    {
+        UNICODE_STRING name;
+        UINT64 result[3];
+
+        if (!(status = RtlDosPathNameToNtPathName_U_WithStatus(
+                  helper_path, &name, NULL, NULL )))
+        {
+            for (i = 0; i < ARRAY_SIZE(result_lengths); i++)
+            {
+                memset( result, 0x55, sizeof(result) );
+                status = NtQueryVirtualMemory( GetCurrentProcess(), &name,
+                                               MemoryWineLoadUnixLibByName,
+                                               result, result_lengths[i], NULL );
+                if (result_lengths[i] == 8 || result_lengths[i] == 16)
+                {
+                    ok( !status, "result length %Iu returned %#lx\n",
+                        result_lengths[i], status );
+                    if (!status)
+                    {
+                        unixlib_module_t token = result[0];
+                        NTSTATUS unload_status = __wine_unload_unix_lib( token );
+
+                        ok( !unload_status, "length %Iu unload returned %#lx\n",
+                            result_lengths[i], unload_status );
+                    }
+                }
+                else
+                    ok( status == STATUS_INFO_LENGTH_MISMATCH,
+                        "result length %Iu returned %#lx\n", result_lengths[i], status );
+            }
+
+            {
+                unixlib_handle_t published_handle;
+                unixlib_module_t published_module;
+                DWORD old_protect;
+                UINT64 *readonly_result;
+
+                readonly_result = VirtualAlloc( NULL, 0x1000, MEM_RESERVE | MEM_COMMIT,
+                                                PAGE_READWRITE );
+                ok( !!readonly_result, "failed to allocate protected result page, error %lu\n",
+                    GetLastError() );
+                if (readonly_result)
+                {
+                    readonly_result[0] = 0x1111111111111111ull;
+                    readonly_result[1] = 0x2222222222222222ull;
+                    ok( VirtualProtect( readonly_result, 0x1000, PAGE_READONLY,
+                                        &old_protect ),
+                        "failed to protect result page, error %lu\n", GetLastError() );
+                    status = NtQueryVirtualMemory( GetCurrentProcess(), &name,
+                                                   MemoryWineLoadUnixLibByName,
+                                                   readonly_result, 16, NULL );
+                    ok( status == STATUS_ACCESS_VIOLATION,
+                        "read-only result returned %#lx\n", status );
+                    ok( readonly_result[0] == 0x1111111111111111ull &&
+                        readonly_result[1] == 0x2222222222222222ull,
+                        "read-only result was modified: %s/%s\n",
+                        wine_dbgstr_longlong(readonly_result[0]),
+                        wine_dbgstr_longlong(readonly_result[1]) );
+                    ok( VirtualProtect( readonly_result, 0x1000, old_protect,
+                                        &old_protect ),
+                        "failed to restore result page, error %lu\n", GetLastError() );
+
+                    status = NtQueryVirtualMemory( GetCurrentProcess(), &name,
+                                                   MemoryWineLoadUnixLibByName,
+                                                   readonly_result, 16, NULL );
+                    ok( !status, "valid retry returned %#lx\n", status );
+                    if (!status)
+                    {
+                        published_module = readonly_result[0];
+                        published_handle = readonly_result[1];
+                        status = __wine_unload_unix_lib( published_module );
+                        ok( !status, "valid retry unload returned %#lx\n", status );
+                        status = dispatcher( published_handle,
+                                             wow64_unixlib_lifecycle_zero_args, NULL );
+                        ok( status == STATUS_INVALID_PARAMETER,
+                            "post-retry stale dispatch returned %#lx\n", status );
+                    }
+                    VirtualFree( readonly_result, 0, MEM_RELEASE );
+                }
+            }
+
+            {
+                unixlib_handle_t reused_handle = 0;
+                const UINT iterations = WINE_UNIXLIB_DISPATCH_MAX_SLOTS + 32;
+
+                for (i = 0; i < iterations; i++)
+                {
+                    status = NtQueryVirtualMemory( GetCurrentProcess(), &name,
+                                                   MemoryWineLoadUnixLibByName,
+                                                   result, 16, NULL );
+                    if (status)
+                    {
+                        ok( 0, "sequential load %u returned %#lx\n", i, status );
+                        break;
+                    }
+                    reused_handle = result[1];
+                    status = __wine_unload_unix_lib( result[0] );
+                    if (status)
+                    {
+                        ok( 0, "sequential unload %u returned %#lx\n", i, status );
+                        break;
+                    }
+                    status = dispatcher( reused_handle,
+                                         wow64_unixlib_lifecycle_zero_args, NULL );
+                    if (status != STATUS_INVALID_PARAMETER)
+                    {
+                        ok( 0, "sequential stale dispatch %u returned %#lx\n", i, status );
+                        break;
+                    }
+                }
+                ok( i == iterations, "completed only %u/%u sequential load cycles\n",
+                    i, iterations );
+            }
+            RtlFreeUnicodeString( &name );
+        }
+        else ok( 0, "failed to convert helper path, status %#lx\n", status );
+    }
+}
+
+static void test_unixlib_zero_args_requires_wow64_model(void)
+{
+#ifdef __aarch64__
+    unix_call_dispatcher_func *dispatcher_ptr, dispatcher;
+    struct wow64_unixlib_zero_count_result count = {0};
+    unixlib_handle_t native_handle, tagged_handle;
+    unixlib_module_t native_module, tagged_module;
+    UINT64 result[2];
+    UNICODE_STRING name;
+    WCHAR helper_path[MAX_PATH];
+    HMODULE ntdll;
+    NTSTATUS status;
+    BOOL found;
+
+    if (is_wow64) return;
+    status = load_wow64_unixlib_lifecycle_helper(
+        helper_path, ARRAY_SIZE(helper_path), &found, &native_module, &native_handle );
+    if (!found)
+    {
+        skip( "the native Unixlib lifecycle helper is unavailable\n" );
+        return;
+    }
+    ok( !status, "failed to load native helper %s, status %#lx\n",
+        wine_dbgstr_w(helper_path), status );
+    if (status) return;
+
+    ntdll = GetModuleHandleA( "ntdll.dll" );
+    dispatcher_ptr = pRtlFindExportedRoutineByName( ntdll, "__wine_unix_call_dispatcher" );
+    if (!dispatcher_ptr || !(dispatcher = *dispatcher_ptr))
+    {
+        skip( "the Wine Unix-call dispatcher is unavailable\n" );
+        __wine_unload_unix_lib( native_module );
+        return;
+    }
+    status = RtlDosPathNameToNtPathName_U_WithStatus( helper_path, &name, NULL, NULL );
+    ok( !status, "failed to convert helper path, status %#lx\n", status );
+    if (status)
+    {
+        __wine_unload_unix_lib( native_module );
+        return;
+    }
+    status = NtQueryVirtualMemory( GetCurrentProcess(), &name,
+                                   MemoryWineLoadUnixLibByNameWow64,
+                                   result, sizeof(result), NULL );
+    RtlFreeUnicodeString( &name );
+    ok( !status, "failed to load tagged helper, status %#lx\n", status );
+    if (status)
+    {
+        __wine_unload_unix_lib( native_module );
+        return;
+    }
+    tagged_module = result[0];
+    tagged_handle = result[1];
+    ok( wine_unixlib_decode_dispatch_handle( tagged_handle, NULL, NULL ),
+        "expected generation-tagged handle, got %s\n",
+        wine_dbgstr_longlong(tagged_handle) );
+
+    status = dispatcher( tagged_handle, wow64_unixlib_lifecycle_zero_args, NULL );
+    ok( status == STATUS_INVALID_PARAMETER,
+        "zero-argument dispatch without a paired WoW64 model returned %#lx\n", status );
+    status = dispatcher( native_handle, x18_dispatch_get_zero_count, &count );
+    ok( !status, "native zero-count dispatch returned %#lx\n", status );
+    ok( !count.count, "zero-argument side effect ran %ld times without a WoW64 model\n",
+        count.count );
+
+    status = __wine_unload_unix_lib( tagged_module );
+    ok( !status, "tagged helper unload returned %#lx\n", status );
+    status = __wine_unload_unix_lib( native_module );
+    ok( !status, "native helper unload returned %#lx\n", status );
+#endif
+}
 
 #ifdef __i386__
 static USHORT current_machine = IMAGE_FILE_MACHINE_I386;
@@ -216,6 +745,1013 @@ static BOOL create_process_machine( char *cmdline, DWORD flags, USHORT machine, 
     DeleteProcThreadAttributeList( list );
     free( list );
     return ret;
+}
+
+#ifndef _WIN64
+
+static BOOL read_shadow_shared_data( HANDLE process, BYTE *value )
+{
+    ULONG64 size = 0;
+    NTSTATUS status;
+
+    status = pNtWow64ReadVirtualMemory64( process,
+                                         WINE_LOW_VA_SHADOW_BASE + WINE_USER_SHARED_DATA_ADDRESS,
+                                         value, sizeof(*value), &size );
+    return !status && size == sizeof(*value);
+}
+
+static void check_remote_memory_minimal_rights( HANDLE process, void *address )
+{
+    static const BYTE value = 0xa5;
+    HANDLE limited;
+    SIZE_T size;
+    void *base;
+    ULONG old_protect;
+    BYTE result = 0;
+    NTSTATUS status;
+    DWORD pid = GetProcessId( process );
+
+    limited = OpenProcess( PROCESS_VM_READ, FALSE, pid );
+    ok( !!limited, "OpenProcess(PROCESS_VM_READ) failed %lu\n", GetLastError() );
+    if (limited)
+    {
+        size = 0;
+        status = NtReadVirtualMemory( limited, address, &result, sizeof(result), &size );
+        ok( !status && size == sizeof(result),
+            "minimal-rights NtReadVirtualMemory failed %#lx, size %Iu\n", status, size );
+        CloseHandle( limited );
+    }
+
+    limited = OpenProcess( PROCESS_VM_WRITE, FALSE, pid );
+    ok( !!limited, "OpenProcess(PROCESS_VM_WRITE) failed %lu\n", GetLastError() );
+    if (limited)
+    {
+        size = 0;
+        status = NtWriteVirtualMemory( limited, address, &value, sizeof(value), &size );
+        ok( !status && size == sizeof(value),
+            "minimal-rights NtWriteVirtualMemory failed %#lx, size %Iu\n", status, size );
+        CloseHandle( limited );
+    }
+    result = 0;
+    size = 0;
+    status = NtReadVirtualMemory( process, address, &result, sizeof(result), &size );
+    ok( !status && size == sizeof(result) && result == value,
+        "read after minimal-rights write failed %#lx, size %Iu, value %#x\n",
+        status, size, result );
+
+    limited = OpenProcess( PROCESS_VM_OPERATION, FALSE, pid );
+    ok( !!limited, "OpenProcess(PROCESS_VM_OPERATION) failed %lu\n", GetLastError() );
+    if (limited)
+    {
+        base = address;
+        size = 1;
+        status = NtProtectVirtualMemory( limited, &base, &size, PAGE_READONLY, &old_protect );
+        ok( !status, "minimal-rights NtProtectVirtualMemory failed %#lx\n", status );
+        if (!status)
+        {
+            base = address;
+            size = 1;
+            status = NtProtectVirtualMemory( limited, &base, &size, old_protect, &old_protect );
+            ok( !status, "minimal-rights NtProtectVirtualMemory restore failed %#lx\n", status );
+        }
+        CloseHandle( limited );
+    }
+
+    limited = OpenProcess( SYNCHRONIZE, FALSE, pid );
+    ok( !!limited, "OpenProcess(SYNCHRONIZE) failed %lu\n", GetLastError() );
+    if (limited)
+    {
+        status = NtReadVirtualMemory( limited, address, &result, sizeof(result), &size );
+        ok( status == STATUS_ACCESS_DENIED, "no-VM-rights read returned %#lx\n", status );
+        CloseHandle( limited );
+    }
+
+    status = NtReadVirtualMemory( (HANDLE)(ULONG_PTR)0xdeadbeef, address,
+                                  &result, sizeof(result), &size );
+    ok( status == STATUS_INVALID_HANDLE, "invalid-handle read returned %#lx\n", status );
+}
+
+static void check_remote_memory_region( HANDLE process, BOOL check_minimal_rights )
+{
+    static const BYTE value = 0x5a;
+    MEMORY_BASIC_INFORMATION info;
+    LARGE_INTEGER section_size;
+    SIZE_T size, ret_size = 0;
+    void *address;
+    HANDLE section;
+    ULONG old_protect;
+    BYTE result = 0;
+    NTSTATUS status;
+
+    address = NULL;
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( process, &address, 0, &size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "NtAllocateVirtualMemory failed %#lx\n", status );
+    if (!status)
+    {
+        status = NtWriteVirtualMemory( process, address, &value, sizeof(value), &ret_size );
+        ok( !status && ret_size == sizeof(value), "NtWriteVirtualMemory failed %#lx, size %Iu\n",
+            status, ret_size );
+        status = NtReadVirtualMemory( process, address, &result, sizeof(result), &ret_size );
+        ok( !status && ret_size == sizeof(result), "NtReadVirtualMemory failed %#lx, size %Iu\n",
+            status, ret_size );
+        ok( result == value, "read %#x, expected %#x\n", result, value );
+
+        if (check_minimal_rights) check_remote_memory_minimal_rights( process, address );
+
+        status = NtQueryVirtualMemory( process, address, MemoryBasicInformation,
+                                       &info, sizeof(info), &ret_size );
+        ok( !status, "NtQueryVirtualMemory failed %#lx\n", status );
+        if (!status)
+        {
+            ok( info.BaseAddress == address, "got base %p, expected %p\n",
+                info.BaseAddress, address );
+            ok( info.State == MEM_COMMIT, "got state %#lx\n", info.State );
+        }
+
+        size = 1;
+        status = NtProtectVirtualMemory( process, &address, &size, PAGE_READONLY, &old_protect );
+        ok( !status, "NtProtectVirtualMemory failed %#lx\n", status );
+
+        size = 0;
+        status = NtFreeVirtualMemory( process, &address, &size, MEM_RELEASE );
+        ok( !status, "NtFreeVirtualMemory failed %#lx\n", status );
+    }
+
+    section_size.QuadPart = 0x10000;
+    status = NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &section_size,
+                              PAGE_READWRITE, SEC_COMMIT, NULL );
+    ok( !status, "NtCreateSection failed %#lx\n", status );
+    if (status) return;
+
+    address = NULL;
+    size = 0;
+    status = NtMapViewOfSection( section, process, &address, 0, 0, NULL, &size,
+                                 ViewUnmap, 0, PAGE_READWRITE );
+    ok( !status, "NtMapViewOfSection failed %#lx\n", status );
+    if (!status)
+    {
+        status = NtQueryVirtualMemory( process, address, MemoryBasicInformation,
+                                       &info, sizeof(info), &ret_size );
+        ok( !status, "NtQueryVirtualMemory failed %#lx\n", status );
+        if (!status) ok( info.State == MEM_COMMIT, "got state %#lx\n", info.State );
+        status = NtUnmapViewOfSection( process, address );
+        ok( !status, "NtUnmapViewOfSection failed %#lx\n", status );
+    }
+    NtClose( section );
+}
+
+static void check_native_low_address_is_raw( HANDLE process )
+{
+    const void *low_address = (void *)(ULONG_PTR)WINE_USER_SHARED_DATA_ADDRESS;
+    MEMORY_BASIC_INFORMATION info;
+    BYTE before, after;
+    SIZE_T size, ret_size;
+    void *address;
+    ULONG old_protect;
+    NTSTATUS status;
+
+    if (!read_shadow_shared_data( process, &before ))
+    {
+        skip( "native target has no readable shadow shared-data mapping\n" );
+        return;
+    }
+
+    status = NtQueryVirtualMemory( process, low_address, MemoryBasicInformation,
+                                   &info, sizeof(info), &ret_size );
+    ok( !status, "NtQueryVirtualMemory failed %#lx\n", status );
+    if (!status) ok( info.State != MEM_COMMIT, "raw low address unexpectedly resolved to a mapping\n" );
+
+    status = NtReadVirtualMemory( process, low_address, &after, sizeof(after), &ret_size );
+    ok( status != STATUS_SUCCESS, "raw low NtReadVirtualMemory reached the shadow mapping\n" );
+
+    status = NtWriteVirtualMemory( process, (void *)low_address, &before, sizeof(before), &ret_size );
+    ok( status != STATUS_SUCCESS, "raw low NtWriteVirtualMemory reached the shadow mapping\n" );
+    ok( read_shadow_shared_data( process, &after ) && after == before,
+        "shadow shared data changed after raw low write\n" );
+
+    address = (void *)low_address;
+    size = 1;
+    status = NtProtectVirtualMemory( process, &address, &size, PAGE_READONLY, &old_protect );
+    ok( status != STATUS_SUCCESS, "raw low NtProtectVirtualMemory reached the shadow mapping\n" );
+    ok( read_shadow_shared_data( process, &after ) && after == before,
+        "shadow shared data became unreadable after raw low protect\n" );
+
+    address = (void *)low_address;
+    size = 0;
+    status = NtFreeVirtualMemory( process, &address, &size, MEM_RELEASE );
+    ok( status != STATUS_SUCCESS, "raw low NtFreeVirtualMemory reached the shadow mapping\n" );
+    ok( read_shadow_shared_data( process, &after ) && after == before,
+        "shadow shared data became unreadable after raw low free\n" );
+
+    status = NtUnmapViewOfSection( process, (void *)low_address );
+    ok( status != STATUS_SUCCESS, "raw low NtUnmapViewOfSection reached the shadow mapping\n" );
+    ok( read_shadow_shared_data( process, &after ) && after == before,
+        "shadow shared data became unreadable after raw low unmap\n" );
+}
+
+static void test_remote_memory_address_codec(void)
+{
+    char native_cmd[] = "C:\\windows\\sysnative\\cmd.exe /c ping -n 30 127.0.0.1 >nul";
+    char wow64_cmd[] = "C:\\windows\\syswow64\\cmd.exe /c ping -n 30 127.0.0.1 >nul";
+    char image_path[MAX_PATH], cmdline[MAX_PATH + 3];
+    STARTUPINFOA startup = { sizeof(startup) };
+    PROCESS_INFORMATION pi;
+    WINE_PROCESS_VM_INFORMATION vm_info;
+    USHORT process_machine = 0xffff, target_native_machine = 0xffff;
+    DWORD len;
+    BYTE value;
+    BOOL ret;
+    NTSTATUS status;
+
+    if (current_machine != IMAGE_FILE_MACHINE_I386 ||
+        native_machine != IMAGE_FILE_MACHINE_ARM64 ||
+        !pRtlWow64GetProcessMachines ||
+        !pNtWow64ReadVirtualMemory64 ||
+        !read_shadow_shared_data( GetCurrentProcess(), &value ))
+        return;
+
+    len = GetModuleFileNameA( NULL, image_path, ARRAY_SIZE(image_path) );
+    ok( len && len < ARRAY_SIZE(image_path), "GetModuleFileNameA failed %lu\n", GetLastError() );
+    if (len && len < ARRAY_SIZE(image_path))
+    {
+        sprintf( cmdline, "\"%s\"", image_path );
+        ret = CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, CREATE_SUSPENDED,
+                              NULL, NULL, &startup, &pi );
+        ok( ret, "CreateProcessA with a non-redirected image name failed %lu\n", GetLastError() );
+        if (ret)
+        {
+            TerminateProcess( pi.hProcess, 0 );
+            CloseHandle( pi.hProcess );
+            CloseHandle( pi.hThread );
+        }
+    }
+
+    if (create_process_machine( wow64_cmd, 0, IMAGE_FILE_MACHINE_I386, &pi ))
+    {
+        winetest_push_context( "i386 target" );
+        memset( &vm_info, 0, sizeof(vm_info) );
+        status = NtQueryVirtualMemory( pi.hProcess, NULL,
+                                       MemoryWineProcessVmMachineInformation,
+                                       &vm_info, sizeof(vm_info), NULL );
+        ok( !status, "VM metadata query failed %#lx\n", status );
+        ok( vm_info.Version == WINE_PROCESS_VM_INFORMATION_VERSION,
+            "got version %lu\n", vm_info.Version );
+        ok( vm_info.Size == sizeof(vm_info), "got size %lu\n", vm_info.Size );
+        ok( vm_info.Machine == IMAGE_FILE_MACHINE_I386, "got machine %#x\n", vm_info.Machine );
+        ok( vm_info.Flags == WINE_PROCESS_VM_FLAG_WOW64_TRANSLATED,
+            "got flags %#x\n", vm_info.Flags );
+        ok( !vm_info.Reserved, "got reserved %#lx\n", vm_info.Reserved );
+        status = pRtlWow64GetProcessMachines( pi.hProcess, &process_machine,
+                                              &target_native_machine );
+        ok( !status, "RtlWow64GetProcessMachines failed %#lx\n", status );
+        ok( process_machine == IMAGE_FILE_MACHINE_I386, "got process machine %#x\n",
+            process_machine );
+        ok( target_native_machine == IMAGE_FILE_MACHINE_ARM64, "got native machine %#x\n",
+            target_native_machine );
+        if (!status && process_machine == IMAGE_FILE_MACHINE_I386)
+            check_remote_memory_region( pi.hProcess, TRUE );
+        TerminateProcess( pi.hProcess, 0 );
+        CloseHandle( pi.hProcess );
+        CloseHandle( pi.hThread );
+        winetest_pop_context();
+    }
+    else win_skip( "could not start i386 target: %lu\n", GetLastError() );
+
+    if (create_process_machine( native_cmd, 0, IMAGE_FILE_MACHINE_ARM64, &pi ))
+    {
+        winetest_push_context( "ARM64 target" );
+        memset( &vm_info, 0, sizeof(vm_info) );
+        status = NtQueryVirtualMemory( pi.hProcess, NULL,
+                                       MemoryWineProcessVmMachineInformation,
+                                       &vm_info, sizeof(vm_info), NULL );
+        ok( !status, "VM metadata query failed %#lx\n", status );
+        ok( vm_info.Version == WINE_PROCESS_VM_INFORMATION_VERSION,
+            "got version %lu\n", vm_info.Version );
+        ok( vm_info.Size == sizeof(vm_info), "got size %lu\n", vm_info.Size );
+        ok( vm_info.Machine == IMAGE_FILE_MACHINE_ARM64, "got machine %#x\n", vm_info.Machine );
+        ok( !vm_info.Flags, "got flags %#x\n", vm_info.Flags );
+        ok( !vm_info.Reserved, "got reserved %#lx\n", vm_info.Reserved );
+        status = pRtlWow64GetProcessMachines( pi.hProcess, &process_machine,
+                                              &target_native_machine );
+        ok( !status, "RtlWow64GetProcessMachines failed %#lx\n", status );
+        ok( !process_machine, "got emulated process machine %#x\n", process_machine );
+        ok( target_native_machine == IMAGE_FILE_MACHINE_ARM64, "got native machine %#x\n",
+            target_native_machine );
+        if (!status && !process_machine)
+        {
+            check_remote_memory_region( pi.hProcess, FALSE );
+            check_native_low_address_is_raw( pi.hProcess );
+        }
+        TerminateProcess( pi.hProcess, 0 );
+        CloseHandle( pi.hProcess );
+        CloseHandle( pi.hThread );
+        winetest_pop_context();
+    }
+    else win_skip( "could not start ARM64 target: %lu\n", GetLastError() );
+}
+
+static void test_remote_memory_codec_cleanup(void)
+{
+    MEMORY_BASIC_INFORMATION info;
+    MEMORY_WORKING_SET_EX_INFORMATION working_set;
+    HANDLE self = NULL;
+    ULONG before, after, i;
+    BYTE value;
+    SIZE_T size;
+    DWORD exception;
+    NTSTATUS status;
+
+    if (current_machine != IMAGE_FILE_MACHINE_I386 ||
+        native_machine != IMAGE_FILE_MACHINE_ARM64 ||
+        !read_shadow_shared_data( GetCurrentProcess(), &value ))
+        return;
+
+    /* Warm the exception path before taking the handle-count baseline. */
+    exception = 0;
+    __TRY
+    {
+        NtQueryVirtualMemory( GetCurrentProcess(), NtCurrentTeb(),
+                              MemoryBasicInformation, NULL, sizeof(info), NULL );
+    }
+    __EXCEPT_ALL
+    {
+        exception = GetExceptionCode();
+    }
+    __ENDTRY
+    ok( exception == STATUS_ACCESS_VIOLATION, "warm query raised %#lx\n", exception );
+
+    status = NtDuplicateObject( GetCurrentProcess(), GetCurrentProcess(),
+                                GetCurrentProcess(), &self, 0, 0, DUPLICATE_SAME_ACCESS );
+    ok( !status, "NtDuplicateObject failed %#lx\n", status );
+    if (status) return;
+
+    memset( &working_set, 0, sizeof(working_set) );
+    working_set.VirtualAddress = &working_set;
+    status = NtQueryVirtualMemory( self, NULL, MemoryWorkingSetExInformation,
+                                   &working_set, sizeof(working_set), NULL );
+    ok( !status, "duplicated-self working-set query failed %#lx\n", status );
+
+    status = NtQueryInformationProcess( GetCurrentProcess(), ProcessHandleCount,
+                                        &before, sizeof(before), NULL );
+    ok( !status, "ProcessHandleCount query failed %#lx\n", status );
+    if (status)
+    {
+        NtClose( self );
+        return;
+    }
+
+    for (i = 0; i < 32; i++)
+    {
+        size = 0x1000;
+        exception = 0;
+        __TRY
+        {
+            NtAllocateVirtualMemory( self, NULL, 0, &size, MEM_RESERVE,
+                                     PAGE_READWRITE );
+        }
+        __EXCEPT_ALL
+        {
+            exception = GetExceptionCode();
+        }
+        __ENDTRY
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "allocate iteration %lu raised %#lx\n", i, exception );
+
+        exception = 0;
+        __TRY
+        {
+            NtQueryVirtualMemory( self, NtCurrentTeb(), MemoryBasicInformation,
+                                  NULL, sizeof(info), NULL );
+        }
+        __EXCEPT_ALL
+        {
+            exception = GetExceptionCode();
+        }
+        __ENDTRY
+        ok( exception == STATUS_ACCESS_VIOLATION,
+            "query iteration %lu raised %#lx\n", i, exception );
+    }
+
+    status = NtQueryInformationProcess( GetCurrentProcess(), ProcessHandleCount,
+                                        &after, sizeof(after), NULL );
+    ok( !status, "ProcessHandleCount query failed %#lx\n", status );
+    if (!status) ok( after == before, "handle count changed from %lu to %lu\n", before, after );
+
+    status = NtQueryVirtualMemory( (HANDLE)(ULONG_PTR)0xdeadbeef, NULL,
+                                   MemoryBasicInformation, &info,
+                                   sizeof(info) - 1, NULL );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH,
+        "invalid handle with short buffer returned %#lx\n", status );
+    status = NtQueryVirtualMemory( (HANDLE)(ULONG_PTR)0xdeadbeef, NULL,
+                                   (MEMORY_INFORMATION_CLASS)0xdead, &info,
+                                   sizeof(info), NULL );
+    ok( status == STATUS_INVALID_INFO_CLASS,
+        "invalid handle with unsupported class returned %#lx\n", status );
+    NtClose( self );
+}
+
+static void init_raw_create_event_request( struct __server_request_info *req,
+                                           const struct object_attributes *objattr )
+{
+    memset( req, 0, sizeof(*req) );
+    req->u.req.request_header.req = REQ_create_event;
+    req->u.req.create_event_request.access = EVENT_ALL_ACCESS;
+    req->u.req.create_event_request.manual_reset = FALSE;
+    req->u.req.create_event_request.initial_state = FALSE;
+    req->u.req.request_header.request_size = sizeof(*objattr);
+    req->data_count = 1;
+    req->data[0].ptr = objattr;
+    req->data[0].size = sizeof(*objattr);
+}
+
+static NTSTATUS call_raw_create_event( unsigned int (CDECL *server_call)(void *),
+                                       struct __server_request_info *req,
+                                       const struct object_attributes *objattr )
+{
+    NTSTATUS status;
+
+    init_raw_create_event_request( req, objattr );
+    status = server_call( req );
+    if (!status) NtClose( wine_server_ptr_handle( req->u.reply.create_event_reply.handle ) );
+    return status;
+}
+
+static void init_raw_get_process_info_request( struct __server_request_info *req,
+                                               void *reply_data, data_size_t reply_size )
+{
+    memset( req, 0, sizeof(*req) );
+    req->u.req.request_header.req = REQ_get_process_info;
+    req->u.req.get_process_info_request.handle = wine_server_obj_handle( NtCurrentProcess() );
+    req->u.req.request_header.reply_size = reply_size;
+    req->reply_data = reply_data;
+}
+
+static void test_wow64_raw_server_call_protection(void)
+{
+    unsigned int (CDECL *server_call)(void *);
+    struct object_attributes objattr = {0};
+    struct __server_request_info *req;
+    void *base = NULL, *watch_base = NULL, *protect_page, *reply_page;
+    void *written[8];
+    SIZE_T region_size;
+    ULONG before, after, old_protect, granularity;
+    ULONG_PTR count;
+    data_size_t reply_size;
+    NTSTATUS status;
+    UINT ret;
+    BYTE probe;
+    HMODULE ntdll;
+
+    if (current_machine != IMAGE_FILE_MACHINE_I386 ||
+        native_machine != IMAGE_FILE_MACHINE_ARM64 ||
+        !read_shadow_shared_data( GetCurrentProcess(), &probe ))
+        return;
+
+    ntdll = GetModuleHandleA( "ntdll.dll" );
+    server_call = (void *)pRtlFindExportedRoutineByName( ntdll, "wine_server_call" );
+    if (!server_call)
+    {
+        win_skip( "wine_server_call is not exported\n" );
+        return;
+    }
+
+    region_size = 0x20000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &region_size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "NtAllocateVirtualMemory failed %#lx\n", status );
+    if (status) return;
+    req = (struct __server_request_info *)((BYTE *)base + 0x1000);
+    reply_page = (BYTE *)base + 0x10000;
+
+    status = NtQueryInformationProcess( NtCurrentProcess(), ProcessHandleCount,
+                                        &before, sizeof(before), NULL );
+    ok( !status, "ProcessHandleCount query failed %#lx\n", status );
+    init_raw_create_event_request( req, &objattr );
+    protect_page = req;
+    region_size = 0x1000;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &region_size,
+                                     PAGE_READONLY, &old_protect );
+    ok( !status, "fixed reply protect failed %#lx\n", status );
+    if (!status)
+    {
+        status = server_call( req );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "read-only fixed reply returned %#lx\n", status );
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &region_size,
+                                         PAGE_READWRITE, &old_protect );
+        ok( !status, "fixed reply restore failed %#lx\n", status );
+    }
+    status = NtQueryInformationProcess( NtCurrentProcess(), ProcessHandleCount,
+                                        &after, sizeof(after), NULL );
+    ok( !status, "ProcessHandleCount query failed %#lx\n", status );
+    if (!status) ok( after == before, "protected descriptor leaked a handle (%lu -> %lu)\n",
+                     before, after );
+    status = call_raw_create_event( server_call, req, &objattr );
+    ok( !status, "valid call after fixed reply fault failed %#lx\n", status );
+
+    init_raw_create_event_request( req, &objattr );
+    req->data_count = __SERVER_MAX_DATA + 1;
+    status = server_call( req );
+    ok( status == STATUS_INVALID_PARAMETER, "oversized data count returned %#lx\n", status );
+    status = call_raw_create_event( server_call, req, &objattr );
+    ok( !status, "valid call after oversized count failed %#lx\n", status );
+
+    init_raw_create_event_request( req, &objattr );
+    req->u.req.request_header.request_size = 1;
+    req->data[0].ptr = NULL;
+    req->data[0].size = 1;
+    status = server_call( req );
+    ok( status == STATUS_ACCESS_VIOLATION, "NULL payload returned %#lx\n", status );
+    status = call_raw_create_event( server_call, req, &objattr );
+    ok( !status, "valid call after NULL payload failed %#lx\n", status );
+
+    init_raw_create_event_request( req, &objattr );
+    req->u.req.request_header.request_size = 4;
+    req->data[0].ptr = (void *)(ULONG_PTR)0xfffffffe;
+    req->data[0].size = 4;
+    status = server_call( req );
+    ok( status == STATUS_ACCESS_VIOLATION, "wrapping payload returned %#lx\n", status );
+    status = call_raw_create_event( server_call, req, &objattr );
+    ok( !status, "valid call after wrapping payload failed %#lx\n", status );
+
+    init_raw_create_event_request( req, &objattr );
+    req->u.req.request_header.request_size = ~(data_size_t)0;
+    req->data[0].ptr = (void *)(ULONG_PTR)1;
+    req->data[0].size = ~(data_size_t)0;
+    status = server_call( req );
+    ok( status == STATUS_INVALID_PARAMETER, "header-overflow payload returned %#lx\n", status );
+    status = call_raw_create_event( server_call, req, &objattr );
+    ok( !status, "valid call after header overflow failed %#lx\n", status );
+
+    init_raw_get_process_info_request( req, reply_page, sizeof(struct pe_image_info) );
+    protect_page = reply_page;
+    region_size = 0x1000;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &region_size,
+                                     PAGE_READONLY, &old_protect );
+    ok( !status, "variable reply protect failed %#lx\n", status );
+    if (!status)
+    {
+        status = server_call( req );
+        ok( status == STATUS_ACCESS_VIOLATION,
+            "read-only variable reply returned %#lx\n", status );
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &region_size,
+                                         PAGE_READWRITE, &old_protect );
+        ok( !status, "variable reply restore failed %#lx\n", status );
+    }
+    init_raw_get_process_info_request( req, reply_page, sizeof(struct pe_image_info) );
+    status = server_call( req );
+    ok( !status, "valid get_process_info after reply fault failed %#lx\n", status );
+
+    region_size = 0x30000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &watch_base, 0, &region_size,
+                                      MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                                      PAGE_READWRITE );
+    ok( !status, "write-watch allocation failed %#lx\n", status );
+    if (!status)
+    {
+        req = (struct __server_request_info *)watch_base;
+        reply_page = (BYTE *)watch_base + 0x10000;
+        init_raw_get_process_info_request( req, reply_page, 0x2000 );
+        count = ARRAY_SIZE( written );
+        ret = GetWriteWatch( WRITE_WATCH_FLAG_RESET, watch_base, 0x30000,
+                             written, &count, &granularity );
+        ok( !ret, "GetWriteWatch reset failed %u\n", ret );
+        status = server_call( req );
+        ok( !status, "write-watch get_process_info failed %#lx\n", status );
+        reply_size = wine_server_reply_size( &req->u.reply );
+        ok( reply_size && reply_size < 0x1000, "unexpected reply size %u\n", reply_size );
+        count = ARRAY_SIZE( written );
+        ret = GetWriteWatch( 0, watch_base, 0x30000, written, &count, &granularity );
+        ok( !ret, "GetWriteWatch failed %u\n", ret );
+        ok( count == 2, "expected two written pages, got %Iu\n", count );
+        if (count == 2)
+        {
+            ok( written[0] == watch_base, "fixed reply page %p, expected %p\n",
+                written[0], watch_base );
+            ok( written[1] == reply_page, "variable reply page %p, expected %p\n",
+                written[1], reply_page );
+        }
+    }
+
+    if (watch_base)
+    {
+        region_size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &watch_base, &region_size, MEM_RELEASE );
+    }
+    region_size = 0;
+    NtFreeVirtualMemory( NtCurrentProcess(), &base, &region_size, MEM_RELEASE );
+}
+
+static void test_wow64_handle_pair_publication(void)
+{
+    NTSTATUS (CDECL *publish_pair)(ULONG *,ULONG,ULONG *,ULONG);
+    ULONG *first, *second, old_protect, granularity;
+    void *base = NULL, *protect_page;
+    void *written[4];
+    SIZE_T region_size;
+    ULONG_PTR count;
+    NTSTATUS status;
+    UINT ret;
+    HMODULE ntdll;
+
+    if (current_machine != IMAGE_FILE_MACHINE_I386) return;
+
+    ntdll = GetModuleHandleA( "ntdll.dll" );
+    publish_pair = (void *)pRtlFindExportedRoutineByName(
+        ntdll, "__wine_wow64_publish_handle_pair" );
+    if (!publish_pair)
+    {
+        win_skip( "__wine_wow64_publish_handle_pair is not exported\n" );
+        return;
+    }
+
+    region_size = 0x30000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &region_size,
+                                      MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                                      PAGE_READWRITE );
+    ok( !status, "write-watch allocation failed %#lx\n", status );
+    if (status) return;
+    first = (ULONG *)((BYTE *)base + 0x1000);
+    second = (ULONG *)((BYTE *)base + 0x10000);
+    *first = 0x11111111;
+    *second = 0x22222222;
+
+    protect_page = second;
+    region_size = 0x1000;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &region_size,
+                                     PAGE_NOACCESS, &old_protect );
+    ok( !status, "second lane protect failed %#lx\n", status );
+    if (!status)
+    {
+        status = publish_pair( first, 0xaaaaaaaa, second, 0xbbbbbbbb );
+        ok( status == STATUS_ACCESS_VIOLATION, "second-lane fault returned %#lx\n", status );
+        ok( *first == 0x11111111, "first output changed to %#lx\n", *first );
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &region_size,
+                                         PAGE_READWRITE, &old_protect );
+        ok( !status, "second lane restore failed %#lx\n", status );
+        ok( *second == 0x22222222, "second output changed to %#lx\n", *second );
+    }
+
+    protect_page = first;
+    region_size = 0x1000;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &region_size,
+                                     PAGE_NOACCESS, &old_protect );
+    ok( !status, "first lane protect failed %#lx\n", status );
+    if (!status)
+    {
+        status = publish_pair( first, 0xaaaaaaaa, second, 0xbbbbbbbb );
+        ok( status == STATUS_ACCESS_VIOLATION, "first-lane fault returned %#lx\n", status );
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_page, &region_size,
+                                         PAGE_READWRITE, &old_protect );
+        ok( !status, "first lane restore failed %#lx\n", status );
+        ok( *first == 0x11111111, "first output changed to %#lx\n", *first );
+        ok( *second == 0x22222222, "second output changed to %#lx\n", *second );
+    }
+
+    status = publish_pair( first, 0x33333333, first, 0x44444444 );
+    ok( !status, "same-address publication failed %#lx\n", status );
+    ok( *first == 0x44444444, "same-address output is %#lx\n", *first );
+
+    count = ARRAY_SIZE( written );
+    ret = GetWriteWatch( WRITE_WATCH_FLAG_RESET, base, 0x30000,
+                         written, &count, &granularity );
+    ok( !ret, "GetWriteWatch reset failed %u\n", ret );
+    status = publish_pair( first, 0x55555555, second, 0x66666666 );
+    ok( !status, "valid publication failed %#lx\n", status );
+    ok( *first == 0x55555555 && *second == 0x66666666,
+        "outputs are %#lx/%#lx\n", *first, *second );
+    count = ARRAY_SIZE( written );
+    ret = GetWriteWatch( 0, base, 0x30000, written, &count, &granularity );
+    ok( !ret, "GetWriteWatch failed %u\n", ret );
+    ok( count == 2, "expected two written pages, got %Iu\n", count );
+    if (count == 2)
+    {
+        ok( written[0] == first, "first dirty page %p, expected %p\n", written[0], first );
+        ok( written[1] == second, "second dirty page %p, expected %p\n", written[1], second );
+    }
+
+    region_size = 0;
+    NtFreeVirtualMemory( NtCurrentProcess(), &base, &region_size, MEM_RELEASE );
+}
+
+static ULONG query_memory_protect( const void *address )
+{
+    MEMORY_BASIC_INFORMATION info;
+    NTSTATUS status;
+
+    status = NtQueryVirtualMemory( NtCurrentProcess(), address, MemoryBasicInformation,
+                                   &info, sizeof(info), NULL );
+    ok( !status, "NtQueryVirtualMemory(%p) failed %#lx\n", address, status );
+    return status ? 0 : info.Protect;
+}
+
+static void protect_stack_lane( void *address, ULONG protect )
+{
+    SIZE_T size = 0x1000;
+    ULONG old_protect;
+    void *base = address;
+    NTSTATUS status;
+
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, protect, &old_protect );
+    ok( !status, "NtProtectVirtualMemory(%p, %#lx) failed %#lx\n",
+        address, protect, status );
+}
+
+static void test_wow64_stack_guard_granularity(void)
+{
+    NTSTATUS (CDECL *copy_user)(void *,const void *,SIZE_T,ULONG);
+    ULONG saved_protect[6], saved_guarantee, protect;
+    BYTE *stack_start, *stack_base, *saved_limit;
+    BYTE *block, *lanes[4], *bottom[2];
+    BYTE value = 0xa5, probe;
+    HMODULE ntdll;
+    unsigned int i;
+    NTSTATUS status;
+
+    if (current_machine != IMAGE_FILE_MACHINE_I386 ||
+        native_machine != IMAGE_FILE_MACHINE_ARM64 ||
+        !read_shadow_shared_data( GetCurrentProcess(), &probe ))
+        return;
+
+    ntdll = GetModuleHandleA( "ntdll.dll" );
+    copy_user = (void *)pRtlFindExportedRoutineByName( ntdll, "__wine_wow64_user_copy" );
+    if (!copy_user)
+    {
+        win_skip( "__wine_wow64_user_copy is not exported\n" );
+        return;
+    }
+
+    stack_start = NtCurrentTeb()->DeallocationStack;
+    stack_base = NtCurrentTeb()->Tib.StackBase;
+    saved_limit = NtCurrentTeb()->Tib.StackLimit;
+    saved_guarantee = NtCurrentTeb()->GuaranteedStackBytes;
+    block = (BYTE *)(((ULONG_PTR)saved_limit + 0x13fff) & ~0x3fffu);
+    if (!stack_start || block < stack_start + 0x10000 || block + 0x4000 >= stack_base)
+    {
+        win_skip( "current WoW64 stack has no isolated 16K guard test range\n" );
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(lanes); i++)
+    {
+        lanes[i] = block + i * 0x1000;
+        saved_protect[i] = query_memory_protect( lanes[i] );
+        protect_stack_lane( lanes[i], PAGE_READWRITE );
+    }
+    protect_stack_lane( lanes[2], PAGE_READWRITE | PAGE_GUARD );
+    protect_stack_lane( lanes[3], PAGE_READONLY );
+    NtCurrentTeb()->GuaranteedStackBytes = 0;
+    NtCurrentTeb()->Tib.StackLimit = lanes[3];
+
+    status = copy_user( lanes[2], &value, sizeof(value), WOW64_USER_COPY_FAULTING_WRITE );
+    ok( !status, "first logical stack growth failed %#lx\n", status );
+    ok( NtCurrentTeb()->Tib.StackLimit == lanes[2],
+        "first StackLimit is %p, expected %p\n", NtCurrentTeb()->Tib.StackLimit, lanes[2] );
+    if (!status) ok( *lanes[2] == value, "first guard write stored %#x\n", *lanes[2] );
+    protect = query_memory_protect( lanes[0] );
+    ok( protect == PAGE_READWRITE, "lower sibling protect is %#lx\n", protect );
+    protect = query_memory_protect( lanes[1] );
+    ok( protect == (PAGE_READWRITE | PAGE_GUARD), "new guard protect is %#lx\n", protect );
+    protect = query_memory_protect( lanes[2] );
+    ok( protect == PAGE_READWRITE, "old guard protect is %#lx\n", protect );
+    protect = query_memory_protect( lanes[3] );
+    ok( protect == PAGE_READONLY, "upper sibling protect is %#lx\n", protect );
+
+    status = copy_user( lanes[1], &value, sizeof(value), WOW64_USER_COPY_FAULTING_WRITE );
+    ok( !status, "second logical stack growth failed %#lx\n", status );
+    ok( NtCurrentTeb()->Tib.StackLimit == lanes[1],
+        "second StackLimit is %p, expected %p\n", NtCurrentTeb()->Tib.StackLimit, lanes[1] );
+    protect = query_memory_protect( lanes[0] );
+    ok( protect == (PAGE_READWRITE | PAGE_GUARD), "second guard protect is %#lx\n", protect );
+    protect = query_memory_protect( lanes[1] );
+    ok( protect == PAGE_READWRITE, "second old guard protect is %#lx\n", protect );
+    protect = query_memory_protect( lanes[2] );
+    ok( protect == PAGE_READWRITE, "second upper sibling protect is %#lx\n", protect );
+    protect = query_memory_protect( lanes[3] );
+    ok( protect == PAGE_READONLY, "read-only sibling changed to %#lx\n", protect );
+
+    bottom[0] = stack_start;
+    bottom[1] = stack_start + 0x1000;
+    saved_protect[4] = query_memory_protect( bottom[0] );
+    saved_protect[5] = query_memory_protect( bottom[1] );
+    protect_stack_lane( bottom[0], PAGE_NOACCESS );
+    protect_stack_lane( bottom[1], PAGE_READWRITE );
+    *bottom[1] = 0x5a;
+    protect_stack_lane( bottom[1], PAGE_READWRITE | PAGE_GUARD );
+    NtCurrentTeb()->Tib.StackLimit = bottom[1] + 0x1000;
+    status = copy_user( bottom[1], &value, sizeof(value), WOW64_USER_COPY_FAULTING_WRITE );
+    ok( status == STATUS_STACK_OVERFLOW, "minimum guarantee returned %#lx\n", status );
+    ok( NtCurrentTeb()->Tib.StackLimit == bottom[1],
+        "overflow StackLimit is %p, expected %p\n", NtCurrentTeb()->Tib.StackLimit, bottom[1] );
+    protect = query_memory_protect( bottom[0] );
+    ok( protect == PAGE_NOACCESS, "overflow no-access lane changed to %#lx\n", protect );
+    protect = query_memory_protect( bottom[1] );
+    ok( protect == PAGE_READWRITE, "overflow guarantee protect is %#lx\n", protect );
+    if (protect == PAGE_READWRITE)
+        ok( *bottom[1] == 0x5a, "overflow path published %#x\n", *bottom[1] );
+
+    NtCurrentTeb()->Tib.StackLimit = saved_limit;
+    NtCurrentTeb()->GuaranteedStackBytes = saved_guarantee;
+    for (i = 0; i < ARRAY_SIZE(lanes); i++) protect_stack_lane( lanes[i], saved_protect[i] );
+    protect_stack_lane( bottom[0], saved_protect[4] );
+    protect_stack_lane( bottom[1], saved_protect[5] );
+}
+
+static void test_wow64_server_call_protection(void)
+{
+    static const WCHAR value_nameW[] = L"server-call-value";
+    KEY_VALUE_PARTIAL_INFORMATION *info;
+    UNICODE_STRING value_name;
+    char key_name[128];
+    DWORD disposition, size, type, value;
+    DWORD initial = 0x11223344, replacement = 0x55667788;
+    HANDLE key;
+    BYTE probe;
+    void *base = NULL, *page;
+    SIZE_T region_size;
+    ULONG old_protect, result_len;
+    NTSTATUS status;
+    LSTATUS error;
+
+    if (current_machine != IMAGE_FILE_MACHINE_I386 ||
+        native_machine != IMAGE_FILE_MACHINE_ARM64 ||
+        !read_shadow_shared_data( GetCurrentProcess(), &probe ))
+        return;
+
+    sprintf( key_name, "Software\\Wine\\Tests\\wow64-server-call-%08lx", GetCurrentProcessId() );
+    error = RegCreateKeyExA( HKEY_CURRENT_USER, key_name, 0, NULL, REG_OPTION_VOLATILE,
+                             KEY_ALL_ACCESS, NULL, (HKEY *)&key, &disposition );
+    ok( !error, "RegCreateKeyExA failed %ld\n", error );
+    if (error) return;
+    error = RegSetValueExW( key, value_nameW, 0, REG_DWORD,
+                            (const BYTE *)&initial, sizeof(initial) );
+    ok( !error, "initial RegSetValueExW failed %ld\n", error );
+    if (error) goto done;
+
+    region_size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &region_size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !status, "NtAllocateVirtualMemory failed %#lx\n", status );
+    if (status) goto done;
+    page = (BYTE *)base + 0x1000;
+    *(DWORD *)page = replacement;
+    RtlInitUnicodeString( &value_name, value_nameW );
+
+    region_size = 0x1000;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &region_size,
+                                     PAGE_NOACCESS, &old_protect );
+    ok( !status, "NtProtectVirtualMemory failed %#lx\n", status );
+    if (status) goto free;
+    status = NtSetValueKey( key, &value_name, 0, REG_DWORD, page, sizeof(DWORD) );
+    ok( status == STATUS_ACCESS_VIOLATION, "protected request returned %#lx\n", status );
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &region_size,
+                                     PAGE_READWRITE, &old_protect );
+    ok( !status, "request page restore failed %#lx\n", status );
+
+    value = 0;
+    size = sizeof(value);
+    error = RegQueryValueExW( key, value_nameW, NULL, &type, (BYTE *)&value, &size );
+    ok( !error && type == REG_DWORD && size == sizeof(value) && value == initial,
+        "protected request changed value, error %ld type %lu size %lu value %#lx\n",
+        error, type, size, value );
+
+    status = NtSetValueKey( key, &value_name, 0, REG_DWORD, NULL, sizeof(DWORD) );
+    ok( status == STATUS_ACCESS_VIOLATION, "NULL request returned %#lx\n", status );
+    status = NtSetValueKey( key, &value_name, 0, REG_DWORD,
+                            (void *)(ULONG_PTR)0xfffffffe, sizeof(DWORD) );
+    ok( status == STATUS_ACCESS_VIOLATION, "wrapping request returned %#lx\n", status );
+    status = NtSetValueKey( key, &value_name, 0, REG_DWORD, page, sizeof(DWORD) );
+    ok( !status, "valid request after rejected ranges failed %#lx\n", status );
+
+    info = (KEY_VALUE_PARTIAL_INFORMATION *)
+           ((BYTE *)page - FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data));
+    *(DWORD *)page = 0xa5a5a5a5;
+    region_size = 0x1000;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &region_size,
+                                     PAGE_NOACCESS, &old_protect );
+    ok( !status, "reply page protect failed %#lx\n", status );
+    if (status) goto free;
+    result_len = 0xdeadbeef;
+    status = NtQueryValueKey( key, &value_name, KeyValuePartialInformation, info,
+                              FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(DWORD),
+                              &result_len );
+    ok( status == STATUS_ACCESS_VIOLATION, "protected reply returned %#lx\n", status );
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &page, &region_size,
+                                     PAGE_READWRITE, &old_protect );
+    ok( !status, "reply page restore failed %#lx\n", status );
+    ok( *(DWORD *)page == 0xa5a5a5a5, "protected reply changed data to %#lx\n", *(DWORD *)page );
+
+    result_len = 0;
+    status = NtQueryValueKey( key, &value_name, KeyValuePartialInformation, info,
+                              FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(DWORD),
+                              &result_len );
+    ok( !status, "valid reply after protection failure failed %#lx\n", status );
+    if (!status)
+        ok( *(DWORD *)info->Data == replacement, "valid reply returned %#lx\n", *(DWORD *)info->Data );
+
+free:
+    if (base)
+    {
+        region_size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &base, &region_size, MEM_RELEASE );
+    }
+done:
+    RegCloseKey( key );
+    RegDeleteKeyA( HKEY_CURRENT_USER, key_name );
+}
+
+static void test_continue_boolean_argument(void)
+{
+    static LONG pass;
+    CONTEXT context;
+    BYTE value;
+    LONG current;
+    NTSTATUS status;
+
+    if (current_machine != IMAGE_FILE_MACHINE_I386 ||
+        native_machine != IMAGE_FILE_MACHINE_ARM64 ||
+        !read_shadow_shared_data( GetCurrentProcess(), &value ))
+        return;
+
+    RtlCaptureContext( &context );
+    current = InterlockedIncrement( &pass );
+    if (current == 1)
+    {
+        status = NtContinue( &context, TRUE );
+        ok( 0, "NtContinue returned %#lx\n", status );
+    }
+    ok( current == 2, "NtContinue resumed with pass %ld\n", current );
+}
+
+#else
+
+static void test_remote_memory_address_codec(void)
+{
+}
+
+static void test_remote_memory_codec_cleanup(void)
+{
+}
+
+static void test_wow64_server_call_protection(void)
+{
+}
+
+static void test_wow64_raw_server_call_protection(void)
+{
+}
+
+static void test_wow64_handle_pair_publication(void)
+{
+}
+
+static void test_wow64_stack_guard_granularity(void)
+{
+}
+
+static void test_continue_boolean_argument(void)
+{
+}
+
+#endif
+
+static void test_complete_new_process_request_validation(void)
+{
+    static const int invalid_commits[] = { -1, INT_MIN, 2 };
+    unsigned int (CDECL *server_call)(void *);
+    struct __server_request_info req;
+    NTSTATUS status;
+    unsigned int i;
+    HMODULE ntdll;
+
+    ntdll = GetModuleHandleA( "ntdll.dll" );
+    server_call = (void *)pRtlFindExportedRoutineByName( ntdll, "wine_server_call" );
+    if (!server_call)
+    {
+        win_skip( "wine_server_call is not exported\n" );
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(invalid_commits); ++i)
+    {
+        memset( &req, 0, sizeof(req) );
+        req.u.req.request_header.req = REQ_complete_new_process;
+        req.u.req.complete_new_process_request.commit = invalid_commits[i];
+        status = server_call( &req );
+        ok( status == STATUS_INVALID_PARAMETER,
+            "complete_new_process commit %d returned %#lx\n", invalid_commits[i], status );
+    }
+    for (i = 0; i <= 1; ++i)
+    {
+        memset( &req, 0, sizeof(req) );
+        req.u.req.request_header.req = REQ_complete_new_process;
+        req.u.req.complete_new_process_request.commit = i;
+        status = server_call( &req );
+        ok( status == STATUS_INVALID_HANDLE,
+            "complete_new_process commit %u returned %#lx\n", i, status );
+    }
 }
 
 static void test_process_architecture( SYSTEM_INFORMATION_CLASS class, HANDLE process, USHORT expect_machine, USHORT expect_native )
@@ -523,6 +2059,8 @@ static void request_cross_process_flush( CROSS_PROCESS_WORK_HDR *list )
 
 #define expect_cross_work_entry(list,entry,id,addr,size,arg0,arg1,arg2,arg3) \
     expect_cross_work_entry_(list,entry,id,addr,size,arg0,arg1,arg2,arg3,__LINE__)
+static BOOL cross_work_addresses_use_shadow;
+
 static CROSS_PROCESS_WORK_ENTRY *expect_cross_work_entry_( CROSS_PROCESS_WORK_LIST *list,
                                                            CROSS_PROCESS_WORK_ENTRY *entry,
                                                            UINT id, void *addr, SIZE_T size,
@@ -530,12 +2068,16 @@ static CROSS_PROCESS_WORK_ENTRY *expect_cross_work_entry_( CROSS_PROCESS_WORK_LI
                                                            int line )
 {
     CROSS_PROCESS_WORK_ENTRY *next;
+    ULONG_PTR expected_addr = (ULONG_PTR)addr;
+
+    if (cross_work_addresses_use_shadow && expected_addr)
+        expected_addr += WINE_LOW_VA_SHADOW_BASE;
 
     ok_(__FILE__,line)( entry != NULL, "no more entries in list\n" );
     if (!entry) return NULL;
     ok_(__FILE__,line)( entry->id == id, "wrong type %u / %u\n", entry->id, id );
-    ok_(__FILE__,line)( entry->addr == (ULONG_PTR)addr, "wrong address %s / %p\n",
-                        wine_dbgstr_longlong(entry->addr), addr );
+    ok_(__FILE__,line)( entry->addr == expected_addr, "wrong address %s / %s\n",
+                        wine_dbgstr_longlong(entry->addr), wine_dbgstr_longlong(expected_addr) );
     ok_(__FILE__,line)( entry->size == size, "wrong size %s / %Ix\n",
                         wine_dbgstr_longlong(entry->size), size );
     ok_(__FILE__,line)( entry->args[0] == arg0, "wrong args[0] %x / %x\n", entry->args[0], arg0 );
@@ -561,6 +2103,17 @@ static void test_cross_process_notifications( HANDLE process, ULONG_PTR section,
     NTSTATUS status;
     BOOL ret;
     BYTE data[] = { 0xcc, 0xcc, 0xcc };
+
+    cross_work_addresses_use_shadow = FALSE;
+#ifndef _WIN64
+    if (current_machine == IMAGE_FILE_MACHINE_I386 &&
+        native_machine == IMAGE_FILE_MACHINE_ARM64 && pNtWow64ReadVirtualMemory64)
+    {
+        BYTE value;
+
+        cross_work_addresses_use_shadow = read_shadow_shared_data( GetCurrentProcess(), &value );
+    }
+#endif
 
     ret = DuplicateHandle( process, (HANDLE)section, GetCurrentProcess(), &mapping,
                            0, FALSE, DUPLICATE_SAME_ACCESS );
@@ -2148,6 +3701,103 @@ static void test_exception_dispatcher(void)
 #endif
 }
 
+static void test_translated_view_information(void)
+{
+#ifdef _WIN64
+    WINE_TRANSLATED_VIEW_INFORMATION info;
+    SIZE_T ret_len = 0xdeadbeef;
+    NTSTATUS status;
+    void *page;
+
+    C_ASSERT( sizeof(info) == 48 );
+
+    page = VirtualAlloc( NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
+    ok( !!page, "VirtualAlloc failed, error %lu\n", GetLastError() );
+    if (!page) return;
+
+    memset( &info, 0xcc, sizeof(info) );
+    status = NtQueryVirtualMemory( GetCurrentProcess(), (char *)page + 0x321,
+                                   MemoryWineTranslatedViewInformation,
+                                   &info, sizeof(info) - 1, &ret_len );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH,
+        "short translated-view query returned %#lx\n", status );
+    ok( ret_len == 0xdeadbeef, "short query changed result length to %Iu\n", ret_len );
+
+    status = NtQueryVirtualMemory( GetCurrentProcess(), page,
+                                   MemoryWineTranslatedViewInformation,
+                                   NULL, sizeof(info), &ret_len );
+    ok( status == STATUS_ACCESS_VIOLATION,
+        "NULL translated-view output returned %#lx\n", status );
+
+    status = NtQueryVirtualMemory( (HANDLE)(ULONG_PTR)0xdeadbeef, page,
+                                   MemoryWineTranslatedViewInformation,
+                                   &info, sizeof(info), &ret_len );
+    ok( status == STATUS_INVALID_HANDLE,
+        "invalid-handle translated-view query returned %#lx\n", status );
+
+    memset( &info, 0xcc, sizeof(info) );
+    ret_len = 0xdeadbeef;
+    status = NtQueryVirtualMemory( GetCurrentProcess(), (char *)page + 0x321,
+                                   MemoryWineTranslatedViewInformation,
+                                   &info, sizeof(info), &ret_len );
+    ok( !status, "translated-view query returned %#lx\n", status );
+    if (!status)
+    {
+        ok( info.Version == WINE_TRANSLATED_VIEW_INFORMATION_VERSION,
+            "unexpected version %lu\n", info.Version );
+        ok( !info.Flags, "unexpected identity-view flags %#lx\n", info.Flags );
+        ok( !info.Reserved, "unexpected reserved value %#lx\n", info.Reserved );
+        ok( info.GuestBase == info.HostBase,
+            "identity guest base %p differs from host base %p\n",
+            info.GuestBase, info.HostBase );
+        ok( (char *)page + 0x321 >= (char *)info.GuestBase &&
+            (char *)page + 0x321 < (char *)info.GuestBase + info.RegionSize,
+            "query address is outside returned range %p+%Iu\n",
+            info.GuestBase, info.RegionSize );
+        ok( !!info.AllocationBase, "missing allocation base\n" );
+        ok( info.Protect == PAGE_READWRITE, "unexpected protection %#lx\n", info.Protect );
+        ok( ret_len == sizeof(info), "result length %Iu, expected %Iu\n",
+            ret_len, sizeof(info) );
+    }
+
+    VirtualFree( page, 0, MEM_RELEASE );
+#endif
+}
+
+#ifdef __arm64ec__
+static void test_x64_execution_gate(void)
+{
+    NTSTATUS (WINAPI *prepare_x64_execution)(void);
+    NTSTATUS (WINAPI *get_x64_syscall_dispatcher)(ULONG_PTR *, ULONG *);
+    HMODULE ntdll = GetModuleHandleA( "ntdll.dll" );
+    ULONG_PTR dispatcher = 0;
+    ULONG count = 0;
+    NTSTATUS status;
+
+    prepare_x64_execution = pRtlFindExportedRoutineByName(
+        ntdll, "__wine_arm64ec_prepare_x64_execution" );
+    get_x64_syscall_dispatcher = pRtlFindExportedRoutineByName(
+        ntdll, "__wine_arm64ec_get_x64_syscall_dispatcher" );
+    ok( !!prepare_x64_execution, "x64 execution preparation gate is missing\n" );
+    ok( !!get_x64_syscall_dispatcher, "x64 syscall dispatcher query is missing\n" );
+    if (!prepare_x64_execution || !get_x64_syscall_dispatcher) return;
+
+    status = prepare_x64_execution();
+    ok( !status, "identity x64 execution preparation returned %#lx\n", status );
+    status = prepare_x64_execution();
+    ok( !status, "repeated identity x64 execution preparation returned %#lx\n", status );
+
+    status = get_x64_syscall_dispatcher( NULL, &count );
+    ok( status == STATUS_INVALID_PARAMETER, "NULL dispatcher returned %#lx\n", status );
+    status = get_x64_syscall_dispatcher( &dispatcher, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "NULL count returned %#lx\n", status );
+    status = get_x64_syscall_dispatcher( &dispatcher, &count );
+    ok( !status, "dispatcher query returned %#lx\n", status );
+    ok( !!dispatcher, "dispatcher query returned NULL\n" );
+    ok( !!count, "dispatcher query returned zero syscall count\n" );
+}
+#endif
+
 #ifdef __arm64ec__
 static DWORD CALLBACK simulation_thread( void *arg )
 {
@@ -3447,8 +5097,19 @@ static void test_arm64ec(void)
 START_TEST(wow64)
 {
     init();
+    test_unixlib_dispatch_bounds();
+    test_unixlib_dispatch_lifecycle();
+    test_unixlib_zero_args_requires_wow64_model();
     test_query_architectures(SystemSupportedProcessorArchitectures);
     test_query_architectures(SystemSupportedProcessorArchitectures2);
+    test_remote_memory_address_codec();
+    test_remote_memory_codec_cleanup();
+    test_wow64_server_call_protection();
+    test_complete_new_process_request_validation();
+    test_wow64_raw_server_call_protection();
+    test_wow64_handle_pair_publication();
+    test_wow64_stack_guard_granularity();
+    test_continue_boolean_argument();
     test_peb_teb();
     test_selectors();
     test_image_mappings();
@@ -3466,6 +5127,12 @@ START_TEST(wow64)
     test_suspend_doorbell();
 #endif
     test_memory_notifications();
+#ifdef _WIN64
+    test_translated_view_information();
+#endif
+#ifdef __arm64ec__
+    test_x64_execution_gate();
+#endif
     test_cpu_area();
     test_exception_dispatcher();
     test_arm64ec();

@@ -68,6 +68,7 @@ static void dump_new_process_request( const struct new_process_request *req )
     fprintf( stderr, ", socket_fd=%d", req->socket_fd );
     fprintf( stderr, ", access=%08x", req->access );
     fprintf( stderr, ", machine=%04x", req->machine );
+    fprintf( stderr, ", wine_flags=%04x", req->wine_flags );
     fprintf( stderr, ", info_size=%u", req->info_size );
     fprintf( stderr, ", handles_size=%u", req->handles_size );
     fprintf( stderr, ", jobs_size=%u", req->jobs_size );
@@ -105,6 +106,7 @@ static void dump_new_thread_request( const struct new_thread_request *req )
     fprintf( stderr, " process=%04x", req->process );
     fprintf( stderr, ", access=%08x", req->access );
     fprintf( stderr, ", flags=%08x", req->flags );
+    fprintf( stderr, ", wine_flags=%08x", req->wine_flags );
     fprintf( stderr, ", request_fd=%d", req->request_fd );
     fprintf( stderr, ", is_system=%d", req->is_system );
     dump_varargs_object_attributes( ", objattr=", cur_size );
@@ -114,6 +116,7 @@ static void dump_new_thread_reply( const struct new_thread_reply *req )
 {
     fprintf( stderr, " tid=%04x", req->tid );
     fprintf( stderr, ", handle=%04x", req->handle );
+    fprintf( stderr, ", info=%04x", req->info );
 }
 
 static void dump_get_startup_info_request( const struct get_startup_info_request *req )
@@ -1023,6 +1026,7 @@ static void dump_map_view_request( const struct map_view_request *req )
     fprintf( stderr, ", access=%08x", req->access );
     dump_uint64( ", base=", &req->base );
     dump_uint64( ", size=", &req->size );
+    dump_uint64( ", commit_size=", &req->commit_size );
     dump_uint64( ", start=", &req->start );
 }
 
@@ -1030,10 +1034,12 @@ static void dump_map_image_view_request( const struct map_image_view_request *re
 {
     fprintf( stderr, " mapping=%04x", req->mapping );
     dump_uint64( ", base=", &req->base );
+    dump_uint64( ", guest_base=", &req->guest_base );
     dump_uint64( ", size=", &req->size );
     dump_uint64( ", offset=", &req->offset );
     fprintf( stderr, ", entry=%08x", req->entry );
     fprintf( stderr, ", machine=%04x", req->machine );
+    fprintf( stderr, ", flags=%04x", req->flags );
 }
 
 static void dump_map_builtin_view_request( const struct map_builtin_view_request *req )
@@ -3676,6 +3682,31 @@ static void dump_dcomp_get_shared_visual_info_reply( const struct dcomp_get_shar
     dump_uint64( " target_root=", &req->target_root );
 }
 
+static void dump_get_process_vm_machine_request( const struct get_process_vm_machine_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_get_process_vm_machine_reply( const struct get_process_vm_machine_reply *req )
+{
+    fprintf( stderr, " machine=%04x", req->machine );
+    fprintf( stderr, ", flags=%04x", req->flags );
+}
+
+static void dump_complete_new_process_request( const struct complete_new_process_request *req )
+{
+    fprintf( stderr, " info=%04x", req->info );
+    fprintf( stderr, ", status=%d", req->status );
+    fprintf( stderr, ", commit=%d", req->commit );
+}
+
+static void dump_complete_new_thread_request( const struct complete_new_thread_request *req )
+{
+    fprintf( stderr, " info=%04x", req->info );
+    fprintf( stderr, ", status=%d", req->status );
+    fprintf( stderr, ", commit=%d", req->commit );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -4001,6 +4032,9 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_dcomp_create_shared_visual_request,
     (dump_func)dump_dcomp_set_shared_visual_info_request,
     (dump_func)dump_dcomp_get_shared_visual_info_request,
+    (dump_func)dump_get_process_vm_machine_request,
+    (dump_func)dump_complete_new_process_request,
+    (dump_func)dump_complete_new_thread_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4326,6 +4360,9 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_dcomp_create_shared_visual_reply,
     NULL,
     (dump_func)dump_dcomp_get_shared_visual_info_reply,
+    (dump_func)dump_get_process_vm_machine_reply,
+    NULL,
+    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4651,6 +4688,9 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "dcomp_create_shared_visual",
     "dcomp_set_shared_visual_info",
     "dcomp_get_shared_visual_info",
+    "get_process_vm_machine",
+    "complete_new_process",
+    "complete_new_thread",
 };
 
 static const struct

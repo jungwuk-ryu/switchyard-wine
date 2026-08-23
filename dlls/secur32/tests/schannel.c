@@ -685,10 +685,17 @@ static void test_InitializeSecurityContext(void)
     SCHANNEL_CRED cred;
     CredHandle cred_handle;
     CtxtHandle context;
+    SecPkgContext_StreamSizes sizes;
     SECURITY_STATUS status;
-    SecBuffer out_buffer = {1000, SECBUFFER_TOKEN, NULL};
+    SecBuffer out_buffer[4] =
+    {
+        {1000, SECBUFFER_TOKEN, NULL},
+        {0, SECBUFFER_EMPTY, NULL},
+        {0, SECBUFFER_EMPTY, NULL},
+        {0, SECBUFFER_EMPTY, NULL},
+    };
     SecBuffer in_buffer = {0, SECBUFFER_EMPTY, NULL};
-    SecBufferDesc out_buffers = {SECBUFFER_VERSION, 1, &out_buffer};
+    SecBufferDesc out_buffers = {SECBUFFER_VERSION, ARRAY_SIZE(out_buffer), out_buffer};
     SecBufferDesc in_buffers  = {SECBUFFER_VERSION, 1, &in_buffer};
     ULONG attrs;
 
@@ -705,9 +712,17 @@ static void test_InitializeSecurityContext(void)
         0, 0, &in_buffers, 0, &context, &out_buffers, &attrs, NULL);
     ok(status == SEC_I_CONTINUE_NEEDED, "Expected SEC_I_CONTINUE_NEEDED, got %08lx\n", status);
 
-    FreeContextBuffer(out_buffer.pvBuffer);
-    DeleteSecurityContext(&context);
-    FreeCredentialsHandle(&cred_handle);
+    FreeContextBuffer(out_buffer[0].pvBuffer);
+    status = FreeCredentialsHandle(&cred_handle);
+    ok(status == SEC_E_OK, "FreeCredentialsHandle failed: %08lx\n", status);
+    status = QueryContextAttributesW(&context, SECPKG_ATTR_STREAM_SIZES, &sizes);
+    ok(status == SEC_E_OK, "QueryContextAttributesW failed after freeing credentials: %08lx\n", status);
+    status = FreeCredentialsHandle(&cred_handle);
+    ok(status == SEC_E_INVALID_HANDLE, "second FreeCredentialsHandle returned %08lx\n", status);
+    status = DeleteSecurityContext(&context);
+    ok(status == SEC_E_OK, "DeleteSecurityContext failed: %08lx\n", status);
+    status = DeleteSecurityContext(&context);
+    ok(status == SEC_E_INVALID_HANDLE, "second DeleteSecurityContext returned %08lx\n", status);
 }
 
 static SOCKET create_ssl_socket( const char *hostname )
