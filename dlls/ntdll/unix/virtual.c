@@ -3227,6 +3227,56 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot, BOOL tr
 }
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Darwin's JIT write-protect state is per-thread and applies to every MAP_JIT
+ * mapping, so Wine valloc views must not join the CPU provider's JIT domain.
+ * After an RWX mprotect denial, a private valloc may remain logically RWX but
+ * physically RW/NX; translated code stays readable to the CPU provider and a
+ * native execution attempt raises an access violation.  Never drop host EXEC
+ * when a distinct committed RX logical page shares the host-page run. */
+static BOOL can_retry_native_writable_exec( const struct file_view *view, const void *base,
+                                            size_t size, BYTE set, BYTE clear )
+{
+    const char *page = base;
+    BOOL found_exec = FALSE;
+
+    if (!view || !is_view_valloc( view ) ||
+        (view->protect & (VPROT_SYSTEM | VPROT_SHADOW_TRANSLATED))) return FALSE;
+
+    while (size)
+    {
+        BYTE vprot = (get_page_vprot( page ) & ~clear) | set;
+
+        if ((vprot & (VPROT_COMMITTED | VPROT_GUARD | VPROT_EXEC)) ==
+            (VPROT_COMMITTED | VPROT_EXEC))
+        {
+            if (!(vprot & (VPROT_WRITE | VPROT_WRITECOPY)) ||
+                find_view( page, page_size ) != view) return FALSE;
+            found_exec = TRUE;
+        }
+        page += page_size;
+        size -= page_size;
+    }
+    return found_exec;
+}
+#endif
+
+
+static inline int mprotect_range_run( struct file_view *view, void *base, size_t size, int unix_prot,
+                                      BOOL translated_shadow, BYTE set, BYTE clear )
+{
+    if (!mprotect_exec( base, size, unix_prot, translated_shadow )) return 0;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (errno == EACCES &&
+        (unix_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC) &&
+        can_retry_native_writable_exec( view, base, size, set, clear ))
+        return mprotect( base, size, unix_prot & ~PROT_EXEC );
+#endif
+    return -1;
+}
+
+
 /***********************************************************************
  *           mprotect_range
  *
@@ -3253,12 +3303,14 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
                 : get_host_page_vprot( addr + count * host_page_size );
         next = get_unix_prot( (vprot & ~clear) | set );
         if (next == prot) continue;
-        if (mprotect_exec( addr, count * host_page_size, prot, translated_shadow )) return -1;
+        if (mprotect_range_run( view, addr, count * host_page_size, prot,
+                                translated_shadow, set, clear )) return -1;
         addr += count * host_page_size;
         prot = next;
         count = 0;
     }
-    return mprotect_exec( addr, count * host_page_size, prot, translated_shadow );
+    return mprotect_range_run( view, addr, count * host_page_size, prot,
+                               translated_shadow, set, clear );
 }
 
 
@@ -3355,6 +3407,45 @@ static int mprotect_memory_access_range( void *base, size_t size, BYTE set, BYTE
 }
 
 
+#define VPROT_STACK_SNAPSHOT_PAGES 64
+
+/* Protection changes normally span only a few logical pages.  Keep those
+ * snapshots off the heap; larger ranges use one byte per logical page. */
+static BYTE *snapshot_vprot( const void *base, size_t size, BYTE *stack, size_t stack_count )
+{
+    const char *page = base;
+    size_t i, page_count = size >> page_shift;
+    BYTE *snapshot = stack;
+
+    if (page_count > stack_count && !(snapshot = malloc( page_count ))) return NULL;
+    for (i = 0; i < page_count; i++, page += page_size)
+        snapshot[i] = get_page_vprot( page );
+    return snapshot;
+}
+
+
+static void restore_vprot_or_abort( void *base, size_t size, const BYTE *snapshot )
+{
+    size_t i, run_start, page_count = size >> page_shift;
+    BYTE run_vprot;
+
+    for (run_start = 0; run_start < page_count; run_start = i)
+    {
+        run_vprot = snapshot[run_start];
+        for (i = run_start + 1; i < page_count && snapshot[i] == run_vprot; i++);
+        set_page_vprot( (char *)base + run_start * page_size,
+                        (i - run_start) * page_size, run_vprot );
+    }
+    /* Metadata must be authoritative before any observer capture.  If the host
+     * protections cannot be restored too, continuing would publish split state. */
+    if (mprotect_range( base, size, 0, 0 ))
+    {
+        ERR( "failed to restore protection for %p-%p\n", base, (char *)base + size );
+        abort_process( STATUS_ACCESS_DENIED );
+    }
+}
+
+
 /***********************************************************************
  *           set_vprot
  *
@@ -3389,9 +3480,14 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
  */
 static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size, ULONG protect )
 {
+    BYTE stack_snapshot[VPROT_STACK_SNAPSHOT_PAGES];
+    BYTE *old_vprot, current_vprot, compare_mask;
+    BOOL preserve_writewatch;
     unsigned int vprot;
     NTSTATUS status;
 
+    if (!size || (size & page_mask) || ((UINT_PTR)base & page_mask))
+        return STATUS_INVALID_PARAMETER;
     if ((status = get_vprot_flags( protect, &vprot, view->protect & SEC_IMAGE ))) return status;
     if (view->protect & SEC_IMAGE)
     {
@@ -3422,8 +3518,29 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
         if ((allowed & access) != access) return STATUS_INVALID_PAGE_PROTECTION;
     }
 
-    if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED )) return STATUS_ACCESS_DENIED;
-    return STATUS_SUCCESS;
+    vprot |= VPROT_COMMITTED;
+    preserve_writewatch = !use_kernel_writewatch && (view->protect & VPROT_WRITEWATCH);
+    if (!preserve_writewatch)
+    {
+        if (enable_write_exceptions && is_vprot_exec_write( vprot )) vprot |= VPROT_WRITEWATCH;
+        else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
+            vprot &= ~VPROT_WRITEWATCH;
+    }
+    compare_mask = preserve_writewatch ? ~VPROT_WRITEWATCH : ~(BYTE)0;
+    if (get_vprot_range_size( base, size, compare_mask, &current_vprot ) == size &&
+        (current_vprot & compare_mask) == (vprot & compare_mask))
+        return set_vprot( view, base, size, vprot ) ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+
+    if (!(old_vprot = snapshot_vprot( base, size, stack_snapshot,
+                                      ARRAY_SIZE(stack_snapshot) ))) return STATUS_NO_MEMORY;
+    if (!set_vprot( view, base, size, vprot ))
+    {
+        restore_vprot_or_abort( base, size, old_vprot );
+        status = STATUS_ACCESS_DENIED;
+    }
+    else status = STATUS_SUCCESS;
+    if (old_vprot != stack_snapshot) free( old_vprot );
+    return status;
 }
 
 
@@ -3737,7 +3854,10 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
     if (alloc_type & MEM_REPLACE_PLACEHOLDER)
     {
+        BYTE stack_snapshot[VPROT_STACK_SNAPSHOT_PAGES];
+        BYTE *old_vprot;
         struct file_view *view;
+        unsigned int old_protect;
 #if defined(__APPLE__) && defined(__aarch64__)
         unsigned int requested_owner, view_owner;
 #endif
@@ -3763,8 +3883,19 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             return STATUS_CONFLICTING_ADDRESSES;
         vprot |= view_owner;
 #endif
+        if (!(old_vprot = snapshot_vprot( base, size, stack_snapshot,
+                                          ARRAY_SIZE(stack_snapshot) )))
+            return STATUS_NO_MEMORY;
+        old_protect = view->protect;
         view->protect = vprot | VPROT_PLACEHOLDER;
-        set_vprot( view, base, size, vprot );
+        if (!set_vprot( view, base, size, vprot ))
+        {
+            view->protect = old_protect;
+            restore_vprot_or_abort( base, size, old_vprot );
+            if (old_vprot != stack_snapshot) free( old_vprot );
+            return STATUS_ACCESS_DENIED;
+        }
+        if (old_vprot != stack_snapshot) free( old_vprot );
         if (vprot & VPROT_WRITEWATCH)
         {
             kernel_writewatch_register_range( view, base, size );
@@ -9364,7 +9495,14 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
                     allocation_base = view->base;
                 }
 #endif
-                if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
+                if (!(type & MEM_REPLACE_PLACEHOLDER) &&
+                    (vprot & VPROT_EXEC || force_exec_prot) &&
+                    mprotect_range( base, size, 0, 0 ))
+                {
+                    delete_view( view );
+                    view = NULL;
+                    status = STATUS_ACCESS_DENIED;
+                }
             }
         }
     }
@@ -9401,19 +9539,18 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             else if (view->protect & VPROT_FREE_PLACEHOLDER) status = STATUS_CONFLICTING_ADDRESSES;
             else if (view->protect & SEC_RESERVE)
             {
-                SIZE_T page_count = size >> page_shift;
+                BYTE stack_snapshot[VPROT_STACK_SNAPSHOT_PAGES];
                 BYTE *old_vprot;
+                BOOL protection_set = FALSE;
 
-                if (!(old_vprot = malloc( page_count ))) status = STATUS_NO_MEMORY;
+                if (!(old_vprot = snapshot_vprot( base, size, stack_snapshot,
+                                                  ARRAY_SIZE(stack_snapshot) )))
+                    status = STATUS_NO_MEMORY;
                 else
                 {
-                    SIZE_T i, run_start;
-                    BYTE run_vprot;
-
-                    for (i = 0; i < page_count; i++)
-                        old_vprot[i] = get_page_vprot( (char *)base + i * page_size );
                     if (!(status = set_protection( view, base, size, protect )))
                     {
+                        protection_set = TRUE;
                         SERVER_START_REQ( add_mapping_committed_range )
                         {
                             req->base   = wine_server_client_ptr( view->base );
@@ -9423,20 +9560,9 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
                         }
                         SERVER_END_REQ;
                     }
-                    if (status)
-                    {
-                        for (run_start = 0; run_start < page_count;)
-                        {
-                            run_vprot = old_vprot[run_start];
-                            for (i = run_start + 1;
-                                 i < page_count && old_vprot[i] == run_vprot; i++);
-                            set_page_vprot( (char *)base + run_start * page_size,
-                                            (i - run_start) * page_size, run_vprot );
-                            run_start = i;
-                        }
-                        mprotect_range( base, size, 0, 0 );
-                    }
-                    free( old_vprot );
+                    if (status && protection_set)
+                        restore_vprot_or_abort( base, size, old_vprot );
+                    if (old_vprot != stack_snapshot) free( old_vprot );
                 }
             }
             else status = set_protection( view, base, size, protect );

@@ -229,6 +229,25 @@ static void test_HeapCreate(void)
     count = GetProcessHeaps( 0, NULL );
     ok( count == heap_count, "GetProcessHeaps returned %lu\n", count );
 
+    /* executable heaps must still provide ordinary readable and writable storage */
+    heap = HeapCreate( HEAP_CREATE_ENABLE_EXECUTE, REGION_ALIGN, 2 * REGION_ALIGN );
+    ok( !!heap, "executable HeapCreate failed, error %lu\n", GetLastError() );
+    if (heap)
+    {
+        ptr = HeapAlloc( heap, 0, 32 );
+        ok( !!ptr, "executable HeapAlloc failed, error %lu\n", GetLastError() );
+        if (ptr)
+        {
+            ptr[0] = 0x5a;
+            ptr[31] = 0xa5;
+            ok( ptr[0] == 0x5a && ptr[31] == 0xa5, "executable heap storage is not writable\n" );
+            ret = HeapFree( heap, 0, ptr );
+            ok( ret, "executable HeapFree failed, error %lu\n", GetLastError() );
+        }
+        ret = HeapDestroy( heap );
+        ok( ret, "executable HeapDestroy failed, error %lu\n", GetLastError() );
+    }
+
     /* growable heap */
 
     heap = HeapCreate( 0, 0, 0 );

@@ -71,5 +71,6 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
 "$ROOT_DIR/switchyard/tests/macho_tree_validation_test.sh"
 "$ROOT_DIR/switchyard/tests/provider_source_models_test.sh"
 "$ROOT_DIR/switchyard/tests/darwin_arm64_x18_availability_source_test.sh"
+"$ROOT_DIR/switchyard/tests/darwin_arm64_private_valloc_wx_source_test.sh"
 
 echo "source history verified from $upstream_base through $(git -C "$ROOT_DIR" rev-parse HEAD)"

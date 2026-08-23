@@ -1494,9 +1494,11 @@ static UINT_PTR get_zero_bits_mask(ULONG_PTR z)
 
 static void test_NtAllocateVirtualMemory(void)
 {
-    void *addr1, *addr2;
+    MEMORY_BASIC_INFORMATION info;
+    void *addr1, *addr2, *allocation_base, *protect_base;
     NTSTATUS status;
-    SIZE_T size;
+    SIZE_T query_size, size;
+    ULONG old_protect;
     ULONG_PTR zero_bits;
 
     /* simple allocation should success */
@@ -1505,6 +1507,120 @@ static void test_NtAllocateVirtualMemory(void)
     status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr1, 0, &size,
                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     ok(status == STATUS_SUCCESS, "NtAllocateVirtualMemory returned %08lx\n", status);
+
+    /* logical executable protection must survive a separate reserve and commit */
+    size = 0x10000;
+    addr2 = NULL;
+    status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr2, 0, &size,
+                                     MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    ok(status == STATUS_SUCCESS, "executable reserve returned %08lx\n", status);
+    if (status == STATUS_SUCCESS)
+    {
+        allocation_base = addr2;
+        query_size = 0;
+        status = NtQueryVirtualMemory( NtCurrentProcess(), addr2,
+                                       MemoryBasicInformation, &info,
+                                       sizeof(info), &query_size );
+        ok(status == STATUS_SUCCESS, "executable reserve query returned %08lx\n", status);
+        if (status == STATUS_SUCCESS)
+        {
+            ok(info.BaseAddress == allocation_base, "executable reserve base is %p\n",
+               info.BaseAddress);
+            ok(info.AllocationBase == addr2, "executable reserve allocation base is %p\n",
+               info.AllocationBase);
+            ok(info.AllocationProtect == PAGE_EXECUTE_READWRITE,
+               "executable reserve allocation protection is %#lx\n", info.AllocationProtect);
+            ok(info.RegionSize == 0x10000, "executable reserve region size is %Ix\n",
+               info.RegionSize);
+            ok(info.State == MEM_RESERVE, "executable reserve state is %#lx\n", info.State);
+            ok(!info.Protect, "executable reserve protection is %#lx\n", info.Protect);
+            ok(info.Type == MEM_PRIVATE, "executable reserve type is %#lx\n", info.Type);
+            ok(query_size == sizeof(info), "executable reserve query size is %Ix\n", query_size);
+        }
+
+        size = 0x10000;
+        status = NtAllocateVirtualMemory(NtCurrentProcess(), &addr2, 0, &size,
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        ok(status == STATUS_SUCCESS, "executable commit returned %08lx\n", status);
+        if (status == STATUS_SUCCESS)
+        {
+            ok(addr2 == allocation_base, "executable commit base is %p\n", addr2);
+            ok(size == 0x10000, "executable commit size is %Ix\n", size);
+            query_size = 0;
+            status = NtQueryVirtualMemory( NtCurrentProcess(), addr2,
+                                           MemoryBasicInformation, &info,
+                                           sizeof(info), &query_size );
+            ok(status == STATUS_SUCCESS, "executable query returned %08lx\n", status);
+            if (status == STATUS_SUCCESS)
+            {
+                ok(info.BaseAddress == allocation_base, "executable allocation base address is %p\n",
+                   info.BaseAddress);
+                ok(info.AllocationBase == addr2, "executable allocation base is %p\n",
+                   info.AllocationBase);
+                ok(info.AllocationProtect == PAGE_EXECUTE_READWRITE,
+                   "executable allocation protection is %#lx\n", info.AllocationProtect);
+                ok(info.RegionSize == 0x10000, "executable allocation region size is %Ix\n",
+                   info.RegionSize);
+                ok(info.State == MEM_COMMIT, "executable allocation state is %#lx\n", info.State);
+                ok(info.Protect == PAGE_EXECUTE_READWRITE,
+                   "executable allocation protection is %#lx\n", info.Protect);
+                ok(info.Type == MEM_PRIVATE, "executable allocation type is %#lx\n", info.Type);
+                ok(query_size == sizeof(info), "executable allocation query size is %Ix\n",
+                   query_size);
+            }
+            *(volatile BYTE *)addr2 = 0x5a;
+            ok(*(volatile BYTE *)addr2 == 0x5a,
+               "executable allocation is not readable and writable\n");
+
+            /* On hosts with larger physical pages this currently exposes an RX+RWX
+             * protection union.  The transition is required to succeed on Windows;
+             * if Wine cannot represent it, the failed change must be atomic. */
+            protect_base = addr2;
+            size = 0x1000;
+            old_protect = 0xdeadbeef;
+            status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_base, &size,
+                                             PAGE_EXECUTE_READ, &old_protect );
+            todo_wine_if(status == STATUS_ACCESS_DENIED)
+                ok(status == STATUS_SUCCESS, "executable read protect returned %08lx\n", status);
+            if (status == STATUS_SUCCESS)
+            {
+                ok(old_protect == PAGE_EXECUTE_READWRITE,
+                   "executable read old protection is %#lx\n", old_protect);
+                query_size = 0;
+                status = NtQueryVirtualMemory( NtCurrentProcess(), addr2,
+                                               MemoryBasicInformation, &info,
+                                               sizeof(info), &query_size );
+                ok(status == STATUS_SUCCESS, "executable read query returned %08lx\n", status);
+                if (status == STATUS_SUCCESS)
+                {
+                    ok(info.State == MEM_COMMIT, "executable read state is %#lx\n", info.State);
+                    ok(info.Protect == PAGE_EXECUTE_READ,
+                       "executable read protection is %#lx\n", info.Protect);
+                }
+            }
+            else if (status == STATUS_ACCESS_DENIED)
+            {
+                query_size = 0;
+                status = NtQueryVirtualMemory( NtCurrentProcess(), addr2,
+                                               MemoryBasicInformation, &info,
+                                               sizeof(info), &query_size );
+                ok(status == STATUS_SUCCESS, "failed protect query returned %08lx\n", status);
+                if (status == STATUS_SUCCESS)
+                {
+                    ok(info.State == MEM_COMMIT, "failed protect state is %#lx\n", info.State);
+                    ok(info.Protect == PAGE_EXECUTE_READWRITE,
+                       "failed protect changed protection to %#lx\n", info.Protect);
+                }
+                *(volatile BYTE *)addr2 = 0xa5;
+                ok(*(volatile BYTE *)addr2 == 0xa5,
+                   "failed protect did not restore readable and writable access\n");
+            }
+        }
+
+        size = 0;
+        status = NtFreeVirtualMemory(NtCurrentProcess(), &addr2, &size, MEM_RELEASE);
+        ok(status == STATUS_SUCCESS, "executable allocation release returned %08lx\n", status);
+    }
 
     /* allocation conflicts because of 64k align */
     size = 0x1000;

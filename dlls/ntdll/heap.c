@@ -971,7 +971,7 @@ static struct block *split_block( struct heap *heap, ULONG flags, struct block *
 static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_size, SIZE_T *commit_size )
 {
     const SIZE_T align = 0x400 * sizeof(void*);  /* minimum alignment for virtual allocations */
-    void *addr = NULL;
+    void *addr = NULL, *allocation_base;
     NTSTATUS status;
 
     if (heap && !(flags & HEAP_GROWABLE) && (NtCurrentTeb()->Peb->OSPlatformId != VER_PLATFORM_WIN32_WINDOWS))
@@ -990,10 +990,18 @@ static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_siz
         WARN( "Could not allocate %#Ix bytes, status %#lx\n", *region_size, status );
         return NULL;
     }
+    allocation_base = addr;
     if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, commit_size, MEM_COMMIT,
                                            get_protection_type( flags ) )))
     {
+        void *release_addr = allocation_base;
+        SIZE_T free_size = 0;
+        NTSTATUS free_status;
+
         WARN( "Could not commit %#Ix bytes, status %#lx\n", *commit_size, status );
+        free_status = NtFreeVirtualMemory( NtCurrentProcess(), &release_addr, &free_size, MEM_RELEASE );
+        if (free_status)
+            WARN( "Could not release reservation at %p, status %#lx\n", allocation_base, free_status );
         return NULL;
     }
 
