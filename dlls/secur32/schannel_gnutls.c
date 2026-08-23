@@ -2313,6 +2313,16 @@ static NTSTATUS wow64_schan_copy_from_guest( PTR32 address, void *buffer, SIZE_T
     return ntdll_wow64_copy_from_user( buffer, host, size );
 }
 
+static NTSTATUS wow64_schan_validate_guest_range( PTR32 address, SIZE_T size, BOOL output )
+{
+    void *host;
+    NTSTATUS status;
+
+    if ((status = wow64_schan_guest_range( address, size, &host ))) return status;
+    if (output) return ntdll_wow64_probe_user_write( host, size );
+    return ntdll_wow64_probe_user_read( host, size );
+}
+
 static NTSTATUS wow64_schan_capture_rsa_component( PTR32 address, SIZE_T *offset,
                                                    gnutls_datum_t *component,
                                                    BYTE **dst, SIZE_T *capacity,
@@ -2428,6 +2438,11 @@ struct wow64_schan_desc
     BYTE *storage[4];
 };
 
+/* The PE side stages authentication output in a 64 KiB token buffer.  TLS and
+ * DTLS record plaintext is smaller, and the largest wire header is 13 bytes. */
+#define SCHAN_WOW64_MAX_TOKEN_SIZE 0x10000
+#define SCHAN_WOW64_MAX_RECORD_BUFFER_SIZE (0xffff + 13)
+
 static void wow64_schan_free_desc( struct wow64_schan_desc *desc )
 {
     unsigned int i;
@@ -2464,18 +2479,30 @@ static NTSTATUS wow64_schan_capture_desc( PTR32 address,
 }
 
 static NTSTATUS wow64_schan_capture_desc_data( struct wow64_schan_desc *snapshot,
-                                               BOOL input, SIZE_T input_limit )
+                                               BOOL input, SIZE_T input_limit,
+                                               SIZE_T staging_limit )
 {
     unsigned int i;
     SIZE_T size;
     NTSTATUS status;
 
+    /* The transport consumes the descriptor sequentially, so cap total native
+     * staging across all buffers rather than granting the limit to each one. */
     for (i = 0; i < snapshot->desc.cBuffers; i++)
     {
         size = snapshot->buffers[i].cbBuffer;
         if (input && size > input_limit) size = input_limit;
         if (input) input_limit -= size;
+        if (input && size > staging_limit)
+        {
+            status = SEC_E_INVALID_TOKEN;
+            goto error;
+        }
+        if (!input && size > staging_limit) size = staging_limit;
+        snapshot->buffers[i].cbBuffer = size;
         if (!size) continue;
+        if ((status = wow64_schan_validate_guest_range( snapshot->buffers32[i].pvBuffer,
+                                                        size, !input ))) goto error;
         if (!(snapshot->storage[i] = malloc( size )))
         {
             status = STATUS_NO_MEMORY;
@@ -2486,6 +2513,7 @@ static NTSTATUS wow64_schan_capture_desc_data( struct wow64_schan_desc *snapshot
                                                             snapshot->storage[i],
                                                             size )))
             goto error;
+        staging_limit -= size;
     }
     return STATUS_SUCCESS;
 error:
@@ -2910,9 +2938,11 @@ static NTSTATUS wow64_schan_handshake( void *args )
     }
     if (params32->input && !params32->control_token &&
         (status = wow64_schan_capture_desc_data( &input, TRUE,
-                                                 params32->input_size ))) goto unlock;
+                                                 params32->input_size,
+                                                 SCHAN_WOW64_MAX_TOKEN_SIZE ))) goto unlock;
     if (params32->output &&
-        (status = wow64_schan_capture_desc_data( &output, FALSE, 0 ))) goto unlock;
+        (status = wow64_schan_capture_desc_data( &output, FALSE, 0,
+                                                 SCHAN_WOW64_MAX_TOKEN_SIZE ))) goto unlock;
     call_status = handshake_session( object, &params );
     if (params32->output &&
         (status = wow64_schan_add_output_buffers( &output, output_buffer_idx,
@@ -2950,6 +2980,7 @@ static NTSTATUS wow64_schan_recv( void *args )
     BOOL length_set = FALSE;
     struct recv_params params = { params32->session, NULL, params32->input_size,
                                   NULL, &length };
+    SIZE_T max_message_size;
     NTSTATUS status, call_status;
     ULONG count = 0;
 
@@ -2962,6 +2993,10 @@ static NTSTATUS wow64_schan_recv( void *args )
     }
     if ((status = wow64_schan_copy_from_guest( params32->length, &length,
                                                sizeof(length) ))) goto unlock;
+    max_message_size = pgnutls_record_get_max_size( object->session );
+    if (length > max_message_size) length = max_message_size;
+    if (length && (status = wow64_schan_validate_guest_range( params32->buffer,
+                                                              length, TRUE ))) goto unlock;
     if (length && !(buffer = malloc( length )))
     {
         status = STATUS_NO_MEMORY;
@@ -2970,7 +3005,8 @@ static NTSTATUS wow64_schan_recv( void *args )
     params.buffer = buffer;
     if (params32->input &&
         (status = wow64_schan_capture_desc_data( &input, TRUE,
-                                                 params32->input_size ))) goto unlock;
+                                                 params32->input_size,
+                                                 SCHAN_WOW64_MAX_RECORD_BUFFER_SIZE ))) goto unlock;
     call_status = recv_session( object, &params, &published, &length_set );
     if (published &&
         (status = wow64_schan_output_range( params32->buffer, buffer, published,
@@ -3004,18 +3040,28 @@ static NTSTATUS wow64_schan_send( void *args )
     ULONG output_offset = 0, count = 0;
     struct send_params params = { params32->session, NULL, NULL, params32->length,
                                   &output_buffer_idx, &output_offset };
+    SIZE_T max_message_size;
     NTSTATUS status, call_status;
 
     if ((status = wow64_schan_check_call( sizeof(*params32), flags ))) return status;
     if ((status = begin_session( params32->session, &object ))) return status;
+    max_message_size = pgnutls_record_get_max_size( object->session );
+    if (params.length > max_message_size)
+    {
+        status = SEC_E_BUFFER_TOO_SMALL;
+        goto unlock;
+    }
     if (params32->output)
     {
         if ((status = wow64_schan_capture_desc( params32->output, &output ))) goto unlock;
-        if ((status = wow64_schan_capture_desc_data( &output, FALSE, 0 ))) goto unlock;
+        if ((status = wow64_schan_capture_desc_data( &output, FALSE, 0,
+                                                     SCHAN_WOW64_MAX_RECORD_BUFFER_SIZE ))) goto unlock;
         params.output = &output.desc;
     }
     if (params.length)
     {
+        if ((status = wow64_schan_validate_guest_range( params32->buffer,
+                                                        params.length, FALSE ))) goto unlock;
         if (!(buffer = malloc( params.length )))
         {
             status = STATUS_NO_MEMORY;

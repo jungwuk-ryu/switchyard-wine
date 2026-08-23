@@ -1661,7 +1661,7 @@ source_files = {
     "secur32": (
         "dlls/secur32/schannel_gnutls.c",
         22,
-        "43e8a12240a05c982afec0e7566b44b12d8c744658848c6ea23759dd85d25589",
+        "8806af8a5217a580c2c980ac58f0561287f88e9807b9457d007dcf42cccedde2",
     ),
     "winemac": ("dlls/winemac.drv/macdrv_main.c", None, None),
     "ws2_32": ("dlls/ws2_32/unixlib.c", None, None),

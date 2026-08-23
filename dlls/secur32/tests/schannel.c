@@ -18,10 +18,14 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <limits.h>
 #include <stdarg.h>
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include <windef.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <winternl.h>
 #include <stdio.h>
 #define SECURITY_WIN32
 #include <security.h>
@@ -30,6 +34,7 @@
 #include <ncrypt.h>
 
 #include "wine/test.h"
+#include "wine/unixlib.h"
 
 static const BYTE bigCert[] = { 0x30, 0x7a, 0x02, 0x01, 0x01, 0x30, 0x02, 0x06,
  0x00, 0x30, 0x15, 0x31, 0x13, 0x30, 0x11, 0x06, 0x03, 0x55, 0x04, 0x03, 0x13,
@@ -95,6 +100,81 @@ static const BYTE selfSignedCert[] = {
  0xa8, 0x76, 0x57, 0x92, 0x36 };
 
 static CHAR unisp_name_a[] = UNISP_NAME_A;
+
+enum wow64_schan_test_unix_call
+{
+    wow64_schan_test_allocate_certificate_credentials = 2,
+    wow64_schan_test_create_session,
+    wow64_schan_test_dispose_session,
+    wow64_schan_test_free_certificate_credentials,
+    wow64_schan_test_get_max_message_size = 11,
+    wow64_schan_test_recv = 16,
+    wow64_schan_test_send,
+};
+
+struct wow64_schan_test_credentials
+{
+    ULONG credential_use;
+    DWORD enabled_protocols;
+    UINT64 credentials;
+};
+
+struct wow64_schan_test_allocate_params
+{
+    ULONG credentials;
+    ULONG cert_encoding;
+    ULONG cert_size;
+    ULONG cert_blob;
+    ULONG key_size;
+    ULONG key_blob;
+};
+
+struct wow64_schan_test_create_params { ULONG credentials, session; };
+struct wow64_schan_test_session_params { UINT64 session; };
+struct wow64_schan_test_free_params { ULONG credentials; };
+
+struct wow64_schan_test_buffer_desc
+{
+    ULONG version;
+    ULONG count;
+    ULONG buffers;
+};
+
+struct wow64_schan_test_buffer
+{
+    ULONG size;
+    ULONG type;
+    ULONG data;
+};
+
+struct wow64_schan_test_recv_params
+{
+    UINT64 session;
+    ULONG input;
+    ULONG input_size;
+    ULONG buffer;
+    ULONG length;
+};
+
+struct wow64_schan_test_send_params
+{
+    UINT64 session;
+    ULONG output;
+    ULONG buffer;
+    ULONG length;
+    ULONG output_buffer_idx;
+    ULONG output_offset;
+};
+
+C_ASSERT( sizeof(struct wow64_schan_test_credentials) == 16 );
+C_ASSERT( sizeof(struct wow64_schan_test_allocate_params) == 24 );
+C_ASSERT( sizeof(struct wow64_schan_test_create_params) == 8 );
+C_ASSERT( sizeof(struct wow64_schan_test_session_params) == 8 );
+C_ASSERT( sizeof(struct wow64_schan_test_free_params) == 4 );
+C_ASSERT( sizeof(struct wow64_schan_test_buffer_desc) == 12 );
+C_ASSERT( sizeof(struct wow64_schan_test_buffer) == 12 );
+C_ASSERT( sizeof(struct wow64_schan_test_recv_params) == 24 );
+C_ASSERT( sizeof(struct wow64_schan_test_send_params) == 32 );
 
 static const char *algid_to_str(ALG_ID alg)
 {
@@ -2124,12 +2204,172 @@ static void test_ncrypt_key_credentials(void)
     CertCloseStore(store, 0);
 }
 
+static void test_wow64_unix_buffer_limits(void)
+{
+    NTSTATUS (WINAPI **dispatcher_ptr)(unixlib_handle_t, unsigned int, void *);
+    NTSTATUS (WINAPI *dispatcher)(unixlib_handle_t, unsigned int, void *);
+    struct wow64_schan_test_allocate_params allocate_params = {0};
+    struct wow64_schan_test_create_params create_params;
+    struct wow64_schan_test_session_params session_params;
+    struct wow64_schan_test_free_params free_params;
+    struct wow64_schan_test_recv_params recv_params = {0};
+    struct wow64_schan_test_send_params send_params = {0};
+    struct wow64_schan_test_credentials *credentials;
+    struct wow64_schan_test_buffer_desc *desc;
+    struct wow64_schan_test_buffer *buffer;
+    UINT64 *session;
+    ULONG *length, *output_buffer_idx, *output_offset;
+    ULONG translated = 0, max_message;
+    unixlib_handle_t handle;
+    HMODULE ntdll, secur32;
+    BYTE *memory;
+    NTSTATUS status;
+    BOOL have_credentials = FALSE, have_session = FALSE;
+
+    if (sizeof(void *) != 4)
+    {
+        skip("WoW64 Schannel marshalling requires a 32-bit test process\n");
+        return;
+    }
+    status = NtQueryVirtualMemory(GetCurrentProcess(), NtCurrentTeb(),
+                                  MemoryWineWow64TranslatedInformation,
+                                  &translated, sizeof(translated), NULL);
+    if (status || !translated)
+    {
+        skip("WoW64 translated memory is unavailable\n");
+        return;
+    }
+
+    ntdll = GetModuleHandleA("ntdll.dll");
+    secur32 = GetModuleHandleA("secur32.dll");
+    dispatcher_ptr = (void *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher");
+    if (!dispatcher_ptr || !(dispatcher = *dispatcher_ptr))
+    {
+        skip("Unix-call dispatcher is unavailable\n");
+        return;
+    }
+    status = NtQueryVirtualMemory(GetCurrentProcess(), secur32, MemoryWineLoadUnixLibWow64,
+                                  &handle, sizeof(handle), NULL);
+    if (status)
+    {
+        skip("Schannel WoW64 Unixlib is unavailable, status %#lx\n", status);
+        return;
+    }
+    ok(!!(handle & WINE_UNIXLIB_DISPATCH_HANDLE_TAG),
+       "expected tagged Schannel Unixlib handle, got %s\n", wine_dbgstr_longlong(handle));
+
+    memory = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(!!memory, "failed to allocate test memory, error %lu\n", GetLastError());
+    if (!memory) return;
+    memset(memory, 0, 0x10000);
+
+    credentials = (struct wow64_schan_test_credentials *)(memory + 0x1000);
+    session = (UINT64 *)(memory + 0x2000);
+    length = (ULONG *)(memory + 0x3000);
+    output_buffer_idx = (ULONG *)(memory + 0x4000);
+    output_offset = output_buffer_idx + 1;
+    desc = (struct wow64_schan_test_buffer_desc *)(memory + 0x5000);
+    buffer = (struct wow64_schan_test_buffer *)(memory + 0x6000);
+
+    credentials->credential_use = SECPKG_CRED_OUTBOUND;
+    credentials->enabled_protocols = SP_PROT_TLS1_2_CLIENT;
+    allocate_params.credentials = PtrToUlong(credentials);
+    status = dispatcher(handle, wow64_schan_test_allocate_certificate_credentials,
+                        &allocate_params);
+    ok(!status, "allocate credentials returned %#lx\n", status);
+    if (status) goto done;
+    have_credentials = TRUE;
+
+    create_params.credentials = PtrToUlong(credentials);
+    create_params.session = PtrToUlong(session);
+    status = dispatcher(handle, wow64_schan_test_create_session, &create_params);
+    ok(!status && !!*session, "create session returned %#lx, session %s\n",
+       status, wine_dbgstr_longlong(*session));
+    if (status || !*session) goto done;
+    have_session = TRUE;
+
+    session_params.session = *session;
+    status = dispatcher(handle, wow64_schan_test_get_max_message_size, &session_params);
+    max_message = status;
+    ok(status > 0 && max_message <= 0x4000,
+       "unexpected Schannel maximum message size %#lx\n", status);
+    if (status <= 0 || max_message > 0x4000) goto done;
+
+    send_params.session = *session;
+    send_params.output_buffer_idx = PtrToUlong(output_buffer_idx);
+    send_params.output_offset = PtrToUlong(output_offset);
+    send_params.length = max_message;
+    status = dispatcher(handle, wow64_schan_test_send, &send_params);
+    ok(status == STATUS_ACCESS_VIOLATION,
+       "null exact-size send buffer returned %#lx\n", status);
+
+    send_params.length = max_message + 1;
+    status = dispatcher(handle, wow64_schan_test_send, &send_params);
+    ok(status == SEC_E_BUFFER_TOO_SMALL,
+       "oversized send buffer returned %#lx\n", status);
+
+    send_params.length = UINT_MAX;
+    status = dispatcher(handle, wow64_schan_test_send, &send_params);
+    ok(status == SEC_E_BUFFER_TOO_SMALL,
+       "UINT_MAX send buffer returned %#lx\n", status);
+
+    desc->version = SECBUFFER_VERSION;
+    desc->count = 1;
+    desc->buffers = PtrToUlong(buffer);
+    buffer->size = UINT_MAX;
+    buffer->type = SECBUFFER_TOKEN;
+    buffer->data = 0;
+    send_params.output = PtrToUlong(desc);
+    send_params.length = 0;
+    status = dispatcher(handle, wow64_schan_test_send, &send_params);
+    ok(status == STATUS_ACCESS_VIOLATION,
+       "null UINT_MAX output buffer returned %#lx\n", status);
+
+    buffer->data = PtrToUlong(memory);
+    recv_params.session = *session;
+    recv_params.input = PtrToUlong(desc);
+    recv_params.input_size = UINT_MAX;
+    recv_params.length = PtrToUlong(length);
+    *length = 0;
+    status = dispatcher(handle, wow64_schan_test_recv, &recv_params);
+    ok(status == SEC_E_INVALID_TOKEN,
+       "UINT_MAX input descriptor returned %#lx\n", status);
+
+    recv_params.input = 0;
+    recv_params.input_size = 0;
+    *length = UINT_MAX;
+    status = dispatcher(handle, wow64_schan_test_recv, &recv_params);
+    ok(status == STATUS_ACCESS_VIOLATION && *length == UINT_MAX,
+       "null UINT_MAX receive buffer returned %#lx, length %#lx\n", status, *length);
+
+    *length = 0;
+    status = dispatcher(handle, wow64_schan_test_recv, &recv_params);
+    ok(status == SEC_E_OK && !*length,
+       "zero-length receive buffer returned %#lx, length %#lx\n", status, *length);
+
+done:
+    if (have_session)
+    {
+        session_params.session = *session;
+        status = dispatcher(handle, wow64_schan_test_dispose_session, &session_params);
+        ok(!status, "dispose session returned %#lx\n", status);
+    }
+    if (have_credentials)
+    {
+        free_params.credentials = PtrToUlong(credentials);
+        status = dispatcher(handle, wow64_schan_test_free_certificate_credentials, &free_params);
+        ok(!status, "free credentials returned %#lx\n", status);
+    }
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 START_TEST(schannel)
 {
     WSADATA wsa_data;
 
     WSAStartup(0x0202, &wsa_data);
 
+    test_wow64_unix_buffer_limits();
     test_cread_attrs();
     testAcquireSecurityContext();
     test_ncrypt_key_credentials();

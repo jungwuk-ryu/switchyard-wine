@@ -151,7 +151,7 @@ REPO_SOURCE_PATCH="$ROOT_DIR/switchyard/patches/$(basename "$SWITCHYARD_NATIVE_U
   7c2dab33bc8166286af5d8d48388c68eb83a095176ed25025e0740fd828fab3d ] ||
   fail "crypt32 v2-reviewed source differs from its frozen identity"
 [ "$(sha256_file "$ROOT_DIR/dlls/secur32/schannel_gnutls.c")" = \
-  43e8a12240a05c982afec0e7566b44b12d8c744658848c6ea23759dd85d25589 ] ||
+  8806af8a5217a580c2c980ac58f0561287f88e9807b9457d007dcf42cccedde2 ] ||
   fail "secur32 v2-reviewed source differs from its frozen identity"
 
 UNICORN_CACHE="${SWITCHYARD_UNICORN_FIXTURE_CACHE:-${HOME}/.switchyard/deps/cpu-provider/unicorn-${SWITCHYARD_UNICORN_VERSION}-${SWITCHYARD_UNICORN_SOURCE_REVISION:0:12}-build${SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION}-arm64-macos-${SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS}}"
