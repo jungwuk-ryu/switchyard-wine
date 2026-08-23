@@ -882,6 +882,18 @@ manifest_compare = text.index('[ "$manifest_id" = "$runtime_id" ] || return 1')
 native_packaging = text.index('switchyard_validate_native_arm64_runtime_packaging', manifest_compare)
 if not manifest_compare < native_packaging:
     raise SystemExit("runtime reuse does not bind the recomputed exact native ID")
+
+loader_reuse = text.index(
+    '  if [ "$WINE_UNIX_ARCH" = "x86_64" ]; then'
+)
+loader_reuse_end = text.index(
+    '  if ! grep -F "#define SONAME_LIBFREETYPE', loader_reuse
+)
+if not (
+    text.index('HAVE_WINE_PRELOADER', loader_reuse, loader_reuse_end)
+    < text.index('-no_huge', loader_reuse, loader_reuse_end)
+):
+    raise SystemExit("x86_64 loader-reservation reuse policy is incomplete")
 PY
 then
   fail "native compiler, compact-ID, or path ordering policy is incomplete"

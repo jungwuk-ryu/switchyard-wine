@@ -3770,14 +3770,18 @@ if [ "$configured" -eq 1 ] && ! grep -F "prefix = $WINE_INSTALL_PREFIX" "$WINE_B
 fi
 
 if [ "$configured" -eq 1 ]; then
-  if grep -F "#define HAVE_WINE_PRELOADER 1" "$WINE_BUILD_DIR/include/config.h" >/dev/null 2>&1; then
-    if [ "$MACOS_NO_HUGE_SUPPORTED" -eq 1 ]; then
-      echo "existing Wine build uses the macOS preloader despite -no_huge support; reconfiguring"
+  # Only the x86_64 Darwin loader needs either the preloader or the -no_huge
+  # reservation.  The aarch64 configure path intentionally uses neither.
+  if [ "$WINE_UNIX_ARCH" = "x86_64" ]; then
+    if grep -F "#define HAVE_WINE_PRELOADER 1" "$WINE_BUILD_DIR/include/config.h" >/dev/null 2>&1; then
+      if [ "$MACOS_NO_HUGE_SUPPORTED" -eq 1 ]; then
+        echo "existing Wine build uses the macOS preloader despite -no_huge support; reconfiguring"
+        RECONFIGURE=1
+      fi
+    elif ! grep -F -- "-no_huge" "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
+      echo "existing Wine build has neither the macOS preloader nor the -no_huge loader reservation; reconfiguring"
       RECONFIGURE=1
     fi
-  elif ! grep -F -- "-no_huge" "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
-    echo "existing Wine build has neither the macOS preloader nor the -no_huge loader reservation; reconfiguring"
-    RECONFIGURE=1
   fi
   if ! grep -F "#define SONAME_LIBFREETYPE \"$FONT_DLOPEN_FREETYPE\"" "$WINE_BUILD_DIR/include/config.h" >/dev/null 2>&1; then
     echo "existing Wine build is missing the expected FreeType dlopen name; reconfiguring"
