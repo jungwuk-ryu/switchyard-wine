@@ -7087,7 +7087,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
 #ifdef __aarch64__
     source_machine = nt->FileHeader.Machine;
-    if (source_machine != image_info->machine) return status;
+    if (source_machine != image_info->machine) goto done;
 #endif
 
     /* check for non page-aligned binary */
