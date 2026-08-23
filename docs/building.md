@@ -107,7 +107,8 @@ Developer ID signed, optionally notarized archive:
 ```sh
 set -o pipefail
 runtime_digest="$(
-  SWITCHYARD_DISABLE_GPTK_OVERLAY=1 ./switchyard/build_runtime.sh |
+  SWITCHYARD_DISABLE_GPTK_OVERLAY=1 ./switchyard/build_runtime.sh \
+    --runtime-profile preview-native-arm64-fex |
     tee /dev/stderr |
     sed -n 's/^runtime content sha256: //p'
 )"
