@@ -6,12 +6,14 @@ SOURCE="$ROOT_DIR/switchyard/native_arm64_host_probe.c"
 ENTITLEMENTS="$ROOT_DIR/switchyard/native_arm64_host_probe.entitlements"
 MODE=strict
 MINIMUM_MACOS=26.5
+KUSER_MODEL=direct
 MODE_SEEN=0
 MINIMUM_SEEN=0
+KUSER_MODEL_SEEN=0
 
 usage()
 {
-    echo "usage: $0 [--strict | --probe] [--minimum-macos VERSION]" >&2
+    echo "usage: $0 [--strict | --probe] [--minimum-macos VERSION] [--kuser-model direct|translated-shadow]" >&2
 }
 
 fail_usage()
@@ -62,6 +64,16 @@ while [ "$#" -gt 0 ]; do
             MINIMUM_SEEN=1
             shift 2
             ;;
+        --kuser-model)
+            [ "$KUSER_MODEL_SEEN" -eq 0 ] || fail_usage "--kuser-model may be specified only once"
+            [ "$#" -ge 2 ] || fail_usage "--kuser-model requires a model"
+            case "$2" in
+                direct|translated-shadow) KUSER_MODEL="$2" ;;
+                *) fail_usage "unknown KUSER_SHARED_DATA model: $2" ;;
+            esac
+            KUSER_MODEL_SEEN=1
+            shift 2
+            ;;
         --help|-h)
             usage
             exit 0
@@ -97,7 +109,10 @@ cleanup()
         *) echo "refusing to clean an unexpected native ARM64 probe path: $WORK_DIR" >&2 ;;
     esac
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "$HOST_PLATFORM" = Darwin ]; then
     MACOS_VERSION="$(/usr/bin/sw_vers -productVersion)"
@@ -115,12 +130,15 @@ printf 'hostArchitectureSupported=%s\n' "$ARCHITECTURE_SUPPORTED"
 printf 'macOSVersion=%s\n' "$MACOS_VERSION"
 printf 'minimumMacOS=%s\n' "$MINIMUM_MACOS"
 printf 'macOSFloorSupported=%s\n' "$OS_FLOOR_SUPPORTED"
+printf 'kuserSharedDataModel=%s\n' "$KUSER_MODEL"
 
 if [ "$ARCHITECTURE_SUPPORTED" != true ]; then
     echo "native ARM64 Wine requires an arm64 process on an Apple Silicon macOS host; detected $HOST_PLATFORM/$HOST_ARCHITECTURE" >&2
     printf '%s\n' \
         'kuserSharedDataMappable=not-probed' \
         'kuserSharedDataCleanupSucceeded=not-probed' \
+        'kuserSharedDataProbeCompleted=not-probed' \
+        'kuserSharedDataModelSupported=false' \
         'customX18ApiAvailable=not-probed' \
         'customX18SignatureVerified=not-probed' \
         'customX18HardenedRuntime=not-probed' \
@@ -242,6 +260,7 @@ fi
 /bin/cat "$PROBE_OUTPUT"
 
 for required_key in kuserSharedDataMappable kuserSharedDataCleanupSucceeded \
+                    kuserSharedDataProbeCompleted \
                     customX18ApiAvailable customX18SignatureVerified \
                     customX18HardenedRuntime customX18EntitlementEmbedded \
                     customX18EntitlementRequired customX18PreemptionObserved \
@@ -254,8 +273,23 @@ done
 
 SUPPORTED=true
 [ "$OS_FLOOR_SUPPORTED" = true ] || SUPPORTED=false
-/usr/bin/grep -Fx 'kuserSharedDataMappable=true' "$PROBE_OUTPUT" >/dev/null || SUPPORTED=false
-/usr/bin/grep -Fx 'kuserSharedDataCleanupSucceeded=true' "$PROBE_OUTPUT" >/dev/null || SUPPORTED=false
+KUSER_MODEL_SUPPORTED=true
+/usr/bin/grep -Fx 'kuserSharedDataCleanupSucceeded=true' "$PROBE_OUTPUT" >/dev/null ||
+    KUSER_MODEL_SUPPORTED=false
+/usr/bin/grep -Fx 'kuserSharedDataProbeCompleted=true' "$PROBE_OUTPUT" >/dev/null ||
+    KUSER_MODEL_SUPPORTED=false
+case "$KUSER_MODEL" in
+    direct)
+        /usr/bin/grep -Fx 'kuserSharedDataMappable=true' "$PROBE_OUTPUT" >/dev/null ||
+            KUSER_MODEL_SUPPORTED=false
+        ;;
+    translated-shadow)
+        # This probe establishes only that the direct capability result is
+        # trustworthy and left no mapping behind.  The runtime's source and
+        # manifest validators own proof of PEB.SharedData/high-shadow routing.
+        ;;
+esac
+[ "$KUSER_MODEL_SUPPORTED" = true ] || SUPPORTED=false
 /usr/bin/grep -Fx 'customX18ApiAvailable=true' "$PROBE_OUTPUT" >/dev/null || SUPPORTED=false
 /usr/bin/grep -Fx 'customX18SignatureVerified=true' "$PROBE_OUTPUT" >/dev/null || SUPPORTED=false
 /usr/bin/grep -Fx 'customX18HardenedRuntime=true' "$PROBE_OUTPUT" >/dev/null || SUPPORTED=false
@@ -263,6 +297,7 @@ SUPPORTED=true
 /usr/bin/grep -Fx 'customX18PreemptionObserved=true' "$PROBE_OUTPUT" >/dev/null || SUPPORTED=false
 /usr/bin/grep -Fx 'customX18Preserved=true' "$PROBE_OUTPUT" >/dev/null || SUPPORTED=false
 
+printf 'kuserSharedDataModelSupported=%s\n' "$KUSER_MODEL_SUPPORTED"
 printf 'nativeArm64HostSupported=%s\n' "$SUPPORTED"
 if [ "$MODE" = strict ] && [ "$SUPPORTED" != true ]; then
     echo "native ARM64 host requirements are not satisfied; use --probe to collect non-fatal capability evidence" >&2

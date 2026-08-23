@@ -37,6 +37,7 @@ struct mapping_result
     bool mmap_attempted;
     bool mappable;
     bool cleanup_succeeded;
+    bool probe_completed;
     const char *stage;
     const char *error_domain;
     int error_code;
@@ -62,7 +63,7 @@ static void set_mapping_error(struct mapping_result *result, const char *stage,
 static struct mapping_result probe_kuser_shared_data(void)
 {
     const mach_vm_address_t target = KUSER_SHARED_DATA_ADDRESS;
-    struct mapping_result result = {0, false, false, false, true,
+    struct mapping_result result = {0, false, false, false, true, false,
                                     "not-started", "none", 0};
     mach_vm_address_t reservation = target;
     kern_return_t mach_status;
@@ -95,10 +96,10 @@ static struct mapping_result probe_kuser_shared_data(void)
     if (mach_status != KERN_SUCCESS)
     {
         set_mapping_error(&result, "reservation", "mach", mach_status);
+        result.probe_completed = true;
         fprintf(stderr,
                 "cannot reserve Windows KUSER_SHARED_DATA at 0x%llx without overwrite: "
-                "mach_vm_map returned %d (%s); this host cannot run the native ARM64 "
-                "Wine path without a supported low-VA mapping policy\n",
+                "mach_vm_map returned %d (%s); direct low-address placement is unavailable\n",
                 (unsigned long long)target, mach_status, mach_error_string(mach_status));
         return result;
     }
@@ -127,6 +128,7 @@ static struct mapping_result probe_kuser_shared_data(void)
         if (mach_vm_deallocate(mach_task_self(), reservation,
                                (mach_vm_size_t)result.page_size) != KERN_SUCCESS)
             result.cleanup_succeeded = false;
+        result.probe_completed = result.cleanup_succeeded;
         fprintf(stderr,
                 "mmap could not place Windows KUSER_SHARED_DATA at 0x%llx: %s; "
                 "the non-overwriting reservation was released\n",
@@ -173,6 +175,8 @@ static struct mapping_result probe_kuser_shared_data(void)
         fprintf(stderr, "cannot release the KUSER_SHARED_DATA probe mapping: %s\n",
                 strerror(errno));
     }
+    else
+        result.probe_completed = true;
     return result;
 }
 
@@ -314,6 +318,8 @@ int main(int argc, char **argv)
     printf("kuserSharedDataMappable=%s\n", boolean(mapping.mappable));
     printf("kuserSharedDataCleanupSucceeded=%s\n",
            boolean(mapping.cleanup_succeeded));
+    printf("kuserSharedDataProbeCompleted=%s\n",
+           boolean(mapping.probe_completed));
     printf("kuserSharedDataProbeStage=%s\n", mapping.stage);
     printf("kuserSharedDataErrorDomain=%s\n", mapping.error_domain);
     printf("kuserSharedDataErrorCode=%d\n", mapping.error_code);
