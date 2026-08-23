@@ -26,6 +26,13 @@ my @nls_files;
 my @winmd_files;
 my %deleted_files;
 
+# This provider test runs as ARM64EC but launches an AMD64 child, so it cannot
+# live in the ordinary per-DLL tests directory without obscuring its ownership.
+my %nonstandard_test_makefiles =
+(
+    "dlls/xtajit64/provider_tests/Makefile.in" => 1,
+);
+
 sub dirname($)
 {
     my $ret = shift;
@@ -277,6 +284,8 @@ sub assign_sources_to_makefiles(@)
         }
         elsif ($name =~ /\.spec$/)
         {
+            my %flags = get_makedep_flags($file);
+            next if defined $flags{standalone};
             my $dllflags = ${$make}{"EXTRADLLFLAGS"} || "";
             next unless defined ${$make}{"TESTDLL"} ||
                 ${$make}{"MODULE"} =~ /\.drv$/ ||
@@ -306,7 +315,7 @@ sub assign_sources_to_makefiles(@)
         else
         {
             my %flags = get_makedep_flags($file);
-            next if defined $flags{header};
+            next if defined $flags{header} || defined $flags{standalone};
         }
         push @{${$make}{"=SOURCES"}}, $name;
     }
@@ -339,7 +348,8 @@ sub update_makefiles(@)
 
         if (defined($make{"TESTDLL"}))  # test
         {
-            die "TESTDLL should not be defined in $file" unless $file =~ /\/tests\/Makefile\.in$/;
+            die "TESTDLL should not be defined in $file"
+                unless $file =~ /\/tests\/Makefile\.in$/ || $nonstandard_test_makefiles{$file};
         }
         elsif (defined($make{"STATICLIB"}))
         {
