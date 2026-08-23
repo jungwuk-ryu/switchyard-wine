@@ -1001,6 +1001,8 @@ def pin_entitlements(arguments):
 
 
 def signing_mode(arguments):
+    if arguments == ["--force", "--sign", "-"]:
+        return "dependency"
     if arguments == [
         "--force",
         "--sign",
@@ -1086,22 +1088,22 @@ def verify_staging_signature(
             )
         ):
             raise PublicationError("embedded Mach-O entitlements do not match the pinned snapshot")
-    if mode == "engineering":
+    if mode in ("dependency", "engineering"):
         status, stdout, stderr = run_in_directory(
             staging_fd, [codesign, "-d", "--verbose=4", target_argument]
         )
         if status:
-            raise PublicationError("cannot inspect private engineering signature details")
+            raise PublicationError("cannot inspect private ad-hoc signature details")
         details = (stdout + stderr).decode("utf-8", "strict")
         lines = details.splitlines()
         if lines.count("Signature=adhoc") != 1:
-            raise PublicationError("engineering Mach-O is not ad-hoc signed")
+            raise PublicationError("private Mach-O is not ad-hoc signed")
         if len(re.findall(r"\bflags=0x2\(adhoc\)(?:\s|$)", details)) != 1:
-            raise PublicationError("engineering Mach-O does not have exact CodeDirectory flags 0x2")
+            raise PublicationError("private Mach-O does not have exact CodeDirectory flags 0x2")
         if "Runtime Version=" in details or re.search(
             r"\bflags=.*(?:\(|,)runtime(?:,|\)|\s|$)", details
         ):
-            raise PublicationError("engineering Mach-O unexpectedly enables Hardened Runtime")
+            raise PublicationError("private ad-hoc Mach-O unexpectedly enables Hardened Runtime")
     elif mode == "release":
         status, stdout, stderr = run_in_directory(
             staging_fd, [codesign, "-d", "--verbose=4", target_argument]

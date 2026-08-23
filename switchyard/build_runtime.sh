@@ -274,6 +274,16 @@ NATIVE_MINGW_CLANG=""
 NATIVE_HOST_CLANG=""
 NATIVE_HOST_CLANGXX=""
 NATIVE_COMPILER_POLICY_IDENTITY=""
+NATIVE_MACOS_DEPLOYMENT_FLAG=""
+NATIVE_MACOS_SDKROOT=""
+NATIVE_MACOS_SDK_VERSION=""
+NATIVE_MACOS_SDK_BUILD_VERSION=""
+NATIVE_MACOS_SDK_SETTINGS_SHA256=""
+NATIVE_MACOS_SDK_FLAG=""
+NATIVE_MACOS_SDK_IDENTITY=""
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  NATIVE_MACOS_DEPLOYMENT_FLAG="-mmacosx-version-min=$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
+fi
 DISABLE_GPTK_OVERLAY="${SWITCHYARD_DISABLE_GPTK_OVERLAY:-0}"
 case "$DISABLE_GPTK_OVERLAY" in
   0) GPTK_PATH="${GPTK_PATH:-$(defaults read dev.switchyard.Switchyard gptkPath 2>/dev/null || true)}" ;;
@@ -302,6 +312,22 @@ RECONFIGURE="${RECONFIGURE:-0}"
 INSTALL_STAGE_ROOT=""
 SWAP_HELPER_DIR=""
 NATIVE_ENTITLEMENTS_SNAPSHOT_FD=""
+FONT_RUNTIME_PREPARED_ROOT=""
+
+remove_prepared_font_runtime() {
+  local prepared_root="$1"
+
+  case "$prepared_root" in
+    /private/tmp/switchyard-font-runtime.??????)
+      [ -d "$prepared_root" ] && [ ! -L "$prepared_root" ] || return 1
+      rm -rf -- "$prepared_root"
+      ;;
+    *)
+      echo "Refusing to remove unexpected prepared font runtime: $prepared_root" >&2
+      return 1
+      ;;
+  esac
+}
 
 cleanup_temporary_paths() {
   if [ -n "$NATIVE_ENTITLEMENTS_SNAPSHOT_FD" ] &&
@@ -315,6 +341,10 @@ cleanup_temporary_paths() {
   if [ -n "$SWAP_HELPER_DIR" ]; then
     rm -rf "$SWAP_HELPER_DIR"
   fi
+  if [ -n "$FONT_RUNTIME_PREPARED_ROOT" ]; then
+    remove_prepared_font_runtime "$FONT_RUNTIME_PREPARED_ROOT" || true
+  fi
+  FONT_RUNTIME_PREPARED_ROOT=""
 }
 trap cleanup_temporary_paths EXIT
 
@@ -331,7 +361,8 @@ int main(void) { return 0; }
 EOF
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
     if "${PROFILE_ARCH_COMMAND[@]}" "$compiler" "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" \
-        -arch "$HOST_MACHO_ARCH" \
+        -arch "$HOST_MACHO_ARCH" "$NATIVE_MACOS_DEPLOYMENT_FLAG" \
+        "$NATIVE_MACOS_SDK_FLAG" \
         "$temporary_dir/conftest.c" -o "$temporary_dir/conftest" -Wl,-no_huge >/dev/null 2>&1; then
       rm -rf "$temporary_dir"
       return 0
@@ -362,7 +393,15 @@ require_command() {
 native_configured_compiler_policy_is_exact() {
   switchyard_native_configured_compiler_policy_is_exact \
     "$1" "$NATIVE_HOST_CLANG" "$NATIVE_HOST_CLANGXX" \
-    "$HOST_MACHO_ARCH" "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG"
+    "$HOST_MACHO_ARCH" "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" &&
+    switchyard_native_configured_host_target_policy_is_exact \
+      "$1" "$NATIVE_MACOS_DEPLOYMENT_FLAG" "$NATIVE_MACOS_SDK_FLAG" \
+      "$NATIVE_HOST_CLANG" "$NATIVE_HOST_CLANGXX"
+}
+
+validate_native_host_toolchain_policy() {
+  switchyard_validate_qualified_native_llvm_compilers &&
+    switchyard_validate_qualified_native_macos_sdk
 }
 
 reject_ambient_native_compiler_policy() {
@@ -472,10 +511,25 @@ if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
     exit 1
   }
   switchyard_qualify_native_llvm_compilers "$NATIVE_LLVM_BIN" || exit $?
+  switchyard_qualify_native_macos_sdk \
+    "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" || exit $?
   NATIVE_MINGW_CLANG="$SWITCHYARD_QUALIFIED_NATIVE_CLANG"
   NATIVE_HOST_CLANG="$SWITCHYARD_QUALIFIED_NATIVE_CLANG"
   NATIVE_HOST_CLANGXX="$SWITCHYARD_QUALIFIED_NATIVE_CLANGXX"
-  NATIVE_COMPILER_POLICY_IDENTITY="$SWITCHYARD_QUALIFIED_NATIVE_COMPILER_IDENTITY"
+  NATIVE_MACOS_SDKROOT="$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDKROOT"
+  NATIVE_MACOS_SDK_VERSION="$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_VERSION"
+  NATIVE_MACOS_SDK_BUILD_VERSION="$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_BUILD_VERSION"
+  NATIVE_MACOS_SDK_SETTINGS_SHA256="$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_SETTINGS_SHA256"
+  NATIVE_MACOS_SDK_FLAG="$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_FLAG"
+  NATIVE_MACOS_SDK_IDENTITY="$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_IDENTITY"
+  NATIVE_COMPILER_POLICY_IDENTITY="$(
+    /usr/bin/printf '%s\0%s\0' \
+      "$SWITCHYARD_QUALIFIED_NATIVE_COMPILER_IDENTITY" \
+      "$NATIVE_MACOS_SDK_IDENTITY" |
+      /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+  )"
+  export SDKROOT="$NATIVE_MACOS_SDKROOT"
+  export MACOSX_DEPLOYMENT_TARGET="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
   if macos_no_huge_supported; then
     MACOS_NO_HUGE_SUPPORTED=1
   fi
@@ -510,6 +564,37 @@ sha256_file() {
 
 short_sha256_stream() {
   shasum -a 256 | awk '{print substr($1, 1, 12)}'
+}
+
+capture_required_output() {
+  [ "$#" -ge 2 ] || {
+    echo "capture_required_output requires an output variable and command" >&2
+    return 2
+  }
+
+  local output_variable="$1"
+  local captured_output
+  local command_status
+
+  shift
+  case "$output_variable" in
+    ''|[0-9]*|*[!a-zA-Z0-9_]*)
+      echo "invalid captured-output variable name: $output_variable" >&2
+      return 2
+      ;;
+  esac
+
+  # macOS Bash 3.2 clears errexit in command-substitution subshells. Restore it
+  # at this boundary so nested staging failures cannot be hidden by later work.
+  if captured_output="$(
+    set -e
+    "$@"
+  )"; then
+    printf -v "$output_variable" '%s' "$captured_output"
+  else
+    command_status=$?
+    return "$command_status"
+  fi
 }
 
 content_tree_digest() {
@@ -715,6 +800,131 @@ verify_host_macho_tree_arches() {
   done < <(find "$root" -type f -print0)
   [ "$macho_count" -gt 0 ] || {
     echo "$label does not contain a Mach-O file." >&2
+    return 1
+  }
+}
+
+adhoc_sign_host_macho_tree() {
+  local root="$1"
+  local label="$2"
+  local candidate description
+  local -a candidates=()
+  local macho_count=0
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || {
+    echo "$label signing is restricted to the native runtime profile." >&2
+    return 1
+  }
+  [ -d "$root" ] && [ ! -L "$root" ] || {
+    echo "$label root is missing or unsafe: $root" >&2
+    return 1
+  }
+
+  # Snapshot the target paths before signing. sign_macho_atomically() creates a
+  # private sibling directory, so a concurrently walking find must not discover
+  # the signer's own temporary copy as another dependency target.
+  while IFS= read -r -d '' candidate; do
+    candidates+=("$candidate")
+  done < <(find "$root" -type f -print0)
+
+  for candidate in "${candidates[@]}"; do
+    description="$(file -b "$candidate")" || {
+      echo "Could not identify staged $label file: $candidate" >&2
+      return 1
+    }
+    case "$description" in
+      *Mach-O*) ;;
+      *) continue ;;
+    esac
+    sign_macho_atomically /usr/bin/codesign "$candidate" \
+      --force --sign - || {
+      echo "Could not ad-hoc sign staged $label Mach-O file: $candidate" >&2
+      return 1
+    }
+    macho_count=$((macho_count + 1))
+  done
+
+  [ "$macho_count" -gt 0 ] || {
+    echo "$label does not contain a staged Mach-O file to sign." >&2
+    return 1
+  }
+}
+
+verify_host_macho_tree_signatures() {
+  local root="$1"
+  local label="$2"
+  local candidate description
+  local macho_count=0
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || {
+    echo "$label signature verification is restricted to the native runtime profile." >&2
+    return 1
+  }
+  [ -d "$root" ] && [ ! -L "$root" ] || {
+    echo "$label root is missing or unsafe: $root" >&2
+    return 1
+  }
+
+  while IFS= read -r -d '' candidate; do
+    description="$(file -b "$candidate")" || {
+      echo "Could not identify staged $label file: $candidate" >&2
+      return 1
+    }
+    case "$description" in
+      *Mach-O*) ;;
+      *) continue ;;
+    esac
+    /usr/bin/codesign --verify --strict --verbose=2 \
+      "$candidate" >/dev/null 2>&1 || {
+      echo "Staged $label Mach-O file has an invalid code signature: $candidate" >&2
+      return 1
+    }
+    macho_count=$((macho_count + 1))
+  done < <(find "$root" -type f -print0)
+
+  [ "$macho_count" -gt 0 ] || {
+    echo "$label does not contain a staged Mach-O file to verify." >&2
+    return 1
+  }
+}
+
+adhoc_sign_and_verify_host_macho_tree() {
+  local root="$1"
+  local label="$2"
+
+  adhoc_sign_host_macho_tree "$root" "$label" || return 1
+  verify_host_macho_tree_signatures "$root" "$label"
+}
+
+adhoc_sign_and_verify_host_macho_file() {
+  local candidate="$1"
+  local label="$2"
+  local description
+
+  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || {
+    echo "$label signing is restricted to the native runtime profile." >&2
+    return 1
+  }
+  [ -f "$candidate" ] && [ ! -L "$candidate" ] || {
+    echo "$label Mach-O file is missing or unsafe: $candidate" >&2
+    return 1
+  }
+  description="$(file -b "$candidate")" || return 1
+  case "$description" in
+    *Mach-O*) ;;
+    *)
+      echo "$label is not a Mach-O file: $candidate ($description)" >&2
+      return 1
+      ;;
+  esac
+  sign_macho_atomically /usr/bin/codesign "$candidate" \
+    --force --sign - || {
+    echo "Could not ad-hoc sign $label: $candidate" >&2
+    return 1
+  }
+  /usr/bin/codesign --verify --strict --verbose=2 \
+    "$candidate" >/dev/null 2>&1 || {
+    echo "$label failed strict signature verification: $candidate" >&2
     return 1
   }
 }
@@ -1041,7 +1251,8 @@ stage_font_assets() {
         ;;
     esac
 
-    asset="$(download_font_asset "$name" "$expected_hash" "$url")"
+    capture_required_output asset \
+      download_font_asset "$name" "$expected_hash" "$url" || return $?
     if [ "$kind" = "font" ] || [ "$kind" = "font-source" ]; then
       case "$name" in
         *.ttf|*.ttc|*.otf) ;;
@@ -1187,15 +1398,18 @@ stage_mesa_windows_opengl() {
     return 0
   fi
 
-  archive="$(download_mesa_windows_asset \
-    "$MESA_WINDOWS_ARCHIVE" "$MESA_WINDOWS_ARCHIVE_SHA256" "$MESA_WINDOWS_ARCHIVE_URL")"
-  mesa_license="$(download_mesa_windows_asset \
-    "MESA-LICENSE.rst" "$MESA_SOURCE_LICENSE_SHA256" "$MESA_SOURCE_LICENSE_URL")"
-  llvm_license="$(download_mesa_windows_asset \
-    "LLVM-LICENSE.txt" "$MESA_LLVM_LICENSE_SHA256" "$MESA_LLVM_LICENSE_URL")"
-  distributor_license="$(download_mesa_windows_asset \
+  capture_required_output archive download_mesa_windows_asset \
+    "$MESA_WINDOWS_ARCHIVE" "$MESA_WINDOWS_ARCHIVE_SHA256" \
+    "$MESA_WINDOWS_ARCHIVE_URL" || return $?
+  capture_required_output mesa_license download_mesa_windows_asset \
+    "MESA-LICENSE.rst" "$MESA_SOURCE_LICENSE_SHA256" \
+    "$MESA_SOURCE_LICENSE_URL" || return $?
+  capture_required_output llvm_license download_mesa_windows_asset \
+    "LLVM-LICENSE.txt" "$MESA_LLVM_LICENSE_SHA256" \
+    "$MESA_LLVM_LICENSE_URL" || return $?
+  capture_required_output distributor_license download_mesa_windows_asset \
     "DISTRIBUTOR-LICENSE.txt" "$MESA_WINDOWS_DISTRIBUTOR_LICENSE_SHA256" \
-    "$MESA_WINDOWS_DISTRIBUTOR_LICENSE_URL")"
+    "$MESA_WINDOWS_DISTRIBUTOR_LICENSE_URL" || return $?
 
   staging_dir="$(mktemp -d)"
   temporary_prefix="${MESA_WINDOWS_DEPS_PREFIX}.tmp.$$"
@@ -1369,14 +1583,23 @@ stage_vulkan_deps() {
      [ -f "$lib_dir/libvulkan.1.4.350.dylib" ] &&
      [ -f "$lib_dir/libMoltenVK.dylib" ] &&
      [ -f "$icd_file" ] &&
-     vulkan_deps_match_profile_architecture "$VULKAN_DEPS_PREFIX"; then
+     vulkan_deps_match_profile_architecture "$VULKAN_DEPS_PREFIX" &&
+     { [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 0 ] ||
+       verify_host_macho_tree_signatures "$VULKAN_DEPS_PREFIX" \
+         "Vulkan runtime" >/dev/null 2>&1; }; then
     printf '%s\n' "$VULKAN_DEPS_PREFIX"
     return 0
   fi
 
-  loader_archive="$(download_homebrew_oci_blob "$VULKAN_LOADER_REPOSITORY" "sha256:$VULKAN_LOADER_LAYER_SHA256" "$VULKAN_LOADER_BOTTLE")"
-  headers_archive="$(download_homebrew_oci_blob "$VULKAN_HEADERS_REPOSITORY" "sha256:$VULKAN_HEADERS_LAYER_SHA256" "$VULKAN_HEADERS_BOTTLE")"
-  moltenvk_archive="$(download_homebrew_oci_blob "$MOLTENVK_REPOSITORY" "sha256:$MOLTENVK_LAYER_SHA256" "$MOLTENVK_BOTTLE")"
+  capture_required_output loader_archive download_homebrew_oci_blob \
+    "$VULKAN_LOADER_REPOSITORY" "sha256:$VULKAN_LOADER_LAYER_SHA256" \
+    "$VULKAN_LOADER_BOTTLE" || return $?
+  capture_required_output headers_archive download_homebrew_oci_blob \
+    "$VULKAN_HEADERS_REPOSITORY" "sha256:$VULKAN_HEADERS_LAYER_SHA256" \
+    "$VULKAN_HEADERS_BOTTLE" || return $?
+  capture_required_output moltenvk_archive download_homebrew_oci_blob \
+    "$MOLTENVK_REPOSITORY" "sha256:$MOLTENVK_LAYER_SHA256" \
+    "$MOLTENVK_BOTTLE" || return $?
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
     validate_archive_members "$loader_archive" tar
     validate_archive_members "$headers_archive" tar
@@ -1427,6 +1650,7 @@ stage_vulkan_deps() {
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
     vulkan_deps_match_profile_architecture "$temporary_prefix"
     verify_runtime_relative_macho_tree "$temporary_prefix" "Vulkan runtime"
+    adhoc_sign_and_verify_host_macho_tree "$temporary_prefix" "Vulkan runtime"
   fi
 
   {
@@ -1498,7 +1722,10 @@ stage_font_deps() {
      [ -f "$FONT_DEPS_PREFIX/lib/pkgconfig/freetype2.pc" ] &&
      [ -f "$FONT_DEPS_PREFIX/lib/pkgconfig/fontconfig.pc" ] &&
      [ -f "$FONT_DEPS_PREFIX/etc/fonts/fonts.conf" ] &&
-     font_deps_match_profile_architecture "$FONT_DEPS_PREFIX"; then
+     font_deps_match_profile_architecture "$FONT_DEPS_PREFIX" &&
+     { [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 0 ] ||
+       verify_host_macho_tree_signatures "$FONT_DEPS_PREFIX" \
+         "font runtime" >/dev/null 2>&1; }; then
     printf '%s\n' "$FONT_DEPS_PREFIX"
     return 0
   fi
@@ -1515,7 +1742,8 @@ stage_font_deps() {
     repository="${FONT_DEPS_REPOSITORIES[$index]}"
     sha="${FONT_DEPS_LAYER_SHA256[$index]}"
     bottle="${name}--${version}.${SWITCHYARD_RUNTIME_PROFILE_FONT_BOTTLE_TAG}.bottle.tar.gz"
-    archive="$(download_homebrew_oci_blob "$repository" "sha256:$sha" "$bottle" "$FONT_DEPS_CACHE_DIR")"
+    capture_required_output archive download_homebrew_oci_blob \
+      "$repository" "sha256:$sha" "$bottle" "$FONT_DEPS_CACHE_DIR" || return $?
     if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
       validate_archive_members "$archive" tar
     fi
@@ -1628,6 +1856,11 @@ runtime built with these libraries.
 EOF
   fi
 
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    font_deps_match_profile_architecture "$temporary_prefix"
+    adhoc_sign_and_verify_host_macho_tree "$temporary_prefix" "font runtime"
+  fi
+
   test_source="$temporary_prefix/freetype-link-test.c"
   test_binary="$temporary_prefix/freetype-link-test"
   cat >"$test_source" <<'EOF'
@@ -1636,10 +1869,10 @@ EOF
 int main(void) { FT_Library lib; return FT_Init_FreeType(&lib); }
 EOF
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-    switchyard_validate_qualified_native_llvm_compilers || return 1
+    validate_native_host_toolchain_policy || return 1
     "${PROFILE_ARCH_COMMAND[@]}" "$NATIVE_HOST_CLANG" \
       "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" -arch "$HOST_MACHO_ARCH" \
-      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      "$NATIVE_MACOS_DEPLOYMENT_FLAG" "$NATIVE_MACOS_SDK_FLAG" \
       -I"$temporary_prefix/include/freetype2" \
       -L"$temporary_prefix/lib" \
       -Wl,-rpath,"$temporary_prefix/lib" \
@@ -1662,10 +1895,10 @@ EOF
 int main(void) { return FcInit() ? 0 : 1; }
 EOF
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-    switchyard_validate_qualified_native_llvm_compilers || return 1
+    validate_native_host_toolchain_policy || return 1
     "${PROFILE_ARCH_COMMAND[@]}" "$NATIVE_HOST_CLANG" \
       "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" -arch "$HOST_MACHO_ARCH" \
-      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      "$NATIVE_MACOS_DEPLOYMENT_FLAG" "$NATIVE_MACOS_SDK_FLAG" \
       -I"$temporary_prefix/include" \
       -I"$temporary_prefix/include/freetype2" \
       -L"$temporary_prefix/lib" \
@@ -1687,9 +1920,6 @@ EOF
     FONTCONFIG_PATH="$temporary_prefix/etc/fonts" \
     "$test_binary"
   rm -f "$test_source" "$test_binary"
-  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-    font_deps_match_profile_architecture "$temporary_prefix"
-  fi
   write_content_tree_digest "$temporary_prefix"
   atomic_replace_directory "$temporary_prefix" "$FONT_DEPS_PREFIX" cache
   rm -rf "$staging_dir"
@@ -1728,6 +1958,11 @@ relocate_font_deps_for_runtime() {
       esac
     done < <(otool -L "$library" | awk 'NR > 1 { print $1 }')
   done
+
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    adhoc_sign_and_verify_host_macho_tree "$runtime_font_root" \
+      "installed font runtime"
+  fi
 }
 
 download_tls_package() {
@@ -1910,7 +2145,10 @@ stage_tls_deps() {
   if content_tree_is_verified "$tls_deps_prefix" &&
      [ -f "$tls_deps_prefix/lib/libgnutls.30.dylib" ] &&
      [ -f "$tls_deps_prefix/lib/pkgconfig/gnutls.pc" ] &&
-     tls_deps_match_profile_architecture "$tls_deps_prefix"; then
+     tls_deps_match_profile_architecture "$tls_deps_prefix" &&
+     { [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 0 ] ||
+       verify_host_macho_tree_signatures "$tls_deps_prefix" \
+         "TLS runtime" >/dev/null 2>&1; }; then
     printf '%s\n' "$tls_deps_prefix"
     return 0
   fi
@@ -1932,7 +2170,8 @@ stage_tls_deps() {
       exit 1
     fi
 
-    package_archive="$(download_tls_package "$package_name" "$package_filename" "$package_hash")"
+    capture_required_output package_archive download_tls_package \
+      "$package_name" "$package_filename" "$package_hash" || return $?
     package_root="$(mktemp -d)"
     extract_tls_package "$package_archive" "$package_root"
 
@@ -1979,8 +2218,8 @@ stage_tls_deps() {
       exit 1
     fi
 
-    source_archive="$(download_tls_source \
-      "$source_name" "$source_filename" "$source_url" "$source_hash")"
+    capture_required_output source_archive download_tls_source \
+      "$source_name" "$source_filename" "$source_url" "$source_hash" || return $?
     if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
       validate_archive_members "$source_archive" tar
     fi
@@ -2003,7 +2242,7 @@ stage_tls_deps() {
     tls_source_cc="clang -arch $HOST_DEPENDENCY_ARCH"
     tls_source_cxx="clang++ -arch $HOST_DEPENDENCY_ARCH"
     if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-      switchyard_validate_qualified_native_llvm_compilers || return 1
+      validate_native_host_toolchain_policy || return 1
       tls_source_cc="$NATIVE_HOST_CLANG $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_DEPENDENCY_ARCH"
       tls_source_cxx="$NATIVE_HOST_CLANGXX $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_DEPENDENCY_ARCH"
     fi
@@ -2013,9 +2252,9 @@ stage_tls_deps() {
       env \
         CC="$tls_source_cc" \
         CXX="$tls_source_cxx" \
-        CFLAGS="-O2 -mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
-        CXXFLAGS="-O2 -mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
-        LDFLAGS="-mmacosx-version-min=$TLS_MIN_MACOS_VERSION" \
+        CFLAGS="-O2 -mmacosx-version-min=$TLS_MIN_MACOS_VERSION ${NATIVE_MACOS_SDK_FLAG:-}" \
+        CXXFLAGS="-O2 -mmacosx-version-min=$TLS_MIN_MACOS_VERSION ${NATIVE_MACOS_SDK_FLAG:-}" \
+        LDFLAGS="-mmacosx-version-min=$TLS_MIN_MACOS_VERSION ${NATIVE_MACOS_SDK_FLAG:-}" \
         MACOSX_DEPLOYMENT_TARGET="$TLS_MIN_MACOS_VERSION" \
         "$source_root/configure" \
           --build="$source_build_triplet" \
@@ -2184,6 +2423,12 @@ EOF
   install -m 0644 "$TLS_SOURCE_MANIFEST" \
     "$temporary_prefix/share/doc/switchyard-tls/sources.tsv"
 
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    tls_deps_match_profile_architecture "$temporary_prefix"
+    verify_runtime_relative_macho_tree "$temporary_prefix" "TLS runtime"
+    adhoc_sign_and_verify_host_macho_tree "$temporary_prefix" "TLS runtime"
+  fi
+
   test_source="$temporary_prefix/gnutls-link-test.c"
   test_binary="$temporary_prefix/gnutls-link-test"
   cat >"$test_source" <<'EOF'
@@ -2191,10 +2436,10 @@ EOF
 int main(void) { return gnutls_check_version("3.0") ? 0 : 1; }
 EOF
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-    switchyard_validate_qualified_native_llvm_compilers || return 1
+    validate_native_host_toolchain_policy || return 1
     "${PROFILE_ARCH_COMMAND[@]}" "$NATIVE_HOST_CLANG" \
       "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" -arch "$HOST_MACHO_ARCH" \
-      -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+      "$NATIVE_MACOS_DEPLOYMENT_FLAG" "$NATIVE_MACOS_SDK_FLAG" \
       -I"$temporary_prefix/include" \
       -L"$temporary_prefix/lib" \
       -Wl,-rpath,"$temporary_prefix/lib" \
@@ -2209,11 +2454,6 @@ EOF
   fi
   env DYLD_LIBRARY_PATH="$temporary_prefix/lib" "$test_binary"
   rm -f "$test_source" "$test_binary"
-
-  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-    tls_deps_match_profile_architecture "$temporary_prefix"
-    verify_runtime_relative_macho_tree "$temporary_prefix" "TLS runtime"
-  fi
 
   write_content_tree_digest "$temporary_prefix"
   atomic_replace_directory "$temporary_prefix" "$tls_deps_prefix" cache
@@ -2334,6 +2574,10 @@ gstreamer_deps_are_complete() {
   [ -f "$prefix/share/doc/switchyard-gstreamer/packages.tsv" ] || return 1
   [ "$(tr -d '[:space:]' < "$prefix/share/doc/switchyard-gstreamer/VERSION")" = "$GSTREAMER_VERSION" ] || return 1
   gstreamer_deps_match_profile_architecture "$prefix" || return 1
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    verify_host_macho_tree_signatures "$prefix" \
+      "GStreamer runtime" >/dev/null 2>&1 || return 1
+  fi
   for plugin in "${GSTREAMER_PLUGIN_FILES[@]}"; do
     [ -f "$prefix/lib/gstreamer-1.0/$plugin" ] || return 1
   done
@@ -2358,10 +2602,10 @@ stage_gstreamer_deps() {
     return 0
   fi
 
-  runtime_package="$(download_gstreamer_package \
-    "$GSTREAMER_RUNTIME_PACKAGE" "$GSTREAMER_RUNTIME_PACKAGE_SHA256")"
-  devel_package="$(download_gstreamer_package \
-    "$GSTREAMER_DEVEL_PACKAGE" "$GSTREAMER_DEVEL_PACKAGE_SHA256")"
+  capture_required_output runtime_package download_gstreamer_package \
+    "$GSTREAMER_RUNTIME_PACKAGE" "$GSTREAMER_RUNTIME_PACKAGE_SHA256" || return $?
+  capture_required_output devel_package download_gstreamer_package \
+    "$GSTREAMER_DEVEL_PACKAGE" "$GSTREAMER_DEVEL_PACKAGE_SHA256" || return $?
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
     validate_xar_members "$runtime_package"
     validate_xar_members "$devel_package"
@@ -2466,6 +2710,8 @@ stage_gstreamer_deps() {
     validate_extracted_tree_links "$temporary_prefix"
     gstreamer_deps_match_profile_architecture "$temporary_prefix"
     verify_runtime_relative_macho_tree "$temporary_prefix" "GStreamer runtime"
+    adhoc_sign_and_verify_host_macho_tree "$temporary_prefix" \
+      "GStreamer runtime"
   fi
   verify_gstreamer_runtime "$temporary_prefix"
   write_content_tree_digest "$temporary_prefix"
@@ -2502,6 +2748,10 @@ relocate_winegstreamer_for_runtime() {
     if ! otool -L "$module" | grep -F '@rpath/libgstreamer-1.0.0.dylib' >/dev/null 2>&1; then
       echo "Wine GStreamer backend does not link the staged GStreamer runtime: $module" >&2
       return 1
+    fi
+    if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+      adhoc_sign_and_verify_host_macho_file "$module" \
+        "relocated Wine GStreamer backend" || return 1
     fi
   done < <(find "$runtime_root/lib/wine" -type f -path '*-unix/winegstreamer.so' -print0)
 
@@ -2691,6 +2941,8 @@ PY
   [ "$(/usr/bin/gzip -dc "$source_archive" | git get-tar-commit-id 2>/dev/null || true)" = \
     "$SWITCHYARD_UNICORN_SOURCE_REVISION" ] || return 1
   [ "$(lipo -archs "$dylib")" = "arm64" ] || return 1
+  /usr/bin/codesign --verify --strict --verbose=2 \
+    "$dylib" >/dev/null 2>&1 || return 1
   [ "$(otool -D "$dylib" | /usr/bin/tail -n 1)" = "@rpath/libunicorn.2.dylib" ] || return 1
   verify_exact_arm64_macos_metadata "$dylib" "Unicorn runtime" \
     "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" || return 1
@@ -2729,6 +2981,8 @@ validate_staged_unicorn_providers() {
       *) return 1 ;;
     esac
     [ "$(lipo -archs "$unix_library")" = "arm64" ] || return 1
+    /usr/bin/codesign --verify --strict --verbose=2 \
+      "$unix_library" >/dev/null 2>&1 || return 1
     verify_exact_arm64_macos_metadata "$unix_library" \
       "native Unicorn provider" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" || return 1
     [ "$(otool -D "$unix_library" | /usr/bin/tail -n 1)" = \
@@ -2873,6 +3127,11 @@ stage_unicorn_runtime() {
     fi
   done
 
+  for relative in "${UNICORN_PROVIDER_UNIXLIBS[@]}"; do
+    adhoc_sign_and_verify_host_macho_file "$runtime_root/$relative" \
+      "relocated native Unicorn provider" || return 1
+  done
+
   validate_staged_unicorn_runtime "$runtime_root" || {
     echo "Staged Unicorn runtime payload failed validation." >&2
     return 1
@@ -2975,42 +3234,50 @@ if [ -n "$GPTK_PATH" ] && [ -d "$GPTK_PATH/redist/lib" ]; then
   )"
 fi
 
+wine_mono_path=""
+gstreamer_deps_prefix=""
+vulkan_deps_prefix=""
+mesa_windows_prefix=""
+font_deps_prefix=""
+font_assets_prefix=""
+tls_deps_prefix=""
+
 if [ "$MODE" = "--verify-tls" ]; then
-  tls_deps_prefix="$(stage_tls_deps)"
-  echo "verified pinned x86_64 TLS runtime at $tls_deps_prefix"
+  capture_required_output tls_deps_prefix stage_tls_deps || exit $?
+  echo "verified pinned $HOST_DEPENDENCY_ARCH TLS runtime at $tls_deps_prefix"
   echo "tlsRuntimeDigest=$(content_tree_digest "$tls_deps_prefix")"
   exit 0
 fi
 
 if [ "$MODE" = "--verify-media" ]; then
-  gstreamer_deps_prefix="$(stage_gstreamer_deps)"
+  capture_required_output gstreamer_deps_prefix stage_gstreamer_deps || exit $?
   verify_gstreamer_runtime "$gstreamer_deps_prefix" "${SWITCHYARD_MEDIA_SMOKE_ASSET:-}"
-  echo "verified pinned x86_64 GStreamer media runtime at $gstreamer_deps_prefix"
+  echo "verified pinned $SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_ARCHITECTURE_DESCRIPTION GStreamer media runtime at $gstreamer_deps_prefix"
   echo "gstreamerRuntimeDigest=$(content_tree_digest "$gstreamer_deps_prefix")"
   exit 0
 fi
 
 if [ "$MODE" = "--verify-mesa" ]; then
-  mesa_windows_prefix="$(stage_mesa_windows_opengl)"
+  capture_required_output mesa_windows_prefix stage_mesa_windows_opengl || exit $?
   echo "verified pinned i386/x86_64 Mesa Windows OpenGL runtime at $mesa_windows_prefix"
   echo "mesaRuntimeDigest=$(content_tree_digest "$mesa_windows_prefix")"
   exit 0
 fi
 
-wine_mono_path="$(download_wine_mono)"
+capture_required_output wine_mono_path download_wine_mono || exit $?
 wine_mono_digest="$(sha256_file "$wine_mono_path")"
-gstreamer_deps_prefix="$(stage_gstreamer_deps)"
+capture_required_output gstreamer_deps_prefix stage_gstreamer_deps || exit $?
 gstreamer_deps_digest="$(content_tree_digest "$gstreamer_deps_prefix")"
-vulkan_deps_prefix="$(stage_vulkan_deps)"
+capture_required_output vulkan_deps_prefix stage_vulkan_deps || exit $?
 vulkan_deps_digest="$(content_tree_digest "$vulkan_deps_prefix")"
-mesa_windows_prefix="$(stage_mesa_windows_opengl)"
+capture_required_output mesa_windows_prefix stage_mesa_windows_opengl || exit $?
 mesa_windows_digest="$(content_tree_digest "$mesa_windows_prefix")"
-font_deps_prefix="$(stage_font_deps)"
+capture_required_output font_deps_prefix stage_font_deps || exit $?
 font_deps_digest="$(content_tree_digest "$font_deps_prefix")"
-font_assets_prefix="$(stage_font_assets)"
+capture_required_output font_assets_prefix stage_font_assets || exit $?
 font_assets_digest="$(content_tree_digest "$font_assets_prefix")"
 font_asset_count="$(awk -F '\t' '$1 == "font" { count++ } END { print count + 2 }' "$FONT_ASSET_MANIFEST")"
-tls_deps_prefix="$(stage_tls_deps)"
+capture_required_output tls_deps_prefix stage_tls_deps || exit $?
 if [ -n "$tls_deps_prefix" ]; then
   tls_deps_digest="$(content_tree_digest "$tls_deps_prefix")"
   tls_dlopen_digest="$(printf '%s' "$TLS_DLOPEN_NAME" | short_sha256_stream)"
@@ -3177,6 +3444,17 @@ runtime_is_complete_at() {
       "$prefix/lib/switchyard-tls" "TLS runtime" >/dev/null 2>&1 || return 1
     verify_runtime_relative_macho_tree \
       "$prefix/lib/switchyard-gstreamer" "GStreamer runtime" >/dev/null 2>&1 || return 1
+    verify_host_macho_tree_signatures \
+      "$prefix/lib/switchyard-vulkan" "Vulkan runtime" >/dev/null 2>&1 || return 1
+    verify_host_macho_tree_signatures \
+      "$prefix/lib/switchyard-fonts" "font runtime" >/dev/null 2>&1 || return 1
+    verify_host_macho_tree_signatures \
+      "$prefix/lib/switchyard-tls" "TLS runtime" >/dev/null 2>&1 || return 1
+    verify_host_macho_tree_signatures \
+      "$prefix/lib/switchyard-gstreamer" "GStreamer runtime" >/dev/null 2>&1 || return 1
+    /usr/bin/codesign --verify --strict --verbose=2 \
+      "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/winegstreamer.so" \
+      >/dev/null 2>&1 || return 1
 
     manifest_native_value="$(/usr/bin/plutil -extract gstreamerRuntime.architecture raw -o - "$manifest" 2>/dev/null || true)"
     [ "$manifest_native_value" = \
@@ -3353,9 +3631,12 @@ configured=0
 native_compiler_config_identity=""
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
   native_compiler_config_identity="$(
-    /usr/bin/printf '%s\0%s\0%s\0%s\0' \
+    /usr/bin/printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
       "$NATIVE_COMPILER_POLICY_IDENTITY" "$NATIVE_HOST_CLANG" \
-      "$NATIVE_HOST_CLANGXX" "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" |
+      "$NATIVE_HOST_CLANGXX" "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" \
+      "$NATIVE_MACOS_DEPLOYMENT_FLAG" "$NATIVE_MACOS_SDKROOT" \
+      "$NATIVE_MACOS_SDK_VERSION" "$NATIVE_MACOS_SDK_BUILD_VERSION" \
+      "$NATIVE_MACOS_SDK_SETTINGS_SHA256" "$NATIVE_MACOS_SDK_FLAG" |
       /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
   )"
 fi
@@ -3452,6 +3733,7 @@ if [ "$configured" -eq 0 ]; then
   configure_ldflags="-L${font_deps_prefix}/lib -Wl,-rpath,${font_deps_prefix}/lib -L${vulkan_deps_prefix}/lib -Wl,-rpath,${vulkan_deps_prefix}/lib"
   configure_pkg_config_path="${gstreamer_deps_prefix}/lib/pkgconfig:${font_deps_prefix}/lib/pkgconfig:${vulkan_deps_prefix}/lib/pkgconfig"
   configure_deployment_flag="-mmacosx-version-min=$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"
+  configure_sdk_flag=""
   if [ -n "$tls_deps_prefix" ]; then
     configure_cppflags="-I${tls_deps_prefix}/include ${configure_cppflags}"
     configure_ldflags="-L${tls_deps_prefix}/lib -Wl,-rpath,${tls_deps_prefix}/lib ${configure_ldflags}"
@@ -3476,15 +3758,16 @@ if [ "$configured" -eq 0 ]; then
   configure_ldflags_environment="${configure_deployment_flag} ${configure_ldflags} ${LDFLAGS:-}"
   configure_pkg_config_path_environment="${configure_pkg_config_path}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-    switchyard_validate_qualified_native_llvm_compilers || exit $?
+    validate_native_host_toolchain_policy || exit $?
+    configure_sdk_flag="$NATIVE_MACOS_SDK_FLAG"
     configure_cc="$NATIVE_HOST_CLANG $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_MACHO_ARCH"
     configure_cxx="$NATIVE_HOST_CLANGXX $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_MACHO_ARCH"
     configure_objc="$NATIVE_HOST_CLANG $SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG -arch $HOST_MACHO_ARCH"
-    configure_cflags="-g -O2 $configure_deployment_flag"
-    configure_cxxflags="-g -O2 $configure_deployment_flag"
-    configure_objcflags="-g -O2 $configure_deployment_flag"
+    configure_cflags="-g -O2 $configure_deployment_flag $configure_sdk_flag"
+    configure_cxxflags="-g -O2 $configure_deployment_flag $configure_sdk_flag"
+    configure_objcflags="-g -O2 $configure_deployment_flag $configure_sdk_flag"
     configure_cppflags_environment="$configure_cppflags"
-    configure_ldflags_environment="${configure_deployment_flag} ${configure_ldflags}"
+    configure_ldflags_environment="${configure_deployment_flag} ${configure_sdk_flag} ${configure_ldflags}"
     configure_pkg_config_path_environment="$configure_pkg_config_path"
   fi
   (
@@ -3497,6 +3780,7 @@ if [ "$configured" -eq 0 ]; then
     if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
       unset cc cxx cpp objc objcxx
     fi
+    SDKROOT="${NATIVE_MACOS_SDKROOT:-${SDKROOT:-}}" \
     MACOSX_DEPLOYMENT_TARGET="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
     CFLAGS="$configure_cflags" \
     CXXFLAGS="$configure_cxxflags" \
@@ -3599,7 +3883,7 @@ fi
 
 assert_source_state_unchanged "dependency preparation"
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-  switchyard_validate_qualified_native_llvm_compilers || exit $?
+  validate_native_host_toolchain_policy || exit $?
 fi
 echo "building Switchyard Wine with $JOBS jobs"
 make -C "$WINE_BUILD_DIR" -j"$JOBS"
@@ -3825,11 +4109,11 @@ install -m 0644 "$ROOT_DIR/switchyard/lib/gpu_capability_policy.sh" \
 mkdir -p "$WINE_INSTALL_PREFIX/libexec"
 echo "building the D3DMetal host GPU identity helper"
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-  switchyard_validate_qualified_native_llvm_compilers || exit $?
+  validate_native_host_toolchain_policy || exit $?
   "${PROFILE_ARCH_COMMAND[@]}" "$NATIVE_HOST_CLANG" \
     "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" \
     -arch "$HOST_MACHO_ARCH" -fobjc-arc -Wall -Wextra -Werror \
-    -mmacosx-version-min="$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
+    "$NATIVE_MACOS_DEPLOYMENT_FLAG" "$NATIVE_MACOS_SDK_FLAG" \
     "$ROOT_DIR/switchyard/host_gpu_info.m" \
     -framework Foundation -framework IOKit -framework Metal \
     -o "$WINE_INSTALL_PREFIX/libexec/switchyard-host-gpu-info"

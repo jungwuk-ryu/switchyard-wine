@@ -762,7 +762,10 @@ fi''',
     'native_homebrew="/opt/homebrew/bin/brew"',
     '"/opt/homebrew/Cellar/llvm/$SWITCHYARD_NATIVE_LLVM_VERSION/bin"',
     '"--with-mingw=$NATIVE_MINGW_CLANG"',
-    'configure_cflags="-g -O2 $configure_deployment_flag"',
+    'switchyard_qualify_native_macos_sdk \\\n    "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS"',
+    'NATIVE_MACOS_SDK_FLAG="$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_FLAG"',
+    'configure_cflags="-g -O2 $configure_deployment_flag $configure_sdk_flag"',
+    'configure_ldflags_environment="${configure_deployment_flag} ${configure_sdk_flag} ${configure_ldflags}"',
     'reject_ambient_native_compiler_policy || exit $?',
 )
 for fragment in required:

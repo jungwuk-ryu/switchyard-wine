@@ -154,6 +154,129 @@ switchyard_validate_qualified_native_llvm_compilers() {
   }
 }
 
+switchyard_qualify_native_macos_sdk() {
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
+    echo "usage: switchyard_qualify_native_macos_sdk EXPECTED_VERSION [XCRUN]" >&2
+    return 2
+  }
+
+  local expected_version="$1"
+  local xcrun_command="${2:-/usr/bin/xcrun}"
+  local reported_sdk
+  local resolved_sdk
+  local sdk_version
+  local sdk_build_version
+  local sdk_settings
+  local sdk_settings_version
+  local sdk_settings_deployment
+  local sdk_settings_sha256
+  local sdk_identity
+
+  case "$expected_version" in
+    ''|*[!0-9.]*)
+      echo "Native macOS SDK version contract is invalid: $expected_version" >&2
+      return 1
+      ;;
+  esac
+  [ -f "$xcrun_command" ] && [ ! -L "$xcrun_command" ] &&
+    [ -x "$xcrun_command" ] || {
+    echo "Native macOS SDK resolver is missing or unsafe: $xcrun_command" >&2
+    return 1
+  }
+  reported_sdk="$("$xcrun_command" --sdk macosx --show-sdk-path)" || return 1
+  sdk_version="$("$xcrun_command" --sdk macosx --show-sdk-version)" || return 1
+  sdk_build_version="$(
+    "$xcrun_command" --sdk macosx --show-sdk-build-version
+  )" || return 1
+  [ "$sdk_version" = "$expected_version" ] || {
+    echo "Native Wine build requires macOS SDK $expected_version, not $sdk_version." >&2
+    return 1
+  }
+  case "$sdk_build_version" in
+    ''|*[!0-9A-Za-z.]*)
+      echo "Native macOS SDK build version is invalid: $sdk_build_version" >&2
+      return 1
+      ;;
+  esac
+  [ -d "$reported_sdk" ] || {
+    echo "Native Wine build could not resolve the macOS SDK directory: $reported_sdk" >&2
+    return 1
+  }
+  resolved_sdk="$(cd "$reported_sdk" && /bin/pwd -P)" || return 1
+  case "$resolved_sdk" in
+    /*) ;;
+    *) echo "Native macOS SDK path is not absolute: $resolved_sdk" >&2; return 1 ;;
+  esac
+  case "$resolved_sdk" in
+    *[[:space:]]*|*[[:cntrl:]]*)
+      echo "Native Wine build requires a macOS SDK path without whitespace or control characters: $resolved_sdk" >&2
+      return 1
+      ;;
+  esac
+  sdk_settings="$resolved_sdk/SDKSettings.plist"
+  [ -f "$sdk_settings" ] && [ ! -L "$sdk_settings" ] || {
+    echo "Native macOS SDK settings are missing or unsafe: $sdk_settings" >&2
+    return 1
+  }
+  sdk_settings_version="$(
+    /usr/bin/plutil -extract Version raw -o - "$sdk_settings"
+  )" || return 1
+  sdk_settings_deployment="$(
+    /usr/bin/plutil -extract DefaultProperties.MACOSX_DEPLOYMENT_TARGET raw \
+      -o - "$sdk_settings"
+  )" || return 1
+  [ "$sdk_settings_version" = "$sdk_version" ] &&
+    [ "$sdk_settings_deployment" = "$expected_version" ] || {
+    echo "Native macOS SDK settings do not match the selected $sdk_version SDK." >&2
+    return 1
+  }
+  sdk_settings_sha256="$(
+    /usr/bin/shasum -a 256 "$sdk_settings" | /usr/bin/awk '{print $1}'
+  )" || return 1
+  sdk_identity="$(
+    /usr/bin/printf '%s\0%s\0%s\0' \
+      "$sdk_version" "$sdk_build_version" "$sdk_settings_sha256" |
+      /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+  )" || return 1
+
+  SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDKROOT="$resolved_sdk"
+  SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_VERSION="$sdk_version"
+  SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_BUILD_VERSION="$sdk_build_version"
+  SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_SETTINGS_SHA256="$sdk_settings_sha256"
+  SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_FLAG="-isysroot$resolved_sdk"
+  SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_IDENTITY="$sdk_identity"
+  SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_XCRUN="$xcrun_command"
+  SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_EXPECTED_VERSION="$expected_version"
+}
+
+switchyard_validate_qualified_native_macos_sdk() {
+  local expected_root="${SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDKROOT:-}"
+  local expected_version="${SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_VERSION:-}"
+  local expected_build_version="${SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_BUILD_VERSION:-}"
+  local expected_settings_sha256="${SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_SETTINGS_SHA256:-}"
+  local expected_flag="${SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_FLAG:-}"
+  local expected_identity="${SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_IDENTITY:-}"
+  local expected_xcrun="${SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_XCRUN:-}"
+  local contract_version="${SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_EXPECTED_VERSION:-}"
+
+  [ -n "$expected_root" ] && [ -n "$expected_identity" ] &&
+    [ -n "$expected_xcrun" ] && [ -n "$contract_version" ] || {
+    echo "Native macOS SDK policy was not qualified." >&2
+    return 1
+  }
+  switchyard_qualify_native_macos_sdk "$contract_version" "$expected_xcrun" ||
+    return 1
+  [ "$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDKROOT" = "$expected_root" ] &&
+    [ "$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_VERSION" = "$expected_version" ] &&
+    [ "$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_BUILD_VERSION" = "$expected_build_version" ] &&
+    [ "$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_SETTINGS_SHA256" = "$expected_settings_sha256" ] &&
+    [ "$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_FLAG" = "$expected_flag" ] &&
+    [ "$SWITCHYARD_QUALIFIED_NATIVE_MACOS_SDK_IDENTITY" = "$expected_identity" ] || {
+    echo "Qualified native macOS SDK identity changed during the build." >&2
+    return 1
+  }
+}
+
 switchyard_native_configured_compiler_policy_is_exact() {
   [ "$#" -eq 5 ] || return 2
 
@@ -197,6 +320,134 @@ switchyard_native_configured_compiler_policy_is_exact() {
              objc_count == 1 && objc_exact == 1)
     }
   ' "$makefile"
+}
+
+switchyard_native_makefile_assignment_has_exact_target_policy() {
+  [ "$#" -eq 8 ] || return 2
+
+  local makefile="$1"
+  local variable="$2"
+  local expected_deployment="$3"
+  local expected_sdk="$4"
+  local required_deployment_count="$5"
+  local required_sdk_count="$6"
+  local required_arch_count="$7"
+  local required_config_count="$8"
+
+  [ -f "$makefile" ] && [ ! -L "$makefile" ] || return 1
+  /usr/bin/awk -v variable="$variable" \
+      -v expected_deployment="$expected_deployment" -v expected_sdk="$expected_sdk" \
+      -v required_deployment_count="$required_deployment_count" \
+      -v required_sdk_count="$required_sdk_count" \
+      -v required_arch_count="$required_arch_count" \
+      -v required_config_count="$required_config_count" '
+    function normalize(value) {
+      gsub(/["\\\047]/, "", value)
+      return value
+    }
+    function has_unsafe_metachar(value) {
+      return value ~ /[\\$`;|&<>*?\[\]{}()#]/ ||
+             index(value, "\"") || index(value, "\047")
+    }
+    function is_deployment(value) {
+      return value ~ /-m[[:alnum:]_-]*version-min/ || index(value, "-mtargetos")
+    }
+    function is_sdk(value) {
+      return index(value, "-isysroot") || index(value, "--sysroot") ||
+             index(value, "-syslibroot")
+    }
+    function is_other_override(value) {
+      return index(value, "-target") ||
+             index(value, "apple-macos") || index(value, "apple-darwin") ||
+             index(value, "-platform_version") ||
+             value ~ /-[[:alnum:]_-]*_version_min/ ||
+             index(value, "-sdk_version") || index(value, "-target-sdk-version") ||
+             index(value, "-Xarch_") || value ~ /-m(cpu|arch|tune|abi)(=|$)/ ||
+             index(value, "-Wl,@") || index(value, "-Xclang") ||
+             index(value, "-Xlinker") || index(value, "--driver-mode") ||
+             index(value, "/clang:") ||
+             index(value, "-fuse-ld") || index(value, "--ld-path") ||
+             value ~ /^-B/ || index(value, "-ccc-install-dir") ||
+             index(value, "-ccc-gcc-name") ||
+             index(value, "-resource-dir") ||
+             index(value, "--config") == 1 || substr(value, 1, 1) == "@"
+    }
+    $1 == variable && $2 == "=" {
+      assignments++
+      if ($0 ~ /\\[[:space:]]*$/) invalid = 1
+      for (field = 3; field <= NF; field++)
+      {
+        raw = $field
+        value = normalize(raw)
+        if (has_unsafe_metachar(raw)) invalid = 1
+        if (is_deployment(value)) {
+          deployment_count++
+          if (raw != expected_deployment) invalid = 1
+        }
+        if (is_sdk(value)) {
+          sdk_count++
+          if (raw != expected_sdk) invalid = 1
+        }
+        if (index(value, "-arch")) {
+          arch_count++
+          if (raw != "-arch" || normalize($(field + 1)) != "arm64") invalid = 1
+        }
+        if (value == "--no-default-config") {
+          config_count++
+          if (raw != "--no-default-config") invalid = 1
+        }
+        else if (is_other_override(value)) invalid = 1
+      }
+    }
+    END {
+      valid = assignments == 1 && deployment_count == required_deployment_count &&
+              sdk_count == required_sdk_count && arch_count == required_arch_count &&
+              config_count == required_config_count && !invalid
+      exit !valid
+    }
+  ' "$makefile"
+}
+
+switchyard_native_makefile_assignment_uses_exact_compiler() {
+  [ "$#" -eq 3 ] || return 2
+
+  local makefile="$1"
+  local variable="$2"
+  local expected_compiler="$3"
+
+  [ -f "$makefile" ] && [ ! -L "$makefile" ] || return 1
+  /usr/bin/awk -v variable="$variable" -v expected_compiler="$expected_compiler" '
+    $1 == variable && $2 == "=" { assignments++; if ($3 == expected_compiler) matches++ }
+    END { exit !(assignments == 1 && matches == 1) }
+  ' "$makefile"
+}
+
+switchyard_native_configured_host_target_policy_is_exact() {
+  [ "$#" -eq 5 ] || return 2
+
+  local makefile="$1"
+  local deployment_flag="$2"
+  local sdk_flag="$3"
+  local host_clang="$4"
+  local host_clangxx="$5"
+  local variable
+
+  switchyard_native_makefile_assignment_uses_exact_compiler \
+    "$makefile" CC "$host_clang" || return 1
+  switchyard_native_makefile_assignment_uses_exact_compiler \
+    "$makefile" CXX "$host_clangxx" || return 1
+  switchyard_native_makefile_assignment_uses_exact_compiler \
+    "$makefile" OBJC "$host_clang" || return 1
+  for variable in CC CXX OBJC; do
+    switchyard_native_makefile_assignment_has_exact_target_policy \
+      "$makefile" "$variable" "$deployment_flag" "$sdk_flag" 0 0 1 1 || return 1
+  done
+  switchyard_native_makefile_assignment_has_exact_target_policy \
+    "$makefile" CPPFLAGS "$deployment_flag" "$sdk_flag" 0 0 0 0 || return 1
+  for variable in CFLAGS CXXFLAGS OBJCFLAGS LDFLAGS; do
+    switchyard_native_makefile_assignment_has_exact_target_policy \
+      "$makefile" "$variable" "$deployment_flag" "$sdk_flag" 1 1 0 0 || return 1
+  done
 }
 
 switchyard_native_runtime_closure_digest() {
