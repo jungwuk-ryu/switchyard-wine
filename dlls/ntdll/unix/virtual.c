@@ -148,7 +148,9 @@ struct file_view
 #define VPROT_FREE_PLACEHOLDER 0x0800
 #define VPROT_WOW64_TRANSLATED 0x1000  /* view contains i386 guest memory in the Darwin shadow */
 #define VPROT_AMD64_LOW_TRANSLATED 0x2000 /* fixed-low AMD64 image in the Darwin shadow */
+#define VPROT_AMD64_IDENTITY   0x4000  /* identity-mapped AMD64 image fetched by the CPU provider */
 #define VPROT_SHADOW_TRANSLATED (VPROT_WOW64_TRANSLATED | VPROT_AMD64_LOW_TRANSLATED)
+#define VPROT_CPU_PROVIDER_OWNED (VPROT_SHADOW_TRANSLATED | VPROT_AMD64_IDENTITY)
 
 static inline BOOL is_shadow_translated_vprot( unsigned int vprot )
 {
@@ -3206,16 +3208,16 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image 
  *
  * Wrapper for mprotect, adds PROT_EXEC if forced by force_exec_prot
  */
-static inline int mprotect_exec( void *base, size_t size, int unix_prot, BOOL translated_wow64 )
+static inline int mprotect_exec( void *base, size_t size, int unix_prot, BOOL cpu_provider_owned )
 {
 #if defined(__APPLE__) && defined(__aarch64__)
     /* Guest code is fetched by the CPU provider and must never become host ARM64 executable code. */
-    if (translated_wow64) unix_prot &= ~PROT_EXEC;
+    if (cpu_provider_owned) unix_prot &= ~PROT_EXEC;
 #else
-    translated_wow64 = FALSE;
+    cpu_provider_owned = FALSE;
 #endif
 
-    if (!translated_wow64 && force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
+    if (!cpu_provider_owned && force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
         if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
@@ -3263,9 +3265,9 @@ static BOOL can_retry_native_writable_exec( const struct file_view *view, const 
 
 
 static inline int mprotect_range_run( struct file_view *view, void *base, size_t size, int unix_prot,
-                                      BOOL translated_shadow, BYTE set, BYTE clear )
+                                      BOOL cpu_provider_owned, BYTE set, BYTE clear )
 {
-    if (!mprotect_exec( base, size, unix_prot, translated_shadow )) return 0;
+    if (!mprotect_exec( base, size, unix_prot, cpu_provider_owned )) return 0;
 
 #if defined(__APPLE__) && defined(__aarch64__)
     if (errno == EACCES &&
@@ -3286,6 +3288,7 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
 {
     struct file_view *view = find_view( base, size );
     BOOL translated_shadow = view && is_shadow_translated_vprot( view->protect );
+    BOOL cpu_provider_owned = view && (view->protect & VPROT_CPU_PROVIDER_OWNED);
     size_t i, count;
     char *addr = ROUND_ADDR( base, host_page_mask );
     int prot, next;
@@ -3304,13 +3307,13 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
         next = get_unix_prot( (vprot & ~clear) | set );
         if (next == prot) continue;
         if (mprotect_range_run( view, addr, count * host_page_size, prot,
-                                translated_shadow, set, clear )) return -1;
+                                cpu_provider_owned, set, clear )) return -1;
         addr += count * host_page_size;
         prot = next;
         count = 0;
     }
     return mprotect_range_run( view, addr, count * host_page_size, prot,
-                               translated_shadow, set, clear );
+                               cpu_provider_owned, set, clear );
 }
 
 
@@ -3436,6 +3439,19 @@ static void restore_vprot_or_abort( void *base, size_t size, const BYTE *snapsho
         set_page_vprot( (char *)base + run_start * page_size,
                         (i - run_start) * page_size, run_vprot );
     }
+    /* Metadata must be authoritative before any observer capture.  If the host
+     * protections cannot be restored too, continuing would publish split state. */
+    if (mprotect_range( base, size, 0, 0 ))
+    {
+        ERR( "failed to restore protection for %p-%p\n", base, (char *)base + size );
+        abort_process( STATUS_ACCESS_DENIED );
+    }
+}
+
+
+static void restore_uniform_vprot_or_abort( void *base, size_t size, BYTE vprot )
+{
+    set_page_vprot( base, size, vprot );
     /* Metadata must be authoritative before any observer capture.  If the host
      * protections cannot be restored too, continuing would publish split state. */
     if (mprotect_range( base, size, 0, 0 ))
@@ -3854,8 +3870,6 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
     if (alloc_type & MEM_REPLACE_PLACEHOLDER)
     {
-        BYTE stack_snapshot[VPROT_STACK_SNAPSHOT_PAGES];
-        BYTE *old_vprot;
         struct file_view *view;
         unsigned int old_protect;
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -3883,19 +3897,14 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             return STATUS_CONFLICTING_ADDRESSES;
         vprot |= view_owner;
 #endif
-        if (!(old_vprot = snapshot_vprot( base, size, stack_snapshot,
-                                          ARRAY_SIZE(stack_snapshot) )))
-            return STATUS_NO_MEMORY;
         old_protect = view->protect;
         view->protect = vprot | VPROT_PLACEHOLDER;
         if (!set_vprot( view, base, size, vprot ))
         {
             view->protect = old_protect;
-            restore_vprot_or_abort( base, size, old_vprot );
-            if (old_vprot != stack_snapshot) free( old_vprot );
+            restore_uniform_vprot_or_abort( base, size, 0 );
             return STATUS_ACCESS_DENIED;
         }
-        if (old_vprot != stack_snapshot) free( old_vprot );
         if (vprot & VPROT_WRITEWATCH)
         {
             kernel_writewatch_register_range( view, base, size );
@@ -4298,6 +4307,8 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
 static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *base, size_t size )
 {
     NTSTATUS status;
+    /* Only address-translation ownership survives.  An identity image ceases
+     * to be CPU-provider-owned when its mapping becomes a free placeholder. */
     unsigned int translated_owner = view->protect & VPROT_SHADOW_TRANSLATED;
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -4866,7 +4877,12 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         }
 
         /* set the image protections */
-        set_vprot( view, ptr, total_size, VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY | VPROT_EXEC );
+        if (!set_vprot( view, ptr, total_size,
+                        VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY | VPROT_EXEC ))
+        {
+            status = STATUS_ACCESS_DENIED;
+            goto done;
+        }
 
         /* no relocations are performed on non page-aligned binaries */
         status = STATUS_SUCCESS;
@@ -5009,13 +5025,19 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
     /* set the image protections */
 
-    set_vprot( view, ptr, ROUND_SIZE( 0, header_size, align_mask ), VPROT_COMMITTED | VPROT_READ );
+    if (!set_vprot( view, ptr, ROUND_SIZE( 0, header_size, align_mask ),
+                    VPROT_COMMITTED | VPROT_READ ))
+    {
+        status = STATUS_ACCESS_DENIED;
+        goto done;
+    }
 
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
         SIZE_T size;
         BYTE vprot = VPROT_COMMITTED;
 
+        if (!sec[i].Misc.VirtualSize && !sec[i].SizeOfRawData) continue;
         if (sec[i].Misc.VirtualSize)
             size = ROUND_SIZE( sec[i].VirtualAddress, sec[i].Misc.VirtualSize, align_mask );
         else
@@ -5025,9 +5047,13 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)   vprot |= VPROT_WRITECOPY;
         if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) vprot |= VPROT_EXEC;
 
-        if (!set_vprot( view, ptr + sec[i].VirtualAddress, size, vprot ) && (vprot & VPROT_EXEC))
-            ERR( "failed to set %08x protection on %s section %.8s, noexec filesystem?\n",
+        if (!set_vprot( view, ptr + sec[i].VirtualAddress, size, vprot ))
+        {
+            ERR( "failed to set %08x protection on %s section %.8s\n",
                  sec[i].Characteristics, debugstr_us(nt_name), sec[i].Name );
+            status = STATUS_ACCESS_DENIED;
+            goto done;
+        }
     }
 
 #ifdef VALGRIND_LOAD_PDB_DEBUGINFO
@@ -5116,6 +5142,15 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
     ULONG_PTR start, end;
     BOOL top_down = (image_info->image_charact & IMAGE_FILE_DLL) &&
                     (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated);
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* The server has already classified hybrid images.  Only a pure AMD64
+     * identity mapping is entirely fetched by the CPU provider.  ARM64EC/X
+     * contain native ARM64 ranges; shadow-backed images use separate ownership. */
+    if (!address_bias && !is_shadow_translated_vprot( translated_vprot ) &&
+        image_info->machine == IMAGE_FILE_MACHINE_AMD64 && !image_info->is_hybrid)
+        vprot |= VPROT_AMD64_IDENTITY;
+#endif
 
     if (address_bias)
     {

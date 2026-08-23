@@ -275,6 +275,72 @@ static void check_image_protection( const void *address, DWORD expected, const c
     }
 }
 
+static BOOL check_identity_image_region( const void *address, const void *allocation,
+                                         DWORD expected, const char *section )
+{
+    WINE_TRANSLATED_VIEW_INFORMATION info = {0};
+    NTSTATUS status;
+
+    status = NtQueryVirtualMemory( GetCurrentProcess(), address,
+                                   MemoryWineTranslatedViewInformation,
+                                   &info, sizeof(info), NULL );
+    ok( !status, "%s translated-view query returned %#lx\n", section, status );
+    if (status) return FALSE;
+    ok( info.Version == WINE_TRANSLATED_VIEW_INFORMATION_VERSION,
+        "%s translated-view version %lu\n", section, info.Version );
+    ok( !info.Flags, "%s translated-view flags %#lx, expected identity\n",
+        section, info.Flags );
+    ok( info.GuestBase == address, "%s guest base %p, expected %p\n",
+        section, info.GuestBase, address );
+    ok( info.HostBase == address, "%s host base %p, expected %p\n",
+        section, info.HostBase, address );
+    ok( info.AllocationBase == allocation, "%s allocation base %p, expected %p\n",
+        section, info.AllocationBase, allocation );
+    ok( info.RegionSize == MIXED_IMAGE_SECTION_SIZE,
+        "%s region size %#Ix, expected %#x\n", section, info.RegionSize,
+        MIXED_IMAGE_SECTION_SIZE );
+    ok( (info.Protect & 0xff) == expected, "%s translated-view protection %#lx, expected %#lx\n",
+        section, info.Protect, expected );
+    ok( !info.Reserved, "%s translated-view reserved field %#lx\n",
+        section, info.Reserved );
+    return info.Version == WINE_TRANSLATED_VIEW_INFORMATION_VERSION && !info.Flags &&
+           info.GuestBase == address && info.HostBase == address &&
+           info.AllocationBase == allocation && info.RegionSize == MIXED_IMAGE_SECTION_SIZE &&
+           (info.Protect & 0xff) == expected && !info.Reserved;
+}
+
+/* Force the shared host page through a non-writable state before restoring the
+ * image's writable logical lane.  On a 16K Darwin host the untagged path then
+ * requests RWX and fails with EACCES.  Ignoring that failure cannot make this
+ * regression pass: the native write below would still fault on the read-only
+ * host page before the provider gets a chance to execute the x64 write. */
+static BOOL restore_mixed_image_writable_lane( void *base )
+{
+    DWORD old_protect, restore_old;
+    void *data = (BYTE *)base + MIXED_IMAGE_DATA_RVA;
+    volatile DWORD *value = data;
+    BOOL ret;
+
+    ret = VirtualProtect( data, MIXED_IMAGE_SECTION_SIZE, PAGE_READONLY, &old_protect );
+    ok( ret, "mixed image writable-to-read-only transition failed, error %lu\n",
+        GetLastError() );
+    if (!ret) return FALSE;
+    /* VirtualProtect reports writable image copy-on-write pages as read/write
+     * when the requested replacement protection is non-executable. */
+    ok( (old_protect & 0xff) == PAGE_READWRITE,
+        "mixed image writable lane old protection %#lx\n", old_protect );
+
+    ret = VirtualProtect( data, MIXED_IMAGE_SECTION_SIZE, PAGE_WRITECOPY, &restore_old );
+    ok( ret, "mixed RX/RW host-page restoration failed, error %lu\n", GetLastError() );
+    if (!ret) return FALSE;
+    ok( (restore_old & 0xff) == PAGE_READONLY,
+        "mixed image restored lane old protection %#lx\n", restore_old );
+
+    *value = 0x24681357;
+    ok( *value == 0x24681357, "mixed image native writable-lane probe did not persist\n" );
+    return TRUE;
+}
+
 static void test_mixed_image_mapping( void (WINAPI *begin_simulation)(void) )
 {
     static WCHAR image_name[] = L"x64-provider-mixed-protection-image";
@@ -311,6 +377,8 @@ static void test_mixed_image_mapping( void (WINAPI *begin_simulation)(void) )
     ok( NT_SUCCESS(status), "mixed-protection NtMapViewOfSection failed %#lx\n", status );
     if (!NT_SUCCESS(status)) goto done;
     ok( size == MIXED_IMAGE_SIZE, "mixed-protection image size %#Ix\n", size );
+    ok( !((ULONG_PTR)base & (MIXED_IMAGE_SIZE - 1)),
+        "mixed-protection image base %p is not 16K aligned\n", base );
 
     check_image_protection( (BYTE *)base + MIXED_IMAGE_TEXT_RVA,
                             PAGE_EXECUTE_READ, "RX section" );
@@ -318,8 +386,20 @@ static void test_mixed_image_mapping( void (WINAPI *begin_simulation)(void) )
                             PAGE_WRITECOPY, "writable section" );
     check_image_protection( (BYTE *)base + MIXED_IMAGE_RDATA_RVA,
                             PAGE_READONLY, "read-only section" );
+    check_identity_image_region( base, base, PAGE_READONLY, "image header" );
+    check_identity_image_region( (BYTE *)base + MIXED_IMAGE_TEXT_RVA, base,
+                                 PAGE_EXECUTE_READ, "RX section" );
+    check_identity_image_region( (BYTE *)base + MIXED_IMAGE_DATA_RVA, base,
+                                 PAGE_WRITECOPY, "writable section" );
+    check_identity_image_region( (BYTE *)base + MIXED_IMAGE_RDATA_RVA, base,
+                                 PAGE_READONLY, "read-only section" );
     ret = VirtualQuery( (BYTE *)base + MIXED_IMAGE_DATA_RVA, &info, sizeof(info) );
     if (ret != sizeof(info) || (info.Protect & 0xff) != PAGE_WRITECOPY) goto done;
+    if (!restore_mixed_image_writable_lane( base )) goto done;
+    check_image_protection( (BYTE *)base + MIXED_IMAGE_TEXT_RVA,
+                            PAGE_EXECUTE_READ, "RX section after writable restore" );
+    check_identity_image_region( (BYTE *)base + MIXED_IMAGE_DATA_RVA, base,
+                                 PAGE_WRITECOPY, "restored writable section" );
 
     args.entry = (BYTE *)base + MIXED_IMAGE_TEXT_RVA;
     args.exit_thread = exit_thread;

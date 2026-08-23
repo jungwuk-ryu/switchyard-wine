@@ -173,6 +173,7 @@ allocate_source, _, _ = extract_function("allocate_virtual_memory")
 map_view_source, _, _ = extract_function("map_view")
 snapshot_source, _, _ = extract_function("snapshot_vprot")
 restore_source, _, _ = extract_function("restore_vprot_or_abort")
+restore_uniform_source, _, _ = extract_function("restore_uniform_vprot_or_abort")
 
 if not has_apple_arm64_guard(can_retry_start):
     fail("the private-valloc eligibility helper is not gated to Apple ARM64")
@@ -263,7 +264,7 @@ snapshot_contracts = (
     r"\bsnapshot\s*\[\s*i\s*\]\s*=\s*get_page_vprot\s*\(",
 )
 if any(not re.search(contract, snapshot_clean) for contract in snapshot_contracts):
-    fail("placeholder rollback does not preserve every logical page's vprot")
+    fail("protection rollback does not preserve every logical page's vprot")
 
 restore_clean = strip_comments_and_literals(restore_source)
 if (not re.search(r"\bset_page_vprot\s*\(", restore_clean) or
@@ -273,7 +274,20 @@ if (not re.search(r"\bset_page_vprot\s*\(", restore_clean) or
             restore_clean,
             re.DOTALL,
         )):
-    fail("placeholder rollback does not restore logical and host protection atomically")
+    fail("protection rollback does not restore logical and host protection atomically")
+
+restore_uniform_clean = strip_comments_and_literals(restore_uniform_source)
+if (not re.search(
+        r"\bset_page_vprot\s*\(\s*base\s*,\s*size\s*,\s*vprot\s*\)\s*;",
+        restore_uniform_clean,
+    ) or
+        not re.search(
+            r"if\s*\(\s*mprotect_range\s*\([^;{}]*\)\s*\)\s*\{[^{}]*"
+            r"abort_process\s*\(\s*STATUS_ACCESS_DENIED\s*\)\s*;",
+            restore_uniform_clean,
+            re.DOTALL,
+        )):
+    fail("uniform rollback does not restore logical and host protection atomically")
 
 map_view_clean = strip_comments_and_literals(map_view_source)
 placeholder_token = re.search(r"\bMEM_REPLACE_PLACEHOLDER\b", map_view_clean)
@@ -288,13 +302,19 @@ if not re.search(
     fail("map_view placeholder transaction is not gated by MEM_REPLACE_PLACEHOLDER")
 
 placeholder_contracts = (
-    r"\bold_vprot\s*=\s*snapshot_vprot\s*\(\s*base\s*,\s*size\s*,",
-    r"\breturn\s+STATUS_NO_MEMORY\s*;",
     r"\bold_protect\s*=\s*view\s*->\s*protect\s*;",
     r"\bview\s*->\s*protect\s*=\s*vprot\s*\|\s*VPROT_PLACEHOLDER\s*;",
 )
 if any(not re.search(contract, placeholder_body) for contract in placeholder_contracts):
-    fail("map_view placeholder transaction does not snapshot logical protection and view metadata")
+    fail("map_view placeholder transaction does not preserve view metadata")
+placeholder_snapshot_contracts = (
+    r"\bsnapshot_vprot\s*\(",
+    r"\b(?:malloc|calloc|realloc|free)\s*\(",
+    r"\bstack_snapshot\b",
+    r"\bold_vprot\b",
+)
+if any(re.search(contract, placeholder_body) for contract in placeholder_snapshot_contracts):
+    fail("map_view placeholder transaction allocates or retains a redundant protection snapshot")
 
 placeholder_set = re.search(
     r"\bset_vprot\s*\(\s*view\s*,\s*base\s*,\s*size\s*,\s*vprot\s*\)",
@@ -311,24 +331,19 @@ if not re.search(r"!\s*set_vprot\s*\(", set_condition):
 
 rollback_contracts = (
     r"\bview\s*->\s*protect\s*=\s*old_protect\s*;",
-    r"\brestore_vprot_or_abort\s*\(\s*base\s*,\s*size\s*,\s*old_vprot\s*\)\s*;",
-    r"if\s*\(\s*old_vprot\s*!=\s*stack_snapshot\s*\)\s*free\s*\(\s*old_vprot\s*\)\s*;",
+    r"\brestore_uniform_vprot_or_abort\s*\(\s*base\s*,\s*size\s*,\s*0\s*\)\s*;",
     r"\breturn\s+STATUS_ACCESS_DENIED\s*;",
 )
 rollback_offset = 0
 for contract in rollback_contracts:
     match = re.search(contract, rollback_body[rollback_offset:])
     if not match:
-        fail("map_view placeholder failure does not restore metadata and per-page protection")
+        fail("map_view placeholder failure does not restore metadata and uniform free-placeholder protection")
     rollback_offset += match.end()
 placeholder_success = placeholder_body[rollback_end + 1:]
-if (not re.search(
-        r"if\s*\(\s*old_vprot\s*!=\s*stack_snapshot\s*\)\s*free\s*\(\s*old_vprot\s*\)\s*;",
-        placeholder_success,
-    ) or
-        not re.search(r"\*\s*view_ret\s*=\s*view\s*;", placeholder_success) or
+if (not re.search(r"\*\s*view_ret\s*=\s*view\s*;", placeholder_success) or
         not re.search(r"\breturn\s+STATUS_SUCCESS\s*;", placeholder_success)):
-    fail("map_view placeholder success does not release a heap-backed protection snapshot")
+    fail("map_view placeholder success does not publish the replacement view")
 
 
 def compile_and_run(name: str, program: str) -> None:
@@ -628,8 +643,121 @@ int main(void)
 '''
 
 
+uniform_rollback_model = r'''
+#include <setjmp.h>
+#include <stddef.h>
+#include <stdio.h>
+
+typedef unsigned char BYTE;
+
+#define STATUS_ACCESS_DENIED ((unsigned int)0xc0000022)
+#define ERR(...) ((void)0)
+
+static unsigned char probe_memory[64];
+static jmp_buf abort_environment;
+static int event_step;
+static int ordering_error;
+static int page_vprot_calls;
+static void *page_vprot_base;
+static size_t page_vprot_size;
+static BYTE page_vprot_value;
+static int mprotect_calls;
+static void *mprotect_base;
+static size_t mprotect_size;
+static BYTE mprotect_set;
+static BYTE mprotect_clear;
+static int mprotect_result;
+static int abort_calls;
+static unsigned int abort_status;
+
+static void set_page_vprot(const void *base, size_t size, BYTE vprot)
+{
+    if (event_step != 0) ordering_error = 1;
+    event_step = 1;
+    page_vprot_calls++;
+    page_vprot_base = (void *)base;
+    page_vprot_size = size;
+    page_vprot_value = vprot;
+}
+
+static int mprotect_range(void *base, size_t size, BYTE set, BYTE clear)
+{
+    if (event_step != 1 || page_vprot_calls != 1) ordering_error = 1;
+    event_step = 2;
+    mprotect_calls++;
+    mprotect_base = base;
+    mprotect_size = size;
+    mprotect_set = set;
+    mprotect_clear = clear;
+    return mprotect_result;
+}
+
+static void abort_process(unsigned int status)
+{
+    if (event_step != 2 || mprotect_calls != 1) ordering_error = 1;
+    event_step = 3;
+    abort_calls++;
+    abort_status = status;
+    longjmp(abort_environment, 1);
+}
+''' + restore_uniform_source + r'''
+
+#define CHECK(expression) do { \
+    if (!(expression)) { \
+        fprintf(stderr, "uniform rollback check failed at line %d: %s\n", \
+                __LINE__, #expression); \
+        return 1; \
+    } \
+} while (0)
+
+static void reset_rollback(void)
+{
+    event_step = 0;
+    ordering_error = 0;
+    page_vprot_calls = 0;
+    page_vprot_base = NULL;
+    page_vprot_size = 0;
+    page_vprot_value = 0xff;
+    mprotect_calls = 0;
+    mprotect_base = NULL;
+    mprotect_size = 0;
+    mprotect_set = 0xff;
+    mprotect_clear = 0xff;
+    mprotect_result = 0;
+    abort_calls = 0;
+    abort_status = 0;
+}
+
+int main(void)
+{
+    reset_rollback();
+    restore_uniform_vprot_or_abort(probe_memory, sizeof(probe_memory), 0);
+    CHECK(!ordering_error && event_step == 2);
+    CHECK(page_vprot_calls == 1 && page_vprot_base == probe_memory);
+    CHECK(page_vprot_size == sizeof(probe_memory) && page_vprot_value == 0);
+    CHECK(mprotect_calls == 1 && mprotect_base == probe_memory);
+    CHECK(mprotect_size == sizeof(probe_memory));
+    CHECK(mprotect_set == 0 && mprotect_clear == 0 && abort_calls == 0);
+
+    reset_rollback();
+    mprotect_result = -1;
+    if (!setjmp(abort_environment))
+    {
+        restore_uniform_vprot_or_abort(probe_memory, sizeof(probe_memory), 0);
+        CHECK(0);
+    }
+    CHECK(!ordering_error && event_step == 3);
+    CHECK(page_vprot_calls == 1 && page_vprot_value == 0);
+    CHECK(mprotect_calls == 1);
+    CHECK(abort_calls == 1 && abort_status == STATUS_ACCESS_DENIED);
+    return 0;
+}
+'''
+
+
 compile_and_run("private-valloc-eligibility-model", eligibility_model)
 compile_and_run("writable-exec-retry-model", retry_model)
+compile_and_run("uniform-protection-rollback-model", uniform_rollback_model)
 PY
 
 echo "Darwin ARM64 private-valloc W^X source contract verified"
