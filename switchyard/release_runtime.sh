@@ -34,6 +34,9 @@ native_manifest_public_path=""
 native_manifest_public_identity=""
 CODESIGN_TOOL="/usr/bin/codesign"
 NATIVE_SMOKE_TOOL="$ROOT_DIR/switchyard/tests/native_no_rosetta_process_test.sh"
+NATIVE_RELEASE_WINESERVER_CONTROL_ATTEMPTS=600
+NATIVE_RELEASE_WINESERVER_TERM_ATTEMPTS=50
+NATIVE_RELEASE_WINESERVER_KILL_ATTEMPTS=20
 
 remove_owned_native_release_output() {
   local path="$1"
@@ -354,10 +357,42 @@ switchyard_run_native_release_smoke() {
     SWITCHYARD_NATIVE_RELEASE_OK
 }
 
-switchyard_stop_native_release_wineserver() {
-  local runtime_root="$1"
+switchyard_native_release_control_has_exited() {
+  local pid="$1"
+  local state
+
+  case "$pid" in
+    ''|0|*[!0-9]*) return 1 ;;
+  esac
+  if state="$(/bin/ps -o state= -p "$pid" 2>/dev/null | \
+      /usr/bin/awk 'NR == 1 { print $1 }')"; then
+    [ -z "$state" ] || [ "${state#Z}" != "$state" ]
+  else
+    ! /bin/kill -0 "$pid" 2>/dev/null
+  fi
+}
+
+switchyard_wait_native_release_control() {
+  local pid="$1"
+  local attempts="$2"
+  local count
+
+  case "$attempts" in
+    ''|0|*[!0-9]*) return 1 ;;
+  esac
+  for ((count = 0; count < attempts; count++)); do
+    switchyard_native_release_control_has_exited "$pid" && return 0
+    /bin/sleep 0.1
+  done
+  return 1
+}
+
+switchyard_run_native_release_wineserver_control() {
+  local wineserver="$1"
   local prepared_prefix="$2"
-  local wineserver="$runtime_root/bin/wineserver"
+  local operation="$3"
+  local control_pid
+  local status
   local clean_environment=(
     /usr/bin/env
     -u WINEARCH -u WINEDEBUG -u WINEDLLPATH -u WINELOADER -u WINESERVER
@@ -366,18 +401,44 @@ switchyard_stop_native_release_wineserver() {
     -u DYLD_INSERT_LIBRARIES
   )
 
-  [ -x "$wineserver" ] && [ ! -L "$wineserver" ] || return 1
-  if "${clean_environment[@]}" WINEPREFIX="$prepared_prefix" \
-      "$wineserver" -k >/dev/null 2>&1; then
-    "${clean_environment[@]}" WINEPREFIX="$prepared_prefix" \
-      "$wineserver" -w >/dev/null 2>&1
-  else
-    # The strict process harness owns the first stop/wait pass.  When it has
-    # already drained this exact prefix, wineserver -k reports failure because
-    # no server remains, but the idempotent wait still succeeds.
-    "${clean_environment[@]}" WINEPREFIX="$prepared_prefix" \
-      "$wineserver" -w >/dev/null 2>&1
+  [ "$operation" = -k ] || [ "$operation" = -w ] || return 1
+  "${clean_environment[@]}" WINEPREFIX="$prepared_prefix" \
+    "$wineserver" "$operation" >/dev/null 2>&1 &
+  control_pid=$!
+  if ! switchyard_wait_native_release_control \
+      "$control_pid" "$NATIVE_RELEASE_WINESERVER_CONTROL_ATTEMPTS"; then
+    /bin/kill -TERM "$control_pid" 2>/dev/null || true
+    if ! { switchyard_wait_native_release_control \
+        "$control_pid" "$NATIVE_RELEASE_WINESERVER_TERM_ATTEMPTS"; } 2>/dev/null; then
+      /bin/kill -KILL "$control_pid" 2>/dev/null || true
+      { switchyard_wait_native_release_control \
+        "$control_pid" "$NATIVE_RELEASE_WINESERVER_KILL_ATTEMPTS"; } \
+        2>/dev/null || return 124
+    fi
+    wait "$control_pid" 2>/dev/null || true
+    return 124
   fi
+  if wait "$control_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+  return "$status"
+}
+
+switchyard_stop_native_release_wineserver() {
+  local runtime_root="$1"
+  local prepared_prefix="$2"
+  local wineserver="$runtime_root/bin/wineserver"
+
+  [ -x "$wineserver" ] && [ ! -L "$wineserver" ] || return 1
+  # A prior strict harness pass may already have drained this exact prefix, in
+  # which case -k reports failure.  Bound both control clients, then treat only
+  # an independently successful exact-prefix -w as proof of quiescence.
+  switchyard_run_native_release_wineserver_control \
+    "$wineserver" "$prepared_prefix" -k || true
+  switchyard_run_native_release_wineserver_control \
+    "$wineserver" "$prepared_prefix" -w
 }
 
 switchyard_publish_native_outer_digest() {

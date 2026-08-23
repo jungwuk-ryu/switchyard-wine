@@ -279,6 +279,8 @@ assert_native_release_stop_is_idempotent() {
   local stop_prefix="$TEST_ROOT/stop-prefix"
   local stop_log="$TEST_ROOT/stop.log"
   local status
+  local stop_pid
+  local unrelated_pid
 
   /bin/mkdir -p "$stop_runtime/bin" "$stop_prefix"
   /usr/bin/sed 's/^+//' >"$stop_runtime/bin/wineserver" <<'EOF'
@@ -288,10 +290,16 @@ set -euo pipefail
 /usr/bin/printf '%s WINEPREFIX=%s\n' "${1:-}" "${WINEPREFIX:-}" \
   >>"$SWITCHYARD_TEST_STOP_LOG"
 case "${1:-}" in
-  -k) exit "${SWITCHYARD_TEST_STOP_K_STATUS:-0}" ;;
-  -w) exit "${SWITCHYARD_TEST_STOP_W_STATUS:-0}" ;;
+  -k) control_status="${SWITCHYARD_TEST_STOP_K_STATUS:-0}" ;;
+  -w) control_status="${SWITCHYARD_TEST_STOP_W_STATUS:-0}" ;;
   *) exit 88 ;;
 esac
+if [ "$control_status" = hang ]; then
+  /usr/bin/printf '%s\n' "$$" >>"$SWITCHYARD_TEST_STOP_PID_FILE"
+  trap '' TERM
+  exec /bin/sleep 30
+fi
+exit "$control_status"
 EOF
   /bin/chmod 0755 "$stop_runtime/bin/wineserver"
 
@@ -336,6 +344,57 @@ EOF
   set -e
   [ "$status" -ne 0 ] ||
     fail "native release stop accepted a failed kill and failed wait"
+
+  : >"$stop_log"
+  (
+    export SWITCHYARD_TEST_STOP_LOG="$stop_log"
+    export SWITCHYARD_TEST_STOP_PID_FILE="$TEST_ROOT/stop-k.pid"
+    export SWITCHYARD_TEST_STOP_K_STATUS=hang
+    export SWITCHYARD_TEST_STOP_W_STATUS=0
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    NATIVE_RELEASE_WINESERVER_CONTROL_ATTEMPTS=2
+    NATIVE_RELEASE_WINESERVER_TERM_ATTEMPTS=2
+    NATIVE_RELEASE_WINESERVER_KILL_ATTEMPTS=20
+    switchyard_stop_native_release_wineserver "$stop_runtime" "$stop_prefix"
+  ) || fail "native release stop did not bound a failed kill before exact-prefix wait"
+  while IFS= read -r stop_pid; do
+    ! /bin/kill -0 "$stop_pid" 2>/dev/null ||
+      fail "native release stop left its timed-out kill control process running"
+  done <"$TEST_ROOT/stop-k.pid"
+  [ "$(/usr/bin/awk 'END { print NR }' "$stop_log")" -eq 2 ] &&
+    /usr/bin/awk 'NR == 1 { exit ($1 == "-k" ? 0 : 1) }
+                 NR == 2 { exit ($1 == "-w" ? 0 : 1) }' "$stop_log" ||
+    fail "native release stop did not wait after a timed-out kill control"
+
+  : >"$stop_log"
+  /bin/sleep 30 &
+  unrelated_pid=$!
+  set +e
+  (
+    export SWITCHYARD_TEST_STOP_LOG="$stop_log"
+    export SWITCHYARD_TEST_STOP_PID_FILE="$TEST_ROOT/stop-w.pid"
+    export SWITCHYARD_TEST_STOP_K_STATUS=1
+    export SWITCHYARD_TEST_STOP_W_STATUS=hang
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    NATIVE_RELEASE_WINESERVER_CONTROL_ATTEMPTS=2
+    NATIVE_RELEASE_WINESERVER_TERM_ATTEMPTS=2
+    NATIVE_RELEASE_WINESERVER_KILL_ATTEMPTS=20
+    switchyard_stop_native_release_wineserver "$stop_runtime" "$stop_prefix"
+  )
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] ||
+    fail "native release stop accepted a timed-out exact-prefix wait"
+  while IFS= read -r stop_pid; do
+    ! /bin/kill -0 "$stop_pid" 2>/dev/null ||
+      fail "native release stop left its timed-out wait control process running"
+  done <"$TEST_ROOT/stop-w.pid"
+  /bin/kill -0 "$unrelated_pid" 2>/dev/null ||
+    fail "native release stop signaled an unrelated process"
+  /bin/kill -TERM "$unrelated_pid"
+  wait "$unrelated_pid" 2>/dev/null || true
 }
 
 run_case() {
