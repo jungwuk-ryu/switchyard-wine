@@ -62,6 +62,7 @@ names = (
     "content_tree_digest",
     "write_content_tree_digest",
     "content_tree_is_verified",
+    "validate_extracted_tree_links",
     "verify_host_macho_tree_arches",
     "adhoc_sign_host_macho_tree",
     "verify_host_macho_tree_signatures",

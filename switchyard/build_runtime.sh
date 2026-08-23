@@ -1989,6 +1989,14 @@ prepare_font_runtime_for_install() {
     echo "Font asset documentation root is missing or unsafe: $font_assets_prefix" >&2
     return 1
   }
+  validate_extracted_tree_links "$source_prefix" || {
+    echo "Font dependency root contains an unsafe link or file type: $source_prefix" >&2
+    return 1
+  }
+  validate_extracted_tree_links "$font_assets_prefix" || {
+    echo "Font asset root contains an unsafe link or file type: $font_assets_prefix" >&2
+    return 1
+  }
   created_root="$(
     /usr/bin/mktemp -d /private/tmp/switchyard-font-runtime.XXXXXX
   )" || return 1
@@ -1996,7 +2004,10 @@ prepare_font_runtime_for_install() {
     remove_prepared_font_runtime "$created_root" || true
     return 1
   }
-  chmod 0700 "$runtime_font_root"
+  chmod 0700 "$runtime_font_root" || {
+    remove_prepared_font_runtime "$runtime_font_root" || true
+    return 1
+  }
 
   if ! (
     set -e
@@ -2019,6 +2030,7 @@ prepare_font_runtime_for_install() {
     ditto "$font_assets_prefix/lib/switchyard-fonts/share/doc/switchyard-font-assets" \
       "$runtime_font_root/share/doc/switchyard-font-assets"
     chmod 0755 "$runtime_font_root"
+    validate_extracted_tree_links "$runtime_font_root"
     font_deps_match_profile_architecture "$runtime_font_root"
     verify_runtime_relative_macho_tree "$runtime_font_root" \
       "prepared font runtime"
@@ -4139,8 +4151,18 @@ else
     "$runtime_font_root/share/doc/switchyard-font-assets"
 fi
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-  content_tree_is_verified "$runtime_font_root"
-  [ "$(content_tree_digest "$runtime_font_root")" = "$font_deps_digest" ]
+  content_tree_is_verified "$runtime_font_root" || {
+    echo "Staged font runtime content marker does not match the installed bytes." >&2
+    exit 1
+  }
+  installed_font_digest="$(content_tree_digest "$runtime_font_root")" || {
+    echo "Could not digest the staged font runtime." >&2
+    exit 1
+  }
+  [ "$installed_font_digest" = "$font_deps_digest" ] || {
+    echo "Staged font runtime digest changed after final preparation." >&2
+    exit 1
+  }
   verify_host_macho_tree_arches "$runtime_font_root" \
     "staged font runtime" "$HOST_DEPENDENCY_ARCH"
   verify_native_macho_tree_macos_compatibility "$runtime_font_root" \
