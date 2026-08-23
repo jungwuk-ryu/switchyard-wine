@@ -70,5 +70,5 @@ font	NotoSerifTibetan-Regular.ttf	ee97bf3dc56e813651db734c9f35f8f1d41e7e31acf5f7
 font	NotoSansCJK-Bold.ttc	faa5f3656a78b2e2d450d27fe8382c778bc2b6bb5ea29c986664a6a435056ceb	https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/OTC/NotoSansCJK-Bold.ttc
 font	NotoSansCJK-Regular.ttc	b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a	https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/OTC/NotoSansCJK-Regular.ttc
 license	Noto-CJK-OFL.txt	6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2	https://raw.githubusercontent.com/notofonts/noto-cjk/a99a4354c68964f6bfac488d01010b1fb6d9178a/Sans/LICENSE
-license	Noto-Emoji-OFL.txt	6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2	https://raw.githubusercontent.com/google/fonts/2d85e20401920891efb7cd6272d6339685df2820/ofl/notoemoji/OFL.txt
+license	Noto-Emoji-OFL.txt	500bb1ccf43df7bbb522112f9133a52b16e1c35e809632f5d8609b179152de5b	https://raw.githubusercontent.com/google/fonts/2d85e20401920891efb7cd6272d6339685df2820/ofl/notoemoji/OFL.txt
 license	Noto-OFL.txt	f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8	https://raw.githubusercontent.com/notofonts/notofonts.github.io/noto-monthly-release-2026.07.01/fonts/LICENSE
