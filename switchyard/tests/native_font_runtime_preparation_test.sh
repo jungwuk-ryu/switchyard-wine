@@ -72,6 +72,8 @@ output_path = pathlib.Path(sys.argv[2])
 source = source_path.read_text(encoding="utf-8")
 names = (
     "remove_prepared_font_runtime",
+    "cleanup_temporary_paths",
+    "cleanup_temporary_paths_on_signal",
     "sha256_file",
     "short_sha256_stream",
     "content_tree_digest",
@@ -124,6 +126,14 @@ for name in names:
                 "font input link validation must precede prepared-root allocation"
             )
     fragments.append(fragment)
+for expected in (
+    "trap cleanup_temporary_paths EXIT",
+    "trap 'cleanup_temporary_paths_on_signal 129' HUP",
+    "trap 'cleanup_temporary_paths_on_signal 130' INT",
+    "trap 'cleanup_temporary_paths_on_signal 143' TERM",
+):
+    if source.count(expected) != 1:
+        raise SystemExit("missing exact build-runtime signal cleanup trap: " + expected)
 output_path.write_text("\n\n".join(fragments) + "\n", encoding="utf-8")
 PY
 
@@ -322,5 +332,28 @@ fi
 [ -f "$victim/sentinel" ] || fail "cleanup followed a symlink into another tree"
 /bin/rm -f -- "$ATTACK_LINK"
 ATTACK_LINK=""
+
+SIGNAL_ROOT="$(/usr/bin/mktemp -d /private/tmp/switchyard-font-runtime.XXXXXX)"
+set +e
+/bin/bash --noprofile --norc -c '
+set -euo pipefail
+source "$1"
+NATIVE_ENTITLEMENTS_SNAPSHOT_FD=""
+INSTALL_STAGE_ROOT=""
+SWAP_HELPER_DIR=""
+FONT_RUNTIME_PREPARED_ROOT="$2"
+trap cleanup_temporary_paths EXIT
+trap "cleanup_temporary_paths_on_signal 129" HUP
+trap "cleanup_temporary_paths_on_signal 130" INT
+trap "cleanup_temporary_paths_on_signal 143" TERM
+kill -TERM "$$"
+exit 99
+' _ "$HELPER_FILE" "$SIGNAL_ROOT"
+signal_status=$?
+set -e
+[ "$signal_status" -eq 143 ] ||
+    fail "TERM cleanup fixture exited with $signal_status instead of 143"
+[ ! -e "$SIGNAL_ROOT" ] && [ ! -L "$SIGNAL_ROOT" ] ||
+    fail "TERM cleanup left the prepared font runtime behind"
 
 echo "Native font runtime final-form digest, relocation, signing, assets, and cleanup verified"

@@ -346,7 +346,18 @@ cleanup_temporary_paths() {
   fi
   FONT_RUNTIME_PREPARED_ROOT=""
 }
+
+cleanup_temporary_paths_on_signal() {
+  local signal_status="$1"
+
+  trap - HUP INT TERM
+  exit "$signal_status"
+}
+
 trap cleanup_temporary_paths EXIT
+trap 'cleanup_temporary_paths_on_signal 129' HUP
+trap 'cleanup_temporary_paths_on_signal 130' INT
+trap 'cleanup_temporary_paths_on_signal 143' TERM
 
 macos_no_huge_supported() {
   local compiler="clang"
