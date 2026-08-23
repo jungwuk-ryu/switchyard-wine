@@ -1,0 +1,435 @@
+Switchyard Winemetal companion ABI schema v4
+canonical-encoding: ASCII
+canonical-newlines: LF
+canonical-final-newline: required
+pinned-winemetal-revision: 856d9f35789679ef00c1ba01a6353438df84b66f
+entry-abi: NTSTATUS (*)(void *), native ARM64 C ABI
+entry-count: 138
+
+Host scalar layout
+u32: size=4 align=4
+u64: size=8 align=8
+pointer: size=8 align=8
+function-pointer: size=8 align=8
+
+wine_wow64_unixlib_alias_v2: version=2 size=48 align=8
+  version:u32@0
+  size:u32@4
+  address:u64@8
+  length:u64@16
+  mapped_length:u64@24
+  lease:u64@32
+  generation:u64@40
+
+wine_wow64_unixlib_codec_v2: version=2 size=56 align=8
+  version:u32@0
+  size:u32@4
+  capabilities:u64@8
+  translate:function-pointer@16
+  copy_from_guest:function-pointer@24
+  copy_to_guest:function-pointer@32
+  acquire_alias:function-pointer@40 optional
+  release_alias:function-pointer@48 optional
+
+wine_wow64_unixlib_binding_v4: version=4 size=48 align=8
+  version:u32@0 value=4
+  size:u32@4 value=48
+  entry_count:u32@8 value=138
+  reserved:u32@12 value=0
+  normal_funcs:pointer@16
+  legacy_wow64_funcs:pointer@24
+  codec:pointer@32
+  owned_backing_codec:pointer@40
+
+wine_wow64_unixlib_companion_v4: version=4 size=56 align=8
+  version:u32@0 value=4
+  size:u32@4 value=56
+  entry_count:u32@8 value=138
+  flags:u32@12 value=0
+  abi_sha256:byte[32]@16 value=SHA256(this-file-exact-bytes)
+  bind:function-pointer@48
+  export=__wine_unix_call_wow64_companion_v4
+  v1-export=absent
+  v2-export=absent
+  v3-export=absent
+  native-companion-export=absent
+
+wine_unixlib_dispatch_entry_v2: size=8 align=4
+  args_size:u32@0
+  flags:u32@4
+
+wine_unixlib_dispatch_source_v2: version=2 size=40 align=8
+  version:u32@0 value=2
+  size:u32@4 value=40
+  entry_count:u32@8 value=138
+  entry_size:u32@12 value=8
+  funcs:pointer@16 value=__wine_unix_call_wow64_funcs
+  entries:pointer@24 value=immutable-reviewed-metadata
+  flags:u32@32 value=0
+  reserved:u32@36 value=0
+  export=__wine_unix_call_wow64_dispatch_v2
+
+wine_unixlib_owned_backing_v2: version=2 size=56 align=8
+  version:u32@0
+  size:u32@4
+  address:u64@8
+  length:u64@16
+  mapped_length:u64@24
+  lease:u64@32
+  generation:u64@40
+  guest_address:u64@48
+
+wine_unixlib_owned_backing_codec_v2: version=2 size=32 align=8
+  version:u32@0
+  size:u32@4
+  capabilities:u64@8
+  acquire_backing:function-pointer@16
+  release_backing:function-pointer@24
+
+Capabilities and callbacks
+WINE_WOW64_UNIXLIB_CAP_SEPARATE_GUEST_ADDRESS_SPACE=0x0000000000000001 exactly required
+WINE_WOW64_UNIXLIB_CAP_OWNED_MEMORY_ALIAS=0x0000000000000002 not required and not accepted by this v4 binding
+WINE_WOW64_UNIXLIB_ACCESS_READ=0x00000001
+WINE_WOW64_UNIXLIB_ACCESS_WRITE=0x00000002
+translate(guest:u64,size:u64,access:u32,host_out:pointer): synchronous borrowed view only
+copy_from_guest(guest:u64,dst:pointer,size:u64): loader-owned codec callback; adapter nested copies use current ntdll helpers
+copy_to_guest(guest:u64,src:pointer,size:u64): loader-owned codec callback; adapter nested copies use current ntdll helpers
+acquire_alias and release_alias may be null; this companion never calls them.
+
+Translated i386 owned-backing callbacks
+WINE_UNIXLIB_OWNED_BACKING_CAP_ACQUIRE_RELEASE=0x0000000000000001 exactly required
+acquire_backing(length:u64,access:u32,backing_out:pointer): allocate observer-published PAGE_READWRITE/NX backing with distinct native host and low guest addresses
+release_backing(lease:u64): consume every valid lease once; foreign-pthread safe; reclaim failure is retained for process cleanup
+backing.address: exact page-aligned Wine-owned native host address passed to Metal
+backing.length: exact nonzero logical requested length
+backing.mapped_length: exact host-page-round-up of length
+backing.lease: nonzero opaque ownership token; zero is the invalid/consumed sentinel
+backing.generation: nonzero lifetime identity
+backing.guest_address: distinct page-aligned canonical low 32-bit address published to the Windows process
+Backing acquisition zeroes private capacity before publication; release makes the allocation inactive before reuse.
+Before Metal publication, ntdll_wow64_guest32_to_host(guest_address) must return the exact backing.address and the full mapped range must pass read and write probes.
+Provider observer failure is fail-stop; the allocator never republishes a failed or quarantined protected view.
+
+Dispatch and copy contract
+The exported 138-entry function table and metadata are immutable and identity-bound to this companion Mach-O.
+The original normal and legacy source tables may reside in writable storage; the loader validates them, copies all 138 entries from each, revalidates the original contents and identity, then invokes bind synchronously with the stable copies.
+Bind independently double-copies and validates the stable source tables, copies them into companion-owned anonymous storage, and makes the complete snapshot read-only before release-publishing it.
+Successful repeated bind compares the protected snapshot contents and codec identities; dispatch never dereferences either binding source table after publication.
+Snapshot allocation or protection failure publishes nothing and leaves first bind retryable; the loader drains registered calls before companion unload and its destructor unmaps the single published snapshot.
+Pinned source slot 083 is null in both tables; snapshots preserve null entries and internal source dispatch reports STATUS_NOT_SUPPORTED for them.
+Every wrapper requires an active call context with exact args_size and exact reviewed flags for its slot.
+The loader passes a native-owned stable outer snapshot; no implementation may retain that snapshot pointer.
+Before any implementation side effect, the wrapper decodes and write-probes the exact canonical guest outer range.
+After implementation, the wrapper atomically publishes the complete outer snapshot, including deterministic failure outputs.
+Recoverable atomic publication failure writes no bytes; observer failure after stores is fail-stop.
+Every nested pointer is decoded with ntdll_wow64_guest32_to_host and accessed only through ntdll current-process copy, probe, or atomic-publication helpers.
+Forward entries call only the same-index original legacy-wow64 handler.
+Adapted entries call only the same-index original normal handler after bounded snapshots and explicit conversion.
+Denied entries return STATUS_NOT_SUPPORTED after the listed deterministic output initialization.
+
+Wire and adapter invariants
+i386 pointers are little-endian low:u32 then high:u32, size=8 align=4.
+Input guest-memory pointers require high=0 and a bounded 32-bit guest range.
+Native locals and snapshots are passed only to the same-index normal handler.
+All adapted outer return fields and documented nested outputs are initialized before failure.
+WMTRenderPassInfo wire32 size=652 align=4 visibility_buffer@644; native size=664 align=8 visibility_buffer@656.
+WMTRenderPipelineInfo wire32 size=168 align=4 logic_operation@98 vertex_function@112 tessellation_partition_mode@140 max_tessellation_factor@141 tessellation_output_winding_order@142 tessellation_factor_step@143 archives@152; native size=168 align=8 logic_operation@98 vertex_function@112 tessellation_partition_mode@140 max_tessellation_factor@141 tessellation_output_winding_order@142 tessellation_factor_step@143 archives@152.
+Command graphs are explicit field conversions, never wire/native memcpy; cycles and unknown node types fail closed.
+Blit wire/native sizes by type 0..10: 16/16,56/56,104/104,104/104,120/120,24/24,24/24,24/24,44/48,48/48,104/104.
+Render accepted types are 0..25 and 29..41; 26..28 and unknown values fail closed.
+Strings: payload<=1048576 bytes plus one terminator byte.
+Paths: snapshot<=PATH_MAX+1 bytes including terminator.
+Graphs: nodes<=65536; records+cycle-set+native-arena<=16777216 bytes.
+Function constants: count<=4096; copied data<=1048576 bytes; struct/array/none types denied.
+Dispatch blob: one call<=67108864 bytes; aggregate live snapshots<=268435456 bytes.
+Slot 18 caller-supplied nonzero memory is explicitly STATUS_NOT_SUPPORTED because the v4 loader provides no safe retained-address pin manager.
+Slot 18 null memory with nonzero Shared or Managed storage acquires owned backing, passes the native host address to Metal, validates the exact rounded mapping and full low-32-bit guest range, then publishes guest memory low/high=0, gpu_address, and object in that order.
+Slot 18 Metal deallocator atomically consumes release_backing once and is foreign-thread safe; nil consumes the lease without publishing a buffer.
+Slot 18 nested-output failure destroys the unpublished Metal object exactly once; object-release failure takes priority and cleanup is never retried.
+Slot 18 outer publication failure zeros nested memory/gpu outputs and destroys the unpublished object exactly once.
+Slot 18 null memory with zero length or Private, Memoryless, reserved, or unknown storage calls normal slot 18 with a native local and copies the full native contents pointer to low/high words.
+Slot 18 original-handler failure with a nonzero object, or later output-copy failure, destroys the unpublished object exactly once; slot-001 cleanup failure takes priority and ret remains zero.
+
+Reviewed v2 dispatch metadata
+000 args-size=8 flags=REVIEWED
+001 args-size=8 flags=REVIEWED
+002 args-size=24 flags=REVIEWED|HAS_OUTPUT
+003 args-size=16 flags=REVIEWED|HAS_OUTPUT
+004 args-size=8 flags=REVIEWED|HAS_OUTPUT
+005 args-size=16 flags=REVIEWED|HAS_OUTPUT
+006 args-size=16 flags=REVIEWED|HAS_OUTPUT
+007 args-size=16 flags=REVIEWED|HAS_OUTPUT
+008 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
+009 args-size=24 flags=REVIEWED|HAS_OUTPUT
+010 args-size=8 flags=REVIEWED
+011 args-size=16 flags=REVIEWED|HAS_OUTPUT
+012 args-size=8 flags=REVIEWED
+013 args-size=8 flags=REVIEWED
+014 args-size=16 flags=REVIEWED|HAS_OUTPUT
+015 args-size=16 flags=REVIEWED|HAS_OUTPUT
+016 args-size=16 flags=REVIEWED|HAS_OUTPUT
+017 args-size=24 flags=REVIEWED
+018 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT|MAY_CALLBACK|RETAINS_ADDRESS
+019 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+020 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+021 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+022 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
+023 args-size=48 flags=REVIEWED|HAS_OUTPUT
+024 args-size=24 flags=REVIEWED|HAS_OUTPUT
+025 args-size=32 flags=REVIEWED|HAS_OUTPUT
+026 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+027 args-size=24 flags=REVIEWED|HAS_OUTPUT
+028 args-size=16 flags=REVIEWED|HAS_OUTPUT
+029 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+030 args-size=16 flags=REVIEWED|HAS_OUTPUT
+031 args-size=24 flags=REVIEWED|HAS_OUTPUT
+032 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+033 args-size=8 flags=REVIEWED
+034 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+035 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+036 args-size=16 flags=REVIEWED|NESTED
+037 args-size=16 flags=REVIEWED|NESTED
+038 args-size=16 flags=REVIEWED|NESTED
+039 args-size=16 flags=REVIEWED|HAS_OUTPUT
+040 args-size=16 flags=REVIEWED|HAS_OUTPUT
+041 args-size=16 flags=REVIEWED|HAS_OUTPUT
+042 args-size=16 flags=REVIEWED|HAS_OUTPUT
+043 args-size=16 flags=REVIEWED|HAS_OUTPUT
+044 args-size=16 flags=REVIEWED|HAS_OUTPUT
+045 args-size=96 flags=REVIEWED|NESTED
+046 args-size=24 flags=REVIEWED
+047 args-size=16 flags=REVIEWED
+048 args-size=24 flags=REVIEWED
+049 args-size=24 flags=REVIEWED|HAS_OUTPUT
+050 args-size=16 flags=REVIEWED|HAS_OUTPUT
+051 args-size=24 flags=REVIEWED|HAS_OUTPUT
+052 args-size=16 flags=REVIEWED|HAS_OUTPUT
+053 args-size=8 flags=REVIEWED|HAS_OUTPUT
+054 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+055 args-size=8 flags=REVIEWED
+056 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+057 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+058 args-size=72 flags=REVIEWED|NESTED
+059 args-size=40 flags=REVIEWED
+060 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+061 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+062 args-size=8 flags=REVIEWED|HAS_OUTPUT
+063 args-size=32 flags=REVIEWED|HAS_OUTPUT
+064 args-size=24 flags=REVIEWED
+065 args-size=16 flags=REVIEWED
+066 args-size=16 flags=REVIEWED|HAS_OUTPUT
+067 args-size=16 flags=REVIEWED|HAS_OUTPUT
+068 args-size=16 flags=REVIEWED|HAS_OUTPUT
+069 args-size=16 flags=REVIEWED|HAS_OUTPUT
+070 args-size=16 flags=REVIEWED|NESTED
+071 args-size=16 flags=REVIEWED|NESTED|HAS_OUTPUT
+072 args-size=32 flags=REVIEWED|HAS_OUTPUT
+073 args-size=8 flags=REVIEWED
+074 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+075 args-size=8 flags=REVIEWED
+076 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+077 args-size=16 flags=REVIEWED|NESTED|HAS_OUTPUT
+078 args-size=8 flags=REVIEWED
+079 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+080 args-size=8 flags=REVIEWED
+081 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
+082 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
+083 args-size=0 flags=REVIEWED
+084 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
+085 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
+086 args-size=16 flags=REVIEWED
+087 args-size=16 flags=REVIEWED
+088 args-size=16 flags=REVIEWED|NESTED
+089 args-size=16 flags=REVIEWED|HAS_OUTPUT
+090 args-size=16 flags=REVIEWED|HAS_OUTPUT
+091 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
+092 args-size=16 flags=REVIEWED|HAS_OUTPUT
+093 args-size=24 flags=REVIEWED|HAS_OUTPUT
+094 args-size=8 flags=REVIEWED|HAS_OUTPUT
+095 args-size=8 flags=REVIEWED|HAS_OUTPUT
+096 args-size=16 flags=REVIEWED|NESTED|HAS_OUTPUT
+097 args-size=16 flags=REVIEWED|NESTED|HAS_OUTPUT
+098 args-size=48 flags=REVIEWED|NESTED|HAS_OUTPUT
+099 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+100 args-size=24 flags=REVIEWED|NESTED
+101 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
+102 args-size=24 flags=REVIEWED
+103 args-size=16 flags=REVIEWED
+104 args-size=32 flags=REVIEWED|MAY_CALLBACK
+105 args-size=16 flags=REVIEWED|HAS_OUTPUT
+106 args-size=16 flags=REVIEWED|HAS_OUTPUT
+107 args-size=32 flags=REVIEWED|NESTED
+108 args-size=8 flags=REVIEWED|HAS_OUTPUT
+109 args-size=8 flags=REVIEWED
+110 args-size=8 flags=REVIEWED
+111 args-size=24 flags=REVIEWED|HAS_OUTPUT
+112 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+113 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+114 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+115 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+116 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+117 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+118 args-size=32 flags=REVIEWED|NESTED
+119 args-size=16 flags=REVIEWED|NESTED|HAS_OUTPUT
+120 args-size=24 flags=REVIEWED|NESTED|HAS_OUTPUT
+121 args-size=136 flags=REVIEWED
+122 args-size=136 flags=REVIEWED|HAS_OUTPUT
+123 args-size=16 flags=REVIEWED|HAS_OUTPUT
+124 args-size=24 flags=REVIEWED|HAS_OUTPUT
+125 args-size=16 flags=REVIEWED|HAS_OUTPUT
+126 args-size=32 flags=REVIEWED|HAS_OUTPUT
+127 args-size=24 flags=REVIEWED|HAS_OUTPUT
+128 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+129 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+130 args-size=24 flags=REVIEWED|HAS_OUTPUT
+131 args-size=32 flags=REVIEWED|NESTED|HAS_OUTPUT
+132 args-size=32 flags=REVIEWED|HAS_OUTPUT
+133 args-size=24 flags=REVIEWED|NESTED
+134 args-size=24 flags=REVIEWED|NESTED
+135 args-size=8 flags=REVIEWED
+136 args-size=8 flags=REVIEWED
+137 args-size=16 flags=REVIEWED
+
+Table legend
+F: forward same index through original legacy-wow64 table; scalar, inline-fixed, or opaque-only ABI.
+A: adapt the stated guest schema and call the same-index original normal handler, except slot 18 owned-backing branch.
+D: deny with the stated deterministic output policy; no original handler call.
+
+000 F _NSObject_retain opaque object
+001 F _NSObject_release opaque object
+002 F _NSArray_object opaque object and scalar index, object return
+003 F _NSArray_count opaque object, scalar return
+004 F _MTLCopyAllDevices object return
+005 F _MTLDevice_recommendedMaxWorkingSetSize opaque object, scalar return
+006 F _MTLDevice_currentAllocatedSize opaque object, scalar return
+007 F _MTLDevice_name opaque object, object return
+008 D _NSString_getCString ret=0; if bounded buffer and nonzero length then buffer[0]=0
+009 F _MTLDevice_newCommandQueue opaque object and scalar, object return
+010 F _NSAutoreleasePool_alloc_init object return
+011 F _MTLCommandQueue_commandBuffer opaque object, object return
+012 F _MTLCommandBuffer_commit opaque object
+013 F _MTLCommandBuffer_waitUntilCompleted opaque object
+014 F _MTLCommandBuffer_status opaque object, scalar return
+015 F _MTLDevice_newSharedEvent opaque object, object return
+016 F _MTLSharedEvent_signaledValue opaque object, scalar return
+017 F _MTLCommandBuffer_encodeSignalEvent opaque objects and scalar
+018 A _MTLDevice_newBuffer buffer-info32; caller memory is denied without a safe pin manager; null nonzero Shared/Managed uses split-address owned backing; null zero/Private/Memoryless/unknown uses normal handler/full contents copyback; ret=0,memory=0,gpu_address=0 on owned-backing failure
+019 A _MTLDevice_newSamplerState sampler-info32; ret=0 and gpu_resource_id=0 on failure
+020 A _MTLDevice_newDepthStencilState depth-stencil-info32; ret=0 on failure
+021 A _MTLDevice_newTexture texture-info32; ret=0 and gpu_resource_id=0 on failure; mach_port preserved unless successful copyback
+022 D _MTLBuffer_newTexture ret=0 and gpu_resource_id=0; mach_port preserved
+023 F _MTLTexture_newTextureView fixed inline schema, object and gpu-resource returns
+024 F _MTLDevice_minimumLinearTextureAlignmentForPixelFormat opaque object and scalar
+025 F _MTLDevice_newLibrary opaque objects and outer returns
+026 A _MTLLibrary_newFunction bounded C-string snapshot; ret=0 on failure
+027 F _NSString_lengthOfBytesUsingEncoding opaque object and scalar
+028 F _NSObject_description opaque object, object return
+029 A _MTLDevice_newComputePipelineState compute-pipeline-info32 and bounded archive-handle array; pso=0,error=0 on failure
+030 F _MTLCommandBuffer_blitCommandEncoder opaque object, object return
+031 F _MTLCommandBuffer_computeCommandEncoder opaque object and scalar, object return
+032 A _MTLCommandBuffer_renderCommandEncoder render-pass-info32 explicit conversion; ret=0 on failure
+033 F _MTLCommandEncoder_endEncoding opaque object
+034 A _MTLDevice_newRenderPipelineState render-pipeline-info32 and bounded archive-handle array; pso=0,error=0 on failure
+035 D _MTLDevice_newMeshRenderPipelineState pso=0,error=0
+036 A _MTLBlitCommandEncoder_encodeCommands bounded blit graph snapshot and explicit conversion
+037 D _MTLComputeCommandEncoder_encodeCommands no output
+038 A _MTLRenderCommandEncoder_encodeCommands bounded render graph/payload snapshot and explicit conversion
+039 F _MTLTexture_pixelFormat opaque object, scalar return
+040 F _MTLTexture_width opaque object, scalar return
+041 F _MTLTexture_height opaque object, scalar return
+042 F _MTLTexture_depth opaque object, scalar return
+043 F _MTLTexture_arrayLength opaque object, scalar return
+044 F _MTLTexture_mipmapLevelCount opaque object, scalar return
+045 D _MTLTexture_replaceRegion input-only guest pointer; no output
+046 F _MTLBuffer_didModifyRange opaque object and scalars
+047 F _MTLCommandBuffer_presentDrawable opaque objects
+048 F _MTLCommandBuffer_presentDrawableAfterMinimumDuration opaque objects and double
+049 F _MTLDevice_supportsFamily opaque object and scalar, boolean return
+050 F _MTLDevice_supportsBCTextureCompression opaque object, boolean return
+051 F _MTLDevice_supportsTextureSampleCount opaque object and scalar, boolean return
+052 F _MTLDevice_hasUnifiedMemory opaque object, boolean return
+053 F _MTLCaptureManager_sharedCaptureManager object return
+054 D _MTLCaptureManager_startCapture ret=false
+055 F _MTLCaptureManager_stopCapture opaque object
+056 D _MTLDevice_newTemporalScaler ret=0
+057 D _MTLDevice_newSpatialScaler ret=0
+058 D _MTLCommandBuffer_encodeTemporalScale input-only nested pointer; no output
+059 F _MTLCommandBuffer_encodeSpatialScale opaque objects only
+060 A _NSString_string bounded C-string snapshot; ret=0 on failure
+061 A _NSString_alloc_init bounded C-string snapshot; ret=0 on failure
+062 F _DeveloperHUDProperties_instance object return
+063 F _DeveloperHUDProperties_addLabel opaque objects
+064 F _DeveloperHUDProperties_updateLabel opaque objects
+065 F _DeveloperHUDProperties_remove opaque object and scalar
+066 F _MetalDrawable_texture opaque object, object return
+067 F _MetalLayer_nextDrawable opaque object, object return
+068 F _MTLDevice_supportsFXSpatialScaler opaque object, boolean return
+069 F _MTLDevice_supportsFXTemporalScaler opaque object, boolean return
+070 A _MetalLayer_setProps layer-props32 input snapshot and conversion
+071 A _MetalLayer_getProps native output local and bounded layer-props32 copyback; output zero on failure
+072 F _CreateMetalViewFromHWND opaque HWND/device values and object returns
+073 F _ReleaseMetalView opaque object
+074 D thunk_SM50Initialize ret=-1; shader=0; reflection struct zero; error=0 where bounded
+075 F thunk_SM50Destroy opaque AIR owner
+076 D thunk_SM50Compile ret=-1; bitcode=0; error=0 where bounded
+077 D thunk_SM50GetCompiledBitcode compiled-bitcode output struct zero where bounded
+078 F thunk_SM50DestroyBitcode opaque AIR bitcode
+079 D thunk_SM50GetErrorMessage ret_size=0; first output byte=0 where bounded
+080 F thunk_SM50FreeError opaque AIR error
+081 D thunk_SM50CompileGeometryPipelineVertex ret=-1; bitcode=0; error=0 where bounded
+082 D thunk_SM50CompileGeometryPipelineGeometry ret=-1; bitcode=0; error=0 where bounded
+083 D pinned NULL entry; no output
+084 D thunk_SM50CompileTessellationPipelineHull ret=-1; bitcode=0; error=0 where bounded
+085 D thunk_SM50CompileTessellationPipelineDomain ret=-1; bitcode=0; error=0 where bounded
+086 F _MTLCommandEncoder_setLabel opaque objects
+087 F _MTLDevice_setShouldMaximizeConcurrentCompilation opaque object and boolean
+088 D thunk_SM50GetArgumentsInfo count-less output arrays are untouched because bounded zeroing is impossible
+089 F _MTLCommandBuffer_error opaque object, object return
+090 F _MTLCommandBuffer_logs opaque object, object return
+091 D _MTLLogContainer_enumerate ret_read=0; count-less output buffer untouched
+092 F _CGColorSpace_checkColorSpaceSupported scalar, boolean return
+093 F _MetalLayer_setColorSpace opaque object and scalar, boolean return
+094 F _WMTGetPrimaryDisplayId scalar return
+095 F _WMTGetSecondaryDisplayId scalar return
+096 D _WMTGetDisplayDescription bounded description output zero
+097 A _MetalLayer_getEDRValue native output local and bounded EDR-value32 copyback; output zero on failure
+098 A _MTLLibrary_newFunctionWithConstants bounded name, constant array, and typed data snapshots; ret=0,error=0 on failure
+099 D _WMTQueryDisplaySetting colorspace=0; ret=false; bounded metadata output zero
+100 D _WMTUpdateDisplaySetting input-only guest pointer; no output
+101 A _WMTQueryDisplaySettingForLayer native metadata output local; version=0,colorspace=0,EDR=0,metadata=0 on failure
+102 F _MTLCommandBuffer_encodeWaitForEvent opaque objects and scalar
+103 F _MTLSharedEvent_signalValue opaque object and scalar
+104 F _MTLSharedEvent_setWin32EventAtValue opaque objects/NT handle and scalar
+105 F _MTLDevice_newFence opaque object, object return
+106 F _MTLDevice_newEvent opaque object, object return
+107 D _MTLBuffer_updateContents input-only guest pointer; no output
+108 F _SharedEventListener_create object return
+109 F _SharedEventListener_start opaque object
+110 F _SharedEventListener_destroy opaque object
+111 F _WMTGetOSVersion fixed outer scalar returns
+112 D _MTLDevice_newBinaryArchive archive=0,error=0
+113 D _MTLBinaryArchive_serialize error=0
+114 A _DispatchData_alloc_init low guest address only and blob<=67108864 snapshot; ret=0 on failure
+115 A _CacheReader_alloc_init bounded path snapshot; ret=0 on failure
+116 D _CacheReader_get data=0
+117 A _CacheWriter_alloc_init bounded path snapshot; ret=0 on failure
+118 D _CacheWriter_set input-only guest key; no output
+119 A _WMTSetMetalShaderCachePath bounded path snapshot; success=0 on failure
+120 D _MTLDevice_newSharedTexture ret=0 and gpu_resource_id=0; mach_port preserved
+121 F _WMTBootstrapRegister inline char[128] and Mach port
+122 F _WMTBootstrapLookUp inline char[128] and Mach port output
+123 F _MTLSharedEvent_createMachPort opaque object, Mach port return
+124 F _MTLDevice_newSharedEventWithMachPort opaque object/Mach port, object return
+125 F _MTLDevice_registryID opaque object, scalar return
+126 F _MTLSharedEvent_waitUntilSignaledValue opaque object/scalars, boolean return
+127 F _MTLCounterSampleBuffer_newTimestampBuffer opaque object/scalars, object return
+128 D _MTLCounterSampleBuffer_resolveCounterRange bounded data output zero when length<=67108864
+129 D _MTLCommandBuffer_blitCommandEncoderWithSampleBuffers ret=0
+130 F _MTLCommandBuffer_property opaque object and scalar, scalar return
+131 D _MTLDevice_newTileRenderPipelineState pso=0,error=0
+132 F _MTLDevice_newResidencySet opaque object/scalar, object/error outer returns
+133 D _MTLResidencySet_addAllocations input-only guest array; no output
+134 D _MTLResidencySet_removeAllocations input-only guest array; no output
+135 F _MTLResidencySet_removeAllAllocations opaque object
+136 F _MTLResidencySet_commit opaque object
+137 F _MTLCommandQueue_addResidencySet opaque objects
