@@ -167,8 +167,19 @@ def has_apple_arm64_guard(offset: int) -> bool:
     return False
 
 
+mprotect_exec_source, _, _ = extract_function("mprotect_exec")
+view_bounds_source, view_bounds_start, _ = extract_function("get_mprotect_view_bounds")
+next_view_source, _, _ = extract_function("next_mprotect_view")
 can_retry_source, can_retry_start, _ = extract_function("can_retry_native_writable_exec")
 retry_source, retry_start, retry_end = extract_function("mprotect_range_run")
+translated_projection_source, _, _ = extract_function("get_mprotect_translated_host_page_vprot")
+domain_source, _, _ = extract_function("mprotect_range_domain")
+validate_domains_source, validate_domains_start, _ = extract_function("validate_mprotect_domains")
+mprotect_source, mprotect_start, _ = extract_function("mprotect_range")
+validate_memory_access_source, _, _ = extract_function("validate_mprotect_memory_access_range")
+memory_access_source, _, _ = extract_function("mprotect_memory_access_range")
+native_fault_source, _, _ = extract_function("virtual_handle_fault")
+wow64_fault_source, _, _ = extract_function("__wine_resolve_wow64_memory_fault_v1")
 allocate_source, _, _ = extract_function("allocate_virtual_memory")
 map_view_source, _, _ = extract_function("map_view")
 snapshot_source, _, _ = extract_function("snapshot_vprot")
@@ -177,6 +188,10 @@ restore_uniform_source, _, _ = extract_function("restore_uniform_vprot_or_abort"
 
 if not has_apple_arm64_guard(can_retry_start):
     fail("the private-valloc eligibility helper is not gated to Apple ARM64")
+if not has_apple_arm64_guard(view_bounds_start):
+    fail("the physical view-bounds helper is not gated to Apple ARM64")
+if not has_apple_arm64_guard(validate_domains_start):
+    fail("the physical ownership-domain validator is not gated to Apple ARM64")
 
 retry_clean = clean_source[retry_start:retry_end]
 retry_gate = retry_clean.find("errno")
@@ -186,6 +201,95 @@ if retry_gate < 0 or not has_apple_arm64_guard(retry_start + retry_gate):
 # MAP_JIT is allowed in rationale comments, but not in executable source.
 if re.search(r"\bMAP_JIT\b", clean_source):
     fail("virtual.c implements MAP_JIT instead of isolating private valloc from the JIT domain")
+
+mprotect_exec_clean = strip_comments_and_literals(mprotect_exec_source)
+if not re.search(
+        r"if\s*\(\s*cpu_provider_owned\s*\)\s*unix_prot\s*&=\s*~PROT_EXEC\s*;",
+        mprotect_exec_clean,
+    ):
+    fail("CPU-provider-owned domains can retain host execute permission")
+
+can_retry_clean = strip_comments_and_literals(can_retry_source)
+if (re.search(r"\bfind_view\s*\(", can_retry_clean) or
+        not re.search(r"\bget_mprotect_view_bounds\s*\(", can_retry_clean) or
+        not re.search(r"\bpage_end\s*=\s*\(const char \*\)min\s*\(\s*end\s*,\s*view_end\s*\)",
+                      can_retry_clean)):
+    fail("private-valloc retry does not use its exact owner and logical tail bound")
+
+domain_clean = strip_comments_and_literals(domain_source)
+if (not re.search(r"\bis_shadow_translated_vprot\s*\(\s*view\s*->\s*protect\s*\)",
+                  domain_clean) or
+        not re.search(r"\bview\s*->\s*protect\s*&\s*VPROT_CPU_PROVIDER_OWNED\b",
+                      domain_clean)):
+    fail("physical domains do not retain their translated/provider ownership policy")
+
+translated_projection_clean = strip_comments_and_literals(translated_projection_source)
+delta_projection = translated_projection_clean.find(
+    "page_vprot = (page_vprot & ~clear) | set"
+)
+guard_filter = translated_projection_clean.find("page_vprot & VPROT_GUARD")
+if (delta_projection < 0 or guard_filter < 0 or delta_projection > guard_filter or
+        not re.search(
+            r"!delegated\s*&&\s*\(\s*clear\s*&\s*VPROT_WRITEWATCH\s*\)",
+            translated_projection_clean,
+        ) or
+        not re.search(r"page\s*<\s*logical_end\s*&&\s*"
+                      r"page\s*\+\s*page_size\s*>\s*logical_start",
+                      translated_projection_clean)):
+    fail("translated aggregation does not project lane deltas before filtering")
+
+validate_domains_clean = strip_comments_and_literals(validate_domains_source)
+if (not re.search(r"\bfind_view_at_or_after\s*\(", validate_domains_clean) or
+        not re.search(r"\bget_mprotect_view_bounds\s*\(", validate_domains_clean) or
+        not re.search(r"\bnext_mprotect_view\s*\(", validate_domains_clean) or
+        not re.search(r"\berrno\s*=\s*EINVAL\s*;", validate_domains_clean)):
+    fail("physical ownership domains are not validated before protection changes")
+
+mprotect_clean = strip_comments_and_literals(mprotect_source)
+validate_call = mprotect_clean.find("validate_mprotect_domains")
+apply_call = mprotect_clean.find("mprotect_range_domain")
+if (validate_call < 0 or apply_call < 0 or validate_call > apply_call or
+        not re.search(r"if\s*\(\s*!size\s*\)\s*return\s+0\s*;", mprotect_clean) or
+        not re.search(r"logical_end\s*>\s*~\(ULONG_PTR\)0\s*-\s*host_page_mask",
+                      mprotect_clean)):
+    fail("mprotect_range does not validate its complete domain walk before applying it")
+
+memory_access_clean = strip_comments_and_literals(memory_access_source)
+if (not re.search(r"\boverlaps_wow64_shadow\s*\(", memory_access_clean) or
+        not re.search(r"\bvalidate_mprotect_memory_access_range\s*\(",
+                      memory_access_clean)):
+    fail("native-copy reprotection no longer validates translated shadow ownership")
+
+validate_memory_access_clean = strip_comments_and_literals(validate_memory_access_source)
+if (not re.search(r"size\s*>\s*~\(ULONG_PTR\)0\s*-\s*address",
+                  validate_memory_access_clean) or
+        not re.search(
+            r"\(\s*view\s*->\s*protect\s*&\s*VPROT_CPU_PROVIDER_OWNED\s*\)\s*"
+            r"!=\s*VPROT_WOW64_TRANSLATED",
+            validate_memory_access_clean,
+        ) or
+        not re.search(r"\bget_mprotect_view_bounds\s*\(",
+                      validate_memory_access_clean)):
+    fail("shadow reprotection preflight accepts gaps or ambiguous CPU ownership")
+
+fault_contracts = (
+    ("native", native_fault_source, "VPROT_GUARD", "page", "host_page_size"),
+    ("native", native_fault_source, "VPROT_WRITEWATCH", "page", "host_page_size"),
+    ("WoW64", wow64_fault_source, "VPROT_GUARD", "logical_page", "page_size"),
+    ("WoW64", wow64_fault_source, "VPROT_WRITEWATCH", "clear_base", "clear_size"),
+)
+for fault_name, fault_source, bit, base, size in fault_contracts:
+    fault_clean = strip_comments_and_literals(fault_source)
+    protect_match = re.search(
+        rf"mprotect_range\s*\(\s*{base}\s*,\s*{size}\s*,\s*0\s*,\s*{bit}\s*\)",
+        fault_clean,
+    )
+    clear_match = re.search(
+        rf"set_page_vprot_bits\s*\([^;]*,\s*0\s*,\s*{bit}\s*\)",
+        fault_clean,
+    )
+    if not protect_match or not clear_match or protect_match.start() > clear_match.start():
+        fail(f"{fault_name} fault publishes the {bit} clear before physical success")
 
 allocate_clean = strip_comments_and_literals(allocate_source)
 
@@ -365,15 +469,20 @@ def compile_and_run(name: str, program: str) -> None:
 
 
 eligibility_model = r'''
+#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
 typedef unsigned char BYTE;
 typedef int BOOL;
+typedef uintptr_t ULONG_PTR;
+typedef size_t SIZE_T;
 
 #define FALSE 0
 #define TRUE 1
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
 #define VPROT_COMMITTED         0x01
 #define VPROT_GUARD             0x02
 #define VPROT_EXEC              0x04
@@ -382,20 +491,23 @@ typedef int BOOL;
 #define VPROT_SYSTEM            0x20
 #define VPROT_SHADOW_TRANSLATED 0x40
 #define VPROT_READ              0x80
+#define VPROT_AMD64_IDENTITY    0x100
+#define VPROT_CPU_PROVIDER_OWNED (VPROT_SHADOW_TRANSLATED | VPROT_AMD64_IDENTITY)
 
 struct file_view
 {
-    BYTE protect;
+    void *base;
+    size_t size;
+    unsigned int protect;
     BOOL valloc;
 };
 
 static const size_t page_size = 4096;
-static unsigned char probe_memory[4 * 4096];
-static BYTE page_vprot[4];
+static const ULONG_PTR page_mask = 4095;
+static const ULONG_PTR host_page_mask = 16383;
+_Alignas(16384) static unsigned char probe_memory[8 * 4096];
+static BYTE page_vprot[8];
 static size_t page_reads;
-static int foreign_page;
-static struct file_view foreign_view;
-static struct file_view *active_view;
 
 static BOOL is_view_valloc(const struct file_view *view)
 {
@@ -407,19 +519,10 @@ static BYTE get_page_vprot(const void *page)
     size_t index = ((const unsigned char *)page - probe_memory) / page_size;
 
     page_reads++;
-    if (index >= 4) return 0;
+    if (index >= 8) return 0;
     return page_vprot[index];
 }
-
-static struct file_view *find_view(const void *page, size_t size)
-{
-    size_t index = ((const unsigned char *)page - probe_memory) / page_size;
-
-    (void)size;
-    if ((int)index == foreign_page) return &foreign_view;
-    return active_view;
-}
-''' + can_retry_source + r'''
+''' + view_bounds_source + can_retry_source + r'''
 
 #define CHECK(expression) do { \
     if (!(expression)) { \
@@ -434,57 +537,86 @@ static void reset_pages(struct file_view *view)
     size_t index;
 
     memset(page_vprot, 0, sizeof(page_vprot));
-    for (index = 0; index < 4; index++)
+    for (index = 0; index < 5; index++)
         page_vprot[index] = VPROT_COMMITTED | VPROT_READ | VPROT_WRITE | VPROT_EXEC;
     page_reads = 0;
-    foreign_page = -1;
-    active_view = view;
+    view->base = probe_memory;
+    view->size = 5 * page_size;
 }
 
 int main(void)
 {
-    struct file_view view = {0, TRUE};
+    struct file_view view = {probe_memory, 5 * 4096, 0, TRUE};
 
     reset_pages(&view);
     CHECK(can_retry_native_writable_exec(&view, probe_memory,
-                                         sizeof(probe_memory), 0, 0));
-    CHECK(page_reads == 4);
+                                         sizeof(probe_memory),
+                                         (ULONG_PTR)probe_memory,
+                                         (ULONG_PTR)probe_memory + sizeof(probe_memory),
+                                         0, 0));
+    CHECK(page_reads == 5);
 
     reset_pages(&view);
-    page_vprot[3] = VPROT_COMMITTED | VPROT_READ | VPROT_EXEC;
-    CHECK(!can_retry_native_writable_exec(&view, probe_memory,
-                                          sizeof(probe_memory), 0, 0));
-    CHECK(page_reads == 4);
+    CHECK(can_retry_native_writable_exec(&view, probe_memory + 4 * page_size,
+                                         4 * page_size,
+                                         (ULONG_PTR)probe_memory + 4 * page_size,
+                                         (ULONG_PTR)probe_memory + 5 * page_size,
+                                         0, 0));
+    CHECK(page_reads == 1);
 
     reset_pages(&view);
-    foreign_page = 3;
+    page_vprot[4] = VPROT_COMMITTED | VPROT_READ | VPROT_EXEC;
     CHECK(!can_retry_native_writable_exec(&view, probe_memory,
-                                          sizeof(probe_memory), 0, 0));
-    CHECK(page_reads == 4);
+                                          sizeof(probe_memory),
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + sizeof(probe_memory),
+                                          0, 0));
+    CHECK(page_reads == 5);
+
+    reset_pages(&view);
+    CHECK(!can_retry_native_writable_exec(&view, probe_memory + 5 * page_size,
+                                          page_size,
+                                          (ULONG_PTR)probe_memory + 5 * page_size,
+                                          (ULONG_PTR)probe_memory + 6 * page_size,
+                                          0, 0));
+    CHECK(page_reads == 0);
 
     reset_pages(&view);
     view.valloc = FALSE;
     CHECK(!can_retry_native_writable_exec(&view, probe_memory,
-                                          sizeof(probe_memory), 0, 0));
+                                          sizeof(probe_memory),
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + sizeof(probe_memory),
+                                          0, 0));
     CHECK(page_reads == 0);
     view.valloc = TRUE;
 
     reset_pages(&view);
     view.protect = VPROT_SYSTEM;
     CHECK(!can_retry_native_writable_exec(&view, probe_memory,
-                                          sizeof(probe_memory), 0, 0));
+                                          sizeof(probe_memory),
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + sizeof(probe_memory),
+                                          0, 0));
     CHECK(page_reads == 0);
 
     reset_pages(&view);
-    view.protect = VPROT_SHADOW_TRANSLATED;
+    view.protect = VPROT_AMD64_IDENTITY;
     CHECK(!can_retry_native_writable_exec(&view, probe_memory,
-                                          sizeof(probe_memory), 0, 0));
+                                          sizeof(probe_memory),
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + sizeof(probe_memory),
+                                          0, 0));
     CHECK(page_reads == 0);
 
     view.protect = 0;
     reset_pages(&view);
-    CHECK(!can_retry_native_writable_exec(&view, probe_memory,
-                                          sizeof(probe_memory), 0, VPROT_WRITE));
+    CHECK(!can_retry_native_writable_exec(&view, probe_memory + 4 * page_size,
+                                          4 * page_size,
+                                          (ULONG_PTR)probe_memory + 4 * page_size,
+                                          (ULONG_PTR)probe_memory + 5 * page_size,
+                                          0, VPROT_WRITE));
+    CHECK(page_reads == 1);
     return 0;
 }
 '''
@@ -492,11 +624,13 @@ int main(void)
 
 retry_model = r'''
 #include <errno.h>
+#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 
 typedef unsigned char BYTE;
 typedef int BOOL;
+typedef uintptr_t ULONG_PTR;
 
 #define FALSE 0
 #define TRUE 1
@@ -520,6 +654,8 @@ static int retry_calls;
 static void *retry_base;
 static size_t retry_size;
 static int retry_prot;
+static ULONG_PTR observed_logical_start;
+static ULONG_PTR observed_logical_end;
 static BYTE observed_set;
 static BYTE observed_clear;
 
@@ -535,12 +671,15 @@ int mprotect_exec(void *base, size_t size, int prot, BOOL translated)
 }
 
 BOOL can_retry_native_writable_exec(const struct file_view *view, const void *base,
-                                    size_t size, BYTE set, BYTE clear)
+                                    size_t size, ULONG_PTR logical_start,
+                                    ULONG_PTR logical_end, BYTE set, BYTE clear)
 {
     (void)view;
     (void)base;
     (void)size;
     eligibility_calls++;
+    observed_logical_start = logical_start;
+    observed_logical_end = logical_end;
     observed_set = set;
     observed_clear = clear;
     return eligible;
@@ -585,6 +724,8 @@ static void reset_retry(void)
     retry_base = NULL;
     retry_size = 0;
     retry_prot = 0;
+    observed_logical_start = 0;
+    observed_logical_end = 0;
     observed_set = 0;
     observed_clear = 0;
 }
@@ -598,46 +739,385 @@ int main(void)
 
     reset_retry();
     initial_result = 0;
-    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE, 0x10, 0x20);
+    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE,
+                                (ULONG_PTR)memory, (ULONG_PTR)memory + sizeof(memory),
+                                0x10, 0x20);
     CHECK(result == 0 && initial_calls == 1);
     CHECK(eligibility_calls == 0 && retry_calls == 0);
 
     reset_retry();
     initial_errno = EINVAL;
-    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE, 0x10, 0x20);
+    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE,
+                                (ULONG_PTR)memory, (ULONG_PTR)memory + sizeof(memory),
+                                0x10, 0x20);
     CHECK(result == -1);
     CHECK(eligibility_calls == 0 && retry_calls == 0);
 
     reset_retry();
     result = mprotect_range_run(&view, memory, sizeof(memory),
-                                PROT_READ | PROT_EXEC, FALSE, 0x10, 0x20);
+                                PROT_READ | PROT_EXEC, FALSE,
+                                (ULONG_PTR)memory, (ULONG_PTR)memory + sizeof(memory),
+                                0x10, 0x20);
     CHECK(result == -1);
     CHECK(eligibility_calls == 0 && retry_calls == 0);
 
     reset_retry();
     result = mprotect_range_run(&view, memory, sizeof(memory),
-                                PROT_READ | PROT_WRITE, FALSE, 0x10, 0x20);
+                                PROT_READ | PROT_WRITE, FALSE,
+                                (ULONG_PTR)memory, (ULONG_PTR)memory + sizeof(memory),
+                                0x10, 0x20);
     CHECK(result == -1);
     CHECK(eligibility_calls == 0 && retry_calls == 0);
 
     reset_retry();
     eligible = FALSE;
-    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE, 0x10, 0x20);
+    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE,
+                                (ULONG_PTR)memory, (ULONG_PTR)memory + sizeof(memory),
+                                0x10, 0x20);
     CHECK(result == -1);
     CHECK(eligibility_calls == 1 && retry_calls == 0);
 
     reset_retry();
-    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE, 0x10, 0x20);
+    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE,
+                                (ULONG_PTR)memory, (ULONG_PTR)memory + sizeof(memory),
+                                0x10, 0x20);
     CHECK(result == 0);
     CHECK(eligibility_calls == 1 && retry_calls == 1);
     CHECK(retry_base == memory && retry_size == sizeof(memory));
     CHECK(retry_prot == (prot & ~PROT_EXEC));
+    CHECK(observed_logical_start == (ULONG_PTR)memory);
+    CHECK(observed_logical_end == (ULONG_PTR)memory + sizeof(memory));
     CHECK(observed_set == 0x10 && observed_clear == 0x20);
 
     reset_retry();
     retry_result = -1;
-    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE, 0x10, 0x20);
+    result = mprotect_range_run(&view, memory, sizeof(memory), prot, FALSE,
+                                (ULONG_PTR)memory, (ULONG_PTR)memory + sizeof(memory),
+                                0x10, 0x20);
     CHECK(result == -1 && retry_calls == 1);
+    return 0;
+}
+'''
+
+
+domain_model = r'''
+#include <assert.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef unsigned char BYTE;
+typedef int BOOL;
+typedef uintptr_t ULONG_PTR;
+typedef size_t SIZE_T;
+
+#define FALSE 0
+#define TRUE 1
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define PROT_NONE  0
+#define PROT_READ  0x01
+#define PROT_WRITE 0x02
+#define PROT_EXEC  0x04
+#define VPROT_READ       0x01
+#define VPROT_WRITE      0x02
+#define VPROT_EXEC       0x04
+#define VPROT_WRITECOPY  0x08
+#define VPROT_GUARD      0x10
+#define VPROT_COMMITTED  0x20
+#define VPROT_WRITEWATCH 0x40
+#define VPROT_SYSTEM     0x0200
+#define VPROT_WOW64_TRANSLATED 0x1000
+#define VPROT_AMD64_LOW_TRANSLATED 0x2000
+#define VPROT_AMD64_IDENTITY 0x4000
+#define VPROT_SHADOW_TRANSLATED \
+    (VPROT_WOW64_TRANSLATED | VPROT_AMD64_LOW_TRANSLATED)
+#define VPROT_CPU_PROVIDER_OWNED \
+    (VPROT_SHADOW_TRANSLATED | VPROT_AMD64_IDENTITY)
+#define STATUS_ACCESS_DENIED 0xc0000022u
+#define ROUND_ADDR(addr, mask) ((void *)((ULONG_PTR)(addr) & ~(ULONG_PTR)(mask)))
+#define WINE_RB_ENTRY_VALUE(entry, type, field) \
+    ((type *)((char *)(entry) - offsetof(type, field)))
+#ifndef __APPLE__
+# define __APPLE__ 1
+#endif
+#ifndef __aarch64__
+# define __aarch64__ 1
+#endif
+
+static const size_t page_size = 4096;
+static const ULONG_PTR page_mask = 4095;
+static const size_t host_page_size = 16384;
+static const ULONG_PTR host_page_mask = 16383;
+
+struct wine_rb_entry
+{
+    struct wine_rb_entry *next;
+    struct wine_rb_entry *prev;
+};
+
+struct file_view
+{
+    struct wine_rb_entry entry;
+    void *base;
+    size_t size;
+    unsigned int protect;
+};
+
+struct protection_call
+{
+    struct file_view *view;
+    void *base;
+    size_t size;
+    int requested_prot;
+    int effective_prot;
+    BOOL cpu_provider_owned;
+};
+
+_Alignas(16384) static unsigned char probe_memory[16 * 4096];
+static BYTE page_vprot[16];
+static struct file_view views[3];
+static size_t view_count;
+static struct protection_call calls[8];
+static size_t call_count;
+static size_t lookup_calls;
+static BOOL delegated;
+
+static struct wine_rb_entry *rb_next(const struct wine_rb_entry *entry)
+{
+    return entry->next;
+}
+
+static struct wine_rb_entry *rb_prev(const struct wine_rb_entry *entry)
+{
+    return entry->prev;
+}
+
+static BOOL is_shadow_translated_vprot(unsigned int vprot)
+{
+    return !!(vprot & VPROT_SHADOW_TRANSLATED);
+}
+
+static BOOL wow64_memory_logical_write_fault_is_delegated(void)
+{
+    return delegated;
+}
+
+static BYTE get_page_vprot(const void *address)
+{
+    ULONG_PTR value = (ULONG_PTR)address;
+    ULONG_PTR start = (ULONG_PTR)probe_memory;
+    size_t index;
+
+    if (value < start || value >= start + sizeof(probe_memory)) return 0;
+    index = (value - start) / page_size;
+    return page_vprot[index];
+}
+
+static BYTE get_host_page_vprot(const void *address)
+{
+    ULONG_PTR base = (ULONG_PTR)ROUND_ADDR(address, host_page_mask);
+    BYTE vprot = 0;
+    size_t offset;
+
+    for (offset = 0; offset < host_page_size; offset += page_size)
+        vprot |= get_page_vprot((void *)(base + offset));
+    return vprot;
+}
+
+static int get_unix_prot(BYTE vprot)
+{
+    int prot = 0;
+
+    if ((vprot & VPROT_COMMITTED) && !(vprot & VPROT_GUARD))
+    {
+        if (vprot & VPROT_READ) prot |= PROT_READ;
+        if (vprot & (VPROT_WRITE | VPROT_WRITECOPY)) prot |= PROT_READ | PROT_WRITE;
+        if (vprot & VPROT_EXEC) prot |= PROT_READ | PROT_EXEC;
+        if (vprot & VPROT_WRITEWATCH) prot &= ~PROT_WRITE;
+    }
+    return prot;
+}
+
+static struct file_view *find_view_at_or_after(const void *address)
+{
+    ULONG_PTR value = (ULONG_PTR)address;
+    size_t index;
+
+    lookup_calls++;
+    for (index = 0; index < view_count; index++)
+    {
+        ULONG_PTR start = (ULONG_PTR)views[index].base;
+
+        if (views[index].size <= ~(ULONG_PTR)0 - start &&
+            start + views[index].size <= value) continue;
+        return &views[index];
+    }
+    return NULL;
+}
+
+static int mprotect_range_run(struct file_view *view, void *base, size_t size,
+                              int unix_prot, BOOL cpu_provider_owned,
+                              ULONG_PTR logical_start, ULONG_PTR logical_end,
+                              BYTE set, BYTE clear)
+{
+    struct protection_call *call;
+
+    (void)logical_start;
+    (void)logical_end;
+    (void)set;
+    (void)clear;
+    assert(call_count < sizeof(calls) / sizeof(calls[0]));
+    call = &calls[call_count++];
+    call->view = view;
+    call->base = base;
+    call->size = size;
+    call->requested_prot = unix_prot;
+    call->effective_prot = cpu_provider_owned ? unix_prot & ~PROT_EXEC : unix_prot;
+    call->cpu_provider_owned = cpu_provider_owned;
+    return 0;
+}
+
+static _Noreturn void abort_process(unsigned int status)
+{
+    (void)status;
+    abort();
+}
+
+static void set_views(size_t count)
+{
+    size_t index;
+
+    view_count = count;
+    for (index = 0; index < count; index++)
+    {
+        views[index].entry.prev = index ? &views[index - 1].entry : NULL;
+        views[index].entry.next = index + 1 < count ? &views[index + 1].entry : NULL;
+    }
+}
+
+static void reset_model(void)
+{
+    memset(page_vprot, 0, sizeof(page_vprot));
+    memset(views, 0, sizeof(views));
+    memset(calls, 0, sizeof(calls));
+    view_count = 0;
+    call_count = 0;
+    lookup_calls = 0;
+    delegated = FALSE;
+    errno = 0;
+}
+''' + view_bounds_source + next_view_source + translated_projection_source + \
+    domain_source + validate_domains_source + mprotect_source + r'''
+
+#define CHECK(expression) do { \
+    if (!(expression)) { \
+        fprintf(stderr, "domain check failed at line %d: %s\n", \
+                __LINE__, #expression); \
+        return 1; \
+    } \
+} while (0)
+
+int main(void)
+{
+    ULONG_PTR start = (ULONG_PTR)probe_memory;
+    size_t index;
+
+    reset_model();
+    views[0].base = probe_memory;
+    views[0].size = 5 * page_size;
+    views[0].protect = VPROT_AMD64_IDENTITY;
+    set_views(1);
+    page_vprot[4] = VPROT_COMMITTED | VPROT_READ | VPROT_WRITE | VPROT_EXEC;
+    CHECK(!mprotect_range(probe_memory + 4 * page_size, page_size, 0, 0));
+    CHECK(call_count == 1 && calls[0].view == &views[0]);
+    CHECK(calls[0].base == probe_memory + 4 * page_size);
+    CHECK(calls[0].size == host_page_size && calls[0].cpu_provider_owned);
+    CHECK(calls[0].requested_prot & PROT_EXEC);
+    CHECK((calls[0].effective_prot & (PROT_WRITE | PROT_EXEC)) == PROT_WRITE);
+
+    reset_model();
+    views[0].base = probe_memory;
+    views[0].size = host_page_size;
+    views[1].base = probe_memory + host_page_size;
+    views[1].size = 5 * page_size;
+    views[1].protect = VPROT_AMD64_IDENTITY;
+    set_views(2);
+    for (index = 0; index < 8; index++)
+        page_vprot[index] = VPROT_COMMITTED | VPROT_READ | VPROT_EXEC;
+    CHECK(!mprotect_range(probe_memory + 3 * page_size, 2 * page_size, 0, 0));
+    CHECK(call_count == 2);
+    CHECK(calls[0].view == &views[0] && !calls[0].cpu_provider_owned);
+    CHECK(calls[1].view == &views[1] && calls[1].cpu_provider_owned);
+    CHECK(calls[0].base == probe_memory && calls[0].size == host_page_size);
+    CHECK(calls[1].base == probe_memory + host_page_size &&
+          calls[1].size == host_page_size);
+
+    reset_model();
+    views[0].base = probe_memory + host_page_size;
+    views[0].size = 5 * page_size;
+    views[0].protect = VPROT_AMD64_IDENTITY;
+    set_views(1);
+    CHECK(!mprotect_range(probe_memory, 4 * host_page_size, 0, 0));
+    CHECK(call_count == 3);
+    CHECK(!calls[0].view && calls[0].base == probe_memory);
+    CHECK(calls[1].view == &views[0]);
+    CHECK(!calls[2].view && calls[2].base == probe_memory + 3 * host_page_size);
+
+    reset_model();
+    views[0].base = probe_memory;
+    views[0].size = host_page_size;
+    views[0].protect = VPROT_WOW64_TRANSLATED;
+    set_views(1);
+    page_vprot[0] = VPROT_COMMITTED | VPROT_READ | VPROT_GUARD;
+    page_vprot[1] = VPROT_COMMITTED | VPROT_EXEC | VPROT_GUARD;
+    CHECK(!mprotect_range(probe_memory, page_size, 0, VPROT_GUARD));
+    CHECK(call_count == 1 && (calls[0].requested_prot & PROT_READ));
+    CHECK(!(calls[0].requested_prot & PROT_EXEC));
+
+    reset_model();
+    views[0].base = probe_memory;
+    views[0].size = host_page_size;
+    views[0].protect = VPROT_WOW64_TRANSLATED;
+    set_views(1);
+    page_vprot[0] = VPROT_COMMITTED | VPROT_READ | VPROT_WRITE | VPROT_WRITEWATCH;
+    page_vprot[1] = page_vprot[0];
+    CHECK(!mprotect_range(probe_memory, page_size, 0, VPROT_WRITEWATCH));
+    CHECK(call_count == 1 && (calls[0].requested_prot & PROT_WRITE));
+
+    reset_model();
+    views[0].base = probe_memory;
+    views[0].size = host_page_size;
+    views[0].protect = VPROT_WOW64_TRANSLATED;
+    set_views(1);
+    page_vprot[0] = VPROT_COMMITTED | VPROT_READ | VPROT_GUARD;
+    page_vprot[1] = VPROT_COMMITTED | VPROT_WRITE | VPROT_GUARD;
+    CHECK(!mprotect_range(probe_memory, host_page_size, 0, VPROT_GUARD));
+    CHECK(call_count == 1 && (calls[0].requested_prot & PROT_WRITE));
+
+    reset_model();
+    views[0].base = probe_memory;
+    views[0].size = 5 * page_size;
+    views[1].base = probe_memory + host_page_size;
+    views[1].size = host_page_size;
+    set_views(2);
+    CHECK(mprotect_range(probe_memory, host_page_size, 0, 0) == -1);
+    CHECK(errno == EINVAL && call_count == 0);
+
+    reset_model();
+    CHECK(!mprotect_range(probe_memory, 0, 0, 0));
+    CHECK(!lookup_calls && !call_count);
+    CHECK(mprotect_range((void *)(~(ULONG_PTR)0 - page_mask),
+                         2 * page_size, 0, 0) == -1);
+    CHECK(errno == EINVAL && !lookup_calls && !call_count);
+
+    reset_model();
+    CHECK(mprotect_range((void *)(~(ULONG_PTR)0 - 2 * page_mask),
+                         page_size, 0, 0) == -1);
+    CHECK(errno == EINVAL && !lookup_calls && !call_count);
+    CHECK(start == (ULONG_PTR)probe_memory);
     return 0;
 }
 '''
@@ -757,6 +1237,7 @@ int main(void)
 
 compile_and_run("private-valloc-eligibility-model", eligibility_model)
 compile_and_run("writable-exec-retry-model", retry_model)
+compile_and_run("physical-ownership-domain-model", domain_model)
 compile_and_run("uniform-protection-rollback-model", uniform_rollback_model)
 PY
 

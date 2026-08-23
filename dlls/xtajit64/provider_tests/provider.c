@@ -76,7 +76,9 @@ static DWORD CALLBACK simulation_thread( void *arg )
 #define MIXED_IMAGE_TEXT_RVA     0x1000
 #define MIXED_IMAGE_DATA_RVA     0x2000
 #define MIXED_IMAGE_RDATA_RVA    0x3000
-#define MIXED_IMAGE_SIZE         0x4000
+#define MIXED_IMAGE_TAIL_RVA     0x4000
+#define MIXED_IMAGE_HOST_PAGE    0x4000  /* Darwin arm64 host page size */
+#define MIXED_IMAGE_SIZE         0x5000
 
 struct mixed_image_thread_args
 {
@@ -99,12 +101,13 @@ static HANDLE create_mixed_protection_image( char path[MAX_PATH] )
 {
     static const DWORD written_value = 0x13572468;
     static const DWORD readonly_value = 0x6a09beef;
-    IMAGE_SECTION_HEADER sections[3];
+    IMAGE_SECTION_HEADER sections[4];
     IMAGE_NT_HEADERS64 nt;
     IMAGE_DOS_HEADER dos;
     BYTE text[MIXED_IMAGE_RAW_SIZE] = {0};
     BYTE data[MIXED_IMAGE_RAW_SIZE] = {0};
     BYTE rdata[MIXED_IMAGE_RAW_SIZE] = {0};
+    BYTE tail[MIXED_IMAGE_RAW_SIZE] = {0};
     char temp_path[MAX_PATH];
     SIZE_T offset = 0, displacement_offset, branch_offset, failure_offset, exit_offset;
     void *preferred;
@@ -132,7 +135,7 @@ static HANDLE create_mixed_protection_image( char path[MAX_PATH] )
     nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
     nt.OptionalHeader.MajorLinkerVersion = 1;
     nt.OptionalHeader.SizeOfCode = MIXED_IMAGE_RAW_SIZE;
-    nt.OptionalHeader.SizeOfInitializedData = 2 * MIXED_IMAGE_RAW_SIZE;
+    nt.OptionalHeader.SizeOfInitializedData = 3 * MIXED_IMAGE_RAW_SIZE;
     nt.OptionalHeader.AddressOfEntryPoint = MIXED_IMAGE_TEXT_RVA;
     nt.OptionalHeader.BaseOfCode = MIXED_IMAGE_TEXT_RVA;
     nt.OptionalHeader.ImageBase = (ULONG_PTR)preferred;
@@ -171,6 +174,13 @@ static HANDLE create_mixed_protection_image( char path[MAX_PATH] )
     sections[2].SizeOfRawData = MIXED_IMAGE_RAW_SIZE;
     sections[2].PointerToRawData = 3 * MIXED_IMAGE_RAW_SIZE;
     sections[2].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    memcpy( sections[3].Name, ".tail", sizeof(".tail") );
+    sections[3].Misc.VirtualSize = MIXED_IMAGE_SECTION_SIZE;
+    sections[3].VirtualAddress = MIXED_IMAGE_TAIL_RVA;
+    sections[3].SizeOfRawData = MIXED_IMAGE_RAW_SIZE;
+    sections[3].PointerToRawData = 4 * MIXED_IMAGE_RAW_SIZE;
+    sections[3].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+                                  IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE;
 
     /* movl $written_value, data(%rip) */
     text[offset++] = 0xc7;
@@ -231,7 +241,8 @@ static HANDLE create_mixed_protection_image( char path[MAX_PATH] )
           write_image_part( file, dos.e_lfanew + sizeof(nt), sections, sizeof(sections) ) &&
           write_image_part( file, sections[0].PointerToRawData, text, sizeof(text) ) &&
           write_image_part( file, sections[1].PointerToRawData, data, sizeof(data) ) &&
-          write_image_part( file, sections[2].PointerToRawData, rdata, sizeof(rdata) );
+          write_image_part( file, sections[2].PointerToRawData, rdata, sizeof(rdata) ) &&
+          write_image_part( file, sections[3].PointerToRawData, tail, sizeof(tail) );
     CloseHandle( file );
     if (ret)
     {
@@ -341,6 +352,49 @@ static BOOL restore_mixed_image_writable_lane( void *base )
     return TRUE;
 }
 
+/* Keep the final logical image page deliberately short of its 16K host page.
+ * The native store must fault once for executable-write tracking, retain the
+ * identity-image owner while reprotecting the rounded host page, and retry. */
+static BOOL write_mixed_image_tail( void *base )
+{
+    MANAGE_WRITES_TO_EXECUTABLE_MEMORY process =
+        { .Version = 2, .ProcessEnableWriteExceptions = 1 };
+    MANAGE_WRITES_TO_EXECUTABLE_MEMORY thread = { .Version = 2, .ThreadAllowWrites = 1 };
+    volatile DWORD *value = (DWORD *)((BYTE *)base + MIXED_IMAGE_TAIL_RVA);
+    NTSTATUS status, cleanup_status;
+    BOOL ret = FALSE;
+
+    status = NtSetInformationThread( GetCurrentThread(), ThreadManageWritesToExecutableMemory,
+                                     &thread, sizeof(thread) );
+    ok( !status, "tail write allowance failed %#lx\n", status );
+    if (status) return FALSE;
+
+    status = NtSetInformationProcess( GetCurrentProcess(), ProcessManageWritesToExecutableMemory,
+                                      &process, sizeof(process) );
+    ok( !status, "tail executable-write tracking failed %#lx\n", status );
+    if (!status)
+    {
+        *value = 0x31415926;
+        ok( *value == 0x31415926, "tail executable-write retry did not persist\n" );
+        ret = *value == 0x31415926;
+
+        process.ProcessEnableWriteExceptions = 0;
+        cleanup_status = NtSetInformationProcess( GetCurrentProcess(),
+                                                  ProcessManageWritesToExecutableMemory,
+                                                  &process, sizeof(process) );
+        ok( !cleanup_status, "tail executable-write tracking cleanup failed %#lx\n",
+            cleanup_status );
+        if (cleanup_status) ret = FALSE;
+    }
+
+    thread.ThreadAllowWrites = 0;
+    cleanup_status = NtSetInformationThread( GetCurrentThread(),
+                                             ThreadManageWritesToExecutableMemory,
+                                             &thread, sizeof(thread) );
+    ok( !cleanup_status, "tail write allowance cleanup failed %#lx\n", cleanup_status );
+    return ret && !cleanup_status;
+}
+
 static void test_mixed_image_mapping( void (WINAPI *begin_simulation)(void) )
 {
     static WCHAR image_name[] = L"x64-provider-mixed-protection-image";
@@ -377,7 +431,7 @@ static void test_mixed_image_mapping( void (WINAPI *begin_simulation)(void) )
     ok( NT_SUCCESS(status), "mixed-protection NtMapViewOfSection failed %#lx\n", status );
     if (!NT_SUCCESS(status)) goto done;
     ok( size == MIXED_IMAGE_SIZE, "mixed-protection image size %#Ix\n", size );
-    ok( !((ULONG_PTR)base & (MIXED_IMAGE_SIZE - 1)),
+    ok( !((ULONG_PTR)base & (MIXED_IMAGE_HOST_PAGE - 1)),
         "mixed-protection image base %p is not 16K aligned\n", base );
 
     check_image_protection( (BYTE *)base + MIXED_IMAGE_TEXT_RVA,
@@ -386,6 +440,8 @@ static void test_mixed_image_mapping( void (WINAPI *begin_simulation)(void) )
                             PAGE_WRITECOPY, "writable section" );
     check_image_protection( (BYTE *)base + MIXED_IMAGE_RDATA_RVA,
                             PAGE_READONLY, "read-only section" );
+    check_image_protection( (BYTE *)base + MIXED_IMAGE_TAIL_RVA,
+                            PAGE_EXECUTE_WRITECOPY, "executable-write tail section" );
     check_identity_image_region( base, base, PAGE_READONLY, "image header" );
     check_identity_image_region( (BYTE *)base + MIXED_IMAGE_TEXT_RVA, base,
                                  PAGE_EXECUTE_READ, "RX section" );
@@ -393,6 +449,8 @@ static void test_mixed_image_mapping( void (WINAPI *begin_simulation)(void) )
                                  PAGE_WRITECOPY, "writable section" );
     check_identity_image_region( (BYTE *)base + MIXED_IMAGE_RDATA_RVA, base,
                                  PAGE_READONLY, "read-only section" );
+    check_identity_image_region( (BYTE *)base + MIXED_IMAGE_TAIL_RVA, base,
+                                 PAGE_EXECUTE_WRITECOPY, "executable-write tail section" );
     ret = VirtualQuery( (BYTE *)base + MIXED_IMAGE_DATA_RVA, &info, sizeof(info) );
     if (ret != sizeof(info) || (info.Protect & 0xff) != PAGE_WRITECOPY) goto done;
     if (!restore_mixed_image_writable_lane( base )) goto done;
@@ -418,6 +476,15 @@ static void test_mixed_image_mapping( void (WINAPI *begin_simulation)(void) )
             "mixed-protection writable section was not updated\n" );
     }
     CloseHandle( thread );
+    if (write_mixed_image_tail( base ))
+    {
+        check_image_protection( (BYTE *)base + MIXED_IMAGE_TAIL_RVA,
+                                PAGE_EXECUTE_WRITECOPY,
+                                "executable-write tail section after retry" );
+        check_identity_image_region( (BYTE *)base + MIXED_IMAGE_TAIL_RVA, base,
+                                     PAGE_EXECUTE_WRITECOPY,
+                                     "executable-write tail section after retry" );
+    }
 
 done:
     if (base) NtUnmapViewOfSection( GetCurrentProcess(), base );
@@ -650,8 +717,10 @@ static void test_provider_contract(void)
     }
     CloseHandle( thread );
 
-    test_mixed_image_mapping( begin_simulation );
     test_concurrent_provider( begin_simulation );
+    /* This enables process-wide executable-write tracking; keep it last so
+     * every earlier concurrency test has completed before policy changes. */
+    test_mixed_image_mapping( begin_simulation );
 
     if (simulation_ok)
     {

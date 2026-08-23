@@ -3230,6 +3230,33 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot, BOOL cp
 
 
 #if defined(__APPLE__) && defined(__aarch64__)
+/* Return the exact logical end and the host-page-rounded physical ownership
+ * end of a view.  View bases are host-page aligned by the view allocator. */
+static BOOL get_mprotect_view_bounds( const struct file_view *view, ULONG_PTR *logical_end,
+                                      ULONG_PTR *physical_end )
+{
+    ULONG_PTR start = (ULONG_PTR)view->base;
+    SIZE_T physical_size;
+
+    if ((start & host_page_mask) || !view->size || (view->size & page_mask) ||
+        view->size > ~(ULONG_PTR)0 - start || view->size > ~(SIZE_T)0 - host_page_mask)
+        return FALSE;
+    physical_size = (view->size + host_page_mask) & ~host_page_mask;
+    if (!physical_size || physical_size > ~(ULONG_PTR)0 - start) return FALSE;
+    *logical_end = start + view->size;
+    *physical_end = start + physical_size;
+    return TRUE;
+}
+
+
+static struct file_view *next_mprotect_view( struct file_view *view )
+{
+    struct wine_rb_entry *next = rb_next( &view->entry );
+
+    return next ? WINE_RB_ENTRY_VALUE( next, struct file_view, entry ) : NULL;
+}
+
+
 /* Darwin's JIT write-protect state is per-thread and applies to every MAP_JIT
  * mapping, so Wine valloc views must not join the CPU provider's JIT domain.
  * After an RWX mprotect denial, a private valloc may remain logically RWX but
@@ -3237,27 +3264,41 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot, BOOL cp
  * native execution attempt raises an access violation.  Never drop host EXEC
  * when a distinct committed RX logical page shares the host-page run. */
 static BOOL can_retry_native_writable_exec( const struct file_view *view, const void *base,
-                                            size_t size, BYTE set, BYTE clear )
+                                            size_t size, ULONG_PTR logical_start,
+                                            ULONG_PTR logical_end, BYTE set, BYTE clear )
 {
-    const char *page = base;
+    ULONG_PTR start = (ULONG_PTR)base, end, view_start, view_end, physical_end;
+    const char *page, *page_end;
     BOOL found_exec = FALSE;
 
     if (!view || !is_view_valloc( view ) ||
-        (view->protect & (VPROT_SYSTEM | VPROT_SHADOW_TRANSLATED))) return FALSE;
+        (view->protect & (VPROT_SYSTEM | VPROT_CPU_PROVIDER_OWNED)) || !size ||
+        size > ~(ULONG_PTR)0 - start ||
+        !get_mprotect_view_bounds( view, &view_end, &physical_end )) return FALSE;
 
-    while (size)
+    end = start + size;
+    view_start = (ULONG_PTR)view->base;
+    if (start < view_start || end > physical_end) return FALSE;
+    page = (const char *)max( start, view_start );
+    page_end = (const char *)min( end, view_end );
+    if (page >= page_end || ((ULONG_PTR)page & page_mask) ||
+        ((ULONG_PTR)page_end & page_mask)) return FALSE;
+
+    while (page < page_end)
     {
-        BYTE vprot = (get_page_vprot( page ) & ~clear) | set;
+        BYTE vprot = get_page_vprot( page );
+
+        if ((ULONG_PTR)page < logical_end &&
+            (ULONG_PTR)page + page_size > logical_start)
+            vprot = (vprot & ~clear) | set;
 
         if ((vprot & (VPROT_COMMITTED | VPROT_GUARD | VPROT_EXEC)) ==
             (VPROT_COMMITTED | VPROT_EXEC))
         {
-            if (!(vprot & (VPROT_WRITE | VPROT_WRITECOPY)) ||
-                find_view( page, page_size ) != view) return FALSE;
+            if (!(vprot & (VPROT_WRITE | VPROT_WRITECOPY))) return FALSE;
             found_exec = TRUE;
         }
         page += page_size;
-        size -= page_size;
     }
     return found_exec;
 }
@@ -3265,18 +3306,139 @@ static BOOL can_retry_native_writable_exec( const struct file_view *view, const 
 
 
 static inline int mprotect_range_run( struct file_view *view, void *base, size_t size, int unix_prot,
-                                      BOOL cpu_provider_owned, BYTE set, BYTE clear )
+                                      BOOL cpu_provider_owned, ULONG_PTR logical_start,
+                                      ULONG_PTR logical_end, BYTE set, BYTE clear )
 {
     if (!mprotect_exec( base, size, unix_prot, cpu_provider_owned )) return 0;
 
 #if defined(__APPLE__) && defined(__aarch64__)
     if (errno == EACCES &&
         (unix_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC) &&
-        can_retry_native_writable_exec( view, base, size, set, clear ))
+        can_retry_native_writable_exec( view, base, size, logical_start, logical_end,
+                                        set, clear ))
         return mprotect( base, size, unix_prot & ~PROT_EXEC );
 #endif
     return -1;
 }
+
+
+/* Project a logical protection delta before filtering translated guard lanes.
+ * Applying the delta to the already-filtered union would lose the underlying
+ * access of a guarded lane that is being unguarded. */
+static BYTE get_mprotect_translated_host_page_vprot( const void *addr,
+                                                      ULONG_PTR logical_start,
+                                                      ULONG_PTR logical_end,
+                                                      BYTE set, BYTE clear )
+{
+    const char *base = ROUND_ADDR( addr, host_page_mask );
+    BOOL delegated = wow64_memory_logical_write_fault_is_delegated();
+    BYTE vprot = 0;
+    size_t i;
+
+    for (i = 0; i < host_page_size; i += page_size)
+    {
+        ULONG_PTR page = (ULONG_PTR)base + i;
+        BYTE page_vprot = get_page_vprot( (void *)page );
+
+        /* Without 4K provider delegation a write-watch clear is necessarily
+         * host-page-wide; otherwise a watched sibling keeps the whole page
+         * read-only.  Other deltas retain their exact logical lane scope. */
+        if (!delegated && (clear & VPROT_WRITEWATCH))
+            page_vprot &= ~VPROT_WRITEWATCH;
+        if (page < logical_end && page + page_size > logical_start)
+            page_vprot = (page_vprot & ~clear) | set;
+        if (!(page_vprot & VPROT_COMMITTED) || (page_vprot & VPROT_GUARD)) continue;
+        if (delegated) page_vprot &= ~VPROT_WRITEWATCH;
+        vprot |= page_vprot;
+    }
+    return vprot;
+}
+
+
+/* Apply protection to one physical ownership domain.  Runs with identical host
+ * protection may be coalesced only inside this domain. */
+static int mprotect_range_domain( struct file_view *view, void *base, size_t size,
+                                  ULONG_PTR logical_start, ULONG_PTR logical_end,
+                                  BYTE set, BYTE clear )
+{
+    BOOL translated_shadow = view && is_shadow_translated_vprot( view->protect );
+    BOOL cpu_provider_owned = view && (view->protect & VPROT_CPU_PROVIDER_OWNED);
+    size_t i, count;
+    char *addr = base;
+    int prot, next;
+    BYTE vprot;
+
+    assert( size && !((ULONG_PTR)base & host_page_mask) && !(size & host_page_mask) );
+
+    vprot = translated_shadow
+            ? get_mprotect_translated_host_page_vprot( addr, logical_start, logical_end,
+                                                       set, clear )
+            : (get_host_page_vprot( addr ) & ~clear) | set;
+    prot = get_unix_prot( vprot );
+    for (count = i = 1; i < size / host_page_size; i++, count++)
+    {
+        vprot = translated_shadow
+                ? get_mprotect_translated_host_page_vprot( addr + count * host_page_size,
+                                                           logical_start, logical_end,
+                                                           set, clear )
+                : (get_host_page_vprot( addr + count * host_page_size ) & ~clear) | set;
+        next = get_unix_prot( vprot );
+        if (next == prot) continue;
+        if (mprotect_range_run( view, addr, count * host_page_size, prot,
+                                cpu_provider_owned, logical_start, logical_end,
+                                set, clear )) return -1;
+        addr += count * host_page_size;
+        prot = next;
+        count = 0;
+    }
+    return mprotect_range_run( view, addr, count * host_page_size, prot,
+                               cpu_provider_owned, logical_start, logical_end,
+                               set, clear );
+}
+
+
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Validate the complete physical ownership walk before the first mprotect().
+ * The tree is stable under virtual_mutex, so the returned first view can be
+ * reused by the apply pass without allocating a domain list. */
+static int validate_mprotect_domains( ULONG_PTR start, ULONG_PTR end,
+                                      struct file_view **first_ret )
+{
+    struct file_view *view = find_view_at_or_after( (void *)start );
+
+    *first_ret = view;
+    if (view && (ULONG_PTR)view->base < end)
+    {
+        struct wine_rb_entry *prev_entry = rb_prev( &view->entry );
+
+        if (prev_entry)
+        {
+            struct file_view *prev = WINE_RB_ENTRY_VALUE( prev_entry, struct file_view, entry );
+            ULONG_PTR prev_logical_end, prev_physical_end;
+
+            if (!get_mprotect_view_bounds( prev, &prev_logical_end, &prev_physical_end ) ||
+                prev_physical_end > (ULONG_PTR)view->base) goto invalid;
+        }
+    }
+
+    while (view && (ULONG_PTR)view->base < end)
+    {
+        struct file_view *next = next_mprotect_view( view );
+        ULONG_PTR logical_end, physical_end;
+
+        if (!get_mprotect_view_bounds( view, &logical_end, &physical_end )) goto invalid;
+        if ((ULONG_PTR)view->base < start && logical_end <= start) goto invalid;
+        if (next && (((ULONG_PTR)next->base & host_page_mask) ||
+                     (ULONG_PTR)next->base < physical_end)) goto invalid;
+        view = next;
+    }
+    return 0;
+
+invalid:
+    errno = EINVAL;
+    return -1;
+}
+#endif
 
 
 /***********************************************************************
@@ -3286,34 +3448,60 @@ static inline int mprotect_range_run( struct file_view *view, void *base, size_t
  */
 static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
 {
-    struct file_view *view = find_view( base, size );
-    BOOL translated_shadow = view && is_shadow_translated_vprot( view->protect );
-    BOOL cpu_provider_owned = view && (view->protect & VPROT_CPU_PROVIDER_OWNED);
-    size_t i, count;
-    char *addr = ROUND_ADDR( base, host_page_mask );
-    int prot, next;
-    BYTE vprot;
+    ULONG_PTR logical_start = (ULONG_PTR)base, logical_end, start, end;
 
-    size = ROUND_SIZE( base, size, host_page_mask );
+    if (!size) return 0;
+    if (size > ~(ULONG_PTR)0 - logical_start) goto invalid;
+    logical_end = logical_start + size;
+    if (logical_end > ~(ULONG_PTR)0 - host_page_mask) goto invalid;
+    start = logical_start & ~host_page_mask;
+    end = (logical_end + host_page_mask) & ~host_page_mask;
+    if (end <= start) goto invalid;
 
-    vprot = translated_shadow ? get_translated_host_page_vprot( addr )
-                             : get_host_page_vprot( addr );
-    prot = get_unix_prot( (vprot & ~clear) | set );
-    for (count = i = 1; i < size / host_page_size; i++, count++)
+#if defined(__APPLE__) && defined(__aarch64__)
     {
-        vprot = translated_shadow
-                ? get_translated_host_page_vprot( addr + count * host_page_size )
-                : get_host_page_vprot( addr + count * host_page_size );
-        next = get_unix_prot( (vprot & ~clear) | set );
-        if (next == prot) continue;
-        if (mprotect_range_run( view, addr, count * host_page_size, prot,
-                                cpu_provider_owned, set, clear )) return -1;
-        addr += count * host_page_size;
-        prot = next;
-        count = 0;
+        struct file_view *view;
+        ULONG_PTR address = start;
+
+        if (validate_mprotect_domains( start, end, &view )) return -1;
+        while (address < end)
+        {
+            ULONG_PTR domain_end;
+
+            if (!view || (ULONG_PTR)view->base > address)
+            {
+                domain_end = view ? min( end, (ULONG_PTR)view->base ) : end;
+                assert( domain_end > address );
+                if (mprotect_range_domain( NULL, (void *)address, domain_end - address,
+                                           logical_start, logical_end,
+                                           set, clear )) return -1;
+            }
+            else
+            {
+                ULONG_PTR logical_view_end, physical_view_end;
+                BOOL valid = get_mprotect_view_bounds( view, &logical_view_end,
+                                                       &physical_view_end );
+
+                assert( valid && physical_view_end > address );
+                if (!valid || physical_view_end <= address) abort_process( STATUS_ACCESS_DENIED );
+                domain_end = min( end, physical_view_end );
+                if (mprotect_range_domain( view, (void *)address, domain_end - address,
+                                           logical_start, logical_end,
+                                           set, clear )) return -1;
+                if (domain_end == physical_view_end) view = next_mprotect_view( view );
+            }
+            address = domain_end;
+        }
+        return 0;
     }
-    return mprotect_range_run( view, addr, count * host_page_size, prot,
-                               cpu_provider_owned, set, clear );
+#else
+    return mprotect_range_domain( find_view( base, size ), (void *)start, end - start,
+                                  logical_start, logical_end, set, clear );
+#endif
+
+invalid:
+    errno = EINVAL;
+    return -1;
 }
 
 
@@ -3373,16 +3561,55 @@ static NTSTATUS wow64_memory_set_logical_write_fault_delegation( BOOL enable )
 #endif
 
 
+/* Validate the complete shadow trust policy before the apply pass can change
+ * any ordinary prefix.  Only exact WoW64-translated ownership is accepted;
+ * fixed-low AMD64 views, ambiguous owner tags, and gaps are rejected. */
+#if defined(__APPLE__) && defined(__aarch64__)
+static int validate_mprotect_memory_access_range( const void *base, size_t size )
+{
+    ULONG_PTR address = (ULONG_PTR)base, end;
+
+    if (!size) return 0;
+    if (size > ~(ULONG_PTR)0 - address) goto invalid;
+    end = address + size;
+    while (address < end)
+    {
+        struct file_view *view;
+        ULONG_PTR logical_end, physical_end;
+
+        if (address < WINE_LOW_VA_SHADOW_BASE)
+        {
+            address = min( end, (ULONG_PTR)WINE_LOW_VA_SHADOW_BASE );
+            continue;
+        }
+        if (address >= WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) break;
+        if (!(view = find_view( (void *)address, 0 )) ||
+            (view->protect & VPROT_CPU_PROVIDER_OWNED) != VPROT_WOW64_TRANSLATED ||
+            !get_mprotect_view_bounds( view, &logical_end, &physical_end ) ||
+            logical_end <= address)
+            goto invalid;
+        address = min( end, logical_end );
+    }
+    return 0;
+
+invalid:
+    errno = EINVAL;
+    return -1;
+}
+#endif
+
+
 /* Apply physical protection without widening ownership across a logical view
- * boundary.  Keep ordinary memory on the existing coalesced fast path.  A
- * translated shadow range is split only at view boundaries; mprotect_range()
- * still aggregates all host pages within each tagged view segment. */
+ * boundary.  mprotect_range() further splits each validated segment into
+ * physical ownership domains, including ordinary views and gaps outside the
+ * shadow. */
 static int mprotect_memory_access_range( void *base, size_t size, BYTE set, BYTE clear )
 {
     if (!overlaps_wow64_shadow( base, size ))
         return mprotect_range( base, size, set, clear );
 
 #if defined(__APPLE__) && defined(__aarch64__)
+    if (validate_mprotect_memory_access_range( base, size )) return -1;
     while (size)
     {
         struct file_view *view;
@@ -3393,11 +3620,14 @@ static int mprotect_memory_access_range( void *base, size_t size, BYTE set, BYTE
             available = min( available, WINE_LOW_VA_SHADOW_BASE - address );
         else if (address < WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE)
         {
-            if (!(view = find_view( base, 0 )) ||
-                !(view->protect & VPROT_WOW64_TRANSLATED))
-                return -1;
-            available = min( available,
-                             (SIZE_T)((ULONG_PTR)view->base + view->size - address) );
+            ULONG_PTR logical_end, physical_end;
+            BOOL valid;
+
+            view = find_view( base, 0 );
+            valid = view && get_mprotect_view_bounds( view, &logical_end, &physical_end );
+            assert( valid && logical_end > address );
+            if (!valid || logical_end <= address) abort_process( STATUS_ACCESS_DENIED );
+            available = min( available, (SIZE_T)(logical_end - address) );
         }
         if (mprotect_range( base, available, set, clear )) return -1;
         base = (char *)base + available;
@@ -6975,9 +7205,10 @@ int32_t __wine_resolve_wow64_memory_fault_v1(
             goto done;
         }
 
-        set_page_vprot_bits( logical_page, page_size, 0, VPROT_GUARD );
-        if (mprotect_range( logical_page, page_size, 0, 0 ))
+        if (mprotect_range( logical_page, page_size, 0, VPROT_GUARD ))
             bridge_status = STATUS_ACCESS_DENIED;
+        else
+            set_page_vprot_bits( logical_page, page_size, 0, VPROT_GUARD );
         result->status = STATUS_GUARD_PAGE_VIOLATION;
         wow64_memory_capture_transaction( &transaction, result->status,
                                            logical_page, page_size, allocation_base );
@@ -7011,11 +7242,12 @@ int32_t __wine_resolve_wow64_memory_fault_v1(
                 clear_base = logical_page;
                 clear_size = page_size;
             }
-            set_page_vprot_bits( clear_base, clear_size, 0, VPROT_WRITEWATCH );
-            /* Keep the logical address here so mprotect_range() can identify
-             * the translated view even when it ends inside this host page. */
-            if (mprotect_range( logical_page, page_size, 0, 0 ))
+            /* Match the projected physical delta to the metadata clear range;
+             * the domain walk preserves a short translated tail's owner. */
+            if (mprotect_range( clear_base, clear_size, 0, VPROT_WRITEWATCH ))
                 bridge_status = STATUS_ACCESS_DENIED;
+            else
+                set_page_vprot_bits( clear_base, clear_size, 0, VPROT_WRITEWATCH );
             result->action = WINE_WOW64_MEMORY_FAULT_RETRY;
             result->status = STATUS_SUCCESS;
             result->parameter_count = 0;
@@ -7085,9 +7317,13 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
         struct thread_stack_info stack_info;
         if (!is_inside_thread_stack( data, page, &stack_info ))
         {
-            set_page_vprot_bits( page, host_page_size, 0, VPROT_GUARD );
-            mprotect_range( page, host_page_size, 0, 0 );
-            ret = STATUS_GUARD_PAGE_VIOLATION;
+            /* Change the physical page before publishing the logical clear.
+             * A failed mprotect therefore leaves the exact old vprot intact. */
+            if (!mprotect_range( page, host_page_size, 0, VPROT_GUARD ))
+            {
+                set_page_vprot_bits( page, host_page_size, 0, VPROT_GUARD );
+                ret = STATUS_GUARD_PAGE_VIOLATION;
+            }
         }
         else ret = grow_thread_stack( data, page, &stack_info, NULL );
     }
@@ -7103,8 +7339,10 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
             }
             else
             {
-                set_page_vprot_bits( page, host_page_size, 0, VPROT_WRITEWATCH );
-                mprotect_range( page, host_page_size, 0, 0 );
+                /* The domain walk retains a short image tail's owner while
+                 * applying this legacy host-page-wide metadata change. */
+                if (!mprotect_range( page, host_page_size, 0, VPROT_WRITEWATCH ))
+                    set_page_vprot_bits( page, host_page_size, 0, VPROT_WRITEWATCH );
             }
         }
         /* ignore fault if page is writable now */
