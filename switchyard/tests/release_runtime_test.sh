@@ -11,6 +11,7 @@ DIGEST_HELPER="$ROOT_DIR/switchyard/runtime_content_digest.py"
 NATIVE_ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime-native-arm64.entitlements"
 TEST_ROOT="$(/usr/bin/mktemp -d /private/tmp/switchyard-release-runtime.XXXXXX)"
 TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
+NATIVE_MACHO_FIXTURE="$TEST_ROOT/native-arm64-macho-fixture"
 SOURCE_REVISION="$(/usr/bin/git -C "$ROOT_DIR" rev-parse HEAD)"
 
 cleanup() {
@@ -68,10 +69,15 @@ make_runtime() {
     /usr/bin/printf 'release fixture notice\n' >"$runtime/$required_notice"
   done
 
-  /bin/cp /bin/echo "$runtime/lib/wine/aarch64-unix/wine"
-  /bin/cp /bin/echo "$runtime/bin/wine.switchyard-real"
-  /bin/cp /bin/echo "$runtime/bin/wineserver"
-  /bin/cp /bin/echo "$runtime/lib/wine/aarch64-unix/helper.dylib"
+  if [ ! -f "$NATIVE_MACHO_FIXTURE" ]; then
+    /usr/bin/printf '%s\n' 'int main(void) { return 0; }' |
+      /usr/bin/clang -arch arm64 -x c - -o "$NATIVE_MACHO_FIXTURE"
+    /bin/chmod 0755 "$NATIVE_MACHO_FIXTURE"
+  fi
+  /bin/cp "$NATIVE_MACHO_FIXTURE" "$runtime/lib/wine/aarch64-unix/wine"
+  /bin/cp "$NATIVE_MACHO_FIXTURE" "$runtime/bin/wine.switchyard-real"
+  /bin/cp "$NATIVE_MACHO_FIXTURE" "$runtime/bin/wineserver"
+  /bin/cp "$NATIVE_MACHO_FIXTURE" "$runtime/lib/wine/aarch64-unix/helper.dylib"
   /bin/chmod 0755 \
     "$runtime/lib/wine/aarch64-unix/wine" \
     "$runtime/bin/wine.switchyard-real" \
@@ -157,15 +163,38 @@ make_fake_codesign() {
 +  verify)
 +    ;;
 +  details)
++    item="${@: -1}"
++    team_id="${SWITCHYARD_TEST_TEAM_ID:-M3CULMDKU3}"
++    case "$item" in
++      "${SWITCHYARD_TEST_EXTRACTED_RUNTIME:-/nonexistent}"/*)
++        team_id="${SWITCHYARD_TEST_EXTRACTED_TEAM_ID:-$team_id}"
++        ;;
++    esac
 +    /usr/bin/printf '%s\n' \
 +      'CodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0 location=embedded' \
 +      'Signature size=9000' \
-+      'Authority=Developer ID Application: Fixture (M3CULMDKU3)' \
-+      'TeamIdentifier=M3CULMDKU3' \
++      "Authority=Developer ID Application: Fixture ($team_id)" \
++      "TeamIdentifier=$team_id" \
 +      'Runtime Version=26.0.0'
 +    ;;
 +  entitlements)
-+    /bin/cat "$SWITCHYARD_TEST_NATIVE_ENTITLEMENTS"
++    item="${@: -1}"
++    case "$item" in
++      ./wine|./wine.switchyard-real|*/lib/wine/aarch64-unix/wine|*/bin/wine.switchyard-real) ;;
++      *) exit 1 ;;
++    esac
++    unexpected=0
++    case "$item" in
++      "${SWITCHYARD_TEST_EXTRACTED_RUNTIME:-/nonexistent}"/*)
++        unexpected="${SWITCHYARD_TEST_EXTRACTED_UNEXPECTED_ENTITLEMENT:-0}"
++        ;;
++    esac
++    if [ "$unexpected" = 1 ]; then
++      /usr/bin/sed 's#</dict>#<key>com.apple.security.get-task-allow</key><true/></dict>#' \
++        "$SWITCHYARD_TEST_NATIVE_ENTITLEMENTS"
++    else
++      /bin/cat "$SWITCHYARD_TEST_NATIVE_ENTITLEMENTS"
++    fi
 +    ;;
 +  *) exit 82 ;;
 +esac
@@ -233,15 +262,27 @@ operations = {
     "outer": call_offsets(release, "switchyard_publish_native_outer_digest"),
     "tree_verify": call_offsets(release, "runtime_content_tree_is_verified"),
     "archive": call_offsets(release, "switchyard_create_native_release_archive"),
+    "pin": call_offsets(release, "switchyard_pin_native_release_archive"),
+    "extract": call_offsets(release, "switchyard_extract_native_release_archive"),
+    "extracted_validate": call_offsets(
+        release, "switchyard_validate_extracted_native_release_runtime"
+    ),
+    "macho_verify": call_offsets(
+        release, "switchyard_verify_native_release_macho_tree"
+    ),
 }
 expected_counts = {
     "sign": 1,
     "refresh": 1,
-    "validate": 2,
+    "validate": 1,
     "smoke": 1,
     "outer": 1,
-    "tree_verify": 2,
+    "tree_verify": 4,
     "archive": 1,
+    "pin": 3,
+    "extract": 1,
+    "extracted_validate": 1,
+    "macho_verify": 1,
 }
 for operation, expected in expected_counts.items():
     actual = len(operations[operation])
@@ -254,16 +295,24 @@ ordered = [
     operations["sign"][0],
     operations["refresh"][0],
     operations["validate"][0],
-    operations["smoke"][0],
-    operations["validate"][1],
     operations["outer"][0],
     operations["tree_verify"][1],
     operations["archive"][0],
+    operations["pin"][0],
+    operations["extract"][0],
+    operations["extracted_validate"][0],
+    operations["macho_verify"][0],
+    operations["tree_verify"][2],
+    operations["smoke"][0],
+    operations["tree_verify"][3],
+    operations["pin"][1],
+    operations["pin"][2],
 ]
 if ordered != sorted(ordered) or len(set(ordered)) != len(ordered):
     raise SystemExit(
-        "native release source contract is not sign, refresh, validate, smoke, "
-        "validate, outer digest, archive"
+        "native release source contract is not sign, refresh, staging validate, "
+        "outer digest, archive, archive pin, private extract, extracted validate, Mach-O "
+        "verify, smoke"
     )
 
 outer_publisher = function_body("switchyard_publish_native_outer_digest")
@@ -397,6 +446,214 @@ EOF
   wait "$unrelated_pid" 2>/dev/null || true
 }
 
+make_invalid_native_release_archive() {
+  local archive="$1"
+  local root_name="$2"
+  local scenario="$3"
+  local producer_archive="${4:-}"
+
+  /usr/bin/python3 -I - \
+    "$archive" "$root_name" "$scenario" "$producer_archive" <<'PY'
+import shutil
+import stat
+import struct
+import sys
+import unicodedata
+import warnings
+import zipfile
+
+
+archive, root, scenario, producer_archive = sys.argv[1:]
+
+
+def member(name, mode, data=b""):
+    value = zipfile.ZipInfo(name)
+    value.create_system = 3
+    value.compress_type = zipfile.ZIP_STORED
+    value.external_attr = mode << 16
+    return value, data
+
+
+entries = None
+if scenario in ("mode", "oversize", "crc", "truncated"):
+    if not producer_archive:
+        raise SystemExit("producer archive is required for mutation fixtures")
+    shutil.copyfile(producer_archive, archive)
+elif scenario == "extra-root":
+    entries = [member(root + "/file", stat.S_IFREG | 0o644, b"runtime\n"),
+               member("Other-Root/file", stat.S_IFREG | 0o644, b"other\n")]
+elif scenario == "absolute":
+    entries = [member("/absolute", stat.S_IFREG | 0o644, b"bad\n")]
+elif scenario == "traversal":
+    entries = [member(root + "/../escape", stat.S_IFREG | 0o644, b"bad\n")]
+elif scenario == "duplicate":
+    entries = [member(root + "/file", stat.S_IFREG | 0o644, b"one\n"),
+               member(root + "/file", stat.S_IFREG | 0o644, b"two\n")]
+elif scenario == "casefold":
+    entries = [member(root + "/Alias", stat.S_IFREG | 0o644, b"one\n"),
+               member(root + "/alias", stat.S_IFREG | 0o644, b"two\n")]
+elif scenario == "nfc":
+    composed = unicodedata.normalize("NFC", "cafe\N{COMBINING ACUTE ACCENT}")
+    decomposed = unicodedata.normalize("NFD", composed)
+    entries = [member(root + "/" + composed, stat.S_IFREG | 0o644, b"one\n"),
+               member(root + "/" + decomposed, stat.S_IFREG | 0o644, b"two\n")]
+elif scenario == "escaping-symlink":
+    entries = [member(root + "/link", stat.S_IFLNK | 0o777, b"../../escape")]
+elif scenario == "unsupported-type":
+    entries = [member(root + "/pipe", stat.S_IFIFO | 0o600)]
+else:
+    raise SystemExit("unknown invalid archive fixture: " + scenario)
+
+if entries is not None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(archive, "x", allowZip64=True) as stream:
+            for info, data in entries:
+                stream.writestr(info, data)
+
+with open(archive, "r+b") as stream:
+    data = bytearray(stream.read())
+    if scenario in ("mode", "oversize"):
+        central = 0
+        expected = (root + "/bin/runtime").encode("utf-8")
+        while True:
+            central = data.index(b"PK\x01\x02", central)
+            name_length, extra_length, comment_length = struct.unpack_from(
+                "<HHH", data, central + 28
+            )
+            name = bytes(data[central + 46:central + 46 + name_length])
+            if name == expected:
+                break
+            central += 46 + name_length + extra_length + comment_length
+        if scenario == "mode":
+            struct.pack_into("<I", data, central + 38,
+                             (stat.S_IFREG | 0o777) << 16)
+        else:
+            # The central-directory uncompressed-size field is authoritative
+            # to ZipFile readers.  No large allocation is needed.
+            struct.pack_into("<I", data, central + 24, 0x7FFFFFFF)
+    elif scenario == "crc":
+        with zipfile.ZipFile(archive) as package:
+            target = package.getinfo(root + "/bin/runtime")
+            local = target.header_offset
+        name_length, extra_length = struct.unpack_from("<HH", data, local + 26)
+        payload = local + 30 + name_length + extra_length
+        data[payload + target.compress_size // 2] ^= 0x40
+    elif scenario == "truncated":
+        del data[-12:]
+    stream.seek(0)
+    stream.write(data)
+    stream.truncate()
+PY
+}
+
+assert_native_release_archive_extractor() {
+  local fixture_root="$TEST_ROOT/archive-extractor"
+  local source_root_name="Switchyard-Wine-Runtime-fixture-native-arm64"
+  local source_runtime="$fixture_root/$source_root_name"
+  local archive="$fixture_root/runtime.zip"
+  local extraction_container="$fixture_root/extracted"
+  local archive_sha256
+  local archive_size
+  local scenario
+  local status
+
+  /bin/mkdir -m 700 "$fixture_root"
+  /bin/mkdir -m 755 "$source_runtime"
+  /bin/mkdir -m 755 "$source_runtime/bin"
+  /usr/bin/printf 'runtime payload\n' >"$source_runtime/bin/runtime"
+  /bin/chmod 0755 "$source_runtime/bin/runtime"
+  /bin/ln -s runtime "$source_runtime/bin/launcher"
+
+  (
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    switchyard_create_native_release_archive "$source_runtime" "$archive"
+  ) || fail "cannot create the valid native release archive fixture"
+  archive_sha256="$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')"
+  archive_size="$(/usr/bin/stat -f '%z' "$archive")"
+  /bin/mkdir -m 700 "$extraction_container"
+  (
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    switchyard_extract_native_release_archive \
+      "$archive" "$source_runtime" "$extraction_container" \
+      "$source_root_name" "$archive_sha256" "$archive_size"
+  ) || fail "native release extractor rejected its exact producer archive"
+  [ "$(/usr/bin/stat -f '%Lp' "$extraction_container")" = 700 ] ||
+    fail "native release extraction container is not private"
+  if ! { [ -f "$extraction_container/$source_root_name/bin/runtime" ] &&
+         [ "$(/usr/bin/stat -f '%Lp' "$extraction_container/$source_root_name/bin/runtime")" = 755 ] &&
+         [ "$(/usr/bin/readlink "$extraction_container/$source_root_name/bin/launcher")" = runtime ] &&
+         /usr/bin/cmp -s \
+           "$source_runtime/bin/runtime" \
+           "$extraction_container/$source_root_name/bin/runtime"; }; then
+    fail "native release extractor did not reproduce the exact runtime closure"
+  fi
+
+  for scenario in \
+    extra-root absolute traversal duplicate casefold nfc escaping-symlink \
+    unsupported-type mode oversize crc truncated; do
+    archive="$fixture_root/$scenario.zip"
+    extraction_container="$fixture_root/$scenario-extracted"
+    make_invalid_native_release_archive \
+      "$archive" "$source_root_name" "$scenario" "$fixture_root/runtime.zip"
+    archive_sha256="$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')"
+    archive_size="$(/usr/bin/stat -f '%z' "$archive")"
+    /bin/mkdir -m 700 "$extraction_container"
+    set +e
+    (
+      # shellcheck disable=SC1090 # Fixed worktree release script.
+      source "$RELEASE_SCRIPT"
+      switchyard_extract_native_release_archive \
+        "$archive" "$source_runtime" "$extraction_container" \
+        "$source_root_name" "$archive_sha256" "$archive_size"
+    ) >"$fixture_root/$scenario.stdout" 2>"$fixture_root/$scenario.stderr"
+    status=$?
+    set -e
+    [ "$status" -ne 0 ] ||
+      fail "native release extractor accepted the $scenario archive fixture"
+    if /usr/bin/find "$extraction_container" -mindepth 1 -print -quit |
+       /usr/bin/grep -q .; then
+      fail "native release extractor left output from the $scenario archive fixture"
+    fi
+  done
+
+  /bin/mkdir -m 700 "$fixture_root/pin-extracted"
+  set +e
+  (
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    switchyard_extract_native_release_archive \
+      "$fixture_root/runtime.zip" "$source_runtime" \
+      "$fixture_root/pin-extracted" "$source_root_name" \
+      "0000000000000000000000000000000000000000000000000000000000000000" \
+      "$(/usr/bin/stat -f '%z' "$fixture_root/runtime.zip")"
+  ) >/dev/null 2>"$fixture_root/pin.stderr"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] ||
+    fail "native release extractor accepted the wrong pinned archive digest"
+
+  /bin/mkdir -m 700 "$fixture_root/size-pin-extracted"
+  archive_sha256="$(/usr/bin/shasum -a 256 "$fixture_root/runtime.zip" |
+    /usr/bin/awk '{print $1}')"
+  archive_size="$(/usr/bin/stat -f '%z' "$fixture_root/runtime.zip")"
+  set +e
+  (
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    switchyard_extract_native_release_archive \
+      "$fixture_root/runtime.zip" "$source_runtime" \
+      "$fixture_root/size-pin-extracted" "$source_root_name" \
+      "$archive_sha256" "$((archive_size + 1))"
+  ) >/dev/null 2>"$fixture_root/size-pin.stderr"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] ||
+    fail "native release extractor accepted the wrong pinned archive size"
+}
+
 run_case() {
   local label="$1"
   local failure_mode="$2"
@@ -431,10 +688,18 @@ run_case() {
     if [ "$failure_mode" = signing ]; then
       export SWITCHYARD_TEST_FAIL_SIGN_AT=2
     fi
+    if [ "$failure_mode" = signing-wrong-team ]; then
+      export SWITCHYARD_TEST_TEAM_ID=AAAAAAAAAA
+    fi
 
     # shellcheck disable=SC1090 # Fixed worktree release script.
     source "$RELEASE_SCRIPT"
     CODESIGN_TOOL="$fake_codesign"
+
+    eval "$(declare -f switchyard_create_native_release_archive |
+      /usr/bin/sed '1s/switchyard_create_native_release_archive/switchyard_create_native_release_archive_original/')"
+    eval "$(declare -f switchyard_pin_native_release_archive |
+      /usr/bin/sed '1s/switchyard_pin_native_release_archive/switchyard_pin_native_release_archive_original/')"
 
     switchyard_publish_native_release_file() {
       publish_call_count=$((publish_call_count + 1))
@@ -509,13 +774,63 @@ run_case() {
     }
     switchyard_create_native_release_archive() {
       /usr/bin/printf 'archive\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
-      /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$1" "$2"
+      switchyard_create_native_release_archive_original "$@"
     }
+    switchyard_pin_native_release_archive() {
+      /usr/bin/printf 'pin\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
+      switchyard_pin_native_release_archive_original "$@"
+    }
+    switchyard_extract_native_release_archive() {
+      local actual_sha256
+      local actual_size
+      local extracted_runtime
+      local thin_macho
 
+      /usr/bin/printf 'extract\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
+      [ "$#" -eq 6 ] || return 90
+      actual_sha256="$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')"
+      actual_size="$(/usr/bin/stat -f '%z' "$1")"
+      [ "$actual_sha256" = "$5" ] && [ "$actual_size" = "$6" ] || return 91
+      [ "$(/usr/bin/stat -f '%Lp' "$3")" = 700 ] || return 92
+      [ "$failure_mode" != archive-extract ] || return 74
+      extracted_runtime="$3/$4"
+      /usr/bin/ditto "$2" "$extracted_runtime"
+      export SWITCHYARD_TEST_EXTRACTED_RUNTIME="$extracted_runtime"
+      case "$failure_mode" in
+        extracted-outer-tamper)
+          /usr/bin/printf 'tampered after ZIP extraction\n' \
+            >>"$extracted_runtime/share/doc/switchyard-wine/LICENSE"
+          ;;
+        portable-install-prefix)
+          /usr/bin/plutil -replace installPrefix -string '../escape' \
+            "$extracted_runtime/switchyard-runtime.json"
+          /usr/bin/python3 -I "$DIGEST_HELPER" write "$extracted_runtime" >/dev/null
+          ;;
+        portable-executable)
+          /usr/bin/plutil -replace executable -string '../escape/wine' \
+            "$extracted_runtime/switchyard-runtime.json"
+          /usr/bin/python3 -I "$DIGEST_HELPER" write "$extracted_runtime" >/dev/null
+          ;;
+        extracted-x86-only)
+          thin_macho="$extracted_runtime/lib/wine/aarch64-unix/helper.dylib.x86_64"
+          /usr/bin/printf '%s\n' 'int main(void) { return 0; }' |
+            /usr/bin/clang -arch x86_64 -x c - -o "$thin_macho"
+          /bin/mv "$thin_macho" \
+            "$extracted_runtime/lib/wine/aarch64-unix/helper.dylib"
+          /usr/bin/python3 -I "$DIGEST_HELPER" write "$extracted_runtime" >/dev/null
+          ;;
+      esac
+    }
     profile_call_count=0
     packaging_call_count=0
     native_validation_call_count=0
     publish_call_count=0
+    if [ "$failure_mode" = extracted-wrong-team ]; then
+      export SWITCHYARD_TEST_EXTRACTED_TEAM_ID=AAAAAAAAAA
+    fi
+    if [ "$failure_mode" = extracted-unexpected-entitlement ]; then
+      export SWITCHYARD_TEST_EXTRACTED_UNEXPECTED_ENTITLEMENT=1
+    fi
     release_arguments=(
       --runtime "$runtime" \
       --runtime-content-sha256 "$expected_digest" \
@@ -550,6 +865,7 @@ run_case() {
   "$RELEASE_SCRIPT" >/dev/null || fail "stable Developer-ID/Hardened signing changed"
 assert_native_release_source_contract || fail "native release source ordering contract changed"
 assert_native_release_stop_is_idempotent
+assert_native_release_archive_extractor
 
 run_case success none 0
 success_output="$TEST_ROOT/success-output"
@@ -575,6 +891,10 @@ if value["runtimeProfile"] != "preview-native-arm64-fex":
     raise SystemExit("wrong runtime profile")
 if value["hostArchitecture"] != "arm64" or value["requiresRosetta"] is not False:
     raise SystemExit("wrong native host policy")
+if value["developerTeamID"] != "M3CULMDKU3":
+    raise SystemExit("wrong native Developer Team ID")
+if value["notarizationStatus"] != "not-submitted" or value["notarizationID"] != "":
+    raise SystemExit("absent notary profile is not represented exactly")
 text = json.dumps(value, ensure_ascii=False)
 if any("\uac00" <= character <= "\ud7a3" for character in text):
     raise SystemExit("Korean release text")
@@ -587,22 +907,38 @@ PY
 last_sign="$(/usr/bin/awk '/^sign:/ { line=NR } END { print line }' "$success_log")"
 refresh_line="$(event_line refresh "$success_log")"
 first_validation_line="$(event_line validate:1 "$success_log")"
-smoke_line="$(event_line smoke "$success_log")"
-second_validation_line="$(event_line validate:2 "$success_log")"
 digest_line="$(event_line outer-digest "$success_log")"
 archive_line="$(event_line archive "$success_log")"
+pin_line="$(event_line pin "$success_log")"
+second_pin_line="$(/usr/bin/awk '$0 == "pin" && ++count == 2 { print NR; exit }' "$success_log")"
+third_pin_line="$(/usr/bin/awk '$0 == "pin" && ++count == 3 { print NR; exit }' "$success_log")"
+extract_line="$(event_line extract "$success_log")"
+second_validation_line="$(event_line validate:2 "$success_log")"
+smoke_line="$(event_line smoke "$success_log")"
 [ "$last_sign" -lt "$refresh_line" ] &&
   [ "$refresh_line" -lt "$first_validation_line" ] &&
-  [ "$first_validation_line" -lt "$smoke_line" ] &&
-  [ "$smoke_line" -lt "$second_validation_line" ] &&
-  [ "$second_validation_line" -lt "$digest_line" ] &&
-  [ "$archive_line" -gt "$digest_line" ] ||
+  [ "$first_validation_line" -lt "$digest_line" ] &&
+  [ "$digest_line" -lt "$archive_line" ] &&
+  [ "$archive_line" -lt "$pin_line" ] &&
+  [ "$pin_line" -lt "$extract_line" ] &&
+  [ "$extract_line" -lt "$second_validation_line" ] &&
+  [ "$second_validation_line" -lt "$smoke_line" ] &&
+  [ "$smoke_line" -lt "$second_pin_line" ] &&
+  [ "$second_pin_line" -lt "$third_pin_line" ] ||
   fail "native release ordering contract changed"
 
 run_case signing-failure signing 1
+run_case signing-wrong-team signing-wrong-team 1
 run_case missing-entry missing-entry 1
 run_case refresh-unknown-field refresh-unknown 1
-run_case smoke-failure smoke 73
+run_case archive-extract-failure archive-extract 1
+run_case extracted-outer-tamper extracted-outer-tamper 1
+run_case portable-install-prefix portable-install-prefix 1
+run_case portable-executable portable-executable 1
+run_case extracted-wrong-team extracted-wrong-team 1
+run_case extracted-unexpected-entitlement extracted-unexpected-entitlement 1
+run_case extracted-x86-only extracted-x86-only 1
+run_case extracted-smoke-failure smoke 73
 run_case validator-failure post-smoke-validator 1
 run_case post-outer-dependency-mutation post-outer-dependency-mutation 1
 if /usr/bin/grep -Fqx archive \
