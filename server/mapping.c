@@ -274,6 +274,15 @@ static inline mem_size_t round_size( mem_size_t size, mem_size_t mask )
     return (size + mask) & ~mask;
 }
 
+static inline int round_image_map_size( unsigned int size, mem_size_t mask, unsigned int *ret )
+{
+    mem_size_t rounded = round_size( size, mask );
+
+    if (!rounded || rounded > ~(unsigned int)0) return 0;
+    *ret = rounded;
+    return 1;
+}
+
 void init_memory(void)
 {
     host_page_mask = sysconf( _SC_PAGESIZE ) - 1;
@@ -1040,7 +1049,10 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
         mapping->image.image_flags |= IMAGE_FLAGS_ImageDynamicallyRelocated;
 
     align_mask = max( mapping->image.alignment - 1, page_mask );
-    mapping->image.map_size = round_size( mapping->image.map_size, align_mask );
+    if (!round_image_map_size( mapping->image.map_size, align_mask, &mapping->image.map_size ))
+        return STATUS_INVALID_FILE_FOR_SECTION;
+    if (mapping->image.header_size > mapping->image.map_size)
+        return STATUS_INVALID_FILE_FOR_SECTION;
 
     /* load the section headers */
 

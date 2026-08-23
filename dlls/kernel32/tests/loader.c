@@ -725,6 +725,78 @@ done:
     return status;
 }
 
+static NTSTATUS create_image_section( const IMAGE_NT_HEADERS *nt_header,
+                                      const IMAGE_SECTION_HEADER *image_section, int line )
+{
+    char dll_name[MAX_PATH];
+    LARGE_INTEGER end;
+    DWORD file_size;
+    HANDLE file, mapping;
+    NTSTATUS status;
+
+    file_size = create_test_dll_sections( &dos_header, nt_header, image_section,
+                                          section_data, dll_name );
+    ok_(__FILE__, line)( file_size != 0, "could not create test image\n" );
+    if (!file_size)
+    {
+        DeleteFileA( dll_name );
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    file = CreateFileA( dll_name, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                        NULL, OPEN_EXISTING, 0, 0 );
+    ok_(__FILE__, line)( file != INVALID_HANDLE_VALUE, "CreateFile error %ld\n", GetLastError() );
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        DeleteFileA( dll_name );
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    end.QuadPart = nt_header->OptionalHeader.SizeOfHeaders;
+    if (!SetFilePointerEx( file, end, NULL, FILE_BEGIN ) || !SetEndOfFile( file ))
+    {
+        ok_(__FILE__, line)( 0, "could not pad test image, error %ld\n", GetLastError() );
+        CloseHandle( file );
+        DeleteFileA( dll_name );
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    status = pNtCreateSection( &mapping, STANDARD_RIGHTS_REQUIRED | SECTION_MAP_READ | SECTION_QUERY,
+                               NULL, NULL, PAGE_READONLY, SEC_IMAGE, file );
+    if (!status) CloseHandle( mapping );
+    CloseHandle( file );
+    DeleteFileA( dll_name );
+    return status;
+}
+
+static void test_image_header_size_bounds(void)
+{
+    IMAGE_NT_HEADERS nt_header = nt_header_template;
+    IMAGE_SECTION_HEADER image_section = {0};
+    NTSTATUS status;
+
+    memcpy( image_section.Name, ".bound", sizeof(".bound") );
+    image_section.Misc.VirtualSize = 1;
+    image_section.VirtualAddress = page_size;
+    image_section.Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+
+    nt_header.FileHeader.NumberOfSections = 1;
+    nt_header.FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER);
+    nt_header.OptionalHeader.SectionAlignment = page_size;
+    nt_header.OptionalHeader.FileAlignment = page_size;
+    nt_header.OptionalHeader.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_NX_COMPAT |
+                                                  IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+    nt_header.OptionalHeader.SizeOfImage = 2 * page_size;
+    nt_header.OptionalHeader.SizeOfHeaders = page_size;
+
+    status = create_image_section( &nt_header, &image_section, __LINE__ );
+    ok( status == STATUS_SUCCESS, "NtCreateSection error %08lx\n", status );
+
+    nt_header.OptionalHeader.SizeOfHeaders = 3 * page_size;
+    status = create_image_section( &nt_header, &image_section, __LINE__ );
+    ok( status == STATUS_INVALID_FILE_FOR_SECTION, "NtCreateSection error %08lx\n", status );
+}
+
 
 static void test_Loader(void)
 {
@@ -5558,6 +5630,7 @@ START_TEST(loader)
     test_dll_file( "advapi32.dll" );
     test_dll_file( "user32.dll" );
     test_Wow64Transition();
+    test_image_header_size_bounds();
     /* loader test must be last, it can corrupt the internal loader state on Windows */
     test_Loader();
 }
