@@ -10,6 +10,7 @@ DXMT_LIBRARY="$ROOT_DIR/switchyard/lib/dxmt_artifact.sh"
 SIGNING_LIBRARY="$ROOT_DIR/switchyard/lib/macho_signing.sh"
 DIGEST_HELPER="$ROOT_DIR/switchyard/runtime_content_digest.py"
 NATIVE_ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime-native-arm64.entitlements"
+BUILD_RUNTIME="$ROOT_DIR/switchyard/build_runtime.sh"
 DXMT_ARCHIVE="${1:-}"
 DXMT_SOURCE="${2:-}"
 
@@ -66,6 +67,31 @@ expect_failure() {
 
 sha256_file() {
   /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+# Exercise the exact build_runtime.sh producer semantics instead of maintaining
+# a second test-only approximation of the short dependency-tree digest.
+[ -f "$BUILD_RUNTIME" ] && [ ! -L "$BUILD_RUNTIME" ] ||
+  fail "build-runtime digest producer is missing or unsafe"
+BUILD_DIGEST_FUNCTIONS="$TEST_ROOT/build-runtime-content-digest.sh"
+{
+  /usr/bin/sed -n '/^sha256_file() {$/,/^}$/p' \
+    "$BUILD_RUNTIME"
+  /usr/bin/sed -n '/^short_sha256_stream() {$/,/^}$/p' \
+    "$BUILD_RUNTIME"
+  /usr/bin/sed -n '/^content_tree_digest() {$/,/^}$/p' \
+    "$BUILD_RUNTIME"
+} >"$BUILD_DIGEST_FUNCTIONS"
+# shellcheck disable=SC1090 # Extracted from the fixed repository build producer.
+source "$BUILD_DIGEST_FUNCTIONS"
+declare -F content_tree_digest >/dev/null ||
+  fail "could not load the build-runtime dependency digest producer"
+
+write_fixture_content_marker() {
+  local root="$1"
+
+  content_tree_digest "$root" >"$root/.switchyard-content-sha256"
+  /bin/chmod 0644 "$root/.switchyard-content-sha256"
 }
 
 for library in \
@@ -258,6 +284,40 @@ for module in crypt32 dwrite secur32 winemac ws2_32; do
     "$TEST_ROOT/policy.c" -o "$RUNTIME/lib/wine/aarch64-unix/$module.so"
 done
 
+DEPENDENCY_FIELDS=(gstreamerRuntime vulkanRuntime fontRuntime tlsRuntime)
+DEPENDENCY_ROOTS=(
+  "$RUNTIME/lib/switchyard-gstreamer"
+  "$RUNTIME/lib/switchyard-vulkan"
+  "$RUNTIME/lib/switchyard-fonts"
+  "$RUNTIME/lib/switchyard-tls"
+)
+DEPENDENCY_MACHOS=()
+DEPENDENCY_DIGESTS=()
+for index in "${!DEPENDENCY_ROOTS[@]}"; do
+  dependency_root="${DEPENDENCY_ROOTS[$index]}"
+  /bin/mkdir -p "$dependency_root/lib" "$dependency_root/share/fixture"
+  /usr/bin/install -m 0755 "$RUNTIME/lib/wine/aarch64-unix/crypt32.so" \
+    "$dependency_root/lib/fixture-$index.dylib"
+  /usr/bin/printf 'dependency-%s\n' "${DEPENDENCY_FIELDS[$index]}" \
+    >"$dependency_root/share/fixture/identity.txt"
+  /bin/ln -s "fixture-$index.dylib" \
+    "$dependency_root/lib/fixture-current.dylib"
+  write_fixture_content_marker "$dependency_root"
+  DEPENDENCY_MACHOS+=("$dependency_root/lib/fixture-$index.dylib")
+  DEPENDENCY_DIGESTS+=("$(content_tree_digest "$dependency_root")")
+done
+# Cover mode preservation rather than assuming every producer marker is 0644.
+/bin/chmod 0600 "$RUNTIME/lib/switchyard-fonts/.switchyard-content-sha256"
+
+MESA_ROOT="$RUNTIME/lib/switchyard-mesa"
+FONT_ASSETS_ROOT="$RUNTIME/share/wine/fonts"
+/bin/mkdir -p "$MESA_ROOT/x86_64-windows" "$FONT_ASSETS_ROOT"
+/usr/bin/printf 'mesa-identity\n' >"$MESA_ROOT/x86_64-windows/opengl32.dll"
+/usr/bin/printf 'font-asset-identity\n' >"$FONT_ASSETS_ROOT/fixture.ttf"
+write_fixture_content_marker "$MESA_ROOT"
+MESA_DIGEST="$(content_tree_digest "$MESA_ROOT")"
+FONT_ASSETS_DIGEST="$(content_tree_digest "$FONT_ASSETS_ROOT")"
+
 XTAJIT_UNIX_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-unix/xtajit.so")"
 XTAJIT_PE_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-windows/xtajit.dll")"
 XTAJIT64_UNIX_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-unix/xtajit64.so")"
@@ -275,7 +335,8 @@ X86_64_NTDLL_SHA="$(sha256_file "$RUNTIME/lib/wine/x86_64-windows/ntdll.dll")"
   "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" \
   "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" "$SWITCHYARD_UNICORN_LIBRARY_SHA256" \
   "$XTAJIT_UNIX_SHA" "$XTAJIT_PE_SHA" "$XTAJIT64_UNIX_SHA" "$XTAJIT64_PE_SHA" \
-  "$WINE_UNIX_SHA" "$WINE_REAL_SHA" "$I386_NTDLL_SHA" "$X86_64_NTDLL_SHA" <<'PY'
+  "$WINE_UNIX_SHA" "$WINE_REAL_SHA" "$I386_NTDLL_SHA" "$X86_64_NTDLL_SHA" \
+  "${DEPENDENCY_DIGESTS[@]}" "$MESA_DIGEST" "$FONT_ASSETS_DIGEST" <<'PY'
 import json
 import sys
 
@@ -299,6 +360,12 @@ import sys
     wine_real_digest,
     i386_ntdll_digest,
     x86_64_ntdll_digest,
+    gstreamer_digest,
+    vulkan_digest,
+    font_digest,
+    tls_digest,
+    mesa_digest,
+    font_assets_digest,
 ) = sys.argv[1:]
 value = {
     "manifestVersion": 2,
@@ -334,6 +401,32 @@ value = {
                 "sha256": wine_real_digest,
             },
         ],
+    },
+    "gstreamerRuntime": {
+        "root": "lib/switchyard-gstreamer",
+        "digest": gstreamer_digest,
+    },
+    "vulkanRuntime": {
+        "root": "lib/switchyard-vulkan",
+        "digest": vulkan_digest,
+    },
+    "fontRuntime": {
+        "root": "lib/switchyard-fonts",
+        "digest": font_digest,
+    },
+    "tlsRuntime": {
+        "root": "lib/switchyard-tls",
+        "digest": tls_digest,
+    },
+    "mesaOpenGL": {
+        "root": "lib/switchyard-mesa",
+        "digest": mesa_digest,
+        "fixtureSentinel": "mesa-unchanged",
+    },
+    "fontAssets": {
+        "root": "share/wine/fonts",
+        "digest": font_assets_digest,
+        "fixtureSentinel": "font-assets-unchanged",
     },
     "cpuProvider": {
         "implementation": "unicorn",
@@ -411,6 +504,28 @@ if len(value["dxmt"]["modules"]) != 17 or len(value["dxmt"]["documents"]) != 4:
     raise SystemExit("producer did not emit the exact DXMT closure")
 PY
 
+RUNTIME_ID_BEFORE="$(/usr/bin/plutil -extract id raw -o - "$MANIFEST")"
+MESA_MANIFEST_BEFORE="$(
+  /usr/bin/plutil -extract mesaOpenGL.digest raw -o - "$MANIFEST"
+)"
+FONT_ASSETS_MANIFEST_BEFORE="$(
+  /usr/bin/plutil -extract fontAssets.digest raw -o - "$MANIFEST"
+)"
+MESA_TREE_BEFORE="$(content_tree_digest "$MESA_ROOT")"
+FONT_ASSETS_TREE_BEFORE="$(content_tree_digest "$FONT_ASSETS_ROOT")"
+MESA_MARKER_SHA_BEFORE="$(
+  sha256_file "$MESA_ROOT/.switchyard-content-sha256"
+)"
+MESA_MARKER_MODE_BEFORE="$(
+  /usr/bin/stat -f '%Lp' "$MESA_ROOT/.switchyard-content-sha256"
+)"
+DEPENDENCY_MARKER_MODES_BEFORE=()
+for dependency_root in "${DEPENDENCY_ROOTS[@]}"; do
+  DEPENDENCY_MARKER_MODES_BEFORE+=("$(
+    /usr/bin/stat -f '%Lp' "$dependency_root/.switchyard-content-sha256"
+  )")
+done
+
 SIGNING_MUTATION_TARGETS=(
   "$UNICORN_PACKAGE/lib/libunicorn.2.dylib"
   "$RUNTIME/lib/wine/aarch64-unix/xtajit.so"
@@ -421,6 +536,7 @@ SIGNING_MUTATION_TARGETS=(
   "$RUNTIME/lib/wine/aarch64-unix/winemac.so"
   "$RUNTIME/lib/wine/aarch64-unix/ws2_32.so"
   "$RUNTIME/lib/wine/aarch64-unix/winemetal.so"
+  "${DEPENDENCY_MACHOS[@]}"
 )
 unsigned_hashes="$TEST_ROOT/unsigned-macho-hashes.txt"
 : >"$unsigned_hashes"
@@ -441,6 +557,9 @@ done <"$unsigned_hashes"
 
 expect_failure "stale post-signing manifest" \
   switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
+/usr/bin/grep -F 'dependency tree does not match its marker and manifest' \
+  "$TEST_ROOT/failure-$failure_index.log" >/dev/null ||
+  fail "post-signing validation did not reject a stale dependency tree"
 switchyard_refresh_native_arm64_signed_runtime_manifest "$RUNTIME" "$MANIFEST"
 switchyard_validate_runtime_manifest_profile \
   "$MANIFEST" preview-native-arm64-fex "$RUNTIME"
@@ -449,6 +568,46 @@ switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT
   fail "refreshed Unicorn nested content marker is invalid"
 [ ! -e "$RUNTIME/.switchyard-content-sha256" ] ||
   fail "signed-manifest refresh published the outer runtime marker out of order"
+for index in "${!DEPENDENCY_ROOTS[@]}"; do
+  dependency_root="${DEPENDENCY_ROOTS[$index]}"
+  dependency_field="${DEPENDENCY_FIELDS[$index]}"
+  actual_digest="$(content_tree_digest "$dependency_root")"
+  marker_digest="$(/usr/bin/tr -d '\n' \
+    <"$dependency_root/.switchyard-content-sha256")"
+  manifest_digest="$(
+    /usr/bin/plutil -extract "$dependency_field.digest" raw -o - "$MANIFEST"
+  )"
+  [ "$actual_digest" != "${DEPENDENCY_DIGESTS[$index]}" ] ||
+    fail "signing did not change the $dependency_field content-tree identity"
+  [ "$marker_digest" = "$actual_digest" ] &&
+    [ "$manifest_digest" = "$actual_digest" ] ||
+    fail "signed-manifest refresh did not repair $dependency_field"
+  [ "$(/usr/bin/stat -f '%Lp' \
+    "$dependency_root/.switchyard-content-sha256")" = \
+    "${DEPENDENCY_MARKER_MODES_BEFORE[$index]}" ] ||
+    fail "signed-manifest refresh changed the $dependency_field marker mode"
+done
+[ "$(/usr/bin/plutil -extract id raw -o - "$MANIFEST")" = \
+  "$RUNTIME_ID_BEFORE" ] ||
+  fail "signed-manifest refresh changed the build-time runtime identity"
+[ "$(/usr/bin/plutil -extract mesaOpenGL.digest raw -o - "$MANIFEST")" = \
+  "$MESA_MANIFEST_BEFORE" ] &&
+  [ "$(/usr/bin/plutil -extract mesaOpenGL.fixtureSentinel raw -o - \
+    "$MANIFEST")" = mesa-unchanged ] &&
+  [ "$(content_tree_digest "$MESA_ROOT")" = "$MESA_TREE_BEFORE" ] &&
+  [ "$(sha256_file "$MESA_ROOT/.switchyard-content-sha256")" = \
+    "$MESA_MARKER_SHA_BEFORE" ] &&
+  [ "$(/usr/bin/stat -f '%Lp' \
+    "$MESA_ROOT/.switchyard-content-sha256")" = \
+    "$MESA_MARKER_MODE_BEFORE" ] ||
+  fail "signed-manifest refresh changed the Mesa identity or bytes"
+[ "$(/usr/bin/plutil -extract fontAssets.digest raw -o - "$MANIFEST")" = \
+  "$FONT_ASSETS_MANIFEST_BEFORE" ] &&
+  [ "$(/usr/bin/plutil -extract fontAssets.fixtureSentinel raw -o - \
+    "$MANIFEST")" = font-assets-unchanged ] &&
+  [ "$(content_tree_digest "$FONT_ASSETS_ROOT")" = \
+    "$FONT_ASSETS_TREE_BEFORE" ] ||
+  fail "signed-manifest refresh changed the font-assets identity or bytes"
 if /usr/bin/find "$RUNTIME" -maxdepth 1 -name '.switchyard-signed-manifest.*' \
     -print -quit | /usr/bin/grep . >/dev/null; then
   fail "signed-manifest refresh left a private staging or capability path"
@@ -512,6 +671,101 @@ with open(os.path.join(root, files_path), "rb") as stream:
 if value["dxmt"]["documents"][0]["sha256"] != hashlib.sha256(files).hexdigest():
     raise SystemExit("refreshed DXMT files.sha256 document identity is stale")
 PY
+
+NO_TLS_RUNTIME="$TEST_ROOT/no-tls-runtime"
+NO_TLS_MANIFEST="$NO_TLS_RUNTIME/switchyard-runtime.json"
+/usr/bin/ditto "$RUNTIME" "$NO_TLS_RUNTIME"
+/bin/rm -rf -- "$NO_TLS_RUNTIME/lib/switchyard-tls"
+/usr/bin/python3 -I - "$NO_TLS_MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+value["tlsRuntime"] = None
+with open(sys.argv[1], "w", encoding="utf-8", newline="\n") as stream:
+    json.dump(value, stream, ensure_ascii=True, indent=2)
+    stream.write("\n")
+PY
+switchyard_validate_native_arm64_signed_dependency_trees \
+  "$NO_TLS_RUNTIME" "$NO_TLS_MANIFEST"
+switchyard_refresh_native_arm64_signed_runtime_manifest \
+  "$NO_TLS_RUNTIME" "$NO_TLS_MANIFEST"
+switchyard_validate_native_arm64_signed_dependency_trees \
+  "$NO_TLS_RUNTIME" "$NO_TLS_MANIFEST"
+[ ! -e "$NO_TLS_RUNTIME/lib/switchyard-tls" ] ||
+  fail "optional TLS refresh synthesized a dependency tree"
+if ! /usr/bin/python3 -I - "$NO_TLS_MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+if "tlsRuntime" not in value or value["tlsRuntime"] is not None:
+    raise SystemExit(1)
+PY
+then
+  fail "optional TLS refresh synthesized a manifest"
+fi
+[ ! -e "$NO_TLS_RUNTIME/.switchyard-content-sha256" ] ||
+  fail "optional TLS refresh published an outer runtime marker"
+
+/bin/mkdir -p "$NO_TLS_RUNTIME/lib/switchyard-tls"
+expect_failure "TLS tree without manifest" \
+  switchyard_validate_native_arm64_signed_dependency_trees \
+  "$NO_TLS_RUNTIME" "$NO_TLS_MANIFEST"
+/bin/rm -rf -- "$NO_TLS_RUNTIME/lib/switchyard-tls"
+
+MISSING_TLS_RUNTIME="$TEST_ROOT/missing-tls-runtime"
+MISSING_TLS_MANIFEST="$MISSING_TLS_RUNTIME/switchyard-runtime.json"
+/usr/bin/ditto "$RUNTIME" "$MISSING_TLS_RUNTIME"
+/bin/rm -rf -- "$MISSING_TLS_RUNTIME/lib/switchyard-tls"
+expect_failure "TLS manifest without tree" \
+  switchyard_validate_native_arm64_signed_dependency_trees \
+  "$MISSING_TLS_RUNTIME" "$MISSING_TLS_MANIFEST"
+
+MARKER_RUNTIME="$TEST_ROOT/marker-runtime"
+MARKER_MANIFEST="$MARKER_RUNTIME/switchyard-runtime.json"
+/usr/bin/ditto "$RUNTIME" "$MARKER_RUNTIME"
+MARKER_PATH="$MARKER_RUNTIME/lib/switchyard-gstreamer/.switchyard-content-sha256"
+/bin/rm -f -- "$MARKER_PATH"
+expect_failure "signed validation with missing dependency marker" \
+  switchyard_validate_native_arm64_signed_dependency_trees \
+  "$MARKER_RUNTIME" "$MARKER_MANIFEST"
+expect_failure "missing dependency marker" \
+  switchyard_refresh_native_arm64_signed_runtime_manifest \
+  "$MARKER_RUNTIME" "$MARKER_MANIFEST"
+[ ! -e "$MARKER_RUNTIME/.switchyard-signed-manifest-refresh-in-progress" ] ||
+  fail "pre-publication missing-marker failure tainted the runtime"
+/usr/bin/install -m 0644 \
+  "$RUNTIME/lib/switchyard-gstreamer/.switchyard-content-sha256" "$MARKER_PATH"
+/bin/chmod 0666 "$MARKER_PATH"
+expect_failure "signed validation with unsafe dependency marker mode" \
+  switchyard_validate_native_arm64_signed_dependency_trees \
+  "$MARKER_RUNTIME" "$MARKER_MANIFEST"
+expect_failure "unsafe dependency marker mode" \
+  switchyard_refresh_native_arm64_signed_runtime_manifest \
+  "$MARKER_RUNTIME" "$MARKER_MANIFEST"
+[ ! -e "$MARKER_RUNTIME/.switchyard-signed-manifest-refresh-in-progress" ] ||
+  fail "pre-publication unsafe-marker failure tainted the runtime"
+/bin/chmod 0644 "$MARKER_PATH"
+/usr/bin/printf '000000000000\n' >"$MARKER_PATH"
+expect_failure "signed validation with mismatched dependency marker" \
+  switchyard_validate_native_arm64_signed_dependency_trees \
+  "$MARKER_RUNTIME" "$MARKER_MANIFEST"
+expect_failure "mismatched dependency marker and manifest" \
+  switchyard_refresh_native_arm64_signed_runtime_manifest \
+  "$MARKER_RUNTIME" "$MARKER_MANIFEST"
+
+UNSAFE_PARENT_RUNTIME="$TEST_ROOT/unsafe-parent-runtime"
+UNSAFE_PARENT_MANIFEST="$UNSAFE_PARENT_RUNTIME/switchyard-runtime.json"
+/usr/bin/ditto "$RUNTIME" "$UNSAFE_PARENT_RUNTIME"
+/bin/chmod 0777 "$UNSAFE_PARENT_RUNTIME/lib"
+expect_failure "unsafe dependency parent directory" \
+  switchyard_refresh_native_arm64_signed_runtime_manifest \
+  "$UNSAFE_PARENT_RUNTIME" "$UNSAFE_PARENT_MANIFEST"
+[ ! -e "$UNSAFE_PARENT_RUNTIME/.switchyard-signed-manifest-refresh-in-progress" ] ||
+  fail "pre-publication unsafe-parent failure tainted the runtime"
 
 TAINT_RUNTIME="$TEST_ROOT/taint-runtime"
 TAINT_MANIFEST="$TAINT_RUNTIME/switchyard-runtime.json"

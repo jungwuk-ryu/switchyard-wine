@@ -748,6 +748,427 @@ switchyard_validate_native_arm64_signed_manifest_refresh_in_progress() (
   fi
 )
 
+# Emit the single Python implementation used to calculate native dependency
+# content-tree digests during both refresh and validation.  Keeping this logic
+# shared prevents the producer and consumer from drifting apart while retaining
+# the historical build_runtime.sh byte-stream contract.
+switchyard_native_arm64_dependency_digest_python_source() {
+  /bin/cat <<'PY'
+CONTENT_MAX_ENTRIES = 300000
+CONTENT_MAX_BYTES = 8 * 1024 * 1024 * 1024
+CONTENT_MAX_DEPTH = 256
+CONTENT_MAX_METADATA_BYTES = 32 * 1024 * 1024
+
+
+def dependency_content_tree_digest(tree_relative):
+    tree_parent, tree_name = open_parent(tree_relative)
+    tree_fd = -1
+    lines = []
+    entry_count = 0
+    byte_count = 0
+    metadata_byte_count = 0
+    try:
+        entry = os.stat(tree_name, dir_fd=tree_parent, follow_symlinks=False)
+        tree_fd = os.open(tree_name, DIRECTORY_FLAGS, dir_fd=tree_parent)
+        before = os.fstat(tree_fd)
+        if identity(entry) != identity(before):
+            fail("dependency root changed while opening: " + tree_relative)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            fail("dependency root has an unsafe type, owner, or mode: " + tree_relative)
+        remember(tree_relative, before)
+
+        def safe_tree_component(name):
+            raw = os.fsencode(name)
+            if (
+                name in ("", ".", "..")
+                or "/" in name
+                or any(byte < 0x20 or byte == 0x7f for byte in raw)
+            ):
+                fail("dependency tree contains an unsafe path component")
+            return raw
+
+        def walk(directory_fd, relative_directory, depth):
+            nonlocal entry_count, byte_count, metadata_byte_count
+            if depth > CONTENT_MAX_DEPTH:
+                fail("dependency tree exceeds its nesting-depth bound: " + tree_relative)
+            directory_before = os.fstat(directory_fd)
+            with os.scandir(directory_fd) as iterator:
+                for entry_view in iterator:
+                    entry_count += 1
+                    if entry_count > CONTENT_MAX_ENTRIES:
+                        fail("dependency tree exceeds its entry-count bound: " + tree_relative)
+                    name = entry_view.name
+                    safe_tree_component(name)
+                    relative = name if not relative_directory else relative_directory + "/" + name
+                    relative_bytes = os.fsencode(relative)
+                    runtime_relative = tree_relative + "/" + relative
+                    metadata_byte_count += len(os.fsencode(runtime_relative))
+                    if metadata_byte_count > CONTENT_MAX_METADATA_BYTES:
+                        fail("dependency tree exceeds its metadata-byte bound: " + tree_relative)
+                    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if metadata.st_uid != os.geteuid():
+                        fail("dependency entry has an unsafe owner: " + runtime_relative)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                            fail("dependency directory is group/world writable: " + runtime_relative)
+                        child = os.open(name, DIRECTORY_FLAGS, dir_fd=directory_fd)
+                        try:
+                            opened = os.fstat(child)
+                            if identity(opened) != identity(metadata):
+                                fail("dependency directory changed while opening: " + runtime_relative)
+                            remember(runtime_relative, opened)
+                            walk(child, relative, depth + 1)
+                            if identity(os.fstat(child)) != identity(opened):
+                                fail("dependency directory changed while scanning: " + runtime_relative)
+                        finally:
+                            os.close(child)
+                    elif stat.S_ISREG(metadata.st_mode):
+                        if relative == ".switchyard-content-sha256":
+                            continue
+                        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                            fail("dependency file is group/world writable: " + runtime_relative)
+                        if metadata.st_size > MAX_BINARY:
+                            fail("dependency file exceeds its size bound: " + runtime_relative)
+                        byte_count += metadata.st_size
+                        if byte_count > CONTENT_MAX_BYTES:
+                            fail("dependency tree exceeds its total-byte bound: " + tree_relative)
+                        descriptor = os.open(name, FILE_FLAGS, dir_fd=directory_fd)
+                        try:
+                            opened = os.fstat(descriptor)
+                            if identity(opened) != identity(metadata):
+                                fail("dependency file changed while opening: " + runtime_relative)
+                            file_digest = hashlib.sha256()
+                            remaining = opened.st_size
+                            while remaining:
+                                block = os.read(descriptor, min(1024 * 1024, remaining))
+                                if not block:
+                                    fail("dependency file ended early: " + runtime_relative)
+                                file_digest.update(block)
+                                remaining -= len(block)
+                            if (
+                                os.read(descriptor, 1)
+                                or identity(os.fstat(descriptor)) != identity(opened)
+                            ):
+                                fail("dependency file changed while hashing: " + runtime_relative)
+                            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                            if identity(current) != identity(opened):
+                                fail("dependency file path changed while hashing: " + runtime_relative)
+                            remember(runtime_relative, opened)
+                        finally:
+                            os.close(descriptor)
+                        record = (
+                            b"file ./" + relative_bytes + b" "
+                            + file_digest.hexdigest().encode("ascii") + b"\n"
+                        )
+                        metadata_byte_count += len(relative_bytes) + len(record)
+                        if metadata_byte_count > CONTENT_MAX_METADATA_BYTES:
+                            fail("dependency tree exceeds its metadata-byte bound: " + tree_relative)
+                        lines.append((relative_bytes, record))
+                    elif stat.S_ISLNK(metadata.st_mode):
+                        if relative == ".switchyard-content-sha256":
+                            fail("dependency content marker is a symbolic link: " + tree_relative)
+                        target = os.readlink(name, dir_fd=directory_fd)
+                        target_bytes = os.fsencode(target)
+                        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if identity(current) != identity(metadata):
+                            fail("dependency symbolic link changed while reading: " + runtime_relative)
+                        if (
+                            not target
+                            or target.startswith("/")
+                            or any(byte < 0x20 or byte == 0x7f for byte in target_bytes)
+                        ):
+                            fail("dependency symbolic link has an unsafe target: " + runtime_relative)
+                        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(relative), target))
+                        if resolved == ".." or resolved.startswith("../"):
+                            fail("dependency symbolic link escapes its component root: " + runtime_relative)
+                        remember(runtime_relative, metadata)
+                        record = b"link ./" + relative_bytes + b" " + target_bytes + b"\n"
+                        metadata_byte_count += len(relative_bytes) + len(record)
+                        if metadata_byte_count > CONTENT_MAX_METADATA_BYTES:
+                            fail("dependency tree exceeds its metadata-byte bound: " + tree_relative)
+                        lines.append((relative_bytes, record))
+                    else:
+                        fail("dependency tree contains an unsupported file type: " + runtime_relative)
+            if identity(os.fstat(directory_fd)) != identity(directory_before):
+                fail("dependency directory changed while scanning: " + tree_relative)
+
+        walk(tree_fd, "", 0)
+        current = os.stat(tree_name, dir_fd=tree_parent, follow_symlinks=False)
+        if identity(current) != identity(before) or identity(os.fstat(tree_fd)) != identity(before):
+            fail("dependency root changed while scanning: " + tree_relative)
+    finally:
+        if tree_fd >= 0:
+            os.close(tree_fd)
+        os.close(tree_parent)
+    payload = b"".join(line for _relative, line in sorted(lines))
+    return hashlib.sha256(payload).hexdigest()[:12]
+PY
+}
+
+# Bind the short dependency-tree identities in a signed native manifest to the
+# exact private runtime bytes.  These markers intentionally use the historical
+# build_runtime.sh content_tree_digest format rather than the outer runtime
+# digest format: sorted "file ./... SHA256" and "link ./... TARGET" records,
+# truncated to 12 hexadecimal characters.
+switchyard_validate_native_arm64_signed_dependency_trees() (
+  local runtime_root manifest dependency_digest_source
+
+  [ "$#" -eq 2 ] || {
+    echo "usage: switchyard_validate_native_arm64_signed_dependency_trees RUNTIME MANIFEST" >&2
+    return 2
+  }
+  runtime_root="$1"
+  manifest="$2"
+  dependency_digest_source="$(
+    switchyard_native_arm64_dependency_digest_python_source
+  )" || return 1
+
+  /usr/bin/python3 -I - \
+    "$runtime_root" "$manifest" "$dependency_digest_source" <<'PY'
+import hashlib
+import json
+import os
+import posixpath
+import re
+import stat
+import sys
+
+root_name, manifest_name, dependency_digest_source = sys.argv[1:]
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+MAX_BINARY = 512 * 1024 * 1024
+MAX_MANIFEST = 1024 * 1024
+MAX_PATH_WALK_COMPONENTS = 4 * 1024 * 1024
+SHORT_SHA256 = re.compile(r"[0-9a-f]{12}")
+COMPONENTS = (
+    ("gstreamerRuntime", "lib/switchyard-gstreamer", False),
+    ("vulkanRuntime", "lib/switchyard-vulkan", False),
+    ("fontRuntime", "lib/switchyard-fonts", False),
+    ("tlsRuntime", "lib/switchyard-tls", True),
+)
+
+
+def fail(message):
+    raise RuntimeError("native signed dependency validation failed: " + message)
+
+
+def no_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail("duplicate JSON object key: " + key)
+        value[key] = item
+    return value
+
+
+def identity(info):
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+        info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def safe_component(name, description):
+    raw = os.fsencode(name)
+    if (
+        name in ("", ".", "..")
+        or "/" in name
+        or any(byte < 0x20 or byte == 0x7f for byte in raw)
+    ):
+        fail(description + " contains an unsafe path component")
+    return raw
+
+
+if (
+    not os.path.isabs(root_name)
+    or os.path.normpath(root_name) != root_name
+    or root_name == "/"
+    or os.path.realpath(root_name) != root_name
+    or manifest_name != os.path.join(root_name, "switchyard-runtime.json")
+):
+    fail("runtime root or manifest path is not canonical")
+
+root_fd = os.open("/", DIRECTORY_FLAGS)
+records = {}
+path_walk_components = 0
+try:
+    for component in root_name.split("/")[1:]:
+        safe_component(component, "runtime root")
+        child = os.open(component, DIRECTORY_FLAGS, dir_fd=root_fd)
+        os.close(root_fd)
+        root_fd = child
+    root_info = os.fstat(root_fd)
+    root_identity = identity(root_info)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or root_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        fail("runtime root has an unsafe type, owner, or mode")
+
+    def remember(relative, info):
+        current = identity(info)
+        previous = records.get(relative)
+        if previous is not None and previous != current:
+            fail("runtime path changed while validating: " + relative)
+        records[relative] = current
+
+    def open_parent(relative):
+        global path_walk_components
+        parts = relative.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            fail("invalid runtime-relative path: " + relative)
+        descriptor = os.dup(root_fd)
+        try:
+            walked = []
+            for part in parts[:-1]:
+                path_walk_components += 1
+                if path_walk_components > MAX_PATH_WALK_COMPONENTS:
+                    fail("runtime path traversal exceeds its component-work bound")
+                safe_component(part, "runtime-relative path")
+                child = os.open(part, DIRECTORY_FLAGS, dir_fd=descriptor)
+                info = os.fstat(child)
+                walked.append(part)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                ):
+                    os.close(child)
+                    fail(
+                        "runtime directory has an unsafe type, owner, or mode: "
+                        + "/".join(walked)
+                    )
+                remember("/".join(walked), info)
+                os.close(descriptor)
+                descriptor = child
+            safe_component(parts[-1], "runtime-relative path")
+            return descriptor, parts[-1]
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def read_file(relative, maximum):
+        parent, name = open_parent(relative)
+        descriptor = -1
+        try:
+            entry = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            descriptor = os.open(name, FILE_FLAGS, dir_fd=parent)
+            before = os.fstat(descriptor)
+            if identity(entry) != identity(before):
+                fail("runtime file changed while opening: " + relative)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_size > maximum
+                or before.st_uid != os.geteuid()
+                or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                fail("runtime file has an unsafe type, size, owner, or mode: " + relative)
+            chunks = []
+            remaining = before.st_size
+            while remaining:
+                block = os.read(descriptor, min(1024 * 1024, remaining))
+                if not block:
+                    fail("runtime file ended early: " + relative)
+                chunks.append(block)
+                remaining -= len(block)
+            if os.read(descriptor, 1) or identity(os.fstat(descriptor)) != identity(before):
+                fail("runtime file changed while reading: " + relative)
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if identity(current) != identity(before):
+                fail("runtime file path changed while reading: " + relative)
+            remember(relative, before)
+            return b"".join(chunks), before
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(parent)
+
+    def path_exists(relative):
+        parent, name = open_parent(relative)
+        try:
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            return True
+        finally:
+            os.close(parent)
+
+    exec(dependency_digest_source, globals())
+    manifest_data, manifest_info = read_file("switchyard-runtime.json", MAX_MANIFEST)
+    if manifest_info.st_size <= 0:
+        fail("runtime manifest is empty")
+    try:
+        value = json.loads(
+            manifest_data.decode("utf-8"),
+            object_pairs_hook=no_duplicates,
+            parse_constant=lambda item: fail("non-standard JSON constant: " + item),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail("cannot parse runtime manifest: " + str(error))
+    signing = value.get("runtimeSigning") if type(value) is dict else None
+    if (
+        type(value) is not dict
+        or value.get("runtimeFamily") != "preview-native-arm64-fex"
+        or type(signing) is not dict
+        or signing.get("mode") not in (
+            "engineering-adhoc", "developer-id-hardened-runtime"
+        )
+    ):
+        fail("runtime manifest is not a signed preview-native-arm64-fex manifest")
+
+    for field, tree_relative, optional in COMPONENTS:
+        component = value.get(field)
+        exists = path_exists(tree_relative)
+        if component is None:
+            if not optional:
+                fail("required dependency manifest is absent: " + field)
+            if exists:
+                fail("optional TLS tree exists without its manifest")
+            continue
+        if type(component) is not dict or component.get("root") != tree_relative:
+            fail("dependency manifest root is not exact: " + field)
+        expected = component.get("digest")
+        if type(expected) is not str or SHORT_SHA256.fullmatch(expected) is None:
+            fail("dependency manifest digest is malformed: " + field)
+        if not exists:
+            fail("dependency tree is absent: " + tree_relative)
+        marker_relative = tree_relative + "/.switchyard-content-sha256"
+        marker_data, marker_info = read_file(marker_relative, 13)
+        if (
+            marker_info.st_size != 13
+            or marker_info.st_nlink != 1
+            or stat.S_IMODE(marker_info.st_mode) not in (0o600, 0o644)
+            or marker_data != (expected + "\n").encode("ascii")
+        ):
+            fail("dependency marker does not match its manifest: " + tree_relative)
+        actual = dependency_content_tree_digest(tree_relative)
+        if actual != expected:
+            fail("dependency tree does not match its marker and manifest: " + tree_relative)
+
+    for relative, expected in records.items():
+        parent, name = open_parent(relative)
+        try:
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if identity(current) != expected:
+                fail("runtime bytes changed before dependency validation completed: " + relative)
+        finally:
+            os.close(parent)
+    if identity(os.fstat(root_fd)) != root_identity:
+        fail("runtime root changed during dependency validation")
+except (OSError, RuntimeError, UnicodeError, ValueError) as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    os.close(root_fd)
+PY
+)
+
 # Refresh every runtime identity that may change when Mach-O signatures are
 # applied.  Callers must finish all signing before this function and must keep
 # the runtime private until it succeeds.  A transaction marker taints the
@@ -756,6 +1177,7 @@ switchyard_validate_native_arm64_signed_manifest_refresh_in_progress() (
 # only permitted later mutation is the outer .switchyard-content-sha256 marker.
 switchyard_refresh_native_arm64_signed_runtime_manifest() (
   local runtime_root manifest source_root library_dir digest_helper
+  local dependency_digest_source
 
   [ "$#" -eq 2 ] || {
     echo "usage: switchyard_refresh_native_arm64_signed_runtime_manifest RUNTIME MANIFEST" >&2
@@ -770,13 +1192,18 @@ switchyard_refresh_native_arm64_signed_runtime_manifest() (
     echo "Native signed-manifest content-digest helper is missing or unsafe." >&2
     return 1
   }
+  dependency_digest_source="$(
+    switchyard_native_arm64_dependency_digest_python_source
+  )" || return 1
   /usr/bin/python3 -I - \
-    "$runtime_root" "$manifest" "$digest_helper" "$source_root" <<'PY' || return 1
+    "$runtime_root" "$manifest" "$digest_helper" "$source_root" \
+    "$dependency_digest_source" <<'PY' || return 1
 import errno
 import hashlib
 import json
 import os
 import plistlib
+import posixpath
 import re
 import secrets
 import shutil
@@ -784,12 +1211,20 @@ import stat
 import subprocess
 import sys
 
-root_name, manifest_name, digest_helper, source_root = sys.argv[1:]
+(
+    root_name,
+    manifest_name,
+    digest_helper,
+    source_root,
+    dependency_digest_source,
+) = sys.argv[1:]
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 MAX_BINARY = 512 * 1024 * 1024
 MAX_MANIFEST = 1024 * 1024
+MAX_PATH_WALK_COMPONENTS = 4 * 1024 * 1024
 SHA256 = re.compile(r"[0-9a-f]{64}")
+SHORT_SHA256 = re.compile(r"[0-9a-f]{12}")
 ENTRY_PATHS = [
     "lib/wine/aarch64-unix/wine",
     "bin/wine.switchyard-real",
@@ -818,6 +1253,12 @@ NESTED_UNICORN_FIELDS = {
     "librarySha256", "sourceArchive", "sourceArchiveSha256", "sourcePatch",
     "license",
 }
+CONTENT_COMPONENTS = (
+    ("gstreamerRuntime", "lib/switchyard-gstreamer", False, "gstreamer-marker"),
+    ("vulkanRuntime", "lib/switchyard-vulkan", False, "vulkan-marker"),
+    ("fontRuntime", "lib/switchyard-fonts", False, "font-marker"),
+    ("tlsRuntime", "lib/switchyard-tls", True, "tls-marker"),
+)
 
 
 def fail(message):
@@ -840,8 +1281,26 @@ def identity(info):
     )
 
 
+def replacement_identity(info):
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+        info.st_gid, info.st_size,
+    )
+
+
 def json_bytes(value):
     return (json.dumps(value, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
+
+
+def safe_component(name, description):
+    raw = os.fsencode(name)
+    if (
+        name in ("", ".", "..")
+        or "/" in name
+        or any(byte < 0x20 or byte == 0x7f for byte in raw)
+    ):
+        fail(description + " contains an unsafe path component")
+    return raw
 
 
 if (
@@ -866,8 +1325,11 @@ stage_name = None
 package_copy = None
 capability_fd = -1
 records = {}
+replacement_parent_fds = []
+path_walk_components = 0
 try:
     for component in root_name.split("/")[1:]:
+        safe_component(component, "runtime root")
         child = os.open(component, DIRECTORY_FLAGS, dir_fd=root_fd)
         os.close(root_fd)
         root_fd = child
@@ -892,16 +1354,43 @@ try:
     else:
         fail("signed-manifest refresh descriptor 18 is already in use")
 
+    def remember(relative, info):
+        current = identity(info)
+        previous = records.get(relative)
+        if previous is not None and previous != current:
+            fail("runtime path changed while recording its identity: " + relative)
+        records[relative] = current
+
     def open_parent(relative):
+        global path_walk_components
         parts = relative.split("/")
         if any(part in ("", ".", "..") for part in parts):
             fail("invalid runtime-relative path: " + relative)
         descriptor = os.dup(root_fd)
         try:
+            walked = []
             for part in parts[:-1]:
+                path_walk_components += 1
+                if path_walk_components > MAX_PATH_WALK_COMPONENTS:
+                    fail("runtime path traversal exceeds its component-work bound")
+                safe_component(part, "runtime-relative path")
                 child = os.open(part, DIRECTORY_FLAGS, dir_fd=descriptor)
+                info = os.fstat(child)
+                walked.append(part)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                ):
+                    os.close(child)
+                    fail(
+                        "runtime directory has an unsafe type, owner, or mode: "
+                        + "/".join(walked)
+                    )
+                remember("/".join(walked), info)
                 os.close(descriptor)
                 descriptor = child
+            safe_component(parts[-1], "runtime-relative path")
             return descriptor, parts[-1]
         except BaseException:
             os.close(descriptor)
@@ -936,7 +1425,7 @@ try:
             current = os.stat(name, dir_fd=parent, follow_symlinks=False)
             if identity(current) != identity(before):
                 fail("runtime file path changed while reading: " + relative)
-            records.setdefault(relative, identity(before))
+            remember(relative, before)
             return b"".join(chunks), before
         finally:
             if descriptor >= 0:
@@ -946,6 +1435,18 @@ try:
     def digest(relative):
         return hashlib.sha256(read_file(relative)[0]).hexdigest()
 
+    def path_exists(relative):
+        parent, name = open_parent(relative)
+        try:
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            return True
+        finally:
+            os.close(parent)
+
+    exec(dependency_digest_source, globals())
     manifest_data, _manifest_info = read_file("switchyard-runtime.json", MAX_MANIFEST)
     try:
         value = json.loads(
@@ -981,6 +1482,42 @@ try:
         "wineUnixSha256", "i386NtdllSha256", "x86_64NtdllSha256"
     }:
         fail("runtime integrity schema is not exact")
+
+    dependency_markers = []
+    for field, tree_relative, optional, staged_name in CONTENT_COMPONENTS:
+        component = value.get(field)
+        exists = path_exists(tree_relative)
+        if component is None:
+            if not optional:
+                fail("required dependency manifest is absent: " + field)
+            if exists:
+                fail("optional TLS tree exists without its manifest")
+            continue
+        if type(component) is not dict or component.get("root") != tree_relative:
+            fail("dependency manifest root is not exact: " + field)
+        previous_digest = component.get("digest")
+        if type(previous_digest) is not str or SHORT_SHA256.fullmatch(previous_digest) is None:
+            fail("dependency manifest digest is malformed: " + field)
+        if not exists:
+            fail("dependency tree is absent: " + tree_relative)
+        marker_relative = tree_relative + "/.switchyard-content-sha256"
+        marker_data, marker_info = read_file(marker_relative, 13)
+        marker_mode = stat.S_IMODE(marker_info.st_mode)
+        if (
+            marker_info.st_size != 13
+            or marker_info.st_nlink != 1
+            or marker_mode not in (0o600, 0o644)
+            or marker_data != (previous_digest + "\n").encode("ascii")
+        ):
+            fail("dependency marker does not match its manifest: " + tree_relative)
+        refreshed_digest = dependency_content_tree_digest(tree_relative)
+        component["digest"] = refreshed_digest
+        dependency_markers.append((
+            staged_name,
+            marker_relative,
+            (refreshed_digest + "\n").encode("ascii"),
+            marker_mode,
+        ))
 
     def signing_mode(relative):
         path = os.path.join(root_name, relative)
@@ -1173,12 +1710,17 @@ try:
         fail("refreshed runtime manifest exceeds its size bound")
 
     staged = {}
-    for name, data, mode in (
+    staged_payloads = [
         ("unicorn-manifest", new_nested_data, stat.S_IMODE(nested_info.st_mode)),
         ("unicorn-marker", new_unicorn_marker, 0o644),
         ("dxmt-files", new_files_data, stat.S_IMODE(files_info.st_mode)),
         ("runtime-manifest", output, 0o644),
-    ):
+    ]
+    staged_payloads.extend(
+        (staged_name, data, mode)
+        for staged_name, _relative, data, mode in dependency_markers
+    )
+    for name, data, mode in staged_payloads:
         descriptor = os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -1194,9 +1736,48 @@ try:
                 offset += written
             os.fchmod(descriptor, mode)
             os.fsync(descriptor)
+            staged_info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(staged_info.st_mode)
+                or staged_info.st_uid != os.geteuid()
+                or staged_info.st_nlink != 1
+                or staged_info.st_size != len(data)
+                or stat.S_IMODE(staged_info.st_mode) != mode
+            ):
+                fail("refreshed staged identity has an unsafe type, owner, link count, size, or mode")
         finally:
             os.close(descriptor)
-        staged[name] = mode
+        staged_path_info = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+        if identity(staged_path_info) != identity(staged_info):
+            fail("refreshed staged identity changed after closing: " + name)
+        staged[name] = (
+            identity(staged_info), replacement_identity(staged_info)
+        )
+    os.fsync(stage_fd)
+
+    replacements = [
+        ("unicorn-manifest", nested_relative),
+        ("unicorn-marker", provider["runtimeRoot"] + "/.switchyard-content-sha256"),
+        ("dxmt-files", files_relative),
+    ]
+    replacements.extend(
+        (staged_name, relative)
+        for staged_name, relative, _data, _mode in dependency_markers
+    )
+    replacements.append(("runtime-manifest", "switchyard-runtime.json"))
+    prepared_replacements = []
+    for staged_name, relative in replacements:
+        parent, target = open_parent(relative)
+        replacement_parent_fds.append(parent)
+        target_info = os.stat(target, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(target_info.st_mode)
+            or target_info.st_uid != os.geteuid()
+            or target_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            fail("refresh replacement target has an unsafe type, owner, or mode: " + relative)
+        remember(relative, target_info)
+        prepared_replacements.append((staged_name, relative, parent, target))
 
     for relative, expected in records.items():
         parent, name = open_parent(relative)
@@ -1281,19 +1862,24 @@ try:
     ):
         fail("signed-manifest refresh taint is not exact")
 
-    replacements = [
-        ("unicorn-manifest", nested_relative),
-        ("unicorn-marker", provider["runtimeRoot"] + "/.switchyard-content-sha256"),
-        ("dxmt-files", files_relative),
-        ("runtime-manifest", "switchyard-runtime.json"),
-    ]
-    for staged_name, relative in replacements:
-        parent, target = open_parent(relative)
-        try:
-            os.replace(staged_name, target, src_dir_fd=stage_fd, dst_dir_fd=parent)
-            os.fsync(parent)
-        finally:
-            os.close(parent)
+    for staged_name, relative, parent, target in prepared_replacements:
+        target_current = os.stat(target, dir_fd=parent, follow_symlinks=False)
+        if identity(target_current) != records[relative]:
+            fail("refresh replacement target changed before publication: " + relative)
+        staged_current = os.stat(
+            staged_name, dir_fd=stage_fd, follow_symlinks=False
+        )
+        if identity(staged_current) != staged[staged_name][0]:
+            fail("refreshed staged identity changed before publication: " + staged_name)
+        os.replace(staged_name, target, src_dir_fd=stage_fd, dst_dir_fd=parent)
+        published = os.stat(target, dir_fd=parent, follow_symlinks=False)
+        if replacement_identity(published) != staged[staged_name][1]:
+            fail("published refreshed identity differs from its staged file: " + relative)
+        os.fsync(parent)
+    os.fsync(stage_fd)
+    for parent in replacement_parent_fds:
+        os.close(parent)
+    replacement_parent_fds = []
     os.fsync(root_fd)
 
     shutil.rmtree(package_copy)
@@ -1399,6 +1985,11 @@ except (OSError, RuntimeError, UnicodeError, ValueError) as error:
     print(error, file=sys.stderr)
     raise SystemExit(1)
 finally:
+    for parent in replacement_parent_fds:
+        try:
+            os.close(parent)
+        except OSError:
+            pass
     if capability_fd >= 0:
         try:
             os.close(capability_fd)
@@ -1442,6 +2033,7 @@ switchyard_validate_native_arm64_runtime_packaging() {
     SWITCHYARD_RUNTIME_PROFILE_BOUND_ROOT="$runtime_root"
   fi
   for validator in \
+      switchyard_validate_native_arm64_signed_dependency_trees \
       switchyard_validate_native_cpu_provider_files \
       switchyard_validate_wow64_unixlib_policy_manifest \
       switchyard_validate_dxmt_runtime_manifest; do
@@ -1450,6 +2042,10 @@ switchyard_validate_native_arm64_runtime_packaging() {
       return 1
     }
   done
+  if [ -n "$SWITCHYARD_RUNTIME_PROFILE_BOUND_ROOT" ]; then
+    switchyard_validate_native_arm64_signed_dependency_trees \
+      "$runtime_root" "$manifest" || return 1
+  fi
   switchyard_validate_native_cpu_provider_files "$manifest" "$runtime_root" || return 1
   switchyard_validate_wow64_unixlib_policy_manifest \
     "$runtime_root" "$manifest" "$source_root" || return 1
