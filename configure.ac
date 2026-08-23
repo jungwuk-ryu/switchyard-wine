@@ -57,6 +57,7 @@ AC_ARG_WITH(pulse,     AS_HELP_STRING([--without-pulse],[do not use PulseAudio s
 AC_ARG_WITH(sane,      AS_HELP_STRING([--without-sane],[do not use SANE (scanner support)]))
 AC_ARG_WITH(sdl,       AS_HELP_STRING([--without-sdl],[do not use SDL]))
 AC_ARG_WITH(udev,      AS_HELP_STRING([--without-udev],[do not use udev (plug and play support)]))
+AC_ARG_WITH(unicorn,   AS_HELP_STRING([--with-unicorn],[use Unicorn for ARM64 x86 emulation]))
 AC_ARG_WITH(usb,       AS_HELP_STRING([--without-usb],[do not use the libusb library]))
 AC_ARG_WITH(v4l2,      AS_HELP_STRING([--without-v4l2],[do not use v4l2 (video capture)]))
 AC_ARG_WITH(vulkan,    AS_HELP_STRING([--without-vulkan],[do not use Vulkan]))
@@ -761,6 +762,7 @@ AC_CHECK_HEADERS(\
 	netinet/in_systm.h \
 	netinet/tcp.h \
 	netinet/tcp_fsm.h \
+	os/arch/arm64.h \
 	port.h \
 	pwd.h \
 	sched.h \
@@ -805,6 +807,30 @@ AC_CHECK_HEADERS(\
 	valgrind/memcheck.h \
 	valgrind/valgrind.h
 )
+
+case "$host_os:$HOST_ARCH" in
+  darwin*:aarch64)
+    if test "x$ac_cv_header_os_arch_arm64_h" = xyes
+    then
+      AC_CACHE_CHECK([for Darwin custom x18 ABI support], wine_cv_have_os_custom_x18_abi,
+        [AC_LINK_IFELSE([AC_LANG_PROGRAM(
+          [[#include <stdbool.h>
+#include <os/arch/arm64.h>]],
+          [[if (__builtin_available(macOS 26.4, *))
+            {
+                bool enabled = os_custom_x18_abi_enabled();
+                os_set_custom_x18_abi_enabled(enabled);
+            }]])],
+          [wine_cv_have_os_custom_x18_abi=yes],
+          [wine_cv_have_os_custom_x18_abi=no])])
+      test "x$wine_cv_have_os_custom_x18_abi" != xyes ||
+        AC_DEFINE(HAVE_OS_CUSTOM_X18_ABI, 1,
+                  [Define if the Darwin custom x18 ABI interfaces are available])
+    else
+      wine_cv_have_os_custom_x18_abi=no
+    fi
+    ;;
+esac
 AC_HEADER_MAJOR()
 
 dnl **** Checks for headers that depend on other ones ****
@@ -962,6 +988,15 @@ AC_SUBST(TOP_INSTALL_LIB,"")
 AC_SUBST(TOP_INSTALL_DEV,"")
 AC_SUBST(WINELOADER_LDFLAGS,"")
 AC_SUBST(WINEPRELOADER_LDFLAGS,"")
+AC_SUBST(NTDLL_X18_TEST_UNIXLIB,"")
+XTAJIT64_UNIXLIB=
+XTAJIT64_PE_CFLAGS=
+XTAJIT_UNIXLIB=
+XTAJIT_PE_CFLAGS=
+AC_SUBST(XTAJIT64_UNIXLIB)
+AC_SUBST(XTAJIT64_PE_CFLAGS)
+AC_SUBST(XTAJIT_UNIXLIB)
+AC_SUBST(XTAJIT_PE_CFLAGS)
 LIBEXT="so"
 WINE_PATH_SONAME_TOOLS
 WINE_CONFIG_HELPERS
@@ -977,6 +1012,8 @@ case $host_os in
     DLLFLAGS="$DLLFLAGS -fPIC"
     LDDLLFLAGS="-fPIC"
     enable_winemac_drv=${enable_winemac_drv:-yes}
+    test "$HOST_ARCH" != aarch64 || test "x$wine_cv_have_os_custom_x18_abi" != xyes ||
+        NTDLL_X18_TEST_UNIXLIB=ntdll-x18-test.so
     with_fontconfig=${with_fontconfig:-no}
     dnl declare needed frameworks
     AC_SUBST(CORETEXT_LIBS,"-framework CoreText")
@@ -1508,6 +1545,29 @@ fi
 WINE_NOTICE_WITH(opencl,[test "x$ac_cv_func_clGetPlatformInfo" != xyes],
                  [OpenCL ${notice_platform}development files not found, OpenCL won't be supported.],
                  [enable_opencl])
+
+dnl **** Check for Unicorn (explicit opt-in for the ARM64 x86 providers) ****
+if test "x$with_unicorn" != "x" -a "x$with_unicorn" != "xno"
+then
+    WINE_PACKAGE_FLAGS(UNICORN,[unicorn],[-lunicorn],,,
+        [AC_CHECK_HEADER([unicorn/unicorn.h],
+            [AC_CHECK_HEADER([unicorn/x86.h],
+                [AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <unicorn/unicorn.h>
+#if UC_API_MAJOR < 2 || (UC_API_MAJOR == 2 && (UC_API_MINOR < 1 || (UC_API_MINOR == 1 && UC_API_PATCH < 4)))
+#error Unicorn 2.1.4 or newer is required
+#endif]])],
+                    [AC_CHECK_FUNC(uc_open,
+                        [XTAJIT64_UNIXLIB=xtajit64.so
+                         XTAJIT64_PE_CFLAGS=-DHAVE_UNICORN
+                         XTAJIT_UNIXLIB=xtajit.so
+                         XTAJIT_PE_CFLAGS=-DHAVE_UNICORN],
+                        [UNICORN_LIBS=""])],
+                    [UNICORN_LIBS=""])],
+                [UNICORN_LIBS=""])],
+            [UNICORN_LIBS=""])])
+    WINE_ERROR_WITH(unicorn,[test "x$UNICORN_LIBS" = "x"],
+                    [Unicorn 2.1.4 or newer development files not found.])
+fi
 
 dnl **** Check for libpcap ****
 if test "x$with_pcap" != "xno"
@@ -2392,17 +2452,30 @@ dnl *** Check for modules to disable by default
 
 enable_vcruntime140_1=${enable_vcruntime140_1:-x86_64,arm64ec}
 
+if test -z "$XTAJIT64_UNIXLIB"
+then
+    case "x$enable_provider_tests" in
+      x|xno) enable_provider_tests=no ;;
+      *) AC_MSG_ERROR([xtajit64 provider tests require Unicorn support]) ;;
+    esac
+fi
+
 if test -n "$PE_ARCHS"
 then
     enable_wow64=${enable_wow64:-aarch64,x86_64}
     enable_wow64win=${enable_wow64win:-aarch64,x86_64}
     enable_wow64cpu=${enable_wow64cpu:-x86_64}
+    enable_xtajit=${enable_xtajit:-aarch64}
     enable_xtajit64=${enable_xtajit64:-arm64ec}
+    test -z "$XTAJIT64_UNIXLIB" ||
+        enable_provider_tests=${enable_provider_tests:-aarch64,arm64ec}
 else
     enable_wow64=${enable_wow64:-no}
     enable_wow64win=${enable_wow64win:-no}
     enable_wow64cpu=${enable_wow64cpu:-no}
+    enable_xtajit=${enable_xtajit:-no}
     enable_xtajit64=${enable_xtajit64:-no}
+    enable_provider_tests=${enable_provider_tests:-no}
     enable_compiler_rt=${enable_compiler_rt:-no}
 fi
 
@@ -3537,7 +3610,9 @@ WINE_CONFIG_MAKEFILE(dlls/xmllite/tests)
 WINE_CONFIG_MAKEFILE(dlls/xolehlp)
 WINE_CONFIG_MAKEFILE(dlls/xpsprint)
 WINE_CONFIG_MAKEFILE(dlls/xpssvcs)
+WINE_CONFIG_MAKEFILE(dlls/xtajit)
 WINE_CONFIG_MAKEFILE(dlls/xtajit64)
+WINE_CONFIG_MAKEFILE(dlls/xtajit64/provider_tests)
 WINE_CONFIG_MAKEFILE(fonts)
 WINE_CONFIG_MAKEFILE(include)
 WINE_CONFIG_MAKEFILE(libs/adsiid)
@@ -3817,6 +3892,12 @@ server/wineserver"
 fi
 
 dnl Rules for generated source files
+
+if test -n "$NTDLL_X18_TEST_UNIXLIB"
+then
+    WINE_APPEND_RULE(
+[dlls/ntdll/tests/exception.ok dlls/ntdll/tests/aarch64-windows/exception.ok: dlls/ntdll/tests/ntdll-x18-test.so])
+fi
 
 WINE_APPEND_RULE(
 [dlls/ntdll/unix/version.c: dummy

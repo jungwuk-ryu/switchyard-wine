@@ -315,6 +315,12 @@
 /* Define to 1 if you have the <OpenCL/opencl.h> header file. */
 #undef HAVE_OPENCL_OPENCL_H
 
+/* Define to 1 if you have the <os/arch/arm64.h> header file. */
+#undef HAVE_OS_ARCH_ARM64_H
+
+/* Define if the Darwin custom x18 ABI interfaces are available */
+#undef HAVE_OS_CUSTOM_X18_ABI
+
 /* Define to 1 if 'numaudioengines' is a member of 'oss_sysinfo'. */
 #undef HAVE_OSS_SYSINFO_NUMAUDIOENGINES
 

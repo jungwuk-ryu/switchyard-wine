@@ -684,6 +684,9 @@ PCSCLITE_LIBS
 PCSCLITE_CFLAGS
 PCAP_LIBS
 PCAP_CFLAGS
+NTDLL_X18_TEST_UNIXLIB
+UNICORN_LIBS
+UNICORN_CFLAGS
 OPENCL_CFLAGS
 WAYLAND_EGL_LIBS
 WAYLAND_EGL_CFLAGS
@@ -774,6 +777,10 @@ SUBDIRS
 READELF
 OTOOL
 LDD
+XTAJIT_PE_CFLAGS
+XTAJIT_UNIXLIB
+XTAJIT64_PE_CFLAGS
+XTAJIT64_UNIXLIB
 WINEPRELOADER_LDFLAGS
 WINELOADER_LDFLAGS
 TOP_INSTALL_DEV
@@ -968,6 +975,7 @@ with_pulse
 with_sane
 with_sdl
 with_udev
+with_unicorn
 with_usb
 with_v4l2
 with_vulkan
@@ -1675,7 +1683,9 @@ enable_xmllite
 enable_xolehlp
 enable_xpsprint
 enable_xpssvcs
+enable_xtajit
 enable_xtajit64
+enable_provider_tests
 enable_fonts
 enable_include
 enable_adsiid
@@ -1920,6 +1930,8 @@ WAYLAND_EGL_CFLAGS
 WAYLAND_EGL_LIBS
 OPENCL_CFLAGS
 OPENCL_LIBS
+UNICORN_CFLAGS
+UNICORN_LIBS
 PCAP_CFLAGS
 PCAP_LIBS
 PCSCLITE_CFLAGS
@@ -2641,6 +2653,7 @@ Optional Packages:
   --without-sane          do not use SANE (scanner support)
   --without-sdl           do not use SDL
   --without-udev          do not use udev (plug and play support)
+  --with-unicorn          use Unicorn for ARM64 x86 emulation
   --without-usb           do not use the libusb library
   --without-v4l2          do not use v4l2 (video capture)
   --without-vulkan        do not use Vulkan
@@ -2805,6 +2818,10 @@ Some influential environment variables:
   OPENCL_CFLAGS
               C compiler flags for OpenCL, overriding pkg-config
   OPENCL_LIBS Linker flags for OpenCL, overriding pkg-config
+  UNICORN_CFLAGS
+              C compiler flags for unicorn, overriding pkg-config
+  UNICORN_LIBS
+              Linker flags for unicorn, overriding pkg-config
   PCAP_CFLAGS C compiler flags for libpcap, overriding pkg-config
   PCAP_LIBS   Linker flags for libpcap, overriding pkg-config
   PCSCLITE_CFLAGS
@@ -4522,6 +4539,13 @@ fi
 if test ${with_udev+y}
 then :
   withval=$with_udev;
+fi
+
+
+# Check whether --with-unicorn was given.
+if test ${with_unicorn+y}
+then :
+  withval=$with_unicorn;
 fi
 
 
@@ -11004,6 +11028,12 @@ then :
   printf '%s\n' "#define HAVE_NETINET_TCP_FSM_H 1" >>confdefs.h
 
 fi
+ac_fn_c_check_header_compile "$LINENO" "os/arch/arm64.h" "ac_cv_header_os_arch_arm64_h" "$ac_includes_default"
+if test "x$ac_cv_header_os_arch_arm64_h" = xyes
+then :
+  printf '%s\n' "#define HAVE_OS_ARCH_ARM64_H 1" >>confdefs.h
+
+fi
 ac_fn_c_check_header_compile "$LINENO" "port.h" "ac_cv_header_port_h" "$ac_includes_default"
 if test "x$ac_cv_header_port_h" = xyes
 then :
@@ -11262,6 +11292,57 @@ then :
   printf '%s\n' "#define HAVE_VALGRIND_VALGRIND_H 1" >>confdefs.h
 
 fi
+
+case "$host_os:$HOST_ARCH" in
+  darwin*:aarch64)
+    if test "x$ac_cv_header_os_arch_arm64_h" = xyes
+    then
+      { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for Darwin custom x18 ABI support" >&5
+printf %s "checking for Darwin custom x18 ABI support... " >&6; }
+if test ${wine_cv_have_os_custom_x18_abi+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+#include <stdbool.h>
+#include <os/arch/arm64.h>
+int
+main (void)
+{
+if (__builtin_available(macOS 26.4, *))
+            {
+                bool enabled = os_custom_x18_abi_enabled();
+                os_set_custom_x18_abi_enabled(enabled);
+            }
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  wine_cv_have_os_custom_x18_abi=yes
+else case e in #(
+  e) wine_cv_have_os_custom_x18_abi=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $wine_cv_have_os_custom_x18_abi" >&5
+printf '%s\n' "$wine_cv_have_os_custom_x18_abi" >&6; }
+      if test "x$wine_cv_have_os_custom_x18_abi" = xyes
+      then
+
+printf '%s\n' "#define HAVE_OS_CUSTOM_X18_ABI 1" >>confdefs.h
+
+      fi
+    else
+      wine_cv_have_os_custom_x18_abi=no
+    fi
+    ;;
+esac
 
 
 ac_fn_c_check_header_compile "$LINENO" "sys/mkdev.h" "ac_cv_header_sys_mkdev_h" "$ac_includes_default"
@@ -12043,6 +12124,16 @@ WINELOADER_LDFLAGS=""
 
 WINEPRELOADER_LDFLAGS=""
 
+NTDLL_X18_TEST_UNIXLIB=""
+
+XTAJIT64_UNIXLIB=
+XTAJIT64_PE_CFLAGS=
+XTAJIT_UNIXLIB=
+XTAJIT_PE_CFLAGS=
+
+
+
+
 LIBEXT="so"
 # Extract the first word of "ldd", so it can be a program name with args.
 set dummy ldd; ac_word=$2
@@ -12344,6 +12435,8 @@ case $host_os in
     DLLFLAGS="$DLLFLAGS -fPIC"
     LDDLLFLAGS="-fPIC"
     enable_winemac_drv=${enable_winemac_drv:-yes}
+    test "$HOST_ARCH" != aarch64 || test "x$wine_cv_have_os_custom_x18_abi" != xyes ||
+        NTDLL_X18_TEST_UNIXLIB=ntdll-x18-test.so
     with_fontconfig=${with_fontconfig:-no}
         CORETEXT_LIBS="-framework CoreText"
 
@@ -17168,6 +17261,103 @@ then :
 This is an error since --with-opencl was requested." "$LINENO" 5 ;;
 esac
 enable_opencl=${enable_opencl:-no}
+fi
+
+if test "x$with_unicorn" != "x" -a "x$with_unicorn" != "xno"
+then
+    rm -f conftest.err
+if ${UNICORN_CFLAGS:+false} :
+then :
+  if test ${PKG_CONFIG+y}
+then :
+  UNICORN_CFLAGS=`$PKG_CONFIG --cflags unicorn 2>conftest.err`
+fi
+fi
+
+if ${UNICORN_LIBS:+false} :
+then :
+  if test ${PKG_CONFIG+y}
+then :
+  UNICORN_LIBS=`$PKG_CONFIG --libs unicorn 2>/dev/null`
+fi
+fi
+
+UNICORN_LIBS=${UNICORN_LIBS:-"-lunicorn"}
+printf '%s\n' "$as_me:${as_lineno-$LINENO}: unicorn cflags: $UNICORN_CFLAGS" >&5
+printf '%s\n' "$as_me:${as_lineno-$LINENO}: unicorn libs: $UNICORN_LIBS" >&5
+if test -s conftest.err; then
+     printf %s "$as_me:${as_lineno-$LINENO}: unicorn errors: " >&5
+     cat conftest.err >&5
+fi
+rm -f conftest.err
+if test -n "$UNICORN_CFLAGS$UNICORN_LIBS"
+then :
+  ac_save_pkg_CPPFLAGS=$CPPFLAGS
+ac_save_pkg_LIBS=$LIBS
+CPPFLAGS="$CPPFLAGS $UNICORN_CFLAGS"
+LIBS="$UNICORN_LIBS $LIBS"
+ac_fn_c_check_header_compile "$LINENO" "unicorn/unicorn.h" "ac_cv_header_unicorn_unicorn_h" "$ac_includes_default"
+if test "x$ac_cv_header_unicorn_unicorn_h" = xyes
+then :
+  ac_fn_c_check_header_compile "$LINENO" "unicorn/x86.h" "ac_cv_header_unicorn_x86_h" "$ac_includes_default"
+if test "x$ac_cv_header_unicorn_x86_h" = xyes
+then :
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+#include <unicorn/unicorn.h>
+#if UC_API_MAJOR < 2 || (UC_API_MAJOR == 2 && (UC_API_MINOR < 1 || (UC_API_MINOR == 1 && UC_API_PATCH < 4)))
+#error Unicorn 2.1.4 or newer is required
+#endif
+int
+main (void)
+{
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  ac_fn_c_check_func "$LINENO" "uc_open" "ac_cv_func_uc_open"
+if test "x$ac_cv_func_uc_open" = xyes
+then :
+  XTAJIT64_UNIXLIB=xtajit64.so
+                         XTAJIT64_PE_CFLAGS=-DHAVE_UNICORN
+                         XTAJIT_UNIXLIB=xtajit.so
+                         XTAJIT_PE_CFLAGS=-DHAVE_UNICORN
+else case e in #(
+  e) UNICORN_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) UNICORN_LIBS="" ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+else case e in #(
+  e) UNICORN_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) UNICORN_LIBS="" ;;
+esac
+fi
+
+CPPFLAGS=$ac_save_pkg_CPPFLAGS
+LIBS=$ac_save_pkg_LIBS
+fi
+
+    if test "x$UNICORN_LIBS" = "x"
+then :
+  case "x$with_unicorn" in
+  xno) ;;
+  *)   as_fn_error $? "Unicorn 2.1.4 or newer development files not found.
+Use the --without-unicorn option if you really want this." "$LINENO" 5 ;;
+esac
+
+fi
 fi
 
 if test "x$with_pcap" != "xno"
@@ -22100,17 +22290,30 @@ esac
 
 enable_vcruntime140_1=${enable_vcruntime140_1:-x86_64,arm64ec}
 
+if test -z "$XTAJIT64_UNIXLIB"
+then
+    case "x$enable_provider_tests" in
+      x|xno) enable_provider_tests=no ;;
+      *) as_fn_error $? "xtajit64 provider tests require Unicorn support" "$LINENO" 5 ;;
+    esac
+fi
+
 if test -n "$PE_ARCHS"
 then
     enable_wow64=${enable_wow64:-aarch64,x86_64}
     enable_wow64win=${enable_wow64win:-aarch64,x86_64}
     enable_wow64cpu=${enable_wow64cpu:-x86_64}
+    enable_xtajit=${enable_xtajit:-aarch64}
     enable_xtajit64=${enable_xtajit64:-arm64ec}
+    test -z "$XTAJIT64_UNIXLIB" ||
+        enable_provider_tests=${enable_provider_tests:-aarch64,arm64ec}
 else
     enable_wow64=${enable_wow64:-no}
     enable_wow64win=${enable_wow64win:-no}
     enable_wow64cpu=${enable_wow64cpu:-no}
+    enable_xtajit=${enable_xtajit:-no}
     enable_xtajit64=${enable_xtajit64:-no}
+    enable_provider_tests=${enable_provider_tests:-no}
     enable_compiler_rt=${enable_compiler_rt:-no}
 fi
 
@@ -23239,7 +23442,9 @@ wine_fn_config_makefile dlls/xmllite/tests enable_tests
 wine_fn_config_makefile dlls/xolehlp enable_xolehlp
 wine_fn_config_makefile dlls/xpsprint enable_xpsprint
 wine_fn_config_makefile dlls/xpssvcs enable_xpssvcs
+wine_fn_config_makefile dlls/xtajit enable_xtajit
 wine_fn_config_makefile dlls/xtajit64 enable_xtajit64
+wine_fn_config_makefile dlls/xtajit64/provider_tests enable_provider_tests
 wine_fn_config_makefile fonts enable_fonts
 wine_fn_config_makefile include enable_include
 wine_fn_config_makefile libs/adsiid enable_adsiid
@@ -23486,6 +23691,12 @@ server/wineserver"
       cygwin*|mingw32*|darwin*|linux-android*) ;;
       *) TOP_INSTALL_LIB="$TOP_INSTALL_LIB loader/wine.desktop" ;;
     esac
+fi
+
+if test -n "$NTDLL_X18_TEST_UNIXLIB"
+then
+    as_fn_append wine_rules "
+dlls/ntdll/tests/exception.ok dlls/ntdll/tests/aarch64-windows/exception.ok: dlls/ntdll/tests/ntdll-x18-test.so"
 fi
 
 
@@ -24318,6 +24529,11 @@ TOP_INSTALL_LIB = $TOP_INSTALL_LIB
 TOP_INSTALL_DEV = $TOP_INSTALL_DEV
 WINELOADER_LDFLAGS = $WINELOADER_LDFLAGS
 WINEPRELOADER_LDFLAGS = $WINEPRELOADER_LDFLAGS
+NTDLL_X18_TEST_UNIXLIB = $NTDLL_X18_TEST_UNIXLIB
+XTAJIT64_UNIXLIB = $XTAJIT64_UNIXLIB
+XTAJIT64_PE_CFLAGS = $XTAJIT64_PE_CFLAGS
+XTAJIT_UNIXLIB = $XTAJIT_UNIXLIB
+XTAJIT_PE_CFLAGS = $XTAJIT_PE_CFLAGS
 LDD = $LDD
 OTOOL = $OTOOL
 READELF = $READELF
@@ -24408,6 +24624,8 @@ XKBCOMMON_LIBS = $XKBCOMMON_LIBS
 WAYLAND_EGL_CFLAGS = $WAYLAND_EGL_CFLAGS
 WAYLAND_EGL_LIBS = $WAYLAND_EGL_LIBS
 OPENCL_CFLAGS = $OPENCL_CFLAGS
+UNICORN_CFLAGS = $UNICORN_CFLAGS
+UNICORN_LIBS = $UNICORN_LIBS
 PCAP_CFLAGS = $PCAP_CFLAGS
 PCAP_LIBS = $PCAP_LIBS
 PCSCLITE_CFLAGS = $PCSCLITE_CFLAGS

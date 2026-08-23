@@ -64,5 +64,7 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
   "$ROOT_DIR/dlls/ntdll/tests/check_creation_transactions.py" \
   "$ROOT_DIR/server/process.c" \
   "$ROOT_DIR/server/thread.c"
+"$ROOT_DIR/switchyard/tests/provider_source_models_test.sh"
+"$ROOT_DIR/switchyard/tests/darwin_arm64_x18_availability_source_test.sh"
 
 echo "source history verified from $upstream_base through $(git -C "$ROOT_DIR" rev-parse HEAD)"
