@@ -4743,7 +4743,30 @@ static NTSTATUS allocate_dos_memory( struct file_view **view, unsigned int vprot
  */
 static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, BOOL *removable )
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    char *read_ptr = ptr;
+    size_t remaining = size;
+    off_t offset = 0;
+    ssize_t ret;
+#endif
+
     if (!size) return STATUS_INVALID_IMAGE_FORMAT;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* A writable handle opened before SEC_IMAGE creation can still change the
+     * file.  Keep the header used for the final image classification in the
+     * anonymous view instead of exposing a live MAP_PRIVATE file mapping. */
+    while (remaining)
+    {
+        do ret = pread( fd, read_ptr, remaining, offset );
+        while (ret < 0 && errno == EINTR);
+        if (ret <= 0) return STATUS_INVALID_IMAGE_FORMAT;
+        read_ptr += ret;
+        remaining -= ret;
+        offset += ret;
+    }
+    return STATUS_SUCCESS;
+#endif
 
     map_size &= ~host_page_mask;
 
@@ -5008,6 +5031,7 @@ struct arm64ec_mapping
     IMAGE_ARM64EC_METADATA metadata;
     UINT entry_point;
     BOOL present;
+    BOOL has_native_code;
 };
 
 
@@ -5842,7 +5866,8 @@ static NTSTATUS validate_arm64_unwind_info( const char *base,
 static NTSTATUS validate_arm64ec_metadata( const char *base,
                                            const struct arm64x_fixup_transaction *transaction,
                                            SIZE_T total_size, ULONG metadata_rva,
-                                           IMAGE_ARM64EC_METADATA *metadata )
+                                           IMAGE_ARM64EC_METADATA *metadata,
+                                           BOOL *has_native_code )
 {
     ARM64_RUNTIME_FUNCTION function, previous_function;
     IMAGE_ARM64EC_CODE_RANGE_ENTRY_POINT code_range;
@@ -5867,6 +5892,7 @@ static NTSTATUS validate_arm64ec_metadata( const char *base,
         if (!code.Length || !image_rva_range_valid( total_size, start, code.Length ) ||
             (i && start < code_map_end))
             return STATUS_INVALID_IMAGE_FORMAT;
+        if ((code.StartOffset & 0x3) == 1) *has_native_code = TRUE;
         code_map_end = start + (SIZE_T)code.Length;
     }
 
@@ -6152,7 +6178,8 @@ static NTSTATUS update_arm64ec_ranges( struct file_view *view, IMAGE_NT_HEADERS 
     }
 
     if ((status = validate_arm64ec_metadata( base, transaction, total_size, metadata_rva,
-                                             &mapping->metadata )))
+                                             &mapping->metadata,
+                                             &mapping->has_native_code )))
         goto done;
 
     mapping->entry_point = redirect_validated_arm64ec_rva(
@@ -7000,10 +7027,12 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     struct stat st;
     char *header_end;
     char *ptr = view->base;
-    SIZE_T header_size, header_map_size, total_size = view->size;
+    SIZE_T header_size, header_map_size, header_span, nt_offset, section_offset, section_end;
+    SIZE_T total_size = view->size;
     SIZE_T align_mask = max( image_info->alignment - 1, page_mask );
     INT_PTR delta;
 #ifdef __aarch64__
+    USHORT source_machine;
     USHORT mapped_machine = image_info->machine;
     UINT mapped_entry_point = image_info->entry_point;
     struct arm64x_fixup_transaction arm64x_transaction = {0};
@@ -7026,14 +7055,27 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         return status;
 
     status = STATUS_INVALID_IMAGE_FORMAT;  /* generic error */
-    dos = (IMAGE_DOS_HEADER *)ptr;
-    nt = (IMAGE_NT_HEADERS *)(ptr + dos->e_lfanew);
-    header_end = ptr + ROUND_SIZE( 0, header_size, align_mask );
+    if (header_size < sizeof(*dos)) return status;
+    header_span = ROUND_SIZE( 0, header_size, align_mask );
+    if (header_span < header_size || header_span > total_size) return status;
+    header_end = ptr + header_span;
     memset( ptr + header_size, 0, header_end - (ptr + header_size) );
-    if ((char *)(nt + 1) > header_end) return status;
-    sec = IMAGE_FIRST_SECTION( nt );
-    if ((char *)(sec + nt->FileHeader.NumberOfSections) > header_end) return status;
-    if ((char *)(sec + nt->FileHeader.NumberOfSections) > ptr + image_info->header_map_size)
+    dos = (IMAGE_DOS_HEADER *)ptr;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return status;
+    nt_offset = dos->e_lfanew;
+    if (nt_offset > header_span || sizeof(*nt) > header_span - nt_offset)
+        return status;
+    nt = (IMAGE_NT_HEADERS *)(ptr + nt_offset);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return status;
+    section_offset = nt_offset + offsetof( IMAGE_NT_HEADERS, OptionalHeader );
+    if (nt->FileHeader.SizeOfOptionalHeader > header_span - section_offset)
+        return status;
+    section_offset += nt->FileHeader.SizeOfOptionalHeader;
+    if (nt->FileHeader.NumberOfSections > (header_span - section_offset) / sizeof(*sec))
+        return status;
+    section_end = section_offset + nt->FileHeader.NumberOfSections * sizeof(*sec);
+    sec = (IMAGE_SECTION_HEADER *)(ptr + section_offset);
+    if (section_end > image_info->header_map_size)
     {
         /* copy section data since it will get overwritten by a section mapping */
         if (!(sections = malloc( sizeof(*sections) * nt->FileHeader.NumberOfSections )))
@@ -7042,6 +7084,11 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         sec = sections;
     }
     imports = get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_IMPORT );
+
+#ifdef __aarch64__
+    source_machine = nt->FileHeader.Machine;
+    if (source_machine != image_info->machine) return status;
+#endif
 
     /* check for non page-aligned binary */
 
@@ -7063,6 +7110,13 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         }
 
         /* set the image protections */
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (!(view->protect & VPROT_SHADOW_TRANSLATED) &&
+            source_machine == IMAGE_FILE_MACHINE_AMD64)
+            view->protect |= VPROT_AMD64_IDENTITY;
+        else
+            view->protect &= ~VPROT_AMD64_IDENTITY;
+#endif
         if (!set_vprot( view, ptr, total_size,
                         VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY | VPROT_EXEC ))
         {
@@ -7242,6 +7296,12 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             effective_import_thunk_size = sizeof(IMAGE_THUNK_DATA64);
         }
     }
+    if (source_machine == IMAGE_FILE_MACHINE_AMD64 &&
+        !!image_info->is_hybrid != arm64ec_mapping.present)
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
     if (machine && machine != (hybrid_metadata_processed ? mapped_machine : nt->FileHeader.Machine))
     {
         status = STATUS_NOT_SUPPORTED;
@@ -7296,6 +7356,14 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     }
 
     /* set the image protections */
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (!(view->protect & VPROT_SHADOW_TRANSLATED) &&
+        mapped_machine == IMAGE_FILE_MACHINE_AMD64 && !arm64ec_mapping.has_native_code)
+        view->protect |= VPROT_AMD64_IDENTITY;
+    else
+        view->protect &= ~VPROT_AMD64_IDENTITY;
+#endif
 
     if (!set_vprot( view, ptr, ROUND_SIZE( 0, header_size, align_mask ),
                     VPROT_COMMITTED | VPROT_READ ))
@@ -7421,15 +7489,6 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
     ULONG_PTR start, end;
     BOOL top_down = (image_info->image_charact & IMAGE_FILE_DLL) &&
                     (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated);
-
-#if defined(__APPLE__) && defined(__aarch64__)
-    /* The server has already classified hybrid images.  Only a pure AMD64
-     * identity mapping is entirely fetched by the CPU provider.  ARM64EC/X
-     * contain native ARM64 ranges; shadow-backed images use separate ownership. */
-    if (!address_bias && !is_shadow_translated_vprot( translated_vprot ) &&
-        image_info->machine == IMAGE_FILE_MACHINE_AMD64 && !image_info->is_hybrid)
-        vprot |= VPROT_AMD64_IDENTITY;
-#endif
 
     if (address_bias)
     {

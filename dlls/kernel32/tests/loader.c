@@ -953,7 +953,8 @@ static void init_hybrid_image32( IMAGE_NT_HEADERS32 *nt, IMAGE_SECTION_HEADER *i
 static HANDLE create_hybrid_image_section( const IMAGE_NT_HEADERS *nt,
                                            const IMAGE_SECTION_HEADER *image_section,
                                            const BYTE *data, char filename[MAX_PATH],
-                                           NTSTATUS *create_status, BOOL truncate_tail )
+                                           NTSTATUS *create_status, BOOL truncate_tail,
+                                           HANDLE *writer_ret )
 {
     const DWORD expected_size = HYBRID_FILE_OFFSET + HYBRID_SECTION_SIZE;
     LARGE_INTEGER end;
@@ -962,13 +963,16 @@ static HANDLE create_hybrid_image_section( const IMAGE_NT_HEADERS *nt,
 
     filename[0] = 0;
     *create_status = STATUS_UNSUCCESSFUL;
+    if (writer_ret) *writer_ret = INVALID_HANDLE_VALUE;
     file_size = create_test_dll_sections( &dos_header, nt, image_section, data, filename );
     ok( file_size == expected_size, "test image size %#lx, expected %#lx\n",
         file_size, expected_size );
     if (file_size != expected_size) goto failed;
 
-    file = CreateFileA( filename, GENERIC_READ | (truncate_tail ? GENERIC_WRITE : 0),
-                        FILE_SHARE_READ | FILE_SHARE_DELETE,
+    file = CreateFileA( filename,
+                        GENERIC_READ | ((truncate_tail || writer_ret) ? GENERIC_WRITE : 0),
+                        FILE_SHARE_READ | FILE_SHARE_DELETE |
+                        (writer_ret ? FILE_SHARE_WRITE : 0),
                         NULL, OPEN_EXISTING, 0, 0 );
     ok( file != INVALID_HANDLE_VALUE, "CreateFileA(%s) failed, error %lu\n",
         wine_dbgstr_a(filename), GetLastError() );
@@ -988,8 +992,13 @@ static HANDLE create_hybrid_image_section( const IMAGE_NT_HEADERS *nt,
     *create_status = pNtCreateSection( &mapping,
                                        STANDARD_RIGHTS_REQUIRED | SECTION_MAP_READ | SECTION_QUERY,
                                        NULL, NULL, PAGE_READONLY, SEC_IMAGE, file );
+    if (*create_status == STATUS_SUCCESS)
+    {
+        if (writer_ret) *writer_ret = file;
+        else CloseHandle( file );
+        return mapping;
+    }
     CloseHandle( file );
-    if (*create_status == STATUS_SUCCESS) return mapping;
 
 failed:
     if (mapping) CloseHandle( mapping );
@@ -1012,6 +1021,21 @@ static void close_hybrid_image_section( HANDLE mapping, char filename[MAX_PATH] 
     ret = DeleteFileA( filename );
     ok( ret, "DeleteFileA(%s) failed, error %lu\n", wine_dbgstr_a(filename), GetLastError() );
     filename[0] = 0;
+}
+
+static BOOL rewrite_hybrid_nt_header( HANDLE file, const IMAGE_NT_HEADERS *nt )
+{
+    LARGE_INTEGER offset;
+    DWORD written = 0;
+    BOOL ret;
+
+    offset.QuadPart = dos_header.e_lfanew;
+    ret = SetFilePointerEx( file, offset, NULL, FILE_BEGIN ) &&
+          WriteFile( file, nt, sizeof(*nt), &written, NULL ) && written == sizeof(*nt) &&
+          FlushFileBuffers( file );
+    ok( ret, "failed to rewrite hybrid image header, error %lu, written %lu\n",
+        GetLastError(), written );
+    return ret;
 }
 
 static NTSTATUS map_hybrid_image_section( HANDLE mapping, WORD machine, void **base )
@@ -1057,7 +1081,7 @@ static BOOL probe_hybrid_image_mapping(void)
     if (!data) return FALSE;
     init_hybrid_image( &nt, &image_section, data, IMAGE_FILE_MACHINE_ARM64 );
     mapping = create_hybrid_image_section( &nt, &image_section, data, filename,
-                                           &create_status, FALSE );
+                                           &create_status, FALSE, NULL );
     ok( create_status == STATUS_SUCCESS, "ARM64 control NtCreateSection returned %#lx\n",
         create_status );
     if (!mapping)
@@ -1233,7 +1257,7 @@ static void test_pe32_chpe_classification(void)
         winetest_push_context( "%s", tests[i].name );
         build_pe32_chpe_image( tests[i].test, &nt, &image_section, data );
         mapping = create_hybrid_image_section( (const IMAGE_NT_HEADERS *)&nt, &image_section,
-                                               data, filename, &create_status, FALSE );
+                                               data, filename, &create_status, FALSE, NULL );
         ok( create_status == tests[i].status, "NtCreateSection returned %#lx, expected %#lx\n",
             create_status, tests[i].status );
         close_hybrid_image_section( mapping, filename );
@@ -1627,6 +1651,67 @@ static void build_arm64x_image( enum hybrid_arm64x_case test, IMAGE_NT_HEADERS *
     }
 }
 
+static void test_stale_hybrid_image_classification(void)
+{
+    static const char * const names[] =
+    {
+        "pure AMD64 section rewritten as hybrid",
+        "hybrid section rewritten as pure AMD64",
+    };
+    IMAGE_DATA_DIRECTORY hybrid_dir, *dir;
+    IMAGE_NT_HEADERS nt;
+    IMAGE_SECTION_HEADER image_section;
+    char filename[MAX_PATH] = {0};
+    BYTE *data;
+    HANDLE mapping, writer;
+    NTSTATUS create_status, status;
+    void *base;
+    unsigned int i;
+
+    data = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, HYBRID_SECTION_SIZE );
+    ok( !!data, "failed to allocate stale-classification image data\n" );
+    if (!data) return;
+
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+    {
+        winetest_push_context( "%s", names[i] );
+        build_chpe_image( HYBRID_CHPE_CONFIG_EXACT, &nt, &image_section, data );
+        dir = &nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+        hybrid_dir = *dir;
+        if (!i) memset( dir, 0, sizeof(*dir) );
+
+        mapping = create_hybrid_image_section( &nt, &image_section, data, filename,
+                                               &create_status, FALSE, &writer );
+        ok( create_status == STATUS_SUCCESS, "NtCreateSection returned %#lx\n", create_status );
+        if (!mapping)
+        {
+            winetest_pop_context();
+            continue;
+        }
+
+        status = map_hybrid_image_section( mapping, IMAGE_FILE_MACHINE_AMD64, &base );
+        ok( NT_SUCCESS(status), "control mapping returned %#lx\n", status );
+        unmap_hybrid_image( base );
+
+        if (i) memset( dir, 0, sizeof(*dir) );
+        else *dir = hybrid_dir;
+        if (rewrite_hybrid_nt_header( writer, &nt ))
+        {
+            status = map_hybrid_image_section( mapping, IMAGE_FILE_MACHINE_AMD64, &base );
+            ok( status == STATUS_INVALID_IMAGE_FORMAT,
+                "mapping after rewrite returned %#lx\n", status );
+            ok( !base, "mapping after rewrite returned base %p\n", base );
+            unmap_hybrid_image( base );
+        }
+
+        CloseHandle( writer );
+        close_hybrid_image_section( mapping, filename );
+        winetest_pop_context();
+    }
+
+    HeapFree( GetProcessHeap(), 0, data );
+}
+
 static void test_arm64ec_metadata_bounds(void)
 {
     static const struct
@@ -1756,6 +1841,7 @@ static void test_arm64ec_metadata_bounds(void)
     }
     test_pe32_chpe_classification();
     if (!probe_hybrid_image_mapping()) return;
+    test_stale_hybrid_image_classification();
 
     data = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, HYBRID_SECTION_SIZE );
     ok( !!data, "failed to allocate hybrid image data\n" );
@@ -1767,7 +1853,7 @@ static void test_arm64ec_metadata_bounds(void)
         winetest_push_context( "%s", chpe_tests[i].name );
         build_chpe_image( chpe_tests[i].test, &nt, &image_section, data );
         mapping = create_hybrid_image_section( &nt, &image_section, data, filename,
-                                               &create_status, chpe_tests[i].truncate_tail );
+                                               &create_status, chpe_tests[i].truncate_tail, NULL );
         ok( create_status == chpe_tests[i].create_status,
             "NtCreateSection returned %#lx, expected %#lx\n",
             create_status, chpe_tests[i].create_status );
@@ -1790,7 +1876,7 @@ static void test_arm64ec_metadata_bounds(void)
         winetest_push_context( "%s", arm64x_tests[i].name );
         build_arm64x_image( arm64x_tests[i].test, &nt, &image_section, data );
         mapping = create_hybrid_image_section( &nt, &image_section, data, filename,
-                                               &create_status, FALSE );
+                                               &create_status, FALSE, NULL );
         ok( create_status == STATUS_SUCCESS, "NtCreateSection returned %#lx\n", create_status );
         if (mapping)
         {
