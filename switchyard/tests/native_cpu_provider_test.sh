@@ -263,7 +263,9 @@ def write_pe(relative, machine, arm64ec=False):
     path = os.path.join(root, relative)
     with open(path, "xb") as stream:
         stream.write(value)
-    os.chmod(path, 0o755)
+    # Wine installs PE modules as data (0644); only the native Unix provider
+    # library must carry host execute bits.
+    os.chmod(path, 0o644)
 
 
 write_pe(xtajit, 0xAA64)
@@ -450,6 +452,12 @@ PY
 
 switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
 switchyard_validate_wow64_unixlib_policy_manifest "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
+
+/bin/chmod 0644 "$RUNTIME/$SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY"
+expect_failure "non-executable provider Unix library" \
+  switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
+/bin/chmod 0755 "$RUNTIME/$SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY"
+switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
 
 /usr/bin/plutil -remove cpuProvider.kuserSharedDataModel "$MANIFEST"
 expect_failure "missing CPU-provider KUSER model" \

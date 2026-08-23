@@ -453,15 +453,15 @@ for component, (guest, unix_relative, pe_relative) in zip(components, expected_c
         or component.get("peLibrary") != pe_relative
     ):
         fail("CPU-provider component order or path is not canonical")
-    for path_key, digest_key in (
-        ("unixLibrary", "unixLibrarySha256"),
-        ("peLibrary", "peLibrarySha256"),
+    for path_key, digest_key, executable in (
+        ("unixLibrary", "unixLibrarySha256", True),
+        ("peLibrary", "peLibrarySha256", False),
     ):
         relative = component[path_key]
         expected_digest = component.get(digest_key)
         if type(expected_digest) is not str or SHA256.fullmatch(expected_digest) is None:
             fail("CPU-provider component digest is malformed")
-        record = digest_regular(relative, executable=True)
+        record = digest_regular(relative, executable=executable)
         if record["digest"] != expected_digest:
             fail("CPU-provider component digest mismatch: " + relative)
         binary_records[relative] = record
