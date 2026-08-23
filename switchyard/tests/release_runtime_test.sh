@@ -274,6 +274,70 @@ if call_offsets(release, "write_runtime_content_tree_digest"):
 PY
 }
 
+assert_native_release_stop_is_idempotent() {
+  local stop_runtime="$TEST_ROOT/stop-runtime"
+  local stop_prefix="$TEST_ROOT/stop-prefix"
+  local stop_log="$TEST_ROOT/stop.log"
+  local status
+
+  /bin/mkdir -p "$stop_runtime/bin" "$stop_prefix"
+  /usr/bin/sed 's/^+//' >"$stop_runtime/bin/wineserver" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+/usr/bin/printf '%s WINEPREFIX=%s\n' "${1:-}" "${WINEPREFIX:-}" \
+  >>"$SWITCHYARD_TEST_STOP_LOG"
+case "${1:-}" in
+  -k) exit "${SWITCHYARD_TEST_STOP_K_STATUS:-0}" ;;
+  -w) exit "${SWITCHYARD_TEST_STOP_W_STATUS:-0}" ;;
+  *) exit 88 ;;
+esac
+EOF
+  /bin/chmod 0755 "$stop_runtime/bin/wineserver"
+
+  : >"$stop_log"
+  (
+    export SWITCHYARD_TEST_STOP_LOG="$stop_log"
+    export SWITCHYARD_TEST_STOP_K_STATUS=0
+    export SWITCHYARD_TEST_STOP_W_STATUS=0
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    switchyard_stop_native_release_wineserver "$stop_runtime" "$stop_prefix"
+  ) || fail "native release stop rejected a normal stop/wait"
+  /usr/bin/grep -Fqx -- "-k WINEPREFIX=$stop_prefix" "$stop_log" &&
+    /usr/bin/grep -Fqx -- "-w WINEPREFIX=$stop_prefix" "$stop_log" ||
+    fail "native release stop did not use the exact prefix for normal stop/wait"
+
+  : >"$stop_log"
+  (
+    export SWITCHYARD_TEST_STOP_LOG="$stop_log"
+    export SWITCHYARD_TEST_STOP_K_STATUS=1
+    export SWITCHYARD_TEST_STOP_W_STATUS=0
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    switchyard_stop_native_release_wineserver "$stop_runtime" "$stop_prefix"
+  ) || fail "native release stop rejected an already-stopped exact prefix"
+  [ "$(/usr/bin/awk 'END { print NR }' "$stop_log")" -eq 2 ] &&
+    /usr/bin/awk 'NR == 1 { exit ($1 == "-k" ? 0 : 1) }
+                 NR == 2 { exit ($1 == "-w" ? 0 : 1) }' "$stop_log" ||
+    fail "native release already-stopped path did not fall through to wait"
+
+  : >"$stop_log"
+  set +e
+  (
+    export SWITCHYARD_TEST_STOP_LOG="$stop_log"
+    export SWITCHYARD_TEST_STOP_K_STATUS=1
+    export SWITCHYARD_TEST_STOP_W_STATUS=1
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    switchyard_stop_native_release_wineserver "$stop_runtime" "$stop_prefix"
+  )
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] ||
+    fail "native release stop accepted a failed kill and failed wait"
+}
+
 run_case() {
   local label="$1"
   local failure_mode="$2"
@@ -426,6 +490,7 @@ run_case() {
 /usr/bin/grep -F '/usr/bin/codesign --force --sign "$IDENTITY" --options runtime --timestamp' \
   "$RELEASE_SCRIPT" >/dev/null || fail "stable Developer-ID/Hardened signing changed"
 assert_native_release_source_contract || fail "native release source ordering contract changed"
+assert_native_release_stop_is_idempotent
 
 run_case success none 0
 success_output="$TEST_ROOT/success-output"

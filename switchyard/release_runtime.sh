@@ -367,10 +367,17 @@ switchyard_stop_native_release_wineserver() {
   )
 
   [ -x "$wineserver" ] && [ ! -L "$wineserver" ] || return 1
-  "${clean_environment[@]}" WINEPREFIX="$prepared_prefix" \
-    "$wineserver" -k >/dev/null 2>&1 &&
+  if "${clean_environment[@]}" WINEPREFIX="$prepared_prefix" \
+      "$wineserver" -k >/dev/null 2>&1; then
     "${clean_environment[@]}" WINEPREFIX="$prepared_prefix" \
       "$wineserver" -w >/dev/null 2>&1
+  else
+    # The strict process harness owns the first stop/wait pass.  When it has
+    # already drained this exact prefix, wineserver -k reports failure because
+    # no server remains, but the idempotent wait still succeeds.
+    "${clean_environment[@]}" WINEPREFIX="$prepared_prefix" \
+      "$wineserver" -w >/dev/null 2>&1
+  fi
 }
 
 switchyard_publish_native_outer_digest() {
