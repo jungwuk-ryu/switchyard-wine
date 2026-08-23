@@ -940,7 +940,24 @@ PARM64_RUNTIME_FUNCTION WINAPI RtlLookupFunctionEntry( ULONG_PTR pc, ULONG_PTR *
     ULONG size;
 
     if ((func = (ARM64_RUNTIME_FUNCTION *)RtlLookupFunctionTable( pc, base, &size )))
+    {
+#ifdef __arm64ec__
+        ULONG count = size / sizeof(*func), low = 0, high = count;
+
+        /* Exclude the sorted tombstone prefix without changing RtlLookupFunctionTable. */
+        while (low < high)
+        {
+            ULONG pos = low + (high - low) / 2;
+
+            if (!func[pos].BeginAddress) low = pos + 1;
+            else high = pos;
+        }
+        if (low == count) return NULL;
+        func += low;
+        size = (count - low) * sizeof(*func);
+#endif
         return find_function_info_arm64( pc, *base, func, size / sizeof(*func));
+    }
 
     if ((func = (ARM64_RUNTIME_FUNCTION *)lookup_dynamic_function_table( pc, &dynbase, &size )))
     {

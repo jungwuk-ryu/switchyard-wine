@@ -832,6 +832,10 @@ enum hybrid_chpe_case
     HYBRID_CHPE_REDIRECTION_CROSSING,
     HYBRID_CHPE_REDIRECTION_COUNT_OVERFLOW,
     HYBRID_CHPE_POINTER_SLOT_CROSSING,
+    HYBRID_CHPE_EXTRA_RFE_LEADING_ZERO,
+    HYBRID_CHPE_EXTRA_RFE_ALL_ZERO,
+    HYBRID_CHPE_EXTRA_RFE_DUPLICATE_NONZERO,
+    HYBRID_CHPE_EXTRA_RFE_ZERO_AFTER_NONZERO,
     HYBRID_CHPE_VALID_BOUNDARY,
 };
 
@@ -1118,6 +1122,8 @@ static void build_chpe_image( enum hybrid_chpe_case test, IMAGE_NT_HEADERS *nt,
     IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
     IMAGE_ARM64EC_METADATA *metadata;
     IMAGE_CHPE_RANGE_ENTRY range = {0};
+    ARM64_RUNTIME_FUNCTION functions[3] = {0};
+    DWORD rfe_rva = array_rva + sizeof(range);
     DWORD boundary_rva, old_size = sizeof(DWORD);
 
     init_hybrid_image( nt, image_section, data, IMAGE_FILE_MACHINE_AMD64 );
@@ -1174,6 +1180,47 @@ static void build_chpe_image( enum hybrid_chpe_case test, IMAGE_NT_HEADERS *nt,
         break;
     case HYBRID_CHPE_POINTER_SLOT_CROSSING:
         metadata->__os_arm64x_helper3 = HYBRID_IMAGE_SIZE - 1;
+        break;
+    case HYBRID_CHPE_EXTRA_RFE_LEADING_ZERO:
+        metadata->CodeMap = array_rva;
+        metadata->CodeMapCount = 1;
+        metadata->ExtraRFETable = rfe_rva;
+        metadata->ExtraRFETableSize = sizeof(functions);
+        range.StartOffset = HYBRID_SECTION_RVA | 1;
+        range.Length = 4;
+        functions[0].UnwindData = HYBRID_IMAGE_SIZE + sizeof(DWORD);
+        functions[1].UnwindData = HYBRID_IMAGE_SIZE + 2 * sizeof(DWORD);
+        functions[2].Flag = 1;
+        functions[2].FunctionLength = 1;
+        functions[2].BeginAddress = HYBRID_SECTION_RVA;
+        memcpy( hybrid_section_ptr( data, array_rva ), &range, sizeof(range) );
+        memcpy( hybrid_section_ptr( data, rfe_rva ), functions, sizeof(functions) );
+        break;
+    case HYBRID_CHPE_EXTRA_RFE_ALL_ZERO:
+        metadata->ExtraRFETable = rfe_rva;
+        metadata->ExtraRFETableSize = 2 * sizeof(functions[0]);
+        functions[0].UnwindData = HYBRID_IMAGE_SIZE + sizeof(DWORD);
+        functions[1].UnwindData = HYBRID_IMAGE_SIZE + 2 * sizeof(DWORD);
+        memcpy( hybrid_section_ptr( data, rfe_rva ), functions,
+                metadata->ExtraRFETableSize );
+        break;
+    case HYBRID_CHPE_EXTRA_RFE_DUPLICATE_NONZERO:
+        metadata->ExtraRFETable = rfe_rva;
+        metadata->ExtraRFETableSize = 2 * sizeof(functions[0]);
+        functions[0].BeginAddress = functions[1].BeginAddress = HYBRID_SECTION_RVA;
+        functions[0].Flag = functions[1].Flag = 1;
+        functions[0].FunctionLength = functions[1].FunctionLength = 1;
+        memcpy( hybrid_section_ptr( data, rfe_rva ), functions,
+                metadata->ExtraRFETableSize );
+        break;
+    case HYBRID_CHPE_EXTRA_RFE_ZERO_AFTER_NONZERO:
+        metadata->ExtraRFETable = rfe_rva;
+        metadata->ExtraRFETableSize = 2 * sizeof(functions[0]);
+        functions[0].BeginAddress = HYBRID_SECTION_RVA;
+        functions[0].Flag = functions[1].Flag = 1;
+        functions[0].FunctionLength = functions[1].FunctionLength = 1;
+        memcpy( hybrid_section_ptr( data, rfe_rva ), functions,
+                metadata->ExtraRFETableSize );
         break;
     case HYBRID_CHPE_VALID_BOUNDARY:
         boundary_rva = HYBRID_IMAGE_SIZE - sizeof(IMAGE_CHPE_RANGE_ENTRY);
@@ -1746,6 +1793,14 @@ static void test_arm64ec_metadata_bounds(void)
         { "CHPE redirection count overflow", HYBRID_CHPE_REDIRECTION_COUNT_OVERFLOW,
           STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
         { "CHPE pointer slot crossing image", HYBRID_CHPE_POINTER_SLOT_CROSSING,
+          STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "CHPE ExtraRFE leading zero entries", HYBRID_CHPE_EXTRA_RFE_LEADING_ZERO,
+          STATUS_SUCCESS, STATUS_SUCCESS, FALSE },
+        { "CHPE ExtraRFE all zero entries", HYBRID_CHPE_EXTRA_RFE_ALL_ZERO,
+          STATUS_SUCCESS, STATUS_SUCCESS, FALSE },
+        { "CHPE ExtraRFE duplicate nonzero entries", HYBRID_CHPE_EXTRA_RFE_DUPLICATE_NONZERO,
+          STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
+        { "CHPE ExtraRFE zero after nonzero entry", HYBRID_CHPE_EXTRA_RFE_ZERO_AFTER_NONZERO,
           STATUS_SUCCESS, STATUS_INVALID_IMAGE_FORMAT, FALSE },
         { "CHPE arrays ending at image boundary", HYBRID_CHPE_VALID_BOUNDARY,
           STATUS_SUCCESS, STATUS_SUCCESS, FALSE },
@@ -7041,6 +7096,11 @@ START_TEST(loader)
     {
         test_dll_phase = atoi(argv[4]);
         child_process(argv[2], atol(argv[3]));
+        return;
+    }
+    if (argc > 2 && !strcmp( argv[2], "hybrid-metadata" ))
+    {
+        test_arm64ec_metadata_bounds();
         return;
     }
 

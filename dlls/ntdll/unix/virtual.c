@@ -5924,8 +5924,16 @@ static NTSTATUS validate_arm64ec_metadata( const char *base,
                            metadata->ExtraRFETable + i * sizeof(function),
                            &function, sizeof(function) );
         if (function.BeginAddress >= total_size ||
-            (i && previous_function.BeginAddress >= function.BeginAddress))
+            (i && (previous_function.BeginAddress > function.BeginAddress ||
+                   (function.BeginAddress &&
+                    previous_function.BeginAddress == function.BeginAddress))))
             return STATUS_INVALID_IMAGE_FORMAT;
+        if (!function.BeginAddress)
+        {
+            /* Zero-address entries are sorted tombstones, not unwind records. */
+            previous_function = function;
+            continue;
+        }
         if (!function.Flag)
         {
             if (validate_arm64_unwind_info( base, transaction, total_size,
@@ -6136,7 +6144,7 @@ static NTSTATUS update_arm64ec_ranges( struct file_view *view, IMAGE_NT_HEADERS 
         read_arm64x_image( base, transaction,
                            metadata.ExtraRFETable + i * sizeof(function),
                            &function, sizeof(function) );
-        if (!function.Flag &&
+        if (function.BeginAddress && !function.Flag &&
             (status = privatize_arm64ec_unwind_info(
                 view, transaction, total_size, function.UnwindData, ranges, range_count,
                 private_pages, private_page_count, &snapshot )))
