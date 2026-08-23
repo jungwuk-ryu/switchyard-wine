@@ -756,6 +756,7 @@ struct module_write_protect
     SIZE_T  page_count;
 };
 
+#ifdef __arm64ec__
 static NTSTATUS save_module_image_protections( HMODULE module, SIZE_T size,
                                                ULONG **protect_ret, SIZE_T *count_ret )
 {
@@ -877,6 +878,7 @@ static NTSTATUS protect_module_image_for_write( HMODULE module, SIZE_T size,
 
     return STATUS_SUCCESS;
 }
+#endif
 
 static NTSTATUS protect_module_range_for_write( HMODULE module, SIZE_T image_size,
                                                 void **base, SIZE_T *size,
@@ -920,6 +922,7 @@ static NTSTATUS restore_module_write_protect( HMODULE module, struct module_writ
     SIZE_T size;
     ULONG old_prot;
 
+#ifdef __arm64ec__
     if (protect->page_protect)
     {
         status = restore_module_image_protections( module, protect->page_protect,
@@ -928,6 +931,7 @@ static NTSTATUS restore_module_write_protect( HMODULE module, struct module_writ
         memset( protect, 0, sizeof(*protect) );
         return status;
     }
+#endif
 
     if (!protect->size) return STATUS_SUCCESS;
 
@@ -3095,6 +3099,7 @@ static NTSTATUS validate_relocation_directory( void *module,
         remaining -= rel->SizeOfBlock;
         rel = (const IMAGE_BASE_RELOCATION *)((const char *)rel + rel->SizeOfBlock);
     }
+    if (remaining && remaining < sizeof(*rel)) return STATUS_INVALID_IMAGE_FORMAT;
     return STATUS_SUCCESS;
 }
 
@@ -3204,25 +3209,23 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
     if ((status = validate_relocation_sections( nt, len ))) return status;
     if ((status = validate_relocation_directory( module, relocs, len ))) return status;
 
-    if (!(protect_old = RtlAllocateHeap( GetProcessHeap(), 0,
-                                         nt->FileHeader.NumberOfSections * sizeof(*protect_old ))))
-        return STATUS_NO_MEMORY;
-
-    status = protect_relocation_sections( module, nt, protect_old, &protect_count );
-    if (status)
+#ifdef __arm64ec__
+    if (nt->OptionalHeader.SectionAlignment == page_size)
     {
-        NTSTATUS restore_status;
-
-        restore_status = restore_relocation_sections( module, nt, protect_old, protect_count );
-        protect_count = 0;
-        if (restore_status)
-        {
-            status = restore_status;
-            goto done;
-        }
         if ((status = protect_module_image_for_write( module, len, &image_protect )))
-            goto done;
+            return status;
         image_write_protected = TRUE;
+    }
+    else
+#endif
+    {
+        if (!nt->FileHeader.NumberOfSections) return STATUS_INVALID_IMAGE_FORMAT;
+        if (!(protect_old = RtlAllocateHeap( GetProcessHeap(), 0,
+                                             nt->FileHeader.NumberOfSections * sizeof(*protect_old ))))
+            return STATUS_NO_MEMORY;
+
+        status = protect_relocation_sections( module, nt, protect_old, &protect_count );
+        if (status) goto done;
     }
 
     TRACE( "relocating from %p-%p to client %p-%p using native backing %p-%p\n",
@@ -3235,6 +3238,7 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
 
     while (remaining >= sizeof(*rel) && rel->SizeOfBlock)
     {
+        IMAGE_BASE_RELOCATION *next;
         ULONG block_size = rel->SizeOfBlock;
 
         if (block_size < sizeof(*rel) || block_size > remaining)
@@ -3242,21 +3246,16 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
             status = STATUS_INVALID_IMAGE_FORMAT;
             goto done;
         }
-        if (rel->VirtualAddress >= len)
-        {
-            WARN( "invalid address %p in relocation %p\n", get_rva( module, rel->VirtualAddress ), rel );
-            status = STATUS_ACCESS_VIOLATION;
-            goto done;
-        }
-        rel = LdrProcessRelocationBlock( get_rva( module, rel->VirtualAddress ),
-                                         (rel->SizeOfBlock - sizeof(*rel)) / sizeof(USHORT),
-                                         (USHORT *)(rel + 1), delta );
-        if (!rel)
+        next = LdrProcessRelocationBlock( get_rva( module, rel->VirtualAddress ),
+                                          (block_size - sizeof(*rel)) / sizeof(USHORT),
+                                          (USHORT *)(rel + 1), delta );
+        if (!next || (char *)next != (char *)rel + block_size)
         {
             status = STATUS_INVALID_IMAGE_FORMAT;
             goto done;
         }
         remaining -= block_size;
+        rel = next;
     }
 
 done:
@@ -3295,6 +3294,9 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     SIZE_T map_size;
 
     if (!(nt = get_image_headers( *module ))) return STATUS_INVALID_IMAGE_FORMAT;
+    if (!nt->OptionalHeader.SizeOfImage ||
+        nt->OptionalHeader.SizeOfImage > ~(SIZE_T)0 - page_size + 1)
+        return STATUS_INVALID_IMAGE_FORMAT;
 
     map_size = (nt->OptionalHeader.SizeOfImage + page_size - 1) & ~(page_size - 1);
     if ((status = perform_relocations( *module, client_base, nt, map_size ))) return status;

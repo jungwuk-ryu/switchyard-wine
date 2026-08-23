@@ -1771,19 +1771,34 @@ static BOOL is_darwin_host(void)
     return sysname && !strcmp( sysname, "Darwin" );
 }
 
+enum
+{
+    SUBPAGE_TEXT_RVA = 0x1000,
+    SUBPAGE_RDATA_RVA = 0x4000,
+    SUBPAGE_CONFIG_OFFSET = 0x100,
+    SUBPAGE_METADATA_OFFSET = 0x300,
+    SUBPAGE_RELOC_OFFSET = 0x700,
+    SUBPAGE_RELOC_TARGET_OFFSET = 0x900,
+    SUBPAGE_IMAGE_SIZE = 0x6000,
+};
+
 static void build_subpage_native_chpe_image( IMAGE_NT_HEADERS *nt,
                                              IMAGE_SECTION_HEADER sections[2], BYTE *data,
                                              BOOL writable_collision )
 {
-    const DWORD cfg_offset = 0x100, metadata_offset = 0x300, code_map_offset = 0x500;
-    const DWORD text_rva = 0x1000, text_size = 0x2000;
-    const DWORD data_rva = writable_collision ? 0x3000 : 0x4000;
-    const DWORD data_size = 0x6000 - data_rva;
+    const DWORD cfg_offset = SUBPAGE_CONFIG_OFFSET;
+    const DWORD metadata_offset = SUBPAGE_METADATA_OFFSET, code_map_offset = 0x500;
+    const DWORD text_rva = SUBPAGE_TEXT_RVA, text_size = 0x2000;
+    const DWORD data_rva = writable_collision ? 0x3000 : SUBPAGE_RDATA_RVA;
+    const DWORD data_size = SUBPAGE_IMAGE_SIZE - data_rva;
     const DWORD cfg_field_end = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) +
                                 sizeof(((IMAGE_LOAD_CONFIG_DIRECTORY *)0)->CHPEMetadataPointer);
     IMAGE_LOAD_CONFIG_DIRECTORY *cfg = (void *)(data + cfg_offset);
     IMAGE_ARM64EC_METADATA *metadata = (void *)(data + metadata_offset);
     IMAGE_CHPE_RANGE_ENTRY *code = (void *)(data + code_map_offset);
+    IMAGE_BASE_RELOCATION *reloc = (void *)(data + SUBPAGE_RELOC_OFFSET);
+    ULONGLONG *reloc_target = (void *)(data + SUBPAGE_RELOC_TARGET_OFFSET);
+    USHORT *reloc_entries = (void *)(reloc + 1);
     static const DWORD native_code[] = {0x52800540, 0xd65f03c0}; /* mov w0, #42; ret */
     IMAGE_DATA_DIRECTORY *dir;
 
@@ -1802,7 +1817,7 @@ static void build_subpage_native_chpe_image( IMAGE_NT_HEADERS *nt,
     nt->OptionalHeader.SizeOfCode = text_size;
     nt->OptionalHeader.SizeOfInitializedData = data_size;
     nt->OptionalHeader.SizeOfHeaders = 0x1000;
-    nt->OptionalHeader.SizeOfImage = 0x6000;
+    nt->OptionalHeader.SizeOfImage = SUBPAGE_IMAGE_SIZE;
     nt->OptionalHeader.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE |
                                             IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
     nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
@@ -1834,6 +1849,17 @@ static void build_subpage_native_chpe_image( IMAGE_NT_HEADERS *nt,
     metadata->CodeMapCount = 1;
     code->StartOffset = text_rva | 1;
     code->Length = text_size;
+
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    dir->VirtualAddress = data_rva + SUBPAGE_RELOC_OFFSET;
+    dir->Size = sizeof(*reloc) + 2 * sizeof(*reloc_entries);
+    reloc->VirtualAddress = data_rva;
+    reloc->SizeOfBlock = dir->Size;
+    reloc_entries[0] = (IMAGE_REL_BASED_DIR64 << 12) |
+                       (cfg_offset + offsetof( IMAGE_LOAD_CONFIG_DIRECTORY,
+                                               CHPEMetadataPointer ));
+    reloc_entries[1] = (IMAGE_REL_BASED_DIR64 << 12) | SUBPAGE_RELOC_TARGET_OFFSET;
+    *reloc_target = nt->OptionalHeader.ImageBase + text_rva;
 }
 
 static void test_subpage_native_chpe_protections(void)
@@ -1901,6 +1927,115 @@ static void test_subpage_native_chpe_protections(void)
         DeleteFileA( filename );
         winetest_pop_context();
     }
+}
+
+static void test_subpage_native_chpe_relocations(void)
+{
+    static const struct
+    {
+        const char *name;
+        enum { RELOC_BAD_BLOCK, RELOC_TARGET_CROSSING, RELOC_UNKNOWN_TYPE,
+               RELOC_VALID } test;
+        NTSTATUS status;
+    } tests[] =
+    {
+        { "relocation block smaller than header", RELOC_BAD_BLOCK,
+          STATUS_INVALID_IMAGE_FORMAT },
+        { "relocation target crossing image", RELOC_TARGET_CROSSING,
+          STATUS_INVALID_IMAGE_FORMAT },
+        { "unknown relocation restores protections", RELOC_UNKNOWN_TYPE,
+          STATUS_INVALID_IMAGE_FORMAT },
+        { "valid relocation after malformed images", RELOC_VALID, STATUS_SUCCESS },
+    };
+    IMAGE_SECTION_HEADER sections[2];
+    IMAGE_BASE_RELOCATION *reloc;
+    IMAGE_NT_HEADERS nt;
+    MEMORY_BASIC_INFORMATION info;
+    UNICODE_STRING name;
+    WCHAR filenameW[MAX_PATH];
+    char filename[MAX_PATH];
+    BYTE data[0x3000];
+    ULONGLONG value, expected;
+    USHORT *entries;
+    HMODULE module;
+    NTSTATUS status;
+    SIZE_T size;
+    void *preferred;
+    unsigned int i;
+
+    preferred = VirtualAlloc( NULL, SUBPAGE_IMAGE_SIZE, MEM_RESERVE, PAGE_NOACCESS );
+    ok( !!preferred, "failed to reserve preferred image base, error %lu\n", GetLastError() );
+    if (!preferred)
+    {
+        skip( "could not force the test image to relocate\n" );
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        winetest_push_context( "%s", tests[i].name );
+        build_subpage_native_chpe_image( &nt, sections, data, FALSE );
+        nt.OptionalHeader.ImageBase = (ULONG_PTR)preferred;
+        ((IMAGE_LOAD_CONFIG_DIRECTORY *)(data + SUBPAGE_CONFIG_OFFSET))->CHPEMetadataPointer =
+            (ULONG_PTR)preferred + SUBPAGE_RDATA_RVA + SUBPAGE_METADATA_OFFSET;
+        *(ULONGLONG *)(data + SUBPAGE_RELOC_TARGET_OFFSET) =
+            (ULONG_PTR)preferred + SUBPAGE_TEXT_RVA;
+        reloc = (void *)(data + SUBPAGE_RELOC_OFFSET);
+        entries = (void *)(reloc + 1);
+        switch (tests[i].test)
+        {
+        case RELOC_BAD_BLOCK:
+            reloc->SizeOfBlock = sizeof(*reloc) - sizeof(USHORT);
+            break;
+        case RELOC_TARGET_CROSSING:
+            reloc->VirtualAddress = SUBPAGE_IMAGE_SIZE - 0x1000;
+            entries[0] = (IMAGE_REL_BASED_DIR64 << 12) | 0xffc;
+            entries[1] = IMAGE_REL_BASED_ABSOLUTE << 12;
+            break;
+        case RELOC_UNKNOWN_TYPE:
+            entries[0] = 0xf000 | 0x100;
+            entries[1] = IMAGE_REL_BASED_ABSOLUTE << 12;
+            break;
+        case RELOC_VALID:
+            break;
+        }
+
+        size = create_test_dll_sections( &dos_header, &nt, sections, data, filename );
+        ok( size == SUBPAGE_IMAGE_SIZE, "test image size %#Ix, expected %#x\n",
+            size, SUBPAGE_IMAGE_SIZE );
+        MultiByteToWideChar( CP_ACP, 0, filename, -1, filenameW, ARRAY_SIZE(filenameW) );
+        pRtlInitUnicodeString( &name, filenameW );
+        module = NULL;
+        status = pLdrLoadDll( NULL, 0, &name, &module );
+        ok( status == tests[i].status, "LdrLoadDll returned %#lx, expected %#lx\n",
+            status, tests[i].status );
+        if (!status)
+        {
+            ok( module != (HMODULE)(ULONG_PTR)nt.OptionalHeader.ImageBase,
+                "module loaded at occupied preferred base %p\n", module );
+            value = *(ULONGLONG *)((BYTE *)module + SUBPAGE_RDATA_RVA +
+                                   SUBPAGE_RELOC_TARGET_OFFSET);
+            expected = (ULONGLONG)(ULONG_PTR)module + SUBPAGE_TEXT_RVA;
+            ok( value == expected, "relocated value %#I64x, expected %#I64x\n",
+                value, expected );
+            size = VirtualQuery( (BYTE *)module + SUBPAGE_RDATA_RVA +
+                                 SUBPAGE_RELOC_TARGET_OFFSET, &info, sizeof(info) );
+            ok( size == sizeof(info), "VirtualQuery returned %#Ix\n", size );
+            ok( info.Protect == PAGE_READONLY,
+                "relocation target protection %#lx, expected PAGE_READONLY\n",
+                info.Protect );
+            size = VirtualQuery( (BYTE *)module + SUBPAGE_TEXT_RVA, &info, sizeof(info) );
+            ok( size == sizeof(info), "VirtualQuery returned %#Ix\n", size );
+            ok( info.Protect == PAGE_EXECUTE_READ,
+                "native code protection %#lx, expected PAGE_EXECUTE_READ\n", info.Protect );
+            pLdrUnloadDll( module );
+        }
+        else ok( !module, "LdrLoadDll returned module %p on failure\n", module );
+        DeleteFileA( filename );
+        winetest_pop_context();
+    }
+
+    if (preferred) VirtualFree( preferred, 0, MEM_RELEASE );
 }
 
 static void test_arm64ec_metadata_bounds(void)
@@ -2042,6 +2177,8 @@ static void test_arm64ec_metadata_bounds(void)
     if (!probe_hybrid_image_mapping()) return;
     test_stale_hybrid_image_classification();
     test_subpage_native_chpe_protections();
+    if (nt_header_template.FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64)
+        test_subpage_native_chpe_relocations();
 
     data = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, HYBRID_SECTION_SIZE );
     ok( !!data, "failed to allocate hybrid image data\n" );
