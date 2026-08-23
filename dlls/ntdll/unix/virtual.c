@@ -149,6 +149,7 @@ struct file_view
 #define VPROT_WOW64_TRANSLATED 0x1000  /* view contains i386 guest memory in the Darwin shadow */
 #define VPROT_AMD64_LOW_TRANSLATED 0x2000 /* fixed-low AMD64 image in the Darwin shadow */
 #define VPROT_AMD64_IDENTITY   0x4000  /* identity-mapped AMD64 image fetched by the CPU provider */
+#define VPROT_WOW64_OWNED_BACKING 0x8000 /* process-lifetime native resource backing */
 #define VPROT_SHADOW_TRANSLATED (VPROT_WOW64_TRANSLATED | VPROT_AMD64_LOW_TRANSLATED)
 #define VPROT_CPU_PROVIDER_OWNED (VPROT_SHADOW_TRANSLATED | VPROT_AMD64_IDENTITY)
 
@@ -1209,6 +1210,186 @@ void *get_builtin_so_handle( void *module )
     return ret;
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+static NTSTATUS wow64_companion_translate( UINT64 guest, UINT64 size, UINT32 access,
+                                           void **host )
+{
+    NTSTATUS status;
+
+    if (!host || guest > UINT32_MAX || size > SIZE_MAX ||
+        size > UINT32_MAX + 1ull - guest || !access ||
+        (access & ~(WINE_WOW64_UNIXLIB_ACCESS_READ | WINE_WOW64_UNIXLIB_ACCESS_WRITE)))
+        return STATUS_INVALID_PARAMETER;
+    *host = NULL;
+    if ((status = ntdll_wow64_guest32_to_host( guest, host ))) return status;
+    if ((access & WINE_WOW64_UNIXLIB_ACCESS_READ) &&
+        (status = ntdll_wow64_probe_user_read( *host, size )))
+        return status;
+    if ((access & WINE_WOW64_UNIXLIB_ACCESS_WRITE) &&
+        (status = ntdll_wow64_probe_user_write( *host, size )))
+        return status;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS wow64_companion_copy_from_guest( UINT64 guest, void *dst, UINT64 size )
+{
+    void *host;
+    NTSTATUS status;
+
+    if (!dst && size) return STATUS_INVALID_PARAMETER;
+    if ((status = wow64_companion_translate( guest, size,
+                                             WINE_WOW64_UNIXLIB_ACCESS_READ, &host )))
+        return status;
+    return ntdll_wow64_copy_from_user( dst, host, size );
+}
+
+static NTSTATUS wow64_companion_copy_to_guest( UINT64 guest, const void *src, UINT64 size )
+{
+    void *host;
+    NTSTATUS status;
+
+    if (!src && size) return STATUS_INVALID_PARAMETER;
+    if ((status = wow64_companion_translate( guest, size,
+                                             WINE_WOW64_UNIXLIB_ACCESS_WRITE, &host )))
+        return status;
+    return ntdll_wow64_atomic_write_user( host, src, size );
+}
+
+static const struct wine_wow64_unixlib_codec_v2 wow64_companion_codec =
+{
+    WINE_WOW64_UNIXLIB_CODEC_V2_VERSION,
+    sizeof(wow64_companion_codec),
+    WINE_WOW64_UNIXLIB_CAP_SEPARATE_GUEST_ADDRESS_SPACE,
+    wow64_companion_translate,
+    wow64_companion_copy_from_guest,
+    wow64_companion_copy_to_guest,
+    NULL,
+    NULL,
+};
+
+static char *get_wow64_companion_path( const unixlib_entry_t *funcs )
+{
+    Dl_info info;
+    size_t length;
+    char *path;
+
+    if (!funcs || !dladdr( funcs, &info ) || !info.dli_fname) return NULL;
+    length = strlen( info.dli_fname );
+    if (length < 3 || length > SIZE_MAX - sizeof("-wow64") ||
+        strcmp( info.dli_fname + length - 3, ".so" ))
+        return NULL;
+    if (!(path = malloc( length + sizeof("-wow64") ))) return NULL;
+    memcpy( path, info.dli_fname, length - 3 );
+    memcpy( path + length - 3, "-wow64.so", sizeof("-wow64.so") );
+    return path;
+}
+
+static NTSTATUS bind_wow64_companion( void *so_handle, const unixlib_entry_t *legacy_funcs,
+                                      unixlib_handle_t *dispatch )
+{
+    static const BYTE expected_abi_sha256[32] =
+        WINE_WOW64_UNIXLIB_COMPANION_V4_ABI_SHA256;
+    const struct wine_wow64_unixlib_companion_v4 *descriptor;
+    const struct wine_unixlib_dispatch_source_v2 *source;
+    const struct wine_unixlib_owned_backing_codec_v2 *owned_codec;
+    struct wine_wow64_unixlib_binding_v4 binding;
+    const unixlib_entry_t *normal_funcs, *companion_funcs;
+    unixlib_entry_t *binding_funcs = NULL;
+    Dl_info descriptor_info, bind_info, source_info, funcs_info;
+    SIZE_T table_size;
+    char *path;
+    void *companion;
+    NTSTATUS status;
+
+    if (!(path = get_wow64_companion_path( legacy_funcs )))
+    {
+        WARN_(module)( "cannot derive WoW64 companion path\n" );
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+    companion = dlopen( path, RTLD_NOW | RTLD_LOCAL );
+    if (!companion)
+        WARN_(module)( "cannot load WoW64 companion %s: %s\n", debugstr_a(path), dlerror() );
+    free( path );
+    if (!companion) return STATUS_INVALID_IMAGE_FORMAT;
+
+    normal_funcs = dlsym( so_handle, "__wine_unix_call_funcs" );
+    companion_funcs = dlsym( companion, "__wine_unix_call_wow64_funcs" );
+    source = dlsym( companion, "__wine_unix_call_wow64_dispatch_v2" );
+    descriptor = dlsym( companion, "__wine_unix_call_wow64_companion_v4" );
+    owned_codec = wow64_owned_backing_get_codec();
+    if (!normal_funcs || !companion_funcs || !source || !descriptor ||
+        descriptor->version != WINE_WOW64_UNIXLIB_COMPANION_V4_VERSION ||
+        descriptor->size != sizeof(*descriptor) || !descriptor->entry_count ||
+        descriptor->entry_count > WINE_UNIXLIB_DISPATCH_MAX_ENTRIES ||
+        descriptor->flags || !descriptor->bind ||
+        memcmp( descriptor->abi_sha256, expected_abi_sha256,
+                sizeof(expected_abi_sha256) ) ||
+        source->entry_count != descriptor->entry_count || source->funcs != companion_funcs ||
+        !dladdr( descriptor, &descriptor_info ) || !dladdr( descriptor->bind, &bind_info ) ||
+        !dladdr( source, &source_info ) || !dladdr( companion_funcs, &funcs_info ) ||
+        descriptor_info.dli_fbase != bind_info.dli_fbase ||
+        descriptor_info.dli_fbase != source_info.dli_fbase ||
+        descriptor_info.dli_fbase != funcs_info.dli_fbase ||
+        validate_wow64_unixlib_function_table( normal_funcs,
+                                                descriptor->entry_count, legacy_funcs ) ||
+        validate_wow64_unixlib_function_table( legacy_funcs,
+                                                descriptor->entry_count, normal_funcs ) ||
+        !owned_codec || owned_codec->version != WINE_UNIXLIB_OWNED_BACKING_CODEC_V2_VERSION ||
+        owned_codec->size != sizeof(*owned_codec) ||
+        owned_codec->capabilities != WINE_UNIXLIB_OWNED_BACKING_CAP_ACQUIRE_RELEASE ||
+        !owned_codec->acquire_backing || !owned_codec->release_backing)
+    {
+        WARN_(module)( "invalid WoW64 companion v4 contract\n" );
+        dlclose( companion );
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    table_size = descriptor->entry_count * sizeof(*binding_funcs);
+    if (!(binding_funcs = malloc( 2 * table_size )))
+    {
+        dlclose( companion );
+        return STATUS_NO_MEMORY;
+    }
+    memcpy( binding_funcs, normal_funcs, table_size );
+    memcpy( binding_funcs + descriptor->entry_count, legacy_funcs, table_size );
+    if (validate_wow64_unixlib_function_table( normal_funcs,
+                                                descriptor->entry_count, legacy_funcs ) ||
+        validate_wow64_unixlib_function_table( legacy_funcs,
+                                                descriptor->entry_count, normal_funcs ) ||
+        memcmp( binding_funcs, normal_funcs, table_size ) ||
+        memcmp( binding_funcs + descriptor->entry_count, legacy_funcs, table_size ))
+    {
+        WARN_(module)( "WoW64 companion source tables changed while binding\n" );
+        free( binding_funcs );
+        dlclose( companion );
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    binding.version = WINE_WOW64_UNIXLIB_BINDING_V4_VERSION;
+    binding.size = sizeof(binding);
+    binding.entry_count = descriptor->entry_count;
+    binding.reserved = 0;
+    binding.normal_funcs = binding_funcs;
+    binding.legacy_wow64_funcs = binding_funcs + descriptor->entry_count;
+    binding.codec = &wow64_companion_codec;
+    binding.owned_backing_codec = owned_codec;
+    if (!(status = register_wow64_unixlib_dispatch_v2( source, companion_funcs, dispatch )))
+    {
+        if ((status = descriptor->bind( &binding )))
+        {
+            NTSTATUS unregister_status = unregister_wow64_unixlib_dispatch( *dispatch );
+
+            *dispatch = 0;
+            if (unregister_status) status = unregister_status;
+        }
+    }
+    if (status) WARN_(module)( "failed to bind WoW64 companion, status %#x\n", status );
+    free( binding_funcs );
+    dlclose( companion ); /* the dispatch registry retains its validated image */
+    return status;
+}
+#endif
+
 
 /***********************************************************************
  *           get_unixlib_funcs
@@ -1225,11 +1406,22 @@ static NTSTATUS get_unixlib_funcs( void *so_handle, BOOL wow, unixlib_handle_t *
     if (wow)
     {
         const struct wine_unixlib_dispatch_source_v2 *source;
+        Dl_info funcs_info, source_info;
         NTSTATUS status;
 
         if (!funcs) return STATUS_ENTRYPOINT_NOT_FOUND;
         source = dlsym( so_handle, "__wine_unix_call_wow64_dispatch_v2" );
-        if (!source) return STATUS_INVALID_IMAGE_FORMAT;
+        /* dlsym() on a Mach-O handle can find a dependency's export.  Such a
+         * descriptor does not describe this library's function table. */
+        if (source && (!dladdr( funcs, &funcs_info ) || !dladdr( source, &source_info ) ||
+                       funcs_info.dli_fbase != source_info.dli_fbase))
+            source = NULL;
+        if (!source)
+        {
+            if ((status = bind_wow64_companion( so_handle, funcs, dispatch ))) return status;
+            *dispatch_registered = TRUE;
+            return STATUS_SUCCESS;
+        }
         if ((status = register_wow64_unixlib_dispatch_v2( source, funcs, dispatch )))
             return status;
         *dispatch_registered = TRUE;
@@ -3735,6 +3927,9 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
     if (!size || (size & page_mask) || ((UINT_PTR)base & page_mask))
         return STATUS_INVALID_PARAMETER;
     if ((status = get_vprot_flags( protect, &vprot, view->protect & SEC_IMAGE ))) return status;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (view->protect & VPROT_WOW64_OWNED_BACKING) return STATUS_ACCESS_DENIED;
+#endif
     if (view->protect & SEC_IMAGE)
     {
         BYTE current = get_host_page_vprot( base );
@@ -7012,6 +7207,73 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
         }
     }
     return (IMAGE_BASE_RELOCATION *)reloc;  /* return address of next block */
+}
+
+
+/***********************************************************************
+ *           virtual_alloc_wow64_owned_backing
+ *
+ * Allocate a private, process-lifetime translated view.  The owning native
+ * resource pool may recycle its contents, but guest memory APIs must never
+ * invalidate the address retained by a native framework.
+ */
+NTSTATUS virtual_alloc_wow64_owned_backing( void **host_address, UINT64 *guest_address,
+                                             SIZE_T *size )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    unsigned int vprot = VPROT_READ | VPROT_WRITE | VPROT_COMMITTED |
+                         VPROT_WOW64_TRANSLATED | VPROT_WOW64_OWNED_BACKING;
+    struct wow64_memory_transaction transaction;
+    struct file_view *view;
+    ULONG_PTR wow_limit, limit_low, limit_high;
+    sigset_t sigset;
+    NTSTATUS status;
+
+    if (!host_address || !guest_address || !size) return STATUS_INVALID_PARAMETER;
+    *host_address = NULL;
+    *guest_address = 0;
+    if (!is_wow64() || !*size || (*size & host_page_mask) ||
+        is_beyond_limit( 0, *size, working_set_limit ))
+        return STATUS_INVALID_PARAMETER;
+    wow_limit = get_wow_user_space_limit();
+    if (!wow_limit) wow_limit = limit_2g;
+    if (wow_limit <= 0x10000) return STATUS_NO_MEMORY;
+    limit_low = WINE_LOW_VA_SHADOW_BASE + 0x10000;
+    limit_high = WINE_LOW_VA_SHADOW_BASE + wow_limit - 1;
+
+    status = wow64_memory_begin_transaction( &transaction, TRUE,
+                                              WINE_WOW64_MEMORY_ALLOCATE,
+                                              NULL, *size, NULL );
+    if (status) return status;
+    if (!transaction.observer_begun || transaction.nested)
+    {
+        transaction.event.status = STATUS_INVALID_DEVICE_STATE;
+        wow64_memory_complete_transaction( &transaction );
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    status = map_view( &view, NULL, *size, 0, vprot, limit_low, limit_high,
+                       granularity_mask );
+    if (!status)
+    {
+        *host_address = view->base;
+        *guest_address = wow64_native_to_guest_addr( view->base );
+        *size = view->size;
+        wow64_memory_capture_transaction( &transaction, status, view->base,
+                                           view->size, view->base );
+        VIRTUAL_DEBUG_DUMP_VIEW( view );
+    }
+    else wow64_memory_capture_transaction( &transaction, status, NULL, 0, NULL );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    wow64_memory_complete_transaction( &transaction );
+    return status;
+#else
+    if (host_address) *host_address = NULL;
+    if (guest_address) *guest_address = 0;
+    (void)size;
+    return STATUS_NOT_SUPPORTED;
+#endif
 }
 
 
@@ -11674,6 +11936,9 @@ void virtual_set_force_exec( BOOL enable )
             /* file mappings are always accessible */
             BYTE commit = is_view_valloc( view ) ? 0 : VPROT_COMMITTED;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (view->protect & VPROT_WOW64_OWNED_BACKING) continue;
+#endif
             mprotect_range( view->base, view->size, commit, 0 );
         }
     }
@@ -11693,8 +11958,13 @@ void virtual_enable_write_exceptions( BOOL enable )
     if (!enable_write_exceptions && enable)  /* change all existing views */
     {
         WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+        {
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (view->protect & VPROT_WOW64_OWNED_BACKING) continue;
+#endif
             if (set_page_vprot_exec_write_protect( view->base, view->size ))
                 mprotect_range( view->base, view->size, 0, 0 );
+        }
     }
     enable_write_exceptions = enable;
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
@@ -11967,7 +12237,11 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             }
             if (view->protect & VPROT_WOW64_TRANSLATED) allocation_base = view->base;
 #endif
-            madvise( base, size, MADV_DONTNEED );
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (view->protect & VPROT_WOW64_OWNED_BACKING) status = STATUS_ACCESS_DENIED;
+            else
+#endif
+                madvise( base, size, MADV_DONTNEED );
         }
     }
     else if (!status)  /* commit the pages */
@@ -12458,6 +12732,10 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
                 capture_size = view->size;
             }
         }
+#endif
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (view->protect & VPROT_WOW64_OWNED_BACKING) status = STATUS_ACCESS_DENIED;
+        else
 #endif
         if (!is_view_valloc( view )) status = STATUS_INVALID_PARAMETER;
         else if (!size && base != view->base) status = STATUS_FREE_VM_NOT_AT_BASE;
@@ -13792,7 +14070,15 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
 #else
     view = find_view( addr, 0 );
 #endif
-    if (!view || is_view_valloc( view )) goto done;
+    if (!view) goto done;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (view->protect & VPROT_WOW64_OWNED_BACKING)
+    {
+        status = STATUS_ACCESS_DENIED;
+        goto done;
+    }
+#endif
+    if (is_view_valloc( view )) goto done;
 
 #if defined(__APPLE__) && defined(__aarch64__)
     if (low_view || (view->protect & VPROT_AMD64_LOW_TRANSLATED))
@@ -14040,6 +14326,7 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
     sigset_t sigset;
 #if defined(__APPLE__) && defined(__aarch64__)
     struct wow64_memory_transaction transaction;
+    struct file_view *view;
     NTSTATUS snapshot_status = STATUS_SUCCESS;
     BOOL candidate;
 #endif
@@ -14066,6 +14353,12 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((flags & WRITE_WATCH_FLAG_RESET) && (view = find_view( base, size )) &&
+        (view->protect & VPROT_WOW64_OWNED_BACKING))
+        status = STATUS_ACCESS_DENIED;
+    else
+#endif
     if (is_write_watch_range( base, size ))
     {
         ULONG_PTR pos = 0;
@@ -14122,6 +14415,7 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
     sigset_t sigset;
 #if defined(__APPLE__) && defined(__aarch64__)
     struct wow64_memory_transaction transaction;
+    struct file_view *view;
     NTSTATUS snapshot_status = STATUS_SUCCESS;
     BOOL candidate;
 #endif
@@ -14143,6 +14437,11 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if ((view = find_view( base, size )) && (view->protect & VPROT_WOW64_OWNED_BACKING))
+        status = STATUS_ACCESS_DENIED;
+    else
+#endif
     if (is_write_watch_range( base, size ))
         reset_write_watches( base, size );
     else
@@ -14355,6 +14654,7 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
             if (ret) break;
             server_enter_uninterrupted_section( &virtual_mutex, &sigset );
             if (!(view = find_view( base, size ))) ret = STATUS_MEMORY_NOT_ALLOCATED;
+            else if (view->protect & VPROT_WOW64_OWNED_BACKING) ret = STATUS_ACCESS_DENIED;
             else if (use_kernel_writewatch) reset_write_watches( base, size );
             else if (set_page_vprot_exec_write_protect( base, size ))
                 mprotect_range( base, size, 0, 0 );
@@ -14384,6 +14684,13 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
             ret = STATUS_MEMORY_NOT_ALLOCATED;
             break;
         }
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (view->protect & VPROT_WOW64_OWNED_BACKING)
+        {
+            ret = STATUS_ACCESS_DENIED;
+            break;
+        }
+#endif
         if (use_kernel_writewatch) reset_write_watches( base, size );
         else if (set_page_vprot_exec_write_protect( base, size ))
             mprotect_range( base, size, 0, 0 );

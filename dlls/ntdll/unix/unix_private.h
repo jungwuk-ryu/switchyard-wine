@@ -354,6 +354,9 @@ extern NTSTATUS virtual_create_builtin_view( void *module, const UNICODE_STRING 
 extern NTSTATUS virtual_relocate_module( void *module );
 extern TEB *virtual_alloc_first_teb(void);
 extern NTSTATUS virtual_alloc_teb( struct thread_data *data );
+extern NTSTATUS virtual_alloc_wow64_owned_backing( void **host_address,
+                                                    UINT64 *guest_address, SIZE_T *size );
+extern const struct wine_unixlib_owned_backing_codec_v2 *wow64_owned_backing_get_codec(void);
 struct thread_data *virtual_alloc_thread_data(void);
 extern void virtual_free_thread_data( struct thread_data *data );
 extern NTSTATUS virtual_clear_tls_index( ULONG index );
@@ -441,6 +444,8 @@ extern NTSTATUS register_wow64_unixlib_dispatch(
 extern NTSTATUS register_wow64_unixlib_dispatch_v2(
     const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
     unixlib_handle_t *handle );
+extern NTSTATUS validate_wow64_unixlib_function_table( const unixlib_entry_t *funcs,
+                                                        UINT32 count, const void *identity );
 extern NTSTATUS unregister_wow64_unixlib_dispatch( unixlib_handle_t handle );
 extern NTSTATUS create_unixlib_module_token( void *module, unixlib_handle_t dispatch,
                                              BOOL dispatch_registered,

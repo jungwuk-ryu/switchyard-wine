@@ -172,6 +172,36 @@ static BOOL dispatch_range_has_protection( const void *ptr, SIZE_T size, vm_prot
     return TRUE;
 }
 
+NTSTATUS validate_wow64_unixlib_function_table( const unixlib_entry_t *funcs,
+                                                 UINT32 count, const void *identity )
+{
+    Dl_info table_info, identity_info, func_info;
+    UINT32 i;
+
+    /* Some external Unix libraries publish their entry tables in writable
+     * data.  Validate every current target here; the reviewed companion must
+     * snapshot the complete binding before it publishes its backend. */
+    if (!funcs || !identity || !count || count > WINE_UNIXLIB_DISPATCH_MAX_ENTRIES ||
+        is_guest_controlled_dispatch_address( funcs ) ||
+        is_guest_controlled_dispatch_address( identity ) ||
+        !dladdr( funcs, &table_info ) || !dladdr( identity, &identity_info ) ||
+        table_info.dli_fbase != identity_info.dli_fbase ||
+        !dispatch_range_has_protection( funcs, count * sizeof(*funcs), VM_PROT_READ, 0 ))
+        return STATUS_INVALID_IMAGE_FORMAT;
+
+    for (i = 0; i < count; i++)
+    {
+        unixlib_entry_t func = funcs[i];
+
+        if (func && (is_guest_controlled_dispatch_address( (const void *)func ) ||
+            !dispatch_range_has_protection( (const void *)func, 1, VM_PROT_EXECUTE, 0 ) ||
+            !dladdr( (const void *)func, &func_info ) ||
+            func_info.dli_fbase != table_info.dli_fbase))
+            return STATUS_INVALID_IMAGE_FORMAT;
+    }
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS pin_wow64_unixlib_dispatch_source( const void *source, void **module_ref )
 {
     Dl_info source_info;
@@ -587,6 +617,15 @@ done:
     return status;
 }
 #else
+NTSTATUS validate_wow64_unixlib_function_table( const unixlib_entry_t *funcs,
+                                                 UINT32 count, const void *identity )
+{
+    (void)funcs;
+    (void)count;
+    (void)identity;
+    return STATUS_NOT_SUPPORTED;
+}
+
 NTSTATUS register_wow64_unixlib_dispatch(
     const struct wine_unixlib_dispatch_source_v1 *source, const unixlib_entry_t *funcs,
     unixlib_handle_t *handle )
