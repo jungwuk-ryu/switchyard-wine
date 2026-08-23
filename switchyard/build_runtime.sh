@@ -2045,7 +2045,8 @@ prepare_font_runtime_for_install() {
     if [ -f "$runtime_font_root/etc/fonts/fonts.conf" ]; then
       SWITCHYARD_FONT_SOURCE_PREFIX="$source_prefix" \
         perl -0pi -e '
-          s#\n\s*<cachedir>\Q$ENV{SWITCHYARD_FONT_SOURCE_PREFIX}\E/var/cache/fontconfig</cachedir>##g
+          s#\n\s*<cachedir>\Q$ENV{SWITCHYARD_FONT_SOURCE_PREFIX}\E/var/cache/fontconfig</cachedir>##g;
+          s#\n\s*<cachedir>(?:/usr/local|/opt/homebrew|\@\@HOMEBREW_PREFIX\@\@)/var/cache/fontconfig</cachedir>##g
         ' "$runtime_font_root/etc/fonts/fonts.conf"
     fi
     [ -f "$FONTCONFIG_ASSET_FRAGMENT" ] && [ ! -L "$FONTCONFIG_ASSET_FRAGMENT" ] || {

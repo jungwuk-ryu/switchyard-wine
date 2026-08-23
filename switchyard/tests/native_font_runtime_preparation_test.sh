@@ -201,6 +201,7 @@ MACOSX_DEPLOYMENT_TARGET=26.5 \
     /usr/bin/printf '  <cachedir>%s/var/cache/fontconfig</cachedir>\n' \
         "$SOURCE_PREFIX"
     /usr/bin/printf '%s\n' \
+        '  <cachedir>@@HOMEBREW_PREFIX@@/var/cache/fontconfig</cachedir>' \
         '  <cachedir>/tmp/switchyard-preserved-font-cache</cachedir>' \
         '</fontconfig>'
 } >"$SOURCE_PREFIX/etc/fonts/fonts.conf"
@@ -321,6 +322,10 @@ verify_host_macho_tree_signatures "$PREPARED_ROOT" "prepared font fixture" ||
 if /usr/bin/grep -F "$SOURCE_PREFIX/var/cache/fontconfig" \
         "$PREPARED_ROOT/etc/fonts/fonts.conf" >/dev/null; then
     fail "prepared fonts.conf retains the source cache path"
+fi
+if /usr/bin/grep -F '@@HOMEBREW_PREFIX@@/var/cache/fontconfig' \
+        "$PREPARED_ROOT/etc/fonts/fonts.conf" >/dev/null; then
+    fail "prepared fonts.conf retains the Homebrew bottle cache placeholder"
 fi
 /usr/bin/grep -Fqx \
     '  <cachedir>/tmp/switchyard-preserved-font-cache</cachedir>' \
