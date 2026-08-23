@@ -3039,9 +3039,9 @@ static NTSTATUS validate_relocation_sections( const IMAGE_NT_HEADERS *nt, SIZE_T
 }
 
 
-static NTSTATUS validate_relocation_directory( void *module,
-                                               const IMAGE_DATA_DIRECTORY *dir,
-                                               SIZE_T image_size )
+static NTSTATUS validate_relocation_directory_data( void *module,
+                                                    const IMAGE_DATA_DIRECTORY *dir,
+                                                    SIZE_T image_size )
 {
     const IMAGE_BASE_RELOCATION *rel;
     SIZE_T remaining;
@@ -3101,6 +3101,24 @@ static NTSTATUS validate_relocation_directory( void *module,
     }
     if (remaining && remaining < sizeof(*rel)) return STATUS_INVALID_IMAGE_FORMAT;
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS validate_relocation_directory( void *module,
+                                               const IMAGE_DATA_DIRECTORY *dir,
+                                               SIZE_T image_size )
+{
+    NTSTATUS status;
+
+    __TRY
+    {
+        status = validate_relocation_directory_data( module, dir, image_size );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        status = STATUS_INVALID_IMAGE_FORMAT;
+    }
+    __ENDTRY
+    return status;
 }
 
 
