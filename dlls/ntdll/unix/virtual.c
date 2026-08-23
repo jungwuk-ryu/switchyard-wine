@@ -7050,6 +7050,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     SIZE_T effective_import_thunk_size = 0;
     BOOL transformed_load_config_present, transformed_import_present;
     BOOL hybrid_metadata_processed = FALSE, effective_import_present = FALSE;
+#if defined(__APPLE__)
+    BOOL initialize_native_arm64ec_protections = FALSE;
+#endif
 #endif
 
     TRACE_(module)( "mapping PE file %s at %p-%p\n", debugstr_us(nt_name), ptr, ptr + total_size );
@@ -7366,6 +7369,23 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     /* set the image protections */
 
 #if defined(__APPLE__) && defined(__aarch64__)
+    initialize_native_arm64ec_protections =
+        !(view->protect & VPROT_SHADOW_TRANSLATED) &&
+        mapped_machine == IMAGE_FILE_MACHINE_AMD64 && arm64ec_mapping.has_native_code &&
+        align_mask < host_page_mask;
+
+    /* A sub-host-page native image must not expose the initial image-wide
+     * WRITECOPY|EXEC logical protection while its final per-section protections
+     * are being installed.  Initialize every logical lane to no-access, then
+     * project each final protection normally. */
+    if (initialize_native_arm64ec_protections)
+    {
+        if (!set_vprot( view, ptr, total_size, VPROT_COMMITTED ))
+        {
+            status = STATUS_ACCESS_DENIED;
+            goto done;
+        }
+    }
     if (!(view->protect & VPROT_SHADOW_TRANSLATED) &&
         mapped_machine == IMAGE_FILE_MACHINE_AMD64 && !arm64ec_mapping.has_native_code)
         view->protect |= VPROT_AMD64_IDENTITY;

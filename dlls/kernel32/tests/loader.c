@@ -1759,6 +1759,150 @@ static void test_stale_hybrid_image_classification(void)
     HeapFree( GetProcessHeap(), 0, data );
 }
 
+static BOOL is_darwin_host(void)
+{
+    void (CDECL *wine_get_host_version)(const char **, const char **);
+    const char *sysname = NULL;
+
+    wine_get_host_version = (void *)GetProcAddress( GetModuleHandleA( "ntdll.dll" ),
+                                                    "wine_get_host_version" );
+    if (!wine_get_host_version) return FALSE;
+    wine_get_host_version( &sysname, NULL );
+    return sysname && !strcmp( sysname, "Darwin" );
+}
+
+static void build_subpage_native_chpe_image( IMAGE_NT_HEADERS *nt,
+                                             IMAGE_SECTION_HEADER sections[2], BYTE *data,
+                                             BOOL writable_collision )
+{
+    const DWORD cfg_offset = 0x100, metadata_offset = 0x300, code_map_offset = 0x500;
+    const DWORD text_rva = 0x1000, text_size = 0x2000;
+    const DWORD data_rva = writable_collision ? 0x3000 : 0x4000;
+    const DWORD data_size = 0x6000 - data_rva;
+    const DWORD cfg_field_end = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) +
+                                sizeof(((IMAGE_LOAD_CONFIG_DIRECTORY *)0)->CHPEMetadataPointer);
+    IMAGE_LOAD_CONFIG_DIRECTORY *cfg = (void *)(data + cfg_offset);
+    IMAGE_ARM64EC_METADATA *metadata = (void *)(data + metadata_offset);
+    IMAGE_CHPE_RANGE_ENTRY *code = (void *)(data + code_map_offset);
+    static const DWORD native_code[] = {0x52800540, 0xd65f03c0}; /* mov w0, #42; ret */
+    IMAGE_DATA_DIRECTORY *dir;
+
+    memset( data, 0, 0x3000 );
+    memcpy( data, native_code, sizeof(native_code) );
+    *nt = nt_header_template;
+    memset( sections, 0, 2 * sizeof(*sections) );
+
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 2;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(nt->OptionalHeader);
+    nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL;
+    nt->OptionalHeader.ImageBase = 0x180000000;
+    nt->OptionalHeader.SectionAlignment = 0x1000;
+    nt->OptionalHeader.FileAlignment = 0x1000;
+    nt->OptionalHeader.SizeOfCode = text_size;
+    nt->OptionalHeader.SizeOfInitializedData = data_size;
+    nt->OptionalHeader.SizeOfHeaders = 0x1000;
+    nt->OptionalHeader.SizeOfImage = 0x6000;
+    nt->OptionalHeader.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE |
+                                            IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+
+    memcpy( sections[0].Name, ".text", sizeof(".text") );
+    sections[0].Misc.VirtualSize = text_size;
+    sections[0].VirtualAddress = text_rva;
+    sections[0].SizeOfRawData = text_size;
+    sections[0].PointerToRawData = 0x1000;
+    sections[0].Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_READ |
+                                  IMAGE_SCN_MEM_EXECUTE;
+
+    memcpy( sections[1].Name, writable_collision ? ".data" : ".rdata",
+            writable_collision ? sizeof(".data") : sizeof(".rdata") );
+    sections[1].Misc.VirtualSize = data_size;
+    sections[1].VirtualAddress = data_rva;
+    sections[1].SizeOfRawData = data_size;
+    sections[1].PointerToRawData = data_rva;
+    sections[1].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    if (writable_collision) sections[1].Characteristics |= IMAGE_SCN_MEM_WRITE;
+
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    dir->VirtualAddress = data_rva + cfg_offset;
+    dir->Size = cfg_field_end;
+    cfg->Size = cfg_field_end;
+    cfg->CHPEMetadataPointer = nt->OptionalHeader.ImageBase + data_rva + metadata_offset;
+    metadata->Version = 2;
+    metadata->CodeMap = data_rva + code_map_offset;
+    metadata->CodeMapCount = 1;
+    code->StartOffset = text_rva | 1;
+    code->Length = text_size;
+}
+
+static void test_subpage_native_chpe_protections(void)
+{
+    IMAGE_SECTION_HEADER sections[2];
+    IMAGE_NT_HEADERS nt;
+    MEMORY_BASIC_INFORMATION info;
+    char filename[MAX_PATH];
+    BYTE data[0x3000];
+    HANDLE file, mapping;
+    NTSTATUS status;
+    SIZE_T size;
+    void *base;
+    BOOL collision;
+
+    for (collision = FALSE; collision <= TRUE; collision++)
+    {
+        winetest_push_context( collision ? "final writable/executable host-page collision" :
+                                          "representable sub-host-page protections" );
+        build_subpage_native_chpe_image( &nt, sections, data, collision );
+        size = create_test_dll_sections( &dos_header, &nt, sections, data, filename );
+        ok( size == 0x6000, "test image size %#Ix, expected 0x6000\n", size );
+        file = CreateFileA( filename, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, 0, 0 );
+        ok( file != INVALID_HANDLE_VALUE, "CreateFileA failed, error %lu\n", GetLastError() );
+        mapping = NULL;
+        status = file == INVALID_HANDLE_VALUE ? STATUS_UNSUCCESSFUL :
+                 pNtCreateSection( &mapping,
+                                   STANDARD_RIGHTS_REQUIRED | SECTION_MAP_READ | SECTION_QUERY,
+                                   NULL, NULL, PAGE_READONLY, SEC_IMAGE, file );
+        ok( status == STATUS_SUCCESS, "NtCreateSection returned %#lx\n", status );
+        if (file != INVALID_HANDLE_VALUE) CloseHandle( file );
+
+        base = NULL;
+        if (mapping)
+            status = map_hybrid_image_section( mapping, IMAGE_FILE_MACHINE_AMD64, &base );
+        if (collision && is_darwin_host())
+        {
+            ok( status == STATUS_ACCESS_DENIED,
+                "writable/executable host-page mapping returned %#lx\n", status );
+            ok( !base, "writable/executable host-page mapping returned base %p\n", base );
+        }
+        else
+        {
+            ok( NT_SUCCESS(status), "NtMapViewOfSectionEx returned %#lx\n", status );
+            if (NT_SUCCESS(status) && !collision)
+            {
+                size = VirtualQuery( (BYTE *)base + sections[0].VirtualAddress,
+                                     &info, sizeof(info) );
+                ok( size == sizeof(info), "VirtualQuery returned %#Ix\n", size );
+                ok( info.Protect == PAGE_EXECUTE_READ,
+                    "native code protection %#lx, expected PAGE_EXECUTE_READ\n", info.Protect );
+                ok( ((int (CDECL *)(void))((BYTE *)base + sections[0].VirtualAddress))() == 42,
+                    "native code returned an unexpected value\n" );
+                size = VirtualQuery( (BYTE *)base + 0x3000, &info, sizeof(info) );
+                ok( size == sizeof(info), "VirtualQuery returned %#Ix\n", size );
+                ok( info.State == MEM_COMMIT, "image hole state %#lx, expected MEM_COMMIT\n",
+                    info.State );
+                ok( info.Protect == PAGE_NOACCESS,
+                    "image hole protection %#lx, expected PAGE_NOACCESS\n", info.Protect );
+            }
+        }
+        unmap_hybrid_image( base );
+        if (mapping) CloseHandle( mapping );
+        DeleteFileA( filename );
+        winetest_pop_context();
+    }
+}
+
 static void test_arm64ec_metadata_bounds(void)
 {
     static const struct
@@ -1897,6 +2041,7 @@ static void test_arm64ec_metadata_bounds(void)
     test_pe32_chpe_classification();
     if (!probe_hybrid_image_mapping()) return;
     test_stale_hybrid_image_classification();
+    test_subpage_native_chpe_protections();
 
     data = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, HYBRID_SECTION_SIZE );
     ok( !!data, "failed to allocate hybrid image data\n" );

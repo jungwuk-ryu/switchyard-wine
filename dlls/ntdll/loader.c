@@ -747,6 +747,198 @@ static SIZE_T get_native_image_size( HMODULE module )
     return nt ? nt->OptionalHeader.SizeOfImage : 0;
 }
 
+struct module_write_protect
+{
+    void   *base;
+    SIZE_T  size;
+    ULONG   old_prot;
+    ULONG  *page_protect;
+    SIZE_T  page_count;
+};
+
+static NTSTATUS save_module_image_protections( HMODULE module, SIZE_T size,
+                                               ULONG **protect_ret, SIZE_T *count_ret )
+{
+    MEMORY_BASIC_INFORMATION info;
+    ULONG *protect;
+    ULONG_PTR base = (ULONG_PTR)module, end, region_end;
+    SIZE_T i, next, count;
+    NTSTATUS status;
+
+    *protect_ret = NULL;
+    *count_ret = 0;
+
+    if (size > ~(SIZE_T)0 - page_size + 1) return STATUS_INVALID_IMAGE_FORMAT;
+    count = (size + page_size - 1) / page_size;
+    if (!count) return STATUS_SUCCESS;
+    size = count * page_size;
+    if (base > ~(ULONG_PTR)0 - size) return STATUS_INVALID_IMAGE_FORMAT;
+    end = base + size;
+    if (count > ~(SIZE_T)0 / sizeof(*protect)) return STATUS_NO_MEMORY;
+    if (!(protect = RtlAllocateHeap( GetProcessHeap(), 0, count * sizeof(*protect) )))
+        return STATUS_NO_MEMORY;
+
+    for (i = 0; i < count; i = next)
+    {
+        ULONG_PTR address = base + i * page_size;
+
+        status = NtQueryVirtualMemory( NtCurrentProcess(), (void *)address,
+                                       MemoryBasicInformation, &info, sizeof(info), NULL );
+        if (status)
+        {
+            RtlFreeHeap( GetProcessHeap(), 0, protect );
+            return status;
+        }
+        if (info.State != MEM_COMMIT || !info.Protect ||
+            (ULONG_PTR)info.BaseAddress > address ||
+            info.RegionSize > ~(ULONG_PTR)0 - (ULONG_PTR)info.BaseAddress ||
+            (region_end = (ULONG_PTR)info.BaseAddress + info.RegionSize) <= address ||
+            ((ULONG_PTR)info.BaseAddress & (page_size - 1)) ||
+            (info.RegionSize & (page_size - 1)))
+        {
+            RtlFreeHeap( GetProcessHeap(), 0, protect );
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        if (region_end > end) region_end = end;
+        next = (region_end - base) / page_size;
+        if (next <= i || next > count)
+        {
+            RtlFreeHeap( GetProcessHeap(), 0, protect );
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        while (i < next) protect[i++] = info.Protect;
+    }
+
+    *protect_ret = protect;
+    *count_ret = count;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS restore_module_image_protections( HMODULE module, ULONG *protect, SIZE_T count )
+{
+    SIZE_T i, end;
+    NTSTATUS status;
+    void *addr = module;
+    SIZE_T size = count * page_size;
+    ULONG old_prot;
+
+    /* Do not recreate a writable+executable host-page union while restoring
+     * sub-host-page images: first remove write and execute access from the
+     * complete staged image, then restore the original logical runs. */
+    if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                          PAGE_NOACCESS, &old_prot )))
+        return status;
+
+    for (i = 0; i < count; i = end)
+    {
+        addr = (char *)module + i * page_size;
+
+        for (end = i + 1; end < count && protect[end] == protect[i]; ++end) {}
+
+        size = (end - i) * page_size;
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, protect[i], &old_prot );
+        if (status)
+        {
+            WARN( "failed to restore image page protections at %p size %#Ix status %#lx\n",
+                  addr, size, status );
+            return status;
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS protect_module_image_for_write( HMODULE module, SIZE_T size,
+                                                struct module_write_protect *protect )
+{
+    NTSTATUS status, restore_status;
+    void *addr = module;
+    SIZE_T protect_size;
+
+    memset( protect, 0, sizeof(*protect) );
+
+    if (!size) return STATUS_INVALID_IMAGE_FORMAT;
+    if ((status = save_module_image_protections( module, size, &protect->page_protect,
+                                                 &protect->page_count )))
+        return status;
+
+    protect->base = module;
+    protect->size = protect->page_count * page_size;
+    protect_size = protect->size;
+    if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &protect_size,
+                                          PAGE_READWRITE, &protect->old_prot )))
+    {
+        restore_status = restore_module_image_protections( module, protect->page_protect,
+                                                           protect->page_count );
+        RtlFreeHeap( GetProcessHeap(), 0, protect->page_protect );
+        memset( protect, 0, sizeof(*protect) );
+        return restore_status ? restore_status : status;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS protect_module_range_for_write( HMODULE module, SIZE_T image_size,
+                                                void **base, SIZE_T *size,
+                                                struct module_write_protect *protect )
+{
+    ULONG_PTR image_base = (ULONG_PTR)module, range_base = (ULONG_PTR)*base;
+    NTSTATUS status;
+
+    memset( protect, 0, sizeof(*protect) );
+    if (!*size) return STATUS_SUCCESS;
+    if (!image_size || range_base < image_base ||
+        range_base - image_base > image_size ||
+        *size > image_size - (range_base - image_base))
+        return STATUS_INVALID_IMAGE_FORMAT;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), base, size, PAGE_READWRITE,
+                                     &protect->old_prot );
+    if (!status)
+    {
+        protect->base = *base;
+        protect->size = *size;
+        return STATUS_SUCCESS;
+    }
+
+    WARN( "failed to make module range %p size %#Ix writable status %#lx, staging image\n",
+          *base, *size, status );
+#ifdef __arm64ec__
+    {
+        IMAGE_NT_HEADERS *nt = get_image_headers( module );
+
+        if (nt && nt->OptionalHeader.SectionAlignment == page_size)
+            return protect_module_image_for_write( module, image_size, protect );
+    }
+#endif
+    return status;
+}
+
+static NTSTATUS restore_module_write_protect( HMODULE module, struct module_write_protect *protect )
+{
+    NTSTATUS status;
+    void *base;
+    SIZE_T size;
+    ULONG old_prot;
+
+    if (protect->page_protect)
+    {
+        status = restore_module_image_protections( module, protect->page_protect,
+                                                   protect->page_count );
+        RtlFreeHeap( GetProcessHeap(), 0, protect->page_protect );
+        memset( protect, 0, sizeof(*protect) );
+        return status;
+    }
+
+    if (!protect->size) return STATUS_SUCCESS;
+
+    base = protect->base;
+    size = protect->size;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, protect->old_prot,
+                                     &old_prot );
+    memset( protect, 0, sizeof(*protect) );
+    return status;
+}
+
 
 void *ntdll_get_native_image_directory( HMODULE module, BOOL image, WORD dir, ULONG *size )
 {
@@ -1648,6 +1840,7 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
 static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, LPCWSTR load_path, WINE_MODREF **pwm )
 {
     HMODULE module = get_modref_native_base( wm );
+    IMAGE_NT_HEADERS *nt = get_image_headers( module );
     BOOL system = wm->system || (wm->ldr.Flags & LDR_WINE_INTERNAL);
     NTSTATUS status;
     WINE_MODREF *wmImp;
@@ -1660,14 +1853,27 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
     const char *name = get_rva( module, descr->Name );
     DWORD len = strlen(name);
     PVOID protect_base;
-    SIZE_T protect_size = 0;
-    DWORD protect_old;
+    SIZE_T image_size, import_capacity, thunk_capacity, protect_size = 0;
+    struct module_write_protect write_protect = {0};
+
+    if (!nt) return FALSE;
+    image_size = nt->OptionalHeader.SizeOfImage;
+    if (descr->FirstThunk >= image_size) return FALSE;
 
     thunk_list = get_rva( module, (DWORD)descr->FirstThunk );
     if (descr->OriginalFirstThunk)
+    {
+        if (descr->OriginalFirstThunk >= image_size) return FALSE;
         import_list = get_rva( module, (DWORD)descr->OriginalFirstThunk );
+        import_capacity = (image_size - descr->OriginalFirstThunk) / sizeof(*import_list);
+    }
     else
+    {
         import_list = thunk_list;
+        import_capacity = (image_size - descr->FirstThunk) / sizeof(*import_list);
+    }
+    thunk_capacity = (image_size - descr->FirstThunk) / sizeof(*thunk_list);
+    import_capacity = min( import_capacity, thunk_capacity );
 
     if (!import_list->u1.Ordinal)
     {
@@ -1692,11 +1898,24 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
 
     /* unprotect the import address table since it can be located in
      * readonly section */
-    while (import_list[protect_size].u1.Ordinal) protect_size++;
+    while (protect_size < import_capacity && import_list[protect_size].u1.Ordinal)
+        protect_size++;
+    if (protect_size == import_capacity)
+    {
+        ERR( "Invalid import address table for %s.\n",
+             debugstr_w(wm->ldr.FullDllName.Buffer) );
+        return FALSE;
+    }
     protect_base = thunk_list;
     protect_size *= sizeof(*thunk_list);
-    NtProtectVirtualMemory( NtCurrentProcess(), &protect_base,
-                            &protect_size, PAGE_READWRITE, &protect_old );
+    if ((status = protect_module_range_for_write( module, image_size,
+                                                  &protect_base, &protect_size,
+                                                  &write_protect )))
+    {
+        ERR( "Failed to make import address table writable for %s, status %#lx.\n",
+             debugstr_w(wm->ldr.FullDllName.Buffer), status );
+        return FALSE;
+    }
 
     imp_mod = get_modref_native_base( wmImp );
     exports = ntdll_get_native_image_directory( wmImp->ldr.DllBase, TRUE,
@@ -1768,7 +1987,12 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
 
 done:
     /* restore old protection of the import address table */
-    NtProtectVirtualMemory( NtCurrentProcess(), &protect_base, &protect_size, protect_old, &protect_old );
+    if ((status = restore_module_write_protect( module, &write_protect )))
+    {
+        ERR( "Failed to restore import address table protection for %s, status %#lx.\n",
+             debugstr_w(wm->ldr.FullDllName.Buffer), status );
+        return FALSE;
+    }
     *pwm = wmImp;
     return TRUE;
 }
@@ -2678,13 +2902,14 @@ NTSTATUS WINAPI LdrGetProcedureAddress(HMODULE module, const ANSI_STRING *name,
  * Create a random security cookie for buffer overflow protection. Make
  * sure it does not accidentally match the default cookie value.
  */
-static void set_security_cookie( ULONG_PTR *cookie )
+static NTSTATUS set_security_cookie( HMODULE module, IMAGE_NT_HEADERS *nt, ULONG_PTR *cookie )
 {
     static ULONG seed;
+    struct module_write_protect write_protect;
     ULONG_PTR new_cookie;
+    NTSTATUS status;
     SIZE_T size;
     void *addr;
-    ULONG old_prot;
 
     TRACE( "initializing security cookie %p\n", cookie );
 
@@ -2708,30 +2933,39 @@ static void set_security_cookie( ULONG_PTR *cookie )
             break;
     }
 
-    if (new_cookie == *cookie) return;  /* already initialized */
+    if (new_cookie == *cookie) return STATUS_SUCCESS;  /* already initialized */
 
     addr = cookie;
     size = sizeof(*cookie);
-    if (!NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_READWRITE, &old_prot ))
-    {
-        *cookie = new_cookie;
-        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old_prot, &old_prot );
-    }
+    if ((status = protect_module_range_for_write( module, nt->OptionalHeader.SizeOfImage,
+                                                  &addr, &size, &write_protect )))
+        return status;
+
+    *cookie = new_cookie;
+    return restore_module_write_protect( module, &write_protect );
 }
 
 
 /***********************************************************************
  *           update_load_config
  */
-static void update_load_config( void *module, void *client_base )
+static NTSTATUS update_load_config( void *module, void *client_base )
 {
     IMAGE_NT_HEADERS *nt = get_image_headers( module );
     IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
+    ULONG_PTR *cookie = NULL;
+    NTSTATUS status = STATUS_SUCCESS, restore_status;
     ULONG size;
+#ifdef __arm64ec__
+    struct module_write_protect image_protect = {0};
+    const IMAGE_ARM64EC_METADATA *metadata = NULL;
+    BOOL image_write_protected = FALSE;
+#endif
 
     cfg = ntdll_get_native_image_directory( module, TRUE,
                                             IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &size );
-    if (!cfg) return;
+    if (!cfg) return STATUS_SUCCESS;
+    if (!nt) return STATUS_INVALID_IMAGE_FORMAT;
     size = min( size, cfg->Size );
     if (size >= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, SecurityCookie ) +
                 sizeof(cfg->SecurityCookie) &&
@@ -2740,10 +2974,8 @@ static void update_load_config( void *module, void *client_base )
         cfg->SecurityCookie - (ULONG_PTR)client_base <=
             nt->OptionalHeader.SizeOfImage - sizeof(ULONG_PTR))
     {
-        ULONG_PTR *cookie = (ULONG_PTR *)((char *)module +
-            (cfg->SecurityCookie - (ULONG_PTR)client_base));
-
-        set_security_cookie( cookie );
+        cookie = (ULONG_PTR *)((char *)module +
+                              (cfg->SecurityCookie - (ULONG_PTR)client_base));
     }
 #ifdef __arm64ec__
     if (size >= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) +
@@ -2753,12 +2985,184 @@ static void update_load_config( void *module, void *client_base )
         cfg->CHPEMetadataPointer - (ULONG_PTR)client_base <=
             nt->OptionalHeader.SizeOfImage - sizeof(IMAGE_ARM64EC_METADATA))
     {
-        const IMAGE_ARM64EC_METADATA *metadata = (void *)((char *)module +
-            (cfg->CHPEMetadataPointer - (ULONG_PTR)client_base));
+        metadata = (void *)((char *)module +
+                            (cfg->CHPEMetadataPointer - (ULONG_PTR)client_base));
+    }
 
-        arm64ec_update_hybrid_metadata( module, nt, metadata );
+    if ((cookie || metadata) && nt->OptionalHeader.SectionAlignment == page_size)
+    {
+        if ((status = protect_module_image_for_write( module,
+                                                       nt->OptionalHeader.SizeOfImage,
+                                                       &image_protect )))
+            return status;
+        image_write_protected = TRUE;
     }
 #endif
+
+    if (cookie && (status = set_security_cookie( module, nt, cookie ))) goto done;
+#ifdef __arm64ec__
+    if (metadata)
+        arm64ec_update_hybrid_metadata( module, nt, metadata );
+#endif
+
+done:
+#ifdef __arm64ec__
+    if (image_write_protected)
+    {
+        restore_status = restore_module_write_protect( module, &image_protect );
+        if (!status) status = restore_status;
+    }
+#else
+    (void)restore_status;
+#endif
+    return status;
+}
+
+
+static NTSTATUS validate_relocation_sections( const IMAGE_NT_HEADERS *nt, SIZE_T image_size )
+{
+    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
+    ULONG i;
+
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        if (!sec[i].SizeOfRawData) continue;
+        if (sec[i].VirtualAddress >= image_size ||
+            sec[i].SizeOfRawData > image_size - sec[i].VirtualAddress)
+            return STATUS_INVALID_IMAGE_FORMAT;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS validate_relocation_directory( void *module,
+                                               const IMAGE_DATA_DIRECTORY *dir,
+                                               SIZE_T image_size )
+{
+    const IMAGE_BASE_RELOCATION *rel;
+    SIZE_T remaining;
+
+    if (dir->VirtualAddress >= image_size || dir->Size > image_size - dir->VirtualAddress)
+        return STATUS_INVALID_IMAGE_FORMAT;
+
+    rel = get_rva( module, dir->VirtualAddress );
+    remaining = dir->Size;
+    while (remaining >= sizeof(*rel) && rel->SizeOfBlock)
+    {
+        const USHORT *entry;
+        SIZE_T count, i;
+
+        if (rel->SizeOfBlock < sizeof(*rel) || rel->SizeOfBlock > remaining ||
+            ((rel->SizeOfBlock - sizeof(*rel)) & (sizeof(*entry) - 1)) ||
+            rel->VirtualAddress >= image_size)
+            return STATUS_INVALID_IMAGE_FORMAT;
+
+        entry = (const USHORT *)(rel + 1);
+        count = (rel->SizeOfBlock - sizeof(*rel)) / sizeof(*entry);
+        for (i = 0; i < count; i++)
+        {
+            SIZE_T write_size = 0;
+            ULONG offset = entry[i] & 0xfff;
+
+            switch (entry[i] >> 12)
+            {
+            case IMAGE_REL_BASED_ABSOLUTE:
+                continue;
+            case IMAGE_REL_BASED_HIGH:
+            case IMAGE_REL_BASED_LOW:
+                write_size = sizeof(short);
+                break;
+            case IMAGE_REL_BASED_HIGHLOW:
+                write_size = sizeof(int);
+                break;
+#ifdef _WIN64
+            case IMAGE_REL_BASED_DIR64:
+                write_size = sizeof(INT_PTR);
+                break;
+#elif defined(__arm__)
+            case IMAGE_REL_BASED_THUMB_MOV32:
+                write_size = 2 * sizeof(UINT);
+                break;
+#endif
+            default:
+                continue;  /* LdrProcessRelocationBlock will reject this. */
+            }
+            if (write_size > image_size - rel->VirtualAddress ||
+                offset > image_size - rel->VirtualAddress - write_size)
+                return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        remaining -= rel->SizeOfBlock;
+        rel = (const IMAGE_BASE_RELOCATION *)((const char *)rel + rel->SizeOfBlock);
+    }
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS protect_relocation_sections( void *module, const IMAGE_NT_HEADERS *nt,
+                                             ULONG *protect_old, ULONG *protect_count )
+{
+    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
+    ULONG i;
+    NTSTATUS status;
+
+    *protect_count = 0;
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        void *addr;
+        SIZE_T size;
+
+        if (!sec[i].SizeOfRawData)
+        {
+            *protect_count = i + 1;
+            continue;
+        }
+
+        addr = get_rva( module, sec[i].VirtualAddress );
+        size = sec[i].SizeOfRawData;
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                         PAGE_READWRITE, &protect_old[i] );
+        if (status)
+        {
+            WARN( "failed to make relocation section %.8s writable at %p size %#Ix status %#lx\n",
+                  sec[i].Name, addr, size, status );
+            return status;
+        }
+        *protect_count = i + 1;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS restore_relocation_sections( void *module, const IMAGE_NT_HEADERS *nt,
+                                             ULONG *protect_old, ULONG protect_count )
+{
+    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
+    NTSTATUS ret = STATUS_SUCCESS, status;
+    ULONG i;
+
+    for (i = 0; i < protect_count; i++)
+    {
+        void *addr;
+        SIZE_T size;
+        ULONG old_prot;
+
+        if (!sec[i].SizeOfRawData) continue;
+
+        addr = get_rva( module, sec[i].VirtualAddress );
+        size = sec[i].SizeOfRawData;
+        status = NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size,
+                                         protect_old[i], &old_prot );
+        if (status)
+        {
+            WARN( "failed to restore relocation section %.8s at %p size %#Ix status %#lx\n",
+                  sec[i].Name, addr, size, status );
+            if (!ret) ret = status;
+        }
+    }
+
+    return ret;
 }
 
 
@@ -2768,10 +3172,11 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
     char *base;
     IMAGE_BASE_RELOCATION *rel, *end;
     const IMAGE_DATA_DIRECTORY *relocs;
-    const IMAGE_SECTION_HEADER *sec;
+    struct module_write_protect image_protect = {0};
     INT_PTR delta;
-    ULONG *protect_old, i;
+    ULONG *protect_old = NULL, protect_count = 0;
     NTSTATUS status = STATUS_SUCCESS;
+    BOOL image_write_protected = FALSE;
 
     base = (char *)nt->OptionalHeader.ImageBase;
     if (client_base == base) return STATUS_SUCCESS;  /* nothing to do */
@@ -2795,18 +3200,28 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
 
     if (!relocs->Size) return STATUS_SUCCESS;
     if (!relocs->VirtualAddress) return STATUS_CONFLICTING_ADDRESSES;
+    if ((status = validate_relocation_sections( nt, len ))) return status;
+    if ((status = validate_relocation_directory( module, relocs, len ))) return status;
 
     if (!(protect_old = RtlAllocateHeap( GetProcessHeap(), 0,
                                          nt->FileHeader.NumberOfSections * sizeof(*protect_old ))))
         return STATUS_NO_MEMORY;
 
-    sec = IMAGE_FIRST_SECTION( nt );
-    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    status = protect_relocation_sections( module, nt, protect_old, &protect_count );
+    if (status)
     {
-        void *addr = get_rva( module, sec[i].VirtualAddress );
-        SIZE_T size = sec[i].SizeOfRawData;
-        NtProtectVirtualMemory( NtCurrentProcess(), &addr,
-                                &size, PAGE_READWRITE, &protect_old[i] );
+        NTSTATUS restore_status;
+
+        restore_status = restore_relocation_sections( module, nt, protect_old, protect_count );
+        protect_count = 0;
+        if (restore_status)
+        {
+            status = restore_status;
+            goto done;
+        }
+        if ((status = protect_module_image_for_write( module, len, &image_protect )))
+            goto done;
+        image_write_protected = TRUE;
     }
 
     TRACE( "relocating from %p-%p to client %p-%p using native backing %p-%p\n",
@@ -2835,15 +3250,17 @@ static NTSTATUS perform_relocations( void *module, void *client_base,
         }
     }
 
-    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
-    {
-        void *addr = get_rva( module, sec[i].VirtualAddress );
-        SIZE_T size = sec[i].SizeOfRawData;
-        NtProtectVirtualMemory( NtCurrentProcess(), &addr,
-                                &size, protect_old[i], &protect_old[i] );
-    }
-
 done:
+    if (image_write_protected)
+    {
+        NTSTATUS restore_status = restore_module_write_protect( module, &image_protect );
+        if (!status) status = restore_status;
+    }
+    else if (protect_count)
+    {
+        NTSTATUS restore_status = restore_relocation_sections( module, nt, protect_old, protect_count );
+        if (!status) status = restore_status;
+    }
     RtlFreeHeap( GetProcessHeap(), 0, protect_old );
     return status;
 }
@@ -2887,7 +3304,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     if (redirected) wm->ldr.Flags |= LDR_REDIRECTED;
     wm->system = system;
 
-    update_load_config( *module, client_base );
+    if ((status = update_load_config( *module, client_base ))) goto failed;
 
     /* fixup imports */
 
@@ -2899,24 +3316,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
             status = fixup_imports_ilonly( wm, load_path, &wm->ldr.EntryPoint );
         else
             status = fixup_imports( wm, load_path );
-        if (status != STATUS_SUCCESS)
-        {
-            /* the module has only be inserted in the load & memory order lists */
-            RemoveEntryList(&wm->ldr.InLoadOrderLinks);
-            RemoveEntryList(&wm->ldr.InMemoryOrderLinks);
-            RemoveEntryList(&wm->ldr.HashLinks);
-            RtlRbRemoveNode( &base_address_index_tree, &wm->ldr.BaseAddressIndexNode );
-
-            /* FIXME: there are several more dangling references
-             * left. Including dlls loaded by this dll before the
-             * failed one. Unrolling is rather difficult with the
-             * current structure and we can leave them lying
-             * around with no problems, so we don't care.
-             * As these might reference our wm, we don't free it.
-             */
-            *module = NULL;
-            return status;
-        }
+        if (status != STATUS_SUCCESS) goto failed;
     }
 
     TRACE( "loaded %s %p %p\n", debugstr_us(nt_name), wm, *module );
@@ -2937,6 +3337,19 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     *pwm = wm;
     *module = NULL;
     return STATUS_SUCCESS;
+
+failed:
+    /* the module has only been inserted in the load & memory order lists */
+    RemoveEntryList(&wm->ldr.InLoadOrderLinks);
+    RemoveEntryList(&wm->ldr.InMemoryOrderLinks);
+    RemoveEntryList(&wm->ldr.HashLinks);
+    RtlRbRemoveNode( &base_address_index_tree, &wm->ldr.BaseAddressIndexNode );
+
+    /* FIXME: there are several more dangling references left, including DLLs
+     * loaded by this DLL before the failure.  Unrolling is difficult with the
+     * current structure.  Since those may reference wm, don't free it here. */
+    *module = NULL;
+    return status;
 }
 
 
@@ -12313,7 +12726,8 @@ void loader_init( CONTEXT *context, void **entry )
         build_ntdll_module();
 #ifdef __arm64ec__
         load_arm64ec_module();
-        update_load_config( get_modref_native_base( wm ), wm->ldr.DllBase );
+        if ((status = update_load_config( get_modref_native_base( wm ), wm->ldr.DllBase )))
+            NtTerminateProcess( GetCurrentProcess(), status );
 #endif
 
         if ((status = load_dll( NULL, L"kernel32.dll", 0, &kernel32, FALSE )) != STATUS_SUCCESS)
