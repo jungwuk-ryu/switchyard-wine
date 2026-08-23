@@ -286,10 +286,15 @@ switchyard_native_configured_compiler_policy_is_exact() {
   local architecture="$4"
   local no_default_config_flag="$5"
   local expected_cc="$clang $no_default_config_flag -arch $architecture"
+  local expected_cc_c23="$expected_cc -std=gnu23"
   local expected_cxx="$clangxx $no_default_config_flag -arch $architecture"
 
   [ -f "$makefile" ] && [ ! -L "$makefile" ] || return 1
-  /usr/bin/awk -v expected_cc="$expected_cc" -v expected_cxx="$expected_cxx" '
+  # AC_PROG_CC's C23 probe may append its canonical language-mode switch to CC
+  # after qualification.  It is configure-owned rather than ambient policy,
+  # but no other compiler suffix is permitted without a contract update.
+  /usr/bin/awk -v expected_cc="$expected_cc" \
+      -v expected_cc_c23="$expected_cc_c23" -v expected_cxx="$expected_cxx" '
     function assignment(line, variable) {
       return line ~ ("^[[:space:]]*" variable "[[:space:]]*[:+?!]?=")
     }
@@ -303,7 +308,7 @@ switchyard_native_configured_compiler_policy_is_exact() {
     {
       if (assignment($0, "CC") || directive($0, "CC")) {
         cc_count++
-        if ($0 == "CC = " expected_cc) cc_exact++
+        if ($0 == "CC = " expected_cc || $0 == "CC = " expected_cc_c23) cc_exact++
       }
       if (assignment($0, "CXX") || directive($0, "CXX")) {
         cxx_count++

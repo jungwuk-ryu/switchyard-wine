@@ -463,12 +463,26 @@ qualified_makefile="$TEST_ROOT/qualified-Makefile"
 cat >"$qualified_makefile" <<EOF
 CXX = $fake_llvm_bin/clang++ --no-default-config -arch arm64
 OBJC = $fake_llvm_bin/clang --no-default-config -arch arm64
+CC = $fake_llvm_bin/clang --no-default-config -arch arm64 -std=gnu23
+EOF
+switchyard_native_configured_compiler_policy_is_exact \
+  "$qualified_makefile" "$fake_llvm_bin/clang" "$fake_llvm_bin/clang++" \
+  arm64 --no-default-config ||
+  fail "configured compiler validator rejected configure-owned C23 mode"
+cat >"$qualified_makefile" <<EOF
+CXX = $fake_llvm_bin/clang++ --no-default-config -arch arm64
+OBJC = $fake_llvm_bin/clang --no-default-config -arch arm64
 CC = $fake_llvm_bin/clang --no-default-config -arch arm64
 EOF
 switchyard_native_configured_compiler_policy_is_exact \
   "$qualified_makefile" "$fake_llvm_bin/clang" "$fake_llvm_bin/clang++" \
   arm64 --no-default-config ||
-  fail "configured compiler validator rejected the exact reordered assignments"
+  fail "configured compiler validator rejected an exact default C mode"
+cat >"$qualified_makefile" <<EOF
+CXX = $fake_llvm_bin/clang++ --no-default-config -arch arm64
+OBJC = $fake_llvm_bin/clang --no-default-config -arch arm64
+CC = $fake_llvm_bin/clang --no-default-config -arch arm64 -std=gnu23
+EOF
 cat >>"$qualified_makefile" <<EOF
 CC += -fno-integrated-as
 EOF
@@ -486,6 +500,26 @@ if switchyard_native_configured_compiler_policy_is_exact \
     "$qualified_makefile" "$fake_llvm_bin/clang" "$fake_llvm_bin/clang++" \
     arm64 --no-default-config; then
   fail "configured compiler validator accepted nondeterministic flag order"
+fi
+cat >"$qualified_makefile" <<EOF
+CC = $fake_llvm_bin/clang --no-default-config -arch arm64 -std=gnu17
+CXX = $fake_llvm_bin/clang++ --no-default-config -arch arm64
+OBJC = $fake_llvm_bin/clang --no-default-config -arch arm64
+EOF
+if switchyard_native_configured_compiler_policy_is_exact \
+    "$qualified_makefile" "$fake_llvm_bin/clang" "$fake_llvm_bin/clang++" \
+    arm64 --no-default-config; then
+  fail "configured compiler validator accepted an unqualified language mode"
+fi
+cat >"$qualified_makefile" <<EOF
+CC = $fake_llvm_bin/clang --no-default-config -arch arm64 -std=gnu23 -O2
+CXX = $fake_llvm_bin/clang++ --no-default-config -arch arm64
+OBJC = $fake_llvm_bin/clang --no-default-config -arch arm64
+EOF
+if switchyard_native_configured_compiler_policy_is_exact \
+    "$qualified_makefile" "$fake_llvm_bin/clang" "$fake_llvm_bin/clang++" \
+    arm64 --no-default-config; then
+  fail "configured compiler validator accepted an extra compiler suffix"
 fi
 unset SWITCHYARD_TEST_LLVM_LOG SWITCHYARD_TEST_LLVM_MODE
 
