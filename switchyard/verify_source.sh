@@ -67,6 +67,7 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
 "$ROOT_DIR/switchyard/tests/build_runtime_failure_propagation_test.sh"
 "$ROOT_DIR/switchyard/tests/native_macos_sdk_policy_test.sh"
 "$ROOT_DIR/switchyard/tests/native_dependency_signing_test.sh"
+"$ROOT_DIR/switchyard/tests/native_font_runtime_preparation_test.sh"
 "$ROOT_DIR/switchyard/tests/macho_tree_validation_test.sh"
 "$ROOT_DIR/switchyard/tests/provider_source_models_test.sh"
 "$ROOT_DIR/switchyard/tests/darwin_arm64_x18_availability_source_test.sh"
