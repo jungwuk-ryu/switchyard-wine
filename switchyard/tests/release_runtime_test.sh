@@ -96,6 +96,10 @@ make_runtime() {
     "$runtime/lib/switchyard-gstreamer/libfixture.dylib"
   /bin/ln -s wine.switchyard-real "$runtime/bin/switchyard-wine"
   /usr/bin/printf 'fixture PE command\n' >"$runtime/lib/wine/aarch64-windows/cmd.exe"
+  # A four-byte Mach-O magic prefix is not a valid image and must remain in
+  # the protected non-Mach-O inventory instead of entering the signing set.
+  /usr/bin/printf '\317\372\355\376not-a-mach-o\n' \
+    >"$runtime/share/doc/switchyard-wine/fake-magic.bin"
 
   /usr/bin/python3 -I - "$runtime/switchyard-runtime.json" \
     "$SOURCE_REVISION" "$unknown_field" <<'PY'
@@ -175,12 +179,22 @@ make_fake_codesign() {
 +    ;;
 +  details)
 +    item="${@: -1}"
++    architecture=""
++    previous=""
++    for argument in "$@"; do
++      [ "$previous" != --architecture ] || architecture="$argument"
++      previous="$argument"
++    done
 +    team_id="${SWITCHYARD_TEST_TEAM_ID:-M3CULMDKU3}"
 +    case "$item" in
 +      "${SWITCHYARD_TEST_EXTRACTED_RUNTIME:-/nonexistent}"/*)
 +        team_id="${SWITCHYARD_TEST_EXTRACTED_TEAM_ID:-$team_id}"
 +        ;;
 +    esac
++    if [ "$architecture" = x86_64 ] &&
++       [ "${SWITCHYARD_TEST_EXTRACTED_X86_TEAM_MISMATCH:-0}" = 1 ]; then
++      team_id=AAAAAAAAAA
++    fi
 +    /usr/bin/printf '%s\n' \
 +      'CodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0 location=embedded' \
 +      'Signature size=9000' \
@@ -190,9 +204,24 @@ make_fake_codesign() {
 +    ;;
 +  entitlements)
 +    item="${@: -1}"
++    architecture=""
++    previous=""
++    for argument in "$@"; do
++      [ "$previous" != --architecture ] || architecture="$argument"
++      previous="$argument"
++    done
 +    case "$item" in
 +      ./wine|./wine.switchyard-real|*/lib/wine/aarch64-unix/wine|*/bin/wine.switchyard-real) ;;
-+      *) exit 1 ;;
++      *)
++        if [ "$architecture" = x86_64 ] &&
++           [ "${SWITCHYARD_TEST_EXTRACTED_X86_ENTITLEMENT_ERROR:-0}" = 1 ]; then
++          exit 83
++        fi
++        /usr/bin/printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
++          '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
++          '<plist version="1.0"><dict/></plist>'
++        exit 0
++        ;;
 +    esac
 +    unexpected=0
 +    case "$item" in
@@ -213,37 +242,61 @@ EOF
   /bin/chmod 0755 "$destination"
 }
 
-assert_no_publication() {
+assert_no_completed_publication() {
   local output="$1"
+  local failure_mode="$2"
 
-  if [ -d "$output" ] &&
-     /usr/bin/find "$output" -mindepth 1 -print -quit | /usr/bin/grep -q .; then
+  [ ! -e "$output/switchyard-runtime-release.json" ] ||
+    fail "failed release exposed its completion manifest"
+  if [ "$failure_mode" = partial-publication ]; then
+    /usr/bin/grep -Fqx 'foreign replacement' "$output"/*.zip ||
+      fail "failure cleanup changed a public foreign replacement"
+  elif [ -d "$output" ] &&
+       /usr/bin/find "$output" -mindepth 1 -maxdepth 1 ! -name '.switchyard-native-release.*' \
+         -print -quit | /usr/bin/grep -q .; then
     /usr/bin/find "$output" -mindepth 1 -maxdepth 2 -print >&2
-    fail "failed release published output or leaked private staging"
+    fail "failed release published a non-private output"
   fi
 }
 
-assert_native_release_cleanup_preserves_foreign_replacement() {
-  local fixture_root="$TEST_ROOT/foreign-cleanup"
-  local output="$fixture_root/archive.zip"
-  local identity
+assert_native_release_fd_pin() {
+  local fixture="$TEST_ROOT/fd-pin.zip"
+  local fd_pin
+  local path_pin
 
-  /bin/mkdir -m 700 "$fixture_root"
-  /usr/bin/printf 'owned archive\n' >"$output"
-  /bin/chmod 0644 "$output"
+  /usr/bin/printf 'PK\003\004fd pin fixture\n' >"$fixture"
+  /bin/chmod 0644 "$fixture"
   (
     # shellcheck disable=SC1090 # Fixed worktree release script.
     source "$RELEASE_SCRIPT"
-    identity="$(switchyard_native_release_file_identity "$output")"
-    /bin/mv "$output" "$output.away"
-    /usr/bin/printf 'foreign replacement\n' >"$output"
-    /bin/chmod 0644 "$output"
-    if remove_owned_native_release_output "$output" "$identity"; then
-      fail "release cleanup removed a foreign replacement"
-    fi
+    path_pin="$(switchyard_pin_native_release_file "$fixture")"
+    exec 15<"$fixture"
+    fd_pin="$(switchyard_pin_native_release_fd 15)"
+    [ "$fd_pin" = "$path_pin" ] || fail "numeric fd pin differs from path pin"
+    [ "$(/usr/bin/python3 -I - 15 <<'PY'
+import os
+import sys
+print(os.lseek(int(sys.argv[1]), 0, os.SEEK_CUR))
+PY
+)" = 0 ] || fail "numeric fd pin advanced the shared file offset"
+    /usr/bin/python3 -I - 15 <<'PY'
+import os
+import sys
+
+descriptor = int(sys.argv[1])
+data = b""
+while True:
+    block = os.read(descriptor, 4096)
+    if not block:
+        break
+    data += block
+if not data.startswith(b"PK\x03\x04"):
+    raise SystemExit("held notary input did not start at ZIP magic")
+PY
+    [ "$(switchyard_pin_native_release_fd 15)" = "$path_pin" ] ||
+      fail "numeric fd pin changed after a sequential consumer"
+    exec 15<&-
   )
-  /usr/bin/grep -Fqx 'foreign replacement' "$output" ||
-    fail "release cleanup changed a foreign replacement"
 }
 
 event_line() {
@@ -305,6 +358,7 @@ operations = {
     "macho_verify": call_offsets(
         release, "switchyard_verify_native_release_macho_tree"
     ),
+    "publish": call_offsets(release, "switchyard_publish_native_release_files"),
 }
 expected_counts = {
     "sign": 1,
@@ -319,6 +373,7 @@ expected_counts = {
     "extract": 1,
     "extracted_validate": 1,
     "macho_verify": 1,
+    "publish": 1,
 }
 for operation, expected in expected_counts.items():
     actual = len(operations[operation])
@@ -343,6 +398,7 @@ ordered = [
     operations["tree_match"][2],
     operations["pin"][1],
     operations["pin"][2],
+    operations["publish"][0],
 ]
 if ordered != sorted(ordered) or len(set(ordered)) != len(ordered):
     raise SystemExit(
@@ -517,6 +573,7 @@ if scenario in (
     "oversize",
     "encrypted",
     "unsupported-compression",
+    "central-size",
     "crc",
     "truncated",
     "duplicate",
@@ -622,6 +679,9 @@ with open(archive, "r+b") as stream:
             # only stored or deflated members.
             struct.pack_into("<H", data, central + 10, zipfile.ZIP_BZIP2)
             struct.pack_into("<H", data, local + 8, zipfile.ZIP_BZIP2)
+    elif scenario == "central-size":
+        end_record = data.rindex(b"PK\x05\x06")
+        struct.pack_into("<I", data, end_record + 12, 0xFFFFFFFF)
     elif scenario == "crc":
         with zipfile.ZipFile(archive) as package:
             target = package.getinfo(root + "/bin/runtime")
@@ -736,7 +796,7 @@ assert_native_release_archive_extractor() {
 
   for scenario in \
     extra-root absolute traversal duplicate casefold nfc escaping-symlink \
-    unsupported-type mode oversize encrypted unsupported-compression crc truncated; do
+    unsupported-type mode oversize encrypted unsupported-compression central-size crc truncated; do
     archive="$fixture_root/$scenario.zip"
     extraction_container="$fixture_root/$scenario-extracted"
     make_invalid_native_release_archive \
@@ -792,8 +852,14 @@ assert_native_release_archive_extractor() {
           "$fixture_root/$scenario.stderr" >/dev/null ||
           fail "compression fixture did not reach the compression policy"
         ;;
+      central-size)
+        /usr/bin/grep -F 'central directory size is outside its bound' \
+          "$fixture_root/$scenario.stderr" >/dev/null ||
+          fail "central-size fixture did not reach the pre-materialization bound"
+        ;;
     esac
-    if /usr/bin/find "$extraction_container" -mindepth 1 -print -quit |
+    if [ "$scenario" != crc ] &&
+       /usr/bin/find "$extraction_container" -mindepth 1 -print -quit |
        /usr/bin/grep -q .; then
       fail "native release extractor left output from the $scenario archive fixture"
     fi
@@ -852,6 +918,10 @@ run_case() {
   if [ "$failure_mode" = permissive-umask ]; then
     /bin/mkdir -m 700 "$output"
   fi
+  if [ "$failure_mode" = output-acl ]; then
+    /bin/mkdir -m 700 "$output"
+    /bin/chmod +a "$(/usr/bin/id -un) allow read" "$output"
+  fi
   make_runtime "$runtime" "$([ "$failure_mode" = unknown-source ] && printf 1 || printf 0)"
   if [ "$failure_mode" = missing-entry ]; then
     /usr/bin/printf 'not a Mach-O entry\n' >"$runtime/bin/wine.switchyard-real"
@@ -896,32 +966,156 @@ run_case() {
 
     eval "$(declare -f switchyard_create_native_release_archive |
       /usr/bin/sed '1s/switchyard_create_native_release_archive/switchyard_create_native_release_archive_original/')"
+    eval "$(declare -f switchyard_pin_native_release_file |
+      /usr/bin/sed '1s/switchyard_pin_native_release_file/switchyard_pin_native_release_file_original/')"
+    eval "$(declare -f switchyard_pin_native_release_fd |
+      /usr/bin/sed '1s/switchyard_pin_native_release_fd/switchyard_pin_native_release_fd_original/')"
     eval "$(declare -f switchyard_pin_native_release_archive |
       /usr/bin/sed '1s/switchyard_pin_native_release_archive/switchyard_pin_native_release_archive_original/')"
+    eval "$(declare -f switchyard_publish_native_release_files |
+      /usr/bin/sed '1s/switchyard_publish_native_release_files/switchyard_publish_native_release_files_original/')"
+    eval "$(declare -f switchyard_run_native_release_in_directory |
+      /usr/bin/sed '1s/switchyard_run_native_release_in_directory/switchyard_run_native_release_in_directory_original/')"
+    eval "$(declare -f switchyard_sign_native_release_runtime |
+      /usr/bin/sed '1s/switchyard_sign_native_release_runtime/switchyard_sign_native_release_runtime_original/')"
 
-    switchyard_publish_native_release_file() {
+    switchyard_run_native_release_in_directory() {
+      if [ "${3:-}" = "$fake_codesign" ]; then
+        local directory_fd="$1"
+        shift 2
+        /usr/bin/python3 -I - "$directory_fd" "$@" <<'PY'
+import os
+import sys
+
+os.fchdir(int(sys.argv[1]))
+os.execve(sys.argv[2], sys.argv[2:], os.environ)
+PY
+      else
+        switchyard_run_native_release_in_directory_original "$@" || return 1
+        if [ "$failure_mode" = plutil-return-mutation ] &&
+           [ "${3:-}" = /usr/bin/plutil ]; then
+          /usr/bin/printf 'plutil return-edge mutation\n' \
+            >>"$signed_runtime/share/doc/switchyard-wine/LICENSE"
+        fi
+      fi
+    }
+    switchyard_sign_native_release_runtime() {
+      if [ "$failure_mode" = macho-inventory-swap ]; then
+        /usr/bin/printf 'changed before signing\n' >>"$signed_runtime/bin/wineserver"
+      fi
+      switchyard_sign_native_release_runtime_original "$@" || return 1
+      if [ "$failure_mode" = sign-return-mutation ]; then
+        /usr/bin/printf 'sign-return mutation\n' \
+          >>"$signed_runtime/share/doc/switchyard-wine/LICENSE"
+      fi
+      if [ "$failure_mode" = fake-magic-sign-return-mutation ]; then
+        /usr/bin/printf 'changed after signing\n' \
+          >>"$signed_runtime/share/doc/switchyard-wine/fake-magic.bin"
+      fi
+    }
+
+    switchyard_pin_native_release_file() {
+      case "$failure_mode:$1" in
+        checksum-content-mutation:*.sha256)
+          /usr/bin/printf 'coherent but false checksum\n' >"$1"
+          ;;
+        manifest-content-mutation:*/switchyard-runtime-release.json)
+          /usr/bin/printf '{"schemaVersion":1,"developerTeamID":"AAAAAAAAAA"}\n' >"$1"
+          ;;
+      esac
+      switchyard_pin_native_release_file_original "$@"
+    }
+
+    switchyard_pin_native_release_fd() {
+      local replacement=""
+
+      if [ "$failure_mode" = checksum-content-mutation ] &&
+          [ "$1" = "${native_release_checksum_fd:-}" ]; then
+        replacement='coherent but false checksum'
+      elif [ "$failure_mode" = manifest-content-mutation ] &&
+          [ "$1" = "${native_release_manifest_fd:-}" ]; then
+        replacement='{"schemaVersion":1,"developerTeamID":"AAAAAAAAAA"}'
+      fi
+      if [ -n "$replacement" ]; then
+        /usr/bin/python3 -I - "$1" "$replacement" <<'PY'
+import os
+import sys
+
+descriptor = int(sys.argv[1])
+payload = (sys.argv[2] + "\n").encode("utf-8")
+os.ftruncate(descriptor, 0)
+if os.pwrite(descriptor, payload, 0) != len(payload):
+    raise SystemExit("short fixture mutation")
+os.fsync(descriptor)
+PY
+      fi
+      switchyard_pin_native_release_fd_original "$@"
+    }
+
+    switchyard_publish_native_release_files() {
+      local output
+      local saved_output
+      local status
+
       publish_call_count=$((publish_call_count + 1))
-      if [ "$failure_mode" = post-final-pin-mutation ] &&
-         [ "$publish_call_count" -eq 1 ]; then
-        /usr/bin/printf 'post-pin mutation\n' >>"$1"
-      fi
-      if [ "$failure_mode" = post-final-pin-path-swap ] &&
-         [ "$publish_call_count" -eq 1 ]; then
-        /bin/mv "$1" "$1.pinned"
-        /usr/bin/printf 'replacement archive\n' >"$1"
-        /bin/chmod 0644 "$1"
-      fi
-      if [ "$failure_mode" = partial-publication ] &&
-         [ "$publish_call_count" -eq 2 ]; then
-        echo "publication fixture failure" >&2
-        return 84
-      fi
-      switchyard_publish_native_release_file_atomically "$@"
+      case "$failure_mode" in
+        post-final-pin-mutation)
+          /usr/bin/printf 'post-pin mutation\n' >>"$3"
+          ;;
+        post-final-pin-path-swap)
+          /bin/mv "$3" "$3.pinned"
+          /usr/bin/printf 'replacement archive\n' >"$3"
+          /bin/chmod 0644 "$3"
+          ;;
+        post-final-pin-clone-swap)
+          /bin/mv "$3" "$3.pinned"
+          /bin/cp -p "$3.pinned" "$3"
+          ;;
+        post-final-pin-fifo-swap)
+          /bin/mv "$3" "$3.pinned"
+          /usr/bin/mkfifo "$3"
+          ;;
+        post-final-pin-xattr)
+          /usr/bin/xattr -w com.apple.quarantine fixture "$3"
+          ;;
+        post-final-pin-acl)
+          /bin/chmod +a "$(/usr/bin/id -un) allow read" "$3"
+          ;;
+        provenance-pin-mismatch)
+          switchyard_publish_native_release_files_original \
+            "$1" "$2" "$3" "$4" "${5%$'\t'*}"$'\t00' \
+            "$6" "$7" "$8" "$9" "${10}" "${11}"
+          return
+          ;;
+        output-root-swap)
+          output="${4%/*}"
+          saved_output="$output.original"
+          /bin/mv "$output" "$saved_output"
+          /bin/mkdir -m 700 "$output"
+          if switchyard_publish_native_release_files_original "$@"; then
+            /bin/rmdir "$output"
+            /bin/mv "$saved_output" "$output"
+            return 0
+          else
+            status=$?
+          fi
+          /bin/rmdir "$output"
+          /bin/mv "$saved_output" "$output"
+          return "$status"
+          ;;
+        partial-publication)
+          /bin/cp "$3" "$4"
+          /bin/chmod 0644 "$4"
+          /usr/bin/printf 'foreign replacement\n' >"$4"
+          echo "publication fixture failure" >&2
+          return 84
+          ;;
+      esac
+      switchyard_publish_native_release_files_original "$@"
     }
     switchyard_submit_native_release_notary() {
       [ "$failure_mode" = malformed-notary ] || return 85
-      /usr/bin/printf '%s\n' \
-        '{"status":"Accepted","id":"malformed submission id"}' >"$3"
+      /usr/bin/printf 'Accepted\tmalformed submission id\n'
     }
 
     switchyard_require_runtime_profile_enabled() { return 0; }
@@ -950,7 +1144,12 @@ run_case() {
       switchyard_validate_runtime_manifest_profile \
         "$2" preview-native-arm64-fex "$1" &&
         switchyard_validate_native_arm64_runtime_packaging \
-          "$1" "$2" "$ROOT_DIR"
+          "$1" "$2" "$ROOT_DIR" || return 1
+      if [ "$failure_mode" = validation-return-mutation ] &&
+         [ "$native_validation_call_count" -eq 1 ]; then
+        /usr/bin/printf 'validator return-edge mutation\n' \
+          >>"$1/share/doc/switchyard-wine/LICENSE"
+      fi
     }
     switchyard_refresh_native_arm64_signed_runtime_manifest() {
       /usr/bin/printf 'refresh\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
@@ -959,6 +1158,10 @@ run_case() {
           >"$1/.switchyard-signed-manifest-refresh-in-progress"
         echo "native signed-manifest refresh rejected an unknown field" >&2
         return 1
+      fi
+      if [ "$failure_mode" = refresh-return-mutation ]; then
+        /usr/bin/printf 'refresh return-edge mutation\n' \
+          >>"$1/share/doc/switchyard-wine/LICENSE"
       fi
     }
     switchyard_run_native_release_smoke() {
@@ -1035,6 +1238,12 @@ run_case() {
     if [ "$failure_mode" = extracted-unexpected-entitlement ]; then
       export SWITCHYARD_TEST_EXTRACTED_UNEXPECTED_ENTITLEMENT=1
     fi
+    if [ "$failure_mode" = extracted-gstreamer-x86-wrong-team ]; then
+      export SWITCHYARD_TEST_EXTRACTED_X86_TEAM_MISMATCH=1
+    fi
+    if [ "$failure_mode" = extracted-gstreamer-x86-entitlement-error ]; then
+      export SWITCHYARD_TEST_EXTRACTED_X86_ENTITLEMENT_ERROR=1
+    fi
     release_arguments=(
       --runtime "$runtime" \
       --runtime-content-sha256 "$expected_digest" \
@@ -1055,7 +1264,7 @@ run_case() {
     fail "$label returned $status instead of $expected_status"
   }
   if [ "$expected_status" -ne 0 ]; then
-    assert_no_publication "$output"
+    assert_no_completed_publication "$output" "$failure_mode"
   fi
 }
 
@@ -1073,8 +1282,8 @@ run_case() {
   fail "stable release output mode normalization changed"
 assert_native_release_source_contract || fail "native release source ordering contract changed"
 assert_native_release_stop_is_idempotent
-assert_native_release_cleanup_preserves_foreign_replacement
 assert_native_release_archive_extractor
+assert_native_release_fd_pin
 
 run_case success none 0
 success_output="$TEST_ROOT/success-output"
@@ -1082,14 +1291,28 @@ success_log="$TEST_ROOT/success-case/order.log"
 archive="$(/usr/bin/find "$success_output" -maxdepth 1 -type f -name '*.zip' -print)"
 checksum="$(/usr/bin/find "$success_output" -maxdepth 1 -type f -name '*.zip.sha256' -print)"
 release_manifest="$success_output/switchyard-runtime-release.json"
+private_staging="$(/usr/bin/find "$success_output" -mindepth 1 -maxdepth 1 \
+  -type d -name '.switchyard-native-release.*' -print)"
 [ -f "$archive" ] && [ -f "$checksum" ] && [ -f "$release_manifest" ] ||
   fail "successful native release did not publish its exact output set"
-[ "$(/usr/bin/find "$success_output" -mindepth 1 -maxdepth 1 -print | /usr/bin/wc -l | tr -d ' ')" -eq 3 ] ||
+[ -d "$private_staging" ] && [ ! -L "$private_staging" ] &&
+  [ "$(/usr/bin/stat -f '%Lp' "$private_staging")" = 700 ] ||
+  fail "successful native release did not preserve one private audit tree"
+[ "$(/usr/bin/find "$success_output" -mindepth 1 -maxdepth 1 -print | /usr/bin/wc -l | tr -d ' ')" -eq 4 ] ||
   fail "successful native release published unexpected output"
 [ "$(/usr/bin/stat -f '%Lp' "$archive")" = 644 ] &&
   [ "$(/usr/bin/stat -f '%Lp' "$checksum")" = 644 ] &&
   [ "$(/usr/bin/stat -f '%Lp' "$release_manifest")" = 644 ] ||
   fail "successful native release output modes are not exact"
+for published in "$archive" "$checksum" "$release_manifest"; do
+  if /usr/bin/xattr "$published" |
+     /usr/bin/grep -Fvx 'com.apple.provenance' | /usr/bin/grep -q .; then
+    fail "successful native release output retained unsafe extended attributes"
+  fi
+  if /bin/ls -lde "$published" | /usr/bin/grep -q '^ '; then
+    fail "successful native release output retained an extended ACL"
+  fi
+done
 (
   cd "$success_output"
   /usr/bin/shasum -a 256 -c "$(basename "$checksum")" >/dev/null
@@ -1142,8 +1365,13 @@ smoke_line="$(event_line smoke "$success_log")"
 
 run_case signing-failure signing 1
 run_case signing-wrong-team signing-wrong-team 1
+run_case plutil-return-mutation plutil-return-mutation 1
+run_case macho-inventory-swap macho-inventory-swap 1
+run_case sign-return-mutation sign-return-mutation 1
+run_case fake-magic-sign-return-mutation fake-magic-sign-return-mutation 1
 run_case missing-entry missing-entry 1
 run_case refresh-unknown-field refresh-unknown 1
+run_case refresh-return-mutation refresh-return-mutation 1
 run_case archive-extract-failure archive-extract 1
 run_case extracted-outer-tamper extracted-outer-tamper 1
 run_case portable-install-prefix portable-install-prefix 1
@@ -1156,9 +1384,13 @@ run_case extracted-gstreamer-arm64-only extracted-gstreamer-arm64-only 1
   'Mach-O architecture set is not exact: lib/switchyard-gstreamer/libfixture.dylib' \
   "$TEST_ROOT/extracted-gstreamer-arm64-only-case/stderr" >/dev/null ||
   fail "GStreamer architecture fixture did not reach the universal-image policy"
+run_case extracted-gstreamer-x86-wrong-team extracted-gstreamer-x86-wrong-team 1
+run_case extracted-gstreamer-x86-entitlement-error \
+  extracted-gstreamer-x86-entitlement-error 1
 run_case extracted-smoke-failure smoke 73
 run_case validator-failure post-smoke-validator 1
 run_case post-outer-dependency-mutation post-outer-dependency-mutation 1
+run_case validation-return-mutation validation-return-mutation 1
 if /usr/bin/grep -Fqx archive \
     "$TEST_ROOT/post-outer-dependency-mutation-case/order.log"; then
   fail "native release archived a runtime changed after its outer marker"
@@ -1176,6 +1408,15 @@ fi
   fail "coherent post-validation mutation did not reach the pinned digest gate"
 run_case post-final-pin-mutation post-final-pin-mutation 1
 run_case post-final-pin-path-swap post-final-pin-path-swap 1
+run_case post-final-pin-clone-swap post-final-pin-clone-swap 1
+run_case post-final-pin-fifo-swap post-final-pin-fifo-swap 1
+run_case post-final-pin-xattr post-final-pin-xattr 1
+run_case post-final-pin-acl post-final-pin-acl 1
+run_case provenance-pin-mismatch provenance-pin-mismatch 1
+run_case checksum-content-mutation checksum-content-mutation 1
+run_case manifest-content-mutation manifest-content-mutation 1
+run_case output-root-swap output-root-swap 1
+run_case output-acl output-acl 1
 run_case permissive-umask permissive-umask 0
 for published in "$TEST_ROOT/permissive-umask-output"/*; do
   [ -f "$published" ] && [ ! -L "$published" ] &&

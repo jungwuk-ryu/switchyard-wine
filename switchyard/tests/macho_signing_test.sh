@@ -15,6 +15,9 @@ cleanup() {
   if [ -e /dev/fd/19 ]; then
     exec 19<&-
   fi
+  if [ -e /dev/fd/18 ]; then
+    exec 18<&-
+  fi
   case "$TEST_ROOT" in
     /private/tmp/switchyard-macho-signing.??????)
       [ ! -L "$TEST_ROOT" ] && /bin/rm -rf -- "$TEST_ROOT"
@@ -382,6 +385,30 @@ sign_release_macho_atomically \
 /usr/bin/grep -a -F 'SWITCHYARD_RELEASE_SIGNATURE' "$release_target" >/dev/null ||
   fail "release mode did not publish its signed target"
 assert_no_staging "$TEST_ROOT"
+
+pinned_root="$TEST_ROOT/pinned-release-root"
+pinned_root_moved="$TEST_ROOT/pinned-release-root.moved"
+/bin/mkdir -m 700 "$pinned_root"
+make_target "$pinned_root/release.bin"
+exec 18<"$pinned_root"
+/bin/mv "$pinned_root" "$pinned_root_moved"
+/bin/mkdir -m 700 "$pinned_root"
+make_target "$pinned_root/release.bin"
+sign_release_macho_at_fd_atomically \
+  "$fake_codesign" 18 release.bin \
+  'Developer ID Application: Fixture (TEAMID)' ||
+  fail "pinned-directory Developer-ID signing failed after path replacement"
+/usr/bin/grep -a -F 'SWITCHYARD_RELEASE_SIGNATURE' \
+  "$pinned_root_moved/release.bin" >/dev/null ||
+  fail "pinned-directory signing did not update the held directory"
+/usr/bin/grep -Fx 'UNSIGNED:release.bin' "$pinned_root/release.bin" >/dev/null ||
+  fail "pinned-directory signing modified the pathname replacement"
+staged_original="$(/usr/bin/find "$pinned_root_moved" -maxdepth 2 \
+  -path '*/.switchyard-codesign.*/release.bin' -type f -print)"
+[ -n "$staged_original" ] &&
+  /usr/bin/grep -Fx 'UNSIGNED:release.bin' "$staged_original" >/dev/null ||
+  fail "pinned-directory signing did not preserve its displaced original"
+exec 18<&-
 close_validated_entitlements_snapshot "$failure_fd" || fail "could not close failure snapshot"
 
 real_runtime="$TEST_ROOT/real-runtime"

@@ -733,23 +733,31 @@ finally:
 PY
 }
 
-sign_macho_atomically() {
-  local codesign_tool item
+switchyard_sign_macho_atomically_internal() {
+  local codesign_tool directory_fd item
 
-  [ "$#" -ge 3 ] || {
-    echo "usage: sign_macho_atomically CODESIGN ITEM CODESIGN_ARGUMENT..." >&2
+  [ "$#" -ge 4 ] || {
+    echo "usage: switchyard_sign_macho_atomically_internal DIRECTORY_FD CODESIGN ITEM CODESIGN_ARGUMENT..." >&2
     return 2
   }
-  codesign_tool="$1"
-  item="$2"
-  shift 2
+  directory_fd="$1"
+  codesign_tool="$2"
+  item="$3"
+  shift 3
   [ -x "$codesign_tool" ] && [ ! -L "$codesign_tool" ] || {
     echo "Mach-O signing tool is missing or unsafe: $codesign_tool" >&2
     return 1
   }
 
-  /usr/bin/python3 -I - "$codesign_tool" "$item" "$@" <<'PY'
+  /usr/bin/env \
+    -u BASH_ENV -u ENV -u CODESIGN_ALLOCATE -u DEVELOPER_DIR \
+    -u DYLD_INSERT_LIBRARIES -u DYLD_LIBRARY_PATH \
+    -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_FRAMEWORK_PATH \
+    -u DYLD_FALLBACK_FRAMEWORK_PATH -u PYTHONHOME -u PYTHONPATH \
+    /usr/bin/python3 -I - \
+    "$directory_fd" "$codesign_tool" "$item" "$@" <<'PY'
 import ctypes
+import hashlib
 import os
 import plistlib
 import re
@@ -835,9 +843,30 @@ def open_directory(path):
         raise
 
 
-def require_directory_path(path, expected_id):
+def open_directory_at(root_fd, path):
+    descriptor = os.dup(root_fd)
     try:
-        descriptor = open_directory(path)
+        for component in path.split(os.path.sep):
+            if not component or component == ".":
+                continue
+            if component == "..":
+                raise PublicationError("Mach-O parent escapes its pinned directory")
+            following = os.open(component, DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = following
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def require_directory_path(path, expected_id, root_fd=None):
+    try:
+        descriptor = (
+            open_directory(path)
+            if root_fd is None
+            else open_directory_at(root_fd, path)
+        )
     except OSError as error:
         raise PublicationError(f"Mach-O signing parent changed or contains a symlink: {error}") from error
     try:
@@ -864,7 +893,7 @@ def any_entry(directory_fd, filename, description):
         raise PublicationError(f"cannot identify {description}: {error}") from error
 
 
-def create_staging_directory(parent_fd):
+def create_staging_directory(parent_fd, cleanup_on_error=True):
     for unused in range(128):
         name = ".switchyard-codesign." + secrets.token_hex(8)
         try:
@@ -886,10 +915,11 @@ def create_staging_directory(parent_fd):
             raise PublicationError("private Mach-O signing staging directory is unsafe")
         return name, descriptor
     except BaseException:
-        try:
-            os.rmdir(name, dir_fd=parent_fd)
-        except OSError:
-            pass
+        if cleanup_on_error:
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError:
+                pass
         raise
 
 
@@ -922,6 +952,17 @@ def run_in_directory(directory_fd, arguments, pass_fds=()):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             pass_fds=pass_fds,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "LC_ALL": "C",
+                "LANG": "C",
+                "TMPDIR": "/private/tmp",
+                **{
+                    name: value for name, value in os.environ.items()
+                    if name.startswith("SWITCHYARD_FAKE_")
+                    or name.startswith("SWITCHYARD_TEST_")
+                },
+            },
         )
     finally:
         os.fchdir(saved_fd)
@@ -1050,6 +1091,20 @@ def read_snapshot(descriptor, expected_state):
     return value
 
 
+def sha256_file(descriptor, expected):
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < expected.st_size:
+        block = os.pread(descriptor, min(1024 * 1024, expected.st_size - offset), offset)
+        if not block:
+            raise PublicationError("Mach-O source ended while hashing")
+        digest.update(block)
+        offset += len(block)
+    if os.pread(descriptor, 1, offset) or file_state(os.fstat(descriptor)) != file_state(expected):
+        raise PublicationError("Mach-O source changed while hashing")
+    return digest.hexdigest()
+
+
 def verify_staging_signature(
     codesign, staging_fd, target_argument, mode, snapshot_fd, snapshot_fd_states
 ):
@@ -1127,20 +1182,59 @@ def interrupted(signum, unused_frame):
 
 
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 5:
         raise PublicationError("atomic Mach-O signing arguments are incomplete")
-    codesign = sys.argv[1]
-    item = sys.argv[2]
+    directory_fd_text = sys.argv[1]
+    codesign = sys.argv[2]
+    item = sys.argv[3]
     if not os.path.isabs(codesign) or os.path.normpath(codesign) != codesign:
         raise PublicationError("Mach-O signing tool path is not canonical and absolute")
-    if (
+    root_fd = None
+    if directory_fd_text:
+        if not directory_fd_text.isascii() or not directory_fd_text.isdecimal():
+            raise PublicationError("Mach-O signing directory descriptor is malformed")
+        root_fd = os.dup(int(directory_fd_text))
+        root = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root.st_mode)
+            or root.st_uid != os.geteuid()
+            or stat.S_IMODE(root.st_mode) != 0o700
+            or getattr(root, "st_flags", 0)
+        ):
+            raise PublicationError("Mach-O signing directory descriptor is unsafe")
+        if (
+            os.path.isabs(item)
+            or os.path.normpath(item) != item
+            or item in ("", ".", "..")
+            or item.startswith("../")
+            or "\n" in item
+            or "\r" in item
+        ):
+            raise PublicationError("Mach-O target is not a bounded relative path")
+    elif (
         not os.path.isabs(item)
         or os.path.normpath(item) != item
         or "\n" in item
         or "\r" in item
     ):
         raise PublicationError("Mach-O target path is not canonical and absolute")
-    arguments, signing_fds, signing_fd_states, snapshot_fd = pin_entitlements(sys.argv[3:])
+    raw_arguments = sys.argv[4:]
+    expected_source_sha256 = None
+    if "--switchyard-expected-source-sha256" in raw_arguments:
+        digest_index = raw_arguments.index("--switchyard-expected-source-sha256")
+        if (
+            raw_arguments.count("--switchyard-expected-source-sha256") != 1
+            or digest_index + 1 >= len(raw_arguments)
+            or len(raw_arguments[digest_index + 1]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in raw_arguments[digest_index + 1]
+            )
+        ):
+            raise PublicationError("expected Mach-O source digest is malformed")
+        expected_source_sha256 = raw_arguments[digest_index + 1]
+        raw_arguments = raw_arguments[:digest_index] + raw_arguments[digest_index + 2:]
+    arguments, signing_fds, signing_fd_states, snapshot_fd = pin_entitlements(raw_arguments)
     mode = signing_mode(arguments)
     directory, filename = os.path.split(item)
     if not filename or filename in (".", ".."):
@@ -1157,8 +1251,24 @@ def main():
         ctypes.c_uint,
     ]
     libc.renameatx_np.restype = ctypes.c_int
+    libc.acl_get_fd_np.argtypes = ctypes.c_int, ctypes.c_int
+    libc.acl_get_fd_np.restype = ctypes.c_void_p
+    libc.acl_free.argtypes = ctypes.c_void_p,
+    libc.acl_free.restype = ctypes.c_int
+    if root_fd is not None:
+        ctypes.set_errno(0)
+        root_acl = libc.acl_get_fd_np(root_fd, 0x00000100)
+        if root_acl:
+            libc.acl_free(root_acl)
+            raise PublicationError("Mach-O signing directory has an extended ACL")
+        if ctypes.get_errno() not in (0, 2):
+            raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
 
-    parent_fd = open_directory(directory)
+    parent_fd = (
+        open_directory(directory)
+        if root_fd is None
+        else open_directory_at(root_fd, directory)
+    )
     source_fd = -1
     signed_fd = -1
     staging_fd = -1
@@ -1176,14 +1286,27 @@ def main():
             raise PublicationError("Mach-O signing target changed while opening it")
         if source.st_uid != os.geteuid() or source.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise PublicationError("Mach-O signing target has an unsafe owner or mode")
+        if expected_source_sha256 is not None and sha256_file(source_fd, source) != expected_source_sha256:
+            raise PublicationError("Mach-O signing target differs from its inventory digest")
 
-        staging_name, staging_fd = create_staging_directory(parent_fd)
+        staging_name, staging_fd = create_staging_directory(
+            parent_fd if root_fd is None else root_fd,
+            cleanup_on_error=root_fd is None,
+        )
         copied = copy_file(source_fd, staging_fd, filename, source, libc)
         staging_has_entry = True
         if file_id(copied) == file_id(source):
             raise PublicationError("private Mach-O copy reused the published inode")
         if file_state(os.fstat(source_fd)) != file_state(source):
             raise PublicationError("Mach-O signing target changed while copying")
+        if expected_source_sha256 is not None:
+            copied_fd = os.open(filename, FILE_FLAGS, dir_fd=staging_fd)
+            try:
+                copied_state = os.fstat(copied_fd)
+                if sha256_file(copied_fd, copied_state) != expected_source_sha256:
+                    raise PublicationError("private Mach-O copy differs from its inventory digest")
+            finally:
+                os.close(copied_fd)
 
         target_argument = "./" + filename
         status, stdout, stderr = run_in_directory(
@@ -1216,7 +1339,7 @@ def main():
         if preserved_metadata(verified) != preserved_metadata(source):
             raise PublicationError("signed Mach-O staging copy changed source metadata")
 
-        require_directory_path(directory, parent_id)
+        require_directory_path(directory, parent_id, root_fd)
         if file_state(os.fstat(source_fd)) != file_state(source):
             raise PublicationError("Mach-O signing target changed before publication")
         current = regular_entry(parent_fd, filename, "Mach-O target before publication")
@@ -1235,6 +1358,10 @@ def main():
         displaced_original = stat.S_ISREG(displaced.st_mode) and file_id(displaced) == file_id(source)
         published_signed = stat.S_ISREG(published.st_mode) and file_id(published) == file_id(signed)
         if not displaced_original and published_signed:
+            if root_fd is not None:
+                raise PublicationError(
+                    "Mach-O signing target changed during fd-bound atomic publication"
+                )
             rollback_swap(
                 libc, staging_fd, parent_fd, filename, file_id(signed), file_id(displaced)
             )
@@ -1250,8 +1377,10 @@ def main():
         staging_has_entry = True
 
         try:
-            require_directory_path(directory, parent_id)
+            require_directory_path(directory, parent_id, root_fd)
         except BaseException as path_error:
+            if root_fd is not None:
+                raise path_error
             staging_entry = any_entry(staging_fd, filename, "rollback staging entry")
             target_entry = any_entry(parent_fd, filename, "rollback target entry")
             if (
@@ -1273,9 +1402,11 @@ def main():
         if file_id(final) != file_id(signed) or file_id(final) == file_id(source):
             raise PublicationError("atomic Mach-O publication installed an unexpected inode")
         os.fsync(parent_fd)
-        retain_staging = False
+        retain_staging = root_fd is not None
     except BaseException as error:
         operation_error = error
+        if root_fd is not None and staging_name is not None:
+            retain_staging = True
     finally:
         for descriptor in signing_fds:
             os.close(descriptor)
@@ -1290,13 +1421,16 @@ def main():
             os.close(staging_fd)
         if staging_name is not None and not retain_staging:
             try:
-                os.rmdir(staging_name, dir_fd=parent_fd)
-                os.fsync(parent_fd)
+                staging_parent_fd = parent_fd if root_fd is None else root_fd
+                os.rmdir(staging_name, dir_fd=staging_parent_fd)
+                os.fsync(staging_parent_fd)
             except OSError as error:
                 cleanup_errors.append(f"cannot remove private Mach-O staging directory: {error}")
         if source_fd >= 0:
             os.close(source_fd)
         os.close(parent_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
     if operation_error is not None:
         print(str(operation_error), file=sys.stderr)
@@ -1318,6 +1452,30 @@ except OSError as error:
     print(f"atomic Mach-O signing failed: {error}", file=sys.stderr)
     raise SystemExit(1)
 PY
+}
+
+sign_macho_atomically() {
+  [ "$#" -ge 3 ] || {
+    echo "usage: sign_macho_atomically CODESIGN ITEM CODESIGN_ARGUMENT..." >&2
+    return 2
+  }
+  switchyard_sign_macho_atomically_internal "" "$@"
+}
+
+sign_macho_at_fd_atomically() {
+  local codesign_tool directory_fd item
+
+  [ "$#" -ge 4 ] || {
+    echo "usage: sign_macho_at_fd_atomically CODESIGN DIRECTORY_FD ITEM CODESIGN_ARGUMENT..." >&2
+    return 2
+  }
+  codesign_tool="$1"
+  directory_fd="$2"
+  item="$3"
+  shift 3
+  case "$directory_fd" in ''|*[!0-9]*) return 2 ;; esac
+  switchyard_sign_macho_atomically_internal \
+    "$directory_fd" "$codesign_tool" "$item" "$@"
 }
 
 sign_engineering_macho_atomically() {
@@ -1399,4 +1557,26 @@ sign_release_macho_atomically() {
     echo "Release Mach-O is not signed by a Developer ID Application identity: $item" >&2
     return 1
   }
+}
+
+sign_release_macho_at_fd_atomically() {
+  local codesign_tool directory_fd item identity
+
+  [ "$#" -ge 4 ] || {
+    echo "usage: sign_release_macho_at_fd_atomically CODESIGN DIRECTORY_FD ITEM IDENTITY [CODESIGN_ARGUMENT...]" >&2
+    return 2
+  }
+  codesign_tool="$1"
+  directory_fd="$2"
+  item="$3"
+  identity="$4"
+  shift 4
+  [ -n "$identity" ] && [ "$identity" != - ] &&
+    [[ "$identity" != -* ]] && [[ "$identity" != *$'\n'* ]] &&
+    [[ "$identity" != *$'\r'* ]] || {
+    echo "Release Mach-O signing requires a non-ad-hoc identity." >&2
+    return 2
+  }
+  sign_macho_at_fd_atomically "$codesign_tool" "$directory_fd" "$item" \
+    --force --sign "$identity" --options runtime --timestamp "$@"
 }
