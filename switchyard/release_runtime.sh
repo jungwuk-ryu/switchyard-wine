@@ -1287,6 +1287,7 @@ switchyard_release_preview_native() {
   local release_architecture_command=""
   local release_pe_architectures=""
   local smoke_status
+  local signed_runtime_digest
   local prefix_candidate
   local pe_architecture
   local command_part
@@ -1355,11 +1356,25 @@ switchyard_release_preview_native() {
   switchyard_validate_native_release_runtime \
     "$signed_runtime" "$portable_manifest" || return 1
 
+  # Bind every later check to the exact validated, signed staging payload.
+  # The outer marker is excluded from this digest, so pinning before its
+  # replacement also closes coherent payload+marker mutation races.
+  signed_runtime_digest="$(runtime_content_tree_digest "$signed_runtime")" || return 1
+  [[ "$signed_runtime_digest" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "native release signed staging digest is malformed" >&2
+    return 1
+  }
+
   # The outer marker is the sole allowed runtime mutation after the signed
   # manifest refresh.  Everything below this point is read-only for the tree.
   switchyard_publish_native_outer_digest "$signed_runtime" || return 1
   runtime_content_tree_is_verified "$signed_runtime" || {
     echo "native release outer content digest did not verify" >&2
+    return 1
+  }
+  [ "$(runtime_content_tree_digest "$signed_runtime")" = \
+      "$signed_runtime_digest" ] || {
+    echo "native release signed staging changed before archive creation" >&2
     return 1
   }
 
@@ -1397,9 +1412,19 @@ switchyard_release_preview_native() {
   extracted_manifest="$native_release_smoke_runtime/switchyard-runtime.json"
   switchyard_validate_extracted_native_release_runtime \
     "$native_release_smoke_runtime" "$extracted_manifest" || return 1
+  [ "$(runtime_content_tree_digest "$native_release_smoke_runtime")" = \
+      "$signed_runtime_digest" ] || {
+    echo "extracted native runtime differs from signed staging" >&2
+    return 1
+  }
   switchyard_verify_native_release_macho_tree \
     "$native_release_smoke_runtime" "$entitlements_snapshot_fd" || return 1
   runtime_content_tree_is_verified "$native_release_smoke_runtime" || {
+    echo "extracted native runtime changed during Mach-O validation" >&2
+    return 1
+  }
+  [ "$(runtime_content_tree_digest "$native_release_smoke_runtime")" = \
+      "$signed_runtime_digest" ] || {
     echo "extracted native runtime changed during Mach-O validation" >&2
     return 1
   }
@@ -1428,6 +1453,11 @@ switchyard_release_preview_native() {
     return "$smoke_status"
   }
   runtime_content_tree_is_verified "$native_release_smoke_runtime" || {
+    echo "extracted native runtime changed during no-Rosetta smoke" >&2
+    return 1
+  }
+  [ "$(runtime_content_tree_digest "$native_release_smoke_runtime")" = \
+      "$signed_runtime_digest" ] || {
     echo "extracted native runtime changed during no-Rosetta smoke" >&2
     return 1
   }

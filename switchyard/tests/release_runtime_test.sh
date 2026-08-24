@@ -12,6 +12,8 @@ NATIVE_ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime-native-arm64.entitlements
 TEST_ROOT="$(/usr/bin/mktemp -d /private/tmp/switchyard-release-runtime.XXXXXX)"
 TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
 NATIVE_MACHO_FIXTURE="$TEST_ROOT/native-arm64-macho-fixture"
+X86_64_MACHO_FIXTURE="$TEST_ROOT/x86_64-macho-fixture"
+UNIVERSAL_MACHO_FIXTURE="$TEST_ROOT/universal-macho-fixture"
 SOURCE_REVISION="$(/usr/bin/git -C "$ROOT_DIR" rev-parse HEAD)"
 
 cleanup() {
@@ -72,17 +74,26 @@ make_runtime() {
   if [ ! -f "$NATIVE_MACHO_FIXTURE" ]; then
     /usr/bin/printf '%s\n' 'int main(void) { return 0; }' |
       /usr/bin/clang -arch arm64 -x c - -o "$NATIVE_MACHO_FIXTURE"
+    /usr/bin/printf '%s\n' 'int main(void) { return 0; }' |
+      /usr/bin/clang -arch x86_64 -x c - -o "$X86_64_MACHO_FIXTURE"
+    /usr/bin/lipo -create \
+      "$X86_64_MACHO_FIXTURE" "$NATIVE_MACHO_FIXTURE" \
+      -output "$UNIVERSAL_MACHO_FIXTURE"
     /bin/chmod 0755 "$NATIVE_MACHO_FIXTURE"
+    /bin/chmod 0755 "$X86_64_MACHO_FIXTURE" "$UNIVERSAL_MACHO_FIXTURE"
   fi
   /bin/cp "$NATIVE_MACHO_FIXTURE" "$runtime/lib/wine/aarch64-unix/wine"
   /bin/cp "$NATIVE_MACHO_FIXTURE" "$runtime/bin/wine.switchyard-real"
   /bin/cp "$NATIVE_MACHO_FIXTURE" "$runtime/bin/wineserver"
   /bin/cp "$NATIVE_MACHO_FIXTURE" "$runtime/lib/wine/aarch64-unix/helper.dylib"
+  /bin/cp "$UNIVERSAL_MACHO_FIXTURE" \
+    "$runtime/lib/switchyard-gstreamer/libfixture.dylib"
   /bin/chmod 0755 \
     "$runtime/lib/wine/aarch64-unix/wine" \
     "$runtime/bin/wine.switchyard-real" \
     "$runtime/bin/wineserver" \
-    "$runtime/lib/wine/aarch64-unix/helper.dylib"
+    "$runtime/lib/wine/aarch64-unix/helper.dylib" \
+    "$runtime/lib/switchyard-gstreamer/libfixture.dylib"
   /bin/ln -s wine.switchyard-real "$runtime/bin/switchyard-wine"
   /usr/bin/printf 'fixture PE command\n' >"$runtime/lib/wine/aarch64-windows/cmd.exe"
 
@@ -475,7 +486,14 @@ def member(name, mode, data=b""):
 
 
 entries = None
-if scenario in ("mode", "oversize", "crc", "truncated"):
+if scenario in (
+    "mode",
+    "oversize",
+    "encrypted",
+    "unsupported-compression",
+    "crc",
+    "truncated",
+):
     if not producer_archive:
         raise SystemExit("producer archive is required for mutation fixtures")
     shutil.copyfile(producer_archive, archive)
@@ -513,7 +531,9 @@ if entries is not None:
 
 with open(archive, "r+b") as stream:
     data = bytearray(stream.read())
-    if scenario in ("mode", "oversize"):
+    if scenario in (
+        "mode", "oversize", "encrypted", "unsupported-compression"
+    ):
         central = 0
         expected = (root + "/bin/runtime").encode("utf-8")
         while True:
@@ -525,13 +545,24 @@ with open(archive, "r+b") as stream:
             if name == expected:
                 break
             central += 46 + name_length + extra_length + comment_length
+        local = struct.unpack_from("<I", data, central + 42)[0]
         if scenario == "mode":
             struct.pack_into("<I", data, central + 38,
                              (stat.S_IFREG | 0o777) << 16)
-        else:
+        elif scenario == "oversize":
             # The central-directory uncompressed-size field is authoritative
             # to ZipFile readers.  No large allocation is needed.
             struct.pack_into("<I", data, central + 24, 0x7FFFFFFF)
+        elif scenario == "encrypted":
+            central_flags = struct.unpack_from("<H", data, central + 8)[0]
+            local_flags = struct.unpack_from("<H", data, local + 6)[0]
+            struct.pack_into("<H", data, central + 8, central_flags | 0x1)
+            struct.pack_into("<H", data, local + 6, local_flags | 0x1)
+        else:
+            # BZIP2 is a valid ZIP method, but the release contract permits
+            # only stored or deflated members.
+            struct.pack_into("<H", data, central + 10, zipfile.ZIP_BZIP2)
+            struct.pack_into("<H", data, local + 8, zipfile.ZIP_BZIP2)
     elif scenario == "crc":
         with zipfile.ZipFile(archive) as package:
             target = package.getinfo(root + "/bin/runtime")
@@ -555,6 +586,8 @@ assert_native_release_archive_extractor() {
   local extraction_container="$fixture_root/extracted"
   local archive_sha256
   local archive_size
+  local permission
+  local permission_label
   local scenario
   local status
 
@@ -591,9 +624,59 @@ assert_native_release_archive_extractor() {
     fail "native release extractor did not reproduce the exact runtime closure"
   fi
 
+  /bin/ln \
+    "$source_runtime/bin/runtime" "$source_runtime/bin/runtime-hardlink"
+  extraction_container="$fixture_root/hardlink-extracted"
+  /bin/mkdir -m 700 "$extraction_container"
+  set +e
+  (
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    switchyard_extract_native_release_archive \
+      "$archive" "$source_runtime" "$extraction_container" \
+      "$source_root_name" "$archive_sha256" "$archive_size"
+  ) >"$fixture_root/hardlink.stdout" 2>"$fixture_root/hardlink.stderr"
+  status=$?
+  set -e
+  /bin/rm -f "$source_runtime/bin/runtime-hardlink"
+  [ "$status" -ne 0 ] &&
+    /usr/bin/grep -F 'hard-linked file' \
+      "$fixture_root/hardlink.stderr" >/dev/null ||
+    fail "native release extractor did not reject a staging hard link directly"
+
+  # /private/tmp inherits group wheel on this host; use the caller's primary
+  # group so macOS can represent a setgid fixture instead of silently clearing it.
+  /usr/bin/chgrp "$(/usr/bin/id -g)" "$source_runtime/bin/runtime"
+  for permission_label in setuid setgid sticky; do
+    case "$permission_label" in
+      setuid) permission=4755 ;;
+      setgid) permission=2755 ;;
+      sticky) permission=1755 ;;
+    esac
+    /bin/chmod "$permission" "$source_runtime/bin/runtime"
+    extraction_container="$fixture_root/$permission_label-extracted"
+    /bin/mkdir -m 700 "$extraction_container"
+    set +e
+    (
+      # shellcheck disable=SC1090 # Fixed worktree release script.
+      source "$RELEASE_SCRIPT"
+      switchyard_extract_native_release_archive \
+        "$archive" "$source_runtime" "$extraction_container" \
+        "$source_root_name" "$archive_sha256" "$archive_size"
+    ) >"$fixture_root/$permission_label.stdout" \
+      2>"$fixture_root/$permission_label.stderr"
+    status=$?
+    set -e
+    /bin/chmod 0755 "$source_runtime/bin/runtime"
+    [ "$status" -ne 0 ] &&
+      /usr/bin/grep -F 'unsafe permission bits' \
+        "$fixture_root/$permission_label.stderr" >/dev/null ||
+      fail "native release extractor did not reject staging $permission_label directly"
+  done
+
   for scenario in \
     extra-root absolute traversal duplicate casefold nfc escaping-symlink \
-    unsupported-type mode oversize crc truncated; do
+    unsupported-type mode oversize encrypted unsupported-compression crc truncated; do
     archive="$fixture_root/$scenario.zip"
     extraction_container="$fixture_root/$scenario-extracted"
     make_invalid_native_release_archive \
@@ -613,6 +696,18 @@ assert_native_release_archive_extractor() {
     set -e
     [ "$status" -ne 0 ] ||
       fail "native release extractor accepted the $scenario archive fixture"
+    case "$scenario" in
+      encrypted)
+        /usr/bin/grep -F 'encrypted member' \
+          "$fixture_root/$scenario.stderr" >/dev/null ||
+          fail "encrypted ZIP fixture did not reach the encryption policy"
+        ;;
+      unsupported-compression)
+        /usr/bin/grep -F 'unsupported compression method' \
+          "$fixture_root/$scenario.stderr" >/dev/null ||
+          fail "compression fixture did not reach the compression policy"
+        ;;
+    esac
     if /usr/bin/find "$extraction_container" -mindepth 1 -print -quit |
        /usr/bin/grep -q .; then
       fail "native release extractor left output from the $scenario archive fixture"
@@ -673,6 +768,18 @@ run_case() {
   if [ "$failure_mode" = missing-entry ]; then
     /usr/bin/printf 'not a Mach-O entry\n' >"$runtime/bin/wine.switchyard-real"
   fi
+  case "$failure_mode" in
+    extracted-x86-only)
+      /bin/cp "$X86_64_MACHO_FIXTURE" \
+        "$runtime/lib/wine/aarch64-unix/helper.dylib"
+      /usr/bin/python3 -I "$DIGEST_HELPER" write "$runtime" >/dev/null
+      ;;
+    extracted-gstreamer-arm64-only)
+      /bin/cp "$NATIVE_MACHO_FIXTURE" \
+        "$runtime/lib/switchyard-gstreamer/libfixture.dylib"
+      /usr/bin/python3 -I "$DIGEST_HELPER" write "$runtime" >/dev/null
+      ;;
+  esac
   expected_digest="$(/usr/bin/python3 -I "$DIGEST_HELPER" digest "$runtime")"
   : >"$log"
   /usr/bin/printf '0\n' >"$sign_count"
@@ -771,6 +878,11 @@ run_case() {
         /usr/bin/printf 'stale dependency marker\n' \
           >"$1/lib/switchyard-gstreamer/.switchyard-content-sha256"
       fi
+      if [ "$failure_mode" = post-outer-coherent-mutation ]; then
+        /usr/bin/printf 'coherent post-validation mutation\n' \
+          >>"$1/share/doc/switchyard-wine/LICENSE"
+        /usr/bin/python3 -I "$DIGEST_HELPER" write "$1" >/dev/null
+      fi
     }
     switchyard_create_native_release_archive() {
       /usr/bin/printf 'archive\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
@@ -784,7 +896,6 @@ run_case() {
       local actual_sha256
       local actual_size
       local extracted_runtime
-      local thin_macho
 
       /usr/bin/printf 'extract\n' >>"$SWITCHYARD_TEST_ORDER_LOG"
       [ "$#" -eq 6 ] || return 90
@@ -809,14 +920,6 @@ run_case() {
         portable-executable)
           /usr/bin/plutil -replace executable -string '../escape/wine' \
             "$extracted_runtime/switchyard-runtime.json"
-          /usr/bin/python3 -I "$DIGEST_HELPER" write "$extracted_runtime" >/dev/null
-          ;;
-        extracted-x86-only)
-          thin_macho="$extracted_runtime/lib/wine/aarch64-unix/helper.dylib.x86_64"
-          /usr/bin/printf '%s\n' 'int main(void) { return 0; }' |
-            /usr/bin/clang -arch x86_64 -x c - -o "$thin_macho"
-          /bin/mv "$thin_macho" \
-            "$extracted_runtime/lib/wine/aarch64-unix/helper.dylib"
           /usr/bin/python3 -I "$DIGEST_HELPER" write "$extracted_runtime" >/dev/null
           ;;
       esac
@@ -900,7 +1003,7 @@ if any("\uac00" <= character <= "\ud7a3" for character in text):
     raise SystemExit("Korean release text")
 PY
 
-[ "$(/usr/bin/grep -c '^sign:' "$success_log")" -eq 4 ] ||
+[ "$(/usr/bin/grep -c '^sign:' "$success_log")" -eq 5 ] ||
   fail "native release did not sign every Mach-O exactly once"
 [ "$(/usr/bin/grep -c '^sign:entry$' "$success_log")" -eq 2 ] ||
   fail "native release did not attach entitlements to exactly two entries"
@@ -938,6 +1041,11 @@ run_case portable-executable portable-executable 1
 run_case extracted-wrong-team extracted-wrong-team 1
 run_case extracted-unexpected-entitlement extracted-unexpected-entitlement 1
 run_case extracted-x86-only extracted-x86-only 1
+run_case extracted-gstreamer-arm64-only extracted-gstreamer-arm64-only 1
+/usr/bin/grep -F \
+  'Mach-O architecture set is not exact: lib/switchyard-gstreamer/libfixture.dylib' \
+  "$TEST_ROOT/extracted-gstreamer-arm64-only-case/stderr" >/dev/null ||
+  fail "GStreamer architecture fixture did not reach the universal-image policy"
 run_case extracted-smoke-failure smoke 73
 run_case validator-failure post-smoke-validator 1
 run_case post-outer-dependency-mutation post-outer-dependency-mutation 1
@@ -948,6 +1056,14 @@ fi
 /usr/bin/grep -F 'native release outer content digest did not verify' \
   "$TEST_ROOT/post-outer-dependency-mutation-case/stderr" >/dev/null ||
   fail "post-outer dependency mutation did not reach the final digest gate"
+run_case post-outer-coherent-mutation post-outer-coherent-mutation 1
+if /usr/bin/grep -Fqx archive \
+    "$TEST_ROOT/post-outer-coherent-mutation-case/order.log"; then
+  fail "native release archived a coherently mutated signed staging tree"
+fi
+/usr/bin/grep -F 'native release signed staging changed before archive creation' \
+  "$TEST_ROOT/post-outer-coherent-mutation-case/stderr" >/dev/null ||
+  fail "coherent post-validation mutation did not reach the pinned digest gate"
 run_case source-unknown-field unknown-source 1
 run_case partial-publication partial-publication 1
 run_case malformed-notary malformed-notary 1
