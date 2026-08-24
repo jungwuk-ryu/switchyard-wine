@@ -37,7 +37,7 @@ required = (
     "dlls/winemetal-wow64/commands.c",
     "dlls/winemetal-wow64/unixlib.c",
     "dlls/winemetal-wow64/winemetal_private.h",
-    "dlls/winemetal-wow64/abi-schema-v4.txt",
+    "dlls/winemetal-wow64/abi-schema-v6.txt",
 )
 
 
@@ -105,7 +105,7 @@ def read_file(relative, maximum):
 
 
 contents = {relative: read_file(relative, 32 * 1024 * 1024) for relative in required}
-schema = contents["dlls/winemetal-wow64/abi-schema-v4.txt"]
+schema = contents["dlls/winemetal-wow64/abi-schema-v6.txt"]
 if (
     hashlib.sha256(schema).hexdigest() != expected_schema_sha256
     or not schema.endswith(b"\n")
@@ -113,19 +113,19 @@ if (
     or b"\0" in schema
     or any(byte > 0x7f for byte in schema)
 ):
-    fail("abi-schema-v4.txt is not the exact pinned ASCII/LF schema")
+    fail("abi-schema-v6.txt is not the exact pinned ASCII/LF schema")
 header = contents["include/wine/unixlib.h"]
 header_match = re.search(
-    rb"^#define WINE_WOW64_UNIXLIB_COMPANION_V4_ABI_SHA256 \\\n"
+    rb"^#define WINE_WOW64_UNIXLIB_COMPANION_V6_ABI_SHA256 \\\n"
     rb"((?:[ \t]+.*\n)+)",
     header,
     re.MULTILINE,
 )
 if header_match is None:
-    fail("unixlib.h has no canonical companion v4 ABI digest")
+    fail("unixlib.h has no canonical companion v6 ABI digest")
 header_digest_bytes = re.findall(rb"0x([0-9a-fA-F]{2})(?![0-9a-fA-F])", header_match.group(1))
 if len(header_digest_bytes) != 32 or b"".join(header_digest_bytes).decode("ascii").lower() != expected_schema_sha256:
-    fail("unixlib.h companion v4 ABI digest does not match abi-schema-v4.txt")
+    fail("unixlib.h companion v6 ABI digest does not match abi-schema-v6.txt")
 makefile = contents["dlls/winemetal-wow64/Makefile.in"]
 if b"UNIXLIB" not in makefile or b"$(WINEMETAL_WOW64_UNIXLIB)" not in makefile:
     fail("companion Makefile does not use the configured Unixlib target")
@@ -146,14 +146,16 @@ for data, description in ((configure_ac, "configure.ac"), (configure, "configure
 unixlib = contents["dlls/winemetal-wow64/unixlib.c"]
 for symbol in (
     b"__wine_unix_call_wow64_funcs",
-    b"__wine_unix_call_wow64_companion_v4",
+    b"__wine_unix_call_wow64_companion_v6",
 ):
     if symbol not in unixlib:
         fail("companion source is missing required export: " + symbol.decode("ascii"))
 if unixlib.count(b"WINE_UNIXLIB_DISPATCH_SOURCE_V2(") != 1:
     fail("companion source does not publish exactly one v2 dispatch source")
-if b"__wine_unix_call_wow64_companion_v3" in unixlib:
-    fail("companion source still exports the retired v3 descriptor")
+for version in range(1, 6):
+    retired = b"__wine_unix_call_wow64_companion_v" + str(version).encode("ascii")
+    if retired in unixlib:
+        fail("companion source still exports a retired descriptor")
 print(expected_schema_sha256)
 PY
 }
@@ -197,9 +199,14 @@ import tempfile
 
 
 SOURCE_REPOSITORY = "https://github.com/3Shain/dxmt.git"
+SOURCE_BASE_TREE = "22fa93d36867f175c0283b36cd3628a4df94876e"
 SOURCE_REVISION = "856d9f35789679ef00c1ba01a6353438df84b66f"
-ARTIFACT_NAME = f"dxmt-{SOURCE_REVISION}.tar.gz"
-ARTIFACT_SHA256 = "8840df7038d7cbffed3652712c86ec4d6d495612aa39306e9a184bd213514acf"
+SOURCE_TREE = "a8c397f9b03dcb3592f6b0204ae6dbda5492990d"
+SOURCE_PATCH = "0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch"
+SOURCE_PATCH_SHA256 = "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852"
+ARTIFACT_BUILD_IDENTITY = "f02a37f5b7c8022941712a7cf9415ac9d1925442"
+ARTIFACT_NAME = f"dxmt-{ARTIFACT_BUILD_IDENTITY}.tar.gz"
+ARTIFACT_SHA256 = "4bf4f0bd654a92c0feb6a8e5b960307be53d62ef45f9ed32fdcbf37c418b8a3c"
 PACKAGE_WORKFLOW = ".github/workflows/ci.yml"
 PACKAGE_WORKFLOW_SHA256 = "fe5a3656b9f59e81e650e60077bcdd840a5205ff0d960f00f6cb4c8fbacbe851"
 PACKAGE_BUILD = (
@@ -213,8 +220,9 @@ HOST_MINIMUM_MACOS = "26.5"
 MACHO_MINIMUM_MACOS = "15.0"
 MACHO_SDK = "15.1"
 COMPANION_PATH = "lib/wine/aarch64-unix/winemetal-wow64.so"
-COMPANION_SCHEMA_PATH = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
-COMPANION_SCHEMA_SHA256 = "7938d56916074f61dce96b43e3f63b47fe52565c6a4c6096c876847f1920d9d3"
+COMPANION_SCHEMA_PATH = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v6.txt"
+SOURCE_PATCH_PATH = "lib/switchyard-dxmt/share/src/switchyard-dxmt/" + SOURCE_PATCH
+COMPANION_SCHEMA_SHA256 = "0051bd8c0bc3e3ce261e9d5007665342ac2d28a643576744d8ec71896af856f1"
 COMPANION_ENTRY_COUNT = 138
 COMPANION_MINIMUM_MACOS = "26.5"
 COMPANION_SDK = "26.5"
@@ -235,10 +243,10 @@ MODULE_SOURCES = [
     ("lib/wine/aarch64-windows/nvapi64.dll", "f4e1cf79244d378c660b5d9b6c98923e29f2bd30e9073dadf62ac1879ffd9f02", "pe-dll", "arm64ec"),
     ("lib/wine/aarch64-windows/nvngx.dll", "b8ddc2d81dcf4306b58398b486299f31067617e4f5e66cd64c8e5eacde2a0c0c", "pe-dll", "arm64ec"),
     ("lib/wine/aarch64-windows/winemetal.dll", "64007d8901b691bd91aac8218bddb12e2cce272fbdaab8a7bdc3f0ca6fe3eb99", "pe-dll", "arm64ec"),
-    ("lib/wine/i386-windows/d3d10core.dll", "77a7c58a8ee649a2959017a91211f5003bf988010a090447b78fa00ca8a7544b", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/d3d11.dll", "3f42b073b2954d7b27fa00380d4e268b6f8f2216d701b2c57176c9f3c83b49fb", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/dxgi.dll", "c6ba805aafd21668d487252747fadba3ee4525a55c7bfdf6f65ec26e140a39ff", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/winemetal.dll", "99db6924a2726d534562f9168692c5c1b4d4651d40a55133a8887e7621c9bc2f", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/d3d10core.dll", "2408d249cfe0ea8cb333a816dc833725ae85d76a94a414b31272b2d53807a1a6", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/d3d11.dll", "35be5a26db509ca206b6521bb79dbb16b49dd8ec79e863fac5a1eb8d572700d4", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/dxgi.dll", "eea621daefc1e1d811eb780372af639a2229ab4596ca049e7d8554f96595feb3", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/winemetal.dll", "a4da600c7f33eee3b5cd74bd763c5df9dc08ca543ad8537bfd8e845463a38db0", "pe-dll", "i386"),
     ("lib/wine/x86_64-windows/d3d10core.dll", "4910ce0b1960a627c61114b019869057be8e1bf2edddd2ecb348c434bb98e5e0", "pe-dll", "x86_64"),
     ("lib/wine/x86_64-windows/d3d11.dll", "26b88098961e936b3bfe0ad984d3ad2a4568f10b04a4e6f7fa54711a9c17b583", "pe-dll", "x86_64"),
     ("lib/wine/x86_64-windows/dxgi.dll", "19ffb16b5dd22c944b284d9ea6d7b301e2ad96ef68f65ebdb642db49c55a9491", "pe-dll", "x86_64"),
@@ -251,8 +259,11 @@ DOCUMENTS = [
     ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/files.sha256", None),
     ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/LICENSE", "b87c35aef7b2cf14de854118ca55ce5c4b284c85b5f002421fb8d46d868c2d17"),
     ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/COPYING.LIB", "e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c"),
-    ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/CORRESPONDING-SOURCE.txt", "40bbbbecb9c48cfd67f5862b0b93878ae80dc3de083790d3ec9dadd98618c89a"),
+    ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/CORRESPONDING-SOURCE.txt", "972485701e4d189475644657c6a35a1380484e0e252995a80f3b3ad17311327c"),
     (COMPANION_SCHEMA_PATH, COMPANION_SCHEMA_SHA256),
+]
+SOURCE_MATERIALS = [
+    (SOURCE_PATCH_PATH, SOURCE_PATCH_SHA256, "patch"),
 ]
 
 MACHO_RPATHS = ["@loader_path/", "@loader_path/../../"]
@@ -943,7 +954,7 @@ def verify_companion(runtime_root, relative, metadata, data):
     expected = {
         "___wine_unix_call_wow64_funcs",
         "___wine_unix_call_wow64_dispatch_v2",
-        "___wine_unix_call_wow64_companion_v4",
+        "___wine_unix_call_wow64_companion_v6",
     }
     exported = symbols.stdout.splitlines()
     if sorted(exported) != sorted(expected):
@@ -962,7 +973,7 @@ def verify_companion(runtime_root, relative, metadata, data):
             reject("DXMT WoW64 companion export is not uniquely immutable: " + symbol)
         symbol_addresses[symbol] = int(matches[0], 16)
 
-    descriptor_address = symbol_addresses["___wine_unix_call_wow64_companion_v4"]
+    descriptor_address = symbol_addresses["___wine_unix_call_wow64_companion_v6"]
     descriptor_offset = None
     command_count, command_bytes = struct.unpack_from("<II", data, 16)
     command_offset = 32
@@ -976,15 +987,15 @@ def verify_companion(runtime_root, relative, metadata, data):
             if (
                 descriptor_address >= vm_address
                 and descriptor_address - vm_address <= file_size
-                and 56 <= file_size - (descriptor_address - vm_address)
+                and 72 <= file_size - (descriptor_address - vm_address)
             ):
                 descriptor_offset = file_offset + descriptor_address - vm_address
                 break
         command_offset += command_size
-    if descriptor_offset is None or descriptor_offset > len(data) - 56:
+    if descriptor_offset is None or descriptor_offset > len(data) - 72:
         reject("DXMT WoW64 companion descriptor is outside its file-backed segment")
     version, size, entry_count, flags = struct.unpack_from("<IIII", data, descriptor_offset)
-    if (version, size, entry_count, flags) != (4, 56, COMPANION_ENTRY_COUNT, 0):
+    if (version, size, entry_count, flags) != (6, 72, COMPANION_ENTRY_COUNT, 0):
         reject("DXMT WoW64 companion descriptor header is not exact")
     if data[descriptor_offset + 16:descriptor_offset + 48].hex() != COMPANION_SCHEMA_SHA256:
         reject("DXMT WoW64 companion descriptor ABI digest is not exact")
@@ -1028,11 +1039,11 @@ def validate_manifest(tree, manifest_relative):
     dxmt = require_exact_type(value, "dxmt", dict, "runtime manifest")
     require_exact_keys(
         dxmt,
-        {"contractVersion", "implementation", "graphicsApi", "hostBackend", "provenance", "license", "modules", "wow64Companion", "documents"},
+        {"contractVersion", "implementation", "graphicsApi", "hostBackend", "provenance", "license", "sourceMaterials", "modules", "wow64Companion", "documents"},
         "runtime manifest.dxmt",
     )
     exact_scalars = {
-        "contractVersion": 1,
+        "contractVersion": 2,
         "implementation": "dxmt",
         "graphicsApi": "d3d11",
         "hostBackend": "metal",
@@ -1045,7 +1056,12 @@ def validate_manifest(tree, manifest_relative):
     provenance = require_exact_type(dxmt, "provenance", dict, "runtime manifest.dxmt")
     expected_provenance = {
         "sourceRepository": SOURCE_REPOSITORY,
+        "sourceBaseTree": SOURCE_BASE_TREE,
         "sourceRevision": SOURCE_REVISION,
+        "sourceTree": SOURCE_TREE,
+        "sourcePatch": SOURCE_PATCH_PATH,
+        "sourcePatchSha256": SOURCE_PATCH_SHA256,
+        "artifactBuildIdentity": ARTIFACT_BUILD_IDENTITY,
         "artifactName": ARTIFACT_NAME,
         "artifactSha256": ARTIFACT_SHA256,
         "packageWorkflow": PACKAGE_WORKFLOW,
@@ -1056,6 +1072,17 @@ def validate_manifest(tree, manifest_relative):
     for key, expected in expected_provenance.items():
         if provenance.get(key) != expected or type(provenance.get(key)) is not str:
             reject("runtime manifest.dxmt.provenance field is invalid: " + key)
+
+    source_materials = require_exact_type(dxmt, "sourceMaterials", list, "runtime manifest.dxmt")
+    if len(source_materials) != len(SOURCE_MATERIALS):
+        reject("runtime manifest.dxmt.sourceMaterials has an unexpected length")
+    for item, (path, pinned_digest, material_type) in zip(source_materials, SOURCE_MATERIALS):
+        require_exact_keys(item, {"path", "sha256", "type"}, "runtime manifest.dxmt.sourceMaterials item")
+        if item != {"path": path, "sha256": pinned_digest, "type": material_type}:
+            reject("runtime manifest.dxmt.sourceMaterials is not the exact ordered allowlist")
+        data, _metadata = tree.read_file(path, 1024 * 1024)
+        if sha256(data) != pinned_digest:
+            reject("runtime DXMT source material differs from the pinned source: " + path)
 
     modules = require_exact_type(dxmt, "modules", list, "runtime manifest.dxmt")
     if len(modules) != len(MODULE_SOURCES):
@@ -1175,18 +1202,21 @@ def validate_manifest(tree, manifest_relative):
     )
     expected_files_manifest += f"{companion['sha256']}  {COMPANION_PATH}\n"
     expected_files_manifest += f"{COMPANION_SCHEMA_SHA256}  {COMPANION_SCHEMA_PATH}\n"
+    expected_files_manifest += f"{SOURCE_PATCH_SHA256}  {SOURCE_PATCH_PATH}\n"
     expected_files_manifest = expected_files_manifest.encode("ascii")
     files_manifest_path = DOCUMENTS[0][0]
     if document_data[files_manifest_path] != expected_files_manifest:
         reject("runtime DXMT files.sha256 is not the exact ordered module closure")
 
     tree.require_entries("lib/switchyard-dxmt", {"share"})
-    tree.require_entries("lib/switchyard-dxmt/share", {"doc"})
+    tree.require_entries("lib/switchyard-dxmt/share", {"doc", "src"})
     tree.require_entries("lib/switchyard-dxmt/share/doc", {"switchyard-dxmt"})
     tree.require_entries(
         "lib/switchyard-dxmt/share/doc/switchyard-dxmt",
-        {"files.sha256", "LICENSE", "COPYING.LIB", "CORRESPONDING-SOURCE.txt", "abi-schema-v4.txt"},
+        {"files.sha256", "LICENSE", "COPYING.LIB", "CORRESPONDING-SOURCE.txt", "abi-schema-v6.txt"},
     )
+    tree.require_entries("lib/switchyard-dxmt/share/src", {"switchyard-dxmt"})
+    tree.require_entries("lib/switchyard-dxmt/share/src/switchyard-dxmt", {SOURCE_PATCH})
     tree.discover_owned_modules()
 
     host_path = MODULE_SOURCES[0][0]

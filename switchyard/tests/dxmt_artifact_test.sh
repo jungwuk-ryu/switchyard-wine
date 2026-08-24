@@ -81,19 +81,23 @@ __attribute__((visibility("default"))) const struct dispatch_source_v2
     __wine_unix_call_wow64_dispatch_v2 =
         {2, sizeof(struct dispatch_source_v2), 1, sizeof(struct dispatch_entry_v2),
          __wine_unix_call_wow64_funcs, entries, 0, 0};
-struct companion_descriptor_v4
+struct companion_descriptor_v6
 {
     uint32_t version, size, entry_count, flags;
     unsigned char abi_sha256[32];
     const void *bind;
+    const void *quiesce;
+    const void *unbind;
 };
-__attribute__((visibility("default"))) const struct companion_descriptor_v4
-    __wine_unix_call_wow64_companion_v4 = {
-        4, sizeof(struct companion_descriptor_v4), 138, 0,
-        {0x79, 0x38, 0xd5, 0x69, 0x16, 0x07, 0x4f, 0x61,
-         0xdc, 0xe9, 0x6b, 0x43, 0xe3, 0xf6, 0x3b, 0x47,
-         0xfe, 0x52, 0x56, 0x5c, 0x6a, 0x4c, 0x60, 0x96,
-         0xc8, 0x76, 0x84, 0x7f, 0x19, 0x20, 0xd9, 0xd3},
+__attribute__((visibility("default"))) const struct companion_descriptor_v6
+    __wine_unix_call_wow64_companion_v6 = {
+        6, sizeof(struct companion_descriptor_v6), 138, 0,
+        {0x00, 0x51, 0xbd, 0x8c, 0x0b, 0xc3, 0xe3, 0xce,
+         0x26, 0x1e, 0x9d, 0x50, 0x07, 0x66, 0x53, 0x42,
+         0xac, 0x2d, 0x28, 0xa6, 0x43, 0x57, 0x67, 0x44,
+         0xd8, 0xec, 0x71, 0x89, 0x6a, 0xf8, 0x56, 0xf1},
+        __wine_unix_call_wow64_funcs,
+        __wine_unix_call_wow64_funcs,
         __wine_unix_call_wow64_funcs,
     };
 #ifdef EXTRA_COMPANION_EXPORT
@@ -157,6 +161,7 @@ import sys
 
 runtime = sys.argv[1]
 revision = "856d9f35789679ef00c1ba01a6353438df84b66f"
+artifact_build_identity = "f02a37f5b7c8022941712a7cf9415ac9d1925442"
 module_sources = [
     ("lib/wine/aarch64-unix/winemetal.so", "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0", "mach-o-dylib", "arm64"),
     ("lib/wine/aarch64-windows/d3d10core.dll", "0ca52517ce266d63b85310a8aae940e92b0a05392d1d03698dbc4156ce28a959", "pe-dll", "arm64ec"),
@@ -165,10 +170,10 @@ module_sources = [
     ("lib/wine/aarch64-windows/nvapi64.dll", "f4e1cf79244d378c660b5d9b6c98923e29f2bd30e9073dadf62ac1879ffd9f02", "pe-dll", "arm64ec"),
     ("lib/wine/aarch64-windows/nvngx.dll", "b8ddc2d81dcf4306b58398b486299f31067617e4f5e66cd64c8e5eacde2a0c0c", "pe-dll", "arm64ec"),
     ("lib/wine/aarch64-windows/winemetal.dll", "64007d8901b691bd91aac8218bddb12e2cce272fbdaab8a7bdc3f0ca6fe3eb99", "pe-dll", "arm64ec"),
-    ("lib/wine/i386-windows/d3d10core.dll", "77a7c58a8ee649a2959017a91211f5003bf988010a090447b78fa00ca8a7544b", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/d3d11.dll", "3f42b073b2954d7b27fa00380d4e268b6f8f2216d701b2c57176c9f3c83b49fb", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/dxgi.dll", "c6ba805aafd21668d487252747fadba3ee4525a55c7bfdf6f65ec26e140a39ff", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/winemetal.dll", "99db6924a2726d534562f9168692c5c1b4d4651d40a55133a8887e7621c9bc2f", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/d3d10core.dll", "2408d249cfe0ea8cb333a816dc833725ae85d76a94a414b31272b2d53807a1a6", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/d3d11.dll", "35be5a26db509ca206b6521bb79dbb16b49dd8ec79e863fac5a1eb8d572700d4", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/dxgi.dll", "eea621daefc1e1d811eb780372af639a2229ab4596ca049e7d8554f96595feb3", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/winemetal.dll", "a4da600c7f33eee3b5cd74bd763c5df9dc08ca543ad8537bfd8e845463a38db0", "pe-dll", "i386"),
     ("lib/wine/x86_64-windows/d3d10core.dll", "4910ce0b1960a627c61114b019869057be8e1bf2edddd2ecb348c434bb98e5e0", "pe-dll", "x86_64"),
     ("lib/wine/x86_64-windows/d3d11.dll", "26b88098961e936b3bfe0ad984d3ad2a4568f10b04a4e6f7fa54711a9c17b583", "pe-dll", "x86_64"),
     ("lib/wine/x86_64-windows/dxgi.dll", "19ffb16b5dd22c944b284d9ea6d7b301e2ad96ef68f65ebdb642db49c55a9491", "pe-dll", "x86_64"),
@@ -226,7 +231,9 @@ for path, source_digest, file_format, architecture in module_sources:
 
 files_manifest = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/files.sha256"
 companion_path = "lib/wine/aarch64-unix/winemetal-wow64.so"
-schema_path = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+schema_path = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v6.txt"
+source_patch = "0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch"
+source_patch_path = "lib/switchyard-dxmt/share/src/switchyard-dxmt/" + source_patch
 companion = {
     "path": companion_path,
     "sha256": digest(companion_path),
@@ -257,25 +264,44 @@ with open(os.path.join(runtime, files_manifest), "w", encoding="ascii", newline=
         stream.write(f"{item['sha256']}  {item['path']}\n")
     stream.write(f"{companion['sha256']}  {companion_path}\n")
     stream.write(f"{companion['abiSchemaSha256']}  {schema_path}\n")
+    stream.write(f"{digest(source_patch_path)}  {source_patch_path}\n")
 
 corresponding_source = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/CORRESPONDING-SOURCE.txt"
 with open(os.path.join(runtime, corresponding_source), "w", encoding="utf-8", newline="\n") as stream:
     stream.write("""DXMT corresponding source and artifact provenance
 
-Repository: https://github.com/3Shain/dxmt.git
-Revision: 856d9f35789679ef00c1ba01a6353438df84b66f
-Source URL: https://github.com/3Shain/dxmt/tree/856d9f35789679ef00c1ba01a6353438df84b66f
-Artifact: dxmt-856d9f35789679ef00c1ba01a6353438df84b66f.tar.gz
-Artifact SHA-256: 8840df7038d7cbffed3652712c86ec4d6d495612aa39306e9a184bd213514acf
-Package workflow: .github/workflows/ci.yml
+Upstream repository: https://github.com/3Shain/dxmt.git
+Upstream revision: 856d9f35789679ef00c1ba01a6353438df84b66f
+Upstream tree: 22fa93d36867f175c0283b36cd3628a4df94876e
+Upstream source URL: https://github.com/3Shain/dxmt/tree/856d9f35789679ef00c1ba01a6353438df84b66f
+Artifact build label: f02a37f5b7c8022941712a7cf9415ac9d1925442
+Patched source tree: a8c397f9b03dcb3592f6b0204ae6dbda5492990d
+Artifact build label semantics: opaque local artifact identifier; no Git object is required
+Patch: lib/switchyard-dxmt/share/src/switchyard-dxmt/0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch
+Patch SHA-256: 5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852
+Reconstruction contract: upstream revision plus the pinned patch yields the patched source tree
+DirectX headers submodule: 9df86f2341616ef1888ae59919feaa6d4fad693d
+NVAPI submodule: d08488fcc82eef313b0464db37d2955709691e94
+Base artifact: dxmt-856d9f35789679ef00c1ba01a6353438df84b66f.tar.gz
+Base artifact SHA-256: 8840df7038d7cbffed3652712c86ec4d6d495612aa39306e9a184bd213514acf
+Artifact: dxmt-f02a37f5b7c8022941712a7cf9415ac9d1925442.tar.gz
+Artifact SHA-256: 4bf4f0bd654a92c0feb6a8e5b960307be53d62ef45f9ed32fdcbf37c418b8a3c
+Package workflow path: .github/workflows/ci.yml
 Package workflow SHA-256: fe5a3656b9f59e81e650e60077bcdd840a5205ff0d960f00f6cb4c8fbacbe851
 Package build: gcc-release-x86_64-windows-cross+gcc-release-x86-windows-cross+clang-release-arm64ec-windows-cross
 
-The PE modules are byte-for-byte files from the pinned artifact. The host
-Mach-O module is derived from that artifact and may differ only through the
-runtime's validated code-signing step; its final digest is recorded in both
-files.sha256 and switchyard-runtime.json. DXMT is licensed under
-LGPL-2.1-or-later; LICENSE and COPYING.LIB are retained in this directory.
+To reconstruct the corresponding source, check out the public upstream
+revision, apply the pinned patch, initialize the submodules at the commits
+recorded above, and verify that the resulting superproject Git tree is the
+patched source tree. The artifact build label does not identify a required Git
+object, and no unpublished commit metadata or history is needed or promised.
+
+The i386 PE modules were rebuilt from the patched source tree. Every retained
+native and x86_64 module is byte-for-byte identical to the base artifact. The
+host Mach-O module may differ only through the runtime's validated code-signing
+step; its final digest is recorded in both files.sha256 and
+switchyard-runtime.json. DXMT is licensed under LGPL-2.1-or-later; LICENSE and
+COPYING.LIB are retained in this directory.
 """)
 
 document_paths = [
@@ -305,20 +331,30 @@ value = {
     },
     "peArchitectures": ["aarch64", "arm64ec", "x86_64", "i386"],
     "dxmt": {
-        "contractVersion": 1,
+        "contractVersion": 2,
         "implementation": "dxmt",
         "graphicsApi": "d3d11",
         "hostBackend": "metal",
         "provenance": {
             "sourceRepository": "https://github.com/3Shain/dxmt.git",
+            "sourceBaseTree": "22fa93d36867f175c0283b36cd3628a4df94876e",
             "sourceRevision": revision,
-            "artifactName": f"dxmt-{revision}.tar.gz",
-            "artifactSha256": "8840df7038d7cbffed3652712c86ec4d6d495612aa39306e9a184bd213514acf",
+            "sourceTree": "a8c397f9b03dcb3592f6b0204ae6dbda5492990d",
+            "sourcePatch": source_patch_path,
+            "sourcePatchSha256": "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852",
+            "artifactBuildIdentity": artifact_build_identity,
+            "artifactName": f"dxmt-{artifact_build_identity}.tar.gz",
+            "artifactSha256": "4bf4f0bd654a92c0feb6a8e5b960307be53d62ef45f9ed32fdcbf37c418b8a3c",
             "packageWorkflow": ".github/workflows/ci.yml",
             "packageWorkflowSha256": "fe5a3656b9f59e81e650e60077bcdd840a5205ff0d960f00f6cb4c8fbacbe851",
             "packageBuild": "gcc-release-x86_64-windows-cross+gcc-release-x86-windows-cross+clang-release-arm64ec-windows-cross",
         },
         "license": "LGPL-2.1-or-later",
+        "sourceMaterials": [{
+            "path": source_patch_path,
+            "sha256": "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852",
+            "type": "patch",
+        }],
         "modules": modules,
         "wow64Companion": companion,
         "documents": documents,
@@ -340,8 +376,11 @@ reset_runtime() {
   /bin/cp -R "$STAGED_FIXTURE/." "$runtime/"
   /usr/bin/install -m 0755 "$fixture_companion" \
     "$runtime/lib/wine/aarch64-unix/winemetal-wow64.so"
-  /usr/bin/install -m 0644 "$ROOT_DIR/dlls/winemetal-wow64/abi-schema-v4.txt" \
-    "$runtime/lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+  /usr/bin/install -m 0644 "$ROOT_DIR/dlls/winemetal-wow64/abi-schema-v6.txt" \
+    "$runtime/lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v6.txt"
+  /bin/mkdir -p "$runtime/lib/switchyard-dxmt/share/src/switchyard-dxmt"
+  /usr/bin/install -m 0644 "$ROOT_DIR/switchyard/patches/0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch" \
+    "$runtime/lib/switchyard-dxmt/share/src/switchyard-dxmt/0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch"
   write_manifest
 }
 
@@ -429,8 +468,40 @@ expect_failure "symbolic-link DXMT WoW64 companion" "failed safely"
 
 reset_runtime
 /usr/bin/printf 'tampered\n' >> \
-  "$runtime/lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+  "$runtime/lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v6.txt"
 expect_failure "tampered DXMT WoW64 schema" "document digest mismatch"
+
+source_patch_path="$runtime/lib/switchyard-dxmt/share/src/switchyard-dxmt/0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch"
+
+reset_runtime
+/bin/rm "$source_patch_path"
+expect_failure "missing DXMT source patch" "failed safely"
+
+reset_runtime
+/usr/bin/printf 'tampered\n' >>"$source_patch_path"
+expect_failure "tampered DXMT source patch" "source material differs from the pinned source"
+
+reset_runtime
+/bin/mv "$source_patch_path" "$test_root/dxmt-source-patch.good"
+/bin/ln -s "$test_root/dxmt-source-patch.good" "$source_patch_path"
+expect_failure "symbolic-link DXMT source patch" "failed safely"
+
+reset_runtime
+/bin/chmod 0664 "$source_patch_path"
+expect_failure "group-writable DXMT source patch" "group/world writable"
+
+reset_runtime
+/usr/bin/printf 'unexpected\n' > \
+  "$runtime/lib/switchyard-dxmt/share/src/switchyard-dxmt/unexpected.patch"
+expect_failure "extra DXMT source material" "unexpected entry set"
+
+reset_runtime
+mutate_manifest 'value["dxmt"]["provenance"]["sourceTree"] = "0000000000000000000000000000000000000000"'
+expect_failure "wrong reconstructed DXMT source tree" "provenance field is invalid: sourceTree"
+
+reset_runtime
+mutate_manifest 'value["dxmt"].pop("sourceMaterials")'
+expect_failure "missing DXMT source material closure" "unexpected field set"
 
 reset_runtime
 mutate_manifest 'value["dxmt"]["unexpected"] = True'
@@ -442,7 +513,7 @@ import sys
 path = sys.argv[1]
 with open(path, encoding="utf-8") as stream:
     text = stream.read()
-needle = '    "contractVersion": 1,\n'
+needle = '    "contractVersion": 2,\n'
 if text.count(needle) != 1:
     raise SystemExit("cannot build duplicate-key fixture")
 with open(path, "w", encoding="utf-8", newline="\n") as stream:

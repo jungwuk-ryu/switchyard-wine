@@ -8,12 +8,22 @@
 switchyard_native_arm64_require_packaging_contract() {
   [ "${SWITCHYARD_DXMT_SOURCE_REPOSITORY:-}" = \
       "https://github.com/3Shain/dxmt.git" ] &&
+    [ "${SWITCHYARD_DXMT_SOURCE_BASE_TREE:-}" = \
+      "22fa93d36867f175c0283b36cd3628a4df94876e" ] &&
     [ "${SWITCHYARD_DXMT_SOURCE_REVISION:-}" = \
       "856d9f35789679ef00c1ba01a6353438df84b66f" ] &&
+    [ "${SWITCHYARD_DXMT_SOURCE_TREE:-}" = \
+      "a8c397f9b03dcb3592f6b0204ae6dbda5492990d" ] &&
+    [ "${SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME:-}" = \
+      "0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch" ] &&
+    [ "${SWITCHYARD_DXMT_SOURCE_PATCH_SHA256:-}" = \
+      "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852" ] &&
+    [ "${SWITCHYARD_DXMT_ARTIFACT_BUILD_IDENTITY:-}" = \
+      "f02a37f5b7c8022941712a7cf9415ac9d1925442" ] &&
     [ "${SWITCHYARD_DXMT_ARTIFACT_NAME:-}" = \
-      "dxmt-856d9f35789679ef00c1ba01a6353438df84b66f.tar.gz" ] &&
+      "dxmt-f02a37f5b7c8022941712a7cf9415ac9d1925442.tar.gz" ] &&
     [ "${SWITCHYARD_DXMT_ARTIFACT_SHA256:-}" = \
-      "8840df7038d7cbffed3652712c86ec4d6d495612aa39306e9a184bd213514acf" ] &&
+      "4bf4f0bd654a92c0feb6a8e5b960307be53d62ef45f9ed32fdcbf37c418b8a3c" ] &&
     [ "${SWITCHYARD_DXMT_PACKAGE_WORKFLOW:-}" = ".github/workflows/ci.yml" ] &&
     [ "${SWITCHYARD_DXMT_PACKAGE_WORKFLOW_SHA256:-}" = \
       "fe5a3656b9f59e81e650e60077bcdd840a5205ff0d960f00f6cb4c8fbacbe851" ] &&
@@ -24,11 +34,11 @@ switchyard_native_arm64_require_packaging_contract() {
     [ "${SWITCHYARD_DXMT_COPYING_SHA256:-}" = \
       "e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c" ] &&
     [ "${SWITCHYARD_DXMT_CORRESPONDING_SOURCE_SHA256:-}" = \
-      "40bbbbecb9c48cfd67f5862b0b93878ae80dc3de083790d3ec9dadd98618c89a" ] &&
+      "972485701e4d189475644657c6a35a1380484e0e252995a80f3b3ad17311327c" ] &&
     [ "${SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256:-}" = \
       "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0" ] &&
     [ "${SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256:-}" = \
-      "7938d56916074f61dce96b43e3f63b47fe52565c6a4c6096c876847f1920d9d3" ] || {
+      "0051bd8c0bc3e3ce261e9d5007665342ac2d28a643576744d8ec71896af856f1" ] || {
     echo "Native ARM64 DXMT packaging constants do not match the closed policy." >&2
     return 1
   }
@@ -57,7 +67,12 @@ switchyard_stage_native_arm64_dxmt_artifact() {
 
   /usr/bin/python3 -I - "$archive" "$source_root" "$wine_source_root" "$runtime_root" \
     "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" \
+    "$SWITCHYARD_DXMT_SOURCE_BASE_TREE" \
     "$SWITCHYARD_DXMT_SOURCE_REVISION" \
+    "$SWITCHYARD_DXMT_SOURCE_TREE" \
+    "$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME" \
+    "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" \
+    "$SWITCHYARD_DXMT_ARTIFACT_BUILD_IDENTITY" \
     "$SWITCHYARD_DXMT_ARTIFACT_NAME" \
     "$SWITCHYARD_DXMT_ARTIFACT_SHA256" \
     "$SWITCHYARD_DXMT_PACKAGE_WORKFLOW" \
@@ -73,6 +88,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 (
     archive_name,
@@ -80,7 +96,12 @@ import tarfile
     wine_source_name,
     runtime_name,
     repository,
+    base_tree,
     revision,
+    source_tree,
+    patch_basename,
+    patch_sha256,
+    artifact_build_identity,
     artifact_name,
     artifact_sha256,
     workflow,
@@ -93,8 +114,10 @@ import tarfile
 ) = sys.argv[1:]
 
 COMPANION_PATH = "lib/wine/aarch64-unix/winemetal-wow64.so"
-COMPANION_SCHEMA_SOURCE = "dlls/winemetal-wow64/abi-schema-v4.txt"
-COMPANION_SCHEMA_PATH = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+COMPANION_SCHEMA_SOURCE = "dlls/winemetal-wow64/abi-schema-v6.txt"
+COMPANION_SCHEMA_PATH = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v6.txt"
+SOURCE_PATCH_SOURCE = "switchyard/patches/" + patch_basename
+SOURCE_PATCH_PATH = "lib/switchyard-dxmt/share/src/switchyard-dxmt/" + patch_basename
 
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_MEMBER = 40 * 1024 * 1024
@@ -108,10 +131,10 @@ SOURCE_FILES = {
     "aarch64-windows/nvapi64.dll": "f4e1cf79244d378c660b5d9b6c98923e29f2bd30e9073dadf62ac1879ffd9f02",
     "aarch64-windows/nvngx.dll": "b8ddc2d81dcf4306b58398b486299f31067617e4f5e66cd64c8e5eacde2a0c0c",
     "aarch64-windows/winemetal.dll": "64007d8901b691bd91aac8218bddb12e2cce272fbdaab8a7bdc3f0ca6fe3eb99",
-    "i386-windows/d3d10core.dll": "77a7c58a8ee649a2959017a91211f5003bf988010a090447b78fa00ca8a7544b",
-    "i386-windows/d3d11.dll": "3f42b073b2954d7b27fa00380d4e268b6f8f2216d701b2c57176c9f3c83b49fb",
-    "i386-windows/dxgi.dll": "c6ba805aafd21668d487252747fadba3ee4525a55c7bfdf6f65ec26e140a39ff",
-    "i386-windows/winemetal.dll": "99db6924a2726d534562f9168692c5c1b4d4651d40a55133a8887e7621c9bc2f",
+    "i386-windows/d3d10core.dll": "2408d249cfe0ea8cb333a816dc833725ae85d76a94a414b31272b2d53807a1a6",
+    "i386-windows/d3d11.dll": "35be5a26db509ca206b6521bb79dbb16b49dd8ec79e863fac5a1eb8d572700d4",
+    "i386-windows/dxgi.dll": "eea621daefc1e1d811eb780372af639a2229ab4596ca049e7d8554f96595feb3",
+    "i386-windows/winemetal.dll": "a4da600c7f33eee3b5cd74bd763c5df9dc08ca543ad8537bfd8e845463a38db0",
     "x86_64-windows/d3d10core.dll": "4910ce0b1960a627c61114b019869057be8e1bf2edddd2ecb348c434bb98e5e0",
     "x86_64-windows/d3d11.dll": "26b88098961e936b3bfe0ad984d3ad2a4568f10b04a4e6f7fa54711a9c17b583",
     "x86_64-windows/dxgi.dll": "19ffb16b5dd22c944b284d9ea6d7b301e2ad96ef68f65ebdb642db49c55a9491",
@@ -325,6 +348,28 @@ def git(*arguments):
     return result.stdout
 
 
+def git_index(index_name, *arguments, input_data=None):
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_INDEX_FILE": index_name,
+    }
+    result = subprocess.run(
+        ["/usr/bin/git", "-C", source_name, *arguments],
+        input=input_data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        check=False,
+    )
+    if result.returncode:
+        fail("source reconstruction failed: " + result.stderr.decode("utf-8", "replace").strip())
+    return result.stdout
+
+
 source_fd, _source_metadata = validate_absolute(source_name, "source root", directory=True)
 os.close(source_fd)
 wine_source_fd, _wine_source_metadata = validate_absolute(
@@ -347,11 +392,43 @@ if (
     or any(byte > 0x7f for byte in schema_data)
 ):
     fail("companion ABI schema is not the exact pinned ASCII/LF file")
+patch_name = os.path.join(wine_source_name, SOURCE_PATCH_SOURCE)
+patch_fd, patch_metadata = validate_absolute(patch_name, "DXMT source patch")
+if patch_metadata.st_size <= 0 or patch_metadata.st_size > 1024 * 1024:
+    os.close(patch_fd)
+    fail("DXMT source patch is outside its size bound")
+with os.fdopen(patch_fd, "rb") as patch_stream:
+    patch_data = patch_stream.read(patch_metadata.st_size + 1)
+if len(patch_data) != patch_metadata.st_size or sha256(patch_data) != patch_sha256:
+    fail("DXMT source patch differs from the frozen contract")
 if git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii").strip() != revision:
     fail("source checkout is not at the pinned revision")
+if git("rev-parse", "--verify", revision + "^{tree}").decode("ascii").strip() != base_tree:
+    fail("upstream revision does not resolve to the pinned source tree")
 remotes = git("remote", "get-url", "--all", "origin").decode("utf-8").splitlines()
 if remotes != [repository]:
     fail("source origin is not the exact pinned repository")
+with tempfile.TemporaryDirectory(prefix="switchyard-dxmt-index-") as temporary:
+    index_name = os.path.join(temporary, "index")
+    git_index(index_name, "read-tree", revision)
+    git_index(
+        index_name, "apply", "--cached", "--check", "--whitespace=error-all", "-",
+        input_data=patch_data,
+    )
+    git_index(
+        index_name, "apply", "--cached", "--whitespace=error-all", "-",
+        input_data=patch_data,
+    )
+    git_index(index_name, "diff", "--cached", "--check")
+    if git_index(index_name, "write-tree").decode("ascii").strip() != source_tree:
+        fail("source patch does not reconstruct the pinned source tree")
+expected_gitlinks = (
+    "160000 commit d08488fcc82eef313b0464db37d2955709691e94\texternal/nvapi\n"
+    "160000 commit 9df86f2341616ef1888ae59919feaa6d4fad693d\tinclude/native/directx\n"
+).encode("ascii")
+for treeish in (base_tree, source_tree):
+    if git("ls-tree", treeish, "external/nvapi", "include/native/directx") != expected_gitlinks:
+        fail("source reconstruction changed a pinned submodule gitlink")
 
 
 def source_blob(relative, expected, maximum=4 * 1024 * 1024):
@@ -384,16 +461,16 @@ with os.fdopen(archive_fd, "rb") as archive_stream:
     with tarfile.open(fileobj=archive_stream, mode="r:gz") as package:
         members = package.getmembers()
         names = [member.name.rstrip("/") for member in members]
-        expected = {revision}
-        expected.update(revision + "/" + item for item in DIRECTORIES)
-        expected.update(revision + "/" + item for item in SOURCE_FILES)
+        expected = {artifact_build_identity}
+        expected.update(artifact_build_identity + "/" + item for item in DIRECTORIES)
+        expected.update(artifact_build_identity + "/" + item for item in SOURCE_FILES)
         if len(names) != len(set(names)) or set(names) != expected or len(names) != 24:
             fail("artifact archive is not the exact 24-member closure")
         data_by_name = {}
         expanded = 0
         for member, normalized in zip(members, names):
-            relative = normalized.removeprefix(revision + "/")
-            if normalized == revision or relative in DIRECTORIES:
+            relative = normalized.removeprefix(artifact_build_identity + "/")
+            if normalized == artifact_build_identity or relative in DIRECTORIES:
                 if not member.isdir() or member.issym() or member.islnk():
                     fail("artifact directory has an unsafe type: " + normalized)
                 continue
@@ -433,20 +510,38 @@ try:
     documentation = "lib/switchyard-dxmt/share/doc/switchyard-dxmt"
     corresponding_source = f"""DXMT corresponding source and artifact provenance
 
-Repository: {repository}
-Revision: {revision}
-Source URL: {repository.removesuffix('.git')}/tree/{revision}
+Upstream repository: {repository}
+Upstream revision: {revision}
+Upstream tree: {base_tree}
+Upstream source URL: {repository.removesuffix('.git')}/tree/{revision}
+Artifact build label: {artifact_build_identity}
+Patched source tree: {source_tree}
+Artifact build label semantics: opaque local artifact identifier; no Git object is required
+Patch: {SOURCE_PATCH_PATH}
+Patch SHA-256: {patch_sha256}
+Reconstruction contract: upstream revision plus the pinned patch yields the patched source tree
+DirectX headers submodule: 9df86f2341616ef1888ae59919feaa6d4fad693d
+NVAPI submodule: d08488fcc82eef313b0464db37d2955709691e94
+Base artifact: dxmt-{revision}.tar.gz
+Base artifact SHA-256: 8840df7038d7cbffed3652712c86ec4d6d495612aa39306e9a184bd213514acf
 Artifact: {artifact_name}
 Artifact SHA-256: {artifact_sha256}
-Package workflow: {workflow}
+Package workflow path: {workflow}
 Package workflow SHA-256: {workflow_sha256}
 Package build: {package_build}
 
-The PE modules are byte-for-byte files from the pinned artifact. The host
-Mach-O module is derived from that artifact and may differ only through the
-runtime's validated code-signing step; its final digest is recorded in both
-files.sha256 and switchyard-runtime.json. DXMT is licensed under
-LGPL-2.1-or-later; LICENSE and COPYING.LIB are retained in this directory.
+To reconstruct the corresponding source, check out the public upstream
+revision, apply the pinned patch, initialize the submodules at the commits
+recorded above, and verify that the resulting superproject Git tree is the
+patched source tree. The artifact build label does not identify a required Git
+object, and no unpublished commit metadata or history is needed or promised.
+
+The i386 PE modules were rebuilt from the patched source tree. Every retained
+native and x86_64 module is byte-for-byte identical to the base artifact. The
+host Mach-O module may differ only through the runtime's validated code-signing
+step; its final digest is recorded in both files.sha256 and
+switchyard-runtime.json. DXMT is licensed under LGPL-2.1-or-later; LICENSE and
+COPYING.LIB are retained in this directory.
 """.encode("utf-8")
     if sha256(corresponding_source) != corresponding_source_sha256:
         fail("corresponding-source document differs from the frozen contract")
@@ -457,6 +552,7 @@ LGPL-2.1-or-later; LICENSE and COPYING.LIB are retained in this directory.
     files_manifest += (
         sha256(companion_data) + "  " + COMPANION_PATH + "\n"
         + companion_schema_sha256 + "  " + COMPANION_SCHEMA_PATH + "\n"
+        + patch_sha256 + "  " + SOURCE_PATCH_PATH + "\n"
     ).encode("ascii")
     tree.write_file(documentation + "/files.sha256", files_manifest, 0o644, replace=False)
     tree.write_file(documentation + "/LICENSE", license_data, 0o644, replace=False)
@@ -468,6 +564,7 @@ LGPL-2.1-or-later; LICENSE and COPYING.LIB are retained in this directory.
         replace=False,
     )
     tree.write_file(COMPANION_SCHEMA_PATH, schema_data, 0o644, replace=False)
+    tree.write_file(SOURCE_PATCH_PATH, patch_data, 0o644, replace=False)
 finally:
     tree.close()
 PY
@@ -486,7 +583,12 @@ switchyard_finalize_native_arm64_runtime_manifest() {
 
   /usr/bin/python3 -I - "$runtime_root" "$manifest" \
     "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" \
+    "$SWITCHYARD_DXMT_SOURCE_BASE_TREE" \
     "$SWITCHYARD_DXMT_SOURCE_REVISION" \
+    "$SWITCHYARD_DXMT_SOURCE_TREE" \
+    "$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME" \
+    "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" \
+    "$SWITCHYARD_DXMT_ARTIFACT_BUILD_IDENTITY" \
     "$SWITCHYARD_DXMT_ARTIFACT_NAME" \
     "$SWITCHYARD_DXMT_ARTIFACT_SHA256" \
     "$SWITCHYARD_DXMT_PACKAGE_WORKFLOW" \
@@ -505,7 +607,12 @@ import sys
     root_name,
     manifest_name,
     repository,
+    base_tree,
     revision,
+    source_tree,
+    patch_basename,
+    patch_sha256,
+    artifact_build_identity,
     artifact_name,
     artifact_sha256,
     workflow,
@@ -516,7 +623,8 @@ import sys
 ) = sys.argv[1:]
 
 COMPANION_PATH = "lib/wine/aarch64-unix/winemetal-wow64.so"
-COMPANION_SCHEMA_PATH = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+COMPANION_SCHEMA_PATH = "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v6.txt"
+SOURCE_PATCH_PATH = "lib/switchyard-dxmt/share/src/switchyard-dxmt/" + patch_basename
 
 MODULE_SOURCES = [
     ("lib/wine/aarch64-unix/winemetal.so", "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0", "mach-o-dylib", "arm64"),
@@ -526,10 +634,10 @@ MODULE_SOURCES = [
     ("lib/wine/aarch64-windows/nvapi64.dll", "f4e1cf79244d378c660b5d9b6c98923e29f2bd30e9073dadf62ac1879ffd9f02", "pe-dll", "arm64ec"),
     ("lib/wine/aarch64-windows/nvngx.dll", "b8ddc2d81dcf4306b58398b486299f31067617e4f5e66cd64c8e5eacde2a0c0c", "pe-dll", "arm64ec"),
     ("lib/wine/aarch64-windows/winemetal.dll", "64007d8901b691bd91aac8218bddb12e2cce272fbdaab8a7bdc3f0ca6fe3eb99", "pe-dll", "arm64ec"),
-    ("lib/wine/i386-windows/d3d10core.dll", "77a7c58a8ee649a2959017a91211f5003bf988010a090447b78fa00ca8a7544b", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/d3d11.dll", "3f42b073b2954d7b27fa00380d4e268b6f8f2216d701b2c57176c9f3c83b49fb", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/dxgi.dll", "c6ba805aafd21668d487252747fadba3ee4525a55c7bfdf6f65ec26e140a39ff", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/winemetal.dll", "99db6924a2726d534562f9168692c5c1b4d4651d40a55133a8887e7621c9bc2f", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/d3d10core.dll", "2408d249cfe0ea8cb333a816dc833725ae85d76a94a414b31272b2d53807a1a6", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/d3d11.dll", "35be5a26db509ca206b6521bb79dbb16b49dd8ec79e863fac5a1eb8d572700d4", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/dxgi.dll", "eea621daefc1e1d811eb780372af639a2229ab4596ca049e7d8554f96595feb3", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/winemetal.dll", "a4da600c7f33eee3b5cd74bd763c5df9dc08ca543ad8537bfd8e845463a38db0", "pe-dll", "i386"),
     ("lib/wine/x86_64-windows/d3d10core.dll", "4910ce0b1960a627c61114b019869057be8e1bf2edddd2ecb348c434bb98e5e0", "pe-dll", "x86_64"),
     ("lib/wine/x86_64-windows/d3d11.dll", "26b88098961e936b3bfe0ad984d3ad2a4568f10b04a4e6f7fa54711a9c17b583", "pe-dll", "x86_64"),
     ("lib/wine/x86_64-windows/dxgi.dll", "19ffb16b5dd22c944b284d9ea6d7b301e2ad96ef68f65ebdb642db49c55a9491", "pe-dll", "x86_64"),
@@ -731,13 +839,18 @@ try:
             })
         modules.append(item)
     value["dxmt"] = {
-        "contractVersion": 1,
+        "contractVersion": 2,
         "implementation": "dxmt",
         "graphicsApi": "d3d11",
         "hostBackend": "metal",
         "provenance": {
             "sourceRepository": repository,
+            "sourceBaseTree": base_tree,
             "sourceRevision": revision,
+            "sourceTree": source_tree,
+            "sourcePatch": SOURCE_PATCH_PATH,
+            "sourcePatchSha256": patch_sha256,
+            "artifactBuildIdentity": artifact_build_identity,
             "artifactName": artifact_name,
             "artifactSha256": artifact_sha256,
             "packageWorkflow": workflow,
@@ -745,6 +858,11 @@ try:
             "packageBuild": package_build,
         },
         "license": "LGPL-2.1-or-later",
+        "sourceMaterials": [{
+            "path": SOURCE_PATCH_PATH,
+            "sha256": patch_sha256,
+            "type": "patch",
+        }],
         "modules": modules,
         "wow64Companion": {
             "path": COMPANION_PATH,
@@ -1809,7 +1927,7 @@ try:
         ]
         or companion.get("originalUnixLibrary") != modules[0].get("path")
         or companion.get("abiSchema")
-        != "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v4.txt"
+        != "lib/switchyard-dxmt/share/doc/switchyard-dxmt/abi-schema-v6.txt"
         or companion.get("entryCount") != 138
         or companion.get("dispatchSourceVersion") != 2
         or companion.get("bindingVersion") != 4
@@ -1827,6 +1945,25 @@ try:
     )
     new_files_text += f"{companion['sha256']}  {companion['path']}\n"
     new_files_text += f"{schema_digest}  {companion['abiSchema']}\n"
+    provenance = dxmt.get("provenance")
+    source_materials = dxmt.get("sourceMaterials")
+    if (
+        type(provenance) is not dict
+        or type(provenance.get("sourcePatch")) is not str
+        or type(source_materials) is not list
+        or len(source_materials) != 1
+        or type(source_materials[0]) is not dict
+        or set(source_materials[0]) != {"path", "sha256", "type"}
+        or source_materials[0].get("path") != provenance.get("sourcePatch")
+        or source_materials[0].get("sha256") != provenance.get("sourcePatchSha256")
+        or source_materials[0].get("type") != "patch"
+    ):
+        fail("DXMT source-patch provenance is not exact")
+    patch_relative = provenance["sourcePatch"]
+    patch_digest = digest(patch_relative)
+    if patch_digest != provenance.get("sourcePatchSha256"):
+        fail("DXMT source patch differs from its manifest provenance")
+    new_files_text += f"{patch_digest}  {patch_relative}\n"
     new_files_data = new_files_text.encode("ascii")
     _old_files_data, files_info = read_file(files_relative, MAX_MANIFEST)
     documents = dxmt.get("documents")

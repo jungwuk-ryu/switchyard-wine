@@ -246,11 +246,16 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "a9a853d25af1274fde256ac3dff2b83ba563d8cbe70c5c7a754ca93b94ee0486" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" = "https://github.com/3Shain/dxmt.git" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REVISION" = "856d9f35789679ef00c1ba01a6353438df84b66f" ]
-[ "$SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION" = "2" ]
-[ "$SWITCHYARD_DXMT_ARTIFACT_NAME" = "dxmt-856d9f35789679ef00c1ba01a6353438df84b66f.tar.gz" ]
-[ "$SWITCHYARD_DXMT_ARTIFACT_SHA256" = "8840df7038d7cbffed3652712c86ec4d6d495612aa39306e9a184bd213514acf" ]
+[ "$SWITCHYARD_DXMT_SOURCE_BASE_TREE" = "22fa93d36867f175c0283b36cd3628a4df94876e" ]
+[ "$SWITCHYARD_DXMT_SOURCE_TREE" = "a8c397f9b03dcb3592f6b0204ae6dbda5492990d" ]
+[ "$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME" = "0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch" ]
+[ "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" = "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852" ]
+[ "$SWITCHYARD_DXMT_ARTIFACT_BUILD_IDENTITY" = "f02a37f5b7c8022941712a7cf9415ac9d1925442" ]
+[ "$SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION" = "3" ]
+[ "$SWITCHYARD_DXMT_ARTIFACT_NAME" = "dxmt-f02a37f5b7c8022941712a7cf9415ac9d1925442.tar.gz" ]
+[ "$SWITCHYARD_DXMT_ARTIFACT_SHA256" = "4bf4f0bd654a92c0feb6a8e5b960307be53d62ef45f9ed32fdcbf37c418b8a3c" ]
 [ "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" = "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0" ]
-[ "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" = "7938d56916074f61dce96b43e3f63b47fe52565c6a4c6096c876847f1920d9d3" ]
+[ "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" = "0051bd8c0bc3e3ce261e9d5007665342ac2d28a643576744d8ec71896af856f1" ]
 [ "$SWITCHYARD_DXMT_PACKAGE_WORKFLOW" = ".github/workflows/ci.yml" ]
 [ "$SWITCHYARD_DXMT_PACKAGE_WORKFLOW_SHA256" = "fe5a3656b9f59e81e650e60077bcdd840a5205ff0d960f00f6cb4c8fbacbe851" ]
 [ "$SWITCHYARD_DXMT_PACKAGE_BUILD" = "gcc-release-x86_64-windows-cross+gcc-release-x86-windows-cross+clang-release-arm64ec-windows-cross" ]
@@ -272,6 +277,7 @@ closure_inputs=(
   "$(printf '%064x' 9)"
   "$(printf '%064x' 10)"
   "$(printf '%064x' 11)"
+  "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256"
   "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256"
   "$(printf '%064x' 12)"
   "$(printf '%064x' 13)"
@@ -279,12 +285,12 @@ closure_inputs=(
 closure_digest="$(switchyard_native_runtime_closure_digest "${closure_inputs[@]}")"
 [[ "$closure_digest" =~ ^[0-9a-f]{64}$ ]] ||
   fail "native runtime closure is not a full SHA-256"
-[ "$closure_digest" = "11827171549a4e473e75c458808597cfe98382c446a12ae5fa2cc64dba75594e" ] ||
-  fail "native runtime closure v2 labels, order, or domain changed"
+[ "$closure_digest" = "6fcfa05d146b38f5c2ac641c02de447c708a3fb6a90402ba4aace75214b21e9a" ] ||
+  fail "native runtime closure v3 labels, order, or domain changed"
 [ "$(switchyard_native_runtime_closure_digest "${closure_inputs[@]}")" = \
   "$closure_digest" ] || fail "native runtime closure is not deterministic"
 
-for closure_index in 0 1 2 3 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+for closure_index in 0 1 2 3 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
   mutated_closure_inputs=("${closure_inputs[@]}")
   case "$closure_index" in
     0) mutated_closure_inputs[closure_index]="different-source-identity" ;;
@@ -306,20 +312,20 @@ expect_failure "native closure GPTK policy" 1 \
   "native runtime closure must not bind a GPTK overlay" \
   switchyard_native_runtime_closure_digest "${mutated_closure_inputs[@]}"
 expect_failure "native closure arity" 2 \
-  "Native runtime closure requires the exact 19-input contract." \
-  switchyard_native_runtime_closure_digest "${closure_inputs[@]:0:18}"
+  "Native runtime closure requires the exact 20-input contract." \
+  switchyard_native_runtime_closure_digest "${closure_inputs[@]:0:19}"
 mutated_closure_inputs=("${closure_inputs[@]}")
 mutated_closure_inputs[13]="123456789abc"
 expect_failure "truncated TLS dlopen closure input" 1 \
   "native runtime closure TLS dlopen digest is invalid" \
   switchyard_native_runtime_closure_digest "${mutated_closure_inputs[@]}"
 mutated_closure_inputs=("${closure_inputs[@]}")
-mutated_closure_inputs[16]="1C03A178DB45540507E3784ED97890EE4FD8BAFFA1413E00991B6588C95859D0"
+mutated_closure_inputs[17]="1C03A178DB45540507E3784ED97890EE4FD8BAFFA1413E00991B6588C95859D0"
 expect_failure "uppercase original DXMT winemetal closure input" 1 \
   "native runtime closure input is not a full SHA-256: dxmtOriginalWinemetalSha256" \
   switchyard_native_runtime_closure_digest "${mutated_closure_inputs[@]}"
 mutated_closure_inputs=("${closure_inputs[@]}")
-mutated_closure_inputs[17]="123456789abc"
+mutated_closure_inputs[18]="123456789abc"
 expect_failure "truncated DXMT companion ABI schema closure input" 1 \
   "native runtime closure input is not a full SHA-256: dxmtCompanionAbiSchemaSha256" \
   switchyard_native_runtime_closure_digest "${mutated_closure_inputs[@]}"
@@ -822,7 +828,8 @@ fi''',
     'tls_closure_digest="$(runtime_content_tree_digest "$tls_deps_prefix")"',
     'switchyard_native_runtime_closure_digest \\',
     'switchyard_native_runtime_id_from_closure_digest \\',
-    '"$SWITCHYARD_DXMT_ARTIFACT_SHA256" "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" \\\n'
+    '"$SWITCHYARD_DXMT_ARTIFACT_SHA256" "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" \\\n'
+    '      "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" \\\n'
     '      "$DXMT_WOW64_COMPANION_ABI_SCHEMA_SHA256" "$NATIVE_COMPILER_POLICY_IDENTITY"',
     'native_homebrew="/opt/homebrew/bin/brew"',
     '"/opt/homebrew/Cellar/llvm/$SWITCHYARD_NATIVE_LLVM_VERSION/bin"',

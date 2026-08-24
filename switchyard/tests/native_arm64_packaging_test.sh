@@ -131,30 +131,30 @@ for relative in \
     dlls/winemetal-wow64/commands.c \
     dlls/winemetal-wow64/unixlib.c \
     dlls/winemetal-wow64/winemetal_private.h \
-    dlls/winemetal-wow64/abi-schema-v4.txt; do
+    dlls/winemetal-wow64/abi-schema-v6.txt; do
   /bin/mkdir -p "$COMPANION_SOURCE_FIXTURE/$(dirname "$relative")"
   /bin/cp "$ROOT_DIR/$relative" "$COMPANION_SOURCE_FIXTURE/$relative"
 done
 [ "$(switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE")" = \
   "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" ] ||
   fail "exact DXMT WoW64 companion source preflight did not return its schema identity"
-/bin/cp "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt" \
-  "$TEST_ROOT/abi-schema-v4.good"
+/bin/cp "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v6.txt" \
+  "$TEST_ROOT/abi-schema-v6.good"
 /usr/bin/printf 'tampered\n' >> \
-  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v6.txt"
 expect_failure "tampered companion ABI schema source" \
   switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
-/bin/cp "$TEST_ROOT/abi-schema-v4.good" \
-  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
-/bin/mv "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt" \
-  "$TEST_ROOT/abi-schema-v4.target"
-/bin/ln -s "$TEST_ROOT/abi-schema-v4.target" \
-  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
+/bin/cp "$TEST_ROOT/abi-schema-v6.good" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v6.txt"
+/bin/mv "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v6.txt" \
+  "$TEST_ROOT/abi-schema-v6.target"
+/bin/ln -s "$TEST_ROOT/abi-schema-v6.target" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v6.txt"
 expect_failure "symbolic-link companion ABI schema source" \
   switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
-/bin/rm "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
-/bin/mv "$TEST_ROOT/abi-schema-v4.target" \
-  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v4.txt"
+/bin/rm "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v6.txt"
+/bin/mv "$TEST_ROOT/abi-schema-v6.target" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v6.txt"
 /bin/mv "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/buffer.m" \
   "$TEST_ROOT/buffer.m.target"
 /bin/ln -s "$TEST_ROOT/buffer.m.target" \
@@ -166,7 +166,7 @@ expect_failure "symbolic-link companion implementation source" \
   "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/buffer.m"
 /bin/cp "$COMPANION_SOURCE_FIXTURE/include/wine/unixlib.h" \
   "$TEST_ROOT/unixlib.h.good"
-/usr/bin/sed -i '' 's/{ 0x79,/{ 0x78,/' \
+/usr/bin/sed -i '' 's/{ 0x00,/{ 0x01,/' \
   "$COMPANION_SOURCE_FIXTURE/include/wine/unixlib.h"
 expect_failure "mismatched companion ABI digest header" \
   switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
@@ -360,19 +360,23 @@ __attribute__((constructor)) static void companion_dependencies(void)
     };
     (void)dependencies;
 }
-struct companion_descriptor_v4
+struct companion_descriptor_v6
 {
     uint32_t version, size, entry_count, flags;
     unsigned char abi_sha256[32];
     const void *bind;
+    const void *quiesce;
+    const void *unbind;
 };
-FIXTURE_IMMUTABLE_EXPORT const struct companion_descriptor_v4
-    __wine_unix_call_wow64_companion_v4 = {
-        4, sizeof(struct companion_descriptor_v4), 138, 0,
-        {0x79, 0x38, 0xd5, 0x69, 0x16, 0x07, 0x4f, 0x61,
-         0xdc, 0xe9, 0x6b, 0x43, 0xe3, 0xf6, 0x3b, 0x47,
-         0xfe, 0x52, 0x56, 0x5c, 0x6a, 0x4c, 0x60, 0x96,
-         0xc8, 0x76, 0x84, 0x7f, 0x19, 0x20, 0xd9, 0xd3},
+FIXTURE_IMMUTABLE_EXPORT const struct companion_descriptor_v6
+    __wine_unix_call_wow64_companion_v6 = {
+        6, sizeof(struct companion_descriptor_v6), 138, 0,
+        {0x00, 0x51, 0xbd, 0x8c, 0x0b, 0xc3, 0xe3, 0xce,
+         0x26, 0x1e, 0x9d, 0x50, 0x07, 0x66, 0x53, 0x42,
+         0xac, 0x2d, 0x28, 0xa6, 0x43, 0x57, 0x67, 0x44,
+         0xd8, 0xec, 0x71, 0x89, 0x6a, 0xf8, 0x56, 0xf1},
+        __wine_unix_call_wow64_funcs,
+        __wine_unix_call_wow64_funcs,
         __wine_unix_call_wow64_funcs,
     };
 EOF
@@ -602,6 +606,18 @@ if [item["module"] for item in value["wow64UnixlibPolicy"]["auditedModules"]] !=
     raise SystemExit("producer did not emit the exact sorted audited-module list")
 if len(value["dxmt"]["modules"]) != 17 or len(value["dxmt"]["documents"]) != 5:
     raise SystemExit("producer did not emit the exact DXMT closure")
+if value["dxmt"].get("sourceMaterials") != [{
+    "path": "lib/switchyard-dxmt/share/src/switchyard-dxmt/0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch",
+    "sha256": "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852",
+    "type": "patch",
+}]:
+    raise SystemExit("producer did not emit the exact DXMT source-material closure")
+provenance = value["dxmt"].get("provenance")
+if (provenance.get("sourceRevision") != "856d9f35789679ef00c1ba01a6353438df84b66f"
+        or provenance.get("sourceBaseTree") != "22fa93d36867f175c0283b36cd3628a4df94876e"
+        or provenance.get("sourceTree") != "a8c397f9b03dcb3592f6b0204ae6dbda5492990d"
+        or provenance.get("artifactBuildIdentity") != "f02a37f5b7c8022941712a7cf9415ac9d1925442"):
+    raise SystemExit("producer conflated public source with the opaque artifact build label")
 companion = value["dxmt"]["wow64Companion"]
 if (companion["path"] != "lib/wine/aarch64-unix/winemetal-wow64.so"
         or companion["format"] != "mach-o-dylib"
@@ -801,6 +817,10 @@ if companion["abiSchemaSha256"] != digest(companion["abiSchema"]):
     raise SystemExit("refreshed DXMT companion schema digest is stale")
 files += f"{companion['sha256']}  {companion['path']}\n"
 files += f"{companion['abiSchemaSha256']}  {companion['abiSchema']}\n"
+for item in value["dxmt"]["sourceMaterials"]:
+    if item["sha256"] != digest(item["path"]):
+        raise SystemExit("refreshed DXMT source-material digest is stale")
+    files += f"{item['sha256']}  {item['path']}\n"
 files = files.encode("ascii")
 files_path = value["dxmt"]["documents"][0]["path"]
 with open(os.path.join(root, files_path), "rb") as stream:
@@ -1147,6 +1167,27 @@ expect_failure "symbolic-link DXMT WoW64 companion" \
 expect_failure "missing artifact input" \
   switchyard_stage_native_arm64_dxmt_artifact \
     "$TEST_ROOT/missing.tar.gz" "$DXMT_SOURCE" "$ROOT_DIR" "$RUNTIME"
+
+patch_input_runtime="$TEST_ROOT/patch-input-runtime"
+/bin/mkdir -p "$patch_input_runtime/lib/wine"
+/bin/chmod 0700 "$patch_input_runtime"
+expect_failure "missing DXMT corresponding-source patch input" \
+  switchyard_stage_native_arm64_dxmt_artifact \
+    "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$COMPANION_SOURCE_FIXTURE" "$patch_input_runtime"
+/bin/mkdir -p "$COMPANION_SOURCE_FIXTURE/switchyard/patches"
+/bin/cp "$ROOT_DIR/switchyard/patches/$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME" \
+  "$COMPANION_SOURCE_FIXTURE/switchyard/patches/$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME"
+/usr/bin/printf 'tampered\n' >> \
+  "$COMPANION_SOURCE_FIXTURE/switchyard/patches/$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME"
+expect_failure "tampered DXMT corresponding-source patch input" \
+  switchyard_stage_native_arm64_dxmt_artifact \
+    "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$COMPANION_SOURCE_FIXTURE" "$patch_input_runtime"
+/bin/rm "$COMPANION_SOURCE_FIXTURE/switchyard/patches/$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME"
+/bin/ln -s "$ROOT_DIR/switchyard/patches/$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME" \
+  "$COMPANION_SOURCE_FIXTURE/switchyard/patches/$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME"
+expect_failure "symbolic-link DXMT corresponding-source patch input" \
+  switchyard_stage_native_arm64_dxmt_artifact \
+    "$DXMT_ARCHIVE" "$DXMT_SOURCE" "$COMPANION_SOURCE_FIXTURE" "$patch_input_runtime"
 
 tampered_archive="$TEST_ROOT/tampered.tar.gz"
 /bin/cp "$DXMT_ARCHIVE" "$tampered_archive"

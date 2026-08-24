@@ -3452,7 +3452,8 @@ if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
       "$vulkan_closure_digest" "$mesa_closure_digest" "$font_closure_digest" \
       "$font_assets_closure_digest" "$tls_closure_digest" "$TLS_DLOPEN_NAME" \
       "$tls_dlopen_closure_digest" "$unicorn_runtime_digest" \
-      "$SWITCHYARD_DXMT_ARTIFACT_SHA256" "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" \
+      "$SWITCHYARD_DXMT_ARTIFACT_SHA256" "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" \
+      "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" \
       "$DXMT_WOW64_COMPANION_ABI_SCHEMA_SHA256" "$NATIVE_COMPILER_POLICY_IDENTITY"
   )" || exit $?
   runtime_id="$(
