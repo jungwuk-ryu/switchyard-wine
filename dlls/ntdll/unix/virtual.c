@@ -1288,14 +1288,14 @@ static NTSTATUS bind_wow64_companion( void *so_handle, const unixlib_entry_t *le
                                       unixlib_handle_t *dispatch )
 {
     static const BYTE expected_abi_sha256[32] =
-        WINE_WOW64_UNIXLIB_COMPANION_V4_ABI_SHA256;
-    const struct wine_wow64_unixlib_companion_v4 *descriptor;
+        WINE_WOW64_UNIXLIB_COMPANION_V6_ABI_SHA256;
+    const struct wine_wow64_unixlib_companion_v6 *descriptor;
     const struct wine_unixlib_dispatch_source_v2 *source;
     const struct wine_unixlib_owned_backing_codec_v2 *owned_codec;
-    struct wine_wow64_unixlib_binding_v4 binding;
+    struct wine_wow64_unixlib_binding_v6 binding;
     const unixlib_entry_t *normal_funcs, *companion_funcs;
     unixlib_entry_t *binding_funcs = NULL;
-    Dl_info descriptor_info, bind_info, source_info, funcs_info;
+    Dl_info descriptor_info, bind_info, quiesce_info, unbind_info, source_info, funcs_info;
     SIZE_T table_size;
     char *path;
     void *companion;
@@ -1315,19 +1315,23 @@ static NTSTATUS bind_wow64_companion( void *so_handle, const unixlib_entry_t *le
     normal_funcs = dlsym( so_handle, "__wine_unix_call_funcs" );
     companion_funcs = dlsym( companion, "__wine_unix_call_wow64_funcs" );
     source = dlsym( companion, "__wine_unix_call_wow64_dispatch_v2" );
-    descriptor = dlsym( companion, "__wine_unix_call_wow64_companion_v4" );
+    descriptor = dlsym( companion, "__wine_unix_call_wow64_companion_v6" );
     owned_codec = wow64_owned_backing_get_codec();
     if (!normal_funcs || !companion_funcs || !source || !descriptor ||
-        descriptor->version != WINE_WOW64_UNIXLIB_COMPANION_V4_VERSION ||
+        descriptor->version != WINE_WOW64_UNIXLIB_COMPANION_V6_VERSION ||
         descriptor->size != sizeof(*descriptor) || !descriptor->entry_count ||
         descriptor->entry_count > WINE_UNIXLIB_DISPATCH_MAX_ENTRIES ||
-        descriptor->flags || !descriptor->bind ||
+        descriptor->flags || !descriptor->bind || !descriptor->quiesce || !descriptor->unbind ||
         memcmp( descriptor->abi_sha256, expected_abi_sha256,
                 sizeof(expected_abi_sha256) ) ||
         source->entry_count != descriptor->entry_count || source->funcs != companion_funcs ||
         !dladdr( descriptor, &descriptor_info ) || !dladdr( descriptor->bind, &bind_info ) ||
+        !dladdr( descriptor->quiesce, &quiesce_info ) ||
+        !dladdr( descriptor->unbind, &unbind_info ) ||
         !dladdr( source, &source_info ) || !dladdr( companion_funcs, &funcs_info ) ||
         descriptor_info.dli_fbase != bind_info.dli_fbase ||
+        descriptor_info.dli_fbase != quiesce_info.dli_fbase ||
+        descriptor_info.dli_fbase != unbind_info.dli_fbase ||
         descriptor_info.dli_fbase != source_info.dli_fbase ||
         descriptor_info.dli_fbase != funcs_info.dli_fbase ||
         validate_wow64_unixlib_function_table( normal_funcs,
@@ -1339,7 +1343,7 @@ static NTSTATUS bind_wow64_companion( void *so_handle, const unixlib_entry_t *le
         owned_codec->capabilities != WINE_UNIXLIB_OWNED_BACKING_CAP_ACQUIRE_RELEASE ||
         !owned_codec->acquire_backing || !owned_codec->release_backing)
     {
-        WARN_(module)( "invalid WoW64 companion v4 contract\n" );
+        WARN_(module)( "invalid WoW64 companion v6 contract\n" );
         dlclose( companion );
         return STATUS_INVALID_IMAGE_FORMAT;
     }
@@ -1365,7 +1369,7 @@ static NTSTATUS bind_wow64_companion( void *so_handle, const unixlib_entry_t *le
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
-    binding.version = WINE_WOW64_UNIXLIB_BINDING_V4_VERSION;
+    binding.version = WINE_WOW64_UNIXLIB_BINDING_V6_VERSION;
     binding.size = sizeof(binding);
     binding.entry_count = descriptor->entry_count;
     binding.reserved = 0;
@@ -1373,7 +1377,8 @@ static NTSTATUS bind_wow64_companion( void *so_handle, const unixlib_entry_t *le
     binding.legacy_wow64_funcs = binding_funcs + descriptor->entry_count;
     binding.codec = &wow64_companion_codec;
     binding.owned_backing_codec = owned_codec;
-    if (!(status = register_wow64_unixlib_dispatch_v2( source, companion_funcs, dispatch )))
+    if (!(status = ntdll_wow64_register_unixlib_dispatch_v2(
+              source, companion_funcs, descriptor->quiesce, descriptor->unbind, dispatch )))
     {
         if ((status = descriptor->bind( &binding )))
         {

@@ -16,15 +16,67 @@
 #include "config.h"
 
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __APPLE__
+# include <mach/mach.h>
+#endif
 
 #include "buffer.h"
 #include "winemetal_private.h"
 
 static _Atomic uint64_t snapshot_live_bytes;
+
+#ifdef WMT_NATIVE_TEST
+extern void wmt_test_before_native_snapshot_copy(void);
+
+uint64_t wmt_test_snapshot_live_bytes(void)
+{
+    return atomic_load_explicit( &snapshot_live_bytes, memory_order_acquire );
+}
+#endif
+
+struct wmt_air_shader_record
+{
+    uint64_t shader;
+    uint32_t constant_buffers;
+    uint32_t arguments;
+    unsigned int references;
+    BOOL destroying;
+    struct wmt_air_shader_record *next;
+};
+
+struct wmt_air_bitcode_record
+{
+    uint64_t bitcode;
+    uint64_t token;
+    uint64_t dispatch_data;
+    uint64_t size;
+    BOOL destroying;
+    struct wmt_air_bitcode_record *next;
+};
+
+struct wmt_air_error_record
+{
+    uint64_t error;
+    BOOL destroying;
+    struct wmt_air_error_record *next;
+};
+
+static pthread_mutex_t air_shader_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t air_shader_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t air_bitcode_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t air_error_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct wmt_air_shader_record *air_shaders;
+static struct wmt_air_bitcode_record *air_bitcodes;
+static struct wmt_air_error_record *air_errors;
+static uint64_t air_next_token = 1;
+
+#define WMT_AIR_TOKEN_PREFIX 0x574d540000000000ull
+#define WMT_AIR_TOKEN_MAX    0x000000ffffffffffull
 
 static BOOL valid_guest_range( uint64_t guest, uint64_t size )
 {
@@ -97,6 +149,34 @@ static NTSTATUS copy_to_wire_offset( struct wmt_wire_ptr ptr, size_t offset,
     if (field.high || offset > UINT32_MAX - field.low) return STATUS_INVALID_PARAMETER;
     field.low += offset;
     return copy_to_wire( field, src, size );
+}
+
+static NTSTATUS publish_air_argument_outputs( uint32_t constant_guest, const void *constant_data,
+                                              uint64_t constant_size, uint32_t argument_guest,
+                                              const void *argument_data, uint64_t argument_size )
+{
+    struct ntdll_wow64_user_write_range ranges[2];
+    ULONG count = 0;
+    NTSTATUS status;
+
+    if (constant_size)
+    {
+        if (!valid_guest_range( constant_guest, constant_size ) || constant_size > SIZE_MAX)
+            return STATUS_INVALID_PARAMETER;
+        if ((status = ntdll_wow64_guest32_to_host( constant_guest, &ranges[count].dst ))) return status;
+        ranges[count].src = constant_data;
+        ranges[count++].size = constant_size;
+    }
+    if (argument_size)
+    {
+        if (!valid_guest_range( argument_guest, argument_size ) || argument_size > SIZE_MAX)
+            return STATUS_INVALID_PARAMETER;
+        if ((status = ntdll_wow64_guest32_to_host( argument_guest, &ranges[count].dst ))) return status;
+        ranges[count].src = argument_data;
+        ranges[count++].size = argument_size;
+    }
+    if (!count) return STATUS_SUCCESS;
+    return ntdll_wow64_atomic_writev( ranges, count );
 }
 
 static NTSTATUS zero_guest_range( uint32_t guest, uint64_t size, uint64_t maximum )
@@ -187,6 +267,25 @@ void wmt_snapshot_free( void *ptr, uint64_t size )
     if (!ptr) return;
     free( ptr );
     release_snapshot_bytes( size );
+}
+
+static NTSTATUS snapshot_native_bytes( void *dst, const void *src, size_t size )
+{
+    NTSTATUS status = STATUS_ACCESS_VIOLATION;
+
+    __TRY
+    {
+#ifdef WMT_NATIVE_TEST
+        wmt_test_before_native_snapshot_copy();
+#endif
+        memcpy( dst, src, size );
+        status = STATUS_SUCCESS;
+    }
+    __EXCEPT
+    {
+    }
+    __ENDTRY
+    return status;
 }
 
 NTSTATUS wmt_snapshot_cstring( uint64_t guest, size_t max_length, char **ret )
@@ -478,7 +577,7 @@ NTSTATUS wmt_call_19( void *args )
     native.info.ptr = &info;
     native.ret = 0;
     status = wmt_normal_call( WMT_CALL_NEW_SAMPLER, &native );
-    if (status) return status;
+    if (status) return release_native_object_on_failure( native.ret, status );
     if ((status = copy_to_wire_offset( wire.info, offsetof(struct wmt_sampler_info32, gpu_resource_id),
                                        &info.gpu_resource_id, sizeof(info.gpu_resource_id) )))
     {
@@ -506,6 +605,7 @@ NTSTATUS wmt_call_20( void *args )
     native.info.ptr = &info;
     native.ret = 0;
     status = wmt_normal_call( WMT_CALL_NEW_DEPTH_STENCIL, &native );
+    if (status) return release_native_object_on_failure( native.ret, status );
     if (!status) memcpy( (char *)args + offsetof(struct wmt_params32_info_ret, ret),
                          &native.ret, sizeof(native.ret) );
     return status;
@@ -531,7 +631,7 @@ NTSTATUS wmt_call_21( void *args )
     native.info.ptr = &info;
     native.ret = 0;
     status = wmt_normal_call( WMT_CALL_NEW_TEXTURE, &native );
-    if (status) return status;
+    if (status) return release_native_object_on_failure( native.ret, status );
     if ((status = copy_to_wire_offset( wire.info, offsetof(struct wmt_texture_info32, gpu_resource_id),
                                        &info.gpu_resource_id, sizeof(info.gpu_resource_id) )))
     {
@@ -567,6 +667,7 @@ NTSTATUS wmt_call_26( void *args )
     native.ret = 0;
     status = wmt_normal_call( WMT_CALL_LIBRARY_NEW_FUNCTION, &native );
     wmt_snapshot_free( name, WMT_STRING_MAX + 1u );
+    if (status) return release_native_object_on_failure( native.ret, status );
     if (!status) memcpy( (char *)args + offsetof(struct wmt_params32_obj_u64_obj_ret, ret),
                          &native.ret, sizeof(native.ret) );
     return status;
@@ -603,6 +704,7 @@ NTSTATUS wmt_call_29( void *args )
     native.ret_error = native.ret_pso = 0;
     status = wmt_normal_call( WMT_CALL_NEW_COMPUTE_PSO, &native );
     wmt_snapshot_free( archives, archive_size );
+    if (status) return release_native_object_on_failure( native.ret_pso, status );
     if (!status)
     {
         memcpy( (char *)args + offsetof(struct wmt_params32_pipeline, ret_error),
@@ -663,6 +765,7 @@ NTSTATUS wmt_call_34( void *args )
     native.ret_error = native.ret_pso = 0;
     status = wmt_normal_call( WMT_CALL_NEW_RENDER_PSO, &native );
     wmt_snapshot_free( archives, archive_size );
+    if (status) return release_native_object_on_failure( native.ret_pso, status );
     if (!status)
     {
         memcpy( (char *)args + offsetof(struct wmt_params32_pipeline, ret_error),
@@ -690,6 +793,8 @@ static NTSTATUS call_string( unsigned int index, void *args )
     native.ret = 0;
     status = wmt_normal_call( index, &native );
     wmt_snapshot_free( string, WMT_STRING_MAX + 1u );
+    if (status && index == WMT_CALL_NSSTRING_ALLOC_INIT)
+        return release_native_object_on_failure( native.ret, status );
     if (!status) memcpy( (char *)args + offsetof(struct wmt_params32_string, ret),
                          &native.ret, sizeof(native.ret) );
     return status;
@@ -845,6 +950,8 @@ NTSTATUS wmt_call_98( void *args )
     native.count = wire.count;
     native.ret = native.ret_error = 0;
     status = wmt_normal_call( WMT_CALL_FUNCTION_CONSTANTS, &native );
+    if (status && native.ret)
+        status = release_native_object_on_failure( native.ret, status );
     if (!status)
     {
         memcpy( (char *)args + offsetof(struct wmt_params32_function_constants, ret),
@@ -894,27 +1001,122 @@ NTSTATUS wmt_call_101( void *args )
     return STATUS_SUCCESS;
 }
 
+NTSTATUS wmt_call_45( void *args )
+{
+    struct wmt_params32_texture_replace wire;
+    struct wmt_params_texture_replace native;
+    uint64_t image_bytes, row_bytes, rows, size;
+    void *data = NULL;
+    NTSTATUS status;
+
+    memcpy( &wire, args, sizeof(wire) );
+    if (wire.data.high || !wire.data.low || !wire.texture || !wire.bytes_per_row)
+        return STATUS_INVALID_PARAMETER;
+    if ((status = wmt_metal_texture_snapshot_rows( wire.texture, wire.origin.x,
+                                                   wire.origin.y, wire.origin.z,
+                                                   wire.size.width, wire.size.height,
+                                                   wire.size.depth, wire.level, wire.slice,
+                                                   wire.bytes_per_row, wire.bytes_per_image,
+                                                   &rows, &row_bytes )))
+        return status;
+    if (wire.bytes_per_row < row_bytes) return STATUS_INVALID_PARAMETER;
+    if (rows - 1 > (UINT64_MAX - row_bytes) / wire.bytes_per_row)
+        return STATUS_INVALID_PARAMETER;
+    image_bytes = (rows - 1) * wire.bytes_per_row + row_bytes;
+    if (wire.size.depth > 1)
+    {
+        if (wire.bytes_per_image < image_bytes || wire.size.depth - 1 >
+            (UINT64_MAX - image_bytes) / wire.bytes_per_image)
+            return STATUS_INVALID_PARAMETER;
+        size = (wire.size.depth - 1) * wire.bytes_per_image + image_bytes;
+    }
+    else size = image_bytes;
+    if (!size || size > WMT_DISPATCH_BLOB_MAX) return STATUS_INVALID_PARAMETER;
+    if ((status = wmt_snapshot_bytes( wire.data.low, size, &data ))) return status;
+    native.texture = wire.texture;
+    native.origin = wire.origin;
+    native.size = wire.size;
+    native.level = wire.level;
+    native.slice = wire.slice;
+    native.data.ptr = data;
+    native.bytes_per_row = wire.bytes_per_row;
+    native.bytes_per_image = wire.bytes_per_image;
+    status = wmt_normal_call( 45, &native );
+    wmt_snapshot_free( data, size );
+    return status;
+}
+
+NTSTATUS wmt_call_107( void *args )
+{
+    struct wmt_params32_buffer_update wire;
+    struct wmt_params_buffer_update native;
+    void *data = NULL;
+    uint64_t buffer_length;
+    NTSTATUS status;
+
+    memcpy( &wire, args, sizeof(wire) );
+    if (wire.data.high || !wire.data.low || !wire.buffer || !wire.length ||
+        wire.length > WMT_DISPATCH_BLOB_MAX || wire.offset > UINT64_MAX - wire.length)
+        return STATUS_INVALID_PARAMETER;
+    if ((status = wmt_metal_buffer_length( wire.buffer, &buffer_length ))) return status;
+    if (wire.offset + wire.length > buffer_length) return STATUS_INVALID_PARAMETER;
+    if ((status = wmt_snapshot_bytes( wire.data.low, wire.length, &data ))) return status;
+    native.buffer = wire.buffer;
+    native.offset = wire.offset;
+    native.data.ptr = data;
+    native.length = wire.length;
+    status = wmt_normal_call( 107, &native );
+    wmt_snapshot_free( data, wire.length );
+    return status;
+}
+
 NTSTATUS wmt_call_114( void *args )
 {
     struct wmt_params32_obj_u64_obj_ret wire;
-    struct wmt_params_obj_u64_obj_ret native;
+    struct wmt_air_bitcode_record *record;
+    uint64_t token, retained;
     NTSTATUS status;
     void *bytes = NULL;
 
     memcpy( &wire, args, sizeof(wire) );
     wire.ret = 0;
     memcpy( args, &wire, sizeof(wire) );
-    if (wire.handle > UINT32_MAX || wire.arg > WMT_DISPATCH_BLOB_MAX)
-        return STATUS_INVALID_PARAMETER;
+    if (wire.arg > WMT_DISPATCH_BLOB_MAX) return STATUS_INVALID_PARAMETER;
+    if (wire.handle > UINT32_MAX)
+    {
+        pthread_mutex_lock( &air_bitcode_mutex );
+        for (record = air_bitcodes; record && record->token != wire.handle; record = record->next);
+        if (!record || record->destroying || record->size != wire.arg)
+        {
+            pthread_mutex_unlock( &air_bitcode_mutex );
+            return STATUS_INVALID_PARAMETER;
+        }
+        retained = record->dispatch_data;
+        status = wmt_normal_call( 0, &retained );
+        if (!status) wire.ret = retained;
+        pthread_mutex_unlock( &air_bitcode_mutex );
+        if (!status) memcpy( args, &wire, sizeof(wire) );
+        return status;
+    }
     if (wire.arg && (status = wmt_snapshot_bytes( wire.handle, wire.arg, &bytes ))) return status;
-    native.handle = (uintptr_t)bytes;
-    native.arg = wire.arg;
-    native.ret = 0;
-    status = wmt_normal_call( WMT_CALL_DISPATCH_DATA, &native );
-    wmt_snapshot_free( bytes, wire.arg );
+    if (!wire.arg) return STATUS_INVALID_PARAMETER;
+    token = 0;
+    status = wmt_dispatch_data_from_snapshot( bytes, wire.arg, wmt_snapshot_free, &token );
     if (!status) memcpy( (char *)args + offsetof(struct wmt_params32_obj_u64_obj_ret, ret),
-                         &native.ret, sizeof(native.ret) );
+                         &token, sizeof(token) );
     return status;
+}
+
+NTSTATUS wmt_rollback_114( void *args, NTSTATUS status )
+{
+    uint64_t object, zero = 0;
+
+    memcpy( &object, (char *)args + offsetof(struct wmt_params32_obj_u64_obj_ret, ret),
+            sizeof(object) );
+    if (!object) return status;
+    memcpy( (char *)args + offsetof(struct wmt_params32_obj_u64_obj_ret, ret),
+            &zero, sizeof(zero) );
+    return release_native_object_on_failure( object, status );
 }
 
 static NTSTATUS call_cache_init( unsigned int index, void *args )
@@ -934,9 +1136,224 @@ static NTSTATUS call_cache_init( unsigned int index, void *args )
     native.ret = 0;
     status = wmt_normal_call( index, &native );
     wmt_snapshot_free( path, PATH_MAX + 1u );
+    if (status && native.ret)
+        return release_native_object_on_failure( native.ret, status );
     if (!status) memcpy( (char *)args + offsetof(struct wmt_params32_cache_init, ret),
                          &native.ret, sizeof(native.ret) );
     return status;
+}
+
+NTSTATUS wmt_rollback_cache_init( void *args, NTSTATUS status )
+{
+    uint64_t object, zero = 0;
+
+    memcpy( &object, (char *)args + offsetof(struct wmt_params32_cache_init, ret),
+            sizeof(object) );
+    if (!object) return status;
+    memcpy( (char *)args + offsetof(struct wmt_params32_cache_init, ret), &zero, sizeof(zero) );
+    return release_native_object_on_failure( object, status );
+}
+
+void wmt_prepare_owned_output( unsigned int index, void *args )
+{
+    uint64_t zero = 0;
+    uint32_t zero32 = 0;
+    size_t offset;
+
+    switch (index)
+    {
+    case WMT_CALL_COPY_ALL_DEVICES:
+    case WMT_CALL_AUTORELEASE_POOL_INIT:
+    case WMT_CALL_SHARED_EVENT_LISTENER_CREATE:
+        offset = 0;
+        break;
+    case WMT_CALL_NEW_SHARED_EVENT:
+    case WMT_CALL_NEW_FENCE:
+    case WMT_CALL_NEW_EVENT:
+        offset = 8;
+        break;
+    case WMT_CALL_NEW_COMMAND_QUEUE:
+    case WMT_CALL_NEW_SAMPLER:
+    case WMT_CALL_NEW_DEPTH_STENCIL:
+    case WMT_CALL_NEW_TEXTURE:
+    case WMT_CALL_LIBRARY_NEW_FUNCTION:
+    case WMT_CALL_NSSTRING_ALLOC_INIT:
+    case WMT_CALL_CACHE_READER_INIT:
+    case WMT_CALL_CACHE_WRITER_INIT:
+    case WMT_CALL_NEW_SHARED_EVENT_WITH_PORT:
+    case WMT_CALL_NEW_TIMESTAMP_BUFFER:
+        offset = 16;
+        break;
+    case WMT_CALL_NEW_COMPUTE_PSO:
+    case WMT_CALL_NEW_RENDER_PSO:
+    case WMT_CALL_NEW_LIBRARY:
+    case WMT_CALL_NEW_RESIDENCY_SET:
+        offset = 24;
+        break;
+    case WMT_CALL_NEW_TEXTURE_VIEW:
+    case WMT_CALL_FUNCTION_CONSTANTS:
+        offset = 32;
+        break;
+    case WMT_CALL_CREATE_METAL_VIEW:
+        offset = 16;
+        memcpy( (char *)args + 24, &zero, sizeof(zero) );
+        break;
+    case WMT_CALL_BOOTSTRAP_LOOKUP:
+        memcpy( (char *)args + 128, &zero32, sizeof(zero32) );
+        return;
+    case WMT_CALL_SHARED_EVENT_CREATE_PORT:
+        memcpy( (char *)args + 8, &zero32, sizeof(zero32) );
+        return;
+    default:
+        return;
+    }
+    memcpy( (char *)args + offset, &zero, sizeof(zero) );
+}
+
+NTSTATUS wmt_rollback_owned_output( unsigned int index, void *args, NTSTATUS status )
+{
+    uint64_t object = 0, zero = 0;
+    NTSTATUS cleanup_status = STATUS_SUCCESS;
+    size_t object_offset = 0;
+
+    switch (index)
+    {
+    case WMT_CALL_COPY_ALL_DEVICES:
+    case WMT_CALL_AUTORELEASE_POOL_INIT:
+        object_offset = 0;
+        goto take_offset_object;
+    case WMT_CALL_NEW_COMMAND_QUEUE:
+        object_offset = 16;
+        goto take_offset_object;
+    case WMT_CALL_NEW_SHARED_EVENT:
+    case WMT_CALL_NEW_FENCE:
+    case WMT_CALL_NEW_EVENT:
+        object_offset = 8;
+        goto take_offset_object;
+    case WMT_CALL_NEW_TEXTURE_VIEW:
+        object_offset = 32;
+        goto take_offset_object;
+    case WMT_CALL_NEW_LIBRARY:
+        object_offset = 24;
+        goto take_offset_object;
+    case WMT_CALL_NEW_SHARED_EVENT_WITH_PORT:
+    case WMT_CALL_NEW_TIMESTAMP_BUFFER:
+        object_offset = 16;
+        goto take_offset_object;
+    case WMT_CALL_NEW_RESIDENCY_SET:
+        object_offset = 24;
+take_offset_object:
+        memcpy( &object, (char *)args + object_offset, sizeof(object) );
+        memcpy( (char *)args + object_offset, &zero, sizeof(zero) );
+        break;
+    case WMT_CALL_CREATE_METAL_VIEW:
+        memcpy( &object, (char *)args + 16, sizeof(object) );
+        memcpy( (char *)args + 16, &zero, sizeof(zero) );
+        memcpy( (char *)args + 24, &zero, sizeof(zero) );
+        if (object)
+        {
+            NTSTATUS release_status = wmt_normal_call( WMT_CALL_RELEASE_METAL_VIEW, &object );
+
+            if (release_status) return release_status;
+        }
+        return status;
+    case WMT_CALL_BOOTSTRAP_LOOKUP:
+    case WMT_CALL_SHARED_EVENT_CREATE_PORT:
+    {
+        uint32_t port = 0, zero32 = 0;
+        size_t port_offset = index == WMT_CALL_BOOTSTRAP_LOOKUP ? 128 : 8;
+
+        memcpy( &port, (char *)args + port_offset, sizeof(port) );
+        memcpy( (char *)args + port_offset, &zero32, sizeof(zero32) );
+#ifdef __APPLE__
+        if (port && mach_port_deallocate( mach_task_self(), port ) != KERN_SUCCESS)
+            return STATUS_UNSUCCESSFUL;
+#else
+        if (port) return STATUS_NOT_SUPPORTED;
+#endif
+        return status;
+    }
+    case WMT_CALL_SHARED_EVENT_LISTENER_CREATE:
+        memcpy( &object, args, sizeof(object) );
+        memcpy( args, &zero, sizeof(zero) );
+        if (object)
+        {
+            NTSTATUS release_status = wmt_shared_event_listener_destroy( object );
+
+            if (release_status) return release_status;
+        }
+        return status;
+    case WMT_CALL_NEW_SAMPLER:
+    case WMT_CALL_NEW_DEPTH_STENCIL:
+    case WMT_CALL_NEW_TEXTURE:
+    {
+        struct wmt_params32_info_ret *wire = args;
+
+        object = wire->ret;
+        wire->ret = 0;
+        if (index == WMT_CALL_NEW_SAMPLER)
+            cleanup_status = copy_to_wire_offset( wire->info,
+                    offsetof(struct wmt_sampler_info32, gpu_resource_id), &zero, sizeof(zero) );
+        else if (index == WMT_CALL_NEW_TEXTURE)
+        {
+            cleanup_status = copy_to_wire_offset( wire->info,
+                    offsetof(struct wmt_texture_info32, gpu_resource_id), &zero, sizeof(zero) );
+            if (!cleanup_status)
+            {
+                uint32_t zero32 = 0;
+
+                cleanup_status = copy_to_wire_offset( wire->info,
+                        offsetof(struct wmt_texture_info32, mach_port), &zero32, sizeof(zero32) );
+            }
+        }
+        break;
+    }
+    case WMT_CALL_LIBRARY_NEW_FUNCTION:
+    {
+        struct wmt_params32_obj_u64_obj_ret *wire = args;
+
+        object = wire->ret;
+        wire->ret = 0;
+        break;
+    }
+    case WMT_CALL_NEW_COMPUTE_PSO:
+    case WMT_CALL_NEW_RENDER_PSO:
+    {
+        struct wmt_params32_pipeline *wire = args;
+
+        object = wire->ret_pso;
+        wire->ret_pso = 0;
+        break;
+    }
+    case WMT_CALL_NSSTRING_ALLOC_INIT:
+    {
+        struct wmt_params32_string *wire = args;
+
+        object = wire->ret;
+        wire->ret = 0;
+        break;
+    }
+    case WMT_CALL_FUNCTION_CONSTANTS:
+    {
+        struct wmt_params32_function_constants *wire = args;
+
+        object = wire->ret;
+        wire->ret = 0;
+        break;
+    }
+    case WMT_CALL_CACHE_READER_INIT:
+    case WMT_CALL_CACHE_WRITER_INIT:
+        return wmt_rollback_cache_init( args, status );
+    default:
+        return status;
+    }
+    if (object)
+    {
+        NTSTATUS release_status = release_native_object( object );
+
+        if (release_status) return release_status;
+    }
+    return cleanup_status ? cleanup_status : status;
 }
 
 NTSTATUS wmt_call_115( void *args )
@@ -1167,6 +1584,971 @@ NTSTATUS wmt_rollback_18( void *args, NTSTATUS status )
     memcpy( (char *)args + offsetof(struct wmt_params32_info_ret, ret), &zero, sizeof(zero) );
     if (release_status) return release_status;
     if (clear_status) return clear_status;
+    return status;
+}
+
+struct wmt_air_argument_allocation
+{
+    union
+    {
+        struct wmt_air_argument base;
+        struct wmt_air_stream_output_argument stream_output;
+        struct wmt_air_common_argument common;
+        struct wmt_air_pixel_argument pixel;
+        struct wmt_air_input_layout_argument input_layout;
+        struct wmt_air_gs_passthrough_argument gs_passthrough;
+        struct wmt_air_bool_argument boolean;
+        struct wmt_air_u32_argument u32;
+        struct wmt_air_root_signature_argument root_signature;
+    } value;
+    void *payload;
+    uint64_t payload_size;
+    struct wmt_air_argument_allocation *next;
+};
+
+static NTSTATUS release_air_handle( unsigned int index, uint64_t handle )
+{
+    if (!handle) return STATUS_SUCCESS;
+    return wmt_normal_call( index, &handle );
+}
+
+static NTSTATUS register_air_shader( uint64_t shader, const struct wmt_air_reflection *reflection )
+{
+    struct wmt_air_shader_record *current, *record;
+
+    if (!shader) return STATUS_INVALID_PARAMETER;
+    if (!(record = malloc( sizeof(*record) ))) return STATUS_NO_MEMORY;
+    record->shader = shader;
+    record->constant_buffers = reflection->num_constant_buffers;
+    record->arguments = reflection->num_arguments;
+    record->references = 0;
+    record->destroying = FALSE;
+    pthread_mutex_lock( &air_shader_mutex );
+    for (current = air_shaders; current && current->shader != shader; current = current->next);
+    if (current)
+    {
+        pthread_mutex_unlock( &air_shader_mutex );
+        free( record );
+        return STATUS_INVALID_HANDLE;
+    }
+    record->next = air_shaders;
+    air_shaders = record;
+    pthread_mutex_unlock( &air_shader_mutex );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS retain_air_shaders( uint64_t first, uint64_t second,
+                                    struct wmt_air_shader_record **ret_first,
+                                    struct wmt_air_shader_record **ret_second )
+{
+    struct wmt_air_shader_record *record;
+
+    *ret_first = *ret_second = NULL;
+    pthread_mutex_lock( &air_shader_mutex );
+    for (record = air_shaders; record && record->shader != first; record = record->next);
+    if (!record || record->destroying) goto invalid;
+    ++record->references;
+    *ret_first = record;
+    if (!second || second == first)
+    {
+        *ret_second = second ? record : NULL;
+        pthread_mutex_unlock( &air_shader_mutex );
+        return STATUS_SUCCESS;
+    }
+    for (record = air_shaders; record && record->shader != second; record = record->next);
+    if (!record || record->destroying)
+    {
+        --(*ret_first)->references;
+        *ret_first = NULL;
+        goto invalid;
+    }
+    ++record->references;
+    *ret_second = record;
+    pthread_mutex_unlock( &air_shader_mutex );
+    return STATUS_SUCCESS;
+
+invalid:
+    pthread_mutex_unlock( &air_shader_mutex );
+    return STATUS_INVALID_HANDLE;
+}
+
+static void release_air_shaders( struct wmt_air_shader_record *first,
+                                 struct wmt_air_shader_record *second )
+{
+    pthread_mutex_lock( &air_shader_mutex );
+    if (second && second != first)
+    {
+        if (!second->references) abort();
+        --second->references;
+    }
+    if (first)
+    {
+        if (!first->references) abort();
+        --first->references;
+    }
+    pthread_cond_broadcast( &air_shader_cond );
+    pthread_mutex_unlock( &air_shader_mutex );
+}
+
+static NTSTATUS destroy_registered_air_shader( uint64_t shader )
+{
+    struct wmt_air_shader_record **cursor, *record;
+    NTSTATUS status;
+
+    pthread_mutex_lock( &air_shader_mutex );
+    for (record = air_shaders; record && record->shader != shader; record = record->next);
+    if (!record || record->destroying)
+    {
+        pthread_mutex_unlock( &air_shader_mutex );
+        return STATUS_INVALID_HANDLE;
+    }
+    record->destroying = TRUE;
+    while (record->references) pthread_cond_wait( &air_shader_cond, &air_shader_mutex );
+    for (cursor = &air_shaders; *cursor != record; cursor = &(*cursor)->next);
+    *cursor = record->next;
+    pthread_mutex_unlock( &air_shader_mutex );
+    /* Native destroy is destructive even when a fault is caught after delete.
+     * Detach first and never make the raw owner reachable for a retry. */
+    status = wmt_normal_call( 75, &shader );
+    free( record );
+    return status;
+}
+
+static NTSTATUS register_air_error( uint64_t error )
+{
+    struct wmt_air_error_record *current, *record;
+
+    if (!error) return STATUS_SUCCESS;
+    if (!(record = malloc( sizeof(*record) ))) return STATUS_NO_MEMORY;
+    record->error = error;
+    record->destroying = FALSE;
+    pthread_mutex_lock( &air_error_mutex );
+    for (current = air_errors; current && current->error != error; current = current->next);
+    if (current)
+    {
+        pthread_mutex_unlock( &air_error_mutex );
+        free( record );
+        return STATUS_INVALID_HANDLE;
+    }
+    record->next = air_errors;
+    air_errors = record;
+    pthread_mutex_unlock( &air_error_mutex );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS destroy_registered_air_error( uint64_t error )
+{
+    struct wmt_air_error_record **cursor, *record;
+    NTSTATUS status;
+
+    pthread_mutex_lock( &air_error_mutex );
+    for (record = air_errors; record && record->error != error; record = record->next);
+    if (!record || record->destroying)
+    {
+        pthread_mutex_unlock( &air_error_mutex );
+        return STATUS_INVALID_HANDLE;
+    }
+    record->destroying = TRUE;
+    for (cursor = &air_errors; *cursor != record; cursor = &(*cursor)->next);
+    *cursor = record->next;
+    pthread_mutex_unlock( &air_error_mutex );
+    status = wmt_normal_call( 80, &error );
+    free( record );
+    return status;
+}
+
+static NTSTATUS register_air_bitcode( uint64_t bitcode )
+{
+    struct wmt_air_bitcode_record *current, *record;
+
+    if (!bitcode) return STATUS_INVALID_PARAMETER;
+    if (!(record = calloc( 1, sizeof(*record) ))) return STATUS_NO_MEMORY;
+    record->bitcode = bitcode;
+    pthread_mutex_lock( &air_bitcode_mutex );
+    for (current = air_bitcodes; current && current->bitcode != bitcode; current = current->next);
+    if (current)
+    {
+        pthread_mutex_unlock( &air_bitcode_mutex );
+        free( record );
+        return STATUS_INVALID_HANDLE;
+    }
+    record->next = air_bitcodes;
+    air_bitcodes = record;
+    pthread_mutex_unlock( &air_bitcode_mutex );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS destroy_registered_air_bitcode( uint64_t bitcode )
+{
+    struct wmt_air_bitcode_record **cursor, *record;
+    NTSTATUS release_status = STATUS_SUCCESS, status;
+
+    pthread_mutex_lock( &air_bitcode_mutex );
+    for (record = air_bitcodes; record && record->bitcode != bitcode; record = record->next);
+    if (!record || record->destroying)
+    {
+        pthread_mutex_unlock( &air_bitcode_mutex );
+        return STATUS_INVALID_HANDLE;
+    }
+    record->destroying = TRUE;
+    for (cursor = &air_bitcodes; *cursor != record; cursor = &(*cursor)->next);
+    *cursor = record->next;
+    pthread_mutex_unlock( &air_bitcode_mutex );
+    status = wmt_normal_call( 78, &bitcode );
+    if (record->dispatch_data) release_status = release_native_object( record->dispatch_data );
+    free( record );
+    return status ? status : release_status;
+}
+
+NTSTATUS wmt_drain_air_registries(void)
+{
+    uint64_t handle;
+    NTSTATUS status;
+
+    for (;;)
+    {
+        pthread_mutex_lock( &air_bitcode_mutex );
+        handle = air_bitcodes ? air_bitcodes->bitcode : 0;
+        pthread_mutex_unlock( &air_bitcode_mutex );
+        if (!handle) break;
+        if ((status = destroy_registered_air_bitcode( handle ))) return status;
+    }
+    for (;;)
+    {
+        pthread_mutex_lock( &air_error_mutex );
+        handle = air_errors ? air_errors->error : 0;
+        pthread_mutex_unlock( &air_error_mutex );
+        if (!handle) break;
+        if ((status = destroy_registered_air_error( handle ))) return status;
+    }
+    for (;;)
+    {
+        pthread_mutex_lock( &air_shader_mutex );
+        handle = air_shaders ? air_shaders->shader : 0;
+        pthread_mutex_unlock( &air_shader_mutex );
+        if (!handle) break;
+        if ((status = destroy_registered_air_shader( handle ))) return status;
+    }
+    return STATUS_SUCCESS;
+}
+
+static void free_air_arguments( struct wmt_air_argument_allocation *allocation )
+{
+    struct wmt_air_argument_allocation *next;
+
+    while (allocation)
+    {
+        next = allocation->next;
+        wmt_snapshot_free( allocation->payload, allocation->payload_size );
+        wmt_snapshot_free( allocation, sizeof(*allocation) );
+        allocation = next;
+    }
+}
+
+static BOOL valid_air_attribute_format( uint32_t format )
+{
+    switch (format)
+    {
+    case 1: case 3: case 4: case 6: case 7: case 9: case 10: case 12:
+    case 13: case 15: case 16: case 18: case 19: case 21: case 22: case 24:
+    case 25: case 27: case 28: case 29: case 30: case 31: case 32: case 33:
+    case 34: case 35: case 36: case 37: case 38: case 39: case 40: case 41:
+    case 42: case 45: case 46: case 47: case 48: case 49: case 50: case 51:
+    case 52: case 53: case 54: case 55:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL valid_air_gs_passthrough_pair( uint32_t data, unsigned int shift )
+{
+    uint8_t reg = data >> shift;
+    uint8_t component = data >> (shift + 8);
+
+    return (reg == 0xff && component == 0xff) || (reg < 32 && component < 4);
+}
+
+static NTSTATUS copy_air_arguments( uint32_t guest, struct wmt_air_argument *sentinel,
+                                    struct wmt_air_argument_allocation **ret )
+{
+    struct wmt_air_argument_allocation *allocation, **tail = ret;
+    struct wmt_air_argument32 base;
+    uint32_t *visited = NULL;
+    uint32_t address, slot;
+    uint64_t graph_size, payload_size;
+    uint32_t seen_types = 0;
+    unsigned int count = 0;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    *ret = NULL;
+    sentinel->next = NULL;
+    sentinel->type = UINT32_MAX;
+    if (!guest) return STATUS_SUCCESS;
+    graph_size = WMT_AIR_ARGUMENT_MAX * 2u * sizeof(*visited);
+    if ((status = wmt_snapshot_alloc( graph_size,
+                                      (void **)&visited )))
+        return status;
+    memset( visited, 0, graph_size );
+
+    while (guest)
+    {
+        if (++count > WMT_AIR_ARGUMENT_MAX)
+        {
+            status = STATUS_BUFFER_OVERFLOW;
+            break;
+        }
+        address = guest;
+        slot = (address * 2654435761u) & (WMT_AIR_ARGUMENT_MAX * 2u - 1u);
+        while (visited[slot] && visited[slot] != address)
+            slot = (slot + 1u) & (WMT_AIR_ARGUMENT_MAX * 2u - 1u);
+        if (visited[slot] == address)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        visited[slot] = address;
+        if ((status = wmt_snapshot_bytes( address, sizeof(base), (void **)&allocation ))) break;
+        memcpy( &base, allocation, sizeof(base) );
+        wmt_snapshot_free( allocation, sizeof(base) );
+        allocation = NULL;
+        if (base.type < 1 || base.type > 8 || (seen_types & (1u << base.type)))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        seen_types |= 1u << base.type;
+        if (graph_size > WMT_AIR_GRAPH_MAX - sizeof(*allocation))
+        {
+            status = STATUS_BUFFER_OVERFLOW;
+            break;
+        }
+        graph_size += sizeof(*allocation);
+        if ((status = wmt_snapshot_alloc( sizeof(*allocation), (void **)&allocation ))) break;
+        memset( allocation, 0, sizeof(*allocation) );
+        allocation->value.base.type = base.type;
+        guest = base.next;
+
+        switch (base.type)
+        {
+        case 1:
+        {
+            struct wmt_air_stream_output_argument32 wire;
+
+            if ((status = wmt_snapshot_bytes( address, sizeof(wire), (void **)&allocation->payload ))) break;
+            memcpy( &wire, allocation->payload, sizeof(wire) );
+            wmt_snapshot_free( allocation->payload, sizeof(wire) );
+            allocation->payload = NULL;
+            allocation->value.stream_output.num_output_slots = wire.num_output_slots;
+            allocation->value.stream_output.num_elements = wire.num_elements;
+            memcpy( allocation->value.stream_output.strides, wire.strides, sizeof(wire.strides) );
+            if (!wire.num_output_slots || wire.num_output_slots > 4 ||
+                wire.num_elements > WMT_CONSTANT_COUNT_MAX)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            payload_size = wire.num_elements * sizeof(struct wmt_air_stream_output_element);
+            if (payload_size > WMT_AIR_GRAPH_MAX - graph_size)
+            {
+                status = STATUS_BUFFER_OVERFLOW;
+                break;
+            }
+            graph_size += payload_size;
+            if (payload_size && (status = wmt_snapshot_bytes( wire.elements, payload_size,
+                                                              &allocation->payload )))
+                break;
+            allocation->payload_size = payload_size;
+            allocation->value.stream_output.elements = allocation->payload;
+            if (payload_size)
+            {
+                const struct wmt_air_stream_output_element *elements = allocation->payload;
+                unsigned int i;
+
+                for (i = 0; i < wire.num_elements; ++i)
+                    if (elements[i].component >= 4 ||
+                        elements[i].output_slot >= wire.num_output_slots ||
+                        elements[i].output_slot >= 4 ||
+                        (elements[i].reg_id != UINT32_MAX && elements[i].reg_id >= 32) ||
+                        (elements[i].offset & 3) ||
+                        (wire.strides[elements[i].output_slot] & 3) ||
+                        wire.strides[elements[i].output_slot] < 4 ||
+                        elements[i].offset > wire.strides[elements[i].output_slot] - 4)
+                    {
+                        status = STATUS_INVALID_PARAMETER;
+                        break;
+                    }
+            }
+            break;
+        }
+        case 2:
+        {
+            struct wmt_air_common_argument32 wire;
+
+            if ((status = wmt_snapshot_bytes( address, sizeof(wire), (void **)&allocation->payload ))) break;
+            memcpy( &wire, allocation->payload, sizeof(wire) );
+            wmt_snapshot_free( allocation->payload, sizeof(wire) );
+            allocation->payload = NULL;
+            allocation->value.common.metal_version = wire.metal_version;
+            allocation->value.common.flags = wire.flags;
+            if ((wire.metal_version != 310 && wire.metal_version != 320) || (wire.flags & ~3u))
+                status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        case 3:
+        {
+            struct wmt_air_pixel_argument32 wire;
+
+            if ((status = wmt_snapshot_bytes( address, sizeof(wire), (void **)&allocation->payload ))) break;
+            memcpy( &wire, allocation->payload, sizeof(wire) );
+            wmt_snapshot_free( allocation->payload, sizeof(wire) );
+            allocation->payload = NULL;
+            allocation->value.pixel.sample_mask = wire.sample_mask;
+            allocation->value.pixel.dual_source_blending = wire.dual_source_blending;
+            allocation->value.pixel.disable_depth_output = wire.disable_depth_output;
+            allocation->value.pixel.unorm_output_reg_mask = wire.unorm_output_reg_mask;
+            if (wire.dual_source_blending > 1 || wire.disable_depth_output > 1)
+                status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        case 4:
+        {
+            struct wmt_air_input_layout_argument32 wire;
+
+            if ((status = wmt_snapshot_bytes( address, sizeof(wire), (void **)&allocation->payload ))) break;
+            memcpy( &wire, allocation->payload, sizeof(wire) );
+            wmt_snapshot_free( allocation->payload, sizeof(wire) );
+            allocation->payload = NULL;
+            allocation->value.input_layout.index_buffer_format = wire.index_buffer_format;
+            allocation->value.input_layout.slot_mask = wire.slot_mask;
+            allocation->value.input_layout.num_elements = wire.num_elements;
+            if (wire.index_buffer_format > 2 || wire.num_elements > WMT_CONSTANT_COUNT_MAX)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            payload_size = wire.num_elements * sizeof(struct wmt_air_input_element);
+            if (payload_size > WMT_AIR_GRAPH_MAX - graph_size)
+            {
+                status = STATUS_BUFFER_OVERFLOW;
+                break;
+            }
+            graph_size += payload_size;
+            if (payload_size && (status = wmt_snapshot_bytes( wire.elements, payload_size,
+                                                              &allocation->payload )))
+                break;
+            allocation->payload_size = payload_size;
+            allocation->value.input_layout.elements = allocation->payload;
+            if (payload_size)
+            {
+                const struct wmt_air_input_element *elements = allocation->payload;
+                unsigned int i;
+
+                for (i = 0; i < wire.num_elements; ++i)
+                    if (elements[i].reg >= 32 || elements[i].slot >= 32 ||
+                        !(wire.slot_mask & (1u << elements[i].slot)) ||
+                        !valid_air_attribute_format( elements[i].format ))
+                    {
+                        status = STATUS_INVALID_PARAMETER;
+                        break;
+                    }
+            }
+            break;
+        }
+        case 5:
+        {
+            struct wmt_air_gs_passthrough_argument32 wire;
+
+            if ((status = wmt_snapshot_bytes( address, sizeof(wire), (void **)&allocation->payload ))) break;
+            memcpy( &wire, allocation->payload, sizeof(wire) );
+            wmt_snapshot_free( allocation->payload, sizeof(wire) );
+            allocation->payload = NULL;
+            allocation->value.gs_passthrough.data = wire.data;
+            allocation->value.gs_passthrough.rasterization_disabled = wire.rasterization_disabled;
+            if (wire.rasterization_disabled > 1 ||
+                !valid_air_gs_passthrough_pair( wire.data, 0 ) ||
+                !valid_air_gs_passthrough_pair( wire.data, 16 ))
+                status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        case 6:
+        {
+            struct wmt_air_bool_argument32 wire;
+
+            if ((status = wmt_snapshot_bytes( address, sizeof(wire), (void **)&allocation->payload ))) break;
+            memcpy( &wire, allocation->payload, sizeof(wire) );
+            wmt_snapshot_free( allocation->payload, sizeof(wire) );
+            allocation->payload = NULL;
+            allocation->value.boolean.value = wire.value;
+            if (wire.value > 1) status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        case 7:
+        {
+            struct wmt_air_u32_argument32 wire;
+
+            if ((status = wmt_snapshot_bytes( address, sizeof(wire), (void **)&allocation->payload ))) break;
+            memcpy( &wire, allocation->payload, sizeof(wire) );
+            wmt_snapshot_free( allocation->payload, sizeof(wire) );
+            allocation->payload = NULL;
+            allocation->value.u32.value = wire.value;
+            break;
+        }
+        case 8:
+        {
+            struct wmt_air_root_signature_argument32 wire;
+
+            if ((status = wmt_snapshot_bytes( address, sizeof(wire), (void **)&allocation->payload ))) break;
+            memcpy( &wire, allocation->payload, sizeof(wire) );
+            wmt_snapshot_free( allocation->payload, sizeof(wire) );
+            allocation->payload = NULL;
+            if (wire.bytecode_length > WMT_AIR_GRAPH_MAX - graph_size)
+            {
+                status = STATUS_BUFFER_OVERFLOW;
+                break;
+            }
+            graph_size += wire.bytecode_length;
+            if (wire.bytecode_length &&
+                (status = wmt_snapshot_bytes( wire.bytecode, wire.bytecode_length,
+                                              &allocation->payload )))
+                break;
+            allocation->payload_size = wire.bytecode_length;
+            allocation->value.root_signature.bytecode = allocation->payload;
+            allocation->value.root_signature.bytecode_length = wire.bytecode_length;
+            break;
+        }
+        default:
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (status)
+        {
+            wmt_snapshot_free( allocation->payload, allocation->payload_size );
+            wmt_snapshot_free( allocation, sizeof(*allocation) );
+            break;
+        }
+        *tail = allocation;
+        tail = &allocation->next;
+    }
+
+    if (!status)
+    {
+        struct wmt_air_argument *previous = sentinel;
+
+        for (allocation = *ret; allocation; allocation = allocation->next)
+        {
+            previous->next = &allocation->value.base;
+            previous = &allocation->value.base;
+        }
+    }
+    wmt_snapshot_free( visited, WMT_AIR_ARGUMENT_MAX * 2u * sizeof(*visited) );
+    if (status)
+    {
+        free_air_arguments( *ret );
+        *ret = NULL;
+    }
+    return status;
+}
+
+NTSTATUS wmt_call_74( void *args )
+{
+    struct wmt_air_initialize32 wire;
+    struct wmt_air_initialize native;
+    struct wmt_air_reflection reflection;
+    void *bytecode = NULL;
+    uint64_t shader = 0, error = 0, zero = 0;
+    int32_t ret = -1;
+    NTSTATUS status;
+
+    memcpy( &wire, args, sizeof(wire) );
+    memcpy( (char *)args + offsetof(struct wmt_air_initialize32, ret), &ret, sizeof(ret) );
+    if (wire.shader && (status = zero_guest_range( wire.shader, sizeof(zero), sizeof(zero) ))) return status;
+    if (wire.error && (status = zero_guest_range( wire.error, sizeof(zero), sizeof(zero) ))) return status;
+    if (wire.reflection && (status = zero_guest_range( wire.reflection, sizeof(reflection), sizeof(reflection) )))
+        return status;
+    if (!wire.bytecode || !wire.bytecode_size || wire.bytecode_size > WMT_DISPATCH_BLOB_MAX ||
+        !wire.shader || !wire.reflection || !wire.error)
+        return STATUS_INVALID_PARAMETER;
+    if ((status = wmt_snapshot_bytes( wire.bytecode, wire.bytecode_size, &bytecode ))) return status;
+    memset( &reflection, 0, sizeof(reflection) );
+    native.bytecode = bytecode;
+    native.bytecode_size = wire.bytecode_size;
+    native.shader = &shader;
+    native.reflection = &reflection;
+    native.error = &error;
+    native.ret = -1;
+    status = wmt_normal_call( 74, &native );
+    wmt_snapshot_free( bytecode, wire.bytecode_size );
+    if (status)
+    {
+        release_air_handle( 75, shader );
+        release_air_handle( 80, error );
+        return status;
+    }
+    if (!native.ret)
+    {
+        if (!shader || error)
+        {
+            release_air_handle( 75, shader );
+            release_air_handle( 80, error );
+            return STATUS_INVALID_PARAMETER;
+        }
+        if ((status = register_air_shader( shader, &reflection )))
+        {
+            release_air_handle( 75, shader );
+            return status;
+        }
+        if ((status = copy_to_wire( (struct wmt_wire_ptr){wire.reflection, 0},
+                                     &reflection, sizeof(reflection) )) ||
+            (status = copy_to_wire( (struct wmt_wire_ptr){wire.shader, 0},
+                                     &shader, sizeof(shader) )))
+        {
+            destroy_registered_air_shader( shader );
+            zero_guest_range( wire.shader, sizeof(zero), sizeof(zero) );
+            zero_guest_range( wire.reflection, sizeof(reflection), sizeof(reflection) );
+            return status;
+        }
+    }
+    else
+    {
+        release_air_handle( 75, shader );
+        if (!error) return STATUS_INVALID_PARAMETER;
+        if ((status = register_air_error( error )))
+        {
+            release_air_handle( 80, error );
+            return status;
+        }
+        if ((status = copy_to_wire( (struct wmt_wire_ptr){wire.error, 0},
+                                     &error, sizeof(error) )))
+        {
+            if (error) destroy_registered_air_error( error );
+            return status;
+        }
+    }
+    ret = native.ret;
+    memcpy( (char *)args + offsetof(struct wmt_air_initialize32, ret), &ret, sizeof(ret) );
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS wmt_call_75( void *args )
+{
+    uint64_t shader;
+
+    memcpy( &shader, args, sizeof(shader) );
+    return destroy_registered_air_shader( shader );
+}
+
+static NTSTATUS call_air_compile( unsigned int index, void *args, BOOL pipeline )
+{
+    struct wmt_air_pipeline_compile32 pipeline_wire;
+    struct wmt_air_compile32 compile_wire;
+    struct wmt_air_pipeline_compile pipeline_native;
+    struct wmt_air_compile compile_native;
+    struct wmt_air_argument_allocation *allocations = NULL;
+    struct wmt_air_argument sentinel;
+    char *function_name = NULL;
+    uint32_t argument_guest, function_guest, bitcode_guest, error_guest;
+    uint64_t bitcode = 0, error = 0, zero = 0;
+    int32_t ret = -1;
+    struct wmt_air_shader_record *first_record = NULL, *second_record = NULL;
+    BOOL bitcode_registered = FALSE, error_registered = FALSE;
+    NTSTATUS status;
+
+    if (pipeline)
+    {
+        memcpy( &pipeline_wire, args, sizeof(pipeline_wire) );
+        argument_guest = pipeline_wire.arguments;
+        function_guest = pipeline_wire.function_name;
+        bitcode_guest = pipeline_wire.bitcode;
+        error_guest = pipeline_wire.error;
+        memcpy( (char *)args + offsetof(struct wmt_air_pipeline_compile32, ret), &ret, sizeof(ret) );
+    }
+    else
+    {
+        memcpy( &compile_wire, args, sizeof(compile_wire) );
+        argument_guest = compile_wire.arguments;
+        function_guest = compile_wire.function_name;
+        bitcode_guest = compile_wire.bitcode;
+        error_guest = compile_wire.error;
+        memcpy( (char *)args + offsetof(struct wmt_air_compile32, ret), &ret, sizeof(ret) );
+    }
+    if (!bitcode_guest || !error_guest || !function_guest) return STATUS_INVALID_PARAMETER;
+    if ((status = zero_guest_range( bitcode_guest, sizeof(zero), sizeof(zero) )) ||
+        (status = zero_guest_range( error_guest, sizeof(zero), sizeof(zero) )) ||
+        (status = copy_air_arguments( argument_guest, &sentinel, &allocations )) ||
+        (status = wmt_snapshot_cstring( function_guest, WMT_STRING_MAX + 1u, &function_name )))
+        goto done;
+
+    if (pipeline)
+    {
+        if ((status = retain_air_shaders( pipeline_wire.first_shader,
+                                          pipeline_wire.second_shader,
+                                          &first_record, &second_record )))
+            goto done;
+        pipeline_native.first_shader = pipeline_wire.first_shader;
+        pipeline_native.second_shader = pipeline_wire.second_shader;
+        pipeline_native.arguments = &sentinel;
+        pipeline_native.function_name = function_name;
+        pipeline_native.bitcode = &bitcode;
+        pipeline_native.error = &error;
+        pipeline_native.ret = -1;
+        status = wmt_normal_call( index, &pipeline_native );
+        ret = pipeline_native.ret;
+    }
+    else
+    {
+        if ((status = retain_air_shaders( compile_wire.shader, 0,
+                                          &first_record, &second_record )))
+            goto done;
+        compile_native.shader = compile_wire.shader;
+        compile_native.arguments = &sentinel;
+        compile_native.function_name = function_name;
+        compile_native.bitcode = &bitcode;
+        compile_native.error = &error;
+        compile_native.ret = -1;
+        status = wmt_normal_call( index, &compile_native );
+        ret = compile_native.ret;
+    }
+    release_air_shaders( first_record, second_record );
+    first_record = second_record = NULL;
+    if (status) goto cleanup_outputs;
+    if (!ret)
+    {
+        if (!bitcode || error)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            goto cleanup_outputs;
+        }
+        if ((status = register_air_bitcode( bitcode ))) goto cleanup_outputs;
+        bitcode_registered = TRUE;
+        status = copy_to_wire( (struct wmt_wire_ptr){bitcode_guest, 0}, &bitcode, sizeof(bitcode) );
+        if (status) goto cleanup_outputs;
+    }
+    else
+    {
+        release_air_handle( 78, bitcode );
+        bitcode = 0;
+        if (!error)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            goto cleanup_outputs;
+        }
+        if ((status = register_air_error( error ))) goto cleanup_outputs;
+        error_registered = TRUE;
+        status = copy_to_wire( (struct wmt_wire_ptr){error_guest, 0}, &error, sizeof(error) );
+        if (status) goto cleanup_outputs;
+    }
+    if (pipeline)
+        memcpy( (char *)args + offsetof(struct wmt_air_pipeline_compile32, ret), &ret, sizeof(ret) );
+    else
+        memcpy( (char *)args + offsetof(struct wmt_air_compile32, ret), &ret, sizeof(ret) );
+    status = STATUS_SUCCESS;
+    goto done;
+
+cleanup_outputs:
+    if (first_record) release_air_shaders( first_record, second_record );
+    if (bitcode_registered) destroy_registered_air_bitcode( bitcode );
+    else release_air_handle( 78, bitcode );
+    if (error_registered) destroy_registered_air_error( error );
+    else release_air_handle( 80, error );
+    zero_guest_range( bitcode_guest, sizeof(zero), sizeof(zero) );
+    zero_guest_range( error_guest, sizeof(zero), sizeof(zero) );
+done:
+    wmt_snapshot_free( function_name, WMT_STRING_MAX + 1u );
+    free_air_arguments( allocations );
+    return status;
+}
+
+NTSTATUS wmt_call_76( void *args ) { return call_air_compile( 76, args, FALSE ); }
+NTSTATUS wmt_call_81( void *args ) { return call_air_compile( 81, args, TRUE ); }
+NTSTATUS wmt_call_82( void *args ) { return call_air_compile( 82, args, TRUE ); }
+NTSTATUS wmt_call_84( void *args ) { return call_air_compile( 84, args, TRUE ); }
+NTSTATUS wmt_call_85( void *args ) { return call_air_compile( 85, args, TRUE ); }
+
+NTSTATUS wmt_call_77( void *args )
+{
+    struct wmt_air_get_bitcode32 wire;
+    struct wmt_air_get_bitcode native;
+    struct wmt_air_compiled_bitcode data, output;
+    struct wmt_air_bitcode_record *record;
+    void *snapshot = NULL;
+    uint64_t dispatch_data = 0;
+    NTSTATUS status;
+
+    memcpy( &wire, args, sizeof(wire) );
+    memset( &output, 0, sizeof(output) );
+    if (!wire.bitcode || !wire.data_out) return STATUS_INVALID_PARAMETER;
+    if ((status = copy_to_wire( (struct wmt_wire_ptr){wire.data_out, 0}, &output, sizeof(output) )))
+        return status;
+
+    pthread_mutex_lock( &air_bitcode_mutex );
+    for (record = air_bitcodes; record && record->bitcode != wire.bitcode; record = record->next);
+    if (!record || record->destroying)
+    {
+        pthread_mutex_unlock( &air_bitcode_mutex );
+        return STATUS_INVALID_HANDLE;
+    }
+    if (record->dispatch_data)
+    {
+        output.data = record->token;
+        output.size = record->size;
+        status = copy_to_wire( (struct wmt_wire_ptr){wire.data_out, 0}, &output, sizeof(output) );
+        pthread_mutex_unlock( &air_bitcode_mutex );
+        return status;
+    }
+    memset( &data, 0, sizeof(data) );
+    native.bitcode = wire.bitcode;
+    native.data_out = &data;
+    if ((status = wmt_normal_call( 77, &native ))) goto done;
+    if (!data.data || !data.size || data.size > WMT_DISPATCH_BLOB_MAX || data.size > SIZE_MAX)
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if ((status = wmt_snapshot_alloc( data.size, &snapshot ))) goto done;
+    if ((status = snapshot_native_bytes( snapshot, (const void *)(uintptr_t)data.data,
+                                         data.size )))
+        goto done;
+    status = wmt_dispatch_data_from_snapshot( snapshot, data.size, wmt_snapshot_free,
+                                              &dispatch_data );
+    snapshot = NULL; /* The dispatch helper consumes the snapshot on every path. */
+    if (status) goto done;
+    if (air_next_token > WMT_AIR_TOKEN_MAX)
+    {
+        release_native_object( dispatch_data );
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+    record->token = WMT_AIR_TOKEN_PREFIX | air_next_token++;
+    record->dispatch_data = dispatch_data;
+    record->size = data.size;
+    output.data = record->token;
+    output.size = record->size;
+    status = copy_to_wire( (struct wmt_wire_ptr){wire.data_out, 0}, &output, sizeof(output) );
+done:
+    wmt_snapshot_free( snapshot, data.size );
+    pthread_mutex_unlock( &air_bitcode_mutex );
+    return status;
+}
+
+NTSTATUS wmt_call_78( void *args )
+{
+    uint64_t bitcode;
+
+    memcpy( &bitcode, args, sizeof(bitcode) );
+    return destroy_registered_air_bitcode( bitcode );
+}
+
+NTSTATUS wmt_call_79( void *args )
+{
+    struct wmt_air_get_error32 wire;
+    struct wmt_air_get_error native;
+    char *buffer = NULL;
+    struct wmt_air_error_record *record;
+    uint32_t ret_size = 0;
+    NTSTATUS status;
+
+    memcpy( &wire, args, sizeof(wire) );
+    memcpy( (char *)args + offsetof(struct wmt_air_get_error32, ret_size),
+            &ret_size, sizeof(ret_size) );
+    if (!wire.buffer_size) return STATUS_SUCCESS;
+    if (!wire.buffer || wire.buffer_size > WMT_STRING_MAX) return STATUS_INVALID_PARAMETER;
+    if ((status = wmt_snapshot_alloc( wire.buffer_size, (void **)&buffer ))) return status;
+    memset( buffer, 0, wire.buffer_size );
+    pthread_mutex_lock( &air_error_mutex );
+    for (record = air_errors; record && record->error != wire.error; record = record->next);
+    if (!record || record->destroying)
+    {
+        status = STATUS_INVALID_HANDLE;
+        goto done;
+    }
+    native.error = wire.error;
+    native.buffer = buffer;
+    native.buffer_size = wire.buffer_size;
+    native.ret_size = 0;
+    status = wmt_normal_call( 79, &native );
+    if (!status)
+    {
+        if (native.ret_size >= wire.buffer_size || native.ret_size > UINT32_MAX)
+            status = STATUS_INVALID_PARAMETER;
+        else
+        {
+            status = copy_to_wire( (struct wmt_wire_ptr){wire.buffer, 0},
+                                   buffer, native.ret_size + 1u );
+            if (!status)
+            {
+                ret_size = native.ret_size;
+                memcpy( (char *)args + offsetof(struct wmt_air_get_error32, ret_size),
+                        &ret_size, sizeof(ret_size) );
+            }
+        }
+    }
+done:
+    pthread_mutex_unlock( &air_error_mutex );
+    wmt_snapshot_free( buffer, wire.buffer_size );
+    return status;
+}
+
+NTSTATUS wmt_call_80( void *args )
+{
+    uint64_t error;
+
+    memcpy( &error, args, sizeof(error) );
+    if (!error) return STATUS_SUCCESS;
+    return destroy_registered_air_error( error );
+}
+
+NTSTATUS wmt_call_88( void *args )
+{
+    struct wmt_air_get_arguments32 wire;
+    struct wmt_air_get_arguments native;
+    struct wmt_air_shader_record *record;
+    struct wmt_air_shader_argument *constant_buffers = NULL, *arguments = NULL;
+    uint64_t constant_size = 0, argument_size = 0;
+    BOOL retained = FALSE;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    memcpy( &wire, args, sizeof(wire) );
+    pthread_mutex_lock( &air_shader_mutex );
+    for (record = air_shaders; record && record->shader != wire.shader; record = record->next);
+    if (!record || record->destroying)
+    {
+        status = STATUS_INVALID_HANDLE;
+        goto done;
+    }
+    ++record->references;
+    retained = TRUE;
+    constant_size = (uint64_t)record->constant_buffers * sizeof(*constant_buffers);
+    argument_size = (uint64_t)record->arguments * sizeof(*arguments);
+    pthread_mutex_unlock( &air_shader_mutex );
+    if (constant_size > WMT_DISPATCH_BLOB_MAX || argument_size > WMT_DISPATCH_BLOB_MAX ||
+        (constant_size && (!wire.constant_buffers ||
+                           !valid_guest_range( wire.constant_buffers, constant_size ))) ||
+        (argument_size && (!wire.arguments ||
+                           !valid_guest_range( wire.arguments, argument_size ))))
+    {
+        status = STATUS_INVALID_PARAMETER;
+        goto done;
+    }
+    if ((constant_size && (status = wmt_snapshot_alloc( constant_size, (void **)&constant_buffers ))) ||
+        (argument_size && (status = wmt_snapshot_alloc( argument_size, (void **)&arguments ))))
+        goto done;
+    if (constant_size) memset( constant_buffers, 0, constant_size );
+    if (argument_size) memset( arguments, 0, argument_size );
+    if ((status = publish_air_argument_outputs( wire.constant_buffers, constant_buffers, constant_size,
+                                                wire.arguments, arguments, argument_size )))
+        goto done;
+    native.shader = wire.shader;
+    native.constant_buffers = constant_buffers;
+    native.arguments = arguments;
+    if (!(status = wmt_normal_call( 88, &native )))
+        status = publish_air_argument_outputs( wire.constant_buffers, constant_buffers, constant_size,
+                                               wire.arguments, arguments, argument_size );
+done:
+    if (retained) release_air_shaders( record, NULL );
+    else pthread_mutex_unlock( &air_shader_mutex );
+    wmt_snapshot_free( constant_buffers, constant_size );
+    wmt_snapshot_free( arguments, argument_size );
     return status;
 }
 

@@ -16,6 +16,7 @@
 #include "config.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
 #ifdef __APPLE__
@@ -23,6 +24,7 @@
 # include <mach/mach_vm.h>
 #endif
 
+#include "buffer.h"
 #include "winemetal_private.h"
 
 struct wmt_backend_tables
@@ -31,9 +33,21 @@ struct wmt_backend_tables
     unixlib_entry_t legacy[WMT_UNIX_CALL_COUNT];
 };
 
-static struct wine_wow64_unixlib_binding_v4 backend_binding;
+struct wmt_backend_image_info
+{
+    const char *path;
+    const void *base;
+};
+
+static struct wine_wow64_unixlib_binding_v6 backend_binding;
 static const struct wmt_backend_tables *backend_tables;
+static void *backend_image_ref;
 static _Atomic unsigned int backend_state;
+#ifndef WMT_NATIVE_TEST
+static pthread_mutex_t resident_backend_image_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void *resident_backend_image_ref;
+static const void *resident_backend_image_base;
+#endif
 
 #if defined(__APPLE__) && defined(__aarch64__)
 static BOOL backend_range_has_protection( const void *ptr, SIZE_T size, vm_prot_t required,
@@ -65,10 +79,11 @@ static BOOL backend_range_has_protection( const void *ptr, SIZE_T size, vm_prot_
     return TRUE;
 }
 
-static BOOL backend_entries_are_valid( const struct wmt_backend_tables *tables )
+static BOOL backend_entries_are_valid( const struct wmt_backend_tables *tables,
+                                       struct wmt_backend_image_info *ret_info )
 {
     const void *image = NULL;
-    Dl_info info;
+    Dl_info info, image_info;
     unsigned int i, table;
 
     for (i = 0; i < WMT_UNIX_CALL_COUNT; ++i)
@@ -84,8 +99,14 @@ static BOOL backend_entries_are_valid( const struct wmt_backend_tables *tables )
                 !dladdr( (const void *)entry, &info ))
                 return FALSE;
             if (image && image != info.dli_fbase) return FALSE;
+            if (!image) image_info = info;
             image = info.dli_fbase;
         }
+    }
+    if (image && ret_info)
+    {
+        ret_info->path = image_info.dli_fname;
+        ret_info->base = image_info.dli_fbase;
     }
     return image != NULL;
 }
@@ -100,15 +121,18 @@ static BOOL backend_range_has_protection( const void *ptr, SIZE_T size,
     return FALSE;
 }
 
-static BOOL backend_entries_are_valid( const struct wmt_backend_tables *tables )
+static BOOL backend_entries_are_valid( const struct wmt_backend_tables *tables,
+                                       struct wmt_backend_image_info *ret_info )
 {
     (void)tables;
+    (void)ret_info;
     return FALSE;
 }
 #endif
 
-static BOOL copy_backend_tables( const struct wine_wow64_unixlib_binding_v4 *binding,
-                                 struct wmt_backend_tables *tables )
+static BOOL copy_backend_tables( const struct wine_wow64_unixlib_binding_v6 *binding,
+                                 struct wmt_backend_tables *tables,
+                                 struct wmt_backend_image_info *ret_info )
 {
     struct wmt_backend_tables verification;
 
@@ -126,15 +150,72 @@ static BOOL copy_backend_tables( const struct wine_wow64_unixlib_binding_v4 *bin
     memcpy( verification.normal, binding->normal_funcs, sizeof(verification.normal) );
     memcpy( verification.legacy, binding->legacy_wow64_funcs, sizeof(verification.legacy) );
     return !memcmp( tables, &verification, sizeof(*tables) ) &&
-           backend_entries_are_valid( tables );
+           backend_entries_are_valid( tables, ret_info );
 }
 
-static BOOL binding_is_valid( const struct wine_wow64_unixlib_binding_v4 *binding )
+static void *pin_backend_image( const struct wmt_backend_image_info *info )
+{
+#if defined(__APPLE__) && defined(__aarch64__) && defined(RTLD_NOLOAD)
+    if (!info || !info->path || !info->base) return NULL;
+    return dlopen( info->path, RTLD_NOW | RTLD_NOLOAD );
+#else
+    (void)info;
+    return NULL;
+#endif
+}
+
+static NTSTATUS retain_backend_image_for_escaped_objects(
+    const struct wmt_backend_image_info *info )
+{
+#ifdef WMT_NATIVE_TEST
+    extern NTSTATUS wmt_test_retain_backend_image( const void *base );
+
+    return wmt_test_retain_backend_image( info ? info->base : NULL );
+#else
+    Dl_info verification;
+    void *candidate;
+    const void *identity;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!info || !info->base) return STATUS_INVALID_IMAGE_FORMAT;
+    pthread_mutex_lock( &resident_backend_image_mutex );
+    if (resident_backend_image_ref)
+    {
+        status = resident_backend_image_base == info->base ? STATUS_SUCCESS :
+                                                            STATUS_INVALID_IMAGE_FORMAT;
+        pthread_mutex_unlock( &resident_backend_image_mutex );
+        return status;
+    }
+    pthread_mutex_unlock( &resident_backend_image_mutex );
+    if (!(candidate = pin_backend_image( info ))) return STATUS_INVALID_IMAGE_FORMAT;
+    identity = dlsym( candidate, "__wine_unix_call_funcs" );
+    if (!identity || !dladdr( identity, &verification ) ||
+        verification.dli_fbase != info->base)
+    {
+        dlclose( candidate );
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+    pthread_mutex_lock( &resident_backend_image_mutex );
+    if (!resident_backend_image_ref)
+    {
+        resident_backend_image_ref = candidate;
+        resident_backend_image_base = info->base;
+        candidate = NULL;
+    }
+    else if (resident_backend_image_base != info->base)
+        status = STATUS_INVALID_IMAGE_FORMAT;
+    pthread_mutex_unlock( &resident_backend_image_mutex );
+    if (candidate) dlclose( candidate );
+    return status;
+#endif
+}
+
+static BOOL binding_is_valid( const struct wine_wow64_unixlib_binding_v6 *binding )
 {
     const struct wine_wow64_unixlib_codec_v2 *codec;
     const struct wine_unixlib_owned_backing_codec_v2 *owned_backing_codec;
 
-    if (!binding || binding->version != WINE_WOW64_UNIXLIB_BINDING_V4_VERSION ||
+    if (!binding || binding->version != WINE_WOW64_UNIXLIB_BINDING_V6_VERSION ||
         binding->size != sizeof(*binding) || binding->entry_count != WMT_UNIX_CALL_COUNT ||
         binding->reserved || !binding->normal_funcs || !binding->legacy_wow64_funcs ||
         !(codec = binding->codec) || !(owned_backing_codec = binding->owned_backing_codec))
@@ -152,8 +233,8 @@ static BOOL binding_is_valid( const struct wine_wow64_unixlib_binding_v4 *bindin
     return TRUE;
 }
 
-static BOOL binding_codecs_are_equal( const struct wine_wow64_unixlib_binding_v4 *left,
-                                      const struct wine_wow64_unixlib_binding_v4 *right )
+static BOOL binding_codecs_are_equal( const struct wine_wow64_unixlib_binding_v6 *left,
+                                      const struct wine_wow64_unixlib_binding_v6 *right )
 {
     return left->version == right->version && left->size == right->size &&
            left->entry_count == right->entry_count && left->reserved == right->reserved &&
@@ -161,10 +242,12 @@ static BOOL binding_codecs_are_equal( const struct wine_wow64_unixlib_binding_v4
            left->owned_backing_codec == right->owned_backing_codec;
 }
 
-static NTSTATUS bind_backend( const struct wine_wow64_unixlib_binding_v4 *binding )
+static NTSTATUS bind_backend( const struct wine_wow64_unixlib_binding_v6 *binding )
 {
-    struct wine_wow64_unixlib_binding_v4 source;
+    struct wine_wow64_unixlib_binding_v6 source;
     struct wmt_backend_tables *tables, candidate;
+    struct wmt_backend_image_info backend_info;
+    void *image_ref;
     unsigned int expected = 0, state;
 
     if (!binding) return STATUS_INVALID_PARAMETER;
@@ -179,7 +262,8 @@ static NTSTATUS bind_backend( const struct wine_wow64_unixlib_binding_v4 *bindin
             atomic_store_explicit( &backend_state, 0, memory_order_release );
             return STATUS_NO_MEMORY;
         }
-        if (!copy_backend_tables( &source, tables ))
+        if (!copy_backend_tables( &source, tables, &backend_info ) ||
+            !(image_ref = pin_backend_image( &backend_info )))
         {
             munmap( tables, sizeof(*tables) );
             atomic_store_explicit( &backend_state, 0, memory_order_release );
@@ -194,19 +278,41 @@ static NTSTATUS bind_backend( const struct wine_wow64_unixlib_binding_v4 *bindin
 #endif
         {
             munmap( tables, sizeof(*tables) );
+            dlclose( image_ref );
             atomic_store_explicit( &backend_state, 0, memory_order_release );
             return STATUS_UNSUCCESSFUL;
+        }
+        if (wmt_pin_companion_image_resident())
+        {
+            munmap( tables, sizeof(*tables) );
+            dlclose( image_ref );
+            atomic_store_explicit( &backend_state, 0, memory_order_release );
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        /* The pinned ABI exports ObjC cache objects (slots 115/117) whose
+         * implementations can outlive logical Unixlib unload.  Keep one
+         * independently validated backend image reference for process lifetime;
+         * the ordinary snapshot ref is still released by unbind after active
+         * calls and AIR records drain. */
+        if (retain_backend_image_for_escaped_objects( &backend_info ))
+        {
+            munmap( tables, sizeof(*tables) );
+            dlclose( image_ref );
+            atomic_store_explicit( &backend_state, 0, memory_order_release );
+            return STATUS_INVALID_IMAGE_FORMAT;
         }
         backend_binding = source;
         backend_binding.normal_funcs = tables->normal;
         backend_binding.legacy_wow64_funcs = tables->legacy;
         backend_tables = tables;
+        backend_image_ref = image_ref;
+        wmt_resume_shared_event_listeners();
         atomic_store_explicit( &backend_state, 2, memory_order_release );
         return STATUS_SUCCESS;
     }
     state = atomic_load_explicit( &backend_state, memory_order_acquire );
     if (state == 2 && binding_codecs_are_equal( &backend_binding, &source ) &&
-        copy_backend_tables( &source, &candidate ) &&
+        copy_backend_tables( &source, &candidate, NULL ) &&
         !memcmp( backend_tables, &candidate, sizeof(candidate) ))
         return STATUS_SUCCESS;
     return STATUS_INVALID_DEVICE_STATE;
@@ -215,17 +321,41 @@ static NTSTATUS bind_backend( const struct wine_wow64_unixlib_binding_v4 *bindin
 static NTSTATUS release_backend_snapshot(void)
 {
     const struct wmt_backend_tables *tables;
-    int ret;
+    void *image_ref;
+    NTSTATUS status;
+    int close_ret, unmap_ret;
 
     if (atomic_load_explicit( &backend_state, memory_order_acquire ) != 2)
         return STATUS_INVALID_DEVICE_STATE;
+    /* The loader drains active calls before release.  Destroy companion-owned
+     * AIR records while the immutable normal table is still callable. */
+    if ((status = wmt_drain_air_registries()))
+    {
+        atomic_store_explicit( &backend_state, 3, memory_order_release );
+        return status;
+    }
     atomic_store_explicit( &backend_state, 1, memory_order_release );
     tables = backend_tables;
+    image_ref = backend_image_ref;
     backend_tables = NULL;
+    backend_image_ref = NULL;
     memset( &backend_binding, 0, sizeof(backend_binding) );
-    ret = munmap( (void *)tables, sizeof(*tables) );
-    atomic_store_explicit( &backend_state, 0, memory_order_release );
-    return ret ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
+    unmap_ret = munmap( (void *)tables, sizeof(*tables) );
+    /* The normal/legacy target image must outlive AIR destruction and every
+     * read through the immutable table.  Drop its independent retain last. */
+    close_ret = dlclose( image_ref );
+    atomic_store_explicit( &backend_state, unmap_ret || close_ret ? 3 : 0,
+                           memory_order_release );
+    return unmap_ret || close_ret ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
+}
+
+static NTSTATUS unbind_backend(void)
+{
+    unsigned int state = atomic_load_explicit( &backend_state, memory_order_acquire );
+
+    if (!state) return STATUS_SUCCESS;
+    if (state != 2) return STATUS_INVALID_DEVICE_STATE;
+    return release_backend_snapshot();
 }
 
 /* The loader drains registered calls before releasing the companion image. */
@@ -248,6 +378,93 @@ const struct wine_unixlib_owned_backing_codec_v2 *wmt_get_owned_backing_codec(vo
     return backend_binding.owned_backing_codec;
 }
 
+wmt_status_t wmt_guarded_call( wmt_guarded_call_func func, void *context )
+{
+    wmt_status_t status = STATUS_ACCESS_VIOLATION;
+
+    if (!func) return STATUS_INVALID_PARAMETER;
+    __TRY
+    {
+        status = func( context );
+    }
+    __EXCEPT
+    {
+    }
+    __ENDTRY
+    return status;
+}
+
+static NTSTATUS invoke_backend_entry( unsigned int index, unixlib_entry_t entry, void *args )
+{
+    NTSTATUS status = STATUS_ACCESS_VIOLATION;
+
+    /* The pinned MAY_CALLBACK entries do not synchronously re-enter Unixlib:
+     * slot 18's deallocator calls the ntdll backing codec directly, while
+     * slot 104 signals from the listener thread after this call returns. */
+    __TRY
+    {
+        status = entry( args );
+    }
+    __EXCEPT
+    {
+    }
+    __ENDTRY
+    return status;
+}
+
+struct wmt_shared_event_notify_params
+{
+    UINT64 shared_event;
+    UINT64 event_handle;
+    UINT64 listener_token;
+    UINT64 value;
+};
+
+struct wmt_shared_event_listener_params
+{
+    UINT64 token;
+};
+
+static NTSTATUS wmt_call_104( void *args )
+{
+    struct wmt_shared_event_notify_params params;
+
+    memcpy( &params, args, sizeof(params) );
+    return wmt_shared_event_notify_win32( params.shared_event, params.event_handle,
+                                          params.listener_token, params.value );
+}
+
+static NTSTATUS wmt_call_108( void *args )
+{
+    struct wmt_shared_event_listener_params *params = args;
+    uint64_t token = 0;
+    NTSTATUS status;
+
+    params->token = 0;
+    status = wmt_shared_event_listener_create( &token );
+    if (!status) params->token = token;
+    return status;
+}
+
+static NTSTATUS wmt_call_109( void *args )
+{
+    struct wmt_shared_event_listener_params params;
+
+    memcpy( &params, args, sizeof(params) );
+    return wmt_shared_event_listener_start( params.token );
+}
+
+static NTSTATUS wmt_call_110( void *args )
+{
+    struct wmt_shared_event_listener_params params;
+
+    memcpy( &params, args, sizeof(params) );
+    return wmt_shared_event_listener_destroy( params.token );
+}
+
+C_ASSERT( sizeof(struct wmt_shared_event_notify_params) == 32 );
+C_ASSERT( sizeof(struct wmt_shared_event_listener_params) == 8 );
+
 NTSTATUS wmt_forward_call( unsigned int index, void *args )
 {
     unixlib_entry_t entry;
@@ -256,7 +473,7 @@ NTSTATUS wmt_forward_call( unsigned int index, void *args )
         atomic_load_explicit( &backend_state, memory_order_acquire ) != 2)
         return STATUS_INVALID_DEVICE_STATE;
     if (!(entry = backend_tables->legacy[index])) return STATUS_NOT_SUPPORTED;
-    return entry( args );
+    return invoke_backend_entry( index, entry, args );
 }
 
 NTSTATUS wmt_normal_call( unsigned int index, void *args )
@@ -267,7 +484,7 @@ NTSTATUS wmt_normal_call( unsigned int index, void *args )
         atomic_load_explicit( &backend_state, memory_order_acquire ) != 2)
         return STATUS_INVALID_DEVICE_STATE;
     if (!(entry = backend_tables->normal[index])) return STATUS_NOT_SUPPORTED;
-    return entry( args );
+    return invoke_backend_entry( index, entry, args );
 }
 
 #define DEFINE_FORWARD(index) \
@@ -286,11 +503,11 @@ DEFINE_FORWARD(51)  DEFINE_FORWARD(52)  DEFINE_FORWARD(53)  DEFINE_FORWARD(55)
 DEFINE_FORWARD(59)  DEFINE_FORWARD(62)  DEFINE_FORWARD(63)  DEFINE_FORWARD(64)
 DEFINE_FORWARD(65)  DEFINE_FORWARD(66)  DEFINE_FORWARD(67)  DEFINE_FORWARD(68)
 DEFINE_FORWARD(69)  DEFINE_FORWARD(72)  DEFINE_FORWARD(73)
-DEFINE_FORWARD(75)  DEFINE_FORWARD(78)  DEFINE_FORWARD(80)  DEFINE_FORWARD(86)
+DEFINE_FORWARD(86)
 DEFINE_FORWARD(87)  DEFINE_FORWARD(89)  DEFINE_FORWARD(90)  DEFINE_FORWARD(92)
 DEFINE_FORWARD(93)  DEFINE_FORWARD(94)  DEFINE_FORWARD(95)  DEFINE_FORWARD(102)
-DEFINE_FORWARD(103) DEFINE_FORWARD(104) DEFINE_FORWARD(105) DEFINE_FORWARD(106)
-DEFINE_FORWARD(108) DEFINE_FORWARD(109) DEFINE_FORWARD(110) DEFINE_FORWARD(111)
+DEFINE_FORWARD(103) DEFINE_FORWARD(105) DEFINE_FORWARD(106)
+DEFINE_FORWARD(111)
 DEFINE_FORWARD(121) DEFINE_FORWARD(122) DEFINE_FORWARD(123) DEFINE_FORWARD(124)
 DEFINE_FORWARD(125) DEFINE_FORWARD(126) DEFINE_FORWARD(127) DEFINE_FORWARD(130)
 DEFINE_FORWARD(132) DEFINE_FORWARD(135) DEFINE_FORWARD(136) DEFINE_FORWARD(137)
@@ -317,7 +534,7 @@ static const unixlib_entry_t wmt_implementation_funcs[WMT_UNIX_CALL_COUNT] =
     [34] = wmt_call_34, [35] = wmt_unsupported_pipeline,
     [36] = wmt_call_36, [37] = wmt_unsupported_no_output, [38] = wmt_call_38,
     [39] = forward_39, [40] = forward_40, [41] = forward_41, [42] = forward_42,
-    [43] = forward_43, [44] = forward_44, [45] = wmt_unsupported_no_output,
+    [43] = forward_43, [44] = forward_44, [45] = wmt_call_45,
     [46] = forward_46, [47] = forward_47, [48] = forward_48, [49] = forward_49,
     [50] = forward_50, [51] = forward_51, [52] = forward_52, [53] = forward_53,
     [54] = wmt_unsupported_capture, [55] = forward_55,
@@ -327,25 +544,22 @@ static const unixlib_entry_t wmt_implementation_funcs[WMT_UNIX_CALL_COUNT] =
     [62] = forward_62, [63] = forward_63, [64] = forward_64, [65] = forward_65,
     [66] = forward_66, [67] = forward_67, [68] = forward_68, [69] = forward_69,
     [70] = wmt_call_70, [71] = wmt_call_71, [72] = forward_72, [73] = forward_73,
-    /* AIR pointer schemas are unsafe in the high shadow; opaque destroy/free calls remain safe. */
-    [74] = wmt_unsupported_air_initialize, [75] = forward_75,
-    [76] = wmt_unsupported_air_compile, [77] = wmt_unsupported_air_get_bitcode,
-    [78] = forward_78, [79] = wmt_unsupported_air_get_error, [80] = forward_80,
-    [81] = wmt_unsupported_air_pipeline_compile,
-    [82] = wmt_unsupported_air_pipeline_compile, [83] = wmt_unsupported_no_output,
-    [84] = wmt_unsupported_air_pipeline_compile,
-    [85] = wmt_unsupported_air_pipeline_compile, [86] = forward_86, [87] = forward_87,
-    [88] = wmt_unsupported_air_get_arguments, [89] = forward_89, [90] = forward_90,
+    [74] = wmt_call_74, [75] = wmt_call_75,
+    [76] = wmt_call_76, [77] = wmt_call_77,
+    [78] = wmt_call_78, [79] = wmt_call_79, [80] = wmt_call_80,
+    [81] = wmt_call_81, [82] = wmt_call_82, [83] = wmt_unsupported_no_output,
+    [84] = wmt_call_84, [85] = wmt_call_85, [86] = forward_86, [87] = forward_87,
+    [88] = wmt_call_88, [89] = forward_89, [90] = forward_90,
     [91] = wmt_unsupported_enumerate,
     [92] = forward_92, [93] = forward_93, [94] = forward_94, [95] = forward_95,
     [96] = wmt_unsupported_display_description,
     [97] = wmt_call_97, [98] = wmt_call_98,
     [99] = wmt_unsupported_query_display, [100] = wmt_unsupported_no_output,
     [101] = wmt_call_101,
-    [102] = forward_102, [103] = forward_103, [104] = forward_104,
+    [102] = forward_102, [103] = forward_103, [104] = wmt_call_104,
     [105] = forward_105, [106] = forward_106,
-    [107] = wmt_unsupported_no_output,
-    [108] = forward_108, [109] = forward_109, [110] = forward_110, [111] = forward_111,
+    [107] = wmt_call_107,
+    [108] = wmt_call_108, [109] = wmt_call_109, [110] = wmt_call_110, [111] = forward_111,
     [112] = wmt_unsupported_archive, [113] = wmt_unsupported_archive_serialize,
     [114] = wmt_call_114, [115] = wmt_call_115,
     [116] = wmt_unsupported_cache_get, [117] = wmt_call_117,
@@ -384,7 +598,7 @@ static const struct wine_unixlib_dispatch_entry_v2 wow64_dispatch_metadata[] =
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_40, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
                                    WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_24, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
-    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, 0 ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, 0 ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, 0 ),
@@ -462,8 +676,7 @@ static const struct wine_unixlib_dispatch_entry_v2 wow64_dispatch_metadata[] =
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED ),
-    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
-                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_32, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, 0 ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_24, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
@@ -471,8 +684,7 @@ static const struct wine_unixlib_dispatch_entry_v2 wow64_dispatch_metadata[] =
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, 0 ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_32, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
                                    WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
-    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
-                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, 0 ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_24, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
                                    WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
@@ -497,10 +709,8 @@ static const struct wine_unixlib_dispatch_entry_v2 wow64_dispatch_metadata[] =
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_24, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_8, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
-    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
-                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
-    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
-                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_48, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
                                    WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_32, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
@@ -542,8 +752,7 @@ static const struct wine_unixlib_dispatch_entry_v2 wow64_dispatch_metadata[] =
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_16, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_32, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_24, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
-    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_32, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
-                                   WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_32, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_32, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED |
                                    WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
     WINE_UNIXLIB_DISPATCH_ARGS_V2( struct wmt_dispatch_args_24, WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
@@ -572,7 +781,7 @@ static NTSTATUS wmt_dispatch_call( unsigned int index, void *args )
         (UINT_PTR)context.guest_args > UINT32_MAX)
         return STATUS_INVALID_PARAMETER;
 
-    if (context.args_size)
+    if (context.args_size && (metadata->flags & WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT))
     {
         if ((status = ntdll_wow64_guest32_to_host( (ULONG)(UINT_PTR)context.guest_args,
                                                    &guest_args )))
@@ -581,12 +790,16 @@ static NTSTATUS wmt_dispatch_call( unsigned int index, void *args )
             return status;
     }
 
+    wmt_prepare_owned_output( index, args );
     status = wmt_implementation_funcs[index]( args );
-    if (!context.args_size) return status;
+    if (!context.args_size || !(metadata->flags & WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT))
+        return status;
+    if (status) status = wmt_rollback_owned_output( index, args, status );
     publish_status = ntdll_wow64_atomic_write_user( guest_args, args, context.args_size );
     if (!publish_status) return status;
     if (index == WMT_CALL_NEW_BUFFER) return wmt_rollback_18( args, publish_status );
-    return publish_status;
+    if (index == WMT_CALL_DISPATCH_DATA) return wmt_rollback_114( args, publish_status );
+    return wmt_rollback_owned_output( index, args, publish_status );
 }
 
 static NTSTATUS dispatch_0( void *args ) { return wmt_dispatch_call( 0, args ); }
@@ -880,27 +1093,31 @@ C_ASSERT( sizeof(struct wine_wow64_unixlib_alias_v2) == 48 );
 C_ASSERT( sizeof(struct wine_wow64_unixlib_codec_v2) == 56 );
 C_ASSERT( offsetof(struct wine_wow64_unixlib_codec_v2, translate) == 16 );
 C_ASSERT( offsetof(struct wine_wow64_unixlib_codec_v2, acquire_alias) == 40 );
-C_ASSERT( sizeof(struct wine_wow64_unixlib_binding_v4) == 48 );
-C_ASSERT( offsetof(struct wine_wow64_unixlib_binding_v4, normal_funcs) == 16 );
-C_ASSERT( offsetof(struct wine_wow64_unixlib_binding_v4, codec) == 32 );
-C_ASSERT( offsetof(struct wine_wow64_unixlib_binding_v4, owned_backing_codec) == 40 );
-C_ASSERT( sizeof(struct wine_wow64_unixlib_companion_v4) == 56 );
-C_ASSERT( offsetof(struct wine_wow64_unixlib_companion_v4, abi_sha256) == 16 );
-C_ASSERT( offsetof(struct wine_wow64_unixlib_companion_v4, bind) == 48 );
+C_ASSERT( sizeof(struct wine_wow64_unixlib_binding_v6) == 48 );
+C_ASSERT( offsetof(struct wine_wow64_unixlib_binding_v6, normal_funcs) == 16 );
+C_ASSERT( offsetof(struct wine_wow64_unixlib_binding_v6, codec) == 32 );
+C_ASSERT( offsetof(struct wine_wow64_unixlib_binding_v6, owned_backing_codec) == 40 );
+C_ASSERT( sizeof(struct wine_wow64_unixlib_companion_v6) == 72 );
+C_ASSERT( offsetof(struct wine_wow64_unixlib_companion_v6, abi_sha256) == 16 );
+C_ASSERT( offsetof(struct wine_wow64_unixlib_companion_v6, bind) == 48 );
+C_ASSERT( offsetof(struct wine_wow64_unixlib_companion_v6, quiesce) == 56 );
+C_ASSERT( offsetof(struct wine_wow64_unixlib_companion_v6, unbind) == 64 );
 C_ASSERT( sizeof(struct wine_unixlib_owned_backing_v2) == 56 );
 C_ASSERT( offsetof(struct wine_unixlib_owned_backing_v2, guest_address) == 48 );
 C_ASSERT( sizeof(struct wine_unixlib_owned_backing_codec_v2) == 32 );
 C_ASSERT( offsetof(struct wine_unixlib_owned_backing_codec_v2, acquire_backing) == 16 );
 C_ASSERT( offsetof(struct wine_unixlib_owned_backing_codec_v2, release_backing) == 24 );
 
-/* SHA-256 of abi-schema-v4.txt exact bytes (ASCII, LF, final newline). */
-DECLSPEC_EXPORT const struct wine_wow64_unixlib_companion_v4
-__wine_unix_call_wow64_companion_v4 =
+/* SHA-256 of abi-schema-v6.txt exact bytes (ASCII, LF, final newline). */
+DECLSPEC_EXPORT const struct wine_wow64_unixlib_companion_v6
+__wine_unix_call_wow64_companion_v6 =
 {
-    WINE_WOW64_UNIXLIB_COMPANION_V4_VERSION,
-    sizeof(struct wine_wow64_unixlib_companion_v4),
+    WINE_WOW64_UNIXLIB_COMPANION_V6_VERSION,
+    sizeof(struct wine_wow64_unixlib_companion_v6),
     WMT_UNIX_CALL_COUNT,
     0,
-    WINE_WOW64_UNIXLIB_COMPANION_V4_ABI_SHA256,
+    WINE_WOW64_UNIXLIB_COMPANION_V6_ABI_SHA256,
     bind_backend,
+    wmt_quiesce_shared_event_listeners,
+    unbind_backend,
 };

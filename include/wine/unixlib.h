@@ -53,17 +53,17 @@ typedef UINT64 unixlib_module_t;
  * legacy WoW64 entry table cannot consume high-shadow guest pointers. */
 #define WINE_WOW64_UNIXLIB_ALIAS_V2_VERSION          2u
 #define WINE_WOW64_UNIXLIB_CODEC_V2_VERSION          2u
-#define WINE_WOW64_UNIXLIB_BINDING_V4_VERSION        4u
-#define WINE_WOW64_UNIXLIB_COMPANION_V4_VERSION      4u
+#define WINE_WOW64_UNIXLIB_BINDING_V6_VERSION        6u
+#define WINE_WOW64_UNIXLIB_COMPANION_V6_VERSION      6u
 #define WINE_UNIXLIB_OWNED_BACKING_V2_VERSION        2u
 #define WINE_UNIXLIB_OWNED_BACKING_CODEC_V2_VERSION  2u
 
-/* SHA-256 of the canonical winemetal-wow64 abi-schema-v4.txt bytes. */
-#define WINE_WOW64_UNIXLIB_COMPANION_V4_ABI_SHA256 \
-    { 0x79, 0x38, 0xd5, 0x69, 0x16, 0x07, 0x4f, 0x61, \
-      0xdc, 0xe9, 0x6b, 0x43, 0xe3, 0xf6, 0x3b, 0x47, \
-      0xfe, 0x52, 0x56, 0x5c, 0x6a, 0x4c, 0x60, 0x96, \
-      0xc8, 0x76, 0x84, 0x7f, 0x19, 0x20, 0xd9, 0xd3 }
+/* SHA-256 of the canonical winemetal-wow64 abi-schema-v6.txt bytes. */
+#define WINE_WOW64_UNIXLIB_COMPANION_V6_ABI_SHA256 \
+    { 0x00, 0x51, 0xbd, 0x8c, 0x0b, 0xc3, 0xe3, 0xce, \
+      0x26, 0x1e, 0x9d, 0x50, 0x07, 0x66, 0x53, 0x42, \
+      0xac, 0x2d, 0x28, 0xa6, 0x43, 0x57, 0x67, 0x44, \
+      0xd8, 0xec, 0x71, 0x89, 0x6a, 0xf8, 0x56, 0xf1 }
 
 #define WINE_WOW64_UNIXLIB_CAP_SEPARATE_GUEST_ADDRESS_SPACE 0x0000000000000001ull
 #define WINE_WOW64_UNIXLIB_CAP_OWNED_MEMORY_ALIAS           0x0000000000000002ull
@@ -157,7 +157,7 @@ struct wine_unixlib_owned_backing_codec_v2
 
 /* A companion must test the capability and callbacks before accepting a call
  * that lets a native framework retain caller-owned memory. */
-struct wine_wow64_unixlib_binding_v4
+struct wine_wow64_unixlib_binding_v6
 {
     UINT32 version;
     UINT32 size;
@@ -169,22 +169,24 @@ struct wine_wow64_unixlib_binding_v4
     const struct wine_unixlib_owned_backing_codec_v2 *owned_backing_codec;
 };
 
-struct wine_wow64_unixlib_companion_v4
+struct wine_wow64_unixlib_companion_v6
 {
     UINT32 version;
     UINT32 size;
     UINT32 entry_count;
     UINT32 flags;
     BYTE abi_sha256[32];
-    NTSTATUS (*bind)( const struct wine_wow64_unixlib_binding_v4 *binding );
+    NTSTATUS (*bind)( const struct wine_wow64_unixlib_binding_v6 *binding );
+    NTSTATUS (*quiesce)(void);
+    NTSTATUS (*unbind)(void);
 };
 
 C_ASSERT( sizeof(struct wine_wow64_unixlib_alias_v2) == 48 );
 C_ASSERT( sizeof(struct wine_wow64_unixlib_codec_v2) == 16 + 5 * sizeof(void *) );
 C_ASSERT( sizeof(struct wine_unixlib_owned_backing_v2) == 56 );
 C_ASSERT( sizeof(struct wine_unixlib_owned_backing_codec_v2) == 16 + 2 * sizeof(void *) );
-C_ASSERT( sizeof(struct wine_wow64_unixlib_binding_v4) == 16 + 4 * sizeof(void *) );
-C_ASSERT( sizeof(struct wine_wow64_unixlib_companion_v4) == 48 + sizeof(void *) );
+C_ASSERT( sizeof(struct wine_wow64_unixlib_binding_v6) == 16 + 4 * sizeof(void *) );
+C_ASSERT( sizeof(struct wine_wow64_unixlib_companion_v6) == 48 + 3 * sizeof(void *) );
 
 /* Immutable v1 source descriptor used only by ntdll's audited internal WoW64
  * table.  External high-shadow Unix libraries must use v2 metadata; a raw
@@ -333,6 +335,13 @@ NTSYSAPI NTSTATUS ntdll_wow64_probe_user_write( void *dst, SIZE_T size );
  * entry and must not be retained after the call. */
 NTSYSAPI NTSTATUS ntdll_wow64_get_unixlib_call_context(
     struct ntdll_wow64_unixlib_call_context *context );
+/* Native-only lifecycle registration for reviewed v2 companion images.  The
+ * immutable source, function table, and both callbacks must resolve to the
+ * same loaded image; callbacks are invoked outside ntdll's registry lock. */
+NTSYSAPI NTSTATUS ntdll_wow64_register_unixlib_dispatch_v2(
+    const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
+    NTSTATUS (*quiesce)(void), NTSTATUS (*unbind)(void), unixlib_handle_t *handle );
+NTSYSAPI NTSTATUS ntdll_wow64_unregister_unixlib_dispatch( unixlib_handle_t handle );
 
 /* exception handling */
 

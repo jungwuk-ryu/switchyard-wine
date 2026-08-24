@@ -242,7 +242,6 @@ static void test_unixlib_dispatch_lifecycle(void)
     struct wow64_unixlib_checked_fault_params fault_params;
     struct wow64_unixlib_checked_fault_result fault_result = {0};
     struct wow64_unixlib_block_params block_params;
-    struct wow64_unixlib_block_state block_state;
     struct wow64_unixlib_self_unload_params unload_params;
     struct unixlib_dispatch_thread_params thread_params;
     unixlib_handle_t handle, stale_handle;
@@ -250,7 +249,7 @@ static void test_unixlib_dispatch_lifecycle(void)
     ULONG translated = 0;
     WCHAR helper_path[MAX_PATH];
     HMODULE ntdll;
-    HANDLE thread;
+    HANDLE thread, entered_event, release_event;
     NTSTATUS status;
     void *noaccess;
     BOOL found;
@@ -356,9 +355,12 @@ static void test_unixlib_dispatch_lifecycle(void)
     ok( handle != stale_handle, "reload reused stale handle %s\n",
         wine_dbgstr_longlong(handle) );
 
-    memset( &block_state, 0, sizeof(block_state) );
-    block_params.state = PtrToUlong( &block_state );
-    block_params.reserved = 0;
+    entered_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    release_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ok( !!entered_event && !!release_event,
+        "failed to create lifecycle events, error %lu\n", GetLastError() );
+    block_params.entered_event = (ULONG_PTR)entered_event;
+    block_params.release_event = (ULONG_PTR)release_event;
     thread_params.dispatcher = dispatcher;
     thread_params.handle = handle;
     thread_params.code = wow64_unixlib_lifecycle_block;
@@ -368,19 +370,16 @@ static void test_unixlib_dispatch_lifecycle(void)
     ok( !!thread, "failed to create dispatch thread, error %lu\n", GetLastError() );
     if (thread)
     {
-        for (i = 0; i < 5000 &&
-             !InterlockedCompareExchange( &block_state.entered, 0, 0 ); i++) Sleep(1);
-        ok( InterlockedCompareExchange( &block_state.entered, 0, 0 ) == 1,
+        ok( WaitForSingleObject( entered_event, 5000 ) == WAIT_OBJECT_0,
             "blocking dispatch did not enter\n" );
         stale_handle = handle;
         status = __wine_unload_unix_lib( module );
         ok( !status, "active unload returned %#lx\n", status );
-        InterlockedExchange( &block_state.release, 1 );
+        SetEvent( release_event );
         ok( WaitForSingleObject( thread, 5000 ) == WAIT_OBJECT_0,
             "blocking dispatch did not complete\n" );
         ok( !thread_params.status, "blocking dispatch returned %#lx\n",
             thread_params.status );
-        ok( block_state.exited == 1, "blocking dispatch did not publish exit\n" );
         CloseHandle( thread );
         status = dispatcher( stale_handle, wow64_unixlib_lifecycle_zero_args, NULL );
         ok( status == STATUS_INVALID_PARAMETER,
@@ -391,6 +390,8 @@ static void test_unixlib_dispatch_lifecycle(void)
         status = __wine_unload_unix_lib( module );
         ok( !status, "fallback unload returned %#lx\n", status );
     }
+    if (entered_event) CloseHandle( entered_event );
+    if (release_event) CloseHandle( release_event );
 
     status = load_wow64_unixlib_lifecycle_helper(
         helper_path, ARRAY_SIZE(helper_path), &found, &module, &handle );

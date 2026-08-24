@@ -4,7 +4,7 @@ set -eu
 test_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 source_dir=$(CDPATH= cd -- "$test_dir/../../../" && pwd)
 : "${WINE_BUILD_INCLUDE:?set WINE_BUILD_INCLUDE to the configured native ARM64 Wine include directory}"
-schema_file="$source_dir/dlls/winemetal-wow64/abi-schema-v4.txt"
+schema_file="$source_dir/dlls/winemetal-wow64/abi-schema-v6.txt"
 schema_sha=$(shasum -a 256 "$schema_file" | awk '{print $1}')
 
 LC_ALL=C awk '/^[0-9][0-9][0-9] [FAD] / { if ($1 != sprintf("%03d", count)) exit 1; count++ }
@@ -28,7 +28,7 @@ file "$build_dir/winemetal-wow64-tests" | grep -q 'Mach-O 64-bit executable arm6
 nm -m "$build_dir/winemetal-wow64-tests" | \
     grep '__wine_unix_call_wow64_funcs' | grep -q '(__DATA_CONST,__const)'
 nm -m "$build_dir/winemetal-wow64-tests" | \
-    grep '__wine_unix_call_wow64_companion_v4' | grep -q '(__DATA_CONST,__const)'
+    grep '__wine_unix_call_wow64_companion_v6' | grep -q '(__DATA_CONST,__const)'
 nm -m "$build_dir/winemetal-wow64-tests" | \
     grep '__wine_unix_call_wow64_dispatch_v2' | grep -q '(__DATA_CONST,__const)'
 if nm "$build_dir/winemetal-wow64-tests" | \

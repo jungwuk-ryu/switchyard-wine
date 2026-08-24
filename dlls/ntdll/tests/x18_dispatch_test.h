@@ -23,6 +23,10 @@ enum x18_dispatch_test_unix_func
     x18_dispatch_inner_probe,
     x18_dispatch_illegal_instruction,
     x18_dispatch_get_zero_count,
+    x18_dispatch_lifecycle_configure,
+    x18_dispatch_lifecycle_register,
+    x18_dispatch_lifecycle_unregister,
+    x18_dispatch_lifecycle_get_state,
     x18_dispatch_test_unix_func_count,
 };
 
@@ -33,6 +37,8 @@ enum wow64_unixlib_lifecycle_test_func
     wow64_unixlib_lifecycle_checked_fault,
     wow64_unixlib_lifecycle_block,
     wow64_unixlib_lifecycle_self_unload,
+    wow64_unixlib_lifecycle_self_unregister,
+    wow64_unixlib_lifecycle_self_unregister_fault,
     wow64_unixlib_lifecycle_illegal_instruction,
     wow64_unixlib_lifecycle_test_func_count,
 };
@@ -58,8 +64,8 @@ struct wow64_unixlib_context_result
 
 struct wow64_unixlib_block_params
 {
-    UINT32 state;
-    UINT32 reserved;
+    UINT64 entered_event;
+    UINT64 release_event;
 };
 
 struct wow64_unixlib_checked_fault_params
@@ -89,14 +95,62 @@ struct wow64_unixlib_self_unload_params
     UINT64 module;
 };
 
+struct wow64_unixlib_self_unregister_params
+{
+    UINT64 handle;
+};
+
+#define WOW64_UNIXLIB_LIFECYCLE_QUIESCE_FAULT    0x00000001u
+#define WOW64_UNIXLIB_LIFECYCLE_UNBIND_FAULT     0x00000002u
+#define WOW64_UNIXLIB_LIFECYCLE_QUIESCE_REENTER  0x00000004u
+
+struct wow64_unixlib_lifecycle_config
+{
+    UINT32 variant;
+    UINT32 flags;
+    NTSTATUS quiesce_status;
+    NTSTATUS unbind_status;
+};
+
+struct wow64_unixlib_lifecycle_registration
+{
+    UINT32 variant;
+    UINT32 reserved;
+    UINT64 handle;
+};
+
+struct wow64_unixlib_lifecycle_unregistration
+{
+    UINT64 handle;
+};
+
+struct wow64_unixlib_lifecycle_state
+{
+    UINT32 variant;
+    UINT32 reserved;
+    LONG quiesce_calls;
+    LONG unbind_calls;
+    LONG entry_sequence;
+    LONG quiesce_sequence;
+    LONG exit_sequence;
+    LONG unbind_sequence;
+    NTSTATUS reenter_status;
+    UINT32 reserved2;
+};
+
 C_ASSERT( sizeof(struct wow64_unixlib_context_params) == 8 );
 C_ASSERT( sizeof(struct wow64_unixlib_zero_count_result) == 4 );
 C_ASSERT( sizeof(struct wow64_unixlib_context_result) == 16 );
 C_ASSERT( sizeof(struct wow64_unixlib_checked_fault_params) == 8 );
 C_ASSERT( sizeof(struct wow64_unixlib_checked_fault_result) == 16 );
-C_ASSERT( sizeof(struct wow64_unixlib_block_params) == 8 );
+C_ASSERT( sizeof(struct wow64_unixlib_block_params) == 16 );
 C_ASSERT( sizeof(struct wow64_unixlib_block_state) == 16 );
 C_ASSERT( sizeof(struct wow64_unixlib_self_unload_params) == 8 );
+C_ASSERT( sizeof(struct wow64_unixlib_self_unregister_params) == 8 );
+C_ASSERT( sizeof(struct wow64_unixlib_lifecycle_config) == 16 );
+C_ASSERT( sizeof(struct wow64_unixlib_lifecycle_registration) == 16 );
+C_ASSERT( sizeof(struct wow64_unixlib_lifecycle_unregistration) == 8 );
+C_ASSERT( sizeof(struct wow64_unixlib_lifecycle_state) == 40 );
 
 /* Keep this pointer-free so the PE test and native helper share one layout. */
 struct x18_dispatch_test_state

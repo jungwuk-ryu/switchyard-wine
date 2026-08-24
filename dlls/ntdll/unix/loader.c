@@ -110,10 +110,16 @@ struct wow64_unixlib_dispatch_slot
 {
     struct wine_unixlib_dispatch_v1 dispatch;
     const struct wine_unixlib_dispatch_entry_v2 *entries;
+    NTSTATUS (*quiesce)(void);
+    NTSTATUS (*unbind)(void);
     void *module_ref;
     UINT64 generation;
     UINT64 state;
     UINT32 owners;
+    BOOL quiescing;
+    BOOL quiesced;
+    BOOL unbinding;
+    BOOL quarantined;
 };
 
 struct wow64_unixlib_call_context
@@ -219,21 +225,62 @@ static NTSTATUS pin_wow64_unixlib_dispatch_source( const void *source, void **mo
 #endif
 }
 
-static void finalize_wow64_unixlib_dispatch_slot(
+static NTSTATUS finalize_wow64_unixlib_dispatch_slot(
     struct wow64_unixlib_dispatch_slot *slot_entry )
 {
     struct wine_unixlib_dispatch_v1 *entry = &slot_entry->dispatch;
+    NTSTATUS (*unbind)(void) = NULL;
     void *module_ref = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOL should_unbind = FALSE;
     UINT64 state;
 
     pthread_mutex_lock( &wow64_unixlib_dispatch_mutex );
     state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
     if (state == (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING) &&
-        !slot_entry->owners)
+        !slot_entry->owners && slot_entry->quiesced && !slot_entry->quiescing &&
+        !slot_entry->unbinding && !slot_entry->quarantined)
+    {
+        slot_entry->unbinding = TRUE;
+        unbind = slot_entry->unbind;
+        should_unbind = TRUE;
+    }
+    pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+
+    if (!should_unbind) return STATUS_SUCCESS;
+    if (unbind)
+    {
+        __TRY
+        {
+            status = unbind();
+        }
+        __EXCEPT
+        {
+            status = STATUS_ACCESS_VIOLATION;
+        }
+        __ENDTRY
+    }
+
+    pthread_mutex_lock( &wow64_unixlib_dispatch_mutex );
+    state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
+    if (status)
+    {
+        slot_entry->unbinding = FALSE;
+        slot_entry->quarantined = TRUE;
+    }
+    else if (state == (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING) &&
+             !slot_entry->owners && slot_entry->quiesced &&
+             slot_entry->unbinding && !slot_entry->quarantined)
     {
         module_ref = slot_entry->module_ref;
         slot_entry->module_ref = NULL;
         slot_entry->entries = NULL;
+        slot_entry->quiesce = NULL;
+        slot_entry->unbind = NULL;
+        slot_entry->quiescing = FALSE;
+        slot_entry->quiesced = FALSE;
+        slot_entry->unbinding = FALSE;
+        slot_entry->quarantined = FALSE;
         entry->magic = 0;
         entry->version = 0;
         entry->entry_count = 0;
@@ -243,6 +290,61 @@ static void finalize_wow64_unixlib_dispatch_slot(
     }
     pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
     if (module_ref) dlclose( module_ref );
+    return status;
+}
+
+static NTSTATUS quiesce_wow64_unixlib_dispatch_slot(
+    struct wow64_unixlib_dispatch_slot *slot_entry )
+{
+    NTSTATUS (*quiesce)(void) = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOL should_finalize = FALSE;
+    UINT64 state;
+
+    pthread_mutex_lock( &wow64_unixlib_dispatch_mutex );
+    state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
+    if ((state & (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING)) ==
+        (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING) &&
+        !slot_entry->owners && slot_entry->quiescing && !slot_entry->quiesced &&
+        !slot_entry->quarantined)
+        quiesce = slot_entry->quiesce;
+    pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+
+    if (!quiesce) return STATUS_SUCCESS;
+    __TRY
+    {
+        status = quiesce();
+    }
+    __EXCEPT
+    {
+        status = STATUS_ACCESS_VIOLATION;
+    }
+    __ENDTRY
+
+    pthread_mutex_lock( &wow64_unixlib_dispatch_mutex );
+    state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
+    if (status)
+    {
+        slot_entry->quiescing = FALSE;
+        slot_entry->quarantined = TRUE;
+    }
+    else if ((state & (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING)) ==
+             (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING) &&
+             !slot_entry->owners && slot_entry->quiescing && !slot_entry->quarantined)
+    {
+        slot_entry->quiescing = FALSE;
+        slot_entry->quiesced = TRUE;
+        should_finalize = !(state & WOW64_UNIXLIB_SLOT_ACTIVE_MASK);
+    }
+    pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+
+    if (should_finalize)
+    {
+        NTSTATUS unbind_status = finalize_wow64_unixlib_dispatch_slot( slot_entry );
+
+        if (!status) status = unbind_status;
+    }
+    return status;
 }
 
 static void finalize_drained_wow64_unixlib_dispatch_slots(void)
@@ -312,11 +414,12 @@ static NTSTATUS acquire_wow64_unixlib_dispatch_slot(
 
 static NTSTATUS register_wow64_unixlib_dispatch_source(
     const void *source, SIZE_T source_size, const unixlib_entry_t *funcs, UINT32 entry_count,
-    const struct wine_unixlib_dispatch_entry_v2 *entries, unixlib_handle_t *handle )
+    const struct wine_unixlib_dispatch_entry_v2 *entries, NTSTATUS (*quiesce)(void),
+    NTSTATUS (*unbind)(void), unixlib_handle_t *handle )
 {
     struct wow64_unixlib_dispatch_slot *slot_entry, *free_slot = NULL;
     struct wine_unixlib_dispatch_v1 *entry;
-    Dl_info source_info, table_info, metadata_info, func_info;
+    Dl_info source_info, table_info, metadata_info, func_info, quiesce_info, unbind_info;
     SIZE_T metadata_size = entry_count * sizeof(*entries);
     SIZE_T table_size = entry_count * sizeof(*funcs);
     UINT64 state;
@@ -343,6 +446,16 @@ static NTSTATUS register_wow64_unixlib_dispatch_source(
          !dispatch_range_has_protection( entries, metadata_size, VM_PROT_READ, VM_PROT_WRITE ) ||
          !dladdr( entries, &metadata_info ) ||
          source_info.dli_fbase != metadata_info.dli_fbase))
+        goto invalid;
+    if (quiesce && (is_guest_controlled_dispatch_address( (const void *)quiesce ) ||
+        !dispatch_range_has_protection( (const void *)quiesce, 1, VM_PROT_EXECUTE, 0 ) ||
+        !dladdr( (const void *)quiesce, &quiesce_info ) ||
+        source_info.dli_fbase != quiesce_info.dli_fbase))
+        goto invalid;
+    if (unbind && (is_guest_controlled_dispatch_address( (const void *)unbind ) ||
+        !dispatch_range_has_protection( (const void *)unbind, 1, VM_PROT_EXECUTE, 0 ) ||
+        !dladdr( (const void *)unbind, &unbind_info ) ||
+        source_info.dli_fbase != unbind_info.dli_fbase))
         goto invalid;
 
     for (i = 0; i < entry_count; i++)
@@ -376,13 +489,27 @@ static NTSTATUS register_wow64_unixlib_dispatch_source(
         slot_entry = &wow64_unixlib_dispatch_registry[slot];
         state = __atomic_load_n( &slot_entry->state, __ATOMIC_ACQUIRE );
         if (!state && !free_slot) free_slot = slot_entry;
+        entry = &slot_entry->dispatch;
+        if ((state & WOW64_UNIXLIB_SLOT_LIVE) && entry->entry_count == entry_count &&
+            entry->funcs == funcs && slot_entry->entries == entries &&
+            (state & WOW64_UNIXLIB_SLOT_CLOSING))
+        {
+            pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+            dlclose( module_ref );
+            return STATUS_DEVICE_BUSY;
+        }
         if ((state & (WOW64_UNIXLIB_SLOT_LIVE | WOW64_UNIXLIB_SLOT_CLOSING)) !=
             WOW64_UNIXLIB_SLOT_LIVE)
             continue;
-        entry = &slot_entry->dispatch;
         if (entry->entry_count == entry_count && entry->funcs == funcs &&
             slot_entry->entries == entries)
         {
+            if (slot_entry->quiesce != quiesce || slot_entry->unbind != unbind)
+            {
+                pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
+                dlclose( module_ref );
+                return STATUS_INVALID_DEVICE_STATE;
+            }
             if (slot_entry->owners == UINT_MAX)
             {
                 pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
@@ -414,8 +541,14 @@ static NTSTATUS register_wow64_unixlib_dispatch_source(
     entry->funcs = funcs;
     entry->self = (UINT_PTR)entry;
     slot_entry->entries = entries;
+    slot_entry->quiesce = quiesce;
+    slot_entry->unbind = unbind;
     slot_entry->module_ref = module_ref;
     slot_entry->owners = 1;
+    slot_entry->quiescing = FALSE;
+    slot_entry->quiesced = FALSE;
+    slot_entry->unbinding = FALSE;
+    slot_entry->quarantined = FALSE;
     *handle = wine_unixlib_dispatch_handle( slot, slot_entry->generation );
     __atomic_store_n( &slot_entry->state, WOW64_UNIXLIB_SLOT_LIVE, __ATOMIC_RELEASE );
     pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
@@ -442,14 +575,15 @@ NTSTATUS register_wow64_unixlib_dispatch(
         status = STATUS_INVALID_PARAMETER;
     else
         status = register_wow64_unixlib_dispatch_source( source, sizeof(*source), funcs,
-                                                         source->entry_count, NULL, handle );
+                                                         source->entry_count, NULL, NULL, NULL,
+                                                         handle );
     dlclose( module_ref );
     return status;
 }
 
-NTSTATUS register_wow64_unixlib_dispatch_v2(
+static NTSTATUS register_wow64_unixlib_dispatch_v2_internal(
     const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
-    unixlib_handle_t *handle )
+    NTSTATUS (*quiesce)(void), NTSTATUS (*unbind)(void), unixlib_handle_t *handle )
 {
     void *module_ref;
     NTSTATUS status;
@@ -465,17 +599,33 @@ NTSTATUS register_wow64_unixlib_dispatch_v2(
     else
         status = register_wow64_unixlib_dispatch_source( source, sizeof(*source), funcs,
                                                          source->entry_count, source->entries,
-                                                         handle );
+                                                         quiesce, unbind, handle );
     dlclose( module_ref );
     return status;
 }
 
-NTSTATUS unregister_wow64_unixlib_dispatch( unixlib_handle_t handle )
+NTSTATUS register_wow64_unixlib_dispatch_v2(
+    const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
+    unixlib_handle_t *handle )
+{
+    return register_wow64_unixlib_dispatch_v2_internal( source, funcs, NULL, NULL, handle );
+}
+
+NTSTATUS ntdll_wow64_register_unixlib_dispatch_v2(
+    const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
+    NTSTATUS (*quiesce)(void), NTSTATUS (*unbind)(void), unixlib_handle_t *handle )
+{
+    if (!quiesce || !unbind) return STATUS_INVALID_PARAMETER;
+    return register_wow64_unixlib_dispatch_v2_internal( source, funcs, quiesce, unbind,
+                                                         handle );
+}
+
+NTSTATUS ntdll_wow64_unregister_unixlib_dispatch( unixlib_handle_t handle )
 {
     struct wow64_unixlib_dispatch_slot *slot_entry;
     UINT64 generation, old_state;
     UINT32 slot;
-    BOOL finalize = FALSE;
+    BOOL finalize = FALSE, quiesce = FALSE;
 
     if (!wine_unixlib_decode_dispatch_handle( handle, &slot, &generation ))
         return STATUS_INVALID_HANDLE;
@@ -494,11 +644,26 @@ NTSTATUS unregister_wow64_unixlib_dispatch( unixlib_handle_t handle )
     {
         old_state = __atomic_fetch_or( &slot_entry->state, WOW64_UNIXLIB_SLOT_CLOSING,
                                        __ATOMIC_ACQ_REL );
-        finalize = !(old_state & WOW64_UNIXLIB_SLOT_ACTIVE_MASK);
+        if (slot_entry->quiesce)
+        {
+            slot_entry->quiescing = TRUE;
+            quiesce = TRUE;
+        }
+        else
+        {
+            slot_entry->quiesced = TRUE;
+            finalize = !(old_state & WOW64_UNIXLIB_SLOT_ACTIVE_MASK);
+        }
     }
     pthread_mutex_unlock( &wow64_unixlib_dispatch_mutex );
-    if (finalize) finalize_wow64_unixlib_dispatch_slot( slot_entry );
+    if (quiesce) return quiesce_wow64_unixlib_dispatch_slot( slot_entry );
+    if (finalize) return finalize_wow64_unixlib_dispatch_slot( slot_entry );
     return STATUS_SUCCESS;
+}
+
+NTSTATUS unregister_wow64_unixlib_dispatch( unixlib_handle_t handle )
+{
+    return ntdll_wow64_unregister_unixlib_dispatch( handle );
 }
 
 NTSTATUS ntdll_wow64_get_unixlib_call_context(
@@ -623,6 +788,24 @@ NTSTATUS validate_wow64_unixlib_function_table( const unixlib_entry_t *funcs,
     (void)funcs;
     (void)count;
     (void)identity;
+    return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS ntdll_wow64_register_unixlib_dispatch_v2(
+    const struct wine_unixlib_dispatch_source_v2 *source, const unixlib_entry_t *funcs,
+    NTSTATUS (*quiesce)(void), NTSTATUS (*unbind)(void), unixlib_handle_t *handle )
+{
+    (void)source;
+    (void)funcs;
+    (void)quiesce;
+    (void)unbind;
+    (void)handle;
+    return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS ntdll_wow64_unregister_unixlib_dispatch( unixlib_handle_t handle )
+{
+    (void)handle;
     return STATUS_NOT_SUPPORTED;
 }
 

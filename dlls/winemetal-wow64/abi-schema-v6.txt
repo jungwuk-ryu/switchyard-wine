@@ -1,4 +1,4 @@
-Switchyard Winemetal companion ABI schema v4
+Switchyard Winemetal companion ABI schema v6
 canonical-encoding: ASCII
 canonical-newlines: LF
 canonical-final-newline: required
@@ -31,8 +31,8 @@ wine_wow64_unixlib_codec_v2: version=2 size=56 align=8
   acquire_alias:function-pointer@40 optional
   release_alias:function-pointer@48 optional
 
-wine_wow64_unixlib_binding_v4: version=4 size=48 align=8
-  version:u32@0 value=4
+wine_wow64_unixlib_binding_v6: version=6 size=48 align=8
+  version:u32@0 value=6
   size:u32@4 value=48
   entry_count:u32@8 value=138
   reserved:u32@12 value=0
@@ -41,17 +41,21 @@ wine_wow64_unixlib_binding_v4: version=4 size=48 align=8
   codec:pointer@32
   owned_backing_codec:pointer@40
 
-wine_wow64_unixlib_companion_v4: version=4 size=56 align=8
-  version:u32@0 value=4
-  size:u32@4 value=56
+wine_wow64_unixlib_companion_v6: version=6 size=72 align=8
+  version:u32@0 value=6
+  size:u32@4 value=72
   entry_count:u32@8 value=138
   flags:u32@12 value=0
   abi_sha256:byte[32]@16 value=SHA256(this-file-exact-bytes)
   bind:function-pointer@48
-  export=__wine_unix_call_wow64_companion_v4
+  quiesce:function-pointer@56
+  unbind:function-pointer@64
+  export=__wine_unix_call_wow64_companion_v6
   v1-export=absent
   v2-export=absent
   v3-export=absent
+  v4-export=absent
+  v5-export=absent
   native-companion-export=absent
 
 wine_unixlib_dispatch_entry_v2: size=8 align=4
@@ -88,7 +92,7 @@ wine_unixlib_owned_backing_codec_v2: version=2 size=32 align=8
 
 Capabilities and callbacks
 WINE_WOW64_UNIXLIB_CAP_SEPARATE_GUEST_ADDRESS_SPACE=0x0000000000000001 exactly required
-WINE_WOW64_UNIXLIB_CAP_OWNED_MEMORY_ALIAS=0x0000000000000002 not required and not accepted by this v4 binding
+WINE_WOW64_UNIXLIB_CAP_OWNED_MEMORY_ALIAS=0x0000000000000002 not required and not accepted by this v6 binding
 WINE_WOW64_UNIXLIB_ACCESS_READ=0x00000001
 WINE_WOW64_UNIXLIB_ACCESS_WRITE=0x00000002
 translate(guest:u64,size:u64,access:u32,host_out:pointer): synchronous borrowed view only
@@ -113,9 +117,13 @@ Provider observer failure is fail-stop; the allocator never republishes a failed
 Dispatch and copy contract
 The exported 138-entry function table and metadata are immutable and identity-bound to this companion Mach-O.
 The original normal and legacy source tables may reside in writable storage; the loader validates them, copies all 138 entries from each, revalidates the original contents and identity, then invokes bind synchronously with the stable copies.
-Bind independently double-copies and validates the stable source tables, copies them into companion-owned anonymous storage, and makes the complete snapshot read-only before release-publishing it.
+Bind independently double-copies and validates the stable source tables, retains their single original Mach-O image with RTLD_NOLOAD, copies them into companion-owned anonymous storage, and makes the complete snapshot read-only before release-publishing it.
 Successful repeated bind compares the protected snapshot contents and codec identities; dispatch never dereferences either binding source table after publication.
-Snapshot allocation or protection failure publishes nothing and leaves first bind retryable; the loader drains registered calls before companion unload and its destructor unmaps the single published snapshot.
+Snapshot allocation, image-retain, or protection failure publishes nothing and leaves first bind retryable; after the last owner, the loader invokes the armed v6 quiesce callback exactly once outside its registry lock while both images remain pinned, then invokes the armed v6 unbind callback exactly once after registered calls drain.
+Successful unbind drains AIR, unmaps the single published snapshot, and releases the original image retain last before the loader clears the dispatch slot; failed unbind quarantines the closing slot and backend pins and forbids identity reuse.
+Shared-event listener tokens encode a monotonically increasing generation and one of 64 bounded registry slots; they are never native pointers, stale generations fail with STATUS_INVALID_HANDLE, and a closing token accepts no new notification.
+Shared-event notification callbacks remain unarmed until notifyListener returns successfully; a callback fired during registration is delivered only after that success, while a faulting registration cancels both the synchronous callback and every later invocation of the copied block.
+Listener quiesce first prevents new token creation, retires every live generation, and returns the first guarded stop or cleanup failure so the loader can quarantine the companion; resume only reopens creation after a successful new binding lifecycle.
 Pinned source slot 083 is null in both tables; snapshots preserve null entries and internal source dispatch reports STATUS_NOT_SUPPORTED for them.
 Every wrapper requires an active call context with exact args_size and exact reviewed flags for its slot.
 The loader passes a native-owned stable outer snapshot; no implementation may retain that snapshot pointer.
@@ -124,14 +132,14 @@ After implementation, the wrapper atomically publishes the complete outer snapsh
 Recoverable atomic publication failure writes no bytes; observer failure after stores is fail-stop.
 Every nested pointer is decoded with ntdll_wow64_guest32_to_host and accessed only through ntdll current-process copy, probe, or atomic-publication helpers.
 Forward entries call only the same-index original legacy-wow64 handler.
-Adapted entries call only the same-index original normal handler after bounded snapshots and explicit conversion.
+Adapted entries call only the same-index original normal handler after bounded snapshots and explicit conversion, except the documented local slot 18 and slot 114 ownership branches.
 Denied entries return STATUS_NOT_SUPPORTED after the listed deterministic output initialization.
 
 Wire and adapter invariants
 i386 pointers are little-endian low:u32 then high:u32, size=8 align=4.
 Input guest-memory pointers require high=0 and a bounded 32-bit guest range.
-Native locals and snapshots are passed only to the same-index normal handler.
-All adapted outer return fields and documented nested outputs are initialized before failure.
+Native locals and snapshots are passed only to the same-index normal handler, except slot 18 owned backing and slot 114 dispatch-data token resolution.
+All adapted outer return fields and documented nested outputs are initialized before a native side effect, except that slot 088 staging or initial failure-atomic publication failure leaves both nested output ranges unchanged.
 WMTRenderPassInfo wire32 size=652 align=4 visibility_buffer@644; native size=664 align=8 visibility_buffer@656.
 WMTRenderPipelineInfo wire32 size=168 align=4 logic_operation@98 vertex_function@112 tessellation_partition_mode@140 max_tessellation_factor@141 tessellation_output_winding_order@142 tessellation_factor_step@143 archives@152; native size=168 align=8 logic_operation@98 vertex_function@112 tessellation_partition_mode@140 max_tessellation_factor@141 tessellation_output_winding_order@142 tessellation_factor_step@143 archives@152.
 Command graphs are explicit field conversions, never wire/native memcpy; cycles and unknown node types fail closed.
@@ -142,13 +150,24 @@ Paths: snapshot<=PATH_MAX+1 bytes including terminator.
 Graphs: nodes<=65536; records+cycle-set+native-arena<=16777216 bytes.
 Function constants: count<=4096; copied data<=1048576 bytes; struct/array/none types denied.
 Dispatch blob: one call<=67108864 bytes; aggregate live snapshots<=268435456 bytes.
-Slot 18 caller-supplied nonzero memory is explicitly STATUS_NOT_SUPPORTED because the v4 loader provides no safe retained-address pin manager.
+AIR initialize bytecode and compiled blobs are bounded by 67108864 bytes; function names are bounded by 1048576 bytes plus one terminator.
+AIR compilation argument lists retain at most 16777216 bytes across their cycle set, nodes, and payloads; contain at most 4096 nodes; reject cycles, duplicate or unknown types, invalid enum/boolean/slot/register/format fields, GS pass-through register/component pairs other than ff/ff or register<32/component<4, and stream-output spans outside their selected stride; and deep-copy stream-output elements, input-layout elements, and root-signature bytecode before the synchronous native call.
+AIR shader reflection registers exact constant-buffer and argument counts for bounded slot 088 output; compile and argument queries retain registered shaders across native use, and slot 075 removes a shader from publication then waits for those uses before destruction.
+AIR compiled data is copied into companion-owned dispatch data at slot 077; the guest receives a non-address opaque token which only slot 114 resolves with an exact length match. Slot 078 first destroys the native bitcode, then removes the token and releases its dispatch-data owner after success.
+AIR errors are registered before guest publication; slot 079 holds their lifetime across the native query and slot 080 makes the registration unavailable before destruction, unlinking it only after native success. Error buffers are nonzero and at most 1048576 bytes; zero-size queries return zero without calling the pinned native implementation that assumes positive capacity.
+AIR destroy slots mark records unavailable and wait for retained users; failed native destruction restores publication for a retry, while successful destruction unlinks and releases companion state. Backend teardown drains every AIR registry before the original dispatch table is unmapped.
+Slot 045 validates the mip-level region and slice against a CPU-replaceable, non-framebuffer-only, single-sample native texture; rejects private, memoryless, multisample, unknown-layout, and misaligned compressed resources; enforces Metal pixel/block pitch multiples, the raw/packed row-pitch ceiling, and zero image pitch outside 3D textures; derives physical rows, minimum row bytes, and the exact last-row/last-image source extent without trailing padding; and snapshots at most 67108864 bytes before the synchronous native texture update.
+Slot 107 snapshots its explicit nonzero length only after checking offset+length against the native Metal buffer length and verifying CPU-addressable contents, and bounds one synchronous update to 67108864 bytes.
+Slot 18 caller-supplied nonzero memory is explicitly STATUS_NOT_SUPPORTED because the v6 loader provides no safe retained-address pin manager.
 Slot 18 null memory with nonzero Shared or Managed storage acquires owned backing, passes the native host address to Metal, validates the exact rounded mapping and full low-32-bit guest range, then publishes guest memory low/high=0, gpu_address, and object in that order.
+Before slot 18 creates an escaped Metal deallocator, the companion retains exactly one independent RTLD_NOLOAD image reference for process lifetime; it is intentionally never dropped from callback code, so arbitrary-thread object destruction cannot self-unload its invoke code.
 Slot 18 Metal deallocator atomically consumes release_backing once and is foreign-thread safe; nil consumes the lease without publishing a buffer.
 Slot 18 nested-output failure destroys the unpublished Metal object exactly once; object-release failure takes priority and cleanup is never retried.
 Slot 18 outer publication failure zeros nested memory/gpu outputs and destroys the unpublished object exactly once.
 Slot 18 null memory with zero length or Private, Memoryless, reserved, or unknown storage calls normal slot 18 with a native local and copies the full native contents pointer to low/high words.
 Slot 18 original-handler failure with a nonzero object, or later output-copy failure, destroys the unpublished object exactly once; slot-001 cleanup failure takes priority and ret remains zero.
+Slot 077 and direct slot 114 copy compiled/blob bytes synchronously into dispatch-owned storage and release the companion snapshot before publication; no companion callback escapes in the dispatch-data object.
+Slot 114 outer publication failure releases the unpublished direct or retained dispatch-data object through normal slot 001 exactly once; cleanup failure takes priority.
 
 Reviewed v2 dispatch metadata
 000 args-size=8 flags=REVIEWED
@@ -239,7 +258,7 @@ Reviewed v2 dispatch metadata
 085 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
 086 args-size=16 flags=REVIEWED
 087 args-size=16 flags=REVIEWED
-088 args-size=16 flags=REVIEWED|NESTED
+088 args-size=16 flags=REVIEWED|NESTED|HAS_OUTPUT
 089 args-size=16 flags=REVIEWED|HAS_OUTPUT
 090 args-size=16 flags=REVIEWED|HAS_OUTPUT
 091 args-size=40 flags=REVIEWED|NESTED|HAS_OUTPUT
@@ -292,7 +311,7 @@ Reviewed v2 dispatch metadata
 
 Table legend
 F: forward same index through original legacy-wow64 table; scalar, inline-fixed, or opaque-only ABI.
-A: adapt the stated guest schema and call the same-index original normal handler, except slot 18 owned-backing branch.
+A: adapt the stated guest schema and call the same-index original normal handler, except the documented slot 18 owned-backing and slot 114 dispatch-data branches.
 D: deny with the stated deterministic output policy; no original handler call.
 
 000 F _NSObject_retain opaque object
@@ -340,7 +359,7 @@ D: deny with the stated deterministic output policy; no original handler call.
 042 F _MTLTexture_depth opaque object, scalar return
 043 F _MTLTexture_arrayLength opaque object, scalar return
 044 F _MTLTexture_mipmapLevelCount opaque object, scalar return
-045 D _MTLTexture_replaceRegion input-only guest pointer; no output
+045 A _MTLTexture_replaceRegion bounded input snapshot from native-validated mip region and format-derived physical row/image pitch extent; no output
 046 F _MTLBuffer_didModifyRange opaque object and scalars
 047 F _MTLCommandBuffer_presentDrawable opaque objects
 048 F _MTLCommandBuffer_presentDrawableAfterMinimumDuration opaque objects and double
@@ -369,21 +388,21 @@ D: deny with the stated deterministic output policy; no original handler call.
 071 A _MetalLayer_getProps native output local and bounded layer-props32 copyback; output zero on failure
 072 F _CreateMetalViewFromHWND opaque HWND/device values and object returns
 073 F _ReleaseMetalView opaque object
-074 D thunk_SM50Initialize ret=-1; shader=0; reflection struct zero; error=0 where bounded
-075 F thunk_SM50Destroy opaque AIR owner
-076 D thunk_SM50Compile ret=-1; bitcode=0; error=0 where bounded
-077 D thunk_SM50GetCompiledBitcode compiled-bitcode output struct zero where bounded
-078 F thunk_SM50DestroyBitcode opaque AIR bitcode
-079 D thunk_SM50GetErrorMessage ret_size=0; first output byte=0 where bounded
-080 F thunk_SM50FreeError opaque AIR error
-081 D thunk_SM50CompileGeometryPipelineVertex ret=-1; bitcode=0; error=0 where bounded
-082 D thunk_SM50CompileGeometryPipelineGeometry ret=-1; bitcode=0; error=0 where bounded
+074 A thunk_SM50Initialize bounded bytecode snapshot and native output locals; ret=-1,shader=0,reflection=0,error=0 before call; successful shader reflection counts are registered
+075 A thunk_SM50Destroy makes registered reflection counts unavailable, waits for users, and removes them after successful native shader destruction; failure restores publication
+076 A thunk_SM50Compile bounded deep argument graph and function snapshot; ret=-1,bitcode=0,error=0 before call; unpublished native owners are destroyed on failure
+077 A thunk_SM50GetCompiledBitcode copies bounded native data into companion-owned dispatch data and returns opaque token plus exact size
+078 A thunk_SM50DestroyBitcode makes the registered token unavailable and removes/releases dispatch data after successful native bitcode destruction; failure restores publication
+079 A thunk_SM50GetErrorMessage bounded native temporary and guest copyback; zero capacity returns zero without native call
+080 A thunk_SM50FreeError makes a registered AIR error unavailable and removes it after successful same-index destruction; failure restores publication
+081 A thunk_SM50CompileGeometryPipelineVertex bounded deep argument graph and function snapshot with local owner outputs
+082 A thunk_SM50CompileGeometryPipelineGeometry bounded deep argument graph and function snapshot with local owner outputs
 083 D pinned NULL entry; no output
-084 D thunk_SM50CompileTessellationPipelineHull ret=-1; bitcode=0; error=0 where bounded
-085 D thunk_SM50CompileTessellationPipelineDomain ret=-1; bitcode=0; error=0 where bounded
+084 A thunk_SM50CompileTessellationPipelineHull bounded deep argument graph and function snapshot with local owner outputs
+085 A thunk_SM50CompileTessellationPipelineDomain bounded deep argument graph and function snapshot with local owner outputs
 086 F _MTLCommandEncoder_setLabel opaque objects
 087 F _MTLDevice_setShouldMaximizeConcurrentCompilation opaque object and boolean
-088 D thunk_SM50GetArgumentsInfo count-less output arrays are untouched because bounded zeroing is impossible
+088 A thunk_SM50GetArgumentsInfo output arrays bounded by slot-074 registered reflection counts; after staging allocation one failure-atomic writev validates both ranges before publishing zeros, native/final-publication failure leaves both zero, and one failure-atomic result writev publishes neither range on recoverable validation failure; unsynchronized guest readers still require their own coherence protocol
 089 F _MTLCommandBuffer_error opaque object, object return
 090 F _MTLCommandBuffer_logs opaque object, object return
 091 D _MTLLogContainer_enumerate ret_read=0; count-less output buffer untouched
@@ -402,14 +421,14 @@ D: deny with the stated deterministic output policy; no original handler call.
 104 F _MTLSharedEvent_setWin32EventAtValue opaque objects/NT handle and scalar
 105 F _MTLDevice_newFence opaque object, object return
 106 F _MTLDevice_newEvent opaque object, object return
-107 D _MTLBuffer_updateContents input-only guest pointer; no output
+107 A _MTLBuffer_updateContents bounded explicit-length input snapshot with offset+length native buffer-capacity validation; no output
 108 F _SharedEventListener_create object return
 109 F _SharedEventListener_start opaque object
 110 F _SharedEventListener_destroy opaque object
 111 F _WMTGetOSVersion fixed outer scalar returns
 112 D _MTLDevice_newBinaryArchive archive=0,error=0
 113 D _MTLBinaryArchive_serialize error=0
-114 A _DispatchData_alloc_init low guest address only and blob<=67108864 snapshot; ret=0 on failure
+114 A _DispatchData_alloc_init low guest address blob<=67108864 synchronous dispatch-owned copy or exact slot-077 opaque token/length resolution; ret=0 on failure and unpublished ret released on outer publication failure
 115 A _CacheReader_alloc_init bounded path snapshot; ret=0 on failure
 116 D _CacheReader_get data=0
 117 A _CacheWriter_alloc_init bounded path snapshot; ret=0 on failure

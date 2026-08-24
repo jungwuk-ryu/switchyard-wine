@@ -31,6 +31,8 @@
 #define WMT_CONSTANT_BYTE_MAX            (1024u * 1024u)
 #define WMT_DISPATCH_BLOB_MAX            (64u * 1024u * 1024u)
 #define WMT_SNAPSHOT_LIVE_MAX            (256u * 1024u * 1024u)
+#define WMT_AIR_GRAPH_MAX                 (16u * 1024u * 1024u)
+#define WMT_AIR_ARGUMENT_MAX              4096u
 
 typedef uint64_t wmt_handle_t;
 
@@ -566,6 +568,26 @@ struct wmt_params32_resolve_counter_range
     uint64_t data_length;
 };
 
+struct wmt_params32_texture_replace
+{
+    uint64_t texture;
+    struct wmt_origin origin;
+    struct wmt_size size;
+    uint64_t level;
+    uint64_t slice;
+    struct wmt_wire_ptr data;
+    uint64_t bytes_per_row;
+    uint64_t bytes_per_image;
+};
+
+struct wmt_params32_buffer_update
+{
+    uint64_t buffer;
+    uint64_t offset;
+    struct wmt_wire_ptr data;
+    uint64_t length;
+};
+
 #pragma pack(pop)
 
 /* Pinned AIR thunk32 outer blocks.  Guest pointers remain explicit uint32_t. */
@@ -643,6 +665,297 @@ struct wmt_air_compiled_bitcode32
     uint64_t data;
     uint64_t size;
 };
+
+#pragma pack(push, 4)
+struct wmt_air_argument32
+{
+    uint32_t next;
+    uint32_t type;
+};
+
+struct wmt_air_stream_output_argument32
+{
+    uint32_t next;
+    uint32_t type;
+    uint32_t num_output_slots;
+    uint32_t num_elements;
+    uint32_t strides[4];
+    uint32_t elements;
+};
+
+struct wmt_air_common_argument32
+{
+    uint32_t next;
+    uint32_t type;
+    uint32_t metal_version;
+    uint32_t flags;
+};
+
+struct wmt_air_pixel_argument32
+{
+    uint32_t next;
+    uint32_t type;
+    uint32_t sample_mask;
+    uint8_t dual_source_blending;
+    uint8_t disable_depth_output;
+    uint8_t padding[2];
+    uint32_t unorm_output_reg_mask;
+};
+
+struct wmt_air_input_layout_argument32
+{
+    uint32_t next;
+    uint32_t type;
+    uint32_t index_buffer_format;
+    uint32_t slot_mask;
+    uint32_t num_elements;
+    uint32_t elements;
+};
+
+struct wmt_air_gs_passthrough_argument32
+{
+    uint32_t next;
+    uint32_t type;
+    uint32_t data;
+    uint8_t rasterization_disabled;
+    uint8_t padding[3];
+};
+
+struct wmt_air_bool_argument32
+{
+    uint32_t next;
+    uint32_t type;
+    uint8_t value;
+    uint8_t padding[3];
+};
+
+struct wmt_air_u32_argument32
+{
+    uint32_t next;
+    uint32_t type;
+    uint32_t value;
+};
+
+struct wmt_air_root_signature_argument32
+{
+    uint32_t next;
+    uint32_t type;
+    uint32_t bytecode;
+    uint32_t bytecode_length;
+};
+#pragma pack(pop)
+
+struct wmt_air_stream_output_element
+{
+    uint32_t reg_id;
+    uint32_t component;
+    uint32_t output_slot;
+    uint32_t offset;
+};
+
+struct wmt_air_input_element
+{
+    uint32_t reg;
+    uint32_t slot;
+    uint32_t aligned_byte_offset;
+    uint32_t format;
+    uint32_t step;
+};
+
+struct wmt_air_argument
+{
+    void *next;
+    uint32_t type;
+};
+
+struct wmt_air_stream_output_argument
+{
+    void *next;
+    uint32_t type;
+    uint32_t num_output_slots;
+    uint32_t num_elements;
+    uint32_t strides[4];
+    struct wmt_air_stream_output_element *elements;
+};
+
+struct wmt_air_common_argument
+{
+    void *next;
+    uint32_t type;
+    uint32_t metal_version;
+    uint32_t flags;
+};
+
+struct wmt_air_pixel_argument
+{
+    void *next;
+    uint32_t type;
+    uint32_t sample_mask;
+    bool dual_source_blending;
+    bool disable_depth_output;
+    uint32_t unorm_output_reg_mask;
+};
+
+struct wmt_air_input_layout_argument
+{
+    void *next;
+    uint32_t type;
+    uint32_t index_buffer_format;
+    uint32_t slot_mask;
+    uint32_t num_elements;
+    struct wmt_air_input_element *elements;
+};
+
+struct wmt_air_gs_passthrough_argument
+{
+    void *next;
+    uint32_t type;
+    uint32_t data;
+    bool rasterization_disabled;
+};
+
+struct wmt_air_bool_argument
+{
+    void *next;
+    uint32_t type;
+    bool value;
+};
+
+struct wmt_air_u32_argument
+{
+    void *next;
+    uint32_t type;
+    uint32_t value;
+};
+
+struct wmt_air_root_signature_argument
+{
+    void *next;
+    uint32_t type;
+    const void *bytecode;
+    size_t bytecode_length;
+};
+
+struct wmt_air_reflection
+{
+    uint32_t constant_buffer_table_bind_index;
+    uint32_t argument_buffer_bind_index;
+    uint32_t num_constant_buffers;
+    uint32_t num_arguments;
+    uint32_t stage_data[3];
+    uint16_t constant_buffer_slot_mask;
+    uint16_t sampler_slot_mask;
+    uint64_t uav_slot_mask;
+    uint64_t srv_slot_mask_hi;
+    uint64_t srv_slot_mask_lo;
+    uint32_t num_output_elements;
+    uint32_t threads_per_patch;
+    uint32_t argument_table_qwords;
+};
+
+struct wmt_air_compiled_bitcode
+{
+    uint64_t data;
+    uint64_t size;
+};
+
+struct wmt_air_initialize
+{
+    const void *bytecode;
+    size_t bytecode_size;
+    uint64_t *shader;
+    struct wmt_air_reflection *reflection;
+    uint64_t *error;
+    int32_t ret;
+};
+
+struct wmt_air_compile
+{
+    uint64_t shader;
+    struct wmt_air_argument *arguments;
+    const char *function_name;
+    uint64_t *bitcode;
+    uint64_t *error;
+    int32_t ret;
+};
+
+struct wmt_air_pipeline_compile
+{
+    uint64_t first_shader;
+    uint64_t second_shader;
+    struct wmt_air_argument *arguments;
+    const char *function_name;
+    uint64_t *bitcode;
+    uint64_t *error;
+    int32_t ret;
+};
+
+struct wmt_air_get_bitcode
+{
+    uint64_t bitcode;
+    struct wmt_air_compiled_bitcode *data_out;
+};
+
+struct wmt_air_get_error
+{
+    uint64_t error;
+    char *buffer;
+    size_t buffer_size;
+    size_t ret_size;
+};
+
+struct wmt_air_shader_argument
+{
+    uint32_t type;
+    uint32_t slot;
+    uint32_t flags;
+    uint32_t structure_ptr_offset;
+};
+
+struct wmt_air_get_arguments
+{
+    uint64_t shader;
+    struct wmt_air_shader_argument *constant_buffers;
+    struct wmt_air_shader_argument *arguments;
+};
+
+C_ASSERT( sizeof(struct wmt_air_initialize32) == 24 );
+C_ASSERT( sizeof(struct wmt_air_compile32) == 32 );
+C_ASSERT( sizeof(struct wmt_air_pipeline_compile32) == 40 );
+C_ASSERT( sizeof(struct wmt_air_get_bitcode32) == 16 );
+C_ASSERT( sizeof(struct wmt_air_get_error32) == 24 );
+C_ASSERT( sizeof(struct wmt_air_get_arguments32) == 16 );
+C_ASSERT( sizeof(struct wmt_air_reflection32) == 72 );
+C_ASSERT( sizeof(struct wmt_air_compiled_bitcode32) == 16 );
+C_ASSERT( sizeof(struct wmt_air_stream_output_argument32) == 36 );
+C_ASSERT( sizeof(struct wmt_air_common_argument32) == 16 );
+C_ASSERT( sizeof(struct wmt_air_pixel_argument32) == 20 );
+C_ASSERT( sizeof(struct wmt_air_input_layout_argument32) == 24 );
+C_ASSERT( sizeof(struct wmt_air_gs_passthrough_argument32) == 16 );
+C_ASSERT( sizeof(struct wmt_air_bool_argument32) == 12 );
+C_ASSERT( sizeof(struct wmt_air_u32_argument32) == 12 );
+C_ASSERT( sizeof(struct wmt_air_root_signature_argument32) == 16 );
+C_ASSERT( sizeof(struct wmt_air_argument) == 16 );
+C_ASSERT( sizeof(struct wmt_air_stream_output_argument) == 48 );
+C_ASSERT( sizeof(struct wmt_air_common_argument) == 24 );
+C_ASSERT( sizeof(struct wmt_air_pixel_argument) == 24 );
+C_ASSERT( sizeof(struct wmt_air_input_layout_argument) == 32 );
+C_ASSERT( sizeof(struct wmt_air_gs_passthrough_argument) == 24 );
+C_ASSERT( sizeof(struct wmt_air_bool_argument) == 16 );
+C_ASSERT( sizeof(struct wmt_air_u32_argument) == 16 );
+C_ASSERT( sizeof(struct wmt_air_root_signature_argument) == 32 );
+C_ASSERT( sizeof(struct wmt_air_stream_output_element) == 16 );
+C_ASSERT( sizeof(struct wmt_air_input_element) == 20 );
+C_ASSERT( sizeof(struct wmt_air_reflection) == 72 );
+C_ASSERT( sizeof(struct wmt_air_initialize) == 48 );
+C_ASSERT( sizeof(struct wmt_air_compile) == 48 );
+C_ASSERT( sizeof(struct wmt_air_pipeline_compile) == 56 );
+C_ASSERT( sizeof(struct wmt_air_get_bitcode) == 16 );
+C_ASSERT( sizeof(struct wmt_air_get_error) == 32 );
+C_ASSERT( sizeof(struct wmt_air_get_arguments) == 24 );
+C_ASSERT( sizeof(struct wmt_air_shader_argument) == 16 );
+C_ASSERT( sizeof(struct wmt_params32_texture_replace) == 96 );
+C_ASSERT( sizeof(struct wmt_params32_buffer_update) == 32 );
 
 struct wmt_buffer_info
 {
@@ -1683,12 +1996,18 @@ C_ASSERT( sizeof(struct wmt_air_compiled_bitcode32) == 16 );
 /* Pinned table indices used by the companion. */
 enum wmt_unix_call
 {
+    WMT_CALL_COPY_ALL_DEVICES = 4,
+    WMT_CALL_NEW_COMMAND_QUEUE = 9,
+    WMT_CALL_AUTORELEASE_POOL_INIT = 10,
+    WMT_CALL_NEW_SHARED_EVENT = 15,
     WMT_CALL_NSSTRING_GETCSTRING = 8,
     WMT_CALL_NEW_BUFFER = 18,
     WMT_CALL_NEW_SAMPLER = 19,
     WMT_CALL_NEW_DEPTH_STENCIL = 20,
     WMT_CALL_NEW_TEXTURE = 21,
     WMT_CALL_BUFFER_NEW_TEXTURE = 22,
+    WMT_CALL_NEW_TEXTURE_VIEW = 23,
+    WMT_CALL_NEW_LIBRARY = 25,
     WMT_CALL_LIBRARY_NEW_FUNCTION = 26,
     WMT_CALL_NEW_COMPUTE_PSO = 29,
     WMT_CALL_RENDER_ENCODER = 32,
@@ -1706,6 +2025,8 @@ enum wmt_unix_call
     WMT_CALL_NSSTRING_ALLOC_INIT = 61,
     WMT_CALL_LAYER_SET_PROPS = 70,
     WMT_CALL_LAYER_GET_PROPS = 71,
+    WMT_CALL_CREATE_METAL_VIEW = 72,
+    WMT_CALL_RELEASE_METAL_VIEW = 73,
     WMT_CALL_NULL_83 = 83,
     WMT_CALL_LOG_ENUMERATE = 91,
     WMT_CALL_DISPLAY_DESCRIPTION = 96,
@@ -1714,7 +2035,12 @@ enum wmt_unix_call
     WMT_CALL_QUERY_DISPLAY = 99,
     WMT_CALL_UPDATE_DISPLAY = 100,
     WMT_CALL_QUERY_DISPLAY_LAYER = 101,
+    WMT_CALL_SHARED_EVENT_SET_WIN32_EVENT = 104,
+    WMT_CALL_NEW_FENCE = 105,
+    WMT_CALL_NEW_EVENT = 106,
     WMT_CALL_BUFFER_UPDATE = 107,
+    WMT_CALL_SHARED_EVENT_LISTENER_CREATE = 108,
+    WMT_CALL_SHARED_EVENT_LISTENER_DESTROY = 110,
     WMT_CALL_NEW_BINARY_ARCHIVE = 112,
     WMT_CALL_SERIALIZE_BINARY_ARCHIVE = 113,
     WMT_CALL_DISPATCH_DATA = 114,
@@ -1724,9 +2050,14 @@ enum wmt_unix_call
     WMT_CALL_CACHE_WRITER_SET = 118,
     WMT_CALL_SET_CACHE_PATH = 119,
     WMT_CALL_NEW_SHARED_TEXTURE = 120,
+    WMT_CALL_BOOTSTRAP_LOOKUP = 122,
+    WMT_CALL_SHARED_EVENT_CREATE_PORT = 123,
+    WMT_CALL_NEW_SHARED_EVENT_WITH_PORT = 124,
+    WMT_CALL_NEW_TIMESTAMP_BUFFER = 127,
     WMT_CALL_RESOLVE_COUNTER_RANGE = 128,
     WMT_CALL_BLIT_WITH_SAMPLE_BUFFERS = 129,
     WMT_CALL_NEW_TILE_RENDER_PSO = 131,
+    WMT_CALL_NEW_RESIDENCY_SET = 132,
     WMT_CALL_RESIDENCY_ADD = 133,
     WMT_CALL_RESIDENCY_REMOVE = 134,
 };
@@ -1805,6 +2136,29 @@ struct wmt_params_query_display_layer
     struct wmt_edr_value edr_value;
 };
 
+struct wmt_params_texture_replace
+{
+    uint64_t texture;
+    struct wmt_origin origin;
+    struct wmt_size size;
+    uint64_t level;
+    uint64_t slice;
+    struct wmt_native_ptr data;
+    uint64_t bytes_per_row;
+    uint64_t bytes_per_image;
+};
+
+struct wmt_params_buffer_update
+{
+    uint64_t buffer;
+    uint64_t offset;
+    struct wmt_native_const_ptr data;
+    uint64_t length;
+};
+
+C_ASSERT( sizeof(struct wmt_params_texture_replace) == 96 );
+C_ASSERT( sizeof(struct wmt_params_buffer_update) == 32 );
+
 struct wmt_params_cache_init
 {
     struct wmt_native_const_ptr path;
@@ -1836,10 +2190,29 @@ NTSTATUS wmt_call_97( void *args );
 NTSTATUS wmt_call_98( void *args );
 NTSTATUS wmt_call_101( void *args );
 NTSTATUS wmt_call_114( void *args );
+NTSTATUS wmt_call_45( void *args );
+NTSTATUS wmt_call_107( void *args );
+NTSTATUS wmt_call_74( void *args );
+NTSTATUS wmt_call_75( void *args );
+NTSTATUS wmt_call_76( void *args );
+NTSTATUS wmt_call_77( void *args );
+NTSTATUS wmt_call_78( void *args );
+NTSTATUS wmt_call_79( void *args );
+NTSTATUS wmt_call_80( void *args );
+NTSTATUS wmt_call_81( void *args );
+NTSTATUS wmt_call_82( void *args );
+NTSTATUS wmt_call_84( void *args );
+NTSTATUS wmt_call_85( void *args );
+NTSTATUS wmt_call_88( void *args );
 NTSTATUS wmt_call_115( void *args );
 NTSTATUS wmt_call_117( void *args );
 NTSTATUS wmt_call_119( void *args );
 NTSTATUS wmt_rollback_18( void *args, NTSTATUS status );
+NTSTATUS wmt_rollback_cache_init( void *args, NTSTATUS status );
+NTSTATUS wmt_rollback_114( void *args, NTSTATUS status );
+NTSTATUS wmt_rollback_owned_output( unsigned int index, void *args, NTSTATUS status );
+void wmt_prepare_owned_output( unsigned int index, void *args );
+NTSTATUS wmt_drain_air_registries(void);
 
 NTSTATUS wmt_unsupported_8( void *args );
 NTSTATUS wmt_unsupported_22( void *args );
