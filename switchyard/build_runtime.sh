@@ -4137,6 +4137,9 @@ else
 fi
 
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  echo "normalizing the native ARM64 DXMT WoW64 companion runtime closure"
+  switchyard_normalize_native_arm64_dxmt_companion_rpaths \
+    "$WINE_INSTALL_PREFIX"
   echo "staging the pinned native ARM64 DXMT artifact closure"
   switchyard_stage_native_arm64_dxmt_artifact \
     "$DXMT_ARCHIVE" "$DXMT_SOURCE_DIR" "$ROOT_DIR" "$WINE_INSTALL_PREFIX"

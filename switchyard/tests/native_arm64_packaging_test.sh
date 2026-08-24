@@ -382,10 +382,23 @@ FIXTURE_IMMUTABLE_EXPORT const struct companion_descriptor_v6
 EOF
 /usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -nostdlib -O2 -Wall -Wextra -Werror \
   -mmacosx-version-min=26.5 -Wl,-install_name,@rpath/winemetal-wow64.so \
-  -Wl,-rpath,@loader_path/ -I"$TEST_ROOT" "$TEST_ROOT/companion.c" \
+  -Wl,-rpath,@loader_path/ -Wl,-rpath,"$TEST_ROOT/build-only-dependency" \
+  -I"$TEST_ROOT" "$TEST_ROOT/companion.c" \
   "$RUNTIME/lib/wine/aarch64-unix/ntdll.so" \
   -framework Foundation -framework Metal -lSystem -lobjc \
   -o "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so"
+COMPANION_RPATHS_BEFORE="$(/usr/bin/otool -l \
+  "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so" | /usr/bin/awk \
+  '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')"
+/usr/bin/grep -Fx "$TEST_ROOT/build-only-dependency" \
+  <<<"$COMPANION_RPATHS_BEFORE" >/dev/null ||
+  fail "companion RPATH regression fixture did not contain its build-only path"
+switchyard_normalize_native_arm64_dxmt_companion_rpaths "$RUNTIME"
+[ "$(/usr/bin/otool -l "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so" | \
+  /usr/bin/awk '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')" = \
+  '@loader_path/' ] || fail "companion RPATH normalization did not produce the exact closure"
+/usr/bin/codesign --force --sign - \
+  "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so"
 
 DEPENDENCY_FIELDS=(gstreamerRuntime vulkanRuntime fontRuntime tlsRuntime)
 DEPENDENCY_ROOTS=(

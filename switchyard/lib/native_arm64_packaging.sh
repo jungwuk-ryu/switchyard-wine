@@ -44,6 +44,80 @@ switchyard_native_arm64_require_packaging_contract() {
   }
 }
 
+switchyard_normalize_native_arm64_dxmt_companion_rpaths() {
+  local runtime_root companion canonical_root rpaths rpath loader_rpath_count
+
+  [ "$#" -eq 1 ] || {
+    echo "usage: switchyard_normalize_native_arm64_dxmt_companion_rpaths RUNTIME" >&2
+    return 2
+  }
+  runtime_root="$1"
+  case "$runtime_root" in
+    /*) ;;
+    *)
+      echo "Native ARM64 DXMT companion runtime root is not absolute." >&2
+      return 1
+      ;;
+  esac
+  [ -d "$runtime_root" ] && [ ! -L "$runtime_root" ] || {
+    echo "Native ARM64 DXMT companion runtime root is missing or unsafe." >&2
+    return 1
+  }
+  canonical_root="$(cd "$runtime_root" && pwd -P)" || return 1
+  [ "$canonical_root" = "$runtime_root" ] && [ "$canonical_root" != / ] || {
+    echo "Native ARM64 DXMT companion runtime root is not canonical and bounded." >&2
+    return 1
+  }
+  companion="$runtime_root/lib/wine/aarch64-unix/winemetal-wow64.so"
+  [ -f "$companion" ] && [ ! -L "$companion" ] && [ -x "$companion" ] || {
+    echo "Native ARM64 DXMT WoW64 companion is missing or unsafe." >&2
+    return 1
+  }
+
+  rpaths="$(/usr/bin/otool -l "$companion" | /usr/bin/awk '
+    /cmd LC_RPATH/ { found=1; next }
+    found && /^[[:space:]]*path / {
+      value=$0
+      sub(/^[[:space:]]*path /, "", value)
+      sub(/ \(offset [0-9]+\)$/, "", value)
+      print value
+      found=0
+    }
+  ')" || return 1
+  loader_rpath_count=0
+  while IFS= read -r rpath; do
+    [ -n "$rpath" ] || continue
+    if [ "$rpath" = '@loader_path/' ]; then
+      loader_rpath_count=$((loader_rpath_count + 1))
+    fi
+  done <<<"$rpaths"
+  [ "$loader_rpath_count" -eq 1 ] || {
+    echo "Native ARM64 DXMT WoW64 companion lacks one exact loader rpath." >&2
+    return 1
+  }
+
+  while IFS= read -r rpath; do
+    [ -n "$rpath" ] || continue
+    [ "$rpath" = '@loader_path/' ] ||
+      /usr/bin/install_name_tool -delete_rpath "$rpath" "$companion" || return 1
+  done <<<"$rpaths"
+  [ -f "$companion" ] && [ ! -L "$companion" ] && [ -x "$companion" ] || return 1
+  [ "$(/usr/bin/otool -l "$companion" | /usr/bin/awk '
+    /cmd LC_RPATH/ { found=1; next }
+    found && /^[[:space:]]*path / {
+      value=$0
+      sub(/^[[:space:]]*path /, "", value)
+      sub(/ \(offset [0-9]+\)$/, "", value)
+      print value
+      found=0
+    }
+  ')" = \
+    '@loader_path/' ] || {
+    echo "Native ARM64 DXMT WoW64 companion RPATH normalization did not close exactly." >&2
+    return 1
+  }
+}
+
 switchyard_stage_native_arm64_dxmt_artifact() {
   local archive source_root wine_source_root runtime_root schema_sha256
 
