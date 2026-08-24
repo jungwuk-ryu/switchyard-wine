@@ -165,6 +165,9 @@ extern void *ntdll_image_address_to_native( HMODULE module, const void *address,
 extern void *ntdll_image_address_to_client( HMODULE module, const void *address,
                                             SIZE_T size );
 
+/* Return the native backing address for a current-process WoW64 pointer. */
+extern UINT64 ntdll_get_wow64_native_address( const void *address );
+
 extern struct _KUSER_SHARED_DATA *user_shared_data;
 
 #ifdef _WIN64

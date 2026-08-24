@@ -170,6 +170,12 @@ def has_apple_arm64_guard(offset: int) -> bool:
 mprotect_exec_source, _, _ = extract_function("mprotect_exec")
 view_bounds_source, view_bounds_start, _ = extract_function("get_mprotect_view_bounds")
 next_view_source, _, _ = extract_function("next_mprotect_view")
+arm64ec_native_source, arm64ec_native_start, _ = extract_function(
+    "arm64ec_host_page_has_native_code"
+)
+provider_owner_source, provider_owner_start, _ = extract_function(
+    "mprotect_host_page_is_cpu_provider_owned"
+)
 can_retry_source, can_retry_start, _ = extract_function("can_retry_native_writable_exec")
 retry_source, retry_start, retry_end = extract_function("mprotect_range_run")
 translated_projection_source, _, _ = extract_function("get_mprotect_translated_host_page_vprot")
@@ -208,12 +214,22 @@ if not has_apple_arm64_guard(can_retry_start):
     fail("the private-valloc eligibility helper is not gated to Apple ARM64")
 if not has_apple_arm64_guard(view_bounds_start):
     fail("the physical view-bounds helper is not gated to Apple ARM64")
+if not has_apple_arm64_guard(arm64ec_native_start):
+    fail("the ARM64EC host-page ownership helper is not gated to Apple ARM64")
+if not has_apple_arm64_guard(provider_owner_start):
+    fail("the CPU-provider ownership helper is not gated to Apple ARM64")
 if not has_apple_arm64_guard(validate_domains_start):
     fail("the physical ownership-domain validator is not gated to Apple ARM64")
 
 retry_clean = clean_source[retry_start:retry_end]
-retry_gate = retry_clean.find("errno")
-if retry_gate < 0 or not has_apple_arm64_guard(retry_start + retry_gate):
+retry_calls = list(re.finditer(r"\bcan_retry_native_writable_exec\s*\(", retry_clean))
+fallback_calls = list(re.finditer(
+    r"\bmprotect\s*\(\s*base\s*,\s*size\s*,\s*unix_prot\s*&\s*~PROT_EXEC\s*\)",
+    retry_clean,
+))
+if (len(retry_calls) != 1 or len(fallback_calls) != 1 or
+        not has_apple_arm64_guard(retry_start + retry_calls[0].start()) or
+        not has_apple_arm64_guard(retry_start + fallback_calls[0].start())):
     fail("the writable-executable retry is not gated to Apple ARM64")
 
 # MAP_JIT is allowed in rationale comments, but not in executable source.
@@ -234,10 +250,30 @@ if (re.search(r"\bfind_view\s*\(", can_retry_clean) or
                       can_retry_clean)):
     fail("private-valloc retry does not use its exact owner and logical tail bound")
 
+arm64ec_native_clean = strip_comments_and_literals(arm64ec_native_source)
+if (not re.search(r"\bget_mprotect_view_bounds\s*\(", arm64ec_native_clean) or
+        not re.search(r"host_page_size\s*>\s*~\(ULONG_PTR\)0\s*-\s*host_start",
+                      arm64ec_native_clean) or
+        not re.search(r"arm64ec_view\s*->\s*size\s*/\s*sizeof\s*\(\s*\*map\s*\)",
+                      arm64ec_native_clean) or
+        re.search(r"\bend\s*\+\s*page_mask\b", arm64ec_native_clean)):
+    fail("ARM64EC host-page ownership is not bounded by validated view and bitmap limits")
+
+provider_owner_clean = strip_comments_and_literals(provider_owner_source)
+if (not re.search(r"view\s*->\s*protect\s*&\s*VPROT_CPU_PROVIDER_OWNED",
+                  provider_owner_clean) or
+        not re.search(r"view\s*->\s*protect\s*&\s*VPROT_ARM64EC",
+                      provider_owner_clean) or
+        not re.search(r"!\s*arm64ec_host_page_has_native_code\s*\(",
+                      provider_owner_clean)):
+    fail("CPU-provider ownership does not preserve explicit and ARM64X page policy")
+
 domain_clean = strip_comments_and_literals(domain_source)
 if (not re.search(r"\bis_shadow_translated_vprot\s*\(\s*view\s*->\s*protect\s*\)",
                   domain_clean) or
-        not re.search(r"\bview\s*->\s*protect\s*&\s*VPROT_CPU_PROVIDER_OWNED\b",
+        len(re.findall(r"\bmprotect_host_page_is_cpu_provider_owned\s*\(",
+                       domain_clean)) != 2 or
+        not re.search(r"next_cpu_provider_owned\s*==\s*cpu_provider_owned",
                       domain_clean)):
     fail("physical domains do not retain their translated/provider ownership policy")
 
@@ -656,10 +692,11 @@ typedef uintptr_t ULONG_PTR;
 #define PROT_WRITE 0x02
 #define PROT_EXEC  0x04
 #define PROT_OTHER 0x08
+#define TRACE(...) ((void)0)
 
 struct file_view
 {
-    int unused;
+    unsigned int protect;
 };
 
 static int initial_result;
@@ -818,6 +855,115 @@ int main(void)
 '''
 
 
+arm64ec_ownership_model = r'''
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef int BOOL;
+typedef uintptr_t ULONG_PTR;
+typedef size_t SIZE_T;
+typedef uint64_t UINT64;
+
+#define FALSE 0
+#define TRUE 1
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define VPROT_ARM64EC 0x0100
+#define VPROT_WOW64_TRANSLATED 0x1000
+#define VPROT_AMD64_LOW_TRANSLATED 0x2000
+#define VPROT_AMD64_IDENTITY 0x4000
+#define VPROT_SHADOW_TRANSLATED \
+    (VPROT_WOW64_TRANSLATED | VPROT_AMD64_LOW_TRANSLATED)
+#define VPROT_CPU_PROVIDER_OWNED \
+    (VPROT_SHADOW_TRANSLATED | VPROT_AMD64_IDENTITY)
+
+static const unsigned int page_shift = 12;
+static const ULONG_PTR page_mask = 4095;
+static const size_t host_page_size = 16384;
+static const ULONG_PTR host_page_mask = 16383;
+
+struct file_view
+{
+    void *base;
+    size_t size;
+    unsigned int protect;
+};
+
+static UINT64 bitmap[8];
+static struct file_view bitmap_view;
+static struct file_view *arm64ec_view;
+''' + view_bounds_source + arm64ec_native_source + provider_owner_source + r'''
+
+#define CHECK(expression) do { \
+    if (!(expression)) { \
+        fprintf(stderr, "ARM64EC ownership check failed at line %d: %s\n", \
+                __LINE__, #expression); \
+        return 1; \
+    } \
+} while (0)
+
+int main(void)
+{
+    const ULONG_PTR base = 0x100000;
+    const ULONG_PTR first_page = base >> page_shift;
+    const ULONG_PTR second_host_page = first_page + host_page_size / (page_mask + 1);
+    struct file_view view = {(void *)base, 2 * host_page_size, VPROT_ARM64EC};
+
+    memset(bitmap, 0, sizeof(bitmap));
+    bitmap_view.base = bitmap;
+    bitmap_view.size = sizeof(bitmap);
+    bitmap_view.protect = 0;
+    arm64ec_view = &bitmap_view;
+
+    CHECK(!arm64ec_host_page_has_native_code(&view, (void *)base));
+    CHECK(mprotect_host_page_is_cpu_provider_owned(&view, (void *)base));
+
+    bitmap[first_page / 64] |= (UINT64)1 << ((first_page + 2) & 63);
+    CHECK(arm64ec_host_page_has_native_code(&view, (void *)base));
+    CHECK(!mprotect_host_page_is_cpu_provider_owned(&view, (void *)base));
+    bitmap[first_page / 64] = 0;
+
+    bitmap[second_host_page / 64] |= (UINT64)1 << (second_host_page & 63);
+    CHECK(!arm64ec_host_page_has_native_code(&view, (void *)base));
+    CHECK(arm64ec_host_page_has_native_code(&view,
+                                             (void *)(base + host_page_size)));
+    CHECK(mprotect_host_page_is_cpu_provider_owned(&view, (void *)base));
+    CHECK(!mprotect_host_page_is_cpu_provider_owned(
+        &view, (void *)(base + host_page_size)));
+
+    arm64ec_view = NULL;
+    CHECK(arm64ec_host_page_has_native_code(&view, (void *)base));
+    CHECK(!mprotect_host_page_is_cpu_provider_owned(&view, (void *)base));
+    arm64ec_view = &bitmap_view;
+
+    bitmap_view.size = (first_page / 64) * sizeof(*bitmap);
+    CHECK(arm64ec_host_page_has_native_code(&view, (void *)base));
+    CHECK(!mprotect_host_page_is_cpu_provider_owned(&view, (void *)base));
+    bitmap_view.size = sizeof(bitmap);
+
+    view.base = (void *)(base + page_mask + 1);
+    CHECK(arm64ec_host_page_has_native_code(&view, view.base));
+    view.base = (void *)base;
+    CHECK(arm64ec_host_page_has_native_code(
+        &view, (void *)(base + 2 * host_page_size)));
+
+    view.base = (void *)(~(ULONG_PTR)host_page_mask);
+    view.size = host_page_size;
+    CHECK(arm64ec_host_page_has_native_code(&view, view.base));
+
+    view.base = (void *)base;
+    view.size = 2 * host_page_size;
+    view.protect = VPROT_AMD64_IDENTITY;
+    CHECK(mprotect_host_page_is_cpu_provider_owned(&view, (void *)base));
+    view.protect = 0;
+    CHECK(!mprotect_host_page_is_cpu_provider_owned(&view, (void *)base));
+    return 0;
+}
+'''
+
+
 domain_model = r'''
 #include <assert.h>
 #include <errno.h>
@@ -831,6 +977,7 @@ typedef unsigned char BYTE;
 typedef int BOOL;
 typedef uintptr_t ULONG_PTR;
 typedef size_t SIZE_T;
+typedef uint64_t UINT64;
 
 #define FALSE 0
 #define TRUE 1
@@ -847,6 +994,7 @@ typedef size_t SIZE_T;
 #define VPROT_COMMITTED  0x20
 #define VPROT_WRITEWATCH 0x40
 #define VPROT_SYSTEM     0x0200
+#define VPROT_ARM64EC    0x0800
 #define VPROT_WOW64_TRANSLATED 0x1000
 #define VPROT_AMD64_LOW_TRANSLATED 0x2000
 #define VPROT_AMD64_IDENTITY 0x4000
@@ -902,6 +1050,7 @@ static struct protection_call calls[8];
 static size_t call_count;
 static size_t lookup_calls;
 static BOOL delegated;
+static BOOL arm64ec_provider_owned[4];
 
 static struct wine_rb_entry *rb_next(const struct wine_rb_entry *entry)
 {
@@ -921,6 +1070,22 @@ static BOOL is_shadow_translated_vprot(unsigned int vprot)
 static BOOL wow64_memory_logical_write_fault_is_delegated(void)
 {
     return delegated;
+}
+
+static BOOL mprotect_host_page_is_cpu_provider_owned(const struct file_view *view,
+                                                      const void *address)
+{
+    ULONG_PTR host_start = (ULONG_PTR)ROUND_ADDR(address, host_page_mask);
+    ULONG_PTR probe_start = (ULONG_PTR)probe_memory;
+    size_t index;
+
+    if (!view) return FALSE;
+    if (view->protect & VPROT_CPU_PROVIDER_OWNED) return TRUE;
+    if (!(view->protect & VPROT_ARM64EC) || host_start < probe_start) return FALSE;
+    index = (host_start - probe_start) / host_page_size;
+    return index < sizeof(arm64ec_provider_owned) /
+                   sizeof(arm64ec_provider_owned[0]) &&
+           arm64ec_provider_owned[index];
 }
 
 static BYTE get_page_vprot(const void *address)
@@ -1021,6 +1186,7 @@ static void reset_model(void)
     memset(page_vprot, 0, sizeof(page_vprot));
     memset(views, 0, sizeof(views));
     memset(calls, 0, sizeof(calls));
+    memset(arm64ec_provider_owned, 0, sizeof(arm64ec_provider_owned));
     view_count = 0;
     call_count = 0;
     lookup_calls = 0;
@@ -1072,6 +1238,39 @@ int main(void)
     CHECK(calls[0].base == probe_memory && calls[0].size == host_page_size);
     CHECK(calls[1].base == probe_memory + host_page_size &&
           calls[1].size == host_page_size);
+
+    reset_model();
+    views[0].base = probe_memory;
+    views[0].size = 2 * host_page_size;
+    views[0].protect = VPROT_ARM64EC;
+    set_views(1);
+    for (index = 0; index < 8; index++)
+        page_vprot[index] = VPROT_COMMITTED | VPROT_READ | VPROT_EXEC;
+    arm64ec_provider_owned[0] = TRUE;
+    arm64ec_provider_owned[1] = FALSE;
+    CHECK(!mprotect_range(probe_memory, 2 * host_page_size, 0, 0));
+    CHECK(call_count == 2);
+    CHECK(calls[0].base == probe_memory && calls[0].size == host_page_size);
+    CHECK(calls[0].cpu_provider_owned &&
+          !(calls[0].effective_prot & PROT_EXEC));
+    CHECK(calls[1].base == probe_memory + host_page_size &&
+          calls[1].size == host_page_size);
+    CHECK(!calls[1].cpu_provider_owned &&
+          (calls[1].effective_prot & PROT_EXEC));
+
+    reset_model();
+    views[0].base = probe_memory;
+    views[0].size = 2 * host_page_size;
+    views[0].protect = VPROT_ARM64EC;
+    set_views(1);
+    for (index = 0; index < 8; index++)
+        page_vprot[index] = VPROT_COMMITTED | VPROT_READ | VPROT_EXEC;
+    arm64ec_provider_owned[0] = TRUE;
+    arm64ec_provider_owned[1] = TRUE;
+    CHECK(!mprotect_range(probe_memory, 2 * host_page_size, 0, 0));
+    CHECK(call_count == 1 && calls[0].size == 2 * host_page_size);
+    CHECK(calls[0].cpu_provider_owned &&
+          !(calls[0].effective_prot & PROT_EXEC));
 
     reset_model();
     views[0].base = probe_memory + host_page_size;
@@ -1584,6 +1783,7 @@ int main(void)
 
 compile_and_run("private-valloc-eligibility-model", eligibility_model)
 compile_and_run("writable-exec-retry-model", retry_model)
+compile_and_run("arm64ec-host-page-ownership-model", arm64ec_ownership_model)
 compile_and_run("physical-ownership-domain-model", domain_model)
 compile_and_run("uniform-protection-rollback-model", uniform_rollback_model)
 compile_and_run("stack-growth-atomicity-model", stack_growth_model)

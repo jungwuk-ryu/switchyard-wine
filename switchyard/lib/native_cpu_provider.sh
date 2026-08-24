@@ -9,11 +9,13 @@ SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit.so"
 SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY="lib/wine/aarch64-windows/xtajit.dll"
 SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit64.so"
 SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY="lib/wine/aarch64-windows/xtajit64.dll"
+SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION="6"
+SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY="switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464"
 SWITCHYARD_NATIVE_UNICORN_ROOT="lib/switchyard-unicorn"
 SWITCHYARD_NATIVE_UNICORN_LIBRARY="lib/switchyard-unicorn/lib/libunicorn.2.dylib"
 SWITCHYARD_NATIVE_UNICORN_RPATH='@loader_path/../../switchyard-unicorn/lib'
 SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH="lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch"
-SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256="68f7df756eec731ec2143d63b8e454b7d1d538ccee8fa2205563fb26c3b995d6"
+SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256="89e4beeeccacc799789659ab826589ea1d87a358210d0412e81527166117bd68"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_CONTRACT_VERSION="2"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_HANDLE_ENCODING="generation-tagged-v1"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_EXTERNAL_SOURCE_VERSION="2"
@@ -139,7 +141,9 @@ switchyard_validate_native_cpu_provider_files() {
     "$SWITCHYARD_NATIVE_UNICORN_LIBRARY" \
     "$SWITCHYARD_NATIVE_UNICORN_RPATH" \
     "$SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH" \
-    "$SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256" <<'PY'
+    "$SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256" \
+    "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" \
+    "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" <<'PY'
 import hashlib
 import json
 import mmap
@@ -168,6 +172,8 @@ import tempfile
     unicorn_rpath,
     unicorn_source_patch,
     unicorn_source_patch_sha256,
+    xtajit64_abi_version,
+    xtajit64_abi_identity,
 ) = sys.argv[1:]
 
 MAX_MANIFEST = 1024 * 1024
@@ -481,6 +487,28 @@ for component, (guest, unix_relative, pe_relative) in zip(components, expected_c
         if record["digest"] != expected_digest:
             fail("CPU-provider component digest mismatch: " + relative)
         binary_records[relative] = record
+
+try:
+    expected_x64_abi = (
+        "switchyard-xtajit64-provider-abi-v"
+        + str(int(xtajit64_abi_version))
+        + "-process-init-80-begin-464"
+    )
+    x64_abi_bytes = xtajit64_abi_identity.encode("ascii")
+except (UnicodeError, ValueError) as error:
+    fail(f"invalid configured x64 provider ABI identity: {error}")
+if xtajit64_abi_identity != expected_x64_abi or not (32 <= len(x64_abi_bytes) <= 128):
+    fail("configured x64 provider ABI identity is inconsistent")
+for relative in (xtajit64_unix, xtajit64_pe):
+    record = binary_records[relative]
+    try:
+        with open(record["snapshot"], "rb") as stream:
+            with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as image:
+                found = image.find(x64_abi_bytes) >= 0
+    except OSError as error:
+        fail(f"cannot inspect x64 provider ABI identity in {relative}: {error}")
+    if not found:
+        fail("x64 provider ABI identity is absent from " + relative)
 
 if provider.get("library") != unicorn_library:
     fail("CPU-provider Unicorn library path is not canonical")

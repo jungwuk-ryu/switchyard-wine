@@ -2,11 +2,11 @@
  * Bounded DXMT D3D11 acceptance client.
  *
  * The client validates the loaded provider image, clears a swap-chain render
- * target, exercises a multi-page dynamic WRITE_DISCARD buffer, reads the known
- * pixels back through a staging texture, and presents the frame.  The shell
- * harness additionally proves that the native arm64 winemetal Unix library
- * and the selected native CPU-provider Unix library were loaded and that DXMT
- * emitted its device log.
+ * target, exercises multi-page dynamic WRITE_DISCARD buffer and texture
+ * mappings, reads the known pixels back through a staging texture, and
+ * presents the frame.  The shell harness additionally proves that the native
+ * arm64 winemetal Unix library and the selected native CPU-provider Unix
+ * library were loaded and that DXMT emitted its device log.
  */
 
 #define COBJMACROS
@@ -26,6 +26,9 @@
 #define TEST_WIDTH 64
 #define TEST_HEIGHT 64
 #define DYNAMIC_BUFFER_SIZE (257 * 1024 + 64)
+#define DYNAMIC_TEXTURE_WIDTH 257
+#define DYNAMIC_TEXTURE_HEIGHT 17
+#define DYNAMIC_TEXTURE_ROW_SIZE (DYNAMIC_TEXTURE_WIDTH * 4)
 #define INSPECTION_NONCE_LENGTH 36
 
 static int inspection_nonce_is_valid(const char *nonce)
@@ -241,6 +244,7 @@ int main(int argc, char **argv)
     ID3D11DeviceContext *context = NULL;
     ID3D11Texture2D *back_buffer = NULL;
     ID3D11Texture2D *readback = NULL;
+    ID3D11Texture2D *dynamic_texture = NULL;
     ID3D11Buffer *dynamic_buffer = NULL;
     IDXGISwapChain *swapchain = NULL;
     ID3D11Device *device = NULL;
@@ -360,6 +364,53 @@ int main(int argc, char **argv)
     printf("DXMT D3D11 dynamic WRITE_DISCARD/unmap/release passed for %u bytes.\n",
            (unsigned int)DYNAMIC_BUFFER_SIZE);
 
+    memset(&texture_desc, 0, sizeof(texture_desc));
+    texture_desc.Width = DYNAMIC_TEXTURE_WIDTH;
+    texture_desc.Height = DYNAMIC_TEXTURE_HEIGHT;
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Usage = D3D11_USAGE_DYNAMIC;
+    texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    result = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL, &dynamic_texture);
+    if (FAILED(result))
+    {
+        fprintf(stderr, "Creating the D3D11 dynamic texture failed: %#lx.\n",
+                (unsigned long)result);
+        goto done;
+    }
+    if (!dynamic_texture)
+    {
+        fprintf(stderr, "Creating the D3D11 dynamic texture returned no interface.\n");
+        goto done;
+    }
+    memset(&mapped, 0, sizeof(mapped));
+    result = ID3D11DeviceContext_Map(context, (ID3D11Resource *)dynamic_texture, 0,
+                                    D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(result))
+    {
+        fprintf(stderr, "Mapping the D3D11 dynamic texture for WRITE_DISCARD failed: %#lx.\n",
+                (unsigned long)result);
+        goto done;
+    }
+    if (!mapped.pData || mapped.RowPitch < DYNAMIC_TEXTURE_ROW_SIZE)
+    {
+        fprintf(stderr, "Mapping the D3D11 dynamic texture returned invalid bounds.\n");
+        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)dynamic_texture, 0);
+        goto done;
+    }
+    for (sample = 0; sample < DYNAMIC_TEXTURE_HEIGHT; ++sample)
+        for (offset = 0; offset < DYNAMIC_TEXTURE_ROW_SIZE; ++offset)
+            ((BYTE *)mapped.pData)[sample * mapped.RowPitch + offset] =
+                (BYTE)((sample * 29 + offset * 17 + 3) & 0xff);
+    ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)dynamic_texture, 0);
+    ID3D11Texture2D_Release(dynamic_texture);
+    dynamic_texture = NULL;
+    printf("DXMT D3D11 dynamic texture WRITE_DISCARD/unmap/release passed for %ux%u pixels.\n",
+           (unsigned int)DYNAMIC_TEXTURE_WIDTH, (unsigned int)DYNAMIC_TEXTURE_HEIGHT);
+
     result = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D,
                                       (void **)&back_buffer);
     if (FAILED(result) || !back_buffer ||
@@ -459,6 +510,7 @@ int main(int argc, char **argv)
 
 done:
     if (dynamic_buffer) ID3D11Buffer_Release(dynamic_buffer);
+    if (dynamic_texture) ID3D11Texture2D_Release(dynamic_texture);
     if (readback) ID3D11Texture2D_Release(readback);
     if (render_target) ID3D11RenderTargetView_Release(render_target);
     if (back_buffer) ID3D11Texture2D_Release(back_buffer);

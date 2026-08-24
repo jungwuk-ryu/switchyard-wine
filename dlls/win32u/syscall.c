@@ -32,10 +32,42 @@
 #include "ntuser.h"
 #include "d3dkmt_private.h"
 #include "wine/asm.h"
+#include "wine/low_va.h"
 #include "wine/unixlib.h"
 #include "win32syscalls.h"
 
 ULONG_PTR zero_bits = 0;
+
+#if defined(__aarch64__) && defined(__APPLE__) && defined(_WIN64)
+static ULONG_PTR client_shadow_lowest;
+static ULONG_PTR client_shadow_limit;
+#endif
+
+NTSTATUS alloc_client_memory( void **address, SIZE_T *size, ULONG type, ULONG protect )
+{
+#if defined(__aarch64__) && defined(__APPLE__) && defined(_WIN64)
+    if (client_shadow_limit)
+    {
+        MEM_ADDRESS_REQUIREMENTS requirements =
+        {
+            (void *)(WINE_LOW_VA_SHADOW_BASE + client_shadow_lowest),
+            (void *)(WINE_LOW_VA_SHADOW_BASE + client_shadow_limit - 1),
+            0
+        };
+        MEM_EXTENDED_PARAMETER parameters[2] = {0};
+
+        /* Native win32u keeps the backing address, while 32-bit clients see
+         * its preserved low bits.  The private tag also publishes the mapping
+         * to the WoW64 CPU provider before the pointer can escape. */
+        parameters[0].Type = MemExtendedParameterAddressRequirements;
+        parameters[0].Pointer = &requirements;
+        parameters[1].Type = WINE_MEM_EXTENDED_PARAMETER_WOW64_TRANSLATED;
+        return NtAllocateVirtualMemoryEx( NtCurrentProcess(), address, size, type, protect,
+                                          parameters, ARRAY_SIZE(parameters) );
+    }
+#endif
+    return NtAllocateVirtualMemory( NtCurrentProcess(), address, zero_bits, size, type, protect );
+}
 
 #if defined(__aarch64__) && defined(__APPLE__)
 
@@ -177,9 +209,36 @@ NTSTATUS __wine_unix_lib_init(void)
     if (NtCurrentTeb()->WowTebOffset)
     {
         SYSTEM_BASIC_INFORMATION info;
+        NTSTATUS status;
 
-        NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
+        if ((status = NtQuerySystemInformation( SystemEmulationBasicInformation, &info,
+                                                sizeof(info), NULL )))
+            return status;
         zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+
+#if defined(__aarch64__) && defined(__APPLE__)
+        {
+            ULONG_PTR teb32 = (ULONG_PTR)NtCurrentTeb() + NtCurrentTeb()->WowTebOffset;
+
+            if (teb32 >= WINE_LOW_VA_SHADOW_BASE &&
+                teb32 - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE)
+            {
+                ULONG_PTR lowest = (ULONG_PTR)info.LowestUserAddress;
+                ULONG_PTR highest = (ULONG_PTR)info.HighestUserAddress;
+                ULONG_PTR granularity = info.AllocationGranularity;
+
+                if (!granularity || (granularity & (granularity - 1)) ||
+                    lowest < 0x10000 || lowest >= WINE_LOW_VA_SHADOW_SIZE ||
+                    highest < lowest || highest >= WINE_LOW_VA_SHADOW_SIZE ||
+                    (lowest & (granularity - 1)) ||
+                    ((highest + 1) & (granularity - 1)))
+                    return STATUS_INVALID_ADDRESS;
+
+                client_shadow_lowest = lowest;
+                client_shadow_limit = highest + 1;
+            }
+        }
+#endif
     }
 #endif
     KeAddSystemServiceTable( syscalls, NULL, ARRAY_SIZE(syscalls), arguments, 1 );

@@ -583,6 +583,213 @@ static void test_concurrent_provider( void (WINAPI *begin_simulation)(void) )
     }
 }
 
+struct x64_memory_fault_args
+{
+    void (WINAPI *begin_simulation)(void);
+    void *entry;
+};
+
+static LONG x64_memory_fault_handler_calls;
+static void *x64_memory_fault_instruction;
+static void *x64_memory_fault_resume;
+static void *x64_memory_fault_address;
+static ULONG_PTR x64_memory_fault_access;
+static const char *x64_memory_fault_name;
+
+static LONG WINAPI x64_memory_fault_handler( EXCEPTION_POINTERS *ptrs )
+{
+    EXCEPTION_RECORD *rec = ptrs->ExceptionRecord;
+    CONTEXT *context = ptrs->ContextRecord;
+
+    if (rec->ExceptionCode != STATUS_ACCESS_VIOLATION ||
+        rec->ExceptionAddress != x64_memory_fault_instruction)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    InterlockedIncrement( &x64_memory_fault_handler_calls );
+    ok( rec->NumberParameters == 2, "%s x64 memory fault parameter count %lu\n",
+        x64_memory_fault_name, rec->NumberParameters );
+    ok( rec->ExceptionInformation[0] == x64_memory_fault_access,
+        "%s x64 memory fault access %#Ix, expected %#Ix\n",
+        x64_memory_fault_name, rec->ExceptionInformation[0],
+        x64_memory_fault_access );
+    ok( rec->ExceptionInformation[1] == (ULONG_PTR)x64_memory_fault_address,
+        "%s x64 memory fault address %p, expected %p\n",
+        x64_memory_fault_name, (void *)rec->ExceptionInformation[1],
+        x64_memory_fault_address );
+    ok( context->Rip == (ULONG_PTR)x64_memory_fault_instruction,
+        "%s x64 memory fault RIP %p, expected %p\n",
+        x64_memory_fault_name, (void *)(ULONG_PTR)context->Rip,
+        x64_memory_fault_instruction );
+    context->Rip = (ULONG_PTR)x64_memory_fault_resume;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static DWORD CALLBACK x64_memory_fault_thread( void *arg )
+{
+    struct x64_memory_fault_args *args = arg;
+    CONTEXT *context;
+
+    context = &NtCurrentTeb()->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
+    context->Rsp = (ULONG_PTR)&context - 0x800;
+    context->Rip = (ULONG_PTR)args->entry;
+    NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
+    args->begin_simulation();
+    return 0xe301;
+}
+
+struct x64_memory_fault_case
+{
+    const char *name;
+    ULONG_PTR access;
+};
+
+static void run_x64_memory_fault_case( void (WINAPI *begin_simulation)(void),
+                                       const struct x64_memory_fault_case *fault_case,
+                                       unsigned int index )
+{
+    BYTE code[64] = {0};
+    struct x64_memory_fault_args args = { begin_simulation };
+    void *address = NULL, *fault = NULL, *target, *handler = NULL;
+    SIZE_T offset = 0, instruction_offset, branch_offset, resume_offset, exit_offset;
+    DWORD old_protect, exit_code = 0, ret;
+    DWORD failure_code = 0xe310 + index, success_code = 0x6600 + index;
+    HANDLE thread = NULL;
+
+    target = GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "RtlExitUserThread" );
+    ok( !!target, "%s RtlExitUserThread is missing\n", fault_case->name );
+    if (!target) return;
+    address = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE );
+    ok( !!address, "%s x64 memory fault code allocation failed, error %lu\n",
+        fault_case->name, GetLastError() );
+    if (!address) goto done;
+    fault = VirtualAlloc( NULL, 0x1000, MEM_RESERVE, PAGE_NOACCESS );
+    ok( !!fault, "%s x64 memory fault reserve allocation failed, error %lu\n",
+        fault_case->name, GetLastError() );
+    if (!fault) goto done;
+
+    code[offset++] = 0x48;
+    code[offset++] = 0xb8; /* movabs $fault,%rax */
+    memcpy( code + offset, &fault, sizeof(fault) );
+    offset += sizeof(fault);
+    instruction_offset = offset;
+    switch (fault_case->access)
+    {
+    case EXCEPTION_READ_FAULT:
+        code[offset++] = 0x8b;
+        code[offset++] = 0x08; /* movl (%rax),%ecx */
+        break;
+    case EXCEPTION_WRITE_FAULT:
+        code[offset++] = 0xc7;
+        code[offset++] = 0x00;
+        code[offset++] = 0x78;
+        code[offset++] = 0x56;
+        code[offset++] = 0x34;
+        code[offset++] = 0x12; /* movl $0x12345678,(%rax) */
+        break;
+    case EXCEPTION_EXECUTE_FAULT:
+        code[offset++] = 0xff;
+        code[offset++] = 0xe0; /* jmp *%rax */
+        break;
+    default:
+        ok( 0, "unsupported x64 memory fault access %#Ix\n", fault_case->access );
+        goto done;
+    }
+    code[offset++] = 0xb9; /* mov $failure_code,%ecx */
+    memcpy( code + offset, &failure_code, sizeof(failure_code) );
+    offset += sizeof(failure_code);
+    code[offset++] = 0xeb; /* jmp exit */
+    branch_offset = offset++;
+    resume_offset = offset;
+    code[offset++] = 0xb9; /* mov $success_code,%ecx */
+    memcpy( code + offset, &success_code, sizeof(success_code) );
+    offset += sizeof(success_code);
+    exit_offset = offset;
+    code[branch_offset] = exit_offset - branch_offset - 1;
+    code[offset++] = 0x48;
+    code[offset++] = 0xb8; /* movabs $RtlExitUserThread,%rax */
+    memcpy( code + offset, &target, sizeof(target) );
+    offset += sizeof(target);
+    code[offset++] = 0xff;
+    code[offset++] = 0xd0; /* call *%rax */
+    code[offset++] = 0xc3;
+    ok( offset <= sizeof(code), "%s x64 memory fault code overflowed\n",
+        fault_case->name );
+    if (offset > sizeof(code)) goto done;
+
+    memcpy( address, code, offset );
+    ret = VirtualProtect( address, 0x1000, PAGE_EXECUTE_READ, &old_protect );
+    ok( ret, "%s x64 memory fault code protect failed, error %lu\n",
+        fault_case->name, GetLastError() );
+    if (!ret) goto done;
+
+    x64_memory_fault_handler_calls = 0;
+    x64_memory_fault_name = fault_case->name;
+    x64_memory_fault_access = fault_case->access;
+    x64_memory_fault_address = fault;
+    x64_memory_fault_instruction = fault_case->access == EXCEPTION_EXECUTE_FAULT ?
+                                   fault : (BYTE *)address + instruction_offset;
+    x64_memory_fault_resume = (BYTE *)address + resume_offset;
+    handler = AddVectoredExceptionHandler( TRUE, x64_memory_fault_handler );
+    ok( !!handler, "%s x64 memory fault handler registration failed\n",
+        fault_case->name );
+    if (!handler) goto done;
+
+    args.entry = address;
+    thread = CreateThread( NULL, 0, x64_memory_fault_thread, &args, 0, NULL );
+    ok( !!thread, "%s x64 memory fault thread creation failed, error %lu\n",
+        fault_case->name, GetLastError() );
+    if (!thread) goto done;
+    ret = WaitForSingleObject( thread, 10000 );
+    ok( ret == WAIT_OBJECT_0, "%s x64 memory fault wait returned %#lx\n",
+        fault_case->name, ret );
+    if (ret == WAIT_OBJECT_0)
+    {
+        ret = GetExitCodeThread( thread, &exit_code );
+        ok( ret, "%s x64 memory fault GetExitCodeThread failed, error %lu\n",
+            fault_case->name, GetLastError() );
+        if (ret)
+            ok( exit_code == success_code,
+                "%s x64 memory fault exit code %#lx, expected %#lx\n",
+                fault_case->name, exit_code, success_code );
+        ok( x64_memory_fault_handler_calls == 1,
+            "%s x64 memory fault handler called %ld times\n",
+            fault_case->name, x64_memory_fault_handler_calls );
+        trace( "XTAJIT64_MEMORY_FAULT_SEH access=%s/%#Ix address=%p exit=%#lx handlers=%ld\n",
+               fault_case->name, fault_case->access, fault, exit_code,
+               x64_memory_fault_handler_calls );
+    }
+    else
+    {
+        TerminateThread( thread, STATUS_TIMEOUT );
+        WaitForSingleObject( thread, 10000 );
+    }
+
+done:
+    if (thread) CloseHandle( thread );
+    if (handler) RemoveVectoredExceptionHandler( handler );
+    x64_memory_fault_name = NULL;
+    x64_memory_fault_access = 0;
+    x64_memory_fault_address = NULL;
+    x64_memory_fault_instruction = NULL;
+    x64_memory_fault_resume = NULL;
+    if (fault) VirtualFree( fault, 0, MEM_RELEASE );
+    if (address) VirtualFree( address, 0, MEM_RELEASE );
+}
+
+static void test_x64_memory_fault_exception( void (WINAPI *begin_simulation)(void) )
+{
+    static const struct x64_memory_fault_case cases[] =
+    {
+        { "read", EXCEPTION_READ_FAULT },
+        { "write", EXCEPTION_WRITE_FAULT },
+        { "execute", EXCEPTION_EXECUTE_FAULT },
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(cases); ++i)
+        run_x64_memory_fault_case( begin_simulation, &cases[i], i );
+}
+
 static void test_reset_to_consistent_state( HMODULE module )
 {
     void (WINAPI *reset_to_consistent_state)(EXCEPTION_RECORD *, CONTEXT *, ARM64_NT_CONTEXT *);
@@ -717,6 +924,7 @@ static void test_provider_contract(void)
     }
     CloseHandle( thread );
 
+    test_x64_memory_fault_exception( begin_simulation );
     test_concurrent_provider( begin_simulation );
     /* This enables process-wide executable-write tracking; keep it last so
      * every earlier concurrency test has completed before policy changes. */

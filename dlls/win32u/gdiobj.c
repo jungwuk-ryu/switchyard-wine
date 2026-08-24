@@ -565,8 +565,8 @@ static void init_gdi_shared(void)
 {
     SIZE_T size = sizeof(*gdi_shared);
 
-    if (NtAllocateVirtualMemory( GetCurrentProcess(), (void **)&gdi_shared, zero_bits,
-                                 &size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE ))
+    if (alloc_client_memory( (void **)&gdi_shared, &size,
+                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE ))
         return;
     next_unused = gdi_shared->Handles + FIRST_GDI_HANDLE;
 

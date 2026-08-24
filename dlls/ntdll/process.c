@@ -513,7 +513,7 @@ NTSTATUS WINAPI RtlCreateUserProcess( UNICODE_STRING *path, ULONG attributes,
                                       RTL_USER_PROCESS_INFORMATION *info )
 {
     OBJECT_ATTRIBUTES process_attr, thread_attr;
-    PS_CREATE_INFO create_info;
+    PS_CREATE_INFO create_info = { sizeof(create_info) };
     ULONG_PTR buffer[offsetof( PS_ATTRIBUTE_LIST, Attributes[6] ) / sizeof(ULONG_PTR)];
     PS_ATTRIBUTE_LIST *attr = (PS_ATTRIBUTE_LIST *)buffer;
     UINT pos = 0;

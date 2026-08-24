@@ -36,6 +36,21 @@ if [[ -n ${XTAJIT_EXPECTED_SOURCE_DIR:-} ]]; then
         exit 2
     fi
 fi
+if [[ -n ${XTAJIT_UNICORN_ROOT:-} ]]; then
+    if [[ $XTAJIT_UNICORN_ROOT != /* || ! -d $XTAJIT_UNICORN_ROOT ||
+          -L $XTAJIT_UNICORN_ROOT ]]; then
+        echo "XTAJIT_UNICORN_ROOT must name an absolute, real directory" >&2
+        exit 2
+    fi
+    unicorn_root=$(cd "$XTAJIT_UNICORN_ROOT" && pwd -P)
+    if [[ ! -f $unicorn_root/include/unicorn/unicorn.h ||
+          ! -f $unicorn_root/lib/libunicorn.2.dylib ]]; then
+        echo "XTAJIT_UNICORN_ROOT is missing the development header or dylib" >&2
+        exit 2
+    fi
+    unicorn_cflags="-I$unicorn_root/include"
+    unicorn_libs="-L$unicorn_root/lib -lunicorn"
+fi
 
 read -r -a cc_words <<<"$cc_line"
 read -r -a cflag_words <<<"$cflags_line"

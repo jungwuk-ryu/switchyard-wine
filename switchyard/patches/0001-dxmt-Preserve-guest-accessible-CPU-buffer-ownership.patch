@@ -1,77 +1,110 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From af8ab67d197a4bc6751483b8c16fa17df3b0a6b0 Mon Sep 17 00:00:00 2001
 From: jungwuk-ryu <vojougae35@gmail.com>
-Date: Mon, 24 Aug 2026 07:49:37 +0900
-Subject: [PATCH] fix(dxmt): use owned buffer backing for i386
+Date: Tue, 25 Aug 2026 01:14:21 +0900
+Subject: [PATCH] dxmt: Preserve guest-accessible CPU buffer ownership.
 
+The i386 PE cannot lend arbitrary guest mappings to the native ARM64 Winemetal companion, so the companion must own those buffers and publish only accessible pointers.
+
+Conversely, ARM64EC mappings returned to translated x64 code cannot use Metal-owned host pointers because Wine never publishes those ranges to the CPU provider. Allocate dynamic buffers, staging resources, and buffer-backed dynamic textures through the Windows heap, then release all Metal objects before freeing that storage.
 ---
- src/d3d11/d3d11_buffer.cpp            |  3 ---
- src/d3d11/d3d11_texture_dynamic.cpp   |  5 +----
- src/dxmt/dxmt_buffer.cpp              | 12 ++----------
- src/dxmt/dxmt_buffer.hpp              |  5 +----
- src/dxmt/dxmt_context.cpp             | 11 +++++++++--
- src/dxmt/dxmt_occlusion_query.hpp     |  8 +-------
- src/dxmt/dxmt_ring_bump_allocator.hpp | 12 +++++++++++-
- src/dxmt/dxmt_staging.cpp             |  3 ---
- src/dxmt/dxmt_texture.cpp             |  9 +--------
- src/dxmt/dxmt_texture.hpp             |  3 ++-
- 10 files changed, 28 insertions(+), 43 deletions(-)
+ src/d3d11/d3d11_buffer.cpp            |  2 +-
+ src/d3d11/d3d11_texture_dynamic.cpp   |  4 +--
+ src/d3d11/d3d11_texture_linear.cpp    |  4 +++
+ src/dxmt/dxmt_buffer.cpp              | 32 +++++++++++++++++++-----
+ src/dxmt/dxmt_buffer.hpp              |  8 +++---
+ src/dxmt/dxmt_context.cpp             | 11 ++++++--
+ src/dxmt/dxmt_occlusion_query.hpp     |  8 +-----
+ src/dxmt/dxmt_ring_bump_allocator.hpp | 12 ++++++++-
+ src/dxmt/dxmt_staging.cpp             |  2 +-
+ src/dxmt/dxmt_texture.cpp             | 36 +++++++++++++++++++++++----
+ src/dxmt/dxmt_texture.hpp             |  8 +++++-
+ 11 files changed, 98 insertions(+), 29 deletions(-)
 
 diff --git a/src/d3d11/d3d11_buffer.cpp b/src/d3d11/d3d11_buffer.cpp
-index c354db3..0454a9f 100644
+index c354db3..94c1b5a 100644
 --- a/src/d3d11/d3d11_buffer.cpp
 +++ b/src/d3d11/d3d11_buffer.cpp
-@@ -98,9 +98,6 @@ public:
+@@ -98,7 +98,7 @@ public:
          flags.set(BufferAllocationFlag::GpuManaged);
      } else {
        flags.set(BufferAllocationFlag::SuballocateFromOnePage);
 -#ifdef __i386__
--      flags.set(BufferAllocationFlag::CpuPlaced);
--#endif
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
+       flags.set(BufferAllocationFlag::CpuPlaced);
+ #endif
      }
-     auto allocation = buffer_->allocate(flags);
-     auto &initializer = device->GetDXMTDevice().queue().initializer;
 diff --git a/src/d3d11/d3d11_texture_dynamic.cpp b/src/d3d11/d3d11_texture_dynamic.cpp
-index da9a7cc..c1d5f0e 100644
+index da9a7cc..a596f99 100644
 --- a/src/d3d11/d3d11_texture_dynamic.cpp
 +++ b/src/d3d11/d3d11_texture_dynamic.cpp
-@@ -118,9 +118,6 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
+@@ -118,7 +118,7 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
      }
      Flags<BufferAllocationFlag> buffer_flags;
      buffer_flags.set(BufferAllocationFlag::CpuWriteCombined, BufferAllocationFlag::SuballocateFromOnePage);
 -#ifdef __i386__
--    buffer_flags.set(BufferAllocationFlag::CpuPlaced);
--#endif
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
+     buffer_flags.set(BufferAllocationFlag::CpuPlaced);
+ #endif
      Subresource subresource;
-     subresource.buffer = new Buffer(buf_len, pDevice->GetMTLDevice());
-     subresource.buffer->rename(subresource.buffer->allocate(buffer_flags));
-@@ -183,4 +180,4 @@ CreateDynamicTexture3D(MTLD3D11Device *pDevice,
+@@ -183,4 +183,4 @@ CreateDynamicTexture3D(MTLD3D11Device *pDevice,
  
  #pragma endregion
  
 -} // namespace dxmt
 \ No newline at end of file
 +} // namespace dxmt
+diff --git a/src/d3d11/d3d11_texture_linear.cpp b/src/d3d11/d3d11_texture_linear.cpp
+index e250d6e..dd03dd9 100644
+--- a/src/d3d11/d3d11_texture_linear.cpp
++++ b/src/d3d11/d3d11_texture_linear.cpp
+@@ -50,6 +50,10 @@ TDynamicLinearTexture(
+     flags.set(TextureAllocationFlag::ShaderReadonly);
+     if (!this->m_parent->IsTraced() && pDesc->Usage == D3D11_USAGE_DYNAMIC)
+       flags.set(TextureAllocationFlag::CpuWriteCombined);
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++    if (pDesc->Usage == D3D11_USAGE_DYNAMIC)
++      flags.set(TextureAllocationFlag::CpuPlaced);
++#endif
+     // if (pDesc->Usage != D3D11_USAGE_DEFAULT)
+     if (pDesc->Usage == D3D11_USAGE_IMMUTABLE)
+       flags.set(TextureAllocationFlag::GpuReadonly);
 diff --git a/src/dxmt/dxmt_buffer.cpp b/src/dxmt/dxmt_buffer.cpp
-index e918e63..8ec88b7 100644
+index e918e63..a86ceb8 100644
 --- a/src/dxmt/dxmt_buffer.cpp
 +++ b/src/dxmt/dxmt_buffer.cpp
-@@ -21,7 +21,6 @@
+@@ -19,6 +19,7 @@
+ #include "dxmt_buffer.hpp"
+ #include "dxmt_format.hpp"
  #include "thread.hpp"
++#include "util_error.hpp"
  #include "util_likely.hpp"
  #include "util_math.hpp"
--#include "wsi_platform.hpp"
- #include <cassert>
- #include <mutex>
- 
-@@ -41,21 +40,14 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
+ #include "wsi_platform.hpp"
+@@ -41,21 +42,40 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
      info_.length = DXMT_PAGE_SIZE;
    }
    fenceTrackers.resize(suballocation_count_);
--  if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
+   if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
 -    placed_buffer = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
 -    info_.memory.set(placed_buffer);
--  }
++    // This mapping can escape to translated x64 code, so allocate it through
++    // the Windows heap and let Wine publish the backing to the CPU provider.
++    placed_buffer_ = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
++    if (!placed_buffer_)
++      throw MTLD3DError("Failed to allocate guest-accessible buffer backing");
++    info_.memory.set(placed_buffer_);
+   }
++#endif
    obj_ = device.newBuffer(info_);
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++  if (placed_buffer_ && !obj_) {
++    info_.memory.set(nullptr);
++    wsi::aligned_free(placed_buffer_);
++    placed_buffer_ = nullptr;
++    throw MTLD3DError("Failed to create Metal buffer with guest-accessible backing");
++  }
++#endif
    gpuAddress_ = info_.gpu_address;
 +  // Storage returned in info_.memory is borrowed from obj_.
    mappedMemory_ = info_.memory.get_accessible_or_null();
@@ -82,11 +115,18 @@ index e918e63..8ec88b7 100644
 -  if (placed_buffer) {
 -    wsi::aligned_free(placed_buffer);
 -    placed_buffer = nullptr;
--  }
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++  if (placed_buffer_) {
++    cached_view_.clear();
++    obj_ = nullptr;
++    wsi::aligned_free(placed_buffer_);
++    placed_buffer_ = nullptr;
+   }
++#endif
    delete this;
  }
  
-@@ -185,4 +177,4 @@ Buffer::decRef() {
+@@ -185,4 +205,4 @@ Buffer::decRef() {
      delete this;
  };
  
@@ -94,27 +134,30 @@ index e918e63..8ec88b7 100644
 \ No newline at end of file
 +} // namespace dxmt
 diff --git a/src/dxmt/dxmt_buffer.hpp b/src/dxmt/dxmt_buffer.hpp
-index 9feb708..4f17196 100644
+index 9feb708..b36aff7 100644
 --- a/src/dxmt/dxmt_buffer.hpp
 +++ b/src/dxmt/dxmt_buffer.hpp
-@@ -39,7 +39,6 @@ enum class BufferAllocationFlag : uint32_t {
+@@ -39,6 +39,7 @@ enum class BufferAllocationFlag : uint32_t {
    GpuManaged = 4,
    /* will allocate at least one page of memory and try to suballocate from that */
    SuballocateFromOnePage = 5,
--  CpuPlaced = 6,
++  /* caller owns guest-addressable storage wrapped by the Metal buffer */
+   CpuPlaced = 6,
  };
  
- struct BufferViewKey {
-@@ -162,8 +161,6 @@ private:
+@@ -162,8 +163,9 @@ private:
    uint32_t current_suballocation_ = 0;
    uint32_t suballocation_size_;
    uint32_t suballocation_count_ = 1;
 -
 -  void * placed_buffer = nullptr;
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++  void *placed_buffer_ = nullptr;
++#endif
  };
  
  class Buffer {
-@@ -223,4 +220,4 @@ struct BufferSlice {
+@@ -223,4 +225,4 @@ struct BufferSlice {
    uint32_t elementCount = 0;
  };
  
@@ -244,52 +287,87 @@ index 5c92d92..1dde890 100644
 \ No newline at end of file
 +} // namespace dxmt
 diff --git a/src/dxmt/dxmt_staging.cpp b/src/dxmt/dxmt_staging.cpp
-index 80a3d62..0353bbf 100644
+index 80a3d62..bc50685 100644
 --- a/src/dxmt/dxmt_staging.cpp
 +++ b/src/dxmt/dxmt_staging.cpp
-@@ -77,9 +77,6 @@ StagingResource::allocate(uint64_t coherent_seq_id) {
+@@ -77,7 +77,7 @@ StagingResource::allocate(uint64_t coherent_seq_id) {
    }
    if (ret == ~0ull) {
      Flags<BufferAllocationFlag> flags;
 -#ifdef __i386__
--    flags.set(BufferAllocationFlag::CpuPlaced);
--#endif
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
+     flags.set(BufferAllocationFlag::CpuPlaced);
+ #endif
      buffer_pool.push_back(buffer_->allocate(flags));
-     ret = buffer_pool.size() - 1;
-   }
 diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
-index 8db2874..0d09a07 100644
+index 8db2874..8f1d0f3 100644
 --- a/src/dxmt/dxmt_texture.cpp
 +++ b/src/dxmt/dxmt_texture.cpp
-@@ -18,7 +18,6 @@
+@@ -18,6 +18,7 @@
  
  #include "dxmt_texture.hpp"
  #include "dxmt_residency.hpp"
--#include "wsi_platform.hpp"
++#include "util_error.hpp"
+ #include "wsi_platform.hpp"
  #include <atomic>
  #include <cassert>
+@@ -63,6 +64,10 @@ TextureAllocation::TextureAllocation(
+     mappedMemory(mapped_buffer),
+     buffer_(std::move(buffer)),
+     flags_(flags) {
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++  if (flags.test(TextureAllocationFlag::CpuPlaced))
++    owned_mapped_buffer_ = mapped_buffer;
++#endif
+   auto info_copy = info;
+   obj_ = buffer_.newTexture(info_copy, 0, bytes_per_row);
  
-@@ -90,9 +89,6 @@ TextureAllocation::TextureAllocation(
+@@ -90,8 +95,14 @@ TextureAllocation::TextureAllocation(
  
  void
  TextureAllocation::free(){
 -#ifdef __i386__
 -  wsi::aligned_free(mappedMemory);
--#endif
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++  if (owned_mapped_buffer_) {
++    cached_view_.clear();
++    obj_ = nullptr;
++    buffer_ = nullptr;
++    wsi::aligned_free(owned_mapped_buffer_);
++    owned_mapped_buffer_ = nullptr;
++  }
+ #endif
    delete this;
  };
- 
-@@ -193,9 +189,6 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
+@@ -193,10 +204,25 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
      buffer_info.length = bytes_per_image_;
      buffer_info.options = options;
      buffer_info.memory.set(nullptr);
 -#ifdef __i386__
 -    buffer_info.memory.set(wsi::aligned_malloc(bytes_per_image_, DXMT_PAGE_SIZE));
--#endif
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++    void *owned_mapped_buffer = nullptr;
++    if (flags.test(TextureAllocationFlag::CpuPlaced)) {
++      // Dynamic texture maps escape to translated x64 code as well. Keep the
++      // no-copy Metal storage inside Wine's registered Windows address space.
++      owned_mapped_buffer = wsi::aligned_malloc(bytes_per_image_, DXMT_PAGE_SIZE);
++      if (!owned_mapped_buffer)
++        throw MTLD3DError("Failed to allocate guest-accessible texture backing");
++      buffer_info.memory.set(owned_mapped_buffer);
++    }
+ #endif
      auto buffer = device_.newBuffer(buffer_info);
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++    if (owned_mapped_buffer && !buffer) {
++      buffer_info.memory.set(nullptr);
++      wsi::aligned_free(owned_mapped_buffer);
++      throw MTLD3DError("Failed to create Metal buffer with guest-accessible texture backing");
++    }
++#endif
      return new TextureAllocation(this, std::move(buffer), buffer_info.memory.get(), info, bytes_per_row_, flags);
    }
-@@ -349,4 +342,4 @@ RenamableTexturePool::getNext(uint64_t frame) {
+   auto texture = flags.test(TextureAllocationFlag::Shared) ? device_.newSharedTexture(info) : device_.newTexture(info);
+@@ -349,4 +375,4 @@ RenamableTexturePool::getNext(uint64_t frame) {
    return allocations_[current_index];
  }
  
@@ -297,10 +375,19 @@ index 8db2874..0d09a07 100644
 \ No newline at end of file
 +} // namespace dxmt
 diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
-index 68d43cd..9defce8 100644
+index 68d43cd..161a881 100644
 --- a/src/dxmt/dxmt_texture.hpp
 +++ b/src/dxmt/dxmt_texture.hpp
-@@ -145,6 +145,7 @@ public:
+@@ -38,6 +38,8 @@ enum class TextureAllocationFlag : uint32_t {
+   GpuManaged = 4,
+   Shared = 5,
+   ShaderReadonly = 6,
++  /* caller owns guest-addressable storage wrapped by the Metal buffer */
++  CpuPlaced = 7,
+ };
+ 
+ struct TextureViewDescriptor {
+@@ -145,6 +147,7 @@ public:
    }
  
    Texture *descriptor;
@@ -308,10 +395,23 @@ index 68d43cd..9defce8 100644
    void *mappedMemory;
    uint64_t gpuResourceID;
    mach_port_t machPort;
-@@ -323,4 +324,4 @@ private:
+@@ -170,6 +173,9 @@ private:
+   uint32_t version_ = 0;
+   Flags<TextureAllocationFlag> flags_;
+   small_vector<TextureViewRef, 4> cached_view_;
++#if defined(__arm64ec__) || defined(_M_ARM64EC)
++  void *owned_mapped_buffer_ = nullptr;
++#endif
+ };
+ 
+ class Texture {
+@@ -323,4 +329,4 @@ private:
    std::atomic<uint32_t> refcount_ = {0u};
  };
  
 -} // namespace dxmt
 \ No newline at end of file
 +} // namespace dxmt
+-- 
+2.50.1 (Apple Git-155)
+

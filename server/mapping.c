@@ -875,15 +875,12 @@ static int load_cfg_header( void *cfg, size_t capacity, IMAGE_DATA_DIRECTORY *da
                             int unix_fd, IMAGE_SECTION_HEADER *sec, unsigned int nb_sec,
                             size_t *loaded_size, unsigned int *config_size )
 {
-    size_t required_size;
     int ret = load_data_dir( cfg, capacity, data->VirtualAddress, data->Size,
                              align_mask, unix_fd, sec, nb_sec );
 
     if (ret < (int)sizeof(*config_size)) return 0;
     memcpy( config_size, cfg, sizeof(*config_size) );
     if (*config_size && *config_size < sizeof(*config_size)) return 0;
-    required_size = min( (size_t)*config_size, capacity );
-    if ((size_t)ret < required_size) return 0;
     if ((size_t)ret < capacity) memset( (char *)cfg + ret, 0, capacity - ret );
     *loaded_size = ret;
     return 1;

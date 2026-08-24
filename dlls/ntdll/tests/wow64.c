@@ -2701,6 +2701,14 @@ static void test_peb_teb(void)
     {
         PEB64 *peb64;
         TEB64 *teb64 = (TEB64 *)NtCurrentTeb()->GdiBatchCount;
+        UINT64 nls_address_bias = 0;
+        UINT64 expected_ansi, expected_oem, expected_case;
+        ULONG translated = FALSE;
+
+        status = NtQueryVirtualMemory( GetCurrentProcess(), NtCurrentTeb(),
+                                       MemoryWineWow64TranslatedInformation,
+                                       &translated, sizeof(translated), NULL );
+        if (!status && translated) nls_address_bias = WINE_LOW_VA_SHADOW_BASE;
 
         ok( !!teb64, "GdiBatchCount not set\n" );
         ok( (char *)NtCurrentTeb() + NtCurrentTeb()->WowTebOffset == (char *)teb64 ||
@@ -2724,6 +2732,15 @@ static void test_peb_teb(void)
         ok( teb64->ClientId.UniqueThread == GetCurrentThreadId(), "wrong tid %s / %lx\n",
             wine_dbgstr_longlong(teb64->ClientId.UniqueThread), GetCurrentThreadId() );
         peb64 = ULongToPtr( teb64->Peb );
+        expected_ansi = PtrToUlong( NtCurrentTeb()->Peb->AnsiCodePageData );
+        expected_oem = PtrToUlong( NtCurrentTeb()->Peb->OemCodePageData );
+        expected_case = PtrToUlong( NtCurrentTeb()->Peb->UnicodeCaseTableData );
+        if (nls_address_bias)
+        {
+            if (expected_ansi) expected_ansi += nls_address_bias;
+            if (expected_oem) expected_oem += nls_address_bias;
+            if (expected_case) expected_case += nls_address_bias;
+        }
         ok( peb64->ImageBaseAddress == PtrToUlong( NtCurrentTeb()->Peb->ImageBaseAddress ),
             "wrong ImageBaseAddress %s / %p\n",
             wine_dbgstr_longlong(peb64->ImageBaseAddress), NtCurrentTeb()->Peb->ImageBaseAddress);
@@ -2731,13 +2748,13 @@ static void test_peb_teb(void)
             peb64->OSBuildNumber, NtCurrentTeb()->Peb->OSBuildNumber );
         ok( peb64->OSPlatformId == NtCurrentTeb()->Peb->OSPlatformId, "wrong OSPlatformId %lx / %lx\n",
             peb64->OSPlatformId, NtCurrentTeb()->Peb->OSPlatformId );
-        ok( peb64->AnsiCodePageData == PtrToUlong( NtCurrentTeb()->Peb->AnsiCodePageData ),
+        ok( peb64->AnsiCodePageData == expected_ansi,
             "wrong AnsiCodePageData %I64x / %p\n",
             peb64->AnsiCodePageData, NtCurrentTeb()->Peb->AnsiCodePageData );
-        ok( peb64->OemCodePageData == PtrToUlong( NtCurrentTeb()->Peb->OemCodePageData ),
+        ok( peb64->OemCodePageData == expected_oem,
             "wrong OemCodePageData %I64x / %p\n",
             peb64->OemCodePageData, NtCurrentTeb()->Peb->OemCodePageData );
-        ok( peb64->UnicodeCaseTableData == PtrToUlong( NtCurrentTeb()->Peb->UnicodeCaseTableData ),
+        ok( peb64->UnicodeCaseTableData == expected_case,
             "wrong UnicodeCaseTableData %I64x / %p\n",
             peb64->UnicodeCaseTableData, NtCurrentTeb()->Peb->UnicodeCaseTableData );
         return;

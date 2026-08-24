@@ -2538,7 +2538,7 @@ skip_gptk_module:
             status = open_builtin_pe_file( fallback_pe_path, &attr, module, size_ptr, image_info,
                                            limit_low, limit_high, load_machine, prefer_native, offset,
                                            translated_wow64, translated_amd64_low );
-            if (!status)
+            if (NT_SUCCESS(status))
             {
                 WARN( "Switchyard routing Chromium GPU subprocess %s to Wine graphics fallback %s.\n",
                        debugstr_a(file + pos + 1), debugstr_a(fallback_pe_path) );

@@ -19,9 +19,18 @@ git -C "$ROOT_DIR" cat-file -e "${upstream_base}^{commit}" 2>/dev/null ||
 git -C "$ROOT_DIR" merge-base --is-ancestor "$upstream_base" HEAD ||
   fail "HEAD is not descended from upstream base $upstream_base"
 
-git -C "$ROOT_DIR" diff --check "$upstream_base"..HEAD
-git -C "$ROOT_DIR" diff --check
-git -C "$ROOT_DIR" diff --cached --check
+check_source_whitespace() {
+  # This DXMT source patch is a hash-pinned corresponding-source material for a
+  # closed runtime artifact.  Its patch payload may need to preserve upstream
+  # whitespace exactly, so the DXMT artifact/source-material validators own that
+  # file's byte-for-byte contract instead of the generic source whitespace gate.
+  git -C "$ROOT_DIR" diff --check "$@" -- . \
+    ':(exclude)switchyard/patches/0001-dxmt-Preserve-guest-accessible-CPU-buffer-ownership.patch'
+}
+
+check_source_whitespace "$upstream_base"..HEAD
+check_source_whitespace
+check_source_whitespace --cached
 
 added_files="$({
   git -C "$ROOT_DIR" log --format= --name-only --diff-filter=A "$upstream_base"..HEAD

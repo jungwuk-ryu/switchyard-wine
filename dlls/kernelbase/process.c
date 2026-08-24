@@ -296,7 +296,7 @@ static NTSTATUS create_nt_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBUT
                                    const struct proc_thread_attr *job_list)
 {
     OBJECT_ATTRIBUTES process_attr, thread_attr;
-    PS_CREATE_INFO create_info;
+    PS_CREATE_INFO create_info = { sizeof(create_info) };
     ULONG_PTR buffer[offsetof( PS_ATTRIBUTE_LIST, Attributes[9] ) / sizeof(ULONG_PTR)];
     PS_ATTRIBUTE_LIST *attr = (PS_ATTRIBUTE_LIST *)buffer;
     UNICODE_STRING nameW;

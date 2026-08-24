@@ -145,6 +145,12 @@ source "$PROFILE_LIBRARY"
 source "$PROVIDER_LIBRARY"
 switchyard_load_runtime_profile preview-native-arm64-fex
 
+[ "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" = 6 ] ||
+  fail "x64 provider validator ABI version is not v6"
+[ "$(/usr/bin/grep -Fc "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" \
+  "$ROOT_DIR/dlls/xtajit64/unixlib.h")" -eq 1 ] ||
+  fail "x64 provider header and validator ABI identities differ"
+
 [ "$(/usr/bin/grep -Fxc \
   "  \"\$manifest\" preview-native-arm64-fex \"\$RUNTIME\"" \
   "$DXMT_ACCEPTANCE_TEST")" -eq 2 ] ||
@@ -218,6 +224,9 @@ EOF
 /bin/cat >"$TEST_ROOT/provider.c" <<'EOF'
 extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
+__attribute__((used, visibility("default"))) const char
+    switchyard_xtajit64_fixture_abi_identity[] =
+        "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);
@@ -237,15 +246,16 @@ done
 
 /usr/bin/python3 -I - "$RUNTIME" \
   "$SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY" \
-  "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY" <<'PY'
+  "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY" \
+  "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" <<'PY'
 import os
 import struct
 import sys
 
-root, xtajit, xtajit64 = sys.argv[1:]
+root, xtajit, xtajit64, x64_abi_identity = sys.argv[1:]
 
 
-def write_pe(relative, machine, arm64ec=False):
+def write_pe(relative, machine, arm64ec=False, abi_identity=None):
     value = bytearray(0x1200 if arm64ec else 0x98)
     value[:2] = b"MZ"
     struct.pack_into("<I", value, 0x3C, 0x80)
@@ -267,6 +277,8 @@ def write_pe(relative, machine, arm64ec=False):
         struct.pack_into("<Q", value, 0x200 + 0xC8, 0x180001100)
         struct.pack_into("<III", value, 0x300, 2, 0x1120, 1)
         struct.pack_into("<II", value, 0x320, 0x2001, 0x100)
+    if abi_identity is not None:
+        value.extend(abi_identity.encode("ascii") + b"\0")
     path = os.path.join(root, relative)
     with open(path, "xb") as stream:
         stream.write(value)
@@ -276,7 +288,7 @@ def write_pe(relative, machine, arm64ec=False):
 
 
 write_pe(xtajit, 0xAA64)
-write_pe(xtajit64, 0x8664, True)
+write_pe(xtajit64, 0x8664, True, x64_abi_identity)
 PY
 
 /bin/cat >"$TEST_ROOT/policy.c" <<'EOF'
@@ -488,6 +500,41 @@ source "$PROFILE_LIBRARY"
 
 switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
 switchyard_validate_wow64_unixlib_policy_manifest "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
+
+for abi_relative in \
+    "$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY" \
+    "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY"; do
+  abi_live="$RUNTIME/$abi_relative"
+  abi_saved="$TEST_ROOT/$(/usr/bin/basename "$abi_relative").abi-good"
+  /bin/cp "$abi_live" "$abi_saved"
+  /usr/bin/python3 -I - "$abi_live" "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" <<'PY'
+import os
+import sys
+
+path, identity = sys.argv[1:]
+with open(path, "rb") as stream:
+    value = stream.read()
+old = identity.encode("ascii")
+new = old.replace(b"-v6-", b"-v5-", 1)
+if new == old or value.count(old) != 1:
+    raise SystemExit("fixture x64 provider ABI marker is not unique")
+with open(path, "wb") as stream:
+    stream.write(value.replace(old, new, 1))
+PY
+  case "$abi_relative" in
+    "$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY")
+      refresh_component_digest x86_64 unixLibrarySha256 "$abi_live"
+      ;;
+    "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY")
+      refresh_component_digest x86_64 peLibrarySha256 "$abi_live"
+      ;;
+  esac
+  expect_failure "ABI-incompatible x64 provider pair $abi_relative" \
+    switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
+  /bin/mv "$abi_saved" "$abi_live"
+  restore_manifest
+done
+switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
 
 /bin/chmod 0644 "$RUNTIME/$SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY"
 expect_failure "non-executable provider Unix library" \

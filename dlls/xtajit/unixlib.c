@@ -57,6 +57,17 @@ struct range_array
     size_t capacity;
 };
 
+struct xtajit_segment_state
+{
+    uint32_t cs;
+    uint32_t ss;
+    uint32_t ds;
+    uint32_t es;
+    uint32_t fs;
+    uint32_t gs;
+    uint32_t teb_guest;
+};
+
 struct xtajit_engine
 {
     struct xtajit_engine *next;
@@ -74,6 +85,8 @@ struct xtajit_engine
     uint32_t recent_eip_count;
     uint32_t recent_eip_next;
     enum xtajit_stop_reason stop_reason;
+    struct xtajit_segment_state segment_state;
+    BOOL segment_state_valid;
 };
 
 struct provider_process
@@ -118,9 +131,16 @@ static int engine_key_error;
 #ifdef XTAJIT_UNIXLIB_TEST
 static int test_fail_engine_mutation = -1;
 static int test_engine_mutation_count;
+static unsigned int test_segment_descriptor_write_count;
 static atomic_int test_hold_progress_hook;
 static atomic_int test_progress_hook_entered;
 static atomic_int test_release_progress_hook;
+#ifndef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
+static atomic_uint test_hold_write_address;
+static atomic_int test_write_hook_entered;
+static atomic_int test_release_write_hook;
+#endif
+static atomic_int test_pause_request_count;
 static int32_t (*test_memory_fault_resolver)(
     uint64_t, uint32_t, struct wine_wow64_memory_fault_result_v1 * );
 #endif
@@ -549,12 +569,21 @@ static void request_engine_pause_locked( struct xtajit_engine *engine )
 
     if (!engine->running) return;
     __atomic_store_n( &engine->pause_requested, TRUE, __ATOMIC_RELEASE );
-    /* Unicorn's timer and threaded_emu_start regression both use this API from
-     * a non-emulation thread.  A request published before the first-block
-     * acknowledgement is instead consumed by that hook, after uc_emu_start()
-     * has cleared Unicorn's internal stop flag. */
+#ifdef XTAJIT_UNIXLIB_TEST
+    atomic_fetch_add_explicit( &test_pause_request_count, 1,
+                               memory_order_release );
+#endif
+    /* A non-owner stop must reach a guest-instruction boundary; an immediate
+     * stop can commit a guest memory side effect while restoring the PC to the
+     * beginning of that instruction.  A request published before the first-
+     * block acknowledgement is instead consumed by that hook, after
+     * uc_emu_start() has cleared Unicorn's internal stop flag. */
     if (engine->start_acknowledged &&
+#ifdef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP
+        (err = uc_emu_stop_at_instruction_boundary( engine->uc )) != UC_ERR_OK)
+#else
         (err = uc_emu_stop( engine->uc )) != UC_ERR_OK)
+#endif
         poison_provider_locked( STATUS_UNSUCCESSFUL );
 }
 
@@ -758,6 +787,29 @@ static bool invalid_memory_hook( uc_engine *uc, uc_mem_type type, uint64_t addre
     return false;
 }
 
+#if defined(XTAJIT_UNIXLIB_TEST) && !defined(UC_SWITCHYARD_SHARED_MEMORY_ATOMICS)
+static void test_memory_write_hook( uc_engine *uc, uc_mem_type type,
+                                    uint64_t address, int size, int64_t value,
+                                    void *user )
+{
+    uint32_t hold_address;
+
+    (void)uc;
+    (void)type;
+    (void)size;
+    (void)value;
+    (void)user;
+    hold_address = atomic_load_explicit( &test_hold_write_address,
+                                         memory_order_acquire );
+    if (address != hold_address ||
+        atomic_exchange_explicit( &test_write_hook_entered, 1,
+                                  memory_order_acq_rel ))
+        return;
+    while (!atomic_load_explicit( &test_release_write_hook,
+                                  memory_order_acquire ));
+}
+#endif
+
 static uint64_t make_segment_descriptor( uint32_t base, uint32_t limit,
                                          uint8_t access, uint8_t flags )
 {
@@ -781,6 +833,9 @@ static uc_err write_segment_descriptor( struct xtajit_engine *engine, uint32_t s
         offset > XTAJIT_GUEST_PAGE_SIZE - sizeof(descriptor))
         return UC_ERR_ARG;
     descriptor = make_segment_descriptor( base, 0xfffff, access, 0x0c );
+#ifdef XTAJIT_UNIXLIB_TEST
+    ++test_segment_descriptor_write_count;
+#endif
     return uc_mem_write( engine->uc, XTAJIT_GUEST_GDT_PAGE + offset,
                          &descriptor, sizeof(descriptor) );
 }
@@ -846,17 +901,16 @@ static uc_err write_segments( struct xtajit_engine *engine,
     const uint32_t fs = context->seg_fs ? context->seg_fs : 0x53;
     const uint32_t gs = context->seg_gs ? context->seg_gs : 0x2b;
     uc_x86_mmr gdtr = {0};
+    BOOL descriptors_unchanged;
     uc_err err;
-
-    gdtr.base = XTAJIT_GUEST_GDT_PAGE;
-    gdtr.limit = XTAJIT_GUEST_PAGE_SIZE - 1;
-    if ((err = uc_reg_write( engine->uc, UC_X86_REG_GDTR, &gdtr )) != UC_ERR_OK) return err;
 
     /* Unicorn retains each segment's hidden descriptor cache independently of
      * its visible selector.  Initializing only FS leaves SS (and potentially
      * the other flat Windows segments) with an engine-default base, so an
      * implicit stack access can land somewhere other than ESP.  Materialize
-     * every selector in our private GDT on each entry; only FS is non-flat. */
+     * every changed selector in our private GDT; only FS is non-flat.  Guest
+     * code may still load a different visible selector, so descriptor caching
+     * must never suppress the register loads below. */
     if ((cs & 7) != 3 || (ss & 7) != 3 || (ds & 7) != 3 ||
         (es & 7) != 3 || (fs & 7) != 3 || (gs & 7) != 3 ||
         (cs & ~7u) == (ss & ~7u) || (cs & ~7u) == (ds & ~7u) ||
@@ -865,12 +919,31 @@ static uc_err write_segments( struct xtajit_engine *engine,
         (ds & ~7u) == (fs & ~7u) || (es & ~7u) == (fs & ~7u) ||
         (gs & ~7u) == (fs & ~7u))
         return UC_ERR_ARG;
-    if ((err = write_segment_descriptor( engine, cs, 0, 0xfb )) != UC_ERR_OK) return err;
-    if ((err = write_segment_descriptor( engine, ss, 0, 0xf3 )) != UC_ERR_OK) return err;
-    if ((err = write_segment_descriptor( engine, ds, 0, 0xf3 )) != UC_ERR_OK) return err;
-    if ((err = write_segment_descriptor( engine, es, 0, 0xf3 )) != UC_ERR_OK) return err;
-    if ((err = write_segment_descriptor( engine, gs, 0, 0xf3 )) != UC_ERR_OK) return err;
-    if ((err = write_segment_descriptor( engine, fs, teb_guest, 0xf3 )) != UC_ERR_OK) return err;
+
+    descriptors_unchanged = engine->segment_state_valid &&
+                            engine->segment_state.cs == cs &&
+                            engine->segment_state.ss == ss &&
+                            engine->segment_state.ds == ds &&
+                            engine->segment_state.es == es &&
+                            engine->segment_state.fs == fs &&
+                            engine->segment_state.gs == gs &&
+                            engine->segment_state.teb_guest == teb_guest;
+    if (!descriptors_unchanged)
+    {
+        /* The engine and its GDT are thread-owned.  Invalidate before the
+         * first Unicorn mutation so a partial failure can never make a later
+         * caller trust the previously programmed descriptor state. */
+        engine->segment_state_valid = FALSE;
+        gdtr.base = XTAJIT_GUEST_GDT_PAGE;
+        gdtr.limit = XTAJIT_GUEST_PAGE_SIZE - 1;
+        if ((err = uc_reg_write( engine->uc, UC_X86_REG_GDTR, &gdtr )) != UC_ERR_OK) return err;
+        if ((err = write_segment_descriptor( engine, cs, 0, 0xfb )) != UC_ERR_OK) return err;
+        if ((err = write_segment_descriptor( engine, ss, 0, 0xf3 )) != UC_ERR_OK) return err;
+        if ((err = write_segment_descriptor( engine, ds, 0, 0xf3 )) != UC_ERR_OK) return err;
+        if ((err = write_segment_descriptor( engine, es, 0, 0xf3 )) != UC_ERR_OK) return err;
+        if ((err = write_segment_descriptor( engine, gs, 0, 0xf3 )) != UC_ERR_OK) return err;
+        if ((err = write_segment_descriptor( engine, fs, teb_guest, 0xf3 )) != UC_ERR_OK) return err;
+    }
 
 #define LOAD_SEGMENT(reg, selector, name) \
     do \
@@ -889,6 +962,14 @@ static uc_err write_segments( struct xtajit_engine *engine,
     LOAD_SEGMENT( UC_X86_REG_GS, gs, "GS" );
     LOAD_SEGMENT( UC_X86_REG_FS, fs, "FS" );
 #undef LOAD_SEGMENT
+    engine->segment_state.cs = cs;
+    engine->segment_state.ss = ss;
+    engine->segment_state.ds = ds;
+    engine->segment_state.es = es;
+    engine->segment_state.fs = fs;
+    engine->segment_state.gs = gs;
+    engine->segment_state.teb_guest = teb_guest;
+    engine->segment_state_valid = TRUE;
     return UC_ERR_OK;
 }
 
@@ -962,6 +1043,14 @@ static uc_err install_engine( struct xtajit_engine *engine )
     uc_err err;
 
     if ((err = uc_open( UC_ARCH_X86, UC_MODE_32, &engine->uc )) != UC_ERR_OK) return err;
+#ifdef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
+    if ((err = uc_enable_shared_memory_atomics( engine->uc )) != UC_ERR_OK)
+    {
+        uc_close( engine->uc );
+        engine->uc = NULL;
+        return err;
+    }
+#endif
     if ((err = uc_mem_map( engine->uc, XTAJIT_GUEST_GDT_PAGE, XTAJIT_GUEST_PAGE_SIZE,
                            UC_PROT_READ | UC_PROT_WRITE )) != UC_ERR_OK ||
         (err = uc_mem_map( engine->uc, XTAJIT_GUEST_BOP_PAGE, XTAJIT_GUEST_PAGE_SIZE,
@@ -986,6 +1075,10 @@ static uc_err install_engine( struct xtajit_engine *engine )
                             invalid_instruction_hook, engine, 1, 0 )) != UC_ERR_OK ||
         (err = uc_hook_add( engine->uc, &hook, UC_HOOK_MEM_INVALID,
                             invalid_memory_hook, engine, 1, 0 )) != UC_ERR_OK ||
+#if defined(XTAJIT_UNIXLIB_TEST) && !defined(UC_SWITCHYARD_SHARED_MEMORY_ATOMICS)
+        (err = uc_hook_add( engine->uc, &hook, UC_HOOK_MEM_WRITE,
+                            test_memory_write_hook, engine, 1, 0 )) != UC_ERR_OK ||
+#endif
         (err = map_registry( engine, &provider.ranges )) != UC_ERR_OK)
     {
         uc_close( engine->uc );

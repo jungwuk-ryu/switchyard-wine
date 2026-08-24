@@ -36,6 +36,21 @@ if [[ -n ${XTAJIT64_EXPECTED_SOURCE_DIR:-} ]]; then
         exit 2
     fi
 fi
+if [[ -n ${XTAJIT64_UNICORN_ROOT:-} ]]; then
+    if [[ $XTAJIT64_UNICORN_ROOT != /* || ! -d $XTAJIT64_UNICORN_ROOT ||
+          -L $XTAJIT64_UNICORN_ROOT ]]; then
+        echo "XTAJIT64_UNICORN_ROOT must name an absolute, real directory" >&2
+        exit 2
+    fi
+    unicorn_root=$(cd "$XTAJIT64_UNICORN_ROOT" && pwd -P)
+    if [[ ! -f $unicorn_root/include/unicorn/unicorn.h ||
+          ! -f $unicorn_root/lib/libunicorn.2.dylib ]]; then
+        echo "XTAJIT64_UNICORN_ROOT is missing the development header or dylib" >&2
+        exit 2
+    fi
+    unicorn_cflags="-I$unicorn_root/include"
+    unicorn_libs="-L$unicorn_root/lib -lunicorn"
+fi
 
 /usr/bin/python3 \
     "$source_dir/dlls/xtajit64/provider_tests/check_x64_entry_gate.py" \
@@ -52,7 +67,8 @@ if [[ ! -f $native_provider || ! -f $pe_provider ]]; then
     exit 2
 fi
 native_imports=$(/usr/bin/nm -u "$native_provider") || exit 1
-for symbol in uc_open uc_emu_start uc_hook_add uc_mem_map_ptr; do
+for symbol in uc_open uc_emu_start uc_hook_add uc_mem_map_ptr \
+              uc_context_alloc uc_context_save uc_context_restore uc_context_free; do
     if ! grep -Eq "(^|[[:space:]])_?${symbol}$" <<<"$native_imports"; then
         echo "production xtajit64 Unixlib is missing Unicorn symbol $symbol" >&2
         exit 1

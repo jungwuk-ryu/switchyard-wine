@@ -90,10 +90,10 @@
 # define __ASM_BLOCK_END
 #endif
 
-#define __ASM_DEFINE_FUNC(name,code)  \
+#define __ASM_DEFINE_FUNC_SECTION(name,section,align,code)  \
     __ASM_BLOCK_BEGIN(__LINE__) \
-    asm( __ASM_FUNC_SECTION(name) "\n\t" \
-         __ASM_FUNC_ALIGN "\n\t" \
+    asm( section "\n\t" \
+         align "\n\t" \
          __ASM_FUNC_TYPE(name) "\n" \
          __ASM_GLOBL(name) "\n\t" \
          __ASM_SEH(".seh_proc " name "\n\t") \
@@ -105,6 +105,12 @@
          __ASM_SEH(".seh_endproc\n\t") \
          __ASM_FUNC_SIZE(name)); \
     __ASM_BLOCK_END
+
+#define __ASM_DEFINE_FUNC_ALIGN(name,align,code) \
+    __ASM_DEFINE_FUNC_SECTION(name,__ASM_FUNC_SECTION(name),align,code)
+
+#define __ASM_DEFINE_FUNC(name,code) \
+    __ASM_DEFINE_FUNC_ALIGN(name,__ASM_FUNC_ALIGN,code)
 
 #define __ASM_GLOBAL_FUNC(name,code) __ASM_DEFINE_FUNC(__ASM_NAME(#name),code)
 
@@ -269,8 +275,12 @@
          "ret\n\t" \
          ".seh_endproc" :: "i" (id) )
 #elif defined __arm64ec_x64__
+/* Keep patchable x64 service stubs in their own ARM64X PE section so they
+ * cannot share a physical page with native ARM64EC code. */
 # define __ASM_SYSCALL_FUNC(id,name) \
-    __ASM_DEFINE_FUNC( "\"EXP+#" #name "\"", \
+    __ASM_DEFINE_FUNC_SECTION( "\"EXP+#" #name "\"", \
+                       ".section .x64sys,\"xr\",discard,\"EXP+#" #name "\"", \
+                       __ASM_FUNC_ALIGN, \
                        ".seh_endprologue\n\t" \
                        ".byte 0x4c,0x8b,0xd1\n\t" /* 00: movq %rcx,%r10 */ \
                        ".byte 0xb8\n\t"           /* 03: movl $i,%eax */ \

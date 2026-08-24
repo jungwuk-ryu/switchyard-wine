@@ -105,17 +105,17 @@ write_preview_manifest() {
     "sourceArchiveSha256": "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e",
     "sourcePatch": {
       "path": "lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch",
-      "sha256": "68f7df756eec731ec2143d63b8e454b7d1d538ccee8fa2205563fb26c3b995d6"
+      "sha256": "89e4beeeccacc799789659ab826589ea1d87a358210d0412e81527166117bd68"
     },
-    "buildContractVersion": 3,
+    "buildContractVersion": 7,
     "hostArchitecture": "arm64",
     "kuserSharedDataModel": "translated-shadow",
     "emulatedArchitectures": ["i386", "x86_64"],
-    "developmentCacheDigest": "7944bfa5710dfec5183ac1b8460c9dfce5f7c4b0af40675ce6afb893a3e38e87",
+    "developmentCacheDigest": "5137e8fc8a0a621b97733cf58594390385c843f1febfa988c439630aa02b7660",
     "runtimeRoot": "lib/switchyard-unicorn",
-    "runtimePayloadDigest": "a9a853d25af1274fde256ac3dff2b83ba563d8cbe70c5c7a754ca93b94ee0486",
+    "runtimePayloadDigest": "4f243445afbbe0205e1c64533b1bb7115c1a3a39ce222a639ed020e4581c8dd7",
     "library": "lib/switchyard-unicorn/lib/libunicorn.2.dylib",
-    "librarySha256": "60b4c1e2cec6459c8d5bf7aafa11b43f79e029ec85b199e116dd29a4f0636b07",
+    "librarySha256": "f98f65ff58b3455b3fbab7585d82fc004dc62676250117958250cd266c57a54a",
     "providerUnixLibraries": [
       "lib/wine/aarch64-unix/xtajit.so",
       "lib/wine/aarch64-unix/xtajit64.so"
@@ -239,21 +239,21 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_UNICORN_SOURCE_REVISION" = "8028ec436f2d9376525352dd38ed9ed6b9f6be10" ]
 [ "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" = "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e" ]
 [ "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" = "unicorn-2.1.4-threaded-emu-stop.patch" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "68f7df756eec731ec2143d63b8e454b7d1d538ccee8fa2205563fb26c3b995d6" ]
-[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "60b4c1e2cec6459c8d5bf7aafa11b43f79e029ec85b199e116dd29a4f0636b07" ]
-[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "3" ]
-[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "7944bfa5710dfec5183ac1b8460c9dfce5f7c4b0af40675ce6afb893a3e38e87" ]
-[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "a9a853d25af1274fde256ac3dff2b83ba563d8cbe70c5c7a754ca93b94ee0486" ]
+[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "89e4beeeccacc799789659ab826589ea1d87a358210d0412e81527166117bd68" ]
+[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "f98f65ff58b3455b3fbab7585d82fc004dc62676250117958250cd266c57a54a" ]
+[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "7" ]
+[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "5137e8fc8a0a621b97733cf58594390385c843f1febfa988c439630aa02b7660" ]
+[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "4f243445afbbe0205e1c64533b1bb7115c1a3a39ce222a639ed020e4581c8dd7" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" = "https://github.com/3Shain/dxmt.git" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REVISION" = "856d9f35789679ef00c1ba01a6353438df84b66f" ]
 [ "$SWITCHYARD_DXMT_SOURCE_BASE_TREE" = "22fa93d36867f175c0283b36cd3628a4df94876e" ]
-[ "$SWITCHYARD_DXMT_SOURCE_TREE" = "a8c397f9b03dcb3592f6b0204ae6dbda5492990d" ]
-[ "$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME" = "0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch" ]
-[ "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" = "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852" ]
-[ "$SWITCHYARD_DXMT_ARTIFACT_BUILD_IDENTITY" = "f02a37f5b7c8022941712a7cf9415ac9d1925442" ]
+[ "$SWITCHYARD_DXMT_SOURCE_TREE" = "2c91e88660daecc3d492de23d32f9e2fed0dd001" ]
+[ "$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME" = "0001-dxmt-Preserve-guest-accessible-CPU-buffer-ownership.patch" ]
+[ "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" = "2e6f6436706f283be6b9ca1668391e0fa70fe83e290781d2a2c5b9f2496a4a26" ]
+[ "$SWITCHYARD_DXMT_ARTIFACT_BUILD_IDENTITY" = "af8ab67d197a4bc6751483b8c16fa17df3b0a6b0" ]
 [ "$SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION" = "3" ]
-[ "$SWITCHYARD_DXMT_ARTIFACT_NAME" = "dxmt-f02a37f5b7c8022941712a7cf9415ac9d1925442.tar.gz" ]
-[ "$SWITCHYARD_DXMT_ARTIFACT_SHA256" = "4bf4f0bd654a92c0feb6a8e5b960307be53d62ef45f9ed32fdcbf37c418b8a3c" ]
+[ "$SWITCHYARD_DXMT_ARTIFACT_NAME" = "dxmt-af8ab67d197a4bc6751483b8c16fa17df3b0a6b0.tar.gz" ]
+[ "$SWITCHYARD_DXMT_ARTIFACT_SHA256" = "3d1b73a42b25ff6b90c1c054ec501abfffe1f8433cbf3c97183b69e00d57f778" ]
 [ "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" = "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0" ]
 [ "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" = "0051bd8c0bc3e3ce261e9d5007665342ac2d28a643576744d8ec71896af856f1" ]
 [ "$SWITCHYARD_DXMT_PACKAGE_WORKFLOW" = ".github/workflows/ci.yml" ]
@@ -285,7 +285,7 @@ closure_inputs=(
 closure_digest="$(switchyard_native_runtime_closure_digest "${closure_inputs[@]}")"
 [[ "$closure_digest" =~ ^[0-9a-f]{64}$ ]] ||
   fail "native runtime closure is not a full SHA-256"
-[ "$closure_digest" = "6fcfa05d146b38f5c2ac641c02de447c708a3fb6a90402ba4aace75214b21e9a" ] ||
+[ "$closure_digest" = "5aaff80c995e67ad8481bac468417d920b5d322f2517c11e4741e26e8b5729c9" ] ||
   fail "native runtime closure v3 labels, order, or domain changed"
 [ "$(switchyard_native_runtime_closure_digest "${closure_inputs[@]}")" = \
   "$closure_digest" ] || fail "native runtime closure is not deterministic"
@@ -576,6 +576,27 @@ grep -F 'git -C "$PATCHED_SOURCE_DIR" apply --whitespace=error-all "$PATCH_SNAPS
 grep -F 'git -C "$PATCHED_SOURCE_DIR" apply --reverse --check --whitespace=error-all "$PATCH_SNAPSHOT"' \
   "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not verify the private patched source state"
+grep -F 'GIT_CEILING_DIRECTORIES="$patch_apply_ceiling"' \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper can inherit an ambient repository while applying its source patch"
+grep -F "grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP 1'" \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the instruction-boundary stop patch reached its source and output"
+grep -F '"_uc_emu_stop_at_instruction_boundary"' "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the patched stop API is exported"
+grep -F "grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1'" \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the shared-memory atomic patch reached its source and output"
+grep -F '"_uc_enable_shared_memory_atomics"' "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the shared-memory atomic API is exported"
+grep -F "grep -Fx '#define CONFIG_ATOMIC64 1'" "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not require the 64-bit atomic helper configuration"
+grep -F 'for regression in aarch64_rotl_zero threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook; do' \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not run the AArch64 rotate, stop, and shared-memory atomic regressions"
+grep -F '"$regression_binary" || fail "Unicorn regression failed: $regression"' \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper can ignore a cross-thread stop regression failure"
 grep -F -- '-S "$PATCHED_SOURCE_DIR"' "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not build from the private patched source tree"
 if grep -F -- '-S "$SOURCE_DIR"' "$UNICORN_HELPER" >/dev/null; then

@@ -45,6 +45,9 @@
 #ifdef HAVE_UNICORN
 
 WINE_DEFAULT_DEBUG_CHANNEL(xtajit);
+#ifndef XTAJIT64_UNIXLIB_TEST
+WINE_DECLARE_DEBUG_CHANNEL(xtajitmap);
+#endif
 
 #define XTAJIT64_MAX_RESYNC_RANGES (1u << 20)
 #define XTAJIT64_MAX_SYSCALL_COUNT  (1u << 16)
@@ -71,6 +74,8 @@ struct mapped_range
     unsigned int domain;
     unsigned int flags;
     BOOL permanent;
+    /* An engine can miss a complete unmap/remap cycle while it is idle. */
+    BOOL stale;
 };
 
 struct range_array
@@ -80,18 +85,51 @@ struct range_array
     size_t capacity;
 };
 
+struct thread_binding
+{
+    uc_context *context;
+    uint64_t process_instance;
+    uint64_t id;
+    BOOL context_valid;
+    BOOL active;
+};
+
 struct thread_engine
 {
     struct thread_engine *next;
     uc_engine *uc;
+    /* Actual Unicorn mappings, not a copy of the canonical process registry.
+     * Keeping untouched canonical ranges absent lets each pooled engine fault
+     * in only the guest regions reached by concurrent translated execution. */
+    struct range_array mapped_ranges;
+    uint64_t mapping_generation;
+    uint64_t resident_binding_id;
+    uint64_t diagnostic_id;
+    unsigned int diagnostic_pool_size;
+    unsigned int diagnostic_pool_in_use;
+    unsigned int diagnostic_pool_high_water;
+    uint64_t demand_map_calls;
+    uint64_t demand_map_bytes;
+    uint64_t demand_map_4k_calls;
+    uint64_t demand_map_16k_calls;
+    uint64_t demand_map_64k_calls;
+    uint64_t demand_map_1m_calls;
+    uint64_t demand_map_large_calls;
+    uint64_t demand_map_max_size;
+    uint64_t registry_sync_calls;
+    uint64_t resync_unmap_calls;
+    uint64_t resync_unmap_bytes;
     pthread_t owner;
     BOOL linked;
+    BOOL in_use;
     BOOL running;
     atomic_bool pause_requested;
     uint64_t stack_limit;
     uint64_t stack_base;
     uint64_t transition_target;
     uint64_t fault_address;
+    uint32_t fault_access;
+    uc_err mapping_error;
     enum xtajit64_stop_reason stop_reason;
 };
 
@@ -149,6 +187,13 @@ struct provider_process
     uint64_t guest_kuser;
     uint64_t host_kuser;
     uint64_t kuser_size;
+    uint64_t instance;
+    uint64_t next_binding_id;
+    uint64_t next_diagnostic_id;
+    unsigned int engine_count;
+    unsigned int engines_in_use;
+    unsigned int engine_high_water;
+    uc_context *initial_context;
     struct range_array ranges;
     struct thread_engine *engines;
     struct arm64ec_low_observer_transaction *observer_transaction;
@@ -163,36 +208,31 @@ static pthread_key_t engine_key;
 static pthread_once_t engine_key_once = PTHREAD_ONCE_INIT;
 static int engine_key_error;
 
+#define XTAJIT64_DEMAND_MAP_MAX_SIZE \
+    ((uint64_t)4096 * XTAJIT64_GUEST_PAGE_SIZE)
+
 static NTSTATUS memory_map( void *args );
 static NTSTATUS memory_map_internal( void *args );
 static BOOL legacy_mutation_selects_low_locked( uint64_t guest, uint64_t size );
 static NTSTATUS process_term( void *args );
-static BOOL fail_test_engine_mutation(void);
 
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_range_v1) == 40 );
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_event_v1) == 72 );
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_observer_v1) == 40 );
 
 #ifdef XTAJIT64_UNIXLIB_TEST
-/* The host regression includes this translation unit and uses this single
- * deterministic failure point to prove that a partially applied multi-engine
- * mutation poisons the provider instead of publishing a mixed registry. */
-static int test_fail_engine_mutation = -1;
-static int test_engine_mutation_count;
 static int test_fail_flush_interval_append = -1;
 static int test_flush_interval_append_count;
 enum test_mutation_fault_point
 {
     TEST_MUTATION_FAULT_NONE,
     TEST_MUTATION_FAULT_AFTER_BEGIN,
-    TEST_MUTATION_FAULT_MAP_AFTER_ENGINE,
     TEST_MUTATION_FAULT_ENGINE_PAUSE,
 };
 static atomic_int test_mutation_fault_point;
 static atomic_int test_mutation_fault_entered;
 static atomic_int test_mutation_fault_release;
 static atomic_int test_mutation_waiters;
-static unsigned int test_map_engine_applications;
 static atomic_int test_hold_ec_hook;
 static atomic_int test_ec_hook_entered;
 static atomic_int test_release_ec_hook;
@@ -204,6 +244,7 @@ static atomic_int test_pause_stop_owner_violation;
 static atomic_int test_emu_start_count;
 static atomic_int test_context_write_count;
 static atomic_int test_context_read_count;
+static struct thread_engine *test_last_acquired_engine;
 static atomic_int test_check_context_read_lock;
 static atomic_int test_context_read_lock_violation;
 #endif
@@ -293,7 +334,8 @@ static BOOL ranges_can_merge( const struct mapped_range *left,
            left->host + left->size == right->host &&
            left->allocation_base == right->allocation_base &&
            left->perms == right->perms && left->state == right->state &&
-           left->domain == right->domain && left->flags == right->flags;
+           left->domain == right->domain && left->flags == right->flags &&
+           left->stale == right->stale;
 }
 
 static BOOL range_array_append( struct range_array *array, const struct mapped_range *range )
@@ -636,6 +678,45 @@ static NTSTATUS build_unmapped_registry( const struct range_array *old, uint64_t
     return STATUS_SUCCESS;
 }
 
+static void mark_engine_mappings_stale_locked( uint64_t start, uint64_t size,
+                                               uint64_t allocation_base )
+{
+    struct thread_engine *engine;
+    uint64_t end = size ? start + size : 0;
+
+    for (engine = provider.engines; engine; engine = engine->next)
+    {
+        size_t i = 0;
+
+        if (size)
+        {
+            size_t left = 0, right = engine->mapped_ranges.count;
+
+            while (left < right)
+            {
+                size_t mid = left + (right - left) / 2;
+                const struct mapped_range *range = &engine->mapped_ranges.data[mid];
+
+                if (range->guest + range->size <= start) left = mid + 1;
+                else right = mid;
+            }
+            i = left;
+        }
+        for (; i < engine->mapped_ranges.count; ++i)
+        {
+            struct mapped_range *range = &engine->mapped_ranges.data[i];
+
+            if (size)
+            {
+                if (range->guest >= end) break;
+                if (!range_overlaps( range, start, end )) continue;
+            }
+            else if (range->allocation_base != allocation_base) continue;
+            range->stale = TRUE;
+        }
+    }
+}
+
 static NTSTATUS build_protected_registry( const struct range_array *old, uint64_t start,
                                           uint64_t end, unsigned int perms,
                                           struct range_array *result )
@@ -702,59 +783,168 @@ static uc_err unmap_range( struct thread_engine *engine, uint64_t guest, uint64_
     return uc_mem_unmap( engine->uc, guest, size );
 }
 
-static uc_err unmap_registry_intersections( struct thread_engine *engine,
-                                            const struct range_array *ranges,
-                                            uint64_t start, uint64_t end )
+static void trace_mapping_diagnostic( const struct thread_engine *engine,
+                                      const char *event, uint64_t latest_size )
 {
-    size_t i;
-    uc_err err;
-
-    for (i = 0; i < ranges->count; ++i)
-    {
-        const struct mapped_range *range = &ranges->data[i];
-        uint64_t range_end = range->guest + range->size;
-        uint64_t overlap_start, overlap_end;
-
-        if (range->state != MEM_COMMIT || !range_overlaps( range, start, end )) continue;
-        overlap_start = max( range->guest, start );
-        overlap_end = min( range_end, end );
-        if ((err = unmap_range( engine, overlap_start, overlap_end - overlap_start )) != UC_ERR_OK)
-            return err;
-    }
-    return UC_ERR_OK;
+#ifdef XTAJIT64_UNIXLIB_TEST
+    (void)engine;
+    (void)event;
+    (void)latest_size;
+#else
+    TRACE_(xtajitmap)(
+        "pid %ld engine %llu pool=%u/%u/%u event %s maps %llu bytes %llu "
+        "buckets 4k=%llu 16k=%llu "
+        "64k=%llu 1m=%llu large=%llu max=%llu latest=%llu mapped=%zu "
+        "syncs=%llu resync-unmaps=%llu/%llu generation=%llu\n",
+        (long)getpid(), (unsigned long long)engine->diagnostic_id,
+        engine->diagnostic_pool_in_use, engine->diagnostic_pool_size,
+        engine->diagnostic_pool_high_water, event,
+        (unsigned long long)engine->demand_map_calls,
+        (unsigned long long)engine->demand_map_bytes,
+        (unsigned long long)engine->demand_map_4k_calls,
+        (unsigned long long)engine->demand_map_16k_calls,
+        (unsigned long long)engine->demand_map_64k_calls,
+        (unsigned long long)engine->demand_map_1m_calls,
+        (unsigned long long)engine->demand_map_large_calls,
+        (unsigned long long)engine->demand_map_max_size,
+        (unsigned long long)latest_size, engine->mapped_ranges.count,
+        (unsigned long long)engine->registry_sync_calls,
+        (unsigned long long)engine->resync_unmap_calls,
+        (unsigned long long)engine->resync_unmap_bytes,
+        (unsigned long long)engine->mapping_generation );
+#endif
 }
 
-static uc_err unmap_allocation_ranges( struct thread_engine *engine,
-                                       const struct range_array *ranges,
-                                       uint64_t allocation_base )
+static const struct mapped_range *find_canonical_mapping( uint64_t address,
+                                                          uint64_t size,
+                                                          unsigned int perms )
 {
-    size_t i;
-    uc_err err;
+    const struct mapped_range *range;
+    size_t left = 0, right = provider.ranges.count;
+    uint64_t end;
 
-    for (i = 0; i < ranges->count; ++i)
+    if (!size || address > UINT64_MAX - size) return NULL;
+    end = address + size;
+    while (left < right)
     {
-        const struct mapped_range *range = &ranges->data[i];
+        size_t mid = left + (right - left) / 2;
 
-        if (range->state != MEM_COMMIT || range->allocation_base != allocation_base) continue;
-        if ((err = unmap_range( engine, range->guest, range->size )) != UC_ERR_OK) return err;
+        if (provider.ranges.data[mid].guest <= address) left = mid + 1;
+        else right = mid;
     }
-    return UC_ERR_OK;
+    if (!left) return NULL;
+    range = &provider.ranges.data[left - 1];
+    if (range->state != MEM_COMMIT || range->size > UINT64_MAX - range->guest ||
+        address < range->guest || end > range->guest + range->size ||
+        (range->perms & perms) != perms)
+        return NULL;
+    return range;
 }
 
-static uc_err map_registry( struct thread_engine *engine, const struct range_array *ranges )
+static uc_err demand_map_canonical_range( struct thread_engine *engine,
+                                          uint64_t address, uint64_t size,
+                                          unsigned int perms, BOOL *found,
+                                          BOOL *mapped )
 {
-    size_t i;
+    const struct mapped_range *range;
+    struct mapped_range mapping;
+    struct range_array replacement = {0}, old;
+    uint64_t start, end, mapping_start, mapping_end, range_end;
+    NTSTATUS status;
     uc_err err;
+    size_t i;
 
-    for (i = 0; i < ranges->count; ++i)
+    *found = FALSE;
+    *mapped = FALSE;
+    if (!(range = find_canonical_mapping( address, size, 0 ))) return UC_ERR_MAP;
+    *found = TRUE;
+    /* An engine that has not touched a canonical page reports UNMAPPED even
+     * when the requested guest access violates that page's protection.  Keep
+     * this as a Windows access violation instead of misclassifying it as a
+     * late native mapping that should be registered again. */
+    if ((range->perms & perms) != perms) return UC_ERR_OK;
+
+    range_end = range->guest + range->size;
+    if (!align_range( address, size, &start, &end ) ||
+        start < range->guest || end > range_end)
+        return UC_ERR_ARG;
+
+    /* Canonical ranges can split or coalesce between generations.  Map the
+     * entire still-unmapped gap containing the fault, bounded by retained
+     * actual mappings.  Mapping the whole enlarged canonical range would
+     * collide with a retained prefix or suffix; mapping one guest page per
+     * fault makes Unicorn rebuild its MemoryRegion topology thousands of times
+     * during a large application startup. */
+    mapping_start = range->guest;
+    mapping_end = range_end;
+    for (i = 0; i < engine->mapped_ranges.count; ++i)
     {
-        const struct mapped_range *range = &ranges->data[i];
+        const struct mapped_range *mapped = &engine->mapped_ranges.data[i];
+        uint64_t mapped_end;
 
-        if (range->state != MEM_COMMIT) continue;
-        if ((err = map_host_range( engine, range->guest, range->host, range->size,
-                                   range->perms )) != UC_ERR_OK)
-            return err;
+        if (mapped->size > UINT64_MAX - mapped->guest) return UC_ERR_ARG;
+        mapped_end = mapped->guest + mapped->size;
+        if (mapped_end <= start)
+        {
+            mapping_start = max( mapping_start, mapped_end );
+            continue;
+        }
+        if (mapped->guest >= end)
+        {
+            mapping_end = min( mapping_end, mapped->guest );
+            break;
+        }
+        return UC_ERR_MAP;
     }
+    if (mapping_start > start || mapping_end < end || mapping_start >= mapping_end)
+        return UC_ERR_MAP;
+    if (mapping_end - mapping_start > XTAJIT64_DEMAND_MAP_MAX_SIZE)
+    {
+        /* Keep large image and sparse reservation faults coarse enough to avoid
+         * per-page hook churn, but do not force every pooled engine to
+         * instantiate hundreds of megabytes after a single code or data touch.
+         * The required Unicorn contract invokes invalid-memory hooks for an
+         * unmapped atomic read-modify-write target, so writable data can follow
+         * this same bounded first-touch path without eager process-wide
+         * cloning into every engine. */
+        mapping_start = start;
+        mapping_end = min( mapping_end,
+                           mapping_start + XTAJIT64_DEMAND_MAP_MAX_SIZE );
+        if (mapping_end < end) return UC_ERR_ARG;
+    }
+    mapping = range_slice( range, mapping_start, mapping_end );
+
+    for (i = 0; i < engine->mapped_ranges.count; ++i)
+        if (range_overlaps( &engine->mapped_ranges.data[i], mapping.guest,
+                            mapping.guest + mapping.size ))
+            return UC_ERR_MAP;
+    status = build_mapped_registry( &engine->mapped_ranges, &mapping, &replacement );
+    if (status) return status == STATUS_NO_MEMORY ? UC_ERR_NOMEM : UC_ERR_ARG;
+    if ((err = map_host_range( engine, mapping.guest, mapping.host, mapping.size,
+                               mapping.perms )) != UC_ERR_OK)
+    {
+        range_array_free( &replacement );
+        return err;
+    }
+
+    old = engine->mapped_ranges;
+    engine->mapped_ranges = replacement;
+    range_array_free( &old );
+
+    ++engine->demand_map_calls;
+    engine->demand_map_bytes += mapping.size;
+    if (mapping.size <= XTAJIT64_GUEST_PAGE_SIZE) ++engine->demand_map_4k_calls;
+    else if (mapping.size <= 4 * XTAJIT64_GUEST_PAGE_SIZE)
+        ++engine->demand_map_16k_calls;
+    else if (mapping.size <= 16 * XTAJIT64_GUEST_PAGE_SIZE)
+        ++engine->demand_map_64k_calls;
+    else if (mapping.size <= 256 * XTAJIT64_GUEST_PAGE_SIZE)
+        ++engine->demand_map_1m_calls;
+    else ++engine->demand_map_large_calls;
+    engine->demand_map_max_size = max( engine->demand_map_max_size, mapping.size );
+    if (!(engine->demand_map_calls & (engine->demand_map_calls - 1)))
+        trace_mapping_diagnostic( engine, "map", mapping.size );
+    *mapped = TRUE;
     return UC_ERR_OK;
 }
 
@@ -818,7 +1008,6 @@ static void test_mutation_fault_checkpoint( int point )
     (void)point;
 }
 # define TEST_MUTATION_FAULT_AFTER_BEGIN 0
-# define TEST_MUTATION_FAULT_MAP_AFTER_ENGINE 0
 # define TEST_MUTATION_FAULT_ENGINE_PAUSE 0
 #endif
 
@@ -828,6 +1017,15 @@ static BOOL any_engine_running_locked(void)
 
     for (engine = provider.engines; engine; engine = engine->next)
         if (engine->running) return TRUE;
+    return FALSE;
+}
+
+static BOOL any_engine_in_use_locked(void)
+{
+    struct thread_engine *engine;
+
+    for (engine = provider.engines; engine; engine = engine->next)
+        if (engine->in_use) return TRUE;
     return FALSE;
 }
 
@@ -1025,8 +1223,11 @@ static bool invalid_memory_hook( uc_engine *uc, uc_mem_type type, uint64_t addre
                                  int size, int64_t value, void *user )
 {
     struct thread_engine *engine = user;
+    unsigned int required_perms = 0;
+    uint32_t fault_access = EXCEPTION_READ_FAULT;
+    BOOL found = FALSE, mapped = FALSE;
+    uc_err err;
 
-    (void)size;
     (void)value;
     if (type == UC_MEM_FETCH_UNMAPPED && is_ec_code( address ) &&
         unmapped_ec_target_is_executable( address ))
@@ -1035,8 +1236,58 @@ static bool invalid_memory_hook( uc_engine *uc, uc_mem_type type, uint64_t addre
         return false;
     }
 
+    switch (type)
+    {
+    case UC_MEM_READ_UNMAPPED:
+    case UC_MEM_READ_PROT:
+        required_perms = type == UC_MEM_READ_UNMAPPED ? UC_PROT_READ : 0;
+        fault_access = EXCEPTION_READ_FAULT;
+        break;
+    case UC_MEM_WRITE_UNMAPPED:
+    case UC_MEM_WRITE_PROT:
+        required_perms = type == UC_MEM_WRITE_UNMAPPED ? UC_PROT_WRITE : 0;
+        fault_access = EXCEPTION_WRITE_FAULT;
+        break;
+    case UC_MEM_FETCH_UNMAPPED:
+    case UC_MEM_FETCH_PROT:
+        required_perms = type == UC_MEM_FETCH_UNMAPPED ? UC_PROT_EXEC : 0;
+        fault_access = EXCEPTION_EXECUTE_FAULT;
+        break;
+    default: break;
+    }
+    if (required_perms && size > 0)
+    {
+        err = demand_map_canonical_range( engine, address, size,
+                                          required_perms, &found, &mapped );
+        if (err == UC_ERR_OK && mapped) return true;
+        if (err == UC_ERR_OK && found)
+        {
+            engine->fault_address = address;
+            engine->fault_access = fault_access;
+            engine->stop_reason = XTAJIT64_STOP_MEMORY_FAULT;
+            uc_emu_stop( uc );
+            return false;
+        }
+        if (found)
+        {
+            engine->fault_address = address;
+            engine->fault_access = fault_access;
+            engine->mapping_error = err;
+            engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+            uc_emu_stop( uc );
+            return false;
+        }
+    }
+
     engine->fault_address = address;
-    engine->stop_reason = XTAJIT64_STOP_MEMORY_FAULT;
+    engine->fault_access = fault_access;
+    /* A committed identity mapping can be created by a native Unixlib through
+     * ntdll.so without traversing the ARM64EC PE syscall notification.  Let
+     * the PE side query this exact address once before deciding that the guest
+     * access is invalid.  Protection faults already have an authoritative
+     * engine mapping and remain ordinary Windows access violations. */
+    engine->stop_reason = required_perms ? XTAJIT64_STOP_MAPPING_MISS :
+                                           XTAJIT64_STOP_MEMORY_FAULT;
     uc_emu_stop( uc );
     return false;
 }
@@ -1070,12 +1321,21 @@ static uc_err open_thread_engine( struct thread_engine *engine )
     uc_err err;
 
     if ((err = uc_open( UC_ARCH_X86, UC_MODE_64, &engine->uc )) != UC_ERR_OK) return err;
-    if ((err = install_engine_hooks( engine )) != UC_ERR_OK ||
-        (err = map_registry( engine, &provider.ranges )) != UC_ERR_OK)
+#ifdef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
+    if ((err = uc_enable_shared_memory_atomics( engine->uc )) != UC_ERR_OK)
     {
         uc_close( engine->uc );
         engine->uc = NULL;
+        return err;
     }
+#endif
+    if ((err = install_engine_hooks( engine )) != UC_ERR_OK)
+    {
+        range_array_free( &engine->mapped_ranges );
+        uc_close( engine->uc );
+        engine->uc = NULL;
+    }
+    else engine->mapping_generation = 0;
     return err;
 }
 
@@ -1170,43 +1430,114 @@ static uc_err prepare_x64_syscall_engine( struct thread_engine *engine,
     return UC_ERR_OK;
 }
 
-static void unlink_engine_locked( struct thread_engine *engine )
+static uc_err create_pool_engine_locked( struct thread_engine **result )
 {
-    struct thread_engine **cursor;
+    struct thread_engine *engine;
+    uc_context *initial_context = NULL;
+    uc_err err;
 
-    if (!engine->linked) return;
-    for (cursor = &provider.engines; *cursor && *cursor != engine; cursor = &(*cursor)->next);
-    if (*cursor == engine) *cursor = engine->next;
-    engine->next = NULL;
-    engine->linked = FALSE;
+    if (!(engine = calloc( 1, sizeof(*engine) ))) return UC_ERR_NOMEM;
+    atomic_init( &engine->pause_requested, false );
+    if ((err = open_thread_engine( engine )) != UC_ERR_OK) goto failed;
+    if (!provider.initial_context)
+    {
+        if ((err = uc_context_alloc( engine->uc, &initial_context )) != UC_ERR_OK ||
+            (err = uc_context_save( engine->uc, initial_context )) != UC_ERR_OK)
+            goto failed;
+        provider.initial_context = initial_context;
+    }
+    engine->diagnostic_id = ++provider.next_diagnostic_id;
+    engine->next = provider.engines;
+    provider.engines = engine;
+    engine->linked = TRUE;
+    ++provider.engine_count;
+    if (result) *result = engine;
+    return UC_ERR_OK;
+
+failed:
+    if (initial_context) uc_context_free( initial_context );
+    if (engine->uc) uc_close( engine->uc );
+    range_array_free( &engine->mapped_ranges );
+    free( engine );
+    return err;
 }
 
-static void destroy_thread_engine( void *value )
+static uc_err acquire_pool_engine_locked( struct thread_binding *binding,
+                                          struct thread_engine **result )
 {
-    struct thread_engine *engine = value;
-    uc_engine *uc;
+    struct thread_engine *engine, *idle = NULL;
+    uc_err err;
 
-    if (!engine) return;
-    pthread_mutex_lock( &provider.mutex );
-    while (provider.mutating && provider.initialized)
-        pthread_cond_wait( &provider.cond, &provider.mutex );
-    if (engine->running)
+    for (engine = provider.engines; engine; engine = engine->next)
     {
-        poison_provider_locked( STATUS_UNSUCCESSFUL );
-        request_engine_pause_locked( engine );
-        while (engine->running) pthread_cond_wait( &provider.cond, &provider.mutex );
+        if (engine->in_use) continue;
+        if (!idle) idle = engine;
+        if (engine->resident_binding_id == binding->id) break;
     }
-    unlink_engine_locked( engine );
-    uc = engine->uc;
-    engine->uc = NULL;
-    pthread_mutex_unlock( &provider.mutex );
-    if (uc) uc_close( uc );
-    free( engine );
+    if (!engine) engine = idle;
+    if (!engine && (err = create_pool_engine_locked( &engine )) != UC_ERR_OK)
+        return err;
+    if (!binding->context &&
+        (err = uc_context_alloc( engine->uc, &binding->context )) != UC_ERR_OK)
+        return err;
+    if (engine->resident_binding_id != binding->id &&
+        (err = uc_context_restore( engine->uc, binding->context_valid ?
+                                   binding->context : provider.initial_context )) != UC_ERR_OK)
+        return err;
+
+    engine->resident_binding_id = 0;
+    engine->owner = pthread_self();
+    engine->in_use = TRUE;
+    ++provider.engines_in_use;
+    provider.engine_high_water = max( provider.engine_high_water,
+                                      provider.engines_in_use );
+    engine->diagnostic_pool_size = provider.engine_count;
+    engine->diagnostic_pool_in_use = provider.engines_in_use;
+    engine->diagnostic_pool_high_water = provider.engine_high_water;
+    binding->active = TRUE;
+#ifdef XTAJIT64_UNIXLIB_TEST
+    test_last_acquired_engine = engine;
+#endif
+    *result = engine;
+    return UC_ERR_OK;
+}
+
+static uc_err release_pool_engine_locked( struct thread_binding *binding,
+                                          struct thread_engine *engine,
+                                          BOOL save_context )
+{
+    uc_err err = UC_ERR_OK;
+
+    if (save_context)
+    {
+        err = uc_context_save( engine->uc, binding->context );
+        if (err == UC_ERR_OK)
+        {
+            binding->context_valid = TRUE;
+            engine->resident_binding_id = binding->id;
+        }
+    }
+    else engine->resident_binding_id = 0;
+    engine->running = FALSE;
+    engine->in_use = FALSE;
+    --provider.engines_in_use;
+    binding->active = FALSE;
+    pthread_cond_broadcast( &provider.cond );
+    return err;
+}
+
+static void destroy_thread_binding( void *value )
+{
+    struct thread_binding *binding = value;
+
+    if (!binding) return;
+    if (binding->context) uc_context_free( binding->context );
+    free( binding );
 }
 
 static void make_engine_key(void)
 {
-    engine_key_error = pthread_key_create( &engine_key, destroy_thread_engine );
+    engine_key_error = pthread_key_create( &engine_key, destroy_thread_binding );
 }
 
 static NTSTATUS merge_range_arrays( const struct range_array *left,
@@ -1391,6 +1722,7 @@ static NTSTATUS build_observer_ranges(
                             protection_to_unicorn( input->protect ) : UC_PROT_NONE;
             mapping.state = input->state;
             mapping.domain = XTAJIT64_MEMORY_ADDRESS_AMD64_LOW;
+            mapping.stale = FALSE;
             if (!range_array_append( result, &mapping )) return STATUS_INVALID_PARAMETER;
         }
         cursor = input_end;
@@ -1467,43 +1799,6 @@ done:
     return status;
 }
 
-static uc_err apply_observer_event_to_engine( struct thread_engine *engine,
-                                               const struct range_array *old,
-                                               const struct range_array *captured,
-                                               uint64_t start, uint64_t end,
-                                               BOOL full_snapshot )
-{
-    uc_err err;
-    size_t i;
-
-    for (i = 0; i < old->count; ++i)
-    {
-        const struct mapped_range *range = &old->data[i];
-        uint64_t overlap_start, overlap_end;
-
-        if (range->domain != XTAJIT64_MEMORY_ADDRESS_AMD64_LOW ||
-            range->state != MEM_COMMIT || !range_overlaps( range, start, end ))
-            continue;
-        overlap_start = max( range->guest, start );
-        overlap_end = min( range->guest + range->size, end );
-        if ((err = unmap_range( engine, overlap_start,
-                                overlap_end - overlap_start )) != UC_ERR_OK)
-            return err;
-    }
-    for (i = 0; i < captured->count; ++i)
-    {
-        const struct mapped_range *range = &captured->data[i];
-
-        if (range->state != MEM_COMMIT) continue;
-        if ((err = map_host_range( engine, range->guest, range->host,
-                                   range->size, range->perms )) != UC_ERR_OK)
-            return err;
-    }
-    if (full_snapshot) return uc_ctl_flush_tb( engine->uc );
-    if (start == end) return UC_ERR_OK;
-    return uc_ctl_remove_cache( engine->uc, start, end );
-}
-
 static int32_t arm64ec_low_observer_begin_callback(
     void *context, uint32_t operation, uint64_t host_address, uint64_t size,
     uint64_t host_allocation_base, void **transaction_ret )
@@ -1572,7 +1867,6 @@ static void arm64ec_low_observer_complete_callback(
 {
     struct arm64ec_low_observer_transaction *transaction = NULL;
     struct range_array captured = {0}, replacement = {0};
-    struct thread_engine *engine;
     volatile NTSTATUS status = STATUS_SUCCESS;
     volatile BOOL faulted = FALSE;
     enum mutation_kind fault_kind = MUTATION_NONE;
@@ -1581,7 +1875,6 @@ static void arm64ec_low_observer_complete_callback(
     uint64_t free_bytes = 0, reserve_bytes = 0, commit_bytes = 0;
     uint64_t free_ranges = 0, reserve_ranges = 0, commit_ranges = 0;
     BOOL full_snapshot = FALSE;
-    uc_err err = UC_ERR_OK;
     size_t i;
 
     pthread_mutex_lock( &provider.mutex );
@@ -1608,28 +1901,14 @@ static void arm64ec_low_observer_complete_callback(
             status = build_observer_replacement( &provider.ranges, &captured,
                                                  guest_start, guest_end,
                                                  full_snapshot, &replacement );
-        if (!status)
-        {
-            set_mutation_stage_locked( MUTATION_STAGE_APPLY );
-#ifdef XTAJIT64_UNIXLIB_TEST
-            test_engine_mutation_count = 0;
-#endif
-            for (engine = provider.engines; engine; engine = engine->next)
-                if (fail_test_engine_mutation() ||
-                    (err = apply_observer_event_to_engine( engine, &provider.ranges,
-                                                           &captured, guest_start,
-                                                           guest_end,
-                                                           full_snapshot )) != UC_ERR_OK)
-                {
-                    status = STATUS_UNSUCCESSFUL;
-                    break;
-                }
-        }
+        if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
         if (!status)
         {
             struct range_array old = provider.ranges;
 
             set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
+            mark_engine_mappings_stale_locked( guest_start,
+                                               guest_end - guest_start, 0 );
             for (i = 0; i < (size_t)event->range_count; ++i)
             {
                 switch (event->ranges[i].state)
@@ -1692,8 +1971,8 @@ static void arm64ec_low_observer_complete_callback(
     if (faulted)
         report_mutation_access_violation( fault_kind, fault_stage, fault_generation );
     else if (status)
-        WARN( "cannot publish ARM64EC LOW memory event status %#x: %s\n",
-              (unsigned int)status, uc_strerror( err ) );
+        WARN( "cannot publish ARM64EC LOW memory event status %#x\n",
+              (unsigned int)status );
     range_array_free( &captured );
     range_array_free( &replacement );
     free( transaction );
@@ -1762,6 +2041,7 @@ static NTSTATUS process_init( void *args )
     NTSTATUS status;
     unsigned int major, minor;
 
+    TRACE( "CPU provider interface %s\n", XTAJIT64_PROVIDER_ABI_IDENTITY );
     if (!params) return STATUS_INVALID_PARAMETER;
     if (params->abi_version != XTAJIT64_PROCESS_ABI_VERSION ||
         params->abi_size != sizeof(*params) ||
@@ -1801,6 +2081,8 @@ static NTSTATUS process_init( void *args )
     }
 
     pthread_mutex_lock( &provider.mutex );
+    while (provider.shutting_down)
+        pthread_cond_wait( &provider.cond, &provider.mutex );
     if (provider.initialized)
     {
         pthread_mutex_unlock( &provider.mutex );
@@ -1815,6 +2097,12 @@ static NTSTATUS process_init( void *args )
     provider.guest_kuser = params->guest_kuser;
     provider.host_kuser = params->host_kuser;
     provider.kuser_size = params->kuser_size;
+    provider.next_diagnostic_id = 0;
+    provider.next_binding_id = 0;
+    provider.engine_count = 0;
+    provider.engines_in_use = 0;
+    provider.engine_high_water = 0;
+    if (!++provider.instance) ++provider.instance;
     provider.poison_status = STATUS_SUCCESS;
     provider.last_fault_kind = MUTATION_NONE;
     provider.last_fault_stage = MUTATION_STAGE_IDLE;
@@ -1833,6 +2121,7 @@ static NTSTATUS process_init( void *args )
     kuser.domain = XTAJIT64_MEMORY_ADDRESS_INVALID;
     kuser.flags = 0;
     kuser.permanent = TRUE;
+    kuser.stale = FALSE;
     if (!range_array_append( &provider.ranges, &kuser ))
     {
         range_array_free( &provider.ranges );
@@ -1858,6 +2147,9 @@ static NTSTATUS process_init( void *args )
     else
     {
         params->enabled_capabilities = XTAJIT64_CAPABILITIES;
+#ifndef XTAJIT64_UNIXLIB_TEST
+        TRACE_(xtajitmap)( "schema 1 initialized\n" );
+#endif
         TRACE( "initialized Unicorn %u.%u provider registry, KUSER guest %p host %p, "
                "RtlExitUserThread %p, x64 syscall dispatcher %p count %u\n", major, minor,
                (void *)(uintptr_t)params->guest_kuser,
@@ -1877,7 +2169,7 @@ static NTSTATUS process_init( void *args )
 
 static NTSTATUS process_term( void *args )
 {
-    struct thread_engine *engine;
+    struct thread_engine *engine, *next;
     (void)args;
     pthread_mutex_lock( &provider.mutex );
     if (!provider.initialized)
@@ -1894,15 +2186,29 @@ static NTSTATUS process_term( void *args )
     while (any_engine_running_locked())
         pthread_cond_wait( &provider.cond, &provider.mutex );
 
-    for (engine = provider.engines; engine; engine = engine->next)
+    /* A simulation paused for this mutation still owns its engine while it
+     * waits to discover the terminal provider state.  Publish that state first,
+     * then wait for every borrower to return before closing pooled engines. */
+    provider.initialized = FALSE;
+    pthread_cond_broadcast( &provider.cond );
+    while (any_engine_in_use_locked())
+        pthread_cond_wait( &provider.cond, &provider.mutex );
+
+    for (engine = provider.engines; engine; engine = next)
     {
+        next = engine->next;
+        trace_mapping_diagnostic( engine, "final", 0 );
         if (engine->uc) uc_close( engine->uc );
-        engine->uc = NULL;
-        engine->linked = FALSE;
+        range_array_free( &engine->mapped_ranges );
+        free( engine );
     }
     provider.engines = NULL;
+    provider.engine_count = 0;
+    provider.engines_in_use = 0;
+    provider.engine_high_water = 0;
+    if (provider.initial_context) uc_context_free( provider.initial_context );
+    provider.initial_context = NULL;
     range_array_free( &provider.ranges );
-    provider.initialized = FALSE;
     provider.observer_active = FALSE;
     provider.observer_transaction = NULL;
     provider.ec_bitmap = NULL;
@@ -1923,83 +2229,59 @@ static NTSTATUS process_term( void *args )
 
 static NTSTATUS thread_init( void *args )
 {
-    struct thread_engine *engine;
+    struct thread_binding *binding, *current;
+    NTSTATUS status = STATUS_SUCCESS;
     uc_err err;
     int ret;
 
     (void)args;
     pthread_once( &engine_key_once, make_engine_key );
     if (engine_key_error) return STATUS_NO_MEMORY;
-    if ((engine = pthread_getspecific( engine_key )))
-    {
-        if (engine->uc && engine->linked) return STATUS_SUCCESS;
-        pthread_setspecific( engine_key, NULL );
-        destroy_thread_engine( engine );
-    }
-    if (!(engine = calloc( 1, sizeof(*engine) ))) return STATUS_NO_MEMORY;
-    atomic_init( &engine->pause_requested, false );
-    engine->owner = pthread_self();
+    current = pthread_getspecific( engine_key );
+    if (!(binding = calloc( 1, sizeof(*binding) ))) return STATUS_NO_MEMORY;
 
     pthread_mutex_lock( &provider.mutex );
     while (provider.mutating && provider.initialized)
         pthread_cond_wait( &provider.cond, &provider.mutex );
     if (!provider.initialized || provider.shutting_down)
+        status = STATUS_INVALID_HANDLE;
+    else if (provider.poison_status) status = provider.poison_status;
+    else if (current && current->process_instance == provider.instance)
+        status = STATUS_SUCCESS;
+    else if (!provider.engines &&
+             (err = create_pool_engine_locked( NULL )) != UC_ERR_OK)
     {
-        pthread_mutex_unlock( &provider.mutex );
-        free( engine );
-        return STATUS_INVALID_HANDLE;
+        WARN( "cannot initialize pooled x64 engine: %s\n", uc_strerror( err ) );
+        status = STATUS_NOT_SUPPORTED;
     }
-    if (provider.poison_status)
+    if (!status && (!current || current->process_instance != provider.instance))
     {
-        NTSTATUS status = provider.poison_status;
-
-        pthread_mutex_unlock( &provider.mutex );
-        free( engine );
-        return status;
-    }
-    if ((err = open_thread_engine( engine )) != UC_ERR_OK)
-    {
-        WARN( "cannot initialize thread-owned x64 engine: %s\n", uc_strerror( err ) );
-        pthread_mutex_unlock( &provider.mutex );
-        free( engine );
-        return STATUS_NOT_SUPPORTED;
-    }
-    engine->next = provider.engines;
-    provider.engines = engine;
-    engine->linked = TRUE;
-    if ((ret = pthread_setspecific( engine_key, engine )))
-    {
-        unlink_engine_locked( engine );
-        uc_close( engine->uc );
-        pthread_mutex_unlock( &provider.mutex );
-        free( engine );
-        return ret == ENOMEM ? STATUS_NO_MEMORY : STATUS_UNSUCCESSFUL;
+        binding->process_instance = provider.instance;
+        if (!(binding->id = ++provider.next_binding_id))
+            binding->id = ++provider.next_binding_id;
+        if ((ret = pthread_setspecific( engine_key, binding )))
+            status = ret == ENOMEM ? STATUS_NO_MEMORY : STATUS_UNSUCCESSFUL;
     }
     pthread_mutex_unlock( &provider.mutex );
-    return STATUS_SUCCESS;
+    if (!status && current && current->process_instance == provider.instance)
+        free( binding );
+    else if (status) free( binding );
+    else if (current) destroy_thread_binding( current );
+    return status;
 }
 
 static NTSTATUS thread_term( void *args )
 {
-    struct thread_engine *engine;
+    struct thread_binding *binding;
 
     (void)args;
     pthread_once( &engine_key_once, make_engine_key );
     if (engine_key_error) return STATUS_UNSUCCESSFUL;
-    if (!(engine = pthread_getspecific( engine_key ))) return STATUS_SUCCESS;
+    if (!(binding = pthread_getspecific( engine_key ))) return STATUS_SUCCESS;
+    if (binding->active) return STATUS_INVALID_DEVICE_STATE;
     pthread_setspecific( engine_key, NULL );
-    destroy_thread_engine( engine );
+    destroy_thread_binding( binding );
     return STATUS_SUCCESS;
-}
-
-static BOOL fail_test_engine_mutation(void)
-{
-#ifdef XTAJIT64_UNIXLIB_TEST
-    return test_fail_engine_mutation >= 0 &&
-           test_engine_mutation_count++ == test_fail_engine_mutation;
-#else
-    return FALSE;
-#endif
 }
 
 static NTSTATUS memory_map_internal( void *args )
@@ -2007,7 +2289,6 @@ static NTSTATUS memory_map_internal( void *args )
     const struct xtajit64_memory_params *params = args;
     struct mapped_range mapping;
     struct range_array replacement = {0};
-    struct thread_engine *engine;
     uint64_t start, end, host_start, host_end;
     volatile NTSTATUS status = STATUS_SUCCESS;
     volatile BOOL faulted = FALSE;
@@ -2015,7 +2296,6 @@ static NTSTATUS memory_map_internal( void *args )
     enum mutation_kind fault_kind = MUTATION_NONE;
     enum mutation_stage fault_stage = MUTATION_STAGE_IDLE;
     uint64_t fault_generation = 0;
-    uc_err err = UC_ERR_OK;
 
     if (!params || params->flags || !params->guest || !params->host || !params->size ||
         !params->allocation_base ||
@@ -2037,6 +2317,7 @@ static NTSTATUS memory_map_internal( void *args )
     mapping.domain = XTAJIT64_MEMORY_ADDRESS_IDENTITY;
     mapping.flags = 0;
     mapping.permanent = FALSE;
+    mapping.stale = FALSE;
 
     pthread_mutex_lock( &provider.mutex );
     if (legacy_mutation_selects_low_locked( start, end - start ))
@@ -2060,30 +2341,6 @@ static NTSTATUS memory_map_internal( void *args )
         if (!status)
             status = build_mapped_registry( &provider.ranges, &mapping, &replacement );
         if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
-        if (!status)
-        {
-#ifdef XTAJIT64_UNIXLIB_TEST
-            test_engine_mutation_count = 0;
-            test_map_engine_applications = 0;
-#endif
-            for (engine = provider.engines; engine; engine = engine->next)
-            {
-                if (fail_test_engine_mutation() ||
-                    (err = unmap_registry_intersections( engine, &provider.ranges,
-                                                          start, end )) != UC_ERR_OK ||
-                    (err = map_host_range( engine, mapping.guest, mapping.host,
-                                           mapping.size, mapping.perms )) != UC_ERR_OK ||
-                    (err = uc_ctl_remove_cache( engine->uc, start, end )) != UC_ERR_OK)
-                {
-                    status = STATUS_UNSUCCESSFUL;
-                    break;
-                }
-#ifdef XTAJIT64_UNIXLIB_TEST
-                if (++test_map_engine_applications == 1)
-                    test_mutation_fault_checkpoint( TEST_MUTATION_FAULT_MAP_AFTER_ENGINE );
-#endif
-            }
-        }
         if (!status)
         {
             struct range_array old = provider.ranges;
@@ -2118,9 +2375,9 @@ static NTSTATUS memory_map_internal( void *args )
     else
     {
         if (report_error)
-            WARN( "cannot map guest %p size %#llx: %s, status %#x\n",
+            WARN( "cannot map guest %p size %#llx: status %#x\n",
                   (void *)(uintptr_t)start, (unsigned long long)(end - start),
-                  uc_strerror( err ), (unsigned int)status );
+                  (unsigned int)status );
         range_array_free( &replacement );
     }
     return status;
@@ -2162,7 +2419,6 @@ static NTSTATUS memory_unmap( void *args )
 {
     const struct xtajit64_memory_params *params = args;
     struct range_array replacement = {0};
-    struct thread_engine *engine;
     uint64_t guest = 0, size = 0;
     volatile NTSTATUS status = STATUS_SUCCESS;
     volatile BOOL faulted = FALSE;
@@ -2170,7 +2426,6 @@ static NTSTATUS memory_unmap( void *args )
     enum mutation_kind fault_kind = MUTATION_NONE;
     enum mutation_stage fault_stage = MUTATION_STAGE_IDLE;
     uint64_t fault_generation = 0;
-    uc_err err = UC_ERR_OK;
 
     if (!params || (params->flags & ~XTAJIT64_MEMORY_VALID_FLAGS) ||
         !params->guest || params->guest > XTAJIT64_X64_USER_ADDRESS_MAX)
@@ -2215,28 +2470,10 @@ static NTSTATUS memory_unmap( void *args )
         if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
         if (!status)
         {
-#ifdef XTAJIT64_UNIXLIB_TEST
-            test_engine_mutation_count = 0;
-#endif
-            for (engine = provider.engines; engine; engine = engine->next)
-            {
-                if (fail_test_engine_mutation()) err = UC_ERR_RESOURCE;
-                else if (size)
-                    err = unmap_registry_intersections( engine, &provider.ranges,
-                                                        guest, guest + size );
-                else err = unmap_allocation_ranges( engine, &provider.ranges, guest );
-                if (err != UC_ERR_OK)
-                {
-                    status = STATUS_UNSUCCESSFUL;
-                    break;
-                }
-            }
-        }
-        if (!status)
-        {
             struct range_array old = provider.ranges;
 
             set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
+            mark_engine_mappings_stale_locked( guest, size, guest );
             provider.ranges = replacement;
             memset( &replacement, 0, sizeof(replacement) );
             range_array_free( &old );
@@ -2266,9 +2503,9 @@ static NTSTATUS memory_unmap( void *args )
     else
     {
         if (report_error)
-            WARN( "cannot unmap guest %p size %#llx: %s, status %#x\n",
+            WARN( "cannot unmap guest %p size %#llx: status %#x\n",
                   (void *)(uintptr_t)guest, (unsigned long long)size,
-                  uc_strerror( err ), (unsigned int)status );
+                  (unsigned int)status );
         range_array_free( &replacement );
     }
     return status;
@@ -2278,7 +2515,6 @@ static NTSTATUS memory_protect( void *args )
 {
     const struct xtajit64_memory_params *params = args;
     struct range_array replacement = {0};
-    struct thread_engine *engine;
     uint64_t start = 0, end = 0;
     unsigned int perms;
     volatile NTSTATUS status = STATUS_SUCCESS;
@@ -2287,8 +2523,6 @@ static NTSTATUS memory_protect( void *args )
     enum mutation_kind fault_kind = MUTATION_NONE;
     enum mutation_stage fault_stage = MUTATION_STAGE_IDLE;
     uint64_t fault_generation = 0;
-    uc_err err = UC_ERR_OK;
-    size_t i;
 
     if (!params || (params->flags & ~XTAJIT64_MEMORY_VALID_FLAGS) ||
         !params->guest || !params->size)
@@ -2326,41 +2560,6 @@ static NTSTATUS memory_protect( void *args )
         if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
         if (!status)
         {
-#ifdef XTAJIT64_UNIXLIB_TEST
-            test_engine_mutation_count = 0;
-#endif
-            for (engine = provider.engines; engine; engine = engine->next)
-            {
-                if (fail_test_engine_mutation())
-                {
-                    err = UC_ERR_RESOURCE;
-                    status = STATUS_UNSUCCESSFUL;
-                    break;
-                }
-                for (i = 0; i < provider.ranges.count; ++i)
-                {
-                    const struct mapped_range *range = &provider.ranges.data[i];
-                    uint64_t overlap_start, overlap_end;
-
-                    if (!range_overlaps( range, start, end )) continue;
-                    overlap_start = max( range->guest, start );
-                    overlap_end = min( range->guest + range->size, end );
-                    if ((err = uc_mem_protect( engine->uc, overlap_start,
-                                               overlap_end - overlap_start,
-                                               perms )) != UC_ERR_OK)
-                        break;
-                }
-                if (err == UC_ERR_OK)
-                    err = uc_ctl_remove_cache( engine->uc, start, end );
-                if (err != UC_ERR_OK)
-                {
-                    status = STATUS_UNSUCCESSFUL;
-                    break;
-                }
-            }
-        }
-        if (!status)
-        {
             struct range_array old = provider.ranges;
 
             set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
@@ -2393,9 +2592,9 @@ static NTSTATUS memory_protect( void *args )
     else
     {
         if (report_error)
-            WARN( "cannot protect guest %p-%p: %s, status %#x\n",
+            WARN( "cannot protect guest %p-%p: status %#x\n",
                   (void *)(uintptr_t)start, (void *)(uintptr_t)end,
-                  uc_strerror( err ), (unsigned int)status );
+                  (unsigned int)status );
         range_array_free( &replacement );
     }
     return status;
@@ -2472,6 +2671,7 @@ static NTSTATUS build_resync_registry( const struct xtajit64_memory_resync_param
     kuser.domain = XTAJIT64_MEMORY_ADDRESS_INVALID;
     kuser.flags = 0;
     kuser.permanent = TRUE;
+    kuser.stale = FALSE;
     if (!range_array_reserve( result, params->count + 1 ))
     {
         status = STATUS_NO_MEMORY;
@@ -2518,6 +2718,7 @@ static NTSTATUS build_resync_registry( const struct xtajit64_memory_resync_param
         range.domain = XTAJIT64_MEMORY_ADDRESS_IDENTITY;
         range.flags = 0;
         range.permanent = FALSE;
+        range.stale = FALSE;
         if (!range_array_append( result, &range ))
         {
             status = STATUS_INVALID_PARAMETER;
@@ -2556,21 +2757,161 @@ done:
     return status;
 }
 
+static BOOL ranges_have_same_engine_mapping( const struct mapped_range *left,
+                                             const struct mapped_range *right,
+                                             uint64_t guest )
+{
+    uint64_t left_offset, right_offset;
+
+    if (guest < left->guest || guest < right->guest) return FALSE;
+    left_offset = guest - left->guest;
+    right_offset = guest - right->guest;
+    return left->state == MEM_COMMIT && right->state == MEM_COMMIT &&
+           left->perms == right->perms &&
+           left->host <= UINT64_MAX - left_offset &&
+           right->host <= UINT64_MAX - right_offset &&
+           left->host + left_offset == right->host + right_offset;
+}
+
+static NTSTATUS append_resync_mapping_changes( const struct range_array *source,
+                                                const struct range_array *reference,
+                                                struct range_array *changes )
+{
+    size_t i, reference_index = 0;
+
+    if (source->count > SIZE_MAX - reference->count ||
+        !range_array_reserve( changes, source->count + reference->count ))
+        return STATUS_NO_MEMORY;
+    for (i = 0; i < source->count; ++i)
+    {
+        const struct mapped_range *range = &source->data[i];
+        uint64_t cursor, end;
+        size_t j;
+
+        if (range->state != MEM_COMMIT) continue;
+        cursor = range->guest;
+        end = cursor + range->size;
+        while (reference_index < reference->count &&
+               reference->data[reference_index].guest +
+                   reference->data[reference_index].size <= cursor)
+            ++reference_index;
+        j = reference_index;
+        while (cursor < end)
+        {
+            const struct mapped_range *other;
+            struct mapped_range slice;
+            uint64_t next;
+
+            while (j < reference->count &&
+                   reference->data[j].guest + reference->data[j].size <= cursor)
+                ++j;
+            if (j == reference->count || reference->data[j].guest >= end)
+                next = end;
+            else if (reference->data[j].guest > cursor)
+                next = min( end, reference->data[j].guest );
+            else
+            {
+                other = &reference->data[j];
+                next = min( end, other->guest + other->size );
+                if (ranges_have_same_engine_mapping( range, other, cursor ))
+                {
+                    cursor = next;
+                    continue;
+                }
+            }
+            slice = range_slice( range, cursor, next );
+            if (!range_array_append( changes, &slice ))
+                return STATUS_INVALID_ADDRESS;
+            cursor = next;
+        }
+        reference_index = j;
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS build_resync_mapping_changes( const struct range_array *old,
+                                               const struct range_array *replacement,
+                                               struct range_array *removals,
+                                               struct range_array *additions )
+{
+    NTSTATUS status;
+
+    if ((status = append_resync_mapping_changes( old, replacement, removals )))
+        return status;
+    return append_resync_mapping_changes( replacement, old, additions );
+}
+
+static uc_err synchronize_engine_registry_locked( struct thread_engine *engine )
+{
+    struct range_array retained = {0}, old;
+    size_t i;
+    BOOL unmapped = FALSE;
+    uc_err err = UC_ERR_OK;
+
+    if (engine->mapping_generation == provider.generation) return UC_ERR_OK;
+    ++engine->registry_sync_calls;
+    if (!range_array_reserve( &retained, engine->mapped_ranges.count ))
+        return UC_ERR_NOMEM;
+
+    for (i = 0; i < engine->mapped_ranges.count; ++i)
+    {
+        const struct mapped_range *mapped = &engine->mapped_ranges.data[i];
+        const struct mapped_range *canonical =
+            find_canonical_mapping( mapped->guest, mapped->size, mapped->perms );
+        uint64_t offset = canonical ? mapped->guest - canonical->guest : 0;
+
+        if (!mapped->stale && canonical &&
+            canonical->host <= UINT64_MAX - offset &&
+            canonical->host + offset == mapped->host &&
+            canonical->allocation_base == mapped->allocation_base &&
+            canonical->perms == mapped->perms &&
+            canonical->state == mapped->state &&
+            canonical->domain == mapped->domain &&
+            canonical->flags == mapped->flags &&
+            canonical->permanent == mapped->permanent)
+        {
+            if (!range_array_append( &retained, mapped ))
+            {
+                err = UC_ERR_ARG;
+                goto done;
+            }
+            continue;
+        }
+        if ((err = unmap_range( engine, mapped->guest, mapped->size )) != UC_ERR_OK)
+            goto done;
+        ++engine->resync_unmap_calls;
+        engine->resync_unmap_bytes += mapped->size;
+        unmapped = TRUE;
+    }
+    if (unmapped && (err = uc_ctl_flush_tb( engine->uc )) != UC_ERR_OK)
+        goto done;
+
+    old = engine->mapped_ranges;
+    engine->mapped_ranges = retained;
+    memset( &retained, 0, sizeof(retained) );
+    range_array_free( &old );
+    engine->mapping_generation = provider.generation;
+    if (!(engine->registry_sync_calls & (engine->registry_sync_calls - 1)))
+        trace_mapping_diagnostic( engine, "sync", 0 );
+
+done:
+    range_array_free( &retained );
+    return err;
+}
+
 static NTSTATUS memory_resync( void *args )
 {
     const struct xtajit64_memory_resync_params *params = args;
-    struct range_array replacement = {0};
-    struct thread_engine *engine;
+    struct range_array replacement = {0}, removals = {0}, additions = {0};
     volatile NTSTATUS status = STATUS_SUCCESS;
     volatile BOOL faulted = FALSE;
     BOOL report_error = FALSE;
     enum mutation_kind fault_kind = MUTATION_NONE;
     enum mutation_stage fault_stage = MUTATION_STAGE_IDLE;
     uint64_t fault_generation = 0;
-    uc_err err = UC_ERR_OK;
     uint64_t completed_generation = 0;
     size_t completed_range_count = 0;
-    size_t i;
+    size_t completed_removal_count = 0, completed_addition_count = 0;
 
     pthread_mutex_lock( &provider.mutex );
     while (provider.mutating && provider.initialized)
@@ -2596,43 +2937,19 @@ static NTSTATUS memory_resync( void *args )
     {
         test_mutation_fault_checkpoint( TEST_MUTATION_FAULT_AFTER_BEGIN );
         if (!status) status = build_resync_registry( params, &replacement );
+        if (!status)
+            status = build_resync_mapping_changes( &provider.ranges, &replacement,
+                                                   &removals, &additions );
         if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
         if (!status)
         {
-#ifdef XTAJIT64_UNIXLIB_TEST
-            test_engine_mutation_count = 0;
-#endif
-            for (engine = provider.engines; engine; engine = engine->next)
-            {
-                if (fail_test_engine_mutation())
-                {
-                    err = UC_ERR_RESOURCE;
-                    status = STATUS_UNSUCCESSFUL;
-                    break;
-                }
-                for (i = 0; i < provider.ranges.count; ++i)
-                {
-                    const struct mapped_range *range = &provider.ranges.data[i];
-
-                    if (range->state == MEM_COMMIT &&
-                        (err = unmap_range( engine, range->guest,
-                                            range->size )) != UC_ERR_OK)
-                        break;
-                }
-                if (err == UC_ERR_OK) err = map_registry( engine, &replacement );
-                if (err == UC_ERR_OK) err = uc_ctl_flush_tb( engine->uc );
-                if (err != UC_ERR_OK)
-                {
-                    status = STATUS_UNSUCCESSFUL;
-                    break;
-                }
-            }
-        }
-        if (!status)
-        {
             struct range_array old = provider.ranges;
+            size_t i;
 
             set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
+            for (i = 0; i < removals.count; ++i)
+                mark_engine_mappings_stale_locked( removals.data[i].guest,
+                                                   removals.data[i].size, 0 );
             provider.ranges = replacement;
             memset( &replacement, 0, sizeof(replacement) );
             range_array_free( &old );
@@ -2652,6 +2969,8 @@ static NTSTATUS memory_resync( void *args )
         {
             completed_range_count = provider.ranges.count;
             completed_generation = provider.generation;
+            completed_removal_count = removals.count;
+            completed_addition_count = additions.count;
         }
         if (current_thread_owns_mutation_locked()) finish_mutation_locked();
     }
@@ -2667,12 +2986,16 @@ static NTSTATUS memory_resync( void *args )
     else
     {
         if (report_error)
-            WARN( "cannot authoritatively resynchronize x64 mappings: %s, status %#x\n",
-                  uc_strerror( err ), (unsigned int)status );
+            WARN( "cannot authoritatively resynchronize x64 mappings: status %#x\n",
+                  (unsigned int)status );
+        range_array_free( &removals );
+        range_array_free( &additions );
         range_array_free( &replacement );
         if (!status)
-            TRACE( "resynchronized %zu canonical x64 mapping ranges across generation %llu\n",
-                   completed_range_count, (unsigned long long)completed_generation );
+            TRACE( "resynchronized %zu canonical x64 mapping ranges with %zu removals and "
+                   "%zu additions across generation %llu\n", completed_range_count,
+                   completed_removal_count, completed_addition_count,
+                   (unsigned long long)completed_generation );
     }
     return status;
 }
@@ -2860,11 +3183,21 @@ static NTSTATUS flush_instruction_cache( void *args )
         {
             if (full_flush) err = uc_ctl_flush_tb( engine->uc );
             else if (intervals)
+            {
+                /* Unicorn resolves targeted TB invalidations through the
+                 * engine's software TLB.  A pooled engine may retain a TLB
+                 * entry across an unmap/remap generation even when the final
+                 * canonical host mapping is byte-for-byte identical. */
+                err = uc_ctl_flush_tlb( engine->uc );
                 for (i = 0; i < intervals->count; ++i)
+                {
+                    if (err != UC_ERR_OK) break;
                     if ((err = uc_ctl_remove_cache( engine->uc,
                                                     intervals->data[i].start,
                                                     intervals->data[i].end )) != UC_ERR_OK)
                         break;
+                }
+            }
             if (err != UC_ERR_OK)
             {
                 status = STATUS_UNSUCCESSFUL;
@@ -2949,8 +3282,9 @@ static NTSTATUS poison( void *args )
 static NTSTATUS begin_simulation( void *args )
 {
     struct xtajit64_begin_params *params = args;
-    struct thread_engine *engine;
-    uc_err err = UC_ERR_OK, read_err = UC_ERR_OK;
+    struct thread_binding *binding;
+    struct thread_engine *engine = NULL;
+    uc_err err = UC_ERR_OK, read_err = UC_ERR_OK, context_err = UC_ERR_OK;
     NTSTATUS status = STATUS_SUCCESS;
     uint64_t next_rip;
     BOOL resume;
@@ -2967,8 +3301,27 @@ static NTSTATUS begin_simulation( void *args )
         params->stack_limit >= params->stack_base)
         return STATUS_INVALID_PARAMETER;
     pthread_once( &engine_key_once, make_engine_key );
-    if (engine_key_error || !(engine = pthread_getspecific( engine_key )))
+    if (engine_key_error || !(binding = pthread_getspecific( engine_key )))
         return STATUS_INVALID_HANDLE;
+
+    pthread_mutex_lock( &provider.mutex );
+    while (provider.mutating && provider.initialized)
+        pthread_cond_wait( &provider.cond, &provider.mutex );
+    if (!provider.initialized || provider.shutting_down ||
+        binding->process_instance != provider.instance)
+        status = STATUS_INVALID_HANDLE;
+    else if (provider.poison_status) status = provider.poison_status;
+    else if (binding->active) status = STATUS_INVALID_DEVICE_STATE;
+    else if ((err = acquire_pool_engine_locked( binding, &engine )) != UC_ERR_OK)
+        status = err == UC_ERR_NOMEM ? STATUS_NO_MEMORY : STATUS_UNSUCCESSFUL;
+    if (status)
+    {
+        params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+        params->unicorn_error = err;
+        pthread_mutex_unlock( &provider.mutex );
+        return status;
+    }
+    pthread_mutex_unlock( &provider.mutex );
 
     do
     {
@@ -2979,11 +3332,17 @@ static NTSTATUS begin_simulation( void *args )
         if (!provider.initialized || !engine->uc || !engine->linked)
             status = STATUS_INVALID_HANDLE;
         else if (provider.poison_status) status = provider.poison_status;
-        else if (engine->running) status = STATUS_INVALID_DEVICE_STATE;
+        else if (!engine->in_use || !binding->active)
+            status = STATUS_INVALID_DEVICE_STATE;
         else if (!registry_covers_readable_range( &provider.ranges, params->gs_base,
                                                    params->gs_base +
                                                    XTAJIT64_TEB_SELF_END ))
             status = STATUS_INVALID_ADDRESS;
+        else if ((err = synchronize_engine_registry_locked( engine )) != UC_ERR_OK)
+        {
+            status = STATUS_UNSUCCESSFUL;
+            poison_provider_locked( status );
+        }
         else if ((err = write_context( engine, &params->context,
                                        params->gs_base )) != UC_ERR_OK)
         {
@@ -2994,6 +3353,7 @@ static NTSTATUS begin_simulation( void *args )
         {
             params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
             params->unicorn_error = err;
+            release_pool_engine_locked( binding, engine, FALSE );
             pthread_mutex_unlock( &provider.mutex );
             return status;
         }
@@ -3002,6 +3362,8 @@ static NTSTATUS begin_simulation( void *args )
         engine->stack_base = params->stack_base;
         engine->transition_target = 0;
         engine->fault_address = 0;
+        engine->fault_access = EXCEPTION_READ_FAULT;
+        engine->mapping_error = UC_ERR_OK;
         engine->stop_reason = XTAJIT64_STOP_NONE;
         atomic_store_explicit( &engine->pause_requested, false, memory_order_release );
         engine->running = TRUE;
@@ -3015,6 +3377,9 @@ static NTSTATUS begin_simulation( void *args )
 #endif
             err = uc_emu_start( engine->uc, next_rip, UINT64_MAX, 0, 0 );
             pthread_mutex_lock( &provider.mutex );
+            if (engine->stop_reason == XTAJIT64_STOP_INTERNAL_ERROR &&
+                engine->mapping_error != UC_ERR_OK)
+                err = engine->mapping_error;
             if (!provider.poison_status && provider.initialized && engine->uc &&
                 engine->linked && engine->stop_reason == XTAJIT64_STOP_SYSCALL &&
                 err == UC_ERR_OK)
@@ -3047,8 +3412,6 @@ static NTSTATUS begin_simulation( void *args )
              * Mutators only publish a pause request, so the owner callback has
              * already completed uc_emu_stop before this read can begin. */
             read_err = read_context( engine, &params->context );
-            engine->running = FALSE;
-            pthread_cond_broadcast( &provider.cond );
             if (read_err != UC_ERR_OK) poison_provider_locked( STATUS_UNSUCCESSFUL );
             if (provider.poison_status) status = provider.poison_status;
             else if (!provider.initialized || !engine->uc || !engine->linked)
@@ -3058,30 +3421,61 @@ static NTSTATUS begin_simulation( void *args )
                      engine->stop_reason == XTAJIT64_STOP_NONE &&
                      err == UC_ERR_OK && read_err == UC_ERR_OK)
                 resume = TRUE;
+
+            if (resume)
+            {
+                engine->running = FALSE;
+                pthread_cond_broadcast( &provider.cond );
+            }
+            else
+            {
+                params->transition_target = engine->transition_target;
+                params->fault_address = engine->fault_address;
+                params->fault_access = engine->fault_access;
+                params->stop_reason = status ? XTAJIT64_STOP_INTERNAL_ERROR :
+                                               engine->stop_reason;
+                params->unicorn_error = err != UC_ERR_OK ? err : read_err;
+#ifndef XTAJIT64_UNIXLIB_TEST
+                if (status || params->stop_reason != XTAJIT64_STOP_EC_TRANSITION)
+                    TRACE_(xtajitmap)(
+                        "pid %ld engine %llu result status=%#x reason=%u "
+                        "unicorn=%u rip=%#llx fault=%#llx access=%u\n",
+                        (long)getpid(),
+                        (unsigned long long)engine->diagnostic_id,
+                        (unsigned int)status, params->stop_reason,
+                        params->unicorn_error,
+                        (unsigned long long)params->context.rip,
+                        (unsigned long long)params->fault_address,
+                        params->fault_access );
+#endif
+                if (!status && params->stop_reason == XTAJIT64_STOP_NONE)
+                    params->stop_reason = err == UC_ERR_INSN_INVALID ?
+                                          XTAJIT64_STOP_INVALID_INSTRUCTION :
+                                          XTAJIT64_STOP_INTERNAL_ERROR;
+                if (!status && params->stop_reason == XTAJIT64_STOP_INTERNAL_ERROR)
+                {
+                    poison_provider_locked( STATUS_UNSUCCESSFUL );
+                    status = provider.poison_status;
+                }
+                context_err = release_pool_engine_locked(
+                    binding, engine, read_err == UC_ERR_OK );
+                if (context_err != UC_ERR_OK)
+                {
+                    params->unicorn_error = context_err;
+                    params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+                    poison_provider_locked( STATUS_UNSUCCESSFUL );
+                    status = provider.poison_status;
+                }
+            }
             pthread_mutex_unlock( &provider.mutex );
             break;
         }
     } while (resume);
 
-    params->transition_target = engine->transition_target;
-    params->fault_address = engine->fault_address;
-    params->stop_reason = status ? XTAJIT64_STOP_INTERNAL_ERROR : engine->stop_reason;
-    params->unicorn_error = err != UC_ERR_OK ? err : read_err;
-    if (!status && params->stop_reason == XTAJIT64_STOP_NONE)
-        params->stop_reason = err == UC_ERR_INSN_INVALID ? XTAJIT64_STOP_INVALID_INSTRUCTION :
-                              XTAJIT64_STOP_INTERNAL_ERROR;
-
-    if (!status && params->stop_reason == XTAJIT64_STOP_INTERNAL_ERROR)
-    {
-        pthread_mutex_lock( &provider.mutex );
-        poison_provider_locked( STATUS_UNSUCCESSFUL );
-        status = provider.poison_status;
-        pthread_mutex_unlock( &provider.mutex );
-    }
-
     if (status) return status;
     if (params->stop_reason == XTAJIT64_STOP_EC_TRANSITION) return STATUS_SUCCESS;
     if (params->stop_reason == XTAJIT64_STOP_MEMORY_FAULT) return STATUS_ACCESS_VIOLATION;
+    if (params->stop_reason == XTAJIT64_STOP_MAPPING_MISS) return STATUS_RETRY;
     return STATUS_NOT_SUPPORTED;
 }
 

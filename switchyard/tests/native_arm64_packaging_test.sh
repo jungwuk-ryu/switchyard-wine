@@ -248,6 +248,9 @@ EOF
 /bin/cat >"$TEST_ROOT/provider.c" <<'EOF'
 extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
+__attribute__((used, visibility("default"))) const char
+    switchyard_xtajit64_fixture_abi_identity[] =
+        "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);
@@ -263,15 +266,16 @@ for provider in xtajit xtajit64; do
     -o "$RUNTIME/lib/wine/aarch64-unix/$provider.so"
 done
 
-/usr/bin/python3 -I - "$RUNTIME" <<'PY'
+/usr/bin/python3 -I - "$RUNTIME" \
+  "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" <<'PY'
 import os
 import struct
 import sys
 
-root = sys.argv[1]
+root, x64_abi_identity = sys.argv[1:]
 
 
-def write_pe(relative, machine, arm64ec=False):
+def write_pe(relative, machine, arm64ec=False, abi_identity=None):
     value = bytearray(0x1200 if arm64ec else 0x98)
     value[:2] = b"MZ"
     struct.pack_into("<I", value, 0x3C, 0x80)
@@ -293,6 +297,8 @@ def write_pe(relative, machine, arm64ec=False):
         struct.pack_into("<Q", value, 0x200 + 0xC8, 0x180001100)
         struct.pack_into("<III", value, 0x300, 2, 0x1120, 1)
         struct.pack_into("<II", value, 0x320, 0x2001, 0x100)
+    if abi_identity is not None:
+        value.extend(abi_identity.encode("ascii") + b"\0")
     path = os.path.join(root, relative)
     with open(path, "xb") as stream:
         stream.write(value)
@@ -300,7 +306,8 @@ def write_pe(relative, machine, arm64ec=False):
 
 
 write_pe("lib/wine/aarch64-windows/xtajit.dll", 0xAA64)
-write_pe("lib/wine/aarch64-windows/xtajit64.dll", 0x8664, True)
+write_pe("lib/wine/aarch64-windows/xtajit64.dll", 0x8664, True,
+         x64_abi_identity)
 write_pe("lib/wine/i386-windows/ntdll.dll", 0x014C)
 write_pe("lib/wine/x86_64-windows/ntdll.dll", 0x8664)
 PY
@@ -628,16 +635,16 @@ if [item["module"] for item in value["wow64UnixlibPolicy"]["auditedModules"]] !=
 if len(value["dxmt"]["modules"]) != 17 or len(value["dxmt"]["documents"]) != 5:
     raise SystemExit("producer did not emit the exact DXMT closure")
 if value["dxmt"].get("sourceMaterials") != [{
-    "path": "lib/switchyard-dxmt/share/src/switchyard-dxmt/0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch",
-    "sha256": "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852",
+    "path": "lib/switchyard-dxmt/share/src/switchyard-dxmt/0001-dxmt-Preserve-guest-accessible-CPU-buffer-ownership.patch",
+    "sha256": "2e6f6436706f283be6b9ca1668391e0fa70fe83e290781d2a2c5b9f2496a4a26",
     "type": "patch",
 }]:
     raise SystemExit("producer did not emit the exact DXMT source-material closure")
 provenance = value["dxmt"].get("provenance")
 if (provenance.get("sourceRevision") != "856d9f35789679ef00c1ba01a6353438df84b66f"
         or provenance.get("sourceBaseTree") != "22fa93d36867f175c0283b36cd3628a4df94876e"
-        or provenance.get("sourceTree") != "a8c397f9b03dcb3592f6b0204ae6dbda5492990d"
-        or provenance.get("artifactBuildIdentity") != "f02a37f5b7c8022941712a7cf9415ac9d1925442"):
+        or provenance.get("sourceTree") != "2c91e88660daecc3d492de23d32f9e2fed0dd001"
+        or provenance.get("artifactBuildIdentity") != "af8ab67d197a4bc6751483b8c16fa17df3b0a6b0"):
     raise SystemExit("producer conflated public source with the opaque artifact build label")
 companion = value["dxmt"]["wow64Companion"]
 if (companion["path"] != "lib/wine/aarch64-unix/winemetal-wow64.so"

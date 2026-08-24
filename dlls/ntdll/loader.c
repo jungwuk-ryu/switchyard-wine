@@ -2307,6 +2307,11 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
 static WINE_MODREF *alloc_module( HMODULE native, HMODULE client,
                                   const UNICODE_STRING *nt_name, BOOL builtin )
 {
+    BOOL unix_path = nt_name->Length > 8 * sizeof(WCHAR) &&
+                     !wcsnicmp( nt_name->Buffer, L"\\??\\unix", 8 ) &&
+                     (nt_name->Buffer[8] == '\\' || nt_name->Buffer[8] == '/');
+    SIZE_T buffer_size = unix_path ? nt_name->Length + sizeof(WCHAR) :
+                                     nt_name->Length - 3 * sizeof(WCHAR);
     WCHAR *buffer;
     WINE_MODREF *wm;
     const WCHAR *p;
@@ -2324,7 +2329,7 @@ static WINE_MODREF *alloc_module( HMODULE native, HMODULE client,
     wm->CheckSum          = nt->OptionalHeader.CheckSum;
     wm->ldr.TimeDateStamp = nt->FileHeader.TimeDateStamp;
 
-    if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, nt_name->Length - 3 * sizeof(WCHAR) )))
+    if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, buffer_size )))
     {
         RtlFreeHeap( GetProcessHeap(), 0, wm );
         return NULL;
@@ -2339,7 +2344,13 @@ static WINE_MODREF *alloc_module( HMODULE native, HMODULE client,
     InitializeListHead(&wm->ldr.DdagNode->Modules);
     InsertTailList(&wm->ldr.DdagNode->Modules, &wm->ldr.NodeModuleLink);
 
-    if (nt_name->Length >= 8 * sizeof(WCHAR) && !wcsncmp(nt_name->Buffer + 4, L"UNC\\", 4))
+    if (unix_path)
+    {
+        memcpy( buffer, nt_name->Buffer, nt_name->Length );
+        buffer[1] = '\\';  /* change \??\unix to \\?\unix */
+        buffer[nt_name->Length / sizeof(WCHAR)] = 0;
+    }
+    else if (nt_name->Length >= 8 * sizeof(WCHAR) && !wcsncmp(nt_name->Buffer + 4, L"UNC\\", 4))
     {
         buffer[0] = '\\';
         memcpy( buffer + 1, nt_name->Buffer + 7 /* \??\UNC prefix */, nt_name->Length - 7 * sizeof(WCHAR) );
@@ -11508,7 +11519,7 @@ C_ASSERT( offsetof(struct wow64_user_copy_params, operation) == 32 );
 C_ASSERT( offsetof(struct wow64_user_copy_params, status) == 36 );
 C_ASSERT( offsetof(struct wow64_user_copy_params, reserved) == 40 );
 
-static UINT64 wow64_user_copy_address( const void *ptr )
+UINT64 ntdll_get_wow64_native_address( const void *ptr )
 {
 #ifdef _WIN64
     return (ULONG_PTR)ptr;
@@ -11528,8 +11539,8 @@ NTSTATUS CDECL __wine_wow64_user_copy( void *dst, const void *src, SIZE_T size,
 {
     struct wow64_user_copy_params params =
     {
-        .dst = wow64_user_copy_address( dst ),
-        .src = wow64_user_copy_address( src ),
+        .dst = ntdll_get_wow64_native_address( dst ),
+        .src = ntdll_get_wow64_native_address( src ),
         .size = size,
         .operation = operation,
     };
@@ -11545,7 +11556,7 @@ NTSTATUS CDECL __wine_wow64_store_release_long( LONG *dst, LONG value )
 {
     struct wow64_user_copy_params params =
     {
-        .dst = wow64_user_copy_address( dst ),
+        .dst = ntdll_get_wow64_native_address( dst ),
         .size = sizeof(*dst),
         .value = value,
         .operation = WOW64_USER_COPY_STORE_RELEASE_LONG,
@@ -11562,7 +11573,7 @@ NTSTATUS CDECL __wine_wow64_publish_iosb( void *dst, NTSTATUS status, ULONG info
 {
     struct wow64_user_copy_params params =
     {
-        .dst = wow64_user_copy_address( dst ),
+        .dst = ntdll_get_wow64_native_address( dst ),
         .size = 2 * sizeof(ULONG),
         .value = information,
         .operation = WOW64_USER_COPY_PUBLISH_IOSB,
@@ -11581,8 +11592,8 @@ NTSTATUS CDECL __wine_wow64_publish_handle_pair( ULONG *dst1, ULONG value1,
 {
     struct wow64_user_copy_params params =
     {
-        .dst = wow64_user_copy_address( dst1 ),
-        .src = wow64_user_copy_address( dst2 ),
+        .dst = ntdll_get_wow64_native_address( dst1 ),
+        .src = ntdll_get_wow64_native_address( dst2 ),
         .size = 2 * sizeof(ULONG),
         .value = (ULONG64)value1 | ((ULONG64)value2 << 32),
         .operation = WOW64_USER_COPY_PUBLISH_HANDLE_PAIR,

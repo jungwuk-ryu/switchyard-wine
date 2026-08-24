@@ -74,7 +74,7 @@ esac
 }
 [ ! -L "$OUTPUT" ] || fail "output must not be a symbolic link: $OUTPUT"
 
-for command in cmake git gzip lipo make otool perl python3 shasum tar vtool xcrun; do
+for command in clang cmake git gzip lipo make nm otool perl python3 shasum tar vtool xcrun; do
   command -v "$command" >/dev/null 2>&1 || fail "missing required command: $command"
 done
 
@@ -266,6 +266,20 @@ validate_output() {
       "$root/lib/pkgconfig/unicorn.pc"; do
     [ -f "$development_file" ] && [ ! -L "$development_file" ] || return 1
   done
+  /usr/bin/grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP 1' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_emu_stop_at_instruction_boundary(uc_engine *uc);' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_enable_shared_memory_atomics(uc_engine *uc);' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_emu_stop_at_instruction_boundary" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_enable_shared_memory_atomics" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
   /usr/bin/grep -Fx 'libdir=${pcfiledir}/..' "$root/lib/pkgconfig/unicorn.pc" >/dev/null || return 1
   /usr/bin/grep -Fx 'includedir=${pcfiledir}/../../include' \
     "$root/lib/pkgconfig/unicorn.pc" >/dev/null || return 1
@@ -469,9 +483,33 @@ validate_source_patch "$PATCH_SNAPSHOT"
 # exact closed patch, and no alternate source state, produced the build tree.
 git -C "$SOURCE_DIR" archive --format=tar HEAD | /usr/bin/tar -xf - -C "$PATCHED_SOURCE_DIR"
 validate_tree_links "$PATCHED_SOURCE_DIR" || fail "private source export has unsafe links"
-git -C "$PATCHED_SOURCE_DIR" apply --check --whitespace=error-all "$PATCH_SNAPSHOT"
-git -C "$PATCHED_SOURCE_DIR" apply --whitespace=error-all "$PATCH_SNAPSHOT"
-git -C "$PATCHED_SOURCE_DIR" apply --reverse --check --whitespace=error-all "$PATCH_SNAPSHOT"
+# The build root may itself be inside an excluded repository directory.  In
+# that case Git otherwise discovers the parent worktree, skips every patch path
+# as outside the current prefix, and still exits successfully.  Treat the
+# private export as a repository-independent tree so apply and reverse-check
+# operate on its files rather than on ambient Git state.
+patch_apply_ceiling="$(dirname "$PATCHED_SOURCE_DIR")"
+GIT_CEILING_DIRECTORIES="$patch_apply_ceiling" \
+  git -C "$PATCHED_SOURCE_DIR" apply --check --whitespace=error-all "$PATCH_SNAPSHOT"
+GIT_CEILING_DIRECTORIES="$patch_apply_ceiling" \
+  git -C "$PATCHED_SOURCE_DIR" apply --whitespace=error-all "$PATCH_SNAPSHOT"
+GIT_CEILING_DIRECTORIES="$patch_apply_ceiling" \
+  git -C "$PATCHED_SOURCE_DIR" apply --reverse --check --whitespace=error-all "$PATCH_SNAPSHOT"
+/usr/bin/grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP 1' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the instruction-boundary stop contract"
+/usr/bin/grep -Fx 'uc_err uc_emu_stop_at_instruction_boundary(uc_engine *uc);' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the instruction-boundary stop API"
+/usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the shared-memory atomic contract"
+/usr/bin/grep -Fx 'uc_err uc_enable_shared_memory_atomics(uc_engine *uc);' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the shared-memory atomic API"
+/usr/bin/grep -F '__atomic_load_n(&x, __ATOMIC_RELAXED)' \
+  "$PATCHED_SOURCE_DIR/qemu/configure" >/dev/null ||
+  fail "source patch did not correct the 64-bit atomic capability probe"
 validate_tree_links "$PATCHED_SOURCE_DIR" || fail "patched private source has unsafe links"
 
 reproducible_source_root="/usr/src/unicorn-$SWITCHYARD_UNICORN_SOURCE_REVISION"
@@ -496,6 +534,29 @@ cmake_args=(
 )
 cmake "${cmake_args[@]}"
 cmake --build "$BUILD_WORK_DIR" --parallel "$JOBS"
+/usr/bin/grep -Fx '#define CONFIG_ATOMIC64 1' \
+  "$BUILD_WORK_DIR/config-host.h" >/dev/null ||
+  fail "Unicorn build did not enable the required 64-bit atomic helpers"
+
+# Exercise AArch64 code generation, cross-thread publication,
+# instruction-boundary stopping, cross-engine shared-memory atomicity, and
+# atomic invalid-memory recovery against the exact dylib that will be
+# installed.  The tests cover zero-count i32/i64 rotate lowering, LOCK
+# CMPXCHG, CMPXCHG8B, demand mapping, and an interruptible REP iteration in
+# addition to the ordinary cross-thread stop path.
+for regression in aarch64_rotl_zero threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook; do
+  regression_source="$PATCHED_SOURCE_DIR/tests/regress/$regression.c"
+  regression_binary="$BUILD_WORK_DIR/switchyard-$regression"
+  [ -f "$regression_source" ] && [ ! -L "$regression_source" ] ||
+    fail "patched source is missing regression: $regression"
+  /usr/bin/clang -arch arm64 -mmacosx-version-min="$MINIMUM_MACOS" \
+    -std=c11 -Wall -Wextra -Werror \
+    -I"$PATCHED_SOURCE_DIR/include" "$regression_source" \
+    -L"$BUILD_WORK_DIR" '-Wl,-rpath,@loader_path' -lunicorn -lpthread \
+    -o "$regression_binary"
+  "$regression_binary" || fail "Unicorn regression failed: $regression"
+done
+
 cmake --install "$BUILD_WORK_DIR"
 source_checkout_is_clean "$SOURCE_DIR" ||
   fail "build modified the pinned source checkout"
@@ -532,7 +593,7 @@ install -m 0644 "$PATCH_SNAPSHOT" \
 
 library_sha="$(sha256_file "$dylib")"
 [ "$library_sha" = "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ] ||
-  fail "built dylib does not match the closed-policy SHA-256"
+  fail "built dylib SHA-256 $library_sha does not match the closed policy"
 cat >"$STAGING/switchyard-unicorn-runtime.json" <<EOF
 {
   "version": "$SWITCHYARD_UNICORN_VERSION",

@@ -45,6 +45,27 @@ static uint64_t cache_remove_end;
 static unsigned int cache_remove_calls;
 static unsigned int cache_flush_calls;
 static int cache_remove_fail_call = -1;
+static unsigned int memory_map_calls;
+static unsigned int memory_unmap_calls;
+static int memory_map_fail_call = -1;
+static int memory_unmap_fail_call = -1;
+
+static uc_err record_memory_map( uc_engine *uc, uint64_t address, size_t size,
+                                 uint32_t perms, void *pointer )
+{
+    unsigned int call = memory_map_calls++;
+
+    if ((int)call == memory_map_fail_call) return UC_ERR_RESOURCE;
+    return uc_mem_map_ptr( uc, address, size, perms, pointer );
+}
+
+static uc_err record_memory_unmap( uc_engine *uc, uint64_t address, size_t size )
+{
+    unsigned int call = memory_unmap_calls++;
+
+    if ((int)call == memory_unmap_fail_call) return UC_ERR_RESOURCE;
+    return uc_mem_unmap( uc, address, size );
+}
 
 static uc_err record_cache_remove( uc_engine *uc, uint64_t start, uint64_t end )
 {
@@ -83,6 +104,10 @@ static void reset_cache_recorders(void)
 #define uc_ctl_remove_cache record_cache_remove
 #undef uc_ctl_flush_tb
 #define uc_ctl_flush_tb record_cache_flush
+#undef uc_mem_map_ptr
+#define uc_mem_map_ptr record_memory_map
+#undef uc_mem_unmap
+#define uc_mem_unmap record_memory_unmap
 
 static _Thread_local void *test_exception_jmp_buf;
 void test_ntdll_set_exception_jmp_buf( jmp_buf jmp );
@@ -95,10 +120,14 @@ static void test_raise_mutation_exception(void);
  * test hooks without adding a production control opcode to the provider ABI. */
 #include "../unixlib.c"
 
+C_ASSERT( XTAJIT64_PROCESS_ABI_VERSION == 6 );
+
 #undef XTAJIT64_TEST_RAISE_EXCEPTION
 #undef ntdll_set_exception_jmp_buf
 #undef uc_ctl_remove_cache
 #undef uc_ctl_flush_tb
+#undef uc_mem_map_ptr
+#undef uc_mem_unmap
 
 void test_ntdll_set_exception_jmp_buf( jmp_buf jmp )
 {
@@ -169,6 +198,12 @@ struct flush_worker
     NTSTATUS status;
 };
 
+struct process_term_worker
+{
+    atomic_int done;
+    NTSTATUS status;
+};
+
 struct low_observer_worker
 {
     struct wine_arm64ec_low_memory_range_v1 range;
@@ -188,10 +223,14 @@ struct low_begin_worker
 
 struct engine_holder
 {
+    struct xtajit64_begin_params params;
     atomic_int ready;
+    atomic_int execute;
+    atomic_int executed;
     atomic_int release;
     atomic_int done;
     NTSTATUS status;
+    NTSTATUS simulation_status;
 };
 
 static void *alloc_pages_at( uint64_t address, size_t count )
@@ -304,6 +343,56 @@ static uint64_t observer_generation(void)
     return generation;
 }
 
+static struct thread_engine *first_provider_engine(void)
+{
+    struct thread_engine *engine;
+
+    pthread_mutex_lock( &provider.mutex );
+    engine = provider.engines;
+    pthread_mutex_unlock( &provider.mutex );
+    return engine;
+}
+
+static size_t provider_engine_count(void)
+{
+    struct thread_engine *engine;
+    size_t count = 0;
+
+    pthread_mutex_lock( &provider.mutex );
+    for (engine = provider.engines; engine; engine = engine->next) ++count;
+    pthread_mutex_unlock( &provider.mutex );
+    return count;
+}
+
+static BOOL engine_mappings_match_registry( const struct thread_engine *engine )
+{
+    const struct mapped_range *mapped, *canonical;
+    uint64_t offset;
+    size_t i;
+    BOOL match = TRUE;
+
+    pthread_mutex_lock( &provider.mutex );
+    for (i = 0; i < engine->mapped_ranges.count; ++i)
+    {
+        mapped = &engine->mapped_ranges.data[i];
+        canonical = find_canonical_mapping( mapped->guest, mapped->size,
+                                            mapped->perms );
+        if (!canonical || (offset = mapped->guest - canonical->guest) >
+                          UINT64_MAX - canonical->host ||
+            canonical->host + offset != mapped->host ||
+            canonical->allocation_base != mapped->allocation_base ||
+            canonical->state != mapped->state || canonical->domain != mapped->domain ||
+            canonical->flags != mapped->flags ||
+            canonical->permanent != mapped->permanent || mapped->stale)
+        {
+            match = FALSE;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &provider.mutex );
+    return match;
+}
+
 static BOOL canonical_range_matches( uint64_t guest, uint64_t host,
                                      unsigned int state, unsigned int perms,
                                      unsigned int domain, BOOL permanent )
@@ -396,6 +485,243 @@ static NTSTATUS reset_test_provider(void)
     return process_init( &process_params );
 }
 
+static void test_incremental_resync(void)
+{
+    unsigned char *existing_low = test_pages + 9 * TEST_PAGE;
+    unsigned char *added = test_pages + 10 * TEST_PAGE;
+    unsigned char *existing_high = test_pages + 11 * TEST_PAGE;
+    struct xtajit64_memory_resync_begin_params begin;
+    struct xtajit64_memory_resync_params resync = {0};
+    struct xtajit64_memory_params ranges[3] = {0};
+    struct thread_engine *engine;
+    unsigned int starting_failures = failures;
+    BOOL found, mapped;
+    NTSTATUS status;
+    uc_err err;
+
+    status = thread_init( NULL );
+    check( !status, "additions-only resync engine init returned %#x\n",
+           (unsigned int)status );
+    if (status) return;
+    status = register_identity_page( existing_low, PAGE_READONLY );
+    if (!status) status = register_identity_page( existing_high, PAGE_READONLY );
+    check( !status, "additions-only resync setup maps returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+
+    ranges[0].guest = ranges[0].host = (uintptr_t)existing_low;
+    ranges[0].size = TEST_PAGE;
+    ranges[0].allocation_base = (uintptr_t)existing_low;
+    ranges[0].protect = PAGE_READONLY;
+    ranges[1].guest = ranges[1].host = (uintptr_t)added;
+    ranges[1].size = TEST_PAGE;
+    ranges[1].allocation_base = (uintptr_t)added;
+    ranges[1].protect = PAGE_READONLY;
+    ranges[2].guest = ranges[2].host = (uintptr_t)existing_high;
+    ranges[2].size = TEST_PAGE;
+    ranges[2].allocation_base = (uintptr_t)existing_high;
+    ranges[2].protect = PAGE_READONLY;
+    resync.ranges = (uintptr_t)ranges;
+    resync.count = ARRAY_SIZE(ranges);
+
+    status = memory_resync_begin( &begin );
+    resync.generation = begin.generation;
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    if (!status) status = memory_resync( &resync );
+    check( !status && !memory_map_calls && !memory_unmap_calls &&
+           !cache_flush_calls && canonical_range_matches(
+               (uintptr_t)existing_low, (uintptr_t)existing_low, MEM_COMMIT,
+               UC_PROT_READ,
+               XTAJIT64_MEMORY_ADDRESS_IDENTITY, FALSE ) &&
+           canonical_range_matches(
+               (uintptr_t)added, (uintptr_t)added, MEM_COMMIT,
+               UC_PROT_READ,
+               XTAJIT64_MEMORY_ADDRESS_IDENTITY, FALSE ) &&
+           canonical_range_matches(
+               (uintptr_t)existing_high, (uintptr_t)existing_high, MEM_COMMIT,
+               UC_PROT_READ,
+               XTAJIT64_MEMORY_ADDRESS_IDENTITY, FALSE ),
+           "additions-only resync returned %#x with map/unmap/flush %u/%u/%u\n",
+           (unsigned int)status, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls );
+    if (status) goto done;
+
+    engine = first_provider_engine();
+    pthread_mutex_lock( &provider.mutex );
+    err = synchronize_engine_registry_locked( engine );
+    pthread_mutex_unlock( &provider.mutex );
+    check( err == UC_ERR_OK && !memory_map_calls && !memory_unmap_calls &&
+           !cache_flush_calls && !engine->mapped_ranges.count,
+           "untouched additions synchronized with map/unmap/flush %u/%u/%u: %s\n",
+           memory_map_calls, memory_unmap_calls, cache_flush_calls,
+           uc_strerror( err ) );
+    found = mapped = FALSE;
+    err = demand_map_canonical_range( engine, (uintptr_t)added, 1,
+                                      UC_PROT_READ, &found, &mapped );
+    check( err == UC_ERR_OK && found && mapped && memory_map_calls == 1 &&
+           !memory_unmap_calls && !cache_flush_calls &&
+           engine->mapped_ranges.count == 1,
+           "first-use addition map returned %s found %u calls %u/%u/%u ranges %zu\n",
+           uc_strerror( err ), found, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls, engine->mapped_ranges.count );
+
+    ranges[1].protect = PAGE_EXECUTE_READ;
+    resync.count = 2;
+    status = memory_resync_begin( &begin );
+    resync.generation = begin.generation;
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    if (!status) status = memory_resync( &resync );
+    check( !status && !memory_map_calls && !memory_unmap_calls &&
+           !cache_flush_calls && canonical_range_matches(
+               (uintptr_t)existing_low, (uintptr_t)existing_low, MEM_COMMIT,
+               UC_PROT_READ,
+               XTAJIT64_MEMORY_ADDRESS_IDENTITY, FALSE ) &&
+           canonical_range_matches(
+               (uintptr_t)added, (uintptr_t)added, MEM_COMMIT,
+               UC_PROT_READ | UC_PROT_EXEC,
+               XTAJIT64_MEMORY_ADDRESS_IDENTITY, FALSE ) &&
+           !canonical_range_matches(
+               (uintptr_t)existing_high, (uintptr_t)existing_high, MEM_COMMIT,
+               UC_PROT_READ,
+               XTAJIT64_MEMORY_ADDRESS_IDENTITY, FALSE ),
+           "changed resync returned %#x with map/unmap/flush %u/%u/%u\n",
+           (unsigned int)status, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls );
+    if (status) goto done;
+
+    pthread_mutex_lock( &provider.mutex );
+    err = synchronize_engine_registry_locked( engine );
+    pthread_mutex_unlock( &provider.mutex );
+    check( err == UC_ERR_OK && !memory_map_calls && memory_unmap_calls == 1 &&
+           cache_flush_calls == 1,
+           "changed demand-mapped range synchronized with map/unmap/flush %u/%u/%u: %s\n",
+           memory_map_calls, memory_unmap_calls, cache_flush_calls,
+           uc_strerror( err ) );
+    found = mapped = FALSE;
+    err = demand_map_canonical_range( engine, (uintptr_t)added, 1,
+                                      UC_PROT_READ, &found, &mapped );
+    check( err == UC_ERR_OK && found && mapped && memory_map_calls == 1 &&
+           memory_unmap_calls == 1 && cache_flush_calls == 1 &&
+           engine->mapped_ranges.count == 1,
+           "changed range first-use remap returned %s found %u calls %u/%u/%u ranges %zu\n",
+           uc_strerror( err ), found, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls, engine->mapped_ranges.count );
+    found = mapped = TRUE;
+    err = demand_map_canonical_range( engine, (uintptr_t)existing_high, 1,
+                                      UC_PROT_READ, &found, &mapped );
+    check( err == UC_ERR_MAP && !found && !mapped && memory_map_calls == 1 &&
+           engine->mapped_ranges.count == 1,
+           "removed untouched range demand map returned %s found %u calls %u ranges %zu\n",
+           uc_strerror( err ), found, memory_map_calls,
+           engine->mapped_ranges.count );
+
+done:
+    unregister_identity_page( added );
+    unregister_identity_page( existing_high );
+    unregister_identity_page( existing_low );
+    thread_term( NULL );
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    if (failures == starting_failures)
+        printf( "XTAJIT64_INCREMENTAL_RESYNC_PASS\n" );
+}
+
+static void test_coalesced_demand_mapping(void)
+{
+    unsigned char *base = test_pages + 9 * TEST_PAGE;
+    struct xtajit64_memory_params first =
+    {
+        .guest = (uintptr_t)base,
+        .host = (uintptr_t)base,
+        .size = XTAJIT64_GUEST_PAGE_SIZE,
+        .allocation_base = (uintptr_t)base,
+        .protect = PAGE_READWRITE,
+    };
+    struct xtajit64_memory_params second = first;
+    struct xtajit64_memory_params cleanup =
+    {
+        .guest = (uintptr_t)base,
+        .size = 2 * XTAJIT64_GUEST_PAGE_SIZE,
+    };
+    struct thread_engine *engine;
+    unsigned int starting_failures = failures;
+    BOOL found = FALSE, mapped = FALSE;
+    BOOL thread_initialized = FALSE;
+    NTSTATUS status;
+    uc_err err;
+
+    status = reset_test_provider();
+    check( !status, "coalesced demand-map reset returned %#x\n",
+           (unsigned int)status );
+    if (status) return;
+
+    second.guest += XTAJIT64_GUEST_PAGE_SIZE;
+    second.host += XTAJIT64_GUEST_PAGE_SIZE;
+    status = memory_map( &first );
+    if (!status) status = thread_init( NULL );
+    check( !status, "coalesced demand-map setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    thread_initialized = TRUE;
+    engine = first_provider_engine();
+
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    err = demand_map_canonical_range( engine, first.guest, 1,
+                                      UC_PROT_WRITE, &found, &mapped );
+    check( err == UC_ERR_OK && found && mapped && memory_map_calls == 1 &&
+           !memory_unmap_calls && engine->mapped_ranges.count == 1 &&
+           engine->mapped_ranges.data[0].size == XTAJIT64_GUEST_PAGE_SIZE,
+           "first coalesced demand map returned %s found %u calls %u/%u ranges %zu\n",
+           uc_strerror( err ), found, memory_map_calls, memory_unmap_calls,
+           engine->mapped_ranges.count );
+
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    status = memory_map( &second );
+    check( !status && !memory_map_calls && !memory_unmap_calls &&
+           !cache_flush_calls && canonical_range_matches(
+               first.guest, first.host, MEM_COMMIT,
+               UC_PROT_READ | UC_PROT_WRITE,
+               XTAJIT64_MEMORY_ADDRESS_IDENTITY, FALSE ),
+           "adjacent canonical map returned %#x calls %u/%u/%u\n",
+           (unsigned int)status, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls );
+    if (status) goto done;
+
+    pthread_mutex_lock( &provider.mutex );
+    err = synchronize_engine_registry_locked( engine );
+    pthread_mutex_unlock( &provider.mutex );
+    check( err == UC_ERR_OK && !memory_map_calls && !memory_unmap_calls &&
+           !cache_flush_calls && engine->mapped_ranges.count == 1 &&
+           engine->mapped_ranges.data[0].guest == first.guest &&
+           engine->mapped_ranges.data[0].size == XTAJIT64_GUEST_PAGE_SIZE,
+           "lazy coalesced writable sync returned %s calls %u/%u/%u ranges %zu\n",
+           uc_strerror( err ), memory_map_calls, memory_unmap_calls,
+           cache_flush_calls, engine->mapped_ranges.count );
+    found = mapped = FALSE;
+    err = demand_map_canonical_range( engine, second.guest, 1,
+                                      UC_PROT_WRITE, &found, &mapped );
+    check( err == UC_ERR_OK && found && mapped && memory_map_calls == 1 &&
+           !memory_unmap_calls && !cache_flush_calls &&
+           engine->mapped_ranges.count == 1 &&
+           engine->mapped_ranges.data[0].guest == first.guest &&
+           engine->mapped_ranges.data[0].size == 2 * XTAJIT64_GUEST_PAGE_SIZE,
+           "coalesced writable second touch returned %s found %u calls %u/%u/%u ranges %zu\n",
+           uc_strerror( err ), found, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls, engine->mapped_ranges.count );
+
+done:
+    if (thread_initialized) thread_term( NULL );
+    memory_unmap( &cleanup );
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    if (failures == starting_failures)
+        printf( "XTAJIT64_COALESCED_DEMAND_MAPPING_PASS\n" );
+}
+
 static uint64_t elapsed_milliseconds( const struct timespec *start,
                                       const struct timespec *now )
 {
@@ -425,6 +751,21 @@ static BOOL wait_atomic_int_at_least( atomic_int *value, int expected,
     return FALSE;
 }
 
+static BOOL wait_atomic_int_equal( atomic_int *value, int expected,
+                                   unsigned int timeout_ms )
+{
+    struct timespec start, now;
+
+    clock_gettime( CLOCK_MONOTONIC, &start );
+    do
+    {
+        if (atomic_load_explicit( value, memory_order_acquire ) == expected) return TRUE;
+        sched_yield();
+        clock_gettime( CLOCK_MONOTONIC, &now );
+    } while (elapsed_milliseconds( &start, &now ) < timeout_ms);
+    return FALSE;
+}
+
 static BOOL wait_mutation_stage( enum mutation_stage expected,
                                  unsigned int timeout_ms )
 {
@@ -444,17 +785,41 @@ static BOOL wait_mutation_stage( enum mutation_stage expected,
     return FALSE;
 }
 
+static BOOL wait_provider_shutdown_started( unsigned int timeout_ms )
+{
+    struct timespec start, now;
+    BOOL shutting_down;
+
+    clock_gettime( CLOCK_MONOTONIC, &start );
+    do
+    {
+        pthread_mutex_lock( &provider.mutex );
+        shutting_down = provider.shutting_down;
+        pthread_mutex_unlock( &provider.mutex );
+        if (shutting_down) return TRUE;
+        sched_yield();
+        clock_gettime( CLOCK_MONOTONIC, &now );
+    } while (elapsed_milliseconds( &start, &now ) < timeout_ms);
+    return FALSE;
+}
+
+static void initialize_begin_parameters( struct xtajit64_begin_params *params,
+                                         uint64_t code, uint64_t stack )
+{
+    memset( params, 0, sizeof(*params) );
+    params->context.rip = code;
+    params->context.rsp = stack + TEST_PAGE - 16;
+    params->context.eflags = 0x202;
+    params->context.mxcsr = 0x1f80;
+    params->gs_base = test_teb;
+    params->stack_limit = stack;
+    params->stack_base = stack + TEST_PAGE;
+}
+
 static void initialize_begin_params( struct simulation *simulation,
                                      uint64_t code, uint64_t stack )
 {
-    memset( &simulation->params, 0, sizeof(simulation->params) );
-    simulation->params.context.rip = code;
-    simulation->params.context.rsp = stack + TEST_PAGE - 16;
-    simulation->params.context.eflags = 0x202;
-    simulation->params.context.mxcsr = 0x1f80;
-    simulation->params.gs_base = test_teb;
-    simulation->params.stack_limit = stack;
-    simulation->params.stack_base = stack + TEST_PAGE;
+    initialize_begin_parameters( &simulation->params, code, stack );
 }
 
 static void *run_simulation( void *arg )
@@ -491,10 +856,15 @@ static void test_process_init_abi(void)
 
     check( process_init( NULL ) == STATUS_INVALID_PARAMETER,
            "NULL process init was accepted\n" );
+    invalid.abi_version = XTAJIT64_PROCESS_ABI_VERSION - 1;
+    status = process_init( &invalid );
+    check( status == STATUS_REVISION_MISMATCH,
+           "previous ABI version returned %#x\n", (unsigned int)status );
+    invalid = process_params;
     invalid.abi_version++;
     status = process_init( &invalid );
     check( status == STATUS_REVISION_MISMATCH,
-           "wrong ABI version returned %#x\n", (unsigned int)status );
+           "future ABI version returned %#x\n", (unsigned int)status );
     invalid = process_params;
     invalid.abi_size--;
     status = process_init( &invalid );
@@ -563,7 +933,20 @@ static void *run_engine_holder( void *arg )
     holder->status = thread_init( NULL );
     atomic_store_explicit( &holder->ready, 1, memory_order_release );
     while (!atomic_load_explicit( &holder->release, memory_order_acquire ))
+    {
+        if (!holder->status &&
+            atomic_load_explicit( &holder->execute, memory_order_acquire ) &&
+            !atomic_load_explicit( &holder->executed, memory_order_relaxed ))
+        {
+            holder->simulation_status = begin_simulation( &holder->params );
+            atomic_store_explicit( &holder->executed, 1, memory_order_release );
+            while (atomic_load_explicit( &holder->execute, memory_order_acquire ) &&
+                   !atomic_load_explicit( &holder->release, memory_order_relaxed ))
+                sched_yield();
+            atomic_store_explicit( &holder->executed, 0, memory_order_release );
+        }
         sched_yield();
+    }
     if (!holder->status) thread_term( NULL );
     atomic_store_explicit( &holder->done, 1, memory_order_release );
     return NULL;
@@ -943,94 +1326,290 @@ static void test_low_observer_interval_replacement(void)
         printf( "XTAJIT64_LOW_OBSERVER_INTERVAL_PASS\n" );
 }
 
-static void test_low_observer_partial_engine_poison(void)
+static void test_low_observer_lazy_engine_sync(void)
 {
+    unsigned char *code_page = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    struct code_buffer code = { .data = code_page };
     struct wine_arm64ec_low_memory_range_v1 range;
     struct engine_holder holders[2] = {0};
+    struct xtajit64_poison_params timeout = { .status = STATUS_TIMEOUT };
     pthread_t threads[2];
     BOOL created[2] = {FALSE, FALSE};
-    uint64_t generation;
     unsigned int starting_failures = failures;
+    unsigned int emu_start_count;
     NTSTATUS status;
     int i, ret;
 
+    emit_movabs_rax( &code, TEST_LOW_GUEST_BASE );
+    emit_u8( &code, 0x48 ); emit_u8( &code, 0x8b ); emit_u8( &code, 0x00 );
+    emit_movabs_rax( &code, test_ec_target );
+    emit_jump_rax( &code );
+
+    status = register_identity_page( (void *)(uintptr_t)test_ec_target,
+                                     PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( code_page, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    if (!status) status = register_identity_page( (void *)(uintptr_t)test_teb,
+                                                  PAGE_READWRITE );
     initialize_low_range( &range, TEST_LOW_GUEST_BASE, TEST_PAGE,
                           TEST_LOW_GUEST_BASE, MEM_COMMIT, PAGE_READWRITE );
-    status = publish_low_event( WINE_WOW64_MEMORY_ALLOCATE, 0,
-                                TEST_LOW_GUEST_BASE, TEST_PAGE,
-                                TEST_LOW_GUEST_BASE, &range, 1,
-                                STATUS_SUCCESS, STATUS_SUCCESS );
-    check( !status && canonical_range_matches(
-               TEST_LOW_GUEST_BASE, TEST_LOW_HOST_BASE, MEM_COMMIT,
-               UC_PROT_READ | UC_PROT_WRITE,
-               XTAJIT64_MEMORY_ADDRESS_AMD64_LOW, FALSE ),
-           "LOW partial-engine setup failed %#x\n", (unsigned int)status );
+    if (!status)
+        status = publish_low_event( WINE_WOW64_MEMORY_ALLOCATE, 0,
+                                    TEST_LOW_GUEST_BASE, TEST_PAGE,
+                                    TEST_LOW_GUEST_BASE, &range, 1,
+                                    STATUS_SUCCESS, STATUS_SUCCESS );
+    check( !status, "lazy LOW synchronization setup failed %#x\n",
+           (unsigned int)status );
     if (status) goto done;
 
     for (i = 0; i < 2; ++i)
     {
+        initialize_begin_parameters( &holders[i].params, (uintptr_t)code_page,
+                                     (uintptr_t)stack );
         ret = pthread_create( &threads[i], NULL, run_engine_holder, &holders[i] );
-        check( !ret, "LOW partial-engine holder %d creation failed %d\n", i, ret );
+        check( !ret, "lazy LOW holder %d creation failed %d\n", i, ret );
         if (!ret) created[i] = TRUE;
     }
     for (i = 0; i < 2; ++i)
     {
         if (!created[i]) continue;
         check( wait_atomic_int_at_least( &holders[i].ready, 1, 5000 ),
-               "LOW partial-engine holder %d did not initialize\n", i );
-        check( !holders[i].status,
-               "LOW partial-engine holder %d init failed %#x\n", i,
+               "lazy LOW holder %d did not initialize\n", i );
+        check( !holders[i].status, "lazy LOW holder %d init failed %#x\n", i,
                (unsigned int)holders[i].status );
     }
     if (!created[0] || !created[1] || holders[0].status || holders[1].status)
         goto release;
 
-    generation = observer_generation();
+    /* Exercise two Windows threads sequentially.  They must retain independent
+     * CPU contexts while borrowing one idle engine and one mapping topology. */
+    for (i = 0; i < 2; ++i)
+    {
+        atomic_store_explicit( &holders[i].execute, 1, memory_order_release );
+        if (!wait_atomic_int_at_least( &holders[i].executed, 1, 5000 ))
+        {
+            check( FALSE, "initial lazy LOW engine %d did not execute\n", i );
+            poison( &timeout );
+            goto release;
+        }
+        check( !holders[i].simulation_status &&
+               holders[i].params.stop_reason == XTAJIT64_STOP_EC_TRANSITION,
+               "initial lazy LOW engine %d returned %#x reason %u\n", i,
+               (unsigned int)holders[i].simulation_status,
+               holders[i].params.stop_reason );
+        atomic_store_explicit( &holders[i].execute, 0, memory_order_release );
+        check( wait_atomic_int_equal( &holders[i].executed, 0, 5000 ),
+               "initial lazy LOW engine %d did not rearm\n", i );
+        initialize_begin_parameters( &holders[i].params, (uintptr_t)code_page,
+                                     (uintptr_t)stack );
+    }
+    check( provider_engine_count() == 1,
+           "sequential LOW holders retained %zu pooled engines\n",
+           provider_engine_count() );
+
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
     initialize_low_range( &range, TEST_LOW_GUEST_BASE, TEST_PAGE,
                           TEST_LOW_GUEST_BASE, MEM_COMMIT, PAGE_READONLY );
-    test_fail_engine_mutation = 1;
     status = publish_low_event( WINE_WOW64_MEMORY_PROTECT, 0,
                                 TEST_LOW_GUEST_BASE, TEST_PAGE,
                                 TEST_LOW_GUEST_BASE, &range, 1,
                                 STATUS_SUCCESS, STATUS_SUCCESS );
-    test_fail_engine_mutation = -1;
-    check( status == STATUS_UNSUCCESSFUL &&
-           observer_provider_status() == STATUS_UNSUCCESSFUL,
-           "partial LOW engine mutation did not poison provider %#x/%#x\n",
-           (unsigned int)status, (unsigned int)observer_provider_status() );
-    check( test_engine_mutation_count == 2,
-           "partial LOW engine mutation touched %d engines\n",
-           test_engine_mutation_count );
-    check( observer_generation() == generation && canonical_range_matches(
-               TEST_LOW_GUEST_BASE, TEST_LOW_HOST_BASE, MEM_COMMIT,
-               UC_PROT_READ | UC_PROT_WRITE,
+    check( !status && !memory_map_calls && !memory_unmap_calls &&
+           !cache_flush_calls && canonical_range_matches(
+               TEST_LOW_GUEST_BASE, TEST_LOW_HOST_BASE, MEM_COMMIT, UC_PROT_READ,
                XTAJIT64_MEMORY_ADDRESS_AMD64_LOW, FALSE ),
-           "partial LOW engine failure published a mixed registry\n" );
-    pthread_mutex_lock( &provider.mutex );
-    check( !provider.mutating && !provider.mutation_owner_valid &&
-           provider.mutation_stage == MUTATION_STAGE_IDLE &&
-           !provider.observer_transaction,
-           "partial LOW engine failure retained mutation ownership\n" );
-    pthread_mutex_unlock( &provider.mutex );
-    check( thread_init( NULL ) == STATUS_UNSUCCESSFUL,
-           "poisoned provider accepted a future engine\n" );
-    thread_term( NULL );
+           "LOW publication eagerly touched engines %#x %u/%u/%u\n",
+           (unsigned int)status, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls );
+    if (status) goto release;
+
+    emu_start_count = atomic_load_explicit( &test_emu_start_count,
+                                            memory_order_relaxed );
+    atomic_store_explicit( &holders[0].execute, 1, memory_order_release );
+    if (!wait_atomic_int_at_least( &holders[0].executed, 1, 5000 ))
+    {
+        check( FALSE, "first lazy LOW engine did not execute\n" );
+        poison( &timeout );
+        goto release;
+    }
+    check( !holders[0].simulation_status &&
+           holders[0].params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           memory_map_calls == 1 && memory_unmap_calls == 1 &&
+           cache_flush_calls == 1 &&
+           atomic_load_explicit( &test_emu_start_count, memory_order_relaxed ) ==
+               emu_start_count + 1,
+           "first lazy LOW engine returned %#x reason %u map/unmap/flush %u/%u/%u\n",
+           (unsigned int)holders[0].simulation_status,
+           holders[0].params.stop_reason, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls );
+
+    atomic_store_explicit( &holders[1].execute, 1, memory_order_release );
+    if (!wait_atomic_int_at_least( &holders[1].executed, 1, 5000 ))
+    {
+        check( FALSE, "second lazy LOW engine did not execute\n" );
+        poison( &timeout );
+        goto release;
+    }
+    check( !holders[1].simulation_status &&
+           holders[1].params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           memory_map_calls == 1 && memory_unmap_calls == 1 &&
+           cache_flush_calls == 1 && provider_engine_count() == 1 &&
+           atomic_load_explicit( &test_emu_start_count, memory_order_relaxed ) ==
+               emu_start_count + 2,
+           "second sequential LOW borrower returned %#x reason %u map/unmap/flush %u/%u/%u engines %zu\n",
+           (unsigned int)holders[1].simulation_status,
+           holders[1].params.stop_reason, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls, provider_engine_count() );
 
 release:
-    test_fail_engine_mutation = -1;
     for (i = 0; i < 2; ++i)
         atomic_store_explicit( &holders[i].release, 1, memory_order_release );
     for (i = 0; i < 2; ++i)
     {
         if (!created[i]) continue;
         check( wait_atomic_int_at_least( &holders[i].done, 1, 5000 ),
-               "LOW partial-engine holder %d did not terminate\n", i );
+               "lazy LOW holder %d did not terminate\n", i );
         pthread_join( threads[i], NULL );
     }
 done:
-    check( !reset_test_provider(), "LOW reset after partial-engine poison failed\n" );
+    memory_map_fail_call = memory_unmap_fail_call = -1;
+    check( !reset_test_provider(), "reset after lazy LOW synchronization failed\n" );
     if (failures == starting_failures)
-        printf( "XTAJIT64_LOW_OBSERVER_PARTIAL_POISON_PASS\n" );
+        printf( "XTAJIT64_LOW_OBSERVER_LAZY_SYNC_PASS\n" );
+}
+
+static void test_low_observer_lazy_sync_poison(void)
+{
+    unsigned char *code_page = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    struct code_buffer code = { .data = code_page };
+    struct wine_arm64ec_low_memory_range_v1 range;
+    struct engine_holder holder = {0};
+    struct xtajit64_poison_params timeout = { .status = STATUS_TIMEOUT };
+    pthread_t thread;
+    BOOL created = FALSE;
+    uint64_t generation;
+    unsigned int starting_failures = failures;
+    unsigned int emu_start_count;
+    NTSTATUS status;
+    int ret;
+
+    emit_movabs_rax( &code, TEST_LOW_GUEST_BASE );
+    emit_u8( &code, 0x48 ); emit_u8( &code, 0x8b ); emit_u8( &code, 0x00 );
+    emit_movabs_rax( &code, test_ec_target );
+    emit_jump_rax( &code );
+
+    status = register_identity_page( (void *)(uintptr_t)test_ec_target,
+                                     PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( code_page, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    if (!status) status = register_identity_page( (void *)(uintptr_t)test_teb,
+                                                  PAGE_READWRITE );
+    initialize_low_range( &range, TEST_LOW_GUEST_BASE, TEST_PAGE,
+                          TEST_LOW_GUEST_BASE, MEM_COMMIT, PAGE_READWRITE );
+    if (!status)
+        status = publish_low_event( WINE_WOW64_MEMORY_ALLOCATE, 0,
+                                    TEST_LOW_GUEST_BASE, TEST_PAGE,
+                                    TEST_LOW_GUEST_BASE, &range, 1,
+                                    STATUS_SUCCESS, STATUS_SUCCESS );
+    check( !status, "lazy-sync poison setup failed %#x\n", (unsigned int)status );
+    if (status) goto done;
+
+    initialize_begin_parameters( &holder.params, (uintptr_t)code_page,
+                                 (uintptr_t)stack );
+    ret = pthread_create( &thread, NULL, run_engine_holder, &holder );
+    check( !ret, "lazy-sync poison holder creation failed %d\n", ret );
+    if (ret) goto done;
+    created = TRUE;
+    check( wait_atomic_int_at_least( &holder.ready, 1, 5000 ),
+           "lazy-sync poison holder did not initialize\n" );
+    check( !holder.status, "lazy-sync poison holder init failed %#x\n",
+           (unsigned int)holder.status );
+    if (holder.status) goto release;
+
+    atomic_store_explicit( &holder.execute, 1, memory_order_release );
+    if (!wait_atomic_int_at_least( &holder.executed, 1, 5000 ))
+    {
+        check( FALSE, "lazy-sync poison holder did not fault in LOW mapping\n" );
+        poison( &timeout );
+        goto release;
+    }
+    check( !holder.simulation_status &&
+           holder.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION,
+           "lazy-sync poison setup execution returned %#x reason %u\n",
+           (unsigned int)holder.simulation_status, holder.params.stop_reason );
+    atomic_store_explicit( &holder.execute, 0, memory_order_release );
+    check( wait_atomic_int_equal( &holder.executed, 0, 5000 ),
+           "lazy-sync poison holder did not rearm\n" );
+    initialize_begin_parameters( &holder.params, (uintptr_t)code_page,
+                                 (uintptr_t)stack );
+
+    generation = observer_generation();
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    initialize_low_range( &range, TEST_LOW_GUEST_BASE, TEST_PAGE,
+                          TEST_LOW_GUEST_BASE, MEM_COMMIT, PAGE_READONLY );
+    status = publish_low_event( WINE_WOW64_MEMORY_PROTECT, 0,
+                                TEST_LOW_GUEST_BASE, TEST_PAGE,
+                                TEST_LOW_GUEST_BASE, &range, 1,
+                                STATUS_SUCCESS, STATUS_SUCCESS );
+    check( !status && observer_generation() == generation + 1 &&
+           !memory_map_calls && !memory_unmap_calls && !cache_flush_calls,
+           "lazy-sync poison publication failed %#x generation %llu calls %u/%u/%u\n",
+           (unsigned int)status,
+           (unsigned long long)observer_generation(), memory_map_calls,
+           memory_unmap_calls, cache_flush_calls );
+    if (status) goto release;
+
+    memory_map_fail_call = 0;
+    emu_start_count = atomic_load_explicit( &test_emu_start_count,
+                                            memory_order_relaxed );
+    atomic_store_explicit( &holder.execute, 1, memory_order_release );
+    if (!wait_atomic_int_at_least( &holder.executed, 1, 5000 ))
+    {
+        check( FALSE, "failing lazy LOW engine did not return\n" );
+        poison( &timeout );
+        goto release;
+    }
+    check( holder.simulation_status == STATUS_UNSUCCESSFUL &&
+           holder.params.stop_reason == XTAJIT64_STOP_INTERNAL_ERROR &&
+           holder.params.unicorn_error == UC_ERR_RESOURCE &&
+           observer_provider_status() == STATUS_UNSUCCESSFUL,
+           "lazy LOW sync failure did not poison provider %#x reason %u uc %u/%#x\n",
+           (unsigned int)holder.simulation_status, holder.params.stop_reason,
+           holder.params.unicorn_error, (unsigned int)observer_provider_status() );
+    check( memory_map_calls == 1 && memory_unmap_calls == 1 &&
+           cache_flush_calls == 1 &&
+           atomic_load_explicit( &test_emu_start_count, memory_order_relaxed ) ==
+               emu_start_count + 1,
+           "failed demand map had wrong execution or map/unmap/flush calls %u/%u/%u\n",
+           memory_map_calls, memory_unmap_calls, cache_flush_calls );
+    check( canonical_range_matches(
+               TEST_LOW_GUEST_BASE, TEST_LOW_HOST_BASE, MEM_COMMIT, UC_PROT_READ,
+               XTAJIT64_MEMORY_ADDRESS_AMD64_LOW, FALSE ),
+           "failed lazy LOW sync corrupted the canonical registry\n" );
+    check( thread_init( NULL ) == STATUS_UNSUCCESSFUL,
+           "lazy-sync-poisoned provider accepted a future engine\n" );
+    thread_term( NULL );
+
+release:
+    memory_map_fail_call = memory_unmap_fail_call = -1;
+    atomic_store_explicit( &holder.release, 1, memory_order_release );
+    if (created)
+    {
+        check( wait_atomic_int_at_least( &holder.done, 1, 5000 ),
+               "lazy-sync poison holder did not terminate\n" );
+        pthread_join( thread, NULL );
+    }
+done:
+    memory_map_fail_call = memory_unmap_fail_call = -1;
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    check( !reset_test_provider(), "reset after lazy-sync poison failed\n" );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_LOW_OBSERVER_LAZY_POISON_PASS\n" );
 }
 
 static void test_low_flush_multi_engine_poison(void)
@@ -1057,6 +1636,7 @@ static void test_low_flush_multi_engine_poison(void)
     uint64_t generation;
     unsigned int starting_failures = failures;
     NTSTATUS status;
+    uc_err engine_err;
     int i, ret;
 
     initialize_low_range( &range, TEST_LOW_GUEST_BASE, TEST_PAGE,
@@ -1088,6 +1668,17 @@ static void test_low_flush_multi_engine_poison(void)
     }
     if (!created[0] || !created[1] || holders[0].status || holders[1].status)
         goto release;
+
+    /* Cache invalidation is process-wide over every pooled topology.  Create a
+     * second idle topology explicitly; simultaneous borrowing is covered by
+     * test_concurrent_engines(). */
+    pthread_mutex_lock( &provider.mutex );
+    engine_err = create_pool_engine_locked( NULL );
+    pthread_mutex_unlock( &provider.mutex );
+    check( engine_err == UC_ERR_OK && provider_engine_count() == 2,
+           "LOW cache-flush pool setup returned %s with %zu engines\n",
+           uc_strerror( engine_err ), provider_engine_count() );
+    if (engine_err != UC_ERR_OK) goto release;
 
     reset_cache_recorders();
     status = flush_instruction_cache( &targeted );
@@ -1373,6 +1964,277 @@ done:
         printf( "XTAJIT64_EXECUTE_ONLY_PASS\n" );
 }
 
+static void test_demand_mapped_atomic(void)
+{
+    unsigned char *data = test_pages + 3 * TEST_PAGE;
+    unsigned char *code_page = test_pages + 4 * TEST_PAGE;
+    unsigned char *stack = test_pages + 5 * TEST_PAGE;
+    struct code_buffer code = { .data = code_page };
+    struct simulation simulation = {0};
+    struct thread_engine *engine;
+    unsigned int starting_failures = failures;
+    BOOL thread_initialized = FALSE;
+    BOOL mappings_match = FALSE;
+    BOOL has_ec = FALSE, has_teb = FALSE, has_data = FALSE;
+    BOOL has_code = FALSE, has_stack = FALSE;
+    NTSTATUS status;
+    size_t i;
+
+    memset( data, 0, TEST_PAGE );
+    memset( code_page, 0, TEST_PAGE );
+    emit_movabs_rax( &code, (uintptr_t)data );
+    emit_u8( &code, 0xf0 ); emit_u8( &code, 0x48 );
+    emit_u8( &code, 0xff ); emit_u8( &code, 0x00 ); /* lock incq [rax] */
+    emit_movabs_rax( &code, test_ec_target );
+    emit_jump_rax( &code );
+
+    status = register_identity_page( data, PAGE_READWRITE );
+    if (!status) status = register_identity_page( code_page, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    check( !status, "demand-mapped atomic setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    status = thread_init( NULL );
+    check( !status, "demand-mapped atomic engine init returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    thread_initialized = TRUE;
+
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    initialize_begin_params( &simulation, (uintptr_t)code_page,
+                             (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    engine = test_last_acquired_engine;
+    for (i = 0; engine && i < engine->mapped_ranges.count; ++i)
+    {
+        const struct mapped_range *range = &engine->mapped_ranges.data[i];
+
+        if (range->guest == test_ec_target &&
+            range->size == TEST_PAGE &&
+            range->perms == (UC_PROT_READ | UC_PROT_EXEC))
+            has_ec = TRUE;
+        else if (range->guest == test_teb &&
+                 range->size == TEST_PAGE &&
+                 range->perms == (UC_PROT_READ | UC_PROT_WRITE))
+            has_teb = TRUE;
+        else if (range->guest == (uintptr_t)data &&
+                 range->size == TEST_PAGE &&
+                 range->perms == (UC_PROT_READ | UC_PROT_WRITE))
+            has_data = TRUE;
+        else if (range->guest == (uintptr_t)code_page &&
+                 range->size == TEST_PAGE &&
+                 range->perms == (UC_PROT_READ | UC_PROT_EXEC))
+            has_code = TRUE;
+        else if (range->guest == (uintptr_t)stack &&
+                 range->size == TEST_PAGE &&
+                 range->perms == (UC_PROT_READ | UC_PROT_WRITE))
+            has_stack = TRUE;
+    }
+    mappings_match = engine && engine->mapped_ranges.count == 3 &&
+                     has_ec && !has_teb && has_data && has_code && !has_stack &&
+                     engine_mappings_match_registry( engine );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           *(uint64_t *)data == 1 && memory_map_calls == 2 &&
+           memory_unmap_calls <= 3 && cache_flush_calls <= 1 &&
+           mappings_match,
+           "demand-mapped atomic returned %#x reason %u value %#llx calls %u/%u/%u ranges %zu\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)*(uint64_t *)data, memory_map_calls,
+           memory_unmap_calls, cache_flush_calls,
+           engine ? engine->mapped_ranges.count : 0 );
+
+done:
+    if (thread_initialized) thread_term( NULL );
+    unregister_identity_page( stack );
+    unregister_identity_page( code_page );
+    unregister_identity_page( data );
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    if (failures == starting_failures)
+        printf( "XTAJIT64_DEMAND_MAPPED_ATOMIC_PASS\n" );
+}
+
+static void test_memory_fault_access_reporting(void)
+{
+    unsigned char *read_code = test_pages + 6 * TEST_PAGE;
+    unsigned char *write_code = test_pages + 7 * TEST_PAGE;
+    unsigned char *stack = test_pages + 8 * TEST_PAGE;
+    unsigned char *fault = test_pages + 9 * TEST_PAGE;
+    struct code_buffer code = {0};
+    struct simulation simulation = {0};
+    unsigned int starting_failures = failures;
+    BOOL fault_registered = FALSE, thread_initialized = FALSE;
+    NTSTATUS status;
+
+    memset( read_code, 0, TEST_PAGE );
+    code.data = read_code;
+    emit_movabs_rax( &code, (uintptr_t)fault );
+    emit_u8( &code, 0x48 ); emit_u8( &code, 0x8b );
+    emit_u8( &code, 0x18 ); /* mov (%rax),%rbx */
+
+    memset( write_code, 0, TEST_PAGE );
+    code.data = write_code;
+    code.offset = 0;
+    emit_movabs_rax( &code, (uintptr_t)fault );
+    emit_u8( &code, 0xc7 ); emit_u8( &code, 0x00 );
+    emit_u32( &code, 0x12345678 ); /* movl $0x12345678,(%rax) */
+
+    status = register_identity_page( read_code, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( write_code, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    check( !status, "memory-fault access setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    status = thread_init( NULL );
+    check( !status, "memory-fault access engine init returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    thread_initialized = TRUE;
+
+    initialize_begin_params( &simulation, (uintptr_t)read_code, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( status == STATUS_RETRY &&
+           simulation.params.stop_reason == XTAJIT64_STOP_MAPPING_MISS &&
+           simulation.params.fault_address == (uintptr_t)fault &&
+           simulation.params.fault_access == EXCEPTION_READ_FAULT,
+           "read memory fault returned %#x reason %u fault %#llx access %#x\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.fault_address,
+           simulation.params.fault_access );
+
+    initialize_begin_params( &simulation, (uintptr_t)write_code, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( status == STATUS_RETRY &&
+           simulation.params.stop_reason == XTAJIT64_STOP_MAPPING_MISS &&
+           simulation.params.fault_address == (uintptr_t)fault &&
+           simulation.params.fault_access == EXCEPTION_WRITE_FAULT,
+           "write memory fault returned %#x reason %u fault %#llx access %#x\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.fault_address,
+           simulation.params.fault_access );
+
+    initialize_begin_params( &simulation, (uintptr_t)fault, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( status == STATUS_RETRY &&
+           simulation.params.stop_reason == XTAJIT64_STOP_MAPPING_MISS &&
+           simulation.params.fault_address == (uintptr_t)fault &&
+           simulation.params.fault_access == EXCEPTION_EXECUTE_FAULT,
+           "execute memory fault returned %#x reason %u fault %#llx access %#x\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.fault_address,
+           simulation.params.fault_access );
+
+    status = register_identity_page( fault, PAGE_READONLY );
+    fault_registered = !status;
+    check( !status, "first-touch protection-fault setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+
+    memory_map_calls = 0;
+    initialize_begin_params( &simulation, (uintptr_t)write_code, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( status == STATUS_ACCESS_VIOLATION &&
+           simulation.params.stop_reason == XTAJIT64_STOP_MEMORY_FAULT &&
+           simulation.params.fault_address == (uintptr_t)fault &&
+           simulation.params.fault_access == EXCEPTION_WRITE_FAULT &&
+           !memory_map_calls,
+           "first-touch write protection fault returned %#x reason %u fault %#llx "
+           "access %#x maps %u\n", (unsigned int)status,
+           simulation.params.stop_reason,
+           (unsigned long long)simulation.params.fault_address,
+           simulation.params.fault_access, memory_map_calls );
+
+    memory_map_calls = 0;
+    initialize_begin_params( &simulation, (uintptr_t)fault, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( status == STATUS_ACCESS_VIOLATION &&
+           simulation.params.stop_reason == XTAJIT64_STOP_MEMORY_FAULT &&
+           simulation.params.fault_address == (uintptr_t)fault &&
+           simulation.params.fault_access == EXCEPTION_EXECUTE_FAULT &&
+           !memory_map_calls,
+           "first-touch execute protection fault returned %#x reason %u fault %#llx "
+           "access %#x maps %u\n", (unsigned int)status,
+           simulation.params.stop_reason,
+           (unsigned long long)simulation.params.fault_address,
+           simulation.params.fault_access, memory_map_calls );
+
+done:
+    if (thread_initialized) thread_term( NULL );
+    if (fault_registered) unregister_identity_page( fault );
+    unregister_identity_page( stack );
+    unregister_identity_page( write_code );
+    unregister_identity_page( read_code );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_MEMORY_FAULT_ACCESS_PASS\n" );
+}
+
+static void test_late_identity_mapping_retry(void)
+{
+    unsigned char *code_page = test_pages + 6 * TEST_PAGE;
+    unsigned char *data = test_pages + 7 * TEST_PAGE;
+    unsigned char *stack = test_pages + 8 * TEST_PAGE;
+    const uint64_t expected = 0x6c6174656d617070ull;
+    struct code_buffer code = { code_page, 0 };
+    struct simulation simulation = {0};
+    unsigned int starting_failures = failures;
+    BOOL data_registered = FALSE, thread_initialized = FALSE;
+    NTSTATUS status;
+
+    memset( code_page, 0, TEST_PAGE );
+    memset( data, 0, TEST_PAGE );
+    *(uint64_t *)data = expected;
+    emit_movabs_rax( &code, (uintptr_t)data );
+    emit_u8( &code, 0x48 ); emit_u8( &code, 0x8b );
+    emit_u8( &code, 0x18 ); /* mov (%rax),%rbx */
+    emit_movabs_rax( &code, test_ec_target );
+    emit_jump_rax( &code );
+
+    status = register_identity_page( code_page, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    check( !status, "late identity mapping setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    status = thread_init( NULL );
+    check( !status, "late identity mapping engine init returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    thread_initialized = TRUE;
+
+    initialize_begin_params( &simulation, (uintptr_t)code_page, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( status == STATUS_RETRY &&
+           simulation.params.stop_reason == XTAJIT64_STOP_MAPPING_MISS &&
+           simulation.params.fault_address == (uintptr_t)data &&
+           simulation.params.fault_access == EXCEPTION_READ_FAULT,
+           "late identity first access returned %#x reason %u fault %#llx access %#x\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.fault_address,
+           simulation.params.fault_access );
+
+    status = register_identity_page( data, PAGE_READWRITE );
+    data_registered = !status;
+    check( !status, "late identity reconciliation returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    initialize_begin_params( &simulation, (uintptr_t)code_page, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( !status &&
+           simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.context.rbx == expected,
+           "late identity retry returned %#x reason %u value %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.context.rbx );
+
+done:
+    if (thread_initialized) thread_term( NULL );
+    if (data_registered) unregister_identity_page( data );
+    unregister_identity_page( stack );
+    unregister_identity_page( code_page );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_LATE_IDENTITY_MAPPING_RETRY_PASS\n" );
+}
+
 static size_t build_syscall_trap_code( unsigned char *page, BOOL use_int2e,
                                        uint32_t syscall, uint64_t argument )
 {
@@ -1521,6 +2383,93 @@ done:
     unregister_identity_page( code );
 }
 
+static void build_x87_control_code( unsigned char *page, uint64_t address,
+                                    BOOL load )
+{
+    struct code_buffer code = { page, 0 };
+
+    emit_movabs_rax( &code, address );
+    emit_u8( &code, 0xd9 );
+    emit_u8( &code, load ? 0x28 : 0x38 ); /* FLDCW/FNSTCW word ptr [RAX] */
+    emit_movabs_rax( &code, test_ec_target );
+    emit_jump_rax( &code );
+}
+
+static void test_pooled_thread_cpu_context(void)
+{
+    unsigned char *data = test_pages + 3 * TEST_PAGE;
+    unsigned char *code = test_pages + 4 * TEST_PAGE;
+    unsigned char *stack = test_pages + 5 * TEST_PAGE;
+    uint16_t *control = (uint16_t *)data;
+    struct simulation current = {0}, other = {0};
+    pthread_t thread;
+    unsigned int starting_failures = failures;
+    BOOL thread_created = FALSE, thread_initialized = FALSE;
+    NTSTATUS status;
+    int ret;
+
+    memset( data, 0, TEST_PAGE );
+    memset( code, 0, TEST_PAGE );
+    control[0] = 0x027f;
+    control[1] = 0x037f;
+    build_x87_control_code( code, (uintptr_t)&control[0], TRUE );
+    build_x87_control_code( code + 64, (uintptr_t)&control[1], TRUE );
+    build_x87_control_code( code + 128, (uintptr_t)&control[2], FALSE );
+
+    status = register_identity_page( data, PAGE_READWRITE );
+    if (!status) status = register_identity_page( code, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    if (!status) status = thread_init( NULL );
+    check( !status, "pooled CPU-context setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    thread_initialized = TRUE;
+
+    initialize_begin_params( &current, (uintptr_t)code, (uintptr_t)stack );
+    status = begin_simulation( &current.params );
+    check( !status && current.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           provider_engine_count() == 1,
+           "first pooled CPU context returned %#x reason %u engines %zu\n",
+           (unsigned int)status, current.params.stop_reason,
+           provider_engine_count() );
+    if (status) goto done;
+
+    initialize_begin_params( &other, (uintptr_t)code + 64, (uintptr_t)stack );
+    ret = pthread_create( &thread, NULL, run_simulation, &other );
+    check( !ret, "second pooled CPU-context thread creation failed %d\n", ret );
+    if (!ret)
+    {
+        thread_created = TRUE;
+        check( join_simulation( thread, &other ),
+               "second pooled CPU-context thread timed out\n" );
+        thread_created = FALSE;
+        check( !other.init_status && !other.status &&
+               other.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+               provider_engine_count() == 1,
+               "second pooled CPU context returned %#x/%#x reason %u engines %zu\n",
+               (unsigned int)other.init_status, (unsigned int)other.status,
+               other.params.stop_reason, provider_engine_count() );
+    }
+
+    initialize_begin_params( &current, (uintptr_t)code + 128, (uintptr_t)stack );
+    status = begin_simulation( &current.params );
+    check( !status && current.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           control[2] == control[0] && control[2] != control[1] &&
+           provider_engine_count() == 1,
+           "pooled x87 state returned %#x reason %u control %#x/%#x/%#x engines %zu\n",
+           (unsigned int)status, current.params.stop_reason, control[0], control[1],
+           control[2], provider_engine_count() );
+
+done:
+    if (thread_created) pthread_join( thread, NULL );
+    if (thread_initialized) thread_term( NULL );
+    unregister_identity_page( stack );
+    unregister_identity_page( code );
+    unregister_identity_page( data );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_POOLED_CPU_CONTEXT_PASS\n" );
+}
+
 static void build_peer_wait_code( unsigned char *page, uint64_t data,
                                   unsigned int self, unsigned int peer )
 {
@@ -1577,6 +2526,9 @@ static void test_concurrent_engines(void)
                (unsigned int)simulations[i].init_status,
                (unsigned int)simulations[i].status,
                simulations[i].params.stop_reason );
+    check( provider_engine_count() == 2,
+           "simultaneous peer execution retained %zu pooled engines\n",
+           provider_engine_count() );
 
     unregister_identity_page( stack1 );
     unregister_identity_page( stack0 );
@@ -1585,13 +2537,14 @@ static void test_concurrent_engines(void)
     unregister_identity_page( data );
 }
 
-static void build_marker_code( unsigned char *page, uint64_t marker )
+static size_t build_marker_code( unsigned char *page, uint64_t marker )
 {
     struct code_buffer code = { page, 0 };
 
     emit_u8( &code, 0x49 ); emit_u8( &code, 0xba ); emit_u64( &code, marker );
     emit_movabs_rax( &code, test_ec_target );
     emit_jump_rax( &code );
+    return code.offset;
 }
 
 static void test_executable_cache_invalidation(void)
@@ -1603,13 +2556,14 @@ static void test_executable_cache_invalidation(void)
     struct xtajit64_memory_params flush =
     {
         .guest = (uintptr_t)code,
-        .size = 10,
     };
     struct simulation simulation = {0};
+    struct thread_engine *first_engine;
+    size_t engine_count;
     NTSTATUS status;
 
     memset( code, 0, TEST_PAGE );
-    build_marker_code( code, first );
+    flush.size = build_marker_code( code, first );
     check( !register_identity_page( code, PAGE_EXECUTE_READ ), "cache code map failed\n" );
     check( !register_identity_page( stack, PAGE_READWRITE ), "cache stack map failed\n" );
     status = thread_init( NULL );
@@ -1617,6 +2571,7 @@ static void test_executable_cache_invalidation(void)
     if (status) goto done;
     initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
     status = begin_simulation( &simulation.params );
+    first_engine = test_last_acquired_engine;
     check( !status && simulation.params.context.r10 == first,
            "first code generation returned %#x/%#llx\n", (unsigned int)status,
            (unsigned long long)simulation.params.context.r10 );
@@ -1624,20 +2579,88 @@ static void test_executable_cache_invalidation(void)
     build_marker_code( code, second );
     reset_cache_recorders();
     check( !flush_instruction_cache( &flush ), "targeted cache flush failed\n" );
-    check( cache_remove_calls == 1 && cache_remove_start == (uintptr_t)code &&
+    engine_count = provider_engine_count();
+    check( cache_remove_calls == engine_count && cache_remove_start == (uintptr_t)code &&
            cache_remove_end == (uintptr_t)code + flush.size,
-           "targeted cache interval %#llx-%#llx calls %u\n",
+           "targeted cache interval %#llx-%#llx calls %u/%zu\n",
            (unsigned long long)cache_remove_start,
-           (unsigned long long)cache_remove_end, cache_remove_calls );
+           (unsigned long long)cache_remove_end, cache_remove_calls, engine_count );
     initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
     status = begin_simulation( &simulation.params );
-    check( !status && simulation.params.context.r10 == second,
-           "cache flush retained stale code %#x/%#llx\n", (unsigned int)status,
-           (unsigned long long)simulation.params.context.r10 );
+    check( !status && simulation.params.context.r10 == second &&
+           test_last_acquired_engine == first_engine,
+           "cache flush retained stale code %#x/%#llx engine %p/%p\n",
+           (unsigned int)status, (unsigned long long)simulation.params.context.r10,
+           first_engine, test_last_acquired_engine );
     thread_term( NULL );
 done:
     unregister_identity_page( stack );
     unregister_identity_page( code );
+}
+
+static void test_executable_address_reuse_invalidation(void)
+{
+    const uint64_t first = 0x1122334455667788ull;
+    const uint64_t second = 0x8877665544332211ull;
+    unsigned char *code = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    struct simulation simulation = {0};
+    struct thread_engine *first_engine;
+    unsigned int starting_failures = failures;
+    NTSTATUS status;
+
+    memset( code, 0, TEST_PAGE );
+    build_marker_code( code, first );
+    check( !register_identity_page( code, PAGE_EXECUTE_READ ),
+           "address-reuse code map failed\n" );
+    check( !register_identity_page( stack, PAGE_READWRITE ),
+           "address-reuse stack map failed\n" );
+    status = thread_init( NULL );
+    check( !status, "address-reuse engine init failed %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    first_engine = test_last_acquired_engine;
+    check( !status && simulation.params.context.r10 == first,
+           "first address-reuse generation returned %#x/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)simulation.params.context.r10 );
+
+    reset_cache_recorders();
+    memory_map_calls = memory_unmap_calls = 0;
+    status = unregister_identity_page( code );
+    build_marker_code( code, second );
+    if (!status) status = register_identity_page( code, PAGE_EXECUTE_READ );
+    check( !status && !memory_map_calls && !memory_unmap_calls &&
+           !cache_flush_calls,
+           "address reuse publication returned %#x with engine calls %u/%u/%u\n",
+           (unsigned int)status, memory_map_calls, memory_unmap_calls,
+           cache_flush_calls );
+    if (status) goto thread_done;
+
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.context.r10 == second &&
+           test_last_acquired_engine == first_engine &&
+           memory_unmap_calls == 1 && memory_map_calls == 1 &&
+           cache_flush_calls == 1,
+           "address reuse retained stale code %#x/%#llx engine %p/%p calls %u/%u/%u\n",
+           (unsigned int)status,
+           (unsigned long long)simulation.params.context.r10,
+           first_engine, test_last_acquired_engine, memory_map_calls,
+           memory_unmap_calls, cache_flush_calls );
+
+thread_done:
+    thread_term( NULL );
+done:
+    unregister_identity_page( stack );
+    unregister_identity_page( code );
+    memory_map_calls = memory_unmap_calls = 0;
+    reset_cache_recorders();
+    if (failures == starting_failures)
+        printf( "XTAJIT64_ADDRESS_REUSE_INVALIDATION_PASS\n" );
 }
 
 static void *run_protect( void *arg )
@@ -1656,6 +2679,98 @@ static void *run_flush( void *arg )
     worker->status = flush_instruction_cache( &worker->params );
     atomic_store_explicit( &worker->done, 1, memory_order_release );
     return NULL;
+}
+
+static void *run_process_term( void *arg )
+{
+    struct process_term_worker *worker = arg;
+
+    worker->status = process_term( NULL );
+    atomic_store_explicit( &worker->done, 1, memory_order_release );
+    return NULL;
+}
+
+static void test_running_pool_teardown(void)
+{
+    unsigned char *code = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    struct code_buffer buffer = { code, 0 };
+    struct simulation simulation = {0};
+    struct process_term_worker worker = {0};
+    pthread_t runner, terminator;
+    unsigned int starting_failures = failures;
+    BOOL runner_created = FALSE, terminator_created = FALSE;
+    BOOL entered, shutting_down;
+    NTSTATUS status;
+    int ret;
+
+    memset( code, 0, TEST_PAGE );
+    emit_movabs_rax( &buffer, test_ec_target );
+    emit_jump_rax( &buffer );
+    status = register_identity_page( (void *)(uintptr_t)test_ec_target,
+                                     PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( code, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    if (!status) status = register_identity_page( (void *)(uintptr_t)test_teb,
+                                                  PAGE_READWRITE );
+    check( !status, "running pool teardown setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto reset;
+
+    atomic_store( &test_hold_ec_hook, 1 );
+    atomic_store( &test_ec_hook_entered, 0 );
+    atomic_store( &test_release_ec_hook, 0 );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    ret = pthread_create( &runner, NULL, run_simulation, &simulation );
+    check( !ret, "running pool teardown simulation creation failed %d\n", ret );
+    if (ret) goto release;
+    runner_created = TRUE;
+    entered = wait_atomic_int_at_least( &test_ec_hook_entered, 1, 2000 );
+    check( entered, "running pool teardown did not enter the held engine\n" );
+    if (!entered) goto release;
+
+    ret = pthread_create( &terminator, NULL, run_process_term, &worker );
+    check( !ret, "running pool terminator creation failed %d\n", ret );
+    if (ret) goto release;
+    terminator_created = TRUE;
+    shutting_down = wait_provider_shutdown_started( 2000 );
+    check( shutting_down && !atomic_load_explicit( &worker.done,
+                                                   memory_order_acquire ),
+           "process teardown did not wait for the borrowed engine\n" );
+
+release:
+    atomic_store_explicit( &test_release_ec_hook, 1, memory_order_release );
+    if (runner_created)
+        check( join_simulation( runner, &simulation ),
+               "running pool teardown simulation timed out\n" );
+    if (terminator_created) pthread_join( terminator, NULL );
+    if (runner_created)
+        check( !simulation.init_status && !simulation.status &&
+               simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION,
+               "running pool teardown simulation returned %#x/%#x reason %u\n",
+               (unsigned int)simulation.init_status,
+               (unsigned int)simulation.status, simulation.params.stop_reason );
+    if (terminator_created)
+        check( !worker.status && atomic_load_explicit( &worker.done,
+                                                       memory_order_acquire ),
+               "running pool teardown returned %#x\n", (unsigned int)worker.status );
+    pthread_mutex_lock( &provider.mutex );
+    check( !provider.initialized && !provider.engines &&
+           !provider.initial_context && !provider.mutating &&
+           !provider.shutting_down,
+           "running pool teardown retained provider resources\n" );
+    pthread_mutex_unlock( &provider.mutex );
+
+reset:
+    atomic_store( &test_hold_ec_hook, 0 );
+    atomic_store( &test_release_ec_hook, 1 );
+    process_term( NULL );
+    process_params.enabled_capabilities = 0;
+    status = process_init( &process_params );
+    check( !status, "provider restart after running pool teardown returned %#x\n",
+           (unsigned int)status );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_RUNNING_POOL_TEARDOWN_PASS\n" );
 }
 
 static void *run_low_observer( void *arg )
@@ -1957,15 +3072,18 @@ release:
                (unsigned int)status );
         if (!status)
         {
+            size_t engine_count = provider_engine_count();
+
             reset_cache_recorders();
             status = flush_instruction_cache( &worker.params );
-            check( !status && cache_remove_calls == 1 && !cache_flush_calls &&
+            check( !status && cache_remove_calls == engine_count &&
+                   !cache_flush_calls &&
                    cache_remove_start == worker.params.guest &&
                    cache_remove_end == worker.params.guest + worker.params.size,
-                   "flush preflight retry returned %#x remove/full %#x-%#x %u/%u\n",
+                   "flush preflight retry returned %#x remove/full %#x-%#x %u/%u engines %zu\n",
                    (unsigned int)status, (unsigned int)cache_remove_start,
                    (unsigned int)cache_remove_end, cache_remove_calls,
-                   cache_flush_calls );
+                   cache_flush_calls, engine_count );
             thread_term( NULL );
         }
     }
@@ -2035,10 +3153,14 @@ int main(void)
     check( provider.ranges.count == 1 && !provider.ranges.data[0].flags &&
            provider.ranges.data[0].permanent,
            "KUSER registry metadata was not initialized deterministically\n" );
+    test_incremental_resync();
+    test_coalesced_demand_mapping();
     test_low_observer_validation();
     test_low_observer_interval_replacement();
-    test_low_observer_partial_engine_poison();
+    test_low_observer_lazy_engine_sync();
+    test_low_observer_lazy_sync_poison();
     test_low_flush_multi_engine_poison();
+    test_running_pool_teardown();
     check( !register_identity_page( (void *)(uintptr_t)test_ec_target,
                                     PAGE_EXECUTE_READ ),
            "EC target map failed\n" );
@@ -2050,9 +3172,14 @@ int main(void)
 
     test_identity_codec();
     test_execute_only_read_and_execute();
+    test_demand_mapped_atomic();
+    test_memory_fault_access_reporting();
+    test_late_identity_mapping_retry();
     test_x64_syscall_traps();
+    test_pooled_thread_cpu_context();
     test_concurrent_engines();
     test_executable_cache_invalidation();
+    test_executable_address_reuse_invalidation();
     test_running_mutation_barrier();
     test_running_low_observer_barrier();
     test_running_flush_preflight_failure();

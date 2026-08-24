@@ -73,8 +73,13 @@ static uc_err record_cache_remove( uc_engine *uc, uint64_t start, uint64_t end )
 #define TEST_STRESS_TEB  0x01c00000u
 #define TEST_REP_BUFFER  0x02000000u
 #define TEST_REP_SIZE    (16 * 1024 * 1024u)
+#define TEST_ATOMIC_CODE  0x03100000u
+#define TEST_ATOMIC_STACK 0x03200000u
+#define TEST_ATOMIC_TEB   0x03300000u
 #define TEST_STOP_FLAG   (TEST_DATA + 0x200)
 #define TEST_ENTERED_FLAG (TEST_DATA + 0x204)
+#define TEST_ATOMIC_WORD  (TEST_DATA + 0x300)
+#define TEST_ATOMIC_RESULT (TEST_DATA + 0x304)
 
 static unsigned int failures;
 static struct xtajit_process_init_params process_params;
@@ -100,6 +105,37 @@ struct holder
     atomic_int *release;
     NTSTATUS status;
 };
+
+static void test_context_segment_normalization(void)
+{
+    struct xtajit_i386_context converted = {0};
+    I386_CONTEXT context = {0};
+
+    context.SegCs = 0x11110023;
+    context.SegSs = 0x2222002b;
+    context.SegDs = 0x33330033;
+    context.SegEs = 0x4444003b;
+    context.SegFs = 0x55550053;
+    context.SegGs = 0x66660043;
+    xtajit_context_segments_to_unix( &converted, &context );
+    check( converted.seg_cs == 0x23 && converted.seg_ss == 0x2b &&
+           converted.seg_ds == 0x33 && converted.seg_es == 0x3b &&
+           converted.seg_fs == 0x53 && converted.seg_gs == 0x43,
+           "PE context segment conversion retained undefined upper bits\n" );
+
+    converted.seg_cs |= 0x11110000;
+    converted.seg_ss |= 0x22220000;
+    converted.seg_ds |= 0x33330000;
+    converted.seg_es |= 0x44440000;
+    converted.seg_fs |= 0x55550000;
+    converted.seg_gs |= 0x66660000;
+    memset( &context, 0, sizeof(context) );
+    xtajit_context_segments_from_unix( &context, &converted );
+    check( context.SegCs == 0x23 && context.SegSs == 0x2b &&
+           context.SegDs == 0x33 && context.SegEs == 0x3b &&
+           context.SegFs == 0x53 && context.SegGs == 0x43,
+           "Unix context segment conversion published undefined upper bits\n" );
+}
 
 struct mutation
 {
@@ -695,6 +731,37 @@ static void emit_unix_bop( unsigned char *code, size_t *offset )
     emit_u8( code, offset, 0xe0 );
 }
 
+#if defined(UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP) && \
+    !defined(UC_SWITCHYARD_SHARED_MEMORY_ATOMICS)
+static void build_atomic_pause_code( unsigned char *code )
+{
+    size_t offset = 0, failure_branch, failure;
+    intptr_t displacement;
+
+    emit_u8( code, &offset, 0xb9 );
+    emit_u32( code, &offset, TEST_ATOMIC_WORD );
+    emit_u8( code, &offset, 0x31 );
+    emit_u8( code, &offset, 0xc0 );
+    emit_u8( code, &offset, 0xba );
+    emit_u32( code, &offset, UINT32_MAX );
+    emit_u8( code, &offset, 0xf0 );
+    emit_u8( code, &offset, 0x0f );
+    emit_u8( code, &offset, 0xb1 );
+    emit_u8( code, &offset, 0x11 );
+    emit_u8( code, &offset, 0x75 );
+    failure_branch = offset++;
+    emit_absolute_store( code, &offset, TEST_ATOMIC_RESULT, 1 );
+    emit_unix_bop( code, &offset );
+    failure = offset;
+    emit_absolute_store( code, &offset, TEST_ATOMIC_RESULT, 0xdead );
+    emit_unix_bop( code, &offset );
+    displacement = (intptr_t)failure - (intptr_t)(failure_branch + 1);
+    check( displacement >= INT8_MIN && displacement <= INT8_MAX,
+           "atomic failure branch is out of range\n" );
+    code[failure_branch] = (unsigned char)(int8_t)displacement;
+}
+#endif
+
 static void build_tight_loop_code( unsigned char *code )
 {
     size_t offset = 0;
@@ -863,6 +930,80 @@ static void test_concurrent_engines(void)
     check( !simulations[0].status &&
            simulations[0].params.stop_reason == XTAJIT_STOP_UNIX_CALL,
            "replacement engine did not clone the canonical registry\n" );
+}
+
+static void test_segment_programming_cache(void)
+{
+    struct xtajit_i386_context context =
+    {
+        .seg_cs = 0x23,
+        .seg_ss = 0x2b,
+        .seg_ds = 0x33,
+        .seg_es = 0x3b,
+        .seg_fs = 0x53,
+        .seg_gs = 0x43,
+    };
+    struct xtajit_engine *engine;
+    uint16_t selector;
+    NTSTATUS status;
+    uc_err err;
+
+    status = thread_init( NULL );
+    check( !status, "segment-cache engine initialization failed %#x\n",
+           (unsigned int)status );
+    if (status) return;
+    engine = pthread_getspecific( engine_key );
+    check( engine != NULL, "segment-cache engine is missing\n" );
+    if (!engine)
+    {
+        thread_term( NULL );
+        return;
+    }
+
+    test_segment_descriptor_write_count = 0;
+    err = write_segments( engine, &context, TEST_TEB0 );
+    check( err == UC_ERR_OK && test_segment_descriptor_write_count == 6 &&
+           engine->segment_state_valid,
+           "initial segment programming failed %u/%u/%u\n", err,
+           test_segment_descriptor_write_count, engine->segment_state_valid );
+
+    err = write_segments( engine, &context, TEST_TEB0 );
+    check( err == UC_ERR_OK && test_segment_descriptor_write_count == 6,
+           "unchanged segment state was reprogrammed %u/%u\n", err,
+           test_segment_descriptor_write_count );
+
+    err = load_segment( engine, UC_X86_REG_FS, context.seg_gs );
+    check( err == UC_ERR_OK, "guest segment mutation setup failed %u\n", err );
+    err = write_segments( engine, &context, TEST_TEB0 );
+    selector = 0;
+    if (err == UC_ERR_OK) err = uc_reg_read( engine->uc, UC_X86_REG_FS, &selector );
+    check( err == UC_ERR_OK && selector == context.seg_fs &&
+           test_segment_descriptor_write_count == 6,
+           "cached descriptors suppressed selector restoration %u/%#x/%u\n",
+           err, selector, test_segment_descriptor_write_count );
+
+    err = write_segments( engine, &context, TEST_TEB1 );
+    check( err == UC_ERR_OK && test_segment_descriptor_write_count == 12 &&
+           engine->segment_state.teb_guest == TEST_TEB1,
+           "changed TEB base did not reprogram FS %u/%u/%#x\n", err,
+           test_segment_descriptor_write_count, engine->segment_state.teb_guest );
+
+    context.seg_gs = 0x4b;
+    err = write_segments( engine, &context, TEST_TEB1 );
+    check( err == UC_ERR_OK && test_segment_descriptor_write_count == 18 &&
+           engine->segment_state.gs == context.seg_gs,
+           "changed selector did not reprogram segments %u/%u/%#x\n", err,
+           test_segment_descriptor_write_count, engine->segment_state.gs );
+
+    context.seg_fs = context.seg_gs;
+    err = write_segments( engine, &context, TEST_TEB1 );
+    check( err == UC_ERR_ARG && test_segment_descriptor_write_count == 18 &&
+           engine->segment_state_valid && engine->segment_state.gs == 0x4b,
+           "invalid selector set changed the programmed cache %u/%u/%u/%#x\n", err,
+           test_segment_descriptor_write_count, engine->segment_state_valid,
+           engine->segment_state.gs );
+
+    check( !thread_term( NULL ), "segment-cache engine cleanup failed\n" );
 }
 
 static void test_mixed_pages_and_duplicates(void)
@@ -1333,6 +1474,81 @@ static void test_cross_thread_pause_context(void)
     pthread_mutex_unlock( &provider.mutex );
     check( !poison_status, "cross-thread pause poisoned provider %#x\n",
            poison_status );
+}
+
+static void test_atomic_pause_boundary(void)
+{
+#if defined(UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP) && \
+    !defined(UC_SWITCHYARD_SHARED_MEMORY_ATOMICS)
+    struct simulation simulation;
+    struct mutation mutation = {0};
+    unsigned char *code;
+    uint32_t *word, *result;
+    pthread_t simulation_thread, mutation_thread;
+    int pause_count;
+    BOOL entered, requested, completed;
+
+    if (!map_test_page( TEST_ATOMIC_CODE, PAGE_EXECUTE_READ ) ||
+        !map_test_page( TEST_ATOMIC_STACK, PAGE_READWRITE ) ||
+        !map_test_page( TEST_ATOMIC_TEB, PAGE_READWRITE ))
+    {
+        check( FALSE, "atomic pause mapping setup failed\n" );
+        return;
+    }
+
+    code = (unsigned char *)(uintptr_t)shadow_address( TEST_ATOMIC_CODE );
+    word = (uint32_t *)(uintptr_t)shadow_address( TEST_ATOMIC_WORD );
+    result = (uint32_t *)(uintptr_t)shadow_address( TEST_ATOMIC_RESULT );
+    *word = 0;
+    *result = 0;
+    build_atomic_pause_code( code );
+    atomic_store( &test_hold_write_address, TEST_ATOMIC_WORD );
+    atomic_store( &test_write_hook_entered, 0 );
+    atomic_store( &test_release_write_hook, 0 );
+    pause_count = atomic_load_explicit( &test_pause_request_count,
+                                        memory_order_acquire );
+
+    initialize_simulation( &simulation, TEST_ATOMIC_CODE,
+                           TEST_ATOMIC_STACK, TEST_ATOMIC_TEB );
+    pthread_create( &simulation_thread, NULL, run_simulation, &simulation );
+    entered = wait_int( &simulation.ready, 1, 2000 ) &&
+              wait_int( &test_write_hook_entered, 1, 2000 );
+    check( entered, "atomic instruction did not enter its deterministic write hook\n" );
+    if (!entered)
+    {
+        atomic_store_explicit( &test_release_write_hook, 1, memory_order_release );
+        if (!wait_int( &simulation.done, 1, 5000 )) poison( NULL );
+        pthread_join( simulation_thread, NULL );
+        atomic_store( &test_hold_write_address, 0 );
+        return;
+    }
+
+    initialize_range( &mutation.range, TEST_ATOMIC_TEB, TEST_PAGE,
+                      TEST_ATOMIC_TEB, MEM_COMMIT, PAGE_READONLY, TRUE );
+    mutation.operation = WINE_WOW64_MEMORY_PROTECT;
+    pthread_create( &mutation_thread, NULL, run_mutation, &mutation );
+    requested = wait_int( &test_pause_request_count, pause_count + 1, 2000 );
+    check( requested, "atomic instruction did not receive a cross-thread pause request\n" );
+    atomic_store_explicit( &test_release_write_hook, 1, memory_order_release );
+    completed = wait_int( &mutation.done, 1, 5000 ) &&
+                wait_int( &simulation.done, 1, 5000 );
+    check( completed, "atomic pause mutation or resumed simulation timed out\n" );
+    if (!completed) poison( NULL );
+    pthread_join( mutation_thread, NULL );
+    pthread_join( simulation_thread, NULL );
+
+    check( !mutation.status && !simulation.init_status && !simulation.status &&
+           simulation.params.stop_reason == XTAJIT_STOP_UNIX_CALL &&
+           simulation.params.execution_slice_count >= 2,
+           "atomic pause returned mutation %#x init %#x status %#x reason %u slices %llu\n",
+           (unsigned int)mutation.status, (unsigned int)simulation.init_status,
+           (unsigned int)simulation.status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.execution_slice_count );
+    check( *word == UINT32_MAX && *result == 1,
+           "atomic pause split a committed instruction, word %#x result %#x\n",
+           *word, *result );
+    atomic_store( &test_hold_write_address, 0 );
+#endif
 }
 
 static uint64_t run_pause_workload( const char *name, uint32_t eip,
@@ -1989,6 +2205,7 @@ int main(void)
     process_params.kuser_size = TEST_PAGE;
     process_params.low_va_shadow_base = test_shadow_base;
     process_params.low_va_shadow_size = WINE_LOW_VA_SHADOW_SIZE;
+    test_context_segment_normalization();
     test_guest_unixlib_handle_gate();
     test_process_handshake_validation();
     status = process_init( &process_params );
@@ -2003,11 +2220,13 @@ int main(void)
     test_private_page_boundaries();
     test_observer_range_flag_validation();
     test_concurrent_engines();
+    test_segment_programming_cache();
     test_mixed_pages_and_duplicates();
     test_authoritative_completion();
     test_running_mutation_gate();
     test_single_byte_cache_invalidation();
     test_cross_thread_pause_context();
+    test_atomic_pause_boundary();
     test_cross_thread_stop_workloads();
     benchmark_pause_latencies();
     test_fault_resolver_actions();

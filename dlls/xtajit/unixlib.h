@@ -152,23 +152,26 @@ C_ASSERT( XTAJIT_GUEST_GDT_PAGE == XTAJIT_GUEST_BOP_PAGE + XTAJIT_GUEST_PAGE_SIZ
 static inline void xtajit_context_segments_to_unix( struct xtajit_i386_context *dst,
                                                       const I386_CONTEXT *src )
 {
-    dst->seg_cs = src->SegCs;
-    dst->seg_ss = src->SegSs;
-    dst->seg_ds = src->SegDs;
-    dst->seg_es = src->SegEs;
-    dst->seg_fs = src->SegFs;
-    dst->seg_gs = src->SegGs;
+    /* Windows stores selectors in DWORD context fields but defines only their
+     * low 16 bits.  Exception dispatch is allowed to leave the upper bits
+     * unspecified, and Unicorn rejects those non-selector bits. */
+    dst->seg_cs = LOWORD( src->SegCs );
+    dst->seg_ss = LOWORD( src->SegSs );
+    dst->seg_ds = LOWORD( src->SegDs );
+    dst->seg_es = LOWORD( src->SegEs );
+    dst->seg_fs = LOWORD( src->SegFs );
+    dst->seg_gs = LOWORD( src->SegGs );
 }
 
 static inline void xtajit_context_segments_from_unix( I386_CONTEXT *dst,
                                                         const struct xtajit_i386_context *src )
 {
-    dst->SegCs = src->seg_cs;
-    dst->SegSs = src->seg_ss;
-    dst->SegDs = src->seg_ds;
-    dst->SegEs = src->seg_es;
-    dst->SegFs = src->seg_fs;
-    dst->SegGs = src->seg_gs;
+    dst->SegCs = LOWORD( src->seg_cs );
+    dst->SegSs = LOWORD( src->seg_ss );
+    dst->SegDs = LOWORD( src->seg_ds );
+    dst->SegEs = LOWORD( src->seg_es );
+    dst->SegFs = LOWORD( src->seg_fs );
+    dst->SegGs = LOWORD( src->seg_gs );
 }
 
 static inline BOOL xtajit_normalize_shadow_address( UINT64 address, BOOL allow_end,

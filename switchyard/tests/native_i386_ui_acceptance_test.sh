@@ -221,6 +221,9 @@ EOF
     -o "$RUNTIME/lib/wine/aarch64-unix/xtajit64.so" <<'EOF'
 extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
+__attribute__((used, visibility("default"))) const char
+    switchyard_xtajit64_fixture_abi_identity[] =
+        "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);
@@ -229,15 +232,16 @@ EOF
 
 /usr/bin/python3 -I - "$RUNTIME" \
     "$SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY" \
-    "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY" <<'PY'
+    "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY" \
+    "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" <<'PY'
 import os
 import struct
 import sys
 
-root, xtajit, xtajit64 = sys.argv[1:]
+root, xtajit, xtajit64, x64_abi_identity = sys.argv[1:]
 
 
-def write_pe(relative, machine, arm64ec=False):
+def write_pe(relative, machine, arm64ec=False, abi_identity=None):
     value = bytearray(0x1200 if arm64ec else 0x98)
     value[:2] = b"MZ"
     struct.pack_into("<I", value, 0x3C, 0x80)
@@ -259,6 +263,8 @@ def write_pe(relative, machine, arm64ec=False):
         struct.pack_into("<Q", value, 0x2C8, 0x180001100)
         struct.pack_into("<III", value, 0x300, 2, 0x1120, 1)
         struct.pack_into("<II", value, 0x320, 0x2001, 0x100)
+    if abi_identity is not None:
+        value.extend(abi_identity.encode("ascii") + b"\0")
     path = os.path.join(root, relative)
     with open(path, "xb") as stream:
         stream.write(value)
@@ -266,7 +272,7 @@ def write_pe(relative, machine, arm64ec=False):
 
 
 write_pe(xtajit, 0xAA64)
-write_pe(xtajit64, 0x8664, True)
+write_pe(xtajit64, 0x8664, True, x64_abi_identity)
 PY
 
 for module in crypt32 dwrite secur32 winemac ws2_32; do

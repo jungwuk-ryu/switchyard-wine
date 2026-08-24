@@ -3454,6 +3454,52 @@ static struct file_view *next_mprotect_view( struct file_view *view )
 }
 
 
+/* ARM64X images can contain native ARM64EC and translated AMD64 code in the
+ * same image view.  The EC bitmap is the validated, page-granular ownership
+ * record; use it to decide whether a physical host page needs host EXEC. */
+static BOOL arm64ec_host_page_has_native_code( const struct file_view *view,
+                                               const void *address )
+{
+    ULONG_PTR host_start = (ULONG_PTR)address & ~host_page_mask;
+    ULONG_PTR start, end, page, end_page, host_end, view_end, physical_end;
+    SIZE_T map_word_count;
+    const UINT64 *map;
+
+    /* Missing or inconsistent ownership metadata must preserve host EXEC.  It
+     * is safer to reject a translated write than to make native EC code NX. */
+    if (!(view->protect & VPROT_ARM64EC) || !arm64ec_view ||
+        !get_mprotect_view_bounds( view, &view_end, &physical_end ) ||
+        host_start >= physical_end || host_page_size > ~(ULONG_PTR)0 - host_start)
+        return TRUE;
+    host_end = host_start + host_page_size;
+    start = max( host_start, (ULONG_PTR)view->base );
+    end = min( host_end, view_end );
+    if (start >= end) return FALSE;
+
+    page = start >> page_shift;
+    end_page = end >> page_shift;
+    map = arm64ec_view->base;
+    map_word_count = arm64ec_view->size / sizeof(*map);
+    while (page < end_page)
+    {
+        if (page / 64 >= map_word_count) return TRUE;
+        if ((map[page / 64] >> (page & 63)) & 1) return TRUE;
+        page++;
+    }
+    return FALSE;
+}
+
+
+static BOOL mprotect_host_page_is_cpu_provider_owned( const struct file_view *view,
+                                                       const void *address )
+{
+    if (!view) return FALSE;
+    if (view->protect & VPROT_CPU_PROVIDER_OWNED) return TRUE;
+    return (view->protect & VPROT_ARM64EC) &&
+           !arm64ec_host_page_has_native_code( view, address );
+}
+
+
 /* Darwin's JIT write-protect state is per-thread and applies to every MAP_JIT
  * mapping, so Wine valloc views must not join the CPU provider's JIT domain.
  * After an RWX mprotect denial, a private valloc may remain logically RWX but
@@ -3506,15 +3552,24 @@ static inline int mprotect_range_run( struct file_view *view, void *base, size_t
                                       BOOL cpu_provider_owned, ULONG_PTR logical_start,
                                       ULONG_PTR logical_end, BYTE set, BYTE clear )
 {
+    int first_errno;
+
     if (!mprotect_exec( base, size, unix_prot, cpu_provider_owned )) return 0;
+    first_errno = errno;
+    TRACE( "mprotect failed for %p-%p, unix_prot %#x, owner %#x, cpu_provider_owned %u, "
+           "logical %p-%p, set %#x, clear %#x, errno %d\n",
+           base, (char *)base + size, unix_prot, view ? view->protect : 0,
+           cpu_provider_owned, (void *)logical_start, (void *)logical_end,
+           set, clear, first_errno );
 
 #if defined(__APPLE__) && defined(__aarch64__)
-    if (errno == EACCES &&
+    if (first_errno == EACCES &&
         (unix_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC) &&
         can_retry_native_writable_exec( view, base, size, logical_start, logical_end,
                                         set, clear ))
         return mprotect( base, size, unix_prot & ~PROT_EXEC );
 #endif
+    errno = first_errno;
     return -1;
 }
 
@@ -3559,7 +3614,7 @@ static int mprotect_range_domain( struct file_view *view, void *base, size_t siz
                                   BYTE set, BYTE clear )
 {
     BOOL translated_shadow = view && is_shadow_translated_vprot( view->protect );
-    BOOL cpu_provider_owned = view && (view->protect & VPROT_CPU_PROVIDER_OWNED);
+    BOOL cpu_provider_owned, next_cpu_provider_owned;
     size_t i, count;
     char *addr = base;
     int prot, next;
@@ -3572,6 +3627,7 @@ static int mprotect_range_domain( struct file_view *view, void *base, size_t siz
                                                        set, clear )
             : (get_host_page_vprot( addr ) & ~clear) | set;
     prot = get_unix_prot( vprot );
+    cpu_provider_owned = mprotect_host_page_is_cpu_provider_owned( view, addr );
     for (count = i = 1; i < size / host_page_size; i++, count++)
     {
         vprot = translated_shadow
@@ -3580,12 +3636,15 @@ static int mprotect_range_domain( struct file_view *view, void *base, size_t siz
                                                            set, clear )
                 : (get_host_page_vprot( addr + count * host_page_size ) & ~clear) | set;
         next = get_unix_prot( vprot );
-        if (next == prot) continue;
+        next_cpu_provider_owned = mprotect_host_page_is_cpu_provider_owned(
+            view, addr + count * host_page_size );
+        if (next == prot && next_cpu_provider_owned == cpu_provider_owned) continue;
         if (mprotect_range_run( view, addr, count * host_page_size, prot,
                                 cpu_provider_owned, logical_start, logical_end,
                                 set, clear )) return -1;
         addr += count * host_page_size;
         prot = next;
+        cpu_provider_owned = next_cpu_provider_owned;
         count = 0;
     }
     return mprotect_range_run( view, addr, count * host_page_size, prot,
@@ -3981,6 +4040,8 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
                                       ARRAY_SIZE(stack_snapshot) ))) return STATUS_NO_MEMORY;
     if (!set_vprot( view, base, size, vprot ))
     {
+        TRACE( "set_vprot failed for %p-%p, protect %#x, vprot %#x, owner %#x, errno %d\n",
+               base, (char *)base + size, protect, vprot, view->protect, errno );
         restore_vprot_or_abort( base, size, old_vprot );
         status = STATUS_ACCESS_DENIED;
     }

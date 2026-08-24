@@ -66,6 +66,98 @@ static void flush_events(void)
     }
 }
 
+static void *get_gdi_shared_table(void)
+{
+#ifndef _WIN64
+    if (NtCurrentTeb()->GdiBatchCount)
+    {
+        TEB64 *teb64 = (TEB64 *)(UINT_PTR)NtCurrentTeb()->GdiBatchCount;
+        PEB64 *peb64 = (PEB64 *)(UINT_PTR)teb64->Peb;
+        return (void *)(UINT_PTR)peb64->GdiSharedHandleTable;
+    }
+#endif
+    return NtCurrentTeb()->Peb->GdiSharedHandleTable;
+}
+
+static void test_gdi_client_buffer(void)
+{
+    BITMAPINFO *bmi;
+    BYTE *bitmap_bits;
+    RGNDATA *region_data;
+    DWORD region_size;
+    HGDIOBJ old_bitmap;
+    HBITMAP bitmap;
+    LOGFONTW *logfont;
+    HRGN region;
+    HDC hdc;
+    HFONT font;
+    INT ret;
+
+    logfont = VirtualAlloc( NULL, sizeof(*logfont), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+    ok( !!logfont, "VirtualAlloc failed, error %lu\n", GetLastError() );
+    if (!logfont) return;
+
+    logfont->lfHeight = 12;
+    logfont->lfCharSet = DEFAULT_CHARSET;
+    font = CreateFontIndirectW( logfont );
+    ok( !!font, "CreateFontIndirectW failed, error %lu\n", GetLastError() );
+    if (font) DeleteObject( font );
+    VirtualFree( logfont, 0, MEM_RELEASE );
+
+    bitmap_bits = VirtualAlloc( NULL, 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+    ok( !!bitmap_bits, "VirtualAlloc failed, error %lu\n", GetLastError() );
+    if (!bitmap_bits) return;
+
+    memset( bitmap_bits, 0xa5, 8 );
+    bitmap = CreateBitmap( 8, 8, 1, 1, bitmap_bits );
+    ok( !!bitmap, "CreateBitmap failed, error %lu\n", GetLastError() );
+    if (bitmap) DeleteObject( bitmap );
+    VirtualFree( bitmap_bits, 0, MEM_RELEASE );
+
+    bmi = VirtualAlloc( NULL, sizeof(*bmi) + 8 * 8 * 4,
+                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+    ok( !!bmi, "VirtualAlloc failed, error %lu\n", GetLastError() );
+    if (!bmi) return;
+
+    bmi->bmiHeader.biSize = sizeof(bmi->bmiHeader);
+    bmi->bmiHeader.biWidth = 8;
+    bmi->bmiHeader.biHeight = -8;
+    bmi->bmiHeader.biPlanes = 1;
+    bmi->bmiHeader.biBitCount = 32;
+    bmi->bmiHeader.biCompression = BI_RGB;
+    bitmap_bits = (BYTE *)(bmi + 1);
+    memset( bitmap_bits, 0xa5, 8 * 8 * 4 );
+
+    hdc = CreateCompatibleDC( NULL );
+    ok( !!hdc, "CreateCompatibleDC failed, error %lu\n", GetLastError() );
+    region = CreateRectRgn( 0, 0, 8, 8 );
+    ok( !!region, "CreateRectRgn failed, error %lu\n", GetLastError() );
+    region_size = region ? GetRegionData( region, 0, NULL ) : 0;
+    ok( region_size >= sizeof(RGNDATAHEADER), "GetRegionData returned %lu, error %lu\n",
+        region_size, GetLastError() );
+    region_data = region_size ? VirtualAlloc( NULL, region_size, MEM_COMMIT | MEM_RESERVE,
+                                              PAGE_READWRITE ) : NULL;
+    ok( !!region_data, "VirtualAlloc failed, error %lu\n", GetLastError() );
+    if (region_data)
+    {
+        ret = GetRegionData( region, region_size, region_data );
+        ok( ret == region_size, "GetRegionData returned %d, expected %lu, error %lu\n",
+            ret, region_size, GetLastError() );
+        VirtualFree( region_data, 0, MEM_RELEASE );
+    }
+    if (region) DeleteObject( region );
+    bitmap = CreateCompatibleBitmap( hdc, 8, 8 );
+    ok( !!bitmap, "CreateCompatibleBitmap failed, error %lu\n", GetLastError() );
+    old_bitmap = bitmap ? SelectObject( hdc, bitmap ) : NULL;
+    ret = StretchDIBits( hdc, 0, 0, 8, 8, 0, 0, 8, 8, bitmap_bits, bmi,
+                         DIB_RGB_COLORS, SRCCOPY );
+    ok( ret == 8, "StretchDIBits returned %d, error %lu\n", ret, GetLastError() );
+    if (old_bitmap) SelectObject( hdc, old_bitmap );
+    if (bitmap) DeleteObject( bitmap );
+    if (hdc) DeleteDC( hdc );
+    VirtualFree( bmi, 0, MEM_RELEASE );
+}
+
 static void test_NtUserEnumDisplayDevices(void)
 {
     NTSTATUS ret;
@@ -117,6 +209,7 @@ static void test_NtUserCloseWindowStation(void)
 
 static void test_window_props(void)
 {
+    WCHAR string_prop[] = L"string property";
     HANDLE prop;
     ATOM atom;
     HWND hwnd;
@@ -166,6 +259,13 @@ static void test_window_props(void)
 
     prop = GetPropW(hwnd, L"test");
     ok(!prop, "prop = %p\n", prop);
+
+    ret = SetPropW( hwnd, string_prop, UlongToHandle(0x12345678) );
+    ok( ret, "SetPropW failed: %lu\n", GetLastError() );
+    prop = GetPropW( hwnd, string_prop );
+    ok( prop == UlongToHandle(0x12345678), "prop = %p\n", prop );
+    prop = RemovePropW( hwnd, string_prop );
+    ok( prop == UlongToHandle(0x12345678), "prop = %p\n", prop );
 
     status = NtUserBuildPropList( hwnd, 32, props, &count );
     ok( !status, "NtUserBuildPropList failed %lx\n", status );
@@ -903,6 +1003,12 @@ static void test_NtUserBuildHwndList(void)
     child2 = CreateWindowExA( 0, "static", "child2 static", WS_CHILD, 0,0,0,0,hwnd,0,0, NULL );
     grandchild = CreateWindowExA( 0, "static", "grandchild static", WS_CHILD, 0,0,0,0,child,0,0, NULL );
 
+    count = 0;
+    SetLastError( 0xdeadbeef );
+    ret = EnumThreadWindows( GetCurrentThreadId(), count_win, (LPARAM)&count );
+    ok( ret, "EnumThreadWindows failed, error %lu\n", GetLastError() );
+    ok( count >= 1, "expected at least one thread window, got %lu\n", count );
+
     size = 0xdeadbeef;
     status = NtUserBuildHwndList( 0, 0, FALSE, FALSE, GetCurrentThreadId(), ARRAYSIZE(buf), buf, &size );
     ok( !status, "NtUserBuildHwndList failed: %#lx\n", status );
@@ -1507,6 +1613,12 @@ static void test_window_text(void)
     ok( len == 4, "len = %d\n", len );
     ok( !lstrcmpW( buf, L"test" ), "buf = %s\n", wine_dbgstr_w(buf) );
 
+    memset( buf, 0xcc, sizeof(buf) );
+    res = NtUserMessageCall( hwnd, WM_GETTEXT, ARRAYSIZE(buf), (LPARAM)buf,
+                             0, NtUserDefWindowProc, FALSE );
+    ok( res == 4, "res = %Id\n", res );
+    ok( !lstrcmpW( buf, L"test" ), "buf = %s\n", wine_dbgstr_w(buf) );
+
     res = NtUserMessageCall( hwnd, WM_GETTEXTLENGTH, 0, 0, 0, NtUserDefWindowProc, TRUE );
     ok( res == 4, "res = %Id\n", res );
 
@@ -1523,6 +1635,36 @@ static void test_window_text(void)
 
     res = NtUserMessageCall( hwnd, WM_GETTEXTLENGTH, 0, 0, 0, NtUserDefWindowProc, TRUE );
     ok( res == 5, "res = %Id\n", res );
+
+    DestroyWindow( hwnd );
+}
+
+static void test_builtin_control_private_data(void)
+{
+    char buffer[32];
+    HWND hwnd;
+    BOOL ret;
+    int len;
+
+    /* Built-in controls store their state through NtUserGet/SetPrivateData.
+     * Keep the caller-owned buffers on the stack to exercise WoW64 guest
+     * address translation at the NtUserCallHwndParam boundary. */
+    hwnd = CreateWindowExA( 0, "edit", "initial", WS_POPUP, 0, 0, 64, 32,
+                            NULL, NULL, NULL, NULL );
+    ok( !!hwnd, "CreateWindowExA failed: %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    memset( buffer, 0xcc, sizeof(buffer) );
+    len = GetWindowTextA( hwnd, buffer, sizeof(buffer) );
+    ok( len == 7, "GetWindowTextA returned %d, error %lu\n", len, GetLastError() );
+    ok( !strcmp( buffer, "initial" ), "got %s\n", wine_dbgstr_a(buffer) );
+
+    ret = SetWindowTextA( hwnd, "updated" );
+    ok( ret, "SetWindowTextA failed: %lu\n", GetLastError() );
+    memset( buffer, 0xcc, sizeof(buffer) );
+    len = GetWindowTextA( hwnd, buffer, sizeof(buffer) );
+    ok( len == 7, "GetWindowTextA returned %d, error %lu\n", len, GetLastError() );
+    ok( !strcmp( buffer, "updated" ), "got %s\n", wine_dbgstr_a(buffer) );
 
     DestroyWindow( hwnd );
 }
@@ -1602,6 +1744,21 @@ static void test_menu(void)
 }
 
 static MSG *msg_ptr;
+
+static void test_message_pointer_arguments(void)
+{
+    MSG msg = {0};
+    LRESULT result;
+    BOOL ret;
+
+    msg.message = WM_NULL;
+    ret = NtUserTranslateMessage( &msg, 0 );
+    ok( !ret, "NtUserTranslateMessage returned %d\n", ret );
+    result = NtUserDispatchMessage( &msg );
+    ok( !result, "NtUserDispatchMessage returned %Id\n", result );
+    ret = NtUserTranslateAccelerator( NULL, NULL, &msg );
+    ok( !ret, "NtUserTranslateAccelerator returned %d\n", ret );
+}
 
 static LRESULT WINAPI hook_proc( INT code, WPARAM wparam, LPARAM lparam )
 {
@@ -2958,6 +3115,8 @@ static void test_NtUserRegisterWindowMessage(void)
 {
     char DECLSPEC_ALIGN(8) abi_buf[sizeof(ATOM_BASIC_INFORMATION) + MAX_ATOM_LEN * sizeof(WCHAR)];
     ATOM_BASIC_INFORMATION *abi = (ATOM_BASIC_INFORMATION *)abi_buf;
+    static const WCHAR wow64_nameW[] = L"Wine low address wow64 message";
+    UNICODE_STRING *wow64_name;
     UNICODE_STRING name;
     NTSTATUS status;
     WCHAR buf[64];
@@ -2993,6 +3152,20 @@ static void test_NtUserRegisterWindowMessage(void)
     ok( GetLastError() == 0xdeadbeef, "got %#lx\n", GetLastError() );
     status = NtQueryInformationAtom( atom, AtomBasicInformation, abi, sizeof(abi_buf), NULL );
     ok( status == STATUS_INVALID_HANDLE, "got %#lx\n", status );
+
+    wow64_name = VirtualAlloc( NULL, sizeof(*wow64_name) + sizeof(wow64_nameW),
+                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+    ok( !!wow64_name, "VirtualAlloc failed, error %lu\n", GetLastError() );
+    if (wow64_name)
+    {
+        wow64_name->Buffer = (WCHAR *)(wow64_name + 1);
+        memcpy( wow64_name->Buffer, wow64_nameW, sizeof(wow64_nameW) );
+        wow64_name->Length = sizeof(wow64_nameW) - sizeof(WCHAR);
+        wow64_name->MaximumLength = sizeof(wow64_nameW);
+        atom = NtUserRegisterWindowMessage( wow64_name );
+        ok( atom >= MAXINTATOM, "got %#x\n", atom );
+        VirtualFree( wow64_name, 0, MEM_RELEASE );
+    }
 
     memset( buf, 0xcc, sizeof(buf) );
     name.Buffer = buf;
@@ -3316,8 +3489,22 @@ START_TEST(win32u)
 {
     char **argv;
     int argc;
+    HWINSTA winstation;
+    HDESK desktop;
+    void *gdi_shared;
 
     /* Native win32u.dll needs user32 fully initialized before the remaining tests. */
+    winstation = GetProcessWindowStation();
+    desktop = GetThreadDesktop( GetCurrentThreadId() );
+    ok( !!winstation, "process window station was not initialized\n" );
+    ok( !!desktop, "thread desktop was not initialized\n" );
+    if (!winstation || !desktop) return;
+
+    gdi_shared = get_gdi_shared_table();
+    ok( !!gdi_shared, "GDI shared handle table was not initialized\n" );
+    if (!gdi_shared) return;
+    ok( !!GetStockObject( WHITE_BRUSH ), "failed to resolve a stock GDI object\n" );
+    test_gdi_client_buffer();
     GetDesktopWindow();
 
     argc = winetest_get_mainargs( &argv );
@@ -3366,7 +3553,9 @@ START_TEST(win32u)
     test_cursoricon();
     test_message_call();
     test_window_text();
+    test_builtin_control_private_data();
     test_menu();
+    test_message_pointer_arguments();
     test_message_filter();
     test_timer();
     test_inter_process_messages( argv[0] );

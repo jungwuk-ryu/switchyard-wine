@@ -304,7 +304,7 @@ static struct fence *fence_from_handle( VkFence handle )
 }
 
 static VkResult allocate_external_host_memory( struct vulkan_device *device, VkMemoryAllocateInfo *alloc_info, uint32_t mem_flags,
-                                               VkImportMemoryHostPointerInfoEXT *import_info )
+                                               VkImportMemoryHostPointerInfoEXT *import_info, void **mapping_ret )
 {
     struct vulkan_physical_device *physical_device = device->physical_device;
     VkMemoryHostPointerPropertiesEXT props =
@@ -317,9 +317,10 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
     void *mapping = NULL;
     VkResult res;
 
+    *mapping_ret = NULL;
     if (!once++) FIXME( "Using VK_EXT_external_memory_host\n" );
 
-    if (NtAllocateVirtualMemory( GetCurrentProcess(), &mapping, zero_bits, &alloc_size, MEM_COMMIT, PAGE_READWRITE ))
+    if (alloc_client_memory( &mapping, &alloc_size, MEM_COMMIT, PAGE_READWRITE ))
     {
         ERR( "NtAllocateVirtualMemory failed\n" );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -328,7 +329,10 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
     if ((res = device->p_vkGetMemoryHostPointerPropertiesEXT( device->host.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                               mapping, &props )))
     {
+        SIZE_T free_size = 0;
+
         ERR( "vkGetMemoryHostPointerPropertiesEXT failed: %d\n", res );
+        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &free_size, MEM_RELEASE );
         return res;
     }
 
@@ -361,6 +365,7 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
         import_info->pNext = alloc_info->pNext;
         alloc_info->pNext = import_info;
         alloc_info->allocationSize = (alloc_info->allocationSize + align) & ~align;
+        *mapping_ret = mapping;
     }
 
     return VK_SUCCESS;
@@ -1044,10 +1049,17 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
     /* For host visible memory, we try to use VK_EXT_external_memory_host on wow64 to ensure that mapped pointer is 32-bit. */
     mem_flags = physical_device->memory_properties.memoryTypes[alloc_info->memoryTypeIndex].propertyFlags;
     if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info &&
-        (res = allocate_external_host_memory( device, alloc_info, mem_flags, &host_pointer_info )))
+        (res = allocate_external_host_memory( device, alloc_info, mem_flags,
+                                              &host_pointer_info, &mapping )))
         return res;
 
-    if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(memory = calloc( 1, sizeof(*memory) )))
+    {
+        SIZE_T free_size = 0;
+
+        if (mapping) NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &free_size, MEM_RELEASE );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
     if (import_win32)
     {
@@ -1144,6 +1156,12 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
 failed:
     WARN( "Failed to allocate memory, res %d\n", res );
     if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
+    if (mapping)
+    {
+        SIZE_T free_size = 0;
+
+        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &free_size, MEM_RELEASE );
+    }
     if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
     d3dkmt_destroy_resource( memory->local );
     d3dkmt_destroy_mutex( memory->mutex );
@@ -1268,8 +1286,8 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
         info.size = VK_WHOLE_SIZE;
         info.flags |= VK_MEMORY_MAP_PLACED_BIT_EXT;
 
-        if (NtAllocateVirtualMemory( GetCurrentProcess(), &placed_info.pPlacedAddress, zero_bits,
-                                     &alloc_size, MEM_COMMIT, PAGE_READWRITE ))
+        if (alloc_client_memory( &placed_info.pPlacedAddress, &alloc_size,
+                                 MEM_COMMIT, PAGE_READWRITE ))
         {
             ERR( "NtAllocateVirtualMemory failed\n" );
             return VK_ERROR_OUT_OF_HOST_MEMORY;

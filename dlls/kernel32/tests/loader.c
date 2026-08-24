@@ -842,6 +842,7 @@ enum hybrid_chpe_case
 enum hybrid_pe32_chpe_case
 {
     HYBRID_PE32_CHPE_OLD_CONFIG_BOUNDARY,
+    HYBRID_PE32_CHPE_LEGACY_DIRECTORY_EXTENDED_SIZE,
     HYBRID_PE32_CHPE_CONFIG_PARTIAL,
     HYBRID_PE32_CHPE_METADATA_EXACT_FIT,
 };
@@ -1263,6 +1264,10 @@ static void build_pe32_chpe_image( enum hybrid_pe32_chpe_case test, IMAGE_NT_HEA
         dir->Size = sizeof(old_size);
         memcpy( hybrid_section_ptr( data, dir->VirtualAddress ), &old_size, sizeof(old_size) );
         break;
+    case HYBRID_PE32_CHPE_LEGACY_DIRECTORY_EXTENDED_SIZE:
+        dir->Size = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerTable );
+        cfg->Size = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFCheckFunctionPointer );
+        break;
     case HYBRID_PE32_CHPE_CONFIG_PARTIAL:
         cfg->Size = field_end - 1;
         break;
@@ -1282,6 +1287,8 @@ static void test_pe32_chpe_classification(void)
     {
         { "PE32 old load config ending at section boundary",
           HYBRID_PE32_CHPE_OLD_CONFIG_BOUNDARY, STATUS_SUCCESS },
+        { "PE32 legacy load-config directory with newer internal size",
+          HYBRID_PE32_CHPE_LEGACY_DIRECTORY_EXTENDED_SIZE, STATUS_SUCCESS },
         { "PE32 load-config CHPE field partially declared",
           HYBRID_PE32_CHPE_CONFIG_PARTIAL, STATUS_INVALID_FILE_FOR_SECTION },
         { "PE32 CHPE metadata ending at image boundary",

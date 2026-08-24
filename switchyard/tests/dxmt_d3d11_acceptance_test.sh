@@ -569,6 +569,13 @@ run_guest() {
       /bin/cat "$log" >&2
       return 1
     }
+  /usr/bin/grep -F \
+    'DXMT D3D11 dynamic texture WRITE_DISCARD/unmap/release passed for 257x17 pixels.' \
+    "$log" >/dev/null || {
+      echo "DXMT $guest run did not complete dynamic texture WRITE_DISCARD mapping." >&2
+      /bin/cat "$log" >&2
+      return 1
+    }
   /usr/bin/grep -F 'Maximum supported feature level:' "$log" >/dev/null || {
     echo "DXMT $guest run did not emit the DXMT device log." >&2
     /bin/cat "$log" >&2

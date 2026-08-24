@@ -1569,7 +1569,7 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
         ' ','-','-','i','n','i','t',0};
     RTL_USER_PROCESS_PARAMETERS params = { sizeof(params), sizeof(params) };
     PS_ATTRIBUTE_LIST ps_attr;
-    PS_CREATE_INFO create_info;
+    PS_CREATE_INFO create_info = { sizeof(create_info) };
     HANDLE process, thread, handles[2];
     UNICODE_STRING nameW;
     OBJECT_ATTRIBUTES attr;

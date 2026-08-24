@@ -819,7 +819,7 @@ HWND get_desktop_window(void)
             's','y','s','t','e','m','3','2','\\',0};
         RTL_USER_PROCESS_PARAMETERS params = { sizeof(params), sizeof(params) };
         PS_ATTRIBUTE_LIST ps_attr;
-        PS_CREATE_INFO create_info;
+        PS_CREATE_INFO create_info = { sizeof(create_info) };
         WCHAR desktop[MAX_PATH];
         PEB *peb = RtlGetCurrentPeb();
         HANDLE process, thread;

@@ -360,6 +360,7 @@ extern HKEY hkcu_key;
 extern const struct user_driver_funcs *user_driver;
 
 extern ULONG_PTR zero_bits;
+extern NTSTATUS alloc_client_memory( void **address, SIZE_T *size, ULONG type, ULONG protect );
 
 static inline BOOL set_ntstatus( NTSTATUS status )
 {

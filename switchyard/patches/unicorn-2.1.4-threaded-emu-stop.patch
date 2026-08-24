@@ -1,5 +1,5 @@
 diff --git a/include/uc_priv.h b/include/uc_priv.h
-index c3132dc..f316da1 100644
+index c3132dc..294456f 100644
 --- a/include/uc_priv.h
 +++ b/include/uc_priv.h
 @@ -9,6 +9,7 @@
@@ -10,7 +10,16 @@ index c3132dc..f316da1 100644
  #include "qemu/xxhash.h"
  #include "unicorn/unicorn.h"
  #include "list.h"
-@@ -521,6 +522,16 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
+@@ -374,6 +375,8 @@ struct uc_struct {
+     bool init_tcg;       // already initialized local TCGv variables?
+     bool stop_request;   // request to immediately stop emulation - for
+                          // uc_emu_stop()
++    bool instruction_boundary_stop_request; // request to stop after the
++                                            // current guest instruction
+     bool quit_request;   // request to quit the current TB, but continue to
+                          // emulate - for uc_mem_protect()
+     bool emulation_done; // emulation is done by uc_emu_start()
+@@ -521,6 +524,27 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
                                  length);
  }
  
@@ -24,10 +33,21 @@ index c3132dc..f316da1 100644
 +    atomic_set(&uc->stop_request, value);
 +}
 +
++static inline bool uc_instruction_boundary_stop_requested(const uc_engine *uc)
++{
++    return atomic_read(&uc->instruction_boundary_stop_request);
++}
++
++static inline void uc_set_instruction_boundary_stop_request(uc_engine *uc,
++                                                            bool value)
++{
++    atomic_set(&uc->instruction_boundary_stop_request, value);
++}
++
  /*
   break translation loop:
   This is done in two cases:
-@@ -530,11 +541,10 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
+@@ -530,11 +554,10 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
  */
  static inline uc_err break_translation_loop(uc_engine *uc)
  {
@@ -40,7 +60,7 @@ index c3132dc..f316da1 100644
      if (uc->cpu) {
          // exit the current TB
          cpu_exit(uc->cpu);
-@@ -545,10 +555,10 @@ static inline uc_err break_translation_loop(uc_engine *uc)
+@@ -545,10 +568,10 @@ static inline uc_err break_translation_loop(uc_engine *uc)
  
  static inline void revert_uc_emu_stop(uc_engine *uc)
  {
@@ -55,6 +75,168 @@ index c3132dc..f316da1 100644
  }
  
  #ifdef UNICORN_TRACER
+diff --git a/include/unicorn/unicorn.h b/include/unicorn/unicorn.h
+index b4ffc6b..5ee1303 100644
+--- a/include/unicorn/unicorn.h
++++ b/include/unicorn/unicorn.h
+@@ -1059,6 +1059,20 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+ UNICORN_EXPORT
+ uc_err uc_emu_stop(uc_engine *uc);
+ 
++/* Switchyard extension: defer a cross-thread stop until the current
++ translation block has completed at a guest-instruction boundary.  This must
++ not restart an instruction after one of its memory side effects committed. */
++#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP 1
++UNICORN_EXPORT
++uc_err uc_emu_stop_at_instruction_boundary(uc_engine *uc);
++
++/* Switchyard extension: make guest atomic instructions operate atomically
++ across independent engines that map the same host backing memory.  This is a
++ process-wide, one-way mode and must be enabled before emulation starts. */
++#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1
++UNICORN_EXPORT
++uc_err uc_enable_shared_memory_atomics(uc_engine *uc);
++
+ /*
+  Register callback for a hook event.
+  The callback will be run when the hook event is hit.
+diff --git a/qemu/tcg/aarch64/tcg-target.inc.c b/qemu/tcg/aarch64/tcg-target.inc.c
+index 50c9e59..6bd5b4a 100644
+--- a/qemu/tcg/aarch64/tcg-target.inc.c
++++ b/qemu/tcg/aarch64/tcg-target.inc.c
+@@ -1284,7 +1284,7 @@ static inline void tcg_out_rotl(TCGContext *s, TCGType ext,
+ {
+     int bits = ext ? 64 : 32;
+     int max = bits - 1;
+-    tcg_out_extr(s, ext, rd, rn, rn, bits - (m & max));
++    tcg_out_extr(s, ext, rd, rn, rn, (bits - (m & max)) & max);
+ }
+ 
+ static inline void tcg_out_dep(TCGContext *s, TCGType ext, TCGReg rd,
+diff --git a/tests/regress/aarch64_rotl_zero.c b/tests/regress/aarch64_rotl_zero.c
+new file mode 100644
+index 0000000..c5883e7
+--- /dev/null
++++ b/tests/regress/aarch64_rotl_zero.c
+@@ -0,0 +1,118 @@
++#include <inttypes.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <unicorn/unicorn.h>
++#include <unicorn/x86.h>
++
++#define CODE_ADDRESS 0x1000000ULL
++#define MAP_SIZE 0x1000ULL
++
++static int run_i32(unsigned int count, uint32_t expected)
++{
++    static const uint8_t code[] =
++    {
++        0xb8, 0x78, 0x56, 0x34, 0x12,       /* mov $0x12345678,%eax */
++        0xb9, 0x00, 0x00, 0x00, 0x00,       /* mov $count,%ecx */
++        0xd3, 0xc0,                         /* rol %cl,%eax */
++    };
++    uint8_t instance[sizeof(code)];
++    uint32_t eax = 0, eflags = 0x202;
++    uc_engine *uc = NULL;
++    uc_err err;
++
++    if (count > UINT8_MAX)
++    {
++        fprintf(stderr, "invalid i32 count %u\n", count);
++        return 1;
++    }
++    memcpy(instance, code, sizeof(instance));
++    instance[6] = (uint8_t)count;
++
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_32, &uc)) ||
++        (err = uc_mem_map(uc, CODE_ADDRESS, MAP_SIZE, UC_PROT_ALL)) ||
++        (err = uc_mem_write(uc, CODE_ADDRESS, instance, sizeof(instance))) ||
++        (err = uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags)) ||
++        (err = uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(instance),
++                            0, 0)) ||
++        (err = uc_reg_read(uc, UC_X86_REG_EAX, &eax)) ||
++        (err = uc_reg_read(uc, UC_X86_REG_EFLAGS, &eflags)))
++    {
++        fprintf(stderr, "i32 count %u failed: %s\n", count,
++                uc_strerror(err));
++        if (uc) uc_close(uc);
++        return 1;
++    }
++    uc_close(uc);
++
++    if (eax != expected || (count == 0 && eflags != 0x202))
++    {
++        fprintf(stderr, "i32 count %u produced eax %#" PRIx32
++                " eflags %#" PRIx32 " (expected %#" PRIx32 ")\n",
++                count, eax, eflags, expected);
++        return 1;
++    }
++    return 0;
++}
++
++static int run_i64(unsigned int count, uint64_t expected)
++{
++    static const uint8_t code[] =
++    {
++        0x48, 0xb8, 0xef, 0xcd, 0xab, 0x89,
++        0x67, 0x45, 0x23, 0x01,             /* mov $0x0123456789abcdef,%rax */
++        0xb9, 0x00, 0x00, 0x00, 0x00,       /* mov $count,%ecx */
++        0x48, 0xd3, 0xc0,                   /* rol %cl,%rax */
++    };
++    uint8_t instance[sizeof(code)];
++    uint64_t rax = 0;
++    uint32_t eflags = 0x202;
++    uc_engine *uc = NULL;
++    uc_err err;
++
++    if (count > UINT8_MAX)
++    {
++        fprintf(stderr, "invalid i64 count %u\n", count);
++        return 1;
++    }
++    memcpy(instance, code, sizeof(instance));
++    instance[11] = (uint8_t)count;
++
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc)) ||
++        (err = uc_mem_map(uc, CODE_ADDRESS, MAP_SIZE, UC_PROT_ALL)) ||
++        (err = uc_mem_write(uc, CODE_ADDRESS, instance, sizeof(instance))) ||
++        (err = uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags)) ||
++        (err = uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(instance),
++                            0, 0)) ||
++        (err = uc_reg_read(uc, UC_X86_REG_RAX, &rax)) ||
++        (err = uc_reg_read(uc, UC_X86_REG_EFLAGS, &eflags)))
++    {
++        fprintf(stderr, "i64 count %u failed: %s\n", count,
++                uc_strerror(err));
++        if (uc) uc_close(uc);
++        return 1;
++    }
++    uc_close(uc);
++
++    if (rax != expected || (count == 0 && eflags != 0x202))
++    {
++        fprintf(stderr, "i64 count %u produced rax %#" PRIx64
++                " eflags %#" PRIx32 " (expected %#" PRIx64 ")\n",
++                count, rax, eflags, expected);
++        return 1;
++    }
++    return 0;
++}
++
++int main(void)
++{
++    if (run_i32(0, UINT32_C(0x12345678)) ||
++        run_i32(1, UINT32_C(0x2468acf0)) ||
++        run_i64(0, UINT64_C(0x0123456789abcdef)) ||
++        run_i64(1, UINT64_C(0x02468acf13579bde)))
++        return 1;
++
++    puts("AArch64 TCG emitted valid zero-count i32 and i64 rotations");
++    return 0;
++}
 diff --git a/qemu/accel/tcg/cpu-exec.c b/qemu/accel/tcg/cpu-exec.c
 index 77168f3..80038b2 100644
 --- a/qemu/accel/tcg/cpu-exec.c
@@ -123,7 +305,149 @@ diff --git a/qemu/accel/tcg/cputlb.c b/qemu/accel/tcg/cputlb.c
 index 3d0bebd..ff90b58 100644
 --- a/qemu/accel/tcg/cputlb.c
 +++ b/qemu/accel/tcg/cputlb.c
-@@ -1578,7 +1578,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+@@ -1396,20 +1396,72 @@ void *tlb_vaddr_to_host(CPUArchState *env, abi_ptr addr,
+ 
+ /* Probe for a read-modify-write atomic operation.  Do not allow unaligned
+  * operations, or io operations to proceed.  Return the host address.  */
++static bool atomic_mmu_invalid_hook(CPUArchState *env, uc_hook_idx hook_idx,
++                                    uc_mem_type type, hwaddr paddr, size_t size,
++                                    uintptr_t retaddr, bool *synced)
++{
++    struct uc_struct *uc = env->uc;
++    struct list_item *cur;
++    struct hook *hook;
++    bool handled;
++
++    if (uc->invalid_error != UC_ERR_OK) {
++        return false;
++    }
++
++    for (cur = uc->hook[hook_idx].head;
++         cur != NULL && (hook = (struct hook *)cur->data); cur = cur->next) {
++        if (hook->to_delete || !HOOK_BOUND_CHECK(hook, paddr)) {
++            continue;
++        }
++        if (!*synced && !uc->skip_sync_pc_on_exit && retaddr) {
++            cpu_restore_state(uc->cpu, retaddr, false);
++            *synced = true;
++        }
++        JIT_CALLBACK_GUARD_VAR(
++            handled, ((uc_cb_eventmem_t)hook->callback)(
++                         uc, type, paddr, size, 0, hook->user_data));
++        if (handled) {
++            uc->invalid_error = UC_ERR_OK;
++            return true;
++        }
++        if (uc_stop_requested(uc)) {
++            break;
++        }
++    }
++    return false;
++}
++
++static void QEMU_NORETURN atomic_mmu_exit_invalid(CPUArchState *env,
++                                                   hwaddr paddr,
++                                                   uc_err error,
++                                                   uintptr_t retaddr)
++{
++    struct uc_struct *uc = env->uc;
++
++    uc->invalid_addr = paddr;
++    if (uc->invalid_error == UC_ERR_OK) {
++        uc->invalid_error = error;
++    }
++    cpu_exit(uc->cpu);
++    cpu_loop_exit_restore(uc->cpu, retaddr);
++}
++
+ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
+                                TCGMemOpIdx oi, uintptr_t retaddr)
+ {
+-#ifdef TARGET_ARM
+     struct uc_struct *uc = env->uc;
+-#endif
+     size_t mmu_idx = get_mmuidx(oi);
+-    uintptr_t index = tlb_index(env, mmu_idx, addr);
+-    CPUTLBEntry *tlbe = tlb_entry(env, mmu_idx, addr);
+-    target_ulong tlb_addr = tlb_addr_write(tlbe);
++    uintptr_t index;
++    CPUTLBEntry *tlbe;
++    target_ulong tlb_addr;
+     MemOp mop = get_memop(oi);
+     int a_bits = get_alignment_bits(mop);
+     int s_bits = mop & MO_SIZE;
++    hwaddr paddr;
++    MemoryRegion *mr;
+     void *hostaddr;
++    bool synced = false;
+ 
+     /* Adjust the given return address.  */
+     retaddr -= GETPC_ADJ;
+@@ -1430,6 +1482,11 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
+         goto stop_the_world;
+     }
+ 
++ retry:
++    index = tlb_index(env, mmu_idx, addr);
++    tlbe = tlb_entry(env, mmu_idx, addr);
++    tlb_addr = tlb_addr_write(tlbe);
++
+     /* Check TLB entry and enforce page permissions.  */
+     if (!tlb_hit(env->uc, tlb_addr, addr)) {
+         if (!VICTIM_TLB_HIT(addr_write, addr)) {
+@@ -1441,6 +1498,51 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
+         tlb_addr = tlb_addr_write(tlbe) & ~TLB_INVALID_MASK;
+     }
+ 
++    paddr = tlbe->paddr | (addr & ~TARGET_PAGE_MASK);
++    mr = uc->memory_mapping(uc, paddr);
++    if (mr == NULL) {
++        if (!atomic_mmu_invalid_hook(env, UC_HOOK_MEM_WRITE_UNMAPPED_IDX,
++                                     UC_MEM_WRITE_UNMAPPED, paddr,
++                                     1 << s_bits, retaddr, &synced)) {
++            atomic_mmu_exit_invalid(env, paddr, UC_ERR_WRITE_UNMAPPED,
++                                    retaddr);
++        }
++        if (uc->memory_mapping(uc, paddr) == NULL) {
++            atomic_mmu_exit_invalid(env, paddr, UC_ERR_MAP, retaddr);
++        }
++        goto retry;
++    }
++    if (!(mr->perms & UC_PROT_WRITE)) {
++        if (!atomic_mmu_invalid_hook(env, UC_HOOK_MEM_WRITE_PROT_IDX,
++                                     UC_MEM_WRITE_PROT, paddr, 1 << s_bits,
++                                     retaddr, &synced)) {
++            atomic_mmu_exit_invalid(env, paddr, UC_ERR_WRITE_PROT, retaddr);
++        }
++        mr = uc->memory_mapping(uc, paddr);
++        if (mr == NULL) {
++            atomic_mmu_exit_invalid(env, paddr, UC_ERR_MAP, retaddr);
++        }
++        if (!(mr->perms & UC_PROT_WRITE)) {
++            atomic_mmu_exit_invalid(env, paddr, UC_ERR_WRITE_PROT, retaddr);
++        }
++        goto retry;
++    }
++    if (!(mr->perms & UC_PROT_READ)) {
++        if (!atomic_mmu_invalid_hook(env, UC_HOOK_MEM_READ_PROT_IDX,
++                                     UC_MEM_READ_PROT, paddr, 1 << s_bits,
++                                     retaddr, &synced)) {
++            atomic_mmu_exit_invalid(env, paddr, UC_ERR_READ_PROT, retaddr);
++        }
++        mr = uc->memory_mapping(uc, paddr);
++        if (mr == NULL) {
++            atomic_mmu_exit_invalid(env, paddr, UC_ERR_MAP, retaddr);
++        }
++        if (!(mr->perms & UC_PROT_READ)) {
++            atomic_mmu_exit_invalid(env, paddr, UC_ERR_READ_PROT, retaddr);
++        }
++        goto retry;
++    }
++
+     /* Notice an IO access or a needs-MMU-lookup access */
+     if (unlikely(tlb_addr & TLB_MMIO)) {
+         /* There's really nothing that can be done to
+@@ -1578,7 +1680,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                          break;
  
                      // the last callback may already asked to stop emulation
@@ -132,7 +456,7 @@ index 3d0bebd..ff90b58 100644
                          break;
                  }
              } else {
-@@ -1599,7 +1599,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+@@ -1599,7 +1701,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                          break;
  
                      // the last callback may already asked to stop emulation
@@ -141,7 +465,7 @@ index 3d0bebd..ff90b58 100644
                          break;
                  }
              }
-@@ -1663,7 +1663,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+@@ -1663,7 +1765,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
              }
              JIT_CALLBACK_GUARD(((uc_cb_hookmem_t)hook->callback)(env->uc, UC_MEM_READ, paddr, size, 0, hook->user_data));
              // the last callback may already asked to stop emulation
@@ -150,7 +474,7 @@ index 3d0bebd..ff90b58 100644
                  break;
          }
  
-@@ -1699,7 +1699,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+@@ -1699,7 +1801,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                      break;
  
                  // the last callback may already asked to stop emulation
@@ -159,7 +483,7 @@ index 3d0bebd..ff90b58 100644
                      break;
              }
  
-@@ -1749,7 +1749,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+@@ -1749,7 +1851,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                      break;
  
                  // the last callback may already asked to stop emulation
@@ -168,7 +492,7 @@ index 3d0bebd..ff90b58 100644
                      break;
              }
  
-@@ -1859,7 +1859,7 @@ _out:
+@@ -1859,7 +1961,7 @@ _out:
                  }
                  JIT_CALLBACK_GUARD(((uc_cb_hookmem_t)hook->callback)(env->uc, UC_MEM_READ_AFTER, paddr, size, res, hook->user_data));
                  // the last callback may already asked to stop emulation
@@ -177,7 +501,7 @@ index 3d0bebd..ff90b58 100644
                      break;
              }
          }
-@@ -2207,7 +2207,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
+@@ -2207,7 +2309,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
              }
              JIT_CALLBACK_GUARD(((uc_cb_hookmem_t)hook->callback)(uc, UC_MEM_WRITE, paddr, size, val, hook->user_data));
              // the last callback may already asked to stop emulation
@@ -186,7 +510,7 @@ index 3d0bebd..ff90b58 100644
                  break;
          }
      }
-@@ -2230,7 +2230,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
+@@ -2230,7 +2332,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
                  break;
  
              // the last callback may already asked to stop emulation
@@ -195,7 +519,7 @@ index 3d0bebd..ff90b58 100644
                  break;
          }
  
-@@ -2283,7 +2283,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
+@@ -2283,7 +2385,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
                  break;
  
              // the last callback may already asked to stop emulation
@@ -205,10 +529,29 @@ index 3d0bebd..ff90b58 100644
          }
  
 diff --git a/qemu/accel/tcg/tcg-runtime.c b/qemu/accel/tcg/tcg-runtime.c
-index 777287a..d02e8c4 100644
+index 777287a..7d166d7 100644
 --- a/qemu/accel/tcg/tcg-runtime.c
 +++ b/qemu/accel/tcg/tcg-runtime.c
-@@ -176,7 +176,7 @@ void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
+@@ -165,10 +165,16 @@ void HELPER(exit_atomic)(CPUArchState *env)
+     cpu_loop_exit_atomic(env_cpu(env), GETPC());
+ }
+ 
+-void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
++static void check_exit_request_common(void *p, uint32_t in_delay_slot,
++                                      bool instruction_boundary,
++                                      uintptr_t retaddr)
++{
+     uc_engine *uc = p;
+ 
+-    if (cpu_loop_exit_requested(uc->cpu) && !in_delay_slot) {
++    if (cpu_loop_exit_requested(uc->cpu) && !in_delay_slot &&
++        (instruction_boundary ||
++         !uc_instruction_boundary_stop_requested(uc) ||
++         uc_stop_requested(uc))) {
+         // There are stil something we have to before exiting to be compatible with previous behaviors
+ 
+         // from cpu_tb_exec
+@@ -176,13 +182,23 @@ void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
              // Only unlock (allow writing to JIT area) if we are the outmost uc_emu_start
              tb_exec_unlock(uc);
          }
@@ -217,13 +560,66 @@ index 777287a..d02e8c4 100644
  
          if (uc->skip_sync_pc_on_exit) {
              uc->skip_sync_pc_on_exit = false;
-@@ -185,4 +185,4 @@ void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
-             cpu_loop_exit_restore(uc->cpu, GETPC());
+             cpu_loop_exit(uc->cpu);
+         } else {
+-            cpu_loop_exit_restore(uc->cpu, GETPC());
++            cpu_loop_exit_restore(uc->cpu, retaddr);
          }
      }
 -}
 \ No newline at end of file
 +}
++
++void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot)
++{
++    check_exit_request_common(p, in_delay_slot, false, GETPC());
++}
++
++void HELPER(check_exit_request_at_tb_start)(void *p, uint32_t in_delay_slot)
++{
++    check_exit_request_common(p, in_delay_slot, true, GETPC());
++}
+diff --git a/qemu/accel/tcg/tcg-runtime.h b/qemu/accel/tcg/tcg-runtime.h
+index 8ba10e1..7e2365a 100644
+--- a/qemu/accel/tcg/tcg-runtime.h
++++ b/qemu/accel/tcg/tcg-runtime.h
+@@ -260,4 +260,5 @@ DEF_HELPER_FLAGS_4(gvec_leu64, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+ 
+ DEF_HELPER_FLAGS_5(gvec_bitsel, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, ptr, i32)
+ 
+-DEF_HELPER_2(check_exit_request, void, ptr, i32)
+\ No newline at end of file
++DEF_HELPER_2(check_exit_request, void, ptr, i32)
++DEF_HELPER_2(check_exit_request_at_tb_start, void, ptr, i32)
+diff --git a/qemu/configure b/qemu/configure
+index cfd344f..f7d33da 100755
+--- a/qemu/configure
++++ b/qemu/configure
+@@ -1866,17 +1866,19 @@ fi
+ # Note that without __atomic builtins, we can only
+ # assume atomic loads/stores max at pointer size.
+ 
++atomic64=no
+ cat > $TMPC << EOF
+ #include <stdint.h>
+ int main(void)
+ {
+   uint64_t x = 0, y = 0;
+ #ifdef __ATOMIC_RELAXED
+-  y = __atomic_load_8(&x, 0);
+-  __atomic_store_8(&x, y, 0);
+-  __atomic_compare_exchange_8(&x, &y, x, 0, 0, 0);
+-  __atomic_exchange_8(&x, y, 0);
+-  __atomic_fetch_add_8(&x, y, 0);
++  y = __atomic_load_n(&x, __ATOMIC_RELAXED);
++  __atomic_store_n(&x, y, __ATOMIC_RELAXED);
++  __atomic_compare_exchange_n(&x, &y, x, 0,
++                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++  y = __atomic_exchange_n(&x, y, __ATOMIC_SEQ_CST);
++  y = __atomic_fetch_add(&x, y, __ATOMIC_SEQ_CST);
+ #else
+   typedef char is_host64[sizeof(void *) >= sizeof(uint64_t) ? 1 : -1];
+   __sync_lock_test_and_set(&x, y);
 diff --git a/qemu/hw/core/cpu.c b/qemu/hw/core/cpu.c
 index 0bd16dc..e3f99f2 100644
 --- a/qemu/hw/core/cpu.c
@@ -244,7 +640,7 @@ index 0bd16dc..e3f99f2 100644
  
  static void cpu_common_noop(CPUState *cpu)
 diff --git a/qemu/include/exec/exec-all.h b/qemu/include/exec/exec-all.h
-index 68c6567..a84e812 100644
+index 68c6567..3d94ebe 100644
 --- a/qemu/include/exec/exec-all.h
 +++ b/qemu/include/exec/exec-all.h
 @@ -80,7 +80,7 @@ void QEMU_NORETURN cpu_loop_exit_atomic(CPUState *cpu, uintptr_t pc);
@@ -256,16 +652,56 @@ index 68c6567..a84e812 100644
  }
  
  void cpu_reloading_memory_map(void);
+@@ -366,7 +366,7 @@ struct TranslationBlock {
+     uint32_t hash;  // unicorn needs this hash to remove this TB from QHT cache
+ };
+ 
+-// extern bool parallel_cpus;
++extern bool parallel_cpus;
+ 
+ /* Hide the atomic_read to make code a little easier on the eyes */
+ static inline uint32_t tb_cflags(const TranslationBlock *tb)
+@@ -377,7 +377,7 @@ static inline uint32_t tb_cflags(const TranslationBlock *tb)
+ /* current cflags for hashing/comparison */
+ static inline uint32_t curr_cflags(void)
+ {
+-    return 0;
++    return atomic_read(&parallel_cpus) ? CF_PARALLEL : 0;
+ }
+ 
+ /* TranslationBlock invalidate API */
+diff --git a/qemu/include/exec/gen-icount.h b/qemu/include/exec/gen-icount.h
+index 8b484cb..e3e6d45 100644
+--- a/qemu/include/exec/gen-icount.h
++++ b/qemu/include/exec/gen-icount.h
+@@ -40,7 +40,7 @@ static inline void gen_tb_start(TCGContext *tcg_ctx, TranslationBlock *tb)
+     if (tcg_ctx->delay_slot_flag != NULL) {
+         tcg_gen_mov_i32(tcg_ctx, tmp, tcg_ctx->delay_slot_flag);
+     }
+-    gen_helper_check_exit_request(tcg_ctx, puc, tmp);
++    gen_helper_check_exit_request_at_tb_start(tcg_ctx, puc, tmp);
+     tcg_temp_free_i32(tcg_ctx, tmp);
+     tcg_temp_free_ptr(tcg_ctx, puc);
+ }
 diff --git a/qemu/softmmu/cpus.c b/qemu/softmmu/cpus.c
-index afb8bbe..9e49021 100644
+index afb8bbe..8b05440 100644
 --- a/qemu/softmmu/cpus.c
 +++ b/qemu/softmmu/cpus.c
-@@ -97,16 +97,16 @@ static int tcg_cpu_exec(struct uc_struct *uc)
+@@ -96,20 +96,24 @@ static int tcg_cpu_exec(struct uc_struct *uc)
+             uc->size_recur_mem = 0;
              r = cpu_exec(uc, cpu);
  
++            if (uc_stop_requested(uc)) {
++                //printf(">>> got STOP request!!!\n");
++                finish = true;
++                break;
++            } else if (uc_instruction_boundary_stop_requested(uc)) {
++                uc_set_instruction_boundary_stop_request(uc, false);
++                finish = true;
++                break;
              // quit current TB but continue emulating?
 -            if (uc->quit_request && !uc->stop_request) {
-+            if (uc->quit_request && !uc_stop_requested(uc)) {
++            } else if (uc->quit_request) {
                  // reset stop_request
 -                uc->stop_request = false;
 +                uc_set_stop_request(uc, false);
@@ -277,24 +713,27 @@ index afb8bbe..9e49021 100644
                  cpu->exception_index = -1;
                  cpu_resume(cpu);
 -            } else if (uc->stop_request) {
-+            } else if (uc_stop_requested(uc)) {
-                 //printf(">>> got STOP request!!!\n");
-                 finish = true;
-                 break;
-@@ -135,9 +135,9 @@ static int tcg_cpu_exec(struct uc_struct *uc)
+-                //printf(">>> got STOP request!!!\n");
+-                finish = true;
+-                break;
+             }
+ 
+             // save invalid memory access error & quit
+@@ -135,9 +139,10 @@ static int tcg_cpu_exec(struct uc_struct *uc)
          }
      }
      uc->exit_request = 0;
 -    uc->cpu->exit_request = 0;
 -    uc->cpu->icount_decr_ptr->u16.high = 0;
 -    uc->cpu->tcg_exit_req = 0;
++    uc_set_instruction_boundary_stop_request(uc, false);
 +    atomic_set(&uc->cpu->exit_request, false);
 +    atomic_set(&uc->cpu->icount_decr_ptr->u16.high, 0);
 +    atomic_set(&uc->cpu->tcg_exit_req, 0);
  
      return finish;
  }
-@@ -207,7 +207,7 @@ void resume_all_vcpus(struct uc_struct* uc)
+@@ -207,7 +212,7 @@ void resume_all_vcpus(struct uc_struct* uc)
  {
      CPUState *cpu = uc->cpu;
      cpu->halted = 0;
@@ -356,109 +795,485 @@ index 97447fe..e39a85b 100644
              break;
      }
  
-diff --git a/uc.c b/uc.c
-index 75b89a0..e66a152 100644
---- a/uc.c
-+++ b/uc.c
-@@ -1018,13 +1018,13 @@ static void *_timeout_fn(void *arg)
-     do {
-         usleep(TIMEOUT_STEP);
-         // perhaps emulation is even done before timeout?
--        if (uc->emulation_done) {
-+        if (atomic_read(&uc->emulation_done)) {
-             break;
-         }
-     } while ((uint64_t)(get_clock() - current_time) < uc->timeout);
- 
-     // timeout before emulation is done?
--    if (!uc->emulation_done) {
-+    if (!atomic_read(&uc->emulation_done)) {
-         uc->timed_out = true;
-         // force emulation to stop
-         uc_emu_stop(uc);
-@@ -1081,7 +1081,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
-     // reset the counter
-     uc->emu_counter = 0;
-     uc->invalid_error = UC_ERR_OK;
--    uc->emulation_done = false;
-+    atomic_set(&uc->emulation_done, false);
-     uc->size_recur_mem = 0;
-     uc->timed_out = false;
-     uc->first_tb = true;
-@@ -1187,7 +1187,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
- #endif
-     }
-     uc->skip_sync_pc_on_exit = false;
--    uc->stop_request = false;
-+    uc_set_stop_request(uc, false);
- 
-     uc->emu_count = count;
-     // remove count hook if counting isn't necessary
-@@ -1232,7 +1232,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
-     // emulation is done if and only if we exit the outer uc_emu_start
-     // or we may lost uc_emu_stop
-     if (uc->nested_level == 0) {
--        uc->emulation_done = true;
-+        atomic_set(&uc->emulation_done, true);
- 
-         // remove hooks to delete
-         // make sure we delete all hooks at the first level.
-@@ -1256,11 +1256,8 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
- UNICORN_EXPORT
- uc_err uc_emu_stop(uc_engine *uc)
- {
--    UC_INIT(uc);
--    uc->stop_request = true;
--    uc_err err = break_translation_loop(uc);
--    restore_jit_state(uc);
--    return err;
-+    uc_set_stop_request(uc, true);
-+    return break_translation_loop(uc);
- }
- 
- // return target index where a memory region at the address exists, or could be
-@@ -2071,7 +2068,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
- {
-     struct uc_struct *uc = handle;
- 
--    if (unlikely(uc->stop_request)) {
-+    if (unlikely(uc_stop_requested(uc))) {
-         return;
-     }
- 
-@@ -2089,7 +2086,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
-     JIT_CALLBACK_GUARD(((uc_hook_tcg_op_2)hook->callback)(
-         uc, address, arg1, arg2, size, hook->user_data));
- 
--    if (unlikely(uc->stop_request)) {
-+    if (unlikely(uc_stop_requested(uc))) {
-         return;
-     }
- }
-@@ -2121,9 +2118,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
-     // }
- 
-     // the last callback may already asked to stop emulation
--    if (uc->stop_request && !not_allow_stop) {
-+    if (uc_stop_requested(uc) && !not_allow_stop) {
-         return;
--    } else if (not_allow_stop && uc->stop_request) {
-+    } else if (not_allow_stop && uc_stop_requested(uc)) {
-         revert_uc_emu_stop(uc);
-     }
- 
-@@ -2156,9 +2153,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
-         //   normally. No check_exit_request is generated and the hooks are
-         //   triggered normally. In other words, the whole IT block is treated
-         //   as a single instruction.
--        if (not_allow_stop && uc->stop_request) {
-+        if (not_allow_stop && uc_stop_requested(uc)) {
-             revert_uc_emu_stop(uc);
--        } else if (!not_allow_stop && uc->stop_request) {
-+        } else if (!not_allow_stop && uc_stop_requested(uc)) {
-             break;
-         }
-     }
+diff --git a/tests/regress/atomic_unmapped_hook.c b/tests/regress/atomic_unmapped_hook.c
+new file mode 100644
+index 0000000..ea9b816
+--- /dev/null
++++ b/tests/regress/atomic_unmapped_hook.c
+@@ -0,0 +1,138 @@
++/* Test invalid-memory recovery for an atomic read-modify-write operation. */
++
++#define _POSIX_C_SOURCE 200809L
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <unicorn/unicorn.h>
++#include <unicorn/x86.h>
++
++#define CODE_ADDRESS UINT64_C(0x100000)
++#define DATA_ADDRESS UINT64_C(0x200000)
++#define PAGE_SIZE 0x1000
++#define TIMEOUT_SECONDS 5
++
++struct hook_state
++{
++    uint64_t *data;
++    unsigned int calls;
++    uc_err map_error;
++};
++
++static const unsigned char code[] =
++{
++    0x48, 0xb8, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0xf0, 0x48, 0xff, 0x00, /* lock incq (DATA_ADDRESS) */
++};
++
++static bool map_atomic_target(uc_engine *uc, uc_mem_type type,
++                              uint64_t address, int size, int64_t value,
++                              void *user_data)
++{
++    struct hook_state *state = user_data;
++
++    (void)value;
++    ++state->calls;
++    if (type != UC_MEM_WRITE_UNMAPPED || address != DATA_ADDRESS || size != 8) {
++        return false;
++    }
++    state->map_error = uc_mem_map_ptr(uc, DATA_ADDRESS, PAGE_SIZE,
++                                      UC_PROT_READ | UC_PROT_WRITE,
++                                      state->data);
++    return state->map_error == UC_ERR_OK;
++}
++
++static uc_err open_test_engine(uc_engine **uc)
++{
++    uc_err err;
++
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_64, uc)) ||
++        (err = uc_enable_shared_memory_atomics(*uc)) ||
++        (err = uc_mem_map(*uc, CODE_ADDRESS, PAGE_SIZE, UC_PROT_ALL)) ||
++        (err = uc_mem_write(*uc, CODE_ADDRESS, code, sizeof(code)))) {
++        if (*uc) {
++            uc_close(*uc);
++            *uc = NULL;
++        }
++    }
++    return err;
++}
++
++static int test_recover_unmapped_atomic(uint64_t *data)
++{
++    struct hook_state state = {.data = data};
++    uc_engine *uc = NULL;
++    uc_hook hook;
++    uc_err err;
++    int ret = 1;
++
++    *data = 0;
++    if ((err = open_test_engine(&uc)) ||
++        (err = uc_hook_add(uc, &hook, UC_HOOK_MEM_WRITE_UNMAPPED,
++                           map_atomic_target, &state, DATA_ADDRESS,
++                           DATA_ADDRESS + sizeof(*data) - 1)) ||
++        (err = uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(code),
++                            0, 0))) {
++        fprintf(stderr, "recovering atomic access failed: %s\n",
++                uc_strerror(err));
++        goto done;
++    }
++    if (*data != 1 || state.calls != 1 || state.map_error != UC_ERR_OK) {
++        fprintf(stderr, "atomic recovery mismatch: value %llu, calls %u, "
++                "map error %s\n", (unsigned long long)*data, state.calls,
++                uc_strerror(state.map_error));
++        goto done;
++    }
++    ret = 0;
++
++ done:
++    if (uc) uc_close(uc);
++    return ret;
++}
++
++static int test_reject_unhandled_atomic(void)
++{
++    uc_engine *uc = NULL;
++    uc_err err;
++
++    if ((err = open_test_engine(&uc))) {
++        fprintf(stderr, "unhandled atomic setup failed: %s\n",
++                uc_strerror(err));
++        return 1;
++    }
++    err = uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(code), 0, 0);
++    uc_close(uc);
++    if (err != UC_ERR_WRITE_UNMAPPED) {
++        fprintf(stderr, "unhandled atomic returned %s\n", uc_strerror(err));
++        return 1;
++    }
++    return 0;
++}
++
++int main(void)
++{
++    uint64_t *data = NULL;
++    int ret = 1;
++
++    alarm(TIMEOUT_SECONDS);
++    if (posix_memalign((void **)&data, PAGE_SIZE, PAGE_SIZE)) {
++        fprintf(stderr, "data allocation failed\n");
++        return 2;
++    }
++    memset(data, 0, PAGE_SIZE);
++    if (test_recover_unmapped_atomic(data) || test_reject_unhandled_atomic()) {
++        goto done;
++    }
++    puts("atomic invalid-memory hook recovery passed");
++    ret = 0;
++
++ done:
++    free(data);
++    alarm(0);
++    return ret;
++}
+diff --git a/tests/regress/shared_memory_atomics.c b/tests/regress/shared_memory_atomics.c
+new file mode 100644
+index 0000000..367c4bd
+--- /dev/null
++++ b/tests/regress/shared_memory_atomics.c
+@@ -0,0 +1,329 @@
++/* Test x86 guest atomic instructions shared by independent Unicorn engines. */
++
++#define _POSIX_C_SOURCE 200809L
++
++#include <pthread.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <unicorn/unicorn.h>
++#include <unicorn/x86.h>
++
++#ifndef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
++#error UC_SWITCHYARD_SHARED_MEMORY_ATOMICS is required
++#endif
++
++#define CODE_ADDRESS 0x10000u
++#define DATA_ADDRESS 0x20000u
++#define PAGE_SIZE 0x1000u
++#define ITERATIONS 100
++#define ZF (1u << 6)
++
++struct barrier
++{
++    pthread_mutex_t mutex;
++    pthread_cond_t cond;
++    unsigned int starters;
++    unsigned int readers;
++};
++
++struct worker
++{
++    uc_engine *uc;
++    struct barrier *barrier;
++    uc_hook read_hook;
++    uc_err result;
++    uint32_t eax;
++    uint32_t eflags;
++};
++
++static uc_err enable_shared_memory_atomics(uc_engine *uc)
++{
++#ifdef SWITCHYARD_SHARED_ATOMICS_NEGATIVE_CONTROL
++    (void)uc;
++    return UC_ERR_OK;
++#else
++    return uc_enable_shared_memory_atomics(uc);
++#endif
++}
++
++static void read_after_hook(uc_engine *uc, uc_mem_type type, uint64_t address,
++                            int size, int64_t value, void *user_data)
++{
++    struct barrier *barrier = user_data;
++
++    (void)uc;
++    (void)type;
++    (void)address;
++    (void)size;
++    (void)value;
++
++    /* In a non-parallel translation this forces both engines to complete the
++     * ordinary load before either can store.  Parallel atomic helpers may
++     * bypass valid-memory hooks; either behavior must still produce one
++     * successful compare-exchange. */
++    pthread_mutex_lock(&barrier->mutex);
++    ++barrier->readers;
++    pthread_cond_broadcast(&barrier->cond);
++    while (barrier->readers < 2)
++        pthread_cond_wait(&barrier->cond, &barrier->mutex);
++    pthread_mutex_unlock(&barrier->mutex);
++}
++
++static void *run_worker(void *opaque)
++{
++    struct worker *worker = opaque;
++
++    pthread_mutex_lock(&worker->barrier->mutex);
++    ++worker->barrier->starters;
++    pthread_cond_broadcast(&worker->barrier->cond);
++    while (worker->barrier->starters < 2)
++        pthread_cond_wait(&worker->barrier->cond, &worker->barrier->mutex);
++    pthread_mutex_unlock(&worker->barrier->mutex);
++
++    worker->result = uc_emu_start(worker->uc, CODE_ADDRESS,
++                                  CODE_ADDRESS + 16, 0, 0);
++    if (!worker->result)
++        worker->result = uc_reg_read(worker->uc, UC_X86_REG_EAX,
++                                     &worker->eax);
++    if (!worker->result)
++        worker->result = uc_reg_read(worker->uc, UC_X86_REG_EFLAGS,
++                                     &worker->eflags);
++    return NULL;
++}
++
++static int setup_worker(struct worker *worker, struct barrier *barrier,
++                        uint32_t *shared)
++{
++    static const unsigned char code[] =
++    {
++        0xb9, 0x00, 0x00, 0x02, 0x00,       /* mov $DATA_ADDRESS,%ecx */
++        0x31, 0xc0,                         /* xor %eax,%eax */
++        0xba, 0x01, 0x00, 0x00, 0x00,       /* mov $1,%edx */
++        0xf0, 0x0f, 0xb1, 0x11,             /* lock cmpxchg %edx,(%ecx) */
++    };
++    uc_err err;
++
++    memset(worker, 0, sizeof(*worker));
++    worker->barrier = barrier;
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_32, &worker->uc)) ||
++        (err = enable_shared_memory_atomics(worker->uc)) ||
++        (err = uc_mem_map(worker->uc, CODE_ADDRESS, PAGE_SIZE, UC_PROT_ALL)) ||
++        (err = uc_mem_write(worker->uc, CODE_ADDRESS, code, sizeof(code))) ||
++        (err = uc_mem_map_ptr(worker->uc, DATA_ADDRESS, PAGE_SIZE,
++                              UC_PROT_ALL, shared)) ||
++        (err = uc_hook_add(worker->uc, &worker->read_hook,
++                           UC_HOOK_MEM_READ_AFTER, read_after_hook, barrier,
++                           DATA_ADDRESS, DATA_ADDRESS + sizeof(*shared) - 1)))
++    {
++        fprintf(stderr, "worker setup failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++    return 0;
++}
++
++static int test_cross_engine_cmpxchg(uint32_t *shared)
++{
++    struct barrier barrier;
++    struct worker workers[2];
++    pthread_t threads[2];
++    unsigned int i, iteration;
++    int err;
++    int ret = 1;
++
++    memset(&barrier, 0, sizeof(barrier));
++    if ((err = pthread_mutex_init(&barrier.mutex, NULL)))
++    {
++        fprintf(stderr, "barrier mutex initialization failed: %d\n", err);
++        return 1;
++    }
++    if ((err = pthread_cond_init(&barrier.cond, NULL)))
++    {
++        fprintf(stderr, "barrier condition initialization failed: %d\n", err);
++        pthread_mutex_destroy(&barrier.mutex);
++        return 1;
++    }
++    memset(workers, 0, sizeof(workers));
++    if (setup_worker(&workers[0], &barrier, shared) ||
++        setup_worker(&workers[1], &barrier, shared))
++        goto done;
++
++    for (iteration = 0; iteration < ITERATIONS; ++iteration)
++    {
++        unsigned int created = 0;
++        unsigned int successes = 0;
++
++        *shared = 0;
++        barrier.starters = 0;
++        barrier.readers = 0;
++        memset(&threads, 0, sizeof(threads));
++        for (i = 0; i < 2; ++i)
++        {
++            workers[i].result = UC_ERR_OK;
++            workers[i].eax = UINT32_MAX;
++            workers[i].eflags = 0;
++            if ((err = pthread_create(&threads[i], NULL, run_worker,
++                                      &workers[i])))
++            {
++                fprintf(stderr, "pthread_create failed at iteration %u: %d\n",
++                        iteration, err);
++                pthread_mutex_lock(&barrier.mutex);
++                barrier.starters = 2;
++                pthread_cond_broadcast(&barrier.cond);
++                pthread_mutex_unlock(&barrier.mutex);
++                while (created) pthread_join(threads[--created], NULL);
++                goto done;
++            }
++            ++created;
++        }
++        for (i = 0; i < 2; ++i) pthread_join(threads[i], NULL);
++        for (i = 0; i < 2; ++i)
++        {
++            if (workers[i].result)
++            {
++                fprintf(stderr, "worker %u failed at iteration %u: %s\n", i,
++                        iteration, uc_strerror(workers[i].result));
++                goto done;
++            }
++            if (workers[i].eflags & ZF)
++            {
++                ++successes;
++                if (workers[i].eax != 0)
++                {
++                    fprintf(stderr, "winner EAX is %#x at iteration %u\n",
++                            workers[i].eax, iteration);
++                    goto done;
++                }
++            }
++            else if (workers[i].eax != 1)
++            {
++                fprintf(stderr, "loser EAX is %#x at iteration %u\n",
++                        workers[i].eax, iteration);
++                goto done;
++            }
++        }
++        if (*shared != 1 || successes != 1)
++        {
++            fprintf(stderr, "cross-engine LOCK violation at iteration %u: "
++                    "memory %#x, successes %u, read hooks %u\n", iteration,
++                    *shared, successes, barrier.readers);
++            goto done;
++        }
++    }
++    ret = 0;
++
++done:
++    for (i = 0; i < 2; ++i)
++        if (workers[i].uc) uc_close(workers[i].uc);
++    pthread_cond_destroy(&barrier.cond);
++    pthread_mutex_destroy(&barrier.mutex);
++    return ret;
++}
++
++static int run_cmpxchg8b_case(uc_engine *uc, uint64_t *shared,
++                              uint64_t initial, uint64_t expected,
++                              uint64_t replacement, int should_succeed)
++{
++    static const unsigned char code[] =
++    {
++        0xbe, 0x00, 0x00, 0x02, 0x00,       /* mov $DATA_ADDRESS,%esi */
++        0xf0, 0x0f, 0xc7, 0x0e,             /* lock cmpxchg8b (%esi) */
++    };
++    uint32_t eax = (uint32_t)expected;
++    uint32_t edx = (uint32_t)(expected >> 32);
++    uint32_t ebx = (uint32_t)replacement;
++    uint32_t ecx = (uint32_t)(replacement >> 32);
++    uint32_t eflags = 2;
++    uc_err err;
++
++    *shared = initial;
++    if ((err = uc_mem_write(uc, CODE_ADDRESS, code, sizeof(code))) ||
++        (err = uc_reg_write(uc, UC_X86_REG_EAX, &eax)) ||
++        (err = uc_reg_write(uc, UC_X86_REG_EDX, &edx)) ||
++        (err = uc_reg_write(uc, UC_X86_REG_EBX, &ebx)) ||
++        (err = uc_reg_write(uc, UC_X86_REG_ECX, &ecx)) ||
++        (err = uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags)) ||
++        (err = uc_emu_start(uc, CODE_ADDRESS,
++                            CODE_ADDRESS + sizeof(code), 0, 0)) ||
++        (err = uc_reg_read(uc, UC_X86_REG_EAX, &eax)) ||
++        (err = uc_reg_read(uc, UC_X86_REG_EDX, &edx)) ||
++        (err = uc_reg_read(uc, UC_X86_REG_EFLAGS, &eflags)))
++    {
++        fprintf(stderr, "CMPXCHG8B execution failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++
++    if (should_succeed)
++    {
++        if (!(eflags & ZF) || *shared != replacement)
++        {
++            fprintf(stderr, "CMPXCHG8B success mismatch: flags %#x, memory "
++                    "%#llx\n", eflags, (unsigned long long)*shared);
++            return 1;
++        }
++    }
++    else if ((eflags & ZF) || *shared != initial ||
++             eax != (uint32_t)initial || edx != (uint32_t)(initial >> 32))
++    {
++        fprintf(stderr, "CMPXCHG8B failure mismatch: EAX %#x, EDX %#x, "
++                "flags %#x, memory %#llx\n", eax, edx, eflags,
++                (unsigned long long)*shared);
++        return 1;
++    }
++    return 0;
++}
++
++static int test_cmpxchg8b(uint64_t *shared)
++{
++    uc_engine *uc = NULL;
++    uc_err err;
++    int ret = 1;
++
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_32, &uc)) ||
++        (err = enable_shared_memory_atomics(uc)) ||
++        (err = uc_mem_map(uc, CODE_ADDRESS, PAGE_SIZE, UC_PROT_ALL)) ||
++        (err = uc_mem_map_ptr(uc, DATA_ADDRESS, PAGE_SIZE,
++                              UC_PROT_ALL, shared)))
++    {
++        fprintf(stderr, "CMPXCHG8B setup failed: %s\n", uc_strerror(err));
++        goto done;
++    }
++    if (run_cmpxchg8b_case(uc, shared, UINT64_C(0x1122334455667788),
++                           UINT64_C(0x1122334455667788),
++                           UINT64_C(0x0123456789abcdef), 1) ||
++        run_cmpxchg8b_case(uc, shared, UINT64_C(0xfedcba9876543210),
++                           UINT64_C(0x1122334455667788),
++                           UINT64_C(0x0123456789abcdef), 0))
++        goto done;
++    ret = 0;
++
++done:
++    if (uc) uc_close(uc);
++    return ret;
++}
++
++int main(void)
++{
++    void *shared = NULL;
++    int ret = 1;
++
++    alarm(20);
++    if (posix_memalign(&shared, PAGE_SIZE, PAGE_SIZE))
++    {
++        fprintf(stderr, "shared allocation failed\n");
++        return 2;
++    }
++    memset(shared, 0, PAGE_SIZE);
++    if (test_cross_engine_cmpxchg(shared) || test_cmpxchg8b(shared)) goto done;
++    puts("shared-memory LOCK and CMPXCHG8B atomics passed");
++    ret = 0;
++
++done:
++    free(shared);
++    alarm(0);
++    return ret;
++}
 diff --git a/tests/regress/threaded_emu_stop.c b/tests/regress/threaded_emu_stop.c
 new file mode 100644
 index 0000000..e4cc03f
@@ -610,3 +1425,373 @@ index 0000000..e4cc03f
 +    puts("cross-thread stop passed");
 +    return 0;
 +}
+diff --git a/tests/regress/threaded_emu_stop_atomic.c b/tests/regress/threaded_emu_stop_atomic.c
+new file mode 100644
+index 0000000..4998286
+--- /dev/null
++++ b/tests/regress/threaded_emu_stop_atomic.c
+@@ -0,0 +1,236 @@
++/* Test a cross-thread stop without restarting a side-effecting instruction. */
++
++#define _POSIX_C_SOURCE 200809L
++
++#include <pthread.h>
++#include <sched.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <unicorn/unicorn.h>
++#include <unicorn/x86.h>
++
++#define ADDRESS 0x100000
++#define DATA_ADDRESS 0x101000
++#define RESULT_ADDRESS (DATA_ADDRESS + 4)
++#define TIMEOUT_SECONDS 5
++
++struct test_state
++{
++    uc_engine *uc;
++    uint64_t begin;
++    uint64_t write_address;
++    atomic_bool write_entered;
++    atomic_bool write_released;
++    uc_err result;
++};
++
++static bool wait_for_bool(atomic_bool *value)
++{
++    struct timespec start, now;
++
++    clock_gettime(CLOCK_MONOTONIC, &start);
++    do
++    {
++        if (atomic_load_explicit(value, memory_order_acquire)) return true;
++        sched_yield();
++        clock_gettime(CLOCK_MONOTONIC, &now);
++    } while (now.tv_sec - start.tv_sec < TIMEOUT_SECONDS);
++    return false;
++}
++
++static void write_hook(uc_engine *uc, uc_mem_type type, uint64_t address,
++                       int size, int64_t value, void *user_data)
++{
++    struct test_state *state = user_data;
++
++    (void)uc;
++    (void)type;
++    (void)size;
++    (void)value;
++    if (address != state->write_address ||
++        atomic_exchange_explicit(&state->write_entered, true,
++                                 memory_order_acq_rel))
++        return;
++    while (!atomic_load_explicit(&state->write_released, memory_order_acquire))
++        sched_yield();
++}
++
++static void *emulation_thread(void *arg)
++{
++    struct test_state *state = arg;
++
++    state->result = uc_emu_start(state->uc, state->begin, UINT64_MAX, 0, 0);
++    return NULL;
++}
++
++static int stop_at_first_write(struct test_state *state, const char *name)
++{
++    pthread_t thread;
++    uc_err err;
++    int ret;
++
++    if ((ret = pthread_create(&thread, NULL, emulation_thread, state)))
++    {
++        fprintf(stderr, "%s pthread_create failed: %d\n", name, ret);
++        return 1;
++    }
++    if (!wait_for_bool(&state->write_entered))
++    {
++        fprintf(stderr, "%s write hook was not reached\n", name);
++        return 1;
++    }
++    if ((err = uc_emu_stop_at_instruction_boundary(state->uc)))
++    {
++        fprintf(stderr, "%s instruction-boundary stop failed: %s\n",
++                name, uc_strerror(err));
++        return 1;
++    }
++    atomic_store_explicit(&state->write_released, true, memory_order_release);
++    pthread_join(thread, NULL);
++    if (state->result)
++    {
++        fprintf(stderr, "%s first slice failed: %s\n", name,
++                uc_strerror(state->result));
++        return 1;
++    }
++    return 0;
++}
++
++static int test_atomic_boundary(void)
++{
++    static const unsigned char code[] =
++    {
++        0xb9, 0x00, 0x10, 0x10, 0x00,       /* mov $DATA_ADDRESS,%ecx */
++        0x31, 0xc0,                         /* xor %eax,%eax */
++        0xba, 0xff, 0xff, 0xff, 0xff,       /* mov $-1,%edx */
++        0xf0, 0x0f, 0xb1, 0x11,             /* lock cmpxchg %edx,(%ecx) */
++        0x75, 0x0c,                         /* jne failure */
++        0xc7, 0x05, 0x04, 0x10, 0x10, 0x00,
++        0x01, 0x00, 0x00, 0x00,             /* movl $1,RESULT_ADDRESS */
++        0xeb, 0xfe,                         /* success: jmp success */
++        0xc7, 0x05, 0x04, 0x10, 0x10, 0x00,
++        0xad, 0xde, 0x00, 0x00,             /* failure: movl $0xdead,RESULT_ADDRESS */
++        0xeb, 0xfe,                         /* jmp failure */
++    };
++    struct test_state state = {.begin = ADDRESS, .write_address = DATA_ADDRESS};
++    uint32_t data = 0, result = 0, eip = 0;
++    uc_hook hook;
++    uc_err err;
++
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_32, &state.uc)) ||
++        (err = uc_mem_map(state.uc, ADDRESS, 0x2000, UC_PROT_ALL)) ||
++        (err = uc_mem_write(state.uc, ADDRESS, code, sizeof(code))) ||
++        (err = uc_hook_add(state.uc, &hook, UC_HOOK_MEM_WRITE, write_hook,
++                           &state, DATA_ADDRESS, DATA_ADDRESS)))
++    {
++        fprintf(stderr, "setup failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++    if (stop_at_first_write(&state, "atomic") ||
++        (err = uc_mem_read(state.uc, DATA_ADDRESS, &data, sizeof(data))) ||
++        (err = uc_reg_read(state.uc, UC_X86_REG_EIP, &eip)))
++    {
++        fprintf(stderr, "first slice failed: %s\n",
++                uc_strerror(err));
++        return 1;
++    }
++    if (data != UINT32_MAX || eip == ADDRESS + 12)
++    {
++        fprintf(stderr, "boundary stop split atomic instruction: data %#x eip %#x\n",
++                data, eip);
++        return 1;
++    }
++
++    if ((err = uc_emu_start(state.uc, eip, UINT64_MAX, 10000, 0)) ||
++        (err = uc_mem_read(state.uc, RESULT_ADDRESS, &result, sizeof(result))))
++    {
++        fprintf(stderr, "resume failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++    if (result != 1)
++    {
++        fprintf(stderr, "atomic instruction restarted after its write: %#x\n", result);
++        return 1;
++    }
++
++    uc_close(state.uc);
++    return 0;
++}
++
++static int test_rep_boundary(void)
++{
++    static const unsigned char code[] =
++    {
++        0xbf, 0x00, 0x10, 0x10, 0x00,       /* mov $DATA_ADDRESS,%edi */
++        0xb9, 0x04, 0x00, 0x00, 0x00,       /* mov $4,%ecx */
++        0xb0, 0x11,                         /* mov $0x11,%al */
++        0xf3, 0xaa,                         /* rep stosb */
++        0xeb, 0xfe,                         /* done: jmp done */
++    };
++    struct test_state state = {.begin = ADDRESS, .write_address = DATA_ADDRESS};
++    const unsigned char expected[] = {0x22, 0x11, 0x11, 0x11};
++    unsigned char data[sizeof(expected)] = {0};
++    uint32_t eip = 0, edi = 0, ecx = 0;
++    unsigned char replacement = expected[0];
++    uc_hook hook;
++    uc_err err;
++
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_32, &state.uc)) ||
++        (err = uc_mem_map(state.uc, ADDRESS, 0x2000, UC_PROT_ALL)) ||
++        (err = uc_mem_write(state.uc, ADDRESS, code, sizeof(code))) ||
++        (err = uc_hook_add(state.uc, &hook, UC_HOOK_MEM_WRITE, write_hook,
++                           &state, DATA_ADDRESS, DATA_ADDRESS)))
++    {
++        fprintf(stderr, "REP setup failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++    if (stop_at_first_write(&state, "REP") ||
++        (err = uc_reg_read(state.uc, UC_X86_REG_EIP, &eip)) ||
++        (err = uc_reg_read(state.uc, UC_X86_REG_EDI, &edi)) ||
++        (err = uc_reg_read(state.uc, UC_X86_REG_ECX, &ecx)) ||
++        (err = uc_mem_read(state.uc, DATA_ADDRESS, data, 1)))
++    {
++        fprintf(stderr, "REP first-slice inspection failed: %s\n",
++                uc_strerror(err));
++        return 1;
++    }
++    if (eip != ADDRESS + 12 || edi != DATA_ADDRESS + 1 || ecx != 3 ||
++        data[0] != 0x11)
++    {
++        fprintf(stderr, "REP stop split an iteration: eip %#x edi %#x "
++                "ecx %#x data %#x\n", eip, edi, ecx, data[0]);
++        return 1;
++    }
++    if ((err = uc_mem_write(state.uc, DATA_ADDRESS, &replacement,
++                            sizeof(replacement))) ||
++        (err = uc_emu_start(state.uc, eip, UINT64_MAX, 10000, 0)) ||
++        (err = uc_mem_read(state.uc, DATA_ADDRESS, data, sizeof(data))))
++    {
++        fprintf(stderr, "REP resume failed: %s\n", uc_strerror(err));
++        return 1;
++    }
++    if (memcmp(data, expected, sizeof(data)))
++    {
++        fprintf(stderr, "REP iteration restarted after its write: "
++                "%#x %#x %#x %#x\n", data[0], data[1], data[2], data[3]);
++        return 1;
++    }
++
++    uc_close(state.uc);
++    return 0;
++}
++
++int main(void)
++{
++    alarm(TIMEOUT_SECONDS * 3);
++    if (test_atomic_boundary() || test_rep_boundary()) return 1;
++    alarm(0);
++    puts("instruction-boundary stop preserved atomic and REP instructions");
++    return 0;
++}
+diff --git a/uc.c b/uc.c
+index 75b89a0..67bfea3 100644
+--- a/uc.c
++++ b/uc.c
+@@ -35,6 +35,8 @@ static void clear_deleted_hooks(uc_engine *uc);
+ static uc_err uc_snapshot(uc_engine *uc);
+ static uc_err uc_restore_latest_snapshot(uc_engine *uc);
+ 
++bool parallel_cpus;
++
+ #if defined(__APPLE__) && defined(HAVE_PTHREAD_JIT_PROTECT) &&                 \
+     (defined(__arm__) || defined(__aarch64__))
+ static void save_jit_state(uc_engine *uc)
+@@ -1018,13 +1020,13 @@ static void *_timeout_fn(void *arg)
+     do {
+         usleep(TIMEOUT_STEP);
+         // perhaps emulation is even done before timeout?
+-        if (uc->emulation_done) {
++        if (atomic_read(&uc->emulation_done)) {
+             break;
+         }
+     } while ((uint64_t)(get_clock() - current_time) < uc->timeout);
+ 
+     // timeout before emulation is done?
+-    if (!uc->emulation_done) {
++    if (!atomic_read(&uc->emulation_done)) {
+         uc->timed_out = true;
+         // force emulation to stop
+         uc_emu_stop(uc);
+@@ -1081,7 +1083,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+     // reset the counter
+     uc->emu_counter = 0;
+     uc->invalid_error = UC_ERR_OK;
+-    uc->emulation_done = false;
++    atomic_set(&uc->emulation_done, false);
+     uc->size_recur_mem = 0;
+     uc->timed_out = false;
+     uc->first_tb = true;
+@@ -1187,7 +1189,8 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+ #endif
+     }
+     uc->skip_sync_pc_on_exit = false;
+-    uc->stop_request = false;
++    uc_set_stop_request(uc, false);
++    uc_set_instruction_boundary_stop_request(uc, false);
+ 
+     uc->emu_count = count;
+     // remove count hook if counting isn't necessary
+@@ -1232,7 +1235,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+     // emulation is done if and only if we exit the outer uc_emu_start
+     // or we may lost uc_emu_stop
+     if (uc->nested_level == 0) {
+-        uc->emulation_done = true;
++        atomic_set(&uc->emulation_done, true);
+ 
+         // remove hooks to delete
+         // make sure we delete all hooks at the first level.
+@@ -1255,12 +1258,25 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+ 
+ UNICORN_EXPORT
+ uc_err uc_emu_stop(uc_engine *uc)
++{
++    uc_set_stop_request(uc, true);
++    return break_translation_loop(uc);
++}
++
++UNICORN_EXPORT
++uc_err uc_emu_stop_at_instruction_boundary(uc_engine *uc)
++{
++    uc_set_instruction_boundary_stop_request(uc, true);
++    return break_translation_loop(uc);
++}
++
++UNICORN_EXPORT
++uc_err uc_enable_shared_memory_atomics(uc_engine *uc)
+ {
+     UC_INIT(uc);
+-    uc->stop_request = true;
+-    uc_err err = break_translation_loop(uc);
++    atomic_set(&parallel_cpus, true);
+     restore_jit_state(uc);
+-    return err;
++    return UC_ERR_OK;
+ }
+ 
+ // return target index where a memory region at the address exists, or could be
+@@ -2071,7 +2087,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
+ {
+     struct uc_struct *uc = handle;
+ 
+-    if (unlikely(uc->stop_request)) {
++    if (unlikely(uc_stop_requested(uc))) {
+         return;
+     }
+ 
+@@ -2089,7 +2105,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
+     JIT_CALLBACK_GUARD(((uc_hook_tcg_op_2)hook->callback)(
+         uc, address, arg1, arg2, size, hook->user_data));
+ 
+-    if (unlikely(uc->stop_request)) {
++    if (unlikely(uc_stop_requested(uc))) {
+         return;
+     }
+ }
+@@ -2121,9 +2137,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
+     // }
+ 
+     // the last callback may already asked to stop emulation
+-    if (uc->stop_request && !not_allow_stop) {
++    if (uc_stop_requested(uc) && !not_allow_stop) {
+         return;
+-    } else if (not_allow_stop && uc->stop_request) {
++    } else if (not_allow_stop && uc_stop_requested(uc)) {
+         revert_uc_emu_stop(uc);
+     }
+ 
+@@ -2156,9 +2172,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
+         //   normally. No check_exit_request is generated and the hooks are
+         //   triggered normally. In other words, the whole IT block is treated
+         //   as a single instruction.
+-        if (not_allow_stop && uc->stop_request) {
++        if (not_allow_stop && uc_stop_requested(uc)) {
+             revert_uc_emu_stop(uc);
+-        } else if (!not_allow_stop && uc->stop_request) {
++        } else if (!not_allow_stop && uc_stop_requested(uc)) {
+             break;
+         }
+     }

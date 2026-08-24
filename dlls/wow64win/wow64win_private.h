@@ -36,6 +36,7 @@ struct object_attr64
     OBJECT_ATTRIBUTES   attr;
     UNICODE_STRING      str;
     SECURITY_DESCRIPTOR sd;
+    SECURITY_QUALITY_OF_SERVICE qos;
 };
 
 typedef struct
@@ -50,10 +51,13 @@ typedef struct
 
 static inline ULONG get_ulong( UINT **args ) { return *(*args)++; }
 static inline HANDLE get_handle( UINT **args ) { return LongToHandle( *(*args)++ ); }
-static inline void *get_ptr( UINT **args ) { return ULongToPtr( *(*args)++ ); }
+static inline void *get_ptr( UINT **args )
+{
+    return wine_wow64_guest_memory_ptr( *(*args)++ );
+}
 
-/* Keep get_ptr() as the zero-extending client-value facade used by user.c.
- * GDI wrappers must opt in explicitly when a value denotes guest memory. */
+/* NtUser pointer arguments denote guest memory unless a wrapper explicitly
+ * identifies the value as a client callback or module address. */
 static inline void *wow64win_guest_memory_ptr( ULONG address )
 {
     return wine_wow64_guest_memory_ptr( address );
@@ -72,6 +76,17 @@ static inline void *get_memory_ptr( UINT **args )
 static inline void *get_client_ptr( UINT **args )
 {
     return ULongToPtr( get_ulong( args ) );
+}
+
+static inline void *wow64win_guest_memory_or_atom_ptr( ULONG address )
+{
+    if (!HIWORD( address )) return ULongToPtr( address );
+    return wow64win_guest_memory_ptr( address );
+}
+
+static inline void *get_memory_or_atom_ptr( UINT **args )
+{
+    return wow64win_guest_memory_or_atom_ptr( get_ulong( args ) );
 }
 
 static inline void wow64win_read_user( void *dst, const void *src, SIZE_T size )
@@ -106,7 +121,7 @@ static inline void wow64win_probe_user_write( void *dst, SIZE_T size )
 static inline void **addr_32to64( void **addr, ULONG *addr32 )
 {
     if (!addr32) return NULL;
-    *addr = ULongToPtr( *addr32 );
+    *addr = wow64win_guest_memory_ptr( *addr32 );
     return addr;
 }
 
@@ -119,7 +134,7 @@ static inline SIZE_T *size_32to64( SIZE_T *size, ULONG *size32 )
 
 static inline void put_addr( ULONG *addr32, void *addr )
 {
-    if (addr32) *addr32 = PtrToUlong( addr );
+    if (addr32) *addr32 = wow64win_guest_memory_addr( addr );
 }
 
 static inline void put_size( ULONG *size32, SIZE_T size )
@@ -129,51 +144,71 @@ static inline void put_size( ULONG *size32, SIZE_T size )
 
 static inline UNICODE_STRING *unicode_str_32to64( UNICODE_STRING *str, const UNICODE_STRING32 *str32 )
 {
+    UNICODE_STRING32 local;
+
     if (!str32) return NULL;
-    str->Length = str32->Length;
-    str->MaximumLength = str32->MaximumLength;
-    str->Buffer = ULongToPtr( str32->Buffer );
+    wow64win_read_user( &local, str32, sizeof(local) );
+    str->Length = local.Length;
+    str->MaximumLength = local.MaximumLength;
+    str->Buffer = wow64win_guest_memory_ptr( local.Buffer );
     return str;
 }
 
 static inline SECURITY_DESCRIPTOR *secdesc_32to64( SECURITY_DESCRIPTOR *out, const SECURITY_DESCRIPTOR *in )
 {
     /* relative descr has the same layout for 32 and 64 */
-    const SECURITY_DESCRIPTOR_RELATIVE *sd = (const SECURITY_DESCRIPTOR_RELATIVE *)in;
+    SECURITY_DESCRIPTOR_RELATIVE sd;
 
     if (!in) return NULL;
-    out->Revision = sd->Revision;
-    out->Sbz1     = sd->Sbz1;
-    out->Control  = sd->Control & ~SE_SELF_RELATIVE;
-    if (sd->Control & SE_SELF_RELATIVE)
+    wow64win_read_user( &sd, in, sizeof(sd) );
+    out->Revision = sd.Revision;
+    out->Sbz1     = sd.Sbz1;
+    out->Control  = sd.Control & ~SE_SELF_RELATIVE;
+    if (sd.Control & SE_SELF_RELATIVE)
     {
-        if (sd->Owner) out->Owner = (PSID)((BYTE *)sd + sd->Owner);
-        if (sd->Group) out->Group = (PSID)((BYTE *)sd + sd->Group);
-        if ((sd->Control & SE_SACL_PRESENT) && sd->Sacl) out->Sacl = (PSID)((BYTE *)sd + sd->Sacl);
-        if ((sd->Control & SE_DACL_PRESENT) && sd->Dacl) out->Dacl = (PSID)((BYTE *)sd + sd->Dacl);
+        out->Owner = sd.Owner ? (PSID)((BYTE *)in + sd.Owner) : NULL;
+        out->Group = sd.Group ? (PSID)((BYTE *)in + sd.Group) : NULL;
+        out->Sacl = ((sd.Control & SE_SACL_PRESENT) && sd.Sacl) ? (PSID)((BYTE *)in + sd.Sacl) : NULL;
+        out->Dacl = ((sd.Control & SE_DACL_PRESENT) && sd.Dacl) ? (PSID)((BYTE *)in + sd.Dacl) : NULL;
     }
     else
     {
-        out->Owner = ULongToPtr( sd->Owner );
-        out->Group = ULongToPtr( sd->Group );
-        if (sd->Control & SE_SACL_PRESENT) out->Sacl = ULongToPtr( sd->Sacl );
-        if (sd->Control & SE_DACL_PRESENT) out->Dacl = ULongToPtr( sd->Dacl );
+        out->Owner = wow64win_guest_memory_ptr( sd.Owner );
+        out->Group = wow64win_guest_memory_ptr( sd.Group );
+        out->Sacl = (sd.Control & SE_SACL_PRESENT) ? wow64win_guest_memory_ptr( sd.Sacl ) : NULL;
+        out->Dacl = (sd.Control & SE_DACL_PRESENT) ? wow64win_guest_memory_ptr( sd.Dacl ) : NULL;
     }
     return out;
 }
 
 static inline OBJECT_ATTRIBUTES *objattr_32to64( struct object_attr64 *out, const OBJECT_ATTRIBUTES32 *in )
 {
+    OBJECT_ATTRIBUTES32 local;
+
     memset( out, 0, sizeof(*out) );
     if (!in) return NULL;
-    if (in->Length != sizeof(*in)) return &out->attr;
+    wow64win_read_user( &local, in, sizeof(local) );
+    if (local.Length != sizeof(local)) return &out->attr;
 
     out->attr.Length = sizeof(out->attr);
-    out->attr.RootDirectory = LongToHandle( in->RootDirectory );
-    out->attr.Attributes = in->Attributes;
-    out->attr.ObjectName = unicode_str_32to64( &out->str, ULongToPtr( in->ObjectName ));
-    out->attr.SecurityQualityOfService = ULongToPtr( in->SecurityQualityOfService );
-    out->attr.SecurityDescriptor = secdesc_32to64( &out->sd, ULongToPtr( in->SecurityDescriptor ));
+    out->attr.RootDirectory = LongToHandle( local.RootDirectory );
+    out->attr.Attributes = local.Attributes;
+    out->attr.ObjectName = unicode_str_32to64( &out->str,
+                                               wow64win_guest_memory_ptr( local.ObjectName ));
+    if (local.SecurityQualityOfService)
+    {
+        SECURITY_QUALITY_OF_SERVICE qos32;
+
+        wow64win_read_user( &qos32, wow64win_guest_memory_ptr( local.SecurityQualityOfService ),
+                            sizeof(qos32) );
+        out->qos.Length = qos32.Length;
+        out->qos.ImpersonationLevel = qos32.ImpersonationLevel;
+        out->qos.ContextTrackingMode = qos32.ContextTrackingMode;
+        out->qos.EffectiveOnly = qos32.EffectiveOnly;
+        out->attr.SecurityQualityOfService = &out->qos;
+    }
+    out->attr.SecurityDescriptor = secdesc_32to64( &out->sd,
+                                                   wow64win_guest_memory_ptr( local.SecurityDescriptor ));
     return &out->attr;
 }
 

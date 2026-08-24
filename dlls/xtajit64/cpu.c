@@ -537,6 +537,55 @@ static NTSTATUS synchronize_mapping_window( ULONG_PTR lowest, ULONG_PTR highest 
     return status;
 }
 
+/* Reconcile the faulting committed region that may have been created by a native
+ * Unixlib through ntdll.so.  Such a call does not cross the ARM64EC PE syscall
+ * wrappers, so it cannot use NotifyMemoryAlloc.  A single targeted query keeps
+ * this recovery off the normal transition path and distinguishes a real
+ * committed mapping from a reserved, free, or otherwise invalid guest address.
+ */
+static NTSTATUS synchronize_fault_mapping( ULONG_PTR address, BOOL *mapped )
+{
+    struct xtajit64_memory_params params = {0};
+    MEMORY_BASIC_INFORMATION info;
+    ULONG_PTR region_start, region_end, start, end;
+    NTSTATUS status;
+
+    if (!mapped) return STATUS_INVALID_PARAMETER;
+    *mapped = FALSE;
+    if (!address || address > XTAJIT64_X64_USER_ADDRESS_MAX ||
+        address > ~(ULONG_PTR)0 - XTAJIT64_GUEST_PAGE_SIZE)
+        return STATUS_SUCCESS;
+    status = NtQueryVirtualMemory( GetCurrentProcess(), (void *)address,
+                                   MemoryBasicInformation, &info, sizeof(info), NULL );
+    if (status) return status;
+    region_start = (ULONG_PTR)info.BaseAddress;
+    if (!info.RegionSize || region_start > ~(ULONG_PTR)0 - info.RegionSize)
+        return STATUS_INVALID_ADDRESS;
+    region_end = region_start + info.RegionSize;
+    if (info.State != MEM_COMMIT || !info.AllocationBase ||
+        address < region_start || address >= region_end)
+        return STATUS_SUCCESS;
+
+    start = region_start;
+    end = region_end;
+    if (end - 1 > XTAJIT64_X64_USER_ADDRESS_MAX ||
+        ((start | end) & (XTAJIT64_GUEST_PAGE_SIZE - 1)))
+        return STATUS_INVALID_ADDRESS;
+    status = describe_host_mapping( start, end - start,
+                                    (ULONG_PTR)info.AllocationBase,
+                                    info.Protect, &params );
+    if (status == STATUS_ACCESS_DENIED) return STATUS_SUCCESS;
+    if (status) return status;
+    if (params.guest < XTAJIT64_GUEST_KUSER + host_page_size &&
+        params.guest + params.size > XTAJIT64_GUEST_KUSER)
+        return STATUS_SUCCESS;
+    if ((status = XTAJIT64_CALL( memory_map, &params ))) return status;
+    TRACE( "reconciled late x64 mapping fault %p region %p-%p protect %#lx\n",
+           (void *)address, (void *)start, (void *)end, info.Protect );
+    *mapped = TRUE;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS get_current_thread_teb_window( ULONG_PTR *lowest, ULONG_PTR *highest,
                                                UINT64 *allocation_base )
 {
@@ -831,6 +880,40 @@ static DECLSPEC_NORETURN void abort_simulation( struct xtajit64_thread_state *st
     terminate_transition( status );
 }
 
+static DECLSPEC_NORETURN void raise_x64_memory_fault( struct xtajit64_thread_state *state,
+                                                      const struct xtajit64_begin_params *params,
+                                                      ARM64EC_NT_CONTEXT *ec_context )
+{
+    EXCEPTION_RECORD rec;
+    NTSTATUS status;
+
+    memset( &rec, 0, sizeof(rec) );
+    rec.ExceptionCode = STATUS_ACCESS_VIOLATION;
+    rec.ExceptionAddress = (void *)(ULONG_PTR)params->context.rip;
+    rec.NumberParameters = 2;
+    switch (params->fault_access)
+    {
+    case EXCEPTION_READ_FAULT:
+    case EXCEPTION_WRITE_FAULT:
+    case EXCEPTION_EXECUTE_FAULT:
+        rec.ExceptionInformation[0] = params->fault_access;
+        break;
+    default:
+        rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
+        break;
+    }
+    rec.ExceptionInformation[1] = params->fault_address;
+    ec_context->AMD64_Context.ContextFlags |= CONTEXT_AMD64_FULL |
+                                              CONTEXT_AMD64_FLOATING_POINT;
+
+    TRACE( "raise x64 access violation rip %p fault %p access %#Ix\n",
+           rec.ExceptionAddress, (void *)(ULONG_PTR)rec.ExceptionInformation[1],
+           rec.ExceptionInformation[0] );
+    status = NtRaiseException( &rec, &ec_context->AMD64_Context, TRUE );
+    abort_simulation( state, status ? status : STATUS_ACCESS_VIOLATION,
+                      params->stop_reason, params->unicorn_error );
+}
+
 static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *state )
 {
     CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
@@ -840,6 +923,7 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
     UINT64 guest_return;
     ULONG_PTR native_target, entry, host_rsp;
     NTSTATUS status;
+    BOOL mapping_reconciled = FALSE;
 
     if (!state || state->magic != XTAJIT64_THREAD_STATE_MAGIC || !cpu ||
         !(ec_context = cpu->ContextAmd64))
@@ -860,14 +944,43 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
                                &params.stack_base ))
         abort_transition( state, STATUS_INVALID_ADDRESS, "invalid semantic x64 stack" );
 
-    cpu->InSimulation = 1;
-    status = XTAJIT64_CALL( begin_simulation, &params );
-    context_from_unix( &ec_context->AMD64_Context, &params.context );
+    for (;;)
+    {
+        BOOL mapped = FALSE;
+
+        cpu->InSimulation = 1;
+        status = XTAJIT64_CALL( begin_simulation, &params );
+        context_from_unix( &ec_context->AMD64_Context, &params.context );
+        if (status != STATUS_RETRY ||
+            params.stop_reason != XTAJIT64_STOP_MAPPING_MISS ||
+            mapping_reconciled)
+            break;
+
+        /* begin_simulation has captured the unchanged faulting context and
+         * returned its engine to the pool.  Reconcile at most once so a truly
+         * invalid pointer cannot turn into an unbounded retry loop. */
+        cpu->InSimulation = 0;
+        status = synchronize_fault_mapping( params.fault_address, &mapped );
+        if (status)
+            abort_transition( state, status, "cannot reconcile late x64 mapping" );
+        if (!mapped)
+        {
+            status = STATUS_RETRY;
+            cpu->InSimulation = 1;
+            break;
+        }
+        mapping_reconciled = TRUE;
+    }
     if (status || params.stop_reason != XTAJIT64_STOP_EC_TRANSITION)
     {
         TRACE( "x64 simulation stopped fault %p target %p\n",
                (void *)(ULONG_PTR)params.fault_address,
                (void *)(ULONG_PTR)params.transition_target );
+        if ((status == STATUS_ACCESS_VIOLATION &&
+             params.stop_reason == XTAJIT64_STOP_MEMORY_FAULT) ||
+            (status == STATUS_RETRY &&
+             params.stop_reason == XTAJIT64_STOP_MAPPING_MISS))
+            raise_x64_memory_fault( state, &params, ec_context );
         abort_simulation( state, status ? status : STATUS_NOT_SUPPORTED,
                           params.stop_reason, params.unicorn_error );
     }
@@ -1488,6 +1601,7 @@ NTSTATUS WINAPI ProcessInit(void)
     ULONG_PTR shared_data;
     NTSTATUS status;
 
+    TRACE( "CPU provider interface %s\n", XTAJIT64_PROVIDER_ABI_IDENTITY );
     if ((status = init_unixlib())) return status;
     status = NtQuerySystemInformation( SystemBasicInformation, &info, sizeof(info), NULL );
     if (status) return status;

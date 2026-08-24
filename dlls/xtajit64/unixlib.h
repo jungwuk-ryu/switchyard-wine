@@ -21,7 +21,11 @@
 #define XTAJIT64_MAX_HOST_PAGE_SIZE   0x10000
 #define XTAJIT64_GUEST_KUSER          WINE_USER_SHARED_DATA_ADDRESS
 #define XTAJIT64_X64_USER_ADDRESS_MAX 0x00007fffffffffffull
-#define XTAJIT64_PROCESS_ABI_VERSION  4u
+#define XTAJIT64_PROCESS_ABI_VERSION          6u
+#define XTAJIT64_PROCESS_INIT_PARAMS_SIZE     80u
+#define XTAJIT64_BEGIN_PARAMS_SIZE            464u
+#define XTAJIT64_PROVIDER_ABI_IDENTITY \
+    "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464"
 
 #define XTAJIT64_CAP_GS_NATIVE_DOMAIN 0x00000001u
 #define XTAJIT64_CAP_ADDRESS_CODEC    0x00000002u
@@ -83,6 +87,7 @@ enum xtajit64_stop_reason
     XTAJIT64_STOP_EC_TRANSITION,
     XTAJIT64_STOP_SYSCALL,
     XTAJIT64_STOP_MEMORY_FAULT,
+    XTAJIT64_STOP_MAPPING_MISS,
     XTAJIT64_STOP_INVALID_INSTRUCTION,
     XTAJIT64_STOP_UNSUPPORTED_TRANSITION,
     XTAJIT64_STOP_INTERNAL_ERROR
@@ -159,8 +164,10 @@ struct xtajit64_begin_params
     UINT64 stack_base;
     UINT64 transition_target;
     UINT64 fault_address;
+    UINT32 fault_access;
     UINT32 stop_reason;
     UINT32 unicorn_error;
+    UINT32 reserved;
 };
 
 struct xtajit64_poison_params
@@ -177,7 +184,8 @@ C_ASSERT( offsetof(struct xtajit64_process_init_params, enabled_capabilities) ==
 C_ASSERT( offsetof(struct xtajit64_process_init_params, x64_syscall_dispatcher) == 64 );
 C_ASSERT( offsetof(struct xtajit64_process_init_params, x64_syscall_count) == 72 );
 C_ASSERT( offsetof(struct xtajit64_process_init_params, reserved) == 76 );
-C_ASSERT( sizeof(struct xtajit64_process_init_params) == 80 );
+C_ASSERT( sizeof(struct xtajit64_process_init_params) ==
+          XTAJIT64_PROCESS_INIT_PARAMS_SIZE );
 /* The new handshake intentionally cannot satisfy the legacy tail validation. */
 C_ASSERT( (((UINT64)sizeof(struct xtajit64_process_init_params) << 32) |
            XTAJIT64_PROCESS_ABI_VERSION) != WINE_LOW_VA_SHADOW_BASE );
@@ -193,9 +201,11 @@ C_ASSERT( offsetof(struct xtajit64_begin_params, stack_limit) == 416 );
 C_ASSERT( offsetof(struct xtajit64_begin_params, stack_base) == 424 );
 C_ASSERT( offsetof(struct xtajit64_begin_params, transition_target) == 432 );
 C_ASSERT( offsetof(struct xtajit64_begin_params, fault_address) == 440 );
-C_ASSERT( offsetof(struct xtajit64_begin_params, stop_reason) == 448 );
-C_ASSERT( offsetof(struct xtajit64_begin_params, unicorn_error) == 452 );
-C_ASSERT( sizeof(struct xtajit64_begin_params) == 456 );
+C_ASSERT( offsetof(struct xtajit64_begin_params, fault_access) == 448 );
+C_ASSERT( offsetof(struct xtajit64_begin_params, stop_reason) == 452 );
+C_ASSERT( offsetof(struct xtajit64_begin_params, unicorn_error) == 456 );
+C_ASSERT( offsetof(struct xtajit64_begin_params, reserved) == 460 );
+C_ASSERT( sizeof(struct xtajit64_begin_params) == XTAJIT64_BEGIN_PARAMS_SIZE );
 C_ASSERT( sizeof(struct xtajit64_poison_params) == 8 );
 C_ASSERT( !(XTAJIT64_GUEST_KUSER & (XTAJIT64_MAX_HOST_PAGE_SIZE - 1)) );
 

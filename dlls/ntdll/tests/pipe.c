@@ -27,6 +27,7 @@
 #include "winuser.h"
 #include "winreg.h"
 #include "winnls.h"
+#include "sddl.h"
 #include "wine/test.h"
 #include "winternl.h"
 #include "winioctl.h"
@@ -2751,6 +2752,34 @@ static void test_security_info(void)
     HeapFree(GetProcessHeap(), 0, local_sid);
 }
 
+static void test_self_relative_sacl_creation(void)
+{
+    static const WCHAR sddl[] = L"S:(ML;;;;;S-1-16-0)";
+    WCHAR name[128];
+    PSECURITY_DESCRIPTOR descriptor;
+    SECURITY_ATTRIBUTES attributes;
+    HANDLE pipe;
+    BOOL ret;
+
+    ret = ConvertStringSecurityDescriptorToSecurityDescriptorW( sddl, SDDL_REVISION_1,
+                                                                 &descriptor, NULL );
+    ok( ret, "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: %lu\n",
+        GetLastError() );
+    if (!ret) return;
+
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = descriptor;
+    attributes.bInheritHandle = TRUE;
+    swprintf( name, ARRAY_SIZE(name), L"\\\\.\\pipe\\wine_ntdll_sacl_%08lx",
+              GetCurrentProcessId() );
+    pipe = CreateNamedPipeW( name, PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                             2, 512, 512, 0, &attributes );
+    ok( pipe != INVALID_HANDLE_VALUE, "CreateNamedPipeW failed: %lu\n", GetLastError() );
+    if (pipe != INVALID_HANDLE_VALUE) CloseHandle( pipe );
+    LocalFree( descriptor );
+}
+
 static void subtest_empty_name_pipe_operations(HANDLE handle)
 {
     static const struct fsctl_test {
@@ -3295,6 +3324,7 @@ START_TEST(pipe)
     test_volume_info();
     test_file_info();
     test_security_info();
+    test_self_relative_sacl_creation();
     test_empty_name();
     test_pipe_names();
     test_async_cancel_on_handle_close();

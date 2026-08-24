@@ -235,6 +235,7 @@ unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct obje
     {
         const void *sd_source = attr->SecurityDescriptor;
 
+        ADD_OBJECT_ATTRIBUTE_SIZE( sizeof(struct security_descriptor) );
         if ((status = virtual_copy_from_user( &sd_header, sd_source, sizeof(sd_header) )))
             return status;
         if (sd_header.Revision != SECURITY_DESCRIPTOR_REVISION) return STATUS_UNKNOWN_REVISION;

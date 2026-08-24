@@ -214,12 +214,12 @@ import tempfile
 SOURCE_REPOSITORY = "https://github.com/3Shain/dxmt.git"
 SOURCE_BASE_TREE = "22fa93d36867f175c0283b36cd3628a4df94876e"
 SOURCE_REVISION = "856d9f35789679ef00c1ba01a6353438df84b66f"
-SOURCE_TREE = "a8c397f9b03dcb3592f6b0204ae6dbda5492990d"
-SOURCE_PATCH = "0001-fix-dxmt-use-owned-buffer-backing-for-i386.patch"
-SOURCE_PATCH_SHA256 = "5491ef13f2adfd611c12df30f191ac0ffd0083bcb246c5ab81ef1d29a8baa852"
-ARTIFACT_BUILD_IDENTITY = "f02a37f5b7c8022941712a7cf9415ac9d1925442"
+SOURCE_TREE = "2c91e88660daecc3d492de23d32f9e2fed0dd001"
+SOURCE_PATCH = "0001-dxmt-Preserve-guest-accessible-CPU-buffer-ownership.patch"
+SOURCE_PATCH_SHA256 = "2e6f6436706f283be6b9ca1668391e0fa70fe83e290781d2a2c5b9f2496a4a26"
+ARTIFACT_BUILD_IDENTITY = "af8ab67d197a4bc6751483b8c16fa17df3b0a6b0"
 ARTIFACT_NAME = f"dxmt-{ARTIFACT_BUILD_IDENTITY}.tar.gz"
-ARTIFACT_SHA256 = "4bf4f0bd654a92c0feb6a8e5b960307be53d62ef45f9ed32fdcbf37c418b8a3c"
+ARTIFACT_SHA256 = "3d1b73a42b25ff6b90c1c054ec501abfffe1f8433cbf3c97183b69e00d57f778"
 PACKAGE_WORKFLOW = ".github/workflows/ci.yml"
 PACKAGE_WORKFLOW_SHA256 = "fe5a3656b9f59e81e650e60077bcdd840a5205ff0d960f00f6cb4c8fbacbe851"
 PACKAGE_BUILD = (
@@ -251,16 +251,16 @@ COMPANION_LOAD_COMMANDS = [
 
 MODULE_SOURCES = [
     ("lib/wine/aarch64-unix/winemetal.so", "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0", "mach-o-dylib", "arm64"),
-    ("lib/wine/aarch64-windows/d3d10core.dll", "0ca52517ce266d63b85310a8aae940e92b0a05392d1d03698dbc4156ce28a959", "pe-dll", "arm64ec"),
-    ("lib/wine/aarch64-windows/d3d11.dll", "bb74a3835c731d7dfe19e9d928cf20a4eef6d37c88edddfcf112557408a01fc6", "pe-dll", "arm64ec"),
-    ("lib/wine/aarch64-windows/dxgi.dll", "9c374cc1896dca4129fd5c810c09e8dce9df6b04398ddb1207da6bce01e15e3c", "pe-dll", "arm64ec"),
+    ("lib/wine/aarch64-windows/d3d10core.dll", "38d9576da3adea9431e55007908286679ec3ecd32babff8038d32c25e967d540", "pe-dll", "arm64ec"),
+    ("lib/wine/aarch64-windows/d3d11.dll", "a55336ef712820d3fd33862374b5ad09122da4e8a26bf5d151caf5d5859ed653", "pe-dll", "arm64ec"),
+    ("lib/wine/aarch64-windows/dxgi.dll", "a0f29706e04a547bf789ddf399e80e9d15c85b6a1a0d0ddf8f7d6f636cf01cc1", "pe-dll", "arm64ec"),
     ("lib/wine/aarch64-windows/nvapi64.dll", "f4e1cf79244d378c660b5d9b6c98923e29f2bd30e9073dadf62ac1879ffd9f02", "pe-dll", "arm64ec"),
     ("lib/wine/aarch64-windows/nvngx.dll", "b8ddc2d81dcf4306b58398b486299f31067617e4f5e66cd64c8e5eacde2a0c0c", "pe-dll", "arm64ec"),
-    ("lib/wine/aarch64-windows/winemetal.dll", "64007d8901b691bd91aac8218bddb12e2cce272fbdaab8a7bdc3f0ca6fe3eb99", "pe-dll", "arm64ec"),
-    ("lib/wine/i386-windows/d3d10core.dll", "2408d249cfe0ea8cb333a816dc833725ae85d76a94a414b31272b2d53807a1a6", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/d3d11.dll", "35be5a26db509ca206b6521bb79dbb16b49dd8ec79e863fac5a1eb8d572700d4", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/dxgi.dll", "eea621daefc1e1d811eb780372af639a2229ab4596ca049e7d8554f96595feb3", "pe-dll", "i386"),
-    ("lib/wine/i386-windows/winemetal.dll", "a4da600c7f33eee3b5cd74bd763c5df9dc08ca543ad8537bfd8e845463a38db0", "pe-dll", "i386"),
+    ("lib/wine/aarch64-windows/winemetal.dll", "5b46f00c1217e16bba8ae42f7084343750f2516faf8884c7d66cb3ba88128ac2", "pe-dll", "arm64ec"),
+    ("lib/wine/i386-windows/d3d10core.dll", "15d74460b922bc46b1e563413320d61b460b8e2b3218b33a5e38070be56f59d5", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/d3d11.dll", "55ee41c57f5771ea2d8e277b9644a2ba9a0896b5a96b5edf24a3f55f12d6867e", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/dxgi.dll", "1819cf644d78d3a0cdb1aed5356e028a3603da7657aa0e503621302321081655", "pe-dll", "i386"),
+    ("lib/wine/i386-windows/winemetal.dll", "79c261baa6eaec1ec9213debe241249b1d582a17f2baaf3359aee8d103d76869", "pe-dll", "i386"),
     ("lib/wine/x86_64-windows/d3d10core.dll", "4910ce0b1960a627c61114b019869057be8e1bf2edddd2ecb348c434bb98e5e0", "pe-dll", "x86_64"),
     ("lib/wine/x86_64-windows/d3d11.dll", "26b88098961e936b3bfe0ad984d3ad2a4568f10b04a4e6f7fa54711a9c17b583", "pe-dll", "x86_64"),
     ("lib/wine/x86_64-windows/dxgi.dll", "19ffb16b5dd22c944b284d9ea6d7b301e2ad96ef68f65ebdb642db49c55a9491", "pe-dll", "x86_64"),
@@ -273,7 +273,7 @@ DOCUMENTS = [
     ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/files.sha256", None),
     ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/LICENSE", "b87c35aef7b2cf14de854118ca55ce5c4b284c85b5f002421fb8d46d868c2d17"),
     ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/COPYING.LIB", "e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c"),
-    ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/CORRESPONDING-SOURCE.txt", "972485701e4d189475644657c6a35a1380484e0e252995a80f3b3ad17311327c"),
+    ("lib/switchyard-dxmt/share/doc/switchyard-dxmt/CORRESPONDING-SOURCE.txt", "e4686702f8a38e5968705fe1253233fe61991fa8f44027fbebd68e9803952bfa"),
     (COMPANION_SCHEMA_PATH, COMPANION_SCHEMA_SHA256),
 ]
 SOURCE_MATERIALS = [
