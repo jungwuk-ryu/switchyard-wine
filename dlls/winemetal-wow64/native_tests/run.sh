@@ -42,7 +42,7 @@ fi
 ${CC:-clang} $common_flags -fblocks \
     "$source_dir/dlls/winemetal-wow64/buffer.m" \
     "$test_dir/buffer.m" \
-    -framework Foundation -framework Metal \
+    -framework Foundation -framework Metal -framework CoreFoundation \
     -o "$build_dir/winemetal-wow64-buffer-tests"
 
 file "$build_dir/winemetal-wow64-buffer-tests" | grep -q 'Mach-O 64-bit executable arm64'

@@ -129,6 +129,19 @@ if len(header_digest_bytes) != 32 or b"".join(header_digest_bytes).decode("ascii
 makefile = contents["dlls/winemetal-wow64/Makefile.in"]
 if b"UNIXLIB" not in makefile or b"$(WINEMETAL_WOW64_UNIXLIB)" not in makefile:
     fail("companion Makefile does not use the configured Unixlib target")
+library_match = re.search(rb"^UNIX_LIBS\s*=\s*\\\n((?:\t[^\n]+(?:\s*\\)?\n)+)", makefile, re.MULTILINE)
+if not library_match:
+    fail("companion Makefile has no bounded UNIX_LIBS list")
+makefile_libraries = [
+    line.strip().removesuffix(b"\\").strip().decode("ascii")
+    for line in library_match.group(1).splitlines()
+]
+if makefile_libraries != [
+    "-framework Foundation",
+    "-framework Metal",
+    "-framework CoreFoundation",
+]:
+    fail("companion Makefile framework closure is not exact")
 source_match = re.search(rb"^SOURCES\s*=\s*\\\n((?:\t[^\n]+(?:\s*\\)?\n)+)", makefile, re.MULTILINE)
 if not source_match:
     fail("companion Makefile has no bounded SOURCES list")
@@ -231,6 +244,7 @@ COMPANION_LOAD_COMMANDS = [
     {"command": "LC_LOAD_DYLIB", "path": "@rpath/ntdll.so"},
     {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"},
     {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Metal.framework/Versions/A/Metal"},
+    {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation"},
     {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libSystem.B.dylib"},
     {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libobjc.A.dylib"},
 ]

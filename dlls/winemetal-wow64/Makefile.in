@@ -2,7 +2,8 @@ UNIXLIB     = $(WINEMETAL_WOW64_UNIXLIB)
 UNIX_CFLAGS = -fblocks
 UNIX_LIBS   = \
 	-framework Foundation \
-	-framework Metal
+	-framework Metal \
+	-framework CoreFoundation
 
 SOURCES = \
 	adapter.c \

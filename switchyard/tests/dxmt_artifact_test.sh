@@ -128,12 +128,14 @@ EOF
 /usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -nostdlib -O2 -Wall -Wextra -Werror \
   -mmacosx-version-min=26.5 -Wl,-install_name,@rpath/winemetal-wow64.so \
   -Wl,-rpath,@loader_path/ "$test_root/winemetal-wow64.c" "$test_root/ntdll.so" \
-  -framework Foundation -framework Metal -lSystem -lobjc -o "$fixture_companion"
+  -framework Foundation -framework Metal -framework CoreFoundation \
+  -lSystem -lobjc -o "$fixture_companion"
 /usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -nostdlib -O2 -Wall -Wextra -Werror \
   -DEXTRA_COMPANION_EXPORT=1 -mmacosx-version-min=26.5 \
   -Wl,-install_name,@rpath/winemetal-wow64.so -Wl,-rpath,@loader_path/ \
   "$test_root/winemetal-wow64.c" "$test_root/ntdll.so" \
-  -framework Foundation -framework Metal -lSystem -lobjc -o "$fixture_companion_extra"
+  -framework Foundation -framework Metal -framework CoreFoundation \
+  -lSystem -lobjc -o "$fixture_companion_extra"
 
 cleanup() {
   local status=$?
@@ -247,6 +249,7 @@ companion = {
         {"command": "LC_LOAD_DYLIB", "path": "@rpath/ntdll.so"},
         {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"},
         {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/Metal.framework/Versions/A/Metal"},
+        {"command": "LC_LOAD_DYLIB", "path": "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation"},
         {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libSystem.B.dylib"},
         {"command": "LC_LOAD_DYLIB", "path": "/usr/lib/libobjc.A.dylib"},
     ],

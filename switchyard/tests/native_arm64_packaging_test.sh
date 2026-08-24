@@ -138,6 +138,14 @@ done
 [ "$(switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE")" = \
   "$SWITCHYARD_DXMT_WOW64_ABI_SCHEMA_SHA256" ] ||
   fail "exact DXMT WoW64 companion source preflight did not return its schema identity"
+/bin/cp "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/Makefile.in" \
+  "$TEST_ROOT/companion-Makefile.good"
+/usr/bin/sed -i '' '/CoreFoundation/d' \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/Makefile.in"
+expect_failure "incomplete companion framework closure" \
+  switchyard_validate_dxmt_wow64_companion_source "$COMPANION_SOURCE_FIXTURE"
+/bin/cp "$TEST_ROOT/companion-Makefile.good" \
+  "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/Makefile.in"
 /bin/cp "$COMPANION_SOURCE_FIXTURE/dlls/winemetal-wow64/abi-schema-v6.txt" \
   "$TEST_ROOT/abi-schema-v6.good"
 /usr/bin/printf 'tampered\n' >> \
@@ -385,7 +393,7 @@ EOF
   -Wl,-rpath,@loader_path/ -Wl,-rpath,"$TEST_ROOT/build-only-dependency" \
   -I"$TEST_ROOT" "$TEST_ROOT/companion.c" \
   "$RUNTIME/lib/wine/aarch64-unix/ntdll.so" \
-  -framework Foundation -framework Metal -lSystem -lobjc \
+  -framework Foundation -framework Metal -framework CoreFoundation -lSystem -lobjc \
   -o "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so"
 COMPANION_RPATHS_BEFORE="$(/usr/bin/otool -l \
   "$RUNTIME/lib/wine/aarch64-unix/winemetal-wow64.so" | /usr/bin/awk \
