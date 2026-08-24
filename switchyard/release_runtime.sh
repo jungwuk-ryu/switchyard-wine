@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/switchyard/lib/runtime_profile.sh"
@@ -181,16 +182,40 @@ PY
 }
 
 switchyard_publish_native_release_file_atomically() {
-  /usr/bin/python3 -I - "$1" "$2" <<'PY'
+  [ "$#" -eq 2 ] || [ "$#" -eq 4 ] || {
+    echo "usage: switchyard_publish_native_release_file SOURCE DESTINATION [SHA256 SIZE]" >&2
+    return 2
+  }
+  /usr/bin/python3 -I - "$@" <<'PY'
 import ctypes
 import errno
+import hashlib
 import os
+import secrets
 import stat
 import sys
 
-source, destination = sys.argv[1:]
+source, destination, *expected = sys.argv[1:]
 RENAME_EXCL = 0x00000004
-flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+if expected:
+    expected_sha256, expected_size_text = expected
+    if (
+        len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise SystemExit("native release publication SHA-256 is malformed")
+    try:
+        expected_size = int(expected_size_text)
+    except ValueError:
+        raise SystemExit("native release publication size is malformed")
+    if expected_size <= 0:
+        raise SystemExit("native release publication size is invalid")
+else:
+    expected_sha256 = None
+    expected_size = None
 
 if any(
     not os.path.isabs(path)
@@ -202,10 +227,10 @@ if any(
     raise SystemExit("native release publication path is not canonical")
 
 def open_directory(path):
-    descriptor = os.open("/", flags)
+    descriptor = os.open("/", DIRECTORY_FLAGS)
     try:
         for component in path.split("/")[1:]:
-            child = os.open(component, flags, dir_fd=descriptor)
+            child = os.open(component, DIRECTORY_FLAGS, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -219,14 +244,42 @@ if not source_name or not destination_name:
     raise SystemExit("native release publication filename is invalid")
 source_fd = open_directory(source_parent)
 destination_fd = open_directory(destination_parent)
+source_file = None
 try:
+    source_file = os.open(source_name, FILE_FLAGS, dir_fd=source_fd)
+    opened_info = os.fstat(source_file)
     source_info = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+    identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+        value.st_uid, value.st_gid, value.st_size, value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
     if (
-        not stat.S_ISREG(source_info.st_mode)
+        identity(source_info) != identity(opened_info)
+        or not stat.S_ISREG(source_info.st_mode)
         or source_info.st_uid != os.geteuid()
         or source_info.st_nlink != 1
+        or stat.S_IMODE(source_info.st_mode) != 0o644
     ):
         raise SystemExit("native release publication source is unsafe")
+    if expected_size is not None and source_info.st_size != expected_size:
+        raise SystemExit("native release publication size changed before rename")
+
+    def hash_open_file():
+        before = os.fstat(source_file)
+        os.lseek(source_file, 0, os.SEEK_SET)
+        remaining = before.st_size
+        digest = hashlib.sha256()
+        while remaining:
+            block = os.read(source_file, min(1024 * 1024, remaining))
+            if not block:
+                raise SystemExit("native release publication source ended early")
+            remaining -= len(block)
+            digest.update(block)
+        if os.read(source_file, 1) or identity(os.fstat(source_file)) != identity(before):
+            raise SystemExit("native release publication source changed while hashing")
+        return digest.hexdigest(), before.st_size, before
+
     try:
         os.stat(destination_name, dir_fd=destination_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -244,9 +297,49 @@ try:
         ctypes.c_uint,
     ]
     renameatx_np.restype = ctypes.c_int
+    if identity(os.stat(source_name, dir_fd=source_fd,
+                        follow_symlinks=False)) != identity(opened_info):
+        raise SystemExit("native release publication source path changed before anchoring")
+
+    anchor_name = None
+    for _attempt in range(128):
+        candidate = ".switchyard-native-release-publish." + secrets.token_hex(16)
+        if renameatx_np(
+            source_fd,
+            os.fsencode(source_name),
+            source_fd,
+            os.fsencode(candidate),
+            RENAME_EXCL,
+        ) == 0:
+            anchor_name = candidate
+            break
+        error = ctypes.get_errno()
+        if error != errno.EEXIST:
+            raise OSError(error, os.strerror(error), source)
+    if anchor_name is None:
+        raise SystemExit("native release publication could not allocate a private anchor")
+
+    anchored_file = os.open(anchor_name, FILE_FLAGS, dir_fd=source_fd)
+    os.close(source_file)
+    source_file = anchored_file
+    anchored_info = os.fstat(source_file)
+    content_identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+        value.st_uid, value.st_gid, value.st_size, value.st_mtime_ns,
+    )
+    if content_identity(anchored_info) != content_identity(opened_info):
+        raise SystemExit("native release publication anchor changed file identity")
+    pinned_sha256, pinned_size, pinned_info = hash_open_file()
+    if expected_sha256 is not None and (
+        pinned_sha256 != expected_sha256 or pinned_size != expected_size
+    ):
+        raise SystemExit("native release publication anchor does not match its pin")
+    if identity(os.stat(anchor_name, dir_fd=source_fd,
+                        follow_symlinks=False)) != identity(pinned_info):
+        raise SystemExit("native release publication anchor changed before rename")
     if renameatx_np(
         source_fd,
-        os.fsencode(source_name),
+        os.fsencode(anchor_name),
         destination_fd,
         os.fsencode(destination_name),
         RENAME_EXCL,
@@ -255,9 +348,21 @@ try:
         raise OSError(error, os.strerror(error), destination)
     os.fsync(destination_fd)
     published = os.stat(destination_name, dir_fd=destination_fd, follow_symlinks=False)
-    if (published.st_dev, published.st_ino) != (source_info.st_dev, source_info.st_ino):
+    if (
+        not stat.S_ISREG(published.st_mode)
+        or published.st_uid != os.geteuid()
+        or published.st_nlink != 1
+        or stat.S_IMODE(published.st_mode) != 0o644
+        or content_identity(published) != content_identity(pinned_info)
+        or content_identity(os.fstat(source_file)) != content_identity(pinned_info)
+    ):
         raise SystemExit("native release publication changed file identity")
+    if identity(os.stat(destination_name, dir_fd=destination_fd,
+                        follow_symlinks=False)) != identity(os.fstat(source_file)):
+        raise SystemExit("native release publication path changed after rename")
 finally:
+    if source_file is not None:
+        os.close(source_file)
     os.close(destination_fd)
     os.close(source_fd)
 PY
@@ -454,7 +559,7 @@ switchyard_create_native_release_archive() {
   /usr/bin/ditto -c -k --norsrc --noextattr --noacl --keepParent "$1" "$2"
 }
 
-switchyard_pin_native_release_archive() {
+switchyard_pin_native_release_file() {
   /usr/bin/python3 -I - "$1" <<'PY'
 import hashlib
 import os
@@ -470,7 +575,7 @@ if (
     or os.path.normpath(path) != path
     or os.path.realpath(os.path.dirname(path)) != os.path.dirname(path)
 ):
-    raise SystemExit("native release archive path is not canonical")
+    raise SystemExit("native release file path is not canonical")
 descriptor = os.open(path, flags)
 try:
     before = os.fstat(descriptor)
@@ -481,7 +586,7 @@ try:
         value.st_ctime_ns,
     )
     if identity(entry) != identity(before):
-        raise SystemExit("native release archive changed while opening")
+        raise SystemExit("native release file changed while opening")
     if (
         not stat.S_ISREG(before.st_mode)
         or before.st_uid != os.geteuid()
@@ -490,23 +595,27 @@ try:
         or before.st_size <= 0
         or before.st_size > MAX_ARCHIVE_BYTES
     ):
-        raise SystemExit("native release archive has unsafe metadata or size")
+        raise SystemExit("native release file has unsafe metadata or size")
     digest = hashlib.sha256()
     remaining = before.st_size
     while remaining:
         block = os.read(descriptor, min(1024 * 1024, remaining))
         if not block:
-            raise SystemExit("native release archive ended early")
+            raise SystemExit("native release file ended early")
         remaining -= len(block)
         digest.update(block)
     if os.read(descriptor, 1) or identity(os.fstat(descriptor)) != identity(before):
-        raise SystemExit("native release archive changed while hashing")
+        raise SystemExit("native release file changed while hashing")
     if identity(os.stat(path, follow_symlinks=False)) != identity(before):
-        raise SystemExit("native release archive path changed while hashing")
+        raise SystemExit("native release file path changed while hashing")
     print(digest.hexdigest() + "\t" + str(before.st_size))
 finally:
     os.close(descriptor)
 PY
+}
+
+switchyard_pin_native_release_archive() {
+  switchyard_pin_native_release_file "$@"
 }
 
 switchyard_extract_native_release_archive() {
@@ -979,6 +1088,7 @@ PY
 switchyard_validate_extracted_native_release_runtime() {
   local runtime_root="$1"
   local runtime_manifest="$2"
+  local expected_digest="${3:-}"
 
   /usr/bin/python3 -I - "$runtime_root" "$runtime_manifest" <<'PY' || return 1
 import json
@@ -1034,7 +1144,11 @@ if resolved_root != root or os.path.commonpath((root, resolved_executable)) != r
 if resolved_executable != os.path.join(root, "bin", "switchyard-wine"):
     raise SystemExit("portable runtime fields do not bind the extracted launcher")
 PY
-  runtime_content_tree_is_verified "$runtime_root" || {
+  if [ -n "$expected_digest" ]; then
+    runtime_content_tree_matches_digest "$runtime_root" "$expected_digest"
+  else
+    runtime_content_tree_is_verified "$runtime_root"
+  fi || {
     echo "extracted native runtime outer content digest did not verify" >&2
     return 1
   }
@@ -1276,10 +1390,16 @@ switchyard_release_preview_native() {
   local archive_recheck
   local archive_sha256
   local archive_size
+  local checksum_pin
+  local checksum_sha256
+  local checksum_size
   local checksum_private
   local extracted_manifest
   local extraction_container
   local manifest_private
+  local manifest_pin
+  local manifest_sha256
+  local manifest_size
   local notary_id
   local notary_result
   local notary_status
@@ -1368,12 +1488,8 @@ switchyard_release_preview_native() {
   # The outer marker is the sole allowed runtime mutation after the signed
   # manifest refresh.  Everything below this point is read-only for the tree.
   switchyard_publish_native_outer_digest "$signed_runtime" || return 1
-  runtime_content_tree_is_verified "$signed_runtime" || {
-    echo "native release outer content digest did not verify" >&2
-    return 1
-  }
-  [ "$(runtime_content_tree_digest "$signed_runtime")" = \
-      "$signed_runtime_digest" ] || {
+  runtime_content_tree_matches_digest \
+    "$signed_runtime" "$signed_runtime_digest" || {
     echo "native release signed staging changed before archive creation" >&2
     return 1
   }
@@ -1381,6 +1497,7 @@ switchyard_release_preview_native() {
   echo "creating $archive_name"
   switchyard_create_native_release_archive \
     "$signed_runtime" "$archive_private" || return 1
+  /bin/chmod 0644 "$archive_private"
   archive_pin="$(switchyard_pin_native_release_archive "$archive_private")" || return 1
   case "$archive_pin" in
     *$'\t'*)
@@ -1411,20 +1528,12 @@ switchyard_release_preview_native() {
   native_release_smoke_runtime="$extraction_container/$release_root_name"
   extracted_manifest="$native_release_smoke_runtime/switchyard-runtime.json"
   switchyard_validate_extracted_native_release_runtime \
-    "$native_release_smoke_runtime" "$extracted_manifest" || return 1
-  [ "$(runtime_content_tree_digest "$native_release_smoke_runtime")" = \
-      "$signed_runtime_digest" ] || {
-    echo "extracted native runtime differs from signed staging" >&2
-    return 1
-  }
+    "$native_release_smoke_runtime" "$extracted_manifest" \
+    "$signed_runtime_digest" || return 1
   switchyard_verify_native_release_macho_tree \
     "$native_release_smoke_runtime" "$entitlements_snapshot_fd" || return 1
-  runtime_content_tree_is_verified "$native_release_smoke_runtime" || {
-    echo "extracted native runtime changed during Mach-O validation" >&2
-    return 1
-  }
-  [ "$(runtime_content_tree_digest "$native_release_smoke_runtime")" = \
-      "$signed_runtime_digest" ] || {
+  runtime_content_tree_matches_digest \
+    "$native_release_smoke_runtime" "$signed_runtime_digest" || {
     echo "extracted native runtime changed during Mach-O validation" >&2
     return 1
   }
@@ -1452,12 +1561,8 @@ switchyard_release_preview_native() {
     echo "native release failed the strict no-Rosetta smoke test" >&2
     return "$smoke_status"
   }
-  runtime_content_tree_is_verified "$native_release_smoke_runtime" || {
-    echo "extracted native runtime changed during no-Rosetta smoke" >&2
-    return 1
-  }
-  [ "$(runtime_content_tree_digest "$native_release_smoke_runtime")" = \
-      "$signed_runtime_digest" ] || {
+  runtime_content_tree_matches_digest \
+    "$native_release_smoke_runtime" "$signed_runtime_digest" || {
     echo "extracted native runtime changed during no-Rosetta smoke" >&2
     return 1
   }
@@ -1494,6 +1599,7 @@ switchyard_release_preview_native() {
   }
   /usr/bin/printf '%s  %s\n' \
     "$archive_sha256" "$archive_name" >"$checksum_private"
+  /bin/chmod 0644 "$checksum_private"
 
   for pe_architecture in "${SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS[@]}"; do
     [ -z "$release_pe_architectures" ] || release_pe_architectures+=", "
@@ -1529,25 +1635,63 @@ switchyard_release_preview_native() {
   "notarizationID": "$notary_id"
 }
 EOF
+  /bin/chmod 0644 "$manifest_private"
   switchyard_release_text_has_no_korean "$manifest_private" || return 1
+
+  checksum_pin="$(switchyard_pin_native_release_file "$checksum_private")" || return 1
+  manifest_pin="$(switchyard_pin_native_release_file "$manifest_private")" || return 1
+  case "$checksum_pin" in
+    *$'\t'*)
+      checksum_sha256="${checksum_pin%%$'\t'*}"
+      checksum_size="${checksum_pin#*$'\t'}"
+      ;;
+    *)
+      echo "native release checksum pin is malformed" >&2
+      return 1
+      ;;
+  esac
+  case "$manifest_pin" in
+    *$'\t'*)
+      manifest_sha256="${manifest_pin%%$'\t'*}"
+      manifest_size="${manifest_pin#*$'\t'}"
+      ;;
+    *)
+      echo "native release manifest pin is malformed" >&2
+      return 1
+      ;;
+  esac
 
   native_archive_public_path="$archive"
   native_archive_public_identity="$(
     switchyard_native_release_file_identity "$archive_private"
   )"
-  switchyard_publish_native_release_file "$archive_private" "$archive" || return 1
+  switchyard_publish_native_release_file \
+    "$archive_private" "$archive" \
+    "$archive_sha256" "$archive_size" || return 1
   native_checksum_public_path="$checksum_file"
   native_checksum_public_identity="$(
     switchyard_native_release_file_identity "$checksum_private"
   )"
   switchyard_publish_native_release_file \
-    "$checksum_private" "$checksum_file" || return 1
+    "$checksum_private" "$checksum_file" \
+    "$checksum_sha256" "$checksum_size" || return 1
   native_manifest_public_path="$release_manifest"
   native_manifest_public_identity="$(
     switchyard_native_release_file_identity "$manifest_private"
   )"
   switchyard_publish_native_release_file \
-    "$manifest_private" "$release_manifest" || return 1
+    "$manifest_private" "$release_manifest" \
+    "$manifest_sha256" "$manifest_size" || return 1
+
+  [ "$(switchyard_pin_native_release_file "$archive")" = "$archive_pin" ] &&
+    [ "$(switchyard_pin_native_release_file "$checksum_file")" = "$checksum_pin" ] &&
+    [ "$(switchyard_pin_native_release_file "$release_manifest")" = "$manifest_pin" ] &&
+    [ "$(/usr/bin/stat -f '%Lp' "$archive")" = 644 ] &&
+    [ "$(/usr/bin/stat -f '%Lp' "$checksum_file")" = 644 ] &&
+    [ "$(/usr/bin/stat -f '%Lp' "$release_manifest")" = 644 ] || {
+    echo "native release publication changed after its atomic rename" >&2
+    return 1
+  }
 
   remove_native_release_private_root || return 1
   native_release_complete=1
@@ -1620,6 +1764,13 @@ sha256_file() {
 runtime_content_tree_is_verified() {
   local root="$1"
   /usr/bin/python3 "$ROOT_DIR/switchyard/runtime_content_digest.py" verify "$root"
+}
+
+runtime_content_tree_matches_digest() {
+  local root="$1"
+  local expected_digest="$2"
+  /usr/bin/python3 "$ROOT_DIR/switchyard/runtime_content_digest.py" \
+    verify "$root" "$expected_digest"
 }
 
 runtime_content_tree_digest() {
@@ -1837,9 +1988,11 @@ prefix=""
 write_runtime_content_tree_digest "$signed_runtime"
 echo "creating $archive_name"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$signed_runtime" "$archive"
+/bin/chmod 0644 "$archive"
 archive_sha256="$(sha256_file "$archive")"
 archive_size="$(/usr/bin/stat -f '%z' "$archive")"
 /usr/bin/printf '%s  %s\n' "$archive_sha256" "$archive_name" > "$checksum_file"
+/bin/chmod 0644 "$checksum_file"
 
 notary_status="not-submitted"
 notary_id=""
@@ -1892,6 +2045,7 @@ cat > "$release_manifest" <<EOF
   "notarizationID": "$notary_id"
 }
 EOF
+/bin/chmod 0644 "$release_manifest"
 
 echo "runtime release archive: $archive"
 echo "runtime release manifest: $release_manifest"

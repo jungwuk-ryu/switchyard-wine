@@ -223,6 +223,29 @@ assert_no_publication() {
   fi
 }
 
+assert_native_release_cleanup_preserves_foreign_replacement() {
+  local fixture_root="$TEST_ROOT/foreign-cleanup"
+  local output="$fixture_root/archive.zip"
+  local identity
+
+  /bin/mkdir -m 700 "$fixture_root"
+  /usr/bin/printf 'owned archive\n' >"$output"
+  /bin/chmod 0644 "$output"
+  (
+    # shellcheck disable=SC1090 # Fixed worktree release script.
+    source "$RELEASE_SCRIPT"
+    identity="$(switchyard_native_release_file_identity "$output")"
+    /bin/mv "$output" "$output.away"
+    /usr/bin/printf 'foreign replacement\n' >"$output"
+    /bin/chmod 0644 "$output"
+    if remove_owned_native_release_output "$output" "$identity"; then
+      fail "release cleanup removed a foreign replacement"
+    fi
+  )
+  /usr/bin/grep -Fqx 'foreign replacement' "$output" ||
+    fail "release cleanup changed a foreign replacement"
+}
+
 event_line() {
   local event="$1"
   local log="$2"
@@ -272,6 +295,7 @@ operations = {
     "smoke": call_offsets(release, "switchyard_run_native_release_smoke"),
     "outer": call_offsets(release, "switchyard_publish_native_outer_digest"),
     "tree_verify": call_offsets(release, "runtime_content_tree_is_verified"),
+    "tree_match": call_offsets(release, "runtime_content_tree_matches_digest"),
     "archive": call_offsets(release, "switchyard_create_native_release_archive"),
     "pin": call_offsets(release, "switchyard_pin_native_release_archive"),
     "extract": call_offsets(release, "switchyard_extract_native_release_archive"),
@@ -288,7 +312,8 @@ expected_counts = {
     "validate": 1,
     "smoke": 1,
     "outer": 1,
-    "tree_verify": 4,
+    "tree_verify": 1,
+    "tree_match": 3,
     "archive": 1,
     "pin": 3,
     "extract": 1,
@@ -307,15 +332,15 @@ ordered = [
     operations["refresh"][0],
     operations["validate"][0],
     operations["outer"][0],
-    operations["tree_verify"][1],
+    operations["tree_match"][0],
     operations["archive"][0],
     operations["pin"][0],
     operations["extract"][0],
     operations["extracted_validate"][0],
     operations["macho_verify"][0],
-    operations["tree_verify"][2],
+    operations["tree_match"][1],
     operations["smoke"][0],
-    operations["tree_verify"][3],
+    operations["tree_match"][2],
     operations["pin"][1],
     operations["pin"][2],
 ]
@@ -466,6 +491,7 @@ make_invalid_native_release_archive() {
   /usr/bin/python3 -I - \
     "$archive" "$root_name" "$scenario" "$producer_archive" <<'PY'
 import shutil
+import os
 import stat
 import struct
 import sys
@@ -493,30 +519,21 @@ if scenario in (
     "unsupported-compression",
     "crc",
     "truncated",
+    "duplicate",
+    "casefold",
+    "nfc",
+    "escaping-symlink",
 ):
     if not producer_archive:
         raise SystemExit("producer archive is required for mutation fixtures")
     shutil.copyfile(producer_archive, archive)
 elif scenario == "extra-root":
-    entries = [member(root + "/file", stat.S_IFREG | 0o644, b"runtime\n"),
-               member("Other-Root/file", stat.S_IFREG | 0o644, b"other\n")]
+    entries = [member("Other-Root/file", stat.S_IFREG | 0o644, b"other\n"),
+               member(root + "/file", stat.S_IFREG | 0o644, b"runtime\n")]
 elif scenario == "absolute":
     entries = [member("/absolute", stat.S_IFREG | 0o644, b"bad\n")]
 elif scenario == "traversal":
     entries = [member(root + "/../escape", stat.S_IFREG | 0o644, b"bad\n")]
-elif scenario == "duplicate":
-    entries = [member(root + "/file", stat.S_IFREG | 0o644, b"one\n"),
-               member(root + "/file", stat.S_IFREG | 0o644, b"two\n")]
-elif scenario == "casefold":
-    entries = [member(root + "/Alias", stat.S_IFREG | 0o644, b"one\n"),
-               member(root + "/alias", stat.S_IFREG | 0o644, b"two\n")]
-elif scenario == "nfc":
-    composed = unicodedata.normalize("NFC", "cafe\N{COMBINING ACUTE ACCENT}")
-    decomposed = unicodedata.normalize("NFD", composed)
-    entries = [member(root + "/" + composed, stat.S_IFREG | 0o644, b"one\n"),
-               member(root + "/" + decomposed, stat.S_IFREG | 0o644, b"two\n")]
-elif scenario == "escaping-symlink":
-    entries = [member(root + "/link", stat.S_IFLNK | 0o777, b"../../escape")]
 elif scenario == "unsupported-type":
     entries = [member(root + "/pipe", stat.S_IFIFO | 0o600)]
 else:
@@ -528,6 +545,48 @@ if entries is not None:
         with zipfile.ZipFile(archive, "x", allowZip64=True) as stream:
             for info, data in entries:
                 stream.writestr(info, data)
+
+if scenario in ("duplicate", "casefold", "nfc"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(archive, "a", allowZip64=True) as stream:
+            if scenario == "duplicate":
+                original = stream.getinfo(root + "/bin/runtime")
+                duplicate, data = member(
+                    original.filename, stat.S_IFREG | 0o755,
+                    stream.read(original),
+                )
+            elif scenario == "casefold":
+                duplicate, data = member(
+                    root + "/bin/Runtime", stat.S_IFREG | 0o644, b"alias\n"
+                )
+            else:
+                composed = unicodedata.normalize(
+                    "NFC", "cafe\N{COMBINING ACUTE ACCENT}"
+                )
+                duplicate, data = member(
+                    root + "/bin/" + unicodedata.normalize("NFD", composed),
+                    stat.S_IFREG | 0o644,
+                    b"alias\n",
+                )
+            stream.writestr(duplicate, data)
+elif scenario == "escaping-symlink":
+    replacement = archive + ".replacement"
+    with zipfile.ZipFile(archive, "r") as source:
+        payloads = [(info, source.read(info)) for info in source.infolist()]
+    with zipfile.ZipFile(replacement, "x", allowZip64=True) as destination:
+        for original, data in payloads:
+            clone = zipfile.ZipInfo(original.filename, original.date_time)
+            clone.create_system = original.create_system
+            clone.compress_type = original.compress_type
+            clone.external_attr = original.external_attr
+            clone.internal_attr = original.internal_attr
+            clone.extra = original.extra
+            clone.comment = original.comment
+            if original.filename == root + "/bin/escape-link":
+                data = b"../../escape"
+            destination.writestr(clone, data)
+    os.replace(replacement, archive)
 
 with open(archive, "r+b") as stream:
     data = bytearray(stream.read())
@@ -597,6 +656,7 @@ assert_native_release_archive_extractor() {
   /usr/bin/printf 'runtime payload\n' >"$source_runtime/bin/runtime"
   /bin/chmod 0755 "$source_runtime/bin/runtime"
   /bin/ln -s runtime "$source_runtime/bin/launcher"
+  /bin/ln -s 'safe-target!' "$source_runtime/bin/escape-link"
 
   (
     # shellcheck disable=SC1090 # Fixed worktree release script.
@@ -697,6 +757,31 @@ assert_native_release_archive_extractor() {
     [ "$status" -ne 0 ] ||
       fail "native release extractor accepted the $scenario archive fixture"
     case "$scenario" in
+      extra-root)
+        /usr/bin/grep -F 'exactly the expected root' \
+          "$fixture_root/$scenario.stderr" >/dev/null ||
+          fail "extra-root fixture did not reach the one-root policy"
+        ;;
+      duplicate)
+        /usr/bin/grep -F 'duplicate member' \
+          "$fixture_root/$scenario.stderr" >/dev/null ||
+          fail "duplicate fixture did not reach the duplicate policy"
+        ;;
+      casefold)
+        /usr/bin/grep -F 'casefold or Unicode path collision' \
+          "$fixture_root/$scenario.stderr" >/dev/null ||
+          fail "casefold fixture did not reach the collision policy"
+        ;;
+      nfc)
+        /usr/bin/grep -F 'non-canonical path component' \
+          "$fixture_root/$scenario.stderr" >/dev/null ||
+          fail "NFC fixture did not reach the Unicode canonicalization policy"
+        ;;
+      escaping-symlink)
+        /usr/bin/grep -F 'symbolic link escapes the runtime root' \
+          "$fixture_root/$scenario.stderr" >/dev/null ||
+          fail "symlink fixture did not reach the escape policy"
+        ;;
       encrypted)
         /usr/bin/grep -F 'encrypted member' \
           "$fixture_root/$scenario.stderr" >/dev/null ||
@@ -764,6 +849,9 @@ run_case() {
   local status
 
   /bin/mkdir -m 700 "$case_root"
+  if [ "$failure_mode" = permissive-umask ]; then
+    /bin/mkdir -m 700 "$output"
+  fi
   make_runtime "$runtime" "$([ "$failure_mode" = unknown-source ] && printf 1 || printf 0)"
   if [ "$failure_mode" = missing-entry ]; then
     /usr/bin/printf 'not a Mach-O entry\n' >"$runtime/bin/wine.switchyard-real"
@@ -787,6 +875,9 @@ run_case() {
 
   set +e
   (
+    if [ "$failure_mode" = permissive-umask ]; then
+      umask 000
+    fi
     export HOME="$case_root/home"
     /bin/mkdir -m 700 "$HOME"
     export SWITCHYARD_TEST_ORDER_LOG="$log"
@@ -810,6 +901,16 @@ run_case() {
 
     switchyard_publish_native_release_file() {
       publish_call_count=$((publish_call_count + 1))
+      if [ "$failure_mode" = post-final-pin-mutation ] &&
+         [ "$publish_call_count" -eq 1 ]; then
+        /usr/bin/printf 'post-pin mutation\n' >>"$1"
+      fi
+      if [ "$failure_mode" = post-final-pin-path-swap ] &&
+         [ "$publish_call_count" -eq 1 ]; then
+        /bin/mv "$1" "$1.pinned"
+        /usr/bin/printf 'replacement archive\n' >"$1"
+        /bin/chmod 0644 "$1"
+      fi
       if [ "$failure_mode" = partial-publication ] &&
          [ "$publish_call_count" -eq 2 ]; then
         echo "publication fixture failure" >&2
@@ -966,8 +1067,13 @@ run_case() {
   "$RELEASE_SCRIPT" >/dev/null || fail "stable fresh-prefix smoke changed"
 /usr/bin/grep -F '/usr/bin/codesign --force --sign "$IDENTITY" --options runtime --timestamp' \
   "$RELEASE_SCRIPT" >/dev/null || fail "stable Developer-ID/Hardened signing changed"
+/usr/bin/grep -F '/bin/chmod 0644 "$archive"' "$RELEASE_SCRIPT" >/dev/null &&
+  /usr/bin/grep -F '/bin/chmod 0644 "$checksum_file"' "$RELEASE_SCRIPT" >/dev/null &&
+  /usr/bin/grep -F '/bin/chmod 0644 "$release_manifest"' "$RELEASE_SCRIPT" >/dev/null ||
+  fail "stable release output mode normalization changed"
 assert_native_release_source_contract || fail "native release source ordering contract changed"
 assert_native_release_stop_is_idempotent
+assert_native_release_cleanup_preserves_foreign_replacement
 assert_native_release_archive_extractor
 
 run_case success none 0
@@ -980,6 +1086,10 @@ release_manifest="$success_output/switchyard-runtime-release.json"
   fail "successful native release did not publish its exact output set"
 [ "$(/usr/bin/find "$success_output" -mindepth 1 -maxdepth 1 -print | /usr/bin/wc -l | tr -d ' ')" -eq 3 ] ||
   fail "successful native release published unexpected output"
+[ "$(/usr/bin/stat -f '%Lp' "$archive")" = 644 ] &&
+  [ "$(/usr/bin/stat -f '%Lp' "$checksum")" = 644 ] &&
+  [ "$(/usr/bin/stat -f '%Lp' "$release_manifest")" = 644 ] ||
+  fail "successful native release output modes are not exact"
 (
   cd "$success_output"
   /usr/bin/shasum -a 256 -c "$(basename "$checksum")" >/dev/null
@@ -1053,7 +1163,7 @@ if /usr/bin/grep -Fqx archive \
     "$TEST_ROOT/post-outer-dependency-mutation-case/order.log"; then
   fail "native release archived a runtime changed after its outer marker"
 fi
-/usr/bin/grep -F 'native release outer content digest did not verify' \
+/usr/bin/grep -F 'native release signed staging changed before archive creation' \
   "$TEST_ROOT/post-outer-dependency-mutation-case/stderr" >/dev/null ||
   fail "post-outer dependency mutation did not reach the final digest gate"
 run_case post-outer-coherent-mutation post-outer-coherent-mutation 1
@@ -1064,6 +1174,14 @@ fi
 /usr/bin/grep -F 'native release signed staging changed before archive creation' \
   "$TEST_ROOT/post-outer-coherent-mutation-case/stderr" >/dev/null ||
   fail "coherent post-validation mutation did not reach the pinned digest gate"
+run_case post-final-pin-mutation post-final-pin-mutation 1
+run_case post-final-pin-path-swap post-final-pin-path-swap 1
+run_case permissive-umask permissive-umask 0
+for published in "$TEST_ROOT/permissive-umask-output"/*; do
+  [ -f "$published" ] && [ ! -L "$published" ] &&
+    [ "$(/usr/bin/stat -f '%Lp' "$published")" = 644 ] ||
+    fail "permissive umask changed a published release artifact mode"
+done
 run_case source-unknown-field unknown-source 1
 run_case partial-publication partial-publication 1
 run_case malformed-notary malformed-notary 1

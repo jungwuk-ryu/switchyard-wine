@@ -39,6 +39,16 @@ original="$(run_digest digest "$runtime")"
 }
 run_digest write "$runtime" >/dev/null
 run_digest verify "$runtime"
+run_digest verify "$runtime" "$original"
+if run_digest verify "$runtime" \
+     0000000000000000000000000000000000000000000000000000000000000000; then
+  echo "expected exact digest verification to reject a different digest" >&2
+  exit 1
+fi
+if run_digest verify "$runtime" malformed; then
+  echo "expected exact digest verification to reject a malformed digest" >&2
+  exit 1
+fi
 [ "$(run_digest digest "$runtime")" = "$original" ]
 [ "${#original}" -eq 64 ]
 

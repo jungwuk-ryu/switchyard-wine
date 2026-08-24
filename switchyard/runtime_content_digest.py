@@ -633,7 +633,7 @@ def write_marker(root_name):
         return hexadecimal
 
 
-def verify_marker(root_name):
+def verify_marker(root_name, expected_digest=None):
     with RuntimeTree(root_name) as tree:
         try:
             expected, marker_info = read_marker(tree)
@@ -652,21 +652,35 @@ def verify_marker(root_name):
         if final != expected or stable_identity(final_info) != stable_identity(marker_info):
             return False
         tree.validate_path()
-        return hmac.compare_digest(actual, hexadecimal)
+        matches_marker = hmac.compare_digest(actual, hexadecimal)
+        if expected_digest is None:
+            return matches_marker
+        if (
+            not isinstance(expected_digest, str)
+            or len(expected_digest) != 64
+            or any(character not in "0123456789abcdef" for character in expected_digest)
+        ):
+            return False
+        return matches_marker and hmac.compare_digest(
+            actual, expected_digest.encode("ascii")
+        )
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("digest", "write", "verify"))
     parser.add_argument("root")
+    parser.add_argument("expected_digest", nargs="?")
     arguments = parser.parse_args()
 
     try:
+        if arguments.action != "verify" and arguments.expected_digest is not None:
+            parser.error("expected_digest is valid only with verify")
         if arguments.action == "digest":
             print(content_digest(arguments.root))
         elif arguments.action == "write":
             print(write_marker(arguments.root))
-        elif not verify_marker(arguments.root):
+        elif not verify_marker(arguments.root, arguments.expected_digest):
             return 1
     except (DigestError, OSError) as error:
         print(f"runtime content digest failed: {error}", file=sys.stderr)
