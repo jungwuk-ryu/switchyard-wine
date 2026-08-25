@@ -9,8 +9,8 @@ SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit.so"
 SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY="lib/wine/aarch64-windows/xtajit.dll"
 SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit64.so"
 SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY="lib/wine/aarch64-windows/xtajit64.dll"
-SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION="6"
-SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY="switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464"
+SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION="8"
+SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY="switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-464"
 SWITCHYARD_NATIVE_UNICORN_ROOT="lib/switchyard-unicorn"
 SWITCHYARD_NATIVE_UNICORN_LIBRARY="lib/switchyard-unicorn/lib/libunicorn.2.dylib"
 SWITCHYARD_NATIVE_UNICORN_RPATH='@loader_path/../../switchyard-unicorn/lib'
@@ -492,7 +492,7 @@ try:
     expected_x64_abi = (
         "switchyard-xtajit64-provider-abi-v"
         + str(int(xtajit64_abi_version))
-        + "-process-init-80-begin-464"
+        + "-flight-bind-process-init-80-begin-464"
     )
     x64_abi_bytes = xtajit64_abi_identity.encode("ascii")
 except (UnicodeError, ValueError) as error:

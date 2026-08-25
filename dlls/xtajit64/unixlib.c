@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef XTAJIT64_UNIXLIB_TEST
 # include <sched.h>
 #endif
@@ -32,6 +33,9 @@
 # ifdef __APPLE__
 #  include <mach/mach.h>
 #  include <mach/mach_vm.h>
+#  if defined(__aarch64__) && defined(HAVE_OS_CUSTOM_X18_ABI)
+#   include <os/arch/arm64.h>
+#  endif
 # endif
 #endif
 
@@ -90,6 +94,24 @@ struct thread_binding
     uc_context *context;
     uint64_t process_instance;
     uint64_t id;
+    struct xtajit64_flight_recorder *flight_recorder;
+    uint64_t flight_causal_boundary_id;
+    uint64_t flight_context_generation;
+    uint64_t flight_last_context_generation;
+    uint64_t flight_transition_generation;
+    /* `flight_expected_teb` is the Unix-TLS authenticated value.  The
+     * separately retained claim is the PE x18 value supplied at bind. */
+    uint64_t flight_expected_teb;
+    uint64_t flight_claimed_teb;
+    uint64_t flight_guest_rip;
+    uint64_t flight_guest_rsp;
+    uint64_t flight_guest_stack_limit;
+    uint64_t flight_guest_stack_base;
+    uint64_t flight_control_stack_limit;
+    uint64_t flight_control_stack_top;
+    uint64_t flight_pid;
+    uint64_t flight_mach_thread_id;
+    uint64_t flight_pthread_identity;
     BOOL context_valid;
     BOOL active;
 };
@@ -104,6 +126,27 @@ struct thread_engine
     struct range_array mapped_ranges;
     uint64_t mapping_generation;
     uint64_t resident_binding_id;
+    uint64_t execution_generation;
+    struct xtajit64_flight_recorder *flight_recorder;
+    uint64_t flight_binding_id;
+    uint64_t flight_causal_boundary_id;
+    uint64_t flight_context_generation;
+    uint64_t flight_transition_generation;
+    uint64_t flight_expected_teb;
+    uint64_t flight_claimed_teb;
+    uint64_t flight_guest_rip;
+    uint64_t flight_guest_rsp;
+    uint64_t flight_guest_stack_limit;
+    uint64_t flight_guest_stack_base;
+    uint64_t flight_control_stack_limit;
+    uint64_t flight_control_stack_top;
+    uint64_t flight_pid;
+    uint64_t flight_mach_thread_id;
+    uint64_t flight_pthread_identity;
+    /* Terminal interrupt evidence is captured in the owner callback and
+     * copied into each PROVIDER_STOP record.  It is diagnostic-only and is
+     * never used to drive provider behavior. */
+    uint64_t flight_stop_detail0;
     uint64_t diagnostic_id;
     unsigned int diagnostic_pool_size;
     unsigned int diagnostic_pool_in_use;
@@ -219,6 +262,322 @@ static NTSTATUS process_term( void *args );
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_range_v1) == 40 );
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_event_v1) == 72 );
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_observer_v1) == 40 );
+
+static uint64_t flight_timestamp_from_timespec( const struct timespec *timestamp )
+{
+    uint64_t seconds, nanoseconds, base;
+
+    if (!timestamp || timestamp->tv_sec < 0 || timestamp->tv_nsec < 0 ||
+        timestamp->tv_nsec >= 1000000000 ||
+        (uint64_t)timestamp->tv_sec > UINT64_MAX / UINT64_C(1000000000))
+        return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    seconds = timestamp->tv_sec;
+    nanoseconds = timestamp->tv_nsec;
+    base = seconds * UINT64_C(1000000000);
+    /* UINT64_MAX is the explicit unavailable sentinel, so reject equality as
+     * well as arithmetic overflow rather than returning an ambiguous value. */
+    if (base >= UINT64_MAX - nanoseconds) return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    return base + nanoseconds;
+}
+
+static uint64_t flight_monotonic_timestamp_ns(void)
+{
+    struct timespec timestamp;
+
+    if (clock_gettime( CLOCK_MONOTONIC, &timestamp )) return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    return flight_timestamp_from_timespec( &timestamp );
+}
+
+static uint64_t flight_read_live_x18(void)
+{
+#if defined(__aarch64__) || defined(__arm64__)
+    uint64_t value;
+
+    __asm__ volatile( "mov %0, x18" : "=r" (value) : : "memory" );
+    return value;
+#else
+    return XTAJIT64_FLIGHT_UNKNOWN_U64;
+#endif
+}
+
+static uint64_t flight_read_live_sp(void)
+{
+#if defined(__aarch64__) || defined(__arm64__)
+    uint64_t value;
+
+    __asm__ volatile( "mov %0, sp" : "=r" (value) : : "memory" );
+    return value;
+#else
+    return XTAJIT64_FLIGHT_UNKNOWN_U64;
+#endif
+}
+
+static uint64_t flight_current_frame_address(void)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    void *frame = __builtin_frame_address( 0 );
+
+    return frame ? (uint64_t)(uintptr_t)frame : XTAJIT64_FLIGHT_UNKNOWN_U64;
+#else
+    return XTAJIT64_FLIGHT_UNKNOWN_U64;
+#endif
+}
+
+static uint64_t flight_current_return_address(void)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    void *address = __builtin_return_address( 0 );
+
+    return address ? (uint64_t)(uintptr_t)address : XTAJIT64_FLIGHT_UNKNOWN_U64;
+#else
+    return XTAJIT64_FLIGHT_UNKNOWN_U64;
+#endif
+}
+
+static uint64_t flight_current_pthread_identity(void)
+{
+    pthread_t thread = pthread_self();
+    uint64_t identity = XTAJIT64_FLIGHT_UNKNOWN_U64;
+
+    memcpy( &identity, &thread,
+            sizeof(identity) < sizeof(thread) ? sizeof(identity) : sizeof(thread) );
+    return identity;
+}
+
+static uint64_t flight_current_mach_thread_id(void)
+{
+#ifdef __APPLE__
+    return (uint64_t)pthread_mach_thread_np( pthread_self() );
+#else
+    return XTAJIT64_FLIGHT_UNKNOWN_U64;
+#endif
+}
+
+/* This must be called only by an ordinary Unixlib entry after the dispatcher
+ * has switched ownership of x18 to Darwin.  It describes that Unix/system
+ * side alone; it never claims to observe the ARM64EC caller's pre-switch mode. */
+static uint32_t flight_query_unix_system_x18_mode( BOOL *safe )
+{
+    *safe = FALSE;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__)) && \
+    defined(HAVE_OS_CUSTOM_X18_ABI)
+    if (__builtin_available( macOS 26.4, * ))
+    {
+        *safe = TRUE;
+        return os_custom_x18_abi_enabled() ? XTAJIT64_FLIGHT_X18_MODE_ENABLED :
+                                             XTAJIT64_FLIGHT_X18_MODE_DISABLED;
+    }
+#endif
+    return XTAJIT64_FLIGHT_X18_MODE_UNKNOWN;
+}
+
+static void flight_init_binding_event( struct xtajit64_flight_event *event,
+                                       const struct thread_binding *binding,
+                                       uint32_t type )
+{
+    uint64_t timestamp;
+
+    /* The Unix dispatcher can be entered while a transition stack is under
+     * investigation.  All callers obtain this payload from the recorder's
+     * reentrant scratch pool; do not turn it back into a large C stack local. */
+    xtajit64_flight_event_init( event, type, XTAJIT64_FLIGHT_SOURCE_UNIX_PROVIDER );
+    if (!binding) return;
+    event->binding_id = binding->id;
+    event->causal_boundary_id = binding->flight_causal_boundary_id;
+    event->context_generation = binding->flight_context_generation;
+    event->transition_generation = binding->flight_transition_generation;
+    event->expected_teb = binding->flight_expected_teb;
+    if (binding->flight_expected_teb &&
+        binding->flight_expected_teb != XTAJIT64_FLIGHT_UNKNOWN_U64)
+        event->flags |= XTAJIT64_FLIGHT_FLAG_EXPECTED_TEB_AUTHENTICATED;
+    event->saved_x18_value = binding->flight_claimed_teb;
+    if (binding->flight_claimed_teb != XTAJIT64_FLIGHT_UNKNOWN_U64)
+        event->flags &= ~XTAJIT64_FLIGHT_FLAG_SAVED_X18_UNKNOWN;
+    if (binding->flight_claimed_teb &&
+        binding->flight_claimed_teb != XTAJIT64_FLIGHT_UNKNOWN_U64)
+        event->flags |= XTAJIT64_FLIGHT_FLAG_PE_X18_CLAIM_PRESENT;
+    event->guest_rip = binding->flight_guest_rip;
+    event->guest_rsp = binding->flight_guest_rsp;
+    event->guest_stack_limit = binding->flight_guest_stack_limit;
+    event->guest_stack_base = binding->flight_guest_stack_base;
+    event->control_stack_limit = binding->flight_control_stack_limit;
+    event->control_stack_top = binding->flight_control_stack_top;
+    event->pid = binding->flight_pid;
+    event->mach_thread_id = binding->flight_mach_thread_id;
+    event->pthread_identity = binding->flight_pthread_identity;
+    event->x18_value = flight_read_live_x18();
+    event->native_sp = flight_read_live_sp();
+    event->native_frame = flight_current_frame_address();
+    event->native_pc = flight_current_return_address();
+    timestamp = flight_monotonic_timestamp_ns();
+    if (timestamp != XTAJIT64_FLIGHT_UNKNOWN_U64)
+    {
+        event->monotonic_timestamp_ns = timestamp;
+        event->flags &= ~XTAJIT64_FLIGHT_FLAG_TIME_UNAVAILABLE;
+    }
+}
+
+static void flight_init_engine_event( struct xtajit64_flight_event *event,
+                                      const struct thread_engine *engine,
+                                      uint32_t type )
+{
+    uint64_t timestamp;
+
+    if (!engine || !engine->flight_recorder) return;
+    xtajit64_flight_event_init( event, type, XTAJIT64_FLIGHT_SOURCE_UNIX_PROVIDER );
+    event->binding_id = engine->flight_binding_id;
+    event->causal_boundary_id = engine->flight_causal_boundary_id;
+    event->context_generation = engine->flight_context_generation;
+    event->transition_generation = engine->flight_transition_generation;
+    event->expected_teb = engine->flight_expected_teb;
+    if (engine->flight_expected_teb &&
+        engine->flight_expected_teb != XTAJIT64_FLIGHT_UNKNOWN_U64)
+        event->flags |= XTAJIT64_FLIGHT_FLAG_EXPECTED_TEB_AUTHENTICATED;
+    event->saved_x18_value = engine->flight_claimed_teb;
+    if (engine->flight_claimed_teb != XTAJIT64_FLIGHT_UNKNOWN_U64)
+        event->flags &= ~XTAJIT64_FLIGHT_FLAG_SAVED_X18_UNKNOWN;
+    if (engine->flight_claimed_teb &&
+        engine->flight_claimed_teb != XTAJIT64_FLIGHT_UNKNOWN_U64)
+        event->flags |= XTAJIT64_FLIGHT_FLAG_PE_X18_CLAIM_PRESENT;
+    event->guest_rip = engine->flight_guest_rip;
+    event->guest_rsp = engine->flight_guest_rsp;
+    event->guest_stack_limit = engine->flight_guest_stack_limit;
+    event->guest_stack_base = engine->flight_guest_stack_base;
+    event->control_stack_limit = engine->flight_control_stack_limit;
+    event->control_stack_top = engine->flight_control_stack_top;
+    event->pid = engine->flight_pid;
+    event->mach_thread_id = engine->flight_mach_thread_id;
+    event->pthread_identity = engine->flight_pthread_identity;
+    event->x18_value = flight_read_live_x18();
+    event->native_sp = flight_read_live_sp();
+    event->native_frame = flight_current_frame_address();
+    event->native_pc = flight_current_return_address();
+    timestamp = flight_monotonic_timestamp_ns();
+    if (timestamp != XTAJIT64_FLIGHT_UNKNOWN_U64)
+    {
+        event->monotonic_timestamp_ns = timestamp;
+        event->flags &= ~XTAJIT64_FLIGHT_FLAG_TIME_UNAVAILABLE;
+    }
+    event->engine_id = engine->diagnostic_id;
+    event->engine_generation = engine->execution_generation;
+    event->mapping_generation = engine->mapping_generation;
+    event->x18_expectation = XTAJIT64_FLIGHT_X18_EXPECTATION_NATIVE_SYSTEM;
+    if (type == XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP)
+        event->detail0 = engine->flight_stop_detail0;
+}
+
+static void flight_record_engine_event( struct thread_engine *engine, uint32_t type,
+                                        uint32_t reason, uint32_t stop_reason,
+                                        uint64_t guest_rip, uint64_t guest_rsp )
+{
+    struct xtajit64_flight_recorder *recorder;
+    struct xtajit64_flight_scratch *scratch;
+    struct xtajit64_flight_event *event;
+
+    if (!engine || !(recorder = engine->flight_recorder) ||
+        !xtajit64_flight_recorder_is_active( recorder ))
+        return;
+    if (!(event = xtajit64_flight_acquire_scratch( recorder, &scratch )))
+    {
+        if (reason && xtajit64_flight_recorder_is_active( recorder ))
+            xtajit64_flight_freeze( recorder, reason );
+        return;
+    }
+    flight_init_engine_event( event, engine, type );
+    event->reason = reason;
+    event->stop_reason = stop_reason;
+    if (guest_rip != XTAJIT64_FLIGHT_UNKNOWN_U64) event->guest_rip = guest_rip;
+    if (guest_rsp != XTAJIT64_FLIGHT_UNKNOWN_U64) event->guest_rsp = guest_rsp;
+    if (type == XTAJIT64_FLIGHT_EVENT_SUSPEND_REQUEST)
+    {
+        /* A mutator may be requesting a pause for another thread's engine.
+         * Keep its causal binding ID, but identify the actual requester. */
+        event->mach_thread_id = flight_current_mach_thread_id();
+        event->pthread_identity = flight_current_pthread_identity();
+    }
+    if (reason) xtajit64_flight_record_and_freeze( recorder, event, reason );
+    else xtajit64_flight_record( recorder, event );
+    xtajit64_flight_release_scratch( scratch );
+}
+
+static void flight_record_binding_event( struct thread_binding *binding, uint32_t type,
+                                         uint32_t reason )
+{
+    struct xtajit64_flight_recorder *recorder;
+    struct xtajit64_flight_scratch *scratch;
+    struct xtajit64_flight_event *event;
+
+    if (!binding || !(recorder = binding->flight_recorder) ||
+        !xtajit64_flight_recorder_is_active( recorder ))
+        return;
+    if (!(event = xtajit64_flight_acquire_scratch( recorder, &scratch )))
+    {
+        if (reason && xtajit64_flight_recorder_is_active( recorder ))
+            xtajit64_flight_freeze( recorder, reason );
+        return;
+    }
+    flight_init_binding_event( event, binding, type );
+    event->reason = reason;
+    if (reason) xtajit64_flight_record_and_freeze( recorder, event, reason );
+    else xtajit64_flight_record( recorder, event );
+    xtajit64_flight_release_scratch( scratch );
+}
+
+static uint32_t flight_validate_provider_context( const struct xtajit64_begin_params *params )
+{
+    if (!params) return XTAJIT64_FLIGHT_REASON_CONTEXT_RIP;
+    /* The provider ABI carries a normalized x64 context, not AMD64_CONTEXT,
+     * so context flags/version and FltSave.MxCsr are explicitly unavailable
+     * here.  The PE-side watchdog verifies those source fields. */
+    return xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                             params->context.mxcsr,
+                                             XTAJIT64_FLIGHT_UNKNOWN_U32,
+                                             params->context.rip,
+                                             params->context.rsp,
+                                             XTAJIT64_X64_USER_ADDRESS_MAX,
+                                             params->stack_limit,
+                                             params->stack_base,
+                                             XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                             XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                             XTAJIT64_FLIGHT_UNKNOWN_U64 );
+}
+
+static void flight_record_context_event( struct thread_engine *engine, uint32_t type,
+                                         const struct xtajit64_begin_params *params,
+                                         uint32_t reason )
+{
+    struct xtajit64_flight_recorder *recorder;
+    struct xtajit64_flight_scratch *scratch;
+    struct xtajit64_flight_event *event;
+
+    if (!engine || !params || !(recorder = engine->flight_recorder) ||
+        !xtajit64_flight_recorder_is_active( recorder ))
+        return;
+    if (!reason) reason = flight_validate_provider_context( params );
+    if (!(event = xtajit64_flight_acquire_scratch( recorder, &scratch )))
+    {
+        if (reason && xtajit64_flight_recorder_is_active( recorder ))
+            xtajit64_flight_freeze( recorder, reason );
+        return;
+    }
+    flight_init_engine_event( event, engine, type );
+    event->reason = reason;
+    event->guest_rip = params->context.rip;
+    event->guest_rsp = params->context.rsp;
+    event->guest_stack_limit = params->stack_limit;
+    event->guest_stack_base = params->stack_base;
+    event->mxcsr = params->context.mxcsr;
+    /* CONTEXT_EXPORT carries the normalized terminal provider reason as well
+     * as the context.  Do not copy it into IMPORT: CPU intentionally reuses
+     * begin_params after a MAPPING_MISS retry, so that field may still contain
+     * the preceding output reason rather than an input-side observation. */
+    if (type == XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT)
+        event->stop_reason = params->stop_reason;
+    event->flags |= XTAJIT64_FLIGHT_FLAG_CONTEXT_FLAGS_UNKNOWN;
+    if (reason) xtajit64_flight_record_and_freeze( recorder, event, reason );
+    else xtajit64_flight_record( recorder, event );
+    xtajit64_flight_release_scratch( scratch );
+}
 
 #ifdef XTAJIT64_UNIXLIB_TEST
 static int test_fail_flush_interval_append = -1;
@@ -1032,6 +1391,12 @@ static BOOL any_engine_in_use_locked(void)
 static void request_engine_pause_locked( struct thread_engine *engine )
 {
     if (!engine->running) return;
+    if (engine->flight_recorder)
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_REQUEST,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U32,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U64 );
     atomic_store_explicit( &engine->pause_requested, true, memory_order_release );
     test_mutation_fault_checkpoint( TEST_MUTATION_FAULT_ENGINE_PAUSE );
 }
@@ -1152,8 +1517,17 @@ static BOOL unmapped_ec_target_is_executable( uint64_t address )
 static void stop_at_ec_target( struct thread_engine *engine, uc_engine *uc,
                                uint64_t address )
 {
+    uint64_t rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
+
     engine->transition_target = address;
     engine->stop_reason = XTAJIT64_STOP_EC_TRANSITION;
+    if (engine->flight_recorder &&
+        uc_reg_read( uc, UC_X86_REG_RSP, &rsp ) != UC_ERR_OK)
+        rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
+    if (engine->flight_recorder)
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    XTAJIT64_STOP_EC_TRANSITION, address, rsp );
     uc_emu_stop( uc );
 }
 
@@ -1185,6 +1559,11 @@ static void block_hook( uc_engine *uc, uint64_t address, uint32_t size, void *us
     }
 #endif
     if (!atomic_load_explicit( &engine->pause_requested, memory_order_acquire )) return;
+    if (engine->flight_recorder)
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U32,
+                                    address, XTAJIT64_FLIGHT_UNKNOWN_U64 );
 #ifdef XTAJIT64_UNIXLIB_TEST
     if (!pthread_equal( engine->owner, pthread_self() ))
         atomic_store_explicit( &test_pause_stop_owner_violation, 1, memory_order_relaxed );
@@ -1196,17 +1575,47 @@ static void block_hook( uc_engine *uc, uint64_t address, uint32_t size, void *us
 static void syscall_hook( uc_engine *uc, void *user )
 {
     struct thread_engine *engine = user;
+    uint64_t rip = XTAJIT64_FLIGHT_UNKNOWN_U64;
+    uint64_t rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
 
     engine->stop_reason = XTAJIT64_STOP_SYSCALL;
+    if (engine->flight_recorder)
+    {
+        if (uc_reg_read( uc, UC_X86_REG_RIP, &rip ) != UC_ERR_OK)
+            rip = XTAJIT64_FLIGHT_UNKNOWN_U64;
+        if (uc_reg_read( uc, UC_X86_REG_RSP, &rsp ) != UC_ERR_OK)
+            rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
+    }
+    if (engine->flight_recorder)
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    XTAJIT64_STOP_SYSCALL, rip, rsp );
     uc_emu_stop( uc );
 }
 
 static void interrupt_hook( uc_engine *uc, uint32_t intno, void *user )
 {
     struct thread_engine *engine = user;
+    uint64_t rip = XTAJIT64_FLIGHT_UNKNOWN_U64;
+    uint64_t rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
 
     engine->stop_reason = intno == 0x2e ? XTAJIT64_STOP_SYSCALL :
                                          XTAJIT64_STOP_INVALID_INSTRUCTION;
+    if (engine->flight_recorder &&
+        xtajit64_flight_recorder_is_active( engine->flight_recorder ))
+    {
+        /* UC_HOOK_INTR runs after Unicorn advances RIP past INT.  Preserve
+         * both that exact register pair and the interrupt number instead of
+         * reducing every non-2e interrupt to the same stop-reason enum. */
+        engine->flight_stop_detail0 = intno;
+        if (uc_reg_read( uc, UC_X86_REG_RIP, &rip ) != UC_ERR_OK)
+            rip = XTAJIT64_FLIGHT_UNKNOWN_U64;
+        if (uc_reg_read( uc, UC_X86_REG_RSP, &rsp ) != UC_ERR_OK)
+            rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    engine->stop_reason, rip, rsp );
+    }
     uc_emu_stop( uc );
 }
 
@@ -1488,6 +1897,26 @@ static uc_err acquire_pool_engine_locked( struct thread_binding *binding,
     engine->resident_binding_id = 0;
     engine->owner = pthread_self();
     engine->in_use = TRUE;
+    if ((engine->flight_recorder = binding->flight_recorder))
+    {
+        engine->flight_binding_id = binding->id;
+        engine->flight_causal_boundary_id = binding->flight_causal_boundary_id;
+        engine->flight_context_generation = binding->flight_context_generation;
+        engine->flight_transition_generation = binding->flight_transition_generation;
+        engine->flight_expected_teb = binding->flight_expected_teb;
+        engine->flight_claimed_teb = binding->flight_claimed_teb;
+        engine->flight_guest_rip = binding->flight_guest_rip;
+        engine->flight_guest_rsp = binding->flight_guest_rsp;
+        engine->flight_guest_stack_limit = binding->flight_guest_stack_limit;
+        engine->flight_guest_stack_base = binding->flight_guest_stack_base;
+        engine->flight_control_stack_limit = binding->flight_control_stack_limit;
+        engine->flight_control_stack_top = binding->flight_control_stack_top;
+        engine->flight_pid = binding->flight_pid;
+        engine->flight_mach_thread_id = binding->flight_mach_thread_id;
+        engine->flight_pthread_identity = binding->flight_pthread_identity;
+        engine->flight_stop_detail0 = XTAJIT64_FLIGHT_UNKNOWN_U64;
+        if (!(++engine->execution_generation)) ++engine->execution_generation;
+    }
     ++provider.engines_in_use;
     provider.engine_high_water = max( provider.engine_high_water,
                                       provider.engines_in_use );
@@ -1495,6 +1924,12 @@ static uc_err acquire_pool_engine_locked( struct thread_binding *binding,
     engine->diagnostic_pool_in_use = provider.engines_in_use;
     engine->diagnostic_pool_high_water = provider.engine_high_water;
     binding->active = TRUE;
+    if (engine->flight_recorder)
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_ENGINE_ACQUIRE,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U32,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U64 );
 #ifdef XTAJIT64_UNIXLIB_TEST
     test_last_acquired_engine = engine;
 #endif
@@ -1517,7 +1952,32 @@ static uc_err release_pool_engine_locked( struct thread_binding *binding,
             engine->resident_binding_id = binding->id;
         }
     }
-    else engine->resident_binding_id = 0;
+    if (engine->flight_recorder)
+    {
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_ENGINE_RELEASE,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U32,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U64 );
+        engine->flight_recorder = NULL;
+        engine->flight_binding_id = 0;
+        engine->flight_causal_boundary_id = 0;
+        engine->flight_context_generation = 0;
+        engine->flight_transition_generation = 0;
+        engine->flight_expected_teb = 0;
+        engine->flight_claimed_teb = 0;
+        engine->flight_guest_rip = 0;
+        engine->flight_guest_rsp = 0;
+        engine->flight_guest_stack_limit = 0;
+        engine->flight_guest_stack_base = 0;
+        engine->flight_control_stack_limit = 0;
+        engine->flight_control_stack_top = 0;
+        engine->flight_pid = 0;
+        engine->flight_mach_thread_id = 0;
+        engine->flight_pthread_identity = 0;
+        engine->flight_stop_detail0 = 0;
+    }
+    if (!save_context) engine->resident_binding_id = 0;
     engine->running = FALSE;
     engine->in_use = FALSE;
     --provider.engines_in_use;
@@ -2284,6 +2744,167 @@ static NTSTATUS thread_term( void *args )
     return STATUS_SUCCESS;
 }
 
+static void clear_flight_binding( struct thread_binding *binding )
+{
+    binding->flight_recorder = NULL;
+    binding->flight_causal_boundary_id = 0;
+    binding->flight_context_generation = 0;
+    binding->flight_transition_generation = 0;
+    binding->flight_expected_teb = 0;
+    binding->flight_claimed_teb = 0;
+    binding->flight_guest_rip = 0;
+    binding->flight_guest_rsp = 0;
+    binding->flight_guest_stack_limit = 0;
+    binding->flight_guest_stack_base = 0;
+    binding->flight_control_stack_limit = 0;
+    binding->flight_control_stack_top = 0;
+    binding->flight_last_context_generation = 0;
+    binding->flight_pid = 0;
+    binding->flight_mach_thread_id = 0;
+    binding->flight_pthread_identity = 0;
+}
+
+static NTSTATUS flight_bind( void *args )
+{
+    const struct xtajit64_flight_bind_params *params = args;
+    struct thread_binding *binding;
+    const struct mapped_range *range;
+    uint64_t offset, unix_teb;
+    BOOL mode_safe;
+    BOOL stale_context_generation = FALSE;
+    uint32_t mode, reason, teb_reason = XTAJIT64_FLIGHT_REASON_NONE;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    pthread_once( &engine_key_once, make_engine_key );
+    if (engine_key_error || !(binding = pthread_getspecific( engine_key )))
+        return STATUS_INVALID_HANDLE;
+    if (!params) return STATUS_INVALID_PARAMETER;
+    if (!params->recorder)
+    {
+        /* An unbind also crosses recorder lifetime boundaries.  Keep it under
+         * the same lock/instance validation as a non-null bind instead of
+         * leaving a stale association visible during provider teardown. */
+        pthread_mutex_lock( &provider.mutex );
+        while (provider.mutating && provider.initialized)
+            pthread_cond_wait( &provider.cond, &provider.mutex );
+        if (!provider.initialized || provider.shutting_down ||
+            binding->process_instance != provider.instance)
+            status = STATUS_INVALID_HANDLE;
+        else if (binding->active) status = STATUS_INVALID_DEVICE_STATE;
+        else clear_flight_binding( binding );
+        pthread_mutex_unlock( &provider.mutex );
+        return status;
+    }
+    if ((params->recorder & 63) || !params->causal_boundary_id ||
+        params->recorder > XTAJIT64_X64_USER_ADDRESS_MAX ||
+        params->recorder > UINT64_MAX - sizeof(*binding->flight_recorder))
+        return STATUS_INVALID_PARAMETER;
+
+    /* This opt-in call validates process lifetime and canonical mapping on
+     * every bind.  It deliberately takes the provider mutex rather than
+     * relying on a same-pointer fast path across process teardown/reuse. */
+    pthread_mutex_lock( &provider.mutex );
+    while (provider.mutating && provider.initialized)
+        pthread_cond_wait( &provider.cond, &provider.mutex );
+    if (!provider.initialized || provider.shutting_down ||
+        binding->process_instance != provider.instance)
+        status = STATUS_INVALID_HANDLE;
+    else if (binding->active) status = STATUS_INVALID_DEVICE_STATE;
+    else if (!(range = find_canonical_mapping( params->recorder,
+                                                sizeof(*binding->flight_recorder),
+                                                UC_PROT_READ | UC_PROT_WRITE )) ||
+             range->domain != XTAJIT64_MEMORY_ADDRESS_IDENTITY ||
+             params->recorder < range->guest ||
+             (offset = params->recorder - range->guest) > range->size ||
+             range->host > UINT64_MAX - offset || range->host + offset != params->recorder)
+        status = STATUS_INVALID_ADDRESS;
+    else if (!xtajit64_flight_recorder_is_valid(
+                 (const struct xtajit64_flight_recorder *)(uintptr_t)params->recorder ))
+        status = STATUS_REVISION_MISMATCH;
+    else
+    {
+        if (binding->flight_recorder !=
+            (struct xtajit64_flight_recorder *)(uintptr_t)params->recorder)
+        {
+            binding->flight_last_context_generation = 0;
+            /* Diagnostic identity is sampled only after a non-null opt-in
+             * binding has passed lifetime/mapping validation. */
+            binding->flight_pid = (uint64_t)getpid();
+            binding->flight_mach_thread_id = flight_current_mach_thread_id();
+            binding->flight_pthread_identity = flight_current_pthread_identity();
+        }
+        stale_context_generation = params->context_generation &&
+            binding->flight_last_context_generation &&
+            params->context_generation <= binding->flight_last_context_generation;
+        binding->flight_recorder =
+            (struct xtajit64_flight_recorder *)(uintptr_t)params->recorder;
+        binding->flight_causal_boundary_id = params->causal_boundary_id;
+        binding->flight_context_generation = params->context_generation;
+        binding->flight_transition_generation = params->transition_generation;
+        /* WINE_UNIX_LIB NtCurrentTeb() is backed by Unix thread data rather
+         * than the ARM64EC x18 register.  It is the independent authority for
+         * this handshake; never use a fresh PE-side NtCurrentTeb() as both
+         * sides of a numeric x18 comparison. */
+        unix_teb = (uint64_t)(uintptr_t)NtCurrentTeb();
+        teb_reason = xtajit64_flight_validate_pe_x18_claim( params->claimed_teb, unix_teb );
+        binding->flight_expected_teb = unix_teb;
+        binding->flight_claimed_teb = params->claimed_teb;
+        __atomic_store_n( &binding->flight_recorder->authenticated_teb, unix_teb,
+                          __ATOMIC_RELEASE );
+        binding->flight_guest_rip = params->guest_rip;
+        binding->flight_guest_rsp = params->guest_rsp;
+        binding->flight_guest_stack_limit = params->guest_stack_limit;
+        binding->flight_guest_stack_base = params->guest_stack_base;
+        binding->flight_control_stack_limit = params->control_stack_limit;
+        binding->flight_control_stack_top = params->control_stack_top;
+        if (params->context_generation > binding->flight_last_context_generation)
+            binding->flight_last_context_generation = params->context_generation;
+    }
+    pthread_mutex_unlock( &provider.mutex );
+    if (status) return status;
+
+    flight_record_binding_event( binding, XTAJIT64_FLIGHT_EVENT_BINDING,
+                                 teb_reason ? teb_reason :
+                                 stale_context_generation ?
+                                 XTAJIT64_FLIGHT_REASON_CONTEXT_STALE_PUBLICATION :
+                                 XTAJIT64_FLIGHT_REASON_NONE );
+    if (!xtajit64_flight_recorder_is_active( binding->flight_recorder ))
+        return STATUS_SUCCESS;
+    /* Native-system validity depends only on the separately queried ABI mode,
+     * not on the numeric x18 sample.  Query/validate it before acquiring a
+     * payload so scratch exhaustion cannot hide an enabled-mode violation. */
+    mode = flight_query_unix_system_x18_mode( &mode_safe );
+    reason = xtajit64_flight_validate_x18(
+        mode, XTAJIT64_FLIGHT_X18_EXPECTATION_NATIVE_SYSTEM,
+        XTAJIT64_FLIGHT_UNKNOWN_U64, XTAJIT64_FLIGHT_UNKNOWN_U64 );
+    {
+        struct xtajit64_flight_recorder *recorder = binding->flight_recorder;
+        struct xtajit64_flight_scratch *scratch;
+        struct xtajit64_flight_event *event;
+
+        if (!(event = xtajit64_flight_acquire_scratch( recorder, &scratch )))
+        {
+            if (reason && xtajit64_flight_recorder_is_active( recorder ))
+                xtajit64_flight_freeze( recorder, reason );
+        }
+        else
+        {
+            flight_init_binding_event( event, binding,
+                                       XTAJIT64_FLIGHT_EVENT_UNIX_ENTERED_SYSTEM_MODE );
+            event->custom_x18_mode = mode;
+            event->x18_expectation = XTAJIT64_FLIGHT_X18_EXPECTATION_NATIVE_SYSTEM;
+            if (mode_safe)
+                event->flags = (event->flags | XTAJIT64_FLIGHT_FLAG_MODE_QUERY_SAFE) &
+                               ~XTAJIT64_FLIGHT_FLAG_EXECUTION_MODE_UNKNOWN;
+            event->reason = reason;
+            if (reason) xtajit64_flight_record_and_freeze( recorder, event, reason );
+            else xtajit64_flight_record( recorder, event );
+            xtajit64_flight_release_scratch( scratch );
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS memory_map_internal( void *args )
 {
     const struct xtajit64_memory_params *params = args;
@@ -2891,6 +3512,12 @@ static uc_err synchronize_engine_registry_locked( struct thread_engine *engine )
     memset( &retained, 0, sizeof(retained) );
     range_array_free( &old );
     engine->mapping_generation = provider.generation;
+    if (engine->flight_recorder)
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_MAPPING_GENERATION,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U32,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U64 );
     if (!(engine->registry_sync_calls & (engine->registry_sync_calls - 1)))
         trace_mapping_diagnostic( engine, "sync", 0 );
 
@@ -3287,7 +3914,7 @@ static NTSTATUS begin_simulation( void *args )
     uc_err err = UC_ERR_OK, read_err = UC_ERR_OK, context_err = UC_ERR_OK;
     NTSTATUS status = STATUS_SUCCESS;
     uint64_t next_rip;
-    BOOL resume;
+    BOOL resume, reentering = FALSE;
 
     if (!params || !params->context.rip ||
         params->context.rip > XTAJIT64_X64_USER_ADDRESS_MAX ||
@@ -3366,6 +3993,9 @@ static NTSTATUS begin_simulation( void *args )
         engine->mapping_error = UC_ERR_OK;
         engine->stop_reason = XTAJIT64_STOP_NONE;
         atomic_store_explicit( &engine->pause_requested, false, memory_order_release );
+        if (engine->flight_recorder)
+            flight_record_context_event( engine, XTAJIT64_FLIGHT_EVENT_CONTEXT_IMPORT,
+                                         params, XTAJIT64_FLIGHT_REASON_NONE );
         engine->running = TRUE;
         pthread_mutex_unlock( &provider.mutex );
 
@@ -3375,6 +4005,15 @@ static NTSTATUS begin_simulation( void *args )
 #ifdef XTAJIT64_UNIXLIB_TEST
             atomic_fetch_add_explicit( &test_emu_start_count, 1, memory_order_relaxed );
 #endif
+            if (engine->flight_recorder)
+                flight_record_engine_event( engine,
+                                            reentering ? XTAJIT64_FLIGHT_EVENT_PROVIDER_RESUME :
+                                                         XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN,
+                                            XTAJIT64_FLIGHT_REASON_NONE,
+                                            XTAJIT64_FLIGHT_UNKNOWN_U32, next_rip,
+                                            params->context.rsp );
+            if (engine->flight_recorder)
+                engine->flight_stop_detail0 = XTAJIT64_FLIGHT_UNKNOWN_U64;
             err = uc_emu_start( engine->uc, next_rip, UINT64_MAX, 0, 0 );
             pthread_mutex_lock( &provider.mutex );
             if (engine->stop_reason == XTAJIT64_STOP_INTERNAL_ERROR &&
@@ -3402,6 +4041,13 @@ static NTSTATUS begin_simulation( void *args )
                     if (!atomic_load_explicit( &engine->pause_requested,
                                                 memory_order_acquire ))
                     {
+                        if (engine->flight_recorder)
+                            flight_record_engine_event( engine,
+                                                        XTAJIT64_FLIGHT_EVENT_PROVIDER_RESUME,
+                                                        XTAJIT64_FLIGHT_REASON_NONE,
+                                                        XTAJIT64_STOP_SYSCALL, next_rip,
+                                                        XTAJIT64_FLIGHT_UNKNOWN_U64 );
+                        reentering = TRUE;
                         pthread_mutex_unlock( &provider.mutex );
                         continue;
                     }
@@ -3424,6 +4070,7 @@ static NTSTATUS begin_simulation( void *args )
 
             if (resume)
             {
+                reentering = TRUE;
                 engine->running = FALSE;
                 pthread_cond_broadcast( &provider.cond );
             }
@@ -3452,6 +4099,18 @@ static NTSTATUS begin_simulation( void *args )
                     params->stop_reason = err == UC_ERR_INSN_INVALID ?
                                           XTAJIT64_STOP_INVALID_INSTRUCTION :
                                           XTAJIT64_STOP_INTERNAL_ERROR;
+                /* Record only after the ordinary terminal normalization.  In
+                 * particular, uc_emu_start() returning UC_ERR_INSN_INVALID
+                 * must not be published as an ambiguous STOP_NONE event. */
+                if (engine->flight_recorder)
+                {
+                    flight_record_context_event( engine, XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT,
+                                                 params, XTAJIT64_FLIGHT_REASON_NONE );
+                    flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP,
+                                                XTAJIT64_FLIGHT_REASON_NONE,
+                                                params->stop_reason, params->context.rip,
+                                                params->context.rsp );
+                }
                 if (!status && params->stop_reason == XTAJIT64_STOP_INTERNAL_ERROR)
                 {
                     poison_provider_locked( STATUS_UNSUCCESSFUL );
@@ -3499,6 +4158,7 @@ static NTSTATUS unicorn_not_supported( void *args )
 #define flush_instruction_cache  unicorn_not_supported
 #define poison                   unicorn_not_supported
 #define begin_simulation         unicorn_not_supported
+#define flight_bind              unicorn_not_supported
 
 #endif /* HAVE_UNICORN */
 
@@ -3517,6 +4177,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     begin_simulation,
     memory_resync_begin,
     memory_translate,
+    flight_bind,
 };
 
 C_ASSERT( ARRAY_SIZE(__wine_unix_call_funcs) == unix_funcs_count );
