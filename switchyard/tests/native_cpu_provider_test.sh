@@ -145,8 +145,8 @@ source "$PROFILE_LIBRARY"
 source "$PROVIDER_LIBRARY"
 switchyard_load_runtime_profile preview-native-arm64-fex
 
-[ "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" = 6 ] ||
-  fail "x64 provider validator ABI version is not v6"
+[ "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" = 8 ] ||
+  fail "x64 provider validator ABI version is not v8"
 [ "$(/usr/bin/grep -Fc "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" \
   "$ROOT_DIR/dlls/xtajit64/unixlib.h")" -eq 1 ] ||
   fail "x64 provider header and validator ABI identities differ"
@@ -226,7 +226,7 @@ extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
 __attribute__((used, visibility("default"))) const char
     switchyard_xtajit64_fixture_abi_identity[] =
-        "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464";
+        "switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-464";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);
@@ -515,7 +515,7 @@ path, identity = sys.argv[1:]
 with open(path, "rb") as stream:
     value = stream.read()
 old = identity.encode("ascii")
-new = old.replace(b"-v6-", b"-v5-", 1)
+new = old.replace(b"-v8-", b"-v7-", 1)
 if new == old or value.count(old) != 1:
     raise SystemExit("fixture x64 provider ABI marker is not unique")
 with open(path, "wb") as stream:

@@ -223,7 +223,7 @@ extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
 __attribute__((used, visibility("default"))) const char
     switchyard_xtajit64_fixture_abi_identity[] =
-        "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464";
+        "switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-464";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);

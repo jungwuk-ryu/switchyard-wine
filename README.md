@@ -88,6 +88,7 @@ signing, notarization, and available regression checks.
 
 - [Documentation index](docs/README.md)
 - [Architecture and repository boundaries](docs/architecture.md)
+- [ARM64EC transition diagnostics](docs/arm64-transition-diagnostics.md)
 - [Building and releasing the runtime](docs/building.md)
 - [MSIX and packaged desktop support](docs/msix.md)
 - [Recorded application compatibility](docs/compatibility.md)

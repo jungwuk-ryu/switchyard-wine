@@ -10,6 +10,9 @@ below.
 - [`architecture.md`](architecture.md) explains what this repository owns, how
   it stays separate from the Switchyard app and user-provided Apple software,
   and how a generated runtime identifies itself.
+- [`arm64-transition-diagnostics.md`](arm64-transition-diagnostics.md) explains
+  the opt-in ARM64EC transition flight recorder and its `CONTEXT` and x18/TEB
+  watchdogs, including safe capture, interpretation, and validation.
 - [`building.md`](building.md) covers the Apple Silicon build, verified external
   inputs, runtime promotion, signing, notarization, and regression checks.
 - [`hdr-edr.md`](hdr-edr.md) defines display-colour semantics, HDR/EDR provider
