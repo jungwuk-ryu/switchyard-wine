@@ -71,7 +71,7 @@ def main() -> int:
     for token in (
         "ldr x15, [x0, #0x848]",
         "cmp x16, x17",
-        "movz x9, #0x5fc0",
+        "movz x9, #0x6880",
         "cmp x16, x15",
         "str x18, [x0, #0x870]",
         "mov sp, x16",
@@ -132,6 +132,32 @@ def main() -> int:
                               violation)
     if not candidate < mismatch < exact < violation < mismatch_abort:
         raise AssertionError("continuation watchdog runs before the complete frame search")
+    stack_bounds = function_body(source, "get_x64_stack_bounds")
+    disabled_gate = stack_bounds.find("if (!result)")
+    disabled_translate = stack_bounds.find("guest_range_to_host(", disabled_gate)
+    diagnostic_init = stack_bounds.find("memset( result", disabled_translate)
+    unix_translate = stack_bounds.find("XTAJIT64_CALL( memory_translate", diagnostic_init)
+    post_translate_teb = stack_bounds.find("teb = NtCurrentTeb();", unix_translate)
+    if not (disabled_gate < disabled_translate < diagnostic_init < unix_translate <
+            post_translate_teb):
+        raise AssertionError(
+            "transition-stack diagnostics changed the recorder-disabled predicate or "
+            "missed the post-Unixlib TEB sample"
+        )
+    require(run, "get_x64_stack_bounds(", "run_x64_simulation")
+    require(run, "flight_record_transition_stack_violation(", "run_x64_simulation")
+    stack_probe = run.find("get_x64_stack_bounds(")
+    stack_record = run.find("flight_record_transition_stack_violation(")
+    stack_abort = run.find('"invalid semantic x64 stack"')
+    if not stack_probe < stack_record < stack_abort:
+        raise AssertionError("transition-stack evidence is not frozen before terminal abort")
+    classifier = function_body(source, "flight_record_transition_stack_violation")
+    for token in (
+        "xtajit64_flight_classify_transition_stack(",
+        "xtajit64_flight_record_transition_stack_violation_and_freeze(",
+        "violation.frames[index]",
+    ):
+        require(classifier, token, "flight_record_transition_stack_violation")
     require(function_body(source, "xtajit64_capture_native"),
             r'b \"#xtajit64_transition_from_native\"', "xtajit64_capture_native")
     capture = function_body(source, "capture_transition")

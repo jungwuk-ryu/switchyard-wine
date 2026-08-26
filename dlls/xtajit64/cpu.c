@@ -890,28 +890,120 @@ static NTSTATUS write_guest_u64( UINT64 guest, UINT64 value )
     return status;
 }
 
-static BOOL get_x64_stack_bounds( UINT64 rsp, UINT64 *limit, UINT64 *base )
+struct xtajit64_x64_stack_probe
 {
-    CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
-    ULONG_PTR host_rsp;
+    UINT64 fresh_teb;
+    UINT64 fresh_cpu;
+    UINT64 translated_guest;
+    UINT64 host_rsp;
+    UINT64 allocation_base;
+    UINT64 emulator_stack_limit;
+    UINT64 emulator_stack_base;
+    UINT64 teb_stack_limit;
+    UINT64 teb_stack_base;
+    UINT32 translation_status;
+    UINT32 translation_domain;
+    UINT32 stack_match_mask;
+    BOOL probe_ran;
+};
 
-    if (!cpu || !guest_range_to_host( rsp, sizeof(UINT64),
-                                      XTAJIT64_MEMORY_TRANSLATE_REQUIRE_READ,
-                                      &host_rsp )) return FALSE;
-    if (host_rsp >= cpu->EmulatorStackLimit && host_rsp < cpu->EmulatorStackBase)
+static BOOL get_x64_stack_bounds( UINT64 rsp, UINT64 *limit, UINT64 *base,
+                                  struct xtajit64_x64_stack_probe *result )
+{
+    struct xtajit64_memory_translate_params params =
     {
+        .address = rsp,
+        .size = sizeof(UINT64),
+        .flags = XTAJIT64_MEMORY_TRANSLATE_GUEST_TO_HOST |
+                 XTAJIT64_MEMORY_TRANSLATE_REQUIRE_READ,
+    };
+    TEB *teb;
+    CHPE_V2_CPU_AREA_INFO *cpu;
+    ULONG_PTR host_rsp;
+    NTSTATUS status;
+    UINT32 stack_match_mask = 0;
+
+    /* Keep the recorder-disabled path identical to the production predicate.
+     * In particular, do not move the post-Unixlib NtCurrentTeb() reads across
+     * memory_translate: x18 preservation at that boundary is one of the
+     * invariants this diagnostic exists to observe. */
+    if (!result)
+    {
+        cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+        if (!cpu || !guest_range_to_host( rsp, sizeof(UINT64),
+                                          XTAJIT64_MEMORY_TRANSLATE_REQUIRE_READ,
+                                          &host_rsp )) return FALSE;
+        if (host_rsp >= cpu->EmulatorStackLimit && host_rsp < cpu->EmulatorStackBase)
+        {
+            *limit = cpu->EmulatorStackLimit;
+            *base = cpu->EmulatorStackBase;
+            return TRUE;
+        }
+        if (host_rsp >= (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit &&
+            host_rsp < (ULONG_PTR)NtCurrentTeb()->Tib.StackBase)
+        {
+            *limit = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
+            *base = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    memset( result, 0xff, sizeof(*result) );
+    result->fresh_cpu = 0;
+    result->stack_match_mask = 0;
+    result->probe_ran = FALSE;
+    teb = NtCurrentTeb();
+    result->fresh_teb = (ULONG_PTR)teb;
+    if (!teb || !(cpu = teb->ChpeV2CpuAreaInfo)) return FALSE;
+    result->fresh_cpu = (ULONG_PTR)cpu;
+    result->emulator_stack_limit = cpu->EmulatorStackLimit;
+    result->emulator_stack_base = cpu->EmulatorStackBase;
+    result->probe_ran = TRUE;
+    if (rsp > XTAJIT64_X64_USER_ADDRESS_MAX ||
+        sizeof(UINT64) - 1 > XTAJIT64_X64_USER_ADDRESS_MAX - rsp)
+        status = STATUS_INVALID_PARAMETER;
+    else if (!__wine_unixlib_handle)
+        status = STATUS_INVALID_HANDLE;
+    else
+        status = XTAJIT64_CALL( memory_translate, &params );
+    result->translation_status = status;
+    result->translated_guest = params.guest;
+    result->host_rsp = params.host;
+    result->allocation_base = params.allocation_base;
+    result->translation_domain = params.domain;
+    if (status || params.guest != rsp) return FALSE;
+
+    if (params.host >= cpu->EmulatorStackLimit && params.host < cpu->EmulatorStackBase)
+    {
+        stack_match_mask |= XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR;
         *limit = cpu->EmulatorStackLimit;
         *base = cpu->EmulatorStackBase;
-        return TRUE;
     }
-    if (host_rsp >= (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit &&
-        host_rsp < (ULONG_PTR)NtCurrentTeb()->Tib.StackBase)
+    /* Sample the live TEB after the Unix call, at the same semantic point as
+     * the original TEB-stack predicate.  On a rejected transition this makes
+     * an x18 boundary failure distinguishable from a valid translation whose
+     * host address simply belongs to neither accepted stack. */
+    teb = NtCurrentTeb();
+    result->fresh_teb = (ULONG_PTR)teb;
+    result->fresh_cpu = teb ? (ULONG_PTR)teb->ChpeV2CpuAreaInfo : 0;
+    if (teb)
     {
-        *limit = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
-        *base = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
-        return TRUE;
+        result->teb_stack_limit = (ULONG_PTR)teb->Tib.StackLimit;
+        result->teb_stack_base = (ULONG_PTR)teb->Tib.StackBase;
+        if (params.host >= (ULONG_PTR)teb->Tib.StackLimit &&
+            params.host < (ULONG_PTR)teb->Tib.StackBase)
+        {
+            stack_match_mask |= XTAJIT64_FLIGHT_STACK_MATCH_TEB;
+            if (!(stack_match_mask & XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR))
+            {
+                *limit = (ULONG_PTR)teb->Tib.StackLimit;
+                *base = (ULONG_PTR)teb->Tib.StackBase;
+            }
+        }
     }
-    return FALSE;
+    result->stack_match_mask = stack_match_mask;
+    return !!stack_match_mask;
 }
 
 /* The opt-in is sampled once during ProcessInit.  Individual transitions only
@@ -1014,6 +1106,7 @@ static BOOL flight_cpu_event_requires_control_stack( UINT32 type )
     case XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_POP:
     case XTAJIT64_FLIGHT_EVENT_TRANSITION_UNWIND:
     case XTAJIT64_FLIGHT_EVENT_TRANSITION_RECONCILE:
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_STACK_CLASSIFY:
         return TRUE;
     default:
         return FALSE;
@@ -1167,6 +1260,90 @@ static BOOL flight_record_cpu_event( struct xtajit64_thread_state *state,
     else recorded = !!xtajit64_flight_record( recorder, event );
     xtajit64_flight_release_scratch( scratch );
     return recorded;
+}
+
+static void flight_record_transition_stack_violation(
+    struct xtajit64_thread_state *state, const ARM64EC_NT_CONTEXT *ec_context,
+    const AMD64_CONTEXT *context, const TEB *expected_teb,
+    const CHPE_V2_CPU_AREA_INFO *expected_cpu, UINT64 gs_base,
+    const struct xtajit64_x64_stack_probe *probe )
+{
+    struct xtajit64_flight_transition_stack_violation violation;
+    struct xtajit64_flight_recorder *recorder;
+    struct xtajit64_flight_scratch *scratch;
+    struct xtajit64_flight_event *event;
+    UINT32 count, index, reject;
+
+    if (!state || !probe) return;
+    if (!(event = flight_acquire_cpu_event( state, &recorder, &scratch )))
+    {
+        if (recorder && xtajit64_flight_recorder_is_active( recorder ))
+            xtajit64_flight_freeze( recorder,
+                                   XTAJIT64_FLIGHT_REASON_TRANSITION_STACK );
+        return;
+    }
+
+    memset( &violation, 0xff, sizeof(violation) );
+    violation.guest_rip = context ? context->Rip : XTAJIT64_FLIGHT_UNKNOWN_U64;
+    violation.guest_rsp = context ? context->Rsp : XTAJIT64_FLIGHT_UNKNOWN_U64;
+    violation.gs_base = gs_base;
+    violation.expected_teb = (ULONG_PTR)expected_teb;
+    violation.fresh_teb = probe->fresh_teb;
+    violation.expected_cpu = (ULONG_PTR)expected_cpu;
+    violation.fresh_cpu = probe->fresh_cpu;
+    violation.translated_guest = probe->translated_guest;
+    violation.host_rsp = probe->host_rsp;
+    violation.allocation_base = probe->allocation_base;
+    violation.emulator_stack_limit = probe->emulator_stack_limit;
+    violation.emulator_stack_base = probe->emulator_stack_base;
+    violation.teb_stack_limit = probe->teb_stack_limit;
+    violation.teb_stack_base = probe->teb_stack_base;
+    violation.causal_boundary_id = state->flight_causal_boundary_id;
+    violation.context_generation = state->flight_context_generation;
+    violation.transition_generation = state->flight_transition_generation;
+    violation.translation_status = probe->probe_ran ? probe->translation_status :
+                                                     XTAJIT64_FLIGHT_UNKNOWN_U32;
+    violation.translation_domain = probe->probe_ran ? probe->translation_domain :
+                                                     XTAJIT64_FLIGHT_UNKNOWN_U32;
+    violation.stack_match_mask = probe->stack_match_mask;
+    violation.capture_kind = state->capture_kind;
+    violation.depth = state->depth;
+    count = min( state->depth, XTAJIT64_FLIGHT_MAX_TRANSITION_FRAMES );
+    violation.frame_count = count;
+    violation.reserved = XTAJIT64_FLIGHT_UNKNOWN_U32;
+    for (index = 0; index < count; ++index)
+    {
+        const struct xtajit64_transition_frame *frame = &state->frames[index];
+        struct xtajit64_flight_transition_frame_snapshot *snapshot =
+            &violation.frames[index];
+
+        snapshot->guest_rsp = frame->guest_rsp;
+        snapshot->native_sp = frame->native_sp;
+        snapshot->native_pc = frame->native_pc;
+        snapshot->kind = frame->kind;
+        snapshot->depth = index + 1;
+    }
+    reject = xtajit64_flight_classify_transition_stack(
+        violation.guest_rip, violation.guest_rsp, violation.gs_base,
+        XTAJIT64_X64_USER_ADDRESS_MAX, violation.expected_teb,
+        violation.fresh_teb, violation.expected_cpu, violation.fresh_cpu,
+        probe->probe_ran, violation.translation_status,
+        violation.translated_guest, violation.stack_match_mask, violation.depth );
+    violation.reject_mask = reject;
+
+    flight_init_cpu_event( event, state, ec_context, context,
+                           XTAJIT64_FLIGHT_UNKNOWN_U64,
+                           XTAJIT64_FLIGHT_UNKNOWN_U64,
+                           XTAJIT64_FLIGHT_EVENT_TRANSITION_STACK_CLASSIFY );
+    event->reason = XTAJIT64_FLIGHT_REASON_TRANSITION_STACK;
+    event->detail0 = reject;
+    event->detail1 = (UINT64)violation.translation_status |
+                     (UINT64)violation.stack_match_mask << 32;
+    event->transition_depth_before = state->depth;
+    event->transition_depth_after = state->depth;
+    xtajit64_flight_record_transition_stack_violation_and_freeze(
+        recorder, event, &violation );
+    xtajit64_flight_release_scratch( scratch );
 }
 
 /* Frame records are a distinct diagnostic contract.  Do not overload a
@@ -1369,6 +1546,7 @@ static const char *flight_event_type_name( UINT32 type )
     case XTAJIT64_FLIGHT_EVENT_MAPPING_GENERATION: return "mapping-generation";
     case XTAJIT64_FLIGHT_EVENT_SUSPEND_REQUEST: return "suspend-request";
     case XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED: return "suspend-ack";
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_STACK_CLASSIFY: return "transition-stack-classify";
     case XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION: return "watchdog";
     default: return "unknown";
     }
@@ -1468,6 +1646,60 @@ static void flight_dump_event( const char *prefix, const struct xtajit64_flight_
          (unsigned int)!!(event->flags & XTAJIT64_FLIGHT_FLAG_EXPECTED_TEB_AUTHENTICATED) );
 }
 
+static void flight_dump_transition_stack_violation(
+    const struct xtajit64_flight_recorder *recorder )
+{
+    struct xtajit64_flight_transition_stack_violation violation;
+    UINT32 index, reject;
+
+    if (!xtajit64_flight_snapshot_transition_stack_violation( recorder, &violation ))
+        return;
+    reject = violation.reject_mask;
+    ERR( "xtajit64 diagnostic transition-stack-classify reject %#x "
+         "rip/rsp/gs %u/%u/%u teb/cpu %u/%u translate %u guest %u stack %u "
+         "probe %u depth %u\n",
+         reject,
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_RIP_RANGE),
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_RSP_RANGE),
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_GS_RANGE),
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_TEB_IDENTITY),
+         !!(reject & (XTAJIT64_FLIGHT_STACK_REJECT_CPU_MISSING |
+                      XTAJIT64_FLIGHT_STACK_REJECT_CPU_IDENTITY)),
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_TRANSLATE_STATUS),
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_TRANSLATED_GUEST),
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_STACK_RANGE),
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_PROBE_NOT_RUN),
+         !!(reject & XTAJIT64_FLIGHT_STACK_REJECT_FRAME_DEPTH) );
+    ERR( "xtajit64 diagnostic transition-stack-classify guest rip %#llx rsp %#llx "
+         "gs %#llx expected/fresh teb %#llx/%#llx expected/fresh cpu %#llx/%#llx\n",
+         violation.guest_rip, violation.guest_rsp, violation.gs_base,
+         violation.expected_teb, violation.fresh_teb,
+         violation.expected_cpu, violation.fresh_cpu );
+    ERR( "xtajit64 diagnostic transition-stack-classify translate status %#x "
+         "domain %#x guest %#llx host %#llx allocation %#llx match %#x "
+         "emulator %#llx-%#llx teb %#llx-%#llx\n",
+         violation.translation_status, violation.translation_domain,
+         violation.translated_guest, violation.host_rsp, violation.allocation_base,
+         violation.stack_match_mask, violation.emulator_stack_limit,
+         violation.emulator_stack_base, violation.teb_stack_limit,
+         violation.teb_stack_base );
+    ERR( "xtajit64 diagnostic transition-stack-classify causal %#llx ctx %#llx "
+         "trans %#llx capture %u depth %u frames %u\n",
+         violation.causal_boundary_id, violation.context_generation,
+         violation.transition_generation, violation.capture_kind,
+         violation.depth, violation.frame_count );
+    for (index = 0; index < violation.frame_count; ++index)
+    {
+        const struct xtajit64_flight_transition_frame_snapshot *frame =
+            &violation.frames[index];
+
+        ERR( "xtajit64 diagnostic transition-stack-frame depth %u kind %u "
+             "guest-rsp %#llx native-sp %#llx native-pc %#llx\n",
+             frame->depth, frame->kind, frame->guest_rsp,
+             frame->native_sp, frame->native_pc );
+    }
+}
+
 static void flight_dump_if_frozen( struct xtajit64_thread_state *state, const char *where )
 {
     struct xtajit64_flight_snapshot_metadata metadata;
@@ -1520,6 +1752,7 @@ static void flight_dump_if_frozen( struct xtajit64_thread_state *state, const ch
     if (metadata.first_violation_available &&
         xtajit64_flight_snapshot_first_violation( recorder, event ))
         flight_dump_event( "first-violation", event );
+    flight_dump_transition_stack_violation( recorder );
     for (sequence = metadata.first_sequence;
          sequence && sequence <= metadata.last_sequence;
          ++sequence)
@@ -1870,6 +2103,7 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
 {
     CHPE_V2_CPU_AREA_INFO *cpu;
     ARM64EC_NT_CONTEXT *ec_context;
+    struct xtajit64_x64_stack_probe stack_probe;
     struct xtajit64_transition_frame *frame, *mismatched_frame = NULL;
     struct xtajit64_begin_params params = {0};
     TEB *teb;
@@ -1878,7 +2112,7 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
     NTSTATUS status;
     UINT frame_index;
     UINT32 depth_before;
-    BOOL continuation_target_seen, mapping_reconciled = FALSE;
+    BOOL continuation_target_seen, mapping_reconciled = FALSE, stack_valid = FALSE;
 
     if (!state || state->magic != XTAJIT64_THREAD_STATE_MAGIC ||
         !(teb = (TEB *)(ULONG_PTR)state->flight_expected_teb) ||
@@ -1902,12 +2136,27 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
      * ThreadBasicInformation, which is also the Windows x64 GS base. */
     params.gs_base = (ULONG_PTR)teb;
     params.suspend_doorbell = (ULONG_PTR)cpu->SuspendDoorbell;
-    if (params.context.rip > XTAJIT64_X64_USER_ADDRESS_MAX ||
-        params.context.rsp > XTAJIT64_X64_USER_ADDRESS_MAX ||
-        params.gs_base > XTAJIT64_X64_USER_ADDRESS_MAX ||
-        !get_x64_stack_bounds( params.context.rsp, &params.stack_limit,
-                               &params.stack_base ))
+    if (state->flight_recorder)
+    {
+        memset( &stack_probe, 0xff, sizeof(stack_probe) );
+        stack_probe.fresh_cpu = 0;
+        stack_probe.stack_match_mask = 0;
+        stack_probe.probe_ran = FALSE;
+    }
+    if (params.context.rip <= XTAJIT64_X64_USER_ADDRESS_MAX &&
+        params.context.rsp <= XTAJIT64_X64_USER_ADDRESS_MAX &&
+        params.gs_base <= XTAJIT64_X64_USER_ADDRESS_MAX)
+        stack_valid = get_x64_stack_bounds(
+            params.context.rsp, &params.stack_limit, &params.stack_base,
+            state->flight_recorder ? &stack_probe : NULL );
+    if (!stack_valid)
+    {
+        if (state->flight_recorder)
+            flight_record_transition_stack_violation(
+                state, ec_context, &ec_context->AMD64_Context, teb, cpu,
+                params.gs_base, &stack_probe );
         abort_transition( state, STATUS_INVALID_ADDRESS, "invalid semantic x64 stack" );
+    }
 
     /* This outer branch is the complete normal-transition cost when the
      * recorder is disabled.  In particular, it avoids the Unixlib bind and
@@ -2185,7 +2434,7 @@ static void __attribute__((used, noreturn)) xtajit64_transition_from_native(
         UINT64 stack_base = XTAJIT64_FLIGHT_UNKNOWN_U64;
 
         flight_start_transition( state );
-        get_x64_stack_bounds( ec_context->AMD64_Context.Rsp, &stack_limit, &stack_base );
+        get_x64_stack_bounds( ec_context->AMD64_Context.Rsp, &stack_limit, &stack_base, NULL );
         /* detail0/detail1 preserve the assembly capture's pre-switch native
          * SP/PC; the regular native_sp/native_frame fields describe this live
          * private-control-stack C observation. */
@@ -2526,7 +2775,7 @@ void WINAPI __attribute__((naked)) BeginSimulation(void)
         "3:\n\t"
         "tst x17, #63\n\t"
         "b.ne 1f\n\t"
-        "movz x9, #0x5fc0\n\t"           /* XTAJIT64_FLIGHT_RECORDER_SIZE */
+        "movz x9, #0x6880\n\t"           /* XTAJIT64_FLIGHT_RECORDER_SIZE */
         "sub x9, x17, x9\n\t"
         "cmp x15, x9\n\t"                /* exact high-end recorder */
         "b.ne 1f\n\t"

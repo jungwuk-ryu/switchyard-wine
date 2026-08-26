@@ -1353,6 +1353,67 @@ static void test_flight_recorder_core(void)
                                                             0x2000, 0x4000 ) ==
            XTAJIT64_FLIGHT_REASON_TRANSITION_STACK,
            "flight private-control-stack watchdog failed\n" );
+    check( !xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4000, TRUE, 0, 0x2000,
+               XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR, 2 ) &&
+           xtajit64_flight_classify_transition_stack(
+               0, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4000, TRUE, 0, 0x2000,
+               XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_RIP_RANGE &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, XTAJIT64_X64_USER_ADDRESS_MAX + 1, 0x3000,
+               XTAJIT64_X64_USER_ADDRESS_MAX, 0x3000, 0x3000, 0x4000, 0x4000,
+               TRUE, 0, XTAJIT64_X64_USER_ADDRESS_MAX + 1,
+               XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_RSP_RANGE &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4000, TRUE, 0, 0x2000,
+               XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_GS_RANGE &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3008, 0x4000, 0x4000, TRUE, 0, 0x2000,
+               XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_TEB_IDENTITY &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0, TRUE, 0, 0x2000,
+               XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_CPU_MISSING &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4008, TRUE, 0, 0x2000,
+               XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_CPU_IDENTITY &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4000, TRUE, STATUS_INVALID_ADDRESS,
+               XTAJIT64_FLIGHT_UNKNOWN_U64, 0, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_TRANSLATE_STATUS &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4000, TRUE, 0, 0x2008,
+               XTAJIT64_FLIGHT_STACK_MATCH_TEB, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_TRANSLATED_GUEST &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4000, TRUE, 0, 0x2000, 0, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_STACK_RANGE &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4000, FALSE,
+               XTAJIT64_FLIGHT_UNKNOWN_U32, XTAJIT64_FLIGHT_UNKNOWN_U64, 0, 2 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_PROBE_NOT_RUN &&
+           xtajit64_flight_classify_transition_stack(
+               0x1000, 0x2000, 0x3000, XTAJIT64_X64_USER_ADDRESS_MAX,
+               0x3000, 0x3000, 0x4000, 0x4000, TRUE, 0, 0x2000,
+               XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR,
+               XTAJIT64_FLIGHT_MAX_TRANSITION_FRAMES + 1 ) ==
+               XTAJIT64_FLIGHT_STACK_REJECT_FRAME_DEPTH,
+           "flight transition-stack classifier did not isolate each predicate\n" );
     /* Simulate the next MAPPING_MISS retry reusing begin_params.  IMPORT is
      * input-side evidence, so it must not inherit that prior output reason. */
     xtajit64_flight_recorder_init( &flight_test_recorder );
@@ -1434,6 +1495,7 @@ done:
 static void test_flight_recorder_contracts(void)
 {
     struct xtajit64_flight_event event, first;
+    struct xtajit64_flight_transition_stack_violation violation, violation_copy;
     struct xtajit64_flight_scratch *scratch[XTAJIT64_FLIGHT_SCRATCH_SLOTS];
     struct xtajit64_flight_scratch *exhausted_scratch;
     struct xtajit64_flight_event *held_slot;
@@ -1513,6 +1575,32 @@ static void test_flight_recorder_contracts(void)
            first.reason == XTAJIT64_FLIGHT_REASON_CONTEXT_FLAGS && first.sequence == 1 &&
            first.detail0 == 0xfeed,
            "flight first watchdog winner was not atomically preserved\n" );
+
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    xtajit64_flight_event_init( &event,
+                               XTAJIT64_FLIGHT_EVENT_TRANSITION_STACK_CLASSIFY,
+                               XTAJIT64_FLIGHT_SOURCE_ARM64EC_PE );
+    memset( &violation, 0, sizeof(violation) );
+    violation.reject_mask = XTAJIT64_FLIGHT_STACK_REJECT_STACK_RANGE;
+    violation.depth = violation.frame_count = 2;
+    violation.frames[0].depth = 1;
+    violation.frames[0].guest_rsp = 0x8000;
+    violation.frames[1].depth = 2;
+    violation.frames[1].guest_rsp = 0x7ff0;
+    check( xtajit64_flight_record_transition_stack_violation_and_freeze(
+               &flight_test_recorder, &event, &violation ) &&
+           xtajit64_flight_snapshot_metadata( &flight_test_recorder, &metadata ) &&
+           metadata.freeze_reason == XTAJIT64_FLIGHT_REASON_TRANSITION_STACK &&
+           xtajit64_flight_snapshot_first_violation( &flight_test_recorder, &first ) &&
+           first.event_type == XTAJIT64_FLIGHT_EVENT_TRANSITION_STACK_CLASSIFY &&
+           first.reason == XTAJIT64_FLIGHT_REASON_TRANSITION_STACK &&
+           xtajit64_flight_snapshot_transition_stack_violation(
+               &flight_test_recorder, &violation_copy ) &&
+           violation_copy.reject_mask == XTAJIT64_FLIGHT_STACK_REJECT_STACK_RANGE &&
+           violation_copy.depth == 2 && violation_copy.frame_count == 2 &&
+           violation_copy.frames[0].guest_rsp == 0x8000 &&
+           violation_copy.frames[1].guest_rsp == 0x7ff0,
+           "flight transition-stack side payload was not atomically preserved\n" );
 
     xtajit64_flight_recorder_init( &flight_test_recorder );
     xtajit64_flight_event_init( &event, XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_PUSH,

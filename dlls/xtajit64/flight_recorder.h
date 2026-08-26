@@ -26,10 +26,10 @@
  * types in records.  Raw addresses are retained only while the caller has
  * explicitly enabled the engineering diagnostic. */
 #define XTAJIT64_FLIGHT_MAGIC          0x3154474c46545858ull /* "XXFTLGT1" */
-#define XTAJIT64_FLIGHT_SCHEMA_VERSION 4u
+#define XTAJIT64_FLIGHT_SCHEMA_VERSION 5u
 #define XTAJIT64_FLIGHT_CAPACITY       64u
 #define XTAJIT64_FLIGHT_SCRATCH_SLOTS  8u
-#define XTAJIT64_FLIGHT_RECORDER_SIZE  0x5fc0u
+#define XTAJIT64_FLIGHT_RECORDER_SIZE  0x6880u
 #define XTAJIT64_FLIGHT_UNKNOWN_U64    (~(UINT64)0)
 #define XTAJIT64_FLIGHT_UNKNOWN_U32    (~(UINT32)0)
 #define XTAJIT64_FLIGHT_OWNER_BUSY     0x8000000000000000ull
@@ -60,6 +60,7 @@ enum xtajit64_flight_event_type
     XTAJIT64_FLIGHT_EVENT_MAPPING_GENERATION,
     XTAJIT64_FLIGHT_EVENT_SUSPEND_REQUEST,
     XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
+    XTAJIT64_FLIGHT_EVENT_TRANSITION_STACK_CLASSIFY,
     XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION,
 };
 
@@ -109,6 +110,23 @@ enum xtajit64_flight_transition_frame_kind
     XTAJIT64_FLIGHT_FRAME_ENTRY,
     XTAJIT64_FLIGHT_FRAME_EXIT,
 };
+
+#define XTAJIT64_FLIGHT_MAX_TRANSITION_FRAMES 64u
+
+#define XTAJIT64_FLIGHT_STACK_REJECT_RIP_RANGE        0x00000001u
+#define XTAJIT64_FLIGHT_STACK_REJECT_RSP_RANGE        0x00000002u
+#define XTAJIT64_FLIGHT_STACK_REJECT_GS_RANGE         0x00000004u
+#define XTAJIT64_FLIGHT_STACK_REJECT_TEB_IDENTITY     0x00000008u
+#define XTAJIT64_FLIGHT_STACK_REJECT_CPU_MISSING      0x00000010u
+#define XTAJIT64_FLIGHT_STACK_REJECT_CPU_IDENTITY     0x00000020u
+#define XTAJIT64_FLIGHT_STACK_REJECT_TRANSLATE_STATUS 0x00000040u
+#define XTAJIT64_FLIGHT_STACK_REJECT_TRANSLATED_GUEST 0x00000080u
+#define XTAJIT64_FLIGHT_STACK_REJECT_STACK_RANGE      0x00000100u
+#define XTAJIT64_FLIGHT_STACK_REJECT_PROBE_NOT_RUN    0x00000200u
+#define XTAJIT64_FLIGHT_STACK_REJECT_FRAME_DEPTH      0x00000400u
+
+#define XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR 0x00000001u
+#define XTAJIT64_FLIGHT_STACK_MATCH_TEB      0x00000002u
 
 #define XTAJIT64_FLIGHT_FLAG_RAW_DIAGNOSTIC          0x00000001u
 #define XTAJIT64_FLIGHT_FLAG_TIME_UNAVAILABLE        0x00000002u
@@ -181,6 +199,49 @@ struct DECLSPEC_ALIGN(64) xtajit64_flight_event
     UINT32 reserved;
 };
 
+struct xtajit64_flight_transition_frame_snapshot
+{
+    UINT64 guest_rsp;
+    UINT64 native_sp;
+    UINT64 native_pc;
+    UINT32 kind;
+    UINT32 depth;
+};
+
+/* This side payload exists only for the first transition-stack violation.  It
+ * keeps predicate-specific evidence and the complete bounded frame stack out
+ * of the general 320-byte event ABI, while remaining allocation-free. */
+struct DECLSPEC_ALIGN(64) xtajit64_flight_transition_stack_violation
+{
+    UINT64 guest_rip;
+    UINT64 guest_rsp;
+    UINT64 gs_base;
+    UINT64 expected_teb;
+    UINT64 fresh_teb;
+    UINT64 expected_cpu;
+    UINT64 fresh_cpu;
+    UINT64 translated_guest;
+    UINT64 host_rsp;
+    UINT64 allocation_base;
+    UINT64 emulator_stack_limit;
+    UINT64 emulator_stack_base;
+    UINT64 teb_stack_limit;
+    UINT64 teb_stack_base;
+    UINT64 causal_boundary_id;
+    UINT64 context_generation;
+    UINT64 transition_generation;
+    UINT32 translation_status;
+    UINT32 translation_domain;
+    UINT32 reject_mask;
+    UINT32 stack_match_mask;
+    UINT32 capture_kind;
+    UINT32 depth;
+    UINT32 frame_count;
+    UINT32 reserved;
+    struct xtajit64_flight_transition_frame_snapshot
+        frames[XTAJIT64_FLIGHT_MAX_TRANSITION_FRAMES];
+};
+
 /* Event construction must not use a possibly shared guest stack, and a
  * signal/non-local re-entry may interrupt a producer on the same thread.  A
  * recorder-owned bounded pool supplies exclusive construction storage without
@@ -220,8 +281,9 @@ struct DECLSPEC_ALIGN(64) xtajit64_flight_recorder
      * this boundary clock, so the hot BeginSimulation call can refresh all
      * three identities without a second diagnostic-only Unix dispatch. */
     volatile UINT64 published_boundary_id;
-    UINT64 reserved;
+    volatile UINT64 transition_stack_violation_publication;
     struct xtajit64_flight_event first_violation;
+    struct xtajit64_flight_transition_stack_violation transition_stack_violation;
     struct xtajit64_flight_scratch scratch[XTAJIT64_FLIGHT_SCRATCH_SLOTS];
     /* A slot belongs only to the writer holding its exact generation.  The
      * busy bit prevents an old stalled writer from publishing after a newer
@@ -268,10 +330,13 @@ struct xtajit64_flight_snapshot_metadata
 
 C_ASSERT( !(XTAJIT64_FLIGHT_CAPACITY & (XTAJIT64_FLIGHT_CAPACITY - 1)) );
 C_ASSERT( sizeof(struct xtajit64_flight_event) == 320 );
+C_ASSERT( sizeof(struct xtajit64_flight_transition_frame_snapshot) == 32 );
+C_ASSERT( sizeof(struct xtajit64_flight_transition_stack_violation) == 0x8c0 );
 C_ASSERT( sizeof(struct xtajit64_flight_scratch) % 64 == 0 );
 C_ASSERT( offsetof(struct xtajit64_flight_scratch, event) % 64 == 0 );
 C_ASSERT( !(XTAJIT64_FLIGHT_SCRATCH_SLOTS & (XTAJIT64_FLIGHT_SCRATCH_SLOTS - 1)) );
 C_ASSERT( offsetof(struct xtajit64_flight_recorder, first_violation) % 64 == 0 );
+C_ASSERT( offsetof(struct xtajit64_flight_recorder, transition_stack_violation) % 64 == 0 );
 C_ASSERT( offsetof(struct xtajit64_flight_recorder, scratch) % 64 == 0 );
 C_ASSERT( offsetof(struct xtajit64_flight_recorder, slot_owners) % sizeof(UINT64) == 0 );
 C_ASSERT( offsetof(struct xtajit64_flight_recorder, events) % 64 == 0 );
@@ -654,18 +719,12 @@ static inline UINT64 xtajit64_flight_record( struct xtajit64_flight_recorder *re
     return sequence;
 }
 
-/* Selects the first violation before producing any ordinary watchdog event.
- * The winner stores a complete event in dedicated recorder storage, then
- * release-publishes the frozen state.  Later violations cannot replace its
- * reason or payload, and no exception/logging path is involved. */
-static inline BOOL xtajit64_flight_record_and_freeze(
+static inline void xtajit64_flight_publish_first_violation(
     struct xtajit64_flight_recorder *recorder, const struct xtajit64_flight_event *event,
     UINT32 reason )
 {
     UINT64 sequence;
 
-    if (!event) return FALSE;
-    if (!xtajit64_flight_begin_freeze( recorder )) return FALSE;
     __atomic_store_n( &recorder->first_violation_publication, 0, __ATOMIC_RELEASE );
     xtajit64_flight_store_event( &recorder->first_violation, event );
     /* The dedicated payload is outside the ring.  Give it the boundary
@@ -679,7 +738,43 @@ static inline BOOL xtajit64_flight_record_and_freeze(
     __atomic_store_n( &recorder->first_violation.publication_sequence, 1,
                       __ATOMIC_RELAXED );
     __atomic_store_n( &recorder->first_violation_publication, 1, __ATOMIC_RELEASE );
+}
+
+/* Selects the first violation before producing any ordinary watchdog event.
+ * The winner stores a complete event in dedicated recorder storage, then
+ * release-publishes the frozen state.  Later violations cannot replace its
+ * reason or payload, and no exception/logging path is involved. */
+static inline BOOL xtajit64_flight_record_and_freeze(
+    struct xtajit64_flight_recorder *recorder, const struct xtajit64_flight_event *event,
+    UINT32 reason )
+{
+    if (!event) return FALSE;
+    if (!xtajit64_flight_begin_freeze( recorder )) return FALSE;
+    xtajit64_flight_publish_first_violation( recorder, event, reason );
     xtajit64_flight_finish_freeze( recorder, reason );
+    return TRUE;
+}
+
+/* Transition-stack rejection needs more evidence than the general event can
+ * hold.  The freeze winner copies one complete bounded side payload before the
+ * final release store, so readers never observe a partial frame snapshot. */
+static inline BOOL xtajit64_flight_record_transition_stack_violation_and_freeze(
+    struct xtajit64_flight_recorder *recorder, const struct xtajit64_flight_event *event,
+    const struct xtajit64_flight_transition_stack_violation *violation )
+{
+    if (!event || !violation ||
+        violation->frame_count > XTAJIT64_FLIGHT_MAX_TRANSITION_FRAMES)
+        return FALSE;
+    if (!xtajit64_flight_begin_freeze( recorder )) return FALSE;
+    __atomic_store_n( &recorder->transition_stack_violation_publication, 0,
+                      __ATOMIC_RELEASE );
+    memcpy( &recorder->transition_stack_violation, violation, sizeof(*violation) );
+    __atomic_store_n( &recorder->transition_stack_violation_publication, 1,
+                      __ATOMIC_RELEASE );
+    xtajit64_flight_publish_first_violation(
+        recorder, event, XTAJIT64_FLIGHT_REASON_TRANSITION_STACK );
+    xtajit64_flight_finish_freeze( recorder,
+                                   XTAJIT64_FLIGHT_REASON_TRANSITION_STACK );
     return TRUE;
 }
 
@@ -742,6 +837,23 @@ static inline BOOL xtajit64_flight_snapshot_first_violation(
     xtajit64_flight_load_event( event, &recorder->first_violation, before );
     after = __atomic_load_n( &recorder->first_violation_publication, __ATOMIC_ACQUIRE );
     return before == after;
+}
+
+static inline BOOL xtajit64_flight_snapshot_transition_stack_violation(
+    const struct xtajit64_flight_recorder *recorder,
+    struct xtajit64_flight_transition_stack_violation *violation )
+{
+    UINT64 before, after;
+
+    if (!recorder || !violation) return FALSE;
+    before = __atomic_load_n( &recorder->transition_stack_violation_publication,
+                              __ATOMIC_ACQUIRE );
+    if (before != 1) return FALSE;
+    memcpy( violation, &recorder->transition_stack_violation, sizeof(*violation) );
+    after = __atomic_load_n( &recorder->transition_stack_violation_publication,
+                             __ATOMIC_ACQUIRE );
+    return before == after &&
+           violation->frame_count <= XTAJIT64_FLIGHT_MAX_TRANSITION_FRAMES;
 }
 
 static inline UINT32 xtajit64_flight_snapshot_event(
@@ -814,6 +926,46 @@ static inline void xtajit64_flight_snapshot( const struct xtajit64_flight_record
         else snapshot->lost_count = xtajit64_flight_saturating_add(
             snapshot->lost_count, 1 );
     }
+}
+
+/* Classify the first invalid transition-stack observation without dereferencing
+ * any captured pointer.  The caller supplies explicit probe results so native
+ * tests can cover every predicate without a live ARM64EC transition. */
+static inline UINT32 xtajit64_flight_classify_transition_stack(
+    UINT64 rip, UINT64 rsp, UINT64 gs_base, UINT64 user_address_max,
+    UINT64 expected_teb, UINT64 fresh_teb, UINT64 expected_cpu, UINT64 fresh_cpu,
+    BOOL probe_ran, UINT32 translation_status, UINT64 translated_guest,
+    UINT32 stack_match_mask, UINT32 depth )
+{
+    UINT32 reject = 0;
+
+    if (!rip || rip > user_address_max) reject |= XTAJIT64_FLIGHT_STACK_REJECT_RIP_RANGE;
+    if (!rsp || rsp > user_address_max) reject |= XTAJIT64_FLIGHT_STACK_REJECT_RSP_RANGE;
+    if (!gs_base || gs_base > user_address_max) reject |= XTAJIT64_FLIGHT_STACK_REJECT_GS_RANGE;
+    if (expected_teb && expected_teb != XTAJIT64_FLIGHT_UNKNOWN_U64 &&
+        fresh_teb != XTAJIT64_FLIGHT_UNKNOWN_U64 &&
+        fresh_teb != expected_teb)
+        reject |= XTAJIT64_FLIGHT_STACK_REJECT_TEB_IDENTITY;
+    if (!fresh_cpu || fresh_cpu == XTAJIT64_FLIGHT_UNKNOWN_U64)
+        reject |= XTAJIT64_FLIGHT_STACK_REJECT_CPU_MISSING;
+    else if (expected_cpu && expected_cpu != XTAJIT64_FLIGHT_UNKNOWN_U64 &&
+             fresh_cpu != expected_cpu)
+        reject |= XTAJIT64_FLIGHT_STACK_REJECT_CPU_IDENTITY;
+    if (!probe_ran)
+        reject |= XTAJIT64_FLIGHT_STACK_REJECT_PROBE_NOT_RUN;
+    else if (translation_status)
+        reject |= XTAJIT64_FLIGHT_STACK_REJECT_TRANSLATE_STATUS;
+    else
+    {
+        if (translated_guest != rsp)
+            reject |= XTAJIT64_FLIGHT_STACK_REJECT_TRANSLATED_GUEST;
+        if (!(stack_match_mask & (XTAJIT64_FLIGHT_STACK_MATCH_EMULATOR |
+                                  XTAJIT64_FLIGHT_STACK_MATCH_TEB)))
+            reject |= XTAJIT64_FLIGHT_STACK_REJECT_STACK_RANGE;
+    }
+    if (depth > XTAJIT64_FLIGHT_MAX_TRANSITION_FRAMES)
+        reject |= XTAJIT64_FLIGHT_STACK_REJECT_FRAME_DEPTH;
+    return reject;
 }
 
 static inline UINT32 xtajit64_flight_validate_context(
