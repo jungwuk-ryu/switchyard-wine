@@ -145,8 +145,8 @@ source "$PROFILE_LIBRARY"
 source "$PROVIDER_LIBRARY"
 switchyard_load_runtime_profile preview-native-arm64-fex
 
-[ "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" = 6 ] ||
-  fail "x64 provider validator ABI version is not v6"
+[ "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" = 8 ] ||
+  fail "x64 provider validator ABI version is not v8"
 [ "$(/usr/bin/grep -Fc "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" \
   "$ROOT_DIR/dlls/xtajit64/unixlib.h")" -eq 1 ] ||
   fail "x64 provider header and validator ABI identities differ"
@@ -224,9 +224,18 @@ EOF
 /bin/cat >"$TEST_ROOT/provider.c" <<'EOF'
 extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
+struct uc_struct;
+typedef int (*switchyard_unicorn_extension_t)(struct uc_struct *);
+extern int uc_emu_stop_at_instruction_boundary(struct uc_struct *);
+extern int uc_enable_shared_memory_atomics(struct uc_struct *);
+__attribute__((used, visibility("default")))
+switchyard_unicorn_extension_t const switchyard_unicorn_fixture_imports[] = {
+    uc_emu_stop_at_instruction_boundary,
+    uc_enable_shared_memory_atomics,
+};
 __attribute__((used, visibility("default"))) const char
     switchyard_xtajit64_fixture_abi_identity[] =
-        "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464";
+        "switchyard-xtajit64-provider-abi-v8-process-init-80-begin-472-doorbell-single-step";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);
@@ -501,6 +510,37 @@ source "$PROFILE_LIBRARY"
 switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
 switchyard_validate_wow64_unixlib_policy_manifest "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
 
+semantic_provider="$RUNTIME/$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY"
+/bin/cp "$semantic_provider" "$TEST_ROOT/xtajit64.semantic-good"
+/bin/cat >"$TEST_ROOT/provider-without-switchyard-api.c" <<'EOF'
+extern int ntdll_fixture(void);
+extern unsigned int uc_version(unsigned int *, unsigned int *);
+__attribute__((used, visibility("default"))) const char
+    switchyard_xtajit64_fixture_abi_identity[] =
+        "switchyard-xtajit64-provider-abi-v8-process-init-80-begin-472-doorbell-single-step";
+__attribute__((visibility("default"))) unsigned int provider_fixture(void)
+{
+    return (unsigned int)ntdll_fixture() + uc_version(0, 0);
+}
+EOF
+/usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -O2 -Wall -Wextra -Werror \
+  -mmacosx-version-min=26.5 -Wl,-install_name,@rpath/xtajit64.so \
+  -Wl,-rpath,@loader_path/ \
+  -Wl,-rpath,@loader_path/../../switchyard-unicorn/lib \
+  "$TEST_ROOT/provider-without-switchyard-api.c" \
+  "$RUNTIME/lib/wine/aarch64-unix/ntdll.so" \
+  "$UNICORN_PACKAGE/lib/libunicorn.2.dylib" \
+  -o "$semantic_provider"
+refresh_component_digest x86_64 unixLibrarySha256 "$semantic_provider"
+expect_failure "provider without required Switchyard Unicorn imports" \
+  switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
+/usr/bin/grep -F 'does not import the required Switchyard Unicorn API' \
+  "$TEST_ROOT/rejected.err" >/dev/null ||
+  fail "semantic provider rejection did not identify its missing Unicorn API"
+/bin/mv "$TEST_ROOT/xtajit64.semantic-good" "$semantic_provider"
+restore_manifest
+switchyard_validate_native_cpu_provider_files "$MANIFEST" "$RUNTIME"
+
 for abi_relative in \
     "$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY" \
     "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY"; do
@@ -515,7 +555,7 @@ path, identity = sys.argv[1:]
 with open(path, "rb") as stream:
     value = stream.read()
 old = identity.encode("ascii")
-new = old.replace(b"-v6-", b"-v5-", 1)
+new = old.replace(b"-v8-", b"-v7-", 1)
 if new == old or value.count(old) != 1:
     raise SystemExit("fixture x64 provider ABI marker is not unique")
 with open(path, "wb") as stream:

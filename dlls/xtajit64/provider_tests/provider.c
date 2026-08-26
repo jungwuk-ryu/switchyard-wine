@@ -27,6 +27,223 @@
 
 #ifdef __arm64ec__
 
+typedef void (WINAPI *x64_return_func)(void);
+
+static ULONG_PTR __attribute__((noinline)) WINAPI capture_and_restore_x18( TEB *teb )
+{
+    ULONG_PTR observed;
+
+    __asm__ volatile( "mov %0, x18\n\t"
+                      "mov x18, %1"
+                      : "=&r" (observed) : "r" (teb) : "memory" );
+    return observed;
+}
+
+static ULONG_PTR __attribute__((noinline)) call_x64_and_restore_x18(
+    x64_return_func func, TEB *teb )
+{
+    ULONG_PTR observed;
+
+    func();
+    __asm__ volatile( "mov %0, x18\n\t"
+                      "mov x18, %1"
+                      : "=&r" (observed) : "r" (teb) : "memory" );
+    return observed;
+}
+
+static void test_native_return_x18(void)
+{
+    static const BYTE code[] = { 0xc3 }; /* ret */
+    x64_return_func func;
+    ULONG_PTR observed;
+    DWORD old_protect;
+    TEB *teb;
+    void *address;
+
+    address = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE );
+    ok( !!address, "x64 return code allocation failed, error %lu\n", GetLastError() );
+    if (!address) return;
+    memcpy( address, code, sizeof(code) );
+    old_protect = 0;
+    ok( VirtualProtect( address, 0x1000, PAGE_EXECUTE_READ, &old_protect ),
+        "x64 return code protect failed, error %lu\n", GetLastError() );
+    FlushInstructionCache( GetCurrentProcess(), address, sizeof(code) );
+
+    teb = NtCurrentTeb();
+    func = address;
+    observed = call_x64_and_restore_x18( func, teb );
+    ok( observed == (ULONG_PTR)teb,
+        "x64 return restored x18 %#Ix, expected TEB %p\n", observed, teb );
+    VirtualFree( address, 0, MEM_RELEASE );
+}
+
+static DWORD CALLBACK ec_entry_x18_thread( void *arg )
+{
+    static const BYTE template[] =
+    {
+        0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $TEB,%rcx */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $capture,%rax */
+        0x48, 0x83, 0xec, 0x20,                       /* sub $0x20,%rsp */
+        0xff, 0xd0,                                    /* call *%rax */
+        0x48, 0x83, 0xc4, 0x20,                       /* add $0x20,%rsp */
+        0x48, 0xba, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $TEB,%rdx */
+        0x48, 0x39, 0xd0,                              /* cmp %rdx,%rax */
+        0x75, 0x07,                                    /* jne failed */
+        0xb9, 0x35, 0x12, 0, 0,                       /* mov $0x1235,%ecx */
+        0xeb, 0x05,                                    /* jmp exit */
+        0xb9, 0x02, 0xe0, 0, 0,                       /* failed: mov $0xe002,%ecx */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,          /* exit: movabs $exit,%rax */
+        0xff, 0xd0,                                    /* call *%rax */
+        0xc3,                                          /* ret */
+    };
+    void (WINAPI *begin_simulation)(void) = arg;
+    void *address, *capture, *exit_thread;
+    CONTEXT *context;
+    DWORD old_protect;
+    TEB *teb;
+
+    address = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE );
+    if (!address) return 0xe101;
+    capture = capture_and_restore_x18;
+    exit_thread = GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "RtlExitUserThread" );
+    if (!exit_thread) return 0xe102;
+    teb = NtCurrentTeb();
+    memcpy( address, template, sizeof(template) );
+    memcpy( (BYTE *)address + 2, &teb, sizeof(teb) );
+    memcpy( (BYTE *)address + 12, &capture, sizeof(capture) );
+    memcpy( (BYTE *)address + 32, &teb, sizeof(teb) );
+    memcpy( (BYTE *)address + 59, &exit_thread, sizeof(exit_thread) );
+    if (!VirtualProtect( address, 0x1000, PAGE_EXECUTE_READ, &old_protect )) return 0xe103;
+    FlushInstructionCache( GetCurrentProcess(), address, sizeof(template) );
+
+    context = &teb->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
+    context->Rsp = ((ULONG_PTR)&context - 0x800) & ~15;
+    context->Rip = (ULONG_PTR)address;
+    teb->ChpeV2CpuAreaInfo->InSimulation = 1;
+    begin_simulation();
+    return 0xe104;
+}
+
+static void test_ec_entry_x18( void (WINAPI *begin_simulation)(void) )
+{
+    DWORD exit_code, ret;
+    HANDLE thread;
+
+    thread = CreateThread( NULL, 0, ec_entry_x18_thread, begin_simulation, 0, NULL );
+    ok( !!thread, "EC entry x18 thread creation failed, error %lu\n", GetLastError() );
+    if (!thread) return;
+    ret = WaitForSingleObject( thread, 10000 );
+    ok( ret == WAIT_OBJECT_0, "EC entry x18 wait returned %#lx\n", ret );
+    if (ret == WAIT_OBJECT_0)
+    {
+        ret = GetExitCodeThread( thread, &exit_code );
+        ok( ret, "EC entry x18 GetExitCodeThread failed, error %lu\n", GetLastError() );
+        if (ret) ok( exit_code == 0x1235,
+                     "EC entry restored wrong x18, exit code %#lx\n", exit_code );
+    }
+    CloseHandle( thread );
+}
+
+static x64_return_func nonlocal_unwind_inner;
+static ULONG_PTR nonlocal_unwind_outer_pc;
+static ULONG_PTR nonlocal_unwind_outer_rsp;
+static LONG nonlocal_unwind_level1_calls;
+static LONG nonlocal_unwind_level1_resumed;
+static LONG nonlocal_unwind_level2_calls;
+
+static void __attribute__((noinline)) WINAPI nonlocal_unwind_ec_level2(void)
+{
+    InterlockedIncrement( &nonlocal_unwind_level2_calls );
+}
+
+static void __attribute__((noinline)) WINAPI nonlocal_unwind_ec_level1(void)
+{
+    InterlockedIncrement( &nonlocal_unwind_level1_calls );
+    nonlocal_unwind_inner();
+    InterlockedIncrement( &nonlocal_unwind_level1_resumed );
+}
+
+static void test_nonlocal_transition_unwind(void)
+{
+    static const BYTE outer_template[] =
+    {
+        0x48, 0x8b, 0x04, 0x24,                       /* mov (%rsp),%rax */
+        0x48, 0xba, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $outer_pc,%rdx */
+        0x48, 0x89, 0x02,                             /* mov %rax,(%rdx) */
+        0x48, 0x8d, 0x44, 0x24, 0x08,                 /* lea 8(%rsp),%rax */
+        0x48, 0xba, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $outer_rsp,%rdx */
+        0x48, 0x89, 0x02,                             /* mov %rax,(%rdx) */
+        0x48, 0x83, 0xec, 0x28,                       /* sub $0x28,%rsp */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $level1,%rax */
+        0xff, 0xd0,                                    /* call *%rax */
+        0x48, 0x83, 0xc4, 0x28,                       /* add $0x28,%rsp */
+        0xc3,                                          /* ret */
+    };
+    static const BYTE inner_template[] =
+    {
+        0x48, 0x83, 0xec, 0x28,                       /* sub $0x28,%rsp */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $level2,%rax */
+        0xff, 0xd0,                                    /* call *%rax */
+        0x48, 0x83, 0xc4, 0x28,                       /* add $0x28,%rsp */
+        0x48, 0xba, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $outer_rsp,%rdx */
+        0x48, 0x8b, 0x22,                             /* mov (%rdx),%rsp */
+        0x48, 0xba, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $outer_pc,%rdx */
+        0xff, 0x22,                                    /* jmp *(%rdx) */
+    };
+    x64_return_func outer;
+    BYTE *address, *inner;
+    void *level1, *level2, *outer_pc, *outer_rsp;
+    DWORD old_protect;
+    BOOL ret;
+
+    address = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE );
+    ok( !!address, "non-local unwind code allocation failed, error %lu\n",
+        GetLastError() );
+    if (!address) return;
+    inner = address + 0x100;
+    memcpy( address, outer_template, sizeof(outer_template) );
+    memcpy( inner, inner_template, sizeof(inner_template) );
+
+    level1 = nonlocal_unwind_ec_level1;
+    level2 = nonlocal_unwind_ec_level2;
+    outer_pc = &nonlocal_unwind_outer_pc;
+    outer_rsp = &nonlocal_unwind_outer_rsp;
+    memcpy( address + 6, &outer_pc, sizeof(outer_pc) );
+    memcpy( address + 24, &outer_rsp, sizeof(outer_rsp) );
+    memcpy( address + 41, &level1, sizeof(level1) );
+    memcpy( inner + 6, &level2, sizeof(level2) );
+    memcpy( inner + 22, &outer_rsp, sizeof(outer_rsp) );
+    memcpy( inner + 35, &outer_pc, sizeof(outer_pc) );
+
+    ret = VirtualProtect( address, 0x1000, PAGE_EXECUTE_READ, &old_protect );
+    ok( ret, "non-local unwind code protect failed, error %lu\n", GetLastError() );
+    if (!ret) goto done;
+    FlushInstructionCache( GetCurrentProcess(), address, 0x1000 );
+
+    nonlocal_unwind_outer_pc = 0;
+    nonlocal_unwind_outer_rsp = 0;
+    nonlocal_unwind_level1_calls = 0;
+    nonlocal_unwind_level1_resumed = 0;
+    nonlocal_unwind_level2_calls = 0;
+    nonlocal_unwind_inner = (x64_return_func)inner;
+    outer = (x64_return_func)address;
+    outer();
+
+    ok( !!nonlocal_unwind_outer_pc, "outer continuation PC was not captured\n" );
+    ok( !!nonlocal_unwind_outer_rsp, "outer continuation RSP was not captured\n" );
+    ok( nonlocal_unwind_level1_calls == 1,
+        "level 1 callback called %ld times\n", nonlocal_unwind_level1_calls );
+    ok( nonlocal_unwind_level2_calls == 1,
+        "level 2 callback called %ld times\n", nonlocal_unwind_level2_calls );
+    ok( !nonlocal_unwind_level1_resumed,
+        "abandoned level 1 callback resumed %ld times\n",
+        nonlocal_unwind_level1_resumed );
+
+done:
+    nonlocal_unwind_inner = NULL;
+    VirtualFree( address, 0, MEM_RELEASE );
+}
+
 static DWORD CALLBACK simulation_thread( void *arg )
 {
     BYTE code[] =
@@ -69,6 +286,350 @@ static DWORD CALLBACK simulation_thread( void *arg )
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
     begin_simulation();
     return 0xe004;
+}
+
+struct suspend_simulation_args
+{
+    void (WINAPI *begin_simulation)(void);
+    void *exit_thread;
+    void *code;
+    CHPE_V2_CPU_AREA_INFO *cpu;
+    ULONG *doorbell;
+    ULONG_PTR rsp;
+    LONG ready;
+    LONG guest_ready;
+    LONG stop;
+};
+
+static const UINT64 suspend_stack_guard[] =
+{
+    0x1111222233334444,
+    0xfedcba9876543210,
+    0x0f1e2d3c4b5a6978,
+    0x8877665544332211,
+};
+
+static void check_suspend_simulation_stack( const struct suspend_simulation_args *args,
+                                            unsigned int cycle, const char *stage )
+{
+    const volatile UINT64 *stack = (const UINT64 *)args->rsp;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(suspend_stack_guard); ++i)
+        ok( stack[i] == suspend_stack_guard[i],
+            "cycle %u %s: stack guard %u %#I64x, expected %#I64x\n",
+            cycle, stage, i, stack[i], suspend_stack_guard[i] );
+}
+
+static void initialize_suspend_simulation_context( CONTEXT *context, void *stop )
+{
+    M128A *xmm = &context->Xmm0;
+    unsigned int i;
+
+    context->ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT;
+    context->Rax = (ULONG_PTR)stop;
+    context->Rbx = 0x1111222233334444;
+    context->Rcx = 0x2111222233334444;
+    context->Rdx = 0x3111222233334444;
+    context->Rsi = 0x4111222233334444;
+    context->Rdi = 0x5111222233334444;
+    context->Rbp = 0x6111222233334444;
+    context->R8  = 0x7111222233334444;
+    context->R9  = 0x0111222233334444;
+    context->R10 = 0x1211222233334444;
+    context->R11 = 0x2211222233334444;
+    context->R12 = 0x3211222233334444;
+    context->R13 = 0x4211222233334444;
+    context->R14 = 0x5211222233334444;
+    context->R15 = 0x6211222233334444;
+    context->MxCsr = 0x1f80;
+    for (i = 0; i < 16; ++i)
+    {
+        xmm[i].Low = 0x1020304050607000 | i;
+        xmm[i].High = 0x1121314151617100 | i;
+    }
+}
+
+static void check_suspend_simulation_context( const CONTEXT *context,
+                                              const struct suspend_simulation_args *args,
+                                              unsigned int cycle )
+{
+    const M128A *xmm = &context->Xmm0;
+    unsigned int i;
+
+#define CHECK_SUSPEND_REG(name, value) \
+    ok( context->name == (value), "cycle %u: " #name " %#I64x, expected %#I64x\n", \
+        cycle, (UINT64)context->name, (UINT64)(value) )
+    CHECK_SUSPEND_REG( Rax, (ULONG_PTR)&args->stop );
+    CHECK_SUSPEND_REG( Rbx, 0x1111222233334444 );
+    CHECK_SUSPEND_REG( Rcx, 0x2111222233334444 );
+    CHECK_SUSPEND_REG( Rdx, 0x3111222233334444 );
+    CHECK_SUSPEND_REG( Rsi, 0x4111222233334444 );
+    CHECK_SUSPEND_REG( Rdi, 0x5111222233334444 );
+    CHECK_SUSPEND_REG( Rbp, 0x6111222233334444 );
+    CHECK_SUSPEND_REG( Rsp, args->rsp );
+    CHECK_SUSPEND_REG( R8,  0x7111222233334444 );
+    CHECK_SUSPEND_REG( R9,  0x0111222233334444 );
+    CHECK_SUSPEND_REG( R10, 0x1211222233334444 );
+    CHECK_SUSPEND_REG( R11, 0x2211222233334444 );
+    CHECK_SUSPEND_REG( R12, 0x3211222233334444 );
+    CHECK_SUSPEND_REG( R13, 0x4211222233334444 );
+    CHECK_SUSPEND_REG( R14, 0x5211222233334444 );
+    CHECK_SUSPEND_REG( R15, 0x6211222233334444 );
+#undef CHECK_SUSPEND_REG
+    ok( context->MxCsr == 0x1f80, "cycle %u: MxCsr %#lx, expected 0x1f80\n",
+        cycle, context->MxCsr );
+    ok( context->FltSave.MxCsr == 0x1f80,
+        "cycle %u: FltSave.MxCsr %#lx, expected 0x1f80\n",
+        cycle, context->FltSave.MxCsr );
+    for (i = 0; i < 16; ++i)
+    {
+        ok( xmm[i].Low == (0x1020304050607000 | i) &&
+            xmm[i].High == (0x1121314151617100 | i),
+            "cycle %u: Xmm%u {%#I64x,%#I64x}, expected {%#I64x,%#I64x}\n",
+            cycle, i, (UINT64)xmm[i].High, xmm[i].Low,
+            (UINT64)(0x1121314151617100 | i),
+            (UINT64)(0x1020304050607000 | i) );
+    }
+    check_suspend_simulation_stack( args, cycle, "context" );
+}
+
+static DWORD CALLBACK suspend_simulation_thread( void *arg )
+{
+    struct suspend_simulation_args *args = arg;
+    static const BYTE template[] =
+    {
+        0x48, 0x89, 0x1c, 0x24,                     /* mov %rbx,(%rsp) */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,       /* movabs $guest_ready,%rax */
+        0xc7, 0x00, 0x01, 0x00, 0x00, 0x00,         /* movl $1,(%rax) */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,       /* movabs $stop,%rax */
+        0x83, 0x38, 0x00,                           /* cmp $0,(%rax) */
+        0x74, 0xfb,                                 /* je cmp */
+        0xb9, 0x5a, 0x5a, 0x00, 0x00,               /* mov $0x5a5a,%ecx */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,       /* movabs $exit_thread,%rax */
+        0xff, 0xd0,                                 /* call *%rax */
+        0xc3,                                       /* ret */
+    };
+    CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    CONTEXT *context;
+    DWORD old_protect;
+    BYTE *code;
+    void *guest_ready = &args->guest_ready;
+    void *stop = &args->stop;
+
+    if (!(code = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE ))) return 0xe101;
+    memcpy( code, template, sizeof(template) );
+    memcpy( code + 6, &guest_ready, sizeof(guest_ready) );
+    memcpy( code + 22, &stop, sizeof(stop) );
+    memcpy( code + 42, &args->exit_thread, sizeof(args->exit_thread) );
+    if (!VirtualProtect( code, 0x1000, PAGE_EXECUTE_READ, &old_protect )) return 0xe102;
+
+    args->code = code;
+    args->cpu = cpu;
+    args->doorbell = cpu ? cpu->SuspendDoorbell : NULL;
+    InterlockedExchange( &args->ready, 1 );
+    if (!cpu || !cpu->ContextAmd64 || !args->doorbell) return 0xe103;
+
+    context = &cpu->ContextAmd64->AMD64_Context;
+    initialize_suspend_simulation_context( context, stop );
+    args->rsp = context->Rsp = ((ULONG_PTR)&context - 0x800) & ~15;
+    *(UINT64 *)args->rsp = 0;
+    memcpy( (UINT64 *)args->rsp + 1, suspend_stack_guard + 1,
+            sizeof(suspend_stack_guard) - sizeof(*suspend_stack_guard) );
+    context->Rip = (ULONG_PTR)code;
+    cpu->InSimulation = 1;
+    args->begin_simulation();
+    return 0xe104;
+}
+
+static BOOL wait_suspend_condition( const struct suspend_simulation_args *args,
+                                    BOOL require_quiesced, DWORD timeout )
+{
+    ULONGLONG deadline = GetTickCount64() + timeout;
+
+    do
+    {
+        MemoryBarrier();
+        if (args->ready && (!require_quiesced ||
+            (args->cpu && !*(volatile BOOLEAN *)&args->cpu->InSimulation)))
+            return TRUE;
+        YieldProcessor();
+    } while (GetTickCount64() < deadline);
+    return FALSE;
+}
+
+static BOOL wait_simulation_active( const struct suspend_simulation_args *args,
+                                    DWORD timeout )
+{
+    ULONGLONG deadline = GetTickCount64() + timeout;
+
+    do
+    {
+        MemoryBarrier();
+        if (args->guest_ready && args->cpu &&
+            *(volatile BOOLEAN *)&args->cpu->InSimulation &&
+            args->doorbell && !*(volatile ULONG *)args->doorbell)
+            return TRUE;
+        YieldProcessor();
+    } while (GetTickCount64() < deadline);
+    return FALSE;
+}
+
+static void test_suspend_doorbell_provider( void (WINAPI *begin_simulation)(void) )
+{
+    struct suspend_simulation_args args = { .begin_simulation = begin_simulation };
+    struct suspend_simulation_args holder_args;
+    CONTEXT context;
+    DWORD exit_code, holder_exit_code, old_protect, ret;
+    HANDLE holder_thread, thread;
+    void *mutation;
+    unsigned int cycle;
+    BOOL resume_failed;
+
+    args.exit_thread = GetProcAddress( GetModuleHandleA( "ntdll.dll" ),
+                                      "RtlExitUserThread" );
+    ok( !!args.exit_thread, "RtlExitUserThread is missing\n" );
+    if (!args.exit_thread) return;
+    thread = CreateThread( NULL, 0, suspend_simulation_thread, &args, 0, NULL );
+    ok( !!thread, "suspend simulation thread creation failed, error %lu\n",
+        GetLastError() );
+    if (!thread) return;
+
+    ret = wait_suspend_condition( &args, FALSE, 5000 );
+    ok( ret, "suspend simulation thread did not initialize\n" );
+    ok( !!args.doorbell, "CPU provider did not publish a suspend doorbell\n" );
+    if (ret && args.doorbell)
+    {
+        for (cycle = 0; cycle < 32; ++cycle)
+        {
+            ret = wait_simulation_active( &args, 5000 );
+            ok( ret, "cycle %u: suspend simulation did not enter translated execution\n",
+                cycle );
+            if (!ret) break;
+            ret = SuspendThread( thread );
+            ok( ret == 0, "cycle %u: SuspendThread returned %#lx, error %lu\n",
+                cycle, ret, GetLastError() );
+            if (ret == ~0u) break;
+
+            ret = wait_suspend_condition( &args, TRUE, 5000 );
+            ok( ret, "cycle %u: translated execution did not service its suspend doorbell\n",
+                cycle );
+            if (ret)
+            {
+                memset( &context, 0, sizeof(context) );
+                context.ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT;
+                ret = GetThreadContext( thread, &context );
+                ok( ret, "cycle %u: GetThreadContext failed, error %lu\n",
+                    cycle, GetLastError() );
+                ok( !ret || (context.Rip >= (ULONG_PTR)args.code + 30 &&
+                             context.Rip < (ULONG_PTR)args.code + 35),
+                    "cycle %u: suspended Rip %p is outside loop %p\n",
+                    cycle, (void *)(ULONG_PTR)context.Rip, args.code );
+                if (ret) check_suspend_simulation_context( &context, &args, cycle );
+                if (ret)
+                {
+                    ret = SetThreadContext( thread, &context );
+                    ok( ret, "cycle %u: SetThreadContext failed, error %lu\n",
+                        cycle, GetLastError() );
+                }
+                if (ret)
+                {
+                    memset( &context, 0, sizeof(context) );
+                    context.ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT;
+                    ret = GetThreadContext( thread, &context );
+                    ok( ret, "cycle %u: post-set GetThreadContext failed, error %lu\n",
+                        cycle, GetLastError() );
+                    ok( !ret || (context.Rip >= (ULONG_PTR)args.code + 30 &&
+                                 context.Rip < (ULONG_PTR)args.code + 35),
+                        "cycle %u: post-set Rip %p is outside loop %p\n",
+                        cycle, (void *)(ULONG_PTR)context.Rip, args.code );
+                    if (ret) check_suspend_simulation_context( &context, &args, cycle );
+                }
+                if (ret)
+                {
+                    mutation = VirtualAlloc( NULL, 0x1000, MEM_COMMIT,
+                                             PAGE_READWRITE );
+                    ok( !!mutation,
+                        "cycle %u: mutation allocation failed, error %lu\n",
+                        cycle, GetLastError() );
+                    if (mutation)
+                    {
+                        ret = VirtualProtect( mutation, 0x1000, PAGE_READONLY,
+                                              &old_protect );
+                        ok( ret,
+                            "cycle %u: mutation protect failed, error %lu\n",
+                            cycle, GetLastError() );
+                        ret = VirtualFree( mutation, 0, MEM_RELEASE );
+                        ok( ret,
+                            "cycle %u: mutation free failed, error %lu\n",
+                            cycle, GetLastError() );
+                    }
+                    check_suspend_simulation_stack( &args, cycle, "after mutation" );
+                }
+            }
+
+            holder_thread = NULL;
+            if (!cycle)
+            {
+                memset( &holder_args, 0, sizeof(holder_args) );
+                holder_args.begin_simulation = begin_simulation;
+                holder_args.exit_thread = args.exit_thread;
+                holder_thread = CreateThread( NULL, 0, suspend_simulation_thread,
+                                              &holder_args, 0, NULL );
+                ok( !!holder_thread,
+                    "engine holder thread creation failed, error %lu\n",
+                    GetLastError() );
+                if (holder_thread)
+                {
+                    ret = wait_simulation_active( &holder_args, 5000 );
+                    ok( ret, "engine holder did not enter translated execution\n" );
+                }
+            }
+
+            ret = ResumeThread( thread );
+            ok( ret == 1, "cycle %u: ResumeThread returned %#lx, error %lu\n",
+                cycle, ret, GetLastError() );
+            resume_failed = ret == ~0u;
+            if (holder_thread)
+            {
+                if (!resume_failed)
+                {
+                    ret = wait_simulation_active( &args, 5000 );
+                    ok( ret,
+                        "victim did not resume while its resident engine was occupied\n" );
+                    if (ret)
+                        check_suspend_simulation_stack(
+                            &args, cycle, "after forced engine migration" );
+                }
+                InterlockedExchange( &holder_args.stop, 1 );
+                ret = WaitForSingleObject( holder_thread, 10000 );
+                ok( ret == WAIT_OBJECT_0,
+                    "engine holder wait returned %#lx\n", ret );
+                if (ret == WAIT_OBJECT_0)
+                {
+                    ret = GetExitCodeThread( holder_thread, &holder_exit_code );
+                    ok( ret, "engine holder GetExitCodeThread failed, error %lu\n",
+                        GetLastError() );
+                    ok( !ret || holder_exit_code == 0x5a5a,
+                        "engine holder exit code was %#lx\n", holder_exit_code );
+                }
+                CloseHandle( holder_thread );
+            }
+            if (resume_failed) break;
+        }
+    }
+
+    InterlockedExchange( &args.stop, 1 );
+    ret = WaitForSingleObject( thread, 10000 );
+    ok( ret == WAIT_OBJECT_0, "suspend simulation wait returned %#lx\n", ret );
+    if (ret == WAIT_OBJECT_0)
+    {
+        ret = GetExitCodeThread( thread, &exit_code );
+        ok( ret, "GetExitCodeThread failed, error %lu\n", GetLastError() );
+        ok( !ret || exit_code == 0x5a5a,
+            "suspend simulation exit code was %#lx\n", exit_code );
+    }
+    CloseHandle( thread );
 }
 
 #define MIXED_IMAGE_SECTION_SIZE 0x1000  /* x64 logical page size */
@@ -790,6 +1351,268 @@ static void test_x64_memory_fault_exception( void (WINAPI *begin_simulation)(voi
         run_x64_memory_fault_case( begin_simulation, &cases[i], i );
 }
 
+struct x64_single_step_args
+{
+    void (WINAPI *begin_simulation)(void);
+    void *entry;
+};
+
+static LONG x64_single_step_handler_calls;
+static void *x64_single_step_resume;
+
+static LONG WINAPI x64_single_step_handler( EXCEPTION_POINTERS *ptrs )
+{
+    EXCEPTION_RECORD *rec = ptrs->ExceptionRecord;
+    CONTEXT *context = ptrs->ContextRecord;
+
+    if (rec->ExceptionCode != STATUS_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement( &x64_single_step_handler_calls );
+    ok( rec->ExceptionAddress == x64_single_step_resume,
+        "x64 single-step address %p, expected %p\n",
+        rec->ExceptionAddress, x64_single_step_resume );
+    ok( !rec->NumberParameters,
+        "x64 single-step parameter count %lu\n", rec->NumberParameters );
+    ok( context->Rip == (ULONG_PTR)x64_single_step_resume,
+        "x64 single-step RIP %p, expected %p\n",
+        (void *)(ULONG_PTR)context->Rip, x64_single_step_resume );
+    ok( !(context->EFlags & 0x100),
+        "x64 single-step context retained trap flag %#lx\n", context->EFlags );
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static DWORD CALLBACK x64_single_step_thread( void *arg )
+{
+    struct x64_single_step_args *args = arg;
+    CONTEXT *context;
+
+    context = &NtCurrentTeb()->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
+    context->Rsp = (ULONG_PTR)&context - 0x800;
+    context->Rip = (ULONG_PTR)args->entry;
+    NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
+    args->begin_simulation();
+    return 0xe340;
+}
+
+static void test_x64_single_step_exception( void (WINAPI *begin_simulation)(void) )
+{
+    static const BYTE trap_code[] =
+    {
+        0x9c,                                           /* pushfq */
+        0x81, 0x0c, 0x24, 0x00, 0x01, 0x01, 0x00,     /* orl $(TF|RF),(%rsp) */
+        0x9d,                                           /* popfq */
+        0x0f, 0xa2,                                     /* cpuid */
+        0x90,                                           /* resume: nop */
+        0xb9, 0x20, 0x66, 0x00, 0x00,                   /* mov $0x6620,%ecx */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,           /* movabs $exit,%rax */
+        0xff, 0xd0,                                     /* call *%rax */
+        0xc3,                                           /* ret */
+    };
+    struct x64_single_step_args args = { begin_simulation };
+    void *address = NULL, *exit_thread, *handler = NULL;
+    DWORD old_protect, exit_code = 0, ret;
+    HANDLE thread = NULL;
+    BYTE code[sizeof(trap_code)];
+
+    exit_thread = GetProcAddress( GetModuleHandleA( "ntdll.dll" ),
+                                  "RtlExitUserThread" );
+    ok( !!exit_thread, "single-step RtlExitUserThread is missing\n" );
+    if (!exit_thread) return;
+    address = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE );
+    ok( !!address, "single-step code allocation failed, error %lu\n",
+        GetLastError() );
+    if (!address) goto done;
+    memcpy( code, trap_code, sizeof(code) );
+    memcpy( code + 19, &exit_thread, sizeof(exit_thread) );
+    memcpy( address, code, sizeof(code) );
+    ret = VirtualProtect( address, 0x1000, PAGE_EXECUTE_READ, &old_protect );
+    ok( ret, "single-step code protect failed, error %lu\n", GetLastError() );
+    if (!ret) goto done;
+    FlushInstructionCache( GetCurrentProcess(), address, sizeof(code) );
+
+    x64_single_step_handler_calls = 0;
+    x64_single_step_resume = (BYTE *)address + 11;
+    handler = AddVectoredExceptionHandler( TRUE, x64_single_step_handler );
+    ok( !!handler, "single-step handler registration failed\n" );
+    if (!handler) goto done;
+    args.entry = address;
+    thread = CreateThread( NULL, 0, x64_single_step_thread, &args, 0, NULL );
+    ok( !!thread, "single-step thread creation failed, error %lu\n",
+        GetLastError() );
+    if (!thread) goto done;
+    ret = WaitForSingleObject( thread, 10000 );
+    ok( ret == WAIT_OBJECT_0, "single-step wait returned %#lx\n", ret );
+    if (ret == WAIT_OBJECT_0)
+    {
+        ret = GetExitCodeThread( thread, &exit_code );
+        ok( ret, "single-step GetExitCodeThread failed, error %lu\n",
+            GetLastError() );
+        if (ret) ok( exit_code == 0x6620,
+                     "single-step exit code %#lx, expected 0x6620\n", exit_code );
+        ok( x64_single_step_handler_calls == 1,
+            "single-step handler called %ld times\n",
+            x64_single_step_handler_calls );
+        trace( "XTAJIT64_SINGLE_STEP_SEH rip=%p exit=%#lx handlers=%ld\n",
+               x64_single_step_resume, exit_code,
+               x64_single_step_handler_calls );
+    }
+    else
+    {
+        TerminateThread( thread, STATUS_TIMEOUT );
+        WaitForSingleObject( thread, 10000 );
+    }
+
+done:
+    if (thread) CloseHandle( thread );
+    if (handler) RemoveVectoredExceptionHandler( handler );
+    x64_single_step_resume = NULL;
+    if (address) VirtualFree( address, 0, MEM_RELEASE );
+}
+
+struct x64_nonlocal_continue_args
+{
+    void (WINAPI *begin_simulation)(void);
+    void *entry;
+    ULONG_PTR rsp;
+};
+
+static LONG x64_nonlocal_continue_calls;
+static LONG x64_nonlocal_continue_bad_rsp;
+static ULONG_PTR x64_nonlocal_continue_expected_rsp;
+static void *x64_nonlocal_continue_resume;
+
+static DECLSPEC_NORETURN void WINAPI x64_nonlocal_continue_handler(
+    EXCEPTION_POINTERS *ptrs )
+{
+    CONTEXT *context = ptrs->ContextRecord;
+    NTSTATUS status;
+
+    InterlockedIncrement( &x64_nonlocal_continue_calls );
+    if (context->Rsp != x64_nonlocal_continue_expected_rsp)
+        InterlockedIncrement( &x64_nonlocal_continue_bad_rsp );
+    context->Rip = (ULONG_PTR)x64_nonlocal_continue_resume;
+    status = NtContinue( context, FALSE );
+    RtlRaiseStatus( status ? status : STATUS_ACCESS_VIOLATION );
+}
+
+static DWORD CALLBACK x64_nonlocal_continue_thread( void *arg )
+{
+    struct x64_nonlocal_continue_args *args = arg;
+    CONTEXT *context;
+
+    context = &NtCurrentTeb()->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
+    args->rsp = context->Rsp = ((ULONG_PTR)&context - 0x800) & ~15;
+    x64_nonlocal_continue_expected_rsp = context->Rsp;
+    context->Rip = (ULONG_PTR)args->entry;
+    NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
+    args->begin_simulation();
+    return 0xe401;
+}
+
+static void test_x64_nonlocal_continue_unwind(
+    void (WINAPI *begin_simulation)(void) )
+{
+    static const BYTE entry_template[] =
+    {
+        0x41, 0xba, 0x28, 0, 0, 0,                    /* mov $40,%r10d */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $fault,%rax */
+        0x8b, 0x00,                                    /* loop: mov (%rax),%eax */
+        0x41, 0xff, 0xca,                              /* dec %r10d */
+        0x75, 0xf9,                                    /* jne loop */
+        0xb9, 0x10, 0x67, 0, 0,                       /* mov $0x6710,%ecx */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $exit,%rax */
+        0xff, 0xd0,                                    /* call *%rax */
+        0xc3,                                          /* ret */
+    };
+    static const BYTE handler_template[] =
+    {
+        0x48, 0x83, 0xec, 0x28,                       /* sub $0x28,%rsp */
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,          /* movabs $helper,%rax */
+        0xff, 0xd0,                                    /* call *%rax */
+        0x0f, 0x0b,                                    /* ud2 (helper is noreturn) */
+    };
+    struct x64_nonlocal_continue_args args = { begin_simulation };
+    BYTE *address = NULL, *handler_code = NULL;
+    void *fault = NULL, *handler = NULL, *helper, *exit_thread;
+    DWORD exit_code = 0, old_protect, ret;
+    HANDLE thread = NULL;
+
+    exit_thread = GetProcAddress( GetModuleHandleA( "ntdll.dll" ),
+                                  "RtlExitUserThread" );
+    ok( !!exit_thread, "non-local continue RtlExitUserThread is missing\n" );
+    if (!exit_thread) return;
+    address = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE );
+    handler_code = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE );
+    fault = VirtualAlloc( NULL, 0x1000, MEM_RESERVE, PAGE_NOACCESS );
+    ok( !!address && !!handler_code && !!fault,
+        "non-local continue allocations %p/%p/%p, error %lu\n",
+        address, handler_code, fault, GetLastError() );
+    if (!address || !handler_code || !fault) goto done;
+
+    memcpy( address, entry_template, sizeof(entry_template) );
+    memcpy( address + 8, &fault, sizeof(fault) );
+    memcpy( address + 30, &exit_thread, sizeof(exit_thread) );
+    memcpy( handler_code, handler_template, sizeof(handler_template) );
+    helper = x64_nonlocal_continue_handler;
+    memcpy( handler_code + 6, &helper, sizeof(helper) );
+    ret = VirtualProtect( address, 0x1000, PAGE_EXECUTE_READ, &old_protect );
+    ok( ret, "non-local continue entry protect failed, error %lu\n",
+        GetLastError() );
+    if (!ret) goto done;
+    ret = VirtualProtect( handler_code, 0x1000, PAGE_EXECUTE_READ, &old_protect );
+    ok( ret, "non-local continue handler protect failed, error %lu\n",
+        GetLastError() );
+    if (!ret) goto done;
+    FlushInstructionCache( GetCurrentProcess(), address, sizeof(entry_template) );
+    FlushInstructionCache( GetCurrentProcess(), handler_code,
+                           sizeof(handler_template) );
+
+    x64_nonlocal_continue_calls = 0;
+    x64_nonlocal_continue_bad_rsp = 0;
+    x64_nonlocal_continue_expected_rsp = 0;
+    x64_nonlocal_continue_resume = address + 18;
+    handler = AddVectoredExceptionHandler(
+        TRUE, (PVECTORED_EXCEPTION_HANDLER)handler_code );
+    ok( !!handler, "non-local continue handler registration failed\n" );
+    if (!handler) goto done;
+
+    args.entry = address;
+    thread = CreateThread( NULL, 0, x64_nonlocal_continue_thread, &args, 0, NULL );
+    ok( !!thread, "non-local continue thread creation failed, error %lu\n",
+        GetLastError() );
+    if (!thread) goto done;
+    ret = WaitForSingleObject( thread, 10000 );
+    ok( ret == WAIT_OBJECT_0, "non-local continue wait returned %#lx\n", ret );
+    if (ret == WAIT_OBJECT_0)
+    {
+        ret = GetExitCodeThread( thread, &exit_code );
+        ok( ret, "non-local continue GetExitCodeThread failed, error %lu\n",
+            GetLastError() );
+        ok( !ret || exit_code == 0x6710,
+            "non-local continue exit code %#lx, expected 0x6710\n", exit_code );
+        ok( x64_nonlocal_continue_calls == 40,
+            "non-local continue handler called %ld times\n",
+            x64_nonlocal_continue_calls );
+        ok( !x64_nonlocal_continue_bad_rsp,
+            "non-local continue observed %ld wrong restored stacks\n",
+            x64_nonlocal_continue_bad_rsp );
+        trace( "XTAJIT64_NONLOCAL_CONTINUE calls=%ld rsp=%p exit=%#lx\n",
+               x64_nonlocal_continue_calls, (void *)args.rsp, exit_code );
+    }
+    else
+    {
+        TerminateThread( thread, STATUS_TIMEOUT );
+        WaitForSingleObject( thread, 10000 );
+    }
+
+done:
+    if (thread) CloseHandle( thread );
+    if (handler) RemoveVectoredExceptionHandler( handler );
+    x64_nonlocal_continue_resume = NULL;
+    if (fault) VirtualFree( fault, 0, MEM_RELEASE );
+    if (handler_code) VirtualFree( handler_code, 0, MEM_RELEASE );
+    if (address) VirtualFree( address, 0, MEM_RELEASE );
+}
+
 static void test_reset_to_consistent_state( HMODULE module )
 {
     void (WINAPI *reset_to_consistent_state)(EXCEPTION_RECORD *, CONTEXT *, ARM64_NT_CONTEXT *);
@@ -891,6 +1714,9 @@ static void test_provider_contract(void)
     if (!begin_simulation || !is_feature_present || !update_processor_information) return;
 
     test_reset_to_consistent_state( module );
+    test_native_return_x18();
+    test_ec_entry_x18( begin_simulation );
+    test_nonlocal_transition_unwind();
 
     for (i = 0; i < 64; i++)
         if (required_features & (1ull << i))
@@ -924,7 +1750,10 @@ static void test_provider_contract(void)
     }
     CloseHandle( thread );
 
+    test_suspend_doorbell_provider( begin_simulation );
     test_x64_memory_fault_exception( begin_simulation );
+    test_x64_single_step_exception( begin_simulation );
+    test_x64_nonlocal_continue_unwind( begin_simulation );
     test_concurrent_provider( begin_simulation );
     /* This enables process-wide executable-write tracking; keep it last so
      * every earlier concurrency test has completed before policy changes. */

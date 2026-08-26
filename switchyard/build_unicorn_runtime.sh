@@ -272,6 +272,8 @@ validate_output() {
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1' \
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_CODE_COHERENCE 1' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   /usr/bin/grep -Fx 'uc_err uc_enable_shared_memory_atomics(uc_engine *uc);' \
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   [ "$(nm -gU "$dylib" | /usr/bin/awk \
@@ -504,6 +506,9 @@ GIT_CEILING_DIRECTORIES="$patch_apply_ceiling" \
 /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1' \
   "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
   fail "source patch did not add the shared-memory atomic contract"
+/usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_CODE_COHERENCE 1' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the shared-code coherence contract"
 /usr/bin/grep -Fx 'uc_err uc_enable_shared_memory_atomics(uc_engine *uc);' \
   "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
   fail "source patch did not add the shared-memory atomic API"
@@ -540,18 +545,30 @@ cmake --build "$BUILD_WORK_DIR" --parallel "$JOBS"
 
 # Exercise AArch64 code generation, cross-thread publication,
 # instruction-boundary stopping, cross-engine shared-memory atomicity, and
-# atomic invalid-memory recovery against the exact dylib that will be
-# installed.  The tests cover zero-count i32/i64 rotate lowering, LOCK
-# CMPXCHG, CMPXCHG8B, demand mapping, and an interruptible REP iteration in
-# addition to the ordinary cross-thread stop path.
-for regression in aarch64_rotl_zero threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook; do
+# atomic invalid-memory recovery and cross-engine executable-code publication
+# against the exact dylib that will be installed.  The tests cover zero-count
+# i32/i64 rotate lowering, LOCK CMPXCHG, CMPXCHG8B, demand mapping, repeated
+# shared-code writes, concurrent emulation startup, caller-thread Apple JIT
+# state preservation, and an interruptible REP iteration in addition to the
+# ordinary cross-thread stop path.
+for regression in aarch64_rotl_zero apple_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state; do
   regression_source="$PATCHED_SOURCE_DIR/tests/regress/$regression.c"
   regression_binary="$BUILD_WORK_DIR/switchyard-$regression"
   [ -f "$regression_source" ] && [ ! -L "$regression_source" ] ||
     fail "patched source is missing regression: $regression"
+  if [ "$regression" = "apple_jit_state" ]; then
+    regression_cflags=(
+      -DHAVE_PTHREAD_JIT_PROTECT=1
+      -I"$PATCHED_SOURCE_DIR"
+      -I"$PATCHED_SOURCE_DIR/qemu/include"
+      -I"$PATCHED_SOURCE_DIR/include"
+    )
+  else
+    regression_cflags=(-I"$PATCHED_SOURCE_DIR/include")
+  fi
   /usr/bin/clang -arch arm64 -mmacosx-version-min="$MINIMUM_MACOS" \
     -std=c11 -Wall -Wextra -Werror \
-    -I"$PATCHED_SOURCE_DIR/include" "$regression_source" \
+    "${regression_cflags[@]}" "$regression_source" \
     -L"$BUILD_WORK_DIR" '-Wl,-rpath,@loader_path' -lunicorn -lpthread \
     -o "$regression_binary"
   "$regression_binary" || fail "Unicorn regression failed: $regression"

@@ -3204,7 +3204,8 @@ static bool wined3d_cs_map_upload_bo(struct wined3d_device_context *context, str
         return false;
     }
 
-    if (flags & (WINED3D_MAP_DISCARD | WINED3D_MAP_NOOVERWRITE))
+    if (!wined3d_settings.client_is_translated
+            && flags & (WINED3D_MAP_DISCARD | WINED3D_MAP_NOOVERWRITE))
     {
         struct wined3d_device *device = context->device;
         struct wined3d_bo_address addr;
@@ -3306,6 +3307,8 @@ static bool wined3d_cs_map_upload_bo(struct wined3d_device_context *context, str
     client->mapped_upload.addr.buffer_object = 0;
     client->mapped_upload.addr.addr = map_desc->data;
     client->mapped_upload.flags = UPLOAD_BO_UPLOAD_ON_UNMAP | UPLOAD_BO_FREE_ON_UNMAP;
+    if (flags & WINED3D_MAP_NOOVERWRITE)
+        client->mapped_upload.flags |= UPLOAD_BO_NOOVERWRITE;
     client->mapped_box = *box;
     return true;
 }
@@ -4462,7 +4465,7 @@ static bool wined3d_deferred_context_map_upload_bo(struct wined3d_device_context
 
     upload = &deferred->uploads[deferred->upload_count++];
 
-    if ((flags & WINED3D_MAP_DISCARD)
+    if (!wined3d_settings.client_is_translated && (flags & WINED3D_MAP_DISCARD)
             && device->adapter->adapter_ops->adapter_alloc_bo(device, resource, sub_resource_idx, &addr))
     {
         upload->bo = addr.buffer_object;

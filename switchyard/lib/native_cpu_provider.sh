@@ -9,13 +9,13 @@ SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit.so"
 SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY="lib/wine/aarch64-windows/xtajit.dll"
 SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit64.so"
 SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY="lib/wine/aarch64-windows/xtajit64.dll"
-SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION="6"
-SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY="switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464"
+SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION="8"
+SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY="switchyard-xtajit64-provider-abi-v8-process-init-80-begin-472-doorbell-single-step"
 SWITCHYARD_NATIVE_UNICORN_ROOT="lib/switchyard-unicorn"
 SWITCHYARD_NATIVE_UNICORN_LIBRARY="lib/switchyard-unicorn/lib/libunicorn.2.dylib"
 SWITCHYARD_NATIVE_UNICORN_RPATH='@loader_path/../../switchyard-unicorn/lib'
 SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH="lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch"
-SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256="89e4beeeccacc799789659ab826589ea1d87a358210d0412e81527166117bd68"
+SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256="013cb7b25948d8c781b8a36afde38284bc405c84553d49f1fb081020f749ce90"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_CONTRACT_VERSION="2"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_HANDLE_ENCODING="generation-tagged-v1"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_EXTERNAL_SOURCE_VERSION="2"
@@ -106,7 +106,7 @@ switchyard_native_cpu_provider_validate_runtime_profile() {
 }
 
 switchyard_validate_native_cpu_provider_files() {
-  local manifest runtime_root digest_helper lipo_tool otool_tool vtool_tool
+  local manifest runtime_root digest_helper lipo_tool nm_tool otool_tool vtool_tool
 
   [ "$#" -eq 2 ] || {
     echo "usage: switchyard_validate_native_cpu_provider_files MANIFEST RUNTIME" >&2
@@ -119,6 +119,7 @@ switchyard_validate_native_cpu_provider_files() {
     "$manifest" "$runtime_root" || return 1
   digest_helper="$(switchyard_native_cpu_provider_content_digest_helper)" || return 1
   lipo_tool="$(switchyard_native_cpu_provider_inspection_tool lipo)" || return 1
+  nm_tool="$(switchyard_native_cpu_provider_inspection_tool nm)" || return 1
   otool_tool="$(switchyard_native_cpu_provider_inspection_tool otool)" || return 1
   vtool_tool="$(switchyard_native_cpu_provider_inspection_tool vtool)" || return 1
   switchyard_native_cpu_provider_validate_executable_path \
@@ -126,12 +127,14 @@ switchyard_validate_native_cpu_provider_files() {
   switchyard_native_cpu_provider_validate_executable_path \
     "$lipo_tool" "Native CPU-provider lipo tool" || return 1
   switchyard_native_cpu_provider_validate_executable_path \
+    "$nm_tool" "Native CPU-provider nm tool" || return 1
+  switchyard_native_cpu_provider_validate_executable_path \
     "$otool_tool" "Native CPU-provider otool tool" || return 1
   switchyard_native_cpu_provider_validate_executable_path \
     "$vtool_tool" "Native CPU-provider vtool tool" || return 1
 
   /usr/bin/python3 -I - "$manifest" "$runtime_root" "$digest_helper" \
-    "$lipo_tool" "$otool_tool" "$vtool_tool" \
+    "$lipo_tool" "$nm_tool" "$otool_tool" "$vtool_tool" \
     "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
     "$SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY" \
     "$SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY" \
@@ -160,6 +163,7 @@ import tempfile
     runtime_name,
     digest_helper,
     lipo_tool,
+    nm_tool,
     otool_tool,
     vtool_tool,
     minimum_macos,
@@ -492,7 +496,7 @@ try:
     expected_x64_abi = (
         "switchyard-xtajit64-provider-abi-v"
         + str(int(xtajit64_abi_version))
-        + "-process-init-80-begin-464"
+        + "-process-init-80-begin-472-doorbell-single-step"
     )
     x64_abi_bytes = xtajit64_abi_identity.encode("ascii")
 except (UnicodeError, ValueError) as error:
@@ -938,6 +942,21 @@ def validate_macho(relative, install_name, provider_binary):
             fail("provider Unix library does not bind exactly one native ntdll")
         if sorted(rpaths) != sorted(["@loader_path/", unicorn_rpath]):
             fail("provider Unix library does not have the exact runtime rpaths")
+        undefined = {
+            line.strip()
+            for line in command_output([nm_tool, "-ju", path], "nm -ju").splitlines()
+            if line.strip()
+        }
+        required = {
+            "_uc_emu_stop_at_instruction_boundary",
+            "_uc_enable_shared_memory_atomics",
+        }
+        missing = sorted(required - undefined)
+        if missing:
+            fail(
+                "provider Unix library does not import the required Switchyard "
+                "Unicorn API: " + ", ".join(missing)
+            )
     else:
         for dependency in dependencies:
             if dependency == install_name or dependency.startswith(("/usr/lib/", "/System/Library/")):
@@ -945,6 +964,21 @@ def validate_macho(relative, install_name, provider_binary):
             fail("Unicorn dylib has an unexpected dependency: " + dependency)
         if rpaths:
             fail("Unicorn dylib unexpectedly contains an LC_RPATH")
+        exports = {
+            line.strip()
+            for line in command_output([nm_tool, "-gjU", path], "nm -gjU").splitlines()
+            if line.strip()
+        }
+        required = {
+            "_uc_emu_stop_at_instruction_boundary",
+            "_uc_enable_shared_memory_atomics",
+        }
+        missing = sorted(required - exports)
+        if missing:
+            fail(
+                "Unicorn dylib does not export the required Switchyard API: "
+                + ", ".join(missing)
+            )
     verify_private_snapshot(record, relative)
 
 

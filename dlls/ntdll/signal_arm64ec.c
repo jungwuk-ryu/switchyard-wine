@@ -1614,7 +1614,6 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 void dispatch_emulation( ARM64_NT_CONTEXT *arm_ctx )
 {
     context_arm_to_x64( get_arm64ec_cpu_area()->ContextAmd64, arm_ctx );
-    get_arm64ec_cpu_area()->InSimulation = 1;
     pBeginSimulation();
 }
 __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
@@ -1639,6 +1638,7 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
     else context->X8 = STATUS_INVALID_SYSTEM_SERVICE;  /* set return value in rax */
 
     /* return to x64 code so that the syscall entry thunk is invoked properly */
+    get_arm64ec_cpu_area()->InSimulation = 1;
     dispatch_emulation( context );
 }
 

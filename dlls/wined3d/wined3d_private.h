@@ -485,6 +485,7 @@ struct wined3d_settings
     bool check_float_constants;
     bool cb_access_map_w;
     bool ffp_hlsl;
+    bool client_is_translated;
 };
 
 extern struct wined3d_settings wined3d_settings;

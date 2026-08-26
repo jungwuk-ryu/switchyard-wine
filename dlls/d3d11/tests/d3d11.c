@@ -15464,6 +15464,170 @@ static void test_resource_map(void)
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
+static BOOL is_committed_writable_pointer(void *pointer)
+{
+    MEMORY_BASIC_INFORMATION info = {0};
+    DWORD protection;
+    SIZE_T ret;
+
+    ret = VirtualQuery(pointer, &info, sizeof(info));
+    ok(ret == sizeof(info), "Failed to query pointer %p, ret %Iu, error %lu.\n",
+            pointer, ret, GetLastError());
+    if (ret != sizeof(info))
+        return FALSE;
+
+    ok(info.State == MEM_COMMIT, "Pointer %p has unexpected state %#lx.\n", pointer, info.State);
+    protection = info.Protect & 0xff;
+    ok(protection == PAGE_READWRITE || protection == PAGE_WRITECOPY
+            || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY,
+            "Pointer %p has non-writable protection %#lx.\n", pointer, info.Protect);
+    return info.State == MEM_COMMIT && (protection == PAGE_READWRITE || protection == PAGE_WRITECOPY
+            || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY);
+}
+
+static BOOL check_translated_map_pointer(void *pointer, SIZE_T size)
+{
+    BOOL first_accessible, last_accessible;
+
+    ok(!!pointer, "Got a NULL map pointer.\n");
+    if (!pointer || !size)
+        return FALSE;
+
+    first_accessible = is_committed_writable_pointer(pointer);
+    last_accessible = is_committed_writable_pointer((BYTE *)pointer + size - 1);
+    if (first_accessible && last_accessible)
+    {
+        ((BYTE *)pointer)[0] = 0x5a;
+        ((BYTE *)pointer)[size - 1] = 0xa5;
+    }
+    return first_accessible && last_accessible;
+}
+
+static void test_translated_dynamic_resource_map(void)
+{
+    D3D11_MAPPED_SUBRESOURCE mapped_subresource;
+    ID3D11DeviceContext *context, *deferred;
+    D3D11_TEXTURE2D_DESC texture_desc;
+    ID3D11CommandList *command_list;
+    D3D11_BUFFER_DESC buffer_desc;
+    ID3D11Texture2D *texture;
+    USHORT native_machine;
+    ID3D11Buffer *buffer;
+    ID3D11Device *device;
+    ULONG refcount;
+    HRESULT hr;
+
+    if (RtlWow64GetProcessMachines(GetCurrentProcess(), NULL, &native_machine)
+            || !native_machine || RtlWow64GetCurrentMachine() == native_machine)
+    {
+        skip("Not running with a translated client.\n");
+        return;
+    }
+
+    if (!(device = create_device(NULL)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+    ID3D11Device_GetImmediateContext(device, &context);
+
+    memset(&buffer_desc, 0, sizeof(buffer_desc));
+    buffer_desc.ByteWidth = 4096;
+    buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+    buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = ID3D11Device_CreateBuffer(device, &buffer_desc, NULL, &buffer);
+    ok(hr == S_OK, "Failed to create a dynamic buffer, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    memset(&mapped_subresource, 0, sizeof(mapped_subresource));
+    hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)buffer, 0,
+            D3D11_MAP_WRITE_DISCARD, 0, &mapped_subresource);
+    ok(hr == S_OK, "Failed to map a dynamic buffer with DISCARD, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        winetest_push_context("immediate buffer DISCARD");
+        check_translated_map_pointer(mapped_subresource.pData, buffer_desc.ByteWidth);
+        winetest_pop_context();
+        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)buffer, 0);
+    }
+
+    memset(&mapped_subresource, 0, sizeof(mapped_subresource));
+    hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)buffer, 0,
+            D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped_subresource);
+    ok(hr == S_OK, "Failed to map a dynamic buffer with NO_OVERWRITE, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        winetest_push_context("immediate buffer NO_OVERWRITE");
+        check_translated_map_pointer(mapped_subresource.pData, buffer_desc.ByteWidth);
+        winetest_pop_context();
+        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)buffer, 0);
+    }
+
+    memset(&texture_desc, 0, sizeof(texture_desc));
+    texture_desc.Width = 64;
+    texture_desc.Height = 64;
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Usage = D3D11_USAGE_DYNAMIC;
+    texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL, &texture);
+    ok(hr == S_OK, "Failed to create a dynamic texture, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        memset(&mapped_subresource, 0, sizeof(mapped_subresource));
+        hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)texture, 0,
+                D3D11_MAP_WRITE_DISCARD, 0, &mapped_subresource);
+        ok(hr == S_OK, "Failed to map a dynamic texture with DISCARD, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            winetest_push_context("immediate texture DISCARD");
+            check_translated_map_pointer(mapped_subresource.pData,
+                    mapped_subresource.RowPitch * texture_desc.Height);
+            winetest_pop_context();
+            ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)texture, 0);
+        }
+        refcount = ID3D11Texture2D_Release(texture);
+        ok(!refcount, "Texture has %lu references left.\n", refcount);
+    }
+
+    hr = ID3D11Device_CreateDeferredContext(device, 0, &deferred);
+    ok(hr == S_OK, "Failed to create a deferred context, hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        memset(&mapped_subresource, 0, sizeof(mapped_subresource));
+        hr = ID3D11DeviceContext_Map(deferred, (ID3D11Resource *)buffer, 0,
+                D3D11_MAP_WRITE_DISCARD, 0, &mapped_subresource);
+        ok(hr == S_OK, "Failed to map a deferred dynamic buffer, hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            winetest_push_context("deferred buffer DISCARD");
+            check_translated_map_pointer(mapped_subresource.pData, buffer_desc.ByteWidth);
+            winetest_pop_context();
+            ID3D11DeviceContext_Unmap(deferred, (ID3D11Resource *)buffer, 0);
+        }
+
+        command_list = NULL;
+        hr = ID3D11DeviceContext_FinishCommandList(deferred, FALSE, &command_list);
+        ok(hr == S_OK, "Failed to finish the deferred command list, hr %#lx.\n", hr);
+        if (command_list)
+            ID3D11CommandList_Release(command_list);
+        ID3D11DeviceContext_Release(deferred);
+    }
+
+    refcount = ID3D11Buffer_Release(buffer);
+    ok(!refcount, "Buffer has %lu references left.\n", refcount);
+
+done:
+    ID3D11DeviceContext_Release(context);
+    refcount = ID3D11Device_Release(device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
 #define check_resource_cpu_access(a, b, c, d, e) check_resource_cpu_access_(__LINE__, a, b, c, d, e)
 static void check_resource_cpu_access_(unsigned int line, ID3D11DeviceContext *context,
         ID3D11Resource *resource, D3D11_USAGE usage, UINT bind_flags, UINT cpu_access)
@@ -37553,6 +37717,11 @@ START_TEST(d3d11)
         test_create_device_child();
         return;
     }
+    if (argc == 3 && !strcmp(argv[2], "test_translated_dynamic_resource_map"))
+    {
+        test_translated_dynamic_resource_map();
+        return;
+    }
 
     if ((wined3d = GetModuleHandleA("wined3d.dll")))
     {
@@ -37633,6 +37802,7 @@ START_TEST(d3d11)
     queue_test(test_copy_subresource_region_1d);
     queue_test(test_copy_subresource_region_3d);
     queue_test(test_resource_map);
+    queue_test(test_translated_dynamic_resource_map);
     queue_for_each_feature_level(test_resource_access);
     queue_test(test_check_multisample_quality_levels);
     queue_for_each_feature_level(test_swapchain_formats);

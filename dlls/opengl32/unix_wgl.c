@@ -53,7 +53,18 @@ static BOOL is_wow64(void)
 }
 
 static UINT64 call_gl_debug_message_callback;
+static BOOL copy_client_strings;
 pthread_mutex_t wgl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct client_string_entry
+{
+    const char *native;
+    UINT_PTR client;
+    SIZE_T length;
+};
+
+static struct client_string_entry *client_strings;
+static SIZE_T client_strings_count;
 
 /* context state management */
 
@@ -1749,10 +1760,84 @@ GLsync wrap_glImportSyncEXT( TEB *teb, GLenum external_sync_type, GLintptr exter
     return client_sync;
 }
 
+NTSTATUS return_client_string( const void *str, UINT_PTR *client_str )
+{
+    struct client_string_entry *entry;
+    SIZE_T i, length;
+    void *tmp;
+
+    if (!copy_client_strings)
+    {
+        *client_str = (UINT_PTR)str;
+        return STATUS_SUCCESS;
+    }
+
+    if (!str)
+    {
+        *client_str = 0;
+        return STATUS_SUCCESS;
+    }
+
+    if ((length = strlen( str )) == ~(SIZE_T)0) return STATUS_INTEGER_OVERFLOW;
+    ++length;
+
+    pthread_mutex_lock( &wgl_lock );
+
+    for (i = 0; i < client_strings_count; ++i)
+        if (client_strings[i].native == str) break;
+
+    if (i == client_strings_count && i < ~(SIZE_T)0 / sizeof(*client_strings)
+            && (tmp = realloc( client_strings, (i + 1) * sizeof(*client_strings) )))
+    {
+        client_strings = tmp;
+        client_strings[i].native = str;
+        client_strings[i].client = 0;
+        client_strings[i].length = length;
+        ++client_strings_count;
+    }
+
+    if (i == client_strings_count)
+    {
+        ERR( "Failed to allocate memory for translated client strings\n" );
+        *client_str = 0;
+        pthread_mutex_unlock( &wgl_lock );
+        return STATUS_NO_MEMORY;
+    }
+
+    entry = &client_strings[i];
+    if (entry->client)
+    {
+        *client_str = entry->client;
+        pthread_mutex_unlock( &wgl_lock );
+        return STATUS_SUCCESS;
+    }
+
+    if (entry->length != length)
+    {
+        entry->length = length;
+        *client_str = length;
+        pthread_mutex_unlock( &wgl_lock );
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    if (*client_str)
+    {
+        memcpy( (void *)*client_str, str, length );
+        entry->client = *client_str;
+        pthread_mutex_unlock( &wgl_lock );
+        return STATUS_SUCCESS;
+    }
+
+    *client_str = length;
+    pthread_mutex_unlock( &wgl_lock );
+    return STATUS_BUFFER_TOO_SMALL;
+}
+
 NTSTATUS process_attach( void *args )
 {
     struct process_attach_params *params = args;
     call_gl_debug_message_callback = params->call_gl_debug_message_callback;
+    copy_client_strings = params->copy_client_strings;
     if (is_win64 && is_wow64())
     {
         SYSTEM_BASIC_INFORMATION info;
@@ -1788,6 +1873,9 @@ NTSTATUS process_detach( void *args )
         vk_instance = NULL;
     }
     vk_funcs = NULL;
+    free( client_strings );
+    client_strings = NULL;
+    client_strings_count = 0;
     return STATUS_SUCCESS;
 }
 

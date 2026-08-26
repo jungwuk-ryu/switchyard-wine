@@ -80,6 +80,31 @@ static bool (*custom_x18_abi_enabled_func)(void);
 static void (*set_custom_x18_abi_enabled_func)(bool enabled);
 #endif
 
+/* libsystem_kernel uses this exported commpage entry to commit TPIDR_EL0 after
+ * checking the public strict-toggle contract.  The kernel can reinstall its
+ * system TPIDR value asynchronously, so a query followed by the strict setter
+ * has an unavoidable check/use race.  Use the same update entry when present;
+ * init_custom_x18_abi() exercises both directions before PE code can rely on
+ * it, and older systems retain the public-API fallback. */
+#ifdef HAVE_OS_CUSTOM_X18_ABI
+extern void *update_tpidr __attribute__((weak_import));
+static BOOL use_idempotent_x18_transition;
+
+extern void set_custom_x18_abi_enabled_idempotent( BOOL enabled );
+__ASM_GLOBAL_FUNC( set_custom_x18_abi_enabled_idempotent,
+                   "mrs x9, TPIDR_EL0\n\t"
+                   "and x8, x9, #0xfffffffffff00000\n\t"
+                   "and x8, x8, #0xfffeffffffffffff\n\t"
+                   "cmp w0, #0\n\t"
+                   "mov x9, #0x1000000000000\n\t"
+                   "csel x9, x9, xzr, ne\n\t"
+                   "orr x0, x8, x9\n\t"
+                   "adrp x10, _update_tpidr@GOTPAGE\n\t"
+                   "ldr x10, [x10, _update_tpidr@GOTPAGEOFF]\n\t"
+                   "ldr x1, [x10]\n\t"
+                   "braaz x1" )
+#endif
+
 static void set_custom_x18_abi_enabled( BOOL enabled );
 
 static BOOL custom_x18_abi_enabled(void)
@@ -106,6 +131,10 @@ static BOOL init_custom_x18_abi(void)
     return FALSE;
 #endif
 
+#ifdef HAVE_OS_CUSTOM_X18_ABI
+    use_idempotent_x18_transition = &update_tpidr && update_tpidr;
+#endif
+
     /* Symbol availability does not prove that this task carries the required
      * entitlement. Exercise both states while x18 still belongs to Darwin. */
     if (!custom_x18_abi_enabled())
@@ -119,6 +148,13 @@ static BOOL init_custom_x18_abi(void)
 
 static void set_custom_x18_abi_enabled( BOOL enabled )
 {
+#ifdef HAVE_OS_CUSTOM_X18_ABI
+    if (use_idempotent_x18_transition)
+    {
+        set_custom_x18_abi_enabled_idempotent( enabled );
+        return;
+    }
+#endif
 #ifdef CUSTOM_X18_ABI_ALWAYS_AVAILABLE
     os_set_custom_x18_abi_enabled( enabled );
 #elif defined(HAVE_OS_CUSTOM_X18_ABI)
@@ -258,6 +294,8 @@ struct callback_stack_layout
 };
 C_ASSERT( offsetof(struct callback_stack_layout, sp) == 0x20 );
 C_ASSERT( sizeof(struct callback_stack_layout) == 0x30 );
+
+#define RESTORE_FLAGS_EMULATION  0x00010000
 
 struct syscall_frame
 {
@@ -494,15 +532,6 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
         frame->restore_flags |= CONTEXT_INTEGER;
 
-    if (is_arm64ec() && !is_ec_code( frame->pc ))
-    {
-        CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
-
-        user_context->ContextFlags = CONTEXT_FULL;
-        NtGetContextThread( GetCurrentThread(), user_context );
-        frame->sp = (ULONG_PTR)user_context;
-        frame->pc = (ULONG_PTR)pKiUserEmulationDispatcher;
-    }
     return status;
 }
 
@@ -559,6 +588,11 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
         frame->sp    = context->Sp;
         frame->pc    = context->Pc;
         frame->cpsr  = context->Cpsr;
+        if (is_arm64ec())
+        {
+            if (!is_ec_code( frame->pc )) flags |= RESTORE_FLAGS_EMULATION;
+            else frame->restore_flags &= ~RESTORE_FLAGS_EMULATION;
+        }
     }
     if (flags & CONTEXT_FLOATING_POINT)
     {
@@ -1332,6 +1366,83 @@ static BOOL set_arm64_signal_d( ucontext_t *context, unsigned int reg, ULONG64 v
     return TRUE;
 }
 
+/* macOS may lose the Windows x18 value on an exceptional return after custom
+ * x18 was enabled.  The TPIDR custom-mode bit is not a reliable discriminator:
+ * observed failures have left it either clear or set while saved x18 was zero.
+ * Recover only an authenticated ARM64EC or Wine syscall-entry TEB access;
+ * remove this bridge when Darwin preserves custom x18 across every kernel
+ * return path supported by the runtime. */
+extern void __wine_syscall_dispatcher(void);
+
+#define SYSCALL_DISPATCHER_FRAME_X18_OFFSET 4
+#define SYSCALL_DISPATCHER_TRACE_X18_OFFSET 52
+
+static BOOL fetch_lost_custom_x18_instr( ULONG_PTR pc, ULONG *instr )
+{
+    if (pc == (ULONG_PTR)__wine_syscall_dispatcher + SYSCALL_DISPATCHER_FRAME_X18_OFFSET ||
+        pc == (ULONG_PTR)__wine_syscall_dispatcher + SYSCALL_DISPATCHER_TRACE_X18_OFFSET)
+    {
+        *instr = *(const ULONG *)pc;
+        return TRUE;
+    }
+    return virtual_arm64ec_fetch_low_guest_instr( (const void *)pc, instr );
+}
+
+static BOOL recover_lost_custom_x18_fault( struct thread_data *data,
+                                           ucontext_t *sigcontext,
+                                           siginfo_t *siginfo )
+{
+    struct arm64ec_low_guest_access access;
+    DWORD64 esr = get_fault_esr( sigcontext );
+    ULONG_PTR pc = PC_sig( sigcontext );
+    ULONG_PTR lost_x18 = REGn_sig( 18, sigcontext );
+    ULONG_PTR base, offset_register = 0, producer_offset_register = 0;
+    ULONG instr, producer_instr;
+    unsigned int rn, rm, producer_rm;
+    BOOL derived = FALSE;
+
+    if (!data || !data->teb || !siginfo || !is_arm64ec() ||
+        is_inside_syscall( data, SP_sig( sigcontext )) ||
+        !arm64ec_low_guest_is_translation_fault( esr ) ||
+        !fetch_lost_custom_x18_instr( pc, &instr ))
+        return FALSE;
+    rn = arm64ec_low_guest_base_register( instr );
+    if (arm64ec_low_guest_offset_register( instr, &rm ) && rm != 31)
+    {
+        if (rm == 18 || !get_arm64_signal_reg( sigcontext, rm, &offset_register ))
+            return FALSE;
+    }
+    if (arm64ec_decode_lost_x18_access( instr, lost_x18, offset_register,
+                                        (ULONG_PTR)siginfo->si_addr,
+                                        ESR_ELx_ISS_DABT_WNR(esr),
+                                        WINE_LOW_VA_SHADOW_SIZE, &access ))
+        goto recover;
+
+    /* A compiler may first derive an indexed TEB address in a temporary and
+     * fault on the following memory instruction.  Authenticate the complete
+     * two-instruction dependency, then replay only the side-effect-free ADD. */
+    if (pc < sizeof(ULONG) || rn == 18 || rn == 31 ||
+        !virtual_arm64ec_fetch_low_guest_instr( (const void *)(pc - sizeof(ULONG)),
+                                                &producer_instr ) ||
+        !get_arm64_signal_reg( sigcontext, rn, &base ))
+        return FALSE;
+    producer_rm = (producer_instr >> 16) & 0x1f;
+    if (producer_rm != 31 &&
+        !get_arm64_signal_reg( sigcontext, producer_rm, &producer_offset_register ))
+        return FALSE;
+    if (!arm64ec_decode_lost_x18_derived_access(
+            producer_instr, instr, lost_x18, producer_offset_register,
+            base, offset_register, (ULONG_PTR)siginfo->si_addr,
+            ESR_ELx_ISS_DABT_WNR(esr), WINE_LOW_VA_SHADOW_SIZE, &access ))
+        return FALSE;
+    derived = TRUE;
+
+recover:
+    REGn_sig( 18, sigcontext ) = (ULONG_PTR)data->teb;
+    if (derived) PC_sig( sigcontext ) = pc - sizeof(ULONG);
+    return TRUE;
+}
+
 static BOOL handle_arm64ec_low_guest_access( struct thread_data *data, ucontext_t *sigcontext,
                                              siginfo_t *siginfo, DWORD64 esr,
                                              EXCEPTION_RECORD *rec, BOOL *raise_exception )
@@ -1794,6 +1905,16 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         save_context( &context, sigcontext );
         context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         wait_suspend( &context );
+        if (is_arm64ec() && !is_ec_code( context.Pc ))
+        {
+            CONTEXT *user_context = (CONTEXT *)((context.Sp - sizeof(CONTEXT)) & ~15);
+
+            chpe->InSimulation = 1;
+            *user_context = context;
+            user_context->ContextFlags = CONTEXT_FULL;
+            context.Sp = (ULONG_PTR)user_context;
+            context.Pc = (ULONG_PTR)pKiUserEmulationDispatcher;
+        }
         restore_context( &context, sigcontext );
     }
 }
@@ -1814,10 +1935,23 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     if (!is_inside_syscall( data, SP_sig(sigcontext) )) return;
     if (!frame) return;
 
+    if (is_arm64ec() && !is_ec_code( frame->pc ))
+    {
+        CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
+
+        data->teb->ChpeV2CpuAreaInfo->InSimulation = 1;
+        user_context->ContextFlags = CONTEXT_FULL;
+        NtGetContextThread( GetCurrentThread(), user_context );
+        SP_sig(sigcontext) = (ULONG_PTR)user_context;
+        PC_sig(sigcontext) = (ULONG_PTR)pKiUserEmulationDispatcher;
+    }
+    else
+    {
+        SP_sig(sigcontext) = frame->sp;
+        PC_sig(sigcontext) = frame->pc;
+    }
     FP_sig(sigcontext)     = frame->fp;
     LR_sig(sigcontext)     = frame->lr;
-    SP_sig(sigcontext)     = frame->sp;
-    PC_sig(sigcontext)     = frame->pc;
     PSTATE_sig(sigcontext) = frame->cpsr;
     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = frame->x[i];
 
@@ -1852,7 +1986,11 @@ static void dispatch_signal_with_system_x18( signal_handler_func handler, int si
     BOOL resume_custom = custom;
 
     if (custom) set_custom_x18_abi_enabled( FALSE );
-    handler( signal, siginfo, sigcontext );
+    if ((signal == SIGSEGV || signal == SIGBUS) &&
+        recover_lost_custom_x18_fault( get_thread_data(), sigcontext, siginfo ))
+        resume_custom = TRUE;
+    else
+        handler( signal, siginfo, sigcontext );
 
     /* A system-ABI fault may have been redirected to a Windows dispatcher.
      * The SIGUSR2 slow path likewise resumes the saved Windows frame. */
@@ -1866,6 +2004,10 @@ static void dispatch_signal_with_system_x18( signal_handler_func handler, int si
         if (!resume_custom && handler == usr2_handler)
             resume_custom = frame && SP_sig( sigcontext ) == frame->sp &&
                             PC_sig( sigcontext ) == frame->pc &&
+                            REGn_sig( 18, sigcontext ) == frame->x[18];
+        if (!resume_custom && handler == usr2_handler)
+            resume_custom = frame &&
+                            PC_sig( sigcontext ) == (ULONG_PTR)pKiUserEmulationDispatcher &&
                             REGn_sig( 18, sigcontext ) == frame->x[18];
     }
 
@@ -2248,7 +2390,9 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
-                   "tbz x16, #1, 2f\n\t"        /* CONTEXT_INTEGER */
+                   "tbz x16, #16, 1f\n\t"       /* RESTORE_FLAGS_EMULATION */
+                   "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
+                   "1:\ttbz x16, #1, 2f\n"      /* CONTEXT_INTEGER */
                    "ldp x12, x13, [sp, #0x80]\n\t" /* frame->x[16..17] */
                    "ldp x14, x15, [sp, #0xf8]\n\t" /* frame->sp, frame->pc */
                    "cmp x12, x15\n\t"              /* frame->x16 == frame->pc? */

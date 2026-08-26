@@ -21,18 +21,20 @@
 #define XTAJIT64_MAX_HOST_PAGE_SIZE   0x10000
 #define XTAJIT64_GUEST_KUSER          WINE_USER_SHARED_DATA_ADDRESS
 #define XTAJIT64_X64_USER_ADDRESS_MAX 0x00007fffffffffffull
-#define XTAJIT64_PROCESS_ABI_VERSION          6u
+#define XTAJIT64_PROCESS_ABI_VERSION          8u
 #define XTAJIT64_PROCESS_INIT_PARAMS_SIZE     80u
-#define XTAJIT64_BEGIN_PARAMS_SIZE            464u
+#define XTAJIT64_BEGIN_PARAMS_SIZE            472u
 #define XTAJIT64_PROVIDER_ABI_IDENTITY \
-    "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464"
+    "switchyard-xtajit64-provider-abi-v8-process-init-80-begin-472-doorbell-single-step"
 
 #define XTAJIT64_CAP_GS_NATIVE_DOMAIN 0x00000001u
 #define XTAJIT64_CAP_ADDRESS_CODEC    0x00000002u
 #define XTAJIT64_CAP_MUTATION_CODEC   0x00000004u
+#define XTAJIT64_CAP_SUSPEND_DOORBELL 0x00000008u
 #define XTAJIT64_CAPABILITIES         (XTAJIT64_CAP_GS_NATIVE_DOMAIN | \
                                        XTAJIT64_CAP_ADDRESS_CODEC | \
-                                       XTAJIT64_CAP_MUTATION_CODEC)
+                                       XTAJIT64_CAP_MUTATION_CODEC | \
+                                       XTAJIT64_CAP_SUSPEND_DOORBELL)
 
 #define XTAJIT64_MEMORY_VALID_FLAGS   0u
 
@@ -90,7 +92,9 @@ enum xtajit64_stop_reason
     XTAJIT64_STOP_MAPPING_MISS,
     XTAJIT64_STOP_INVALID_INSTRUCTION,
     XTAJIT64_STOP_UNSUPPORTED_TRANSITION,
-    XTAJIT64_STOP_INTERNAL_ERROR
+    XTAJIT64_STOP_INTERNAL_ERROR,
+    XTAJIT64_STOP_SUSPEND,
+    XTAJIT64_STOP_SINGLE_STEP
 };
 
 struct xtajit64_x64_context
@@ -168,6 +172,7 @@ struct xtajit64_begin_params
     UINT32 stop_reason;
     UINT32 unicorn_error;
     UINT32 reserved;
+    UINT64 suspend_doorbell;
 };
 
 struct xtajit64_poison_params
@@ -205,6 +210,7 @@ C_ASSERT( offsetof(struct xtajit64_begin_params, fault_access) == 448 );
 C_ASSERT( offsetof(struct xtajit64_begin_params, stop_reason) == 452 );
 C_ASSERT( offsetof(struct xtajit64_begin_params, unicorn_error) == 456 );
 C_ASSERT( offsetof(struct xtajit64_begin_params, reserved) == 460 );
+C_ASSERT( offsetof(struct xtajit64_begin_params, suspend_doorbell) == 464 );
 C_ASSERT( sizeof(struct xtajit64_begin_params) == XTAJIT64_BEGIN_PARAMS_SIZE );
 C_ASSERT( sizeof(struct xtajit64_poison_params) == 8 );
 C_ASSERT( !(XTAJIT64_GUEST_KUSER & (XTAJIT64_MAX_HOST_PAGE_SIZE - 1)) );

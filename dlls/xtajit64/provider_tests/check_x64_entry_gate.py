@@ -45,8 +45,15 @@ def main() -> int:
     if run.find(gate) > run.find(begin):
         raise AssertionError("run_x64_simulation reaches the provider before the ntdll gate")
 
-    require(function_body(source, "BeginSimulation"), "run_x64_simulation( state )",
-            "BeginSimulation")
+    begin = function_body(source, "BeginSimulation")
+    require(begin, r'b \"#begin_simulation_on_control_stack\"', "BeginSimulation")
+    control = function_body(source, "begin_simulation_on_control_stack")
+    require(control, "run_x64_simulation( state )",
+            "begin_simulation_on_control_stack")
+    for token in ("state != get_thread_state()",
+                  "state->magic != XTAJIT64_THREAD_STATE_MAGIC",
+                  "discard_unwound_transition_frames"):
+        require(control, token, "begin_simulation_on_control_stack")
     require(function_body(source, "xtajit64_transition_from_native"),
             "run_x64_simulation( state )", "xtajit64_transition_from_native", 3)
     require(function_body(source, "xtajit64_capture_native"),

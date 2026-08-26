@@ -337,4 +337,69 @@ validate:
     return true;
 }
 
+/* Match only a bounded, non-writeback access whose architectural base is x18.
+ * This is also used to authenticate a Darwin custom-x18 recovery fault; keep it
+ * as strict as the fixed-low bridge so an unrelated null dereference cannot be
+ * mistaken for a lost platform-register state. */
+static inline bool arm64ec_decode_lost_x18_access( uint32_t instruction,
+                                                   uint64_t base,
+                                                   uint64_t offset_register,
+                                                   uint64_t fault, bool esr_write,
+                                                   uint64_t low_limit,
+                                                   struct arm64ec_low_guest_access *access )
+{
+    struct arm64ec_low_guest_access decoded;
+
+    if (arm64ec_low_guest_base_register( instruction ) != 18 ||
+        !arm64ec_decode_low_guest_access( instruction, base, offset_register,
+                                          fault, esr_write, low_limit, &decoded ) ||
+        decoded.writeback_valid)
+        return false;
+    if (access) *access = decoded;
+    return true;
+}
+
+/* Match an access through a temporary register produced immediately beforehand
+ * by a side-effect-free extended ADD from x18.  The caller must replay the ADD
+ * after restoring x18; validating its result against the captured temporary
+ * value proves that the low access was actually derived from the lost platform
+ * register rather than from an unrelated null pointer. */
+static inline bool arm64ec_decode_lost_x18_derived_access(
+    uint32_t producer_instruction, uint32_t access_instruction,
+    uint64_t lost_x18, uint64_t producer_offset_register,
+    uint64_t access_base, uint64_t access_offset_register,
+    uint64_t fault, bool esr_write, uint64_t low_limit,
+    struct arm64ec_low_guest_access *access )
+{
+    struct arm64ec_low_guest_access decoded;
+    unsigned int rd = producer_instruction & 0x1f;
+    unsigned int rn = arm64ec_low_guest_base_register( producer_instruction );
+    unsigned int rm = (producer_instruction >> 16) & 0x1f;
+    unsigned int option = (producer_instruction >> 13) & 7;
+    unsigned int shift = (producer_instruction >> 10) & 7;
+    uint64_t delta, expected_base;
+    bool negative;
+
+    /* ADD Xd, Xn, Rm, extend #shift, without flag updates.  Replaying an ADD
+     * that writes SP or x18 is not safe, and an overwritten Rm cannot be
+     * reconstructed from the fault context. */
+    if ((producer_instruction & UINT32_C(0xffe00000)) != UINT32_C(0x8b200000) ||
+        rn != 18 || rd == 18 || rd == 31 || rm == 18 || rm == rd ||
+        rd != arm64ec_low_guest_base_register( access_instruction ))
+        return false;
+    if (rm == 31) producer_offset_register = 0;
+    if (!arm64ec_low_guest_register_delta( producer_offset_register, option, shift,
+                                            &negative, &delta ) ||
+        !arm64ec_low_guest_add_delta( lost_x18, negative, delta, low_limit,
+                                      &expected_base ) ||
+        expected_base != access_base ||
+        !arm64ec_decode_low_guest_access( access_instruction, access_base,
+                                          access_offset_register, fault, esr_write,
+                                          low_limit, &decoded ) ||
+        decoded.writeback_valid)
+        return false;
+    if (access) *access = decoded;
+    return true;
+}
+
 #endif /* __WINE_ARM64EC_LOW_GUEST_DECODE_H */

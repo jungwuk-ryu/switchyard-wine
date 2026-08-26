@@ -9077,6 +9077,8 @@ static void test_system_abi_illegal_instruction(void)
 
 #if defined(__aarch64__) && !defined(__arm64ec__)
 
+C_ASSERT( FIELD_OFFSET(TEB, Tib.Self) == 0x30 );
+
 static WCHAR *find_last_path_separator( WCHAR *path )
 {
     WCHAR *ret = NULL;
@@ -9145,15 +9147,29 @@ static void test_system_x18_dispatcher_entry(void)
 {
     typedef NTSTATUS (WINAPI *unix_call_dispatcher_func)(unixlib_handle_t,
                                                          unsigned int, void *);
+    typedef NTSTATUS (WINAPI *allocate_virtual_memory_ex_func)(HANDLE, void **,
+                                                                SIZE_T *, ULONG, ULONG,
+                                                                MEM_EXTENDED_PARAMETER *, ULONG);
     typedef NTSTATUS (*direct_bridge_func)(void *);
+    static const ULONG recovery_code[] =
+    {
+        0xd503245f, /* bti c */
+        0xf9401a40, /* ldr x0,[x18,#0x30] -- TEB.Tib.Self */
+        0xd65f03c0, /* ret */
+    };
     struct x18_dispatch_test_state state;
     unix_call_dispatcher_func *dispatcher_export, dispatcher;
+    allocate_virtual_memory_ex_func allocate_virtual_memory_ex;
     unixlib_handle_t *ntdll_handle_export;
+    MEM_EXTENDED_PARAMETER ext = {0};
     unixlib_module_t test_module = 0;
     unixlib_handle_t test_handle = 0;
     const ULONG_PTR *test_funcs;
     direct_bridge_func bridge;
+    void *recovery_target = NULL;
     ULONG_PTR shared_data = (ULONG_PTR)NtCurrentTeb()->Peb->SharedData;
+    SIZE_T commit_size;
+    SIZE_T recovery_size = 0x10000;
     WCHAR helper_path[MAX_PATH];
     BOOL found;
     NTSTATUS status;
@@ -9192,6 +9208,41 @@ static void test_system_x18_dispatcher_entry(void)
         return;
     }
 
+    allocate_virtual_memory_ex = (void *)RtlFindExportedRoutineByName(
+        hntdll, "NtAllocateVirtualMemoryEx" );
+    if (!allocate_virtual_memory_ex)
+    {
+        win_skip( "NtAllocateVirtualMemoryEx is unavailable\n" );
+        __wine_unload_unix_lib( test_module );
+        return;
+    }
+    ext.Type = MemExtendedParameterAttributeFlags;
+    ext.ULong64 = MEM_EXTENDED_PARAMETER_EC_CODE;
+    status = allocate_virtual_memory_ex( NtCurrentProcess(), &recovery_target,
+                                         &recovery_size, MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE, &ext, 1 );
+    ok( !status, "failed to allocate EC recovery target, status %#lx\n", status );
+    if (status)
+    {
+        __wine_unload_unix_lib( test_module );
+        return;
+    }
+    commit_size = recovery_size;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &recovery_target, 0,
+                                      &commit_size, MEM_COMMIT,
+                                      PAGE_EXECUTE_READWRITE );
+    ok( !status, "failed to commit EC recovery target, status %#lx\n", status );
+    if (status)
+    {
+        recovery_size = 0;
+        NtFreeVirtualMemory( NtCurrentProcess(), &recovery_target,
+                             &recovery_size, MEM_RELEASE );
+        __wine_unload_unix_lib( test_module );
+        return;
+    }
+    memcpy( recovery_target, recovery_code, sizeof(recovery_code) );
+    FlushInstructionCache( GetCurrentProcess(), recovery_target, sizeof(recovery_code) );
+
     for (i = 0; i < 2; i++)
     {
         TEB *teb = NtCurrentTeb();
@@ -9205,6 +9256,7 @@ static void test_system_x18_dispatcher_entry(void)
         state.opaque_status = STATUS_UNSUCCESSFUL;
         state.system_status = STATUS_UNSUCCESSFUL;
         state.teb_status = STATUS_UNSUCCESSFUL;
+        state.recovery_target = (ULONG_PTR)recovery_target;
 
         status = bridge( &state );
         if (status == STATUS_NOT_SUPPORTED)
@@ -9251,9 +9303,23 @@ static void test_system_x18_dispatcher_entry(void)
         ok( state.observed_teb == state.expected_teb,
             "iteration %u observed TEB %p, expected %p\n", i,
             (void *)(ULONG_PTR)state.observed_teb, (void *)(ULONG_PTR)state.expected_teb );
+        ok( state.recovery_called == TRUE,
+            "iteration %u recovery target call count is %u\n", i,
+            state.recovery_called );
+        ok( state.recovered_custom == TRUE,
+            "iteration %u recovered mode is %u\n", i, state.recovered_custom );
+        ok( state.recovered_teb == state.expected_teb,
+            "iteration %u recovered TEB %p, expected %p\n", i,
+            (void *)(ULONG_PTR)state.recovered_teb,
+            (void *)(ULONG_PTR)state.expected_teb );
         ok( NtCurrentTeb() == teb, "iteration %u returned with TEB %p, expected %p\n",
             i, NtCurrentTeb(), teb );
     }
+
+    recovery_size = 0;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), &recovery_target,
+                                  &recovery_size, MEM_RELEASE );
+    ok( !status, "failed to free EC recovery target, status %#lx\n", status );
 
     status = __wine_unload_unix_lib( test_module );
     ok( !status, "failed to unload the native system-x18 helper, status %#lx\n", status );
@@ -13185,6 +13251,13 @@ START_TEST(exception)
 #endif
 
     my_argc = winetest_get_mainargs( &my_argv );
+#if defined(__aarch64__) && !defined(__arm64ec__)
+    if (my_argc == 3 && !strcmp( my_argv[2], "system-x18" ))
+    {
+        test_system_x18_dispatcher_entry();
+        return;
+    }
+#endif
     if (my_argc >= 4)
     {
         void *addr;

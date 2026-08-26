@@ -1227,9 +1227,15 @@ static NTSTATUS gl_glGetString( void *args )
 {
     struct glGetString_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
+    const GLubyte *ret;
+    UINT_PTR client_ret;
+    NTSTATUS status;
     if (!funcs->p_glGetString) return STATUS_NOT_IMPLEMENTED;
-    params->ret = wrap_glGetString( params->teb, params->name, funcs->p_glGetString );
-    return STATUS_SUCCESS;
+    ret = wrap_glGetString( params->teb, params->name, funcs->p_glGetString );
+    client_ret = (UINT_PTR)params->ret;
+    status = return_client_string( ret, &client_ret );
+    params->ret = (const GLubyte *)(UINT_PTR)client_ret;
+    return status;
 }
 
 static NTSTATUS gl_glGetTexEnvfv( void *args )
@@ -12325,9 +12331,15 @@ static NTSTATUS ext_glGetStringi( void *args )
 {
     struct glGetStringi_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
+    const GLubyte *ret;
+    UINT_PTR client_ret;
+    NTSTATUS status;
     if (!funcs->p_glGetStringi) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glGetStringi( params->name, params->index );
-    return STATUS_SUCCESS;
+    ret = funcs->p_glGetStringi( params->name, params->index );
+    client_ret = (UINT_PTR)params->ret;
+    status = return_client_string( ret, &client_ret );
+    params->ret = (const GLubyte *)(UINT_PTR)client_ret;
+    return status;
 }
 
 static NTSTATUS ext_glGetSubroutineIndex( void *args )
@@ -30447,9 +30459,15 @@ static NTSTATUS ext_wglQueryCurrentRendererStringWINE( void *args )
 {
     struct wglQueryCurrentRendererStringWINE_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
+    const GLchar *ret;
+    UINT_PTR client_ret;
+    NTSTATUS status;
     if (!funcs->p_wglQueryCurrentRendererStringWINE) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_wglQueryCurrentRendererStringWINE( params->attribute );
-    return STATUS_SUCCESS;
+    ret = funcs->p_wglQueryCurrentRendererStringWINE( params->attribute );
+    client_ret = (UINT_PTR)params->ret;
+    status = return_client_string( ret, &client_ret );
+    params->ret = (const GLchar *)(UINT_PTR)client_ret;
+    return status;
 }
 
 static NTSTATUS ext_wglQueryPbufferARB( void *args )
@@ -30474,9 +30492,15 @@ static NTSTATUS ext_wglQueryRendererStringWINE( void *args )
 {
     struct wglQueryRendererStringWINE_params *params = args;
     const struct opengl_funcs *funcs = get_dc_funcs( params->dc );
+    const GLchar *ret;
+    UINT_PTR client_ret;
+    NTSTATUS status;
     if (!funcs || !funcs->p_wglQueryRendererStringWINE) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_wglQueryRendererStringWINE( params->dc, params->renderer, params->attribute );
-    return STATUS_SUCCESS;
+    ret = funcs->p_wglQueryRendererStringWINE( params->dc, params->renderer, params->attribute );
+    client_ret = (UINT_PTR)params->ret;
+    status = return_client_string( ret, &client_ret );
+    params->ret = (const GLchar *)(UINT_PTR)client_ret;
+    return status;
 }
 
 static NTSTATUS ext_wglReleasePbufferDCARB( void *args )

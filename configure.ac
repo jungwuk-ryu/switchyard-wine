@@ -1557,18 +1557,31 @@ then
                 [AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <unicorn/unicorn.h>
 #if UC_API_MAJOR < 2 || (UC_API_MAJOR == 2 && (UC_API_MINOR < 1 || (UC_API_MINOR == 1 && UC_API_PATCH < 4)))
 #error Unicorn 2.1.4 or newer is required
+#endif
+#ifndef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP
+#error Switchyard instruction-boundary stop support is required
+#endif
+#ifndef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
+#error Switchyard shared-memory atomic support is required
+#endif
+#ifndef UC_SWITCHYARD_SHARED_CODE_COHERENCE
+#error Switchyard shared-code coherence support is required
 #endif]])],
                     [AC_CHECK_FUNC(uc_open,
-                        [XTAJIT64_UNIXLIB=xtajit64.so
-                         XTAJIT64_PE_CFLAGS=-DHAVE_UNICORN
-                         XTAJIT_UNIXLIB=xtajit.so
-                         XTAJIT_PE_CFLAGS=-DHAVE_UNICORN],
+                        [AC_CHECK_FUNC(uc_emu_stop_at_instruction_boundary,
+                            [AC_CHECK_FUNC(uc_enable_shared_memory_atomics,
+                                [XTAJIT64_UNIXLIB=xtajit64.so
+                                 XTAJIT64_PE_CFLAGS=-DHAVE_UNICORN
+                                 XTAJIT_UNIXLIB=xtajit.so
+                                 XTAJIT_PE_CFLAGS=-DHAVE_UNICORN],
+                                [UNICORN_LIBS=""])],
+                            [UNICORN_LIBS=""])],
                         [UNICORN_LIBS=""])],
                     [UNICORN_LIBS=""])],
                 [UNICORN_LIBS=""])],
             [UNICORN_LIBS=""])])
     WINE_ERROR_WITH(unicorn,[test "x$UNICORN_LIBS" = "x"],
-                    [Unicorn 2.1.4 or newer development files not found.])
+                    [Switchyard Unicorn 2.1.4 development files with instruction-boundary stop, shared-memory atomic, and shared-code coherence support not found.])
 fi
 
 dnl **** Check for libpcap ****

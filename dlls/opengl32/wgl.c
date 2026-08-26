@@ -61,45 +61,41 @@ static char *wgl_extensions;
 static const char *extension_names[] = { ALL_GL_EXTS ALL_WGL_EXTS };
 #undef USE_GL_EXT
 
-#ifndef _WIN64
+static char **unix_strings;
+static SIZE_T unix_strings_count;
 
-static char **wow64_strings;
-static SIZE_T wow64_strings_count;
-
-static CRITICAL_SECTION wow64_cs;
-static CRITICAL_SECTION_DEBUG wow64_cs_debug =
+static CRITICAL_SECTION unix_strings_cs;
+static CRITICAL_SECTION_DEBUG unix_strings_cs_debug =
 {
-    0, 0, &wow64_cs,
-    { &wow64_cs_debug.ProcessLocksList, &wow64_cs_debug.ProcessLocksList },
-      0, 0, { (DWORD_PTR)(__FILE__ ": wow64_cs") }
+    0, 0, &unix_strings_cs,
+    { &unix_strings_cs_debug.ProcessLocksList, &unix_strings_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": unix_strings_cs") }
 };
-static CRITICAL_SECTION wow64_cs = { &wow64_cs_debug, -1, 0, 0, 0, 0 };
+static CRITICAL_SECTION unix_strings_cs = { &unix_strings_cs_debug, -1, 0, 0, 0, 0 };
 
-static void append_wow64_string( char *str )
+static void append_unix_string( char *str )
 {
     char **tmp;
 
-    EnterCriticalSection( &wow64_cs );
+    EnterCriticalSection( &unix_strings_cs );
 
-    if (!(tmp = realloc( wow64_strings, (wow64_strings_count + 1) * sizeof(*wow64_strings) )))
-        ERR( "Failed to allocate memory for wow64 strings\n" );
+    if (unix_strings_count == ~(SIZE_T)0 / sizeof(*unix_strings) ||
+            !(tmp = realloc( unix_strings, (unix_strings_count + 1) * sizeof(*unix_strings) )))
+        ERR( "Failed to retain Unix string allocation\n" );
     else
     {
-        wow64_strings = tmp;
-        wow64_strings[wow64_strings_count] = str;
-        wow64_strings_count += 1;
+        unix_strings = tmp;
+        unix_strings[unix_strings_count++] = str;
     }
 
-    LeaveCriticalSection( &wow64_cs );
+    LeaveCriticalSection( &unix_strings_cs );
 }
 
-static void cleanup_wow64_strings(void)
+static void cleanup_unix_strings(void)
 {
-    while (wow64_strings_count--) free( wow64_strings[wow64_strings_count] );
-    free( wow64_strings );
+    while (unix_strings_count--) free( unix_strings[unix_strings_count] );
+    free( unix_strings );
 }
-
-#endif
 
 static const char *debugstr_object_type( enum object_type type )
 {
@@ -2744,9 +2740,7 @@ const GLubyte * WINAPI glGetStringi( GLenum name, GLuint index )
     };
     NTSTATUS status;
     struct context *ctx;
-#ifndef _WIN64
-    GLubyte *wow64_str = NULL;
-#endif
+    GLubyte *unix_str = NULL;
 
     TRACE( "name %d, index %d\n", name, index );
 
@@ -2761,14 +2755,19 @@ const GLubyte * WINAPI glGetStringi( GLenum name, GLuint index )
         return NULL;
     }
 
-#ifndef _WIN64
-    if (UNIX_CALL( glGetStringi, &args ) == STATUS_BUFFER_TOO_SMALL) args.ret = wow64_str = malloc( (size_t)args.ret );
-#endif
-    if ((status = UNIX_CALL( glGetStringi, &args ))) WARN( "glGetStringi returned %#lx\n", status );
-#ifndef _WIN64
-    if (args.ret != wow64_str) free( wow64_str );
-    else if (args.ret) append_wow64_string( (char *)args.ret );
-#endif
+    if ((status = UNIX_CALL( glGetStringi, &args )) == STATUS_BUFFER_TOO_SMALL)
+    {
+        if (!(args.ret = unix_str = malloc( (SIZE_T)(UINT_PTR)args.ret ))) return NULL;
+        status = UNIX_CALL( glGetStringi, &args );
+    }
+    if (status)
+    {
+        WARN( "glGetStringi returned %#lx\n", status );
+        free( unix_str );
+        return NULL;
+    }
+    if (args.ret != unix_str) free( unix_str );
+    else if (args.ret) append_unix_string( (char *)args.ret );
     return args.ret;
 }
 
@@ -2779,20 +2778,23 @@ const GLubyte * WINAPI glGetString( GLenum name )
 {
     struct glGetString_params args = { .teb = NtCurrentTeb(), .name = name };
     NTSTATUS status;
-#ifndef _WIN64
-    GLubyte *wow64_str = NULL;
-#endif
+    GLubyte *unix_str = NULL;
 
     TRACE( "name %d\n", name );
 
-#ifndef _WIN64
-    if (UNIX_CALL( glGetString, &args ) == STATUS_BUFFER_TOO_SMALL) args.ret = wow64_str = malloc( (size_t)args.ret );
-#endif
-    if ((status = UNIX_CALL( glGetString, &args ))) WARN( "glGetString returned %#lx\n", status );
-#ifndef _WIN64
-    if (args.ret != wow64_str) free( wow64_str );
-    else if (args.ret) append_wow64_string( (char *)args.ret );
-#endif
+    if ((status = UNIX_CALL( glGetString, &args )) == STATUS_BUFFER_TOO_SMALL)
+    {
+        if (!(args.ret = unix_str = malloc( (SIZE_T)(UINT_PTR)args.ret ))) return NULL;
+        status = UNIX_CALL( glGetString, &args );
+    }
+    if (status)
+    {
+        WARN( "glGetString returned %#lx\n", status );
+        free( unix_str );
+        return NULL;
+    }
+    if (args.ret != unix_str) free( unix_str );
+    else if (args.ret) append_unix_string( (char *)args.ret );
     return args.ret;
 }
 
@@ -2812,20 +2814,23 @@ const GLchar * WINAPI wglQueryCurrentRendererStringWINE( GLenum attribute )
 {
     struct wglQueryCurrentRendererStringWINE_params args = { .teb = NtCurrentTeb(), .attribute = attribute };
     NTSTATUS status;
-#ifndef _WIN64
-    char *wow64_str = NULL;
-#endif
+    char *unix_str = NULL;
 
     TRACE( "attribute %d\n", attribute );
 
-#ifndef _WIN64
-    if (UNIX_CALL( wglQueryCurrentRendererStringWINE, &args ) == STATUS_BUFFER_TOO_SMALL) args.ret = wow64_str = malloc( (size_t)args.ret );
-#endif
-    if ((status = UNIX_CALL( wglQueryCurrentRendererStringWINE, &args ))) WARN( "wglQueryCurrentRendererStringWINE returned %#lx\n", status );
-#ifndef _WIN64
-    if (args.ret != wow64_str) free( wow64_str );
-    else if (args.ret) append_wow64_string( wow64_str );
-#endif
+    if ((status = UNIX_CALL( wglQueryCurrentRendererStringWINE, &args )) == STATUS_BUFFER_TOO_SMALL)
+    {
+        if (!(args.ret = unix_str = malloc( (SIZE_T)(UINT_PTR)args.ret ))) return NULL;
+        status = UNIX_CALL( wglQueryCurrentRendererStringWINE, &args );
+    }
+    if (status)
+    {
+        WARN( "wglQueryCurrentRendererStringWINE returned %#lx\n", status );
+        free( unix_str );
+        return NULL;
+    }
+    if (args.ret != unix_str) free( unix_str );
+    else if (args.ret) append_unix_string( unix_str );
     return args.ret;
 }
 
@@ -2839,20 +2844,23 @@ const GLchar * WINAPI wglQueryRendererStringWINE( HDC dc, GLint renderer, GLenum
         .attribute = attribute,
     };
     NTSTATUS status;
-#ifndef _WIN64
-    char *wow64_str = NULL;
-#endif
+    char *unix_str = NULL;
 
     TRACE( "dc %p, renderer %d, attribute %d\n", dc, renderer, attribute );
 
-#ifndef _WIN64
-    if (UNIX_CALL( wglQueryRendererStringWINE, &args ) == STATUS_BUFFER_TOO_SMALL) args.ret = wow64_str = malloc( (size_t)args.ret );
-#endif
-    if ((status = UNIX_CALL( wglQueryRendererStringWINE, &args ))) WARN( "wglQueryRendererStringWINE returned %#lx\n", status );
-#ifndef _WIN64
-    if (args.ret != wow64_str) free( wow64_str );
-    else if (args.ret) append_wow64_string( wow64_str );
-#endif
+    if ((status = UNIX_CALL( wglQueryRendererStringWINE, &args )) == STATUS_BUFFER_TOO_SMALL)
+    {
+        if (!(args.ret = unix_str = malloc( (SIZE_T)(UINT_PTR)args.ret ))) return NULL;
+        status = UNIX_CALL( wglQueryRendererStringWINE, &args );
+    }
+    if (status)
+    {
+        WARN( "wglQueryRendererStringWINE returned %#lx\n", status );
+        free( unix_str );
+        return NULL;
+    }
+    if (args.ret != unix_str) free( unix_str );
+    else if (args.ret) append_unix_string( unix_str );
     return args.ret;
 }
 
@@ -2878,11 +2886,14 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
         .call_gl_debug_message_callback = (UINT_PTR)call_gl_debug_message_callback,
     };
     struct context *context;
+    USHORT native_machine;
     NTSTATUS status;
 
     switch(reason)
     {
     case DLL_PROCESS_ATTACH:
+        if (!RtlWow64GetProcessMachines( GetCurrentProcess(), NULL, &native_machine ) && native_machine)
+            params.copy_client_strings = RtlWow64GetCurrentMachine() != native_machine;
         if ((status = __wine_init_unix_call()) ||
             (status = UNIX_CALL( process_attach, &params )))
         {
@@ -2902,9 +2913,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
     case DLL_PROCESS_DETACH:
         if (reserved) break;
         UNIX_CALL( process_detach, NULL );
-#ifndef _WIN64
-        cleanup_wow64_strings();
-#endif
+        cleanup_unix_strings();
         /* fallthrough */
     case DLL_THREAD_DETACH:
         if ((context = get_current_context())) context->base.current_tid = 0;

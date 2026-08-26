@@ -120,7 +120,7 @@ static void test_raise_mutation_exception(void);
  * test hooks without adding a production control opcode to the provider ABI. */
 #include "../unixlib.c"
 
-C_ASSERT( XTAJIT64_PROCESS_ABI_VERSION == 6 );
+C_ASSERT( XTAJIT64_PROCESS_ABI_VERSION == 8 );
 
 #undef XTAJIT64_TEST_RAISE_EXCEPTION
 #undef ntdll_set_exception_jmp_buf
@@ -165,6 +165,11 @@ static uint64_t test_base;
 static uint64_t test_ec_target;
 static uint64_t test_syscall_dispatcher;
 static uint64_t test_teb;
+
+static volatile uint32_t *test_suspend_doorbell(void)
+{
+    return (volatile uint32_t *)(uintptr_t)(test_teb + 0x100);
+}
 
 #define check(condition, ...) \
     do { if (!(condition)) { fprintf( stderr, "not ok: " __VA_ARGS__ ); ++failures; } } while (0)
@@ -595,7 +600,7 @@ static void test_incremental_resync(void)
     err = synchronize_engine_registry_locked( engine );
     pthread_mutex_unlock( &provider.mutex );
     check( err == UC_ERR_OK && !memory_map_calls && memory_unmap_calls == 1 &&
-           cache_flush_calls == 1,
+           !cache_flush_calls,
            "changed demand-mapped range synchronized with map/unmap/flush %u/%u/%u: %s\n",
            memory_map_calls, memory_unmap_calls, cache_flush_calls,
            uc_strerror( err ) );
@@ -603,7 +608,7 @@ static void test_incremental_resync(void)
     err = demand_map_canonical_range( engine, (uintptr_t)added, 1,
                                       UC_PROT_READ, &found, &mapped );
     check( err == UC_ERR_OK && found && mapped && memory_map_calls == 1 &&
-           memory_unmap_calls == 1 && cache_flush_calls == 1 &&
+           memory_unmap_calls == 1 && !cache_flush_calls &&
            engine->mapped_ranges.count == 1,
            "changed range first-use remap returned %s found %u calls %u/%u/%u ranges %zu\n",
            uc_strerror( err ), found, memory_map_calls, memory_unmap_calls,
@@ -814,6 +819,7 @@ static void initialize_begin_parameters( struct xtajit64_begin_params *params,
     params->gs_base = test_teb;
     params->stack_limit = stack;
     params->stack_base = stack + TEST_PAGE;
+    params->suspend_doorbell = (uintptr_t)test_suspend_doorbell();
 }
 
 static void initialize_begin_params( struct simulation *simulation,
@@ -1437,7 +1443,7 @@ static void test_low_observer_lazy_engine_sync(void)
     check( !holders[0].simulation_status &&
            holders[0].params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
            memory_map_calls == 1 && memory_unmap_calls == 1 &&
-           cache_flush_calls == 1 &&
+           !cache_flush_calls &&
            atomic_load_explicit( &test_emu_start_count, memory_order_relaxed ) ==
                emu_start_count + 1,
            "first lazy LOW engine returned %#x reason %u map/unmap/flush %u/%u/%u\n",
@@ -1455,7 +1461,7 @@ static void test_low_observer_lazy_engine_sync(void)
     check( !holders[1].simulation_status &&
            holders[1].params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
            memory_map_calls == 1 && memory_unmap_calls == 1 &&
-           cache_flush_calls == 1 && provider_engine_count() == 1 &&
+           !cache_flush_calls && provider_engine_count() == 1 &&
            atomic_load_explicit( &test_emu_start_count, memory_order_relaxed ) ==
                emu_start_count + 2,
            "second sequential LOW borrower returned %#x reason %u map/unmap/flush %u/%u/%u engines %zu\n",
@@ -1581,7 +1587,7 @@ static void test_low_observer_lazy_sync_poison(void)
            (unsigned int)holder.simulation_status, holder.params.stop_reason,
            holder.params.unicorn_error, (unsigned int)observer_provider_status() );
     check( memory_map_calls == 1 && memory_unmap_calls == 1 &&
-           cache_flush_calls == 1 &&
+           !cache_flush_calls &&
            atomic_load_explicit( &test_emu_start_count, memory_order_relaxed ) ==
                emu_start_count + 1,
            "failed demand map had wrong execution or map/unmap/flush calls %u/%u/%u\n",
@@ -2363,6 +2369,27 @@ static void test_x64_syscall_traps(void)
     memset( code, 0x90, TEST_PAGE );
     unsupported.data = code;
     unsupported.offset = 0;
+    emit_u8( &unsupported, 0x9c ); /* pushfq */
+    emit_u8( &unsupported, 0x81 ); emit_u8( &unsupported, 0x0c );
+    emit_u8( &unsupported, 0x24 ); emit_u32( &unsupported, 0x00010100 );
+                                      /* orl $(TF|RF),(%rsp) */
+    emit_u8( &unsupported, 0x9d ); /* popfq */
+    emit_u8( &unsupported, 0x0f ); emit_u8( &unsupported, 0xa2 ); /* cpuid */
+    check( !flush_instruction_cache( &flush ), "single-step code flush failed\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    check( status == STATUS_SINGLE_STEP &&
+           simulation.params.stop_reason == XTAJIT64_STOP_SINGLE_STEP &&
+           simulation.params.context.rip == (uintptr_t)code + unsupported.offset &&
+           !provider.poison_status,
+           "single-step trap returned %#x reason %u rip %#llx poison %#x\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.context.rip,
+           (unsigned int)provider.poison_status );
+
+    memset( code, 0x90, TEST_PAGE );
+    unsupported.data = code;
+    unsupported.offset = 0;
     emit_u8( &unsupported, 0xcd ); emit_u8( &unsupported, 0x80 );
     emit_movabs_rax( &unsupported, test_ec_target );
     emit_jump_rax( &unsupported );
@@ -2645,7 +2672,7 @@ static void test_executable_address_reuse_invalidation(void)
     check( !status && simulation.params.context.r10 == second &&
            test_last_acquired_engine == first_engine &&
            memory_unmap_calls == 1 && memory_map_calls == 1 &&
-           cache_flush_calls == 1,
+           !cache_flush_calls,
            "address reuse retained stale code %#x/%#llx engine %p/%p calls %u/%u/%u\n",
            (unsigned int)status,
            (unsigned long long)simulation.params.context.r10,
@@ -2849,6 +2876,125 @@ static void test_running_mutation_barrier(void)
     atomic_store( &test_release_ec_hook, 1 );
     unregister_identity_page( stack );
     unregister_identity_page( code );
+}
+
+static void test_suspend_doorbell_mutation_barrier(void)
+{
+    unsigned char *code = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    struct code_buffer buffer = { code, 0 };
+    struct simulation simulation = {0}, resumed = {0};
+    struct protect_worker worker =
+    {
+        .params =
+        {
+            .guest = (uintptr_t)code,
+            .size = TEST_PAGE,
+            .protect = PAGE_EXECUTE_READWRITE,
+        },
+    };
+    volatile uint32_t *doorbell = test_suspend_doorbell();
+    BOOL runner_created = FALSE, mutator_created = FALSE, entered = FALSE;
+    unsigned int starting_failures = failures;
+    pthread_t runner, mutator;
+    uint64_t initial_rsp;
+    NTSTATUS status;
+    int ret;
+
+    memset( code, 0, TEST_PAGE );
+    emit_movabs_rax( &buffer, test_ec_target );
+    emit_u8( &buffer, 0x50 ); /* push %rax */
+    emit_jump_rax( &buffer );
+    *doorbell = 0;
+    status = register_identity_page( code, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    check( !status, "suspend doorbell barrier setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+
+    atomic_store( &test_hold_non_ec_hook, 1 );
+    atomic_store( &test_non_ec_hook_entered, 0 );
+    atomic_store( &test_release_non_ec_hook, 0 );
+    atomic_store( &test_pause_stop_owner_violation, 0 );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    ret = pthread_create( &runner, NULL, run_simulation, &simulation );
+    check( !ret, "suspend doorbell runner creation failed %d\n", ret );
+    if (ret) goto release;
+    runner_created = TRUE;
+    entered = wait_atomic_int_at_least( &test_non_ec_hook_entered, 1, 2000 );
+    check( entered, "suspend doorbell runner did not enter the held block\n" );
+    if (!entered) goto release;
+
+    ret = pthread_create( &mutator, NULL, run_protect, &worker );
+    check( !ret, "suspend doorbell mutator creation failed %d\n", ret );
+    if (ret) goto release;
+    mutator_created = TRUE;
+    check( wait_mutation_stage( MUTATION_STAGE_WAIT, 2000 ),
+           "suspend doorbell mutation did not wait for the running engine\n" );
+    *doorbell = ~0u;
+
+release:
+    atomic_store_explicit( &test_release_non_ec_hook, 1, memory_order_release );
+    if (runner_created)
+        check( join_simulation( runner, &simulation ),
+               "suspend doorbell simulation timed out\n" );
+    if (mutator_created) pthread_join( mutator, NULL );
+    if (runner_created)
+        check( !simulation.init_status && !simulation.status &&
+               simulation.params.stop_reason == XTAJIT64_STOP_SUSPEND &&
+               !atomic_load_explicit( &test_pause_stop_owner_violation,
+                                      memory_order_acquire ),
+               "suspend doorbell lost the captured stop %#x/%#x reason %u\n",
+               (unsigned int)simulation.init_status,
+               (unsigned int)simulation.status,
+               simulation.params.stop_reason );
+    if (runner_created)
+        check( (simulation.params.context.rip == (uintptr_t)code &&
+                simulation.params.context.rsp == initial_rsp) ||
+               (simulation.params.context.rip == test_ec_target &&
+                simulation.params.context.rsp == initial_rsp - sizeof(uint64_t) &&
+                *(uint64_t *)(uintptr_t)simulation.params.context.rsp ==
+                    test_ec_target),
+               "suspend doorbell captured a replayable block context rip %#llx "
+               "rsp %#llx value %#llx\n",
+               (unsigned long long)simulation.params.context.rip,
+               (unsigned long long)simulation.params.context.rsp,
+               (unsigned long long)*(uint64_t *)(uintptr_t)
+                   simulation.params.context.rsp );
+    if (mutator_created)
+        check( !worker.status &&
+               atomic_load_explicit( &worker.done, memory_order_acquire ),
+               "suspend doorbell mutation returned %#x\n",
+               (unsigned int)worker.status );
+
+    *doorbell = 0;
+    status = thread_init( NULL );
+    check( !status, "suspend doorbell resume init returned %#x\n",
+           (unsigned int)status );
+    if (!status)
+    {
+        resumed.params = simulation.params;
+        status = begin_simulation( &resumed.params );
+        check( !status &&
+               resumed.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+               resumed.params.context.rsp == initial_rsp - sizeof(uint64_t),
+               "cleared suspend doorbell did not resume captured context "
+               "%#x reason %u rip %#llx rsp %#llx\n",
+               (unsigned int)status, resumed.params.stop_reason,
+               (unsigned long long)resumed.params.context.rip,
+               (unsigned long long)resumed.params.context.rsp );
+        thread_term( NULL );
+    }
+
+done:
+    *doorbell = 0;
+    atomic_store( &test_hold_non_ec_hook, 0 );
+    atomic_store( &test_release_non_ec_hook, 1 );
+    unregister_identity_page( stack );
+    unregister_identity_page( code );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_SUSPEND_DOORBELL_BARRIER_PASS\n" );
 }
 
 static void test_running_low_observer_barrier(void)
@@ -3181,6 +3327,7 @@ int main(void)
     test_executable_cache_invalidation();
     test_executable_address_reuse_invalidation();
     test_running_mutation_barrier();
+    test_suspend_doorbell_mutation_barrier();
     test_running_low_observer_barrier();
     test_running_flush_preflight_failure();
 

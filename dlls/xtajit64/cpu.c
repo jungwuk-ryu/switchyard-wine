@@ -77,6 +77,9 @@ struct xtajit64_thread_state
     UINT32 capture_kind;
     UINT32 depth;
     struct xtajit64_transition_frame frames[XTAJIT64_MAX_TRANSITION_DEPTH];
+    ULONG suspend_doorbell;
+    ULONG reserved;
+    UINT64 teb;
 };
 
 typedef NTSTATUS (WINAPI *arm64x_get_information)( ULONG, void *, void * );
@@ -98,6 +101,8 @@ C_ASSERT( offsetof(struct xtajit64_thread_state, capture_x10) == 0x30 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, capture_kind) == 0x38 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, depth) == 0x3c );
 C_ASSERT( offsetof(struct xtajit64_thread_state, frames) == 0x40 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, suspend_doorbell) == 0x840 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, teb) == 0x848 );
 C_ASSERT( sizeof(struct xtajit64_transition_frame) == 0x20 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, X8) == 0x78 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, Sp) == 0x98 );
@@ -144,6 +149,24 @@ static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
     state->allocation_size = size;
     state->control_stack_top = ((ULONG_PTR)allocation + size) & ~(ULONG_PTR)15;
     *ret = state;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS query_current_thread_teb( TEB **ret )
+{
+    THREAD_BASIC_INFORMATION info;
+    TEB *teb;
+    NTSTATUS status;
+
+    if (!ret) return STATUS_INVALID_PARAMETER;
+    *ret = NULL;
+    if ((status = NtQueryInformationThread( NtCurrentThread(), ThreadBasicInformation,
+                                             &info, sizeof(info), NULL )))
+        return status;
+    teb = info.TebBaseAddress;
+    if (!teb || teb->Tib.Self != &teb->Tib)
+        return STATUS_INVALID_ADDRESS;
+    *ret = teb;
     return STATUS_SUCCESS;
 }
 
@@ -255,7 +278,7 @@ static void context_from_unix( AMD64_CONTEXT *dst, const struct xtajit64_x64_con
     dst->R15 = src->r15;
     dst->Rip = src->rip;
     dst->EFlags = src->eflags;
-    dst->MxCsr = src->mxcsr;
+    dst->MxCsr = dst->FltSave.MxCsr = src->mxcsr;
     memcpy( &dst->Xmm0, src->xmm, sizeof(src->xmm) );
 }
 
@@ -833,6 +856,26 @@ static struct xtajit64_transition_frame *push_transition_frame(
     return frame;
 }
 
+static void discard_unwound_transition_frames( struct xtajit64_thread_state *state,
+                                                UINT64 guest_rsp )
+{
+    UINT old_depth = state->depth;
+
+    /* BeginSimulation is also the re-entry point after NtContinue restores an
+     * x64 context.  Such a restore may abandon native callbacks without ever
+     * reaching their entry/exit thunks.  Frames whose return stack is at or
+     * below the restored RSP are no longer reachable and must not accumulate
+     * across repeated exception, APC, or user-callback dispatch. */
+    while (state->depth &&
+           guest_rsp >= state->frames[state->depth - 1].guest_rsp)
+        --state->depth;
+
+    if (state->depth != old_depth)
+        TRACE( "discarded %u unwound transition frames at restored x64 rsp %p, depth %u\n",
+               old_depth - state->depth, (void *)(ULONG_PTR)guest_rsp,
+               state->depth );
+}
+
 static NTSTATUS capture_fp_state( AMD64_CONTEXT *context )
 {
     arm64x_get_information get_info = (arm64x_get_information)__os_arm64x_get_x64_information;
@@ -880,6 +923,26 @@ static DECLSPEC_NORETURN void abort_simulation( struct xtajit64_thread_state *st
     terminate_transition( status );
 }
 
+static BOOL suspend_doorbell_is_set( const CHPE_V2_CPU_AREA_INFO *cpu )
+{
+    return cpu && cpu->SuspendDoorbell &&
+           *(const volatile ULONG *)cpu->SuspendDoorbell;
+}
+
+static DECLSPEC_NORETURN void continue_suspended_context(
+    struct xtajit64_thread_state *state, CHPE_V2_CPU_AREA_INFO *cpu,
+    ARM64EC_NT_CONTEXT *context, UINT stop_reason, UINT unicorn_error )
+{
+    NTSTATUS status;
+
+    cpu->InSimulation = 0;
+    context->AMD64_Context.ContextFlags |= CONTEXT_AMD64_FULL |
+                                           CONTEXT_AMD64_FLOATING_POINT;
+    status = NtContinue( &context->AMD64_Context, FALSE );
+    abort_simulation( state, status ? status : STATUS_UNSUCCESSFUL,
+                      stop_reason, unicorn_error );
+}
+
 static DECLSPEC_NORETURN void raise_x64_memory_fault( struct xtajit64_thread_state *state,
                                                       const struct xtajit64_begin_params *params,
                                                       ARM64EC_NT_CONTEXT *ec_context )
@@ -905,7 +968,6 @@ static DECLSPEC_NORETURN void raise_x64_memory_fault( struct xtajit64_thread_sta
     rec.ExceptionInformation[1] = params->fault_address;
     ec_context->AMD64_Context.ContextFlags |= CONTEXT_AMD64_FULL |
                                               CONTEXT_AMD64_FLOATING_POINT;
-
     TRACE( "raise x64 access violation rip %p fault %p access %#Ix\n",
            rec.ExceptionAddress, (void *)(ULONG_PTR)rec.ExceptionInformation[1],
            rec.ExceptionInformation[0] );
@@ -914,19 +976,45 @@ static DECLSPEC_NORETURN void raise_x64_memory_fault( struct xtajit64_thread_sta
                       params->stop_reason, params->unicorn_error );
 }
 
+static DECLSPEC_NORETURN void raise_x64_single_step(
+    struct xtajit64_thread_state *state,
+    const struct xtajit64_begin_params *params,
+    ARM64EC_NT_CONTEXT *ec_context )
+{
+    EXCEPTION_RECORD rec;
+    NTSTATUS status;
+
+    memset( &rec, 0, sizeof(rec) );
+    rec.ExceptionCode = STATUS_SINGLE_STEP;
+    rec.ExceptionAddress = (void *)(ULONG_PTR)params->context.rip;
+    ec_context->AMD64_Context.ContextFlags |= CONTEXT_AMD64_FULL |
+                                              CONTEXT_AMD64_FLOATING_POINT;
+    ec_context->AMD64_Context.EFlags &= ~0x100; /* clear the trap flag */
+    TRACE( "raise x64 single-step exception rip %p\n", rec.ExceptionAddress );
+    status = NtRaiseException( &rec, &ec_context->AMD64_Context, TRUE );
+    abort_simulation( state, status ? status : STATUS_SINGLE_STEP,
+                      params->stop_reason, params->unicorn_error );
+}
+
 static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *state )
 {
-    CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    CHPE_V2_CPU_AREA_INFO *cpu;
     ARM64EC_NT_CONTEXT *ec_context;
     struct xtajit64_transition_frame *frame;
     struct xtajit64_begin_params params = {0};
+    TEB *teb;
     UINT64 guest_return;
     ULONG_PTR native_target, entry, host_rsp;
     NTSTATUS status;
-    BOOL mapping_reconciled = FALSE;
+    UINT frame_index;
+    BOOL continuation_target_seen, mapping_reconciled = FALSE;
 
-    if (!state || state->magic != XTAJIT64_THREAD_STATE_MAGIC || !cpu ||
-        !(ec_context = cpu->ContextAmd64))
+    if (!state || state->magic != XTAJIT64_THREAD_STATE_MAGIC ||
+        !(teb = (TEB *)(ULONG_PTR)state->teb) ||
+        teb->Tib.Self != &teb->Tib ||
+        !(cpu = teb->ChpeV2CpuAreaInfo) ||
+        !(ec_context = cpu->ContextAmd64) ||
+        cpu->SuspendDoorbell != &state->suspend_doorbell)
         abort_transition( state, STATUS_INVALID_PARAMETER, "missing x64 transition state" );
 
     /* BeginSimulation and every native return/exit/jump converge here.  Do not
@@ -936,7 +1024,13 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
         abort_transition( state, status, "cannot prepare deferred x64 mapping state" );
 
     context_to_unix( &params.context, &ec_context->AMD64_Context );
-    params.gs_base = (ULONG_PTR)NtCurrentTeb();
+    /* A Darwin exceptional return can lose live x18 after the direct TEB
+     * access above.  A bare NtCurrentTeb() read would then silently produce
+     * zero rather than faulting through ntdll's authenticated recovery path.
+     * The generation-owned transition state retains the TEB established by
+     * ThreadBasicInformation, which is also the Windows x64 GS base. */
+    params.gs_base = (ULONG_PTR)teb;
+    params.suspend_doorbell = (ULONG_PTR)cpu->SuspendDoorbell;
     if (params.context.rip > XTAJIT64_X64_USER_ADDRESS_MAX ||
         params.context.rsp > XTAJIT64_X64_USER_ADDRESS_MAX ||
         params.gs_base > XTAJIT64_X64_USER_ADDRESS_MAX ||
@@ -951,6 +1045,15 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
         cpu->InSimulation = 1;
         status = XTAJIT64_CALL( begin_simulation, &params );
         context_from_unix( &ec_context->AMD64_Context, &params.context );
+        if (!status && params.stop_reason == XTAJIT64_STOP_SUSPEND)
+        {
+            if (!suspend_doorbell_is_set( cpu ))
+                abort_simulation( state, STATUS_INVALID_DEVICE_STATE,
+                                  params.stop_reason, params.unicorn_error );
+            continue_suspended_context( state, cpu, ec_context,
+                                        params.stop_reason,
+                                        params.unicorn_error );
+        }
         if (status != STATUS_RETRY ||
             params.stop_reason != XTAJIT64_STOP_MAPPING_MISS ||
             mapping_reconciled)
@@ -981,39 +1084,65 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
             (status == STATUS_RETRY &&
              params.stop_reason == XTAJIT64_STOP_MAPPING_MISS))
             raise_x64_memory_fault( state, &params, ec_context );
+        if (status == STATUS_SINGLE_STEP &&
+            params.stop_reason == XTAJIT64_STOP_SINGLE_STEP)
+            raise_x64_single_step( state, &params, ec_context );
         abort_simulation( state, status ? status : STATUS_NOT_SUPPORTED,
                           params.stop_reason, params.unicorn_error );
     }
 
-    /* A returning x64 callee reaches the exact ARM64EC instruction following
-     * the exit thunk's helper call.  This is a continuation, not a callable
-     * function entry and therefore must never be parsed as entry-thunk metadata. */
-    if (state->depth &&
-        (frame = &state->frames[state->depth - 1])->kind == XTAJIT64_FRAME_EXIT &&
-        params.transition_target == frame->native_pc)
+    /* A non-local unwind may abandon nested x64/ARM64EC transitions and resume
+     * an earlier exit-thunk continuation.  Match both the continuation PC and
+     * its post-pop x64 RSP; either value alone can recur in nested calls. */
+    frame = NULL;
+    continuation_target_seen = FALSE;
+    for (frame_index = state->depth; frame_index; )
     {
-        if (params.context.rsp != frame->guest_rsp)
-            abort_transition( state, STATUS_BAD_STACK,
-                              "x64 exit-thunk continuation stack mismatch" );
-        --state->depth;
+        struct xtajit64_transition_frame *candidate =
+            &state->frames[--frame_index];
+
+        if (candidate->kind != XTAJIT64_FRAME_EXIT ||
+            params.transition_target != candidate->native_pc)
+            continue;
+        continuation_target_seen = TRUE;
+        if (params.context.rsp == candidate->guest_rsp)
+        {
+            frame = candidate;
+            break;
+        }
+    }
+    if (frame)
+    {
+        /* Remove the matched EXIT frame and every newer frame abandoned by
+         * the unwind before restoring the captured native continuation. */
+        state->depth = frame_index;
         ec_context->Sp = frame->native_sp;
         ec_context->Pc = frame->native_pc;
         ec_context->Lr = frame->native_pc;
         if ((status = restore_fp_state( &ec_context->AMD64_Context )))
             abort_transition( state, status, "cannot restore native FP state" );
         cpu->InSimulation = 0;
+        if (suspend_doorbell_is_set( cpu ))
+            continue_suspended_context( state, cpu, ec_context,
+                                        XTAJIT64_STOP_SUSPEND,
+                                        params.unicorn_error );
         TRACE( "return x64 target to EC continuation %p native sp %p depth %u\n",
                (void *)(ULONG_PTR)frame->native_pc,
                (void *)(ULONG_PTR)frame->native_sp, state->depth );
         xtajit64_restore_native( ec_context );
     }
+    if (continuation_target_seen)
+        abort_transition( state, STATUS_BAD_STACK,
+                          "x64 exit-thunk continuation stack mismatch" );
 
     if (params.context.rsp > ~(UINT64)0 - sizeof(guest_return) ||
         (status = read_guest_u64( params.context.rsp, &guest_return )))
         abort_transition( state, status ? status : STATUS_BAD_STACK,
                           "cannot pop x64 return address for EC entry" );
-    if (!guest_return ||
-        (status = resolve_ec_entry_thunk( params.transition_target,
+    if (!guest_return)
+        abort_transition( state, STATUS_INVALID_IMAGE_FORMAT,
+                          "missing x64 return address for ARM64EC entry" );
+    if ((status = resolve_ec_entry_thunk( params.transition_target,
                                           &native_target, &entry )))
         abort_transition( state, status ? status : STATUS_INVALID_IMAGE_FORMAT,
                           "invalid ARM64EC entry-thunk metadata" );
@@ -1035,6 +1164,10 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
     if ((status = restore_fp_state( &ec_context->AMD64_Context )))
         abort_transition( state, status, "cannot restore EC entry FP state" );
     cpu->InSimulation = 0;
+    if (suspend_doorbell_is_set( cpu ))
+        continue_suspended_context( state, cpu, ec_context,
+                                    XTAJIT64_STOP_SUSPEND,
+                                    params.unicorn_error );
     TRACE( "enter EC target %p through compiler thunk %p x64 return %p "
            "guest rsp %p native sp %p depth %u\n",
            (void *)native_target, (void *)entry, (void *)(ULONG_PTR)guest_return,
@@ -1312,18 +1445,70 @@ void WINAPI ExitToX64(void)
 /**********************************************************************
  *           BeginSimulation  (xtajit64.@)
  */
+#ifdef HAVE_UNICORN
+static DECLSPEC_NORETURN void __attribute__((used)) begin_simulation_missing_state(void)
+{
+    RtlRaiseStatus( STATUS_INVALID_PARAMETER );
+    __builtin_unreachable();
+}
+
+static DECLSPEC_NORETURN void __attribute__((used)) begin_simulation_on_control_stack(
+    struct xtajit64_thread_state *state )
+{
+    CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+
+    if (state != get_thread_state() || state->magic != XTAJIT64_THREAD_STATE_MAGIC ||
+        state->allocation_size != XTAJIT64_CONTROL_STACK_SIZE ||
+        state->control_stack_top != (ULONG_PTR)state + state->allocation_size ||
+        !cpu || !cpu->ContextAmd64)
+        RtlRaiseStatus( STATUS_INVALID_PARAMETER );
+    discard_unwound_transition_frames( state,
+                                       cpu->ContextAmd64->AMD64_Context.Rsp );
+    run_x64_simulation( state );
+}
+
+/* The Windows x64 stack remains live for the entire emulation interval and
+ * may descend arbitrarily before a suspend or context operation re-enters
+ * BeginSimulation.  Reset every non-returning entry to the provider-owned
+ * control stack so native dispatcher frames can never overlap guest locals.
+ * Validate every value that controls SP before leaving the current stack. */
+void WINAPI __attribute__((naked)) BeginSimulation(void)
+{
+    __asm__(
+        "ldr x16, [x18, #0x1788]\n\t"      /* TEB.ChpeV2CpuAreaInfo */
+        "cbz x16, 1f\n\t"
+        "ldr x0, [x16, #0x30]\n\t"        /* cpu.EmulatorData[0] */
+        "cbz x0, 1f\n\t"
+        "ldr x17, [x0]\n\t"
+        "movz x16, #0x5458\n\t"
+        "movk x16, #0x4a41, lsl #16\n\t"
+        "movk x16, #0x5449, lsl #32\n\t"
+        "movk x16, #0x3634, lsl #48\n\t"
+        "cmp x17, x16\n\t"               /* state.magic */
+        "b.ne 1f\n\t"
+        "ldr x16, [x0, #8]\n\t"          /* state.allocation_size */
+        "cmp x16, #0x40, lsl #12\n\t"     /* XTAJIT64_CONTROL_STACK_SIZE */
+        "b.ne 1f\n\t"
+        "adds x17, x0, x16\n\t"
+        "b.cs 1f\n\t"
+        "ldr x16, [x0, #0x10]\n\t"       /* state.control_stack_top */
+        "cmp x16, x17\n\t"
+        "b.ne 1f\n\t"
+        "tst x16, #15\n\t"
+        "b.ne 1f\n\t"
+        "mov sp, x16\n\t"
+        "adr x30, 2f\n\t"
+        "b \"#begin_simulation_on_control_stack\"\n\t"
+        "1: b \"#begin_simulation_missing_state\"\n\t"
+        "2: brk #0xf67\n\t" );
+}
+#else
 void WINAPI BeginSimulation(void)
 {
-#ifdef HAVE_UNICORN
-    struct xtajit64_thread_state *state = get_thread_state();
-
-    if (!state) RtlRaiseStatus( STATUS_INVALID_PARAMETER );
-    run_x64_simulation( state );
-#else
     ERR( "x64 emulation not implemented\n" );
     NtTerminateProcess( GetCurrentProcess(), 1 );
-#endif
 }
+#endif
 
 
 /**********************************************************************
@@ -1682,21 +1867,31 @@ void WINAPI ResetToConsistentState( EXCEPTION_RECORD *rec, CONTEXT *context, ARM
 NTSTATUS WINAPI ThreadInit(void)
 {
 #ifdef HAVE_UNICORN
-    CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    CHPE_V2_CPU_AREA_INFO *cpu;
     struct xtajit64_thread_state *state;
+    TEB *teb;
     NTSTATUS cleanup_status, status;
     BOOL provider_touched;
 
+    if ((status = query_current_thread_teb( &teb ))) return status;
+    cpu = teb->ChpeV2CpuAreaInfo;
     if (!cpu || !cpu->ContextAmd64) return STATUS_INVALID_PARAMETER;
     if ((state = cpu->EmulatorData[0]))
-        return state->magic == XTAJIT64_THREAD_STATE_MAGIC ? STATUS_SUCCESS :
-                                                            STATUS_ALREADY_INITIALIZED;
+    {
+        if (state->magic != XTAJIT64_THREAD_STATE_MAGIC || state->teb != (ULONG_PTR)teb ||
+            (cpu->SuspendDoorbell &&
+             cpu->SuspendDoorbell != &state->suspend_doorbell))
+            return STATUS_ALREADY_INITIALIZED;
+        cpu->SuspendDoorbell = &state->suspend_doorbell;
+        return STATUS_SUCCESS;
+    }
     if ((status = synchronize_current_thread_mappings()))
     {
         poison_provider( "thread mapping synchronization", status );
         return status;
     }
     if ((status = allocate_transition_state( &state ))) return status;
+    state->teb = (ULONG_PTR)teb;
     /* Publish this known uniform allocation directly while ntdll defers its
      * nested VM notification.  Ntdll acknowledges the exact single mutation;
      * any additional or concurrent mutation retains the full-resync fallback. */
@@ -1714,6 +1909,7 @@ NTSTATUS WINAPI ThreadInit(void)
         return status;
     }
 
+    cpu->SuspendDoorbell = &state->suspend_doorbell;
     cpu->EmulatorData[0] = state;
     return STATUS_SUCCESS;
 #else
@@ -1753,8 +1949,16 @@ void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
     if (emulator_stack_allocation != native_stack_allocation)
         unregister_thread_stack_allocation( emulator_stack_allocation );
     if (!cpu || !(state = get_thread_state())) return;
+    if (cpu->SuspendDoorbell &&
+        cpu->SuspendDoorbell != &state->suspend_doorbell)
+    {
+        poison_provider( "thread doorbell ownership", STATUS_INVALID_DEVICE_STATE );
+        return;
+    }
+    cpu->SuspendDoorbell = NULL;
     if ((status = unregister_transition_state_mapping( state )))
     {
+        cpu->SuspendDoorbell = &state->suspend_doorbell;
         poison_provider( "transition-state unregister", status );
         return;
     }
@@ -1774,6 +1978,7 @@ void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
         {
             state->magic = XTAJIT64_THREAD_STATE_MAGIC;
             cpu->EmulatorData[0] = state;
+            cpu->SuspendDoorbell = &state->suspend_doorbell;
             poison_provider( "transition-state release", status );
         }
     }

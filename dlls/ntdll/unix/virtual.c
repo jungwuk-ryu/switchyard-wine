@@ -4625,6 +4625,40 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
 
     if (vprot & VPROT_WRITE)
     {
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (view->protect & SEC_IMAGE)
+        {
+            size_t physical_size = ROUND_SIZE( host_addr, map_addr + map_size - host_addr,
+                                               host_page_mask );
+            size_t physical_view_size = ROUND_SIZE( 0, view->size, host_page_mask );
+            size_t physical_offset;
+            ssize_t ret;
+
+            /* Darwin cannot represent one writable shared 4K Windows image lane
+             * inside a larger host page without also sharing the adjacent private
+             * image lanes.  Preserve the image contents and per-lane protections
+             * with an anonymous copy rather than rejecting the entire image.  Only
+             * the cross-process visibility of this physically unrepresentable lane
+             * is lost; representable address, size, and offset combinations retain
+             * their MAP_SHARED backing.  Remove this fallback if Darwin gains
+             * coherent sub-host-page mappings. */
+            if (host_addr < (char *)view->base) return STATUS_INVALID_IMAGE_FORMAT;
+            physical_offset = host_addr - (char *)view->base;
+            if (!physical_size || physical_offset > physical_view_size ||
+                physical_size > physical_view_size - physical_offset)
+                return STATUS_INVALID_IMAGE_FORMAT;
+            if (mprotect( host_addr, physical_size, PROT_READ | PROT_WRITE ))
+                return STATUS_ACCESS_DENIED;
+            ret = pread( fd, map_addr, size, offset );
+            if (ret < 0 || (size_t)ret != size)
+            {
+                ERR( "failed to copy unaligned shared image mapping %p-%p: %s\n",
+                     map_addr, map_addr + size, ret < 0 ? strerror(errno) : "short read" );
+                return STATUS_INVALID_IMAGE_FORMAT;
+            }
+            return STATUS_SUCCESS;
+        }
+#endif
         ERR( "unaligned shared mapping %p-%p not supported\n", map_addr, map_addr + map_size );
         return STATUS_INVALID_PARAMETER;
     }

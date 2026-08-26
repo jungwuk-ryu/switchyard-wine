@@ -177,6 +177,10 @@ struct x18_dispatch_test_state
     NTSTATUS system_status;        /* 70 */
     NTSTATUS teb_status;           /* 74 */
     UINT32 reserved[2];            /* 78 */
+    UINT64 recovery_target;        /* 80: native ARM64EC TEB-load probe */
+    UINT64 recovered_teb;          /* 88 */
+    UINT32 recovered_custom;       /* 90 */
+    UINT32 recovery_called;        /* 94 */
 };
 
 C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, dispatcher) == 0x00 );
@@ -200,6 +204,10 @@ C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, inner_called) == 0x68 );
 C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, opaque_status) == 0x6c );
 C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, system_status) == 0x70 );
 C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, teb_status) == 0x74 );
-C_ASSERT( sizeof(struct x18_dispatch_test_state) == 0x80 );
+C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, recovery_target) == 0x80 );
+C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, recovered_teb) == 0x88 );
+C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, recovered_custom) == 0x90 );
+C_ASSERT( FIELD_OFFSET(struct x18_dispatch_test_state, recovery_called) == 0x94 );
+C_ASSERT( sizeof(struct x18_dispatch_test_state) == 0x98 );
 
 #endif /* __NTDLL_TESTS_X18_DISPATCH_TEST_H */

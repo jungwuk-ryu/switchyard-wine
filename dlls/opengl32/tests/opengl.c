@@ -20,6 +20,8 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -105,6 +107,49 @@ static void init_functions(void)
     ALL_GL_EXT_FUNCS
     ALL_WGL_EXT_FUNCS
 #undef USE_GL_FUNC
+}
+
+static void test_string_returns(void)
+{
+    const GLubyte *renderer, *vendor, *version, *version_again;
+    const GLchar *wine_renderer;
+    char *version_copy = NULL;
+
+    renderer = glGetString( GL_RENDERER );
+    vendor = glGetString( GL_VENDOR );
+    version = glGetString( GL_VERSION );
+
+    ok( !!renderer, "Expected a renderer string.\n" );
+    ok( !!vendor, "Expected a vendor string.\n" );
+    ok( !!version, "Expected a version string.\n" );
+    if (renderer) ok( !!*renderer, "Expected a nonempty renderer string.\n" );
+    if (vendor) ok( !!*vendor, "Expected a nonempty vendor string.\n" );
+    if (version)
+    {
+        SIZE_T length;
+
+        ok( !!*version, "Expected a nonempty version string.\n" );
+        length = strlen( (const char *)version ) + 1;
+        if ((version_copy = malloc( length ))) memcpy( version_copy, version, length );
+        ok( !!version_copy, "Failed to copy the version string.\n" );
+    }
+
+    version_again = glGetString( GL_VERSION );
+    ok( !!version_again, "Expected a repeated version string.\n" );
+    if (version_copy && version_again)
+        ok( !strcmp( version_copy, (const char *)version_again ),
+                "Version string changed from %s to %s.\n", version_copy, version_again );
+    free( version_copy );
+
+    if (!ext.wglQueryCurrentRendererStringWINE)
+    {
+        win_skip( "WGL_WINE_query_renderer is not supported.\n" );
+        return;
+    }
+
+    wine_renderer = ext.wglQueryCurrentRendererStringWINE( WGL_RENDERER_DEVICE_ID_WINE );
+    ok( !!wine_renderer, "Expected a WGL renderer string.\n" );
+    if (wine_renderer) ok( !!*wine_renderer, "Expected a nonempty WGL renderer string.\n" );
 }
 
 static BOOL gl_extension_supported(const char *extensions, const char *extension_string)
@@ -3281,6 +3326,7 @@ static void test_opengl3(HDC hdc)
         check_gl_error(0);
         extension = ext.glGetStringi( GL_EXTENSIONS, 0 );
         ok( !!extension, "got %p\n", extension );
+        if (extension) ok( !!*extension, "got an empty extension string\n" );
         check_gl_error(0);
         extension = ext.glGetStringi( GL_EXTENSIONS, num );
         ok( !extension, "got %p\n", extension );
@@ -5179,11 +5225,16 @@ START_TEST(opengl)
     };
 
     HMODULE gdi32 = GetModuleHandleA( "gdi32.dll" );
-    int format, res;
+    int argc, format, res;
     const char *tmp;
+    BOOL string_returns_only;
+    char **argv;
     HGLRC hglrc;
     HWND hwnd;
     HDC hdc;
+
+    argc = winetest_get_mainargs( &argv );
+    string_returns_only = argc == 3 && !strcmp( argv[2], "test_string_returns" );
 
     pD3DKMTCreateDCFromMemory = (void *)GetProcAddress( gdi32, "D3DKMTCreateDCFromMemory" );
     pD3DKMTDestroyDCFromMemory = (void *)GetProcAddress( gdi32, "D3DKMTDestroyDCFromMemory" );
@@ -5210,14 +5261,17 @@ START_TEST(opengl)
     ok_ptr( glGetString( GL_VERSION ), ==, NULL );
     ok_ptr( glGetString( GL_VENDOR ), ==, NULL );
 
-    test_bitmap_rendering( TRUE );
-    test_bitmap_rendering( FALSE );
-    test_16bit_bitmap_rendering();
-    test_d3dkmt_rendering();
-    test_minimized();
-    test_window_dc();
-    test_message_window();
-    test_dc( hwnd, hdc );
+    if (!string_returns_only)
+    {
+        test_bitmap_rendering( TRUE );
+        test_bitmap_rendering( FALSE );
+        test_16bit_bitmap_rendering();
+        test_d3dkmt_rendering();
+        test_minimized();
+        test_window_dc();
+        test_message_window();
+        test_dc( hwnd, hdc );
+    }
 
     hglrc = wglCreateContext( hdc );
     res = wglMakeCurrent( hdc, hglrc );
@@ -5235,6 +5289,13 @@ START_TEST(opengl)
      * any WGL call :( On Wine this would work but not on real Windows because there can be different implementations (software, ICD, MCD).
      */
     init_functions();
+    test_string_returns();
+    if (string_returns_only)
+    {
+        wglMakeCurrent( NULL, NULL );
+        wglDeleteContext( hglrc );
+        goto cleanup;
+    }
 
     test_getprocaddress( hdc );
     test_deletecontext( hwnd, hdc );

@@ -726,9 +726,11 @@ static void *get_shm( unsigned int idx )
     if (entry >= shm_addrs_size)
     {
         int new_size = max(shm_addrs_size * 2, entry + 1);
+        void **new_addrs;
 
-        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
-            fprintf( stderr, "msync: couldn't expand shm_addrs array to size %d\n", entry + 1 );
+        if (!(new_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
+            fatal_error( "could not expand msync shared memory table\n" );
+        shm_addrs = new_addrs;
 
         memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
 
@@ -738,11 +740,16 @@ static void *get_shm( unsigned int idx )
     if (!shm_addrs[entry])
     {
         kern_return_t kr;
-        mach_vm_address_t address;
+        mach_vm_address_t address = 0;
 
         kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&address, (mach_vm_size_t)pagesize, 0, VM_FLAGS_ANYWHERE,
                           MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
-        MACH_CHECK_ERROR( kr, "mach_vm_map" );
+        if (kr != KERN_SUCCESS)
+        {
+            fprintf( stderr, "msync: error: mach_vm_map failed with %d: %s\n",
+                     kr, mach_error_string( kr ) );
+            fatal_error( "could not map msync shared memory page\n" );
+        }
         memset( (void *)address, 0, pagesize );
 
         if (debug_level)

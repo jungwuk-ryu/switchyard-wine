@@ -68,7 +68,8 @@ if [[ ! -f $native_provider || ! -f $pe_provider ]]; then
 fi
 native_imports=$(/usr/bin/nm -u "$native_provider") || exit 1
 for symbol in uc_open uc_emu_start uc_hook_add uc_mem_map_ptr \
-              uc_context_alloc uc_context_save uc_context_restore uc_context_free; do
+              uc_context_alloc uc_context_save uc_context_restore uc_context_free \
+              uc_emu_stop_at_instruction_boundary uc_enable_shared_memory_atomics; do
     if ! grep -Eq "(^|[[:space:]])_?${symbol}$" <<<"$native_imports"; then
         echo "production xtajit64 Unixlib is missing Unicorn symbol $symbol" >&2
         exit 1

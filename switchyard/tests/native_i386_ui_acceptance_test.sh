@@ -205,6 +205,15 @@ EOF
     -o "$RUNTIME/lib/wine/aarch64-unix/xtajit.so" <<'EOF'
 extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
+struct uc_struct;
+typedef int (*switchyard_unicorn_extension_t)(struct uc_struct *);
+extern int uc_emu_stop_at_instruction_boundary(struct uc_struct *);
+extern int uc_enable_shared_memory_atomics(struct uc_struct *);
+__attribute__((used, visibility("default")))
+switchyard_unicorn_extension_t const switchyard_unicorn_fixture_imports[] = {
+    uc_emu_stop_at_instruction_boundary,
+    uc_enable_shared_memory_atomics,
+};
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);
@@ -221,9 +230,18 @@ EOF
     -o "$RUNTIME/lib/wine/aarch64-unix/xtajit64.so" <<'EOF'
 extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
+struct uc_struct;
+typedef int (*switchyard_unicorn_extension_t)(struct uc_struct *);
+extern int uc_emu_stop_at_instruction_boundary(struct uc_struct *);
+extern int uc_enable_shared_memory_atomics(struct uc_struct *);
+__attribute__((used, visibility("default")))
+switchyard_unicorn_extension_t const switchyard_unicorn_fixture_imports[] = {
+    uc_emu_stop_at_instruction_boundary,
+    uc_enable_shared_memory_atomics,
+};
 __attribute__((used, visibility("default"))) const char
     switchyard_xtajit64_fixture_abi_identity[] =
-        "switchyard-xtajit64-provider-abi-v6-process-init-80-begin-464";
+        "switchyard-xtajit64-provider-abi-v8-process-init-80-begin-472-doorbell-single-step";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);

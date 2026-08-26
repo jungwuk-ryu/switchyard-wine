@@ -3945,30 +3945,37 @@ static void test_section_access(void)
 static void test_shared_image_section(void)
 {
     static const BYTE shared_data[0x200] = "shared section data";
-    IMAGE_SECTION_HEADER shared_section = {0};
+    IMAGE_SECTION_HEADER sections[3] = {0}, invalid_section;
     IMAGE_NT_HEADERS nt_header = nt_header_template;
     LARGE_INTEGER size;
     char dll_name[MAX_PATH];
     NTSTATUS status;
     HANDLE file, map;
     HMODULE module;
+    unsigned int i;
 
-    nt_header.FileHeader.NumberOfSections = 1;
+    nt_header.FileHeader.NumberOfSections = ARRAY_SIZE(sections);
     nt_header.OptionalHeader.SectionAlignment = page_size;
     nt_header.OptionalHeader.FileAlignment = sizeof(shared_data);
     nt_header.OptionalHeader.SizeOfHeaders = sizeof(shared_data);
-    nt_header.OptionalHeader.SizeOfImage = page_size * 2;
-    nt_header.OptionalHeader.SizeOfInitializedData = sizeof(shared_data);
+    nt_header.OptionalHeader.SizeOfImage = page_size * 4;
+    nt_header.OptionalHeader.SizeOfInitializedData = sizeof(shared_data) * ARRAY_SIZE(sections);
 
-    memcpy( shared_section.Name, ".mdata", sizeof(".mdata") );
-    shared_section.Misc.VirtualSize = sizeof(shared_data);
-    shared_section.VirtualAddress = page_size;
-    shared_section.SizeOfRawData = sizeof(shared_data);
-    shared_section.PointerToRawData = nt_header.OptionalHeader.FileAlignment;
-    shared_section.Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
-                                    IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_SHARED;
+    for (i = 0; i < ARRAY_SIZE(sections); i++)
+    {
+        sections[i].Misc.VirtualSize = sizeof(shared_data);
+        sections[i].VirtualAddress = page_size * (i + 1);
+        sections[i].SizeOfRawData = sizeof(shared_data);
+        sections[i].PointerToRawData = nt_header.OptionalHeader.FileAlignment * (i + 1);
+        sections[i].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    }
+    memcpy( sections[0].Name, ".rdata", sizeof(".rdata") );
+    memcpy( sections[1].Name, ".mdata", sizeof(".mdata") );
+    sections[1].Characteristics |= IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_SHARED;
+    memcpy( sections[2].Name, ".text", sizeof(".text") );
+    sections[2].Characteristics |= IMAGE_SCN_MEM_EXECUTE;
 
-    create_test_dll_sections( &dos_header, &nt_header, &shared_section, shared_data, dll_name );
+    create_test_dll_sections( &dos_header, &nt_header, sections, shared_data, dll_name );
     file = CreateFileA( dll_name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, 0 );
     ok( file != INVALID_HANDLE_VALUE, "CreateFileA failed, error %lu.\n", GetLastError() );
     if (file != INVALID_HANDLE_VALUE)
@@ -3987,15 +3994,21 @@ static void test_shared_image_section(void)
     ok( module != NULL, "LoadLibraryExA failed, error %lu.\n", GetLastError() );
     if (module)
     {
-        ok( !memcmp( (const BYTE *)module + shared_section.VirtualAddress,
-                     shared_data, sizeof(shared_data) ), "Shared section data was not preserved.\n" );
+        for (i = 0; i < ARRAY_SIZE(sections); i++)
+            ok( !memcmp( (const BYTE *)module + sections[i].VirtualAddress,
+                         shared_data, sizeof(shared_data) ),
+                "Section %u data was not preserved.\n", i );
         FreeLibrary( module );
     }
 
     DeleteFileA( dll_name );
 
-    shared_section.VirtualAddress = 0;
-    create_test_dll_sections( &dos_header, &nt_header, &shared_section, shared_data, dll_name );
+    invalid_section = sections[1];
+    invalid_section.VirtualAddress = 0;
+    nt_header.FileHeader.NumberOfSections = 1;
+    nt_header.OptionalHeader.SizeOfImage = page_size * 2;
+    nt_header.OptionalHeader.SizeOfInitializedData = sizeof(shared_data);
+    create_test_dll_sections( &dos_header, &nt_header, &invalid_section, shared_data, dll_name );
     file = CreateFileA( dll_name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, 0 );
     ok( file != INVALID_HANDLE_VALUE, "CreateFileA failed, error %lu.\n", GetLastError() );
     if (file != INVALID_HANDLE_VALUE)

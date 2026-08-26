@@ -1193,6 +1193,99 @@ static void test_fixed_low_first_fault(void)
     CHECK( !access.writeback_valid );
 }
 
+static void test_lost_x18_access(void)
+{
+    struct arm64ec_low_guest_access access;
+    uint32_t instruction, producer;
+
+    /* Heartopia's frozen first fault: ldr x8,[x18,#0x60]. */
+    instruction = UINT32_C(0xf9403248);
+    CHECK( arm64ec_decode_lost_x18_access( instruction, 0, 0, UINT64_C(0x60),
+                                           false, LOW_LIMIT, &access ) );
+    CHECK( access.address == UINT64_C(0x60) );
+    CHECK( access.rn == 18 && access.rt == 8 && access.size == 8 );
+    CHECK( !access.write && !access.writeback_valid );
+
+    /* A raw Darwin per-CPU x18 value is still authenticated by the FAR. */
+    CHECK( arm64ec_decode_lost_x18_access( instruction, UINT64_C(0x2011), 0,
+                                           UINT64_C(0x2071), false,
+                                           LOW_LIMIT, &access ) );
+
+    /* Wrong base, wrong FAR, wrong access direction, and writeback fail closed. */
+    CHECK( !arm64ec_decode_lost_x18_access( instruction - UINT32_C(0x20), 0, 0,
+                                            UINT64_C(0x60), false,
+                                            LOW_LIMIT, &access ) );
+    CHECK( !arm64ec_decode_lost_x18_access( instruction, 0, 0, UINT64_C(0x68),
+                                            false, LOW_LIMIT, &access ) );
+    CHECK( !arm64ec_decode_lost_x18_access( instruction, 0, 0, UINT64_C(0x60),
+                                            true, LOW_LIMIT, &access ) );
+    instruction = make_unscaled( 3, true, 1, 8, 18, 8 );
+    CHECK( !arm64ec_decode_lost_x18_access( instruction, UINT64_C(0x2000), 0,
+                                            UINT64_C(0x2000), false,
+                                            LOW_LIMIT, &access ) );
+
+    /* Heartopia's later TlsSetValue fault.  The first instruction computes
+     * x8 = x18 + (w0 << 3), then str writes through the derived low x8. */
+    producer = UINT32_C(0x8b204e48);   /* add x8,x18,w0,uxtw #3 */
+    instruction = UINT32_C(0xf90a4101); /* str x1,[x8,#0x1480] */
+    CHECK( arm64ec_decode_lost_x18_derived_access( producer, instruction,
+                                                   0, 23, UINT64_C(0xb8), 0,
+                                                   UINT64_C(0x1538), true,
+                                                   LOW_LIMIT, &access ) );
+    CHECK( access.address == UINT64_C(0x1538) );
+    CHECK( access.rn == 8 && access.rt == 1 && access.size == 8 );
+    CHECK( access.write && !access.writeback_valid );
+
+    /* Darwin's low per-CPU TPIDR encoding is authenticated the same way. */
+    CHECK( arm64ec_decode_lost_x18_derived_access( producer, instruction,
+                                                   UINT64_C(0x2011), 23,
+                                                   UINT64_C(0x20c9), 0,
+                                                   UINT64_C(0x3549), true,
+                                                   LOW_LIMIT, &access ) );
+
+    /* The producer, captured result, FAR, direction, and non-writeback access
+     * must all agree.  Replaying a producer that overwrites an input is also
+     * rejected. */
+    CHECK( !arm64ec_decode_lost_x18_derived_access( producer ^ UINT32_C(0x40000000),
+                                                    instruction, 0, 23,
+                                                    UINT64_C(0xb8), 0,
+                                                    UINT64_C(0x1538), true,
+                                                    LOW_LIMIT, &access ) );
+    CHECK( !arm64ec_decode_lost_x18_derived_access( producer - UINT32_C(0x20),
+                                                    instruction, 0, 23,
+                                                    UINT64_C(0xb8), 0,
+                                                    UINT64_C(0x1538), true,
+                                                    LOW_LIMIT, &access ) );
+    CHECK( !arm64ec_decode_lost_x18_derived_access( producer, instruction,
+                                                    0, 23, UINT64_C(0xc0), 0,
+                                                    UINT64_C(0x1540), true,
+                                                    LOW_LIMIT, &access ) );
+    CHECK( !arm64ec_decode_lost_x18_derived_access( producer, instruction,
+                                                    0, 22, UINT64_C(0xb8), 0,
+                                                    UINT64_C(0x1538), true,
+                                                    LOW_LIMIT, &access ) );
+    CHECK( !arm64ec_decode_lost_x18_derived_access( producer, instruction,
+                                                    0, 23, UINT64_C(0xb8), 0,
+                                                    UINT64_C(0x1530), true,
+                                                    LOW_LIMIT, &access ) );
+    CHECK( !arm64ec_decode_lost_x18_derived_access( producer, instruction,
+                                                    0, 23, UINT64_C(0xb8), 0,
+                                                    UINT64_C(0x1538), false,
+                                                    LOW_LIMIT, &access ) );
+    instruction = make_unscaled( 3, true, 1, 8, 8, 1 );
+    CHECK( !arm64ec_decode_lost_x18_derived_access( producer, instruction,
+                                                    0, 23, UINT64_C(0xb8), 0,
+                                                    UINT64_C(0xb8), false,
+                                                    LOW_LIMIT, &access ) );
+    producer = (producer & ~UINT32_C(0x001f0000)) | UINT32_C(8 << 16);
+    CHECK( !arm64ec_decode_lost_x18_derived_access( producer,
+                                                    UINT32_C(0xf90a4101),
+                                                    0, UINT64_C(0xb8),
+                                                    UINT64_C(0xb8), 0,
+                                                    UINT64_C(0x1538), true,
+                                                    LOW_LIMIT, &access ) );
+}
+
 int main(void)
 {
     test_unsigned_offset();
@@ -1212,6 +1305,7 @@ int main(void)
     test_register_offset_boundaries();
     test_translation_fault_class();
     test_fixed_low_first_fault();
+    test_lost_x18_access();
 
     if (failures)
     {

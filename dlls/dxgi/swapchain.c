@@ -1340,6 +1340,13 @@ static const struct wined3d_swapchain_state_parent_ops d3d11_swapchain_state_par
     d3d11_swapchain_windowed_state_changed,
 };
 
+static BOOL d3d11_swapchain_format_supports_get_dc(enum wined3d_format_id format)
+{
+    return format == WINED3DFMT_B8G8R8A8_UNORM
+            || format == WINED3DFMT_B8G8R8A8_TYPELESS
+            || format == WINED3DFMT_B8G8R8A8_UNORM_SRGB;
+}
+
 static HRESULT d3d11_swapchain_create_d3d11_textures(struct d3d11_swapchain *swapchain,
         IWineDXGIDevice *device, struct wined3d_swapchain_desc *desc)
 {
@@ -1355,7 +1362,12 @@ static HRESULT d3d11_swapchain_create_d3d11_textures(struct d3d11_swapchain *swa
         return E_FAIL;
     }
 
-    texture_flags |= WINED3D_TEXTURE_CREATE_GET_DC;
+    /* The software DComp compositor reads swapchain textures through a DC even
+     * when the application did not request a GDI-compatible swapchain. Only
+     * BGRA textures can carry D3D11_RESOURCE_MISC_GDI_COMPATIBLE, however. */
+    if ((desc->flags & WINED3D_SWAPCHAIN_GDI_COMPATIBLE)
+            || d3d11_swapchain_format_supports_get_dc(desc->backbuffer_format))
+        texture_flags |= WINED3D_TEXTURE_CREATE_GET_DC;
 
     if (FAILED(hr = IWineDXGIDeviceParent_register_swapchain_texture(dxgi_device_parent,
             wined3d_swapchain_get_front_buffer(swapchain->wined3d_swapchain),

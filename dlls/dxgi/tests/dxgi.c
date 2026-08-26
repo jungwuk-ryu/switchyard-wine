@@ -5851,6 +5851,73 @@ static void test_maximum_frame_latency(void)
     ok(!refcount, "Device has %lu references left.\n", refcount);
 }
 
+static void test_d3d11_non_gdi_swapchain(void)
+{
+    DXGI_SWAP_CHAIN_DESC1 swapchain_desc = {0};
+    D3D11_TEXTURE2D_DESC texture_desc;
+    ID3D11Texture2D *texture;
+    IDXGISwapChain1 *swapchain;
+    IDXGIFactory2 *factory;
+    IDXGIAdapter *adapter;
+    IDXGIDevice *device;
+    ULONG refcount;
+    HWND window;
+    HRESULT hr;
+
+    if (!(device = create_d3d11_device()))
+    {
+        skip("Failed to create a Direct3D 11 device.\n");
+        return;
+    }
+
+    hr = IDXGIDevice_GetAdapter(device, &adapter);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory2, (void **)&factory);
+    IDXGIAdapter_Release(adapter);
+    if (FAILED(hr))
+    {
+        win_skip("IDXGIFactory2 is not supported.\n");
+        IDXGIDevice_Release(device);
+        return;
+    }
+
+    window = create_window();
+    swapchain_desc.Width = 640;
+    swapchain_desc.Height = 480;
+    swapchain_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swapchain_desc.SampleDesc.Count = 1;
+    swapchain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swapchain_desc.BufferCount = 1;
+    swapchain_desc.Scaling = DXGI_SCALING_STRETCH;
+    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
+    swapchain_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+    hr = IDXGIFactory2_CreateSwapChainForHwnd(factory, (IUnknown *)device, window,
+            &swapchain_desc, NULL, NULL, &swapchain);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        hr = IDXGISwapChain1_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&texture);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        if (SUCCEEDED(hr))
+        {
+            ID3D11Texture2D_GetDesc(texture, &texture_desc);
+            ok(texture_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM,
+                    "Got unexpected format %#x.\n", texture_desc.Format);
+            ok(!(texture_desc.MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE),
+                    "Got unexpected misc flags %#x.\n", texture_desc.MiscFlags);
+            ID3D11Texture2D_Release(texture);
+        }
+        IDXGISwapChain1_Release(swapchain);
+    }
+
+    DestroyWindow(window);
+    refcount = IDXGIFactory2_Release(factory);
+    ok(refcount == 1, "Factory has %lu references left.\n", refcount);
+    refcount = IDXGIDevice_Release(device);
+    ok(!refcount, "Device has %lu references left.\n", refcount);
+}
+
 static void test_output_desc(void)
 {
     IDXGIAdapter *adapter, *adapter2;
@@ -9370,6 +9437,7 @@ START_TEST(dxgi)
     queue_test(test_create_factory);
     queue_test(test_private_data);
     queue_test(test_maximum_frame_latency);
+    queue_test(test_d3d11_non_gdi_swapchain);
     queue_test(test_output_desc);
     queue_test(test_object_wrapping);
     queue_test(test_factory_check_feature_support);

@@ -540,6 +540,21 @@ sub generate_unix_thunk($$$$)
     }
     else
     {
+        if (!is_void_func($func))
+        {
+            my $ret_type = get_arg_type( $func->[0] );
+            if ($ret_type eq "const GLubyte *" || $ret_type eq "const char *" || $ret_type eq "const GLchar *")
+            {
+                $vars .= "    $ret_type ret;\n";
+                $vars .= "    UINT_PTR client_ret;\n";
+                $vars .= "    NTSTATUS status;\n";
+                $ret_expr = "ret = ";
+                $ret_stat = "client_ret = (UINT_PTR)params->ret;\n";
+                $ret_stat .= "    status = return_client_string( ret, &client_ret );\n";
+                $ret_stat .= "    params->ret = ($ret_type)(UINT_PTR)client_ret;\n";
+                $ret_stat .= "    return status;";
+            }
+        }
         foreach my $arg (@{$func->[1]})
         {
             my $ptype = get_arg_type( $arg );
@@ -1804,6 +1819,7 @@ print OUT "#include \"wine/unixlib.h\"\n\n";
 print OUT "struct process_attach_params\n";
 print OUT "{\n";
 print OUT "    UINT64 call_gl_debug_message_callback;\n";
+print OUT "    BOOL copy_client_strings;\n";
 print OUT "};\n\n";
 
 foreach (sort keys %wgl_functions)

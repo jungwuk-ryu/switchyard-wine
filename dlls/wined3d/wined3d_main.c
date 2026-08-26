@@ -275,6 +275,7 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
     DWORD wined3d_context_tls_idx;
     char buffer[MAX_PATH+10];
     DWORD size = sizeof(buffer);
+    USHORT native_machine;
     const char *env;
     HKEY hkey = 0;
     HKEY appkey = 0;
@@ -289,6 +290,9 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
         return FALSE;
     }
     context_set_tls_idx(wined3d_context_tls_idx);
+
+    if (!RtlWow64GetProcessMachines(GetCurrentProcess(), NULL, &native_machine) && native_machine)
+        wined3d_settings.client_is_translated = RtlWow64GetCurrentMachine() != native_machine;
 
     /* We need our own window class for a fake window which we use to retrieve GL capabilities */
     /* We might need CS_OWNDC in the future if we notice strange things on Windows.

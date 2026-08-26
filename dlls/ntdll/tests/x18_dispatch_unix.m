@@ -464,6 +464,22 @@ __ASM_GLOBAL_FUNC( x18_dispatch_direct_bridge_impl,
                    "str x18, [x19, #0x40]\n\t"
                    "bl " __ASM_NAME("x18_dispatch_custom_x18_abi_enabled") "\n\t"
                    "str w0, [x19, #0x60]\n\t"
+
+                   /* Reproduce a lost Darwin custom-x18 mode at a native PE
+                    * TEB load.  The signal bridge must restore the TEB, retry
+                    * the unchanged instruction, and resume custom mode. */
+                   "ldr x16, [x19, #0x80]\n\t"
+                   "cbz x16, 7f\n\t"
+                   "mov w0, #0\n\t"
+                   "bl " __ASM_NAME("x18_dispatch_set_custom_x18_abi_enabled") "\n\t"
+                   "mov x18, xzr\n\t"
+                   "ldr x16, [x19, #0x80]\n\t"
+                   "blr x16\n\t"
+                   "str x0, [x19, #0x88]\n\t"
+                   "mov w0, #1\n\t"
+                   "str w0, [x19, #0x94]\n\t"
+                   "bl " __ASM_NAME("x18_dispatch_custom_x18_abi_enabled") "\n\t"
+                   "str w0, [x19, #0x90]\n\t"
                    "b 7f\n\t"
 
                    /* The bridge contract requires a PE/custom-mode caller. */

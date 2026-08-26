@@ -38,6 +38,12 @@
 
 #ifdef HAVE_UNICORN
 
+#if !defined(UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP) || \
+    !defined(UC_SWITCHYARD_SHARED_MEMORY_ATOMICS) || \
+    !defined(UC_SWITCHYARD_SHARED_CODE_COHERENCE)
+# error Switchyard Unicorn instruction-boundary stop, shared-memory atomics, and shared-code coherence are required
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(xtajit);
 
 struct mapped_range
@@ -579,11 +585,7 @@ static void request_engine_pause_locked( struct xtajit_engine *engine )
      * block acknowledgement is instead consumed by that hook, after
      * uc_emu_start() has cleared Unicorn's internal stop flag. */
     if (engine->start_acknowledged &&
-#ifdef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP
         (err = uc_emu_stop_at_instruction_boundary( engine->uc )) != UC_ERR_OK)
-#else
-        (err = uc_emu_stop( engine->uc )) != UC_ERR_OK)
-#endif
         poison_provider_locked( STATUS_UNSUCCESSFUL );
 }
 
@@ -1043,14 +1045,12 @@ static uc_err install_engine( struct xtajit_engine *engine )
     uc_err err;
 
     if ((err = uc_open( UC_ARCH_X86, UC_MODE_32, &engine->uc )) != UC_ERR_OK) return err;
-#ifdef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
     if ((err = uc_enable_shared_memory_atomics( engine->uc )) != UC_ERR_OK)
     {
         uc_close( engine->uc );
         engine->uc = NULL;
         return err;
     }
-#endif
     if ((err = uc_mem_map( engine->uc, XTAJIT_GUEST_GDT_PAGE, XTAJIT_GUEST_PAGE_SIZE,
                            UC_PROT_READ | UC_PROT_WRITE )) != UC_ERR_OK ||
         (err = uc_mem_map( engine->uc, XTAJIT_GUEST_BOP_PAGE, XTAJIT_GUEST_PAGE_SIZE,

@@ -44,6 +44,12 @@
 
 #ifdef HAVE_UNICORN
 
+#if !defined(UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP) || \
+    !defined(UC_SWITCHYARD_SHARED_MEMORY_ATOMICS) || \
+    !defined(UC_SWITCHYARD_SHARED_CODE_COHERENCE)
+# error Switchyard Unicorn instruction-boundary stop, shared-memory atomics, and shared-code coherence are required
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(xtajit);
 #ifndef XTAJIT64_UNIXLIB_TEST
 WINE_DECLARE_DEBUG_CHANNEL(xtajitmap);
@@ -124,6 +130,7 @@ struct thread_engine
     BOOL in_use;
     BOOL running;
     atomic_bool pause_requested;
+    volatile uint32_t *suspend_doorbell;
     uint64_t stack_limit;
     uint64_t stack_base;
     uint64_t transition_target;
@@ -1157,6 +1164,22 @@ static void stop_at_ec_target( struct thread_engine *engine, uc_engine *uc,
     uc_emu_stop( uc );
 }
 
+static void stop_at_instruction_boundary( struct thread_engine *engine,
+                                          uc_engine *uc )
+{
+    uc_err err;
+
+    /* An ordinary hook-time stop can commit the current translation block's
+     * side effects while restoring RIP to its beginning.  Resuming that
+     * context would repeat stores, stack updates, calls, or returns. */
+    err = uc_emu_stop_at_instruction_boundary( uc );
+    if (err == UC_ERR_OK) return;
+
+    engine->mapping_error = err;
+    engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+    uc_emu_stop( uc );
+}
+
 static void block_hook( uc_engine *uc, uint64_t address, uint32_t size, void *user )
 {
     struct thread_engine *engine = user;
@@ -1184,13 +1207,19 @@ static void block_hook( uc_engine *uc, uint64_t address, uint32_t size, void *us
             sched_yield();
     }
 #endif
+    if (engine->suspend_doorbell && *engine->suspend_doorbell)
+    {
+        engine->stop_reason = XTAJIT64_STOP_SUSPEND;
+        stop_at_instruction_boundary( engine, uc );
+        return;
+    }
     if (!atomic_load_explicit( &engine->pause_requested, memory_order_acquire )) return;
 #ifdef XTAJIT64_UNIXLIB_TEST
     if (!pthread_equal( engine->owner, pthread_self() ))
         atomic_store_explicit( &test_pause_stop_owner_violation, 1, memory_order_relaxed );
     atomic_fetch_add_explicit( &test_pause_stop_count, 1, memory_order_relaxed );
 #endif
-    uc_emu_stop( uc );
+    stop_at_instruction_boundary( engine, uc );
 }
 
 static void syscall_hook( uc_engine *uc, void *user )
@@ -1204,9 +1233,16 @@ static void syscall_hook( uc_engine *uc, void *user )
 static void interrupt_hook( uc_engine *uc, uint32_t intno, void *user )
 {
     struct thread_engine *engine = user;
+    uint64_t eflags = 0;
 
-    engine->stop_reason = intno == 0x2e ? XTAJIT64_STOP_SYSCALL :
-                                         XTAJIT64_STOP_INVALID_INSTRUCTION;
+    if (intno == 0x2e)
+        engine->stop_reason = XTAJIT64_STOP_SYSCALL;
+    else if (intno == 1 &&
+             uc_reg_read( uc, UC_X86_REG_EFLAGS, &eflags ) == UC_ERR_OK &&
+             (eflags & 0x100))
+        engine->stop_reason = XTAJIT64_STOP_SINGLE_STEP;
+    else
+        engine->stop_reason = XTAJIT64_STOP_INVALID_INSTRUCTION;
     uc_emu_stop( uc );
 }
 
@@ -1321,14 +1357,12 @@ static uc_err open_thread_engine( struct thread_engine *engine )
     uc_err err;
 
     if ((err = uc_open( UC_ARCH_X86, UC_MODE_64, &engine->uc )) != UC_ERR_OK) return err;
-#ifdef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
     if ((err = uc_enable_shared_memory_atomics( engine->uc )) != UC_ERR_OK)
     {
         uc_close( engine->uc );
         engine->uc = NULL;
         return err;
     }
-#endif
     if ((err = install_engine_hooks( engine )) != UC_ERR_OK)
     {
         range_array_free( &engine->mapped_ranges );
@@ -1468,6 +1502,11 @@ static uc_err acquire_pool_engine_locked( struct thread_binding *binding,
     struct thread_engine *engine, *idle = NULL;
     uc_err err;
 
+    while (provider.mutating && provider.initialized)
+        pthread_cond_wait( &provider.cond, &provider.mutex );
+    if (!provider.initialized || provider.shutting_down || provider.poison_status)
+        return UC_ERR_HANDLE;
+    idle = NULL;
     for (engine = provider.engines; engine; engine = engine->next)
     {
         if (engine->in_use) continue;
@@ -1520,6 +1559,7 @@ static uc_err release_pool_engine_locked( struct thread_binding *binding,
     else engine->resident_binding_id = 0;
     engine->running = FALSE;
     engine->in_use = FALSE;
+    engine->suspend_doorbell = NULL;
     --provider.engines_in_use;
     binding->active = FALSE;
     pthread_cond_broadcast( &provider.cond );
@@ -2845,7 +2885,6 @@ static uc_err synchronize_engine_registry_locked( struct thread_engine *engine )
 {
     struct range_array retained = {0}, old;
     size_t i;
-    BOOL unmapped = FALSE;
     uc_err err = UC_ERR_OK;
 
     if (engine->mapping_generation == provider.generation) return UC_ERR_OK;
@@ -2879,12 +2918,12 @@ static uc_err synchronize_engine_registry_locked( struct thread_engine *engine )
         }
         if ((err = unmap_range( engine, mapped->guest, mapped->size )) != UC_ERR_OK)
             goto done;
+        /* uc_mem_unmap() invalidates translated blocks and TLB entries for
+         * every affected mapped region.  A full-engine flush here would
+         * discard unrelated translations on every generation change. */
         ++engine->resync_unmap_calls;
         engine->resync_unmap_bytes += mapped->size;
-        unmapped = TRUE;
     }
-    if (unmapped && (err = uc_ctl_flush_tb( engine->uc )) != UC_ERR_OK)
-        goto done;
 
     old = engine->mapped_ranges;
     engine->mapped_ranges = retained;
@@ -3284,12 +3323,15 @@ static NTSTATUS begin_simulation( void *args )
     struct xtajit64_begin_params *params = args;
     struct thread_binding *binding;
     struct thread_engine *engine = NULL;
+    volatile uint32_t *suspend_doorbell = NULL;
+    uint64_t doorbell_host, doorbell_allocation;
+    unsigned int doorbell_domain;
     uc_err err = UC_ERR_OK, read_err = UC_ERR_OK, context_err = UC_ERR_OK;
     NTSTATUS status = STATUS_SUCCESS;
     uint64_t next_rip;
     BOOL resume;
 
-    if (!params || !params->context.rip ||
+    if (!params || params->reserved || !params->context.rip ||
         params->context.rip > XTAJIT64_X64_USER_ADDRESS_MAX ||
         !params->context.rsp ||
         params->context.rsp < params->stack_limit ||
@@ -3298,6 +3340,8 @@ static NTSTATUS begin_simulation( void *args )
         !params->gs_base ||
         params->gs_base > XTAJIT64_X64_USER_ADDRESS_MAX ||
         params->gs_base > UINT64_MAX - XTAJIT64_TEB_SELF_END ||
+        !params->suspend_doorbell ||
+        (params->suspend_doorbell & (sizeof(uint32_t) - 1)) ||
         params->stack_limit >= params->stack_base)
         return STATUS_INVALID_PARAMETER;
     pthread_once( &engine_key_once, make_engine_key );
@@ -3312,8 +3356,29 @@ static NTSTATUS begin_simulation( void *args )
         status = STATUS_INVALID_HANDLE;
     else if (provider.poison_status) status = provider.poison_status;
     else if (binding->active) status = STATUS_INVALID_DEVICE_STATE;
+    else if (!translate_guest_range_locked(
+                 params->suspend_doorbell, sizeof(uint32_t),
+                 UC_PROT_READ | UC_PROT_WRITE, &doorbell_host,
+                 &doorbell_allocation, &doorbell_domain ) ||
+             doorbell_host != params->suspend_doorbell ||
+             doorbell_domain != XTAJIT64_MEMORY_ADDRESS_IDENTITY)
+        status = STATUS_INVALID_ADDRESS;
+    else if (*(suspend_doorbell =
+                   (volatile uint32_t *)(uintptr_t)doorbell_host))
+    {
+        params->transition_target = 0;
+        params->fault_address = 0;
+        params->fault_access = EXCEPTION_READ_FAULT;
+        params->stop_reason = XTAJIT64_STOP_SUSPEND;
+        params->unicorn_error = UC_ERR_OK;
+    }
     else if ((err = acquire_pool_engine_locked( binding, &engine )) != UC_ERR_OK)
         status = err == UC_ERR_NOMEM ? STATUS_NO_MEMORY : STATUS_UNSUCCESSFUL;
+    if (!status && !engine)
+    {
+        pthread_mutex_unlock( &provider.mutex );
+        return STATUS_SUCCESS;
+    }
     if (status)
     {
         params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
@@ -3334,6 +3399,13 @@ static NTSTATUS begin_simulation( void *args )
         else if (provider.poison_status) status = provider.poison_status;
         else if (!engine->in_use || !binding->active)
             status = STATUS_INVALID_DEVICE_STATE;
+        else if (!translate_guest_range_locked(
+                     params->suspend_doorbell, sizeof(uint32_t),
+                     UC_PROT_READ | UC_PROT_WRITE, &doorbell_host,
+                     &doorbell_allocation, &doorbell_domain ) ||
+                 doorbell_host != params->suspend_doorbell ||
+                 doorbell_domain != XTAJIT64_MEMORY_ADDRESS_IDENTITY)
+            status = STATUS_INVALID_ADDRESS;
         else if (!registry_covers_readable_range( &provider.ranges, params->gs_base,
                                                    params->gs_base +
                                                    XTAJIT64_TEB_SELF_END ))
@@ -3358,6 +3430,20 @@ static NTSTATUS begin_simulation( void *args )
             return status;
         }
 
+        suspend_doorbell = (volatile uint32_t *)(uintptr_t)doorbell_host;
+        engine->suspend_doorbell = suspend_doorbell;
+        if (*suspend_doorbell)
+        {
+            params->transition_target = 0;
+            params->fault_address = 0;
+            params->fault_access = EXCEPTION_READ_FAULT;
+            params->stop_reason = XTAJIT64_STOP_SUSPEND;
+            params->unicorn_error = UC_ERR_OK;
+            release_pool_engine_locked( binding, engine, FALSE );
+            pthread_mutex_unlock( &provider.mutex );
+            return STATUS_SUCCESS;
+        }
+
         engine->stack_limit = params->stack_limit;
         engine->stack_base = params->stack_base;
         engine->transition_target = 0;
@@ -3366,6 +3452,17 @@ static NTSTATUS begin_simulation( void *args )
         engine->mapping_error = UC_ERR_OK;
         engine->stop_reason = XTAJIT64_STOP_NONE;
         atomic_store_explicit( &engine->pause_requested, false, memory_order_release );
+        if (*suspend_doorbell)
+        {
+            params->transition_target = 0;
+            params->fault_address = 0;
+            params->fault_access = EXCEPTION_READ_FAULT;
+            params->stop_reason = XTAJIT64_STOP_SUSPEND;
+            params->unicorn_error = UC_ERR_OK;
+            release_pool_engine_locked( binding, engine, FALSE );
+            pthread_mutex_unlock( &provider.mutex );
+            return STATUS_SUCCESS;
+        }
         engine->running = TRUE;
         pthread_mutex_unlock( &provider.mutex );
 
@@ -3399,8 +3496,11 @@ static NTSTATUS begin_simulation( void *args )
                 else
                 {
                     engine->stop_reason = XTAJIT64_STOP_NONE;
-                    if (!atomic_load_explicit( &engine->pause_requested,
-                                                memory_order_acquire ))
+                    if (engine->suspend_doorbell && *engine->suspend_doorbell)
+                        engine->stop_reason = XTAJIT64_STOP_SUSPEND;
+                    if (engine->stop_reason == XTAJIT64_STOP_NONE &&
+                        !atomic_load_explicit( &engine->pause_requested,
+                                               memory_order_acquire ))
                     {
                         pthread_mutex_unlock( &provider.mutex );
                         continue;
@@ -3439,11 +3539,16 @@ static NTSTATUS begin_simulation( void *args )
                 if (status || params->stop_reason != XTAJIT64_STOP_EC_TRANSITION)
                     TRACE_(xtajitmap)(
                         "pid %ld engine %llu result status=%#x reason=%u "
-                        "unicorn=%u rip=%#llx fault=%#llx access=%u\n",
+                        "unicorn=%u emu=%u read=%u mapping=%u pause=%u "
+                        "doorbell=%u rip=%#llx fault=%#llx access=%u\n",
                         (long)getpid(),
                         (unsigned long long)engine->diagnostic_id,
                         (unsigned int)status, params->stop_reason,
-                        params->unicorn_error,
+                        params->unicorn_error, err, read_err,
+                        engine->mapping_error,
+                        atomic_load_explicit( &engine->pause_requested,
+                                              memory_order_acquire ),
+                        engine->suspend_doorbell ? *engine->suspend_doorbell : 0,
                         (unsigned long long)params->context.rip,
                         (unsigned long long)params->fault_address,
                         params->fault_access );
@@ -3474,8 +3579,10 @@ static NTSTATUS begin_simulation( void *args )
 
     if (status) return status;
     if (params->stop_reason == XTAJIT64_STOP_EC_TRANSITION) return STATUS_SUCCESS;
+    if (params->stop_reason == XTAJIT64_STOP_SUSPEND) return STATUS_SUCCESS;
     if (params->stop_reason == XTAJIT64_STOP_MEMORY_FAULT) return STATUS_ACCESS_VIOLATION;
     if (params->stop_reason == XTAJIT64_STOP_MAPPING_MISS) return STATUS_RETRY;
+    if (params->stop_reason == XTAJIT64_STOP_SINGLE_STEP) return STATUS_SINGLE_STEP;
     return STATUS_NOT_SUPPORTED;
 }
 

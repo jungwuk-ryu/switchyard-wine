@@ -19,6 +19,7 @@
 struct process_attach_params
 {
     UINT64 call_gl_debug_message_callback;
+    BOOL copy_client_strings;
 };
 
 struct wglCopyContext_params
