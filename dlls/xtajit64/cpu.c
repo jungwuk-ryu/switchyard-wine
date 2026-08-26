@@ -1542,7 +1542,8 @@ static void flight_bind_provider( struct xtajit64_thread_state *state,
     UINT64 authenticated_teb;
     NTSTATUS status;
 
-    if (!flight_has_active_recorder( state )) return;
+    if (!flight_has_active_recorder( state ) ||
+        state->flight_teb_authenticated) return;
     recorder = state->flight_recorder;
     memset( &params, 0, sizeof(params) );
     params.recorder = (ULONG_PTR)recorder;
@@ -1849,28 +1850,30 @@ static DECLSPEC_NORETURN void raise_x64_single_step(
 static void flight_start_transition( struct xtajit64_thread_state *state )
 {
     struct xtajit64_flight_recorder *recorder;
-    UINT64 causal_boundary_id;
+    UINT64 boundary_id;
 
     if (!flight_has_active_recorder( state )) return;
     recorder = state->flight_recorder;
-    if (!(++state->flight_transition_generation)) ++state->flight_transition_generation;
-    if (!(++state->flight_context_generation)) ++state->flight_context_generation;
-    causal_boundary_id = xtajit64_flight_next_causal_boundary_id( recorder );
-    if (causal_boundary_id != XTAJIT64_FLIGHT_UNKNOWN_U64)
-        state->flight_causal_boundary_id = causal_boundary_id;
+    boundary_id = xtajit64_flight_next_causal_boundary_id( recorder );
+    if (boundary_id == XTAJIT64_FLIGHT_UNKNOWN_U64) return;
+    boundary_id = xtajit64_flight_publish_boundary( recorder, boundary_id );
+    if (boundary_id == XTAJIT64_FLIGHT_UNKNOWN_U64) return;
+    /* These are separate event fields but one owning transition boundary.
+     * Assign them from the release-published ID so an interrupted outer
+     * producer cannot regress state after a nested transition published. */
+    state->flight_causal_boundary_id = boundary_id;
+    state->flight_context_generation = boundary_id;
+    state->flight_transition_generation = boundary_id;
 }
 
 static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *state )
 {
     CHPE_V2_CPU_AREA_INFO *cpu;
     ARM64EC_NT_CONTEXT *ec_context;
-    struct xtajit64_transition_frame *frame;
+    struct xtajit64_transition_frame *frame, *mismatched_frame = NULL;
     struct xtajit64_begin_params params = {0};
     TEB *teb;
     UINT64 guest_return;
-    UINT64 continuation_target = XTAJIT64_FLIGHT_UNKNOWN_U64;
-    UINT64 continuation_pc = XTAJIT64_FLIGHT_UNKNOWN_U64;
-    UINT64 continuation_rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
     ULONG_PTR native_target, entry, host_rsp;
     NTSTATUS status;
     UINT frame_index;
@@ -1922,10 +1925,10 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
                               XTAJIT64_FLIGHT_EVENT_TRANSITION_BEGIN );
         flight_bind_provider( state, ec_context, &ec_context->AMD64_Context,
                               params.stack_limit, params.stack_base );
-        /* unix_flight_bind() returns through the system-mode dispatcher.
-         * Re-observe the PE numeric x18 contract directly before the actual
-         * provider entry rather than treating the Unix-side mode sample as a
-         * statement about the caller's public ARM64EC mode. */
+        /* The first unix_flight_bind() returns through the system-mode
+         * dispatcher; later transitions reuse that authenticated association
+         * and publish their live boundary through the recorder.  Re-observe
+         * the PE numeric x18 contract directly before every provider entry. */
         flight_watch_cpu_x18( state, ec_context, &ec_context->AMD64_Context,
                               params.stack_limit, params.stack_base,
                               XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN );
@@ -1957,19 +1960,13 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
             flight_dump_if_frozen( state, "provider boundary return" );
         }
         context_from_unix( &ec_context->AMD64_Context, &params.context );
-        if (state->depth &&
-            (frame = &state->frames[state->depth - 1])->kind == XTAJIT64_FRAME_EXIT)
-        {
-            continuation_target = params.transition_target;
-            continuation_pc = frame->native_pc;
-            continuation_rsp = frame->guest_rsp;
-        }
         if (state->flight_recorder)
         {
             flight_watch_cpu_context( state, ec_context, &ec_context->AMD64_Context,
                                       params.stack_limit, params.stack_base,
-                                      continuation_target, continuation_pc,
-                                      continuation_rsp,
+                                      XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                      XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                      XTAJIT64_FLIGHT_UNKNOWN_U64,
                                       XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT );
             flight_watch_cpu_x18( state, ec_context, &ec_context->AMD64_Context,
                                   params.stack_limit, params.stack_base,
@@ -2036,6 +2033,7 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
             params.transition_target != candidate->native_pc)
             continue;
         continuation_target_seen = TRUE;
+        if (!mismatched_frame) mismatched_frame = candidate;
         if (params.context.rsp == candidate->guest_rsp)
         {
             frame = candidate;
@@ -2086,8 +2084,24 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
         xtajit64_restore_native( ec_context );
     }
     if (continuation_target_seen)
+    {
+        /* Only the complete frame search owns the continuation-pair
+         * invariant.  The top frame can legitimately share a native PC with
+         * an older frame that has the exact post-pop guest RSP selected by a
+         * non-local unwind.  Freeze only when no candidate matched both. */
+        if (state->flight_recorder && mismatched_frame)
+        {
+            flight_record_cpu_event( state, ec_context, &ec_context->AMD64_Context,
+                                     params.stack_limit, params.stack_base,
+                                     mismatched_frame->native_pc,
+                                     mismatched_frame->guest_rsp,
+                                     XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION,
+                                     XTAJIT64_FLIGHT_REASON_CONTINUATION_PAIR );
+            flight_dump_if_frozen( state, "continuation frame search" );
+        }
         abort_transition( state, STATUS_BAD_STACK,
                           "x64 exit-thunk continuation stack mismatch" );
+    }
 
     if (params.context.rsp > ~(UINT64)0 - sizeof(guest_return) ||
         (status = read_guest_u64( params.context.rsp, &guest_return )))
@@ -2158,6 +2172,13 @@ static void __attribute__((used, noreturn)) xtajit64_transition_from_native(
         abort_transition( state, STATUS_INVALID_PARAMETER, "invalid native capture state" );
     if ((status = capture_fp_state( &ec_context->AMD64_Context )))
         abort_transition( state, status, "cannot capture native FP state" );
+    /* The assembly capture above materializes every integer and SIMD register,
+     * while capture_fp_state() completes the architectural FP metadata.  Mark
+     * those groups valid at their owning boundary so consumers, including the
+     * diagnostic watchdog, never observe a fully populated context with stale
+     * or zero validity flags. */
+    ec_context->AMD64_Context.ContextFlags |= CONTEXT_AMD64_FULL |
+                                               CONTEXT_AMD64_FLOATING_POINT;
     if (state->flight_recorder)
     {
         UINT64 stack_limit = XTAJIT64_FLIGHT_UNKNOWN_U64;

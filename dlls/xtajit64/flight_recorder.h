@@ -26,7 +26,7 @@
  * types in records.  Raw addresses are retained only while the caller has
  * explicitly enabled the engineering diagnostic. */
 #define XTAJIT64_FLIGHT_MAGIC          0x3154474c46545858ull /* "XXFTLGT1" */
-#define XTAJIT64_FLIGHT_SCHEMA_VERSION 3u
+#define XTAJIT64_FLIGHT_SCHEMA_VERSION 4u
 #define XTAJIT64_FLIGHT_CAPACITY       64u
 #define XTAJIT64_FLIGHT_SCRATCH_SLOTS  8u
 #define XTAJIT64_FLIGHT_RECORDER_SIZE  0x5fc0u
@@ -215,7 +215,12 @@ struct DECLSPEC_ALIGN(64) xtajit64_flight_recorder
     /* The first watchdog winner has a separate atomically-published payload,
      * so choosing the freeze reason never races with ring-slot ownership. */
     volatile UINT64 first_violation_publication;
-    UINT64 reserved[2];
+    /* The PE transition owner release-publishes the newest boundary before
+     * entering Unix.  Context and transition generations deliberately share
+     * this boundary clock, so the hot BeginSimulation call can refresh all
+     * three identities without a second diagnostic-only Unix dispatch. */
+    volatile UINT64 published_boundary_id;
+    UINT64 reserved;
     struct xtajit64_flight_event first_violation;
     struct xtajit64_flight_scratch scratch[XTAJIT64_FLIGHT_SCRATCH_SLOTS];
     /* A slot belongs only to the writer holding its exact generation.  The
@@ -381,6 +386,7 @@ static inline void xtajit64_flight_recorder_init( struct xtajit64_flight_recorde
     recorder->capacity = XTAJIT64_FLIGHT_CAPACITY;
     __atomic_store_n( &recorder->next_sequence, 1, __ATOMIC_RELAXED );
     __atomic_store_n( &recorder->next_causal_boundary_id, 1, __ATOMIC_RELAXED );
+    __atomic_store_n( &recorder->published_boundary_id, 0, __ATOMIC_RELAXED );
     __atomic_store_n( &recorder->authenticated_teb, XTAJIT64_FLIGHT_UNKNOWN_U64,
                       __ATOMIC_RELAXED );
     /* Sequence 1 maps to slot 1; slot 0 first belongs to sequence 64. */
@@ -392,6 +398,51 @@ static inline void xtajit64_flight_recorder_init( struct xtajit64_flight_recorde
 
 static inline BOOL xtajit64_flight_freeze( struct xtajit64_flight_recorder *recorder,
                                            UINT32 reason );
+
+/* Publish a monotonically increasing transition boundary.  A signal-driven
+ * nested transition may publish a newer ID before an interrupted outer
+ * producer resumes, so the compare/exchange is a max operation rather than a
+ * plain store.  Returning the retained value lets the PE state converge on
+ * that non-regressing publication. */
+static inline UINT64 xtajit64_flight_publish_boundary(
+    struct xtajit64_flight_recorder *recorder, UINT64 boundary_id )
+{
+    UINT64 current, expected;
+
+    if (!xtajit64_flight_recorder_is_active( recorder ))
+        return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    if (!boundary_id || boundary_id == XTAJIT64_FLIGHT_UNKNOWN_U64)
+    {
+        xtajit64_flight_freeze( recorder,
+                               XTAJIT64_FLIGHT_REASON_CONTEXT_STALE_PUBLICATION );
+        return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    }
+    for (;;)
+    {
+        current = __atomic_load_n( &recorder->published_boundary_id,
+                                   __ATOMIC_ACQUIRE );
+        if (current == XTAJIT64_FLIGHT_UNKNOWN_U64)
+        {
+            xtajit64_flight_freeze( recorder,
+                                   XTAJIT64_FLIGHT_REASON_CONTEXT_STALE_PUBLICATION );
+            return XTAJIT64_FLIGHT_UNKNOWN_U64;
+        }
+        if (current >= boundary_id) return current;
+        expected = current;
+        if (__atomic_compare_exchange_n( &recorder->published_boundary_id,
+                                         &expected, boundary_id, FALSE,
+                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ))
+            return boundary_id;
+    }
+}
+
+static inline UINT64 xtajit64_flight_current_boundary(
+    const struct xtajit64_flight_recorder *recorder )
+{
+    if (!xtajit64_flight_recorder_is_valid( recorder ))
+        return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    return __atomic_load_n( &recorder->published_boundary_id, __ATOMIC_ACQUIRE );
+}
 
 static inline UINT64 xtajit64_flight_next_causal_boundary_id(
     struct xtajit64_flight_recorder *recorder )

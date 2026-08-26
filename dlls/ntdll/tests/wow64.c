@@ -4374,6 +4374,8 @@ static DWORD CALLBACK simulation_thread( void *arg )
     context = &NtCurrentTeb()->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
     context->Rsp = (ULONG_PTR)&context - 0x800;
     context->Rip = (ULONG_PTR)addr;
+    context->ContextFlags |= CONTEXT_AMD64_FULL | CONTEXT_AMD64_FLOATING_POINT;
+    context->FltSave.MxCsr = context->MxCsr;
 
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;  /* otherwise it crashes on recent Windows */
     pBeginSimulation();

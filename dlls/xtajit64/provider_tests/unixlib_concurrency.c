@@ -1093,6 +1093,19 @@ static void test_flight_recorder_core(void)
            XTAJIT64_FLIGHT_REASON_RECORDER_WRAP,
            "flight causal ID zero sentinel did not fail closed\n" );
     xtajit64_flight_recorder_init( &flight_test_recorder );
+    check( xtajit64_flight_publish_boundary( &flight_test_recorder, 0x41 ) == 0x41 &&
+           xtajit64_flight_current_boundary( &flight_test_recorder ) == 0x41 &&
+           xtajit64_flight_publish_boundary( &flight_test_recorder, 0x40 ) == 0x41 &&
+           xtajit64_flight_current_boundary( &flight_test_recorder ) == 0x41,
+           "flight shared boundary publication regressed\n" );
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    check( xtajit64_flight_publish_boundary( &flight_test_recorder,
+                                             XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_UNKNOWN_U64 &&
+           __atomic_load_n( &flight_test_recorder.freeze_reason, __ATOMIC_ACQUIRE ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_STALE_PUBLICATION,
+           "flight invalid shared boundary did not fail closed\n" );
+    xtajit64_flight_recorder_init( &flight_test_recorder );
     recorder_address = (ULONG_PTR)&flight_test_recorder;
     layout_base = recorder_address - 0x10000;
     check( xtajit64_flight_validate_layout( layout_base,
@@ -1554,6 +1567,18 @@ static void test_flight_recorder_contracts(void)
     if (failures == starting_failures) printf( "XTAJIT64_FLIGHT_CONTRACTS_PASS\n" );
 }
 
+static void publish_test_flight_boundary( struct xtajit64_flight_recorder *recorder,
+                                          struct xtajit64_flight_bind_params *binding,
+                                          UINT64 boundary_id )
+{
+    binding->causal_boundary_id = boundary_id;
+    binding->context_generation = boundary_id;
+    binding->transition_generation = boundary_id;
+    check( xtajit64_flight_publish_boundary( recorder, boundary_id ) == boundary_id,
+           "flight test boundary %#llx was not published\n",
+           (unsigned long long)boundary_id );
+}
+
 static void test_flight_provider_boundary(void)
 {
     unsigned char *recorder_pages = test_pages + 12 * TEST_PAGE;
@@ -1627,9 +1652,7 @@ static void test_flight_provider_boundary(void)
     if (!unix_teb || unix_teb == XTAJIT64_FLIGHT_UNKNOWN_U64) goto done;
     initialize_begin_parameters( &params, test_ec_target, (uintptr_t)stack_page );
     binding.recorder = (uintptr_t)recorder;
-    binding.causal_boundary_id = 0x9a17;
-    binding.context_generation = 1;
-    binding.transition_generation = 7;
+    publish_test_flight_boundary( recorder, &binding, 0x9a17 );
     binding.claimed_teb = unix_teb;
     binding.guest_rip = params.context.rip;
     binding.guest_rsp = params.context.rsp;
@@ -1639,10 +1662,6 @@ static void test_flight_provider_boundary(void)
     binding.control_stack_top = (uintptr_t)recorder_pages + 2 * TEST_PAGE;
     status = flight_bind( &binding );
     check( !status, "flight binding returned %#x\n", (unsigned int)status );
-    if (status) goto done;
-    binding.context_generation = 2;
-    status = flight_bind( &binding );
-    check( !status, "flight binding refresh returned %#x\n", (unsigned int)status );
     if (status) goto done;
 
     status = begin_simulation( &params );
@@ -1676,6 +1695,8 @@ static void test_flight_provider_boundary(void)
                stop->binding_id == binding_id && export->binding_id == binding_id &&
                release->binding_id == binding_id &&
                causal_boundary_id == binding.causal_boundary_id &&
+               acquire->context_generation == causal_boundary_id &&
+               acquire->transition_generation == causal_boundary_id &&
                bind->guest_rsp == binding.guest_rsp &&
                begin->guest_stack_limit == binding.guest_stack_limit &&
                begin->guest_stack_base == binding.guest_stack_base &&
@@ -1691,16 +1712,7 @@ static void test_flight_provider_boundary(void)
      * normalization, not the pre-normalization NONE left by uc_emu_start(). */
     initialize_begin_parameters( &params, (uintptr_t)invalid_code_page,
                                  (uintptr_t)stack_page );
-    binding.causal_boundary_id = 0x9a19;
-    binding.context_generation = 3;
-    binding.transition_generation = 8;
-    binding.guest_rip = params.context.rip;
-    binding.guest_rsp = params.context.rsp;
-    binding.guest_stack_limit = params.stack_limit;
-    binding.guest_stack_base = params.stack_base;
-    status = flight_bind( &binding );
-    check( !status, "flight invalid-instruction binding returned %#x\n", (unsigned int)status );
-    if (status) goto done;
+    publish_test_flight_boundary( recorder, &binding, 0x9a19 );
     status = begin_simulation( &params );
     check( status == STATUS_NOT_SUPPORTED &&
            params.stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION,
@@ -1711,10 +1723,14 @@ static void test_flight_provider_boundary(void)
                                       binding.causal_boundary_id );
     invalid_export = find_flight_event( XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT,
                                         binding.causal_boundary_id );
-    check( invalid_stop && invalid_export &&
+    check( !find_flight_event( XTAJIT64_FLIGHT_EVENT_BINDING,
+                               binding.causal_boundary_id ) &&
+           invalid_stop && invalid_export &&
+           invalid_stop->context_generation == binding.causal_boundary_id &&
+           invalid_stop->transition_generation == binding.causal_boundary_id &&
            invalid_stop->stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION &&
            invalid_export->stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION,
-           "flight invalid-instruction terminal events lost stop reason stop %p/%u export %p/%u\n",
+           "flight shared-boundary refresh or terminal stop was lost stop %p/%u export %p/%u\n",
            invalid_stop, invalid_stop ? invalid_stop->stop_reason : XTAJIT64_FLIGHT_UNKNOWN_U32,
            invalid_export, invalid_export ? invalid_export->stop_reason : XTAJIT64_FLIGHT_UNKNOWN_U32 );
 
@@ -1728,16 +1744,7 @@ static void test_flight_provider_boundary(void)
            "flight interrupt code flush failed\n" );
     initialize_begin_parameters( &params, (uintptr_t)invalid_code_page,
                                  (uintptr_t)stack_page );
-    binding.causal_boundary_id = 0x9a1a;
-    binding.context_generation = 4;
-    binding.transition_generation = 9;
-    binding.guest_rip = params.context.rip;
-    binding.guest_rsp = params.context.rsp;
-    binding.guest_stack_limit = params.stack_limit;
-    binding.guest_stack_base = params.stack_base;
-    status = flight_bind( &binding );
-    check( !status, "flight interrupt binding returned %#x\n", (unsigned int)status );
-    if (status) goto done;
+    publish_test_flight_boundary( recorder, &binding, 0x9a1a );
     status = begin_simulation( &params );
     check( status == STATUS_NOT_SUPPORTED &&
            params.stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION,
@@ -1761,8 +1768,7 @@ static void test_flight_provider_boundary(void)
     check( !status, "flight unbind returned %#x\n", (unsigned int)status );
     if (status) goto done;
     binding.recorder = (uintptr_t)recorder2;
-    binding.causal_boundary_id = 0x9a18;
-    binding.context_generation = 1;
+    publish_test_flight_boundary( recorder2, &binding, 0x9a18 );
     binding.control_stack_limit = (uintptr_t)recorder2_pages;
     binding.control_stack_top = (uintptr_t)recorder2_pages + 2 * TEST_PAGE;
     status = flight_bind( &binding );
@@ -1771,7 +1777,8 @@ static void test_flight_provider_boundary(void)
            (unsigned int)status,
            __atomic_load_n( &recorder2->freeze_state, __ATOMIC_ACQUIRE ) );
     if (status) goto done;
-    binding.context_generation = 1;  /* stale publication must freeze once. */
+    /* A redundant standalone bind is a stale publication even though a
+     * BeginSimulation retry may legitimately reuse the current boundary. */
     status = flight_bind( &binding );
     check( !status && __atomic_load_n( &recorder2->freeze_state, __ATOMIC_ACQUIRE ) == 1 &&
            __atomic_load_n( &recorder2->freeze_reason, __ATOMIC_ACQUIRE ) ==
@@ -1786,7 +1793,7 @@ static void test_flight_provider_boundary(void)
     if (status) goto done;
     xtajit64_flight_recorder_init( recorder2 );
     binding.recorder = (uintptr_t)recorder2;
-    binding.context_generation = 1;
+    publish_test_flight_boundary( recorder2, &binding, 0x9a18 );
     wrong_teb = unix_teb ^ UINT64_C(0x10);
     binding.claimed_teb = wrong_teb;
     status = flight_bind( &binding );
@@ -1809,7 +1816,7 @@ static void test_flight_provider_boundary(void)
     if (status) goto done;
     xtajit64_flight_recorder_init( recorder2 );
     binding.recorder = (uintptr_t)recorder2;
-    binding.context_generation = 1;
+    publish_test_flight_boundary( recorder2, &binding, 0x9a18 );
     binding.claimed_teb = 0;
     status = flight_bind( &binding );
     check( !status && __atomic_load_n( &recorder2->freeze_state, __ATOMIC_ACQUIRE ) == 1 &&

@@ -29,6 +29,16 @@
 
 typedef void (WINAPI *x64_return_func)(void);
 
+static void prepare_begin_simulation_context( CONTEXT *context )
+{
+    /* Production enters through either context_arm_to_x64() or the native
+     * capture path, both of which publish a complete integer/FP context.
+     * Direct provider-test entries own the same BeginSimulation contract. */
+    context->ContextFlags |= CONTEXT_AMD64_FULL |
+                             CONTEXT_AMD64_FLOATING_POINT;
+    context->FltSave.MxCsr = context->MxCsr;
+}
+
 static ULONG_PTR __attribute__((noinline)) WINAPI capture_and_restore_x18( TEB *teb )
 {
     ULONG_PTR observed;
@@ -74,6 +84,11 @@ static void test_native_return_x18(void)
     observed = call_x64_and_restore_x18( func, teb );
     ok( observed == (ULONG_PTR)teb,
         "x64 return restored x18 %#Ix, expected TEB %p\n", observed, teb );
+    ok( (teb->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context.ContextFlags &
+         (CONTEXT_AMD64_FULL | CONTEXT_AMD64_FLOATING_POINT)) ==
+        (CONTEXT_AMD64_FULL | CONTEXT_AMD64_FLOATING_POINT),
+        "native capture context flags %#lx do not describe the full FP context\n",
+        teb->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context.ContextFlags );
     VirtualFree( address, 0, MEM_RELEASE );
 }
 
@@ -119,6 +134,7 @@ static DWORD CALLBACK ec_entry_x18_thread( void *arg )
     context = &teb->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
     context->Rsp = ((ULONG_PTR)&context - 0x800) & ~15;
     context->Rip = (ULONG_PTR)address;
+    prepare_begin_simulation_context( context );
     teb->ChpeV2CpuAreaInfo->InSimulation = 1;
     begin_simulation();
     return 0xe104;
@@ -283,6 +299,7 @@ static DWORD CALLBACK simulation_thread( void *arg )
     context = &NtCurrentTeb()->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
     context->Rsp = (ULONG_PTR)&context - 0x800;
     context->Rip = (ULONG_PTR)address;
+    prepare_begin_simulation_context( context );
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
     begin_simulation();
     return 0xe004;
@@ -437,6 +454,7 @@ static DWORD CALLBACK suspend_simulation_thread( void *arg )
     memcpy( (UINT64 *)args->rsp + 1, suspend_stack_guard + 1,
             sizeof(suspend_stack_guard) - sizeof(*suspend_stack_guard) );
     context->Rip = (ULONG_PTR)code;
+    prepare_begin_simulation_context( context );
     cpu->InSimulation = 1;
     args->begin_simulation();
     return 0xe104;
@@ -824,6 +842,7 @@ static DWORD CALLBACK mixed_image_thread( void *arg )
     context->Rax = (ULONG_PTR)args->exit_thread;
     context->Rsp = (ULONG_PTR)&context - 0x800;
     context->Rip = (ULONG_PTR)args->entry;
+    prepare_begin_simulation_context( context );
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
     args->begin_simulation();
     return 0xe202;
@@ -1092,6 +1111,7 @@ static DWORD CALLBACK concurrent_simulation_thread( void *arg )
     context = &NtCurrentTeb()->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
     context->Rsp = (ULONG_PTR)&context - 0x800;
     context->Rip = (ULONG_PTR)address;
+    prepare_begin_simulation_context( context );
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
     args->begin_simulation();
     return 0xe104;
@@ -1193,6 +1213,7 @@ static DWORD CALLBACK x64_memory_fault_thread( void *arg )
     context = &NtCurrentTeb()->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
     context->Rsp = (ULONG_PTR)&context - 0x800;
     context->Rip = (ULONG_PTR)args->entry;
+    prepare_begin_simulation_context( context );
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
     args->begin_simulation();
     return 0xe301;
@@ -1388,6 +1409,7 @@ static DWORD CALLBACK x64_single_step_thread( void *arg )
     context = &NtCurrentTeb()->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context;
     context->Rsp = (ULONG_PTR)&context - 0x800;
     context->Rip = (ULONG_PTR)args->entry;
+    prepare_begin_simulation_context( context );
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
     args->begin_simulation();
     return 0xe340;
@@ -1503,6 +1525,7 @@ static DWORD CALLBACK x64_nonlocal_continue_thread( void *arg )
     args->rsp = context->Rsp = ((ULONG_PTR)&context - 0x800) & ~15;
     x64_nonlocal_continue_expected_rsp = context->Rsp;
     context->Rip = (ULONG_PTR)args->entry;
+    prepare_begin_simulation_context( context );
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
     args->begin_simulation();
     return 0xe401;

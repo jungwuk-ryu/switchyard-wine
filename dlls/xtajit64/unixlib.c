@@ -2915,7 +2915,7 @@ static NTSTATUS flight_bind( void *args )
     const struct xtajit64_flight_bind_params *params = args;
     struct thread_binding *binding;
     const struct mapped_range *range;
-    uint64_t offset, unix_teb;
+    uint64_t offset, published_boundary_id, unix_teb;
     BOOL mode_safe;
     BOOL stale_context_generation = FALSE;
     uint32_t mode, reason, teb_reason = XTAJIT64_FLIGHT_REASON_NONE;
@@ -2979,9 +2979,14 @@ static NTSTATUS flight_bind( void *args )
             binding->flight_mach_thread_id = flight_current_mach_thread_id();
             binding->flight_pthread_identity = flight_current_pthread_identity();
         }
-        stale_context_generation = params->context_generation &&
-            binding->flight_last_context_generation &&
-            params->context_generation <= binding->flight_last_context_generation;
+        published_boundary_id = xtajit64_flight_current_boundary(
+            (const struct xtajit64_flight_recorder *)(uintptr_t)params->recorder );
+        stale_context_generation =
+            published_boundary_id != params->causal_boundary_id ||
+            params->context_generation != params->causal_boundary_id ||
+            params->transition_generation != params->causal_boundary_id ||
+            (params->context_generation && binding->flight_last_context_generation &&
+             params->context_generation <= binding->flight_last_context_generation);
         binding->flight_recorder =
             (struct xtajit64_flight_recorder *)(uintptr_t)params->recorder;
         binding->flight_causal_boundary_id = params->causal_boundary_id;
@@ -3049,6 +3054,61 @@ static NTSTATUS flight_bind( void *args )
         }
     }
     return STATUS_SUCCESS;
+}
+
+/* Refresh per-transition diagnostic identity from data already crossing the
+ * operational BeginSimulation boundary.  flight_bind owns the stable recorder,
+ * control-stack, and Unix-authenticated TEB association once per thread; doing
+ * another standalone Unix dispatch for every transition is unnecessary and,
+ * on the ARM64EC control-stack path, observably perturbs application execution.
+ * Must be called with provider.mutex held and an inactive binding. */
+static uint32_t refresh_flight_binding_for_begin_locked(
+    struct thread_binding *binding, const struct xtajit64_begin_params *params )
+{
+    struct xtajit64_flight_recorder *recorder;
+    const struct mapped_range *range;
+    uint64_t address, boundary_id, offset;
+    uint32_t reason = XTAJIT64_FLIGHT_REASON_NONE;
+
+    if (!binding || !params || !(recorder = binding->flight_recorder) ||
+        !xtajit64_flight_recorder_is_active( recorder ))
+        return reason;
+
+    /* The initial bind authenticated this runtime-owned identity mapping.  It
+     * may still have crossed a process mapping mutation before this entry, so
+     * revalidate it while the provider map is stable before the shared load. */
+    address = (uint64_t)(uintptr_t)recorder;
+    if ((address & 63) || address > XTAJIT64_X64_USER_ADDRESS_MAX ||
+        address > UINT64_MAX - sizeof(*recorder) ||
+        !(range = find_canonical_mapping( address, sizeof(*recorder),
+                                          UC_PROT_READ | UC_PROT_WRITE )) ||
+        range->domain != XTAJIT64_MEMORY_ADDRESS_IDENTITY ||
+        address < range->guest || (offset = address - range->guest) > range->size ||
+        range->host > UINT64_MAX - offset || range->host + offset != address)
+    {
+        clear_flight_binding( binding );
+        return XTAJIT64_FLIGHT_REASON_RECORDER_INVALID;
+    }
+
+    boundary_id = xtajit64_flight_current_boundary( recorder );
+    /* Equality is a valid one-transition retry after mapping reconciliation;
+     * only a regressing publication violates the monotonic context contract. */
+    if (!boundary_id || boundary_id == XTAJIT64_FLIGHT_UNKNOWN_U64 ||
+        boundary_id < binding->flight_last_context_generation)
+        reason = XTAJIT64_FLIGHT_REASON_CONTEXT_STALE_PUBLICATION;
+    else
+    {
+        binding->flight_causal_boundary_id = boundary_id;
+        binding->flight_context_generation = boundary_id;
+        binding->flight_transition_generation = boundary_id;
+        if (boundary_id > binding->flight_last_context_generation)
+            binding->flight_last_context_generation = boundary_id;
+    }
+    binding->flight_guest_rip = params->context.rip;
+    binding->flight_guest_rsp = params->context.rsp;
+    binding->flight_guest_stack_limit = params->stack_limit;
+    binding->flight_guest_stack_base = params->stack_base;
+    return reason;
 }
 
 static NTSTATUS memory_map_internal( void *args )
@@ -4062,6 +4122,7 @@ static NTSTATUS begin_simulation( void *args )
     uc_err err = UC_ERR_OK, read_err = UC_ERR_OK, context_err = UC_ERR_OK;
     NTSTATUS status = STATUS_SUCCESS;
     uint64_t next_rip;
+    uint32_t flight_reason;
     BOOL resume, reentering = FALSE;
 
     if (!params || params->reserved || !params->context.rip ||
@@ -4105,8 +4166,19 @@ static NTSTATUS begin_simulation( void *args )
         params->stop_reason = XTAJIT64_STOP_SUSPEND;
         params->unicorn_error = UC_ERR_OK;
     }
-    else if ((err = acquire_pool_engine_locked( binding, &engine )) != UC_ERR_OK)
-        status = err == UC_ERR_NOMEM ? STATUS_NO_MEMORY : STATUS_UNSUCCESSFUL;
+    else
+    {
+        if (binding->flight_recorder)
+        {
+            flight_reason = refresh_flight_binding_for_begin_locked( binding, params );
+            if (flight_reason)
+                flight_record_binding_event( binding,
+                                             XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION,
+                                             flight_reason );
+        }
+        if ((err = acquire_pool_engine_locked( binding, &engine )) != UC_ERR_OK)
+            status = err == UC_ERR_NOMEM ? STATUS_NO_MEMORY : STATUS_UNSUCCESSFUL;
+    }
     if (!status && !engine)
     {
         pthread_mutex_unlock( &provider.mutex );

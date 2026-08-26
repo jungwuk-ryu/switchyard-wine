@@ -45,6 +45,27 @@ def main() -> int:
     if run.find(gate) > run.find(begin):
         raise AssertionError("run_x64_simulation reaches the provider before the ntdll gate")
 
+    flight_bind = function_body(source, "flight_bind_provider")
+    authenticated_gate = ("if (!flight_has_active_recorder( state ) ||\n"
+                          "        state->flight_teb_authenticated) return;")
+    require(flight_bind, authenticated_gate, "flight_bind_provider")
+    require(flight_bind, "XTAJIT64_CALL( flight_bind", "flight_bind_provider")
+    authenticated_return = flight_bind.find(authenticated_gate)
+    bind_call = flight_bind.find("XTAJIT64_CALL( flight_bind")
+    if authenticated_return < 0 or authenticated_return > bind_call:
+        raise AssertionError("flight_bind_provider repeats the authenticated Unix bind")
+
+    flight_start = function_body(source, "flight_start_transition")
+    require(flight_start, "xtajit64_flight_publish_boundary(",
+            "flight_start_transition")
+    for field in ("flight_causal_boundary_id", "flight_context_generation",
+                  "flight_transition_generation"):
+        require(flight_start, f"state->{field} = boundary_id;",
+                "flight_start_transition")
+    if not (flight_start.find("xtajit64_flight_publish_boundary(") <
+            flight_start.find("state->flight_causal_boundary_id = boundary_id;")):
+        raise AssertionError("flight_start_transition exposes an unpublished boundary")
+
     begin = function_body(source, "BeginSimulation")
     require(begin, r'b \"#begin_simulation_on_control_stack\"', "BeginSimulation")
     for token in (
@@ -86,8 +107,31 @@ def main() -> int:
     require(discard, "--state->depth", "discard_unwound_transition_frames")
     if discard.find("flight_reconcile_transition_frame(") > discard.find("--state->depth"):
         raise AssertionError("unwound transition depth changes before its reconcile event")
-    require(function_body(source, "xtajit64_transition_from_native"),
-            "run_x64_simulation( state )", "xtajit64_transition_from_native", 3)
+    transition = function_body(source, "xtajit64_transition_from_native")
+    require(transition, "run_x64_simulation( state )",
+            "xtajit64_transition_from_native", 3)
+    require(transition, "ec_context->AMD64_Context.ContextFlags |=",
+            "xtajit64_transition_from_native")
+    require(transition, "CONTEXT_AMD64_FULL |",
+            "xtajit64_transition_from_native")
+    require(transition, "CONTEXT_AMD64_FLOATING_POINT;",
+            "xtajit64_transition_from_native")
+    if not (transition.find("capture_fp_state( &ec_context->AMD64_Context )") <
+            transition.find("ec_context->AMD64_Context.ContextFlags |=") <
+            transition.find("flight_start_transition( state )")):
+        raise AssertionError("native capture publishes context flags outside its owning boundary")
+    require(run, "mismatched_frame = candidate;", "run_x64_simulation")
+    require(run, "XTAJIT64_FLIGHT_REASON_CONTINUATION_PAIR",
+            "run_x64_simulation")
+    require(run, "continuation_rsp", "run_x64_simulation", 0)
+    candidate = run.find("continuation_target_seen = TRUE;")
+    mismatch = run.find("mismatched_frame = candidate;")
+    exact = run.find("if (params.context.rsp == candidate->guest_rsp)")
+    violation = run.find("XTAJIT64_FLIGHT_REASON_CONTINUATION_PAIR")
+    mismatch_abort = run.find('"x64 exit-thunk continuation stack mismatch"',
+                              violation)
+    if not candidate < mismatch < exact < violation < mismatch_abort:
+        raise AssertionError("continuation watchdog runs before the complete frame search")
     require(function_body(source, "xtajit64_capture_native"),
             r'b \"#xtajit64_transition_from_native\"', "xtajit64_capture_native")
     capture = function_body(source, "capture_transition")
