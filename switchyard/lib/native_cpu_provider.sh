@@ -868,7 +868,7 @@ def version_tuple(text):
     return tuple((pieces + [0, 0])[:3])
 
 
-def validate_macho(relative, install_name, provider_binary):
+def validate_macho(relative, install_name, provider_required_imports):
     record = binary_records[relative]
     path = record["snapshot"]
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -930,7 +930,7 @@ def validate_macho(relative, install_name, provider_binary):
             if index + 2 >= len(lines) or not lines[index + 2].strip().startswith("path "):
                 fail("provider Mach-O has malformed LC_RPATH metadata: " + relative)
             rpaths.append(lines[index + 2].split()[1])
-    if provider_binary:
+    if provider_required_imports is not None:
         allowed = {install_name, "@rpath/libunicorn.2.dylib", "@rpath/ntdll.so"}
         for dependency in dependencies:
             if dependency in allowed or dependency.startswith(("/usr/lib/", "/System/Library/")):
@@ -947,12 +947,7 @@ def validate_macho(relative, install_name, provider_binary):
             for line in command_output([nm_tool, "-ju", path], "nm -ju").splitlines()
             if line.strip()
         }
-        required = {
-            "_uc_emu_stop_at_instruction_boundary",
-            "_uc_enable_shared_memory_atomics",
-            "_uc_set_shared_memory_atomic_callback",
-        }
-        missing = sorted(required - undefined)
+        missing = sorted(provider_required_imports - undefined)
         if missing:
             fail(
                 "provider Unix library does not import the required Switchyard "
@@ -984,9 +979,17 @@ def validate_macho(relative, install_name, provider_binary):
     verify_private_snapshot(record, relative)
 
 
-validate_macho(xtajit_unix, "@rpath/xtajit.so", True)
-validate_macho(xtajit64_unix, "@rpath/xtajit64.so", True)
-validate_macho(unicorn_library, "@rpath/libunicorn.2.dylib", False)
+common_provider_imports = {
+    "_uc_emu_stop_at_instruction_boundary",
+    "_uc_enable_shared_memory_atomics",
+}
+validate_macho(xtajit_unix, "@rpath/xtajit.so", common_provider_imports)
+validate_macho(
+    xtajit64_unix,
+    "@rpath/xtajit64.so",
+    common_provider_imports | {"_uc_set_shared_memory_atomic_callback"},
+)
+validate_macho(unicorn_library, "@rpath/libunicorn.2.dylib", None)
 
 allowed_provider_paths = {
     xtajit_unix.casefold(),

@@ -228,12 +228,16 @@ struct uc_struct;
 typedef int (*switchyard_unicorn_extension_t)(struct uc_struct *);
 extern int uc_emu_stop_at_instruction_boundary(struct uc_struct *);
 extern int uc_enable_shared_memory_atomics(struct uc_struct *);
+#ifdef XTAJIT64_PROVIDER
 extern int uc_set_shared_memory_atomic_callback(struct uc_struct *);
+#endif
 __attribute__((used, visibility("default")))
 switchyard_unicorn_extension_t const switchyard_unicorn_fixture_imports[] = {
     uc_emu_stop_at_instruction_boundary,
     uc_enable_shared_memory_atomics,
+#ifdef XTAJIT64_PROVIDER
     uc_set_shared_memory_atomic_callback,
+#endif
 };
 __attribute__((used, visibility("default"))) const char
     switchyard_xtajit64_fixture_abi_identity[] =
@@ -244,8 +248,11 @@ __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 }
 EOF
 for provider_name in xtajit xtajit64; do
+  provider_define=
+  [ "$provider_name" != xtajit64 ] || provider_define=-DXTAJIT64_PROVIDER
   /usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -O2 -Wall -Wextra -Werror \
     -mmacosx-version-min=26.5 \
+    ${provider_define:+"$provider_define"} \
     -Wl,-install_name,"@rpath/$provider_name.so" \
     -Wl,-rpath,@loader_path/ \
     -Wl,-rpath,@loader_path/../../switchyard-unicorn/lib \

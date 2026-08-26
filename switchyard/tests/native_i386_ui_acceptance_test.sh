@@ -209,12 +209,10 @@ struct uc_struct;
 typedef int (*switchyard_unicorn_extension_t)(struct uc_struct *);
 extern int uc_emu_stop_at_instruction_boundary(struct uc_struct *);
 extern int uc_enable_shared_memory_atomics(struct uc_struct *);
-extern int uc_set_shared_memory_atomic_callback(struct uc_struct *);
 __attribute__((used, visibility("default")))
 switchyard_unicorn_extension_t const switchyard_unicorn_fixture_imports[] = {
     uc_emu_stop_at_instruction_boundary,
     uc_enable_shared_memory_atomics,
-    uc_set_shared_memory_atomic_callback,
 };
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
