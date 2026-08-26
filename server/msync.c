@@ -310,7 +310,7 @@ typedef struct
 } mach_map_message_reply_t;
 
 static void **shm_addrs;
-static int shm_addrs_size;  /* length of the allocated shm_addrs array */
+static size_t shm_addrs_size;  /* length of the allocated shm_addrs array */
 
 static void send_shm_to_client( mach_map_message_t *message )
 {
@@ -326,7 +326,7 @@ static void send_shm_to_client( mach_map_message_t *message )
         offset = (memory_object_offset_t)shm_tid_map;
         entry_size = shm_tid_size;
     }
-    else if (message->entry < shm_addrs_size)
+    else if (message->entry >= 0 && (size_t)message->entry < shm_addrs_size)
     {
         offset = (memory_object_offset_t)shm_addrs[message->entry];
         entry_size = pagesize;
@@ -636,7 +636,8 @@ void msync_init_shm(void)
 
     pagesize = (long)vm_kernel_page_size;
 
-    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
+    if (!(shm_addrs = calloc( 128, sizeof(shm_addrs[0]) )))
+        fatal_error( "could not allocate msync shared memory table\n" );
     shm_addrs_size = 128;
 
     kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&shm_tid_map, shm_tid_size, 0, VM_FLAGS_ANYWHERE,
@@ -720,14 +721,22 @@ void msync_destroy( struct msync *msync )
 
 static void *get_shm( unsigned int idx )
 {
-    int entry  = (idx * 16) / pagesize;
-    int offset = (idx * 16) % pagesize;
+    size_t byte_offset = (size_t)idx * 16;
+    size_t entry = byte_offset / pagesize;
+    size_t offset = byte_offset % pagesize;
 
     if (entry >= shm_addrs_size)
     {
-        int new_size = max(shm_addrs_size * 2, entry + 1);
+        size_t min_size, new_size;
         void **new_addrs;
 
+        if (entry == SIZE_MAX || entry + 1 > SIZE_MAX / sizeof(*shm_addrs))
+            fatal_error( "msync shared memory table is too large\n" );
+        min_size = entry + 1;
+        new_size = shm_addrs_size <= SIZE_MAX / 2 ? shm_addrs_size * 2 : SIZE_MAX;
+        if (new_size < min_size) new_size = min_size;
+        if (new_size > SIZE_MAX / sizeof(*shm_addrs))
+            fatal_error( "msync shared memory table is too large\n" );
         if (!(new_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
             fatal_error( "could not expand msync shared memory table\n" );
         shm_addrs = new_addrs;
@@ -753,7 +762,7 @@ static void *get_shm( unsigned int idx )
         memset( (void *)address, 0, pagesize );
 
         if (debug_level)
-            fprintf( stderr, "msync: Mapping page %d at %llu.\n", entry, address );
+            fprintf( stderr, "msync: Mapping page %zu at %llu.\n", entry, address );
 
         if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, (void *)address ))
             mach_vm_deallocate( mach_task_self(), address, pagesize ); /* someone beat us to it */
