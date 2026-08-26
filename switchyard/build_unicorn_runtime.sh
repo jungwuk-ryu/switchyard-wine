@@ -274,13 +274,20 @@ validate_output() {
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_CODE_COHERENCE 1' \
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMIC_TRACE 1' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   /usr/bin/grep -Fx 'uc_err uc_enable_shared_memory_atomics(uc_engine *uc);' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_set_shared_memory_atomic_callback(' \
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   [ "$(nm -gU "$dylib" | /usr/bin/awk \
       '$NF == "_uc_emu_stop_at_instruction_boundary" { count++ } END { print count + 0 }')" -eq 1 ] ||
     return 1
   [ "$(nm -gU "$dylib" | /usr/bin/awk \
       '$NF == "_uc_enable_shared_memory_atomics" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_set_shared_memory_atomic_callback" { count++ } END { print count + 0 }')" -eq 1 ] ||
     return 1
   /usr/bin/grep -Fx 'libdir=${pcfiledir}/..' "$root/lib/pkgconfig/unicorn.pc" >/dev/null || return 1
   /usr/bin/grep -Fx 'includedir=${pcfiledir}/../../include' \
@@ -509,9 +516,15 @@ GIT_CEILING_DIRECTORIES="$patch_apply_ceiling" \
 /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_CODE_COHERENCE 1' \
   "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
   fail "source patch did not add the shared-code coherence contract"
+/usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMIC_TRACE 1' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the serial-atomic trace contract"
 /usr/bin/grep -Fx 'uc_err uc_enable_shared_memory_atomics(uc_engine *uc);' \
   "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
   fail "source patch did not add the shared-memory atomic API"
+/usr/bin/grep -Fx 'uc_err uc_set_shared_memory_atomic_callback(' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the serial-atomic trace API"
 /usr/bin/grep -F '__atomic_load_n(&x, __ATOMIC_RELAXED)' \
   "$PATCHED_SOURCE_DIR/qemu/configure" >/dev/null ||
   fail "source patch did not correct the 64-bit atomic capability probe"

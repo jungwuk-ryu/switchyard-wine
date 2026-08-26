@@ -47,19 +47,55 @@ def main() -> int:
 
     begin = function_body(source, "BeginSimulation")
     require(begin, r'b \"#begin_simulation_on_control_stack\"', "BeginSimulation")
+    for token in (
+        "ldr x15, [x0, #0x848]",
+        "cmp x16, x17",
+        "movz x9, #0x5fc0",
+        "cmp x16, x15",
+        "str x18, [x0, #0x870]",
+        "mov sp, x16",
+    ):
+        require(begin, token, "BeginSimulation")
+    require(begin, "cmp x15, x9", "BeginSimulation", 2)
+    recorder_load = begin.find("ldr x15, [x0, #0x848]")
+    x18_capture = begin.find("str x18, [x0, #0x870]")
+    stack_switch = begin.find("mov sp, x16")
+    c_entry = begin.find(r'b \"#begin_simulation_on_control_stack\"')
+    if not recorder_load < x18_capture < stack_switch < c_entry:
+        raise AssertionError("BeginSimulation validates layout and captures x18 in the wrong order")
+    if re.search(r"ldr\s+x\d+,\s*\[x15", begin[:stack_switch]):
+        raise AssertionError("BeginSimulation dereferences the recorder header before switching stacks")
+
     control = function_body(source, "begin_simulation_on_control_stack")
     require(control, "run_x64_simulation( state )",
             "begin_simulation_on_control_stack")
     for token in ("state != get_thread_state()",
                   "state->magic != XTAJIT64_THREAD_STATE_MAGIC",
+                  "flight_validate_recorder_layout( state )",
                   "discard_unwound_transition_frames"):
         require(control, token, "begin_simulation_on_control_stack")
+    if not (control.find("flight_validate_recorder_layout( state )") <
+            control.find("flight_start_transition( state )") <
+            control.find("discard_unwound_transition_frames") <
+            control.find("run_x64_simulation( state )")):
+        raise AssertionError("control-stack C entry uses the recorder before layout validation")
+
+    discard = function_body(source, "discard_unwound_transition_frames")
+    require(discard, "flight_reconcile_transition_frame(",
+            "discard_unwound_transition_frames")
+    require(discard, "--state->depth", "discard_unwound_transition_frames")
+    if discard.find("flight_reconcile_transition_frame(") > discard.find("--state->depth"):
+        raise AssertionError("unwound transition depth changes before its reconcile event")
     require(function_body(source, "xtajit64_transition_from_native"),
             "run_x64_simulation( state )", "xtajit64_transition_from_native", 3)
     require(function_body(source, "xtajit64_capture_native"),
             r'b \"#xtajit64_transition_from_native\"', "xtajit64_capture_native")
-    require(function_body(source, "capture_transition"),
-            r'b \"#xtajit64_capture_native\"', "capture_transition")
+    capture = function_body(source, "capture_transition")
+    require(capture, r'b \"#xtajit64_capture_native\"', "capture_transition")
+    for token in ("ldr x16, [x17, #0x848]", "str x18, [x17, #0x870]"):
+        require(capture, token, "capture_transition")
+    if capture.find("ldr x16, [x17, #0x848]") > capture.find("str x18, [x17, #0x870]"):
+        raise AssertionError("capture_transition stores x18 before checking recorder enablement")
     for thunk in ("DispatchJump", "RetToEntryThunk", "ExitToX64"):
         require(function_body(source, thunk), r'b \"#capture_transition\"', thunk)
 

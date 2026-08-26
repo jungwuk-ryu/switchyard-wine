@@ -37,11 +37,24 @@ WINE_DEFAULT_DEBUG_CHANNEL(xtajit);
 
 static ULONG_PTR rtl_exit_user_thread;
 static ULONG host_page_size;
+static BOOL flight_recorder_enabled;
+static LARGE_INTEGER flight_qpc_frequency;
 
 #define XTAJIT64_CONTROL_STACK_SIZE 0x40000
 #define XTAJIT64_MAX_TRANSITION_DEPTH 64
 #define XTAJIT64_MAX_RESYNC_ATTEMPTS 8
 #define XTAJIT64_THREAD_STATE_MAGIC 0x363454494a415458ull /* "XTAJIT64" */
+
+/* ARM64EC's clang target advertises __arm64ec__ rather than the native
+ * aarch64 spelling.  Keep this capability centralized: an UNKNOWN x18 from
+ * an accidentally excluded PE build would make the watchdog observationally
+ * useless. */
+#if defined(__aarch64__) || defined(__arm64__) || defined(__arm64ec__) || defined(_M_ARM64EC)
+# define XTAJIT64_HAVE_LIVE_ARM64_REGISTERS 1
+#endif
+#if (defined(__arm64ec__) || defined(_M_ARM64EC)) && !defined(XTAJIT64_HAVE_LIVE_ARM64_REGISTERS)
+# error ARM64EC requires live x18/SP diagnostic capture
+#endif
 
 enum xtajit64_native_transition
 {
@@ -52,8 +65,8 @@ enum xtajit64_native_transition
 
 enum xtajit64_transition_frame_kind
 {
-    XTAJIT64_FRAME_ENTRY = 1,
-    XTAJIT64_FRAME_EXIT,
+    XTAJIT64_FRAME_ENTRY = XTAJIT64_FLIGHT_FRAME_ENTRY,
+    XTAJIT64_FRAME_EXIT = XTAJIT64_FLIGHT_FRAME_EXIT,
 };
 
 struct xtajit64_transition_frame
@@ -78,8 +91,23 @@ struct xtajit64_thread_state
     UINT32 depth;
     struct xtajit64_transition_frame frames[XTAJIT64_MAX_TRANSITION_DEPTH];
     ULONG suspend_doorbell;
-    ULONG reserved;
-    UINT64 teb;
+    ULONG flight_alignment;
+    struct xtajit64_flight_recorder *flight_recorder;
+    UINT64 flight_causal_boundary_id;
+    UINT64 flight_context_generation;
+    UINT64 flight_transition_generation;
+    volatile UINT32 flight_dump_state;
+    UINT32 flight_reserved;
+    /* Captured in the naked ARM64EC wrapper before this code switches to the
+     * private control stack.  It is meaningful only on TRANSITION_CAPTURE. */
+    UINT64 capture_x18;
+    /* A PE-side x18 claim is captured exactly once while ThreadInit has its
+     * normal ARM64EC contract.  unix_flight_bind authenticates it against the
+     * independently-backed Unix TEB; do not refresh it through NtCurrentTeb,
+     * which is itself x18 on this side of the ABI. */
+    UINT64 flight_expected_teb;
+    BOOL flight_teb_authenticated;
+    UINT32 flight_teb_reserved;
 };
 
 typedef NTSTATUS (WINAPI *arm64x_get_information)( ULONG, void *, void * );
@@ -102,8 +130,20 @@ C_ASSERT( offsetof(struct xtajit64_thread_state, capture_kind) == 0x38 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, depth) == 0x3c );
 C_ASSERT( offsetof(struct xtajit64_thread_state, frames) == 0x40 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, suspend_doorbell) == 0x840 );
-C_ASSERT( offsetof(struct xtajit64_thread_state, teb) == 0x848 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, flight_alignment) == 0x844 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, flight_recorder) == 0x848 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, flight_causal_boundary_id) == 0x850 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, flight_context_generation) == 0x858 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, flight_transition_generation) == 0x860 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, flight_dump_state) == 0x868 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, capture_x18) == 0x870 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, flight_expected_teb) == 0x878 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, flight_teb_authenticated) == 0x880 );
+C_ASSERT( sizeof(struct xtajit64_thread_state) == 0x888 );
+C_ASSERT( ((sizeof(struct xtajit64_thread_state) + 15) & ~(SIZE_T)15) == 0x890 );
 C_ASSERT( sizeof(struct xtajit64_transition_frame) == 0x20 );
+C_ASSERT( XTAJIT64_CONTROL_STACK_SIZE >= sizeof(struct xtajit64_thread_state) +
+          sizeof(struct xtajit64_flight_recorder) + 0x10000 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, X8) == 0x78 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, Sp) == 0x98 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, Pc) == 0xf8 );
@@ -122,12 +162,62 @@ static NTSTATUS init_unixlib(void)
 static NTSTATUS synchronize_transition_state_mapping( struct xtajit64_thread_state *state,
                                                        BOOL *provider_touched );
 static NTSTATUS unregister_transition_state_mapping( struct xtajit64_thread_state *state );
+static UINT64 flight_read_live_x18(void);
+
+/* State itself is supplied by the current thread's owned allocation.  Before
+ * any opt-in producer dereferences its recorder pointer, additionally prove
+ * that the pointer is the exact high-end object allocated below.  This is
+ * intentionally separate from the recorder magic/schema check: a damaged
+ * pointer must never be dereferenced merely to discover that it is damaged. */
+static BOOL flight_validate_recorder_layout( const struct xtajit64_thread_state *state )
+{
+    ULONG_PTR state_address, allocation_end, control_limit, recorder_address;
+
+    if (!state) return FALSE;
+    if (state->magic != XTAJIT64_THREAD_STATE_MAGIC ||
+        state->allocation_size != XTAJIT64_CONTROL_STACK_SIZE)
+        return FALSE;
+    state_address = (ULONG_PTR)state;
+    /* Prove the whole fixed allocation first.  This also proves the later
+     * +15 alignment rounding cannot overflow. */
+    if (state_address > ~(ULONG_PTR)0 - state->allocation_size ||
+        sizeof(*state) > state->allocation_size - 15)
+        return FALSE;
+    allocation_end = state_address + state->allocation_size;
+    if (!state->flight_recorder)
+        return state->control_stack_top == allocation_end &&
+               !(state->control_stack_top & 15);
+    if ((allocation_end & 63) ||
+        sizeof(*state->flight_recorder) > state->allocation_size)
+        return FALSE;
+    recorder_address = allocation_end - sizeof(*state->flight_recorder);
+    if ((ULONG_PTR)state->flight_recorder != recorder_address ||
+        state->control_stack_top != recorder_address || (recorder_address & 63))
+        return FALSE;
+    control_limit = (state_address + sizeof(*state) + 15) & ~(ULONG_PTR)15;
+    if (control_limit >= (ULONG_PTR)state->flight_recorder) return FALSE;
+    return xtajit64_flight_validate_layout( state_address, state->allocation_size,
+                                            state->control_stack_top,
+                                            state->flight_recorder );
+}
+
+static BOOL flight_has_valid_recorder( const struct xtajit64_thread_state *state )
+{
+    return state && state->flight_recorder && flight_validate_recorder_layout( state );
+}
+
+static BOOL flight_has_active_recorder( const struct xtajit64_thread_state *state )
+{
+    return flight_has_valid_recorder( state ) &&
+           xtajit64_flight_recorder_is_active( state->flight_recorder );
+}
 
 static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
 {
     struct xtajit64_thread_state *state;
     SIZE_T size = XTAJIT64_CONTROL_STACK_SIZE;
     void *allocation = NULL;
+    ULONG_PTR allocation_end, recorder, stack_limit;
     NTSTATUS status;
 
     status = NtAllocateVirtualMemory( GetCurrentProcess(), &allocation, 0, &size,
@@ -147,7 +237,39 @@ static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
     memset( state, 0, sizeof(*state) );
     state->magic = XTAJIT64_THREAD_STATE_MAGIC;
     state->allocation_size = size;
-    state->control_stack_top = ((ULONG_PTR)allocation + size) & ~(ULONG_PTR)15;
+    allocation_end = (ULONG_PTR)allocation + size;
+    if (allocation_end & 15)
+    {
+        void *free_base = allocation;
+        SIZE_T free_size = 0;
+
+        NtFreeVirtualMemory( GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
+        return STATUS_NO_MEMORY;
+    }
+    state->control_stack_top = allocation_end;
+    if (flight_recorder_enabled)
+    {
+        stack_limit = ((ULONG_PTR)state + sizeof(*state) + 15) & ~(ULONG_PTR)15;
+        if ((allocation_end & 63) || sizeof(*state->flight_recorder) > size)
+            recorder = 0;
+        else recorder = allocation_end - sizeof(*state->flight_recorder);
+        if (!recorder || (recorder & 63) || recorder < stack_limit ||
+            recorder - stack_limit < 0x10000)
+        {
+            void *free_base = allocation;
+            SIZE_T free_size = 0;
+
+            NtFreeVirtualMemory( GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
+            return STATUS_NO_MEMORY;
+        }
+        /* The recorder occupies the high end of the existing transition-state
+         * allocation.  Lowering the native control-stack top makes the two
+         * non-overlapping even as the state structure grows. */
+        state->control_stack_top = recorder;
+        state->flight_recorder = (struct xtajit64_flight_recorder *)recorder;
+        xtajit64_flight_recorder_init( state->flight_recorder );
+        state->flight_teb_authenticated = FALSE;
+    }
     *ret = state;
     return STATUS_SUCCESS;
 }
@@ -792,6 +914,684 @@ static BOOL get_x64_stack_bounds( UINT64 rsp, UINT64 *limit, UINT64 *base )
     return FALSE;
 }
 
+/* The opt-in is sampled once during ProcessInit.  Individual transitions only
+ * test state->flight_recorder, so disabled execution neither touches the
+ * recorder nor makes a Unixlib call, performs an OS query, or takes a lock. */
+static void init_flight_recorder_enablement(void)
+{
+    static const WCHAR nameW[] = L"WINE_XTAJIT64_DIAGNOSTICS";
+    UNICODE_STRING name = { sizeof(nameW) - sizeof(*nameW), sizeof(nameW), (WCHAR *)nameW };
+    WCHAR valueW[2] = {0};
+    UNICODE_STRING value = { 0, sizeof(valueW), valueW };
+
+    flight_recorder_enabled = RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ==
+                              STATUS_SUCCESS && value.Length == sizeof(WCHAR) &&
+                              valueW[0] == '1';
+    flight_qpc_frequency.QuadPart = 0;
+    if (flight_recorder_enabled)
+    {
+        LARGE_INTEGER counter;
+
+        if (NtQueryPerformanceCounter( &counter, &flight_qpc_frequency ))
+            flight_qpc_frequency.QuadPart = 0;
+    }
+}
+
+static UINT64 flight_monotonic_timestamp_ns(void)
+{
+    LARGE_INTEGER counter;
+    UINT64 frequency, ticks, seconds_ns, remainder_ns;
+
+    if (flight_qpc_frequency.QuadPart <= 0 ||
+        NtQueryPerformanceCounter( &counter, NULL ) || counter.QuadPart < 0)
+        return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    frequency = flight_qpc_frequency.QuadPart;
+    ticks = counter.QuadPart;
+    /* QPC frequency is provider ABI input, not a host constant.  Check both
+     * products before converting to nanoseconds. */
+    if (ticks / frequency > ~(UINT64)0 / UINT64_C(1000000000) ||
+        ticks % frequency > ~(UINT64)0 / UINT64_C(1000000000))
+        return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    seconds_ns = ticks / frequency * UINT64_C(1000000000);
+    remainder_ns = ticks % frequency * UINT64_C(1000000000) / frequency;
+    /* UINT64_MAX is the explicit unavailable sentinel, so reject equality
+     * as well as arithmetic overflow rather than returning an ambiguous time. */
+    if (seconds_ns >= ~(UINT64)0 - remainder_ns)
+        return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    return seconds_ns + remainder_ns;
+}
+
+static UINT64 flight_read_live_sp(void)
+{
+#ifdef XTAJIT64_HAVE_LIVE_ARM64_REGISTERS
+    UINT64 value;
+
+    __asm__ volatile( "mov %0, sp" : "=r" (value) : : "memory" );
+    return value;
+#else
+    return XTAJIT64_FLIGHT_UNKNOWN_U64;
+#endif
+}
+
+static UINT64 flight_read_live_x18(void)
+{
+#ifdef XTAJIT64_HAVE_LIVE_ARM64_REGISTERS
+    UINT64 value;
+
+    __asm__ volatile( "mov %0, x18" : "=r" (value) : : "memory" );
+    return value;
+#else
+    return XTAJIT64_FLIGHT_UNKNOWN_U64;
+#endif
+}
+
+static UINT64 flight_control_stack_limit( const struct xtajit64_thread_state *state )
+{
+    ULONG_PTR limit;
+
+    /* Account for alignment rounding too: this helper is also used while
+     * validating a damaged diagnostic state, before trusting its top field. */
+    if (!state || (ULONG_PTR)state > ~(ULONG_PTR)0 - sizeof(*state) - 15)
+        return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    limit = ((ULONG_PTR)state + sizeof(*state) + 15) & ~(ULONG_PTR)15;
+    if (state->control_stack_top <= limit) return XTAJIT64_FLIGHT_UNKNOWN_U64;
+    return limit;
+}
+
+static BOOL flight_cpu_event_requires_control_stack( UINT32 type )
+{
+    switch (type)
+    {
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_CAPTURE:
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_BEGIN:
+    case XTAJIT64_FLIGHT_EVENT_CONTEXT_IMPORT:
+    case XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN:
+    case XTAJIT64_FLIGHT_EVENT_PROVIDER_RESUME:
+    case XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP:
+    case XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT:
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_CONTINUE:
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_PUSH:
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_POP:
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_UNWIND:
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_RECONCILE:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static UINT32 flight_validate_cpu_stack( const struct xtajit64_flight_event *event )
+{
+    if (!(event->flags & XTAJIT64_FLIGHT_FLAG_EXPECT_PRIVATE_CONTROL_STACK))
+        return XTAJIT64_FLIGHT_REASON_NONE;
+    return xtajit64_flight_validate_private_control_stack(
+        event->native_sp, event->control_stack_limit, event->control_stack_top,
+        event->guest_stack_limit, event->guest_stack_base );
+}
+
+static UINT32 flight_validate_cpu_stack_values( const struct xtajit64_thread_state *state,
+                                                UINT64 native_sp, UINT64 stack_limit,
+                                                UINT64 stack_base, UINT32 type )
+{
+    if (!state || !flight_cpu_event_requires_control_stack( type ))
+        return XTAJIT64_FLIGHT_REASON_NONE;
+    return xtajit64_flight_validate_private_control_stack(
+        native_sp, flight_control_stack_limit( state ), state->control_stack_top,
+        stack_limit, stack_base );
+}
+
+static struct xtajit64_flight_event *flight_acquire_cpu_event(
+    struct xtajit64_thread_state *state, struct xtajit64_flight_recorder **recorder,
+    struct xtajit64_flight_scratch **scratch )
+{
+    if (recorder) *recorder = NULL;
+    if (scratch) *scratch = NULL;
+    if (!recorder || !flight_has_valid_recorder( state )) return NULL;
+    *recorder = state->flight_recorder;
+    if (!xtajit64_flight_recorder_is_active( *recorder ))
+    {
+        *recorder = NULL;
+        return NULL;
+    }
+    return xtajit64_flight_acquire_scratch( *recorder, scratch );
+}
+
+static void flight_init_cpu_event( struct xtajit64_flight_event *event,
+                                   const struct xtajit64_thread_state *state,
+                                   const ARM64EC_NT_CONTEXT *ec_context,
+                                   const AMD64_CONTEXT *context,
+                                   UINT64 stack_limit, UINT64 stack_base,
+                                   UINT32 type )
+{
+    const TEB *teb = NULL;
+    UINT64 timestamp;
+
+    xtajit64_flight_event_init( event, type, XTAJIT64_FLIGHT_SOURCE_ARM64EC_PE );
+    event->causal_boundary_id = state->flight_causal_boundary_id;
+    event->context_generation = state->flight_context_generation;
+    event->transition_generation = state->flight_transition_generation;
+    event->guest_stack_limit = stack_limit;
+    event->guest_stack_base = stack_base;
+    event->control_stack_limit = flight_control_stack_limit( state );
+    event->control_stack_top = state->control_stack_top;
+    if (state->flight_teb_authenticated && state->flight_expected_teb &&
+        state->flight_expected_teb != XTAJIT64_FLIGHT_UNKNOWN_U64)
+    {
+        event->expected_teb = state->flight_expected_teb;
+        event->flags |= XTAJIT64_FLIGHT_FLAG_EXPECTED_TEB_AUTHENTICATED;
+    }
+    /* Do not dereference a fresh ARM64EC NtCurrentTeb(): it aliases the live
+     * x18 value being checked.  The stable initial claim becomes safe identity
+     * data only after Unix flight_bind authenticated it independently. */
+    if (state->flight_teb_authenticated && state->flight_expected_teb &&
+        state->flight_expected_teb != XTAJIT64_FLIGHT_UNKNOWN_U64)
+    {
+        teb = (const TEB *)(ULONG_PTR)state->flight_expected_teb;
+        event->pid = (ULONG_PTR)teb->ClientId.UniqueProcess;
+        event->wine_tid = (ULONG_PTR)teb->ClientId.UniqueThread;
+    }
+    event->native_sp = flight_read_live_sp();
+    event->native_frame = (UINT64)(ULONG_PTR)__builtin_frame_address( 0 );
+    event->native_pc = (UINT64)(ULONG_PTR)__builtin_return_address( 0 );
+    event->x18_value = flight_read_live_x18();
+    /* There is no supported PE-side mode query at this CPU boundary.  The
+     * numeric value is useful evidence, but it never implies an ABI mode. */
+    event->custom_x18_mode = XTAJIT64_FLIGHT_X18_MODE_UNKNOWN;
+    event->x18_expectation = XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC;
+    if (flight_cpu_event_requires_control_stack( type ))
+        event->flags |= XTAJIT64_FLIGHT_FLAG_EXPECT_PRIVATE_CONTROL_STACK;
+    if (ec_context) event->arm64ec_pc = ec_context->Pc;
+    if (context)
+    {
+        event->guest_rip = context->Rip;
+        event->guest_rsp = context->Rsp;
+        event->context_flags = context->ContextFlags;
+        event->mxcsr = context->MxCsr;
+        event->fltsave_mxcsr = context->FltSave.MxCsr;
+        event->flags &= ~XTAJIT64_FLIGHT_FLAG_CONTEXT_FLAGS_UNKNOWN;
+    }
+    timestamp = flight_monotonic_timestamp_ns();
+    if (timestamp != XTAJIT64_FLIGHT_UNKNOWN_U64)
+    {
+        event->monotonic_timestamp_ns = timestamp;
+        event->flags &= ~XTAJIT64_FLIGHT_FLAG_TIME_UNAVAILABLE;
+    }
+}
+
+static BOOL flight_record_cpu_event( struct xtajit64_thread_state *state,
+                                     const ARM64EC_NT_CONTEXT *ec_context,
+                                     const AMD64_CONTEXT *context,
+                                     UINT64 stack_limit, UINT64 stack_base,
+                                     UINT64 detail0, UINT64 detail1,
+                                     UINT32 type, UINT32 reason )
+{
+    struct xtajit64_flight_recorder *recorder;
+    struct xtajit64_flight_scratch *scratch;
+    struct xtajit64_flight_event *event;
+    BOOL recorded;
+
+    if (!(event = flight_acquire_cpu_event( state, &recorder, &scratch )))
+    {
+        if (!recorder || !xtajit64_flight_recorder_is_active( recorder )) return FALSE;
+        if (!reason && state && state->flight_teb_authenticated &&
+            type == XTAJIT64_FLIGHT_EVENT_TRANSITION_CAPTURE)
+            reason = xtajit64_flight_validate_x18(
+                XTAJIT64_FLIGHT_X18_MODE_UNKNOWN,
+                XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+                state->capture_x18, state->flight_expected_teb );
+        if (!reason && state)
+            reason = flight_validate_cpu_stack_values( state, flight_read_live_sp(),
+                                                        stack_limit, stack_base, type );
+        if (reason && xtajit64_flight_recorder_is_active( recorder ))
+            xtajit64_flight_freeze( recorder, reason );
+        return FALSE;
+    }
+    flight_init_cpu_event( event, state, ec_context, context, stack_limit, stack_base, type );
+    if (!reason && state->flight_teb_authenticated &&
+        type == XTAJIT64_FLIGHT_EVENT_TRANSITION_CAPTURE)
+        reason = xtajit64_flight_validate_x18(
+            XTAJIT64_FLIGHT_X18_MODE_UNKNOWN,
+            XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+            state->capture_x18, state->flight_expected_teb );
+    if (!reason) reason = flight_validate_cpu_stack( event );
+    event->reason = reason;
+    event->detail0 = detail0;
+    event->detail1 = detail1;
+    if (type == XTAJIT64_FLIGHT_EVENT_TRANSITION_CAPTURE)
+    {
+        event->saved_x18_value = state->capture_x18;
+        event->flags &= ~XTAJIT64_FLIGHT_FLAG_SAVED_X18_UNKNOWN;
+        event->flags |= XTAJIT64_FLIGHT_FLAG_PE_X18_CLAIM_PRESENT;
+    }
+    if (reason) recorded = xtajit64_flight_record_and_freeze( recorder, event, reason );
+    else recorded = !!xtajit64_flight_record( recorder, event );
+    xtajit64_flight_release_scratch( scratch );
+    return recorded;
+}
+
+/* Frame records are a distinct diagnostic contract.  Do not overload a
+ * provider stop reason or an implementation-reserved field: non-local
+ * re-entry needs the exact frame kind and before/after depth to be readable
+ * across a later provider resume. */
+static void flight_record_transition_frame_event(
+    struct xtajit64_thread_state *state, const ARM64EC_NT_CONTEXT *ec_context,
+    const AMD64_CONTEXT *context, UINT64 stack_limit, UINT64 stack_base,
+    UINT32 type, UINT32 reason, UINT32 kind, UINT32 depth_before, UINT32 depth_after,
+    UINT64 guest_rsp, UINT64 native_sp, UINT64 native_pc )
+{
+    struct xtajit64_flight_recorder *recorder;
+    struct xtajit64_flight_scratch *scratch;
+    struct xtajit64_flight_event *event;
+
+    if (!(event = flight_acquire_cpu_event( state, &recorder, &scratch )))
+    {
+        if (!recorder || !xtajit64_flight_recorder_is_active( recorder )) return;
+        if (!reason && state)
+            reason = flight_validate_cpu_stack_values( state, flight_read_live_sp(),
+                                                        stack_limit, stack_base, type );
+        if (reason && xtajit64_flight_recorder_is_active( recorder ))
+            xtajit64_flight_freeze( recorder, reason );
+        return;
+    }
+    flight_init_cpu_event( event, state, ec_context, context, stack_limit, stack_base, type );
+    if (!reason) reason = flight_validate_cpu_stack( event );
+    event->reason = reason;
+    event->transition_frame_kind = kind;
+    event->transition_depth_before = depth_before;
+    event->transition_depth_after = depth_after;
+    event->guest_rsp = guest_rsp;
+    event->detail0 = native_sp;
+    event->detail1 = native_pc;
+    if (reason) xtajit64_flight_record_and_freeze( recorder, event, reason );
+    else xtajit64_flight_record( recorder, event );
+    xtajit64_flight_release_scratch( scratch );
+}
+
+static void flight_record_transition_frame_push(
+    struct xtajit64_thread_state *state, const ARM64EC_NT_CONTEXT *ec_context,
+    const AMD64_CONTEXT *context, UINT64 stack_limit, UINT64 stack_base,
+    const struct xtajit64_transition_frame *frame, UINT32 depth_before, UINT32 depth_after,
+    UINT64 native_sp, UINT64 native_pc )
+{
+    if (!frame) return;
+    flight_record_transition_frame_event( state, ec_context, context, stack_limit, stack_base,
+                                          XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_PUSH,
+                                          XTAJIT64_FLIGHT_REASON_NONE, frame->kind,
+                                          depth_before, depth_after, frame->guest_rsp,
+                                          native_sp, native_pc );
+}
+
+/* This is intentionally reusable by the non-local restoration work that is
+ * currently outside the clean base.  Its caller owns the actual frame-array
+ * mutation and supplies the old/new depth; the recorder only observes it.
+ * Rebase hook: call once for every discarded or reconciled frame in the
+ * BeginSimulation/NtContinue frame-discard loop. */
+static void flight_reconcile_transition_frame(
+    struct xtajit64_thread_state *state, const ARM64EC_NT_CONTEXT *ec_context,
+    const AMD64_CONTEXT *context, UINT64 stack_limit, UINT64 stack_base,
+    const struct xtajit64_transition_frame *frame, UINT32 depth_before, UINT32 depth_after,
+    BOOL reconciled )
+{
+    if (!frame) return;
+    flight_record_transition_frame_event(
+        state, ec_context, context, stack_limit, stack_base,
+        reconciled ? XTAJIT64_FLIGHT_EVENT_TRANSITION_RECONCILE :
+                     XTAJIT64_FLIGHT_EVENT_TRANSITION_UNWIND,
+        XTAJIT64_FLIGHT_REASON_NONE, frame->kind, depth_before, depth_after,
+        frame->guest_rsp, frame->native_sp, frame->native_pc );
+}
+
+static void flight_pop_transition_frame(
+    struct xtajit64_thread_state *state, const ARM64EC_NT_CONTEXT *ec_context,
+    const AMD64_CONTEXT *context, UINT64 stack_limit, UINT64 stack_base )
+{
+    struct xtajit64_transition_frame *frame;
+    UINT32 depth_before;
+
+    if (!state || !state->depth) return;
+    depth_before = state->depth;
+    frame = &state->frames[depth_before - 1];
+    /* Keep the frame owned while the recorder builds its bounded payload.
+     * A signal/non-local re-entry can otherwise see the decremented depth and
+     * reuse this slot before the helper has copied its evidence.  A normal
+     * return still performs exactly the original depth mutation below. */
+    flight_record_transition_frame_event( state, ec_context, context, stack_limit, stack_base,
+                                          XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_POP,
+                                          XTAJIT64_FLIGHT_REASON_NONE, frame->kind,
+                                          depth_before, depth_before - 1, frame->guest_rsp,
+                                          frame->native_sp, frame->native_pc );
+    --state->depth;
+}
+
+static UINT32 flight_validate_cpu_context( const AMD64_CONTEXT *context,
+                                            UINT64 stack_limit, UINT64 stack_base,
+                                            UINT64 continuation_target,
+                                            UINT64 continuation_pc,
+                                            UINT64 continuation_rsp )
+{
+    if (!context) return XTAJIT64_FLIGHT_REASON_CONTEXT_RIP;
+    return xtajit64_flight_validate_context( context->ContextFlags,
+                                             CONTEXT_AMD64_FULL |
+                                             CONTEXT_AMD64_FLOATING_POINT,
+                                             context->MxCsr, context->FltSave.MxCsr,
+                                             context->Rip, context->Rsp,
+                                             XTAJIT64_X64_USER_ADDRESS_MAX,
+                                             stack_limit, stack_base,
+                                             continuation_target, continuation_pc,
+                                             continuation_rsp );
+}
+
+static void flight_watch_cpu_context( struct xtajit64_thread_state *state,
+                                      const ARM64EC_NT_CONTEXT *ec_context,
+                                      const AMD64_CONTEXT *context,
+                                      UINT64 stack_limit, UINT64 stack_base,
+                                      UINT64 continuation_target,
+                                      UINT64 continuation_pc,
+                                      UINT64 continuation_rsp, UINT32 type )
+{
+    UINT32 reason;
+
+    if (!flight_has_active_recorder( state )) return;
+    reason = flight_validate_cpu_context( context, stack_limit, stack_base,
+                                           continuation_target, continuation_pc,
+                                           continuation_rsp );
+    flight_record_cpu_event( state, ec_context, context, stack_limit, stack_base,
+                             continuation_pc, continuation_rsp, type, reason );
+}
+
+static void flight_watch_cpu_x18( struct xtajit64_thread_state *state,
+                                  const ARM64EC_NT_CONTEXT *ec_context,
+                                  const AMD64_CONTEXT *context,
+                                  UINT64 stack_limit, UINT64 stack_base,
+                                  UINT32 type )
+{
+    struct xtajit64_flight_recorder *recorder;
+    struct xtajit64_flight_scratch *scratch;
+    struct xtajit64_flight_event *event;
+    UINT32 reason;
+
+    if (!(event = flight_acquire_cpu_event( state, &recorder, &scratch )))
+    {
+        if (!recorder || !xtajit64_flight_recorder_is_active( recorder )) return;
+        reason = state && state->flight_teb_authenticated ?
+            xtajit64_flight_validate_x18(
+                XTAJIT64_FLIGHT_X18_MODE_UNKNOWN,
+                XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+                flight_read_live_x18(), state->flight_expected_teb ) :
+            XTAJIT64_FLIGHT_REASON_NONE;
+        if (!reason && state)
+            reason = flight_validate_cpu_stack_values( state, flight_read_live_sp(),
+                                                        stack_limit, stack_base, type );
+        if (reason && xtajit64_flight_recorder_is_active( recorder ))
+            xtajit64_flight_freeze( recorder, reason );
+        return;
+    }
+    flight_init_cpu_event( event, state, ec_context, context, stack_limit, stack_base, type );
+    reason = state->flight_teb_authenticated ?
+        xtajit64_flight_validate_x18( event->custom_x18_mode,
+                                      event->x18_expectation, event->x18_value,
+                                      state->flight_expected_teb ) :
+        XTAJIT64_FLIGHT_REASON_NONE;
+    if (!reason) reason = flight_validate_cpu_stack( event );
+    event->reason = reason;
+    if (reason) xtajit64_flight_record_and_freeze( recorder, event, reason );
+    else xtajit64_flight_record( recorder, event );
+    xtajit64_flight_release_scratch( scratch );
+}
+
+/* Rendering is deliberately deferred to ordinary C code after a Unixlib call
+ * returns (or a terminal abort path).  Producers and watchdogs only write the
+ * binary ring; they never recurse through Wine exception handling or logging. */
+static const char *flight_event_type_name( UINT32 type )
+{
+    switch (type)
+    {
+    case XTAJIT64_FLIGHT_EVENT_NONE: return "none";
+    case XTAJIT64_FLIGHT_EVENT_RECORDER_READY: return "recorder-ready";
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_CAPTURE: return "transition-capture";
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_BEGIN: return "transition-begin";
+    case XTAJIT64_FLIGHT_EVENT_CONTEXT_IMPORT: return "context-import";
+    case XTAJIT64_FLIGHT_EVENT_UNIX_ENTERED_SYSTEM_MODE: return "unix-system-mode";
+    case XTAJIT64_FLIGHT_EVENT_BINDING: return "binding";
+    case XTAJIT64_FLIGHT_EVENT_ENGINE_ACQUIRE: return "engine-acquire";
+    case XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN: return "provider-begin";
+    case XTAJIT64_FLIGHT_EVENT_PROVIDER_RESUME: return "provider-resume";
+    case XTAJIT64_FLIGHT_EVENT_ATOMIC_EXIT: return "atomic-exit";
+    case XTAJIT64_FLIGHT_EVENT_ATOMIC_REENTRY: return "atomic-reentry";
+    case XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP: return "provider-stop";
+    case XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT: return "context-export";
+    case XTAJIT64_FLIGHT_EVENT_ENGINE_RELEASE: return "engine-release";
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_CONTINUE: return "transition-continue";
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_PUSH: return "frame-push";
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_POP: return "frame-pop";
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_UNWIND: return "frame-unwind";
+    case XTAJIT64_FLIGHT_EVENT_TRANSITION_RECONCILE: return "frame-reconcile";
+    case XTAJIT64_FLIGHT_EVENT_MAPPING_GENERATION: return "mapping-generation";
+    case XTAJIT64_FLIGHT_EVENT_SUSPEND_REQUEST: return "suspend-request";
+    case XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED: return "suspend-ack";
+    case XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION: return "watchdog";
+    default: return "unknown";
+    }
+}
+
+static const char *flight_reason_name( UINT32 reason )
+{
+    switch (reason)
+    {
+    case XTAJIT64_FLIGHT_REASON_NONE: return "none";
+    case XTAJIT64_FLIGHT_REASON_CONTEXT_FLAGS: return "context-flags";
+    case XTAJIT64_FLIGHT_REASON_CONTEXT_MXCSR: return "context-mxcsr";
+    case XTAJIT64_FLIGHT_REASON_CONTEXT_RIP: return "context-rip";
+    case XTAJIT64_FLIGHT_REASON_CONTEXT_RSP: return "context-rsp";
+    case XTAJIT64_FLIGHT_REASON_CONTEXT_STACK: return "context-stack";
+    case XTAJIT64_FLIGHT_REASON_TRANSITION_STACK: return "transition-stack";
+    case XTAJIT64_FLIGHT_REASON_CONTINUATION_PAIR: return "continuation-pair";
+    case XTAJIT64_FLIGHT_REASON_CONTEXT_STALE_PUBLICATION: return "context-stale";
+    case XTAJIT64_FLIGHT_REASON_X18_MODE: return "x18-mode";
+    case XTAJIT64_FLIGHT_REASON_X18_VALUE: return "x18-value";
+    case XTAJIT64_FLIGHT_REASON_TRANSITION_DEPTH: return "transition-depth";
+    case XTAJIT64_FLIGHT_REASON_TERMINAL_ABORT: return "terminal-abort";
+    case XTAJIT64_FLIGHT_REASON_RECORDER_WRAP: return "recorder-wrap";
+    case XTAJIT64_FLIGHT_REASON_RECORDER_INVALID: return "recorder-invalid";
+    default: return "unknown";
+    }
+}
+
+static const char *flight_stop_reason_name( UINT32 reason )
+{
+    switch (reason)
+    {
+    case XTAJIT64_STOP_NONE: return "none";
+    case XTAJIT64_STOP_EC_TRANSITION: return "ec-transition";
+    case XTAJIT64_STOP_SYSCALL: return "syscall";
+    case XTAJIT64_STOP_MEMORY_FAULT: return "memory-fault";
+    case XTAJIT64_STOP_MAPPING_MISS: return "mapping-miss";
+    case XTAJIT64_STOP_INVALID_INSTRUCTION: return "invalid-instruction";
+    case XTAJIT64_STOP_UNSUPPORTED_TRANSITION: return "unsupported-transition";
+    case XTAJIT64_STOP_INTERNAL_ERROR: return "internal-error";
+    default: return "unknown";
+    }
+}
+
+static const char *flight_x18_mode_name( UINT32 mode )
+{
+    switch (mode)
+    {
+    case XTAJIT64_FLIGHT_X18_MODE_UNKNOWN: return "unknown";
+    case XTAJIT64_FLIGHT_X18_MODE_DISABLED: return "disabled";
+    case XTAJIT64_FLIGHT_X18_MODE_ENABLED: return "enabled";
+    default: return "invalid";
+    }
+}
+
+static const char *flight_x18_expectation_name( UINT32 expectation )
+{
+    switch (expectation)
+    {
+    case XTAJIT64_FLIGHT_X18_EXPECTATION_UNKNOWN: return "unknown";
+    case XTAJIT64_FLIGHT_X18_EXPECTATION_NATIVE_SYSTEM: return "native-system";
+    case XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC: return "pe-arm64ec";
+    default: return "invalid";
+    }
+}
+
+static void flight_dump_event( const char *prefix, const struct xtajit64_flight_event *event )
+{
+    ERR( "xtajit64 diagnostic %s seq %#llx ts %#llx src %u type %s/%u reason %s/%u "
+         "stop %s/%u "
+         "causal %#llx binding %#llx engine %#llx/%#llx map %#llx ctx %#llx trans %#llx\n",
+         prefix, event->sequence, event->monotonic_timestamp_ns, event->source,
+         flight_event_type_name( event->event_type ), event->event_type,
+         flight_reason_name( event->reason ), event->reason,
+         flight_stop_reason_name( event->stop_reason ), event->stop_reason,
+         event->causal_boundary_id, event->binding_id, event->engine_id,
+         event->engine_generation, event->mapping_generation,
+         event->context_generation, event->transition_generation );
+    ERR( "xtajit64 diagnostic %s guest rip %#llx rsp %#llx stack %#llx-%#llx arm-pc %#llx "
+         "native pc %#llx sp %#llx frame %#llx control %#llx-%#llx "
+         "x18 %#llx saved %#llx teb %#llx mode %s/%u expectation %s/%u detail %#llx/%#llx "
+         "frame %u depth %u->%u\n",
+         prefix, event->guest_rip, event->guest_rsp, event->guest_stack_limit,
+         event->guest_stack_base, event->arm64ec_pc, event->native_pc,
+         event->native_sp, event->native_frame, event->control_stack_limit,
+         event->control_stack_top, event->x18_value, event->saved_x18_value,
+         event->expected_teb, flight_x18_mode_name( event->custom_x18_mode ),
+         event->custom_x18_mode, flight_x18_expectation_name( event->x18_expectation ),
+         event->x18_expectation,
+         event->detail0, event->detail1, event->transition_frame_kind,
+         event->transition_depth_before, event->transition_depth_after );
+    ERR( "xtajit64 diagnostic %s pid %#llx tid %#llx mach %#llx pthread %#llx "
+         "context-flags %#x mxcsr %#x fltsave-mxcsr %#x flags %#x teb-auth %u\n",
+         prefix, event->pid, event->wine_tid, event->mach_thread_id,
+         event->pthread_identity, event->context_flags, event->mxcsr,
+         event->fltsave_mxcsr, event->flags,
+         (unsigned int)!!(event->flags & XTAJIT64_FLIGHT_FLAG_EXPECTED_TEB_AUTHENTICATED) );
+}
+
+static void flight_dump_if_frozen( struct xtajit64_thread_state *state, const char *where )
+{
+    struct xtajit64_flight_snapshot_metadata metadata;
+    struct xtajit64_flight_recorder *recorder;
+    struct xtajit64_flight_scratch *scratch;
+    struct xtajit64_flight_event *event;
+    UINT64 sequence;
+    UINT64 lost;
+    UINT32 expected = 0;
+    UINT32 committed = 0, torn = 0, snapshot_state;
+
+    if (!flight_recorder_enabled || !flight_has_valid_recorder( state )) return;
+    recorder = state->flight_recorder;
+    if (__atomic_load_n( &recorder->freeze_state, __ATOMIC_ACQUIRE ) != 1)
+        return;
+    /* A previous renderer owns or completed this one-shot dump.  Check before
+     * borrowing recorder scratch so later terminal paths remain observationally
+     * quiet.  The CAS below stays after acquisition: temporary scratch
+     * exhaustion must not suppress the first usable dump forever. */
+    if (__atomic_load_n( &state->flight_dump_state, __ATOMIC_ACQUIRE )) return;
+    if (!(event = xtajit64_flight_acquire_scratch( recorder, &scratch ))) return;
+    if (!__atomic_compare_exchange_n( &state->flight_dump_state, &expected, 1, FALSE,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_RELAXED ))
+    {
+        xtajit64_flight_release_scratch( scratch );
+        return;
+    }
+    if (!xtajit64_flight_snapshot_metadata( recorder, &metadata ))
+    {
+        xtajit64_flight_release_scratch( scratch );
+        return;
+    }
+    lost = xtajit64_flight_saturating_add( metadata.historical_loss_count,
+                                           metadata.contention_loss_count );
+    lost = xtajit64_flight_saturating_add( lost, metadata.scratch_loss_count );
+    for (sequence = metadata.first_sequence;
+         sequence && sequence <= metadata.last_sequence;
+         ++sequence)
+    {
+        snapshot_state = xtajit64_flight_snapshot_event( recorder, sequence, event );
+        if (snapshot_state == XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED) ++committed;
+        else if (snapshot_state == XTAJIT64_FLIGHT_SNAPSHOT_TORN) ++torn;
+        else lost = xtajit64_flight_saturating_add( lost, 1 );
+    }
+    ERR( "xtajit64 diagnostic recorder frozen at %s reason %s/%u sequences %#llx-%#llx "
+         "committed %u lost %#llx torn %u contention-loss %#llx scratch-loss %#llx\n", where,
+         flight_reason_name( metadata.freeze_reason ), metadata.freeze_reason,
+         metadata.first_sequence, metadata.last_sequence, committed, lost, torn,
+         metadata.contention_loss_count, metadata.scratch_loss_count );
+    if (metadata.first_violation_available &&
+        xtajit64_flight_snapshot_first_violation( recorder, event ))
+        flight_dump_event( "first-violation", event );
+    for (sequence = metadata.first_sequence;
+         sequence && sequence <= metadata.last_sequence;
+         ++sequence)
+    {
+        if (xtajit64_flight_snapshot_event( recorder, sequence, event ) !=
+            XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED)
+            continue;
+        flight_dump_event( "ring", event );
+    }
+    xtajit64_flight_release_scratch( scratch );
+}
+
+static void flight_bind_provider( struct xtajit64_thread_state *state,
+                                  const ARM64EC_NT_CONTEXT *ec_context,
+                                  const AMD64_CONTEXT *context,
+                                  UINT64 stack_limit, UINT64 stack_base )
+{
+    struct xtajit64_flight_bind_params params;
+    struct xtajit64_flight_recorder *recorder;
+    UINT64 authenticated_teb;
+    NTSTATUS status;
+
+    if (!flight_has_active_recorder( state )) return;
+    recorder = state->flight_recorder;
+    memset( &params, 0, sizeof(params) );
+    params.recorder = (ULONG_PTR)recorder;
+    params.causal_boundary_id = state->flight_causal_boundary_id;
+    params.context_generation = state->flight_context_generation;
+    params.transition_generation = state->flight_transition_generation;
+    /* Authenticate the wrapper's live pre-dispatch x18 observation.  The
+     * stable ThreadBasicInformation value remains the operational TEB and is
+     * accepted by the watchdog only after Unix publishes the same value. */
+    params.claimed_teb = state->capture_x18;
+    params.guest_rip = context ? context->Rip : XTAJIT64_FLIGHT_UNKNOWN_U64;
+    params.guest_rsp = context ? context->Rsp : XTAJIT64_FLIGHT_UNKNOWN_U64;
+    params.guest_stack_limit = stack_limit;
+    params.guest_stack_base = stack_base;
+    params.control_stack_limit = flight_control_stack_limit( state );
+    params.control_stack_top = state->control_stack_top;
+    state->flight_teb_authenticated = FALSE;
+    status = XTAJIT64_CALL( flight_bind, &params );
+    if (status)
+        flight_record_cpu_event( state, ec_context, context, stack_limit, stack_base,
+                                 XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                 XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                 XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION,
+                                 XTAJIT64_FLIGHT_REASON_RECORDER_INVALID );
+    else if (!flight_has_valid_recorder( state ) || state->flight_recorder != recorder)
+        xtajit64_flight_freeze( recorder, XTAJIT64_FLIGHT_REASON_RECORDER_INVALID );
+    else
+    {
+        authenticated_teb = __atomic_load_n( &recorder->authenticated_teb, __ATOMIC_ACQUIRE );
+        state->flight_teb_authenticated =
+            xtajit64_flight_validate_pe_x18_claim( authenticated_teb,
+                                                    params.claimed_teb ) ==
+                XTAJIT64_FLIGHT_REASON_NONE &&
+            authenticated_teb == state->flight_expected_teb;
+        if (state->flight_teb_authenticated)
+            state->flight_expected_teb = authenticated_teb;
+        if (!state->flight_teb_authenticated)
+        {
+            /* A successful Unix call without an independently authenticated
+             * TEB is itself an x18 contract failure, not a reason to quietly
+             * downgrade all later PE observations to untrusted evidence. */
+            flight_record_cpu_event( state, ec_context, context, stack_limit, stack_base,
+                                     state->flight_expected_teb, authenticated_teb,
+                                     XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION,
+                                     XTAJIT64_FLIGHT_REASON_X18_VALUE );
+        }
+    }
+}
+
 static NTSTATUS resolve_ec_entry_thunk( UINT64 guest_target, ULONG_PTR *native_target,
                                         ULONG_PTR *entry )
 {
@@ -849,7 +1649,21 @@ static struct xtajit64_transition_frame *push_transition_frame(
 {
     struct xtajit64_transition_frame *frame;
 
-    if (!state || state->depth >= XTAJIT64_MAX_TRANSITION_DEPTH) return NULL;
+    if (!state) return NULL;
+    if (state->depth >= XTAJIT64_MAX_TRANSITION_DEPTH)
+    {
+        /* A depth limit is the primary signal for leaked non-local frames.
+         * Freeze it before abort_transition() so the preceding ring remains
+         * available even when no context/x18 invariant fired. */
+        if (state->flight_recorder)
+            flight_record_transition_frame_event(
+                state, NULL, NULL, XTAJIT64_FLIGHT_UNKNOWN_U64,
+                XTAJIT64_FLIGHT_UNKNOWN_U64, XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_PUSH,
+                XTAJIT64_FLIGHT_REASON_TRANSITION_DEPTH, kind, state->depth, state->depth,
+                XTAJIT64_FLIGHT_UNKNOWN_U64, XTAJIT64_FLIGHT_UNKNOWN_U64,
+                XTAJIT64_FLIGHT_UNKNOWN_U64 );
+        return NULL;
+    }
     frame = &state->frames[state->depth++];
     memset( frame, 0, sizeof(*frame) );
     frame->kind = kind;
@@ -868,7 +1682,17 @@ static void discard_unwound_transition_frames( struct xtajit64_thread_state *sta
      * across repeated exception, APC, or user-callback dispatch. */
     while (state->depth &&
            guest_rsp >= state->frames[state->depth - 1].guest_rsp)
+    {
+        struct xtajit64_transition_frame *frame =
+            &state->frames[state->depth - 1];
+
+        if (state->flight_recorder)
+            flight_reconcile_transition_frame(
+                state, NULL, NULL, XTAJIT64_FLIGHT_UNKNOWN_U64,
+                XTAJIT64_FLIGHT_UNKNOWN_U64, frame, state->depth,
+                state->depth - 1, TRUE );
         --state->depth;
+    }
 
     if (state->depth != old_depth)
         TRACE( "discarded %u unwound transition frames at restored x64 rsp %p, depth %u\n",
@@ -905,9 +1729,33 @@ static DECLSPEC_NORETURN void terminate_transition( NTSTATUS status )
     RtlRaiseStatus( status ? status : STATUS_NOT_SUPPORTED );
 }
 
+/* Terminal paths are normally outside the narrow watchdog checks.  In opt-in
+ * diagnostic mode freeze the ring before termination so an unsupported stop
+ * or a depth-overflow abort does not silently discard its causal history. */
+static void flight_freeze_terminal_abort( struct xtajit64_thread_state *state,
+                                          NTSTATUS status, UINT stop_reason,
+                                          UINT unicorn_error )
+{
+    struct xtajit64_flight_recorder *recorder;
+
+    if (!flight_has_active_recorder( state )) return;
+    recorder = state->flight_recorder;
+    if (__atomic_load_n( &recorder->freeze_state, __ATOMIC_ACQUIRE ))
+        return;
+    if (!flight_record_cpu_event( state, NULL, NULL, XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                  XTAJIT64_FLIGHT_UNKNOWN_U64, (UINT64)(ULONG)status,
+                                  (UINT64)stop_reason | (UINT64)unicorn_error << 32,
+                                  XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION,
+                                  XTAJIT64_FLIGHT_REASON_TERMINAL_ABORT ))
+        xtajit64_flight_freeze( recorder,
+                                 XTAJIT64_FLIGHT_REASON_TERMINAL_ABORT );
+}
+
 static DECLSPEC_NORETURN void abort_transition( struct xtajit64_thread_state *state,
                                                NTSTATUS status, const char *reason )
 {
+    flight_freeze_terminal_abort( state, status, XTAJIT64_STOP_INTERNAL_ERROR, 0 );
+    flight_dump_if_frozen( state, "terminal transition abort" );
     ERR( "%s, status %#lx transition %u depth %u\n", reason, status,
          state ? state->capture_kind : ~0u, state ? state->depth : 0 );
     terminate_transition( status );
@@ -917,6 +1765,8 @@ static DECLSPEC_NORETURN void abort_simulation( struct xtajit64_thread_state *st
                                                NTSTATUS status, UINT stop_reason,
                                                UINT unicorn_error )
 {
+    flight_freeze_terminal_abort( state, status, stop_reason, unicorn_error );
+    flight_dump_if_frozen( state, "terminal provider return" );
     ERR( "unsupported x64 simulation boundary, status %#lx reason %u unicorn %u "
          "transition %u depth %u\n", status, stop_reason, unicorn_error,
          state ? state->capture_kind : ~0u, state ? state->depth : 0 );
@@ -996,6 +1846,20 @@ static DECLSPEC_NORETURN void raise_x64_single_step(
                       params->stop_reason, params->unicorn_error );
 }
 
+static void flight_start_transition( struct xtajit64_thread_state *state )
+{
+    struct xtajit64_flight_recorder *recorder;
+    UINT64 causal_boundary_id;
+
+    if (!flight_has_active_recorder( state )) return;
+    recorder = state->flight_recorder;
+    if (!(++state->flight_transition_generation)) ++state->flight_transition_generation;
+    if (!(++state->flight_context_generation)) ++state->flight_context_generation;
+    causal_boundary_id = xtajit64_flight_next_causal_boundary_id( recorder );
+    if (causal_boundary_id != XTAJIT64_FLIGHT_UNKNOWN_U64)
+        state->flight_causal_boundary_id = causal_boundary_id;
+}
+
 static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *state )
 {
     CHPE_V2_CPU_AREA_INFO *cpu;
@@ -1004,13 +1868,17 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
     struct xtajit64_begin_params params = {0};
     TEB *teb;
     UINT64 guest_return;
+    UINT64 continuation_target = XTAJIT64_FLIGHT_UNKNOWN_U64;
+    UINT64 continuation_pc = XTAJIT64_FLIGHT_UNKNOWN_U64;
+    UINT64 continuation_rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
     ULONG_PTR native_target, entry, host_rsp;
     NTSTATUS status;
     UINT frame_index;
+    UINT32 depth_before;
     BOOL continuation_target_seen, mapping_reconciled = FALSE;
 
     if (!state || state->magic != XTAJIT64_THREAD_STATE_MAGIC ||
-        !(teb = (TEB *)(ULONG_PTR)state->teb) ||
+        !(teb = (TEB *)(ULONG_PTR)state->flight_expected_teb) ||
         teb->Tib.Self != &teb->Tib ||
         !(cpu = teb->ChpeV2CpuAreaInfo) ||
         !(ec_context = cpu->ContextAmd64) ||
@@ -1038,13 +1906,76 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
                                &params.stack_base ))
         abort_transition( state, STATUS_INVALID_ADDRESS, "invalid semantic x64 stack" );
 
+    /* This outer branch is the complete normal-transition cost when the
+     * recorder is disabled.  In particular, it avoids the Unixlib bind and
+     * all diagnostic register/time sampling. */
+    if (state->flight_recorder)
+    {
+        flight_watch_cpu_context( state, ec_context, &ec_context->AMD64_Context,
+                                  params.stack_limit, params.stack_base,
+                                  XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                  XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                  XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                  XTAJIT64_FLIGHT_EVENT_CONTEXT_IMPORT );
+        flight_watch_cpu_x18( state, ec_context, &ec_context->AMD64_Context,
+                              params.stack_limit, params.stack_base,
+                              XTAJIT64_FLIGHT_EVENT_TRANSITION_BEGIN );
+        flight_bind_provider( state, ec_context, &ec_context->AMD64_Context,
+                              params.stack_limit, params.stack_base );
+        /* unix_flight_bind() returns through the system-mode dispatcher.
+         * Re-observe the PE numeric x18 contract directly before the actual
+         * provider entry rather than treating the Unix-side mode sample as a
+         * statement about the caller's public ARM64EC mode. */
+        flight_watch_cpu_x18( state, ec_context, &ec_context->AMD64_Context,
+                              params.stack_limit, params.stack_base,
+                              XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN );
+    }
+
     for (;;)
     {
         BOOL mapped = FALSE;
 
         cpu->InSimulation = 1;
+        if (state->flight_recorder)
+            flight_record_cpu_event( state, ec_context, &ec_context->AMD64_Context,
+                                     params.stack_limit, params.stack_base,
+                                     XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                     XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                     mapping_reconciled ?
+                                     XTAJIT64_FLIGHT_EVENT_PROVIDER_RESUME :
+                                     XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN,
+                                     XTAJIT64_FLIGHT_REASON_NONE );
         status = XTAJIT64_CALL( begin_simulation, &params );
+        if (state->flight_recorder)
+        {
+            /* This samples the public PE register contract before ordinary
+             * return-side helpers can blur the provider boundary.  The later
+             * CONTEXT_EXPORT observation pairs it with imported guest state. */
+            flight_watch_cpu_x18( state, ec_context, &ec_context->AMD64_Context,
+                                  params.stack_limit, params.stack_base,
+                                  XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP );
+            flight_dump_if_frozen( state, "provider boundary return" );
+        }
         context_from_unix( &ec_context->AMD64_Context, &params.context );
+        if (state->depth &&
+            (frame = &state->frames[state->depth - 1])->kind == XTAJIT64_FRAME_EXIT)
+        {
+            continuation_target = params.transition_target;
+            continuation_pc = frame->native_pc;
+            continuation_rsp = frame->guest_rsp;
+        }
+        if (state->flight_recorder)
+        {
+            flight_watch_cpu_context( state, ec_context, &ec_context->AMD64_Context,
+                                      params.stack_limit, params.stack_base,
+                                      continuation_target, continuation_pc,
+                                      continuation_rsp,
+                                      XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT );
+            flight_watch_cpu_x18( state, ec_context, &ec_context->AMD64_Context,
+                                  params.stack_limit, params.stack_base,
+                                  XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT );
+            flight_dump_if_frozen( state, "context export" );
+        }
         if (!status && params.stop_reason == XTAJIT64_STOP_SUSPEND)
         {
             if (!suspend_doorbell_is_set( cpu ))
@@ -1115,10 +2046,33 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
     {
         /* Remove the matched EXIT frame and every newer frame abandoned by
          * the unwind before restoring the captured native continuation. */
-        state->depth = frame_index;
+        if (params.context.rsp != frame->guest_rsp)
+            abort_transition( state, STATUS_BAD_STACK,
+                              "x64 exit-thunk continuation stack mismatch" );
+        while (state->depth > frame_index)
+        {
+            struct xtajit64_transition_frame *discarded =
+                &state->frames[state->depth - 1];
+
+            if (state->flight_recorder)
+                flight_reconcile_transition_frame(
+                    state, ec_context, &ec_context->AMD64_Context,
+                    params.stack_limit, params.stack_base, discarded,
+                    state->depth, state->depth - 1, TRUE );
+            --state->depth;
+        }
         ec_context->Sp = frame->native_sp;
         ec_context->Pc = frame->native_pc;
         ec_context->Lr = frame->native_pc;
+        if (state->flight_recorder)
+        {
+            flight_record_cpu_event( state, ec_context, &ec_context->AMD64_Context,
+                                     params.stack_limit, params.stack_base,
+                                     frame->native_pc, frame->guest_rsp,
+                                     XTAJIT64_FLIGHT_EVENT_TRANSITION_CONTINUE,
+                                     XTAJIT64_FLIGHT_REASON_NONE );
+            flight_dump_if_frozen( state, "EC continuation re-entry" );
+        }
         if ((status = restore_fp_state( &ec_context->AMD64_Context )))
             abort_transition( state, status, "cannot restore native FP state" );
         cpu->InSimulation = 0;
@@ -1151,6 +2105,7 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
                               XTAJIT64_MEMORY_TRANSLATE_REQUIRE_READ, &host_rsp ))
         abort_transition( state, STATUS_BAD_STACK,
                           "cannot materialize EC entry stack" );
+    depth_before = state->depth;
     if (!(frame = push_transition_frame( state, XTAJIT64_FRAME_ENTRY )))
         abort_transition( state, STATUS_STACK_OVERFLOW,
                           "ARM64EC transition nesting limit exceeded" );
@@ -1161,6 +2116,19 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
     ec_context->Lr = guest_return;
     ec_context->Sp = host_rsp & ~(ULONG_PTR)15;
     ec_context->Pc = entry;
+    if (state->flight_recorder)
+    {
+        flight_record_transition_frame_push( state, ec_context, &ec_context->AMD64_Context,
+                                             params.stack_limit, params.stack_base, frame,
+                                             depth_before, state->depth,
+                                             host_rsp & ~(ULONG_PTR)15, entry );
+        flight_record_cpu_event( state, ec_context, &ec_context->AMD64_Context,
+                                 params.stack_limit, params.stack_base,
+                                 entry, ec_context->Sp,
+                                 XTAJIT64_FLIGHT_EVENT_TRANSITION_CONTINUE,
+                                 XTAJIT64_FLIGHT_REASON_NONE );
+        flight_dump_if_frozen( state, "EC entry re-entry" );
+    }
     if ((status = restore_fp_state( &ec_context->AMD64_Context )))
         abort_transition( state, status, "cannot restore EC entry FP state" );
     cpu->InSimulation = 0;
@@ -1184,11 +2152,28 @@ static void __attribute__((used, noreturn)) xtajit64_transition_from_native(
     struct xtajit64_transition_frame *frame;
     UINT64 guest_sp, guest_target;
     NTSTATUS status;
+    UINT32 depth_before;
 
     if (!state || state != get_thread_state() || !cpu || !(ec_context = cpu->ContextAmd64))
         abort_transition( state, STATUS_INVALID_PARAMETER, "invalid native capture state" );
     if ((status = capture_fp_state( &ec_context->AMD64_Context )))
         abort_transition( state, status, "cannot capture native FP state" );
+    if (state->flight_recorder)
+    {
+        UINT64 stack_limit = XTAJIT64_FLIGHT_UNKNOWN_U64;
+        UINT64 stack_base = XTAJIT64_FLIGHT_UNKNOWN_U64;
+
+        flight_start_transition( state );
+        get_x64_stack_bounds( ec_context->AMD64_Context.Rsp, &stack_limit, &stack_base );
+        /* detail0/detail1 preserve the assembly capture's pre-switch native
+         * SP/PC; the regular native_sp/native_frame fields describe this live
+         * private-control-stack C observation. */
+        flight_record_cpu_event( state, ec_context, &ec_context->AMD64_Context,
+                                 stack_limit, stack_base, state->capture_sp,
+                                 state->capture_lr,
+                                 XTAJIT64_FLIGHT_EVENT_TRANSITION_CAPTURE,
+                                 XTAJIT64_FLIGHT_REASON_NONE );
+    }
 
     switch (state->capture_kind)
     {
@@ -1200,7 +2185,11 @@ static void __attribute__((used, noreturn)) xtajit64_transition_from_native(
                               "unmatched ARM64EC entry return" );
         ec_context->AMD64_Context.Rsp = frame->guest_rsp;
         ec_context->AMD64_Context.Rip = state->capture_lr;
-        --state->depth;
+        if (state->flight_recorder)
+            flight_pop_transition_frame( state, ec_context, &ec_context->AMD64_Context,
+                                         XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                         XTAJIT64_FLIGHT_UNKNOWN_U64 );
+        else --state->depth;
         cpu->InSimulation = 1;
         TRACE( "return EC entry to x64 rip %p rsp %p depth %u\n",
                (void *)(ULONG_PTR)state->capture_lr,
@@ -1217,12 +2206,18 @@ static void __attribute__((used, noreturn)) xtajit64_transition_from_native(
                               "invalid ARM64EC exit-thunk state" );
         guest_sp = state->capture_sp;
         guest_target = state->capture_target;
+        depth_before = state->depth;
         if (!(frame = push_transition_frame( state, XTAJIT64_FRAME_EXIT )))
             abort_transition( state, STATUS_STACK_OVERFLOW,
                               "ARM64EC transition nesting limit exceeded" );
         frame->guest_rsp = guest_sp;
         frame->native_sp = state->capture_sp;
         frame->native_pc = state->capture_lr;
+        if (state->flight_recorder)
+            flight_record_transition_frame_push(
+                state, ec_context, &ec_context->AMD64_Context,
+                XTAJIT64_FLIGHT_UNKNOWN_U64, XTAJIT64_FLIGHT_UNKNOWN_U64, frame,
+                depth_before, state->depth, frame->native_sp, frame->native_pc );
         if ((status = write_guest_u64( guest_sp - sizeof(UINT64), state->capture_lr )))
             abort_transition( state, status, "cannot push EC exit continuation" );
         ec_context->AMD64_Context.Rsp = guest_sp - sizeof(UINT64);
@@ -1249,7 +2244,12 @@ static void __attribute__((used, noreturn)) xtajit64_transition_from_native(
             abort_transition( state, status, "cannot restore tail-jump return address" );
         ec_context->AMD64_Context.Rsp = frame->guest_rsp - sizeof(UINT64);
         ec_context->AMD64_Context.Rip = guest_target;
-        --state->depth;  /* the custom entry thunk is tail-forwarding */
+        /* The custom entry thunk is tail-forwarding. */
+        if (state->flight_recorder)
+            flight_pop_transition_frame( state, ec_context, &ec_context->AMD64_Context,
+                                         XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                         XTAJIT64_FLIGHT_UNKNOWN_U64 );
+        else --state->depth;
         cpu->InSimulation = 1;
         TRACE( "tail-forward EC adjustor to x64 target %p return %p depth %u\n",
                (void *)(ULONG_PTR)guest_target, (void *)(ULONG_PTR)state->capture_lr,
@@ -1386,6 +2386,10 @@ static void __attribute__((used, naked)) capture_transition(void)
         "str x10, [x17, #0x30]\n\t"
         "ldr w16, [sp, #8]\n\t"
         "str w16, [x17, #0x38]\n\t"
+        "ldr x16, [x17, #0x848]\n\t"     /* opt-in recorder */
+        "cbz x16, 2f\n\t"
+        "str x18, [x17, #0x870]\n\t"     /* pre-switch caller x18 */
+        "2:\n\t"
         "add sp, sp, #16\n\t"
         "mov x16, x17\n\t"               /* state for capture common */
         "b \"#xtajit64_capture_native\"\n\t"
@@ -1459,9 +2463,10 @@ static DECLSPEC_NORETURN void __attribute__((used)) begin_simulation_on_control_
 
     if (state != get_thread_state() || state->magic != XTAJIT64_THREAD_STATE_MAGIC ||
         state->allocation_size != XTAJIT64_CONTROL_STACK_SIZE ||
-        state->control_stack_top != (ULONG_PTR)state + state->allocation_size ||
+        !flight_validate_recorder_layout( state ) ||
         !cpu || !cpu->ContextAmd64)
         RtlRaiseStatus( STATUS_INVALID_PARAMETER );
+    if (state->flight_recorder) flight_start_transition( state );
     discard_unwound_transition_frames( state,
                                        cpu->ContextAmd64->AMD64_Context.Rsp );
     run_x64_simulation( state );
@@ -1492,10 +2497,32 @@ void WINAPI __attribute__((naked)) BeginSimulation(void)
         "adds x17, x0, x16\n\t"
         "b.cs 1f\n\t"
         "ldr x16, [x0, #0x10]\n\t"       /* state.control_stack_top */
-        "cmp x16, x17\n\t"
+        "ldr x15, [x0, #0x848]\n\t"      /* state.flight_recorder */
+        "cbnz x15, 3f\n\t"
+        "cmp x16, x17\n\t"               /* diagnostics-disabled top */
         "b.ne 1f\n\t"
+        "b 4f\n\t"
+        "3:\n\t"
+        "tst x17, #63\n\t"
+        "b.ne 1f\n\t"
+        "movz x9, #0x5fc0\n\t"           /* XTAJIT64_FLIGHT_RECORDER_SIZE */
+        "sub x9, x17, x9\n\t"
+        "cmp x15, x9\n\t"                /* exact high-end recorder */
+        "b.ne 1f\n\t"
+        "tst x15, #63\n\t"
+        "b.ne 1f\n\t"
+        "cmp x16, x15\n\t"               /* recorder owns stack high end */
+        "b.ne 1f\n\t"
+        "add x9, x0, #0x890\n\t"         /* rounded state/control low */
+        "cmp x15, x9\n\t"
+        "b.ls 1f\n\t"
+        "sub x9, x15, x9\n\t"
+        "cmp x9, #0x10, lsl #12\n\t"     /* at least 64 KiB stack */
+        "b.lo 1f\n\t"
+        "4:\n\t"
         "tst x16, #15\n\t"
         "b.ne 1f\n\t"
+        "str x18, [x0, #0x870]\n\t"      /* state.capture_x18 */
         "mov sp, x16\n\t"
         "adr x30, 2f\n\t"
         "b \"#begin_simulation_on_control_stack\"\n\t"
@@ -1787,6 +2814,7 @@ NTSTATUS WINAPI ProcessInit(void)
     NTSTATUS status;
 
     TRACE( "CPU provider interface %s\n", XTAJIT64_PROVIDER_ABI_IDENTITY );
+    init_flight_recorder_enablement();
     if ((status = init_unixlib())) return status;
     status = NtQuerySystemInformation( SystemBasicInformation, &info, sizeof(info), NULL );
     if (status) return status;
@@ -1878,7 +2906,9 @@ NTSTATUS WINAPI ThreadInit(void)
     if (!cpu || !cpu->ContextAmd64) return STATUS_INVALID_PARAMETER;
     if ((state = cpu->EmulatorData[0]))
     {
-        if (state->magic != XTAJIT64_THREAD_STATE_MAGIC || state->teb != (ULONG_PTR)teb ||
+        if (state->magic != XTAJIT64_THREAD_STATE_MAGIC ||
+            !flight_validate_recorder_layout( state ) ||
+            state->flight_expected_teb != (ULONG_PTR)teb ||
             (cpu->SuspendDoorbell &&
              cpu->SuspendDoorbell != &state->suspend_doorbell))
             return STATUS_ALREADY_INITIALIZED;
@@ -1891,7 +2921,7 @@ NTSTATUS WINAPI ThreadInit(void)
         return status;
     }
     if ((status = allocate_transition_state( &state ))) return status;
-    state->teb = (ULONG_PTR)teb;
+    state->flight_expected_teb = (ULONG_PTR)teb;
     /* Publish this known uniform allocation directly while ntdll defers its
      * nested VM notification.  Ntdll acknowledges the exact single mutation;
      * any additional or concurrent mutation retains the full-resync fallback. */
@@ -1910,6 +2940,14 @@ NTSTATUS WINAPI ThreadInit(void)
     }
 
     cpu->SuspendDoorbell = &state->suspend_doorbell;
+    if (state->flight_recorder)
+        flight_record_cpu_event( state, NULL, &cpu->ContextAmd64->AMD64_Context,
+                                 XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                 XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                 XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                 XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                 XTAJIT64_FLIGHT_EVENT_RECORDER_READY,
+                                 XTAJIT64_FLIGHT_REASON_NONE );
     cpu->EmulatorData[0] = state;
     return STATUS_SUCCESS;
 #else
@@ -1936,6 +2974,9 @@ void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
 #ifdef HAVE_UNICORN
 
     if (!RtlIsCurrentThread( handle )) return;
+    if ((cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo) && (state = get_thread_state()) &&
+        state->flight_recorder)
+        flight_dump_if_frozen( state, "thread termination" );
     get_current_thread_teb_window( &teb_limit, &teb_base, &teb_allocation );
     get_allocation_base( &state, &native_stack_allocation );
     if ((cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo) && cpu->EmulatorStackBase > cpu->EmulatorStackLimit)

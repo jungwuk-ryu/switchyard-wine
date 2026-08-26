@@ -16,6 +16,7 @@
 #include "winnt.h"
 #include "wine/low_va.h"
 #include "wine/unixlib.h"
+#include "flight_recorder.h"
 
 #define XTAJIT64_GUEST_PAGE_SIZE      0x1000
 #define XTAJIT64_MAX_HOST_PAGE_SIZE   0x10000
@@ -25,7 +26,7 @@
 #define XTAJIT64_PROCESS_INIT_PARAMS_SIZE     80u
 #define XTAJIT64_BEGIN_PARAMS_SIZE            472u
 #define XTAJIT64_PROVIDER_ABI_IDENTITY \
-    "switchyard-xtajit64-provider-abi-v8-process-init-80-begin-472-doorbell-single-step"
+    "switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-472-doorbell"
 
 #define XTAJIT64_CAP_GS_NATIVE_DOMAIN 0x00000001u
 #define XTAJIT64_CAP_ADDRESS_CODEC    0x00000002u
@@ -80,6 +81,7 @@ enum xtajit64_unix_funcs
     unix_begin_simulation,
     unix_memory_resync_begin,
     unix_memory_translate,
+    unix_flight_bind,
     unix_funcs_count
 };
 
@@ -175,6 +177,26 @@ struct xtajit64_begin_params
     UINT64 suspend_doorbell;
 };
 
+/* Optional, diagnostic-only association.  Kept separate from begin_params so
+ * operational provider ABI additions (for example suspend signaling) do not
+ * need to share a hot-path diagnostic layout. */
+struct xtajit64_flight_bind_params
+{
+    UINT64 recorder;
+    UINT64 causal_boundary_id;
+    UINT64 context_generation;
+    UINT64 transition_generation;
+    /* Stable PE-side x18 claim captured before this Unix dispatcher entry.
+     * unix_flight_bind authenticates it against WINE_UNIX_LIB NtCurrentTeb(). */
+    UINT64 claimed_teb;
+    UINT64 guest_rip;
+    UINT64 guest_rsp;
+    UINT64 guest_stack_limit;
+    UINT64 guest_stack_base;
+    UINT64 control_stack_limit;
+    UINT64 control_stack_top;
+};
+
 struct xtajit64_poison_params
 {
     UINT32 status;
@@ -212,6 +234,7 @@ C_ASSERT( offsetof(struct xtajit64_begin_params, unicorn_error) == 456 );
 C_ASSERT( offsetof(struct xtajit64_begin_params, reserved) == 460 );
 C_ASSERT( offsetof(struct xtajit64_begin_params, suspend_doorbell) == 464 );
 C_ASSERT( sizeof(struct xtajit64_begin_params) == XTAJIT64_BEGIN_PARAMS_SIZE );
+C_ASSERT( sizeof(struct xtajit64_flight_bind_params) == 88 );
 C_ASSERT( sizeof(struct xtajit64_poison_params) == 8 );
 C_ASSERT( !(XTAJIT64_GUEST_KUSER & (XTAJIT64_MAX_HOST_PAGE_SIZE - 1)) );
 

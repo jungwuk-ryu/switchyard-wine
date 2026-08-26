@@ -1,5 +1,5 @@
 diff --git a/include/uc_priv.h b/include/uc_priv.h
-index c3132dccec83bce81c972561644bf8df030eafcf..a3e47a0783e085e7ca755d59372254127202223e 100644
+index c3132dccec83bce81c972561644bf8df030eafcf..8d0ea1b9b31b24a534c6e9272da173dd8d6930a7 100644
 --- a/include/uc_priv.h
 +++ b/include/uc_priv.h
 @@ -9,6 +9,7 @@
@@ -27,7 +27,7 @@ index c3132dccec83bce81c972561644bf8df030eafcf..a3e47a0783e085e7ca755d5937225412
      uc_gen_tb_t uc_gen_tb;
      uc_tb_flush_t tb_flush;
      uc_add_inline_hook_t add_inline_hook;
-@@ -374,6 +378,15 @@ struct uc_struct {
+@@ -374,6 +378,18 @@ struct uc_struct {
      bool init_tcg;       // already initialized local TCGv variables?
      bool stop_request;   // request to immediately stop emulation - for
                           // uc_emu_stop()
@@ -40,10 +40,13 @@ index c3132dccec83bce81c972561644bf8df030eafcf..a3e47a0783e085e7ca755d5937225412
 +    bool shared_code_translation_active; // translating shared executable code
 +    unsigned int shared_exclusive_depth;
 +    struct uc_struct *shared_atomic_next;
++    uc_cb_shared_memory_atomic_t shared_memory_atomic_callback;
++    void *shared_memory_atomic_user_data;
++    bool shared_memory_atomic_trace_open;
      bool quit_request;   // request to quit the current TB, but continue to
                           // emulate - for uc_mem_protect()
      bool emulation_done; // emulation is done by uc_emu_start()
-@@ -521,6 +534,49 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
+@@ -521,6 +537,49 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
                                  length);
  }
  
@@ -93,7 +96,7 @@ index c3132dccec83bce81c972561644bf8df030eafcf..a3e47a0783e085e7ca755d5937225412
  /*
   break translation loop:
   This is done in two cases:
-@@ -530,11 +586,10 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
+@@ -530,11 +589,10 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
  */
  static inline uc_err break_translation_loop(uc_engine *uc)
  {
@@ -106,7 +109,7 @@ index c3132dccec83bce81c972561644bf8df030eafcf..a3e47a0783e085e7ca755d5937225412
      if (uc->cpu) {
          // exit the current TB
          cpu_exit(uc->cpu);
-@@ -545,10 +600,10 @@ static inline uc_err break_translation_loop(uc_engine *uc)
+@@ -545,10 +603,10 @@ static inline uc_err break_translation_loop(uc_engine *uc)
  
  static inline void revert_uc_emu_stop(uc_engine *uc)
  {
@@ -122,10 +125,29 @@ index c3132dccec83bce81c972561644bf8df030eafcf..a3e47a0783e085e7ca755d5937225412
  
  #ifdef UNICORN_TRACER
 diff --git a/include/unicorn/unicorn.h b/include/unicorn/unicorn.h
-index b4ffc6bc75ff865f04fa8cfc12b6743404599ecf..6de158ccfb1acd349ffb13c33576e85783ba478a 100644
+index b4ffc6bc75ff865f04fa8cfc12b6743404599ecf..cda2438d893746a315cb536c60c737ef18f36955 100644
 --- a/include/unicorn/unicorn.h
 +++ b/include/unicorn/unicorn.h
-@@ -1059,6 +1059,24 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+@@ -206,6 +206,18 @@ typedef enum uc_err {
+ typedef void (*uc_cb_hookcode_t)(uc_engine *uc, uint64_t address, uint32_t size,
+                                  void *user_data);
+ 
++/* Switchyard serial-atomic fallback phases.  EXIT is emitted after all
++ * participating engines are quiescent and immediately before the one-
++ * instruction non-parallel execution.  REENTRY is emitted after the
++ * exclusive owner is released. */
++typedef enum uc_shared_memory_atomic_phase {
++    UC_SHARED_MEMORY_ATOMIC_EXIT = 1,
++    UC_SHARED_MEMORY_ATOMIC_REENTRY = 2,
++} uc_shared_memory_atomic_phase;
++
++typedef void (*uc_cb_shared_memory_atomic_t)(
++    uc_engine *uc, uc_shared_memory_atomic_phase phase, void *user_data);
++
+ /*
+   Callback function for tracing interrupts (for uc_hook_intr())
+ 
+@@ -1059,6 +1071,31 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
  UNICORN_EXPORT
  uc_err uc_emu_stop(uc_engine *uc);
  
@@ -144,14 +166,21 @@ index b4ffc6bc75ff865f04fa8cfc12b6743404599ecf..6de158ccfb1acd349ffb13c33576e857
 + engines at a translation-block boundary. */
 +#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1
 +#define UC_SWITCHYARD_SHARED_CODE_COHERENCE 1
++#define UC_SWITCHYARD_SHARED_MEMORY_ATOMIC_TRACE 1
 +UNICORN_EXPORT
 +uc_err uc_enable_shared_memory_atomics(uc_engine *uc);
++
++/* Install a callback for the rare serial one-instruction fallback.  Configure
++ * it before enabling shared-memory atomics; passing NULL clears it. */
++UNICORN_EXPORT
++uc_err uc_set_shared_memory_atomic_callback(
++    uc_engine *uc, uc_cb_shared_memory_atomic_t callback, void *user_data);
 +
  /*
   Register callback for a hook event.
   The callback will be run when the hook event is hit.
 diff --git a/qemu/accel/tcg/cpu-exec.c b/qemu/accel/tcg/cpu-exec.c
-index 77168f35a7bba4aac1cdb6681a6c77501cec5b1a..70e3d90ef05c2b19deedf0ecbb5a4337129152b2 100644
+index 77168f35a7bba4aac1cdb6681a6c77501cec5b1a..8dea2625ab33ee9823568b7db19966502c9d39b0 100644
 --- a/qemu/accel/tcg/cpu-exec.c
 +++ b/qemu/accel/tcg/cpu-exec.c
 @@ -101,7 +101,7 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
@@ -223,7 +252,7 @@ index 77168f35a7bba4aac1cdb6681a6c77501cec5b1a..70e3d90ef05c2b19deedf0ecbb5a4337
          /* Something asked us to stop executing chained TBs; just
           * continue round the main loop. Whatever requested the exit
           * will also have set something else (eg exit_request or
-@@ -587,14 +606,27 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
+@@ -587,14 +606,39 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
          g_assert(cc == CPU_GET_CLASS(cpu));
  #endif /* buggy compiler */
  
@@ -243,8 +272,20 @@ index 77168f35a7bba4aac1cdb6681a6c77501cec5b1a..70e3d90ef05c2b19deedf0ecbb5a4337
 +        if (cpu->exception_index == EXCP_ATOMIC) {
 +            cpu->exception_index = -1;
 +            if (uc_shared_atomic_begin_exclusive(uc)) {
++                if (uc->shared_memory_atomic_callback) {
++                    uc->shared_memory_atomic_trace_open = true;
++                    JIT_CALLBACK_GUARD(uc->shared_memory_atomic_callback(
++                        uc, UC_SHARED_MEMORY_ATOMIC_EXIT,
++                        uc->shared_memory_atomic_user_data));
++                }
 +                cpu_exec_step_atomic(cpu);
 +                uc_shared_atomic_end_exclusive(uc);
++                if (uc->shared_memory_atomic_trace_open) {
++                    uc->shared_memory_atomic_trace_open = false;
++                    JIT_CALLBACK_GUARD(uc->shared_memory_atomic_callback(
++                        uc, UC_SHARED_MEMORY_ATOMIC_REENTRY,
++                        uc->shared_memory_atomic_user_data));
++                }
 +            }
 +            continue;
 +        }
@@ -253,7 +294,7 @@ index 77168f35a7bba4aac1cdb6681a6c77501cec5b1a..70e3d90ef05c2b19deedf0ecbb5a4337
          while (!cpu_handle_interrupt(cpu, &last_tb)) {
              uint32_t cflags = cpu->cflags_next_tb;
              TranslationBlock *tb;
-@@ -611,7 +643,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
+@@ -611,7 +655,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
              }
  
              tb = tb_find(cpu, last_tb, tb_exit, cflags);
@@ -262,7 +303,7 @@ index 77168f35a7bba4aac1cdb6681a6c77501cec5b1a..70e3d90ef05c2b19deedf0ecbb5a4337
                  continue;
              }
              cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
-@@ -622,7 +654,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
+@@ -622,7 +666,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
      }
  
      // Unicorn: Clear any TCG exit flag that might have been left set by exit requests
@@ -1740,10 +1781,10 @@ index 0000000000000000000000000000000000000000..09e3dc5490a06fb4c4cccc07bf9b31dc
 +}
 diff --git a/tests/regress/shared_memory_atomics.c b/tests/regress/shared_memory_atomics.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..fcd4ad2198c37218767e3f5f2daf650fc85c17ea
+index 0000000000000000000000000000000000000000..9b5e82c616e62c74779db4f30757fd834dccc39c
 --- /dev/null
 +++ b/tests/regress/shared_memory_atomics.c
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,572 @@
 +/* Test x86 guest atomic instructions shared by independent Unicorn engines. */
 +
 +#define _POSIX_C_SOURCE 200809L
@@ -1761,6 +1802,9 @@ index 0000000000000000000000000000000000000000..fcd4ad2198c37218767e3f5f2daf650f
 +
 +#ifndef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
 +#error UC_SWITCHYARD_SHARED_MEMORY_ATOMICS is required
++#endif
++#ifndef UC_SWITCHYARD_SHARED_MEMORY_ATOMIC_TRACE
++#error UC_SWITCHYARD_SHARED_MEMORY_ATOMIC_TRACE is required
 +#endif
 +
 +#define CODE_ADDRESS 0x10000u
@@ -1794,6 +1838,10 @@ index 0000000000000000000000000000000000000000..fcd4ad2198c37218767e3f5f2daf650f
 +    uc_err result;
 +    uint16_t value;
 +    uint16_t previous;
++    unsigned int atomic_exit_count;
++    unsigned int atomic_reentry_count;
++    int atomic_phase_open;
++    int atomic_order_error;
 +};
 +
 +static uc_err enable_shared_memory_atomics(uc_engine *uc)
@@ -1803,6 +1851,72 @@ index 0000000000000000000000000000000000000000..fcd4ad2198c37218767e3f5f2daf650f
 +    return UC_ERR_OK;
 +#else
 +    return uc_enable_shared_memory_atomics(uc);
++#endif
++}
++
++static void shared_memory_atomic_trace(
++    uc_engine *uc, uc_shared_memory_atomic_phase phase, void *user_data)
++{
++    struct xchg_worker *worker = user_data;
++
++    (void)uc;
++    if (phase == UC_SHARED_MEMORY_ATOMIC_EXIT)
++    {
++        if (worker->atomic_phase_open) worker->atomic_order_error = 1;
++        worker->atomic_phase_open = 1;
++        ++worker->atomic_exit_count;
++    }
++    else if (phase == UC_SHARED_MEMORY_ATOMIC_REENTRY)
++    {
++        if (!worker->atomic_phase_open) worker->atomic_order_error = 1;
++        worker->atomic_phase_open = 0;
++        ++worker->atomic_reentry_count;
++    }
++    else worker->atomic_order_error = 1;
++}
++
++static int test_atomic_trace_registration(void)
++{
++#ifdef SWITCHYARD_SHARED_ATOMICS_NEGATIVE_CONTROL
++    return 0;
++#else
++    struct xchg_worker worker = {0};
++    uc_engine *uc = NULL;
++    uc_err err;
++    int ret = 1;
++
++    if ((err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc)))
++    {
++        fprintf(stderr, "atomic trace contract open failed: %s\n",
++                uc_strerror(err));
++        return 1;
++    }
++    if (uc_set_shared_memory_atomic_callback(uc, NULL, &worker) != UC_ERR_ARG)
++    {
++        fprintf(stderr, "atomic trace accepted user data without callback\n");
++        goto done;
++    }
++    if ((err = uc_set_shared_memory_atomic_callback(
++             uc, shared_memory_atomic_trace, &worker)) ||
++        (err = uc_set_shared_memory_atomic_callback(uc, NULL, NULL)) ||
++        (err = uc_set_shared_memory_atomic_callback(
++             uc, shared_memory_atomic_trace, &worker)) ||
++        (err = uc_enable_shared_memory_atomics(uc)))
++    {
++        fprintf(stderr, "atomic trace registration failed: %s\n",
++                uc_strerror(err));
++        goto done;
++    }
++    if (uc_set_shared_memory_atomic_callback(uc, NULL, NULL) != UC_ERR_RESOURCE)
++    {
++        fprintf(stderr, "atomic trace changed after atomics were enabled\n");
++        goto done;
++    }
++    ret = 0;
++
++done:
++    uc_close(uc);
++    return ret;
 +#endif
 +}
 +
@@ -2018,6 +2132,8 @@ index 0000000000000000000000000000000000000000..fcd4ad2198c37218767e3f5f2daf650f
 +    memcpy(worker_code, code, sizeof(worker_code));
 +    memcpy(worker_code + 6, &value, sizeof(value));
 +    if ((err = uc_open(UC_ARCH_X86, UC_MODE_64, &worker->uc)) ||
++        (err = uc_set_shared_memory_atomic_callback(
++            worker->uc, shared_memory_atomic_trace, worker)) ||
 +        (err = enable_shared_memory_atomics(worker->uc)) ||
 +        (err = uc_mem_map(worker->uc, CODE_ADDRESS, PAGE_SIZE, UC_PROT_ALL)) ||
 +        (err = uc_mem_write(worker->uc, CODE_ADDRESS, worker_code,
@@ -2108,6 +2224,23 @@ index 0000000000000000000000000000000000000000..fcd4ad2198c37218767e3f5f2daf650f
 +            goto done;
 +        }
 +    }
++#ifndef SWITCHYARD_SHARED_ATOMICS_NEGATIVE_CONTROL
++    for (i = 0; i < 2; ++i)
++    {
++        if (workers[i].atomic_order_error || workers[i].atomic_phase_open ||
++            !workers[i].atomic_exit_count ||
++            workers[i].atomic_exit_count != workers[i].atomic_reentry_count)
++        {
++            fprintf(stderr, "serial atomic trace mismatch for worker %u: "
++                    "exit %u reentry %u open %d order %d\n", i,
++                    workers[i].atomic_exit_count,
++                    workers[i].atomic_reentry_count,
++                    workers[i].atomic_phase_open,
++                    workers[i].atomic_order_error);
++            goto done;
++        }
++    }
++#endif
 +    ret = 0;
 +
 +done:
@@ -2212,7 +2345,8 @@ index 0000000000000000000000000000000000000000..fcd4ad2198c37218767e3f5f2daf650f
 +        return 2;
 +    }
 +    memset(shared, 0, PAGE_SIZE);
-+    if (test_cross_engine_cmpxchg(shared) ||
++    if (test_atomic_trace_registration() ||
++        test_cross_engine_cmpxchg(shared) ||
 +        test_cross_engine_unaligned_xchgw(shared) || test_cmpxchg8b(shared))
 +        goto done;
 +    puts("shared-memory LOCK, unaligned XCHGW, and CMPXCHG8B atomics passed");
@@ -2617,10 +2751,10 @@ index 0000000000000000000000000000000000000000..4998286a9c844083ee36df4281f92837
 +    return 0;
 +}
 diff --git a/uc.c b/uc.c
-index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7ae2083c9 100644
+index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..18a8373924438613e01fb1d97c2afee890650d6e 100644
 --- a/uc.c
 +++ b/uc.c
-@@ -29,12 +29,226 @@
+@@ -29,12 +29,234 @@
  
  #include "qemu/include/tcg/tcg-apple-jit.h"
  #include "qemu/include/qemu/queue.h"
@@ -2759,10 +2893,18 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
 +
 +void uc_shared_atomic_abort_exclusive(uc_engine *uc)
 +{
++    bool trace_reentry = uc->shared_memory_atomic_trace_open;
++
++    uc->shared_memory_atomic_trace_open = false;
 +    uc->shared_code_write_active = false;
 +    uc->shared_code_translation_active = false;
 +    uc->shared_exclusive_depth = 0;
 +    atomic_cmpxchg(&shared_atomic_owner, uc, NULL);
++    if (trace_reentry) {
++        JIT_CALLBACK_GUARD(uc->shared_memory_atomic_callback(
++            uc, UC_SHARED_MEMORY_ATOMIC_REENTRY,
++            uc->shared_memory_atomic_user_data));
++    }
 +}
 +
 +static bool shared_executable_mapping(uc_engine *uc, uint64_t address,
@@ -2847,7 +2989,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
  #if defined(__APPLE__) && defined(HAVE_PTHREAD_JIT_PROTECT) &&                 \
      (defined(__arm__) || defined(__aarch64__))
  static void save_jit_state(uc_engine *uc)
-@@ -49,16 +263,15 @@ static void save_jit_state(uc_engine *uc)
+@@ -49,16 +271,15 @@ static void save_jit_state(uc_engine *uc)
  
  static void restore_jit_state(uc_engine *uc)
  {
@@ -2871,7 +3013,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
      }
      uc->nested -= 1;
  }
-@@ -504,6 +717,8 @@ uc_err uc_close(uc_engine *uc)
+@@ -504,6 +725,8 @@ uc_err uc_close(uc_engine *uc)
          return UC_ERR_OK;
      }
  
@@ -2880,7 +3022,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
      // Flush all translation buffers or we leak memory allocated by MMU
      uc->tb_flush(uc);
  
-@@ -1018,13 +1233,13 @@ static void *_timeout_fn(void *arg)
+@@ -1018,13 +1241,13 @@ static void *_timeout_fn(void *arg)
      do {
          usleep(TIMEOUT_STEP);
          // perhaps emulation is even done before timeout?
@@ -2896,7 +3038,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
          uc->timed_out = true;
          // force emulation to stop
          uc_emu_stop(uc);
-@@ -1081,7 +1296,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+@@ -1081,7 +1304,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
      // reset the counter
      uc->emu_counter = 0;
      uc->invalid_error = UC_ERR_OK;
@@ -2905,7 +3047,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
      uc->size_recur_mem = 0;
      uc->timed_out = false;
      uc->first_tb = true;
-@@ -1187,7 +1402,8 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+@@ -1187,7 +1410,8 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
  #endif
      }
      uc->skip_sync_pc_on_exit = false;
@@ -2915,7 +3057,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
  
      uc->emu_count = count;
      // remove count hook if counting isn't necessary
-@@ -1232,7 +1448,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+@@ -1232,7 +1456,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
      // emulation is done if and only if we exit the outer uc_emu_start
      // or we may lost uc_emu_stop
      if (uc->nested_level == 0) {
@@ -2924,7 +3066,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
  
          // remove hooks to delete
          // make sure we delete all hooks at the first level.
-@@ -1255,12 +1471,26 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+@@ -1255,12 +1479,45 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
  
  UNICORN_EXPORT
  uc_err uc_emu_stop(uc_engine *uc)
@@ -2951,10 +3093,29 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
      restore_jit_state(uc);
 -    return err;
 +    return UC_ERR_OK;
++}
++
++UNICORN_EXPORT
++uc_err uc_set_shared_memory_atomic_callback(
++    uc_engine *uc, uc_cb_shared_memory_atomic_t callback, void *user_data)
++{
++    UC_INIT(uc);
++    if (atomic_read(&uc->shared_memory_atomics)) {
++        restore_jit_state(uc);
++        return UC_ERR_RESOURCE;
++    }
++    if (!callback && user_data) {
++        restore_jit_state(uc);
++        return UC_ERR_ARG;
++    }
++    uc->shared_memory_atomic_callback = callback;
++    uc->shared_memory_atomic_user_data = user_data;
++    restore_jit_state(uc);
++    return UC_ERR_OK;
  }
  
  // return target index where a memory region at the address exists, or could be
-@@ -2071,7 +2301,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
+@@ -2071,7 +2328,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
  {
      struct uc_struct *uc = handle;
  
@@ -2963,7 +3124,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
          return;
      }
  
-@@ -2089,7 +2319,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
+@@ -2089,7 +2346,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
      JIT_CALLBACK_GUARD(((uc_hook_tcg_op_2)hook->callback)(
          uc, address, arg1, arg2, size, hook->user_data));
  
@@ -2972,7 +3133,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
          return;
      }
  }
-@@ -2121,9 +2351,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
+@@ -2121,9 +2378,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
      // }
  
      // the last callback may already asked to stop emulation
@@ -2984,7 +3145,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..730b4f340bbf3320e5fe6dbd437bb6d7
          revert_uc_emu_stop(uc);
      }
  
-@@ -2156,9 +2386,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
+@@ -2156,9 +2413,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
          //   normally. No check_exit_request is generated and the hooks are
          //   triggered normally. In other words, the whole IT block is treated
          //   as a single instruction.

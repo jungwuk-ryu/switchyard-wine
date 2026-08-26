@@ -144,7 +144,7 @@ static void test_raise_mutation_exception(void)
 }
 
 #define TEST_PAGE             0x4000u
-#define TEST_PAGE_COUNT       12u
+#define TEST_PAGE_COUNT       15u
 #define TEST_PREFERRED_KUSER  (WINE_LOW_VA_SHADOW_BASE + 0x04000000ull)
 #define TEST_PREFERRED_BASE   (WINE_LOW_VA_SHADOW_BASE + 0x06000000ull)
 #define TEST_LOW_HOST_BASE    (WINE_LOW_VA_SHADOW_BASE + 0x08000000ull)
@@ -165,6 +165,8 @@ static uint64_t test_base;
 static uint64_t test_ec_target;
 static uint64_t test_syscall_dispatcher;
 static uint64_t test_teb;
+static struct xtajit64_flight_recorder flight_test_recorder;
+static struct xtajit64_flight_snapshot flight_test_snapshot;
 
 static volatile uint32_t *test_suspend_doorbell(void)
 {
@@ -317,12 +319,37 @@ static NTSTATUS register_identity_page( void *page, unsigned int protect )
     return memory_map( &params );
 }
 
+static NTSTATUS register_identity_range( void *base, size_t size, unsigned int protect )
+{
+    struct xtajit64_memory_params params =
+    {
+        .guest = (uintptr_t)base,
+        .host = (uintptr_t)base,
+        .size = size,
+        .allocation_base = (uintptr_t)base,
+        .protect = protect,
+    };
+
+    return memory_map( &params );
+}
+
 static NTSTATUS unregister_identity_page( void *page )
 {
     struct xtajit64_memory_params params =
     {
         .guest = (uintptr_t)page,
         .size = TEST_PAGE,
+    };
+
+    return memory_unmap( &params );
+}
+
+static NTSTATUS unregister_identity_range( void *base, size_t size )
+{
+    struct xtajit64_memory_params params =
+    {
+        .guest = (uintptr_t)base,
+        .size = size,
     };
 
     return memory_unmap( &params );
@@ -853,6 +880,965 @@ static BOOL join_simulation( pthread_t thread, struct simulation *simulation )
     }
     pthread_join( thread, NULL );
     return done;
+}
+
+static const struct xtajit64_flight_event *find_flight_event( UINT32 type,
+                                                               UINT64 causal_boundary_id )
+{
+    UINT32 i;
+
+    for (i = 0; i < XTAJIT64_FLIGHT_CAPACITY; ++i)
+        if (flight_test_snapshot.states[i] == XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED &&
+            flight_test_snapshot.events[i].event_type == type &&
+            (!causal_boundary_id ||
+             flight_test_snapshot.events[i].causal_boundary_id == causal_boundary_id))
+            return &flight_test_snapshot.events[i];
+    return NULL;
+}
+
+#define FLIGHT_STRESS_WRITERS 4u
+#define FLIGHT_STRESS_RECORDS 2048u
+
+struct flight_stress_context
+{
+    struct xtajit64_flight_recorder recorder;
+    atomic_int start;
+    atomic_int writers_done;
+    atomic_uint_fast64_t accepted;
+    atomic_uint failures;
+};
+
+struct flight_stress_writer
+{
+    struct flight_stress_context *context;
+    UINT32 writer;
+};
+
+static struct flight_stress_context flight_stress;
+
+static void *flight_stress_writer_main( void *arg )
+{
+    struct flight_stress_writer *writer = arg;
+    struct xtajit64_flight_event event;
+    UINT32 i;
+
+    while (!atomic_load_explicit( &writer->context->start, memory_order_acquire )) sched_yield();
+    for (i = 0; i < FLIGHT_STRESS_RECORDS; ++i)
+    {
+        UINT64 value = (UINT64)writer->writer << 32 | i;
+
+        xtajit64_flight_event_init( &event, XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN,
+                                     XTAJIT64_FLIGHT_SOURCE_UNIX_PROVIDER );
+        event.detail0 = value;
+        event.detail1 = ~value;
+        if (xtajit64_flight_record( &writer->context->recorder, &event ))
+            atomic_fetch_add_explicit( &writer->context->accepted, 1, memory_order_relaxed );
+        if (!(i & 63)) sched_yield();
+    }
+    atomic_fetch_add_explicit( &writer->context->writers_done, 1, memory_order_release );
+    return NULL;
+}
+
+static void *flight_stress_snapshot_main( void *arg )
+{
+    struct flight_stress_context *context = arg;
+    struct xtajit64_flight_snapshot_metadata metadata;
+    struct xtajit64_flight_event event;
+    UINT64 sequence;
+
+    while (!atomic_load_explicit( &context->start, memory_order_acquire )) sched_yield();
+    do
+    {
+        if (!xtajit64_flight_snapshot_metadata( &context->recorder, &metadata ))
+        {
+            atomic_fetch_add_explicit( &context->failures, 1, memory_order_relaxed );
+            break;
+        }
+        for (sequence = metadata.first_sequence;
+             sequence && sequence <= metadata.last_sequence; ++sequence)
+        {
+            if (xtajit64_flight_snapshot_event( &context->recorder, sequence, &event ) ==
+                XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED &&
+                (event.sequence != sequence || event.event_type !=
+                 XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN || event.detail1 != ~event.detail0))
+                atomic_fetch_add_explicit( &context->failures, 1, memory_order_relaxed );
+        }
+        sched_yield();
+    } while (atomic_load_explicit( &context->writers_done, memory_order_acquire ) <
+             FLIGHT_STRESS_WRITERS);
+    return NULL;
+}
+
+static void test_flight_recorder_stress(void)
+{
+    struct flight_stress_writer writers[FLIGHT_STRESS_WRITERS];
+    struct xtajit64_flight_snapshot_metadata metadata;
+    struct xtajit64_flight_event event;
+    pthread_t writer_threads[FLIGHT_STRESS_WRITERS], snapshot_thread;
+    BOOL writer_created[FLIGHT_STRESS_WRITERS] = {0};
+    BOOL snapshot_created = FALSE, threads_ready = TRUE;
+    UINT64 accepted, attempts = (UINT64)FLIGHT_STRESS_WRITERS * FLIGHT_STRESS_RECORDS;
+    UINT64 sequence;
+    unsigned int starting_failures = failures;
+    UINT32 i;
+
+    memset( &flight_stress, 0, sizeof(flight_stress) );
+    xtajit64_flight_recorder_init( &flight_stress.recorder );
+    for (i = 0; i < FLIGHT_STRESS_WRITERS; ++i)
+    {
+        writers[i].context = &flight_stress;
+        writers[i].writer = i + 1;
+        if (!(writer_created[i] = !pthread_create( &writer_threads[i], NULL,
+                                                    flight_stress_writer_main, &writers[i] )))
+        {
+            check( FALSE, "flight stress writer %u creation failed\n", i );
+            threads_ready = FALSE;
+            break;
+        }
+    }
+    if (threads_ready &&
+        !(snapshot_created = !pthread_create( &snapshot_thread, NULL,
+                                              flight_stress_snapshot_main, &flight_stress )))
+    {
+        check( FALSE, "flight stress snapshot creation failed\n" );
+        threads_ready = FALSE;
+    }
+    atomic_store_explicit( &flight_stress.start, 1, memory_order_release );
+    for (i = 0; i < FLIGHT_STRESS_WRITERS; ++i)
+        if (writer_created[i]) pthread_join( writer_threads[i], NULL );
+    if (snapshot_created) pthread_join( snapshot_thread, NULL );
+    if (!threads_ready) return;
+
+    accepted = atomic_load_explicit( &flight_stress.accepted, memory_order_relaxed );
+    check( !atomic_load_explicit( &flight_stress.failures, memory_order_relaxed ) &&
+           !__atomic_load_n( &flight_stress.recorder.freeze_state, __ATOMIC_ACQUIRE ) &&
+           accepted &&
+           accepted + __atomic_load_n( &flight_stress.recorder.contention_loss_count,
+                                       __ATOMIC_RELAXED ) == attempts &&
+           __atomic_load_n( &flight_stress.recorder.next_sequence, __ATOMIC_ACQUIRE ) ==
+           accepted + 1,
+           "flight MPMC snapshot/ownership stress failed accepted %llu contention %llu failures %u\n",
+           (unsigned long long)accepted,
+           (unsigned long long)__atomic_load_n( &flight_stress.recorder.contention_loss_count,
+                                                __ATOMIC_RELAXED ),
+           atomic_load_explicit( &flight_stress.failures, memory_order_relaxed ) );
+    check( xtajit64_flight_snapshot_metadata( &flight_stress.recorder, &metadata ),
+           "flight stress metadata failed\n" );
+    for (sequence = metadata.first_sequence;
+         sequence && sequence <= metadata.last_sequence; ++sequence)
+        check( xtajit64_flight_snapshot_event( &flight_stress.recorder, sequence, &event ) ==
+               XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED && event.sequence == sequence &&
+               event.detail1 == ~event.detail0,
+               "flight MPMC final snapshot failed at sequence %llu\n",
+               (unsigned long long)sequence );
+    if (failures == starting_failures) printf( "XTAJIT64_FLIGHT_MPMC_PASS\n" );
+}
+
+static void test_flight_recorder_core(void)
+{
+    struct xtajit64_flight_event event;
+    struct xtajit64_flight_snapshot_metadata metadata;
+    struct thread_engine engine = {0};
+    struct xtajit64_begin_params params = {0};
+    struct timespec timestamp;
+    ULONG_PTR layout_base, recorder_address;
+    UINT64 before, sequence;
+    UINT32 reason;
+    unsigned int starting_failures = failures;
+    unsigned int i;
+
+    timestamp.tv_sec = 1;
+    timestamp.tv_nsec = 17;
+    check( flight_timestamp_from_timespec( &timestamp ) == UINT64_C(1000000017),
+           "flight monotonic timestamp conversion failed\n" );
+    timestamp.tv_sec = UINT64_MAX / UINT64_C(1000000000);
+    timestamp.tv_nsec = UINT64_MAX % UINT64_C(1000000000);
+    check( flight_timestamp_from_timespec( &timestamp ) == XTAJIT64_FLIGHT_UNKNOWN_U64,
+           "flight monotonic timestamp accepted the unavailable sentinel\n" );
+    timestamp.tv_sec = UINT64_MAX / UINT64_C(1000000000);
+    timestamp.tv_nsec = 999999999;
+    check( flight_timestamp_from_timespec( &timestamp ) == XTAJIT64_FLIGHT_UNKNOWN_U64,
+           "flight monotonic timestamp final-add overflow was not rejected\n" );
+    timestamp.tv_sec = 0;
+    timestamp.tv_nsec = 1000000000;
+    check( flight_timestamp_from_timespec( &timestamp ) == XTAJIT64_FLIGHT_UNKNOWN_U64,
+           "flight monotonic timestamp accepted invalid nanoseconds\n" );
+
+    xtajit64_flight_event_init( &event, XTAJIT64_FLIGHT_EVENT_TRANSITION_BEGIN,
+                                 XTAJIT64_FLIGHT_SOURCE_ARM64EC_PE );
+    event.causal_boundary_id = 0x41;
+    before = __atomic_load_n( &flight_test_recorder.next_sequence, __ATOMIC_RELAXED );
+    check( !xtajit64_flight_record( NULL, &event ) &&
+           __atomic_load_n( &flight_test_recorder.next_sequence, __ATOMIC_RELAXED ) == before,
+           "disabled flight recorder changed state\n" );
+    check( !xtajit64_flight_record( &flight_test_recorder, &event ) &&
+           __atomic_load_n( &flight_test_recorder.next_sequence, __ATOMIC_RELAXED ) == before,
+           "uninitialized flight recorder changed state\n" );
+
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    __atomic_store_n( &flight_test_recorder.next_causal_boundary_id,
+                      XTAJIT64_FLIGHT_UNKNOWN_U64 - 1, __ATOMIC_RELAXED );
+    check( xtajit64_flight_next_causal_boundary_id( &flight_test_recorder ) ==
+           XTAJIT64_FLIGHT_UNKNOWN_U64 - 1 &&
+           xtajit64_flight_next_causal_boundary_id( &flight_test_recorder ) ==
+           XTAJIT64_FLIGHT_UNKNOWN_U64 &&
+           __atomic_load_n( &flight_test_recorder.freeze_reason, __ATOMIC_ACQUIRE ) ==
+           XTAJIT64_FLIGHT_REASON_RECORDER_WRAP,
+           "flight causal ID wrap reused a reserved or prior identity\n" );
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    __atomic_store_n( &flight_test_recorder.next_causal_boundary_id, 0, __ATOMIC_RELAXED );
+    check( xtajit64_flight_next_causal_boundary_id( &flight_test_recorder ) ==
+           XTAJIT64_FLIGHT_UNKNOWN_U64 &&
+           __atomic_load_n( &flight_test_recorder.freeze_reason, __ATOMIC_ACQUIRE ) ==
+           XTAJIT64_FLIGHT_REASON_RECORDER_WRAP,
+           "flight causal ID zero sentinel did not fail closed\n" );
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    recorder_address = (ULONG_PTR)&flight_test_recorder;
+    layout_base = recorder_address - 0x10000;
+    check( xtajit64_flight_validate_layout( layout_base,
+                                            0x10000 + sizeof(flight_test_recorder),
+                                            recorder_address, &flight_test_recorder ) &&
+           xtajit64_flight_validate_layout( layout_base,
+                                            0x10000 + sizeof(flight_test_recorder), 0,
+                                            NULL ) &&
+           !xtajit64_flight_validate_layout( layout_base,
+                                             0x10000 + sizeof(flight_test_recorder),
+                                             recorder_address + 64, &flight_test_recorder ) &&
+           !xtajit64_flight_validate_layout( layout_base,
+                                             0x10001 + sizeof(flight_test_recorder),
+                                             recorder_address, &flight_test_recorder ) &&
+           !xtajit64_flight_validate_layout( layout_base,
+                                             0x10000 + sizeof(flight_test_recorder),
+                                             recorder_address + 1,
+                                             (const struct xtajit64_flight_recorder *)
+                                             (recorder_address + 1) ),
+           "flight recorder layout validation accepted an unsafe placement\n" );
+    for (i = 0; i < XTAJIT64_FLIGHT_CAPACITY + 3; ++i)
+    {
+        event.detail0 = i;
+        sequence = xtajit64_flight_record( &flight_test_recorder, &event );
+        check( sequence == i + 1, "flight sequence %llu was expected %u\n",
+               (unsigned long long)sequence, i + 1 );
+    }
+    xtajit64_flight_snapshot( &flight_test_recorder, &flight_test_snapshot );
+    check( flight_test_snapshot.first_sequence == 4 &&
+           flight_test_snapshot.last_sequence == XTAJIT64_FLIGHT_CAPACITY + 3 &&
+           flight_test_snapshot.count == XTAJIT64_FLIGHT_CAPACITY &&
+           flight_test_snapshot.lost_count == 3,
+           "flight wrap snapshot %#llx-%#llx count %u lost %llu\n",
+           (unsigned long long)flight_test_snapshot.first_sequence,
+           (unsigned long long)flight_test_snapshot.last_sequence,
+           flight_test_snapshot.count,
+           (unsigned long long)flight_test_snapshot.lost_count );
+    for (i = 0; i < XTAJIT64_FLIGHT_CAPACITY; ++i)
+        check( flight_test_snapshot.states[i] == XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED &&
+               flight_test_snapshot.events[i].sequence == i + 4 &&
+               flight_test_snapshot.events[i].detail0 == i + 3,
+               "flight snapshot ordering failed at slot %u\n", i );
+
+    check( xtajit64_flight_snapshot_metadata( &flight_test_recorder, &metadata ) &&
+           metadata.first_sequence == 4 &&
+           metadata.historical_loss_count == 3,
+           "flight metadata did not expose wrap loss\n" );
+    __atomic_store_n( &flight_test_recorder.events[
+                          metadata.last_sequence & (XTAJIT64_FLIGHT_CAPACITY - 1)].publication_sequence,
+                      0, __ATOMIC_RELEASE );
+    check( xtajit64_flight_snapshot_event( &flight_test_recorder, metadata.last_sequence,
+                                           &event ) ==
+           XTAJIT64_FLIGHT_SNAPSHOT_UNCOMMITTED,
+           "flight snapshot did not detect invalidated writer slot\n" );
+    __atomic_store_n( &flight_test_recorder.events[
+                          metadata.last_sequence & (XTAJIT64_FLIGHT_CAPACITY - 1)].publication_sequence,
+                      metadata.last_sequence + XTAJIT64_FLIGHT_CAPACITY, __ATOMIC_RELEASE );
+    check( xtajit64_flight_snapshot_event( &flight_test_recorder, metadata.last_sequence,
+                                           &event ) ==
+           XTAJIT64_FLIGHT_SNAPSHOT_OVERWRITTEN,
+           "flight snapshot did not detect overwritten writer slot\n" );
+    __atomic_store_n( &flight_test_recorder.events[
+                          metadata.last_sequence & (XTAJIT64_FLIGHT_CAPACITY - 1)].publication_sequence,
+                      metadata.last_sequence, __ATOMIC_RELEASE );
+    __atomic_store_n( &flight_test_recorder.slot_owners[
+                          metadata.last_sequence & (XTAJIT64_FLIGHT_CAPACITY - 1)],
+                      metadata.last_sequence + XTAJIT64_FLIGHT_CAPACITY |
+                      XTAJIT64_FLIGHT_OWNER_BUSY, __ATOMIC_RELEASE );
+    check( xtajit64_flight_snapshot_event( &flight_test_recorder, metadata.last_sequence,
+                                           &event ) ==
+           XTAJIT64_FLIGHT_SNAPSHOT_OVERWRITTEN,
+           "flight snapshot accepted an old publication during next-generation claim\n" );
+    __atomic_store_n( &flight_test_recorder.slot_owners[
+                          metadata.last_sequence & (XTAJIT64_FLIGHT_CAPACITY - 1)],
+                      metadata.last_sequence + XTAJIT64_FLIGHT_CAPACITY, __ATOMIC_RELEASE );
+    __atomic_store_n( &flight_test_recorder.contention_loss_count, ~(UINT64)0,
+                      __ATOMIC_RELAXED );
+    xtajit64_flight_snapshot( &flight_test_recorder, &flight_test_snapshot );
+    check( flight_test_snapshot.lost_count == ~(UINT64)0,
+           "flight loss counter did not saturate\n" );
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+
+    reason = xtajit64_flight_validate_context( CONTEXT_AMD64_CONTROL |
+                                                CONTEXT_AMD64_INTEGER,
+                                                CONTEXT_AMD64_FULL |
+                                                CONTEXT_AMD64_FLOATING_POINT,
+                                                0x1f80, 0x1f80, 0x1000, 0x2000,
+                                                XTAJIT64_X64_USER_ADDRESS_MAX,
+                                                0x1000, 0x3000,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64 );
+    check( reason == XTAJIT64_FLIGHT_REASON_CONTEXT_FLAGS,
+           "flight context flags watchdog returned %u\n", reason );
+    reason = xtajit64_flight_validate_context( 0,
+                                                CONTEXT_AMD64_FULL |
+                                                CONTEXT_AMD64_FLOATING_POINT,
+                                                0x1f80, 0x1f80, 0x1000, 0x2000,
+                                                XTAJIT64_X64_USER_ADDRESS_MAX,
+                                                0x1000, 0x3000,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64 );
+    check( reason == XTAJIT64_FLIGHT_REASON_CONTEXT_FLAGS,
+           "flight known zero context flags passed required bits\n" );
+    reason = xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                                0x1f80, 0x1234, 0x1000, 0x2000,
+                                                XTAJIT64_X64_USER_ADDRESS_MAX,
+                                                0x1000, 0x3000,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                                XTAJIT64_FLIGHT_UNKNOWN_U64 );
+    check( reason == XTAJIT64_FLIGHT_REASON_CONTEXT_MXCSR,
+           "flight MXCSR watchdog returned %u\n", reason );
+    reason = xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                                0x1f80, 0x1f80, 0x1000, 0x1000,
+                                                XTAJIT64_X64_USER_ADDRESS_MAX,
+                                                0x1000, 0x3000, 0x5000, 0x5000,
+                                                0x2000 );
+    check( reason == XTAJIT64_FLIGHT_REASON_CONTINUATION_PAIR,
+           "flight continuation watchdog returned %u\n", reason );
+    check( xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                              0x1f80, 0x1f80, 0, 0x2000,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX,
+                                              0x1000, 0x3000,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_RIP &&
+           xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                              0x1f80, 0x1f80,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX + 1, 0x2000,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX,
+                                              0x1000, 0x3000,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_RIP,
+           "flight RIP address bounds watchdog failed\n" );
+    check( xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                              0x1f80, 0x1f80, 0x1000, 0,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX,
+                                              0x1000, 0x3000,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_RSP &&
+           xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                              0x1f80, 0x1f80, 0x1000,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX + 1,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX,
+                                              0x1000, 0x3000,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_RSP,
+           "flight RSP address bounds watchdog failed\n" );
+    check( xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                              0x1f80, 0x1f80, 0x1000, 0x2000,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX,
+                                              0x3000, 0x1000,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_STACK &&
+           xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                              0x1f80, 0x1f80, 0x1000, 0x0fff,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX,
+                                              0x1000, 0x3000,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_STACK &&
+           xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                              0x1f80, 0x1f80, 0x1000, 0x3000,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX,
+                                              0x1000, 0x3000,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_STACK &&
+           xtajit64_flight_validate_context( XTAJIT64_FLIGHT_UNKNOWN_U32, 0,
+                                              0x1f80, 0x1f80, 0x1000, 0x2000,
+                                              XTAJIT64_X64_USER_ADDRESS_MAX,
+                                              0x1000, 0x3000,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64,
+                                              XTAJIT64_FLIGHT_UNKNOWN_U64 ) ==
+           XTAJIT64_FLIGHT_REASON_NONE,
+           "flight stack-range watchdog failed\n" );
+    check( xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_UNKNOWN,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+                                         0x1111, 0x1111 ) ==
+           XTAJIT64_FLIGHT_REASON_NONE &&
+           xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_UNKNOWN,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+                                         0x1111, 0x2222 ) ==
+           XTAJIT64_FLIGHT_REASON_X18_VALUE,
+           "flight x18 UNKNOWN semantics inferred a mode\n" );
+    check( xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_ENABLED,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_NATIVE_SYSTEM,
+                                         0, 0x1111 ) == XTAJIT64_FLIGHT_REASON_X18_MODE &&
+           xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_DISABLED,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_NATIVE_SYSTEM,
+                                         0, 0x1111 ) == XTAJIT64_FLIGHT_REASON_NONE &&
+           xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_DISABLED,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_NATIVE_SYSTEM,
+                                         0x9999, 0x1111 ) == XTAJIT64_FLIGHT_REASON_NONE &&
+           xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_UNKNOWN,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_NATIVE_SYSTEM,
+                                         0x9999, 0x1111 ) == XTAJIT64_FLIGHT_REASON_NONE,
+           "flight native-system x18 mode/value separation failed\n" );
+    check( xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_ENABLED,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+                                         0x1111, 0x1111 ) == XTAJIT64_FLIGHT_REASON_NONE &&
+           xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_ENABLED,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+                                         0x2222, 0x1111 ) == XTAJIT64_FLIGHT_REASON_X18_VALUE &&
+           xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_DISABLED,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+                                         0x1111, 0x1111 ) == XTAJIT64_FLIGHT_REASON_X18_MODE &&
+           xtajit64_flight_validate_x18( XTAJIT64_FLIGHT_X18_MODE_UNKNOWN,
+                                         XTAJIT64_FLIGHT_X18_EXPECTATION_PE_ARM64EC,
+                                         0x2222, 0x1111 ) == XTAJIT64_FLIGHT_REASON_X18_VALUE,
+           "flight PE x18 mode/value separation failed\n" );
+    check( xtajit64_flight_validate_pe_x18_claim( 0x1111, 0x1111 ) ==
+           XTAJIT64_FLIGHT_REASON_NONE &&
+           xtajit64_flight_validate_pe_x18_claim( 0x2222, 0x1111 ) ==
+           XTAJIT64_FLIGHT_REASON_X18_VALUE &&
+           xtajit64_flight_validate_pe_x18_claim( 0, 0x1111 ) ==
+           XTAJIT64_FLIGHT_REASON_X18_VALUE &&
+           xtajit64_flight_validate_pe_x18_claim( XTAJIT64_FLIGHT_UNKNOWN_U64, 0x1111 ) ==
+           XTAJIT64_FLIGHT_REASON_X18_VALUE,
+           "flight PE x18 claim authentication accepted an invalid value\n" );
+    check( xtajit64_flight_validate_private_control_stack( 0x1800, 0x1000, 0x2000,
+                                                            0x3000, 0x4000 ) ==
+           XTAJIT64_FLIGHT_REASON_NONE &&
+           xtajit64_flight_validate_private_control_stack( 0x1800, 0x2000, 0x1000,
+                                                            0x3000, 0x4000 ) ==
+           XTAJIT64_FLIGHT_REASON_TRANSITION_STACK &&
+           xtajit64_flight_validate_private_control_stack( 0x2000, 0x1000, 0x2000,
+                                                            0x3000, 0x4000 ) ==
+           XTAJIT64_FLIGHT_REASON_TRANSITION_STACK &&
+           xtajit64_flight_validate_private_control_stack( 0x1800, 0x1000, 0x3000,
+                                                            0x2000, 0x4000 ) ==
+           XTAJIT64_FLIGHT_REASON_TRANSITION_STACK,
+           "flight private-control-stack watchdog failed\n" );
+    /* Simulate the next MAPPING_MISS retry reusing begin_params.  IMPORT is
+     * input-side evidence, so it must not inherit that prior output reason. */
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    engine.flight_recorder = &flight_test_recorder;
+    params.context.rip = 0x1000;
+    params.context.rsp = 0x2000;
+    params.context.mxcsr = 0x1f80;
+    params.stack_limit = 0x1000;
+    params.stack_base = 0x3000;
+    params.stop_reason = XTAJIT64_STOP_MAPPING_MISS;
+    flight_record_context_event( &engine, XTAJIT64_FLIGHT_EVENT_CONTEXT_IMPORT,
+                                 &params, XTAJIT64_FLIGHT_REASON_NONE );
+    check( xtajit64_flight_snapshot_event( &flight_test_recorder, 1, &event ) ==
+           XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED &&
+           event.event_type == XTAJIT64_FLIGHT_EVENT_CONTEXT_IMPORT &&
+           event.stop_reason == XTAJIT64_FLIGHT_UNKNOWN_U32,
+           "flight retry import inherited terminal stop reason %u\n", event.stop_reason );
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    check( xtajit64_flight_freeze( &flight_test_recorder,
+                                   XTAJIT64_FLIGHT_REASON_CONTEXT_MXCSR ) &&
+           !xtajit64_flight_freeze( &flight_test_recorder,
+                                    XTAJIT64_FLIGHT_REASON_X18_VALUE ) &&
+           !xtajit64_flight_recorder_is_active( &flight_test_recorder ) &&
+           __atomic_load_n( &flight_test_recorder.freeze_reason, __ATOMIC_ACQUIRE ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_MXCSR,
+           "flight first-violation freeze was not stable\n" );
+    if (failures == starting_failures) printf( "XTAJIT64_FLIGHT_CORE_PASS\n" );
+}
+
+static void test_flight_atomic_trace(void)
+{
+    struct xtajit64_flight_event exit_event, reentry_event;
+    struct thread_engine engine = {0};
+    uc_engine *uc = NULL;
+    uint64_t rip = UINT64_C(0x1234567812345678);
+    uint64_t rsp = UINT64_C(0x0000001020004000);
+    uc_err err;
+    unsigned int starting_failures = failures;
+
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    engine.flight_recorder = &flight_test_recorder;
+    engine.flight_binding_id = 0x51;
+    engine.flight_causal_boundary_id = 0x61;
+    engine.flight_guest_rip = 0x71;
+    engine.flight_guest_rsp = 0x81;
+    engine.diagnostic_id = 0x91;
+    engine.execution_generation = 0xa1;
+
+    err = uc_open( UC_ARCH_X86, UC_MODE_64, &uc );
+    check( err == UC_ERR_OK, "flight atomic trace engine open failed: %s\n",
+           uc_strerror( err ) );
+    if (err != UC_ERR_OK) goto done;
+    err = uc_reg_write( uc, UC_X86_REG_RIP, &rip );
+    if (err == UC_ERR_OK) err = uc_reg_write( uc, UC_X86_REG_RSP, &rsp );
+    check( err == UC_ERR_OK, "flight atomic trace register setup failed: %s\n",
+           uc_strerror( err ) );
+    if (err != UC_ERR_OK) goto done;
+
+    shared_memory_atomic_hook( uc, (uc_shared_memory_atomic_phase)0, &engine );
+    shared_memory_atomic_hook( uc, UC_SHARED_MEMORY_ATOMIC_EXIT, &engine );
+    shared_memory_atomic_hook( uc, UC_SHARED_MEMORY_ATOMIC_REENTRY, &engine );
+    check( xtajit64_flight_snapshot_event( &flight_test_recorder, 1, &exit_event ) ==
+               XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED &&
+           xtajit64_flight_snapshot_event( &flight_test_recorder, 2, &reentry_event ) ==
+               XTAJIT64_FLIGHT_SNAPSHOT_COMMITTED &&
+           exit_event.event_type == XTAJIT64_FLIGHT_EVENT_ATOMIC_EXIT &&
+           reentry_event.event_type == XTAJIT64_FLIGHT_EVENT_ATOMIC_REENTRY &&
+           exit_event.guest_rip == rip && exit_event.guest_rsp == rsp &&
+           reentry_event.guest_rip == rip && reentry_event.guest_rsp == rsp &&
+           exit_event.binding_id == engine.flight_binding_id &&
+           reentry_event.causal_boundary_id == engine.flight_causal_boundary_id,
+           "flight serial-atomic events lost phase or exact RIP/RSP evidence\n" );
+
+done:
+    if (uc) uc_close( uc );
+    if (failures == starting_failures) printf( "XTAJIT64_FLIGHT_ATOMIC_TRACE_PASS\n" );
+}
+
+static void test_flight_recorder_contracts(void)
+{
+    struct xtajit64_flight_event event, first;
+    struct xtajit64_flight_scratch *scratch[XTAJIT64_FLIGHT_SCRATCH_SLOTS];
+    struct xtajit64_flight_scratch *exhausted_scratch;
+    struct xtajit64_flight_event *held_slot;
+    struct xtajit64_flight_snapshot_metadata metadata;
+    UINT64 held_sequence, sequence;
+    unsigned int starting_failures = failures;
+    UINT32 i;
+
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    xtajit64_flight_event_init( &event, XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN,
+                                 XTAJIT64_FLIGHT_SOURCE_UNIX_PROVIDER );
+    check( xtajit64_flight_claim_slot( &flight_test_recorder, &held_sequence, &held_slot ) &&
+           held_sequence == 1,
+           "flight deterministic owner claim failed\n" );
+    for (i = 2; i <= XTAJIT64_FLIGHT_CAPACITY; ++i)
+        check( xtajit64_flight_record( &flight_test_recorder, &event ) == i,
+               "flight deterministic fill failed at sequence %u\n", i );
+    check( !xtajit64_flight_record( &flight_test_recorder, &event ) &&
+           __atomic_load_n( &flight_test_recorder.next_sequence, __ATOMIC_ACQUIRE ) ==
+           XTAJIT64_FLIGHT_CAPACITY + 1 &&
+           __atomic_load_n( &flight_test_recorder.contention_loss_count,
+                            __ATOMIC_RELAXED ) == 1,
+           "flight blocked next-generation slot advanced or lost accounting\n" );
+    xtajit64_flight_release_slot( &flight_test_recorder, held_slot, held_sequence );
+    sequence = xtajit64_flight_record( &flight_test_recorder, &event );
+    check( sequence == XTAJIT64_FLIGHT_CAPACITY + 1,
+           "flight released next-generation slot did not recover\n" );
+
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    for (i = 0; i < XTAJIT64_FLIGHT_SCRATCH_SLOTS; ++i)
+        check( xtajit64_flight_acquire_scratch( &flight_test_recorder, &scratch[i] ),
+               "flight scratch slot %u was unavailable\n", i );
+    exhausted_scratch = (void *)(ULONG_PTR)0x1;
+    check( !xtajit64_flight_acquire_scratch( &flight_test_recorder, &exhausted_scratch ) &&
+           !exhausted_scratch &&
+           __atomic_load_n( &flight_test_recorder.scratch_loss_count, __ATOMIC_RELAXED ) == 1,
+           "flight scratch exhaustion was not reported\n" );
+    for (i = 0; i < XTAJIT64_FLIGHT_SCRATCH_SLOTS; ++i)
+        xtajit64_flight_release_scratch( scratch[i] );
+    check( xtajit64_flight_acquire_scratch( &flight_test_recorder, &scratch[0] ),
+           "flight scratch slot did not recover after release\n" );
+    xtajit64_flight_release_scratch( scratch[0] );
+
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    check( xtajit64_flight_record( &flight_test_recorder, &event ) == 1 &&
+           xtajit64_flight_freeze( &flight_test_recorder,
+                                   XTAJIT64_FLIGHT_REASON_TERMINAL_ABORT ),
+           "flight frozen-window setup failed\n" );
+    /* Model the only remaining freeze-gate race deterministically: a writer
+     * sampled ACTIVE, then reserves ticket 2 after the freezer captured its
+     * cut-off.  Snapshot metadata must retain sequence 1 as the end of causal
+     * history even though next_sequence subsequently advances. */
+    sequence = 2;
+    check( __atomic_compare_exchange_n( &flight_test_recorder.next_sequence, &sequence, 3,
+                                        FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ) &&
+           xtajit64_flight_snapshot_metadata( &flight_test_recorder, &metadata ) &&
+           metadata.frozen_sequence == 1 && metadata.last_sequence == 1,
+           "flight frozen-window metadata did not cap a late ticket\n" );
+    xtajit64_flight_snapshot( &flight_test_recorder, &flight_test_snapshot );
+    check( flight_test_snapshot.first_sequence == 1 && flight_test_snapshot.last_sequence == 1 &&
+           flight_test_snapshot.count == 1 &&
+           flight_test_snapshot.events[0].sequence == 1,
+           "flight late ticket was rendered as frozen causal history\n" );
+
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    xtajit64_flight_event_init( &event, XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION,
+                                 XTAJIT64_FLIGHT_SOURCE_ARM64EC_PE );
+    event.reason = XTAJIT64_FLIGHT_REASON_NONE;
+    event.detail0 = 0xfeed;
+    check( xtajit64_flight_record_and_freeze( &flight_test_recorder, &event,
+                                               XTAJIT64_FLIGHT_REASON_CONTEXT_FLAGS ) &&
+           !xtajit64_flight_record_and_freeze( &flight_test_recorder, &event,
+                                                XTAJIT64_FLIGHT_REASON_X18_VALUE ) &&
+           xtajit64_flight_snapshot_metadata( &flight_test_recorder, &metadata ) &&
+           metadata.first_violation_available &&
+           xtajit64_flight_snapshot_first_violation( &flight_test_recorder, &first ) &&
+           first.reason == XTAJIT64_FLIGHT_REASON_CONTEXT_FLAGS && first.sequence == 1 &&
+           first.detail0 == 0xfeed,
+           "flight first watchdog winner was not atomically preserved\n" );
+
+    xtajit64_flight_recorder_init( &flight_test_recorder );
+    xtajit64_flight_event_init( &event, XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_PUSH,
+                                 XTAJIT64_FLIGHT_SOURCE_ARM64EC_PE );
+    event.transition_frame_kind = XTAJIT64_FLIGHT_FRAME_ENTRY;
+    event.transition_depth_before = 0;
+    event.transition_depth_after = 1;
+    event.guest_rsp = 0x8000;
+    event.detail0 = 0x1800;
+    event.detail1 = 0x5000;
+    xtajit64_flight_record( &flight_test_recorder, &event );
+    event.transition_frame_kind = XTAJIT64_FLIGHT_FRAME_EXIT;
+    event.transition_depth_before = 1;
+    event.transition_depth_after = 2;
+    event.guest_rsp = 0x7ff0;
+    event.detail0 = 0x1810;
+    event.detail1 = 0x5010;
+    xtajit64_flight_record( &flight_test_recorder, &event );
+    event.event_type = XTAJIT64_FLIGHT_EVENT_TRANSITION_UNWIND;
+    event.transition_depth_before = 2;
+    event.transition_depth_after = 1;
+    xtajit64_flight_record( &flight_test_recorder, &event );
+    event.event_type = XTAJIT64_FLIGHT_EVENT_TRANSITION_RECONCILE;
+    event.transition_frame_kind = XTAJIT64_FLIGHT_FRAME_ENTRY;
+    event.transition_depth_before = 1;
+    event.transition_depth_after = 0;
+    event.guest_rsp = 0x8000;
+    event.detail0 = 0x1800;
+    event.detail1 = 0x5000;
+    xtajit64_flight_record( &flight_test_recorder, &event );
+    xtajit64_flight_snapshot( &flight_test_recorder, &flight_test_snapshot );
+    check( flight_test_snapshot.count == 4 &&
+           flight_test_snapshot.events[0].event_type ==
+           XTAJIT64_FLIGHT_EVENT_TRANSITION_FRAME_PUSH &&
+           flight_test_snapshot.events[0].transition_frame_kind == XTAJIT64_FLIGHT_FRAME_ENTRY &&
+           flight_test_snapshot.events[0].transition_depth_before == 0 &&
+           flight_test_snapshot.events[0].transition_depth_after == 1 &&
+           flight_test_snapshot.events[1].transition_frame_kind == XTAJIT64_FLIGHT_FRAME_EXIT &&
+           flight_test_snapshot.events[1].transition_depth_before == 1 &&
+           flight_test_snapshot.events[1].transition_depth_after == 2 &&
+           flight_test_snapshot.events[2].event_type ==
+           XTAJIT64_FLIGHT_EVENT_TRANSITION_UNWIND &&
+           flight_test_snapshot.events[2].transition_depth_before == 2 &&
+           flight_test_snapshot.events[2].transition_depth_after == 1 &&
+           flight_test_snapshot.events[3].event_type ==
+           XTAJIT64_FLIGHT_EVENT_TRANSITION_RECONCILE &&
+           flight_test_snapshot.events[3].transition_depth_before == 1 &&
+           flight_test_snapshot.events[3].transition_depth_after == 0 &&
+           flight_test_snapshot.events[2].detail0 == 0x1810 &&
+           flight_test_snapshot.events[2].detail1 == 0x5010,
+           "flight nested/non-local transition-frame sequence was not preserved\n" );
+    if (failures == starting_failures) printf( "XTAJIT64_FLIGHT_CONTRACTS_PASS\n" );
+}
+
+static void test_flight_provider_boundary(void)
+{
+    unsigned char *recorder_pages = test_pages + 12 * TEST_PAGE;
+    unsigned char *stack_page = test_pages + 14 * TEST_PAGE;
+    unsigned char *invalid_code_page = test_pages + 11 * TEST_PAGE;
+    void *recorder2_pages = MAP_FAILED;
+    struct xtajit64_flight_recorder *recorder =
+        (struct xtajit64_flight_recorder *)recorder_pages;
+    struct xtajit64_flight_recorder *recorder2;
+    struct xtajit64_flight_bind_params binding = {0};
+    struct xtajit64_begin_params params;
+    struct xtajit64_memory_params flush =
+    {
+        .guest = (uintptr_t)invalid_code_page,
+        .size = TEST_PAGE,
+    };
+    const struct xtajit64_flight_event *bind, *acquire, *import, *begin;
+    const struct xtajit64_flight_event *stop, *export, *release;
+    const struct xtajit64_flight_event *invalid_stop, *invalid_export;
+    const struct xtajit64_flight_event *interrupt_stop;
+    struct xtajit64_flight_event first_violation;
+    UINT64 binding_id, causal_boundary_id, unix_teb, wrong_teb;
+    NTSTATUS status;
+    unsigned int starting_failures = failures;
+    BOOL recorder_mapped = FALSE, recorder2_mapped = FALSE, stack_mapped = FALSE, ec_mapped = FALSE;
+    BOOL invalid_code_mapped = FALSE;
+    BOOL teb_mapped = FALSE, thread_initialized = FALSE;
+
+    check( sizeof(*recorder) <= 2 * TEST_PAGE,
+           "flight recorder %lu exceeds test mapping\n", (unsigned long)sizeof(*recorder) );
+    status = reset_test_provider();
+    if (!status) status = register_identity_page( (void *)(uintptr_t)test_ec_target,
+                                                   PAGE_EXECUTE_READ );
+    if (!status) ec_mapped = TRUE;
+    if (!status) status = register_identity_page( (void *)(uintptr_t)test_teb, PAGE_READWRITE );
+    if (!status) teb_mapped = TRUE;
+    if (!status)
+        status = register_identity_range( recorder_pages, 2 * TEST_PAGE, PAGE_READWRITE );
+    if (!status) recorder_mapped = TRUE;
+    if (!status)
+    {
+        recorder2_pages = mmap( NULL, 2 * TEST_PAGE, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANON, -1, 0 );
+        if (recorder2_pages == MAP_FAILED ||
+            (uintptr_t)recorder2_pages > XTAJIT64_X64_USER_ADDRESS_MAX)
+            status = STATUS_NO_MEMORY;
+        else status = register_identity_range( recorder2_pages, 2 * TEST_PAGE, PAGE_READWRITE );
+    }
+    if (!status) recorder2_mapped = TRUE;
+    if (!status) status = register_identity_page( stack_page, PAGE_READWRITE );
+    if (!status) stack_mapped = TRUE;
+    if (!status)
+    {
+        memset( invalid_code_page, 0x90, TEST_PAGE );
+        invalid_code_page[0] = 0x0f;  /* UD2: route through the invalid-insn path. */
+        invalid_code_page[1] = 0x0b;
+        status = register_identity_page( invalid_code_page, PAGE_EXECUTE_READ );
+    }
+    if (!status) invalid_code_mapped = TRUE;
+    if (!status) status = thread_init( NULL );
+    if (!status) thread_initialized = TRUE;
+    check( !status, "flight provider setup returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+
+    xtajit64_flight_recorder_init( recorder );
+    recorder2 = recorder2_pages;
+    xtajit64_flight_recorder_init( recorder2 );
+    unix_teb = (UINT64)(ULONG_PTR)NtCurrentTeb();
+    check( unix_teb && unix_teb != XTAJIT64_FLIGHT_UNKNOWN_U64,
+           "flight Unix TEB authority was unavailable\n" );
+    if (!unix_teb || unix_teb == XTAJIT64_FLIGHT_UNKNOWN_U64) goto done;
+    initialize_begin_parameters( &params, test_ec_target, (uintptr_t)stack_page );
+    binding.recorder = (uintptr_t)recorder;
+    binding.causal_boundary_id = 0x9a17;
+    binding.context_generation = 1;
+    binding.transition_generation = 7;
+    binding.claimed_teb = unix_teb;
+    binding.guest_rip = params.context.rip;
+    binding.guest_rsp = params.context.rsp;
+    binding.guest_stack_limit = params.stack_limit;
+    binding.guest_stack_base = params.stack_base;
+    binding.control_stack_limit = (uintptr_t)recorder_pages;
+    binding.control_stack_top = (uintptr_t)recorder_pages + 2 * TEST_PAGE;
+    status = flight_bind( &binding );
+    check( !status, "flight binding returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+    binding.context_generation = 2;
+    status = flight_bind( &binding );
+    check( !status, "flight binding refresh returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+
+    status = begin_simulation( &params );
+    check( !status && params.stop_reason == XTAJIT64_STOP_EC_TRANSITION,
+           "flight provider simulation returned %#x stop %u\n",
+           (unsigned int)status, params.stop_reason );
+    xtajit64_flight_snapshot( recorder, &flight_test_snapshot );
+    bind = find_flight_event( XTAJIT64_FLIGHT_EVENT_BINDING, binding.causal_boundary_id );
+    acquire = find_flight_event( XTAJIT64_FLIGHT_EVENT_ENGINE_ACQUIRE,
+                                 binding.causal_boundary_id );
+    import = find_flight_event( XTAJIT64_FLIGHT_EVENT_CONTEXT_IMPORT,
+                                binding.causal_boundary_id );
+    begin = find_flight_event( XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN,
+                               binding.causal_boundary_id );
+    stop = find_flight_event( XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP,
+                              binding.causal_boundary_id );
+    export = find_flight_event( XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT,
+                                binding.causal_boundary_id );
+    release = find_flight_event( XTAJIT64_FLIGHT_EVENT_ENGINE_RELEASE,
+                                 binding.causal_boundary_id );
+    check( bind && acquire && import && begin && stop && export && release,
+           "flight provider boundary events missing bind %p acquire %p import %p begin %p "
+           "stop %p export %p release %p\n", bind, acquire, import, begin, stop,
+           export, release );
+    if (bind && acquire && import && begin && stop && export && release)
+    {
+        binding_id = bind->binding_id;
+        causal_boundary_id = bind->causal_boundary_id;
+        check( binding_id && acquire->binding_id == binding_id &&
+               import->binding_id == binding_id && begin->binding_id == binding_id &&
+               stop->binding_id == binding_id && export->binding_id == binding_id &&
+               release->binding_id == binding_id &&
+               causal_boundary_id == binding.causal_boundary_id &&
+               bind->guest_rsp == binding.guest_rsp &&
+               begin->guest_stack_limit == binding.guest_stack_limit &&
+               begin->guest_stack_base == binding.guest_stack_base &&
+               begin->control_stack_limit == binding.control_stack_limit &&
+               begin->control_stack_top == binding.control_stack_top &&
+               bind->expected_teb == unix_teb && bind->saved_x18_value == unix_teb &&
+               (__atomic_load_n( &recorder->authenticated_teb, __ATOMIC_ACQUIRE ) == unix_teb) &&
+               stop->guest_rsp == params.context.rsp,
+               "flight provider identity/stack data was not preserved\n" );
+    }
+
+    /* The terminal recorder events must see the ordinary stop-reason
+     * normalization, not the pre-normalization NONE left by uc_emu_start(). */
+    initialize_begin_parameters( &params, (uintptr_t)invalid_code_page,
+                                 (uintptr_t)stack_page );
+    binding.causal_boundary_id = 0x9a19;
+    binding.context_generation = 3;
+    binding.transition_generation = 8;
+    binding.guest_rip = params.context.rip;
+    binding.guest_rsp = params.context.rsp;
+    binding.guest_stack_limit = params.stack_limit;
+    binding.guest_stack_base = params.stack_base;
+    status = flight_bind( &binding );
+    check( !status, "flight invalid-instruction binding returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+    status = begin_simulation( &params );
+    check( status == STATUS_NOT_SUPPORTED &&
+           params.stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION,
+           "flight invalid instruction returned %#x stop %u\n",
+           (unsigned int)status, params.stop_reason );
+    xtajit64_flight_snapshot( recorder, &flight_test_snapshot );
+    invalid_stop = find_flight_event( XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP,
+                                      binding.causal_boundary_id );
+    invalid_export = find_flight_event( XTAJIT64_FLIGHT_EVENT_CONTEXT_EXPORT,
+                                        binding.causal_boundary_id );
+    check( invalid_stop && invalid_export &&
+           invalid_stop->stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION &&
+           invalid_export->stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION,
+           "flight invalid-instruction terminal events lost stop reason stop %p/%u export %p/%u\n",
+           invalid_stop, invalid_stop ? invalid_stop->stop_reason : XTAJIT64_FLIGHT_UNKNOWN_U32,
+           invalid_export, invalid_export ? invalid_export->stop_reason : XTAJIT64_FLIGHT_UNKNOWN_U32 );
+
+    /* UC_HOOK_INTR distinguishes INT 2e (syscall bridge) from every other
+     * interrupt.  Preserve the latter's exact number rather than only its
+     * normalized INVALID_INSTRUCTION terminal reason. */
+    memset( invalid_code_page, 0x90, TEST_PAGE );
+    invalid_code_page[0] = 0xcd;  /* INT 80 */
+    invalid_code_page[1] = 0x80;
+    check( !flush_instruction_cache( &flush ),
+           "flight interrupt code flush failed\n" );
+    initialize_begin_parameters( &params, (uintptr_t)invalid_code_page,
+                                 (uintptr_t)stack_page );
+    binding.causal_boundary_id = 0x9a1a;
+    binding.context_generation = 4;
+    binding.transition_generation = 9;
+    binding.guest_rip = params.context.rip;
+    binding.guest_rsp = params.context.rsp;
+    binding.guest_stack_limit = params.stack_limit;
+    binding.guest_stack_base = params.stack_base;
+    status = flight_bind( &binding );
+    check( !status, "flight interrupt binding returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+    status = begin_simulation( &params );
+    check( status == STATUS_NOT_SUPPORTED &&
+           params.stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION,
+           "flight interrupt returned %#x stop %u\n", (unsigned int)status,
+           params.stop_reason );
+    xtajit64_flight_snapshot( recorder, &flight_test_snapshot );
+    interrupt_stop = find_flight_event( XTAJIT64_FLIGHT_EVENT_PROVIDER_STOP,
+                                        binding.causal_boundary_id );
+    check( interrupt_stop && interrupt_stop->detail0 == 0x80 &&
+           interrupt_stop->stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION &&
+           interrupt_stop->guest_rip == (uintptr_t)invalid_code_page + 2 &&
+           interrupt_stop->guest_rsp == params.context.rsp,
+           "flight interrupt evidence missing event %p int %#llx stop %u rip %#llx rsp %#llx\n",
+           interrupt_stop, (unsigned long long)(interrupt_stop ? interrupt_stop->detail0 : 0),
+           interrupt_stop ? interrupt_stop->stop_reason : XTAJIT64_FLIGHT_UNKNOWN_U32,
+           (unsigned long long)(interrupt_stop ? interrupt_stop->guest_rip : 0),
+           (unsigned long long)(interrupt_stop ? interrupt_stop->guest_rsp : 0) );
+
+    binding.recorder = 0;
+    status = flight_bind( &binding );
+    check( !status, "flight unbind returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+    binding.recorder = (uintptr_t)recorder2;
+    binding.causal_boundary_id = 0x9a18;
+    binding.context_generation = 1;
+    binding.control_stack_limit = (uintptr_t)recorder2_pages;
+    binding.control_stack_top = (uintptr_t)recorder2_pages + 2 * TEST_PAGE;
+    status = flight_bind( &binding );
+    check( !status && !__atomic_load_n( &recorder2->freeze_state, __ATOMIC_ACQUIRE ),
+           "flight rebind to new recorder rejected generation one %#x/%u\n",
+           (unsigned int)status,
+           __atomic_load_n( &recorder2->freeze_state, __ATOMIC_ACQUIRE ) );
+    if (status) goto done;
+    binding.context_generation = 1;  /* stale publication must freeze once. */
+    status = flight_bind( &binding );
+    check( !status && __atomic_load_n( &recorder2->freeze_state, __ATOMIC_ACQUIRE ) == 1 &&
+           __atomic_load_n( &recorder2->freeze_reason, __ATOMIC_ACQUIRE ) ==
+           XTAJIT64_FLIGHT_REASON_CONTEXT_STALE_PUBLICATION,
+           "flight stale binding generation was not frozen %#x/%u\n",
+           (unsigned int)status,
+           __atomic_load_n( &recorder2->freeze_reason, __ATOMIC_ACQUIRE ) );
+
+    binding.recorder = 0;
+    status = flight_bind( &binding );
+    check( !status, "flight unbind before TEB mismatch returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+    xtajit64_flight_recorder_init( recorder2 );
+    binding.recorder = (uintptr_t)recorder2;
+    binding.context_generation = 1;
+    wrong_teb = unix_teb ^ UINT64_C(0x10);
+    binding.claimed_teb = wrong_teb;
+    status = flight_bind( &binding );
+    check( !status && __atomic_load_n( &recorder2->freeze_state, __ATOMIC_ACQUIRE ) == 1 &&
+           __atomic_load_n( &recorder2->freeze_reason, __ATOMIC_ACQUIRE ) ==
+           XTAJIT64_FLIGHT_REASON_X18_VALUE,
+           "flight wrong PE TEB claim was not frozen %#x/%u\n", (unsigned int)status,
+           __atomic_load_n( &recorder2->freeze_reason, __ATOMIC_ACQUIRE ) );
+    check( xtajit64_flight_snapshot_first_violation( recorder2, &first_violation ) &&
+           first_violation.event_type == XTAJIT64_FLIGHT_EVENT_BINDING &&
+           first_violation.reason == XTAJIT64_FLIGHT_REASON_X18_VALUE &&
+           first_violation.saved_x18_value == wrong_teb &&
+           first_violation.expected_teb == unix_teb &&
+           __atomic_load_n( &recorder2->authenticated_teb, __ATOMIC_ACQUIRE ) == unix_teb,
+           "flight TEB claim and Unix authority were not independently recorded\n" );
+
+    binding.recorder = 0;
+    status = flight_bind( &binding );
+    check( !status, "flight unbind before NULL TEB claim returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+    xtajit64_flight_recorder_init( recorder2 );
+    binding.recorder = (uintptr_t)recorder2;
+    binding.context_generation = 1;
+    binding.claimed_teb = 0;
+    status = flight_bind( &binding );
+    check( !status && __atomic_load_n( &recorder2->freeze_state, __ATOMIC_ACQUIRE ) == 1 &&
+           __atomic_load_n( &recorder2->freeze_reason, __ATOMIC_ACQUIRE ) ==
+           XTAJIT64_FLIGHT_REASON_X18_VALUE,
+           "flight NULL PE TEB claim was not frozen %#x/%u\n", (unsigned int)status,
+           __atomic_load_n( &recorder2->freeze_reason, __ATOMIC_ACQUIRE ) );
+
+done:
+    if (thread_initialized) thread_term( NULL );
+    if (stack_mapped)
+        check( !unregister_identity_page( stack_page ), "flight stack unmap failed\n" );
+    if (invalid_code_mapped)
+        check( !unregister_identity_page( invalid_code_page ),
+               "flight invalid-instruction code unmap failed\n" );
+    if (recorder_mapped)
+        check( !unregister_identity_range( recorder_pages, 2 * TEST_PAGE ),
+               "flight recorder unmap failed\n" );
+    if (recorder2_mapped)
+        check( !unregister_identity_range( recorder2_pages, 2 * TEST_PAGE ),
+               "flight second-recorder unmap failed\n" );
+    if (recorder2_pages != MAP_FAILED) munmap( recorder2_pages, 2 * TEST_PAGE );
+    if (teb_mapped)
+        check( !unregister_identity_page( (void *)(uintptr_t)test_teb ),
+               "flight TEB unmap failed\n" );
+    if (ec_mapped)
+        check( !unregister_identity_page( (void *)(uintptr_t)test_ec_target ),
+               "flight EC target unmap failed\n" );
+    if (failures == starting_failures) printf( "XTAJIT64_FLIGHT_PROVIDER_BOUNDARY_PASS\n" );
 }
 
 static void test_process_init_abi(void)
@@ -3299,6 +4285,10 @@ int main(void)
     check( provider.ranges.count == 1 && !provider.ranges.data[0].flags &&
            provider.ranges.data[0].permanent,
            "KUSER registry metadata was not initialized deterministically\n" );
+    test_flight_recorder_core();
+    test_flight_atomic_trace();
+    test_flight_recorder_contracts();
+    test_flight_recorder_stress();
     test_incremental_resync();
     test_coalesced_demand_mapping();
     test_low_observer_validation();
@@ -3330,6 +4320,7 @@ int main(void)
     test_suspend_doorbell_mutation_barrier();
     test_running_low_observer_barrier();
     test_running_flush_preflight_failure();
+    test_flight_provider_boundary();
 
     unregister_identity_page( (void *)(uintptr_t)test_teb );
     unregister_identity_page( (void *)(uintptr_t)test_syscall_dispatcher );
