@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: codex-apple-silicon-block-poll
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build-benchmark-publish:
