@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the measured xtajit64 translated-block poll optimization."""
+"""Apply the measured xtajit64 translated-block doorbell optimization."""
 
 from __future__ import annotations
 
@@ -70,8 +70,9 @@ def patch_unixlib() -> None:
 
     /* begin_simulation publishes this identity-mapped doorbell before setting
      * engine->running and entering uc_emu_start(), and release clears it only
-     * after emulation has returned.  Avoid a nullable-pointer branch in every
-     * translated block while preserving the existing doorbell-first priority. */
+     * after emulation has returned.  A running block callback therefore always
+     * has a valid pointer.  Remove the redundant nullable-pointer branch while
+     * preserving doorbell-first stop priority and the acquire pause poll. */
     doorbell = *engine->suspend_doorbell;
     if (doorbell)
     {
@@ -85,13 +86,7 @@ def patch_unixlib() -> None:
         stop_at_instruction_boundary( engine, uc );
         return;
     }
-
-    /* pause_requested is only a stop flag; it publishes no mutation payload.
-     * The provider mutex and condition variable establish the required state
-     * ordering after the owner has stopped.  Retain the negative early-return
-     * source shape: Apple Clang lays the overwhelmingly common no-stop path out
-     * as the short return path instead of branching over the cold stop body. */
-    if (!atomic_load_explicit( &engine->pause_requested, memory_order_relaxed )) return;
+    if (!atomic_load_explicit( &engine->pause_requested, memory_order_acquire )) return;
     if (engine->flight_recorder)
         flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
                                     XTAJIT64_FLIGHT_REASON_NONE,
@@ -122,13 +117,12 @@ def patch_checker() -> None:
         fail("block_hook() does not use the running-engine doorbell invariant")
     poll_start = block_hook.find("doorbell = *engine->suspend_doorbell;")
     pause_poll = block_hook.find(
-        "if (!atomic_load_explicit( &engine->pause_requested, memory_order_relaxed )) return;"
+        "if (!atomic_load_explicit( &engine->pause_requested, memory_order_acquire )) return;"
     )
     if poll_start < 0 or pause_poll <= poll_start:
-        fail("block_hook() does not retain the measured negative early-return poll")
-    poll = block_hook[poll_start:]
-    if "memory_order_acquire" in poll:
-        fail("block_hook() common pause poll still emits an acquire barrier")
+        fail("block_hook() does not retain the measured acquire early-return poll")
+    if "memory_order_relaxed" in block_hook[poll_start:pause_poll]:
+        fail("block_hook() unexpectedly weakened the common stop ordering")
     if "if (!(doorbell |" in block_hook:
         fail("block_hook() uses the rejected fused common-return branch")
     if block_hook.find("if (doorbell)", poll_start) > pause_poll:
