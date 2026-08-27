@@ -1,0 +1,43 @@
+name: xtajit64 Apple Silicon hot paths
+
+on:
+  pull_request:
+    paths:
+      - "dlls/xtajit64/unixlib.c"
+      - "dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c"
+      - "dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py"
+      - "dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh"
+      - "dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh"
+      - ".github/workflows/xtajit64-apple-silicon-hotpaths.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Native arm64 semantics and nanosecond benchmark
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Verify source contracts
+        run: |
+          /usr/bin/python3 \
+            dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py \
+            dlls/xtajit64/unixlib.c
+      - name: Benchmark pinned Unicorn on Apple Silicon
+        shell: bash
+        run: |
+          set -o pipefail
+          dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
+            "$RUNNER_TEMP/xtajit64-hotpaths" | tee "$RUNNER_TEMP/hotpaths.log"
+          {
+            echo '## Apple Silicon hot-path benchmark'
+            echo
+            echo '```text'
+            grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+              "$RUNNER_TEMP/hotpaths.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
