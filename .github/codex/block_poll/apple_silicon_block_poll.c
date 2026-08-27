@@ -134,11 +134,10 @@ static void direct_acquire_block_hook(uc_engine *uc, uint64_t address,
         uc_emu_stop(uc);
         return;
     }
-    if (atomic_load_explicit(&state->pause_requested, memory_order_acquire))
-    {
-        state->stop_reason = STOP_PAUSE;
-        uc_emu_stop(uc);
-    }
+    if (!atomic_load_explicit(&state->pause_requested, memory_order_acquire))
+        return;
+    state->stop_reason = STOP_PAUSE;
+    uc_emu_stop(uc);
 }
 
 static void nullable_relaxed_block_hook(uc_engine *uc, uint64_t address,
@@ -160,11 +159,10 @@ static void nullable_relaxed_block_hook(uc_engine *uc, uint64_t address,
         uc_emu_stop(uc);
         return;
     }
-    if (atomic_load_explicit(&state->pause_requested, memory_order_relaxed))
-    {
-        state->stop_reason = STOP_PAUSE;
-        uc_emu_stop(uc);
-    }
+    if (!atomic_load_explicit(&state->pause_requested, memory_order_relaxed))
+        return;
+    state->stop_reason = STOP_PAUSE;
+    uc_emu_stop(uc);
 }
 
 static void direct_relaxed_block_hook(uc_engine *uc, uint64_t address,
@@ -188,11 +186,10 @@ static void direct_relaxed_block_hook(uc_engine *uc, uint64_t address,
         uc_emu_stop(uc);
         return;
     }
-    if (atomic_load_explicit(&state->pause_requested, memory_order_relaxed))
-    {
-        state->stop_reason = STOP_PAUSE;
-        uc_emu_stop(uc);
-    }
+    if (!atomic_load_explicit(&state->pause_requested, memory_order_relaxed))
+        return;
+    state->stop_reason = STOP_PAUSE;
+    uc_emu_stop(uc);
 }
 
 static void initialize_state(struct poll_state *state)
@@ -410,7 +407,7 @@ int main(void)
            baseline_ns, direct_acquire_ns, nullable_relaxed_ns,
            direct_relaxed_ns, baseline_ns / direct_relaxed_ns);
     printf("APPLE_SILICON_HOTPATH block_poll_nullable_checks=1->0 "
-           "pause_order=acquire->relaxed common_path=fallthrough\n");
+           "pause_order=acquire->relaxed common_path=negative-early-return\n");
 
     close_poll_engine(&baseline);
     close_poll_engine(&direct_acquire);
