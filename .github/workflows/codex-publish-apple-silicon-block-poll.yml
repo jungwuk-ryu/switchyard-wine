@@ -59,7 +59,7 @@ jobs:
           install -m 644 "$RUNNER_TEMP/unixlib.c" dlls/xtajit64/unixlib.c
           git diff --check
           git add dlls/xtajit64/unixlib.c
-          git commit -m "xtajit64: fuse translated-block stop polling"
+          git commit -m "xtajit64: streamline translated-block stop polling"
 
           install -m 755 "$RUNNER_TEMP/check_apple_silicon_hotpaths.py" \
             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
@@ -91,7 +91,7 @@ jobs:
           dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
             "$RUNNER_TEMP/xtajit64-hotpaths" | tee "$RUNNER_TEMP/hotpaths.log"
           grep -E '^APPLE_SILICON_HOTPATH block_poll_' "$RUNNER_TEMP/hotpaths.log"
-          grep -F 'APPLE_SILICON_HOTPATH block_poll_branches=2->1 pause_order=acquire->relaxed' \
+          grep -F 'APPLE_SILICON_HOTPATH block_poll_nullable_checks=1->0 pause_order=acquire->relaxed common_path=fallthrough' \
             "$RUNNER_TEMP/hotpaths.log"
           {
             echo "## Apple Silicon translated-block poll benchmark"
