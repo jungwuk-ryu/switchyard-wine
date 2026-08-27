@@ -59,7 +59,7 @@ jobs:
           install -m 644 "$RUNNER_TEMP/unixlib.c" dlls/xtajit64/unixlib.c
           git diff --check
           git add dlls/xtajit64/unixlib.c
-          git commit -m "xtajit64: streamline translated-block stop polling"
+          git commit -m "xtajit64: remove nullable doorbell check from block hook"
 
           install -m 755 "$RUNNER_TEMP/check_apple_silicon_hotpaths.py" \
             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
@@ -78,7 +78,7 @@ jobs:
             dlls/xtajit64/provider_tests/apple_silicon_block_poll.c \
             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py \
             dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
-          git commit -m "test: benchmark translated-block stop polling"
+          git commit -m "test: benchmark translated-block doorbell polling"
 
           git log --oneline --decorate -2
           git diff --check "$BASE_SHA..HEAD"
@@ -91,10 +91,10 @@ jobs:
           dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
             "$RUNNER_TEMP/xtajit64-hotpaths" | tee "$RUNNER_TEMP/hotpaths.log"
           grep -E '^APPLE_SILICON_HOTPATH block_poll_' "$RUNNER_TEMP/hotpaths.log"
-          grep -F 'APPLE_SILICON_HOTPATH block_poll_nullable_checks=1->0 pause_order=acquire->relaxed common_path=negative-early-return' \
+          grep -F 'APPLE_SILICON_HOTPATH block_poll_nullable_checks=1->0 pause_order=acquire common_path=negative-early-return' \
             "$RUNNER_TEMP/hotpaths.log"
           {
-            echo "## Apple Silicon translated-block poll benchmark"
+            echo "## Apple Silicon translated-block doorbell benchmark"
             echo
             echo '```text'
             grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
