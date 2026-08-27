@@ -1,4 +1,4 @@
-name: Codex apply Apple Silicon hot paths
+name: Codex apply Apple Silicon context batching
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: codex-apple-silicon-hotpaths
+  group: codex-apple-silicon-context-batching
   cancel-in-progress: false
 
 jobs:
@@ -26,63 +26,78 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          payload="$RUNNER_TEMP/xtajit64-hotpaths.tar.gz"
-          cat .github/codex/v3/payload.b64.* | base64 --decode > "$payload"
+          payload="$RUNNER_TEMP/xtajit64-context-transfer.tar.gz"
+          cat .github/codex/v4/payload.b64.* | base64 --decode > "$payload"
           actual=$(shasum -a 256 "$payload" | awk '{print $1}')
-          test "$actual" = "3b072a747840576a1490ed79f63156287894fc204897305bb74b382a9cf19525"
-          mkdir -p "$RUNNER_TEMP/xtajit64-hotpaths"
-          tar -xzf "$payload" -C "$RUNNER_TEMP/xtajit64-hotpaths"
-          python3 -m py_compile             "$RUNNER_TEMP/xtajit64-hotpaths/patch1.py"             "$RUNNER_TEMP/xtajit64-hotpaths/patch2.py"             "$RUNNER_TEMP/xtajit64-hotpaths/check_apple_silicon_hotpaths.py"
-          bash -n "$RUNNER_TEMP/xtajit64-hotpaths/run_apple_silicon_hotpaths.sh"
+          test "$actual" = "e7f3e8ea731afc4d7a7574ebc5dd10ead5067b24b42e454ba3319f0730c20da3"
+          mkdir -p "$RUNNER_TEMP/xtajit64-context-transfer"
+          tar -xzf "$payload" -C "$RUNNER_TEMP/xtajit64-context-transfer"
+          python3 -m py_compile \
+            "$RUNNER_TEMP/xtajit64-context-transfer/patch2.py" \
+            "$RUNNER_TEMP/xtajit64-context-transfer/check_apple_silicon_hotpaths.py"
+          bash -n "$RUNNER_TEMP/xtajit64-context-transfer/run_apple_silicon_hotpaths.sh"
 
-      - name: Build two clean commits
+      - name: Build, benchmark, and publish two clean commits
         shell: bash
         env:
           BASE_SHA: a6224b8a7ca9763024c7d40271abcc040dcc65f4
         run: |
           set -euo pipefail
           expected_remote=$(git rev-parse "origin/$GITHUB_REF_NAME")
-          payload_dir="$RUNNER_TEMP/xtajit64-hotpaths"
+          payload_dir="$RUNNER_TEMP/xtajit64-context-transfer"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git reset --hard "$BASE_SHA"
 
-          python3 "$payload_dir/patch1.py"
-          git diff --check
-          grep -Fq 'page = address >> provider.ec_page_shift;' dlls/xtajit64/unixlib.c
-          if sed -n '/static inline BOOL is_ec_code/,/^}/p' dlls/xtajit64/unixlib.c | grep -q '/'; then
-            echo "runtime division remains in is_ec_code" >&2
-            exit 1
-          fi
-          git add dlls/xtajit64/unixlib.c
-          git commit -m "xtajit64: remove division from EC block classification"
-
           python3 "$payload_dir/patch2.py"
-          install -m 755 "$payload_dir/check_apple_silicon_hotpaths.py"             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
-          install -m 644 "$payload_dir/apple_silicon_hotpaths.c"             dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c
-          install -m 755 "$payload_dir/run_apple_silicon_hotpaths.sh"             dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
-          install -m 644 "$payload_dir/xtajit64-apple-silicon-hotpaths.yml"             .github/workflows/xtajit64-apple-silicon-hotpaths.yml
+          python3 "$payload_dir/check_apple_silicon_hotpaths.py" \
+            dlls/xtajit64/unixlib.c
+          bash -n dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh
+          git diff --check
+          git add \
+            dlls/xtajit64/unixlib.c \
+            dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh
+          git commit -m "xtajit64: batch Unicorn context transfers"
 
-          python3 dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py             dlls/xtajit64/unixlib.c
-          python3 -m py_compile             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
+          install -m 755 "$payload_dir/check_apple_silicon_hotpaths.py" \
+            dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
+          install -m 644 "$payload_dir/apple_silicon_hotpaths.c" \
+            dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c
+          install -m 755 "$payload_dir/run_apple_silicon_hotpaths.sh" \
+            dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
+          install -m 644 "$payload_dir/xtajit64-apple-silicon-hotpaths.yml" \
+            .github/workflows/xtajit64-apple-silicon-hotpaths.yml
+
+          python3 dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py \
+            dlls/xtajit64/unixlib.c
+          python3 -m py_compile \
+            dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
           bash -n dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
           bash -n dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh
           git diff --check
-          git add             .github/workflows/xtajit64-apple-silicon-hotpaths.yml             dlls/xtajit64/unixlib.c             dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py             dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh             dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh
-          git commit -m "xtajit64: batch Unicorn context transfers"
+          git add \
+            .github/workflows/xtajit64-apple-silicon-hotpaths.yml \
+            dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c \
+            dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py \
+            dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
+          git commit -m "test: add Apple Silicon context-transfer benchmark"
 
           git log --oneline --decorate -2
           git diff --check "$BASE_SHA..HEAD"
 
           set -o pipefail
-          dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh             "$RUNNER_TEMP/xtajit64-benchmark" | tee "$RUNNER_TEMP/hotpaths.log"
+          dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
+            "$RUNNER_TEMP/xtajit64-benchmark" | tee "$RUNNER_TEMP/hotpaths.log"
           {
-            echo "## Bootstrap Apple Silicon benchmark"
+            echo "## Bootstrap Apple Silicon context-transfer benchmark"
             echo
             echo '```text'
-            grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)'               "$RUNNER_TEMP/hotpaths.log"
+            grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+              "$RUNNER_TEMP/hotpaths.log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          git push             --force-with-lease="refs/heads/$GITHUB_REF_NAME:$expected_remote"             origin "HEAD:refs/heads/$GITHUB_REF_NAME"
+          git push \
+            --force-with-lease="refs/heads/$GITHUB_REF_NAME:$expected_remote" \
+            origin "HEAD:refs/heads/$GITHUB_REF_NAME"
