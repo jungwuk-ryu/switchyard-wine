@@ -1,0 +1,88 @@
+name: Codex measure Apple Silicon context export
+
+on:
+  push:
+    branches:
+      - perf/apple-silicon-context-export-stage
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-apple-silicon-context-export
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: macos-26
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out staging branch
+        uses: actions/checkout@v4
+
+      - name: Build pinned Unicorn and benchmark export orderings
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ $(/usr/bin/uname -m) != arm64 ]]; then
+            echo "native arm64 runner required" >&2
+            exit 2
+          fi
+          if translated=$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null); then
+            [[ $translated != 1 ]] || {
+              echo "Rosetta execution is not accepted" >&2
+              exit 2
+            }
+          fi
+
+          work_dir="$RUNNER_TEMP/xtajit64-context-export"
+          unicorn_source="$work_dir/unicorn"
+          unicorn_build="$work_dir/unicorn-build"
+          benchmark="$work_dir/apple_silicon_context_export"
+          revision=8028ec436f2d9376525352dd38ed9ed6b9f6be10
+          mkdir -p "$work_dir"
+
+          /usr/bin/git init -q "$unicorn_source"
+          /usr/bin/git -C "$unicorn_source" remote add origin \
+            https://github.com/unicorn-engine/unicorn.git
+          /usr/bin/git -C "$unicorn_source" fetch -q --depth=1 origin "$revision"
+          /usr/bin/git -C "$unicorn_source" checkout -q --detach FETCH_HEAD
+
+          cmake_bin=$(command -v cmake)
+          [[ -x $cmake_bin ]] || { echo "cmake is required" >&2; exit 2; }
+          ARCHFLAGS="-arch arm64" "$cmake_bin" \
+            -S "$unicorn_source" -B "$unicorn_build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DUNICORN_ARCH=x86 \
+            -DUNICORN_BUILD_TESTS=OFF \
+            -DUNICORN_BUILD_SAMPLES=OFF \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+          "$cmake_bin" --build "$unicorn_build" --parallel 3
+
+          library=$(find "$unicorn_build" -maxdepth 3 \
+            \( -name 'libunicorn.dylib' -o -name 'libunicorn.2.dylib' \) \
+            -type f -print -quit)
+          [[ -n $library ]] || {
+            echo "pinned Unicorn dylib was not produced" >&2
+            exit 1
+          }
+          library_dir=$(cd "$(dirname "$library")" && /bin/pwd -P)
+
+          /usr/bin/clang -O3 -DNDEBUG -Wall -Wextra -Werror \
+            -I"$unicorn_source/include" \
+            .github/codex/context_export/apple_silicon_context_export.c \
+            -L"$library_dir" -Wl,-rpath,"$library_dir" -lunicorn \
+            -o "$benchmark"
+          /usr/bin/file "$benchmark"
+
+          set -o pipefail
+          /usr/bin/arch -arm64 "$benchmark" | tee "$RUNNER_TEMP/context-export.log"
+          {
+            echo "## Apple Silicon terminal context-export experiment"
+            echo
+            echo '```text'
+            grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+              "$RUNNER_TEMP/context-export.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
