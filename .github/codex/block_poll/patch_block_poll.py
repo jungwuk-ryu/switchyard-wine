@@ -88,24 +88,21 @@ def patch_unixlib() -> None:
 
     /* pause_requested is only a stop flag; it publishes no mutation payload.
      * The provider mutex and condition variable establish the required state
-     * ordering after the owner has stopped.  Keep the no-stop path as straight
-     * fall-through code and avoid an acquire barrier in every block callback. */
-    if (atomic_load_explicit( &engine->pause_requested, memory_order_relaxed ))
-    {
-        if (engine->flight_recorder)
-            flight_record_engine_event( engine,
-                                        XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
-                                        XTAJIT64_FLIGHT_REASON_NONE,
-                                        XTAJIT64_FLIGHT_UNKNOWN_U32,
-                                        address, XTAJIT64_FLIGHT_UNKNOWN_U64 );
+     * ordering after the owner has stopped.  Retain the negative early-return
+     * source shape: Apple Clang lays the overwhelmingly common no-stop path out
+     * as the short return path instead of branching over the cold stop body. */
+    if (!atomic_load_explicit( &engine->pause_requested, memory_order_relaxed )) return;
+    if (engine->flight_recorder)
+        flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
+                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                    XTAJIT64_FLIGHT_UNKNOWN_U32,
+                                    address, XTAJIT64_FLIGHT_UNKNOWN_U64 );
 #ifdef XTAJIT64_UNIXLIB_TEST
-        if (!pthread_equal( engine->owner, pthread_self() ))
-            atomic_store_explicit( &test_pause_stop_owner_violation, 1,
-                                   memory_order_relaxed );
-        atomic_fetch_add_explicit( &test_pause_stop_count, 1, memory_order_relaxed );
+    if (!pthread_equal( engine->owner, pthread_self() ))
+        atomic_store_explicit( &test_pause_stop_owner_violation, 1, memory_order_relaxed );
+    atomic_fetch_add_explicit( &test_pause_stop_count, 1, memory_order_relaxed );
 #endif
-        stop_at_instruction_boundary( engine, uc );
-    }
+    stop_at_instruction_boundary( engine, uc );
 }
 '''
     source = replace_function(source, "block_hook", replacement)
@@ -124,16 +121,16 @@ def patch_checker() -> None:
     if "doorbell = *engine->suspend_doorbell;" not in block_hook:
         fail("block_hook() does not use the running-engine doorbell invariant")
     poll_start = block_hook.find("doorbell = *engine->suspend_doorbell;")
-    pause_poll = block_hook.find("if (atomic_load_explicit( &engine->pause_requested")
+    pause_poll = block_hook.find(
+        "if (!atomic_load_explicit( &engine->pause_requested, memory_order_relaxed )) return;"
+    )
     if poll_start < 0 or pause_poll <= poll_start:
-        fail("block_hook() stop-poll ordering changed")
+        fail("block_hook() does not retain the measured negative early-return poll")
     poll = block_hook[poll_start:]
-    if poll.count("memory_order_relaxed") < 1:
-        fail("block_hook() does not use a relaxed payload-free pause poll")
     if "memory_order_acquire" in poll:
         fail("block_hook() common pause poll still emits an acquire barrier")
     if "if (!(doorbell |" in block_hook:
-        fail("block_hook() uses a taken common-path fused-return branch")
+        fail("block_hook() uses the rejected fused common-return branch")
     if block_hook.find("if (doorbell)", poll_start) > pause_poll:
         fail("block_hook() no longer preserves doorbell-first stop priority")
     publish = begin_simulation.find("engine->suspend_doorbell = suspend_doorbell;")
