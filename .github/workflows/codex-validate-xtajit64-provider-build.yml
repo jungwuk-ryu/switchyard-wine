@@ -1,0 +1,105 @@
+name: Codex validate optimized xtajit64 provider build
+
+on:
+  push:
+    branches:
+      - perf/apple-silicon-ns-hotpaths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-validate-optimized-xtajit64-provider-build
+  cancel-in-progress: true
+
+jobs:
+  provider-build:
+    runs-on: macos-26
+    timeout-minutes: 55
+    steps:
+      - name: Check out optimized branch
+        uses: actions/checkout@v7
+        with:
+          ref: perf/apple-silicon-context-batching
+          fetch-depth: 0
+
+      - name: Build and install benchmark Unicorn
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace="$RUNNER_TEMP/xtajit64-provider-unicorn"
+          dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
+            "$workspace" | tee "$RUNNER_TEMP/context-hotpaths.log"
+          /opt/homebrew/bin/cmake --install "$workspace/unicorn-build" \
+            --prefix "$workspace/unicorn-prefix"
+          test -f "$workspace/unicorn-prefix/include/unicorn/unicorn.h"
+          test -d "$workspace/unicorn-prefix/lib"
+          grep -Fq UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP \
+            "$workspace/unicorn-prefix/include/unicorn/unicorn.h"
+          library=$(find "$workspace/unicorn-prefix/lib" \
+            \( -name 'libunicorn.2.dylib' -o -name 'libunicorn.dylib' \) \
+            -type f -print -quit)
+          test -n "$library"
+          printf '%s\n' "$workspace/unicorn-prefix" > "$RUNNER_TEMP/unicorn-prefix"
+          printf '%s\n' "$library" > "$RUNNER_TEMP/unicorn-library"
+
+      - name: Configure native arm64 Wine provider build
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE"
+          build="$RUNNER_TEMP/wine-provider-build"
+          prefix=$(cat "$RUNNER_TEMP/unicorn-prefix")
+          library=$(cat "$RUNNER_TEMP/unicorn-library")
+          sdk=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
+          source_date_epoch=$(git log -1 --format=%ct HEAD)
+          mkdir -p "$build"
+          tool_path="/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          cd "$build"
+          /usr/bin/env -i \
+            PATH="$tool_path" \
+            LC_ALL=C LANG=C TZ=UTC \
+            CONFIG_SHELL=/bin/sh \
+            SDKROOT="$sdk" \
+            SOURCE_DATE_EPOCH="$source_date_epoch" \
+            ZERO_AR_DATE=1 \
+            MACOSX_DEPLOYMENT_TARGET=15.0 \
+            CC=/usr/bin/clang \
+            CXX=/usr/bin/clang++ \
+            CFLAGS="-g -O2 -I$prefix/include" \
+            CXXFLAGS="-g -O2 -I$prefix/include" \
+            CROSSCFLAGS='-g -O2' \
+            CPPFLAGS="-I$prefix/include" \
+            LDFLAGS="-L$prefix/lib -Wl,-rpath,$prefix/lib" \
+            UNICORN_CFLAGS="-I$prefix/include" \
+            UNICORN_LIBS="$library" \
+            PKG_CONFIG_PATH="$prefix/lib/pkgconfig" \
+            BISON=/opt/homebrew/opt/bison/bin/bison \
+            FLEX=/usr/bin/flex \
+            /bin/sh "$root/configure" \
+              --build=aarch64-apple-darwin \
+              --host=aarch64-apple-darwin \
+              --enable-archs=aarch64,arm64ec,x86_64,i386 \
+              --with-mingw=/opt/homebrew/opt/llvm/bin/clang \
+              --disable-tests \
+              --without-x \
+              --without-freetype \
+              --without-gnutls \
+              --without-gstreamer
+
+      - name: Compile and run xtajit64 provider regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          build="$RUNNER_TEMP/wine-provider-build"
+          prefix=$(cat "$RUNNER_TEMP/unicorn-prefix")
+          /usr/bin/make -C "$build" -j3 \
+            dlls/ntdll/ntdll.so \
+            dlls/xtajit64/xtajit64.so \
+            dlls/xtajit64/aarch64-windows/xtajit64.dll
+          test -f "$build/dlls/xtajit64/xtajit64.so"
+          test -f "$build/dlls/xtajit64/aarch64-windows/xtajit64.dll"
+          XTAJIT64_EXPECTED_SOURCE_DIR="$GITHUB_WORKSPACE" \
+          XTAJIT64_UNICORN_ROOT="$prefix" \
+          DYLD_LIBRARY_PATH="$prefix/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+            dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh "$build"
