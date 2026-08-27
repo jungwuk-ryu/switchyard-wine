@@ -648,6 +648,19 @@ static const int context_read_regs[] =
     UC_X86_REG_XMM12, UC_X86_REG_XMM13, UC_X86_REG_XMM14, UC_X86_REG_XMM15,
 };
 
+static const int x64_syscall_read_regs[] =
+{
+    UC_X86_REG_RAX, UC_X86_REG_RIP, UC_X86_REG_R10,
+};
+
+static const int x64_syscall_write_regs[] =
+{
+    UC_X86_REG_RCX, UC_X86_REG_R10, UC_X86_REG_RIP,
+};
+
+C_ASSERT( ARRAY_SIZE(x64_syscall_read_regs) == 3 );
+C_ASSERT( ARRAY_SIZE(x64_syscall_write_regs) == 3 );
+
 C_ASSERT( offsetof(struct xtajit64_x64_context, mxcsr) ==
           XTAJIT64_CONTEXT_INTEGER_REG_COUNT * sizeof(UINT64) );
 C_ASSERT( ARRAY_SIZE(((struct xtajit64_x64_context *)0)->xmm) ==
@@ -1973,12 +1986,17 @@ static uc_err prepare_x64_syscall_engine( struct thread_engine *engine,
                                           uint64_t dispatcher, uint32_t count,
                                           uint64_t *next_rip )
 {
-    uint64_t rax, r10, rip;
+    uint64_t rax, rip, r10;
+    void *read_values[] = {&rax, &rip, &r10};
+    void *write_values[] = {&r10, &rip, &dispatcher};
     uc_err err;
 
-    if ((err = uc_reg_read( engine->uc, UC_X86_REG_RAX, &rax )) != UC_ERR_OK)
-        return err;
-    if ((err = uc_reg_read( engine->uc, UC_X86_REG_RIP, &rip )) != UC_ERR_OK)
+    /* This is the normal x64 SYSCALL continuation path.  Keep Unicorn's
+     * register-dispatch setup outside the three-register import and export
+     * groups rather than crossing the dylib boundary six times per syscall. */
+    if ((err = uc_reg_read_batch( engine->uc, x64_syscall_read_regs,
+                                  read_values,
+                                  (int)ARRAY_SIZE(x64_syscall_read_regs) )) != UC_ERR_OK)
         return err;
     if (rax >= count)
     {
@@ -1988,14 +2006,12 @@ static uc_err prepare_x64_syscall_engine( struct thread_engine *engine,
         *next_rip = rip;
         return UC_ERR_OK;
     }
-    if ((err = uc_reg_read( engine->uc, UC_X86_REG_R10, &r10 )) != UC_ERR_OK)
-        return err;
 
     /* Match ntdll's ARM64EC STATUS_EMULATION_SYSCALL conversion.  Unicorn
      * reports RIP after both SYSCALL and INT 2E once the stop hook returns. */
-    if ((err = uc_reg_write( engine->uc, UC_X86_REG_RCX, &r10 )) != UC_ERR_OK ||
-        (err = uc_reg_write( engine->uc, UC_X86_REG_R10, &rip )) != UC_ERR_OK ||
-        (err = uc_reg_write( engine->uc, UC_X86_REG_RIP, &dispatcher )) != UC_ERR_OK)
+    if ((err = uc_reg_write_batch( engine->uc, x64_syscall_write_regs,
+                                   write_values,
+                                   (int)ARRAY_SIZE(x64_syscall_write_regs) )) != UC_ERR_OK)
         return err;
     *next_rip = dispatcher;
     return UC_ERR_OK;
