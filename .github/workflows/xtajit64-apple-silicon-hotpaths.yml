@@ -1,0 +1,63 @@
+name: xtajit64 Apple Silicon hot paths
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/xtajit64-apple-silicon-hotpaths.yml"
+      - "dlls/xtajit64/unixlib.c"
+      - "dlls/xtajit64/provider_tests/**"
+  push:
+    branches:
+      - perf/apple-silicon-context-batching
+    paths:
+      - ".github/workflows/xtajit64-apple-silicon-hotpaths.yml"
+      - "dlls/xtajit64/unixlib.c"
+      - "dlls/xtajit64/provider_tests/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xtajit64-apple-silicon-hotpaths-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  context-transfer:
+    name: Native arm64 context transfer
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py \
+            dlls/xtajit64/unixlib.c
+          python3 -m py_compile \
+            dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
+          bash -n dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
+          bash -n dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh
+          git diff --check
+
+      - name: Benchmark pinned Unicorn on native Apple Silicon
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
+            "$RUNNER_TEMP/xtajit64-hotpaths" | tee "$RUNNER_TEMP/xtajit64-hotpaths.log"
+          grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+            "$RUNNER_TEMP/xtajit64-hotpaths.log"
+          {
+            echo "## xtajit64 Apple Silicon context-transfer benchmark"
+            echo
+            echo '```text'
+            grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+              "$RUNNER_TEMP/xtajit64-hotpaths.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
