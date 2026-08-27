@@ -616,22 +616,46 @@ static atomic_int test_check_context_read_lock;
 static atomic_int test_context_read_lock_violation;
 #endif
 
-static const int integer_regs[] =
+enum
+{
+    XTAJIT64_CONTEXT_INTEGER_REG_COUNT = 18,
+    XTAJIT64_CONTEXT_XMM_REG_COUNT = 16,
+};
+
+static const int context_write_regs[] =
 {
     UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX,
     UC_X86_REG_RSI, UC_X86_REG_RDI, UC_X86_REG_RBP, UC_X86_REG_RSP,
     UC_X86_REG_R8,  UC_X86_REG_R9,  UC_X86_REG_R10, UC_X86_REG_R11,
     UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15,
-    UC_X86_REG_RIP, UC_X86_REG_EFLAGS,
-};
-
-static const int xmm_regs[] =
-{
+    UC_X86_REG_RIP, UC_X86_REG_EFLAGS, UC_X86_REG_GS_BASE, UC_X86_REG_MXCSR,
     UC_X86_REG_XMM0,  UC_X86_REG_XMM1,  UC_X86_REG_XMM2,  UC_X86_REG_XMM3,
     UC_X86_REG_XMM4,  UC_X86_REG_XMM5,  UC_X86_REG_XMM6,  UC_X86_REG_XMM7,
     UC_X86_REG_XMM8,  UC_X86_REG_XMM9,  UC_X86_REG_XMM10, UC_X86_REG_XMM11,
     UC_X86_REG_XMM12, UC_X86_REG_XMM13, UC_X86_REG_XMM14, UC_X86_REG_XMM15,
 };
+
+static const int context_read_regs[] =
+{
+    UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX,
+    UC_X86_REG_RSI, UC_X86_REG_RDI, UC_X86_REG_RBP, UC_X86_REG_RSP,
+    UC_X86_REG_R8,  UC_X86_REG_R9,  UC_X86_REG_R10, UC_X86_REG_R11,
+    UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15,
+    UC_X86_REG_RIP, UC_X86_REG_EFLAGS, UC_X86_REG_MXCSR,
+    UC_X86_REG_XMM0,  UC_X86_REG_XMM1,  UC_X86_REG_XMM2,  UC_X86_REG_XMM3,
+    UC_X86_REG_XMM4,  UC_X86_REG_XMM5,  UC_X86_REG_XMM6,  UC_X86_REG_XMM7,
+    UC_X86_REG_XMM8,  UC_X86_REG_XMM9,  UC_X86_REG_XMM10, UC_X86_REG_XMM11,
+    UC_X86_REG_XMM12, UC_X86_REG_XMM13, UC_X86_REG_XMM14, UC_X86_REG_XMM15,
+};
+
+C_ASSERT( offsetof(struct xtajit64_x64_context, mxcsr) ==
+          XTAJIT64_CONTEXT_INTEGER_REG_COUNT * sizeof(UINT64) );
+C_ASSERT( ARRAY_SIZE(((struct xtajit64_x64_context *)0)->xmm) ==
+          XTAJIT64_CONTEXT_XMM_REG_COUNT );
+C_ASSERT( ARRAY_SIZE(context_write_regs) ==
+          XTAJIT64_CONTEXT_INTEGER_REG_COUNT + XTAJIT64_CONTEXT_XMM_REG_COUNT + 2 );
+C_ASSERT( ARRAY_SIZE(context_read_regs) ==
+          XTAJIT64_CONTEXT_INTEGER_REG_COUNT + XTAJIT64_CONTEXT_XMM_REG_COUNT + 1 );
 
 static uint64_t align_down( uint64_t value )
 {
@@ -1892,32 +1916,31 @@ static uc_err write_context( struct thread_engine *engine,
                              const struct xtajit64_x64_context *context,
                              uint64_t gs_base )
 {
-    const UINT64 *values = &context->rax;
-    uc_err err;
-    unsigned int i;
+    const UINT64 *integer_values = &context->rax;
+    void *values[ARRAY_SIZE(context_write_regs)];
+    unsigned int i, index = 0;
 
 #ifdef XTAJIT64_UNIXLIB_TEST
     atomic_fetch_add_explicit( &test_context_write_count, 1, memory_order_relaxed );
 #endif
-    for (i = 0; i < ARRAY_SIZE(integer_regs); ++i)
-        if ((err = uc_reg_write( engine->uc, integer_regs[i], &values[i] )) != UC_ERR_OK)
-            return err;
-    if ((err = uc_reg_write( engine->uc, UC_X86_REG_GS_BASE, &gs_base )) != UC_ERR_OK)
-        return err;
-    if ((err = uc_reg_write( engine->uc, UC_X86_REG_MXCSR, &context->mxcsr )) != UC_ERR_OK)
-        return err;
-    for (i = 0; i < ARRAY_SIZE(xmm_regs); ++i)
-        if ((err = uc_reg_write( engine->uc, xmm_regs[i], context->xmm[i] )) != UC_ERR_OK)
-            return err;
-    return UC_ERR_OK;
+    /* One batch keeps Unicorn's JIT-state and register-dispatch setup outside
+     * the 36-register loop instead of crossing the dylib boundary 36 times. */
+    for (i = 0; i < XTAJIT64_CONTEXT_INTEGER_REG_COUNT; ++i)
+        values[index++] = (void *)&integer_values[i];
+    values[index++] = &gs_base;
+    values[index++] = (void *)&context->mxcsr;
+    for (i = 0; i < XTAJIT64_CONTEXT_XMM_REG_COUNT; ++i)
+        values[index++] = (void *)context->xmm[i];
+    return uc_reg_write_batch( engine->uc, context_write_regs, values,
+                               (int)ARRAY_SIZE(context_write_regs) );
 }
 
 static uc_err read_context( struct thread_engine *engine,
                             struct xtajit64_x64_context *context )
 {
-    UINT64 *values = &context->rax;
-    uc_err err;
-    unsigned int i;
+    UINT64 *integer_values = &context->rax;
+    void *values[ARRAY_SIZE(context_read_regs)];
+    unsigned int i, index = 0;
 
 #ifdef XTAJIT64_UNIXLIB_TEST
     atomic_fetch_add_explicit( &test_context_read_count, 1, memory_order_relaxed );
@@ -1936,15 +1959,14 @@ static uc_err read_context( struct thread_engine *engine,
                                    memory_order_release );
     }
 #endif
-    for (i = 0; i < ARRAY_SIZE(integer_regs); ++i)
-        if ((err = uc_reg_read( engine->uc, integer_regs[i], &values[i] )) != UC_ERR_OK)
-            return err;
-    if ((err = uc_reg_read( engine->uc, UC_X86_REG_MXCSR, &context->mxcsr )) != UC_ERR_OK)
-        return err;
-    for (i = 0; i < ARRAY_SIZE(xmm_regs); ++i)
-        if ((err = uc_reg_read( engine->uc, xmm_regs[i], context->xmm[i] )) != UC_ERR_OK)
-            return err;
-    return UC_ERR_OK;
+    /* Export the 35 normalized registers through one Unicorn API boundary. */
+    for (i = 0; i < XTAJIT64_CONTEXT_INTEGER_REG_COUNT; ++i)
+        values[index++] = &integer_values[i];
+    values[index++] = &context->mxcsr;
+    for (i = 0; i < XTAJIT64_CONTEXT_XMM_REG_COUNT; ++i)
+        values[index++] = context->xmm[i];
+    return uc_reg_read_batch( engine->uc, context_read_regs, values,
+                              (int)ARRAY_SIZE(context_read_regs) );
 }
 
 static uc_err prepare_x64_syscall_engine( struct thread_engine *engine,
