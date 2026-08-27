@@ -2,8 +2,8 @@
  * Apple Silicon benchmark for the xtajit64 translated-block stop poll.
  *
  * The benchmark executes one self-looping x86 translation block repeatedly
- * through Unicorn.  Both callbacks perform the same EC classification and
- * stop semantics; only the common no-stop polling sequence differs.
+ * through Unicorn.  Every callback performs the same EC classification and
+ * stop semantics; the common no-stop polling sequence is varied independently.
  */
 
 #include <mach/mach_time.h>
@@ -113,12 +113,11 @@ static void baseline_block_hook(uc_engine *uc, uint64_t address,
     uc_emu_stop(uc);
 }
 
-static void fused_block_hook(uc_engine *uc, uint64_t address,
-                             uint32_t size, void *user)
+static void direct_acquire_block_hook(uc_engine *uc, uint64_t address,
+                                      uint32_t size, void *user)
 {
     struct poll_state *state = user;
     uint32_t doorbell;
-    bool pause_requested;
 
     (void)size;
     ++state->hook_count;
@@ -129,17 +128,71 @@ static void fused_block_hook(uc_engine *uc, uint64_t address,
         return;
     }
     doorbell = *state->suspend_doorbell;
-    pause_requested = atomic_load_explicit(&state->pause_requested,
-                                           memory_order_relaxed);
-    if (!(doorbell | (uint32_t)pause_requested)) return;
     if (doorbell)
     {
         state->stop_reason = STOP_DOORBELL;
         uc_emu_stop(uc);
         return;
     }
-    state->stop_reason = STOP_PAUSE;
-    uc_emu_stop(uc);
+    if (atomic_load_explicit(&state->pause_requested, memory_order_acquire))
+    {
+        state->stop_reason = STOP_PAUSE;
+        uc_emu_stop(uc);
+    }
+}
+
+static void nullable_relaxed_block_hook(uc_engine *uc, uint64_t address,
+                                        uint32_t size, void *user)
+{
+    struct poll_state *state = user;
+
+    (void)size;
+    ++state->hook_count;
+    if (is_ec_code(state, address))
+    {
+        state->stop_reason = STOP_EC;
+        uc_emu_stop(uc);
+        return;
+    }
+    if (state->suspend_doorbell && *state->suspend_doorbell)
+    {
+        state->stop_reason = STOP_DOORBELL;
+        uc_emu_stop(uc);
+        return;
+    }
+    if (atomic_load_explicit(&state->pause_requested, memory_order_relaxed))
+    {
+        state->stop_reason = STOP_PAUSE;
+        uc_emu_stop(uc);
+    }
+}
+
+static void direct_relaxed_block_hook(uc_engine *uc, uint64_t address,
+                                      uint32_t size, void *user)
+{
+    struct poll_state *state = user;
+    uint32_t doorbell;
+
+    (void)size;
+    ++state->hook_count;
+    if (is_ec_code(state, address))
+    {
+        state->stop_reason = STOP_EC;
+        uc_emu_stop(uc);
+        return;
+    }
+    doorbell = *state->suspend_doorbell;
+    if (doorbell)
+    {
+        state->stop_reason = STOP_DOORBELL;
+        uc_emu_stop(uc);
+        return;
+    }
+    if (atomic_load_explicit(&state->pause_requested, memory_order_relaxed))
+    {
+        state->stop_reason = STOP_PAUSE;
+        uc_emu_stop(uc);
+    }
 }
 
 static void initialize_state(struct poll_state *state)
@@ -298,9 +351,10 @@ static void print_cpu_model(void)
 
 int main(void)
 {
-    struct poll_engine baseline, fused;
-    double baseline_samples[ROUNDS], fused_samples[ROUNDS];
-    double baseline_ns, fused_ns;
+    struct poll_engine baseline, direct_acquire, nullable_relaxed, direct_relaxed;
+    double baseline_samples[ROUNDS], direct_acquire_samples[ROUNDS];
+    double nullable_relaxed_samples[ROUNDS], direct_relaxed_samples[ROUNDS];
+    double baseline_ns, direct_acquire_ns, nullable_relaxed_ns, direct_relaxed_ns;
     unsigned int round;
 
     if (mach_timebase_info(&timebase) != KERN_SUCCESS)
@@ -316,39 +370,55 @@ int main(void)
     }
 
     open_poll_engine(&baseline, baseline_block_hook);
-    open_poll_engine(&fused, fused_block_hook);
+    open_poll_engine(&direct_acquire, direct_acquire_block_hook);
+    open_poll_engine(&nullable_relaxed, nullable_relaxed_block_hook);
+    open_poll_engine(&direct_relaxed, direct_relaxed_block_hook);
     verify_stop_semantics(&baseline);
-    verify_stop_semantics(&fused);
+    verify_stop_semantics(&direct_acquire);
+    verify_stop_semantics(&nullable_relaxed);
+    verify_stop_semantics(&direct_relaxed);
     (void)measure_once(&baseline, WARMUP_ITERATIONS);
-    (void)measure_once(&fused, WARMUP_ITERATIONS);
+    (void)measure_once(&direct_acquire, WARMUP_ITERATIONS);
+    (void)measure_once(&nullable_relaxed, WARMUP_ITERATIONS);
+    (void)measure_once(&direct_relaxed, WARMUP_ITERATIONS);
 
     for (round = 0; round < ROUNDS; ++round)
     {
         if (round & 1)
         {
-            fused_samples[round] = measure_once(&fused, ITERATIONS);
+            direct_relaxed_samples[round] = measure_once(&direct_relaxed, ITERATIONS);
+            nullable_relaxed_samples[round] = measure_once(&nullable_relaxed, ITERATIONS);
+            direct_acquire_samples[round] = measure_once(&direct_acquire, ITERATIONS);
             baseline_samples[round] = measure_once(&baseline, ITERATIONS);
         }
         else
         {
             baseline_samples[round] = measure_once(&baseline, ITERATIONS);
-            fused_samples[round] = measure_once(&fused, ITERATIONS);
+            direct_acquire_samples[round] = measure_once(&direct_acquire, ITERATIONS);
+            nullable_relaxed_samples[round] = measure_once(&nullable_relaxed, ITERATIONS);
+            direct_relaxed_samples[round] = measure_once(&direct_relaxed, ITERATIONS);
         }
     }
     baseline_ns = median(baseline_samples);
-    fused_ns = median(fused_samples);
+    direct_acquire_ns = median(direct_acquire_samples);
+    nullable_relaxed_ns = median(nullable_relaxed_samples);
+    direct_relaxed_ns = median(direct_relaxed_samples);
 
-    printf("APPLE_SILICON_HOTPATH block_poll_acquire_ns=%.3f "
-           "block_poll_fused_relaxed_ns=%.3f speedup=%.3fx\n",
-           baseline_ns, fused_ns, baseline_ns / fused_ns);
-    printf("APPLE_SILICON_HOTPATH block_poll_branches=2->1 "
-           "pause_order=acquire->relaxed\n");
+    printf("APPLE_SILICON_HOTPATH block_poll_baseline_ns=%.3f "
+           "direct_acquire_ns=%.3f nullable_relaxed_ns=%.3f "
+           "direct_relaxed_ns=%.3f speedup=%.3fx\n",
+           baseline_ns, direct_acquire_ns, nullable_relaxed_ns,
+           direct_relaxed_ns, baseline_ns / direct_relaxed_ns);
+    printf("APPLE_SILICON_HOTPATH block_poll_nullable_checks=1->0 "
+           "pause_order=acquire->relaxed common_path=fallthrough\n");
 
     close_poll_engine(&baseline);
-    close_poll_engine(&fused);
-    if (!(fused_ns < baseline_ns))
+    close_poll_engine(&direct_acquire);
+    close_poll_engine(&nullable_relaxed);
+    close_poll_engine(&direct_relaxed);
+    if (!(direct_relaxed_ns < baseline_ns))
     {
-        fprintf(stderr, "fused relaxed block poll did not beat baseline\n");
+        fprintf(stderr, "direct relaxed block poll did not beat baseline\n");
         return 1;
     }
     return benchmark_sink == UINT64_MAX ? 1 : 0;
