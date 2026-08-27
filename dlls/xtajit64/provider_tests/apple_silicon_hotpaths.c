@@ -1,9 +1,8 @@
 /*
- * Apple Silicon nanosecond benchmark for the xtajit64 Unicorn
- * context-transfer API boundary.
+ * Apple Silicon nanosecond benchmarks for xtajit64 Unicorn API boundaries.
  *
- * The benchmark first verifies scalar and batch register-transfer semantics,
- * then reports the median cost of a full write/read boundary.
+ * Each benchmark first verifies scalar and batch register-transfer semantics,
+ * then reports the median cost of the relevant hot-path operation.
  */
 
 #include <mach/mach_time.h>
@@ -19,6 +18,7 @@
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define ROUNDS 9
 #define CONTEXT_ITERATIONS 12000u
+#define SYSCALL_ITERATIONS 50000u
 
 struct x64_context
 {
@@ -30,6 +30,11 @@ struct x64_context
     uint32_t mxcsr;
     uint32_t reserved;
     uint64_t xmm[16][2];
+};
+
+struct syscall_state
+{
+    uint64_t rax, rcx, r10, rip;
 };
 
 static const int integer_regs[] =
@@ -73,6 +78,26 @@ static const int context_read_regs[] =
     UC_X86_REG_XMM4,  UC_X86_REG_XMM5,  UC_X86_REG_XMM6,  UC_X86_REG_XMM7,
     UC_X86_REG_XMM8,  UC_X86_REG_XMM9,  UC_X86_REG_XMM10, UC_X86_REG_XMM11,
     UC_X86_REG_XMM12, UC_X86_REG_XMM13, UC_X86_REG_XMM14, UC_X86_REG_XMM15,
+};
+
+static const int syscall_read_regs[] =
+{
+    UC_X86_REG_RAX, UC_X86_REG_RIP, UC_X86_REG_R10,
+};
+
+static const int syscall_write_regs[] =
+{
+    UC_X86_REG_RCX, UC_X86_REG_R10, UC_X86_REG_RIP,
+};
+
+static const int syscall_seed_regs[] =
+{
+    UC_X86_REG_RAX, UC_X86_REG_R10, UC_X86_REG_RIP,
+};
+
+static const int syscall_observe_regs[] =
+{
+    UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_R10, UC_X86_REG_RIP,
 };
 
 static volatile uint64_t benchmark_sink;
@@ -171,6 +196,63 @@ static uc_err batch_read(uc_engine *uc, struct x64_context *context)
                              (int)ARRAY_SIZE(context_read_regs));
 }
 
+static uc_err seed_syscall_state(uc_engine *uc, uint64_t rax, uint64_t r10,
+                                 uint64_t rip)
+{
+    void *values[] = {&rax, &r10, &rip};
+
+    return uc_reg_write_batch(uc, syscall_seed_regs, values,
+                              (int)ARRAY_SIZE(syscall_seed_regs));
+}
+
+static uc_err observe_syscall_state(uc_engine *uc, struct syscall_state *state)
+{
+    void *values[] = {&state->rax, &state->rcx, &state->r10, &state->rip};
+
+    return uc_reg_read_batch(uc, syscall_observe_regs, values,
+                             (int)ARRAY_SIZE(syscall_observe_regs));
+}
+
+static uc_err scalar_prepare_syscall(uc_engine *uc, uint64_t dispatcher,
+                                     uint32_t count, uint64_t *next_rip)
+{
+    uint64_t rax, rip, r10;
+    uc_err error;
+
+    if ((error = uc_reg_read(uc, UC_X86_REG_RAX, &rax)) != UC_ERR_OK)
+        return error;
+    if ((error = uc_reg_read(uc, UC_X86_REG_RIP, &rip)) != UC_ERR_OK)
+        return error;
+    if (rax >= count) return UC_ERR_ARG;
+    if ((error = uc_reg_read(uc, UC_X86_REG_R10, &r10)) != UC_ERR_OK)
+        return error;
+    if ((error = uc_reg_write(uc, UC_X86_REG_RCX, &r10)) != UC_ERR_OK ||
+        (error = uc_reg_write(uc, UC_X86_REG_R10, &rip)) != UC_ERR_OK ||
+        (error = uc_reg_write(uc, UC_X86_REG_RIP, &dispatcher)) != UC_ERR_OK)
+        return error;
+    *next_rip = dispatcher;
+    return UC_ERR_OK;
+}
+
+static uc_err batch_prepare_syscall(uc_engine *uc, uint64_t dispatcher,
+                                    uint32_t count, uint64_t *next_rip)
+{
+    uint64_t rax, rip, r10;
+    void *read_values[] = {&rax, &rip, &r10};
+    void *write_values[] = {&r10, &rip, &dispatcher};
+    uc_err error;
+
+    if ((error = uc_reg_read_batch(uc, syscall_read_regs, read_values,
+                                   (int)ARRAY_SIZE(syscall_read_regs))) != UC_ERR_OK)
+        return error;
+    if (rax >= count) return UC_ERR_ARG;
+    if ((error = uc_reg_write_batch(uc, syscall_write_regs, write_values,
+                                    (int)ARRAY_SIZE(syscall_write_regs))) != UC_ERR_OK)
+        return error;
+    *next_rip = dispatcher;
+    return UC_ERR_OK;
+}
+
 static void initialize_context(struct x64_context *context)
 {
     uint64_t *values = &context->rax;
@@ -223,6 +305,40 @@ static void validate_context_transfer(uc_engine *uc,
     }
 }
 
+static void validate_syscall_transfer(uc_engine *uc, uint64_t dispatcher,
+                                      uint32_t count)
+{
+    const uint64_t input_rax = 7;
+    const uint64_t input_r10 = UINT64_C(0x123456789abcdef0);
+    const uint64_t input_rip = UINT64_C(0x0000000100401234);
+    struct syscall_state scalar_state, batch_state;
+    uint64_t scalar_next = 0, batch_next = 0;
+    uc_err error;
+
+    if ((error = seed_syscall_state(uc, input_rax, input_r10, input_rip)) != UC_ERR_OK)
+        die_unicorn("scalar syscall seed", error);
+    if ((error = scalar_prepare_syscall(uc, dispatcher, count, &scalar_next)) != UC_ERR_OK)
+        die_unicorn("scalar syscall prepare", error);
+    if ((error = observe_syscall_state(uc, &scalar_state)) != UC_ERR_OK)
+        die_unicorn("scalar syscall observe", error);
+
+    if ((error = seed_syscall_state(uc, input_rax, input_r10, input_rip)) != UC_ERR_OK)
+        die_unicorn("batch syscall seed", error);
+    if ((error = batch_prepare_syscall(uc, dispatcher, count, &batch_next)) != UC_ERR_OK)
+        die_unicorn("batch syscall prepare", error);
+    if ((error = observe_syscall_state(uc, &batch_state)) != UC_ERR_OK)
+        die_unicorn("batch syscall observe", error);
+
+    if (memcmp(&scalar_state, &batch_state, sizeof(scalar_state)) ||
+        scalar_next != batch_next || scalar_next != dispatcher ||
+        batch_state.rax != input_rax || batch_state.rcx != input_r10 ||
+        batch_state.r10 != input_rip || batch_state.rip != dispatcher)
+    {
+        fprintf(stderr, "scalar and batch syscall continuation state differ\n");
+        exit(1);
+    }
+}
+
 static double benchmark_context(uc_engine *uc,
                                 const struct x64_context *input,
                                 uint64_t gs_base, bool batch)
@@ -260,6 +376,40 @@ static double benchmark_context(uc_engine *uc,
     return median(samples);
 }
 
+static double benchmark_syscall(uc_engine *uc, uint64_t dispatcher,
+                                uint32_t count, bool batch)
+{
+    const uint64_t input_rax = 7;
+    const uint64_t input_r10 = UINT64_C(0x123456789abcdef0);
+    const uint64_t input_rip = UINT64_C(0x0000000100401234);
+    double samples[ROUNDS];
+    unsigned int round;
+
+    for (round = 0; round < ROUNDS; ++round)
+    {
+        uint64_t begin, next_rip = 0;
+        unsigned int i;
+        uc_err error;
+
+        if ((error = seed_syscall_state(uc, input_rax, input_r10, input_rip)) != UC_ERR_OK)
+            die_unicorn("syscall benchmark seed", error);
+        begin = mach_continuous_time();
+        for (i = 0; i < SYSCALL_ITERATIONS; ++i)
+        {
+            if (batch)
+                error = batch_prepare_syscall(uc, dispatcher, count, &next_rip);
+            else
+                error = scalar_prepare_syscall(uc, dispatcher, count, &next_rip);
+            if (error != UC_ERR_OK) break;
+        }
+        if (error != UC_ERR_OK) die_unicorn("syscall benchmark", error);
+        samples[round] =
+            elapsed_ns(begin, mach_continuous_time()) / SYSCALL_ITERATIONS;
+        benchmark_sink ^= next_rip;
+    }
+    return median(samples);
+}
+
 static void print_cpu_model(void)
 {
     char model[256];
@@ -272,8 +422,10 @@ static void print_cpu_model(void)
 int main(void)
 {
     struct x64_context context;
-    uint64_t gs_base = UINT64_C(0x0000000101000000);
-    double scalar_ns, batch_ns;
+    const uint64_t gs_base = UINT64_C(0x0000000101000000);
+    const uint64_t dispatcher = UINT64_C(0x0000000100800000);
+    const uint32_t syscall_count = 0x1000;
+    double scalar_ns, batch_ns, syscall_scalar_ns, syscall_batch_ns;
     uc_engine *uc = NULL;
     uc_err error;
     size_t i;
@@ -289,16 +441,28 @@ int main(void)
         die_unicorn("uc_open", error);
     initialize_context(&context);
     validate_context_transfer(uc, &context, gs_base);
+    validate_syscall_transfer(uc, dispatcher, syscall_count);
     for (i = 0; i < 100; ++i)
     {
+        uint64_t next_rip;
+
         if ((error = scalar_write(uc, &context, gs_base)) != UC_ERR_OK ||
             (error = scalar_read(uc, &context)) != UC_ERR_OK ||
             (error = batch_write(uc, &context, gs_base)) != UC_ERR_OK ||
-            (error = batch_read(uc, &context)) != UC_ERR_OK)
-            die_unicorn("context warmup", error);
+            (error = batch_read(uc, &context)) != UC_ERR_OK ||
+            (error = seed_syscall_state(uc, 7,
+                                        UINT64_C(0x123456789abcdef0),
+                                        UINT64_C(0x0000000100401234))) != UC_ERR_OK ||
+            (error = scalar_prepare_syscall(uc, dispatcher, syscall_count,
+                                            &next_rip)) != UC_ERR_OK ||
+            (error = batch_prepare_syscall(uc, dispatcher, syscall_count,
+                                           &next_rip)) != UC_ERR_OK)
+            die_unicorn("hot-path warmup", error);
     }
     scalar_ns = benchmark_context(uc, &context, gs_base, false);
     batch_ns = benchmark_context(uc, &context, gs_base, true);
+    syscall_scalar_ns = benchmark_syscall(uc, dispatcher, syscall_count, false);
+    syscall_batch_ns = benchmark_syscall(uc, dispatcher, syscall_count, true);
     uc_close(uc);
 
     printf("APPLE_SILICON_HOTPATH context_scalar_ns=%.3f "
@@ -306,10 +470,20 @@ int main(void)
            scalar_ns, batch_ns, scalar_ns / batch_ns);
     printf("APPLE_SILICON_HOTPATH api_calls_per_boundary=71->2 "
            "removed=69\n");
+    printf("APPLE_SILICON_HOTPATH syscall_scalar_ns=%.3f "
+           "syscall_batch_ns=%.3f speedup=%.3fx\n",
+           syscall_scalar_ns, syscall_batch_ns,
+           syscall_scalar_ns / syscall_batch_ns);
+    printf("APPLE_SILICON_HOTPATH api_calls_per_syscall=6->2 removed=4\n");
 
     if (!(batch_ns < scalar_ns))
     {
         fprintf(stderr, "batch context transfer did not beat scalar calls\n");
+        return 1;
+    }
+    if (!(syscall_batch_ns < syscall_scalar_ns))
+    {
+        fprintf(stderr, "batch syscall continuation did not beat scalar calls\n");
         return 1;
     }
     return benchmark_sink == UINT64_MAX ? 1 : 0;
