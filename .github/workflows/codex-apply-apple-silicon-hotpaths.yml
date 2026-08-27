@@ -2,22 +2,87 @@ name: Codex apply Apple Silicon hot paths
 
 on:
   push:
-    branches: ["perf/apple-silicon-ns-hotpaths"]
+    branches:
+      - perf/apple-silicon-ns-hotpaths
 
 permissions:
   contents: write
 
+concurrency:
+  group: codex-apple-silicon-hotpaths
+  cancel-in-progress: false
+
 jobs:
   apply-test-push:
     runs-on: macos-26
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
-      - name: Check out bootstrap revision
-        uses: actions/checkout@v7
+      - name: Check out staging branch
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Reconstruct and verify optimizer payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/xtajit64-hotpaths.tar.gz"
+          cat .github/codex/v3/payload.b64.* | base64 --decode > "$payload"
+          actual=$(shasum -a 256 "$payload" | awk '{print $1}')
+          test "$actual" = "3b072a747840576a1490ed79f63156287894fc204897305bb74b382a9cf19525"
+          mkdir -p "$RUNNER_TEMP/xtajit64-hotpaths"
+          tar -xzf "$payload" -C "$RUNNER_TEMP/xtajit64-hotpaths"
+          python3 -m py_compile             "$RUNNER_TEMP/xtajit64-hotpaths/patch1.py"             "$RUNNER_TEMP/xtajit64-hotpaths/patch2.py"             "$RUNNER_TEMP/xtajit64-hotpaths/check_apple_silicon_hotpaths.py"
+          bash -n "$RUNNER_TEMP/xtajit64-hotpaths/run_apple_silicon_hotpaths.sh"
+
       - name: Build two clean commits
         shell: bash
         env:
-          FIRST_PATCH: ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpwYXRoID0gUGF0aCgiZGxscy94dGFqaXQ2NC91bml4bGliLmMiKQpzb3VyY2UgPSBwYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQoKZGVmIHJlcGxhY2Vfb25jZShvbGQsIG5ldyk6CiAgICBnbG9iYWwgc291cmNlCiAgICBjb3VudCA9IHNvdXJjZS5jb3VudChvbGQpCiAgICBpZiBjb3VudCAhPSAxOgogICAgICAgIHJhaXNlIFN5c3RlbUV4aXQoZiJleHBlY3RlZCBvbmUgcmVwbGFjZW1lbnQsIGZvdW5kIHtjb3VudH06IHtvbGRbOjgwXSFyfSIpCiAgICBzb3VyY2UgPSBzb3VyY2UucmVwbGFjZShvbGQsIG5ldywgMSkKCnJlcGxhY2Vfb25jZSgiICAgIHVpbnQ2NF90IGVjX3BhZ2Vfc2l6ZTtcbiIsICIgICAgdWludDY0X3QgZWNfcGFnZV9zaGlmdDtcbiIpCnJlcGxhY2Vfb25jZSgnc3RhdGljIEJPT0wgaXNfZWNfY29kZSggdWludDY0X3QgYWRkcmVzcyApXG57XG4gICAgdWludDY0X3QgcGFnZSwgd29yZDtcblxuICAgIGlmICghcHJvdmlkZXIuZWNfYml0bWFwIHx8IGFkZHJlc3MgPiBwcm92aWRlci5oaWdoZXN0X3VzZXJfYWRkcmVzcykgcmV0dXJuIEZBTFNFO1xuICAgIHBhZ2UgPSBhZGRyZXNzIC8gcHJvdmlkZXIuZWNfcGFnZV9zaXplO1xuICAgIHdvcmQgPSBwcm92aWRlci5lY19iaXRtYXBbcGFnZSAvIDY0XTtcbiAgICByZXR1cm4gKHdvcmQgPj4gKHBhZ2UgJiA2MykpICYgMTtcbn1cbicsICdzdGF0aWMgaW5saW5lIEJPT0wgaXNfZWNfY29kZSggdWludDY0X3QgYWRkcmVzcyApXG57XG4gICAgdWludDY0X3QgcGFnZTtcblxuICAgIGlmICghcHJvdmlkZXIuZWNfYml0bWFwIHx8IGFkZHJlc3MgPiBwcm92aWRlci5oaWdoZXN0X3VzZXJfYWRkcmVzcykgcmV0dXJuIEZBTFNFO1xuICAgIHBhZ2UgPSBhZGRyZXNzID4+IHByb3ZpZGVyLmVjX3BhZ2Vfc2hpZnQ7XG4gICAgcmV0dXJuIChwcm92aWRlci5lY19iaXRtYXBbcGFnZSA+PiA2XSA+PiAocGFnZSAmIDYzKSkgJiAxO1xufVxuJykKcmVwbGFjZV9vbmNlKAogICAgIiAgICBwcm92aWRlci5lY19wYWdlX3NpemUgPSBwYXJhbXM+Gt1c2VyX3NpemU7XG4iLAogICAgIiAgICBwcm92aWRlci5lY19wYWdlX3NoaWZ0ID0gX19idWlsdGluX2N0emxsKCBwYXJhbXMtPmt1c2VyX3NpemUgKTtcbiIsCikKcmVwbGFjZV9vbmNlKCIgICAgcHJvdmlkZXIuZWNfcGFnZV9zaXplID0gMDtcbiIsICIgICAgcHJvdmlkZXIuZWNfcGFnZV9zaGlmdCA9IDA7XG4iKQpwYXRoLndyaXRlX3RleHQoc291cmNlLCBlbmNvZGluZz0idXRmLTgiKQo=
-          SECOND_PATCH: ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBiYXNlNjQKCnBhdGggPSBQYXRoKCJkbGxzL3h0YWppdDY0L3VuaXhsaWIuYyIpCnNvdXJjZSA9IHBhdGgucmVhZF90ZXh0KGVuY29kaW5nPSJ1dGYtOCIpCgpkZWYgcmVwbGFjZV9vbmNlKG9sZCwgbmV3KToKICAgIGdsb2JhbCBzb3VyY2UKICAgIGNvdW50ID0gc291cmNlLmNvdW50KG9sZCkKICAgIGlmIGNvdW50ICE9IDE6CiAgICAgICAgcmFpc2UgU3lzdGVtRXhpdChmImV4cGVjdGVkIG9uZSByZXBsYWNlbWVudCwgZm91bmQge2NvdW50fToge29sZFs6ODBdIXJ9IikKICAgIHNvdXJjZSA9IHNvdXJjZS5yZXBsYWNlKG9sZCwgbmV3LCAxKQoKcmVwbGFjZV9vbmNlKCdzdGF0aWMgY29uc3QgaW50IGludGVnZXJfcmVnc1tdID1cbntcbiAgICBVQ19YODZfUkVHX1JBWCwgVUNfWDg2X1JFR19SQlgsIFVDX1g4Nl9SRUdfUkNYLCBVQ19YODZfUkVHX1JEWCxcbiAgICBVQ19YODZfUkVHX1JTSSwgVUNfWDg2X1JFR19SREksIFVDX1g4Nl9SRUdfUkJQLCBVQ19YODZfUkVHX1JTUCxcbiAgICBVQ19YODZfUkVHX1I4LCAgVUNfWDg2X1JFR19SOSwgIFVDX1g4Nl9SRUdfUjEwLCBVQ19YODZfUkVHX1IxMSxcbiAgICBVQ19YODZfUkVHX1IxMiwgVUNfWDg2X1JFR19SMTMsIFVDX1g4Nl9SRUdfUjE0LCBVQ19YODZfUkVHX1IxNSxcbiAgICBVQ19YODZfUkVHX1JJUCwgVUNfWDg2X1JFR19FRkxBR1MsXG59O1xuXG5zdGF0aWMgY29uc3QgaW50IHhtbV9yZWdzW10gPVxue1xuICAgIFVDX1g4Nl9SRUdfWE1NMCwgIFVDX1g4Nl9SRUdfWE1NMSwgIFVDX1g4Nl9SRUdfWE1NMiwgIFVDX1g4Nl9SRUdfWE1NMyxcbiAgICBVQ19YODZfUkVHX1hNTTQsICBVQ19YODZfUkVHX1hNTTUsICBVQ19YODZfUkVHX1hNTTYsICBVQ19YODZfUkVHX1hNTTcsXG4gICAgVUNfWDg2X1JFR19YTU04LCAgVUNfWDg2X1JFR19YTU05LCAgVUNfWDg2X1JFR19YTU0xMCwgVUNfWDg2X1JFR19YTU0xMSxcbiAgICBVQ19YODZfUkVHX1hNTTEyLCBVQ19YODZfUkVHX1hNTTEzLCBVQ19YODZfUkVHX1hNTTE0LCBVQ19YODZfUkVHX1hNTTE1LFxufTtc bicsICdlbnVtXG57XG4gICAgWFRBSklUNjRfQ09OVEVYVF9JTlRFR0VSX1JFR19DT1VOVCA9IDE4LFxuICAgIFhUQUpJVDY0X0NPTlRFWFRfWE1NX1JFR19DT1VOVCA9IDE2LFxufTtcblxuc3RhdGljIGNvbnN0IGludCBjb250ZXh0X3dyaXRlX3JlZ3NbXSA9XG57XG4gICAgVUNfWDg2X1JFR19SQVgsIFVDX1g4Nl9SRUdfUkJYLCBVQ19YODZfUkVHX1JDWCwgVUNfWDg2X1JFR19SRFgsXG4gICAgVUNfWDg2X1JFR19SU0ksIFVDX1g4Nl9SRUdfUkRJLCBVQ19YODZfUkVHX1JCUCwgVUNfWDg2X1JFR19SU1AsXG4gICAgVUNfWDg2X1JFR19SOCwgIFVDX1g4Nl9SRUdfUjksICBVQ19YODZfUkVHX1IxMCwgVUNfWDg2X1JFR19SMTEsXG4gICAgVUNfWDg2X1JFR19SMTIsIFVDX1g4Nl9SRUdfUjEzLCBVQ19YODZfUkVHX1IxNCwgVUNfWDg2X1JFR19SMTUsXG4gICAgVUNfWDg2X1JFR19SSVAsIFVDX1g4Nl9SRUdfRUZMQUdTLCBVQ19YODZfUkVHX0dTX0JBU0UsIFVDX1g4Nl9SRUdfTVhDU1IsXG4gICAgVUNfWDg2X1JFR19YTU0wLCAgVUNfWDg2X1JFR19YTU0xLCAgVUNfWDg2X1JFR19YTU0yLCAgVUNfWDg2X1JFR19YTU0zLFxuICAgIFVDX1g4Nl9SRUdfWE1NNCwgIFVDX1g4Nl9SRUdfWE1NNSwgIFVDX1g4Nl9SRUdfWE1NNiwgIFVDX1g4Nl9SRUdfWE1NNyxcbiAgICBVQ19YODZfUkVHX1hNTTgsICBVQ19YODZfUkVHX1hNTTksICBVQ19YODZfUkVHX1hNTTEwLCBVQ19YODZfUkVHX1hNTTExLFxuICAgIFVDX1g4Nl9SRUdfWE1NMTIsIFVDX1g4Nl9SRUdfWE1NMTMsIFVDX1g4Nl9SRUdfWE1NMTQsIFVDX1g4Nl9SRUdfWE1NMTUsXG59O1xuXG5zdGF0aWMgY29uc3QgaW50IGNvbnRleHRfcmVhZF9yZWdzW10gPVxue1xuICAgIFVDX1g4Nl9SRUdfUkFYLCBVQ19YODZfUkVHX1JCWCwgVUNfWDg2X1JFR19SQ1gsIFVDX1g4Nl9SRUdfUkRYLFxuICAgIFVDX1g4Nl9SRUdfUlNJLCBVQ19YODZfUkVHX1JESSwgVUNfWDg2X1JFR19SQlAsIFVDX1g4Nl9SRUdfUlNQLFxuICAgIFVDX1g4Nl9SRUdfUjgsICBVQ19YODZfUkVHX1I5LCAgVUNfWDg2X1JFR19SMTAsIFVDX1g4Nl9SRUdfUjExLFxuICAgIFVDX1g4Nl9SRUdfUjEyLCBVQ19YODZfUkVHX1IxMywgVUNfWDg2X1JFR19SMTQsIFVDX1g4Nl9SRUdfUjE1LFxuICAgIFVDX1g4Nl9SRUdfUklQLCBVQ19YODZfUkVHX0VGTEFHUywgVUNfWDg2X1JFR19NWENTUixcbiAgICBVQ19YODZfUkVHX1hNTTAsICBVQ19YODZfUkVHX1hNTTEsICBVQ19YODZfUkVHX1hNTTIsICBVQ19YODZfUkVHX1hNTTMsXG4gICAgVUNfWDg2X1JFR19YTU00LCAgVUNfWDg2X1JFR19YTU01LCAgVUNfWDg2X1JFR19YTU02LCAgVUNfWDg2X1JFR19YTU03LFxuICAgIFVDX1g4Nl9SRUdfWE1NOCwgIFVDX1g4Nl9SRUdfWE1NOSwgIFVDX1g4Nl9SRUdfWE1NMTAsIFVDX1g4Nl9SRUdfWE1NMTEsXG4gICAgVUNfWDg2X1JFR19YTU0xMiwgVUNfWDg2X1JFR19YTU0xMywgVUNfWDg2X1JFR19YTU0xNCwgVUNfWDg2X1JFR19YTU0xNSxcbn07XG5cbkNfQVNTRVJUKCBvZmZzZXRvZihzdHJ1Y3QgeHRhaml0NjRfeDY0X2NvbnRleHQsIG14Y3NyKSA9PVxuICAgICAgICAgIFhUQUpJVDY0X0NPTlRFWFRfSU5URUdFUl9SRUdfQ09VTlQgKiBzaXplb2YoVUlOVDY0KSApO1xuQ19BU1NFUlQoIEFSUkFZX1NJWkUoKChzdHJ1Y3QgeHRhaml0NjRfeDY0X2NvbnRleHQgKTApLT54bW0pID09XG4gICAgICAgICAgWFRBSklUNjRfQ09OVEVYVF9YTU1fUkVHX0NPVU5UICk7XG5DX0FTU0VSVCggQVJSQVlfU0laRShjb250ZXh0X3dyaXRlX3JlZ3MpID09XG4gICAgICAgICAgWFRBSklUNjRfQ09OVEVYVF9JTlRFR0VSX1JFR19DT1VOVCArIFhUQUpJVDY0X0NPTlRFWFRfWE1NX1JFR19DT1VOVCArIDIgKTtcbkNfQVNTRVJUKCBBUlJBWV9TSVpFKGNvbnRleHRfcmVhZF9yZWdzKSA9PVxuICAgICAgICAgIFhUQUpJVDY0X0NPTlRFWFRfSU5URUdFUl9SRUdfQ09VTlQgKyBYVEFKSVQ2NF9DT05URVhUX1hNTV9SRUdfQ09VTlQgKyAxICk7XG4nKQpyZXBsYWNlX29uY2UoJ3N0YXRpYyB1Y19lcnIgd3JpdGVfY29udGV4dCggc3RydWN0IHRocmVhZF9lbmdpbmUgKmVuZ2luZSxcbiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgY29uc3Qgc3RydWN0IHh0YWppdDY0X3g2NF9jb250ZXh0ICpjb250ZXh0LFxuICAgICAgICAgICAgICAgICAgICAgICAgICAgICB1aW50NjRfdCBnc19iYXNlIClcbntcbiAgICBjb25zdCBVSU5UNjQgKnZhbHVlcyA9ICZjb250ZXh0LT5yYXg7XG4gICAgdWNfZXJyIGVycjtcbiAgICB1bnNpZ25lZCBpbnQgaTtcblxuI2lmZGVmIFhUQUpJVDY0X1VOSVhMSUJfVEVTVFxuICAgIGF0b21pY19mZXRjaF9hZGRfZXhwbGljaXQoICZ0ZXN0X2NvbnRleHRfd3JpdGVfY291bnQsIDEsIG1lbW9yeV9vcmRlcl9yZWxheGVkICk7XG4jZW5kaWZcbiAgICBmb3IgKGkgPSAwOyBpIDwgQVJSQVlfU0laRShpbnRlZ2VyX3JlZ3MpOyArK2kpXG4gICAgICAgIGlmICgoZXJyID0gdWNfcmVnX3dyaXRlKCBlbmdpbmUtPnVjLCBpbnRlZ2VyX3JlZ3NbaV0sICZ2YWx1ZXNbaV0gKSkgIT0gVUNfRVJSX09LKFxuICAgICAgICAgICAgcmV0dXJuIGVycjtcbiAgICBpZiAoKGVyciA9IHVjX3JlZ193cml0ZSggZW5naW5lLT51YywgVUNfWDg2X1JFR19HU19CQVNFLCAmZ3NfYmFzZSApKSAhPSBVQ19FUlJfT0spXG4gICAgICAgIHJldHVybiBlcnI7XG4gICAgaWYgKChlcnIgPSB1Y19yZWdfd3JpdGUoIGVuZ2luZS0+dWMsIFVDX1g4Nl9SRUdfTVhDU1IsICZjb250ZXh0LT5teGNzciApKSAhPSBVQ19FUlJfT0spXG4gICAgICAgIHJldHVybiBlcnI7XG4gICAgZm9yIChpID0gMDsgaSA8IEFSUkFZX1NJWkUoeG1tX3JlZ3MpOyArK2kpXG4gICAgICAgIGlmICgoZXJyID0gdWNfcmVnX3dyaXRlKCBlbmdpbmUtPnVjLCB4bW1fcmVnc1tpXSwgY29udGV4dC0+eG1tW2ldICkpICE9IFVDX0VSUl9PSylcbiAgICAgICAgICAgIHJldHVybiBlcnI7XG4gICAgcmV0dXJuIFVDX0VSUl9PSztcbn1cblxuc3RhdGljIHVjX2VyciByZWFkX2NvbnRleHQoIHN0cnVjdCB0aHJlYWRfZW5naW5lICplbmdpbmUsXG4gICAgICAgICAgICAgICAgICAgICAgICAgICAgc3RydWN0IHh0YWppdDY0X3g2NF9jb250ZXh0ICpjb250ZXh0IClcbntcbiAgICBVSU5UNjQgKnZhbHVlcyA9ICZjb250ZXh0LT5yYXg7XG4gICAgdWNfZXJyIGVycjtcbiAgICB1bnNpZ25lZCBpbnQgaTtcblxuI2lmZGVmIFhUQUpJVDY0X1VOSVhMSUJfVEVTVFxuICAgIGF0b21pY19mZXRjaF9hZGRfZXhwbGljaXQoICZ0ZXN0X2NvbnRleHRfcmVhZF9jb3VudCwgMSwgbWVtb3J5X29yZGVyX3JlbGF4ZWQgKTtcbiAgICBpZiAoYXRvbWljX2xvYWRfZXhwbGljaXQoICZ0ZXN0X2NoZWNrX2NvbnRleHRfcmVhZF9sb2NrLCBtZW1vcnlfb3JkZXJfYWNxdWlyZSApKVxuICAgIHtcbiAgICAgICAgaW50IHJldCA9IHB0aHJlYWRfbXV0ZXhfdHJ5bG9jayggJnByb3ZpZGVyLm11dGV4ICk7XG5cbiAgICAgICAgaWYgKCFyZXQpXG4gICAgICAgIHtcbiAgICAgICAgICAgIGF0b21pY19zdG9yZV9leHBsaWNpdCggJnRlc3RfY29udGV4dF9yZWFkX2xvY2tfdmlvbGF0aW9uLCAxLFxuICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbWVtb3J5X29yZGVyX3JlbGVhc2UgKTtcbiAgICAgICAgICAgIHB0aHJlYWRfbXV0ZXhfdW5sb2NrKCAmcHJvdmlkZXIubXV0ZXggKTtcbiAgICAgICAgfVxuICAgICAgICBlbHNlIGlmIChyZXQgIT0gRUJVU1kpXG4gICAgICAgICAgICBhdG9taWNfc3RvcmVfZXhwbGljaXQoICZ0ZXN0X2NvbnRleHRfcmVhZF9sb2NrX3Zpb2xhdGlvbiwgMSxcbiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbWVtb3J5X29yZGVyX3JlbGVhc2UgKTtcbiAgICB9XG4jZW5kaWZcbiAgICBmb3IgKGkgPSAwOyBpIDwgQVJSQVlfU0laRShpbnRlZ2VyX3JlZ3MpOyArK2kpXG4gICAgICAgIGlmICgoZXJyID0gdWNfcmVnX3JlYWQoIGVuZ2luZS0+dWMsIGludGVnZXJfcmVnc1tpXSwgJnZhbHVlc1tpXSApKSAhPSBVQ19FUlJfT0spXG4gICAgICAgICAgICByZXR1cm4gZXJyO1xuICAgIGlmICgoZXJyID0gdWNfcmVnX3JlYWQoIGVuZ2luZS0+dWMsIFVDX1g4Nl9SRUdfTVhDU1IsICZjb250ZXh0LT5teGNzciApKSAhPSBVQ19FUlJfT0spXG4gICAgICAgIHJldHVybiBlcnI7XG4gICAgZm9yIChpID0gMDsgaSA8IEFSUkFZX1NJWkUoeG1tX3JlZ3MpOyArK2kpXG4gICAgICAgIGlmICgoZXJyID0gdWNfcmVnX3JlYWQoIGVuZ2luZS0+dWMsIHhtbV9yZWdzW2ldLCBjb250ZXh0LT54bW1baV0gKSkgIT0gVUNfRVJSX09LKFxuICAgICAgICAgICAgcmV0dXJuIGVycjtcbiAgICByZXR1cm4gVUNfRVJSX09LO1xufVxuJyw...
+          BASE_SHA: a6224b8a7ca9763024c7d40271abcc040dcc65f4
+        run: |
+          set -euo pipefail
+          expected_remote=$(git rev-parse "origin/$GITHUB_REF_NAME")
+          payload_dir="$RUNNER_TEMP/xtajit64-hotpaths"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git reset --hard "$BASE_SHA"
+
+          python3 "$payload_dir/patch1.py"
+          git diff --check
+          grep -Fq 'page = address >> provider.ec_page_shift;' dlls/xtajit64/unixlib.c
+          if sed -n '/static inline BOOL is_ec_code/,/^}/p' dlls/xtajit64/unixlib.c | grep -q '/'; then
+            echo "runtime division remains in is_ec_code" >&2
+            exit 1
+          fi
+          git add dlls/xtajit64/unixlib.c
+          git commit -m "xtajit64: remove division from EC block classification"
+
+          python3 "$payload_dir/patch2.py"
+          install -m 755 "$payload_dir/check_apple_silicon_hotpaths.py"             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
+          install -m 644 "$payload_dir/apple_silicon_hotpaths.c"             dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c
+          install -m 755 "$payload_dir/run_apple_silicon_hotpaths.sh"             dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
+          install -m 644 "$payload_dir/xtajit64-apple-silicon-hotpaths.yml"             .github/workflows/xtajit64-apple-silicon-hotpaths.yml
+
+          python3 dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py             dlls/xtajit64/unixlib.c
+          python3 -m py_compile             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py
+          bash -n dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
+          bash -n dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh
+          git diff --check
+          git add             .github/workflows/xtajit64-apple-silicon-hotpaths.yml             dlls/xtajit64/unixlib.c             dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py             dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh             dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh
+          git commit -m "xtajit64: batch Unicorn context transfers"
+
+          git log --oneline --decorate -2
+          git diff --check "$BASE_SHA..HEAD"
+
+          set -o pipefail
+          dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh             "$RUNNER_TEMP/xtajit64-benchmark" | tee "$RUNNER_TEMP/hotpaths.log"
+          {
+            echo "## Bootstrap Apple Silicon benchmark"
+            echo
+            echo '```text'
+            grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)'               "$RUNNER_TEMP/hotpaths.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          git push             --force-with-lease="refs/heads/$GITHUB_REF_NAME:$expected_remote"             origin "HEAD:refs/heads/$GITHUB_REF_NAME"
