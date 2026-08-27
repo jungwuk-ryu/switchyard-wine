@@ -91,7 +91,7 @@ jobs:
           dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
             "$RUNNER_TEMP/xtajit64-hotpaths" | tee "$RUNNER_TEMP/hotpaths.log"
           grep -E '^APPLE_SILICON_HOTPATH block_poll_' "$RUNNER_TEMP/hotpaths.log"
-          grep -F 'APPLE_SILICON_HOTPATH block_poll_nullable_checks=1->0 pause_order=acquire->relaxed common_path=fallthrough' \
+          grep -F 'APPLE_SILICON_HOTPATH block_poll_nullable_checks=1->0 pause_order=acquire->relaxed common_path=negative-early-return' \
             "$RUNNER_TEMP/hotpaths.log"
           {
             echo "## Apple Silicon translated-block poll benchmark"
