@@ -1,0 +1,103 @@
+name: Codex finalize Apple Silicon performance PR
+
+on:
+  push:
+    branches:
+      - perf/apple-silicon-ns-hotpaths
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: codex-finalize-apple-silicon-performance-pr
+  cancel-in-progress: true
+
+env:
+  OUTPUT_BRANCH: perf/apple-silicon-context-batching
+
+jobs:
+  benchmark-and-update:
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - name: Check out optimized branch
+        uses: actions/checkout@v7
+        with:
+          ref: perf/apple-silicon-context-batching
+          fetch-depth: 0
+
+      - name: Re-run native Apple Silicon benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          workspace="$RUNNER_TEMP/xtajit64-pr-final-benchmark"
+          dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
+            "$workspace" | tee "$RUNNER_TEMP/context-hotpaths.log"
+          dlls/xtajit64/provider_tests/run_syscall_register_hotpath.sh \
+            "$workspace" | tee "$RUNNER_TEMP/syscall-hotpaths.log"
+          grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+            "$RUNNER_TEMP/context-hotpaths.log" > "$RUNNER_TEMP/benchmark-summary.log"
+          grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+            "$RUNNER_TEMP/syscall-hotpaths.log" >> "$RUNNER_TEMP/benchmark-summary.log"
+
+      - name: Update pull request title and description
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr_number=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "$OUTPUT_BRANCH" \
+            --base main \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+          test -n "$pr_number"
+          body="$RUNNER_TEMP/pr-body.md"
+          cat > "$body" <<'EOF'
+          ## Summary
+
+          Reduce the number of Unicorn API boundaries in the two highest-frequency xtajit64 register-transfer paths.
+
+          - Replace 36 scalar `uc_reg_write()` calls and 35 scalar `uc_reg_read()` calls at a complete x64 context boundary with one `uc_reg_write_batch()` and one `uc_reg_read_batch()` call.
+          - Replace the six scalar Unicorn calls in valid x64 syscall preparation with one batched read and one batched write.
+          - Preserve register order through explicit register/value arrays and compile-time layout assertions.
+          - Extend native provider linkage checks to require the Unicorn batch APIs.
+          - Add semantic-equivalence checks, static source contracts, and native Apple Silicon nanosecond benchmarks.
+
+          ## Native Apple Silicon measurements
+
+          Measured on GitHub's native `macos-26-arm64` environment. Every benchmark verifies scalar and batched register state equality before timing.
+
+          ```text
+          EOF
+          cat "$RUNNER_TEMP/benchmark-summary.log" >> "$body"
+          cat >> "$body" <<'EOF'
+          ```
+
+          The full context boundary removes 69 Unicorn API entries (`71 → 2`). The valid syscall preparation path removes four (`6 → 2`). These are per-operation microbenchmarks, not claims about whole-application latency.
+
+          ## Rejected experiment
+
+          An EC-bitmap page classifier using a precomputed shift was also measured. It regressed from **1.407 ns** to **1.516 ns** (`0.928×`) on the same Apple Silicon class of runner, so it is intentionally excluded.
+
+          ## Validation
+
+          - Native arm64 Unicorn builds and both benchmarks pass on `macos-26`.
+          - Scalar/batched semantic-equivalence checks pass for full context round trips and valid/invalid syscall preparation.
+          - Static hot-path contract checkers pass.
+          - Python byte-compilation and shell syntax checks pass.
+          - Repository source-integrity workflow passes.
+          - `git diff --check` passes.
+
+          ## Risk
+
+          The production changes are localized to register marshaling. They use Unicorn 2.1 batch APIs already exported by the pinned runtime dependency, preserve the original register ordering and error propagation, and do not change the provider ABI or context layout.
+          EOF
+          gh pr edit "$pr_number" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "xtajit64: batch Unicorn register transfers on Apple Silicon" \
+            --body-file "$body"
