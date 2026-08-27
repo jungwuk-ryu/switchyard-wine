@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[3]
 UNIXLIB = ROOT / "dlls/xtajit64/unixlib.c"
 CHECKER = ROOT / "dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py"
 RUNNER = ROOT / "dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh"
+BENCHMARK = ROOT / "dlls/xtajit64/provider_tests/apple_silicon_block_poll.c"
 
 
 def replace_function(source: str, name: str, replacement: str) -> str:
@@ -35,6 +36,12 @@ def replace_function(source: str, name: str, replacement: str) -> str:
     if end < 0:
         raise SystemExit(f"unterminated {name}()")
     return source[:start] + replacement.rstrip() + source[end:]
+
+
+def replace_once(source: str, old: str, new: str, label: str) -> str:
+    if source.count(old) != 1:
+        raise SystemExit(f"{label} changed unexpectedly")
+    return source.replace(old, new, 1)
 
 
 def patch_unixlib() -> None:
@@ -159,10 +166,44 @@ block_poll_benchmark="$work_dir/apple_silicon_block_poll"
     RUNNER.write_text(source, encoding="utf-8")
 
 
+def patch_benchmark() -> None:
+    source = BENCHMARK.read_text(encoding="utf-8")
+    source = replace_once(
+        source,
+        "#define ITERATIONS UINT64_C(500000)",
+        "#define ITERATIONS UINT64_C(2000000)",
+        "block-poll iteration count",
+    )
+    source = replace_once(
+        source,
+        "           direct_relaxed_ns, baseline_ns / direct_relaxed_ns);",
+        "           direct_relaxed_ns, baseline_ns / direct_acquire_ns);",
+        "block-poll speedup target",
+    )
+    source = replace_once(
+        source,
+        '           "pause_order=acquire->relaxed common_path=negative-early-return\\n");',
+        '           "pause_order=acquire common_path=negative-early-return\\n");',
+        "block-poll contract output",
+    )
+    source = replace_once(
+        source,
+        "    if (!(direct_relaxed_ns < baseline_ns))\n"
+        "    {\n"
+        "        fprintf(stderr, \"direct relaxed block poll did not beat baseline\\n\");",
+        "    if (!(direct_acquire_ns < baseline_ns))\n"
+        "    {\n"
+        "        fprintf(stderr, \"direct acquire block poll did not beat baseline\\n\");",
+        "block-poll performance gate",
+    )
+    BENCHMARK.write_text(source, encoding="utf-8")
+
+
 def main() -> None:
     patch_unixlib()
     patch_checker()
     patch_runner()
+    patch_benchmark()
 
 
 if __name__ == "__main__":
