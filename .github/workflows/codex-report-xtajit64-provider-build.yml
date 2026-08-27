@@ -1,0 +1,59 @@
+name: Codex report optimized xtajit64 provider build
+
+on:
+  push:
+    branches:
+      - perf/apple-silicon-ns-hotpaths
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: codex-report-optimized-xtajit64-provider-build
+  cancel-in-progress: true
+
+env:
+  OUTPUT_BRANCH: perf/apple-silicon-context-batching
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm successful native provider validation and comment on PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          validation=$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow "Codex validate optimized xtajit64 provider build" \
+            --branch perf/apple-silicon-ns-hotpaths \
+            --limit 1 \
+            --json databaseId,conclusion,status,url \
+            --jq '.[0]')
+          test "$(jq -r .status <<<"$validation")" = completed
+          test "$(jq -r .conclusion <<<"$validation")" = success
+          run_url=$(jq -r .url <<<"$validation")
+          pr_number=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "$OUTPUT_BRANCH" \
+            --base main \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+          test -n "$pr_number"
+          cat > "$RUNNER_TEMP/comment.md" <<EOF
+          Native provider validation also passed on a native macOS arm64 runner:
+
+          - configured the optimized Wine tree against the patched Switchyard Unicorn build;
+          - compiled \`dlls/xtajit64/xtajit64.so\` and the ARM64EC PE provider;
+          - ran \`dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh\` successfully.
+
+          Validation run: $run_url
+          EOF
+          gh pr comment "$pr_number" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body-file "$RUNNER_TEMP/comment.md"
