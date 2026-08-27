@@ -1,0 +1,121 @@
+name: Codex apply Apple Silicon syscall batching
+
+on:
+  push:
+    branches:
+      - perf/apple-silicon-ns-hotpaths
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-apple-silicon-syscall-batching
+  cancel-in-progress: true
+
+env:
+  OUTPUT_BRANCH: perf/apple-silicon-context-batching
+
+jobs:
+  build-benchmark-publish:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Check out staging branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Stage and verify payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload_dir="$RUNNER_TEMP/syscall-batching-payload"
+          mkdir -p "$payload_dir"
+          cp .github/codex/syscall-batching/patch.py "$payload_dir/patch.py"
+          cp .github/codex/syscall-batching/check.py "$payload_dir/check.py"
+          cp .github/codex/syscall-batching/syscall_register_hotpath.c \
+            "$payload_dir/syscall_register_hotpath.c"
+          cp .github/codex/syscall-batching/run_v2.sh "$payload_dir/run.sh"
+          python3 - "$payload_dir/syscall_register_hotpath.c" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          text, count = re.subn(
+              r"#define SAMPLE_COUNT\s+nine_samples_are_required\n#undef SAMPLE_COUNT\n",
+              "",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("cannot sanitize staged benchmark source")
+          path.write_text(text, encoding="utf-8")
+          PY
+          python3 -m py_compile "$payload_dir/patch.py" "$payload_dir/check.py"
+          bash -n "$payload_dir/run.sh"
+
+      - name: Apply production and benchmark commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload_dir="$RUNNER_TEMP/syscall-batching-payload"
+          git fetch origin "$OUTPUT_BRANCH"
+          expected_remote=$(git rev-parse "origin/$OUTPUT_BRANCH")
+          git checkout -B "$OUTPUT_BRANCH" "origin/$OUTPUT_BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 "$payload_dir/patch.py"
+          python3 "$payload_dir/check.py" dlls/xtajit64/unixlib.c
+          git diff --check
+          git add dlls/xtajit64/unixlib.c
+          git commit -m "xtajit64: batch syscall register transfers"
+
+          install -m 755 "$payload_dir/check.py" \
+            dlls/xtajit64/provider_tests/check_syscall_register_batching.py
+          install -m 644 "$payload_dir/syscall_register_hotpath.c" \
+            dlls/xtajit64/provider_tests/syscall_register_hotpath.c
+          install -m 755 "$payload_dir/run.sh" \
+            dlls/xtajit64/provider_tests/run_syscall_register_hotpath.sh
+          python3 dlls/xtajit64/provider_tests/check_syscall_register_batching.py \
+            dlls/xtajit64/unixlib.c
+          python3 -m py_compile \
+            dlls/xtajit64/provider_tests/check_syscall_register_batching.py
+          bash -n dlls/xtajit64/provider_tests/run_syscall_register_hotpath.sh
+          git diff --check
+          git add \
+            dlls/xtajit64/provider_tests/check_syscall_register_batching.py \
+            dlls/xtajit64/provider_tests/syscall_register_hotpath.c \
+            dlls/xtajit64/provider_tests/run_syscall_register_hotpath.sh
+          git commit -m "test: add Apple Silicon syscall register benchmark"
+
+          git log --oneline --decorate -5
+          git diff --check "$expected_remote..HEAD"
+          printf '%s\n' "$expected_remote" > "$RUNNER_TEMP/expected-output-head"
+
+      - name: Benchmark native arm64 and publish branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          workspace="$RUNNER_TEMP/xtajit64-apple-silicon-hotpaths"
+          dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
+            "$workspace" | tee "$RUNNER_TEMP/context-hotpaths.log"
+          dlls/xtajit64/provider_tests/run_syscall_register_hotpath.sh \
+            "$workspace" | tee "$RUNNER_TEMP/syscall-hotpaths.log"
+          {
+            echo "## Apple Silicon register-transfer benchmarks"
+            echo
+            echo '```text'
+            grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+              "$RUNNER_TEMP/context-hotpaths.log"
+            grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
+              "$RUNNER_TEMP/syscall-hotpaths.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          expected_remote=$(cat "$RUNNER_TEMP/expected-output-head")
+          git push \
+            --force-with-lease="refs/heads/$OUTPUT_BRANCH:$expected_remote" \
+            origin "HEAD:refs/heads/$OUTPUT_BRANCH"
