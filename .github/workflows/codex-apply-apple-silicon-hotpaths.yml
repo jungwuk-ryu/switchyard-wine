@@ -1,4 +1,4 @@
-name: Codex apply Apple Silicon context batching
+name: Codex publish Apple Silicon context batching
 
 on:
   push:
@@ -13,9 +13,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  apply-test-push:
+  build-benchmark-publish:
     runs-on: macos-26
     timeout-minutes: 45
+    env:
+      OUTPUT_BRANCH: perf/apple-silicon-context-batching
+      BASE_SHA: a6224b8a7ca9763024c7d40271abcc040dcc65f4
     steps:
       - name: Check out staging branch
         uses: actions/checkout@v4
@@ -37,13 +40,10 @@ jobs:
             "$RUNNER_TEMP/xtajit64-context-transfer/check_apple_silicon_hotpaths.py"
           bash -n "$RUNNER_TEMP/xtajit64-context-transfer/run_apple_silicon_hotpaths.sh"
 
-      - name: Build, benchmark, and publish two clean commits
+      - name: Build two clean commits
         shell: bash
-        env:
-          BASE_SHA: a6224b8a7ca9763024c7d40271abcc040dcc65f4
         run: |
           set -euo pipefail
-          expected_remote=$(git rev-parse "origin/$GITHUB_REF_NAME")
           payload_dir="$RUNNER_TEMP/xtajit64-context-transfer"
 
           git config user.name "github-actions[bot]"
@@ -66,8 +66,6 @@ jobs:
             dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c
           install -m 755 "$payload_dir/run_apple_silicon_hotpaths.sh" \
             dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
-          install -m 644 "$payload_dir/xtajit64-apple-silicon-hotpaths.yml" \
-            .github/workflows/xtajit64-apple-silicon-hotpaths.yml
 
           python3 dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py \
             dlls/xtajit64/unixlib.c
@@ -77,27 +75,25 @@ jobs:
           bash -n dlls/xtajit64/provider_tests/run_unixlib_concurrency.sh
           git diff --check
           git add \
-            .github/workflows/xtajit64-apple-silicon-hotpaths.yml \
             dlls/xtajit64/provider_tests/apple_silicon_hotpaths.c \
             dlls/xtajit64/provider_tests/check_apple_silicon_hotpaths.py \
             dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh
           git commit -m "test: add Apple Silicon context-transfer benchmark"
 
-          git log --oneline --decorate -2
-          git diff --check "$BASE_SHA..HEAD"
-
+      - name: Benchmark native arm64 and publish branch
+        shell: bash
+        run: |
+          set -euo pipefail
           set -o pipefail
+          git diff --check "$BASE_SHA..HEAD"
           dlls/xtajit64/provider_tests/run_apple_silicon_hotpaths.sh \
             "$RUNNER_TEMP/xtajit64-benchmark" | tee "$RUNNER_TEMP/hotpaths.log"
           {
-            echo "## Bootstrap Apple Silicon context-transfer benchmark"
+            echo "## Apple Silicon context-transfer benchmark"
             echo
             echo '```text'
             grep -E '^(APPLE_SILICON_CPU|APPLE_SILICON_HOTPATH)' \
               "$RUNNER_TEMP/hotpaths.log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-          git push \
-            --force-with-lease="refs/heads/$GITHUB_REF_NAME:$expected_remote" \
-            origin "HEAD:refs/heads/$GITHUB_REF_NAME"
+          git push origin "HEAD:refs/heads/$OUTPUT_BRANCH"
