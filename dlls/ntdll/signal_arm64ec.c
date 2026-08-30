@@ -561,10 +561,14 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
 enum syscall_ids
 {
 #define SYSCALL_ENTRY(id,name,args) __id_##name = id,
-ALL_SYSCALLS
+    ALL_SYSCALLS
 #undef SYSCALL_ENTRY
     __nb_syscalls
 };
+
+/* Keep the provider's direct-syscall discriminator synchronized with the
+ * generated service table without coupling ntdll to xtajit64's private ABI. */
+C_ASSERT( __id_NtReadVirtualMemory == 0x003f );
 
 NTSTATUS WINAPI __wine_arm64ec_get_x64_syscall_dispatcher( ULONG_PTR *dispatcher,
                                                             ULONG *count )
@@ -923,7 +927,7 @@ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
 {
     ARM64_NT_CONTEXT arm_ctx;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    context_x64_to_arm_guest_return( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
     return syscall_NtContinue( &arm_ctx, alertable );
 }
 
@@ -931,7 +935,7 @@ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
 {
     ARM64_NT_CONTEXT arm_ctx;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    context_x64_to_arm_guest_return( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
     return syscall_NtContinueEx( &arm_ctx, args );
 }
 
@@ -1103,7 +1107,7 @@ NTSTATUS SYSCALL_API NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, 
 {
     ARM64_NT_CONTEXT arm_ctx;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    context_x64_to_arm_guest_return( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
     return syscall_NtRaiseException( rec, &arm_ctx, first_chance );
 }
 
@@ -1144,7 +1148,7 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
 {
     ARM64_NT_CONTEXT arm_ctx;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    context_x64_to_arm_guest_return( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
     return syscall_NtSetContextThread( handle, &arm_ctx );
 }
 

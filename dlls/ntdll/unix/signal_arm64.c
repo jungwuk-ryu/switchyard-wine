@@ -61,11 +61,14 @@
 #include "wine/asm.h"
 #include "unix_private.h"
 #include "wine/debug.h"
+#include "arm64ec_emulation_dispatch.h"
 #ifdef __APPLE__
 # include "arm64ec_low_guest_decode.h"
 #endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
+WINE_DECLARE_DEBUG_CHANNEL(arm64ec_return);
+WINE_DECLARE_DEBUG_CHANNEL(arm64ec_susp);
 
 #ifdef __APPLE__
 
@@ -109,6 +112,15 @@ static void set_custom_x18_abi_enabled( BOOL enabled );
 
 static BOOL custom_x18_abi_enabled(void)
 {
+#ifdef HAVE_OS_CUSTOM_X18_ABI
+    if (use_idempotent_x18_transition)
+    {
+        ULONG_PTR tpidr;
+
+        __asm__ volatile( "mrs %0, TPIDR_EL0" : "=r" (tpidr) );
+        return !!(tpidr & 0x1000000000000ULL);
+    }
+#endif
 #ifdef CUSTOM_X18_ABI_ALWAYS_AVAILABLE
     return os_custom_x18_abi_enabled();
 #elif defined(HAVE_OS_CUSTOM_X18_ABI)
@@ -169,11 +181,25 @@ static void set_custom_x18_abi_enabled( BOOL enabled )
  * ownership mode before crossing the boundary. */
 static void __attribute__((used,noinline)) enter_system_x18_abi(void)
 {
+#ifdef HAVE_OS_CUSTOM_X18_ABI
+    if (use_idempotent_x18_transition)
+    {
+        set_custom_x18_abi_enabled( FALSE );
+        return;
+    }
+#endif
     if (custom_x18_abi_enabled()) set_custom_x18_abi_enabled( FALSE );
 }
 
 static void __attribute__((used,noinline)) enter_windows_x18_abi(void)
 {
+#ifdef HAVE_OS_CUSTOM_X18_ABI
+    if (use_idempotent_x18_transition)
+    {
+        set_custom_x18_abi_enabled( TRUE );
+        return;
+    }
+#endif
     if (!custom_x18_abi_enabled()) set_custom_x18_abi_enabled( TRUE );
 }
 
@@ -314,6 +340,34 @@ struct syscall_frame
     ULONG                 fpsr;           /* 12c */
     NEON128               v[32];          /* 130 */
 };
+
+static BOOL arm64ec_signal_return_requires_emulation_dispatch(
+    struct thread_data *data, struct syscall_frame *frame )
+{
+    const CHPE_V2_CPU_AREA_INFO *cpu =
+        data && data->teb ? data->teb->ChpeV2CpuAreaInfo : NULL;
+    ULONG restore_flags = frame->restore_flags;
+    BOOL arm64ec = is_arm64ec();
+    BOOL emulation_requested = arm64ec_consume_emulation_dispatch_request(
+        &frame->restore_flags, RESTORE_FLAGS_EMULATION );
+    BOOL target_is_ec_code = is_ec_code( frame->pc );
+    BOOL dispatch = arm64ec_emulation_dispatch_pending(
+        arm64ec, emulation_requested, target_is_ec_code );
+
+    TRACE_(arm64ec_return)(
+        "flags %#x->%#x dispatcher %#x syscall %#x pc %p sp %p "
+        "x16 %p x17 %p arm64ec %u requested %u simulation %u "
+        "callback %u ec %u dispatch %u\n",
+        restore_flags, frame->restore_flags, frame->dispatcher_flags,
+        frame->syscall_id,
+        (void *)(ULONG_PTR)frame->pc, (void *)(ULONG_PTR)frame->sp,
+        (void *)(ULONG_PTR)frame->x[16], (void *)(ULONG_PTR)frame->x[17],
+        arm64ec, emulation_requested,
+        cpu ? *(const volatile BOOLEAN *)&cpu->InSimulation : 0,
+        cpu ? *(const volatile BOOLEAN *)&cpu->InSyscallCallback : 0,
+        target_is_ec_code, dispatch );
+    return dispatch;
+}
 
 C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 
@@ -515,16 +569,62 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
     struct syscall_frame *frame = get_syscall_frame( data );
     struct arm64_thread_data *arm64_data = arm64_thread_data( data );
     CHPE_V2_CPU_AREA_INFO *cpu_area = data->teb->ChpeV2CpuAreaInfo;
+    BOOL arm64ec = is_arm64ec();
+    BOOL guest_return_requested =
+        !!(context->ContextFlags & CONTEXT_ARM64_RET_TO_GUEST);
+    BOOL handoff_ready = cpu_area && cpu_area->SuspendDoorbell &&
+        arm64ec_suspend_handoff_ready(
+            arm64ec, arm64_data->suspend_pending,
+            *(const volatile BOOLEAN *)&cpu_area->InSyscallCallback,
+            *(const volatile BOOLEAN *)&cpu_area->InSimulation,
+            guest_return_requested );
     NTSTATUS status;
 
-    if (arm64_data->suspend_pending && !cpu_area->InSyscallCallback && !cpu_area->InSimulation)
+    if (handoff_ready)
     {
         sigset_t old_set;
+
         pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
-        *cpu_area->SuspendDoorbell = 0;
-        arm64_data->suspend_pending = FALSE;
-        wait_suspend( context );
-        status = NtSetContextThread( GetCurrentThread(), context );
+        handoff_ready = cpu_area->SuspendDoorbell &&
+            arm64ec_suspend_handoff_ready(
+                arm64ec, arm64_data->suspend_pending,
+                *(const volatile BOOLEAN *)&cpu_area->InSyscallCallback,
+                *(const volatile BOOLEAN *)&cpu_area->InSimulation,
+                guest_return_requested );
+        if (handoff_ready)
+        {
+            BOOL simulation_active =
+                *(const volatile BOOLEAN *)&cpu_area->InSimulation;
+            BOOL simulation_quiesced;
+            BOOL suspend_pending = arm64_data->suspend_pending;
+            ULONG doorbell_value =
+                *(const volatile ULONG *)cpu_area->SuspendDoorbell;
+
+            /* Publish quiescence only while server signals are blocked.  This
+             * NtContinue handoff resumes a provider context rather than ending
+             * simulation, so reclaim ownership before restoring SIGUSR1.  The
+             * provider's actual native-stack return owns the final clear. */
+            if (simulation_active) cpu_area->InSimulation = 0;
+            simulation_quiesced =
+                *(const volatile BOOLEAN *)&cpu_area->InSimulation;
+            *cpu_area->SuspendDoorbell = 0;
+            arm64_data->suspend_pending = FALSE;
+            wait_suspend( context );
+            status = NtSetContextThread( GetCurrentThread(), context );
+            if (simulation_active) cpu_area->InSimulation = 1;
+            TRACE_(arm64ec_susp)(
+                "suspend return handoff pc %p sp %p simulation %u->%u->%u "
+                "callback %u doorbell %p value %#x pending %u guest %u "
+                "status %#x\n",
+                (void *)(ULONG_PTR)context->Pc,
+                (void *)(ULONG_PTR)context->Sp, simulation_active,
+                simulation_quiesced,
+                *(const volatile BOOLEAN *)&cpu_area->InSimulation,
+                *(const volatile BOOLEAN *)&cpu_area->InSyscallCallback,
+                cpu_area->SuspendDoorbell, doorbell_value, suspend_pending,
+                guest_return_requested, status );
+        }
+        else status = NtSetContextThread( GetCurrentThread(), context );
         pthread_sigmask( SIG_SETMASK, &old_set, NULL );
     }
     else status = NtSetContextThread( GetCurrentThread(), context );
@@ -562,9 +662,16 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
 {
     struct thread_data *data = get_thread_data();
     struct syscall_frame *frame = get_syscall_frame( data );
+    const CHPE_V2_CPU_AREA_INFO *cpu =
+        data && data->teb ? data->teb->ChpeV2CpuAreaInfo : NULL;
     NTSTATUS ret = STATUS_SUCCESS;
     BOOL self = (handle == GetCurrentThread());
     DWORD flags = context->ContextFlags & ~CONTEXT_ARM64;
+    BOOL guest_return_requested = flags & CONTEXT_ARM64_RET_TO_GUEST;
+    BOOL simulation_active = cpu &&
+        *(const volatile BOOLEAN *)&cpu->InSimulation;
+
+    flags &= ~CONTEXT_ARM64_RET_TO_GUEST;
 
     if (self && !frame) return STATUS_ACCESS_DENIED;
     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
@@ -590,7 +697,10 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
         frame->cpsr  = context->Cpsr;
         if (is_arm64ec())
         {
-            if (!is_ec_code( frame->pc )) flags |= RESTORE_FLAGS_EMULATION;
+            if (arm64ec_emulation_dispatch_required(
+                    TRUE, guest_return_requested, simulation_active,
+                    is_ec_code( frame->pc )))
+                flags |= RESTORE_FLAGS_EMULATION;
             else frame->restore_flags &= ~RESTORE_FLAGS_EMULATION;
         }
     }
@@ -1905,16 +2015,22 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         save_context( &context, sigcontext );
         context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         wait_suspend( &context );
-        if (is_arm64ec() && !is_ec_code( context.Pc ))
-        {
-            CONTEXT *user_context = (CONTEXT *)((context.Sp - sizeof(CONTEXT)) & ~15);
-
-            chpe->InSimulation = 1;
-            *user_context = context;
-            user_context->ContextFlags = CONTEXT_FULL;
-            context.Sp = (ULONG_PTR)user_context;
-            context.Pc = (ULONG_PTR)pKiUserEmulationDispatcher;
-        }
+        /* This ucontext was captured directly from live AArch64 execution.
+         * Provider-owned x64 execution and syscall callbacks are handled by
+         * the cooperative branch above, while an explicit x64 context return
+         * is published through RESTORE_FLAGS_EMULATION and consumed by
+         * usr2_handler.  A non-EC live PC can therefore be Wine's native
+         * Mach-O dispatcher; the EC bitmap alone is not guest provenance. */
+        TRACE_(arm64ec_susp)(
+            "sigusr1 native route pc %p sp %p simulation %u callback %u "
+            "doorbell %p value %#x pending %u\n",
+            (void *)(ULONG_PTR)context.Pc, (void *)(ULONG_PTR)context.Sp,
+            chpe ? *(const volatile BOOLEAN *)&chpe->InSimulation : 0,
+            chpe ? *(const volatile BOOLEAN *)&chpe->InSyscallCallback : 0,
+            chpe ? chpe->SuspendDoorbell : NULL,
+            chpe && chpe->SuspendDoorbell ?
+                *(const volatile ULONG *)chpe->SuspendDoorbell : 0,
+            arm64_thread_data( data )->suspend_pending );
         restore_context( &context, sigcontext );
     }
 }
@@ -1935,7 +2051,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     if (!is_inside_syscall( data, SP_sig(sigcontext) )) return;
     if (!frame) return;
 
-    if (is_arm64ec() && !is_ec_code( frame->pc ))
+    if (arm64ec_signal_return_requires_emulation_dispatch( data, frame ))
     {
         CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
 

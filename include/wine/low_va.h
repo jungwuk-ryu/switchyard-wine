@@ -180,9 +180,11 @@ struct wine_arm64ec_low_memory_event_v1
  * is held.  Every successful begin() receives exactly one complete() outside
  * that lock, including when the mutation fails.  The post-state ranges are
  * sorted, non-overlapping, and exactly cover the completion event interval,
- * including MEM_FREE gaps.  A nested mutation is reconciled with a
- * FULL_SNAPSHOT covering the complete 4-GiB shadow.  Range storage is borrowed
- * for complete() only. */
+ * including MEM_FREE gaps.  A nested mutation is normally reconciled with a
+ * FULL_SNAPSHOT covering the complete 4-GiB shadow.  Ntdll may coalesce an
+ * exactly matching nested operation into an outer transaction only when it
+ * owns stable serialization for that interval and its completion captures the
+ * authoritative post-state.  Range storage is borrowed for complete() only. */
 struct wine_arm64ec_low_memory_observer_v1
 {
     uint32_t version;
@@ -193,6 +195,64 @@ struct wine_arm64ec_low_memory_observer_v1
                       void **transaction );
     void (*complete)( void *context, void *transaction,
                       const struct wine_arm64ec_low_memory_event_v1 *event );
+    uint64_t capabilities;
+};
+
+/* Native ARM64EC code-ownership synchronization.  The EcCodeBitMap is read by
+ * x64 CPU providers when translating a block.  Once a provider caches that
+ * classification in generated code, every bitmap writer must first quiesce
+ * guest execution and then invalidate all translated blocks whose page
+ * classification may have changed.  This observer is intentionally separate
+ * from the AMD64-low mapping observer: it owns code classification only and
+ * publishes native guest addresses rather than shadow-host mappings. */
+#define WINE_ARM64EC_CODE_OBSERVER_VERSION 1u
+#define WINE_ARM64EC_CODE_OBSERVER_CAP_EXACT_INVALIDATION_RANGES \
+    0x0000000000000001ull
+
+enum wine_arm64ec_code_operation
+{
+    WINE_ARM64EC_CODE_RESYNC = 1,
+    WINE_ARM64EC_CODE_ALLOCATE,
+    WINE_ARM64EC_CODE_RELEASE,
+    WINE_ARM64EC_CODE_MAP,
+    WINE_ARM64EC_CODE_UNMAP,
+};
+
+struct wine_arm64ec_code_range_v1
+{
+    uint64_t address;
+    uint64_t size;
+};
+
+#define WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION 0x00000001u
+
+struct wine_arm64ec_code_event_v1
+{
+    uint32_t version;
+    uint32_t size;
+    uint32_t operation;
+    uint32_t flags;
+    int32_t status;
+    uint32_t reserved;
+    const struct wine_arm64ec_code_range_v1 *ranges;
+    uint64_t range_count;
+};
+
+/* begin() runs before ntdll takes its virtual-memory lock and must keep every
+ * x64 engine quiescent until complete() returns.  Each successful begin()
+ * receives exactly one complete(), including when the Windows mutation fails.
+ * Successful events contain the sorted, merged union of page-aligned bitmap
+ * writes.  FULL_INVALIDATION is the fail-closed fallback for registration,
+ * nested mutation, or range-capture exhaustion.  Range storage is borrowed
+ * for complete() only. */
+struct wine_arm64ec_code_observer_v1
+{
+    uint32_t version;
+    uint32_t size;
+    void *context;
+    int32_t (*begin)( void *context, uint32_t operation, void **transaction );
+    void (*complete)( void *context, void *transaction,
+                      const struct wine_arm64ec_code_event_v1 *event );
     uint64_t capabilities;
 };
 
@@ -244,6 +304,10 @@ WINE_LOW_VA_EXPORT int32_t __wine_register_wow64_memory_observer(
  * completes an exact full post-state snapshot before returning success. */
 WINE_LOW_VA_EXPORT int32_t __wine_register_arm64ec_low_memory_observer_v1(
     const struct wine_arm64ec_low_memory_observer_v1 *observer );
+/* Registration is process-lifetime and ARM64EC-only.  It synchronously
+ * completes a full invalidation while native bitmap writers are excluded. */
+WINE_LOW_VA_EXPORT int32_t __wine_register_arm64ec_code_observer_v1(
+    const struct wine_arm64ec_code_observer_v1 *observer );
 WINE_LOW_VA_EXPORT int32_t __wine_resolve_wow64_memory_fault_v1(
     uint64_t host_address, uint32_t access_type,
     struct wine_wow64_memory_fault_result_v1 *result );

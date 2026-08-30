@@ -244,9 +244,14 @@ def check_transaction_core(virtual: str) -> None:
         "transaction begin",
         "if (!candidate) return STATUS_SUCCESS",
         "arm64ec_low_memory_normalize_begin_interval(",
-        "if (arm64ec_low_memory_observer_callback_active)",
+        "if (arm64ec_low_memory_observer_callback_active ||",
         "if (arm64ec_low_memory_current_transaction)",
+        "struct arm64ec_low_memory_transaction *parent =",
         "transaction->nested = TRUE",
+        "!parent->allow_exact_nested",
+        "parent->event.operation != operation",
+        "parent->event.host_address != (ULONG_PTR)begin_address",
+        "parent->event.size_covered != begin_size",
         "WINE_ARM64EC_LOW_MEMORY_EVENT_FULL_SNAPSHOT",
         "mutex_lock( &arm64ec_low_memory_observer_mutex )",
         "transaction->observer->begin(",
@@ -304,6 +309,34 @@ def check_mapping_and_codec(virtual: str, server: str, loader: str) -> None:
         "unmap_view_of_section",
     ):
         check_mutator(virtual, name)
+
+    teb = function_body(virtual, "virtual_alloc_teb")
+    require_order(
+        teb,
+        "TEB LOW observer lock order",
+        "pthread_mutex_lock( &teb_allocator_mutex )",
+        "server_enter_uninterrupted_section( &virtual_mutex, &preview_sigset )",
+        "server_leave_uninterrupted_section( &virtual_mutex, &preview_sigset )",
+        "get_arm64ec_low_candidate_range(",
+        "wow64_memory_begin_transaction(",
+        "arm64ec_low_memory_begin_transaction(",
+        "low_transaction.allow_exact_nested = exact_low_candidate",
+        "server_enter_uninterrupted_section( &virtual_mutex, &sigset )",
+        "arm64ec_low_memory_capture_transaction(",
+        "server_leave_uninterrupted_section( &virtual_mutex, &sigset )",
+        "arm64ec_low_memory_complete_transaction( &low_transaction )",
+        "pthread_mutex_unlock( &teb_allocator_mutex )",
+    )
+    free_teb = function_body(virtual, "virtual_free_thread_data")
+    require_order(
+        free_teb,
+        "TEB free-list serialization",
+        "pthread_mutex_lock( &teb_allocator_mutex )",
+        "server_enter_uninterrupted_section( &virtual_mutex, &sigset )",
+        "next_free_teb = ptr",
+        "server_leave_uninterrupted_section( &virtual_mutex, &sigset )",
+        "pthread_mutex_unlock( &teb_allocator_mutex )",
+    )
 
     mapping = function_body(virtual, "map_view")
     require(mapping, "shared shadow owner", "VPROT_SHADOW_TRANSLATED", 6)
@@ -522,12 +555,223 @@ def check_main_image_dual_base(
         raise AssertionError("main-image native-base export is not append-only at the spec tail")
 
 
+def check_code_observer(header: str, virtual: str) -> None:
+    if numeric_define(header, "WINE_ARM64EC_CODE_OBSERVER_VERSION") != 1:
+        raise AssertionError("code observer version changed")
+    if numeric_define(header, "WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION") != 1:
+        raise AssertionError("code observer FULL invalidation flag changed")
+    require(
+        header,
+        "public code observer ABI",
+        "#define WINE_ARM64EC_CODE_OBSERVER_CAP_EXACT_INVALIDATION_RANGES "
+        "\\\n    0x0000000000000001ull",
+    )
+    for declaration in (
+        "enum wine_arm64ec_code_operation",
+        "struct wine_arm64ec_code_range_v1",
+        "struct wine_arm64ec_code_event_v1",
+        "struct wine_arm64ec_code_observer_v1",
+        "__wine_register_arm64ec_code_observer_v1",
+    ):
+        require(header, "public code observer ABI", declaration)
+    for operation in (
+        "WINE_ARM64EC_CODE_RESYNC",
+        "WINE_ARM64EC_CODE_ALLOCATE",
+        "WINE_ARM64EC_CODE_RELEASE",
+        "WINE_ARM64EC_CODE_MAP",
+        "WINE_ARM64EC_CODE_UNMAP",
+    ):
+        require(header, "code observer operations", operation)
+
+    layout_asserts = {
+        "wine_arm64ec_code_range_v1": (
+            16,
+            (("address", 0), ("size", 8)),
+        ),
+        "wine_arm64ec_code_event_v1": (
+            40,
+            (
+                ("version", 0),
+                ("size", 4),
+                ("operation", 8),
+                ("flags", 12),
+                ("status", 16),
+                ("reserved", 20),
+                ("ranges", 24),
+                ("range_count", 32),
+            ),
+        ),
+        "wine_arm64ec_code_observer_v1": (
+            40,
+            (
+                ("version", 0),
+                ("size", 4),
+                ("context", 8),
+                ("begin", 16),
+                ("complete", 24),
+                ("capabilities", 32),
+            ),
+        ),
+    }
+    for struct_name, (size, fields) in layout_asserts.items():
+        require(
+            virtual,
+            f"{struct_name} layout",
+            f"C_ASSERT( sizeof(struct {struct_name}) == {size} );",
+        )
+        for field, offset in fields:
+            require(
+                virtual,
+                f"{struct_name} layout",
+                f"offsetof(struct {struct_name}, {field}) == {offset} );",
+            )
+
+    registration = function_body(
+        virtual, "__wine_register_arm64ec_code_observer_v1"
+    )
+    require(registration, "code registration", "observer->size != sizeof(*observer)")
+    require(
+        registration,
+        "code registration",
+        "WINE_ARM64EC_CODE_OBSERVER_CAP_EXACT_INVALIDATION_RANGES",
+    )
+    require(registration, "code registration", "STATUS_ALREADY_REGISTERED")
+    require(registration, "code registration", "if (!is_arm64ec())")
+    require_order(
+        registration,
+        "code registration ordering",
+        "mutex_lock( &arm64ec_code_observer_mutex )",
+        "observer->begin(",
+        "server_enter_uninterrupted_section( &virtual_mutex",
+        "__atomic_store_n( &arm64ec_code_observer_required, TRUE",
+        "arm64ec_code_observer = *observer",
+        "arm64ec_code_observer_registered = TRUE",
+        "server_leave_uninterrupted_section( &virtual_mutex",
+        "observer->complete(",
+        "mutex_unlock( &arm64ec_code_observer_mutex )",
+    )
+    require(registration, "registration full invalidation", "WINE_ARM64EC_CODE_RESYNC")
+    require(
+        registration,
+        "registration full invalidation",
+        "WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION",
+    )
+
+    begin = function_body(virtual, "arm64ec_code_begin_transaction")
+    require_order(
+        begin,
+        "code transaction begin",
+        "if (!candidate) return STATUS_SUCCESS",
+        "if (arm64ec_code_observer_callback_active ||",
+        "if (arm64ec_low_memory_current_transaction)",
+        "if (arm64ec_code_current_transaction)",
+        "transaction->nested = TRUE",
+        "WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION",
+        "mutex_lock( &arm64ec_code_observer_mutex )",
+        "transaction->observer->begin(",
+        "transaction->observer_begun = TRUE",
+        "arm64ec_code_current_transaction = transaction",
+    )
+    record = function_body(virtual, "arm64ec_code_record_range")
+    for token in (
+        "arm64ec_code_assert_transaction( address, size )",
+        "start >= WINE_ARM64EC_CODE_POINTER_LIMIT",
+        "size > WINE_ARM64EC_CODE_POINTER_LIMIT - start",
+        "start &= ~page_mask",
+        "end = (end + page_mask) & ~page_mask",
+        "capacity > ~(SIZE_T)0 / sizeof(*ranges)",
+        "malloc( capacity * sizeof(*ranges) )",
+        "realloc( transaction->ranges",
+        "WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION",
+    ):
+        require(record, "code range capture", token)
+    normalize = function_body(virtual, "arm64ec_code_normalize_ranges")
+    require(normalize, "code range normalization", "qsort( transaction->ranges")
+    require(normalize, "code range normalization", "range->address <= previous_end")
+    require(normalize, "code range normalization", "transaction->event.range_count = out")
+    complete = function_body(virtual, "arm64ec_code_complete_transaction")
+    require_order(
+        complete,
+        "code transaction complete",
+        "arm64ec_code_current_transaction = NULL",
+        "arm64ec_code_normalize_ranges( transaction )",
+        "transaction->event.ranges = transaction->ranges",
+        "transaction->observer->complete(",
+        "free( transaction->ranges )",
+        "mutex_unlock( &arm64ec_code_observer_mutex )",
+    )
+
+    for writer in ("set_arm64ec_range", "clear_arm64ec_range"):
+        body = function_body(virtual, writer)
+        require_order(
+            body,
+            f"{writer} synchronization",
+            "arm64ec_code_record_range( addr, size )",
+            "map[pos",
+        )
+
+    wrappers = (
+        ("virtual_map_image", "WINE_ARM64EC_CODE_MAP"),
+        ("virtual_map_section", "WINE_ARM64EC_CODE_MAP"),
+        ("virtual_create_builtin_view", "WINE_ARM64EC_CODE_MAP"),
+        ("allocate_virtual_memory", "WINE_ARM64EC_CODE_ALLOCATE"),
+        ("NtFreeVirtualMemory", "WINE_ARM64EC_CODE_RELEASE"),
+        ("unmap_view_of_section", "WINE_ARM64EC_CODE_UNMAP"),
+    )
+    for function, operation in wrappers:
+        body = function_body(virtual, function)
+        require(body, f"{function} code operation", operation)
+        require_order(
+            body,
+            f"{function} code transaction",
+            "arm64ec_code_begin_transaction(",
+            "server_enter_uninterrupted_section( &virtual_mutex",
+            "arm64ec_code_capture_transaction(",
+            "server_leave_uninterrupted_section( &virtual_mutex",
+            "arm64ec_code_complete_transaction(",
+        )
+    allocate = function_body(virtual, "allocate_virtual_memory")
+    require(allocate, "allocation code candidate", "is_arm64ec() && !low_candidate &&")
+    require(allocate, "allocation code candidate", "(type & MEM_RESERVE)")
+    require(
+        allocate,
+        "allocation code candidate",
+        "(attributes & MEM_EXTENDED_PARAMETER_EC_CODE)",
+    )
+    free = function_body(virtual, "NtFreeVirtualMemory")
+    require(free, "release code candidate", "is_arm64ec() && !low_candidate &&")
+    require(free, "release code candidate", "(type & MEM_RELEASE)")
+    unmap = function_body(virtual, "unmap_view_of_section")
+    require(unmap, "unmap code candidate", "is_arm64ec() && !low_candidate")
+    placeholder = function_body(virtual, "free_pages_preserve_placeholder")
+    require(
+        placeholder,
+        "placeholder code ownership",
+        "BOOL arm64ec_owned = !!(view->protect & VPROT_ARM64EC)",
+    )
+    require(
+        placeholder,
+        "placeholder code ownership",
+        "clear_arm64ec_range( base, size )",
+        2,
+    )
+    require_order(
+        placeholder,
+        "partial placeholder ownership removal",
+        "remove_pages_from_view( view, base, size )",
+        "clear_arm64ec_range( base, size )",
+        "create_view( &view, base, size",
+    )
+
+
+
 def verify(header: str, virtual: str, server: str, loader: str) -> None:
     check_abi(header, virtual)
     check_registration(virtual)
     check_snapshot(virtual)
     check_transaction_core(virtual)
     check_mapping_and_codec(virtual, server, loader)
+    check_code_observer(header, virtual)
 
 
 def main() -> int:
@@ -570,6 +814,21 @@ def main() -> int:
             "translated_wow64, TRUE );",
             1,
         ),
+        virtual.replace(
+            "arm64ec_code_record_range( addr, size );",
+            "/* code-classification range capture removed */",
+            1,
+        ),
+        virtual.replace(
+            "__atomic_store_n( &arm64ec_code_observer_required, TRUE",
+            "__atomic_store_n( &arm64ec_code_observer_required, FALSE",
+            1,
+        ),
+        virtual.replace(
+            "low_transaction.allow_exact_nested = exact_low_candidate;",
+            "/* exact nested TEB ownership removed */",
+            1,
+        ),
     )
     for index, mutated in enumerate(mutations):
         if mutated == virtual:
@@ -596,7 +855,7 @@ def main() -> int:
     else:
         raise AssertionError("regression checker accepted native main base as relocation client base")
 
-    print("ARM64EC fixed-low observer v1 core contract verified")
+    print("ARM64EC fixed-low and code observer v1 core contracts verified")
     return 0
 
 
