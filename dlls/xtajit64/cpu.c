@@ -49,6 +49,8 @@ static volatile LONG64 transition_cache_generation = 1;
 #define XTAJIT64_EC_ENTRY_CACHE_SIZE 32
 #define XTAJIT64_THREAD_STATE_MAGIC 0x363454494a415458ull /* "XTAJIT64" */
 
+C_ASSERT( !(XTAJIT64_EC_ENTRY_CACHE_SIZE & (XTAJIT64_EC_ENTRY_CACHE_SIZE - 1)) );
+
 /* ARM64EC's clang target advertises __arm64ec__ rather than the native
  * aarch64 spelling.  Keep this capability centralized: an UNKNOWN x18 from
  * an accidentally excluded PE build would make the watchdog observationally
@@ -2035,6 +2037,15 @@ static BOOL decode_ec_entry_thunk( ULONG_PTR target, UINT32 encoded,
     return !(*candidate & 3);
 }
 
+static UINT32 ec_entry_cache_index( UINT64 address )
+{
+    address >>= 4;
+    address ^= address >> 33;
+    address *= 0xff51afd7ed558ccdull;
+    address ^= address >> 33;
+    return address & (XTAJIT64_EC_ENTRY_CACHE_SIZE - 1);
+}
+
 static NTSTATUS resolve_ec_entry_thunk( struct xtajit64_thread_state *state,
                                         UINT64 guest_target, ULONG_PTR *native_target,
                                         ULONG_PTR *entry )
@@ -2049,8 +2060,7 @@ static NTSTATUS resolve_ec_entry_thunk( struct xtajit64_thread_state *state,
     if (!native_target || !entry) return STATUS_INVALID_PARAMETER;
 
     generation = current_transition_cache_generation();
-    cache = state ? &state->ec_entry_cache[
-                        (guest_target >> 4) & (XTAJIT64_EC_ENTRY_CACHE_SIZE - 1)] : NULL;
+    cache = state ? &state->ec_entry_cache[ec_entry_cache_index( guest_target )] : NULL;
     if (cache &&
         (cached_generation = __atomic_load_n( &cache->generation,
                                                __ATOMIC_ACQUIRE )) == generation)

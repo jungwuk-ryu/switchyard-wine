@@ -209,6 +209,31 @@ def main() -> int:
     if "XTAJIT64_MEMORY_TRANSLATE_REQUIRE_READ" in write_guest:
         raise AssertionError("write_guest_u64 accepts a read-only guest mapping")
 
+    cache_index = function_body(source, "ec_entry_cache_index")
+    for token in ("address >>= 4;",
+                  "address *= 0xff51afd7ed558ccdull;",
+                  "return address & (XTAJIT64_EC_ENTRY_CACHE_SIZE - 1);"):
+        require(cache_index, token, "EC entry cache index")
+    require(cache_index, "address ^= address >> 33;", "EC entry cache index", 2)
+    ec_resolver = function_body(source, "resolve_ec_entry_thunk")
+    require(ec_resolver, "ec_entry_cache_index( guest_target )",
+            "resolve_ec_entry_thunk")
+    if "(guest_target >> 4) & (XTAJIT64_EC_ENTRY_CACHE_SIZE - 1)" in ec_resolver:
+        raise AssertionError("EC entry cache still uses the conflict-prone direct index")
+
+    def model_cache_index(address: int) -> int:
+        address >>= 4
+        address ^= address >> 33
+        address = (address * 0xFF51AFD7ED558CCD) & ((1 << 64) - 1)
+        address ^= address >> 33
+        return address & 31
+
+    conflict_a, conflict_b = 0x1000, 0x1200
+    if ((conflict_a >> 4) & 31) != ((conflict_b >> 4) & 31):
+        raise AssertionError("EC cache regression pair no longer models a direct-map conflict")
+    if model_cache_index(conflict_a) == model_cache_index(conflict_b):
+        raise AssertionError("EC cache hash does not separate the regression pair")
+
     resolver = function_body(source, "resolve_arm64ec_export")
     require(resolver, "!metadata->RedirectionMetadataCount",
             "resolve_arm64ec_export")
