@@ -51,6 +51,25 @@ if [[ -n ${XTAJIT64_UNICORN_ROOT:-} ]]; then
     unicorn_cflags="-I$unicorn_root/include"
     unicorn_libs="-L$unicorn_root/lib -lunicorn"
 fi
+if [[ -n ${XTAJIT64_UNICORN_INCLUDE_DIR:-} || -n ${XTAJIT64_UNICORN_LIBRARY_DIR:-} ]]; then
+    if [[ -n ${XTAJIT64_UNICORN_ROOT:-} || -z ${XTAJIT64_UNICORN_INCLUDE_DIR:-} ||
+          -z ${XTAJIT64_UNICORN_LIBRARY_DIR:-} || $XTAJIT64_UNICORN_INCLUDE_DIR != /* ||
+          $XTAJIT64_UNICORN_LIBRARY_DIR != /* ||
+          ! -d $XTAJIT64_UNICORN_INCLUDE_DIR || ! -d $XTAJIT64_UNICORN_LIBRARY_DIR ||
+          -L $XTAJIT64_UNICORN_INCLUDE_DIR || -L $XTAJIT64_UNICORN_LIBRARY_DIR ]]; then
+        echo "XTAJIT64_UNICORN_INCLUDE_DIR and XTAJIT64_UNICORN_LIBRARY_DIR must name separate absolute, real directories" >&2
+        exit 2
+    fi
+    unicorn_include_dir=$(cd "$XTAJIT64_UNICORN_INCLUDE_DIR" && pwd -P)
+    unicorn_library_dir=$(cd "$XTAJIT64_UNICORN_LIBRARY_DIR" && pwd -P)
+    if [[ ! -f $unicorn_include_dir/unicorn/unicorn.h ||
+          ! -f $unicorn_library_dir/libunicorn.2.dylib ]]; then
+        echo "separate Unicorn directories are missing the development header or dylib" >&2
+        exit 2
+    fi
+    unicorn_cflags="-I$unicorn_include_dir"
+    unicorn_libs="-L$unicorn_library_dir -lunicorn"
+fi
 
 /usr/bin/python3 \
     "$source_dir/dlls/xtajit64/provider_tests/check_x64_entry_gate.py" \
@@ -69,8 +88,15 @@ fi
 native_imports=$(/usr/bin/nm -u "$native_provider") || exit 1
 for symbol in uc_open uc_emu_start uc_hook_add uc_mem_map_ptr \
               uc_context_alloc uc_context_save uc_context_restore uc_context_free \
-              uc_emu_stop_at_instruction_boundary uc_enable_shared_memory_atomics \
-              uc_set_shared_memory_atomic_callback; do
+              uc_emu_stop_at_instruction_boundary \
+              uc_clear_instruction_boundary_stop uc_enable_shared_memory_atomics \
+              uc_set_shared_memory_atomic_callback \
+              uc_configure_identity_memory_fastpath \
+              uc_configure_x64_boundary_guard \
+              uc_update_x64_boundary_suspend_doorbell \
+              uc_query_x64_boundary_stop \
+              uc_switchyard_x86_64_import_transition_context \
+              uc_switchyard_x86_64_export_transition_context; do
     if ! grep -Eq "(^|[[:space:]])_?${symbol}$" <<<"$native_imports"; then
         echo "production xtajit64 Unixlib is missing Unicorn symbol $symbol" >&2
         exit 1
@@ -141,7 +167,7 @@ fi
     -I"$build_dir/include" \
     -I"$source_dir/include" \
     -D__WINESRC__ -D_CRTIMP= -DHAVE_UNICORN -DWINE_UNIX_LIB \
-    -DXTAJIT64_UNIXLIB_TEST \
+    -DXTAJIT64_UNIXLIB_TEST -DXTAJIT64_TEST_EC_LEAF_FASTPATH \
     -Wall -Werror -Wdeclaration-after-statement -Wempty-body \
     -Wignored-qualifiers -Winit-self -Wpointer-arith -Wstrict-prototypes \
     -Wtype-limits -Wunused-but-set-parameter -Wvla -Wwrite-strings \

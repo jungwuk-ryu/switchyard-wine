@@ -105,17 +105,17 @@ write_preview_manifest() {
     "sourceArchiveSha256": "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e",
     "sourcePatch": {
       "path": "lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch",
-      "sha256": "312f816eaff10fc7495c5e12ce45f30053bb0f84ffde78f7870c315f96028a79"
+      "sha256": "3bf46ebd5276a087b39d5446c9468e09f8af93b23a28a5d2eb8421db4c012930"
     },
-    "buildContractVersion": 12,
+    "buildContractVersion": 17,
     "hostArchitecture": "arm64",
     "kuserSharedDataModel": "translated-shadow",
     "emulatedArchitectures": ["i386", "x86_64"],
-    "developmentCacheDigest": "c72de0022809ad97503c86192a447f30740983ac9e319ab22a571f4350fc5a1d",
+    "developmentCacheDigest": "db6a087b90607bd6839675c2ffcae84531c8d1c3e299ddd8ddf287c319e2fb2d",
     "runtimeRoot": "lib/switchyard-unicorn",
-    "runtimePayloadDigest": "792efe536ce143a7028f0772ec645ff6ba6e9fab6382d96d2948943fbef44292",
+    "runtimePayloadDigest": "3722c86658cef0daf88ffb35fb28830f5826b8f63a1689d7236b946d17068d97",
     "library": "lib/switchyard-unicorn/lib/libunicorn.2.dylib",
-    "librarySha256": "533ec7a2ec850bb32d7f5b907d70cdb3ee5013837f7aa6b6f641799133d7dbae",
+    "librarySha256": "e47a410bcdfb99d2542eacc850d09495d30f9869999a0d2833cad58755a660c2",
     "providerUnixLibraries": [
       "lib/wine/aarch64-unix/xtajit.so",
       "lib/wine/aarch64-unix/xtajit64.so"
@@ -239,11 +239,11 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_UNICORN_SOURCE_REVISION" = "8028ec436f2d9376525352dd38ed9ed6b9f6be10" ]
 [ "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" = "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e" ]
 [ "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" = "unicorn-2.1.4-threaded-emu-stop.patch" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "312f816eaff10fc7495c5e12ce45f30053bb0f84ffde78f7870c315f96028a79" ]
-[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "533ec7a2ec850bb32d7f5b907d70cdb3ee5013837f7aa6b6f641799133d7dbae" ]
-[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "12" ]
-[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "c72de0022809ad97503c86192a447f30740983ac9e319ab22a571f4350fc5a1d" ]
-[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "792efe536ce143a7028f0772ec645ff6ba6e9fab6382d96d2948943fbef44292" ]
+[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "3bf46ebd5276a087b39d5446c9468e09f8af93b23a28a5d2eb8421db4c012930" ]
+[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "e47a410bcdfb99d2542eacc850d09495d30f9869999a0d2833cad58755a660c2" ]
+[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "17" ]
+[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "db6a087b90607bd6839675c2ffcae84531c8d1c3e299ddd8ddf287c319e2fb2d" ]
+[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "3722c86658cef0daf88ffb35fb28830f5826b8f63a1689d7236b946d17068d97" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" = "https://github.com/3Shain/dxmt.git" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REVISION" = "856d9f35789679ef00c1ba01a6353438df84b66f" ]
 [ "$SWITCHYARD_DXMT_SOURCE_BASE_TREE" = "22fa93d36867f175c0283b36cd3628a4df94876e" ]
@@ -549,6 +549,25 @@ fi
 unset SWITCHYARD_TEST_LLVM_LOG SWITCHYARD_TEST_LLVM_MODE
 
 /bin/bash -n "$UNICORN_HELPER" || fail "Unicorn helper does not pass bash syntax validation"
+/bin/bash -n "$BUILD_SCRIPT" || fail "runtime builder does not pass bash syntax validation"
+grep -F 'SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH=0' "$BUILD_SCRIPT" >/dev/null ||
+  fail "native Wine wrapper lacks the direct-hit JIT default policy"
+grep -F '[ -z "${UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH+x}" ]' "$BUILD_SCRIPT" >/dev/null ||
+  fail "native Wine wrapper cannot preserve the direct-hit JIT kill switch"
+grep -F 'export UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH=1' "$BUILD_SCRIPT" >/dev/null ||
+  fail "native Wine wrapper does not enable the direct-hit JIT policy"
+grep -F 's/__SWITCHYARD_JIT_DIRECT_HIT_BATCH__/$ENV{SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH}/g;' \
+  "$BUILD_SCRIPT" >/dev/null ||
+  fail "native Wine wrapper does not bind its direct-hit JIT policy"
+grep -F 'const char *value = getenv("UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH");' \
+  "$UNICORN_PATCH" >/dev/null ||
+  fail "Unicorn patch lacks the direct-hit JIT opt-in"
+grep -F "arch == UC_ARCH_X86 && value && value[0] == '1' && !value[1];" \
+  "$UNICORN_PATCH" >/dev/null ||
+  fail "Unicorn direct-hit JIT opt-in is not exact or x86-scoped"
+grep -F 'static inline void cpu_jit_direct_hit_batch_finish(CPUState *cpu)' \
+  "$UNICORN_PATCH" >/dev/null ||
+  fail "Unicorn patch lacks direct-hit JIT boundary closure"
 grep -F 'BUILD_WORK_DIR="$(mktemp -d "$BUILD_DIR/.build.XXXXXX")"' \
   "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not isolate each CMake build in a fresh work directory"
@@ -584,6 +603,11 @@ grep -F "grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP 1'" \
   fail "Unicorn helper does not prove the instruction-boundary stop patch reached its source and output"
 grep -F '"_uc_emu_stop_at_instruction_boundary"' "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not prove the patched stop API is exported"
+grep -F "grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP_CLEAR 1'" \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the instruction-boundary stop-clear contract reached its source and output"
+grep -F '"_uc_clear_instruction_boundary_stop"' "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the patched stop-clear API is exported"
 grep -F "grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1'" \
   "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not prove the shared-memory atomic patch reached its source and output"
@@ -594,14 +618,41 @@ grep -F "grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMIC_TRACE 1'" \
   fail "Unicorn helper does not prove the serial-atomic trace patch reached its source and output"
 grep -F '"_uc_set_shared_memory_atomic_callback"' "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not prove the serial-atomic trace API is exported"
+grep -F "grep -Fx '#define UC_SWITCHYARD_X64_BOUNDARY_GUARD 1'" \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the x86-64 boundary guard reached its source and output"
+grep -F '"_uc_configure_x64_boundary_guard"' "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the x86-64 boundary guard is exported"
+grep -F '"_uc_update_x64_boundary_suspend_doorbell"' "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the boundary doorbell updater is exported"
+grep -F '"_uc_query_x64_boundary_stop"' "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the boundary stop query is exported"
+grep -F "grep -Fx '#define UC_SWITCHYARD_X86_64_TRANSITION_CONTEXT 1'" \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the transition-context patch reached its source and output"
+grep -F '"_uc_switchyard_x86_64_import_transition_context"' \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the transition-context import API is exported"
+grep -F '"_uc_switchyard_x86_64_export_transition_context"' \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove the transition-context export API is exported"
+grep -F 'extern __thread bool jit_thread_executable_cache;' \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not prove caller-thread Apple JIT ownership"
 grep -F "grep -Fx '#define CONFIG_ATOMIC64 1'" "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not require the 64-bit atomic helper configuration"
-grep -F 'for regression in aarch64_rotl_zero apple_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state; do' \
+grep -F 'for regression in aarch64_rotl_zero apple_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state identity_memory_fastpath identity_atomic_fastpath tb_page_addr_iotlb shared_atomic_idle_mapping shared_code_private_write x86_64_cross_page_chain x86_64_transition_context x86_64_boundary_guard x86_pause; do' \
   "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not run the AArch64 rotate, stop, atomic, and shared-code regressions"
+  fail "Unicorn helper does not run the AArch64 rotate, PAUSE, atomic, identity, and shared-code regressions"
 grep -F '"$regression_binary" || fail "Unicorn regression failed: $regression"' \
   "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper can ignore a cross-thread stop regression failure"
+grep -F 'apple_jit_state|shared_code_jit_state|x86_64_cross_page_chain)' \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not exercise direct-hit JIT boundaries"
+grep -F 'UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH=1 "$regression_binary"' \
+  "$UNICORN_HELPER" >/dev/null ||
+  fail "Unicorn helper does not run the direct-hit JIT regressions"
 grep -F -- '-S "$PATCHED_SOURCE_DIR"' "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not build from the private patched source tree"
 if grep -F -- '-S "$SOURCE_DIR"' "$UNICORN_HELPER" >/dev/null; then

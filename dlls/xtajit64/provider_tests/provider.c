@@ -81,14 +81,22 @@ static void test_native_return_x18(void)
 
     teb = NtCurrentTeb();
     func = address;
+    /* A direct ARM64EC-to-x64 call starts after native execution has released
+     * simulation.  The capture thunk must reacquire ownership before changing
+     * to the provider control stack, then release it on the native return. */
+    teb->ChpeV2CpuAreaInfo->InSimulation = 0;
     observed = call_x64_and_restore_x18( func, teb );
     ok( observed == (ULONG_PTR)teb,
         "x64 return restored x18 %#Ix, expected TEB %p\n", observed, teb );
+    ok( !teb->ChpeV2CpuAreaInfo->InSimulation,
+        "native capture return retained simulation ownership\n" );
     ok( (teb->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context.ContextFlags &
          (CONTEXT_AMD64_FULL | CONTEXT_AMD64_FLOATING_POINT)) ==
         (CONTEXT_AMD64_FULL | CONTEXT_AMD64_FLOATING_POINT),
         "native capture context flags %#lx do not describe the full FP context\n",
         teb->ChpeV2CpuAreaInfo->ContextAmd64->AMD64_Context.ContextFlags );
+    trace( "XTAJIT64_CAPTURE_OWNERSHIP initial=0 final=%u\n",
+           teb->ChpeV2CpuAreaInfo->InSimulation );
     VirtualFree( address, 0, MEM_RELEASE );
 }
 
@@ -260,6 +268,12 @@ done:
     VirtualFree( address, 0, MEM_RELEASE );
 }
 
+struct simulation_thread_args
+{
+    void (WINAPI *begin_simulation)(void);
+    BOOLEAN initial_simulation;
+};
+
 static DWORD CALLBACK simulation_thread( void *arg )
 {
     BYTE code[] =
@@ -281,11 +295,12 @@ static DWORD CALLBACK simulation_thread( void *arg )
         0xff, 0xd0,                                    /* call *%rax */
         0xc3,                                          /* ret */
     };
-    void (WINAPI *begin_simulation)(void) = arg;
+    struct simulation_thread_args args = *(const struct simulation_thread_args *)arg;
     CONTEXT *context;
     DWORD old_protect;
     void *address, *heap, *target, *teb;
 
+    HeapFree( GetProcessHeap(), 0, arg );
     if (!(address = VirtualAlloc( NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE ))) return 0xe001;
     if (!(target = GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "RtlExitUserThread" ))) return 0xe002;
     teb = NtCurrentTeb();
@@ -300,9 +315,54 @@ static DWORD CALLBACK simulation_thread( void *arg )
     context->Rsp = (ULONG_PTR)&context - 0x800;
     context->Rip = (ULONG_PTR)address;
     prepare_begin_simulation_context( context );
-    NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
-    begin_simulation();
+    NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = args.initial_simulation;
+    args.begin_simulation();
     return 0xe004;
+}
+
+static HANDLE create_simulation_thread( void (WINAPI *begin_simulation)(void),
+                                        BOOLEAN initial_simulation )
+{
+    struct simulation_thread_args *args;
+    HANDLE thread;
+
+    if (!(args = HeapAlloc( GetProcessHeap(), 0, sizeof(*args) )))
+    {
+        SetLastError( ERROR_OUTOFMEMORY );
+        return NULL;
+    }
+    args->begin_simulation = begin_simulation;
+    args->initial_simulation = initial_simulation;
+    if (!(thread = CreateThread( NULL, 0, simulation_thread, args, 0, NULL )))
+        HeapFree( GetProcessHeap(), 0, args );
+    return thread;
+}
+
+static void test_begin_simulation_ownership(
+    void (WINAPI *begin_simulation)(void) )
+{
+    DWORD exit_code = 0, ret;
+    HANDLE thread;
+
+    /* A native/NtContinue owner may legitimately release simulation before
+     * dispatching a restored x64 context.  BeginSimulation must reacquire it
+     * before its naked wrapper changes SP to the private control stack. */
+    thread = create_simulation_thread( begin_simulation, FALSE );
+    ok( !!thread, "initial-zero BeginSimulation thread creation failed, error %lu\n",
+        GetLastError() );
+    if (!thread) return;
+    ret = WaitForSingleObject( thread, 10000 );
+    ok( ret == WAIT_OBJECT_0, "initial-zero BeginSimulation wait returned %#lx\n", ret );
+    if (ret == WAIT_OBJECT_0)
+    {
+        ret = GetExitCodeThread( thread, &exit_code );
+        ok( ret, "initial-zero GetExitCodeThread failed, error %lu\n", GetLastError() );
+        if (ret) ok( exit_code == 0x1234,
+                     "initial-zero simulation exit code %#lx, expected 0x1234\n",
+                     exit_code );
+        if (ret) trace( "XTAJIT64_BEGIN_OWNERSHIP initial=0 exit=%#lx\n", exit_code );
+    }
+    CloseHandle( thread );
 }
 
 struct suspend_simulation_args
@@ -1756,7 +1816,7 @@ static void test_provider_contract(void)
     ok( info.ProcessorFeatureBits == 0xcccccccc, "wrong feature bits %#lx\n",
         info.ProcessorFeatureBits );
 
-    thread = CreateThread( NULL, 0, simulation_thread, begin_simulation, 0, NULL );
+    thread = create_simulation_thread( begin_simulation, TRUE );
     ok( !!thread, "thread creation failed, error %lu\n", GetLastError() );
     if (!thread) return;
     ret = WaitForSingleObject( thread, 10000 );
@@ -1773,6 +1833,7 @@ static void test_provider_contract(void)
     }
     CloseHandle( thread );
 
+    test_begin_simulation_ownership( begin_simulation );
     test_suspend_doorbell_provider( begin_simulation );
     test_x64_memory_fault_exception( begin_simulation );
     test_x64_single_step_exception( begin_simulation );

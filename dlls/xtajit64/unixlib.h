@@ -22,11 +22,12 @@
 #define XTAJIT64_MAX_HOST_PAGE_SIZE   0x10000
 #define XTAJIT64_GUEST_KUSER          WINE_USER_SHARED_DATA_ADDRESS
 #define XTAJIT64_X64_USER_ADDRESS_MAX 0x00007fffffffffffull
-#define XTAJIT64_PROCESS_ABI_VERSION          8u
-#define XTAJIT64_PROCESS_INIT_PARAMS_SIZE     80u
+#define XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY 0x003fu
+#define XTAJIT64_PROCESS_ABI_VERSION          10u
+#define XTAJIT64_PROCESS_INIT_PARAMS_SIZE     96u
 #define XTAJIT64_BEGIN_PARAMS_SIZE            472u
 #define XTAJIT64_PROVIDER_ABI_IDENTITY \
-    "switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-472-doorbell"
+    "switchyard-xtajit64-provider-abi-v10-flight-bind-process-init-96-begin-472-doorbell"
 
 #define XTAJIT64_CAP_GS_NATIVE_DOMAIN 0x00000001u
 #define XTAJIT64_CAP_ADDRESS_CODEC    0x00000002u
@@ -51,6 +52,16 @@
      XTAJIT64_MEMORY_TRANSLATE_REQUIRE_READ | \
      XTAJIT64_MEMORY_TRANSLATE_REQUIRE_WRITE | \
      XTAJIT64_MEMORY_TRANSLATE_REQUIRE_EXECUTE)
+
+/* Returned translation domains are part of the PE/Unix validation contract.
+ * PE fast paths may dereference an address only when the provider explicitly
+ * authenticates the identity lane. */
+enum xtajit64_memory_domain
+{
+    XTAJIT64_MEMORY_ADDRESS_INVALID,
+    XTAJIT64_MEMORY_ADDRESS_IDENTITY,
+    XTAJIT64_MEMORY_ADDRESS_AMD64_LOW,
+};
 
 static inline BOOL xtajit64_process_term_notification_may_cleanup(
     UINT_PTR handle, BOOL is_post, NTSTATUS status )
@@ -126,6 +137,14 @@ struct xtajit64_process_init_params
     UINT64 x64_syscall_dispatcher;
     UINT32 x64_syscall_count;
     UINT32 reserved;
+    /* This native target is resolved by the PE-side ARM64EC metadata parser.
+     * It lets the Unix provider distinguish Wine's RtlQueryPerformanceCounter
+     * from an arbitrary EC function with a superficially similar body. */
+    UINT64 rtl_query_performance_counter;
+    /* The raw x64 export authenticates the final branch of an ARM64X
+     * hybrid-patch thunk.  It is intentionally not redirected through the
+     * ARM64EC metadata table. */
+    UINT64 nt_query_performance_counter;
 };
 
 struct xtajit64_memory_params
@@ -211,6 +230,8 @@ C_ASSERT( offsetof(struct xtajit64_process_init_params, enabled_capabilities) ==
 C_ASSERT( offsetof(struct xtajit64_process_init_params, x64_syscall_dispatcher) == 64 );
 C_ASSERT( offsetof(struct xtajit64_process_init_params, x64_syscall_count) == 72 );
 C_ASSERT( offsetof(struct xtajit64_process_init_params, reserved) == 76 );
+C_ASSERT( offsetof(struct xtajit64_process_init_params, rtl_query_performance_counter) == 80 );
+C_ASSERT( offsetof(struct xtajit64_process_init_params, nt_query_performance_counter) == 88 );
 C_ASSERT( sizeof(struct xtajit64_process_init_params) ==
           XTAJIT64_PROCESS_INIT_PARAMS_SIZE );
 /* The new handshake intentionally cannot satisfy the legacy tail validation. */

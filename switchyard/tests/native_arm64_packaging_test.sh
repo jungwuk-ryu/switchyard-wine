@@ -253,6 +253,7 @@ typedef int (*switchyard_unicorn_extension_t)(struct uc_struct *);
 extern int uc_emu_stop_at_instruction_boundary(struct uc_struct *);
 extern int uc_enable_shared_memory_atomics(struct uc_struct *);
 #ifdef XTAJIT64_PROVIDER
+extern int uc_clear_instruction_boundary_stop(struct uc_struct *);
 extern int uc_set_shared_memory_atomic_callback(struct uc_struct *);
 #endif
 __attribute__((used, visibility("default")))
@@ -260,12 +261,13 @@ switchyard_unicorn_extension_t const switchyard_unicorn_fixture_imports[] = {
     uc_emu_stop_at_instruction_boundary,
     uc_enable_shared_memory_atomics,
 #ifdef XTAJIT64_PROVIDER
+    uc_clear_instruction_boundary_stop,
     uc_set_shared_memory_atomic_callback,
 #endif
 };
 __attribute__((used, visibility("default"))) const char
     switchyard_xtajit64_fixture_abi_identity[] =
-        "switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-472-doorbell";
+        "switchyard-xtajit64-provider-abi-v10-flight-bind-process-init-96-begin-472-doorbell";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);

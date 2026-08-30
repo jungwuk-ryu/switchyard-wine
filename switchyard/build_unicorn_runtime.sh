@@ -270,6 +270,10 @@ validate_output() {
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   /usr/bin/grep -Fx 'uc_err uc_emu_stop_at_instruction_boundary(uc_engine *uc);' \
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP_CLEAR 1' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_clear_instruction_boundary_stop(uc_engine *uc);' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1' \
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_CODE_COHERENCE 1' \
@@ -280,14 +284,53 @@ validate_output() {
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   /usr/bin/grep -Fx 'uc_err uc_set_shared_memory_atomic_callback(' \
     "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx '#define UC_SWITCHYARD_AARCH64_IDENTITY_MEMORY_FASTPATH 1' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_configure_identity_memory_fastpath(uc_engine *uc,' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx '#define UC_SWITCHYARD_X64_BOUNDARY_GUARD 1' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_configure_x64_boundary_guard(' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_update_x64_boundary_suspend_doorbell(' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_query_x64_boundary_stop(uc_engine *uc,' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx '#define UC_SWITCHYARD_X86_64_TRANSITION_CONTEXT 1' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_switchyard_x86_64_import_transition_context(' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
+  /usr/bin/grep -Fx 'uc_err uc_switchyard_x86_64_export_transition_context(' \
+    "$root/include/unicorn/unicorn.h" >/dev/null || return 1
   [ "$(nm -gU "$dylib" | /usr/bin/awk \
       '$NF == "_uc_emu_stop_at_instruction_boundary" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_clear_instruction_boundary_stop" { count++ } END { print count + 0 }')" -eq 1 ] ||
     return 1
   [ "$(nm -gU "$dylib" | /usr/bin/awk \
       '$NF == "_uc_enable_shared_memory_atomics" { count++ } END { print count + 0 }')" -eq 1 ] ||
     return 1
   [ "$(nm -gU "$dylib" | /usr/bin/awk \
       '$NF == "_uc_set_shared_memory_atomic_callback" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_configure_identity_memory_fastpath" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_configure_x64_boundary_guard" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_update_x64_boundary_suspend_doorbell" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_query_x64_boundary_stop" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_switchyard_x86_64_import_transition_context" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_switchyard_x86_64_export_transition_context" { count++ } END { print count + 0 }')" -eq 1 ] ||
     return 1
   /usr/bin/grep -Fx 'libdir=${pcfiledir}/..' "$root/lib/pkgconfig/unicorn.pc" >/dev/null || return 1
   /usr/bin/grep -Fx 'includedir=${pcfiledir}/../../include' \
@@ -510,6 +553,12 @@ GIT_CEILING_DIRECTORIES="$patch_apply_ceiling" \
 /usr/bin/grep -Fx 'uc_err uc_emu_stop_at_instruction_boundary(uc_engine *uc);' \
   "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
   fail "source patch did not add the instruction-boundary stop API"
+/usr/bin/grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP_CLEAR 1' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the instruction-boundary stop-clear contract"
+/usr/bin/grep -Fx 'uc_err uc_clear_instruction_boundary_stop(uc_engine *uc);' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the instruction-boundary stop-clear API"
 /usr/bin/grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1' \
   "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
   fail "source patch did not add the shared-memory atomic contract"
@@ -525,6 +574,36 @@ GIT_CEILING_DIRECTORIES="$patch_apply_ceiling" \
 /usr/bin/grep -Fx 'uc_err uc_set_shared_memory_atomic_callback(' \
   "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
   fail "source patch did not add the serial-atomic trace API"
+/usr/bin/grep -Fx '#define UC_SWITCHYARD_AARCH64_IDENTITY_MEMORY_FASTPATH 1' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the AArch64 identity-memory fast-path contract"
+/usr/bin/grep -Fx 'uc_err uc_configure_identity_memory_fastpath(uc_engine *uc,' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the identity-memory fast-path API"
+/usr/bin/grep -Fx '#define UC_SWITCHYARD_X64_BOUNDARY_GUARD 1' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the x86-64 boundary-guard contract"
+/usr/bin/grep -Fx 'uc_err uc_configure_x64_boundary_guard(' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the x86-64 boundary-guard configuration API"
+/usr/bin/grep -Fx 'uc_err uc_update_x64_boundary_suspend_doorbell(' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the boundary-guard doorbell update API"
+/usr/bin/grep -Fx 'uc_err uc_query_x64_boundary_stop(uc_engine *uc,' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the boundary-guard stop-query API"
+/usr/bin/grep -Fx '#define UC_SWITCHYARD_X86_64_TRANSITION_CONTEXT 1' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the x86-64 transition-context contract"
+/usr/bin/grep -Fx 'uc_err uc_switchyard_x86_64_import_transition_context(' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the transition-context import API"
+/usr/bin/grep -Fx 'uc_err uc_switchyard_x86_64_export_transition_context(' \
+  "$PATCHED_SOURCE_DIR/include/unicorn/unicorn.h" >/dev/null ||
+  fail "source patch did not add the transition-context export API"
+/usr/bin/grep -Fx 'extern __thread bool jit_thread_executable_cache;' \
+  "$PATCHED_SOURCE_DIR/qemu/include/tcg/tcg-apple-jit.h" >/dev/null ||
+  fail "source patch did not add caller-thread Apple JIT ownership"
 /usr/bin/grep -F '__atomic_load_n(&x, __ATOMIC_RELAXED)' \
   "$PATCHED_SOURCE_DIR/qemu/configure" >/dev/null ||
   fail "source patch did not correct the 64-bit atomic capability probe"
@@ -558,13 +637,17 @@ cmake --build "$BUILD_WORK_DIR" --parallel "$JOBS"
 
 # Exercise AArch64 code generation, cross-thread publication,
 # instruction-boundary stopping, cross-engine shared-memory atomicity, and
-# atomic invalid-memory recovery and cross-engine executable-code publication
+# atomic invalid-memory recovery, permission-gated identity memory and atomic
+# helpers, architectural PAUSE hint handling,
+# cross-engine executable-code publication and private-write fallback, idle
+# engine mapping preservation, packed x86-64 transition state, IOTLB host-page
+# reuse, cross-page direct chaining, and static x86-64/EC boundary classification
 # against the exact dylib that will be installed.  The tests cover zero-count
 # i32/i64 rotate lowering, LOCK CMPXCHG, CMPXCHG8B, demand mapping, repeated
 # shared-code writes, concurrent emulation startup, caller-thread Apple JIT
 # state preservation, and an interruptible REP iteration in addition to the
 # ordinary cross-thread stop path.
-for regression in aarch64_rotl_zero apple_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state; do
+for regression in aarch64_rotl_zero apple_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state identity_memory_fastpath identity_atomic_fastpath tb_page_addr_iotlb shared_atomic_idle_mapping shared_code_private_write x86_64_cross_page_chain x86_64_transition_context x86_64_boundary_guard x86_pause; do
   regression_source="$PATCHED_SOURCE_DIR/tests/regress/$regression.c"
   regression_binary="$BUILD_WORK_DIR/switchyard-$regression"
   [ -f "$regression_source" ] && [ ! -L "$regression_source" ] ||
@@ -585,6 +668,12 @@ for regression in aarch64_rotl_zero apple_jit_state threaded_emu_stop threaded_e
     -L"$BUILD_WORK_DIR" '-Wl,-rpath,@loader_path' -lunicorn -lpthread \
     -o "$regression_binary"
   "$regression_binary" || fail "Unicorn regression failed: $regression"
+  case "$regression" in
+    apple_jit_state|shared_code_jit_state|x86_64_cross_page_chain)
+      UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH=1 "$regression_binary" ||
+        fail "Unicorn direct-hit JIT regression failed: $regression"
+      ;;
+  esac
 done
 
 cmake --install "$BUILD_WORK_DIR"

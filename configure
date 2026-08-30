@@ -684,8 +684,6 @@ PCSCLITE_LIBS
 PCSCLITE_CFLAGS
 PCAP_LIBS
 PCAP_CFLAGS
-NTDLL_X18_TEST_UNIXLIB
-WINEMETAL_WOW64_UNIXLIB
 UNICORN_LIBS
 UNICORN_CFLAGS
 OPENCL_CFLAGS
@@ -782,6 +780,8 @@ XTAJIT_PE_CFLAGS
 XTAJIT_UNIXLIB
 XTAJIT64_PE_CFLAGS
 XTAJIT64_UNIXLIB
+NTDLL_X18_TEST_UNIXLIB
+WINEMETAL_WOW64_UNIXLIB
 WINEPRELOADER_LDFLAGS
 WINELOADER_LDFLAGS
 TOP_INSTALL_DEV
@@ -11295,6 +11295,7 @@ then :
 
 fi
 
+
 case "$host_os:$HOST_ARCH" in
   darwin*:aarch64)
     if test "x$ac_cv_header_os_arch_arm64_h" = xyes
@@ -11334,18 +11335,15 @@ esac
 fi
 { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $wine_cv_have_os_custom_x18_abi" >&5
 printf '%s\n' "$wine_cv_have_os_custom_x18_abi" >&6; }
-      if test "x$wine_cv_have_os_custom_x18_abi" = xyes
-      then
+      test "x$wine_cv_have_os_custom_x18_abi" != xyes ||
 
 printf '%s\n' "#define HAVE_OS_CUSTOM_X18_ABI 1" >>confdefs.h
 
-      fi
     else
       wine_cv_have_os_custom_x18_abi=no
     fi
     ;;
 esac
-
 
 ac_fn_c_check_header_compile "$LINENO" "sys/mkdev.h" "ac_cv_header_sys_mkdev_h" "$ac_includes_default"
 if test "x$ac_cv_header_sys_mkdev_h" = xyes
@@ -12126,8 +12124,9 @@ WINELOADER_LDFLAGS=""
 
 WINEPRELOADER_LDFLAGS=""
 
-NTDLL_X18_TEST_UNIXLIB=""
 WINEMETAL_WOW64_UNIXLIB=""
+
+NTDLL_X18_TEST_UNIXLIB=""
 
 XTAJIT64_UNIXLIB=
 XTAJIT64_PE_CFLAGS=
@@ -17312,6 +17311,18 @@ then :
 #if UC_API_MAJOR < 2 || (UC_API_MAJOR == 2 && (UC_API_MINOR < 1 || (UC_API_MINOR == 1 && UC_API_PATCH < 4)))
 #error Unicorn 2.1.4 or newer is required
 #endif
+#ifndef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP
+#error Switchyard instruction-boundary stop support is required
+#endif
+#ifndef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP_CLEAR
+#error Switchyard instruction-boundary stop-clear support is required
+#endif
+#ifndef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
+#error Switchyard shared-memory atomic support is required
+#endif
+#ifndef UC_SWITCHYARD_SHARED_CODE_COHERENCE
+#error Switchyard shared-code coherence support is required
+#endif
 int
 main (void)
 {
@@ -17325,10 +17336,34 @@ then :
   ac_fn_c_check_func "$LINENO" "uc_open" "ac_cv_func_uc_open"
 if test "x$ac_cv_func_uc_open" = xyes
 then :
+  ac_fn_c_check_func "$LINENO" "uc_emu_stop_at_instruction_boundary" "ac_cv_func_uc_emu_stop_at_instruction_boundary"
+if test "x$ac_cv_func_uc_emu_stop_at_instruction_boundary" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "uc_clear_instruction_boundary_stop" "ac_cv_func_uc_clear_instruction_boundary_stop"
+if test "x$ac_cv_func_uc_clear_instruction_boundary_stop" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "uc_enable_shared_memory_atomics" "ac_cv_func_uc_enable_shared_memory_atomics"
+if test "x$ac_cv_func_uc_enable_shared_memory_atomics" = xyes
+then :
   XTAJIT64_UNIXLIB=xtajit64.so
-                         XTAJIT64_PE_CFLAGS=-DHAVE_UNICORN
-                         XTAJIT_UNIXLIB=xtajit.so
-                         XTAJIT_PE_CFLAGS=-DHAVE_UNICORN
+                                     XTAJIT64_PE_CFLAGS=-DHAVE_UNICORN
+                                     XTAJIT_UNIXLIB=xtajit.so
+                                     XTAJIT_PE_CFLAGS=-DHAVE_UNICORN
+else case e in #(
+  e) UNICORN_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) UNICORN_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) UNICORN_LIBS="" ;;
+esac
+fi
+
 else case e in #(
   e) UNICORN_LIBS="" ;;
 esac
@@ -17357,7 +17392,7 @@ fi
 then :
   case "x$with_unicorn" in
   xno) ;;
-  *)   as_fn_error $? "Unicorn 2.1.4 or newer development files not found.
+  *)   as_fn_error $? "Switchyard Unicorn 2.1.4 development files with instruction-boundary stop/clear, shared-memory atomic, and shared-code coherence support not found.
 Use the --without-unicorn option if you really want this." "$LINENO" 5 ;;
 esac
 
@@ -23698,12 +23733,12 @@ server/wineserver"
     esac
 fi
 
+
 if test -n "$NTDLL_X18_TEST_UNIXLIB"
 then
     as_fn_append wine_rules "
 dlls/ntdll/tests/exception.ok dlls/ntdll/tests/aarch64-windows/exception.ok: dlls/ntdll/tests/ntdll-x18-test.so"
 fi
-
 
 as_fn_append wine_rules "
 dlls/ntdll/unix/version.c: dummy

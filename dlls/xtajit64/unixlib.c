@@ -16,10 +16,13 @@
 #include "config.h"
 
 #include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #ifdef XTAJIT64_UNIXLIB_TEST
 # include <sched.h>
@@ -31,8 +34,11 @@
 # include <unicorn/unicorn.h>
 # include <unicorn/x86.h>
 # ifdef __APPLE__
+#  include <dlfcn.h>
 #  include <mach/mach.h>
+#  include <mach/mach_time.h>
 #  include <mach/mach_vm.h>
+#  include <mach-o/dyld.h>
 #  if defined(__aarch64__) && defined(HAVE_OS_CUSTOM_X18_ABI)
 #   include <os/arch/arm64.h>
 #  endif
@@ -45,34 +51,241 @@
 #include "winnt.h"
 #include "wine/debug.h"
 #include "unixlib.h"
+#include "tb_history.h"
 
 #ifdef HAVE_UNICORN
 
 #if !defined(UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP) || \
+    !defined(UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP_CLEAR) || \
+    !defined(UC_SWITCHYARD_X64_BOUNDARY_GUARD) || \
     !defined(UC_SWITCHYARD_SHARED_MEMORY_ATOMICS) || \
     !defined(UC_SWITCHYARD_SHARED_MEMORY_ATOMIC_TRACE) || \
-    !defined(UC_SWITCHYARD_SHARED_CODE_COHERENCE)
-# error Switchyard Unicorn instruction-boundary stop, atomic trace, shared-memory atomics, and shared-code coherence are required
+    !defined(UC_SWITCHYARD_SHARED_CODE_COHERENCE) || \
+    !defined(UC_SWITCHYARD_AARCH64_IDENTITY_MEMORY_FASTPATH) || \
+    !defined(UC_SWITCHYARD_X86_64_TRANSITION_CONTEXT)
+# error Switchyard Unicorn instruction-boundary stop/clear, x64 boundary guard, atomic trace, shared-memory atomics, shared-code coherence, AArch64 identity-memory fast path, and x86-64 transition context are required
 #endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(xtajit);
 #ifndef XTAJIT64_UNIXLIB_TEST
 WINE_DECLARE_DEBUG_CHANNEL(xtajitmap);
+WINE_DECLARE_DEBUG_CHANNEL(xtajittrap);
 #endif
 
 #define XTAJIT64_MAX_RESYNC_RANGES (1u << 20)
 #define XTAJIT64_MAX_SYSCALL_COUNT  (1u << 16)
+#define XTAJIT64_DIRECT_SELF_READ_MAX_SIZE 0x10000u
 #define XTAJIT64_TEB_SELF_END 0x38
+#define XTAJIT64_TEB_THREAD_ID_OFFSET 0x48
+#define XTAJIT64_TEB_LAST_ERROR_OFFSET 0x68
+#define XTAJIT64_TEB_TLS_SLOTS_OFFSET 0x1480
+#define XTAJIT64_TEB_TLS_SLOT_COUNT 64
+#define XTAJIT64_TB_HISTORY_WATCHDOG_SECONDS 5
+#define XTAJIT64_TB_HISTORY_HOT_ENGINES      4
+#define XTAJIT64_EC_TARGET_STATS_SLOTS       4096
+#define XTAJIT64_EC_TARGET_STATS_MAX_PROBE   32
+#define XTAJIT64_EC_TARGET_STATS_TOP         16
+#define XTAJIT64_EC_TARGET_STATS_ENGINE_SLOTS 64
+#define XTAJIT64_EC_TARGET_STATS_SAMPLE_STRIDE 16381u
+#define XTAJIT64_EC_TARGET_STATS_DEFAULT_INITIAL_REPORT (1u << 20)
+#define XTAJIT64_EC_TARGET_STATS_MIN_INITIAL_REPORT     (1u << 12)
+#define XTAJIT64_EC_LEAF_FASTPATH_CACHE_SIZE 64
 
-/* Provider-private address domains remain internal until a coordinated,
- * capability-negotiated low-memory observer publishes the translated lane
- * through the foundation contract. */
-enum xtajit64_memory_domain
+C_ASSERT( !(XTAJIT64_EC_TARGET_STATS_ENGINE_SLOTS &
+            (XTAJIT64_EC_TARGET_STATS_ENGINE_SLOTS - 1)) );
+C_ASSERT( !(XTAJIT64_EC_LEAF_FASTPATH_CACHE_SIZE &
+            (XTAJIT64_EC_LEAF_FASTPATH_CACHE_SIZE - 1)) );
+
+enum direct_self_read_range_result
 {
-    XTAJIT64_MEMORY_ADDRESS_INVALID,
-    XTAJIT64_MEMORY_ADDRESS_IDENTITY,
-    XTAJIT64_MEMORY_ADDRESS_AMD64_LOW,
+    DIRECT_SELF_READ_RANGE_OK,
+    DIRECT_SELF_READ_RANGE_MISSING,
+    DIRECT_SELF_READ_RANGE_PERMISSIONS,
+    DIRECT_SELF_READ_RANGE_DOMAIN,
 };
+
+enum direct_self_read_rejection
+{
+    DIRECT_SELF_READ_REJECT_PROCESS,
+    DIRECT_SELF_READ_REJECT_REGISTERS,
+    DIRECT_SELF_READ_REJECT_SIZE,
+    DIRECT_SELF_READ_REJECT_STACK_BOUNDS,
+    DIRECT_SELF_READ_REJECT_STACK_RANGE,
+    DIRECT_SELF_READ_REJECT_STACK_PERMISSIONS,
+    DIRECT_SELF_READ_REJECT_STACK_DOMAIN,
+    DIRECT_SELF_READ_REJECT_STACK_PHYSICAL,
+    DIRECT_SELF_READ_REJECT_SOURCE_RANGE,
+    DIRECT_SELF_READ_REJECT_SOURCE_PERMISSIONS,
+    DIRECT_SELF_READ_REJECT_SOURCE_DOMAIN,
+    DIRECT_SELF_READ_REJECT_DESTINATION_RANGE,
+    DIRECT_SELF_READ_REJECT_DESTINATION_PERMISSIONS,
+    DIRECT_SELF_READ_REJECT_DESTINATION_DOMAIN,
+    DIRECT_SELF_READ_REJECT_RESULT_RANGE,
+    DIRECT_SELF_READ_REJECT_RESULT_PERMISSIONS,
+    DIRECT_SELF_READ_REJECT_RESULT_DOMAIN,
+    DIRECT_SELF_READ_REJECT_OVERLAP,
+    DIRECT_SELF_READ_REJECT_DATA_COPY,
+    DIRECT_SELF_READ_REJECT_RESULT_COPY,
+    DIRECT_SELF_READ_REJECT_COUNT,
+};
+
+enum direct_self_read_size_bucket
+{
+    DIRECT_SELF_READ_SIZE_ZERO,
+    DIRECT_SELF_READ_SIZE_64,
+    DIRECT_SELF_READ_SIZE_4K,
+    DIRECT_SELF_READ_SIZE_64K,
+    DIRECT_SELF_READ_SIZE_1M,
+    DIRECT_SELF_READ_SIZE_16M,
+    DIRECT_SELF_READ_SIZE_LARGE,
+    DIRECT_SELF_READ_SIZE_BUCKET_COUNT,
+};
+
+struct direct_self_read_diagnostics
+{
+    uint64_t syscalls;
+    uint64_t current_process;
+    uint64_t requested_bytes;
+    uint64_t maximum_size;
+    uint64_t null_result;
+    uint64_t size_buckets[DIRECT_SELF_READ_SIZE_BUCKET_COUNT];
+    uint64_t rejections[DIRECT_SELF_READ_REJECT_COUNT];
+};
+
+#define XTAJIT64_UNICORN_PERF_COUNTERS_VERSION 5u
+
+struct xtajit64_unicorn_perf_counters
+{
+    uint32_t version;
+    uint32_t size;
+    uint64_t tcg_dispatch_entries;
+    uint64_t tb_lookup_calls;
+    uint64_t tb_jump_cache_hits;
+    uint64_t tb_hash_hits;
+    uint64_t tb_lookup_misses;
+    uint64_t tb_generations;
+    uint64_t indirect_tb_lookups;
+    uint64_t softmmu_load_helpers;
+    uint64_t softmmu_store_helpers;
+    uint64_t notdirty_writes;
+    uint64_t executable_writes;
+    uint64_t invalidate_fast_calls;
+    uint64_t invalidate_bitmap_skips;
+    uint64_t actual_tb_invalidations;
+    uint64_t shared_code_write_begins;
+    uint64_t shared_code_engine_scans;
+    uint64_t shared_code_peer_invalidations;
+    uint64_t shared_code_private_writes;
+    uint64_t shared_code_translation_begins;
+    uint64_t shared_exclusive_begins;
+    uint64_t shared_pause_requests;
+    uint64_t indirect_site_first_observations;
+    uint64_t indirect_site_reobservations;
+    uint64_t indirect_site_target_matches;
+    uint64_t indirect_site_target_tb_matches;
+    uint64_t indirect_site_target_changes;
+    uint64_t indirect_site_collisions;
+};
+
+#ifdef UC_SWITCHYARD_PERF_COUNTERS
+C_ASSERT( UC_SWITCHYARD_PERF_COUNTERS_VERSION ==
+          XTAJIT64_UNICORN_PERF_COUNTERS_VERSION );
+C_ASSERT( sizeof(struct xtajit64_unicorn_perf_counters) ==
+          sizeof(uc_switchyard_perf_counters) );
+#endif
+
+typedef uc_err (*unicorn_enable_perf_counters_fn)( uc_engine *uc );
+typedef uc_err (*unicorn_get_perf_counters_fn)(
+    uc_engine *uc, struct xtajit64_unicorn_perf_counters *counters );
+
+#ifdef __APPLE__
+enum unicorn_perf_counter_api_resolution
+{
+    UNICORN_PERF_COUNTER_API_RESOLVED,
+    UNICORN_PERF_COUNTER_API_BAD_ARGUMENT,
+    UNICORN_PERF_COUNTER_API_IMAGE_UNAVAILABLE,
+    UNICORN_PERF_COUNTER_API_SYMBOL_UNAVAILABLE,
+    UNICORN_PERF_COUNTER_API_IMAGE_UNVERIFIABLE,
+};
+
+/* Resolve optional counters from the exact Unicorn image used by this unixlib.
+ * RTLD_DEFAULT omits private two-level-namespace dependencies on Darwin. */
+static void *open_loaded_unicorn_image(void)
+{
+#ifdef RTLD_NOLOAD
+    Dl_info info;
+    uint32_t count, index;
+    const char *image, *basename;
+    void *handle;
+
+    if (dladdr( (const void *)uc_version, &info ) && info.dli_fname &&
+        (handle = dlopen( info.dli_fname, RTLD_NOW | RTLD_NOLOAD )))
+    {
+        if (dlsym( handle, "uc_version" )) return handle;
+        dlclose( handle );
+    }
+
+    count = _dyld_image_count();
+    for (index = 0; index < count; ++index)
+    {
+        image = _dyld_get_image_name( index );
+        if (!image) continue;
+        basename = strrchr( image, '/' );
+        if (strcmp( basename ? basename + 1 : image, "libunicorn.2.dylib" )) continue;
+        if (!(handle = dlopen( image, RTLD_NOW | RTLD_NOLOAD ))) continue;
+        if (dlsym( handle, "uc_version" )) return handle;
+        dlclose( handle );
+    }
+#endif
+    return NULL;
+}
+
+static enum unicorn_perf_counter_api_resolution resolve_unicorn_perf_counter_api(
+    unicorn_enable_perf_counters_fn *enable, unicorn_get_perf_counters_fn *get )
+{
+#ifdef RTLD_NOLOAD
+    Dl_info unicorn_info, enable_info, get_info;
+    unicorn_enable_perf_counters_fn resolved_enable;
+    unicorn_get_perf_counters_fn resolved_get;
+    void *handle, *version_address, *enable_address, *get_address;
+    BOOL ret = FALSE;
+
+    if (!enable || !get || sizeof(resolved_enable) != sizeof(enable_address) ||
+        sizeof(resolved_get) != sizeof(get_address))
+        return UNICORN_PERF_COUNTER_API_BAD_ARGUMENT;
+    if (!(handle = open_loaded_unicorn_image()))
+        return UNICORN_PERF_COUNTER_API_IMAGE_UNAVAILABLE;
+
+    version_address = dlsym( handle, "uc_version" );
+    enable_address = dlsym( handle, "uc_switchyard_enable_perf_counters" );
+    get_address = dlsym( handle, "uc_switchyard_get_perf_counters" );
+    if (!version_address || !enable_address || !get_address)
+    {
+        dlclose( handle );
+        return UNICORN_PERF_COUNTER_API_SYMBOL_UNAVAILABLE;
+    }
+    if (!dladdr( version_address, &unicorn_info ) || !unicorn_info.dli_fbase ||
+        !dladdr( enable_address, &enable_info ) || !dladdr( get_address, &get_info ) ||
+        enable_info.dli_fbase != unicorn_info.dli_fbase ||
+        get_info.dli_fbase != unicorn_info.dli_fbase)
+    {
+        dlclose( handle );
+        return UNICORN_PERF_COUNTER_API_IMAGE_UNVERIFIABLE;
+    }
+
+    memcpy( &resolved_enable, &enable_address, sizeof(resolved_enable) );
+    memcpy( &resolved_get, &get_address, sizeof(resolved_get) );
+    *enable = resolved_enable;
+    *get = resolved_get;
+    ret = TRUE;
+
+    dlclose( handle );
+    return ret ? UNICORN_PERF_COUNTER_API_RESOLVED : UNICORN_PERF_COUNTER_API_IMAGE_UNVERIFIABLE;
+#else
+    return UNICORN_PERF_COUNTER_API_IMAGE_UNAVAILABLE;
+#endif
+}
+#endif
 
 struct mapped_range
 {
@@ -96,9 +309,46 @@ struct range_array
     size_t capacity;
 };
 
+struct thread_engine;
+
+enum ec_leaf_fastpath_kind
+{
+    EC_LEAF_FASTPATH_UNCLASSIFIED,
+    EC_LEAF_FASTPATH_UNSUPPORTED,
+    /* A leaf reads a zero-extended 32-bit TEB field into ARM64 x0.  The
+     * ARM64EC entry/return thunks map that result to the emulated x64 RAX.
+     * Keep the exact instruction in the cache so the field offset is part of
+     * the recognition result rather than an unchecked policy list. */
+    EC_LEAF_FASTPATH_TEB_LOAD_W0,
+    EC_LEAF_FASTPATH_TLS_GET_VALUE,
+    EC_LEAF_FASTPATH_TLS_GET_VALUE2,
+    EC_LEAF_FASTPATH_RTL_QUERY_PERFORMANCE_COUNTER,
+    EC_LEAF_FASTPATH_ROTL32,
+    EC_LEAF_FASTPATH_ROTR32,
+    EC_LEAF_FASTPATH_ROTL64,
+    EC_LEAF_FASTPATH_ROTR64,
+    EC_LEAF_FASTPATH_KIND_COUNT,
+};
+
+struct ec_leaf_fastpath_cache_entry
+{
+    uint64_t address;
+    uint64_t mapping_generation;
+    uint64_t code_generation;
+    uint32_t instruction;
+    enum ec_leaf_fastpath_kind kind;
+};
+
+struct ec_transition_target_sample
+{
+    atomic_uint_fast64_t address;
+    atomic_uint_fast64_t count;
+};
+
 struct thread_binding
 {
     uc_context *context;
+    struct thread_engine *resident_engine;
     uint64_t process_instance;
     uint64_t id;
     struct xtajit64_flight_recorder *flight_recorder;
@@ -132,8 +382,13 @@ struct thread_engine
      * in only the guest regions reached by concurrent translated execution. */
     struct range_array mapped_ranges;
     uint64_t mapping_generation;
+    struct thread_binding *resident_binding;
     uint64_t resident_binding_id;
     uint64_t execution_generation;
+    struct xtajit64_tb_history *tb_history;
+    uint64_t tb_binding_id;
+    uint64_t tb_causal_boundary_id;
+    uint32_t tb_history_sample_counter;
     struct xtajit64_flight_recorder *flight_recorder;
     uint64_t flight_binding_id;
     uint64_t flight_causal_boundary_id;
@@ -169,12 +424,26 @@ struct thread_engine
     uint64_t registry_sync_calls;
     uint64_t resync_unmap_calls;
     uint64_t resync_unmap_bytes;
+    uint64_t direct_self_read_attempts;
+    uint64_t direct_self_read_completions;
+    uint64_t direct_self_read_bytes;
+    struct direct_self_read_diagnostics direct_self_read_diagnostics;
+    uint64_t direct_self_read_next_report;
+    uint64_t perf_sample_count;
+    uint64_t perf_next_report;
+    uint32_t ec_target_stats_sample_counter;
+    atomic_uint_fast64_t ec_target_stats_lost;
+    BOOL ec_target_stats_report_pending;
+    struct ec_transition_target_sample
+        ec_target_stats[XTAJIT64_EC_TARGET_STATS_ENGINE_SLOTS];
+    struct ec_leaf_fastpath_cache_entry ec_leaf_fastpath_cache[XTAJIT64_EC_LEAF_FASTPATH_CACHE_SIZE];
     pthread_t owner;
     BOOL linked;
     BOOL in_use;
     BOOL running;
     atomic_bool pause_requested;
     volatile uint32_t *suspend_doorbell;
+    volatile uint32_t boundary_idle_doorbell;
     uint64_t stack_limit;
     uint64_t stack_base;
     uint64_t transition_target;
@@ -183,6 +452,8 @@ struct thread_engine
     uc_err mapping_error;
     enum xtajit64_stop_reason stop_reason;
 };
+C_ASSERT( !(offsetof(struct thread_engine, boundary_idle_doorbell) &
+            (sizeof(uint32_t) - 1)) );
 
 enum mutation_kind
 {
@@ -212,6 +483,19 @@ struct arm64ec_low_observer_transaction
     uint32_t reserved;
 };
 
+struct arm64ec_code_observer_transaction
+{
+    uint64_t generation;
+    uint32_t operation;
+    uint32_t reserved;
+};
+
+struct ec_transition_target_stat
+{
+    uint64_t address;
+    uint64_t count;
+};
+
 struct provider_process
 {
     pthread_mutex_t mutex;
@@ -221,6 +505,7 @@ struct provider_process
     BOOL mutation_owner_valid;
     BOOL shutting_down;
     BOOL observer_active;
+    BOOL code_observer_active;
     uint64_t generation;
     pthread_t mutation_owner;
     enum mutation_kind mutation_kind;
@@ -230,9 +515,15 @@ struct provider_process
     uint64_t last_fault_generation;
     NTSTATUS poison_status;
     const uint64_t *ec_bitmap;
-    uint64_t ec_page_size;
+    size_t ec_bitmap_word_count;
+    unsigned int ec_page_shift;
     uint64_t highest_user_address;
+    uint8_t *identity_page_flags;
+    size_t identity_page_flags_size;
+    uint32_t identity_address_bits;
     uint64_t rtl_exit_user_thread;
+    uint64_t rtl_query_performance_counter;
+    uint64_t nt_query_performance_counter;
     uint64_t x64_syscall_dispatcher;
     uint32_t x64_syscall_count;
     uint64_t guest_kuser;
@@ -244,10 +535,38 @@ struct provider_process
     unsigned int engine_count;
     unsigned int engines_in_use;
     unsigned int engine_high_water;
+    BOOL tb_history_enabled;
+    BOOL direct_self_read_stats_enabled;
+    BOOL unicorn_perf_stats_enabled;
+    BOOL ec_target_stats_enabled;
+    BOOL ec_leaf_fastpath_enabled;
+    BOOL ec_leaf_fastpath_stats_enabled;
+    uint64_t ec_leaf_fastpath_code_generation;
+    atomic_uint_fast64_t ec_target_stats_total;
+    uint64_t ec_target_stats_lost;
+    atomic_uint_fast64_t ec_target_stats_next_report;
+    struct ec_transition_target_stat ec_target_stats[XTAJIT64_EC_TARGET_STATS_SLOTS];
+    atomic_uint_fast64_t ec_leaf_fastpath_attempts;
+    atomic_uint_fast64_t ec_leaf_fastpath_hits;
+    atomic_uint_fast64_t ec_leaf_fastpath_unsupported;
+    atomic_uint_fast64_t ec_leaf_fastpath_register_failures;
+    atomic_uint_fast64_t ec_leaf_fastpath_memory_failures;
+    atomic_uint_fast64_t ec_leaf_fastpath_stack_failures;
+    atomic_uint_fast64_t ec_leaf_fastpath_write_failures;
+    atomic_uint_fast64_t ec_leaf_fastpath_hits_by_kind[EC_LEAF_FASTPATH_KIND_COUNT];
+    atomic_uint_fast64_t ec_leaf_fastpath_next_report;
+    unicorn_enable_perf_counters_fn unicorn_enable_perf_counters;
+    unicorn_get_perf_counters_fn unicorn_get_perf_counters;
+#ifndef XTAJIT64_UNIXLIB_TEST
+    BOOL tb_history_watchdog_started;
+    pthread_t tb_history_watchdog;
+    uint64_t tb_history_watchdog_tick;
+#endif
     uc_context *initial_context;
     struct range_array ranges;
     struct thread_engine *engines;
     struct arm64ec_low_observer_transaction *observer_transaction;
+    struct arm64ec_code_observer_transaction *code_observer_transaction;
 };
 
 static struct provider_process provider =
@@ -255,6 +574,17 @@ static struct provider_process provider =
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
 };
+
+/* This cache is only a classification cache, never a code-lifetime claim.
+ * Code observers and FlushInstructionCache advance it after Unicorn has
+ * invalidated the affected translations.  Keeping it separate from the
+ * mapping generation also covers byte changes with unchanged VM mappings. */
+static void advance_ec_leaf_fastpath_code_generation_locked(void)
+{
+    if (!++provider.ec_leaf_fastpath_code_generation)
+        ++provider.ec_leaf_fastpath_code_generation;
+}
+
 static pthread_key_t engine_key;
 static pthread_once_t engine_key_once = PTHREAD_ONCE_INIT;
 static int engine_key_error;
@@ -265,11 +595,235 @@ static int engine_key_error;
 static NTSTATUS memory_map( void *args );
 static NTSTATUS memory_map_internal( void *args );
 static BOOL legacy_mutation_selects_low_locked( uint64_t guest, uint64_t size );
+static NTSTATUS build_resync_mapping_changes( const struct range_array *old,
+                                               const struct range_array *replacement,
+                                               struct range_array *removals,
+                                               struct range_array *additions );
 static NTSTATUS process_term( void *args );
+
+static struct xtajit64_tb_history *tb_history_create(void)
+{
+    struct xtajit64_tb_history *history;
+
+    if (!(history = malloc( sizeof(*history) ))) return NULL;
+    xtajit64_tb_history_init( history );
+    return history;
+}
+
+static void tb_history_record_execution_entry( struct thread_engine *engine,
+                                               uint64_t address )
+{
+    xtajit64_tb_history_record( engine->tb_history, address, 0,
+                                engine->tb_binding_id,
+                                engine->execution_generation,
+                                engine->mapping_generation,
+                                engine->tb_causal_boundary_id );
+}
+
+#ifndef XTAJIT64_UNIXLIB_TEST
+struct tb_history_hot_engine
+{
+    struct thread_engine *engine;
+    uint64_t delta;
+    uint64_t diagnostic_id;
+};
+
+/* A provider-created POSIX watchdog is not a Wine thread and therefore has no
+ * Windows TEB in x18.  Keep its diagnostic output entirely below Wine's debug
+ * layer; wine_dbg_log() obtains thread state and is invalid from this thread. */
+static void tb_history_native_log( const char *format, ... )
+{
+    char buffer[768];
+    va_list args;
+    size_t length, offset = 0;
+    int ret;
+
+    va_start( args, format );
+    ret = vsnprintf( buffer, sizeof(buffer), format, args );
+    va_end( args );
+    if (ret <= 0) return;
+    length = (size_t)ret < sizeof(buffer) ? (size_t)ret : sizeof(buffer) - 1;
+    while (offset < length)
+    {
+        ssize_t written = write( STDERR_FILENO, buffer + offset, length - offset );
+
+        if (written > 0) offset += written;
+        else if (written < 0 && errno == EINTR) continue;
+        else break;
+    }
+}
+
+static unsigned int tb_history_select_hot_engines_locked(
+    struct tb_history_hot_engine selected[XTAJIT64_TB_HISTORY_HOT_ENGINES] )
+{
+    struct thread_engine *engine;
+    unsigned int count = 0;
+
+    for (engine = provider.engines; engine; engine = engine->next)
+    {
+        struct xtajit64_tb_history *history = engine->tb_history;
+        uint64_t previous, latest, delta;
+        unsigned int position;
+
+        if (!history) continue;
+        latest = atomic_load_explicit( &history->writer_sequence,
+                                       memory_order_acquire );
+        previous = history->watchdog_last_sequence;
+        history->watchdog_last_sequence = latest;
+        delta = latest >= previous ? latest - previous : latest;
+        if (!delta) continue;
+        for (position = 0; position < count; ++position)
+            if (delta > selected[position].delta) break;
+        if (position >= XTAJIT64_TB_HISTORY_HOT_ENGINES) continue;
+        if (count < XTAJIT64_TB_HISTORY_HOT_ENGINES) ++count;
+        if (position + 1 < count)
+            memmove( &selected[position + 1], &selected[position],
+                     (count - position - 1) * sizeof(selected[0]) );
+        selected[position].engine = engine;
+        selected[position].delta = delta;
+        selected[position].diagnostic_id = engine->diagnostic_id;
+    }
+    return count;
+}
+
+static void tb_history_trace_engine( const struct tb_history_hot_engine *selected,
+                                     uint64_t tick, BOOL include_tail )
+{
+    struct xtajit64_tb_history_summary summary;
+    const struct xtajit64_tb_history_snapshot *latest;
+    const char *classification;
+    BOOL repeating;
+    unsigned int i;
+
+    xtajit64_tb_history_summarize( selected->engine->tb_history, &summary );
+    if (!summary.valid) return;
+    latest = &summary.tail[summary.tail_count - 1];
+    repeating = xtajit64_tb_history_is_repeat_candidate( &summary );
+    classification = !repeating ? "advancing" :
+                     summary.execution_generation_changes ?
+                     "cross-generation-repeat" : "same-generation-repeat";
+    tb_history_native_log(
+        "xtajittb: pid %ld tick %#llx engine %#llx samples %#llx stride %u "
+        "seq %#llx-%#llx "
+        "window %u/%u missing %u unique-pc %u execution-generation-changes %u "
+        "provenance-changes %u overwritten %#llx "
+        "pc %#llx-%#llx map %#llx-%#llx binding %#llx generation %#llx "
+        "causal %#llx class %s\n",
+        (long)getpid(),
+        (unsigned long long)tick,
+        (unsigned long long)selected->diagnostic_id,
+        (unsigned long long)selected->delta,
+        XTAJIT64_TB_HISTORY_SAMPLE_STRIDE,
+        (unsigned long long)summary.first_sequence,
+        (unsigned long long)summary.last_sequence,
+        summary.valid, summary.requested, summary.missing_or_torn,
+        summary.unique_pc_count, summary.execution_generation_changes,
+        summary.provenance_changes,
+        (unsigned long long)summary.overwritten,
+        (unsigned long long)summary.first_pc,
+        (unsigned long long)summary.last_pc,
+        (unsigned long long)summary.minimum_mapping_generation,
+        (unsigned long long)summary.maximum_mapping_generation,
+        (unsigned long long)latest->binding_id,
+        (unsigned long long)latest->execution_generation,
+        (unsigned long long)latest->causal_boundary_id,
+        classification );
+    if (!include_tail && !repeating) return;
+    for (i = 0; i < summary.tail_count; ++i)
+    {
+        const struct xtajit64_tb_history_snapshot *event = &summary.tail[i];
+
+        tb_history_native_log(
+            "xtajittb: pid %ld tail engine %#llx seq %#llx pc %#llx size %#x map %#llx "
+            "binding %#llx generation %#llx causal %#llx\n",
+            (long)getpid(),
+            (unsigned long long)selected->diagnostic_id,
+            (unsigned long long)event->sequence,
+            (unsigned long long)event->guest_pc, event->block_size,
+            (unsigned long long)event->mapping_generation,
+            (unsigned long long)event->binding_id,
+            (unsigned long long)event->execution_generation,
+            (unsigned long long)event->causal_boundary_id );
+    }
+}
+
+static void tb_history_watchdog_deadline( struct timespec *deadline )
+{
+    if (clock_gettime( CLOCK_REALTIME, deadline ))
+    {
+        deadline->tv_sec = time( NULL );
+        deadline->tv_nsec = 0;
+    }
+    deadline->tv_sec += XTAJIT64_TB_HISTORY_WATCHDOG_SECONDS;
+}
+
+static void *tb_history_watchdog_main( void *arg )
+{
+    struct tb_history_hot_engine selected[XTAJIT64_TB_HISTORY_HOT_ENGINES];
+
+    (void)arg;
+    pthread_mutex_lock( &provider.mutex );
+    while (!provider.shutting_down)
+    {
+        struct timespec deadline;
+        unsigned int count, i;
+        int ret;
+
+        tb_history_watchdog_deadline( &deadline );
+        do
+            ret = pthread_cond_timedwait( &provider.cond, &provider.mutex,
+                                          &deadline );
+        while (!provider.shutting_down && !ret);
+        if (provider.shutting_down) break;
+        if (ret != ETIMEDOUT)
+        {
+            tb_history_native_log( "xtajittb: pid %ld watchdog wait failed: %s\n",
+                                   (long)getpid(), strerror( ret ) );
+            break;
+        }
+        ++provider.tb_history_watchdog_tick;
+        count = tb_history_select_hot_engines_locked( selected );
+        pthread_mutex_unlock( &provider.mutex );
+        for (i = 0; i < count; ++i)
+            tb_history_trace_engine( &selected[i],
+                                     provider.tb_history_watchdog_tick, !i );
+        pthread_mutex_lock( &provider.mutex );
+    }
+    pthread_mutex_unlock( &provider.mutex );
+    return NULL;
+}
+
+static NTSTATUS tb_history_start_watchdog_locked(void)
+{
+    int ret;
+
+    if (!provider.tb_history_enabled || provider.tb_history_watchdog_started)
+        return STATUS_SUCCESS;
+    if ((ret = pthread_create( &provider.tb_history_watchdog, NULL,
+                               tb_history_watchdog_main, NULL )))
+    {
+        tb_history_native_log(
+            "xtajittb: pid %ld cannot start translated-block history watchdog: %s\n",
+            (long)getpid(), strerror( ret ) );
+        return ret == ENOMEM ? STATUS_NO_MEMORY : STATUS_UNSUCCESSFUL;
+    }
+    provider.tb_history_watchdog_started = TRUE;
+    tb_history_native_log(
+        "xtajittb: pid %ld enabled capacity %u window %u stride %u interval %us\n",
+        (long)getpid(), XTAJIT64_TB_HISTORY_CAPACITY,
+        XTAJIT64_TB_HISTORY_SUMMARY_WINDOW,
+        XTAJIT64_TB_HISTORY_SAMPLE_STRIDE,
+        XTAJIT64_TB_HISTORY_WATCHDOG_SECONDS );
+    return STATUS_SUCCESS;
+}
+#endif
 
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_range_v1) == 40 );
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_event_v1) == 72 );
 C_ASSERT( sizeof(struct wine_arm64ec_low_memory_observer_v1) == 40 );
+C_ASSERT( sizeof(struct wine_arm64ec_code_range_v1) == 16 );
+C_ASSERT( sizeof(struct wine_arm64ec_code_event_v1) == 40 );
+C_ASSERT( sizeof(struct wine_arm64ec_code_observer_v1) == 40 );
 
 static uint64_t flight_timestamp_from_timespec( const struct timespec *timestamp )
 {
@@ -608,6 +1162,13 @@ static atomic_int test_non_ec_hook_entered;
 static atomic_int test_release_non_ec_hook;
 static atomic_int test_pause_stop_count;
 static atomic_int test_pause_stop_owner_violation;
+static atomic_int test_hold_engine_start;
+static atomic_int test_engine_start_entered;
+static atomic_int test_release_engine_start;
+static atomic_int test_hold_engine_result;
+static atomic_int test_engine_result_entered;
+static atomic_int test_release_engine_result;
+static atomic_int test_disable_pause_hook;
 static atomic_int test_emu_start_count;
 static atomic_int test_context_write_count;
 static atomic_int test_context_read_count;
@@ -616,22 +1177,14 @@ static atomic_int test_check_context_read_lock;
 static atomic_int test_context_read_lock_violation;
 #endif
 
-static const int integer_regs[] =
-{
-    UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX,
-    UC_X86_REG_RSI, UC_X86_REG_RDI, UC_X86_REG_RBP, UC_X86_REG_RSP,
-    UC_X86_REG_R8,  UC_X86_REG_R9,  UC_X86_REG_R10, UC_X86_REG_R11,
-    UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15,
-    UC_X86_REG_RIP, UC_X86_REG_EFLAGS,
-};
-
-static const int xmm_regs[] =
-{
-    UC_X86_REG_XMM0,  UC_X86_REG_XMM1,  UC_X86_REG_XMM2,  UC_X86_REG_XMM3,
-    UC_X86_REG_XMM4,  UC_X86_REG_XMM5,  UC_X86_REG_XMM6,  UC_X86_REG_XMM7,
-    UC_X86_REG_XMM8,  UC_X86_REG_XMM9,  UC_X86_REG_XMM10, UC_X86_REG_XMM11,
-    UC_X86_REG_XMM12, UC_X86_REG_XMM13, UC_X86_REG_XMM14, UC_X86_REG_XMM15,
-};
+C_ASSERT( sizeof(struct xtajit64_x64_context) ==
+          sizeof(uc_switchyard_x86_64_transition_context) );
+C_ASSERT( offsetof(struct xtajit64_x64_context, rip) ==
+          offsetof(uc_switchyard_x86_64_transition_context, rip) );
+C_ASSERT( offsetof(struct xtajit64_x64_context, mxcsr) ==
+          offsetof(uc_switchyard_x86_64_transition_context, mxcsr) );
+C_ASSERT( offsetof(struct xtajit64_x64_context, xmm) ==
+          offsetof(uc_switchyard_x86_64_transition_context, xmm) );
 
 static uint64_t align_down( uint64_t value )
 {
@@ -679,6 +1232,133 @@ static unsigned int protection_to_unicorn( unsigned int protect )
     default:
         return UC_PROT_NONE;
     }
+}
+
+static BOOL identity_page_table_layout( uint64_t highest_address,
+                                        uint32_t *address_bits,
+                                        size_t *table_size )
+{
+    uint32_t bits;
+
+    if (!highest_address) return FALSE;
+    bits = 64 - __builtin_clzll( highest_address );
+    if (bits <= UC_SWITCHYARD_IDENTITY_PAGE_SHIFT || bits >= 64 ||
+        bits - UC_SWITCHYARD_IDENTITY_PAGE_SHIFT >= sizeof(size_t) * 8)
+        return FALSE;
+    *address_bits = bits;
+    *table_size = (size_t)1 <<
+                  (bits - UC_SWITCHYARD_IDENTITY_PAGE_SHIFT);
+    return TRUE;
+}
+
+static NTSTATUS allocate_identity_page_table_locked( uint64_t highest_address )
+{
+    uint32_t address_bits;
+    size_t table_size;
+    int flags = MAP_PRIVATE;
+    void *table;
+
+    if (!identity_page_table_layout( highest_address, &address_bits,
+                                     &table_size ))
+        return STATUS_INVALID_PARAMETER;
+#ifdef MAP_ANONYMOUS
+    flags |= MAP_ANONYMOUS;
+#else
+    flags |= MAP_ANON;
+#endif
+    table = mmap( NULL, table_size, PROT_READ | PROT_WRITE, flags, -1, 0 );
+    if (table == MAP_FAILED) return STATUS_NO_MEMORY;
+    provider.identity_page_flags = table;
+    provider.identity_page_flags_size = table_size;
+    provider.identity_address_bits = address_bits;
+    return STATUS_SUCCESS;
+}
+
+static uint8_t identity_page_permissions( const struct mapped_range *range )
+{
+    uint8_t flags = 0;
+
+    if (range->state != MEM_COMMIT ||
+        range->domain != XTAJIT64_MEMORY_ADDRESS_IDENTITY ||
+        range->guest != range->host)
+        return 0;
+    if (range->perms & UC_PROT_READ)
+        flags |= UC_SWITCHYARD_IDENTITY_PAGE_READ;
+    /* Executable mappings must retain Unicorn's shared-code write transaction
+     * and translated-block invalidation path even when Windows also marks the
+     * page writable. */
+    if ((range->perms & (UC_PROT_WRITE | UC_PROT_EXEC)) == UC_PROT_WRITE)
+        flags |= UC_SWITCHYARD_IDENTITY_PAGE_WRITE;
+    return flags;
+}
+
+static BOOL identity_page_flag_span( const struct mapped_range *range,
+                                     size_t *first, size_t *count )
+{
+    uint64_t last;
+
+    if (!range->size ||
+        (range->guest & (XTAJIT64_GUEST_PAGE_SIZE - 1)) ||
+        (range->size & (XTAJIT64_GUEST_PAGE_SIZE - 1)) ||
+        range->guest > UINT64_MAX - range->size)
+        return FALSE;
+    last = range->guest + range->size - 1;
+    *first = range->guest >> UC_SWITCHYARD_IDENTITY_PAGE_SHIFT;
+    *count = range->size >> UC_SWITCHYARD_IDENTITY_PAGE_SHIFT;
+    return last <= provider.highest_user_address &&
+           *first <= provider.identity_page_flags_size &&
+           *count <= provider.identity_page_flags_size - *first;
+}
+
+static void publish_identity_page_permissions( size_t first, size_t count,
+                                               uint8_t permissions )
+{
+    size_t i;
+
+    for (i = 0; i < count; ++i)
+    {
+        uint8_t old = __atomic_load_n( &provider.identity_page_flags[first + i],
+                                       __ATOMIC_RELAXED );
+        uint8_t replacement =
+            (old & UC_SWITCHYARD_IDENTITY_PAGE_OWNER_MASK) |
+            (permissions & UC_SWITCHYARD_IDENTITY_PAGE_PERMISSIONS);
+
+        __atomic_store_n( &provider.identity_page_flags[first + i], replacement,
+                          __ATOMIC_RELAXED );
+    }
+}
+
+/* All engines are quiescent while this runs.  Clear removed permissions first
+ * and then publish replacement permissions so a protect or remap cannot leave
+ * a stale direct-write grant behind.  Unicorn owns the upper, monotonic
+ * executable-page participation bits; retaining them can only select the
+ * conservative shared-code path after an unmap or engine teardown. */
+static NTSTATUS publish_identity_page_flag_changes_locked(
+    const struct range_array *removals, const struct range_array *additions )
+{
+    size_t i, first, count;
+
+    if (!provider.identity_page_flags) return STATUS_INVALID_DEVICE_STATE;
+    for (i = 0; i < removals->count; ++i)
+        if (!identity_page_flag_span( &removals->data[i], &first, &count ))
+            return STATUS_INVALID_ADDRESS;
+    for (i = 0; i < additions->count; ++i)
+        if (!identity_page_flag_span( &additions->data[i], &first, &count ))
+            return STATUS_INVALID_ADDRESS;
+
+    for (i = 0; i < removals->count; ++i)
+    {
+        identity_page_flag_span( &removals->data[i], &first, &count );
+        publish_identity_page_permissions( first, count, 0 );
+    }
+    for (i = 0; i < additions->count; ++i)
+    {
+        uint8_t flags = identity_page_permissions( &additions->data[i] );
+
+        identity_page_flag_span( &additions->data[i], &first, &count );
+        publish_identity_page_permissions( first, count, flags );
+    }
+    return STATUS_SUCCESS;
 }
 
 static BOOL range_array_reserve( struct range_array *array, size_t capacity )
@@ -1162,7 +1842,7 @@ static void trace_mapping_diagnostic( const struct thread_engine *engine,
         "pid %ld engine %llu pool=%u/%u/%u event %s maps %llu bytes %llu "
         "buckets 4k=%llu 16k=%llu "
         "64k=%llu 1m=%llu large=%llu max=%llu latest=%llu mapped=%zu "
-        "syncs=%llu resync-unmaps=%llu/%llu generation=%llu\n",
+        "syncs=%llu resync-unmaps=%llu/%llu self-reads=%llu/%llu/%llu generation=%llu\n",
         (long)getpid(), (unsigned long long)engine->diagnostic_id,
         engine->diagnostic_pool_in_use, engine->diagnostic_pool_size,
         engine->diagnostic_pool_high_water, event,
@@ -1178,6 +1858,9 @@ static void trace_mapping_diagnostic( const struct thread_engine *engine,
         (unsigned long long)engine->registry_sync_calls,
         (unsigned long long)engine->resync_unmap_calls,
         (unsigned long long)engine->resync_unmap_bytes,
+        (unsigned long long)engine->direct_self_read_attempts,
+        (unsigned long long)engine->direct_self_read_completions,
+        (unsigned long long)engine->direct_self_read_bytes,
         (unsigned long long)engine->mapping_generation );
 #endif
 }
@@ -1208,7 +1891,7 @@ static const struct mapped_range *find_canonical_mapping( uint64_t address,
     return range;
 }
 
-#ifndef XTAJIT64_UNIXLIB_TEST
+#if !defined(XTAJIT64_UNIXLIB_TEST) || defined(XTAJIT64_TEST_EC_LEAF_FASTPATH)
 static const struct mapped_range *find_engine_mapping( const struct thread_engine *engine,
                                                         uint64_t address, uint64_t size )
 {
@@ -1233,7 +1916,9 @@ static const struct mapped_range *find_engine_mapping( const struct thread_engin
         return NULL;
     return range;
 }
+#endif
 
+#ifndef XTAJIT64_UNIXLIB_TEST
 static void trace_interrupt_diagnostic_locked( struct thread_engine *engine, uint64_t rip )
 {
     const struct mapped_range *canonical, *mapped;
@@ -1242,7 +1927,7 @@ static void trace_interrupt_diagnostic_locked( struct thread_engine *engine, uin
     uint64_t start, available;
     size_t count = 0, i;
 
-    if (!TRACE_ON( xtajitmap ) || !engine ||
+    if (!TRACE_ON( xtajittrap ) || !engine ||
         engine->flight_stop_detail0 == XTAJIT64_FLIGHT_UNKNOWN_U64)
         return;
     start = rip >= 2 ? rip - 2 : rip;
@@ -1260,12 +1945,13 @@ static void trace_interrupt_diagnostic_locked( struct thread_engine *engine, uin
         for (i = 0; i < count; ++i)
             snprintf( hex + 2 * i, sizeof(hex) - 2 * i, "%02x", bytes[i] );
     }
-    TRACE_(xtajitmap)(
-        "pid %ld engine %llu interrupt=%#llx rip=%#llx bytes@%#llx=%s/%zu "
+    TRACE_(xtajittrap)(
+        "pid %ld engine %llu interrupt=%#llx reason=%u rip=%#llx bytes@%#llx=%s/%zu "
         "canonical=%u/%#llx/%#llx/%#llx/%#llx/%#x/%#x/%#x/%#x/%u "
         "mapped=%u/%#llx/%#llx/%#llx/%#x/%u generation=%llu/%llu\n",
         (long)getpid(), (unsigned long long)engine->diagnostic_id,
         (unsigned long long)engine->flight_stop_detail0,
+        engine->stop_reason,
         (unsigned long long)rip, (unsigned long long)start, hex, count,
         !!canonical, (unsigned long long)(canonical ? canonical->guest : 0),
         (unsigned long long)(canonical ? canonical->host : 0),
@@ -1291,7 +1977,7 @@ static uc_err demand_map_canonical_range( struct thread_engine *engine,
     const struct mapped_range *range;
     struct mapped_range mapping;
     struct range_array replacement = {0}, old;
-    uint64_t start, end, mapping_start, mapping_end, range_end;
+    uint64_t start, end, missing_start, mapping_start, mapping_end, range_end;
     NTSTATUS status;
     uc_err err;
     size_t i;
@@ -1312,11 +1998,15 @@ static uc_err demand_map_canonical_range( struct thread_engine *engine,
         return UC_ERR_ARG;
 
     /* Canonical ranges can split or coalesce between generations.  Map the
-     * entire still-unmapped gap containing the fault, bounded by retained
-     * actual mappings.  Mapping the whole enlarged canonical range would
-     * collide with a retained prefix or suffix; mapping one guest page per
-     * fault makes Unicorn rebuild its MemoryRegion topology thousands of times
-     * during a large application startup. */
+     * entire still-unmapped gap containing the first missing part of the
+     * access, bounded by retained actual mappings.  A multi-byte access may
+     * begin in a retained page and end in an untouched page, so overlap with
+     * the requested range is not itself a mapping collision.  Mapping the
+     * whole enlarged canonical range would collide with a retained prefix or
+     * suffix; mapping one guest page per fault makes Unicorn rebuild its
+     * MemoryRegion topology thousands of times during a large application
+     * startup. */
+    missing_start = start;
     mapping_start = range->guest;
     mapping_end = range_end;
     for (i = 0; i < engine->mapped_ranges.count; ++i)
@@ -1326,19 +2016,22 @@ static uc_err demand_map_canonical_range( struct thread_engine *engine,
 
         if (mapped->size > UINT64_MAX - mapped->guest) return UC_ERR_ARG;
         mapped_end = mapped->guest + mapped->size;
-        if (mapped_end <= start)
+        if (mapped_end <= missing_start)
         {
             mapping_start = max( mapping_start, mapped_end );
             continue;
         }
-        if (mapped->guest >= end)
+        if (mapped->guest > missing_start)
         {
             mapping_end = min( mapping_end, mapped->guest );
             break;
         }
-        return UC_ERR_MAP;
+        mapping_start = max( mapping_start, mapped_end );
+        missing_start = mapped_end;
+        if (missing_start >= end) return UC_ERR_MAP;
     }
-    if (mapping_start > start || mapping_end < end || mapping_start >= mapping_end)
+    if (mapping_start > missing_start || mapping_end <= missing_start ||
+        mapping_start >= mapping_end)
         return UC_ERR_MAP;
     if (mapping_end - mapping_start > XTAJIT64_DEMAND_MAP_MAX_SIZE)
     {
@@ -1349,10 +2042,9 @@ static uc_err demand_map_canonical_range( struct thread_engine *engine,
          * unmapped atomic read-modify-write target, so writable data can follow
          * this same bounded first-touch path without eager process-wide
          * cloning into every engine. */
-        mapping_start = start;
+        mapping_start = missing_start;
         mapping_end = min( mapping_end,
                            mapping_start + XTAJIT64_DEMAND_MAP_MAX_SIZE );
-        if (mapping_end < end) return UC_ERR_ARG;
     }
     mapping = range_slice( range, mapping_start, mapping_end );
 
@@ -1473,6 +2165,8 @@ static BOOL any_engine_in_use_locked(void)
 
 static void request_engine_pause_locked( struct thread_engine *engine )
 {
+    uc_err err;
+
     if (!engine->running) return;
     if (engine->flight_recorder)
         flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_REQUEST,
@@ -1481,6 +2175,17 @@ static void request_engine_pause_locked( struct thread_engine *engine )
                                     XTAJIT64_FLIGHT_UNKNOWN_U64,
                                     XTAJIT64_FLIGHT_UNKNOWN_U64 );
     atomic_store_explicit( &engine->pause_requested, true, memory_order_release );
+    /* The ordinary block hook is absent from production hot execution.  Ask
+     * Unicorn directly to leave after the current guest instruction; the owner
+     * thread will publish running=FALSE only after it has exported the exact
+     * architectural context. */
+    if ((err = uc_emu_stop_at_instruction_boundary( engine->uc )) != UC_ERR_OK)
+    {
+        engine->mapping_error = err;
+        engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+        poison_provider_locked( STATUS_UNSUCCESSFUL );
+        uc_emu_stop( engine->uc );
+    }
     test_mutation_fault_checkpoint( TEST_MUTATION_FAULT_ENGINE_PAUSE );
 }
 
@@ -1559,7 +2264,7 @@ static BOOL is_ec_code( uint64_t address )
     uint64_t page, word;
 
     if (!provider.ec_bitmap || address > provider.highest_user_address) return FALSE;
-    page = address / provider.ec_page_size;
+    page = address >> provider.ec_page_shift;
     word = provider.ec_bitmap[page / 64];
     return (word >> (page & 63)) & 1;
 }
@@ -1584,6 +2289,7 @@ static BOOL query_host_page( uint64_t address, unsigned int *perms )
     if (info.protection & VM_PROT_EXECUTE) *perms |= UC_PROT_EXEC;
     return TRUE;
 }
+
 #endif
 
 static BOOL unmapped_ec_target_is_executable( uint64_t address )
@@ -1597,11 +2303,1379 @@ static BOOL unmapped_ec_target_is_executable( uint64_t address )
 #endif
 }
 
+#ifdef __APPLE__
+enum direct_self_read_operand
+{
+    DIRECT_SELF_READ_OPERAND_STACK,
+    DIRECT_SELF_READ_OPERAND_SOURCE,
+    DIRECT_SELF_READ_OPERAND_DESTINATION,
+    DIRECT_SELF_READ_OPERAND_RESULT,
+};
+
+static void direct_self_read_increment( uint64_t *value )
+{
+    if (*value != UINT64_MAX) ++*value;
+}
+
+static void direct_self_read_add( uint64_t *value, uint64_t addend )
+{
+    if (*value > UINT64_MAX - addend) *value = UINT64_MAX;
+    else *value += addend;
+}
+
+#ifndef XTAJIT64_UNIXLIB_TEST
+static void render_direct_self_read_diagnostics(
+    const struct direct_self_read_diagnostics *diagnostics, uint64_t engine_id,
+    uint64_t attempts, uint64_t completions, uint64_t completed_bytes );
+
+static void direct_self_read_maybe_report( struct thread_engine *engine )
+{
+    uint64_t next;
+
+    if (!provider.direct_self_read_stats_enabled) return;
+    next = engine->direct_self_read_next_report;
+    if (!next) next = 1;
+    if (engine->direct_self_read_diagnostics.syscalls < next)
+    {
+        engine->direct_self_read_next_report = next;
+        return;
+    }
+    render_direct_self_read_diagnostics( &engine->direct_self_read_diagnostics,
+                                         engine->diagnostic_id,
+                                         engine->direct_self_read_attempts,
+                                         engine->direct_self_read_completions,
+                                         engine->direct_self_read_bytes );
+    if (next < 1024) next = 1024;
+    else if (next <= UINT64_MAX / 4) next *= 4;
+    else next = UINT64_MAX;
+    engine->direct_self_read_next_report = next;
+}
+#else
+static void direct_self_read_maybe_report( struct thread_engine *engine )
+{
+    (void)engine;
+}
+#endif
+
+static void direct_self_read_record_rejection( struct thread_engine *engine,
+                                               enum direct_self_read_rejection reason )
+{
+    if (provider.direct_self_read_stats_enabled)
+    {
+        direct_self_read_increment( &engine->direct_self_read_diagnostics.rejections[reason] );
+        direct_self_read_maybe_report( engine );
+    }
+}
+
+static void direct_self_read_record_request( struct thread_engine *engine, uint64_t size )
+{
+    struct direct_self_read_diagnostics *diagnostics;
+    enum direct_self_read_size_bucket bucket;
+
+    if (!provider.direct_self_read_stats_enabled) return;
+    diagnostics = &engine->direct_self_read_diagnostics;
+    direct_self_read_increment( &diagnostics->current_process );
+    direct_self_read_add( &diagnostics->requested_bytes, size );
+    if (size > diagnostics->maximum_size) diagnostics->maximum_size = size;
+    if (!size) bucket = DIRECT_SELF_READ_SIZE_ZERO;
+    else if (size <= 64) bucket = DIRECT_SELF_READ_SIZE_64;
+    else if (size <= 0x1000) bucket = DIRECT_SELF_READ_SIZE_4K;
+    else if (size <= XTAJIT64_DIRECT_SELF_READ_MAX_SIZE) bucket = DIRECT_SELF_READ_SIZE_64K;
+    else if (size <= 0x100000) bucket = DIRECT_SELF_READ_SIZE_1M;
+    else if (size <= 0x1000000) bucket = DIRECT_SELF_READ_SIZE_16M;
+    else bucket = DIRECT_SELF_READ_SIZE_LARGE;
+    direct_self_read_increment( &diagnostics->size_buckets[bucket] );
+}
+
+static void direct_self_read_record_range_rejection(
+    struct thread_engine *engine, enum direct_self_read_operand operand,
+    enum direct_self_read_range_result result )
+{
+    enum direct_self_read_rejection reason;
+
+    switch (operand)
+    {
+    case DIRECT_SELF_READ_OPERAND_STACK:
+        reason = result == DIRECT_SELF_READ_RANGE_PERMISSIONS ?
+                 DIRECT_SELF_READ_REJECT_STACK_PERMISSIONS :
+                 result == DIRECT_SELF_READ_RANGE_DOMAIN ?
+                 DIRECT_SELF_READ_REJECT_STACK_DOMAIN : DIRECT_SELF_READ_REJECT_STACK_RANGE;
+        break;
+    case DIRECT_SELF_READ_OPERAND_SOURCE:
+        reason = result == DIRECT_SELF_READ_RANGE_PERMISSIONS ?
+                 DIRECT_SELF_READ_REJECT_SOURCE_PERMISSIONS :
+                 result == DIRECT_SELF_READ_RANGE_DOMAIN ?
+                 DIRECT_SELF_READ_REJECT_SOURCE_DOMAIN : DIRECT_SELF_READ_REJECT_SOURCE_RANGE;
+        break;
+    case DIRECT_SELF_READ_OPERAND_DESTINATION:
+        reason = result == DIRECT_SELF_READ_RANGE_PERMISSIONS ?
+                 DIRECT_SELF_READ_REJECT_DESTINATION_PERMISSIONS :
+                 result == DIRECT_SELF_READ_RANGE_DOMAIN ?
+                 DIRECT_SELF_READ_REJECT_DESTINATION_DOMAIN :
+                 DIRECT_SELF_READ_REJECT_DESTINATION_RANGE;
+        break;
+    default:
+        reason = result == DIRECT_SELF_READ_RANGE_PERMISSIONS ?
+                 DIRECT_SELF_READ_REJECT_RESULT_PERMISSIONS :
+                 result == DIRECT_SELF_READ_RANGE_DOMAIN ?
+                 DIRECT_SELF_READ_REJECT_RESULT_DOMAIN : DIRECT_SELF_READ_REJECT_RESULT_RANGE;
+        break;
+    }
+    direct_self_read_record_rejection( engine, reason );
+}
+
+static enum direct_self_read_range_result translate_direct_identity_range_locked(
+    uint64_t guest, uint64_t size, unsigned int required_perms, uint64_t *host )
+{
+    uint64_t allocation_base;
+    unsigned int domain;
+
+    if (translate_guest_range_locked( guest, size, required_perms, host,
+                                      &allocation_base, &domain ))
+        return domain == XTAJIT64_MEMORY_ADDRESS_IDENTITY ?
+               DIRECT_SELF_READ_RANGE_OK : DIRECT_SELF_READ_RANGE_DOMAIN;
+
+    /* Extra classification work is diagnostic-only.  The normal fallback
+     * remains one failed registry lookup when statistics are disabled. */
+    if (!provider.direct_self_read_stats_enabled ||
+        !translate_guest_range_locked( guest, size, 0, host,
+                                       &allocation_base, &domain ))
+        return DIRECT_SELF_READ_RANGE_MISSING;
+    return domain == XTAJIT64_MEMORY_ADDRESS_IDENTITY ?
+           DIRECT_SELF_READ_RANGE_PERMISSIONS : DIRECT_SELF_READ_RANGE_DOMAIN;
+}
+
+static uc_err try_direct_self_read( struct thread_engine *engine, uint64_t rip,
+                                    uint64_t process, uint64_t *next_rip,
+                                    BOOL *handled )
+{
+    static const int read_regs[] =
+    {
+        UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_RSP,
+    };
+    uint64_t source, destination, size, rsp, bytes_read = 0;
+    uint64_t source_host = 0, destination_host = 0, bytes_read_host = 0;
+    void *read_values[] = {&source, &destination, &size, &rsp};
+    uint64_t status = STATUS_SUCCESS;
+    mach_vm_size_t copied;
+    enum direct_self_read_range_result range_result;
+    kern_return_t ret;
+    uc_err err;
+
+    *handled = FALSE;
+    if (provider.direct_self_read_stats_enabled)
+        direct_self_read_increment( &engine->direct_self_read_diagnostics.syscalls );
+    if (process != ~(uint64_t)0)
+    {
+        direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_PROCESS );
+        return UC_ERR_OK;
+    }
+    ++engine->direct_self_read_attempts;
+    if ((err = uc_reg_read_batch( engine->uc, read_regs, read_values,
+                                  ARRAY_SIZE(read_regs) )) != UC_ERR_OK)
+    {
+        direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_REGISTERS );
+        return err;
+    }
+    direct_self_read_record_request( engine, size );
+    if (size > XTAJIT64_DIRECT_SELF_READ_MAX_SIZE)
+    {
+        direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_SIZE );
+        return UC_ERR_OK;
+    }
+    if (rsp < engine->stack_limit || rsp > engine->stack_base ||
+        rsp > UINT64_MAX - 0x30 || rsp + 0x30 > engine->stack_base ||
+        rsp + 0x28 < engine->stack_limit)
+    {
+        direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_STACK_BOUNDS );
+        return UC_ERR_OK;
+    }
+    range_result = translate_direct_identity_range_locked( rsp + 0x28,
+                                                           sizeof(bytes_read),
+                                                           UC_PROT_READ,
+                                                           &source_host );
+    if (range_result != DIRECT_SELF_READ_RANGE_OK)
+    {
+        direct_self_read_record_range_rejection( engine, DIRECT_SELF_READ_OPERAND_STACK,
+                                                 range_result );
+        return UC_ERR_OK;
+    }
+    copied = 0;
+    ret = mach_vm_read_overwrite( mach_task_self(), source_host, sizeof(bytes_read),
+                                  (mach_vm_address_t)(uintptr_t)&bytes_read, &copied );
+    if (ret != KERN_SUCCESS || copied != sizeof(bytes_read))
+    {
+        direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_STACK_PHYSICAL );
+        return UC_ERR_OK;
+    }
+    if (!bytes_read && provider.direct_self_read_stats_enabled)
+        direct_self_read_increment( &engine->direct_self_read_diagnostics.null_result );
+
+    if (size)
+    {
+        range_result = translate_direct_identity_range_locked( source, size, UC_PROT_READ,
+                                                               &source_host );
+        if (range_result != DIRECT_SELF_READ_RANGE_OK)
+        {
+            direct_self_read_record_range_rejection( engine,
+                                                     DIRECT_SELF_READ_OPERAND_SOURCE,
+                                                     range_result );
+            return UC_ERR_OK;
+        }
+        range_result = translate_direct_identity_range_locked( destination, size,
+                                                               UC_PROT_WRITE,
+                                                               &destination_host );
+        if (range_result != DIRECT_SELF_READ_RANGE_OK)
+        {
+            direct_self_read_record_range_rejection(
+                engine, DIRECT_SELF_READ_OPERAND_DESTINATION, range_result );
+            return UC_ERR_OK;
+        }
+    }
+    if (bytes_read &&
+        (range_result = translate_direct_identity_range_locked( bytes_read, sizeof(size),
+                                                                UC_PROT_WRITE,
+                                                                &bytes_read_host )) !=
+            DIRECT_SELF_READ_RANGE_OK)
+    {
+        direct_self_read_record_range_rejection( engine, DIRECT_SELF_READ_OPERAND_RESULT,
+                                                 range_result );
+        return UC_ERR_OK;
+    }
+
+    if (size)
+    {
+        /* Mach performs the protection check and copy in one bounded kernel
+         * operation.  This cannot fault while provider.mutex is held, and a
+         * physically armed write-watch page returns an error to the ordinary
+         * ntdll path.  Defer overlapping copies because Mach does not promise
+         * memmove ordering for a single task map. */
+        if (source != destination && source < destination + size &&
+            destination < source + size)
+        {
+            direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_OVERLAP );
+            return UC_ERR_OK;
+        }
+        copied = 0;
+        ret = mach_vm_read_overwrite( mach_task_self(), source_host, size,
+                                      destination_host, &copied );
+        if (ret != KERN_SUCCESS || copied != size)
+        {
+            direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_DATA_COPY );
+            return UC_ERR_OK;
+        }
+    }
+    if (bytes_read)
+    {
+        copied = 0;
+        ret = mach_vm_read_overwrite( mach_task_self(),
+                                      (mach_vm_address_t)(uintptr_t)&size,
+                                      sizeof(size), bytes_read_host, &copied );
+        if (ret != KERN_SUCCESS || copied != sizeof(size))
+        {
+            direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_RESULT_COPY );
+            return UC_ERR_OK;
+        }
+    }
+    if ((err = uc_reg_write( engine->uc, UC_X86_REG_RAX, &status )) != UC_ERR_OK)
+    {
+        direct_self_read_record_rejection( engine, DIRECT_SELF_READ_REJECT_REGISTERS );
+        return err;
+    }
+    ++engine->direct_self_read_completions;
+    direct_self_read_add( &engine->direct_self_read_bytes, size );
+    direct_self_read_maybe_report( engine );
+    *next_rip = rip;
+    *handled = TRUE;
+    return UC_ERR_OK;
+}
+
+/* A forced Wine shutdown does not necessarily execute process_term(), so a
+ * bounded live capture needs to emit before the normal million-transition
+ * checkpoint. This remains opt-in diagnostic configuration, and the lower
+ * bound prevents a hostile or accidental environment from turning it into a
+ * logging loop. */
+static BOOL parse_ec_target_stats_initial_report( const char *value,
+                                                  uint64_t *initial_report )
+{
+    const char *cursor;
+    char *end;
+    unsigned long long parsed;
+
+    if (!value || !*value || !initial_report) return FALSE;
+    for (cursor = value; *cursor; ++cursor)
+        if (*cursor < '0' || *cursor > '9') return FALSE;
+    errno = 0;
+    parsed = strtoull( value, &end, 10 );
+    if (errno || *end || parsed < XTAJIT64_EC_TARGET_STATS_MIN_INITIAL_REPORT ||
+        parsed > XTAJIT64_EC_TARGET_STATS_DEFAULT_INITIAL_REPORT)
+        return FALSE;
+    *initial_report = parsed;
+    return TRUE;
+}
+
+/* The environment remains expressed as an estimated number of transitions,
+ * even though the low-distortion collector records only a sparse sample. */
+static uint64_t ec_target_stats_initial_sample_count( uint64_t initial_report )
+{
+    return initial_report / XTAJIT64_EC_TARGET_STATS_SAMPLE_STRIDE +
+           !!(initial_report % XTAJIT64_EC_TARGET_STATS_SAMPLE_STRIDE);
+}
+
+#if !defined(XTAJIT64_UNIXLIB_TEST) || defined(XTAJIT64_TEST_EC_LEAF_FASTPATH)
+static uint64_t ec_transition_target_hash( uint64_t address )
+{
+    address >>= 4;
+    address ^= address >> 33;
+    address *= 0xff51afd7ed558ccdull;
+    address ^= address >> 33;
+    return address;
+}
+#endif
+
+#ifndef XTAJIT64_UNIXLIB_TEST
+static void write_diagnostic_line( const char *buffer, size_t length )
+{
+    size_t offset = 0;
+
+    while (offset < length)
+    {
+        ssize_t written = write( STDERR_FILENO, buffer + offset, length - offset );
+
+        if (written > 0) offset += written;
+        else if (written < 0 && errno == EINTR) continue;
+        else break;
+    }
+}
+
+static void reset_ec_transition_target_stats( uint64_t initial_report )
+{
+    unsigned int i;
+
+    memset( provider.ec_target_stats, 0, sizeof(provider.ec_target_stats) );
+    atomic_store_explicit( &provider.ec_target_stats_total, 0, memory_order_relaxed );
+    provider.ec_target_stats_lost = 0;
+    atomic_store_explicit( &provider.ec_target_stats_next_report,
+                           ec_target_stats_initial_sample_count( initial_report ),
+                           memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_attempts, 0, memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_hits, 0, memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_unsupported, 0, memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_register_failures, 0,
+                           memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_memory_failures, 0,
+                           memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_stack_failures, 0,
+                           memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_write_failures, 0,
+                           memory_order_relaxed );
+    for (i = 0; i < EC_LEAF_FASTPATH_KIND_COUNT; ++i)
+        atomic_store_explicit( &provider.ec_leaf_fastpath_hits_by_kind[i], 0,
+                               memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_next_report,
+                           initial_report,
+                           memory_order_relaxed );
+}
+
+/* The Unicorn boundary hook and begin_simulation() can both call this on the
+ * engine's owner thread.  Keep the enabled diagnostic out of their hot path:
+ * sample a thread-owned direct map rather than bouncing shared atomics and
+ * request rendering only at a sparse report interval. */
+static void record_ec_transition_target( struct thread_engine *engine,
+                                         uint64_t address )
+{
+    uint64_t index, expected, total, next_report;
+    unsigned int probe;
+
+    if (!provider.ec_target_stats_enabled || !address) return;
+    if (++engine->ec_target_stats_sample_counter !=
+        XTAJIT64_EC_TARGET_STATS_SAMPLE_STRIDE)
+        return;
+    engine->ec_target_stats_sample_counter = 0;
+    index = ec_transition_target_hash( address ) &
+            (XTAJIT64_EC_TARGET_STATS_ENGINE_SLOTS - 1);
+    for (probe = 0; probe < XTAJIT64_EC_TARGET_STATS_MAX_PROBE; ++probe)
+    {
+        struct ec_transition_target_sample *slot =
+            &engine->ec_target_stats[(index + probe) &
+                                     (XTAJIT64_EC_TARGET_STATS_ENGINE_SLOTS - 1)];
+        uint64_t current = atomic_load_explicit( &slot->address, memory_order_acquire );
+
+        if (current == address)
+        {
+            atomic_fetch_add_explicit( &slot->count, 1, memory_order_relaxed );
+            goto maybe_report;
+        }
+        if (current) continue;
+        expected = 0;
+        if (atomic_compare_exchange_strong_explicit(
+                &slot->address, &expected, address,
+                memory_order_acq_rel, memory_order_acquire ))
+        {
+            atomic_store_explicit( &slot->count, 1, memory_order_relaxed );
+            goto maybe_report;
+        }
+        if (expected == address)
+        {
+            atomic_fetch_add_explicit( &slot->count, 1, memory_order_relaxed );
+            goto maybe_report;
+        }
+    }
+    atomic_fetch_add_explicit( &engine->ec_target_stats_lost, 1, memory_order_relaxed );
+
+maybe_report:
+    total = atomic_fetch_add_explicit( &provider.ec_target_stats_total, 1,
+                                       memory_order_relaxed ) + 1;
+    next_report = atomic_load_explicit( &provider.ec_target_stats_next_report,
+                                        memory_order_relaxed );
+    while (total >= next_report && next_report)
+    {
+        uint64_t replacement = next_report <= UINT64_MAX / 4 ?
+                               next_report * 4 : UINT64_MAX;
+
+        if (atomic_compare_exchange_weak_explicit(
+                &provider.ec_target_stats_next_report, &next_report,
+                replacement, memory_order_acq_rel, memory_order_relaxed ))
+        {
+            engine->ec_target_stats_report_pending = TRUE;
+            break;
+        }
+    }
+}
+
+#if defined(__APPLE__)
+/* Leaf statistics already opt into per-transition counters.  Reuse the
+ * transition renderer's thread-owned pending bit, but let a leaf-only run
+ * request a periodic snapshot independently of target sampling. */
+static void record_ec_leaf_fastpath_attempt( struct thread_engine *engine )
+{
+    uint64_t total, next_report;
+
+    total = atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_attempts, 1,
+                                       memory_order_relaxed ) + 1;
+    next_report = atomic_load_explicit( &provider.ec_leaf_fastpath_next_report,
+                                        memory_order_relaxed );
+    while (total >= next_report && next_report)
+    {
+        uint64_t replacement = next_report <= UINT64_MAX / 4 ?
+                               next_report * 4 : UINT64_MAX;
+
+        if (atomic_compare_exchange_weak_explicit(
+                &provider.ec_leaf_fastpath_next_report, &next_report,
+                replacement, memory_order_acq_rel, memory_order_relaxed ))
+        {
+            engine->ec_target_stats_report_pending = TRUE;
+            break;
+        }
+    }
+}
+#endif
+
+/* Caller holds provider.mutex.  The resulting buffer is written only after
+ * the lock is released, so a slow stderr consumer cannot perturb transition
+ * ownership or the ARM64EC return path. */
+static size_t format_ec_transition_target_stats_locked( char *buffer, size_t size )
+{
+    struct
+    {
+        uint64_t address;
+        uint64_t count;
+        uint32_t instruction[3];
+    } top[XTAJIT64_EC_TARGET_STATS_TOP] = {0};
+    struct thread_engine *engine;
+    uint64_t total, lost, estimated_total, host, allocation_base;
+    unsigned int domain;
+    int length;
+    unsigned int i, j;
+    size_t offset = 0;
+
+    if ((!provider.ec_target_stats_enabled && !provider.ec_leaf_fastpath_stats_enabled) ||
+        !buffer || !size)
+        return 0;
+    if (!provider.ec_target_stats_enabled) goto leaf_stats;
+    memset( provider.ec_target_stats, 0, sizeof(provider.ec_target_stats) );
+    provider.ec_target_stats_lost = 0;
+    for (engine = provider.engines; engine; engine = engine->next)
+    {
+        provider.ec_target_stats_lost += atomic_load_explicit(
+            &engine->ec_target_stats_lost, memory_order_relaxed );
+        for (i = 0; i < XTAJIT64_EC_TARGET_STATS_ENGINE_SLOTS; ++i)
+        {
+            const struct ec_transition_target_sample *sample = &engine->ec_target_stats[i];
+            uint64_t address, count, index;
+
+            address = atomic_load_explicit( &sample->address, memory_order_acquire );
+            count = atomic_load_explicit( &sample->count, memory_order_relaxed );
+            if (!address || !count) continue;
+            index = ec_transition_target_hash( address ) &
+                    (XTAJIT64_EC_TARGET_STATS_SLOTS - 1);
+            for (j = 0; j < XTAJIT64_EC_TARGET_STATS_MAX_PROBE; ++j)
+            {
+                struct ec_transition_target_stat *slot =
+                    &provider.ec_target_stats[(index + j) &
+                                              (XTAJIT64_EC_TARGET_STATS_SLOTS - 1)];
+
+                if (!slot->address)
+                {
+                    slot->address = address;
+                    slot->count = count;
+                    break;
+                }
+                if (slot->address != address) continue;
+                slot->count += count;
+                break;
+            }
+            if (j == XTAJIT64_EC_TARGET_STATS_MAX_PROBE)
+                ++provider.ec_target_stats_lost;
+        }
+    }
+    total = atomic_load_explicit( &provider.ec_target_stats_total,
+                                  memory_order_relaxed );
+    lost = provider.ec_target_stats_lost;
+    estimated_total = total > UINT64_MAX / XTAJIT64_EC_TARGET_STATS_SAMPLE_STRIDE ?
+                      UINT64_MAX : total * XTAJIT64_EC_TARGET_STATS_SAMPLE_STRIDE;
+    for (i = 0; i < XTAJIT64_EC_TARGET_STATS_SLOTS; ++i)
+    {
+        uint64_t count = provider.ec_target_stats[i].count;
+        uint64_t address = provider.ec_target_stats[i].address;
+
+        if (!address || !count || count <= top[XTAJIT64_EC_TARGET_STATS_TOP - 1].count)
+            continue;
+        for (j = 0; j < XTAJIT64_EC_TARGET_STATS_TOP; ++j)
+            if (count > top[j].count) break;
+        if (j >= XTAJIT64_EC_TARGET_STATS_TOP) continue;
+        if (j + 1 < XTAJIT64_EC_TARGET_STATS_TOP)
+            memmove( &top[j + 1], &top[j],
+                     (XTAJIT64_EC_TARGET_STATS_TOP - j - 1) * sizeof(top[0]) );
+        top[j].address = address;
+        top[j].count = count;
+    }
+    for (i = 0; i < XTAJIT64_EC_TARGET_STATS_TOP && top[i].count; ++i)
+    {
+        if (top[i].address > UINT64_MAX - sizeof(top[i].instruction) ||
+            !translate_guest_range_locked( top[i].address, sizeof(top[i].instruction),
+                                           UC_PROT_READ, &host, &allocation_base, &domain ) ||
+            host > UINT64_MAX - sizeof(top[i].instruction))
+            continue;
+        memcpy( top[i].instruction, (const void *)(uintptr_t)host,
+                sizeof(top[i].instruction) );
+    }
+
+    length = snprintf( buffer, size,
+                       "XTAJIT64_EC_TARGET_STATS_V3 pid=%ld samples=%llu "
+                       "estimated_transitions=%llu lost_samples=%llu top=",
+                       (long)getpid(), (unsigned long long)total,
+                       (unsigned long long)estimated_total,
+                       (unsigned long long)lost );
+    if (length <= 0) return 0;
+    offset = (size_t)length < size ? (size_t)length : size - 1;
+    for (i = 0; i < XTAJIT64_EC_TARGET_STATS_TOP && top[i].count; ++i)
+    {
+        length = snprintf( buffer + offset, size - offset,
+                           "%s%#llx@%08x,%08x,%08x:%llu", i ? "," : "",
+                           (unsigned long long)top[i].address,
+                           top[i].instruction[0], top[i].instruction[1],
+                           top[i].instruction[2],
+                           (unsigned long long)top[i].count );
+        if (length <= 0) break;
+        if ((size_t)length >= size - offset)
+        {
+            offset = size - 1;
+            break;
+        }
+        offset += (size_t)length;
+    }
+    if (offset < size - 1) buffer[offset++] = '\n';
+leaf_stats:
+    if (provider.ec_leaf_fastpath_stats_enabled && offset < size)
+    {
+        length = snprintf(
+            buffer + offset, size - offset,
+            "XTAJIT64_EC_LEAF_FASTPATH_STATS_V4 pid=%ld attempts=%llu "
+            "hits=%llu unsupported=%llu register_fail=%llu memory_fail=%llu stack_fail=%llu "
+            "write_fail=%llu teb_load_w0=%llu tls_get_value=%llu tls_get_value2=%llu "
+            "rtl_query_performance_counter=%llu qpc_arm64ec_target=%#llx "
+            "qpc_x64_target=%#llx "
+            "rotl32=%llu rotr32=%llu rotl64=%llu rotr64=%llu\n",
+            (long)getpid(),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_attempts, memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits, memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_unsupported, memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_register_failures,
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_memory_failures,
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_stack_failures,
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_write_failures,
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits_by_kind[EC_LEAF_FASTPATH_TEB_LOAD_W0],
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits_by_kind[EC_LEAF_FASTPATH_TLS_GET_VALUE],
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits_by_kind[EC_LEAF_FASTPATH_TLS_GET_VALUE2],
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits_by_kind[
+                    EC_LEAF_FASTPATH_RTL_QUERY_PERFORMANCE_COUNTER ],
+                memory_order_relaxed ),
+            (unsigned long long)provider.rtl_query_performance_counter,
+            (unsigned long long)provider.nt_query_performance_counter,
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits_by_kind[EC_LEAF_FASTPATH_ROTL32],
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits_by_kind[EC_LEAF_FASTPATH_ROTR32],
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits_by_kind[EC_LEAF_FASTPATH_ROTL64],
+                memory_order_relaxed ),
+            (unsigned long long)atomic_load_explicit(
+                &provider.ec_leaf_fastpath_hits_by_kind[EC_LEAF_FASTPATH_ROTR64],
+                memory_order_relaxed ) );
+        if (length > 0)
+        {
+            if ((size_t)length >= size - offset) offset = size - 1;
+            else offset += (size_t)length;
+        }
+    }
+    return offset;
+}
+
+static void render_ec_transition_target_stats(void)
+{
+    char buffer[2048];
+    size_t length;
+
+    pthread_mutex_lock( &provider.mutex );
+    length = format_ec_transition_target_stats_locked( buffer, sizeof(buffer) );
+    pthread_mutex_unlock( &provider.mutex );
+    if (length) write_diagnostic_line( buffer, length );
+}
+
+static void merge_direct_self_read_diagnostics(
+    struct direct_self_read_diagnostics *destination,
+    const struct direct_self_read_diagnostics *source )
+{
+    unsigned int i;
+
+    direct_self_read_add( &destination->syscalls, source->syscalls );
+    direct_self_read_add( &destination->current_process, source->current_process );
+    direct_self_read_add( &destination->requested_bytes, source->requested_bytes );
+    if (source->maximum_size > destination->maximum_size)
+        destination->maximum_size = source->maximum_size;
+    direct_self_read_add( &destination->null_result, source->null_result );
+    for (i = 0; i < DIRECT_SELF_READ_SIZE_BUCKET_COUNT; ++i)
+        direct_self_read_add( &destination->size_buckets[i], source->size_buckets[i] );
+    for (i = 0; i < DIRECT_SELF_READ_REJECT_COUNT; ++i)
+        direct_self_read_add( &destination->rejections[i], source->rejections[i] );
+}
+
+static void render_direct_self_read_diagnostics(
+    const struct direct_self_read_diagnostics *diagnostics,
+    uint64_t engine_id, uint64_t attempts, uint64_t completions,
+    uint64_t completed_bytes )
+{
+    char buffer[2048];
+    int length;
+
+    if (!diagnostics->syscalls) return;
+    length = snprintf(
+        buffer, sizeof(buffer),
+        "XTAJIT64_DIRECT_READ_STATS_V1 pid=%ld engine=%llu syscalls=%llu current=%llu "
+        "attempts=%llu completions=%llu requested_bytes=%llu completed_bytes=%llu "
+        "maximum_size=%llu null_result=%llu "
+        "sizes=zero:%llu,64:%llu,4k:%llu,64k:%llu,1m:%llu,16m:%llu,large:%llu "
+        "reject=process:%llu,registers:%llu,size:%llu,stack_bounds:%llu,"
+        "stack_range:%llu,stack_permissions:%llu,stack_domain:%llu,stack_physical:%llu,"
+        "source_range:%llu,source_permissions:%llu,source_domain:%llu,"
+        "destination_range:%llu,destination_permissions:%llu,destination_domain:%llu,"
+        "result_range:%llu,result_permissions:%llu,result_domain:%llu,overlap:%llu,"
+        "data_copy:%llu,result_copy:%llu\n",
+        (long)getpid(), (unsigned long long)engine_id,
+        (unsigned long long)diagnostics->syscalls,
+        (unsigned long long)diagnostics->current_process,
+        (unsigned long long)attempts, (unsigned long long)completions,
+        (unsigned long long)diagnostics->requested_bytes,
+        (unsigned long long)completed_bytes,
+        (unsigned long long)diagnostics->maximum_size,
+        (unsigned long long)diagnostics->null_result,
+        (unsigned long long)diagnostics->size_buckets[DIRECT_SELF_READ_SIZE_ZERO],
+        (unsigned long long)diagnostics->size_buckets[DIRECT_SELF_READ_SIZE_64],
+        (unsigned long long)diagnostics->size_buckets[DIRECT_SELF_READ_SIZE_4K],
+        (unsigned long long)diagnostics->size_buckets[DIRECT_SELF_READ_SIZE_64K],
+        (unsigned long long)diagnostics->size_buckets[DIRECT_SELF_READ_SIZE_1M],
+        (unsigned long long)diagnostics->size_buckets[DIRECT_SELF_READ_SIZE_16M],
+        (unsigned long long)diagnostics->size_buckets[DIRECT_SELF_READ_SIZE_LARGE],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_PROCESS],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_REGISTERS],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_SIZE],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_STACK_BOUNDS],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_STACK_RANGE],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_STACK_PERMISSIONS],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_STACK_DOMAIN],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_STACK_PHYSICAL],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_SOURCE_RANGE],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_SOURCE_PERMISSIONS],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_SOURCE_DOMAIN],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_DESTINATION_RANGE],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_DESTINATION_PERMISSIONS],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_DESTINATION_DOMAIN],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_RESULT_RANGE],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_RESULT_PERMISSIONS],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_RESULT_DOMAIN],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_OVERLAP],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_DATA_COPY],
+        (unsigned long long)diagnostics->rejections[DIRECT_SELF_READ_REJECT_RESULT_COPY] );
+    if (length <= 0) return;
+    if ((size_t)length >= sizeof(buffer)) length = sizeof(buffer) - 1;
+    write_diagnostic_line( buffer, length );
+}
+#endif
+#else
+static uc_err try_direct_self_read( struct thread_engine *engine, uint64_t rip,
+                                    uint64_t process, uint64_t *next_rip,
+                                    BOOL *handled )
+{
+    (void)engine;
+    (void)rip;
+    (void)process;
+    (void)next_rip;
+    *handled = FALSE;
+    return UC_ERR_OK;
+}
+#endif
+
+#if defined(__APPLE__) && \
+    (!defined(XTAJIT64_UNIXLIB_TEST) || defined(XTAJIT64_TEST_EC_LEAF_FASTPATH))
+static mach_timebase_info_data_t ec_qpc_timebase;
+static pthread_once_t ec_qpc_timebase_once = PTHREAD_ONCE_INIT;
+
+static void initialize_ec_qpc_timebase(void)
+{
+    if (mach_timebase_info( &ec_qpc_timebase ) != KERN_SUCCESS ||
+        !ec_qpc_timebase.numer || !ec_qpc_timebase.denom)
+        memset( &ec_qpc_timebase, 0, sizeof(ec_qpc_timebase) );
+}
+
+/* Keep the native RtlQueryPerformanceCounter contract bit-for-bit aligned
+ * with dlls/ntdll/unix/sync.c: mach_continuous_time converted to 100 ns
+ * ticks.  If Darwin cannot provide a valid timebase, decline the shortcut so
+ * native ntdll remains authoritative. */
+static BOOL query_ec_performance_counter( uint64_t *counter )
+{
+    if (!counter) return FALSE;
+    pthread_once( &ec_qpc_timebase_once, initialize_ec_qpc_timebase );
+    if (!ec_qpc_timebase.numer || !ec_qpc_timebase.denom) return FALSE;
+    *counter = mach_continuous_time() * ec_qpc_timebase.numer /
+               ec_qpc_timebase.denom / 100;
+    return TRUE;
+}
+
+static BOOL decode_arm64_bl_target( uint64_t address, uint32_t instruction,
+                                    uint64_t *target )
+{
+    uint64_t immediate, displacement;
+
+    if (!target || (instruction & 0xfc000000) != 0x94000000) return FALSE;
+    immediate = instruction & 0x03ffffff;
+    if (immediate & 0x02000000)
+    {
+        displacement = (UINT64_C(0x04000000) - immediate) << 2;
+        if (address < displacement) return FALSE;
+        *target = address - displacement;
+    }
+    else
+    {
+        displacement = immediate << 2;
+        if (address > UINT64_MAX - displacement) return FALSE;
+        *target = address + displacement;
+    }
+    return TRUE;
+}
+
+static BOOL decode_arm64_adrp_target( uint64_t address, uint32_t instruction,
+                                      uint64_t *target )
+{
+    uint64_t immediate, displacement, page;
+
+    if (!target || (instruction & 0x9f000000) != 0x90000000) return FALSE;
+    page = address & ~UINT64_C(0xfff);
+    immediate = (((uint64_t)instruction >> 5) & 0x7ffff) << 2 |
+                ((instruction >> 29) & 3);
+    if (immediate & 0x100000)
+    {
+        displacement = (UINT64_C(0x200000) - immediate) << 12;
+        if (page < displacement) return FALSE;
+        *target = page - displacement;
+    }
+    else
+    {
+        displacement = immediate << 12;
+        if (page > UINT64_MAX - displacement) return FALSE;
+        *target = page + displacement;
+    }
+    return TRUE;
+}
+
+static BOOL decode_arm64_add_immediate_target( uint64_t base, uint32_t instruction,
+                                               unsigned int source, unsigned int destination,
+                                               uint64_t *target )
+{
+    uint64_t immediate;
+
+    if (!target || source > 30 || destination > 30 ||
+        (instruction & 0xff000000) != 0x91000000 ||
+        ((instruction >> 5) & 0x1f) != source ||
+        (instruction & 0x1f) != destination)
+        return FALSE;
+    immediate = (instruction >> 10) & 0xfff;
+    if (instruction & 0x00400000) immediate <<= 12;
+    if (base > UINT64_MAX - immediate) return FALSE;
+    *target = base + immediate;
+    return TRUE;
+}
+
+static BOOL is_arm64_adrp_register( uint32_t instruction, unsigned int destination )
+{
+    return destination <= 30 &&
+           (instruction & 0x9f00001f) == (0x90000000 | destination);
+}
+
+static BOOL is_arm64_ldr_register_offset( uint32_t instruction, unsigned int base,
+                                          unsigned int destination )
+{
+    return base <= 30 && destination <= 30 &&
+           (instruction & 0xffc003ff) ==
+           (0xf9400000 | (base << 5) | destination);
+}
+
+/* An ARM64X hotpatch thunk bridges an ARM64EC caller to an x64 export.  The
+ * registered RtlQueryPerformanceCounter target authenticates the wrapper;
+ * this exact structural check and the raw NtQueryPerformanceCounter export
+ * authenticate the thunk's final x64 branch before the provider replaces the
+ * whole call with the Unix-side monotonic counter. */
+static BOOL is_arm64ec_qpc_hybrid_patch_thunk( uc_engine *uc, uint64_t address )
+{
+    uint32_t instruction[12];
+    uint64_t x64_page, x64_target, ignored;
+
+    if (!provider.nt_query_performance_counter ||
+        address > provider.highest_user_address ||
+        address > UINT64_MAX - sizeof(instruction) ||
+        sizeof(instruction) - 1 > provider.highest_user_address - address ||
+        uc_mem_read( uc, address, instruction, sizeof(instruction) ) != UC_ERR_OK ||
+        instruction[0] != 0xf81f0ffe || /* str x30,[sp,#-16]! */
+        !is_arm64_adrp_register( instruction[1], 8 ) ||
+        !is_arm64_adrp_register( instruction[2], 11 ) ||
+        !decode_arm64_adrp_target( address + 2 * sizeof(instruction[0]), instruction[2],
+                                   &x64_page ) ||
+        !decode_arm64_add_immediate_target( x64_page, instruction[3], 11, 11,
+                                            &x64_target ) ||
+        !is_arm64_ldr_register_offset( instruction[4], 8, 8 ) ||
+        !is_arm64_adrp_register( instruction[5], 10 ) ||
+        !decode_arm64_add_immediate_target( 0, instruction[6], 10, 10, &ignored ) ||
+        !is_arm64_adrp_register( instruction[7], 9 ) ||
+        !decode_arm64_add_immediate_target( 0, instruction[8], 9, 9, &ignored ) ||
+        instruction[9] != 0xd63f0100 || /* blr x8 */
+        instruction[10] != 0xf84107fe || /* ldr x30,[sp],#16 */
+        instruction[11] != 0xd61f0160 || /* br x11 */
+        x64_target != provider.nt_query_performance_counter)
+        return FALSE;
+    return TRUE;
+}
+
+static enum ec_leaf_fastpath_kind classify_ec_leaf_fastpath_target(
+    uc_engine *uc, uint64_t address, uint32_t *instruction )
+{
+    static const uint32_t tls_get_value[] =
+    {
+        0x7100fc1f, /* cmp w0,#0x3f */
+        0xb9006a5f, /* str wzr,[x18,#0x68] */
+        0x54000088, /* b.hi +0x10 */
+        0x8b204e48, /* add x8,x18,w0,uxtw #3 */
+        0xf94a4100, /* ldr x0,[x8,#0x1480] */
+        0xd65f03c0, /* ret */
+    };
+    static const uint32_t tls_get_value2[] =
+    {
+        0x7100fc1f, /* cmp w0,#0x3f */
+        0x54000088, /* b.hi +0x10 */
+        0x8b204e48, /* add x8,x18,w0,uxtw #3 */
+        0xf94a4100, /* ldr x0,[x8,#0x1480] */
+        0xd65f03c0, /* ret */
+    };
+    static const uint32_t rtl_query_performance_counter[] =
+    {
+        0xf81f0ffe, /* str x30,[sp,#-16]! */
+        0xaa1f03e1, /* mov x1,xzr */
+        0,          /* bl NtQueryPerformanceCounter */
+        0x52800020, /* mov w0,#1 */
+        0xf84107fe, /* ldr x30,[sp],#16 */
+        0xd65f03c0, /* ret */
+    };
+    static const uint32_t nt_query_performance_counter[] =
+    {
+        0xd2800628, /* mov x8,#0x31 */
+        0xaa1e03e9, /* mov x9,x30 */
+        0x58000090, /* ldr x16,=unix syscall dispatcher */
+        0xf9400210, /* ldr x16,[x16] */
+        0xd63f0200, /* blr x16 */
+        0xd65f03c0, /* ret */
+    };
+    uint32_t insn[ARRAY_SIZE(tls_get_value)] = {0};
+    uint32_t syscall_insn[ARRAY_SIZE(nt_query_performance_counter)];
+    uint64_t syscall_target;
+
+    *instruction = 0;
+    if (address > UINT64_MAX - 2 * sizeof(insn[0]) ||
+        uc_mem_read( uc, address, insn, 2 * sizeof(insn[0]) ) != UC_ERR_OK)
+        return EC_LEAF_FASTPATH_UNSUPPORTED;
+
+    /* ldr w0,[x18,#imm] ; ret.  AArch64 encodes the byte offset as an
+     * unsigned, naturally aligned imm12, so extracting it later cannot
+     * overflow a 64-bit authenticated guest TEB address. */
+    if (insn[1] == 0xd65f03c0 && (insn[0] & 0xffc003ff) == 0xb9400240)
+    {
+        *instruction = insn[0];
+        return EC_LEAF_FASTPATH_TEB_LOAD_W0;
+    }
+    if (insn[0] == 0x1ac12c00 && insn[1] == 0xd65f03c0)
+        return EC_LEAF_FASTPATH_ROTR32;
+    if (insn[0] == 0x9ac12c00 && insn[1] == 0xd65f03c0)
+        return EC_LEAF_FASTPATH_ROTR64;
+    if (address > UINT64_MAX - 3 * sizeof(insn[0]) ||
+        uc_mem_read( uc, address + 2 * sizeof(insn[0]), &insn[2],
+                     sizeof(insn[2]) ) != UC_ERR_OK)
+        return EC_LEAF_FASTPATH_UNSUPPORTED;
+    if (insn[0] == 0x4b0103e8 && insn[1] == 0x1ac82c00 &&
+        insn[2] == 0xd65f03c0)
+        return EC_LEAF_FASTPATH_ROTL32;
+    if (insn[0] == 0x4b0103e8 && insn[1] == 0x9ac82c00 &&
+        insn[2] == 0xd65f03c0)
+        return EC_LEAF_FASTPATH_ROTL64;
+    if (address > UINT64_MAX - sizeof(insn) ||
+        uc_mem_read( uc, address, insn, sizeof(insn) ) != UC_ERR_OK)
+        return EC_LEAF_FASTPATH_UNSUPPORTED;
+    if (!memcmp( insn, tls_get_value, sizeof(tls_get_value) ))
+        return EC_LEAF_FASTPATH_TLS_GET_VALUE;
+    if (!memcmp( insn, tls_get_value2, sizeof(tls_get_value2) ))
+        return EC_LEAF_FASTPATH_TLS_GET_VALUE2;
+
+    if (address != provider.rtl_query_performance_counter ||
+        memcmp( insn, rtl_query_performance_counter, 2 * sizeof(insn[0])) ||
+        insn[3] != rtl_query_performance_counter[3] ||
+        insn[4] != rtl_query_performance_counter[4] ||
+        insn[5] != rtl_query_performance_counter[5] ||
+        !decode_arm64_bl_target( address + 2 * sizeof(insn[0]), insn[2],
+                                 &syscall_target ) ||
+        !syscall_target || syscall_target > provider.highest_user_address)
+        return EC_LEAF_FASTPATH_UNSUPPORTED;
+    if (syscall_target <= UINT64_MAX - sizeof(syscall_insn) &&
+        sizeof(syscall_insn) - 1 <= provider.highest_user_address - syscall_target &&
+        uc_mem_read( uc, syscall_target, syscall_insn, sizeof(syscall_insn) ) == UC_ERR_OK &&
+        !memcmp( syscall_insn, nt_query_performance_counter, sizeof(syscall_insn) ))
+        return EC_LEAF_FASTPATH_RTL_QUERY_PERFORMANCE_COUNTER;
+    if (!is_arm64ec_qpc_hybrid_patch_thunk( uc, syscall_target ))
+        return EC_LEAF_FASTPATH_UNSUPPORTED;
+    return EC_LEAF_FASTPATH_RTL_QUERY_PERFORMANCE_COUNTER;
+}
+
+/* Caller holds provider.mutex.  Code and VM generation checks make this a
+ * recognition cache only; no entry survives a published code or mapping
+ * change. */
+static enum ec_leaf_fastpath_kind get_ec_leaf_fastpath_kind(
+    struct thread_engine *engine, uc_engine *uc, uint64_t address,
+    uint32_t *instruction )
+{
+    struct ec_leaf_fastpath_cache_entry *entry;
+    unsigned int index;
+
+    index = ec_transition_target_hash( address ) &
+            (XTAJIT64_EC_LEAF_FASTPATH_CACHE_SIZE - 1);
+    entry = &engine->ec_leaf_fastpath_cache[index];
+    if (entry->address == address &&
+        entry->mapping_generation == provider.generation &&
+        entry->code_generation == provider.ec_leaf_fastpath_code_generation &&
+        entry->kind != EC_LEAF_FASTPATH_UNCLASSIFIED)
+    {
+        *instruction = entry->instruction;
+        return entry->kind;
+    }
+
+    entry->address = address;
+    entry->mapping_generation = provider.generation;
+    entry->code_generation = provider.ec_leaf_fastpath_code_generation;
+    entry->kind = classify_ec_leaf_fastpath_target( uc, address, &entry->instruction );
+    *instruction = entry->instruction;
+    return entry->kind;
+}
+
+static uint64_t rotate_left64( uint64_t value, unsigned int shift )
+{
+    shift &= 63;
+    return shift ? (value << shift) | (value >> (64 - shift)) : value;
+}
+
+static uint64_t rotate_right64( uint64_t value, unsigned int shift )
+{
+    shift &= 63;
+    return shift ? (value >> shift) | (value << (64 - shift)) : value;
+}
+
+static uint32_t rotate_left32( uint32_t value, unsigned int shift )
+{
+    shift &= 31;
+    return shift ? (value << shift) | (value >> (32 - shift)) : value;
+}
+
+static uint32_t rotate_right32( uint32_t value, unsigned int shift )
+{
+    shift &= 31;
+    return shift ? (value >> shift) | (value << (32 - shift)) : value;
+}
+
+static BOOL read_engine_guest( const struct thread_engine *engine,
+                               uint64_t guest, void *value, size_t size )
+{
+    const struct mapped_range *range;
+    uint64_t host, allocation_base;
+    unsigned int domain;
+
+    if (!engine || !value || !size || guest > UINT64_MAX - size) return FALSE;
+    if ((range = find_engine_mapping( engine, guest, size )) &&
+        range->state == MEM_COMMIT &&
+        (range->perms & UC_PROT_READ) == UC_PROT_READ &&
+        range->host <= UINT64_MAX - (guest - range->guest))
+        host = range->host + guest - range->guest;
+    else if (!translate_guest_range_locked( guest, size, UC_PROT_READ,
+                                            &host, &allocation_base, &domain ))
+        return FALSE;
+    if (host > UINT64_MAX - size) return FALSE;
+    memcpy( value, (const void *)(uintptr_t)host, size );
+    return TRUE;
+}
+
+static BOOL read_engine_guest_u64( const struct thread_engine *engine,
+                                   uint64_t guest, uint64_t *value )
+{
+    return read_engine_guest( engine, guest, value, sizeof(*value) );
+}
+
+static BOOL read_engine_guest_u32( const struct thread_engine *engine,
+                                   uint64_t guest, uint32_t *value )
+{
+    return read_engine_guest( engine, guest, value, sizeof(*value) );
+}
+
+static BOOL write_engine_guest( const struct thread_engine *engine,
+                                uint64_t guest, const void *value, size_t size )
+{
+    const struct mapped_range *range;
+    uint64_t host, allocation_base;
+    unsigned int domain;
+
+    if (!engine || !value || !size || guest > UINT64_MAX - size) return FALSE;
+    if ((range = find_engine_mapping( engine, guest, size )) &&
+        range->state == MEM_COMMIT &&
+        (range->perms & UC_PROT_WRITE) == UC_PROT_WRITE &&
+        range->host <= UINT64_MAX - (guest - range->guest))
+        host = range->host + guest - range->guest;
+    else if (!translate_guest_range_locked( guest, size, UC_PROT_WRITE,
+                                            &host, &allocation_base, &domain ))
+        return FALSE;
+    if (host > UINT64_MAX - size) return FALSE;
+    memcpy( (void *)(uintptr_t)host, value, size );
+    return TRUE;
+}
+
+static BOOL write_engine_guest_u32( const struct thread_engine *engine,
+                                    uint64_t guest, uint32_t value )
+{
+    return write_engine_guest( engine, guest, &value, sizeof(value) );
+}
+
+#ifndef XTAJIT64_UNIXLIB_TEST
+static void report_ec_leaf_fastpath_stack_failure( uint64_t address, uint64_t rsp,
+                                                   uint64_t ret_rsp, uint64_t ret,
+                                                   const struct thread_engine *engine,
+                                                   BOOL stack_in_bounds, BOOL stack_read,
+                                                   BOOL ret_valid )
+{
+    static atomic_bool reported;
+    char buffer[384];
+    int length;
+
+    if (!provider.ec_leaf_fastpath_stats_enabled ||
+        atomic_exchange_explicit( &reported, true, memory_order_relaxed ))
+        return;
+    length = snprintf(
+        buffer, sizeof(buffer),
+        "XTAJIT64_EC_LEAF_FASTPATH_STACK_FAIL_V1 pid=%ld target=%#llx "
+        "rsp=%#llx ret_rsp=%#llx limit=%#llx base=%#llx in_bounds=%u read=%u "
+        "ret=%#llx ret_valid=%u ret_ec=%u\n",
+        (long)getpid(), (unsigned long long)address,
+        (unsigned long long)rsp, (unsigned long long)ret_rsp,
+        (unsigned long long)engine->stack_limit,
+        (unsigned long long)engine->stack_base, stack_in_bounds,
+        stack_read, (unsigned long long)ret, ret_valid,
+        stack_read && ret ? is_ec_code( ret ) : 0 );
+    if (length <= 0) return;
+    if ((size_t)length >= sizeof(buffer)) length = sizeof(buffer) - 1;
+    write_diagnostic_line( buffer, (size_t)length );
+}
+#endif
+
+static BOOL try_ec_leaf_fastpath( struct thread_engine *engine, uc_engine *uc,
+                                  uint64_t address, BOOL pre_call_stack,
+                                  uint64_t *next_rip )
+{
+    enum ec_leaf_fastpath_kind kind;
+    uint64_t rcx = 0, rdx = 0, rax = 0, rsp = 0, gs_base = 0;
+    uint64_t ret_rsp, final_rsp, ret = 0, teb_offset, tls_slot_offset;
+    uint64_t performance_counter;
+    uint32_t instruction;
+    uint32_t teb_value;
+    uc_err write_err;
+    BOOL stack_in_bounds, stack_read, ret_valid;
+    BOOL stats;
+    static const int rotate_read_regs[] =
+    {
+        UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RSP,
+    };
+    static const int teb_read_regs[] =
+    {
+        UC_X86_REG_RSP, UC_X86_REG_GS_BASE,
+    };
+    static const int tls_read_regs[] =
+    {
+        UC_X86_REG_RCX, UC_X86_REG_RSP, UC_X86_REG_GS_BASE,
+    };
+    static const int qpc_read_regs[] =
+    {
+        UC_X86_REG_RCX, UC_X86_REG_RSP,
+    };
+    static const int write_regs[] =
+    {
+        UC_X86_REG_RAX, UC_X86_REG_RSP, UC_X86_REG_RIP,
+    };
+    void *rotate_read_values[] = {&rcx, &rdx, &rsp};
+    void *teb_read_values[] = {&rsp, &gs_base};
+    void *tls_read_values[] = {&rcx, &rsp, &gs_base};
+    void *qpc_read_values[] = {&rcx, &rsp};
+    void *write_values[] = {&rax, &rsp, &ret};
+
+    if (!provider.ec_leaf_fastpath_enabled || !engine || !uc || !next_rip) return FALSE;
+    stats = provider.ec_leaf_fastpath_stats_enabled;
+    if (stats)
+#ifndef XTAJIT64_UNIXLIB_TEST
+        record_ec_leaf_fastpath_attempt( engine );
+#else
+        atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_attempts, 1,
+                                   memory_order_relaxed );
+#endif
+    kind = get_ec_leaf_fastpath_kind( engine, uc, address, &instruction );
+    if (kind == EC_LEAF_FASTPATH_UNSUPPORTED) goto unsupported;
+    if (kind == EC_LEAF_FASTPATH_TEB_LOAD_W0)
+    {
+        if (uc_reg_read_batch( uc, teb_read_regs, teb_read_values,
+                               ARRAY_SIZE(teb_read_regs) ) != UC_ERR_OK)
+        {
+            if (stats)
+                atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_register_failures, 1,
+                                           memory_order_relaxed );
+            return FALSE;
+        }
+    }
+    else if (kind == EC_LEAF_FASTPATH_TLS_GET_VALUE ||
+             kind == EC_LEAF_FASTPATH_TLS_GET_VALUE2)
+    {
+        if (uc_reg_read_batch( uc, tls_read_regs, tls_read_values,
+                               ARRAY_SIZE(tls_read_regs) ) != UC_ERR_OK)
+        {
+            if (stats)
+                atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_register_failures, 1,
+                                           memory_order_relaxed );
+            return FALSE;
+        }
+    }
+    else if (kind == EC_LEAF_FASTPATH_RTL_QUERY_PERFORMANCE_COUNTER)
+    {
+        if (uc_reg_read_batch( uc, qpc_read_regs, qpc_read_values,
+                               ARRAY_SIZE(qpc_read_regs) ) != UC_ERR_OK)
+        {
+            if (stats)
+                atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_register_failures, 1,
+                                           memory_order_relaxed );
+            return FALSE;
+        }
+    }
+    else if (uc_reg_read_batch( uc, rotate_read_regs, rotate_read_values,
+                                ARRAY_SIZE(rotate_read_regs) ) != UC_ERR_OK)
+    {
+        if (stats)
+            atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_register_failures, 1,
+                                       memory_order_relaxed );
+        return FALSE;
+    }
+    if (pre_call_stack)
+    {
+        if (rsp < sizeof(ret))
+        {
+            if (stats)
+                atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_stack_failures, 1,
+                                           memory_order_relaxed );
+            return FALSE;
+        }
+        ret_rsp = rsp - sizeof(ret);
+        final_rsp = rsp;
+    }
+    else
+    {
+        if (rsp > UINT64_MAX - sizeof(ret))
+        {
+            if (stats)
+                atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_stack_failures, 1,
+                                           memory_order_relaxed );
+            return FALSE;
+        }
+        ret_rsp = rsp;
+        final_rsp = rsp + sizeof(ret);
+    }
+    stack_in_bounds = engine->stack_base >= sizeof(ret) &&
+                      ret_rsp >= engine->stack_limit &&
+                      ret_rsp <= engine->stack_base - sizeof(ret);
+    stack_read = stack_in_bounds && read_engine_guest_u64( engine, ret_rsp, &ret );
+    ret_valid = stack_read && ret &&
+                ret <= XTAJIT64_X64_USER_ADDRESS_MAX && !is_ec_code( ret );
+    if (!stack_in_bounds || !ret_valid)
+    {
+#ifndef XTAJIT64_UNIXLIB_TEST
+        report_ec_leaf_fastpath_stack_failure( address, rsp, ret_rsp, ret, engine,
+                                               stack_in_bounds, stack_read, ret_valid );
+#endif
+        if (stats)
+            atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_stack_failures, 1,
+                                       memory_order_relaxed );
+        return FALSE;
+    }
+
+    switch (kind)
+    {
+    case EC_LEAF_FASTPATH_TEB_LOAD_W0:
+        teb_offset = ((instruction >> 10) & 0xfff) * sizeof(uint32_t);
+        if (gs_base > UINT64_MAX - teb_offset ||
+            !read_engine_guest_u32( engine, gs_base + teb_offset, &teb_value ))
+            goto memory_failure;
+        rax = teb_value;
+        break;
+    case EC_LEAF_FASTPATH_TLS_GET_VALUE:
+        /* The out-of-range branch is intentionally left to native ARM64EC.
+         * The accepted prefix's LastError clear precedes that branch, so
+         * writing it before discovering an unsupported case would make an
+         * otherwise safe fallback a partial emulation. */
+        if ((uint32_t)rcx >= XTAJIT64_TEB_TLS_SLOT_COUNT) goto unsupported;
+        if (gs_base > UINT64_MAX - XTAJIT64_TEB_LAST_ERROR_OFFSET ||
+            !write_engine_guest_u32( engine,
+                                     gs_base + XTAJIT64_TEB_LAST_ERROR_OFFSET, 0 ))
+            goto memory_failure;
+        /* Fall through.  TlsGetValue2 has the same bounded slot lookup but
+         * deliberately retains LastError. */
+        /* fall through */
+    case EC_LEAF_FASTPATH_TLS_GET_VALUE2:
+        if ((uint32_t)rcx >= XTAJIT64_TEB_TLS_SLOT_COUNT) goto unsupported;
+        tls_slot_offset = XTAJIT64_TEB_TLS_SLOTS_OFFSET +
+                          (uint64_t)(uint32_t)rcx * sizeof(rax);
+        if (gs_base > UINT64_MAX - tls_slot_offset ||
+            !read_engine_guest_u64( engine, gs_base + tls_slot_offset, &rax ))
+            goto memory_failure;
+        break;
+    case EC_LEAF_FASTPATH_RTL_QUERY_PERFORMANCE_COUNTER:
+        /* RtlQueryPerformanceCounter always passes x1 = NULL to the ntdll
+         * syscall body, so the x64 caller supplies only the counter pointer
+         * in RCX.  Compute before the store: any unavailable counter source
+         * or invalid guest destination must leave the native fallback wholly
+         * responsible for the call. */
+        if (!query_ec_performance_counter( &performance_counter )) goto unsupported;
+        if (!write_engine_guest( engine, rcx, &performance_counter,
+                                 sizeof(performance_counter) ))
+            goto memory_failure;
+        rax = TRUE;
+        break;
+    case EC_LEAF_FASTPATH_ROTL32:
+        rax = rotate_left32( (uint32_t)rcx, (unsigned int)rdx );
+        break;
+    case EC_LEAF_FASTPATH_ROTR32:
+        rax = rotate_right32( (uint32_t)rcx, (unsigned int)rdx );
+        break;
+    case EC_LEAF_FASTPATH_ROTL64:
+        rax = rotate_left64( rcx, (unsigned int)rdx );
+        break;
+    case EC_LEAF_FASTPATH_ROTR64:
+        rax = rotate_right64( rcx, (unsigned int)rdx );
+        break;
+    default:
+        goto unsupported;
+    }
+    rsp = final_rsp;
+    if ((write_err = uc_reg_write_batch( uc, write_regs, write_values,
+                                         ARRAY_SIZE(write_regs) )) != UC_ERR_OK)
+    {
+        if (stats)
+            atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_write_failures, 1,
+                                       memory_order_relaxed );
+        /* Some leaf implementations have already updated guest memory at
+         * this point.  Never fall back to the native implementation with a
+         * partially committed call; a valid-register write failure means the
+         * engine is no longer trustworthy.  The caller holds provider.mutex. */
+        engine->mapping_error = write_err;
+        engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+        poison_provider_locked( STATUS_UNSUCCESSFUL );
+        return FALSE;
+    }
+    if (stats)
+    {
+        atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_hits, 1,
+                                   memory_order_relaxed );
+        if (kind > EC_LEAF_FASTPATH_UNSUPPORTED && kind < EC_LEAF_FASTPATH_KIND_COUNT)
+            atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_hits_by_kind[kind], 1,
+                                       memory_order_relaxed );
+    }
+    *next_rip = ret;
+    return TRUE;
+
+memory_failure:
+    if (stats)
+        atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_memory_failures, 1,
+                                   memory_order_relaxed );
+    return FALSE;
+
+unsupported:
+    if (stats)
+        atomic_fetch_add_explicit( &provider.ec_leaf_fastpath_unsupported, 1,
+                                   memory_order_relaxed );
+    return FALSE;
+}
+#endif
+
 static void stop_at_ec_target( struct thread_engine *engine, uc_engine *uc,
                                uint64_t address )
 {
     uint64_t rsp = XTAJIT64_FLIGHT_UNKNOWN_U64;
 
+#ifndef XTAJIT64_UNIXLIB_TEST
+    record_ec_transition_target( engine, address );
+#endif
     engine->transition_target = address;
     engine->stop_reason = XTAJIT64_STOP_EC_TRANSITION;
     if (engine->flight_recorder &&
@@ -1629,6 +3703,101 @@ static void stop_at_instruction_boundary( struct thread_engine *engine,
     engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
     uc_emu_stop( uc );
 }
+
+#if defined(__APPLE__) && !defined(XTAJIT64_UNIXLIB_TEST)
+static void render_unicorn_perf_diagnostics(
+    const struct thread_engine *engine,
+    const struct xtajit64_unicorn_perf_counters *counters )
+{
+    char buffer[2048];
+    int length;
+
+    length = snprintf(
+        buffer, sizeof(buffer),
+        "XTAJIT64_UNICORN_PERF_V5 pid=%ld engine=%llu samples=%llu "
+        "dispatch=%llu lookups=%llu jump_hits=%llu hash_hits=%llu misses=%llu "
+        "generated=%llu indirect=%llu soft_load=%llu soft_store=%llu "
+        "notdirty=%llu exec_writes=%llu invalidate_fast=%llu bitmap_skips=%llu "
+        "tb_invalidated=%llu code_writes=%llu engine_scans=%llu peer_invalidations=%llu "
+        "private_writes=%llu "
+        "code_translations=%llu exclusive=%llu pause_requests=%llu "
+        "site_first=%llu site_reobserved=%llu site_matches=%llu site_tb_matches=%llu site_changes=%llu "
+        "site_collisions=%llu\n",
+        (long)getpid(), (unsigned long long)engine->diagnostic_id,
+        (unsigned long long)engine->perf_sample_count,
+        (unsigned long long)counters->tcg_dispatch_entries,
+        (unsigned long long)counters->tb_lookup_calls,
+        (unsigned long long)counters->tb_jump_cache_hits,
+        (unsigned long long)counters->tb_hash_hits,
+        (unsigned long long)counters->tb_lookup_misses,
+        (unsigned long long)counters->tb_generations,
+        (unsigned long long)counters->indirect_tb_lookups,
+        (unsigned long long)counters->softmmu_load_helpers,
+        (unsigned long long)counters->softmmu_store_helpers,
+        (unsigned long long)counters->notdirty_writes,
+        (unsigned long long)counters->executable_writes,
+        (unsigned long long)counters->invalidate_fast_calls,
+        (unsigned long long)counters->invalidate_bitmap_skips,
+        (unsigned long long)counters->actual_tb_invalidations,
+        (unsigned long long)counters->shared_code_write_begins,
+        (unsigned long long)counters->shared_code_engine_scans,
+        (unsigned long long)counters->shared_code_peer_invalidations,
+        (unsigned long long)counters->shared_code_private_writes,
+        (unsigned long long)counters->shared_code_translation_begins,
+        (unsigned long long)counters->shared_exclusive_begins,
+        (unsigned long long)counters->shared_pause_requests,
+        (unsigned long long)counters->indirect_site_first_observations,
+        (unsigned long long)counters->indirect_site_reobservations,
+        (unsigned long long)counters->indirect_site_target_matches,
+        (unsigned long long)counters->indirect_site_target_tb_matches,
+        (unsigned long long)counters->indirect_site_target_changes,
+        (unsigned long long)counters->indirect_site_collisions );
+    if (length <= 0) return;
+    if ((size_t)length >= sizeof(buffer)) length = sizeof(buffer) - 1;
+    write_diagnostic_line( buffer, length );
+}
+
+static void maybe_report_unicorn_perf_diagnostics( struct thread_engine *engine )
+{
+    struct xtajit64_unicorn_perf_counters counters =
+    {
+        .version = XTAJIT64_UNICORN_PERF_COUNTERS_VERSION,
+        .size = sizeof(counters),
+    };
+    uint64_t next;
+    uc_err err;
+
+    if (!provider.unicorn_perf_stats_enabled ||
+        !provider.unicorn_get_perf_counters)
+        return;
+    if (engine->perf_sample_count != UINT64_MAX) ++engine->perf_sample_count;
+    next = engine->perf_next_report;
+    if (!next) next = 1;
+    if (engine->perf_sample_count < next)
+    {
+        engine->perf_next_report = next;
+        return;
+    }
+    err = provider.unicorn_get_perf_counters( engine->uc, &counters );
+    if (err != UC_ERR_OK)
+    {
+        ERR( "engine %llu Unicorn performance counter query failed %u\n",
+             (unsigned long long)engine->diagnostic_id, err );
+        engine->perf_next_report = UINT64_MAX;
+        return;
+    }
+    render_unicorn_perf_diagnostics( engine, &counters );
+    if (next < (1u << 10)) next = 1u << 10;
+    else if (next <= UINT64_MAX / 4) next *= 4;
+    else next = UINT64_MAX;
+    engine->perf_next_report = next;
+}
+#else
+static void maybe_report_unicorn_perf_diagnostics( struct thread_engine *engine )
+{
+    (void)engine;
+}
+#endif
 
 static void block_hook( uc_engine *uc, uint64_t address, uint32_t size, void *user )
 {
@@ -1670,6 +3839,9 @@ static void block_hook( uc_engine *uc, uint64_t address, uint32_t size, void *us
         return;
     }
     if (!atomic_load_explicit( &engine->pause_requested, memory_order_acquire )) return;
+#ifdef XTAJIT64_UNIXLIB_TEST
+    if (atomic_load_explicit( &test_disable_pause_hook, memory_order_acquire )) return;
+#endif
     if (engine->flight_recorder)
         flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
                                     XTAJIT64_FLIGHT_REASON_NONE,
@@ -1845,11 +4017,16 @@ static uc_err install_engine_hooks( struct thread_engine *engine )
 {
     uc_hook hook;
     uc_err err;
+    BOOL install_block_hook = FALSE;
 
-    /* ARM64EC transitions occur only at translated-block boundaries.  A block
-     * hook preserves the EC bitmap contract without the old per-instruction
-     * callback on the emulation hot path. */
-    if ((err = uc_hook_add( engine->uc, &hook, UC_HOOK_BLOCK, block_hook,
+#ifdef XTAJIT64_UNIXLIB_TEST
+    /* The legacy concurrency harness deliberately holds hook callbacks to
+     * exercise owner/mutator races.  Production does not install a block hook:
+     * TB history samples uc_emu_start() entries outside generated execution. */
+    install_block_hook = TRUE;
+#endif
+    if (install_block_hook &&
+        (err = uc_hook_add( engine->uc, &hook, UC_HOOK_BLOCK, block_hook,
                             engine, 1, 0 )) != UC_ERR_OK)
         return err;
     if ((err = uc_hook_add( engine->uc, &hook, UC_HOOK_INSN, syscall_hook,
@@ -1870,7 +4047,16 @@ static uc_err open_thread_engine( struct thread_engine *engine )
     uc_err err;
 
     if ((err = uc_open( UC_ARCH_X86, UC_MODE_64, &engine->uc )) != UC_ERR_OK) return err;
-    if ((err = uc_set_shared_memory_atomic_callback(
+    if ((provider.unicorn_perf_stats_enabled &&
+         (err = provider.unicorn_enable_perf_counters( engine->uc )) != UC_ERR_OK) ||
+        (err = uc_configure_identity_memory_fastpath(
+             engine->uc, provider.identity_page_flags,
+             provider.identity_address_bits )) != UC_ERR_OK ||
+        (err = uc_configure_x64_boundary_guard(
+             engine->uc, provider.ec_bitmap, provider.ec_bitmap_word_count,
+             provider.highest_user_address, provider.ec_page_shift,
+             &engine->boundary_idle_doorbell, NULL )) != UC_ERR_OK ||
+        (err = uc_set_shared_memory_atomic_callback(
              engine->uc, shared_memory_atomic_hook, engine )) != UC_ERR_OK ||
         (err = uc_enable_shared_memory_atomics( engine->uc )) != UC_ERR_OK)
     {
@@ -1889,35 +4075,25 @@ static uc_err open_thread_engine( struct thread_engine *engine )
 }
 
 static uc_err write_context( struct thread_engine *engine,
-                             const struct xtajit64_x64_context *context,
+                             struct xtajit64_x64_context *context,
                              uint64_t gs_base )
 {
-    const UINT64 *values = &context->rax;
-    uc_err err;
-    unsigned int i;
+    uc_switchyard_x86_64_transition_context packed;
 
 #ifdef XTAJIT64_UNIXLIB_TEST
     atomic_fetch_add_explicit( &test_context_write_count, 1, memory_order_relaxed );
 #endif
-    for (i = 0; i < ARRAY_SIZE(integer_regs); ++i)
-        if ((err = uc_reg_write( engine->uc, integer_regs[i], &values[i] )) != UC_ERR_OK)
-            return err;
-    if ((err = uc_reg_write( engine->uc, UC_X86_REG_GS_BASE, &gs_base )) != UC_ERR_OK)
-        return err;
-    if ((err = uc_reg_write( engine->uc, UC_X86_REG_MXCSR, &context->mxcsr )) != UC_ERR_OK)
-        return err;
-    for (i = 0; i < ARRAY_SIZE(xmm_regs); ++i)
-        if ((err = uc_reg_write( engine->uc, xmm_regs[i], context->xmm[i] )) != UC_ERR_OK)
-            return err;
-    return UC_ERR_OK;
+    memcpy( &packed, context, sizeof(packed) );
+    return uc_switchyard_x86_64_import_transition_context(
+        engine->uc, &packed, gs_base,
+        UC_SWITCHYARD_X86_64_TRANSITION_CONTEXT_VERSION, sizeof(packed) );
 }
 
 static uc_err read_context( struct thread_engine *engine,
                             struct xtajit64_x64_context *context )
 {
-    UINT64 *values = &context->rax;
+    uc_switchyard_x86_64_transition_context packed;
     uc_err err;
-    unsigned int i;
 
 #ifdef XTAJIT64_UNIXLIB_TEST
     atomic_fetch_add_explicit( &test_context_read_count, 1, memory_order_relaxed );
@@ -1936,15 +4112,12 @@ static uc_err read_context( struct thread_engine *engine,
                                    memory_order_release );
     }
 #endif
-    for (i = 0; i < ARRAY_SIZE(integer_regs); ++i)
-        if ((err = uc_reg_read( engine->uc, integer_regs[i], &values[i] )) != UC_ERR_OK)
-            return err;
-    if ((err = uc_reg_read( engine->uc, UC_X86_REG_MXCSR, &context->mxcsr )) != UC_ERR_OK)
-        return err;
-    for (i = 0; i < ARRAY_SIZE(xmm_regs); ++i)
-        if ((err = uc_reg_read( engine->uc, xmm_regs[i], context->xmm[i] )) != UC_ERR_OK)
-            return err;
-    return UC_ERR_OK;
+    packed.reserved = context->reserved;
+    err = uc_switchyard_x86_64_export_transition_context(
+        engine->uc, &packed,
+        UC_SWITCHYARD_X86_64_TRANSITION_CONTEXT_VERSION, sizeof(packed) );
+    if (err == UC_ERR_OK) memcpy( context, &packed, sizeof(packed) );
+    return err;
 }
 
 static uc_err prepare_x64_syscall_engine( struct thread_engine *engine,
@@ -1952,11 +4125,21 @@ static uc_err prepare_x64_syscall_engine( struct thread_engine *engine,
                                           uint64_t *next_rip )
 {
     uint64_t rax, r10, rip;
+    BOOL handled;
+    static const int read_regs[] =
+    {
+        UC_X86_REG_RAX, UC_X86_REG_RIP, UC_X86_REG_R10,
+    };
+    static const int write_regs[] =
+    {
+        UC_X86_REG_RCX, UC_X86_REG_R10, UC_X86_REG_RIP,
+    };
+    void *read_values[] = {&rax, &rip, &r10};
+    void *write_values[] = {&r10, &rip, &dispatcher};
     uc_err err;
 
-    if ((err = uc_reg_read( engine->uc, UC_X86_REG_RAX, &rax )) != UC_ERR_OK)
-        return err;
-    if ((err = uc_reg_read( engine->uc, UC_X86_REG_RIP, &rip )) != UC_ERR_OK)
+    if ((err = uc_reg_read_batch( engine->uc, read_regs, read_values,
+                                  ARRAY_SIZE(read_regs) )) != UC_ERR_OK)
         return err;
     if (rax >= count)
     {
@@ -1966,14 +4149,16 @@ static uc_err prepare_x64_syscall_engine( struct thread_engine *engine,
         *next_rip = rip;
         return UC_ERR_OK;
     }
-    if ((err = uc_reg_read( engine->uc, UC_X86_REG_R10, &r10 )) != UC_ERR_OK)
-        return err;
-
+    if (rax == XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY)
+    {
+        if ((err = try_direct_self_read( engine, rip, r10, next_rip,
+                                         &handled )) != UC_ERR_OK || handled)
+            return err;
+    }
     /* Match ntdll's ARM64EC STATUS_EMULATION_SYSCALL conversion.  Unicorn
      * reports RIP after both SYSCALL and INT 2E once the stop hook returns. */
-    if ((err = uc_reg_write( engine->uc, UC_X86_REG_RCX, &r10 )) != UC_ERR_OK ||
-        (err = uc_reg_write( engine->uc, UC_X86_REG_R10, &rip )) != UC_ERR_OK ||
-        (err = uc_reg_write( engine->uc, UC_X86_REG_RIP, &dispatcher )) != UC_ERR_OK)
+    if ((err = uc_reg_write_batch( engine->uc, write_regs, write_values,
+                                   ARRAY_SIZE(write_regs) )) != UC_ERR_OK)
         return err;
     *next_rip = dispatcher;
     return UC_ERR_OK;
@@ -1984,9 +4169,22 @@ static uc_err create_pool_engine_locked( struct thread_engine **result )
     struct thread_engine *engine;
     uc_context *initial_context = NULL;
     uc_err err;
+    unsigned int i;
 
     if (!(engine = calloc( 1, sizeof(*engine) ))) return UC_ERR_NOMEM;
     atomic_init( &engine->pause_requested, false );
+    atomic_init( &engine->ec_target_stats_lost, 0 );
+    for (i = 0; i < XTAJIT64_EC_TARGET_STATS_ENGINE_SLOTS; ++i)
+    {
+        atomic_init( &engine->ec_target_stats[i].address, 0 );
+        atomic_init( &engine->ec_target_stats[i].count, 0 );
+    }
+    if (provider.tb_history_enabled &&
+        !(engine->tb_history = tb_history_create()))
+    {
+        err = UC_ERR_NOMEM;
+        goto failed;
+    }
     if ((err = open_thread_engine( engine )) != UC_ERR_OK) goto failed;
     if (!provider.initial_context)
     {
@@ -2007,8 +4205,39 @@ failed:
     if (initial_context) uc_context_free( initial_context );
     if (engine->uc) uc_close( engine->uc );
     range_array_free( &engine->mapped_ranges );
+    free( engine->tb_history );
     free( engine );
     return err;
+}
+
+static void clear_engine_residency_locked( struct thread_engine *engine )
+{
+    struct thread_binding *binding = engine->resident_binding;
+
+    if (binding && binding->resident_engine == engine)
+        binding->resident_engine = NULL;
+    engine->resident_binding = NULL;
+    engine->resident_binding_id = 0;
+}
+
+static uc_err evict_engine_residency_locked( struct thread_engine *engine )
+{
+    struct thread_binding *binding = engine->resident_binding;
+    uc_err err;
+
+    if (!binding)
+    {
+        engine->resident_binding_id = 0;
+        return UC_ERR_OK;
+    }
+    if (binding->resident_engine != engine ||
+        engine->resident_binding_id != binding->id || !binding->context)
+        return UC_ERR_HANDLE;
+    if ((err = uc_context_save( engine->uc, binding->context )) != UC_ERR_OK)
+        return err;
+    binding->context_valid = TRUE;
+    clear_engine_residency_locked( engine );
+    return UC_ERR_OK;
 }
 
 static uc_err acquire_pool_engine_locked( struct thread_binding *binding,
@@ -2021,29 +4250,53 @@ static uc_err acquire_pool_engine_locked( struct thread_binding *binding,
         pthread_cond_wait( &provider.cond, &provider.mutex );
     if (!provider.initialized || provider.shutting_down || provider.poison_status)
         return UC_ERR_HANDLE;
-    idle = NULL;
-    for (engine = provider.engines; engine; engine = engine->next)
+    if ((engine = binding->resident_engine))
     {
-        if (engine->in_use) continue;
-        if (!idle) idle = engine;
-        if (engine->resident_binding_id == binding->id) break;
+        if (!engine->linked || engine->in_use ||
+            engine->resident_binding != binding ||
+            engine->resident_binding_id != binding->id)
+            return UC_ERR_HANDLE;
     }
-    if (!engine) engine = idle;
+    else
+    {
+        idle = NULL;
+        for (engine = provider.engines; engine; engine = engine->next)
+        {
+            if (engine->in_use) continue;
+            if (!idle) idle = engine;
+        }
+        engine = idle;
+    }
     if (!engine && (err = create_pool_engine_locked( &engine )) != UC_ERR_OK)
         return err;
     if (!binding->context &&
         (err = uc_context_alloc( engine->uc, &binding->context )) != UC_ERR_OK)
         return err;
-    if (engine->resident_binding_id != binding->id &&
-        (err = uc_context_restore( engine->uc, binding->context_valid ?
-                                   binding->context : provider.initial_context )) != UC_ERR_OK)
-        return err;
+    if (engine->resident_binding == binding)
+        clear_engine_residency_locked( engine );
+    else
+    {
+        if ((err = evict_engine_residency_locked( engine )) != UC_ERR_OK)
+            return err;
+        if ((err = uc_context_restore( engine->uc, binding->context_valid ?
+                                       binding->context : provider.initial_context )) != UC_ERR_OK)
+            return err;
+    }
 
-    engine->resident_binding_id = 0;
     engine->owner = pthread_self();
     engine->in_use = TRUE;
     engine->flight_stop_detail0 = XTAJIT64_FLIGHT_UNKNOWN_U64;
-    if ((engine->flight_recorder = binding->flight_recorder))
+    engine->flight_recorder = binding->flight_recorder;
+    if (engine->flight_recorder || engine->tb_history)
+    {
+        if (!(++engine->execution_generation)) ++engine->execution_generation;
+    }
+    if (engine->tb_history)
+    {
+        engine->tb_binding_id = binding->id;
+        engine->tb_causal_boundary_id = binding->flight_causal_boundary_id;
+    }
+    if (engine->flight_recorder)
     {
         engine->flight_binding_id = binding->id;
         engine->flight_causal_boundary_id = binding->flight_causal_boundary_id;
@@ -2060,7 +4313,6 @@ static uc_err acquire_pool_engine_locked( struct thread_binding *binding,
         engine->flight_pid = binding->flight_pid;
         engine->flight_mach_thread_id = binding->flight_mach_thread_id;
         engine->flight_pthread_identity = binding->flight_pthread_identity;
-        if (!(++engine->execution_generation)) ++engine->execution_generation;
     }
     ++provider.engines_in_use;
     provider.engine_high_water = max( provider.engine_high_water,
@@ -2087,16 +4339,26 @@ static uc_err release_pool_engine_locked( struct thread_binding *binding,
                                           BOOL save_context )
 {
     uc_err err = UC_ERR_OK;
+    uc_err stop_err;
 
     if (save_context)
     {
-        err = uc_context_save( engine->uc, binding->context );
-        if (err == UC_ERR_OK)
+        if ((binding->resident_engine && binding->resident_engine != engine) ||
+            (engine->resident_binding && engine->resident_binding != binding))
         {
-            binding->context_valid = TRUE;
+            err = UC_ERR_HANDLE;
+            if (binding->resident_engine)
+                clear_engine_residency_locked( binding->resident_engine );
+            clear_engine_residency_locked( engine );
+        }
+        else
+        {
+            binding->resident_engine = engine;
+            engine->resident_binding = binding;
             engine->resident_binding_id = binding->id;
         }
     }
+    else clear_engine_residency_locked( engine );
     if (engine->flight_recorder)
     {
         flight_record_engine_event( engine, XTAJIT64_FLIGHT_EVENT_ENGINE_RELEASE,
@@ -2121,10 +4383,42 @@ static uc_err release_pool_engine_locked( struct thread_binding *binding,
         engine->flight_mach_thread_id = 0;
         engine->flight_pthread_identity = 0;
     }
+    engine->tb_binding_id = 0;
+    engine->tb_causal_boundary_id = 0;
     engine->flight_stop_detail0 = XTAJIT64_FLIGHT_UNKNOWN_U64;
-    if (!save_context) engine->resident_binding_id = 0;
-    engine->running = FALSE;
+    if (engine->running)
+    {
+        /* A mutator may publish its stop after uc_emu_start() has returned but
+         * before the owner can reacquire this mutex.  No further requester can
+         * enter while the mutex is held, so discard that lease-scoped request
+         * before running=FALSE exposes the engine to the pool. */
+        stop_err = uc_clear_instruction_boundary_stop( engine->uc );
+        engine->running = FALSE;
+        if (stop_err != UC_ERR_OK)
+        {
+            engine->mapping_error = stop_err;
+            engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+            poison_provider_locked( STATUS_UNSUCCESSFUL );
+            if (err == UC_ERR_OK) err = stop_err;
+        }
+    }
     engine->in_use = FALSE;
+    {
+        uc_err doorbell_err = uc_update_x64_boundary_suspend_doorbell(
+            engine->uc, &engine->boundary_idle_doorbell );
+
+        if (doorbell_err != UC_ERR_OK)
+        {
+            /* Never return an engine to the pool while Unicorn may retain a
+             * caller-owned doorbell pointer.  A poisoned provider cannot run
+             * the engine again, even if the extension failed before replacing
+             * its pointer. */
+            engine->mapping_error = doorbell_err;
+            engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+            poison_provider_locked( STATUS_UNSUCCESSFUL );
+            if (err == UC_ERR_OK) err = doorbell_err;
+        }
+    }
     engine->suspend_doorbell = NULL;
     --provider.engines_in_use;
     binding->active = FALSE;
@@ -2137,6 +4431,10 @@ static void destroy_thread_binding( void *value )
     struct thread_binding *binding = value;
 
     if (!binding) return;
+    pthread_mutex_lock( &provider.mutex );
+    if (binding->resident_engine)
+        clear_engine_residency_locked( binding->resident_engine );
+    pthread_mutex_unlock( &provider.mutex );
     if (binding->context) uc_context_free( binding->context );
     free( binding );
 }
@@ -2594,6 +4892,239 @@ static const struct wine_arm64ec_low_memory_observer_v1 arm64ec_low_memory_obser
     WINE_ARM64EC_LOW_MEMORY_OBSERVER_CAP_EXACT_POST_SNAPSHOT,
 };
 
+static BOOL arm64ec_code_operation_is_valid( uint32_t operation )
+{
+    switch (operation)
+    {
+    case WINE_ARM64EC_CODE_RESYNC:
+    case WINE_ARM64EC_CODE_ALLOCATE:
+    case WINE_ARM64EC_CODE_RELEASE:
+    case WINE_ARM64EC_CODE_MAP:
+    case WINE_ARM64EC_CODE_UNMAP:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static enum mutation_kind arm64ec_code_mutation_kind( uint32_t operation )
+{
+    switch (operation)
+    {
+    case WINE_ARM64EC_CODE_RESYNC: return MUTATION_RESYNC;
+    case WINE_ARM64EC_CODE_ALLOCATE:
+    case WINE_ARM64EC_CODE_MAP: return MUTATION_MAP;
+    case WINE_ARM64EC_CODE_RELEASE:
+    case WINE_ARM64EC_CODE_UNMAP: return MUTATION_UNMAP;
+    default: return MUTATION_FLUSH;
+    }
+}
+
+static NTSTATUS validate_arm64ec_code_event(
+    const struct wine_arm64ec_code_event_v1 *event,
+    const struct arm64ec_code_observer_transaction *transaction,
+    BOOL *full_invalidation )
+{
+    uint64_t page_mask, previous_end = 0;
+    size_t i, count;
+
+    if (!event || event->version != WINE_ARM64EC_CODE_OBSERVER_VERSION ||
+        event->size != sizeof(*event) || event->operation != transaction->operation ||
+        !arm64ec_code_operation_is_valid( event->operation ) ||
+        (event->flags & ~WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION) ||
+        event->reserved || event->range_count > XTAJIT64_MAX_RESYNC_RANGES ||
+        event->range_count > SIZE_MAX || (event->range_count && !event->ranges))
+        return STATUS_INVALID_PARAMETER;
+
+    *full_invalidation = !!(event->flags & WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION);
+    if (*full_invalidation)
+    {
+        if (event->range_count) return STATUS_INVALID_PARAMETER;
+        return STATUS_SUCCESS;
+    }
+    if (!provider.code_observer_active) return STATUS_INVALID_DEVICE_STATE;
+
+    page_mask = (UINT64_C(1) << provider.ec_page_shift) - 1;
+    count = (size_t)event->range_count;
+    for (i = 0; i < count; ++i)
+    {
+        const struct wine_arm64ec_code_range_v1 *range = &event->ranges[i];
+        uint64_t end;
+
+        if (!range->size || (range->address & page_mask) ||
+            (range->size & page_mask) ||
+            range->address > provider.highest_user_address ||
+            range->size - 1 > provider.highest_user_address - range->address)
+            return STATUS_INVALID_PARAMETER;
+        end = range->address + range->size;
+        if (i && range->address <= previous_end) return STATUS_INVALID_PARAMETER;
+        previous_end = end;
+    }
+    return STATUS_SUCCESS;
+}
+
+static int32_t arm64ec_code_observer_begin_callback(
+    void *context, uint32_t operation, void **transaction_ret )
+{
+    struct arm64ec_code_observer_transaction *transaction;
+    volatile NTSTATUS status = STATUS_SUCCESS;
+    volatile BOOL faulted = FALSE;
+    BOOL claimed = FALSE;
+    enum mutation_kind fault_kind = MUTATION_NONE;
+    enum mutation_stage fault_stage = MUTATION_STAGE_IDLE;
+    uint64_t fault_generation = 0;
+
+    if (!transaction_ret) return STATUS_INVALID_PARAMETER;
+    *transaction_ret = NULL;
+    if (context != &provider || !arm64ec_code_operation_is_valid( operation ))
+        return STATUS_INVALID_PARAMETER;
+    if (!(transaction = calloc( 1, sizeof(*transaction) ))) return STATUS_NO_MEMORY;
+
+    pthread_mutex_lock( &provider.mutex );
+    if (current_thread_owns_mutation_locked() || provider.observer_transaction ||
+        provider.code_observer_transaction)
+        status = STATUS_INVALID_DEVICE_STATE;
+    else
+    {
+        status = claim_mutation_locked( arm64ec_code_mutation_kind( operation ), FALSE );
+        claimed = !status;
+    }
+    if (!status) __TRY
+    {
+        pause_mutation_engines_locked();
+    }
+    __EXCEPT
+    {
+        status = recover_mutation_access_violation_locked();
+        faulted = TRUE;
+    }
+    __ENDTRY
+    if (!faulted && !status && claimed && current_thread_owns_mutation_locked())
+        status = wait_for_mutation_engines_locked();
+    if (!faulted && !status)
+    {
+        transaction->generation = provider.generation;
+        transaction->operation = operation;
+        provider.code_observer_transaction = transaction;
+        *transaction_ret = transaction;
+    }
+    else if (!faulted && claimed && current_thread_owns_mutation_locked())
+        finish_mutation_locked();
+    if (faulted)
+    {
+        fault_kind = provider.last_fault_kind;
+        fault_stage = provider.last_fault_stage;
+        fault_generation = provider.last_fault_generation;
+    }
+    pthread_mutex_unlock( &provider.mutex );
+    if (faulted)
+        report_mutation_access_violation( fault_kind, fault_stage, fault_generation );
+    if (status) free( transaction );
+    return status;
+}
+
+static void arm64ec_code_observer_complete_callback(
+    void *context, void *token, const struct wine_arm64ec_code_event_v1 *event )
+{
+    struct arm64ec_code_observer_transaction *transaction;
+    struct thread_engine *engine;
+    volatile NTSTATUS status = STATUS_SUCCESS;
+    volatile BOOL faulted = FALSE;
+    enum mutation_kind fault_kind = MUTATION_NONE;
+    enum mutation_stage fault_stage = MUTATION_STAGE_IDLE;
+    uint64_t fault_generation = 0;
+    BOOL full_invalidation = FALSE;
+    size_t i;
+
+    pthread_mutex_lock( &provider.mutex );
+    transaction = provider.code_observer_transaction;
+    if (context != &provider || !token || token != transaction || !transaction ||
+        !current_thread_owns_mutation_locked() ||
+        transaction->generation != provider.generation)
+    {
+        status = STATUS_INVALID_DEVICE_STATE;
+        poison_provider_locked( status );
+        pthread_mutex_unlock( &provider.mutex );
+        WARN( "rejected non-owning ARM64EC code completion\n" );
+        return;
+    }
+
+    __TRY
+    {
+        status = validate_arm64ec_code_event( event, transaction, &full_invalidation );
+        if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
+        if (!status)
+        {
+            for (engine = provider.engines; engine; engine = engine->next)
+            {
+                uc_err err = UC_ERR_OK;
+
+                if (full_invalidation) err = uc_ctl_flush_tb( engine->uc );
+                else if (event->range_count)
+                {
+                    err = uc_ctl_flush_tlb( engine->uc );
+                    for (i = 0; err == UC_ERR_OK && i < (size_t)event->range_count; ++i)
+                        err = uc_ctl_remove_cache(
+                            engine->uc, event->ranges[i].address,
+                            event->ranges[i].address + event->ranges[i].size );
+                }
+                if (err != UC_ERR_OK)
+                {
+                    status = STATUS_UNSUCCESSFUL;
+                    break;
+                }
+            }
+        }
+        if (!status)
+        {
+            if (full_invalidation || event->range_count)
+                advance_ec_leaf_fastpath_code_generation_locked();
+            set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
+            if (full_invalidation) provider.code_observer_active = TRUE;
+            TRACE( "published ARM64EC code event operation %u mutation status %#x, "
+                   "full %u ranges %llu\n", event->operation,
+                   (unsigned int)event->status, full_invalidation,
+                   (unsigned long long)event->range_count );
+        }
+    }
+    __EXCEPT
+    {
+        status = recover_mutation_access_violation_locked();
+        faulted = TRUE;
+    }
+    __ENDTRY
+    if (!faulted)
+    {
+        if (status) poison_provider_locked( status );
+        if (provider.mutating) finish_mutation_locked();
+    }
+    if (faulted)
+    {
+        fault_kind = provider.last_fault_kind;
+        fault_stage = provider.last_fault_stage;
+        fault_generation = provider.last_fault_generation;
+    }
+    provider.code_observer_transaction = NULL;
+    pthread_mutex_unlock( &provider.mutex );
+
+    if (faulted)
+        report_mutation_access_violation( fault_kind, fault_stage, fault_generation );
+    else if (status)
+        WARN( "cannot publish ARM64EC code event status %#x\n",
+              (unsigned int)status );
+    free( transaction );
+}
+
+static const struct wine_arm64ec_code_observer_v1 arm64ec_code_observer =
+{
+    WINE_ARM64EC_CODE_OBSERVER_VERSION,
+    sizeof(arm64ec_code_observer),
+    &provider,
+    arm64ec_code_observer_begin_callback,
+    arm64ec_code_observer_complete_callback,
+    WINE_ARM64EC_CODE_OBSERVER_CAP_EXACT_INVALIDATION_RANGES,
+};
+
 static int32_t register_xtajit64_memory_observer(void)
 {
 #ifdef XTAJIT64_UNIXLIB_TEST
@@ -2622,7 +5153,18 @@ static int32_t register_xtajit64_memory_observer(void)
         &range,
         1,
     };
-    void *transaction = NULL;
+    struct wine_arm64ec_code_event_v1 code_event =
+    {
+        WINE_ARM64EC_CODE_OBSERVER_VERSION,
+        sizeof(code_event),
+        WINE_ARM64EC_CODE_RESYNC,
+        WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION,
+        STATUS_SUCCESS,
+        0,
+        NULL,
+        0,
+    };
+    void *transaction = NULL, *code_transaction = NULL;
     int32_t status;
 
     status = arm64ec_low_memory_observer.begin( arm64ec_low_memory_observer.context,
@@ -2633,10 +5175,20 @@ static int32_t register_xtajit64_memory_observer(void)
     if (!status)
         arm64ec_low_memory_observer.complete( arm64ec_low_memory_observer.context,
                                               transaction, &event );
+    if (!status)
+        status = arm64ec_code_observer.begin( arm64ec_code_observer.context,
+                                              WINE_ARM64EC_CODE_RESYNC,
+                                              &code_transaction );
+    if (!status)
+        arm64ec_code_observer.complete( arm64ec_code_observer.context,
+                                        code_transaction, &code_event );
     return status;
 #else
-    return __wine_register_arm64ec_low_memory_observer_v1(
+    int32_t status = __wine_register_arm64ec_low_memory_observer_v1(
         &arm64ec_low_memory_observer );
+
+    if (status) return status;
+    return __wine_register_arm64ec_code_observer_v1( &arm64ec_code_observer );
 #endif
 }
 
@@ -2646,6 +5198,22 @@ static NTSTATUS process_init( void *args )
     struct mapped_range kuser;
     NTSTATUS status;
     unsigned int major, minor;
+#ifndef XTAJIT64_UNIXLIB_TEST
+    const char *tb_history_environment;
+    const char *ec_target_stats_environment;
+    const char *ec_target_stats_initial_environment;
+    const char *ec_leaf_fastpath_environment;
+    const char *ec_leaf_fastpath_stats_environment;
+    uint64_t ec_target_stats_initial_report =
+        XTAJIT64_EC_TARGET_STATS_DEFAULT_INITIAL_REPORT;
+#ifdef __APPLE__
+    const char *direct_self_read_stats_environment;
+    const char *unicorn_perf_stats_environment;
+    unicorn_enable_perf_counters_fn unicorn_enable_perf_counters = NULL;
+    unicorn_get_perf_counters_fn unicorn_get_perf_counters = NULL;
+    enum unicorn_perf_counter_api_resolution unicorn_perf_counter_api_resolution;
+#endif
+#endif
 
     TRACE( "CPU provider interface %s\n", XTAJIT64_PROVIDER_ABI_IDENTITY );
     if (!params) return STATUS_INVALID_PARAMETER;
@@ -2661,6 +5229,12 @@ static NTSTATUS process_init( void *args )
         !params->rtl_exit_user_thread ||
         params->rtl_exit_user_thread > XTAJIT64_X64_USER_ADDRESS_MAX ||
         params->rtl_exit_user_thread > params->highest_user_address ||
+        (params->rtl_query_performance_counter &&
+         (params->rtl_query_performance_counter > XTAJIT64_X64_USER_ADDRESS_MAX ||
+          params->rtl_query_performance_counter > params->highest_user_address)) ||
+        (params->nt_query_performance_counter &&
+         (params->nt_query_performance_counter > XTAJIT64_X64_USER_ADDRESS_MAX ||
+          params->nt_query_performance_counter > params->highest_user_address)) ||
         !params->x64_syscall_dispatcher ||
         params->x64_syscall_dispatcher > XTAJIT64_X64_USER_ADDRESS_MAX ||
         params->x64_syscall_dispatcher > params->highest_user_address ||
@@ -2685,6 +5259,43 @@ static NTSTATUS process_init( void *args )
         ERR( "unsupported Unicorn API %u.%u\n", major, minor );
         return STATUS_REVISION_MISMATCH;
     }
+#ifndef XTAJIT64_UNIXLIB_TEST
+    tb_history_environment = getenv( "WINE_XTAJIT64_TB_HISTORY" );
+    ec_target_stats_environment = getenv( "WINE_XTAJIT64_EC_TARGET_STATS" );
+    ec_target_stats_initial_environment =
+        getenv( "WINE_XTAJIT64_EC_TARGET_STATS_INITIAL" );
+    ec_leaf_fastpath_environment = getenv( "WINE_XTAJIT64_EC_LEAF_FASTPATH" );
+    ec_leaf_fastpath_stats_environment =
+        getenv( "WINE_XTAJIT64_EC_LEAF_FASTPATH_STATS" );
+    if (ec_target_stats_environment && !strcmp( ec_target_stats_environment, "1" ) &&
+        ec_target_stats_initial_environment &&
+        !parse_ec_target_stats_initial_report( ec_target_stats_initial_environment,
+                                               &ec_target_stats_initial_report ))
+    {
+        ERR( "WINE_XTAJIT64_EC_TARGET_STATS_INITIAL must be a decimal value "
+             "from %u through %u\n", XTAJIT64_EC_TARGET_STATS_MIN_INITIAL_REPORT,
+             XTAJIT64_EC_TARGET_STATS_DEFAULT_INITIAL_REPORT );
+        return STATUS_INVALID_PARAMETER;
+    }
+#ifdef __APPLE__
+    direct_self_read_stats_environment =
+        getenv( "WINE_XTAJIT64_DIRECT_READ_STATS" );
+    unicorn_perf_stats_environment = getenv( "WINE_XTAJIT64_PERF_STATS" );
+    if (unicorn_perf_stats_environment &&
+        !strcmp( unicorn_perf_stats_environment, "1" ))
+    {
+        unicorn_perf_counter_api_resolution = resolve_unicorn_perf_counter_api(
+            &unicorn_enable_perf_counters, &unicorn_get_perf_counters );
+        if (unicorn_perf_counter_api_resolution != UNICORN_PERF_COUNTER_API_RESOLVED)
+        {
+            ERR( "WINE_XTAJIT64_PERF_STATS requires the Switchyard Unicorn "
+                 "performance-counter API (resolver stage %u)\n",
+                 unicorn_perf_counter_api_resolution );
+            return STATUS_NOT_SUPPORTED;
+        }
+    }
+#endif
+#endif
 
     pthread_mutex_lock( &provider.mutex );
     while (provider.shutting_down)
@@ -2694,10 +5305,23 @@ static NTSTATUS process_init( void *args )
         pthread_mutex_unlock( &provider.mutex );
         return STATUS_ALREADY_INITIALIZED;
     }
+    status = allocate_identity_page_table_locked( params->highest_user_address );
+    if (status)
+    {
+        pthread_mutex_unlock( &provider.mutex );
+        return status;
+    }
     provider.ec_bitmap = (const uint64_t *)(uintptr_t)params->ec_bitmap;
-    provider.ec_page_size = params->kuser_size;
+    /* kuser_size is a validated, nonzero power of two and is also the EC
+     * bitmap page size.  Precompute its shift once instead of executing a
+     * variable 64-bit division at every translated basic-block boundary. */
+    provider.ec_page_shift = __builtin_ctzll( params->kuser_size );
+    provider.ec_bitmap_word_count =
+        (params->highest_user_address >> provider.ec_page_shift) / 64 + 1;
     provider.highest_user_address = params->highest_user_address;
     provider.rtl_exit_user_thread = params->rtl_exit_user_thread;
+    provider.rtl_query_performance_counter = params->rtl_query_performance_counter;
+    provider.nt_query_performance_counter = params->nt_query_performance_counter;
     provider.x64_syscall_dispatcher = params->x64_syscall_dispatcher;
     provider.x64_syscall_count = params->x64_syscall_count;
     provider.guest_kuser = params->guest_kuser;
@@ -2708,6 +5332,52 @@ static NTSTATUS process_init( void *args )
     provider.engine_count = 0;
     provider.engines_in_use = 0;
     provider.engine_high_water = 0;
+    provider.ec_leaf_fastpath_code_generation = 1;
+#ifdef XTAJIT64_UNIXLIB_TEST
+    provider.tb_history_enabled = FALSE;
+    provider.direct_self_read_stats_enabled = FALSE;
+    provider.unicorn_perf_stats_enabled = FALSE;
+    provider.ec_target_stats_enabled = FALSE;
+    provider.ec_leaf_fastpath_enabled = FALSE;
+    provider.ec_leaf_fastpath_stats_enabled = FALSE;
+    provider.unicorn_enable_perf_counters = NULL;
+    provider.unicorn_get_perf_counters = NULL;
+#else
+    provider.tb_history_enabled = tb_history_environment &&
+                                  !strcmp( tb_history_environment, "1" );
+    reset_ec_transition_target_stats( ec_target_stats_initial_report );
+    provider.ec_target_stats_enabled = ec_target_stats_environment &&
+                                       !strcmp( ec_target_stats_environment, "1" );
+    /* The exact-state shortcut is a normal Apple native-runtime path.  Keep
+     * a conservative per-process escape hatch for a new application or a
+     * field regression; unsupported values also choose that fallback. */
+#ifdef __APPLE__
+    provider.ec_leaf_fastpath_enabled = !ec_leaf_fastpath_environment ||
+                                        !strcmp( ec_leaf_fastpath_environment, "1" );
+#else
+    provider.ec_leaf_fastpath_enabled = FALSE;
+#endif
+    provider.ec_leaf_fastpath_stats_enabled = provider.ec_leaf_fastpath_enabled &&
+                                              ec_leaf_fastpath_stats_environment &&
+                                              !strcmp( ec_leaf_fastpath_stats_environment,
+                                                       "1" );
+#ifdef __APPLE__
+    provider.direct_self_read_stats_enabled = direct_self_read_stats_environment &&
+                                              !strcmp( direct_self_read_stats_environment,
+                                                       "1" );
+    provider.unicorn_perf_stats_enabled = unicorn_enable_perf_counters &&
+                                          unicorn_get_perf_counters;
+    provider.unicorn_enable_perf_counters = unicorn_enable_perf_counters;
+    provider.unicorn_get_perf_counters = unicorn_get_perf_counters;
+#else
+    provider.direct_self_read_stats_enabled = FALSE;
+    provider.unicorn_perf_stats_enabled = FALSE;
+    provider.unicorn_enable_perf_counters = NULL;
+    provider.unicorn_get_perf_counters = NULL;
+#endif
+    provider.tb_history_watchdog_started = FALSE;
+    provider.tb_history_watchdog_tick = 0;
+#endif
     if (!++provider.instance) ++provider.instance;
     provider.poison_status = STATUS_SUCCESS;
     provider.last_fault_kind = MUTATION_NONE;
@@ -2715,7 +5385,9 @@ static NTSTATUS process_init( void *args )
     provider.last_fault_generation = 0;
     provider.shutting_down = FALSE;
     provider.observer_active = FALSE;
+    provider.code_observer_active = FALSE;
     provider.observer_transaction = NULL;
+    provider.code_observer_transaction = NULL;
     provider.generation = 1;
 
     kuser.guest = params->guest_kuser;
@@ -2731,6 +5403,10 @@ static NTSTATUS process_init( void *args )
     if (!range_array_append( &provider.ranges, &kuser ))
     {
         range_array_free( &provider.ranges );
+        munmap( provider.identity_page_flags, provider.identity_page_flags_size );
+        provider.identity_page_flags = NULL;
+        provider.identity_page_flags_size = 0;
+        provider.identity_address_bits = 0;
         pthread_mutex_unlock( &provider.mutex );
         return STATUS_NO_MEMORY;
     }
@@ -2745,11 +5421,17 @@ static NTSTATUS process_init( void *args )
     }
     pthread_mutex_lock( &provider.mutex );
     if (provider.poison_status) status = provider.poison_status;
-    else if (!provider.observer_active)
+    else if (!provider.observer_active || !provider.code_observer_active)
     {
         status = STATUS_INVALID_DEVICE_STATE;
         poison_provider_locked( status );
     }
+#ifndef XTAJIT64_UNIXLIB_TEST
+    else if ((status = tb_history_start_watchdog_locked()))
+    {
+        provider.tb_history_enabled = FALSE;
+    }
+#endif
     else
     {
         params->enabled_capabilities = XTAJIT64_CAPABILITIES;
@@ -2776,6 +5458,19 @@ static NTSTATUS process_init( void *args )
 static NTSTATUS process_term( void *args )
 {
     struct thread_engine *engine, *next;
+#if defined(__APPLE__) && !defined(XTAJIT64_UNIXLIB_TEST)
+    struct direct_self_read_diagnostics direct_self_read_diagnostics = {0};
+    uint64_t direct_self_read_attempts = 0;
+    uint64_t direct_self_read_completions = 0;
+    uint64_t direct_self_read_bytes = 0;
+    BOOL render_direct_self_read_stats = FALSE;
+#endif
+#ifndef XTAJIT64_UNIXLIB_TEST
+    pthread_t tb_history_watchdog;
+    BOOL join_tb_history_watchdog = FALSE;
+    char ec_target_stats_report[2048];
+    size_t ec_target_stats_report_length = 0;
+#endif
     (void)args;
     pthread_mutex_lock( &provider.mutex );
     if (!provider.initialized)
@@ -2800,27 +5495,81 @@ static NTSTATUS process_term( void *args )
     while (any_engine_in_use_locked())
         pthread_cond_wait( &provider.cond, &provider.mutex );
 
+#ifndef XTAJIT64_UNIXLIB_TEST
+    if (provider.tb_history_watchdog_started)
+    {
+        tb_history_watchdog = provider.tb_history_watchdog;
+        provider.tb_history_watchdog_started = FALSE;
+        join_tb_history_watchdog = TRUE;
+    }
+    if (join_tb_history_watchdog)
+    {
+        pthread_mutex_unlock( &provider.mutex );
+        pthread_join( tb_history_watchdog, NULL );
+        pthread_mutex_lock( &provider.mutex );
+    }
+    ec_target_stats_report_length = format_ec_transition_target_stats_locked(
+        ec_target_stats_report, sizeof(ec_target_stats_report) );
+#endif
+
     for (engine = provider.engines; engine; engine = next)
     {
         next = engine->next;
+#if defined(__APPLE__) && !defined(XTAJIT64_UNIXLIB_TEST)
+        if (provider.direct_self_read_stats_enabled)
+        {
+            render_direct_self_read_stats = TRUE;
+            merge_direct_self_read_diagnostics( &direct_self_read_diagnostics,
+                                                &engine->direct_self_read_diagnostics );
+            direct_self_read_add( &direct_self_read_attempts,
+                                  engine->direct_self_read_attempts );
+            direct_self_read_add( &direct_self_read_completions,
+                                  engine->direct_self_read_completions );
+            direct_self_read_add( &direct_self_read_bytes,
+                                  engine->direct_self_read_bytes );
+        }
+#endif
         trace_mapping_diagnostic( engine, "final", 0 );
+        clear_engine_residency_locked( engine );
         if (engine->uc) uc_close( engine->uc );
         range_array_free( &engine->mapped_ranges );
+        free( engine->tb_history );
         free( engine );
     }
     provider.engines = NULL;
     provider.engine_count = 0;
     provider.engines_in_use = 0;
     provider.engine_high_water = 0;
+    provider.tb_history_enabled = FALSE;
+    provider.direct_self_read_stats_enabled = FALSE;
+    provider.unicorn_perf_stats_enabled = FALSE;
+    provider.ec_target_stats_enabled = FALSE;
+    provider.ec_leaf_fastpath_enabled = FALSE;
+    provider.ec_leaf_fastpath_stats_enabled = FALSE;
+    provider.ec_leaf_fastpath_code_generation = 0;
+    provider.unicorn_enable_perf_counters = NULL;
+    provider.unicorn_get_perf_counters = NULL;
+#ifndef XTAJIT64_UNIXLIB_TEST
+    provider.tb_history_watchdog_tick = 0;
+#endif
     if (provider.initial_context) uc_context_free( provider.initial_context );
     provider.initial_context = NULL;
     range_array_free( &provider.ranges );
+    munmap( provider.identity_page_flags, provider.identity_page_flags_size );
+    provider.identity_page_flags = NULL;
+    provider.identity_page_flags_size = 0;
+    provider.identity_address_bits = 0;
     provider.observer_active = FALSE;
+    provider.code_observer_active = FALSE;
     provider.observer_transaction = NULL;
+    provider.code_observer_transaction = NULL;
     provider.ec_bitmap = NULL;
-    provider.ec_page_size = 0;
+    provider.ec_bitmap_word_count = 0;
+    provider.ec_page_shift = 0;
     provider.highest_user_address = 0;
     provider.rtl_exit_user_thread = 0;
+    provider.rtl_query_performance_counter = 0;
+    provider.nt_query_performance_counter = 0;
     provider.x64_syscall_dispatcher = 0;
     provider.x64_syscall_count = 0;
     provider.guest_kuser = 0;
@@ -2830,6 +5579,18 @@ static NTSTATUS process_term( void *args )
     provider.shutting_down = FALSE;
     finish_mutation_locked();
     pthread_mutex_unlock( &provider.mutex );
+#ifndef XTAJIT64_UNIXLIB_TEST
+    if (ec_target_stats_report_length)
+        write_diagnostic_line( ec_target_stats_report, ec_target_stats_report_length );
+#endif
+#if defined(__APPLE__) && !defined(XTAJIT64_UNIXLIB_TEST)
+    if (render_direct_self_read_stats)
+        render_direct_self_read_diagnostics( &direct_self_read_diagnostics,
+                                             0,
+                                             direct_self_read_attempts,
+                                             direct_self_read_completions,
+                                             direct_self_read_bytes );
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -3115,7 +5876,7 @@ static NTSTATUS memory_map_internal( void *args )
 {
     const struct xtajit64_memory_params *params = args;
     struct mapped_range mapping;
-    struct range_array replacement = {0};
+    struct range_array replacement = {0}, removals = {0}, additions = {0};
     uint64_t start, end, host_start, host_end;
     volatile NTSTATUS status = STATUS_SUCCESS;
     volatile BOOL faulted = FALSE;
@@ -3167,15 +5928,23 @@ static NTSTATUS memory_map_internal( void *args )
         test_mutation_fault_checkpoint( TEST_MUTATION_FAULT_AFTER_BEGIN );
         if (!status)
             status = build_mapped_registry( &provider.ranges, &mapping, &replacement );
+        if (!status)
+            status = build_resync_mapping_changes( &provider.ranges, &replacement,
+                                                   &removals, &additions );
         if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
         if (!status)
         {
             struct range_array old = provider.ranges;
 
             set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
-            provider.ranges = replacement;
-            memset( &replacement, 0, sizeof(replacement) );
-            range_array_free( &old );
+            status = publish_identity_page_flag_changes_locked( &removals,
+                                                                 &additions );
+            if (!status)
+            {
+                provider.ranges = replacement;
+                memset( &replacement, 0, sizeof(replacement) );
+                range_array_free( &old );
+            }
         }
     }
     __EXCEPT
@@ -3205,6 +5974,8 @@ static NTSTATUS memory_map_internal( void *args )
             WARN( "cannot map guest %p size %#llx: status %#x\n",
                   (void *)(uintptr_t)start, (unsigned long long)(end - start),
                   (unsigned int)status );
+        range_array_free( &removals );
+        range_array_free( &additions );
         range_array_free( &replacement );
     }
     return status;
@@ -3245,7 +6016,7 @@ static BOOL legacy_mutation_selects_low_locked( uint64_t address, uint64_t size 
 static NTSTATUS memory_unmap( void *args )
 {
     const struct xtajit64_memory_params *params = args;
-    struct range_array replacement = {0};
+    struct range_array replacement = {0}, removals = {0}, additions = {0};
     uint64_t guest = 0, size = 0;
     volatile NTSTATUS status = STATUS_SUCCESS;
     volatile BOOL faulted = FALSE;
@@ -3294,16 +6065,24 @@ static NTSTATUS memory_unmap( void *args )
         test_mutation_fault_checkpoint( TEST_MUTATION_FAULT_AFTER_BEGIN );
         if (!status)
             status = build_unmapped_registry( &provider.ranges, guest, size, guest, &replacement );
+        if (!status)
+            status = build_resync_mapping_changes( &provider.ranges, &replacement,
+                                                   &removals, &additions );
         if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
         if (!status)
         {
             struct range_array old = provider.ranges;
 
             set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
-            mark_engine_mappings_stale_locked( guest, size, guest );
-            provider.ranges = replacement;
-            memset( &replacement, 0, sizeof(replacement) );
-            range_array_free( &old );
+            status = publish_identity_page_flag_changes_locked( &removals,
+                                                                 &additions );
+            if (!status)
+            {
+                mark_engine_mappings_stale_locked( guest, size, guest );
+                provider.ranges = replacement;
+                memset( &replacement, 0, sizeof(replacement) );
+                range_array_free( &old );
+            }
         }
     }
     __EXCEPT
@@ -3333,6 +6112,8 @@ static NTSTATUS memory_unmap( void *args )
             WARN( "cannot unmap guest %p size %#llx: status %#x\n",
                   (void *)(uintptr_t)guest, (unsigned long long)size,
                   (unsigned int)status );
+        range_array_free( &removals );
+        range_array_free( &additions );
         range_array_free( &replacement );
     }
     return status;
@@ -3341,7 +6122,7 @@ static NTSTATUS memory_unmap( void *args )
 static NTSTATUS memory_protect( void *args )
 {
     const struct xtajit64_memory_params *params = args;
-    struct range_array replacement = {0};
+    struct range_array replacement = {0}, removals = {0}, additions = {0};
     uint64_t start = 0, end = 0;
     unsigned int perms;
     volatile NTSTATUS status = STATUS_SUCCESS;
@@ -3384,15 +6165,23 @@ static NTSTATUS memory_protect( void *args )
         if (!status)
             status = build_protected_registry( &provider.ranges, start, end, perms,
                                                &replacement );
+        if (!status)
+            status = build_resync_mapping_changes( &provider.ranges, &replacement,
+                                                   &removals, &additions );
         if (!status) set_mutation_stage_locked( MUTATION_STAGE_APPLY );
         if (!status)
         {
             struct range_array old = provider.ranges;
 
             set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
-            provider.ranges = replacement;
-            memset( &replacement, 0, sizeof(replacement) );
-            range_array_free( &old );
+            status = publish_identity_page_flag_changes_locked( &removals,
+                                                                 &additions );
+            if (!status)
+            {
+                provider.ranges = replacement;
+                memset( &replacement, 0, sizeof(replacement) );
+                range_array_free( &old );
+            }
         }
     }
     __EXCEPT
@@ -3422,6 +6211,8 @@ static NTSTATUS memory_protect( void *args )
             WARN( "cannot protect guest %p-%p: status %#x\n",
                   (void *)(uintptr_t)start, (void *)(uintptr_t)end,
                   (unsigned int)status );
+        range_array_free( &removals );
+        range_array_free( &additions );
         range_array_free( &replacement );
     }
     return status;
@@ -3779,12 +6570,17 @@ static NTSTATUS memory_resync( void *args )
             size_t i;
 
             set_mutation_stage_locked( MUTATION_STAGE_PUBLISH );
-            for (i = 0; i < removals.count; ++i)
-                mark_engine_mappings_stale_locked( removals.data[i].guest,
-                                                   removals.data[i].size, 0 );
-            provider.ranges = replacement;
-            memset( &replacement, 0, sizeof(replacement) );
-            range_array_free( &old );
+            status = publish_identity_page_flag_changes_locked( &removals,
+                                                                 &additions );
+            if (!status)
+            {
+                for (i = 0; i < removals.count; ++i)
+                    mark_engine_mappings_stale_locked( removals.data[i].guest,
+                                                       removals.data[i].size, 0 );
+                provider.ranges = replacement;
+                memset( &replacement, 0, sizeof(replacement) );
+                range_array_free( &old );
+            }
         }
     }
     __EXCEPT
@@ -4045,6 +6841,7 @@ static NTSTATUS flush_instruction_cache( void *args )
     __ENDTRY
     if (!faulted)
     {
+        if (!status) advance_ec_leaf_fastpath_code_generation_locked();
         /* Once engine quiescence has begun, a failed invalidation cannot prove
          * that every engine discarded the requested code.  Preflight failures
          * happen before any pause request or cache operation and are safe for
@@ -4118,12 +6915,18 @@ static NTSTATUS begin_simulation( void *args )
     struct thread_engine *engine = NULL;
     volatile uint32_t *suspend_doorbell = NULL;
     uint64_t doorbell_host, doorbell_allocation;
+    uint64_t boundary_address = 0;
     unsigned int doorbell_domain;
     uc_err err = UC_ERR_OK, read_err = UC_ERR_OK, context_err = UC_ERR_OK;
+    uc_err boundary_err = UC_ERR_OK;
+    uc_x64_boundary_stop_reason boundary_reason = UC_X64_BOUNDARY_STOP_NONE;
     NTSTATUS status = STATUS_SUCCESS;
     uint64_t next_rip;
     uint32_t flight_reason;
     BOOL resume, reentering = FALSE;
+#ifndef XTAJIT64_UNIXLIB_TEST
+    BOOL ec_target_stats_report = FALSE;
+#endif
 
     if (!params || params->reserved || !params->context.rip ||
         params->context.rip > XTAJIT64_X64_USER_ADDRESS_MAX ||
@@ -4236,6 +7039,17 @@ static NTSTATUS begin_simulation( void *args )
         }
 
         suspend_doorbell = (volatile uint32_t *)(uintptr_t)doorbell_host;
+        if ((err = uc_update_x64_boundary_suspend_doorbell(
+                 engine->uc, suspend_doorbell )) != UC_ERR_OK)
+        {
+            status = STATUS_UNSUCCESSFUL;
+            poison_provider_locked( status );
+            params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+            params->unicorn_error = err;
+            release_pool_engine_locked( binding, engine, FALSE );
+            pthread_mutex_unlock( &provider.mutex );
+            return status;
+        }
         engine->suspend_doorbell = suspend_doorbell;
         if (*suspend_doorbell)
         {
@@ -4284,12 +7098,25 @@ static NTSTATUS begin_simulation( void *args )
         engine->running = TRUE;
         pthread_mutex_unlock( &provider.mutex );
 
+#ifdef XTAJIT64_UNIXLIB_TEST
+        if (atomic_load_explicit( &test_hold_engine_start, memory_order_acquire ))
+        {
+            atomic_store_explicit( &test_engine_start_entered, 1, memory_order_release );
+            while (!atomic_load_explicit( &test_release_engine_start,
+                                          memory_order_acquire ))
+                sched_yield();
+        }
+#endif
+
         next_rip = params->context.rip;
         for (;;)
         {
 #ifdef XTAJIT64_UNIXLIB_TEST
             atomic_fetch_add_explicit( &test_emu_start_count, 1, memory_order_relaxed );
 #endif
+            if (engine->tb_history &&
+                xtajit64_tb_history_should_sample( &engine->tb_history_sample_counter ))
+                tb_history_record_execution_entry( engine, next_rip );
             if (engine->flight_recorder)
                 flight_record_engine_event( engine,
                                             reentering ? XTAJIT64_FLIGHT_EVENT_PROVIDER_RESUME :
@@ -4299,7 +7126,60 @@ static NTSTATUS begin_simulation( void *args )
                                             params->context.rsp );
             engine->flight_stop_detail0 = XTAJIT64_FLIGHT_UNKNOWN_U64;
             err = uc_emu_start( engine->uc, next_rip, UINT64_MAX, 0, 0 );
+            maybe_report_unicorn_perf_diagnostics( engine );
+#ifdef XTAJIT64_UNIXLIB_TEST
+            if (atomic_load_explicit( &test_hold_engine_result, memory_order_acquire ))
+            {
+                atomic_store_explicit( &test_engine_result_entered, 1,
+                                       memory_order_release );
+                while (!atomic_load_explicit( &test_release_engine_result,
+                                              memory_order_acquire ))
+                    sched_yield();
+            }
+#endif
+            boundary_reason = UC_X64_BOUNDARY_STOP_NONE;
+            boundary_address = 0;
+            boundary_err = uc_query_x64_boundary_stop(
+                engine->uc, &boundary_reason, &boundary_address );
             pthread_mutex_lock( &provider.mutex );
+            if (boundary_err != UC_ERR_OK)
+            {
+                engine->mapping_error = boundary_err;
+                engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+                poison_provider_locked( STATUS_UNSUCCESSFUL );
+            }
+            else if (boundary_reason == UC_X64_BOUNDARY_STOP_EC_CODE)
+            {
+                engine->transition_target = boundary_address;
+                engine->stop_reason = XTAJIT64_STOP_EC_TRANSITION;
+#ifndef XTAJIT64_UNIXLIB_TEST
+                record_ec_transition_target( engine, boundary_address );
+#endif
+            }
+            else if (boundary_reason == UC_X64_BOUNDARY_STOP_SUSPEND)
+            {
+                engine->stop_reason = XTAJIT64_STOP_SUSPEND;
+                if (engine->flight_recorder)
+                    flight_record_engine_event(
+                        engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
+                        XTAJIT64_FLIGHT_REASON_NONE, XTAJIT64_STOP_SUSPEND,
+                        boundary_address, XTAJIT64_FLIGHT_UNKNOWN_U64 );
+            }
+            else if (boundary_reason == UC_X64_BOUNDARY_STOP_PAUSE &&
+                     !atomic_load_explicit( &engine->pause_requested,
+                                            memory_order_acquire ))
+            {
+                engine->mapping_error = UC_ERR_EXCEPTION;
+                engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+                poison_provider_locked( STATUS_UNSUCCESSFUL );
+            }
+            else if (boundary_reason != UC_X64_BOUNDARY_STOP_NONE &&
+                     boundary_reason != UC_X64_BOUNDARY_STOP_PAUSE)
+            {
+                engine->mapping_error = UC_ERR_EXCEPTION;
+                engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+                poison_provider_locked( STATUS_UNSUCCESSFUL );
+            }
             if (engine->stop_reason == XTAJIT64_STOP_INTERNAL_ERROR &&
                 engine->mapping_error != UC_ERR_OK)
                 err = engine->mapping_error;
@@ -4340,6 +7220,35 @@ static NTSTATUS begin_simulation( void *args )
                     }
                 }
             }
+#if defined(__APPLE__) && \
+    (!defined(XTAJIT64_UNIXLIB_TEST) || defined(XTAJIT64_TEST_EC_LEAF_FASTPATH))
+            if (!provider.poison_status && provider.initialized && engine->uc &&
+                engine->linked && engine->stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+                err == UC_ERR_OK &&
+                try_ec_leaf_fastpath( engine, engine->uc,
+                                      engine->transition_target, FALSE,
+                                      &next_rip ))
+            {
+                engine->stop_reason = XTAJIT64_STOP_NONE;
+                if (engine->suspend_doorbell && *engine->suspend_doorbell)
+                    engine->stop_reason = XTAJIT64_STOP_SUSPEND;
+                if (engine->stop_reason == XTAJIT64_STOP_NONE &&
+                    !atomic_load_explicit( &engine->pause_requested,
+                                           memory_order_acquire ))
+                {
+                    if (engine->flight_recorder)
+                        flight_record_engine_event( engine,
+                                                    XTAJIT64_FLIGHT_EVENT_PROVIDER_RESUME,
+                                                    XTAJIT64_FLIGHT_REASON_NONE,
+                                                    XTAJIT64_STOP_EC_TRANSITION,
+                                                    next_rip,
+                                                    XTAJIT64_FLIGHT_UNKNOWN_U64 );
+                    reentering = TRUE;
+                    pthread_mutex_unlock( &provider.mutex );
+                    continue;
+                }
+            }
+#endif
 
             /* Keep the engine logically running until its registers are captured.
              * Mutators only publish a pause request, so the owner callback has
@@ -4357,12 +7266,27 @@ static NTSTATUS begin_simulation( void *args )
 
             if (resume)
             {
-                reentering = TRUE;
+                uc_err stop_err = uc_clear_instruction_boundary_stop( engine->uc );
+
                 engine->running = FALSE;
                 pthread_cond_broadcast( &provider.cond );
+                if (stop_err != UC_ERR_OK)
+                {
+                    err = stop_err;
+                    engine->mapping_error = stop_err;
+                    engine->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
+                    poison_provider_locked( STATUS_UNSUCCESSFUL );
+                    status = provider.poison_status;
+                    resume = FALSE;
+                }
+                else reentering = TRUE;
             }
-            else
+            if (!resume)
             {
+#ifndef XTAJIT64_UNIXLIB_TEST
+                ec_target_stats_report = engine->ec_target_stats_report_pending;
+                engine->ec_target_stats_report_pending = FALSE;
+#endif
                 params->transition_target = engine->transition_target;
                 params->fault_address = engine->fault_address;
                 params->fault_access = engine->fault_access;
@@ -4420,6 +7344,9 @@ static NTSTATUS begin_simulation( void *args )
                 }
             }
             pthread_mutex_unlock( &provider.mutex );
+#ifndef XTAJIT64_UNIXLIB_TEST
+            if (!resume && ec_target_stats_report) render_ec_transition_target_stats();
+#endif
             break;
         }
     } while (resume);

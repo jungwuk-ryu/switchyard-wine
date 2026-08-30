@@ -3045,6 +3045,27 @@ PY
   actual="$(/usr/bin/plutil -extract librarySha256 raw -o - "$metadata" 2>/dev/null || true)"
   [ "$actual" = "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ] || return 1
   [ "$(sha256_file "$dylib")" = "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ] || return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_configure_identity_memory_fastpath" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_configure_x64_boundary_guard" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_update_x64_boundary_suspend_doorbell" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_query_x64_boundary_stop" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_clear_instruction_boundary_stop" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_switchyard_x86_64_import_transition_context" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
+  [ "$(nm -gU "$dylib" | /usr/bin/awk \
+      '$NF == "_uc_switchyard_x86_64_export_transition_context" { count++ } END { print count + 0 }')" -eq 1 ] ||
+    return 1
   [ "$(sha256_file "$source_archive")" = "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" ] || return 1
   [ "$(sha256_file "$source_patch")" = "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" ] || return 1
   /usr/bin/cmp -s "$source_patch" \
@@ -3076,7 +3097,7 @@ validate_staged_unicorn_providers() {
   local runtime_root="$1"
   local index relative unix_library pe_library pe_description dependency rpath
   local unicorn_dependency_count ntdll_dependency_count
-  local loader_rpath_count runtime_rpath_count
+  local loader_rpath_count runtime_rpath_count symbol imports
 
   [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
   [ "${#UNICORN_PROVIDER_UNIXLIBS[@]}" -eq "${#UNICORN_PROVIDER_PE_LIBS[@]}" ] &&
@@ -3116,6 +3137,23 @@ validate_staged_unicorn_providers() {
     done < <(otool -L "$unix_library" | /usr/bin/awk 'NR > 1 { print $1 }')
     [ "$unicorn_dependency_count" -eq 1 ] || return 1
     [ "$ntdll_dependency_count" -eq 1 ] || return 1
+    imports="$(nm -u "$unix_library")" || return 1
+    for symbol in uc_emu_stop_at_instruction_boundary \
+        uc_enable_shared_memory_atomics; do
+      /usr/bin/grep -Eq "(^|[[:space:]])_?${symbol}$" <<<"$imports" || return 1
+    done
+    if [ "${UNICORN_PROVIDER_GUEST_ARCHS[$index]}" = x86_64 ]; then
+      for symbol in uc_set_shared_memory_atomic_callback \
+          uc_clear_instruction_boundary_stop \
+          uc_configure_identity_memory_fastpath \
+          uc_configure_x64_boundary_guard \
+          uc_update_x64_boundary_suspend_doorbell \
+          uc_query_x64_boundary_stop \
+          uc_switchyard_x86_64_import_transition_context \
+          uc_switchyard_x86_64_export_transition_context; do
+        /usr/bin/grep -Eq "(^|[[:space:]])_?${symbol}$" <<<"$imports" || return 1
+      done
+    fi
     loader_rpath_count=0
     runtime_rpath_count=0
     while IFS= read -r rpath; do
@@ -4060,6 +4098,21 @@ if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
 fi
 WINE_INSTALL_PREFIX="$staged_wine_install_prefix"
 
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  arm64x_ucrtbase="$WINE_INSTALL_PREFIX/lib/wine/aarch64-windows/ucrtbase.dll"
+  if [ ! -f "$arm64x_ucrtbase" ] || [ -L "$arm64x_ucrtbase" ]; then
+    echo "Native runtime is missing the ARM64X ucrtbase.dll required for audited leaf-thunk patching: $arm64x_ucrtbase" >&2
+    exit 1
+  fi
+  echo "patching audited ARM64X ucrtbase x64 leaf thunks"
+  PYTHONDONTWRITEBYTECODE=1 python3 -I \
+    "$ROOT_DIR/switchyard/patch_arm64x_leaf_thunks.py" patch \
+    "$arm64x_ucrtbase"
+  PYTHONDONTWRITEBYTECODE=1 python3 -I \
+    "$ROOT_DIR/switchyard/patch_arm64x_leaf_thunks.py" verify \
+    "$arm64x_ucrtbase"
+fi
+
 if ! grep -F "#define HAVE_WINE_PRELOADER 1" "$WINE_BUILD_DIR/include/config.h" >/dev/null 2>&1; then
   echo "removing stale Wine preloader files from no-preloader runtime"
   find "$WINE_INSTALL_PREFIX" \( -type f -o -type l \) \( -name wine-preloader -o -name wine64-preloader \) -exec rm -f {} +
@@ -4326,6 +4379,11 @@ if [ ! -x "$WINE_INSTALL_PREFIX/bin/wine.switchyard-real" ] &&
   exit 1
 fi
 
+SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH=0
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH=1
+fi
+
 cat >"$WINE_INSTALL_PREFIX/bin/wine" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -4360,6 +4418,12 @@ prepend_path() {
 
 export DYLD_LIBRARY_PATH="$(prepend_path "$vulkan_lib" "${DYLD_LIBRARY_PATH:-}")"
 export DYLD_FALLBACK_LIBRARY_PATH="$(prepend_path "$vulkan_lib" "${DYLD_FALLBACK_LIBRARY_PATH:-}")"
+if [ "__SWITCHYARD_JIT_DIRECT_HIT_BATCH__" = "1" ] &&
+   [ -z "${UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH+x}" ]; then
+  # Native Unicorn: keep MAP_JIT executable over ordinary direct TB-cache hits.
+  # An explicitly supplied value, including 0, remains an immediate kill switch.
+  export UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH=1
+fi
 if [ -d "$font_lib" ]; then
   export DYLD_LIBRARY_PATH="$(prepend_path "$font_lib" "${DYLD_LIBRARY_PATH:-}")"
   export DYLD_FALLBACK_LIBRARY_PATH="$(prepend_path "$font_lib" "${DYLD_FALLBACK_LIBRARY_PATH:-}")"
@@ -4469,9 +4533,11 @@ exec -a "$invoked_path" "$real_executable" "$@"
 EOF
 SWITCHYARD_WRAPPER_GSTREAMER_REGISTRY_ARCH="$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH" \
 SWITCHYARD_WRAPPER_WINE_UNIX_ARCH="$WINE_UNIX_ARCH" \
+SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH="$SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH" \
   perl -0pi -e '
     s/__SWITCHYARD_GSTREAMER_REGISTRY_ARCH__/$ENV{SWITCHYARD_WRAPPER_GSTREAMER_REGISTRY_ARCH}/g;
     s/__SWITCHYARD_WINE_UNIX_ARCH__/$ENV{SWITCHYARD_WRAPPER_WINE_UNIX_ARCH}/g;
+    s/__SWITCHYARD_JIT_DIRECT_HIT_BATCH__/$ENV{SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH}/g;
   ' "$WINE_INSTALL_PREFIX/bin/wine"
 chmod 0755 "$WINE_INSTALL_PREFIX/bin/wine"
 if [ -x "$WINE_INSTALL_PREFIX/bin/wine64.switchyard-real" ]; then

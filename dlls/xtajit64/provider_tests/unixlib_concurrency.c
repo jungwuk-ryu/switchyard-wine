@@ -40,15 +40,20 @@ struct cache_remove_record
 
 static struct cache_remove_record cache_remove_records[CACHE_RECORD_LIMIT];
 static uc_engine *cache_flush_engines[CACHE_RECORD_LIMIT];
+static uc_engine *tlb_flush_engines[CACHE_RECORD_LIMIT];
 static uint64_t cache_remove_start;
 static uint64_t cache_remove_end;
 static unsigned int cache_remove_calls;
 static unsigned int cache_flush_calls;
+static unsigned int tlb_flush_calls;
 static int cache_remove_fail_call = -1;
+static int tlb_flush_fail_call = -1;
 static unsigned int memory_map_calls;
 static unsigned int memory_unmap_calls;
 static int memory_map_fail_call = -1;
 static int memory_unmap_fail_call = -1;
+static unsigned int reg_write_batch_calls;
+static int reg_write_batch_fail_call = -1;
 
 static uc_err record_memory_map( uc_engine *uc, uint64_t address, size_t size,
                                  uint32_t perms, void *pointer )
@@ -65,6 +70,15 @@ static uc_err record_memory_unmap( uc_engine *uc, uint64_t address, size_t size 
 
     if ((int)call == memory_unmap_fail_call) return UC_ERR_RESOURCE;
     return uc_mem_unmap( uc, address, size );
+}
+
+static uc_err record_reg_write_batch( uc_engine *uc, int const *regs,
+                                      void *const *values, int count )
+{
+    unsigned int call = reg_write_batch_calls++;
+
+    if ((int)call == reg_write_batch_fail_call) return UC_ERR_RESOURCE;
+    return uc_reg_write_batch( uc, regs, values, count );
 }
 
 static uc_err record_cache_remove( uc_engine *uc, uint64_t start, uint64_t end )
@@ -91,23 +105,38 @@ static uc_err record_cache_flush( uc_engine *uc )
     return uc_ctl_flush_tb( uc );
 }
 
+static uc_err record_tlb_flush( uc_engine *uc )
+{
+    unsigned int call = tlb_flush_calls++;
+
+    if (call < CACHE_RECORD_LIMIT) tlb_flush_engines[call] = uc;
+    if ((int)call == tlb_flush_fail_call) return UC_ERR_RESOURCE;
+    return uc_ctl_flush_tlb( uc );
+}
+
 static void reset_cache_recorders(void)
 {
     memset( cache_remove_records, 0, sizeof(cache_remove_records) );
     memset( cache_flush_engines, 0, sizeof(cache_flush_engines) );
+    memset( tlb_flush_engines, 0, sizeof(tlb_flush_engines) );
     cache_remove_start = cache_remove_end = 0;
-    cache_remove_calls = cache_flush_calls = 0;
+    cache_remove_calls = cache_flush_calls = tlb_flush_calls = 0;
     cache_remove_fail_call = -1;
+    tlb_flush_fail_call = -1;
 }
 
 #undef uc_ctl_remove_cache
 #define uc_ctl_remove_cache record_cache_remove
 #undef uc_ctl_flush_tb
 #define uc_ctl_flush_tb record_cache_flush
+#undef uc_ctl_flush_tlb
+#define uc_ctl_flush_tlb record_tlb_flush
 #undef uc_mem_map_ptr
 #define uc_mem_map_ptr record_memory_map
 #undef uc_mem_unmap
 #define uc_mem_unmap record_memory_unmap
+#undef uc_reg_write_batch
+#define uc_reg_write_batch record_reg_write_batch
 
 static _Thread_local void *test_exception_jmp_buf;
 void test_ntdll_set_exception_jmp_buf( jmp_buf jmp );
@@ -120,14 +149,16 @@ static void test_raise_mutation_exception(void);
  * test hooks without adding a production control opcode to the provider ABI. */
 #include "../unixlib.c"
 
-C_ASSERT( XTAJIT64_PROCESS_ABI_VERSION == 8 );
+C_ASSERT( XTAJIT64_PROCESS_ABI_VERSION == 10 );
 
 #undef XTAJIT64_TEST_RAISE_EXCEPTION
 #undef ntdll_set_exception_jmp_buf
 #undef uc_ctl_remove_cache
 #undef uc_ctl_flush_tb
+#undef uc_ctl_flush_tlb
 #undef uc_mem_map_ptr
 #undef uc_mem_unmap
+#undef uc_reg_write_batch
 
 void test_ntdll_set_exception_jmp_buf( jmp_buf jmp )
 {
@@ -153,7 +184,7 @@ static void test_raise_mutation_exception(void)
 #define TEST_FALLBACK_BASE    0x0000001006000000ull
 #define TEST_ASAN_KUSER       0x0000000404000000ull
 #define TEST_ASAN_BASE        0x0000000406000000ull
-#define TEST_SYSCALL_COUNT    2u
+#define TEST_SYSCALL_COUNT    (XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY + 1u)
 #define TEST_LOW_PAGE_COUNT   8u
 
 static unsigned int failures;
@@ -175,6 +206,87 @@ static volatile uint32_t *test_suspend_doorbell(void)
 
 #define check(condition, ...) \
     do { if (!(condition)) { fprintf( stderr, "not ok: " __VA_ARGS__ ); ++failures; } } while (0)
+
+static void test_unicorn_perf_counter_api(void)
+{
+#if defined(__APPLE__) && defined(RTLD_NOLOAD)
+    Dl_info unicorn_info, enable_info, get_info;
+    unicorn_enable_perf_counters_fn enable = NULL, expected_enable = NULL;
+    unicorn_get_perf_counters_fn get = NULL, expected_get = NULL;
+    enum unicorn_perf_counter_api_resolution resolution;
+    void *handle, *enable_address, *get_address;
+    BOOL expected = FALSE;
+
+    if (!dladdr( (const void *)uc_version, &unicorn_info ) || !unicorn_info.dli_fbase ||
+        !unicorn_info.dli_fname)
+    {
+        check( FALSE, "cannot identify linked Unicorn image\n" );
+        return;
+    }
+    handle = dlopen( unicorn_info.dli_fname, RTLD_NOW | RTLD_NOLOAD );
+    check( handle != NULL, "cannot retain linked Unicorn image\n" );
+    if (!handle) return;
+
+    enable_address = dlsym( handle, "uc_switchyard_enable_perf_counters" );
+    get_address = dlsym( handle, "uc_switchyard_get_perf_counters" );
+    if (enable_address && get_address &&
+        dladdr( enable_address, &enable_info ) && dladdr( get_address, &get_info ) &&
+        enable_info.dli_fbase == unicorn_info.dli_fbase &&
+        get_info.dli_fbase == unicorn_info.dli_fbase)
+    {
+        memcpy( &expected_enable, &enable_address, sizeof(expected_enable) );
+        memcpy( &expected_get, &get_address, sizeof(expected_get) );
+        expected = TRUE;
+    }
+    resolution = resolve_unicorn_perf_counter_api( &enable, &get );
+    check( (resolution == UNICORN_PERF_COUNTER_API_RESOLVED) == expected,
+           "Unicorn performance-counter resolver did not match the linked image\n" );
+    if (expected)
+        check( enable == expected_enable && get == expected_get,
+               "Unicorn performance-counter resolver returned foreign symbols\n" );
+    else
+        check( !enable && !get,
+               "failed Unicorn performance-counter resolution altered outputs\n" );
+    dlclose( handle );
+#endif
+}
+
+static void test_ec_target_stats_initial_report_parser(void)
+{
+    uint64_t initial_report = 0;
+
+    check( parse_ec_target_stats_initial_report( "4096", &initial_report ) &&
+           initial_report == XTAJIT64_EC_TARGET_STATS_MIN_INITIAL_REPORT,
+           "EC target stats minimum initial report was rejected\n" );
+    check( parse_ec_target_stats_initial_report( "1048576", &initial_report ) &&
+           initial_report == XTAJIT64_EC_TARGET_STATS_DEFAULT_INITIAL_REPORT,
+           "EC target stats maximum initial report was rejected\n" );
+    initial_report = 0xfeedface;
+    check( !parse_ec_target_stats_initial_report( "4095", &initial_report ) &&
+           initial_report == 0xfeedface,
+           "EC target stats lower-bound rejection changed output\n" );
+    check( !parse_ec_target_stats_initial_report( "1048577", &initial_report ) &&
+           initial_report == 0xfeedface,
+           "EC target stats upper-bound rejection changed output\n" );
+    check( !parse_ec_target_stats_initial_report( "4096x", &initial_report ) &&
+           !parse_ec_target_stats_initial_report( "-4096", &initial_report ) &&
+           !parse_ec_target_stats_initial_report( "+4096", &initial_report ) &&
+           !parse_ec_target_stats_initial_report( " 4096", &initial_report ) &&
+           !parse_ec_target_stats_initial_report( "4096 ", &initial_report ) &&
+           !parse_ec_target_stats_initial_report( "", &initial_report ) &&
+           !parse_ec_target_stats_initial_report( NULL, &initial_report ) &&
+           !parse_ec_target_stats_initial_report( "4096", NULL ),
+           "EC target stats malformed initial report was accepted\n" );
+    check( ec_target_stats_initial_sample_count(
+               XTAJIT64_EC_TARGET_STATS_MIN_INITIAL_REPORT ) == 1 &&
+           ec_target_stats_initial_sample_count(
+               XTAJIT64_EC_TARGET_STATS_SAMPLE_STRIDE ) == 1 &&
+           ec_target_stats_initial_sample_count(
+               XTAJIT64_EC_TARGET_STATS_SAMPLE_STRIDE + 1 ) == 2 &&
+           ec_target_stats_initial_sample_count(
+               XTAJIT64_EC_TARGET_STATS_DEFAULT_INITIAL_REPORT ) == 65,
+           "EC target stats sample threshold conversion is incorrect\n" );
+}
 
 struct code_buffer
 {
@@ -215,6 +327,18 @@ struct low_observer_worker
 {
     struct wine_arm64ec_low_memory_range_v1 range;
     struct wine_arm64ec_low_memory_event_v1 event;
+    atomic_int begun;
+    atomic_int done;
+    NTSTATUS status;
+};
+
+struct code_observer_worker
+{
+    struct wine_arm64ec_code_range_v1 range;
+    struct wine_arm64ec_code_event_v1 event;
+    uint64_t *bitmap_word;
+    uint64_t bitmap_mask;
+    BOOL set_ec;
     atomic_int begun;
     atomic_int done;
     NTSTATUS status;
@@ -286,14 +410,34 @@ static void emit_movabs_rax( struct code_buffer *code, uint64_t value )
     emit_u8( code, 0x48 ); emit_u8( code, 0xb8 ); emit_u64( code, value );
 }
 
+static void emit_movabs_rbx( struct code_buffer *code, uint64_t value )
+{
+    emit_u8( code, 0x48 ); emit_u8( code, 0xbb ); emit_u64( code, value );
+}
+
 static void emit_movabs_rcx( struct code_buffer *code, uint64_t value )
 {
     emit_u8( code, 0x48 ); emit_u8( code, 0xb9 ); emit_u64( code, value );
 }
 
+static void emit_movabs_rdx( struct code_buffer *code, uint64_t value )
+{
+    emit_u8( code, 0x48 ); emit_u8( code, 0xba ); emit_u64( code, value );
+}
+
+static void emit_call_rax( struct code_buffer *code )
+{
+    emit_u8( code, 0xff ); emit_u8( code, 0xd0 );
+}
+
 static void emit_jump_rax( struct code_buffer *code )
 {
     emit_u8( code, 0xff ); emit_u8( code, 0xe0 );
+}
+
+static void emit_jump_rdx( struct code_buffer *code )
+{
+    emit_u8( code, 0xff ); emit_u8( code, 0xe2 );
 }
 
 static void patch_rel8( struct code_buffer *code, size_t displacement, size_t target )
@@ -392,6 +536,44 @@ static size_t provider_engine_count(void)
 
     pthread_mutex_lock( &provider.mutex );
     for (engine = provider.engines; engine; engine = engine->next) ++count;
+    pthread_mutex_unlock( &provider.mutex );
+    return count;
+}
+
+static uint64_t provider_direct_self_read_completions(void)
+{
+    struct thread_engine *engine;
+    uint64_t count = 0;
+
+    pthread_mutex_lock( &provider.mutex );
+    for (engine = provider.engines; engine; engine = engine->next)
+        count += engine->direct_self_read_completions;
+    pthread_mutex_unlock( &provider.mutex );
+    return count;
+}
+
+static uint64_t provider_direct_self_read_rejections(
+    enum direct_self_read_rejection reason )
+{
+    struct thread_engine *engine;
+    uint64_t count = 0;
+
+    pthread_mutex_lock( &provider.mutex );
+    for (engine = provider.engines; engine; engine = engine->next)
+        count += engine->direct_self_read_diagnostics.rejections[reason];
+    pthread_mutex_unlock( &provider.mutex );
+    return count;
+}
+
+static uint64_t provider_direct_self_read_size_bucket(
+    enum direct_self_read_size_bucket bucket )
+{
+    struct thread_engine *engine;
+    uint64_t count = 0;
+
+    pthread_mutex_lock( &provider.mutex );
+    for (engine = provider.engines; engine; engine = engine->next)
+        count += engine->direct_self_read_diagnostics.size_buckets[bucket];
     pthread_mutex_unlock( &provider.mutex );
     return count;
 }
@@ -504,6 +686,41 @@ static NTSTATUS publish_low_event(
     if (!status)
         arm64ec_low_memory_observer.complete( arm64ec_low_memory_observer.context,
                                               transaction, &event );
+    if (!status) status = observer_provider_status();
+    return status;
+}
+
+static void initialize_code_event(
+    struct wine_arm64ec_code_event_v1 *event, uint32_t operation,
+    uint32_t flags, const struct wine_arm64ec_code_range_v1 *ranges,
+    size_t range_count, NTSTATUS mutation_status )
+{
+    memset( event, 0, sizeof(*event) );
+    event->version = WINE_ARM64EC_CODE_OBSERVER_VERSION;
+    event->size = sizeof(*event);
+    event->operation = operation;
+    event->flags = flags;
+    event->status = mutation_status;
+    event->ranges = ranges;
+    event->range_count = range_count;
+}
+
+static NTSTATUS publish_code_event(
+    uint32_t operation, uint32_t flags,
+    const struct wine_arm64ec_code_range_v1 *ranges, size_t range_count,
+    NTSTATUS mutation_status )
+{
+    struct wine_arm64ec_code_event_v1 event;
+    void *transaction = NULL;
+    NTSTATUS status;
+
+    initialize_code_event( &event, operation, flags, ranges, range_count,
+                           mutation_status );
+    status = arm64ec_code_observer.begin( arm64ec_code_observer.context,
+                                          operation, &transaction );
+    if (!status)
+        arm64ec_code_observer.complete( arm64ec_code_observer.context,
+                                        transaction, &event );
     if (!status) status = observer_provider_status();
     return status;
 }
@@ -734,14 +951,15 @@ static void test_coalesced_demand_mapping(void)
            uc_strerror( err ), memory_map_calls, memory_unmap_calls,
            cache_flush_calls, engine->mapped_ranges.count );
     found = mapped = FALSE;
-    err = demand_map_canonical_range( engine, second.guest, 1,
+    err = demand_map_canonical_range(
+        engine, second.guest - sizeof(uint32_t), 2 * sizeof(uint32_t),
                                       UC_PROT_WRITE, &found, &mapped );
     check( err == UC_ERR_OK && found && mapped && memory_map_calls == 1 &&
            !memory_unmap_calls && !cache_flush_calls &&
            engine->mapped_ranges.count == 1 &&
            engine->mapped_ranges.data[0].guest == first.guest &&
            engine->mapped_ranges.data[0].size == 2 * XTAJIT64_GUEST_PAGE_SIZE,
-           "coalesced writable second touch returned %s found %u calls %u/%u/%u ranges %zu\n",
+           "coalesced writable cross-page touch returned %s found %u calls %u/%u/%u ranges %zu\n",
            uc_strerror( err ), found, memory_map_calls, memory_unmap_calls,
            cache_flush_calls, engine->mapped_ranges.count );
 
@@ -1066,6 +1284,8 @@ static void test_flight_recorder_core(void)
 
     xtajit64_flight_event_init( &event, XTAJIT64_FLIGHT_EVENT_TRANSITION_BEGIN,
                                  XTAJIT64_FLIGHT_SOURCE_ARM64EC_PE );
+    check( event.ownership_flags == XTAJIT64_FLIGHT_UNKNOWN_U32,
+           "flight event initialized ownership as known\n" );
     event.causal_boundary_id = 0x41;
     before = __atomic_load_n( &flight_test_recorder.next_sequence, __ATOMIC_RELAXED );
     check( !xtajit64_flight_record( NULL, &event ) &&
@@ -1608,6 +1828,9 @@ static void test_flight_recorder_contracts(void)
     event.transition_frame_kind = XTAJIT64_FLIGHT_FRAME_ENTRY;
     event.transition_depth_before = 0;
     event.transition_depth_after = 1;
+    event.ownership_flags = XTAJIT64_FLIGHT_OWNERSHIP_SIMULATION_ACTIVE |
+                            XTAJIT64_FLIGHT_OWNERSHIP_DOORBELL_PRESENT |
+                            XTAJIT64_FLIGHT_OWNERSHIP_DOORBELL_OWNED;
     event.guest_rsp = 0x8000;
     event.detail0 = 0x1800;
     event.detail1 = 0x5000;
@@ -1638,6 +1861,10 @@ static void test_flight_recorder_contracts(void)
            flight_test_snapshot.events[0].transition_frame_kind == XTAJIT64_FLIGHT_FRAME_ENTRY &&
            flight_test_snapshot.events[0].transition_depth_before == 0 &&
            flight_test_snapshot.events[0].transition_depth_after == 1 &&
+           flight_test_snapshot.events[0].ownership_flags ==
+               (XTAJIT64_FLIGHT_OWNERSHIP_SIMULATION_ACTIVE |
+                XTAJIT64_FLIGHT_OWNERSHIP_DOORBELL_PRESENT |
+                XTAJIT64_FLIGHT_OWNERSHIP_DOORBELL_OWNED) &&
            flight_test_snapshot.events[1].transition_frame_kind == XTAJIT64_FLIGHT_FRAME_EXIT &&
            flight_test_snapshot.events[1].transition_depth_before == 1 &&
            flight_test_snapshot.events[1].transition_depth_after == 2 &&
@@ -1983,6 +2210,16 @@ static void test_process_init_abi(void)
     check( status == STATUS_INVALID_PARAMETER,
            "out-of-range exit thunk returned %#x\n", (unsigned int)status );
     invalid = process_params;
+    invalid.rtl_query_performance_counter = invalid.highest_user_address + 1;
+    status = process_init( &invalid );
+    check( status == STATUS_INVALID_PARAMETER,
+           "out-of-range QPC target returned %#x\n", (unsigned int)status );
+    invalid = process_params;
+    invalid.nt_query_performance_counter = invalid.highest_user_address + 1;
+    status = process_init( &invalid );
+    check( status == STATUS_INVALID_PARAMETER,
+           "out-of-range raw x64 QPC target returned %#x\n", (unsigned int)status );
+    invalid = process_params;
     invalid.x64_syscall_dispatcher = invalid.highest_user_address + 1;
     status = process_init( &invalid );
     check( status == STATUS_INVALID_PARAMETER,
@@ -1999,6 +2236,21 @@ static void test_process_init_abi(void)
     status = process_init( &invalid );
     check( status == STATUS_INVALID_PARAMETER,
            "overflowing host KUSER mapping returned %#x\n", (unsigned int)status );
+}
+
+static void test_ec_bitmap_lookup(void)
+{
+    check( provider.ec_page_shift == 14,
+           "EC bitmap page shift is %u instead of 14\n",
+           provider.ec_page_shift );
+    check( is_ec_code( test_ec_target ),
+           "marked EC page start was not recognized\n" );
+    check( is_ec_code( test_ec_target + TEST_PAGE - 1 ),
+           "marked EC page end was not recognized\n" );
+    check( !is_ec_code( test_ec_target + TEST_PAGE ),
+           "adjacent non-EC page was recognized as EC code\n" );
+    check( !is_ec_code( provider.highest_user_address + 1 ),
+           "address above the EC bitmap bound was accepted\n" );
 }
 
 static void *run_low_begin_only( void *arg )
@@ -2865,6 +3117,171 @@ done:
         printf( "XTAJIT64_LOW_FLUSH_MULTI_ENGINE_PASS\n" );
 }
 
+static void test_code_observer_invalidation(void)
+{
+    struct wine_arm64ec_code_range_v1 ranges[2] =
+    {
+        {0, TEST_PAGE},
+        {0, TEST_PAGE},
+    };
+    struct wine_arm64ec_code_event_v1 event;
+    void *transaction = NULL, *stale;
+    uint64_t generation;
+    unsigned int starting_failures = failures;
+    uc_err engine_err = UC_ERR_OK;
+    NTSTATUS status;
+    size_t i;
+
+    ranges[0].address = test_base + 4 * TEST_PAGE;
+    ranges[1].address = test_base + 6 * TEST_PAGE;
+    check( arm64ec_code_observer.version == WINE_ARM64EC_CODE_OBSERVER_VERSION &&
+           arm64ec_code_observer.size == sizeof(arm64ec_code_observer) &&
+           arm64ec_code_observer.capabilities ==
+               WINE_ARM64EC_CODE_OBSERVER_CAP_EXACT_INVALIDATION_RANGES,
+           "code observer descriptor does not advertise the exact v1 ABI\n" );
+    check( provider.code_observer_active,
+           "code observer was not activated by its registration resync\n" );
+
+    transaction = (void *)(uintptr_t)1;
+    status = arm64ec_code_observer.begin( arm64ec_code_observer.context,
+                                          UINT32_MAX, &transaction );
+    check( status == STATUS_INVALID_PARAMETER && !transaction,
+           "unknown code operation returned %#x/%p\n",
+           (unsigned int)status, transaction );
+    status = arm64ec_code_observer.begin( arm64ec_code_observer.context,
+                                          WINE_ARM64EC_CODE_MAP, NULL );
+    check( status == STATUS_INVALID_PARAMETER,
+           "NULL code transaction output returned %#x\n", (unsigned int)status );
+
+    pthread_mutex_lock( &provider.mutex );
+    while (provider.engine_count < 2 && engine_err == UC_ERR_OK)
+        engine_err = create_pool_engine_locked( NULL );
+    pthread_mutex_unlock( &provider.mutex );
+    check( engine_err == UC_ERR_OK && provider_engine_count() == 2,
+           "code observer pool setup returned %s with %zu engines\n",
+           uc_strerror( engine_err ), provider_engine_count() );
+    if (engine_err != UC_ERR_OK || provider_engine_count() != 2) goto done;
+
+    generation = observer_generation();
+    reset_cache_recorders();
+    status = publish_code_event( WINE_ARM64EC_CODE_ALLOCATE, 0, ranges,
+                                 ARRAY_SIZE(ranges), STATUS_UNSUCCESSFUL );
+    check( !status && observer_generation() == generation &&
+           tlb_flush_calls == 2 && cache_remove_calls == 4 &&
+           !cache_flush_calls,
+           "exact code invalidation returned %#x generation %#llx/%#llx "
+           "TLB/remove/full %u/%u/%u\n", (unsigned int)status,
+           (unsigned long long)observer_generation(),
+           (unsigned long long)generation, tlb_flush_calls,
+           cache_remove_calls, cache_flush_calls );
+    for (i = 0; i < cache_remove_calls && i < CACHE_RECORD_LIMIT; ++i)
+    {
+        const struct wine_arm64ec_code_range_v1 *range = &ranges[i & 1];
+
+        check( cache_remove_records[i].start == range->address &&
+               cache_remove_records[i].end == range->address + range->size,
+               "exact code interval %zu was %#llx-%#llx\n", i,
+               (unsigned long long)cache_remove_records[i].start,
+               (unsigned long long)cache_remove_records[i].end );
+    }
+    check( cache_remove_calls < 4 ||
+           cache_remove_records[0].engine != cache_remove_records[2].engine,
+           "exact code invalidation reused one engine\n" );
+    check( tlb_flush_calls < 2 || tlb_flush_engines[0] != tlb_flush_engines[1],
+           "exact code invalidation flushed one engine TLB twice\n" );
+
+    reset_cache_recorders();
+    status = publish_code_event( WINE_ARM64EC_CODE_MAP, 0, NULL, 0,
+                                 STATUS_SUCCESS );
+    check( !status && !tlb_flush_calls && !cache_remove_calls &&
+           !cache_flush_calls,
+           "empty code event returned %#x with TLB/remove/full %u/%u/%u\n",
+           (unsigned int)status, tlb_flush_calls, cache_remove_calls,
+           cache_flush_calls );
+
+    reset_cache_recorders();
+    status = publish_code_event( WINE_ARM64EC_CODE_RESYNC,
+                                 WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION,
+                                 NULL, 0, STATUS_UNSUCCESSFUL );
+    check( !status && !tlb_flush_calls && !cache_remove_calls &&
+           cache_flush_calls == 2 &&
+           cache_flush_engines[0] != cache_flush_engines[1],
+           "full code invalidation returned %#x with TLB/remove/full %u/%u/%u\n",
+           (unsigned int)status, tlb_flush_calls, cache_remove_calls,
+           cache_flush_calls );
+
+    status = publish_code_event( WINE_ARM64EC_CODE_MAP,
+                                 WINE_ARM64EC_CODE_EVENT_FULL_INVALIDATION,
+                                 ranges, 1, STATUS_SUCCESS );
+    check( status == STATUS_INVALID_PARAMETER,
+           "full code event with ranges returned %#x\n", (unsigned int)status );
+    check( !reset_test_provider(), "code reset after full/range conflict failed\n" );
+
+    ranges[1].address = ranges[0].address + ranges[0].size;
+    status = publish_code_event( WINE_ARM64EC_CODE_MAP, 0, ranges,
+                                 ARRAY_SIZE(ranges), STATUS_SUCCESS );
+    check( status == STATUS_INVALID_PARAMETER,
+           "unmerged adjacent code ranges returned %#x\n", (unsigned int)status );
+    check( !reset_test_provider(), "code reset after adjacent ranges failed\n" );
+    ranges[1].address = test_base + 6 * TEST_PAGE;
+
+    ranges[0].address++;
+    status = publish_code_event( WINE_ARM64EC_CODE_MAP, 0, ranges, 1,
+                                 STATUS_SUCCESS );
+    check( status == STATUS_INVALID_PARAMETER,
+           "misaligned code range returned %#x\n", (unsigned int)status );
+    check( !reset_test_provider(), "code reset after misaligned range failed\n" );
+    --ranges[0].address;
+
+    initialize_code_event( &event, WINE_ARM64EC_CODE_UNMAP, 0, NULL, 0,
+                           STATUS_SUCCESS );
+    status = arm64ec_code_observer.begin( arm64ec_code_observer.context,
+                                          event.operation, &transaction );
+    stale = transaction;
+    if (!status)
+        arm64ec_code_observer.complete( arm64ec_code_observer.context,
+                                        transaction, &event );
+    check( !observer_provider_status(), "valid code completion poisoned provider\n" );
+    arm64ec_code_observer.complete( arm64ec_code_observer.context, stale, &event );
+    check( observer_provider_status() == STATUS_INVALID_DEVICE_STATE,
+           "stale code token was not rejected without dereference %#x\n",
+           (unsigned int)observer_provider_status() );
+    check( !reset_test_provider(), "code reset after stale token failed\n" );
+
+    pthread_mutex_lock( &provider.mutex );
+    while (provider.engine_count < 2 && engine_err == UC_ERR_OK)
+        engine_err = create_pool_engine_locked( NULL );
+    pthread_mutex_unlock( &provider.mutex );
+    check( engine_err == UC_ERR_OK && provider_engine_count() == 2,
+           "code failure pool setup returned %s with %zu engines\n",
+           uc_strerror( engine_err ), provider_engine_count() );
+    if (engine_err != UC_ERR_OK || provider_engine_count() != 2) goto done;
+    reset_cache_recorders();
+    cache_remove_fail_call = 1;
+    status = publish_code_event( WINE_ARM64EC_CODE_RELEASE, 0, ranges, 1,
+                                 STATUS_SUCCESS );
+    cache_remove_fail_call = -1;
+    check( status == STATUS_UNSUCCESSFUL && tlb_flush_calls == 2 &&
+           cache_remove_calls == 2 &&
+           observer_provider_status() == STATUS_UNSUCCESSFUL,
+           "partial code invalidation did not poison provider %#x/%#x "
+           "TLB/remove %u/%u\n", (unsigned int)status,
+           (unsigned int)observer_provider_status(), tlb_flush_calls,
+           cache_remove_calls );
+    pthread_mutex_lock( &provider.mutex );
+    check( !provider.mutating && !provider.mutation_owner_valid &&
+           provider.mutation_stage == MUTATION_STAGE_IDLE &&
+           !provider.code_observer_transaction,
+           "partial code invalidation retained mutation ownership\n" );
+    pthread_mutex_unlock( &provider.mutex );
+
+done:
+    reset_cache_recorders();
+    check( !reset_test_provider(), "code observer final reset failed\n" );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_CODE_OBSERVER_INVALIDATION_PASS\n" );
+}
+
 static void test_identity_codec(void)
 {
     unsigned char *page = test_pages + 3 * TEST_PAGE;
@@ -2875,10 +3292,21 @@ static void test_identity_codec(void)
         .size = TEST_PAGE,
         .protect = PAGE_READONLY,
     };
+    const uint8_t owner = 7u << UC_SWITCHYARD_IDENTITY_PAGE_OWNER_SHIFT;
+    const size_t page_index = (uintptr_t)page >>
+                              UC_SWITCHYARD_IDENTITY_PAGE_SHIFT;
     NTSTATUS status;
+    unsigned int starting_failures = failures;
 
     check( !register_identity_page( page, PAGE_READWRITE ),
            "identity codec map failed\n" );
+    check( provider.identity_page_flags &&
+           provider.identity_page_flags[(uintptr_t)page >>
+               UC_SWITCHYARD_IDENTITY_PAGE_SHIFT] ==
+               (UC_SWITCHYARD_IDENTITY_PAGE_READ |
+                UC_SWITCHYARD_IDENTITY_PAGE_WRITE),
+           "read/write identity page did not publish fast-path permissions\n" );
+    provider.identity_page_flags[page_index] |= owner;
     memset( &translate, 0, sizeof(translate) );
     translate.address = (uintptr_t)page + 37;
     translate.size = 64;
@@ -2907,6 +3335,9 @@ static void test_identity_codec(void)
            (unsigned long long)translate.host );
 
     check( !memory_protect( &protect ), "identity protect failed\n" );
+    check( provider.identity_page_flags[page_index] ==
+               (owner | UC_SWITCHYARD_IDENTITY_PAGE_READ),
+           "read-only identity page lost owner or retained write permission\n" );
     memset( &translate, 0, sizeof(translate) );
     translate.address = (uintptr_t)page;
     translate.size = 1;
@@ -2917,6 +3348,12 @@ static void test_identity_codec(void)
            "read-only identity mapping remained writable %#x\n",
            (unsigned int)status );
 
+    protect.protect = PAGE_EXECUTE_READWRITE;
+    check( !memory_protect( &protect ), "executable identity protect failed\n" );
+    check( provider.identity_page_flags[page_index] ==
+               (owner | UC_SWITCHYARD_IDENTITY_PAGE_READ),
+           "executable identity page lost owner or acquired write permission\n" );
+
     memset( &translate, 0, sizeof(translate) );
     translate.address = UINT64_MAX - 3;
     translate.size = 8;
@@ -2925,6 +3362,10 @@ static void test_identity_codec(void)
     check( status == STATUS_INVALID_PARAMETER,
            "overflowing codec request returned %#x\n", (unsigned int)status );
     check( !unregister_identity_page( page ), "identity codec unmap failed\n" );
+    check( provider.identity_page_flags[page_index] == owner,
+           "unmapped identity page lost owner or retained permissions\n" );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_IDENTITY_FASTPATH_FLAGS_PASS\n" );
 }
 
 static void build_execute_only_code( unsigned char *host_page,
@@ -3051,7 +3492,7 @@ done:
         printf( "XTAJIT64_EXECUTE_ONLY_PASS\n" );
 }
 
-static void test_demand_mapped_atomic(void)
+static void test_identity_atomic_avoids_demand_mapping(void)
 {
     unsigned char *data = test_pages + 3 * TEST_PAGE;
     unsigned char *code_page = test_pages + 4 * TEST_PAGE;
@@ -3078,11 +3519,11 @@ static void test_demand_mapped_atomic(void)
     status = register_identity_page( data, PAGE_READWRITE );
     if (!status) status = register_identity_page( code_page, PAGE_EXECUTE_READ );
     if (!status) status = register_identity_page( stack, PAGE_READWRITE );
-    check( !status, "demand-mapped atomic setup returned %#x\n",
+    check( !status, "identity atomic mapping setup returned %#x\n",
            (unsigned int)status );
     if (status) goto done;
     status = thread_init( NULL );
-    check( !status, "demand-mapped atomic engine init returned %#x\n",
+    check( !status, "identity atomic mapping engine init returned %#x\n",
            (unsigned int)status );
     if (status) goto done;
     thread_initialized = TRUE;
@@ -3118,14 +3559,14 @@ static void test_demand_mapped_atomic(void)
                  range->perms == (UC_PROT_READ | UC_PROT_WRITE))
             has_stack = TRUE;
     }
-    mappings_match = engine && engine->mapped_ranges.count == 3 &&
-                     has_ec && !has_teb && has_data && has_code && !has_stack &&
+    mappings_match = engine && engine->mapped_ranges.count == 2 &&
+                     has_ec && !has_teb && !has_data && has_code && !has_stack &&
                      engine_mappings_match_registry( engine );
     check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
-           *(uint64_t *)data == 1 && memory_map_calls == 2 &&
-           memory_unmap_calls <= 3 && cache_flush_calls <= 1 &&
+           *(uint64_t *)data == 1 && memory_map_calls == 1 &&
+           memory_unmap_calls <= 2 && cache_flush_calls <= 1 &&
            mappings_match,
-           "demand-mapped atomic returned %#x reason %u value %#llx calls %u/%u/%u ranges %zu\n",
+           "identity atomic mapping returned %#x reason %u value %#llx calls %u/%u/%u ranges %zu\n",
            (unsigned int)status, simulation.params.stop_reason,
            (unsigned long long)*(uint64_t *)data, memory_map_calls,
            memory_unmap_calls, cache_flush_calls,
@@ -3139,7 +3580,7 @@ done:
     memory_map_calls = memory_unmap_calls = 0;
     reset_cache_recorders();
     if (failures == starting_failures)
-        printf( "XTAJIT64_DEMAND_MAPPED_ATOMIC_PASS\n" );
+        printf( "XTAJIT64_IDENTITY_ATOMIC_NO_DEMAND_MAP_PASS\n" );
 }
 
 static void test_memory_fault_access_reporting(void)
@@ -3342,6 +3783,33 @@ static size_t build_syscall_trap_code( unsigned char *page, BOOL use_int2e,
     return return_offset;
 }
 
+static size_t build_direct_self_read_code( unsigned char *page, uint64_t process,
+                                           uint64_t source, uint64_t destination,
+                                           uint64_t size )
+{
+    struct code_buffer code = { page, 0 };
+    size_t return_offset;
+
+    emit_movabs_rcx( &code, process );
+    emit_u8( &code, 0x49 ); emit_u8( &code, 0x89 ); emit_u8( &code, 0xca );
+                                               /* mov %rcx,%r10 */
+    emit_u8( &code, 0x48 ); emit_u8( &code, 0xba ); emit_u64( &code, source );
+                                               /* movabs source,%rdx */
+    emit_u8( &code, 0x49 ); emit_u8( &code, 0xb8 ); emit_u64( &code, destination );
+                                               /* movabs destination,%r8 */
+    emit_u8( &code, 0x49 ); emit_u8( &code, 0xb9 ); emit_u64( &code, size );
+                                               /* movabs size,%r9 */
+    emit_u8( &code, 0xb8 );
+    emit_u32( &code, XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY );
+    emit_u8( &code, 0x0f ); emit_u8( &code, 0x05 ); /* syscall */
+    return_offset = code.offset;
+    emit_u8( &code, 0x48 ); emit_u8( &code, 0x89 ); emit_u8( &code, 0xc3 );
+                                               /* mov %rax,%rbx */
+    emit_movabs_rax( &code, test_ec_target );
+    emit_jump_rax( &code );
+    return return_offset;
+}
+
 static void build_syscall_dispatcher_code( unsigned char *page )
 {
     struct code_buffer code = { page, 0 };
@@ -3366,6 +3834,9 @@ static void test_x64_syscall_traps(void)
     const uint64_t stack_marker = 0xdecafbad12345678ull;
     unsigned char *code = test_pages + 3 * TEST_PAGE;
     unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    unsigned char *source = test_pages + 5 * TEST_PAGE;
+    unsigned char *destination = test_pages + 6 * TEST_PAGE;
+    const size_t direct_size = 64;
     struct xtajit64_memory_params flush =
     {
         .guest = (uintptr_t)code,
@@ -3373,16 +3844,28 @@ static void test_x64_syscall_traps(void)
     };
     struct simulation simulation = {0};
     struct code_buffer unsupported;
+    unsigned int starting_failures = failures;
     unsigned int start_count, write_count, read_count;
-    size_t return_offset;
+    uint64_t *bytes_read;
+    uint64_t direct_completions, diagnostic_count;
+    size_t i, return_offset;
+    BOOL direct_stats_enabled = FALSE;
     NTSTATUS status;
+    int ret;
 
     memset( code, 0, TEST_PAGE );
     memset( stack, 0, TEST_PAGE );
+    memset( source, 0, TEST_PAGE );
+    memset( destination, 0, TEST_PAGE );
+    for (i = 0; i < direct_size; ++i) source[i] = (unsigned char)(i ^ 0xa5);
     check( !register_identity_page( code, PAGE_EXECUTE_READ ),
            "syscall code map failed\n" );
     check( !register_identity_page( stack, PAGE_READWRITE ),
            "syscall stack map failed\n" );
+    check( !register_identity_page( source, PAGE_READWRITE ),
+           "direct self-read source map failed\n" );
+    check( !register_identity_page( destination, PAGE_READWRITE ),
+           "direct self-read destination map failed\n" );
     *(uint64_t *)(stack + TEST_PAGE - 16) = stack_marker;
     status = thread_init( NULL );
     check( !status, "syscall engine init failed %#x\n", (unsigned int)status );
@@ -3423,18 +3906,184 @@ static void test_x64_syscall_traps(void)
                read_count + 1,
            "INT 2E did not resume with one context transfer\n" );
 
-    return_offset = build_syscall_trap_code( code, FALSE,
-                                             TEST_SYSCALL_COUNT - 1,
+    return_offset = build_syscall_trap_code( code, FALSE, 1,
                                              arguments[1] );
     check( !flush_instruction_cache( &flush ), "SYSCALL code flush failed\n" );
     initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
     status = begin_simulation( &simulation.params );
     check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
-           simulation.params.context.rbx == TEST_SYSCALL_COUNT - 1 &&
+           simulation.params.context.rbx == 1 &&
            simulation.params.context.r8 == arguments[1] &&
            simulation.params.context.r9 == (uintptr_t)code + return_offset,
            "SYSCALL bridge returned %#x reason %u\n", (unsigned int)status,
            simulation.params.stop_reason );
+
+    pthread_mutex_lock( &provider.mutex );
+    provider.direct_self_read_stats_enabled = TRUE;
+    pthread_mutex_unlock( &provider.mutex );
+    direct_stats_enabled = TRUE;
+    memset( destination, 0xcc, direct_size );
+    return_offset = build_direct_self_read_code( code, ~(uint64_t)0,
+                                                 (uintptr_t)source,
+                                                 (uintptr_t)destination,
+                                                 direct_size );
+    check( !flush_instruction_cache( &flush ), "direct self-read code flush failed\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    simulation.params.context.rsp = (uintptr_t)stack + TEST_PAGE - 0x80;
+    bytes_read = (uint64_t *)(stack + TEST_PAGE - 0x100);
+    *bytes_read = UINT64_MAX;
+    *(uint64_t *)(uintptr_t)(simulation.params.context.rsp + 0x28) =
+        (uintptr_t)bytes_read;
+    direct_completions = provider_direct_self_read_completions();
+    diagnostic_count = provider_direct_self_read_size_bucket( DIRECT_SELF_READ_SIZE_64 );
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.context.rbx == STATUS_SUCCESS &&
+           simulation.params.context.rip == test_ec_target &&
+           return_offset && !memcmp( source, destination, direct_size ) &&
+           *bytes_read == direct_size &&
+           provider_direct_self_read_completions() == direct_completions + 1,
+           "direct self-read returned %#x reason %u status %#llx bytes %#llx completions %#llx/%#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)*bytes_read,
+           (unsigned long long)direct_completions,
+           (unsigned long long)provider_direct_self_read_completions() );
+    check( provider_direct_self_read_size_bucket( DIRECT_SELF_READ_SIZE_64 ) ==
+               diagnostic_count + 1,
+           "direct self-read size bucket was not recorded\n" );
+
+    /* Statistics distinguish unsupported argument shapes without logging
+     * addresses or adding clocks and locks to the syscall hot path. */
+    return_offset = build_direct_self_read_code( code, 0x1234,
+                                                 (uintptr_t)source,
+                                                 (uintptr_t)destination,
+                                                 direct_size );
+    check( !flush_instruction_cache( &flush ),
+           "non-current self-read code flush failed\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    simulation.params.context.rsp = (uintptr_t)stack + TEST_PAGE - 0x80;
+    *(uint64_t *)(uintptr_t)(simulation.params.context.rsp + 0x28) =
+        (uintptr_t)bytes_read;
+    diagnostic_count = provider_direct_self_read_rejections(
+        DIRECT_SELF_READ_REJECT_PROCESS );
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.context.rbx == XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY &&
+           provider_direct_self_read_rejections( DIRECT_SELF_READ_REJECT_PROCESS ) ==
+               diagnostic_count + 1 && return_offset,
+           "non-current self-read did not record dispatcher fallback %#x reason %u\n",
+           (unsigned int)status, simulation.params.stop_reason );
+
+    return_offset = build_direct_self_read_code(
+        code, ~(uint64_t)0, (uintptr_t)source, (uintptr_t)destination,
+        XTAJIT64_DIRECT_SELF_READ_MAX_SIZE + 1 );
+    check( !flush_instruction_cache( &flush ),
+           "oversized self-read code flush failed\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    simulation.params.context.rsp = (uintptr_t)stack + TEST_PAGE - 0x80;
+    *(uint64_t *)(uintptr_t)(simulation.params.context.rsp + 0x28) =
+        (uintptr_t)bytes_read;
+    diagnostic_count = provider_direct_self_read_rejections(
+        DIRECT_SELF_READ_REJECT_SIZE );
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.context.rbx ==
+               XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY &&
+           provider_direct_self_read_rejections( DIRECT_SELF_READ_REJECT_SIZE ) ==
+               diagnostic_count + 1 && return_offset,
+           "oversized self-read did not record dispatcher fallback %#x\n",
+           (unsigned int)status );
+
+    return_offset = build_direct_self_read_code( code, ~(uint64_t)0, 1,
+                                                 (uintptr_t)destination,
+                                                 direct_size );
+    check( !flush_instruction_cache( &flush ),
+           "unmapped-source self-read code flush failed\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    simulation.params.context.rsp = (uintptr_t)stack + TEST_PAGE - 0x80;
+    *(uint64_t *)(uintptr_t)(simulation.params.context.rsp + 0x28) =
+        (uintptr_t)bytes_read;
+    diagnostic_count = provider_direct_self_read_rejections(
+        DIRECT_SELF_READ_REJECT_SOURCE_RANGE );
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.context.rbx ==
+               XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY &&
+           provider_direct_self_read_rejections( DIRECT_SELF_READ_REJECT_SOURCE_RANGE ) ==
+               diagnostic_count + 1 && return_offset,
+           "unmapped-source self-read did not record dispatcher fallback %#x\n",
+           (unsigned int)status );
+
+    return_offset = build_direct_self_read_code( code, ~(uint64_t)0,
+                                                 (uintptr_t)source,
+                                                 (uintptr_t)source + 1,
+                                                 direct_size );
+    check( !flush_instruction_cache( &flush ),
+           "overlapping self-read code flush failed\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    simulation.params.context.rsp = (uintptr_t)stack + TEST_PAGE - 0x80;
+    *(uint64_t *)(uintptr_t)(simulation.params.context.rsp + 0x28) =
+        (uintptr_t)bytes_read;
+    diagnostic_count = provider_direct_self_read_rejections(
+        DIRECT_SELF_READ_REJECT_OVERLAP );
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.context.rbx ==
+               XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY &&
+           provider_direct_self_read_rejections( DIRECT_SELF_READ_REJECT_OVERLAP ) ==
+               diagnostic_count + 1 && return_offset,
+           "overlapping self-read did not record dispatcher fallback %#x\n",
+           (unsigned int)status );
+
+    memset( destination, 0xcc, direct_size );
+    return_offset = build_direct_self_read_code( code, ~(uint64_t)0,
+                                                 (uintptr_t)source,
+                                                 (uintptr_t)destination,
+                                                 direct_size );
+    check( !flush_instruction_cache( &flush ),
+           "null-result self-read code flush failed\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    simulation.params.context.rsp = (uintptr_t)stack + TEST_PAGE - 0x80;
+    *(uint64_t *)(uintptr_t)(simulation.params.context.rsp + 0x28) = 0;
+    direct_completions = provider_direct_self_read_completions();
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.context.rbx == STATUS_SUCCESS &&
+           !memcmp( source, destination, direct_size ) &&
+           provider_direct_self_read_completions() == direct_completions + 1 &&
+           return_offset,
+           "null-result self-read did not complete directly %#x\n",
+           (unsigned int)status );
+
+    /* A canonical RW entry can temporarily be physically read-only for Wine
+     * write-watch handling.  The direct path must leave that case to ntdll. */
+    memset( destination, 0xcc, direct_size );
+    *bytes_read = UINT64_MAX;
+    ret = mprotect( destination, TEST_PAGE, PROT_READ );
+    check( !ret, "direct self-read write-watch simulation mprotect failed %d\n", errno );
+    if (!ret)
+    {
+        check( !flush_instruction_cache( &flush ),
+               "direct self-read fallback code flush failed\n" );
+        initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+        simulation.params.context.rsp = (uintptr_t)stack + TEST_PAGE - 0x80;
+        *(uint64_t *)(uintptr_t)(simulation.params.context.rsp + 0x28) =
+            (uintptr_t)bytes_read;
+        direct_completions = provider_direct_self_read_completions();
+        diagnostic_count = provider_direct_self_read_rejections(
+            DIRECT_SELF_READ_REJECT_DATA_COPY );
+        status = begin_simulation( &simulation.params );
+        check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+               simulation.params.context.rbx ==
+                   XTAJIT64_X64_SYSCALL_NT_READ_VIRTUAL_MEMORY &&
+               destination[0] == 0xcc && *bytes_read == UINT64_MAX &&
+               provider_direct_self_read_completions() == direct_completions &&
+               provider_direct_self_read_rejections( DIRECT_SELF_READ_REJECT_DATA_COPY ) ==
+                   diagnostic_count + 1,
+               "physically protected self-read did not fall back %#x reason %u result %#llx bytes %#llx\n",
+               (unsigned int)status, simulation.params.stop_reason,
+               (unsigned long long)simulation.params.context.rbx,
+               (unsigned long long)*bytes_read );
+        check( !mprotect( destination, TEST_PAGE, PROT_READ | PROT_WRITE ),
+               "direct self-read destination permission restore failed %d\n", errno );
+    }
 
     return_offset = build_syscall_trap_code( code, TRUE, TEST_SYSCALL_COUNT,
                                              arguments[0] );
@@ -3485,10 +4134,25 @@ static void test_x64_syscall_traps(void)
            (unsigned int)status, simulation.params.stop_reason,
            (unsigned int)provider.poison_status );
 
+    pthread_mutex_lock( &provider.mutex );
+    provider.direct_self_read_stats_enabled = FALSE;
+    pthread_mutex_unlock( &provider.mutex );
+    direct_stats_enabled = FALSE;
     thread_term( NULL );
 done:
+    if (direct_stats_enabled)
+    {
+        pthread_mutex_lock( &provider.mutex );
+        provider.direct_self_read_stats_enabled = FALSE;
+        pthread_mutex_unlock( &provider.mutex );
+    }
+    mprotect( destination, TEST_PAGE, PROT_READ | PROT_WRITE );
+    unregister_identity_page( destination );
+    unregister_identity_page( source );
     unregister_identity_page( stack );
     unregister_identity_page( code );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_DIRECT_SELF_READ_PASS\n" );
 }
 
 static void build_x87_control_code( unsigned char *page, uint64_t address,
@@ -3901,6 +4565,30 @@ static void *run_low_observer( void *arg )
     return NULL;
 }
 
+static void *run_code_observer( void *arg )
+{
+    struct code_observer_worker *worker = arg;
+    void *transaction = NULL;
+
+    worker->status = arm64ec_code_observer.begin(
+        arm64ec_code_observer.context, worker->event.operation, &transaction );
+    if (!worker->status)
+    {
+        if (worker->set_ec)
+            __atomic_fetch_or( worker->bitmap_word, worker->bitmap_mask,
+                               __ATOMIC_RELEASE );
+        else
+            __atomic_fetch_and( worker->bitmap_word, ~worker->bitmap_mask,
+                                __ATOMIC_RELEASE );
+        atomic_store_explicit( &worker->begun, 1, memory_order_release );
+        arm64ec_code_observer.complete( arm64ec_code_observer.context,
+                                       transaction, &worker->event );
+        worker->status = observer_provider_status();
+    }
+    atomic_store_explicit( &worker->done, 1, memory_order_release );
+    return NULL;
+}
+
 static void test_running_mutation_barrier(void)
 {
     unsigned char *code = test_pages + 3 * TEST_PAGE;
@@ -3957,6 +4645,214 @@ static void test_running_mutation_barrier(void)
     atomic_store( &test_release_ec_hook, 1 );
     unregister_identity_page( stack );
     unregister_identity_page( code );
+}
+
+static void test_prestart_mutation_barrier(void)
+{
+    unsigned char *code = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    struct simulation simulation = {0};
+    struct protect_worker worker =
+    {
+        .params =
+        {
+            .guest = (uintptr_t)code,
+            .size = TEST_PAGE,
+            .protect = PAGE_EXECUTE_READWRITE,
+        },
+    };
+    volatile uint32_t *doorbell = test_suspend_doorbell();
+    pthread_t runner, mutator;
+    BOOL runner_created = FALSE, mutator_created = FALSE;
+    BOOL entered = FALSE, waiting = FALSE, mutation_done = FALSE;
+    unsigned int starting_failures = failures;
+    unsigned int pause_count;
+    int ret;
+
+    memset( code, 0, TEST_PAGE );
+    code[0] = 0xf3; code[1] = 0x90; /* pause */
+    code[2] = 0xeb; code[3] = 0xfc; /* jmp code */
+    check( !register_identity_page( code, PAGE_EXECUTE_READ ),
+           "prestart barrier code map failed\n" );
+    check( !register_identity_page( stack, PAGE_READWRITE ),
+           "prestart barrier stack map failed\n" );
+    *doorbell = 0;
+    atomic_store( &test_hold_engine_start, 1 );
+    atomic_store( &test_engine_start_entered, 0 );
+    atomic_store( &test_release_engine_start, 0 );
+    atomic_store( &test_disable_pause_hook, 1 );
+    atomic_store( &test_pause_stop_owner_violation, 0 );
+    pause_count = atomic_load_explicit( &test_pause_stop_count,
+                                        memory_order_relaxed );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+
+    ret = pthread_create( &runner, NULL, run_simulation, &simulation );
+    check( !ret, "prestart barrier runner creation failed %d\n", ret );
+    runner_created = !ret;
+    if (runner_created)
+    {
+        entered = wait_atomic_int_at_least( &test_engine_start_entered, 1, 2000 );
+        check( entered, "simulation did not enter the prestart publication window\n" );
+    }
+    if (entered)
+    {
+        ret = pthread_create( &mutator, NULL, run_protect, &worker );
+        check( !ret, "prestart barrier mutator creation failed %d\n", ret );
+        mutator_created = !ret;
+    }
+    if (mutator_created)
+    {
+        waiting = wait_mutation_stage( MUTATION_STAGE_WAIT, 2000 );
+        check( waiting, "prestart mutation did not wait for the published engine\n" );
+        check( !atomic_load_explicit( &worker.done, memory_order_acquire ),
+               "prestart mutation published before the engine could acknowledge\n" );
+    }
+
+    atomic_store_explicit( &test_hold_engine_start, 0, memory_order_release );
+    atomic_store_explicit( &test_release_engine_start, 1, memory_order_release );
+    if (mutator_created)
+    {
+        mutation_done = wait_atomic_int_at_least( &worker.done, 1, 2000 );
+        if (!mutation_done) *doorbell = 1;
+        pthread_join( mutator, NULL );
+        check( mutation_done,
+               "prestart boundary request was lost after uc_emu_start entry\n" );
+        check( !worker.status, "prestart mutation returned %#x\n",
+               (unsigned int)worker.status );
+    }
+    *doorbell = 1;
+    if (runner_created)
+    {
+        check( join_simulation( runner, &simulation ),
+               "prestart barrier simulation timed out\n" );
+        check( !simulation.status &&
+               simulation.params.stop_reason == XTAJIT64_STOP_SUSPEND,
+               "prestart barrier returned %#x reason %u\n",
+               (unsigned int)simulation.status, simulation.params.stop_reason );
+    }
+    check( atomic_load_explicit( &test_pause_stop_count,
+                                 memory_order_relaxed ) == pause_count &&
+           !atomic_load_explicit( &test_pause_stop_owner_violation,
+                                  memory_order_acquire ),
+           "prestart barrier relied on the diagnostic block-hook pause path\n" );
+
+    *doorbell = 0;
+    atomic_store( &test_hold_engine_start, 0 );
+    atomic_store( &test_release_engine_start, 1 );
+    atomic_store( &test_disable_pause_hook, 0 );
+    unregister_identity_page( stack );
+    unregister_identity_page( code );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_PRESTART_MUTATION_BARRIER_PASS\n" );
+}
+
+static void test_late_stop_does_not_escape_engine_lease(void)
+{
+    unsigned char *code = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    struct code_buffer buffer = { code, 0 };
+    struct simulation first = {0}, second = {0};
+    struct protect_worker worker =
+    {
+        .params =
+        {
+            .guest = (uintptr_t)code,
+            .size = TEST_PAGE,
+            .protect = PAGE_EXECUTE_READWRITE,
+        },
+    };
+    struct thread_engine *first_engine = NULL;
+    pthread_t first_runner, second_runner, mutator;
+    BOOL first_created = FALSE, second_created = FALSE, mutator_created = FALSE;
+    BOOL entered = FALSE, waiting = FALSE;
+    unsigned int starting_failures = failures;
+    NTSTATUS status;
+    int ret;
+
+    memset( code, 0, TEST_PAGE );
+    emit_movabs_rax( &buffer, test_ec_target );
+    emit_jump_rax( &buffer );
+    status = register_identity_page( (void *)(uintptr_t)test_ec_target,
+                                     PAGE_EXECUTE_READ );
+    if (!status)
+        status = register_identity_page( (void *)(uintptr_t)test_teb,
+                                         PAGE_READWRITE );
+    if (!status) status = register_identity_page( code, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    check( !status, "late-stop lease setup returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+
+    atomic_store( &test_hold_engine_result, 1 );
+    atomic_store( &test_engine_result_entered, 0 );
+    atomic_store( &test_release_engine_result, 0 );
+    atomic_store( &test_disable_pause_hook, 1 );
+    initialize_begin_params( &first, (uintptr_t)code, (uintptr_t)stack );
+    ret = pthread_create( &first_runner, NULL, run_simulation, &first );
+    check( !ret, "late-stop first runner creation failed %d\n", ret );
+    first_created = !ret;
+    if (first_created)
+    {
+        entered = wait_atomic_int_at_least( &test_engine_result_entered, 1, 2000 );
+        check( entered, "first engine did not enter the post-emulation window\n" );
+        first_engine = test_last_acquired_engine;
+    }
+    if (entered)
+    {
+        ret = pthread_create( &mutator, NULL, run_protect, &worker );
+        check( !ret, "late-stop mutator creation failed %d\n", ret );
+        mutator_created = !ret;
+    }
+    if (mutator_created)
+    {
+        waiting = wait_mutation_stage( MUTATION_STAGE_WAIT, 2000 );
+        check( waiting, "late-stop mutation did not wait for the published engine\n" );
+        check( !atomic_load_explicit( &worker.done, memory_order_acquire ),
+               "late-stop mutation published before the engine lease ended\n" );
+    }
+
+    atomic_store_explicit( &test_hold_engine_result, 0, memory_order_release );
+    atomic_store_explicit( &test_release_engine_result, 1, memory_order_release );
+    if (first_created)
+    {
+        check( join_simulation( first_runner, &first ),
+               "late-stop first simulation timed out\n" );
+        check( !first.status &&
+               first.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION,
+               "late-stop first simulation returned %#x reason %u\n",
+               (unsigned int)first.status, first.params.stop_reason );
+    }
+    if (mutator_created)
+    {
+        pthread_join( mutator, NULL );
+        check( !worker.status, "late-stop mutation returned %#x\n",
+               (unsigned int)worker.status );
+    }
+
+    initialize_begin_params( &second, (uintptr_t)code, (uintptr_t)stack );
+    ret = pthread_create( &second_runner, NULL, run_simulation, &second );
+    check( !ret, "late-stop second runner creation failed %d\n", ret );
+    second_created = !ret;
+    if (second_created)
+    {
+        check( join_simulation( second_runner, &second ),
+               "late-stop second simulation timed out\n" );
+        check( test_last_acquired_engine == first_engine &&
+               !second.status &&
+               second.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION,
+               "late stop escaped into reused engine %p/%p status %#x reason %u\n",
+               (void *)first_engine, (void *)test_last_acquired_engine,
+               (unsigned int)second.status, second.params.stop_reason );
+    }
+
+done:
+    atomic_store( &test_hold_engine_result, 0 );
+    atomic_store( &test_release_engine_result, 1 );
+    atomic_store( &test_disable_pause_hook, 0 );
+    /* Reset even after the expected red result so this contract test cannot
+     * leave a poisoned provider or stale mappings for process cleanup. */
+    check( !reset_test_provider(), "reset after late-stop lease test failed\n" );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_LATE_STOP_LEASE_PASS\n" );
 }
 
 static void test_suspend_doorbell_mutation_barrier(void)
@@ -4180,6 +5076,123 @@ static void test_running_low_observer_barrier(void)
         printf( "XTAJIT64_LOW_OBSERVER_BARRIER_PASS\n" );
 }
 
+static void test_running_code_observer_barrier(void)
+{
+    unsigned char *code = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    struct code_buffer buffer = { code, 0 };
+    struct simulation simulation = {0};
+    struct code_observer_worker worker = {0}, cleanup = {0};
+    uint64_t page = (uintptr_t)code / TEST_PAGE;
+    uint64_t *bitmap = (uint64_t *)(uintptr_t)process_params.ec_bitmap;
+    size_t engine_count;
+    unsigned int pause_count;
+    unsigned int starting_failures = failures;
+    pthread_t runner, observer;
+    BOOL runner_created = FALSE, observer_created = FALSE, entered = FALSE;
+    NTSTATUS status;
+    int ret;
+
+    memset( code, 0, TEST_PAGE );
+    emit_movabs_rax( &buffer, test_ec_target );
+    emit_jump_rax( &buffer );
+    status = register_identity_page( code, PAGE_EXECUTE_READ );
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    check( !status, "code observer barrier setup returned %#x\n",
+           (unsigned int)status );
+    if (status) goto done;
+    check( !is_ec_code( (uintptr_t)code ),
+           "code observer barrier page started as EC code\n" );
+
+    worker.range.address = (uintptr_t)code;
+    worker.range.size = TEST_PAGE;
+    worker.bitmap_word = bitmap + page / 64;
+    worker.bitmap_mask = 1ull << (page & 63);
+    worker.set_ec = TRUE;
+    initialize_code_event( &worker.event, WINE_ARM64EC_CODE_MAP, 0,
+                           &worker.range, 1, STATUS_SUCCESS );
+
+    atomic_store( &test_hold_non_ec_hook, 1 );
+    atomic_store( &test_non_ec_hook_entered, 0 );
+    atomic_store( &test_release_non_ec_hook, 0 );
+    atomic_store( &test_pause_stop_owner_violation, 0 );
+    pause_count = atomic_load_explicit( &test_pause_stop_count,
+                                        memory_order_relaxed );
+    reset_cache_recorders();
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    ret = pthread_create( &runner, NULL, run_simulation, &simulation );
+    check( !ret, "code observer barrier runner creation failed %d\n", ret );
+    if (ret) goto release;
+    runner_created = TRUE;
+    entered = wait_atomic_int_at_least( &test_non_ec_hook_entered, 1, 2000 );
+    check( entered, "code observer barrier did not enter the held block\n" );
+    if (!entered) goto release;
+
+    engine_count = provider_engine_count();
+    ret = pthread_create( &observer, NULL, run_code_observer, &worker );
+    check( !ret, "code observer barrier worker creation failed %d\n", ret );
+    if (ret) goto release;
+    observer_created = TRUE;
+    check( wait_mutation_stage( MUTATION_STAGE_WAIT, 2000 ),
+           "code observer did not wait for the running engine\n" );
+    check( !atomic_load_explicit( &worker.begun, memory_order_acquire ) &&
+           !atomic_load_explicit( &worker.done, memory_order_acquire ) &&
+           !is_ec_code( (uintptr_t)code ),
+           "code observer mutated the bitmap before the engine quiesced\n" );
+
+release:
+    atomic_store_explicit( &test_release_non_ec_hook, 1, memory_order_release );
+    if (observer_created) pthread_join( observer, NULL );
+    if (runner_created)
+        check( join_simulation( runner, &simulation ),
+               "code observer barrier simulation timed out\n" );
+    if (observer_created)
+        check( !worker.status && is_ec_code( (uintptr_t)code ) &&
+               tlb_flush_calls == engine_count &&
+               cache_remove_calls == engine_count && !cache_flush_calls,
+               "code observer barrier publish returned %#x with "
+               "TLB/remove/full %u/%u/%u for %zu engines\n",
+               (unsigned int)worker.status, tlb_flush_calls,
+               cache_remove_calls, cache_flush_calls, engine_count );
+    if (runner_created)
+        check( !simulation.init_status && !simulation.status &&
+               simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+               simulation.params.transition_target >= (uintptr_t)code &&
+               simulation.params.transition_target <
+                   (uintptr_t)code + TEST_PAGE &&
+               atomic_load_explicit( &test_pause_stop_count,
+                                     memory_order_relaxed ) == pause_count + 1 &&
+               !atomic_load_explicit( &test_pause_stop_owner_violation,
+                                      memory_order_acquire ),
+               "code observer barrier lost reclassification %#x/%#x reason %u "
+               "target %#llx\n", (unsigned int)simulation.init_status,
+               (unsigned int)simulation.status, simulation.params.stop_reason,
+               (unsigned long long)simulation.params.transition_target );
+
+    if (__atomic_load_n( worker.bitmap_word, __ATOMIC_ACQUIRE ) &
+        worker.bitmap_mask)
+    {
+        cleanup.range = worker.range;
+        cleanup.bitmap_word = worker.bitmap_word;
+        cleanup.bitmap_mask = worker.bitmap_mask;
+        initialize_code_event( &cleanup.event, WINE_ARM64EC_CODE_UNMAP, 0,
+                               &cleanup.range, 1, STATUS_SUCCESS );
+        run_code_observer( &cleanup );
+        check( !cleanup.status && !is_ec_code( (uintptr_t)code ),
+               "code observer barrier cleanup returned %#x\n",
+               (unsigned int)cleanup.status );
+    }
+
+done:
+    atomic_store( &test_hold_non_ec_hook, 0 );
+    atomic_store( &test_release_non_ec_hook, 1 );
+    unregister_identity_page( stack );
+    unregister_identity_page( code );
+    reset_cache_recorders();
+    if (failures == starting_failures)
+        printf( "XTAJIT64_CODE_OBSERVER_BARRIER_PASS\n" );
+}
+
 static void test_running_flush_preflight_failure(void)
 {
     unsigned char *code = test_pages + 3 * TEST_PAGE;
@@ -4323,6 +5336,700 @@ done:
         printf( "XTAJIT64_FLUSH_PREFLIGHT_FAILURE_PASS\n" );
 }
 
+#if defined(__APPLE__) && defined(XTAJIT64_TEST_EC_LEAF_FASTPATH)
+static void test_ec_leaf_fastpath(void)
+{
+    static const uint32_t thread_id_load = 0xb9404a40;  /* ldr w0,[x18,#0x48] */
+    static const uint32_t last_error_load = 0xb9406a40; /* ldr w0,[x18,#0x68] */
+    static const uint32_t last_status_load = 0xb9525240; /* ldr w0,[x18,#0x1250] */
+    static const uint32_t tls_get_value[] =
+    {
+        0x7100fc1f, 0xb9006a5f, 0x54000088, 0x8b204e48,
+        0xf94a4100, 0xd65f03c0, 0xaa1f03e0, 0xd65f03c0,
+    };
+    static const uint32_t tls_get_value2[] =
+    {
+        0x7100fc1f, 0x54000088, 0x8b204e48, 0xf94a4100,
+        0xd65f03c0, 0xaa1f03e0, 0xd65f03c0,
+    };
+    static const uint32_t rtl_query_performance_counter[] =
+    {
+        0xf81f0ffe, 0xaa1f03e1, 0x9400000e, 0x52800020,
+        0xf84107fe, 0xd65f03c0,
+    };
+    static const uint32_t nt_query_performance_counter[] =
+    {
+        0xd2800628, 0xaa1e03e9, 0x58000090, 0xf9400210,
+        0xd63f0200, 0xd65f03c0,
+    };
+    static const uint32_t nt_query_performance_counter_hybrid_thunk[] =
+    {
+        0xf81f0ffe, 0x90000008, 0xb000000b, 0x9102016b,
+        0xf940c108, 0x9000000a, 0x9106214a, 0x90000009,
+        0x91064129, 0xd63f0100, 0xf84107fe, 0xd61f0160,
+    };
+    static const uint32_t ret = 0xd65f03c0;
+    const uint64_t preserved_rbx = 0x91f0c2d4e6a8b357ull;
+    const uint64_t tls_value = 0x8c7b6a5948372615ull;
+    const uint32_t tls_index = 7;
+    const uint32_t invalid_tls_index = XTAJIT64_TEB_TLS_SLOT_COUNT;
+    const uint32_t thread_id = 0x7a35;
+    const uint32_t last_error = 0x5319;
+    const uint32_t last_status = 0xc0000005;
+    unsigned char *code = test_pages + 3 * TEST_PAGE;
+    unsigned char *stack = test_pages + 4 * TEST_PAGE;
+    unsigned char *counter = test_pages + 5 * TEST_PAGE;
+    uint64_t target = test_ec_target;
+    uint64_t terminal = target + 0x100;
+    uint64_t hybrid_x64_target = target + 0x1000 + 0x80;
+    const uint64_t invalid_counter = test_base + 13 * TEST_PAGE;
+    const uint64_t counter_sentinel = 0x4a3d6c91e7502bf8ull;
+    struct code_buffer buffer = {code, 0};
+    struct xtajit64_memory_params flush =
+    {
+        .guest = target,
+        .size = 0x400,
+    };
+    struct xtajit64_memory_params code_flush = {0};
+    struct simulation simulation = {0};
+    uint64_t initial_rsp, generation, qpc_before, qpc_after, counter_address;
+    size_t tls_index_offset;
+    unsigned int i, starting_failures = failures;
+    BOOL target_mapped = FALSE, teb_mapped = FALSE;
+    BOOL code_mapped = FALSE, stack_mapped = FALSE, counter_mapped = FALSE;
+    BOOL thread_initialized = FALSE, fastpath_enabled = FALSE;
+    NTSTATUS status;
+
+    memset( code, 0, TEST_PAGE );
+    memset( stack, 0, TEST_PAGE );
+    memset( counter, 0, TEST_PAGE );
+    memset( (void *)(uintptr_t)target, 0, 0x400 );
+    *(uint32_t *)(uintptr_t)target = thread_id_load;
+    *(uint32_t *)(uintptr_t)(target + sizeof(uint32_t)) = ret;
+    *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_THREAD_ID_OFFSET) = thread_id;
+    *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET) = last_error;
+    *(uint32_t *)(uintptr_t)(test_teb + 0x1250) = last_status;
+    *(uint64_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_TLS_SLOTS_OFFSET +
+                             tls_index * sizeof(uint64_t)) = tls_value;
+    emit_movabs_rbx( &buffer, preserved_rbx );
+    tls_index_offset = buffer.offset + 2;
+    emit_movabs_rcx( &buffer, tls_index );
+    emit_movabs_rax( &buffer, target );
+    emit_call_rax( &buffer );
+    emit_movabs_rdx( &buffer, terminal );
+    emit_jump_rdx( &buffer );
+    code_flush.guest = (uintptr_t)code;
+    code_flush.size = 0x210;
+
+
+    status = register_identity_page( (void *)(uintptr_t)target, PAGE_EXECUTE_READ );
+    if (!status) target_mapped = TRUE;
+    if (!status) status = register_identity_page( (void *)(uintptr_t)test_teb, PAGE_READWRITE );
+    if (!status) teb_mapped = TRUE;
+    if (!status) status = register_identity_page( code, PAGE_EXECUTE_READ );
+    if (!status) code_mapped = TRUE;
+    if (!status) status = register_identity_page( stack, PAGE_READWRITE );
+    if (!status) stack_mapped = TRUE;
+    if (!status) status = register_identity_page( counter, PAGE_READWRITE );
+    if (!status) counter_mapped = TRUE;
+    if (!status) status = thread_init( NULL );
+    check( !status, "EC leaf fastpath setup returned %#x\n", (unsigned int)status );
+    if (status) goto done;
+    thread_initialized = TRUE;
+
+    pthread_mutex_lock( &provider.mutex );
+    provider.ec_leaf_fastpath_enabled = TRUE;
+    provider.ec_leaf_fastpath_stats_enabled = TRUE;
+    advance_ec_leaf_fastpath_code_generation_locked();
+    atomic_store_explicit( &provider.ec_leaf_fastpath_attempts, 0, memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_hits, 0, memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_unsupported, 0,
+                           memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_register_failures, 0,
+                           memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_memory_failures, 0,
+                           memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_stack_failures, 0,
+                           memory_order_relaxed );
+    atomic_store_explicit( &provider.ec_leaf_fastpath_write_failures, 0,
+                           memory_order_relaxed );
+    for (i = 0; i < EC_LEAF_FASTPATH_KIND_COUNT; ++i)
+        atomic_store_explicit( &provider.ec_leaf_fastpath_hits_by_kind[i], 0,
+                               memory_order_relaxed );
+    pthread_mutex_unlock( &provider.mutex );
+    fastpath_enabled = TRUE;
+
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == terminal &&
+           simulation.params.context.rax == thread_id &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp &&
+           simulation.params.context.eflags == 0x202,
+           "thread-id EC leaf fastpath returned %#x stop %u target %#llx "
+           "rax %#llx rbx %#llx rsp %#llx flags %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags );
+    check( atomic_load_explicit( &provider.ec_leaf_fastpath_attempts,
+                                 memory_order_relaxed ) == 2 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                 memory_order_relaxed ) == 1 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_unsupported,
+                                 memory_order_relaxed ) == 1,
+           "thread-id EC leaf fastpath counters are incorrect\n" );
+
+    *(uint32_t *)(uintptr_t)target = last_error_load;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "EC leaf fastpath code flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == terminal &&
+           simulation.params.context.rax == last_error &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp &&
+           simulation.params.context.eflags == 0x202,
+           "last-error EC leaf fastpath returned %#x stop %u target %#llx "
+           "rax %#llx rbx %#llx rsp %#llx flags %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags );
+    check( atomic_load_explicit( &provider.ec_leaf_fastpath_attempts,
+                                 memory_order_relaxed ) == 4 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                 memory_order_relaxed ) == 2 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_unsupported,
+                                 memory_order_relaxed ) == 2 &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_register_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_memory_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_stack_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_write_failures,
+                                  memory_order_relaxed ),
+           "last-error EC leaf fastpath counters are incorrect\n" );
+
+    *(uint32_t *)(uintptr_t)target = last_status_load;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "generic TEB EC leaf code flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == terminal &&
+           simulation.params.context.rax == last_status &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp &&
+           simulation.params.context.eflags == 0x202,
+           "generic TEB EC leaf returned %#x stop %u target %#llx "
+           "rax %#llx rbx %#llx rsp %#llx flags %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags );
+    check( atomic_load_explicit( &provider.ec_leaf_fastpath_attempts,
+                                 memory_order_relaxed ) == 6 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                 memory_order_relaxed ) == 3 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_unsupported,
+                                 memory_order_relaxed ) == 3 &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_register_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_memory_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_stack_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_write_failures,
+                                  memory_order_relaxed ),
+           "generic TEB EC leaf fastpath counters are incorrect\n" );
+
+    memcpy( (void *)(uintptr_t)target, tls_get_value, sizeof(tls_get_value) );
+    *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET) = last_error;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "TlsGetValue EC leaf code flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == terminal &&
+           simulation.params.context.rax == tls_value &&
+           *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET) == 0 &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp &&
+           simulation.params.context.eflags == 0x202,
+           "TlsGetValue EC leaf returned %#x stop %u target %#llx rax %#llx "
+           "last_error %#x rbx %#llx rsp %#llx flags %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET),
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags );
+    check( atomic_load_explicit( &provider.ec_leaf_fastpath_attempts,
+                                 memory_order_relaxed ) == 8 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                 memory_order_relaxed ) == 4 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_unsupported,
+                                 memory_order_relaxed ) == 4,
+           "TlsGetValue EC leaf fastpath counters are incorrect\n" );
+
+    memcpy( (void *)(uintptr_t)target, tls_get_value2, sizeof(tls_get_value2) );
+    *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET) = last_error;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "TlsGetValue2 EC leaf code flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == terminal &&
+           simulation.params.context.rax == tls_value &&
+           *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET) == last_error &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp &&
+           simulation.params.context.eflags == 0x202,
+           "TlsGetValue2 EC leaf returned %#x stop %u target %#llx rax %#llx "
+           "last_error %#x rbx %#llx rsp %#llx flags %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET),
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags );
+    check( atomic_load_explicit( &provider.ec_leaf_fastpath_attempts,
+                                 memory_order_relaxed ) == 10 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                 memory_order_relaxed ) == 5 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_unsupported,
+                                 memory_order_relaxed ) == 5 &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_register_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_memory_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_stack_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_write_failures,
+                                  memory_order_relaxed ),
+           "TlsGetValue2 EC leaf fastpath counters are incorrect\n" );
+
+    /* An out-of-range TLS index takes TlsGetValue's native ARM64EC branch.
+     * The leaf shortcut must leave every visible state unchanged while it
+     * declines that branch; in particular, the preceding LastError clear is
+     * not allowed to become a partial emulation. */
+    memcpy( code + tls_index_offset, &invalid_tls_index, sizeof(invalid_tls_index) );
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &code_flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "out-of-range TlsGetValue code flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET) = last_error;
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == target &&
+           simulation.params.context.rax == target &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp - sizeof(uint64_t) &&
+           simulation.params.context.eflags == 0x202 &&
+           *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET) == last_error,
+           "out-of-range TlsGetValue changed fallback state %#x stop %u target %#llx "
+           "rax %#llx rbx %#llx rsp %#llx flags %#llx last_error %#x\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags,
+           *(uint32_t *)(uintptr_t)(test_teb + XTAJIT64_TEB_LAST_ERROR_OFFSET) );
+    check( atomic_load_explicit( &provider.ec_leaf_fastpath_attempts,
+                                 memory_order_relaxed ) == 11 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                 memory_order_relaxed ) == 5 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_unsupported,
+                                 memory_order_relaxed ) == 6 &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_register_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_memory_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_stack_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_write_failures,
+                                  memory_order_relaxed ) &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                     EC_LEAF_FASTPATH_TEB_LOAD_W0 ],
+                                 memory_order_relaxed ) == 3 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                     EC_LEAF_FASTPATH_TLS_GET_VALUE ],
+                                 memory_order_relaxed ) == 1 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                     EC_LEAF_FASTPATH_TLS_GET_VALUE2 ],
+                                 memory_order_relaxed ) == 1 &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                      EC_LEAF_FASTPATH_ROTL32 ], memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                      EC_LEAF_FASTPATH_ROTR32 ], memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                      EC_LEAF_FASTPATH_ROTL64 ], memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                      EC_LEAF_FASTPATH_ROTR64 ], memory_order_relaxed ),
+           "out-of-range TlsGetValue fastpath counters are incorrect\n" );
+
+    /* The QPC shortcut is target-authenticated through the process-init
+     * contract and then validates both Wine ARM64EC wrappers.  It must write
+     * the same 100 ns monotonic counter range as native ntdll while preserving
+     * the x64 return contract. */
+    memcpy( (void *)(uintptr_t)target, rtl_query_performance_counter,
+            sizeof(rtl_query_performance_counter) );
+    memcpy( (void *)(uintptr_t)(target + 0x40), nt_query_performance_counter,
+            sizeof(nt_query_performance_counter) );
+    counter_address = (uintptr_t)counter;
+    memcpy( code + tls_index_offset, &counter_address, sizeof(counter_address) );
+    *(uint64_t *)counter = counter_sentinel;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "RtlQueryPerformanceCounter target flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &code_flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "RtlQueryPerformanceCounter caller flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    qpc_before = 0;
+    check( query_ec_performance_counter( &qpc_before ),
+           "cannot read reference RtlQueryPerformanceCounter value\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    qpc_after = 0;
+    check( query_ec_performance_counter( &qpc_after ),
+           "cannot read trailing RtlQueryPerformanceCounter value\n" );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == terminal &&
+           simulation.params.context.rax == TRUE &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp &&
+           simulation.params.context.eflags == 0x202 &&
+           *(uint64_t *)counter >= qpc_before && *(uint64_t *)counter <= qpc_after,
+           "RtlQueryPerformanceCounter EC fastpath returned %#x stop %u target %#llx "
+           "rax %#llx rbx %#llx rsp %#llx flags %#llx counter %#llx range %#llx-%#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags,
+           (unsigned long long)*(uint64_t *)counter,
+           (unsigned long long)qpc_before, (unsigned long long)qpc_after );
+
+    /* ARM64X normally routes this exact wrapper through a generic hybrid
+     * patch thunk before branching to the raw x64 NtQueryPerformanceCounter
+     * export.  The fast path must accept that checked topology too. */
+    check( provider.nt_query_performance_counter == hybrid_x64_target,
+           "raw x64 QPC target is %#llx instead of %#llx\n",
+           (unsigned long long)provider.nt_query_performance_counter,
+           (unsigned long long)hybrid_x64_target );
+    memcpy( (void *)(uintptr_t)(target + 0x40),
+            nt_query_performance_counter_hybrid_thunk,
+            sizeof(nt_query_performance_counter_hybrid_thunk) );
+    *(uint64_t *)counter = counter_sentinel;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "RtlQueryPerformanceCounter hybrid target flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    qpc_before = 0;
+    check( query_ec_performance_counter( &qpc_before ),
+           "cannot read hybrid RtlQueryPerformanceCounter reference value\n" );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    qpc_after = 0;
+    check( query_ec_performance_counter( &qpc_after ),
+           "cannot read trailing hybrid RtlQueryPerformanceCounter value\n" );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == terminal &&
+           simulation.params.context.rax == TRUE &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp &&
+           simulation.params.context.eflags == 0x202 &&
+           *(uint64_t *)counter >= qpc_before && *(uint64_t *)counter <= qpc_after,
+           "hybrid RtlQueryPerformanceCounter EC fastpath returned %#x stop %u target %#llx "
+           "rax %#llx rbx %#llx rsp %#llx flags %#llx counter %#llx range %#llx-%#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags,
+           (unsigned long long)*(uint64_t *)counter,
+           (unsigned long long)qpc_before, (unsigned long long)qpc_after );
+
+    /* The generic bridge shape is insufficient on its own.  Its terminal
+     * x64 branch must be the raw export authenticated in process_init. */
+    *(uint32_t *)(uintptr_t)(target + 0x40 + 3 * sizeof(uint32_t)) = 0x9102416b;
+    *(uint64_t *)counter = counter_sentinel;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "mismatched hybrid QPC target flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == target &&
+           simulation.params.context.rax == target &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp - sizeof(uint64_t) &&
+           simulation.params.context.eflags == 0x202 &&
+           *(uint64_t *)counter == counter_sentinel,
+           "mismatched hybrid QPC target changed fallback state %#x stop %u target %#llx "
+           "rax %#llx rbx %#llx rsp %#llx flags %#llx counter %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags,
+           (unsigned long long)*(uint64_t *)counter );
+
+    /* A valid code signature alone is not enough: the output destination is
+     * checked before any return-state write.  An unavailable mapping must
+     * retain the ordinary transition with no partial counter store. */
+    memcpy( (void *)(uintptr_t)(target + 0x40), nt_query_performance_counter,
+            sizeof(nt_query_performance_counter) );
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "restored RtlQueryPerformanceCounter target flush returned %#x generation %#llx/%#llx\n",
+           (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    memcpy( code + tls_index_offset, &invalid_counter, sizeof(invalid_counter) );
+    *(uint64_t *)counter = counter_sentinel;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &code_flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "invalid RtlQueryPerformanceCounter caller flush returned %#x "
+           "generation %#llx/%#llx\n", (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == target &&
+           simulation.params.context.rax == target &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp - sizeof(uint64_t) &&
+           simulation.params.context.eflags == 0x202 &&
+           *(uint64_t *)counter == counter_sentinel,
+           "invalid RtlQueryPerformanceCounter destination changed fallback state %#x "
+           "stop %u target %#llx rax %#llx rbx %#llx rsp %#llx flags %#llx counter %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags,
+           (unsigned long long)*(uint64_t *)counter );
+
+    /* A code-observer generation change must invalidate the cached function
+     * classification.  A patched target cannot be treated as Wine QPC merely
+     * because its address is still the registered system export. */
+    *(uint32_t *)(uintptr_t)target = 0xd503201f; /* nop */
+    memcpy( code + tls_index_offset, &counter_address, sizeof(counter_address) );
+    *(uint64_t *)counter = counter_sentinel;
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "patched RtlQueryPerformanceCounter target flush returned %#x "
+           "generation %#llx/%#llx\n", (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    generation = provider.ec_leaf_fastpath_code_generation;
+    status = flush_instruction_cache( &code_flush );
+    check( !status && provider.ec_leaf_fastpath_code_generation != generation,
+           "patched RtlQueryPerformanceCounter caller flush returned %#x "
+           "generation %#llx/%#llx\n", (unsigned int)status,
+           (unsigned long long)generation,
+           (unsigned long long)provider.ec_leaf_fastpath_code_generation );
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    initial_rsp = simulation.params.context.rsp;
+    status = begin_simulation( &simulation.params );
+    check( !status && simulation.params.stop_reason == XTAJIT64_STOP_EC_TRANSITION &&
+           simulation.params.transition_target == target &&
+           simulation.params.context.rax == target &&
+           simulation.params.context.rbx == preserved_rbx &&
+           simulation.params.context.rsp == initial_rsp - sizeof(uint64_t) &&
+           simulation.params.context.eflags == 0x202 &&
+           *(uint64_t *)counter == counter_sentinel,
+           "patched RtlQueryPerformanceCounter target changed fallback state %#x "
+           "stop %u target %#llx rax %#llx rbx %#llx rsp %#llx flags %#llx counter %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned long long)simulation.params.transition_target,
+           (unsigned long long)simulation.params.context.rax,
+           (unsigned long long)simulation.params.context.rbx,
+           (unsigned long long)simulation.params.context.rsp,
+           (unsigned long long)simulation.params.context.eflags,
+           (unsigned long long)*(uint64_t *)counter );
+    check( atomic_load_explicit( &provider.ec_leaf_fastpath_attempts,
+                                 memory_order_relaxed ) == 18 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                 memory_order_relaxed ) == 7 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_unsupported,
+                                 memory_order_relaxed ) == 10 &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_register_failures,
+                                  memory_order_relaxed ) &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_memory_failures,
+                                 memory_order_relaxed ) == 1 &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_stack_failures,
+                                  memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_write_failures,
+                                  memory_order_relaxed ) &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                     EC_LEAF_FASTPATH_TEB_LOAD_W0 ],
+                                 memory_order_relaxed ) == 3 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                     EC_LEAF_FASTPATH_TLS_GET_VALUE ],
+                                 memory_order_relaxed ) == 1 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                     EC_LEAF_FASTPATH_TLS_GET_VALUE2 ],
+                                 memory_order_relaxed ) == 1 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                     EC_LEAF_FASTPATH_RTL_QUERY_PERFORMANCE_COUNTER ],
+                                 memory_order_relaxed ) == 2 &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                      EC_LEAF_FASTPATH_ROTL32 ], memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                      EC_LEAF_FASTPATH_ROTR32 ], memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                      EC_LEAF_FASTPATH_ROTL64 ], memory_order_relaxed ) &&
+           !atomic_load_explicit( &provider.ec_leaf_fastpath_hits_by_kind[
+                                      EC_LEAF_FASTPATH_ROTR64 ], memory_order_relaxed ),
+           "RtlQueryPerformanceCounter fastpath counters are incorrect "
+           "attempts %#llx hits %#llx unsupported %#llx memory_fail %#llx qpc_hits %#llx\n",
+           (unsigned long long)atomic_load_explicit( &provider.ec_leaf_fastpath_attempts,
+                                                      memory_order_relaxed ),
+           (unsigned long long)atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                                      memory_order_relaxed ),
+           (unsigned long long)atomic_load_explicit( &provider.ec_leaf_fastpath_unsupported,
+                                                      memory_order_relaxed ),
+           (unsigned long long)atomic_load_explicit(
+               &provider.ec_leaf_fastpath_memory_failures, memory_order_relaxed ),
+           (unsigned long long)atomic_load_explicit(
+               &provider.ec_leaf_fastpath_hits_by_kind[
+                   EC_LEAF_FASTPATH_RTL_QUERY_PERFORMANCE_COUNTER ], memory_order_relaxed ) );
+
+    /* Once a leaf has stored guest output, a failed return-register commit
+     * must poison the engine instead of falling back through the native leaf
+     * with partially committed state. */
+    memcpy( (void *)(uintptr_t)target, rtl_query_performance_counter,
+            sizeof(rtl_query_performance_counter) );
+    memcpy( (void *)(uintptr_t)(target + 0x40), nt_query_performance_counter,
+            sizeof(nt_query_performance_counter) );
+    memcpy( code + tls_index_offset, &counter_address, sizeof(counter_address) );
+    *(uint64_t *)counter = counter_sentinel;
+    status = flush_instruction_cache( &flush );
+    check( !status, "write-failure QPC target flush returned %#x\n",
+           (unsigned int)status );
+    status = flush_instruction_cache( &code_flush );
+    check( !status, "write-failure QPC caller flush returned %#x\n",
+           (unsigned int)status );
+    qpc_before = 0;
+    check( query_ec_performance_counter( &qpc_before ),
+           "cannot read write-failure QPC reference value\n" );
+    reg_write_batch_fail_call = reg_write_batch_calls;
+    initialize_begin_params( &simulation, (uintptr_t)code, (uintptr_t)stack );
+    status = begin_simulation( &simulation.params );
+    reg_write_batch_fail_call = -1;
+    qpc_after = 0;
+    check( query_ec_performance_counter( &qpc_after ),
+           "cannot read trailing write-failure QPC reference value\n" );
+    check( status == STATUS_UNSUCCESSFUL &&
+           simulation.params.stop_reason == XTAJIT64_STOP_INTERNAL_ERROR &&
+           provider.poison_status == STATUS_UNSUCCESSFUL &&
+           *(uint64_t *)counter >= qpc_before && *(uint64_t *)counter <= qpc_after &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_write_failures,
+                                 memory_order_relaxed ) == 1 &&
+           atomic_load_explicit( &provider.ec_leaf_fastpath_hits,
+                                 memory_order_relaxed ) == 7,
+           "QPC return-write failure did not fail closed status %#x stop %u "
+           "poison %#x counter %#llx range %#llx-%#llx writes %#llx hits %#llx\n",
+           (unsigned int)status, simulation.params.stop_reason,
+           (unsigned int)provider.poison_status,
+           (unsigned long long)*(uint64_t *)counter,
+           (unsigned long long)qpc_before, (unsigned long long)qpc_after,
+           (unsigned long long)atomic_load_explicit(
+               &provider.ec_leaf_fastpath_write_failures, memory_order_relaxed ),
+           (unsigned long long)atomic_load_explicit(
+               &provider.ec_leaf_fastpath_hits, memory_order_relaxed ) );
+
+done:
+    if (fastpath_enabled)
+    {
+        pthread_mutex_lock( &provider.mutex );
+        provider.ec_leaf_fastpath_enabled = FALSE;
+        provider.ec_leaf_fastpath_stats_enabled = FALSE;
+        pthread_mutex_unlock( &provider.mutex );
+    }
+    if (thread_initialized) thread_term( NULL );
+    if (counter_mapped) unregister_identity_page( counter );
+    if (stack_mapped) unregister_identity_page( stack );
+    if (code_mapped) unregister_identity_page( code );
+    if (teb_mapped) unregister_identity_page( (void *)(uintptr_t)test_teb );
+    if (target_mapped) unregister_identity_page( (void *)(uintptr_t)target );
+    if (failures == starting_failures)
+        printf( "XTAJIT64_EC_LEAF_FASTPATH_PASS\n" );
+}
+#endif
+
 int main(void)
 {
     uint64_t highest, page;
@@ -4365,12 +6072,16 @@ int main(void)
     process_params.host_kuser = (uintptr_t)test_kuser;
     process_params.kuser_size = TEST_PAGE;
     process_params.rtl_exit_user_thread = test_ec_target;
+    process_params.rtl_query_performance_counter = test_ec_target;
+    process_params.nt_query_performance_counter = test_ec_target + 0x1000 + 0x80;
     process_params.abi_version = XTAJIT64_PROCESS_ABI_VERSION;
     process_params.abi_size = sizeof(process_params);
     process_params.required_capabilities = XTAJIT64_CAPABILITIES;
     process_params.x64_syscall_dispatcher = test_syscall_dispatcher;
     process_params.x64_syscall_count = TEST_SYSCALL_COUNT;
 
+    test_unicorn_perf_counter_api();
+    test_ec_target_stats_initial_report_parser();
     test_process_init_abi();
     status = process_init( &process_params );
     check( !status && process_params.enabled_capabilities == XTAJIT64_CAPABILITIES,
@@ -4380,6 +6091,13 @@ int main(void)
     check( provider.ranges.count == 1 && !provider.ranges.data[0].flags &&
            provider.ranges.data[0].permanent,
            "KUSER registry metadata was not initialized deterministically\n" );
+    check( provider.identity_page_flags && provider.identity_page_flags_size &&
+           provider.identity_address_bits >
+               UC_SWITCHYARD_IDENTITY_PAGE_SHIFT &&
+           !provider.identity_page_flags[process_params.guest_kuser >>
+               UC_SWITCHYARD_IDENTITY_PAGE_SHIFT],
+           "identity fast-path table was not initialized fail-closed\n" );
+    test_ec_bitmap_lookup();
     test_flight_recorder_core();
     test_flight_atomic_trace();
     test_flight_recorder_contracts();
@@ -4391,6 +6109,7 @@ int main(void)
     test_low_observer_lazy_engine_sync();
     test_low_observer_lazy_sync_poison();
     test_low_flush_multi_engine_poison();
+    test_code_observer_invalidation();
     test_running_pool_teardown();
     check( !register_identity_page( (void *)(uintptr_t)test_ec_target,
                                     PAGE_EXECUTE_READ ),
@@ -4403,7 +6122,7 @@ int main(void)
 
     test_identity_codec();
     test_execute_only_read_and_execute();
-    test_demand_mapped_atomic();
+    test_identity_atomic_avoids_demand_mapping();
     test_memory_fault_access_reporting();
     test_late_identity_mapping_retry();
     test_x64_syscall_traps();
@@ -4412,16 +6131,26 @@ int main(void)
     test_executable_cache_invalidation();
     test_executable_address_reuse_invalidation();
     test_running_mutation_barrier();
+    test_prestart_mutation_barrier();
     test_suspend_doorbell_mutation_barrier();
     test_running_low_observer_barrier();
+    test_running_code_observer_barrier();
     test_running_flush_preflight_failure();
     test_flight_provider_boundary();
+    test_late_stop_does_not_escape_engine_lease();
+#if defined(__APPLE__) && defined(XTAJIT64_TEST_EC_LEAF_FASTPATH)
+    test_ec_leaf_fastpath();
+#endif
 
     unregister_identity_page( (void *)(uintptr_t)test_teb );
     unregister_identity_page( (void *)(uintptr_t)test_syscall_dispatcher );
     unregister_identity_page( (void *)(uintptr_t)test_ec_target );
     check( !process_term( NULL ) && !process_term( NULL ),
            "idempotent process termination failed\n" );
+    check( !provider.identity_page_flags &&
+           !provider.identity_page_flags_size &&
+           !provider.identity_address_bits,
+           "process termination retained the identity fast-path table\n" );
     munmap( test_kuser, TEST_PAGE );
     munmap( test_pages, TEST_PAGE_COUNT * TEST_PAGE );
     munmap( test_low_pages, TEST_LOW_PAGE_COUNT * TEST_PAGE );

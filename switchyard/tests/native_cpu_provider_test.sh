@@ -145,8 +145,8 @@ source "$PROFILE_LIBRARY"
 source "$PROVIDER_LIBRARY"
 switchyard_load_runtime_profile preview-native-arm64-fex
 
-[ "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" = 8 ] ||
-  fail "x64 provider validator ABI version is not v8"
+[ "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" = 10 ] ||
+  fail "x64 provider validator ABI version is not v10"
 [ "$(/usr/bin/grep -Fc "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" \
   "$ROOT_DIR/dlls/xtajit64/unixlib.h")" -eq 1 ] ||
   fail "x64 provider header and validator ABI identities differ"
@@ -229,6 +229,7 @@ typedef int (*switchyard_unicorn_extension_t)(struct uc_struct *);
 extern int uc_emu_stop_at_instruction_boundary(struct uc_struct *);
 extern int uc_enable_shared_memory_atomics(struct uc_struct *);
 #ifdef XTAJIT64_PROVIDER
+extern int uc_clear_instruction_boundary_stop(struct uc_struct *);
 extern int uc_set_shared_memory_atomic_callback(struct uc_struct *);
 #endif
 __attribute__((used, visibility("default")))
@@ -236,12 +237,13 @@ switchyard_unicorn_extension_t const switchyard_unicorn_fixture_imports[] = {
     uc_emu_stop_at_instruction_boundary,
     uc_enable_shared_memory_atomics,
 #ifdef XTAJIT64_PROVIDER
+    uc_clear_instruction_boundary_stop,
     uc_set_shared_memory_atomic_callback,
 #endif
 };
 __attribute__((used, visibility("default"))) const char
     switchyard_xtajit64_fixture_abi_identity[] =
-        "switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-472-doorbell";
+        "switchyard-xtajit64-provider-abi-v10-flight-bind-process-init-96-begin-472-doorbell";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);
@@ -526,7 +528,7 @@ extern int ntdll_fixture(void);
 extern unsigned int uc_version(unsigned int *, unsigned int *);
 __attribute__((used, visibility("default"))) const char
     switchyard_xtajit64_fixture_abi_identity[] =
-        "switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-472-doorbell";
+        "switchyard-xtajit64-provider-abi-v10-flight-bind-process-init-96-begin-472-doorbell";
 __attribute__((visibility("default"))) unsigned int provider_fixture(void)
 {
     return (unsigned int)ntdll_fixture() + uc_version(0, 0);
@@ -564,7 +566,7 @@ path, identity = sys.argv[1:]
 with open(path, "rb") as stream:
     value = stream.read()
 old = identity.encode("ascii")
-new = old.replace(b"-v8-", b"-v7-", 1)
+new = old.replace(b"-v10-", b"-v9-", 1)
 if new == old or value.count(old) != 1:
     raise SystemExit("fixture x64 provider ABI marker is not unique")
 with open(path, "wb") as stream:

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UPSTREAM_BASE_FILE="$ROOT_DIR/switchyard/upstream-base.txt"
+export PYTHONDONTWRITEBYTECODE=1
 
 fail() {
   echo "source verification failed: $*" >&2
@@ -57,6 +58,20 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
   "$ROOT_DIR/dlls/ntdll/signal_arm64ec.c" \
   "$ROOT_DIR/include/wine/low_va.h"
 "$ROOT_DIR/dlls/ntdll/tests/run_arm64ec_low_guest_decode.sh"
+"$ROOT_DIR/dlls/ntdll/tests/run_arm64ec_emulation_dispatch.sh"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_emulation_dispatch.py" \
+  "$ROOT_DIR/dlls/ntdll/unix/signal_arm64.c" \
+  "$ROOT_DIR/dlls/ntdll/signal_arm64ec.c" \
+  "$ROOT_DIR/dlls/ntdll/unwind.h" \
+  "$ROOT_DIR/dlls/xtajit64/cpu.c"
+"$ROOT_DIR/dlls/xtajit64/provider_tests/run_tb_history.sh"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/dlls/xtajit64/provider_tests/check_tb_history.py" \
+  "$ROOT_DIR/dlls/xtajit64/unixlib.c"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/dlls/xtajit64/provider_tests/check_trap_diagnostics.py" \
+  "$ROOT_DIR/dlls/xtajit64/unixlib.c"
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
   "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_low_guest_access.py" \
   "$ROOT_DIR/dlls/ntdll/unix/signal_arm64.c" \
@@ -79,6 +94,7 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
 "$ROOT_DIR/switchyard/tests/native_font_runtime_preparation_test.sh"
 "$ROOT_DIR/switchyard/tests/macho_tree_validation_test.sh"
 "$ROOT_DIR/switchyard/tests/provider_source_models_test.sh"
+"$ROOT_DIR/switchyard/tests/arm64x_leaf_thunk_patch_test.sh"
 "$ROOT_DIR/switchyard/tests/darwin_arm64_x18_availability_source_test.sh"
 "$ROOT_DIR/switchyard/tests/darwin_arm64_private_valloc_wx_source_test.sh"
 "$ROOT_DIR/switchyard/tests/swdbg_experiment_test.sh"

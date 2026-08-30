@@ -9,13 +9,13 @@ SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit.so"
 SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY="lib/wine/aarch64-windows/xtajit.dll"
 SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit64.so"
 SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY="lib/wine/aarch64-windows/xtajit64.dll"
-SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION="8"
-SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY="switchyard-xtajit64-provider-abi-v8-flight-bind-process-init-80-begin-472-doorbell"
+SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION="10"
+SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY="switchyard-xtajit64-provider-abi-v10-flight-bind-process-init-96-begin-472-doorbell"
 SWITCHYARD_NATIVE_UNICORN_ROOT="lib/switchyard-unicorn"
 SWITCHYARD_NATIVE_UNICORN_LIBRARY="lib/switchyard-unicorn/lib/libunicorn.2.dylib"
 SWITCHYARD_NATIVE_UNICORN_RPATH='@loader_path/../../switchyard-unicorn/lib'
 SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH="lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch"
-SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256="312f816eaff10fc7495c5e12ce45f30053bb0f84ffde78f7870c315f96028a79"
+SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256="3bf46ebd5276a087b39d5446c9468e09f8af93b23a28a5d2eb8421db4c012930"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_CONTRACT_VERSION="2"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_HANDLE_ENCODING="generation-tagged-v1"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_EXTERNAL_SOURCE_VERSION="2"
@@ -496,7 +496,7 @@ try:
     expected_x64_abi = (
         "switchyard-xtajit64-provider-abi-v"
         + str(int(xtajit64_abi_version))
-        + "-flight-bind-process-init-80-begin-472-doorbell"
+        + "-flight-bind-process-init-96-begin-472-doorbell"
     )
     x64_abi_bytes = xtajit64_abi_identity.encode("ascii")
 except (UnicodeError, ValueError) as error:
@@ -967,6 +967,7 @@ def validate_macho(relative, install_name, provider_required_imports):
         }
         required = {
             "_uc_emu_stop_at_instruction_boundary",
+            "_uc_clear_instruction_boundary_stop",
             "_uc_enable_shared_memory_atomics",
             "_uc_set_shared_memory_atomic_callback",
         }
@@ -987,7 +988,10 @@ validate_macho(xtajit_unix, "@rpath/xtajit.so", common_provider_imports)
 validate_macho(
     xtajit64_unix,
     "@rpath/xtajit64.so",
-    common_provider_imports | {"_uc_set_shared_memory_atomic_callback"},
+    common_provider_imports | {
+        "_uc_clear_instruction_boundary_stop",
+        "_uc_set_shared_memory_atomic_callback",
+    },
 )
 validate_macho(unicorn_library, "@rpath/libunicorn.2.dylib", None)
 

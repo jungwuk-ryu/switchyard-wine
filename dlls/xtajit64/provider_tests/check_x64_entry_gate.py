@@ -74,16 +74,24 @@ def main() -> int:
         "movz x9, #0x6880",
         "cmp x16, x15",
         "str x18, [x0, #0x870]",
+        "ldr x9, [x18, #0x1788]",
+        "mov w15, #1",
+        "stlrb w15, [x9]",
         "mov sp, x16",
     ):
         require(begin, token, "BeginSimulation")
     require(begin, "cmp x15, x9", "BeginSimulation", 2)
     recorder_load = begin.find("ldr x15, [x0, #0x848]")
     x18_capture = begin.find("str x18, [x0, #0x870]")
+    ownership_cpu = begin.find("ldr x9, [x18, #0x1788]")
+    ownership_store = begin.find("stlrb w15, [x9]")
     stack_switch = begin.find("mov sp, x16")
     c_entry = begin.find(r'b \"#begin_simulation_on_control_stack\"')
-    if not recorder_load < x18_capture < stack_switch < c_entry:
-        raise AssertionError("BeginSimulation validates layout and captures x18 in the wrong order")
+    if not (recorder_load < x18_capture < ownership_cpu < ownership_store <
+            stack_switch < c_entry):
+        raise AssertionError(
+            "BeginSimulation must validate layout, acquire simulation, then switch stacks"
+        )
     if re.search(r"ldr\s+x\d+,\s*\[x15", begin[:stack_switch]):
         raise AssertionError("BeginSimulation dereferences the recorder header before switching stacks")
 
@@ -93,13 +101,24 @@ def main() -> int:
     for token in ("state != get_thread_state()",
                   "state->magic != XTAJIT64_THREAD_STATE_MAGIC",
                   "flight_validate_recorder_layout( state )",
+                  "require_control_stack_simulation_ownership(",
                   "discard_unwound_transition_frames"):
         require(control, token, "begin_simulation_on_control_stack")
     if not (control.find("flight_validate_recorder_layout( state )") <
             control.find("flight_start_transition( state )") <
+            control.find("require_control_stack_simulation_ownership(") <
             control.find("discard_unwound_transition_frames") <
             control.find("run_x64_simulation( state )")):
-        raise AssertionError("control-stack C entry uses the recorder before layout validation")
+        raise AssertionError(
+            "control-stack C entry does not fail closed before frame reconciliation"
+        )
+    ownership = function_body(source, "require_control_stack_simulation_ownership")
+    for token in ("*(const volatile BOOLEAN *)&cpu->InSimulation",
+                  "XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION",
+                  "XTAJIT64_FLIGHT_REASON_SIMULATION_OWNERSHIP",
+                  "flight_dump_if_frozen( state, boundary )",
+                  "abort_transition( state, STATUS_INVALID_DEVICE_STATE, boundary )"):
+        require(ownership, token, "control-stack ownership watchdog")
 
     discard = function_body(source, "discard_unwound_transition_frames")
     require(discard, "flight_reconcile_transition_frame(",
@@ -116,9 +135,12 @@ def main() -> int:
             "xtajit64_transition_from_native")
     require(transition, "CONTEXT_AMD64_FLOATING_POINT;",
             "xtajit64_transition_from_native")
-    if not (transition.find("capture_fp_state( &ec_context->AMD64_Context )") <
-            transition.find("ec_context->AMD64_Context.ContextFlags |=") <
-            transition.find("flight_start_transition( state )")):
+    require(transition, "require_control_stack_simulation_ownership(",
+            "xtajit64_transition_from_native")
+    if not (transition.find("flight_start_transition( state )") <
+            transition.find("require_control_stack_simulation_ownership(") <
+            transition.find("capture_fp_state( &ec_context->AMD64_Context )") <
+            transition.find("ec_context->AMD64_Context.ContextFlags |=")):
         raise AssertionError("native capture publishes context flags outside its owning boundary")
     require(run, "mismatched_frame = candidate;", "run_x64_simulation")
     require(run, "XTAJIT64_FLIGHT_REASON_CONTINUATION_PAIR",
@@ -134,15 +156,16 @@ def main() -> int:
         raise AssertionError("continuation watchdog runs before the complete frame search")
     stack_bounds = function_body(source, "get_x64_stack_bounds")
     disabled_gate = stack_bounds.find("if (!result)")
-    disabled_translate = stack_bounds.find("guest_range_to_host(", disabled_gate)
+    disabled_cache = stack_bounds.find("cached_identity_stack_range(", disabled_gate)
+    disabled_translate = stack_bounds.find("XTAJIT64_CALL( memory_translate", disabled_cache)
     diagnostic_init = stack_bounds.find("memset( result", disabled_translate)
     unix_translate = stack_bounds.find("XTAJIT64_CALL( memory_translate", diagnostic_init)
     post_translate_teb = stack_bounds.find("teb = NtCurrentTeb();", unix_translate)
-    if not (disabled_gate < disabled_translate < diagnostic_init < unix_translate <
-            post_translate_teb):
+    if not (disabled_gate < disabled_cache < disabled_translate < diagnostic_init <
+            unix_translate < post_translate_teb):
         raise AssertionError(
-            "transition-stack diagnostics changed the recorder-disabled predicate or "
-            "missed the post-Unixlib TEB sample"
+            "transition-stack fast validation bypassed its authenticated slow path or "
+            "diagnostics missed the post-Unixlib TEB sample"
         )
     require(run, "get_x64_stack_bounds(", "run_x64_simulation")
     require(run, "flight_record_transition_stack_violation(", "run_x64_simulation")
@@ -158,8 +181,19 @@ def main() -> int:
         "violation.frames[index]",
     ):
         require(classifier, token, "flight_record_transition_stack_violation")
-    require(function_body(source, "xtajit64_capture_native"),
-            r'b \"#xtajit64_transition_from_native\"', "xtajit64_capture_native")
+    native_capture = function_body(source, "xtajit64_capture_native")
+    for token in ("ldr x9, [x17, #0x18]", "mov w10, #1",
+                  "stlrb w10, [x17]", "mov x17, x9", "mov sp, x17",
+                  r'b \"#xtajit64_transition_from_native\"'):
+        require(native_capture, token, "xtajit64_capture_native")
+    if not (native_capture.find("ldr x9, [x17, #0x18]") <
+            native_capture.find("stlrb w10, [x17]") <
+            native_capture.find("mov x17, x9") <
+            native_capture.find("mov sp, x17") <
+            native_capture.find(r'b \"#xtajit64_transition_from_native\"')):
+        raise AssertionError(
+            "native capture must validate context, acquire simulation, then switch stacks"
+        )
     capture = function_body(source, "capture_transition")
     require(capture, r'b \"#xtajit64_capture_native\"', "capture_transition")
     for token in ("ldr x16, [x17, #0x848]", "str x18, [x17, #0x870]"):

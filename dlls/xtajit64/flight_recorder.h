@@ -26,7 +26,7 @@
  * types in records.  Raw addresses are retained only while the caller has
  * explicitly enabled the engineering diagnostic. */
 #define XTAJIT64_FLIGHT_MAGIC          0x3154474c46545858ull /* "XXFTLGT1" */
-#define XTAJIT64_FLIGHT_SCHEMA_VERSION 5u
+#define XTAJIT64_FLIGHT_SCHEMA_VERSION 6u
 #define XTAJIT64_FLIGHT_CAPACITY       64u
 #define XTAJIT64_FLIGHT_SCRATCH_SLOTS  8u
 #define XTAJIT64_FLIGHT_RECORDER_SIZE  0x6880u
@@ -81,6 +81,7 @@ enum xtajit64_flight_reason
     XTAJIT64_FLIGHT_REASON_TERMINAL_ABORT,
     XTAJIT64_FLIGHT_REASON_RECORDER_WRAP,
     XTAJIT64_FLIGHT_REASON_RECORDER_INVALID,
+    XTAJIT64_FLIGHT_REASON_SIMULATION_OWNERSHIP,
 };
 
 enum xtajit64_flight_custom_x18_mode
@@ -139,6 +140,16 @@ enum xtajit64_flight_transition_frame_kind
 #define XTAJIT64_FLIGHT_FLAG_EXPECTED_TEB_AUTHENTICATED 0x00000100u
 #define XTAJIT64_FLIGHT_FLAG_PE_X18_CLAIM_PRESENT    0x00000200u
 
+/* Same-thread provider ownership sampled at the event boundary.  UNKNOWN is
+ * retained until the PE-side TEB has been independently authenticated; an
+ * untrusted doorbell pointer is never dereferenced unless it is the exact
+ * provider-owned word in the transition state. */
+#define XTAJIT64_FLIGHT_OWNERSHIP_SIMULATION_ACTIVE  0x00000001u
+#define XTAJIT64_FLIGHT_OWNERSHIP_SYSCALL_CALLBACK   0x00000002u
+#define XTAJIT64_FLIGHT_OWNERSHIP_DOORBELL_PRESENT   0x00000004u
+#define XTAJIT64_FLIGHT_OWNERSHIP_DOORBELL_OWNED     0x00000008u
+#define XTAJIT64_FLIGHT_OWNERSHIP_DOORBELL_SET       0x00000010u
+
 /* A writer first invalidates publication_sequence, fills the payload, then
  * release-publishes the matching sequence.  A reader checks it before and
  * after copying.  Invalidation is essential: without it a reader could accept
@@ -196,7 +207,7 @@ struct DECLSPEC_ALIGN(64) xtajit64_flight_event
     UINT32 transition_frame_kind;
     UINT32 transition_depth_before;
     UINT32 transition_depth_after;
-    UINT32 reserved;
+    UINT32 ownership_flags;
 };
 
 struct xtajit64_flight_transition_frame_snapshot
@@ -358,7 +369,7 @@ C_ASSERT( sizeof(struct xtajit64_flight_recorder) % 64 == 0 );
 #define XTAJIT64_FLIGHT_EVENT_U32_FIELDS(_) \
     _(event_type) _(reason) _(stop_reason) _(custom_x18_mode) _(x18_expectation) \
     _(context_flags) _(mxcsr) _(fltsave_mxcsr) _(flags) _(source) \
-    _(transition_frame_kind) _(transition_depth_before) _(transition_depth_after) _(reserved)
+    _(transition_frame_kind) _(transition_depth_before) _(transition_depth_after) _(ownership_flags)
 
 static inline void xtajit64_flight_store_event( struct xtajit64_flight_event *dst,
                                                 const struct xtajit64_flight_event *src )
@@ -548,6 +559,7 @@ static inline void xtajit64_flight_event_init( struct xtajit64_flight_event *eve
     event->context_flags = XTAJIT64_FLIGHT_UNKNOWN_U32;
     event->mxcsr = XTAJIT64_FLIGHT_UNKNOWN_U32;
     event->fltsave_mxcsr = XTAJIT64_FLIGHT_UNKNOWN_U32;
+    event->ownership_flags = XTAJIT64_FLIGHT_UNKNOWN_U32;
     event->flags = XTAJIT64_FLIGHT_FLAG_RAW_DIAGNOSTIC |
                    XTAJIT64_FLIGHT_FLAG_TIME_UNAVAILABLE |
                    XTAJIT64_FLIGHT_FLAG_CONTEXT_VERSION_UNKNOWN |
