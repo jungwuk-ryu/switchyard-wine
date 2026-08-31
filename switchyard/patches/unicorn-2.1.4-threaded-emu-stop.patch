@@ -5116,10 +5116,10 @@ index 0000000000000000000000000000000000000000..9b5e82c616e62c74779db4f30757fd83
 +}
 diff --git a/tests/regress/switchyard_state_neutral_jit_state.c b/tests/regress/switchyard_state_neutral_jit_state.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..20711ecbe6750a233b7c5f0caedfbad96752c8e2
+index 0000000000000000000000000000000000000000..57ba00ef7f83ea0be9353fef64d794a152f80ca2
 --- /dev/null
 +++ b/tests/regress/switchyard_state_neutral_jit_state.c
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,224 @@
 +/* Verify Switchyard state-only APIs preserve the Apple JIT permission owned by
 + * their calling thread, including lazy initialization and validation errors. */
 +
@@ -5133,6 +5133,9 @@ index 0000000000000000000000000000000000000000..20711ecbe6750a233b7c5f0caedfbad9
 +#include <string.h>
 +
 +#include <unicorn/unicorn.h>
++
++#define CODE_ADDRESS 0x10000u
++#define PAGE_SIZE    0x1000u
 +
 +#if defined(__APPLE__) && defined(__aarch64__)
 +extern __thread bool jit_thread_executable_cache;
@@ -5176,7 +5179,9 @@ index 0000000000000000000000000000000000000000..20711ecbe6750a233b7c5f0caedfbad9
 +    uc_err err = UC_ERR_OK;
 +    bool entry_executable;
 +    bool executable;
++    static const uint8_t code[] = {0x90, 0x90};
 +    unsigned int i;
++    unsigned int j;
 +    int failed = 0;
 +
 +    if (!pthread_jit_write_protect_supported_np() || !read_sprr_permission()) {
@@ -5193,18 +5198,22 @@ index 0000000000000000000000000000000000000000..20711ecbe6750a233b7c5f0caedfbad9
 +    do {                                                                       \
 +        executable = (requested_mode);                                         \
 +        if (select_caller_mode(executable)) {                                  \
-+            fprintf(stderr, "%s: could not select caller mode %u\n",         \
++            fprintf(stderr, "%s: could not select caller mode %u\n",           \
 +                    (label), executable);                                      \
 +            failed = 1;                                                        \
 +            goto cleanup;                                                      \
 +        }                                                                      \
 +        err = (expression);                                                    \
-+        if (err != (expected_error) || caller_is_executable() != executable) { \
++        if (err != (expected_error) || caller_is_executable() != executable || \
++            !jit_thread_executable_valid ||                                    \
++            jit_thread_executable_cache != executable) {                       \
 +            fprintf(stderr,                                                    \
-+                    "%s: error=%u expected=%u mode=%u expected-mode=%u\n",    \
++                    "%s: error=%u expected=%u mode=%u expected-mode=%u "       \
++                    "jit-valid=%u jit-cache=%u\n",                             \
 +                    (label), (unsigned int)err,                                \
 +                    (unsigned int)(expected_error), caller_is_executable(),    \
-+                    executable);                                               \
++                    executable, jit_thread_executable_valid,                   \
++                    jit_thread_executable_cache);                              \
 +            failed = 1;                                                        \
 +            goto cleanup;                                                      \
 +        }                                                                      \
@@ -5215,22 +5224,22 @@ index 0000000000000000000000000000000000000000..20711ecbe6750a233b7c5f0caedfbad9
 +    do {                                                                       \
 +        executable = (requested_mode);                                         \
 +        if (select_caller_mode(executable)) {                                  \
-+            fprintf(stderr, "%s: could not select caller mode %u\n",         \
++            fprintf(stderr, "%s: could not select caller mode %u\n",           \
 +                    (label), executable);                                      \
 +            failed = 1;                                                        \
 +            goto cleanup;                                                      \
 +        }                                                                      \
-+        /* A deliberately invalid shadow makes any authentication observable. \
-+         * Initialized state-only APIs must leave both TLS fields untouched. */ \
++        /* A deliberately invalid shadow makes any authentication observable.  \
++         * Initialized state-only APIs must leave the TLS fields untouched. */ \
 +        jit_thread_executable_cache = !executable;                             \
 +        jit_thread_executable_valid = false;                                   \
 +        err = (expression);                                                    \
 +        if (err != (expected_error) || caller_is_executable() != executable || \
-+            jit_thread_executable_valid ||                                    \
-+            jit_thread_executable_cache != !executable) {                     \
++            jit_thread_executable_valid ||                                     \
++            jit_thread_executable_cache != !executable) {                      \
 +            fprintf(stderr,                                                    \
-+                    "%s: error=%u expected=%u mode=%u expected-mode=%u "      \
-+                    "jit-valid=%u jit-cache=%u\n",                           \
++                    "%s: error=%u expected=%u mode=%u expected-mode=%u "       \
++                    "jit-valid=%u jit-cache=%u\n",                             \
 +                    (label), (unsigned int)err,                                \
 +                    (unsigned int)(expected_error), caller_is_executable(),    \
 +                    executable, jit_thread_executable_valid,                   \
@@ -5276,6 +5285,10 @@ index 0000000000000000000000000000000000000000..20711ecbe6750a233b7c5f0caedfbad9
 +                              sizeof(input)));
 +
 +    if ((err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc)) != UC_ERR_OK ||
++        (err = uc_mem_map(uc, CODE_ADDRESS, PAGE_SIZE, UC_PROT_ALL)) !=
++            UC_ERR_OK ||
++        (err = uc_mem_write(uc, CODE_ADDRESS, code, sizeof(code))) !=
++            UC_ERR_OK ||
 +        (err = uc_configure_x64_boundary_guard(
 +             uc, ec_bitmap, 1, 0xfff, 12, &doorbell_a, NULL)) != UC_ERR_OK) {
 +        fprintf(stderr, "initialized engine setup failed: %u\n",
@@ -5285,6 +5298,12 @@ index 0000000000000000000000000000000000000000..20711ecbe6750a233b7c5f0caedfbad9
 +    }
 +
 +    for (i = 0; i < 2; ++i) {
++        /* The first run may translate code and change the thread permission;
++         * the second reuses the TB and exercises the already-matching path. */
++        for (j = 0; j < 2; ++j) {
++            RUN_API("initialized emulation", i != 0, UC_ERR_OK,
++                    uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + 1, 0, 0));
++        }
 +        RUN_STATE_NEUTRAL_API("initialized import", i != 0, UC_ERR_OK,
 +                              uc_switchyard_x86_64_import_transition_context(
 +                                  uc, &input, 0,
@@ -7298,7 +7317,7 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..4d39417b5b892e30fca5b32b9c83c14f
          uc->current_executable = uc->thread_executable_entry;
      }
  
-@@ -49,16 +451,17 @@ static void save_jit_state(uc_engine *uc)
+@@ -49,16 +451,21 @@ static void save_jit_state(uc_engine *uc)
  
  static void restore_jit_state(uc_engine *uc)
  {
@@ -7315,12 +7334,16 @@ index 75b89a0176b4e89fdde43e3d26ce5af9a2b6adef..4d39417b5b892e30fca5b32b9c83c14f
 -            }
 -        }
 +        executable = jit_authenticate_thread_state();
-+        if (executable != uc->thread_executable_entry)
++        if (executable != uc->thread_executable_entry) {
 +            jit_write_protect(uc->thread_executable_entry);
-+        else
++            /* Authenticate the state written by the platform API.  When the
++             * state already matched, the read above proved the same invariant
++             * and repeating the SPRR read would add no information. */
++            assert_executable(uc->thread_executable_entry);
++        } else {
 +            jit_thread_executable_cache = uc->thread_executable_entry;
++        }
 +        uc->current_executable = uc->thread_executable_entry;
-+        assert_executable(uc->thread_executable_entry);
      }
      uc->nested -= 1;
  }
