@@ -105,17 +105,17 @@ write_preview_manifest() {
     "sourceArchiveSha256": "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e",
     "sourcePatch": {
       "path": "lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch",
-      "sha256": "aac9d35f2641aa79d01596cf49e28e5a758c511976319d4df7701c74ea0ec229"
+      "sha256": "257c640e3987b5bb58d61437e4f743e29a973d24afb4aa9ac7b4b3b36b3bc732"
     },
-    "buildContractVersion": 18,
+    "buildContractVersion": 19,
     "hostArchitecture": "arm64",
     "kuserSharedDataModel": "translated-shadow",
     "emulatedArchitectures": ["i386", "x86_64"],
-    "developmentCacheDigest": "8501202a624c51fbb4907905d9e3398deb8fa9c46d23f20e3474f9ad3dc9d67e",
+    "developmentCacheDigest": "16c3f2e6e910905ea87d5e4ca401e8de406d3baeddb2c5015ff0e53370932a01",
     "runtimeRoot": "lib/switchyard-unicorn",
-    "runtimePayloadDigest": "d3a644afcf9a4ffbea2d7ee83ba918d20d817293e2d52c3f502cf6ffde5c3197",
+    "runtimePayloadDigest": "399c8910ef943889be9cf49416a8cf8f18e3274a07e4740bea42332d14ea00cf",
     "library": "lib/switchyard-unicorn/lib/libunicorn.2.dylib",
-    "librarySha256": "95dfbfad2a1826d00b7dfeb7bce3e057aa6f5ba91be6b7fb6b3196c0ae5f011a",
+    "librarySha256": "e8c017b25495beeff72fe5d1034a6bc3c874e278ea21d48fece7f1939ba1c51c",
     "providerUnixLibraries": [
       "lib/wine/aarch64-unix/xtajit.so",
       "lib/wine/aarch64-unix/xtajit64.so"
@@ -239,11 +239,11 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_UNICORN_SOURCE_REVISION" = "8028ec436f2d9376525352dd38ed9ed6b9f6be10" ]
 [ "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" = "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e" ]
 [ "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" = "unicorn-2.1.4-threaded-emu-stop.patch" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "aac9d35f2641aa79d01596cf49e28e5a758c511976319d4df7701c74ea0ec229" ]
-[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "95dfbfad2a1826d00b7dfeb7bce3e057aa6f5ba91be6b7fb6b3196c0ae5f011a" ]
-[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "18" ]
-[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "8501202a624c51fbb4907905d9e3398deb8fa9c46d23f20e3474f9ad3dc9d67e" ]
-[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "d3a644afcf9a4ffbea2d7ee83ba918d20d817293e2d52c3f502cf6ffde5c3197" ]
+[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "257c640e3987b5bb58d61437e4f743e29a973d24afb4aa9ac7b4b3b36b3bc732" ]
+[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "e8c017b25495beeff72fe5d1034a6bc3c874e278ea21d48fece7f1939ba1c51c" ]
+[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "19" ]
+[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "16c3f2e6e910905ea87d5e4ca401e8de406d3baeddb2c5015ff0e53370932a01" ]
+[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "399c8910ef943889be9cf49416a8cf8f18e3274a07e4740bea42332d14ea00cf" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" = "https://github.com/3Shain/dxmt.git" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REVISION" = "856d9f35789679ef00c1ba01a6353438df84b66f" ]
 [ "$SWITCHYARD_DXMT_SOURCE_BASE_TREE" = "22fa93d36867f175c0283b36cd3628a4df94876e" ]
