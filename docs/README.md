@@ -10,6 +10,9 @@ below.
 - [`architecture.md`](architecture.md) explains what this repository owns, how
   it stays separate from the Switchyard app and user-provided Apple software,
   and how a generated runtime identifies itself.
+- [`apple-silicon-cpu-benchmarks.md`](apple-silicon-cpu-benchmarks.md)
+  defines translated x86-64 microbenchmarks for branch, execution,
+  instruction-delivery, memory, and JIT bottleneck analysis on Apple Silicon.
 - [`building.md`](building.md) covers the Apple Silicon build, verified external
   inputs, runtime promotion, signing, notarization, and regression checks.
 - [`hdr-edr.md`](hdr-edr.md) defines display-colour semantics, HDR/EDR provider
