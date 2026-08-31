@@ -105,17 +105,17 @@ write_preview_manifest() {
     "sourceArchiveSha256": "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e",
     "sourcePatch": {
       "path": "lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch",
-      "sha256": "3bf46ebd5276a087b39d5446c9468e09f8af93b23a28a5d2eb8421db4c012930"
+      "sha256": "aac9d35f2641aa79d01596cf49e28e5a758c511976319d4df7701c74ea0ec229"
     },
-    "buildContractVersion": 17,
+    "buildContractVersion": 18,
     "hostArchitecture": "arm64",
     "kuserSharedDataModel": "translated-shadow",
     "emulatedArchitectures": ["i386", "x86_64"],
-    "developmentCacheDigest": "db6a087b90607bd6839675c2ffcae84531c8d1c3e299ddd8ddf287c319e2fb2d",
+    "developmentCacheDigest": "8501202a624c51fbb4907905d9e3398deb8fa9c46d23f20e3474f9ad3dc9d67e",
     "runtimeRoot": "lib/switchyard-unicorn",
-    "runtimePayloadDigest": "3722c86658cef0daf88ffb35fb28830f5826b8f63a1689d7236b946d17068d97",
+    "runtimePayloadDigest": "d3a644afcf9a4ffbea2d7ee83ba918d20d817293e2d52c3f502cf6ffde5c3197",
     "library": "lib/switchyard-unicorn/lib/libunicorn.2.dylib",
-    "librarySha256": "e47a410bcdfb99d2542eacc850d09495d30f9869999a0d2833cad58755a660c2",
+    "librarySha256": "95dfbfad2a1826d00b7dfeb7bce3e057aa6f5ba91be6b7fb6b3196c0ae5f011a",
     "providerUnixLibraries": [
       "lib/wine/aarch64-unix/xtajit.so",
       "lib/wine/aarch64-unix/xtajit64.so"
@@ -239,11 +239,11 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_UNICORN_SOURCE_REVISION" = "8028ec436f2d9376525352dd38ed9ed6b9f6be10" ]
 [ "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" = "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e" ]
 [ "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" = "unicorn-2.1.4-threaded-emu-stop.patch" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "3bf46ebd5276a087b39d5446c9468e09f8af93b23a28a5d2eb8421db4c012930" ]
-[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "e47a410bcdfb99d2542eacc850d09495d30f9869999a0d2833cad58755a660c2" ]
-[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "17" ]
-[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "db6a087b90607bd6839675c2ffcae84531c8d1c3e299ddd8ddf287c319e2fb2d" ]
-[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "3722c86658cef0daf88ffb35fb28830f5826b8f63a1689d7236b946d17068d97" ]
+[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "aac9d35f2641aa79d01596cf49e28e5a758c511976319d4df7701c74ea0ec229" ]
+[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "95dfbfad2a1826d00b7dfeb7bce3e057aa6f5ba91be6b7fb6b3196c0ae5f011a" ]
+[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "18" ]
+[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "8501202a624c51fbb4907905d9e3398deb8fa9c46d23f20e3474f9ad3dc9d67e" ]
+[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "d3a644afcf9a4ffbea2d7ee83ba918d20d817293e2d52c3f502cf6ffde5c3197" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" = "https://github.com/3Shain/dxmt.git" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REVISION" = "856d9f35789679ef00c1ba01a6353438df84b66f" ]
 [ "$SWITCHYARD_DXMT_SOURCE_BASE_TREE" = "22fa93d36867f175c0283b36cd3628a4df94876e" ]
@@ -641,9 +641,9 @@ grep -F 'extern __thread bool jit_thread_executable_cache;' \
   fail "Unicorn helper does not prove caller-thread Apple JIT ownership"
 grep -F "grep -Fx '#define CONFIG_ATOMIC64 1'" "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper does not require the 64-bit atomic helper configuration"
-grep -F 'for regression in aarch64_rotl_zero apple_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state identity_memory_fastpath identity_atomic_fastpath tb_page_addr_iotlb shared_atomic_idle_mapping shared_code_private_write x86_64_cross_page_chain x86_64_transition_context x86_64_boundary_guard x86_pause; do' \
+grep -F 'for regression in aarch64_rotl_zero apple_jit_state switchyard_state_neutral_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state identity_memory_fastpath identity_atomic_fastpath tb_page_addr_iotlb shared_atomic_idle_mapping shared_code_private_write x86_64_cross_page_chain x86_64_transition_context x86_64_boundary_guard x86_pause; do' \
   "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not run the AArch64 rotate, PAUSE, atomic, identity, and shared-code regressions"
+  fail "Unicorn helper does not run the AArch64 rotate, JIT state-only, PAUSE, atomic, identity, and shared-code regressions"
 grep -F '"$regression_binary" || fail "Unicorn regression failed: $regression"' \
   "$UNICORN_HELPER" >/dev/null ||
   fail "Unicorn helper can ignore a cross-thread stop regression failure"

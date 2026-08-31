@@ -645,9 +645,10 @@ cmake --build "$BUILD_WORK_DIR" --parallel "$JOBS"
 # against the exact dylib that will be installed.  The tests cover zero-count
 # i32/i64 rotate lowering, LOCK CMPXCHG, CMPXCHG8B, demand mapping, repeated
 # shared-code writes, concurrent emulation startup, caller-thread Apple JIT
-# state preservation, and an interruptible REP iteration in addition to the
+# state preservation, state-only boundary calls that avoid redundant JIT
+# authentication, and an interruptible REP iteration in addition to the
 # ordinary cross-thread stop path.
-for regression in aarch64_rotl_zero apple_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state identity_memory_fastpath identity_atomic_fastpath tb_page_addr_iotlb shared_atomic_idle_mapping shared_code_private_write x86_64_cross_page_chain x86_64_transition_context x86_64_boundary_guard x86_pause; do
+for regression in aarch64_rotl_zero apple_jit_state switchyard_state_neutral_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state identity_memory_fastpath identity_atomic_fastpath tb_page_addr_iotlb shared_atomic_idle_mapping shared_code_private_write x86_64_cross_page_chain x86_64_transition_context x86_64_boundary_guard x86_pause; do
   regression_source="$PATCHED_SOURCE_DIR/tests/regress/$regression.c"
   regression_binary="$BUILD_WORK_DIR/switchyard-$regression"
   [ -f "$regression_source" ] && [ ! -L "$regression_source" ] ||
