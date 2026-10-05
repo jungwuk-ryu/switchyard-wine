@@ -359,7 +359,19 @@ struct switchyard_fex_thread {
   // address of any TLS/admission authority. Legacy APIs retain their contract.
   pthread_t NativeGateOwner {};
   switchyard_fex_native_gate NativeGate {};
+  // Positive geometry certificate, not a memory/CPU-state/mapping capability.
+  // Only the authenticated host owner reads/writes it. Every call still borrows
+  // fresh descriptors and payloads; no retained address is dereferenced.
+  struct {
+    uintptr_t Window {}, Output {}, Stop {}, Data {}, Core {}, Frame {}, Epoch {}, Doorbell {};
+    uint64_t GS {};
+  } NativeGeometry {};
+  // EMPTY=0, CONSTRUCTING=1, PUBLISHED=2. Never recycle or overwrite a slot.
+  // Abandonment during construction leaves a permanently cold (not locked)
+  // cache. It cannot retain an execution/mapping lease or block a later call.
+  std::atomic<uint32_t> NativeGeometryState {};
 };
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
 static_assert(sizeof(switchyard_fex_native_gate) == SWITCHYARD_FEX_NATIVE_GATE_SIZE_V1 &&
               offsetof(switchyard_fex_native_gate, mapping_epoch) == 16);
 
@@ -1460,6 +1472,82 @@ static switchyard_fex_result ValidateCompletionWindow(
   return SWITCHYARD_FEX_OK;
 }
 
+static switchyard_fex_result ValidateNativeGateGeometryUncached(
+    switchyard_fex_thread* Thread, const switchyard_fex_register_window* Window,
+    switchyard_fex_stop* Stop, switchyard_fex_register_window& Output) {
+  const auto Valid = ValidateRegisterWindow(Thread, Window, false);
+  if (Valid != SWITCHYARD_FEX_OK) return Valid;
+  const auto& Gate = Thread->NativeGate;
+  if (Window->gs_base != Gate.gs_base) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  Output = *Window;
+  Output.gs_base = 0;
+  if (!Stop || (reinterpret_cast<uintptr_t>(Stop) & (alignof(switchyard_fex_stop) - 1)) ||
+      ObjectOverlap(reinterpret_cast<uintptr_t>(Stop), sizeof(*Stop),
+                    reinterpret_cast<uintptr_t>(Window), sizeof(*Window)))
+    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  const auto Completion = ValidateCompletionWindow(Thread, Stop, &Output);
+  if (Completion != SWITCHYARD_FEX_OK) return Completion;
+  const auto Data = static_cast<uintptr_t>(Window->data);
+  const auto StopPointer = reinterpret_cast<uintptr_t>(Stop);
+  const auto EpochPointer = static_cast<uintptr_t>(Gate.mapping_epoch);
+  const auto DoorbellPointer = static_cast<uintptr_t>(Gate.suspend_doorbell);
+  if (WindowOverlaps(Data, EpochPointer, sizeof(uint64_t)) ||
+      WindowOverlaps(Data, DoorbellPointer, sizeof(uint32_t)) ||
+      ObjectOverlap(StopPointer, sizeof(*Stop), EpochPointer, sizeof(uint64_t)) ||
+      ObjectOverlap(StopPointer, sizeof(*Stop), DoorbellPointer, sizeof(uint32_t)))
+    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  return SWITCHYARD_FEX_OK;
+}
+
+static switchyard_fex_result ValidateNativeGateGeometry(
+    switchyard_fex_thread* Thread, const switchyard_fex_register_window* Window,
+    switchyard_fex_stop* Stop, switchyard_fex_register_window& Output) {
+  // Preserve original validation/error precedence on same-host reentry, but
+  // never read or publish a certificate while an execution is outstanding.
+  if (ActiveExecutionThread) return ValidateNativeGateGeometryUncached(Thread, Window, Stop, Output);
+  auto& Cached = Thread->NativeGeometry;
+  if (Thread->NativeGeometryState.load(std::memory_order_acquire) == 2 &&
+      Cached.Window == reinterpret_cast<uintptr_t>(Window) &&
+      Cached.Output == reinterpret_cast<uintptr_t>(&Output) &&
+      Cached.Stop == reinterpret_cast<uintptr_t>(Stop) &&
+      Cached.Core == reinterpret_cast<uintptr_t>(Thread->CoreThread) &&
+      Cached.Frame == reinterpret_cast<uintptr_t>(Thread->CoreThread->CurrentFrame) &&
+      Window->size >= sizeof(*Window) && Window->version == SWITCHYARD_FEX_REGISTER_WINDOW_VERSION &&
+      !Window->flags && !Window->reserved && Window->data_size == SWITCHYARD_FEX_REGISTER_WINDOW_DATA_SIZE_V1 &&
+      Cached.Data == Window->data && Cached.GS == Window->gs_base &&
+      Cached.GS == Thread->NativeGate.gs_base &&
+      Cached.Epoch == Thread->NativeGate.mapping_epoch &&
+      Cached.Doorbell == Thread->NativeGate.suspend_doorbell &&
+      Stop->size >= sizeof(*Stop) && Stop->version == SWITCHYARD_FEX_STOP_VERSION) {
+    Output = *Window;
+    Output.gs_base = 0;
+    return SWITCHYARD_FEX_OK;
+  }
+  const auto Result = ValidateNativeGateGeometryUncached(Thread, Window, Stop, Output);
+  if (Result != SWITCHYARD_FEX_OK) return Result;
+  // The old borrowed API can describe its descriptor inside opaque storage.
+  // Do not write the certificate in that case; preserve the cold contract.
+  const auto Pointer = reinterpret_cast<uintptr_t>(Window);
+  if (ObjectOverlap(Pointer, sizeof(*Window), reinterpret_cast<uintptr_t>(&Output), sizeof(Output)) ||
+      ObjectOverlap(Pointer, sizeof(*Window), reinterpret_cast<uintptr_t>(Thread), sizeof(*Thread)) ||
+      ObjectOverlap(Pointer, sizeof(*Window), reinterpret_cast<uintptr_t>(Thread->Process), sizeof(*Thread->Process)) ||
+      ObjectOverlap(Pointer, sizeof(*Window), reinterpret_cast<uintptr_t>(Thread->CoreThread), sizeof(*Thread->CoreThread)) ||
+      ObjectOverlap(Pointer, sizeof(*Window), reinterpret_cast<uintptr_t>(Thread->CoreThread->CurrentFrame),
+                    sizeof(*Thread->CoreThread->CurrentFrame))) return Result;
+  uint32_t Empty {};
+  if (!Thread->NativeGeometryState.compare_exchange_strong(Empty, 1, std::memory_order_acq_rel)) return Result;
+  Cached = {Pointer, reinterpret_cast<uintptr_t>(&Output), reinterpret_cast<uintptr_t>(Stop),
+            static_cast<uintptr_t>(Window->data), reinterpret_cast<uintptr_t>(Thread->CoreThread),
+            reinterpret_cast<uintptr_t>(Thread->CoreThread->CurrentFrame),
+            static_cast<uintptr_t>(Thread->NativeGate.mapping_epoch),
+            static_cast<uintptr_t>(Thread->NativeGate.suspend_doorbell), Window->gs_base};
+#ifdef SWITCHYARD_FEX_NATIVE_GEOMETRY_TEST
+  switchyard_fex_geometry_before_publish_test(Thread);
+#endif
+  Thread->NativeGeometryState.store(2, std::memory_order_release);
+  return Result;
+}
+
 switchyard_fex_result switchyard_fex_experiment_execute_export_window(
     switchyard_fex_thread* Thread, uint64_t Generation,
     switchyard_fex_stop* Stop, const switchyard_fex_register_window* Window) {
@@ -1513,28 +1601,10 @@ switchyard_fex_result switchyard_fex_experiment_execute_native_gate(
   if (!pthread_equal(Thread->NativeGateOwner, pthread_self())) return SWITCHYARD_FEX_ERROR_BUSY;
   const auto& Gate = Thread->NativeGate;
   if (!Gate.expected_epoch) return SWITCHYARD_FEX_ERROR_UNSUPPORTED;
-  const auto Valid = ValidateRegisterWindow(Thread, Window, false);
+  switchyard_fex_register_window Output;
+  const auto Valid = ValidateNativeGateGeometry(Thread, Window, Stop, Output);
   if (Valid != SWITCHYARD_FEX_OK) return Valid;
-  if (Window->gs_base != Gate.gs_base) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
-  auto Output = *Window;
-  Output.gs_base = 0;
-  // Validate against the caller's descriptor as well as the private copy:
-  // the output may not overwrite either it or gate ownership storage.
-  if (!Stop || (reinterpret_cast<uintptr_t>(Stop) & (alignof(switchyard_fex_stop) - 1)) ||
-      ObjectOverlap(reinterpret_cast<uintptr_t>(Stop), sizeof(*Stop),
-                    reinterpret_cast<uintptr_t>(Window), sizeof(*Window)))
-    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
-  const auto Completion = ValidateCompletionWindow(Thread, Stop, &Output);
-  if (Completion != SWITCHYARD_FEX_OK) return Completion;
-  const auto Data = static_cast<uintptr_t>(Window->data);
-  const auto StopPointer = reinterpret_cast<uintptr_t>(Stop);
   const auto EpochPointer = static_cast<uintptr_t>(Gate.mapping_epoch);
-  const auto DoorbellPointer = static_cast<uintptr_t>(Gate.suspend_doorbell);
-  if (WindowOverlaps(Data, EpochPointer, sizeof(uint64_t)) ||
-      WindowOverlaps(Data, DoorbellPointer, sizeof(uint32_t)) ||
-      ObjectOverlap(StopPointer, sizeof(*Stop), EpochPointer, sizeof(uint64_t)) ||
-      ObjectOverlap(StopPointer, sizeof(*Stop), DoorbellPointer, sizeof(uint32_t)))
-    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
   if (ActiveExecutionThread) return SWITCHYARD_FEX_ERROR_BUSY;
   uint64_t Token {};
   const int Acquired = switchyard_fex_admission_acquire(&Thread->Admission, true, &Token);

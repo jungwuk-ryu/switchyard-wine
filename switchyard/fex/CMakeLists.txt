@@ -205,7 +205,16 @@ if(SWITCHYARD_FEX_BUILD_TESTS)
   target_link_libraries(switchyard-fex-native-gate-state-test PRIVATE FEXCore FEXCore_Base JemallocDummy)
   target_compile_definitions(switchyard-fex-native-gate-state-test PRIVATE
     SWITCHYARD_FEX_HAS_CUSTOM_X18_API=1 SWITCHYARD_FEX_UPSTREAM_REVISION="${GIT_HASH}")
-  foreach(window_test switchyard-fex-register-window-test switchyard-fex-register-window-state-test switchyard-fex-completion-window-state-test switchyard-fex-native-gate-state-test)
+  add_executable(switchyard-fex-native-geometry-test tests/native_geometry_test.cpp)
+  target_compile_features(switchyard-fex-native-geometry-test PRIVATE cxx_std_20)
+  target_compile_options(switchyard-fex-native-geometry-test PRIVATE -Wall -Wextra -Werror -Wconversion -Wshadow)
+  target_include_directories(switchyard-fex-native-geometry-test PRIVATE include tests)
+  target_include_directories(switchyard-fex-native-geometry-test SYSTEM PRIVATE
+    "${PROJECT_SOURCE_DIR}/FEXCore/include" "${PROJECT_SOURCE_DIR}/FEXHeaderUtils" "${CMAKE_BINARY_DIR}/include")
+  target_link_libraries(switchyard-fex-native-geometry-test PRIVATE FEXCore FEXCore_Base JemallocDummy)
+  target_compile_definitions(switchyard-fex-native-geometry-test PRIVATE
+    SWITCHYARD_FEX_HAS_CUSTOM_X18_API=1 SWITCHYARD_FEX_UPSTREAM_REVISION="${GIT_HASH}")
+  foreach(window_test switchyard-fex-register-window-test switchyard-fex-register-window-state-test switchyard-fex-completion-window-state-test switchyard-fex-native-gate-state-test switchyard-fex-native-geometry-test)
     add_custom_command(TARGET ${window_test} POST_BUILD
       COMMAND /usr/bin/codesign --force --timestamp=none --sign -
               --entitlements "${SWITCHYARD_FEX_ENTITLEMENTS}" "$<TARGET_FILE:${window_test}>" VERBATIM)
@@ -214,5 +223,7 @@ if(SWITCHYARD_FEX_BUILD_TESTS)
   add_test(NAME switchyard-fex-register-window-state COMMAND "$<TARGET_FILE:switchyard-fex-register-window-state-test>")
   add_test(NAME switchyard-fex-completion-window-state COMMAND "$<TARGET_FILE:switchyard-fex-completion-window-state-test>")
   add_test(NAME switchyard-fex-native-gate-state COMMAND "$<TARGET_FILE:switchyard-fex-native-gate-state-test>")
+  add_test(NAME switchyard-fex-native-geometry COMMAND "$<TARGET_FILE:switchyard-fex-native-geometry-test>")
+  set_tests_properties(switchyard-fex-native-geometry PROPERTIES TIMEOUT 30)
   set_tests_properties(switchyard-fex-register-window switchyard-fex-register-window-state switchyard-fex-completion-window-state switchyard-fex-native-gate-state PROPERTIES TIMEOUT 30)
 endif()

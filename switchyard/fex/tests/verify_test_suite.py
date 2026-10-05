@@ -15,13 +15,14 @@ EXPECTED = frozenset((
     "switchyard-fex-register-window", "switchyard-fex-register-window-state",
     "switchyard-fex-completion-window-state",
     "switchyard-fex-native-gate-state",
+    "switchyard-fex-native-geometry",
 ))
 MAX_REPORT = 4 * 1024 * 1024
 
 
 def check_names(names):
     if len(names) != len(EXPECTED) or frozenset(names) != EXPECTED:
-        raise ValueError("private native gate must contain exactly 17 tests")
+        raise ValueError("private geometry gate must contain exactly 18 tests")
 
 
 def check_plan(data):
@@ -57,7 +58,7 @@ def main():
         check_plan(data)
     else:
         check_results(data)
-    print("private native gate " + sys.argv[1] + ": 17 exact tests, no skipped gate")
+    print("private geometry gate " + sys.argv[1] + ": 18 exact tests, no skipped gate")
 
 
 if __name__ == "__main__":
