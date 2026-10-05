@@ -14,6 +14,7 @@
 #endif
 
 #include <stdatomic.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1384,6 +1385,98 @@ static void *run_flush( void *arg )
     return NULL;
 }
 
+struct warm_gate_lock
+{
+    atomic_int held;
+    atomic_int release;
+};
+
+static void *hold_warm_gate_mutex( void *arg )
+{
+    struct warm_gate_lock *lock = arg;
+
+    pthread_mutex_lock( &provider.mutex );
+    atomic_store_explicit( &lock->held, 1, memory_order_release );
+    /* Deliberate bounded test contention, not a runtime spin protocol. The
+     * fixture's existing alarm/supervisor bounds a wrongly locked warm path. */
+    while (!atomic_load_explicit( &lock->release, memory_order_acquire )) sched_yield();
+    pthread_mutex_unlock( &provider.mutex );
+    return NULL;
+}
+
+static void *copied_warm_owner( void *arg )
+{
+    struct thread_binding *binding = arg;
+    struct xtajit64_begin_params params;
+    uint64_t before = switchyard_fex_admission_load( binding->admission );
+    uint64_t cache = binding->native_gate_epoch;
+
+    /* Stronger than copying a PE descriptor: a test-only forged TSD slot still
+     * must not authenticate another pthread or mutate the owner's cache/TLS. */
+    check( !pthread_setspecific( binding_key, binding ), "cannot install foreign test-only TSD" );
+    init_begin_params( &params, test_base, binding->doorbell );
+    check( begin_simulation( &params ) == STATUS_INVALID_DEVICE_STATE &&
+           switchyard_fex_admission_load( binding->admission ) == before &&
+           binding->native_gate_epoch == cache && !active_signal_binding,
+           "copied owner descriptor changed native gate authority" );
+    check( !pthread_setspecific( binding_key, NULL ), "cannot clear foreign test-only TSD" );
+    return NULL;
+}
+
+static void test_warm_native_gate( volatile uint32_t *doorbell )
+{
+    unsigned char code[23] = {0x48,0xb8,0,0,0,0,0,0,0,0,0x49,0xbb,0,0,0,0,0,0,0,0,0x41,0xff,0xe3};
+    unsigned char saved_code[TEST_PAGE];
+    struct warm_gate_lock lock = {0};
+    struct xtajit64_begin_params params;
+    struct thread_binding *binding = pthread_getspecific( binding_key );
+    const uint64_t value = 0x1726354;
+    uint64_t current_generation, word;
+    unsigned int entries, completions, gates, index;
+    pthread_t holder, foreign;
+
+    if (test_custom_dispatch) return;
+    memcpy( saved_code, (const void *)(uintptr_t)test_base, sizeof(saved_code) );
+    memcpy( code + 2, &value, sizeof(value) );
+    memcpy( code + 12, &target_address, sizeof(target_address) );
+    check( !publish_code( test_base, code, sizeof(code) ), "cannot install exact warm native gate code" );
+    init_begin_params( &params, test_base, doorbell );
+    check( !begin_simulation( &params ) && params.context.rax == value &&
+           params.stop_reason == XTAJIT64_STOP_EC_TRANSITION && binding->native_gate_epoch,
+           "native gate cold attachment did not execute" );
+    check( !pthread_create( &foreign, NULL, copied_warm_owner, binding ) &&
+           !pthread_join( foreign, NULL ), "foreign native gate owner test failed" );
+    entries = atomic_load( &fused_initial_calls );
+    completions = atomic_load( &completion_calls );
+    gates = atomic_load( &native_gate_calls );
+    check( !pthread_create( &holder, NULL, hold_warm_gate_mutex, &lock ), "cannot hold provider mutex" );
+    while (!atomic_load_explicit( &lock.held, memory_order_acquire )) sched_yield();
+    for (index = 0; index < 32; ++index)
+    {
+        init_begin_params( &params, test_base, doorbell );
+        check( !begin_simulation( &params ) && params.context.rax == value &&
+               params.stop_reason == XTAJIT64_STOP_EC_TRANSITION && !binding_is_active( binding ) &&
+               !active_signal_binding, "warm native gate did not release before callback" );
+    }
+    atomic_store_explicit( &lock.release, 1, memory_order_release );
+    check( !pthread_join( holder, NULL ), "provider mutex holder did not finish" );
+    check( atomic_load( &fused_initial_calls ) == entries && atomic_load( &completion_calls ) == completions &&
+           atomic_load( &native_gate_calls ) == gates + 32,
+           "warm native gate used cold entry/completion or skipped actual SDK" );
+    pthread_mutex_lock( &provider.mutex );
+    current_generation = provider_mapping_generation();
+    word = switchyard_fex_admission_load( binding->admission );
+    __atomic_store_n( &provider.generation, UINT64_MAX, __ATOMIC_RELEASE );
+    check( begin_mutation_locked() == STATUS_INTEGER_OVERFLOW && !provider.mutating &&
+           switchyard_fex_admission_load( binding->admission ) == word,
+           "mapping generation wrap changed closure/authority" );
+    /* Exclusive, quiescent fixture-only restoration, not a runtime operation. */
+    __atomic_store_n( &provider.generation, current_generation, __ATOMIC_RELEASE );
+    pthread_mutex_unlock( &provider.mutex );
+    check( !publish_code( test_base, saved_code, sizeof(saved_code) ),
+           "warm native gate did not restore the exact existing fixture page" );
+}
+
 static void test_quiescent_invalidation( volatile uint32_t *doorbell )
 {
     struct running_test test;
@@ -1417,8 +1510,17 @@ static void test_quiescent_invalidation( volatile uint32_t *doorbell )
     check( wait_atomic_value( &mutation_quiesced, 1, TEST_TIMEOUT_MS ),
            "mutation did not quiesce active FEX execution" );
     check( __atomic_load_n( (uint32_t *)doorbell, __ATOMIC_ACQUIRE ) ==
-               XTAJIT64_INTERNAL_PAUSE,
-           "internal pause token was not owned at the quiescent boundary" );
+               0,
+           "internal request was not cleared before backing mutation" );
+    {
+        struct thread_binding *binding;
+        /* The release/acquire hook holds mutation here, so membership is
+         * stable. Verify closure is the authority replacing that token. */
+        for (binding = provider.bindings; binding; binding = binding->next)
+            check( (switchyard_fex_admission_load( binding->admission ) &
+                    SWITCHYARD_FEX_ADMISSION_FLAGS) == SWITCHYARD_FEX_ADMISSION_CLOSED,
+                   "clear request did not retain CLOSED+idle admission" );
+    }
     __atomic_store_n( (uint32_t *)doorbell, UINT32_MAX, __ATOMIC_RELEASE );
     atomic_store_explicit( &release_mutation, 1, memory_order_release );
     pthread_join( flush_thread, NULL );
@@ -1651,6 +1753,7 @@ int main(void)
         test_direct_binding();
         test_unaligned_signal_bridge( doorbell );
         test_execution_boundaries( doorbell );
+        test_warm_native_gate( doorbell );
         test_quiescent_invalidation( doorbell );
         test_early_wake_replay( doorbell );
         test_fork_contract( &process_params, doorbell );

@@ -240,8 +240,69 @@ struct switchyard_fex_execution
 SWITCHYARD_FEX_API enum switchyard_fex_result switchyard_fex_thread_prepare_execution(
     struct switchyard_fex_thread *thread, const struct switchyard_fex_execution *execution,
     uint64_t *generation);
+/* PRIVATE experiment, not the ABI6 release contract. Native entry ONLY; never
+ * call for an internal syscall/fault continuation. Same mutex/unlock/owner and
+ * single-consumption contract as prepare_execution; generation unchanged on
+ * failure, although an acquired generation may be consumed. */
+SWITCHYARD_FEX_API enum switchyard_fex_result switchyard_fex_experiment_prepare_native_window(
+    struct switchyard_fex_thread *thread, const struct switchyard_fex_register_window *window,
+    const struct switchyard_fex_execution *execution, uint64_t *generation);
 SWITCHYARD_FEX_API enum switchyard_fex_result switchyard_fex_thread_execute_prepared(
     struct switchyard_fex_thread *thread, uint64_t generation, struct switchyard_fex_stop *stop);
+/* PRIVATE system-ABI experiment. After an ordinary generated invocation,
+ * classify and export the non-syscall window before consuming the SAME owned
+ * execution. Wake/release still precedes any embedding mutex/native callback.
+ * Invalid arguments or stale/wrong-owner generations do not execute, consume
+ * or publish. Syscalls leave the window unchanged: resume uses full state.
+ * The caller pins non-aliasing output/stop storage until this call returns. */
+SWITCHYARD_FEX_API enum switchyard_fex_result switchyard_fex_experiment_execute_export_window(
+    struct switchyard_fex_thread *thread, uint64_t generation,
+    struct switchyard_fex_stop *stop, const struct switchyard_fex_register_window *window);
+
+/* PRIVATE native-gate experiment, NOT the ABI6 release contract. The trusted
+ * Unix embedding binds once under its mutation mutex, after validating the
+ * identity doorbell mapping and authenticating gs_base from Unix NtCurrentTeb.
+ * No descriptor, opaque object, TLS-slot or admission pointer is exposed to PE.
+ * The creator OS thread is the only permitted binding/execution owner; matching
+ * numeric TEB/gs_base values do not authenticate another pthread.
+ *
+ * mapping_epoch points to an aligned, exclusively atomically accessed uint64_t
+ * in embedding-owned storage pinned through successful adapter destruction.
+ * Increment it without wrapping BEFORE closing all admission cells, drain every
+ * ACTIVE cell, mutate/invalidate, then reopen. It is a cache-validation stamp,
+ * never a second admission authority. The gate checks it AFTER acquiring the
+ * existing sole execution cell, before reading a doorbell or importing state.
+ * A mismatch reports UNSUPPORTED, consumes that reservation and wakes if CLOSED;
+ * the embedding must revalidate/rebind through its cold path, not retry blindly.
+ * All borrowed gate storage remains owned even if destruction fails.
+ *
+ * execute_native_gate is an ordinary system-ABI call, with no embedding mutex
+ * held. Import/execute/stopped export share one generation, released/woken
+ * BEFORE any native callback or return. No C++ activation, borrowed window or
+ * raw TB continuation survives. Native entry defaults are NOT valid for full
+ * syscall/fault/internal-suspend replay: those stops use existing full state.
+ * Window.gs_base must match the Unix-bound value. Output data/stop must not
+ * alias the epoch or doorbell; the ordinary window ownership rules also apply.
+ * Invalid metadata/wrong owner/CLOSED/exhausted cells do not publish outputs.
+ */
+#define SWITCHYARD_FEX_NATIVE_GATE_VERSION 1u
+#define SWITCHYARD_FEX_NATIVE_GATE_SIZE_V1 48u
+struct switchyard_fex_native_gate
+{
+    uint32_t size;
+    uint32_t version;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t mapping_epoch;
+    uint64_t expected_epoch;
+    uint64_t gs_base;
+    uint64_t suspend_doorbell;
+};
+SWITCHYARD_FEX_API enum switchyard_fex_result switchyard_fex_experiment_bind_native_gate(
+    struct switchyard_fex_thread *thread, const struct switchyard_fex_native_gate *gate);
+SWITCHYARD_FEX_API enum switchyard_fex_result switchyard_fex_experiment_execute_native_gate(
+    struct switchyard_fex_thread *thread, const struct switchyard_fex_register_window *window,
+    struct switchyard_fex_stop *stop);
 
 /* An invocation capability, not a cached translated-block address. Prepare
  * and complete run in the system ABI on the same OS thread. Between them the

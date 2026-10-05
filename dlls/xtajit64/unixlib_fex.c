@@ -81,6 +81,9 @@ struct thread_binding
     uint64_t process_instance;
     uint64_t id;
     volatile uint32_t *doorbell;
+    uint64_t doorbell_generation;
+    uint64_t native_gate_epoch;
+    uint64_t native_gate_teb;
     struct switchyard_fex_admission *admission;
     uint64_t pause_generation;
     BOOL internal_pause_owned;
@@ -155,6 +158,26 @@ static struct provider_process provider =
     .cond = PTHREAD_COND_INITIALIZER,
 };
 
+/* The attached binding pins process/configuration lifetime. These two mutable
+ * publications are read by the owned warm gate without the provider mutex;
+ * every write is atomic, including init, poison and fork-child failure. */
+static NTSTATUS provider_poison_status(void)
+{
+    return __atomic_load_n( &provider.poison_status, __ATOMIC_ACQUIRE );
+}
+
+static uint64_t provider_mapping_generation(void)
+{
+    return __atomic_load_n( &provider.generation, __ATOMIC_ACQUIRE );
+}
+
+static void clear_execution_doorbell_locked( struct thread_binding *binding )
+{
+    /* A warm gate uses a stable published address, but may dereference it only
+     * after sole-cell admission and matching its mapping generation. */
+    if (!binding->native_gate_epoch) binding->doorbell = NULL;
+}
+
 static BOOL binding_is_active( const struct thread_binding *binding )
 {
     return binding && binding->admission &&
@@ -217,7 +240,7 @@ static void provider_fork_child(void)
     provider.code_observer_active = FALSE;
     provider.signal_observer_active = FALSE;
     provider.mutation_owner_valid = FALSE;
-    provider.poison_status = STATUS_NOT_SUPPORTED;
+    __atomic_store_n( &provider.poison_status, STATUS_NOT_SUPPORTED, __ATOMIC_RELEASE );
     provider.process = NULL;
     provider.ec_bitmap = NULL;
     provider.highest_user_address = 0;
@@ -675,7 +698,7 @@ static enum switchyard_fex_result query_guest_executable_range(
         return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
     binding = __atomic_load_n( &active_signal_binding, __ATOMIC_ACQUIRE );
     pthread_mutex_lock( &provider.mutex );
-    if (!provider.initialized || provider.shutting_down || provider.poison_status ||
+    if (!provider.initialized || provider.shutting_down || provider_poison_status() ||
         !binding_is_active( binding ) || binding->process_instance != provider.instance ||
         !address || address > provider.highest_user_address)
         goto done;
@@ -755,7 +778,8 @@ static void request_binding_pause_locked( struct thread_binding *binding )
 {
     uint32_t expected = 0;
 
-    if (!binding_is_active( binding ) || !binding->doorbell || binding->internal_pause_owned)
+    if (!binding_is_active( binding ) || !binding->doorbell || binding->internal_pause_owned ||
+        binding->doorbell_generation != provider_mapping_generation() - 1)
         return;
     if (__atomic_compare_exchange_n( (uint32_t *)(uintptr_t)binding->doorbell,
                                      &expected, XTAJIT64_INTERNAL_PAUSE, FALSE,
@@ -784,23 +808,38 @@ static NTSTATUS begin_mutation_locked(void)
     }
     if (provider.forked_child) return STATUS_NOT_SUPPORTED;
     if (!provider.initialized || provider.shutting_down) return STATUS_INVALID_HANDLE;
-    if (provider.poison_status) return provider.poison_status;
+    if (provider_poison_status()) return provider_poison_status();
     /* Another thread's observer is ordinary contention, not recursive entry.
      * Its transaction pointers are cleared before finish_mutation_locked()
      * wakes us. Reject only inconsistent leftovers after that ownership wait. */
     if (provider.low_transaction || provider.code_transaction)
         return STATUS_INVALID_DEVICE_STATE;
+    if (provider_mapping_generation() == UINT64_MAX) return STATUS_INTEGER_OVERFLOW;
 
     provider.mutating = TRUE;
     provider.mutation_owner = pthread_self();
     provider.mutation_owner_valid = TRUE;
-    if (!++provider.generation) ++provider.generation;
+    __atomic_add_fetch( &provider.generation, UINT64_C(1), __ATOMIC_RELEASE );
     for (binding = provider.bindings; binding; binding = binding->next)
         switchyard_fex_admission_close( binding->admission );
     for (binding = provider.bindings; binding; binding = binding->next)
         request_binding_pause_locked( binding );
     while (any_binding_active_locked())
         pthread_cond_wait( &provider.cond, &provider.mutex );
+    /* Clear an owned request while its OLD backing is still pinned. CLOSED
+     * already excludes every entrant, so a doorbell need not remain asserted
+     * while mutation later removes/reprotects/remaps that storage. The exact
+     * pause_generation remains the replay cause after this boolean is cleared. */
+    for (binding = provider.bindings; binding; binding = binding->next)
+    {
+        uint32_t expected = XTAJIT64_INTERNAL_PAUSE;
+
+        if (binding->internal_pause_owned && binding->doorbell)
+            __atomic_compare_exchange_n( (uint32_t *)(uintptr_t)binding->doorbell,
+                                         &expected, 0, FALSE,
+                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE );
+        binding->internal_pause_owned = FALSE;
+    }
 #ifdef XTAJIT64_FEX_UNIXLIB_TEST
     xtajit64_fex_test_mutation_quiesced();
 #endif
@@ -813,13 +852,6 @@ static void finish_mutation_locked(void)
 
     for (binding = provider.bindings; binding; binding = binding->next)
     {
-        uint32_t expected = XTAJIT64_INTERNAL_PAUSE;
-
-        if (binding->internal_pause_owned && binding->doorbell)
-            __atomic_compare_exchange_n( (uint32_t *)(uintptr_t)binding->doorbell,
-                                         &expected, 0, FALSE,
-                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE );
-        binding->internal_pause_owned = FALSE;
         switchyard_fex_admission_reopen( binding->admission );
     }
     provider.mutation_owner_valid = FALSE;
@@ -846,7 +878,7 @@ static NTSTATUS invalidate_all_code_locked(void)
 static void poison_provider_locked( NTSTATUS status )
 {
     if (!status) status = STATUS_UNSUCCESSFUL;
-    if (!provider.poison_status) provider.poison_status = status;
+    if (!provider_poison_status()) __atomic_store_n( &provider.poison_status, status, __ATOMIC_RELEASE );
 }
 
 #ifdef XTAJIT64_FEX_UNIXLIB_TEST
@@ -964,7 +996,7 @@ static void record_flight_event( struct thread_binding *binding, uint32_t type,
     event->binding_id = binding->id;
     event->engine_id = binding->id;
     event->engine_generation = provider.instance;
-    event->mapping_generation = provider.generation;
+    event->mapping_generation = provider_mapping_generation();
     event->context_generation = binding->flight_context_generation;
     event->transition_generation = binding->flight_transition_generation;
     event->guest_rip = binding->flight_guest_rip;
@@ -1034,7 +1066,7 @@ static NTSTATUS memory_translate( void *args )
     while (provider.mutating && provider.initialized)
         pthread_cond_wait( &provider.cond, &provider.mutex );
     if (!provider.initialized || provider.shutting_down) status = STATUS_INVALID_HANDLE;
-    else if (provider.poison_status) status = provider.poison_status;
+    else if (provider_poison_status()) status = provider_poison_status();
     else if (direction == XTAJIT64_MEMORY_TRANSLATE_GUEST_TO_HOST)
     {
         guest = address;
@@ -1077,7 +1109,7 @@ static NTSTATUS control_stack_protect( void *args )
     pthread_mutex_lock( &provider.mutex );
     page_size = provider.native_page_size;
     if (!provider.initialized || provider.shutting_down) status = STATUS_INVALID_HANDLE;
-    else if (provider.poison_status) status = provider.poison_status;
+    else if (provider_poison_status()) status = provider_poison_status();
     pthread_mutex_unlock( &provider.mutex );
     if (status) return status;
     if (page_size < XTAJIT64_GUEST_PAGE_SIZE || page_size > XTAJIT64_MAX_HOST_PAGE_SIZE ||
@@ -1393,8 +1425,8 @@ static NTSTATUS memory_resync_begin( void *args )
     while (provider.mutating && provider.initialized)
         pthread_cond_wait( &provider.cond, &provider.mutex );
     if (!provider.initialized || provider.shutting_down) status = STATUS_INVALID_HANDLE;
-    else if (provider.poison_status) status = provider.poison_status;
-    else params->generation = provider.generation;
+    else if (provider_poison_status()) status = provider_poison_status();
+    else params->generation = provider_mapping_generation();
     pthread_mutex_unlock( &provider.mutex );
     return status;
 }
@@ -1411,8 +1443,8 @@ static NTSTATUS memory_resync( void *args )
         pthread_cond_wait( &provider.cond, &provider.mutex );
     if (!params) status = STATUS_INVALID_PARAMETER;
     else if (!provider.initialized || provider.shutting_down) status = STATUS_INVALID_HANDLE;
-    else if (provider.poison_status) status = provider.poison_status;
-    else if (params->generation != provider.generation) status = STATUS_RETRY;
+    else if (provider_poison_status()) status = provider_poison_status();
+    else if (params->generation != provider_mapping_generation()) status = STATUS_RETRY;
     else if (!(status = begin_mutation_locked())) mutation = TRUE;
     if (!status) status = build_resync_registry( params, &replacement );
     if (!status) status = invalidate_all_code_locked();
@@ -1678,7 +1710,7 @@ static int32_t low_observer_begin( void *context, uint32_t operation,
     pthread_mutex_lock( &provider.mutex );
     if (!(status = begin_mutation_locked()))
     {
-        transaction->generation = provider.generation;
+        transaction->generation = provider_mapping_generation();
         transaction->operation = operation;
         provider.low_transaction = transaction;
         *transaction_ret = transaction;
@@ -1797,7 +1829,7 @@ static int32_t code_observer_begin( void *context, uint32_t operation,
     pthread_mutex_lock( &provider.mutex );
     if (!(status = begin_mutation_locked()))
     {
-        transaction->generation = provider.generation;
+        transaction->generation = provider_mapping_generation();
         transaction->operation = operation;
         provider.code_transaction = transaction;
         *transaction_ret = transaction;
@@ -2156,9 +2188,9 @@ static NTSTATUS process_init( void *args )
         provider.guest_kuser = params->guest_kuser;
         provider.host_kuser = params->host_kuser;
         provider.kuser_size = params->kuser_size;
-        provider.generation = 1;
+        __atomic_store_n( &provider.generation, UINT64_C(1), __ATOMIC_RELEASE );
         provider.next_binding_id = 0;
-        provider.poison_status = STATUS_SUCCESS;
+        __atomic_store_n( &provider.poison_status, STATUS_SUCCESS, __ATOMIC_RELEASE );
         provider.observer_active = FALSE;
         provider.code_observer_active = FALSE;
         provider.signal_observer_active = FALSE;
@@ -2176,7 +2208,7 @@ static NTSTATUS process_init( void *args )
     status = register_provider_observers();
     pthread_mutex_lock( &provider.mutex );
     if (!status) provider.signal_observer_active = TRUE;
-    if (!status && provider.poison_status) status = provider.poison_status;
+    if (!status && provider_poison_status()) status = provider_poison_status();
     if (!status && (!provider.observer_active || !provider.code_observer_active ||
                     !provider.signal_observer_active))
         status = STATUS_INVALID_DEVICE_STATE;
@@ -2237,7 +2269,7 @@ static NTSTATUS process_term( void *args )
     provider.observer_active = FALSE;
     provider.code_observer_active = FALSE;
     provider.signal_observer_active = FALSE;
-    provider.poison_status = STATUS_SUCCESS;
+    __atomic_store_n( &provider.poison_status, STATUS_SUCCESS, __ATOMIC_RELEASE );
     pthread_mutex_unlock( &provider.mutex );
 
     result = switchyard_fex_process_destroy( process );
@@ -2274,7 +2306,7 @@ static NTSTATUS thread_init( void *args )
     while (provider.mutating && provider.initialized)
         pthread_cond_wait( &provider.cond, &provider.mutex );
     if (!provider.initialized || provider.shutting_down) status = STATUS_INVALID_HANDLE;
-    else if (provider.poison_status) status = provider.poison_status;
+    else if (provider_poison_status()) status = provider_poison_status();
     else if (current && current->process_instance == provider.instance)
         status = STATUS_SUCCESS;
     else if (provider.next_binding_id == UINT64_MAX) status = STATUS_INTEGER_OVERFLOW;
@@ -2499,6 +2531,26 @@ static NTSTATUS __attribute__((noinline)) resume_syscall_locked(
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS refresh_execution_doorbell_locked( struct thread_binding *binding, uint64_t address )
+{
+    uint64_t host, allocation;
+    unsigned int domain;
+
+    if (binding->doorbell_generation == provider_mapping_generation() &&
+        (uintptr_t)binding->doorbell == address) return STATUS_SUCCESS;
+    binding->native_gate_epoch = 0;
+    if (!translate_guest_range_locked( address, sizeof(uint32_t), FEX_PERM_READ | FEX_PERM_WRITE,
+                                      &host, &allocation, &domain ) || host != address ||
+        domain != XTAJIT64_MEMORY_ADDRESS_IDENTITY)
+    {
+        binding->doorbell = NULL;
+        return STATUS_INVALID_ADDRESS;
+    }
+    binding->doorbell = (volatile uint32_t *)(uintptr_t)host;
+    binding->doorbell_generation = provider_mapping_generation();
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS run_simulation( struct xtajit64_begin_params *params,
                                 struct xtajit64_dispatch_params *dispatch,
                                 BOOL complete )
@@ -2516,6 +2568,7 @@ static NTSTATUS run_simulation( struct xtajit64_begin_params *params,
     pthread_once( &binding_key_once, make_binding_key );
     if (binding_key_error || !(binding = pthread_getspecific( binding_key )))
         return STATUS_INVALID_HANDLE;
+    if (!pthread_equal( binding->owner, pthread_self() )) return STATUS_INVALID_DEVICE_STATE;
     memset( &stop, 0, sizeof(stop) );
     stop.size = sizeof(stop);
     stop.version = SWITCHYARD_FEX_STOP_VERSION;
@@ -2561,6 +2614,49 @@ static NTSTATUS run_simulation( struct xtajit64_begin_params *params,
         (params->suspend_doorbell & (sizeof(uint32_t) - 1)))
         return STATUS_INVALID_PARAMETER;
 
+    window = (struct switchyard_fex_register_window){
+        .size = sizeof(window), .version = SWITCHYARD_FEX_REGISTER_WINDOW_VERSION,
+        .data = (uintptr_t)&params->context, .data_size = sizeof(params->context),
+        .gs_base = params->gs_base,
+    };
+    if (!dispatch && binding->native_gate_epoch && !binding->flight_recorder &&
+        binding->native_gate_teb == params->gs_base &&
+        (uintptr_t)binding->doorbell == params->suspend_doorbell &&
+        !provider_poison_status() && !binding_is_active( binding ) &&
+        !__atomic_load_n( &active_signal_binding, __ATOMIC_ACQUIRE ))
+    {
+        const uint64_t previous = switchyard_fex_admission_load( binding->admission );
+
+        /* Genuine pthread/TLS plus immutable Unix-only binding, NEVER a PE
+         * binding/cell/TLS-slot pointer. The SDK reserves the same cell before
+         * validating mapping_epoch and touching the borrowed doorbell/state. */
+        __atomic_store_n( &active_signal_binding, binding, __ATOMIC_RELEASE );
+        result = switchyard_fex_experiment_execute_native_gate( binding->thread, &window, &stop );
+        execution_generation = switchyard_fex_admission_load( binding->admission ) >> 3;
+        __atomic_store_n( &active_signal_binding, NULL, __ATOMIC_RELEASE );
+        if (result == SWITCHYARD_FEX_OK && stop.reason == SWITCHYARD_FEX_STOP_EC_TRANSITION &&
+            provider_mapping_generation() == binding->native_gate_epoch && !provider_poison_status())
+        {
+            params->transition_target = stop.rip;
+            params->fault_address = 0;
+            params->fault_access = EXCEPTION_READ_FAULT;
+            params->stop_reason = XTAJIT64_STOP_EC_TRANSITION;
+            params->reserved = 0;
+            params->provider_error = SWITCHYARD_FEX_OK;
+            return STATUS_SUCCESS;
+        }
+        if (result != SWITCHYARD_FEX_ERROR_UNSUPPORTED &&
+            !(result == SWITCHYARD_FEX_ERROR_BUSY && execution_generation == (previous >> 3)))
+        {
+            /* Every exceptional stop joins the existing full-state continuation
+             * AFTER release+wake. Never reimport native defaults on that path. */
+            window.gs_base = 0;
+            goto execution_complete;
+        }
+        /* CLOSED/stale mapping stamp: no guest execution or output publication.
+         * Revalidate exactly once through the existing cold mutex path. */
+    }
+
     memset( &execution, 0, sizeof(execution) );
     execution.size = sizeof(execution);
     execution.version = SWITCHYARD_FEX_EXECUTION_VERSION;
@@ -2572,7 +2668,7 @@ static NTSTATUS run_simulation( struct xtajit64_begin_params *params,
     if (!provider.initialized || provider.shutting_down ||
         binding->process_instance != provider.instance || !binding->thread)
         status = STATUS_INVALID_HANDLE;
-    else if (provider.poison_status) status = provider.poison_status;
+    else if (provider_poison_status()) status = provider_poison_status();
     else if (binding_is_active( binding )) status = STATUS_INVALID_DEVICE_STATE;
     else if (!!dispatch != provider.custom_dispatch) status = STATUS_NOT_SUPPORTED;
     else if (dispatch && params->gs_base != (uint64_t)(uintptr_t)NtCurrentTeb())
@@ -2588,8 +2684,27 @@ static NTSTATUS run_simulation( struct xtajit64_begin_params *params,
         status = STATUS_INVALID_ADDRESS;
     else
     {
+        binding->native_gate_epoch = 0;
         binding->doorbell = (volatile uint32_t *)(uintptr_t)doorbell_host;
+        binding->doorbell_generation = provider_mapping_generation();
         refresh_flight_binding_locked( binding, params );
+        if (!dispatch && !binding->flight_recorder &&
+            params->gs_base == (uintptr_t)NtCurrentTeb())
+        {
+            const struct switchyard_fex_native_gate native_gate = {
+                .size = sizeof(native_gate), .version = SWITCHYARD_FEX_NATIVE_GATE_VERSION,
+                .mapping_epoch = (uintptr_t)&provider.generation,
+                .expected_epoch = provider_mapping_generation(),
+                .gs_base = (uintptr_t)NtCurrentTeb(), .suspend_doorbell = doorbell_host,
+            };
+            result = switchyard_fex_experiment_bind_native_gate( binding->thread, &native_gate );
+            if (result != SWITCHYARD_FEX_OK) status = fex_result_to_status( result );
+            else
+            {
+                binding->native_gate_epoch = native_gate.expected_epoch;
+                binding->native_gate_teb = native_gate.gs_base;
+            }
+        }
     }
     if (status)
     {
@@ -2607,37 +2722,44 @@ static NTSTATUS run_simulation( struct xtajit64_begin_params *params,
         params->fault_access = EXCEPTION_READ_FAULT;
         params->stop_reason = XTAJIT64_STOP_SUSPEND;
         params->provider_error = SWITCHYARD_FEX_OK;
-        binding->doorbell = NULL;
+        clear_execution_doorbell_locked( binding );
         pthread_mutex_unlock( &provider.mutex );
         return STATUS_SUCCESS;
     }
 
-    window = (struct switchyard_fex_register_window){
-        .size = sizeof(window), .version = SWITCHYARD_FEX_REGISTER_WINDOW_VERSION,
-        .data = (uintptr_t)&params->context, .data_size = sizeof(params->context),
-        .gs_base = params->gs_base,
-    };
-    result = switchyard_fex_thread_import_register_window( binding->thread, &window );
+    /* PRIVATE differential: import and reserve ordinary native entry under
+     * one generation. Internal suspension/syscall continuations retain the
+     * full core state and must continue to use execute_again below. */
+    result = dispatch ? switchyard_fex_thread_import_register_window( binding->thread, &window ) :
+        switchyard_fex_experiment_prepare_native_window( binding->thread, &window,
+                                                        &execution, &execution_generation );
     if (result != SWITCHYARD_FEX_OK)
     {
         status = fex_result_to_status( result );
         params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
         params->provider_error = result;
-        binding->doorbell = NULL;
+        clear_execution_doorbell_locked( binding );
         poison_provider_locked( status );
         pthread_mutex_unlock( &provider.mutex );
         return status;
     }
+    if (!dispatch) goto execution_ready;
 
 execute_again:
-    if (provider.poison_status) status = provider.poison_status;
+    if (provider_poison_status()) status = provider_poison_status();
     else if (!provider.initialized || provider.shutting_down)
         status = STATUS_INVALID_HANDLE;
+    if (!status && binding->doorbell_generation != provider_mapping_generation())
+    {
+        /* Mutation may retire a formerly validated doorbell. Full-state replay
+         * must revalidate its backing, not trust a cached numeric address. */
+        status = refresh_execution_doorbell_locked( binding, params->suspend_doorbell );
+    }
     if (status)
     {
         params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
         params->provider_error = status;
-        binding->doorbell = NULL;
+        clear_execution_doorbell_locked( binding );
         pthread_mutex_unlock( &provider.mutex );
         return status;
     }
@@ -2664,11 +2786,12 @@ execute_again:
         status = fex_result_to_status( result );
         params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
         params->provider_error = result;
-        binding->doorbell = NULL;
+        clear_execution_doorbell_locked( binding );
         poison_provider_locked( status );
         pthread_mutex_unlock( &provider.mutex );
         return status;
     }
+execution_ready:
     record_flight_event( binding, XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN,
                          XTAJIT64_FLIGHT_REASON_NONE,
                          XTAJIT64_FLIGHT_UNKNOWN_U32,
@@ -2691,7 +2814,15 @@ execute_again:
         dispatch->process_instance = binding->process_instance;
         return STATUS_SUCCESS;
     }
-    else result = switchyard_fex_thread_execute_prepared( binding->thread, execution_generation, &stop );
+    else
+    {
+        /* Publish this stopped native window under the same execution owner.
+         * The SDK releases/wakes BEFORE the provider mutex is reacquired;
+         * syscall continuations still use the complete state below. */
+        window.gs_base = 0;
+        result = switchyard_fex_experiment_execute_export_window(
+            binding->thread, execution_generation, &stop, &window );
+    }
 
 execution_complete:
     __atomic_store_n( &active_signal_binding, NULL, __ATOMIC_RELEASE );
@@ -2702,23 +2833,30 @@ execution_complete:
                        binding->pause_generation == execution_generation;
     while (provider.mutating && provider.initialized)
         pthread_cond_wait( &provider.cond, &provider.mutex );
-    if (internal_suspend && provider.initialized && !provider.poison_status &&
+    if (internal_suspend && provider.initialized && !provider_poison_status() &&
+        binding->doorbell_generation != provider_mapping_generation())
+    {
+        status = refresh_execution_doorbell_locked( binding, params->suspend_doorbell );
+    }
+    if (!status && internal_suspend && provider.initialized && !provider_poison_status() &&
         !__atomic_load_n( (uint32_t *)(uintptr_t)binding->doorbell,
                           __ATOMIC_ACQUIRE ))
         goto execute_again;
 
-    if (provider.poison_status) status = provider.poison_status;
+    if (provider_poison_status()) status = provider_poison_status();
     else if (!provider.initialized || provider.shutting_down)
         status = STATUS_INVALID_HANDLE;
-    else if (result != SWITCHYARD_FEX_OK &&
+    else if (!status && result != SWITCHYARD_FEX_OK &&
              result != SWITCHYARD_FEX_ERROR_GUEST_FAULT)
         status = fex_result_to_status( result );
-    else if (stop.reason == SWITCHYARD_FEX_STOP_SYSCALL)
+    else if (!status && stop.reason == SWITCHYARD_FEX_STOP_SYSCALL)
     {
         status = resume_syscall_locked( binding, params, &stop, &result );
         if (!status) goto execute_again;
     }
-    else status = export_thread_register_window( binding, params );
+    else if (!status && dispatch) status = export_thread_register_window( binding, params );
+    /* The ordinary path already exported before releasing its generation.
+     * Detached/custom completion retains its original separate state export. */
 
     params->transition_target = 0;
     params->fault_address = 0;
@@ -2769,7 +2907,7 @@ execution_complete:
                          ((uint64_t)stop.trap_number << 24) |
                          ((uint64_t)stop.signal_code << 16) | stop.error_code,
                          params->context.rip );
-    binding->doorbell = NULL;
+    clear_execution_doorbell_locked( binding );
     pthread_mutex_unlock( &provider.mutex );
     return status;
 }
@@ -2847,7 +2985,7 @@ static NTSTATUS bind_direct_dispatch( void *args )
     if (!provider.initialized || provider.shutting_down ||
         binding->process_instance != provider.instance || !binding->thread)
         status = STATUS_INVALID_HANDLE;
-    else if (provider.poison_status) status = provider.poison_status;
+    else if (provider_poison_status()) status = provider_poison_status();
     else if (binding_is_active( binding )) status = STATUS_INVALID_DEVICE_STATE;
     else
     {
@@ -2955,7 +3093,7 @@ static NTSTATUS reconstruct_jit_fault( void *args )
 
     pthread_mutex_lock( &provider.mutex );
     binding->dispatch.generation = 0;
-    if (!provider.mutating) binding->doorbell = NULL;
+    if (!provider.mutating) clear_execution_doorbell_locked( binding );
     if (!status)
     {
         export_fex_state( &params->context, &state );

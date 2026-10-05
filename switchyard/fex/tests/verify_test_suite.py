@@ -13,13 +13,15 @@ EXPECTED = frozenset((
     "switchyard-fex-allocator", "switchyard-fex-allocator-fallback",
     "switchyard-fex-c-api",
     "switchyard-fex-register-window", "switchyard-fex-register-window-state",
+    "switchyard-fex-completion-window-state",
+    "switchyard-fex-native-gate-state",
 ))
 MAX_REPORT = 4 * 1024 * 1024
 
 
 def check_names(names):
     if len(names) != len(EXPECTED) or frozenset(names) != EXPECTED:
-        raise ValueError("FEX gate must contain exactly the 15 current tests")
+        raise ValueError("private native gate must contain exactly 17 tests")
 
 
 def check_plan(data):
@@ -55,7 +57,7 @@ def main():
         check_plan(data)
     else:
         check_results(data)
-    print("FEX " + sys.argv[1] + ": 15 exact tests, no skipped gate")
+    print("private native gate " + sys.argv[1] + ": 17 exact tests, no skipped gate")
 
 
 if __name__ == "__main__":

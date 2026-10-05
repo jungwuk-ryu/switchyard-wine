@@ -355,7 +355,13 @@ struct switchyard_fex_thread {
   uint64_t ExecutionExpectedHLTRip {};
   void (*Wake)(void*) {};
   void* WakeContext {};
+  // Unix-only attachment. No PE caller receives this storage or a writable
+  // address of any TLS/admission authority. Legacy APIs retain their contract.
+  pthread_t NativeGateOwner {};
+  switchyard_fex_native_gate NativeGate {};
 };
+static_assert(sizeof(switchyard_fex_native_gate) == SWITCHYARD_FEX_NATIVE_GATE_SIZE_V1 &&
+              offsetof(switchyard_fex_native_gate, mapping_epoch) == 16);
 
 // Private, single-consumption execution capability. It contains no owning C++
 // object or stack address and may outlive a detached generated invocation.
@@ -373,15 +379,18 @@ static_assert(std::is_trivially_copyable_v<ExecutionActivation> &&
 class StateAdmission {
   switchyard_fex_admission* Cell;
   uint64_t Token {};
+  int Acquired {};
 public:
-  explicit StateAdmission(switchyard_fex_thread* Thread) : Cell {&Thread->Admission} {
-    switchyard_fex_admission_acquire(Cell, false, &Token);
+  explicit StateAdmission(switchyard_fex_thread* Thread, bool Executing = false) : Cell {&Thread->Admission} {
+    Acquired = switchyard_fex_admission_acquire(Cell, Executing, &Token);
   }
   StateAdmission(const StateAdmission&) = delete;
   StateAdmission& operator=(const StateAdmission&) = delete;
   ~StateAdmission() { if (Token) switchyard_fex_admission_release(Cell, Token); }
   explicit operator bool() const { return Token != 0; }
-  void Detach() { Token = 0; } // Only immediately before deleting the removed owner.
+  int Acquisition() const { return Acquired; }
+  uint64_t Generation() const { return Token >> 3; }
+  void Detach() { Token = 0; } // Delete an owner, or transfer its exact execution capability.
 };
 
 // Process->Mutex pins membership for this entire scope. No waiter is needed:
@@ -537,6 +546,31 @@ static void __attribute__((noinline)) ExportGenericRegisterWindow(
   std::memcpy(Data + SWITCHYARD_FEX_WINDOW_XMM, XMM, sizeof(XMM));
 }
 
+// Caller owns either short state admission or the stopped execution generation.
+// No borrowed window or scope-bound activation escapes this conversion.
+static inline __attribute__((always_inline)) switchyard_fex_result ExportRegisterWindowUnlocked(
+    switchyard_fex_thread* Thread, const switchyard_fex_register_window* Window) {
+  auto* Data = reinterpret_cast<unsigned char*>(static_cast<uintptr_t>(Window->data));
+  uint32_t Flags;
+  try {
+    // Do not publish until every potentially throwing conversion has ended.
+    Flags = Thread->Process->Context->ReconstructCompactedEFLAGS(Thread->CoreThread, false, nullptr, 0);
+    if (!Thread->Process->SplitVectorState) ExportGenericRegisterWindow(Thread, Data);
+  } catch (...) {
+    return SWITCHYARD_FEX_ERROR_INTERNAL;
+  }
+  const auto& State = Thread->CoreThread->CurrentFrame->State;
+  for (size_t Index = 0; Index < 16; ++Index)
+    StoreWindow(Data, WindowGPROffsets[Index], State.gregs[Index]);
+  StoreWindow(Data, SWITCHYARD_FEX_WINDOW_RIP, State.rip);
+  StoreWindow(Data, SWITCHYARD_FEX_WINDOW_EFLAGS, static_cast<uint64_t>(Flags));
+  StoreWindow(Data, SWITCHYARD_FEX_WINDOW_MXCSR, State.mxcsr);
+  StoreWindow(Data, SWITCHYARD_FEX_WINDOW_RESERVED, uint32_t {0});
+  if (Thread->Process->SplitVectorState)
+    std::memcpy(Data + SWITCHYARD_FEX_WINDOW_XMM, State.xmm.sse.data, 256);
+  return SWITCHYARD_FEX_OK;
+}
+
 static switchyard_fex_result ExportStateUnlocked(
     switchyard_fex_thread* Thread, switchyard_fex_x64_state* Output) {
   try {
@@ -620,6 +654,26 @@ static bool FinishActiveExecution(const ExecutionActivation& Activation) {
   return true;
 }
 
+static inline __attribute__((always_inline)) switchyard_fex_result InitializeOwnedExecution(
+    const ExecutionActivation& AcquiredActivation, const switchyard_fex_execution* Execution,
+    ExecutionActivation& Activation) {
+  auto* const Thread = AcquiredActivation.Owner;
+  Thread->ExecutionExpectedHLTRip = Execution->expected_hlt_rip;
+  ActiveExecutionThread = Thread;
+  auto& Frame = *Thread->CoreThread->CurrentFrame;
+  Frame.ExternalSuspendDoorbell = Execution->suspend_doorbell;
+  Frame.ExternalStop = FEXCore::Core::ExternalStopReason::None;
+  std::memset(&Frame.SynchronousFaultData, 0, sizeof(Frame.SynchronousFaultData));
+  try {
+    FEXCore::Allocator::InitializeThread();
+  } catch (...) {
+    FinishActiveExecution(AcquiredActivation);
+    return SWITCHYARD_FEX_ERROR_INTERNAL;
+  }
+  Activation = AcquiredActivation;
+  return SWITCHYARD_FEX_OK;
+}
+
 static switchyard_fex_result BeginExecution(
     switchyard_fex_thread* Thread, const switchyard_fex_execution* Execution,
     ExecutionActivation& Activation) {
@@ -644,24 +698,12 @@ static switchyard_fex_result BeginExecution(
     return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
   }
   const ExecutionActivation AcquiredActivation {Thread, Token >> 3};
-  Thread->ExecutionExpectedHLTRip = Execution->expected_hlt_rip;
-  ActiveExecutionThread = Thread;
-  auto& Frame = *Thread->CoreThread->CurrentFrame;
-  Frame.ExternalSuspendDoorbell = Execution->suspend_doorbell;
-  Frame.ExternalStop = FEXCore::Core::ExternalStopReason::None;
-  std::memset(&Frame.SynchronousFaultData, 0, sizeof(Frame.SynchronousFaultData));
-  try {
-    FEXCore::Allocator::InitializeThread();
-  } catch (...) {
-    FinishActiveExecution(AcquiredActivation);
-    return SWITCHYARD_FEX_ERROR_INTERNAL;
-  }
-  Activation = AcquiredActivation;
-  return SWITCHYARD_FEX_OK;
+  return InitializeOwnedExecution(AcquiredActivation, Execution, Activation);
 }
 
 static switchyard_fex_result CompleteExecution(
-    const ExecutionActivation& Activation, switchyard_fex_stop* Stop) {
+    const ExecutionActivation& Activation, switchyard_fex_stop* Stop,
+    const switchyard_fex_register_window* Window = nullptr) {
   // Normalize a broken generated return before even accessing C++ TLS: Darwin
   // may implement thread-local access with a Mach-O runtime call. Opaque owner
   // lifetime is pinned by the caller throughout this private activation API.
@@ -703,6 +745,14 @@ static switchyard_fex_result CompleteExecution(
   } else {
     FillStop(Stop, SWITCHYARD_FEX_STOP_GUEST_FAULT, Thread->CoreThread);
     Result = SWITCHYARD_FEX_ERROR_GUEST_FAULT;
+  }
+  if (Window && (Result == SWITCHYARD_FEX_OK || Result == SWITCHYARD_FEX_ERROR_GUEST_FAULT) &&
+      Stop->reason != SWITCHYARD_FEX_STOP_SYSCALL) {
+    const auto Exported = ExportRegisterWindowUnlocked(Thread, Window);
+    if (Exported != SWITCHYARD_FEX_OK) {
+      FillStop(Stop, SWITCHYARD_FEX_STOP_INTERNAL, Thread->CoreThread);
+      Result = Exported;
+    }
   }
   if (!FinishActiveExecution(Activation)) {
     FillStop(Stop, SWITCHYARD_FEX_STOP_INTERNAL, Thread->CoreThread);
@@ -1096,6 +1146,7 @@ static switchyard_fex_result CreateAdapterThread(
   if (!Thread) {
     return SWITCHYARD_FEX_ERROR_NO_MEMORY;
   }
+  Thread->NativeGateOwner = pthread_self();
   if (Domain) {
     Thread->Wake = Domain->wake;
     Thread->WakeContext = Domain->context;
@@ -1270,12 +1321,8 @@ switchyard_fex_result switchyard_fex_thread_export_state(
   return ExportStateUnlocked(Thread, Output);
 }
 
-switchyard_fex_result switchyard_fex_thread_import_register_window(
+static inline __attribute__((always_inline)) switchyard_fex_result ImportRegisterWindowUnlocked(
     switchyard_fex_thread* Thread, const switchyard_fex_register_window* Window) {
-  const auto Result = ValidateRegisterWindow(Thread, Window, false);
-  if (Result != SWITCHYARD_FEX_OK) return Result;
-  StateAdmission Admission {Thread};
-  if (!Admission) return SWITCHYARD_FEX_ERROR_BUSY;
   const auto* Data = reinterpret_cast<const unsigned char*>(static_cast<uintptr_t>(Window->data));
   const auto Flags = LoadWindow<uint64_t>(Data, SWITCHYARD_FEX_WINDOW_EFLAGS);
   const auto MXCSR = LoadWindow<uint32_t>(Data, SWITCHYARD_FEX_WINDOW_MXCSR);
@@ -1310,31 +1357,54 @@ switchyard_fex_result switchyard_fex_thread_import_register_window(
   return SWITCHYARD_FEX_OK;
 }
 
+switchyard_fex_result switchyard_fex_thread_import_register_window(
+    switchyard_fex_thread* Thread, const switchyard_fex_register_window* Window) {
+  const auto Result = ValidateRegisterWindow(Thread, Window, false);
+  if (Result != SWITCHYARD_FEX_OK) return Result;
+  StateAdmission Admission {Thread};
+  if (!Admission) return SWITCHYARD_FEX_ERROR_BUSY;
+  return ImportRegisterWindowUnlocked(Thread, Window);
+}
+
+// Private experiment: one admission covers native-entry import and execution
+// reservation. No C++ activation or borrowed window survives this function.
+// Pre-publication failures are short state operations: release without wake.
+// As with prepare_execution, the external embedding holds its mutation mutex
+// here, then unlocks BEFORE execution/completion; correct external closure
+// cannot race this pre-publication interval.
+switchyard_fex_result switchyard_fex_experiment_prepare_native_window(
+    switchyard_fex_thread* Thread, const switchyard_fex_register_window* Window,
+    const switchyard_fex_execution* Execution, uint64_t* Generation) {
+  if (!Generation) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  const auto ValidWindow = ValidateRegisterWindow(Thread, Window, false);
+  if (ValidWindow != SWITCHYARD_FEX_OK) return ValidWindow;
+  if (!Execution || Execution->size < sizeof(*Execution))
+    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  if (Execution->version != SWITCHYARD_FEX_EXECUTION_VERSION)
+    return SWITCHYARD_FEX_ERROR_ABI_MISMATCH;
+  if (!ValidExecution(Execution)) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  if (ActiveExecutionThread) return SWITCHYARD_FEX_ERROR_BUSY;
+  StateAdmission Admission {Thread, true};
+  if (!Admission) return Admission.Acquisition() < 0 ? SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT : SWITCHYARD_FEX_ERROR_BUSY;
+  const auto Imported = ImportRegisterWindowUnlocked(Thread, Window);
+  if (Imported != SWITCHYARD_FEX_OK) return Imported;
+  const ExecutionActivation Acquired {Thread, Admission.Generation()};
+  // Transfer exact-generation ownership, never hold a scope-bound state lease
+  // across the execution or release it a second time in this destructor.
+  Admission.Detach();
+  ExecutionActivation Activation;
+  const auto Prepared = InitializeOwnedExecution(Acquired, Execution, Activation);
+  if (Prepared == SWITCHYARD_FEX_OK) *Generation = Activation.Generation;
+  return Prepared;
+}
+
 switchyard_fex_result switchyard_fex_thread_export_register_window(
     switchyard_fex_thread* Thread, const switchyard_fex_register_window* Window) {
   const auto Result = ValidateRegisterWindow(Thread, Window, true);
   if (Result != SWITCHYARD_FEX_OK) return Result;
   StateAdmission Admission {Thread};
   if (!Admission || !Thread->StateValid) return SWITCHYARD_FEX_ERROR_BUSY;
-  auto* Data = reinterpret_cast<unsigned char*>(static_cast<uintptr_t>(Window->data));
-  uint32_t Flags;
-  try {
-    // No output publication until every potentially throwing conversion ends.
-    Flags = Thread->Process->Context->ReconstructCompactedEFLAGS(Thread->CoreThread, false, nullptr, 0);
-    if (!Thread->Process->SplitVectorState) ExportGenericRegisterWindow(Thread, Data);
-  } catch (...) {
-    return SWITCHYARD_FEX_ERROR_INTERNAL;
-  }
-  const auto& State = Thread->CoreThread->CurrentFrame->State;
-  for (size_t Index = 0; Index < 16; ++Index)
-    StoreWindow(Data, WindowGPROffsets[Index], State.gregs[Index]);
-  StoreWindow(Data, SWITCHYARD_FEX_WINDOW_RIP, State.rip);
-  StoreWindow(Data, SWITCHYARD_FEX_WINDOW_EFLAGS, static_cast<uint64_t>(Flags));
-  StoreWindow(Data, SWITCHYARD_FEX_WINDOW_MXCSR, State.mxcsr);
-  StoreWindow(Data, SWITCHYARD_FEX_WINDOW_RESERVED, uint32_t {0});
-  if (Thread->Process->SplitVectorState)
-    std::memcpy(Data + SWITCHYARD_FEX_WINDOW_XMM, State.xmm.sse.data, 256);
-  return SWITCHYARD_FEX_OK;
+  return ExportRegisterWindowUnlocked(Thread, Window);
 }
 
 switchyard_fex_result switchyard_fex_thread_prepare_execution(
@@ -1364,6 +1434,142 @@ switchyard_fex_result switchyard_fex_thread_execute_prepared(
     return SWITCHYARD_FEX_ERROR_INTERNAL;
   }
   return CompleteExecution(Activation, Stop);
+}
+
+static bool ObjectOverlap(uintptr_t Left, size_t LeftSize, uintptr_t Right, size_t RightSize) {
+  return Left >= Right ? Left - Right < RightSize : Right - Left < LeftSize;
+}
+
+static switchyard_fex_result ValidateCompletionWindow(
+    switchyard_fex_thread* Thread, switchyard_fex_stop* Stop,
+    const switchyard_fex_register_window* Window) {
+  if (!Stop || (reinterpret_cast<uintptr_t>(Stop) & (alignof(switchyard_fex_stop) - 1)) ||
+      Stop->size < sizeof(*Stop)) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  if (Stop->version != SWITCHYARD_FEX_STOP_VERSION) return SWITCHYARD_FEX_ERROR_ABI_MISMATCH;
+  const auto Result = ValidateRegisterWindow(Thread, Window, true);
+  if (Result != SWITCHYARD_FEX_OK) return Result;
+  const auto Pointer = reinterpret_cast<uintptr_t>(Stop);
+  if (WindowOverlaps(static_cast<uintptr_t>(Window->data), Pointer, sizeof(*Stop)) ||
+      ObjectOverlap(Pointer, sizeof(*Stop), reinterpret_cast<uintptr_t>(Window), sizeof(*Window)) ||
+      ObjectOverlap(Pointer, sizeof(*Stop), reinterpret_cast<uintptr_t>(Thread), sizeof(*Thread)) ||
+      ObjectOverlap(Pointer, sizeof(*Stop), reinterpret_cast<uintptr_t>(Thread->Process), sizeof(*Thread->Process)) ||
+      ObjectOverlap(Pointer, sizeof(*Stop), reinterpret_cast<uintptr_t>(Thread->CoreThread), sizeof(*Thread->CoreThread)) ||
+      ObjectOverlap(Pointer, sizeof(*Stop), reinterpret_cast<uintptr_t>(Thread->CoreThread->CurrentFrame),
+                    sizeof(*Thread->CoreThread->CurrentFrame)))
+    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  return SWITCHYARD_FEX_OK;
+}
+
+switchyard_fex_result switchyard_fex_experiment_execute_export_window(
+    switchyard_fex_thread* Thread, uint64_t Generation,
+    switchyard_fex_stop* Stop, const switchyard_fex_register_window* Window) {
+  const auto Valid = ValidateCompletionWindow(Thread, Stop, Window);
+  if (Valid != SWITCHYARD_FEX_OK) return Valid;
+  const ExecutionActivation Activation {Thread, Generation};
+  if (!OwnsExecution(Activation) || !Thread->StateValid) return SWITCHYARD_FEX_ERROR_BUSY;
+  // The descriptor is borrowed only at entry; generated execution cannot
+  // change the authenticated output span used during stopped-state export.
+  const auto Output = *Window;
+  try {
+    Thread->Process->Context->ExecuteThread(Thread->CoreThread);
+  } catch (...) {
+    FillStop(Stop, SWITCHYARD_FEX_STOP_INTERNAL, Thread->CoreThread);
+    FinishActiveExecution(Activation);
+    return SWITCHYARD_FEX_ERROR_INTERNAL;
+  }
+  return CompleteExecution(Activation, Stop, &Output);
+}
+
+switchyard_fex_result switchyard_fex_experiment_bind_native_gate(
+    switchyard_fex_thread* Thread, const switchyard_fex_native_gate* Gate) {
+  if (!Thread || !Thread->Process || !Thread->CoreThread || !Gate ||
+      (reinterpret_cast<uintptr_t>(Gate) & (alignof(switchyard_fex_native_gate) - 1)) ||
+      Gate->size != sizeof(*Gate)) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  if (!pthread_equal(Thread->NativeGateOwner, pthread_self())) return SWITCHYARD_FEX_ERROR_BUSY;
+  if (Gate->version != SWITCHYARD_FEX_NATIVE_GATE_VERSION) return SWITCHYARD_FEX_ERROR_ABI_MISMATCH;
+  if (!Thread->Process->ExternalAdmission || Thread->Process->CustomDispatchEnabled)
+    return SWITCHYARD_FEX_ERROR_UNSUPPORTED;
+  if (Gate->flags || Gate->reserved || !Gate->expected_epoch || !Gate->gs_base ||
+      !Gate->mapping_epoch || (Gate->mapping_epoch & (alignof(uint64_t) - 1)) ||
+      Gate->mapping_epoch > std::numeric_limits<uintptr_t>::max() - (sizeof(uint64_t) - 1) ||
+      !Gate->suspend_doorbell || (Gate->suspend_doorbell & (alignof(uint32_t) - 1)) ||
+      Gate->suspend_doorbell > std::numeric_limits<uintptr_t>::max() - (sizeof(uint32_t) - 1))
+    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  if (ActiveExecutionThread) return SWITCHYARD_FEX_ERROR_BUSY;
+  StateAdmission Admission {Thread};
+  if (!Admission) return SWITCHYARD_FEX_ERROR_BUSY;
+  const auto* Epoch = reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(Gate->mapping_epoch));
+  if (__atomic_load_n(Epoch, __ATOMIC_ACQUIRE) != Gate->expected_epoch)
+    return SWITCHYARD_FEX_ERROR_UNSUPPORTED;
+  Thread->NativeGate = *Gate;
+  return SWITCHYARD_FEX_OK;
+}
+
+switchyard_fex_result switchyard_fex_experiment_execute_native_gate(
+    switchyard_fex_thread* Thread, const switchyard_fex_register_window* Window,
+    switchyard_fex_stop* Stop) {
+  if (!Thread || !Thread->Process || !Thread->CoreThread) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  // Authenticate the real host owner before touching its cell or signal TLS.
+  if (!pthread_equal(Thread->NativeGateOwner, pthread_self())) return SWITCHYARD_FEX_ERROR_BUSY;
+  const auto& Gate = Thread->NativeGate;
+  if (!Gate.expected_epoch) return SWITCHYARD_FEX_ERROR_UNSUPPORTED;
+  const auto Valid = ValidateRegisterWindow(Thread, Window, false);
+  if (Valid != SWITCHYARD_FEX_OK) return Valid;
+  if (Window->gs_base != Gate.gs_base) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  auto Output = *Window;
+  Output.gs_base = 0;
+  // Validate against the caller's descriptor as well as the private copy:
+  // the output may not overwrite either it or gate ownership storage.
+  if (!Stop || (reinterpret_cast<uintptr_t>(Stop) & (alignof(switchyard_fex_stop) - 1)) ||
+      ObjectOverlap(reinterpret_cast<uintptr_t>(Stop), sizeof(*Stop),
+                    reinterpret_cast<uintptr_t>(Window), sizeof(*Window)))
+    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  const auto Completion = ValidateCompletionWindow(Thread, Stop, &Output);
+  if (Completion != SWITCHYARD_FEX_OK) return Completion;
+  const auto Data = static_cast<uintptr_t>(Window->data);
+  const auto StopPointer = reinterpret_cast<uintptr_t>(Stop);
+  const auto EpochPointer = static_cast<uintptr_t>(Gate.mapping_epoch);
+  const auto DoorbellPointer = static_cast<uintptr_t>(Gate.suspend_doorbell);
+  if (WindowOverlaps(Data, EpochPointer, sizeof(uint64_t)) ||
+      WindowOverlaps(Data, DoorbellPointer, sizeof(uint32_t)) ||
+      ObjectOverlap(StopPointer, sizeof(*Stop), EpochPointer, sizeof(uint64_t)) ||
+      ObjectOverlap(StopPointer, sizeof(*Stop), DoorbellPointer, sizeof(uint32_t)))
+    return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  if (ActiveExecutionThread) return SWITCHYARD_FEX_ERROR_BUSY;
+  uint64_t Token {};
+  const int Acquired = switchyard_fex_admission_acquire(&Thread->Admission, true, &Token);
+  if (!Acquired) return SWITCHYARD_FEX_ERROR_BUSY;
+  if (Acquired < 0) return SWITCHYARD_FEX_ERROR_INVALID_ARGUMENT;
+  const ExecutionActivation Activation {Thread, Token >> 3};
+  // Every acquired fast reservation must release+wake, even before import:
+  // unlike the legacy prepare API, the embedding mutex is not held here.
+  ActiveExecutionThread = Thread;
+#ifdef SWITCHYARD_FEX_NATIVE_GATE_TEST
+  switchyard_fex_native_gate_acquired_test(Thread);
+#endif
+  const auto* Epoch = reinterpret_cast<const uint64_t*>(EpochPointer);
+  if (__atomic_load_n(Epoch, __ATOMIC_ACQUIRE) != Gate.expected_epoch) {
+    FinishActiveExecution(Activation);
+    return SWITCHYARD_FEX_ERROR_UNSUPPORTED;
+  }
+  const auto Imported = ImportRegisterWindowUnlocked(Thread, Window);
+  if (Imported != SWITCHYARD_FEX_OK) {
+    FinishActiveExecution(Activation);
+    return Imported;
+  }
+  const switchyard_fex_execution Execution {
+    sizeof(switchyard_fex_execution), SWITCHYARD_FEX_EXECUTION_VERSION, 0, 0, 0, Gate.suspend_doorbell};
+  ExecutionActivation Initialized;
+  const auto Prepared = InitializeOwnedExecution(Activation, &Execution, Initialized);
+  if (Prepared != SWITCHYARD_FEX_OK) return Prepared;
+  try {
+    Thread->Process->Context->ExecuteThread(Thread->CoreThread);
+  } catch (...) {
+    FillStop(Stop, SWITCHYARD_FEX_STOP_INTERNAL, Thread->CoreThread);
+    FinishActiveExecution(Activation);
+    return SWITCHYARD_FEX_ERROR_INTERNAL;
+  }
+  return CompleteExecution(Activation, Stop, &Output);
 }
 
 switchyard_fex_result switchyard_fex_thread_execute(
