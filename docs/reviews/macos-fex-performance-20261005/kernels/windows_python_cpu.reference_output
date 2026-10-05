@@ -1,0 +1,12 @@
+SWITCHYARD_WINDOWS_PYTHON_CPU_V1
+python=3.13.13
+integer_iterations=1000000
+compression_rounds=4
+blob_bytes=131072
+integer_result=9866a6dfd84e9fac
+zlib_total=524472
+bz2_total=528202
+lzma_total=524560
+compression_digest=c7a9d5fab12e68dbb3c2b28bc17edcbbca5d7beca889b4d931c816a05b86fc60
+final_digest=9968e93e41b0131f96e79700769c6b12361fe19325862ebafec457bb26c03f20
+exit 0

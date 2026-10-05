@@ -1406,6 +1406,17 @@
   "measured_primary_dirty_digest": "bdc894daa950af7481eda6734131711bad658831f82ed156216f4ffe7434dfcd",
   "patch_whitespace": "Existing unified-diff context blank lines and copied upstream license text retained byte-for-byte; all newly exported code passes diff --check.",
   "production_promoted": false,
+  "program_hashes": {
+    "windows_python_exe": "7d984ee02e70c22f04d5e26f1328865d75a5da14b677890896a294f35815d37a",
+    "windows_python313_dll": "aeae90afd246a75ff9af4e8b971a2286de6320bc32e7022943017a7e483a95e8",
+    "windows_python_cpu_script": "14a65215cb403ecb971cdd3f55843b9f5a61fc4c547cdeb670ea4ec9007e2090",
+    "windows_python_cpu_reference": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+    "llvm_bullet_pe": "7bc02482f55361a6f1b71c3265a20faf8f214f75d07ae2fb5f42ac41def12906",
+    "llvm_fhourstones_pe": "1f57b0537dbfa53455252a2035d318c06923af15cbecd4a8ac9bd321168a9880",
+    "llvm_tsvc_pe": "b40066c80b8342ecc0ad02b5c905d59964b7fd72a7bd1600c8d7e344384c1244",
+    "same_byte_pe": "d6b88f4a4047fad2ae62cf28a7a783e3e854f3b98a83ea4518fade950254c24d",
+    "same_byte_payload": "f636037ed5e7ca9652441b41c7ebf6a4ff7010beb95c9dd653a2d2c27f6d1cbc"
+  },
   "review_only": true,
   "runtime_hashes": {
     "baseline_library": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99",
