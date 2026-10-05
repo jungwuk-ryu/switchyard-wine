@@ -25,6 +25,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winnt.h"
+#include "arm64ec_guest_flags.h"
 
 #if defined(__aarch64__) || defined(__arm64ec__)
 
@@ -76,50 +77,29 @@ static inline UINT cpsr_to_eflags( UINT cpsr )
 
 static inline UINT64 mxcsr_to_fpcsr( UINT mxcsr )
 {
-    UINT fpcr = 0, fpsr = 0;
+    UINT fpcr, fpsr, swap;
 
-    if (mxcsr & 0x0001) fpsr |= 0x0001;    /* invalid operation */
-    if (mxcsr & 0x0002) fpsr |= 0x0080;    /* denormal */
-    if (mxcsr & 0x0004) fpsr |= 0x0002;    /* zero-divide */
-    if (mxcsr & 0x0008) fpsr |= 0x0004;    /* overflow */
-    if (mxcsr & 0x0010) fpsr |= 0x0008;    /* underflow */
-    if (mxcsr & 0x0020) fpsr |= 0x0010;    /* precision */
-
-    if (mxcsr & 0x0040)    fpcr |= 0x80000;   /* denormals are zero */
-    if (!(mxcsr & 0x0080)) fpcr |= 0x0100;    /* invalid operation mask */
-    if (!(mxcsr & 0x0100)) fpcr |= 0x8000;    /* denormal mask */
-    if (!(mxcsr & 0x0200)) fpcr |= 0x0200;    /* zero-divide mask */
-    if (!(mxcsr & 0x0400)) fpcr |= 0x0400;    /* overflow mask */
-    if (!(mxcsr & 0x0800)) fpcr |= 0x0800;    /* underflow mask */
-    if (!(mxcsr & 0x1000)) fpcr |= 0x1000;    /* precision mask */
-    if (mxcsr & 0x2000)    fpcr |= 0x800000;  /* round down */
-    if (mxcsr & 0x4000)    fpcr |= 0x400000;  /* round up */
-    if (mxcsr & 0x8000)    fpcr |= 0x1000000; /* flush to zero */
+    /* The four adjacent status bits all move by one bit. */
+    fpsr = (mxcsr & 0x0001) | ((mxcsr & 0x0002) << 6) | ((mxcsr & 0x003c) >> 1);
+    /* Swap the two rounding bits; FTZ is adjacent after the common shift. */
+    swap = (mxcsr ^ (mxcsr >> 1)) & 0x2000;
+    fpcr = ((mxcsr ^ swap ^ (swap << 1)) & 0xe000) << 9;
+    fpcr |= (mxcsr & 0x1e00) | ((mxcsr & 0x0080) << 1) |
+            ((mxcsr & 0x0100) << 7) | ((mxcsr & 0x0040) << 13);
+    fpcr ^= 0x9f00;
     return fpcr | ((UINT64)fpsr << 32);
 }
 
 static inline UINT fpcsr_to_mxcsr( UINT fpcr, UINT fpsr )
 {
-    UINT ret = 0;
+    UINT ret, swap;
 
-    if (fpsr & 0x0001) ret |= 0x0001;      /* invalid operation */
-    if (fpsr & 0x0002) ret |= 0x0004;      /* zero-divide */
-    if (fpsr & 0x0004) ret |= 0x0008;      /* overflow */
-    if (fpsr & 0x0008) ret |= 0x0010;      /* underflow */
-    if (fpsr & 0x0010) ret |= 0x0020;      /* precision */
-    if (fpsr & 0x0080) ret |= 0x0002;      /* denormal */
-
-    if (fpcr & 0x0080000)    ret |= 0x0040;   /* denormals are zero */
-    if (!(fpcr & 0x0000100)) ret |= 0x0080;   /* invalid operation mask */
-    if (!(fpcr & 0x0000200)) ret |= 0x0200;   /* zero-divide mask */
-    if (!(fpcr & 0x0000400)) ret |= 0x0400;   /* overflow mask */
-    if (!(fpcr & 0x0000800)) ret |= 0x0800;   /* underflow mask */
-    if (!(fpcr & 0x0001000)) ret |= 0x1000;   /* precision mask */
-    if (!(fpcr & 0x0008000)) ret |= 0x0100;   /* denormal mask */
-    if (fpcr & 0x0400000)    ret |= 0x4000;   /* round up */
-    if (fpcr & 0x0800000)    ret |= 0x2000;   /* round down */
-    if (fpcr & 0x1000000)    ret |= 0x8000;   /* flush to zero */
-    return ret;
+    ret = (fpsr & 0x0001) | ((fpsr & 0x001e) << 1) | ((fpsr & 0x0080) >> 6);
+    swap = (fpcr ^ (fpcr >> 1)) & 0x400000;
+    ret |= ((fpcr ^ swap ^ (swap << 1)) & 0x1c00000) >> 9;
+    ret |= (fpcr & 0x1e00) | ((fpcr & 0x0100) >> 1) |
+           ((fpcr & 0x8000) >> 7) | ((fpcr & 0x0080000) >> 13);
+    return ret ^ 0x1f80;
 }
 
 static inline void context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_NT_CONTEXT *ec_ctx )
@@ -176,6 +156,8 @@ static inline void context_x64_to_arm_guest_return( ARM64_NT_CONTEXT *arm_ctx,
 {
     context_x64_to_arm( arm_ctx, ec_ctx );
     arm_ctx->ContextFlags |= CONTEXT_ARM64_RET_TO_GUEST;
+    if (ec_ctx->ContextFlags & 1)  /* CONTEXT_CONTROL */
+        arm_ctx->ContextFlags |= arm64ec_guest_flags_to_context( ec_ctx->AMD64_EFlags );
 }
 
 static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_NT_CONTEXT *arm_ctx )
@@ -188,7 +170,8 @@ static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_N
     ec_ctx->AMD64_SegFs  = 0x53;
     ec_ctx->AMD64_SegGs  = 0x2b;
     ec_ctx->AMD64_SegSs  = 0x2b;
-    ec_ctx->AMD64_EFlags = cpsr_to_eflags( arm_ctx->Cpsr );
+    ec_ctx->AMD64_EFlags = cpsr_to_eflags( arm_ctx->Cpsr ) |
+                         arm64ec_guest_flags_from_context( arm_ctx->ContextFlags );
     ec_ctx->AMD64_MxCsr  = ec_ctx->AMD64_MxCsr_copy = fpcsr_to_mxcsr( arm_ctx->Fpcr, arm_ctx->Fpsr );
 
     ec_ctx->X8    = arm_ctx->X8;

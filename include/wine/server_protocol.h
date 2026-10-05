@@ -131,7 +131,7 @@ struct context_data
         struct { unsigned __int64 rip, rsp;
                  unsigned int cs, ss, flags, __pad; } x86_64_regs;
         struct { unsigned int sp, lr, pc, cpsr; } arm_regs;
-        struct { unsigned __int64 sp, pc, pstate; } arm64_regs;
+        struct { unsigned __int64 sp, pc, pstate; unsigned int context_flags, __pad; } arm64_regs;
     } ctl;
     union
     {
@@ -7494,6 +7494,6 @@ union generic_reply
     struct complete_new_thread_reply complete_new_thread_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 967
+#define SERVER_PROTOCOL_VERSION 968
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -54,11 +54,17 @@ fi
 "$ROOT_DIR/switchyard/verify_font_assets.sh"
 "$ROOT_DIR/switchyard/verify_tls_packages.sh"
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/switchyard/tests/fex_build_contract_test.py"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/switchyard/tests/runtime_diagnostics_test.py"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
   "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_low_guest_dispatch.py" \
   "$ROOT_DIR/dlls/ntdll/signal_arm64ec.c" \
   "$ROOT_DIR/include/wine/low_va.h"
 "$ROOT_DIR/dlls/ntdll/tests/run_arm64ec_low_guest_decode.sh"
 "$ROOT_DIR/dlls/ntdll/tests/run_arm64ec_emulation_dispatch.sh"
+bash "$ROOT_DIR/dlls/ntdll/tests/run_arm64ec_guest_flags.sh"
+bash "$ROOT_DIR/dlls/ntdll/tests/run_arm64ec_fp_mapping.sh"
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
   "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_emulation_dispatch.py" \
   "$ROOT_DIR/dlls/ntdll/unix/signal_arm64.c" \
@@ -96,6 +102,7 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
 "$ROOT_DIR/switchyard/tests/provider_source_models_test.sh"
 "$ROOT_DIR/switchyard/tests/arm64x_leaf_thunk_patch_test.sh"
 "$ROOT_DIR/switchyard/tests/darwin_arm64_x18_availability_source_test.sh"
+/bin/bash "$ROOT_DIR/switchyard/tests/darwin_x18_pfz_entry_test.sh"
 "$ROOT_DIR/switchyard/tests/darwin_arm64_private_valloc_wx_source_test.sh"
 "$ROOT_DIR/switchyard/tests/swdbg_experiment_test.sh"
 

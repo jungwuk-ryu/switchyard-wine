@@ -5,6 +5,99 @@
 # only stages the pinned DXMT input, emits their frozen manifest contracts, and
 # composes the validators at the final packaging boundary.
 
+switchyard_emit_native_fex_provider_manifest() {
+  [ "$#" -eq 1 ] || return 2
+  local runtime_root="$1" digest_helper payload_digest
+
+  digest_helper="$(switchyard_native_cpu_provider_content_digest_helper)" || return 1
+  switchyard_validate_fex_development_sdk \
+    "$runtime_root/$SWITCHYARD_NATIVE_FEX_ROOT" || return 1
+  payload_digest="$(/usr/bin/python3 -I "$digest_helper" digest \
+    "$runtime_root/$SWITCHYARD_NATIVE_FEX_ROOT")" || return 1
+  /usr/bin/python3 -I - "$runtime_root" "$payload_digest" \
+    "$SWITCHYARD_FEX_VERSION" "$SWITCHYARD_FEX_SOURCE_REPOSITORY" \
+    "$SWITCHYARD_FEX_SOURCE_REVISION" "$SWITCHYARD_FEX_SOURCE_PATCH_SHA256" \
+    "$SWITCHYARD_FEX_SOURCE_DEPS_SHA256" "$SWITCHYARD_FEX_ADAPTER_SHA256" \
+    "$SWITCHYARD_FEX_TOOLCHAIN_SHA256" "$SWITCHYARD_FEX_PROVIDER_IDENTITY" \
+    "$SWITCHYARD_FEX_BUILD_CONTRACT_VERSION" \
+    "$SWITCHYARD_FEX_DEVELOPMENT_CACHE_DIGEST" \
+    "$SWITCHYARD_FEX_IMMUTABLE_PAYLOAD_DIGEST" \
+    "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" \
+    "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" \
+    "$SWITCHYARD_NATIVE_FEX_ROOT" "$SWITCHYARD_NATIVE_FEX_LIBRARY" \
+    "$SWITCHYARD_NATIVE_FEX_SOURCE_PATCH" "$SWITCHYARD_NATIVE_FEX_RPATH" \
+    "$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY" \
+    "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+(root, payload, version, repository, revision, patch, deps, adapter, toolchain,
+ identity, contract, development, immutable, process_version, process_identity,
+ package, library, source_patch, rpath, unix, pe) = sys.argv[1:]
+
+def digest(relative):
+    path = os.path.join(root, relative)
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 512 * 1024 * 1024:
+        raise SystemExit("unsafe FEX manifest component: " + relative)
+    value = hashlib.sha256()
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    descriptor = os.open(path, flags)
+    identity = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_nlink,
+                             item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if identity(opened) != identity(info):
+            raise SystemExit("FEX manifest component changed while opening: " + relative)
+        remaining = opened.st_size
+        while remaining:
+            block = stream.read(min(1024 * 1024, remaining))
+            if not block:
+                raise SystemExit("FEX manifest component ended early: " + relative)
+            value.update(block)
+            remaining -= len(block)
+        if (stream.read(1) or identity(os.fstat(stream.fileno())) != identity(opened)
+                or identity(os.lstat(path)) != identity(opened)):
+            raise SystemExit("FEX manifest component changed while hashing: " + relative)
+    return value.hexdigest()
+
+json.dump({
+    "implementation": "switchyard-fex",
+    "version": version,
+    "sourceRepository": repository,
+    "sourceRevision": revision,
+    "sourcePatch": {"path": source_patch, "sha256": patch},
+    "sourceDepsSha256": deps,
+    "switchyardAdapterSha256": adapter,
+    "toolchainSha256": toolchain,
+    "providerIdentity": identity,
+    "processABIVersion": int(process_version),
+    "processABIIdentity": process_identity,
+    "arm64ecRegisterABI": True,
+    "buildContractVersion": int(contract),
+    "hostArchitecture": "arm64",
+    "kuserSharedDataModel": "translated-shadow",
+    "emulatedArchitectures": ["x86_64"],
+    "developmentCacheDigest": development,
+    "immutablePayloadDigest": immutable,
+    "runtimeRoot": package,
+    "runtimePayloadDigest": payload,
+    "library": library,
+    "librarySha256": digest(library),
+    "providerUnixLibraries": [unix],
+    "components": [{"guestArchitecture": "x86_64", "unixLibrary": unix,
+                    "unixLibrarySha256": digest(unix), "peLibrary": pe,
+                    "peLibrarySha256": digest(pe)}],
+    "runtimeRpath": rpath,
+    "manifest": package + "/switchyard-fex-runtime.json",
+}, sys.stdout, indent=2, sort_keys=True)
+print()
+PY
+}
+
 switchyard_native_arm64_require_packaging_contract() {
   [ "${SWITCHYARD_DXMT_SOURCE_REPOSITORY:-}" = \
       "https://github.com/3Shain/dxmt.git" ] &&
@@ -1547,7 +1640,6 @@ ENTRY_PATHS = [
     "bin/wine.switchyard-real",
 ]
 PROVIDER_COMPONENTS = [
-    ("i386", "lib/wine/aarch64-unix/xtajit.so", "lib/wine/aarch64-windows/xtajit.dll"),
     ("x86_64", "lib/wine/aarch64-unix/xtajit64.so", "lib/wine/aarch64-windows/xtajit64.dll"),
 ]
 AUDITED_PATHS = [
@@ -1564,11 +1656,11 @@ EXPECTED_ENTITLEMENTS = {
     "com.apple.security.cs.allow-unsigned-executable-memory": True,
     "com.apple.security.custom-x18-abi-toggle": True,
 }
-NESTED_UNICORN_FIELDS = {
-    "version", "sourceRepository", "sourceRevision", "buildContractVersion",
-    "enabledArchitectures", "hostArchitecture", "minimumMacOS", "library",
-    "librarySha256", "sourceArchive", "sourceArchiveSha256", "sourcePatch",
-    "license",
+NESTED_FEX_FIELDS = {
+    "arm64ecRegisterABI", "sourceRepository", "sourceRevision",
+    "buildContractVersion", "hostArchitecture", "minimumMacOS", "library",
+    "librarySha256", "sourcePatch", "switchyardAdapterSha256", "toolchainSha256",
+    "providerIdentity",
 }
 CONTENT_COMPONENTS = (
     ("gstreamerRuntime", "lib/switchyard-gstreamer", False, "gstreamer-marker"),
@@ -1788,15 +1880,15 @@ try:
     if provider.get("kuserSharedDataModel") != "translated-shadow":
         fail("CPU-provider KUSER_SHARED_DATA model is not translated-shadow")
     if (
-        provider.get("runtimeRoot") != "lib/switchyard-unicorn"
+        provider.get("runtimeRoot") != "lib/switchyard-fex"
         or provider.get("library")
-        != "lib/switchyard-unicorn/lib/libunicorn.2.dylib"
+        != "lib/switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib"
         or provider.get("manifest")
-        != "lib/switchyard-unicorn/switchyard-unicorn-runtime.json"
+        != "lib/switchyard-fex/switchyard-fex-runtime.json"
     ):
         fail("CPU-provider runtime paths are not the exact allowlist")
     if type(integrity) is not dict or set(integrity) != {
-        "wineUnixSha256", "i386NtdllSha256", "x86_64NtdllSha256"
+        "wineUnixSha256", "aarch64NtdllSha256", "x86_64NtdllSha256"
     }:
         fail("runtime integrity schema is not exact")
 
@@ -1904,7 +1996,7 @@ try:
     signing["mode"] = entry_modes[0]
 
     integrity["wineUnixSha256"] = digest("lib/wine/aarch64-unix/wine")
-    integrity["i386NtdllSha256"] = digest("lib/wine/i386-windows/ntdll.dll")
+    integrity["aarch64NtdllSha256"] = digest("lib/wine/aarch64-windows/ntdll.dll")
     integrity["x86_64NtdllSha256"] = digest("lib/wine/x86_64-windows/ntdll.dll")
 
     components = provider.get("components")
@@ -1928,9 +2020,9 @@ try:
         component["unixLibrarySha256"] = digest(component["unixLibrary"])
         component["peLibrarySha256"] = digest(component["peLibrary"])
 
-    unicorn_relative = provider.get("library")
-    unicorn_digest = digest(unicorn_relative)
-    provider["librarySha256"] = unicorn_digest
+    fex_relative = provider.get("library")
+    fex_digest = digest(fex_relative)
+    provider["librarySha256"] = fex_digest
     nested_relative = provider.get("manifest")
     nested_data, nested_info = read_file(nested_relative, MAX_MANIFEST)
     try:
@@ -1940,21 +2032,21 @@ try:
             parse_constant=lambda item: fail("non-standard nested JSON constant: " + item),
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail("cannot parse nested Unicorn manifest: " + str(error))
-    if type(nested) is not dict or set(nested) != NESTED_UNICORN_FIELDS:
-        fail("nested Unicorn manifest schema is not exact")
-    if nested.get("librarySha256") == unicorn_digest:
+        fail("cannot parse nested FEX manifest: " + str(error))
+    if type(nested) is not dict or set(nested) != NESTED_FEX_FIELDS:
+        fail("nested FEX manifest schema is not exact")
+    if nested.get("librarySha256") == fex_digest:
         # Keep the pinned package manifest byte-for-byte when signing did not
-        # change the Unicorn dylib.  Re-serializing an otherwise unchanged
+        # change the FEX dylib.  Re-serializing an otherwise unchanged
         # manifest would alter its compact array formatting, needlessly change
         # the package content identity, and turn an engineering refresh into a
         # signed-package mutation.
         new_nested_data = nested_data
     else:
-        nested["librarySha256"] = unicorn_digest
+        nested["librarySha256"] = fex_digest
         new_nested_data = json_bytes(nested)
     if len(new_nested_data) > MAX_MANIFEST:
-        fail("nested Unicorn manifest exceeds its size bound")
+        fail("nested FEX manifest exceeds its size bound")
 
     audited = policy.get("auditedModules")
     if type(audited) is not list or len(audited) != len(AUDITED_PATHS):
@@ -2068,7 +2160,7 @@ try:
     if stat.S_IMODE(os.fstat(stage_fd).st_mode) != 0o700:
         fail("refresh staging directory mode is unsafe")
 
-    package_copy = os.path.join(root_name, stage_name, "unicorn-package")
+    package_copy = os.path.join(root_name, stage_name, "fex-package")
     package_source = os.path.join(root_name, provider.get("runtimeRoot"))
     shutil.copytree(package_source, package_copy, symlinks=True, copy_function=shutil.copy2)
     nested_copy = os.path.join(package_copy, os.path.relpath(nested_relative, provider["runtimeRoot"]))
@@ -2084,12 +2176,12 @@ try:
     if marker.returncode or SHA256.fullmatch(marker.stdout.strip()) is None:
         if marker.stderr:
             sys.stderr.write(marker.stderr)
-        fail("cannot produce refreshed nested Unicorn payload digest")
+        fail("cannot produce refreshed nested FEX payload digest")
     provider["runtimePayloadDigest"] = marker.stdout.strip()
     with open(os.path.join(package_copy, ".switchyard-content-sha256"), "rb") as stream:
-        new_unicorn_marker = stream.read(66)
-    if new_unicorn_marker != (provider["runtimePayloadDigest"] + "\n").encode("ascii"):
-        fail("refreshed nested Unicorn marker is inconsistent")
+        new_fex_marker = stream.read(66)
+    if new_fex_marker != (provider["runtimePayloadDigest"] + "\n").encode("ascii"):
+        fail("refreshed nested FEX marker is inconsistent")
 
     output = json_bytes(value)
     if len(output) > MAX_MANIFEST:
@@ -2097,8 +2189,8 @@ try:
 
     staged = {}
     staged_payloads = [
-        ("unicorn-manifest", new_nested_data, stat.S_IMODE(nested_info.st_mode)),
-        ("unicorn-marker", new_unicorn_marker, 0o644),
+        ("fex-manifest", new_nested_data, stat.S_IMODE(nested_info.st_mode)),
+        ("fex-marker", new_fex_marker, 0o644),
         ("dxmt-files", new_files_data, stat.S_IMODE(files_info.st_mode)),
         ("runtime-manifest", output, 0o644),
     ]
@@ -2142,8 +2234,8 @@ try:
     os.fsync(stage_fd)
 
     replacements = [
-        ("unicorn-manifest", nested_relative),
-        ("unicorn-marker", provider["runtimeRoot"] + "/.switchyard-content-sha256"),
+        ("fex-manifest", nested_relative),
+        ("fex-marker", provider["runtimeRoot"] + "/.switchyard-content-sha256"),
         ("dxmt-files", files_relative),
     ]
     replacements.extend(

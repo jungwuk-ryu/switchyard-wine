@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/switchyard/build_runtime.sh"
 RELEASE_SCRIPT="$ROOT_DIR/switchyard/release_runtime.sh"
 PROFILE_LIBRARY="$ROOT_DIR/switchyard/lib/runtime_profile.sh"
-UNICORN_HELPER="$ROOT_DIR/switchyard/build_unicorn_runtime.sh"
-UNICORN_PATCH="$ROOT_DIR/switchyard/patches/unicorn-2.1.4-threaded-emu-stop.patch"
+FEX_HELPER="$ROOT_DIR/switchyard/build_fex_runtime.sh"
+FEX_PATCH="$ROOT_DIR/switchyard/patches/fex-73dc3b3-darwin-core.patch"
 ARM64_TLS_MANIFEST="$ROOT_DIR/switchyard/tls-deps-arm64.tsv"
 STABLE_ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime.entitlements"
 NATIVE_ENTITLEMENTS="$ROOT_DIR/switchyard/wine-runtime-native-arm64.entitlements"
-TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(/usr/bin/mktemp -d /private/tmp/switchyard-runtime-profile.XXXXXX)"
 failure_index=0
 
 cleanup() {
-  rm -rf "$TEST_ROOT"
+  case "$TEST_ROOT" in
+    /private/tmp/switchyard-runtime-profile.??????)
+      [ ! -L "$TEST_ROOT" ] && /bin/rm -rf -- "$TEST_ROOT" ;;
+    *) echo "refusing to clean unexpected profile fixture root: $TEST_ROOT" >&2 ;;
+  esac
 }
 trap cleanup EXIT
 
@@ -90,44 +95,51 @@ write_preview_manifest() {
     "wineUnixArchitecture": "aarch64",
     "buildTriplet": "aarch64-apple-darwin",
     "hostTriplet": "aarch64-apple-darwin",
-    "architectureCommand": ["arch", "-arm64"],
+    "architectureCommand": [
+      "arch",
+      "-arm64"
+    ],
     "requiresRosetta": false,
     "minimumMacOS": "26.5",
     "gstreamerRegistryArchitecture": "arm64"
   },
-  "peArchitectures": ["aarch64", "arm64ec", "x86_64", "i386"],
+  "peArchitectures": [
+    "aarch64",
+    "arm64ec",
+    "x86_64"
+  ],
   "cpuProvider": {
-    "implementation": "unicorn",
-    "version": "2.1.4",
-    "sourceRepository": "https://github.com/unicorn-engine/unicorn.git",
-    "sourceRevision": "8028ec436f2d9376525352dd38ed9ed6b9f6be10",
-    "sourceArchive": "lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-8028ec436f2d9376525352dd38ed9ed6b9f6be10.tar.gz",
-    "sourceArchiveSha256": "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e",
+    "implementation": "switchyard-fex",
+    "version": "5",
+    "sourceRepository": "https://github.com/FEX-Emu/FEX.git",
+    "sourceRevision": "73dc3b3eddaf72745c743fe8ec76ed66f87636dc",
     "sourcePatch": {
-      "path": "lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch",
-      "sha256": "96a647d57f6f749c3c3864ead959c2e9306488151f5fed468e6ad334483e6cc5"
+      "path": "lib/switchyard-fex/share/src/switchyard-fex/fex-73dc3b3-darwin-core.patch",
+      "sha256": "8afdc678bc873f0e2fc5e51b5e0dca2487a71244e9392615d35142223f493f2e"
     },
-    "buildContractVersion": 20,
+    "sourceDepsSha256": "b31cd5e74e5e0e33fe64bdf8d935bf73ed4d513e95f2e43ddeb7ebff91764271",
+    "switchyardAdapterSha256": "8cdfddd69944d28974f10dc27909e11eabd41626c3bffc4edb594264b11c9a52",
+    "toolchainSha256": "ff120be2bb2db74e795c5a00cbf496e22ef30ea057d8fa872c148d1ec10b9b28",
+    "providerIdentity": "switchyard-fex-provider-abi-v6-darwin-low-shadow-external-stops-signal-repair-stack-query-exec-range-detached-shared-admission-register-window",
+    "processABIVersion": 19,
+    "processABIIdentity": "switchyard-xtajit64-fex-provider-abi-v19-flight-bind-process-init-104-begin-472-doorbell-reconstruct-1248-jit-signal-stack-query-exec-range-dispatch-512-direct-64-native-stack-protect",
+    "arm64ecRegisterABI": true,
+    "buildContractVersion": 6,
     "hostArchitecture": "arm64",
     "kuserSharedDataModel": "translated-shadow",
-    "emulatedArchitectures": ["i386", "x86_64"],
-    "developmentCacheDigest": "15fd615a7ed403dfced3a82c686b608ae837ddab37cd241e2b8d224bbc2c3841",
-    "runtimeRoot": "lib/switchyard-unicorn",
-    "runtimePayloadDigest": "f7d90c666a54f718070657004cc348d97f15f1f26e1d397a460360079f1e3f4d",
-    "library": "lib/switchyard-unicorn/lib/libunicorn.2.dylib",
-    "librarySha256": "1ea70e727ae6db21ea15ac449cd253740263efa5ffeece27f9c3c09b4a1fee1c",
+    "emulatedArchitectures": [
+      "x86_64"
+    ],
+    "developmentCacheDigest": "0450775dee4986112f4877450d5e9bbc10921f99e94f7f7ae421606e353a5b59",
+    "immutablePayloadDigest": "328e889d2161a77e21b2f7dca5dc320f017ae18004a1f00bc5b93b01c840a8e9",
+    "runtimeRoot": "lib/switchyard-fex",
+    "runtimePayloadDigest": "0450775dee4986112f4877450d5e9bbc10921f99e94f7f7ae421606e353a5b59",
+    "library": "lib/switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+    "librarySha256": "1fb4df450ee9f376715ca010bd780015fac6be62220356baf9cc803667492d1c",
     "providerUnixLibraries": [
-      "lib/wine/aarch64-unix/xtajit.so",
       "lib/wine/aarch64-unix/xtajit64.so"
     ],
     "components": [
-      {
-        "guestArchitecture": "i386",
-        "unixLibrary": "lib/wine/aarch64-unix/xtajit.so",
-        "unixLibrarySha256": "3333333333333333333333333333333333333333333333333333333333333333",
-        "peLibrary": "lib/wine/aarch64-windows/xtajit.dll",
-        "peLibrarySha256": "4444444444444444444444444444444444444444444444444444444444444444"
-      },
       {
         "guestArchitecture": "x86_64",
         "unixLibrary": "lib/wine/aarch64-unix/xtajit64.so",
@@ -136,8 +148,8 @@ write_preview_manifest() {
         "peLibrarySha256": "6666666666666666666666666666666666666666666666666666666666666666"
       }
     ],
-    "runtimeRpath": "@loader_path/../../switchyard-unicorn/lib",
-    "manifest": "lib/switchyard-unicorn/switchyard-unicorn-runtime.json"
+    "runtimeRpath": "@loader_path/../../switchyard-fex/lib",
+    "manifest": "lib/switchyard-fex/switchyard-fex-runtime.json"
   }
 }
 EOF
@@ -199,7 +211,7 @@ switchyard_load_runtime_profile stable-x86_64-rosetta
 [ "$SWITCHYARD_RUNTIME_PROFILE_MOLTENVK_BOTTLE_TAG" = "sonoma" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_SUBDIR" = "osx-64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_MANIFEST_BASENAME" = "tls-deps.tsv" ]
-[ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_UNICORN" = "false" ]
+[ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_FEX" = "false" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_DXMT" = "false" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL" = "direct" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_RELEASE_SUFFIX" = "macos-x86_64" ]
@@ -207,12 +219,13 @@ switchyard_load_runtime_profile stable-x86_64-rosetta
 [ "$(switchyard_runtime_profile_entitlements_path "$ROOT_DIR")" = "$STABLE_ENTITLEMENTS" ]
 
 switchyard_load_runtime_profile preview-native-arm64-fex
-[ "$SWITCHYARD_RUNTIME_PROFILE_ENABLED" = "1" ]
+# Public full-Wine publication remains held until combined qualification.
+[ "$SWITCHYARD_RUNTIME_PROFILE_ENABLED" = "0" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_ID_PREFIX" = "switchyard-local-native-arm64-fex-" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH" = "arm64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH" = "aarch64" ]
-[ "$SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV" = "aarch64,arm64ec,x86_64,i386" ]
-[ "${SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS[*]}" = "aarch64 x86_64 i386" ]
+[ "$SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV" = "aarch64,arm64ec,x86_64" ]
+[ "${SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS[*]}" = "aarch64 x86_64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET" = "aarch64-apple-darwin" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET" = "aarch64-apple-darwin" ]
 [ "${SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND[*]}" = "arch -arm64" ]
@@ -227,23 +240,25 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_RUNTIME_PROFILE_MOLTENVK_BOTTLE_TAG" = "arm64_tahoe" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_SUBDIR" = "osx-arm64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_MANIFEST_BASENAME" = "tls-deps-arm64.tsv" ]
-[ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_UNICORN" = "true" ]
+[ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_FEX" = "true" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_DXMT" = "true" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL" = "translated-shadow" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_RELEASE_SUFFIX" = "macos-arm64" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_ENTITLEMENTS_BASENAME" = "wine-runtime-native-arm64.entitlements" ]
 [ "$(switchyard_runtime_profile_entitlements_path "$ROOT_DIR")" = "$NATIVE_ENTITLEMENTS" ]
 [ "$SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH" != "$SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH" ]
-[ "$SWITCHYARD_UNICORN_VERSION" = "2.1.4" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_REPOSITORY" = "https://github.com/unicorn-engine/unicorn.git" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_REVISION" = "8028ec436f2d9376525352dd38ed9ed6b9f6be10" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" = "d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" = "unicorn-2.1.4-threaded-emu-stop.patch" ]
-[ "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" = "96a647d57f6f749c3c3864ead959c2e9306488151f5fed468e6ad334483e6cc5" ]
-[ "$SWITCHYARD_UNICORN_LIBRARY_SHA256" = "1ea70e727ae6db21ea15ac449cd253740263efa5ffeece27f9c3c09b4a1fee1c" ]
-[ "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" = "20" ]
-[ "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" = "15fd615a7ed403dfced3a82c686b608ae837ddab37cd241e2b8d224bbc2c3841" ]
-[ "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" = "f7d90c666a54f718070657004cc348d97f15f1f26e1d397a460360079f1e3f4d" ]
+[ "$SWITCHYARD_FEX_VERSION" = "6" ]
+[ "$SWITCHYARD_FEX_SOURCE_REPOSITORY" = "https://github.com/FEX-Emu/FEX.git" ]
+[ "$SWITCHYARD_FEX_SOURCE_REVISION" = "73dc3b3eddaf72745c743fe8ec76ed66f87636dc" ]
+[ "$SWITCHYARD_FEX_SOURCE_PATCH_BASENAME" = "fex-73dc3b3-darwin-core.patch" ]
+[ "$SWITCHYARD_FEX_SOURCE_PATCH_SHA256" = "8afdc678bc873f0e2fc5e51b5e0dca2487a71244e9392615d35142223f493f2e" ]
+[ "$SWITCHYARD_FEX_LIBRARY_SHA256" = "1fb4df450ee9f376715ca010bd780015fac6be62220356baf9cc803667492d1c" ]
+[ "$SWITCHYARD_FEX_BUILD_CONTRACT_VERSION" = "6" ]
+[ "$SWITCHYARD_FEX_DEVELOPMENT_CACHE_DIGEST" = "0450775dee4986112f4877450d5e9bbc10921f99e94f7f7ae421606e353a5b59" ]
+[ "$SWITCHYARD_FEX_ADAPTER_SHA256" = "8cdfddd69944d28974f10dc27909e11eabd41626c3bffc4edb594264b11c9a52" ]
+[ "$SWITCHYARD_FEX_TOOLCHAIN_SHA256" = "ff120be2bb2db74e795c5a00cbf496e22ef30ea057d8fa872c148d1ec10b9b28" ]
+[ "$SWITCHYARD_FEX_IMMUTABLE_PAYLOAD_DIGEST" = "328e889d2161a77e21b2f7dca5dc320f017ae18004a1f00bc5b93b01c840a8e9" ]
+[ "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" = "switchyard-xtajit64-fex-provider-abi-v19-flight-bind-process-init-104-begin-472-doorbell-reconstruct-1248-jit-signal-stack-query-exec-range-dispatch-512-direct-64-native-stack-protect" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REPOSITORY" = "https://github.com/3Shain/dxmt.git" ]
 [ "$SWITCHYARD_DXMT_SOURCE_REVISION" = "856d9f35789679ef00c1ba01a6353438df84b66f" ]
 [ "$SWITCHYARD_DXMT_SOURCE_BASE_TREE" = "22fa93d36867f175c0283b36cd3628a4df94876e" ]
@@ -251,7 +266,7 @@ switchyard_load_runtime_profile preview-native-arm64-fex
 [ "$SWITCHYARD_DXMT_SOURCE_PATCH_BASENAME" = "0001-dxmt-Preserve-guest-accessible-CPU-buffer-ownership.patch" ]
 [ "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" = "2e6f6436706f283be6b9ca1668391e0fa70fe83e290781d2a2c5b9f2496a4a26" ]
 [ "$SWITCHYARD_DXMT_ARTIFACT_BUILD_IDENTITY" = "af8ab67d197a4bc6751483b8c16fa17df3b0a6b0" ]
-[ "$SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION" = "3" ]
+[ "$SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION" = "4" ]
 [ "$SWITCHYARD_DXMT_ARTIFACT_NAME" = "dxmt-af8ab67d197a4bc6751483b8c16fa17df3b0a6b0.tar.gz" ]
 [ "$SWITCHYARD_DXMT_ARTIFACT_SHA256" = "3d1b73a42b25ff6b90c1c054ec501abfffe1f8433cbf3c97183b69e00d57f778" ]
 [ "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" = "1c03a178db45540507e3784ed97890ee4fd8baffa1413e00991b6588c95859d0" ]
@@ -285,8 +300,8 @@ closure_inputs=(
 closure_digest="$(switchyard_native_runtime_closure_digest "${closure_inputs[@]}")"
 [[ "$closure_digest" =~ ^[0-9a-f]{64}$ ]] ||
   fail "native runtime closure is not a full SHA-256"
-[ "$closure_digest" = "5aaff80c995e67ad8481bac468417d920b5d322f2517c11e4741e26e8b5729c9" ] ||
-  fail "native runtime closure v3 labels, order, or domain changed"
+[ "$closure_digest" = "42c68754280a87a1fcc790e5cdf6cd47d2060a351006a8be1b454c6cc5d66545" ] ||
+  fail "native runtime closure v4 labels, order, or domain changed"
 [ "$(switchyard_native_runtime_closure_digest "${closure_inputs[@]}")" = \
   "$closure_digest" ] || fail "native runtime closure is not deterministic"
 
@@ -548,147 +563,25 @@ if switchyard_native_configured_compiler_policy_is_exact \
 fi
 unset SWITCHYARD_TEST_LLVM_LOG SWITCHYARD_TEST_LLVM_MODE
 
-/bin/bash -n "$UNICORN_HELPER" || fail "Unicorn helper does not pass bash syntax validation"
+/bin/bash -n "$FEX_HELPER" || fail "FEX helper does not pass bash syntax validation"
 /bin/bash -n "$BUILD_SCRIPT" || fail "runtime builder does not pass bash syntax validation"
-grep -F 'SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH=0' "$BUILD_SCRIPT" >/dev/null ||
-  fail "native Wine wrapper lacks the direct-hit JIT default policy"
-grep -F '[ -z "${UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH+x}" ]' "$BUILD_SCRIPT" >/dev/null ||
-  fail "native Wine wrapper cannot preserve the direct-hit JIT kill switch"
-grep -F 'export UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH=1' "$BUILD_SCRIPT" >/dev/null ||
-  fail "native Wine wrapper does not enable the direct-hit JIT policy"
-grep -F 's/__SWITCHYARD_JIT_DIRECT_HIT_BATCH__/$ENV{SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH}/g;' \
-  "$BUILD_SCRIPT" >/dev/null ||
-  fail "native Wine wrapper does not bind its direct-hit JIT policy"
-grep -F 'const char *value = getenv("UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH");' \
-  "$UNICORN_PATCH" >/dev/null ||
-  fail "Unicorn patch lacks the direct-hit JIT opt-in"
-grep -F "arch == UC_ARCH_X86 && value && value[0] == '1' && !value[1];" \
-  "$UNICORN_PATCH" >/dev/null ||
-  fail "Unicorn direct-hit JIT opt-in is not exact or x86-scoped"
-grep -F 'static inline void cpu_jit_direct_hit_batch_finish(CPUState *cpu)' \
-  "$UNICORN_PATCH" >/dev/null ||
-  fail "Unicorn patch lacks direct-hit JIT boundary closure"
-grep -F 'BUILD_WORK_DIR="$(mktemp -d "$BUILD_DIR/.build.XXXXXX")"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not isolate each CMake build in a fresh work directory"
-grep -F -- '-B "$BUILD_WORK_DIR"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not configure the isolated build directory"
-if grep -F 'cmake --build "$BUILD_DIR"' "$UNICORN_HELPER" >/dev/null; then
-  fail "Unicorn helper can execute a persistent build-tree recipe"
+[ "$(/usr/bin/shasum -a 256 "$FEX_PATCH" | /usr/bin/awk '{print $1}')" = \
+  "$SWITCHYARD_FEX_SOURCE_PATCH_SHA256" ] ||
+  fail "FEX source patch differs from the qualified exact patch"
+if grep -E 'unicorn|UNICORN|UC_SWITCHYARD_' "$BUILD_SCRIPT" >/dev/null; then
+  fail "full native builder retains a TCG provider or wrapper policy"
 fi
-grep -F 'validate_source_archive "$source_archive"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not validate the deterministic source archive"
-[ "$(/usr/bin/shasum -a 256 "$UNICORN_PATCH" | /usr/bin/awk '{print $1}')" = \
-  "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" ] ||
-  fail "Unicorn source patch differs from the qualified exact patch"
-grep -F 'git -C "$SOURCE_DIR" archive --format=tar HEAD | /usr/bin/tar -xf - -C "$PATCHED_SOURCE_DIR"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not export the pristine source into a private tree"
-grep -F 'validate_source_patch "$PATCH_SNAPSHOT"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not validate its private exact-byte patch snapshot"
-grep -F 'git -C "$PATCHED_SOURCE_DIR" apply --check --whitespace=error-all "$PATCH_SNAPSHOT"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not preflight the exact source patch without whitespace repair"
-grep -F 'git -C "$PATCHED_SOURCE_DIR" apply --whitespace=error-all "$PATCH_SNAPSHOT"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not apply the qualified source patch"
-grep -F 'git -C "$PATCHED_SOURCE_DIR" apply --reverse --check --whitespace=error-all "$PATCH_SNAPSHOT"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not verify the private patched source state"
-grep -F 'GIT_CEILING_DIRECTORIES="$patch_apply_ceiling"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper can inherit an ambient repository while applying its source patch"
-grep -F "grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP 1'" \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the instruction-boundary stop patch reached its source and output"
-grep -F '"_uc_emu_stop_at_instruction_boundary"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the patched stop API is exported"
-grep -F "grep -Fx '#define UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP_CLEAR 1'" \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the instruction-boundary stop-clear contract reached its source and output"
-grep -F '"_uc_clear_instruction_boundary_stop"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the patched stop-clear API is exported"
-grep -F "grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMICS 1'" \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the shared-memory atomic patch reached its source and output"
-grep -F '"_uc_enable_shared_memory_atomics"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the shared-memory atomic API is exported"
-grep -F "grep -Fx '#define UC_SWITCHYARD_SHARED_MEMORY_ATOMIC_TRACE 1'" \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the serial-atomic trace patch reached its source and output"
-grep -F '"_uc_set_shared_memory_atomic_callback"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the serial-atomic trace API is exported"
-grep -F "grep -Fx '#define UC_SWITCHYARD_X64_BOUNDARY_GUARD 1'" \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the x86-64 boundary guard reached its source and output"
-grep -F '"_uc_configure_x64_boundary_guard"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the x86-64 boundary guard is exported"
-grep -F '"_uc_update_x64_boundary_suspend_doorbell"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the boundary doorbell updater is exported"
-grep -F '"_uc_query_x64_boundary_stop"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the boundary stop query is exported"
-grep -F "grep -Fx '#define UC_SWITCHYARD_X86_64_TRANSITION_CONTEXT 1'" \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the transition-context patch reached its source and output"
-grep -F '"_uc_switchyard_x86_64_import_transition_context"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the transition-context import API is exported"
-grep -F '"_uc_switchyard_x86_64_export_transition_context"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove the transition-context export API is exported"
-grep -F 'extern __thread bool jit_thread_executable_cache;' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not prove caller-thread Apple JIT ownership"
-grep -F "grep -Fx '#define CONFIG_ATOMIC64 1'" "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not require the 64-bit atomic helper configuration"
-grep -F 'for regression in aarch64_rotl_zero apple_jit_state switchyard_state_neutral_jit_state threaded_emu_stop threaded_emu_stop_atomic shared_memory_atomics atomic_unmapped_hook shared_code_coherence shared_code_start_race shared_code_jit_state identity_memory_fastpath identity_atomic_fastpath tb_page_addr_iotlb shared_atomic_idle_mapping shared_code_private_write x86_64_cross_page_chain x86_64_transition_context x86_64_boundary_guard x86_pause; do' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not run the AArch64 rotate, JIT state-only, PAUSE, atomic, identity, and shared-code regressions"
-grep -F '"$regression_binary" || fail "Unicorn regression failed: $regression"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper can ignore a cross-thread stop regression failure"
-grep -F 'apple_jit_state|shared_code_jit_state|x86_64_cross_page_chain)' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not exercise direct-hit JIT boundaries"
-grep -F 'UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH=1 "$regression_binary"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not run the direct-hit JIT regressions"
-grep -F -- '-S "$PATCHED_SOURCE_DIR"' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not build from the private patched source tree"
-if grep -F -- '-S "$SOURCE_DIR"' "$UNICORN_HELPER" >/dev/null; then
-  fail "Unicorn helper can still build directly from the pristine checkout"
-fi
-grep -F 'source "$ROOT_DIR/switchyard/lib/directory_safety.sh"' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not load the fd-relative directory publisher"
-grep -F '"$SWAP_HELPER_DIR/switchyard-preview-directory-publish" \' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not use the fd-relative directory publisher"
-grep -F 'ensure_preview_swap_helper || fail' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not diagnose publisher preparation failure"
+grep -F 'source "$ROOT_DIR/switchyard/lib/fex_contract.sh"' "$FEX_HELPER" >/dev/null ||
+  fail "FEX SDK builder does not share the closed source/ABI pins"
 grep -F '"$STAGING" "$OUTPUT" exclusive || publication_status=$?' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper publication is not exclusive"
-if ! /usr/bin/python3 -I - "$UNICORN_HELPER" <<'PY'
-import sys
-
-text = open(sys.argv[1], encoding="utf-8").read()
-publication = text.index('"$STAGING" "$OUTPUT" exclusive || publication_status=$?')
-failure_branch = text.index('if [ "$publication_status" -ne 0 ]; then', publication)
-fail_stop = text.index('[ "$publication_status" -ne 3 ] || STAGING=""', failure_branch)
-failure = text.index('fail "exclusive output publication failed: $OUTPUT"', fail_stop)
-success_clear = text.index('STAGING=""', failure + 1)
-if not publication < failure_branch < fail_stop < failure < success_clear:
-    raise SystemExit("Unicorn publication status handling is out of order")
-PY
-then
-  fail "Unicorn helper can path-clean an ambiguous fail-stop publication"
-fi
-if grep -F '/bin/mv "$STAGING" "$OUTPUT"' "$UNICORN_HELPER" >/dev/null; then
-  fail "Unicorn helper retains a path-racy output publication"
+  "$FEX_HELPER" >/dev/null || fail "FEX SDK publication is not exclusive"
+grep -F 'if [ "$publication_status" -eq 3 ]; then STAGING=""; fi' \
+  "$FEX_HELPER" >/dev/null || fail "FEX ambiguous publication can be path-cleaned"
+if grep -F '/bin/mv -n "$STAGING"' "$FEX_HELPER" >/dev/null; then
+  fail "FEX helper retains destination-nesting output publication"
 fi
 (
-  publication_root="$TEST_ROOT/unicorn-publication"
+  publication_root="$TEST_ROOT/fex-publication"
   publication_target="$publication_root/output"
   publication_go="$publication_root/go"
   publication_ready_a="$publication_root/ready-a"
@@ -700,13 +593,13 @@ fi
   SWAP_HELPER_DIR=""
   unset SWITCHYARD_PREVIEW_PUBLISH_TEST_FAILURE
 
-  cleanup_unicorn_publication_test() {
+  cleanup_fex_publication_test() {
     if [ -n "$SWAP_HELPER_DIR" ] && [ -d "$SWAP_HELPER_DIR" ] &&
        [ ! -L "$SWAP_HELPER_DIR" ]; then
       /bin/rm -rf "$SWAP_HELPER_DIR"
     fi
   }
-  trap cleanup_unicorn_publication_test EXIT
+  trap cleanup_fex_publication_test EXIT
 
   # shellcheck source=../lib/directory_safety.sh
   source "$ROOT_DIR/switchyard/lib/directory_safety.sh"
@@ -849,25 +742,25 @@ if /usr/bin/grep -E \
     "$stable_trace" >/dev/null; then
   fail "stable source-info sourced or called native-only tooling"
 fi
-if grep -E '^(cpuProvider|unicorn)' <<<"$default_source_info" >/dev/null; then
-  fail "stable source metadata unexpectedly includes native Unicorn identity"
+if grep -E '^(cpuProvider|fex)' <<<"$default_source_info" >/dev/null; then
+  fail "stable source metadata unexpectedly includes native FEX identity"
 fi
 if grep -E '^kuserSharedDataModel=' <<<"$default_source_info" >/dev/null; then
   fail "stable source metadata unexpectedly includes the native KUSER model"
 fi
-grep -F -- '      --with-unicorn' "$BUILD_SCRIPT" >/dev/null ||
-  fail "native profile does not pass --with-unicorn to Wine configure"
+grep -F -- '      "--with-fex=$fex_runtime_prefix"' "$BUILD_SCRIPT" >/dev/null ||
+  fail "native profile does not pass --with-fex to Wine configure"
 grep -F 'INSTALLED_PE_ARCHS=("${SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS[@]}")' \
   "$BUILD_SCRIPT" >/dev/null ||
   fail "runtime build does not separate configure PE targets from installed PE layout"
 [ "$(grep -F -c 'for pe_arch in "${INSTALLED_PE_ARCHS[@]}"; do' "$BUILD_SCRIPT")" -eq 2 ] ||
   fail "runtime install validation still iterates configure-only PE targets"
-grep -F "UNICORN_RUNTIME_RPATH='@loader_path/../../switchyard-unicorn/lib'" \
+grep -F 'FEX_RUNTIME_RPATH="$SWITCHYARD_NATIVE_FEX_RPATH"' \
   "$BUILD_SCRIPT" >/dev/null ||
-  fail "native providers do not use the runtime-relative Unicorn rpath"
-grep -F 'stage_unicorn_runtime "$WINE_INSTALL_PREFIX" "$unicorn_runtime_prefix"' \
+  fail "native providers do not use the canonical runtime-relative FEX rpath"
+grep -F 'stage_fex_runtime "$WINE_INSTALL_PREFIX" "$fex_runtime_prefix"' \
   "$BUILD_SCRIPT" >/dev/null ||
-  fail "native runtime assembly does not stage the validated Unicorn closure"
+  fail "native runtime assembly does not stage the validated FEX closure"
 grep -F 'vulkanRuntime.moltenVK.bottle' "$BUILD_SCRIPT" >/dev/null ||
   fail "native runtime completeness does not validate the exact MoltenVK bottle"
 grep -F 'tlsRuntime.packageSubdir' "$BUILD_SCRIPT" >/dev/null ||
@@ -938,7 +831,7 @@ stable_expression = (
 if text.count(stable_expression) != 1:
     raise SystemExit("stable runtime-ID expression is not literal-identical")
 for stale in (
-    '${runtime_id}-${SWITCHYARD_UNICORN_SOURCE_REVISION:0:12}',
+    '${runtime_id}-${SWITCHYARD_FEX_SOURCE_REVISION:0:12}',
     'full_content_tree_digest',
     '"runtimeClosure"',
 ):
@@ -1103,22 +996,15 @@ PY
 then
   fail "native producer/source isolation is not exact"
 fi
-grep -F 'git -C "$source" ls-files --others --ignored --exclude-standard' \
-  "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not reject ignored material in the pinned source checkout"
-grep -F '"$SOURCE_DIR"|"$SOURCE_DIR"/*)' "$UNICORN_HELPER" >/dev/null ||
-  fail "Unicorn helper does not reject build/output paths inside the pinned source checkout"
-grep -F '[ "$ntdll_dependency_count" -eq 1 ]' "$BUILD_SCRIPT" >/dev/null ||
+grep -F 'dependencies.count("@rpath/ntdll.so") != 1' \
+  "$ROOT_DIR/switchyard/lib/native_cpu_provider.sh" >/dev/null ||
   fail "native provider validation does not require exactly one ntdll dependency"
-grep -F '[ "$loader_rpath_count" -eq 1 ]' "$BUILD_SCRIPT" >/dev/null ||
-  fail "native provider validation does not require exactly one ntdll loader rpath"
-grep -F '[ "$runtime_rpath_count" -eq 1 ]' "$BUILD_SCRIPT" >/dev/null ||
-  fail "native provider validation does not require exactly one Unicorn runtime rpath"
-grep -F '@loader_path|@loader_path/*|@executable_path|@executable_path/*)' \
-  "$BUILD_SCRIPT" >/dev/null ||
-  fail "native dependency validation accepts malformed loader/executable-path prefixes"
-grep -F "*'/../'*|*'/./'*|*/..|*/.)" "$BUILD_SCRIPT" >/dev/null ||
-  fail "native dependency validation does not reject traversing load commands"
+grep -F 'sorted(rpaths) != sorted(["@loader_path/", fex_rpath])' \
+  "$ROOT_DIR/switchyard/lib/native_cpu_provider.sh" >/dev/null ||
+  fail "native provider validation does not close exact ntdll and FEX rpaths"
+grep -F 'name.startswith("_uc_")' \
+  "$ROOT_DIR/switchyard/lib/native_cpu_provider.sh" >/dev/null ||
+  fail "native provider validation does not reject imported Unicorn APIs"
 
 injection_sentinel="$TEST_ROOT/profile-was-executed"
 expect_failure "unknown profile" 2 "Unknown runtime profile." \
@@ -1132,6 +1018,9 @@ expect_failure "missing profile value" 2 "--runtime-profile requires a profile n
 expect_failure "duplicate profile" 2 "--runtime-profile may be specified only once." \
   "$BUILD_SCRIPT" --runtime-profile stable-x86_64-rosetta \
   --runtime-profile stable-x86_64-rosetta --source-info
+# Preserve the native metadata/compiler/path preflight checks for the eventual
+# qualified profile, while testing today's fail-closed public guard explicitly.
+if [ "$SWITCHYARD_RUNTIME_PROFILE_ENABLED" = "1" ]; then
 preview_source_info="$(
   env SWITCHYARD_DISABLE_GPTK_OVERLAY=0 /bin/bash "$BUILD_SCRIPT" \
     --runtime-profile preview-native-arm64-fex --source-info
@@ -1141,7 +1030,7 @@ expected_preview_source_info="$preview_source_prefix
 runtimeProfile=preview-native-arm64-fex
 hostMachOArchitecture=arm64
 wineUnixArchitecture=aarch64
-peArchitectures=aarch64,arm64ec,x86_64,i386
+peArchitectures=aarch64,arm64ec,x86_64
 wineBuildTriplet=aarch64-apple-darwin
 wineHostTriplet=aarch64-apple-darwin
 requiresRosetta=false
@@ -1196,6 +1085,12 @@ expect_failure "caller native runtime path budget" 1 \
     /bin/bash "$BUILD_SCRIPT" \
       --runtime-profile preview-native-arm64-fex --verify-media
 
+else
+  expect_failure "held native profile" 2 \
+    "FEX full-Wine packaging qualification is incomplete." \
+    /bin/bash "$BUILD_SCRIPT" --runtime-profile preview-native-arm64-fex --source-info
+fi
+
 stable_manifest="$TEST_ROOT/stable-runtime.json"
 write_stable_manifest "$stable_manifest"
 switchyard_validate_runtime_manifest_profile \
@@ -1242,11 +1137,41 @@ switchyard_validate_runtime_manifest_profile \
   "$stable_manifest_with_unrelated_provider" stable-x86_64-rosetta
 
 cp "$preview_manifest" "$invalid_manifest"
-/usr/bin/plutil -replace cpuProvider.implementation -string fex "$invalid_manifest"
+/usr/bin/plutil -replace cpuProvider.implementation -string unicorn "$invalid_manifest"
 expect_failure "native provider identity" 1 \
-  "cpuProvider.implementation must identify Unicorn" \
+  "cpuProvider.implementation is not the closed FEX contract" \
   switchyard_validate_runtime_manifest_profile \
   "$invalid_manifest" preview-native-arm64-fex
+
+for pin in sourceDepsSha256 switchyardAdapterSha256 toolchainSha256 immutablePayloadDigest; do
+  cp "$preview_manifest" "$invalid_manifest"
+  /usr/bin/plutil -replace "cpuProvider.$pin" -string "$(printf '%064d' 0)" "$invalid_manifest"
+  expect_failure "wrong native FEX $pin" 1 \
+    "cpuProvider.$pin is not the closed FEX contract" \
+    switchyard_validate_runtime_manifest_profile "$invalid_manifest" preview-native-arm64-fex
+done
+cp "$preview_manifest" "$invalid_manifest"
+/usr/bin/plutil -replace cpuProvider.processABIVersion -integer 18 "$invalid_manifest"
+expect_failure "old PE process ABI" 1 \
+  "cpuProvider.processABIVersion is not the closed FEX contract" \
+  switchyard_validate_runtime_manifest_profile "$invalid_manifest" preview-native-arm64-fex
+cp "$preview_manifest" "$invalid_manifest"
+/usr/bin/plutil -replace cpuProvider.processABIVersion -bool YES "$invalid_manifest"
+expect_failure "boolean PE process ABI" 1 "manifest is not valid unambiguous JSON data" \
+  switchyard_validate_runtime_manifest_profile "$invalid_manifest" preview-native-arm64-fex
+cp "$preview_manifest" "$invalid_manifest"
+/usr/bin/plutil -replace cpuProvider.arm64ecRegisterABI -bool NO "$invalid_manifest"
+expect_failure "generic host-register SDK" 1 "manifest is not valid unambiguous JSON data" \
+  switchyard_validate_runtime_manifest_profile "$invalid_manifest" preview-native-arm64-fex
+cp "$preview_manifest" "$invalid_manifest"
+/usr/bin/plutil -insert cpuProvider.emulatedArchitectures.1 -string i386 "$invalid_manifest"
+expect_failure "unsupported native i386 emulation" 1 \
+  "cpuProvider.emulatedArchitectures is not the closed FEX contract" \
+  switchyard_validate_runtime_manifest_profile "$invalid_manifest" preview-native-arm64-fex
+cp "$preview_manifest" "$invalid_manifest"
+/usr/bin/plutil -insert peArchitectures.3 -string i386 "$invalid_manifest"
+expect_failure "unsupported native i386 PE capability" 1 "peArchitectures has an unexpected length" \
+  switchyard_validate_runtime_manifest_profile "$invalid_manifest" preview-native-arm64-fex
 
 cp "$preview_manifest" "$invalid_manifest"
 /usr/bin/plutil -remove cpuProvider.kuserSharedDataModel "$invalid_manifest"
@@ -1260,7 +1185,7 @@ for invalid_kuser_model in direct unknown; do
   /usr/bin/plutil -replace cpuProvider.kuserSharedDataModel \
     -string "$invalid_kuser_model" "$invalid_manifest"
   expect_failure "invalid native KUSER_SHARED_DATA model $invalid_kuser_model" 1 \
-    "cpuProvider.kuserSharedDataModel does not match the native profile" \
+    "cpuProvider.kuserSharedDataModel is not the closed FEX contract" \
     switchyard_validate_runtime_manifest_profile \
     "$invalid_manifest" preview-native-arm64-fex
 done
@@ -1278,7 +1203,7 @@ cp "$preview_manifest" "$invalid_manifest"
 /usr/bin/plutil -replace cpuProvider.components.0.unixLibrary \
   -string lib/wine/aarch64-unix/untrusted.so "$invalid_manifest"
 expect_failure "native provider component layout" 1 \
-  "cpuProvider.components is not the exact provider layout" \
+  "cpuProvider.components.0.unixLibrary is not the closed FEX contract" \
   switchyard_validate_runtime_manifest_profile \
   "$invalid_manifest" preview-native-arm64-fex
 
@@ -1381,8 +1306,16 @@ expect_failure "release runtime ID validation" 1 \
 [ ! -e "$release_output" ] || fail "malformed runtime ID created release output"
 
 cp "$preview_manifest" "$release_runtime/switchyard-runtime.json"
-expect_failure "unsigned native preview release" 1 \
-  "runtimeSigning is required for runtime-bound native validation" \
+switchyard_load_runtime_profile preview-native-arm64-fex
+if [ "$SWITCHYARD_RUNTIME_PROFILE_ENABLED" = "1" ]; then
+  expected_native_release_status=1
+  expected_native_release_error="runtimeSigning is required for runtime-bound native validation"
+else
+  expected_native_release_status=2
+  expected_native_release_error="FEX full-Wine packaging qualification is incomplete."
+fi
+expect_failure "unsigned native preview release" "$expected_native_release_status" \
+  "$expected_native_release_error" \
   "$RELEASE_SCRIPT" --runtime "$release_runtime" \
   --runtime-content-sha256 "$(printf '%064d' 0)" \
   --output "$release_output" --identity -

@@ -1,0 +1,2 @@
+FEX_ADDRESS_REUSE_PASS low high flags base-change integer-load join offset vector write-fault threads=8
+exit 0

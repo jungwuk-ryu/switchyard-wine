@@ -1,0 +1,7 @@
+EXCEPTION_PE_PASS software
+EXCEPTION_PE_PASS low execute denied
+EXCEPTION_PE_PASS high execute denied
+EXCEPTION_PE_PASS read-write execute denied
+EXCEPTION_PE_PASS execute permission granted
+EXCEPTION_PE_PASS revoked execute denied
+exit 0

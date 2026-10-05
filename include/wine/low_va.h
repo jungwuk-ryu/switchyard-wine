@@ -256,6 +256,63 @@ struct wine_arm64ec_code_observer_v1
     uint64_t capabilities;
 };
 
+/* Process-lifetime signal bridge for native ARM64 CPU providers.  Apple
+ * Silicon can raise an alignment SIGBUS for an Arm release load/store that
+ * crosses a 16-byte atomic granule even though the corresponding x64 memory
+ * access is valid.  The callback runs directly from ntdll's Unix signal
+ * handler before that handler abandons the active provider call.  It may
+ * inspect and update only the supplied register snapshot and provider-owned
+ * JIT code or return-prediction cache; it must not allocate, enter ntdll
+ * virtual-memory APIs, or wait on an ordinary process lock.  A zero return
+ * means that ntdll must copy the
+ * updated context back and retry native execution. */
+#define WINE_ARM64EC_JIT_SIGNAL_OBSERVER_VERSION 3u
+#define WINE_ARM64EC_JIT_HOST_CONTEXT_VERSION 1u
+#define WINE_ARM64EC_JIT_SIGNAL_OBSERVER_CAP_UNALIGNED_TSO_REPAIR \
+    0x0000000000000001ull
+#define WINE_ARM64EC_JIT_SIGNAL_OBSERVER_CAP_CALLRET_REPAIR \
+    0x0000000000000002ull
+#define WINE_ARM64EC_JIT_SIGNAL_OBSERVER_CAP_EXCEPTION_STACK \
+    0x0000000000000004ull
+#define WINE_ARM64EC_JIT_SIGNAL_OBSERVER_CAPABILITIES \
+    (WINE_ARM64EC_JIT_SIGNAL_OBSERVER_CAP_UNALIGNED_TSO_REPAIR | \
+     WINE_ARM64EC_JIT_SIGNAL_OBSERVER_CAP_CALLRET_REPAIR | \
+     WINE_ARM64EC_JIT_SIGNAL_OBSERVER_CAP_EXCEPTION_STACK)
+#define WINE_ARM64EC_JIT_SIGNAL_ALIGNMENT_FAULT 1u
+
+struct wine_arm64ec_jit_host_context_v1
+{
+    uint32_t size;
+    uint32_t version;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t gpr[31];
+    uint64_t vector[32][2];
+    uint64_t pc;
+    uint64_t pstate;
+    uint32_t fpcr;
+    uint32_t fpsr;
+};
+
+struct wine_arm64ec_jit_signal_observer_v3
+{
+    uint32_t version;
+    uint32_t size;
+    uint32_t flags;
+    uint32_t reserved;
+    void *context;
+    /* access is 0 for read or 1 for write. Other flag bits are reserved. */
+    int32_t (*repair_jit_fault)(
+        void *context, struct wine_arm64ec_jit_host_context_v1 *host_context,
+        uint32_t access, uint32_t flags, uint64_t fault_address );
+    /* Non-consuming, signal-safe query of the actual architectural guest RSP.
+     * access additionally accepts 8 for an instruction-fetch fault. */
+    int32_t (*query_exception_stack)(
+        void *context, const struct wine_arm64ec_jit_host_context_v1 *host_context,
+        uint32_t access, uint64_t fault_address, uint64_t *guest_stack );
+    uint64_t capabilities;
+};
+
 /* Normal-context fault resolution between the i386 CPU provider and ntdll.so.
  * The provider must stop the faulting engine and publish it as not running
  * before calling this entry point.  WoW64 thunk copies may also call it while
@@ -308,6 +365,10 @@ WINE_LOW_VA_EXPORT int32_t __wine_register_arm64ec_low_memory_observer_v1(
  * completes a full invalidation while native bitmap writers are excluded. */
 WINE_LOW_VA_EXPORT int32_t __wine_register_arm64ec_code_observer_v1(
     const struct wine_arm64ec_code_observer_v1 *observer );
+/* Registration is process-lifetime and ARM64EC-only.  The immutable callback
+ * is published only after the complete descriptor has been copied. */
+WINE_LOW_VA_EXPORT int32_t __wine_register_arm64ec_jit_signal_observer_v3(
+    const struct wine_arm64ec_jit_signal_observer_v3 *observer );
 WINE_LOW_VA_EXPORT int32_t __wine_resolve_wow64_memory_fault_v1(
     uint64_t host_address, uint32_t access_type,
     struct wine_wow64_memory_fault_result_v1 *result );

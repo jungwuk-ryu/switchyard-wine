@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VIRTUAL_SOURCE="$ROOT_DIR/dlls/ntdll/unix/virtual.c"
+[ "$#" -le 1 ] || { echo "usage: $0 [VIRTUAL_SOURCE]" >&2; exit 2; }
+VIRTUAL_SOURCE="${1:-$ROOT_DIR/dlls/ntdll/unix/virtual.c}"
 TEST_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/darwin-arm64-private-valloc-wx.XXXXXX")"
 trap '/bin/rm -rf -- "$TEST_ROOT"' EXIT
 
@@ -102,11 +103,12 @@ def strip_comments_and_literals(text: str) -> str:
 clean_source = strip_comments_and_literals(source)
 
 
-def extract_function(name: str) -> tuple[str, int, int]:
+def extract_function(name: str, occurrence: int = 0) -> tuple[str, int, int]:
     pattern = re.compile(rf"\b{re.escape(name)}\s*\([^;{{}}]*\)\s*\{{", re.DOTALL)
-    match = pattern.search(clean_source)
-    if not match:
+    matches = list(pattern.finditer(clean_source))
+    if occurrence >= len(matches):
         fail(f"cannot locate the {name} definition")
+    match = matches[occurrence]
 
     brace = clean_source.find("{", match.start())
     depth = 0
@@ -176,6 +178,9 @@ arm64ec_native_source, arm64ec_native_start, _ = extract_function(
 provider_owner_source, provider_owner_start, _ = extract_function(
     "mprotect_host_page_is_cpu_provider_owned"
 )
+portable_provider_owner_source, portable_provider_owner_start, _ = extract_function(
+    "mprotect_host_page_is_cpu_provider_owned", 1
+)
 can_retry_source, can_retry_start, _ = extract_function("can_retry_native_writable_exec")
 retry_source, retry_start, retry_end = extract_function("mprotect_range_run")
 translated_projection_source, _, _ = extract_function("get_mprotect_translated_host_page_vprot")
@@ -218,6 +223,9 @@ if not has_apple_arm64_guard(arm64ec_native_start):
     fail("the ARM64EC host-page ownership helper is not gated to Apple ARM64")
 if not has_apple_arm64_guard(provider_owner_start):
     fail("the CPU-provider ownership helper is not gated to Apple ARM64")
+if re.sub(r"\s+", "", preprocessor_stack_at(portable_provider_owner_start)[-1]) != \
+        "!(defined(__APPLE__)&&defined(__aarch64__))":
+    fail("the generic CPU-provider ownership helper is not excluded from Apple ARM64")
 if not has_apple_arm64_guard(validate_domains_start):
     fail("the physical ownership-domain validator is not gated to Apple ARM64")
 
@@ -522,6 +530,71 @@ def compile_and_run(name: str, program: str) -> None:
         fail(f"{name} model failed with status {run.returncode}:\n{run.stdout}{run.stderr}")
 
 
+portable_owner_model = r'''
+#include <stddef.h>
+#include <errno.h>
+typedef int BOOL;
+#define TRUE 1
+#define FALSE 0
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define PROT_EXEC 4
+#define TRACE(...) do {} while (0)
+struct file_view { unsigned int protect; };
+static BOOL force_exec_prot;
+static BOOL deny_write_exec;
+static unsigned int calls;
+static int last_prot;
+static int mprotect(void *base, size_t size, int prot)
+{
+    (void)base;
+    (void)size;
+    calls++;
+    last_prot = prot;
+    if (deny_write_exec && (prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC))
+    {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+''' + "#if defined(__APPLE__) && defined(__aarch64__)\n" + provider_owner_source + \
+    "\n#else\n" + portable_provider_owner_source + "\n#endif\n" + mprotect_exec_source + r'''
+int main(void)
+{
+    struct file_view view = {~0u};
+    char buffer[16];
+    unsigned int force, prot;
+
+    if (mprotect_host_page_is_cpu_provider_owned(NULL, NULL) ||
+        mprotect_host_page_is_cpu_provider_owned(&view, buffer) ||
+        mprotect_host_page_is_cpu_provider_owned(&view, NULL)) return 1;
+    for (force = 0; force < 2; force++)
+        for (prot = 0; prot < 8; prot++)
+        {
+            int expected = prot;
+
+            force_exec_prot = force;
+            calls = 0;
+            if (force && (prot & PROT_READ)) expected |= PROT_EXEC;
+            if (mprotect_exec(buffer, sizeof(buffer), prot, TRUE) ||
+                calls != 1 || last_prot != expected) return 2;
+        }
+    force_exec_prot = TRUE;
+    deny_write_exec = TRUE;
+    calls = 0;
+    if (mprotect_exec(buffer, sizeof(buffer), PROT_READ | PROT_WRITE, TRUE) ||
+        calls != 2 || last_prot != (PROT_READ | PROT_WRITE)) return 3;
+    return 0;
+}
+'''
+for platform, definitions in (("darwin-x64", "#define __APPLE__ 1\n"),
+                              ("unix-arm64", "#define __aarch64__ 1\n"),
+                              ("unix-x64", "")):
+    compile_and_run("portable-provider-owner-" + platform,
+                    "#undef __APPLE__\n#undef __aarch64__\n" + definitions + portable_owner_model)
+
+
 eligibility_model = r'''
 #include <stdint.h>
 #include <stddef.h>
@@ -546,6 +619,7 @@ typedef size_t SIZE_T;
 #define VPROT_SHADOW_TRANSLATED 0x40
 #define VPROT_READ              0x80
 #define VPROT_AMD64_IDENTITY    0x100
+#define VPROT_ARM64EC           0x200
 #define VPROT_CPU_PROVIDER_OWNED (VPROT_SHADOW_TRANSLATED | VPROT_AMD64_IDENTITY)
 
 struct file_view
@@ -562,6 +636,12 @@ static const ULONG_PTR host_page_mask = 16383;
 _Alignas(16384) static unsigned char probe_memory[8 * 4096];
 static BYTE page_vprot[8];
 static size_t page_reads;
+static BOOL arm64ec_mode;
+
+BOOL is_arm64ec(void)
+{
+    return arm64ec_mode;
+}
 
 static BOOL is_view_valloc(const struct file_view *view)
 {
@@ -671,6 +751,49 @@ int main(void)
                                           (ULONG_PTR)probe_memory + 5 * page_size,
                                           0, VPROT_WRITE));
     CHECK(page_reads == 1);
+
+    /* Even when unmarked private code is x64, widening host WRITE must not
+     * allow stores into a logical RX sibling. Keep this fail-closed until
+     * guest subpage data permissions are enforced, not just native EXEC. */
+    reset_pages(&view);
+    view.size = 4 * page_size;
+    memset(page_vprot, VPROT_COMMITTED | VPROT_READ | VPROT_EXEC, 4);
+    page_vprot[0] = VPROT_COMMITTED | VPROT_READ | VPROT_WRITE;
+    arm64ec_mode = TRUE;
+    CHECK(!can_retry_native_writable_exec(&view, probe_memory, 4 * page_size,
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + page_size, 0, 0));
+    arm64ec_mode = FALSE;
+    CHECK(!can_retry_native_writable_exec(&view, probe_memory, 4 * page_size,
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + page_size, 0, 0));
+    arm64ec_mode = TRUE;
+    view.protect = VPROT_ARM64EC;
+    CHECK(!can_retry_native_writable_exec(&view, probe_memory, 4 * page_size,
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + page_size, 0, 0));
+    view.protect = 0;
+    /* A pending explicit EC_CODE commit can precede bitmap publication.
+     * Never use x64-sibling eligibility when the mutation itself enables X. */
+    page_vprot[0] |= VPROT_EXEC;
+    CHECK(!can_retry_native_writable_exec(&view, probe_memory, 4 * page_size,
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + page_size, 0, 0));
+    /* A projected delta must be rejected too: the unchanged neighbor still
+     * requires RX, even though the changing lane itself loses X. */
+    page_vprot[0] = VPROT_COMMITTED | VPROT_READ | VPROT_EXEC;
+    CHECK(!can_retry_native_writable_exec(&view, probe_memory, 4 * page_size,
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + page_size,
+                                          VPROT_WRITE, VPROT_EXEC));
+    CHECK(page_vprot[0] == (VPROT_COMMITTED | VPROT_READ | VPROT_EXEC));
+    CHECK(page_vprot[1] == (VPROT_COMMITTED | VPROT_READ | VPROT_EXEC));
+    page_vprot[0] = VPROT_COMMITTED | VPROT_READ | VPROT_WRITE;
+    CHECK(!can_retry_native_writable_exec(&view, probe_memory, 4 * page_size,
+                                          (ULONG_PTR)probe_memory,
+                                          (ULONG_PTR)probe_memory + page_size,
+                                          VPROT_EXEC, 0));
+    arm64ec_mode = FALSE;
     return 0;
 }
 '''

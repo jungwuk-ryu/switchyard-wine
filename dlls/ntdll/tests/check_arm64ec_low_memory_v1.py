@@ -177,6 +177,31 @@ def check_registration(virtual: str) -> None:
     require(body, "initial FULL snapshot", "WINE_LOW_VA_SHADOW_SIZE", 3)
 
 
+def check_boundary_guard(virtual: str) -> None:
+    body = function_body(virtual, "reserve_arm64ec_low_va_shadow")
+    require(body, "boundary guard host-page validation", "host_page_size & (host_page_size - 1)")
+    require(body, "boundary guard allocation geometry", "const UINT_PTR guard_size = granularity_mask + 1")
+    require(body, "boundary guard allocation geometry", "host_page_size > guard_size")
+    require(body, "boundary guard overflow check", "guard_size > ~(UINT_PTR)0 - shadow_end")
+    require_order(
+        body,
+        "boundary guard reservation",
+        "reserve_area( (void *)shadow_start, (void *)guard_end )",
+        "mmap_is_in_reserved_area( (void *)shadow_start",
+        "mmap_remove_reserved_area( (void *)shadow_end, guard_size )",
+        "mmap_is_in_reserved_area( (void *)shadow_end, guard_size ) != 0",
+    )
+
+    init = function_body(virtual, "virtual_init")
+    require(init, "boundary guard initialization", "reserve_arm64ec_low_va_shadow()")
+    thread_data = function_body(virtual, "virtual_alloc_thread_data")
+    require(
+        thread_data,
+        "native thread-data guard exclusion",
+        "WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE + granularity_mask + 1",
+    )
+
+
 def check_snapshot(virtual: str) -> None:
     body = function_body(virtual, "arm64ec_low_memory_snapshot_range")
     require(body, "snapshot lower bound", "find_view_at_or_after( (void *)address )")
@@ -768,6 +793,7 @@ def check_code_observer(header: str, virtual: str) -> None:
 def verify(header: str, virtual: str, server: str, loader: str) -> None:
     check_abi(header, virtual)
     check_registration(virtual)
+    check_boundary_guard(virtual)
     check_snapshot(virtual)
     check_transaction_core(virtual)
     check_mapping_and_codec(virtual, server, loader)
@@ -827,6 +853,11 @@ def main() -> int:
         virtual.replace(
             "low_transaction.allow_exact_nested = exact_low_candidate;",
             "/* exact nested TEB ownership removed */",
+            1,
+        ),
+        virtual.replace(
+            "mmap_remove_reserved_area( (void *)shadow_end, guard_size );",
+            "/* boundary guard allocator exclusion removed */",
             1,
         ),
     )

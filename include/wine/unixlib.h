@@ -109,6 +109,18 @@ static inline BOOL wine_unixlib_decode_dispatch_handle( unixlib_handle_t handle,
 
 typedef NTSTATUS (*unixlib_entry_t)( void *args );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Assembly-only entry from an ARM64EC emulator's guarded control stack. The
+ * caller must hold InSimulation with a live SuspendDoorbell. No native guest
+ * callback may leave the supplied system-ABI callback suspended. Nonlocal JIT
+ * faults require provider-authenticated context reconstruction and ownership
+ * consumption; host callback PCs are not reconstructible guest execution.
+ * The returned address is called by assembly with x0 = unixlib_entry_t,
+ * x1 = args, x2 = Unix-authenticated TEB; w0 returns NTSTATUS. Zero means
+ * unsupported. Do not call it through an ARM64EC C function-pointer cast. */
+extern DECLSPEC_EXPORT UINT64 __wine_get_arm64ec_native_call_v1(void);
+#endif
+
 struct wine_wow64_unixlib_alias_v2
 {
     UINT32 version;

@@ -58,7 +58,7 @@ PROFILE_ARCH_COMMAND=("${SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND[@]}")
 HOST_DEPENDENCY_ARCH="$SWITCHYARD_RUNTIME_PROFILE_HOST_DEPENDENCY_ARCH"
 GSTREAMER_MACHO_ARCHS=("${SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_MACHO_ARCHS[@]}")
 NATIVE_CPU_PROVIDER_ENABLED=0
-if [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_UNICORN" = "true" ]; then
+if [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_FEX" = "true" ]; then
   NATIVE_CPU_PROVIDER_ENABLED=1
 fi
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
@@ -207,9 +207,9 @@ GSTREAMER_DEVEL_PACKAGE="gstreamer-1.0-devel-${GSTREAMER_VERSION}-universal.pkg"
 GSTREAMER_DEVEL_PACKAGE_SHA256="6f7b55e8fb86dcc615c9cae46b79b7785851e5c77f79a938648a81dfa2603729"
 GSTREAMER_PACKAGE_CACHE_DIR="${GSTREAMER_PACKAGE_CACHE_DIR:-${HOME}/Library/Caches/Switchyard/Media/GStreamer}"
 GSTREAMER_DEPS_PREFIX="${GSTREAMER_DEPS_PREFIX:-${HOME}/.switchyard/deps/media/gstreamer-${GSTREAMER_VERSION}-universal-curated-v${GSTREAMER_RUNTIME_LAYOUT_VERSION}}"
-UNICORN_RUNTIME_PREFIX=""
+FEX_RUNTIME_PREFIX=""
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-  UNICORN_RUNTIME_PREFIX="${SWITCHYARD_UNICORN_RUNTIME_PREFIX:-${HOME}/.switchyard/deps/cpu-provider/unicorn-${SWITCHYARD_UNICORN_VERSION}-${SWITCHYARD_UNICORN_SOURCE_REVISION:0:12}-build${SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION}-arm64-macos-${SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS}}"
+  FEX_RUNTIME_PREFIX="${SWITCHYARD_FEX_RUNTIME_PREFIX:-${HOME}/.switchyard/deps/cpu-provider/fex-${SWITCHYARD_FEX_SOURCE_REVISION:0:12}-build${SWITCHYARD_FEX_BUILD_CONTRACT_VERSION}-ec-arm64-macos-${SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS}}"
 fi
 DXMT_ARCHIVE=""
 DXMT_SOURCE_DIR=""
@@ -218,19 +218,12 @@ if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
   DXMT_ARCHIVE="${SWITCHYARD_DXMT_ARCHIVE:-${HOME}/Library/Caches/Switchyard/DXMT/${SWITCHYARD_DXMT_ARTIFACT_NAME}}"
   DXMT_SOURCE_DIR="${SWITCHYARD_DXMT_SOURCE_DIR:-${HOME}/.switchyard/deps/dxmt/${SWITCHYARD_DXMT_SOURCE_REVISION}/source}"
 fi
-UNICORN_PACKAGE_ROOT_RELATIVE="lib/switchyard-unicorn"
-UNICORN_DYLIB_RELATIVE="$UNICORN_PACKAGE_ROOT_RELATIVE/lib/libunicorn.2.dylib"
-UNICORN_SOURCE_PATCH_RELATIVE="$UNICORN_PACKAGE_ROOT_RELATIVE/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME"
-UNICORN_RUNTIME_RPATH='@loader_path/../../switchyard-unicorn/lib'
-UNICORN_PROVIDER_UNIXLIBS=(
-  "lib/wine/aarch64-unix/xtajit.so"
-  "lib/wine/aarch64-unix/xtajit64.so"
-)
-UNICORN_PROVIDER_PE_LIBS=(
-  "lib/wine/aarch64-windows/xtajit.dll"
-  "lib/wine/aarch64-windows/xtajit64.dll"
-)
-UNICORN_PROVIDER_GUEST_ARCHS=("i386" "x86_64")
+FEX_PACKAGE_ROOT_RELATIVE="$SWITCHYARD_NATIVE_FEX_ROOT"
+FEX_DYLIB_RELATIVE="$SWITCHYARD_NATIVE_FEX_LIBRARY"
+FEX_RUNTIME_RPATH="$SWITCHYARD_NATIVE_FEX_RPATH"
+FEX_PROVIDER_UNIXLIBS=("${SWITCHYARD_NATIVE_FEX_PROVIDER_UNIXLIBS[@]}")
+FEX_PROVIDER_PE_LIBS=("${SWITCHYARD_NATIVE_FEX_PROVIDER_PE_LIBS[@]}")
+FEX_PROVIDER_GUEST_ARCHS=("${SWITCHYARD_NATIVE_FEX_PROVIDER_GUEST_ARCHS[@]}")
 GSTREAMER_RUNTIME_COMPONENTS=(
   "base-system-1.0-${GSTREAMER_VERSION}-universal.pkg"
   "base-crypto-${GSTREAMER_VERSION}-universal.pkg"
@@ -2918,378 +2911,71 @@ if version(fields.get("sdk")) != version(expected):
 PY
 }
 
-validate_staged_unicorn_runtime() {
-  local runtime_root="$1"
-  local package_root="$runtime_root/$UNICORN_PACKAGE_ROOT_RELATIVE"
-  local metadata="$package_root/switchyard-unicorn-runtime.json"
-  local dylib="$runtime_root/$UNICORN_DYLIB_RELATIVE"
-  local dylib_link="$package_root/lib/libunicorn.dylib"
-  local source_archive="$package_root/share/src/switchyard-unicorn/unicorn-${SWITCHYARD_UNICORN_SOURCE_REVISION}.tar.gz"
-  local source_patch="$runtime_root/$UNICORN_SOURCE_PATCH_RELATIVE"
-  local notice_root="$package_root/share/doc/switchyard-unicorn"
-  local actual dependency notice
-
-  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
-  [ -d "$package_root" ] && [ ! -L "$package_root" ] || return 1
-  validate_extracted_tree_links "$package_root" || return 1
-  runtime_content_tree_is_verified "$package_root" || return 1
-  [ "$(runtime_content_tree_digest "$package_root")" = \
-    "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" ] || return 1
-  [ -f "$metadata" ] && [ ! -L "$metadata" ] || return 1
-  [ -f "$dylib" ] && [ ! -L "$dylib" ] || return 1
-  [ -L "$dylib_link" ] && [ "$(readlink "$dylib_link")" = "libunicorn.2.dylib" ] || return 1
-  [ -f "$source_archive" ] && [ ! -L "$source_archive" ] || return 1
-  [ -f "$source_patch" ] && [ ! -L "$source_patch" ] || return 1
-  [ -z "$(find "$package_root" -type f \( -name '*.a' -o -name '*.o' \) -print -quit)" ] || return 1
-  [ ! -e "$package_root/include" ] && [ ! -L "$package_root/include" ] || return 1
-  [ ! -e "$package_root/lib/pkgconfig" ] && [ ! -L "$package_root/lib/pkgconfig" ] || return 1
-  /usr/bin/python3 -I - "$package_root" "$SWITCHYARD_UNICORN_SOURCE_REVISION" \
-      "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" <<'PY' || return 1
-import os
-import stat
-import sys
-
-root, revision, patch_basename = sys.argv[1:]
-allowed = {
-    ".switchyard-content-sha256",
-    "lib/libunicorn.2.dylib",
-    "lib/libunicorn.dylib",
-    "share/doc/switchyard-unicorn/README.txt",
-    "share/doc/switchyard-unicorn/CORRESPONDING-SOURCE.txt",
-    "share/doc/switchyard-unicorn/COPYING",
-    "share/doc/switchyard-unicorn/COPYING.LGPL2",
-    "share/doc/switchyard-unicorn/COPYING_GLIB",
-    "share/doc/switchyard-unicorn/QEMU-COPYING",
-    "share/doc/switchyard-unicorn/QEMU-COPYING.LIB",
-    "share/doc/switchyard-unicorn/QEMU-LICENSE",
-    "share/src/switchyard-unicorn/unicorn-" + revision + ".tar.gz",
-    "share/src/switchyard-unicorn/" + patch_basename,
-    "switchyard-unicorn-runtime.json",
-}
-seen = set()
-for directory, directories, files in os.walk(root, followlinks=False):
-    for name in files + [name for name in directories if os.path.islink(os.path.join(directory, name))]:
-        path = os.path.join(directory, name)
-        relative = os.path.relpath(path, root).replace(os.sep, "/")
-        info = os.lstat(path)
-        if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
-            raise SystemExit("unsupported Unicorn payload entry: " + relative)
-        if relative not in allowed:
-            raise SystemExit("unexpected Unicorn payload entry: " + relative)
-        seen.add(relative)
-if seen != allowed:
-    raise SystemExit("Unicorn payload file set is incomplete")
-PY
-  /usr/bin/python3 -I - "$metadata" "$SWITCHYARD_UNICORN_VERSION" \
-      "$SWITCHYARD_UNICORN_SOURCE_REPOSITORY" "$SWITCHYARD_UNICORN_SOURCE_REVISION" \
-      "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" \
-      "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" \
-      "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" \
-      "$SWITCHYARD_UNICORN_LIBRARY_SHA256" \
-      "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" \
-      "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" <<'PY' || return 1
-import json
-import os
-import sys
-
-(
-    metadata,
-    version,
-    repository,
-    revision,
-    archive_sha,
-    patch_basename,
-    patch_sha,
-    library_sha,
-    contract,
-    minimum,
-) = sys.argv[1:]
-
-def no_duplicates(pairs):
-    value = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError("duplicate Unicorn manifest field")
-        value[key] = item
-    return value
-
-if os.path.getsize(metadata) > 1024 * 1024:
-    raise ValueError("Unicorn manifest exceeds its size bound")
-with open(metadata, "r", encoding="utf-8") as stream:
-    value = json.load(stream, object_pairs_hook=no_duplicates)
-expected = {
-    "version": version,
-    "sourceRepository": repository,
-    "sourceRevision": revision,
-    "buildContractVersion": int(contract),
-    "enabledArchitectures": ["x86"],
-    "hostArchitecture": "arm64",
-    "minimumMacOS": minimum,
-    "library": "lib/libunicorn.2.dylib",
-    "sourceArchive": "share/src/switchyard-unicorn/unicorn-" + revision + ".tar.gz",
-    "sourceArchiveSha256": archive_sha,
-    "sourcePatch": {
-        "path": "share/src/switchyard-unicorn/" + patch_basename,
-        "sha256": patch_sha,
-    },
-    "license": "GPL-2.0-only with separately licensed GLib/QEMU components; preserve all included notices and corresponding source",
-}
-if type(value) is not dict or set(value) != set(expected) | {"librarySha256"}:
-    raise ValueError("Unicorn manifest has an unexpected field set")
-for key, wanted in expected.items():
-    if type(value.get(key)) is not type(wanted) or value.get(key) != wanted:
-        raise ValueError("Unicorn manifest field is invalid: " + key)
-if value.get("librarySha256") != library_sha:
-    raise ValueError("Unicorn library digest is invalid")
-PY
-  actual="$(/usr/bin/plutil -extract librarySha256 raw -o - "$metadata" 2>/dev/null || true)"
-  [ "$actual" = "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ] || return 1
-  [ "$(sha256_file "$dylib")" = "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ] || return 1
-  [ "$(nm -gU "$dylib" | /usr/bin/awk \
-      '$NF == "_uc_configure_identity_memory_fastpath" { count++ } END { print count + 0 }')" -eq 1 ] ||
-    return 1
-  [ "$(nm -gU "$dylib" | /usr/bin/awk \
-      '$NF == "_uc_configure_x64_boundary_guard" { count++ } END { print count + 0 }')" -eq 1 ] ||
-    return 1
-  [ "$(nm -gU "$dylib" | /usr/bin/awk \
-      '$NF == "_uc_update_x64_boundary_suspend_doorbell" { count++ } END { print count + 0 }')" -eq 1 ] ||
-    return 1
-  [ "$(nm -gU "$dylib" | /usr/bin/awk \
-      '$NF == "_uc_query_x64_boundary_stop" { count++ } END { print count + 0 }')" -eq 1 ] ||
-    return 1
-  [ "$(nm -gU "$dylib" | /usr/bin/awk \
-      '$NF == "_uc_clear_instruction_boundary_stop" { count++ } END { print count + 0 }')" -eq 1 ] ||
-    return 1
-  [ "$(nm -gU "$dylib" | /usr/bin/awk \
-      '$NF == "_uc_switchyard_x86_64_import_transition_context" { count++ } END { print count + 0 }')" -eq 1 ] ||
-    return 1
-  [ "$(nm -gU "$dylib" | /usr/bin/awk \
-      '$NF == "_uc_switchyard_x86_64_export_transition_context" { count++ } END { print count + 0 }')" -eq 1 ] ||
-    return 1
-  [ "$(sha256_file "$source_archive")" = "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" ] || return 1
-  [ "$(sha256_file "$source_patch")" = "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" ] || return 1
-  /usr/bin/cmp -s "$source_patch" \
-    "$ROOT_DIR/switchyard/patches/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" || return 1
-  validate_archive_members "$source_archive" tar || return 1
-  [ "$(/usr/bin/gzip -dc "$source_archive" | git get-tar-commit-id 2>/dev/null || true)" = \
-    "$SWITCHYARD_UNICORN_SOURCE_REVISION" ] || return 1
-  [ "$(lipo -archs "$dylib")" = "arm64" ] || return 1
-  /usr/bin/codesign --verify --strict --verbose=2 \
-    "$dylib" >/dev/null 2>&1 || return 1
-  [ "$(otool -D "$dylib" | /usr/bin/tail -n 1)" = "@rpath/libunicorn.2.dylib" ] || return 1
-  verify_exact_arm64_macos_metadata "$dylib" "Unicorn runtime" \
-    "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" || return 1
-  while IFS= read -r dependency; do
-    case "$dependency" in
-      @rpath/libunicorn.2.dylib|/usr/lib/*|/System/Library/*) ;;
-      *) return 1 ;;
-    esac
-  done < <(otool -L "$dylib" | /usr/bin/awk 'NR > 1 { print $1 }')
-  [ -z "$(otool -l "$dylib" | /usr/bin/awk \
-    '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')" ] || return 1
-  for notice in README.txt CORRESPONDING-SOURCE.txt COPYING COPYING.LGPL2 COPYING_GLIB \
-      QEMU-COPYING QEMU-COPYING.LIB QEMU-LICENSE; do
-    [ -s "$notice_root/$notice" ] && [ ! -L "$notice_root/$notice" ] || return 1
-  done
+validate_staged_fex_runtime() {
+  [ "$#" -eq 1 ] && [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
+  switchyard_validate_fex_development_sdk "$1/$FEX_PACKAGE_ROOT_RELATIVE"
 }
 
-validate_staged_unicorn_providers() {
-  local runtime_root="$1"
-  local index relative unix_library pe_library pe_description dependency rpath
-  local unicorn_dependency_count ntdll_dependency_count
-  local loader_rpath_count runtime_rpath_count symbol imports
-
-  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
-  [ "${#UNICORN_PROVIDER_UNIXLIBS[@]}" -eq "${#UNICORN_PROVIDER_PE_LIBS[@]}" ] &&
-    [ "${#UNICORN_PROVIDER_UNIXLIBS[@]}" -eq "${#UNICORN_PROVIDER_GUEST_ARCHS[@]}" ] || return 1
-  for index in "${!UNICORN_PROVIDER_UNIXLIBS[@]}"; do
-    relative="${UNICORN_PROVIDER_UNIXLIBS[$index]}"
-    unix_library="$runtime_root/$relative"
-    pe_library="$runtime_root/${UNICORN_PROVIDER_PE_LIBS[$index]}"
-    [ -f "$unix_library" ] && [ ! -L "$unix_library" ] || return 1
-    [ -f "$pe_library" ] && [ ! -L "$pe_library" ] || return 1
-    pe_description="$(file -b "$pe_library")" || return 1
-    case "${UNICORN_PROVIDER_GUEST_ARCHS[$index]}:$pe_description" in
-      i386:*PE32+*Aarch64*|x86_64:*PE32+*x86-64*) ;;
-      *) return 1 ;;
-    esac
-    [ "$(lipo -archs "$unix_library")" = "arm64" ] || return 1
-    /usr/bin/codesign --verify --strict --verbose=2 \
-      "$unix_library" >/dev/null 2>&1 || return 1
-    verify_exact_arm64_macos_metadata "$unix_library" \
-      "native Unicorn provider" "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" || return 1
-    [ "$(otool -D "$unix_library" | /usr/bin/tail -n 1)" = \
-      "@rpath/$(basename "$unix_library")" ] || return 1
-    unicorn_dependency_count=0
-    ntdll_dependency_count=0
-    while IFS= read -r dependency; do
-      case "$dependency" in
-        @rpath/libunicorn.2.dylib)
-          unicorn_dependency_count=$((unicorn_dependency_count + 1))
-          ;;
-        @rpath/ntdll.so)
-          ntdll_dependency_count=$((ntdll_dependency_count + 1))
-          ;;
-        "@rpath/$(basename "$unix_library")"|/usr/lib/*|/System/Library/*)
-          ;;
-        *) return 1 ;;
-      esac
-    done < <(otool -L "$unix_library" | /usr/bin/awk 'NR > 1 { print $1 }')
-    [ "$unicorn_dependency_count" -eq 1 ] || return 1
-    [ "$ntdll_dependency_count" -eq 1 ] || return 1
-    imports="$(nm -u "$unix_library")" || return 1
-    for symbol in uc_emu_stop_at_instruction_boundary \
-        uc_enable_shared_memory_atomics; do
-      /usr/bin/grep -Eq "(^|[[:space:]])_?${symbol}$" <<<"$imports" || return 1
-    done
-    if [ "${UNICORN_PROVIDER_GUEST_ARCHS[$index]}" = x86_64 ]; then
-      for symbol in uc_set_shared_memory_atomic_callback \
-          uc_clear_instruction_boundary_stop \
-          uc_configure_identity_memory_fastpath \
-          uc_configure_x64_boundary_guard \
-          uc_update_x64_boundary_suspend_doorbell \
-          uc_query_x64_boundary_stop \
-          uc_switchyard_x86_64_import_transition_context \
-          uc_switchyard_x86_64_export_transition_context; do
-        /usr/bin/grep -Eq "(^|[[:space:]])_?${symbol}$" <<<"$imports" || return 1
-      done
-    fi
-    loader_rpath_count=0
-    runtime_rpath_count=0
-    while IFS= read -r rpath; do
-      case "$rpath" in
-        "$UNICORN_RUNTIME_RPATH")
-          runtime_rpath_count=$((runtime_rpath_count + 1))
-          ;;
-        @loader_path/)
-          loader_rpath_count=$((loader_rpath_count + 1))
-          ;;
-        *) return 1 ;;
-      esac
-    done < <(otool -l "$unix_library" | /usr/bin/awk \
-      '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')
-    [ "$loader_rpath_count" -eq 1 ] || return 1
-    [ "$runtime_rpath_count" -eq 1 ] || return 1
-  done
-}
-
-stage_unicorn_runtime() {
-  local runtime_root="$1"
-  local provider_prefix="$2"
-  local package_root="$runtime_root/$UNICORN_PACKAGE_ROOT_RELATIVE"
-  local source_notice_root="$provider_prefix/share/doc/switchyard-unicorn"
-  local source_archive="$provider_prefix/share/src/switchyard-unicorn/unicorn-${SWITCHYARD_UNICORN_SOURCE_REVISION}.tar.gz"
-  local source_patch="$provider_prefix/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME"
-  local destination_notice_root="$package_root/share/doc/switchyard-unicorn"
-  local destination_source_root="$package_root/share/src/switchyard-unicorn"
+stage_fex_runtime() {
+  [ "$#" -eq 2 ] && [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
+  local runtime_root="$1" provider_prefix="$2"
+  local package_root="$runtime_root/$FEX_PACKAGE_ROOT_RELATIVE"
   local relative unix_library dependency rpath
-  local unicorn_dependency_count loader_rpath_count runtime_rpath_count notice
+  local dependency_count loader_rpath_count runtime_rpath_count
 
-  [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ] || return 1
-  runtime_content_tree_is_verified "$provider_prefix" || {
-    echo "Pinned Unicorn development cache failed content verification." >&2
+  switchyard_validate_fex_development_sdk "$provider_prefix" || {
+    echo "Pinned FEX development SDK failed validation." >&2
     return 1
   }
   [ ! -e "$package_root" ] && [ ! -L "$package_root" ] || {
-    echo "Wine install unexpectedly contains the Unicorn runtime path." >&2
+    echo "Wine install unexpectedly contains the FEX package path." >&2
     return 1
   }
-  [ -f "$provider_prefix/lib/libunicorn.2.dylib" ] && \
-    [ ! -L "$provider_prefix/lib/libunicorn.2.dylib" ] || return 1
-  [ -f "$provider_prefix/switchyard-unicorn-runtime.json" ] && \
-    [ ! -L "$provider_prefix/switchyard-unicorn-runtime.json" ] || return 1
-  [ -f "$source_archive" ] && [ ! -L "$source_archive" ] || return 1
-  [ -f "$source_patch" ] && [ ! -L "$source_patch" ] || return 1
-  [ "$(sha256_file "$source_patch")" = "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" ] || return 1
+  # Preserve the complete source/header/license SDK closure and alias modes.
+  # The private Wine stage is unpublished; never modify the shared SDK.
+  /usr/bin/ditto --noextattr --noqtn "$provider_prefix" "$package_root" || return 1
+  validate_staged_fex_runtime "$runtime_root" || return 1
 
-  mkdir -p "$package_root/lib" "$destination_notice_root" "$destination_source_root"
-  chmod 0755 "$package_root" "$package_root/lib" "$package_root/share" \
-    "$package_root/share/doc" "$destination_notice_root" "$package_root/share/src" \
-    "$destination_source_root"
-  install -m 0755 "$provider_prefix/lib/libunicorn.2.dylib" \
-    "$runtime_root/$UNICORN_DYLIB_RELATIVE"
-  ln -s libunicorn.2.dylib "$package_root/lib/libunicorn.dylib"
-  install -m 0644 "$provider_prefix/switchyard-unicorn-runtime.json" \
-    "$package_root/switchyard-unicorn-runtime.json"
-  for notice in README.txt CORRESPONDING-SOURCE.txt COPYING COPYING.LGPL2 COPYING_GLIB \
-      QEMU-COPYING QEMU-COPYING.LIB QEMU-LICENSE; do
-    [ -f "$source_notice_root/$notice" ] && [ ! -L "$source_notice_root/$notice" ] || {
-      echo "Pinned Unicorn development cache is missing $notice." >&2
-      return 1
-    }
-    install -m 0644 "$source_notice_root/$notice" "$destination_notice_root/$notice"
-  done
-  install -m 0644 "$source_archive" "$destination_source_root/$(basename "$source_archive")"
-  install -m 0644 "$source_patch" "$destination_source_root/$(basename "$source_patch")"
-  write_runtime_content_tree_digest "$package_root" >/dev/null
-
-  for relative in "${UNICORN_PROVIDER_UNIXLIBS[@]}"; do
+  for relative in "${FEX_PROVIDER_UNIXLIBS[@]}"; do
     unix_library="$runtime_root/$relative"
-    [ -f "$unix_library" ] && [ ! -L "$unix_library" ] || {
-      echo "Wine install is missing native Unicorn provider $relative." >&2
-      return 1
-    }
-    unicorn_dependency_count=0
+    [ -f "$unix_library" ] && [ ! -L "$unix_library" ] || return 1
+    dependency_count=0
     while IFS= read -r dependency; do
-      case "$dependency" in
-        */libunicorn.2.dylib|*/libunicorn.dylib)
-          unicorn_dependency_count=$((unicorn_dependency_count + 1))
-          if [ "$dependency" != "@rpath/libunicorn.2.dylib" ]; then
-            install_name_tool -change "$dependency" "@rpath/libunicorn.2.dylib" "$unix_library"
-          fi
-          ;;
-      esac
-    done < <(otool -L "$unix_library" | /usr/bin/awk 'NR > 1 { print $1 }')
-    [ "$unicorn_dependency_count" -eq 1 ] || {
-      echo "Native provider has an ambiguous Unicorn dependency: $relative" >&2
+      if [ "$dependency" = "$SWITCHYARD_NATIVE_FEX_INSTALL_NAME" ]; then
+        dependency_count=$((dependency_count + 1))
+      fi
+    done < <(/usr/bin/otool -L "$unix_library" | /usr/bin/awk 'NR > 1 { print $1 }')
+    [ "$dependency_count" -eq 1 ] || {
+      echo "Native provider does not bind exactly the ABI6 FEX dylib: $relative" >&2
       return 1
     }
     loader_rpath_count=0
     runtime_rpath_count=0
     while IFS= read -r rpath; do
       case "$rpath" in
-        "$UNICORN_RUNTIME_RPATH")
-          runtime_rpath_count=$((runtime_rpath_count + 1))
-          ;;
-        @loader_path/)
-          loader_rpath_count=$((loader_rpath_count + 1))
-          ;;
-        @loader_path)
-          install_name_tool -delete_rpath "$rpath" "$unix_library"
-          ;;
-        *)
-          install_name_tool -delete_rpath "$rpath" "$unix_library"
-          ;;
+        "$FEX_RUNTIME_RPATH") runtime_rpath_count=$((runtime_rpath_count + 1)) ;;
+        @loader_path/) loader_rpath_count=$((loader_rpath_count + 1)) ;;
+        *) /usr/bin/install_name_tool -delete_rpath "$rpath" "$unix_library" || return 1 ;;
       esac
-    done < <(otool -l "$unix_library" | /usr/bin/awk \
+    done < <(/usr/bin/otool -l "$unix_library" | /usr/bin/awk \
       '/cmd LC_RPATH/{found=1; next} found && /path /{print $2; found=0}')
     if [ "$loader_rpath_count" -eq 0 ]; then
-      install_name_tool -add_rpath '@loader_path/' "$unix_library"
+      /usr/bin/install_name_tool -add_rpath '@loader_path/' "$unix_library" || return 1
     elif [ "$loader_rpath_count" -ne 1 ]; then
-      echo "Native provider has duplicate ntdll loader rpaths: $relative" >&2
+      echo "Native provider has duplicate loader rpaths: $relative" >&2
       return 1
     fi
     if [ "$runtime_rpath_count" -eq 0 ]; then
-      install_name_tool -add_rpath "$UNICORN_RUNTIME_RPATH" "$unix_library"
+      /usr/bin/install_name_tool -add_rpath "$FEX_RUNTIME_RPATH" "$unix_library" || return 1
     elif [ "$runtime_rpath_count" -ne 1 ]; then
-      echo "Native provider has duplicate Unicorn runtime rpaths: $relative" >&2
+      echo "Native provider has duplicate FEX rpaths: $relative" >&2
       return 1
     fi
+    adhoc_sign_and_verify_host_macho_file "$unix_library" \
+      "relocated native FEX provider" || return 1
   done
-
-  for relative in "${UNICORN_PROVIDER_UNIXLIBS[@]}"; do
-    adhoc_sign_and_verify_host_macho_file "$runtime_root/$relative" \
-      "relocated native Unicorn provider" || return 1
-  done
-
-  validate_staged_unicorn_runtime "$runtime_root" || {
-    echo "Staged Unicorn runtime payload failed validation." >&2
-    return 1
-  }
-  validate_staged_unicorn_providers "$runtime_root" || {
-    echo "Staged native Unicorn providers failed validation." >&2
-    return 1
-  }
+  # Full Mach-O/PE ABI, imports, signatures and the exact package inventory are
+  # composed by native_arm64_packaging.sh after the root manifest is emitted.
 }
 
 if [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_ROSETTA" = "true" ] &&
@@ -3453,21 +3139,21 @@ else
   tls_dlopen_closure_digest="none"
 fi
 
-unicorn_runtime_prefix=""
-unicorn_runtime_digest=""
+fex_runtime_prefix=""
+fex_runtime_digest=""
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-  echo "building or validating pinned Unicorn $SWITCHYARD_UNICORN_VERSION for native ARM64"
-  "$ROOT_DIR/switchyard/build_unicorn_runtime.sh" \
-    --output "$UNICORN_RUNTIME_PREFIX" \
+  echo "building or validating pinned FEX $SWITCHYARD_FEX_VERSION for native ARM64"
+  "$ROOT_DIR/switchyard/build_fex_runtime.sh" \
+    --output "$FEX_RUNTIME_PREFIX" \
     --minimum-macos "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" >/dev/null
-  unicorn_runtime_prefix="$UNICORN_RUNTIME_PREFIX"
-  runtime_content_tree_is_verified "$unicorn_runtime_prefix" || {
-    echo "Pinned Unicorn development cache failed content verification." >&2
+  fex_runtime_prefix="$FEX_RUNTIME_PREFIX"
+  runtime_content_tree_is_verified "$fex_runtime_prefix" || {
+    echo "Pinned FEX development cache failed content verification." >&2
     exit 1
   }
-  unicorn_runtime_digest="$(runtime_content_tree_digest "$unicorn_runtime_prefix")"
-  [ "$unicorn_runtime_digest" = "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" ] || {
-    echo "Pinned Unicorn development cache has an unexpected closed-policy digest." >&2
+  fex_runtime_digest="$(runtime_content_tree_digest "$fex_runtime_prefix")"
+  [ "$fex_runtime_digest" = "$SWITCHYARD_FEX_DEVELOPMENT_CACHE_DIGEST" ] || {
+    echo "Pinned FEX development cache has an unexpected closed-policy digest." >&2
     exit 1
   }
 fi
@@ -3489,7 +3175,7 @@ if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
       "$gptk_redist_digest" "$wine_mono_digest" "$gstreamer_closure_digest" \
       "$vulkan_closure_digest" "$mesa_closure_digest" "$font_closure_digest" \
       "$font_assets_closure_digest" "$tls_closure_digest" "$TLS_DLOPEN_NAME" \
-      "$tls_dlopen_closure_digest" "$unicorn_runtime_digest" \
+      "$tls_dlopen_closure_digest" "$fex_runtime_digest" \
       "$SWITCHYARD_DXMT_ARTIFACT_SHA256" "$SWITCHYARD_DXMT_SOURCE_PATCH_SHA256" \
       "$SWITCHYARD_DXMT_WINEMETAL_ORIGINAL_SHA256" \
       "$DXMT_WOW64_COMPANION_ABI_SCHEMA_SHA256" "$NATIVE_COMPILER_POLICY_IDENTITY"
@@ -3528,14 +3214,14 @@ runtime_is_complete_at() {
   local manifest_install_prefix
   local manifest_executable
   local expected_wine_sha
-  local expected_i386_ntdll_sha
+  local expected_primary_ntdll_sha
   local expected_x86_64_ntdll_sha
   local manifest_font_assets_digest
   local manifest_gstreamer_digest
   local manifest_mesa_digest
-  local manifest_unicorn_digest
-  local manifest_unicorn_payload_digest
-  local manifest_unicorn_library_sha
+  local manifest_fex_digest
+  local manifest_fex_payload_digest
+  local manifest_fex_library_sha
   local manifest_provider_sha
   local manifest_native_value
   local index
@@ -3568,15 +3254,21 @@ runtime_is_complete_at() {
   [ -f "$prefix/share/switchyard/gpu_capability_policy.sh" ] || return 1
   [ -x "$prefix/libexec/switchyard-host-gpu-info" ] || return 1
   [ -x "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/wine" ] || return 1
-  [ -f "$prefix/lib/wine/i386-windows/ntdll.dll" ] || return 1
   [ -f "$prefix/lib/wine/x86_64-windows/ntdll.dll" ] || return 1
   expected_wine_sha="$(/usr/bin/plutil -extract integrity.wineUnixSha256 raw -o - "$manifest" 2>/dev/null || true)"
-  expected_i386_ntdll_sha="$(/usr/bin/plutil -extract integrity.i386NtdllSha256 raw -o - "$manifest" 2>/dev/null || true)"
   expected_x86_64_ntdll_sha="$(/usr/bin/plutil -extract integrity.x86_64NtdllSha256 raw -o - "$manifest" 2>/dev/null || true)"
   [ -n "$expected_wine_sha" ] &&
     [ "$(sha256_file "$prefix/lib/wine/$WINE_UNIX_ARCH-unix/wine")" = "$expected_wine_sha" ] || return 1
-  [ -n "$expected_i386_ntdll_sha" ] &&
-    [ "$(sha256_file "$prefix/lib/wine/i386-windows/ntdll.dll")" = "$expected_i386_ntdll_sha" ] || return 1
+  if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+    expected_primary_ntdll_sha="$(switchyard_runtime_manifest_value integrity.aarch64NtdllSha256 "$manifest")"
+    [ -n "$expected_primary_ntdll_sha" ] &&
+      [ "$(sha256_file "$prefix/lib/wine/aarch64-windows/ntdll.dll")" = "$expected_primary_ntdll_sha" ] || return 1
+    [ ! -e "$prefix/lib/wine/i386-windows/ntdll.dll" ] && [ ! -L "$prefix/lib/wine/i386-windows/ntdll.dll" ] || return 1
+  else
+    expected_primary_ntdll_sha="$(switchyard_runtime_manifest_value integrity.i386NtdllSha256 "$manifest")"
+    [ -n "$expected_primary_ntdll_sha" ] &&
+      [ "$(sha256_file "$prefix/lib/wine/i386-windows/ntdll.dll")" = "$expected_primary_ntdll_sha" ] || return 1
+  fi
   [ -n "$expected_x86_64_ntdll_sha" ] &&
     [ "$(sha256_file "$prefix/lib/wine/x86_64-windows/ntdll.dll")" = "$expected_x86_64_ntdll_sha" ] || return 1
   manifest_gstreamer_digest="$(/usr/bin/plutil -extract gstreamerRuntime.digest raw -o - "$manifest" 2>/dev/null || true)"
@@ -3704,23 +3396,22 @@ runtime_is_complete_at() {
     manifest_native_value="$(/usr/bin/plutil -extract vulkanRuntime.moltenVK.layerSha256 raw -o - "$manifest" 2>/dev/null || true)"
     [ "$manifest_native_value" = "$MOLTENVK_LAYER_SHA256" ] || return 1
 
-    validate_staged_unicorn_runtime "$prefix" >/dev/null 2>&1 || return 1
-    validate_staged_unicorn_providers "$prefix" >/dev/null 2>&1 || return 1
-    manifest_unicorn_digest="$(/usr/bin/plutil -extract cpuProvider.developmentCacheDigest raw -o - "$manifest" 2>/dev/null || true)"
-    [ "$manifest_unicorn_digest" = "$unicorn_runtime_digest" ] || return 1
-    manifest_unicorn_payload_digest="$(/usr/bin/plutil -extract cpuProvider.runtimePayloadDigest raw -o - "$manifest" 2>/dev/null || true)"
-    [ "$manifest_unicorn_payload_digest" = \
-      "$(runtime_content_tree_digest "$prefix/$UNICORN_PACKAGE_ROOT_RELATIVE")" ] || return 1
-    manifest_unicorn_library_sha="$(/usr/bin/plutil -extract cpuProvider.librarySha256 raw -o - "$manifest" 2>/dev/null || true)"
-    [ "$manifest_unicorn_library_sha" = \
-      "$(sha256_file "$prefix/$UNICORN_DYLIB_RELATIVE")" ] || return 1
-    for index in "${!UNICORN_PROVIDER_UNIXLIBS[@]}"; do
+    validate_staged_fex_runtime "$prefix" >/dev/null 2>&1 || return 1
+    manifest_fex_digest="$(/usr/bin/plutil -extract cpuProvider.developmentCacheDigest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_fex_digest" = "$fex_runtime_digest" ] || return 1
+    manifest_fex_payload_digest="$(/usr/bin/plutil -extract cpuProvider.runtimePayloadDigest raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_fex_payload_digest" = \
+      "$(runtime_content_tree_digest "$prefix/$FEX_PACKAGE_ROOT_RELATIVE")" ] || return 1
+    manifest_fex_library_sha="$(/usr/bin/plutil -extract cpuProvider.librarySha256 raw -o - "$manifest" 2>/dev/null || true)"
+    [ "$manifest_fex_library_sha" = \
+      "$(sha256_file "$prefix/$FEX_DYLIB_RELATIVE")" ] || return 1
+    for index in "${!FEX_PROVIDER_UNIXLIBS[@]}"; do
       manifest_provider_sha="$(/usr/bin/plutil -extract "cpuProvider.components.$index.unixLibrarySha256" raw -o - "$manifest" 2>/dev/null || true)"
       [ "$manifest_provider_sha" = \
-        "$(sha256_file "$prefix/${UNICORN_PROVIDER_UNIXLIBS[$index]}")" ] || return 1
+        "$(sha256_file "$prefix/${FEX_PROVIDER_UNIXLIBS[$index]}")" ] || return 1
       manifest_provider_sha="$(/usr/bin/plutil -extract "cpuProvider.components.$index.peLibrarySha256" raw -o - "$manifest" 2>/dev/null || true)"
       [ "$manifest_provider_sha" = \
-        "$(sha256_file "$prefix/${UNICORN_PROVIDER_PE_LIBS[$index]}")" ] || return 1
+        "$(sha256_file "$prefix/${FEX_PROVIDER_PE_LIBS[$index]}")" ] || return 1
     done
     switchyard_validate_native_arm64_runtime_packaging \
       "$prefix" "$manifest" "$ROOT_DIR" >/dev/null 2>&1 || return 1
@@ -3871,21 +3562,8 @@ if [ "$configured" -eq 1 ]; then
          "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
        ! grep -F -- "$SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG" \
          "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F -- "--with-unicorn" "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "UNICORN_CFLAGS = -I${unicorn_runtime_prefix}/lib/pkgconfig/../../include" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "UNICORN_LIBS = -L${unicorn_runtime_prefix}/lib/pkgconfig/.. -lunicorn" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "XTAJIT64_UNIXLIB = xtajit64.so" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "XTAJIT64_PE_CFLAGS = -DHAVE_UNICORN" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "XTAJIT_UNIXLIB = xtajit.so" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "XTAJIT_PE_CFLAGS = -DHAVE_UNICORN" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "WINEMETAL_WOW64_UNIXLIB = winemetal-wow64.so" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
+       ! switchyard_native_configured_fex_policy_is_exact \
+         "$WINE_BUILD_DIR/Makefile" "$WINE_BUILD_DIR/config.status" "$fex_runtime_prefix"; then
       echo "existing native Wine build does not use the exact native provider and DXMT companion; reconfiguring"
       RECONFIGURE=1
     fi
@@ -3915,12 +3593,12 @@ if [ "$configured" -eq 0 ]; then
     configure_pkg_config_path="${tls_deps_prefix}/lib/pkgconfig:${configure_pkg_config_path}"
   fi
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-    configure_cppflags="-I${unicorn_runtime_prefix}/include ${configure_cppflags}"
-    configure_ldflags="-L${unicorn_runtime_prefix}/lib -Wl,-rpath,${unicorn_runtime_prefix}/lib ${configure_ldflags}"
-    configure_pkg_config_path="${unicorn_runtime_prefix}/lib/pkgconfig:${configure_pkg_config_path}"
+    configure_cppflags="-I${fex_runtime_prefix}/include ${configure_cppflags}"
+    configure_ldflags="-L${fex_runtime_prefix}/lib -Wl,-rpath,${fex_runtime_prefix}/lib ${configure_ldflags}"
     profile_configure_options+=(
       "--with-mingw=$NATIVE_MINGW_CLANG"
-      --with-unicorn
+      "--with-fex=$fex_runtime_prefix"
+      "--disable-xtajit"
     )
   fi
   configure_cc="clang -arch $HOST_MACHO_ARCH"
@@ -3970,7 +3648,7 @@ if [ "$configured" -eq 0 ]; then
       CXX="$configure_cxx" \
       OBJC="$configure_objc" \
       --enable-archs="$SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV" \
-      "${profile_configure_options[@]}" \
+      ${profile_configure_options[@]+"${profile_configure_options[@]}"} \
       --disable-tests \
       --without-alsa \
       --without-capi \
@@ -4032,20 +3710,8 @@ if [ "$configured" -eq 0 ]; then
     exit 1
   fi
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-    if ! grep -F "UNICORN_CFLAGS = -I${unicorn_runtime_prefix}/lib/pkgconfig/../../include" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "UNICORN_LIBS = -L${unicorn_runtime_prefix}/lib/pkgconfig/.. -lunicorn" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "XTAJIT64_UNIXLIB = xtajit64.so" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "XTAJIT64_PE_CFLAGS = -DHAVE_UNICORN" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "XTAJIT_UNIXLIB = xtajit.so" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "XTAJIT_PE_CFLAGS = -DHAVE_UNICORN" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1 ||
-       ! grep -F "WINEMETAL_WOW64_UNIXLIB = winemetal-wow64.so" \
-         "$WINE_BUILD_DIR/config.status" >/dev/null 2>&1; then
+    if ! switchyard_native_configured_fex_policy_is_exact \
+         "$WINE_BUILD_DIR/Makefile" "$WINE_BUILD_DIR/config.status" "$fex_runtime_prefix"; then
       echo "Wine configure did not enable the native providers and DXMT WoW64 companion." >&2
       exit 1
     fi
@@ -4304,15 +3970,9 @@ if [ -n "$tls_deps_prefix" ]; then
   fi
 fi
 
-unicorn_payload_digest=""
-unicorn_library_sha256=""
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-  echo "installing the pinned Unicorn native CPU-provider runtime closure"
-  stage_unicorn_runtime "$WINE_INSTALL_PREFIX" "$unicorn_runtime_prefix"
-  unicorn_payload_digest="$(
-    runtime_content_tree_digest "$WINE_INSTALL_PREFIX/$UNICORN_PACKAGE_ROOT_RELATIVE"
-  )"
-  unicorn_library_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/$UNICORN_DYLIB_RELATIVE")"
+  echo "installing the pinned FEX native CPU-provider runtime closure"
+  stage_fex_runtime "$WINE_INSTALL_PREFIX" "$fex_runtime_prefix"
 fi
 
 echo "installing Wine license, source, and replacement notices"
@@ -4379,11 +4039,6 @@ if [ ! -x "$WINE_INSTALL_PREFIX/bin/wine.switchyard-real" ] &&
   exit 1
 fi
 
-SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH=0
-if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
-  SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH=1
-fi
-
 cat >"$WINE_INSTALL_PREFIX/bin/wine" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -4418,12 +4073,6 @@ prepend_path() {
 
 export DYLD_LIBRARY_PATH="$(prepend_path "$vulkan_lib" "${DYLD_LIBRARY_PATH:-}")"
 export DYLD_FALLBACK_LIBRARY_PATH="$(prepend_path "$vulkan_lib" "${DYLD_FALLBACK_LIBRARY_PATH:-}")"
-if [ "__SWITCHYARD_JIT_DIRECT_HIT_BATCH__" = "1" ] &&
-   [ -z "${UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH+x}" ]; then
-  # Native Unicorn: keep MAP_JIT executable over ordinary direct TB-cache hits.
-  # An explicitly supplied value, including 0, remains an immediate kill switch.
-  export UC_SWITCHYARD_JIT_DIRECT_HIT_BATCH=1
-fi
 if [ -d "$font_lib" ]; then
   export DYLD_LIBRARY_PATH="$(prepend_path "$font_lib" "${DYLD_LIBRARY_PATH:-}")"
   export DYLD_FALLBACK_LIBRARY_PATH="$(prepend_path "$font_lib" "${DYLD_FALLBACK_LIBRARY_PATH:-}")"
@@ -4533,11 +4182,9 @@ exec -a "$invoked_path" "$real_executable" "$@"
 EOF
 SWITCHYARD_WRAPPER_GSTREAMER_REGISTRY_ARCH="$SWITCHYARD_RUNTIME_PROFILE_GSTREAMER_REGISTRY_ARCH" \
 SWITCHYARD_WRAPPER_WINE_UNIX_ARCH="$WINE_UNIX_ARCH" \
-SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH="$SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH" \
   perl -0pi -e '
     s/__SWITCHYARD_GSTREAMER_REGISTRY_ARCH__/$ENV{SWITCHYARD_WRAPPER_GSTREAMER_REGISTRY_ARCH}/g;
     s/__SWITCHYARD_WINE_UNIX_ARCH__/$ENV{SWITCHYARD_WRAPPER_WINE_UNIX_ARCH}/g;
-    s/__SWITCHYARD_JIT_DIRECT_HIT_BATCH__/$ENV{SWITCHYARD_WRAPPER_JIT_DIRECT_HIT_BATCH}/g;
   ' "$WINE_INSTALL_PREFIX/bin/wine"
 chmod 0755 "$WINE_INSTALL_PREFIX/bin/wine"
 if [ -x "$WINE_INSTALL_PREFIX/bin/wine64.switchyard-real" ]; then
@@ -4557,7 +4204,13 @@ wine_real_sha256=""
 if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
   wine_real_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/bin/wine.switchyard-real")"
 fi
-i386_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/i386-windows/ntdll.dll")"
+primary_ntdll_field="i386NtdllSha256"
+primary_ntdll_arch="i386"
+if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
+  primary_ntdll_field="aarch64NtdllSha256"
+  primary_ntdll_arch="aarch64"
+fi
+primary_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/$primary_ntdll_arch-windows/ntdll.dll")"
 x86_64_ntdll_sha256="$(sha256_file "$WINE_INSTALL_PREFIX/lib/wine/x86_64-windows/ntdll.dll")"
 
 assert_source_state_unchanged "runtime assembly"
@@ -4609,7 +4262,7 @@ assert_source_state_unchanged "runtime assembly"
   printf '  "executable": %s,\n' "$(json_string "$wine_executable")"
   printf '  "integrity": {\n'
   printf '    "wineUnixSha256": %s,\n' "$(json_string "$wine_unix_sha256")"
-  printf '    "i386NtdllSha256": %s,\n' "$(json_string "$i386_ntdll_sha256")"
+  printf '    "%s": %s,\n' "$primary_ntdll_field" "$(json_string "$primary_ntdll_sha256")"
   printf '    "x86_64NtdllSha256": %s\n' "$(json_string "$x86_64_ntdll_sha256")"
   printf '  },\n'
   if [ "$NATIVE_CPU_PROVIDER_ENABLED" -eq 1 ]; then
@@ -4622,69 +4275,9 @@ assert_source_state_unchanged "runtime assembly"
       "$(json_string "$wine_real_sha256")"
     printf '    ]\n'
     printf '  },\n'
-    printf '  "cpuProvider": {\n'
-    printf '    "implementation": "unicorn",\n'
-    printf '    "version": %s,\n' "$(json_string "$SWITCHYARD_UNICORN_VERSION")"
-    printf '    "sourceRepository": %s,\n' \
-      "$(json_string "$SWITCHYARD_UNICORN_SOURCE_REPOSITORY")"
-    printf '    "sourceRevision": %s,\n' \
-      "$(json_string "$SWITCHYARD_UNICORN_SOURCE_REVISION")"
-    printf '    "sourceArchive": %s,\n' \
-      "$(json_string "$UNICORN_PACKAGE_ROOT_RELATIVE/share/src/switchyard-unicorn/unicorn-${SWITCHYARD_UNICORN_SOURCE_REVISION}.tar.gz")"
-    printf '    "sourceArchiveSha256": %s,\n' \
-      "$(json_string "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256")"
-    printf '    "sourcePatch": {\n'
-    printf '      "path": %s,\n' "$(json_string "$UNICORN_SOURCE_PATCH_RELATIVE")"
-    printf '      "sha256": %s\n' \
-      "$(json_string "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256")"
-    printf '    },\n'
-    printf '    "buildContractVersion": %s,\n' \
-      "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION"
-    printf '    "hostArchitecture": "arm64",\n'
-    printf '    "kuserSharedDataModel": %s,\n' \
-      "$(json_string "$SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL")"
-    printf '    "emulatedArchitectures": ["i386", "x86_64"],\n'
-    printf '    "developmentCacheDigest": %s,\n' \
-      "$(json_string "$unicorn_runtime_digest")"
-    printf '    "runtimeRoot": %s,\n' \
-      "$(json_string "$UNICORN_PACKAGE_ROOT_RELATIVE")"
-    printf '    "runtimePayloadDigest": %s,\n' \
-      "$(json_string "$unicorn_payload_digest")"
-    printf '    "library": %s,\n' "$(json_string "$UNICORN_DYLIB_RELATIVE")"
-    printf '    "librarySha256": %s,\n' "$(json_string "$unicorn_library_sha256")"
-    printf '    "providerUnixLibraries": [\n'
-    for index in "${!UNICORN_PROVIDER_UNIXLIBS[@]}"; do
-      if [ "$index" -lt "$((${#UNICORN_PROVIDER_UNIXLIBS[@]} - 1))" ]; then
-        printf '      %s,\n' "$(json_string "${UNICORN_PROVIDER_UNIXLIBS[$index]}")"
-      else
-        printf '      %s\n' "$(json_string "${UNICORN_PROVIDER_UNIXLIBS[$index]}")"
-      fi
-    done
-    printf '    ],\n'
-    printf '    "components": [\n'
-    for index in "${!UNICORN_PROVIDER_UNIXLIBS[@]}"; do
-      printf '      {\n'
-      printf '        "guestArchitecture": %s,\n' \
-        "$(json_string "${UNICORN_PROVIDER_GUEST_ARCHS[$index]}")"
-      printf '        "unixLibrary": %s,\n' \
-        "$(json_string "${UNICORN_PROVIDER_UNIXLIBS[$index]}")"
-      printf '        "unixLibrarySha256": %s,\n' \
-        "$(json_string "$(sha256_file "$WINE_INSTALL_PREFIX/${UNICORN_PROVIDER_UNIXLIBS[$index]}")")"
-      printf '        "peLibrary": %s,\n' \
-        "$(json_string "${UNICORN_PROVIDER_PE_LIBS[$index]}")"
-      printf '        "peLibrarySha256": %s\n' \
-        "$(json_string "$(sha256_file "$WINE_INSTALL_PREFIX/${UNICORN_PROVIDER_PE_LIBS[$index]}")")"
-      if [ "$index" -lt "$((${#UNICORN_PROVIDER_UNIXLIBS[@]} - 1))" ]; then
-        printf '      },\n'
-      else
-        printf '      }\n'
-      fi
-    done
-    printf '    ],\n'
-    printf '    "runtimeRpath": %s,\n' "$(json_string "$UNICORN_RUNTIME_RPATH")"
-    printf '    "manifest": %s\n' \
-      "$(json_string "$UNICORN_PACKAGE_ROOT_RELATIVE/switchyard-unicorn-runtime.json")"
-    printf '  },\n'
+    printf '  "cpuProvider": '
+    switchyard_emit_native_fex_provider_manifest "$WINE_INSTALL_PREFIX" || exit $?
+    printf ',\n'
   fi
   printf '  "gptkPath": %s,\n' "$(json_string "$GPTK_PATH")"
   printf '  "gptkRedistDigest": %s,\n' "$(json_string "$gptk_redist_digest")"

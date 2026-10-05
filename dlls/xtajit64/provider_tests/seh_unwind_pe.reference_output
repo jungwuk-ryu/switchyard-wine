@@ -1,0 +1,2 @@
+SEH_UNWIND_PASS software access-violation nested-veh scopes=108 catches=12
+exit 0

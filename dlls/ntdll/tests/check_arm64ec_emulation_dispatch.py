@@ -284,7 +284,7 @@ def verify(
     if "InSimulation = 0" in mapping_reconcile:
         raise AssertionError("mapping reconciliation relinquishes provider stack ownership")
     if run_simulation.count(
-        "xtajit64_restore_native( state, ec_context, cpu, params.unicorn_error )"
+        "xtajit64_restore_native( state, ec_context, cpu, params.provider_error )"
     ) != 2:
         raise AssertionError("both native returns must use the assembly ownership handoff")
     if "cpu->InSimulation = 0" in run_simulation:
@@ -380,7 +380,7 @@ def verify(
         (
             "if (suspend_doorbell_is_set( cpu ))",
             "continue_suspended_context( state, ec_context,",
-            "xtajit64_restore_native( state, ec_context, cpu, params.unicorn_error )",
+            "xtajit64_restore_native( state, ec_context, cpu, params.provider_error )",
         ),
         "EC continuation suspend ownership",
     )
@@ -393,7 +393,7 @@ def verify(
         (
             "if (suspend_doorbell_is_set( cpu ))",
             "continue_suspended_context( state, ec_context,",
-            "xtajit64_restore_native( state, ec_context, cpu, params.unicorn_error )",
+            "xtajit64_restore_native( state, ec_context, cpu, params.provider_error )",
         ),
         "EC entry suspend ownership",
     )
@@ -558,7 +558,7 @@ def main() -> int:
 
     native_return = (
         "        xtajit64_restore_native( state, ec_context, cpu, "
-        "params.unicorn_error );\n"
+        "params.provider_error );\n"
     )
     early_return_clear = "        cpu->InSimulation = 0;\n"
     mutated = provider_source.replace(

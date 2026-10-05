@@ -1673,6 +1673,16 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
          "mov x1, sp\n\t"               /* context */
          "add x2, sp, #0x4d0\n\t"       /* arm_ctx (context + 1) */
          "bl \"#prepare_exception_arm64ec\"\n\t"
+         ".seh_endproc\n\t"
+         /* ResetToConsistentState may have replaced a JIT host context with
+          * its x64 guest context. Unwind through that authoritative context,
+          * not the abandoned native activation. An unwound return PC is
+          * adjusted back to the prepare BL, in the ARM-context range; a
+          * fault at this instruction uses the fully prepared EC context. */
+         ".seh_proc dispatch_prepared_exception\n"
+         "dispatch_prepared_exception:\n\t"
+         ".seh_ec_context\n\t"
+         ".seh_endprologue\n\t"
          "cbz x0, 1f\n\t"
          /* bypass exit thunk to avoid messing up the stack */
          "adrp x16, __os_arm64x_dispatch_call_no_redirect\n\t"

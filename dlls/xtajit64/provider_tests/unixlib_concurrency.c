@@ -2914,11 +2914,11 @@ static void test_low_observer_lazy_sync_poison(void)
     }
     check( holder.simulation_status == STATUS_UNSUCCESSFUL &&
            holder.params.stop_reason == XTAJIT64_STOP_INTERNAL_ERROR &&
-           holder.params.unicorn_error == UC_ERR_RESOURCE &&
+           holder.params.provider_error == UC_ERR_RESOURCE &&
            observer_provider_status() == STATUS_UNSUCCESSFUL,
            "lazy LOW sync failure did not poison provider %#x reason %u uc %u/%#x\n",
            (unsigned int)holder.simulation_status, holder.params.stop_reason,
-           holder.params.unicorn_error, (unsigned int)observer_provider_status() );
+           holder.params.provider_error, (unsigned int)observer_provider_status() );
     check( memory_map_calls == 1 && memory_unmap_calls == 1 &&
            !cache_flush_calls &&
            atomic_load_explicit( &test_emu_start_count, memory_order_relaxed ) ==

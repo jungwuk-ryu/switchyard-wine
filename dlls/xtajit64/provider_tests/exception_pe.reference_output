@@ -1,0 +1,6 @@
+EXCEPTION_PE_PASS software
+EXCEPTION_PE_PASS low read
+EXCEPTION_PE_PASS low write
+EXCEPTION_PE_PASS high read
+EXCEPTION_PE_PASS high write
+exit 0

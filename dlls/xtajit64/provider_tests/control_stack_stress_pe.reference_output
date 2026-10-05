@@ -1,0 +1,2 @@
+CONTROL_STACK_STRESS_PASS scalar=16384 branches=4096 cpuid=512 simd=8192 cold-rounds=3
+exit 0

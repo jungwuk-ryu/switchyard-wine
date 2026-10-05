@@ -1,0 +1,2 @@
+PRIVATE_CODE_WRITE_GUARD_PASS rx-neighbor-write-denied
+exit 0

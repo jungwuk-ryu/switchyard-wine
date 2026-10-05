@@ -1,0 +1,2 @@
+ARM64EC_CALL_PATCH_PASS ffs patch repatch restore retarget x18 last-error
+exit 0

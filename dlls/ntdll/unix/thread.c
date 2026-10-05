@@ -77,6 +77,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "../arm64ec_guest_flags.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -592,6 +593,7 @@ static NTSTATUS context_to_server( struct context_data *to, USHORT to_machine, c
             to->ctl.arm64_regs.sp     = from->Sp;
             to->ctl.arm64_regs.pc     = from->Pc;
             to->ctl.arm64_regs.pstate = from->Cpsr;
+            to->ctl.arm64_regs.context_flags = arm64ec_guest_context_flags( from->ContextFlags );
         }
         if (flags & CONTEXT_ARM64_INTEGER)
         {
@@ -1013,6 +1015,8 @@ static NTSTATUS context_from_server( void *dst, const struct context_data *from,
             to->Sp   = from->ctl.arm64_regs.sp;
             to->Pc   = from->ctl.arm64_regs.pc;
             to->Cpsr = from->ctl.arm64_regs.pstate;
+            to->ContextFlags &= ~(ARM64EC_GUEST_FLAGS_MASK | CONTEXT_ARM64_RET_TO_GUEST);
+            to->ContextFlags |= arm64ec_guest_context_flags( from->ctl.arm64_regs.context_flags | 1u );
         }
         if ((from->flags & SERVER_CTX_INTEGER) && (to_flags & CONTEXT_ARM64_INTEGER))
         {

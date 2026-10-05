@@ -2184,8 +2184,8 @@ switchyard_release_preview_native() {
   refresh_inventory_arguments=("$native_release_runtime_fd")
   for marker in \
       switchyard-runtime.json \
-      lib/switchyard-unicorn/switchyard-unicorn-runtime.json \
-      lib/switchyard-unicorn/.switchyard-content-sha256 \
+      lib/switchyard-fex/switchyard-fex-runtime.json \
+      lib/switchyard-fex/.switchyard-content-sha256 \
       lib/switchyard-dxmt/share/doc/switchyard-dxmt/files.sha256 \
       lib/switchyard-gstreamer/.switchyard-content-sha256 \
       lib/switchyard-vulkan/.switchyard-content-sha256 \

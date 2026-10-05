@@ -57,7 +57,7 @@ AC_ARG_WITH(pulse,     AS_HELP_STRING([--without-pulse],[do not use PulseAudio s
 AC_ARG_WITH(sane,      AS_HELP_STRING([--without-sane],[do not use SANE (scanner support)]))
 AC_ARG_WITH(sdl,       AS_HELP_STRING([--without-sdl],[do not use SDL]))
 AC_ARG_WITH(udev,      AS_HELP_STRING([--without-udev],[do not use udev (plug and play support)]))
-AC_ARG_WITH(unicorn,   AS_HELP_STRING([--with-unicorn],[use Unicorn for ARM64 x86 emulation]))
+AC_ARG_WITH(fex,       AS_HELP_STRING([--with-fex@<:@=PREFIX@:>@],[use Switchyard FEX for native ARM64 x86-64 emulation]))
 AC_ARG_WITH(usb,       AS_HELP_STRING([--without-usb],[do not use the libusb library]))
 AC_ARG_WITH(v4l2,      AS_HELP_STRING([--without-v4l2],[do not use v4l2 (video capture)]))
 AC_ARG_WITH(vulkan,    AS_HELP_STRING([--without-vulkan],[do not use Vulkan]))
@@ -1548,45 +1548,53 @@ WINE_NOTICE_WITH(opencl,[test "x$ac_cv_func_clGetPlatformInfo" != xyes],
                  [OpenCL ${notice_platform}development files not found, OpenCL won't be supported.],
                  [enable_opencl])
 
-dnl **** Check for Unicorn (explicit opt-in for the ARM64 x86 providers) ****
-if test "x$with_unicorn" != "x" -a "x$with_unicorn" != "xno"
+dnl **** Check for Switchyard FEX (explicit native ARM64 x86-64 provider) ****
+if test "x$with_fex" != "x" -a "x$with_fex" != "xno"
 then
-    WINE_PACKAGE_FLAGS(UNICORN,[unicorn],[-lunicorn],,,
-        [AC_CHECK_HEADER([unicorn/unicorn.h],
-            [AC_CHECK_HEADER([unicorn/x86.h],
-                [AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <unicorn/unicorn.h>
-#if UC_API_MAJOR < 2 || (UC_API_MAJOR == 2 && (UC_API_MINOR < 1 || (UC_API_MINOR == 1 && UC_API_PATCH < 4)))
-#error Unicorn 2.1.4 or newer is required
+    if test "x$with_fex" != "xyes"
+    then
+        SWITCHYARD_FEX_CFLAGS="-I$with_fex/include"
+        SWITCHYARD_FEX_LIBS="-L$with_fex/lib -lswitchyard-fex"
+    fi
+    WINE_PACKAGE_FLAGS(SWITCHYARD_FEX,[switchyard-fex],[-lswitchyard-fex],,,
+        [AC_CHECK_HEADER([switchyard_fex.h],
+            [AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <switchyard_fex.h>
+#if SWITCHYARD_FEX_ABI_VERSION != 6
+#error Switchyard FEX ABI v6 is required
 #endif
-#ifndef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP
-#error Switchyard instruction-boundary stop support is required
-#endif
-#ifndef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP_CLEAR
-#error Switchyard instruction-boundary stop-clear support is required
-#endif
-#ifndef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
-#error Switchyard shared-memory atomic support is required
-#endif
-#ifndef UC_SWITCHYARD_SHARED_CODE_COHERENCE
-#error Switchyard shared-code coherence support is required
+#ifndef SWITCHYARD_FEX_PROVIDER_ABI_IDENTITY
+#error Switchyard FEX provider identity is required
 #endif]])],
-                    [AC_CHECK_FUNC(uc_open,
-                        [AC_CHECK_FUNC(uc_emu_stop_at_instruction_boundary,
-                            [AC_CHECK_FUNC(uc_clear_instruction_boundary_stop,
-                                [AC_CHECK_FUNC(uc_enable_shared_memory_atomics,
-                                    [XTAJIT64_UNIXLIB=xtajit64.so
-                                     XTAJIT64_PE_CFLAGS=-DHAVE_UNICORN
-                                     XTAJIT_UNIXLIB=xtajit.so
-                                     XTAJIT_PE_CFLAGS=-DHAVE_UNICORN],
-                                    [UNICORN_LIBS=""])],
-                                [UNICORN_LIBS=""])],
-                            [UNICORN_LIBS=""])],
-                        [UNICORN_LIBS=""])],
-                    [UNICORN_LIBS=""])],
-                [UNICORN_LIBS=""])],
-            [UNICORN_LIBS=""])])
-    WINE_ERROR_WITH(unicorn,[test "x$UNICORN_LIBS" = "x"],
-                    [Switchyard Unicorn 2.1.4 development files with instruction-boundary stop/clear, shared-memory atomic, and shared-code coherence support not found.])
+                [AC_CHECK_FUNC(switchyard_fex_process_create,
+                    [AC_CHECK_FUNC(switchyard_fex_thread_execute_prepared,
+                        [AC_CHECK_FUNC(switchyard_fex_thread_reconstruct_jit_fault,
+                            [AC_CHECK_FUNC(switchyard_fex_process_invalidate_code,
+                                [AC_CHECK_FUNC(switchyard_fex_thread_repair_unaligned_tso,
+                                    [AC_CHECK_FUNC(switchyard_fex_thread_repair_callret_fault,
+                                        [AC_CHECK_FUNC(switchyard_fex_thread_prepare_dispatch,
+                                            [AC_CHECK_FUNC(switchyard_fex_thread_complete_dispatch,
+                                                [AC_CHECK_FUNC(switchyard_fex_thread_create_with_domain,
+                                                    [AC_CHECK_FUNC(switchyard_fex_thread_prepare_execution,
+                                                        [AC_CHECK_FUNC(switchyard_fex_thread_import_register_window,
+                                                            [AC_CHECK_FUNC(switchyard_fex_thread_export_register_window,
+                                                                [XTAJIT64_UNIXLIB=xtajit64.so
+                                                                 XTAJIT64_PE_CFLAGS=-DHAVE_SWITCHYARD_FEX],
+                                                                [SWITCHYARD_FEX_LIBS=""])],
+                                                            [SWITCHYARD_FEX_LIBS=""])],
+                                                        [SWITCHYARD_FEX_LIBS=""])],
+                                                    [SWITCHYARD_FEX_LIBS=""])],
+                                                [SWITCHYARD_FEX_LIBS=""])],
+                                            [SWITCHYARD_FEX_LIBS=""])],
+                                        [SWITCHYARD_FEX_LIBS=""])],
+                                    [SWITCHYARD_FEX_LIBS=""])],
+                                [SWITCHYARD_FEX_LIBS=""])],
+                            [SWITCHYARD_FEX_LIBS=""])],
+                        [SWITCHYARD_FEX_LIBS=""])],
+                    [SWITCHYARD_FEX_LIBS=""])],
+                [SWITCHYARD_FEX_LIBS=""])],
+            [SWITCHYARD_FEX_LIBS=""])])
+    WINE_ERROR_WITH(fex,[test "x$SWITCHYARD_FEX_LIBS" = "x"],
+                    [Switchyard FEX ABI v6 development files with register windows, shared admission, detached execution, JIT-fault reconstruction, unaligned TSO repair, and code invalidation support not found.])
 fi
 
 dnl **** Check for libpcap ****

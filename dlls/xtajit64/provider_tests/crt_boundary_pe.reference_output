@@ -1,0 +1,2 @@
+CRT_BOUNDARY_PASS memory=900 abi=24 guard=24 faults=6 phases=24
+exit 0

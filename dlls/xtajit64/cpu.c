@@ -28,22 +28,23 @@
 #include "winternl.h"
 #include "wine/debug.h"
 #include "wine/exception.h"
+#include "guest_exception.h"
 #include "unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(xtajit);
 
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
 
 #define XTAJIT64_CALL(func,params) WINE_UNIX_CALL( unix_ ## func, params )
 
 static ULONG_PTR rtl_exit_user_thread;
-static ULONG host_page_size;
+static ULONG mapping_page_size; /* Windows logical page size, not Unix pages. */
+static ULONG native_page_size;
 static BOOL flight_recorder_enabled;
 static BOOL terminal_diagnostics_enabled;
 static LARGE_INTEGER flight_qpc_frequency;
 static volatile LONG64 transition_cache_generation = 1;
 
-#define XTAJIT64_CONTROL_STACK_SIZE 0x40000
 #define XTAJIT64_MAX_TRANSITION_DEPTH 64
 #define XTAJIT64_MAX_RESYNC_ATTEMPTS 8
 #define XTAJIT64_EC_ENTRY_CACHE_SIZE 32
@@ -121,7 +122,8 @@ struct xtajit64_thread_state
      * which is itself x18 on this side of the ABI. */
     UINT64 flight_expected_teb;
     BOOL flight_teb_authenticated;
-    UINT32 flight_teb_reserved;
+    /* One replacement hint per pair of EC entries; never a validity token. */
+    UINT32 ec_entry_cache_lru;
     /* Stable identity stack and validated ARM64EC entry metadata are hot
      * transition inputs.  Publish their generation last so a nested signal
      * transition can never consume a partially replaced cache entry. */
@@ -129,6 +131,7 @@ struct xtajit64_thread_state
     UINT64 stack_cache_limit;
     UINT64 stack_cache_base;
     struct xtajit64_ec_entry_cache ec_entry_cache[XTAJIT64_EC_ENTRY_CACHE_SIZE];
+    struct xtajit64_direct_capsule direct_capsule;
 };
 
 typedef NTSTATUS (WINAPI *arm64x_get_information)( ULONG, void *, void * );
@@ -163,15 +166,18 @@ C_ASSERT( offsetof(struct xtajit64_thread_state, flight_dump_state) == 0x868 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, capture_x18) == 0x870 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, flight_expected_teb) == 0x878 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, flight_teb_authenticated) == 0x880 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, ec_entry_cache_lru) == 0x884 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, stack_cache_generation) == 0x888 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, stack_cache_limit) == 0x890 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, stack_cache_base) == 0x898 );
 C_ASSERT( offsetof(struct xtajit64_thread_state, ec_entry_cache) == 0x8a0 );
 C_ASSERT( sizeof(struct xtajit64_ec_entry_cache) == 0x20 );
-C_ASSERT( sizeof(struct xtajit64_thread_state) == 0xca0 );
-C_ASSERT( ((sizeof(struct xtajit64_thread_state) + 15) & ~(SIZE_T)15) == 0xca0 );
+C_ASSERT( offsetof(struct xtajit64_thread_state, direct_capsule) == 0xca0 );
+C_ASSERT( sizeof(struct xtajit64_thread_state) == 0xce0 );
+C_ASSERT( sizeof(struct xtajit64_thread_state) <= XTAJIT64_GUEST_PAGE_SIZE );
+C_ASSERT( ((sizeof(struct xtajit64_thread_state) + 15) & ~(SIZE_T)15) == 0xce0 );
 C_ASSERT( sizeof(struct xtajit64_transition_frame) == 0x20 );
-C_ASSERT( XTAJIT64_CONTROL_STACK_SIZE >= sizeof(struct xtajit64_thread_state) +
+C_ASSERT( XTAJIT64_CONTROL_STACK_SIZE >= 2 * XTAJIT64_MAX_HOST_PAGE_SIZE +
           sizeof(struct xtajit64_flight_recorder) + 0x10000 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, X8) == 0x78 );
 C_ASSERT( offsetof(ARM64EC_NT_CONTEXT, Sp) == 0x98 );
@@ -210,6 +216,16 @@ static NTSTATUS synchronize_transition_state_mapping( struct xtajit64_thread_sta
 static NTSTATUS unregister_transition_state_mapping( struct xtajit64_thread_state *state );
 static UINT64 flight_read_live_x18(void);
 
+/* The first native page owns state; an inaccessible second page separates it
+ * from the descending control stack. ProcessInit validates native_page_size. */
+static ULONG_PTR control_stack_limit( ULONG_PTR allocation )
+{
+    if (!allocation || !native_page_size || (allocation & (native_page_size - 1)) ||
+        allocation > ~(ULONG_PTR)0 - XTAJIT64_CONTROL_STACK_SIZE)
+        return 0;
+    return allocation + 2 * native_page_size;
+}
+
 /* State itself is supplied by the current thread's owned allocation.  Before
  * any opt-in producer dereferences its recorder pointer, additionally prove
  * that the pointer is the exact high-end object allocated below.  This is
@@ -230,6 +246,7 @@ static BOOL flight_validate_recorder_layout( const struct xtajit64_thread_state 
         sizeof(*state) > state->allocation_size - 15)
         return FALSE;
     allocation_end = state_address + state->allocation_size;
+    if (!(control_limit = control_stack_limit( state_address ))) return FALSE;
     if (!state->flight_recorder)
         return state->control_stack_top == allocation_end &&
                !(state->control_stack_top & 15);
@@ -240,7 +257,6 @@ static BOOL flight_validate_recorder_layout( const struct xtajit64_thread_state 
     if ((ULONG_PTR)state->flight_recorder != recorder_address ||
         state->control_stack_top != recorder_address || (recorder_address & 63))
         return FALSE;
-    control_limit = (state_address + sizeof(*state) + 15) & ~(ULONG_PTR)15;
     if (control_limit >= (ULONG_PTR)state->flight_recorder) return FALSE;
     return xtajit64_flight_validate_layout( state_address, state->allocation_size,
                                             state->control_stack_top,
@@ -260,6 +276,7 @@ static BOOL flight_has_active_recorder( const struct xtajit64_thread_state *stat
 
 static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
 {
+    struct xtajit64_control_stack_params params;
     struct xtajit64_thread_state *state;
     SIZE_T size = XTAJIT64_CONTROL_STACK_SIZE;
     void *allocation = NULL;
@@ -269,14 +286,30 @@ static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
     status = NtAllocateVirtualMemory( GetCurrentProcess(), &allocation, 0, &size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
     if (status) return status;
-    if (size < sizeof(*state) + 0x10000 ||
-        (ULONG_PTR)allocation > ~(ULONG_PTR)0 - size)
+    if (size != XTAJIT64_CONTROL_STACK_SIZE ||
+        !(stack_limit = control_stack_limit( (ULONG_PTR)allocation )))
     {
         void *free_base = allocation;
         SIZE_T free_size = 0;
 
         NtFreeVirtualMemory( GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
         return STATUS_NO_MEMORY;
+    }
+    /* Keep the allocation in ntdll's deferred stream. Its native protection
+     * is part of initializing this unpublished allocation, not a second
+     * unaccounted PE mutation. Publish every final run before ThreadInit
+     * succeeds; an unrelated deferred mutation still defeats the one-alloc
+     * acknowledgement. Failure cleanup also keeps the ordinary PE VM path. */
+    params.allocation = (ULONG_PTR)allocation;
+    params.size = size;
+    status = XTAJIT64_CALL( control_stack_protect, &params );
+    if (status)
+    {
+        void *free_base = allocation;
+        SIZE_T free_size = 0;
+
+        NtFreeVirtualMemory( GetCurrentProcess(), &free_base, &free_size, MEM_RELEASE );
+        return status;
     }
 
     state = allocation;
@@ -295,7 +328,6 @@ static NTSTATUS allocate_transition_state( struct xtajit64_thread_state **ret )
     state->control_stack_top = allocation_end;
     if (flight_recorder_enabled)
     {
-        stack_limit = ((ULONG_PTR)state + sizeof(*state) + 15) & ~(ULONG_PTR)15;
         if ((allocation_end & 63) || sizeof(*state->flight_recorder) > size)
             recorder = 0;
         else recorder = allocation_end - sizeof(*state->flight_recorder);
@@ -513,21 +545,34 @@ static NTSTATUS describe_host_mapping( ULONG_PTR host, SIZE_T size,
 static NTSTATUS synchronize_transition_state_mapping( struct xtajit64_thread_state *state,
                                                        BOOL *provider_touched )
 {
-    struct xtajit64_memory_params params;
-    ULONG_PTR allocation_base;
+    struct xtajit64_memory_params params[3];
+    ULONG_PTR allocation_base, stack_limit, starts[3];
+    SIZE_T sizes[3];
     NTSTATUS status;
+    unsigned int i;
 
     if (!provider_touched) return STATUS_INVALID_PARAMETER;
     *provider_touched = FALSE;
-    if (!state || !state->allocation_size ||
-        (ULONG_PTR)state > ~(ULONG_PTR)0 - state->allocation_size)
+    if (!state || state->allocation_size != XTAJIT64_CONTROL_STACK_SIZE ||
+        !(stack_limit = control_stack_limit( (ULONG_PTR)state )))
         return STATUS_INVALID_ADDRESS;
     if ((status = get_allocation_base( state, &allocation_base ))) return status;
-    if ((status = describe_host_mapping( (ULONG_PTR)state, state->allocation_size,
-                                          allocation_base, PAGE_READWRITE, &params )))
-        return status;
+    starts[0] = (ULONG_PTR)state;
+    starts[1] = starts[0] + native_page_size;
+    starts[2] = stack_limit;
+    sizes[0] = sizes[1] = native_page_size;
+    sizes[2] = state->allocation_size - 2 * native_page_size;
+    for (i = 0; i < ARRAY_SIZE(params); ++i)
+        if ((status = describe_host_mapping( starts[i], sizes[i], allocation_base,
+                                              i == 1 ? PAGE_NOACCESS : PAGE_READWRITE,
+                                              &params[i] )))
+            return status;
+    /* Validate all three known runs before publishing any of them. A partial
+     * provider failure retains the allocation, just like the uniform case. */
     *provider_touched = TRUE;
-    return XTAJIT64_CALL( memory_map, &params );
+    for (i = 0; i < ARRAY_SIZE(params); ++i)
+        if ((status = XTAJIT64_CALL( memory_map, &params[i] ))) return status;
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS unregister_transition_state_mapping( struct xtajit64_thread_state *state )
@@ -638,6 +683,10 @@ static NTSTATUS collect_existing_mappings( ULONG_PTR lowest, ULONG_PTR highest,
             status = describe_host_mapping( start, end - start,
                                             (ULONG_PTR)info.AllocationBase,
                                             info.Protect, &params );
+            /* The committed view can disappear between the two queries.
+             * This is an invalidated snapshot, not a permanent provider
+             * failure. The caller must discard every previously read run. */
+            if (status == STATUS_NOT_MAPPED_VIEW) return STATUS_RETRY;
             /* The capability-negotiated low-memory observer is the sole
              * structural authority for fixed-low AMD64 mappings.  Legacy
              * snapshots retain identity views only and must not replay that
@@ -686,12 +735,14 @@ static NTSTATUS resync_existing_mappings(void)
     snapshot->count = 0;
     for (attempt = 0; attempt < XTAJIT64_MAX_RESYNC_ATTEMPTS; ++attempt)
     {
+        snapshot->count = 0;
         /* A concurrent map/protect/unmap after this token makes the commit
          * return STATUS_RETRY instead of republishing a stale snapshot. */
         if ((status = XTAJIT64_CALL( memory_resync_begin, &begin ))) break;
         status = collect_existing_mappings( (ULONG_PTR)info.LowestUserAddress,
                                             (ULONG_PTR)info.HighestUserAddress,
                                             info.PageSize, snapshot );
+        if (status == STATUS_RETRY) continue;
         if (status) break;
         params.ranges = (ULONG_PTR)snapshot->ranges;
         params.generation = begin.generation;
@@ -717,9 +768,9 @@ static NTSTATUS synchronize_mapping_window( ULONG_PTR lowest, ULONG_PTR highest 
     NTSTATUS status;
     ULONG i;
 
-    if (!host_page_size || !lowest || highest <= lowest)
+    if (!mapping_page_size || !lowest || highest <= lowest)
         return STATUS_INVALID_ADDRESS;
-    status = collect_existing_mappings( lowest, highest - 1, host_page_size, &snapshot );
+    status = collect_existing_mappings( lowest, highest - 1, mapping_page_size, &snapshot );
     for (i = 0; !status && i < snapshot.count; ++i)
         status = XTAJIT64_CALL( memory_map, &snapshot.ranges[i] );
     /* A window containing only a fixed-low view is intentionally absent from
@@ -767,7 +818,7 @@ static NTSTATUS synchronize_fault_mapping( ULONG_PTR address, BOOL *mapped )
                                     info.Protect, &params );
     if (status == STATUS_ACCESS_DENIED) return STATUS_SUCCESS;
     if (status) return status;
-    if (params.guest < XTAJIT64_GUEST_KUSER + host_page_size &&
+    if (params.guest < XTAJIT64_GUEST_KUSER + mapping_page_size &&
         params.guest + params.size > XTAJIT64_GUEST_KUSER)
         return STATUS_SUCCESS;
     if ((status = XTAJIT64_CALL( memory_map, &params ))) return status;
@@ -785,7 +836,7 @@ static NTSTATUS get_current_thread_teb_window( ULONG_PTR *lowest, ULONG_PTR *hig
     ULONG_PTR region_start, region_end, teb_end, start, end;
     NTSTATUS status;
 
-    if (!lowest || !highest || !allocation_base || !host_page_size ||
+    if (!lowest || !highest || !allocation_base || !mapping_page_size ||
         teb > ~(ULONG_PTR)0 - sizeof(TEB))
         return STATUS_INVALID_ADDRESS;
     status = NtQueryVirtualMemory( GetCurrentProcess(), (void *)teb,
@@ -797,9 +848,9 @@ static NTSTATUS get_current_thread_teb_window( ULONG_PTR *lowest, ULONG_PTR *hig
         return STATUS_INVALID_ADDRESS;
     region_end = region_start + info.RegionSize;
     teb_end = teb + sizeof(TEB);
-    if (teb_end > ~(ULONG_PTR)0 - (host_page_size - 1)) return STATUS_INVALID_ADDRESS;
-    start = teb & ~(ULONG_PTR)(host_page_size - 1);
-    end = (teb_end + host_page_size - 1) & ~(ULONG_PTR)(host_page_size - 1);
+    if (teb_end > ~(ULONG_PTR)0 - (mapping_page_size - 1)) return STATUS_INVALID_ADDRESS;
+    start = teb & ~(ULONG_PTR)(mapping_page_size - 1);
+    end = (teb_end + mapping_page_size - 1) & ~(ULONG_PTR)(mapping_page_size - 1);
     if (start < region_start || end > region_end || start >= end)
         return STATUS_INVALID_ADDRESS;
     *allocation_base = (ULONG_PTR)info.AllocationBase;
@@ -848,12 +899,12 @@ static void unregister_thread_stack_allocation( ULONG_PTR allocation_base )
     struct xtajit64_memory_params params = { .guest = allocation_base };
     NTSTATUS status;
 
-    if (!allocation_base || !host_page_size || !__wine_unixlib_handle) return;
+    if (!allocation_base || !mapping_page_size || !__wine_unixlib_handle) return;
     if ((status = XTAJIT64_CALL( memory_unmap, &params )))
         poison_provider( "thread-stack unregister", status );
 }
 
-static void flush_unicorn_cache( const void *addr, SIZE_T size )
+static void flush_provider_cache( const void *addr, SIZE_T size )
 {
     struct xtajit64_memory_params params =
     {
@@ -1234,11 +1285,8 @@ static UINT64 flight_control_stack_limit( const struct xtajit64_thread_state *st
 {
     ULONG_PTR limit;
 
-    /* Account for alignment rounding too: this helper is also used while
-     * validating a damaged diagnostic state, before trusting its top field. */
-    if (!state || (ULONG_PTR)state > ~(ULONG_PTR)0 - sizeof(*state) - 15)
+    if (!state || !(limit = control_stack_limit( (ULONG_PTR)state )))
         return XTAJIT64_FLIGHT_UNKNOWN_U64;
-    limit = ((ULONG_PTR)state + sizeof(*state) + 15) & ~(ULONG_PTR)15;
     if (state->control_stack_top <= limit) return XTAJIT64_FLIGHT_UNKNOWN_U64;
     return limit;
 }
@@ -2046,6 +2094,18 @@ static UINT32 ec_entry_cache_index( UINT64 address )
     return address & (XTAJIT64_EC_ENTRY_CACHE_SIZE - 1);
 }
 
+static void touch_ec_entry_cache( struct xtajit64_thread_state *state, UINT32 index )
+{
+    UINT32 mask = 1u << (index / 2);
+    UINT32 hints = __atomic_load_n( &state->ec_entry_cache_lru, __ATOMIC_RELAXED );
+
+    /* Prefer evicting the other way.  A nested transition may replace a hint;
+     * losing that update only affects replacement, not cache authentication. */
+    if (!(index & 1)) hints |= mask;
+    else hints &= ~mask;
+    __atomic_store_n( &state->ec_entry_cache_lru, hints, __ATOMIC_RELAXED );
+}
+
 static NTSTATUS resolve_ec_entry_thunk( struct xtajit64_thread_state *state,
                                         UINT64 guest_target, ULONG_PTR *native_target,
                                         ULONG_PTR *entry )
@@ -2054,17 +2114,21 @@ static NTSTATUS resolve_ec_entry_thunk( struct xtajit64_thread_state *state,
     MEMORY_BASIC_INFORMATION target_info, entry_info;
     ULONG_PTR target, candidate, cached_target, cached_entry;
     UINT64 generation, cached_generation, cached_guest;
-    UINT32 encoded;
+    UINT32 encoded, index, way;
     NTSTATUS status;
 
     if (!native_target || !entry) return STATUS_INVALID_PARAMETER;
 
     generation = current_transition_cache_generation();
-    cache = state ? &state->ec_entry_cache[ec_entry_cache_index( guest_target )] : NULL;
-    if (cache &&
-        (cached_generation = __atomic_load_n( &cache->generation,
-                                               __ATOMIC_ACQUIRE )) == generation)
+    index = ec_entry_cache_index( guest_target );
+    /* Keep the existing footprint and primary hash, but probe both ways of
+     * each pair.  Any hash can collide for frequently alternating EC calls. */
+    for (way = 0; state && way < 2; ++way)
     {
+        cache = &state->ec_entry_cache[index ^ way];
+        if ((cached_generation = __atomic_load_n( &cache->generation,
+                                                    __ATOMIC_ACQUIRE )) != generation)
+            continue;
         cached_guest = cache->guest_target;
         cached_target = cache->native_target;
         cached_entry = cache->entry;
@@ -2075,8 +2139,9 @@ static NTSTATUS resolve_ec_entry_thunk( struct xtajit64_thread_state *state,
                   &encoded, (const void *)(cached_target - sizeof(encoded)),
                   sizeof(encoded) )) &&
             decode_ec_entry_thunk( cached_target, encoded, &candidate ) &&
-            candidate == cached_entry)
+            candidate == cached_entry && current_transition_cache_generation() == generation)
         {
+            touch_ec_entry_cache( state, index ^ way );
             *native_target = cached_target;
             *entry = cached_entry;
             return STATUS_SUCCESS;
@@ -2119,13 +2184,28 @@ static NTSTATUS resolve_ec_entry_thunk( struct xtajit64_thread_state *state,
 
     *native_target = target;
     *entry = candidate;
-    if (cache && current_transition_cache_generation() == generation)
+    if (current_transition_cache_generation() == generation)
     {
+        cache = &state->ec_entry_cache[index];
+        if (__atomic_load_n( &cache->generation, __ATOMIC_ACQUIRE ) == generation &&
+            cache->guest_target != guest_target)
+        {
+            index ^= 1;
+            cache = &state->ec_entry_cache[index];
+            if (__atomic_load_n( &cache->generation, __ATOMIC_ACQUIRE ) == generation &&
+                cache->guest_target != guest_target)
+            {
+                index = (index & ~1u) | ((__atomic_load_n( &state->ec_entry_cache_lru,
+                                                         __ATOMIC_RELAXED ) >> (index / 2)) & 1);
+                cache = &state->ec_entry_cache[index];
+            }
+        }
         __atomic_store_n( &cache->generation, 0, __ATOMIC_RELEASE );
         cache->guest_target = guest_target;
         cache->native_target = target;
         cache->entry = candidate;
         __atomic_store_n( &cache->generation, generation, __ATOMIC_RELEASE );
+        touch_ec_entry_cache( state, index );
     }
     return STATUS_SUCCESS;
 }
@@ -2209,7 +2289,7 @@ static NTSTATUS restore_fp_state( const AMD64_CONTEXT *context )
 
 static DECLSPEC_NORETURN void xtajit64_restore_native(
     struct xtajit64_thread_state *state, ARM64EC_NT_CONTEXT *context,
-    CHPE_V2_CPU_AREA_INFO *cpu, UINT unicorn_error );
+    CHPE_V2_CPU_AREA_INFO *cpu, UINT provider_error );
 
 static DECLSPEC_NORETURN void terminate_transition( NTSTATUS status )
 {
@@ -2222,7 +2302,7 @@ static DECLSPEC_NORETURN void terminate_transition( NTSTATUS status )
  * or a depth-overflow abort does not silently discard its causal history. */
 static void flight_freeze_terminal_abort( struct xtajit64_thread_state *state,
                                           NTSTATUS status, UINT stop_reason,
-                                          UINT unicorn_error )
+                                          UINT provider_error )
 {
     struct xtajit64_flight_recorder *recorder;
 
@@ -2232,7 +2312,7 @@ static void flight_freeze_terminal_abort( struct xtajit64_thread_state *state,
         return;
     if (!flight_record_cpu_event( state, NULL, NULL, XTAJIT64_FLIGHT_UNKNOWN_U64,
                                   XTAJIT64_FLIGHT_UNKNOWN_U64, (UINT64)(ULONG)status,
-                                  (UINT64)stop_reason | (UINT64)unicorn_error << 32,
+                                  (UINT64)stop_reason | (UINT64)provider_error << 32,
                                   XTAJIT64_FLIGHT_EVENT_WATCHDOG_VIOLATION,
                                   XTAJIT64_FLIGHT_REASON_TERMINAL_ABORT ))
         xtajit64_flight_freeze( recorder,
@@ -2295,7 +2375,7 @@ static void terminal_diagnostic_address( const char *name, UINT64 address )
 
 static void terminal_simulation_diagnostic(
     const struct xtajit64_thread_state *state, NTSTATUS status,
-    UINT stop_reason, UINT unicorn_error,
+    UINT stop_reason, UINT provider_error,
     const struct xtajit64_begin_params *params,
     const ARM64EC_NT_CONTEXT *context )
 {
@@ -2306,10 +2386,10 @@ static void terminal_simulation_diagnostic(
     if (state && state->magic == XTAJIT64_THREAD_STATE_MAGIC &&
         state->allocation_size == XTAJIT64_CONTROL_STACK_SIZE)
         depth = min( state->depth, (UINT)XTAJIT64_MAX_TRANSITION_DEPTH );
-    ERR( "XTAJIT64_TERMINAL_V1 status=%#lx reason=%u unicorn=%u state=%p "
+    ERR( "XTAJIT64_TERMINAL_V1 status=%#lx reason=%u provider=%u state=%p "
          "capture=%u depth=%u control_top=%p capture_sp=%p capture_lr=%p "
          "capture_target=%p capture_x10=%p simulation=%u callback=%u "
-         "doorbell=%p\n", status, stop_reason, unicorn_error, state,
+         "doorbell=%p\n", status, stop_reason, provider_error, state,
          state ? state->capture_kind : ~0u, depth,
          state ? (void *)(ULONG_PTR)state->control_stack_top : NULL,
          state ? (void *)(ULONG_PTR)state->capture_sp : NULL,
@@ -2361,16 +2441,16 @@ static void terminal_simulation_diagnostic(
 
 static DECLSPEC_NORETURN void abort_simulation( struct xtajit64_thread_state *state,
                                                NTSTATUS status, UINT stop_reason,
-                                               UINT unicorn_error,
+                                               UINT provider_error,
                                                const struct xtajit64_begin_params *params,
                                                const ARM64EC_NT_CONTEXT *context )
 {
-    terminal_simulation_diagnostic( state, status, stop_reason, unicorn_error,
+    terminal_simulation_diagnostic( state, status, stop_reason, provider_error,
                                     params, context );
-    flight_freeze_terminal_abort( state, status, stop_reason, unicorn_error );
+    flight_freeze_terminal_abort( state, status, stop_reason, provider_error );
     flight_dump_if_frozen( state, "terminal provider return" );
-    ERR( "unsupported x64 simulation boundary, status %#lx reason %u unicorn %u "
-         "transition %u depth %u\n", status, stop_reason, unicorn_error,
+    ERR( "unsupported x64 simulation boundary, status %#lx reason %u provider %u "
+         "transition %u depth %u\n", status, stop_reason, provider_error,
          state ? state->capture_kind : ~0u, state ? state->depth : 0 );
     terminate_transition( status );
 }
@@ -2383,7 +2463,7 @@ static BOOL suspend_doorbell_is_set( const CHPE_V2_CPU_AREA_INFO *cpu )
 
 static DECLSPEC_NORETURN void __attribute__((used, noinline)) continue_suspended_context(
     struct xtajit64_thread_state *state, ARM64EC_NT_CONTEXT *context,
-    UINT stop_reason, UINT unicorn_error )
+    UINT stop_reason, UINT provider_error )
 {
     NTSTATUS status;
 
@@ -2391,7 +2471,7 @@ static DECLSPEC_NORETURN void __attribute__((used, noinline)) continue_suspended
                                            CONTEXT_AMD64_FLOATING_POINT;
     status = NtContinue( &context->AMD64_Context, FALSE );
     abort_simulation( state, status ? status : STATUS_UNSUCCESSFUL,
-                      stop_reason, unicorn_error, NULL, context );
+                      stop_reason, provider_error, NULL, context );
 }
 
 static DECLSPEC_NORETURN void raise_x64_memory_fault( struct xtajit64_thread_state *state,
@@ -2424,7 +2504,7 @@ static DECLSPEC_NORETURN void raise_x64_memory_fault( struct xtajit64_thread_sta
            rec.ExceptionInformation[0] );
     status = NtRaiseException( &rec, &ec_context->AMD64_Context, TRUE );
     abort_simulation( state, status ? status : STATUS_ACCESS_VIOLATION,
-                      params->stop_reason, params->unicorn_error,
+                      params->stop_reason, params->provider_error,
                       params, ec_context );
 }
 
@@ -2445,7 +2525,50 @@ static DECLSPEC_NORETURN void raise_x64_single_step(
     TRACE( "raise x64 single-step exception rip %p\n", rec.ExceptionAddress );
     status = NtRaiseException( &rec, &ec_context->AMD64_Context, TRUE );
     abort_simulation( state, status ? status : STATUS_SINGLE_STEP,
-                      params->stop_reason, params->unicorn_error,
+                      params->stop_reason, params->provider_error,
+                      params, ec_context );
+}
+
+static DECLSPEC_NORETURN void raise_x64_guest_exception(
+    struct xtajit64_thread_state *state,
+    const struct xtajit64_begin_params *params,
+    ARM64EC_NT_CONTEXT *ec_context )
+{
+    struct xtajit64_guest_exception_mapping mapping;
+    EXCEPTION_RECORD rec;
+    UINT32 signal = params->reserved & 0xff;
+    UINT32 trap = (params->reserved >> 8) & 0xff;
+    UINT32 error_code = params->fault_access;
+    NTSTATUS status;
+
+    if (params->stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION)
+    {
+        signal = 4; /* FEX FAULT_SIGILL */
+        trap = 6; /* x86 #UD */
+        error_code = 0;
+    }
+
+    xtajit64_map_guest_exception( signal, trap, error_code,
+                                  ec_context->AMD64_Context.Rip,
+                                  ec_context->AMD64_Context.Rax,
+                                  ec_context->AMD64_Context.Rcx, &mapping );
+    ec_context->AMD64_Context.Rip = mapping.context_rip;
+    memset( &rec, 0, sizeof(rec) );
+    rec.ExceptionCode = mapping.code;
+    rec.ExceptionAddress = (void *)(ULONG_PTR)mapping.exception_address;
+    rec.NumberParameters = mapping.parameter_count;
+    rec.ExceptionInformation[0] = mapping.information[0];
+    rec.ExceptionInformation[1] = mapping.information[1];
+
+    ec_context->AMD64_Context.ContextFlags |= CONTEXT_AMD64_FULL |
+                                              CONTEXT_AMD64_FLOATING_POINT;
+    if (mapping.clear_trap_flag)
+        ec_context->AMD64_Context.EFlags &= ~0x100;
+    TRACE( "raise x64 guest exception %#lx rip %p signal %u trap %u error %#x\n",
+           rec.ExceptionCode, rec.ExceptionAddress, signal, trap, error_code );
+    status = NtRaiseException( &rec, &ec_context->AMD64_Context, TRUE );
+    abort_simulation( state, status ? status : rec.ExceptionCode,
+                      params->stop_reason, params->provider_error,
                       params, ec_context );
 }
 
@@ -2466,6 +2589,81 @@ static void flight_start_transition( struct xtajit64_thread_state *state )
     state->flight_causal_boundary_id = boundary_id;
     state->flight_context_generation = boundary_id;
     state->flight_transition_generation = boundary_id;
+}
+
+/* This is an assembly-only boundary to an authenticated generated dispatcher,
+ * not a C function-pointer call (which would select an ARM64EC exit thunk).
+ * Generated code preserves AAPCS GPR/d8-d15 state; preserve the PE FP control
+ * state here as well. The entry neither changes SP permanently nor calls a
+ * native guest function. BeginSimulation's validated stack remains in use. */
+static void __attribute__((naked)) invoke_custom_dispatch(
+    UINT64 entry, UINT64 frame, UINT64 authenticated_teb )
+{
+    __asm__(
+        "stp x29, x30, [sp, #-32]!\n\t"
+        "mov x29, sp\n\t"
+        "mrs x9, fpcr\n\t"
+        "mrs x10, fpsr\n\t"
+        "stp w9, w10, [sp, #16]\n\t"
+        "str x2, [sp, #24]\n\t"
+        "cmp x18, x2\n\t"
+        "b.ne 1f\n\t"
+        "mov x16, x0\n\t"
+        "mov x0, x1\n\t"
+        "blr x16\n\t"
+        "ldr x9, [sp, #24]\n\t"
+        "cmp x18, x9\n\t"
+        "b.ne 1f\n\t"
+        "ldp w9, w10, [sp, #16]\n\t"
+        "msr fpcr, x9\n\t"
+        "msr fpsr, x10\n\t"
+        "ldp x29, x30, [sp], #32\n\t"
+        "ret\n\t"
+        "1: brk #0xf68\n\t" );
+}
+
+static BOOL custom_dispatch_enabled;
+static BOOL direct_dispatch_enabled;
+
+static NTSTATUS __attribute__((naked)) invoke_direct_dispatch(
+    UINT64 bridge, UINT64 callback, struct xtajit64_direct_params *params, UINT64 teb )
+{
+    __asm__( "mov x16, x0\n\t"
+             "mov x0, x1\n\t"
+             "mov x1, x2\n\t"
+             "mov x2, x3\n\t"
+             "br x16\n\t" );
+}
+
+static NTSTATUS run_explicit_dispatch( struct xtajit64_begin_params *params,
+                                     struct xtajit64_thread_state *state )
+{
+    struct xtajit64_direct_params direct = {0};
+    struct xtajit64_dispatch_params *dispatch = &direct.dispatch;
+    const struct xtajit64_direct_capsule *capsule = &state->direct_capsule;
+    NTSTATUS status;
+
+    direct.binding_id = capsule->binding_id;
+    direct.process_instance = capsule->process_instance;
+    dispatch->simulation = *params;
+    status = direct_dispatch_enabled ? invoke_direct_dispatch(
+        capsule->bridge, capsule->prepare, &direct, capsule->authenticated_teb ) :
+        XTAJIT64_CALL( prepare_dispatch, dispatch );
+    while (!status && dispatch->entry)
+    {
+        if ((dispatch->entry & 3) || !dispatch->frame || (dispatch->frame & 15) ||
+            !dispatch->generation || !dispatch->binding_id || !dispatch->process_instance)
+            terminate_transition( STATUS_INVALID_DEVICE_STATE );
+        invoke_custom_dispatch( dispatch->entry, dispatch->frame, state->flight_expected_teb );
+        /* No FEX generated/C++ activation survives this completion. Mutation
+         * and native guest calls are allowed only after both leases end. A
+         * syscall or internal pause can prepare a fresh dispatch in this call. */
+        status = direct_dispatch_enabled ? invoke_direct_dispatch(
+            capsule->bridge, capsule->complete, &direct, capsule->authenticated_teb ) :
+            XTAJIT64_CALL( complete_dispatch, dispatch );
+    }
+    *params = dispatch->simulation;
+    return status;
 }
 
 static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *state )
@@ -2566,7 +2764,8 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
                                      XTAJIT64_FLIGHT_EVENT_PROVIDER_RESUME :
                                      XTAJIT64_FLIGHT_EVENT_PROVIDER_BEGIN,
                                      XTAJIT64_FLIGHT_REASON_NONE );
-        status = XTAJIT64_CALL( begin_simulation, &params );
+        status = custom_dispatch_enabled || direct_dispatch_enabled ? run_explicit_dispatch( &params, state ) :
+                                          XTAJIT64_CALL( begin_simulation, &params );
         if (state->flight_recorder)
         {
             /* This samples the public PE register contract before ordinary
@@ -2595,11 +2794,11 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
         {
             if (!suspend_doorbell_is_set( cpu ))
                 abort_simulation( state, STATUS_INVALID_DEVICE_STATE,
-                                  params.stop_reason, params.unicorn_error,
+                                  params.stop_reason, params.provider_error,
                                   &params, ec_context );
             continue_suspended_context( state, ec_context,
                                         params.stop_reason,
-                                        params.unicorn_error );
+                                        params.provider_error );
         }
         if (status != STATUS_RETRY ||
             params.stop_reason != XTAJIT64_STOP_MAPPING_MISS ||
@@ -2632,8 +2831,13 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
         if (status == STATUS_SINGLE_STEP &&
             params.stop_reason == XTAJIT64_STOP_SINGLE_STEP)
             raise_x64_single_step( state, &params, ec_context );
+        if ((status == STATUS_ILLEGAL_INSTRUCTION &&
+             params.stop_reason == XTAJIT64_STOP_INVALID_INSTRUCTION) ||
+            (status == STATUS_UNHANDLED_EXCEPTION &&
+             params.stop_reason == XTAJIT64_STOP_GUEST_EXCEPTION))
+            raise_x64_guest_exception( state, &params, ec_context );
         abort_simulation( state, status ? status : STATUS_NOT_SUPPORTED,
-                          params.stop_reason, params.unicorn_error,
+                          params.stop_reason, params.provider_error,
                           &params, ec_context );
     }
 
@@ -2694,11 +2898,11 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
         if (suspend_doorbell_is_set( cpu ))
             continue_suspended_context( state, ec_context,
                                         XTAJIT64_STOP_SUSPEND,
-                                        params.unicorn_error );
+                                        params.provider_error );
         TRACE( "return x64 target to EC continuation %p native sp %p depth %u\n",
                (void *)(ULONG_PTR)frame->native_pc,
                (void *)(ULONG_PTR)frame->native_sp, state->depth );
-        xtajit64_restore_native( state, ec_context, cpu, params.unicorn_error );
+        xtajit64_restore_native( state, ec_context, cpu, params.provider_error );
     }
     if (continuation_target_seen)
     {
@@ -2765,13 +2969,13 @@ static DECLSPEC_NORETURN void run_x64_simulation( struct xtajit64_thread_state *
     if (suspend_doorbell_is_set( cpu ))
         continue_suspended_context( state, ec_context,
                                     XTAJIT64_STOP_SUSPEND,
-                                    params.unicorn_error );
+                                    params.provider_error );
     TRACE( "enter EC target %p through compiler thunk %p x64 return %p "
            "guest rsp %p native sp %p depth %u\n",
            (void *)native_target, (void *)entry, (void *)(ULONG_PTR)guest_return,
            (void *)(ULONG_PTR)frame->guest_rsp, (void *)(ULONG_PTR)ec_context->Sp,
            state->depth );
-    xtajit64_restore_native( state, ec_context, cpu, params.unicorn_error );
+    xtajit64_restore_native( state, ec_context, cpu, params.provider_error );
 }
 
 static void __attribute__((used, noreturn)) xtajit64_transition_from_native(
@@ -2964,7 +3168,7 @@ static void __attribute__((used, naked)) xtajit64_capture_native(void)
 
 static DECLSPEC_NORETURN void __attribute__((naked)) xtajit64_restore_native(
     struct xtajit64_thread_state *state, ARM64EC_NT_CONTEXT *context,
-    CHPE_V2_CPU_AREA_INFO *cpu, UINT unicorn_error )
+    CHPE_V2_CPU_AREA_INFO *cpu, UINT provider_error )
 {
     __asm__(
         "mov x16, x1\n\t"
@@ -3019,7 +3223,7 @@ static DECLSPEC_NORETURN void __attribute__((naked)) xtajit64_restore_native(
         "b \"#continue_suspended_context\"\n\t" );
 }
 
-#endif /* HAVE_UNICORN */
+#endif /* HAVE_SWITCHYARD_FEX */
 
 
 /**********************************************************************
@@ -3027,7 +3231,7 @@ static DECLSPEC_NORETURN void __attribute__((naked)) xtajit64_restore_native(
  *
  * Implementation of __os_arm64x_x64_jump.
  */
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
 
 static void __attribute__((used, naked)) capture_transition(void)
 {
@@ -3118,7 +3322,7 @@ void WINAPI ExitToX64(void)
 /**********************************************************************
  *           BeginSimulation  (xtajit64.@)
  */
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
 static DECLSPEC_NORETURN void __attribute__((used)) begin_simulation_missing_state(void)
 {
     RtlRaiseStatus( STATUS_INVALID_PARAMETER );
@@ -3185,7 +3389,9 @@ void WINAPI __attribute__((naked)) BeginSimulation(void)
         "b.ne 1f\n\t"
         "cmp x16, x15\n\t"               /* recorder owns stack high end */
         "b.ne 1f\n\t"
-        "add x9, x0, #0xca0\n\t"         /* rounded state/control low */
+        /* Conservatively reserve two maximum-size native pages. ProcessInit
+         * validates the actual page size; no recorder dereference before SP. */
+        "add x9, x0, #0x20, lsl #12\n\t" /* state page + inaccessible page */
         "cmp x15, x9\n\t"
         "b.ls 1f\n\t"
         "sub x9, x15, x9\n\t"
@@ -3223,8 +3429,8 @@ void WINAPI BeginSimulation(void)
 void WINAPI BTCpu64FlushInstructionCache( void *addr, SIZE_T size )
 {
     TRACE( "%p %Ix\n", addr, size );
-#ifdef HAVE_UNICORN
-    flush_unicorn_cache( addr, size );
+#ifdef HAVE_SWITCHYARD_FEX
+    flush_provider_cache( addr, size );
 #endif
 }
 
@@ -3259,8 +3465,8 @@ BOOLEAN WINAPI BTCpu64IsProcessorFeaturePresent( UINT feature )
 void WINAPI BTCpu64NotifyMemoryDirty( void *addr, SIZE_T size )
 {
     TRACE( "%p %Ix\n", addr, size );
-#ifdef HAVE_UNICORN
-    flush_unicorn_cache( addr, size );
+#ifdef HAVE_SWITCHYARD_FEX
+    flush_provider_cache( addr, size );
 #endif
 }
 
@@ -3273,8 +3479,8 @@ void WINAPI BTCpu64NotifyReadFile( HANDLE handle, void *addr, SIZE_T size, BOOL 
     (void)is_post;
     (void)status;
     TRACE( "%p %p %Ix\n", handle, addr, size );
-#ifdef HAVE_UNICORN
-    if (is_post && !status) flush_unicorn_cache( addr, size );
+#ifdef HAVE_SWITCHYARD_FEX
+    if (is_post && !status) flush_provider_cache( addr, size );
 #endif
 }
 
@@ -3285,8 +3491,8 @@ void WINAPI BTCpu64NotifyReadFile( HANDLE handle, void *addr, SIZE_T size, BOOL 
 void WINAPI FlushInstructionCacheHeavy( void *addr, SIZE_T size )
 {
     TRACE( "%p %Ix\n", addr, size );
-#ifdef HAVE_UNICORN
-    flush_unicorn_cache( addr, size );
+#ifdef HAVE_SWITCHYARD_FEX
+    flush_provider_cache( addr, size );
 #endif
 }
 
@@ -3300,7 +3506,7 @@ void WINAPI FlushInstructionCacheHeavy( void *addr, SIZE_T size )
  */
 NTSTATUS WINAPI ResyncIdentityMemoryMappingsStatus(void)
 {
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     invalidate_transition_caches();
     return resync_existing_mappings();
 #else
@@ -3318,7 +3524,7 @@ NTSTATUS WINAPI ResyncIdentityMemoryMappingsStatus(void)
  */
 void WINAPI ResyncIdentityMemoryMappings(void)
 {
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     NTSTATUS status;
 
     if ((status = ResyncIdentityMemoryMappingsStatus()))
@@ -3333,7 +3539,7 @@ void WINAPI ResyncIdentityMemoryMappings(void)
 NTSTATUS WINAPI NotifyMapViewOfSection( void *unk1, void *addr, void *unk2, SIZE_T size,
                                         ULONG alloc_type, ULONG protect )
 {
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     ULONG_PTR lowest = (ULONG_PTR)addr;
     NTSTATUS status;
 
@@ -3354,7 +3560,7 @@ NTSTATUS WINAPI NotifyMapViewOfSection( void *unk1, void *addr, void *unk2, SIZE
     (void)unk1;
     (void)unk2;
     TRACE( "%p %Ix %lx %lx\n", addr, size, alloc_type, protect );
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     return status;
 #else
     return STATUS_SUCCESS;
@@ -3372,7 +3578,7 @@ void WINAPI NotifyMemoryAlloc( void *addr, SIZE_T size, ULONG type, ULONG prot, 
     (void)is_post;
     (void)status;
     TRACE( "%p %Ix\n", addr, size );
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     if (is_post && !status && (type & (MEM_RESERVE | MEM_COMMIT)))
     {
         struct xtajit64_memory_params params;
@@ -3404,7 +3610,7 @@ void WINAPI NotifyMemoryFree( void *addr, SIZE_T size, ULONG type, BOOL is_post,
     (void)is_post;
     (void)status;
     TRACE( "%p %Ix %lx\n", addr, size, type );
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     if (is_post && !status)
     {
         NTSTATUS sync_status;
@@ -3433,7 +3639,7 @@ void WINAPI NotifyMemoryProtect( void *addr, SIZE_T size, ULONG prot, BOOL is_po
     (void)is_post;
     (void)status;
     TRACE( "%p %Ix %lx\n", addr, size, prot );
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     if (is_post && !status)
     {
         NTSTATUS sync_status;
@@ -3462,7 +3668,7 @@ void WINAPI NotifyUnmapViewOfSection( void *addr, BOOL is_post, NTSTATUS status 
     (void)is_post;
     (void)status;
     TRACE( "%p\n", addr );
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     if (is_post && !status)
     {
         NTSTATUS sync_status;
@@ -3486,7 +3692,7 @@ void WINAPI NotifyUnmapViewOfSection( void *addr, BOOL is_post, NTSTATUS status 
  */
 NTSTATUS WINAPI ProcessInit(void)
 {
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     SYSTEM_BASIC_INFORMATION info;
     struct xtajit64_process_init_params params = {0};
     UNICODE_STRING ntdll_name = RTL_CONSTANT_STRING( L"ntdll.dll" );
@@ -3536,24 +3742,47 @@ NTSTATUS WINAPI ProcessInit(void)
     params.required_capabilities = XTAJIT64_CAPABILITIES;
     params.x64_syscall_dispatcher = syscall_dispatcher;
     params.x64_syscall_count = syscall_count;
+    {
+        UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINE_FEX_CUSTOM_DISPATCH" );
+        WCHAR buffer[2] = {0};
+        UNICODE_STRING value = {0, sizeof(buffer), buffer};
+
+        custom_dispatch_enabled = RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ==
+                                      STATUS_SUCCESS && value.Length == sizeof(WCHAR) &&
+                                      buffer[0] == '1';
+        if (custom_dispatch_enabled) params.reserved = XTAJIT64_PROCESS_CUSTOM_DISPATCH;
+    }
+    {
+        UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINE_FEX_DIRECT_DISPATCH" );
+        WCHAR buffer[2] = {0};
+        UNICODE_STRING value = {0, sizeof(buffer), buffer};
+
+        direct_dispatch_enabled = RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ==
+                                      STATUS_SUCCESS && value.Length == sizeof(WCHAR) &&
+                                      buffer[0] == '1';
+    }
     params.rtl_query_performance_counter = rtl_query_performance_counter;
     params.nt_query_performance_counter = nt_query_performance_counter;
     if ((status = XTAJIT64_CALL( process_init, &params ))) return status;
     if ((params.enabled_capabilities & params.required_capabilities) !=
             params.required_capabilities ||
-        (params.enabled_capabilities & ~XTAJIT64_CAPABILITIES))
+        (params.enabled_capabilities & ~XTAJIT64_CAPABILITIES) ||
+        params.native_page_size < info.PageSize ||
+        params.native_page_size > XTAJIT64_MAX_HOST_PAGE_SIZE ||
+        (params.native_page_size & (params.native_page_size - 1)))
     {
         XTAJIT64_CALL( process_term, NULL );
         rtl_exit_user_thread = 0;
         return STATUS_REVISION_MISMATCH;
     }
-    host_page_size = info.PageSize;
+    mapping_page_size = info.PageSize;
+    native_page_size = params.native_page_size;
     status = resync_existing_mappings();
     if (status)
     {
         XTAJIT64_CALL( process_term, NULL );
         rtl_exit_user_thread = 0;
-        host_page_size = 0;
+        mapping_page_size = native_page_size = 0;
     }
     return status;
 #else
@@ -3579,7 +3808,72 @@ void WINAPI ProcessTerm( HANDLE handle, BOOL is_post, NTSTATUS status )
  */
 void WINAPI ResetToConsistentState( EXCEPTION_RECORD *rec, CONTEXT *context, ARM64_NT_CONTEXT *arm_ctx )
 {
+#ifdef HAVE_SWITCHYARD_FEX
+    struct xtajit64_reconstruct_params params = {0};
+    CHPE_V2_CPU_AREA_INFO *cpu;
+    BOOL memory_fault;
+    DWORD exception_code;
+    UINT64 host_pc;
+    NTSTATUS status;
+#endif
+
     TRACE( "%p %p %p\n", rec, context, arm_ctx );
+
+#ifdef HAVE_SWITCHYARD_FEX
+    if (!rec || !context || !arm_ctx || !__wine_unixlib_handle ||
+        !(cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo) || !cpu->InSimulation)
+        return;
+
+    exception_code = rec->ExceptionCode;
+    host_pc = arm_ctx->Pc;
+    memory_fault = exception_code == STATUS_ACCESS_VIOLATION;
+    if (memory_fault &&
+        (rec->NumberParameters < 2 ||
+         (rec->ExceptionInformation[0] != EXCEPTION_READ_FAULT &&
+          rec->ExceptionInformation[0] != EXCEPTION_WRITE_FAULT &&
+          rec->ExceptionInformation[0] != EXCEPTION_EXECUTE_FAULT)))
+        return;
+
+    params.host_context.size = sizeof(params.host_context);
+    params.host_context.version = XTAJIT64_ARM64_HOST_CONTEXT_VERSION;
+    memcpy( params.host_context.gpr, arm_ctx->X, sizeof(params.host_context.gpr) );
+    memcpy( params.host_context.vector, arm_ctx->V, sizeof(params.host_context.vector) );
+    params.host_context.pc = arm_ctx->Pc;
+    params.host_context.pstate = arm_ctx->Cpsr;
+    params.host_context.fpcr = arm_ctx->Fpcr;
+    params.host_context.fpsr = arm_ctx->Fpsr;
+    params.exception_code = exception_code;
+    if (memory_fault)
+    {
+        params.host_fault_address = rec->ExceptionInformation[1];
+        params.fault_access = rec->ExceptionInformation[0];
+    }
+
+    status = XTAJIT64_CALL( reconstruct_jit_fault, &params );
+    if (status == STATUS_NOT_SUPPORTED) return;
+    if (status)
+    {
+        ERR( "cannot reconstruct active FEX JIT fault pc %p address %p: %#lx "
+             "provider %u\n", (void *)(ULONG_PTR)host_pc,
+             (void *)(ULONG_PTR)params.host_fault_address, status,
+             params.provider_error );
+        poison_provider( "FEX JIT fault reconstruction", status );
+        return;
+    }
+
+    context_from_unix( (AMD64_CONTEXT *)context, &params.context );
+    context->ContextFlags |= CONTEXT_AMD64_FULL;
+    rec->ExceptionCode = exception_code;
+    rec->ExceptionAddress = (void *)(ULONG_PTR)params.context.rip;
+    if (memory_fault) rec->ExceptionInformation[1] = params.guest_fault_address;
+    cpu->InSimulation = 0;
+    cpu->InSyscallCallback = 0;
+    TRACE( "reconstructed FEX JIT exception %#lx host pc %p guest rip %p "
+           "host address %p guest address %p access %u\n", exception_code,
+           (void *)(ULONG_PTR)host_pc, (void *)(ULONG_PTR)params.context.rip,
+           (void *)(ULONG_PTR)params.host_fault_address,
+           (void *)(ULONG_PTR)params.guest_fault_address, params.fault_access );
+#endif
 }
 
 
@@ -3588,7 +3882,7 @@ void WINAPI ResetToConsistentState( EXCEPTION_RECORD *rec, CONTEXT *context, ARM
  */
 NTSTATUS WINAPI ThreadInit(void)
 {
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     CHPE_V2_CPU_AREA_INFO *cpu;
     struct xtajit64_thread_state *state;
     TEB *teb;
@@ -3616,9 +3910,9 @@ NTSTATUS WINAPI ThreadInit(void)
     }
     if ((status = allocate_transition_state( &state ))) return status;
     state->flight_expected_teb = (ULONG_PTR)teb;
-    /* Publish this known uniform allocation directly while ntdll defers its
-     * nested VM notification.  Ntdll acknowledges the exact single mutation;
-     * any additional or concurrent mutation retains the full-resync fallback. */
+    /* The single PE allocation is not complete until its native barrier and
+     * all three permission runs have been published. ntdll may acknowledge
+     * only that allocation; concurrent mutations retain the normal resync. */
     if ((status = synchronize_transition_state_mapping( state, &provider_touched )))
     {
         if (!provider_touched) free_transition_state( state );
@@ -3631,6 +3925,31 @@ NTSTATUS WINAPI ThreadInit(void)
         if (!cleanup_status) cleanup_status = free_transition_state( state );
         if (cleanup_status) poison_provider( "transition-state cleanup", cleanup_status );
         return status;
+    }
+
+    if (direct_dispatch_enabled)
+    {
+        struct xtajit64_direct_capsule *capsule = &state->direct_capsule;
+
+        capsule->size = sizeof(*capsule);
+        capsule->version = XTAJIT64_DIRECT_CAPSULE_VERSION;
+        status = XTAJIT64_CALL( bind_direct_dispatch, capsule );
+        if (!status && (capsule->size != sizeof(*capsule) ||
+                        capsule->version != XTAJIT64_DIRECT_CAPSULE_VERSION ||
+                        !capsule->bridge || (capsule->bridge & 3) ||
+                        !capsule->prepare || (capsule->prepare & 3) ||
+                        !capsule->complete || (capsule->complete & 3) ||
+                        capsule->authenticated_teb != (ULONG_PTR)teb ||
+                        !capsule->binding_id || !capsule->process_instance || capsule->reserved))
+            status = STATUS_INVALID_DEVICE_STATE;
+        if (status)
+        {
+            cleanup_status = XTAJIT64_CALL( thread_term, NULL );
+            if (!cleanup_status) cleanup_status = unregister_transition_state_mapping( state );
+            if (!cleanup_status) cleanup_status = free_transition_state( state );
+            if (cleanup_status) poison_provider( "direct binding cleanup", cleanup_status );
+            return status;
+        }
     }
 
     cpu->SuspendDoorbell = &state->suspend_doorbell;
@@ -3655,7 +3974,7 @@ NTSTATUS WINAPI ThreadInit(void)
  */
 void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
 {
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
     struct xtajit64_thread_state *state = NULL;
     CHPE_V2_CPU_AREA_INFO *cpu;
     ULONG_PTR native_stack_allocation = 0, emulator_stack_allocation = 0;
@@ -3665,7 +3984,7 @@ void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
 #endif
 
     TRACE( "%p %lx\n", handle, exit_code );
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
 
     if (!RtlIsCurrentThread( handle )) return;
     if ((cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo) && (state = get_thread_state()) &&
@@ -3676,7 +3995,13 @@ void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
     if ((cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo) && cpu->EmulatorStackBase > cpu->EmulatorStackLimit)
         get_allocation_base( (void *)(cpu->EmulatorStackBase - 1),
                              &emulator_stack_allocation );
-    if (__wine_unixlib_handle) XTAJIT64_CALL( thread_term, NULL );
+    if (__wine_unixlib_handle && (status = XTAJIT64_CALL( thread_term, NULL )))
+    {
+        /* Failed detach retains the native binding and its callback storage.
+         * Keep the PE doorbell/control allocation alive as well. */
+        poison_provider( "thread provider detach", status );
+        return;
+    }
     if (teb_allocation != native_stack_allocation &&
         teb_allocation != emulator_stack_allocation)
         unregister_thread_teb_window( teb_limit, teb_base );
@@ -3741,7 +4066,7 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
     if (reason == DLL_PROCESS_ATTACH)
     {
         LdrDisableThreadCalloutsForDll( inst );
-#ifdef HAVE_UNICORN
+#ifdef HAVE_SWITCHYARD_FEX
         if (init_unixlib()) return FALSE;
 #endif
     }

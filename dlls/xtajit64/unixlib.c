@@ -6967,7 +6967,7 @@ static NTSTATUS begin_simulation( void *args )
         params->fault_address = 0;
         params->fault_access = EXCEPTION_READ_FAULT;
         params->stop_reason = XTAJIT64_STOP_SUSPEND;
-        params->unicorn_error = UC_ERR_OK;
+        params->provider_error = UC_ERR_OK;
     }
     else
     {
@@ -6990,7 +6990,7 @@ static NTSTATUS begin_simulation( void *args )
     if (status)
     {
         params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
-        params->unicorn_error = err;
+        params->provider_error = err;
         pthread_mutex_unlock( &provider.mutex );
         return status;
     }
@@ -7032,7 +7032,7 @@ static NTSTATUS begin_simulation( void *args )
         if (status)
         {
             params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
-            params->unicorn_error = err;
+            params->provider_error = err;
             release_pool_engine_locked( binding, engine, FALSE );
             pthread_mutex_unlock( &provider.mutex );
             return status;
@@ -7045,7 +7045,7 @@ static NTSTATUS begin_simulation( void *args )
             status = STATUS_UNSUCCESSFUL;
             poison_provider_locked( status );
             params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
-            params->unicorn_error = err;
+            params->provider_error = err;
             release_pool_engine_locked( binding, engine, FALSE );
             pthread_mutex_unlock( &provider.mutex );
             return status;
@@ -7057,7 +7057,7 @@ static NTSTATUS begin_simulation( void *args )
             params->fault_address = 0;
             params->fault_access = EXCEPTION_READ_FAULT;
             params->stop_reason = XTAJIT64_STOP_SUSPEND;
-            params->unicorn_error = UC_ERR_OK;
+            params->provider_error = UC_ERR_OK;
             if (engine->flight_recorder)
                 flight_record_engine_event(
                     engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
@@ -7082,7 +7082,7 @@ static NTSTATUS begin_simulation( void *args )
             params->fault_address = 0;
             params->fault_access = EXCEPTION_READ_FAULT;
             params->stop_reason = XTAJIT64_STOP_SUSPEND;
-            params->unicorn_error = UC_ERR_OK;
+            params->provider_error = UC_ERR_OK;
             if (engine->flight_recorder)
                 flight_record_engine_event(
                     engine, XTAJIT64_FLIGHT_EVENT_SUSPEND_ACKNOWLEDGED,
@@ -7292,7 +7292,7 @@ static NTSTATUS begin_simulation( void *args )
                 params->fault_access = engine->fault_access;
                 params->stop_reason = status ? XTAJIT64_STOP_INTERNAL_ERROR :
                                                engine->stop_reason;
-                params->unicorn_error = err != UC_ERR_OK ? err : read_err;
+                params->provider_error = err != UC_ERR_OK ? err : read_err;
 #ifndef XTAJIT64_UNIXLIB_TEST
                 if (status || params->stop_reason != XTAJIT64_STOP_EC_TRANSITION)
                     TRACE_(xtajitmap)(
@@ -7302,7 +7302,7 @@ static NTSTATUS begin_simulation( void *args )
                         (long)getpid(),
                         (unsigned long long)engine->diagnostic_id,
                         (unsigned int)status, params->stop_reason,
-                        params->unicorn_error, err, read_err,
+                        params->provider_error, err, read_err,
                         engine->mapping_error,
                         atomic_load_explicit( &engine->pause_requested,
                                               memory_order_acquire ),
@@ -7337,7 +7337,7 @@ static NTSTATUS begin_simulation( void *args )
                     binding, engine, read_err == UC_ERR_OK );
                 if (context_err != UC_ERR_OK)
                 {
-                    params->unicorn_error = context_err;
+                    params->provider_error = context_err;
                     params->stop_reason = XTAJIT64_STOP_INTERNAL_ERROR;
                     poison_provider_locked( STATUS_UNSUCCESSFUL );
                     status = provider.poison_status;

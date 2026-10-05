@@ -2,6 +2,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/check_thread_term_ownership.py" \
+    "$ROOT_DIR/dlls/xtajit64/cpu.c"
+
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/check_control_stack.py" \
+    "$ROOT_DIR/dlls/xtajit64/cpu.c"
+
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/check_mapping_snapshot.py" \
+    "$ROOT_DIR/dlls/xtajit64/cpu.c"
+
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/provider-source-models.XXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
@@ -25,6 +38,16 @@ for standalone_fixture in \
     "$ROOT_DIR/dlls/xtajit/provider_tests/hook_performance.c" \
     "$ROOT_DIR/dlls/xtajit64/provider_tests/fixed_low.c" \
     "$ROOT_DIR/dlls/xtajit64/provider_tests/fixed_low_import.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/unaligned_tso_pe.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/exception_pe.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/seh_unwind_pe.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/seh_unwind_native_pe.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/suspend_context_pe.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/control_stack_pe.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/control_stack_stress_pe.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/thread_lifecycle_pe.c" \
+    "$ROOT_DIR/dlls/ntdll/tests/arm64ec_exception_unwind_pe.c" \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/ec_entry_cache.c" \
     "$ROOT_DIR/dlls/xtajit64/provider_tests/fixed_low.spec" \
     "$ROOT_DIR/dlls/xtajit64/provider_tests/fixed_low_import.spec"; do
     grep -Eq '^#[[:space:]]*pragma[[:space:]]+makedep[[:space:]]+standalone([[:space:]]|$)' \
@@ -55,13 +78,31 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
     "$ROOT_DIR/dlls/xtajit64/provider_tests/check_x64_entry_gate.py" \
     "$ROOT_DIR/dlls/xtajit64/cpu.c"
 
-grep -Fqx 'UNIX_CFLAGS = $(UNICORN_CFLAGS) $(XTAJIT64_PE_CFLAGS)' \
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+    "$ROOT_DIR/dlls/xtajit64/provider_tests/check_ec_entry_cache.py" \
+    "$ROOT_DIR/dlls/xtajit64/cpu.c"
+
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+    "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_exception_stack.py" \
+    "$ROOT_DIR/dlls/ntdll/unix/signal_arm64.c"
+
+grep -Fqx 'UNIX_CFLAGS = $(SWITCHYARD_FEX_CFLAGS) $(XTAJIT64_PE_CFLAGS)' \
     "$ROOT_DIR/dlls/xtajit64/Makefile.in" ||
-    fail "xtajit64 Unixlib does not inherit the configured Unicorn capability"
+    fail "xtajit64 Unixlib does not inherit the configured FEX capability"
+grep -Fqx 'UNIX_LIBS   = $(SWITCHYARD_FEX_LIBS)' \
+    "$ROOT_DIR/dlls/xtajit64/Makefile.in" ||
+    fail "xtajit64 Unixlib does not link the configured FEX provider"
+grep -Eq '^[[:space:]]*unixlib_fex[.]c$' \
+    "$ROOT_DIR/dlls/xtajit64/Makefile.in" ||
+    fail "xtajit64 does not compile the FEX implementation"
+if grep -Eq 'UNICORN|^[[:space:]]*unixlib[.]c([[:space:]\\]|$)' \
+    "$ROOT_DIR/dlls/xtajit64/Makefile.in"; then
+    fail "xtajit64 still selects the retired Unicorn implementation"
+fi
 
 if grep -Eq 'arm64ec_owned_backing|WINE_ARM64EC_MEMORY_OBSERVER_V2' \
     "$ROOT_DIR/dlls/xtajit64/cpu.c" \
-    "$ROOT_DIR/dlls/xtajit64/unixlib.c" \
+    "$ROOT_DIR/dlls/xtajit64/unixlib_fex.c" \
     "$ROOT_DIR/dlls/xtajit64/unixlib.h"; then
     fail "xtajit64 still references a retired fixed-low ownership protocol"
 fi

@@ -3882,6 +3882,15 @@ static BOOL can_retry_native_writable_exec( const struct file_view *view, const 
     }
     return found_exec;
 }
+#else
+static inline BOOL mprotect_host_page_is_cpu_provider_owned( const struct file_view *view,
+                                                              const void *address )
+{
+    /* CPU-provider page ownership is only used by the Darwin ARM64 path. */
+    (void)view;
+    (void)address;
+    return FALSE;
+}
 #endif
 
 
@@ -8761,6 +8770,51 @@ static void *alloc_virtual_heap( SIZE_T size )
     return anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+static void reserve_arm64ec_low_va_shadow(void)
+{
+    const UINT_PTR shadow_start = WINE_LOW_VA_SHADOW_BASE;
+    const UINT_PTR shadow_end = shadow_start + WINE_LOW_VA_SHADOW_SIZE;
+    const UINT_PTR guard_size = granularity_mask + 1;
+    UINT_PTR guard_end;
+
+    if (!host_page_size || (host_page_size & (host_page_size - 1)) ||
+        !guard_size || (guard_size & (guard_size - 1)) ||
+        host_page_size > guard_size || guard_size > ~(UINT_PTR)0 - shadow_end)
+    {
+        ERR( "invalid host page size for the translated low-address boundary guard\n" );
+        exit(1);
+    }
+    guard_end = shadow_end + guard_size;
+
+    /* A generated access beginning in the translated final low page can span
+     * past 4 GiB.  Its native ARM64 load then reaches the page immediately
+     * after the high shadow, while the corresponding identity guest page at
+     * 4 GiB is occupied by the native Mach-O image.  Reserve that spill page
+     * before any Wine-private allocation.  Own a complete Windows allocation
+     * granularity so the next native view retains its required alignment, then
+     * remove only the guard's allocator record: the PROT_NONE Mach mapping
+     * remains process-owned and immutable, but no native view or virtual heap
+     * may consume it. */
+    reserve_area( (void *)shadow_start, (void *)guard_end );
+    if (mmap_is_in_reserved_area( (void *)shadow_start,
+                                  WINE_LOW_VA_SHADOW_SIZE + guard_size ) != 1)
+    {
+        ERR( "failed to reserve the translated low-address window and boundary guard %p-%p\n",
+             (void *)shadow_start, (void *)guard_end );
+        exit(1);
+    }
+    mmap_remove_reserved_area( (void *)shadow_end, guard_size );
+    if (mmap_is_in_reserved_area( (void *)shadow_start, WINE_LOW_VA_SHADOW_SIZE ) != 1 ||
+        mmap_is_in_reserved_area( (void *)shadow_end, guard_size ) != 0)
+    {
+        ERR( "failed to isolate the translated low-address boundary guard %p-%p\n",
+             (void *)shadow_end, (void *)guard_end );
+        exit(1);
+    }
+}
+#endif
+
 /***********************************************************************
  *           virtual_init
  */
@@ -8813,19 +8867,7 @@ void virtual_init(void)
     }
 
 #if defined(__APPLE__) && defined(__aarch64__)
-    /* Own the translated window before any internal anonymous allocation can
-     * consume it.  reserve_area() uses non-overwriting Mach mappings on Darwin
-     * and records only holes that this process successfully acquired. */
-    reserve_area( (void *)WINE_LOW_VA_SHADOW_BASE,
-                  (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) );
-    if (mmap_is_in_reserved_area( (void *)WINE_LOW_VA_SHADOW_BASE,
-                                  WINE_LOW_VA_SHADOW_SIZE ) != 1)
-    {
-        ERR( "failed to reserve the translated low-address window %p-%p\n",
-             (void *)WINE_LOW_VA_SHADOW_BASE,
-             (void *)(WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE) );
-        exit(1);
-    }
+    reserve_arm64ec_low_va_shadow();
 #endif
 
     /* try to find space in a reserved area for the views and pages protection table */
@@ -9502,7 +9544,8 @@ struct thread_data *virtual_alloc_thread_data(void)
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 #if defined(__APPLE__) && defined(__aarch64__)
     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
-                       WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE, 0, 0 );
+                       WINE_LOW_VA_SHADOW_BASE + WINE_LOW_VA_SHADOW_SIZE + granularity_mask + 1,
+                       0, 0 );
 #else
     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
                        limit_4g, 0, 0 );

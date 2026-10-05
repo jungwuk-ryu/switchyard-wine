@@ -684,8 +684,8 @@ PCSCLITE_LIBS
 PCSCLITE_CFLAGS
 PCAP_LIBS
 PCAP_CFLAGS
-UNICORN_LIBS
-UNICORN_CFLAGS
+SWITCHYARD_FEX_LIBS
+SWITCHYARD_FEX_CFLAGS
 OPENCL_CFLAGS
 WAYLAND_EGL_LIBS
 WAYLAND_EGL_CFLAGS
@@ -976,7 +976,7 @@ with_pulse
 with_sane
 with_sdl
 with_udev
-with_unicorn
+with_fex
 with_usb
 with_v4l2
 with_vulkan
@@ -1932,8 +1932,8 @@ WAYLAND_EGL_CFLAGS
 WAYLAND_EGL_LIBS
 OPENCL_CFLAGS
 OPENCL_LIBS
-UNICORN_CFLAGS
-UNICORN_LIBS
+SWITCHYARD_FEX_CFLAGS
+SWITCHYARD_FEX_LIBS
 PCAP_CFLAGS
 PCAP_LIBS
 PCSCLITE_CFLAGS
@@ -2655,7 +2655,7 @@ Optional Packages:
   --without-sane          do not use SANE (scanner support)
   --without-sdl           do not use SDL
   --without-udev          do not use udev (plug and play support)
-  --with-unicorn          use Unicorn for ARM64 x86 emulation
+  --with-fex[=PREFIX]     use Switchyard FEX for native ARM64 x86-64 emulation
   --without-usb           do not use the libusb library
   --without-v4l2          do not use v4l2 (video capture)
   --without-vulkan        do not use Vulkan
@@ -2820,10 +2820,10 @@ Some influential environment variables:
   OPENCL_CFLAGS
               C compiler flags for OpenCL, overriding pkg-config
   OPENCL_LIBS Linker flags for OpenCL, overriding pkg-config
-  UNICORN_CFLAGS
-              C compiler flags for unicorn, overriding pkg-config
-  UNICORN_LIBS
-              Linker flags for unicorn, overriding pkg-config
+  SWITCHYARD_FEX_CFLAGS
+              C compiler flags for switchyard-fex, overriding pkg-config
+  SWITCHYARD_FEX_LIBS
+              Linker flags for switchyard-fex, overriding pkg-config
   PCAP_CFLAGS C compiler flags for libpcap, overriding pkg-config
   PCAP_LIBS   Linker flags for libpcap, overriding pkg-config
   PCSCLITE_CFLAGS
@@ -4544,10 +4544,10 @@ then :
 fi
 
 
-# Check whether --with-unicorn was given.
-if test ${with_unicorn+y}
+# Check whether --with-fex was given.
+if test ${with_fex+y}
 then :
-  withval=$with_unicorn;
+  withval=$with_fex;
 fi
 
 
@@ -17266,62 +17266,55 @@ esac
 enable_opencl=${enable_opencl:-no}
 fi
 
-if test "x$with_unicorn" != "x" -a "x$with_unicorn" != "xno"
+if test "x$with_fex" != "x" -a "x$with_fex" != "xno"
 then
+    if test "x$with_fex" != "xyes"
+    then
+        SWITCHYARD_FEX_CFLAGS="-I$with_fex/include"
+        SWITCHYARD_FEX_LIBS="-L$with_fex/lib -lswitchyard-fex"
+    fi
     rm -f conftest.err
-if ${UNICORN_CFLAGS:+false} :
+if ${SWITCHYARD_FEX_CFLAGS:+false} :
 then :
   if test ${PKG_CONFIG+y}
 then :
-  UNICORN_CFLAGS=`$PKG_CONFIG --cflags unicorn 2>conftest.err`
+  SWITCHYARD_FEX_CFLAGS=`$PKG_CONFIG --cflags switchyard-fex 2>conftest.err`
 fi
 fi
 
-if ${UNICORN_LIBS:+false} :
+if ${SWITCHYARD_FEX_LIBS:+false} :
 then :
   if test ${PKG_CONFIG+y}
 then :
-  UNICORN_LIBS=`$PKG_CONFIG --libs unicorn 2>/dev/null`
+  SWITCHYARD_FEX_LIBS=`$PKG_CONFIG --libs switchyard-fex 2>/dev/null`
 fi
 fi
 
-UNICORN_LIBS=${UNICORN_LIBS:-"-lunicorn"}
-printf '%s\n' "$as_me:${as_lineno-$LINENO}: unicorn cflags: $UNICORN_CFLAGS" >&5
-printf '%s\n' "$as_me:${as_lineno-$LINENO}: unicorn libs: $UNICORN_LIBS" >&5
+SWITCHYARD_FEX_LIBS=${SWITCHYARD_FEX_LIBS:-"-lswitchyard-fex"}
+printf '%s\n' "$as_me:${as_lineno-$LINENO}: switchyard-fex cflags: $SWITCHYARD_FEX_CFLAGS" >&5
+printf '%s\n' "$as_me:${as_lineno-$LINENO}: switchyard-fex libs: $SWITCHYARD_FEX_LIBS" >&5
 if test -s conftest.err; then
-     printf %s "$as_me:${as_lineno-$LINENO}: unicorn errors: " >&5
+     printf %s "$as_me:${as_lineno-$LINENO}: switchyard-fex errors: " >&5
      cat conftest.err >&5
 fi
 rm -f conftest.err
-if test -n "$UNICORN_CFLAGS$UNICORN_LIBS"
+if test -n "$SWITCHYARD_FEX_CFLAGS$SWITCHYARD_FEX_LIBS"
 then :
   ac_save_pkg_CPPFLAGS=$CPPFLAGS
 ac_save_pkg_LIBS=$LIBS
-CPPFLAGS="$CPPFLAGS $UNICORN_CFLAGS"
-LIBS="$UNICORN_LIBS $LIBS"
-ac_fn_c_check_header_compile "$LINENO" "unicorn/unicorn.h" "ac_cv_header_unicorn_unicorn_h" "$ac_includes_default"
-if test "x$ac_cv_header_unicorn_unicorn_h" = xyes
-then :
-  ac_fn_c_check_header_compile "$LINENO" "unicorn/x86.h" "ac_cv_header_unicorn_x86_h" "$ac_includes_default"
-if test "x$ac_cv_header_unicorn_x86_h" = xyes
+CPPFLAGS="$CPPFLAGS $SWITCHYARD_FEX_CFLAGS"
+LIBS="$SWITCHYARD_FEX_LIBS $LIBS"
+ac_fn_c_check_header_compile "$LINENO" "switchyard_fex.h" "ac_cv_header_switchyard_fex_h" "$ac_includes_default"
+if test "x$ac_cv_header_switchyard_fex_h" = xyes
 then :
   cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
-#include <unicorn/unicorn.h>
-#if UC_API_MAJOR < 2 || (UC_API_MAJOR == 2 && (UC_API_MINOR < 1 || (UC_API_MINOR == 1 && UC_API_PATCH < 4)))
-#error Unicorn 2.1.4 or newer is required
+#include <switchyard_fex.h>
+#if SWITCHYARD_FEX_ABI_VERSION != 6
+#error Switchyard FEX ABI v6 is required
 #endif
-#ifndef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP
-#error Switchyard instruction-boundary stop support is required
-#endif
-#ifndef UC_SWITCHYARD_INSTRUCTION_BOUNDARY_STOP_CLEAR
-#error Switchyard instruction-boundary stop-clear support is required
-#endif
-#ifndef UC_SWITCHYARD_SHARED_MEMORY_ATOMICS
-#error Switchyard shared-memory atomic support is required
-#endif
-#ifndef UC_SWITCHYARD_SHARED_CODE_COHERENCE
-#error Switchyard shared-code coherence support is required
+#ifndef SWITCHYARD_FEX_PROVIDER_ABI_IDENTITY
+#error Switchyard FEX provider identity is required
 #endif
 int
 main (void)
@@ -17333,54 +17326,111 @@ main (void)
 _ACEOF
 if ac_fn_c_try_compile "$LINENO"
 then :
-  ac_fn_c_check_func "$LINENO" "uc_open" "ac_cv_func_uc_open"
-if test "x$ac_cv_func_uc_open" = xyes
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_process_create" "ac_cv_func_switchyard_fex_process_create"
+if test "x$ac_cv_func_switchyard_fex_process_create" = xyes
 then :
-  ac_fn_c_check_func "$LINENO" "uc_emu_stop_at_instruction_boundary" "ac_cv_func_uc_emu_stop_at_instruction_boundary"
-if test "x$ac_cv_func_uc_emu_stop_at_instruction_boundary" = xyes
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_execute_prepared" "ac_cv_func_switchyard_fex_thread_execute_prepared"
+if test "x$ac_cv_func_switchyard_fex_thread_execute_prepared" = xyes
 then :
-  ac_fn_c_check_func "$LINENO" "uc_clear_instruction_boundary_stop" "ac_cv_func_uc_clear_instruction_boundary_stop"
-if test "x$ac_cv_func_uc_clear_instruction_boundary_stop" = xyes
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_reconstruct_jit_fault" "ac_cv_func_switchyard_fex_thread_reconstruct_jit_fault"
+if test "x$ac_cv_func_switchyard_fex_thread_reconstruct_jit_fault" = xyes
 then :
-  ac_fn_c_check_func "$LINENO" "uc_enable_shared_memory_atomics" "ac_cv_func_uc_enable_shared_memory_atomics"
-if test "x$ac_cv_func_uc_enable_shared_memory_atomics" = xyes
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_process_invalidate_code" "ac_cv_func_switchyard_fex_process_invalidate_code"
+if test "x$ac_cv_func_switchyard_fex_process_invalidate_code" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_repair_unaligned_tso" "ac_cv_func_switchyard_fex_thread_repair_unaligned_tso"
+if test "x$ac_cv_func_switchyard_fex_thread_repair_unaligned_tso" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_repair_callret_fault" "ac_cv_func_switchyard_fex_thread_repair_callret_fault"
+if test "x$ac_cv_func_switchyard_fex_thread_repair_callret_fault" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_prepare_dispatch" "ac_cv_func_switchyard_fex_thread_prepare_dispatch"
+if test "x$ac_cv_func_switchyard_fex_thread_prepare_dispatch" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_complete_dispatch" "ac_cv_func_switchyard_fex_thread_complete_dispatch"
+if test "x$ac_cv_func_switchyard_fex_thread_complete_dispatch" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_create_with_domain" "ac_cv_func_switchyard_fex_thread_create_with_domain"
+if test "x$ac_cv_func_switchyard_fex_thread_create_with_domain" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_prepare_execution" "ac_cv_func_switchyard_fex_thread_prepare_execution"
+if test "x$ac_cv_func_switchyard_fex_thread_prepare_execution" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_import_register_window" "ac_cv_func_switchyard_fex_thread_import_register_window"
+if test "x$ac_cv_func_switchyard_fex_thread_import_register_window" = xyes
+then :
+  ac_fn_c_check_func "$LINENO" "switchyard_fex_thread_export_register_window" "ac_cv_func_switchyard_fex_thread_export_register_window"
+if test "x$ac_cv_func_switchyard_fex_thread_export_register_window" = xyes
 then :
   XTAJIT64_UNIXLIB=xtajit64.so
-                                     XTAJIT64_PE_CFLAGS=-DHAVE_UNICORN
-                                     XTAJIT_UNIXLIB=xtajit.so
-                                     XTAJIT_PE_CFLAGS=-DHAVE_UNICORN
+                                                                 XTAJIT64_PE_CFLAGS=-DHAVE_SWITCHYARD_FEX
 else case e in #(
-  e) UNICORN_LIBS="" ;;
+  e) SWITCHYARD_FEX_LIBS="" ;;
 esac
 fi
 
 else case e in #(
-  e) UNICORN_LIBS="" ;;
+  e) SWITCHYARD_FEX_LIBS="" ;;
 esac
 fi
 
 else case e in #(
-  e) UNICORN_LIBS="" ;;
+  e) SWITCHYARD_FEX_LIBS="" ;;
 esac
 fi
 
 else case e in #(
-  e) UNICORN_LIBS="" ;;
+  e) SWITCHYARD_FEX_LIBS="" ;;
 esac
 fi
 
 else case e in #(
-  e) UNICORN_LIBS="" ;;
+  e) SWITCHYARD_FEX_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) SWITCHYARD_FEX_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) SWITCHYARD_FEX_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) SWITCHYARD_FEX_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) SWITCHYARD_FEX_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) SWITCHYARD_FEX_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) SWITCHYARD_FEX_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) SWITCHYARD_FEX_LIBS="" ;;
+esac
+fi
+
+else case e in #(
+  e) SWITCHYARD_FEX_LIBS="" ;;
 esac
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
 else case e in #(
-  e) UNICORN_LIBS="" ;;
-esac
-fi
-
-else case e in #(
-  e) UNICORN_LIBS="" ;;
+  e) SWITCHYARD_FEX_LIBS="" ;;
 esac
 fi
 
@@ -17388,12 +17438,12 @@ CPPFLAGS=$ac_save_pkg_CPPFLAGS
 LIBS=$ac_save_pkg_LIBS
 fi
 
-    if test "x$UNICORN_LIBS" = "x"
+    if test "x$SWITCHYARD_FEX_LIBS" = "x"
 then :
-  case "x$with_unicorn" in
+  case "x$with_fex" in
   xno) ;;
-  *)   as_fn_error $? "Switchyard Unicorn 2.1.4 development files with instruction-boundary stop/clear, shared-memory atomic, and shared-code coherence support not found.
-Use the --without-unicorn option if you really want this." "$LINENO" 5 ;;
+  *)   as_fn_error $? "Switchyard FEX ABI v6 development files with register windows, shared admission, detached execution, JIT-fault reconstruction, unaligned TSO repair, and code invalidation support not found.
+Use the --without-fex option if you really want this." "$LINENO" 5 ;;
 esac
 
 fi
@@ -24665,8 +24715,8 @@ XKBCOMMON_LIBS = $XKBCOMMON_LIBS
 WAYLAND_EGL_CFLAGS = $WAYLAND_EGL_CFLAGS
 WAYLAND_EGL_LIBS = $WAYLAND_EGL_LIBS
 OPENCL_CFLAGS = $OPENCL_CFLAGS
-UNICORN_CFLAGS = $UNICORN_CFLAGS
-UNICORN_LIBS = $UNICORN_LIBS
+SWITCHYARD_FEX_CFLAGS = $SWITCHYARD_FEX_CFLAGS
+SWITCHYARD_FEX_LIBS = $SWITCHYARD_FEX_LIBS
 PCAP_CFLAGS = $PCAP_CFLAGS
 PCAP_LIBS = $PCAP_LIBS
 PCSCLITE_CFLAGS = $PCSCLITE_CFLAGS

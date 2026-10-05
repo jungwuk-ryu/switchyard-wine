@@ -1,0 +1,2 @@
+CONTROL_STACK_PASS threads=9 barriers=18 metadata-preserved
+exit 0

@@ -111,9 +111,10 @@ source "$PROVIDER_LIBRARY"
 source "$DXMT_LIBRARY"
 # shellcheck disable=SC1090
 source "$SIGNING_LIBRARY"
+source "$ROOT_DIR/switchyard/tests/fex_packaging_fixture.sh"
 switchyard_load_runtime_profile preview-native-arm64-fex
-[ "$SWITCHYARD_RUNTIME_PROFILE_ENABLED" = 1 ] ||
-  fail "preview profile is not enabled for native packaging acceptance"
+[ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_FEX" = true ] ||
+  fail "preview packaging policy does not select FEX"
 
 [ -f "$DXMT_ARCHIVE" ] && [ ! -L "$DXMT_ARCHIVE" ] ||
   fail "pinned DXMT archive fixture is missing or unsafe"
@@ -187,56 +188,14 @@ expect_failure "missing companion ABI digest header" \
 /bin/mv "$TEST_ROOT/unixlib.h.missing" \
   "$COMPANION_SOURCE_FIXTURE/include/wine/unixlib.h"
 
-UNICORN_CACHE="${SWITCHYARD_UNICORN_FIXTURE_CACHE:-${HOME}/.switchyard/deps/cpu-provider/unicorn-${SWITCHYARD_UNICORN_VERSION}-${SWITCHYARD_UNICORN_SOURCE_REVISION:0:12}-build${SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION}-arm64-macos-${SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS}}"
-[ -d "$UNICORN_CACHE" ] && [ ! -L "$UNICORN_CACHE" ] ||
-  fail "pinned Unicorn fixture cache is missing: $UNICORN_CACHE"
-/usr/bin/python3 -I "$DIGEST_HELPER" verify "$UNICORN_CACHE" ||
-  fail "pinned Unicorn fixture cache failed content verification"
-
 /bin/mkdir -m 700 "$RUNTIME"
-/bin/mkdir -p \
-  "$RUNTIME/bin" \
-  "$RUNTIME/lib/wine/aarch64-unix" \
-  "$RUNTIME/lib/wine/aarch64-windows" \
-  "$RUNTIME/lib/wine/i386-windows" \
-  "$RUNTIME/lib/wine/x86_64-windows" \
-  "$RUNTIME/lib/switchyard-unicorn/lib" \
-  "$RUNTIME/lib/switchyard-unicorn/share/doc/switchyard-unicorn" \
-  "$RUNTIME/lib/switchyard-unicorn/share/src/switchyard-unicorn"
-/bin/chmod 0755 \
-  "$RUNTIME/bin" "$RUNTIME/lib" "$RUNTIME/lib/wine" \
+/bin/mkdir -p "$RUNTIME/bin" "$RUNTIME/lib/wine/aarch64-unix" \
+  "$RUNTIME/lib/wine/aarch64-windows" "$RUNTIME/lib/wine/x86_64-windows"
+/bin/chmod 0755 "$RUNTIME/bin" "$RUNTIME/lib" "$RUNTIME/lib/wine" \
   "$RUNTIME/lib/wine/aarch64-unix" "$RUNTIME/lib/wine/aarch64-windows" \
-  "$RUNTIME/lib/wine/i386-windows" "$RUNTIME/lib/wine/x86_64-windows" \
-  "$RUNTIME/lib/switchyard-unicorn" "$RUNTIME/lib/switchyard-unicorn/lib" \
-  "$RUNTIME/lib/switchyard-unicorn/share" \
-  "$RUNTIME/lib/switchyard-unicorn/share/doc" \
-  "$RUNTIME/lib/switchyard-unicorn/share/doc/switchyard-unicorn" \
-  "$RUNTIME/lib/switchyard-unicorn/share/src" \
-  "$RUNTIME/lib/switchyard-unicorn/share/src/switchyard-unicorn"
-
-UNICORN_PACKAGE="$RUNTIME/lib/switchyard-unicorn"
-UNICORN_MANIFEST="$UNICORN_PACKAGE/switchyard-unicorn-runtime.json"
-/usr/bin/install -m 0755 "$UNICORN_CACHE/lib/libunicorn.2.dylib" \
-  "$UNICORN_PACKAGE/lib/libunicorn.2.dylib"
-/bin/ln -s libunicorn.2.dylib "$UNICORN_PACKAGE/lib/libunicorn.dylib"
-/bin/chmod -h 0755 "$UNICORN_PACKAGE/lib/libunicorn.dylib"
-/usr/bin/install -m 0644 "$UNICORN_CACHE/switchyard-unicorn-runtime.json" \
-  "$UNICORN_PACKAGE/switchyard-unicorn-runtime.json"
-for notice in README.txt CORRESPONDING-SOURCE.txt COPYING COPYING.LGPL2 COPYING_GLIB \
-    QEMU-COPYING QEMU-COPYING.LIB QEMU-LICENSE; do
-  /usr/bin/install -m 0644 "$UNICORN_CACHE/share/doc/switchyard-unicorn/$notice" \
-    "$UNICORN_PACKAGE/share/doc/switchyard-unicorn/$notice"
-done
-UNICORN_SOURCE_ARCHIVE="unicorn-${SWITCHYARD_UNICORN_SOURCE_REVISION}.tar.gz"
-/usr/bin/install -m 0644 \
-  "$UNICORN_CACHE/share/src/switchyard-unicorn/$UNICORN_SOURCE_ARCHIVE" \
-  "$UNICORN_PACKAGE/share/src/switchyard-unicorn/$UNICORN_SOURCE_ARCHIVE"
-/usr/bin/install -m 0644 \
-  "$UNICORN_CACHE/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" \
-  "$UNICORN_PACKAGE/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME"
-fixture_payload_digest="$(/usr/bin/python3 -I "$DIGEST_HELPER" write "$UNICORN_PACKAGE")"
-[ "$fixture_payload_digest" = "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" ] ||
-  fail "fixture Unicorn payload digest $fixture_payload_digest does not match $SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST"
+  "$RUNTIME/lib/wine/x86_64-windows"
+switchyard_fixture_stage_fex_sdk "$RUNTIME" || fail "pinned FEX SDK fixture failed"
+FEX_MANIFEST="$FEX_PACKAGE/switchyard-fex-runtime.json"
 
 /bin/cat >"$TEST_ROOT/ntdll.c" <<'EOF'
 int ntdll_fixture(void) { return 7; }
@@ -245,46 +204,8 @@ EOF
   -mmacosx-version-min=26.5 -Wl,-install_name,@rpath/ntdll.so \
   "$TEST_ROOT/ntdll.c" -o "$RUNTIME/lib/wine/aarch64-unix/ntdll.so"
 
-/bin/cat >"$TEST_ROOT/provider.c" <<'EOF'
-extern int ntdll_fixture(void);
-extern unsigned int uc_version(unsigned int *, unsigned int *);
-struct uc_struct;
-typedef int (*switchyard_unicorn_extension_t)(struct uc_struct *);
-extern int uc_emu_stop_at_instruction_boundary(struct uc_struct *);
-extern int uc_enable_shared_memory_atomics(struct uc_struct *);
-#ifdef XTAJIT64_PROVIDER
-extern int uc_clear_instruction_boundary_stop(struct uc_struct *);
-extern int uc_set_shared_memory_atomic_callback(struct uc_struct *);
-#endif
-__attribute__((used, visibility("default")))
-switchyard_unicorn_extension_t const switchyard_unicorn_fixture_imports[] = {
-    uc_emu_stop_at_instruction_boundary,
-    uc_enable_shared_memory_atomics,
-#ifdef XTAJIT64_PROVIDER
-    uc_clear_instruction_boundary_stop,
-    uc_set_shared_memory_atomic_callback,
-#endif
-};
-__attribute__((used, visibility("default"))) const char
-    switchyard_xtajit64_fixture_abi_identity[] =
-        "switchyard-xtajit64-provider-abi-v10-flight-bind-process-init-96-begin-472-doorbell";
-__attribute__((visibility("default"))) unsigned int provider_fixture(void)
-{
-    return (unsigned int)ntdll_fixture() + uc_version(0, 0);
-}
-EOF
-for provider in xtajit xtajit64; do
-  provider_define=
-  [ "$provider" != xtajit64 ] || provider_define=-DXTAJIT64_PROVIDER
-  /usr/bin/xcrun --sdk macosx clang -arch arm64 -dynamiclib -O2 -Wall -Wextra -Werror \
-    -mmacosx-version-min=26.5 -Wl,-install_name,"@rpath/$provider.so" \
-    ${provider_define:+"$provider_define"} \
-    -Wl,-rpath,@loader_path/ \
-    -Wl,-rpath,@loader_path/../../switchyard-unicorn/lib \
-    "$TEST_ROOT/provider.c" "$RUNTIME/lib/wine/aarch64-unix/ntdll.so" \
-    "$UNICORN_PACKAGE/lib/libunicorn.2.dylib" \
-    -o "$RUNTIME/lib/wine/aarch64-unix/$provider.so"
-done
+switchyard_fixture_build_fex_provider "$RUNTIME" \
+  "$RUNTIME/$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY" || fail "FEX provider fixture build failed"
 
 /usr/bin/python3 -I - "$RUNTIME" \
   "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" <<'PY'
@@ -325,10 +246,9 @@ def write_pe(relative, machine, arm64ec=False, abi_identity=None):
     os.chmod(path, 0o755)
 
 
-write_pe("lib/wine/aarch64-windows/xtajit.dll", 0xAA64)
 write_pe("lib/wine/aarch64-windows/xtajit64.dll", 0x8664, True,
          x64_abi_identity)
-write_pe("lib/wine/i386-windows/ntdll.dll", 0x014C)
+write_pe("lib/wine/aarch64-windows/ntdll.dll", 0xAA64)
 write_pe("lib/wine/x86_64-windows/ntdll.dll", 0x8664)
 PY
 
@@ -469,55 +389,24 @@ write_fixture_content_marker "$MESA_ROOT"
 MESA_DIGEST="$(content_tree_digest "$MESA_ROOT")"
 FONT_ASSETS_DIGEST="$(content_tree_digest "$FONT_ASSETS_ROOT")"
 
-XTAJIT_UNIX_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-unix/xtajit.so")"
-XTAJIT_PE_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-windows/xtajit.dll")"
 XTAJIT64_UNIX_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-unix/xtajit64.so")"
 XTAJIT64_PE_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-windows/xtajit64.dll")"
 WINE_UNIX_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-unix/wine")"
 WINE_REAL_SHA="$(sha256_file "$RUNTIME/bin/wine.switchyard-real")"
-I386_NTDLL_SHA="$(sha256_file "$RUNTIME/lib/wine/i386-windows/ntdll.dll")"
+AARCH64_NTDLL_SHA="$(sha256_file "$RUNTIME/lib/wine/aarch64-windows/ntdll.dll")"
 X86_64_NTDLL_SHA="$(sha256_file "$RUNTIME/lib/wine/x86_64-windows/ntdll.dll")"
 
-/usr/bin/python3 -I - "$MANIFEST" \
-  "$SWITCHYARD_UNICORN_VERSION" "$SWITCHYARD_UNICORN_SOURCE_REPOSITORY" \
-  "$SWITCHYARD_UNICORN_SOURCE_REVISION" "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" \
-  "$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" \
-  "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" \
-  "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" \
-  "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" "$SWITCHYARD_UNICORN_LIBRARY_SHA256" \
-  "$XTAJIT_UNIX_SHA" "$XTAJIT_PE_SHA" "$XTAJIT64_UNIX_SHA" "$XTAJIT64_PE_SHA" \
-  "$WINE_UNIX_SHA" "$WINE_REAL_SHA" "$I386_NTDLL_SHA" "$X86_64_NTDLL_SHA" \
+switchyard_emit_native_fex_provider_manifest "$RUNTIME" >"$TEST_ROOT/fex-provider.json"
+/usr/bin/python3 -I - "$MANIFEST" "$TEST_ROOT/fex-provider.json" \
+  "$WINE_UNIX_SHA" "$WINE_REAL_SHA" "$AARCH64_NTDLL_SHA" "$X86_64_NTDLL_SHA" \
   "${DEPENDENCY_DIGESTS[@]}" "$MESA_DIGEST" "$FONT_ASSETS_DIGEST" <<'PY'
 import json
 import sys
-
-(
-    output,
-    version,
-    repository,
-    revision,
-    archive_digest,
-    patch_basename,
-    patch_digest,
-    build_contract,
-    development_digest,
-    payload_digest,
-    library_digest,
-    xtajit_unix_digest,
-    xtajit_pe_digest,
-    xtajit64_unix_digest,
-    xtajit64_pe_digest,
-    wine_unix_digest,
-    wine_real_digest,
-    i386_ntdll_digest,
-    x86_64_ntdll_digest,
-    gstreamer_digest,
-    vulkan_digest,
-    font_digest,
-    tls_digest,
-    mesa_digest,
-    font_assets_digest,
-) = sys.argv[1:]
+(output, provider_path, wine_unix_digest, wine_real_digest, aarch64_ntdll_digest,
+ x86_64_ntdll_digest, gstreamer_digest, vulkan_digest, font_digest, tls_digest,
+ mesa_digest, font_assets_digest) = sys.argv[1:]
+with open(provider_path, encoding="utf-8") as stream:
+    provider = json.load(stream)
 value = {
     "manifestVersion": 2,
     "id": "switchyard-local-native-arm64-fex-packaging-fixture",
@@ -534,10 +423,10 @@ value = {
         "minimumMacOS": "26.5",
         "gstreamerRegistryArchitecture": "arm64",
     },
-    "peArchitectures": ["aarch64", "arm64ec", "x86_64", "i386"],
+    "peArchitectures": ["aarch64", "arm64ec", "x86_64"],
     "integrity": {
         "wineUnixSha256": wine_unix_digest,
-        "i386NtdllSha256": i386_ntdll_digest,
+        "aarch64NtdllSha256": aarch64_ntdll_digest,
         "x86_64NtdllSha256": x86_64_ntdll_digest,
     },
     "runtimeSigning": {
@@ -579,55 +468,7 @@ value = {
         "digest": font_assets_digest,
         "fixtureSentinel": "font-assets-unchanged",
     },
-    "cpuProvider": {
-        "implementation": "unicorn",
-        "version": version,
-        "sourceRepository": repository,
-        "sourceRevision": revision,
-        "sourceArchive": (
-            "lib/switchyard-unicorn/share/src/switchyard-unicorn/"
-            f"unicorn-{revision}.tar.gz"
-        ),
-        "sourceArchiveSha256": archive_digest,
-        "sourcePatch": {
-            "path": (
-                "lib/switchyard-unicorn/share/src/switchyard-unicorn/"
-                + patch_basename
-            ),
-            "sha256": patch_digest,
-        },
-        "buildContractVersion": int(build_contract),
-        "hostArchitecture": "arm64",
-        "kuserSharedDataModel": "translated-shadow",
-        "emulatedArchitectures": ["i386", "x86_64"],
-        "developmentCacheDigest": development_digest,
-        "runtimeRoot": "lib/switchyard-unicorn",
-        "runtimePayloadDigest": payload_digest,
-        "library": "lib/switchyard-unicorn/lib/libunicorn.2.dylib",
-        "librarySha256": library_digest,
-        "providerUnixLibraries": [
-            "lib/wine/aarch64-unix/xtajit.so",
-            "lib/wine/aarch64-unix/xtajit64.so",
-        ],
-        "components": [
-            {
-                "guestArchitecture": "i386",
-                "unixLibrary": "lib/wine/aarch64-unix/xtajit.so",
-                "unixLibrarySha256": xtajit_unix_digest,
-                "peLibrary": "lib/wine/aarch64-windows/xtajit.dll",
-                "peLibrarySha256": xtajit_pe_digest,
-            },
-            {
-                "guestArchitecture": "x86_64",
-                "unixLibrary": "lib/wine/aarch64-unix/xtajit64.so",
-                "unixLibrarySha256": xtajit64_unix_digest,
-                "peLibrary": "lib/wine/aarch64-windows/xtajit64.dll",
-                "peLibrarySha256": xtajit64_pe_digest,
-            },
-        ],
-        "runtimeRpath": "@loader_path/../../switchyard-unicorn/lib",
-        "manifest": "lib/switchyard-unicorn/switchyard-unicorn-runtime.json",
-    },
+    "cpuProvider": provider,
 }
 with open(output, "x", encoding="utf-8", newline="\n") as stream:
     json.dump(value, stream, ensure_ascii=True, indent=2)
@@ -699,28 +540,27 @@ for dependency_root in "${DEPENDENCY_ROOTS[@]}"; do
   )")
 done
 
-# An identity refresh must not rewrite the pinned Unicorn package merely to
+# An identity refresh must not rewrite the pinned FEX package merely to
 # normalize JSON formatting when its Mach-O library bytes did not change.
-UNICORN_MANIFEST_SHA_BEFORE="$(sha256_file "$UNICORN_MANIFEST")"
-UNICORN_MARKER_SHA_BEFORE="$(
-  sha256_file "$UNICORN_PACKAGE/.switchyard-content-sha256"
+FEX_MANIFEST_SHA_BEFORE="$(sha256_file "$FEX_MANIFEST")"
+FEX_MARKER_SHA_BEFORE="$(
+  sha256_file "$FEX_PACKAGE/.switchyard-content-sha256"
 )"
 switchyard_refresh_native_arm64_signed_runtime_manifest "$RUNTIME" "$MANIFEST"
-[ "$(sha256_file "$UNICORN_MANIFEST")" = "$UNICORN_MANIFEST_SHA_BEFORE" ] ||
-  fail "no-op signed refresh rewrote the pinned Unicorn manifest"
-[ "$(sha256_file "$UNICORN_PACKAGE/.switchyard-content-sha256")" = \
-    "$UNICORN_MARKER_SHA_BEFORE" ] ||
-  fail "no-op signed refresh changed the pinned Unicorn content marker"
+[ "$(sha256_file "$FEX_MANIFEST")" = "$FEX_MANIFEST_SHA_BEFORE" ] ||
+  fail "no-op signed refresh rewrote the pinned FEX manifest"
+[ "$(sha256_file "$FEX_PACKAGE/.switchyard-content-sha256")" = \
+    "$FEX_MARKER_SHA_BEFORE" ] ||
+  fail "no-op signed refresh changed the pinned FEX content marker"
 [ "$(/usr/bin/plutil -extract cpuProvider.runtimePayloadDigest raw -o - \
-    "$MANIFEST")" = "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" ] ||
-  fail "no-op signed refresh changed the pinned Unicorn payload identity"
+    "$MANIFEST")" = "$SWITCHYARD_FEX_RUNTIME_PAYLOAD_DIGEST" ] ||
+  fail "no-op signed refresh changed the pinned FEX payload identity"
 switchyard_validate_runtime_manifest_profile \
   "$MANIFEST" preview-native-arm64-fex "$RUNTIME"
 switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
 
 SIGNING_MUTATION_TARGETS=(
-  "$UNICORN_PACKAGE/lib/libunicorn.2.dylib"
-  "$RUNTIME/lib/wine/aarch64-unix/xtajit.so"
+  "$FEX_PACKAGE/lib/libswitchyard-fex.6.0.0.dylib"
   "$RUNTIME/lib/wine/aarch64-unix/xtajit64.so"
   "$RUNTIME/lib/wine/aarch64-unix/crypt32.so"
   "$RUNTIME/lib/wine/aarch64-unix/dwrite.so"
@@ -756,8 +596,8 @@ switchyard_refresh_native_arm64_signed_runtime_manifest "$RUNTIME" "$MANIFEST"
 switchyard_validate_runtime_manifest_profile \
   "$MANIFEST" preview-native-arm64-fex "$RUNTIME"
 switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
-/usr/bin/python3 -I "$DIGEST_HELPER" verify "$UNICORN_PACKAGE" ||
-  fail "refreshed Unicorn nested content marker is invalid"
+/usr/bin/python3 -I "$DIGEST_HELPER" verify "$FEX_PACKAGE" ||
+  fail "refreshed FEX nested content marker is invalid"
 [ ! -e "$RUNTIME/.switchyard-content-sha256" ] ||
   fail "signed-manifest refresh published the outer runtime marker out of order"
 for index in "${!DEPENDENCY_ROOTS[@]}"; do
@@ -836,7 +676,7 @@ for item in signing["processEntryMachOs"]:
 
 provider = value["cpuProvider"]
 if provider["librarySha256"] != digest(provider["library"]):
-    raise SystemExit("refreshed Unicorn library digest is stale")
+    raise SystemExit("refreshed FEX library digest is stale")
 for component in provider["components"]:
     if component["unixLibrarySha256"] != digest(component["unixLibrary"]):
         raise SystemExit("refreshed provider Unix digest is stale")
@@ -845,7 +685,7 @@ for component in provider["components"]:
 with open(os.path.join(root, provider["manifest"]), encoding="utf-8") as stream:
     nested = json.load(stream)
 if nested["librarySha256"] != provider["librarySha256"]:
-    raise SystemExit("nested Unicorn library identity is stale")
+    raise SystemExit("nested FEX library identity is stale")
 
 for item in value["wow64UnixlibPolicy"]["auditedModules"]:
     if item["sha256"] != digest(item["unixLibrary"]):
@@ -1139,15 +979,15 @@ fi
 
 /bin/cp "$MANIFEST" "$TEST_ROOT/manifest.good"
 /bin/cp "$RUNTIME/lib/wine/x86_64-windows/d3d11.dll" "$TEST_ROOT/d3d11.good"
-/bin/cp "$UNICORN_PACKAGE/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" \
-  "$TEST_ROOT/unicorn-source-patch.good"
+/bin/cp "$FEX_PACKAGE/share/src/switchyard-fex/$SWITCHYARD_FEX_SOURCE_PATCH_BASENAME" \
+  "$TEST_ROOT/fex-source-patch.good"
 
 /usr/bin/printf 'tampered\n' >> \
-  "$UNICORN_PACKAGE/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME"
-expect_failure "tampered Unicorn source patch" \
+  "$FEX_PACKAGE/share/src/switchyard-fex/$SWITCHYARD_FEX_SOURCE_PATCH_BASENAME"
+expect_failure "tampered FEX source patch" \
   switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
-/bin/cp "$TEST_ROOT/unicorn-source-patch.good" \
-  "$UNICORN_PACKAGE/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME"
+/bin/cp "$TEST_ROOT/fex-source-patch.good" \
+  "$FEX_PACKAGE/share/src/switchyard-fex/$SWITCHYARD_FEX_SOURCE_PATCH_BASENAME"
 
 /usr/bin/python3 -I - "$MANIFEST" <<'PY'
 import json
@@ -1159,7 +999,7 @@ with open(sys.argv[1], "w", encoding="utf-8", newline="\n") as stream:
     json.dump(value, stream, ensure_ascii=True, indent=2)
     stream.write("\n")
 PY
-expect_failure "missing Unicorn source-patch identity" \
+expect_failure "missing FEX source-patch identity" \
   switchyard_validate_native_arm64_runtime_packaging "$RUNTIME" "$MANIFEST" "$ROOT_DIR"
 /bin/cp "$TEST_ROOT/manifest.good" "$MANIFEST"
 

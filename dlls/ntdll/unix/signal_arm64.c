@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
 #ifdef HAVE_SYS_PARAM_H
@@ -62,6 +63,7 @@
 #include "unix_private.h"
 #include "wine/debug.h"
 #include "arm64ec_emulation_dispatch.h"
+#include "../arm64ec_guest_flags.h"
 #ifdef __APPLE__
 # include "arm64ec_low_guest_decode.h"
 #endif
@@ -105,6 +107,9 @@ __ASM_GLOBAL_FUNC( set_custom_x18_abi_enabled_idempotent,
                    "adrp x10, _update_tpidr@GOTPAGE\n\t"
                    "ldr x10, [x10, _update_tpidr@GOTPAGEOFF]\n\t"
                    "ldr x1, [x10]\n\t"
+                   /* The commpage uses x15 for deferred preemption. Initialize
+                    * it outside the PFZ; never clear a kernel request afterward. */
+                   "mov x15, xzr\n\t"
                    "braaz x1" )
 #endif
 
@@ -280,6 +285,109 @@ static DWORD64 get_fault_esr( ucontext_t *sigcontext )
 }
 
 #endif /* linux */
+
+#ifdef __APPLE__
+static pthread_mutex_t arm64ec_jit_signal_observer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct wine_arm64ec_jit_signal_observer_v3 arm64ec_jit_signal_observer;
+static BOOL arm64ec_jit_signal_observer_registered;
+
+C_ASSERT( sizeof(struct wine_arm64ec_jit_host_context_v1) == 800 );
+C_ASSERT( offsetof(struct wine_arm64ec_jit_host_context_v1, gpr) == 16 );
+C_ASSERT( offsetof(struct wine_arm64ec_jit_host_context_v1, vector) == 264 );
+C_ASSERT( offsetof(struct wine_arm64ec_jit_host_context_v1, pc) == 776 );
+C_ASSERT( sizeof(struct wine_arm64ec_jit_signal_observer_v3) == 48 );
+
+static void capture_arm64ec_jit_host_context(
+    struct wine_arm64ec_jit_host_context_v1 *host, const ucontext_t *sigcontext )
+{
+    unsigned int index;
+
+    memset( host, 0, sizeof(*host) );
+    host->size = sizeof(*host);
+    host->version = WINE_ARM64EC_JIT_HOST_CONTEXT_VERSION;
+    for (index = 0; index < 29; ++index) host->gpr[index] = REGn_sig( index, sigcontext );
+    host->gpr[29] = FP_sig( sigcontext );
+    host->gpr[30] = LR_sig( sigcontext );
+    memcpy( host->vector, sigcontext->uc_mcontext->__ns.__v, sizeof(host->vector) );
+    host->pc = PC_sig( sigcontext );
+    host->pstate = PSTATE_sig( sigcontext );
+    host->fpcr = sigcontext->uc_mcontext->__ns.__fpcr;
+    host->fpsr = sigcontext->uc_mcontext->__ns.__fpsr;
+}
+
+static BOOL handle_arm64ec_jit_signal_fault( struct thread_data *data,
+                                            ucontext_t *sigcontext,
+                                            const siginfo_t *info,
+                                            uint32_t access, uint32_t flags )
+{
+    struct wine_arm64ec_jit_host_context_v1 host;
+    const struct wine_arm64ec_jit_signal_observer_v3 *observer;
+    unsigned int index;
+    int32_t status;
+
+    /* ThreadInit initializes the provider's signal TLS before a Wine thread
+     * can enter simulation. Native helper faults must not lazily allocate
+     * provider TLS from inside this handler. */
+    if (!data || !data->teb || !is_arm64ec() ||
+        !data->teb->ChpeV2CpuAreaInfo ||
+        !*(const volatile BOOLEAN *)&data->teb->ChpeV2CpuAreaInfo->InSimulation)
+        return FALSE;
+    if (!__atomic_load_n( &arm64ec_jit_signal_observer_registered,
+                          __ATOMIC_ACQUIRE ))
+        return FALSE;
+    observer = &arm64ec_jit_signal_observer;
+    capture_arm64ec_jit_host_context( &host, sigcontext );
+
+    status = observer->repair_jit_fault(
+        observer->context, &host, access, flags,
+        (ULONG_PTR)info->si_addr );
+    if (status || host.size != sizeof(host) ||
+        host.version != WINE_ARM64EC_JIT_HOST_CONTEXT_VERSION ||
+        host.flags || host.reserved || !host.pc || (host.pc & 3))
+        return FALSE;
+
+    for (index = 0; index < 29; ++index) REGn_sig( index, sigcontext ) = host.gpr[index];
+    FP_sig( sigcontext ) = host.gpr[29];
+    LR_sig( sigcontext ) = host.gpr[30];
+    memcpy( sigcontext->uc_mcontext->__ns.__v, host.vector, sizeof(host.vector) );
+    PC_sig( sigcontext ) = host.pc;
+    PSTATE_sig( sigcontext ) = host.pstate;
+    sigcontext->uc_mcontext->__ns.__fpcr = host.fpcr;
+    sigcontext->uc_mcontext->__ns.__fpsr = host.fpsr;
+    return TRUE;
+}
+#endif
+
+int32_t __wine_register_arm64ec_jit_signal_observer_v3(
+    const struct wine_arm64ec_jit_signal_observer_v3 *observer )
+{
+#ifdef __APPLE__
+    int32_t status = STATUS_SUCCESS;
+
+    if (!observer ||
+        observer->version != WINE_ARM64EC_JIT_SIGNAL_OBSERVER_VERSION ||
+        observer->size != sizeof(*observer) || observer->flags || observer->reserved ||
+        !observer->repair_jit_fault || !observer->query_exception_stack ||
+        observer->capabilities !=
+            WINE_ARM64EC_JIT_SIGNAL_OBSERVER_CAPABILITIES)
+        return STATUS_INVALID_PARAMETER;
+
+    pthread_mutex_lock( &arm64ec_jit_signal_observer_mutex );
+    if (arm64ec_jit_signal_observer_registered) status = STATUS_ALREADY_REGISTERED;
+    else if (!is_arm64ec()) status = STATUS_NOT_SUPPORTED;
+    else
+    {
+        arm64ec_jit_signal_observer = *observer;
+        __atomic_store_n( &arm64ec_jit_signal_observer_registered, TRUE,
+                          __ATOMIC_RELEASE );
+    }
+    pthread_mutex_unlock( &arm64ec_jit_signal_observer_mutex );
+    return status;
+#else
+    (void)observer;
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
 
 /* stack layout when calling KiUserExceptionDispatcher */
 struct exc_stack_layout
@@ -672,6 +780,7 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
         *(const volatile BOOLEAN *)&cpu->InSimulation;
 
     flags &= ~CONTEXT_ARM64_RET_TO_GUEST;
+    flags &= ~ARM64EC_GUEST_FLAGS_MASK;
 
     if (self && !frame) return STATUS_ACCESS_DENIED;
     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
@@ -695,8 +804,10 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
         frame->sp    = context->Sp;
         frame->pc    = context->Pc;
         frame->cpsr  = context->Cpsr;
+        frame->restore_flags &= ~(ARM64EC_GUEST_FLAGS_MASK | CONTEXT_ARM64_RET_TO_GUEST);
         if (is_arm64ec())
         {
+            frame->restore_flags |= arm64ec_guest_context_flags( context->ContextFlags );
             if (arm64ec_emulation_dispatch_required(
                     TRUE, guest_return_requested, simulation_active,
                     is_ec_code( frame->pc )))
@@ -750,7 +861,9 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
         context->Sp   = frame->sp;
         context->Pc   = frame->pc;
         context->Cpsr = frame->cpsr;
+        context->ContextFlags &= ~(ARM64EC_GUEST_FLAGS_MASK | CONTEXT_ARM64_RET_TO_GUEST);
         context->ContextFlags |= CONTEXT_CONTROL;
+        context->ContextFlags |= arm64ec_guest_context_flags( frame->restore_flags );
     }
     if (needed_flags & CONTEXT_FLOATING_POINT)
     {
@@ -1025,13 +1138,95 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 
 
 /***********************************************************************
+ *           get_active_x64_exception_stack
+ *
+ * Return the authenticated PE caller stack for an exception that escaped an
+ * active x64 provider invocation. Generated code can run on Wine's native
+ * syscall stack or on a detached PE control stack. Neither is an architectural
+ * guest stack. Use authenticated JIT state, not the interrupted stack's address,
+ * so a nested Unix call cannot overwrite the abandoned provider activation.
+ */
+#ifdef __APPLE__
+static BOOL get_active_x64_exception_stack( struct thread_data *data,
+                                            ucontext_t *context,
+                                            const EXCEPTION_RECORD *rec,
+                                            ULONG_PTR *stack_ptr )
+{
+    struct wine_arm64ec_jit_host_context_v1 host;
+    const struct wine_arm64ec_jit_signal_observer_v3 *observer;
+    CHPE_V2_CPU_AREA_INFO *cpu;
+    uint64_t guest_stack, fault_address = 0;
+    uint32_t access = 0;
+    ULONG_PTR stack, stack_limit, stack_base;
+
+    if (!data || !data->teb || !is_arm64ec() ||
+        !(cpu = data->teb->ChpeV2CpuAreaInfo) ||
+        !*(const volatile BOOLEAN *)&cpu->InSimulation)
+        return FALSE;
+
+    if (data->jmp_buf ||
+        !__atomic_load_n( &arm64ec_jit_signal_observer_registered, __ATOMIC_ACQUIRE ))
+        return FALSE;
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
+    {
+        if (rec->NumberParameters < 2 ||
+            (rec->ExceptionInformation[0] != EXCEPTION_READ_FAULT &&
+             rec->ExceptionInformation[0] != EXCEPTION_WRITE_FAULT &&
+             rec->ExceptionInformation[0] != EXCEPTION_EXECUTE_FAULT))
+            return FALSE;
+        access = rec->ExceptionInformation[0];
+        fault_address = rec->ExceptionInformation[1];
+    }
+    observer = &arm64ec_jit_signal_observer;
+    capture_arm64ec_jit_host_context( &host, context );
+    if (observer->query_exception_stack( observer->context, &host, access,
+                                        fault_address, &guest_stack ))
+        return FALSE;
+    stack = guest_stack;
+    stack_limit = (ULONG_PTR)data->teb->Tib.StackLimit;
+    stack_base = (ULONG_PTR)data->teb->Tib.StackBase;
+    /* A Windows x64 leaf enters with RSP mod 16 == 8. The native exception
+     * frame is aligned downward later, below that actual guest stack. */
+    if (!stack || (stack & 7) || stack < stack_limit || stack > stack_base ||
+        is_inside_syscall( data, stack ))
+    {
+        TRACE( "not routing active x64 exception signal sp %p guest sp %p "
+               "TEB stack %p-%p checked-copy %u signal-in-syscall %u "
+               "guest-in-syscall %u\n", (void *)(ULONG_PTR)SP_sig(context),
+               (void *)stack, (void *)stack_limit, (void *)stack_base,
+               !!data->jmp_buf, is_inside_syscall( data, SP_sig(context) ),
+               is_inside_syscall( data, stack ) );
+        return FALSE;
+    }
+
+    if (stack_ptr) *stack_ptr = stack;
+    return TRUE;
+}
+
+static void route_active_x64_exception( ucontext_t *context, ULONG_PTR stack )
+{
+    /* The exceptional exit bypasses the tagged Unixlib call's C epilogue. */
+    reset_wow64_unixlib_call_context();
+    TRACE( "routing active x64 simulation exception to ARM64EC dispatcher "
+           "on PE caller stack %p\n", (void *)stack );
+    SP_sig(context) = stack;
+}
+#endif
+
+
+/***********************************************************************
  *           setup_raise_exception
  */
 static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcontext,
                                    EXCEPTION_RECORD *rec, CONTEXT *context )
 {
     struct exc_stack_layout *stack;
-    void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
+    void *stack_ptr;
+#ifdef __APPLE__
+    ULONG_PTR active_x64_stack;
+    BOOL active_x64_exception = get_active_x64_exception_stack(
+        data, sigcontext, rec, &active_x64_stack );
+#endif
     NTSTATUS status;
 
     status = send_debug_event( data, rec, context, TRUE, TRUE );
@@ -1040,6 +1235,12 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
         restore_context( context, sigcontext );
         return;
     }
+
+#ifdef __APPLE__
+    if (active_x64_exception)
+        route_active_x64_exception( sigcontext, active_x64_stack );
+#endif
+    stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
 
     /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Pc -= 4;
@@ -1378,6 +1579,11 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context,
         data->jmp_buf = NULL;
         return TRUE;
     }
+#ifdef __APPLE__
+    /* setup_raise_exception() will preserve the live JIT context and move the
+     * dispatcher frame to the authenticated PE caller stack. */
+    if (get_active_x64_exception_stack( data, context, rec, NULL )) return FALSE;
+#endif
     if ((frame = get_syscall_frame( data )))
     {
         /* A fault escaping a tagged Unixlib call bypasses its C epilogue.
@@ -1720,6 +1926,12 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         break;
     case ESR_ELx_EC_DABT_LOW:
     case ESR_ELx_EC_DABT_CUR:
+#ifdef __APPLE__
+        if (handle_arm64ec_jit_signal_fault( data, sigcontext, siginfo,
+                !!ESR_ELx_ISS_DABT_WNR(esr),
+                ESR_ELx_ISS_DFSC(esr) == ESR_ELx_ISS_DFSC_ALIGN_FAULT ?
+                    WINE_ARM64EC_JIT_SIGNAL_ALIGNMENT_FAULT : 0 )) return;
+#endif
         if (ESR_ELx_ISS_DFSC(esr) == ESR_ELx_ISS_DFSC_ALIGN_FAULT)
         {
             rec.ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT;
@@ -2066,6 +2278,9 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         SP_sig(sigcontext) = frame->sp;
         PC_sig(sigcontext) = frame->pc;
     }
+    /* The user context now owns the metadata, or this is a native return.
+     * Do not let a later partial context inherit a consumed guest return. */
+    frame->restore_flags &= ~(ARM64EC_GUEST_FLAGS_MASK | CONTEXT_ARM64_RET_TO_GUEST);
     FP_sig(sigcontext)     = frame->fp;
     LR_sig(sigcontext)     = frame->lr;
     PSTATE_sig(sigcontext) = frame->cpsr;
@@ -2620,6 +2835,75 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
 /***********************************************************************
  *           __wine_unix_call_dispatcher
  */
+#ifdef __APPLE__
+/* Unlike a general Unix call this boundary cannot provide syscall-frame
+ * context restoration. Restrict it to a cooperative emulator interval, whose
+ * ordinary return and separate JIT fault reconstruction own that contract. */
+static NTSTATUS __attribute__((used,noinline)) arm64ec_native_call_validated(
+    unixlib_entry_t entry, void *args, UINT64 authenticated_teb )
+{
+    struct thread_data *data = get_thread_data();
+    CHPE_V2_CPU_AREA_INFO *cpu;
+
+    if (!is_arm64ec() || !data || !data->teb ||
+        (ULONG_PTR)data->teb != authenticated_teb ||
+        !(cpu = data->teb->ChpeV2CpuAreaInfo) || !cpu->SuspendDoorbell ||
+        !*(const volatile BOOLEAN *)&cpu->InSimulation || !entry || !args)
+        return STATUS_INVALID_DEVICE_STATE;
+    return entry( args );
+}
+
+/* The PE caller uses a naked branch, not an ARM64EC exit thunk. Both callbacks
+ * and mode transitions obey AAPCS (x19-x29/d8-d15 preserved); FP control/status
+ * and Windows x18 are owned here. Never save or restore Darwin's system x18.
+ * Every activation ends before a native guest callback. Ordinary emulation can
+ * run here; its authenticated JIT fault reconstruction owns nonlocal cleanup. */
+__ASM_GLOBAL_FUNC( __wine_arm64ec_native_call_v1,
+                   "hint 34\n\t"
+                   "stp x29, x30, [sp, #-64]!\n\t"
+                   __ASM_CFI(".cfi_def_cfa_offset 64\n\t")
+                   __ASM_CFI(".cfi_offset 29, -64\n\t")
+                   __ASM_CFI(".cfi_offset 30, -56\n\t")
+                   "mov x29, sp\n\t"
+                   "stp x0, x1, [sp, #16]\n\t"
+                   "str x2, [sp, #32]\n\t"
+                   "mrs x9, fpcr\n\t"
+                   "mrs x10, fpsr\n\t"
+                   "stp w9, w10, [sp, #40]\n\t"
+                   "cmp x18, x2\n\t"
+                   "b.ne 1f\n\t"
+                   "bl " __ASM_NAME("enter_system_x18_abi") "\n\t"
+                   "ldp x0, x1, [sp, #16]\n\t"
+                   "ldr x2, [sp, #32]\n\t"
+                   "bl " __ASM_NAME("arm64ec_native_call_validated") "\n\t"
+                   "str w0, [sp, #48]\n\t"
+                   "bl " __ASM_NAME("enter_windows_x18_abi") "\n\t"
+                   "ldr x18, [sp, #32]\n\t"
+                   "ldp w9, w10, [sp, #40]\n\t"
+                   "msr fpcr, x9\n\t"
+                   "msr fpsr, x10\n\t"
+                   "ldr w0, [sp, #48]\n\t"
+                   __ASM_CFI(".cfi_remember_state\n\t")
+                   "ldp x29, x30, [sp], #64\n\t"
+                   __ASM_CFI(".cfi_def_cfa_offset 0\n\t")
+                   __ASM_CFI(".cfi_restore 29\n\t")
+                   __ASM_CFI(".cfi_restore 30\n\t")
+                   "ret\n\t"
+                   __ASM_CFI(".cfi_restore_state\n\t")
+                   "1: brk #0xf68" )
+
+extern NTSTATUS __wine_arm64ec_native_call_v1( unixlib_entry_t, void *, UINT64 );
+
+UINT64 __wine_get_arm64ec_native_call_v1(void)
+{
+#ifdef HAVE_OS_CUSTOM_X18_ABI
+    return is_arm64ec() ? (ULONG_PTR)__wine_arm64ec_native_call_v1 : 0;
+#else
+    return 0;
+#endif
+}
+#endif
+
 __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "hint 34\n\t" /* bti c */
 #ifdef __APPLE__

@@ -1,0 +1,2 @@
+THREAD_ID_PASS direct export teb last-error threads=8
+exit 0

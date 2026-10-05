@@ -9,7 +9,8 @@
 
 SWITCHYARD_DEFAULT_RUNTIME_PROFILE="stable-x86_64-rosetta"
 SWITCHYARD_RUNTIME_MANIFEST_VERSION="2"
-SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION="3"
+SWITCHYARD_NATIVE_RUNTIME_CLOSURE_CONTRACT_VERSION="4"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/fex_contract.sh"
 SWITCHYARD_NATIVE_LLVM_VERSION="22.1.8"
 SWITCHYARD_NATIVE_CLANG_NO_DEFAULT_CONFIG_FLAG="--no-default-config"
 SWITCHYARD_RUNTIME_BOOTSTRAP_MAX_PATH="260"
@@ -482,7 +483,7 @@ labels = (
     "tlsRuntimeDigest",
     "tlsDlopenName",
     "tlsDlopenDigest",
-    "unicornRuntimeDigest",
+    "fexRuntimeDigest",
     "dxmtArtifactSha256",
     "dxmtSourcePatchSha256",
     "dxmtOriginalWinemetalSha256",
@@ -513,7 +514,7 @@ if len(values[3]) != 64 or set(values[3]) - hex64:
     raise SystemExit("native runtime closure source state digest is invalid")
 
 digest = hashlib.sha256()
-digest.update(b"switchyard-preview-native-arm64-fex-runtime-closure-v3\0")
+digest.update(b"switchyard-preview-native-arm64-fex-runtime-closure-v4\0")
 for label, value in zip(labels, values):
     key = label.encode("utf-8", "strict")
     payload = value.encode("utf-8", "strict")
@@ -616,20 +617,6 @@ switchyard_validate_native_runtime_prefix_bootstrap_budget() {
   fi
 }
 
-# Native CPU-provider inputs are a closed build policy.  The development tree
-# is used only while configuring Wine; runtime packaging selects the validated
-# dylib and its redistributable provenance materials from that tree.
-SWITCHYARD_UNICORN_VERSION="2.1.4"
-SWITCHYARD_UNICORN_SOURCE_REPOSITORY="https://github.com/unicorn-engine/unicorn.git"
-SWITCHYARD_UNICORN_SOURCE_REVISION="8028ec436f2d9376525352dd38ed9ed6b9f6be10"
-SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256="d3859317cc562ad9d172a32a4e4c2e62613df494b1155a0bf58dd0581fc1675e"
-SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME="unicorn-2.1.4-threaded-emu-stop.patch"
-SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256="96a647d57f6f749c3c3864ead959c2e9306488151f5fed468e6ad334483e6cc5"
-SWITCHYARD_UNICORN_LIBRARY_SHA256="1ea70e727ae6db21ea15ac449cd253740263efa5ffeece27f9c3c09b4a1fee1c"
-SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION="20"
-SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST="15fd615a7ed403dfced3a82c686b608ae837ddab37cd241e2b8d224bbc2c3841"
-SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST="f7d90c666a54f718070657004cc348d97f15f1f26e1d397a460360079f1e3f4d"
-
 # The native graphics input is a closed local artifact.  There is no mutable
 # download URL in the build policy: callers may select a local path, but both
 # the archive and the corresponding Git source are verified against every
@@ -688,7 +675,7 @@ switchyard_load_runtime_profile() {
       SWITCHYARD_RUNTIME_PROFILE_MOLTENVK_BOTTLE_TAG="sonoma"
       SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_SUBDIR="osx-64"
       SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_MANIFEST_BASENAME="tls-deps.tsv"
-      SWITCHYARD_RUNTIME_PROFILE_REQUIRES_UNICORN="false"
+      SWITCHYARD_RUNTIME_PROFILE_REQUIRES_FEX="false"
       SWITCHYARD_RUNTIME_PROFILE_REQUIRES_DXMT="false"
       SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL="direct"
       SWITCHYARD_RUNTIME_PROFILE_BUILD_CACHE_BASENAME="build-wow64-x86_64"
@@ -697,14 +684,16 @@ switchyard_load_runtime_profile() {
       ;;
     preview-native-arm64-fex)
       SWITCHYARD_RUNTIME_PROFILE="$profile"
-      SWITCHYARD_RUNTIME_PROFILE_ENABLED="1"
+      # Reenable only after full FEX configure/link/package validation. A
+      # reproducible standalone SDK is not qualification of the Wine package.
+      SWITCHYARD_RUNTIME_PROFILE_ENABLED="0"
       SWITCHYARD_RUNTIME_PROFILE_ID_PREFIX="switchyard-local-native-arm64-fex-"
       SWITCHYARD_RUNTIME_PROFILE_BUILD_PROFILE="switchyard-native-arm64-fex"
       SWITCHYARD_RUNTIME_PROFILE_MACHO_ARCH="arm64"
       SWITCHYARD_RUNTIME_PROFILE_WINE_UNIX_ARCH="aarch64"
-      SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS=("aarch64" "arm64ec" "x86_64" "i386")
-      SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV="aarch64,arm64ec,x86_64,i386"
-      SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS=("aarch64" "x86_64" "i386")
+      SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS=("aarch64" "arm64ec" "x86_64")
+      SWITCHYARD_RUNTIME_PROFILE_PE_ARCHS_CSV="aarch64,arm64ec,x86_64"
+      SWITCHYARD_RUNTIME_PROFILE_INSTALLED_PE_ARCHS=("aarch64" "x86_64")
       SWITCHYARD_RUNTIME_PROFILE_BUILD_TRIPLET="aarch64-apple-darwin"
       SWITCHYARD_RUNTIME_PROFILE_HOST_TRIPLET="aarch64-apple-darwin"
       SWITCHYARD_RUNTIME_PROFILE_ARCH_COMMAND=("arch" "-arm64")
@@ -720,7 +709,7 @@ switchyard_load_runtime_profile() {
       SWITCHYARD_RUNTIME_PROFILE_MOLTENVK_BOTTLE_TAG="arm64_tahoe"
       SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_SUBDIR="osx-arm64"
       SWITCHYARD_RUNTIME_PROFILE_TLS_PACKAGE_MANIFEST_BASENAME="tls-deps-arm64.tsv"
-      SWITCHYARD_RUNTIME_PROFILE_REQUIRES_UNICORN="true"
+      SWITCHYARD_RUNTIME_PROFILE_REQUIRES_FEX="true"
       SWITCHYARD_RUNTIME_PROFILE_REQUIRES_DXMT="true"
       SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL="translated-shadow"
       SWITCHYARD_RUNTIME_PROFILE_BUILD_CACHE_BASENAME="build-native-arm64-fex"
@@ -756,6 +745,11 @@ switchyard_require_runtime_profile_enabled() {
   fi
 
   echo "Runtime profile $SWITCHYARD_RUNTIME_PROFILE is recognized but not enabled." >&2
+  if [ "$SWITCHYARD_RUNTIME_PROFILE" = preview-native-arm64-fex ]; then
+    echo "FEX full-Wine packaging qualification is incomplete." >&2
+    echo "The standalone FEX SDK is not a full Wine runtime. No TCG fallback is permitted." >&2
+    return 2
+  fi
   echo "The native ARM64 CPU-provider, JIT, signing, and qualification gates have not passed." >&2
   echo "Use --runtime-profile stable-x86_64-rosetta for the supported runtime." >&2
   return 2
@@ -1111,16 +1105,16 @@ try:
             if hashlib.sha256(read_file(relative)).hexdigest() != component[digest_key]:
                 fail("CPU-provider component identity is not runtime-bound: " + relative)
 
-    unicorn_relative = provider.get("library")
-    unicorn_digest = provider.get("librarySha256")
-    if hashlib.sha256(read_file(unicorn_relative)).hexdigest() != unicorn_digest:
-        fail("Unicorn library identity is not runtime-bound")
+    fex_relative = provider.get("library")
+    fex_digest = provider.get("librarySha256")
+    if hashlib.sha256(read_file(fex_relative)).hexdigest() != fex_digest:
+        fail("FEX library identity is not runtime-bound")
     nested = json.loads(
         read_file(provider.get("manifest"), MAX_MANIFEST).decode("utf-8"),
         object_pairs_hook=no_duplicates,
     )
-    if type(nested) is not dict or nested.get("librarySha256") != unicorn_digest:
-        fail("nested Unicorn manifest is not bound to the final library")
+    if type(nested) is not dict or nested.get("librarySha256") != fex_digest:
+        fail("nested FEX manifest is not bound to the final library")
 
     package_root = os.path.join(root_name, provider.get("runtimeRoot"))
     verify = subprocess.run(
@@ -1132,7 +1126,7 @@ try:
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
     )
     if verify.returncode or digest.returncode or digest.stdout.strip() != provider.get("runtimePayloadDigest"):
-        fail("Unicorn payload identity is not runtime-bound")
+        fail("FEX payload identity is not runtime-bound")
 finally:
     os.close(root_fd)
 PY
@@ -1241,8 +1235,12 @@ if expected_profile == "preview-native-arm64-fex":
         "version",
         "sourceRepository",
         "sourceRevision",
-        "sourceArchive",
-        "sourceArchiveSha256",
+        "sourceDepsSha256",
+        "switchyardAdapterSha256",
+        "toolchainSha256",
+        "providerIdentity",
+        "processABIIdentity",
+        "immutablePayloadDigest",
         "hostArchitecture",
         "kuserSharedDataModel",
         "developmentCacheDigest",
@@ -1255,6 +1253,8 @@ if expected_profile == "preview-native-arm64-fex":
     )
     expected_fields = set(string_fields) | {
         "buildContractVersion",
+        "processABIVersion",
+        "arm64ecRegisterABI",
         "components",
         "emulatedArchitectures",
         "providerUnixLibraries",
@@ -1265,6 +1265,10 @@ if expected_profile == "preview-native-arm64-fex":
     for key in string_fields:
         require_exact_type(provider, key, str)
     require_exact_type(provider, "buildContractVersion", int)
+    require_exact_type(provider, "processABIVersion", int)
+    require_exact_type(provider, "arm64ecRegisterABI", bool)
+    if provider["arm64ecRegisterABI"] is not True:
+        raise ValueError("cpuProvider must use the ARM64EC register ABI")
     require_exact_type(provider, "sourcePatch", dict)
     if set(provider["sourcePatch"]) != {"path", "sha256"}:
         raise ValueError("cpuProvider.sourcePatch has an unexpected field set")
@@ -1277,7 +1281,7 @@ if expected_profile == "preview-native-arm64-fex":
         if not all(type(item) is str for item in provider[key]):
             raise ValueError("cpuProvider list contains a non-string value: " + key)
     require_exact_type(provider, "components", list)
-    if len(provider["components"]) != 2:
+    if len(provider["components"]) != 1:
         raise ValueError("cpuProvider.components has an unexpected length")
     component_fields = {
         "guestArchitecture",
@@ -1296,7 +1300,10 @@ if expected_profile == "preview-native-arm64-fex":
             if re.fullmatch(r"[0-9a-f]{64}", component[key]) is None:
                 raise ValueError("cpuProvider component digest is malformed: " + key)
     for key in (
-        "sourceArchiveSha256",
+        "sourceDepsSha256",
+        "switchyardAdapterSha256",
+        "toolchainSha256",
+        "immutablePayloadDigest",
         "developmentCacheDigest",
         "runtimePayloadDigest",
         "librarySha256",
@@ -1435,161 +1442,75 @@ PY
     switchyard_runtime_manifest_error "host.gstreamerRegistryArchitecture does not match the selected profile"
     return 1
   }
-  if [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_UNICORN" = "true" ]; then
-    actual="$(switchyard_runtime_manifest_value cpuProvider.implementation "$manifest")"
-    [ "$actual" = "unicorn" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.implementation must identify Unicorn"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.version "$manifest")"
-    [ "$actual" = "$SWITCHYARD_UNICORN_VERSION" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.version is not the pinned Unicorn version"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.sourceRepository "$manifest")"
-    [ "$actual" = "$SWITCHYARD_UNICORN_SOURCE_REPOSITORY" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.sourceRepository is not the pinned repository"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.sourceRevision "$manifest")"
-    [ "$actual" = "$SWITCHYARD_UNICORN_SOURCE_REVISION" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.sourceRevision is not the pinned revision"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.sourceArchive "$manifest")"
-    [ "$actual" = "lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-${SWITCHYARD_UNICORN_SOURCE_REVISION}.tar.gz" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.sourceArchive is not runtime-relative"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.sourceArchiveSha256 "$manifest")"
-    [ "$actual" = "$SWITCHYARD_UNICORN_SOURCE_ARCHIVE_SHA256" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.sourceArchiveSha256 is not pinned"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.sourcePatch.path "$manifest")"
-    [ "$actual" = "lib/switchyard-unicorn/share/src/switchyard-unicorn/$SWITCHYARD_UNICORN_SOURCE_PATCH_BASENAME" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.sourcePatch.path is not runtime-relative"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.sourcePatch.sha256 "$manifest")"
-    [ "$actual" = "$SWITCHYARD_UNICORN_SOURCE_PATCH_SHA256" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.sourcePatch.sha256 is not pinned"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.buildContractVersion "$manifest")"
-    [ "$actual" = "$SWITCHYARD_UNICORN_BUILD_CONTRACT_VERSION" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.buildContractVersion is not pinned"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.hostArchitecture "$manifest")"
-    [ "$actual" = "arm64" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.hostArchitecture must be arm64"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.kuserSharedDataModel "$manifest")"
-    [ "$actual" = "$SWITCHYARD_RUNTIME_PROFILE_KUSER_SHARED_DATA_MODEL" ] &&
-      [ "$actual" = "translated-shadow" ] || {
-      switchyard_runtime_manifest_error \
-        "cpuProvider.kuserSharedDataModel does not match the native profile"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.emulatedArchitectures "$manifest")"
-    [ "$actual" = "2" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.emulatedArchitectures has an unexpected length"
-      return 1
-    }
-    [ "$(switchyard_runtime_manifest_value cpuProvider.emulatedArchitectures.0 "$manifest")" = "i386" ] &&
-      [ "$(switchyard_runtime_manifest_value cpuProvider.emulatedArchitectures.1 "$manifest")" = "x86_64" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.emulatedArchitectures is not the exact allowlist"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.developmentCacheDigest "$manifest")"
-    [ "$actual" = "$SWITCHYARD_UNICORN_DEVELOPMENT_CACHE_DIGEST" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.developmentCacheDigest is not pinned"
-      return 1
-    }
+  if [ "$SWITCHYARD_RUNTIME_PROFILE_REQUIRES_FEX" = "true" ]; then
+    local field expected key
+    # Check the closed source/ABI contract before admitting runtime-bound
+    # identities. Signing may change only the library, nested manifest and
+    # content marker, never the immutable source/header/license payload.
+    for field in \
+        "implementation=switchyard-fex" \
+        "version=$SWITCHYARD_FEX_VERSION" \
+        "sourceRepository=$SWITCHYARD_FEX_SOURCE_REPOSITORY" \
+        "sourceRevision=$SWITCHYARD_FEX_SOURCE_REVISION" \
+        "sourceDepsSha256=$SWITCHYARD_FEX_SOURCE_DEPS_SHA256" \
+        "sourcePatch.path=$SWITCHYARD_NATIVE_FEX_SOURCE_PATCH" \
+        "sourcePatch.sha256=$SWITCHYARD_FEX_SOURCE_PATCH_SHA256" \
+        "buildContractVersion=$SWITCHYARD_FEX_BUILD_CONTRACT_VERSION" \
+        "switchyardAdapterSha256=$SWITCHYARD_FEX_ADAPTER_SHA256" \
+        "toolchainSha256=$SWITCHYARD_FEX_TOOLCHAIN_SHA256" \
+        "providerIdentity=$SWITCHYARD_FEX_PROVIDER_IDENTITY" \
+        "processABIVersion=$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" \
+        "processABIIdentity=$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" \
+        "arm64ecRegisterABI=true" \
+        "hostArchitecture=arm64" \
+        "kuserSharedDataModel=translated-shadow" \
+        "developmentCacheDigest=$SWITCHYARD_FEX_DEVELOPMENT_CACHE_DIGEST" \
+        "immutablePayloadDigest=$SWITCHYARD_FEX_IMMUTABLE_PAYLOAD_DIGEST" \
+        "runtimeRoot=$SWITCHYARD_NATIVE_FEX_ROOT" \
+        "library=$SWITCHYARD_NATIVE_FEX_LIBRARY" \
+        "runtimeRpath=$SWITCHYARD_NATIVE_FEX_RPATH" \
+        "manifest=$SWITCHYARD_NATIVE_FEX_ROOT/switchyard-fex-runtime.json" \
+        "emulatedArchitectures=1" \
+        "emulatedArchitectures.0=x86_64" \
+        "providerUnixLibraries=1" \
+        "providerUnixLibraries.0=$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY" \
+        "components=1" \
+        "components.0.guestArchitecture=x86_64" \
+        "components.0.unixLibrary=$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY" \
+        "components.0.peLibrary=$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY"; do
+      key="${field%%=*}"
+      expected="${field#*=}"
+      actual="$(switchyard_runtime_manifest_value "cpuProvider.$key" "$manifest")"
+      [ "$actual" = "$expected" ] || {
+        switchyard_runtime_manifest_error "cpuProvider.$key is not the closed FEX contract"
+        return 1
+      }
+    done
     actual="$(switchyard_runtime_manifest_value cpuProvider.runtimePayloadDigest "$manifest")"
-    if [ "$actual" != "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" ] &&
+    if [ "$actual" != "$SWITCHYARD_FEX_DEVELOPMENT_CACHE_DIGEST" ] &&
        [ -z "$runtime_root" ]; then
       switchyard_runtime_manifest_error \
         "cpuProvider.runtimePayloadDigest requires runtime-bound validation"
       return 1
     fi
-    actual="$(switchyard_runtime_manifest_value cpuProvider.runtimeRoot "$manifest")"
-    [ "$actual" = "lib/switchyard-unicorn" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.runtimeRoot is not runtime-relative"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.library "$manifest")"
-    [ "$actual" = "lib/switchyard-unicorn/lib/libunicorn.2.dylib" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.library is not runtime-relative"
-      return 1
-    }
     actual="$(switchyard_runtime_manifest_value cpuProvider.librarySha256 "$manifest")"
-    if [ "$actual" != "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ] &&
-       [ -z "$runtime_root" ]; then
+    if [ "$actual" != "$SWITCHYARD_FEX_LIBRARY_SHA256" ] && [ -z "$runtime_root" ]; then
       switchyard_runtime_manifest_error \
         "cpuProvider.librarySha256 requires runtime-bound validation"
       return 1
     fi
-    actual="$(switchyard_runtime_manifest_value cpuProvider.providerUnixLibraries "$manifest")"
-    [ "$actual" = "2" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.providerUnixLibraries has an unexpected length"
-      return 1
-    }
-    [ "$(switchyard_runtime_manifest_value cpuProvider.providerUnixLibraries.0 "$manifest")" = \
-        "lib/wine/aarch64-unix/xtajit.so" ] &&
-      [ "$(switchyard_runtime_manifest_value cpuProvider.providerUnixLibraries.1 "$manifest")" = \
-        "lib/wine/aarch64-unix/xtajit64.so" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.providerUnixLibraries is not the exact allowlist"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.components "$manifest")"
-    [ "$actual" = "2" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.components has an unexpected length"
-      return 1
-    }
-    [ "$(switchyard_runtime_manifest_value cpuProvider.components.0.guestArchitecture "$manifest")" = "i386" ] &&
-      [ "$(switchyard_runtime_manifest_value cpuProvider.components.0.unixLibrary "$manifest")" = \
-        "lib/wine/aarch64-unix/xtajit.so" ] &&
-      [ "$(switchyard_runtime_manifest_value cpuProvider.components.0.peLibrary "$manifest")" = \
-        "lib/wine/aarch64-windows/xtajit.dll" ] &&
-      [ "$(switchyard_runtime_manifest_value cpuProvider.components.1.guestArchitecture "$manifest")" = "x86_64" ] &&
-      [ "$(switchyard_runtime_manifest_value cpuProvider.components.1.unixLibrary "$manifest")" = \
-        "lib/wine/aarch64-unix/xtajit64.so" ] &&
-      [ "$(switchyard_runtime_manifest_value cpuProvider.components.1.peLibrary "$manifest")" = \
-        "lib/wine/aarch64-windows/xtajit64.dll" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.components is not the exact provider layout"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.runtimeRpath "$manifest")"
-    [ "$actual" = '@loader_path/../../switchyard-unicorn/lib' ] || {
-      switchyard_runtime_manifest_error "cpuProvider.runtimeRpath is not runtime-relative"
-      return 1
-    }
-    actual="$(switchyard_runtime_manifest_value cpuProvider.manifest "$manifest")"
-    [ "$actual" = "lib/switchyard-unicorn/switchyard-unicorn-runtime.json" ] || {
-      switchyard_runtime_manifest_error "cpuProvider.manifest is not runtime-relative"
-      return 1
-    }
     actual="$(switchyard_runtime_manifest_value runtimeSigning.mode "$manifest")"
     if [ -n "$runtime_root" ] && [ -z "$actual" ]; then
       switchyard_runtime_manifest_error \
         "runtimeSigning is required for runtime-bound native validation"
       return 1
     fi
-    if [ -n "$actual" ] ||
-       [ "$(switchyard_runtime_manifest_value cpuProvider.runtimePayloadDigest "$manifest")" != \
-         "$SWITCHYARD_UNICORN_RUNTIME_PAYLOAD_DIGEST" ] ||
-       [ "$(switchyard_runtime_manifest_value cpuProvider.librarySha256 "$manifest")" != \
-         "$SWITCHYARD_UNICORN_LIBRARY_SHA256" ]; then
+    if [ -n "$actual" ]; then
       [ -n "$runtime_root" ] || {
-        switchyard_runtime_manifest_error \
-          "signed native identities require an explicit runtime root"
+        switchyard_runtime_manifest_error "signed native identities require an explicit runtime root"
         return 1
       }
-      switchyard_validate_native_runtime_bound_identity \
-        "$manifest" "$runtime_root" || return 1
+      switchyard_validate_native_runtime_bound_identity "$manifest" "$runtime_root" || return 1
     fi
   fi
 }

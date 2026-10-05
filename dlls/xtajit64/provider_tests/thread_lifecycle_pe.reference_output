@@ -1,0 +1,2 @@
+THREAD_LIFECYCLE_PASS serial=32 batches=4x8 joined=64
+exit 0

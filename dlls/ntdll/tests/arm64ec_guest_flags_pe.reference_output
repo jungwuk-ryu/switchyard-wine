@@ -1,0 +1,2 @@
+ARM64EC_SOFT_FLAGS_PASS PF AF DF low high edits=16 exact-write-faults=16
+exit 0

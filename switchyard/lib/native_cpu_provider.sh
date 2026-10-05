@@ -5,17 +5,7 @@
 # read-only: build and release code owns manifest production and hash refresh.
 
 # shellcheck disable=SC2034 # Public contract constants are consumed by callers and tests.
-SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit.so"
-SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY="lib/wine/aarch64-windows/xtajit.dll"
-SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY="lib/wine/aarch64-unix/xtajit64.so"
-SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY="lib/wine/aarch64-windows/xtajit64.dll"
-SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION="10"
-SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY="switchyard-xtajit64-provider-abi-v10-flight-bind-process-init-96-begin-472-doorbell"
-SWITCHYARD_NATIVE_UNICORN_ROOT="lib/switchyard-unicorn"
-SWITCHYARD_NATIVE_UNICORN_LIBRARY="lib/switchyard-unicorn/lib/libunicorn.2.dylib"
-SWITCHYARD_NATIVE_UNICORN_RPATH='@loader_path/../../switchyard-unicorn/lib'
-SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH="lib/switchyard-unicorn/share/src/switchyard-unicorn/unicorn-2.1.4-threaded-emu-stop.patch"
-SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256="96a647d57f6f749c3c3864ead959c2e9306488151f5fed468e6ad334483e6cc5"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/fex_contract.sh"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_CONTRACT_VERSION="2"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_HANDLE_ENCODING="generation-tagged-v1"
 SWITCHYARD_WOW64_UNIXLIB_POLICY_EXTERNAL_SOURCE_VERSION="2"
@@ -106,7 +96,7 @@ switchyard_native_cpu_provider_validate_runtime_profile() {
 }
 
 switchyard_validate_native_cpu_provider_files() {
-  local manifest runtime_root digest_helper lipo_tool nm_tool otool_tool vtool_tool
+  local manifest runtime_root digest_helper lipo_tool nm_tool otool_tool vtool_tool codesign_tool
 
   [ "$#" -eq 2 ] || {
     echo "usage: switchyard_validate_native_cpu_provider_files MANIFEST RUNTIME" >&2
@@ -122,6 +112,7 @@ switchyard_validate_native_cpu_provider_files() {
   nm_tool="$(switchyard_native_cpu_provider_inspection_tool nm)" || return 1
   otool_tool="$(switchyard_native_cpu_provider_inspection_tool otool)" || return 1
   vtool_tool="$(switchyard_native_cpu_provider_inspection_tool vtool)" || return 1
+  codesign_tool="$(switchyard_native_cpu_provider_inspection_tool codesign)" || return 1
   switchyard_native_cpu_provider_validate_executable_path \
     "$digest_helper" "Native CPU-provider content-digest helper" || return 1
   switchyard_native_cpu_provider_validate_executable_path \
@@ -132,19 +123,20 @@ switchyard_validate_native_cpu_provider_files() {
     "$otool_tool" "Native CPU-provider otool tool" || return 1
   switchyard_native_cpu_provider_validate_executable_path \
     "$vtool_tool" "Native CPU-provider vtool tool" || return 1
+  switchyard_native_cpu_provider_validate_executable_path \
+    "$codesign_tool" "Native CPU-provider codesign tool" || return 1
 
   /usr/bin/python3 -I - "$manifest" "$runtime_root" "$digest_helper" \
-    "$lipo_tool" "$nm_tool" "$otool_tool" "$vtool_tool" \
+    "$lipo_tool" "$nm_tool" "$otool_tool" "$vtool_tool" "$codesign_tool" \
     "$SWITCHYARD_RUNTIME_PROFILE_MINIMUM_MACOS" \
-    "$SWITCHYARD_NATIVE_XTAJIT_UNIX_LIBRARY" \
-    "$SWITCHYARD_NATIVE_XTAJIT_PE_LIBRARY" \
     "$SWITCHYARD_NATIVE_XTAJIT64_UNIX_LIBRARY" \
     "$SWITCHYARD_NATIVE_XTAJIT64_PE_LIBRARY" \
-    "$SWITCHYARD_NATIVE_UNICORN_ROOT" \
-    "$SWITCHYARD_NATIVE_UNICORN_LIBRARY" \
-    "$SWITCHYARD_NATIVE_UNICORN_RPATH" \
-    "$SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH" \
-    "$SWITCHYARD_NATIVE_UNICORN_SOURCE_PATCH_SHA256" \
+    "$SWITCHYARD_NATIVE_FEX_ROOT" \
+    "$SWITCHYARD_NATIVE_FEX_LIBRARY" \
+    "$SWITCHYARD_NATIVE_FEX_RPATH" \
+    "$SWITCHYARD_NATIVE_FEX_SOURCE_PATCH" \
+    "$SWITCHYARD_FEX_SOURCE_PATCH_SHA256" \
+    "$SWITCHYARD_FEX_IMMUTABLE_PAYLOAD_DIGEST" \
     "$SWITCHYARD_NATIVE_XTAJIT64_ABI_VERSION" \
     "$SWITCHYARD_NATIVE_XTAJIT64_ABI_IDENTITY" <<'PY'
 import hashlib
@@ -166,16 +158,16 @@ import tempfile
     nm_tool,
     otool_tool,
     vtool_tool,
+    codesign_tool,
     minimum_macos,
-    xtajit_unix,
-    xtajit_pe,
     xtajit64_unix,
     xtajit64_pe,
-    unicorn_root,
-    unicorn_library,
-    unicorn_rpath,
-    unicorn_source_patch,
-    unicorn_source_patch_sha256,
+    fex_root,
+    fex_library,
+    fex_rpath,
+    fex_source_patch,
+    fex_source_patch_sha256,
+    fex_immutable_payload_digest,
     xtajit64_abi_version,
     xtajit64_abi_identity,
 ) = sys.argv[1:]
@@ -183,7 +175,6 @@ import tempfile
 MAX_MANIFEST = 1024 * 1024
 MAX_BINARY = 512 * 1024 * 1024
 MAX_TEXT = 4 * 1024 * 1024
-MAX_ARCHIVE = 128 * 1024 * 1024
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -346,11 +337,25 @@ def write_all(descriptor, data):
         offset += written
 
 
+def bounded_blocks(descriptor, size, description):
+    # A concurrent writer cannot extend inspection/snapshot I/O past the
+    # accepted extent. Detect both truncation and growth before publication.
+    remaining = size
+    while remaining:
+        block = os.read(descriptor, min(1024 * 1024, remaining))
+        if not block:
+            fail(description + " ended early")
+        remaining -= len(block)
+        yield block
+    if os.read(descriptor, 1):
+        fail(description + " grew during inspection")
+
+
 def digest_regular(relative, maximum=MAX_BINARY, executable=False):
     global snapshot_sequence
 
     path, path_info = checked_path(relative, maximum, executable)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     snapshot_sequence += 1
     snapshot_name = f"{snapshot_sequence:04d}-{os.path.basename(relative)}"
     snapshot_path = os.path.join(snapshot_root, snapshot_name)
@@ -379,7 +384,7 @@ def digest_regular(relative, maximum=MAX_BINARY, executable=False):
             | getattr(os, "O_NOFOLLOW", 0),
             0o400,
         )
-        for block in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
+        for block in bounded_blocks(descriptor, before.st_size, relative):
             digest.update(block)
             write_all(snapshot_descriptor, block)
         after = os.fstat(descriptor)
@@ -415,7 +420,7 @@ def digest_regular(relative, maximum=MAX_BINARY, executable=False):
 
 def verify_private_snapshot(record, relative):
     path = record["snapshot"]
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     descriptor = -1
     digest = hashlib.sha256()
     try:
@@ -423,7 +428,7 @@ def verify_private_snapshot(record, relative):
         opened = os.fstat(descriptor)
         if file_identity(opened) != record["snapshot_identity"]:
             fail("private provider snapshot changed while opening: " + relative)
-        for block in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
+        for block in bounded_blocks(descriptor, opened.st_size, relative):
             digest.update(block)
         after = os.fstat(descriptor)
     except OSError as error:
@@ -444,7 +449,7 @@ def verify_private_snapshot(record, relative):
             or file_identity(live_opened)[:4] != record["identity"][:4]
         ):
             fail("provider artifact path changed during validation: " + relative)
-        for block in iter(lambda: os.read(live_descriptor, 1024 * 1024), b""):
+        for block in bounded_blocks(live_descriptor, live_opened.st_size, relative):
             live_digest.update(block)
         live_after = os.fstat(live_descriptor)
         live_path_after = os.lstat(record["path"])
@@ -463,7 +468,6 @@ def verify_private_snapshot(record, relative):
 
 
 expected_components = [
-    ("i386", xtajit_unix, xtajit_pe),
     ("x86_64", xtajit64_unix, xtajit64_pe),
 ]
 components = provider.get("components")
@@ -494,116 +498,122 @@ for component, (guest, unix_relative, pe_relative) in zip(components, expected_c
 
 try:
     expected_x64_abi = (
-        "switchyard-xtajit64-provider-abi-v"
-        + str(int(xtajit64_abi_version))
-        + "-flight-bind-process-init-96-begin-472-doorbell"
+        "switchyard-xtajit64-fex-provider-abi-v" + str(int(xtajit64_abi_version))
+        + "-flight-bind-process-init-104-begin-472-doorbell-reconstruct-1248"
+        + "-jit-signal-stack-query-exec-range-dispatch-512-direct-64-native-stack-protect"
     )
     x64_abi_bytes = xtajit64_abi_identity.encode("ascii")
 except (UnicodeError, ValueError) as error:
     fail(f"invalid configured x64 provider ABI identity: {error}")
-if xtajit64_abi_identity != expected_x64_abi or not (32 <= len(x64_abi_bytes) <= 128):
+if xtajit64_abi_identity != expected_x64_abi or not (32 <= len(x64_abi_bytes) <= 512):
     fail("configured x64 provider ABI identity is inconsistent")
 for relative in (xtajit64_unix, xtajit64_pe):
     record = binary_records[relative]
     try:
         with open(record["snapshot"], "rb") as stream:
             with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as image:
-                found = image.find(x64_abi_bytes) >= 0
+                found = image.find(x64_abi_bytes + b"\0") >= 0
     except OSError as error:
         fail(f"cannot inspect x64 provider ABI identity in {relative}: {error}")
     if not found:
         fail("x64 provider ABI identity is absent from " + relative)
 
-if provider.get("library") != unicorn_library:
-    fail("CPU-provider Unicorn library path is not canonical")
-unicorn_expected = provider.get("librarySha256")
-if type(unicorn_expected) is not str or SHA256.fullmatch(unicorn_expected) is None:
-    fail("CPU-provider Unicorn library digest is malformed")
-unicorn_record = digest_regular(unicorn_library, executable=True)
-if unicorn_record["digest"] != unicorn_expected:
-    fail("CPU-provider Unicorn library digest mismatch")
-binary_records[unicorn_library] = unicorn_record
+if provider.get("library") != fex_library:
+    fail("CPU-provider FEX library path is not canonical")
+fex_expected = provider.get("librarySha256")
+if type(fex_expected) is not str or SHA256.fullmatch(fex_expected) is None:
+    fail("CPU-provider FEX library digest is malformed")
+fex_record = digest_regular(fex_library, executable=True)
+if fex_record["digest"] != fex_expected:
+    fail("CPU-provider FEX library digest mismatch")
+binary_records[fex_library] = fex_record
 
-source_archive = provider.get("sourceArchive")
-source_archive_sha = provider.get("sourceArchiveSha256")
-if not safe_relative(source_archive) or not source_archive.startswith(unicorn_root + "/"):
-    fail("CPU-provider source archive path is not canonical")
-if type(source_archive_sha) is not str or SHA256.fullmatch(source_archive_sha) is None:
-    fail("CPU-provider source archive digest is malformed")
-archive_record = digest_regular(source_archive, MAX_ARCHIVE)
-if archive_record["digest"] != source_archive_sha:
-    fail("CPU-provider source archive digest mismatch")
-verify_private_snapshot(archive_record, "Unicorn pristine source archive")
+source_deps = fex_root + "/share/src/switchyard-fex/adapter/source-deps.tsv"
+deps_record = digest_regular(source_deps, MAX_TEXT)
+if deps_record["digest"] != provider.get("sourceDepsSha256"):
+    fail("CPU-provider source-dependency manifest digest mismatch")
+verify_private_snapshot(deps_record, source_deps)
 
 source_patch = provider.get("sourcePatch")
 if type(source_patch) is not dict or set(source_patch) != {"path", "sha256"}:
     fail("CPU-provider source patch identity is absent or malformed")
-if source_patch["path"] != unicorn_source_patch:
+if source_patch["path"] != fex_source_patch:
     fail("CPU-provider source patch path is not canonical")
-if source_patch["sha256"] != unicorn_source_patch_sha256:
+if source_patch["sha256"] != fex_source_patch_sha256:
     fail("CPU-provider source patch digest is not the pinned qualification patch")
-patch_record = digest_regular(unicorn_source_patch, MAX_TEXT)
-if patch_record["digest"] != unicorn_source_patch_sha256:
+patch_record = digest_regular(fex_source_patch, MAX_TEXT)
+if patch_record["digest"] != fex_source_patch_sha256:
     fail("CPU-provider source patch bytes do not match the pinned qualification patch")
-verify_private_snapshot(patch_record, "Unicorn qualification source patch")
-unicorn_source_patch_relative = os.path.relpath(unicorn_source_patch, unicorn_root).replace(
+verify_private_snapshot(patch_record, "FEX qualification source patch")
+fex_source_patch_relative = os.path.relpath(fex_source_patch, fex_root).replace(
     os.sep, "/"
 )
 
 metadata_relative = provider.get("manifest")
-if metadata_relative != unicorn_root + "/switchyard-unicorn-runtime.json":
+if metadata_relative != fex_root + "/switchyard-fex-runtime.json":
     fail("CPU-provider package manifest path is not canonical")
 metadata_path, _ = checked_path(metadata_relative, MAX_MANIFEST)
-metadata = load_json(metadata_path, MAX_MANIFEST, "Unicorn runtime manifest")
+metadata = load_json(metadata_path, MAX_MANIFEST, "FEX runtime manifest")
 expected_metadata = {
-    "version": provider.get("version"),
+    "arm64ecRegisterABI": True,
     "sourceRepository": provider.get("sourceRepository"),
     "sourceRevision": provider.get("sourceRevision"),
     "buildContractVersion": provider.get("buildContractVersion"),
-    "enabledArchitectures": ["x86"],
     "hostArchitecture": "arm64",
     "minimumMacOS": minimum_macos,
-    "library": "lib/libunicorn.2.dylib",
-    "librarySha256": unicorn_expected,
-    "sourceArchive": "share/src/switchyard-unicorn/" + os.path.basename(source_archive),
-    "sourceArchiveSha256": source_archive_sha,
+    "library": "lib/libswitchyard-fex.6.0.0.dylib",
+    "librarySha256": fex_expected,
     "sourcePatch": {
-        "path": unicorn_source_patch_relative,
-        "sha256": unicorn_source_patch_sha256,
+        "path": fex_source_patch_relative,
+        "sha256": fex_source_patch_sha256,
     },
-    "license": (
-        "GPL-2.0-only with separately licensed GLib/QEMU components; preserve all "
-        "included notices and corresponding source"
-    ),
+    "switchyardAdapterSha256": provider.get("switchyardAdapterSha256"),
+    "toolchainSha256": provider.get("toolchainSha256"),
+    "providerIdentity": provider.get("providerIdentity"),
 }
 if type(metadata) is not dict or metadata != expected_metadata:
-    fail("Unicorn runtime manifest does not match the closed package identity")
+    fail("FEX runtime manifest does not match the closed package identity")
 
-package_root = os.path.join(root, unicorn_root)
+package_root = os.path.join(root, fex_root)
+adapter_files = (
+    "CMakeLists.txt", "README.md", "exports.txt", "source-deps.tsv",
+    "include/switchyard_fex.h", "include/switchyard_fex_admission.h",
+    "src/switchyard_fex.cpp", "tests/admission_contract.h", "tests/admission_test.h",
+    "tests/allocator_test.cpp", "tests/c_api_test.c", "tests/darwin_abi_test.cpp",
+    "tests/detached_dispatch_test.h", "tests/extract_wine_x18.cmake",
+    "tests/shared_admission_test.h", "tests/vector_state_test.h",
+    "tests/register_window_test.c", "tests/register_window_state_test.cpp",
+    "tests/register_window_reference.h",
+    "tests/verify_test_suite.py", "tests/wine_signal_wrapper.c",
+    "tests/wine_signal_wrapper.h", "wine-runtime-native-arm64.entitlements",
+    "wine/COPYING.LIB", "wine/LICENSE", "wine/dlls/ntdll/unix/signal_arm64.c",
+    "wine/include/wine/asm.h",
+)
+notices = ("FEX-LICENSE", "FEXCORE-LICENSE", "FMT-LICENSE", "RANGE-V3-LICENSE",
+           "UNORDERED-DENSE-LICENSE", "XXHASH-LICENSE", "CEPHES-LICENSE",
+           "SOFTFLOAT-LICENSE-SOURCE.c")
 expected_entries = {
-    ".switchyard-content-sha256",
-    "lib/libunicorn.2.dylib",
-    "lib/libunicorn.dylib",
-    "share/doc/switchyard-unicorn/README.txt",
-    "share/doc/switchyard-unicorn/CORRESPONDING-SOURCE.txt",
-    "share/doc/switchyard-unicorn/COPYING",
-    "share/doc/switchyard-unicorn/COPYING.LGPL2",
-    "share/doc/switchyard-unicorn/COPYING_GLIB",
-    "share/doc/switchyard-unicorn/QEMU-COPYING",
-    "share/doc/switchyard-unicorn/QEMU-COPYING.LIB",
-    "share/doc/switchyard-unicorn/QEMU-LICENSE",
-    "share/src/switchyard-unicorn/" + os.path.basename(source_archive),
-    unicorn_source_patch_relative,
-    "switchyard-unicorn-runtime.json",
+    ".switchyard-content-sha256", "lib/libswitchyard-fex.6.0.0.dylib",
+    "lib/libswitchyard-fex.6.dylib", "lib/libswitchyard-fex.dylib",
+    "include/switchyard_fex.h", "include/switchyard_fex_admission.h",
+    fex_source_patch_relative, "switchyard-fex-runtime.json",
 }
+expected_entries.update("share/src/switchyard-fex/adapter/" + name for name in adapter_files)
+expected_entries.update("share/doc/switchyard-fex/" + name for name in notices)
+expected_directories = {os.path.dirname(name) for name in expected_entries}
+for relative in tuple(expected_directories):
+    while "/" in relative:
+        relative = os.path.dirname(relative)
+        expected_directories.add(relative)
+expected_directories.discard("")
 seen_entries = set()
 try:
     package_root_info = os.lstat(package_root)
 except OSError as error:
-    fail(f"cannot inspect Unicorn package root: {error}")
+    fail(f"cannot inspect FEX package root: {error}")
 if not stat.S_ISDIR(package_root_info.st_mode) or stat.S_ISLNK(package_root_info.st_mode):
-    fail("Unicorn package root is not a real directory")
-package_snapshot = os.path.join(snapshot_root, "unicorn-package")
+    fail("FEX package root is not a real directory")
+package_snapshot = os.path.join(snapshot_root, "fex-package")
 os.mkdir(package_snapshot, 0o700)
 os.chmod(package_snapshot, stat.S_IMODE(package_root_info.st_mode))
 
@@ -611,28 +621,26 @@ os.chmod(package_snapshot, stat.S_IMODE(package_root_info.st_mode))
 def package_file_limit(relative):
     if relative == ".switchyard-content-sha256":
         return 65
-    if relative == "lib/libunicorn.2.dylib":
+    if relative == "lib/libswitchyard-fex.6.0.0.dylib":
         return MAX_BINARY
-    if relative == unicorn_source_patch_relative:
+    if relative == fex_source_patch_relative:
         return MAX_TEXT
-    if relative.startswith("share/src/switchyard-unicorn/"):
-        return MAX_ARCHIVE
-    if relative == "switchyard-unicorn-runtime.json":
+    if relative == "switchyard-fex-runtime.json":
         return MAX_MANIFEST
     return MAX_TEXT
 
 
 def copy_package_file(source, source_info, destination, relative):
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     source_fd = destination_fd = -1
     maximum = package_file_limit(relative)
     if source_info.st_size <= 0 or source_info.st_size > maximum:
-        fail("Unicorn package artifact exceeds its bound: " + relative)
+        fail("FEX package artifact exceeds its bound: " + relative)
     try:
         source_fd = os.open(source, flags)
         opened = os.fstat(source_fd)
         if file_identity(opened) != file_identity(source_info):
-            fail("Unicorn package artifact changed while opening: " + relative)
+            fail("FEX package artifact changed while opening: " + relative)
         destination_fd = os.open(
             destination,
             os.O_WRONLY
@@ -642,14 +650,14 @@ def copy_package_file(source, source_info, destination, relative):
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
-        for block in iter(lambda: os.read(source_fd, 1024 * 1024), b""):
+        for block in bounded_blocks(source_fd, opened.st_size, relative):
             write_all(destination_fd, block)
         after = os.fstat(source_fd)
         if file_identity(after) != file_identity(opened):
-            fail("Unicorn package artifact changed while snapshotting: " + relative)
+            fail("FEX package artifact changed while snapshotting: " + relative)
         current = os.lstat(source)
         if file_identity(current) != file_identity(opened):
-            fail("Unicorn package artifact path changed while snapshotting: " + relative)
+            fail("FEX package artifact path changed while snapshotting: " + relative)
         os.fchmod(destination_fd, stat.S_IMODE(opened.st_mode))
         copied = os.fstat(destination_fd)
         if (
@@ -658,9 +666,9 @@ def copy_package_file(source, source_info, destination, relative):
             or copied.st_size != opened.st_size
             or stat.S_IMODE(copied.st_mode) != stat.S_IMODE(opened.st_mode)
         ):
-            fail("private Unicorn package snapshot is unsafe: " + relative)
+            fail("private FEX package snapshot is unsafe: " + relative)
     except OSError as error:
-        fail(f"cannot snapshot Unicorn package artifact {relative}: {error}")
+        fail(f"cannot snapshot FEX package artifact {relative}: {error}")
     finally:
         if destination_fd >= 0:
             os.close(destination_fd)
@@ -673,7 +681,7 @@ for directory, directories, files in os.walk(package_root, topdown=True, followl
     files.sort()
     directory_info = os.lstat(directory)
     if not stat.S_ISDIR(directory_info.st_mode) or stat.S_ISLNK(directory_info.st_mode):
-        fail("Unicorn package directory changed during traversal")
+        fail("FEX package directory changed during traversal")
     directory_relative = os.path.relpath(directory, package_root)
     snapshot_directory = (
         package_snapshot
@@ -684,22 +692,31 @@ for directory, directories, files in os.walk(package_root, topdown=True, followl
         path = os.path.join(directory, name)
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode):
-            fail("Unicorn package contains a linked directory")
+            fail("FEX package contains a linked directory")
         if not stat.S_ISDIR(info.st_mode):
-            fail("Unicorn package contains an invalid directory entry")
+            fail("FEX package contains an invalid directory entry")
+        relative = os.path.relpath(path, package_root).replace(os.sep, "/")
+        if relative not in expected_directories:
+            fail("FEX package has an unexpected directory: " + relative)
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            fail("FEX package directory is group/world writable: " + relative)
         destination = os.path.join(snapshot_directory, name)
         os.mkdir(destination, 0o700)
         os.chmod(destination, stat.S_IMODE(info.st_mode))
     for name in files:
         path = os.path.join(directory, name)
         relative = os.path.relpath(path, package_root).replace(os.sep, "/")
+        if relative not in expected_entries:
+            fail("FEX package has an unexpected artifact: " + relative)
         seen_entries.add(relative)
         info = os.lstat(path)
         destination = os.path.join(snapshot_directory, name)
         if stat.S_ISLNK(info.st_mode):
             target = os.readlink(path)
-            if relative != "lib/libunicorn.dylib" or target != "libunicorn.2.dylib":
-                fail("Unicorn package contains an unexpected symbolic link: " + relative)
+            expected_links = {"lib/libswitchyard-fex.dylib": "libswitchyard-fex.6.dylib",
+                              "lib/libswitchyard-fex.6.dylib": "libswitchyard-fex.6.0.0.dylib"}
+            if expected_links.get(relative) != target:
+                fail("FEX package contains an unexpected symbolic link: " + relative)
             os.symlink(target, destination)
             os.lchmod(destination, stat.S_IMODE(info.st_mode))
             copied_link = os.lstat(destination)
@@ -710,17 +727,46 @@ for directory, directories, files in os.walk(package_root, topdown=True, followl
                 or file_identity(current_link) != file_identity(info)
                 or os.readlink(path) != target
             ):
-                fail("Unicorn package link changed while snapshotting: " + relative)
+                fail("FEX package link changed while snapshotting: " + relative)
         elif not stat.S_ISREG(info.st_mode):
-            fail("Unicorn package contains an unsupported artifact: " + relative)
+            fail("FEX package contains an unsupported artifact: " + relative)
         else:
             copy_package_file(path, info, destination, relative)
     if file_identity(os.lstat(directory)) != file_identity(directory_info):
-        fail("Unicorn package directory changed during snapshot traversal")
+        fail("FEX package directory changed during snapshot traversal")
 if seen_entries != expected_entries:
     missing = sorted(expected_entries - seen_entries)
     extra = sorted(seen_entries - expected_entries)
-    fail(f"Unicorn package artifact set is not exact; missing={missing}, extra={extra}")
+    fail(f"FEX package artifact set is not exact; missing={missing}, extra={extra}")
+
+# Signing may update only these three leaves. Pin all other bytes, modes,
+# paths and link targets independently of the runtime's self-described digest.
+mutable_entries = {".switchyard-content-sha256", "switchyard-fex-runtime.json",
+                   "lib/libswitchyard-fex.6.0.0.dylib"}
+immutable = hashlib.sha256(b"switchyard-fex-immutable-payload-v1\0")
+for directory, directories, files in os.walk(package_snapshot, followlinks=False):
+    directories.sort()
+    files.sort()
+    for name in directories + files:
+        path = os.path.join(directory, name)
+        relative = os.path.relpath(path, package_snapshot)
+        if relative in mutable_entries:
+            continue
+        info = os.lstat(path)
+        immutable.update(relative.encode("utf-8") + b"\0")
+        immutable.update(format(stat.S_IMODE(info.st_mode), "o").encode("ascii") + b"\0")
+        if stat.S_ISLNK(info.st_mode):
+            immutable.update(b"L" + os.readlink(path).encode("utf-8") + b"\0")
+        elif stat.S_ISDIR(info.st_mode):
+            immutable.update(b"D")
+        else:
+            immutable.update(b"F")
+            with open(path, "rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    immutable.update(block)
+        immutable.update(b"\0")
+if immutable.hexdigest() != fex_immutable_payload_digest:
+    fail("FEX immutable source/header/license payload differs from its closed pin")
 
 payload_digest = provider.get("runtimePayloadDigest")
 if type(payload_digest) is not str or SHA256.fullmatch(payload_digest) is None:
@@ -733,7 +779,7 @@ verify = subprocess.run(
     check=False,
 )
 if verify.returncode:
-    fail("Unicorn package content marker is invalid")
+    fail("FEX package content marker is invalid")
 digest = subprocess.run(
     ["/usr/bin/python3", "-I", digest_helper, "digest", package_snapshot],
     stdout=subprocess.PIPE,
@@ -742,7 +788,7 @@ digest = subprocess.run(
     check=False,
 )
 if digest.returncode or digest.stdout.strip() != payload_digest:
-    fail("Unicorn package content digest does not match the runtime manifest")
+    fail("FEX package content digest does not match the runtime manifest")
 
 
 def pe_rva_to_offset(data, pe_offset, rva, size):
@@ -840,9 +886,6 @@ def pe_identity(relative):
     return result
 
 
-machine, hybrid = pe_identity(xtajit_pe)
-if machine != 0xAA64 or hybrid:
-    fail("i386 guest provider is not a plain ARM64 PE DLL")
 machine, hybrid = pe_identity(xtajit64_pe)
 if machine != 0xA641 and not (machine == 0x8664 and hybrid):
     fail("x86_64 guest provider is not an ARM64EC PE DLL")
@@ -866,6 +909,11 @@ def version_tuple(text):
         fail("malformed Mach-O version: " + repr(text))
     pieces = [int(piece) for piece in text.split(".")]
     return tuple((pieces + [0, 0])[:3])
+
+
+def canonical_system_dependency(dependency):
+    return (dependency.startswith(("/usr/lib/", "/System/Library/"))
+            and os.path.normpath(dependency) == dependency)
 
 
 def validate_macho(relative, install_name, provider_required_imports):
@@ -895,6 +943,7 @@ def validate_macho(relative, install_name, provider_required_imports):
         fail("provider Unix artifact is not a thin arm64 Mach-O dylib: " + relative)
     if command_output([lipo_tool, "-archs", path], "lipo").strip() != "arm64":
         fail("provider Unix artifact has a non-arm64 slice: " + relative)
+    command_output([codesign_tool, "--verify", "--strict", path], "codesign --verify")
     build = command_output(
         [vtool_tool, "-arch", "arm64", "-show-build", path], "vtool"
     )
@@ -931,85 +980,75 @@ def validate_macho(relative, install_name, provider_required_imports):
                 fail("provider Mach-O has malformed LC_RPATH metadata: " + relative)
             rpaths.append(lines[index + 2].split()[1])
     if provider_required_imports is not None:
-        allowed = {install_name, "@rpath/libunicorn.2.dylib", "@rpath/ntdll.so"}
+        allowed = {install_name, "@rpath/libswitchyard-fex.6.dylib", "@rpath/ntdll.so"}
         for dependency in dependencies:
-            if dependency in allowed or dependency.startswith(("/usr/lib/", "/System/Library/")):
+            if dependency in allowed or canonical_system_dependency(dependency):
                 continue
             fail("provider Unix library has an unexpected dependency: " + dependency)
-        if dependencies.count("@rpath/libunicorn.2.dylib") != 1:
-            fail("provider Unix library does not bind exactly one Unicorn dylib")
+        if dependencies.count("@rpath/libswitchyard-fex.6.dylib") != 1:
+            fail("provider Unix library does not bind exactly one FEX dylib")
         if dependencies.count("@rpath/ntdll.so") != 1:
             fail("provider Unix library does not bind exactly one native ntdll")
-        if sorted(rpaths) != sorted(["@loader_path/", unicorn_rpath]):
+        if sorted(rpaths) != sorted(["@loader_path/", fex_rpath]):
             fail("provider Unix library does not have the exact runtime rpaths")
         undefined = {
             line.strip()
             for line in command_output([nm_tool, "-ju", path], "nm -ju").splitlines()
             if line.strip()
         }
+        if any(name.startswith("_uc_") for name in undefined):
+            fail("FEX provider still imports the retired Unicorn API")
         missing = sorted(provider_required_imports - undefined)
         if missing:
             fail(
                 "provider Unix library does not import the required Switchyard "
-                "Unicorn API: " + ", ".join(missing)
+                "FEX API: " + ", ".join(missing)
             )
     else:
         for dependency in dependencies:
-            if dependency == install_name or dependency.startswith(("/usr/lib/", "/System/Library/")):
+            if dependency == install_name or canonical_system_dependency(dependency):
                 continue
-            fail("Unicorn dylib has an unexpected dependency: " + dependency)
+            fail("FEX dylib has an unexpected dependency: " + dependency)
         if rpaths:
-            fail("Unicorn dylib unexpectedly contains an LC_RPATH")
+            fail("FEX dylib unexpectedly contains an LC_RPATH")
         exports = {
             line.strip()
             for line in command_output([nm_tool, "-gjU", path], "nm -gjU").splitlines()
             if line.strip()
         }
-        required = {
-            "_uc_emu_stop_at_instruction_boundary",
-            "_uc_clear_instruction_boundary_stop",
-            "_uc_enable_shared_memory_atomics",
-            "_uc_set_shared_memory_atomic_callback",
-        }
-        missing = sorted(required - exports)
-        if missing:
-            fail(
-                "Unicorn dylib does not export the required Switchyard API: "
-                + ", ".join(missing)
-            )
+        with open(os.path.join(package_snapshot, "share/src/switchyard-fex/adapter/exports.txt"),
+                  "r", encoding="ascii") as stream:
+            required = set(stream.read(MAX_TEXT).splitlines())
+        if exports != required:
+            fail("FEX dylib public symbol set is not the pinned export contract")
     verify_private_snapshot(record, relative)
 
 
-common_provider_imports = {
-    "_uc_emu_stop_at_instruction_boundary",
-    "_uc_enable_shared_memory_atomics",
+required_imports = {
+    "_switchyard_fex_abi_version", "_switchyard_fex_provider_abi_identity",
+    "_switchyard_fex_upstream_revision", "_switchyard_fex_result_string",
+    "_switchyard_fex_process_create", "_switchyard_fex_process_destroy",
+    "_switchyard_fex_process_invalidate_code", "_switchyard_fex_process_set_executable_range_query",
+    "_switchyard_fex_thread_create_with_domain", "_switchyard_fex_thread_destroy",
+    "_switchyard_fex_thread_prepare_execution", "_switchyard_fex_thread_execute_prepared",
+    "_switchyard_fex_thread_import_state", "_switchyard_fex_thread_export_state",
+    "_switchyard_fex_thread_import_register_window", "_switchyard_fex_thread_export_register_window",
+    "_switchyard_fex_thread_prepare_dispatch", "_switchyard_fex_thread_complete_dispatch",
+    "_switchyard_fex_thread_query_jit_stack", "_switchyard_fex_thread_reconstruct_jit_fault",
+    "_switchyard_fex_thread_repair_callret_fault", "_switchyard_fex_thread_repair_unaligned_tso",
 }
-validate_macho(xtajit_unix, "@rpath/xtajit.so", common_provider_imports)
-validate_macho(
-    xtajit64_unix,
-    "@rpath/xtajit64.so",
-    common_provider_imports | {
-        "_uc_clear_instruction_boundary_stop",
-        "_uc_set_shared_memory_atomic_callback",
-    },
-)
-validate_macho(unicorn_library, "@rpath/libunicorn.2.dylib", None)
+validate_macho(xtajit64_unix, "@rpath/xtajit64.so", required_imports)
+validate_macho(fex_library, "@rpath/libswitchyard-fex.6.dylib", None)
 
 allowed_provider_paths = {
-    xtajit_unix.casefold(),
-    xtajit_pe.casefold(),
-    xtajit64_unix.casefold(),
-    xtajit64_pe.casefold(),
-    unicorn_library.casefold(),
-    (unicorn_root + "/lib/libunicorn.dylib").casefold(),
+    xtajit64_unix, xtajit64_pe, fex_library,
+    fex_root + "/lib/libswitchyard-fex.6.dylib",
+    fex_root + "/lib/libswitchyard-fex.dylib",
 }
 reserved_names = {
-    "xtajit.so",
-    "xtajit64.so",
-    "xtajit.dll",
-    "xtajit64.dll",
-    "libunicorn.2.dylib",
-    "libunicorn.dylib",
+    "xtajit.so", "xtajit.dll", "xtajit64.so", "xtajit64.dll",
+    "libunicorn.2.dylib", "libunicorn.dylib", "libswitchyard-fex.6.0.0.dylib",
+    "libswitchyard-fex.6.dylib", "libswitchyard-fex.dylib",
 }
 for directory, directories, files in os.walk(root, followlinks=False):
     for name in directories:
@@ -1021,10 +1060,11 @@ for directory, directories, files in os.walk(root, followlinks=False):
         }:
             fail("provider ABI directory is a symbolic link")
     for name in files:
-        if name.casefold() not in reserved_names:
+        if name.casefold() not in reserved_names and not re.fullmatch(
+                r"libswitchyard-fex(?:\.\d+(?:\.\d+)*)?\.dylib", name.casefold()):
             continue
         relative = os.path.relpath(os.path.join(directory, name), root).replace(os.sep, "/")
-        if relative.casefold() not in allowed_provider_paths:
+        if relative not in allowed_provider_paths:
             fail("unexpected or Rosetta provider artifact: " + relative)
 PY
 }
