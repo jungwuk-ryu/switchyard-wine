@@ -1,0 +1,45 @@
+Synthetic SDK-owned JIT snapshot; addresses relative to block header.
+Original source SHA-256: 9d235cafb3a1bd38024d7fa76f9ef69f8dc86334309d553648d8d39b9a372875
+
+<stdin>:	file format elf64-littleaarch64
+
+Disassembly of section .text:
+
+0x0004 <snapshot_block>:
+0x0004:     	adr	x10, 0x0000 <snapshot_block+0xfffffffffffffffc>
+0x0008:     	str	x10, [x28]
+0x000c:     	ldr	x10, [x28, #0x5d0]
+0x0010:     	cbz	x10, 0x0038 <snapshot_block+0x34>
+0x0014:     	ldar	w10, [x10]
+0x0018:     	cbz	w10, 0x0038 <snapshot_block+0x34>
+0x001c:     	mov	x10, #0x313             // =787
+0x0020:     	movk	x10, #0x102, lsl #32
+0x0024:     	str	x10, [x28, #0x18]
+0x0028:     	mov	w10, #0x3               // =3
+0x002c:     	str	w10, [x28, #0x5d8]
+0x0030:     	ldr	x11, [x28, #0xb98]
+0x0034:     	br	x11
+0x0038:     	add	x8, x8, x2
+0x003c:     	adds	x9, x8, #0x3
+0x0040:     	mov	x24, x8
+0x0044:     	mov	x8, x9
+0x0048:     	clz	x10, x23
+0x004c:     	ubfx	x10, x10, #5, #1
+0x0050:     	add	x11, x23, x10, lsl #40
+0x0054:     	ldr	x6, [x11]
+0x0058:     	add	x23, x23, #0x8
+0x005c:     	cfinv
+0x0060:     	ldp	x10, x11, [x17], #0x10
+0x0064:     	sub	x10, x10, x6
+0x0068:     	cbz	x10, 0x008c <snapshot_block+0x88>
+0x006c:     	ldp	x10, x11, [x28, #0xa0]
+0x0070:     	and	x11, x11, x6, lsl #4
+0x0074:     	add	x10, x10, x11
+0x0078:     	ldp	x11, x10, [x10]
+0x007c:     	sub	x10, x10, x6
+0x0080:     	cbz	x10, 0x008c <snapshot_block+0x88>
+0x0084:     	ldr	x11, [x28, #0xb70]
+0x0088:     	str	x6, [x28, #0x18]
+0x008c:     	ret	x11
+0x0090:     	<unknown>
+0x0094:     	udf	#0x1

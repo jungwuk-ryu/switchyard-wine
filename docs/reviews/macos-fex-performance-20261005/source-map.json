@@ -1,0 +1,1422 @@
+{
+  "branch": "codex/macos-fex-pro-review-20261005",
+  "build_vs_source_warning": "Whole current source is NOT rebuilt/scored. Baseline and candidate export exact SDK/provider components; retained PE cpu.c and unixlib.h match the complete compiled-parent source.",
+  "current_primary_dirty_digest": "9fe4bf08f5c864cebc19f597c793ca4cf5c4dd48d57829e61ea7caa8dbf0cddc",
+  "excluded": [
+    "Apple guide",
+    "private knowledge base",
+    "proprietary binaries/graphics inputs",
+    "prefixes",
+    "raw user paths/PIDs",
+    "runtime installations",
+    "generated caches"
+  ],
+  "fex_core": {
+    "commit": "87550817e8acc26b1822b68321110fdbb4fcffe5",
+    "files": [
+      {
+        "blob": "38ef9e669aa6a5adeacbacaa3c091296a1a514c9",
+        "mode": "100644",
+        "path": "CMakeLists.txt",
+        "sha256": "dccc51b8aa4265231991d87c2aab9b31f6459bd60f1443d330b8e818776477a0"
+      },
+      {
+        "blob": "207890dfd279c57617c780c19424c867f610767e",
+        "mode": "100644",
+        "path": "CodeEmitter/CodeEmitter/Emitter.h",
+        "sha256": "4bdcb10403d9a80a4dce57750b66966a8d008361ddcca000eaf4d011cccdb64a"
+      },
+      {
+        "blob": "3c99a7e25d938b7670c49c628f3d22f870493d9f",
+        "mode": "100644",
+        "path": "FEXCore/Source/CMakeLists.txt",
+        "sha256": "d1fa58f0049571a6dcc53de2c1df88d68db3d3c6e59e3bc60527d59dc4708cff"
+      },
+      {
+        "blob": "4fee7a9da114c125be22982551aab2a668abb5bc",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Context/Context.h",
+        "sha256": "bb5fae1f6f2b85e0ab6c38c665af07973baff7470e4dec1c2354b2ca62905e2f"
+      },
+      {
+        "blob": "a756e92d56f132c8c270047a7e4d5dfb5f6bfd2b",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/Addressing.h",
+        "sha256": "c75d316c96f3527bca5405416d63a1fb027745f4fd41f62af09b0ad78d1946f6"
+      },
+      {
+        "blob": "d5731d8d51864ee33937cb13620dd36909845f5a",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp",
+        "sha256": "a688c854faf727931090a4ca2a10b9fbec643e72c596ae7f31a751821e96b52e"
+      },
+      {
+        "blob": "0f7f2bde061fe74d282087f0ec750de696481781",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h",
+        "sha256": "f90942d980faa79ee34183ae6c401d7e366cb153f89a66c22d91eded5df4a2d7"
+      },
+      {
+        "blob": "8e5f568a21f93feaf68189f454c2f03b79960ad4",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/CodeCache.cpp",
+        "sha256": "e0e0c298720584807049a1a90842f65be546aded321af1c3b384a148862abb9b"
+      },
+      {
+        "blob": "d2e82740da46cb3c67ea2ba2d94d7fcc9f0e53b6",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/Core.cpp",
+        "sha256": "9da0b60009bd1171b07e7f14bfc61222561b715ce01a783f380fc4c50684b34c"
+      },
+      {
+        "blob": "a3a501757ed29576bccd8474c1c65afe912a72e7",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/DiskCache.cpp",
+        "sha256": "980bf91b89b921b757d474a04fd42c3d426dd6b957dff9da26b21e855eccc6de"
+      },
+      {
+        "blob": "31ff6588174eb38f67f0966be30f0b42c5a38764",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp",
+        "sha256": "d549272b1ccd175119e9f05758f750023860568db9ededec9fc35dfa3c36edd8"
+      },
+      {
+        "blob": "fd1626e11ed0bc00472bd5d034a53a75dbb659dd",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h",
+        "sha256": "679b98384bac42600947475fc433b9c784e4a6847ba82a92f643296652bb8ad8"
+      },
+      {
+        "blob": "fdc013b389a6b5303fcd315d59e8657da83717a3",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/Frontend.cpp",
+        "sha256": "af121735597fb5ce2c090a8f82cdd1bc75001826742e1b9a992417c94ec89d9d"
+      },
+      {
+        "blob": "1c8cc5699e62ee6ad36439ce81fc0c4f7619d0ad",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/Frontend.h",
+        "sha256": "19a750d8e3cd73d8d8de52ae9a293a52b59328e86f3c5ed90f4886a3cb7f10d9"
+      },
+      {
+        "blob": "4b8f9b10308e3d548fb00a4b8616bc464e8c8da4",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h",
+        "sha256": "5619fef12059e3730a8ccc58e787910a0457c33c6d4a07ab886dc0e79bfc0239"
+      },
+      {
+        "blob": "eed35228ec80b0d794fac6c351e47031eec5b3eb",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp",
+        "sha256": "5ce0cdc677f96e09685c2be2b02001a1a76a3a66ecf024c2c2f3a34a4092e80e"
+      },
+      {
+        "blob": "ac47bb78140cef24d6971147c5d82e6892b5459e",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/JIT/BranchOps.cpp",
+        "sha256": "7dc0e0d96e2af67d4c4738c1e85eaa5cfe3b4f08d0135dc6d7b8fa60820e1426"
+      },
+      {
+        "blob": "14d72afb42eae8bf5c35dd61fa9acad7cf5f18b9",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/JIT/JIT.cpp",
+        "sha256": "eaeb0009077d9d3507fdd42bc1ef97a92c5f16b0d4726a4cd6efe13d7bfa33b9"
+      },
+      {
+        "blob": "8f355d139b4c57b9f80f0007b3be723f5819e414",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/JIT/JITClass.h",
+        "sha256": "30de897c138b1b12e0455c6e7238224d08a7cf7137355367938fbd608e271b48"
+      },
+      {
+        "blob": "ab23735ba064c56e4cb3b000604c15f8f275e1b3",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
+        "sha256": "3cc61eedd1372f0130eee68e7a39eeeebe0c4b1da28ab79a688968c952b468bf"
+      },
+      {
+        "blob": "46bf4d118d0ebb905bf9fdf4734a1fced565921d",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/JIT/MiscOps.cpp",
+        "sha256": "98ed218d36efecadcd1d386eb53dc15ef73eb8e6916c1d7b98d096a904753135"
+      },
+      {
+        "blob": "2bcea6433206663c67e8188e268ae2d561fd744a",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp",
+        "sha256": "b9b5c6ac0655c556c0934e4c2a46396e692f1ff419f302f8f7c23dc3fc9185a3"
+      },
+      {
+        "blob": "1c46c52709ec91f4cae08d92f7d67f506a8ff230",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/OpcodeDispatcher.h",
+        "sha256": "b98c4f45bf367da457fa80af016b5d0cf90f8105977df17a1791eea4dfa8f734"
+      },
+      {
+        "blob": "23dbd811ed12365e9f316841e1148d961097ad26",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp",
+        "sha256": "ee13c02719c3c033815e1ada585d0e9fc6a62675652c6b19e100f1f6fe10bb0b"
+      },
+      {
+        "blob": "676d771905774a3ea0cc21f35d9bfd4f8a25e696",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/Core/SharedCodeBufferManager.h",
+        "sha256": "e88e0da25df938525e1139cc57fdcaf4350b79fb5c8a1efcec4ec155dcb193a4"
+      },
+      {
+        "blob": "cb9a0d56b77f2d372cbfc16da5d6b7c187cfddd8",
+        "mode": "100644",
+        "path": "FEXCore/Source/Interface/IR/IR.json",
+        "sha256": "1822972dc2046d1f40053262a0e295c48db221bce20f15b5bd7a04c27458b0d8"
+      },
+      {
+        "blob": "729daa0e259b36348c06956283af6b617b302469",
+        "mode": "100644",
+        "path": "FEXCore/Source/Utils/Allocator.cpp",
+        "sha256": "c95a02f6818d3c1a698f2e6532f1e3ac74edf85a99c5381eda949d14ea27567f"
+      },
+      {
+        "blob": "748235d80528a197ea16659a1c5c1daa027fd01b",
+        "mode": "100644",
+        "path": "FEXCore/Source/Utils/Allocator/64BitAllocator.cpp",
+        "sha256": "a52c97ce93f0037730a8800251ab82f6f0d390b93003df37c6d253d839c5cb4b"
+      },
+      {
+        "blob": "c0952525c0349e4f749d635bbfbf2c2b1b5ef22c",
+        "mode": "100644",
+        "path": "FEXCore/Source/Utils/AllocatorHooks.cpp",
+        "sha256": "b428c70e3e7b4aeb4b8efa9860901ae77b28b89f36cff112528a74eb9d56f9b1"
+      },
+      {
+        "blob": "f07235685e91fc8dfe67119963a26093e744a7a4",
+        "mode": "100644",
+        "path": "FEXCore/Source/Utils/ArchHelpers/Arm64.cpp",
+        "sha256": "f53fa989052eb0b3dd2da0495ff64d0a49ac4e6e8c769dff07497d14ed66e4a5"
+      },
+      {
+        "blob": "40464541c5816e008c3099bb57c385bd1cb09b27",
+        "mode": "100644",
+        "path": "FEXCore/Source/Utils/Profiler.cpp",
+        "sha256": "84b5bc7d76ea5a5364530cb90a16a4472504c4a237d5a53c05db0be72601e9bf"
+      },
+      {
+        "blob": "47317ffcc89e15124f278984af2de1bbcc172e09",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Core/Context.h",
+        "sha256": "53f3fb20b6425f3d9903b6c8d1e6f3446a89b54bfbca38506a750306dc65a474"
+      },
+      {
+        "blob": "ea116ee9ef15457f26812010f1606f42b0069b5b",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Core/CoreState.h",
+        "sha256": "caaf68f10ac52836b67512b5ee93caa5ef8cb1fe9cb3197fcff9d7c8f8cb40a9"
+      },
+      {
+        "blob": "2f96dd4a07873c3e607184264d9cb68b20c6c05c",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Core/SignalDelegator.h",
+        "sha256": "1ed279a98eaa0b3c1ce5fa89e6a4bed3940aaf0944ff37895d7f64760e8c6624"
+      },
+      {
+        "blob": "532b30928627a13a43730ff6283bca0d9b1d62e9",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/HLE/SyscallHandler.h",
+        "sha256": "a3244829da0d01d5363968c5b883e4cf9c483b4852d66b8adb186770c4b832fe"
+      },
+      {
+        "blob": "edc0dedda8a03afd77d6e73a13020e5fa20aec61",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Utils/AllocatorHooks.h",
+        "sha256": "3520b63e2c42fde2912e98ec099bb3e0e12759ecbfd031a4ff315ac245f96266"
+      },
+      {
+        "blob": "e122d7c67aa38674c52ed453bf75884251f2de60",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Utils/ArchHelpers/Arm64.h",
+        "sha256": "93bccb75238307ad2e99eac806c3741f88d4610015f522f072b0831798868936"
+      },
+      {
+        "blob": "83ad8d452400a2aa09d5017c03e049acf8a56552",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Utils/PrctlUtils.h",
+        "sha256": "222c9f444575bd2d3e72c8673e2658294183c5fe6db898605029d882676ffd9f"
+      },
+      {
+        "blob": "c74b2d2330e1d037b54a669b6a4b0c2f0cb3e4a8",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Utils/SignalScopeGuards.h",
+        "sha256": "6d743c4f8f2b7c13d0c11455c6bba9a18af0f2b1ef6848a2965e2d8af105903a"
+      },
+      {
+        "blob": "eeee70c8e303b3a0c840eaf1f92dde7098c40f78",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Utils/SpinWaitLock.h",
+        "sha256": "4659570b3e6c7de4e8a1d9c5227dd13558ee0ead47f88302344be4fd67ed078b"
+      },
+      {
+        "blob": "3bdbd5dcf71026ed9f2e922b93d477139ae73a21",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h",
+        "sha256": "8208856e4a38c96eaabab447b812772ebd367debc45369174b74bcb2f9d50b72"
+      },
+      {
+        "blob": "f7c2e1a830a912776cb5a0d99a3155f04f236967",
+        "mode": "100644",
+        "path": "FEXCore/include/FEXCore/Utils/WritePriorityMutex.h",
+        "sha256": "cc2a8ba3d1cb84fc2a89af07c638cda04f2610914810a617d1887cd836e07ef4"
+      },
+      {
+        "blob": "53d4964dcbc4d381f0d630bd1defa2538764d342",
+        "mode": "100644",
+        "path": "FEXHeaderUtils/FEXHeaderUtils/Filesystem.h",
+        "sha256": "53494ed5782d780f4155ef8ae48cd00573a6680d08f7131352a897b6e31b7ed0"
+      },
+      {
+        "blob": "43538727a77c3071291ac2c2dfe056f6a15d5cc7",
+        "mode": "100644",
+        "path": "FEXHeaderUtils/FEXHeaderUtils/Syscalls.h",
+        "sha256": "6d3e7027a54cad61a0c4eb81f559c00abee34ae910de3d3ede6b019ac7b10073"
+      }
+    ],
+    "parent": "73dc3b3eddaf72745c743fe8ec76ed66f87636dc",
+    "tree": "44132e49f20fb944ab6d30873b483509eedb2ab9"
+  },
+  "fex_repository": "https://github.com/jungwuk-ryu/FEX",
+  "full_compiled_wine_parent_source_digest": "eeb82a79d4519304922a89f332816dc94c7adf07ebb59e3489b7cb026a1638d6",
+  "geometry_candidate": {
+    "commit": "8d77011b911e3e32282b59b7ede9e2c9b820d265",
+    "files": [
+      {
+        "blob": "036a445e032856102ed8f3bb36522fbdc77079b5",
+        "mode": "100644",
+        "path": "switchyard/fex/CMakeLists.txt",
+        "sha256": "4cf17f2268e9a12607185d0233cb26f2d61d6b5608bde08f29a515155198f9f0"
+      },
+      {
+        "blob": "688f9efedde403b6dc720f63a960fe7351ee6bd1",
+        "mode": "100644",
+        "path": "switchyard/fex/README.md",
+        "sha256": "946888d8442da342c68e7fff42a16b69b76c365e61f96df2269d3fd4d59c3073"
+      },
+      {
+        "blob": "c4b36e1eb7da4e5897ec6cc6f9f3392def2d696f",
+        "mode": "100644",
+        "path": "switchyard/fex/exports.txt",
+        "sha256": "ea0dde7d9168d1a7e2156f284e3454e41ff936a0b7cf1f0095d47c474931ad31"
+      },
+      {
+        "blob": "361c9332fdf889de36ac18621cb28e5ba9fa9d94",
+        "mode": "100644",
+        "path": "switchyard/fex/include/switchyard_fex.h",
+        "sha256": "1c86b17c5c02ab96013a83d82fc01579d52a40e8823067d105c0c5ca7cb891c4"
+      },
+      {
+        "blob": "4b9e591f48b4bcbcff24ed8bf6ecdef499ba0d92",
+        "mode": "100644",
+        "path": "switchyard/fex/include/switchyard_fex_admission.h",
+        "sha256": "acd29babef28ec4656f06cb23c460c9ae161582bdfc503a763fc919575ede737"
+      },
+      {
+        "blob": "9f510399256e8fcd9fe25658978efefc2a72c409",
+        "mode": "100644",
+        "path": "switchyard/fex/source-deps.tsv",
+        "sha256": "b31cd5e74e5e0e33fe64bdf8d935bf73ed4d513e95f2e43ddeb7ebff91764271"
+      },
+      {
+        "blob": "447151b2854f379c2e9482edd2508ba47ced8211",
+        "mode": "100644",
+        "path": "switchyard/fex/src/switchyard_fex.cpp",
+        "sha256": "d8f4ed2c427505a91cef3ebae711d8ed6c7936571952d3b0195ac328fc7e0557"
+      },
+      {
+        "blob": "92f879455ab37c18389aa5d23eb836a5683950bb",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/admission_contract.h",
+        "sha256": "e4ef340cebe92b9b133ef8d217190fd1bd75e80030d116b8f99e5885de2c32ac"
+      },
+      {
+        "blob": "9193c19a7a477e8841aab16addf5ffb6700356c9",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/admission_test.h",
+        "sha256": "762e16c32db53e2bf0d5756ff46e1da870ef1b3327a36ff25826fdd379733d08"
+      },
+      {
+        "blob": "dee4952c090c517c5e57ba25616f2acd4a54a001",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/allocator_test.cpp",
+        "sha256": "99a7b099cc8b942ddaccd026d726ebfe85549d838e7e7bf10842bd712dbadf10"
+      },
+      {
+        "blob": "a9080028f854cf8a73447bc701f47df2d9031c73",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/c_api_test.c",
+        "sha256": "852e1fc7b343b512777a2bd81753b1ef3b42cb36074df3d84a0b768c111e114b"
+      },
+      {
+        "blob": "4897010124a0adfc768c803355c3fdb03297e6b3",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/completion_window_state_test.cpp",
+        "sha256": "9119af6da98d1010ba5abf56f802e9126cd56763dbbf6ebc87cde5f5938bd20d"
+      },
+      {
+        "blob": "56db73a6954344b29f8b8afb64082cb16afdd45e",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/darwin_abi_test.cpp",
+        "sha256": "3d818e83921fb1624469b042caf5de2b22c8b5e9c7050a1f2c249ad90cc76894"
+      },
+      {
+        "blob": "e328f8004e527f9845f5d1ebb4885dde8c1089ff",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/detached_dispatch_test.h",
+        "sha256": "de703bfef0a18c349b1133fb8f07154eae4941f20febae904836e62cda3caeb7"
+      },
+      {
+        "blob": "11af00412aa52b48f878b69660eb47d2daec5a15",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/extract_wine_x18.cmake",
+        "sha256": "fc756f04d11bbda5906319c74f83382cd927ec93ebe29fc8d76b5b1b644d5ed3"
+      },
+      {
+        "blob": "1cf7314167a21adc1293729e4168b0eaaa00d7ba",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/native_gate_state_test.cpp",
+        "sha256": "5b3b41c3031e31f818eb4b551f953ae4664ba48427a87ebe6a12c92c7feedc08"
+      },
+      {
+        "blob": "beff126889fa106198ad9d1ae7f3816878a9cdd4",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/native_geometry_test.cpp",
+        "sha256": "5dd9d4079f0e312f49debb3af497a499706c001bdad8d39f55eabe936309fbe6"
+      },
+      {
+        "blob": "28094f598be430145c0b7b5e3abe833b591729e2",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_reference.h",
+        "sha256": "363c77229c3064c13ec89fe1624a7602c4b608dede0f221474a7372fa3767e3e"
+      },
+      {
+        "blob": "00c52baccbc264b7dc4159f8ace0af971441758a",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_state_test.cpp",
+        "sha256": "24fceb7d29e002ca641f8846847ed8372e1ae535ff7dd32066ec9c597c197e17"
+      },
+      {
+        "blob": "cd5f0670c5330a725146fcd91379e386700f9477",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_test.c",
+        "sha256": "3019223cd3b4682158771c5052c26ebc08e8e124150474023e38d87734c9b9af"
+      },
+      {
+        "blob": "aae73324218161c5bf382235dd9341dd2819de63",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/shared_admission_test.h",
+        "sha256": "fd81134dbf0f15032df6f9dd9ce7fb45ea5474de3d412fd31cbe0ad17b6b3daf"
+      },
+      {
+        "blob": "ff55190fe41c6b5ba0409231b4743fbf39e9bd41",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/vector_state_test.h",
+        "sha256": "2f45012168d270da9d553c36abe9f13b84024f2916aebd918fd2efda436a3a3a"
+      },
+      {
+        "blob": "cc9b731bd9a0c8d3a860b2fccfd5ba2dbe352a08",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/verify_test_suite.py",
+        "sha256": "4a57b71b27f26a1e04f408ebf70e617446f32ea01ae01a90ee51aea4556a8445"
+      },
+      {
+        "blob": "4e5e1a84383d37adcb3f0b427b55dafb29ad67dc",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/wine_signal_wrapper.c",
+        "sha256": "4a0c478a19cfa1cddae82f3d42c36a468b6fcd3016f6fa8ba0fdbbf485b979f9"
+      },
+      {
+        "blob": "5ab57264685947d6c16ec566cb6092798cbde845",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/wine_signal_wrapper.h",
+        "sha256": "9d2cf5d1e9d7ba54c2edf143d4df7b99891d3c426e00ece7afcb36e69d00e231"
+      },
+      {
+        "blob": "dffd70a187b3444a56f72d5a654448ef5c5bc250",
+        "mode": "100644",
+        "path": "switchyard/fex/wine-runtime-native-arm64.entitlements",
+        "sha256": "3a0bdd52e1d26dbdb41738614511141a369aeff90fcb00df3ef993b4266d9eb0"
+      },
+      {
+        "blob": "732811e4f1faf71870b7350f211b26e00d7bfbe9",
+        "mode": "100644",
+        "path": "switchyard/fex/wine/COPYING.LIB",
+        "sha256": "e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c"
+      },
+      {
+        "blob": "3909c6e050cd238630e2bb9baa7de3ea199bf61e",
+        "mode": "100644",
+        "path": "switchyard/fex/wine/LICENSE",
+        "sha256": "ae025f125a5d639f0f7abe5146efa1e3d7453cc10b744b2910806fa3f46626ef"
+      },
+      {
+        "blob": "cbe40e002c3ff7efa8388248ce34338d7a738371",
+        "mode": "100644",
+        "path": "switchyard/fex/wine/dlls/ntdll/unix/signal_arm64.c",
+        "sha256": "39b5e1e54d91141de769234759d49bf79d9623c4b045f1fb7e27617b5713fee5"
+      },
+      {
+        "blob": "eaebc68d5aef12dbdb07866fd0b831f898c15465",
+        "mode": "100644",
+        "path": "switchyard/fex/wine/include/wine/asm.h",
+        "sha256": "65641e8b3177a75603396b40d482684c2640f6a39d22d5713e82ef8edbc0b652"
+      }
+    ],
+    "parent": "9e955472a66ace6bfa4821a68cb57e58c408d0e9",
+    "tree": "d28b7417192734187897e2a2a6c061983d2a37f4"
+  },
+  "integration": {
+    "commit": "042d999955c7f69f9e55dd79b925cf76b59f9177",
+    "files": [
+      {
+        "blob": "a50668027846a724cafd9fecc541d828650aa997",
+        "mode": "100755",
+        "path": "configure",
+        "sha256": "b475586d7d61e5d5b453ad5611e32456ae08f342266d4d5abe9b93ab1925fa8b"
+      },
+      {
+        "blob": "c0a6303f4eb52f214431b7116be8feeaf8b014df",
+        "mode": "100644",
+        "path": "configure.ac",
+        "sha256": "f79192046cf743301efa62e2d99a12fb6a34b8f40f03357ef32069397b27c12f"
+      },
+      {
+        "blob": "be1f267b0a858ff73ae3934db328247154aefe34",
+        "mode": "100644",
+        "path": "dlls/ntdll/arm64ec_guest_flags.h",
+        "sha256": "94595128674f87f269dd08aa539072b05d8e9530e1bcac485156ce2aadd25c78"
+      },
+      {
+        "blob": "bc782693dc26522b0944aaadaaaa93c4dc755145",
+        "mode": "100644",
+        "path": "dlls/ntdll/signal_arm64ec.c",
+        "sha256": "2126a8b71256b917c7fbb73055c2888c472e39a22f4fd7177d520fe0ef685230"
+      },
+      {
+        "blob": "559e003e5e5214cd19b70e134e90dfe092c9aea0",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/arm64ec_exception_unwind_pe.c",
+        "sha256": "a6369fe0a7df217afdd56b8620d655f1de277a2c94674f3f9ba64a39a3785c14"
+      },
+      {
+        "blob": "9b84fcf407851c66ddfc11bae3f527764b475aac",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/arm64ec_exception_unwind_pe.reference_output",
+        "sha256": "e94ff6850eafd7c5dcf85976855182e7ec23bf77557117ab81a08d01173f5e06"
+      },
+      {
+        "blob": "2f7adcdf0711171357ee76cd253092b4104bd806",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/arm64ec_fp_mapping.c",
+        "sha256": "d6a81645f4ba1da3c1e534d61bf8450f1d9a63d50476c8a71c5bef477a9af4e2"
+      },
+      {
+        "blob": "86412240842adc4536634f1dc1ae81f0a2697569",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/arm64ec_guest_flags.c",
+        "sha256": "6d9f6552942580ddde62ff7bdef1d331f37b29ec6432e0a4205fbe75c21fd7df"
+      },
+      {
+        "blob": "7ab83599a615ead8a12fcc075c189bf1ff686c9e",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/arm64ec_guest_flags_pe.c",
+        "sha256": "d68682acae87e21db2ed7362aaab1000755284d964d86afa8a332694efcd07b9"
+      },
+      {
+        "blob": "c2a0f62893fe6c1b90f1300d4982432392532717",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/arm64ec_guest_flags_pe.reference_output",
+        "sha256": "e04f6a9f068b316a87f7aace26f1c4c78183804dabe7c0c08028a54edaedbc84"
+      },
+      {
+        "blob": "6e31d017da529ad827f30054ed0e17ce7aa4b1f4",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/build_arm64ec_exception_unwind.py",
+        "sha256": "bad39fe4d504daf0e03384ae4d4fbaf6122a90f4e7c8e2646c84ca52253b620f"
+      },
+      {
+        "blob": "f24ae7edd15ca7b818e2c56afcb4ddb23fcb20e5",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/check_arm64ec_emulation_dispatch.py",
+        "sha256": "12645af33082687fa6be574ebafa89291a23e1cc03b8823545d843ba6fbfc1bc"
+      },
+      {
+        "blob": "91827996dc648598a10c8314513370a5e15cfff7",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/check_arm64ec_exception_stack.py",
+        "sha256": "df9fc325c25039b4ed227ff641ed3909b5c3be7dc1357d4ac790905afd47512b"
+      },
+      {
+        "blob": "48b6939248b9178d72a9643d61c30e5eabf9d3c6",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/check_arm64ec_low_memory_v1.py",
+        "sha256": "68cb01b663e2e53104d16dfd18d3f70ef96d620bd71ce3304c49ba5fad718d06"
+      },
+      {
+        "blob": "875f4dbd52b1080947d559f6dd44d681eade2779",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/check_arm64ec_native_call.py",
+        "sha256": "6a779bb135b91e7f6768b0c9d3ec96100b1f9888fddac34d7eff5699f2cba522"
+      },
+      {
+        "blob": "7278207e2b0ad68990e671de767648a1ed5f50d0",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/run_arm64ec_fp_mapping.sh",
+        "sha256": "c8fc3b751a59daba21852ea504d65de1147dba8b51cfa91fd2fb2c00f2e37044"
+      },
+      {
+        "blob": "f5bc2f984c2e59bf297ff7f225657044c7f77740",
+        "mode": "100644",
+        "path": "dlls/ntdll/tests/run_arm64ec_guest_flags.sh",
+        "sha256": "e0de132583fe930173a873b77601948f1acd9a91d33b861e2d9058ab309e9e4e"
+      },
+      {
+        "blob": "cbe40e002c3ff7efa8388248ce34338d7a738371",
+        "mode": "100644",
+        "path": "dlls/ntdll/unix/signal_arm64.c",
+        "sha256": "39b5e1e54d91141de769234759d49bf79d9623c4b045f1fb7e27617b5713fee5"
+      },
+      {
+        "blob": "4ee691f1bbf67bf86908946065b59221e2a3e970",
+        "mode": "100644",
+        "path": "dlls/ntdll/unix/thread.c",
+        "sha256": "9a124fb089b91b8242f773dd804987512c83a998732450811ca7d3afdab3577e"
+      },
+      {
+        "blob": "2678a1317cf9654829a3840bcde2bafdfc2f33ca",
+        "mode": "100644",
+        "path": "dlls/ntdll/unix/virtual.c",
+        "sha256": "fec89e94ad68a04e19bcdafc79d3430c7efd7bc1da3991c624f16e96ed4fe91f"
+      },
+      {
+        "blob": "92a5b58f84b18a0b85437f98a257521cf6a42757",
+        "mode": "100644",
+        "path": "dlls/ntdll/unwind.h",
+        "sha256": "cd8e282f82a6e85902437d86ea8796c83767f0d3c6ddd3052305669a852c21d0"
+      },
+      {
+        "blob": "4bacfdb94f986021d1e8cb4075158f25ccbb2bd4",
+        "mode": "100644",
+        "path": "dlls/xtajit64/Makefile.in",
+        "sha256": "1734be5ce920317c81f7275a4fe3cd260003cd3396826c0d3b67f098e13f9f70"
+      },
+      {
+        "blob": "b01fd7a0aeccda35b159f0051c101d85ce177c74",
+        "mode": "100644",
+        "path": "dlls/xtajit64/cpu.c",
+        "sha256": "2757d9334d28673dea59958a16758ee138bcf5b1c957c1e7044c3aaf5f8ea0e3"
+      },
+      {
+        "blob": "e62751f42884e2107234fb40c4b553065d023bcf",
+        "mode": "100644",
+        "path": "dlls/xtajit64/guest_exception.h",
+        "sha256": "3fdac275193e81ab2bb2f8d8a99dcd19e490c88a496651fcb4cf0cefe4136e11"
+      },
+      {
+        "blob": "88eb46915c0703017f35f3f074541b0142a4c8c7",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/arm64ec_call_patch_pe.c",
+        "sha256": "5e050df94d52f123f08aad3abb2f3c68bc7f2699a286db14950f108cf23cc5b8"
+      },
+      {
+        "blob": "6c415db1dd452cd3f62b6aa76e7a1957b2ae0ada",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/arm64ec_call_patch_pe.reference_output",
+        "sha256": "dc5e228244d2bac7b047051b22e509a6365204a517073dd94121ff3be3497b8d"
+      },
+      {
+        "blob": "ade66e73a2183e6a730821a491fed3d6f61e08d8",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/check_control_stack.py",
+        "sha256": "d2522919006cd76968337d4cda2c091814e6ad4e88bc3e9288febba8053f23b9"
+      },
+      {
+        "blob": "ecd910c53a46176bb6b8f39c35ef5d466705cdfd",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/check_ec_entry_cache.py",
+        "sha256": "457bccc8c91496104ff5a99c37864cce3eb94a68f558c6f1a8b52d7f649a71cb"
+      },
+      {
+        "blob": "d7a9fe92bf097698782242f0fa12e9917f397dbe",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/check_mapping_snapshot.py",
+        "sha256": "5936839036f08624890a75c3b77006a41a158c8be9bd2f4efc4dde52735592f7"
+      },
+      {
+        "blob": "b8903154270e6de88935d65c8de453c9da9d9a21",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/check_thread_term_ownership.py",
+        "sha256": "b6f6be84f4e867586b143f4f216e13ae19c2db3b3645b853fcbdf4115a1f3bc2"
+      },
+      {
+        "blob": "0f8a4f686d62a5f6546b0968929c07fd78d8fe4e",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/control_stack_pe.c",
+        "sha256": "7e253cf7b99e192aba3a1b9287183ed4831a51ef439bac3f1df51c65540f51e5"
+      },
+      {
+        "blob": "543f03834479f91d1d32ec78449954a752c09145",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/control_stack_pe.reference_output",
+        "sha256": "ad982753f5aa45feb4c388580ea74257ad77d09a571083b0cb732a8e51ea49bf"
+      },
+      {
+        "blob": "1f7dcaa3cf3092146f6a6511ff6e3439bf56eb04",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/control_stack_stress_pe.c",
+        "sha256": "8390140926548c997e4771e5d07e39ecb3d098ebd9706d3f9c1e4e64191f7519"
+      },
+      {
+        "blob": "e4d591b2d33fc736251ebeb86441291d7d7408d0",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/control_stack_stress_pe.reference_output",
+        "sha256": "549da83fe447e393aca548f784738ecfe4bbf44d00ab3059ed17dd1341bc61ec"
+      },
+      {
+        "blob": "aebcab9ff5b4f112a238d8e81117bf897fb39780",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/crt_boundary_abi.S",
+        "sha256": "d10a98e6b07c2843187220b7ac1c34710c68c8f3d9ec3b0308c2149ce290c812"
+      },
+      {
+        "blob": "b2245160fe64504b3a131425cf126d6a9151a40e",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/crt_boundary_pe.c",
+        "sha256": "db1e3d54565719fb8ca0de5c343ed916cf9a9ddf658f25cd9edc85f7e15a380e"
+      },
+      {
+        "blob": "24527664c326e39317684b5579f8760eb6093313",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/crt_boundary_pe.reference_output",
+        "sha256": "f73c95fd88b95b292eeaf6f6c97f786c40cf7667d29996adbe52424fd73d7fbe"
+      },
+      {
+        "blob": "1c7234a419aa81406e11f408de4e7ba56e8eafcc",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/ec_entry_cache.c",
+        "sha256": "ce057121abbf145fad63a6c5b6fe22dc968c58022b09a11da1d4d1da96e4a889"
+      },
+      {
+        "blob": "1af8215e921fcd6380edf740c8ad21af1e95a5cd",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/exception_pe.c",
+        "sha256": "db3829bd16b6981c8b7fc99b9c7b44a97e4bdddde709a64519def5e5d6d24171"
+      },
+      {
+        "blob": "f914eb0af6fb755e4cf410f3b84358d6a6609254",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/exception_pe.reference_output",
+        "sha256": "b38ec0c71af2db3a4d330adac56dcc7ae50381de4b778aca44872e0f90316b97"
+      },
+      {
+        "blob": "776848021649f7b1eebf7f0d051cba6d23ab0a96",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/exception_pe_execute.reference_output",
+        "sha256": "6ef6ffd2190b9dae4d80ed28678ead13885b4975c15c8e294ed3fbf0f983daff"
+      },
+      {
+        "blob": "07f7b9e0a0d8ac4a0e332b3a2142ff42c5c4a53c",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/fex_address_reuse_pe.c",
+        "sha256": "d38e9990de574b2006025c35332bfe86333e3ebf38ae2cd9309c3695c14ae136"
+      },
+      {
+        "blob": "e410a9bf5b697f8cd397d90a550fc841897cc55e",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/fex_address_reuse_pe.reference_output",
+        "sha256": "be883529a6101c4cc0142d22deff874b79e9de3cb155a78a488f88baaaebbcbe"
+      },
+      {
+        "blob": "1232c60075536cf296be669cb1298753621d9c80",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/fex_unixlib_contract.c",
+        "sha256": "7674ca3427b36de83482b36ee8f07af1a74010b8f25d8c8f8210c47949275143"
+      },
+      {
+        "blob": "c0179d29c535085b69ca83297d59e12439c7e370",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/native_boundary_pe.md",
+        "sha256": "f582ab982fb4ceb9b29ad193128952da33dec9aaacc4e29f147389b7815dab62"
+      },
+      {
+        "blob": "19d73b12e388f0707c70f04d2bd133d5d32822a2",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/private_code_reprotect_pe.c",
+        "sha256": "4d7b6a4621842e7f9aa15920af20a6a11ff2a25f642412121765b4c192de60a5"
+      },
+      {
+        "blob": "358d6ee439d1c0b64d671b54d951aa32162a5559",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/private_code_reprotect_pe.reference_output",
+        "sha256": "6cb5f769983553fb771f6e1e364bd62abdd1efcc946a9c644ca646c2b29fa398"
+      },
+      {
+        "blob": "406303e0fd4ac1706d0b0f0e80889aef063e870a",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/private_code_write_guard_pe.c",
+        "sha256": "cdc65323e1f38a9cc5a939ea619f764f001deb06583838616fb4f6da5a2c04d6"
+      },
+      {
+        "blob": "94bbc2c66709c137c0c808eb1e8cd170c8dc417b",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/private_code_write_guard_pe.reference_output",
+        "sha256": "bf62de5e26757f45a6133dd904001954ccca6c3d79e1d1704a195d68e9ec9ff1"
+      },
+      {
+        "blob": "986604a8a7b4db3aa9483e021c0aba16895aee4d",
+        "mode": "100755",
+        "path": "dlls/xtajit64/provider_tests/run_fex_unixlib_contract.sh",
+        "sha256": "e50d337bca7a8c4b230378ced4eb658a20dd109b1e4bba98a70635b933460e4e"
+      },
+      {
+        "blob": "33a4a793d9ec075116894a290ca6550abec8c7ac",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/seh_unwind_native_pe.c",
+        "sha256": "32c657d6ba8e2764aff131b98de09921ad4a995800ae5fc322aef54f6a91ed20"
+      },
+      {
+        "blob": "a4034684fd3b977e9d9c298a851a215f9dafb169",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/seh_unwind_native_pe.reference_output",
+        "sha256": "4ff8e3a2b207888d7d6459c009c2a4cbe2090be0a7f1cd8cdeea5f0e2eb56e1e"
+      },
+      {
+        "blob": "5489dd58ef7ac9b4bf63416b768f43fecb14dfb9",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/seh_unwind_pe.c",
+        "sha256": "825485650bbf33ddefdb5349fd371971a4be61b98eef7dfbbe12ce5f20e8c005"
+      },
+      {
+        "blob": "85ad8563c9d6d00f802c281e2a2e8641fa7c09e0",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/seh_unwind_pe.reference_output",
+        "sha256": "075b780552005c5577b694e142c44645a65ed2506006c28cbc43b754089f723e"
+      },
+      {
+        "blob": "7953a4bc9a1ec5874f84b0370b4e53161e6b4671",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/suspend_context_pe.c",
+        "sha256": "20d8ababe9791d714c6481bb8a3730ab0974e7df418c151b9262506170e05b8f"
+      },
+      {
+        "blob": "ad486b9c43023c5a4857de382f663a6b2de7edcb",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/suspend_context_pe.reference_output",
+        "sha256": "d30b38f996cca28011de0f770881cf12ccd01207cea802498f3c4fc2703c3e88"
+      },
+      {
+        "blob": "91ca11cc0d9a8b806c93772f7fc27ed765740119",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/thread_id_native_pe.c",
+        "sha256": "c40bf2abe1b247b63f04fb54502957a6b27ef7524dbebf3f9180efccdd2b3463"
+      },
+      {
+        "blob": "85852807d2ffb36c2029a2934742aeb9e257a26d",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/thread_id_native_pe.reference_output",
+        "sha256": "fe4a9fdfe015d7bd02d7d2e30d251b026009de79220238381f5dd52172fbf8c2"
+      },
+      {
+        "blob": "23eaa516a24ffe15d9be2b549ee47b6a0b18e9d2",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/thread_id_pe.c",
+        "sha256": "48ba3d0a83e73a9134162a0f2bb8826afe1aa0e4b63e8896aa95684fae77f421"
+      },
+      {
+        "blob": "83ce577789e82e8d72ce519dd637355f573505f3",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/thread_id_pe.reference_output",
+        "sha256": "0e215c8136ed568925c849578ea282c3dec234b20f41d05edcc3699e54881c1e"
+      },
+      {
+        "blob": "e31773a6151c7fab0432a84de65378e78b540de5",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/thread_lifecycle_long_pe.reference_output",
+        "sha256": "031b4e1db91e2f351529bad167c5ddd6404e1887379d09504bd1c013de4597d4"
+      },
+      {
+        "blob": "be1a3dc56e9d41c31b6ddeffb731a3f6d6f2159d",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/thread_lifecycle_pe.c",
+        "sha256": "befeb98207e5183f985a1a4fdac9786a6665ce807efb5fbcfa9d7b94c7bcf5c0"
+      },
+      {
+        "blob": "69010d610bd8ff0dcf972fe8535378076f1961af",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/thread_lifecycle_pe.reference_output",
+        "sha256": "7ab802cf6e0b22ccc008f56f01f5a9443b614ee44eacef0af69ec726817daac3"
+      },
+      {
+        "blob": "343c9d794ddc1878e0b60c0580bcb477718169e3",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/unaligned_tso_pe.c",
+        "sha256": "1d0ef7a2920c7d83af73d4f5976ace1644299ac79fe701f819ce8dff4237c34a"
+      },
+      {
+        "blob": "5d2f7abff3ffac764b7abebd5e82b67d8ce3de26",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/unaligned_tso_pe.reference_output",
+        "sha256": "94de99314b7eee5acfbcba48b15f46f14da2d5ff07f5f7cd6594e0e2b655532d"
+      },
+      {
+        "blob": "b0db486f22ab5ceb74c38e329704e43ad46d1ad4",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/unixlib_concurrency.c",
+        "sha256": "7bd8c68bb06321d3446955ce87eeaa6f174c75cc8a4891adf04ce82298ace910"
+      },
+      {
+        "blob": "83f9629f28c438fe8123aeb8a1d5adbc29fd67f3",
+        "mode": "100644",
+        "path": "dlls/xtajit64/unixlib.c",
+        "sha256": "8fc948599fdf2266966cd954fb005e538c8d3b67bdc922fa526704ce9c04710b"
+      },
+      {
+        "blob": "cf5d10fb38b9da22b9959572552c355d8cc9ad5d",
+        "mode": "100644",
+        "path": "dlls/xtajit64/unixlib.h",
+        "sha256": "ea7ef64cfe468bbd3e342d6afb4a99a6e79bc5cd4c8f2c8c8ba0d3f7b4d9ae53"
+      },
+      {
+        "blob": "ff120d7d476bb5507336a5814fb79777be842262",
+        "mode": "100644",
+        "path": "dlls/xtajit64/unixlib_fex.c",
+        "sha256": "df6687d4130595658287aea8b9b17b010abee1e490cd54b292846e196fbc8596"
+      },
+      {
+        "blob": "4ca90d6edebd4ccec13e07377a1d682b85d9e62d",
+        "mode": "100644",
+        "path": "docs/compatibility.md",
+        "sha256": "03e38abb300ea64b21a38bda229c9b879d97462c6dcedaed969e0650df207a4b"
+      },
+      {
+        "blob": "a3e73c8f35b184fa2844ae9cb1042337fdba3fe8",
+        "mode": "100644",
+        "path": "include/wine/low_va.h",
+        "sha256": "cab7c80e1d05d3f375f1e66e33b4f54b628ca307a9bd5fac52a67f3ae6eee326"
+      },
+      {
+        "blob": "13fe933a1fa611667180bca4cab0e99224069c63",
+        "mode": "100644",
+        "path": "include/wine/server_protocol.h",
+        "sha256": "ade42c4a640b83b3fc980ae8558e252b846085fc5f70379ec45305362622ae9a"
+      },
+      {
+        "blob": "6feae275e407e3a959046282dfeef6c4f76ca208",
+        "mode": "100644",
+        "path": "include/wine/unixlib.h",
+        "sha256": "78db891b8b9feedc8eb961c8fde59dde5f7a54eccd4a57aaab579fca585a8bc9"
+      },
+      {
+        "blob": "e33c7cc2a36065c9e9b4e63c3f0eea6949f8c66a",
+        "mode": "100644",
+        "path": "server/protocol.def",
+        "sha256": "fa44c9bec58410ddf903afa53cd6b6eb871002ee20a46a8f84e681ebfc3bb442"
+      },
+      {
+        "blob": "adf3d29e1f73ed96c26c0518b36955e07eea4661",
+        "mode": "100755",
+        "path": "switchyard/build_fex_runtime.sh",
+        "sha256": "ab38d567154fdc3e25f5e45b689d753ea4da64979280a7fe8013de3013b4c426"
+      },
+      {
+        "blob": "c5faa75ed6c7596c4e14e88a9a2abcd2e2871791",
+        "mode": "100755",
+        "path": "switchyard/build_runtime.sh",
+        "sha256": "f8177f603aef1faf1d7c9873f7bee42819cfa48f6fecd7cd8f9539b55bfe181e"
+      },
+      {
+        "blob": "f185fa594513c487904084486985ef60bbffde22",
+        "mode": "100644",
+        "path": "switchyard/fex/CMakeLists.txt",
+        "sha256": "ccdd700de911db64783352de4f0c0d488d098fc64f9c447679efd7505d2f9b84"
+      },
+      {
+        "blob": "688f9efedde403b6dc720f63a960fe7351ee6bd1",
+        "mode": "100644",
+        "path": "switchyard/fex/README.md",
+        "sha256": "946888d8442da342c68e7fff42a16b69b76c365e61f96df2269d3fd4d59c3073"
+      },
+      {
+        "blob": "305753e328f077caccacfab5d64461976452d1a5",
+        "mode": "100644",
+        "path": "switchyard/fex/exports.txt",
+        "sha256": "df91184199b1fc17c149f758b0bc56c42016a60cc29b1b2a02a19d504a36d3f0"
+      },
+      {
+        "blob": "efe9c65a7dc9599da316c946cb3a82dfb0cecb21",
+        "mode": "100644",
+        "path": "switchyard/fex/include/switchyard_fex.h",
+        "sha256": "9dc30b928b8918424b3a648e9896c26daae7472784e44e9f5f81f2bf147ea8d1"
+      },
+      {
+        "blob": "4b9e591f48b4bcbcff24ed8bf6ecdef499ba0d92",
+        "mode": "100644",
+        "path": "switchyard/fex/include/switchyard_fex_admission.h",
+        "sha256": "acd29babef28ec4656f06cb23c460c9ae161582bdfc503a763fc919575ede737"
+      },
+      {
+        "blob": "9f510399256e8fcd9fe25658978efefc2a72c409",
+        "mode": "100644",
+        "path": "switchyard/fex/source-deps.tsv",
+        "sha256": "b31cd5e74e5e0e33fe64bdf8d935bf73ed4d513e95f2e43ddeb7ebff91764271"
+      },
+      {
+        "blob": "b4b5ca36e108b4703f18e606604bf62d8e563cef",
+        "mode": "100644",
+        "path": "switchyard/fex/src/switchyard_fex.cpp",
+        "sha256": "c84846a486c00f6b70be08e4598e877211d08758bd04f40cc2394e0f4231eddd"
+      },
+      {
+        "blob": "92f879455ab37c18389aa5d23eb836a5683950bb",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/admission_contract.h",
+        "sha256": "e4ef340cebe92b9b133ef8d217190fd1bd75e80030d116b8f99e5885de2c32ac"
+      },
+      {
+        "blob": "9193c19a7a477e8841aab16addf5ffb6700356c9",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/admission_test.h",
+        "sha256": "762e16c32db53e2bf0d5756ff46e1da870ef1b3327a36ff25826fdd379733d08"
+      },
+      {
+        "blob": "dee4952c090c517c5e57ba25616f2acd4a54a001",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/allocator_test.cpp",
+        "sha256": "99a7b099cc8b942ddaccd026d726ebfe85549d838e7e7bf10842bd712dbadf10"
+      },
+      {
+        "blob": "a9080028f854cf8a73447bc701f47df2d9031c73",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/c_api_test.c",
+        "sha256": "852e1fc7b343b512777a2bd81753b1ef3b42cb36074df3d84a0b768c111e114b"
+      },
+      {
+        "blob": "56db73a6954344b29f8b8afb64082cb16afdd45e",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/darwin_abi_test.cpp",
+        "sha256": "3d818e83921fb1624469b042caf5de2b22c8b5e9c7050a1f2c249ad90cc76894"
+      },
+      {
+        "blob": "e328f8004e527f9845f5d1ebb4885dde8c1089ff",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/detached_dispatch_test.h",
+        "sha256": "de703bfef0a18c349b1133fb8f07154eae4941f20febae904836e62cda3caeb7"
+      },
+      {
+        "blob": "11af00412aa52b48f878b69660eb47d2daec5a15",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/extract_wine_x18.cmake",
+        "sha256": "fc756f04d11bbda5906319c74f83382cd927ec93ebe29fc8d76b5b1b644d5ed3"
+      },
+      {
+        "blob": "28094f598be430145c0b7b5e3abe833b591729e2",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_reference.h",
+        "sha256": "363c77229c3064c13ec89fe1624a7602c4b608dede0f221474a7372fa3767e3e"
+      },
+      {
+        "blob": "00c52baccbc264b7dc4159f8ace0af971441758a",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_state_test.cpp",
+        "sha256": "24fceb7d29e002ca641f8846847ed8372e1ae535ff7dd32066ec9c597c197e17"
+      },
+      {
+        "blob": "cd5f0670c5330a725146fcd91379e386700f9477",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_test.c",
+        "sha256": "3019223cd3b4682158771c5052c26ebc08e8e124150474023e38d87734c9b9af"
+      },
+      {
+        "blob": "aae73324218161c5bf382235dd9341dd2819de63",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/shared_admission_test.h",
+        "sha256": "fd81134dbf0f15032df6f9dd9ce7fb45ea5474de3d412fd31cbe0ad17b6b3daf"
+      },
+      {
+        "blob": "ff55190fe41c6b5ba0409231b4743fbf39e9bd41",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/vector_state_test.h",
+        "sha256": "2f45012168d270da9d553c36abe9f13b84024f2916aebd918fd2efda436a3a3a"
+      },
+      {
+        "blob": "fd60d119ccee14f24f7b37bbfe92c95bb92f9dc7",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/verify_test_suite.py",
+        "sha256": "cf12bf0a1d27ef2fd0c1b07cbb383887d654c8f2b9992585ec8083363191c698"
+      },
+      {
+        "blob": "4e5e1a84383d37adcb3f0b427b55dafb29ad67dc",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/wine_signal_wrapper.c",
+        "sha256": "4a0c478a19cfa1cddae82f3d42c36a468b6fcd3016f6fa8ba0fdbbf485b979f9"
+      },
+      {
+        "blob": "5ab57264685947d6c16ec566cb6092798cbde845",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/wine_signal_wrapper.h",
+        "sha256": "9d2cf5d1e9d7ba54c2edf143d4df7b99891d3c426e00ece7afcb36e69d00e231"
+      },
+      {
+        "blob": "3e4b0b8b6da67f017a8b5930198535df04f7ac7d",
+        "mode": "100644",
+        "path": "switchyard/lib/fex_contract.sh",
+        "sha256": "4988d29d09905b8430c40c9f3f824c52e0e209f50a0f1be68b2f38571ed336fc"
+      },
+      {
+        "blob": "ff5462b8fbcf02ad725243f2bee4a8dab92a84c5",
+        "mode": "100644",
+        "path": "switchyard/lib/native_arm64_packaging.sh",
+        "sha256": "3e7540fc2cf1b13b3f86d259fda6da6b230c7de86148e888425f5403c8ac5139"
+      },
+      {
+        "blob": "aebb4127f1378277e57ac88f21f31e368abe733b",
+        "mode": "100644",
+        "path": "switchyard/lib/native_cpu_provider.sh",
+        "sha256": "4c1bae1ea6e2570cd04ab198c94fad8866c2cadbf9696cf6e7b61e8c9d6df630"
+      },
+      {
+        "blob": "929b0499070c20b38b12aceddfb8b5b49c80a6e2",
+        "mode": "100644",
+        "path": "switchyard/lib/runtime_profile.sh",
+        "sha256": "8c28e24c59cf16fbdc14da9585f620e92f6a7e0baf2ec0d3d9f7d1cab29d95d5"
+      },
+      {
+        "blob": "93d26a479e6c92336b51a6e1329cab2d1c175842",
+        "mode": "100644",
+        "path": "switchyard/patches/fex-73dc3b3-darwin-core.patch",
+        "sha256": "8afdc678bc873f0e2fc5e51b5e0dca2487a71244e9392615d35142223f493f2e"
+      },
+      {
+        "blob": "52eeb0596db9cad4c9e7cd07fe69740f036cda4f",
+        "mode": "100755",
+        "path": "switchyard/release_runtime.sh",
+        "sha256": "f066a860b707af56249443d5a4f17d8659b00ae6a6b9df6bac0de73af6b8b4c1"
+      },
+      {
+        "blob": "eca86e4bcf98cd002ab22858c733d52bd476c9e5",
+        "mode": "100644",
+        "path": "switchyard/runtime_diagnostics.py",
+        "sha256": "9b8423074e784784408513a87360fe6bbeeb84de999b7d81c6e46647dbd37e1a"
+      },
+      {
+        "blob": "0a092021fe1c0d8ebd698628a6f4700e327789f5",
+        "mode": "100755",
+        "path": "switchyard/tests/darwin_arm64_private_valloc_wx_source_test.sh",
+        "sha256": "86dafa7c38198ba1ecf7117f4d59deeabf55488abead7b21d440bf126d1af4a5"
+      },
+      {
+        "blob": "74fd71e77a7aa71cb3caf1aa4b79853aab1bb9ed",
+        "mode": "100644",
+        "path": "switchyard/tests/darwin_x18_pfz_entry/CMakeLists.txt",
+        "sha256": "24eca730d9bb68ed983df97ee91f4ad100d1087a4294e48be391ddb583f2b88a"
+      },
+      {
+        "blob": "38da7f1b6e3feba904cddf02fc62c75ecc6189b2",
+        "mode": "100644",
+        "path": "switchyard/tests/darwin_x18_pfz_entry/entry_contract.c",
+        "sha256": "960aa8319b9f288cd249467ff8183936cc9ad74f4668eff4cf6b12e9fb558fba"
+      },
+      {
+        "blob": "2a7ffeb4d53aafd8f0242e562423e352ba98a62a",
+        "mode": "100644",
+        "path": "switchyard/tests/darwin_x18_pfz_entry_test.sh",
+        "sha256": "b4f4a7fcc327756c3f94420d3671c203cb6df2ea68a2c26e580aad3fd67d2ba1"
+      },
+      {
+        "blob": "3c1258d581c47e785c97ee671ec8f4e071aab5b1",
+        "mode": "100644",
+        "path": "switchyard/tests/fex_build_contract_test.py",
+        "sha256": "14f910921f8a1e29222f0ecede3b1f0adcaec94f5741c1cd943dc8e7c20e3479"
+      },
+      {
+        "blob": "886091fc14c2fd7acc4974469e31091eab1e75aa",
+        "mode": "100644",
+        "path": "switchyard/tests/fex_packaging_fixture.sh",
+        "sha256": "951542035e9fb06a92a43ec6e57d8d06590da98c7713fab1d6213904059ae9cf"
+      },
+      {
+        "blob": "d728b99eb6b84346ab358c947a47a47a1df6c37a",
+        "mode": "100644",
+        "path": "switchyard/tests/fex_provider_fixture.c",
+        "sha256": "e4334b3dfcac03779cffcd4176985c563a44975955a33adf2914d2f6489533ae"
+      },
+      {
+        "blob": "8edebc8ad9affc51795dfd1a44fb0ff473206129",
+        "mode": "100755",
+        "path": "switchyard/tests/native_arm64_packaging_test.sh",
+        "sha256": "a54336a69e262c5d99a1a8618424452ac6e728e09c2d534e1bd251c75f383376"
+      },
+      {
+        "blob": "970131f78f4072e61bfaec16c99d9849bf3bc83f",
+        "mode": "100755",
+        "path": "switchyard/tests/native_cpu_provider_test.sh",
+        "sha256": "6ea6dd06f7e8dde32f1c83a28dc387be7fa8806ee608dd2c15e57960ff967d80"
+      },
+      {
+        "blob": "de6ef3f7112f935d9ef261ae3cb3c7f523c1bda6",
+        "mode": "100755",
+        "path": "switchyard/tests/provider_source_models_test.sh",
+        "sha256": "d189d5a82c5deecdd544dc12af9f8689f1b2e51e2d2a2643c7cd64beb33b8b68"
+      },
+      {
+        "blob": "95126b0a85160ea63b21a95aedacae908c5db720",
+        "mode": "100644",
+        "path": "switchyard/tests/runtime_diagnostics_test.py",
+        "sha256": "919c52688547e566ef8e773d3f3edff5ae9b95c02c4bf741ab9dc19b6c3c0965"
+      },
+      {
+        "blob": "a838d789e8b7a966ad02f5996462dc644557881b",
+        "mode": "100755",
+        "path": "switchyard/tests/runtime_profile_test.sh",
+        "sha256": "412d27f5038ffb6639fd32428595078adbe93a0c3c598ef2a28846dbb4b654d2"
+      },
+      {
+        "blob": "36bd9978951e81ceb0198c046c28f1ef6bf48e90",
+        "mode": "100755",
+        "path": "switchyard/verify_source.sh",
+        "sha256": "46474e90abbd2ca1319d6f38ca01bac6cc4fe0c6cc66d3e44b9b02fef47e10aa"
+      }
+    ],
+    "parent": "b861d8e260f933a76c17d5482bbbe376bb4ea51e",
+    "tree": "8663a3d76c4583fbd9ea64a6119d69ef5346fc8b"
+  },
+  "measured_baseline_components": {
+    "commit": "9e955472a66ace6bfa4821a68cb57e58c408d0e9",
+    "files": [
+      {
+        "blob": "6b4615525af5cceafa231e203a8c1a36f65c8e3c",
+        "mode": "100644",
+        "path": "dlls/xtajit64/flight_recorder.h",
+        "sha256": "bf90666082c6a077ff652e37601e20b415a735afb70cff58f3d07a9df85cdc7a"
+      },
+      {
+        "blob": "e62751f42884e2107234fb40c4b553065d023bcf",
+        "mode": "100644",
+        "path": "dlls/xtajit64/guest_exception.h",
+        "sha256": "3fdac275193e81ab2bb2f8d8a99dcd19e490c88a496651fcb4cf0cefe4136e11"
+      },
+      {
+        "blob": "afa674854dbba1361a4c124aecb12b1e0f8db28d",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/fex_unixlib_contract.c",
+        "sha256": "5dccabe8e3a0f776734181478a197f7c66c095bf599ff81aa38d7a489be7e6d4"
+      },
+      {
+        "blob": "111da19e6243baf2d34f40d2b147ba062713aad4",
+        "mode": "100644",
+        "path": "dlls/xtajit64/provider_tests/native_gate_contract.c",
+        "sha256": "1a12b3e51e847cf8245848baef11d0c16842320cc23757f741be5c33b18b96d5"
+      },
+      {
+        "blob": "cf5d10fb38b9da22b9959572552c355d8cc9ad5d",
+        "mode": "100644",
+        "path": "dlls/xtajit64/unixlib.h",
+        "sha256": "ea7ef64cfe468bbd3e342d6afb4a99a6e79bc5cd4c8f2c8c8ba0d3f7b4d9ae53"
+      },
+      {
+        "blob": "6f62297a2de6d5e132be46cbe516e68739fe77d9",
+        "mode": "100644",
+        "path": "dlls/xtajit64/unixlib_fex.c",
+        "sha256": "051d84514304079aa2677271123a9f462739dce07ba0b738129a819b752fed9a"
+      },
+      {
+        "blob": "0ac1248d313310b9d1b12eb6eada05dd18434d82",
+        "mode": "100644",
+        "path": "switchyard/fex/CMakeLists.txt",
+        "sha256": "e277bfcfff81374219fd592ed6accf684e85e75298360b7e6754ed8e558d2d15"
+      },
+      {
+        "blob": "688f9efedde403b6dc720f63a960fe7351ee6bd1",
+        "mode": "100644",
+        "path": "switchyard/fex/README.md",
+        "sha256": "946888d8442da342c68e7fff42a16b69b76c365e61f96df2269d3fd4d59c3073"
+      },
+      {
+        "blob": "c4b36e1eb7da4e5897ec6cc6f9f3392def2d696f",
+        "mode": "100644",
+        "path": "switchyard/fex/exports.txt",
+        "sha256": "ea0dde7d9168d1a7e2156f284e3454e41ff936a0b7cf1f0095d47c474931ad31"
+      },
+      {
+        "blob": "361c9332fdf889de36ac18621cb28e5ba9fa9d94",
+        "mode": "100644",
+        "path": "switchyard/fex/include/switchyard_fex.h",
+        "sha256": "1c86b17c5c02ab96013a83d82fc01579d52a40e8823067d105c0c5ca7cb891c4"
+      },
+      {
+        "blob": "4b9e591f48b4bcbcff24ed8bf6ecdef499ba0d92",
+        "mode": "100644",
+        "path": "switchyard/fex/include/switchyard_fex_admission.h",
+        "sha256": "acd29babef28ec4656f06cb23c460c9ae161582bdfc503a763fc919575ede737"
+      },
+      {
+        "blob": "9f510399256e8fcd9fe25658978efefc2a72c409",
+        "mode": "100644",
+        "path": "switchyard/fex/source-deps.tsv",
+        "sha256": "b31cd5e74e5e0e33fe64bdf8d935bf73ed4d513e95f2e43ddeb7ebff91764271"
+      },
+      {
+        "blob": "e7f394c264d745f30886523ce4f9fc7217a56245",
+        "mode": "100644",
+        "path": "switchyard/fex/src/switchyard_fex.cpp",
+        "sha256": "c691bc9182e957aba3b952e49d41c3695172ae640c3c21c60b5d76bb4a7537b3"
+      },
+      {
+        "blob": "92f879455ab37c18389aa5d23eb836a5683950bb",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/admission_contract.h",
+        "sha256": "e4ef340cebe92b9b133ef8d217190fd1bd75e80030d116b8f99e5885de2c32ac"
+      },
+      {
+        "blob": "9193c19a7a477e8841aab16addf5ffb6700356c9",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/admission_test.h",
+        "sha256": "762e16c32db53e2bf0d5756ff46e1da870ef1b3327a36ff25826fdd379733d08"
+      },
+      {
+        "blob": "dee4952c090c517c5e57ba25616f2acd4a54a001",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/allocator_test.cpp",
+        "sha256": "99a7b099cc8b942ddaccd026d726ebfe85549d838e7e7bf10842bd712dbadf10"
+      },
+      {
+        "blob": "a9080028f854cf8a73447bc701f47df2d9031c73",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/c_api_test.c",
+        "sha256": "852e1fc7b343b512777a2bd81753b1ef3b42cb36074df3d84a0b768c111e114b"
+      },
+      {
+        "blob": "4897010124a0adfc768c803355c3fdb03297e6b3",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/completion_window_state_test.cpp",
+        "sha256": "9119af6da98d1010ba5abf56f802e9126cd56763dbbf6ebc87cde5f5938bd20d"
+      },
+      {
+        "blob": "56db73a6954344b29f8b8afb64082cb16afdd45e",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/darwin_abi_test.cpp",
+        "sha256": "3d818e83921fb1624469b042caf5de2b22c8b5e9c7050a1f2c249ad90cc76894"
+      },
+      {
+        "blob": "e328f8004e527f9845f5d1ebb4885dde8c1089ff",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/detached_dispatch_test.h",
+        "sha256": "de703bfef0a18c349b1133fb8f07154eae4941f20febae904836e62cda3caeb7"
+      },
+      {
+        "blob": "11af00412aa52b48f878b69660eb47d2daec5a15",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/extract_wine_x18.cmake",
+        "sha256": "fc756f04d11bbda5906319c74f83382cd927ec93ebe29fc8d76b5b1b644d5ed3"
+      },
+      {
+        "blob": "1cf7314167a21adc1293729e4168b0eaaa00d7ba",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/native_gate_state_test.cpp",
+        "sha256": "5b3b41c3031e31f818eb4b551f953ae4664ba48427a87ebe6a12c92c7feedc08"
+      },
+      {
+        "blob": "28094f598be430145c0b7b5e3abe833b591729e2",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_reference.h",
+        "sha256": "363c77229c3064c13ec89fe1624a7602c4b608dede0f221474a7372fa3767e3e"
+      },
+      {
+        "blob": "00c52baccbc264b7dc4159f8ace0af971441758a",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_state_test.cpp",
+        "sha256": "24fceb7d29e002ca641f8846847ed8372e1ae535ff7dd32066ec9c597c197e17"
+      },
+      {
+        "blob": "cd5f0670c5330a725146fcd91379e386700f9477",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/register_window_test.c",
+        "sha256": "3019223cd3b4682158771c5052c26ebc08e8e124150474023e38d87734c9b9af"
+      },
+      {
+        "blob": "aae73324218161c5bf382235dd9341dd2819de63",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/shared_admission_test.h",
+        "sha256": "fd81134dbf0f15032df6f9dd9ce7fb45ea5474de3d412fd31cbe0ad17b6b3daf"
+      },
+      {
+        "blob": "ff55190fe41c6b5ba0409231b4743fbf39e9bd41",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/vector_state_test.h",
+        "sha256": "2f45012168d270da9d553c36abe9f13b84024f2916aebd918fd2efda436a3a3a"
+      },
+      {
+        "blob": "737c899e7b536c2ae4f81cfbce79155911d799fc",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/verify_test_suite.py",
+        "sha256": "f381c6564cdcce805f09a4db0f1afbd5b82dcfb2313c17050ff3a24e83ce0821"
+      },
+      {
+        "blob": "4e5e1a84383d37adcb3f0b427b55dafb29ad67dc",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/wine_signal_wrapper.c",
+        "sha256": "4a0c478a19cfa1cddae82f3d42c36a468b6fcd3016f6fa8ba0fdbbf485b979f9"
+      },
+      {
+        "blob": "5ab57264685947d6c16ec566cb6092798cbde845",
+        "mode": "100644",
+        "path": "switchyard/fex/tests/wine_signal_wrapper.h",
+        "sha256": "9d2cf5d1e9d7ba54c2edf143d4df7b99891d3c426e00ece7afcb36e69d00e231"
+      },
+      {
+        "blob": "dffd70a187b3444a56f72d5a654448ef5c5bc250",
+        "mode": "100644",
+        "path": "switchyard/fex/wine-runtime-native-arm64.entitlements",
+        "sha256": "3a0bdd52e1d26dbdb41738614511141a369aeff90fcb00df3ef993b4266d9eb0"
+      },
+      {
+        "blob": "732811e4f1faf71870b7350f211b26e00d7bfbe9",
+        "mode": "100644",
+        "path": "switchyard/fex/wine/COPYING.LIB",
+        "sha256": "e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c"
+      },
+      {
+        "blob": "3909c6e050cd238630e2bb9baa7de3ea199bf61e",
+        "mode": "100644",
+        "path": "switchyard/fex/wine/LICENSE",
+        "sha256": "ae025f125a5d639f0f7abe5146efa1e3d7453cc10b744b2910806fa3f46626ef"
+      },
+      {
+        "blob": "cbe40e002c3ff7efa8388248ce34338d7a738371",
+        "mode": "100644",
+        "path": "switchyard/fex/wine/dlls/ntdll/unix/signal_arm64.c",
+        "sha256": "39b5e1e54d91141de769234759d49bf79d9623c4b045f1fb7e27617b5713fee5"
+      },
+      {
+        "blob": "eaebc68d5aef12dbdb07866fd0b831f898c15465",
+        "mode": "100644",
+        "path": "switchyard/fex/wine/include/wine/asm.h",
+        "sha256": "65641e8b3177a75603396b40d482684c2640f6a39d22d5713e82ef8edbc0b652"
+      }
+    ],
+    "parent": "042d999955c7f69f9e55dd79b925cf76b59f9177",
+    "tree": "88c68890f0fbf57531fa794260ac85b2e4f27831"
+  },
+  "measured_primary_dirty_digest": "bdc894daa950af7481eda6734131711bad658831f82ed156216f4ffe7434dfcd",
+  "patch_whitespace": "Existing unified-diff context blank lines and copied upstream license text retained byte-for-byte; all newly exported code passes diff --check.",
+  "production_promoted": false,
+  "review_only": true,
+  "runtime_hashes": {
+    "baseline_library": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99",
+    "baseline_runtime": "5bacff15dc7f5bd0c9056681edb1f268de18df9cc8188b033a02cd7a918b29a5",
+    "baseline_sdk": "90d7203549cd9b15472440cc22d6233e6694e97dc3e53e9a752f28bdba035f03",
+    "candidate_library": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d",
+    "candidate_runtime": "6131b529987978c4dba6de0560a6cb9ca8f67faf58ca2409690e506b861a6596",
+    "candidate_sdk": "103ad74d2912797d393a680723a234eaf670c674b57a2fb956e795d872df07af",
+    "rosetta_runtime": "5ba626ce7c104fd7a656f13818fbc0f788a9b644e3b744065a31b7eaa7fa4d46",
+    "unchanged_arm64ec_pe19": "1b8a38fbcc22aa3aed59fca79a62e01dff0fe8948eb8ea137adab1b9be94cc17",
+    "unchanged_unix_provider": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+  },
+  "wine_repository": "https://github.com/jungwuk-ryu/switchyard-wine"
+}

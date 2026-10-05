@@ -1,0 +1,6354 @@
+{
+  "classification": "Sanitized observations, not full raw logs or a production admission certificate.",
+  "fhourstones_strata": {
+    "baseline_rosetta": {
+      "combined_same_workload": {
+        "mad": 0.025992314299623676,
+        "max": 1.9552062817676161,
+        "median": 1.737229857313384,
+        "min": 1.691963304536359,
+        "n": 12,
+        "values": [
+          1.7926982764290684,
+          1.7590462516334069,
+          1.9435428595282596,
+          1.691963304536359,
+          1.9552062817676161,
+          1.726270617027563,
+          1.7247263829924233,
+          1.7481890975992052,
+          1.7070616230341595,
+          1.7191545412011084,
+          1.7185837649558193,
+          1.7788198965346775
+        ]
+      },
+      "initial": {
+        "mad": 0.0667553032492767,
+        "max": 1.9552062817676161,
+        "median": 1.7758722640312377,
+        "min": 1.691963304536359,
+        "n": 6,
+        "values": [
+          1.7926982764290684,
+          1.7590462516334069,
+          1.9435428595282596,
+          1.691963304536359,
+          1.9552062817676161,
+          1.726270617027563
+        ]
+      },
+      "precision": {
+        "mad": 0.009117768101776336,
+        "max": 1.7788198965346775,
+        "median": 1.7219404620967658,
+        "min": 1.7070616230341595,
+        "n": 6,
+        "values": [
+          1.7247263829924233,
+          1.7481890975992052,
+          1.7070616230341595,
+          1.7191545412011084,
+          1.7185837649558193,
+          1.7788198965346775
+        ]
+      }
+    },
+    "geometry_baseline": {
+      "combined_same_workload": {
+        "mad": 0.01846566818581674,
+        "max": 1.0855695300320438,
+        "median": 0.9927787424906356,
+        "min": 0.8621473420341222,
+        "n": 12,
+        "values": [
+          0.9595415291078271,
+          0.9757646465628027,
+          0.8621473420341222,
+          1.0855695300320438,
+          0.9025932080661379,
+          1.0242256042471642,
+          1.0081018062943756,
+          0.9953727456557985,
+          0.9901847393254726,
+          1.0126959829344362,
+          1.0084105467433129,
+          0.9772860400317912
+        ]
+      },
+      "initial": {
+        "mad": 0.060816198090513196,
+        "max": 1.0855695300320438,
+        "median": 0.9676530878353149,
+        "min": 0.8621473420341222,
+        "n": 6,
+        "values": [
+          0.9595415291078271,
+          0.9757646465628027,
+          0.8621473420341222,
+          1.0855695300320438,
+          0.9025932080661379,
+          1.0242256042471642
+        ]
+      },
+      "precision": {
+        "mad": 0.008815988863787427,
+        "max": 1.0126959829344362,
+        "median": 1.001737275975087,
+        "min": 0.9772860400317912,
+        "n": 6,
+        "values": [
+          1.0081018062943756,
+          0.9953727456557985,
+          0.9901847393254726,
+          1.0126959829344362,
+          1.0084105467433129,
+          0.9772860400317912
+        ]
+      }
+    },
+    "geometry_rosetta": {
+      "combined_same_workload": {
+        "mad": 0.020266022632977054,
+        "max": 1.8367438093369988,
+        "median": 1.7385578173361813,
+        "min": 1.6756203104716865,
+        "n": 12,
+        "values": [
+          1.7201684453937143,
+          1.7164151440126942,
+          1.6756203104716865,
+          1.8367438093369988,
+          1.7647559102916976,
+          1.7680905658191808,
+          1.738699782058227,
+          1.7400997820028534,
+          1.6903063682165973,
+          1.7409808979178563,
+          1.7330379940432787,
+          1.7384158526141356
+        ]
+      },
+      "initial": {
+        "mad": 0.02583771090324327,
+        "max": 1.8367438093369988,
+        "median": 1.742462177842706,
+        "min": 1.6756203104716865,
+        "n": 6,
+        "values": [
+          1.7201684453937143,
+          1.7164151440126942,
+          1.6756203104716865,
+          1.8367438093369988,
+          1.7647559102916976,
+          1.7680905658191808
+        ]
+      },
+      "precision": {
+        "mad": 0.0019825226241735328,
+        "max": 1.7409808979178563,
+        "median": 1.7385578173361813,
+        "min": 1.6903063682165973,
+        "n": 6,
+        "values": [
+          1.738699782058227,
+          1.7400997820028534,
+          1.6903063682165973,
+          1.7409808979178563,
+          1.7330379940432787,
+          1.7384158526141356
+        ]
+      }
+    }
+  },
+  "no_outliers_removed": true,
+  "original_receipt_sha256": {
+    "main_proof": "d1ba065464bf971f4c04e64eaacf2ac3998e9317e2999c7d1df4eaccc8bc0272",
+    "main_summary": "9f9606c0e4e01025d214d46345659fb73c6e3e4e3e8a2389f2638d479bf2dbe3",
+    "precision_proof": "9deb7b0fa8eecf6bfce97d015106b928d6ccb1ef43756834efca7dd048c5699f",
+    "precision_summary": "1d0ccc400d92c6e2910cbb4771de885ce005bba49ec07b765d9b1edafff5b5ea",
+    "same_byte_proof": "718b33c2b5e4afbb8b37fb4340013abdb9ce7ccf15e80dba3f05499b5d034f3c",
+    "same_byte_summary": "13e98e450026bbb76a918daa5d0c0c88d2ed958d8dbf2941232bcfe8b9fa3dea"
+  },
+  "records": [
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "blob_wall_seconds": 0.0394434,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.227824,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 4.0764901,
+      "main_wall_seconds": 4.3495976,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "blob_wall_seconds": 0.0376428,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.226434,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 3.951314,
+      "main_wall_seconds": 4.2209999,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "blob_wall_seconds": 0.0064877,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.1186467,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 0.8036173,
+      "main_wall_seconds": 0.9297935,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.6210536,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.5111472,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.1415066,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2346771,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2392322,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 1.5085677,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5178693,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4969171,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.288877,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.56805,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.1366675,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.5036661,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2313076,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 1.5091688,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2304834,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5124786,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2913389,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5000585,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "blob_wall_seconds": 0.0386164,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2216038,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 4.0686324,
+      "main_wall_seconds": 4.3344325,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "blob_wall_seconds": 0.0073954,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.1438255,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 0.8114066,
+      "main_wall_seconds": 0.9638151,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "blob_wall_seconds": 0.0377813,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.23077,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 3.9488585,
+      "main_wall_seconds": 4.2231155,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2519869,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2453233,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 1.5164068,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4977343,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5773193,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2970448,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "blob_wall_seconds": 0.0381069,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2230766,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 4.0482533,
+      "main_wall_seconds": 4.3150557,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "blob_wall_seconds": 0.0391035,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2233199,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 4.0428357,
+      "main_wall_seconds": 4.3108244,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "blob_wall_seconds": 0.0065809,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.1161615,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 0.7915197,
+      "main_wall_seconds": 0.9152831,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.5039473,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.6629839,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.1434869,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5440437,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2962001,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5011597,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "blob_wall_seconds": 0.0376509,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2269745,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 3.9401715,
+      "main_wall_seconds": 4.2104024,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "blob_wall_seconds": 0.0065557,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.1116219,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 0.8026296,
+      "main_wall_seconds": 0.9219246,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "blob_wall_seconds": 0.0391458,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2347983,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 4.0373619,
+      "main_wall_seconds": 4.3170033,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.5643552,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.1282821,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.6570098,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2299624,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 1.5020509,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2278956,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "blob_wall_seconds": 0.0065769,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.1210001,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 0.8055053,
+      "main_wall_seconds": 0.9342267,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "blob_wall_seconds": 0.0392633,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2215839,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 4.0267572,
+      "main_wall_seconds": 4.2931837,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "blob_wall_seconds": 0.037905,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2227853,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 3.9278648,
+      "main_wall_seconds": 4.1941209,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.1255729,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.5847327,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.6330587,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 1.5083368,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2309209,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2312281,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2945413,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.575889,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5197935,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.1613462,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.6245535,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "bullet",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 4.6855693,
+      "normalized_sha256": "dbb98fdde70c2e1d7bd73bf418d6fd15069a13874a9d00328fff8839a7dbf8ce",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 1.5151868,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.252451,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "tsvc",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 2.2338414,
+      "normalized_sha256": "72b632aa142dd173833734cc3bc8cbfb2450f40ab8b580833ce2e78a5e9d3439",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2900697,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5128695,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5007388,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "blob_wall_seconds": 0.0068741,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.1148232,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 0.810508,
+      "main_wall_seconds": 0.9333175,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "blob_wall_seconds": 0.0377493,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2232768,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 4.0782795,
+      "main_wall_seconds": 4.3448924,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "blob_wall_seconds": 0.0396793,
+      "byte_exact_reference": true,
+      "case": "python",
+      "compression_wall_seconds": 0.2322503,
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "integer_wall_seconds": 4.0468794,
+      "main_wall_seconds": 4.3244273,
+      "normalized_sha256": "22be8cdf6e998bfcb9d0b29ddbcae2b0193d69a6c23251cc0bc22572028b194c",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "initial",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2857644,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4968585,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4928654,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "geometry",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 1,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2830771,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4948723,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4925824,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "rosetta",
+        "baseline",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 2,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4905597,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2902194,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4954224,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "rosetta",
+        "baseline"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 3,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5034532,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4971415,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2891779,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "geometry",
+        "baseline",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 4,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4932973,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.2870371,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "rosetta"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.4974462,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "rosetta",
+        "geometry"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 5,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "dcbf5a6349939dfa43abd692ba1615e0396dd4364d2d6fde10df5fd518b1fd99"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.5109589,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "baseline"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/wine",
+          "sha256": "b3bd3d064f81dca4d01f49a34afdbb0f653ae1e4b6f07415ccfa4863f65c1392"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/ntdll.so",
+          "sha256": "5b2a122e9a80d99f46704dc13452fd287f16fe0148a8bff178f18a52b838e253"
+        },
+        {
+          "architecture": "arm64",
+          "component": "wine/aarch64-unix/xtajit64.so",
+          "sha256": "20cbe32f4322973e661e37aa10bfeed04596d006a4fcca3e16f7cdce113f8211"
+        },
+        {
+          "architecture": "arm64",
+          "component": "switchyard-fex/lib/libswitchyard-fex.6.0.0.dylib",
+          "sha256": "3f66f57d8435a1aae8516e01550907e5bab84f55c6ce8d6dd3116cafcede871d"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.499353,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "geometry"
+    },
+    {
+      "actual_mach_images": [
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/wine",
+          "sha256": "6aeed4491dc54d0eefc2a681b28a39936ee1a56832a0f9844ee42a721096f15d"
+        },
+        {
+          "architecture": "x86_64",
+          "component": "wine/x86_64-unix/ntdll.so",
+          "sha256": "39a447e77e61a2ea1277fbee3093ee4af9ad8d09df92680beee2574393fc07cc"
+        }
+      ],
+      "byte_exact_reference": true,
+      "case": "fhourstones",
+      "custom_dispatch": false,
+      "direct_dispatch": false,
+      "exit_status": 0,
+      "identities_unchanged": true,
+      "main_wall_seconds": 0.287246,
+      "normalized_sha256": "9807dd634e10c3dcd024708a9b5cf314c7cd0a865f01f5f2a640024bc02c440b",
+      "order": [
+        "baseline",
+        "geometry",
+        "rosetta"
+      ],
+      "prefix_removed": true,
+      "program_correct": true,
+      "repetition": 6,
+      "runtime_failure_categories": [
+        "driver_load"
+      ],
+      "stratum": "fhourstones_precision",
+      "variant": "rosetta"
+    }
+  ],
+  "same_byte_metrics": {
+    "direct": {
+      "cold": {
+        "by_variant": {
+          "fex": {
+            "mad": 3.7999999999999975e-06,
+            "max": 2.87e-05,
+            "median": 2.4350000000000002e-05,
+            "min": 1.27e-05,
+            "n": 6,
+            "values": [
+              2.51e-05,
+              1.27e-05,
+              2.36e-05,
+              2.76e-05,
+              2.87e-05,
+              1.29e-05
+            ]
+          },
+          "rosetta": {
+            "mad": 1.5e-06,
+            "max": 1.87e-05,
+            "median": 1.425e-05,
+            "min": 1.15e-05,
+            "n": 6,
+            "values": [
+              1.3e-05,
+              1.55e-05,
+              1.87e-05,
+              1.29e-05,
+              1.15e-05,
+              1.59e-05
+            ]
+          },
+          "sdk": {
+            "mad": 5.500000000000005e-06,
+            "max": 4.1e-05,
+            "median": 3.5e-05,
+            "min": 2.1e-05,
+            "n": 6,
+            "values": [
+              3.7e-05,
+              4.1e-05,
+              3.3e-05,
+              2.4e-05,
+              4e-05,
+              2.1e-05
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.6600900225056263,
+          "max": 2.4956521739130433,
+          "median": 1.596400658165364,
+          "min": 0.8113207547169812,
+          "n": 6,
+          "values": [
+            1.930769230769231,
+            0.8193548387096774,
+            1.2620320855614973,
+            2.13953488372093,
+            2.4956521739130433,
+            0.8113207547169812
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.051607142857142796,
+          "max": 1.15,
+          "median": 0.6967649467649468,
+          "min": 0.3097560975609756,
+          "n": 6,
+          "values": [
+            0.6783783783783784,
+            0.3097560975609756,
+            0.7151515151515151,
+            1.15,
+            0.7174999999999999,
+            0.6142857142857143
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.5407239819004525,
+          "max": 3.4782608695652177,
+          "median": 2.2528132033008252,
+          "min": 1.320754716981132,
+          "n": 6,
+          "values": [
+            2.8461538461538463,
+            2.6451612903225805,
+            1.7647058823529413,
+            1.8604651162790697,
+            3.4782608695652177,
+            1.320754716981132
+          ]
+        }
+      },
+      "warm-long": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.0006864999999999996,
+            "max": 0.0515779,
+            "median": 0.0502642,
+            "min": 0.0484767,
+            "n": 6,
+            "values": [
+              0.0484767,
+              0.051243,
+              0.0515779,
+              0.050054,
+              0.04987,
+              0.0504744
+            ]
+          },
+          "rosetta": {
+            "mad": 8.315000000000058e-05,
+            "max": 0.0232044,
+            "median": 0.02198495,
+            "min": 0.0218954,
+            "n": 6,
+            "values": [
+              0.0218954,
+              0.0225732,
+              0.0232044,
+              0.0219082,
+              0.0219987,
+              0.0219712
+            ]
+          },
+          "sdk": {
+            "mad": 0.0008024999999999977,
+            "max": 0.055789,
+            "median": 0.050700999999999996,
+            "min": 0.049502,
+            "n": 6,
+            "values": [
+              0.049721,
+              0.055789,
+              0.051326,
+              0.049502,
+              0.050298,
+              0.051104
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.02249005999585929,
+          "max": 2.2972982813865426,
+          "median": 2.2685167367348775,
+          "min": 2.2140129890296594,
+          "n": 6,
+          "values": [
+            2.2140129890296594,
+            2.270081335388868,
+            2.2227637861784837,
+            2.284715312074931,
+            2.2669521380808866,
+            2.2972982813865426
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.014966743533072424,
+          "max": 1.0111510646034505,
+          "median": 0.9895853701917785,
+          "min": 0.9185144024807758,
+          "n": 6,
+          "values": [
+            0.9749743569115664,
+            0.9185144024807758,
+            1.0049078439777113,
+            1.0111510646034505,
+            0.9914907153365938,
+            0.9876800250469632
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.033217354677810285,
+          "max": 2.4714705934470964,
+          "median": 2.2786250552817364,
+          "min": 2.211908086397407,
+          "n": 6,
+          "values": [
+            2.2708422773733297,
+            2.4714705934470964,
+            2.211908086397407,
+            2.259519266758565,
+            2.286407833190143,
+            2.3259539761141856
+          ]
+        }
+      },
+      "warm-many": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.00042640000000000386,
+            "max": 0.0600943,
+            "median": 0.055571800000000005,
+            "min": 0.0549035,
+            "n": 6,
+            "values": [
+              0.0549035,
+              0.0599215,
+              0.0600943,
+              0.0555133,
+              0.0556303,
+              0.0553873
+            ]
+          },
+          "rosetta": {
+            "mad": 8.959999999999697e-05,
+            "max": 0.025528,
+            "median": 0.024323749999999998,
+            "min": 0.024209,
+            "n": 6,
+            "values": [
+              0.024209,
+              0.0249615,
+              0.025528,
+              0.0243771,
+              0.0242704,
+              0.0242593
+            ]
+          },
+          "sdk": {
+            "mad": 0.002807999999999977,
+            "max": 0.138241,
+            "median": 0.13272699999999998,
+            "min": 0.128919,
+            "n": 6,
+            "values": [
+              0.132078,
+              0.138241,
+              0.136558,
+              0.133376,
+              0.130919,
+              0.128919
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.015036401694758839,
+          "max": 2.4005568575606433,
+          "median": 2.2876207812441938,
+          "min": 2.2678962369366764,
+          "n": 6,
+          "values": [
+            2.2678962369366764,
+            2.4005568575606433,
+            2.354054371670323,
+            2.2772725221621934,
+            2.2921047860768673,
+            2.2831367764115202
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.008620114264913076,
+          "max": 0.4400642950248246,
+          "median": 0.4272750989663475,
+          "min": 0.4156899710776965,
+          "n": 6,
+          "values": [
+            0.4156899710776965,
+            0.433456789230402,
+            0.4400642950248246,
+            0.41621656070057583,
+            0.42492151635744235,
+            0.42962868157525264
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.061011309623868915,
+          "max": 5.538168779921079,
+          "median": 5.42496173139915,
+          "min": 5.3142093959842205,
+          "n": 6,
+          "values": [
+            5.455739600974844,
+            5.538168779921079,
+            5.349341899091195,
+            5.471364518338933,
+            5.394183861823456,
+            5.3142093959842205
+          ]
+        }
+      }
+    },
+    "indirect": {
+      "cold": {
+        "by_variant": {
+          "fex": {
+            "mad": 6.2e-06,
+            "max": 4.22e-05,
+            "median": 2.9900000000000002e-05,
+            "min": 1.72e-05,
+            "n": 6,
+            "values": [
+              3e-05,
+              1.72e-05,
+              4.22e-05,
+              2.98e-05,
+              2.16e-05,
+              3.4e-05
+            ]
+          },
+          "rosetta": {
+            "mad": 8.999999999999999e-07,
+            "max": 2.41e-05,
+            "median": 1.98e-05,
+            "min": 1.54e-05,
+            "n": 6,
+            "values": [
+              1.98e-05,
+              2.09e-05,
+              2.41e-05,
+              1.91e-05,
+              1.98e-05,
+              1.54e-05
+            ]
+          },
+          "sdk": {
+            "mad": 4.000000000000001e-06,
+            "max": 6e-05,
+            "median": 2.45e-05,
+            "min": 1.1e-05,
+            "n": 6,
+            "values": [
+              2.3e-05,
+              6e-05,
+              3.1e-05,
+              2.4e-05,
+              2.5e-05,
+              1.1e-05
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.3300641267446248,
+          "max": 2.2077922077922074,
+          "median": 1.5376804696176425,
+          "min": 0.8229665071770336,
+          "n": 6,
+          "values": [
+            1.5151515151515151,
+            0.8229665071770336,
+            1.7510373443983405,
+            1.5602094240837696,
+            1.0909090909090908,
+            2.2077922077922074
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.2486451612903226,
+          "max": 3.090909090909091,
+          "median": 1.2730072463768116,
+          "min": 0.2866666666666667,
+          "n": 6,
+          "values": [
+            1.3043478260869565,
+            0.2866666666666667,
+            1.3612903225806452,
+            1.2416666666666667,
+            0.864,
+            3.090909090909091
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.06234544616287363,
+          "max": 2.8708133971291865,
+          "median": 1.2595853826220318,
+          "min": 0.7142857142857142,
+          "n": 6,
+          "values": [
+            1.1616161616161615,
+            2.8708133971291865,
+            1.2863070539419088,
+            1.256544502617801,
+            1.2626262626262628,
+            0.7142857142857142
+          ]
+        }
+      },
+      "warm-long": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.0013689500000000007,
+            "max": 0.0584512,
+            "median": 0.05556665,
+            "min": 0.0536461,
+            "n": 6,
+            "values": [
+              0.0559508,
+              0.0551825,
+              0.0584512,
+              0.0578113,
+              0.0547493,
+              0.0536461
+            ]
+          },
+          "rosetta": {
+            "mad": 0.0013518999999999996,
+            "max": 0.0643145,
+            "median": 0.0603645,
+            "min": 0.0584646,
+            "n": 6,
+            "values": [
+              0.0613275,
+              0.0605801,
+              0.0643145,
+              0.0584646,
+              0.0601489,
+              0.0586237
+            ]
+          },
+          "sdk": {
+            "mad": 0.001008000000000002,
+            "max": 0.057621,
+            "median": 0.055030499999999996,
+            "min": 0.05258,
+            "n": 6,
+            "values": [
+              0.054229,
+              0.057621,
+              0.054046,
+              0.055832,
+              0.05258,
+              0.056062
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.002083064402794099,
+          "max": 0.9888257167585172,
+          "median": 0.9116147546552698,
+          "min": 0.9088339332498893,
+          "n": 6,
+          "values": [
+            0.9123280746810158,
+            0.9109014346295237,
+            0.9088339332498893,
+            0.9888257167585172,
+            0.910229447255062,
+            0.9150923602570292
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.027781970754370167,
+          "max": 1.0815083447433669,
+          "median": 1.033600767611988,
+          "min": 0.9569066390781635,
+          "n": 6,
+          "values": [
+            1.031750539379299,
+            0.9576803595911214,
+            1.0815083447433669,
+            1.035450995844677,
+            1.0412571319893495,
+            0.9569066390781635
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.03793359645151667,
+          "max": 0.9563026557518546,
+          "median": 0.9177032525773818,
+          "min": 0.8403392703045192,
+          "n": 6,
+          "values": [
+            0.8842525783702254,
+            0.9511539267845381,
+            0.8403392703045192,
+            0.9549710423059424,
+            0.8741639497979182,
+            0.9563026557518546
+          ]
+        }
+      },
+      "warm-many": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.0011030500000000013,
+            "max": 0.0606392,
+            "median": 0.0592136,
+            "min": 0.0545391,
+            "n": 6,
+            "values": [
+              0.0600571,
+              0.0596108,
+              0.0606392,
+              0.0588164,
+              0.0545391,
+              0.057851
+            ]
+          },
+          "rosetta": {
+            "mad": 0.0009057000000000093,
+            "max": 0.0681408,
+            "median": 0.06706509999999999,
+            "min": 0.0648497,
+            "n": 6,
+            "values": [
+              0.0681408,
+              0.0675788,
+              0.0678008,
+              0.0649,
+              0.0648497,
+              0.0665514
+            ]
+          },
+          "sdk": {
+            "mad": 0.0011675000000000157,
+            "max": 0.13692,
+            "median": 0.13563799999999998,
+            "min": 0.131954,
+            "n": 6,
+            "values": [
+              0.135464,
+              0.136691,
+              0.133472,
+              0.13692,
+              0.135812,
+              0.131954
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.012552481721386177,
+          "max": 0.9062619414483821,
+          "median": 0.8817304491498807,
+          "min": 0.841007745602524,
+          "n": 6,
+          "values": [
+            0.8813676974734668,
+            0.8820932008262947,
+            0.8943729277530649,
+            0.9062619414483821,
+            0.841007745602524,
+            0.8692679643102925
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.006887994117801222,
+          "max": 0.4543215056341404,
+          "median": 0.43725843600198655,
+          "min": 0.4015779165316762,
+          "n": 6,
+          "values": [
+            0.44334361896887736,
+            0.43609893848168496,
+            0.4543215056341404,
+            0.4295676307332749,
+            0.4015779165316762,
+            0.4384179335222881
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.029681683731027975,
+          "max": 2.1097072419106317,
+          "median": 2.005345931423853,
+          "min": 1.9685903411169192,
+          "n": 6,
+          "values": [
+            1.9880013149243918,
+            2.0226905479233137,
+            1.9685903411169192,
+            2.1097072419106317,
+            2.094257953390686,
+            1.9827381542687306
+          ]
+        }
+      }
+    },
+    "register": {
+      "cold": {
+        "by_variant": {
+          "fex": {
+            "mad": 5.999999999999993e-07,
+            "max": 2.89e-05,
+            "median": 1.9149999999999998e-05,
+            "min": 1.84e-05,
+            "n": 6,
+            "values": [
+              1.96e-05,
+              2.89e-05,
+              1.84e-05,
+              1.84e-05,
+              1.87e-05,
+              1.96e-05
+            ]
+          },
+          "rosetta": {
+            "mad": 2.9999999999999967e-07,
+            "max": 1.31e-05,
+            "median": 1.255e-05,
+            "min": 1.2e-05,
+            "n": 6,
+            "values": [
+              1.31e-05,
+              1.23e-05,
+              1.29e-05,
+              1.2e-05,
+              1.25e-05,
+              1.26e-05
+            ]
+          },
+          "sdk": {
+            "mad": 8.500000000000003e-06,
+            "max": 0.000327,
+            "median": 0.0001675,
+            "min": 0.000103,
+            "n": 6,
+            "values": [
+              0.000327,
+              0.000103,
+              0.000165,
+              0.00017,
+              0.000155,
+              0.000172
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.029777777777777792,
+          "max": 2.3495934959349594,
+          "median": 1.5147582697201016,
+          "min": 1.426356589147287,
+          "n": 6,
+          "values": [
+            1.49618320610687,
+            2.3495934959349594,
+            1.426356589147287,
+            1.5333333333333332,
+            1.496,
+            1.5555555555555556
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.006204933586337766,
+          "max": 0.28058252427184466,
+          "median": 0.11273431994362226,
+          "min": 0.0599388379204893,
+          "n": 6,
+          "values": [
+            0.0599388379204893,
+            0.28058252427184466,
+            0.11151515151515151,
+            0.10823529411764705,
+            0.12064516129032259,
+            0.11395348837209301
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.8833333333333346,
+          "max": 24.9618320610687,
+          "median": 13.220745662606127,
+          "min": 8.373983739837398,
+          "n": 6,
+          "values": [
+            24.9618320610687,
+            8.373983739837398,
+            12.790697674418604,
+            14.166666666666668,
+            12.399999999999999,
+            13.650793650793652
+          ]
+        }
+      },
+      "warm-long": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.00027905000000000117,
+            "max": 0.0169316,
+            "median": 0.01606415,
+            "min": 0.0153719,
+            "n": 6,
+            "values": [
+              0.0161449,
+              0.0153719,
+              0.0169316,
+              0.015829,
+              0.0163871,
+              0.0159834
+            ]
+          },
+          "rosetta": {
+            "mad": 0.00035270000000000093,
+            "max": 0.017208,
+            "median": 0.0163704,
+            "min": 0.0159138,
+            "n": 6,
+            "values": [
+              0.0163431,
+              0.0170094,
+              0.017208,
+              0.0161216,
+              0.0159138,
+              0.0163977
+            ]
+          },
+          "sdk": {
+            "mad": 0.0001860000000000004,
+            "max": 0.017685,
+            "median": 0.0165075,
+            "min": 0.015967,
+            "n": 6,
+            "values": [
+              0.017685,
+              0.01645,
+              0.015967,
+              0.016565,
+              0.016295,
+              0.016667
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.00656914816278964,
+          "max": 1.0297414822355442,
+          "median": 0.9828940700374965,
+          "min": 0.9037297023998495,
+          "n": 6,
+          "values": [
+            0.9878725578378643,
+            0.9037297023998495,
+            0.9839377033937704,
+            0.9818504366812226,
+            1.0297414822355442,
+            0.974734261512285
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.03358844265675487,
+          "max": 1.0604120999561597,
+          "median": 0.9572768955124971,
+          "min": 0.912914899632457,
+          "n": 6,
+          "values": [
+            0.912914899632457,
+            0.9344620060790274,
+            1.0604120999561597,
+            0.9555689707214005,
+            1.0056520405032219,
+            0.9589848203035938
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.03019558549574486,
+          "max": 1.0821080455972245,
+          "median": 1.0201885436977212,
+          "min": 0.9278823802882379,
+          "n": 6,
+          "values": [
+            1.0821080455972245,
+            0.9671123026091455,
+            0.9278823802882379,
+            1.0275034736006352,
+            1.0239540524576156,
+            1.0164230349378267
+          ]
+        }
+      },
+      "warm-many": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.0003268000000000021,
+            "max": 0.0195687,
+            "median": 0.0191192,
+            "min": 0.0174549,
+            "n": 6,
+            "values": [
+              0.0189849,
+              0.0195687,
+              0.0193233,
+              0.0192535,
+              0.0182927,
+              0.0174549
+            ]
+          },
+          "rosetta": {
+            "mad": 0.00020750000000000022,
+            "max": 0.0161417,
+            "median": 0.0151407,
+            "min": 0.0149089,
+            "n": 6,
+            "values": [
+              0.0153138,
+              0.0158936,
+              0.0161417,
+              0.0149575,
+              0.0149676,
+              0.0149089
+            ]
+          },
+          "sdk": {
+            "mad": 0.0007654999999999954,
+            "max": 0.103927,
+            "median": 0.096912,
+            "min": 0.095887,
+            "n": 6,
+            "values": [
+              0.097014,
+              0.099545,
+              0.09681,
+              0.096406,
+              0.103927,
+              0.095887
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.021310279877151617,
+          "max": 1.287213772355006,
+          "median": 1.226692311640522,
+          "min": 1.1707704793780895,
+          "n": 6,
+          "values": [
+            1.239724953963092,
+            1.2312314390698142,
+            1.1971043942087887,
+            1.287213772355006,
+            1.2221531842112296,
+            1.1707704793780895
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.003519550759728207,
+          "max": 0.19971267348505278,
+          "median": 0.19613690993693517,
+          "min": 0.17601489507057835,
+          "n": 6,
+          "values": [
+            0.19569237429649328,
+            0.19658144557737708,
+            0.19960024790827396,
+            0.19971267348505278,
+            0.17601489507057835,
+            0.1820361467143617
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.09105778249864427,
+          "max": 6.943464550094872,
+          "median": 6.3832989027996705,
+          "min": 5.997509555994722,
+          "n": 6,
+          "values": [
+            6.335070328723113,
+            6.263212865555946,
+            5.997509555994722,
+            6.445328430553235,
+            6.943464550094872,
+            6.431527476876228
+          ]
+        }
+      }
+    },
+    "scalar": {
+      "cold": {
+        "by_variant": {
+          "fex": {
+            "mad": 1.2000000000000004e-06,
+            "max": 2.91e-05,
+            "median": 2.515e-05,
+            "min": 2.03e-05,
+            "n": 6,
+            "values": [
+              2.03e-05,
+              2.44e-05,
+              2.42e-05,
+              2.66e-05,
+              2.59e-05,
+              2.91e-05
+            ]
+          },
+          "rosetta": {
+            "mad": 8.999999999999999e-07,
+            "max": 1.74e-05,
+            "median": 1.135e-05,
+            "min": 9.6e-06,
+            "n": 6,
+            "values": [
+              1.19e-05,
+              1.08e-05,
+              1.74e-05,
+              1.24e-05,
+              1.06e-05,
+              9.6e-06
+            ]
+          },
+          "sdk": {
+            "mad": 5.000000000000001e-06,
+            "max": 3.7e-05,
+            "median": 2.9e-05,
+            "min": 2e-05,
+            "n": 6,
+            "values": [
+              2.6e-05,
+              3.6e-05,
+              2.7e-05,
+              3.1e-05,
+              3.7e-05,
+              2e-05
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.36875693673695886,
+          "max": 3.03125,
+          "median": 2.20221027479092,
+          "min": 1.3908045977011494,
+          "n": 6,
+          "values": [
+            1.7058823529411764,
+            2.259259259259259,
+            1.3908045977011494,
+            2.1451612903225805,
+            2.443396226415094,
+            3.03125
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.0981481481481481,
+          "max": 1.4549999999999998,
+          "median": 0.8194168734491315,
+          "min": 0.6777777777777778,
+          "n": 6,
+          "values": [
+            0.7807692307692308,
+            0.6777777777777778,
+            0.8962962962962963,
+            0.8580645161290322,
+            0.7000000000000001,
+            1.4549999999999998
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.5249082391577317,
+          "max": 3.490566037735849,
+          "median": 2.3424369747899156,
+          "min": 1.5517241379310345,
+          "n": 6,
+          "values": [
+            2.1848739495798317,
+            3.3333333333333335,
+            1.5517241379310345,
+            2.5,
+            3.490566037735849,
+            2.0833333333333335
+          ]
+        }
+      },
+      "warm-long": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.0004808499999999997,
+            "max": 0.0259439,
+            "median": 0.025093999999999998,
+            "min": 0.0244049,
+            "n": 6,
+            "values": [
+              0.0246193,
+              0.0255304,
+              0.0259439,
+              0.025581,
+              0.0246576,
+              0.0244049
+            ]
+          },
+          "rosetta": {
+            "mad": 0.00014025000000000148,
+            "max": 0.0171155,
+            "median": 0.01604355,
+            "min": 0.0158846,
+            "n": 6,
+            "values": [
+              0.0160601,
+              0.0166575,
+              0.0171155,
+              0.015922,
+              0.016027,
+              0.0158846
+            ]
+          },
+          "sdk": {
+            "mad": 8.799999999999954e-05,
+            "max": 0.026481,
+            "median": 0.024912999999999998,
+            "min": 0.024544,
+            "n": 6,
+            "values": [
+              0.024931,
+              0.024895,
+              0.024787,
+              0.024544,
+              0.026481,
+              0.024963
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.00291840402406629,
+          "max": 1.6066448938575557,
+          "median": 1.5346677790455774,
+          "min": 1.5158131518214484,
+          "n": 6,
+          "values": [
+            1.5329481136481091,
+            1.5326669668317576,
+            1.5158131518214484,
+            1.6066448938575557,
+            1.5385037748798902,
+            1.5363874444430456
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.032303870190724504,
+          "max": 1.0466736595796182,
+          "median": 1.006510345255053,
+          "min": 0.9311430837204032,
+          "n": 6,
+          "values": [
+            0.9874974930809034,
+            1.0255231974292027,
+            1.0466736595796182,
+            1.0422506518904824,
+            0.9311430837204032,
+            0.9776429115090334
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.03850005803810308,
+          "max": 1.6522742871404505,
+          "median": 1.5469356730539485,
+          "min": 1.4482194502059538,
+          "n": 6,
+          "values": [
+            1.5523564610432063,
+            1.4945219870929012,
+            1.4482194502059538,
+            1.5415148850646905,
+            1.6522742871404505,
+            1.5715221031691073
+          ]
+        }
+      },
+      "warm-many": {
+        "by_variant": {
+          "fex": {
+            "mad": 7.820000000000223e-05,
+            "max": 0.0302557,
+            "median": 0.027830300000000002,
+            "min": 0.0277498,
+            "n": 6,
+            "values": [
+              0.0277544,
+              0.0278014,
+              0.0302557,
+              0.0281311,
+              0.0278592,
+              0.0277498
+            ]
+          },
+          "rosetta": {
+            "mad": 0.0002164499999999991,
+            "max": 0.0168263,
+            "median": 0.0156771,
+            "min": 0.0154284,
+            "n": 6,
+            "values": [
+              0.0157157,
+              0.0164632,
+              0.0168263,
+              0.0154284,
+              0.0154929,
+              0.0156385
+            ]
+          },
+          "sdk": {
+            "mad": 0.00010199999999999793,
+            "max": 0.113048,
+            "median": 0.106105,
+            "min": 0.105872,
+            "n": 6,
+            "values": [
+              0.106139,
+              0.106071,
+              0.106194,
+              0.10599,
+              0.113048,
+              0.105872
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.016080640713424077,
+          "max": 1.8233322962847736,
+          "median": 1.7862868410269628,
+          "min": 1.6886996452694494,
+          "n": 6,
+          "values": [
+            1.7660301481957532,
+            1.6886996452694494,
+            1.7981196103718584,
+            1.8233322962847736,
+            1.7981914296226014,
+            1.774454071682067
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.0019608555924011117,
+          "max": 0.28490969357967494,
+          "median": 0.2621044362147318,
+          "min": 0.24643691175429908,
+          "n": 6,
+          "values": [
+            0.2614910636052723,
+            0.2621017997379114,
+            0.28490969357967494,
+            0.2654127747900745,
+            0.24643691175429908,
+            0.2621070726915521
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.21344172284163188,
+          "max": 7.296761742475585,
+          "median": 6.7618254616700195,
+          "min": 6.31119140868759,
+          "n": 6,
+          "values": [
+            6.753692167704907,
+            6.442915107633995,
+            6.31119140868759,
+            6.869798553317259,
+            7.296761742475585,
+            6.769958755635131
+          ]
+        }
+      }
+    },
+    "simd": {
+      "cold": {
+        "by_variant": {
+          "fex": {
+            "mad": 2.4499999999999986e-06,
+            "max": 3.6e-05,
+            "median": 1.8599999999999998e-05,
+            "min": 1.52e-05,
+            "n": 6,
+            "values": [
+              1.71e-05,
+              1.76e-05,
+              3.6e-05,
+              2.33e-05,
+              1.96e-05,
+              1.52e-05
+            ]
+          },
+          "rosetta": {
+            "mad": 2.5999999999999997e-06,
+            "max": 2.06e-05,
+            "median": 1.325e-05,
+            "min": 9.7e-06,
+            "n": 6,
+            "values": [
+              9.7e-06,
+              1.28e-05,
+              1.37e-05,
+              1.16e-05,
+              1.98e-05,
+              2.06e-05
+            ]
+          },
+          "sdk": {
+            "mad": 4.500000000000001e-06,
+            "max": 0.000259,
+            "median": 5.75e-05,
+            "min": 3.4e-05,
+            "n": 6,
+            "values": [
+              6.1e-05,
+              5.4e-05,
+              5.3e-05,
+              6.2e-05,
+              0.000259,
+              3.4e-05
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.5093608498780912,
+          "max": 2.6277372262773726,
+          "median": 1.5689432989690721,
+          "min": 0.7378640776699029,
+          "n": 6,
+          "values": [
+            1.762886597938144,
+            1.3750000000000002,
+            2.6277372262773726,
+            2.008620689655172,
+            0.9898989898989898,
+            0.7378640776699029
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.08336547733847638,
+          "max": 0.6792452830188679,
+          "median": 0.35086618876941456,
+          "min": 0.07567567567567567,
+          "n": 6,
+          "values": [
+            0.28032786885245903,
+            0.32592592592592595,
+            0.6792452830188679,
+            0.3758064516129032,
+            0.07567567567567567,
+            0.4470588235294118
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 1.2100233275641505,
+          "max": 13.080808080808081,
+          "median": 4.781788793103448,
+          "min": 1.650485436893204,
+          "n": 6,
+          "values": [
+            6.288659793814433,
+            4.21875,
+            3.8686131386861318,
+            5.344827586206897,
+            13.080808080808081,
+            1.650485436893204
+          ]
+        }
+      },
+      "warm-long": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.0001438499999999992,
+            "max": 0.0234879,
+            "median": 0.0222436,
+            "min": 0.0219611,
+            "n": 6,
+            "values": [
+              0.0223195,
+              0.0220388,
+              0.0234879,
+              0.0223265,
+              0.0221677,
+              0.0219611
+            ]
+          },
+          "rosetta": {
+            "mad": 0.000277999999999997,
+            "max": 0.0174271,
+            "median": 0.016266299999999997,
+            "min": 0.0159408,
+            "n": 6,
+            "values": [
+              0.0164887,
+              0.0170477,
+              0.0174271,
+              0.0159408,
+              0.0160358,
+              0.0160439
+            ]
+          },
+          "sdk": {
+            "mad": 1.6999999999999654e-05,
+            "max": 0.023552,
+            "median": 0.02196,
+            "min": 0.02194,
+            "n": 6,
+            "values": [
+              0.022236,
+              0.02197,
+              0.02195,
+              0.02194,
+              0.023552,
+              0.021946
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.017303987529141862,
+          "max": 1.400588427180568,
+          "median": 1.36121853309097,
+          "min": 1.2927726320852668,
+          "n": 6,
+          "values": [
+            1.3536239970403974,
+            1.2927726320852668,
+            1.3477801814415478,
+            1.400588427180568,
+            1.3823881564998315,
+            1.368813069141543
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.008464086789310765,
+          "max": 1.0700637813211844,
+          "median": 1.0034433574033441,
+          "min": 0.9412236752717391,
+          "n": 6,
+          "values": [
+            1.003755171793488,
+            1.0031315430132,
+            1.0700637813211844,
+            1.017616226071103,
+            0.9412236752717391,
+            1.0006880524924815
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.04380278503447366,
+          "max": 1.4687137529777123,
+          "median": 1.3582159121633,
+          "min": 1.2595325670937791,
+          "n": 6,
+          "values": [
+            1.3485599228562593,
+            1.2887368970594275,
+            1.2595325670937791,
+            1.3763424671283748,
+            1.4687137529777123,
+            1.3678719014703409
+          ]
+        }
+      },
+      "warm-many": {
+        "by_variant": {
+          "fex": {
+            "mad": 0.0001565999999999998,
+            "max": 0.0265754,
+            "median": 0.02616935,
+            "min": 0.0258287,
+            "n": 6,
+            "values": [
+              0.0261891,
+              0.0258287,
+              0.0265754,
+              0.0264285,
+              0.0261496,
+              0.0261153
+            ]
+          },
+          "rosetta": {
+            "mad": 7.035000000000027e-05,
+            "max": 0.0165541,
+            "median": 0.0153236,
+            "min": 0.015246,
+            "n": 6,
+            "values": [
+              0.0153847,
+              0.0160235,
+              0.0165541,
+              0.015246,
+              0.0152605,
+              0.0152625
+            ]
+          },
+          "sdk": {
+            "mad": 0.0002500000000000002,
+            "max": 0.10527,
+            "median": 0.10344249999999999,
+            "min": 0.103008,
+            "n": 6,
+            "values": [
+              0.103738,
+              0.103628,
+              0.103238,
+              0.103257,
+              0.10527,
+              0.103008
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.016830409370064192,
+          "max": 1.7334710743801653,
+          "median": 1.7066791522622058,
+          "min": 1.6053666463293081,
+          "n": 6,
+          "values": [
+            1.7022821374482442,
+            1.6119262333447748,
+            1.6053666463293081,
+            1.7334710743801653,
+            1.7135480488843746,
+            1.7110761670761672
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.003352168265174732,
+          "max": 0.25741877990662354,
+          "median": 0.2529905851505128,
+          "min": 0.24840505367151133,
+          "n": 6,
+          "values": [
+            0.25245425976980473,
+            0.24924441270699038,
+            0.25741877990662354,
+            0.25594874923733985,
+            0.24840505367151133,
+            0.2535269105312209
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.08945234412946057,
+          "max": 6.898201238491531,
+          "median": 6.7460119114799415,
+          "min": 6.236400649990033,
+          "n": 6,
+          "values": [
+            6.742932913868974,
+            6.467251224763628,
+            6.236400649990033,
+            6.772727272727273,
+            6.898201238491531,
+            6.749090909090909
+          ]
+        }
+      }
+    },
+    "stack": {
+      "cold": {
+        "by_variant": {
+          "fex": {
+            "mad": 1.2500000000000016e-06,
+            "max": 2.85e-05,
+            "median": 1.865e-05,
+            "min": 8.1e-06,
+            "n": 6,
+            "values": [
+              1.94e-05,
+              8.1e-06,
+              2.85e-05,
+              2e-05,
+              1.79e-05,
+              1.75e-05
+            ]
+          },
+          "rosetta": {
+            "mad": 1.6499999999999994e-06,
+            "max": 0.0001005,
+            "median": 1.345e-05,
+            "min": 1.13e-05,
+            "n": 6,
+            "values": [
+              0.0001005,
+              1.44e-05,
+              3.28e-05,
+              1.25e-05,
+              1.23e-05,
+              1.13e-05
+            ]
+          },
+          "sdk": {
+            "mad": 2.9999999999999984e-06,
+            "max": 3.1e-05,
+            "median": 2e-05,
+            "min": 1.3e-05,
+            "n": 6,
+            "values": [
+              2e-05,
+              2.6e-05,
+              2e-05,
+              2e-05,
+              3.1e-05,
+              1.3e-05
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.41224278725088126,
+          "max": 1.6,
+          "median": 1.1620934959349594,
+          "min": 0.19303482587064677,
+          "n": 6,
+          "values": [
+            0.19303482587064677,
+            0.5625,
+            0.8689024390243903,
+            1.6,
+            1.4552845528455285,
+            1.5486725663716812
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.3843672456575682,
+          "max": 1.425,
+          "median": 0.985,
+          "min": 0.3115384615384616,
+          "n": 6,
+          "values": [
+            0.97,
+            0.3115384615384616,
+            1.425,
+            1.0,
+            0.5774193548387097,
+            1.346153846153846
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.5978997289972899,
+          "max": 2.5203252032520322,
+          "median": 1.3752212389380531,
+          "min": 0.19900497512437812,
+          "n": 6,
+          "values": [
+            0.19900497512437812,
+            1.8055555555555556,
+            0.6097560975609757,
+            1.6,
+            2.5203252032520322,
+            1.1504424778761062
+          ]
+        }
+      },
+      "warm-long": {
+        "by_variant": {
+          "fex": {
+            "mad": 4.7900000000000026e-05,
+            "max": 0.0220969,
+            "median": 0.0220172,
+            "min": 0.0219186,
+            "n": 6,
+            "values": [
+              0.0220765,
+              0.0219807,
+              0.0220969,
+              0.0220301,
+              0.0220043,
+              0.0219186
+            ]
+          },
+          "rosetta": {
+            "mad": 0.00010094999999999896,
+            "max": 0.0382784,
+            "median": 0.0366292,
+            "min": 0.036524,
+            "n": 6,
+            "values": [
+              0.0367182,
+              0.0375406,
+              0.0382784,
+              0.036524,
+              0.0365325,
+              0.0365402
+            ]
+          },
+          "sdk": {
+            "mad": 8.499999999999827e-06,
+            "max": 0.022286,
+            "median": 0.021908,
+            "min": 0.021892,
+            "n": 6,
+            "values": [
+              0.022286,
+              0.021911,
+              0.021894,
+              0.021909,
+              0.021892,
+              0.021907
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.0021993605819201067,
+          "max": 0.603167780089804,
+          "median": 0.6005451398783654,
+          "min": 0.5772681198796188,
+          "n": 6,
+          "values": [
+            0.6012413462533567,
+            0.5855180790930352,
+            0.5772681198796188,
+            0.603167780089804,
+            0.6023212208307671,
+            0.5998489335033743
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.0024989488561268924,
+          "max": 1.0092673791906457,
+          "median": 1.0041553891841388,
+          "min": 0.9905994794938526,
+          "n": 6,
+          "values": [
+            0.9905994794938526,
+            1.0031810506138468,
+            1.0092673791906457,
+            1.0055274088274224,
+            1.0051297277544309,
+            1.0005295111151686
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.004010197557006712,
+          "max": 0.6069469636311148,
+          "median": 0.5993893602633694,
+          "min": 0.5719674803544559,
+          "n": 6,
+          "values": [
+            0.6069469636311148,
+            0.5836614225665013,
+            0.5719674803544559,
+            0.5998521520096375,
+            0.59924724560323,
+            0.5995314749235089
+          ]
+        }
+      },
+      "warm-many": {
+        "by_variant": {
+          "fex": {
+            "mad": 8.534999999999966e-05,
+            "max": 0.0271734,
+            "median": 0.02653585,
+            "min": 0.0260937,
+            "n": 6,
+            "values": [
+              0.0265977,
+              0.026427,
+              0.0271734,
+              0.026541,
+              0.0265307,
+              0.0260937
+            ]
+          },
+          "rosetta": {
+            "mad": 0.00023345000000000136,
+            "max": 0.0207141,
+            "median": 0.02010295,
+            "min": 0.019844,
+            "n": 6,
+            "values": [
+              0.0200631,
+              0.0204276,
+              0.0207141,
+              0.019895,
+              0.0201428,
+              0.019844
+            ]
+          },
+          "sdk": {
+            "mad": 0.0007379999999999956,
+            "max": 0.104103,
+            "median": 0.10316349999999999,
+            "min": 0.101981,
+            "n": 6,
+            "values": [
+              0.104103,
+              0.101981,
+              0.102374,
+              0.103444,
+              0.10385,
+              0.102883
+            ]
+          }
+        },
+        "fex_rosetta": {
+          "mad": 0.006935668655501548,
+          "max": 1.3340537823573762,
+          "median": 1.3160361154695526,
+          "min": 1.2936908887975092,
+          "n": 6,
+          "values": [
+            1.3257024088999207,
+            1.2936908887975092,
+            1.3118310715889177,
+            1.3340537823573762,
+            1.3171306868955657,
+            1.3149415440435397
+          ]
+        },
+        "fex_sdk": {
+          "mad": 0.0014856693073773408,
+          "max": 0.2654326293785531,
+          "median": 0.2560338415114017,
+          "min": 0.2536249914951936,
+          "n": 6,
+          "values": [
+            0.25549407798046164,
+            0.2591365058197115,
+            0.2654326293785531,
+            0.2565736050423417,
+            0.2554713529128551,
+            0.2536249914951936
+          ]
+        },
+        "sdk_rosetta": {
+          "mad": 0.023999288380422534,
+          "max": 5.199497361146016,
+          "median": 5.170139092687524,
+          "min": 4.942237413163015,
+          "n": 6,
+          "values": [
+            5.188779400989877,
+            4.992314319841783,
+            4.942237413163015,
+            5.199497361146016,
+            5.155688384931588,
+            5.184589800443459
+          ]
+        }
+      }
+    }
+  },
+  "wall_seconds_not_cycles": true,
+  "whole_program_metrics": {
+    "bullet": {
+      "main_wall_seconds": {
+        "baseline_rosetta": {
+          "mad": 0.009240033411448634,
+          "max": 2.1881543804742805,
+          "median": 2.1628727998447945,
+          "min": 2.137932083489827,
+          "n": 6,
+          "values": [
+            2.1578516732098794,
+            2.137932083489827,
+            2.175419826451937,
+            2.1881543804742805,
+            2.1569397596290396,
+            2.1678939264797097
+          ]
+        },
+        "by_variant": {
+          "baseline": {
+            "mad": 0.03524489999999991,
+            "max": 4.6855693,
+            "median": 4.6390317,
+            "min": 4.56805,
+            "n": 6,
+            "values": [
+              4.6210536,
+              4.56805,
+              4.6629839,
+              4.6570098,
+              4.5847327,
+              4.6855693
+            ]
+          },
+          "geometry": {
+            "mad": 0.0339444999999996,
+            "max": 4.6330587,
+            "median": 4.5377512,
+            "min": 4.5036661,
+            "n": 6,
+            "values": [
+              4.5111472,
+              4.5036661,
+              4.5039473,
+              4.5643552,
+              4.6330587,
+              4.6245535
+            ]
+          },
+          "rosetta": {
+            "mad": 0.00760240000000012,
+            "max": 2.1613462,
+            "median": 2.13908705,
+            "min": 2.1255729,
+            "n": 6,
+            "values": [
+              2.1415066,
+              2.1366675,
+              2.1434869,
+              2.1282821,
+              2.1255729,
+              2.1613462
+            ]
+          }
+        },
+        "geometry_baseline": {
+          "mad": 0.005380886277139618,
+          "max": 1.010540636316704,
+          "median": 0.9830049386476174,
+          "min": 0.9658938131868737,
+          "n": 6,
+          "values": [
+            0.9762161598818071,
+            0.9859056052363699,
+            0.9658938131868737,
+            0.9801042720588649,
+            1.010540636316704,
+            0.9869779324360863
+          ]
+        },
+        "geometry_rosetta": {
+          "mad": 0.01904489110584029,
+          "max": 2.1796752771923282,
+          "median": 2.123731345012492,
+          "min": 2.1012245514539885,
+          "n": 6,
+          "values": [
+            2.1065296740154804,
+            2.1077992247272914,
+            2.1012245514539885,
+            2.144619456227161,
+            2.1796752771923282,
+            2.139663465297693
+          ]
+        }
+      }
+    },
+    "fhourstones": {
+      "main_wall_seconds": {
+        "baseline_rosetta": {
+          "mad": 0.0667553032492767,
+          "max": 1.9552062817676161,
+          "median": 1.7758722640312377,
+          "min": 1.691963304536359,
+          "n": 6,
+          "values": [
+            1.7926982764290684,
+            1.7590462516334069,
+            1.9435428595282596,
+            1.691963304536359,
+            1.9552062817676161,
+            1.726270617027563
+          ]
+        },
+        "by_variant": {
+          "baseline": {
+            "mad": 0.014224699999999979,
+            "max": 0.5773193,
+            "median": 0.51517395,
+            "min": 0.5007388,
+            "n": 6,
+            "values": [
+              0.5178693,
+              0.5124786,
+              0.5773193,
+              0.5011597,
+              0.575889,
+              0.5007388
+            ]
+          },
+          "geometry": {
+            "mad": 0.009138300000000016,
+            "max": 0.5440437,
+            "median": 0.506464,
+            "min": 0.4969171,
+            "n": 6,
+            "values": [
+              0.4969171,
+              0.5000585,
+              0.4977343,
+              0.5440437,
+              0.5197935,
+              0.5128695
+            ]
+          },
+          "rosetta": {
+            "mad": 0.003065200000000018,
+            "max": 0.2970448,
+            "median": 0.29294010000000004,
+            "min": 0.288877,
+            "n": 6,
+            "values": [
+              0.288877,
+              0.2913389,
+              0.2970448,
+              0.2962001,
+              0.2945413,
+              0.2900697
+            ]
+          }
+        },
+        "geometry_baseline": {
+          "mad": 0.060816198090513196,
+          "max": 1.0855695300320438,
+          "median": 0.9676530878353149,
+          "min": 0.8621473420341222,
+          "n": 6,
+          "values": [
+            0.9595415291078271,
+            0.9757646465628027,
+            0.8621473420341222,
+            1.0855695300320438,
+            0.9025932080661379,
+            1.0242256042471642
+          ]
+        },
+        "geometry_rosetta": {
+          "mad": 0.02583771090324327,
+          "max": 1.8367438093369988,
+          "median": 1.742462177842706,
+          "min": 1.6756203104716865,
+          "n": 6,
+          "values": [
+            1.7201684453937143,
+            1.7164151440126942,
+            1.6756203104716865,
+            1.8367438093369988,
+            1.7647559102916976,
+            1.7680905658191808
+          ]
+        }
+      }
+    },
+    "python": {
+      "blob_wall_seconds": {
+        "baseline_rosetta": {
+          "mad": 0.06956694280916009,
+          "max": 6.079720085700634,
+          "median": 5.955923925124672,
+          "min": 5.221678340590097,
+          "n": 6,
+          "values": [
+            6.079720085700634,
+            5.221678340590097,
+            5.941968423771825,
+            5.971261650167031,
+            5.96987942647752,
+            5.772290190715876
+          ]
+        },
+        "by_variant": {
+          "baseline": {
+            "mad": 0.00016995000000000204,
+            "max": 0.0396793,
+            "median": 0.039204550000000005,
+            "min": 0.0386164,
+            "n": 6,
+            "values": [
+              0.0394434,
+              0.0386164,
+              0.0391035,
+              0.0391458,
+              0.0392633,
+              0.0396793
+            ]
+          },
+          "geometry": {
+            "mad": 0.00011845000000000258,
+            "max": 0.0381069,
+            "median": 0.0377653,
+            "min": 0.0376428,
+            "n": 6,
+            "values": [
+              0.0376428,
+              0.0377813,
+              0.0381069,
+              0.0376509,
+              0.037905,
+              0.0377493
+            ]
+          },
+          "rosetta": {
+            "mad": 5.7200000000000306e-05,
+            "max": 0.0073954,
+            "median": 0.0065789,
+            "min": 0.0064877,
+            "n": 6,
+            "values": [
+              0.0064877,
+              0.0073954,
+              0.0065809,
+              0.0065557,
+              0.0065769,
+              0.0068741
+            ]
+          }
+        },
+        "geometry_baseline": {
+          "mad": 0.010082006588322812,
+          "max": 0.9783744730218248,
+          "median": 0.9636086741235568,
+          "min": 0.9513600290327702,
+          "n": 6,
+          "values": [
+            0.9543497771490286,
+            0.9783744730218248,
+            0.9745137903256742,
+            0.9618119951565686,
+            0.9654053530905451,
+            0.9513600290327702
+          ]
+        },
+        "geometry_rosetta": {
+          "mad": 0.04306252129332888,
+          "max": 5.802179508916873,
+          "median": 5.753292318487784,
+          "min": 5.108756794764313,
+          "n": 6,
+          "values": [
+            5.802179508916873,
+            5.108756794764313,
+            5.7905301706453525,
+            5.743231081349055,
+            5.763353555626511,
+            5.49152616342503
+          ]
+        }
+      },
+      "compression_wall_seconds": {
+        "baseline_rosetta": {
+          "mad": 0.095703542732682,
+          "max": 2.103514632881182,
+          "median": 1.9213416155318568,
+          "min": 1.5407824064578257,
+          "n": 6,
+          "values": [
+            1.920188256394826,
+            1.5407824064578257,
+            1.9224949746688875,
+            2.103514632881182,
+            1.831270387379845,
+            2.022677472845209
+          ]
+        },
+        "by_variant": {
+          "baseline": {
+            "mad": 0.003978099999999998,
+            "max": 0.2347983,
+            "median": 0.22557195,
+            "min": 0.2215839,
+            "n": 6,
+            "values": [
+              0.227824,
+              0.2216038,
+              0.2233199,
+              0.2347983,
+              0.2215839,
+              0.2322503
+            ]
+          },
+          "geometry": {
+            "mad": 0.0019244499999999803,
+            "max": 0.23077,
+            "median": 0.22485539999999998,
+            "min": 0.2227853,
+            "n": 6,
+            "values": [
+              0.226434,
+              0.23077,
+              0.2230766,
+              0.2269745,
+              0.2227853,
+              0.2232768
+            ]
+          },
+          "rosetta": {
+            "mad": 0.0030884499999999995,
+            "max": 0.1438255,
+            "median": 0.1174041,
+            "min": 0.1116219,
+            "n": 6,
+            "values": [
+              0.1186467,
+              0.1438255,
+              0.1161615,
+              0.1116219,
+              0.1210001,
+              0.1148232
+            ]
+          }
+        },
+        "geometry_baseline": {
+          "mad": 0.019371619838403575,
+          "max": 1.0413630091180748,
+          "median": 0.996404665278588,
+          "min": 0.961362805559347,
+          "n": 6,
+          "values": [
+            0.9938987990729686,
+            1.0413630091180748,
+            0.9989105314842073,
+            0.9666786343853427,
+            1.00542187406215,
+            0.961362805559347
+          ]
+        },
+        "geometry_rosetta": {
+          "mad": 0.05166379262109844,
+          "max": 2.0334226527231665,
+          "median": 1.9144366394735255,
+          "min": 1.6045138031851098,
+          "n": 6,
+          "values": [
+            1.9084728020248352,
+            1.6045138031851098,
+            1.920400476922216,
+            2.0334226527231665,
+            1.841199304793963,
+            1.9445268900361599
+          ]
+        }
+      },
+      "integer_wall_seconds": {
+        "baseline_rosetta": {
+          "mad": 0.026201351015474383,
+          "max": 5.107688033538521,
+          "median": 5.022231817190965,
+          "min": 4.9930159850365445,
+          "n": 6,
+          "values": [
+            5.072675886892928,
+            5.014295422295062,
+            5.107688033538521,
+            5.03016821208687,
+            4.999044947314437,
+            4.9930159850365445
+          ]
+        },
+        "by_variant": {
+          "baseline": {
+            "mad": 0.012798000000000087,
+            "max": 4.0764901,
+            "median": 4.04485755,
+            "min": 4.0267572,
+            "n": 6,
+            "values": [
+              4.0764901,
+              4.0686324,
+              4.0428357,
+              4.0373619,
+              4.0267572,
+              4.0468794
+            ]
+          },
+          "geometry": {
+            "mad": 0.01606810000000003,
+            "max": 4.0782795,
+            "median": 3.95008625,
+            "min": 3.9278648,
+            "n": 6,
+            "values": [
+              3.951314,
+              3.9488585,
+              4.0482533,
+              3.9401715,
+              3.9278648,
+              4.0782795
+            ]
+          },
+          "rosetta": {
+            "mad": 0.003939199999999976,
+            "max": 0.8114066,
+            "median": 0.8045613,
+            "min": 0.7915197,
+            "n": 6,
+            "values": [
+              0.8036173,
+              0.8114066,
+              0.7915197,
+              0.8026296,
+              0.8055053,
+              0.810508
+            ]
+          }
+        },
+        "geometry_baseline": {
+          "mad": 0.0057568167837885875,
+          "max": 1.0077590896333604,
+          "median": 0.9756842161084687,
+          "min": 0.9692931671783037,
+          "n": 6,
+          "values": [
+            0.9692931671783037,
+            0.9705616314710565,
+            1.0013400495102978,
+            0.9759272509110467,
+            0.9754411813058906,
+            1.0077590896333604
+          ]
+        },
+        "geometry_rosetta": {
+          "mad": 0.04151562838367395,
+          "max": 5.114532588386618,
+          "median": 4.912994155658765,
+          "min": 4.866682745740545,
+          "n": 6,
+          "values": [
+            4.916910076475457,
+            4.866682745740545,
+            5.114532588386618,
+            4.909078234842074,
+            4.876274308809638,
+            5.031757243605245
+          ]
+        }
+      },
+      "main_wall_seconds": {
+        "baseline_rosetta": {
+          "mad": 0.04050321187017136,
+          "max": 4.709826282163409,
+          "median": 4.655709478003267,
+          "min": 4.497161851894622,
+          "n": 6,
+          "values": [
+            4.67802538950853,
+            4.497161851894622,
+            4.709826282163409,
+            4.682599097583468,
+            4.595441020899959,
+            4.633393566498003
+          ]
+        },
+        "by_variant": {
+          "baseline": {
+            "mad": 0.011804050000000288,
+            "max": 4.3495976,
+            "median": 4.3207153,
+            "min": 4.2931837,
+            "n": 6,
+            "values": [
+              4.3495976,
+              4.3344325,
+              4.3108244,
+              4.3170033,
+              4.2931837,
+              4.3244273
+            ]
+          },
+          "geometry": {
+            "mad": 0.01979604999999962,
+            "max": 4.3448924,
+            "median": 4.2220577,
+            "min": 4.1941209,
+            "n": 6,
+            "values": [
+              4.2209999,
+              4.2231155,
+              4.3150557,
+              4.2104024,
+              4.1941209,
+              4.3448924
+            ]
+          },
+          "rosetta": {
+            "mad": 0.006151049999999991,
+            "max": 0.9638151,
+            "median": 0.9315555,
+            "min": 0.9152831,
+            "n": 6,
+            "values": [
+              0.9297935,
+              0.9638151,
+              0.9152831,
+              0.9219246,
+              0.9342267,
+              0.9333175
+            ]
+          }
+        },
+        "geometry_baseline": {
+          "mad": 0.003739873753177858,
+          "max": 1.0047324416807748,
+          "median": 0.9761161493810724,
+          "min": 0.9704345753731333,
+          "n": 6,
+          "values": [
+            0.9704345753731333,
+            0.9743179758826558,
+            1.0009815523916958,
+            0.9753067365040006,
+            0.9769255622581441,
+            1.0047324416807748
+          ]
+        },
+        "geometry_rosetta": {
+          "mad": 0.0829585140843494,
+          "max": 4.714449223415138,
+          "median": 4.553344013336579,
+          "min": 4.381665632754664,
+          "n": 6,
+          "values": [
+            4.539717582452448,
+            4.381665632754664,
+            4.714449223415138,
+            4.56697044422071,
+            4.489403803166833,
+            4.655320831335532
+          ]
+        }
+      }
+    },
+    "tsvc": {
+      "main_wall_seconds": {
+        "baseline_rosetta": {
+          "mad": 0.0014113476508473832,
+          "max": 1.48323575452736,
+          "median": 1.4798734138024305,
+          "min": 1.474300990478534,
+          "n": 6,
+          "values": [
+            1.4813237085746964,
+            1.4785010132730017,
+            1.4806866468812987,
+            1.48323575452736,
+            1.4790601807235626,
+            1.474300990478534
+          ]
+        },
+        "by_variant": {
+          "baseline": {
+            "mad": 0.0018780999999998826,
+            "max": 2.2453233,
+            "median": 2.2325745,
+            "min": 2.2278956,
+            "n": 6,
+            "values": [
+              2.2346771,
+              2.2313076,
+              2.2453233,
+              2.2278956,
+              2.2309209,
+              2.2338414
+            ]
+          },
+          "geometry": {
+            "mad": 0.005007250000000241,
+            "max": 2.252451,
+            "median": 2.23523015,
+            "min": 2.2299624,
+            "n": 6,
+            "values": [
+              2.2392322,
+              2.2304834,
+              2.2519869,
+              2.2299624,
+              2.2312281,
+              2.252451
+            ]
+          },
+          "rosetta": {
+            "mad": 0.0034250000000000114,
+            "max": 1.5164068,
+            "median": 1.50886825,
+            "min": 1.5020509,
+            "n": 6,
+            "values": [
+              1.5085677,
+              1.5091688,
+              1.5164068,
+              1.5020509,
+              1.5083368,
+              1.5151868
+            ]
+          }
+        },
+        "geometry_baseline": {
+          "mad": 0.0014150338116939443,
+          "max": 1.0083307615303396,
+          "median": 1.0014830310697869,
+          "min": 0.9996306201798442,
+          "n": 6,
+          "values": [
+            1.0020383705547438,
+            0.9996306201798442,
+            1.002967768605973,
+            1.00092769158483,
+            1.0001377009825851,
+            1.0083307615303396
+          ]
+        },
+        "geometry_rosetta": {
+          "mad": 0.001354543810949016,
+          "max": 1.486583040454154,
+          "median": 1.4844774675297263,
+          "min": 1.4779548848346187,
+          "n": 6,
+          "values": [
+            1.4843431952042987,
+            1.4779548848346187,
+            1.4850809822271966,
+            1.484611739855154,
+            1.479263848763751,
+            1.486583040454154
+          ]
+        }
+      }
+    }
+  }
+}
