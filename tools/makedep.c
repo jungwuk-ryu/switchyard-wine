@@ -2524,6 +2524,29 @@ static struct strarray add_import_libs( const struct makefile *make, struct stra
         fatal_error( "library %s not found\n", basename );
 
      found:
+        /* LLVM may expand memory intrinsics into libcalls after its ARM64EC
+         * call-lowering pass has collected import signatures.  The contract
+         * objects use weak IAT aliases, so they author signatures for
+         * real imports without creating unused ones.  CRT implementations use
+         * -fno-builtin and must not gain self-import contracts. */
+        if (type == IMPORT_TYPE_DEFAULT && !strcmp( basename, "winecrt0" ) &&
+            get_cpu_from_name( archs.str[link_arch] ) == CPU_ARM64EC &&
+            !(make->module && is_crt_module( make->module )) &&
+            !(make->testdll && is_crt_module( make->testdll )))
+        {
+            static const char * const libcalls[] = { "memcpy", "memmove", "memset", NULL };
+            const char * const *libcall;
+
+            for (libcall = libcalls; *libcall; libcall++)
+            {
+                const char *contract;
+
+                contract = obj_dir_path( submake,
+                    strmake( "%sarm64ec_%s_contract.o", arch_dirs[link_arch], *libcall ));
+                strarray_add_uniq( deps, contract );
+                strarray_add( &ret, contract );
+            }
+        }
         strarray_add_uniq( deps, lib );
         strarray_add( &ret, lib );
     }

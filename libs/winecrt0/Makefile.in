@@ -2,6 +2,9 @@ STATICLIB = libwinecrt0.a
 
 SOURCES = \
 	arm64ec.c \
+	arm64ec_memcpy_contract.c \
+	arm64ec_memmove_contract.c \
+	arm64ec_memset_contract.c \
 	crt_dllmain.c \
 	crt_fltused.c \
 	debug.c \

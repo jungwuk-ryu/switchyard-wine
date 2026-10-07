@@ -54,6 +54,14 @@ fi
 "$ROOT_DIR/switchyard/verify_font_assets.sh"
 "$ROOT_DIR/switchyard/verify_tls_packages.sh"
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+  "$ROOT_DIR/switchyard/tests/arm64ec_libcall_contract_source_test.py" \
+  "$ROOT_DIR/libs/winecrt0/arm64ec_memcpy_contract.c" \
+  "$ROOT_DIR/libs/winecrt0/arm64ec_memmove_contract.c" \
+  "$ROOT_DIR/libs/winecrt0/arm64ec_memset_contract.c" \
+  "$ROOT_DIR/libs/winecrt0/Makefile.in" \
+  "$ROOT_DIR/dlls/cryptbase/Makefile.in" \
+  "$ROOT_DIR/tools/makedep.c"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
   "$ROOT_DIR/dlls/ntdll/tests/check_arm64ec_low_guest_dispatch.py" \
   "$ROOT_DIR/dlls/ntdll/signal_arm64ec.c" \
   "$ROOT_DIR/include/wine/low_va.h"
